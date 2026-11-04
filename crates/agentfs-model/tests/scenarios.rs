@@ -2403,3 +2403,186 @@ fn r11_an_open_file_follows_a_rename_and_an_unlinked_one_saves_nothing() {
         drain(&mut w);
     }
 }
+
+// ── rule 11: creates, objects and the atomic save (git-model.md §7) ─────
+
+/// An editor's atomic save of `p` as client `c`: create `tmp`, write what
+/// it read of `p` with `edit` applied (a new line holding `text`), close,
+/// rename `tmp` over `p`. Returns the bytes it saved.
+fn atomic_save(
+    w: &mut World,
+    c: &Client,
+    p: &str,
+    tmp: &str,
+    edit: LineEdit,
+    text: &str,
+) -> String {
+    let read = w.client_reads(c, p).bytes();
+    let new = agentfs_model::program::edited(&read, &edit, text);
+    let h = w.create(c, tmp).expect("an unborn identity left");
+    w.write(h, Write::Append(new.clone()));
+    w.close(h);
+    assert!(w.rename(c, tmp, p).is_none(), "the rename ran at once");
+    new
+}
+
+/// Rule 11, creates: a create makes a new file identity (the next unborn
+/// one), saved at once with its path; its content is a later save; both
+/// land like any save. Two trees creating files at once both keep theirs.
+#[test]
+fn r11_a_create_lands_like_any_save() {
+    for history in BOTH {
+        let mut w = world(history);
+        let f = w.create_fork(Tree::Main);
+        let h = w.create(&Client::Fork(f), "t1").unwrap();
+        w.write(h, Write::Append("x\n".into()));
+        w.close(h);
+        let k = w.create(&m1(), "t2").unwrap();
+        w.close(k);
+        assert_eq!(w.lookup(&w.head(Tree::Fork(f)), "t1").as_deref(), Some("g"));
+        assert_eq!(w.lookup(&w.main_head, "t2").as_deref(), Some("h"));
+        assert!(
+            w.lookup(&w.main_head, "t1").is_none(),
+            "landing is a queued step"
+        );
+        drain(&mut w);
+        for t in [Tree::Main, Tree::Fork(f)] {
+            assert_eq!(w.read(t, "t1").bytes(), "x\n", "{history:?} {t:?}");
+            assert_eq!(w.read(t, "t2").bytes(), "", "{history:?} {t:?}");
+        }
+    }
+}
+
+/// Rule 11, the atomic save: a rename-over from a new file is a rewrite of
+/// the replaced file, which keeps its identity, so it merges per line with
+/// the parent's concurrent edit of another line (a plain rename-over would
+/// lose whole: `r11_a_rename_over_applies_or_loses_whole`). The new file ends.
+#[test]
+fn r11_an_atomic_save_keeps_the_files_identity_and_merges_per_line() {
+    for history in BOTH {
+        let mut w = world(history);
+        let f = w.create_fork(Tree::Main);
+        let c = Client::Fork(f);
+        atomic_save(&mut w, &c, "a", "a.tmp", LineEdit::At(0), "x");
+        let m = w.save(&m1(), "a", 4);
+        let fork = w.read(Tree::Fork(f), "a");
+        assert_eq!(fork.name.line, "a", "the replaced file keeps its identity");
+        assert_eq!(
+            w.lookup(&w.head(Tree::Fork(f)), "a.tmp"),
+            None,
+            "the new file ended"
+        );
+        assert!(!w.file(&w.head(Tree::Fork(f)), "g").name.live());
+        drain(&mut w);
+        let main = w.read(Tree::Main, "a");
+        assert_eq!(main.texts()[0], "x", "{history:?}: the atomic save landed");
+        assert!(
+            main.contains(&m),
+            "{history:?}: and main's edit of another line stayed"
+        );
+        assert!(w.collisions.is_empty(), "{history:?}: {:?}", w.collisions);
+        assert_eq!(w.read(Tree::Fork(f), "a"), main);
+    }
+}
+
+/// Rule 11 with git-model.md §7's objects: an old writer of the file an
+/// editor replaces by an atomic save keeps its object; its writes never
+/// reach the replacement, its close saves nothing and an `OrphanDropped`
+/// event names its calls. A take waiting for that writer's close is woken
+/// by the save, since no path names the old object. In main (two clients)
+/// and in a sandbox (one program with both opens).
+#[test]
+fn r11_an_old_writer_after_an_atomic_save_saves_nothing() {
+    for history in BOTH {
+        for in_fork in [false, true] {
+            let mut w = world(history);
+            let f = w.create_fork(Tree::Main);
+            let (t, old, editor) = if in_fork {
+                (Tree::Fork(f), Client::Fork(f), Client::Fork(f))
+            } else {
+                (Tree::Main, Client::Main("m2".into()), m1())
+            };
+            let g = w.create_fork(t);
+            w.save(&Client::Fork(g), "a", 3);
+            let h = w.open_write(&old, "a");
+            w.write(h, Write::Append("old\n".into()));
+            take(&mut w, &Step::Next(t));
+            assert!(
+                w.waits().contains_key(&t),
+                "the landing waits for the old writer"
+            );
+            let new = atomic_save(&mut w, &editor, "a", "a.tmp", LineEdit::At(0), "x");
+            assert!(
+                !w.waits().contains_key(&t),
+                "the save woke it: no path names the old object"
+            );
+            assert_eq!(w.read(t, "a").bytes(), new);
+            w.write(
+                h,
+                Write::Pwrite {
+                    offset: 0,
+                    bytes: "zz".into(),
+                },
+            );
+            let head = w.head(t);
+            w.close(h);
+            ok(&mut w);
+            assert_eq!(w.head(t), head, "{history:?}: the orphan saved nothing");
+            assert_eq!(
+                w.read(t, "a").bytes(),
+                new,
+                "its writes never reached the replacement"
+            );
+            let e = w.orphans.last().expect("an OrphanDropped event");
+            assert_eq!(
+                (e.handle, e.path.as_str(), e.bytes),
+                (h, "a", 6),
+                "{history:?}"
+            );
+            assert_eq!(
+                e.writer,
+                if in_fork {
+                    format!("c{f}")
+                } else {
+                    "m2".into()
+                }
+            );
+            drain(&mut w);
+            let a = w.read(Tree::Main, "a");
+            assert_eq!(a.texts()[0], "x", "{history:?} {in_fork}");
+            assert!(!a.bytes().contains("old") && !a.bytes().contains("zz"));
+            assert_eq!(a.texts().len(), 6, "the landing's line 3 merged per line");
+            assert!(w.collisions.is_empty(), "{:?}", w.collisions);
+        }
+    }
+}
+
+/// Rule 11 with objects: an open of the new file still open at the atomic
+/// save follows its object, now the replaced file's: its later writes and
+/// its close save into that file.
+#[test]
+fn r11_an_open_on_the_new_file_follows_it_through_the_atomic_save() {
+    for history in BOTH {
+        let mut w = world(history);
+        let h = w.create(&m1(), "a.tmp").unwrap();
+        w.write(h, Write::Append("x\n".into()));
+        assert!(w.rename(&m1(), "a.tmp", "a").is_none());
+        ok(&mut w);
+        assert_eq!(
+            w.read(Tree::Main, "a").bytes(),
+            "",
+            "the new file was empty at the rename"
+        );
+        w.write(h, Write::Append("y\n".into()));
+        w.close(h);
+        ok(&mut w);
+        let a = w.read(Tree::Main, "a");
+        assert_eq!(
+            (a.name.line.as_str(), a.bytes().as_str()),
+            ("a", "x\ny\n"),
+            "{history:?}"
+        );
+        assert!(w.orphans.is_empty());
+        drain(&mut w);
+    }
+}

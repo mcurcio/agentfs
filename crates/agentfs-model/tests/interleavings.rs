@@ -31,7 +31,7 @@
 //! SplitMix64 written here: fixed seeds replay exactly.
 
 use agentfs_model::check::{check, check_converged, step_checked};
-use agentfs_model::content::{BLANK, Content, Layout, PATHS};
+use agentfs_model::content::{BLANK, Content, FILES, Layout, PATHS, UNBORN};
 use agentfs_model::git::{git, with_reversed_dates};
 use agentfs_model::program;
 use agentfs_model::world::{
@@ -136,6 +136,13 @@ struct Tally {
     renames: usize,
     rename_overs: usize,
     main_deaths: usize,
+    /// Creates, atomic saves (a create renamed over a file), old writers
+    /// left open on a file an atomic save may replace, and closes of an
+    /// orphan that dropped calls.
+    creates: usize,
+    atomic_saves: usize,
+    old_writers: usize,
+    orphans: usize,
     /// Takes in which a new line met a parent's new line at its place (rule
     /// 10), and changes that edited a file the parent had unlinked (rule
     /// 11), as `check` counted them.
@@ -180,6 +187,31 @@ fn in_txn(w: &World) -> Vec<ForkId> {
 struct Oracle {
     files: BTreeMap<Target, BTreeMap<String, Vec<u8>>>,
     calls: BTreeMap<HandleId, Vec<Write>>,
+    /// Objects (git-model.md §7), the harness's own account: each file's
+    /// object per target, and each open's object, path and writer.
+    inodes: BTreeMap<(Target, String), u64>,
+    held: BTreeMap<HandleId, (Target, u64, String, String)>,
+    next_inode: u64,
+    /// Path calls that wait for a take: (target, file, rename's path).
+    waiting_calls: BTreeMap<HandleId, (Target, String, Option<String>)>,
+}
+
+/// An `OrphanDropped` event as the oracle expects it: (open, writer, path,
+/// bytes).
+type Dropped = (HandleId, String, String, usize);
+
+/// Whether a file is new since its create, read from its line map: an
+/// unborn identity whose name version was written over the unborn one. The
+/// harness's own reading of git-model.md §7's atomic save.
+fn new_file(c: &Content) -> bool {
+    UNBORN.contains(&c.name.line.as_str()) && c.name.over.as_deref() == Some(c.name.line.as_str())
+}
+
+fn writer(w: &World, c: &Client) -> String {
+    match c {
+        Client::Main(n) => n.clone(),
+        Client::Fork(f) => w.forks[f].writer.clone(),
+    }
 }
 
 /// One byte call on a plain byte array: the harness's own code.
@@ -229,6 +261,103 @@ impl Oracle {
             self.files.insert(t, files);
         }
         self.calls.retain(|h, _| w.handles().any(|x| x.id == *h));
+        self.held.retain(|h, _| w.handles().any(|x| x.id == *h));
+    }
+
+    /// A new open, granted or waiting: it holds its file's object in its
+    /// target from now on.
+    fn opened(&mut self, w: &World, h: HandleId) {
+        let x = w.handle(h);
+        let key = (x.target, x.file.clone());
+        let o = match self.inodes.get(&key) {
+            Some(o) => *o,
+            None => {
+                self.next_inode += 1;
+                self.inodes.insert(key, self.next_inode);
+                self.next_inode
+            }
+        };
+        let who = writer(w, &x.client);
+        self.held.insert(h, (x.target, o, x.path.clone(), who));
+    }
+
+    /// The live file open `h`'s object is in its target, if a path names it.
+    fn named(&self, w: &World, h: HandleId) -> Option<String> {
+        let (t, o, _, _) = self.held.get(&h)?;
+        let head = head_of(w, *t)?;
+        self.inodes
+            .iter()
+            .find(|((u, f), x)| u == t && *x == o && w.file(&head, f).name.live())
+            .map(|((_, f), _)| f.clone())
+    }
+
+    /// A path call ran in target `t` on the state at commit `at` (before
+    /// it): its effect on objects, and an atomic save's on bytes.
+    fn ran(&mut self, w: &World, at: &str, t: Target, file: &str, to: Option<&str>) {
+        let Some(to) = to else {
+            self.inodes.remove(&(t, file.to_string()));
+            return;
+        };
+        let Some(g) = w.lookup(at, to).filter(|g| g != file) else {
+            return;
+        };
+        let o = self.inodes.remove(&(t, g.clone()));
+        if new_file(&w.file(at, file)) {
+            let o = self.inodes.remove(&(t, file.to_string()));
+            if let Some(o) = o {
+                self.inodes.insert((t, g.clone()), o);
+            }
+            if let Some(fs) = self.files.get_mut(&t) {
+                let b = fs.get(file).cloned().unwrap_or_default();
+                fs.insert(g, b);
+            }
+        } else {
+            let _ = o;
+        }
+    }
+
+    /// Unlinks `p` (`to` none) or renames it as `c`: the oracle follows the
+    /// call when it runs, at once or when a take's release runs it.
+    fn path_call(&mut self, w: &mut World, c: &Client, p: &str, to: Option<&str>) {
+        let t = match c {
+            Client::Main(_) => Target::Tree(Tree::Main),
+            Client::Fork(f) => match &w.forks[f].txn {
+                Some(x) => Target::Txn(*f, x.id),
+                None => Target::Tree(Tree::Fork(*f)),
+            },
+        };
+        let at = head_of(w, t).expect("live");
+        let file = w.lookup(&at, p).expect("a file");
+        let waits = match to {
+            None => w.unlink(c, p),
+            Some(to) => w.rename(c, p, to),
+        };
+        match waits {
+            None => self.ran(w, &at, t, &file, to),
+            Some(h) => {
+                self.waiting_calls
+                    .insert(h, (t, file, to.map(str::to_string)));
+            }
+        }
+    }
+
+    /// After a take's release in `t`: the waiting path calls it ran, on
+    /// the head its write left. Calls dropped with their client go too.
+    fn released(&mut self, w: &World, t: Tree) {
+        let gone: Vec<HandleId> = self
+            .waiting_calls
+            .keys()
+            .filter(|h| !w.handles().any(|x| x.id == **h))
+            .copied()
+            .collect();
+        for h in gone {
+            let (u, file, to) = self.waiting_calls.remove(&h).expect("listed");
+            if u == Target::Tree(t)
+                && let Some(at) = w.taken_head().map(str::to_string)
+            {
+                self.ran(w, &at, u, &file, to.as_deref());
+            }
+        }
     }
 
     /// Every target but `skip` holds the oracle's bytes.
@@ -257,8 +386,12 @@ impl Oracle {
     /// What open `h`'s program reads: the oracle's bytes of its file with
     /// its own calls applied.
     fn view(&self, w: &World, h: HandleId) -> String {
-        let (t, f) = (w.handle(h).target, w.handle(h).file.clone());
-        let mut b = self.files[&t][&f].clone();
+        let t = w.handle(h).target;
+        let mut b = match self.named(w, h) {
+            Some(f) => self.files[&t][&f].clone(),
+            // An orphan: what it reads is not checked (its calls are dropped).
+            None => Vec::new(),
+        };
         for c in self.calls.get(&h).into_iter().flatten() {
             apply(&mut b, c);
         }
@@ -273,13 +406,32 @@ impl Oracle {
     /// Open `h`'s close as the oracle sees it: its calls applied to its
     /// target's bytes, unless its file is unlinked there (as on Linux, its
     /// calls then reach no path). Call before the model closes it.
-    fn closing(&mut self, w: &World, h: HandleId) {
-        let (t, f) = (w.handle(h).target, w.handle(h).file.clone());
+    /// Its object no path names (an orphan): its calls are dropped, and the
+    /// event the model must raise is returned (none if it made no call).
+    fn closing(&mut self, w: &World, h: HandleId) -> Option<Dropped> {
+        let t = w.handle(h).target;
+        let named = self.named(w, h);
         let calls = self.calls.remove(&h).unwrap_or_default();
-        let live = head_of(w, t).is_some_and(|x| w.file(&x, &f).name.live());
-        if live && let Some(b) = self.files.get_mut(&t).and_then(|x| x.get_mut(&f)) {
-            for c in &calls {
-                apply(b, c);
+        let (_, _, path, who) = self.held.remove(&h).expect("an open the oracle saw");
+        match named {
+            Some(f) => {
+                if let Some(b) = self.files.get_mut(&t).and_then(|x| x.get_mut(&f)) {
+                    for c in &calls {
+                        apply(b, c);
+                    }
+                }
+                None
+            }
+            None if calls.is_empty() => None,
+            None => {
+                let bytes = calls
+                    .iter()
+                    .map(|c| match c {
+                        Write::Append(b) | Write::Pwrite { bytes: b, .. } => b.len(),
+                        Write::Truncate(_) => 0,
+                    })
+                    .sum();
+                Some((h, who, path, bytes))
             }
         }
     }
@@ -305,6 +457,9 @@ fn take(w: &mut World, o: &mut Oracle, s: &Step, tally: &mut Tally) -> Result<()
     };
     o.check_but(w, skip)?;
     o.reload(w);
+    if let Step::Finish(t) = s {
+        o.released(w, *t);
+    }
     if let Step::Finish(t) = s
         && w.queue(*t) != before
     {
@@ -338,10 +493,31 @@ fn take(w: &mut World, o: &mut Oracle, s: &Step, tally: &mut Tally) -> Result<()
 /// Closes `h`: the save holds exactly the bytes the oracle computes (none
 /// if the file was unlinked meanwhile), and nothing else changed.
 fn close_checked(w: &mut World, o: &mut Oracle, h: HandleId) -> Result<(), String> {
-    o.closing(w, h);
+    let t = w.handle(h).target;
+    let (n, head) = (w.orphans.len(), head_of(w, t));
+    let expect = o.closing(w, h);
     w.close(h);
+    if expect.is_some() && head_of(w, t) != head {
+        return Err(format!("close h{h}: an orphan saved"));
+    }
+    dropped(w, n, expect.into_iter().collect())?;
     gitledger::observe(w)?;
     o.check(w).map_err(|e| format!("close h{h}: {e}"))
+}
+
+/// The model raised exactly the `OrphanDropped` events the oracle expects
+/// since event `n` (git-model.md §7: an orphan's calls are dropped, named).
+fn dropped(w: &World, n: usize, expect: Vec<Dropped>) -> Result<(), String> {
+    let got: Vec<Dropped> = w.orphans[n..]
+        .iter()
+        .map(|e| (e.handle, e.writer.clone(), e.path.clone(), e.bytes))
+        .collect();
+    if got != expect {
+        return Err(format!(
+            "orphans: the model raised {got:?}, the oracle expects {expect:?}"
+        ));
+    }
+    Ok(())
 }
 
 /// Every program closes the files it has open (granted ones; a waiting
@@ -372,22 +548,27 @@ fn end_checked(w: &mut World, o: &mut Oracle, c: &Client) -> Result<(), String> 
         .filter(|h| h.client == *c && !h.waiting && h.kind == Kind::Write)
         .map(|h| h.id)
         .collect();
+    let n = w.orphans.len();
+    let mut expect = Vec::new();
     for h in mine {
-        o.closing(w, h);
+        expect.extend(o.closing(w, h));
     }
     match c {
         Client::Main(n) => w.end_main_client(n),
         Client::Fork(f) => w.end_client(*f),
     }
+    dropped(w, n, expect)?;
     gitledger::observe(w)?;
     o.calls.retain(|h, _| w.handles().any(|x| x.id == *h));
+    o.held.retain(|h, _| w.handles().any(|x| x.id == *h));
     o.check(w).map_err(|e| format!("end of {c:?}: {e}"))
 }
 
 fn rollback_checked(w: &mut World, o: &mut Oracle, f: ForkId) -> Result<(), String> {
+    let n = w.orphans.len();
     w.rollback(f).expect("open");
     o.reload(w);
-    Ok(())
+    dropped(w, n, Vec::new())
 }
 
 fn drain(
@@ -454,6 +635,8 @@ struct Calls {
     next_name: usize,
     /// A counter for new lines' bytes, so most new lines differ.
     next_text: usize,
+    /// Creates made: each takes one unborn identity.
+    creates: usize,
 }
 
 impl Calls {
@@ -466,6 +649,7 @@ impl Calls {
             next_main: 3,
             next_name: 1,
             next_text: 1,
+            creates: 0,
         }
     }
 
@@ -628,14 +812,16 @@ impl Calls {
 
     /// Opens `p` for writing as `c`, a sixth with `O_TRUNC`.
     fn open(&mut self, w: &mut World, c: &Client, p: &str, tally: &mut Tally) -> HandleId {
-        if self.rng.below(6) == 0 {
+        let h = if self.rng.below(6) == 0 {
             tally.o_truncs += 1;
             let h = w.open_trunc(c, p);
             self.o.calls.insert(h, vec![Write::Truncate(0)]);
             h
         } else {
             w.open_write(c, p)
-        }
+        };
+        self.o.opened(w, h);
+        h
     }
 
     /// Opens `p` for writing as `c` and, if granted, writes line `slot` and
@@ -649,6 +835,7 @@ impl Calls {
         tally: &mut Tally,
     ) -> Result<(), String> {
         let h = w.open_write(c, p);
+        self.o.opened(w, h);
         if w.handle(h).waiting {
             tally.open_waits += 1;
             return Ok(());
@@ -690,7 +877,7 @@ impl Calls {
     ) {
         if unlink {
             tally.unlinks += 1;
-            w.unlink(c, p);
+            self.o.path_call(w, c, p, None);
             return;
         }
         let over = PATHS
@@ -701,14 +888,80 @@ impl Calls {
         match self.rng.pick(&over) {
             Some(q) if self.rng.below(3) == 0 => {
                 tally.rename_overs += 1;
-                w.rename(c, p, &q);
+                self.o.path_call(w, c, p, Some(&q));
             }
             _ => {
                 tally.renames += 1;
-                w.rename(c, p, &format!("e{}", self.next_name));
+                let to = format!("e{}", self.next_name);
+                self.o.path_call(w, c, p, Some(&to));
                 self.next_name += 1;
             }
         }
+    }
+
+    /// A new file, or an editor's atomic save of `p` (git-model.md §7), as
+    /// `c`: create a temporary file, write it, close it; for an atomic
+    /// save the bytes are `p`'s with a line written at `slot`, and the
+    /// temporary file is renamed over `p`. Half the time an old writer of
+    /// `p` opens it first and stays open, to write and close later (its
+    /// object no path names once the save runs). Each create takes an
+    /// unborn identity; none left: nothing.
+    fn create(
+        &mut self,
+        w: &mut World,
+        c: &Client,
+        p: &str,
+        slot: usize,
+        tally: &mut Tally,
+    ) -> Result<(), String> {
+        if self.creates >= UNBORN.len() {
+            return Ok(());
+        }
+        let atomic = self.rng.below(3) != 0;
+        if atomic && self.rng.below(2) == 0 {
+            let h = self.open(w, c, p, tally);
+            tally.old_writers += 1;
+            if !w.handle(h).waiting {
+                self.write(w, h, slot, tally);
+            }
+        }
+        let tmp = format!("t{}", self.next_name);
+        self.next_name += 1;
+        let Some(h) = w.create(c, &tmp) else {
+            return Ok(());
+        };
+        self.creates += 1;
+        tally.creates += 1;
+        self.o.opened(w, h);
+        // The create's own save (the new file's name) leaves no bytes.
+        self.o.check(w)?;
+        let text = self.text(tally);
+        let bytes = if atomic {
+            let file = w.lookup(&w.target_head(w.handle(h).target), p);
+            let old = file
+                .and_then(|f| {
+                    self.o
+                        .files
+                        .get(&w.handle(h).target)
+                        .and_then(|x| x.get(&f))
+                        .cloned()
+                })
+                .unwrap_or_default();
+            program::edited(
+                &String::from_utf8(old).expect("ASCII"),
+                &LineEdit::At(slot),
+                &text,
+            )
+        } else {
+            format!("{text}\n")
+        };
+        self.o.write(w, h, Write::Append(bytes));
+        close_checked(w, &mut self.o, h)?;
+        if atomic {
+            tally.atomic_saves += 1;
+            self.o.path_call(w, c, &tmp, Some(p));
+        }
+        Ok(())
     }
 
     /// While a take holds files in a tree, a client of that tree calls on
@@ -758,7 +1011,7 @@ impl Calls {
         };
         let file = match self.rng.pick(&held) {
             Some(x) if self.rng.below(4) != 0 => x,
-            _ => PATHS[self.rng.below(PATHS.len())].to_string(),
+            _ => FILES[self.rng.below(FILES.len())].to_string(),
         };
         let Some(p) = w.client_path(&c, &file) else {
             return Ok(false);
@@ -775,6 +1028,7 @@ impl Calls {
             }
             _ => {
                 let h = w.open_write(&c, &p);
+                self.o.opened(w, h);
                 if w.handle(h).waiting {
                     tally.open_waits += 1;
                 } else {
@@ -816,7 +1070,7 @@ fn run(w: &mut World, seed: u64, tally: &mut Tally) -> Result<(), (usize, String
     for step in 0..STEPS {
         let (f, slot) = match focus {
             Some(x) if k.rng.below(2) == 0 => x,
-            _ => (PATHS[k.rng.below(PATHS.len())], k.rng.below(HOT_SLOTS)),
+            _ => (FILES[k.rng.below(FILES.len())], k.rng.below(HOT_SLOTS)),
         };
         let mut clients: Vec<Client> = k.mains.iter().cloned().map(Client::Main).collect();
         clients.extend(live_clients(w).into_iter().map(Client::Fork));
@@ -934,6 +1188,13 @@ fn run(w: &mut World, seed: u64, tally: &mut Tally) -> Result<(), (usize, String
                     k.path_call(w, &c, f, &p, unlink, tally);
                 }
             }
+            20 if k.rng.below(2) == 0 => {
+                if let Some(c) = k.rng.pick(&clients)
+                    && let Some(p) = w.client_path(&c, f)
+                {
+                    k.create(w, &c, &p, slot, tally).map_err(e)?;
+                }
+            }
             26..=33 if !w.holds().is_empty() => {
                 k.during_take(w, slot, tally).map_err(e)?;
             }
@@ -987,6 +1248,7 @@ fn run(w: &mut World, seed: u64, tally: &mut Tally) -> Result<(), (usize, String
     tally.fast_forwards += w.fast_forwards;
     tally.inserts_met += w.inserts_met;
     tally.unlinked_edits += w.unlinked_edits;
+    tally.orphans += w.orphans.len();
     if gitledger::takes() != w.landings.len() {
         return Err((
             STEPS + 1,
@@ -1054,6 +1316,13 @@ fn run_all(policies: Policies) {
         assert!(
             tally.inserts_met > 0 && tally.unlinked_edits > 0 && tally.saves_during_takes > 0,
             "rules 10 and 11, or saves during takes, not met in {} seeds: {tally:?}",
+            seeds().len()
+        );
+        // Atomic saves, and old writers whose calls an atomic save, an
+        // unlink or a rename-over orphaned (git-model.md §7).
+        assert!(
+            tally.atomic_saves > 0 && tally.orphans > 0,
+            "no atomic save, or no orphan, in {} seeds: {tally:?}",
             seeds().len()
         );
         if policies.history == HistoryPolicy::Squashed {
@@ -1134,7 +1403,7 @@ fn rounds(w: &mut World, seed: u64, tally: &mut Tally) -> Result<Vec<String>, (u
     let m1 = Client::Main("m1".into());
     for round in 0..ROUNDS {
         for _ in 0..ROUND_CALLS {
-            let (f, slot) = (PATHS[k.rng.below(PATHS.len())], k.rng.below(HOT_SLOTS));
+            let (f, slot) = (FILES[k.rng.below(FILES.len())], k.rng.below(HOT_SLOTS));
             let e = |e| (round, e);
             let fork = k.rng.pick(&live_clients(w)).map(Client::Fork);
             match k.rng.below(16) {
@@ -1200,8 +1469,12 @@ fn rounds(w: &mut World, seed: u64, tally: &mut Tally) -> Result<Vec<String>, (u
                     if k.rng.below(2) == 0
                         && let Some(p) = w.client_path(&c, f)
                     {
-                        let unlink = k.rng.below(3) == 0;
-                        k.path_call(w, &c, f, &p, unlink, tally);
+                        if k.rng.below(4) == 0 {
+                            k.create(w, &c, &p, slot, tally).map_err(e)?;
+                        } else {
+                            let unlink = k.rng.below(3) == 0;
+                            k.path_call(w, &c, f, &p, unlink, tally);
+                        }
                     }
                 }
             }

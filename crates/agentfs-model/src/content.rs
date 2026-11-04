@@ -17,7 +17,9 @@
 //! T); an identity is the id of its first version. A file has one more
 //! line, its name line: its identity is the file's identity (fixed at
 //! create, kept by a rename), its live versions hold the file's path, a
-//! deleted version marks the file unlinked.
+//! deleted version marks the file unlinked. A file a create can make is in
+//! main's first commit as unborn ([`UNBORN`]): its name line deleted, no
+//! lines.
 //!
 //! The model keeps each line's record (version, identity, the version it
 //! was written over, live or gone) in the file's blob beside its bytes,
@@ -31,9 +33,17 @@ use std::collections::{BTreeMap, BTreeSet};
 
 /// Lines each file starts with: six root lines, all holding [`BLANK`].
 pub const SLOTS: usize = 6;
-/// The files' identities, which are also their first paths. All exist from
-/// main's first commit; the model creates no files.
-pub const PATHS: [&str; 4] = ["a", "b", "c", "d"];
+/// The files that exist from main's first commit: their identities, which
+/// are also their first paths.
+pub const FILES: [&str; 4] = ["a", "b", "c", "d"];
+/// The file identities a create can take, in this order, each once in the
+/// volume (rule 11: a file's identity is fixed at create). Main's first
+/// commit holds each as unborn: a deleted name version and no lines, so a
+/// create is a new version of the name line written over it, and every
+/// reader that walks the files sees an unborn file as an unlinked one.
+pub const UNBORN: [&str; 3] = ["g", "h", "i"];
+/// Every file identity: [`FILES`], then [`UNBORN`].
+pub const PATHS: [&str; 7] = ["a", "b", "c", "d", "g", "h", "i"];
 /// The text of every root line (its bytes are this and a newline): six
 /// identical lines in every file.
 pub const BLANK: &str = "-";
@@ -188,8 +198,20 @@ pub struct Content {
 
 impl Content {
     /// File `file`'s root content: its name line holding its path, and
-    /// [`SLOTS`] root lines `<file>0`.. all holding [`BLANK`] and a newline.
+    /// [`SLOTS`] root lines `<file>0`.. all holding [`BLANK`] and a newline;
+    /// for an [`UNBORN`] identity, a deleted name line and no lines.
     pub fn root(file: &str) -> Self {
+        if UNBORN.contains(&file) {
+            return Self {
+                name: Line {
+                    id: file.into(),
+                    line: file.into(),
+                    over: None,
+                    state: State::Gone,
+                },
+                lines: Vec::new(),
+            };
+        }
         let line = |id: String| Line {
             id: id.clone(),
             line: id,

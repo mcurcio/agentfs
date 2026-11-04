@@ -23,7 +23,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use crate::content::{Content, Layout, Line, Lineage, PATHS, State, split_lines};
+use crate::content::{Content, Layout, Line, Lineage, PATHS, State, UNBORN, split_lines};
 use crate::git::{git, git_in, try_git};
 use crate::program;
 pub use crate::program::LineEdit;
@@ -433,7 +433,15 @@ pub struct Handle {
     pub client: Client,
     pub target: Target,
     /// The file's identity: an open follows its file through a rename.
+    /// After an atomic save over the file it was opened on, the file its
+    /// object is now named by ([`World::named`] says which, at close).
     pub file: String,
+    /// The object it holds (the inode, on Linux; git-model.md §7): fixed
+    /// at open, never changed. Its close saves to the file whose object
+    /// this is in its target then; if no path names it, nothing.
+    pub object: u64,
+    /// The path it was opened by.
+    pub path: String,
     /// The open waits for a take's hold on the file to be released.
     pub waiting: bool,
     pub kind: Kind,
@@ -455,6 +463,21 @@ impl Handle {
         }
         v
     }
+}
+
+/// An `OrphanDropped` event (git-model.md §7, a choice): an open whose
+/// object no path named at its close (its file unlinked, or replaced by a
+/// rename-over or an atomic save, in its target). Its write calls were
+/// recorded as made (the journal, git-model.md §3); they are dropped, never
+/// committed, and this event names them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Orphan {
+    pub handle: HandleId,
+    pub writer: String,
+    /// The path it was opened by.
+    pub path: String,
+    /// The bytes its write calls carried.
+    pub bytes: usize,
 }
 
 /// What a tree's take holds its files for (rule 9).
@@ -676,6 +699,15 @@ pub struct World {
     queues: BTreeMap<Tree, VecDeque<Entry>>,
     handles: BTreeMap<HandleId, Handle>,
     next_handle: HandleId,
+    /// Each file's object in each target (the inode an open holds,
+    /// git-model.md §7); none once its file is unlinked or replaced there.
+    /// Not in git: a view's state, as an inode table is.
+    inodes: BTreeMap<(Target, String), u64>,
+    next_object: u64,
+    /// How many of [`UNBORN`] creates have taken.
+    next_unborn: usize,
+    /// Every `OrphanDropped` event.
+    pub orphans: Vec<Orphan>,
     holds: BTreeMap<Tree, Hold>,
     /// A queue whose head waits for these files' write-opens to close.
     waits: BTreeMap<Tree, BTreeSet<String>>,
@@ -783,6 +815,10 @@ impl World {
             queues: BTreeMap::new(),
             handles: BTreeMap::new(),
             next_handle: 1,
+            inodes: BTreeMap::new(),
+            next_object: 0,
+            next_unborn: 0,
+            orphans: Vec::new(),
             holds: BTreeMap::new(),
             waits: BTreeMap::new(),
             lineage: Lineage::default(),
@@ -951,18 +987,46 @@ impl World {
         &self.holds
     }
 
+    /// The head the last take's write left, before the opens and path
+    /// calls its release granted ran.
+    pub fn taken_head(&self) -> Option<&str> {
+        self.taken.as_deref()
+    }
+
     /// Each tree whose queue head waits, with the files it waits for.
     pub fn waits(&self) -> &BTreeMap<Tree, BTreeSet<String>> {
         &self.waits
     }
 
     /// The files a client of `t` has open for writing (granted opens).
+    /// An open whose object no path names (an orphan) has no file open.
     pub fn write_open(&self, t: Tree) -> BTreeSet<String> {
         self.handles
             .values()
             .filter(|h| !h.waiting && h.target == Target::Tree(t))
-            .map(|h| h.file.clone())
+            .filter_map(|h| self.named(h))
             .collect()
+    }
+
+    /// The file open `h`'s object is in its target now: the live file
+    /// whose object it is; none if no path names it (an orphan: its file
+    /// was unlinked, or replaced by a rename-over or an atomic save, there).
+    pub fn named(&self, h: &Handle) -> Option<String> {
+        let at = self.target_head(h.target);
+        self.inodes
+            .iter()
+            .find(|((t, f), o)| *t == h.target && **o == h.object && self.file(&at, f).name.live())
+            .map(|((_, f), _)| f.clone())
+    }
+
+    /// File `f`'s object in target `t`, a new one if it has none.
+    fn inode(&mut self, t: Target, f: &str) -> u64 {
+        if let Some(o) = self.inodes.get(&(t, f.to_string())) {
+            return *o;
+        }
+        self.next_object += 1;
+        self.inodes.insert((t, f.to_string()), self.next_object);
+        self.next_object
     }
 
     pub fn alive(&self, t: Tree) -> bool {
@@ -1152,11 +1216,17 @@ impl World {
         self.trailer(c, "Agentfs-Cause") == "Direct"
     }
 
-    /// The line versions `b` holds that `a` does not.
+    /// The line versions `b` holds that `a` does not. A file no path names
+    /// in either (a file created and ended between them, as a transaction's
+    /// atomic save leaves its new file) changed nothing anyone can see:
+    /// none of its versions.
     pub fn edits(&self, a: &str, b: &str) -> Vec<Edit> {
         let mut out = Vec::new();
         for p in self.changed(a, b) {
             let (x, y) = (self.file(a, &p), self.file(b, &p));
+            if !x.name.live() && !y.name.live() {
+                continue;
+            }
             for r in y.records() {
                 if x.member(&r.line).is_none_or(|l| l.id != r.id) {
                     out.push(Edit {
@@ -1197,7 +1267,15 @@ impl World {
             let unlink = ins
                 .iter()
                 .find(|i| i.version.line == cur.name.line && !i.version.live());
-            if !cur.name.live() && unlink.is_none() {
+            // A create: a live name version written over the parent's
+            // deleted one, which only an unborn file's create can be (a
+            // program cannot rename a file no path names).
+            let creates = ins.iter().any(|i| {
+                i.version.line == cur.name.line
+                    && i.version.live()
+                    && verdicts[&key(i)] == Verdict::Apply
+            });
+            if !cur.name.live() && unlink.is_none() && !creates {
                 // An edit of a file the parent unlinked: the unlink wins.
                 for i in ins {
                     if verdicts[&key(i)] != Verdict::Drop {
@@ -1707,18 +1785,28 @@ impl World {
 
     /// A new handle on `file` at `target`, waiting if a take holds one of
     /// its files in that tree (a transaction's branch is frozen: never).
-    fn add_handle(&mut self, c: &Client, target: Target, file: String, kind: Kind) -> HandleId {
+    fn add_handle(
+        &mut self,
+        c: &Client,
+        target: Target,
+        file: String,
+        path: &str,
+        kind: Kind,
+    ) -> HandleId {
         assert!(
             !matches!(c, Client::Main(n) if self.ended_main.contains(n)),
             "a call by {c:?}, which ended"
         );
         let id = self.next_handle;
         self.next_handle += 1;
+        let object = self.inode(target, &file);
         let mut h = Handle {
             id,
             client: c.clone(),
             target,
             file,
+            object,
+            path: path.to_string(),
             waiting: false,
             kind,
             calls: Vec::new(),
@@ -1753,8 +1841,10 @@ impl World {
         let target = self.target_of(c);
         let file = self
             .lookup(&self.target_head(target), p)
-            .unwrap_or_else(|| panic!("open_write of {p}: no such file (the model creates none)"));
-        let id = self.add_handle(c, target, file, Kind::Write);
+            .unwrap_or_else(|| {
+                panic!("open_write of {p}: no such file ([`World::create`] makes one)")
+            });
+        let id = self.add_handle(c, target, file, p, Kind::Write);
         let waiting = self.handles[&id].waiting;
         self.note(format!(
             "open h{id} {c:?} {target:?}:{p}{}",
@@ -1857,16 +1947,66 @@ impl World {
 
     fn save_handle(&mut self, handle: &Handle) -> Vec<String> {
         let (writer, txn) = self.handle_writer(handle);
-        let p = handle.file.as_str();
+        let Some(p) = self.named(handle) else {
+            self.orphan(handle, &writer);
+            return Vec::new();
+        };
         let at = self.target_head(handle.target);
-        let cur = self.file(&at, p);
-        if !cur.name.live() {
+        let cur = self.file(&at, &p);
+        let mut reserved = handle.reserved.clone();
+        let (lines, set) = self.rewrite(&cur, &p, &handle.calls, &writer, txn, &mut reserved);
+        if set.is_empty() {
             return Vec::new();
         }
+        let tokens = set.iter().map(|e| e.token.clone()).collect();
+        let new = Content {
+            name: cur.name.clone(),
+            lines,
+        };
+        let files = BTreeMap::from([(p, new)]);
+        let c = self.commit_save(handle.target, &writer, &at, files, set);
+        self.save_calls.insert(c, handle.calls.clone());
+        tokens
+    }
+
+    /// An open no path names at its close: its calls are dropped, and an
+    /// `OrphanDropped` event names them (none if it made no call).
+    fn orphan(&mut self, h: &Handle, writer: &str) {
+        if h.calls.is_empty() {
+            return;
+        }
+        let bytes = h
+            .calls
+            .iter()
+            .map(|c| match c {
+                Write::Append(b) | Write::Pwrite { bytes: b, .. } => b.len(),
+                Write::Truncate(_) => 0,
+            })
+            .sum();
+        self.note(format!("close h{}: orphan, {bytes} bytes dropped", h.id));
+        self.orphans.push(Orphan {
+            handle: h.id,
+            writer: writer.to_string(),
+            path: h.path.clone(),
+            bytes,
+        });
+    }
+
+    /// File `p`'s lines `cur` with byte calls replayed on them (rules 8 and
+    /// 10): the new lines, and the versions they set. A new version holding
+    /// exactly the text of a `reserved` id takes that id.
+    fn rewrite(
+        &mut self,
+        cur: &Content,
+        p: &str,
+        calls: &[Write],
+        writer: &str,
+        txn: Option<TxnId>,
+        reserved: &mut Vec<String>,
+    ) -> (Vec<Line>, Vec<Edit>) {
         let mut lines = Vec::new();
         let mut set = Vec::new();
-        let mut reserved = handle.reserved.clone();
-        for r in self.replay(&cur, &handle.calls) {
+        for r in self.replay(cur, calls) {
             match r {
                 Replayed::Kept(l) => lines.push(l),
                 Replayed::New { line, over, state } => {
@@ -1876,7 +2016,7 @@ impl World {
                     };
                     let id = match reserved.iter().position(|t| t == text) {
                         Some(i) => reserved.remove(i),
-                        None => self.token(&writer, txn),
+                        None => self.token(writer, txn),
                     };
                     let line = line.unwrap_or_else(|| id.clone());
                     self.lineage.wrote(&id, over.as_deref());
@@ -1895,18 +2035,7 @@ impl World {
                 }
             }
         }
-        if set.is_empty() {
-            return Vec::new();
-        }
-        let tokens = set.iter().map(|e| e.token.clone()).collect();
-        let new = Content {
-            name: cur.name.clone(),
-            lines,
-        };
-        let files = BTreeMap::from([(p.to_string(), new)]);
-        let c = self.commit_save(handle.target, &writer, &at, files, set);
-        self.save_calls.insert(c, handle.calls.clone());
-        tokens
+        (lines, set)
     }
 
     /// Rules 8 and 10: an open's byte calls on `cur` (the head at close),
@@ -2109,7 +2238,7 @@ impl World {
         let file = self
             .lookup(&self.target_head(target), p)
             .unwrap_or_else(|| panic!("{kind:?} of {p}: no such file"));
-        let id = self.add_handle(c, target, file, kind);
+        let id = self.add_handle(c, target, file, p, kind);
         if self.handles[&id].waiting {
             let kind = &self.handles[&id].kind;
             self.note(format!("h{id} {c:?} {kind:?} of {p}: waits for the hold"));
@@ -2129,15 +2258,15 @@ impl World {
         }
         let mut files = BTreeMap::new();
         let mut set = Vec::new();
-        let mut name = |w: &mut Self, c: &Content, state: State| {
+        let name = |w: &mut Self, c: &Content, state: State| {
             let id = w.token(&writer, txn);
             w.lineage.wrote(&id, Some(&c.name.id));
-            set.push(Edit {
+            let e = Edit {
                 path: c.name.line.clone(),
                 line: c.name.line.clone(),
                 token: id.clone(),
                 gone: !matches!(state, State::Live(_)),
-            });
+            };
             let mut n = c.clone();
             n.name = Line {
                 id,
@@ -2145,19 +2274,80 @@ impl World {
                 over: Some(c.name.id.clone()),
                 state,
             };
-            files.insert(c.name.line.clone(), n);
+            (n, e)
         };
+        fn put(
+            files: &mut BTreeMap<String, Content>,
+            set: &mut Vec<Edit>,
+            (n, e): (Content, Edit),
+        ) {
+            files.insert(n.name.line.clone(), n);
+            set.push(e);
+        }
         match &h.kind {
-            Kind::Unlink => name(self, &cur, State::Gone),
+            Kind::Unlink => {
+                put(&mut files, &mut set, name(self, &cur, State::Gone));
+                self.inodes.remove(&(h.target, h.file.clone()));
+            }
             Kind::Rename { to, .. } => {
                 if cur.path() == Some(to.as_str()) {
                     return;
                 }
-                let over = self.lookup(&at, to);
-                name(self, &cur, State::Live(to.clone()));
-                if let Some(g) = over {
-                    let gc = self.file(&at, &g);
-                    name(self, &gc, State::Replaced(h.file.clone()));
+                match self.lookup(&at, to) {
+                    Some(g) if fresh(&cur) => {
+                        // The atomic save (git-model.md §7, a choice): a
+                        // rename-over from a file created and never renamed
+                        // since is a rewrite of the replaced file with the
+                        // new file's bytes: `g` keeps its identity, its
+                        // lines aligned with those bytes (rule 10), and the
+                        // new file ends. The new file's object is now `g`'s:
+                        // its opens follow it; `g`'s old object no path names.
+                        let gc = self.file(&at, &g);
+                        let bytes = cur.bytes();
+                        let mut calls = vec![Write::Truncate(0)];
+                        if !bytes.is_empty() {
+                            calls.push(Write::Pwrite { offset: 0, bytes });
+                        }
+                        let (lines, edits) =
+                            self.rewrite(&gc, &g, &calls, &writer, txn, &mut Vec::new());
+                        if !edits.is_empty() {
+                            files.insert(
+                                g.clone(),
+                                Content {
+                                    name: gc.name.clone(),
+                                    lines,
+                                },
+                            );
+                            set.extend(edits);
+                        }
+                        put(&mut files, &mut set, name(self, &cur, State::Gone));
+                        let o = self.inodes.remove(&(h.target, h.file.clone()));
+                        self.inodes.remove(&(h.target, g.clone()));
+                        if let Some(o) = o {
+                            self.inodes.insert((h.target, g.clone()), o);
+                        }
+                        for x in self.handles.values_mut() {
+                            if x.target == h.target && Some(x.object) == o {
+                                x.file = g.clone();
+                            }
+                        }
+                    }
+                    over => {
+                        put(
+                            &mut files,
+                            &mut set,
+                            name(self, &cur, State::Live(to.clone())),
+                        );
+                        if let Some(g) = over {
+                            let gc = self.file(&at, &g);
+                            put(
+                                &mut files,
+                                &mut set,
+                                name(self, &gc, State::Replaced(h.file.clone())),
+                            );
+                            self.inodes.remove(&(h.target, g));
+                        }
+                    }
                 }
             }
             Kind::Write => unreachable!("an open is not a path call"),
@@ -2165,6 +2355,54 @@ impl World {
         let tokens: Vec<&String> = set.iter().map(|e| &e.token).collect();
         self.note(format!("{:?} {:?}: saved {tokens:?}", h.client, h.kind));
         self.commit_save(h.target, &writer, &at, files, set);
+        // An open of a file this call unlinked or replaced holds an object
+        // no path names now, so no file of it is open: a take waiting for
+        // that close is woken.
+        if let Target::Tree(t) = h.target {
+            self.wake(t);
+        }
+    }
+
+    /// Rule 11: `open(p, O_CREAT | O_EXCL | O_WRONLY)` of a path no file
+    /// has: a new file, its identity the next of [`UNBORN`] (each taken once
+    /// in the volume), made at once by one save of its name line, written
+    /// over the unborn version, with no lines; and a granted open on it. The
+    /// only way the model makes a file. None once every unborn identity is
+    /// taken.
+    pub fn create(&mut self, c: &Client, p: &str) -> Option<HandleId> {
+        let target = self.target_of(c);
+        let at = self.target_head(target);
+        assert!(self.lookup(&at, p).is_none(), "create of {p}: it exists");
+        let f = UNBORN.get(self.next_unborn)?.to_string();
+        self.next_unborn += 1;
+        let writer = self.who(c).0;
+        let txn = match target {
+            Target::Txn(_, t) => Some(t),
+            Target::Tree(_) => None,
+        };
+        let cur = self.file(&at, &f);
+        let id = self.token(&writer, txn);
+        self.lineage.wrote(&id, Some(&cur.name.id));
+        let mut n = cur.clone();
+        n.name = Line {
+            id: id.clone(),
+            line: f.clone(),
+            over: Some(cur.name.id.clone()),
+            state: State::Live(p.to_string()),
+        };
+        let set = vec![Edit {
+            path: f.clone(),
+            line: f.clone(),
+            token: id.clone(),
+            gone: false,
+        }];
+        self.note(format!(
+            "create {c:?} {target:?}:{p} as {f}: saved [{id:?}]"
+        ));
+        self.commit_save(target, &writer, &at, BTreeMap::from([(f.clone(), n)]), set);
+        let h = self.add_handle(c, target, f, p, Kind::Write);
+        assert!(!self.handles[&h].waiting, "a new file is held by no take");
+        Some(h)
     }
 
     /// A close or a client's death in `t`: a queue head waiting for write-
@@ -2905,6 +3143,15 @@ impl World {
 }
 
 /// Rule 9: a take writes only files it holds.
+/// Whether file `c` is new since its create: an [`UNBORN`] identity whose
+/// name version is still the one its create wrote (never renamed since).
+/// A rename-over from such a file is an atomic save (git-model.md §7).
+/// Read from git alone, so it is the same whenever the save runs and
+/// whether or not the parent has taken the create yet.
+pub fn fresh(c: &Content) -> bool {
+    UNBORN.contains(&c.name.line.as_str()) && c.name.over.as_deref() == Some(c.name.line.as_str())
+}
+
 fn held(t: Tree, files: &BTreeSet<String>, holds: &BTreeSet<String>) {
     assert!(
         files.is_subset(holds),

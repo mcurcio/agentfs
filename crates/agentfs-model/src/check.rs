@@ -843,10 +843,24 @@ fn transactions_end_as_told(w: &mut World) -> Result<(), String> {
                 .find(|x| x.path == s.path && x.line == s.line)
                 .is_some_and(|x| x.gone)
         };
+        // Whether the transaction created `s`'s file (a new file) and its
+        // last staged version of the file's name line ended it: then the
+        // file changed nothing anyone sees (an atomic save's new file), so
+        // none of its staged versions is in the commit (`World::edits`).
+        let created_and_ended = |s: &crate::world::Edit| {
+            let names = || {
+                e.staged
+                    .iter()
+                    .filter(|x| x.path == s.path && x.line == s.path)
+            };
+            crate::content::UNBORN.contains(&s.path.as_str())
+                && names().any(|x| !x.gone)
+                && names().next_back().is_some_and(|x| x.gone)
+        };
         let ok = match (&e.how, &e.result) {
             (TxnEnd::Commit(TxnOutcome::Committed), Some(r)) => {
                 let none_lost = !w.collisions.iter().any(|c| c.result == *r);
-                let staged = e.staged.iter().all(|s| {
+                let staged = e.staged.iter().filter(|s| !created_and_ended(s)).all(|s| {
                     // A staged delete (or a line the transaction deleted
                     // later) the fork's own delete agrees with.
                     let ends = |v: &Line| {
@@ -873,7 +887,7 @@ fn transactions_end_as_told(w: &mut World) -> Result<(), String> {
                 });
                 let all_told = mine.iter().map(|c| c.lost.len()).sum::<usize>() == lines.len();
                 let none_applied = e.staged.iter().all(|s| !w.file(r, &s.path).holds(&s.token));
-                let named = e.staged.iter().all(|s| {
+                let named = e.staged.iter().filter(|s| !created_and_ended(s)).all(|s| {
                     lines.iter().any(|o| {
                         o.path == s.path
                             && o.line == s.line
@@ -1343,14 +1357,22 @@ fn history_setting(w: &mut World) -> Result<(), String> {
 /// of two inserts at one place the parent's comes first), and no line the
 /// parent added that the change never saw directly follows it. Rule 11: a
 /// change that edits a file the tree had unlinked before the take (and does
-/// not unlink it too) loses, by a file rule. Counts each in the world, so
+/// not unlink it too, nor create it: an unborn file) loses, by a file rule. Counts each in the world, so
 /// a run can show it met them.
 fn placed_and_unlinked(w: &mut World) -> Result<(), String> {
     let mut met = (0, 0);
     for l in &w.landings[w.placements_checked..] {
-        for (u, base) in &l.units {
+        for (i, (u, base)) in l.units.iter().enumerate() {
             for p in PATHS {
                 let b = w.file(&l.before, p);
+                // A file an earlier winning change of the same take created
+                // (a squash judges each save on the one before's result).
+                let created = l.units[..i].iter().any(|(v, vb)| {
+                    l.winners.contains(v) && {
+                        let (was, now) = (w.file(vb, p).name, w.file(v, p).name);
+                        !was.live() && now.live() && now.over.as_deref() == Some(was.id.as_str())
+                    }
+                });
                 let edits: Vec<_> = w
                     .edits(base, u)
                     .into_iter()
@@ -1360,6 +1382,12 @@ fn placed_and_unlinked(w: &mut World) -> Result<(), String> {
                     continue;
                 }
                 let unlinks = edits.iter().any(|e| e.line == b.name.line && e.gone);
+                // A create: its name version written over the tree's deleted
+                // one (read from the change's line map), which only a new
+                // file's create can be.
+                let name = w.file(u, p).name;
+                let creates = edits.iter().any(|e| e.line == b.name.line && !e.gone)
+                    && name.over.as_deref() == Some(b.name.id.as_str());
                 let applies = edits.iter().any(|e| {
                     b.member(&e.line).is_none_or(|v| {
                         v.id != e.token
@@ -1367,7 +1395,7 @@ fn placed_and_unlinked(w: &mut World) -> Result<(), String> {
                             && !w.lineage.descends(&v.id, &e.token)
                     })
                 });
-                if !b.name.live() && !unlinks && applies {
+                if !b.name.live() && !unlinks && !creates && !created && applies {
                     met.1 += 1;
                     let lost = w.collisions.iter().any(|c| {
                         c.tree == l.tree
