@@ -1742,7 +1742,10 @@ fn r9_a_sync_waits_for_an_open_writer_then_applies() {
         let h = w.open_write(&Client::Fork(f), "a");
         let m = w.save(&m1(), "a", 0);
         take(&mut w, &Step::Next(Tree::Fork(f)));
-        assert_eq!(w.waits()[&Tree::Fork(f)], BTreeSet::from(["a".to_string()]));
+        assert_eq!(
+            w.waiting_for(Tree::Fork(f)),
+            BTreeSet::from(["a".to_string()])
+        );
         assert!(!w.pending().contains(&Step::Next(Tree::Fork(f))));
         assert!(!has(&w, Tree::Fork(f), "a", &m), "{history:?}: not written");
         let x = w.edit(h, LineEdit::At(1)).unwrap();
@@ -2488,9 +2491,9 @@ fn r11_an_atomic_save_keeps_the_files_identity_and_merges_per_line() {
 /// Rule 11 with git-model.md §7's objects: an old writer of the file an
 /// editor replaces by an atomic save keeps its object; its writes never
 /// reach the replacement, its close saves nothing and an `OrphanDropped`
-/// event names its calls. A take waiting for that writer's close is woken
-/// by the save, since no path names the old object. In main (two clients)
-/// and in a sandbox (one program with both opens).
+/// event names its calls. A take of the file no longer waits for that
+/// writer's close, since no path names the old object. In main (two
+/// clients) and in a sandbox (one program with both opens).
 #[test]
 fn r11_an_old_writer_after_an_atomic_save_saves_nothing() {
     for history in BOTH {
@@ -2502,21 +2505,18 @@ fn r11_an_old_writer_after_an_atomic_save_saves_nothing() {
             } else {
                 (Tree::Main, Client::Main("m2".into()), m1())
             };
-            let g = w.create_fork(t);
-            w.save(&Client::Fork(g), "a", 3);
             let h = w.open_write(&old, "a");
             w.write(h, Write::Append("old\n".into()));
+            let new = atomic_save(&mut w, &editor, "a", "a.tmp", LineEdit::At(0), "x");
+            assert_eq!(w.read(t, "a").bytes(), new);
+            let g = w.create_fork(t);
+            w.save(&Client::Fork(g), "a", 3);
             take(&mut w, &Step::Next(t));
             assert!(
-                w.waits().contains_key(&t),
-                "the landing waits for the old writer"
-            );
-            let new = atomic_save(&mut w, &editor, "a", "a.tmp", LineEdit::At(0), "x");
-            assert!(
                 !w.waits().contains_key(&t),
-                "the save woke it: no path names the old object"
+                "{history:?}: the landing does not wait"
             );
-            assert_eq!(w.read(t, "a").bytes(), new);
+            take(&mut w, &Step::Finish(t));
             w.write(
                 h,
                 Write::Pwrite {
@@ -2524,15 +2524,17 @@ fn r11_an_old_writer_after_an_atomic_save_saves_nothing() {
                     bytes: "zz".into(),
                 },
             );
-            let head = w.head(t);
+            let (head, now) = (w.head(t), w.read(t, "a").bytes());
+            assert!(now.starts_with("x\n") && !now.contains("old"), "{now:?}");
             w.close(h);
             ok(&mut w);
             assert_eq!(w.head(t), head, "{history:?}: the orphan saved nothing");
             assert_eq!(
                 w.read(t, "a").bytes(),
-                new,
+                now,
                 "its writes never reached the replacement"
             );
+            let _ = new;
             let e = w.orphans.last().expect("an OrphanDropped event");
             assert_eq!(
                 (e.handle, e.path.as_str(), e.bytes),
@@ -2718,5 +2720,142 @@ fn r3_a_dropped_agreeing_delete_follows_the_delete_it_agreed_with() {
                 .iter()
                 .any(|x| x.by == By::Whole && x.lines.contains(&line3))
         );
+    }
+}
+
+// ── rule 9, progress (git-model.md §6: P1 and P3) ───────────────────────
+
+/// Rule 9 with P1: a main writer holding a file open for long holds back
+/// only the landings that touch that file. An unrelated sandbox's change
+/// goes ahead of the waiting one; a later change of the waiting one's own
+/// sandbox does not (each sandbox's order is kept), even of another file.
+#[test]
+fn r9_a_long_lived_main_writer_holds_back_only_its_own_file() {
+    for history in BOTH {
+        let mut w = world(history);
+        let (f, g) = (w.create_fork(Tree::Main), w.create_fork(Tree::Main));
+        let m2 = Client::Main("m2".into());
+        let log = w.open_write(&m2, "a");
+        w.write(log, Write::Append("log\n".into()));
+        let x = w.save(&Client::Fork(f), "a", 0);
+        let y = w.save(&Client::Fork(g), "b", 0);
+        let z = w.save(&Client::Fork(f), "c", 0);
+        take(&mut w, &Step::Next(Tree::Main));
+        assert!(
+            w.waits().contains_key(&Tree::Main),
+            "f's landing of a waits for the writer"
+        );
+        take(&mut w, &Step::Next(Tree::Main));
+        assert!(
+            w.holds().contains_key(&Tree::Main),
+            "{history:?}: g's landing is taken"
+        );
+        take(&mut w, &Step::Finish(Tree::Main));
+        assert!(
+            has(&w, Tree::Main, "b", &y),
+            "{history:?}: g's unrelated change went ahead"
+        );
+        assert!(
+            !has(&w, Tree::Main, "c", &z),
+            "f's later save keeps its place behind its first"
+        );
+        assert!(
+            !w.pending().contains(&Step::Next(Tree::Main)),
+            "nothing else is free to go"
+        );
+        w.write(log, Write::Append("more\n".into()));
+        w.close(log);
+        ok(&mut w);
+        drain(&mut w);
+        assert!(
+            has(&w, Tree::Main, "a", &x) && has(&w, Tree::Main, "c", &z),
+            "{history:?}"
+        );
+        assert!(w.read(Tree::Main, "a").bytes().ends_with("log\nmore\n"));
+    }
+}
+
+/// Rule 9 with P3: once a take waits for a file, a new write-open of it
+/// waits behind the take, so writers that keep opening the file cannot
+/// starve it: the take goes once the opens granted before it began
+/// waiting have closed, and its release grants the waiting open.
+#[test]
+fn r9_a_waiting_take_is_not_starved_by_new_writers() {
+    for history in BOTH {
+        let mut w = world(history);
+        let f = w.create_fork(Tree::Main);
+        let m2 = Client::Main("m2".into());
+        let first = w.open_write(&m1(), "a");
+        let x = w.save(&Client::Fork(f), "a", 0);
+        take(&mut w, &Step::Next(Tree::Main));
+        assert!(w.waits().contains_key(&Tree::Main));
+        let second = w.open_write(&m2, "a");
+        assert!(
+            w.handle(second).waiting,
+            "{history:?}: the new open waits behind the take"
+        );
+        assert!(w.handle(second).behind.is_some());
+        let u = w.unlink(&m2, "a");
+        assert!(u.is_some(), "so does an unlink of the file");
+        w.close(first);
+        ok(&mut w);
+        assert!(
+            !w.waits().contains_key(&Tree::Main),
+            "its own files closed: it is woken"
+        );
+        assert!(w.handle(second).waiting, "and the new open still waits");
+        next(&mut w, Tree::Main);
+        assert!(
+            w.file(&w.main_head, "a").contains(&x),
+            "{history:?}: the take went"
+        );
+        assert!(!w.handle(second).waiting, "its release granted the open");
+        assert!(w.lookup(&w.main_head, "a").is_none(), "and ran the unlink");
+        w.close(second);
+        drain(&mut w);
+    }
+}
+
+/// Rule 9 with P3, finding 20: a program that holds open a file a waiting
+/// take waits for is never made to wait behind that take, or each would
+/// wait for the other (the program blocked in its open cannot close the
+/// file). Its open goes ahead (`jumped`); the take goes once it closes.
+#[test]
+fn r9_a_writer_holding_a_waited_file_is_not_made_to_wait() {
+    for history in BOTH {
+        let mut w = world(history);
+        let f = w.create_fork(Tree::Main);
+        let c = Client::Fork(f);
+        w.begin(f).unwrap();
+        for p in ["a", "b"] {
+            let h = w.open_write(&c, p);
+            w.edit(h, LineEdit::At(0));
+            w.close(h);
+        }
+        assert_eq!(w.commit_txn(f), Ok(TxnOutcome::Committed));
+        let a = w.open_write(&m1(), "a");
+        take(&mut w, &Step::Next(Tree::Main));
+        assert!(
+            w.waits().contains_key(&Tree::Main),
+            "the landing of a and b waits for a"
+        );
+        let b = w.open_write(&m1(), "b");
+        assert!(
+            !w.handle(b).waiting && w.handle(b).jumped,
+            "{history:?}: m1 holds a: not made to wait"
+        );
+        let other = w.open_write(&Client::Main("m2".into()), "b");
+        assert!(
+            w.handle(other).waiting,
+            "another client's open of b waits behind the take"
+        );
+        w.close(b);
+        w.close(a);
+        ok(&mut w);
+        next(&mut w, Tree::Main);
+        assert!(!w.handle(other).waiting);
+        w.close(other);
+        drain(&mut w);
+        assert_eq!(w.read(Tree::Main, "a"), w.read(Tree::Fork(f), "a"));
     }
 }

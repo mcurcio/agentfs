@@ -49,18 +49,32 @@ pub fn step_checked(w: &mut World, s: &Step) -> Result<usize, String> {
     match s {
         Step::Next(t) => {
             let up = match t {
-                Tree::Fork(f) if w.queue(*t).first() == Some(&Entry::Sync) => {
-                    Some(w.head(w.forks[f].parent))
-                }
-                _ => None,
+                Tree::Fork(f) => Some(w.head(w.forks[f].parent)),
+                Tree::Main => None,
             };
+            // P1, read before the step: the entry it must act on is the
+            // first one no earlier waiting entry shares a file or a source
+            // with (the files read from git, not from the model's plan).
+            let q = w.queue_numbered(*t);
+            let Some(i) = p1_first(w, *t) else {
+                return Err(format!("{t:?}: a queue step with no entry free to go"));
+            };
+            let n = q[i].0;
+            let was = w.waits().get(t).is_some_and(|m| m.contains_key(&n));
             let taken = w.step(s);
             if taken == 0 {
                 return match w.waits().get(t) {
-                    Some(_) if w.holds().get(t).is_none() => Ok(0),
-                    _ => Err(format!("{t:?}'s queue head neither waits nor is taken")),
+                    Some(m) if m.contains_key(&n) && !was && w.holds().get(t).is_none() => Ok(0),
+                    _ => Err(format!("{t:?}'s entry {n} neither waits nor is taken")),
                 };
             }
+            if w.holds().get(t).map(|h| h.seqs.first()) != Some(Some(&n)) {
+                return Err(format!(
+                    "{t:?} took {:?}, not entry {n}, the first P1 lets go",
+                    w.holds().get(t).map(|h| &h.seqs)
+                ));
+            }
+            let up = up.filter(|_| q[i].1 == Entry::Sync);
             match (up, w.holds().get(t).map(|h| &h.take)) {
                 (Some(up), Some(Take::Sync { up: read, .. })) if *read != up => Err(format!(
                     "a sync into {t:?} read {read:.7}, not the parent's head {up:.7}"
@@ -139,6 +153,20 @@ fn locks(w: &World) -> Result<(), String> {
             ));
         }
     }
+    let queued = |t: Tree, n: u64| {
+        w.queue_numbered(t).iter().any(|(m, _)| *m == n)
+            || w.holds().get(&t).is_some_and(|x| x.seqs.contains(&n))
+    };
+    // The files each tree's waiting and woken entries lock.
+    let locked = |t: Tree| -> BTreeSet<String> {
+        w.waits()
+            .get(&t)
+            .into_iter()
+            .chain(w.woken().get(&t))
+            .flat_map(|m| m.values())
+            .flat_map(|x| x.files.iter().cloned())
+            .collect()
+    };
     for h in w.handles() {
         let alive = match &h.client {
             Client::Main(n) => !w.ended_main.contains(n),
@@ -151,6 +179,7 @@ fn locks(w: &World) -> Result<(), String> {
                     || w.holds()
                         .get(&t)
                         .is_some_and(|x| h.files().iter().any(|f| x.files.contains(f)))
+                    || h.behind.is_some_and(|n| queued(t, n))
             }
         };
         if !alive {
@@ -158,20 +187,113 @@ fn locks(w: &World) -> Result<(), String> {
         }
         if !held {
             return Err(format!(
-                "h{} ({:?} {:?}:{}) waits with no take holding its file, or outlives its transaction",
+                "h{} ({:?} {:?}:{}) waits with no take holding its file or ahead of it, or outlives its transaction",
                 h.id, h.kind, h.target, h.file
             ));
         }
+        // P3 never deadlocks: a call waiting behind a waiting take is never
+        // of a client that has open a file a waiting take waits for.
+        if let (Some(_), Target::Tree(t)) = (h.behind, h.target) {
+            let mine: BTreeSet<String> = w
+                .handles()
+                .filter(|x| x.client == h.client && !x.waiting && x.target == h.target)
+                .filter_map(|x| w.named(x))
+                .collect();
+            if let Some(f) = mine.intersection(&locked(t)).next() {
+                return Err(format!(
+                    "h{} waits behind a waiting take, but its client has open {f}, which a waiting take waits for: a deadlock",
+                    h.id
+                ));
+            }
+        }
     }
-    for (t, files) in w.waits() {
+    for (t, m) in w.waits().iter().chain(w.woken()) {
         let open = w.write_open(*t);
-        if !w.alive(*t) || !files.iter().any(|p| open.contains(p)) {
-            return Err(format!(
-                "{t:?}'s queue waits for {files:?}, none open for writing: no close woke it"
-            ));
+        for (n, x) in m {
+            let woken = w.woken().get(t).is_some_and(|m| m.contains_key(n));
+            if !w.alive(*t) || !queued(*t, *n) || (!woken && x.files.is_disjoint(&open)) {
+                return Err(format!(
+                    "{t:?}'s entry {n} waits for {:?}, none open for writing: no close woke it",
+                    x.files
+                ));
+            }
+            // P3: it waits only for opens granted before it began waiting,
+            // and those of clients that could not be made to wait.
+            if let Some(h) = w.handles().find(|h| {
+                !h.waiting
+                    && h.target == Target::Tree(*t)
+                    && w.named(h).is_some_and(|f| x.files.contains(&f))
+                    && !x.before.contains(&h.id)
+                    && !h.jumped
+            }) {
+                return Err(format!(
+                    "{t:?}'s entry {n} waits, and h{} opened one of its files after it began waiting",
+                    h.id
+                ));
+            }
+        }
+        // P1: an entry no waiting one shares a file or a source with goes.
+        if w.holds().get(t).is_none()
+            && p1_first(w, *t).is_some()
+            && !w.pending().contains(&Step::Next(*t))
+        {
+            return Err(format!("{t:?}: an entry free to go is not offered"));
         }
     }
     Ok(())
+}
+
+/// P1 (git-model.md §6), the checks' own reading: the first entry of `t`'s
+/// queue that no earlier waiting entry (or one waiting behind it) shares a
+/// file or a source with. Files are read from git: a landing's commit's
+/// own changes (each change against its first parent; a squashed nested
+/// landing's, its graft's saves), a sync's every file its tree and its
+/// parent's head differ in; a waiting entry's, the files it locks.
+pub fn p1_first(w: &World, t: Tree) -> Option<usize> {
+    let waiting = w.waits().get(&t);
+    let mut files: BTreeSet<String> = BTreeSet::new();
+    let mut sources = BTreeSet::new();
+    for (i, (n, e)) in w.queue_numbered(t).iter().enumerate() {
+        if let Some(x) = waiting.and_then(|m| m.get(n)) {
+            files.extend(x.files.iter().cloned());
+            sources.insert(e.source());
+            continue;
+        }
+        let mine: BTreeSet<String> = match (e, t) {
+            (Entry::Landing { commit, .. }, _) => {
+                let mut units = vec![commit.clone()];
+                let squashed = w.policies.history == HistoryPolicy::Squashed;
+                while squashed
+                    && let Some(c) = units
+                        .iter()
+                        .position(|u| w.trailer(u, "Agentfs-Cause") == "Landing")
+                {
+                    let c = units.remove(c);
+                    units.extend(commit_parents(w.repo(), &c, false).into_iter().skip(1));
+                }
+                units
+                    .iter()
+                    .flat_map(|u| diff_files(w, &format!("{u}^1"), u))
+                    .collect()
+            }
+            (Entry::Sync, Tree::Fork(f)) => diff_files(w, &w.head(t), &w.head(w.forks[&f].parent)),
+            (Entry::Sync, Tree::Main) => BTreeSet::new(),
+        };
+        if sources.contains(&e.source()) || !mine.is_disjoint(&files) {
+            files.extend(mine);
+            sources.insert(e.source());
+            continue;
+        }
+        return Some(i);
+    }
+    None
+}
+
+fn diff_files(w: &World, a: &str, b: &str) -> BTreeSet<String> {
+    git(w.repo(), &["diff-tree", "-r", "--name-only", a, b])
+        .lines()
+        .map(str::to_string)
+        .collect()
 }
 
 /// Once writes stop and every queue has drained: no step is left but
@@ -190,10 +312,11 @@ pub fn check_converged(w: &World) -> Result<(), String> {
     if let Some(h) = w.handles().next() {
         return Err(format!("h{} still open at the end", h.id));
     }
-    if !w.waits().is_empty() || !w.holds().is_empty() {
+    if !w.waits().is_empty() || !w.woken().is_empty() || !w.holds().is_empty() {
         return Err(format!(
-            "a lock outlives the run: waits {:?}, holds {:?}",
+            "a lock outlives the run: waits {:?}, woken {:?}, holds {:?}",
             w.waits(),
+            w.woken(),
             w.holds().keys().collect::<Vec<_>>()
         ));
     }

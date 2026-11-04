@@ -143,6 +143,13 @@ struct Tally {
     atomic_saves: usize,
     old_writers: usize,
     orphans: usize,
+    /// Progress (git-model.md §6): queue steps that took an entry ahead of
+    /// an earlier waiting one (P1); calls that waited behind a waiting take
+    /// (P3), and those let through because their client had open a file a
+    /// waiting take waits for.
+    overtakes: usize,
+    behind: usize,
+    jumped: usize,
     /// Crashes of every agentfs process, and those during a close.
     crashes: usize,
     crashes_during_close: usize,
@@ -171,6 +178,21 @@ fn live_clients(w: &World) -> Vec<ForkId> {
         .values()
         .filter(|f| f.life == Life::Open)
         .map(|f| f.id)
+        .collect()
+}
+
+/// A client blocked in a call that waits (an open or a path call waiting
+/// for a take): a program makes no other call until it returns, but it can
+/// still die.
+fn blocked(w: &World, c: &Client) -> bool {
+    w.handles().any(|h| h.client == *c && h.waiting)
+}
+
+/// The sandboxes' clients that can make a call now.
+fn free_clients(w: &World) -> Vec<ForkId> {
+    live_clients(w)
+        .into_iter()
+        .filter(|f| !blocked(w, &Client::Fork(*f)))
         .collect()
 }
 
@@ -469,6 +491,12 @@ fn take(w: &mut World, o: &mut Oracle, s: &Step, tally: &mut Tally) -> Result<()
         Step::Drop(_) | Step::Replicate => Vec::new(),
     };
     gitledger::note_next(w, s)?;
+    // P1: the entry a queue step acts on is the first one no earlier
+    // waiting entry shares a file or a source with (the checks' reading).
+    let first = match s {
+        Step::Next(t) => agentfs_model::check::p1_first(w, *t),
+        _ => None,
+    };
     let taken = step_checked(w, s)?;
     tally.steps += 1;
     let skip = match s {
@@ -501,9 +529,16 @@ fn take(w: &mut World, o: &mut Oracle, s: &Step, tally: &mut Tally) -> Result<()
         // only the saves directly behind its first, never one from behind
         // another entry (rule 7: the history setting decides nothing).
         let squash = w.policies.history == HistoryPolicy::Squashed;
-        if taken == 0 || (taken > 1 && !squash) || after[..] != before[taken.min(before.len())..] {
+        let i = first.ok_or(format!("{s:?} took {taken} entries, none free to go"))?;
+        tally.overtakes += usize::from(i > 0);
+        let rest: Vec<_> = before[..i]
+            .iter()
+            .chain(&before[(i + taken).min(before.len())..])
+            .cloned()
+            .collect();
+        if taken == 0 || (taken > 1 && !squash) || after != rest {
             return Err(format!(
-                "{s:?} took {taken} entries: not its queue's first ones, or the rest out of order"
+                "{s:?} took {taken} entries: not the first P1 lets go (entry {i}) and those directly behind it, or the rest out of order"
             ));
         }
     }
@@ -598,18 +633,21 @@ fn crash_checked(w: &mut World, o: &mut Oracle, during: Option<HandleId>) -> Res
     let n = w.orphans.len();
     let mut granted: Vec<HandleId> = w
         .handles()
-        .filter(|h| !h.waiting && h.kind == Kind::Write && Some(h.id) != during)
+        .filter(|h| !h.waiting && h.kind == Kind::Write)
         .map(|h| h.id)
         .collect();
     granted.sort();
     let mut expect = Vec::new();
-    if let Some(h) = during {
-        let e = o.closing(w, h);
-        expect.extend(e.clone());
-        expect.extend(e);
-    }
+    let first = during.and_then(|h| o.closing(w, h));
+    expect.extend(first.clone());
     for h in granted {
-        expect.extend(o.closing(w, h));
+        if Some(h) == during {
+            // Its close saved nothing git records, so the replay drops it
+            // again, in handle order.
+            expect.extend(first.clone());
+        } else {
+            expect.extend(o.closing(w, h));
+        }
     }
     match during {
         Some(h) => w.close_then_crash(h),
@@ -1071,6 +1109,9 @@ impl Calls {
             Tree::Fork(f) if w.forks[&f].life == Life::Open => Client::Fork(f),
             Tree::Fork(_) => return Ok(false),
         };
+        if blocked(w, &c) {
+            return Ok(false);
+        }
         let file = match self.rng.pick(&held) {
             Some(x) if self.rng.below(4) != 0 => x,
             _ => FILES[self.rng.below(FILES.len())].to_string(),
@@ -1134,18 +1175,22 @@ fn run(w: &mut World, seed: u64, tally: &mut Tally) -> Result<(), (usize, String
             Some(x) if k.rng.below(2) == 0 => x,
             _ => (FILES[k.rng.below(FILES.len())], k.rng.below(HOT_SLOTS)),
         };
+        // Only a client not blocked in a waiting call makes one.
         let mut clients: Vec<Client> = k.mains.iter().cloned().map(Client::Main).collect();
         clients.extend(live_clients(w).into_iter().map(Client::Fork));
+        clients.retain(|c| !blocked(w, c));
         let open: Vec<_> = w
             .handles()
-            .filter(|h| !h.waiting && h.kind == Kind::Write)
+            .filter(|h| !h.waiting && h.kind == Kind::Write && !blocked(w, &h.client))
             .map(|h| h.id)
             .collect();
         let e = |e| (step, e);
         match k.rng.below(34) {
             0..=2 => {
                 let who = Client::Main(k.mains[k.rng.below(k.mains.len())].clone());
-                if let Some(p) = w.client_path(&who, f) {
+                if !blocked(w, &who)
+                    && let Some(p) = w.client_path(&who, f)
+                {
                     k.save(w, &who, &p, slot, tally).map_err(e)?;
                 }
             }
@@ -1165,7 +1210,7 @@ fn run(w: &mut World, seed: u64, tally: &mut Tally) -> Result<(), (usize, String
                 }
             }
             4..=6 => {
-                if let Some(c) = k.rng.pick(&live_clients(w)).map(Client::Fork)
+                if let Some(c) = k.rng.pick(&free_clients(w)).map(Client::Fork)
                     && let Some(p) = w.client_path(&c, f)
                 {
                     k.save(w, &c, &p, slot, tally).map_err(e)?;
@@ -1173,7 +1218,7 @@ fn run(w: &mut World, seed: u64, tally: &mut Tally) -> Result<(), (usize, String
                 }
             }
             7 => {
-                if let Some(f) = k.rng.pick(&live_clients(w)) {
+                if let Some(f) = k.rng.pick(&free_clients(w)) {
                     let _ = w.begin(f);
                     k.o.reload(w);
                 }
@@ -1182,6 +1227,7 @@ fn run(w: &mut World, seed: u64, tally: &mut Tally) -> Result<(), (usize, String
                 // Mostly commit a transaction that staged something, so
                 // commits meet concurrent lines.
                 if let Some(f) = k.rng.pick(&in_txn(w))
+                    && !blocked(w, &Client::Fork(f))
                     && (w.forks[&f]
                         .txn
                         .as_ref()
@@ -1195,6 +1241,7 @@ fn run(w: &mut World, seed: u64, tally: &mut Tally) -> Result<(), (usize, String
             }
             9 => {
                 if let Some(f) = k.rng.pick(&in_txn(w))
+                    && !blocked(w, &Client::Fork(f))
                     && k.rng.below(2) == 0
                 {
                     rollback_checked(w, &mut k.o, f).map_err(e)?;
@@ -1318,6 +1365,8 @@ fn run(w: &mut World, seed: u64, tally: &mut Tally) -> Result<(), (usize, String
     tally.inserts_met += w.inserts_met;
     tally.unlinked_edits += w.unlinked_edits;
     tally.orphans += w.orphans.len();
+    tally.behind += w.behind_count;
+    tally.jumped += w.jumped_count;
     if gitledger::takes() != w.landings.len() {
         return Err((
             STEPS + 1,
@@ -1389,6 +1438,13 @@ fn run_all(policies: Policies) {
         );
         // Atomic saves, and old writers whose calls an atomic save, an
         // unlink or a rename-over orphaned (git-model.md §7).
+        // P1 and P3 met: an entry went ahead of a waiting one, and a call
+        // waited behind a waiting take.
+        assert!(
+            tally.overtakes > 0 && tally.behind > 0,
+            "progress rules not met in {} seeds: {tally:?}",
+            seeds().len()
+        );
         assert!(
             tally.atomic_saves > 0 && tally.orphans > 0 && tally.crashes_during_close > 0,
             "no atomic save, no orphan, or no crash during a close, in {} seeds: {tally:?}",

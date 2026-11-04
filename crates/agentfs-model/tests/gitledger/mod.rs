@@ -35,7 +35,9 @@ struct Ledger {
     collisions: BTreeSet<String>,
     meta: BTreeMap<String, Meta>,
     queues: BTreeMap<Tree, Vec<Q>>,
-    cursor: BTreeMap<Tree, usize>,
+    /// The queue entries (by index) each tree's takes have taken: P1 lets
+    /// a landing go ahead of an earlier waiting entry.
+    done: BTreeMap<Tree, BTreeSet<usize>>,
     at_next: BTreeMap<Tree, usize>,
     landings_seen: usize,
     takes: usize,
@@ -283,34 +285,76 @@ pub fn observe(w: &World) -> Result<(), String> {
                     (vec![head.clone()], if lost { vec![] } else { vec![head] })
                 }
                 Direction::Landing => {
-                    // The harness's queue: the first entries not yet taken.
+                    // The harness's queue: the entries not yet taken that
+                    // were queued when the take began. Which one the take
+                    // began with is read from git: the commit a full-lineage
+                    // landing names, or a squash's first winner or loser.
                     let q = l.queues.get(&x).cloned().unwrap_or_default();
-                    let mut i = *l.cursor.get(&x).unwrap_or(&0);
-                    while i < q.len() && q[i] == Q::Sync {
-                        i += 1;
-                    }
-                    let Some(Q::Landing { from, commit }) = q.get(i).cloned() else {
-                        return Err(format!("ledger: a landing into {x:?} with nothing queued"));
+                    let limit = (*l.at_next.get(&x).unwrap_or(&q.len())).min(q.len());
+                    let done = l.done.get(&x).cloned().unwrap_or_default();
+                    let open: Vec<usize> = (0..limit)
+                        .filter(|i| !done.contains(i) && matches!(q[*i], Q::Landing { .. }))
+                        .collect();
+                    let known: BTreeSet<String> = if squashed {
+                        let mut k: BTreeSet<String> = l.lineage(&r)[1..].iter().cloned().collect();
+                        k.extend(losers.iter().cloned());
+                        k
+                    } else if before.is_none() {
+                        BTreeSet::from([r.clone()])
+                    } else {
+                        l.meta(&r).stored.get(1).cloned().into_iter().collect()
                     };
+                    // A take of no change (a nested squash whose saves all
+                    // lost, so no graft): the first entry that brings none.
+                    let mut start = None;
+                    for i in &open {
+                        if let Q::Landing { commit, .. } = &q[*i] {
+                            let units = l.expand(w, commit);
+                            if units.iter().any(|u| known.contains(u))
+                                || (units.is_empty() && known.is_empty())
+                            {
+                                start = Some(*i);
+                                break;
+                            }
+                        }
+                    }
+                    let Some(i) = start else {
+                        return Err(format!("ledger: a landing into {x:?} ({r:.7}) of nothing queued"));
+                    };
+                    let Some(Q::Landing { from, commit }) = q.get(i).cloned() else {
+                        unreachable!("a landing entry");
+                    };
+                    // One sandbox's entries keep their order (P1).
+                    if let Some(j) = open
+                        .iter()
+                        .find(|j| **j < i && matches!(&q[**j], Q::Landing { from: g, .. } if *g == from))
+                    {
+                        return Err(format!(
+                            "ledger: {x:?} took {commit:.7} of f{from} ahead of its earlier entry {j}"
+                        ));
+                    }
                     let mut slice = vec![commit.clone()];
-                    let limit = *l.at_next.get(&x).unwrap_or(&q.len());
-                    let mut j = i + 1;
+                    let mut taken = vec![i];
                     let plain = |l: &mut Ledger, c: &str| {
                         let m = l.meta(c);
                         m.cause == "Direct"
                     };
                     if squashed && plain(l, &commit) {
-                        while j < limit {
+                        for j in open.iter().copied().filter(|j| *j > i) {
                             match &q[j] {
-                                Q::Landing { from: g, commit: c } if *g == from && plain(l, c) => {
+                                Q::Landing { from: g, commit: c }
+                                    if *g == from
+                                        && plain(l, c)
+                                        && l.expand(w, c).iter().all(|u| known.contains(u)) =>
+                                {
                                     slice.push(c.clone());
-                                    j += 1;
+                                    taken.push(j);
                                 }
                                 _ => break,
                             }
                         }
                     }
-                    l.cursor.insert(x, j);
+                    l.done.entry(x).or_default().extend(taken);
                     let expect: Vec<String> = slice.iter().flat_map(|c| l.expand(w, c)).collect();
                     let units = expect.clone();
                     let winners: Vec<String> = if squashed {
