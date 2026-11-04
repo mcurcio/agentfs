@@ -337,7 +337,10 @@ fast-forwards to) says exactly what the fork has, so the next sync starts from t
 parent's head" still means "nothing to do". A choice in it: a commit *touches* an open file when delivering it
 would overwrite that file in the fork (the sync's own write, so the fork's own save come back from the parent, which
 leaves the file as the fork has it, touches nothing), and the collision notes on the commits held back are not
-delivered either (a decision on one of them reaches the fork with it). The held-back part waits as the sync's
+delivered either (a decision on one of them reaches the fork with it). Causal order holds for decisions from
+further up too: a collision note of the grandparent's (main's, on a nested sandbox's line) is not read while the
+only commit of the parent reaching its losing change is held back, since the parent's landing that carried the
+line up has not reached the fork yet. The held-back part waits as the sync's
 queue entry, for the files that first held commit adds to its write.
 
 **No P3, and the alarm.** A waiting take is woken once none of its files is open for writing; a new write-open of
@@ -465,7 +468,7 @@ it with the content, the parent winning:
 | the sandbox unlinks; the parent changed a line the unlinker never saw | the unlink loses whole: the file stays, with the parent's line | `r11_an_unlink_against_*` |
 | the parent unlinked; the sandbox edits the file | all its changes to the file lose; it stays unlinked | same; every random run (`placed_and_unlinked`) |
 | a rename against a content edit | both apply: the edit follows the file to its new path | `r11_a_rename_and_*` |
-| two renames of one file; two files to one path | the parent's name wins; the sandbox's file keeps its old name. Until the parent decides, a sync keeps the sandbox's own name and shows the parent's file under the name it has in the sandbox, so no tree shows two files at one path (a choice, MODEL.md finding 11) | `r11_concurrent_renames_*`, `r11_two_renames_to_one_path_*` |
+| two renames of one file; two files to one path | the parent's name wins; the sandbox's file keeps its old name. Until the parent decides, a sync keeps the sandbox's own name and shows the parent's file under the name it has in the sandbox, so no tree shows two files at one path (a choice, MODEL.md finding 11); on a chain (the parent gave that previous name to a third file) the same rule again, until no two clash | `r11_concurrent_renames_*`, `r11_two_renames_to_one_path_*`, `r11_a_chain_of_renames_*` |
 | a rename-over (both files existing in the parent) whose replaced file the parent changed, or whose rename loses | one call, so one save holding both name lines: it loses whole by rule 3e, no rule of its own; the path its unlink would free is no claim against its rename, which loses with the change (MODEL.md finding 25) | `r11_a_rename_over_applies_or_loses_whole`, `r11_a_rename_over_whose_rename_loses_keeps_the_replaced_file` |
 
 **The atomic-save idiom** (a choice; modelled, MODEL.md rule 11). A program writes a new file and renames it over

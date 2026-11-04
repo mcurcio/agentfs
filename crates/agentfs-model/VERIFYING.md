@@ -194,7 +194,10 @@ A planted bug is one deliberate mistake in a copy of the model. It shows which t
    writing, or whose first save waits with followers. From the owner's decisions of 2026-11-04: P3 reintroduced (a
    new write-open waits behind a waiting take); a sync that delivers the parent's head whatever is open (past an open
    file); a sync that never delivers a prefix (it waits whole); no alarm on an open that keeps a take waiting; and
-   each fix of findings 11, 25 and 26 reverted.
+   each fix of findings 11, 25 and 26 reverted. From the review of `d552b3d`: a prefix sync that reads main's
+   decision on a line whose carrying landing it holds back; one that reads the notes of the commits it holds
+   back; no alarm on an open granted at once. (No alarm can be due on an open granted at a take's release: the
+   model asserts it, `World::grant`, so the review's planted bug there changed no behaviour.)
 3. Run `cargo test --locked -p agentfs-model --no-fail-fast` in the copy (and 500 seeds for a bug the
    scenarios miss), with a separate target directory per copy: in the container, mount the copy as `/src`
    and a volume of its own as `/target` (`-v agentfs-target-m1:/target`).

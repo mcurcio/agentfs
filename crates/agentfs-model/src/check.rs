@@ -479,20 +479,29 @@ fn moves<'a>(w: &'a World, now: &'a Views) -> Vec<(Tree, &'a str, &'a str, &'a L
 /// A collision in `trees` names `token`, or a later version written over
 /// it, as lost on line `line` of file `path`.
 fn lost_in(w: &World, trees: &[Tree], path: &str, line: &str, token: &str) -> bool {
-    w.collisions.iter().any(|c| {
-        trees.contains(&c.tree)
-            && c.path == path
-            && c.lines
-                .iter()
-                .zip(&c.lost)
-                .any(|(l, x)| l == line && w.lineage.descends(x, token))
-    })
+    w.collisions
+        .iter()
+        .any(|c| trees.contains(&c.tree) && names_lost(w, c, path, line, token))
 }
 
-/// [`lost_in`] `t` or a tree upstream of it: a loss decided upstream
-/// reaches `t` as a plain update.
+/// Collision `c` names `token`, or a later version written over it, as
+/// lost on line `line` of file `path`.
+fn names_lost(w: &World, c: &Collision, path: &str, line: &str, token: &str) -> bool {
+    c.path == path
+        && c.lines
+            .iter()
+            .zip(&c.lost)
+            .any(|(l, x)| l == line && w.lineage.descends(x, token))
+}
+
+/// [`lost_in`] `t` or a tree upstream of it, by a decision that has
+/// reached `t` ([`delivered`]): a loss decided upstream reaches `t` as a
+/// plain update, never before the commit that carries it.
 fn flagged(w: &World, t: Tree, path: &str, line: &str, token: &str) -> bool {
-    lost_in(w, &w.upstream(t), path, line, token)
+    let trees = w.upstream(t);
+    w.collisions.iter().any(|c| {
+        trees.contains(&c.tree) && delivered(w, t, c) && names_lost(w, c, path, line, token)
+    })
 }
 
 /// Neither version was written over the other.
@@ -525,6 +534,7 @@ fn decided_against(w: &World, t: Tree, path: &str, line: &str, token: &str) -> b
     let trees = w.upstream(t);
     w.collisions.iter().any(|c| {
         trees.contains(&c.tree)
+            && delivered(w, t, c)
             && c.path == path
             && c.lines
                 .iter()
@@ -538,6 +548,44 @@ fn decided_against(w: &World, t: Tree, path: &str, line: &str, token: &str) -> b
                         }
                 })
     })
+}
+
+/// Whether collision `c`, decided in `t` or a tree upstream of it, has
+/// reached `t` (causal order, P2), read from git. The commit that carries
+/// it to `t` is the parent's: for a decision of the parent, its result; for
+/// one further up, the parent's commit that carried the losing change up,
+/// which the parent's head reaches (even `t`'s own commit counts only once
+/// the parent's commit carrying it is delivered). It has reached `t` unless
+/// the parent's head reaches that commit and no parent's commit a sync
+/// delivered into `t` (the sync's second parent, or the commit it
+/// fast-forwarded to) does, nor, for a result, `t`'s head. A commit the
+/// parent's head no longer reaches (under `Squashed`, a fast-forward to
+/// main's graft drops the parent's own commits) was delivered before it, or
+/// is decided by notes read from main. So a prefix sync that holds back
+/// the parent's landing that carried a line upstream has not delivered
+/// main's decision against that line, nor a held-back commit's own.
+fn delivered(w: &World, t: Tree, c: &Collision) -> bool {
+    let Some(parent) = w.upstream(t).get(1).copied() else {
+        return true;
+    };
+    if c.tree == t {
+        return true;
+    }
+    let up = w.head(parent);
+    let synced = |x: &str| {
+        w.syncs
+            .iter()
+            .any(|(s, at, _, _)| *s == t && w.is_ancestor(x, at))
+    };
+    let carrier = if c.tree == parent {
+        &c.result
+    } else {
+        &c.loser
+    };
+    !w.is_ancestor(carrier, &up)
+        || synced(carrier)
+        || synced(&c.result)
+        || w.is_ancestor(&c.result, &w.head(t))
 }
 
 /// Main never silently loses a change, nor does any tree, and no stale
@@ -1068,18 +1116,43 @@ fn syncs_deliver(w: &mut World) -> Result<(), String> {
             takes.peek().is_some() && takes.all(|l| !w.is_ancestor(&l.result, up))
         };
         let decided = |id: &str| is_root(id) || took.contains(id);
+        // Finding 11: the parent gave file `p` a path that the fork's own
+        // undecided name of another file holds there, or (a chain) a file
+        // shown under its previous name by this same exception holds
+        // there; the fork keeps showing `p` under the name it had (the one
+        // exception). Grown from the undecided names, so no cycle of
+        // files excuses itself.
+        let mut kept: BTreeSet<&str> = PATHS
+            .iter()
+            .copied()
+            .filter(|q| {
+                let id = &w.file(result, q).name.id;
+                !decided(id) || held_back(id)
+            })
+            .collect();
+        loop {
+            let more: Vec<&str> = PATHS
+                .iter()
+                .copied()
+                .filter(|p| !kept.contains(p))
+                .filter(|p| {
+                    w.file(up, p).path().is_some_and(|path| {
+                        kept.iter()
+                            .any(|q| q != p && w.file(result, q).path() == Some(path))
+                    })
+                })
+                .collect();
+            if more.is_empty() {
+                break;
+            }
+            kept.extend(more);
+        }
         for p in PATHS {
             let (u, r) = (w.file(up, p), w.file(result, p));
-            // Finding 11: the parent gave file `p` a path that the fork's
-            // own undecided name of another file holds there; the fork
-            // keeps showing `p` under the name it had (the one exception).
             let clash = u.path().is_some_and(|path| {
-                PATHS.iter().any(|q| {
-                    let rq = w.file(result, q);
-                    *q != p
-                        && rq.path() == Some(path)
-                        && (!decided(&rq.name.id) || held_back(&rq.name.id))
-                })
+                PATHS
+                    .iter()
+                    .any(|q| *q != p && kept.contains(q) && w.file(result, q).path() == Some(path))
             });
             for x in r.records() {
                 let theirs = u.member(&x.line);

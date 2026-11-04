@@ -1605,7 +1605,11 @@ impl World {
     /// branch is in queue order, so a commit a decided change reaches was
     /// queued before it and is decided too.
     /// A prefix sync (P2) delivers no decision of a commit it holds back
-    /// (`held_back`): a note on one of them is not read.
+    /// (`held_back`): a note on one of them is not read, nor a note from a
+    /// tree further up whose losing change only a held-back commit reaches
+    /// (the parent's commit that carried it upstream is held back, so that
+    /// decision is not delivered yet: causal order, a decision never
+    /// arrives before the change it decided).
     fn decided(
         &self,
         parent: Tree,
@@ -1617,7 +1621,11 @@ impl World {
         let trees: Vec<String> = self.upstream(parent).into_iter().map(Self::name).collect();
         self.is_ancestor(c, up)
             || self.noted_on(known).iter().any(|(on, x)| {
-                !held_back.contains(on) && trees.contains(&x.tree) && self.is_ancestor(c, &x.loser)
+                !held_back.contains(on)
+                    && trees.contains(&x.tree)
+                    && self.is_ancestor(c, &x.loser)
+                    && (self.is_ancestor(&x.loser, up)
+                        || !held_back.iter().any(|h| self.is_ancestor(&x.loser, h)))
             })
     }
 
@@ -1704,33 +1712,35 @@ impl World {
     /// to another file (a rename, a rename-over, a create), the fork shows
     /// the parent's file under the name it has in the fork (its previous
     /// name; none, so not shown, for a file the fork has never had) until
-    /// the parent's queue decides the fork's rename. `files`: the sync's
-    /// changed files, by identity, over `up`.
+    /// the parent's queue decides the fork's rename. A chain (the parent
+    /// then gave that previous name to a third file) is the same rule
+    /// again: each file whose parent's name clashes with a name the sync
+    /// shows is shown under its fork's name, until no two clash; the fork's
+    /// own tree has no clash, so this ends. `files`: the sync's changed
+    /// files, by identity, over `up`.
     fn keep_own_names(&self, ours: &str, up: &str, files: &mut BTreeMap<String, Content>) {
         let now = |files: &BTreeMap<String, Content>, f: &str| {
             files.get(f).cloned().unwrap_or_else(|| self.file(up, f))
         };
-        // The fork's own undecided names: kept from `ours`, not the parent's.
-        let own: BTreeSet<String> = files
-            .iter()
-            .filter(|(f, c)| {
-                c.name.live()
-                    && c.name.id == self.file(ours, f).name.id
-                    && c.name.id != self.file(up, f).name.id
-            })
-            .filter_map(|(_, c)| c.path().map(str::to_string))
-            .collect();
-        for f in PATHS {
-            let c = now(files, f);
-            let Some(p) = c.path() else {
-                continue;
-            };
-            let mine = self.file(ours, f);
-            if own.contains(p) && c.name.id != mine.name.id {
-                let mut c = c.clone();
-                c.name = mine.name.clone();
-                files.insert(f.to_string(), c);
+        loop {
+            let mut at: BTreeMap<String, Vec<&str>> = BTreeMap::new();
+            for f in PATHS {
+                if let Some(p) = now(files, f).path() {
+                    at.entry(p.to_string()).or_default().push(f);
+                }
             }
+            // A file in a clash showing a name other than its fork's.
+            let back = at
+                .values()
+                .filter(|v| v.len() > 1)
+                .flatten()
+                .find(|f| now(files, f).name.id != self.file(ours, f).name.id);
+            let Some(f) = back.map(|f| f.to_string()) else {
+                return;
+            };
+            let mut c = now(files, &f);
+            c.name = self.file(ours, &f).name.clone();
+            files.insert(f, c);
         }
     }
 
@@ -2037,9 +2047,10 @@ impl World {
     }
 
     /// The alarm on a long wait (a choice, the owner's decision of
-    /// 2026-11-04): a call granted on a file a waiting entry of `t` waits
+    /// 2026-11-04): an open granted on a file a waiting entry of `t` waits
     /// for keeps that entry waiting, so it raises a [`Delayed`] event per
-    /// such entry. Raised by the call, never by a timer.
+    /// such entry. Raised by the open, never by a timer; only an open
+    /// granted at once can be due one ([`World::grant`] shows why).
     fn delay(&mut self, t: Tree, h: &Handle) {
         let hit: Vec<(u64, String)> = self
             .waits
@@ -2693,8 +2704,21 @@ impl World {
             x.waiting = false;
             self.note(format!("grant h{h}"));
             let x = self.handles[&h].clone();
+            // No alarm can be due here (review of `d552b3d`, P1-3): P1 lets a
+            // take go only when no earlier waiting entry shares a file with
+            // it, no entry starts waiting while a take holds the tree, and a
+            // prefix sync's rest waits only for files its delivered prefix
+            // does not write; so no waiting entry waits for a file a
+            // release grants. The model stops loudly if one would.
             if let Target::Tree(t) = x.target {
-                self.delay(t, &x);
+                assert!(
+                    self.waits
+                        .get(&t)
+                        .into_iter()
+                        .flatten()
+                        .all(|(_, w)| { x.files().iter().all(|f| !w.until.contains(f)) }),
+                    "h{h}, granted at a release in {t:?}, is a file a waiting entry waits for"
+                );
             }
         } else {
             let call = self.handles.remove(&h).expect("a waiting call");
@@ -3143,9 +3167,10 @@ impl World {
     /// ([`World::scan`]) into `t` and the files it locks there (a landing:
     /// every file its changes touch, [`World::touched`]). If a client of `t`
     /// has one of them open for writing, the entry waits for those to close
-    /// (`waits`), nothing is taken, and from now on a new call on one of
-    /// its files waits behind it (P3); else it leaves the queue and holds
-    /// its files. A squash carries only the saves directly behind its first
+    /// (`waits`) and nothing is taken; a new open of one of its files is
+    /// granted and raises an alarm ([`Delayed`]: no call waits on a waiting
+    /// take, the owner's decision of 2026-11-04); else it leaves the queue
+    /// and holds its files. A squash carries only the saves directly behind its first
     /// that share no file with an entry ahead of it that waits and touch no
     /// file open for writing in `t`; a first that must wait waits alone.
     fn acquire(&mut self, t: Tree) -> usize {

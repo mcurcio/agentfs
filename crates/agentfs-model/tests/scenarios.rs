@@ -2880,7 +2880,7 @@ fn r3_a_dropped_agreeing_delete_follows_the_delete_it_agreed_with() {
     }
 }
 
-// ── rule 9, progress (git-model.md §6: P1 and P3) ───────────────────────
+// ── rule 9, progress (git-model.md §6: P1 and P2; P3 deleted) ───────────
 
 /// Rule 9 with P1: a main writer holding a file open for long holds back
 /// only the landings that touch that file. An unrelated sandbox's change
@@ -3215,6 +3215,125 @@ fn r9_a_sync_delivers_up_to_the_first_change_to_an_open_file() {
         let a = w.read(t, "a");
         assert!(a.contains(&ma) && a.contains(&x), "{history:?}");
         assert!(has(&w, t, "c", &mc));
+    }
+}
+
+/// Finding 11's rule on a chain (review of 2026-11-04): the sandbox renames
+/// `b` to `h`; main renames `c` to `h`, then `d` to `c`. The sync keeps the
+/// sandbox's `h`, shows main's c-file under its previous name `c`, and so
+/// main's d-file, now named `c` in main, under its previous name `d`:
+/// never two files at one path. Main's queue then decides and the sandbox
+/// shows main's names.
+#[test]
+fn r11_a_chain_of_renames_to_one_path_keeps_every_previous_name() {
+    for history in BOTH {
+        let mut w = world(history);
+        let f = w.create_fork(Tree::Main);
+        let t = Tree::Fork(f);
+        w.rename(&Client::Fork(f), "b", "h");
+        w.rename(&m1(), "c", "h");
+        w.rename(&m1(), "d", "c");
+        next(&mut w, t);
+        let names = |w: &World, t| (w.path_of(t, "b"), w.path_of(t, "c"), w.path_of(t, "d"));
+        assert_eq!(
+            names(&w, t),
+            (Some("h".into()), Some("c".into()), Some("d".into())),
+            "{history:?}: its own name, main's files under their previous names"
+        );
+        drain(&mut w);
+        for t in [Tree::Main, t] {
+            assert_eq!(
+                names(&w, t),
+                (Some("b".into()), Some("h".into()), Some("c".into())),
+                "{history:?} {t:?}"
+            );
+        }
+    }
+}
+
+/// P2, causal order (review of 2026-11-04, P0-1): a prefix sync delivers no
+/// upstream decision before the commit that carries it. G is a sandbox in
+/// P and keeps `b` open; G's x and main's m both write over line 0 of `a`.
+/// P saves `c`, then `b`, then takes G's x; main takes P's three commits
+/// and x loses to m. G's sync of P delivers only `c` (P's `b` is open in G)
+/// and holds back the landing that carried x up, so main's decision
+/// against x is not delivered yet: G keeps x, never the version both were
+/// written over. Then `b` closes and G shows m.
+#[test]
+fn r9_a_prefix_sync_delivers_no_upstream_decision_before_its_commit() {
+    for history in BOTH {
+        let mut w = world(history);
+        let p = w.create_fork(Tree::Main);
+        let g = w.create_fork(Tree::Fork(p));
+        let (tp, tg) = (Tree::Fork(p), Tree::Fork(g));
+        let hb = w.open_write(&Client::Fork(g), "b");
+        let x = w.save(&Client::Fork(g), "a", 0);
+        let m = w.save(&m1(), "a", 0);
+        w.save(&Client::Fork(p), "c", 0);
+        w.save(&Client::Fork(p), "b", 0);
+        while !has(&w, tp, "a", &x) {
+            assert!(
+                w.pending().contains(&Step::Next(tp)),
+                "{history:?}: P can take"
+            );
+            next(&mut w, tp);
+        }
+        while w.pending().contains(&Step::Next(Tree::Main)) {
+            next(&mut w, Tree::Main);
+        }
+        assert!(has(&w, Tree::Main, "a", &m) && !has(&w, Tree::Main, "a", &x));
+        take(&mut w, &Step::Next(tg));
+        if w.holds().contains_key(&tg) {
+            take(&mut w, &Step::Finish(tg));
+        }
+        assert!(w.prefix_syncs > 0, "{history:?}: a prefix sync");
+        assert!(
+            has(&w, tg, "a", &x),
+            "{history:?}: G keeps x until the decision arrives"
+        );
+        w.close(hb);
+        drain(&mut w);
+        assert!(has(&w, tg, "a", &m), "{history:?}");
+    }
+}
+
+/// P2, a held-back commit's collision notes are held back with it (review
+/// of 2026-11-04, P1-2): G is a sandbox in P and keeps `b` open; G's x and
+/// P's p both write over line 0 of `a`. P then saves `c` and `b`, and takes
+/// G's x, which loses to p. G's sync of P delivers p and `c` and holds back
+/// `b` and the landing: that landing's decision against x is not delivered,
+/// so G keeps x over p. Then `b` closes and G shows p.
+#[test]
+fn r9_a_prefix_sync_holds_back_the_notes_of_the_commits_it_holds_back() {
+    for history in BOTH {
+        let mut w = world(history);
+        let p = w.create_fork(Tree::Main);
+        let g = w.create_fork(Tree::Fork(p));
+        let (tp, tg) = (Tree::Fork(p), Tree::Fork(g));
+        let hb = w.open_write(&Client::Fork(g), "b");
+        let x = w.save(&Client::Fork(g), "a", 0);
+        let pa = w.save(&Client::Fork(p), "a", 0);
+        w.save(&Client::Fork(p), "c", 0);
+        w.save(&Client::Fork(p), "b", 0);
+        while w.pending().contains(&Step::Next(tp)) {
+            next(&mut w, tp);
+        }
+        assert!(
+            has(&w, tp, "a", &pa) && !has(&w, tp, "a", &x),
+            "{history:?}: x lost in P"
+        );
+        take(&mut w, &Step::Next(tg));
+        if w.holds().contains_key(&tg) {
+            take(&mut w, &Step::Finish(tg));
+        }
+        assert!(w.prefix_syncs > 0, "{history:?}: a prefix sync");
+        assert!(
+            has(&w, tg, "a", &x),
+            "{history:?}: G keeps x until the decision arrives"
+        );
+        w.close(hb);
+        drain(&mut w);
+        assert!(has(&w, tg, "a", &pa), "{history:?}");
     }
 }
 
