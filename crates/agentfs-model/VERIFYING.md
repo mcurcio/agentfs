@@ -101,14 +101,13 @@ the expected failure.
 |---|---|---|
 | `finding_1_git_merge_base_on_crossing_merges` | 1 | a sync leaves a line "which Main already took" |
 | `random_interleavings_git_merge_base` | 1 | 39 of 64 seeds: mostly a sync that leaves a line "which Main already took" or drops a line; in 3 of them a "harness panic: a model file in git", when git's merge leaves one line identity twice |
-| `finding_3_per_file_keeps_clean_lines` | 3 | a "stale revert" in the fork |
-| `random_interleavings_per_file_full_lineage` | 3 | 2 of 64 seeds, a "stale revert" |
 | `finding_6_git_hunks_on_neighbouring_lines` | 6 | a sync leaves a line "which Main already took" |
 
 These were the results at seeds 1..64 on 2026-11-03; a change that moves a count says so in its pull
-request.
+request. Finding 3's two tests went with the per-file setting when the owner chose whole changes (rule 3e).
 
-CI runs `cargo test --workspace` (so the scenarios and seeds 1..64), fmt, clippy with `-D warnings`, and the
+CI runs `cargo test --workspace` (so the scenarios and seeds 1..64; `random_interleavings_history_settings_decide_the_same`
+runs each seed eight times, so it takes seeds 1..16 unless a seed variable is set), fmt, clippy with `-D warnings`, and the
 mdBook build. It does not run 500 seeds, the ignored tests or planted bugs: those stay local, and a design pull
 request says in its body that they were run and what they showed.
 
@@ -136,7 +135,7 @@ request says in its body that they were run and what they showed.
    `#[ignore = "coherence finding N: <what fails>"]`, and add finding N to MODEL.md. Do not loosen an
    invariant, add an excuse to it, or narrow the random runs so the suite passes. A rejected alternative keeps
    its ignored test as the evidence for rejecting it. When it is a policy setting in `Policies`, the test
-   lands with it (findings 1, 3 and 6: `MergeRule::GitMergeBase`, `CollisionScope::File`). When it replaces
+   lands with it (findings 1 and 6: `MergeRule::GitMergeBase`). When it replaces
    the model's code, its tests cannot land without that code: push it as a branch that is never merged,
    and name the branch and commit in its finding (finding 13 does this).
 6. **Docs follow the model.** In the same pull request, update MODEL.md (rules, invariants, findings, costs)
@@ -171,7 +170,10 @@ A planted bug is one deliberate mistake in a copy of the model. It shows which t
 2. Plant exactly one bug per copy, in the code a rule depends on. Bugs that have proved useful: a sync that
    decides a collision itself; the sandbox winning instead of the parent; dropping a flag a later step reads;
    skipping a lock release when a client dies; an append that ignores where the file ends; skipping the ref
-   that keeps a losing commit reachable.
+   that keeps a losing commit reachable; applying the lines of a losing save that did not collide; letting a
+   transaction's clean lines apply when one of its lines lost; naming a losing save in a squash's graft; judging
+   a squashed take as one change; a sync that reads only lineage, not the parent's collision refs; a squash that
+   takes a save from behind another entry of the queue; a file-rule loss that does not cost its whole change.
 3. Run `cargo test --locked -p agentfs-model --no-fail-fast` in the copy (and 500 seeds for a bug the
    scenarios miss), with a separate target directory per copy: in the container, mount the copy as `/src`
    and a volume of its own as `/target` (`-v agentfs-target-m1:/target`).

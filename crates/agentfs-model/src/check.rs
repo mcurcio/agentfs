@@ -9,8 +9,8 @@ use std::path::Path;
 use crate::content::{Content, Line, PATHS, State, is_root, writer_of};
 use crate::git::{git, try_git};
 use crate::world::{
-    Client, Collision, CollisionScope, Direction, Entry, ForkId, HistoryPolicy, Kind, Life, Step,
-    Take, Target, Tree, TxnEnd, TxnId, TxnOutcome, World, commit_parents, origin_in,
+    By, Client, Collision, Direction, Entry, ForkId, HistoryPolicy, Kind, Landed, Life, Step, Take,
+    Target, Tree, TxnEnd, TxnId, TxnOutcome, World, commit_parents, origin_in,
 };
 
 /// Every invariant that holds after any step.
@@ -21,6 +21,7 @@ pub fn check(w: &mut World) -> Result<(), String> {
     w.views = now;
     locks(w)?;
     parent_wins(w)?;
+    changes_whole(w)?;
     syncs_deliver(w)?;
     transactions_end_as_told(w)?;
     let discards = w.grepped.0 != w.discarded.len();
@@ -269,12 +270,32 @@ fn flagged(w: &World, t: Tree, path: &str, line: &str, token: &str) -> bool {
     lost_in(w, &w.upstream(t), path, line, token)
 }
 
-/// [`flagged`], by a collision in which the lost version and its winner
-/// really collided (neither was written over the other): that decision may
-/// replace the lost version with any version, the one it was written over
-/// included (an unlink that lost to a line it never saw gives the file
-/// back). A loss whose winner the lost version was written over (a clean
-/// line lost per file: coherence finding 3) is no such decision.
+/// Neither version was written over the other.
+fn concurrent(w: &World, a: &str, b: &str) -> bool {
+    !w.lineage.descends(a, b) && !w.lineage.descends(b, a)
+}
+
+/// The change collision `c` names really collided in that take: a
+/// same-line or file-rule record of it ([`By::Line`], [`By::File`]) has a
+/// lost version and a winner that are concurrent.
+fn really_collided(w: &World, c: &Collision) -> bool {
+    w.collisions.iter().any(|d| {
+        d.tree == c.tree
+            && d.result == c.result
+            && d.loser == c.loser
+            && d.by != By::Whole
+            && d.lost.iter().zip(&d.won).any(|(x, y)| concurrent(w, x, y))
+    })
+}
+
+/// [`flagged`], by a real decision: a collision in which the lost version
+/// and its winner really collided (neither was written over the other), or
+/// a version of a change that lost whole because another of its versions
+/// really collided (rule 3e, [`By::Whole`]). That decision may replace the
+/// lost version with any version, the one it was written over included (an
+/// unlink that lost to a line it never saw gives the file back; a line of a
+/// losing save goes back to the parent's). A version lost by no real
+/// collision of its change is no such decision.
 fn decided_against(w: &World, t: Tree, path: &str, line: &str, token: &str) -> bool {
     let trees = w.upstream(t);
     w.collisions.iter().any(|c| {
@@ -286,8 +307,10 @@ fn decided_against(w: &World, t: Tree, path: &str, line: &str, token: &str) -> b
                 .any(|(l, (x, won))| {
                     l == line
                         && w.lineage.descends(x, token)
-                        && !w.lineage.descends(x, won)
-                        && !w.lineage.descends(won, x)
+                        && match c.by {
+                            By::Whole => really_collided(w, c),
+                            By::Line | By::File => concurrent(w, x, won),
+                        }
                 })
     })
 }
@@ -370,23 +393,39 @@ fn holds(w: &World, at: &str, token: &str) -> bool {
     PATHS.iter().any(|p| w.file(at, p).holds(token))
 }
 
+/// The take a collision or change was decided in, from the model's record.
+fn take_of<'a>(w: &'a World, tree: Tree, result: &str) -> Option<&'a Landed> {
+    w.landings
+        .iter()
+        .find(|l| l.tree == tree && l.result == result)
+}
+
+/// Whether one of `take`'s changes that won set version `v` of file `p`.
+fn set_by_winner(w: &World, take: &Landed, p: &str, v: &str) -> bool {
+    take.units.iter().any(|(u, base)| {
+        take.winners.contains(u) && w.file(u, p).holds(v) && !w.file(base, p).holds(v)
+    })
+}
+
 /// The parent's version wins every collision, decided only at the
 /// parent's queue (a landing, or a transaction's commit into its fork:
 /// [`Direction`] has no other case, and `sync` records none), and only a
-/// real one: in each recorded collision the result keeps the tree's own
-/// version of every lost line (its whole file under `File`) and holds each
-/// version named in `won`, as the tree did before; the lost versions are
-/// the incoming commit's; each lost and winning pair is concurrent
-/// (neither was written over the other; for a loss decided by a file rule,
-/// at least one pair); the losing incoming commit stays reachable under
-/// the collision's ref; the result's stored parents are the tree's
-/// previous head and the incoming commit (a transaction, or a landing
-/// under `FullLineage`), or under `Squashed` the previous head alone, with
-/// the incoming commit as the graft's second parent. Where it was decided
-/// is read from git, not the model's record: the result is the deciding
-/// tree's own landing or transaction commit, and the losing commit was
-/// written below that tree (a fork under it, or the transaction of that
-/// fork).
+/// real one: in each recorded collision the result holds none of the lost
+/// versions and keeps the tree's own version of every lost line, as the
+/// tree had it before (or, in a squashed take, a version another save of
+/// that take set, which won), and holds each version named in `won`, as
+/// the tree did before; the lost versions are the losing change's; each
+/// lost and winning pair is concurrent (neither was written over the
+/// other; for a loss decided by a file rule, at least one pair; for a line
+/// lost only because its change lost whole, a real collision of that
+/// change: [`really_collided`]); the losing change stays reachable under
+/// the collision's ref; the result's stored parents are the tree's previous
+/// head and the losing change (a transaction, or a landing under
+/// `FullLineage`), or under `Squashed` the previous head alone, the losing
+/// save in no graft ([`changes_whole`]). Where it was decided is read from
+/// git, not the model's record: the result is the deciding tree's own
+/// landing or transaction commit, and the losing commit was written below
+/// that tree (a fork under it, or the transaction of that fork).
 fn parent_wins(w: &mut World) -> Result<(), String> {
     for c in &w.collisions[w.collisions_checked..] {
         if !decided_at_the_parents_queue(w, c) {
@@ -397,6 +436,7 @@ fn parent_wins(w: &mut World) -> Result<(), String> {
                 w.trailer(&c.loser, "Agentfs-Tree"),
             ));
         }
+        let take = take_of(w, c.tree, &c.result).ok_or_else(|| format!("{c:?}: no take"))?;
         let (r, win, lose) = (
             w.file(&c.result, &c.path),
             w.file(&c.winner, &c.path),
@@ -407,20 +447,20 @@ fn parent_wins(w: &mut World) -> Result<(), String> {
             && c.won
                 .iter()
                 .all(|t| holds(w, &c.result, t) && holds(w, &c.winner, t));
-        let ok = match w.policies.collision {
-            CollisionScope::Line => c.lines.iter().all(|l| r.member(l) == win.member(l)),
-            CollisionScope::File => r == win,
-        };
-        if !ok || !named || c.lines.is_empty() {
+        let kept = c.lines.iter().zip(&c.lost).all(|(l, x)| {
+            !r.holds(x)
+                && (r.member(l) == win.member(l)
+                    || r.member(l)
+                        .is_some_and(|v| set_by_winner(w, take, &c.path, &v.id)))
+        });
+        if !kept || !named || c.lines.is_empty() {
             return Err(format!("{c:?}: the parent's version did not win"));
         }
-        let concurrent =
-            |(l, x): (&String, &String)| !w.lineage.descends(l, x) && !w.lineage.descends(x, l);
         let mut pairs = c.lost.iter().zip(&c.won);
-        let real = if c.by_file {
-            pairs.any(concurrent)
-        } else {
-            pairs.all(concurrent)
+        let real = match c.by {
+            By::Line => pairs.all(|(x, y)| concurrent(w, x, y)),
+            By::File => pairs.any(|(x, y)| concurrent(w, x, y)),
+            By::Whole => really_collided(w, c),
         };
         if !real {
             return Err(format!(
@@ -434,24 +474,106 @@ fn parent_wins(w: &mut World) -> Result<(), String> {
         if at != c.loser {
             return Err(format!("{c:?}: its ref names {at}"));
         }
-        let (stored, lineage) = (
-            commit_parents(w.repo(), &c.result, true),
-            commit_parents(w.repo(), &c.result, false),
-        );
-        let both = [c.winner.clone(), c.loser.clone()];
+        let stored = commit_parents(w.repo(), &c.result, true);
         let ok = match (c.direction, w.policies.history) {
-            (Direction::Landing, HistoryPolicy::Squashed) => {
-                stored == [c.winner.clone()] && lineage == both
-            }
-            _ => stored == both,
+            (Direction::Landing, HistoryPolicy::Squashed) => stored == [c.winner.clone()],
+            _ => stored == [c.winner.clone(), c.loser.clone()],
         };
         if !ok {
-            return Err(format!(
-                "{c:?}: result's parents are {stored:?}, in lineage {lineage:?}"
-            ));
+            return Err(format!("{c:?}: result's parents are {stored:?}"));
         }
     }
     w.collisions_checked = w.collisions.len();
+    Ok(())
+}
+
+/// Rule 3e, read from git: no partial save or transaction ever reaches a
+/// parent. Each change a take judged (a save, a transaction's commit, a
+/// landing commit, or a transaction's branch at its commit) either lost,
+/// named by a collision of that take, or won, never both; the versions its
+/// own edit set (its diff from its base, read from git) are, for one that
+/// lost, none in the take's result (unless the tree held it before) and
+/// each named lost by that change's collisions (unless the tree before
+/// already held it, a version written over it, or a delete agreeing with
+/// it); for one that won, every one in the result, or a version written
+/// over it, or a delete agreeing with it. And a squashed commit holds only
+/// judged winners: under `Squashed` a landing's lineage parents are the
+/// tree's previous head and exactly the changes of the take that won, and
+/// every version the squash sets was set by one of them.
+fn changes_whole(w: &mut World) -> Result<(), String> {
+    for l in &w.landings[w.landings_checked..] {
+        for (u, base) in &l.units {
+            let lost = w
+                .collisions
+                .iter()
+                .any(|c| c.tree == l.tree && c.result == l.result && c.loser == *u);
+            if lost == l.winners.contains(u) {
+                return Err(format!(
+                    "{u:.7} into {:?}: judged lost {lost}, among the winners {}",
+                    l.tree, !lost
+                ));
+            }
+            for e in w.edits(base, u) {
+                let (r, b) = (w.file(&l.result, &e.path), w.file(&l.before, &e.path));
+                let ends = |v: &Line| w.lineage.descends(&v.id, &e.token) || (e.gone && !v.live());
+                if !lost {
+                    if !r.member(&e.line).is_some_and(ends) {
+                        return Err(format!(
+                            "{u:.7} won in {:?}, but its {} of {}[{}] is not in {:.7}: a partial change",
+                            l.tree, e.token, e.path, e.line, l.result
+                        ));
+                    }
+                    continue;
+                }
+                if r.holds(&e.token) && !b.holds(&e.token) {
+                    return Err(format!(
+                        "{u:.7} lost in {:?}, but its {} of {}[{}] reached {:.7}: a partial change",
+                        l.tree, e.token, e.path, e.line, l.result
+                    ));
+                }
+                let named = w.collisions.iter().any(|c| {
+                    c.tree == l.tree
+                        && c.result == l.result
+                        && c.loser == *u
+                        && c.path == e.path
+                        && c.lines
+                            .iter()
+                            .zip(&c.lost)
+                            .any(|(x, t)| *x == e.line && *t == e.token)
+                });
+                if !named && !b.member(&e.line).is_some_and(ends) {
+                    return Err(format!(
+                        "{u:.7} lost in {:?}, but no collision names its {} of {}[{}]",
+                        l.tree, e.token, e.path, e.line
+                    ));
+                }
+            }
+        }
+        if l.direction != Direction::Landing || w.policies.history != HistoryPolicy::Squashed {
+            continue;
+        }
+        let lineage = commit_parents(w.repo(), &l.result, false);
+        let mut expect = vec![l.before.clone()];
+        expect.extend(l.winners.iter().cloned());
+        if lineage != expect {
+            return Err(format!(
+                "Squashed: {:.7}'s lineage parents are {lineage:?}, not the take's head and winners {expect:?}",
+                l.result
+            ));
+        }
+        for e in w.edits(&l.before, &l.result) {
+            let by_winner = l.units.iter().any(|(u, base)| {
+                l.winners.contains(u) && w.edits(base, u).iter().any(|x| x.token == e.token)
+            });
+            if !by_winner {
+                return Err(format!(
+                    "Squashed: {:.7} sets {} of {}[{}], which no save that won set",
+                    l.result, e.token, e.path, e.line
+                ));
+            }
+        }
+    }
+    w.landings_checked = w.landings.len();
     Ok(())
 }
 
@@ -608,47 +730,59 @@ fn syncs_deliver(w: &mut World) -> Result<(), String> {
     Ok(())
 }
 
-/// Rule 5, as the program was told: a committed transaction's every
-/// staged edit is in the fork's commit that carries it (or overwritten by
-/// a later edit of its own, or a delete the fork's delete agrees with), or named in the commit's answer as
-/// overwritten, with a collision in the fork naming it and the fork's
-/// winning line in the commit; and the answer names every line the commit's
-/// collisions lost. A rolled-back one's every staged token is discarded
+/// Rule 5, as the program was told, whole (rule 3e): a committed
+/// transaction's every staged edit is in the fork's commit that carries it
+/// (or overwritten by a later edit of its own, or a delete the fork's
+/// delete agrees with), and no collision names that commit; a transaction
+/// that lost has none of its staged versions in that commit, a collision
+/// in the fork that really collided, and its every staged edit (unless a
+/// delete the fork's delete agrees with) named in the answer, with a
+/// collision in the fork naming it and the version named as kept in the
+/// commit; the answer names every line the commit's collisions lost. A
+/// rolled-back one's every staged token is discarded
 /// (`discarded_leave_no_trace` holds that); an empty one staged nothing.
 fn transactions_end_as_told(w: &mut World) -> Result<(), String> {
     for e in &w.ended[w.ended_checked..] {
         let fork = Tree::Fork(e.fork);
         let ok = match (&e.how, &e.result) {
-            (TxnEnd::Commit(TxnOutcome::Committed { overwritten }), Some(r)) => {
-                let told = overwritten.iter().all(|o| {
-                    lost_in(w, &[fork], &o.path, &o.line, &o.staged) && holds(w, r, &o.kept)
-                });
-                let all_told = w
-                    .collisions
-                    .iter()
-                    .filter(|c| c.result == *r)
-                    .map(|c| c.lost.len())
-                    .sum::<usize>()
-                    == overwritten.len();
+            (TxnEnd::Commit(TxnOutcome::Committed), Some(r)) => {
+                let none_lost = !w.collisions.iter().any(|c| c.result == *r);
                 let staged = e.staged.iter().all(|s| {
                     // A staged delete the fork's own delete agrees with.
                     let ends =
                         |v: &Line| w.lineage.descends(&v.id, &s.token) || (s.gone && !v.live());
-                    let applied = w.file(r, &s.path).member(&s.line).is_some_and(ends)
+                    w.file(r, &s.path).member(&s.line).is_some_and(ends)
                         && w.entered.iter().any(|(t, x)| {
                             *t == fork
                                 && x.path == s.path
                                 && x.line == s.line
                                 && w.lineage.descends(&x.token, &s.token)
-                        });
-                    applied
-                        || overwritten.iter().any(|o| {
-                            o.path == s.path
-                                && o.line == s.line
-                                && w.lineage.descends(&o.staged, &s.token)
                         })
                 });
-                told && all_told && staged
+                none_lost && staged
+            }
+            (TxnEnd::Commit(TxnOutcome::Lost { lines }), Some(r)) => {
+                let mine: Vec<&Collision> =
+                    w.collisions.iter().filter(|c| c.result == *r).collect();
+                let real = mine
+                    .iter()
+                    .any(|c| c.by != By::Whole && really_collided(w, c));
+                let told = lines.iter().all(|o| {
+                    lost_in(w, &[fork], &o.path, &o.line, &o.staged) && holds(w, r, &o.kept)
+                });
+                let all_told = mine.iter().map(|c| c.lost.len()).sum::<usize>() == lines.len();
+                let none_applied = e.staged.iter().all(|s| !w.file(r, &s.path).holds(&s.token));
+                let named = e.staged.iter().all(|s| {
+                    lines.iter().any(|o| {
+                        o.path == s.path
+                            && o.line == s.line
+                            && w.lineage.descends(&o.staged, &s.token)
+                    }) || (s.gone
+                        && w.file(r, &s.path)
+                            .member(&s.line)
+                            .is_some_and(|v| !v.live()))
+                });
+                real && told && all_told && none_applied && named
             }
             (TxnEnd::Commit(TxnOutcome::Empty), None) => e.staged.is_empty(),
             (TxnEnd::Rollback, None) => e.staged.iter().all(|s| w.discarded.contains(&s.token)),
@@ -919,30 +1053,35 @@ fn discarded_leave_no_trace(w: &mut World, all: &[String]) -> Result<(), String>
     }
 }
 
-/// Rule 7: a tree's lineage reaches every commit that landed in it; its
-/// stored history does too under `FullLineage`, and under `Squashed` none,
-/// main's holding only main's own commits. Read by ancestry alone (`git
+/// Rule 7: a tree's lineage reaches every change that won in it (and
+/// under `FullLineage` every change it took), or under `Squashed` a
+/// collision ref of a tree upstream keeps it; its stored history reaches
+/// every change it took under `FullLineage`, and under `Squashed` none,
+/// main's holding only main's own commits (a save that lost under
+/// `Squashed` is kept by its collision ref: [`parent_wins`]). Read by ancestry alone (`git
 /// rev-list <head>`, never a `from..to` range, whose walk stops early by
 /// commit date).
 fn history_setting(w: &mut World) -> Result<(), String> {
     let full = w.policies.history == HistoryPolicy::FullLineage;
     let repo = w.repo().to_path_buf();
-    let mut heads: Vec<String> = w
+    let landed: Vec<(Tree, String, bool)> = w
         .landings
         .iter()
-        .filter(|(t, _)| w.alive(*t))
-        .map(|(t, _)| w.head(*t))
+        .filter(|l| l.direction == Direction::Landing && w.alive(l.tree))
+        .flat_map(|l| {
+            l.units
+                .iter()
+                .map(|(u, _)| (l.tree, u.clone(), l.winners.contains(u)))
+        })
         .collect();
+    let mut heads: Vec<String> = landed.iter().map(|(t, _, _)| w.head(*t)).collect();
     heads.push(w.main_head.clone());
     for head in heads {
         w.reach
             .entry(head.clone())
             .or_insert_with(|| (reach(&repo, &head, false), reach(&repo, &head, true)));
     }
-    for (t, c) in &w.landings {
-        if !w.alive(*t) {
-            continue;
-        }
+    for (t, c, won) in &landed {
         let (history, lineage) = &w.reach[&w.head(*t)];
         if history.contains(c) != full {
             return Err(format!(
@@ -950,7 +1089,16 @@ fn history_setting(w: &mut World) -> Result<(), String> {
                 !full, w.policies.history
             ));
         }
-        if !lineage.contains(c) {
+        // Under `Squashed` a change that won here and then lost, itself, in
+        // a tree above is in no graft there, so a sync that fast-forwards
+        // this tree to its parent's commit leaves it out of this tree's
+        // lineage: that collision's ref keeps it.
+        let kept = || {
+            w.collisions
+                .iter()
+                .any(|x| w.upstream(*t)[1..].contains(&x.tree) && x.loser == *c)
+        };
+        if (*won || full) && !lineage.contains(c) && !kept() {
             return Err(format!("{t:?}'s lineage lost landed {c}"));
         }
     }

@@ -3,8 +3,8 @@
 **Layer:** the foundation under the [system](system.md) and its domains: how every tree, save, landing and sync maps onto git.
 **Status:** proposed: the target, not today's code, resting on the executable model in
 [`crates/agentfs-model`](../../crates/agentfs-model/MODEL.md) as of the commit that adds this revision on this
-page's branch (the one adding the `r10_*` and `r11_*` tests; the rules before it are at 43d09a3), which runs the
-rules on the real `git` program.
+page's branch (the one adding rule 3e's whole changes and the `r3_a_save_loses_whole_*` tests; the per-line rules
+before it are at 8185755), which runs the rules on the real `git` program.
 **Read it first:** code for the domains starts from this page. Where another page disagrees, this page wins and the
 other page has a bug.
 
@@ -23,6 +23,7 @@ other page has a bug.
 | 2026-11-03 | On saves: "if we're trying to emulate a traditional linux filesystem, then wouldnt this depend on how the write occurred? Like an append vs a write? I dont think that agentfs should try to do anything beyond record the actions through the filesystem" |
 | 2026-11-03 | "Go", in reply to the recommended next steps: accept close-to-open visibility for open files (§3); trim the superseded older pages; settle what a "line" is in a real file (§7); a rule for deletes and renames (§7) |
 | 2026-11-03 | Asked "If the sandbox has edited line 5 (the file is open) then doesnt that imply that the sandbox has a lock on the file and the upstream commit landing would be queued waiting for that lock?", then: "A sync should acquire a lock on every file that it aims to overwrite, yes"; and 2026-11-02: "freezing only the files that a landing touches sounds reasonable" |
+| 2026-11-03 | On a collision's cost, after reading that "one line loses": "“One line loses” sounds like a collision, and I thought we had already decided that each commit was a transaction"; "some commits represent a transaction, and some commits represent a collection of changes. Those two could have different operational models"; on a plain save: "The whole file, right? That was the “traditional Linux fs” model we had discussed". Then he asked "Wouldn’t a squashed changes still be merged file-by-file? Or does the squashing happen after the merge decisions are made — so only the winning changes get squashed? What happens to the losing files?", was told §11's answer, and did not object (that answer is a design choice he did not object to: not his decision, not his words) |
 | 2026-11-02 | Still binding (system §0): A13 "It’s a transaction, so a failure is an implicit rollback."; R17 "making the fork design so rock-solid that it is almost as effective, by syncing forks quickly and efficiently to minimize conflict drift"; A12 "The sandboxes are generally peers and parallelism is assumed."; A7, the history setting: "one setting per volume" |
 
 Everything else here is a **design choice** and says so, or is what the model does (MODEL.md marks its choices).
@@ -136,7 +137,7 @@ Ref names are a design choice; the model uses the first five (with `refs/collisi
 | `refs/heads/main` | main's decided line | always | yes, as today's `refs/heads/agentfs/<volume>` |
 | `refs/heads/fork/<id>` | a fork's line, syncs included | until the fork drops | only where Replication pushes fork lines (A4); its losing commits go regardless, as collision refs |
 | `refs/heads/txn/<id>` | an open transaction | until commit or rollback | never |
-| `refs/collisions/<loser>` | one per landing with a collision, named by its losing commit (the model makes one per landing and file, numbered) | past the fork's drop | yes, by Replication, under `refs/agentfs/<volume>/collisions/` ("i want to know who changed what when", 2026-11-03) |
+| `refs/collisions/<loser>` | one per losing change, named by its losing commit (the model numbers them, one per losing change, with a record for each file and cause it lost by) | past the fork's drop | yes, by Replication, under `refs/agentfs/<volume>/collisions/` ("i want to know who changed what when", 2026-11-03) |
 | `refs/replace/<commit>` | a `Squashed` landing's graft | always | yes, under `refs/agentfs/<volume>/replace/`, fetched back by `refs/agentfs/<volume>/replace/*:refs/replace/*` |
 | `refs/notes/agentfs/collisions` | each collision's record on the landing commit: tree, files, lines, lost and won lines (the model holds it in memory, so its remote lacks it) | always | with the collision refs |
 | `refs/queue/<tree>/<n>` | one queue entry (§5) | until taken | never |
@@ -153,7 +154,7 @@ Each tree has one queue (rule 2). Two kinds of entry go in, in the order they ha
 
 | Entry | Queued when | Taken as |
 |---|---|---|
-| `Landing{fork, commit}` | a child fork's branch moves by a save, a landing or a transaction commit | the per-line merge of §7 |
+| `Landing{fork, commit}` | a child fork's branch moves by a save, a landing or a transaction commit | §7's referee: per line, each change whole |
 | `Sync` | the tree's upstream moves | §8's sync; it reads the upstream's head when taken, not when queued |
 
 The queue fixes the order; git fixes which line is newer. No clock is read (`r2_no_clock_commit_dates_decide_nothing`).
@@ -222,7 +223,7 @@ sequenceDiagram
   A->>QC: Sync
 ```
 
-## 7. Landing: the per-line referee
+## 7. Landing: the referee, per line, each change whole
 
 When the parent's queue takes a landing, each incoming version meets the parent's version of the same line
 identity (below). Four cases, each read from git:
@@ -235,9 +236,29 @@ identity (below). Four cases, each read from git:
 | concurrent | neither | **the parent's version stays**, the incoming one loses, a collision is recorded |
 
 A line new to the parent (an insert) applies. "Written over" follows one line back: the version the line map
-records, found on the writing commit's first parent, then its own record, and so on (`written_over`). Only
-colliding lines lose; the change's other lines apply, neighbours included (rule 3e, a choice). The referee asks
-git three questions and reads the line maps, nothing else:
+records, found on the writing commit's first parent, then its own record, and so on (`written_over`).
+
+**Each change lands whole or loses whole** (rule 3e, the owner, 2026-11-03: "The whole file, right? That was the
+“traditional Linux fs” model we had discussed"). The referee judges every line of a change as above, then the
+change as one: if any line lost, the whole change loses, its lines that collided with nothing included, and none
+of it reaches the parent. It stays in history, kept by its collision ref, and every line of it is named: a line
+that did not collide itself as lost with its change (`By::Whole`), for the parent's line that decided.
+
+| Change (the unit judged whole) | What it holds |
+|---|---|
+| an ordinary save | the whole file as written at one close (a path call's name lines: an unlink, a rename, both halves of a rename-over) |
+| a transaction's commit | all its files: at its commit into its fork (§9), and again at each queue above |
+| a nested fork's landing commit | what that landing applied in its tree; under `Squashed`, the saves its graft names, each judged on its own (§10, §11) |
+| a squashed changeset | never a unit: each save of the take is judged first (§11) |
+
+Only a lost line costs a change; a dropped one (same, stale, or a delete the parent's agrees with) costs nothing
+(`r3_a_change_whose_delete_agrees_lands_whole`). A loss by a file rule ("Deletes and renames" below: an edit of a file the parent
+unlinked, an unlink or a rename-over against a line its writer never saw) costs the whole change the same way: a
+transaction that edits a and b loses b's line too (`r3_a_file_rule_loss_costs_the_whole_change`). Each later save is judged whole on its own: a save over a line of a save that lost was written over that save's
+line, so it replaces the parent's line under it by lineage unless it collides itself
+(`r3_a_later_save_after_a_losing_one_is_judged_on_its_own`). Two changes never cost each other: neighbouring lines
+of two changes both apply (`r3_neighbouring_lines_merge_per_line`). The referee asks git three questions and reads
+the line maps, nothing else:
 
 ```rust
 /// What the referee needs from git (finding 7): storage plus three questions.
@@ -301,7 +322,7 @@ over the target. Taken as a rename-over, it would replace the target's identity,
 any line would make the whole save lose. So a rename-over from a file the parent has never had (created since the
 fork last synced) is saved instead as a **rewrite of the replaced file** with the new file's bytes: the replaced
 file keeps its identity, its lines are aligned with the new bytes (above), and the new file, which the parent never
-had, simply ends. It then merges per line like any rewrite. As on Linux, an open file of the replaced path keeps
+had, simply ends. It then lands like any rewrite: judged per line, and whole (rule 3e). As on Linux, an open file of the replaced path keeps
 writing to what it opened; here that is the same identity, so its later save is aligned against the rewrite.
 
 An unlink made after a sync saw the parent's lines and wins by lineage (`r11_an_unlink_after_the_sync_wins`). In
@@ -309,7 +330,7 @@ one tree, as on Linux, an open file follows a rename, and one unlinked while ope
 
 **Clean landing.** Under full lineage, a fork commit made on the parent's current head is a fast-forward. Otherwise
 it is a merge: first parent the parent's head, second the fork commit, named for its writer. Under `Squashed` it is
-always one single-parent commit plus a graft (§11).
+always one single-parent commit plus a graft naming the saves that won (§11).
 
 ```mermaid
 sequenceDiagram
@@ -320,18 +341,19 @@ sequenceDiagram
   alt full lineage, c's first parent is main's head
     QM->>M: move main to c (fast-forward)
   else full lineage, main moved since
-    QM->>QM: per line: every line of c replaces or applies
+    QM->>QM: per line: every line of c replaces or applies, so c wins whole
     QM->>M: merge, parents main and c, Writer c1, Cause Landing
   else Squashed
-    QM->>M: commit, parent main only, graft main c
+    QM->>M: commit, parent main only, graft main and each save that won
   end
   M->>A: Sync queued (main moved)
 ```
 
-**Collision.** Main's line wins (owner, 2026-11-03). The landing makes a commit even if every line lost, so main's
-lineage records the decision, and the losing commit gets its own ref, which Replication pushes to the shared
-remote. The fork learns it at its next sync: x, then
-main's m, never x again (`no_flicker`).
+**Collision.** Main's line wins (owner, 2026-11-03), and the change that lost it loses whole. The landing makes a
+commit even if every change lost, so main's history records the decision, and the losing commit gets its own ref,
+which Replication pushes to the shared remote. The fork learns it at its next sync: x, then main's m, never x
+again (`no_flicker`); a clean line y of x's save goes back to main's version of it, decided by the same collision
+(`r3_a_save_loses_whole_with_its_clean_lines`).
 
 ```mermaid
 sequenceDiagram
@@ -340,17 +362,21 @@ sequenceDiagram
   participant M as main (has m, concurrent)
   QM->>QM: take Landing(fork/1, x's commit)
   QM->>QM: line 2: m and x concurrent, main wins
-  QM->>M: commit, line 2 stays m (full lineage: parents main and x's commit)
-  QM->>QM: same ref transaction: refs/collisions/x's commit, note: lost x, won m
+  QM->>QM: line 4: y clean, but its save lost: y loses with it
+  QM->>M: commit, main's tree unchanged (full lineage: parents main and x's commit)
+  QM->>QM: same ref transaction: refs/collisions/x's commit, note: lost x for m, y with its save
   M->>A: Sync queued
-  A->>A: sync: x's commit now reached by main, take m
+  A->>A: sync: x's commit decided by main, take m and main's line 4
 ```
 
 ## 8. Sync: fetch, then fast-forward to the decided state
 
 A sync decides nothing (rule 3a). It reads the upstream's head as it is when taken, never the one current when
-it was queued (rule 3d), and keeps exactly the fork's lines whose writing commit the upstream's lineage does not
-reach yet: lines still on their way to the parent's queue.
+it was queued (rule 3d), and keeps exactly the fork's lines whose writing commit the upstream had not decided then:
+its lineage does not reach the commit, and no collision ref of the upstream or a tree above it, present when the
+head was read, names a change that reaches it. Those are lines still on their way to the parent's queue. Under
+`Squashed` a losing save is in no graft (§11), so its collision ref is the only record that the queue took it
+(with lineage alone, the fork would keep the loser's lines forever: finding 2 again).
 
 ```mermaid
 sequenceDiagram
@@ -362,7 +388,7 @@ sequenceDiagram
   alt A's head already reaches main's head
     QA->>A: nothing to do
   else main's head reaches A's head, or A has undecided lines
-    QA->>QA: main's tree, with A's lines that main does not reach kept (none in the first case)
+    QA->>QA: main's tree, with A's lines that main has not decided kept (none in the first case)
     alt that is main's tree and nothing of A waits in main's queue
       QA->>A: fast-forward fork/1 to main's head
     else
@@ -383,11 +409,14 @@ transaction; opens after begin write in the transaction. Errors: begin with one 
 or rollback with none (`NoTransaction`), after the client ended (`Ended`), and commit while the program itself
 holds open for writing a file of the transaction or a fork file the commit would write (`OpenFiles`).
 
-**Commit** (a choice) lands the branch in the fork as a child lands in its parent: the fork's concurrent line (one
-a sync brought in since begin) wins, the rest apply, and no collision refuses it. `OpenFiles` is a *choice* too:
+**Commit** lands the branch in the fork as a child lands in its parent, whole or not at all (rule 3e, the owner):
+the fork's concurrent line (one a sync brought in since begin) wins, and then none of the transaction applies; no
+collision refuses it. A transaction that lost still writes its merge commit, with the fork's tree, so history
+shows the decision (a choice); its collision ref keeps the transaction's branch. `OpenFiles` is a *choice* too:
 those open files are the caller's own locks (§6), so waiting would wait on the caller; the program closes them
-and commits again (`r5_open_files_and_transactions`). The answer names each overwritten
-line; no saves commits nothing (`Empty`). One ref transaction moves the fork and deletes both refs (the model
+and commits again (`r5_open_files_and_transactions`). The answer says
+`Committed`, or `Lost` with every staged line and the fork's line that won or decided it
+(`r3_a_transaction_loses_whole_and_is_told`); no saves commits nothing (`Empty`). One ref transaction moves the fork and deletes both refs (the model
 deletes the branch first: a crash between would lose the commit). The result lands upstream like any fork commit.
 
 ```mermaid
@@ -400,10 +429,10 @@ sequenceDiagram
   P->>T: saves, each a commit on txn/7
   Note over B: syncs keep landing in B, T stays frozen
   P->>B: commit
-  B->>B: per line, B's head as parent: B's concurrent lines win
-  B->>B: merge, parents B and txn/7, Writer c2, Cause Transaction t7
-  B->>B: one ref transaction: move fork/2, delete txn/7 and its start
-  B-->>P: committed, overwritten lines listed
+  B->>B: per line, B's head as parent: B's concurrent lines win, and then the whole transaction loses
+  B->>B: merge, parents B and txn/7, Writer c2, Cause Transaction t7 (B's tree if it lost)
+  B->>B: one ref transaction: move fork/2, delete txn/7 and its start (a collision ref keeps a loser)
+  B-->>P: Committed, or Lost with every staged line
   B->>QM: Landing(fork/2, the transaction's commit)
 ```
 
@@ -431,7 +460,10 @@ sequenceDiagram
 ```
 
 A nested landing names the writer it carries (`r4_nested_forks_follow_the_same_rules`). Under `Squashed` it lands
-on its own, since it carries another writer's lines (a choice).
+on its own, since it carries another writer's lines (a choice), and the queue above judges it as the saves its
+graft names, each whole, never as a changeset; a save that lost at that level is named by the collision there
+(`r4_nested_changes_land_whole_or_lose_whole_at_every_level`). A tree below learns a decision made above its
+parent from the collision refs above (§8).
 
 ## 11. History settings
 
@@ -440,23 +472,39 @@ One setting per volume (A7). Every sandbox commit stays stored either way (owner
 | | Full lineage | Squashed |
 |---|---|---|
 | A landing commit | a fast-forward, or a merge with the fork commit as second parent | one single-parent commit on the parent |
-| Plain saves waiting in the queue | each lands on its own | all of one fork's, up to its next other entry, land as one changeset |
+| Plain saves waiting in the queue | each lands on its own | one fork's saves sitting directly behind each other in the queue, up to the first other entry (another fork's, a sync, a transaction's commit, a nested landing), are taken together: each judged whole on its own, in order, then the winners land as one changeset |
 | Transaction commits; nested landings | on their own | on their own ("leave the transaction commits as they are"; nested: a choice) |
 | Main's stored history | reaches every landed fork commit | holds only main's own commits |
-| Lineage | the stored history | stored history plus a graft: `<new>` read as having parents `<parent head>` and `<last carried fork commit>` |
-| Empty landing (every line lost) | a merge | an empty commit, so the decision shows |
+| Lineage | the stored history | stored history plus a graft: `<new>` read as having parents `<parent head>` and each save that won |
+| A losing save | a merge, in main's history | its own commit on the fork's branch, in no commit or graft of main's, named by its collision ref |
+| Empty landing (every change lost) | a merge | an empty commit with no graft, so the decision shows and the forks sync |
 
 The graft (a choice, rule 7) lets a later sync see that main took the fork's line (finding 2); without it a sync
 keeps that line forever, or reverts the fork's newer one (`r7_squashed_sync_never_undoes_the_forks_newer_line`).
-Squashing only the saves waiting at the take, pulling them ahead of other forks' entries, is a choice too.
+A squash takes only saves sitting next to each other in the queue, never one from behind another entry (a choice). Taken
+ahead, a later save could reach the parent before another fork's entry queued first and win the collision that full
+lineage gives that fork, so the setting would decide a collision (found by the adversarial review: F saves b, G
+saves a, F saves a; `r7_the_history_setting_decides_no_collision`). Taken in queue order, the squashed take judges the
+same changes in the same order as one take each, and the same calls decide the same trees and collisions under
+both settings (`random_interleavings_history_settings_decide_the_same`).
+
+**Only winners are squashed** (*choice, not objected to*: the owner asked, 2026-11-03, "does the squashing happen
+after the merge decisions are made — so only the winning changes get squashed? What happens to the losing files?",
+and did not object to this answer; silence is not his decision). The squash is history only, never a unit judged whole: each save of the take is judged whole on its own,
+in order, each on the result of the winners before it, and the squashed commit holds exactly the winners, its
+graft naming each. A losing save is squashed into nothing: it stays its own commit on the fork's branch, its
+collision ref names it, and Replication pushes that ref. A loser between two winners is still reached through the
+later winner, its child on the fork's branch; a loser after the last winner is in no lineage of main's
+(`r7_a_squashed_take_squashes_only_the_winners`).
 
 ```mermaid
 sequenceDiagram
   participant QM as main's queue, holding s1 s2 s3 t s4 of fork/1
   participant M as main
   QM->>QM: take s1, carry s2 and s3 (plain saves), stop at t
-  QM->>M: one commit, parent main only, Writer c1, Cause Landing
-  QM->>QM: same ref transaction: graft new as main plus s3
+  QM->>QM: judge s1, s2, s3 each whole, in order: s2 collides, so s2 loses whole
+  QM->>M: one commit of s1 and s3, parent main only, Writer c1, Cause Landing
+  QM->>QM: same ref transaction: graft new as main plus s1 and s3; refs/collisions/s2
   QM->>M: take t alone (a transaction commit)
   QM->>M: take s4 alone
 ```
@@ -499,7 +547,8 @@ refs, the notes ref and the grafts (§4).
 |---|---|---|
 | **Per-line referee (chosen)**: line maps, a parent walk and `merge-base --is-ancestor`, our own code | every invariant below holds in every scenario and random run | the merge is ours to write and test, not a git strategy (finding 7) |
 | git's three-way merge, keeping the sandbox's side of a conflict (`merge-tree -X ours`) | no merge code | once a fork and main have merged each other, git finds two merge bases and keeps a fork line main already decided against (finding 1: 39 of 64 seeds); a hunk spans neighbouring lines, so keeping a side withholds main's decided neighbour (finding 6) |
-| Per file: main's whole file wins | simple to state | reverts the fork's newer, non-colliding line in that file (finding 3) |
+| Per line within a change: only colliding lines lose, the change's other lines apply (the model's rule until 2026-11-03) | no clean line is dropped | a commit or a transaction reaches the parent in part; the owner: "“One line loses” sounds like a collision, and I thought we had already decided that each commit was a transaction" (replaced by rule 3e, §7) |
+| Per file: main's whole file wins | simple to state | a change of several files lands in part; within one file it is rule 3e's cost, which the owner chose for the whole change (finding 3, resolved) |
 | "Saw" read per commit (merge ancestry) | one ancestry query | a sync merge makes main's commit an ancestor, so an edit over the fork's undecided line looks "made on" main's line and silently replaces it (finding 8, resolved: read per line) |
 | Save files as written; git's merge (`merge-ort -X ours`) with a rebase at every sync (tried 2026-11-03, rejected) | no line maps, less model code | the rebase makes the sandbox resolve a conflict at the sync, so the parent's queue no longer decides alone (rule 3a): whichever side wins there, the sandbox either drops its undecided line early (and may show it again) or withholds the parent's decided lines; and git merges by content, so a parent that writes a line A to B and back to A matches the merge base, and a sandbox's concurrent write lands over it with no collision (a silent loss). Finding 13; the variant is the unmerged branch `experiment/native-merge-variant` |
 
@@ -512,12 +561,15 @@ git configuration; one actor per tree is the actor model's single owner of mutab
 Every check runs after every step, in every scenario and random run (seeds 1 to 64 in CI), except
 `check_converged` and `losers_pushed`, which run once the queues and Replication drain. Most tests run both
 history settings. Full lineage only: both `r2_*`, `r3_an_edit_over_the_decided_line_replaces_it`,
-`r3_collision_scope_per_line_sync_keeps_the_clean_line`, `r3_neighbouring_lines_merge_per_line`, `r4_nothing_waits_behind_a_collision`, `r9_a_landing_*`,
-`random_interleavings_full_lineage`, `random_interleavings_adjacent_lines`. `Squashed` only: `r6_*`, `r7_squashed_sync_*`, `random_interleavings_squashed`.
+`r3_a_sync_keeps_the_undecided_saves`, `r3_neighbouring_lines_merge_per_line`, `r4_nothing_waits_behind_a_collision`, `r9_a_landing_*`,
+`random_interleavings_full_lineage`, `random_interleavings_adjacent_lines`. `Squashed` only: `r6_*`, `r7_squashed_sync_*`,
+`r7_a_squashed_take_squashes_only_the_winners`, `random_interleavings_squashed`. Both settings, compared:
+`r7_the_history_setting_decides_no_collision`, `random_interleavings_history_settings_decide_the_same` (seeds 1 to 16
+in CI).
 
 | Invariant | Check | Tests |
 |---|---|---|
-| No tree silently loses a change; no stale version reverts a newer one (a rewrite of an old read is a new version, written over what it replaced: §6), except where a collision decided against it (a lost unlink gives the file back), never for a clean line lost per file (finding 3) | `no_silent_loss` | `r3_a_sync_carries_the_parents_current_version`, `r7_squashed_sync_never_undoes_the_forks_newer_line`, `random_interleavings_full_lineage` |
+| No tree silently loses a change; no stale version reverts a newer one (a rewrite of an old read is a new version, written over what it replaced: §6), except where a collision decided against it (a lost unlink gives the file back; a losing change's clean line goes back to the parent's), never for a line no real collision of its change decided | `no_silent_loss` | `r3_a_sync_carries_the_parents_current_version`, `r7_squashed_sync_never_undoes_the_forks_newer_line`, `random_interleavings_full_lineage` |
 | A line keeps the identity its first save gave it through later inserts and deletes around it; the referee and a sync compare identities only | `no_silent_loss`, `parent_wins` | `r10_an_insert_shifts_lines_without_changing_their_identity`, `r10_concurrent_inserts_at_one_place_keep_both_the_parents_first`, `r10_repeated_identical_lines_align_by_the_diff` |
 | A save's line map is a valid alignment, read from its blob and its first parent's alone (not from the replay that wrote it): every line the parent holds is still there, in order, unchanged or one new version over the parent's; every other line is new | `save_aligned` | every scenario and random run |
 | A save holds exactly the bytes its write calls leave on the head at close, by the harness's own record of the calls | `close_checked` (interleavings.rs) | every random run |
@@ -528,20 +580,23 @@ history settings. Full lineage only: both `r2_*`, `r3_an_edit_over_the_decided_l
 | No take writes a file open for writing in that tree or one it did not hold; no write-open succeeds while a take holds the file; no lock outlives its holder (a sandbox's client or one of main's, a transaction, a tree); every wait ends on an event | `step_checked`, `locks`, `check_converged` | `r9_*`, `r11_an_unlink_or_rename_of_a_held_file_waits`, `r5_open_files_and_transactions`, every random run (main's clients and sandboxes die in them) |
 | The parent wins every collision, decided only at its queue, losing commit reachable | `parent_wins` | `r3_landing_collision_the_parent_wins`, `r3_a_collision_is_recorded_once_at_the_parents_queue`, `r10_a_delete_against_a_concurrent_edit_the_parent_wins`, `r10_a_move_is_a_delete_plus_an_insert` |
 | An edit over the parent's current line replaces it (a save after a sync); before the sync, or over an undecided line, it collides | `parent_wins` | `r3_fast_forward_when_the_base_is_current`, `r3_a_save_after_the_sync_wins_upstream_by_lineage`, `r3_a_save_before_the_sync_arrives_loses_to_the_parent`, `r3_an_edit_over_the_decided_line_replaces_it`, `r3_an_edit_over_an_undecided_line_still_collides` |
-| Only colliding lines lose, neighbours included | `parent_wins` | `r3_collision_scope_per_line_keeps_clean_lines`, `r3_neighbouring_lines_merge_per_line`, `random_interleavings_adjacent_lines` |
+| No partial save or transaction ever reaches a parent: each change a take judged lost or won, never both; one that lost has none of its versions in the result and every one named; one that won has every one in the result | `changes_whole`, `parent_wins` | `r3_a_save_loses_whole_with_its_clean_lines`, `r3_a_change_whose_delete_agrees_lands_whole`, `r3_a_later_save_after_a_losing_one_is_judged_on_its_own`, `r3_a_transaction_loses_whole_and_is_told`, `r3_a_committed_transaction_loses_whole_at_main`, `r3_a_file_rule_loss_costs_the_whole_change`, `r4_nested_changes_land_whole_or_lose_whole_at_every_level`, `r10_a_move_is_a_delete_plus_an_insert`, every random run |
+| A squashed commit holds only judged winners: its lineage parents are the parent's head and exactly the take's winning saves, and it sets only their versions | `changes_whole` | `r7_a_squashed_take_squashes_only_the_winners`, `random_interleavings_squashed` |
+| Two changes never cost each other: neighbouring lines of two changes both apply | `parent_wins`, `no_silent_loss` | `r3_neighbouring_lines_merge_per_line`, `random_interleavings_adjacent_lines` |
 | A sync records no collision and carries the upstream's head as it was then | `step_checked` | `r3_a_sync_carries_the_parents_current_version`, `r3_a_fork_never_flips_back_to_its_own_edit` |
-| Every sync delivers the decided version, keeping only undecided own lines | `syncs_deliver` | `r3_collision_scope_per_line_sync_keeps_the_clean_line` |
-| Nothing else waits; each take is its queue's head or records a wait, the rest stay in order | `take` (interleavings.rs) | `random_interleavings_full_lineage`, `random_interleavings_squashed`, `random_interleavings_adjacent_lines` (the scenarios' own `take` checks no order) |
-| A transaction ends as the program was told; a rollback leaves nothing | `transactions_end_as_told`, `discarded_leave_no_trace` | `r5_transaction_commits_clean`, `r5_transaction_commit_reports_the_overwritten_line`, `r5_sync_before_or_after_the_commit_ends_the_same`, `r5_a_committed_transaction_then_lands_like_any_change`, `r5_transaction_rollback_and_client_death_leave_nothing` |
+| Every sync delivers the decided version, keeping only undecided own lines | `syncs_deliver` | `r3_a_sync_keeps_the_undecided_saves`, `r7_a_squashed_take_squashes_only_the_winners` |
+| Nothing else waits; each take is its queue's first entry (a squash: with the same fork's saves directly behind it) or records a wait, the rest stay in order | `take` (interleavings.rs) | `random_interleavings_full_lineage`, `random_interleavings_squashed`, `random_interleavings_adjacent_lines` (the scenarios' own `take` checks no order) |
+| A transaction ends as the program was told, whole; a rollback leaves nothing | `transactions_end_as_told`, `discarded_leave_no_trace` | `r5_transaction_commits_clean`, `r3_a_transaction_loses_whole_and_is_told`, `r5_sync_before_or_after_the_commit_ends_the_same`, `r5_a_committed_transaction_then_lands_like_any_change`, `r5_transaction_rollback_and_client_death_leave_nothing` |
 | Every change traces to one writer | `one_writer` | `r6_a_sync_is_a_merge_with_the_parent_second` |
 | Every losing change is replicated, eventually, and stays: once Replication drains, every collision of the run is re-read on the shared remote alone, its writer and line; a main collision's result is in the remote main | `losers_pushed` | `r3_a_save_before_the_sync_arrives_loses_to_the_parent`, every collision |
 | Nested forks follow the same rules | all checks | `r4_nested_forks_follow_the_same_rules` |
-| The history setting holds, read by ancestry alone; squashed saves land as one changeset | `history_setting` | `r7_squashed_saves_land_as_one_changeset`, `r7_history_setting_and_losers_stay_reachable`, `random_interleavings_squashed` |
+| The history setting holds, read by ancestry alone; squashed winning saves land as one changeset; a losing save under `Squashed` is kept by its collision ref, not by lineage | `history_setting`, `parent_wins` | `r7_squashed_saves_land_as_one_changeset`, `r7_history_setting_and_losers_stay_reachable`, `r7_a_squashed_take_squashes_only_the_winners`, `random_interleavings_squashed` |
+| The history setting decides nothing: the same calls, drained between rounds, decide the same trees and collisions under full lineage and squashed | fingerprint compare | `r7_the_history_setting_decides_no_collision`, `random_interleavings_history_settings_decide_the_same` |
 | Trees converge when writes stop | `check_converged` | `convergence_when_writes_stop` |
 | No clock decides anything | fingerprint compare | `r2_no_clock_commit_dates_decide_nothing`, `random_interleavings_commit_dates_decide_nothing` |
 
 Ignored (open findings): `finding_1_git_merge_base_on_crossing_merges`, `random_interleavings_git_merge_base`,
-`finding_3_per_file_keeps_clean_lines`, `random_interleavings_per_file_full_lineage`, `finding_6_git_hunks_on_neighbouring_lines`.
+`finding_6_git_hunks_on_neighbouring_lines`. Finding 3's tests went with the per-file setting (rule 3e).
 The model checks nothing in §3 or §12: it has no actor or restarts.
 
 ## 16. Open questions, costs, and what is not modelled
@@ -553,24 +608,31 @@ The model checks nothing in §3 or §12: it has no actor or restarts.
 2. **Two renames to one path before main decides.** Main's queue decides it (the parent keeps the path), but a
    sandbox that syncs first would show two files at one path; the model stops there. Recommendation, a choice
    to confirm: the sandbox keeps its own name until decided, and shows main's file under its previous name.
-3. **Per-line results against "whole" (for the owner).** Three of his statements ask for whole changes: R9, "Whole
-   seems best, right? A partial application has unknown side effects" (2026-10-16); R13, a cooperating
-   integration's transactions "must all land together" (2026-11-02); and A8, his accepted question "This does
-   assume that a *commit* is landed altogether, not just a file" (2026-11-02). The model applies a landing per
-   line (rule 3e, a choice): when one line of a commit or a committed transaction loses to main, its other lines
-   still apply, so main can hold part of a commit and part of a transaction. "main wins" (2026-11-03) decides
-   which line wins, not whether the rest applies. The question: should a commit (or at least a transaction) whose
-   line loses at main lose whole, as finding 3's per-file rule does for a file, at that rule's cost (a clean,
-   newer line dropped), or does per line stand?
+3. **Closed, 2026-11-03: whole changes.** Three of his statements asked for whole changes (R9, "Whole seems best,
+   right? A partial application has unknown side effects", 2026-10-16; R13, a cooperating integration's
+   transactions "must all land together", 2026-11-02; A8, "This does assume that a *commit* is landed
+   altogether, not just a file", 2026-11-02), and the model applied a landing per line. Asked, he answered:
+   "“One line loses” sounds like a collision, and I thought we had already decided that each commit was a
+   transaction"; "some commits represent a transaction, and some commits represent a collection of changes. Those
+   two could have different operational models"; and, on a plain save, "The whole file, right? That was the
+   “traditional Linux fs” model we had discussed". On squashing he asked "does the squashing happen after the
+   merge decisions are made — so only the winning changes get squashed? What happens to the losing files?" and
+   did not object to the answer in §11 (a choice he did not object to, not his decision). So a save or a
+   transaction lands whole or loses whole (§7, rule 3e); a
+   squashed changeset is history only (§11). The per-line application is gone, with no setting to keep it.
 
 **Costs.**
-- **The alignment guesses from bytes.** A move is a delete plus a new line: against a parent's concurrent edit of
-  the moved line, the parent's edit stays at the old place and the old bytes come back at the new one, a doubled
-  line, with only the delete recorded as a collision. In a run of identical lines, which one changed is the
-  diff's pick, so a neighbouring edit can land one line off. A changed region pairs old and new lines by
-  position: a wholesale rewrite (a reformat, a whitespace-only reindent) pairs unrelated lines, and a parent's
-  concurrent edit of old line k wins and is spliced into the rewritten file, a mix neither side wrote (mixed
-  indentation, for a reindent). Kleppmann's list move or a structure-aware diff would do better, at the cost of a
+- **A change loses whole for one line** (rule 3e). Its lines that collided with nothing are dropped with it, and
+  the fork then shows the parent's version of them, its own newer lines included; they stay in history, named
+  by the collision. A program that wants a line to survive a collision elsewhere saves it in another close.
+- **The alignment guesses from bytes, and a whole save pays for it.** A byte-unchanged line between two changed
+  lines of one diff region gets a new version with the same bytes (only a region's end lines keep theirs), so a
+  parent's concurrent edit of it makes the whole save lose for a line its program never changed. A move is a
+  delete plus a new line: against a parent's concurrent edit of the moved line, the delete loses, so the whole
+  save loses and the move is gone, kept in history. In a run of identical lines, which one changed is the diff's
+  pick, so a neighbouring edit can land one line off. A changed region pairs old and new lines by position: a
+  wholesale rewrite (a reformat, a whitespace-only reindent) pairs unrelated lines, so a parent's concurrent edit
+  of any of them makes the whole rewrite lose. Kleppmann's list move or a structure-aware diff would do better, at the cost of a
   second, file-type-specific mechanism.
 - Line maps keep deleted versions and unlinked files, no trim rule.
 - A sync takes main's decided unlink, so a sandbox's undecided edit in that file leaves its view before main's
@@ -589,12 +651,15 @@ The model checks nothing in §3 or §12: it has no actor or restarts.
   program holding one file while opening another. It pulls against R17's "syncing forks quickly".
 - An agentfs restart loses every open file's unsaved write calls (the view holds them until close, §3, §12).
 - A transaction commit is refused while the program holds its own files open (`OpenFiles`, §9).
-- A transaction's answer names only lines its own fork overwrote, not a later loss at main.
+- A transaction's answer covers its commit into its own fork. A transaction committed there can still lose whole
+  at main's queue later: a recorded collision, not part of the answer.
 - **Grafts cost every reader.** Any `refs/replace/` entry turns off git's commit-graph file and its generation
   numbers for the whole repository, so every `merge-base --is-ancestor` and parent walk reads commits one by one.
   Every git run also loads every replace ref. `Squashed` adds one per landing, forever, with no trim rule. Full
   lineage has none of this, which counts in choosing the history setting.
-- `Squashed` writes an empty commit for a landing whose lines all lost, and a clone needs the grafts to sync.
+- `Squashed` writes an empty commit for a take whose saves all lost, and a clone needs the grafts and the
+  collision refs to sync: a losing save is in no graft, so a sync reads the collision refs of its parent and the
+  trees above (§8).
 - The referee and the actor are our own code; no git merge strategy carries them.
 - Atomic steps need the reftable backend (§12).
 - Losing commits and their refs are pushed and kept: a trim rule is not wanted unless it keeps who changed what when.
@@ -619,7 +684,8 @@ contradict this page; where something does, this page wins.
 |---|---|---|---|
 | referee | the parent's queue as the one place a collision is decided | names rule 3a's one judge | the landing process |
 | collision | two same-line edits, each written without seeing the other | replaces "conflict", which held | conflict |
-| decided | the parent's lineage reaches the line's writing commit | what a sync tests | landed |
+| decided | the parent's lineage reaches the line's writing commit, or a collision ref of the parent (or a tree above) names a change that reaches it | what a sync tests | landed |
+| change | the unit the referee judges whole: an ordinary save (the whole file at one close) or a transaction's commit (all its files); a squashed changeset is not one (§7) | rule 3e: a collision costs the whole change, no more | commit; transaction |
 | graft | a `refs/replace/` entry giving a squashed commit its lineage | finding 2 | squash chain |
 | actor | the one place a tree's branch is moved, one step at a time | one mover per branch, so no two moves race | the Trees domain's writer |
 | sync commit | the `Sync` merge a sync makes when the fork has commits its parent has not taken; no edits of its own | why a sync is not always a fast-forward | the older pages' sync landing |
@@ -630,8 +696,9 @@ contradict this page; where something does, this page wins.
 
 ## Questions for the owner
 
-§16 questions 1, 2 and 3. Answered 2026-11-03: saves and locks (§6); a sync commit credited to `agentfs` stays a
+§16 questions 1 and 2. Answered 2026-11-03: question 3, whole changes (§7, §11);
+saves and locks (§6); a sync commit credited to `agentfs` stays a
 labelled choice (§2); a save after a sync over the sandbox's own unlanded line still loses, a cost (§16);
 close-to-open visibility, accepted ("Go", §3).
 
-*History: 2026-11-03, from the model at 509a0ab; revised after review (save ordering, trees, recovery, grafts, slots); 2026-11-03, the owner's answers on losers and saves; review: Replication pushes losers, questions 2 and 3; 2026-11-03, the owner's answers on saves and locks; review: appends at close, main's clients' death, transactions with open files, the lock over path calls, the program-level hang; 2026-11-03, after the owner's "Go": close-to-open accepted, line identity, deletes and renames (§7); review: no POSIX call names a line, so a save aligns its bytes once (§6, §7), the atomic-save idiom, untracked files (§3), R9/R13/A8 put to the owner (§16), §17 cut.*
+*History: 2026-11-03, from the model at 509a0ab; revised after review (save ordering, trees, recovery, grafts, slots); 2026-11-03, the owner's answers on losers and saves; review: Replication pushes losers, questions 2 and 3; 2026-11-03, the owner's answers on saves and locks; review: appends at close, main's clients' death, transactions with open files, the lock over path calls, the program-level hang; 2026-11-03, after the owner's "Go": close-to-open accepted, line identity, deletes and renames (§7); review: no POSIX call names a line, so a save aligns its bytes once (§6, §7), the atomic-save idiom, untracked files (§3), R9/R13/A8 put to the owner (§16), §17 cut; 2026-11-03, the owner's answer to question 3: a save or transaction lands whole or loses whole, only winning saves are squashed (§7, §9, §11, §15).*

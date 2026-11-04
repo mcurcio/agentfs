@@ -4,7 +4,7 @@
 **Status:** revision 10, proposed: the target, not today's code; sketches are Rust surfaces. Revision 3 was approved
 by the owner on 2026-11-02; revision 10 cuts the page to what [agentfs in git terms](git-model.md) does not cover.
 **Read [git-model.md](git-model.md) first.** It is the one source of truth for trees as branches, saves, locks, the
-queue and its per-line referee, collisions, syncs, transactions, nested forks, history settings and crash recovery.
+queue and its referee, collisions, syncs, transactions, nested forks, history settings and crash recovery.
 This page and the domain pages cover only the rest: clients, views and what each shows, tree storage and lifecycle,
 replication, the volume, health, telemetry, deployment and versions. Where a page here seems to disagree with
 git-model.md, git-model.md wins and the page has a bug.
@@ -23,11 +23,11 @@ Nothing else on these pages is his; everything else is a design choice and says 
 | R6 | "THE EDITS CAN LAND IN ONE COMMIT?!?" (read as: no commit holds two writers) | 2026-11-01 | git-model §3 |
 | R7 | "Security boundary. Agentfs is the gatekeeper that exposes only what we want sandboxes to see" | 2026-10-30 | [rules](domains/rules.md), [views](domains/views.md), [clients](domains/clients.md) |
 | R8 | a consumer's personal information never enters the agentfs repo (his exact words name the consumer, so they stay in the session notes) | 2026-10-30 | these pages name no consumer |
-| R9 | "Whole seems best, right? A partial application has unknown side effects" | 2026-10-16 | git-model §6 (a take holds all its files). **Weakened:** a landing applies part of a commit when some of its lines lose (git-model §7, rule 3e); put to the owner, git-model §16 question 3 |
+| R9 | "Whole seems best, right? A partial application has unknown side effects" | 2026-10-16 | git-model §6 (a take holds all its files); git-model §7: a save or transaction lands whole or loses whole (rule 3e, the owner's answer of 2026-11-03 to git-model §16 question 3) |
 | R10 | "agentfs should support merging live" (2026-10-28); "No live landing yet", then "Build incrementally" (2026-10-29) | 2026-10-28/29 | git-model §5 |
 | R11 | "Nothing is locked in. Everything is on the table" | 2026-11-01 | every page |
 | R12 | "The general history should be preserved, yes. But I think it could be configurable if it needs to be every single commit, or whether a fork can be squashed so that mainline is just a merge tree of squashed fork lineage." | 2026-11-02 | git-model §11 |
-| R13 | "A cooperating integration can define batches/transactions across files, and they must all land together. But a default usage, like the CNI provides, can operate per-file." (read: "CNI" is agentfs's CSI driver) | 2026-11-02 | git-model §9; [views](domains/views.md). **Weakened:** a committed transaction can end split at main, a line lost and the rest applied; put to the owner, git-model §16 question 3 |
+| R13 | "A cooperating integration can define batches/transactions across files, and they must all land together. But a default usage, like the CNI provides, can operate per-file." (read: "CNI" is agentfs's CSI driver) | 2026-11-02 | git-model §7, §9: a transaction's commit lands whole or loses whole at every level (rule 3e); [views](domains/views.md) |
 | R14 | "Not A, because that assumes that a clean merge is an acceptable merge" (quoted in agentfs `docs/design.md` §12) | 2026-10-16 | not yet designed (§5) |
 | R15 | "Configurable with a sensible default" (of accepting a clean merge; `docs/design.md` §12) | 2026-10-29 | not yet designed (§5) |
 | R16 | "i would like for the git history to remain compatible across minor versions, and only break on a major version change. The various agentfs components should be within the same version family (major for sure, maybe minor too, patch doesnt need to match)" | 2026-11-02 | §4 below |
@@ -54,8 +54,8 @@ Nothing else on these pages is his; everything else is a design choice and says 
 A9's words ("freezing only the files that a landing touches sounds reasonable", 2026-11-02) still bind and are built
 as the git model's locks (git-model §0, §6). A10's resolver chain and A14's `Lock` setting are replaced by the git
 model's own answers (§7, §9). A8, his accepted question "This does assume that a *commit* is landed altogether,
-not just a file" (2026-11-02), is not met: a landing applies a commit's clean lines when others lose. No words of
-his supersede it; it is put to him with R9 and R13 (git-model §16 question 3).
+not just a file" (2026-11-02), is met: a save (the whole file at one close) or a transaction's commit lands whole
+or loses whole (git-model §7, rule 3e; his answer of 2026-11-03 to git-model §16 question 3).
 
 ## 1. The system in one picture
 
