@@ -42,8 +42,8 @@ without seeing the other. MODEL.md's rules table holds the full wording; this pa
   Tests: `r1_writes_never_wait_and_forks_sync_both_ways`
 - **R1.1** · owner · An open file is private until close: other readers see only saved content (close-to-open).
   Source: "Go" (2026-11-03), accepting that recommendation.
-- **R1.2** · approved · Whatever a tree held when a save was made counts as seen by that save.
-  Approved by the owner, 2026-11-05 (approval page). 
+- **R1.2** · rejected · Whatever a tree held when a save was made counts as seen. Owner, 2026-11-05: "yes, replace
+  it" (by R3c.2).
 - **R1.3** · approved · A program reads its own unsaved writes back through its own open file, as on Linux.
   Approved by the owner, 2026-11-05 (approval page). 
 - **R2** · owner · No clocks. Each tree takes its queue in order, and which of two lines is newer is read from
@@ -66,10 +66,12 @@ without seeing the other. MODEL.md's rules table holds the full wording; this pa
   save made after a sync wins upstream. Source: "if the program saves after the sync has landed, then arguably
   the sandbox was the last writer and its change should take effect" (2026-11-03).
   Tests: `r3_a_save_after_the_sync_wins_upstream_by_lineage`, `r3_an_edit_over_the_decided_line_replaces_it`
-- **R3c.1** · proposed · *The owner asked, 2026-11-05: "you must first define "seen" if i am supposed to write rules around it"* "Seen" is judged per line, not per commit: a line counts as seen only if the new line
-  was written over it. Recommend: approve. Judged per commit, an edit over a sandbox's own undecided line
-  silently overwrote main's winning line (MODEL.md finding 8).
-  Tests: `r3_an_edit_over_an_undecided_line_still_collides`
+- **R3c.1** · rejected · "Seen" is judged per line, not per commit: a line counts as seen only if the new line
+  was written over it. Owner, 2026-11-05 (in chat, round 2): "this doesnt feel right"; replaced by R3c.2. Tests: `r3_an_edit_over_an_undecided_line_still_collides`
+- **R3c.2** · owner · A program has seen a version only if it could read it through normal file I/O: the file was
+  closed when that version arrived, so the program's next open reads it. Owner, 2026-11-05: "i think we can only say
+  that a client has had a chance to "see" a landing is if the file was closed when the landing occurred. that is --
+  only if the client can read the updated content through normal file I/O procedures."
 - **R3d** · owner · A sync carries the parent's current decided version, never a stale one, and keeps only the
   sandbox's own undecided lines (R3a). Tests: `r3_a_sync_carries_the_parents_current_version`,
   `r3_a_sync_keeps_the_undecided_saves`
@@ -109,6 +111,10 @@ without seeing the other. MODEL.md's rules table holds the full wording; this pa
   would write. Owner, 2026-11-05: "if a file is held by program A, and program A tries to commit a transaction, then
   it should be able to acquire a file lock." What replaces it is open (his question: does a transaction need to
   declare the program it belongs to?). Gone when: `OpenFiles`
+- **R5.3** · owner · While a transaction is in progress, other I/O on its files is prohibited, locked or deferred
+  until it completes. Owner, 2026-11-05: "additional I/O on that file must be prohibited/locked/deferred until the
+  transaction is complete. else we risk a client trying to write the transaction while also writing the the file".
+  Deferred: other writes to those files are accepted and applied in order after the transaction completes. Owner, 2026-11-05: "deferred, obviously. thats what i mean by "lock" -- its about ordering the operations so that agentfs has a change to mutate the filesystem without a client fighting it".
 
 ## 4. Who wrote what
 
@@ -120,16 +126,15 @@ without seeing the other. MODEL.md's rules table holds the full wording; this pa
 
 ## 5. History settings
 
-- **R7** · owner · One history setting per volume: full lineage (every sandbox commit in main's history) or
-  squashed (a sandbox's plain saves become one changeset). Transaction commits stay as they are. Every sandbox
+- **R7** · owner · Full lineage only: every sandbox commit is in main's history (squashing dropped, owner 2026-11-05:
+  "drop squashing"). Transaction commits stay as they are. Every sandbox
   commit stays stored. Source: "one setting per volume" (2026-11-02); "the sandbox commits could be squashed to
   one changeset (if they are the naive simple commits) ... leave the transaction commits as they are"; "every
   sandbox commit stays stored ... that makes sense" (2026-11-03). Tests: `r7_squashed_saves_land_as_one_changeset`
-- **R7.1** · approved · Squashing happens after judging: each save is judged on its own, only the winners are
-  squashed, and a loser stays its own commit. Approved by the owner, 2026-11-05 (approval page); his note: "if my squashing optimization idea causes too many issues, we can drop it entirely. it is mostly veneer to cut down on noise in the git history.". Tests: `r7_a_squashed_take_squashes_only_the_winners`
-- **R7.2** · proposed · *The owner asked, 2026-11-05: "what "history setting"?"* The history setting never changes an outcome: the same calls decide the same trees and
-  collisions under either setting. Recommend: approve (it follows from R7.1). Finding 27 broke it.
-  Tests: `r7_the_history_setting_decides_no_collision`, `random_interleavings_history_settings_decide_the_same`
+- **R7.1** · rejected · Squashing happens after judging: each save is judged on its own, only the winners are
+  squashed, and a loser stays its own commit. Approved by the owner, 2026-11-05 (approval page); his note: "if my squashing optimization idea causes too many issues, we can drop it entirely. it is mostly veneer to cut down on noise in the git history.". Owner, 2026-11-05 (in chat, round 2): "drop squashing". Gone when: `Squashed` Tests: `r7_a_squashed_take_squashes_only_the_winners`
+- **R7.2** · rejected · The history setting never changes an outcome: the same calls decide the same trees and
+  collisions under either setting. Owner, 2026-11-05 (in chat, round 2): "drop squashing": with one history mode there is no setting to compare. Gone when: `Squashed` Tests: `r7_the_history_setting_decides_no_collision`, `random_interleavings_history_settings_decide_the_same`
 
 ## 6. What a save records
 
@@ -138,9 +143,8 @@ without seeing the other. MODEL.md's rules table holds the full wording; this pa
   nothing beyond that. Source: "I dont think that agentfs should try to do anything beyond record the actions
   through the filesystem" (2026-11-03). Tests: `r8_concurrent_appends_never_overwrite_each_other`,
   `r8_a_stale_rewrite_overwrites_the_synced_line_and_history_keeps_it`
-- **R8.1** · proposed · *The owner asked, 2026-11-05: "is there a downside to this model?"* An append to a file with no final newline finishes its last line ("foo" plus "bar" is one
-  line, "foobar"), a new version of that line, so two such appends collide. Recommend: approve; it is what the
-  bytes say. Tests: `r8_an_append_onto_a_partial_last_line_finishes_it`, `r8_concurrent_appends_onto_a_partial_last_line_collide`
+- **R8.1** · approved · An append to a file with no final newline finishes its last line ("foo" plus "bar" is one
+  line, "foobar"), a new version of that line, so two such appends collide. Owner, 2026-11-05 (in chat, round 2): approved. Tests: `r8_an_append_onto_a_partial_last_line_finishes_it`, `r8_concurrent_appends_onto_a_partial_last_line_collide`
 
 ## 7. Locks and waiting
 
@@ -148,6 +152,19 @@ without seeing the other. MODEL.md's rules table holds the full wording; this pa
   writing, holds the files while it writes, and new write-opens wait for it to finish. Every wait ends on an event,
   never a timer. Source: "A sync should acquire a lock on every file that it aims to overwrite, yes" (2026-11-03).
   Tests: `r9_a_sync_waits_for_an_open_writer_then_applies`, `r9_a_write_open_waits_while_a_sync_holds_the_file`
+- **R9.10** · owner · Locks order agentfs's own writes against clients only. Clients are never locked or
+  serialized against each other (two programs on one file: last writer wins); agentfs only tracks their opens to
+  know when it has the runway to sync or land. Locking must never deadlock and should starve as little as possible.
+  Owner, 2026-11-05: "the lock mechanism only really applies to agentfs interactions -- we do not need to
+  lock/serialize multiple clients from competing with one another. we only need to track those clients so that
+  agentfs knows when it has the runway to commit/land work"; "we absolutely must avoid deadlocking, while also trying
+  to minimize starvation". How landings acquire their files is open (the owner asked for deterministic techniques
+  beyond trylocks).
+- **R9.11** · owner · Snapshot opens. A sync or landing never waits for a program's open file: it applies at once,
+  as one atomic step. Each open keeps the version of the file it opened; at close its save is merged line by line
+  against that version (R3c.2: it has not seen what arrived while it was open). Owner, 2026-11-05: "alright, lets
+  try option 4 until it becomes a problem." This supersedes the waiting in R9, R9.1, R9.3, R9.4, R9.5, R9.7 and
+  R9.9; which of their parts go is settled by the snapshot-opens design, then recorded here.
 - **R9.1** · owner · A landing locks the files its changes touch, the same way. Source: "freezing only the files
   that a landing touches sounds reasonable" (2026-11-02). Tests: `r9_a_landing_waits_for_the_parents_open_writer`,
   `r9_a_landing_holds_the_files_of_its_losing_changes`
@@ -161,47 +178,45 @@ without seeing the other. MODEL.md's rules table holds the full wording; this pa
   the rule we had discussed" (2026-11-04). Tests: `r9_a_sync_delivers_up_to_the_first_change_to_an_open_file`
 - **R9.4** · approved · A sync or landing waits for all its files at once, never holding one while it waits for
   another. Approved by the owner, 2026-11-05 (approval page); he asked whether a fast writer can starve a landing (open, with R9.8). 
-- **R9.5** · proposed · *The owner asked, 2026-11-05: "what is a "waiting entry"?"* A waiting entry waits only for its own files, and for earlier entries that share a file
-  or a source with it (P1). Recommend: approve; one long-open file then holds back only its own changes.
-  Tests: `r9_a_long_lived_main_writer_holds_back_only_its_own_file`
+- **R9.5** · approved · A waiting entry waits only for its own files, and for earlier entries that share a file
+  or a source with it (P1). Owner, 2026-11-05 (in chat, round 2): "i think approve". Tests: `r9_a_long_lived_main_writer_holds_back_only_its_own_file`
 - **R9.6** · approved · A client's death closes its open files and saves them, as Linux's close on exit does.
   Approved by the owner, 2026-11-05 (approval page). Tests: `r9_client_death_releases_its_locks`
 - **R9.7** · approved · `unlink` and `rename` of a locked file wait like a write-open.
   Approved by the owner, 2026-11-05 (approval page). Tests: `r11_an_unlink_or_rename_of_a_held_file_waits`
-- **R9.8** · proposed · *The owner asked, 2026-11-05: "can we do better than an alarm?"* Each open that keeps a waiting landing waiting raises an alarm event. Recommend: approve;
-  it is the only signal that a landing may never happen.
-  Tests: `r9_new_writers_postpone_a_waiting_take_and_raise_an_alarm`
-- **R9.9** · proposed · *The owner asked, 2026-11-05: "where it came from? how can a decisions be seperated from its change?"* A held-back commit's decisions are held back with it, so a decision never arrives before
-  the change it decided. Recommend: approve (it fixed a review P0).
-  Tests: `r9_a_prefix_sync_delivers_no_upstream_decision_before_its_commit`
+- **R9.8** · rejected · Each open that keeps a waiting landing waiting raises an alarm event. Owner, 2026-11-05:
+  "no alarm is needed". Gone when: `Delayed`
+- **R9.9** · approved · A held-back commit's decisions are held back with it, so a decision never arrives before
+  the change it decided. Owner, 2026-11-05 (in chat, round 2): approved; decisions to be recorded in the commit they belong to (with R5.1). Tests: `r9_a_prefix_sync_delivers_no_upstream_decision_before_its_commit`
 
 ## 8. Lines, files and names
 
-- **R10** · proposed · *The owner asked, 2026-11-05: "are we merging by lines or bytes? this one appears to conflict with R8.1"* At close, a save matches the program's bytes to the file's old lines once, by git's
+- **R10** · approved · At close, a save matches the program's bytes to the file's old lines once, by git's
   histogram diff. Matched lines keep their identity. From then on collisions compare line identities, never
-  positions. A moved line counts as a delete plus a new line. Recommend: approve. It answers his "Go" to "settle
-  what a line is" (2026-11-03); the costs are in MODEL.md §Costs. Tests: `r10_an_insert_shifts_lines_without_changing_their_identity`
+  positions. A moved line counts as a delete plus a new line. Owner, 2026-11-05 (in chat, round 2): approved. Tests: `r10_an_insert_shifts_lines_without_changing_their_identity`
 - **R10.3** · owner · Two deletes of one line agree: both are recorded as ordinary changes of their saves, the
   merge reports no collision, and the line stays deleted. Owner, 2026-11-05: "i want minimal "special cases", so
   if both deletes are recorded and then agree, my hope is that a merge reports no conflicts and life is good".
+- **R10.4** · owner · A line appended after the parent's unfinished last line (no final newline) collides with it,
+  and the parent wins. agentfs never adds a newline no program wrote. Owner, 2026-11-05: "collide".
 - **R10.1** · approved · Of two inserts at one place, the parent's comes first. Approved by the owner, 2026-11-05 (approval page); he asked whether this is only inserts: yes; two edits of one line are a collision the parent wins (R3b). Tests: `r10_concurrent_inserts_at_one_place_keep_both_the_parents_first`
-- **R10.2** · proposed · *The owner asked, 2026-11-05: "i dont know what this means"* A partial last line that a merge puts another line after reads as ending in a newline.
-  Recommend: approve. Tests: `r10_a_line_after_a_partial_line_reads_terminated`
+- **R10.2** · rejected · A partial last line that a merge puts another line after reads as ending in a newline. Owner, 2026-11-05 (in chat, round 2): "collide": a line appended after the parent's unfinished last line collides with it (R10.4). Gone when: `r10_a_line_after_a_partial_line_reads_terminated` Tests: `r10_a_line_after_a_partial_line_reads_terminated`
 - **R11** · approved · A file keeps its identity through renames (like an inode). Its name and existence are one
   more line, judged like any other: an unlink loses against a parent's edit it never saw; an edit of a file the
   parent unlinked loses; a rename and an edit both apply. Approved by the owner, 2026-11-05 (approval page). Tests:
   `r11_an_unlink_against_a_concurrent_edit_the_parent_wins`, `r11_a_rename_and_a_concurrent_edit_both_apply`
-- **R11.1** · proposed · *The owner asked, 2026-11-05: "is this related to landing and file locks?"* When two files are renamed to one path, the parent's keeps it. Until that is decided,
-  the sandbox keeps its own name and shows the parent's file under its previous name. On a chain, the same rule
-  repeats until no two files share a path. Recommend: approve. Tests:
+- **R11.1** · owner · When two files are renamed to one path, the parent's queue decides it like any collision:
+  the parent's name wins and the sandbox's save loses. Until then the sandbox shows its files as they were without
+  the parent's clashing rename, so the parent's file keeps the name it has in the sandbox; on a chain, the same
+  until no two files share a path. Owner, 2026-11-05: "before the landing, the filesystem should show the state of
+  the files without the landing". Tests:
   `r11_two_renames_to_one_path_keep_the_sandboxs_name_until_decided`, `r11_a_chain_of_renames_to_one_path_keeps_every_previous_name`
 - **R11.2** · approved · An editor's atomic save (write a new file, rename it over the old one) is a rewrite of
   the old file, so the file keeps its identity and merges per line. Approved by the owner, 2026-11-05 (approval page). Tests: `r11_an_atomic_save_keeps_the_files_identity_and_merges_per_line`
-- **R11.3** · proposed · *The owner asked, 2026-11-05: "is this consistent with linux?"* Writes through a handle whose file was unlinked or replaced reach no file, and raise an
-  `OrphanDropped` event. Recommend: approve; on Linux they go to a file no name reaches.
-  Tests: `r11_an_old_writer_after_an_atomic_save_saves_nothing`
-- **R11.4** · proposed · *The owner asked, 2026-11-05: "i dont know what this means"* A tracked file arriving at a path an untracked file holds wins the path; the untracked
-  file stays hidden and shows again if the tracked one goes. Recommend: approve.
+- **R11.3** · approved · Writes through a handle whose file was unlinked or replaced reach no file, and raise an
+  `OrphanDropped` event. Owner, 2026-11-05 (in chat, round 2): approved. Tests: `r11_an_old_writer_after_an_atomic_save_saves_nothing`
+- **R11.4** · approved · A tracked file arriving at a path an untracked file holds wins the path; the untracked
+  file stays hidden and shows again if the tracked one goes. Owner, 2026-11-05 (in chat, round 2): option 1, the tracked file shows.
 
 ## 9. Crashes
 
