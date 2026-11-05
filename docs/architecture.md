@@ -128,6 +128,7 @@ missing from these tables or a row names a module that no longer exists;
 
 | Module | Role |
 |---|---|
+| `prototype.rs` | Experimental main/sandbox FUSE views over one target-model actor: direct I/O, saved-reader snapshots and byte-call writes |
 | `lib.rs` | Crate root and overview |
 | `ops.rs` | Every filesystem operation without the kernel, unit-tested against a real directory and state area |
 | `fuse.rs` | The kernel adapter: `fuser::Filesystem` over `Ops`, and kernel passthrough negotiation |
@@ -152,6 +153,7 @@ missing from these tables or a row names a module that no longer exists;
 
 | Module | Role |
 |---|---|
+| `prototype_cmd.rs` | Experimental `prototype init`, `fork` and `mount` composition root; separate state format |
 | `main.rs` | The CLI (`Cli`), command dispatch, `init`, `status`, `record`, `flush`, `push` (direct), `run` and `mount` |
 | `daemon.rs` | Signals and shutdown for `run` and `mount` |
 | `front.rs` | `mount --history-service`: a front of a history service (§14) |

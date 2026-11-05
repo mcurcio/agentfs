@@ -4257,6 +4257,10 @@ one-time migration of Hermes' existing data and the initial import in
 
 ### 17.1 Layer 1: core and daemon (Rust)
 
+The experimental `prototype` command has `init`, `fork` and `mount` subcommands,
+using a separate disposable state area. The [prototype page](target-architecture/prototype.md)
+describes its recording-only contract and limits. It is not a production mount.
+
 - **`agentfs-core`, a library:**
   - recording (§3);
   - rules (§4);

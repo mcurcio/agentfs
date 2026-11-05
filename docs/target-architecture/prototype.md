@@ -5,6 +5,39 @@ without replacing the production recorder. It is experimental, has a separate st
 format, and must use a disposable state directory. The full prototype's exit
 criteria are still open. This page records implementation scope, not new merge rules.
 
+## Try the filesystem slice
+
+On Linux with `/dev/fuse` and `fusermount3`, build with
+`cargo build --locked -p agentfs`, then use an empty, disposable directory:
+
+```sh
+mkdir -p /tmp/agentfs-prototype/main /tmp/agentfs-prototype/sandbox
+target/debug/agentfs --state /tmp/agentfs-prototype/state prototype init
+target/debug/agentfs --state /tmp/agentfs-prototype/state prototype mount \
+  /tmp/agentfs-prototype/main --sandbox /tmp/agentfs-prototype/sandbox
+```
+
+From another terminal, use ordinary file calls in either mount. Files saved in
+one stay isolated from the other. The sandbox starts at main's saved head when
+created. The process prints its `fork/N` name; after stopping it, reuse that
+sandbox with `--fork fork/N`. `prototype fork` creates one without a mount and
+prints its name. Unmount **both** directories with `fusermount3 -u PATH` to exit.
+Only the mounting user can access these views. Mountpoints must be empty and
+must not overlap the state directory or one another. `--writer` and
+`--sandbox-writer` set trusted labels; they do not authenticate clients.
+
+The FUSE adapter uses direct I/O and zero entry/attribute TTLs. A read-only open
+holds a snapshot of saved bytes; a writable open reads its own private bytes.
+Unsupported operations fail instead of passing through to an unrecorded backing
+file. Modes are fixed at 0700 for the root and 0600 for files. The adapter does
+not negotiate passthrough, shared writable mappings or writeback cache.
+
+**Publication ordering remains incomplete.** `FLUSH`/`fsync` syncs the journal;
+`RELEASE` publishes the save. Linux sends `RELEASE` asynchronously, so an immediate
+open after `close(2)` can still see the previous saved bytes. The mounted tests
+wait explicitly for publication. This is a known gap against §18's immediate
+close-to-open exit criterion, not an accepted change to that contract.
+
 ## Recording library
 
 `agentfs_core::prototype::Volume` is a synchronous actor owning one exclusively
@@ -65,6 +98,14 @@ These tests use real repositories and disk files. They also SIGKILL a subprocess
 after an acknowledged write, inject a stale ref lock and fail a checkout after
 a branch move. Restart recovers without duplicating a save. This is process-crash
 evidence, not power-loss evidence.
+
+`ci/e2e-prototype.sh`, in the CI workflow's prototype job, drives main and sandbox
+mounts using actual file calls: write, read, append, `fsync`, offset writes and
+truncation against a plain-file oracle; atomic save over an old writer; unlink and
+recreate; rename of an open file; isolation; and killing the serving process with
+an acknowledged write still open, then remounting and checking replay twice.
+This script needs `/dev/fuse`; unit tests do not. It does not claim power-loss,
+full state-area `ENOSPC`, live landing, prefix sync or full conformance coverage.
 
 On `EIO` or a save failure, stop serving and preserve the state area. Fix space or
 I/O problems before reopening it; reopening replays pending calls. On a journal

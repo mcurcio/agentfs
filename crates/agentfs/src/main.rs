@@ -63,6 +63,7 @@ mod hold;
 mod lfs_cmd;
 mod otel;
 mod patch_cmd;
+mod prototype_cmd;
 mod push_now;
 mod recovery;
 #[cfg(test)]
@@ -136,6 +137,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Experimental target-model recording stack; use a disposable state area.
+    Prototype(prototype_cmd::Args),
     /// Create a state area, or check an existing one: safe to run at every
     /// start (exit 0 when it already belongs to the volume, 1 when it
     /// belongs to another volume or branch). With --root, also creates the
@@ -444,6 +447,12 @@ fn real_main() -> Result<ExitCode> {
     let cli = Cli::parse();
     let state = StateDir::new(&cli.state);
     match cli.command {
+        Command::Prototype(args) => {
+            if cli.root.is_some() || !cli.wait_lock.is_zero() {
+                bail!("prototype uses --state only; --root and --wait-lock are not supported");
+            }
+            prototype_cmd::run(&cli.state, args)?;
+        }
         Command::Init {
             volume,
             branch,
