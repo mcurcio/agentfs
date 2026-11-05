@@ -94,6 +94,11 @@ without seeing the other. MODEL.md's rules table holds the full wording; this pa
   optimization was injected which is causing problems". The delete is now an ordinary change of its save.
   Gone when: `lost_delete`, `r3_a_dropped_agreeing_delete_follows_the_delete_it_agreed_with`,
   `r3_a_nested_sandboxs_dropped_delete_follows_the_delete_that_lost`
+- **R3f** · owner · Trees are never kept in step by ordering them. There are always periods when two trees do not hold
+  the same commits. What agentfs guarantees is that every tree applies the same reconciliation rules, so histories
+  eventually settle, consistently. Owner, 2026-11-05: "we can’t control the order that remotes synchronize. There are
+  guaranteed to be periods where they don’t have the same commits. Our rules are about them sharing the same
+  reconciliation rules so that the histories eventually settle, consistently."
 - **R4** · owner · Nothing waits behind a collision: every sandbox commit is taken in order and lands or loses
   whole. Source: "Every commit can be landed independently (according to the rules of the commit vs transaction,
   etc)." (2026-11-04). Tests: `r4_nothing_waits_behind_a_collision`
