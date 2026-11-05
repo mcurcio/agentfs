@@ -131,7 +131,7 @@ without seeing the other. MODEL.md's rules table holds the full wording; this pa
   "drop squashing"). Transaction commits stay as they are. Every sandbox
   commit stays stored. Source: "one setting per volume" (2026-11-02); "the sandbox commits could be squashed to
   one changeset (if they are the naive simple commits) ... leave the transaction commits as they are"; "every
-  sandbox commit stays stored ... that makes sense" (2026-11-03). Tests: `r7_squashed_saves_land_as_one_changeset`
+  sandbox commit stays stored ... that makes sense" (2026-11-03). Tests: `r7_every_sandbox_commit_lands_on_its_own_in_mains_history`
 - **R7.1** · rejected · Squashing happens after judging: each save is judged on its own, only the winners are
   squashed, and a loser stays its own commit. Approved by the owner, 2026-11-05 (approval page); his note: "if my squashing optimization idea causes too many issues, we can drop it entirely. it is mostly veneer to cut down on noise in the git history.". Owner, 2026-11-05 (in chat, round 2): "drop squashing". Gone when: `Squashed`
 - **R7.2** · rejected · The history setting never changes an outcome: the same calls decide the same trees and
