@@ -175,6 +175,10 @@ without seeing the other. MODEL.md's rules table holds the full wording; this pa
   about to occur, the client view becomes sticky to whatever commit predates the client landing. And the client view
   can only be fast-forwarded after the landing(s) have been fully resolved and also only when the client opens a file
   again."
+- **R9.17** · owner · The view moves forward per file, per open. agentfs tracks each open file against the commit it
+  opened; a file opened after a landing sees it, and a file already open stays on its own commit. Owner, 2026-11-05:
+  "the view can only move forward for each file that has opened after the landing. so we would likely need to track
+  each open file against the SHA that it opened".
 - **R9.14** · owner · A file deleted or replaced by an incoming change while a program has it open: the program's
   save still counts as an edit of that file, judged by R11 (an edit of a file the parent deleted loses, kept in
   history). Owner, 2026-11-05: "(a) sounds correct to me". R11.3 covers deletes made inside the same tree only.
