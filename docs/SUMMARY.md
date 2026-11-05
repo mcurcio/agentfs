@@ -50,7 +50,7 @@
 
 - [Overview](target-architecture/README.md)
   - [agentfs in git terms](target-architecture/git-model.md)
-- [Experimental prototype](target-architecture/prototype.md)
+- [Phase 1: implementation and validation](target-architecture/phase-1.md)
   - [The system](target-architecture/system.md)
   - [Rules](target-architecture/domains/rules.md)
   - [Clients](target-architecture/domains/clients.md)

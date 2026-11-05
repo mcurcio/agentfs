@@ -250,10 +250,13 @@ Never re-run until a seed passes, skip a seed, or lower the seed count to get gr
 - Build output, scratch copies for planted bugs and long seed logs go on a disk with room, not a small system
   disk.
 
-## Plan: the model as the conformance suite (not built)
+## Phase 1: the model as the conformance suite (integration still due)
 
-Today the model checks the design only. The plan is to run the same scenarios and random runs against the
-real implementation, so the code is held to the rules the model checked. Two ways, not yet chosen:
+[Phase 1](../../docs/target-architecture/phase-1.md) builds the proposed design so real end-to-end tests
+can validate this model. The tree actor and mounted recording scenarios exist. The shared conformance
+integration is still due: passing the byte and recording tests alone does not validate landing/sync or
+complete phase 1. Run the same supported scenarios and random calls against the implementation, so its
+visible bytes, history, collisions and progress are held to these rules. Two integration options:
 
 - **A shared trait.** The calls the tests make (open, write, close, unlink, rename, take a queue step, begin
   and end a transaction, sync, read a tree, read the history) become one trait. The model implements it,

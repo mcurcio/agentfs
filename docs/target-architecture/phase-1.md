@@ -1,26 +1,56 @@
-# Experimental target-model prototype
+# Phase 1: implementation and end-to-end validation
 
-The initial MVP starts [git-model §18](git-model.md#18-prototype-plan-first-recording-slice-built),
-without replacing the production recorder. It is experimental, has a separate state
-format, and must use a disposable state directory. The full prototype's exit
-criteria are still open. This page records implementation scope, not new merge rules.
+Phase 1 is the MVP implementation of the proposed design in PR #23. The owner
+clarified its purpose on 2026-11-05: "The goal is to build the phase 1 / MVP of
+the proposed design in the PR so we can run real end-to-end tests and validate
+the model". This code is the implementation foundation to build on.
 
-## Try the filesystem slice
+The contract is [git-model.md](git-model.md). Its
+[§18 exit criteria](git-model.md#18-phase-1-implementation-and-end-to-end-validation)
+define what the real filesystem must validate. **Phase 1 is in progress.** The
+recording milestone is implemented and has mounted end-to-end coverage. The
+landing/sync and model-conformance milestones remain to be built.
+
+## Milestones and completion
+
+| Milestone | Status | Validation |
+|---|---|---|
+| Tree actor, byte-call journal, main/sandbox branches and views | Recording milestone built | Library tests and mounted Linux scenarios cover byte calls, saved-reader snapshots, object lifetime and restart replay |
+| Line-map storage and parent referee; whole-save landing and preserved losers | Due in phase 1 | Drive parent-wins and nonconflicting-line cases through real mounts; inspect saved bytes, Git ancestry and collision records against the model |
+| Live landing and sync with P1 progress, P2 prefix sync and no P3 | Due in phase 1 | Exercise held files and cooperating programs; verify disjoint progress, ordered delivery and postponed-landing alarms |
+| Close-to-open ordering and recording failure/recovery boundaries | Partly covered; exit criteria remain open | Immediate reopen in the same and another process; kill at every durable step; full state area; power-loss replay; object/page-cache cases in §18 |
+| Model conformance on the implemented subset and measurements | Due in phase 1 | Reuse supported scenarios and seeded calls, comparing visible bytes and history with the model and independent oracles; record latency and space costs |
+
+Passing recording tests is evidence for that milestone. Phase 1 completes when
+the pass-or-fail criteria in §18 pass on Linux CI and findings are resolved in
+the implementation or the model. Do not weaken a model invariant or silently
+exclude a failing scenario. The
+[conformance plan](../../crates/agentfs-model/VERIFYING.md#phase-1-the-model-as-the-conformance-suite-integration-still-due)
+describes integration options. The independent model stays independent of product
+code. Current tests compare recording bytes with Linux; they do not yet compare
+landing/sync behavior with the model.
+
+Phase 1 initially covers full lineage, main and one sandbox. §18 places squashed
+history, nested forks, transactions, Rules/view profiles, replication, CSI,
+several view hosts and upgrades beyond this phase. The implementation grows
+through the domain APIs below.
+
+## Run the tree views
 
 On Linux with `/dev/fuse` and `fusermount3`, build with
-`cargo build --locked -p agentfs`, then use an empty, disposable directory:
+`cargo build --locked -p agentfs`, then use empty mountpoints and a dedicated state directory:
 
 ```sh
-mkdir -p /tmp/agentfs-prototype/main /tmp/agentfs-prototype/sandbox
-target/debug/agentfs --state /tmp/agentfs-prototype/state prototype init
-target/debug/agentfs --state /tmp/agentfs-prototype/state prototype mount \
-  /tmp/agentfs-prototype/main --sandbox /tmp/agentfs-prototype/sandbox
+mkdir -p /tmp/agentfs-trees/main /tmp/agentfs-trees/sandbox
+target/debug/agentfs --state /tmp/agentfs-trees/state trees init
+target/debug/agentfs --state /tmp/agentfs-trees/state trees mount \
+  /tmp/agentfs-trees/main --sandbox /tmp/agentfs-trees/sandbox
 ```
 
 From another terminal, use ordinary file calls in either mount. Files saved in
 one stay isolated from the other. The sandbox starts at main's saved head when
 created. The process prints its `fork/N` name; after stopping it, reuse that
-sandbox with `--fork fork/N`. `prototype fork` creates one without a mount and
+sandbox with `--fork fork/N`. `trees fork` creates one without a mount and
 prints its name. Unmount **both** directories with `fusermount3 -u PATH` to exit.
 Only the mounting user can access these views. Mountpoints must be empty and
 must not overlap the state directory or one another. `--writer` and
@@ -40,7 +70,7 @@ close-to-open exit criterion, not an accepted change to that contract.
 
 ## Recording library
 
-`agentfs_core::prototype::Volume` is a synchronous actor owning one exclusively
+`agentfs_core::tree_actor::Volume` is a synchronous actor owning one exclusively
 locked state area. `write_open` binds a handle to a tree, writer and object;
 `write` takes byte offsets or appends; `truncate` shrinks or grows with zero bytes.
 `sync` ensures durability without publication; `close` publishes by replaying the
@@ -50,7 +80,7 @@ rename and unlink are recorded namespace changes too.
 
 Main is `refs/heads/main`. `fork()` snapshots main into `refs/heads/fork/<n>`
 in the same bare repository and records main as its local upstream. Fork saves
-remain isolated. There is deliberately no landing or sync implementation yet:
+remain isolated. Landing and sync are the next implementation milestones:
 native Git merge cannot replace the model's line identities or parent referee.
 
 The state area contains `history.git`, `calls.wal`, `actor.lock`, `format`, and
@@ -58,6 +88,8 @@ private checkout caches at `trees/main` and `trees/fork/<n>`. No checkout contai
 a `.git` entry. These first caches use git2 checkout, not linked Git worktrees or
 on-disk indexes yet. They are rebuilt from the branches before serving after a
 restart. Workloads must use the view API, never mutate a checkout or state area.
+State written by the first recording increments remains readable. The namespace
+change does not rewrite its journal or Git history; new state uses the tree label.
 
 The byte-call WAL stores checksummed frames and persistent, monotonic event/open
 numbers. Every call is fsynced before acknowledgement, a deliberate performance
@@ -65,7 +97,7 @@ cost before group commit. A recording or save failure stops the actor: its WAL
 is retained, and reopening replays it. A complete corrupt frame refuses recovery;
 only an incomplete final frame is discarded. No acknowledged record is silently
 dropped as corruption. The WAL is not compacted: boot time and disk usage grow
-with all calls. Do not use this implementation for long-running workloads.
+with all calls. Account for this limit when running long tests.
 
 Recovery reconstructs object IDs from the journal, including rename-over and
 unlink, rather than matching paths. An old handle's later writes never change
@@ -73,33 +105,36 @@ the replacement. The close returns `OrphanDropped`. Recovery appends closes for
 abandoned opens; a per-branch event trailer makes replay after an already-written
 commit idempotent. Checkout failures retain the journal too.
 
-## Current limits
+## Current implementation boundaries
 
 Only flat regular files with git-safe UTF-8 names; no directories, symlinks,
 permissions changes, hard links, `mmap`, `O_TMPFILE`, or direct access by another
-process. The initial size guard is 16 MiB, conservatively reserved across pending writers. This is a prototype resource limit,
-not a new production policy. Writer labels are trusted operator inputs, not
+process. The current size guard is 16 MiB, conservatively reserved across pending
+writers. Writer labels are trusted operator inputs, not
 authenticated client capabilities. All admitted names are recorded; ignore and
 attribute rules and view profiles are not wired yet.
 
-Not built: line-map storage, the landing queue/referee, automatic sync, collision
-refs/notes, transactions, squashed history, nested forks, replication, RPC,
-multi-host views, CSI integration, telemetry export, journal compaction and upgrades.
+Still to implement in phase 1: line-map storage, the landing queue/referee,
+automatic sync, collision refs/notes and progress checks. Transactions, squashed
+history, nested forks, replication, multi-host views, CSI integration and upgrades
+are beyond §18’s initial phase. Authenticated RPC, telemetry export and journal
+compaction are not wired in this milestone.
 Existing model findings, including 27, are unchanged. This slice does not settle
 them and must not be presented as full model conformance.
 
 ## Verification and recovery
 
-`cargo test --locked -p agentfs-core --test prototype` checks byte calls against
+`cargo test --locked -p agentfs-core --test tree_actor` checks byte calls against
 a plain Linux file, publication at close, append onto a partial line, replay onto
 the current head, object-safe rename/unlink, restart idempotence, checkout repair,
 fork isolation, the exclusive actor lock, unsafe names, and torn/corrupt tails.
-These tests use real repositories and disk files. They also SIGKILL a subprocess
+These tests use real repositories and disk files, including state compatibility
+with the first recording increment’s format label. They also SIGKILL a subprocess
 after an acknowledged write, inject a stale ref lock and fail a checkout after
 a branch move. Restart recovers without duplicating a save. This is process-crash
 evidence, not power-loss evidence.
 
-`ci/e2e-prototype.sh`, in the CI workflow's prototype job, drives main and sandbox
+`ci/e2e-trees.sh`, in the CI workflow's tree-view job, drives main and sandbox
 mounts using actual file calls: write, read, append, `fsync`, offset writes and
 truncation against a plain-file oracle; atomic save over an old writer; unlink and
 recreate; rename of an open file; isolation; and killing the serving process with

@@ -3,7 +3,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
 use std::os::unix::fs::FileExt;
 
-use agentfs_core::prototype::{Error, Saved, Volume};
+use agentfs_core::tree_actor::{Error, Saved, Volume};
 
 fn put(v: &mut Volume, tree: &str, path: &str, bytes: &[u8]) -> u64 {
     let h = v.write_open(tree, path, "test-writer", true).unwrap();
@@ -179,6 +179,34 @@ fn forks_are_real_branches_and_isolate_saves() {
 }
 
 #[test]
+fn state_from_the_first_recording_increment_keeps_its_history_and_pending_calls() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut v = Volume::open(tmp.path()).unwrap();
+    put(&mut v, "main", "a", b"saved");
+    let saved_head = v.head("main").unwrap();
+    let h = v.write_open("main", "a", "writer", false).unwrap();
+    v.write(h, 0, b"-pending", true).unwrap();
+    drop(v);
+    fs::write(tmp.path().join("format"), b"agentfs-prototype-1\n").unwrap();
+    let v = Volume::open(tmp.path()).unwrap();
+    assert_eq!(v.read("main", "a").unwrap(), b"saved-pending");
+    let recovered_head = v.head("main").unwrap();
+    let repo = git2::Repository::open_bare(tmp.path().join("history.git")).unwrap();
+    assert_eq!(
+        repo.find_commit(recovered_head)
+            .unwrap()
+            .parent_id(0)
+            .unwrap(),
+        saved_head
+    );
+    drop(v);
+    assert_eq!(
+        Volume::open(tmp.path()).unwrap().head("main").unwrap(),
+        recovered_head
+    );
+}
+
+#[test]
 fn single_actor_and_invalid_names_fail_before_recording() {
     let tmp = tempfile::tempdir().unwrap();
     let mut v = Volume::open(tmp.path()).unwrap();
@@ -236,7 +264,7 @@ fn killed_actor_replays_acknowledged_calls() {
     let tmp = tempfile::tempdir().unwrap();
     let mut child = Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "crash_worker", "--nocapture"])
-        .env("AGENTFS_PROTOTYPE_CRASH_TEST", tmp.path())
+        .env("AGENTFS_TREE_ACTOR_CRASH_TEST", tmp.path())
         .stdout(Stdio::piped())
         .spawn()
         .unwrap();
@@ -267,7 +295,7 @@ fn killed_actor_replays_acknowledged_calls() {
 
 #[test]
 fn crash_worker() {
-    let Some(root) = std::env::var_os("AGENTFS_PROTOTYPE_CRASH_TEST") else {
+    let Some(root) = std::env::var_os("AGENTFS_TREE_ACTOR_CRASH_TEST") else {
         return;
     };
     let mut v = Volume::open(std::path::Path::new(&root)).unwrap();
@@ -286,7 +314,7 @@ fn concurrent_appends_cannot_exceed_the_limit_only_at_release() {
     let mut v = Volume::open(tmp.path()).unwrap();
     let a = v.write_open("main", "a", "one", true).unwrap();
     let b = v.write_open("main", "a", "two", false).unwrap();
-    v.truncate(a, agentfs_core::prototype::MAX_FILE_SIZE as u64)
+    v.truncate(a, agentfs_core::tree_actor::MAX_FILE_SIZE as u64)
         .unwrap();
     assert!(matches!(v.write(b, 0, b"x", true), Err(Error::TooLarge)));
     v.close(a).unwrap();

@@ -1,4 +1,4 @@
-//! Byte-call frames for the experimental actor (git-model §3).
+//! Byte-call frames for the tree actor (git-model §3).
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};

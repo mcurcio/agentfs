@@ -1,6 +1,6 @@
-//! Experimental target-model composition root (git-model §18).
-use agentfs_core::prototype::Volume;
-use agentfs_fuse::prototype::{Binding, serve};
+//! Target-model composition root (git-model §18).
+use agentfs_core::tree_actor::Volume;
+use agentfs_fuse::tree_view::{Binding, serve};
 use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
 
@@ -12,7 +12,7 @@ pub struct Args {
 
 #[derive(clap::Subcommand)]
 enum Command {
-    /// Initialize or recover a disposable prototype state area.
+    /// Initialize or recover the tree actor's state area.
     Init,
     /// Create an isolated sandbox branch at main's saved head; print its name.
     Fork,
@@ -36,7 +36,7 @@ enum Command {
 }
 
 pub fn run(state: &Path, args: Args) -> Result<()> {
-    let mut volume = Volume::open(state).context("opening experimental prototype state")?;
+    let mut volume = Volume::open(state).context("opening tree state")?;
     match args.command {
         Command::Init => println!("main {}", volume.head("main")?),
         Command::Fork => println!("{}", volume.fork()?),
@@ -62,14 +62,14 @@ pub fn run(state: &Path, args: Args) -> Result<()> {
                 } else {
                     volume.fork()?
                 };
-                eprintln!("prototype sandbox tree: {tree}");
+                eprintln!("sandbox tree: {tree}");
                 bindings.push(Binding {
                     tree,
                     writer: sandbox_writer,
                     mountpoint,
                 });
             }
-            serve(state, volume, bindings).context("serving experimental prototype views")?;
+            serve(state, volume, bindings).context("serving tree views")?;
         }
     }
     Ok(())

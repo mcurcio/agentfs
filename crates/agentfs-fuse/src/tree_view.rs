@@ -1,4 +1,4 @@
-//! Experimental flat-file view of the target actor (git-model §3/§7/§18).
+//! Phase 1 flat-file view of the target actor (git-model §3/§7/§18).
 //! Direct I/O and zero TTLs; no passthrough or writeback-cache negotiation.
 
 use std::collections::BTreeMap;
@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use agentfs_core::prototype::{Error, Saved, Volume};
+use agentfs_core::tree_actor::{Error, Saved, Volume};
 use fuser::*;
 
 const TTL: Duration = Duration::ZERO;
@@ -38,7 +38,7 @@ pub fn serve(state: &Path, volume: Volume, bindings: Vec<Binding>) -> io::Result
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "prototype mounts must be empty directories, separate from state and each other",
+                "trees mounts must be empty directories, separate from state and each other",
             ));
         }
         volume.head(&binding.tree).map_err(io::Error::other)?;
@@ -48,7 +48,7 @@ pub fn serve(state: &Path, volume: Volume, bindings: Vec<Binding>) -> io::Result
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "invalid prototype writer",
+                "invalid tree writer",
             ));
         }
         points.push(at);
@@ -67,7 +67,7 @@ pub fn serve(state: &Path, volume: Volume, bindings: Vec<Binding>) -> io::Result
         };
         let mut config = Config::default();
         config.mount_options = vec![
-            MountOption::FSName("agentfs-prototype".into()),
+            MountOption::FSName("agentfs-trees".into()),
             MountOption::DefaultPermissions,
             MountOption::NoDev,
             MountOption::NoSuid,
@@ -208,7 +208,7 @@ impl View {
         if let Open::Write { handle, .. } = entry
             && v.close(handle).map_err(errno)? == Saved::OrphanDropped
         {
-            eprintln!("prototype OrphanDropped: tree={} open={handle}", self.tree);
+            eprintln!("tree OrphanDropped: tree={} open={handle}", self.tree);
         }
         Ok(())
     }
@@ -453,7 +453,7 @@ impl Filesystem for View {
             Ok(()) => reply.ok(),
             Err(e) => {
                 eprintln!(
-                    "prototype SaveFailed: tree={} errno={e:?}; preserve state and restart",
+                    "tree SaveFailed: tree={} errno={e:?}; preserve state and restart",
                     self.tree
                 );
                 reply.error(e);

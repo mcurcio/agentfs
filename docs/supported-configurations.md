@@ -30,10 +30,10 @@ in:
   share commits through remotes. What matters is refs, order, merging and
   gating.
 
-The [target-model prototype](target-architecture/prototype.md) is a separate
-experimental configuration: one local actor, main and an optional isolated sandbox
-mount, flat files only, no remotes or CSI. The production combinations below do
-not imply prototype support.
+[Phase 1 of the proposed architecture](target-architecture/phase-1.md) currently
+supports one local actor, main and an optional isolated sandbox mount, flat files
+only, without remotes or CSI. Its end-to-end validation work continues on this
+implementation. The combinations below describe the earlier implementation.
 
 ## 1. Dimensions
 

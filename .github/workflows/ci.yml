@@ -464,8 +464,8 @@ jobs:
           ci/lfs-server.sh stop "$RUNNER_TEMP/lfs-server"
           ci/git-http-server.sh stop "$RUNNER_TEMP/git-server"
 
-  prototype:
-    name: e2e (target-model recording prototype)
+  trees:
+    name: e2e (phase 1 tree views)
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -474,10 +474,10 @@ jobs:
           toolchain: stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          key: prototype
+          key: trees
       - run: sudo apt-get update && sudo apt-get install -y fuse3
       - run: cargo build --locked -p agentfs
-      - run: ci/e2e-prototype.sh
+      - run: ci/e2e-trees.sh
 
   csi-sanity:
     name: e2e (csi-sanity against agentfs-csi)

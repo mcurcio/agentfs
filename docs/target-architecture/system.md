@@ -271,7 +271,7 @@ go", 2026-10-17).
 3. **File watchers have no guarantee** (A11): `TreeMoved` and `ViewCaughtUp` are the reliable notices.
 4. **A full checkout per fork** until Trees' storage optimisation serves the same files from less space.
 5. **Five gaps wait for their own gate** (§5), three of them resting on the owner's words (R9, R13, R14, R15, A3).
-6. **The architecture is not settled until the prototype passes** (git-model §18): durable writes, byte-level
+6. **Phase 1 validates the architecture through end-to-end tests** (git-model §18): durable writes, byte-level
    calls, rename-over with open handles and queue progress on a real mount, none of which the model runs.
 
 **Tracer bullet** (design choice). A sidecar runs main's view and one sandbox view: (1) the sandbox closes p; main's
@@ -305,4 +305,4 @@ object capabilities · the transactional outbox · Kubernetes liveness probes ·
 
 **NOT RUN:** the agentfs source was not read; the Rust is reasoned, not compiled.
 
-*History: revisions 1–9 are in git; revision 10 (2026-11-03) removes everything git-model.md now owns; revision 11 (2026-11-04) follows git-model's journal, progress rules and prototype plan.*
+*History: revisions 1–9 are in git; revision 10 (2026-11-03) removes everything git-model.md now owns; revision 11 (2026-11-04) follows git-model's journal, progress rules and filesystem validation plan.*

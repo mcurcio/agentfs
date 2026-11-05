@@ -1,11 +1,12 @@
-//! First real-filesystem slice of target git-model §3, §6, §7 and §18.
+//! Tree actor for phase 1 of target git-model §3, §6, §7 and §18.
 //!
 //! One exclusively locked actor owns a repository, private checkouts and a
-//! byte-call WAL. This is NOT the production recorder or a landing referee.
-//! It supports flat regular files and full-lineage saves on main and forks.
+//! byte-call WAL. The recording milestone supports flat regular files and
+//! full-lineage saves on main and forks. The actor is the implementation
+//! foundation for the landing referee and sync work still due in phase 1.
 //! Every call is fsynced before acknowledgement (deliberately stronger and
 //! slower than the target's group commit). Checkouts are disposable caches;
-//! the branches are authoritative. See docs/target-architecture/prototype.md.
+//! the branches are authoritative. See docs/target-architecture/phase-1.md.
 
 mod wal;
 
@@ -21,9 +22,12 @@ use serde::{Deserialize, Serialize};
 use crate::file_lock::{FileLock, Mode};
 use crate::paths::RepoPath;
 
-/// A bounded prototype, not a production volume's size policy.
+/// Phase 1's current per-file resource guard.
 pub const MAX_FILE_SIZE: usize = 16 << 20;
-const FORMAT: &str = "agentfs-prototype-1\n";
+const FORMAT: &str = "agentfs-trees-1\n";
+// Read state created by the first two development commits without changing
+// its journal, branches or history. New state uses the domain name above.
+const LEGACY_FORMAT: &str = "agentfs-prototype-1\n";
 type Result<T> = std::result::Result<T, Error>;
 
 #[derive(Debug, thiserror::Error)]
@@ -34,11 +38,11 @@ pub enum Error {
     Git(#[from] git2::Error),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
-    #[error("prototype volume is busy")]
+    #[error("tree volume is busy")]
     Busy,
-    #[error("not a prototype state area (or unsupported format)")]
+    #[error("not a tree state area (or unsupported format)")]
     Format,
-    #[error("prototype supports flat, git-safe UTF-8 names only")]
+    #[error("tree supports flat, git-safe UTF-8 names only")]
     Name,
     #[error("writer must be a nonempty single-line label")]
     Writer,
@@ -46,7 +50,7 @@ pub enum Error {
     NotFound,
     #[error("file already exists")]
     Exists,
-    #[error("prototype file limit is 16 MiB")]
+    #[error("tree file limit is 16 MiB")]
     TooLarge,
     #[error("journal corruption at byte {0}; operator recovery required")]
     CorruptJournal(usize),
@@ -177,7 +181,7 @@ pub struct Volume {
 }
 
 impl Volume {
-    /// Initialize an empty directory or recover a prototype volume before serving.
+    /// Initialize an empty directory or recover a tree volume before serving.
     /// Recovery closes every abandoned write-open exactly once.
     pub fn open(root: &Path) -> Result<Self> {
         crate::history::init_libgit2();
@@ -199,7 +203,8 @@ impl Volume {
             File::open(&format)?.sync_all()?;
             File::open(&root)?.sync_all()?;
         }
-        if fs::read_to_string(format)? != FORMAT {
+        let stored_format = fs::read_to_string(format)?;
+        if stored_format != FORMAT && stored_format != LEGACY_FORMAT {
             return Err(Error::Format);
         }
         // Never grant another user access to a newly initialized state area.
@@ -474,7 +479,7 @@ impl Volume {
                     Ok(oid) => oid,
                     Err(e) if e.code() == git2::ErrorCode::NotFound => {
                         let oid = Oid::from_str(&at)?;
-                        self.repo.reference(&branch, oid, false, "prototype fork")?;
+                        self.repo.reference(&branch, oid, false, "trees fork")?;
                         sync_ref_dirs(&self.repo, &branch)?;
                         oid
                     }
@@ -604,7 +609,7 @@ impl Volume {
         File::open(self.repo.path().join("objects"))?.sync_all()?;
         let branch = format!("refs/heads/{name}");
         self.repo
-            .reference_matching(&branch, head, true, t.head, "prototype save")?;
+            .reference_matching(&branch, head, true, t.head, "tree save")?;
         sync_ref_dirs(&self.repo, &branch)?;
         let t = self.trees.get_mut(name).ok_or(Error::NotFound)?;
         t.head = head;

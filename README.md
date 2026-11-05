@@ -294,4 +294,4 @@ otherwise, any contribution intentionally submitted for inclusion in
 agentfs by you, as defined in the Apache-2.0 license, shall be dual
 licensed as above, without any additional terms or conditions.
 
-An [experimental target-model prototype](docs/target-architecture/prototype.md) starts the new Git-backed main/sandbox architecture. It is separate from the production recorder and is not ready for workloads.
+[Phase 1 of the proposed design](docs/target-architecture/phase-1.md) builds Git-backed main/sandbox trees and real end-to-end tests to validate the model. The recording milestone is implemented; phase 1 remains in progress.

@@ -9,7 +9,7 @@ before it are at 8185755), which runs the rules on the real `git` program.
 other page has a bug.
 **Revision of 2026-11-04** (answering the pull-request review's points 1, 3, 4 and 5): the journal that records every
 write call before it returns (§3), objects apart from file identities (§7), progress past a long-held file (§6),
-why a custom protocol on git primitives (§14), and the prototype plan (§18). All four are design choices. Since
+why a custom protocol on git primitives (§14), and the phase 1 validation plan (§18). All four are design choices. Since
 the commit that adds MODEL.md rule 12, the journal's crash replay (§3), creates, objects and the atomic save (§7)
 and progress rule P1 (§6) are **modelled** (MODEL.md rules 9, 11 and 12, findings 19 to 22). After the owner's
 decisions of 2026-11-04 (§6), P3 is deleted and P2 is the prefix sync, both modelled.
@@ -161,7 +161,7 @@ the open's records are dropped only once that ref transaction is durable. Then:
   the file that replaced it, the failure §7 exists to prevent (the review planted exactly that bug; the model's
   byte oracle and object table catch it). The model's crash keeps its object table, which this rule rebuilds
   exactly. What a view host can rely on across its own restart (kernel inode numbers, handles after the mount
-  reconnects) is for the prototype (§18).
+  reconnects) is for phase 1 (§18).
 - **Open numbers never repeat** (a choice; P2-e of that review). The `n` of `Agentfs-Open: <n>` comes from a
   per-tree counter kept in the journal, never reset by a restart: a reused number would make a replay skip a new
   open as "already saved". The model's numbers never repeat within a run.
@@ -751,10 +751,11 @@ that works, so the second table weighs the other established designs (design cho
 | Patch theory: Pijul, Darcs | line identity and commuting patches are its core; conflicts are first-class; Pijul's graph of lines is the nearest prior art to the line map | not git: no git remote carries its history (AGENTS.md principles 3 and 6); it records a conflict for a person to resolve rather than deciding it, so the referee would still be ours; Darcs has had exponential merge cases, and Pijul is younger than git's tooling |
 | Jujutsu (git-backed): change ids and the operation log | a change's identity apart from its commit's; every operation logged, concurrent operations reconciled at the next load; conflicts stored in commits | its merge is three-way by content, so findings 1, 6 and 13(b) apply; it stores a conflict for a person rather than deciding it. Its operation log is prior art for the journal (§3) and for recovery; it is not adopted as a dependency |
 
-**What the custom protocol still owes**, none of it validated yet: where the line map is stored (§16 question 1);
-recovery, designed (§12), its crash replay of the journal modelled (MODEL.md rule 12) but none of it run on a real mount; metadata growth, since line maps keep every deleted version, each
+**What the custom protocol still owes:** where the line map is stored (§16 question 1);
+recovery, designed (§12), its crash replay modelled (MODEL.md rule 12), with recording-process crash cases
+now exercised by phase 1 on real mounts and the full recovery matrix still due; metadata growth, since line maps keep every deleted version, each
 `Squashed` landing adds a graft and each losing change a collision ref, none with a trim rule; performance, with no
-measurement of the alignment, the referee on large files, or grafts' cost to `merge-base` at scale. The prototype
+measurement of the alignment, the referee on large files, or grafts' cost to `merge-base` at scale. Phase 1
 (§18) measures these before the architecture is settled.
 
 Prior art: a merge queue (GitHub's, Bors) is a single referee taking changes in order; Gerrit's `refs/for/<branch>`
@@ -906,10 +907,13 @@ this model replaced (landing, forks, journal, history) and the earlier mechanism
 resolver chain, per-path merge bases, squash chains) are in git history only. Nothing left in the set should
 contradict this page; where something does, this page wins.
 
-## 18. Prototype plan (first recording slice built)
+## 18. Phase 1: implementation and end-to-end validation
 
-The review of 2026-11-04 recommends a small real-filesystem prototype before the architecture is settled, since
-more seeds against the model cannot test what the model leaves out. The [prototype implementation](prototype.md) starts the recording slice; the full exit criteria below are not yet met. Its scope (a design choice):
+The owner clarified on 2026-11-05: "The goal is to build the phase 1 / MVP of the proposed design in the PR so we can run real end-to-end tests and validate the model".
+[Phase 1](phase-1.md) is the first implementation of this design, developed incrementally. Its recording
+milestone is built. The remaining work includes the referee, landing/sync and conformance tests on real
+mounts; passing the recording tests alone does not complete phase 1. The 2026-11-04 review identified the
+filesystem-boundary checks below. The full exit criteria are not yet met. Scope:
 
 | In scope | Answers | Exit criterion (pass or fail) |
 |---|---|---|
@@ -922,7 +926,7 @@ more seeds against the model cannot test what the model leaves out. The [prototy
 
 Out of scope: `Squashed` history and grafts, nested forks, transactions, Rules and view profiles, replication,
 CSI, several view hosts, upgrades. **Exit:** every pass-or-fail row passes on CI's Linux runners (FUSE runs only
-there, AGENTS.md); any failure is a finding that changes this page before code for the domains starts; the
+there, AGENTS.md); any failure is a finding to resolve in the implementation or the model before phase 1 is validated; the
 measurements set the first budgets (no number here is a budget yet).
 
 ## New terms
@@ -957,6 +961,6 @@ an append onto a partial line, a followed partial line). Answered 2026-11-04: no
 the prefix sync (§6). Open: MODEL.md finding 27 (a nested sandbox's dropped agreeing delete is decided by the
 history setting), with finding 19.
 
-*History: 2026-11-03, from the model at 509a0ab; revised after review (save ordering, trees, recovery, grafts, slots); 2026-11-03, the owner's answers on losers and saves; review: Replication pushes losers, questions 2 and 3; 2026-11-03, the owner's answers on saves and locks; review: appends at close, main's clients' death, transactions with open files, the lock over path calls, the program-level hang; 2026-11-03, after the owner's "Go": close-to-open accepted, line identity, deletes and renames (§7); review: no POSIX call names a line, so a save aligns its bytes once (§6, §7), the atomic-save idiom, untracked files (§3), R9/R13/A8 put to the owner (§16), §17 cut; 2026-11-03, the owner's answer to question 3: a save or transaction lands whole or loses whole, only winning saves are squashed (§7, §9, §11, §15); 2026-11-04, answering the pull-request review: the journal (§3), progress (§6), objects (§7), why a custom protocol (§14), the prototype plan (§18), proof claims narrowed to the modelled executions; 2026-11-04, byte calls modelled (§6, §7), the notes ref built (§4, §8), Replication due on every move of main (§4); 2026-11-04, the adversarial review at `ee29551`: finding 24 (P3
+*History: 2026-11-03, from the model at 509a0ab; revised after review (save ordering, trees, recovery, grafts, slots); 2026-11-03, the owner's answers on losers and saves; review: Replication pushes losers, questions 2 and 3; 2026-11-03, the owner's answers on saves and locks; review: appends at close, main's clients' death, transactions with open files, the lock over path calls, the program-level hang; 2026-11-03, after the owner's "Go": close-to-open accepted, line identity, deletes and renames (§7); review: no POSIX call names a line, so a save aligns its bytes once (§6, §7), the atomic-save idiom, untracked files (§3), R9/R13/A8 put to the owner (§16), §17 cut; 2026-11-03, the owner's answer to question 3: a save or transaction lands whole or loses whole, only winning saves are squashed (§7, §9, §11, §15); 2026-11-04, answering the pull-request review: the journal (§3), progress (§6), objects (§7), why a custom protocol (§14), the phase 1 validation plan (§18), proof claims narrowed to the modelled executions; 2026-11-04, byte calls modelled (§6, §7), the notes ref built (§4, §8), Replication due on every move of main (§4); 2026-11-04, the adversarial review at `ee29551`: finding 24 (P3
 deadlocks cooperating programs, §6), squash runs cut at open files (§6), the object table and open numbers across a
 restart (§3, §12); 2026-11-04, the owner's decisions: no P3, P2 as the prefix sync (§6); findings 11 and 25 fixed in the rules (§7)*

@@ -17,10 +17,10 @@ cleanup() {
 }
 trap cleanup EXIT
 mkdir "$work/main" "$work/sandbox"
-"$bin" --state "$work/state" prototype init
-fork=$("$bin" --state "$work/state" prototype fork)
+"$bin" --state "$work/state" trees init
+fork=$("$bin" --state "$work/state" trees fork)
 start() {
-    "$bin" --state "$work/state" prototype mount "$work/main" \
+    "$bin" --state "$work/state" trees mount "$work/main" \
         --sandbox "$work/sandbox" --fork "$fork" >"$work/mount.log" 2>&1 &
     pid=$!
     for _ in $(seq 1 200); do
@@ -28,7 +28,7 @@ start() {
         kill -0 "$pid"
         sleep 0.1
     done
-    echo "prototype mounts did not start" >&2
+    echo "trees mounts did not start" >&2
     return 1
 }
 start
@@ -149,10 +149,10 @@ wait "$client" 2>/dev/null || true
 client=
 fusermount3 -uz "$work/main"
 fusermount3 -uz "$work/sandbox"
-"$bin" --state "$work/state" prototype init
+"$bin" --state "$work/state" trees init
 head=$(git --git-dir="$work/state/history.git" rev-parse main)
 test "$(git --git-dir="$work/state/history.git" show main:crash)" = acknowledged-before-kill
-"$bin" --state "$work/state" prototype init
+"$bin" --state "$work/state" trees init
 test "$(git --git-dir="$work/state/history.git" rev-parse main)" = "$head"
 start
 test "$(cat "$work/main/crash")" = acknowledged-before-kill
@@ -163,4 +163,4 @@ fusermount3 -u "$work/sandbox"
 wait "$pid"
 pid=
 git --git-dir="$work/state/history.git" fsck --strict
-echo "prototype recording, object and crash scenarios passed"
+echo "tree-view recording, object and crash scenarios passed"
