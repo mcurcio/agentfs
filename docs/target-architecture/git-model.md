@@ -237,10 +237,13 @@ hold the order.
 ## 6. Save and locks
 
 The tree's actor makes a save at close and returns at once. Its first parent is the branch's head `h` then.
-*Choice*, read from the owner's 2026-11-03 question (§0), not his words: whatever the tree held then counts as
-seen. So a save after a sync is written over the synced line and wins upstream by lineage; one before the sync
-arrived is concurrent, and the parent wins (`r3_a_save_*`); one over the sandbox's own undecided line still
-loses (finding 8, §16).
+A program has seen a version only if it could read it through normal file I/O (ledger R3c.2; the owner, 2026-11-05:
+"only if the client can read the updated content through normal file I/O procedures"): the file was closed when that
+version arrived. The locks below make `h` agree with that: no sync or landing writes a file open for writing, so what
+a parent brought arrived while the file was closed, and another program's save in the tree while it was open leaves
+this save the later close, final inside the tree (R9.16). So a save after a sync is written over the synced line and
+wins upstream by lineage; one before the sync arrived is concurrent, and the parent wins (`r3_a_save_*`); one over the
+sandbox's own undecided line still loses, since the program could never read the parent's line (finding 8, §16).
 
 **What a save records** (owner, 2026-11-03): what the program's write calls did, applied to `h`. POSIX gives a
 filesystem byte calls only: `write` on an `O_APPEND` open, `pwrite` or `write` at an offset, `ftruncate` (and
@@ -696,7 +699,7 @@ that works, so the second table weighs the other established designs (design cho
 | git's three-way merge, keeping the sandbox's side of a conflict (`merge-tree -X ours`) | no merge code | once a fork and main have merged each other, git finds two merge bases and keeps a fork line main already decided against (finding 1: 35 of 64 seeds); a hunk spans neighbouring lines, so keeping a side withholds main's decided neighbour (finding 6) |
 | Per line within a change: only colliding lines lose, the change's other lines apply (the model's rule until 2026-11-03) | no clean line is dropped | a commit or a transaction reaches the parent in part; the owner: "“One line loses” sounds like a collision, and I thought we had already decided that each commit was a transaction" (replaced by rule 3e, §7) |
 | Per file: main's whole file wins | simple to state | a change of several files lands in part; within one file it is rule 3e's cost, which the owner chose for the whole change (finding 3, resolved) |
-| "Saw" read per commit (merge ancestry) | one ancestry query | a sync merge makes main's commit an ancestor, so an edit over the fork's undecided line looks "made on" main's line and silently replaces it (finding 8, resolved: read per line) |
+| "Saw" read per commit (merge ancestry) | one ancestry query | a sync merge makes main's commit an ancestor, so an edit over the fork's undecided line looks "made on" main's line and silently replaces it (finding 8, resolved: a program has seen only what it could read, R3c.2) |
 | Save files as written; git's merge (`merge-ort -X ours`) with a rebase at every sync (tried 2026-11-03, rejected) | no line maps, less model code | the rebase makes the sandbox resolve a conflict at the sync, so the parent's queue no longer decides alone (rule 3a): whichever side wins there, the sandbox either drops its undecided line early (and may show it again) or withholds the parent's decided lines; and git merges by content, so a parent that writes a line A to B and back to A matches the merge base, and a sandbox's concurrent write lands over it with no collision (a silent loss). Finding 13; the variant is the unmerged branch `experiment/native-merge-variant` |
 
 | Established design | What it would give | Why it is not the referee here (its costs) |
@@ -800,7 +803,7 @@ power loss, failed save or view-host restart.
 - A sandbox line concurrent with main's, and every edit stacked on it before main decides, will lose. They stay
   in history and a collision names them (the owner's "out-of-date copy" case). That includes a save made after
   a sync, in the window after the sandbox closed its line and before main's queue decides it: by commit
-  ancestry it descends from main's line, but per line it was written over its own (finding 8).
+  ancestry it descends from main's line, but its program could never read that line (R3c.2, finding 8).
 - A file held open for writing receives nothing until its close, and every incoming change to it waits, with
   each change that shares a file or a source with one (P1). Into a sandbox, its open file holds back the parent's
   commits from the first that touches it on, all of them, even those touching no open file (P2 is a prefix, so no

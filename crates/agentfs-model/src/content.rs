@@ -339,7 +339,7 @@ pub fn writer_of(token: &str) -> &str {
 /// lost" and "no stale line reverts a newer one", kept apart from git. A
 /// version `b` descends from `a` when `b` was written over `a`: `a` is the
 /// version `b`'s writer saw of that line, or one that version was written
-/// over, and so on. Per line, from what the writer saw, never from which
+/// over, and so on. From what the writer could read (R3c.2), never from which
 /// commits its version merged: a sync that kept the fork's own line over
 /// the parent's did not show the parent's version to the fork's writer.
 #[derive(Default, Debug)]

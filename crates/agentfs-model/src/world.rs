@@ -1234,10 +1234,11 @@ impl World {
     /// The versions version `v` of file `p` (written by commit `origin`)
     /// was written over, newest first: the one its writer saw (on
     /// `origin`'s first parent), the one that one was written over, and so
-    /// on, read from git (the records, first parents and `git blame`). Per
-    /// line, not per commit: a sync merge that kept the fork's version over
-    /// the parent's does not make the parent's version one the fork's next
-    /// edit was written over. Cached: versions never change.
+    /// on, read from git (the records, first parents and `git blame`). Never
+    /// from which commits a version merged: a sync merge that kept the fork's
+    /// version over the parent's showed the fork's writer no parent's version
+    /// (R3c.2: it could not read it), so the fork's next edit is not written
+    /// over that. Cached: versions never change.
     fn written_over(&self, origin: &str, p: &str, v: &Line) -> Vec<String> {
         if let Some(c) = self.over.borrow().get(&v.id) {
             return c.clone();
