@@ -338,10 +338,8 @@ leaves the file as the fork has it, touches nothing), and a decision on a commit
 that commit. The held-back part waits as the sync's
 queue entry, for the files that first held commit adds to its write.
 
-**No P3, and the alarm.** A waiting take is woken once none of its files is open for writing; a new write-open of
-one of them before its step keeps it waiting, as long as overlapping writers keep the file open, and each such open
-raises an alarm event naming the tree, the waiting entry, the open and the file (a choice; raised by the open, never
-by a timer). P3 (once a take waits for a file, new opens of it wait behind the take) was modelled and dropped: it
+**No P3.** A waiting take is woken once none of its files is open for writing; a new write-open of
+one of them before its step keeps it waiting, as long as overlapping writers keep the file open. P3 (once a take waits for a file, new opens of it wait behind the take) was modelled and dropped: it
 deadlocked cooperating programs (MODEL.md finding 24: m1 keeps a log open, so a take of it waits; m1 starts m2 and
 waits for it; m2 opens the log and waits behind the take, which waits for m1). Linux has no such wait, and without
 P3 no program's call waits on another program's close.
@@ -730,7 +728,7 @@ policy of this revision included. Every check runs after every step, in every sc
 | A save is its write calls on the head at close: appends and offset writes keep the lines they did not write | every check | `r8_an_append_after_the_sync_keeps_the_synced_line`, `r8_an_offset_write_elsewhere_keeps_the_synced_line`, `r8_a_stale_rewrite_*` |
 | An append writes over no line but a partial last line it finishes: read from the save's blobs and its program's calls, each line starting in the appended bytes is new, after every line of the parent, and a finished line is the parent's last, one version on | `appends_exact` (in `one_writer`) | `r8_concurrent_appends_never_overwrite_each_other`, every random run |
 | No take writes a file open for writing in that tree or one it did not hold; no write-open succeeds while a take holds the file; no lock outlives its holder (a sandbox's client or one of main's, a transaction, a tree); every wait ends on an event | `step_checked`, `locks`, `check_converged` | `r9_*`, `r11_an_unlink_or_rename_of_a_held_file_waits`, `r5_open_files_and_transactions`, every random run (main's clients and sandboxes die in them) |
-| No program's open, `unlink` or `rename(2)` ever waits on a waiting landing, only on a take writing its file (no P3, §6) | `Oracle::no_wait_on_waiting` (interleavings.rs, the harness's own record), `locks` | `r9_cooperating_programs_never_deadlock`, `r9_new_writers_postpone_a_waiting_take_and_raise_an_alarm`, every random run |
+| No program's open, `unlink` or `rename(2)` ever waits on a waiting landing, only on a take writing its file (no P3, §6) | `Oracle::no_wait_on_waiting` (interleavings.rs, the harness's own record), `locks` | `r9_cooperating_programs_never_deadlock`, `r9_new_writers_postpone_a_waiting_take`, every random run |
 | A sync never delivers past the first change to an open file: it delivers a parent commit, in order, overwrites no open file, and the first commit it holds back names an open file (P2, §6) | `step_checked` (`prefix_cut`) | `r9_a_sync_delivers_up_to_the_first_change_to_an_open_file`, `r9_a_prefix_sync_holds_back_a_transaction_whole`, every random run |
 | The parent wins every collision, decided only at its queue, losing commit reachable, the decision in the notes ref on the take's result commit | `parent_wins` | `r3_landing_collision_the_parent_wins`, `r3_a_collision_is_recorded_once_at_the_parents_queue`, `r10_a_delete_against_a_concurrent_edit_the_parent_wins`, `r10_a_move_is_a_delete_plus_an_insert` |
 | An edit over the parent's current line replaces it (a save after a sync); before the sync, or over an undecided line, it collides | `parent_wins` | `r3_fast_forward_when_the_base_is_current`, `r3_a_save_after_the_sync_wins_upstream_by_lineage`, `r3_a_save_before_the_sync_arrives_loses_to_the_parent`, `r3_an_edit_over_the_decided_line_replaces_it`, `r3_an_edit_over_an_undecided_line_still_collides` |
@@ -802,7 +800,7 @@ power loss, failed save or view-host restart.
   change applies out of order), and a commit touching it holds back its whole change (a transaction's other files
   too).
 - **A busy file can postpone its landing forever** (no P3, the owner's decision of 2026-11-04). Overlapping writers
-  that never all close keep a take of that file waiting; each new open raises an alarm. A sandbox's landing that
+  that never all close keep a take of that file waiting. A sandbox's landing that
   never comes leaves its commits for the parent to resolve. In exchange no program's call waits on a waiting take,
   so cooperating programs never deadlock on one.
 - **The progress rules cost state.** Each entry keeps its file set, and a take checks it against every earlier
@@ -849,7 +847,7 @@ more seeds against the model cannot test what the model leaves out. Its scope (a
 | The journal (§3) | review point 1 | a kill of the view host and of the history service after each journal step: every write call that returned is in the next save, and none is saved twice; under power loss (dm-log-writes, as the power-loss workflow): every call before a returned `fsync` or close survives; a full state area fails the write call with `ENOSPC`; a close followed at once by an open, in the same process and in another, reads the new content (`RELEASE` is sent asynchronously; NOT VERIFIED that the view can always order the open after the save) |
 | Byte-level calls (modelled since 2026-11-04: §6, MODEL.md rules 8 and 10) | review point 2, on a real mount | random `pwrite` at any offset, partial lines, split writes, a missing final newline (appending `bar` to a file holding `foo`), overlapping writes, `ftruncate` shrinking and growing, `O_APPEND`; the bytes are the independent oracle: each saved file equals what the same calls leave on a plain Linux filesystem, and its line map passes `save_aligned` |
 | Objects (§7) | review point 3 | an atomic save (write `n`, `rename(n, a)`) while another process holds `a` open for writing and keeps writing: the new `a` never changes; `O_TMPFILE` with `linkat`; an unlink while open; a rename of an open file; a view-host restart with handles open (the object table rebuilt from the journal, §3): an old handle's later writes still reach no replaced file; two writers at stale offsets through the page cache; shared `mmap` writeback |
-| Progress (§6) | review point 4 | a main process holds a log open for the whole run while a sandbox lands a stream of changes to other files: each lands without waiting for the log; a change to the log waits, new writers of the log are never made to wait (each raises the alarm), and the change lands once no writer has the log open; real programs that wait on each other while one holds a file a take waits for (a shell pipeline, a parent waiting for a child that appends to its log) never hang (finding 24, the reason P3 was dropped); a prefix sync into a sandbox holding a file open delivers the parent's commits before the first that touches it, and the rest at the close |
+| Progress (§6) | review point 4 | a main process holds a log open for the whole run while a sandbox lands a stream of changes to other files: each lands without waiting for the log; a change to the log waits, new writers of the log are never made to wait, and the change lands once no writer has the log open; real programs that wait on each other while one holds a file a take waits for (a shell pipeline, a parent waiting for a child that appends to its log) never hang (finding 24, the reason P3 was dropped); a prefix sync into a sandbox holding a file open delivers the parent's commits before the first that touches it, and the rest at the close |
 | Measurements, recorded, not gated | review point 5 | per-call cost of the journal against plain FUSE (median, 99th percentile); journal size for a file written for an hour; line-map size per 10,000 saves; save and take time for 1 MiB and 100 MiB files |
 
 Out of scope: nested forks, transactions, Rules and view profiles, replication,
@@ -875,7 +873,6 @@ measurements set the first budgets (no number here is a budget yet).
 | object; orphan | what an open handle holds (the inode); an object no path names (§7) | writes through an old handle must never reach the file that replaced it | inode |
 | source (of a queue entry) | the child fork a landing came from; for a sync's changes, their writer (§6) | P1 and P2 keep each source's order | — |
 | held-back part | the parent's commits a prefix sync does not deliver yet: the first that touches a file open in the fork, and every later one (§6, P2) | a held file holds back a sync only from its first change on | a waiting take |
-| alarm (on a waiting take) | an event raised by each write-open that keeps a waiting take waiting (§6) | with no P3 a take can wait forever; the alarm says so, event-driven | `TakeWaiting` |
 
 ## Questions for the owner
 

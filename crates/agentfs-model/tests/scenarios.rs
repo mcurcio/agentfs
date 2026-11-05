@@ -2575,11 +2575,10 @@ fn r9_a_long_lived_main_writer_holds_back_only_its_own_file() {
 /// to be indefinitely delayed while an application is keeping the fs busy
 /// with real work"): once a take waits for a file, a new write-open or
 /// `unlink` of it is still granted at once, so overlapping writers can
-/// postpone the take for as long as they keep the file open. Each open
-/// that keeps it waiting raises an alarm event (a choice), and the take
+/// postpone the take for as long as they keep the file open, and the take
 /// goes once the last one closes.
 #[test]
-fn r9_new_writers_postpone_a_waiting_take_and_raise_an_alarm() {
+fn r9_new_writers_postpone_a_waiting_take() {
     let mut w = world();
     let f = w.create_fork(Tree::Main);
     let m2 = Client::Main("m2".into());
@@ -2587,19 +2586,10 @@ fn r9_new_writers_postpone_a_waiting_take_and_raise_an_alarm() {
     let x = w.save(&Client::Fork(f), "a", 0);
     take(&mut w, &Step::Next(Tree::Main));
     assert!(w.waits().contains_key(&Tree::Main));
-    assert!(w.delayed.is_empty(), "an open before the wait is no alarm");
     let second = w.open_write(&m2, "a");
     assert!(
         !w.handle(second).waiting,
         "the new open is granted, not made to wait behind the take"
-    );
-    assert_eq!(
-        w.delayed
-            .iter()
-            .map(|d| (d.handle, d.file.as_str()))
-            .collect::<Vec<_>>(),
-        vec![(second, "a")],
-        "it raises one alarm"
     );
     w.close(first);
     ok(&mut w);
@@ -2609,7 +2599,6 @@ fn r9_new_writers_postpone_a_waiting_take_and_raise_an_alarm() {
     );
     let third = w.open_write(&Client::Main("m3".into()), "a");
     assert!(!w.handle(third).waiting);
-    assert_eq!(w.delayed.len(), 2, "another alarm");
     w.close(second);
     ok(&mut w);
     assert!(w.waits().contains_key(&Tree::Main));

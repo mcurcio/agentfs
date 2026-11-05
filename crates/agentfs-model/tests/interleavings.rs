@@ -34,8 +34,8 @@ use agentfs_model::content::{BLANK, Content, FILES, Layout, PATHS, UNBORN};
 use agentfs_model::git::{git, with_reversed_dates};
 use agentfs_model::program;
 use agentfs_model::world::{
-    By, Client, Delayed, Direction, Entry, ForkId, HandleId, Kind, Life, LineEdit, MergeRule,
-    ModelError, Policies, Step, Take, Target, Tree, TxnEnd, TxnOutcome, World, Write,
+    By, Client, Direction, Entry, ForkId, HandleId, Kind, Life, LineEdit, MergeRule, ModelError,
+    Policies, Step, Take, Target, Tree, TxnEnd, TxnOutcome, World, Write,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -140,11 +140,9 @@ struct Tally {
     orphans: usize,
     /// Progress (git-model.md §6): queue steps that took an entry ahead of
     /// an earlier waiting one (P1); syncs that delivered a prefix and held
-    /// the rest back (P2); opens granted on a file a waiting take waits
-    /// for, each an alarm (no P3).
+    /// the rest back (P2).
     overtakes: usize,
     prefix_syncs: usize,
-    delayed: usize,
     /// Crashes of every agentfs process, and those during a close.
     crashes: usize,
     crashes_during_close: usize,
@@ -229,51 +227,6 @@ struct Oracle {
     /// from git, every file its taken changes touch; a sync's, the files
     /// it writes). A call waits only there, on one of those files.
     taking: BTreeMap<Tree, BTreeSet<String>>,
-    /// The first alarm fault [`Oracle::alarmed`] found at an open (an open
-    /// returns no error), reported by the next [`Oracle::check`].
-    alarm_fault: Option<String>,
-}
-
-/// The alarm on a waiting take (a choice; no P3), judged per open by the
-/// harness's own record of which opens it made and when each was granted:
-/// a write-open granted in a tree, at its open or at a take's release
-/// (`raised`: the alarms raised then), raises exactly one alarm for each
-/// queue entry of that tree then waiting for one of its files, and none for
-/// any other entry. An open never makes an entry wait or wakes one, so the
-/// tree's waiting entries after the call are those at its grant.
-fn alarmed(w: &World, h: HandleId, raised: &[Delayed]) -> Result<(), String> {
-    let x = w.handle(h);
-    let Target::Tree(t) = x.target else {
-        return Ok(());
-    };
-    let mine: Vec<u64> = raised
-        .iter()
-        .filter(|d| d.handle == h)
-        .map(|d| d.entry)
-        .collect();
-    if x.waiting || x.kind != Kind::Write {
-        return match mine.first() {
-            Some(n) => Err(format!(
-                "h{h} raised an alarm on entry {n}, but was not granted"
-            )),
-            None => Ok(()),
-        };
-    }
-    let files = x.files();
-    let expect: Vec<u64> = w
-        .waits()
-        .get(&t)
-        .into_iter()
-        .flatten()
-        .filter(|(_, e)| files.iter().any(|f| e.until.contains(f)))
-        .map(|(n, _)| *n)
-        .collect();
-    if mine != expect {
-        return Err(format!(
-            "h{h}, granted in {t:?}, raised alarms on entries {mine:?}, not {expect:?} (those waiting for its file)"
-        ));
-    }
-    Ok(())
 }
 
 /// An `OrphanDropped` event as the oracle expects it: (open, writer, path,
@@ -359,9 +312,6 @@ impl Oracle {
         };
         let who = writer(w, &x.client);
         self.held.insert(h, (x.target, o, x.path.clone(), who));
-        if let Err(e) = alarmed(w, h, &w.delayed) {
-            self.alarm_fault.get_or_insert(e);
-        }
     }
 
     /// The live file open `h`'s object is in its target, if a path names it.
@@ -511,9 +461,6 @@ impl Oracle {
     }
 
     fn check(&self, w: &World) -> Result<(), String> {
-        if let Some(e) = &self.alarm_fault {
-            return Err(e.clone());
-        }
         self.check_but(w, None)
     }
 
@@ -602,17 +549,8 @@ fn take(w: &mut World, o: &mut Oracle, s: &Step, tally: &mut Tally) -> Result<()
         Step::Next(t) => agentfs_model::check::p1_first(w, *t),
         _ => None,
     };
-    // The opens waiting before the step: those it grants raise their
-    // alarms then (no P3).
-    let waiting: Vec<HandleId> = w.handles().filter(|x| x.waiting).map(|x| x.id).collect();
-    let raised = w.delayed.len();
     let taken = step_checked(w, s)?;
     tally.steps += 1;
-    for h in waiting {
-        if w.handles().any(|x| x.id == h && !x.waiting) {
-            alarmed(w, h, &w.delayed[raised..])?;
-        }
-    }
     match s {
         Step::Finish(t) => {
             o.taking.remove(t);
@@ -1230,7 +1168,7 @@ impl Calls {
             })
             .collect();
         // And each entry waiting for its files (a new call on one of them
-        // is granted and postpones it, raising an alarm). Steering only.
+        // is granted and postpones it). Steering only.
         let mut holds = holds;
         for (t, m) in w.waits() {
             for x in m.values() {
@@ -1543,7 +1481,6 @@ fn run(w: &mut World, seed: u64, tally: &mut Tally) -> Result<(), (usize, String
     tally.unlinked_edits += w.unlinked_edits;
     tally.orphans += w.orphans.len();
     tally.prefix_syncs += w.prefix_syncs;
-    tally.delayed += w.delayed.len();
     if gitledger::takes() != w.landings.len() {
         return Err((
             STEPS + 1,
@@ -1612,11 +1549,10 @@ fn run_all(policies: Policies) {
         );
         // Atomic saves, and old writers whose calls an atomic save, an
         // unlink or a rename-over orphaned (git-model.md §7).
-        // P1 and P2 met, and the alarm: an entry went ahead of a waiting
-        // one, a sync delivered a prefix and held the rest back, and an
-        // open postponed a waiting take.
+        // P1 and P2 met: an entry went ahead of a waiting one, and a sync
+        // delivered a prefix and held the rest back.
         assert!(
-            tally.overtakes > 0 && tally.prefix_syncs > 0 && tally.delayed > 0,
+            tally.overtakes > 0 && tally.prefix_syncs > 0,
             "progress rules not met in {} seeds: {tally:?}",
             seeds().len()
         );

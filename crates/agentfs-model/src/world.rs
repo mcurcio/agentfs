@@ -13,7 +13,7 @@
 //! | 8. A save records the write calls | [`World::write`] keeps each byte call ([`Write`]: an `O_APPEND` write, `pwrite`, `ftruncate`; [`World::open_trunc`] for `O_TRUNC`) on the open file; [`World::close`] applies them to the tree's head then: an append's bytes go after the file's last byte, finishing a partial last line (a version of it) and then making new lines; other calls leave bytes the save aligns with the head's lines (rule 10). [`World::edit`] makes a test's line edit as a program's byte calls (`program`) |
 //! | 9. A take locks the files it overwrites | [`World::open_write`]; a [`Step::Next`] whose sync or landing would overwrite a file open for writing in that tree waits ([`World::waits`]) until the close; then it holds its files ([`World::holds`]) until [`Step::Finish`] writes them; a write-open, [`World::unlink`] or [`World::rename`] of a held file waits until then; a client's death ([`World::end_client`], [`World::end_main_client`]) closes its files |
 //! | 10. Line identity | a save derives identities from the bytes at close: it aligns them with the head's lines once, by git's histogram diff (`align`), and records the result: each new line an identity, each changed line a new version written over the version it replaced; the referee and a sync then compare versions of one identity, never bytes or positions (`resolve`, `adopt`, `splice`); a partial line that a merge put another line after reads as terminated (`Content::read_lines`) |
-//! | 9, progress (git-model.md §6) | P1: a [`Step::Next`] takes the first entry no earlier waiting entry shares a file or a source with (`scan`), so several may wait ([`World::waits`]); no call ever waits on a waiting entry (P3 is gone, the owner's decision of 2026-11-04): a new open of a file a waiting entry waits for is granted and raises a [`Delayed`] event; P2, the prefix sync: a sync delivers the parent's commits in order up to the first whose delivery would overwrite a file open for writing in the fork, and waits for the rest (`prefix`) |
+//! | 9, progress (git-model.md §6) | P1: a [`Step::Next`] takes the first entry no earlier waiting entry shares a file or a source with (`scan`), so several may wait ([`World::waits`]); no call ever waits on a waiting entry (P3 is gone, the owner's decision of 2026-11-04): a new open of a file a waiting entry waits for is granted; P2, the prefix sync: a sync delivers the parent's commits in order up to the first whose delivery would overwrite a file open for writing in the fork, and waits for the rest (`prefix`) |
 //! | 11. Deletes and renames | a file's name line: [`World::rename`] writes a new version, [`World::unlink`] a deleted one; `resolve` applies the per-line rule to it and couples a file's existence with its content. [`World::create`] makes a file (an unborn identity); an open holds an object ([`Handle::object`]), so a close saves to the file its object is named by ([`World::named`]) or, for an orphan, nothing ([`Orphan`]); a rename-over from a new file is an atomic save, a rewrite of the replaced file |
 //! | 12. The journal (git-model.md §3) | an open's calls are its journal; [`World::crash`] saves each open from it once (the `Agentfs-Open` trailer, [`World::saved`]), drops calls that never returned and puts takes back in their queues |
 //!
@@ -504,19 +504,6 @@ pub struct Waiting {
     pub until: BTreeSet<String>,
 }
 
-/// The alarm on a waiting take (a choice; the owner, 2026-11-04: a landing
-/// "indefinitely delayed while an application is keeping the fs busy with
-/// real work" is low risk): a write-open granted on a file a waiting entry
-/// waits for, which keeps it waiting. One event per such open and entry.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Delayed {
-    pub tree: Tree,
-    /// The queue entry it keeps waiting (its number).
-    pub entry: u64,
-    pub handle: HandleId,
-    pub file: String,
-}
-
 /// Where a queue entry comes from: its order is kept per source (P1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Source {
@@ -732,8 +719,6 @@ pub struct World {
     /// Each tree's queue entries that wait for write-opens of their files
     /// to close (P1: several may wait, each for its own files).
     waits: BTreeMap<Tree, BTreeMap<u64, Waiting>>,
-    /// Every alarm on a waiting take ([`Delayed`]).
-    pub delayed: Vec<Delayed>,
     /// The files each landing commit's own changes touch, cached.
     touches: RefCell<BTreeMap<String, BTreeSet<String>>>,
     pub lineage: Lineage,
@@ -847,7 +832,6 @@ impl World {
             orphans: Vec::new(),
             holds: BTreeMap::new(),
             waits: BTreeMap::new(),
-            delayed: Vec::new(),
             touches: RefCell::new(BTreeMap::new()),
             lineage: Lineage::default(),
             counters: BTreeMap::new(),
@@ -1894,44 +1878,9 @@ impl World {
                 .holds
                 .get(&t)
                 .is_some_and(|x| h.files().iter().any(|f| x.files.contains(f)));
-            if !h.waiting && h.kind == Kind::Write {
-                self.delay(t, &h);
-            }
         }
         self.handles.insert(id, h);
         id
-    }
-
-    /// The alarm on a long wait (a choice, the owner's decision of
-    /// 2026-11-04): an open granted on a file a waiting entry of `t` waits
-    /// for keeps that entry waiting, so it raises a [`Delayed`] event per
-    /// such entry. Raised by the open, never by a timer; only an open
-    /// granted at once can be due one ([`World::grant`] shows why).
-    fn delay(&mut self, t: Tree, h: &Handle) {
-        let hit: Vec<(u64, String)> = self
-            .waits
-            .get(&t)
-            .into_iter()
-            .flatten()
-            .filter_map(|(n, x)| {
-                h.files()
-                    .into_iter()
-                    .find(|f| x.until.contains(f))
-                    .map(|f| (*n, f))
-            })
-            .collect();
-        for (entry, file) in hit {
-            self.note(format!(
-                "alarm: h{} keeps {t:?}'s entry {entry} waiting for {file}",
-                h.id
-            ));
-            self.delayed.push(Delayed {
-                tree: t,
-                entry,
-                handle: h.id,
-                file,
-            });
-        }
     }
 
     /// An `O_TRUNC` open: [`World::open_write`] whose first call truncates the
@@ -2559,23 +2508,6 @@ impl World {
             let x = self.handles.get_mut(&h).expect("open");
             x.waiting = false;
             self.note(format!("grant h{h}"));
-            let x = self.handles[&h].clone();
-            // No alarm can be due here (review of `d552b3d`, P1-3): P1 lets a
-            // take go only when no earlier waiting entry shares a file with
-            // it, no entry starts waiting while a take holds the tree, and a
-            // prefix sync's rest waits only for files its delivered prefix
-            // does not write; so no waiting entry waits for a file a
-            // release grants. The model stops loudly if one would.
-            if let Target::Tree(t) = x.target {
-                assert!(
-                    self.waits
-                        .get(&t)
-                        .into_iter()
-                        .flatten()
-                        .all(|(_, w)| { x.files().iter().all(|f| !w.until.contains(f)) }),
-                    "h{h}, granted at a release in {t:?}, is a file a waiting entry waits for"
-                );
-            }
         } else {
             let call = self.handles.remove(&h).expect("a waiting call");
             self.note(format!("grant h{h}: it runs"));
@@ -3014,8 +2946,8 @@ impl World {
     /// every file its changes touch, [`World::touched`]). If a client of `t`
     /// has one of them open for writing, the entry waits for those to close
     /// (`waits`) and nothing is taken; a new open of one of its files is
-    /// granted and raises an alarm ([`Delayed`]: no call waits on a waiting
-    /// take, the owner's decision of 2026-11-04); else it leaves the queue
+    /// granted (no call waits on a waiting take, the owner's decision of
+    /// 2026-11-04); else it leaves the queue
     /// and holds its files.
     fn acquire(&mut self, t: Tree) -> usize {
         let q = self.queue_numbered(t);
