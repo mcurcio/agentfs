@@ -17,7 +17,7 @@
 //! whole. A sync decides nothing:
 //! the fork takes the parent's decided version, keeping only its own lines
 //! still on their way to that queue. Every losing commit keeps a collision
-//! ref and a note on its take's result commit, which a separate
+//! ref and a record in its take's result commit, which a separate
 //! Replication step pushes with main to a bare shared remote. A file is a
 //! byte buffer and a program's calls are POSIX byte calls ([`world::Write`]):
 //! a save is those calls applied at close to its tree's head, line

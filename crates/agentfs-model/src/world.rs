@@ -6,7 +6,7 @@
 //! | 1. Like a Linux filesystem | a close ([`World::close`]) is never refused; its save is a commit on the writer's tree at once, its first parent the tree's head at that moment |
 //! | 2. One landing queue per tree | [`World::queue_len`]: a FIFO of [`Entry`]s per tree; a [`Step::Next`] takes its head, or records that it waits (rule 9) |
 //! | 3. The parent's queue decides | `land` (a fork's commit into its parent) is the only place a collision with the parent is decided, through `judge` and `resolve`: per line, a line written over the parent's replaces it, a stale one is dropped, and of two concurrent lines the parent's wins; then each change (a save, a transaction's commit) is judged whole: one lost line and none of it applies (rule 3e). `sync` decides nothing: it takes the parent's version and keeps only the fork's lines the parent's queue has not taken yet |
-//! | 4. Nothing waits behind a collision | there is no held state: a collision is recorded as a [`Collision`] and in git (a note on the take's result commit under [`NOTES`]), the fork's losing commit kept under `refs/collisions/<n>`, which Replication later pushes to the shared remote with main and the notes ([`Step::Replicate`], due on every move of main and every collision), and the queue moves on |
+//! | 4. Nothing waits behind a collision | there is no held state: a collision is recorded as a [`Collision`] and in git (a trailer of the take's result commit, [`COLLISION`]), the fork's losing commit kept under `refs/collisions/<n>`, which Replication later pushes to the shared remote with main ([`Step::Replicate`], due on every move of main and every collision), and the queue moves on |
 //! | 5. Transactions | [`World::begin`]: a branch `txn/<n>` frozen at the fork's head; [`World::commit_txn`] lands it in the fork like a child's commit, whole or not at all (the fork is its parent, so the fork's lines win), and answers whether it lost, with every staged line that did not apply; [`World::rollback`] drops it. While one is open, other I/O on its files in the sandbox is accepted and applies in order after it ends ([`Fork::deferred`], R5.3) |
 //! | 6. Attribution | every commit names one writer in an `Agentfs-Writer` trailer; a sync is a merge with the parent's commit as second parent |
 //! | 7. Full lineage | a landing is a merge with the fork's commit as second parent (or a fast-forward), so a tree's history reaches every change it took, the losers included; each fork commit lands on its own |
@@ -465,10 +465,8 @@ pub struct Orphan {
 /// What a tree's take holds its files for (rule 9).
 #[derive(Clone, Debug)]
 pub enum Take {
-    /// The parent's head when the take began, the tree it plans, whether
-    /// a commit of the fork was then on its way to the parent, and the
-    /// collisions recorded then: the notes ref's commit (none: no
-    /// collision yet).
+    /// The parent's head when the take began, the tree it plans, and whether
+    /// a commit of the fork was then on its way to the parent.
     Sync {
         up: String,
         tree: Option<String>,
@@ -612,15 +610,16 @@ enum Verdict {
 
 static WORLDS: AtomicU32 = AtomicU32::new(0);
 
-/// The notes ref holding each take's collision records, on its result
-/// commit (git-model.md §4).
-pub const NOTES: &str = "refs/notes/agentfs/collisions";
+/// The trailer of a take's result commit naming one of its collision records
+/// (R5.1, R9.9): the decision lives on that commit, in its tree's history. A
+/// losing commit cannot be edited after it is made, so it holds none.
+pub const COLLISION: &str = "Agentfs-Collision";
 
-/// One collision record as the notes ref holds it: the deciding tree's
-/// branch name, the file, the cause, the losing change and its ref, the
+/// One collision record as its result commit's trailer holds it: the deciding
+/// tree's branch name, the file, the cause, the losing change and its ref, the
 /// lines, and the lost and winning versions.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Noted {
+pub struct Decision {
     pub tree: String,
     pub path: String,
     pub by: String,
@@ -631,7 +630,7 @@ pub struct Noted {
     pub won: Vec<String>,
 }
 
-impl Noted {
+impl Decision {
     pub fn of(c: &Collision) -> Self {
         Self {
             tree: World::name(c.tree),
@@ -647,7 +646,8 @@ impl Noted {
 
     fn render(&self) -> String {
         format!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            "{}: {} {} {} {} {} {} {} {}\n",
+            COLLISION,
             self.tree,
             self.path,
             self.by,
@@ -660,7 +660,7 @@ impl Noted {
     }
 
     fn parse(s: &str) -> Option<Self> {
-        let f: Vec<&str> = s.split('\t').collect();
+        let f: Vec<&str> = s.split(' ').collect();
         let list = |x: &str| x.split(',').map(str::to_string).collect();
         let [tree, path, by, loser, reference, lines, lost, won] = f[..] else {
             return None;
@@ -678,21 +678,21 @@ impl Noted {
     }
 }
 
-/// Every record of the notes ref at commit `at` in `repo`, with the commit
-/// each note is on: read from git alone (a notes tree names each note by
-/// the commit it annotates, perhaps fanned out into directories).
-pub fn read_notes_on(repo: &Path, at: &str) -> Vec<(String, Noted)> {
+/// Every collision record in the commits `rev` lists (`git log`'s arguments)
+/// in `repo`, with the commit that holds it: read from git alone.
+pub fn decisions_in(repo: &Path, rev: &[&str]) -> Vec<(String, Decision)> {
+    let format =
+        format!("--format=%H%x1f%(trailers:key={COLLISION},valueonly,unfold,separator=%x1f)");
+    let mut args = vec!["log", format.as_str()];
+    args.extend(rev);
     let mut out = Vec::new();
-    for line in git(repo, &["ls-tree", "-r", at]).lines() {
-        let Some((meta, name)) = line.split_once('\t') else {
-            continue;
-        };
-        let blob = meta.split(' ').nth(2).expect("an object");
-        let on = name.replace('/', "");
-        for rec in git(repo, &["cat-file", "-p", blob]).lines() {
+    for line in git(repo, &args).lines() {
+        let mut fields = line.split('\x1f');
+        let on = fields.next().expect("a commit");
+        for rec in fields.map(str::trim).filter(|r| !r.is_empty()) {
             out.push((
-                on.clone(),
-                Noted::parse(rec).expect("a collision record in the notes ref"),
+                on.to_string(),
+                Decision::parse(rec).expect("a collision record in a commit's trailers"),
             ));
         }
     }
@@ -1161,12 +1161,31 @@ impl World {
         if let Some(h) = open {
             msg.push_str(&format!("{OPEN}: {h}\n"));
         }
+        self.commit_message(parents, tree, &msg)
+    }
+
+    /// A take's result commit, its decisions in its trailers (R5.1, R9.9).
+    fn commit_deciding(
+        &self,
+        parents: &[&str],
+        tree: &str,
+        writer: &str,
+        cause: &str,
+        on: &str,
+        decisions: &[Decision],
+    ) -> String {
+        let mut msg = message(&format!("{cause} by {writer}"), writer, cause, on);
+        msg.extend(decisions.iter().map(Decision::render));
+        self.commit_message(parents, tree, &msg)
+    }
+
+    fn commit_message(&self, parents: &[&str], tree: &str, msg: &str) -> String {
         let mut args = vec!["commit-tree", tree];
         for p in parents {
             args.extend(["-p", p]);
         }
         args.extend(["-F", "-"]);
-        git_in(&self.repo, &args, &msg)
+        git_in(&self.repo, &args, msg)
     }
 
     /// `git update-ref`, counted so `check` re-reads history only after a
@@ -1554,12 +1573,6 @@ impl World {
             .collect()
     }
 
-    /// The notes ref's commit now (none: no collision recorded yet).
-    pub fn notes_head(&self) -> Option<String> {
-        let o = try_git(&self.repo, &["rev-parse", "--verify", "-q", NOTES], None);
-        (o.code == 0).then(|| o.stdout.trim().to_string())
-    }
-
     /// [`MergeRule::PerLine`]'s sync: the parent's version `up`, with each
     /// version of the fork's `ours` the parent has not decided yet (`up`'s
     /// history does not reach its writing commit: a line still on its way to
@@ -1698,22 +1711,15 @@ impl World {
         o.stdout.lines().next().expect("a tree").to_string()
     }
 
-    /// Records a take's collisions in tree `t`: one decision per change
-    /// that lost (rule 3a), kept reachable under one `refs/collisions/<n>`,
-    /// with one record under that ref for each file and cause it lost by.
-    fn record(&mut self, t: Tree, dir: Direction, m: &Merged, winner: &str, result: &str) {
-        let first = self.collisions.len();
+    /// A take's decisions in tree `t`, before its result commit, which holds
+    /// them: one decision per change that lost (rule 3a), kept reachable under
+    /// one `refs/collisions/<n>`, with one record under that ref for each file
+    /// and cause it lost by.
+    fn decide(&mut self, t: Tree, m: &Merged) -> Vec<Decision> {
         let mut refs: BTreeMap<&str, String> = BTreeMap::new();
-        for Lost {
-            path,
-            lines,
-            lost,
-            won,
-            by,
-            loser,
-        } in &m.collisions
-        {
-            let reference = match refs.get(loser.as_str()) {
+        let mut out = Vec::new();
+        for l in &m.collisions {
+            let reference = match refs.get(l.loser.as_str()) {
                 Some(r) => r.clone(),
                 None => {
                     let made: BTreeSet<&str> = self
@@ -1722,11 +1728,45 @@ impl World {
                         .map(|c| c.reference.as_str())
                         .collect();
                     let r = format!("refs/collisions/{}", made.len() + 1);
-                    self.update_ref(&[&r, loser]);
-                    refs.insert(loser, r.clone());
+                    self.update_ref(&[&r, &l.loser]);
+                    refs.insert(&l.loser, r.clone());
                     r
                 }
             };
+            out.push(Decision {
+                tree: Self::name(t),
+                path: l.path.clone(),
+                by: format!("{:?}", l.by),
+                loser: l.loser.clone(),
+                reference,
+                lines: l.lines.clone(),
+                lost: l.lost.clone(),
+                won: l.won.clone(),
+            });
+        }
+        out
+    }
+
+    /// Records a take's collisions in tree `t`, its decisions being in its
+    /// result commit.
+    fn record(
+        &mut self,
+        t: Tree,
+        dir: Direction,
+        m: &Merged,
+        decisions: &[Decision],
+        winner: &str,
+        result: &str,
+    ) {
+        for (l, d) in m.collisions.iter().zip(decisions) {
+            let Lost {
+                path,
+                lines,
+                lost,
+                won,
+                by,
+                loser,
+            } = l;
             self.note(format!(
                 "collision in {t:?}:{path}{lines:?} ({dir:?}, {by:?}): {loser:.7}'s {lost:?} lost to {won:?}"
             ));
@@ -1741,28 +1781,14 @@ impl World {
                 winner: winner.to_string(),
                 loser: loser.clone(),
                 result: result.to_string(),
-                reference,
+                reference: d.reference.clone(),
             });
             self.replication_due = true;
         }
-        if self.collisions.len() > first {
-            // The take's decision, beside history: one note on its result
-            // commit, a line per record (git-model.md §4).
-            let note: String = self.collisions[first..]
-                .iter()
-                .map(|c| Noted::of(c).render())
-                .collect();
-            git_in(
-                &self.repo,
-                &["notes", "--ref", NOTES, "add", "-f", "-F", "-", result],
-                &note,
-            );
-            self.ref_moves += 1;
-        }
     }
 
-    /// Replication's push ([`Step::Replicate`]): main, the collision notes
-    /// and every collision ref to the shared remote in one
+    /// Replication's push ([`Step::Replicate`]): main, whose history holds
+    /// every take's decisions, and every collision ref to the shared remote in one
     /// atomic push (owner,
     /// 2026-11-03: "yes, \"losing\" patches should still be part of the
     /// history. i want to know who changed what when"). Replication is the
@@ -1771,8 +1797,6 @@ impl World {
     fn replicate(&mut self) {
         self.replication_due = false;
         let remote = self.remote.to_string_lossy().into_owned();
-        // `refs/notes/*`, a pattern: the notes ref exists only once a
-        // collision has been recorded.
         git(
             &self.repo,
             &[
@@ -1782,7 +1806,6 @@ impl World {
                 &remote,
                 "refs/heads/main:refs/heads/main",
                 "refs/collisions/*:refs/collisions/*",
-                "refs/notes/*:refs/notes/*",
             ],
         );
     }
@@ -2704,14 +2727,16 @@ impl World {
         let outcome = if let Some((edit, m)) = planned {
             let writer = self.forks[&f].writer.clone();
             let t = Tree::Fork(f);
-            let c = self.commit(
+            let decisions = self.decide(t, &m);
+            let c = self.commit_deciding(
                 &[&ours, &txn.head],
                 &m.tree,
                 &writer,
                 &format!("Transaction t{}", txn.id),
                 &Self::name(t),
+                &decisions,
             );
-            self.record(t, Direction::Transaction, &m, &ours, &c);
+            self.record(t, Direction::Transaction, &m, &decisions, &ours, &c);
             self.landings.push(Landed {
                 tree: t,
                 direction: Direction::Transaction,
@@ -3348,8 +3373,16 @@ impl World {
             return;
         }
         let writer = self.writer_of_commit(tip);
-        let new = self.commit(&[&ours, tip], &m.tree, &writer, "Landing", &Self::name(x));
-        self.record(x, Direction::Landing, &m, &ours, &new);
+        let decisions = self.decide(x, &m);
+        let new = self.commit_deciding(
+            &[&ours, tip],
+            &m.tree,
+            &writer,
+            "Landing",
+            &Self::name(x),
+            &decisions,
+        );
+        self.record(x, Direction::Landing, &m, &decisions, &ours, &new);
         self.landed(x, &ours, &new, tip, won);
         self.note(format!("landed f{from}'s {tip:.7} into {x:?}"));
         self.set_head(x, &new);
@@ -3525,8 +3558,7 @@ impl World {
 
     /// Every ref's commits, for history checks.
     pub fn all_commits(&self) -> Vec<String> {
-        let notes = format!("--exclude={NOTES}");
-        git(&self.repo, &["rev-list", &notes, "--all"])
+        git(&self.repo, &["rev-list", "--all"])
             .lines()
             .map(str::to_string)
             .collect()

@@ -9,8 +9,8 @@ use std::path::Path;
 use crate::content::{Content, Line, PATHS, State, is_root, writer_of};
 use crate::git::{git, try_git};
 use crate::world::{
-    By, Client, Collision, Direction, Entry, ForkId, Kind, Life, NOTES, Noted, Step, Take, Target,
-    Tree, TxnEnd, TxnId, TxnOutcome, World, commit_parents, origin_in, read_notes_on,
+    By, Client, Collision, Decision, Direction, Entry, ForkId, Kind, Life, Step, Take, Target,
+    Tree, TxnEnd, TxnId, TxnOutcome, World, commit_parents, decisions_in, origin_in,
 };
 
 /// Every invariant that holds after any step.
@@ -170,7 +170,7 @@ pub fn step_checked(w: &mut World, s: &Step) -> Result<usize, String> {
 /// delivers the parent's first parents in order up to `to` (none: it
 /// delivers nothing and waits), and if it holds any back, the first it
 /// holds back touches a file open there: its own change (against its
-/// first parent) or a collision note on it names that file, and its
+/// first parent) or a collision record in it names that file, and its
 /// version differs from the fork's (a necessary condition: the fork may
 /// keep its own undecided lines over it). That it never delivers past
 /// that commit is the take's write: it overwrites no open file
@@ -190,17 +190,12 @@ fn prefix_cut(
         c = git(w.repo(), &["rev-parse", &format!("{c}^1")]);
     }
     chain.reverse();
-    let notes: Vec<(String, Noted)> = w
-        .notes_head()
-        .map(|n| read_notes_on(w.repo(), &n))
-        .unwrap_or_default();
     let touches = |c: &str| -> Option<String> {
         let mut files = diff_files(w, &format!("{c}^1"), c);
         files.extend(
-            notes
-                .iter()
-                .filter(|(on, _)| on == c)
-                .map(|(_, x)| x.path.clone()),
+            decisions_in(w.repo(), &["-1", c])
+                .into_iter()
+                .map(|(_, x)| x.path),
         );
         files
             .into_iter()
@@ -546,8 +541,7 @@ fn decided_against(w: &World, t: Tree, path: &str, line: &str, token: &str) -> b
 /// the parent's commit carrying it is delivered). It has reached `t` unless
 /// the parent's head reaches that commit and no parent's commit a sync
 /// delivered into `t` (the sync's second parent, or the commit it
-/// fast-forwarded to) does, nor, for a result, `t`'s head. A commit the
-/// parent's head does not reach is decided by notes read from main. So a
+/// fast-forwarded to) does, nor, for a result, `t`'s head. So a
 /// prefix sync that holds back
 /// the parent's landing that carried a line upstream has not delivered
 /// main's decision against that line, nor a held-back commit's own.
@@ -731,15 +725,15 @@ fn parent_wins(w: &mut World) -> Result<(), String> {
         if at != c.loser {
             return Err(format!("{c:?}: its ref names {at}"));
         }
-        // Recorded in git: the note on its result commit holds it.
-        let note = try_git(
-            w.repo(),
-            &["notes", "--ref", NOTES, "show", &c.result],
-            None,
-        );
-        if !note.stdout.lines().any(|l| *l == noted_line(&Noted::of(c))) {
+        // Recorded in git, in its result commit, which names the tree the
+        // decision belongs to; the losing commit holds no decision of its own.
+        let tree = w.trailer(&c.result, "Agentfs-Tree");
+        if !decisions_in(w.repo(), &["-1", &c.result])
+            .iter()
+            .any(|(_, d)| *d == Decision::of(c) && d.tree == tree)
+        {
             return Err(format!(
-                "{c:?}: the notes ref's note on {:.7} does not record it",
+                "{c:?}: its result commit {:.7} in {tree} does not record it",
                 c.result
             ));
         }
@@ -816,58 +810,46 @@ fn changes_whole(w: &mut World) -> Result<(), String> {
     Ok(())
 }
 
-/// A record as the notes ref writes it, for comparing.
-fn noted_line(n: &Noted) -> String {
-    format!(
-        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-        n.tree,
-        n.path,
-        n.by,
-        n.loser,
-        n.reference,
-        n.lines.join(","),
-        n.lost.join(","),
-        n.won.join(",")
-    )
-}
-
 /// Every losing change is replicated to the shared remote, eventually, and
 /// stays there attributable (owner, 2026-11-03: "yes, \"losing\" patches
 /// should still be part of the history. i want to know who changed what
 /// when"). Run once Replication has drained ([`check_converged`]). Read from
-/// the remote alone: its notes ref holds exactly the
-/// run's collision records, each on its result commit; each record's ref
-/// names its losing commit; each lost version is in its file there and was
-/// written by a commit naming that version's writer (who, what); and a
-/// collision decided in main has its result in the remote main's history,
-/// which places the decision in main's order. The commit's date is kept as its
+/// the remote alone: the commits of its main's history hold exactly the
+/// run's collision records, each in its result commit, which places the
+/// decision in main's order; each record's ref
+/// names its losing commit; and each lost version is in its file there and was
+/// written by a commit naming that version's writer (who, what). The commit's date is kept as its
 /// audit "when" but never read to decide anything (rule 2), and not
 /// checked here.
 fn losers_pushed(w: &World) -> Result<(), String> {
     let remote = w.remote();
-    let at = try_git(remote, &["rev-parse", "--verify", "-q", NOTES], None);
-    let records = if at.code == 0 {
-        read_notes_on(remote, at.stdout.trim())
+    let exists = try_git(
+        remote,
+        &["rev-parse", "--verify", "-q", "refs/heads/main"],
+        None,
+    );
+    let records = if exists.code == 0 {
+        decisions_in(remote, &["refs/heads/main"])
     } else {
         Vec::new()
     };
     let mut want: Vec<String> = w
         .collisions
         .iter()
-        .map(|c| format!("{} {}", c.result, noted_line(&Noted::of(c))))
+        .map(|c| format!("{} {:?}", c.result, Decision::of(c)))
         .collect();
     let mut got: Vec<String> = records
         .iter()
-        .map(|(on, n)| format!("{on} {}", noted_line(n)))
+        .map(|(on, n)| format!("{on} {n:?}"))
         .collect();
     want.sort();
     got.sort();
     if want != got {
         return Err(format!(
-            "the remote's collision notes {got:?} are not the run's collisions {want:?}"
+            "the remote main's collision records {got:?} are not the run's collisions {want:?}"
         ));
     }
-    for (result, c) in &records {
+    for (_, c) in &records {
         let at = try_git(remote, &["rev-parse", "--verify", "-q", &c.reference], None);
         if at.stdout.trim() != c.loser {
             return Err(format!(
@@ -908,19 +890,6 @@ fn losers_pushed(w: &World) -> Result<(), String> {
                     "{c:?}: on the remote, lost {token} was written by a commit by {by}"
                 ));
             }
-        }
-        if c.tree == "main"
-            && try_git(
-                remote,
-                &["merge-base", "--is-ancestor", result, "refs/heads/main"],
-                None,
-            )
-            .code
-                != 0
-        {
-            return Err(format!(
-                "{c:?}: its result is not in the remote main's history"
-            ));
         }
     }
     Ok(())

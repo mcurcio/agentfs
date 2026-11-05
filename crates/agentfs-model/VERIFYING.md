@@ -219,7 +219,7 @@ A planted bug is one deliberate mistake in a copy of the model. It shows which t
    transaction's clean lines apply when one of its lines lost; a file-rule loss that does not cost its whole change; a judge that skips one of a take's changes (only the
    `gitledger` check sees it at the step); a landing that locks only the files its plan writes; an append onto a partial last line that adds a line instead of finishing it; a landing that lets a line follow the
    parent's unfinished last line; a
-   hole filled with other bytes than NUL; a collision note on the wrong commit;
+   hole filled with other bytes than NUL; a collision record in the wrong commit, or none;
    placing an incoming insert before the parent's at one place; letting an edit of a file the parent unlinked
    apply; an entry going ahead of an earlier waiting one it shares a file with, or one of its own sandbox (P1); an
    atomic save that

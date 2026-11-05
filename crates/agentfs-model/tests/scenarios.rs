@@ -8,7 +8,7 @@ use agentfs_model::content::{BLANK, Content, Layout, Line, State};
 use agentfs_model::git::{git, with_reversed_dates};
 use agentfs_model::world::{
     By, Client, Direction, Life, LineEdit, MergeRule, ModelError, Overwritten, Policies, Step,
-    Target, Tree, TxnOutcome, World, Write,
+    Target, Tree, TxnOutcome, World, Write, decisions_in,
 };
 use std::collections::BTreeSet;
 
@@ -1959,6 +1959,49 @@ fn finding_31_an_agreeing_delete_of_a_rename_overs_file() {
     drain(&mut w);
 }
 
+/// R5.1 and R9.9, read from git: a take's decision lives in its own result
+/// commit (its tree named), with no notes ref; the losing commit, which cannot
+/// be edited, holds none and keeps its collision ref; and the record reaches
+/// the shared remote with main's history, a transaction's and a nested
+/// sandbox's included.
+#[test]
+fn r5_a_decision_is_in_its_result_commit_with_its_tree() {
+    let mut w = world();
+    let f = w.create_fork(Tree::Main);
+    let c = Client::Fork(f);
+    w.save(&m1(), "a", 1);
+    w.save(&c, "a", 1);
+    w.begin(f).unwrap();
+    w.save(&Client::Outside(f), "b", 1);
+    w.save(&c, "b", 1);
+    assert!(matches!(w.commit_txn(f), Ok(TxnOutcome::Lost { .. })));
+    ok(&mut w);
+    drain(&mut w);
+    assert!(w.collisions.iter().any(|x| x.tree == Tree::Main));
+    assert!(w.collisions.iter().any(|x| x.tree == Tree::Fork(f)));
+    let refs = git(w.repo(), &["for-each-ref", "--format=%(refname)"]);
+    assert!(!refs.contains("refs/notes"), "no notes ref: {refs}");
+    for x in &w.collisions {
+        let d = agentfs_model::world::Decision::of(x);
+        for repo in [w.repo(), w.remote()] {
+            let on = decisions_in(repo, &["-1", &x.result]);
+            assert!(on.iter().any(|(_, n)| *n == d), "the result holds it");
+            assert!(decisions_in(repo, &["-1", &x.loser]).is_empty());
+            let tree = git(
+                repo,
+                &[
+                    "log",
+                    "-1",
+                    "--format=%(trailers:key=Agentfs-Tree,valueonly)",
+                    &x.result,
+                ],
+            );
+            assert_eq!(tree, d.tree, "and names the tree it belongs to");
+            assert_eq!(git(repo, &["rev-parse", &x.reference]), x.loser);
+        }
+    }
+}
+
 // ── rule 10: line identity ──────────────────────────────────────────────
 
 /// One open, one write call, one close: the version the call made, if any.
@@ -3234,14 +3277,14 @@ fn r9_a_prefix_sync_delivers_no_upstream_decision_before_its_commit() {
     assert!(has(&w, tg, "a", &m));
 }
 
-/// P2, a held-back commit's collision notes are held back with it (review
+/// P2, a held-back commit's collision records are held back with it (review
 /// of 2026-11-04, P1-2): G is a sandbox in P and keeps `b` open; G's x and
 /// P's p both write over line 0 of `a`. P then saves `c` and `b`, and takes
 /// G's x, which loses to p. G's sync of P delivers p and `c` and holds back
 /// `b` and the landing: that landing's decision against x is not delivered,
 /// so G keeps x over p. Then `b` closes and G shows p.
 #[test]
-fn r9_a_prefix_sync_holds_back_the_notes_of_the_commits_it_holds_back() {
+fn r9_a_prefix_sync_holds_back_the_decisions_of_the_commits_it_holds_back() {
     let mut w = world();
     let p = w.create_fork(Tree::Main);
     let g = w.create_fork(Tree::Fork(p));

@@ -57,7 +57,7 @@ flowchart TB
   F2 -- "upstream" --> M
   F3 -- "upstream" --> F1
   T7 -- "frozen at begin, lands in" --> F2
-  M -- "Replication pushes main, collisions, notes" --> O[("shared remote: origin")]
+  M -- "Replication pushes main, collisions" --> O[("shared remote: origin")]
   subgraph V["views (FUSE): one per client"]
     VM["main's clients"] --> WM["main's working tree"]
     VA["sandbox A"] --> WA["A's working tree"]
@@ -188,6 +188,22 @@ Agentfs-Cause: Direct         # Direct (a save) | Landing | Sync | Transaction t
 Agentfs-Tree: fork/3          # main | fork/<id> | txn/<id>: the branch it was made on
 ```
 
+A take that decides a collision (R5.1, R9.9) records it in its own result commit, a landing or transaction commit, with
+one more trailer per record: its tree, file, cause, losing change, collision ref, lines, lost and won versions. So a
+commit says which tree it belongs to and what it decided there, and a decision reaches a sandbox only with its commit:
+a held-back commit's decisions are held back with it. A commit with no such trailer decided nothing against anyone. The
+losing commit cannot be edited after it is made: it holds no decision, and stays reachable as the result's second
+parent and by its collision ref.
+
+```text
+Landing by c3
+
+Agentfs-Writer: c3
+Agentfs-Cause: Landing
+Agentfs-Tree: main
+Agentfs-Collision: main a Line <losing commit> refs/collisions/1 a1 c3.2 m1.1
+```
+
 A merge originates nothing: each line it adds comes from a non-first parent, and it names its second parent's
 writer, or `agentfs` for a sync. So every line traces to the one plain commit that wrote it (`one_writer`).
 The "when" of who changed what when is the commit's committer date, kept as its audit field; no rule reads it
@@ -203,12 +219,11 @@ Ref names are a design choice; the model uses the first six (with `refs/collisio
 | `refs/heads/fork/<id>` | a fork's line, syncs included | until the fork drops | only where Replication pushes fork lines (A4); its losing commits go regardless, as collision refs |
 | `refs/heads/txn/<id>` | an open transaction | until commit or rollback | never |
 | `refs/collisions/<loser>` | one per losing change, named by its losing commit (the model numbers them, one per losing change, with a record for each file and cause it lost by) | past the fork's drop | yes, by Replication, under `refs/agentfs/<volume>/collisions/` ("i want to know who changed what when", 2026-11-03) |
-| `refs/notes/agentfs/collisions` | each take's collision records, one note on its result commit (the landing or transaction commit), a line per record: tree, file, cause, losing change and its ref, lines, lost and won versions. Built in the model: the checks read it locally and on the remote | always | with the collision refs |
 | `refs/queue/<tree>/<n>` | one queue entry (§5) | until taken | never |
 | `refs/txn-start/<id>` | the commit a transaction began at (the model holds it in memory, `Txn::start`) | until commit or rollback | never |
 
 Replication adds the release major to pushed names (replication.md). It is the only pusher: the collision refs
-and the notes ref join its refspec, and a move of main or a recorded collision makes a push due (design
+join its refspec, and a move of main or a recorded collision makes a push due (design
 choice; the model's `Step::Replicate`, taken in any order with the queue steps). The model first made only a
 collision an event, so a run without one never pushed main (MODEL.md finding 16). No queue step waits on
 the network.
@@ -535,7 +550,7 @@ sequenceDiagram
   QM->>QM: line 2: m and x concurrent, main wins
   QM->>QM: line 4: y clean, but its save lost: y loses with it
   QM->>M: commit, main's tree unchanged, parents main and x's commit
-  QM->>QM: same ref transaction: refs/collisions/x's commit, note: lost x for m, y with its save
+  QM->>QM: same ref transaction: refs/collisions/x's commit, and the result commit's trailers: lost x for m, y with its save
   M->>A: Sync queued
   A->>A: sync: x's commit decided by main, take m and main's line 4
 ```
@@ -667,7 +682,7 @@ by one, so a crash can leave half a step.
 | Step | Its one ref transaction | On restart |
 |---|---|---|
 | save | the branch, the landing entry at the parent, a sync entry at each child | nothing to do: the move and its entries exist together, or neither |
-| queue take | the branch, the entry deleted, the entries the move causes, the collision ref, the note | the entry is still there only if the take never happened: take it again; collision refs are named by the losing commit, so a rerun makes the same names |
+| queue take | the branch, the entry deleted, the entries the move causes, the collision ref | the entry is still there only if the take never happened: take it again; collision refs are named by the losing commit, so a rerun makes the same names |
 | transaction begin, commit, rollback | `txn/<n>` with `refs/txn-start/<n>`; commit adds the fork's move and its entries | a `txn/*` branch whose client has ended is deleted: an implicit rollback (A13); a client waiting to rebind after a history-service restart has not ended, and its transaction is restored at rebind (clients.md) |
 | fork create, drop | the branch (its upstream config written first); drop deletes it | a dropped fork's leftover entries are deleted |
 | journal | none: outside git; each call appended, and flushed at `fsync` and close, before it returns (§3) | before any view serves the tree, each open with journaled calls that no save's `Agentfs-Open` names is saved as its close would be; then its records are dropped. A torn last frame is discarded: its call never returned |
@@ -675,16 +690,13 @@ by one, so a crash can leave half a step.
 | object table | none: journaled with the calls that move objects (§3) | rebuilt from the journal on the last committed trees, never by file identity; an open whose object no path names is replayed as an orphan (saves nothing, `OrphanDropped`) |
 | objects | none: written before any ref names them | unreferenced objects: git's garbage collection |
 
-`git notes add` writes its own ref, so the take builds the note by hand and stages it into its transaction: a notes
-tree (`mktree`) and commit (`commit-tree`).
-
 ## 13. Where the virtual filesystem sits
 
 The FUSE views sit on top of the working trees (§1's picture) and never run git. A view serves one client's file
 calls from its tree's working tree (or its open transaction's directory), holds the open files (§3), and hands a
 close to the tree's actor as a save. The rules decide what each view shows (rules.md, views.md). Health,
 telemetry, replication to remotes and deployment keep their pages; Replication's refspec gains the collision
-refs and the notes ref (§4).
+refs (§4).
 
 ## 14. Why a custom protocol on git primitives
 
@@ -715,7 +727,7 @@ measurement of the alignment or the referee on large files. The prototype
 (§18) measures these before the architecture is settled.
 
 Prior art: a merge queue (GitHub's, Bors) is a single referee taking changes in order; Gerrit's `refs/for/<branch>`
-pushes into a queue, not a branch; `git notes` record facts beside history; `remote = .` is plain
+pushes into a queue, not a branch; commit trailers record facts in history; `remote = .` is plain
 git configuration; one actor per tree is the actor model's single owner of mutable state.
 
 ## 15. What must always hold
@@ -740,7 +752,7 @@ policy of this revision included. Every check runs after every step, in every sc
 | While a transaction is open, no save reaches its fork on a file it has saved; each deferred call applies in order once it ends (§9) | `transactions_undisturbed`, `locks`, `interleavings.rs` `Oracle::defers` | `r5_io_on_a_transactions_files_is_deferred_past_its_commit`, `r5_a_rollback_applies_what_it_deferred`, `r5_a_clients_death_applies_what_its_transaction_deferred`, `r5_a_crash_keeps_what_a_transaction_deferred`, every random run |
 | No program's open, `unlink` or `rename(2)` ever waits on a waiting landing, only on a take writing its file (no P3, §6) | `Oracle::no_wait_on_waiting` (interleavings.rs, the harness's own record), `locks` | `r9_cooperating_programs_never_deadlock`, `r9_new_writers_postpone_a_waiting_take`, every random run |
 | A sync never delivers past the first change to an open file: it delivers a parent commit, in order, overwrites no open file, and the first commit it holds back names an open file (P2, §6) | `step_checked` (`prefix_cut`) | `r9_a_sync_delivers_up_to_the_first_change_to_an_open_file`, `r9_a_prefix_sync_holds_back_a_transaction_whole`, every random run |
-| The parent wins every collision, decided only at its queue, losing commit reachable, the decision in the notes ref on the take's result commit | `parent_wins` | `r3_landing_collision_the_parent_wins`, `r3_a_collision_is_recorded_once_at_the_parents_queue`, `r10_a_delete_against_a_concurrent_edit_the_parent_wins`, `r10_a_move_is_a_delete_plus_an_insert` |
+| The parent wins every collision, decided only at its queue, losing commit reachable, the decision in the take's result commit, which names its tree | `parent_wins` | `r3_landing_collision_the_parent_wins`, `r3_a_collision_is_recorded_once_at_the_parents_queue`, `r10_a_delete_against_a_concurrent_edit_the_parent_wins`, `r10_a_move_is_a_delete_plus_an_insert` |
 | An edit over the parent's current line replaces it (a save after a sync); before the sync, or over an undecided line, it collides | `parent_wins` | `r3_fast_forward_when_the_base_is_current`, `r3_a_save_after_the_sync_wins_upstream_by_lineage`, `r3_a_save_before_the_sync_arrives_loses_to_the_parent`, `r3_an_edit_over_the_decided_line_replaces_it`, `r3_an_edit_over_an_undecided_line_still_collides` |
 | No partial save or transaction ever reaches a parent: each change a take judged lost or won, never both; one that lost has none of its versions in the result and every one named; one that won has every one in the result | `changes_whole`, `parent_wins` | `r3_a_save_loses_whole_with_its_clean_lines`, `r3_a_change_whose_delete_agrees_lands_whole`, `r3_a_later_save_after_a_losing_one_is_judged_on_its_own`, `r3_a_transaction_loses_whole_and_is_told`, `r3_a_committed_transaction_loses_whole_at_main`, `r3_a_file_rule_loss_costs_the_whole_change`, `r4_nested_changes_land_whole_or_lose_whole_at_every_level`, `r10_a_move_is_a_delete_plus_an_insert`, every random run |
 | Two changes never cost each other: neighbouring lines of two changes both apply | `parent_wins`, `no_silent_loss` | `r3_neighbouring_lines_merge_per_line`, `random_interleavings_adjacent_lines` |
@@ -749,7 +761,7 @@ policy of this revision included. Every check runs after every step, in every sc
 | Nothing else waits; each take is its queue's first entry or records a wait, the rest stay in order | `take` (interleavings.rs) | `random_interleavings_full_lineage`, `random_interleavings_adjacent_lines` (the scenarios' own `take` checks no order) |
 | A transaction ends as the program was told, whole; a rollback leaves nothing | `transactions_end_as_told`, `discarded_leave_no_trace` | `r5_transaction_commits_clean`, `r3_a_transaction_loses_whole_and_is_told`, `r5_sync_before_or_after_the_commit_ends_the_same`, `r5_a_committed_transaction_then_lands_like_any_change`, `r5_transaction_rollback_and_client_death_leave_nothing` |
 | Every change traces to one writer | `one_writer` | `r6_a_sync_is_a_merge_with_the_parent_second` |
-| Every losing change is replicated, eventually, and stays: once Replication drains, the remote's collision notes are the run's collisions, each re-read on the shared remote alone, its writer and line; a main collision's result is in the remote main | `losers_pushed` | `r3_a_save_before_the_sync_arrives_loses_to_the_parent`, every collision |
+| Every losing change is replicated, eventually, and stays: once Replication drains, the commits of the remote main's history hold the run's collisions, each re-read on the shared remote alone, its writer and line | `losers_pushed` | `r3_a_save_before_the_sync_arrives_loses_to_the_parent`, every collision |
 | Nested forks follow the same rules | all checks | `r4_nested_forks_follow_the_same_rules` |
 | Full lineage, read by ancestry alone: a tree's history reaches every change it took | `full_lineage` | `r7_every_sandbox_commit_lands_on_its_own_in_mains_history`, `r7_main_reaches_a_losing_commit_and_its_ref_keeps_it`, `random_interleavings_full_lineage` |
 | Trees converge when writes stop | `check_converged` | `convergence_when_writes_stop` |
