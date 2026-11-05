@@ -67,7 +67,7 @@ without seeing the other. MODEL.md's rules table holds the full wording; this pa
   the sandbox was the last writer and its change should take effect" (2026-11-03).
   Tests: `r3_a_save_after_the_sync_wins_upstream_by_lineage`, `r3_an_edit_over_the_decided_line_replaces_it`
 - **R3c.1** · rejected · "Seen" is judged per line, not per commit: a line counts as seen only if the new line
-  was written over it. Owner, 2026-11-05 (in chat, round 2): "this doesnt feel right"; replaced by R3c.2. Tests: `r3_an_edit_over_an_undecided_line_still_collides`
+  was written over it. Owner, 2026-11-05 (in chat, round 2): "this doesnt feel right"; replaced by R3c.2.
 - **R3c.2** · owner · A program has seen a version only if it could read it through normal file I/O: the file was
   closed when that version arrived, so the program's next open reads it. Owner, 2026-11-05: "i think we can only say
   that a client has had a chance to "see" a landing is if the file was closed when the landing occurred. that is --
@@ -132,10 +132,9 @@ without seeing the other. MODEL.md's rules table holds the full wording; this pa
   one changeset (if they are the naive simple commits) ... leave the transaction commits as they are"; "every
   sandbox commit stays stored ... that makes sense" (2026-11-03). Tests: `r7_squashed_saves_land_as_one_changeset`
 - **R7.1** · rejected · Squashing happens after judging: each save is judged on its own, only the winners are
-  squashed, and a loser stays its own commit. Approved by the owner, 2026-11-05 (approval page); his note: "if my squashing optimization idea causes too many issues, we can drop it entirely. it is mostly veneer to cut down on noise in the git history.". Owner, 2026-11-05 (in chat, round 2): "drop squashing". Gone when: `Squashed` Tests: `r7_a_squashed_take_squashes_only_the_winners`
+  squashed, and a loser stays its own commit. Approved by the owner, 2026-11-05 (approval page); his note: "if my squashing optimization idea causes too many issues, we can drop it entirely. it is mostly veneer to cut down on noise in the git history.". Owner, 2026-11-05 (in chat, round 2): "drop squashing". Gone when: `Squashed`
 - **R7.2** · rejected · The history setting never changes an outcome: the same calls decide the same trees and
-  collisions under either setting. Owner, 2026-11-05 (in chat, round 2): "drop squashing": with one history mode there is no setting to compare. Gone when: `Squashed` Tests: `r7_the_history_setting_decides_no_collision`, `random_interleavings_history_settings_decide_the_same`
-
+  collisions under either setting. Owner, 2026-11-05 (in chat, round 2): "drop squashing": with one history mode there is no setting to compare. Gone when: `Squashed`
 ## 6. What a save records
 
 - **R8** · owner · A save records what the program's write calls did (an append adds, a write at an offset
@@ -221,7 +220,7 @@ without seeing the other. MODEL.md's rules table holds the full wording; this pa
 - **R10.4** · owner · A line appended after the parent's unfinished last line (no final newline) collides with it,
   and the parent wins. agentfs never adds a newline no program wrote. Owner, 2026-11-05: "collide".
 - **R10.1** · approved · Of two inserts at one place, the parent's comes first. Approved by the owner, 2026-11-05 (approval page); he asked whether this is only inserts: yes; two edits of one line are a collision the parent wins (R3b). Tests: `r10_concurrent_inserts_at_one_place_keep_both_the_parents_first`
-- **R10.2** · rejected · A partial last line that a merge puts another line after reads as ending in a newline. Owner, 2026-11-05 (in chat, round 2): "collide": a line appended after the parent's unfinished last line collides with it (R10.4). Gone when: `r10_a_line_after_a_partial_line_reads_terminated` Tests: `r10_a_line_after_a_partial_line_reads_terminated`
+- **R10.2** · rejected · A partial last line that a merge puts another line after reads as ending in a newline. Owner, 2026-11-05 (in chat, round 2): "collide": a line appended after the parent's unfinished last line collides with it (R10.4). Gone when: `r10_a_line_after_a_partial_line_reads_terminated`
 - **R11** · approved · A file keeps its identity through renames (like an inode). Its name and existence are one
   more line, judged like any other: an unlink loses against a parent's edit it never saw; an edit of a file the
   parent unlinked loses; a rename and an edit both apply. Approved by the owner, 2026-11-05 (approval page). Tests:
