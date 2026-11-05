@@ -367,6 +367,13 @@ An open or rejected finding has a test marked `#[ignore = "coherence finding N: 
    applies (R10.3), so d's name is a version not written over the rename-over's, and `rename_overs_whole`, which knows
    nothing of R10.3, calls it half a rename-over. The tree is what R10.3 says. No check was changed (VERIFYING.md,
    "Fix passes"). `finding_31_an_agreeing_delete_of_a_rename_overs_file`.
+32. **Open, for the owner (2026-11-05): a landing leaves a line unfinished before the parent's next line (seed 128 of 1 to
+   500 of `rounds`, no transaction involved).** A sandbox cuts a file to one unfinished line; main edits a line that save
+   deleted, so it loses whole (rule 3e); the sandbox's next save, written over its own first line, lands on its own (rule
+   3c), and the parent's next line then follows it: `n6n5`, bytes nobody wrote, two line identities on one line of bytes.
+   A later non-append save then pairs the wrong records, and saves bytes its calls never left (the oracle reports it),
+   finding 15's first symptom. R10.4 and R10.6 say what happens to a line after an unfinished last line; none says what
+   happens when the line a parent keeps later lines after becomes unfinished. `finding_32_a_landing_leaves_a_line_unfinished_before_the_parents`.
 
 ## Costs
 

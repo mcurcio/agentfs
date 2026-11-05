@@ -106,6 +106,7 @@ the expected failure.
 | `finding_29_a_sync_keeps_a_line_after_the_parents_unfinished_line` | 29 | two lines read as one, `}n9` |
 | `finding_30_a_transactions_line_after_the_sandboxs_unfinished_line` | 30 | two lines read as one, `}n9` |
 | `finding_31_an_agreeing_delete_of_a_rename_overs_file` | 31 | `rename_overs_whole`: "was unlinked by renaming" |
+| `finding_32_a_landing_leaves_a_line_unfinished_before_the_parents` | 32 | two lines read as one, `n6m1.1` |
 
 These were the results at seeds 1..64 on 2026-11-05; a change that moves a count says so in its pull
 request. Finding 27's and finding 28's tests pass since the owner's decisions of 2026-11-05 (one of them went

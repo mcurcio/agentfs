@@ -2002,6 +2002,46 @@ fn r5_a_decision_is_in_its_result_commit_with_its_tree() {
     }
 }
 
+/// Coherence finding 32: a save that makes a line unfinished (no final newline)
+/// lands over a parent whose later lines it lost to. A first save cuts the file
+/// to one unfinished line; main edits a line it deleted, so that save loses
+/// whole; the sandbox's next save, written over its own first line, lands on its
+/// own, and the parent's next line follows it on one line of bytes nobody wrote.
+#[test]
+#[ignore = "coherence finding 32: a landing leaves a middle line with no newline, so two lines read as one"]
+fn finding_32_a_landing_leaves_a_line_unfinished_before_the_parents() {
+    let mut w = world();
+    let f = w.create_fork(Tree::Main);
+    let c = Client::Fork(f);
+    let cut = w.open_trunc(&c, "c");
+    w.write(
+        cut,
+        Write::Pwrite {
+            offset: 0,
+            bytes: "y".into(),
+        },
+    );
+    w.close(cut);
+    w.save(&m1(), "c", 1);
+    let edit = w.open_write(&c, "c");
+    w.write(
+        edit,
+        Write::Pwrite {
+            offset: 0,
+            bytes: "n6".into(),
+        },
+    );
+    w.close(edit);
+    next(&mut w, Tree::Main);
+    next(&mut w, Tree::Main);
+    let bytes = w.read(Tree::Main, "c").bytes();
+    assert_eq!(
+        bytes.lines().count(),
+        w.read(Tree::Main, "c").live().count(),
+        "{bytes:?}: only a file's last line can lack a newline"
+    );
+}
+
 // ── rule 10: line identity ──────────────────────────────────────────────
 
 /// One open, one write call, one close: the version the call made, if any.
