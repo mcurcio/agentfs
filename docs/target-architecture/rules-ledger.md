@@ -230,6 +230,10 @@ without seeing the other. MODEL.md's rules table holds the full wording; this pa
 - **R10.6** · owner · Until the parent decides, a sandbox holding an undecided line does not show the parent's
   unfinished last line in front of it: the file shows the sandbox's line alone, then the parent's version once decided.
   No tree shows bytes nobody wrote. Owner, 2026-11-05: "1 a" (finding 29).
+- **R10.7** · owner · An edited line keeps its place. When a parent appends a line after a line a sandbox edits, the
+  merged file reads the edit, then the append. Owner, 2026-11-05: "B seems more correct. The magic words there are
+  “edit” and “append”. From the perspective of each writer, their operations merged together naturally look like
+  option b".
 - **R10.5** · owner · The same inside a transaction: a line the transaction appended after the sandbox's unfinished
   last line collides at commit, the sandbox's line wins, and the program is told (R5). Owner, 2026-11-05: "A" (finding 30).
 - **R10.1** · approved · Of two inserts at one place, the parent's comes first. Approved by the owner, 2026-11-05 (approval page); he asked whether this is only inserts: yes; two edits of one line are a collision the parent wins (R3b). Tests: `r10_concurrent_inserts_at_one_place_keep_both_the_parents_first`
