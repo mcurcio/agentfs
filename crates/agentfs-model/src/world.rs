@@ -647,8 +647,7 @@ impl Incoming {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Verdict {
     Apply,
-    /// The same version, a delete the parent's delete agrees with, or a
-    /// stale one.
+    /// The same version, or a stale one.
     Drop,
     /// The parent's version (or the line that decided a whole loss) wins.
     Lose(String),
@@ -1542,15 +1541,16 @@ impl World {
 
     /// Rule 3, per line identity: an incoming version against the version
     /// `cur` (the parent's, at `ours`) holds of the same line. None there
-    /// (a line new to the parent): it applies. The same version, or two
-    /// deletes: nothing. Written over the parent's: it replaces it. The
-    /// parent's written over it: stale, dropped. Else the two are
+    /// (a line new to the parent): it applies. The same version: nothing.
+    /// Written over the parent's: it replaces it. The parent's written over
+    /// it: stale, dropped. Two concurrent deletes agree: the incoming one
+    /// applies, an ordinary version of its change. Else the two are
     /// concurrent, and the parent's wins.
     fn verdict(&self, ours: &str, cur: &Content, i: &Incoming) -> Verdict {
         let Some(p) = cur.member(&i.version.line) else {
             return Verdict::Apply;
         };
-        if p.id == i.version.id || (!p.live() && !i.version.live()) {
+        if p.id == i.version.id {
             Verdict::Drop
         } else if self
             .written_over(&i.origin, &i.path, &i.version)
@@ -1562,6 +1562,8 @@ impl World {
             .contains(&i.version.id)
         {
             Verdict::Drop
+        } else if !p.live() && !i.version.live() {
+            Verdict::Apply
         } else {
             Verdict::Lose(p.id.clone())
         }

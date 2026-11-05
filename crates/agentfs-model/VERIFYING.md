@@ -103,10 +103,12 @@ the expected failure.
 | `finding_1_git_merge_base_on_crossing_merges` | 1 | a sync leaves a line "which Main already took" |
 | `random_interleavings_git_merge_base` | 1 | 34 of 64 seeds, 1 of them (seed 46) a "harness panic: a model file in git": a sync that leaves a line "which Main already took" or drops a line (with no P3 and the prefix sync; 35 after the fix pass of the review of 2026-11-04, whose generator changes move the random calls; with creates, crashes and the progress rules 36; with the byte calls alone 32; before them 39 of 64, 2 of them a "harness panic: a model file in git", when git's merge leaves one line identity twice) |
 | `finding_6_git_hunks_on_neighbouring_lines` | 6 | a sync leaves a line "which Main already took" |
-| `finding_27_a_nested_dropped_delete_decided_by_the_history_setting` | 27 | `assertion left == right failed`: under full lineage main's `a` has six lines, under `Squashed` five |
+| `finding_28_an_agreeing_delete_replaces_a_delete_over_an_unseen_edit` | 28 | `m1.5 entered Main:a[a1] and is gone (c1.1 there), with no collision naming it` |
+| `finding_28_a_squashed_agreeing_delete_replaces_the_winning_delete` | 28 | `the parent's version did not win`, for main's `m1.5` |
 
 These were the results at seeds 1..64 on 2026-11-04; a change that moves a count says so in its pull
-request. Finding 3's two tests went with the per-file setting when the owner chose whole changes (rule 3e); finding
+request. Finding 27's test passes since the owner rejected the dropped agreeing delete (2026-11-05), as
+`r7_a_nested_agreeing_delete_is_decided_the_same_under_both_settings`. Finding 3's two tests went with the per-file setting when the owner chose whole changes (rule 3e); finding
 24's test passes since the owner deleted P3 (2026-11-04), as `r9_cooperating_programs_never_deadlock`.
 
 CI runs `cargo test --workspace` (so the scenarios and seeds 1..64; `random_interleavings_history_settings_decide_the_same`

@@ -592,10 +592,8 @@ fn delivered(w: &World, t: Tree, c: &Collision) -> bool {
 /// version reverts a newer one: (a) in every live tree a line moves from
 /// version a to b only if b was written over a, or both are deletes (they
 /// agree), or a recorded collision in that tree or one upstream names a
-/// as lost, or a is a delete and a collision upstream names a delete of
-/// that line lost ([`lost_delete`], finding 19); never if a was written
-/// over b (b is stale), unless a collision decided against a
-/// ([`decided_against`]), or that same delete case; (b) every version that
+/// as lost; never if a was written over b (b is stale), unless a collision
+/// decided against a ([`decided_against`]); (b) every version that
 /// entered a tree (written there, carried in by a landing or a
 /// transaction, won or lost, or taken from the parent by a sync) is still
 /// its line's version there, or one written over it is, or both are
@@ -605,19 +603,13 @@ fn no_silent_loss(w: &World, now: &Views) -> Result<(), String> {
         if !a.live() && !b.live() {
             continue;
         }
-        // A delete dropped where it agreed with the tree's own delete
-        // follows that delete: once it loses upstream, the line comes back
-        // by that decision (finding 19), here as in (b) below (finding 26:
-        // a nested sandbox's delete, dropped in its parent, whose own
-        // delete then lost in main).
-        let follows = !a.live() && lost_delete(w, t, p, l);
-        if w.lineage.descends(&a.id, &b.id) && !decided_against(w, t, p, l, &a.id) && !follows {
+        if w.lineage.descends(&a.id, &b.id) && !decided_against(w, t, p, l, &a.id) {
             return Err(format!(
                 "stale revert in {t:?}:{p}[{l}]: {} became {}, which it was written over",
                 a.id, b.id
             ));
         }
-        if !w.lineage.descends(&b.id, &a.id) && !flagged(w, t, p, l, &a.id) && !follows {
+        if !w.lineage.descends(&b.id, &a.id) && !flagged(w, t, p, l, &a.id) {
             return Err(format!(
                 "silent loss in {t:?}:{p}[{l}]: {} became {}, which was not written over it, and no collision names it",
                 a.id, b.id
@@ -636,11 +628,7 @@ fn no_silent_loss(w: &World, now: &Views) -> Result<(), String> {
             }
             return Err(format!("line {} of {} left {t:?}", e.line, e.path));
         };
-        if !lost
-            && !w.lineage.descends(&s.id, &e.token)
-            && !(e.gone && !s.live())
-            && !(e.gone && lost_delete(w, *t, &e.path, &e.line))
-        {
+        if !lost && !w.lineage.descends(&s.id, &e.token) && !(e.gone && !s.live()) {
             return Err(format!(
                 "{} entered {t:?}:{}[{}] and is gone ({} there), with no collision naming it",
                 e.token, e.path, e.line, s.id
@@ -650,39 +638,17 @@ fn no_silent_loss(w: &World, now: &Views) -> Result<(), String> {
     Ok(())
 }
 
-/// A collision in `t` or upstream names a delete of line `line` of `path`
-/// lost (read from its losing change). A delete that entered `t` and was
-/// dropped there because `t`'s own delete agreed (rule 3e: it costs
-/// nothing) shares that delete's fate: once that delete loses, the line
-/// comes back by that decision (finding 19).
-fn lost_delete(w: &World, t: Tree, path: &str, line: &str) -> bool {
-    let trees = w.upstream(t);
-    w.collisions.iter().any(|c| {
-        trees.contains(&c.tree)
-            && c.path == path
-            && c.lines.iter().zip(&c.lost).any(|(l, x)| {
-                l == line
-                    && w.file(&c.loser, path)
-                        .member(line)
-                        .is_some_and(|v| v.id == *x && !v.live())
-            })
-    })
-}
-
 /// No flip-flop: a version, once replaced in a tree, never shows there
 /// again, unless a collision decided against the version replacing it now
-/// ([`decided_against`]: then it is that decision), or the version replacing
-/// it is a delete that follows a delete that lost upstream ([`lost_delete`],
-/// finding 19). So a fork's line changes at most
-/// once per collision (its own x, then the parent's winning m, never x
-/// again).
+/// ([`decided_against`]: then it is that decision). So a fork's line
+/// changes at most once per collision (its own x, then the parent's
+/// winning m, never x again).
 fn no_flicker(w: &mut World, now: &Views) -> Result<(), String> {
     let mut left = Vec::new();
     for (t, p, l, a, b) in moves(w, now) {
         if w.left
             .contains(&(t, p.to_string(), l.to_string(), b.id.clone()))
             && !decided_against(w, t, p, l, &a.id)
-            && !(!a.live() && lost_delete(w, t, p, l))
         {
             return Err(format!(
                 "flicker in {t:?}:{p}[{l}]: {} shows again after it was replaced (now over {})",
@@ -1180,29 +1146,17 @@ fn syncs_deliver(w: &mut World) -> Result<(), String> {
 
 /// Rule 5, as the program was told, whole (rule 3e): a committed
 /// transaction's every staged edit is in the fork's commit that carries it
-/// (or overwritten by a later edit of its own, or ending, by its own last
-/// staged edit of that line, in a delete the fork's delete agrees with),
-/// and no collision names that commit; a transaction that lost has none of
-/// its staged versions in that commit, a collision in the fork that really
-/// collided, and its every staged edit (unless it ends in a delete the
-/// fork's delete agrees with) named in the answer, with a
-/// collision in the fork naming it and the version named as kept in the
-/// commit; the answer names every line the commit's collisions lost. A
+/// (or overwritten by a later edit of its own), and no collision names
+/// that commit; a transaction that lost has none of its staged versions in
+/// that commit, a collision in the fork that really collided, and its
+/// every staged edit named in the answer (by its last staged version of
+/// that line), with a collision in the fork naming it and the version
+/// named as kept in the commit; the answer names every line the commit's collisions lost. A
 /// rolled-back one's every staged token is discarded
 /// (`discarded_leave_no_trace` holds that); an empty one staged nothing.
 fn transactions_end_as_told(w: &mut World) -> Result<(), String> {
     for e in &w.ended[w.ended_checked..] {
         let fork = Tree::Fork(e.fork);
-        // Whether the transaction's last staged version of `s`'s line (its
-        // edits are in order, each over the one before) is a delete: then a
-        // delete of the fork's agrees with it, for `s` too.
-        let ends_gone = |s: &crate::world::Edit| {
-            e.staged
-                .iter()
-                .rev()
-                .find(|x| x.path == s.path && x.line == s.line)
-                .is_some_and(|x| x.gone)
-        };
         // Whether the transaction created `s`'s file (a new file) and its
         // last staged version of the file's name line ended it: then the
         // file changed nothing anyone sees (an atomic save's new file), so
@@ -1221,12 +1175,9 @@ fn transactions_end_as_told(w: &mut World) -> Result<(), String> {
             (TxnEnd::Commit(TxnOutcome::Committed), Some(r)) => {
                 let none_lost = !w.collisions.iter().any(|c| c.result == *r);
                 let staged = e.staged.iter().filter(|s| !created_and_ended(s)).all(|s| {
-                    // A staged delete (or a line the transaction deleted
-                    // later) the fork's own delete agrees with.
-                    let ends = |v: &Line| {
-                        w.lineage.descends(&v.id, &s.token) || (ends_gone(s) && !v.live())
-                    };
-                    w.file(r, &s.path).member(&s.line).is_some_and(ends)
+                    w.file(r, &s.path)
+                        .member(&s.line)
+                        .is_some_and(|v| w.lineage.descends(&v.id, &s.token))
                         && w.entered.iter().any(|(t, x)| {
                             *t == fork
                                 && x.path == s.path
@@ -1252,10 +1203,7 @@ fn transactions_end_as_told(w: &mut World) -> Result<(), String> {
                         o.path == s.path
                             && o.line == s.line
                             && w.lineage.descends(&o.staged, &s.token)
-                    }) || (ends_gone(s)
-                        && w.file(r, &s.path)
-                            .member(&s.line)
-                            .is_some_and(|v| !v.live()))
+                    })
                 });
                 real && told && all_told && none_applied && named
             }

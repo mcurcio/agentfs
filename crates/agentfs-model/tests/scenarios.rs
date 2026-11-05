@@ -2731,9 +2731,10 @@ fn r12_a_crash_during_a_close_saves_the_open_once() {
 /// The calls of finding 26 (seed 332 of the settings comparison): a nested
 /// sandbox f3 deletes line 3 of `a`; its parent f2 deletes line 3 too and
 /// edits line 0, which main edits concurrently, so f2's save loses whole at
-/// main. Then f2 takes f3's save: its delete agrees with f2's and is
-/// dropped (finding 19). Returns main's and f3's lines once drained.
-fn nested_dropped_delete(history: HistoryPolicy) -> (Vec<String>, Vec<String>) {
+/// main. Then f2 takes f3's save: its delete agrees with f2's, so it
+/// applies there, an ordinary version of f3's change (the owner,
+/// 2026-11-05, rejecting R3e.3). Returns main's and f3's lines once drained.
+fn nested_agreeing_delete(history: HistoryPolicy) -> (Vec<String>, Vec<String>) {
     let mut w = world(history);
     let d = w.open_write(&m1(), "a");
     for i in 0..6 {
@@ -2742,9 +2743,10 @@ fn nested_dropped_delete(history: HistoryPolicy) -> (Vec<String>, Vec<String>) {
     w.close(d);
     let f2 = w.create_fork(Tree::Main);
     let f3 = w.create_fork(Tree::Fork(f2));
-    let h = w.open_write(&Client::Fork(f3), "a");
-    w.edit(h, LineEdit::Delete(3));
-    w.close(h);
+    let line3 = w.read(Tree::Main, "a").lines[3].line.clone();
+    let version = |w: &World, t: Tree| w.read(t, "a").member(&line3).map(|l| l.id.clone());
+    call(&mut w, &Client::Fork(f3), "a", LineEdit::Delete(3));
+    let mine = version(&w, Tree::Fork(f3)).expect("f3's delete");
     let h = w.open_write(&Client::Fork(f2), "a");
     w.edit(h, LineEdit::Delete(3));
     w.edit(h, LineEdit::At(0));
@@ -2756,48 +2758,95 @@ fn nested_dropped_delete(history: HistoryPolicy) -> (Vec<String>, Vec<String>) {
         "{history:?}: f2's save lost whole at main"
     );
     next(&mut w, Tree::Fork(f2));
-    // f2 syncs main (its delete lost there) before f3 syncs: f3 then moves
-    // from its own delete straight to main's line, as seed 332 did.
+    assert_eq!(
+        version(&w, Tree::Fork(f2)),
+        Some(mine.clone()),
+        "{history:?}: f3's delete applied in f2"
+    );
+    // f2 syncs main (its own delete lost there) before f3 syncs: f2 keeps
+    // f3's delete, which main's queue has not decided yet (rule 3d).
     while w.pending().contains(&Step::Next(Tree::Fork(f2))) {
         next(&mut w, Tree::Fork(f2));
     }
-    assert_eq!(w.read(Tree::Fork(f2), "a").texts().len(), 6, "{history:?}");
+    assert_eq!(w.read(Tree::Fork(f2), "a").texts().len(), 5, "{history:?}");
     assert_eq!(w.read(Tree::Fork(f3), "a").texts().len(), 5, "{history:?}");
     next(&mut w, Tree::Fork(f3));
     drain(&mut w);
+    assert_eq!(
+        version(&w, Tree::Main),
+        Some(mine),
+        "{history:?}: f3's delete carried upward and applied in main"
+    );
     (
         w.read(Tree::Main, "a").texts(),
         w.read(Tree::Fork(f3), "a").texts(),
     )
 }
 
-/// Finding 26, fixed in the checks: under full lineage the nested
-/// sandbox's dropped delete follows f2's delete, which lost (finding 19),
-/// so line 3 comes back in f3 by that decision. The no-silent-loss, stale
-/// and flicker checks now allow that move, as the check of what entered a
-/// tree already did; before, they called it a stale revert.
+/// Rule 3e with the agreeing delete an ordinary change (the owner,
+/// 2026-11-05: "(a) agree -- why would it be dropped?"): a nested
+/// sandbox's delete that agrees with its parent's applies there as part of
+/// the change that won, is carried upward with the parent's landing, and is
+/// judged again in main, where it was written over main's line: it applies,
+/// though the parent's own delete lost there. Finding 26's calls.
 #[test]
-fn r3_a_nested_sandboxs_dropped_delete_follows_the_delete_that_lost() {
-    let (main, f3) = nested_dropped_delete(HistoryPolicy::FullLineage);
-    assert_eq!(main.len(), 6, "line 3 came back in main");
-    assert_eq!(f3, main, "and in the nested sandbox");
+fn r3_a_nested_sandboxs_agreeing_delete_is_carried_upward() {
+    for history in BOTH {
+        let (main, f3) = nested_agreeing_delete(history);
+        assert_eq!(main.len(), 5, "{history:?}: line 3 deleted in main");
+        assert_eq!(f3, main, "{history:?}: and in the nested sandbox");
+    }
 }
 
-/// Coherence finding 27 (found fixing finding 26, 2026-11-04): with the
-/// calls above the history setting decides differently. Under full
-/// lineage main judges f2's landing of f3's save as its change in f2, in
-/// which the dropped delete is no change, so line 3 comes back; under
-/// `Squashed` main judges f3's save itself (the saves the graft names,
-/// rule 7), whose delete was written over main's line, so it applies.
-/// Rule 7 says the setting decides nothing; finding 19's dropped delete
-/// and rule 7's graft judging contradict it. The owner's call.
+/// Rule 7's "the setting decides nothing" (R7.2), finding 27: the nested
+/// agreeing delete above is decided the same under both settings. It
+/// failed while an agreeing delete was dropped (R3e.3, which the owner
+/// rejected on 2026-11-05).
 #[test]
-#[ignore = "coherence finding 27: a nested sandbox's dropped agreeing delete is decided differently under the two history settings"]
-fn finding_27_a_nested_dropped_delete_decided_by_the_history_setting() {
+fn r7_a_nested_agreeing_delete_is_decided_the_same_under_both_settings() {
     assert_eq!(
-        nested_dropped_delete(HistoryPolicy::FullLineage),
-        nested_dropped_delete(HistoryPolicy::Squashed)
+        nested_agreeing_delete(HistoryPolicy::FullLineage),
+        nested_agreeing_delete(HistoryPolicy::Squashed)
     );
+}
+
+/// Coherence finding 28 (2026-11-05, found removing R3e.3; seed 15 of
+/// 1 to 64 of the settings comparison): an agreeing delete that applies
+/// replaces the parent's delete without having been written over it. Main
+/// edits line 1, then deletes it; the sandbox deletes line 1 concurrently,
+/// and its delete applies: main's edit entered main and is gone, with no
+/// version written over it in its place and no collision naming it
+/// (`no_silent_loss`). The model follows the owner's rule; the check calls
+/// it a loss. The owner's call.
+#[test]
+#[ignore = "coherence finding 28: an applied agreeing delete replaces the parent's delete, which the checks call a loss"]
+fn finding_28_an_agreeing_delete_replaces_a_delete_over_an_unseen_edit() {
+    for history in BOTH {
+        let mut w = world(history);
+        let f = w.create_fork(Tree::Main);
+        distinct(&mut w, "a");
+        w.save(&m1(), "a", 1);
+        call(&mut w, &m1(), "a", LineEdit::Delete(1));
+        call(&mut w, &Client::Fork(f), "a", LineEdit::Delete(1));
+        drain(&mut w);
+    }
+}
+
+/// Coherence finding 28, under `Squashed` (seeds 44 and 60 of 1 to 64 of
+/// the squashed run): a sandbox's edit of line 1 loses to main's delete,
+/// and a later save of the same take deletes line 1 over that edit. It
+/// applies, so main's winning delete is not in the result (`parent_wins`).
+#[test]
+#[ignore = "coherence finding 28: an applied agreeing delete replaces the parent's winning delete in a squashed take"]
+fn finding_28_a_squashed_agreeing_delete_replaces_the_winning_delete() {
+    let mut w = world(HistoryPolicy::Squashed);
+    let f = w.create_fork(Tree::Main);
+    distinct(&mut w, "a");
+    w.save(&Client::Fork(f), "a", 1);
+    call(&mut w, &m1(), "a", LineEdit::Delete(1));
+    next(&mut w, Tree::Fork(f));
+    call(&mut w, &Client::Fork(f), "a", LineEdit::Delete(1));
+    drain(&mut w);
 }
 
 /// Finding 25 (seeds 287 and 436 of the settings comparison): a sandbox
@@ -2830,15 +2879,18 @@ fn r11_a_losing_rename_over_loses_its_rename_with_its_change() {
     }
 }
 
-/// Rule 3e, finding 19: a transaction's delete that the sandbox's own
-/// delete agrees with is dropped at commit and costs nothing; when the
-/// sandbox's delete then loses whole at main (another line of its save
-/// collided), the line comes back, and no record names the transaction's
-/// delete, though its commit answered `Committed`. It shares the fate of
-/// the delete it agreed with. Found by the random runs (seed 47 of the
-/// squashed run); it needs nothing this round added.
+/// Rule 3e with the agreeing delete an ordinary change (the owner,
+/// 2026-11-05, rejecting R3e.3), finding 19's calls: a transaction deletes
+/// a line the sandbox's own save deletes too. At commit the two deletes
+/// agree, so the transaction's delete applies in the sandbox, part of the
+/// change that won (`Committed`). The sandbox's save then loses whole at
+/// main (another of its lines collided); the transaction's commit, judged
+/// on its own (rule 4), carries its delete upward, and it applies in main.
+/// When the transaction's change loses instead (another of its lines
+/// collided with the sandbox's), its agreeing delete loses with it and the
+/// answer names it.
 #[test]
-fn r3_a_dropped_agreeing_delete_follows_the_delete_it_agreed_with() {
+fn r3_a_transactions_agreeing_delete_is_part_of_its_change() {
     for history in BOTH {
         let mut w = world(history);
         // Distinct bytes, so the alignment's pick among identical lines
@@ -2850,6 +2902,8 @@ fn r3_a_dropped_agreeing_delete_follows_the_delete_it_agreed_with() {
         w.close(d);
         let f = w.create_fork(Tree::Main);
         let c = Client::Fork(f);
+        let line3 = w.read(Tree::Main, "a").lines[3].line.clone();
+        let version = |w: &World, t: Tree| w.read(t, "a").member(&line3).map(|l| l.id.clone());
         let h = w.open_write(&c, "a");
         w.begin(f).unwrap();
         let k = w.open_write(&c, "a");
@@ -2858,25 +2912,55 @@ fn r3_a_dropped_agreeing_delete_follows_the_delete_it_agreed_with() {
         w.edit(h, LineEdit::Delete(3));
         w.edit(h, LineEdit::At(0));
         w.close(h);
+        let theirs = version(&w, Tree::Fork(f)).expect("the sandbox's delete");
         w.save(&m1(), "a", 0);
         assert_eq!(w.commit_txn(f), Ok(TxnOutcome::Committed), "{history:?}");
-        assert_eq!(
-            w.read(Tree::Fork(f), "a").texts().len(),
-            5,
-            "line 3 deleted"
-        );
+        let mine = version(&w, Tree::Fork(f)).expect("the transaction's delete");
+        assert_ne!(mine, theirs, "{history:?}: applied in the sandbox");
         drain(&mut w);
         assert_eq!(
             w.read(Tree::Main, "a").texts().len(),
-            6,
-            "{history:?}: line 3 came back"
+            5,
+            "{history:?}: line 3 stays deleted"
         );
-        let line3 = w.read(Tree::Main, "a").lines[3].line.clone();
+        assert_eq!(
+            version(&w, Tree::Main),
+            Some(mine),
+            "{history:?}: carried upward"
+        );
+
+        // The loss: the transaction deletes line 3 and edits line 0; the
+        // sandbox's save deletes line 3 and edits line 0 concurrently.
+        let line3 = w
+            .read(Tree::Fork(f), "a")
+            .get(3)
+            .expect("a line 3")
+            .line
+            .clone();
+        let h = w.open_write(&c, "a");
+        w.begin(f).unwrap();
+        let k = w.open_write(&c, "a");
+        w.edit(k, LineEdit::Delete(3));
+        w.edit(k, LineEdit::At(0));
+        w.close(k);
+        w.edit(h, LineEdit::Delete(3));
+        w.edit(h, LineEdit::At(0));
+        w.close(h);
+        let Ok(TxnOutcome::Lost { lines }) = w.commit_txn(f) else {
+            panic!("{history:?}: the transaction lost");
+        };
+        let gone = lines
+            .iter()
+            .find(|o| o.line == line3)
+            .map(|o| o.staged.clone())
+            .unwrap_or_else(|| panic!("{history:?}: its agreeing delete is named: {lines:?}"));
         assert!(
             w.collisions
                 .iter()
-                .any(|x| x.by == By::Whole && x.lines.contains(&line3))
+                .any(|x| x.by == By::Whole && x.lost.contains(&gone)),
+            "{history:?}: lost with its change"
         );
+        drain(&mut w);
     }
 }
 
