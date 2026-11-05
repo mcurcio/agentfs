@@ -73,3 +73,5 @@ in the repository:
 [SECURITY.md](https://github.com/mcurcio/agentfs/blob/main/SECURITY.md),
 [LICENSE-APACHE](https://github.com/mcurcio/agentfs/blob/main/LICENSE-APACHE) and
 [LICENSE-MIT](https://github.com/mcurcio/agentfs/blob/main/LICENSE-MIT).
+
+The [experimental target-model prototype](target-architecture/prototype.md) records real byte calls into main and sandbox branches. It is separate from the production recorder.

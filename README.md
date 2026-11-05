@@ -293,3 +293,5 @@ Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or
 otherwise, any contribution intentionally submitted for inclusion in
 agentfs by you, as defined in the Apache-2.0 license, shall be dual
 licensed as above, without any additional terms or conditions.
+
+An [experimental target-model prototype](docs/target-architecture/prototype.md) starts the new Git-backed main/sandbox architecture. It is separate from the production recorder and is not ready for workloads.

@@ -906,10 +906,10 @@ this model replaced (landing, forks, journal, history) and the earlier mechanism
 resolver chain, per-path merge bases, squash chains) are in git history only. Nothing left in the set should
 contradict this page; where something does, this page wins.
 
-## 18. Prototype plan (not built)
+## 18. Prototype plan (first recording slice built)
 
 The review of 2026-11-04 recommends a small real-filesystem prototype before the architecture is settled, since
-more seeds against the model cannot test what the model leaves out. Its scope (a design choice):
+more seeds against the model cannot test what the model leaves out. The [prototype implementation](prototype.md) starts the recording slice; the full exit criteria below are not yet met. Its scope (a design choice):
 
 | In scope | Answers | Exit criterion (pass or fail) |
 |---|---|---|

@@ -32,6 +32,8 @@ missing from these tables or a row names a module that no longer exists;
 | `lib.rs` | Crate root: the module list and the engine's overview |
 | `volume.rs` | Opens a state area: crash recovery, then the [`Recorder`](#the-synchronous-step) used at every boundary and the `Committer` that turns records into commits |
 | `record.rs` | What the journal stores: one record per change boundary, absolute state, never deltas (§3.1, §3.3) |
+| `prototype/mod.rs` | Experimental target-model actor: byte-call saves, object identities, private checkouts, main and sandbox branches; separate from the production recorder |
+| `prototype/wal.rs` | Experimental checksummed byte-call journal and fail-stop append path (target git-model §3) |
 | `journal.rs` | The durable change log: framed, checksummed records with group-commit `fsync` (§3.2, §3.3) |
 | `pending.rs` | Frozen copies in `pending/`: `FICLONE` reflink, else copy plus `fsync`; slot-numbered ids for fronts (§3.2 step 1) |
 | `claims.rs` | Per-path ordering: a record claims its paths from decision to tracked-set update (§3.2, §4) |
