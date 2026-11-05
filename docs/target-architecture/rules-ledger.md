@@ -165,6 +165,23 @@ without seeing the other. MODEL.md's rules table holds the full wording; this pa
   against that version (R3c.2: it has not seen what arrived while it was open). Owner, 2026-11-05: "alright, lets
   try option 4 until it becomes a problem." This supersedes the waiting in R9, R9.1, R9.3, R9.4, R9.5, R9.7 and
   R9.9; which of their parts go is settled by the snapshot-opens design, then recorded here.
+- **R9.12** · owner · A close works in stages. First agentfs builds the edit the program just made, against the
+  version it opened, knowing nothing of what has landed since. Reconciling that edit with what has landed comes
+  after. Owner, 2026-11-05: "when the client closes the file, the first stage is simply trying to build the edit that
+  the client just made, either for a commit or for the impending transaction. The reconciliation with the prior
+  landed commits occurs _after_ that edit has been calculated."
+- **R9.13** · owner · A client's view stays on the commit from before a landing. It moves forward only after the
+  landings are fully resolved, and only when the client opens a file again. Owner, 2026-11-05: "whenever a landing is
+  about to occur, the client view becomes sticky to whatever commit predates the client landing. And the client view
+  can only be fast-forwarded after the landing(s) have been fully resolved and also only when the client opens a file
+  again."
+- **R9.14** · owner · A file deleted or replaced by an incoming change while a program has it open: the program's
+  save still counts as an edit of that file, judged by R11 (an edit of a file the parent deleted loses, kept in
+  history). Owner, 2026-11-05: "(a) sounds correct to me". R11.3 covers deletes made inside the same tree only.
+- **R9.15** · owner · A program's truncate and rewrite replaces the file, even if a landing changed it while it was
+  open: last writer wins, both versions kept in history. Owner, 2026-11-05: "a".
+- **R9.16** · owner · Two programs in one tree: the later close is final inside that tree. Only lines a sync brought
+  are left for the parent to decide. Owner, 2026-11-05: "a".
 - **R9.1** · owner · A landing locks the files its changes touch, the same way. Source: "freezing only the files
   that a landing touches sounds reasonable" (2026-11-02). Tests: `r9_a_landing_waits_for_the_parents_open_writer`,
   `r9_a_landing_holds_the_files_of_its_losing_changes`
