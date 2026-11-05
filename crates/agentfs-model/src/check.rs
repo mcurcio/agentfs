@@ -1361,14 +1361,9 @@ fn appends_exact(
             now.bytes()
         ));
     }
-    let read: BTreeMap<&str, String> = now
-        .read_lines()
-        .into_iter()
-        .map(|(l, t)| (l.id.as_str(), t))
-        .collect();
     let mut offset = 0;
     for (i, l) in now.lines.iter().enumerate() {
-        let Some(t) = read.get(l.id.as_str()) else {
+        let Some(t) = l.text() else {
             continue;
         };
         let start = offset;
@@ -1538,6 +1533,31 @@ fn placed_and_unlinked(w: &mut World) -> Result<(), String> {
     let mut met = (0, 0);
     for l in &w.landings[w.placements_checked..] {
         let (u, base) = (&l.change, &l.base);
+        // R10.4, read from git: a landing leaves no line after the parent's
+        // unfinished last line.
+        if l.direction == Direction::Landing {
+            for p in PATHS {
+                let b = w.file(&l.before, p);
+                let Some(q) = b
+                    .live()
+                    .last()
+                    .filter(|x| x.text().is_some_and(|t| !t.ends_with('\n')))
+                else {
+                    continue;
+                };
+                if let Some(x) = w
+                    .file(&l.result, p)
+                    .live()
+                    .skip_while(|x| x.id != q.id)
+                    .nth(1)
+                {
+                    return Err(format!(
+                        "{u:.7}'s line {} in {p} comes after the parent's unfinished last line {}",
+                        x.id, q.id
+                    ));
+                }
+            }
+        }
         for p in PATHS {
             let b = w.file(&l.before, p);
             let edits: Vec<_> = w

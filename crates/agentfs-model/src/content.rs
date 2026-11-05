@@ -247,31 +247,10 @@ impl Content {
             .collect()
     }
 
-    /// The live lines with their bytes as a program reads them. Only a
-    /// file's last line can lack a newline in bytes, so a partial line that
-    /// another line follows (a merge placed a line after it: rule 10's
-    /// choice) reads as terminated; its version keeps the bytes its writer
-    /// wrote.
-    pub fn read_lines(&self) -> Vec<(&Line, String)> {
-        let live: Vec<&Line> = self.live().collect();
-        let n = live.len();
-        live.into_iter()
-            .enumerate()
-            .map(|(i, l)| {
-                let t = l.text().unwrap_or_default();
-                let read = if i + 1 < n && !t.ends_with('\n') {
-                    format!("{t}\n")
-                } else {
-                    t.to_string()
-                };
-                (l, read)
-            })
-            .collect()
-    }
-
-    /// The file's bytes, as a program reads them ([`Content::read_lines`]).
+    /// The file's bytes, as a program reads them: its live lines' bytes in
+    /// order. agentfs adds no newline a program did not write (R10.4).
     pub fn bytes(&self) -> String {
-        self.read_lines().into_iter().map(|(_, t)| t).collect()
+        self.live().filter_map(|l| l.text()).collect()
     }
 
     /// The `i`th live line, as a program reads it.
@@ -426,13 +405,8 @@ mod tests {
         assert_eq!(split_lines("a\n\n"), ["a\n", "\n"]);
         assert!(split_lines("").is_empty());
         let mut d = Content::root("d");
-        d.lines[0].state = State::Live("x".into());
         d.lines[5].state = State::Live("y".into());
-        assert_eq!(
-            d.bytes(),
-            "x\n-\n-\n-\n-\ny",
-            "a followed partial line reads terminated"
-        );
+        assert_eq!(d.bytes(), "-\n-\n-\n-\n-\ny");
         assert_eq!(c.at(3), "b3");
         assert!(is_root("b3") && is_root("b") && !is_root("b6") && !is_root("c1.1"));
         assert_eq!(c.member("b").and_then(Line::text), Some("b"));

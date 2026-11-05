@@ -423,20 +423,18 @@ order: each new one is a new version of its old one. Extra new lines get new ide
 deleted version. A line's bytes include its newline, so adding or removing a file's final newline changes its last
 line. An append needs none (§6).
 
-**Partial lines** (a choice). Only a file's last line can lack a newline in bytes, but a merge can still put a line
-after another writer's partial last line: main appends `}` with no final newline while a sandbox appends a line, and
-placement (below) puts the parent's first. That line then reads as terminated: the file's bytes add the newline,
-and its version keeps the bytes its writer wrote, until a save makes it the last line again or rewrites it
-(`r10_a_line_after_a_partial_line_reads_terminated`). The byte oracle found the case (MODEL.md finding 15): without
-the rule two line identities made one line of bytes, and the alignment paired the wrong records. Alternatives: count
-a line placed after a partial line as an edit of it, so the incoming change collides and loses whole (no byte
-appears that no writer wrote, but a concurrent append is lost for a missing newline); or have `agentfs` write a
-version adding the newline (a merge would then originate a line, against one writer per change, §3).
+**Partial lines.** A landing can meet a parent's unfinished last line: main appends `}` with no final newline while a
+sandbox appends a line, and placement (below) would put the sandbox's line after it. That line collides with main's
+and main wins, and the sandbox's save loses whole; agentfs never adds a newline no program wrote (the owner,
+2026-11-05, R10.4: "collide"; `r10_a_line_after_the_parents_unfinished_line_collides`). An append made after a sync
+brought that line finishes it (§6). Two cases R10.4 does not decide are open (MODEL.md findings 29, 30): a sync that
+keeps the sandbox's undecided line after the parent's unfinished one, and a transaction's line after its own
+sandbox's unfinished one. In both, two line identities make one line of bytes.
 
 | What the bytes show | Recorded as | Against the parent's concurrent edit of that line | Tests |
 |---|---|---|---|
 | a changed line | a new version, in place | the parent wins | `r3_*` |
-| a new line (an insert, an append) | a new line identity | none: both stay; two new lines at one place keep the parent's first | `r10_an_insert_*`, `r10_concurrent_inserts_*`, every random run (`placed_and_unlinked`) |
+| a new line (an insert, an append) | a new line identity | none: both stay; two new lines at one place keep the parent's first; a line after the parent's unfinished last line loses to it | `r10_an_insert_*`, `r10_a_line_after_the_parents_unfinished_line_collides`, `r10_concurrent_inserts_*`, every random run (`placed_and_unlinked`) |
 | bytes appended to a partial last line | a new version of that line | the parent wins | `r8_concurrent_appends_onto_a_partial_last_line_collide` |
 | a removed line | a deleted version | the parent wins: its edit stays, or its delete stands; two deletes agree | `r10_a_delete_*` |
 | a moved line | a delete plus a new line holding the same bytes | the delete loses to the parent's edit and the new line applies: the parent's edit at the old place, the old bytes at the new one, one collision recorded (the delete's) | `r10_a_move_is_a_delete_plus_an_insert` |
@@ -784,8 +782,8 @@ power loss, failed save or view-host restart.
   of any of them makes the whole rewrite lose. Kleppmann's list move or a structure-aware diff would do better, at the cost of a
   second, file-type-specific mechanism.
 - Line maps keep deleted versions and unlinked files, no trim rule.
-- Appends to a file with no final newline collide across trees: each finishes the last line (§6). A partial line a
-  merge put another line after reads as terminated, a newline no writer wrote (§7).
+- Appends to a file with no final newline collide across trees: each finishes the last line (§6). A line appended after the
+  parent's unfinished last line loses to it (§7).
 - A sync that keeps a sandbox's undecided rename can show a parent's rename-over in part, in that sandbox and in
   sandboxes inside it, until the parent decides (MODEL.md finding 17).
 - A sync takes main's decided unlink, so a sandbox's undecided edit in that file leaves its view before main's
@@ -881,9 +879,9 @@ saves and locks (§6); a sync commit credited to `agentfs` stays a
 labelled choice (§2); a save after a sync over the sandbox's own unlanded line still loses, a cost (§16);
 close-to-open visibility, accepted ("Go", §3). The 2026-11-04 revision (§3 journal, §6 progress, §7 objects, §14,
 §18) adds design choices only, each with its alternatives and costs beside it, and so does the byte model (§6, §7:
-an append onto a partial line, a followed partial line). Answered 2026-11-04: no P3 (§6, MODEL.md finding 24); P2 as
+an append onto a partial line). Answered 2026-11-04: no P3 (§6, MODEL.md finding 24); P2 as
 the prefix sync (§6). Answered 2026-11-05: an agreeing delete is not dropped (MODEL.md
-findings 19, 26, 27), two deletes of one line agree with no collision (ledger rule R10.3, MODEL.md finding 28), and squashing is dropped (§11).
+findings 19, 26, 27), two deletes of one line agree with no collision (ledger rule R10.3, MODEL.md finding 28), squashing is dropped (§11), the alarm is gone (§6), and a line after the parent's unfinished last line collides (§7).
 
 *History: 2026-11-03, from the model at 509a0ab; revised after review (save ordering, trees, recovery, grafts, slots); 2026-11-03, the owner's answers on losers and saves; review: Replication pushes losers, questions 2 and 3; 2026-11-03, the owner's answers on saves and locks; review: appends at close, main's clients' death, transactions with open files, the lock over path calls, the program-level hang; 2026-11-03, after the owner's "Go": close-to-open accepted, line identity, deletes and renames (§7); review: no POSIX call names a line, so a save aligns its bytes once (§6, §7), the atomic-save idiom, untracked files (§3), R9/R13/A8 put to the owner (§16), §17 cut; 2026-11-03, the owner's answer to question 3: a save or transaction lands whole or loses whole, only winning saves are squashed (§7, §9, §11, §15); 2026-11-04, answering the pull-request review: the journal (§3), progress (§6), objects (§7), why a custom protocol (§14), the prototype plan (§18), proof claims narrowed to the modelled executions; 2026-11-04, byte calls modelled (§6, §7), the notes ref built (§4, §8), Replication due on every move of main (§4); 2026-11-04, the adversarial review at `ee29551`: finding 24 (P3
 deadlocks cooperating programs, §6), squash runs cut at open files (§6), the object table and open numbers across a

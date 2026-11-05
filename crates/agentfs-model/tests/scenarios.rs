@@ -1324,15 +1324,77 @@ fn r8_concurrent_appends_onto_a_partial_last_line_collide() {
     assert_eq!((c.by, c.lines), (By::Line, vec![foo]));
 }
 
-/// Rule 10 with partial lines: main appends "}" with no final newline
-/// while the sandbox appends a line. Two new lines at one place, the
-/// parent's first: main's "}" is followed by the sandbox's line, so it
-/// reads as terminated ("}\n"), as only a file's last line can lack a
-/// newline in bytes. Its version keeps the byte its writer wrote (a
-/// choice); no collision. A later save that makes "}" the last line again
-/// writes it as the program's bytes say.
+/// R10.4 (the owner, 2026-11-05: "collide"): main appends "}" with no final
+/// newline while the sandbox appends a line. The sandbox's line, which would
+/// come after main's unfinished last line, collides with it and main wins, at
+/// every level of nesting. agentfs adds no newline: the file ends in "}", and
+/// the sandbox's save stays in history, kept by its collision ref.
 #[test]
-fn r10_a_line_after_a_partial_line_reads_terminated() {
+fn r10_a_line_after_the_parents_unfinished_line_collides() {
+    let mut w = world();
+    let f = w.create_fork(Tree::Main);
+    let g = w.create_fork(Tree::Fork(f));
+    calls(
+        &mut w,
+        &Client::Fork(f),
+        "b",
+        &[Write::Append("n9\n".into())],
+    );
+    let n9 = w.read(Tree::Fork(f), "b").last().to_string();
+    calls(&mut w, &m1(), "b", &[Write::Append("}".into())]);
+    let brace = w.read(Tree::Main, "b").last().to_string();
+    next(&mut w, Tree::Main);
+    assert_eq!(&bytes(&w, Tree::Main, "b")[12..], "}");
+    let c = w.collisions.last().expect("a collision").clone();
+    assert_eq!(
+        (c.tree, c.by, c.lost, c.won),
+        (Tree::Main, By::Line, vec![n9.clone()], vec![brace])
+    );
+    assert!(w.file(&c.loser, "b").contains(&n9), "kept in history");
+    drain(&mut w);
+    // The same with a sandbox as the parent: its own unfinished last line wins.
+    calls(&mut w, &Client::Fork(f), "c", &[Write::Append("{".into())]);
+    calls(
+        &mut w,
+        &Client::Fork(g),
+        "c",
+        &[Write::Append("n8\n".into())],
+    );
+    next(&mut w, Tree::Fork(f));
+    assert_eq!(&bytes(&w, Tree::Fork(f), "c")[12..], "{");
+    let c = w.collisions.last().expect("a collision").clone();
+    assert_eq!(c.tree, Tree::Fork(f));
+    drain(&mut w);
+    for t in [Tree::Main, Tree::Fork(f), Tree::Fork(g)] {
+        assert_eq!(&bytes(&w, t, "b")[12..], "}", "{t:?}");
+        assert_eq!(&bytes(&w, t, "c")[12..], "{", "{t:?}");
+    }
+}
+
+/// R8.1, not R10.4: an append made after the sync brought main's unfinished
+/// last line finishes that line, written over it, and lands with no collision.
+#[test]
+fn r10_an_append_over_the_synced_unfinished_line_finishes_it() {
+    let mut w = world();
+    let f = w.create_fork(Tree::Main);
+    calls(&mut w, &m1(), "b", &[Write::Append("}".into())]);
+    next(&mut w, Tree::Fork(f));
+    calls(
+        &mut w,
+        &Client::Fork(f),
+        "b",
+        &[Write::Append(";\n".into())],
+    );
+    ends_converged_without_collisions(&mut w);
+    assert_eq!(&bytes(&w, Tree::Main, "b")[12..], "};\n");
+}
+
+/// Coherence finding 29: a sync keeps the sandbox's undecided line after the
+/// parent's unfinished last line (R3a: a sync decides nothing). No rule says
+/// what the sandbox shows until the parent's queue decides.
+#[test]
+#[ignore = "coherence finding 29: a sync puts the sandbox's undecided line after the parent's unfinished last line, and two lines read as one"]
+fn finding_29_a_sync_keeps_a_line_after_the_parents_unfinished_line() {
     let mut w = world();
     let f = w.create_fork(Tree::Main);
     calls(
@@ -1342,15 +1404,39 @@ fn r10_a_line_after_a_partial_line_reads_terminated() {
         &[Write::Append("n9\n".into())],
     );
     calls(&mut w, &m1(), "b", &[Write::Append("}".into())]);
-    ends_converged_without_collisions(&mut w);
-    let b = w.read(Tree::Main, "b");
-    assert_eq!(&b.bytes()[12..], "}\nn9\n");
-    let brace = b.get(6).expect("the brace").clone();
-    assert_eq!(brace.text(), Some("}"), "the version keeps its bytes");
-    let n = b.bytes().len();
-    calls(&mut w, &m1(), "b", &[Write::Truncate(n - 3)]);
-    assert_eq!(&bytes(&w, Tree::Main, "b")[12..], "}\n");
-    ends_converged_without_collisions(&mut w);
+    next(&mut w, Tree::Fork(f));
+    let b = w.read(Tree::Fork(f), "b");
+    let lines = b.live().count();
+    assert_eq!(
+        b.bytes().lines().count(),
+        lines,
+        "{:?}: only a file's last line can lack a newline",
+        b.bytes()
+    );
+}
+
+/// Coherence finding 30: a transaction's line after its sandbox's own
+/// unfinished last line. R10.4 is about a parent and a sandbox; no rule says
+/// what happens inside one tree.
+#[test]
+#[ignore = "coherence finding 30: a transaction commit puts its line after the sandbox's unfinished last line, and two lines read as one"]
+fn finding_30_a_transactions_line_after_the_sandboxs_unfinished_line() {
+    let mut w = world();
+    let f = w.create_fork(Tree::Main);
+    let c = Client::Fork(f);
+    w.begin(f).unwrap();
+    calls(&mut w, &c, "b", &[Write::Append("n9\n".into())]);
+    // The sandbox's own unfinished line arrives after begin, by a sync.
+    calls(&mut w, &m1(), "b", &[Write::Append("}".into())]);
+    next(&mut w, Tree::Fork(f));
+    assert_eq!(w.commit_txn(f), Ok(TxnOutcome::Committed));
+    let b = w.read(Tree::Fork(f), "b");
+    assert_eq!(
+        b.bytes().lines().count(),
+        b.live().count(),
+        "{:?}: only a file's last line can lack a newline",
+        b.bytes()
+    );
 }
 
 /// Rule 8 and 10, a line written in two calls, and two calls over one

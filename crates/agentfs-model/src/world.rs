@@ -12,7 +12,7 @@
 //! | 7. Full lineage | a landing is a merge with the fork's commit as second parent (or a fast-forward), so a tree's history reaches every change it took, the losers included; each fork commit lands on its own |
 //! | 8. A save records the write calls | [`World::write`] keeps each byte call ([`Write`]: an `O_APPEND` write, `pwrite`, `ftruncate`; [`World::open_trunc`] for `O_TRUNC`) on the open file; [`World::close`] applies them to the tree's head then: an append's bytes go after the file's last byte, finishing a partial last line (a version of it) and then making new lines; other calls leave bytes the save aligns with the head's lines (rule 10). [`World::edit`] makes a test's line edit as a program's byte calls (`program`) |
 //! | 9. A take locks the files it overwrites | [`World::open_write`]; a [`Step::Next`] whose sync or landing would overwrite a file open for writing in that tree waits ([`World::waits`]) until the close; then it holds its files ([`World::holds`]) until [`Step::Finish`] writes them; a write-open, [`World::unlink`] or [`World::rename`] of a held file waits until then; a client's death ([`World::end_client`], [`World::end_main_client`]) closes its files |
-//! | 10. Line identity | a save derives identities from the bytes at close: it aligns them with the head's lines once, by git's histogram diff (`align`), and records the result: each new line an identity, each changed line a new version written over the version it replaced; the referee and a sync then compare versions of one identity, never bytes or positions (`resolve`, `adopt`, `splice`); a partial line that a merge put another line after reads as terminated (`Content::read_lines`) |
+//! | 10. Line identity | a save derives identities from the bytes at close: it aligns them with the head's lines once, by git's histogram diff (`align`), and records the result: each new line an identity, each changed line a new version written over the version it replaced; the referee and a sync then compare versions of one identity, never bytes or positions (`resolve`, `adopt`, `splice`); a line a landing would put after the parent's unfinished last line collides with it (R10.4) |
 //! | 9, progress (git-model.md §6) | P1: a [`Step::Next`] takes the first entry no earlier waiting entry shares a file or a source with (`scan`), so several may wait ([`World::waits`]); no call ever waits on a waiting entry (P3 is gone, the owner's decision of 2026-11-04): a new open of a file a waiting entry waits for is granted; P2, the prefix sync: a sync delivers the parent's commits in order up to the first whose delivery would overwrite a file open for writing in the fork, and waits for the rest (`prefix`) |
 //! | 11. Deletes and renames | a file's name line: [`World::rename`] writes a new version, [`World::unlink`] a deleted one; `resolve` applies the per-line rule to it and couples a file's existence with its content. [`World::create`] makes a file (an unborn identity); an open holds an object ([`Handle::object`]), so a close saves to the file its object is named by ([`World::named`]) or, for an orphan, nothing ([`Orphan`]); a rename-over from a new file is an atomic save, a rewrite of the replaced file |
 //! | 12. The journal (git-model.md §3) | an open's calls are its journal; [`World::crash`] saves each open from it once (the `Agentfs-Open` trailer, [`World::saved`]), drops calls that never returned and puts takes back in their queues |
@@ -136,7 +136,8 @@ pub enum Direction {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum By {
     /// A same-line collision: the version and the parent's were each
-    /// written without seeing the other.
+    /// written without seeing the other. Or a line placed after the
+    /// parent's unfinished last line, unseen by its writer (R10.4).
     Line,
     /// A file rule (rule 11): an unlink the parent's unseen line defeated,
     /// an edit of a file the parent unlinked, half of a rename-over, a
@@ -165,7 +166,7 @@ pub struct Collision {
     /// The incoming versions of those lines, which lost.
     pub lost: Vec<String>,
     /// The tree's versions that won (it kept them), one for each lost: of
-    /// the same line, or, per [`By`], the line that decided the loss.
+    /// the same line, or, per [`By`] or R10.4, the line that decided the loss.
     pub won: Vec<String>,
     pub by: By,
     /// The tree's head before the take: the parent's version, which won.
@@ -1292,10 +1293,13 @@ impl World {
     /// all of it; an unlink loses whole if the parent has a live line its
     /// writer did not see ([`World::seen`]); a rename onto a path another
     /// file holds in the result loses.
+    /// At a landing, a line placed after the parent's unfinished last line
+    /// collides with it (R10.4, the owner, 2026-11-05: "collide"), so no
+    /// newline appears that no program wrote.
     /// Then the change is judged whole (rule 3e): if any version lost, none
     /// applies. The applied versions are placed by [`splice`], in the order
     /// `tip` (the incoming change) has them.
-    fn resolve(&self, ours: &str, incoming: &[Incoming], tip: &str) -> Merged {
+    fn resolve(&self, dir: Direction, ours: &str, incoming: &[Incoming], tip: &str) -> Merged {
         let mut by_path: BTreeMap<&str, Vec<&Incoming>> = BTreeMap::new();
         for i in incoming {
             by_path.entry(&i.path).or_default().push(i);
@@ -1387,6 +1391,28 @@ impl World {
             }
             if !changed {
                 break;
+            }
+        }
+        if dir == Direction::Landing {
+            for (p, ins) in &by_path {
+                let cur = self.file(ours, p);
+                let Some(q) = cur
+                    .live()
+                    .last()
+                    .filter(|l| l.text().is_some_and(|t| !t.ends_with('\n')))
+                else {
+                    continue;
+                };
+                let applied: Vec<Line> = ins
+                    .iter()
+                    .filter(|i| verdicts[&key(i)] == Verdict::Apply)
+                    .map(|i| i.version.clone())
+                    .collect();
+                let placed = splice(&cur, &applied, &self.file(tip, p));
+                let after = placed.live().skip_while(|l| l.id != q.id).skip(1);
+                for l in after {
+                    verdicts.insert((p.to_string(), l.line.clone()), Verdict::Lose(q.id.clone()));
+                }
             }
         }
         // Rule 3e: the change lands whole or loses whole. Any lost version
@@ -2166,20 +2192,7 @@ impl World {
     fn align(&self, seq: Vec<Replayed>, image: &str) -> Vec<Replayed> {
         let texts = split_lines(image);
         let lives: Vec<usize> = (0..seq.len()).filter(|k| seq[*k].live()).collect();
-        // Each line as the program read it: a followed partial line reads
-        // terminated (`Content::read_lines`).
-        let old: Vec<String> = lives
-            .iter()
-            .enumerate()
-            .map(|(i, k)| {
-                let t = seq[*k].text();
-                if i + 1 < lives.len() && !t.ends_with('\n') {
-                    format!("{t}\n")
-                } else {
-                    t
-                }
-            })
-            .collect();
+        let old: Vec<String> = lives.iter().map(|k| seq[*k].text()).collect();
         let mut instead: Vec<Vec<Replayed>> = lives.iter().map(|k| vec![seq[*k].clone()]).collect();
         let mut before: Vec<Vec<Replayed>> = vec![Vec::new(); old.len() + 1];
         for (os, on, ns, nn) in self.hunks(&old, &texts) {
@@ -2225,16 +2238,6 @@ impl World {
             }
         }
         out.append(&mut before[k]);
-        // A kept line a merge had made read as terminated, now the last:
-        // the program's bytes say what it ends with, so it takes them, as a
-        // new version, if they differ from what its version holds.
-        let last = out.iter().rposition(Replayed::live);
-        if let (Some(k), Some(t)) = (last, texts.last())
-            && matches!(out[k], Replayed::Kept(_))
-            && out[k].text() != *t
-        {
-            out[k] = out[k].clone().version(State::Live(t.clone()));
-        }
         out
     }
 
@@ -2580,7 +2583,7 @@ impl World {
             None
         } else {
             let edit = self.edit_of(&start, &head);
-            let m = self.resolve(&ours, &edit, &head);
+            let m = self.resolve(Direction::Transaction, &ours, &edit, &head);
             let open = self.write_open(Tree::Fork(f));
             if m.files.iter().any(|p| open.contains(p)) {
                 return Err(ModelError::OpenFiles);
@@ -3150,7 +3153,12 @@ impl World {
     /// Rule 3e, one take of commit `c` into the tree at `ours`: the change
     /// judged whole ([`World::resolve`]).
     fn judge(&self, ours: &str, c: &str) -> Merged {
-        self.resolve(ours, &self.edit_of(&self.first_parent(c), c), c)
+        self.resolve(
+            Direction::Landing,
+            ours,
+            &self.edit_of(&self.first_parent(c), c),
+            c,
+        )
     }
 
     /// Rule 3, a fork's change into its parent `x`, the one place a
