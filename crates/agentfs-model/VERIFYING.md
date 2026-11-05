@@ -2,7 +2,8 @@
 
 This page says how agentfs's landing rules are checked before anything is built on them: what to run, when,
 and how to tell whether a passing run means anything. It is for maintainers changing the rules and for
-reviewers of a design pull request. The rules themselves live in [MODEL.md](MODEL.md) (the rule table, the
+reviewers of a design pull request. Which rules exist, and whether the owner approved each, is the
+[rules ledger](../../docs/target-architecture/rules-ledger.md). The rules' full wording lives in [MODEL.md](MODEL.md) (the rule table, the
 invariants, the findings) and [agentfs in git terms](../../docs/target-architecture/git-model.md) (the
 foundation the implementation follows); this page does not restate them.
 
@@ -116,10 +117,11 @@ request says in its body that they were run and what they showed.
 ## The procedure
 
 1. **Encode the rule in the model first.** Change `src/world.rs` (and `src/content.rs` for what a file holds)
-   so the model does what the rule says. Add or change the rule's row in MODEL.md's table: the rule in plain
-   words, its source, and the scenario tests that show it. The source is either an owner decision, quoted
-   and dated in MODEL.md's list of the owner's words, or a design choice, marked *choice* in the row. Never
-   present a choice as an owner decision. MODEL.md's list is the authoritative record of the owner's words.
+   so the model does what the rule says. The rule must already be in the
+   [rules ledger](../../docs/target-architecture/rules-ledger.md) as `owner` or `approved`. A rule that is not
+   there goes to the owner as a question first, with a recommendation, and is built only after he answers.
+   Then add or change the rule's row in MODEL.md's table: the rule in plain words, its ledger ID, and the
+   scenario tests that show it. Never present a choice as an owner decision.
 2. **Let the invariants judge every step.** `src/check.rs` holds the invariants. The scenarios and the random
    runs call them after every step, under every history setting (full lineage and squashed), and the random
    runs also check convergence once writes stop. A rule is only as safe as the invariants that would notice
@@ -135,7 +137,9 @@ request says in its body that they were run and what they showed.
 5. **Record what cannot hold, never weaken a check.** When the model shows a rule cannot be kept as stated,
    write a test that asserts the rule's intent and mark it
    `#[ignore = "coherence finding N: <what fails>"]`, and add finding N to MODEL.md. Do not loosen an
-   invariant, add an excuse to it, or narrow the random runs so the suite passes. A rejected alternative keeps
+   invariant, add an excuse to it, or narrow the random runs so the suite passes. Calling a check "stricter
+   than the rule" or "a check bug" does not change this. If the rule the check enforces is in the ledger
+   as `owner` or `approved`, the model is wrong. If it is not, the question goes to the owner (§"Fix passes"). A rejected alternative keeps
    its ignored test as the evidence for rejecting it. When it is a policy setting in `Policies`, the test
    lands with it (findings 1 and 6: `MergeRule::GitMergeBase`). When it replaces
    the model's code, its tests cannot land without that code: push it as a branch that is never merged,
@@ -143,6 +147,34 @@ request says in its body that they were run and what they showed.
 6. **Docs follow the model.** In the same pull request, update MODEL.md (rules, invariants, findings, costs)
    and git-model.md (the foundation). Owner decisions made during the work go into MODEL.md's list of the
    owner's words (step 1); the pull request body quotes them too, so a reviewer sees them in one place. CI is the gate: fmt, clippy, the tests and the mdBook build must be green.
+
+## Fix passes
+
+A fix pass answers a review or a failing seed. It is where agents have invented rules: an exception added to
+make one seed pass, a "cheap" shortcut, a check taught to excuse a case. Each one was a design decision nobody
+asked the owner about, and several later had to be torn out (P3, held states, the dropped agreeing delete).
+So a fix pass may only do two things:
+
+- **delete** code, a check exception or a mechanism;
+- **correct** the model, a check or a test toward a rule the ledger marks `owner` or `approved`.
+
+It may not add a rule, an exception (in the model or in a check), a refusal, a wait, or a setting. It may not
+loosen, narrow or excuse a check, and it may not reword a rule. Any of these goes back as a question for the
+owner, in the fix pass's result, with:
+
+1. the failing seed or scenario;
+2. the ledger rule or rules involved, or "none";
+3. two or three options in plain words, with a recommendation.
+
+The fix pass then stops on that item. It records the item as an open coherence finding with an ignored
+test (procedure step 5); it does not patch around it.
+
+Before fixing, ask **which ledger rule caused this?** A defect that traces to a `proposed` rule, or to no rule,
+is a question for the owner, not a fix. When the same mechanism has needed two exceptions, or draws a third
+finding, the mechanism's premise is wrong: stop and bring the owner options for removing it.
+
+Every exception in `src/check.rs` is a line marked `// excuse: R<id> <why>`, citing the ledger rule that
+requires it. The ledger check fails on an excuse with no rule, or one whose rule is not `owner` or `approved`.
 
 ## Adding a rule, a scenario or an invariant
 
@@ -227,7 +259,14 @@ Never re-run until a seed passes, skip a seed, or lower the seed count to get gr
 
 ## Reviewer checklist for a design pull request
 
-- Every changed or new rule has a MODEL.md row with its source: an owner quote with its date, or *choice*.
+Review provenance before behaviour. For every finding, name the ledger rule that caused it. If that rule is
+`proposed`, or there is none, the finding goes to the owner as a question, not to a fix pass.
+
+- Every changed or new rule is in the [rules ledger](../../docs/target-architecture/rules-ledger.md), and
+  every outcome-deciding change traces to an `owner` or `approved` entry. Look in particular for a new
+  shortcut, exception, refusal, wait or setting with no ledger entry: an unapproved rule.
+- No check got weaker: diff `src/check.rs` for new `excuse:` lines, removed assertions, narrowed loops or
+  conditions. A weaker check is a finding, whatever reason the commit gives.
 - Every rule row names scenarios that exist and assert the outcome, under both history settings where it
   applies.
 - New invariants read from git or the harness's own record, and appear in MODEL.md's table.

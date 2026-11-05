@@ -11,7 +11,8 @@ does not restate it.
 
 | When | Section of VERIFYING.md |
 |---|---|
-| Before editing | "The procedure", "Adding a rule, a scenario or an invariant" |
+| Before editing | "The procedure", "Adding a rule, a scenario or an invariant"; the rule must be `owner` or `approved` in `docs/target-architecture/rules-ledger.md` |
+| Fixing a review finding or a failing seed | "Fix passes": delete, or correct toward a ledger rule; anything else is a question for the owner |
 | Running anything | "Commands" (the container line, the `-e` seed variables) |
 | A test fails | "Reading a failure", "What the ignored tests are expected to show" |
 | Planting bugs | "Planting bugs (mutation probes)" |

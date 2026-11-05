@@ -5,6 +5,8 @@
 [`crates/agentfs-model`](../../crates/agentfs-model/MODEL.md) as of the commit that adds this revision on this
 page's branch (the one adding rule 3e's whole changes and the `r3_a_save_loses_whole_*` tests; the per-line rules
 before it are at 8185755), which runs the rules on the real `git` program.
+**Rules and their status:** [the rules ledger](rules-ledger.md) lists every rule in plain words and whether the
+owner approved it; it wins on status, this page on what each rule means in git.
 **Read it first:** code for the domains starts from this page. Where another page disagrees, this page wins and the
 other page has a bug.
 **Revision of 2026-11-04** (answering the pull-request review's points 1, 3, 4 and 5): the journal that records every

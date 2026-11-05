@@ -11,14 +11,16 @@ The rest of the set covers only what the git model does not: [the system](system
 | Document | Status |
 |---|---|
 | [agentfs in git terms](git-model.md) | proposed; the foundation for implementation; wins wherever another page disagrees |
+| [The rules ledger](rules-ledger.md) | the authority on which rules the owner approved; CI fails while any is `proposed` |
 | [The system](system.md) | revision 10, proposed (revision 3 approved by the owner on 2026-11-02) |
 | The eight domain pages | proposed |
 
 ## Reading order
 
 1. **[agentfs in git terms](git-model.md)**.
-2. **[The system](system.md)**: its §5 lists the owner's requirements the git model does not design yet.
-3. The domains:
+2. **[The rules ledger](rules-ledger.md)**: every rule in plain words, and whether the owner approved it.
+3. **[The system](system.md)**: its §5 lists the owner's requirements the git model does not design yet.
+4. The domains:
 
 | Domain | One line |
 |---|---|
