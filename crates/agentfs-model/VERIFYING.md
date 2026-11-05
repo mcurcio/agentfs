@@ -101,13 +101,13 @@ the expected failure.
 | Test | Finding | Fails with |
 |---|---|---|
 | `finding_1_git_merge_base_on_crossing_merges` | 1 | a sync leaves a line "which Main already took" |
-| `random_interleavings_git_merge_base` | 1 | 34 of 64 seeds, 1 of them (seed 46) a "harness panic: a model file in git": a sync that leaves a line "which Main already took" or drops a line (with no P3 and the prefix sync; 35 after the fix pass of the review of 2026-11-04, whose generator changes move the random calls; with creates, crashes and the progress rules 36; with the byte calls alone 32; before them 39 of 64, 2 of them a "harness panic: a model file in git", when git's merge leaves one line identity twice) |
+| `random_interleavings_git_merge_base` | 1 | 40 of 64 seeds, 2 of them (seeds 32 and 46) a "harness panic: a model file in git": a sync that leaves a line "which Main already took" or drops a line (with the calls of programs outside a transaction, 2026-11-05; 34 with no P3 and the prefix sync; 35 after the fix pass of the review of 2026-11-04, whose generator changes move the random calls; with creates, crashes and the progress rules 36; with the byte calls alone 32; before them 39 of 64, 2 of them a "harness panic: a model file in git", when git's merge leaves one line identity twice) |
 | `finding_6_git_hunks_on_neighbouring_lines` | 6 | a sync leaves a line "which Main already took" |
 | `finding_29_a_sync_keeps_a_line_after_the_parents_unfinished_line` | 29 | two lines read as one, `}n9` |
 | `finding_30_a_transactions_line_after_the_sandboxs_unfinished_line` | 30 | two lines read as one, `}n9` |
 | `finding_31_an_agreeing_delete_of_a_rename_overs_file` | 31 | `rename_overs_whole`: "was unlinked by renaming" |
 
-These were the results at seeds 1..64 on 2026-11-04; a change that moves a count says so in its pull
+These were the results at seeds 1..64 on 2026-11-05; a change that moves a count says so in its pull
 request. Finding 27's and finding 28's tests pass since the owner's decisions of 2026-11-05 (one of them went
 with squashing; finding 28's are `r10_two_deletes_of_one_line_agree_over_an_unseen_edit` and
 `r10_a_later_delete_agrees_with_the_winning_delete`). Finding 3's two tests went with the per-file setting when the owner chose whole changes (rule 3e); finding

@@ -174,8 +174,8 @@ An open or rejected finding has a test marked `#[ignore = "coherence finding N: 
 1. **git's own merge cannot tell decided from undecided (open, for git's merge).** A sync built by git's
    three-way merge, keeping the sandbox's side of a conflict: once a sandbox and main have each merged the
    other, git finds two merge bases and keeps a sandbox line main already decided against.
-   `finding_1_git_merge_base_on_crossing_merges`, `random_interleavings_git_merge_base` (34 of 64 seeds with
-   no P3 and the prefix sync, 2026-11-04; 35 after the fix pass of the review of 2026-11-04; 36 with creates, crashes and the progress rules; 32 with the byte calls alone; before them 39, in 2 of which git's line merge left one line identity twice in a file, so it
+   `finding_1_git_merge_base_on_crossing_merges`, `random_interleavings_git_merge_base` (40 of 64 seeds with
+   the calls of programs outside a transaction, 2026-11-05; 34 with no P3 and the prefix sync, 2026-11-04; 35 after the fix pass of the review of 2026-11-04; 36 with creates, crashes and the progress rules; 32 with the byte calls alone; before them 39, in 2 of which git's line merge left one line identity twice in a file, so it
    cannot carry the line map either).
 2. **Gone with squashing (the owner, 2026-11-05): a squashed history hid what a sync needs.** A sync could not tell
    that main's queue had taken a sandbox's line, which took a graft to read back. Full lineage has no such gap.
