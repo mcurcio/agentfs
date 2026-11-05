@@ -24,6 +24,7 @@ pub fn check(w: &mut World) -> Result<(), String> {
     changes_whole(w)?;
     syncs_deliver(w)?;
     transactions_end_as_told(w)?;
+    transactions_undisturbed(w)?;
     let discards = w.grepped.0 != w.discarded.len();
     if w.refs_checked != Some(w.ref_moves) || discards {
         let all = w.all_commits();
@@ -255,10 +256,14 @@ fn locks(w: &World) -> Result<(), String> {
     for h in w.handles() {
         let alive = match &h.client {
             Client::Main(n) => !w.ended_main.contains(n),
-            Client::Fork(f) => w.forks[f].life == Life::Open,
+            Client::Fork(f) | Client::Outside(f) => w.forks[f].life == Life::Open,
         };
         let held = match h.target {
             Target::Txn(f, n) => !h.waiting && w.forks[&f].txn.as_ref().is_some_and(|x| x.id == n),
+            // R5.3: a deferred call lives only behind its open transaction.
+            Target::Tree(Tree::Fork(f)) if h.deferred => {
+                w.forks[&f].txn.is_some() && w.forks[&f].deferred.contains(&h.id)
+            }
             Target::Tree(t) => {
                 (!h.waiting && h.kind == Kind::Write)
                     || w.holds()
@@ -1125,6 +1130,37 @@ fn transactions_end_as_told(w: &mut World) -> Result<(), String> {
         }
     }
     w.ended_checked = w.ended.len();
+    Ok(())
+}
+
+/// R5.3, read from git: while a transaction is open, no save reaches its
+/// fork's tree on a file the transaction had saved at the last check. Other
+/// I/O on such a file is deferred. A sync or a landing is not I/O of a client:
+/// it moves the tree with a commit whose cause is not `Direct`, or one made
+/// in another tree.
+fn transactions_undisturbed(w: &mut World) -> Result<(), String> {
+    let mut seen = BTreeMap::new();
+    for f in w.forks.values().filter(|f| f.txn.is_some()) {
+        let txn = f.txn.as_ref().expect("open");
+        let (tree, head) = (World::name(Tree::Fork(f.id)), f.head.clone());
+        if let Some((at, files)) = w.txn_files_seen.get(&txn.id) {
+            let files: &BTreeSet<String> = files;
+            let mut c = head.clone();
+            while !w.is_ancestor(&c, at) {
+                let direct = w.trailer(&c, "Agentfs-Cause") == "Direct"
+                    && w.trailer(&c, "Agentfs-Tree") == tree;
+                if direct && let Some(p) = change_files(w, &c).intersection(files).next() {
+                    return Err(format!(
+                        "{c:.7} saved {p} in fork {} while transaction t{} had it open: R5.3 defers that",
+                        f.id, txn.id
+                    ));
+                }
+                c = git(w.repo(), &["rev-parse", &format!("{c}^1")]);
+            }
+        }
+        seen.insert(txn.id, (head, diff_files(w, &txn.start, &txn.head)));
+    }
+    w.txn_files_seen = seen;
     Ok(())
 }
 

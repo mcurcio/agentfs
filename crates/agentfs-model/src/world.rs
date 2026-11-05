@@ -7,7 +7,7 @@
 //! | 2. One landing queue per tree | [`World::queue_len`]: a FIFO of [`Entry`]s per tree; a [`Step::Next`] takes its head, or records that it waits (rule 9) |
 //! | 3. The parent's queue decides | `land` (a fork's commit into its parent) is the only place a collision with the parent is decided, through `judge` and `resolve`: per line, a line written over the parent's replaces it, a stale one is dropped, and of two concurrent lines the parent's wins; then each change (a save, a transaction's commit) is judged whole: one lost line and none of it applies (rule 3e). `sync` decides nothing: it takes the parent's version and keeps only the fork's lines the parent's queue has not taken yet |
 //! | 4. Nothing waits behind a collision | there is no held state: a collision is recorded as a [`Collision`] and in git (a note on the take's result commit under [`NOTES`]), the fork's losing commit kept under `refs/collisions/<n>`, which Replication later pushes to the shared remote with main and the notes ([`Step::Replicate`], due on every move of main and every collision), and the queue moves on |
-//! | 5. Transactions | [`World::begin`]: a branch `txn/<n>` frozen at the fork's head; [`World::commit_txn`] lands it in the fork like a child's commit, whole or not at all (the fork is its parent, so the fork's lines win), and answers whether it lost, with every staged line that did not apply; [`World::rollback`] drops it |
+//! | 5. Transactions | [`World::begin`]: a branch `txn/<n>` frozen at the fork's head; [`World::commit_txn`] lands it in the fork like a child's commit, whole or not at all (the fork is its parent, so the fork's lines win), and answers whether it lost, with every staged line that did not apply; [`World::rollback`] drops it. While one is open, other I/O on its files in the sandbox is accepted and applies in order after it ends ([`Fork::deferred`], R5.3) |
 //! | 6. Attribution | every commit names one writer in an `Agentfs-Writer` trailer; a sync is a merge with the parent's commit as second parent |
 //! | 7. Full lineage | a landing is a merge with the fork's commit as second parent (or a fast-forward), so a tree's history reaches every change it took, the losers included; each fork commit lands on its own |
 //! | 8. A save records the write calls | [`World::write`] keeps each byte call ([`Write`]: an `O_APPEND` write, `pwrite`, `ftruncate`; [`World::open_trunc`] for `O_TRUNC`) on the open file; [`World::close`] applies them to the tree's head then: an append's bytes go after the file's last byte, finishing a partial last line (a version of it) and then making new lines; other calls leave bytes the save aligns with the head's lines (rule 10). [`World::edit`] makes a test's line edit as a program's byte calls (`program`) |
@@ -76,11 +76,15 @@ impl Default for Policies {
 }
 
 /// A program writing through a view: one of main's clients (by writer
-/// name), or the one client of a fork.
+/// name), a fork's client, or another program in that fork. Only
+/// [`Client::Fork`] begins a transaction and writes in it; [`Client::Outside`]
+/// always writes in the fork's tree, and so meets a transaction's files
+/// (R5.3). Both name the fork's one writer (rule 6).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Client {
     Main(String),
     Fork(ForkId),
+    Outside(ForkId),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -110,6 +114,10 @@ pub struct Fork {
     pub life: Life,
     pub head: String,
     pub txn: Option<Txn>,
+    /// R5.3: the calls on an open transaction's files, in the order they
+    /// were made. Each returned at once; each applies, in this order, after
+    /// the commit or rollback ([`World::apply_deferred`]).
+    pub deferred: VecDeque<HandleId>,
 }
 
 /// A queued change into a tree (rule 2).
@@ -200,9 +208,8 @@ pub enum TxnEnd {
     Rollback,
 }
 
-/// What a transaction's commit tells the program (rule 5). No collision
-/// refuses a commit (only the program's own open files do:
-/// [`ModelError::OpenFiles`]). It lands in the fork as a child's change
+/// What a transaction's commit tells the program (rule 5). Nothing refuses
+/// a commit. It lands in the fork as a child's change
 /// does in its parent, whole or not at all (rule 3e): the fork's own
 /// concurrent line wins a collision, and then none of the transaction's
 /// lines apply; the answer names every staged line that did not, so the
@@ -238,9 +245,6 @@ pub enum ModelError {
     InTransaction,
     NoTransaction,
     Ended,
-    /// Commit while the program holds open for writing a file of the
-    /// transaction, or one of the fork the commit would write (a choice).
-    OpenFiles,
 }
 
 /// A step the scheduler can take: each completes at once (a [`Step::Next`]
@@ -418,6 +422,10 @@ pub struct Handle {
     /// while a take is writing it, never behind a waiting take (the owner,
     /// 2026-11-04: P3 deleted).
     pub waiting: bool,
+    /// R5.3: the call was made and returned while a transaction held its
+    /// file: a close whose save, or a path call that, is on
+    /// [`Fork::deferred`]. Its file counts as open (rule 9) until then.
+    pub deferred: bool,
     pub kind: Kind,
     /// Its write calls, in order, applied to the head at close.
     calls: Vec<Write>,
@@ -779,6 +787,9 @@ pub struct World {
     replication_due: bool,
     pub(crate) syncs_checked: usize,
     pub(crate) ended_checked: usize,
+    /// `check`'s: per open transaction, its fork's head and the files it had
+    /// saved at the last check.
+    pub(crate) txn_files_seen: BTreeMap<TxnId, (String, BTreeSet<String>)>,
     pub(crate) ref_moves: u64,
     pub(crate) refs_checked: Option<u64>,
     /// Counted by `check` (rules 10 and 11 met in a take, so a run can show
@@ -864,6 +875,7 @@ impl World {
             replication_due: false,
             syncs_checked: 0,
             ended_checked: 0,
+            txn_files_seen: BTreeMap::new(),
             ref_moves: 0,
             refs_checked: None,
             inserts_met: 0,
@@ -1032,13 +1044,20 @@ impl World {
             .collect()
     }
 
-    /// The files a client of `t` has open for writing (granted opens).
+    /// The files a client of `t` has open for writing (granted opens), and
+    /// those of its deferred calls (R5.3), whose saves have not happened.
     /// An open whose object no path names (an orphan) has no file open.
     pub fn write_open(&self, t: Tree) -> BTreeSet<String> {
         self.handles
             .values()
             .filter(|h| !h.waiting && h.target == Target::Tree(t))
-            .filter_map(|h| self.named(h))
+            .flat_map(|h| {
+                let mut files: Vec<String> = self.named(h).into_iter().collect();
+                if h.kind != Kind::Write {
+                    files.extend(h.files());
+                }
+                files
+            })
             .collect()
     }
 
@@ -1809,6 +1828,7 @@ impl World {
                 life: Life::Open,
                 head: head.clone(),
                 txn: None,
+                deferred: VecDeque::new(),
             },
         );
         self.set_head(Tree::Fork(id), &head);
@@ -1847,6 +1867,7 @@ impl World {
                 let fork = &self.forks[f];
                 (fork.writer.clone(), fork.txn.as_ref().map(|t| t.id))
             }
+            Client::Outside(f) => (self.forks[f].writer.clone(), None),
         }
     }
 
@@ -1858,6 +1879,7 @@ impl World {
                 Some(t) => Target::Txn(*f, t.id),
                 None => Target::Tree(Tree::Fork(*f)),
             },
+            Client::Outside(f) => Target::Tree(Tree::Fork(*f)),
         }
     }
 
@@ -1895,6 +1917,7 @@ impl World {
             object,
             path: path.to_string(),
             waiting: false,
+            deferred: false,
             kind,
             calls: Vec::new(),
             reserved: Vec::new(),
@@ -2011,13 +2034,18 @@ impl World {
     /// or another writer's append included. One commit, first parent that
     /// head, at once; none if nothing changed, or if the file was unlinked
     /// meanwhile (as on Linux, its write calls reach no path). Then a take
-    /// waiting for this close is woken.
+    /// waiting for this close is woken. A close of an open transaction's
+    /// file returns at once and saves after it ends (R5.3).
     pub fn close(&mut self, h: HandleId) {
-        let handle = self.handles.remove(&h).expect("an open file");
+        let handle = self.handles.get(&h).expect("an open file");
         assert!(
-            !handle.waiting && handle.kind == Kind::Write,
+            !handle.waiting && !handle.deferred && handle.kind == Kind::Write,
             "close a granted open"
         );
+        if self.defer(h) {
+            return;
+        }
+        let handle = self.handles.remove(&h).expect("an open file");
         let target = handle.target;
         let tokens = self.save_handle(&handle);
         self.note(format!("close h{h}: saved {tokens:?}"));
@@ -2313,9 +2341,17 @@ impl World {
             self.note(format!("h{id} {c:?} {kind:?} of {p}: waits for the hold"));
             return Some(id);
         }
-        let h = self.handles.remove(&id).expect("just added");
-        self.run_path_call(&h);
+        self.path_call_goes(id);
         None
+    }
+
+    /// A path call no hold keeps waiting: it runs, or returns at once and
+    /// runs after the transaction that has its file ends (R5.3).
+    fn path_call_goes(&mut self, id: HandleId) {
+        if !self.defer(id) {
+            let h = self.handles.remove(&id).expect("a path call");
+            self.run_path_call(&h);
+        }
     }
 
     fn run_path_call(&mut self, h: &Handle) {
@@ -2512,9 +2548,8 @@ impl World {
             x.waiting = false;
             self.note(format!("grant h{h}"));
         } else {
-            let call = self.handles.remove(&h).expect("a waiting call");
-            self.note(format!("grant h{h}: it runs"));
-            self.run_path_call(&call);
+            self.note(format!("grant h{h}: it goes"));
+            self.path_call_goes(h);
         }
     }
 
@@ -2523,7 +2558,8 @@ impl World {
     /// Begin: a branch frozen at the fork's head. The fork keeps receiving
     /// syncs; the program reads its own staged edits on the snapshot. A
     /// file open before begin keeps writing to the fork (its target is
-    /// fixed at open); only opens after begin write in the transaction.
+    /// fixed at open); only the client's opens after begin write in the
+    /// transaction.
     pub fn begin(&mut self, f: ForkId) -> Result<TxnId, ModelError> {
         let fork = &self.forks[&f];
         if fork.life != Life::Open {
@@ -2546,31 +2582,103 @@ impl World {
         Ok(id)
     }
 
-    /// Commit (MODEL.md rule 5): the transaction's branch lands in the
-    /// fork's current head as a child's change lands in its parent, as one
-    /// merge commit named for the client, which then lands like any fork
-    /// commit. Never refused. The fork is the transaction's parent, so a
-    /// fork line concurrent with a staged line (one a sync brought in since
-    /// begin) wins, and the transaction loses whole (rule 3e): none of its
-    /// lines apply, the merge keeps the fork's tree (so history shows the
-    /// decision) and the answer names every staged line. The fork's one
-    /// actor finishes a take in progress first (rule 9). Refused only while
-    /// the program itself holds open for writing a file of the transaction,
-    /// or a file of the fork (opened before begin) the commit would write
-    /// ([`ModelError::OpenFiles`], a choice): those are the commit's own
-    /// caller's locks, so a wait would wait on the caller. Nothing else is
-    /// open in a fork: it has one client.
-    pub fn commit_txn(&mut self, f: ForkId) -> Result<TxnOutcome, ModelError> {
-        let Some(txn) = &self.forks[&f].txn else {
-            return Err(ModelError::NoTransaction);
+    /// The files open transaction `f` holds (R5.3): those it has saved
+    /// (its branch differs from its start in them), those it has open for
+    /// writing, and those of the calls already deferred, so a file's calls
+    /// keep their order.
+    fn txn_files(&self, f: ForkId) -> BTreeSet<String> {
+        let fork = &self.forks[&f];
+        let txn = fork.txn.as_ref().expect("open");
+        let mut files = self.changed(&txn.start, &txn.head);
+        files.extend(
+            self.handles
+                .values()
+                .filter(|h| h.target == Target::Txn(f, txn.id))
+                .filter_map(|h| self.named(h)),
+        );
+        for h in &fork.deferred {
+            files.extend(self.deferred_files(&self.handles[h]));
+        }
+        files
+    }
+
+    /// The files call `h` acts on: an open's, the file its object is named
+    /// by; a path call's, its file and a rename's target.
+    fn deferred_files(&self, h: &Handle) -> Vec<String> {
+        match h.kind {
+            Kind::Write => self.named(h).into_iter().collect(),
+            _ => h.files(),
+        }
+    }
+
+    /// R5.3 (the owner, 2026-11-05: "deferred, obviously"): call `h`, a close
+    /// or a path call in a fork's tree, acts on a file of the fork's open
+    /// transaction: it returns at once and goes on [`Fork::deferred`], true.
+    /// Nothing waits on a program.
+    fn defer(&mut self, h: HandleId) -> bool {
+        let handle = &self.handles[&h];
+        let Target::Tree(Tree::Fork(f)) = handle.target else {
+            return false;
         };
-        let id = txn.id;
-        if self
-            .handles
-            .values()
-            .any(|h| h.target == Target::Txn(f, id))
-        {
-            return Err(ModelError::OpenFiles);
+        if self.forks[&f].txn.is_none() {
+            return false;
+        }
+        let mine = self.txn_files(f);
+        if !self.deferred_files(handle).iter().any(|x| mine.contains(x)) {
+            return false;
+        }
+        self.note(format!(
+            "h{h} {:?} of {}: deferred behind the transaction",
+            handle.kind, handle.file
+        ));
+        let call = self.handles.get_mut(&h).expect("a call");
+        call.waiting = false;
+        call.deferred = true;
+        self.forks.get_mut(&f).expect("fork").deferred.push_back(h);
+        true
+    }
+
+    /// R5.3: the next deferred call of fork `f` applies, its transaction
+    /// having ended: a save as any later close saves, on the tree's head
+    /// now, a path call as it would have run. None when none is left.
+    pub fn apply_deferred(&mut self, f: ForkId) -> Option<HandleId> {
+        let fork = self.forks.get_mut(&f).expect("fork");
+        assert!(fork.txn.is_none(), "a deferred call during its transaction");
+        let id = fork.deferred.pop_front()?;
+        let h = self.handles.remove(&id).expect("a deferred call");
+        if h.kind == Kind::Write {
+            let tokens = self.save_handle(&h);
+            self.note(format!("deferred close h{id}: saved {tokens:?}"));
+        } else {
+            self.note(format!("deferred h{id}: it runs"));
+            self.run_path_call(&h);
+        }
+        self.wake(Tree::Fork(f));
+        Some(id)
+    }
+
+    /// Commit (MODEL.md rule 5), then the calls it deferred (R5.3).
+    pub fn commit_txn(&mut self, f: ForkId) -> Result<TxnOutcome, ModelError> {
+        let outcome = self.commit_txn_only(f)?;
+        while self.apply_deferred(f).is_some() {}
+        Ok(outcome)
+    }
+
+    /// The commit alone: the transaction's branch lands in the fork's
+    /// current head as a child's change lands in its parent, as one merge
+    /// commit named for the client, which then lands like any fork commit.
+    /// Never refused. The fork is the transaction's parent, so a fork line
+    /// concurrent with a staged line (one a sync brought in since begin)
+    /// wins, and the transaction loses whole (rule 3e): none of its lines
+    /// apply, the merge keeps the fork's tree (so history shows the decision)
+    /// and the answer names every staged line. The fork's one actor finishes
+    /// a take in progress first (rule 9). It goes ahead while programs hold
+    /// files open (the owner, 2026-11-05: R5.3): those files stay open, a
+    /// transaction's opens now write in the fork, and each saves at its close
+    /// as an ordinary later save.
+    pub fn commit_txn_only(&mut self, f: ForkId) -> Result<TxnOutcome, ModelError> {
+        if self.forks[&f].txn.is_none() {
+            return Err(ModelError::NoTransaction);
         }
         if self.holds.contains_key(&Tree::Fork(f)) {
             self.finish(Tree::Fork(f));
@@ -2578,18 +2686,18 @@ impl World {
         let fork = &self.forks[&f];
         let ours = fork.head.clone();
         let txn = fork.txn.as_ref().expect("open");
-        let (start, head) = (txn.start.clone(), txn.head.clone());
-        let planned = if head == start {
-            None
-        } else {
+        let (id, start, head) = (txn.id, txn.start.clone(), txn.head.clone());
+        let planned = (head != start).then(|| {
             let edit = self.edit_of(&start, &head);
             let m = self.resolve(Direction::Transaction, &ours, &edit, &head);
-            let open = self.write_open(Tree::Fork(f));
-            if m.files.iter().any(|p| open.contains(p)) {
-                return Err(ModelError::OpenFiles);
-            }
-            Some((edit, m))
-        };
+            (edit, m)
+        });
+        let stay_open: Vec<(HandleId, Option<String>)> = self
+            .handles
+            .values()
+            .filter(|h| h.target == Target::Txn(f, id))
+            .map(|h| (h.id, self.named(h)))
+            .collect();
         let txn = self.take_txn(f)?;
         let mut result = None;
         let outcome = if let Some((edit, m)) = planned {
@@ -2641,6 +2749,9 @@ impl World {
         } else {
             TxnOutcome::Empty
         };
+        for (h, file) in stay_open {
+            self.move_to_fork(h, f, file);
+        }
         self.note(format!("commit t{} on f{f}: {outcome:?}", txn.id));
         self.ended.push(Ended {
             fork: f,
@@ -2649,12 +2760,39 @@ impl World {
             how: TxnEnd::Commit(outcome.clone()),
             result,
         });
+        self.wake(Tree::Fork(f));
         Ok(outcome)
     }
 
-    /// Rollback (abandon): drop the branch, and its files still open,
-    /// unsaved.
+    /// A transaction's open `h` after its commit: it stays open and writes in
+    /// the fork, holding the object file `file` (its file in the transaction)
+    /// has there; with no such file it is an orphan (R11.3).
+    fn move_to_fork(&mut self, h: HandleId, f: ForkId, file: Option<String>) {
+        let target = Target::Tree(Tree::Fork(f));
+        let object = match &file {
+            Some(x) => self.inode(target, x),
+            None => {
+                self.next_object += 1;
+                self.next_object
+            }
+        };
+        let handle = self.handles.get_mut(&h).expect("an open");
+        handle.target = target;
+        handle.object = object;
+        if let Some(x) = file {
+            handle.file = x;
+        }
+    }
+
+    /// Rollback (abandon), then the calls it deferred (R5.3).
     pub fn rollback(&mut self, f: ForkId) -> Result<(), ModelError> {
+        self.rollback_only(f)?;
+        while self.apply_deferred(f).is_some() {}
+        Ok(())
+    }
+
+    /// The rollback alone: drop the branch, and its files still open, unsaved.
+    pub fn rollback_only(&mut self, f: ForkId) -> Result<(), ModelError> {
         let txn = self.take_txn(f)?;
         self.handles
             .retain(|_, h| !matches!(h.target, Target::Txn(g, t) if g == f && t == txn.id));
@@ -2667,6 +2805,7 @@ impl World {
             how: TxnEnd::Rollback,
             result: None,
         });
+        self.wake(Tree::Fork(f));
         Ok(())
     }
 
@@ -2695,7 +2834,7 @@ impl World {
         if self.forks[&f].txn.is_some() {
             let _ = self.rollback(f);
         }
-        self.release(&Client::Fork(f));
+        self.release(&[Client::Fork(f), Client::Outside(f)]);
         self.forks.get_mut(&f).expect("fork").life = Life::Ended;
         self.wake(Tree::Fork(f));
         self.note(format!("end f{f}"));
@@ -2705,7 +2844,7 @@ impl World {
     /// held is released ([`World::release`]), so main's queue, waiting for
     /// its open file, is woken. It opens nothing after.
     pub fn end_main_client(&mut self, writer: &str) {
-        self.release(&Client::Main(writer.to_string()));
+        self.release(&[Client::Main(writer.to_string())]);
         self.ended_main.insert(writer.to_string());
         self.wake(Tree::Main);
         self.note(format!("end main client {writer}"));
@@ -2714,11 +2853,11 @@ impl World {
     /// A client's end event releases its locks: its open files close as the
     /// kernel closes them on exit, each saving its write calls (a choice),
     /// which wakes a take waiting for them; its waiting opens are dropped.
-    fn release(&mut self, c: &Client) {
+    fn release(&mut self, clients: &[Client]) {
         let mine: Vec<HandleId> = self
             .handles
             .values()
-            .filter(|h| h.client == *c)
+            .filter(|h| clients.contains(&h.client))
             .map(|h| h.id)
             .collect();
         for h in mine {
@@ -2741,7 +2880,9 @@ impl World {
     /// opens end: their descriptors died with the mount. An open no path
     /// names raises its `OrphanDropped` event again (no save records it in
     /// git: events are at least once). Waiting opens and path calls never
-    /// returned: dropped, nothing recorded. A take in progress wrote nothing
+    /// returned: dropped, nothing recorded. A call a transaction deferred did
+    /// return, so it stays in the journal behind that transaction, which
+    /// survives; an open whose close would defer defers (R5.3). A take in progress wrote nothing
     /// (its write is one ref transaction): its entries go back to the front
     /// of its queue; waits are dropped and found again at the next take.
     /// Transactions survive: their branches are refs.
@@ -2775,6 +2916,9 @@ impl World {
         let mut replay = Vec::new();
         for id in ids {
             let h = &self.handles[&id];
+            if h.deferred {
+                continue;
+            }
             if h.waiting || h.kind != Kind::Write {
                 self.handles.remove(&id);
                 self.note(format!("crash: h{id} never returned: dropped"));
@@ -2788,11 +2932,15 @@ impl World {
     /// [`World::crash`]'s restart, for one open: saved from the journal as
     /// its close would save it, unless a save already names it; it ends.
     pub fn restart_open(&mut self, id: HandleId) {
-        let h = self.handles.remove(&id).expect("an open to replay");
         if self.saved(id) {
+            self.handles.remove(&id);
             self.note(format!("crash: h{id} already saved: skipped"));
             return;
         }
+        if self.defer(id) {
+            return;
+        }
+        let h = self.handles.remove(&id).expect("an open to replay");
         let tokens = self.save_handle(&h);
         self.note(format!(
             "crash: h{id} replayed from the journal: saved {tokens:?}"
@@ -2812,9 +2960,12 @@ impl World {
     pub fn close_keeping_journal(&mut self, h: HandleId) {
         let handle = self.handles[&h].clone();
         assert!(
-            !handle.waiting && handle.kind == Kind::Write,
+            !handle.waiting && !handle.deferred && handle.kind == Kind::Write,
             "close a granted open"
         );
+        if self.defer(h) {
+            return;
+        }
         let tokens = self.save_handle(&handle);
         self.note(format!(
             "close h{h}: saved {tokens:?}; crash before its journal drops it"

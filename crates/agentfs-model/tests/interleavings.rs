@@ -34,8 +34,8 @@ use agentfs_model::content::{BLANK, Content, FILES, Layout, PATHS, UNBORN};
 use agentfs_model::git::{git, with_reversed_dates};
 use agentfs_model::program;
 use agentfs_model::world::{
-    By, Client, Direction, Entry, ForkId, HandleId, Kind, Life, LineEdit, MergeRule, ModelError,
-    Policies, Step, Take, Target, Tree, TxnEnd, TxnOutcome, World, Write,
+    By, Client, Direction, Entry, ForkId, HandleId, Kind, Life, LineEdit, MergeRule, Policies,
+    Step, Take, Target, Tree, TxnEnd, TxnOutcome, World, Write,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -98,6 +98,11 @@ struct Tally {
     clean_lines_lost: usize,
     empty: usize,
     rolled_back: usize,
+    /// R5.3: closes and path calls deferred behind a transaction, and
+    /// commits that went ahead with a file open in their sandbox.
+    deferred_closes: usize,
+    deferred_path_calls: usize,
+    commits_with_open: usize,
     forks: usize,
     nested: usize,
     /// Queue heads that waited for a write-open, and opens that waited for
@@ -227,6 +232,25 @@ struct Oracle {
     /// from git, every file its taken changes touch; a sync's, the files
     /// it writes). A call waits only there, on one of those files.
     taking: BTreeMap<Tree, BTreeSet<String>>,
+    /// R5.3, the harness's own list: the calls each sandbox's open transaction
+    /// has deferred, in the order they were made.
+    deferred: BTreeMap<ForkId, Vec<Deferred>>,
+}
+
+/// A call deferred behind a transaction: a close, or a path call (its handle,
+/// and a rename's path).
+#[derive(Clone, Debug)]
+enum Deferred {
+    Close(HandleId),
+    Path(HandleId, Option<String>),
+}
+
+impl Deferred {
+    fn id(&self) -> HandleId {
+        match self {
+            Deferred::Close(h) | Deferred::Path(h, _) => *h,
+        }
+    }
 }
 
 /// An `OrphanDropped` event as the oracle expects it: (open, writer, path,
@@ -243,7 +267,7 @@ fn new_file(c: &Content) -> bool {
 fn writer(w: &World, c: &Client) -> String {
     match c {
         Client::Main(n) => n.clone(),
-        Client::Fork(f) => w.forks[f].writer.clone(),
+        Client::Fork(f) | Client::Outside(f) => w.forks[f].writer.clone(),
     }
 }
 
@@ -364,14 +388,28 @@ impl Oracle {
                 Some(x) => Target::Txn(*f, x.id),
                 None => Target::Tree(Tree::Fork(*f)),
             },
+            Client::Outside(f) => Target::Tree(Tree::Fork(*f)),
         };
         let at = head_of(w, t).expect("live");
         let file = w.lookup(&at, p).expect("a file");
+        let mut files = vec![file.clone()];
+        files.extend(to.and_then(|to| w.lookup(&at, to)));
+        let defers = self.defers(w, t, &files);
         let waits = match to {
             None => w.unlink(c, p),
             Some(to) => w.rename(c, p, to),
         };
         match waits {
+            None if defers.is_some() => {
+                let f = defers.expect("checked");
+                let id = *w.forks[&f].deferred.back().ok_or_else(|| {
+                    format!("R5.3: a path call on {files:?} ran during its transaction")
+                })?;
+                self.deferred
+                    .entry(f)
+                    .or_default()
+                    .push(Deferred::Path(id, to.map(str::to_string)));
+            }
             None => self.ran(w, &at, t, &file, to),
             Some(h) => {
                 self.waiting_calls
@@ -381,6 +419,64 @@ impl Oracle {
         self.no_wait_on_waiting(w)
     }
 
+    /// R5.3, the harness's own reading: target `t` is a sandbox's tree, and
+    /// one of `files` is a file of the sandbox's open transaction: one it has
+    /// saved (read from git), has open for writing, or has deferred a call on.
+    /// The sandbox, if so.
+    fn defers(&self, w: &World, t: Target, files: &[String]) -> Option<ForkId> {
+        let Target::Tree(Tree::Fork(f)) = t else {
+            return None;
+        };
+        let txn = w.forks[&f].txn.as_ref()?;
+        let spec = [txn.start.as_str(), txn.head.as_str()];
+        let saved = git(
+            w.repo(),
+            &["diff-tree", "-r", "--name-only", spec[0], spec[1]],
+        );
+        let mut mine: BTreeSet<String> = saved.lines().map(str::to_string).collect();
+        for (h, (u, _, _, _)) in &self.held {
+            if *u == Target::Txn(f, txn.id) {
+                mine.extend(self.named(w, *h));
+            }
+        }
+        for d in self.deferred.get(&f).into_iter().flatten() {
+            match d {
+                Deferred::Close(h) => mine.extend(self.named(w, *h)),
+                Deferred::Path(h, _) => mine.extend(w.handle(*h).files()),
+            }
+        }
+        files.iter().any(|x| mine.contains(x)).then_some(f)
+    }
+
+    /// R5.3: whether open `h`'s close defers, as the harness reads it.
+    fn close_defers(&self, w: &World, h: HandleId) -> Option<ForkId> {
+        let file = self.named(w, h)?;
+        self.defers(w, w.handle(h).target, &[file])
+    }
+
+    /// A commit left transaction open `h` open: it now holds in the sandbox
+    /// the object its file `file` has there; with none, an orphan.
+    fn move_to_fork(&mut self, h: HandleId, f: ForkId, file: Option<String>) {
+        let t = Target::Tree(Tree::Fork(f));
+        let o = match file {
+            Some(x) => match self.inodes.get(&(t, x.clone())) {
+                Some(o) => *o,
+                None => {
+                    self.next_inode += 1;
+                    self.inodes.insert((t, x), self.next_inode);
+                    self.next_inode
+                }
+            },
+            None => {
+                self.next_inode += 1;
+                self.next_inode
+            }
+        };
+        let held = self.held.get_mut(&h).expect("an open the oracle saw");
+        held.0 = t;
+        held.1 = o;
+    }
+
     /// After a take's release in `t`: the waiting path calls it ran, in
     /// the order it ran them (by handle), each on the state the one before
     /// left: the head the take's write left, then each call's own commit
@@ -388,6 +484,24 @@ impl Oracle {
     /// then, or a rename to the path it has, makes no commit. Calls dropped
     /// with their client go too.
     fn released(&mut self, w: &World, t: Tree) {
+        // R5.3: a call its release let go that a transaction's file defers.
+        let later: Vec<HandleId> = self
+            .waiting_calls
+            .keys()
+            .filter(|h| w.handles().any(|x| x.id == **h && x.deferred))
+            .copied()
+            .collect();
+        for h in later {
+            let (u, file, to) = self.waiting_calls.remove(&h).expect("listed");
+            let Target::Tree(Tree::Fork(f)) = u else {
+                unreachable!("a deferred call in a sandbox's tree");
+            };
+            let _ = file;
+            self.deferred
+                .entry(f)
+                .or_default()
+                .push(Deferred::Path(h, to));
+        }
         let gone: Vec<HandleId> = self
             .waiting_calls
             .keys()
@@ -537,8 +651,14 @@ fn take(w: &mut World, o: &mut Oracle, s: &Step, tally: &mut Tally) -> Result<()
     let open_before: BTreeSet<String> = match s {
         Step::Next(t) => w
             .handles()
-            .filter(|h| !h.waiting && h.kind == Kind::Write && h.target == Target::Tree(*t))
-            .filter_map(|h| o.named(w, h.id))
+            .filter(|h| !h.waiting && h.target == Target::Tree(*t))
+            .flat_map(|h| {
+                let mut files: Vec<String> = o.named(w, h.id).into_iter().collect();
+                if h.kind != Kind::Write {
+                    files.extend(h.files());
+                }
+                files
+            })
             .collect(),
         _ => BTreeSet::new(),
     };
@@ -627,9 +747,25 @@ fn take(w: &mut World, o: &mut Oracle, s: &Step, tally: &mut Tally) -> Result<()
 
 /// Closes `h`: the save holds exactly the bytes the oracle computes (none
 /// if the file was unlinked meanwhile), and nothing else changed.
-fn close_checked(w: &mut World, o: &mut Oracle, h: HandleId) -> Result<(), String> {
+fn close_checked(
+    w: &mut World,
+    o: &mut Oracle,
+    h: HandleId,
+    tally: &mut Tally,
+) -> Result<(), String> {
     let t = w.handle(h).target;
     let (n, head) = (w.orphans.len(), head_of(w, t));
+    // R5.3: a close of an open transaction's file returns at once and saves
+    // nothing yet.
+    if let Some(f) = o.close_defers(w, h) {
+        w.close(h);
+        if w.forks[&f].deferred.back() != Some(&h) {
+            return Err(format!("R5.3: close h{h} did not defer"));
+        }
+        o.deferred.entry(f).or_default().push(Deferred::Close(h));
+        tally.deferred_closes += 1;
+        return o.check(w).map_err(|e| format!("close h{h}: {e}"));
+    }
     let expect = o.closing(w, h);
     w.close(h);
     if expect.is_some() && head_of(w, t) != head {
@@ -657,14 +793,14 @@ fn dropped(w: &World, n: usize, expect: Vec<Dropped>) -> Result<(), String> {
 
 /// Every program closes the files it has open (granted ones; a waiting
 /// open is closed once a take's release grants it).
-fn close_all_checked(w: &mut World, o: &mut Oracle) -> Result<(), String> {
+fn close_all_checked(w: &mut World, o: &mut Oracle, tally: &mut Tally) -> Result<(), String> {
     let open: Vec<_> = w
         .handles()
-        .filter(|h| !h.waiting && h.kind == Kind::Write)
+        .filter(|h| !h.waiting && !h.deferred && h.kind == Kind::Write)
         .map(|h| h.id)
         .collect();
     for h in open {
-        close_checked(w, o, h)?;
+        close_checked(w, o, h, tally)?;
     }
     Ok(())
 }
@@ -678,9 +814,13 @@ fn end_checked(w: &mut World, o: &mut Oracle, c: &Client) -> Result<(), String> 
     {
         rollback_checked(w, o, *f)?;
     }
+    let of_it = |x: &Client| match c {
+        Client::Fork(f) => *x == *c || *x == Client::Outside(*f),
+        _ => *x == *c,
+    };
     let mine: Vec<HandleId> = w
         .handles()
-        .filter(|h| h.client == *c && !h.waiting && h.kind == Kind::Write)
+        .filter(|h| of_it(&h.client) && !h.waiting && h.kind == Kind::Write)
         .map(|h| h.id)
         .collect();
     let n = w.orphans.len();
@@ -690,7 +830,7 @@ fn end_checked(w: &mut World, o: &mut Oracle, c: &Client) -> Result<(), String> 
     }
     match c {
         Client::Main(n) => w.end_main_client(n),
-        Client::Fork(f) => w.end_client(*f),
+        Client::Fork(f) | Client::Outside(f) => w.end_client(*f),
     }
     dropped(w, n, expect)?;
     gitledger::observe(w)?;
@@ -707,55 +847,134 @@ fn end_checked(w: &mut World, o: &mut Oracle, c: &Client) -> Result<(), String> 
 /// order, by handle), so every write call that returned survives; an
 /// orphan's event comes once per close the journal replays (twice for an
 /// orphan whose close the crash interrupted: events are at least once);
-/// waiting opens and path calls are dropped. Takes in progress go back to
-/// their queues and change no bytes.
+/// waiting opens and path calls are dropped. A call a transaction deferred
+/// stays behind it, and a close that would defer defers (R5.3). Takes in
+/// progress go back to their queues and change no bytes.
 fn crash_checked(w: &mut World, o: &mut Oracle, during: Option<HandleId>) -> Result<(), String> {
     let n = w.orphans.len();
-    let mut granted: Vec<HandleId> = w
-        .handles()
-        .filter(|h| !h.waiting && h.kind == Kind::Write)
-        .map(|h| h.id)
-        .collect();
-    granted.sort();
     let mut expect = Vec::new();
-    let first = during.and_then(|h| o.closing(w, h));
-    expect.extend(first.clone());
-    for h in granted {
-        if Some(h) == during {
-            // Its close saved nothing git records, so the replay drops it
-            // again, in handle order.
-            expect.extend(first.clone());
-        } else {
-            expect.extend(o.closing(w, h));
-        }
-    }
-    // Observed after each save, so the ledger sees one tree move at a time.
+    let mut during = during;
+    let mut first = None;
     if let Some(h) = during {
+        if let Some(f) = o.close_defers(w, h) {
+            o.deferred.entry(f).or_default().push(Deferred::Close(h));
+            during = None;
+        } else {
+            first = o.closing(w, h);
+            expect.extend(first.clone());
+        }
+        // Observed after each save, so the ledger sees one tree move at a time.
         w.close_keeping_journal(h);
         gitledger::observe(w)?;
     }
     for h in w.crash_down() {
+        if Some(h) == during {
+            // Its close saved nothing git records, so the replay drops it
+            // again, in handle order.
+            expect.extend(first.clone());
+        } else if let Some(f) = o.close_defers(w, h) {
+            o.deferred.entry(f).or_default().push(Deferred::Close(h));
+        } else {
+            expect.extend(o.closing(w, h));
+        }
         w.restart_open(h);
         gitledger::observe(w)?;
     }
     dropped(w, n, expect)?;
-    if let Some(h) = w.handles().next() {
+    if let Some(h) = w.handles().find(|h| !h.deferred) {
         return Err(format!("h{} outlived the crash", h.id));
     }
     o.waiting_calls.clear();
-    o.calls.clear();
-    o.held.clear();
+    o.calls.retain(|h, _| w.handles().any(|x| x.id == *h));
+    o.held.retain(|h, _| w.handles().any(|x| x.id == *h));
     // A crash ends every take (they go back to their queues).
     o.taking.clear();
     gitledger::observe(w)?;
     o.check(w).map_err(|e| format!("crash: {e}"))
 }
 
+/// R5.3, once sandbox `f`'s transaction has ended: the model's deferred calls
+/// are the harness's, in order, and each applies now, the oracle following it
+/// by its own byte code on the head it finds.
+fn apply_deferred_checked(w: &mut World, o: &mut Oracle, f: ForkId) -> Result<(), String> {
+    let list = o.deferred.remove(&f).unwrap_or_default();
+    let model: Vec<HandleId> = w.forks[&f].deferred.iter().copied().collect();
+    let own: Vec<HandleId> = list.iter().map(Deferred::id).collect();
+    if model != own {
+        return Err(format!(
+            "R5.3: f{f} deferred {model:?}, the harness made {own:?}"
+        ));
+    }
+    let t = Target::Tree(Tree::Fork(f));
+    for d in list {
+        let n = w.orphans.len();
+        let at = w.head(Tree::Fork(f));
+        let mut expect = Vec::new();
+        let run = match &d {
+            Deferred::Close(h) => {
+                expect.extend(o.closing(w, *h));
+                None
+            }
+            Deferred::Path(h, to) => Some((w.handle(*h).file.clone(), to.clone())),
+        };
+        if w.apply_deferred(f) != Some(d.id()) {
+            return Err(format!("R5.3: {d:?} did not apply next"));
+        }
+        if let Some((file, to)) = run
+            && w.file(&at, &file).name.live()
+        {
+            o.ran(w, &at, t, &file, to.as_deref());
+        }
+        dropped(w, n, expect)?;
+        o.check(w)
+            .map_err(|e| format!("deferred {d:?} after its transaction: {e}"))?;
+    }
+    if w.apply_deferred(f).is_some() {
+        return Err(format!("R5.3: f{f} deferred more than the harness made"));
+    }
+    gitledger::observe(w)
+}
+
 fn rollback_checked(w: &mut World, o: &mut Oracle, f: ForkId) -> Result<(), String> {
     let n = w.orphans.len();
-    w.rollback(f).expect("open");
+    w.rollback_only(f).expect("open");
     o.reload(w);
-    dropped(w, n, Vec::new())
+    dropped(w, n, Vec::new())?;
+    apply_deferred_checked(w, o, f)
+}
+
+/// A transaction's commit, with a take in progress in its sandbox finished
+/// first (rule 9), then the calls it deferred (R5.3). The files open in the
+/// sandbox or the transaction stay open; the transaction's write in the
+/// sandbox from now on.
+fn commit_checked(
+    w: &mut World,
+    o: &mut Oracle,
+    f: ForkId,
+    tally: &mut Tally,
+) -> Result<(), String> {
+    if w.holds().contains_key(&Tree::Fork(f)) {
+        take(w, o, &Step::Finish(Tree::Fork(f)), tally)?;
+    }
+    let txn = w.forks[&f].txn.as_ref().expect("open").id;
+    let stay: Vec<(HandleId, Option<String>)> = o
+        .held
+        .iter()
+        .filter(|(_, (u, _, _, _))| *u == Target::Txn(f, txn))
+        .map(|(h, _)| (*h, o.named(w, *h)))
+        .collect();
+    tally.commits_with_open += usize::from(w.handles().any(|h| {
+        !h.waiting
+            && !h.deferred
+            && (h.target == Target::Txn(f, txn) || h.target == Target::Tree(Tree::Fork(f)))
+    }));
+    w.commit_txn_only(f).expect("open");
+    gitledger::observe(w)?;
+    o.reload(w);
+    for (h, file) in stay {
+        o.move_to_fork(h, f, file);
+    }
+    apply_deferred_checked(w, o, f)
 }
 
 fn drain(
@@ -765,7 +984,7 @@ fn drain(
     at: usize,
 ) -> Result<(), (usize, String)> {
     for _ in 0..100_000 {
-        close_all_checked(w, o).map_err(|e| (at, e))?;
+        close_all_checked(w, o, tally).map_err(|e| (at, e))?;
         checkg(w, o).map_err(|e| (at, e))?;
         let Some(s) = w.pending().into_iter().next() else {
             return check_converged(w).map_err(|e| (at, e));
@@ -1030,12 +1249,28 @@ impl Calls {
         }
         let t = self.text(tally);
         self.line_edit(w, h, &LineEdit::At(slot), &t);
-        close_checked(w, &mut self.o, h)
+        close_checked(w, &mut self.o, h, tally)
     }
 
     /// Unlinks `p`, or renames it: to a new path, or a third of the time
     /// over another file the client sees.
     fn path_call(
+        &mut self,
+        w: &mut World,
+        c: &Client,
+        f: &str,
+        p: &str,
+        unlink: bool,
+        tally: &mut Tally,
+    ) -> Result<(), String> {
+        let deferred = |w: &World| w.forks.values().map(|x| x.deferred.len()).sum::<usize>();
+        let before = deferred(w);
+        let out = self.path_call_as(w, c, f, p, unlink, tally);
+        tally.deferred_path_calls += deferred(w) - before;
+        out
+    }
+
+    fn path_call_as(
         &mut self,
         w: &mut World,
         c: &Client,
@@ -1124,12 +1359,52 @@ impl Calls {
             format!("{text}\n")
         };
         self.o.write(w, h, Write::Append(bytes));
-        close_checked(w, &mut self.o, h)?;
+        close_checked(w, &mut self.o, h, tally)?;
         if atomic {
             tally.atomic_saves += 1;
             self.o.path_call(w, c, &tmp, Some(p))?;
         }
         Ok(())
+    }
+
+    /// R5.3: another program in a sandbox whose transaction is open calls on
+    /// one of the transaction's files, mostly: a save, an open it leaves open
+    /// to write and close later, an unlink or a rename. Steering only.
+    fn outside_a_transaction(
+        &mut self,
+        w: &mut World,
+        slot: usize,
+        tally: &mut Tally,
+    ) -> Result<(), String> {
+        let Some(f) = self.rng.pick(&in_txn(w)) else {
+            return Ok(());
+        };
+        let c = Client::Outside(f);
+        if blocked(w, &c) {
+            return Ok(());
+        }
+        let txn = w.forks[&f].txn.as_ref().expect("open");
+        let staged: Vec<String> = txn.staged.iter().map(|e| e.path.clone()).collect();
+        let file = match self.rng.pick(&staged) {
+            Some(x) if self.rng.below(4) != 0 => x,
+            _ => FILES[self.rng.below(FILES.len())].to_string(),
+        };
+        let Some(p) = w.client_path(&c, &file) else {
+            return Ok(());
+        };
+        match self.rng.below(4) {
+            0 => self.save(w, &c, &p, slot, tally),
+            1 => {
+                let h = self.open(w, &c, &p, tally);
+                tally.open_waits += usize::from(w.handle(h).waiting);
+                if !w.handle(h).waiting {
+                    self.write(w, h, slot, tally);
+                }
+                Ok(())
+            }
+            2 => self.path_call(w, &c, &file, &p, true, tally),
+            _ => self.path_call(w, &c, &file, &p, false, tally),
+        }
     }
 
     /// While a take holds files in a tree, a client of that tree calls on
@@ -1226,7 +1501,7 @@ impl Calls {
                     } else {
                         self.write(w, h, spot, tally);
                     }
-                    close_checked(w, &mut self.o, h)?;
+                    close_checked(w, &mut self.o, h, tally)?;
                 }
             }
         }
@@ -1252,10 +1527,15 @@ fn run(w: &mut World, seed: u64, tally: &mut Tally) -> Result<(), (usize, String
         // Only a client not blocked in a waiting call makes one.
         let mut clients: Vec<Client> = k.mains.iter().cloned().map(Client::Main).collect();
         clients.extend(live_clients(w).into_iter().map(Client::Fork));
+        // Another program of a sandbox differs from its client only while a
+        // transaction is open there.
+        clients.extend(in_txn(w).into_iter().map(Client::Outside));
         clients.retain(|c| !blocked(w, c));
         let open: Vec<_> = w
             .handles()
-            .filter(|h| !h.waiting && h.kind == Kind::Write && !blocked(w, &h.client))
+            .filter(|h| {
+                !h.waiting && !h.deferred && h.kind == Kind::Write && !blocked(w, &h.client)
+            })
             .map(|h| h.id)
             .collect();
         let e = |e| (step, e);
@@ -1308,9 +1588,7 @@ fn run(w: &mut World, seed: u64, tally: &mut Tally) -> Result<(), (usize, String
                         .is_some_and(|t| !t.staged.is_empty())
                         || k.rng.below(4) == 0)
                 {
-                    let _ = w.commit_txn(f);
-                    gitledger::observe(w).map_err(e)?;
-                    k.o.reload(w);
+                    commit_checked(w, &mut k.o, f, tally).map_err(e)?;
                 }
             }
             9 => {
@@ -1358,7 +1636,7 @@ fn run(w: &mut World, seed: u64, tally: &mut Tally) -> Result<(), (usize, String
             }
             16 => {
                 if let Some(h) = k.rng.pick(&open) {
-                    close_checked(w, &mut k.o, h).map_err(e)?;
+                    close_checked(w, &mut k.o, h, tally).map_err(e)?;
                 }
             }
             17 => {
@@ -1394,6 +1672,9 @@ fn run(w: &mut World, seed: u64, tally: &mut Tally) -> Result<(), (usize, String
                 {
                     k.create(w, &c, &p, slot, tally).map_err(e)?;
                 }
+            }
+            22 | 23 if !in_txn(w).is_empty() => {
+                k.outside_a_transaction(w, slot, tally).map_err(e)?;
             }
             26..=29 if !w.waits().is_empty() && k.rng.below(2) == 0 => {
                 // An entry waits: a sandbox of that tree saves a file the
@@ -1442,21 +1723,10 @@ fn run(w: &mut World, seed: u64, tally: &mut Tally) -> Result<(), (usize, String
     }
     // Writes stop: every open file closes, every open transaction commits
     // or rolls back; the queues drain; every fork equals main.
-    close_all_checked(w, &mut k.o).map_err(|e| (STEPS, e))?;
+    close_all_checked(w, &mut k.o, tally).map_err(|e| (STEPS, e))?;
     for f in in_txn(w) {
         if k.rng.below(2) == 0 {
-            // A commit first finishes the sandbox's take, which may grant
-            // an open of a file the commit writes: close it too.
-            if w.commit_txn(f) != Err(ModelError::OpenFiles) {
-                gitledger::observe(w).map_err(|e| (STEPS, e))?;
-                k.o.reload(w);
-                continue;
-            }
-            k.o.reload(w);
-            close_all_checked(w, &mut k.o).map_err(|e| (STEPS, e))?;
-            w.commit_txn(f).expect("open");
-            gitledger::observe(w).map_err(|e| (STEPS, e))?;
-            k.o.reload(w);
+            commit_checked(w, &mut k.o, f, tally).map_err(|e| (STEPS, e))?;
         } else {
             rollback_checked(w, &mut k.o, f).map_err(|e| (STEPS, e))?;
             tally.rolled_back += 1;
@@ -1554,6 +1824,15 @@ fn run_all(policies: Policies) {
         assert!(
             tally.overtakes > 0 && tally.prefix_syncs > 0,
             "progress rules not met in {} seeds: {tally:?}",
+            seeds().len()
+        );
+        // R5.3 met: calls deferred behind a transaction, and commits that
+        // went ahead with a file open in their sandbox.
+        assert!(
+            tally.deferred_closes > 0
+                && tally.deferred_path_calls > 0
+                && tally.commits_with_open > 0,
+            "R5.3 not met in {} seeds: {tally:?}",
             seeds().len()
         );
         assert!(

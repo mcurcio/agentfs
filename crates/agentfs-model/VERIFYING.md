@@ -105,6 +105,7 @@ the expected failure.
 | `finding_6_git_hunks_on_neighbouring_lines` | 6 | a sync leaves a line "which Main already took" |
 | `finding_29_a_sync_keeps_a_line_after_the_parents_unfinished_line` | 29 | two lines read as one, `}n9` |
 | `finding_30_a_transactions_line_after_the_sandboxs_unfinished_line` | 30 | two lines read as one, `}n9` |
+| `finding_31_an_agreeing_delete_of_a_rename_overs_file` | 31 | `rename_overs_whole`: "was unlinked by renaming" |
 
 These were the results at seeds 1..64 on 2026-11-04; a change that moves a count says so in its pull
 request. Finding 27's and finding 28's tests pass since the owner's decisions of 2026-11-05 (one of them went
@@ -228,7 +229,8 @@ A planted bug is one deliberate mistake in a copy of the model. It shows which t
    crash that drops a transaction's journaled calls. From the owner's decisions of 2026-11-04: P3 reintroduced (a
    new write-open waits behind a waiting take); a sync that delivers the parent's head whatever is open (past an open
    file); a sync that never delivers a prefix (it waits whole); and
-   each fix of findings 11, 25 and 26 reverted.
+   each fix of findings 11, 25 and 26 reverted. From R5.3: a close of a transaction's file that saves at once; deferred
+   calls applied out of order; a rollback that drops them; a crash that drops them.
 3. Run `cargo test --locked -p agentfs-model --no-fail-fast` in the copy (and 500 seeds for a bug the
    scenarios miss), with a separate target directory per copy: in the container, mount the copy as `/src`
    and a volume of its own as `/target` (`-v agentfs-target-m1:/target`).

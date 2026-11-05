@@ -8,7 +8,7 @@ use agentfs_model::content::{BLANK, Content, Layout, Line, State};
 use agentfs_model::git::{git, with_reversed_dates};
 use agentfs_model::world::{
     By, Client, Direction, Life, LineEdit, MergeRule, ModelError, Overwritten, Policies, Step,
-    Tree, TxnOutcome, World, Write,
+    Target, Tree, TxnOutcome, World, Write,
 };
 use std::collections::BTreeSet;
 
@@ -1665,35 +1665,297 @@ fn r9_a_main_clients_death_releases_its_locks() {
     assert!(w.handles().next().is_none());
 }
 
-/// Rule 5 with open files (a choice): a file the program opened before
-/// begin keeps writing to the sandbox, so a long-lived open file blocks no
-/// transaction. The commit is refused ([`ModelError::OpenFiles`]) only
-/// while the program itself holds open a file of the transaction, or a
-/// sandbox file the commit would write; once it closes them, it commits.
+/// Rule 5 with open files: a file the program opened before begin keeps
+/// writing to the sandbox, so a long-lived open file blocks no transaction.
+/// One the transaction never wrote saves at once.
 #[test]
 fn r5_open_files_and_transactions() {
     let mut w = world();
     let f = w.create_fork(Tree::Main);
     let c = Client::Fork(f);
     let log = w.open_write(&c, "d");
-    let edit = w.open_write(&c, "a");
     w.begin(f).unwrap();
     let s = w.save(&c, "a", 1);
-    let staged = w.open_write(&c, "b");
-    assert_eq!(w.commit_txn(f), Err(ModelError::OpenFiles));
-    w.edit(staged, LineEdit::At(0)).unwrap();
-    w.close(staged);
-    assert_eq!(w.commit_txn(f), Err(ModelError::OpenFiles), "a is open");
     let l = w.edit(log, LineEdit::Append).unwrap();
     w.close(log);
     assert!(
         has(&w, Tree::Fork(f), "d", &l),
-        "the log saves to the sandbox"
+        "the log saves to the sandbox at once"
     );
     assert!(!l.contains('~'), "not a staged line");
-    w.close(edit);
+    ok(&mut w);
     assert_eq!(w.commit_txn(f), Ok(TxnOutcome::Committed));
     assert!(has(&w, Tree::Fork(f), "a", &s));
+    drain(&mut w);
+}
+
+/// R5.2 gone, R5.3 (the owner, 2026-11-05: "it should be able to acquire a
+/// file lock"): a commit goes ahead while its own program holds files open,
+/// opened before begin or inside the transaction. Both stay open and their
+/// writes save into the sandbox at close, as ordinary later saves.
+#[test]
+fn r5_a_commit_goes_ahead_with_the_programs_own_files_open() {
+    let mut w = world();
+    let f = w.create_fork(Tree::Main);
+    let t = Tree::Fork(f);
+    let c = Client::Fork(f);
+    let before = w.open_write(&c, "a");
+    w.begin(f).unwrap();
+    let staged = w.save(&c, "a", 1);
+    let inside = w.open_write(&c, "b");
+    let unsaved = w.edit(inside, LineEdit::Append).unwrap();
+    assert_eq!(w.commit_txn(f), Ok(TxnOutcome::Committed));
+    let merge = w.head(t);
+    ok(&mut w);
+    assert!(w.forks[&f].txn.is_none());
+    assert!(has(&w, t, "a", &staged), "the commit landed");
+    assert!(!has(&w, t, "b", &unsaved), "still private until close");
+    assert_eq!(w.handle(inside).target, Target::Tree(t));
+
+    let late = w.edit(before, LineEdit::Append).unwrap();
+    w.close(before);
+    assert!(has(&w, t, "a", &late));
+    assert!(has(&w, t, "a", &staged), "an append keeps the staged line");
+    assert_eq!(
+        git(w.repo(), &["rev-parse", &format!("{}^1", w.head(t))]),
+        merge,
+        "an ordinary later save, on the commit"
+    );
+    w.close(inside);
+    assert!(has(&w, t, "b", &unsaved));
+    ok(&mut w);
+    drain(&mut w);
+    assert!(has(&w, Tree::Main, "a", &late) && has(&w, Tree::Main, "b", &unsaved));
+}
+
+/// A file only the lost transaction made has no path in the sandbox, so an
+/// open of it left over from the commit saves nothing (R11.3).
+#[test]
+fn r5_an_open_of_a_file_only_a_lost_transaction_made_saves_nothing() {
+    let mut w = world();
+    let f = w.create_fork(Tree::Main);
+    let t = Tree::Fork(f);
+    let c = Client::Fork(f);
+    w.begin(f).unwrap();
+    let new = w.create(&c, "n").expect("a new file");
+    w.edit(new, LineEdit::Append).unwrap();
+    w.save(&c, "a", 1);
+    let m = w.save(&m1(), "a", 1);
+    next(&mut w, t);
+    assert!(has(&w, t, "a", &m));
+    assert!(matches!(w.commit_txn(f), Ok(TxnOutcome::Lost { .. })));
+    ok(&mut w);
+    let n = w.orphans.len();
+    let head = w.head(t);
+    w.close(new);
+    assert_eq!(w.orphans.len(), n + 1, "its write is dropped, and named");
+    assert_eq!(w.head(t), head);
+    drain(&mut w);
+}
+
+/// R5.3: while a transaction is open, another program's close, unlink and
+/// rename of its files return at once and change nothing; they apply in the
+/// order they were made after the commit, the save on the commit's head.
+#[test]
+fn r5_io_on_a_transactions_files_is_deferred_past_its_commit() {
+    let mut w = world();
+    let f = w.create_fork(Tree::Main);
+    let t = Tree::Fork(f);
+    let (c, other) = (Client::Fork(f), Client::Outside(f));
+    let open = w.open_write(&other, "a");
+    w.begin(f).unwrap();
+    let staged = w.save(&c, "a", 1);
+    let staged_b = w.save(&c, "b", 0);
+    let staged_d = w.save(&c, "d", 0);
+    let start = w.head(t);
+    ok(&mut w);
+
+    let x = w.edit(open, LineEdit::Append).unwrap();
+    w.close(open);
+    assert_eq!(w.unlink(&other, "b"), None, "an unlink returns at once");
+    assert_eq!(w.rename(&other, "d", "d2"), None, "so does a rename");
+    let reopened = w.open_write(&other, "a");
+    w.write(reopened, Write::Truncate(0));
+    w.close(reopened);
+    ok(&mut w);
+    assert_eq!(w.head(t), start, "none of it moved the sandbox");
+    assert_eq!(w.forks[&f].deferred.len(), 4);
+    assert!(w.path_of(t, "b").is_some() && w.path_of(t, "d").as_deref() == Some("d"));
+
+    assert_eq!(w.commit_txn(f), Ok(TxnOutcome::Committed));
+    ok(&mut w);
+    assert!(w.forks[&f].deferred.is_empty());
+    assert!(w.handles().next().is_none());
+    let result = w.ended.last().unwrap().result.clone().unwrap();
+    assert!(has(&w, Tree::Fork(f), "a", &staged) || w.file(&result, "a").holds(&staged));
+    assert!(w.file(&result, "b").holds(&staged_b));
+    assert!(w.file(&result, "d").holds(&staged_d));
+    assert_eq!(w.path_of(t, "b"), None, "the unlink ran");
+    assert_eq!(w.path_of(t, "d").as_deref(), Some("d2"), "the rename ran");
+    assert_eq!(
+        w.read(t, "a").bytes(),
+        "",
+        "in order: the truncate came after the save of x {x}"
+    );
+    drain(&mut w);
+}
+
+/// R5.3 with rule 9: a path call that waited for a take's hold, and whose file
+/// is a transaction's when the release lets it go, defers: no call waits on a
+/// transaction.
+#[test]
+fn r5_a_path_call_a_take_let_go_defers() {
+    let mut w = world();
+    let f = w.create_fork(Tree::Main);
+    let t = Tree::Fork(f);
+    let (c, other) = (Client::Fork(f), Client::Outside(f));
+    w.begin(f).unwrap();
+    w.save(&c, "b", 0);
+    w.save(&m1(), "b", 1);
+    take(&mut w, &Step::Next(t));
+    let h = w.unlink(&other, "b").expect("it waits for the hold");
+    assert!(w.handle(h).waiting);
+    take(&mut w, &Step::Finish(t));
+    assert!(!w.handle(h).waiting && w.handle(h).deferred);
+    assert!(w.path_of(t, "b").is_some());
+    assert_eq!(w.commit_txn(f), Ok(TxnOutcome::Committed));
+    ok(&mut w);
+    assert_eq!(w.path_of(t, "b"), None);
+    drain(&mut w);
+}
+
+/// R5.3: a rollback applies the deferred calls the same way, on the
+/// sandbox's head, and nothing of the transaction is in them.
+#[test]
+fn r5_a_rollback_applies_what_it_deferred() {
+    let mut w = world();
+    let f = w.create_fork(Tree::Main);
+    let t = Tree::Fork(f);
+    let (c, other) = (Client::Fork(f), Client::Outside(f));
+    let open = w.open_write(&other, "a");
+    w.begin(f).unwrap();
+    let staged = w.save(&c, "a", 1);
+    let start = w.head(t);
+    let x = w.edit(open, LineEdit::Append).unwrap();
+    w.close(open);
+    assert_eq!(w.unlink(&other, "a"), None);
+    assert_eq!(w.head(t), start);
+    w.rollback(f).unwrap();
+    ok(&mut w);
+    assert!(w.file(&w.head(t), "a").holds(&x), "the save ran");
+    assert!(
+        !w.file(&w.head(t), "a").holds(&staged),
+        "the staged line went"
+    );
+    assert_eq!(w.path_of(t, "a"), None, "then the unlink");
+    drain(&mut w);
+    assert_eq!(w.path_of(Tree::Main, "a"), None);
+}
+
+/// R5.3 with R9.6: the client's death rolls the transaction back, the
+/// deferred calls apply, and then its open files close.
+#[test]
+fn r5_a_clients_death_applies_what_its_transaction_deferred() {
+    let mut w = world();
+    let f = w.create_fork(Tree::Main);
+    let t = Tree::Fork(f);
+    let (c, other) = (Client::Fork(f), Client::Outside(f));
+    let deferred = w.open_write(&other, "a");
+    let stays = w.open_write(&c, "a");
+    w.begin(f).unwrap();
+    let staged = w.save(&c, "a", 1);
+    let x = w.edit(deferred, LineEdit::Append).unwrap();
+    w.close(deferred);
+    let y = w.edit(stays, LineEdit::Append).unwrap();
+    w.end_client(f);
+    ok(&mut w);
+    let a = w.file(&w.head(t), "a");
+    assert!(a.holds(&x) && a.holds(&y) && !a.holds(&staged));
+    assert!(w.handles().next().is_none());
+    drain(&mut w);
+    assert!(has(&w, Tree::Main, "a", &x) && has(&w, Tree::Main, "a", &y));
+}
+
+/// R5.3 with rule 12: a crash keeps a deferred call in the journal behind
+/// its transaction, which survives; an open of its file defers at the
+/// restart's replay. Each applies once, after the commit.
+#[test]
+fn r5_a_crash_keeps_what_a_transaction_deferred() {
+    let mut w = world();
+    let f = w.create_fork(Tree::Main);
+    let t = Tree::Fork(f);
+    let (c, other) = (Client::Fork(f), Client::Outside(f));
+    let (closed, open) = (w.open_write(&other, "a"), w.open_write(&other, "a"));
+    w.begin(f).unwrap();
+    let staged = w.save(&c, "a", 1);
+    let staged_b = w.save(&c, "b", 0);
+    let x = w.edit(closed, LineEdit::Append).unwrap();
+    w.close(closed);
+    assert_eq!(w.unlink(&other, "b"), None);
+    let y = w.edit(open, LineEdit::Append).unwrap();
+    let start = w.head(t);
+    w.crash();
+    ok(&mut w);
+    assert_eq!(w.head(t), start, "still behind the transaction");
+    assert_eq!(w.forks[&f].deferred.len(), 3);
+    assert!(w.handles().all(|h| h.deferred));
+    assert_eq!(w.commit_txn(f), Ok(TxnOutcome::Committed));
+    ok(&mut w);
+    let a = w.file(&w.head(t), "a");
+    assert!(a.holds(&x) && a.holds(&y) && a.holds(&staged));
+    let result = w.ended.last().unwrap().result.clone().unwrap();
+    assert!(w.file(&result, "b").holds(&staged_b));
+    assert_eq!(w.path_of(t, "b"), None);
+    drain(&mut w);
+    assert!(has(&w, Tree::Main, "a", &x) && has(&w, Tree::Main, "a", &y));
+}
+
+/// R5.3 with R3c.2 and rule 9: a deferred save has not happened, so its file
+/// counts as open: a sync of that file waits for it, and the save is never
+/// credited with a parent's line its program could not read. The transaction
+/// ending wakes the sync.
+#[test]
+fn r5_a_deferred_save_holds_back_a_sync_of_its_file() {
+    let mut w = world();
+    let f = w.create_fork(Tree::Main);
+    let t = Tree::Fork(f);
+    let (c, other) = (Client::Fork(f), Client::Outside(f));
+    let open = w.open_write(&other, "a");
+    w.begin(f).unwrap();
+    w.save(&c, "a", 2);
+    w.edit(open, LineEdit::At(1)).unwrap();
+    w.close(open);
+    let m = w.save(&m1(), "a", 1);
+    take(&mut w, &Step::Next(t));
+    assert!(w.waits().contains_key(&t), "the sync waits");
+    assert!(!has(&w, t, "a", &m));
+    assert_eq!(w.commit_txn(f), Ok(TxnOutcome::Committed));
+    ok(&mut w);
+    assert!(!w.waits().contains_key(&t), "the transaction's end woke it");
+    drain(&mut w);
+    assert!(
+        w.collisions.iter().any(|c| c.tree == Tree::Main),
+        "written without reading main's line, the save collides with it"
+    );
+    assert!(has(&w, Tree::Main, "a", &m), "and the parent wins");
+}
+
+/// Coherence finding 31: main renames d over c and then unlinks d, while a
+/// sandbox unlinks d. The two deletes agree (R10.3), so the sandbox's applies,
+/// and d's name is then a version not written over the rename-over's, which
+/// `rename_overs_whole` calls half a rename-over.
+#[test]
+#[ignore = "coherence finding 31: an agreeing delete of a file a rename-over named fails rename_overs_whole"]
+fn finding_31_an_agreeing_delete_of_a_rename_overs_file() {
+    let mut w = world();
+    let f = w.create_fork(Tree::Main);
+    assert_eq!(w.unlink(&Client::Fork(f), "d"), None);
+    ok(&mut w);
+    assert_eq!(w.rename(&m1(), "d", "c"), None);
+    ok(&mut w);
+    assert_eq!(w.unlink(&m1(), "c"), None);
+    ok(&mut w);
+    next(&mut w, Tree::Main);
     drain(&mut w);
 }
 
@@ -2585,13 +2847,15 @@ fn r3_a_transactions_agreeing_delete_is_part_of_its_change() {
         .clone();
     let h = w.open_write(&c, "a");
     w.begin(f).unwrap();
+    // The sandbox saves before the transaction has the file (R5.3 would
+    // defer it after).
+    w.edit(h, LineEdit::Delete(3));
+    w.edit(h, LineEdit::At(0));
+    w.close(h);
     let k = w.open_write(&c, "a");
     w.edit(k, LineEdit::Delete(3));
     w.edit(k, LineEdit::At(0));
     w.close(k);
-    w.edit(h, LineEdit::Delete(3));
-    w.edit(h, LineEdit::At(0));
-    w.close(h);
     let Ok(TxnOutcome::Lost { lines }) = w.commit_txn(f) else {
         panic!("the transaction lost");
     };

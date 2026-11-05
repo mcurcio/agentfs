@@ -570,16 +570,23 @@ next sync replaces it with main's line (`syncs_deliver`).
 Begin creates `txn/<n>` and `refs/txn-start/<n>` at the fork's head: snapshot isolation. The program's saves
 commit there and it reads its own edits; the fork keeps syncing. One per fork; main's clients have none. A file
 open before begin keeps writing to the fork (its target is fixed at open), so a long-lived open file blocks no
-transaction; opens after begin write in the transaction. Errors: begin with one open (`InTransaction`), commit
-or rollback with none (`NoTransaction`), after the client ended (`Ended`), and commit while the program itself
-holds open for writing a file of the transaction or a fork file the commit would write (`OpenFiles`).
+transaction; the client's opens after begin write in the transaction. Errors: begin with one open (`InTransaction`),
+commit or rollback with none (`NoTransaction`), after the client ended (`Ended`).
+
+**Other I/O on its files is deferred** (ledger R5.3; the owner, 2026-11-05: "deferred, obviously. thats what i mean by
+"lock" -- its about ordering the operations so that agentfs has a change to mutate the filesystem without a client
+fighting it"). While a transaction is open, a close (so its truncates and rewrites), an unlink or a rename, in the fork,
+of a file it has saved or has open for writing is accepted, journaled and returns at once; nothing waits on a program.
+It applies in the order made after the commit or rollback, a client's death included, a save as any later close on the
+head then. The file counts as open until then (§6), so a sync or landing never writes it under a save that has not
+happened, and a crash leaves the call in the journal behind its transaction (§3).
 
 **Commit** lands the branch in the fork as a child lands in its parent, whole or not at all (rule 3e, the owner):
 the fork's concurrent line (one a sync brought in since begin) wins, and then none of the transaction applies; no
 collision refuses it. A transaction that lost still writes its merge commit, with the fork's tree, so history
-shows the decision (a choice); its collision ref keeps the transaction's branch. `OpenFiles` is a *choice* too:
-those open files are the caller's own locks (§6), so waiting would wait on the caller; the program closes them
-and commits again (`r5_open_files_and_transactions`). The answer says
+shows the decision (a choice); its collision ref keeps the transaction's branch. Nothing refuses a commit: it goes
+ahead while programs hold files open, those files stay open, and their writes (a transaction's opens now write in the
+fork) save at close as ordinary later saves (`r5_a_commit_goes_ahead_with_the_programs_own_files_open`). The answer says
 `Committed`, or `Lost` with every staged line and the fork's line that won or decided it
 (`r3_a_transaction_loses_whole_and_is_told`); no saves commits nothing (`Empty`). One ref transaction moves the fork and deletes both refs (the model
 deletes the branch first: a crash between would lose the commit). The result lands upstream like any fork commit.
@@ -598,10 +605,11 @@ sequenceDiagram
   B->>B: merge, parents B and txn/7, Writer c2, Cause Transaction t7 (B's tree if it lost)
   B->>B: one ref transaction: move fork/2, delete txn/7 and its start (a collision ref keeps a loser)
   B-->>P: Committed, or Lost with every staged line
+  B->>B: the calls deferred behind it, in order, each an ordinary save or path call
   B->>QM: Landing(fork/2, the transaction's commit)
 ```
 
-**Rollback**, abandon or the client dying deletes the branch and its start ref. No HEAD ever points at `txn/<n>`
+**Rollback**, abandon or the client dying deletes the branch and its start ref, then applies the deferred calls. No HEAD ever points at `txn/<n>`
 and deleting a branch deletes its reflog, so no ref reaches its commits and nothing of it shows in any tree or
 history (`discarded_leave_no_trace`); git's garbage collection removes them. The fork is unchanged.
 
@@ -726,6 +734,7 @@ policy of this revision included. Every check runs after every step, in every sc
 | A save is its write calls on the head at close: appends and offset writes keep the lines they did not write | every check | `r8_an_append_after_the_sync_keeps_the_synced_line`, `r8_an_offset_write_elsewhere_keeps_the_synced_line`, `r8_a_stale_rewrite_*` |
 | An append writes over no line but a partial last line it finishes: read from the save's blobs and its program's calls, each line starting in the appended bytes is new, after every line of the parent, and a finished line is the parent's last, one version on | `appends_exact` (in `one_writer`) | `r8_concurrent_appends_never_overwrite_each_other`, every random run |
 | No take writes a file open for writing in that tree or one it did not hold; no write-open succeeds while a take holds the file; no lock outlives its holder (a sandbox's client or one of main's, a transaction, a tree); every wait ends on an event | `step_checked`, `locks`, `check_converged` | `r9_*`, `r11_an_unlink_or_rename_of_a_held_file_waits`, `r5_open_files_and_transactions`, every random run (main's clients and sandboxes die in them) |
+| While a transaction is open, no save reaches its fork on a file it has saved; each deferred call applies in order once it ends (§9) | `transactions_undisturbed`, `locks`, `interleavings.rs` `Oracle::defers` | `r5_io_on_a_transactions_files_is_deferred_past_its_commit`, `r5_a_rollback_applies_what_it_deferred`, `r5_a_clients_death_applies_what_its_transaction_deferred`, `r5_a_crash_keeps_what_a_transaction_deferred`, every random run |
 | No program's open, `unlink` or `rename(2)` ever waits on a waiting landing, only on a take writing its file (no P3, §6) | `Oracle::no_wait_on_waiting` (interleavings.rs, the harness's own record), `locks` | `r9_cooperating_programs_never_deadlock`, `r9_new_writers_postpone_a_waiting_take`, every random run |
 | A sync never delivers past the first change to an open file: it delivers a parent commit, in order, overwrites no open file, and the first commit it holds back names an open file (P2, §6) | `step_checked` (`prefix_cut`) | `r9_a_sync_delivers_up_to_the_first_change_to_an_open_file`, `r9_a_prefix_sync_holds_back_a_transaction_whole`, every random run |
 | The parent wins every collision, decided only at its queue, losing commit reachable, the decision in the notes ref on the take's result commit | `parent_wins` | `r3_landing_collision_the_parent_wins`, `r3_a_collision_is_recorded_once_at_the_parents_queue`, `r10_a_delete_against_a_concurrent_edit_the_parent_wins`, `r10_a_move_is_a_delete_plus_an_insert` |
@@ -812,7 +821,9 @@ power loss, failed save or view-host restart.
   close after a crash saves what the program had written, even mid-sequence, as a killed program leaves a file on
   Linux.
 - An old handle's writes after a rename-over or an unlink leave no history (§7).
-- A transaction commit is refused while the program holds its own files open (`OpenFiles`, §9).
+- While a transaction is open, other programs' saves, unlinks and renames of its files do not show (§9), so a program's
+  next read misses its own close; a file with a deferred call holds back a sync or landing of it until the transaction
+  ends.
 - A transaction's answer covers its commit into its own fork. A transaction committed there can still lose whole
   at main's queue later: a recorded collision, not part of the answer.
 - The referee and the actor are our own code; no git merge strategy carries them.
