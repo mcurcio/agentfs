@@ -4,7 +4,8 @@
 **Status:** revision 11, proposed: the target, not today's code; sketches are Rust surfaces. Revision 3 was approved
 by the owner on 2026-11-02; revision 10 cuts the page to what [agentfs in git terms](git-model.md) does not cover.
 **Read [git-model.md](git-model.md) first.** It is the one source of truth for trees as branches, saves, locks, the
-queue and its referee, collisions, syncs, transactions, nested forks, history settings and crash recovery.
+queue and its referee, collisions, syncs, transactions, nested forks and crash recovery. There is one history mode, full lineage: the owner dropped squashing on 2026-11-05
+("drop squashing"), and the history setting and its grafts with it.
 This page and the domain pages cover only the rest: clients, views and what each shows, tree storage and lifecycle,
 replication, the volume, health, telemetry, deployment and versions. Where a page here seems to disagree with
 git-model.md, git-model.md wins and the page has a bug.
@@ -26,7 +27,7 @@ Nothing else on these pages is his; everything else is a design choice and says 
 | R9 | "Whole seems best, right? A partial application has unknown side effects" | 2026-10-16 | git-model §6 (a take holds all its files); git-model §7: a save or transaction lands whole or loses whole (rule 3e, the owner's answer of 2026-11-03 to git-model §16 question 3) |
 | R10 | "agentfs should support merging live" (2026-10-28); "No live landing yet", then "Build incrementally" (2026-10-29) | 2026-10-28/29 | git-model §5 |
 | R11 | "Nothing is locked in. Everything is on the table" | 2026-11-01 | every page |
-| R12 | "The general history should be preserved, yes. But I think it could be configurable if it needs to be every single commit, or whether a fork can be squashed so that mainline is just a merge tree of squashed fork lineage." | 2026-11-02 | git-model §11 |
+| R12 | "The general history should be preserved, yes. But I think it could be configurable if it needs to be every single commit, or whether a fork can be squashed so that mainline is just a merge tree of squashed fork lineage." Replaced 2026-11-05: "drop squashing"; history stays preserved | 2026-11-02 | git-model §11 |
 | R13 | "A cooperating integration can define batches/transactions across files, and they must all land together. But a default usage, like the CNI provides, can operate per-file." (read: "CNI" is agentfs's CSI driver) | 2026-11-02 | git-model §7, §9: a transaction's commit lands whole or loses whole at every level (rule 3e); [views](domains/views.md) |
 | R14 | "Not A, because that assumes that a clean merge is an acceptable merge" (quoted in agentfs `docs/design.md` §12) | 2026-10-16 | not yet designed (§5) |
 | R15 | "Configurable with a sensible default" (of accepting a clean merge; `docs/design.md` §12) | 2026-10-29 | not yet designed (§5) |
@@ -44,7 +45,6 @@ Nothing else on these pages is his; everything else is a design choice and says 
 | A4 | "A fork whose branches are rejected and never land in the main branch will inevitably be lost, and that's acceptable" | 2026-11-01 | replaced for losing changes by "yes, \"losing\" patches should still be part of the history. i want to know who changed what when" (2026-11-03, git-model §4); still holds for a fork's whole line ([replication](domains/replication.md) §4) |
 | A5 | Consistency: "It depends on the config!" | 2026-11-02 | [views](domains/views.md) §3 |
 | A6 | A pinned fork is an acceptable snapshot | 2026-11-02 | [trees](domains/trees.md), [views](domains/views.md) |
-| A7 | History setting: "one setting per volume" | 2026-11-02 | git-model §11 |
 | A11 | File watchers: "we can take the "no guarantee" path for now" | 2026-11-02 | [views](domains/views.md) |
 | A12 | "Yes, I think so. The sandboxes are generally peers and parallelism is assumed." | 2026-11-02 | git-model §5 |
 | A13 | "Agreed. It’s a transaction, so a failure is an implicit rollback." | 2026-11-02 | git-model §9, §12 |
@@ -98,7 +98,7 @@ Telemetry receives every event and is left off the picture.
 
 | Domain | Owns exclusively | Is not | Page |
 |---|---|---|---|
-| **the git model** | each tree's branch, index and working tree; saves, locks, the queue, the referee, syncs, transactions, collision refs, grafts, history settings | anything a client sees or who a client is | [git-model.md](git-model.md) |
+| **the git model** | each tree's branch, index and working tree; saves, locks, the queue, the referee, syncs, transactions, collision refs | anything a client sees or who a client is | [git-model.md](git-model.md) |
 | **Rules** | what is recorded, what each view profile shows, database groups | storage, mounts | [rules](domains/rules.md) |
 | **Clients** | clients, writers, grants, sessions, attachments, every capability | liveness, what lands | [clients](domains/clients.md) |
 | **Views** | serving each client's file calls, open files until close, kernel caches, what each consistency setting shows, forwarded file locks | ordering, merging, history | [views](domains/views.md) |
@@ -209,7 +209,7 @@ cites the owner.
 |---|---|---|---|
 | Git history: branches, trailers, refs (git-model §3, §4) | every minor and patch of a major (R16) | a major | at boot: a branch last written by another major is refused (`OtherMajor`) |
 | Components that talk: history service, view hosts, launchers, CSI plugin, CLI | one family: same major **and minor** (a design choice from his "maybe minor too"; revisable); patch free | any minor | the rpc edge: `OtherFamily` |
-| Settings: the history setting, Rules' files, space limits, start point and acceptances, `on_release`, remotes | every release, each by its owner | never: a release that cannot read one refuses to stage, naming it | each owner at boot |
+| Settings: Rules' files, space limits, start point and acceptances, `on_release`, remotes | every release, each by its owner | never: a release that cannot read one refuses to stage, naming it | each owner at boot |
 | Internal formats: `store` rows, tree storage layout, rpc | one family | any minor | `store` at boot: `FormatsOf(family)` until that family drains the volume |
 
 | Upgrade | Path |

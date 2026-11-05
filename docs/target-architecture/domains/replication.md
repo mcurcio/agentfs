@@ -4,7 +4,7 @@
 **Status:** draft 5, proposed, under [system.md](../system.md) revision 10 and [git-model.md](../git-model.md). The
 target, not today's code; Rust sketches show surfaces only.
 **What the git model already fixes** (git-model §4): Replication is the shared remote's only pusher; its refspec
-carries main's branch, every collision ref and the `Squashed` grafts; a recorded collision makes a
+carries main's branch and every collision ref; a recorded collision makes a
 push due; no queue step waits on the network. This page covers the rest: remotes, credentials, attempts, divergence
 and settlement.
 
@@ -37,7 +37,7 @@ the only domain that talks to a remote and the only one that holds a credential.
 | **settlement** | the answer to "does every remote carrying main hold it through this commit?" |
 | **spacing** | the operator's minimum time between two attempts on one remote |
 
-**Not this domain:** commits, branches, collision refs and grafts (git-model); release and an upgrade's drain
+**Not this domain:** commits, branches and collision refs (git-model); release and an upgrade's drain
 (Volume decides, asking `settlement`); alarms (Telemetry, from `PushSettled`).
 
 ## 2. The model
@@ -112,7 +112,7 @@ pub enum Auth {
     SshAgent { socket: CredentialRef, known_hosts: CredentialRef },
 }
 pub enum Carries {
-    Main,                // main's branch, collision refs, grafts (git-model §4)
+    Main,                // main's branch, collision refs (git-model §4)
     MainAndForks,        // also each fork's branch, kept on the remote after the fork drops
 }
 ```
@@ -148,8 +148,7 @@ with a lease touches the remote ref.
 
 | Scenario | Replication's behaviour |
 |---|---|
-| A collision | the take's `TreeMoved` names it; its ref and any graft go in the next attempt, create-only |
-| `Squashed` history | the grafts are pushed under `refs/agentfs/<volume>/replace/`, fetched back by a matching refspec; a clone without them cannot sync a fork (git-model §4) |
+| A collision | the take's `TreeMoved` names it; its ref goes in the next attempt, create-only |
 | 1,000 sandboxes | `Main`: one replica set per remote, whatever the fork count; `MainAndForks`: one more per live fork |
 | A slow, dead or refusing remote | `Unreachable` at an I/O deadline, then `Backoff`; other remotes settle on their own |
 | Crash mid-attempt | each remote is `Due` at restart; the next listing shows what it holds, so a push that landed is `UpToDate`, never a false divergence |
@@ -159,7 +158,7 @@ with a lease touches the remote ref.
 |---|---|
 | Remote set | empty (local-only); the deployment config is the one source of truth, watched, none stored |
 | Spacing; retry cap | 1 minute; 15 minutes (placeholders) |
-| Refs carried | `Main` (main's branch, collision refs, grafts); `MainAndForks` opt-in, a fork's branch kept on the remote after its drop. A fork's losing commits go either way |
+| Refs carried | `Main` (main's branch, collision refs); `MainAndForks` opt-in, a fork's branch kept on the remote after its drop. A fork's losing commits go either way |
 | I/O deadlines | connect 30 s, stalled transfer 5 min (as today) |
 
 ## 6. Tests
@@ -185,7 +184,7 @@ with a lease touches the remote ref.
 
 ## For the code architects (parked)
 
-Ref names on the remote (git-model §4 gives the collision and graft prefixes); batching many fork refs in one
+Ref names on the remote (git-model §4 gives the collision prefix); batching many fork refs in one
 attempt; SSH host-certificate rules (keep today's); the push-state row layout.
 
 ## Reconcile with existing code (agentfs origin/main b5c0dc8)
@@ -193,7 +192,7 @@ attempt; SSH host-certificate rules (keep today's); the push-state row layout.
 - **The interval push loop** becomes attempts started by `TreeMoved`, with `pushInterval` as spacing.
 - **`meta/push/<remote>.json`** becomes an audited row; only the Pending divergence name gains authority.
 - **Remote sections in the repository config** move to the deployment config; origin binding, SSH, proxies and limits stay. **The final push within `--push-grace`** goes: release is Volume's verdict on `settlement`.
-- **Ref names gain the major** and the collision and graft refs.
+- **Ref names gain the major** and the collision refs.
 
 **NOT RUN:** no code was built or tested.
 

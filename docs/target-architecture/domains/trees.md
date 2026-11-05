@@ -50,7 +50,7 @@ stateDiagram-v2
 | A fork ends at its last client's leaving | one writer for life ([clients](clients.md) C4): it is never written again, and a deleted pod's launcher may never call `end` |
 | An ended fork drops only once its parent's queue has taken every entry it put there | every save reaches the referee, so a losing one is kept as a collision ref (git-model §4) before the branch goes |
 | A fork with a live child does not drop | the child's upstream is its branch |
-| After the drop | main still reaches the fork's landed commits (full lineage) or reads them through grafts (squashed); every losing commit stays under its collision ref (git-model §4, §11) |
+| After the drop | main still reaches the fork's landed commits (full lineage); every losing commit stays under its collision ref (git-model §4, §11) |
 
 ## 3. Pinned snapshots
 
