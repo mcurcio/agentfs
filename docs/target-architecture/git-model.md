@@ -377,7 +377,7 @@ identity (below). Five cases, each read from git, in this order:
 | same | the same version | nothing |
 | written over the parent's | the parent's version is the one the incoming writer saw (on its first parent: a save after a sync), or one that one was written over | incoming replaces it, at its place |
 | stale | the parent's version was written over the incoming one | dropped, no collision |
-| both deleted | neither written over the other, both deletes | the deletes agree: the incoming one applies, an ordinary version of its change (the owner, 2026-11-05) |
+| both deleted | neither written over the other, both deletes | the deletes agree: the incoming one applies, an ordinary version of its change, no collision (the owner, 2026-11-05; ledger rule R10.3) |
 | concurrent | neither | **the parent's version stays**, the incoming one loses, a collision is recorded |
 
 A line new to the parent (an insert) applies. "Written over" follows one line back: the version the line map
@@ -960,8 +960,7 @@ close-to-open visibility, accepted ("Go", §3). The 2026-11-04 revision (§3 jou
 §18) adds design choices only, each with its alternatives and costs beside it, and so does the byte model (§6, §7:
 an append onto a partial line, a followed partial line). Answered 2026-11-04: no P3 (§6, MODEL.md finding 24); P2 as
 the prefix sync (§6). Answered 2026-11-05: an agreeing delete is not dropped (MODEL.md
-findings 19, 26, 27). Open: MODEL.md finding 28 (an applied agreeing delete replaces the parent's delete, which the
-checks call a loss).
+findings 19, 26, 27), and two deletes of one line agree with no collision (ledger rule R10.3, MODEL.md finding 28).
 
 *History: 2026-11-03, from the model at 509a0ab; revised after review (save ordering, trees, recovery, grafts, slots); 2026-11-03, the owner's answers on losers and saves; review: Replication pushes losers, questions 2 and 3; 2026-11-03, the owner's answers on saves and locks; review: appends at close, main's clients' death, transactions with open files, the lock over path calls, the program-level hang; 2026-11-03, after the owner's "Go": close-to-open accepted, line identity, deletes and renames (§7); review: no POSIX call names a line, so a save aligns its bytes once (§6, §7), the atomic-save idiom, untracked files (§3), R9/R13/A8 put to the owner (§16), §17 cut; 2026-11-03, the owner's answer to question 3: a save or transaction lands whole or loses whole, only winning saves are squashed (§7, §9, §11, §15); 2026-11-04, answering the pull-request review: the journal (§3), progress (§6), objects (§7), why a custom protocol (§14), the prototype plan (§18), proof claims narrowed to the modelled executions; 2026-11-04, byte calls modelled (§6, §7), the notes ref built (§4, §8), Replication due on every move of main (§4); 2026-11-04, the adversarial review at `ee29551`: finding 24 (P3
 deadlocks cooperating programs, §6), squash runs cut at open files (§6), the object table and open numbers across a

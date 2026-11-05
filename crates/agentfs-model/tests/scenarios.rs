@@ -2810,43 +2810,59 @@ fn r7_a_nested_agreeing_delete_is_decided_the_same_under_both_settings() {
     );
 }
 
-/// Coherence finding 28 (2026-11-05, found removing R3e.3; seed 15 of
-/// 1 to 64 of the settings comparison): an agreeing delete that applies
-/// replaces the parent's delete without having been written over it. Main
-/// edits line 1, then deletes it; the sandbox deletes line 1 concurrently,
-/// and its delete applies: main's edit entered main and is gone, with no
-/// version written over it in its place and no collision naming it
-/// (`no_silent_loss`). The model follows the owner's rule; the check calls
-/// it a loss. The owner's call.
+/// R10.3, finding 28 (2026-11-05, found removing R3e.3; seed 15 of 1 to
+/// 64 of the settings comparison): main edits line 1, then deletes it; the
+/// sandbox deletes line 1 concurrently. The two deletes agree: both are
+/// recorded, no collision is reported, and the line stays deleted. Main's
+/// edit is not lost: main's own delete replaced it first. The checks
+/// called it a loss until the owner's rule R10.3.
 #[test]
-#[ignore = "coherence finding 28: an applied agreeing delete replaces the parent's delete, which the checks call a loss"]
-fn finding_28_an_agreeing_delete_replaces_a_delete_over_an_unseen_edit() {
+fn r10_two_deletes_of_one_line_agree_over_an_unseen_edit() {
     for history in BOTH {
         let mut w = world(history);
         let f = w.create_fork(Tree::Main);
         distinct(&mut w, "a");
+        let line1 = w.read(Tree::Main, "a").lines[1].line.clone();
         w.save(&m1(), "a", 1);
         call(&mut w, &m1(), "a", LineEdit::Delete(1));
         call(&mut w, &Client::Fork(f), "a", LineEdit::Delete(1));
         drain(&mut w);
+        assert!(w.collisions.is_empty(), "{history:?}: {:?}", w.collisions);
+        for t in [Tree::Main, Tree::Fork(f)] {
+            let a = w.read(t, "a");
+            let v = a.member(&line1).expect("line 1");
+            assert!(!v.live(), "{history:?} {t:?}: line 1 deleted, {v:?}");
+        }
     }
 }
 
-/// Coherence finding 28, under `Squashed` (seeds 44 and 60 of 1 to 64 of
-/// the squashed run): a sandbox's edit of line 1 loses to main's delete,
-/// and a later save of the same take deletes line 1 over that edit. It
-/// applies, so main's winning delete is not in the result (`parent_wins`).
+/// R10.3 under `Squashed`, finding 28 (seeds 44 and 60 of 1 to 64 of the
+/// squashed run): a sandbox's edit of line 1 loses to main's delete, and a
+/// later save of the same take deletes line 1 over that edit. That delete
+/// agrees with main's: it applies, the line stays deleted, and only the
+/// edit is named lost.
 #[test]
-#[ignore = "coherence finding 28: an applied agreeing delete replaces the parent's winning delete in a squashed take"]
-fn finding_28_a_squashed_agreeing_delete_replaces_the_winning_delete() {
+fn r10_a_squashed_delete_agrees_with_the_winning_delete() {
     let mut w = world(HistoryPolicy::Squashed);
     let f = w.create_fork(Tree::Main);
     distinct(&mut w, "a");
+    let line1 = w.read(Tree::Main, "a").lines[1].line.clone();
     w.save(&Client::Fork(f), "a", 1);
     call(&mut w, &m1(), "a", LineEdit::Delete(1));
     next(&mut w, Tree::Fork(f));
     call(&mut w, &Client::Fork(f), "a", LineEdit::Delete(1));
     drain(&mut w);
+    assert_eq!(
+        w.collisions.len(),
+        1,
+        "only the edit lost: {:?}",
+        w.collisions
+    );
+    for t in [Tree::Main, Tree::Fork(f)] {
+        let a = w.read(t, "a");
+        let v = a.member(&line1).expect("line 1");
+        assert!(!v.live(), "{t:?}: line 1 deleted, {v:?}");
+    }
 }
 
 /// Finding 25 (seeds 287 and 436 of the settings comparison): a sandbox

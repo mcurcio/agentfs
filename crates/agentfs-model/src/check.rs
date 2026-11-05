@@ -504,6 +504,22 @@ fn flagged(w: &World, t: Tree, path: &str, line: &str, token: &str) -> bool {
     })
 }
 
+/// R10.3: a delete of line `line` of `path` that was written over version
+/// `token` (or is it) entered `t` or a tree upstream of it, and no
+/// collision that reached `t` names it lost. Another delete of that line
+/// then agrees with it: `token`'s content is gone by that delete first.
+fn deleted_over(w: &World, t: Tree, path: &str, line: &str, token: &str) -> bool {
+    let trees = w.upstream(t);
+    w.entered.iter().any(|(u, d)| {
+        trees.contains(u)
+            && d.gone
+            && d.path == path
+            && d.line == line
+            && w.lineage.descends(&d.token, token)
+            && !flagged(w, t, path, line, &d.token)
+    })
+}
+
 /// Neither version was written over the other.
 fn concurrent(w: &World, a: &str, b: &str) -> bool {
     !w.lineage.descends(a, b) && !w.lineage.descends(b, a)
@@ -591,16 +607,18 @@ fn delivered(w: &World, t: Tree, c: &Collision) -> bool {
 /// Main never silently loses a change, nor does any tree, and no stale
 /// version reverts a newer one: (a) in every live tree a line moves from
 /// version a to b only if b was written over a, or both are deletes (they
-/// agree), or a recorded collision in that tree or one upstream names a
+/// agree, R10.3), or b is a delete agreeing with one written over a
+/// ([`deleted_over`]), or a recorded collision in that tree or one upstream names a
 /// as lost; never if a was written over b (b is stale), unless a collision
 /// decided against a ([`decided_against`]); (b) every version that
 /// entered a tree (written there, carried in by a landing or a
 /// transaction, won or lost, or taken from the parent by a sync) is still
-/// its line's version there, or one written over it is, or both are
-/// deletes, or such a collision names it.
+/// its line's version there, or one written over it is, or a delete is
+/// that agrees with it or with a delete written over it
+/// ([`deleted_over`]), or such a collision names it.
 fn no_silent_loss(w: &World, now: &Views) -> Result<(), String> {
     for (t, p, l, a, b) in moves(w, now) {
-        // excuse: NONE two deletes agree; no ledger rule says so (the owner's "(a) agree", 2026-11-05, is under rejected R3e.3)
+        // excuse: R10.3 two deletes of one line agree: the line stays deleted
         if !a.live() && !b.live() {
             continue;
         }
@@ -612,7 +630,11 @@ fn no_silent_loss(w: &World, now: &Views) -> Result<(), String> {
             ));
         }
         // excuse: R3b a collision names a lost: it stays in history, named
-        if !w.lineage.descends(&b.id, &a.id) && !flagged(w, t, p, l, &a.id) {
+        // excuse: R10.3 b agrees with a delete written over a
+        if !w.lineage.descends(&b.id, &a.id)
+            && !flagged(w, t, p, l, &a.id)
+            && !(!b.live() && deleted_over(w, t, p, l, &a.id))
+        {
             return Err(format!(
                 "silent loss in {t:?}:{p}[{l}]: {} became {}, which was not written over it, and no collision names it",
                 a.id, b.id
@@ -633,8 +655,9 @@ fn no_silent_loss(w: &World, now: &Views) -> Result<(), String> {
             return Err(format!("line {} of {} left {t:?}", e.line, e.path));
         };
         // excuse: R3b a collision names it lost
-        // excuse: NONE two deletes agree; no ledger rule says so (the owner's "(a) agree", 2026-11-05, is under rejected R3e.3)
-        if !lost && !w.lineage.descends(&s.id, &e.token) && !(e.gone && !s.live()) {
+        // excuse: R10.3 s agrees with a delete written over e (or e itself)
+        let deleted = !s.live() && deleted_over(w, *t, &e.path, &e.line, &e.token);
+        if !lost && !w.lineage.descends(&s.id, &e.token) && !deleted {
             return Err(format!(
                 "{} entered {t:?}:{}[{}] and is gone ({} there), with no collision naming it",
                 e.token, e.path, e.line, s.id
@@ -694,7 +717,8 @@ fn set_by_winner(w: &World, take: &Landed, p: &str, v: &str) -> bool {
 /// versions and keeps the tree's own version of every lost line, as the
 /// tree had it before (or, in a squashed take, a version another save of
 /// that take set, which won), and holds each version named in `won`, as
-/// the tree did before; the lost versions are the losing change's; each
+/// the tree did before (or, for a winning delete, a delete of its line
+/// that agrees with it: R10.3); the lost versions are the losing change's; each
 /// lost and winning pair is concurrent (neither was written over the
 /// other; for a loss decided by a file rule, at least one pair; for a line
 /// lost only because its change lost whole, a real collision of that
@@ -722,11 +746,16 @@ fn parent_wins(w: &mut World) -> Result<(), String> {
             w.file(&c.winner, &c.path),
             w.file(&c.loser, &c.path),
         );
+        // excuse: R10.3 a winning delete may be replaced by a delete agreeing with it
         let named = c.lines.len() == c.won.len()
             && c.lines.len() == c.lost.len()
-            && c.won
-                .iter()
-                .all(|t| holds(w, &c.result, t) && holds(w, &c.winner, t));
+            && c.won.iter().all(|t| {
+                holds(w, &c.winner, t)
+                    && (holds(w, &c.result, t)
+                        || win.records().find(|v| v.id == *t).is_some_and(|v| {
+                            !v.live() && r.member(&v.line).is_some_and(|x| !x.live())
+                        }))
+            });
         // excuse: R7.1 in a squashed take a later save that won may set the line
         let kept = c.lines.iter().zip(&c.lost).all(|(l, x)| {
             !r.holds(x)
@@ -789,9 +818,8 @@ fn parent_wins(w: &mut World) -> Result<(), String> {
 /// own edit set (its diff from its base, read from git) are, for one that
 /// lost, none in the take's result (unless the tree held it before) and
 /// each named lost by that change's collisions (unless the tree before
-/// already held it, a version written over it, or a delete agreeing with
-/// it); for one that won, every one in the result, or a version written
-/// over it, or a delete agreeing with it. And a squashed commit holds only
+/// already held it, or a version written over it); for one that won,
+/// every one in the result, or a version written over it. And a squashed commit holds only
 /// judged winners: under `Squashed` a landing's lineage parents are the
 /// tree's previous head and exactly the changes of the take that won, and
 /// every version the squash sets was set by one of them.
@@ -810,8 +838,7 @@ fn changes_whole(w: &mut World) -> Result<(), String> {
             }
             for e in w.edits(base, u) {
                 let (r, b) = (w.file(&l.result, &e.path), w.file(&l.before, &e.path));
-                // excuse: NONE two deletes agree; no ledger rule says so (the owner's "(a) agree", 2026-11-05, is under rejected R3e.3)
-                let ends = |v: &Line| w.lineage.descends(&v.id, &e.token) || (e.gone && !v.live());
+                let ends = |v: &Line| w.lineage.descends(&v.id, &e.token);
                 if !lost {
                     if !r.member(&e.line).is_some_and(ends) {
                         return Err(format!(
@@ -1731,13 +1758,9 @@ fn placed_and_unlinked(w: &mut World) -> Result<(), String> {
                 let name = w.file(u, p).name;
                 let creates = edits.iter().any(|e| e.line == b.name.line && !e.gone)
                     && name.over.as_deref() == Some(b.name.id.as_str());
-                // excuse: NONE two deletes agree; no ledger rule says so (the owner's "(a) agree", 2026-11-05, is under rejected R3e.3)
                 let applies = edits.iter().any(|e| {
-                    b.member(&e.line).is_none_or(|v| {
-                        v.id != e.token
-                            && !(e.gone && !v.live())
-                            && !w.lineage.descends(&v.id, &e.token)
-                    })
+                    b.member(&e.line)
+                        .is_none_or(|v| v.id != e.token && !w.lineage.descends(&v.id, &e.token))
                 });
                 // excuse: R11 a change that unlinks the file too, or creates it, is no edit of an unlinked file
                 if !b.name.live() && !unlinks && !creates && !created && applies {
