@@ -9,6 +9,7 @@ what loses, what waits and what history records. Each rule has an ID and one sta
 | `approved` | proposed by an agent, then approved by the owner (his answer quoted and dated) |
 | `proposed` | written by an agent, not yet approved: **the ledger check fails while any rule is `proposed`** |
 | `rejected` | the owner said no: the check fails while the model still has it (the `Gone when` names) |
+| `parked` | the owner's words for a design he set aside, kept for when it is reopened; not in force and not built |
 
 How it is enforced (`crates/agentfs-model/tests/ledger.rs`, run in CI with the workspace tests):
 
@@ -157,31 +158,33 @@ without seeing the other. MODEL.md's rules table holds the full wording; this pa
   Owner, 2026-11-05: "the lock mechanism only really applies to agentfs interactions -- we do not need to
   lock/serialize multiple clients from competing with one another. we only need to track those clients so that
   agentfs knows when it has the runway to commit/land work"; "we absolutely must avoid deadlocking, while also trying
-  to minimize starvation". How landings acquire their files is open (the owner asked for deterministic techniques
-  beyond trylocks).
-- **R9.11** · owner · Snapshot opens. A sync or landing never waits for a program's open file: it applies at once,
+  to minimize starvation". A sync or landing waits for a moment when all its files are closed, tried again at each close (R9.4). Owner,
+  2026-11-05, choosing between that and another round of snapshot opens: "Locks, keep snapshots on file". The cost
+  stays: overlapping opens can delay a landing indefinitely. The prototype measures how often; snapshot opens
+  ([parked design](snapshot-opens.md), R9.11 to R9.15 and R9.17) are the next step if that is a real problem.
+- **R9.11** · parked · Snapshot opens. A sync or landing never waits for a program's open file: it applies at once,
   as one atomic step. Each open keeps the version of the file it opened; at close its save is merged line by line
   against that version (R3c.2: it has not seen what arrived while it was open). Owner, 2026-11-05: "alright, lets
-  try option 4 until it becomes a problem." This supersedes the waiting in R9, R9.1, R9.3, R9.4, R9.5, R9.7 and
-  R9.9; which of their parts go is settled by the snapshot-opens design, then recorded here.
-- **R9.12** · owner · A close works in stages. First agentfs builds the edit the program just made, against the
+  try option 4 until it becomes a problem." Parked, 2026-11-05: "Locks, keep snapshots on file". The design failed two reviews
+  ([snapshot-opens.md](snapshot-opens.md)); R9, R9.1, R9.3, R9.4, R9.5, R9.7 and R9.9 stay in force.
+- **R9.12** · parked · A close works in stages. First agentfs builds the edit the program just made, against the
   version it opened, knowing nothing of what has landed since. Reconciling that edit with what has landed comes
   after. Owner, 2026-11-05: "when the client closes the file, the first stage is simply trying to build the edit that
   the client just made, either for a commit or for the impending transaction. The reconciliation with the prior
   landed commits occurs _after_ that edit has been calculated."
-- **R9.13** · owner · A client's view stays on the commit from before a landing. It moves forward only after the
+- **R9.13** · parked · A client's view stays on the commit from before a landing. It moves forward only after the
   landings are fully resolved, and only when the client opens a file again. Owner, 2026-11-05: "whenever a landing is
   about to occur, the client view becomes sticky to whatever commit predates the client landing. And the client view
   can only be fast-forwarded after the landing(s) have been fully resolved and also only when the client opens a file
   again."
-- **R9.17** · owner · The view moves forward per file, per open. agentfs tracks each open file against the commit it
+- **R9.17** · parked · The view moves forward per file, per open. agentfs tracks each open file against the commit it
   opened; a file opened after a landing sees it, and a file already open stays on its own commit. Owner, 2026-11-05:
   "the view can only move forward for each file that has opened after the landing. so we would likely need to track
   each open file against the SHA that it opened".
-- **R9.14** · owner · A file deleted or replaced by an incoming change while a program has it open: the program's
+- **R9.14** · parked · A file deleted or replaced by an incoming change while a program has it open: the program's
   save still counts as an edit of that file, judged by R11 (an edit of a file the parent deleted loses, kept in
   history). Owner, 2026-11-05: "(a) sounds correct to me". R11.3 covers deletes made inside the same tree only.
-- **R9.15** · owner · A program's truncate and rewrite replaces the file, even if a landing changed it while it was
+- **R9.15** · parked · A program's truncate and rewrite replaces the file, even if a landing changed it while it was
   open: last writer wins, both versions kept in history. Owner, 2026-11-05: "a".
 - **R9.16** · owner · Two programs in one tree: the later close is final inside that tree. Only lines a sync brought
   are left for the parent to decide. Owner, 2026-11-05: "a".

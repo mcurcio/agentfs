@@ -51,6 +51,7 @@
 - [Overview](target-architecture/README.md)
   - [agentfs in git terms](target-architecture/git-model.md)
   - [The rules ledger](target-architecture/rules-ledger.md)
+  - [Snapshot opens (parked)](target-architecture/snapshot-opens.md)
   - [The system](target-architecture/system.md)
   - [Rules](target-architecture/domains/rules.md)
   - [Clients](target-architecture/domains/clients.md)
