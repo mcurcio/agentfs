@@ -171,6 +171,10 @@ owner, in the fix pass's result, with:
 The fix pass then stops on that item. It records the item as an open coherence finding with an ignored
 test (procedure step 5); it does not patch around it.
 
+A rule is binding only until a blocking consideration is found (the owner, 2026-11-05, quoted at the top of the
+ledger). Code that bends to keep a rule (a hack, an exception, a special case) is a code smell: escalate it to the
+owner as a reason to reopen the architecture, never build it.
+
 Before fixing, ask **which ledger rule caused this?** A defect that traces to a `proposed` rule, or to no rule,
 is a question for the owner, not a fix. When the same mechanism has needed two exceptions, or draws a third
 finding, the mechanism's premise is wrong: stop and bring the owner options for removing it.
