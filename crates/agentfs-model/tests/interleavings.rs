@@ -1002,11 +1002,26 @@ fn checkg(w: &mut World, o: &mut Oracle) -> Result<(), String> {
     o.check(w)
 }
 
-/// One seed: [`run`] under `catch_unwind`. `Ok` carries the run's
-/// [`World::fingerprint`]; `Err` the seed, step, violation and log.
+/// A generator of one seed's client calls and steps.
+type Run = fn(&mut World, u64, &mut Tally) -> Result<(), (usize, String)>;
+
+/// One seed: [`run`] under `catch_unwind`.
 fn run_seed(seed: u64, policies: Policies, tally: &mut Tally) -> Result<String, String> {
+    run_seed_of(run, seed, policies, tally)
+}
+
+/// One seed of `generate` under `catch_unwind`. `Ok` carries the run's
+/// [`World::fingerprint`]; `Err` the seed, step, violation and log.
+fn run_seed_of(
+    generate: Run,
+    seed: u64,
+    policies: Policies,
+    tally: &mut Tally,
+) -> Result<String, String> {
     let mut w = World::new(policies);
-    let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(&mut w, seed, tally)));
+    let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        generate(&mut w, seed, tally)
+    }));
     let (step, e) = match out {
         Ok(Ok(())) => return Ok(w.fingerprint()),
         Ok(Err(e)) => e,
@@ -1249,6 +1264,25 @@ impl Calls {
         }
         let t = self.text(tally);
         self.line_edit(w, h, &LineEdit::At(slot), &t);
+        close_checked(w, &mut self.o, h, tally)
+    }
+
+    /// Opens `p` as `c`, makes one random write call and closes, if the
+    /// open is granted.
+    fn one_call(
+        &mut self,
+        w: &mut World,
+        c: &Client,
+        p: &str,
+        slot: usize,
+        tally: &mut Tally,
+    ) -> Result<(), String> {
+        let h = self.open(w, c, p, tally);
+        if w.handle(h).waiting {
+            tally.open_waits += 1;
+            return Ok(());
+        }
+        self.write(w, h, slot, tally);
         close_checked(w, &mut self.o, h, tally)
     }
 
@@ -1742,10 +1776,7 @@ fn run(w: &mut World, seed: u64, tally: &mut Tally) -> Result<(), (usize, String
     if let Some(f) = w.forks.values().find(|f| f.life != Life::Dropped) {
         return Err((STEPS + 1, format!("f{} never dropped", f.id)));
     }
-    for l in &w.landings {
-        tally.changes_lost += usize::from(!l.won);
-    }
-    tally.clean_lines_lost += w.collisions.iter().filter(|c| c.by == By::Whole).count();
+    tally_run(w, tally);
     tally.fast_forwards += w.fast_forwards;
     tally.inserts_met += w.inserts_met;
     tally.unlinked_edits += w.unlinked_edits;
@@ -1783,6 +1814,123 @@ fn run(w: &mut World, seed: u64, tally: &mut Tally) -> Result<(), (usize, String
     Ok(())
 }
 
+/// Rounds of client calls, each drained to convergence: saves by main and by
+/// forks (nested ones included), every kind of write call (line edits as bytes,
+/// raw `pwrite`s, partial appends, truncates, `O_TRUNC` opens, stale rewrites),
+/// unlinks, renames and rename-overs, and transactions begun and committed, with
+/// no queue step between the calls of a round. So a change meets many others
+/// queued behind it, which steps between the calls keep apart: this generator
+/// found findings 25 to 28. Every invariant holds after every call and step.
+fn rounds(w: &mut World, seed: u64, tally: &mut Tally) -> Result<(), (usize, String)> {
+    gitledger::enable(true);
+    gitledger::observe(w).map_err(|e| (0, e))?;
+    let mut k = Calls::new(seed);
+    k.o.reload(w);
+    let m1 = Client::Main("m1".into());
+    for round in 0..ROUNDS {
+        for _ in 0..ROUND_CALLS {
+            let (f, slot) = (FILES[k.rng.below(FILES.len())], k.rng.below(HOT_SLOTS));
+            let e = |e| (round, e);
+            let fork = k.rng.pick(&live_clients(w)).map(Client::Fork);
+            match k.rng.below(16) {
+                0 => {
+                    let forks = live_clients(w);
+                    if forks.len() < 4 {
+                        let parent = match k.rng.pick(&forks) {
+                            Some(f) if k.rng.below(3) == 0 => Tree::Fork(f),
+                            _ => Tree::Main,
+                        };
+                        w.create_fork(parent);
+                        k.o.reload(w);
+                    }
+                }
+                1..=3 => {
+                    if let Some(p) = w.client_path(&m1, f) {
+                        k.save(w, &m1, &p, slot, tally).map_err(e)?;
+                    }
+                }
+                4..=6 => {
+                    if let Some(c) = fork
+                        && let Some(p) = w.client_path(&c, f)
+                    {
+                        k.save(w, &c, &p, slot, tally).map_err(e)?;
+                    }
+                }
+                7..=9 => {
+                    if let Some(c) = fork
+                        && let Some(p) = w.client_path(&c, f)
+                    {
+                        k.one_call(w, &c, &p, slot, tally).map_err(e)?;
+                    }
+                }
+                10 => {
+                    if let Some(p) = w.client_path(&m1, f) {
+                        k.one_call(w, &m1, &p, slot, tally).map_err(e)?;
+                    }
+                }
+                11 => {
+                    if let Some(f) = k.rng.pick(&live_clients(w)) {
+                        let _ = w.begin(f);
+                        k.o.reload(w);
+                    }
+                }
+                12 => {
+                    if let Some(f) = k.rng.pick(&in_txn(w)) {
+                        commit_checked(w, &mut k.o, f, tally).map_err(e)?;
+                    }
+                }
+                13 if k.rng.below(4) == 0 => {
+                    // A sandbox's client dies: its transaction rolls back,
+                    // its opens close, and the sandbox ends.
+                    if let Some(c) = fork {
+                        end_checked(w, &mut k.o, &c).map_err(e)?;
+                    }
+                }
+                13 => {
+                    let c = fork.unwrap_or_else(|| m1.clone());
+                    if let Some(p) = w.client_path(&c, f) {
+                        k.reads
+                            .insert((format!("{c:?}"), f.to_string()), w.client_reads(&c, &p));
+                    }
+                }
+                _ => {
+                    let c = match fork {
+                        Some(c) if k.rng.below(2) == 0 => c,
+                        _ => m1.clone(),
+                    };
+                    if k.rng.below(2) == 0
+                        && let Some(p) = w.client_path(&c, f)
+                    {
+                        if k.rng.below(4) == 0 {
+                            k.create(w, &c, &p, slot, tally).map_err(e)?;
+                        } else {
+                            let unlink = k.rng.below(3) == 0;
+                            k.path_call(w, &c, f, &p, unlink, tally).map_err(e)?;
+                        }
+                    }
+                }
+            }
+            checkg(w, &mut k.o).map_err(e)?;
+        }
+        drain(w, &mut k.o, tally, round)?;
+    }
+    tally_run(w, tally);
+    Ok(())
+}
+
+/// Rounds of [`rounds`].
+const ROUNDS: usize = 4;
+/// Client calls per round.
+const ROUND_CALLS: usize = 12;
+
+/// Changes that lost whole in a finished run, and their clean lines.
+fn tally_run(w: &World, tally: &mut Tally) {
+    for l in &w.landings {
+        tally.changes_lost += usize::from(!l.won);
+    }
+    tally.clean_lines_lost += w.collisions.iter().filter(|c| c.by == By::Whole).count();
+}
+
 fn run_all(policies: Policies) {
     let mut tally = Tally::default();
     let mut failures = Vec::new();
@@ -1806,6 +1954,12 @@ fn run_all(policies: Policies) {
         assert!(
             tally.changes_lost > 0 && tally.clean_lines_lost > 0,
             "no change lost whole with a clean line in {} seeds",
+            seeds().len()
+        );
+        // Takes really wait for write-opens (rule 9), and opens for takes.
+        assert!(
+            tally.take_waits > 0 && tally.open_waits > 0,
+            "no take or no open waited in {} seeds: {tally:?}",
             seeds().len()
         );
         // Rules 10 and 11 met in the random runs, not in one scenario
@@ -1850,6 +2004,44 @@ fn run_all(policies: Policies) {
 #[test]
 fn random_interleavings_full_lineage() {
     run_all(Policies::default());
+}
+
+/// CI runs [`random_interleavings_rounds`] at seeds 1..=ROUNDS_SEEDS: each seed
+/// drains four times, so 64 seeds would be the slowest test by far.
+/// `AGENTFS_MODEL_SEEDS` and `AGENTFS_MODEL_SEED` apply as to every random run.
+const ROUNDS_SEEDS: u64 = 16;
+
+/// [`rounds`]: many calls with no queue step between them, every invariant.
+#[test]
+fn random_interleavings_rounds() {
+    let explicit = ["AGENTFS_MODEL_SEED", "AGENTFS_MODEL_SEEDS"]
+        .iter()
+        .any(|v| std::env::var(v).is_ok());
+    let seeds = if explicit {
+        seeds()
+    } else {
+        (1..=ROUNDS_SEEDS).collect()
+    };
+    let mut tally = Tally::default();
+    let failures: Vec<String> = seeds
+        .iter()
+        .filter_map(|seed| run_seed_of(rounds, *seed, Policies::default(), &mut tally).err())
+        .collect();
+    eprintln!("rounds, {} seeds: {tally:?}", seeds.len());
+    assert!(
+        failures.is_empty(),
+        "{} of {} seeds failed:\n\n{}",
+        failures.len(),
+        seeds.len(),
+        failures.join("\n\n")
+    );
+    if seeds.len() as u64 >= ROUNDS_SEEDS {
+        assert!(
+            tally.changes_lost > 0 && tally.clean_lines_lost > 0,
+            "rounds: no change lost whole with a clean line in {} seeds",
+            seeds.len()
+        );
+    }
 }
 
 /// The per-line rule does not depend on slots being separate git hunks:

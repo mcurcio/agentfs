@@ -156,7 +156,10 @@ file written and renamed over a file), half of them while an old writer of the r
 writes on; every agentfs process crashes now and then, half the time during a close, and more often while a
 transaction has a file open. A client blocked in a call
 that waits makes no other call until it returns (it may still die), as a program does. The random runs replay seeds 1 to
-64 in CI (each record on its own hunk, and every record on a neighbouring git line). Half the time a write goes to the line a sandbox wrote last, so runs
+64 in CI (each record on its own hunk, and every record on a neighbouring git line). A second generator, `rounds` (CI: seeds 1 to 16), makes
+many calls with no queue step between them, drained to convergence each round, so a change meets many others queued
+behind it (it found findings 25 to 28; it went with the settings comparison and came back on 2026-11-05). CI's seeds
+assert that takes really wait for write-opens and opens for takes. Half the time a write goes to the line a sandbox wrote last, so runs
 often build "a sandbox edits over its own undecided line while main writes it" (finding 8). Run more with `AGENTFS_MODEL_SEEDS=500`, or one with
 `AGENTFS_MODEL_SEED=<n>`.
 

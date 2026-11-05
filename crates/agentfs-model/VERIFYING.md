@@ -41,7 +41,7 @@ Keep the build output and the registry on a disk with room; a full workspace bui
 commands below are what goes after `agentfs-dev` in that line:
 
 ```sh
-# The model: every scenario, and the random runs at seeds 1..64 (what CI runs).
+# The model: every scenario, and the random runs at seeds 1..64, rounds at 1..16 (what CI runs).
 cargo test --locked -p agentfs-model
 
 # One rule's scenarios (they are named r<N>_... after the rule they show).
@@ -113,7 +113,7 @@ with squashing; finding 28's are `r10_two_deletes_of_one_line_agree_over_an_unse
 `r10_a_later_delete_agrees_with_the_winning_delete`). Finding 3's two tests went with the per-file setting when the owner chose whole changes (rule 3e); finding
 24's test passes since the owner deleted P3 (2026-11-04), as `r9_cooperating_programs_never_deadlock`.
 
-CI runs `cargo test --workspace` (so the scenarios and seeds 1..64), fmt, clippy with `-D warnings`, and the
+CI runs `cargo test --workspace` (so the scenarios, seeds 1..64 and rounds at 1..16), fmt, clippy with `-D warnings`, and the
 mdBook build. It does not run 500 seeds, the ignored tests or planted bugs: those stay local, and a design pull
 request says in its body that they were run and what they showed.
 
