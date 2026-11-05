@@ -14,8 +14,7 @@
 //! rename one of that tree's files; they unlink and rename files (rule
 //! 11), to a new path or over another file. On top of `check`, the run
 //! itself asserts that nothing else waits: every close returns at once, and
-//! every queue step takes its queue's head (plus, under `Squashed`, the
-//! same fork's plain saves directly behind it, as one changeset), leaving
+//! every queue step takes its queue's head, leaving
 //! the rest of the queue in order, or records that it waits. And it keeps
 //! its own byte oracle ([`Oracle`]): a plain byte array per tree (and open
 //! transaction) and file, and each open's calls, updated by the same calls
@@ -35,8 +34,8 @@ use agentfs_model::content::{BLANK, Content, FILES, Layout, PATHS, UNBORN};
 use agentfs_model::git::{git, with_reversed_dates};
 use agentfs_model::program;
 use agentfs_model::world::{
-    By, Client, Delayed, Direction, Entry, ForkId, HandleId, HistoryPolicy, Kind, Life, LineEdit,
-    MergeRule, ModelError, Policies, Step, Take, Target, Tree, TxnEnd, TxnOutcome, World, Write,
+    By, Client, Delayed, Direction, Entry, ForkId, HandleId, Kind, Life, LineEdit, MergeRule,
+    ModelError, Policies, Step, Take, Target, Tree, TxnEnd, TxnOutcome, World, Write,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -86,7 +85,6 @@ impl Rng {
 struct Tally {
     steps: usize,
     fast_forwards: usize,
-    squashed_runs: usize,
     landing_collisions: usize,
     transaction_collisions: usize,
     committed: usize,
@@ -98,9 +96,6 @@ struct Tally {
     /// lines (`By::Whole`) lost with them.
     changes_lost: usize,
     clean_lines_lost: usize,
-    /// Takes of several changes in which some won and some lost (a squash
-    /// of the winners only).
-    mixed_takes: usize,
     empty: usize,
     rolled_back: usize,
     forks: usize,
@@ -576,9 +571,8 @@ impl Oracle {
     }
 }
 
-/// One step ([`step_checked`]), asserting it took its queue's head (and,
-/// under `Squashed`, the entries it says it carried with it), and left the
-/// rest in order, or waits and left the queue as it was; and that only the
+/// One step ([`step_checked`]), asserting it took its queue's head and left
+/// the rest in order, or waits and left the queue as it was; and that only the
 /// tree a take finished in changed bytes (the oracle reads them again
 /// after).
 fn take(w: &mut World, o: &mut Oracle, s: &Step, tally: &mut Tally) -> Result<(), String> {
@@ -660,9 +654,8 @@ fn take(w: &mut World, o: &mut Oracle, s: &Step, tally: &mut Tally) -> Result<()
         if taken == 0 {
             tally.take_waits += 1;
             if let Some(i) = first {
-                // P1 under either setting: a landing waits only for its own
-                // change's files, never for a file only a save it would
-                // carry touches (the review of 2026-11-04, P1-c).
+                // P1: a landing waits only for its own change's files (the
+                // review of 2026-11-04, P1-c).
                 if let (_, Entry::Landing { commit, .. }) = &numbered[i]
                     && change_files(w, commit).is_disjoint(&open_before)
                 {
@@ -678,29 +671,16 @@ fn take(w: &mut World, o: &mut Oracle, s: &Step, tally: &mut Tally) -> Result<()
                 Err(format!("{s:?} took nothing but does not wait"))
             };
         }
-        // The entries taken are the queue's first ones: a squash carries
-        // only the saves directly behind its first, never one from behind
-        // another entry (rule 7: the history setting decides nothing).
-        let squash = w.policies.history == HistoryPolicy::Squashed;
         let i = first.ok_or(format!("{s:?} took {taken} entries, none free to go"))?;
         tally.overtakes += usize::from(i > 0);
         let rest: Vec<_> = before[..i]
             .iter()
-            .chain(&before[(i + taken).min(before.len())..])
+            .chain(&before[i + 1..])
             .cloned()
             .collect();
-        // A squash carries no save touching a file open for writing there:
-        // it would hold that save back no longer than on its own.
-        for (_, e) in numbered.iter().skip(i + 1).take(taken - 1) {
-            if let Some(p) = entry_files(w, *t, e).intersection(&open_before).next() {
-                return Err(format!(
-                    "{s:?}: a squash carried {e:?}, which touches {p}, open for writing there"
-                ));
-            }
-        }
-        if taken == 0 || (taken > 1 && !squash) || after != rest {
+        if taken != 1 || after != rest {
             return Err(format!(
-                "{s:?} took {taken} entries: not the first P1 lets go (entry {i}) and those directly behind it, or the rest out of order"
+                "{s:?} took {taken} entries: not the first P1 lets go (entry {i}), or the rest out of order"
             ));
         }
     }
@@ -1115,25 +1095,6 @@ impl Calls {
         close_checked(w, &mut self.o, h)
     }
 
-    /// Opens `p` as `c`, makes one random write call and closes, if the
-    /// open is granted.
-    fn one_call(
-        &mut self,
-        w: &mut World,
-        c: &Client,
-        p: &str,
-        slot: usize,
-        tally: &mut Tally,
-    ) -> Result<(), String> {
-        let h = self.open(w, c, p, tally);
-        if w.handle(h).waiting {
-            tally.open_waits += 1;
-            return Ok(());
-        }
-        self.write(w, h, slot, tally);
-        close_checked(w, &mut self.o, h)
-    }
-
     /// Unlinks `p`, or renames it: to a new path, or a third of the time
     /// over another file the client sees.
     fn path_call(
@@ -1245,26 +1206,24 @@ impl Calls {
         tally: &mut Tally,
     ) -> Result<bool, String> {
         // Each take with the files its changes touch and the lines in
-        // contention there, read from git: the lines each commit of the
+        // contention there, read from git: the lines the commit of the
         // take set over its first parent, and those the tree's head set
-        // over that first parent (each commit against its base).
+        // over that first parent (the commit against its base).
         let holds: Vec<Contention> = w
             .holds()
             .iter()
             .map(|(t, x)| {
                 let mut files: Vec<String> = x.files.iter().cloned().collect();
                 let mut lines = Vec::new();
-                if let Take::Landing { run, .. } = &x.take {
-                    for c in run {
-                        let base = git(w.repo(), &["rev-parse", &format!("{c}^1")]);
-                        for e in w
-                            .edits(&base, c)
-                            .into_iter()
-                            .chain(w.edits(&base, &w.head(*t)))
-                        {
-                            files.push(e.path.clone());
-                            lines.push((e.path, e.line));
-                        }
+                if let Take::Landing { commit: c, .. } = &x.take {
+                    let base = git(w.repo(), &["rev-parse", &format!("{c}^1")]);
+                    for e in w
+                        .edits(&base, c)
+                        .into_iter()
+                        .chain(w.edits(&base, &w.head(*t)))
+                    {
+                        files.push(e.path.clone());
+                        lines.push((e.path, e.line));
                     }
                 }
                 (*t, files, lines)
@@ -1576,10 +1535,7 @@ fn run(w: &mut World, seed: u64, tally: &mut Tally) -> Result<(), (usize, String
         return Err((STEPS + 1, format!("f{} never dropped", f.id)));
     }
     for l in &w.landings {
-        tally.changes_lost += l.units.len() - l.winners.len();
-        if !l.winners.is_empty() && l.winners.len() < l.units.len() {
-            tally.mixed_takes += 1;
-        }
+        tally.changes_lost += usize::from(!l.won);
     }
     tally.clean_lines_lost += w.collisions.iter().filter(|c| c.by == By::Whole).count();
     tally.fast_forwards += w.fast_forwards;
@@ -1600,7 +1556,6 @@ fn run(w: &mut World, seed: u64, tally: &mut Tally) -> Result<(), (usize, String
     }
     tally.git_takes = gitledger::takes();
     tally.git_takes_total += gitledger::takes();
-    tally.squashed_runs += w.squashed_runs;
     for c in &w.collisions {
         match c.direction {
             Direction::Landing => tally.landing_collisions += 1,
@@ -1638,10 +1593,8 @@ fn run_all(policies: Policies) {
         failures.join("\n\n")
     );
     // Across the CI seeds (or more) the rules really met: changes lost
-    // whole with clean lines in them (rule 3e), rules 10 and 11 (below),
-    // and under `Squashed` runs of saves landed as one changeset, some
-    // beside a save of the same take that lost (rule 7). One seed alone
-    // may have none.
+    // whole with clean lines in them (rule 3e), and rules 10 and 11 (below).
+    // One seed alone may have none.
     if seeds().len() as u64 >= SEEDS {
         assert!(
             tally.changes_lost > 0 && tally.clean_lines_lost > 0,
@@ -1675,29 +1628,13 @@ fn run_all(policies: Policies) {
             "no atomic save, no orphan, no crash during a close or none inside a transaction, in {} seeds: {tally:?}",
             seeds().len()
         );
-        if policies.history == HistoryPolicy::Squashed {
-            assert!(
-                tally.squashed_runs > 0 && tally.mixed_takes > 0,
-                "Squashed: no run of saves landed as one changeset, or none beside a loser, in {} seeds",
-                seeds().len()
-            );
-        }
     }
 }
 
-/// The model's choices: full lineage, per line, per-line syncs. Every
-/// invariant.
+/// The model's choices: per line, per-line syncs. Every invariant.
 #[test]
 fn random_interleavings_full_lineage() {
-    run_all(Policies::new(HistoryPolicy::FullLineage));
-}
-
-/// `Squashed`, every invariant: a fork's waiting saves land as one
-/// changeset, main's stored history holds only main's commits, and the
-/// graft beside it keeps the lineage rules 2 and 3 read.
-#[test]
-fn random_interleavings_squashed() {
-    run_all(Policies::new(HistoryPolicy::Squashed));
+    run_all(Policies::default());
 }
 
 /// The per-line rule does not depend on slots being separate git hunks:
@@ -1706,217 +1643,28 @@ fn random_interleavings_squashed() {
 fn random_interleavings_adjacent_lines() {
     run_all(Policies {
         layout: Layout::Adjacent,
-        ..Policies::new(HistoryPolicy::FullLineage)
+        ..Policies::default()
     });
 }
 
-/// Rule 2, "no clock is read anywhere", on the random runs: seeds 1..=8
-/// under each history setting run again with every commit dated before its
-/// parents decide exactly the same trees and collisions
-/// ([`World::fingerprint`]). An order taken from commit dates would differ.
+/// Rule 2, "no clock is read anywhere", on the random runs: seeds 1..=8 run
+/// again with every commit dated before its parents decide exactly the same
+/// trees and collisions ([`World::fingerprint`]). An order taken from commit
+/// dates would differ.
 #[test]
 fn random_interleavings_commit_dates_decide_nothing() {
-    for history in [HistoryPolicy::FullLineage, HistoryPolicy::Squashed] {
-        let policies = Policies::new(history);
-        for seed in seeds().into_iter().take(8) {
-            let mut tally = Tally::default();
-            let pinned = run_seed(seed, policies, &mut tally);
-            // Each run must pass on its own first: a failure names commit
-            // hashes, which reversed dates change, so comparing two failures
-            // would report a broken invariant as a date mismatch.
-            let pinned = pinned.unwrap_or_else(|e| panic!("{history:?} seed {seed}: {e}"));
-            let reversed = with_reversed_dates(|| run_seed(seed, policies, &mut tally))
-                .unwrap_or_else(|e| panic!("{history:?} seed {seed}, dates reversed: {e}"));
-            assert_eq!(pinned, reversed, "{history:?} seed {seed}");
-        }
-    }
-}
-
-/// Rounds of client calls, each drained to convergence, for
-/// [`random_interleavings_history_settings_decide_the_same`]: saves by
-/// main and by forks (nested ones included), every kind of write call
-/// (line edits as bytes, raw `pwrite`s, partial appends, truncates,
-/// `O_TRUNC` opens, stale rewrites), unlinks, renames and rename-overs, and
-/// transactions begun and committed, with no queue step between the calls
-/// of a round, so both history settings see exactly the same calls on the
-/// same trees. Returns what each round decided: every tree's content and
-/// every collision (the tree, file, lines, lost and winning versions and
-/// cause), sorted, as the order of recording may differ. Not the commit a
-/// collision ref keeps: for a nested sandbox's change that differs by
-/// design (rule 7: under full lineage the nested landing commit is the
-/// change, under squashed the saves its graft names), while its lost
-/// versions do not.
-fn rounds(w: &mut World, seed: u64, tally: &mut Tally) -> Result<Vec<String>, (usize, String)> {
-    let mut k = Calls::new(seed);
-    k.o.reload(w);
-    let mut decided = Vec::new();
-    let m1 = Client::Main("m1".into());
-    for round in 0..ROUNDS {
-        for _ in 0..ROUND_CALLS {
-            let (f, slot) = (FILES[k.rng.below(FILES.len())], k.rng.below(HOT_SLOTS));
-            let e = |e| (round, e);
-            let fork = k.rng.pick(&live_clients(w)).map(Client::Fork);
-            match k.rng.below(16) {
-                0 => {
-                    let forks = live_clients(w);
-                    if forks.len() < 4 {
-                        let parent = match k.rng.pick(&forks) {
-                            Some(f) if k.rng.below(3) == 0 => Tree::Fork(f),
-                            _ => Tree::Main,
-                        };
-                        w.create_fork(parent);
-                        k.o.reload(w);
-                    }
-                }
-                1..=3 => {
-                    if let Some(p) = w.client_path(&m1, f) {
-                        k.save(w, &m1, &p, slot, tally).map_err(e)?;
-                    }
-                }
-                4..=6 => {
-                    if let Some(c) = fork
-                        && let Some(p) = w.client_path(&c, f)
-                    {
-                        k.save(w, &c, &p, slot, tally).map_err(e)?;
-                    }
-                }
-                7..=9 => {
-                    if let Some(c) = fork
-                        && let Some(p) = w.client_path(&c, f)
-                    {
-                        k.one_call(w, &c, &p, slot, tally).map_err(e)?;
-                    }
-                }
-                10 => {
-                    if let Some(p) = w.client_path(&m1, f) {
-                        k.one_call(w, &m1, &p, slot, tally).map_err(e)?;
-                    }
-                }
-                11 => {
-                    if let Some(f) = k.rng.pick(&live_clients(w)) {
-                        let _ = w.begin(f);
-                        k.o.reload(w);
-                    }
-                }
-                12 => {
-                    if let Some(f) = k.rng.pick(&in_txn(w)) {
-                        let _ = w.commit_txn(f);
-                        k.o.reload(w);
-                    }
-                }
-                13 if k.rng.below(4) == 0 => {
-                    // A sandbox's client dies: its transaction rolls back,
-                    // its opens close, and the sandbox ends.
-                    if let Some(c) = fork {
-                        end_checked(w, &mut k.o, &c).map_err(e)?;
-                    }
-                }
-                13 => {
-                    let c = fork.unwrap_or_else(|| m1.clone());
-                    if let Some(p) = w.client_path(&c, f) {
-                        k.reads
-                            .insert((format!("{c:?}"), f.to_string()), w.client_reads(&c, &p));
-                    }
-                }
-                _ => {
-                    let c = match fork {
-                        Some(c) if k.rng.below(2) == 0 => c,
-                        _ => m1.clone(),
-                    };
-                    if k.rng.below(2) == 0
-                        && let Some(p) = w.client_path(&c, f)
-                    {
-                        if k.rng.below(4) == 0 {
-                            k.create(w, &c, &p, slot, tally).map_err(e)?;
-                        } else {
-                            let unlink = k.rng.below(3) == 0;
-                            k.path_call(w, &c, f, &p, unlink, tally).map_err(e)?;
-                        }
-                    }
-                }
-            }
-        }
-        drain(w, &mut k.o, tally, round)?;
-        let mut lines: Vec<String> = w
-            .fingerprint()
-            .lines()
-            .filter(|l| !l.starts_with("refs/collisions/"))
-            .map(str::to_string)
-            .collect();
-        lines.sort();
-        decided.push(lines.join("\n"));
-    }
-    Ok(decided)
-}
-
-/// Rounds of [`rounds`].
-const ROUNDS: usize = 4;
-/// Client calls per round.
-const ROUND_CALLS: usize = 12;
-/// CI runs [`random_interleavings_history_settings_decide_the_same`] at
-/// seeds 1..=SETTINGS_SEEDS: each seed runs twice and drains four times,
-/// so 64 seeds would be the slowest test by far. `AGENTFS_MODEL_SEEDS`
-/// and `AGENTFS_MODEL_SEED` apply as to every random run.
-const SETTINGS_SEEDS: u64 = 16;
-
-/// Rule 7, "a squashed changeset is history only, never a unit judged
-/// whole": the same calls decide the same trees and the same collisions
-/// under full lineage and under squashed. A squash that took a save ahead
-/// of an entry queued before it would let the setting decide which of two
-/// colliding saves is the parent's (`r7_the_history_setting_decides_no_collision`).
-#[test]
-fn random_interleavings_history_settings_decide_the_same() {
-    let explicit = ["AGENTFS_MODEL_SEED", "AGENTFS_MODEL_SEEDS"]
-        .iter()
-        .any(|v| std::env::var(v).is_ok());
-    let seeds = if explicit {
-        seeds()
-    } else {
-        (1..=SETTINGS_SEEDS).collect()
-    };
-    let mut failures = Vec::new();
-    for &seed in &seeds {
+    let policies = Policies::default();
+    for seed in seeds().into_iter().take(8) {
         let mut tally = Tally::default();
-        let run = |history, tally: &mut Tally| {
-            let mut w = World::new(Policies::new(history));
-            let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                rounds(&mut w, seed, tally)
-            }));
-            match out {
-                Ok(Ok(d)) => Ok(d),
-                Ok(Err((round, e))) => Err(format!(
-                    "{history:?}, round {round}: {e}\nlog:\n  {}",
-                    w.log.join("\n  ")
-                )),
-                Err(_) => Err(format!(
-                    "{history:?}: harness panic\nlog:\n  {}",
-                    w.log.join("\n  ")
-                )),
-            }
-        };
-        let full = run(HistoryPolicy::FullLineage, &mut tally);
-        let squashed = run(HistoryPolicy::Squashed, &mut tally);
-        let e = match (full, squashed) {
-            (Ok(a), Ok(b)) => match a.iter().zip(&b).position(|(x, y)| x != y) {
-                None => continue,
-                Some(r) => format!(
-                    "round {r} decided differently:\nFullLineage:\n{}\nSquashed:\n{}",
-                    a[r], b[r]
-                ),
-            },
-            (Err(e), _) | (_, Err(e)) => e,
-        };
-        failures.push(format!(
-            "seed {seed}: {e}\nreplay: AGENTFS_MODEL_SEED={seed}"
-        ));
+        let pinned = run_seed(seed, policies, &mut tally);
+        // Each run must pass on its own first: a failure names commit
+        // hashes, which reversed dates change, so comparing two failures
+        // would report a broken invariant as a date mismatch.
+        let pinned = pinned.unwrap_or_else(|e| panic!("seed {seed}: {e}"));
+        let reversed = with_reversed_dates(|| run_seed(seed, policies, &mut tally))
+            .unwrap_or_else(|e| panic!("seed {seed}, dates reversed: {e}"));
+        assert_eq!(pinned, reversed, "seed {seed}");
     }
-    assert!(
-        failures.is_empty(),
-        "{} of {} seeds failed:\n\n{}",
-        failures.len(),
-        seeds.len(),
-        failures.join("\n\n")
-    );
 }
 
 /// Coherence finding 1: git's own merge base cannot tell a fork line the
@@ -1926,6 +1674,6 @@ fn random_interleavings_history_settings_decide_the_same() {
 fn random_interleavings_git_merge_base() {
     run_all(Policies {
         merge: MergeRule::GitMergeBase,
-        ..Policies::new(HistoryPolicy::FullLineage)
+        ..Policies::default()
     });
 }

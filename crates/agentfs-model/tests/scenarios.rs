@@ -7,15 +7,13 @@ use agentfs_model::check::{check, check_converged, step_checked};
 use agentfs_model::content::{BLANK, Content, Layout, Line, State};
 use agentfs_model::git::{git, with_reversed_dates};
 use agentfs_model::world::{
-    By, Client, Direction, HistoryPolicy, Life, LineEdit, MergeRule, ModelError, Overwritten,
-    Policies, Step, Tree, TxnOutcome, World, Write,
+    By, Client, Direction, Life, LineEdit, MergeRule, ModelError, Overwritten, Policies, Step,
+    Tree, TxnOutcome, World, Write,
 };
 use std::collections::BTreeSet;
 
-const BOTH: [HistoryPolicy; 2] = [HistoryPolicy::FullLineage, HistoryPolicy::Squashed];
-
-fn world(history: HistoryPolicy) -> World {
-    World::new(Policies::new(history))
+fn world() -> World {
+    World::new(Policies::default())
 }
 
 /// Every invariant, now.
@@ -65,20 +63,6 @@ fn show(w: &World, rev: &str, format: &str) -> String {
     git(w.repo(), &["log", "-1", &format!("--format={format}"), rev])
 }
 
-/// [`show`] on the commit as stored, without `Squashed`'s grafts.
-fn stored(w: &World, rev: &str, format: &str) -> String {
-    git(
-        w.repo(),
-        &[
-            "--no-replace-objects",
-            "log",
-            "-1",
-            &format!("--format={format}"),
-            rev,
-        ],
-    )
-}
-
 /// The writers of main's first-parent commits, newest first.
 fn main_writers(w: &World) -> Vec<String> {
     git(
@@ -102,29 +86,26 @@ fn main_writers(w: &World) -> Vec<String> {
 /// each writer reads its own write at once; forks sync both ways.
 #[test]
 fn r1_writes_never_wait_and_forks_sync_both_ways() {
-    for history in BOTH {
-        let mut w = world(history);
-        let f = w.create_fork(Tree::Main);
-        let mine = w.save(&Client::Fork(f), "a", 0);
-        let theirs = w.save(&m1(), "b", 0);
-        let both = w.save(&m1(), "a", 1);
-        ok(&mut w);
-        assert!(has(&w, Tree::Fork(f), "a", &mine) && has(&w, Tree::Main, "b", &theirs));
-        assert!(!has(&w, Tree::Main, "a", &mine), "landing is a queued step");
-        drain(&mut w);
-        assert!(has(&w, Tree::Main, "a", &mine) && has(&w, Tree::Main, "a", &both));
-        assert!(has(&w, Tree::Fork(f), "b", &theirs), "{history:?}");
-    }
+    let mut w = world();
+    let f = w.create_fork(Tree::Main);
+    let mine = w.save(&Client::Fork(f), "a", 0);
+    let theirs = w.save(&m1(), "b", 0);
+    let both = w.save(&m1(), "a", 1);
+    ok(&mut w);
+    assert!(has(&w, Tree::Fork(f), "a", &mine) && has(&w, Tree::Main, "b", &theirs));
+    assert!(!has(&w, Tree::Main, "a", &mine), "landing is a queued step");
+    drain(&mut w);
+    assert!(has(&w, Tree::Main, "a", &mine) && has(&w, Tree::Main, "a", &both));
+    assert!(has(&w, Tree::Fork(f), "b", &theirs));
 }
 
 // ── rule 2: one landing queue per tree; no clock ────────────────────────
 
 /// Rule 2: main's queue fixes the order its children's commits land in,
-/// whatever order the scheduler visits the forks. (Under `Squashed` a
-/// fork's waiting saves land together: `r7_squashed_saves_land_as_one_changeset`.)
+/// whatever order the scheduler visits the forks.
 #[test]
 fn r2_one_queue_fixes_the_landing_order() {
-    let mut w = world(HistoryPolicy::FullLineage);
+    let mut w = world();
     let (f, g) = (w.create_fork(Tree::Main), w.create_fork(Tree::Main));
     w.save(&Client::Fork(f), "a", 0);
     w.save(&Client::Fork(g), "b", 0);
@@ -150,7 +131,7 @@ fn r2_one_queue_fixes_the_landing_order() {
 #[test]
 fn r2_no_clock_commit_dates_decide_nothing() {
     let run = || {
-        let mut w = world(HistoryPolicy::FullLineage);
+        let mut w = world();
         let f = w.create_fork(Tree::Main);
         let g = w.create_fork(Tree::Fork(f));
         w.save(&Client::Fork(f), "a", 0);
@@ -188,37 +169,19 @@ fn r2_no_clock_commit_dates_decide_nothing() {
 
 // ── rule 3: the parent's queue decides; the parent's version wins ─────
 
-/// Rule 3: an edit whose base is main's current version replaces it.
-/// `FullLineage`: main's head becomes the fork's commit. `Squashed`: one
-/// single-parent commit with that commit's tree, named for the sandbox,
-/// whose graft names the fork's commit as carried.
+/// Rule 3: an edit whose base is main's current version replaces it: main's
+/// head becomes the fork's commit.
 #[test]
 fn r3_fast_forward_when_the_base_is_current() {
-    for history in BOTH {
-        let mut w = world(history);
-        let f = w.create_fork(Tree::Main);
-        let tok = w.save(&Client::Fork(f), "a", 0);
-        let fc = w.head(Tree::Fork(f));
-        next(&mut w, Tree::Main);
-        assert!(has(&w, Tree::Main, "a", &tok));
-        match history {
-            HistoryPolicy::FullLineage => {
-                assert_eq!(w.main_head, fc);
-                assert_eq!(w.fast_forwards, 1);
-            }
-            HistoryPolicy::Squashed => {
-                assert_eq!(show(&w, &w.main_head, "%T"), show(&w, &fc, "%T"));
-                assert_eq!(stored(&w, &w.main_head, "%P").split(' ').count(), 1);
-                assert_eq!(
-                    show(&w, &w.main_head, "%P").split(' ').nth(1),
-                    Some(fc.as_str()),
-                    "the graft names the carried commit"
-                );
-                assert_eq!(main_writers(&w)[0], "c1");
-            }
-        }
-        drain(&mut w);
-    }
+    let mut w = world();
+    let f = w.create_fork(Tree::Main);
+    let tok = w.save(&Client::Fork(f), "a", 0);
+    let fc = w.head(Tree::Fork(f));
+    next(&mut w, Tree::Main);
+    assert!(has(&w, Tree::Main, "a", &tok));
+    assert_eq!(w.main_head, fc);
+    assert_eq!(w.fast_forwards, 1);
+    drain(&mut w);
 }
 
 /// Rule 3, a sandbox's landing into main, the one place their collision is
@@ -230,42 +193,36 @@ fn r3_fast_forward_when_the_base_is_current() {
 /// main's decided version, so the fork takes m.
 #[test]
 fn r3_landing_collision_the_parent_wins() {
-    for history in BOTH {
-        let mut w = world(history);
-        let f = w.create_fork(Tree::Main);
-        let x = w.save(&Client::Fork(f), "a", 0);
-        let fc = w.head(Tree::Fork(f));
-        let m = w.save(&m1(), "a", 0);
-        let mc = w.main_head.clone();
-        next(&mut w, Tree::Main);
-        assert!(has(&w, Tree::Main, "a", &m) && !has(&w, Tree::Main, "a", &x));
-        let c = w.collisions.last().expect("a collision").clone();
-        assert_eq!(
-            (c.tree, c.direction, c.lost.clone(), c.won.clone()),
-            (
-                Tree::Main,
-                Direction::Landing,
-                vec![x.clone()],
-                vec![m.clone()]
-            )
-        );
-        assert_eq!(
-            (c.winner.as_str(), c.loser.as_str()),
-            (mc.as_str(), fc.as_str())
-        );
-        assert_eq!(git(w.repo(), &["rev-parse", &c.reference]), fc);
-        assert!(w.file(&c.reference, "a").contains(&x), "the loser is kept");
-        assert_eq!(
-            w.queue_len(Tree::Fork(f)),
-            2,
-            "{history:?}: two syncs queued"
-        );
-        next(&mut w, Tree::Fork(f)); // the sync queued when m was written
-        assert!(has(&w, Tree::Fork(f), "a", &m), "{history:?}: decided");
-        drain(&mut w);
-        assert!(has(&w, Tree::Fork(f), "a", &m) && has(&w, Tree::Main, "a", &m));
-        assert_eq!(w.collisions.len(), 1, "{history:?}: recorded once");
-    }
+    let mut w = world();
+    let f = w.create_fork(Tree::Main);
+    let x = w.save(&Client::Fork(f), "a", 0);
+    let fc = w.head(Tree::Fork(f));
+    let m = w.save(&m1(), "a", 0);
+    let mc = w.main_head.clone();
+    next(&mut w, Tree::Main);
+    assert!(has(&w, Tree::Main, "a", &m) && !has(&w, Tree::Main, "a", &x));
+    let c = w.collisions.last().expect("a collision").clone();
+    assert_eq!(
+        (c.tree, c.direction, c.lost.clone(), c.won.clone()),
+        (
+            Tree::Main,
+            Direction::Landing,
+            vec![x.clone()],
+            vec![m.clone()]
+        )
+    );
+    assert_eq!(
+        (c.winner.as_str(), c.loser.as_str()),
+        (mc.as_str(), fc.as_str())
+    );
+    assert_eq!(git(w.repo(), &["rev-parse", &c.reference]), fc);
+    assert!(w.file(&c.reference, "a").contains(&x), "the loser is kept");
+    assert_eq!(w.queue_len(Tree::Fork(f)), 2, "two syncs queued");
+    next(&mut w, Tree::Fork(f)); // the sync queued when m was written
+    assert!(has(&w, Tree::Fork(f), "a", &m), "decided");
+    drain(&mut w);
+    assert!(has(&w, Tree::Fork(f), "a", &m) && has(&w, Tree::Main, "a", &m));
+    assert_eq!(w.collisions.len(), 1, "recorded once");
 }
 
 /// Rule 3, no flip-flop (coherence finding 4, resolved): main's sync
@@ -276,33 +233,28 @@ fn r3_landing_collision_the_parent_wins() {
 /// run).
 #[test]
 fn r3_a_fork_never_flips_back_to_its_own_edit() {
-    for history in BOTH {
-        let mut w = world(history);
-        let f = w.create_fork(Tree::Main);
-        let x = w.save(&Client::Fork(f), "a", 0);
-        let m = w.save(&m1(), "a", 0);
-        next(&mut w, Tree::Fork(f)); // main's sync, before x lands
-        assert!(
-            has(&w, Tree::Fork(f), "a", &x),
-            "{history:?}: the fork decided"
-        );
-        assert!(w.collisions.is_empty(), "a sync records nothing");
-        let head = w.head(Tree::Fork(f));
-        assert_eq!(
-            show(&w, &head, "%(trailers:key=Agentfs-Cause,valueonly)"),
-            "Sync"
-        );
-        next(&mut w, Tree::Main); // main's queue decides
-        assert!(has(&w, Tree::Main, "a", &m) && !has(&w, Tree::Main, "a", &x));
-        drain(&mut w);
-        assert!(has(&w, Tree::Fork(f), "a", &m), "{history:?}");
-        let records: Vec<(Tree, Vec<String>)> = w
-            .collisions
-            .iter()
-            .map(|c| (c.tree, c.lost.clone()))
-            .collect();
-        assert_eq!(records, [(Tree::Main, vec![x.clone()])], "{history:?}");
-    }
+    let mut w = world();
+    let f = w.create_fork(Tree::Main);
+    let x = w.save(&Client::Fork(f), "a", 0);
+    let m = w.save(&m1(), "a", 0);
+    next(&mut w, Tree::Fork(f)); // main's sync, before x lands
+    assert!(has(&w, Tree::Fork(f), "a", &x), "the fork decided");
+    assert!(w.collisions.is_empty(), "a sync records nothing");
+    let head = w.head(Tree::Fork(f));
+    assert_eq!(
+        show(&w, &head, "%(trailers:key=Agentfs-Cause,valueonly)"),
+        "Sync"
+    );
+    next(&mut w, Tree::Main); // main's queue decides
+    assert!(has(&w, Tree::Main, "a", &m) && !has(&w, Tree::Main, "a", &x));
+    drain(&mut w);
+    assert!(has(&w, Tree::Fork(f), "a", &m));
+    let records: Vec<(Tree, Vec<String>)> = w
+        .collisions
+        .iter()
+        .map(|c| (c.tree, c.lost.clone()))
+        .collect();
+    assert_eq!(records, [(Tree::Main, vec![x.clone()])]);
 }
 
 /// Rule 3, an edit on a line the parent has not decided: the sandbox
@@ -313,20 +265,16 @@ fn r3_a_fork_never_flips_back_to_its_own_edit() {
 /// merged.
 #[test]
 fn r3_an_edit_over_an_undecided_line_still_collides() {
-    for history in BOTH {
-        let mut w = world(history);
-        let f = w.create_fork(Tree::Main);
-        let x = w.save(&Client::Fork(f), "a", 0);
-        let m = w.save(&m1(), "a", 0);
-        next(&mut w, Tree::Fork(f)); // a Sync merge that keeps x
-        let y = w.save(&Client::Fork(f), "a", 0); // over x, not m
-        drain(&mut w);
-        assert!(has(&w, Tree::Main, "a", &m), "{history:?}");
-        // Under `Squashed` x and y are one take, each save judged on its
-        // own (rule 3e), so each loses on its own there too.
-        let lost: Vec<String> = w.collisions.iter().flat_map(|c| c.lost.clone()).collect();
-        assert_eq!(lost, [x.clone(), y.clone()], "{history:?}");
-    }
+    let mut w = world();
+    let f = w.create_fork(Tree::Main);
+    let x = w.save(&Client::Fork(f), "a", 0);
+    let m = w.save(&m1(), "a", 0);
+    next(&mut w, Tree::Fork(f)); // a Sync merge that keeps x
+    let y = w.save(&Client::Fork(f), "a", 0); // over x, not m
+    drain(&mut w);
+    assert!(has(&w, Tree::Main, "a", &m));
+    let lost: Vec<String> = w.collisions.iter().flat_map(|c| c.lost.clone()).collect();
+    assert_eq!(lost, [x.clone(), y.clone()]);
 }
 
 /// Rule 3, an edit made on the parent's current version replaces it: the
@@ -349,34 +297,29 @@ fn r3_an_edit_over_the_decided_line_replaces_it() {
 /// in main by lineage, with no collision.
 #[test]
 fn r3_a_save_after_the_sync_wins_upstream_by_lineage() {
-    for history in BOTH {
-        let mut w = world(history);
-        let f = w.create_fork(Tree::Main);
-        w.save(&Client::Fork(f), "b", 0);
-        let m = w.save(&m1(), "a", 0);
-        next(&mut w, Tree::Fork(f)); // the sync lands in the sandbox
-        let synced = w.head(Tree::Fork(f));
-        assert_eq!(
-            show(&w, &synced, "%(trailers:key=Agentfs-Cause,valueonly)"),
-            "Sync",
-            "{history:?}: a sync commit, the sandbox has an unlanded line"
-        );
-        assert!(has(&w, Tree::Fork(f), "a", &m));
-        let y = w.save(&Client::Fork(f), "a", 0);
-        assert_eq!(
-            show(&w, &w.head(Tree::Fork(f)), "%P").split(' ').next(),
-            Some(synced.as_str())
-        );
-        drain(&mut w);
-        assert!(
-            has(&w, Tree::Main, "a", &y),
-            "{history:?}: the sandbox's later save wins"
-        );
-        assert!(
-            w.collisions.is_empty(),
-            "{history:?}: written over m, no collision"
-        );
-    }
+    let mut w = world();
+    let f = w.create_fork(Tree::Main);
+    w.save(&Client::Fork(f), "b", 0);
+    let m = w.save(&m1(), "a", 0);
+    next(&mut w, Tree::Fork(f)); // the sync lands in the sandbox
+    let synced = w.head(Tree::Fork(f));
+    assert_eq!(
+        show(&w, &synced, "%(trailers:key=Agentfs-Cause,valueonly)"),
+        "Sync",
+        "a sync commit, the sandbox has an unlanded line"
+    );
+    assert!(has(&w, Tree::Fork(f), "a", &m));
+    let y = w.save(&Client::Fork(f), "a", 0);
+    assert_eq!(
+        show(&w, &w.head(Tree::Fork(f)), "%P").split(' ').next(),
+        Some(synced.as_str())
+    );
+    drain(&mut w);
+    assert!(
+        has(&w, Tree::Main, "a", &y),
+        "the sandbox's later save wins"
+    );
+    assert!(w.collisions.is_empty(), "written over m, no collision");
 }
 
 /// Rule 3b, a save before the sync arrives: main writes m first, but the
@@ -388,37 +331,31 @@ fn r3_a_save_after_the_sync_wins_upstream_by_lineage() {
 /// remote, naming its writer.
 #[test]
 fn r3_a_save_before_the_sync_arrives_loses_to_the_parent() {
-    for history in BOTH {
-        let mut w = world(history);
-        let f = w.create_fork(Tree::Main);
-        let m = w.save(&m1(), "a", 0);
-        assert_eq!(w.queue_len(Tree::Fork(f)), 1, "main's sync waits");
-        let x = w.save(&Client::Fork(f), "a", 0);
-        let xc = w.head(Tree::Fork(f));
-        ok(&mut w);
-        assert!(
-            has(&w, Tree::Fork(f), "a", &x),
-            "the sandbox reads its own write"
-        );
-        drain(&mut w);
-        assert!(has(&w, Tree::Main, "a", &m) && has(&w, Tree::Fork(f), "a", &m));
-        let lost: Vec<(Tree, Vec<String>, Vec<String>)> = w
-            .collisions
-            .iter()
-            .map(|c| (c.tree, c.lost.clone(), c.won.clone()))
-            .collect();
-        assert_eq!(
-            lost,
-            [(Tree::Main, vec![x.clone()], vec![m.clone()])],
-            "{history:?}"
-        );
-        assert!(
-            !w.pending().contains(&Step::Replicate),
-            "{history:?}: drained, Replication included"
-        );
-        let pushed = git(w.remote(), &["rev-parse", &w.collisions[0].reference]);
-        assert_eq!(pushed, xc, "{history:?}: the loser is on the shared remote");
-    }
+    let mut w = world();
+    let f = w.create_fork(Tree::Main);
+    let m = w.save(&m1(), "a", 0);
+    assert_eq!(w.queue_len(Tree::Fork(f)), 1, "main's sync waits");
+    let x = w.save(&Client::Fork(f), "a", 0);
+    let xc = w.head(Tree::Fork(f));
+    ok(&mut w);
+    assert!(
+        has(&w, Tree::Fork(f), "a", &x),
+        "the sandbox reads its own write"
+    );
+    drain(&mut w);
+    assert!(has(&w, Tree::Main, "a", &m) && has(&w, Tree::Fork(f), "a", &m));
+    let lost: Vec<(Tree, Vec<String>, Vec<String>)> = w
+        .collisions
+        .iter()
+        .map(|c| (c.tree, c.lost.clone(), c.won.clone()))
+        .collect();
+    assert_eq!(lost, [(Tree::Main, vec![x.clone()], vec![m.clone()])],);
+    assert!(
+        !w.pending().contains(&Step::Replicate),
+        "drained, Replication included"
+    );
+    let pushed = git(w.remote(), &["rev-parse", &w.collisions[0].reference]);
+    assert_eq!(pushed, xc, "the loser is on the shared remote");
 }
 
 /// Rule 3, "a sync carries the parent's current version, never a stale
@@ -426,20 +363,18 @@ fn r3_a_save_before_the_sync_arrives_loses_to_the_parent() {
 /// sync brings m2 directly; the sandbox never shows m1.
 #[test]
 fn r3_a_sync_carries_the_parents_current_version() {
-    for history in BOTH {
-        let mut w = world(history);
-        let f = w.create_fork(Tree::Main);
-        w.save(&Client::Fork(f), "b", 0);
-        let m1_ = w.save(&m1(), "a", 0);
-        let m2 = w.save(&m1(), "a", 0);
-        assert_eq!(w.queue_len(Tree::Fork(f)), 2);
-        next(&mut w, Tree::Fork(f));
-        assert!(has(&w, Tree::Fork(f), "a", &m2) && !has(&w, Tree::Fork(f), "a", &m1_));
-        let head = w.head(Tree::Fork(f));
-        next(&mut w, Tree::Fork(f));
-        assert_eq!(w.head(Tree::Fork(f)), head, "{history:?}: nothing new");
-        drain(&mut w);
-    }
+    let mut w = world();
+    let f = w.create_fork(Tree::Main);
+    w.save(&Client::Fork(f), "b", 0);
+    let m1_ = w.save(&m1(), "a", 0);
+    let m2 = w.save(&m1(), "a", 0);
+    assert_eq!(w.queue_len(Tree::Fork(f)), 2);
+    next(&mut w, Tree::Fork(f));
+    assert!(has(&w, Tree::Fork(f), "a", &m2) && !has(&w, Tree::Fork(f), "a", &m1_));
+    let head = w.head(Tree::Fork(f));
+    next(&mut w, Tree::Fork(f));
+    assert_eq!(w.head(Tree::Fork(f)), head, "nothing new");
+    drain(&mut w);
 }
 
 /// Coherence finding 1: the same calls as
@@ -458,7 +393,7 @@ fn finding_1_git_merge_base_on_crossing_merges() {
 fn crossing(merge: MergeRule) -> (World, String) {
     let mut w = World::new(Policies {
         merge,
-        ..Policies::new(HistoryPolicy::FullLineage)
+        ..Policies::default()
     });
     let f = w.create_fork(Tree::Main);
     let x = w.save(&Client::Fork(f), "a", 0);
@@ -509,50 +444,47 @@ fn decided(w: &World) -> Vec<Decision> {
 /// then takes main's file, line 2 included, once.
 #[test]
 fn r3_a_save_loses_whole_with_its_clean_lines() {
-    for history in BOTH {
-        let mut w = world(history);
-        let f = w.create_fork(Tree::Main);
-        let t = distinct(&mut w, "a");
-        let v = save_lines(&mut w, &Client::Fork(f), "a", &[0, 2]);
-        let (x, y) = (v[0].clone(), v[1].clone());
-        let save = w.head(Tree::Fork(f));
-        let m = w.save(&m1(), "a", 0);
-        let k = w.save(&m1(), "a", 1);
-        drain(&mut w);
-        for tr in [Tree::Main, Tree::Fork(f)] {
-            assert_eq!(
-                ids(&w, tr, "a")[..3],
-                [m.clone(), k.clone(), t[2].clone()],
-                "{history:?} {tr:?}"
-            );
-        }
+    let mut w = world();
+    let f = w.create_fork(Tree::Main);
+    let t = distinct(&mut w, "a");
+    let v = save_lines(&mut w, &Client::Fork(f), "a", &[0, 2]);
+    let (x, y) = (v[0].clone(), v[1].clone());
+    let save = w.head(Tree::Fork(f));
+    let m = w.save(&m1(), "a", 0);
+    let k = w.save(&m1(), "a", 1);
+    drain(&mut w);
+    for tr in [Tree::Main, Tree::Fork(f)] {
         assert_eq!(
-            decided(&w),
-            [
-                (
-                    Tree::Main,
-                    By::Line,
-                    vec![x.clone()],
-                    vec![m.clone()],
-                    save.clone()
-                ),
-                (
-                    Tree::Main,
-                    By::Whole,
-                    vec![y.clone()],
-                    vec![m.clone()],
-                    save.clone()
-                ),
-            ],
-            "{history:?}"
+            ids(&w, tr, "a")[..3],
+            [m.clone(), k.clone(), t[2].clone()],
+            "{tr:?}"
         );
-        for c in &w.collisions {
-            assert_eq!(
-                git(w.remote(), &["rev-parse", &c.reference]),
-                save,
-                "{history:?}: pushed"
-            );
-        }
+    }
+    assert_eq!(
+        decided(&w),
+        [
+            (
+                Tree::Main,
+                By::Line,
+                vec![x.clone()],
+                vec![m.clone()],
+                save.clone()
+            ),
+            (
+                Tree::Main,
+                By::Whole,
+                vec![y.clone()],
+                vec![m.clone()],
+                save.clone()
+            ),
+        ],
+    );
+    for c in &w.collisions {
+        assert_eq!(
+            git(w.remote(), &["rev-parse", &c.reference]),
+            save,
+            "pushed"
+        );
     }
 }
 
@@ -560,34 +492,25 @@ fn r3_a_save_loses_whole_with_its_clean_lines() {
 /// that lost (lines 0 and 2), the sandbox saves line 2 again, over its own
 /// lost line (which was written over main's), and then b. Neither later
 /// save collides with anything of main's, so both land whole, the first
-/// replacing main's line 2 by lineage; under `Squashed` all three saves
-/// are one take, the first losing and the other two squashed.
+/// replacing main's line 2 by lineage.
 #[test]
 fn r3_a_later_save_after_a_losing_one_is_judged_on_its_own() {
-    for history in BOTH {
-        let mut w = world(history);
-        let f = w.create_fork(Tree::Main);
-        let c = Client::Fork(f);
-        let t = distinct(&mut w, "a");
-        let lost = save_lines(&mut w, &c, "a", &[0, 2]);
-        let z = w.save(&c, "a", 2);
-        let b = w.save(&c, "b", 0);
-        let m = w.save(&m1(), "a", 0);
-        drain(&mut w);
-        assert_eq!(
-            ids(&w, Tree::Main, "a")[..3],
-            [m.clone(), t[1].clone(), z.clone()],
-            "{history:?}"
-        );
-        assert!(has(&w, Tree::Main, "b", &b), "{history:?}");
-        let names: Vec<String> = w.collisions.iter().flat_map(|c| c.lost.clone()).collect();
-        assert_eq!(names, lost, "{history:?}: only the first save lost");
-        assert_eq!(
-            w.squashed_runs,
-            usize::from(history == HistoryPolicy::Squashed),
-            "{history:?}"
-        );
-    }
+    let mut w = world();
+    let f = w.create_fork(Tree::Main);
+    let c = Client::Fork(f);
+    let t = distinct(&mut w, "a");
+    let lost = save_lines(&mut w, &c, "a", &[0, 2]);
+    let z = w.save(&c, "a", 2);
+    let b = w.save(&c, "b", 0);
+    let m = w.save(&m1(), "a", 0);
+    drain(&mut w);
+    assert_eq!(
+        ids(&w, Tree::Main, "a")[..3],
+        [m.clone(), t[1].clone(), z.clone()],
+    );
+    assert!(has(&w, Tree::Main, "b", &b));
+    let names: Vec<String> = w.collisions.iter().flat_map(|c| c.lost.clone()).collect();
+    assert_eq!(names, lost, "only the first save lost");
 }
 
 /// Rule 3e for a transaction (owner, 2026-11-03: "some commits represent a
@@ -599,68 +522,59 @@ fn r3_a_later_save_after_a_losing_one_is_judged_on_its_own() {
 /// the sandbox or main.
 #[test]
 fn r3_a_transaction_loses_whole_and_is_told() {
-    for history in BOTH {
-        let mut w = world(history);
-        let f = w.create_fork(Tree::Main);
-        let c = Client::Fork(f);
-        w.begin(f).unwrap();
-        let s = w.save(&c, "a", 0);
-        let s2 = w.save(&c, "b", 0);
-        let staged = w.forks[&f].txn.as_ref().expect("open").head.clone();
-        let m = w.save(&m1(), "a", 0);
-        drain(&mut w);
-        assert_eq!(
-            w.commit_txn(f),
-            Ok(TxnOutcome::Lost {
-                lines: vec![
-                    Overwritten {
-                        path: "a".into(),
-                        line: "a0".into(),
-                        staged: s.clone(),
-                        kept: m.clone(),
-                    },
-                    Overwritten {
-                        path: "b".into(),
-                        line: "b0".into(),
-                        staged: s2.clone(),
-                        kept: m.clone(),
-                    }
-                ]
-            })
-        );
-        ok(&mut w);
-        assert_eq!(
-            decided(&w),
-            [
-                (
-                    Tree::Fork(f),
-                    By::Line,
-                    vec![s.clone()],
-                    vec![m.clone()],
-                    staged.clone()
-                ),
-                (
-                    Tree::Fork(f),
-                    By::Whole,
-                    vec![s2.clone()],
-                    vec![m.clone()],
-                    staged.clone()
-                ),
+    let mut w = world();
+    let f = w.create_fork(Tree::Main);
+    let c = Client::Fork(f);
+    w.begin(f).unwrap();
+    let s = w.save(&c, "a", 0);
+    let s2 = w.save(&c, "b", 0);
+    let staged = w.forks[&f].txn.as_ref().expect("open").head.clone();
+    let m = w.save(&m1(), "a", 0);
+    drain(&mut w);
+    assert_eq!(
+        w.commit_txn(f),
+        Ok(TxnOutcome::Lost {
+            lines: vec![
+                Overwritten {
+                    path: "a".into(),
+                    line: "a0".into(),
+                    staged: s.clone(),
+                    kept: m.clone(),
+                },
+                Overwritten {
+                    path: "b".into(),
+                    line: "b0".into(),
+                    staged: s2.clone(),
+                    kept: m.clone(),
+                }
             ]
-        );
-        drain(&mut w);
-        for t in [Tree::Main, Tree::Fork(f)] {
-            assert!(
-                has(&w, t, "a", &m) && !has(&w, t, "b", &s2),
-                "{history:?} {t:?}"
-            );
-        }
-        assert_eq!(
-            w.collisions.len(),
-            2,
-            "{history:?}: decided once, in the sandbox"
-        );
+        })
+    );
+    ok(&mut w);
+    assert_eq!(
+        decided(&w),
+        [
+            (
+                Tree::Fork(f),
+                By::Line,
+                vec![s.clone()],
+                vec![m.clone()],
+                staged.clone()
+            ),
+            (
+                Tree::Fork(f),
+                By::Whole,
+                vec![s2.clone()],
+                vec![m.clone()],
+                staged.clone()
+            ),
+        ]
+    );
+    drain(&mut w);
+    for t in [Tree::Main, Tree::Fork(f)] {
+        assert!(has(&w, t, "a", &m) && !has(&w, t, "b", &s2), "{t:?}");
     }
+    assert_eq!(w.collisions.len(), 2, "decided once, in the sandbox");
 }
 
 /// Rule 3e, a committed transaction at main's queue (the case of coherence
@@ -671,45 +585,42 @@ fn r3_a_transaction_loses_whole_and_is_told() {
 /// going back to main's, decided by that collision.
 #[test]
 fn r3_a_committed_transaction_loses_whole_at_main() {
-    for history in BOTH {
-        let mut w = world(history);
-        let f = w.create_fork(Tree::Main);
-        w.begin(f).unwrap();
-        let x = w.save(&Client::Fork(f), "a", 0);
-        let y = w.save(&Client::Fork(f), "a", 2);
-        assert_eq!(w.commit_txn(f), Ok(TxnOutcome::Committed));
-        let commit = w.head(Tree::Fork(f));
-        let m = w.save(&m1(), "a", 0);
-        let k = w.save(&m1(), "a", 1);
-        drain(&mut w);
-        for t in [Tree::Main, Tree::Fork(f)] {
-            assert_eq!(
-                ids(&w, t, "a")[..3],
-                [m.clone(), k.clone(), "a2".into()],
-                "{history:?} {t:?}"
-            );
-        }
+    let mut w = world();
+    let f = w.create_fork(Tree::Main);
+    w.begin(f).unwrap();
+    let x = w.save(&Client::Fork(f), "a", 0);
+    let y = w.save(&Client::Fork(f), "a", 2);
+    assert_eq!(w.commit_txn(f), Ok(TxnOutcome::Committed));
+    let commit = w.head(Tree::Fork(f));
+    let m = w.save(&m1(), "a", 0);
+    let k = w.save(&m1(), "a", 1);
+    drain(&mut w);
+    for t in [Tree::Main, Tree::Fork(f)] {
         assert_eq!(
-            decided(&w),
-            [
-                (
-                    Tree::Main,
-                    By::Line,
-                    vec![x],
-                    vec![m.clone()],
-                    commit.clone()
-                ),
-                (
-                    Tree::Main,
-                    By::Whole,
-                    vec![y],
-                    vec![m.clone()],
-                    commit.clone()
-                ),
-            ],
-            "{history:?}"
+            ids(&w, t, "a")[..3],
+            [m.clone(), k.clone(), "a2".into()],
+            "{t:?}"
         );
     }
+    assert_eq!(
+        decided(&w),
+        [
+            (
+                Tree::Main,
+                By::Line,
+                vec![x],
+                vec![m.clone()],
+                commit.clone()
+            ),
+            (
+                Tree::Main,
+                By::Whole,
+                vec![y],
+                vec![m.clone()],
+                commit.clone()
+            ),
+        ],
+    );
 }
 
 /// Rule 3e for a loss by a file rule (rule 11) inside a change of several
@@ -721,65 +632,54 @@ fn r3_a_committed_transaction_loses_whole_at_main() {
 /// unlink of a loses, so the whole transaction does, b included.
 #[test]
 fn r3_a_file_rule_loss_costs_the_whole_change() {
-    for history in BOTH {
-        for synced_first in [true, false] {
-            let mut w = world(history);
-            let f = w.create_fork(Tree::Main);
-            let c = Client::Fork(f);
-            w.begin(f).unwrap();
-            w.save(&c, "a", 0);
-            let sb = w.save(&c, "b", 0);
-            w.unlink(&m1(), "a");
-            if synced_first {
-                drain(&mut w);
-            }
-            let out = w.commit_txn(f).unwrap();
-            ok(&mut w);
-            assert_eq!(
-                matches!(out, TxnOutcome::Lost { .. }),
-                synced_first,
-                "{history:?}: {out:?}"
-            );
-            drain(&mut w);
-            for t in [Tree::Main, Tree::Fork(f)] {
-                assert!(!has(&w, t, "b", &sb), "{history:?} {t:?}: a partial change");
-                assert_eq!(w.path_of(t, "a"), None, "{history:?} {t:?}: main's unlink");
-            }
-            let lost: BTreeSet<&str> = w.collisions.iter().map(|c| c.path.as_str()).collect();
-            assert!(
-                lost.contains("b"),
-                "{history:?}: b's clean line is named lost"
-            );
-            let tree = if synced_first {
-                Tree::Fork(f)
-            } else {
-                Tree::Main
-            };
-            assert!(w.collisions.iter().all(|c| c.tree == tree), "{history:?}");
-        }
-        let mut w = world(history);
+    for synced_first in [true, false] {
+        let mut w = world();
         let f = w.create_fork(Tree::Main);
         let c = Client::Fork(f);
         w.begin(f).unwrap();
-        w.rename(&c, "c", "a");
+        w.save(&c, "a", 0);
         let sb = w.save(&c, "b", 0);
-        let m = w.save(&m1(), "a", 0);
-        drain(&mut w);
+        w.unlink(&m1(), "a");
+        if synced_first {
+            drain(&mut w);
+        }
         let out = w.commit_txn(f).unwrap();
         ok(&mut w);
-        assert!(
+        assert_eq!(
             matches!(out, TxnOutcome::Lost { .. }),
-            "{history:?}: {out:?}"
+            synced_first,
+            "{out:?}"
         );
         drain(&mut w);
         for t in [Tree::Main, Tree::Fork(f)] {
-            assert!(!has(&w, t, "b", &sb), "{history:?} {t:?}: a partial change");
-            assert!(
-                has(&w, t, "a", &m),
-                "{history:?} {t:?}: main's edit keeps a"
-            );
-            assert_eq!(w.path_of(t, "c").as_deref(), Some("c"), "{history:?} {t:?}");
+            assert!(!has(&w, t, "b", &sb), "{t:?}: a partial change");
+            assert_eq!(w.path_of(t, "a"), None, "{t:?}: main's unlink");
         }
+        let lost: BTreeSet<&str> = w.collisions.iter().map(|c| c.path.as_str()).collect();
+        assert!(lost.contains("b"), "b's clean line is named lost");
+        let tree = if synced_first {
+            Tree::Fork(f)
+        } else {
+            Tree::Main
+        };
+        assert!(w.collisions.iter().all(|c| c.tree == tree));
+    }
+    let mut w = world();
+    let f = w.create_fork(Tree::Main);
+    let c = Client::Fork(f);
+    w.begin(f).unwrap();
+    w.rename(&c, "c", "a");
+    let sb = w.save(&c, "b", 0);
+    let m = w.save(&m1(), "a", 0);
+    drain(&mut w);
+    let out = w.commit_txn(f).unwrap();
+    ok(&mut w);
+    assert!(matches!(out, TxnOutcome::Lost { .. }), "{out:?}");
+    drain(&mut w);
+    for t in [Tree::Main, Tree::Fork(f)] {
+        assert!(!has(&w, t, "b", &sb), "{t:?}: a partial change");
+        assert!(has(&w, t, "a", &m), "{t:?}: main's edit keeps a");
+        assert_eq!(w.path_of(t, "c").as_deref(), Some("c"), "{t:?}");
     }
 }
 
@@ -789,23 +689,20 @@ fn r3_a_file_rule_loss_costs_the_whole_change() {
 /// applies.
 #[test]
 fn r3_a_change_whose_delete_agrees_lands_whole() {
-    for history in BOTH {
-        let mut w = world(history);
-        let f = w.create_fork(Tree::Main);
-        let t = distinct(&mut w, "a");
-        let h = w.open_write(&Client::Fork(f), "a");
-        w.edit(h, LineEdit::Delete(1));
-        let y = w.edit(h, LineEdit::At(2)).expect("a new version");
-        w.close(h);
-        call(&mut w, &m1(), "a", LineEdit::Delete(1));
-        drain(&mut w);
-        assert!(w.collisions.is_empty(), "{history:?}: {:?}", w.collisions);
-        assert_eq!(
-            ids(&w, Tree::Main, "a")[..3],
-            [t[0].clone(), t[2].clone(), y],
-            "{history:?}"
-        );
-    }
+    let mut w = world();
+    let f = w.create_fork(Tree::Main);
+    let t = distinct(&mut w, "a");
+    let h = w.open_write(&Client::Fork(f), "a");
+    w.edit(h, LineEdit::Delete(1));
+    let y = w.edit(h, LineEdit::At(2)).expect("a new version");
+    w.close(h);
+    call(&mut w, &m1(), "a", LineEdit::Delete(1));
+    drain(&mut w);
+    assert!(w.collisions.is_empty(), "{:?}", w.collisions);
+    assert_eq!(
+        ids(&w, Tree::Main, "a")[..3],
+        [t[0].clone(), t[2].clone(), y],
+    );
 }
 
 /// Rule 3d with whole saves, in the sync direction: two sandbox saves (line
@@ -815,7 +712,7 @@ fn r3_a_change_whose_delete_agrees_lands_whole() {
 /// save, and the second, its own change, lands.
 #[test]
 fn r3_a_sync_keeps_the_undecided_saves() {
-    let mut w = world(HistoryPolicy::FullLineage);
+    let mut w = world();
     let f = w.create_fork(Tree::Main);
     let x = w.save(&Client::Fork(f), "a", 0);
     let y = w.save(&Client::Fork(f), "a", 2);
@@ -853,7 +750,6 @@ fn neighbours(merge: MergeRule) -> (World, [String; 2]) {
     let mut w = World::new(Policies {
         merge,
         layout: Layout::Adjacent,
-        ..Policies::default()
     });
     let f = w.create_fork(Tree::Main);
     let k = w.save(&Client::Fork(f), "a", 1);
@@ -870,45 +766,24 @@ fn neighbours(merge: MergeRule) -> (World, [String; 2]) {
 /// F. Sibling H holds m throughout.
 #[test]
 fn r3_a_collision_is_recorded_once_at_the_parents_queue() {
-    for history in BOTH {
-        let mut w = world(history);
-        let (f, h) = (w.create_fork(Tree::Main), w.create_fork(Tree::Main));
-        let g = w.create_fork(Tree::Fork(f));
-        let gl = w.save(&Client::Fork(g), "a", 0);
-        let m = w.save(&m1(), "a", 0);
-        next(&mut w, Tree::Fork(f)); // G's g lands in F: F has nothing there
-        assert!(has(&w, Tree::Fork(f), "a", &gl));
-        drain(&mut w);
-        for t in [Tree::Main, Tree::Fork(f), Tree::Fork(g), Tree::Fork(h)] {
-            assert!(has(&w, t, "a", &m), "{history:?} {t:?}");
-        }
-        let records: Vec<Tree> = w
-            .collisions
-            .iter()
-            .filter(|c| c.lost.contains(&gl))
-            .map(|c| c.tree)
-            .collect();
-        assert_eq!(records, [Tree::Main], "{history:?}");
-    }
-}
-
-/// Rule 7, `Squashed`: the fork's x lands as main's own single-parent
-/// commit; the fork writes y over x; main's version, x, syncs back. The
-/// graft beside main's history names the fork commit that carried x, so
-/// git sees y's writer saw x, and y stays. (Without the graft, x reverted
-/// y in the fork: coherence finding 2, resolved.)
-#[test]
-fn r7_squashed_sync_never_undoes_the_forks_newer_line() {
-    let mut w = world(HistoryPolicy::Squashed);
-    let f = w.create_fork(Tree::Main);
-    w.save(&Client::Fork(f), "a", 0);
-    next(&mut w, Tree::Main); // the fork's x lands
-    let y = w.save(&Client::Fork(f), "a", 0); // y over x
-    next(&mut w, Tree::Fork(f)); // main's version, x, syncs back
-    assert!(has(&w, Tree::Fork(f), "a", &y));
+    let mut w = world();
+    let (f, h) = (w.create_fork(Tree::Main), w.create_fork(Tree::Main));
+    let g = w.create_fork(Tree::Fork(f));
+    let gl = w.save(&Client::Fork(g), "a", 0);
+    let m = w.save(&m1(), "a", 0);
+    next(&mut w, Tree::Fork(f)); // G's g lands in F: F has nothing there
+    assert!(has(&w, Tree::Fork(f), "a", &gl));
     drain(&mut w);
-    assert!(has(&w, Tree::Main, "a", &y));
-    assert!(w.collisions.is_empty());
+    for t in [Tree::Main, Tree::Fork(f), Tree::Fork(g), Tree::Fork(h)] {
+        assert!(has(&w, t, "a", &m), "{t:?}");
+    }
+    let records: Vec<Tree> = w
+        .collisions
+        .iter()
+        .filter(|c| c.lost.contains(&gl))
+        .map(|c| c.tree)
+        .collect();
+    assert_eq!(records, [Tree::Main]);
 }
 
 // ── rule 4: nothing waits; nested forks ─────────────────────────────────
@@ -917,7 +792,7 @@ fn r7_squashed_sync_never_undoes_the_forks_newer_line() {
 /// step takes its queue's head; the queues drain.
 #[test]
 fn r4_nothing_waits_behind_a_collision() {
-    let mut w = world(HistoryPolicy::FullLineage);
+    let mut w = world();
     let f = w.create_fork(Tree::Main);
     w.save(&Client::Fork(f), "a", 0);
     let later = w.save(&Client::Fork(f), "b", 0);
@@ -937,50 +812,48 @@ fn r4_nothing_waits_behind_a_collision() {
 /// a clean change of G's reaches main named for G. Everything converges.
 #[test]
 fn r4_nested_forks_follow_the_same_rules() {
-    for history in BOTH {
-        let mut w = world(history);
-        let f = w.create_fork(Tree::Main);
-        let g = w.create_fork(Tree::Fork(f));
-        let (cf, cg) = (Client::Fork(f), Client::Fork(g));
-        let ga = w.save(&cg, "a", 0);
-        let fa = w.save(&cf, "a", 0);
-        next(&mut w, Tree::Fork(f)); // G's a lands in F: F's line wins.
-        assert!(has(&w, Tree::Fork(f), "a", &fa) && !has(&w, Tree::Fork(f), "a", &ga));
-        assert!(w.collisions.iter().any(|c| c.tree == Tree::Fork(f)
-            && c.direction == Direction::Landing
-            && c.lost == [ga.clone()]));
-        let gb = w.save(&cg, "b", 0);
-        let mb = w.save(&m1(), "b", 0);
-        let gc = w.save(&cg, "c", 0);
-        drain(&mut w);
-        assert!(has(&w, Tree::Main, "b", &mb) && !has(&w, Tree::Main, "b", &gb));
-        assert!(has(&w, Tree::Main, "c", &gc) && has(&w, Tree::Main, "a", &fa));
-        for t in [Tree::Fork(f), Tree::Fork(g)] {
-            assert!(has(&w, t, "b", &mb) && has(&w, t, "a", &fa), "{t:?}");
-        }
-        assert!(
-            w.collisions
-                .iter()
-                .any(|c| c.tree == Tree::Main && c.lost == [gb.clone()])
-        );
-        let c_commit = git(
-            w.repo(),
-            &[
-                "log",
-                "--format=%H",
-                "-S",
-                &gc,
-                "--first-parent",
-                &w.main_head,
-            ],
-        );
-        let c_commit = c_commit.lines().last().expect("a main commit adds G's c");
-        assert_eq!(w.writer_of_commit(c_commit), "c2", "{history:?}");
-        w.end_client(g);
-        w.end_client(f);
-        drain(&mut w);
-        assert_eq!(w.forks[&f].life, Life::Dropped);
+    let mut w = world();
+    let f = w.create_fork(Tree::Main);
+    let g = w.create_fork(Tree::Fork(f));
+    let (cf, cg) = (Client::Fork(f), Client::Fork(g));
+    let ga = w.save(&cg, "a", 0);
+    let fa = w.save(&cf, "a", 0);
+    next(&mut w, Tree::Fork(f)); // G's a lands in F: F's line wins.
+    assert!(has(&w, Tree::Fork(f), "a", &fa) && !has(&w, Tree::Fork(f), "a", &ga));
+    assert!(w.collisions.iter().any(|c| c.tree == Tree::Fork(f)
+        && c.direction == Direction::Landing
+        && c.lost == [ga.clone()]));
+    let gb = w.save(&cg, "b", 0);
+    let mb = w.save(&m1(), "b", 0);
+    let gc = w.save(&cg, "c", 0);
+    drain(&mut w);
+    assert!(has(&w, Tree::Main, "b", &mb) && !has(&w, Tree::Main, "b", &gb));
+    assert!(has(&w, Tree::Main, "c", &gc) && has(&w, Tree::Main, "a", &fa));
+    for t in [Tree::Fork(f), Tree::Fork(g)] {
+        assert!(has(&w, t, "b", &mb) && has(&w, t, "a", &fa), "{t:?}");
     }
+    assert!(
+        w.collisions
+            .iter()
+            .any(|c| c.tree == Tree::Main && c.lost == [gb.clone()])
+    );
+    let c_commit = git(
+        w.repo(),
+        &[
+            "log",
+            "--format=%H",
+            "-S",
+            &gc,
+            "--first-parent",
+            &w.main_head,
+        ],
+    );
+    let c_commit = c_commit.lines().last().expect("a main commit adds G's c");
+    assert_eq!(w.writer_of_commit(c_commit), "c2");
+    w.end_client(g);
+    w.end_client(f);
+    drain(&mut w);
+    assert_eq!(w.forks[&f].life, Life::Dropped);
 }
 
 // ── rule 5: transactions ────────────────────────────────────────────────
@@ -990,38 +863,32 @@ fn r4_nested_forks_follow_the_same_rules() {
 /// in main as ONE commit named for the client.
 #[test]
 fn r5_transaction_commits_clean() {
-    for history in BOTH {
-        let mut w = world(history);
-        let f = w.create_fork(Tree::Main);
-        let c = Client::Fork(f);
-        w.begin(f).unwrap();
-        assert_eq!(w.begin(f), Err(ModelError::InTransaction));
-        let sa = w.save(&c, "a", 0);
-        let sb = w.save(&c, "b", 0);
-        let m = w.save(&m1(), "c", 0);
-        drain(&mut w);
-        assert!(w.client_reads(&c, "a").contains(&sa));
-        assert!(
-            !has(&w, Tree::Fork(f), "a", &sa),
-            "the fork's tree lacks it"
-        );
-        assert!(has(&w, Tree::Fork(f), "c", &m), "the fork got the sync");
-        assert!(
-            !w.client_reads(&c, "c").contains(&m),
-            "the snapshot is frozen"
-        );
-        let before = main_writers(&w).len();
-        assert_eq!(w.commit_txn(f), Ok(TxnOutcome::Committed));
-        assert!(w.client_reads(&c, "c").contains(&m));
-        drain(&mut w);
-        assert!(has(&w, Tree::Main, "a", &sa) && has(&w, Tree::Main, "b", &sb));
-        assert_eq!(
-            main_writers(&w).len(),
-            before + 1,
-            "{history:?}: one commit"
-        );
-        assert_eq!(main_writers(&w)[0], "c1");
-    }
+    let mut w = world();
+    let f = w.create_fork(Tree::Main);
+    let c = Client::Fork(f);
+    w.begin(f).unwrap();
+    assert_eq!(w.begin(f), Err(ModelError::InTransaction));
+    let sa = w.save(&c, "a", 0);
+    let sb = w.save(&c, "b", 0);
+    let m = w.save(&m1(), "c", 0);
+    drain(&mut w);
+    assert!(w.client_reads(&c, "a").contains(&sa));
+    assert!(
+        !has(&w, Tree::Fork(f), "a", &sa),
+        "the fork's tree lacks it"
+    );
+    assert!(has(&w, Tree::Fork(f), "c", &m), "the fork got the sync");
+    assert!(
+        !w.client_reads(&c, "c").contains(&m),
+        "the snapshot is frozen"
+    );
+    let before = main_writers(&w).len();
+    assert_eq!(w.commit_txn(f), Ok(TxnOutcome::Committed));
+    assert!(w.client_reads(&c, "c").contains(&m));
+    drain(&mut w);
+    assert!(has(&w, Tree::Main, "a", &sa) && has(&w, Tree::Main, "b", &sb));
+    assert_eq!(main_writers(&w).len(), before + 1, "one commit");
+    assert_eq!(main_writers(&w)[0], "c1");
 }
 
 /// Rule 5, no race: the same calls as
@@ -1033,49 +900,45 @@ fn r5_transaction_commits_clean() {
 /// commit or at main's queue.
 #[test]
 fn r5_sync_before_or_after_the_commit_ends_the_same() {
-    for history in BOTH {
-        let run = |sync_first: bool| {
-            let mut w = world(history);
-            let f = w.create_fork(Tree::Main);
-            w.begin(f).unwrap();
-            w.save(&Client::Fork(f), "a", 0);
-            w.save(&Client::Fork(f), "b", 0);
-            w.save(&m1(), "a", 0);
-            if sync_first {
-                drain(&mut w);
-            }
-            let outcome = w.commit_txn(f).expect("committed");
-            assert_eq!(matches!(outcome, TxnOutcome::Lost { .. }), sync_first);
+    let run = |sync_first: bool| {
+        let mut w = world();
+        let f = w.create_fork(Tree::Main);
+        w.begin(f).unwrap();
+        w.save(&Client::Fork(f), "a", 0);
+        w.save(&Client::Fork(f), "b", 0);
+        w.save(&m1(), "a", 0);
+        if sync_first {
             drain(&mut w);
-            ["a", "b"].map(|p| w.read(Tree::Main, p))
-        };
-        assert_eq!(run(true), run(false), "{history:?}");
-    }
+        }
+        let outcome = w.commit_txn(f).expect("committed");
+        assert_eq!(matches!(outcome, TxnOutcome::Lost { .. }), sync_first);
+        drain(&mut w);
+        ["a", "b"].map(|p| w.read(Tree::Main, p))
+    };
+    assert_eq!(run(true), run(false));
 }
 
 /// Rule 5, rollback and client death: the branch is dropped, nothing of it
 /// shows anywhere; the fork's own commits from before still land.
 #[test]
 fn r5_transaction_rollback_and_client_death_leave_nothing() {
-    for history in BOTH {
-        let mut w = world(history);
-        let f = w.create_fork(Tree::Main);
-        let c = Client::Fork(f);
-        let kept = w.save(&c, "c", 0);
-        w.begin(f).unwrap();
-        let gone = w.save(&c, "a", 0);
-        w.rollback(f).unwrap();
-        ok(&mut w);
-        assert!(!w.client_reads(&c, "a").contains(&gone));
-        w.begin(f).unwrap();
-        let died = w.save(&c, "b", 0);
-        w.end_client(f);
-        ok(&mut w);
-        drain(&mut w);
-        assert!(w.discarded.contains(&gone) && w.discarded.contains(&died));
-        assert!(has(&w, Tree::Main, "c", &kept));
-        assert_eq!(w.forks[&f].life, Life::Dropped);
-    }
+    let mut w = world();
+    let f = w.create_fork(Tree::Main);
+    let c = Client::Fork(f);
+    let kept = w.save(&c, "c", 0);
+    w.begin(f).unwrap();
+    let gone = w.save(&c, "a", 0);
+    w.rollback(f).unwrap();
+    ok(&mut w);
+    assert!(!w.client_reads(&c, "a").contains(&gone));
+    w.begin(f).unwrap();
+    let died = w.save(&c, "b", 0);
+    w.end_client(f);
+    ok(&mut w);
+    drain(&mut w);
+    assert!(w.discarded.contains(&gone) && w.discarded.contains(&died));
+    assert!(has(&w, Tree::Main, "c", &kept));
+    assert_eq!(w.forks[&f].life, Life::Dropped);
 }
 
 /// Rule 5 then rule 3: a committed transaction lands like any change. A
@@ -1086,23 +949,18 @@ fn r5_transaction_rollback_and_client_death_leave_nothing() {
 /// once.
 #[test]
 fn r5_a_committed_transaction_then_lands_like_any_change() {
-    for history in BOTH {
-        let mut w = world(history);
-        let f = w.create_fork(Tree::Main);
-        w.begin(f).unwrap();
-        let sa = w.save(&Client::Fork(f), "a", 0);
-        let sb = w.save(&Client::Fork(f), "b", 0);
-        let m = w.save(&m1(), "a", 0); // queued into F, not yet synced
-        assert_eq!(w.commit_txn(f), Ok(TxnOutcome::Committed));
-        next(&mut w, Tree::Fork(f));
-        assert!(has(&w, Tree::Fork(f), "a", &sa) && has(&w, Tree::Fork(f), "b", &sb));
-        drain(&mut w);
-        for t in [Tree::Main, Tree::Fork(f)] {
-            assert!(
-                has(&w, t, "a", &m) && !has(&w, t, "b", &sb),
-                "{history:?} {t:?}"
-            );
-        }
+    let mut w = world();
+    let f = w.create_fork(Tree::Main);
+    w.begin(f).unwrap();
+    let sa = w.save(&Client::Fork(f), "a", 0);
+    let sb = w.save(&Client::Fork(f), "b", 0);
+    let m = w.save(&m1(), "a", 0); // queued into F, not yet synced
+    assert_eq!(w.commit_txn(f), Ok(TxnOutcome::Committed));
+    next(&mut w, Tree::Fork(f));
+    assert!(has(&w, Tree::Fork(f), "a", &sa) && has(&w, Tree::Fork(f), "b", &sb));
+    drain(&mut w);
+    for t in [Tree::Main, Tree::Fork(f)] {
+        assert!(has(&w, t, "a", &m) && !has(&w, t, "b", &sb), "{t:?}");
     }
 }
 
@@ -1114,7 +972,7 @@ fn r5_a_committed_transaction_then_lands_like_any_change() {
 /// writer's edits; a merge adds only what a non-first parent holds).
 #[test]
 fn r6_a_sync_is_a_merge_with_the_parent_second() {
-    let mut w = world(HistoryPolicy::Squashed);
+    let mut w = world();
     let f = w.create_fork(Tree::Main);
     w.save(&Client::Fork(f), "a", 0);
     w.save(&m1(), "b", 0);
@@ -1130,258 +988,114 @@ fn r6_a_sync_is_a_merge_with_the_parent_second() {
     drain(&mut w);
 }
 
-// ── rule 7: the history setting ─────────────────────────────────────────
+// ── rule 7: full lineage ────────────────────────────────────────────────
 
-/// Rule 7: `FullLineage` main's history reaches the fork's commits, the
-/// losing one included; `Squashed` holds only main's own, and a losing save
-/// is in no graft (rule 3e: only winners are squashed). Either way the
-/// fork's losing version stays reachable under the collision's ref after
-/// the fork is dropped.
+/// Rule 7: main's history reaches the fork's commits, the losing one
+/// included, and the fork's losing version stays reachable under the
+/// collision's ref after the fork is dropped.
 #[test]
-fn r7_history_setting_and_losers_stay_reachable() {
-    for history in BOTH {
-        let mut w = world(history);
-        let f = w.create_fork(Tree::Main);
-        let x = w.save(&Client::Fork(f), "a", 0);
-        let fc = w.head(Tree::Fork(f));
-        w.save(&m1(), "a", 0);
-        w.end_client(f);
-        drain(&mut w);
-        assert_eq!(w.forks[&f].life, Life::Dropped);
-        assert_eq!(
-            w.in_history(&fc, &w.main_head),
-            history == HistoryPolicy::FullLineage
-        );
-        assert_eq!(
-            w.is_ancestor(&fc, &w.main_head),
-            history == HistoryPolicy::FullLineage,
-            "{history:?}: lineage"
-        );
-        let c = w
-            .collisions
-            .iter()
-            .find(|c| c.lost == [x.clone()])
-            .expect("x lost");
-        let at = git(w.repo(), &["rev-parse", &c.reference]);
-        assert!(w.file(&at, "a").contains(&x), "{history:?}");
-    }
-}
-
-/// Rule 7, the squash: under `Squashed` a sandbox's plain saves waiting in
-/// main's queue when it takes the first land as ONE changeset ("the
-/// sandbox commits could be squashed to one changeset (if they are the
-/// naive simple commits)"); a transaction's commit lands as its own unit
-/// ("it might be best to leave the transaction commits as they are"), and
-/// so does each later save. Every sandbox commit stays stored ("every
-/// sandbox commit stays stored ... that makes sense"), in main's lineage
-/// through the graft, not in main's pushed history. Under `FullLineage`
-/// each commit lands on its own, in main's history.
-#[test]
-fn r7_squashed_saves_land_as_one_changeset() {
-    for history in BOTH {
-        let mut w = world(history);
-        let f = w.create_fork(Tree::Main);
-        let c = Client::Fork(f);
-        let saves: Vec<String> = ["a", "b", "c"]
-            .iter()
-            .map(|p| {
-                w.save(&c, p, 0);
-                w.head(Tree::Fork(f))
-            })
-            .collect();
-        w.begin(f).unwrap();
-        w.save(&c, "d", 0);
-        w.commit_txn(f).unwrap();
-        w.save(&c, "a", 1);
-        assert_eq!(w.queue_len(Tree::Main), 5);
-        let before = main_writers(&w).len();
-        next(&mut w, Tree::Main);
-        let squashed = history == HistoryPolicy::Squashed;
-        assert_eq!(w.queue_len(Tree::Main), if squashed { 2 } else { 4 });
-        assert_eq!(main_writers(&w).len(), before + 1);
-        let landed = ["a", "b", "c"].map(|p| w.read(Tree::Main, p).at(0) != format!("{p}0"));
-        assert_eq!(landed, [true, squashed, squashed], "{history:?}");
-        drain(&mut w);
-        assert_eq!(
-            main_writers(&w).len(),
-            before + if squashed { 3 } else { 5 },
-            "{history:?}"
-        );
-        for s in &saves {
-            assert!(w.is_ancestor(s, &w.main_head), "{history:?}: lineage");
-            assert_eq!(w.in_history(s, &w.main_head), !squashed, "{history:?}");
-        }
-        assert_eq!(w.squashed_runs, usize::from(squashed));
-    }
-}
-
-/// Rule 7, a squashed changeset is history only: the history setting
-/// decides no collision. Sandbox F saves b, sibling G saves a's line 0,
-/// then F saves a's line 0 too, without seeing G's. Main's queue holds F,
-/// G, F: a squash of F's two saves would take F's second ahead of G's and
-/// let F's line win. It takes only the saves directly behind its first,
-/// so under both settings G's line lands first and F's later save loses.
-#[test]
-fn r7_the_history_setting_decides_no_collision() {
-    for history in BOTH {
-        let mut w = world(history);
-        let f = w.create_fork(Tree::Main);
-        let g = w.create_fork(Tree::Main);
-        let fb = w.save(&Client::Fork(f), "b", 0);
-        let ga = w.save(&Client::Fork(g), "a", 0);
-        let fa = w.save(&Client::Fork(f), "a", 0);
-        next(&mut w, Tree::Main);
-        assert_eq!(
-            w.queue_len(Tree::Main),
-            2,
-            "{history:?}: F's first save alone"
-        );
-        drain(&mut w);
-        for t in [Tree::Main, Tree::Fork(f), Tree::Fork(g)] {
-            assert!(
-                has(&w, t, "a", &ga) && has(&w, t, "b", &fb),
-                "{history:?} {t:?}"
-            );
-        }
-        let lost: Vec<String> = w.collisions.iter().flat_map(|c| c.lost.clone()).collect();
-        assert_eq!(lost, [fa], "{history:?}");
-    }
-}
-
-/// Rule 7 with rule 3e (owner, 2026-11-03, asked "does the squashing
-/// happen after the merge decisions are made — so only the winning changes
-/// get squashed? What happens to the losing files?"): under `Squashed` a
-/// take of four waiting saves judges each on its own first. The second and
-/// the last write over a line main changed concurrently and lose; the
-/// first and third win and only they are the squashed commit: its graft
-/// names exactly them, it sets only their lines. The losers are squashed
-/// into nothing: each stays its own commit on the sandbox's branch, named
-/// by a collision ref that Replication pushes. The last loser is in no
-/// lineage of main's at all; the second is reached only through the third
-/// save, its child on the sandbox's branch.
-#[test]
-fn r7_a_squashed_take_squashes_only_the_winners() {
-    let mut w = world(HistoryPolicy::Squashed);
+fn r7_main_reaches_a_losing_commit_and_its_ref_keeps_it() {
+    let mut w = world();
     let f = w.create_fork(Tree::Main);
-    let c = Client::Fork(f);
-    let m = w.save(&m1(), "a", 0);
-    let before = w.main_head.clone();
-    let mut saves = Vec::new();
-    let mut lines = Vec::new();
-    for (p, slot) in [("b", 0), ("a", 0), ("c", 0), ("a", 0)] {
-        lines.push(w.save(&c, p, slot));
-        saves.push(w.head(Tree::Fork(f)));
-    }
-    assert_eq!(w.queue_len(Tree::Main), 4);
-    next(&mut w, Tree::Main);
-    assert_eq!(w.queue_len(Tree::Main), 0, "one take");
-    let squash = w.main_head.clone();
-    assert_eq!(stored(&w, &squash, "%P"), before);
-    assert_eq!(
-        show(&w, &squash, "%P"),
-        format!("{before} {} {}", saves[0], saves[2]),
-        "the graft names the winners only"
-    );
-    assert_eq!(
-        ids(&w, Tree::Main, "a")[0],
-        m,
-        "main's line won against both losers"
-    );
-    assert!(has(&w, Tree::Main, "b", &lines[0]) && has(&w, Tree::Main, "c", &lines[2]));
-    let losers: Vec<(String, Vec<String>)> = w
+    let x = w.save(&Client::Fork(f), "a", 0);
+    let fc = w.head(Tree::Fork(f));
+    w.save(&m1(), "a", 0);
+    w.end_client(f);
+    drain(&mut w);
+    assert_eq!(w.forks[&f].life, Life::Dropped);
+    assert!(w.is_ancestor(&fc, &w.main_head));
+    let c = w
         .collisions
         .iter()
-        .map(|c| (c.loser.clone(), c.lost.clone()))
+        .find(|c| c.lost == [x.clone()])
+        .expect("x lost");
+    let at = git(w.repo(), &["rev-parse", &c.reference]);
+    assert!(w.file(&at, "a").contains(&x));
+}
+
+/// Rule 7 (the owner, 2026-11-05: "drop squashing"): each commit of a
+/// sandbox, a transaction's included, lands on its own and is in main's
+/// history; every sandbox commit stays stored.
+#[test]
+fn r7_every_sandbox_commit_lands_on_its_own_in_mains_history() {
+    let mut w = world();
+    let f = w.create_fork(Tree::Main);
+    let c = Client::Fork(f);
+    let mut commits: Vec<String> = ["a", "b", "c"]
+        .iter()
+        .map(|p| {
+            w.save(&c, p, 0);
+            w.head(Tree::Fork(f))
+        })
         .collect();
-    assert_eq!(
-        losers,
-        [
-            (saves[1].clone(), vec![lines[1].clone()]),
-            (saves[3].clone(), vec![lines[3].clone()])
-        ]
-    );
-    assert!(
-        !w.is_ancestor(&saves[3], &w.main_head),
-        "the last loser: no lineage"
-    );
-    assert!(
-        w.is_ancestor(&saves[1], &saves[2]),
-        "the second: behind the third"
-    );
+    w.begin(f).unwrap();
+    w.save(&c, "d", 0);
+    w.commit_txn(f).unwrap();
+    commits.push(w.head(Tree::Fork(f)));
+    w.save(&c, "a", 1);
+    commits.push(w.head(Tree::Fork(f)));
+    assert_eq!(w.queue_len(Tree::Main), 5);
+    let before = main_writers(&w).len();
+    next(&mut w, Tree::Main);
+    assert_eq!(w.queue_len(Tree::Main), 4, "one commit, one take");
+    assert_eq!(main_writers(&w).len(), before + 1);
+    let landed = ["a", "b", "c"].map(|p| w.read(Tree::Main, p).at(0) != format!("{p}0"));
+    assert_eq!(landed, [true, false, false]);
     drain(&mut w);
-    for c in &w.collisions {
-        let pushed = git(w.remote(), &["rev-parse", &c.reference]);
-        assert_eq!(pushed, c.loser, "the loser is on the shared remote");
-        assert!(w.file(&pushed, "a").contains(&c.lost[0]));
+    assert_eq!(main_writers(&w).len(), before + 5);
+    for s in &commits {
+        assert!(w.is_ancestor(s, &w.main_head));
     }
-    assert!(
-        has(&w, Tree::Fork(f), "a", &m),
-        "the sandbox took main's line"
-    );
 }
 
 /// Rule 3e at every level: G over F over main. G's save of lines 0 and 2
 /// of a loses whole in F, to F's own concurrent line 0, its line 2 too.
 /// G's next save of lines 0 and 2 of b wins in F and travels up in F's
 /// landing commit, which loses whole at main to main's concurrent line 0
-/// of b: b's line 2 reaches main from neither. Under `Squashed` main judges
-/// that landing by the save its graft names, never as a changeset.
+/// of b: b's line 2 reaches main from neither.
 #[test]
 fn r4_nested_changes_land_whole_or_lose_whole_at_every_level() {
-    for history in BOTH {
-        let mut w = world(history);
-        let f = w.create_fork(Tree::Main);
-        let g = w.create_fork(Tree::Fork(f));
-        let (cf, cg) = (Client::Fork(f), Client::Fork(g));
-        let (ta, tb) = (distinct(&mut w, "a"), distinct(&mut w, "b"));
-        let ga = save_lines(&mut w, &cg, "a", &[0, 2]);
-        let fa = w.save(&cf, "a", 0);
-        next(&mut w, Tree::Fork(f)); // G's save loses whole in F
+    let mut w = world();
+    let f = w.create_fork(Tree::Main);
+    let g = w.create_fork(Tree::Fork(f));
+    let (cf, cg) = (Client::Fork(f), Client::Fork(g));
+    let (ta, tb) = (distinct(&mut w, "a"), distinct(&mut w, "b"));
+    let ga = save_lines(&mut w, &cg, "a", &[0, 2]);
+    let fa = w.save(&cf, "a", 0);
+    next(&mut w, Tree::Fork(f)); // G's save loses whole in F
+    assert_eq!(
+        ids(&w, Tree::Fork(f), "a")[..3],
+        [fa.clone(), ta[1].clone(), ta[2].clone()]
+    );
+    let gb = save_lines(&mut w, &cg, "b", &[0, 2]);
+    let mb = w.save(&m1(), "b", 0);
+    drain(&mut w);
+    for t in [Tree::Main, Tree::Fork(f), Tree::Fork(g)] {
         assert_eq!(
-            ids(&w, Tree::Fork(f), "a")[..3],
-            [fa.clone(), ta[1].clone(), ta[2].clone()]
+            ids(&w, t, "a")[..3],
+            [fa.clone(), ta[1].clone(), ta[2].clone()],
+            "{t:?}"
         );
-        let gb = save_lines(&mut w, &cg, "b", &[0, 2]);
-        let gsave = w.head(Tree::Fork(g));
-        let mb = w.save(&m1(), "b", 0);
-        drain(&mut w);
-        for t in [Tree::Main, Tree::Fork(f), Tree::Fork(g)] {
-            assert_eq!(
-                ids(&w, t, "a")[..3],
-                [fa.clone(), ta[1].clone(), ta[2].clone()],
-                "{history:?} {t:?}"
-            );
-            assert_eq!(
-                ids(&w, t, "b")[..3],
-                [mb.clone(), tb[1].clone(), tb[2].clone()],
-                "{history:?} {t:?}"
-            );
-        }
-        let by_tree: Vec<(Tree, Vec<String>)> = w
-            .collisions
-            .iter()
-            .map(|c| (c.tree, c.lost.clone()))
-            .collect();
         assert_eq!(
-            by_tree,
-            [
-                (Tree::Fork(f), vec![ga[0].clone()]),
-                (Tree::Fork(f), vec![ga[1].clone()]),
-                (Tree::Main, vec![gb[0].clone()]),
-                (Tree::Main, vec![gb[1].clone()]),
-            ],
-            "{history:?}"
+            ids(&w, t, "b")[..3],
+            [mb.clone(), tb[1].clone(), tb[2].clone()],
+            "{t:?}"
         );
-        if history == HistoryPolicy::Squashed {
-            let at_main: Vec<&String> = w
-                .collisions
-                .iter()
-                .filter(|c| c.tree == Tree::Main)
-                .map(|c| &c.loser)
-                .collect();
-            assert_eq!(at_main, [&gsave, &gsave], "judged as G's save");
-        }
     }
+    let by_tree: Vec<(Tree, Vec<String>)> = w
+        .collisions
+        .iter()
+        .map(|c| (c.tree, c.lost.clone()))
+        .collect();
+    assert_eq!(
+        by_tree,
+        [
+            (Tree::Fork(f), vec![ga[0].clone()]),
+            (Tree::Fork(f), vec![ga[1].clone()]),
+            (Tree::Main, vec![gb[0].clone()]),
+            (Tree::Main, vec![gb[1].clone()]),
+        ],
+    );
 }
 
 // ── convergence ─────────────────────────────────────────────────────────
@@ -1391,23 +1105,21 @@ fn r4_nested_changes_land_whole_or_lose_whole_at_every_level() {
 /// in both directions.
 #[test]
 fn convergence_when_writes_stop() {
-    for history in BOTH {
-        let mut w = world(history);
-        let f = w.create_fork(Tree::Main);
-        let g = w.create_fork(Tree::Main);
-        let h = w.create_fork(Tree::Fork(f));
-        for (i, c) in [Client::Fork(f), Client::Fork(g), Client::Fork(h), m1()]
-            .iter()
-            .enumerate()
-        {
-            w.save(c, "a", 0);
-            w.save(c, "b", i % 2);
-        }
-        next(&mut w, Tree::Fork(g));
-        next(&mut w, Tree::Main);
-        drain(&mut w);
-        assert!(!w.collisions.is_empty());
+    let mut w = world();
+    let f = w.create_fork(Tree::Main);
+    let g = w.create_fork(Tree::Main);
+    let h = w.create_fork(Tree::Fork(f));
+    for (i, c) in [Client::Fork(f), Client::Fork(g), Client::Fork(h), m1()]
+        .iter()
+        .enumerate()
+    {
+        w.save(c, "a", 0);
+        w.save(c, "b", i % 2);
     }
+    next(&mut w, Tree::Fork(g));
+    next(&mut w, Tree::Main);
+    drain(&mut w);
+    assert!(!w.collisions.is_empty());
 }
 
 // ── rule 8: a save records the write calls ──────────────────────────────
@@ -1415,8 +1127,8 @@ fn convergence_when_writes_stop() {
 /// The sandbox's program read `a` before main's m reached it by sync,
 /// then opens `a`, makes one write call and closes. Returns the world, the
 /// program's stale read, the synced m, and the sandbox.
-fn read_then_sync(history: HistoryPolicy) -> (World, Content, String, u32) {
-    let mut w = world(history);
+fn read_then_sync() -> (World, Content, String, u32) {
+    let mut w = world();
     let f = w.create_fork(Tree::Main);
     let o = w.save(&m1(), "a", 0);
     drain(&mut w);
@@ -1433,35 +1145,31 @@ fn read_then_sync(history: HistoryPolicy) -> (World, Content, String, u32) {
 /// landed, in main.
 #[test]
 fn r8_an_append_after_the_sync_keeps_the_synced_line() {
-    for history in BOTH {
-        let (mut w, _, m, f) = read_then_sync(history);
-        let h = w.open_write(&Client::Fork(f), "a");
-        let x = w.edit(h, LineEdit::Append).unwrap();
-        w.close(h);
-        ok(&mut w);
-        assert_eq!(w.read(Tree::Fork(f), "a").last(), x, "after the end");
-        drain(&mut w);
-        assert!(has(&w, Tree::Main, "a", &m) && has(&w, Tree::Main, "a", &x));
-        assert!(w.collisions.is_empty(), "{history:?}");
-    }
+    let (mut w, _, m, f) = read_then_sync();
+    let h = w.open_write(&Client::Fork(f), "a");
+    let x = w.edit(h, LineEdit::Append).unwrap();
+    w.close(h);
+    ok(&mut w);
+    assert_eq!(w.read(Tree::Fork(f), "a").last(), x, "after the end");
+    drain(&mut w);
+    assert!(has(&w, Tree::Main, "a", &m) && has(&w, Tree::Main, "a", &x));
+    assert!(w.collisions.is_empty());
 }
 
 /// Rule 8, a write at an offset elsewhere: it replaces exactly that line;
 /// the line the sync brought, which the program never read, stays.
 #[test]
 fn r8_an_offset_write_elsewhere_keeps_the_synced_line() {
-    for history in BOTH {
-        let (mut w, _, m, f) = read_then_sync(history);
-        let h = w.open_write(&Client::Fork(f), "a");
-        let y = w.edit(h, LineEdit::At(2)).unwrap();
-        w.close(h);
-        drain(&mut w);
-        for t in [Tree::Main, Tree::Fork(f)] {
-            let a = w.read(t, "a");
-            assert_eq!((a.at(0), a.at(2)), (m.as_str(), y.as_str()), "{t:?}");
-        }
-        assert!(w.collisions.is_empty(), "{history:?}");
+    let (mut w, _, m, f) = read_then_sync();
+    let h = w.open_write(&Client::Fork(f), "a");
+    let y = w.edit(h, LineEdit::At(2)).unwrap();
+    w.close(h);
+    drain(&mut w);
+    for t in [Tree::Main, Tree::Fork(f)] {
+        let a = w.read(t, "a");
+        assert_eq!((a.at(0), a.at(2)), (m.as_str(), y.as_str()), "{t:?}");
     }
+    assert!(w.collisions.is_empty());
 }
 
 /// Rule 8, a stale truncate and rewrite: the program writes back the whole
@@ -1471,45 +1179,39 @@ fn r8_an_offset_write_elsewhere_keeps_the_synced_line() {
 /// with no collision. m stays in main's history.
 #[test]
 fn r8_a_stale_rewrite_overwrites_the_synced_line_and_history_keeps_it() {
-    for history in BOTH {
-        let (mut w, read, m, f) = read_then_sync(history);
-        let m_commit = w.main_head.clone();
-        let h = w.open_write(&Client::Fork(f), "a");
-        assert_eq!(w.edit(h, LineEdit::Rewrite(read.clone())), None);
-        w.close(h);
-        let a = w.read(Tree::Fork(f), "a");
-        let r = a.at(0).to_string();
-        assert_eq!(
-            a.get(0).and_then(|l| l.text()),
-            read.get(0).and_then(|l| l.text()),
-            "o's bytes, back"
-        );
-        assert!(r.starts_with("c1.") && w.lineage.descends(&r, &m));
-        drain(&mut w);
-        assert!(has(&w, Tree::Main, "a", &r) && !has(&w, Tree::Main, "a", &m));
-        assert!(w.collisions.is_empty(), "{history:?}: no collision");
-        // The first line's record: git line `line_of(1)`, after the name.
-        let n = Content::line_of(1, Layout::Separated);
-        let blame = git(
-            w.repo(),
-            &[
-                "blame",
-                "--porcelain",
-                &format!("-L{n},{n}"),
-                &w.main_head,
-                "--",
-                "a",
-            ],
-        );
-        let by = blame.split(' ').next().expect("a commit").to_string();
-        assert_eq!(
-            w.writer_of_commit(&by),
-            "c1",
-            "{history:?}: the program's write"
-        );
-        assert!(w.in_history(&m_commit, &w.main_head), "m stays in history");
-        assert!(w.file(&m_commit, "a").contains(&m));
-    }
+    let (mut w, read, m, f) = read_then_sync();
+    let m_commit = w.main_head.clone();
+    let h = w.open_write(&Client::Fork(f), "a");
+    assert_eq!(w.edit(h, LineEdit::Rewrite(read.clone())), None);
+    w.close(h);
+    let a = w.read(Tree::Fork(f), "a");
+    let r = a.at(0).to_string();
+    assert_eq!(
+        a.get(0).and_then(|l| l.text()),
+        read.get(0).and_then(|l| l.text()),
+        "o's bytes, back"
+    );
+    assert!(r.starts_with("c1.") && w.lineage.descends(&r, &m));
+    drain(&mut w);
+    assert!(has(&w, Tree::Main, "a", &r) && !has(&w, Tree::Main, "a", &m));
+    assert!(w.collisions.is_empty(), "no collision");
+    // The first line's record: git line `line_of(1)`, after the name.
+    let n = Content::line_of(1, Layout::Separated);
+    let blame = git(
+        w.repo(),
+        &[
+            "blame",
+            "--porcelain",
+            &format!("-L{n},{n}"),
+            &w.main_head,
+            "--",
+            "a",
+        ],
+    );
+    let by = blame.split(' ').next().expect("a commit").to_string();
+    assert_eq!(w.writer_of_commit(&by), "c1", "the program's write");
+    assert!(w.is_ancestor(&m_commit, &w.main_head), "m stays in history");
+    assert!(w.file(&m_commit, "a").contains(&m));
 }
 
 /// Rule 8, `O_APPEND`: two of main's clients append to one file at once.
@@ -1518,28 +1220,26 @@ fn r8_a_stale_rewrite_overwrites_the_synced_line_and_history_keeps_it() {
 /// rejects an append that lands on a written slot (`one_writer`).
 #[test]
 fn r8_concurrent_appends_never_overwrite_each_other() {
-    for history in BOTH {
-        for m2_first in [true, false] {
-            let mut w = world(history);
-            let o = w.save(&m1(), "a", 0);
-            let m2 = Client::Main("m2".into());
-            let (a, b) = (w.open_write(&m1(), "a"), w.open_write(&m2, "a"));
-            let xa = w.edit(a, LineEdit::Append).unwrap();
-            let xb = w.edit(b, LineEdit::Append).unwrap();
-            let (first, second) = if m2_first { (b, a) } else { (a, b) };
-            w.close(first);
-            ok(&mut w);
-            w.close(second);
-            ok(&mut w);
-            let f = w.read(Tree::Main, "a");
-            let (one, two) = if m2_first { (&xb, &xa) } else { (&xa, &xb) };
-            assert_eq!(
-                (f.at(0), f.at(6), f.at(7)),
-                (o.as_str(), one.as_str(), two.as_str()),
-                "{history:?}: in close order after the last line, none over another"
-            );
-            drain(&mut w);
-        }
+    for m2_first in [true, false] {
+        let mut w = world();
+        let o = w.save(&m1(), "a", 0);
+        let m2 = Client::Main("m2".into());
+        let (a, b) = (w.open_write(&m1(), "a"), w.open_write(&m2, "a"));
+        let xa = w.edit(a, LineEdit::Append).unwrap();
+        let xb = w.edit(b, LineEdit::Append).unwrap();
+        let (first, second) = if m2_first { (b, a) } else { (a, b) };
+        w.close(first);
+        ok(&mut w);
+        w.close(second);
+        ok(&mut w);
+        let f = w.read(Tree::Main, "a");
+        let (one, two) = if m2_first { (&xb, &xa) } else { (&xa, &xb) };
+        assert_eq!(
+            (f.at(0), f.at(6), f.at(7)),
+            (o.as_str(), one.as_str(), two.as_str()),
+            "in close order after the last line, none over another"
+        );
+        drain(&mut w);
     }
 }
 
@@ -1577,29 +1277,27 @@ fn foo_without_newline(w: &mut World) -> String {
 /// first newline the append writes are new lines.
 #[test]
 fn r8_an_append_onto_a_partial_last_line_finishes_it() {
-    for history in BOTH {
-        let mut w = world(history);
-        let foo = foo_without_newline(&mut w);
-        let before = w.read(Tree::Main, "a").get(0).expect("foo").id.clone();
-        calls(&mut w, &m1(), "a", &[Write::Append("bar".into())]);
-        let a = w.read(Tree::Main, "a");
-        assert_eq!(a.bytes(), "foobar", "{history:?}");
-        let l = a.get(0).expect("a line");
-        assert_eq!(
-            (&l.line, &l.over),
-            (&foo, &Some(before)),
-            "the same line, one version on"
-        );
-        calls(&mut w, &m1(), "a", &[Write::Append("\nbaz\nq".into())]);
-        let a = w.read(Tree::Main, "a");
-        assert_eq!(a.texts(), ["foobar", "baz", "q"], "{history:?}");
-        assert_eq!(a.get(0).expect("a line").line, foo);
-        assert!(
-            a.get(1).is_some_and(|l| l.line == l.id),
-            "baz is a new line"
-        );
-        drain(&mut w);
-    }
+    let mut w = world();
+    let foo = foo_without_newline(&mut w);
+    let before = w.read(Tree::Main, "a").get(0).expect("foo").id.clone();
+    calls(&mut w, &m1(), "a", &[Write::Append("bar".into())]);
+    let a = w.read(Tree::Main, "a");
+    assert_eq!(a.bytes(), "foobar");
+    let l = a.get(0).expect("a line");
+    assert_eq!(
+        (&l.line, &l.over),
+        (&foo, &Some(before)),
+        "the same line, one version on"
+    );
+    calls(&mut w, &m1(), "a", &[Write::Append("\nbaz\nq".into())]);
+    let a = w.read(Tree::Main, "a");
+    assert_eq!(a.texts(), ["foobar", "baz", "q"]);
+    assert_eq!(a.get(0).expect("a line").line, foo);
+    assert!(
+        a.get(1).is_some_and(|l| l.line == l.id),
+        "baz is a new line"
+    );
+    drain(&mut w);
 }
 
 /// Rule 8 with rule 3: two trees append to a file whose last line has no
@@ -1609,23 +1307,21 @@ fn r8_an_append_onto_a_partial_last_line_finishes_it() {
 /// safe, as they are on a terminated file, `r8_concurrent_appends_*`).
 #[test]
 fn r8_concurrent_appends_onto_a_partial_last_line_collide() {
-    for history in BOTH {
-        let mut w = world(history);
-        let f = w.create_fork(Tree::Main);
-        let foo = foo_without_newline(&mut w);
-        calls(
-            &mut w,
-            &Client::Fork(f),
-            "a",
-            &[Write::Append("x\n".into())],
-        );
-        calls(&mut w, &m1(), "a", &[Write::Append("m\n".into())]);
-        drain(&mut w);
-        assert_eq!(bytes(&w, Tree::Main, "a"), "foom\n", "{history:?}");
-        assert_eq!(bytes(&w, Tree::Fork(f), "a"), "foom\n");
-        let c = w.collisions.last().expect("a collision").clone();
-        assert_eq!((c.by, c.lines), (By::Line, vec![foo]), "{history:?}");
-    }
+    let mut w = world();
+    let f = w.create_fork(Tree::Main);
+    let foo = foo_without_newline(&mut w);
+    calls(
+        &mut w,
+        &Client::Fork(f),
+        "a",
+        &[Write::Append("x\n".into())],
+    );
+    calls(&mut w, &m1(), "a", &[Write::Append("m\n".into())]);
+    drain(&mut w);
+    assert_eq!(bytes(&w, Tree::Main, "a"), "foom\n");
+    assert_eq!(bytes(&w, Tree::Fork(f), "a"), "foom\n");
+    let c = w.collisions.last().expect("a collision").clone();
+    assert_eq!((c.by, c.lines), (By::Line, vec![foo]));
 }
 
 /// Rule 10 with partial lines: main appends "}" with no final newline
@@ -1637,26 +1333,24 @@ fn r8_concurrent_appends_onto_a_partial_last_line_collide() {
 /// writes it as the program's bytes say.
 #[test]
 fn r10_a_line_after_a_partial_line_reads_terminated() {
-    for history in BOTH {
-        let mut w = world(history);
-        let f = w.create_fork(Tree::Main);
-        calls(
-            &mut w,
-            &Client::Fork(f),
-            "b",
-            &[Write::Append("n9\n".into())],
-        );
-        calls(&mut w, &m1(), "b", &[Write::Append("}".into())]);
-        ends_converged_without_collisions(&mut w);
-        let b = w.read(Tree::Main, "b");
-        assert_eq!(&b.bytes()[12..], "}\nn9\n", "{history:?}");
-        let brace = b.get(6).expect("the brace").clone();
-        assert_eq!(brace.text(), Some("}"), "the version keeps its bytes");
-        let n = b.bytes().len();
-        calls(&mut w, &m1(), "b", &[Write::Truncate(n - 3)]);
-        assert_eq!(&bytes(&w, Tree::Main, "b")[12..], "}\n", "{history:?}");
-        ends_converged_without_collisions(&mut w);
-    }
+    let mut w = world();
+    let f = w.create_fork(Tree::Main);
+    calls(
+        &mut w,
+        &Client::Fork(f),
+        "b",
+        &[Write::Append("n9\n".into())],
+    );
+    calls(&mut w, &m1(), "b", &[Write::Append("}".into())]);
+    ends_converged_without_collisions(&mut w);
+    let b = w.read(Tree::Main, "b");
+    assert_eq!(&b.bytes()[12..], "}\nn9\n");
+    let brace = b.get(6).expect("the brace").clone();
+    assert_eq!(brace.text(), Some("}"), "the version keeps its bytes");
+    let n = b.bytes().len();
+    calls(&mut w, &m1(), "b", &[Write::Truncate(n - 3)]);
+    assert_eq!(&bytes(&w, Tree::Main, "b")[12..], "}\n");
+    ends_converged_without_collisions(&mut w);
 }
 
 /// Rule 8 and 10, a line written in two calls, and two calls over one
@@ -1665,40 +1359,34 @@ fn r10_a_line_after_a_partial_line_reads_terminated() {
 /// the later one count.
 #[test]
 fn r8_split_and_overlapping_writes_make_one_version() {
-    for history in BOTH {
-        let mut w = world(history);
-        let pw = |offset: usize, bytes: &str| Write::Pwrite {
-            offset,
-            bytes: bytes.into(),
-        };
-        // Line 1 rewritten longer, in two calls: the second rewrites the
-        // bytes after it, as an in-place edit must.
-        calls(&mut w, &m1(), "c", &[pw(2, "ab"), pw(4, "c\n-\n-\n-\n-\n")]);
-        let c = w.read(Tree::Main, "c");
-        assert_eq!(c.texts(), ["-", "abc", "-", "-", "-", "-"], "{history:?}");
-        assert_eq!(
-            c.get(1).expect("a line").line,
-            "c1",
-            "one version of line 1"
-        );
-        // A new line at the end, in two calls: one new line.
-        calls(&mut w, &m1(), "c", &[pw(14, "de"), pw(16, "f\n")]);
-        let c = w.read(Tree::Main, "c");
-        assert_eq!(c.live().count(), 7, "{history:?}");
-        assert!(
-            c.get(6)
-                .is_some_and(|l| l.text() == Some("def\n") && l.line == l.id)
-        );
-        calls(&mut w, &m1(), "c", &[pw(0, "xyz\n"), pw(1, "Q")]);
-        let c = w.read(Tree::Main, "c");
-        // "xyz\n" over "-\nab": line 1 keeps only "c".
-        assert_eq!(
-            c.texts()[..2],
-            ["xQz", "c"],
-            "{history:?}: the later write's byte"
-        );
-        drain(&mut w);
-    }
+    let mut w = world();
+    let pw = |offset: usize, bytes: &str| Write::Pwrite {
+        offset,
+        bytes: bytes.into(),
+    };
+    // Line 1 rewritten longer, in two calls: the second rewrites the
+    // bytes after it, as an in-place edit must.
+    calls(&mut w, &m1(), "c", &[pw(2, "ab"), pw(4, "c\n-\n-\n-\n-\n")]);
+    let c = w.read(Tree::Main, "c");
+    assert_eq!(c.texts(), ["-", "abc", "-", "-", "-", "-"]);
+    assert_eq!(
+        c.get(1).expect("a line").line,
+        "c1",
+        "one version of line 1"
+    );
+    // A new line at the end, in two calls: one new line.
+    calls(&mut w, &m1(), "c", &[pw(14, "de"), pw(16, "f\n")]);
+    let c = w.read(Tree::Main, "c");
+    assert_eq!(c.live().count(), 7);
+    assert!(
+        c.get(6)
+            .is_some_and(|l| l.text() == Some("def\n") && l.line == l.id)
+    );
+    calls(&mut w, &m1(), "c", &[pw(0, "xyz\n"), pw(1, "Q")]);
+    let c = w.read(Tree::Main, "c");
+    // "xyz\n" over "-\nab": line 1 keeps only "c".
+    assert_eq!(c.texts()[..2], ["xQz", "c"], "the later write's byte");
+    drain(&mut w);
 }
 
 /// Rule 8, `ftruncate` and holes: a truncate in the middle of a line
@@ -1708,24 +1396,22 @@ fn r8_split_and_overlapping_writes_make_one_version() {
 /// deleted, none lost from history.
 #[test]
 fn r8_truncates_holes_and_an_empty_o_trunc() {
-    for history in BOTH {
-        let mut w = world(history);
-        calls(&mut w, &m1(), "d", &[Write::Truncate(3)]);
-        let d = w.read(Tree::Main, "d");
-        assert_eq!(d.bytes(), "-\n-", "{history:?}");
-        assert_eq!(d.get(1).expect("a line").line, "d1");
-        let pw = Write::Pwrite {
-            offset: 5,
-            bytes: "z\n".into(),
-        };
-        calls(&mut w, &m1(), "d", &[pw]);
-        assert_eq!(bytes(&w, Tree::Main, "d"), "-\n-\0\0z\n", "{history:?}");
-        let h = w.open_trunc(&m1(), "d");
-        w.close(h);
-        assert_eq!(bytes(&w, Tree::Main, "d"), "", "{history:?}");
-        assert!(w.read(Tree::Main, "d").lines.iter().all(|l| !l.live()));
-        drain(&mut w);
-    }
+    let mut w = world();
+    calls(&mut w, &m1(), "d", &[Write::Truncate(3)]);
+    let d = w.read(Tree::Main, "d");
+    assert_eq!(d.bytes(), "-\n-");
+    assert_eq!(d.get(1).expect("a line").line, "d1");
+    let pw = Write::Pwrite {
+        offset: 5,
+        bytes: "z\n".into(),
+    };
+    calls(&mut w, &m1(), "d", &[pw]);
+    assert_eq!(bytes(&w, Tree::Main, "d"), "-\n-\0\0z\n");
+    let h = w.open_trunc(&m1(), "d");
+    w.close(h);
+    assert_eq!(bytes(&w, Tree::Main, "d"), "");
+    assert!(w.read(Tree::Main, "d").lines.iter().all(|l| !l.live()));
+    drain(&mut w);
 }
 
 // ── rule 9: a take locks the files it overwrites ────────────────────────
@@ -1736,38 +1422,36 @@ fn r8_truncates_holes_and_an_empty_o_trunc() {
 /// sync of a file nobody has open does not wait.
 #[test]
 fn r9_a_sync_waits_for_an_open_writer_then_applies() {
-    for history in BOTH {
-        let mut w = world(history);
-        let f = w.create_fork(Tree::Main);
-        let h = w.open_write(&Client::Fork(f), "a");
-        let m = w.save(&m1(), "a", 0);
-        take(&mut w, &Step::Next(Tree::Fork(f)));
-        assert_eq!(
-            w.waiting_for(Tree::Fork(f)),
-            BTreeSet::from(["a".to_string()])
-        );
-        assert!(!w.pending().contains(&Step::Next(Tree::Fork(f))));
-        assert!(!has(&w, Tree::Fork(f), "a", &m), "{history:?}: not written");
-        let x = w.edit(h, LineEdit::At(1)).unwrap();
-        w.close(h);
-        ok(&mut w);
-        assert!(w.waits().is_empty(), "the close woke it");
-        next(&mut w, Tree::Fork(f));
-        let a = w.read(Tree::Fork(f), "a");
-        assert_eq!((a.at(0), a.at(1)), (m.as_str(), x.as_str()));
-        let h = w.open_write(&Client::Fork(f), "b");
-        w.save(&m1(), "c", 0);
-        next(&mut w, Tree::Fork(f)); // c only: does not wait for b
-        w.close(h);
-        drain(&mut w);
-    }
+    let mut w = world();
+    let f = w.create_fork(Tree::Main);
+    let h = w.open_write(&Client::Fork(f), "a");
+    let m = w.save(&m1(), "a", 0);
+    take(&mut w, &Step::Next(Tree::Fork(f)));
+    assert_eq!(
+        w.waiting_for(Tree::Fork(f)),
+        BTreeSet::from(["a".to_string()])
+    );
+    assert!(!w.pending().contains(&Step::Next(Tree::Fork(f))));
+    assert!(!has(&w, Tree::Fork(f), "a", &m), "not written");
+    let x = w.edit(h, LineEdit::At(1)).unwrap();
+    w.close(h);
+    ok(&mut w);
+    assert!(w.waits().is_empty(), "the close woke it");
+    next(&mut w, Tree::Fork(f));
+    let a = w.read(Tree::Fork(f), "a");
+    assert_eq!((a.at(0), a.at(1)), (m.as_str(), x.as_str()));
+    let h = w.open_write(&Client::Fork(f), "b");
+    w.save(&m1(), "c", 0);
+    next(&mut w, Tree::Fork(f)); // c only: does not wait for b
+    w.close(h);
+    drain(&mut w);
 }
 
 /// Rule 9, the same rule for a landing into a tree (a choice): main's
 /// queue waits while one of main's clients has the file open for writing.
 #[test]
 fn r9_a_landing_waits_for_the_parents_open_writer() {
-    let mut w = world(HistoryPolicy::FullLineage);
+    let mut w = world();
     let f = w.create_fork(Tree::Main);
     let h = w.open_write(&m1(), "a");
     let x = w.save(&Client::Fork(f), "a", 2);
@@ -1788,54 +1472,50 @@ fn r9_a_landing_waits_for_the_parents_open_writer() {
 /// flip the unlink to a win that writes a file the take never held.
 #[test]
 fn r9_a_landing_holds_the_files_of_its_losing_changes() {
-    for history in BOTH {
-        let mut w = world(history);
-        let f = w.create_fork(Tree::Main);
-        w.unlink(&Client::Fork(f), "a");
-        let m = w.save(&m1(), "a", 0);
-        take(&mut w, &Step::Next(Tree::Main));
-        assert!(
-            w.holds()[&Tree::Main].files.contains("a"),
-            "{history:?}: the losing unlink's file is held"
-        );
-        let h = w.open_write(&m1(), "a");
-        ok(&mut w);
-        assert!(w.handle(h).waiting, "{history:?}: the open waits");
-        take(&mut w, &Step::Finish(Tree::Main));
-        assert!(!w.handle(h).waiting, "the release granted it");
-        assert!(has(&w, Tree::Main, "a", &m), "{history:?}: the unlink lost");
-        let c = w.collisions.last().expect("a collision").clone();
-        assert!(c.by == By::File && c.won == [m.clone()], "{c:?}");
-        w.edit(h, LineEdit::Delete(0));
-        w.close(h);
-        drain(&mut w);
-    }
+    let mut w = world();
+    let f = w.create_fork(Tree::Main);
+    w.unlink(&Client::Fork(f), "a");
+    let m = w.save(&m1(), "a", 0);
+    take(&mut w, &Step::Next(Tree::Main));
+    assert!(
+        w.holds()[&Tree::Main].files.contains("a"),
+        "the losing unlink's file is held"
+    );
+    let h = w.open_write(&m1(), "a");
+    ok(&mut w);
+    assert!(w.handle(h).waiting, "the open waits");
+    take(&mut w, &Step::Finish(Tree::Main));
+    assert!(!w.handle(h).waiting, "the release granted it");
+    assert!(has(&w, Tree::Main, "a", &m), "the unlink lost");
+    let c = w.collisions.last().expect("a collision").clone();
+    assert!(c.by == By::File && c.won == [m.clone()], "{c:?}");
+    w.edit(h, LineEdit::Delete(0));
+    w.close(h);
+    drain(&mut w);
 }
 
 /// Rule 9: while a sync holds `a`, a new write-open of `a` waits; the
 /// sync's release (an event) grants it, showing the synced file.
 #[test]
 fn r9_a_write_open_waits_while_a_sync_holds_the_file() {
-    for history in BOTH {
-        let mut w = world(history);
-        let f = w.create_fork(Tree::Main);
-        let m = w.save(&m1(), "a", 0);
-        take(&mut w, &Step::Next(Tree::Fork(f)));
-        assert!(w.holds()[&Tree::Fork(f)].files.contains("a"));
-        let h = w.open_write(&Client::Fork(f), "a");
-        ok(&mut w);
-        assert!(w.handle(h).waiting, "{history:?}: the open waits");
-        let other = w.open_write(&Client::Fork(f), "b");
-        assert!(!w.handle(other).waiting, "an unheld file opens at once");
-        take(&mut w, &Step::Finish(Tree::Fork(f)));
-        assert!(!w.handle(h).waiting, "the release granted it");
-        let x = w.edit(h, LineEdit::Append).unwrap();
-        w.close(h);
-        w.close(other);
-        let a = w.read(Tree::Fork(f), "a");
-        assert_eq!((a.at(0), a.last()), (m.as_str(), x.as_str()));
-        drain(&mut w);
-    }
+    let mut w = world();
+    let f = w.create_fork(Tree::Main);
+    let m = w.save(&m1(), "a", 0);
+    take(&mut w, &Step::Next(Tree::Fork(f)));
+    assert!(w.holds()[&Tree::Fork(f)].files.contains("a"));
+    let h = w.open_write(&Client::Fork(f), "a");
+    ok(&mut w);
+    assert!(w.handle(h).waiting, "the open waits");
+    let other = w.open_write(&Client::Fork(f), "b");
+    assert!(!w.handle(other).waiting, "an unheld file opens at once");
+    take(&mut w, &Step::Finish(Tree::Fork(f)));
+    assert!(!w.handle(h).waiting, "the release granted it");
+    let x = w.edit(h, LineEdit::Append).unwrap();
+    w.close(h);
+    w.close(other);
+    let a = w.read(Tree::Fork(f), "a");
+    assert_eq!((a.at(0), a.last()), (m.as_str(), x.as_str()));
+    drain(&mut w);
 }
 
 /// Rule 9, the client's death (its end event) releases its locks: its
@@ -1843,29 +1523,24 @@ fn r9_a_write_open_waits_while_a_sync_holds_the_file() {
 /// its waiting open is dropped.
 #[test]
 fn r9_client_death_releases_its_locks() {
-    for history in BOTH {
-        let mut w = world(history);
-        let (f, g) = (w.create_fork(Tree::Main), w.create_fork(Tree::Main));
-        let h = w.open_write(&Client::Fork(f), "a");
-        let x = w.edit(h, LineEdit::At(1)).unwrap();
-        let m = w.save(&m1(), "a", 0);
-        take(&mut w, &Step::Next(Tree::Fork(f)));
-        assert!(w.waits().contains_key(&Tree::Fork(f)));
-        let n = w.save(&m1(), "b", 0);
-        take(&mut w, &Step::Next(Tree::Fork(g)));
-        let waiting = w.open_write(&Client::Fork(g), "a");
-        assert!(w.handle(waiting).waiting);
-        w.end_client(f);
-        w.end_client(g);
-        ok(&mut w);
-        assert!(
-            w.waits().is_empty() && w.handles().next().is_none(),
-            "{history:?}"
-        );
-        drain(&mut w);
-        assert!(has(&w, Tree::Main, "a", &x) && has(&w, Tree::Main, "a", &m));
-        assert!(has(&w, Tree::Main, "b", &n));
-    }
+    let mut w = world();
+    let (f, g) = (w.create_fork(Tree::Main), w.create_fork(Tree::Main));
+    let h = w.open_write(&Client::Fork(f), "a");
+    let x = w.edit(h, LineEdit::At(1)).unwrap();
+    let m = w.save(&m1(), "a", 0);
+    take(&mut w, &Step::Next(Tree::Fork(f)));
+    assert!(w.waits().contains_key(&Tree::Fork(f)));
+    let n = w.save(&m1(), "b", 0);
+    take(&mut w, &Step::Next(Tree::Fork(g)));
+    let waiting = w.open_write(&Client::Fork(g), "a");
+    assert!(w.handle(waiting).waiting);
+    w.end_client(f);
+    w.end_client(g);
+    ok(&mut w);
+    assert!(w.waits().is_empty() && w.handles().next().is_none(),);
+    drain(&mut w);
+    assert!(has(&w, Tree::Main, "a", &x) && has(&w, Tree::Main, "a", &m));
+    assert!(has(&w, Tree::Main, "b", &n));
 }
 
 /// Rule 9, one of main's clients dies (its end event) holding `a` open
@@ -1875,38 +1550,33 @@ fn r9_client_death_releases_its_locks() {
 /// no lock of it outlives it (`locks`).
 #[test]
 fn r9_a_main_clients_death_releases_its_locks() {
-    for history in BOTH {
-        let mut w = world(history);
-        let f = w.create_fork(Tree::Main);
-        let x = w.save(&Client::Fork(f), "b", 0);
-        take(&mut w, &Step::Next(Tree::Main));
-        assert!(w.holds()[&Tree::Main].files.contains("b"));
-        let waiting = w.open_write(&m1(), "b");
-        assert!(w.handle(waiting).waiting);
-        take(&mut w, &Step::Finish(Tree::Main));
-        w.close(waiting);
-        let h = w.open_write(&m1(), "a");
-        let y = w.edit(h, LineEdit::At(0)).unwrap();
-        let z = w.save(&Client::Fork(f), "a", 2);
-        take(&mut w, &Step::Next(Tree::Main));
-        assert!(w.waits().contains_key(&Tree::Main), "{history:?}");
-        let m2 = Client::Main("m2".into());
-        let other = w.open_write(&m2, "d");
-        w.end_main_client("m1");
-        ok(&mut w);
-        assert!(
-            w.waits().is_empty(),
-            "{history:?}: the death woke main's queue"
-        );
-        assert!(has(&w, Tree::Main, "a", &y), "its write calls were saved");
-        assert!(!w.handle(other).waiting, "another client's open stays");
-        next(&mut w, Tree::Main);
-        assert!(has(&w, Tree::Main, "a", &z));
-        w.close(other);
-        drain(&mut w);
-        assert!(has(&w, Tree::Main, "b", &x));
-        assert!(w.handles().next().is_none());
-    }
+    let mut w = world();
+    let f = w.create_fork(Tree::Main);
+    let x = w.save(&Client::Fork(f), "b", 0);
+    take(&mut w, &Step::Next(Tree::Main));
+    assert!(w.holds()[&Tree::Main].files.contains("b"));
+    let waiting = w.open_write(&m1(), "b");
+    assert!(w.handle(waiting).waiting);
+    take(&mut w, &Step::Finish(Tree::Main));
+    w.close(waiting);
+    let h = w.open_write(&m1(), "a");
+    let y = w.edit(h, LineEdit::At(0)).unwrap();
+    let z = w.save(&Client::Fork(f), "a", 2);
+    take(&mut w, &Step::Next(Tree::Main));
+    assert!(w.waits().contains_key(&Tree::Main));
+    let m2 = Client::Main("m2".into());
+    let other = w.open_write(&m2, "d");
+    w.end_main_client("m1");
+    ok(&mut w);
+    assert!(w.waits().is_empty(), "the death woke main's queue");
+    assert!(has(&w, Tree::Main, "a", &y), "its write calls were saved");
+    assert!(!w.handle(other).waiting, "another client's open stays");
+    next(&mut w, Tree::Main);
+    assert!(has(&w, Tree::Main, "a", &z));
+    w.close(other);
+    drain(&mut w);
+    assert!(has(&w, Tree::Main, "b", &x));
+    assert!(w.handles().next().is_none());
 }
 
 /// Rule 5 with open files (a choice): a file the program opened before
@@ -1916,31 +1586,29 @@ fn r9_a_main_clients_death_releases_its_locks() {
 /// sandbox file the commit would write; once it closes them, it commits.
 #[test]
 fn r5_open_files_and_transactions() {
-    for history in BOTH {
-        let mut w = world(history);
-        let f = w.create_fork(Tree::Main);
-        let c = Client::Fork(f);
-        let log = w.open_write(&c, "d");
-        let edit = w.open_write(&c, "a");
-        w.begin(f).unwrap();
-        let s = w.save(&c, "a", 1);
-        let staged = w.open_write(&c, "b");
-        assert_eq!(w.commit_txn(f), Err(ModelError::OpenFiles), "{history:?}");
-        w.edit(staged, LineEdit::At(0)).unwrap();
-        w.close(staged);
-        assert_eq!(w.commit_txn(f), Err(ModelError::OpenFiles), "a is open");
-        let l = w.edit(log, LineEdit::Append).unwrap();
-        w.close(log);
-        assert!(
-            has(&w, Tree::Fork(f), "d", &l),
-            "the log saves to the sandbox"
-        );
-        assert!(!l.contains('~'), "not a staged line");
-        w.close(edit);
-        assert_eq!(w.commit_txn(f), Ok(TxnOutcome::Committed));
-        assert!(has(&w, Tree::Fork(f), "a", &s));
-        drain(&mut w);
-    }
+    let mut w = world();
+    let f = w.create_fork(Tree::Main);
+    let c = Client::Fork(f);
+    let log = w.open_write(&c, "d");
+    let edit = w.open_write(&c, "a");
+    w.begin(f).unwrap();
+    let s = w.save(&c, "a", 1);
+    let staged = w.open_write(&c, "b");
+    assert_eq!(w.commit_txn(f), Err(ModelError::OpenFiles));
+    w.edit(staged, LineEdit::At(0)).unwrap();
+    w.close(staged);
+    assert_eq!(w.commit_txn(f), Err(ModelError::OpenFiles), "a is open");
+    let l = w.edit(log, LineEdit::Append).unwrap();
+    w.close(log);
+    assert!(
+        has(&w, Tree::Fork(f), "d", &l),
+        "the log saves to the sandbox"
+    );
+    assert!(!l.contains('~'), "not a staged line");
+    w.close(edit);
+    assert_eq!(w.commit_txn(f), Ok(TxnOutcome::Committed));
+    assert!(has(&w, Tree::Fork(f), "a", &s));
+    drain(&mut w);
 }
 
 // ── rule 10: line identity ──────────────────────────────────────────────
@@ -1987,41 +1655,37 @@ fn ends_converged_without_collisions(w: &mut World) {
 /// collision.
 #[test]
 fn r10_an_insert_shifts_lines_without_changing_their_identity() {
-    for history in BOTH {
-        let mut w = world(history);
-        let f = w.create_fork(Tree::Main);
-        let x = call(&mut w, &Client::Fork(f), "a", LineEdit::Insert(0)).unwrap();
-        let m = w.save(&m1(), "a", 2);
-        ends_converged_without_collisions(&mut w);
-        let a = w.read(Tree::Main, "a");
-        assert_eq!((a.at(0), a.at(3)), (x.as_str(), m.as_str()), "{history:?}");
-        let n = call(&mut w, &m1(), "b", LineEdit::Insert(0)).unwrap();
-        let y = w.save(&Client::Fork(f), "b", 2);
-        ends_converged_without_collisions(&mut w);
-        let b = w.read(Tree::Main, "b");
-        assert_eq!((b.at(0), b.at(3)), (n.as_str(), y.as_str()), "{history:?}");
-        assert_eq!(ids(&w, Tree::Fork(f), "b"), ids(&w, Tree::Main, "b"));
-    }
+    let mut w = world();
+    let f = w.create_fork(Tree::Main);
+    let x = call(&mut w, &Client::Fork(f), "a", LineEdit::Insert(0)).unwrap();
+    let m = w.save(&m1(), "a", 2);
+    ends_converged_without_collisions(&mut w);
+    let a = w.read(Tree::Main, "a");
+    assert_eq!((a.at(0), a.at(3)), (x.as_str(), m.as_str()));
+    let n = call(&mut w, &m1(), "b", LineEdit::Insert(0)).unwrap();
+    let y = w.save(&Client::Fork(f), "b", 2);
+    ends_converged_without_collisions(&mut w);
+    let b = w.read(Tree::Main, "b");
+    assert_eq!((b.at(0), b.at(3)), (n.as_str(), y.as_str()));
+    assert_eq!(ids(&w, Tree::Fork(f), "b"), ids(&w, Tree::Main, "b"));
 }
 
 /// Rule 10, two inserts at one place: both stay, the parent's first (a
 /// design choice), with no collision, whichever reaches the sandbox first.
 #[test]
 fn r10_concurrent_inserts_at_one_place_keep_both_the_parents_first() {
-    for history in BOTH {
-        for sync_first in [false, true] {
-            let mut w = world(history);
-            let f = w.create_fork(Tree::Main);
-            let x = call(&mut w, &Client::Fork(f), "a", LineEdit::Insert(1)).unwrap();
-            let m = call(&mut w, &m1(), "a", LineEdit::Insert(1)).unwrap();
-            if sync_first {
-                next(&mut w, Tree::Fork(f));
-                assert_eq!(ids(&w, Tree::Fork(f), "a")[..4], ["a0", &m, &x, "a1"]);
-            }
-            ends_converged_without_collisions(&mut w);
-            let a = ids(&w, Tree::Main, "a");
-            assert_eq!(a[..4], ["a0", &m, &x, "a1"], "{history:?} {sync_first}");
+    for sync_first in [false, true] {
+        let mut w = world();
+        let f = w.create_fork(Tree::Main);
+        let x = call(&mut w, &Client::Fork(f), "a", LineEdit::Insert(1)).unwrap();
+        let m = call(&mut w, &m1(), "a", LineEdit::Insert(1)).unwrap();
+        if sync_first {
+            next(&mut w, Tree::Fork(f));
+            assert_eq!(ids(&w, Tree::Fork(f), "a")[..4], ["a0", &m, &x, "a1"]);
         }
+        ends_converged_without_collisions(&mut w);
+        let a = ids(&w, Tree::Main, "a");
+        assert_eq!(a[..4], ["a0", &m, &x, "a1"], "{sync_first}");
     }
 }
 
@@ -2034,38 +1698,28 @@ fn r10_concurrent_inserts_at_one_place_keep_both_the_parents_first() {
 /// they agree, no collision.
 #[test]
 fn r10_a_delete_against_a_concurrent_edit_the_parent_wins() {
-    for history in BOTH {
-        let mut w = world(history);
-        let f = w.create_fork(Tree::Main);
-        let t = distinct(&mut w, "a");
-        call(&mut w, &Client::Fork(f), "a", LineEdit::Delete(1));
-        let m = w.save(&m1(), "a", 1);
-        drain(&mut w);
-        assert_eq!(
-            ids(&w, Tree::Main, "a")[..3],
-            [t[0].as_str(), &m, &t[2]],
-            "{history:?}"
-        );
-        let c = w.collisions.last().expect("a collision").clone();
-        assert_eq!((c.lines, c.won), (vec!["a1".to_string()], vec![m.clone()]));
-        let t = distinct(&mut w, "b");
-        call(&mut w, &m1(), "b", LineEdit::Delete(1));
-        let x = w.save(&Client::Fork(f), "b", 1);
-        drain(&mut w);
-        assert_eq!(
-            ids(&w, Tree::Main, "b")[..2],
-            [t[0].as_str(), &t[2]],
-            "{history:?}"
-        );
-        assert_eq!(w.collisions.last().map(|c| c.lost.clone()), Some(vec![x]));
-        let t = distinct(&mut w, "c");
-        let before = w.collisions.len();
-        call(&mut w, &Client::Fork(f), "c", LineEdit::Delete(1));
-        call(&mut w, &m1(), "c", LineEdit::Delete(1));
-        drain(&mut w);
-        assert_eq!(w.collisions.len(), before, "{history:?}: two deletes agree");
-        assert_eq!(ids(&w, Tree::Main, "c")[..2], [t[0].as_str(), &t[2]]);
-    }
+    let mut w = world();
+    let f = w.create_fork(Tree::Main);
+    let t = distinct(&mut w, "a");
+    call(&mut w, &Client::Fork(f), "a", LineEdit::Delete(1));
+    let m = w.save(&m1(), "a", 1);
+    drain(&mut w);
+    assert_eq!(ids(&w, Tree::Main, "a")[..3], [t[0].as_str(), &m, &t[2]],);
+    let c = w.collisions.last().expect("a collision").clone();
+    assert_eq!((c.lines, c.won), (vec!["a1".to_string()], vec![m.clone()]));
+    let t = distinct(&mut w, "b");
+    call(&mut w, &m1(), "b", LineEdit::Delete(1));
+    let x = w.save(&Client::Fork(f), "b", 1);
+    drain(&mut w);
+    assert_eq!(ids(&w, Tree::Main, "b")[..2], [t[0].as_str(), &t[2]],);
+    assert_eq!(w.collisions.last().map(|c| c.lost.clone()), Some(vec![x]));
+    let t = distinct(&mut w, "c");
+    let before = w.collisions.len();
+    call(&mut w, &Client::Fork(f), "c", LineEdit::Delete(1));
+    call(&mut w, &m1(), "c", LineEdit::Delete(1));
+    drain(&mut w);
+    assert_eq!(w.collisions.len(), before, "two deletes agree");
+    assert_eq!(ids(&w, Tree::Main, "c")[..2], [t[0].as_str(), &t[2]]);
 }
 
 /// Lines 0 to 3 of `p` given distinct bytes by main, then every tree
@@ -2089,56 +1743,49 @@ fn distinct(w: &mut World, p: &str) -> Vec<String> {
 /// loses.
 #[test]
 fn r10_a_move_is_a_delete_plus_an_insert() {
-    for history in BOTH {
-        let mut w = world(history);
-        let f = w.create_fork(Tree::Main);
-        let t = distinct(&mut w, "a");
-        let mv = LineEdit::Move { from: 0, to: 3 };
-        call(&mut w, &Client::Fork(f), "a", mv.clone());
-        let m = w.save(&m1(), "a", 5);
-        ends_converged_without_collisions(&mut w);
-        let a = w.read(Tree::Main, "a");
-        assert_eq!(
-            a.texts(),
-            [&t[1], &t[2], &t[3], &t[0], BLANK, &m],
-            "{history:?}"
-        );
-        assert!(!a.contains(&t[0]), "{history:?}: the moved line is new");
-        let t = distinct(&mut w, "b");
-        call(&mut w, &Client::Fork(f), "b", mv.clone());
-        let m = w.save(&m1(), "b", 0);
-        drain(&mut w);
-        assert_eq!(
-            w.read(Tree::Main, "b").texts()[..5],
-            [m.as_str(), &t[1], &t[2], &t[3], BLANK],
-            "{history:?}: main's edit, and not the old bytes"
-        );
-        let n = w.collisions.len();
-        let (del, new) = (&w.collisions[n - 2], &w.collisions[n - 1]);
-        assert_eq!(
-            (del.by, &del.lines, &del.won),
-            (By::Line, &vec!["b0".to_string()], &vec![m.clone()])
-        );
-        assert_eq!(
-            (new.by, &new.won, &new.loser),
-            (By::Whole, &vec![m], &del.loser)
-        );
-        let t = distinct(&mut w, "c");
-        let before = w.collisions.len();
-        call(&mut w, &m1(), "c", mv);
-        let x = w.save(&Client::Fork(f), "c", 0);
-        drain(&mut w);
-        assert_eq!(
-            w.read(Tree::Main, "c").texts()[..4],
-            [t[1].as_str(), &t[2], &t[3], &t[0]],
-            "{history:?}"
-        );
-        let lost: Vec<String> = w.collisions[before..]
-            .iter()
-            .flat_map(|c| c.lost.clone())
-            .collect();
-        assert_eq!(lost, [x]);
-    }
+    let mut w = world();
+    let f = w.create_fork(Tree::Main);
+    let t = distinct(&mut w, "a");
+    let mv = LineEdit::Move { from: 0, to: 3 };
+    call(&mut w, &Client::Fork(f), "a", mv.clone());
+    let m = w.save(&m1(), "a", 5);
+    ends_converged_without_collisions(&mut w);
+    let a = w.read(Tree::Main, "a");
+    assert_eq!(a.texts(), [&t[1], &t[2], &t[3], &t[0], BLANK, &m],);
+    assert!(!a.contains(&t[0]), "the moved line is new");
+    let t = distinct(&mut w, "b");
+    call(&mut w, &Client::Fork(f), "b", mv.clone());
+    let m = w.save(&m1(), "b", 0);
+    drain(&mut w);
+    assert_eq!(
+        w.read(Tree::Main, "b").texts()[..5],
+        [m.as_str(), &t[1], &t[2], &t[3], BLANK],
+        "main's edit, and not the old bytes"
+    );
+    let n = w.collisions.len();
+    let (del, new) = (&w.collisions[n - 2], &w.collisions[n - 1]);
+    assert_eq!(
+        (del.by, &del.lines, &del.won),
+        (By::Line, &vec!["b0".to_string()], &vec![m.clone()])
+    );
+    assert_eq!(
+        (new.by, &new.won, &new.loser),
+        (By::Whole, &vec![m], &del.loser)
+    );
+    let t = distinct(&mut w, "c");
+    let before = w.collisions.len();
+    call(&mut w, &m1(), "c", mv);
+    let x = w.save(&Client::Fork(f), "c", 0);
+    drain(&mut w);
+    assert_eq!(
+        w.read(Tree::Main, "c").texts()[..4],
+        [t[1].as_str(), &t[2], &t[3], &t[0]],
+    );
+    let lost: Vec<String> = w.collisions[before..]
+        .iter()
+        .flat_map(|c| c.lost.clone())
+        .collect();
+    assert_eq!(lost, [x]);
 }
 
 /// Rule 10, repeated lines. Six blank lines, and the sandbox inserts a
@@ -2153,39 +1800,29 @@ fn r10_a_move_is_a_delete_plus_an_insert() {
 /// main's edit stays on `y`'s line, no collision.
 #[test]
 fn r10_repeated_identical_lines_align_by_the_diff() {
-    for history in BOTH {
-        let mut w = world(history);
-        let f = w.create_fork(Tree::Main);
-        let h = w.open_write(&Client::Fork(f), "a");
-        w.edit_text(h, LineEdit::Insert(0), BLANK);
-        w.close(h);
-        let m = w.save(&m1(), "a", 1);
-        ends_converged_without_collisions(&mut w);
-        let a = w.read(Tree::Main, "a");
-        assert_eq!(
-            a.texts(),
-            [BLANK, &m, BLANK, BLANK, BLANK, BLANK, BLANK],
-            "{history:?}"
-        );
-        let h = w.open_write(&m1(), "b");
-        for (i, t) in ["{", "x", "}", "{", "y", "}"].iter().enumerate() {
-            w.edit_text(h, LineEdit::At(i), t);
-        }
-        w.close(h);
-        drain(&mut w);
-        let block = ["{", "x", "}", "{", "z", "}", "{", "y", "}"];
-        let h = w.open_write(&Client::Fork(f), "b");
-        w.edit(h, LineEdit::Rewrite(texts(&block)));
-        let y = w.save(&m1(), "b", 4);
-        w.close(h);
-        ends_converged_without_collisions(&mut w);
-        let b = w.read(Tree::Main, "b").texts();
-        assert_eq!(
-            b,
-            ["{", "x", "}", "{", "z", "}", "{", &y, "}"],
-            "{history:?}"
-        );
+    let mut w = world();
+    let f = w.create_fork(Tree::Main);
+    let h = w.open_write(&Client::Fork(f), "a");
+    w.edit_text(h, LineEdit::Insert(0), BLANK);
+    w.close(h);
+    let m = w.save(&m1(), "a", 1);
+    ends_converged_without_collisions(&mut w);
+    let a = w.read(Tree::Main, "a");
+    assert_eq!(a.texts(), [BLANK, &m, BLANK, BLANK, BLANK, BLANK, BLANK],);
+    let h = w.open_write(&m1(), "b");
+    for (i, t) in ["{", "x", "}", "{", "y", "}"].iter().enumerate() {
+        w.edit_text(h, LineEdit::At(i), t);
     }
+    w.close(h);
+    drain(&mut w);
+    let block = ["{", "x", "}", "{", "z", "}", "{", "y", "}"];
+    let h = w.open_write(&Client::Fork(f), "b");
+    w.edit(h, LineEdit::Rewrite(texts(&block)));
+    let y = w.save(&m1(), "b", 4);
+    w.close(h);
+    ends_converged_without_collisions(&mut w);
+    let b = w.read(Tree::Main, "b").texts();
+    assert_eq!(b, ["{", "x", "}", "{", "z", "}", "{", &y, "}"],);
 }
 
 // ── rule 11: deletes and renames ────────────────────────────────────────
@@ -2197,43 +1834,39 @@ fn r10_repeated_identical_lines_align_by_the_diff() {
 /// the sandbox's line loses. Both are recorded collisions.
 #[test]
 fn r11_an_unlink_against_a_concurrent_edit_the_parent_wins() {
-    for history in BOTH {
-        let mut w = world(history);
-        let f = w.create_fork(Tree::Main);
-        assert_eq!(w.unlink(&Client::Fork(f), "a"), None);
-        assert_eq!(w.path_of(Tree::Fork(f), "a"), None, "unlinked at once");
-        let m = w.save(&m1(), "a", 0);
-        drain(&mut w);
-        assert!(has(&w, Tree::Main, "a", &m) && has(&w, Tree::Fork(f), "a", &m));
-        let c = w.collisions.last().expect("a collision").clone();
-        assert!(
-            c.by == By::File && c.lines == ["a"] && c.won == [m.clone()],
-            "{c:?}"
-        );
-        w.unlink(&m1(), "b");
-        let x = w.save(&Client::Fork(f), "b", 0);
-        drain(&mut w);
-        for t in [Tree::Main, Tree::Fork(f)] {
-            assert_eq!(w.path_of(t, "b"), None, "{history:?} {t:?}");
-        }
-        let c = w.collisions.last().expect("a collision").clone();
-        assert!(c.by == By::File && c.lost == [x.clone()], "{c:?}");
+    let mut w = world();
+    let f = w.create_fork(Tree::Main);
+    assert_eq!(w.unlink(&Client::Fork(f), "a"), None);
+    assert_eq!(w.path_of(Tree::Fork(f), "a"), None, "unlinked at once");
+    let m = w.save(&m1(), "a", 0);
+    drain(&mut w);
+    assert!(has(&w, Tree::Main, "a", &m) && has(&w, Tree::Fork(f), "a", &m));
+    let c = w.collisions.last().expect("a collision").clone();
+    assert!(
+        c.by == By::File && c.lines == ["a"] && c.won == [m.clone()],
+        "{c:?}"
+    );
+    w.unlink(&m1(), "b");
+    let x = w.save(&Client::Fork(f), "b", 0);
+    drain(&mut w);
+    for t in [Tree::Main, Tree::Fork(f)] {
+        assert_eq!(w.path_of(t, "b"), None, "{t:?}");
     }
+    let c = w.collisions.last().expect("a collision").clone();
+    assert!(c.by == By::File && c.lost == [x.clone()], "{c:?}");
 }
 
 /// Rule 11, an unlink after the sync: the sandbox saw main's line, so its
 /// unlink wins upstream by lineage, with no collision.
 #[test]
 fn r11_an_unlink_after_the_sync_wins() {
-    for history in BOTH {
-        let mut w = world(history);
-        let f = w.create_fork(Tree::Main);
-        w.save(&m1(), "a", 0);
-        next(&mut w, Tree::Fork(f));
-        w.unlink(&Client::Fork(f), "a");
-        ends_converged_without_collisions(&mut w);
-        assert_eq!(w.path_of(Tree::Main, "a"), None, "{history:?}");
-    }
+    let mut w = world();
+    let f = w.create_fork(Tree::Main);
+    w.save(&m1(), "a", 0);
+    next(&mut w, Tree::Fork(f));
+    w.unlink(&Client::Fork(f), "a");
+    ends_converged_without_collisions(&mut w);
+    assert_eq!(w.path_of(Tree::Main, "a"), None);
 }
 
 /// Rule 11, a rename and a concurrent edit both apply: a file keeps its
@@ -2241,18 +1874,16 @@ fn r11_an_unlink_after_the_sync_wins() {
 /// each direction.
 #[test]
 fn r11_a_rename_and_a_concurrent_edit_both_apply() {
-    for history in BOTH {
-        let mut w = world(history);
-        let f = w.create_fork(Tree::Main);
-        w.rename(&Client::Fork(f), "a", "e");
-        let m = w.save(&m1(), "a", 0);
-        ends_converged_without_collisions(&mut w);
-        assert!(has(&w, Tree::Main, "e", &m), "{history:?}");
-        w.rename(&m1(), "b", "g");
-        let x = w.save(&Client::Fork(f), "b", 0);
-        ends_converged_without_collisions(&mut w);
-        assert!(has(&w, Tree::Main, "g", &x) && has(&w, Tree::Fork(f), "g", &x));
-    }
+    let mut w = world();
+    let f = w.create_fork(Tree::Main);
+    w.rename(&Client::Fork(f), "a", "e");
+    let m = w.save(&m1(), "a", 0);
+    ends_converged_without_collisions(&mut w);
+    assert!(has(&w, Tree::Main, "e", &m));
+    w.rename(&m1(), "b", "g");
+    let x = w.save(&Client::Fork(f), "b", 0);
+    ends_converged_without_collisions(&mut w);
+    assert!(has(&w, Tree::Main, "g", &x) && has(&w, Tree::Fork(f), "g", &x));
 }
 
 /// Rule 11, two concurrent renames of one file: the parent's name wins.
@@ -2260,28 +1891,26 @@ fn r11_a_rename_and_a_concurrent_edit_both_apply() {
 /// sandbox's keeps its old name.
 #[test]
 fn r11_concurrent_renames_the_parent_wins() {
-    for history in BOTH {
-        let mut w = world(history);
-        let f = w.create_fork(Tree::Main);
-        w.rename(&Client::Fork(f), "a", "e");
-        w.rename(&m1(), "a", "g");
-        drain(&mut w);
-        for t in [Tree::Main, Tree::Fork(f)] {
-            assert_eq!(w.path_of(t, "a").as_deref(), Some("g"), "{history:?} {t:?}");
-        }
-        w.rename(&Client::Fork(f), "b", "h");
-        w.rename(&m1(), "c", "h");
-        // Main's queue decides before the sandbox syncs: a sync first would
-        // show the sandbox two files named h (not modelled: MODEL.md).
-        next(&mut w, Tree::Main);
-        drain(&mut w);
-        for t in [Tree::Main, Tree::Fork(f)] {
-            let names = (w.path_of(t, "b"), w.path_of(t, "c"));
-            assert_eq!(names, (Some("b".into()), Some("h".into())), "{t:?}");
-        }
-        let c = w.collisions.last().expect("a clash").clone();
-        assert!(c.by == By::File && c.lines == ["b"], "{c:?}");
+    let mut w = world();
+    let f = w.create_fork(Tree::Main);
+    w.rename(&Client::Fork(f), "a", "e");
+    w.rename(&m1(), "a", "g");
+    drain(&mut w);
+    for t in [Tree::Main, Tree::Fork(f)] {
+        assert_eq!(w.path_of(t, "a").as_deref(), Some("g"), "{t:?}");
     }
+    w.rename(&Client::Fork(f), "b", "h");
+    w.rename(&m1(), "c", "h");
+    // Main's queue decides before the sandbox syncs: a sync first would
+    // show the sandbox two files named h (not modelled: MODEL.md).
+    next(&mut w, Tree::Main);
+    drain(&mut w);
+    for t in [Tree::Main, Tree::Fork(f)] {
+        let names = (w.path_of(t, "b"), w.path_of(t, "c"));
+        assert_eq!(names, (Some("b".into()), Some("h".into())), "{t:?}");
+    }
+    let c = w.collisions.last().expect("a clash").clone();
+    assert!(c.by == By::File && c.lines == ["b"], "{c:?}");
 }
 
 /// Finding 11, two renames to one path before the parent decides (a
@@ -2293,49 +1922,31 @@ fn r11_concurrent_renames_the_parent_wins() {
 /// rename-overs: both rename a file over `d`.
 #[test]
 fn r11_two_renames_to_one_path_keep_the_sandboxs_name_until_decided() {
-    for history in BOTH {
-        let mut w = world(history);
-        let f = w.create_fork(Tree::Main);
-        let t = Tree::Fork(f);
-        w.rename(&Client::Fork(f), "b", "h");
-        w.rename(&m1(), "c", "h");
-        next(&mut w, t);
-        assert_eq!(
-            w.path_of(t, "b").as_deref(),
-            Some("h"),
-            "{history:?}: its own name"
-        );
-        assert_eq!(
-            w.path_of(t, "c").as_deref(),
-            Some("c"),
-            "{history:?}: main's file under its previous name"
-        );
-        drain(&mut w);
-        for t in [Tree::Main, t] {
-            let names = (w.path_of(t, "b"), w.path_of(t, "c"));
-            assert_eq!(
-                names,
-                (Some("b".into()), Some("h".into())),
-                "{history:?} {t:?}"
-            );
-        }
-        w.rename(&Client::Fork(f), "a", "d");
-        w.rename(&m1(), "b", "d");
-        next(&mut w, Tree::Fork(f));
-        assert_eq!(
-            w.path_of(Tree::Fork(f), "a").as_deref(),
-            Some("d"),
-            "{history:?}"
-        );
-        assert_eq!(
-            w.path_of(Tree::Fork(f), "b").as_deref(),
-            Some("b"),
-            "{history:?}"
-        );
-        drain(&mut w);
-        for t in [Tree::Main, Tree::Fork(f)] {
-            assert_eq!(w.path_of(t, "b").as_deref(), Some("d"), "{history:?} {t:?}");
-        }
+    let mut w = world();
+    let f = w.create_fork(Tree::Main);
+    let t = Tree::Fork(f);
+    w.rename(&Client::Fork(f), "b", "h");
+    w.rename(&m1(), "c", "h");
+    next(&mut w, t);
+    assert_eq!(w.path_of(t, "b").as_deref(), Some("h"), "its own name");
+    assert_eq!(
+        w.path_of(t, "c").as_deref(),
+        Some("c"),
+        "main's file under its previous name"
+    );
+    drain(&mut w);
+    for t in [Tree::Main, t] {
+        let names = (w.path_of(t, "b"), w.path_of(t, "c"));
+        assert_eq!(names, (Some("b".into()), Some("h".into())), "{t:?}");
+    }
+    w.rename(&Client::Fork(f), "a", "d");
+    w.rename(&m1(), "b", "d");
+    next(&mut w, Tree::Fork(f));
+    assert_eq!(w.path_of(Tree::Fork(f), "a").as_deref(), Some("d"),);
+    assert_eq!(w.path_of(Tree::Fork(f), "b").as_deref(), Some("b"),);
+    drain(&mut w);
+    for t in [Tree::Main, Tree::Fork(f)] {
+        assert_eq!(w.path_of(t, "b").as_deref(), Some("d"), "{t:?}");
     }
 }
 
@@ -2348,37 +1959,35 @@ fn r11_two_renames_to_one_path_keep_the_sandboxs_name_until_decided() {
 /// file's edit loses.
 #[test]
 fn r11_a_rename_over_applies_or_loses_whole() {
-    for history in BOTH {
-        let mut w = world(history);
-        let f = w.create_fork(Tree::Main);
-        w.rename(&Client::Fork(f), "a", "b");
-        let m = w.save(&m1(), "b", 0);
-        drain(&mut w);
-        for t in [Tree::Main, Tree::Fork(f)] {
-            assert_eq!(w.path_of(t, "a").as_deref(), Some("a"), "{history:?} {t:?}");
-            assert!(has(&w, t, "b", &m));
-        }
-        let lost: BTreeSet<&str> = w.collisions.iter().map(|c| c.path.as_str()).collect();
-        assert_eq!(lost, BTreeSet::from(["a", "b"]), "both halves lose");
-        let before = w.collisions.len();
-        w.rename(&Client::Fork(f), "c", "d");
-        drain(&mut w);
-        assert_eq!(w.collisions.len(), before, "{history:?}: it applies");
-        assert_eq!(w.path_of(Tree::Main, "c").as_deref(), Some("d"));
-        assert_eq!(w.path_of(Tree::Main, "d"), None);
-        w.rename(&m1(), "a", "b");
-        let kept = w.save(&Client::Fork(f), "a", 1);
-        let gone = w.save(&Client::Fork(f), "b", 1);
-        drain(&mut w);
-        assert!(has(&w, Tree::Main, "b", &kept), "{history:?}");
-        assert_eq!(w.path_of(Tree::Main, "a").as_deref(), Some("b"));
-        assert_eq!(w.path_of(Tree::Main, "b"), None);
-        let lost: Vec<String> = w.collisions[before..]
-            .iter()
-            .flat_map(|c| c.lost.clone())
-            .collect();
-        assert_eq!(lost, [gone]);
+    let mut w = world();
+    let f = w.create_fork(Tree::Main);
+    w.rename(&Client::Fork(f), "a", "b");
+    let m = w.save(&m1(), "b", 0);
+    drain(&mut w);
+    for t in [Tree::Main, Tree::Fork(f)] {
+        assert_eq!(w.path_of(t, "a").as_deref(), Some("a"), "{t:?}");
+        assert!(has(&w, t, "b", &m));
     }
+    let lost: BTreeSet<&str> = w.collisions.iter().map(|c| c.path.as_str()).collect();
+    assert_eq!(lost, BTreeSet::from(["a", "b"]), "both halves lose");
+    let before = w.collisions.len();
+    w.rename(&Client::Fork(f), "c", "d");
+    drain(&mut w);
+    assert_eq!(w.collisions.len(), before, "it applies");
+    assert_eq!(w.path_of(Tree::Main, "c").as_deref(), Some("d"));
+    assert_eq!(w.path_of(Tree::Main, "d"), None);
+    w.rename(&m1(), "a", "b");
+    let kept = w.save(&Client::Fork(f), "a", 1);
+    let gone = w.save(&Client::Fork(f), "b", 1);
+    drain(&mut w);
+    assert!(has(&w, Tree::Main, "b", &kept));
+    assert_eq!(w.path_of(Tree::Main, "a").as_deref(), Some("b"));
+    assert_eq!(w.path_of(Tree::Main, "b"), None);
+    let lost: Vec<String> = w.collisions[before..]
+        .iter()
+        .flat_map(|c| c.lost.clone())
+        .collect();
+    assert_eq!(lost, [gone]);
 }
 
 /// Rule 11, a rename-over's other half: the sandbox renames `a` over `b`
@@ -2387,22 +1996,20 @@ fn r11_a_rename_over_applies_or_loses_whole() {
 /// and its lines, and `a` is at `g`, in both trees.
 #[test]
 fn r11_a_rename_over_whose_rename_loses_keeps_the_replaced_file() {
-    for history in BOTH {
-        let mut w = world(history);
-        let f = w.create_fork(Tree::Main);
-        let x = w.save(&m1(), "b", 0);
-        drain(&mut w);
-        w.rename(&Client::Fork(f), "a", "b");
-        w.rename(&m1(), "a", "g");
-        drain(&mut w);
-        for t in [Tree::Main, Tree::Fork(f)] {
-            assert_eq!(w.path_of(t, "a").as_deref(), Some("g"), "{history:?} {t:?}");
-            assert_eq!(w.path_of(t, "b").as_deref(), Some("b"), "{history:?} {t:?}");
-            assert!(has(&w, t, "b", &x), "{history:?} {t:?}");
-        }
-        let lost: BTreeSet<&str> = w.collisions.iter().map(|c| c.path.as_str()).collect();
-        assert_eq!(lost, BTreeSet::from(["a", "b"]), "both halves lose");
+    let mut w = world();
+    let f = w.create_fork(Tree::Main);
+    let x = w.save(&m1(), "b", 0);
+    drain(&mut w);
+    w.rename(&Client::Fork(f), "a", "b");
+    w.rename(&m1(), "a", "g");
+    drain(&mut w);
+    for t in [Tree::Main, Tree::Fork(f)] {
+        assert_eq!(w.path_of(t, "a").as_deref(), Some("g"), "{t:?}");
+        assert_eq!(w.path_of(t, "b").as_deref(), Some("b"), "{t:?}");
+        assert!(has(&w, t, "b", &x), "{t:?}");
     }
+    let lost: BTreeSet<&str> = w.collisions.iter().map(|c| c.path.as_str()).collect();
+    assert_eq!(lost, BTreeSet::from(["a", "b"]), "both halves lose");
 }
 
 /// Rule 11 with rule 9: an unlink or a rename of a file a take holds waits
@@ -2411,55 +2018,51 @@ fn r11_a_rename_over_whose_rename_loses_keeps_the_replaced_file() {
 /// open writer of that file.
 #[test]
 fn r11_an_unlink_or_rename_of_a_held_file_waits() {
-    for history in BOTH {
-        let mut w = world(history);
-        let f = w.create_fork(Tree::Main);
-        let c = Client::Fork(f);
-        w.save(&m1(), "a", 0);
-        take(&mut w, &Step::Next(Tree::Fork(f)));
-        let h = w.unlink(&c, "a").expect("waits");
-        assert!(w.handle(h).waiting && w.path_of(Tree::Fork(f), "a").is_some());
-        take(&mut w, &Step::Finish(Tree::Fork(f)));
-        assert_eq!(w.path_of(Tree::Fork(f), "a"), None, "{history:?}: it ran");
-        w.save(&m1(), "c", 0);
-        take(&mut w, &Step::Next(Tree::Fork(f)));
-        assert!(w.rename(&c, "d", "c").is_some(), "onto a held file");
-        take(&mut w, &Step::Finish(Tree::Fork(f)));
-        assert_eq!(w.path_of(Tree::Fork(f), "d").as_deref(), Some("c"));
-        drain(&mut w);
-        w.unlink(&m1(), "b");
-        let open = w.open_write(&c, "b");
-        take(&mut w, &Step::Next(Tree::Fork(f)));
-        assert!(w.waits().contains_key(&Tree::Fork(f)), "{history:?}");
-        let x = w.edit(open, LineEdit::At(0)).unwrap();
-        w.close(open);
-        drain(&mut w);
-        assert_eq!(w.path_of(Tree::Fork(f), "b"), None);
-        assert!(w.collisions.iter().any(|c| c.lost.contains(&x)));
-    }
+    let mut w = world();
+    let f = w.create_fork(Tree::Main);
+    let c = Client::Fork(f);
+    w.save(&m1(), "a", 0);
+    take(&mut w, &Step::Next(Tree::Fork(f)));
+    let h = w.unlink(&c, "a").expect("waits");
+    assert!(w.handle(h).waiting && w.path_of(Tree::Fork(f), "a").is_some());
+    take(&mut w, &Step::Finish(Tree::Fork(f)));
+    assert_eq!(w.path_of(Tree::Fork(f), "a"), None, "it ran");
+    w.save(&m1(), "c", 0);
+    take(&mut w, &Step::Next(Tree::Fork(f)));
+    assert!(w.rename(&c, "d", "c").is_some(), "onto a held file");
+    take(&mut w, &Step::Finish(Tree::Fork(f)));
+    assert_eq!(w.path_of(Tree::Fork(f), "d").as_deref(), Some("c"));
+    drain(&mut w);
+    w.unlink(&m1(), "b");
+    let open = w.open_write(&c, "b");
+    take(&mut w, &Step::Next(Tree::Fork(f)));
+    assert!(w.waits().contains_key(&Tree::Fork(f)));
+    let x = w.edit(open, LineEdit::At(0)).unwrap();
+    w.close(open);
+    drain(&mut w);
+    assert_eq!(w.path_of(Tree::Fork(f), "b"), None);
+    assert!(w.collisions.iter().any(|c| c.lost.contains(&x)));
 }
 
 /// Rule 11 in one tree, as on Linux: an open file follows its file through
 /// a rename, and a file unlinked while open saves nothing at close.
 #[test]
 fn r11_an_open_file_follows_a_rename_and_an_unlinked_one_saves_nothing() {
-    for history in BOTH {
-        let mut w = world(history);
-        let m2 = Client::Main("m2".into());
-        let h = w.open_write(&m1(), "a");
-        let x = w.edit(h, LineEdit::At(0)).unwrap();
-        w.rename(&m2, "a", "e");
-        w.close(h);
-        assert!(has(&w, Tree::Main, "e", &x), "{history:?}");
-        let h = w.open_write(&m1(), "b");
-        let y = w.edit(h, LineEdit::At(0)).unwrap();
-        w.unlink(&m2, "b");
-        let head = w.main_head.clone();
-        w.close(h);
-        assert_eq!(w.main_head, head, "nothing saved");
-        assert!(!w.file(&head, "b").holds(&y));
-        drain(&mut w);
-    }
+    let mut w = world();
+    let m2 = Client::Main("m2".into());
+    let h = w.open_write(&m1(), "a");
+    let x = w.edit(h, LineEdit::At(0)).unwrap();
+    w.rename(&m2, "a", "e");
+    w.close(h);
+    assert!(has(&w, Tree::Main, "e", &x));
+    let h = w.open_write(&m1(), "b");
+    let y = w.edit(h, LineEdit::At(0)).unwrap();
+    w.unlink(&m2, "b");
+    let head = w.main_head.clone();
+    w.close(h);
+    assert_eq!(w.main_head, head, "nothing saved");
+    assert!(!w.file(&head, "b").holds(&y));
+    drain(&mut w);
 }
 
 // ── rule 11: creates, objects and the atomic save (git-model.md §7) ─────
@@ -2489,25 +2092,23 @@ fn atomic_save(
 /// land like any save. Two trees creating files at once both keep theirs.
 #[test]
 fn r11_a_create_lands_like_any_save() {
-    for history in BOTH {
-        let mut w = world(history);
-        let f = w.create_fork(Tree::Main);
-        let h = w.create(&Client::Fork(f), "t1").unwrap();
-        w.write(h, Write::Append("x\n".into()));
-        w.close(h);
-        let k = w.create(&m1(), "t2").unwrap();
-        w.close(k);
-        assert_eq!(w.lookup(&w.head(Tree::Fork(f)), "t1").as_deref(), Some("g"));
-        assert_eq!(w.lookup(&w.main_head, "t2").as_deref(), Some("h"));
-        assert!(
-            w.lookup(&w.main_head, "t1").is_none(),
-            "landing is a queued step"
-        );
-        drain(&mut w);
-        for t in [Tree::Main, Tree::Fork(f)] {
-            assert_eq!(w.read(t, "t1").bytes(), "x\n", "{history:?} {t:?}");
-            assert_eq!(w.read(t, "t2").bytes(), "", "{history:?} {t:?}");
-        }
+    let mut w = world();
+    let f = w.create_fork(Tree::Main);
+    let h = w.create(&Client::Fork(f), "t1").unwrap();
+    w.write(h, Write::Append("x\n".into()));
+    w.close(h);
+    let k = w.create(&m1(), "t2").unwrap();
+    w.close(k);
+    assert_eq!(w.lookup(&w.head(Tree::Fork(f)), "t1").as_deref(), Some("g"));
+    assert_eq!(w.lookup(&w.main_head, "t2").as_deref(), Some("h"));
+    assert!(
+        w.lookup(&w.main_head, "t1").is_none(),
+        "landing is a queued step"
+    );
+    drain(&mut w);
+    for t in [Tree::Main, Tree::Fork(f)] {
+        assert_eq!(w.read(t, "t1").bytes(), "x\n", "{t:?}");
+        assert_eq!(w.read(t, "t2").bytes(), "", "{t:?}");
     }
 }
 
@@ -2517,30 +2118,25 @@ fn r11_a_create_lands_like_any_save() {
 /// lose whole: `r11_a_rename_over_applies_or_loses_whole`). The new file ends.
 #[test]
 fn r11_an_atomic_save_keeps_the_files_identity_and_merges_per_line() {
-    for history in BOTH {
-        let mut w = world(history);
-        let f = w.create_fork(Tree::Main);
-        let c = Client::Fork(f);
-        atomic_save(&mut w, &c, "a", "a.tmp", LineEdit::At(0), "x");
-        let m = w.save(&m1(), "a", 4);
-        let fork = w.read(Tree::Fork(f), "a");
-        assert_eq!(fork.name.line, "a", "the replaced file keeps its identity");
-        assert_eq!(
-            w.lookup(&w.head(Tree::Fork(f)), "a.tmp"),
-            None,
-            "the new file ended"
-        );
-        assert!(!w.file(&w.head(Tree::Fork(f)), "g").name.live());
-        drain(&mut w);
-        let main = w.read(Tree::Main, "a");
-        assert_eq!(main.texts()[0], "x", "{history:?}: the atomic save landed");
-        assert!(
-            main.contains(&m),
-            "{history:?}: and main's edit of another line stayed"
-        );
-        assert!(w.collisions.is_empty(), "{history:?}: {:?}", w.collisions);
-        assert_eq!(w.read(Tree::Fork(f), "a"), main);
-    }
+    let mut w = world();
+    let f = w.create_fork(Tree::Main);
+    let c = Client::Fork(f);
+    atomic_save(&mut w, &c, "a", "a.tmp", LineEdit::At(0), "x");
+    let m = w.save(&m1(), "a", 4);
+    let fork = w.read(Tree::Fork(f), "a");
+    assert_eq!(fork.name.line, "a", "the replaced file keeps its identity");
+    assert_eq!(
+        w.lookup(&w.head(Tree::Fork(f)), "a.tmp"),
+        None,
+        "the new file ended"
+    );
+    assert!(!w.file(&w.head(Tree::Fork(f)), "g").name.live());
+    drain(&mut w);
+    let main = w.read(Tree::Main, "a");
+    assert_eq!(main.texts()[0], "x", "the atomic save landed");
+    assert!(main.contains(&m), "and main's edit of another line stayed");
+    assert!(w.collisions.is_empty(), "{:?}", w.collisions);
+    assert_eq!(w.read(Tree::Fork(f), "a"), main);
 }
 
 /// Rule 11 with git-model.md §7's objects: an old writer of the file an
@@ -2551,66 +2147,57 @@ fn r11_an_atomic_save_keeps_the_files_identity_and_merges_per_line() {
 /// clients) and in a sandbox (one program with both opens).
 #[test]
 fn r11_an_old_writer_after_an_atomic_save_saves_nothing() {
-    for history in BOTH {
-        for in_fork in [false, true] {
-            let mut w = world(history);
-            let f = w.create_fork(Tree::Main);
-            let (t, old, editor) = if in_fork {
-                (Tree::Fork(f), Client::Fork(f), Client::Fork(f))
+    for in_fork in [false, true] {
+        let mut w = world();
+        let f = w.create_fork(Tree::Main);
+        let (t, old, editor) = if in_fork {
+            (Tree::Fork(f), Client::Fork(f), Client::Fork(f))
+        } else {
+            (Tree::Main, Client::Main("m2".into()), m1())
+        };
+        let h = w.open_write(&old, "a");
+        w.write(h, Write::Append("old\n".into()));
+        let new = atomic_save(&mut w, &editor, "a", "a.tmp", LineEdit::At(0), "x");
+        assert_eq!(w.read(t, "a").bytes(), new);
+        let g = w.create_fork(t);
+        w.save(&Client::Fork(g), "a", 3);
+        take(&mut w, &Step::Next(t));
+        assert!(!w.waits().contains_key(&t), "the landing does not wait");
+        take(&mut w, &Step::Finish(t));
+        w.write(
+            h,
+            Write::Pwrite {
+                offset: 0,
+                bytes: "zz".into(),
+            },
+        );
+        let (head, now) = (w.head(t), w.read(t, "a").bytes());
+        assert!(now.starts_with("x\n") && !now.contains("old"), "{now:?}");
+        w.close(h);
+        ok(&mut w);
+        assert_eq!(w.head(t), head, "the orphan saved nothing");
+        assert_eq!(
+            w.read(t, "a").bytes(),
+            now,
+            "its writes never reached the replacement"
+        );
+        let _ = new;
+        let e = w.orphans.last().expect("an OrphanDropped event");
+        assert_eq!((e.handle, e.path.as_str(), e.bytes), (h, "a", 6),);
+        assert_eq!(
+            e.writer,
+            if in_fork {
+                format!("c{f}")
             } else {
-                (Tree::Main, Client::Main("m2".into()), m1())
-            };
-            let h = w.open_write(&old, "a");
-            w.write(h, Write::Append("old\n".into()));
-            let new = atomic_save(&mut w, &editor, "a", "a.tmp", LineEdit::At(0), "x");
-            assert_eq!(w.read(t, "a").bytes(), new);
-            let g = w.create_fork(t);
-            w.save(&Client::Fork(g), "a", 3);
-            take(&mut w, &Step::Next(t));
-            assert!(
-                !w.waits().contains_key(&t),
-                "{history:?}: the landing does not wait"
-            );
-            take(&mut w, &Step::Finish(t));
-            w.write(
-                h,
-                Write::Pwrite {
-                    offset: 0,
-                    bytes: "zz".into(),
-                },
-            );
-            let (head, now) = (w.head(t), w.read(t, "a").bytes());
-            assert!(now.starts_with("x\n") && !now.contains("old"), "{now:?}");
-            w.close(h);
-            ok(&mut w);
-            assert_eq!(w.head(t), head, "{history:?}: the orphan saved nothing");
-            assert_eq!(
-                w.read(t, "a").bytes(),
-                now,
-                "its writes never reached the replacement"
-            );
-            let _ = new;
-            let e = w.orphans.last().expect("an OrphanDropped event");
-            assert_eq!(
-                (e.handle, e.path.as_str(), e.bytes),
-                (h, "a", 6),
-                "{history:?}"
-            );
-            assert_eq!(
-                e.writer,
-                if in_fork {
-                    format!("c{f}")
-                } else {
-                    "m2".into()
-                }
-            );
-            drain(&mut w);
-            let a = w.read(Tree::Main, "a");
-            assert_eq!(a.texts()[0], "x", "{history:?} {in_fork}");
-            assert!(!a.bytes().contains("old") && !a.bytes().contains("zz"));
-            assert_eq!(a.texts().len(), 6, "the landing's line 3 merged per line");
-            assert!(w.collisions.is_empty(), "{:?}", w.collisions);
-        }
+                "m2".into()
+            }
+        );
+        drain(&mut w);
+        let a = w.read(Tree::Main, "a");
+        assert_eq!(a.texts()[0], "x", "{in_fork}");
+        assert!(!a.bytes().contains("old") && !a.bytes().contains("zz"));
+        assert_eq!(a.texts().len(), 6, "the landing's line 3 merged per line");
+        assert!(w.collisions.is_empty(), "{:?}", w.collisions);
     }
 }
 
@@ -2619,29 +2206,23 @@ fn r11_an_old_writer_after_an_atomic_save_saves_nothing() {
 /// its close save into that file.
 #[test]
 fn r11_an_open_on_the_new_file_follows_it_through_the_atomic_save() {
-    for history in BOTH {
-        let mut w = world(history);
-        let h = w.create(&m1(), "a.tmp").unwrap();
-        w.write(h, Write::Append("x\n".into()));
-        assert!(w.rename(&m1(), "a.tmp", "a").is_none());
-        ok(&mut w);
-        assert_eq!(
-            w.read(Tree::Main, "a").bytes(),
-            "",
-            "the new file was empty at the rename"
-        );
-        w.write(h, Write::Append("y\n".into()));
-        w.close(h);
-        ok(&mut w);
-        let a = w.read(Tree::Main, "a");
-        assert_eq!(
-            (a.name.line.as_str(), a.bytes().as_str()),
-            ("a", "x\ny\n"),
-            "{history:?}"
-        );
-        assert!(w.orphans.is_empty());
-        drain(&mut w);
-    }
+    let mut w = world();
+    let h = w.create(&m1(), "a.tmp").unwrap();
+    w.write(h, Write::Append("x\n".into()));
+    assert!(w.rename(&m1(), "a.tmp", "a").is_none());
+    ok(&mut w);
+    assert_eq!(
+        w.read(Tree::Main, "a").bytes(),
+        "",
+        "the new file was empty at the rename"
+    );
+    w.write(h, Write::Append("y\n".into()));
+    w.close(h);
+    ok(&mut w);
+    let a = w.read(Tree::Main, "a");
+    assert_eq!((a.name.line.as_str(), a.bytes().as_str()), ("a", "x\ny\n"),);
+    assert!(w.orphans.is_empty());
+    drain(&mut w);
 }
 
 // ── rule 12: every write call is recorded before it returns (git-model.md §3)
@@ -2652,45 +2233,37 @@ fn r11_an_open_on_the_new_file_follows_it_through_the_atomic_save() {
 /// which never returned, is dropped.
 #[test]
 fn r12_a_crash_saves_every_open_from_the_journal() {
-    for history in BOTH {
-        let mut w = world(history);
-        let f = w.create_fork(Tree::Main);
-        let h = w.open_write(&m1(), "a");
-        w.write(h, Write::Append("x\n".into()));
-        let k = w.open_write(&Client::Fork(f), "b");
-        w.write(
-            k,
-            Write::Pwrite {
-                offset: 0,
-                bytes: "y".into(),
-            },
-        );
-        let g = w.create_fork(Tree::Fork(f));
-        w.save(&Client::Fork(g), "b", 1);
-        take(&mut w, &Step::Next(Tree::Fork(f)));
-        assert!(
-            w.waits().contains_key(&Tree::Fork(f)),
-            "the landing waits for k"
-        );
-        w.crash();
-        ok(&mut w);
-        assert_eq!(w.handles().count(), 0, "every open ended with the mount");
-        assert!(
-            w.read(Tree::Main, "a").bytes().ends_with("-\nx\n"),
-            "{history:?}"
-        );
-        assert!(
-            w.read(Tree::Fork(f), "b").bytes().starts_with("y\n"),
-            "{history:?}"
-        );
-        assert!(w.saved(h) && w.saved(k));
-        assert!(
-            w.waits().is_empty(),
-            "waits are found again at the next take"
-        );
-        drain(&mut w);
-        assert!(w.read(Tree::Main, "a").bytes().ends_with("-\nx\n"));
-    }
+    let mut w = world();
+    let f = w.create_fork(Tree::Main);
+    let h = w.open_write(&m1(), "a");
+    w.write(h, Write::Append("x\n".into()));
+    let k = w.open_write(&Client::Fork(f), "b");
+    w.write(
+        k,
+        Write::Pwrite {
+            offset: 0,
+            bytes: "y".into(),
+        },
+    );
+    let g = w.create_fork(Tree::Fork(f));
+    w.save(&Client::Fork(g), "b", 1);
+    take(&mut w, &Step::Next(Tree::Fork(f)));
+    assert!(
+        w.waits().contains_key(&Tree::Fork(f)),
+        "the landing waits for k"
+    );
+    w.crash();
+    ok(&mut w);
+    assert_eq!(w.handles().count(), 0, "every open ended with the mount");
+    assert!(w.read(Tree::Main, "a").bytes().ends_with("-\nx\n"),);
+    assert!(w.read(Tree::Fork(f), "b").bytes().starts_with("y\n"),);
+    assert!(w.saved(h) && w.saved(k));
+    assert!(
+        w.waits().is_empty(),
+        "waits are found again at the next take"
+    );
+    drain(&mut w);
+    assert!(w.read(Tree::Main, "a").bytes().ends_with("-\nx\n"));
 }
 
 /// Rule 12: a crash after a close's save but before its journal records
@@ -2698,44 +2271,42 @@ fn r12_a_crash_saves_every_open_from_the_journal() {
 /// save it again. A take in progress is lost and taken again.
 #[test]
 fn r12_a_crash_during_a_close_saves_the_open_once() {
-    for history in BOTH {
-        let mut w = world(history);
-        let f = w.create_fork(Tree::Main);
-        w.save(&Client::Fork(f), "b", 0);
-        take(&mut w, &Step::Next(Tree::Main));
-        assert!(!w.holds().is_empty());
-        let h = w.open_write(&m1(), "a");
-        w.write(h, Write::Append("x\n".into()));
-        let head = w.main_head.clone();
-        w.close_then_crash(h);
-        ok(&mut w);
-        let saves = git(
-            w.repo(),
-            &["rev-list", "--all", &format!("--grep=^Agentfs-Open: {h}$")],
-        );
-        assert_eq!(saves.lines().count(), 1, "{history:?}: saved once");
-        assert_eq!(
-            git(w.repo(), &["rev-parse", &format!("{}^1", w.main_head)]),
-            head
-        );
-        assert!(
-            w.holds().is_empty() && w.queue_len(Tree::Main) == 1,
-            "the take went back"
-        );
-        drain(&mut w);
-        assert_eq!(w.read(Tree::Main, "a").bytes().matches("x\n").count(), 1);
-        assert_eq!(w.read(Tree::Main, "b"), w.read(Tree::Fork(f), "b"));
-    }
+    let mut w = world();
+    let f = w.create_fork(Tree::Main);
+    w.save(&Client::Fork(f), "b", 0);
+    take(&mut w, &Step::Next(Tree::Main));
+    assert!(!w.holds().is_empty());
+    let h = w.open_write(&m1(), "a");
+    w.write(h, Write::Append("x\n".into()));
+    let head = w.main_head.clone();
+    w.close_then_crash(h);
+    ok(&mut w);
+    let saves = git(
+        w.repo(),
+        &["rev-list", "--all", &format!("--grep=^Agentfs-Open: {h}$")],
+    );
+    assert_eq!(saves.lines().count(), 1, "saved once");
+    assert_eq!(
+        git(w.repo(), &["rev-parse", &format!("{}^1", w.main_head)]),
+        head
+    );
+    assert!(
+        w.holds().is_empty() && w.queue_len(Tree::Main) == 1,
+        "the take went back"
+    );
+    drain(&mut w);
+    assert_eq!(w.read(Tree::Main, "a").bytes().matches("x\n").count(), 1);
+    assert_eq!(w.read(Tree::Main, "b"), w.read(Tree::Fork(f), "b"));
 }
 
-/// The calls of finding 26 (seed 332 of the settings comparison): a nested
+/// The calls of finding 26: a nested
 /// sandbox f3 deletes line 3 of `a`; its parent f2 deletes line 3 too and
 /// edits line 0, which main edits concurrently, so f2's save loses whole at
 /// main. Then f2 takes f3's save: its delete agrees with f2's, so it
 /// applies there, an ordinary version of f3's change (the owner,
 /// 2026-11-05, rejecting R3e.3). Returns main's and f3's lines once drained.
-fn nested_agreeing_delete(history: HistoryPolicy) -> (Vec<String>, Vec<String>) {
-    let mut w = world(history);
+fn nested_agreeing_delete() -> (Vec<String>, Vec<String>) {
+    let mut w = world();
     let d = w.open_write(&m1(), "a");
     for i in 0..6 {
         w.edit(d, LineEdit::At(i));
@@ -2755,27 +2326,27 @@ fn nested_agreeing_delete(history: HistoryPolicy) -> (Vec<String>, Vec<String>) 
     next(&mut w, Tree::Main);
     assert!(
         w.collisions.iter().any(|c| c.by == By::Whole),
-        "{history:?}: f2's save lost whole at main"
+        "f2's save lost whole at main"
     );
     next(&mut w, Tree::Fork(f2));
     assert_eq!(
         version(&w, Tree::Fork(f2)),
         Some(mine.clone()),
-        "{history:?}: f3's delete applied in f2"
+        "f3's delete applied in f2"
     );
     // f2 syncs main (its own delete lost there) before f3 syncs: f2 keeps
     // f3's delete, which main's queue has not decided yet (rule 3d).
     while w.pending().contains(&Step::Next(Tree::Fork(f2))) {
         next(&mut w, Tree::Fork(f2));
     }
-    assert_eq!(w.read(Tree::Fork(f2), "a").texts().len(), 5, "{history:?}");
-    assert_eq!(w.read(Tree::Fork(f3), "a").texts().len(), 5, "{history:?}");
+    assert_eq!(w.read(Tree::Fork(f2), "a").texts().len(), 5);
+    assert_eq!(w.read(Tree::Fork(f3), "a").texts().len(), 5);
     next(&mut w, Tree::Fork(f3));
     drain(&mut w);
     assert_eq!(
         version(&w, Tree::Main),
         Some(mine),
-        "{history:?}: f3's delete carried upward and applied in main"
+        "f3's delete carried upward and applied in main"
     );
     (
         w.read(Tree::Main, "a").texts(),
@@ -2791,59 +2362,41 @@ fn nested_agreeing_delete(history: HistoryPolicy) -> (Vec<String>, Vec<String>) 
 /// though the parent's own delete lost there. Finding 26's calls.
 #[test]
 fn r3_a_nested_sandboxs_agreeing_delete_is_carried_upward() {
-    for history in BOTH {
-        let (main, f3) = nested_agreeing_delete(history);
-        assert_eq!(main.len(), 5, "{history:?}: line 3 deleted in main");
-        assert_eq!(f3, main, "{history:?}: and in the nested sandbox");
-    }
+    let (main, f3) = nested_agreeing_delete();
+    assert_eq!(main.len(), 5, "line 3 deleted in main");
+    assert_eq!(f3, main, "and in the nested sandbox");
 }
 
-/// Rule 7's "the setting decides nothing" (R7.2), finding 27: the nested
-/// agreeing delete above is decided the same under both settings. It
-/// failed while an agreeing delete was dropped (R3e.3, which the owner
-/// rejected on 2026-11-05).
-#[test]
-fn r7_a_nested_agreeing_delete_is_decided_the_same_under_both_settings() {
-    assert_eq!(
-        nested_agreeing_delete(HistoryPolicy::FullLineage),
-        nested_agreeing_delete(HistoryPolicy::Squashed)
-    );
-}
-
-/// R10.3, finding 28 (2026-11-05, found removing R3e.3; seed 15 of 1 to
-/// 64 of the settings comparison): main edits line 1, then deletes it; the
+/// R10.3, finding 28 (2026-11-05, found removing R3e.3): main edits line 1, then deletes it; the
 /// sandbox deletes line 1 concurrently. The two deletes agree: both are
 /// recorded, no collision is reported, and the line stays deleted. Main's
 /// edit is not lost: main's own delete replaced it first. The checks
 /// called it a loss until the owner's rule R10.3.
 #[test]
 fn r10_two_deletes_of_one_line_agree_over_an_unseen_edit() {
-    for history in BOTH {
-        let mut w = world(history);
-        let f = w.create_fork(Tree::Main);
-        distinct(&mut w, "a");
-        let line1 = w.read(Tree::Main, "a").lines[1].line.clone();
-        w.save(&m1(), "a", 1);
-        call(&mut w, &m1(), "a", LineEdit::Delete(1));
-        call(&mut w, &Client::Fork(f), "a", LineEdit::Delete(1));
-        drain(&mut w);
-        assert!(w.collisions.is_empty(), "{history:?}: {:?}", w.collisions);
-        for t in [Tree::Main, Tree::Fork(f)] {
-            let a = w.read(t, "a");
-            let v = a.member(&line1).expect("line 1");
-            assert!(!v.live(), "{history:?} {t:?}: line 1 deleted, {v:?}");
-        }
+    let mut w = world();
+    let f = w.create_fork(Tree::Main);
+    distinct(&mut w, "a");
+    let line1 = w.read(Tree::Main, "a").lines[1].line.clone();
+    w.save(&m1(), "a", 1);
+    call(&mut w, &m1(), "a", LineEdit::Delete(1));
+    call(&mut w, &Client::Fork(f), "a", LineEdit::Delete(1));
+    drain(&mut w);
+    assert!(w.collisions.is_empty(), "{:?}", w.collisions);
+    for t in [Tree::Main, Tree::Fork(f)] {
+        let a = w.read(t, "a");
+        let v = a.member(&line1).expect("line 1");
+        assert!(!v.live(), "{t:?}: line 1 deleted, {v:?}");
     }
 }
 
-/// R10.3 under `Squashed`, finding 28 (seeds 44 and 60 of 1 to 64 of the
-/// squashed run): a sandbox's edit of line 1 loses to main's delete, and a
-/// later save of the same take deletes line 1 over that edit. That delete
-/// agrees with main's: it applies, the line stays deleted, and only the
-/// edit is named lost.
+/// R10.3, finding 28: a sandbox's edit of line 1 loses to main's delete, and
+/// a later save deletes line 1 over that edit. That delete agrees with
+/// main's: it applies, the line stays deleted, and only the edit is named
+/// lost.
 #[test]
-fn r10_a_squashed_delete_agrees_with_the_winning_delete() {
-    let mut w = world(HistoryPolicy::Squashed);
+fn r10_a_later_delete_agrees_with_the_winning_delete() {
+    let mut w = world();
     let f = w.create_fork(Tree::Main);
     distinct(&mut w, "a");
     let line1 = w.read(Tree::Main, "a").lines[1].line.clone();
@@ -2865,33 +2418,29 @@ fn r10_a_squashed_delete_agrees_with_the_winning_delete() {
     }
 }
 
-/// Finding 25 (seeds 287 and 436 of the settings comparison): a sandbox
+/// Finding 25: a sandbox
 /// renames `a` to `e` (save 1), then renames `c` over `e` (save 2, one call:
 /// `c` named `e`, `a` replaced). Main edited `a` meanwhile, unseen by save 2,
 /// so save 2's unlink of `a` loses to that line (the file rule) and save 2
 /// loses whole: its rename of `c` lost with its change (`By::Whole`), not to
-/// the name `a` keeps only because the change lost. Before, it was labelled
-/// lost `By::File` to save 1's name of `a`, which under `Squashed` had won
-/// only earlier in the same take, so the parent-wins check failed.
+/// the name `a` keeps only because the change lost.
 #[test]
 fn r11_a_losing_rename_over_loses_its_rename_with_its_change() {
-    for history in BOTH {
-        let mut w = world(history);
-        let f = w.create_fork(Tree::Main);
-        let c = Client::Fork(f);
-        w.rename(&c, "a", "e");
-        w.save(&m1(), "a", 0);
-        w.rename(&c, "c", "e");
-        drain(&mut w);
-        let named: Vec<_> = w.collisions.iter().filter(|x| x.path == "c").collect();
-        assert!(
-            !named.is_empty() && named.iter().all(|x| x.by == By::Whole),
-            "{history:?}: {named:?}"
-        );
-        for t in [Tree::Main, Tree::Fork(f)] {
-            assert_eq!(w.path_of(t, "a").as_deref(), Some("e"), "{history:?} {t:?}");
-            assert_eq!(w.path_of(t, "c").as_deref(), Some("c"), "{history:?} {t:?}");
-        }
+    let mut w = world();
+    let f = w.create_fork(Tree::Main);
+    let c = Client::Fork(f);
+    w.rename(&c, "a", "e");
+    w.save(&m1(), "a", 0);
+    w.rename(&c, "c", "e");
+    drain(&mut w);
+    let named: Vec<_> = w.collisions.iter().filter(|x| x.path == "c").collect();
+    assert!(
+        !named.is_empty() && named.iter().all(|x| x.by == By::Whole),
+        "{named:?}"
+    );
+    for t in [Tree::Main, Tree::Fork(f)] {
+        assert_eq!(w.path_of(t, "a").as_deref(), Some("e"), "{t:?}");
+        assert_eq!(w.path_of(t, "c").as_deref(), Some("c"), "{t:?}");
     }
 }
 
@@ -2907,77 +2456,71 @@ fn r11_a_losing_rename_over_loses_its_rename_with_its_change() {
 /// answer names it.
 #[test]
 fn r3_a_transactions_agreeing_delete_is_part_of_its_change() {
-    for history in BOTH {
-        let mut w = world(history);
-        // Distinct bytes, so the alignment's pick among identical lines
-        // plays no part (rule 10).
-        let d = w.open_write(&m1(), "a");
-        for i in 0..6 {
-            w.edit(d, LineEdit::At(i));
-        }
-        w.close(d);
-        let f = w.create_fork(Tree::Main);
-        let c = Client::Fork(f);
-        let line3 = w.read(Tree::Main, "a").lines[3].line.clone();
-        let version = |w: &World, t: Tree| w.read(t, "a").member(&line3).map(|l| l.id.clone());
-        let h = w.open_write(&c, "a");
-        w.begin(f).unwrap();
-        let k = w.open_write(&c, "a");
-        w.edit(k, LineEdit::Delete(3));
-        w.close(k);
-        w.edit(h, LineEdit::Delete(3));
-        w.edit(h, LineEdit::At(0));
-        w.close(h);
-        let theirs = version(&w, Tree::Fork(f)).expect("the sandbox's delete");
-        w.save(&m1(), "a", 0);
-        assert_eq!(w.commit_txn(f), Ok(TxnOutcome::Committed), "{history:?}");
-        let mine = version(&w, Tree::Fork(f)).expect("the transaction's delete");
-        assert_ne!(mine, theirs, "{history:?}: applied in the sandbox");
-        drain(&mut w);
-        assert_eq!(
-            w.read(Tree::Main, "a").texts().len(),
-            5,
-            "{history:?}: line 3 stays deleted"
-        );
-        assert_eq!(
-            version(&w, Tree::Main),
-            Some(mine),
-            "{history:?}: carried upward"
-        );
-
-        // The loss: the transaction deletes line 3 and edits line 0; the
-        // sandbox's save deletes line 3 and edits line 0 concurrently.
-        let line3 = w
-            .read(Tree::Fork(f), "a")
-            .get(3)
-            .expect("a line 3")
-            .line
-            .clone();
-        let h = w.open_write(&c, "a");
-        w.begin(f).unwrap();
-        let k = w.open_write(&c, "a");
-        w.edit(k, LineEdit::Delete(3));
-        w.edit(k, LineEdit::At(0));
-        w.close(k);
-        w.edit(h, LineEdit::Delete(3));
-        w.edit(h, LineEdit::At(0));
-        w.close(h);
-        let Ok(TxnOutcome::Lost { lines }) = w.commit_txn(f) else {
-            panic!("{history:?}: the transaction lost");
-        };
-        let gone = lines
-            .iter()
-            .find(|o| o.line == line3)
-            .map(|o| o.staged.clone())
-            .unwrap_or_else(|| panic!("{history:?}: its agreeing delete is named: {lines:?}"));
-        assert!(
-            w.collisions
-                .iter()
-                .any(|x| x.by == By::Whole && x.lost.contains(&gone)),
-            "{history:?}: lost with its change"
-        );
-        drain(&mut w);
+    let mut w = world();
+    // Distinct bytes, so the alignment's pick among identical lines
+    // plays no part (rule 10).
+    let d = w.open_write(&m1(), "a");
+    for i in 0..6 {
+        w.edit(d, LineEdit::At(i));
     }
+    w.close(d);
+    let f = w.create_fork(Tree::Main);
+    let c = Client::Fork(f);
+    let line3 = w.read(Tree::Main, "a").lines[3].line.clone();
+    let version = |w: &World, t: Tree| w.read(t, "a").member(&line3).map(|l| l.id.clone());
+    let h = w.open_write(&c, "a");
+    w.begin(f).unwrap();
+    let k = w.open_write(&c, "a");
+    w.edit(k, LineEdit::Delete(3));
+    w.close(k);
+    w.edit(h, LineEdit::Delete(3));
+    w.edit(h, LineEdit::At(0));
+    w.close(h);
+    let theirs = version(&w, Tree::Fork(f)).expect("the sandbox's delete");
+    w.save(&m1(), "a", 0);
+    assert_eq!(w.commit_txn(f), Ok(TxnOutcome::Committed));
+    let mine = version(&w, Tree::Fork(f)).expect("the transaction's delete");
+    assert_ne!(mine, theirs, "applied in the sandbox");
+    drain(&mut w);
+    assert_eq!(
+        w.read(Tree::Main, "a").texts().len(),
+        5,
+        "line 3 stays deleted"
+    );
+    assert_eq!(version(&w, Tree::Main), Some(mine), "carried upward");
+
+    // The loss: the transaction deletes line 3 and edits line 0; the
+    // sandbox's save deletes line 3 and edits line 0 concurrently.
+    let line3 = w
+        .read(Tree::Fork(f), "a")
+        .get(3)
+        .expect("a line 3")
+        .line
+        .clone();
+    let h = w.open_write(&c, "a");
+    w.begin(f).unwrap();
+    let k = w.open_write(&c, "a");
+    w.edit(k, LineEdit::Delete(3));
+    w.edit(k, LineEdit::At(0));
+    w.close(k);
+    w.edit(h, LineEdit::Delete(3));
+    w.edit(h, LineEdit::At(0));
+    w.close(h);
+    let Ok(TxnOutcome::Lost { lines }) = w.commit_txn(f) else {
+        panic!("the transaction lost");
+    };
+    let gone = lines
+        .iter()
+        .find(|o| o.line == line3)
+        .map(|o| o.staged.clone())
+        .unwrap_or_else(|| panic!("its agreeing delete is named: {lines:?}"));
+    assert!(
+        w.collisions
+            .iter()
+            .any(|x| x.by == By::Whole && x.lost.contains(&gone)),
+        "lost with its change"
+    );
+    drain(&mut w);
 }
 
 // ── rule 9, progress (git-model.md §6: P1 and P2; P3 deleted) ───────────
@@ -2989,51 +2532,43 @@ fn r3_a_transactions_agreeing_delete_is_part_of_its_change() {
 /// nor does another sandbox's change of the held file.
 #[test]
 fn r9_a_long_lived_main_writer_holds_back_only_its_own_file() {
-    for history in BOTH {
-        let mut w = world(history);
-        let (f, g) = (w.create_fork(Tree::Main), w.create_fork(Tree::Main));
-        let k = w.create_fork(Tree::Main);
-        let m2 = Client::Main("m2".into());
-        let log = w.open_write(&m2, "a");
-        w.write(log, Write::Append("log\n".into()));
-        let x = w.save(&Client::Fork(f), "a", 0);
-        let y = w.save(&Client::Fork(g), "b", 0);
-        let z = w.save(&Client::Fork(f), "c", 0);
-        let v = w.save(&Client::Fork(k), "a", 1);
-        take(&mut w, &Step::Next(Tree::Main));
-        assert!(
-            w.waits().contains_key(&Tree::Main),
-            "f's landing of a waits for the writer"
-        );
-        take(&mut w, &Step::Next(Tree::Main));
-        assert!(
-            w.holds().contains_key(&Tree::Main),
-            "{history:?}: g's landing is taken"
-        );
-        take(&mut w, &Step::Finish(Tree::Main));
-        assert!(
-            has(&w, Tree::Main, "b", &y),
-            "{history:?}: g's unrelated change went ahead"
-        );
-        assert!(
-            !has(&w, Tree::Main, "c", &z),
-            "f's later save keeps its place behind its first"
-        );
-        assert!(
-            !w.pending().contains(&Step::Next(Tree::Main)),
-            "nothing else is free to go: k's change shares the waiting one's file"
-        );
-        w.write(log, Write::Append("more\n".into()));
-        w.close(log);
-        ok(&mut w);
-        drain(&mut w);
-        assert!(
-            has(&w, Tree::Main, "a", &x) && has(&w, Tree::Main, "c", &z),
-            "{history:?}"
-        );
-        assert!(has(&w, Tree::Main, "a", &v));
-        assert!(w.read(Tree::Main, "a").bytes().ends_with("log\nmore\n"));
-    }
+    let mut w = world();
+    let (f, g) = (w.create_fork(Tree::Main), w.create_fork(Tree::Main));
+    let k = w.create_fork(Tree::Main);
+    let m2 = Client::Main("m2".into());
+    let log = w.open_write(&m2, "a");
+    w.write(log, Write::Append("log\n".into()));
+    let x = w.save(&Client::Fork(f), "a", 0);
+    let y = w.save(&Client::Fork(g), "b", 0);
+    let z = w.save(&Client::Fork(f), "c", 0);
+    let v = w.save(&Client::Fork(k), "a", 1);
+    take(&mut w, &Step::Next(Tree::Main));
+    assert!(
+        w.waits().contains_key(&Tree::Main),
+        "f's landing of a waits for the writer"
+    );
+    take(&mut w, &Step::Next(Tree::Main));
+    assert!(w.holds().contains_key(&Tree::Main), "g's landing is taken");
+    take(&mut w, &Step::Finish(Tree::Main));
+    assert!(
+        has(&w, Tree::Main, "b", &y),
+        "g's unrelated change went ahead"
+    );
+    assert!(
+        !has(&w, Tree::Main, "c", &z),
+        "f's later save keeps its place behind its first"
+    );
+    assert!(
+        !w.pending().contains(&Step::Next(Tree::Main)),
+        "nothing else is free to go: k's change shares the waiting one's file"
+    );
+    w.write(log, Write::Append("more\n".into()));
+    w.close(log);
+    ok(&mut w);
+    drain(&mut w);
+    assert!(has(&w, Tree::Main, "a", &x) && has(&w, Tree::Main, "c", &z),);
+    assert!(has(&w, Tree::Main, "a", &v));
+    assert!(w.read(Tree::Main, "a").bytes().ends_with("log\nmore\n"));
 }
 
 /// Rule 9 without P3 (the owner, 2026-11-04: "it seems low risk for them
@@ -3045,53 +2580,48 @@ fn r9_a_long_lived_main_writer_holds_back_only_its_own_file() {
 /// goes once the last one closes.
 #[test]
 fn r9_new_writers_postpone_a_waiting_take_and_raise_an_alarm() {
-    for history in BOTH {
-        let mut w = world(history);
-        let f = w.create_fork(Tree::Main);
-        let m2 = Client::Main("m2".into());
-        let first = w.open_write(&m1(), "a");
-        let x = w.save(&Client::Fork(f), "a", 0);
-        take(&mut w, &Step::Next(Tree::Main));
-        assert!(w.waits().contains_key(&Tree::Main));
-        assert!(w.delayed.is_empty(), "an open before the wait is no alarm");
-        let second = w.open_write(&m2, "a");
-        assert!(
-            !w.handle(second).waiting,
-            "{history:?}: the new open is granted, not made to wait behind the take"
-        );
-        assert_eq!(
-            w.delayed
-                .iter()
-                .map(|d| (d.handle, d.file.as_str()))
-                .collect::<Vec<_>>(),
-            vec![(second, "a")],
-            "{history:?}: it raises one alarm"
-        );
-        w.close(first);
-        ok(&mut w);
-        assert!(
-            w.waits().contains_key(&Tree::Main),
-            "{history:?}: the second writer still has it open: the take still waits"
-        );
-        let third = w.open_write(&Client::Main("m3".into()), "a");
-        assert!(!w.handle(third).waiting);
-        assert_eq!(w.delayed.len(), 2, "{history:?}: another alarm");
-        w.close(second);
-        ok(&mut w);
-        assert!(w.waits().contains_key(&Tree::Main));
-        w.close(third);
-        ok(&mut w);
-        assert!(
-            !w.waits().contains_key(&Tree::Main),
-            "the last close woke it"
-        );
-        next(&mut w, Tree::Main);
-        assert!(
-            w.file(&w.main_head, "a").contains(&x),
-            "{history:?}: the take went"
-        );
-        drain(&mut w);
-    }
+    let mut w = world();
+    let f = w.create_fork(Tree::Main);
+    let m2 = Client::Main("m2".into());
+    let first = w.open_write(&m1(), "a");
+    let x = w.save(&Client::Fork(f), "a", 0);
+    take(&mut w, &Step::Next(Tree::Main));
+    assert!(w.waits().contains_key(&Tree::Main));
+    assert!(w.delayed.is_empty(), "an open before the wait is no alarm");
+    let second = w.open_write(&m2, "a");
+    assert!(
+        !w.handle(second).waiting,
+        "the new open is granted, not made to wait behind the take"
+    );
+    assert_eq!(
+        w.delayed
+            .iter()
+            .map(|d| (d.handle, d.file.as_str()))
+            .collect::<Vec<_>>(),
+        vec![(second, "a")],
+        "it raises one alarm"
+    );
+    w.close(first);
+    ok(&mut w);
+    assert!(
+        w.waits().contains_key(&Tree::Main),
+        "the second writer still has it open: the take still waits"
+    );
+    let third = w.open_write(&Client::Main("m3".into()), "a");
+    assert!(!w.handle(third).waiting);
+    assert_eq!(w.delayed.len(), 2, "another alarm");
+    w.close(second);
+    ok(&mut w);
+    assert!(w.waits().contains_key(&Tree::Main));
+    w.close(third);
+    ok(&mut w);
+    assert!(
+        !w.waits().contains_key(&Tree::Main),
+        "the last close woke it"
+    );
+    next(&mut w, Tree::Main);
+    assert!(w.file(&w.main_head, "a").contains(&x), "the take went");
+    drain(&mut w);
 }
 
 /// Rule 9, finding 20: a program that holds open a file a waiting take
@@ -3102,46 +2632,38 @@ fn r9_new_writers_postpone_a_waiting_take_and_raise_an_alarm() {
 /// once both close.
 #[test]
 fn r9_a_writer_holding_a_waited_file_is_not_made_to_wait() {
-    for history in BOTH {
-        let mut w = world(history);
-        let f = w.create_fork(Tree::Main);
-        let c = Client::Fork(f);
-        w.begin(f).unwrap();
-        for p in ["a", "b"] {
-            let h = w.open_write(&c, p);
-            w.edit(h, LineEdit::At(0));
-            w.close(h);
-        }
-        assert_eq!(w.commit_txn(f), Ok(TxnOutcome::Committed));
-        let a = w.open_write(&m1(), "a");
-        take(&mut w, &Step::Next(Tree::Main));
-        assert!(
-            w.waits().contains_key(&Tree::Main),
-            "the landing of a and b waits for a"
-        );
-        let b = w.open_write(&m1(), "b");
-        assert!(
-            !w.handle(b).waiting,
-            "{history:?}: m1 holds a: not made to wait"
-        );
-        let other = w.open_write(&Client::Main("m2".into()), "b");
-        assert!(
-            !w.handle(other).waiting,
-            "{history:?}: another client's open of b is granted too"
-        );
-        w.close(b);
-        w.close(a);
-        ok(&mut w);
-        assert!(
-            w.waits().contains_key(&Tree::Main),
-            "{history:?}: m2 still has b open"
-        );
-        w.close(other);
-        ok(&mut w);
-        next(&mut w, Tree::Main);
-        drain(&mut w);
-        assert_eq!(w.read(Tree::Main, "a"), w.read(Tree::Fork(f), "a"));
+    let mut w = world();
+    let f = w.create_fork(Tree::Main);
+    let c = Client::Fork(f);
+    w.begin(f).unwrap();
+    for p in ["a", "b"] {
+        let h = w.open_write(&c, p);
+        w.edit(h, LineEdit::At(0));
+        w.close(h);
     }
+    assert_eq!(w.commit_txn(f), Ok(TxnOutcome::Committed));
+    let a = w.open_write(&m1(), "a");
+    take(&mut w, &Step::Next(Tree::Main));
+    assert!(
+        w.waits().contains_key(&Tree::Main),
+        "the landing of a and b waits for a"
+    );
+    let b = w.open_write(&m1(), "b");
+    assert!(!w.handle(b).waiting, "m1 holds a: not made to wait");
+    let other = w.open_write(&Client::Main("m2".into()), "b");
+    assert!(
+        !w.handle(other).waiting,
+        "another client's open of b is granted too"
+    );
+    w.close(b);
+    w.close(a);
+    ok(&mut w);
+    assert!(w.waits().contains_key(&Tree::Main), "m2 still has b open");
+    w.close(other);
+    ok(&mut w);
+    next(&mut w, Tree::Main);
+    drain(&mut w);
+    assert_eq!(w.read(Tree::Main, "a"), w.read(Tree::Fork(f), "a"));
 }
 
 /// Rule 12 inside a transaction: an open in the transaction is in the
@@ -3150,85 +2672,78 @@ fn r9_a_writer_holding_a_waited_file_is_not_made_to_wait() {
 /// them into the sandbox and on to main.
 #[test]
 fn r12_a_crash_saves_an_open_inside_a_transaction() {
-    for history in BOTH {
-        let mut w = world(history);
-        let f = w.create_fork(Tree::Main);
-        w.begin(f).unwrap();
-        let h = w.open_write(&Client::Fork(f), "a");
-        w.write(h, Write::Append("txn\n".into()));
-        w.crash();
-        ok(&mut w);
-        assert!(w.saved(h), "{history:?}: the replay saved the open");
-        assert_eq!(w.handles().count(), 0);
-        assert!(
-            !w.read(Tree::Fork(f), "a").bytes().ends_with("txn\n"),
-            "the transaction's save stays in its branch until commit"
-        );
-        assert_eq!(w.commit_txn(f), Ok(TxnOutcome::Committed));
-        ok(&mut w);
-        assert!(
-            w.read(Tree::Fork(f), "a").bytes().ends_with("txn\n"),
-            "{history:?}: the commit carries the replayed call"
-        );
-        drain(&mut w);
-        assert!(w.read(Tree::Main, "a").bytes().ends_with("txn\n"));
-    }
+    let mut w = world();
+    let f = w.create_fork(Tree::Main);
+    w.begin(f).unwrap();
+    let h = w.open_write(&Client::Fork(f), "a");
+    w.write(h, Write::Append("txn\n".into()));
+    w.crash();
+    ok(&mut w);
+    assert!(w.saved(h), "the replay saved the open");
+    assert_eq!(w.handles().count(), 0);
+    assert!(
+        !w.read(Tree::Fork(f), "a").bytes().ends_with("txn\n"),
+        "the transaction's save stays in its branch until commit"
+    );
+    assert_eq!(w.commit_txn(f), Ok(TxnOutcome::Committed));
+    ok(&mut w);
+    assert!(
+        w.read(Tree::Fork(f), "a").bytes().ends_with("txn\n"),
+        "the commit carries the replayed call"
+    );
+    drain(&mut w);
+    assert!(w.read(Tree::Main, "a").bytes().ends_with("txn\n"));
 }
 
-/// Rule 9 with P1 under either history setting (the review of 2026-11-04,
-/// P1-c): a long-held file holds back only the saves that touch it. A
-/// sandbox saves `a`, then `b`, while a main client holds `b` open; the
-/// save of `a` lands at once. Under `Squashed` the run of the two saves is
-/// cut before the save of `b`, which waits on its own. And in the other
-/// order, a first save that waits waits alone.
+/// Rule 9 with P1 (the review of 2026-11-04, P1-c): a long-held file holds
+/// back only the saves that touch it. A sandbox saves `a`, then `b`, while a
+/// main client holds `b` open; the save of `a` lands at once, and the save of
+/// `b` waits on its own. And in the other order, a first save that waits
+/// waits alone.
 #[test]
-fn r9_under_either_setting_a_held_file_holds_back_only_its_saves() {
-    for history in BOTH {
-        let mut w = world(history);
-        let f = w.create_fork(Tree::Main);
-        let m2 = Client::Main("m2".into());
-        let held = w.open_write(&m2, "b");
-        let x = w.save(&Client::Fork(f), "a", 0);
-        let y = w.save(&Client::Fork(f), "b", 0);
-        take(&mut w, &Step::Next(Tree::Main));
-        assert!(
-            w.holds().contains_key(&Tree::Main),
-            "{history:?}: the save of a is taken, not held back by b"
-        );
-        take(&mut w, &Step::Finish(Tree::Main));
-        assert!(has(&w, Tree::Main, "a", &x), "{history:?}");
-        assert!(!has(&w, Tree::Main, "b", &y));
-        take(&mut w, &Step::Next(Tree::Main));
-        assert!(
-            w.waits().contains_key(&Tree::Main),
-            "{history:?}: the save of b waits for its writer"
-        );
-        w.close(held);
-        ok(&mut w);
-        drain(&mut w);
-        assert!(has(&w, Tree::Main, "b", &y), "{history:?}");
-    }
-    // The other order: the save of `a` waits for its writer, and under
-    // `Squashed` waits alone, so its lock does not reach `b`, which
-    // only the save behind it touches: a new open of `b` is granted.
-    for history in BOTH {
-        let mut w = world(history);
-        let f = w.create_fork(Tree::Main);
-        let held = w.open_write(&Client::Main("m2".into()), "a");
-        w.save(&Client::Fork(f), "a", 0);
-        w.save(&Client::Fork(f), "b", 0);
-        take(&mut w, &Step::Next(Tree::Main));
-        assert!(w.waits().contains_key(&Tree::Main));
-        let other = w.open_write(&Client::Main("m3".into()), "b");
-        assert!(
-            !w.handle(other).waiting,
-            "{history:?}: the waiting save of a does not lock b"
-        );
-        w.close(other);
-        w.close(held);
-        ok(&mut w);
-        drain(&mut w);
-    }
+fn r9_a_held_file_holds_back_only_its_saves() {
+    let mut w = world();
+    let f = w.create_fork(Tree::Main);
+    let m2 = Client::Main("m2".into());
+    let held = w.open_write(&m2, "b");
+    let x = w.save(&Client::Fork(f), "a", 0);
+    let y = w.save(&Client::Fork(f), "b", 0);
+    take(&mut w, &Step::Next(Tree::Main));
+    assert!(
+        w.holds().contains_key(&Tree::Main),
+        "the save of a is taken, not held back by b"
+    );
+    take(&mut w, &Step::Finish(Tree::Main));
+    assert!(has(&w, Tree::Main, "a", &x));
+    assert!(!has(&w, Tree::Main, "b", &y));
+    take(&mut w, &Step::Next(Tree::Main));
+    assert!(
+        w.waits().contains_key(&Tree::Main),
+        "the save of b waits for its writer"
+    );
+    w.close(held);
+    ok(&mut w);
+    drain(&mut w);
+    assert!(has(&w, Tree::Main, "b", &y));
+    // The other order: the save of `a` waits for its writer, alone, so its
+    // lock does not reach `b`, which only the save behind it touches: a new
+    // open of `b` is granted.
+    let mut w = world();
+    let f = w.create_fork(Tree::Main);
+    let held = w.open_write(&Client::Main("m2".into()), "a");
+    w.save(&Client::Fork(f), "a", 0);
+    w.save(&Client::Fork(f), "b", 0);
+    take(&mut w, &Step::Next(Tree::Main));
+    assert!(w.waits().contains_key(&Tree::Main));
+    let other = w.open_write(&Client::Main("m3".into()), "b");
+    assert!(
+        !w.handle(other).waiting,
+        "the waiting save of a does not lock b"
+    );
+    w.close(other);
+    w.close(held);
+    ok(&mut w);
+    drain(&mut w);
 }
 
 /// Rule 9 without P3, finding 24 (the review of 2026-11-04, P0-1, decided
@@ -3240,34 +2755,29 @@ fn r9_under_either_setting_a_held_file_holds_back_only_its_saves() {
 /// behind the take, which waited for m1, which waited for m2.
 #[test]
 fn r9_cooperating_programs_never_deadlock() {
-    for history in BOTH {
-        let mut w = world(history);
-        let f = w.create_fork(Tree::Main);
-        let log = w.open_write(&m1(), "a");
-        w.write(log, Write::Append("m1\n".into()));
-        let x = w.save(&Client::Fork(f), "a", 0);
-        take(&mut w, &Step::Next(Tree::Main));
-        assert!(
-            w.waits().contains_key(&Tree::Main),
-            "the landing waits for m1"
-        );
-        let child = w.open_write(&Client::Main("m2".into()), "a");
-        assert!(
-            !w.handle(child).waiting,
-            "{history:?}: m2's open is granted: nothing waits on m1's close but the take"
-        );
-        w.write(child, Write::Append("m2\n".into()));
-        w.close(child);
-        w.close(log);
-        ok(&mut w);
-        drain(&mut w);
-        let a = w.read(Tree::Main, "a");
-        assert!(
-            a.contains(&x),
-            "{history:?}: the take went once both closed"
-        );
-        assert!(a.bytes().contains("m2\n") && a.bytes().contains("m1\n"));
-    }
+    let mut w = world();
+    let f = w.create_fork(Tree::Main);
+    let log = w.open_write(&m1(), "a");
+    w.write(log, Write::Append("m1\n".into()));
+    let x = w.save(&Client::Fork(f), "a", 0);
+    take(&mut w, &Step::Next(Tree::Main));
+    assert!(
+        w.waits().contains_key(&Tree::Main),
+        "the landing waits for m1"
+    );
+    let child = w.open_write(&Client::Main("m2".into()), "a");
+    assert!(
+        !w.handle(child).waiting,
+        "m2's open is granted: nothing waits on m1's close but the take"
+    );
+    w.write(child, Write::Append("m2\n".into()));
+    w.close(child);
+    w.close(log);
+    ok(&mut w);
+    drain(&mut w);
+    let a = w.read(Tree::Main, "a");
+    assert!(a.contains(&x), "the take went once both closed");
+    assert!(a.bytes().contains("m2\n") && a.bytes().contains("m1\n"));
 }
 
 /// Progress rule P2, the prefix sync (the owner, 2026-11-04: "agreed"): a
@@ -3279,43 +2789,41 @@ fn r9_cooperating_programs_never_deadlock() {
 /// close delivers the rest.
 #[test]
 fn r9_a_sync_delivers_up_to_the_first_change_to_an_open_file() {
-    for history in BOTH {
-        let mut w = world(history);
-        let f = w.create_fork(Tree::Main);
-        let t = Tree::Fork(f);
-        let h = w.open_write(&Client::Fork(f), "a");
-        let mb = w.save(&m1(), "b", 0);
-        let ma = w.save(&m1(), "a", 0);
-        let mc = w.save(&m1(), "c", 0);
-        take(&mut w, &Step::Next(t));
-        assert!(
-            w.holds().contains_key(&t) && w.waits().get(&t).is_some_and(|m| m.len() == 1),
-            "{history:?}: it delivers a prefix and waits for the rest"
-        );
-        take(&mut w, &Step::Finish(t));
-        assert!(
-            has(&w, t, "b", &mb),
-            "{history:?}: b, before the change to a, is delivered"
-        );
-        assert!(!has(&w, t, "a", &ma), "a is open: not overwritten");
-        assert!(
-            !has(&w, t, "c", &mc),
-            "{history:?}: c comes after the change to a: held back too"
-        );
-        assert_eq!(w.prefix_syncs, 1);
-        assert!(
-            !w.pending().contains(&Step::Next(t)),
-            "the rest waits for the close"
-        );
-        let x = w.edit(h, LineEdit::At(1)).unwrap();
-        w.close(h);
-        ok(&mut w);
-        assert!(w.waits().get(&t).is_none(), "the close woke it");
-        drain(&mut w);
-        let a = w.read(t, "a");
-        assert!(a.contains(&ma) && a.contains(&x), "{history:?}");
-        assert!(has(&w, t, "c", &mc));
-    }
+    let mut w = world();
+    let f = w.create_fork(Tree::Main);
+    let t = Tree::Fork(f);
+    let h = w.open_write(&Client::Fork(f), "a");
+    let mb = w.save(&m1(), "b", 0);
+    let ma = w.save(&m1(), "a", 0);
+    let mc = w.save(&m1(), "c", 0);
+    take(&mut w, &Step::Next(t));
+    assert!(
+        w.holds().contains_key(&t) && w.waits().get(&t).is_some_and(|m| m.len() == 1),
+        "it delivers a prefix and waits for the rest"
+    );
+    take(&mut w, &Step::Finish(t));
+    assert!(
+        has(&w, t, "b", &mb),
+        "b, before the change to a, is delivered"
+    );
+    assert!(!has(&w, t, "a", &ma), "a is open: not overwritten");
+    assert!(
+        !has(&w, t, "c", &mc),
+        "c comes after the change to a: held back too"
+    );
+    assert_eq!(w.prefix_syncs, 1);
+    assert!(
+        !w.pending().contains(&Step::Next(t)),
+        "the rest waits for the close"
+    );
+    let x = w.edit(h, LineEdit::At(1)).unwrap();
+    w.close(h);
+    ok(&mut w);
+    assert!(w.waits().get(&t).is_none(), "the close woke it");
+    drain(&mut w);
+    let a = w.read(t, "a");
+    assert!(a.contains(&ma) && a.contains(&x));
+    assert!(has(&w, t, "c", &mc));
 }
 
 /// Finding 11's rule on a chain (review of 2026-11-04): the sandbox renames
@@ -3326,28 +2834,26 @@ fn r9_a_sync_delivers_up_to_the_first_change_to_an_open_file() {
 /// shows main's names.
 #[test]
 fn r11_a_chain_of_renames_to_one_path_keeps_every_previous_name() {
-    for history in BOTH {
-        let mut w = world(history);
-        let f = w.create_fork(Tree::Main);
-        let t = Tree::Fork(f);
-        w.rename(&Client::Fork(f), "b", "h");
-        w.rename(&m1(), "c", "h");
-        w.rename(&m1(), "d", "c");
-        next(&mut w, t);
-        let names = |w: &World, t| (w.path_of(t, "b"), w.path_of(t, "c"), w.path_of(t, "d"));
+    let mut w = world();
+    let f = w.create_fork(Tree::Main);
+    let t = Tree::Fork(f);
+    w.rename(&Client::Fork(f), "b", "h");
+    w.rename(&m1(), "c", "h");
+    w.rename(&m1(), "d", "c");
+    next(&mut w, t);
+    let names = |w: &World, t| (w.path_of(t, "b"), w.path_of(t, "c"), w.path_of(t, "d"));
+    assert_eq!(
+        names(&w, t),
+        (Some("h".into()), Some("c".into()), Some("d".into())),
+        "its own name, main's files under their previous names"
+    );
+    drain(&mut w);
+    for t in [Tree::Main, t] {
         assert_eq!(
             names(&w, t),
-            (Some("h".into()), Some("c".into()), Some("d".into())),
-            "{history:?}: its own name, main's files under their previous names"
+            (Some("b".into()), Some("h".into()), Some("c".into())),
+            "{t:?}"
         );
-        drain(&mut w);
-        for t in [Tree::Main, t] {
-            assert_eq!(
-                names(&w, t),
-                (Some("b".into()), Some("h".into()), Some("c".into())),
-                "{history:?} {t:?}"
-            );
-        }
     }
 }
 
@@ -3361,40 +2867,32 @@ fn r11_a_chain_of_renames_to_one_path_keeps_every_previous_name() {
 /// written over. Then `b` closes and G shows m.
 #[test]
 fn r9_a_prefix_sync_delivers_no_upstream_decision_before_its_commit() {
-    for history in BOTH {
-        let mut w = world(history);
-        let p = w.create_fork(Tree::Main);
-        let g = w.create_fork(Tree::Fork(p));
-        let (tp, tg) = (Tree::Fork(p), Tree::Fork(g));
-        let hb = w.open_write(&Client::Fork(g), "b");
-        let x = w.save(&Client::Fork(g), "a", 0);
-        let m = w.save(&m1(), "a", 0);
-        w.save(&Client::Fork(p), "c", 0);
-        w.save(&Client::Fork(p), "b", 0);
-        while !has(&w, tp, "a", &x) {
-            assert!(
-                w.pending().contains(&Step::Next(tp)),
-                "{history:?}: P can take"
-            );
-            next(&mut w, tp);
-        }
-        while w.pending().contains(&Step::Next(Tree::Main)) {
-            next(&mut w, Tree::Main);
-        }
-        assert!(has(&w, Tree::Main, "a", &m) && !has(&w, Tree::Main, "a", &x));
-        take(&mut w, &Step::Next(tg));
-        if w.holds().contains_key(&tg) {
-            take(&mut w, &Step::Finish(tg));
-        }
-        assert!(w.prefix_syncs > 0, "{history:?}: a prefix sync");
-        assert!(
-            has(&w, tg, "a", &x),
-            "{history:?}: G keeps x until the decision arrives"
-        );
-        w.close(hb);
-        drain(&mut w);
-        assert!(has(&w, tg, "a", &m), "{history:?}");
+    let mut w = world();
+    let p = w.create_fork(Tree::Main);
+    let g = w.create_fork(Tree::Fork(p));
+    let (tp, tg) = (Tree::Fork(p), Tree::Fork(g));
+    let hb = w.open_write(&Client::Fork(g), "b");
+    let x = w.save(&Client::Fork(g), "a", 0);
+    let m = w.save(&m1(), "a", 0);
+    w.save(&Client::Fork(p), "c", 0);
+    w.save(&Client::Fork(p), "b", 0);
+    while !has(&w, tp, "a", &x) {
+        assert!(w.pending().contains(&Step::Next(tp)), "P can take");
+        next(&mut w, tp);
     }
+    while w.pending().contains(&Step::Next(Tree::Main)) {
+        next(&mut w, Tree::Main);
+    }
+    assert!(has(&w, Tree::Main, "a", &m) && !has(&w, Tree::Main, "a", &x));
+    take(&mut w, &Step::Next(tg));
+    if w.holds().contains_key(&tg) {
+        take(&mut w, &Step::Finish(tg));
+    }
+    assert!(w.prefix_syncs > 0, "a prefix sync");
+    assert!(has(&w, tg, "a", &x), "G keeps x until the decision arrives");
+    w.close(hb);
+    drain(&mut w);
+    assert!(has(&w, tg, "a", &m));
 }
 
 /// P2, a held-back commit's collision notes are held back with it (review
@@ -3405,36 +2903,31 @@ fn r9_a_prefix_sync_delivers_no_upstream_decision_before_its_commit() {
 /// so G keeps x over p. Then `b` closes and G shows p.
 #[test]
 fn r9_a_prefix_sync_holds_back_the_notes_of_the_commits_it_holds_back() {
-    for history in BOTH {
-        let mut w = world(history);
-        let p = w.create_fork(Tree::Main);
-        let g = w.create_fork(Tree::Fork(p));
-        let (tp, tg) = (Tree::Fork(p), Tree::Fork(g));
-        let hb = w.open_write(&Client::Fork(g), "b");
-        let x = w.save(&Client::Fork(g), "a", 0);
-        let pa = w.save(&Client::Fork(p), "a", 0);
-        w.save(&Client::Fork(p), "c", 0);
-        w.save(&Client::Fork(p), "b", 0);
-        while w.pending().contains(&Step::Next(tp)) {
-            next(&mut w, tp);
-        }
-        assert!(
-            has(&w, tp, "a", &pa) && !has(&w, tp, "a", &x),
-            "{history:?}: x lost in P"
-        );
-        take(&mut w, &Step::Next(tg));
-        if w.holds().contains_key(&tg) {
-            take(&mut w, &Step::Finish(tg));
-        }
-        assert!(w.prefix_syncs > 0, "{history:?}: a prefix sync");
-        assert!(
-            has(&w, tg, "a", &x),
-            "{history:?}: G keeps x until the decision arrives"
-        );
-        w.close(hb);
-        drain(&mut w);
-        assert!(has(&w, tg, "a", &pa), "{history:?}");
+    let mut w = world();
+    let p = w.create_fork(Tree::Main);
+    let g = w.create_fork(Tree::Fork(p));
+    let (tp, tg) = (Tree::Fork(p), Tree::Fork(g));
+    let hb = w.open_write(&Client::Fork(g), "b");
+    let x = w.save(&Client::Fork(g), "a", 0);
+    let pa = w.save(&Client::Fork(p), "a", 0);
+    w.save(&Client::Fork(p), "c", 0);
+    w.save(&Client::Fork(p), "b", 0);
+    while w.pending().contains(&Step::Next(tp)) {
+        next(&mut w, tp);
     }
+    assert!(
+        has(&w, tp, "a", &pa) && !has(&w, tp, "a", &x),
+        "x lost in P"
+    );
+    take(&mut w, &Step::Next(tg));
+    if w.holds().contains_key(&tg) {
+        take(&mut w, &Step::Finish(tg));
+    }
+    assert!(w.prefix_syncs > 0, "a prefix sync");
+    assert!(has(&w, tg, "a", &x), "G keeps x until the decision arrives");
+    w.close(hb);
+    drain(&mut w);
+    assert!(has(&w, tg, "a", &pa));
 }
 
 /// P2, each change by its unit: a transaction's commit is one change, so
@@ -3444,81 +2937,43 @@ fn r9_a_prefix_sync_holds_back_the_notes_of_the_commits_it_holds_back() {
 /// nothing and does not stop the sync.
 #[test]
 fn r9_a_prefix_sync_holds_back_a_transaction_whole() {
-    for history in BOTH {
-        let mut w = world(history);
-        let (f, g) = (w.create_fork(Tree::Main), w.create_fork(Tree::Main));
-        let t = Tree::Fork(f);
-        // f's own save of a lands in main; f opens a again.
-        let own = w.save(&Client::Fork(f), "a", 0);
-        next(&mut w, Tree::Main);
-        let h = w.open_write(&Client::Fork(f), "a");
-        let mb = w.save(&m1(), "b", 0);
-        // g's transaction writes c and a, and lands in main whole.
-        w.begin(g).unwrap();
-        let mut staged = Vec::new();
-        for p in ["c", "a"] {
-            let x = w.open_write(&Client::Fork(g), p);
-            staged.push(w.edit(x, LineEdit::At(2)).unwrap());
-            w.close(x);
-        }
-        let gc = staged[0].clone();
-        assert_eq!(w.commit_txn(g), Ok(TxnOutcome::Committed));
-        while w.queue_len(Tree::Main) > 0 {
-            next(&mut w, Tree::Main);
-        }
-        assert!(has(&w, Tree::Main, "c", &gc));
-        // f's queue: syncs of main's landing of f's own save, of b, and of g's
-        // transaction. The first two deliver; the transaction waits whole.
-        while w.pending().contains(&Step::Next(t)) {
-            take(&mut w, &Step::Next(t));
-            if w.holds().contains_key(&t) {
-                take(&mut w, &Step::Finish(t));
-            }
-        }
-        assert!(has(&w, t, "a", &own) && has(&w, t, "b", &mb), "{history:?}");
-        assert!(
-            !has(&w, t, "c", &gc),
-            "{history:?}: the transaction touches a, open: its c is held back with it"
-        );
-        w.close(h);
-        ok(&mut w);
-        drain(&mut w);
-        assert!(has(&w, t, "c", &gc));
-    }
-}
-
-/// Rules 7 and 9, P1 under `Squashed`: a squash carries no save that shares
-/// a file with an entry ahead of it that waits or waits behind one. Fork f's
-/// save of `a` waits for m2's open, and f's save of `b` waits behind it (one
-/// source); fork g's save of `c` is free to go, but g's save of `b` behind
-/// it shares `b` with f's waiting save, so the squash stops before it and
-/// f's `b` lands first and g's concurrent `b` loses to it, as one take each
-/// decides.
-#[test]
-fn r7_a_squash_stops_before_a_save_sharing_a_file_with_a_waiting_entry() {
-    let mut w = world(HistoryPolicy::Squashed);
+    let mut w = world();
     let (f, g) = (w.create_fork(Tree::Main), w.create_fork(Tree::Main));
-    let held = w.open_write(&Client::Main("m2".into()), "a");
-    w.save(&Client::Fork(f), "a", 0);
-    let fb = w.save(&Client::Fork(f), "b", 1);
-    let gc = w.save(&Client::Fork(g), "c", 0);
-    let gb = w.save(&Client::Fork(g), "b", 1);
-    take(&mut w, &Step::Next(Tree::Main));
-    assert!(w.waits().contains_key(&Tree::Main), "f's save of a waits");
-    take(&mut w, &Step::Next(Tree::Main));
-    assert_eq!(
-        w.holds().get(&Tree::Main).map(|x| x.seqs.len()),
-        Some(1),
-        "g's run is cut before its save of b"
-    );
-    take(&mut w, &Step::Finish(Tree::Main));
+    let t = Tree::Fork(f);
+    // f's own save of a lands in main; f opens a again.
+    let own = w.save(&Client::Fork(f), "a", 0);
+    next(&mut w, Tree::Main);
+    let h = w.open_write(&Client::Fork(f), "a");
+    let mb = w.save(&m1(), "b", 0);
+    // g's transaction writes c and a, and lands in main whole.
+    w.begin(g).unwrap();
+    let mut staged = Vec::new();
+    for p in ["c", "a"] {
+        let x = w.open_write(&Client::Fork(g), p);
+        staged.push(w.edit(x, LineEdit::At(2)).unwrap());
+        w.close(x);
+    }
+    let gc = staged[0].clone();
+    assert_eq!(w.commit_txn(g), Ok(TxnOutcome::Committed));
+    while w.queue_len(Tree::Main) > 0 {
+        next(&mut w, Tree::Main);
+    }
     assert!(has(&w, Tree::Main, "c", &gc));
-    assert!(!has(&w, Tree::Main, "b", &gb), "g's b waits behind f's");
-    w.close(held);
+    // f's queue: syncs of main's landing of f's own save, of b, and of g's
+    // transaction. The first two deliver; the transaction waits whole.
+    while w.pending().contains(&Step::Next(t)) {
+        take(&mut w, &Step::Next(t));
+        if w.holds().contains_key(&t) {
+            take(&mut w, &Step::Finish(t));
+        }
+    }
+    assert!(has(&w, t, "a", &own) && has(&w, t, "b", &mb));
+    assert!(
+        !has(&w, t, "c", &gc),
+        "the transaction touches a, open: its c is held back with it"
+    );
+    w.close(h);
     ok(&mut w);
     drain(&mut w);
-    assert!(
-        has(&w, Tree::Main, "b", &fb) && !has(&w, Tree::Main, "b", &gb),
-        "f's b landed first and g's concurrent b lost to it, as one take each decides"
-    );
+    assert!(has(&w, t, "c", &gc));
 }

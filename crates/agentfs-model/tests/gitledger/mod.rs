@@ -1,14 +1,13 @@
 //! Test-only: which changes each take judged, and which of them won or
-//! lost, re-derived from git alone (commit trailers, stored and grafted
-//! parents, collision refs as they appear) and the harness's own record of
+//! lost, re-derived from git alone (commit trailers, parents, collision
+//! refs as they appear) and the harness's own record of
 //! when it observed each branch move, then compared with the model's own
 //! `Landed` record. The harness rebuilds each tree's landing queue itself
-//! from the branch moves it sees, so a change the model never judged, or
-//! a squash that took the wrong saves, is caught even when the model's
-//! world and its record agree.
+//! from the branch moves it sees, so a change the model never judged is
+//! caught even when the model's world and its record agree.
 
 use agentfs_model::git::{git, try_git};
-use agentfs_model::world::{Direction, HistoryPolicy, Step, Tree, World};
+use agentfs_model::world::{Direction, Step, Tree, World};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -48,8 +47,7 @@ thread_local! {
     static ON: RefCell<bool> = const { RefCell::new(false) };
 }
 
-/// Turns the ledger on for the World built next (the random runs only:
-/// `rounds` makes several calls between checks).
+/// Turns the ledger on for the World built next.
 pub fn enable(on: bool) {
     ON.with(|o| *o.borrow_mut() = on);
     L.with(|l| *l.borrow_mut() = None);
@@ -77,7 +75,6 @@ impl Ledger {
         let out = git(
             &self.repo,
             &[
-                "--no-replace-objects",
                 "log",
                 "-1",
                 "--format=%P%x1f%(trailers:key=Agentfs-Cause,valueonly)%x1f%(trailers:key=Agentfs-Tree,valueonly)",
@@ -94,28 +91,8 @@ impl Ledger {
         m
     }
 
-    /// Lineage parents: grafts applied.
-    fn lineage(&self, c: &str) -> Vec<String> {
-        git(&self.repo, &["rev-list", "--parents", "-n1", c])
-            .split(' ')
-            .skip(1)
-            .map(str::to_string)
-            .collect()
-    }
-
     fn tree_id(&self, c: &str) -> String {
         git(&self.repo, &["rev-parse", &format!("{c}^{{tree}}")])
-    }
-
-    /// The changes a queued commit brings, from git: a squashed landing
-    /// commit (Squashed) the saves its graft names, recursively; else itself.
-    fn expand(&mut self, w: &World, c: &str) -> Vec<String> {
-        let m = self.meta(c);
-        if w.policies.history == HistoryPolicy::Squashed && m.cause == "Landing" {
-            let lin = self.lineage(c);
-            return lin[1..].iter().flat_map(|u| self.expand(w, u)).collect();
-        }
-        vec![c.to_string()]
     }
 }
 
@@ -159,7 +136,6 @@ pub fn observe(w: &World) -> Result<(), String> {
         l.refs = refs.clone();
         let mut heads = BTreeMap::new();
         let mut collisions = BTreeMap::new();
-        let mut replaced = BTreeSet::new();
         for line in refs.lines() {
             let (oid, r) = line.split_once(' ').expect("ref line");
             if let Some(b) = r.strip_prefix("refs/heads/") {
@@ -168,16 +144,10 @@ pub fn observe(w: &World) -> Result<(), String> {
                 }
             } else if r.starts_with("refs/collisions/") {
                 collisions.insert(r.to_string(), oid.to_string());
-            } else if r.starts_with("refs/replace/") {
-                replaced.insert(oid.to_string());
             }
         }
         let all: BTreeSet<String> = w.all_commits().into_iter().collect();
-        let new: BTreeSet<String> = all
-            .difference(&l.seen)
-            .filter(|c| !replaced.contains(*c))
-            .cloned()
-            .collect();
+        let new: BTreeSet<String> = all.difference(&l.seen).cloned().collect();
         let new_refs: Vec<String> = collisions
             .iter()
             .filter(|(r, _)| !l.collisions.contains(*r))
@@ -258,7 +228,6 @@ pub fn observe(w: &World) -> Result<(), String> {
                 }
             }
         }
-        let squashed = w.policies.history == HistoryPolicy::Squashed;
         let records: Vec<_> = w.landings[l.landings_seen..].to_vec();
         if records.len() != found.len() {
             return Err(format!(
@@ -273,7 +242,7 @@ pub fn observe(w: &World) -> Result<(), String> {
                 .iter()
                 .find(|d| d.tree == x && d.direction == dir && d.result == r)
                 .ok_or_else(|| format!("ledger: take {r:.7} into {x:?} has no Landed record"))?;
-            let (units, winners): (Vec<String>, Vec<String>) = match dir {
+            let (change, won): (String, bool) = match dir {
                 Direction::Transaction => {
                     let m = l.meta(&r);
                     let head = m.stored.get(1).cloned().ok_or("ledger: a transaction commit with one parent")?;
@@ -282,42 +251,27 @@ pub fn observe(w: &World) -> Result<(), String> {
                     if lost && l.tree_id(&r) != l.tree_id(&m.stored[0]) {
                         return Err(format!("ledger: transaction {r:.7} lost but changed the tree"));
                     }
-                    (vec![head.clone()], if lost { vec![] } else { vec![head] })
+                    (head, !lost)
                 }
                 Direction::Landing => {
                     // The harness's queue: the entries not yet taken that
                     // were queued when the take began. Which one the take
-                    // began with is read from git: the commit a full-lineage
-                    // landing names, or a squash's first winner or loser.
+                    // began with is read from git: the commit the landing
+                    // names.
                     let q = l.queues.get(&x).cloned().unwrap_or_default();
                     let limit = (*l.at_next.get(&x).unwrap_or(&q.len())).min(q.len());
                     let done = l.done.get(&x).cloned().unwrap_or_default();
                     let open: Vec<usize> = (0..limit)
                         .filter(|i| !done.contains(i) && matches!(q[*i], Q::Landing { .. }))
                         .collect();
-                    let known: BTreeSet<String> = if squashed {
-                        let mut k: BTreeSet<String> = l.lineage(&r)[1..].iter().cloned().collect();
-                        k.extend(losers.iter().cloned());
-                        k
-                    } else if before.is_none() {
-                        BTreeSet::from([r.clone()])
+                    let named = if before.is_none() {
+                        Some(r.clone())
                     } else {
-                        l.meta(&r).stored.get(1).cloned().into_iter().collect()
+                        l.meta(&r).stored.get(1).cloned()
                     };
-                    // A take of no change (a nested squash whose saves all
-                    // lost, so no graft): the first entry that brings none.
-                    let mut start = None;
-                    for i in &open {
-                        if let Q::Landing { commit, .. } = &q[*i] {
-                            let units = l.expand(w, commit);
-                            if units.iter().any(|u| known.contains(u))
-                                || (units.is_empty() && known.is_empty())
-                            {
-                                start = Some(*i);
-                                break;
-                            }
-                        }
-                    }
+                    let start = open.iter().copied().find(
+                        |i| matches!(&q[*i], Q::Landing { commit, .. } if Some(commit) == named.as_ref()),
+                    );
                     let Some(i) = start else {
                         return Err(format!("ledger: a landing into {x:?} ({r:.7}) of nothing queued"));
                     };
@@ -333,84 +287,20 @@ pub fn observe(w: &World) -> Result<(), String> {
                             "ledger: {x:?} took {commit:.7} of f{from} ahead of its earlier entry {j}"
                         ));
                     }
-                    let mut slice = vec![commit.clone()];
-                    let mut taken = vec![i];
-                    let plain = |l: &mut Ledger, c: &str| {
-                        let m = l.meta(c);
-                        m.cause == "Direct"
-                    };
-                    if squashed && plain(l, &commit) {
-                        for j in open.iter().copied().filter(|j| *j > i) {
-                            match &q[j] {
-                                Q::Landing { from: g, commit: c }
-                                    if *g == from
-                                        && plain(l, c)
-                                        && l.expand(w, c).iter().all(|u| known.contains(u)) =>
-                                {
-                                    slice.push(c.clone());
-                                    taken.push(j);
-                                }
-                                _ => break,
-                            }
-                        }
+                    l.done.entry(x).or_default().insert(i);
+                    // A fast-forward: the queued commit itself, won.
+                    let lost = before.is_some() && losers.contains(&commit);
+                    if lost && l.tree_id(&r) != l.tree_id(before.as_ref().unwrap()) {
+                        return Err(format!("ledger: {commit:.7} lost in {r:.7}, but its tree changed"));
                     }
-                    l.done.entry(x).or_default().extend(taken);
-                    let expect: Vec<String> = slice.iter().flat_map(|c| l.expand(w, c)).collect();
-                    let units = expect.clone();
-                    let winners: Vec<String> = if squashed {
-                        let lin = l.lineage(&r);
-                        let m = l.meta(&r);
-                        if m.stored != [before.clone().unwrap_or_default()] {
-                            return Err(format!("ledger: squashed {r:.7} stored parents {:?}", m.stored));
-                        }
-                        if lin[0] != m.stored[0] {
-                            return Err(format!("ledger: {r:.7}'s graft drops its first parent"));
-                        }
-                        lin[1..].to_vec()
-                    } else if before.is_none() {
-                        // A fast-forward: the queued commit itself, won.
-                        if r != commit {
-                            return Err(format!("ledger: fast-forward to {r:.7}, queue head {commit:.7}"));
-                        }
-                        vec![r.clone()]
-                    } else {
-                        let m = l.meta(&r);
-                        if m.stored.get(1) != Some(&commit) {
-                            return Err(format!(
-                                "ledger: {r:.7} landed {:?}, the harness's queue head is {commit:.7}",
-                                m.stored.get(1)
-                            ));
-                        }
-                        if losers.contains(&commit) { vec![] } else { vec![commit.clone()] }
-                    };
-                    let lost: Vec<String> = units.iter().filter(|u| losers.contains(u)).cloned().collect();
-                    for u in &units {
-                        let (won, lo) = (winners.contains(u), lost.contains(u));
-                        if won == lo {
-                            return Err(format!(
-                                "ledger: {u:.7} into {x:?} ({r:.7}): from git won {won}, lost {lo}"
-                            ));
-                        }
-                    }
-                    if let Some(s) = winners.iter().find(|s| !units.contains(s)) {
-                        return Err(format!("ledger: {r:.7}'s graft names {s:.7}, which the queue did not hold"));
-                    }
-                    let order: Vec<&String> = units.iter().filter(|u| winners.contains(u)).collect();
-                    if order != winners.iter().collect::<Vec<_>>() {
-                        return Err(format!("ledger: {r:.7}'s winners out of queue order"));
-                    }
-                    if winners.is_empty() && before.is_some() && l.tree_id(&r) != l.tree_id(before.as_ref().unwrap()) {
-                        return Err(format!("ledger: every change of {r:.7} lost, but its tree changed"));
-                    }
-                    losers.retain(|o| !lost.contains(o));
-                    (units, winners)
+                    losers.retain(|o| *o != commit || !lost);
+                    (commit, !lost)
                 }
             };
-            let rec_units: Vec<String> = rec.units.iter().map(|(u, _)| u.clone()).collect();
-            if rec_units != units || rec.winners != winners {
+            if rec.change != change || rec.won != won {
                 return Err(format!(
-                    "ledger: take {r:.7} into {x:?}: from git units {units:?} winners {winners:?}; the model's record units {rec_units:?} winners {:?}",
-                    rec.winners
+                    "ledger: take {r:.7} into {x:?}: from git change {change} won {won}; the model's record change {} won {}",
+                    rec.change, rec.won
                 ));
             }
         }

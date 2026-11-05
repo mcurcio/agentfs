@@ -9,9 +9,8 @@ use std::path::Path;
 use crate::content::{Content, Line, PATHS, State, is_root, writer_of};
 use crate::git::{git, try_git};
 use crate::world::{
-    By, Client, Collision, Direction, Entry, ForkId, HistoryPolicy, Kind, Landed, Life, NOTES,
-    Noted, Step, Take, Target, Tree, TxnEnd, TxnId, TxnOutcome, World, commit_parents, origin_in,
-    read_notes_on,
+    By, Client, Collision, Direction, Entry, ForkId, Kind, Life, NOTES, Noted, Step, Take, Target,
+    Tree, TxnEnd, TxnId, TxnOutcome, World, commit_parents, origin_in, read_notes_on,
 };
 
 /// Every invariant that holds after any step.
@@ -33,7 +32,7 @@ pub fn check(w: &mut World) -> Result<(), String> {
         w.refs_checked = Some(w.ref_moves);
     }
     rename_overs_whole(w)?;
-    history_setting(w)?;
+    full_lineage(w)?;
     placed_and_unlinked(w)?;
     Ok(())
 }
@@ -56,7 +55,7 @@ pub fn step_checked(w: &mut World, s: &Step) -> Result<usize, String> {
             // first one no earlier waiting entry shares a file or a source
             // with (the files read from git, not from the model's plan).
             let q = w.queue_numbered(*t);
-            let (Some(i), blocked) = p1_scan(w, *t) else {
+            let Some(i) = p1_first(w, *t) else {
                 return Err(format!("{t:?}: a queue step with no entry free to go"));
             };
             let n = q[i].0;
@@ -94,21 +93,11 @@ pub fn step_checked(w: &mut World, s: &Step) -> Result<usize, String> {
                     _ => Err(format!("{t:?}'s entry {n} neither waits nor is taken")),
                 };
             }
-            if w.holds().get(t).map(|h| h.seqs.first()) != Some(Some(&n)) {
+            if w.holds().get(t).map(|h| h.seq) != Some(Some(n)) {
                 return Err(format!(
                     "{t:?} took {:?}, not entry {n}, the first P1 lets go",
-                    w.holds().get(t).map(|h| &h.seqs)
+                    w.holds().get(t).map(|h| h.seq)
                 ));
-            }
-            // P1 and rule 7, read from git: a squash carries no save that
-            // shares a file with a waiting entry ahead of its first (or one
-            // waiting behind it), so no file's order between them flips.
-            for (_, e) in q.iter().skip(i + 1).take(taken - 1) {
-                if let Some(p) = entry_files(w, *t, e).intersection(&blocked).next() {
-                    return Err(format!(
-                        "{t:?}: a squash carried {e:?}, which touches {p}, a file of a waiting entry ahead of it"
-                    ));
-                }
             }
             let up = up.filter(|_| q[i].1 == Entry::Sync);
             match (up, w.holds().get(t).map(|h| &h.take)) {
@@ -246,17 +235,15 @@ fn locks(w: &World) -> Result<(), String> {
         if !w.alive(*t) {
             return Err(format!("a take outlives {t:?}"));
         }
-        // Rule 9, read from git: a landing locks every file its changes
-        // touch, a losing change's included (not only what its plan writes).
-        if let Take::Landing { run, .. } = &hold.take {
-            for c in run {
-                if let Some(p) = change_files(w, c).difference(&hold.files).next() {
-                    return Err(format!(
-                        "{t:?}: a landing holds {:?}, not {p}, which its change {c:.7} touches",
-                        hold.files
-                    ));
-                }
-            }
+        // Rule 9, read from git: a landing locks every file its change
+        // touches, a losing change's included (not only what its plan writes).
+        if let Take::Landing { commit: c, .. } = &hold.take
+            && let Some(p) = change_files(w, c).difference(&hold.files).next()
+        {
+            return Err(format!(
+                "{t:?}: a landing holds {:?}, not {p}, which its change {c:.7} touches",
+                hold.files
+            ));
         }
         if let Some(p) = w.write_open(*t).intersection(&hold.files).next() {
             return Err(format!(
@@ -333,13 +320,6 @@ fn locks(w: &World) -> Result<(), String> {
 /// file or a source with. Files are read from git ([`entry_files`]); a
 /// waiting entry's, the files it locks.
 pub fn p1_first(w: &World, t: Tree) -> Option<usize> {
-    p1_scan(w, t).0
-}
-
-/// [`p1_first`], with the files of the entries ahead of it that wait or
-/// wait behind a waiting one: a squash run must not carry a save touching
-/// one of them (rule 7, P1).
-pub fn p1_scan(w: &World, t: Tree) -> (Option<usize>, BTreeSet<String>) {
     let waiting = w.waits().get(&t);
     let mut files: BTreeSet<String> = BTreeSet::new();
     let mut sources = BTreeSet::new();
@@ -355,9 +335,9 @@ pub fn p1_scan(w: &World, t: Tree) -> (Option<usize>, BTreeSet<String>) {
             sources.insert(e.source());
             continue;
         }
-        return (Some(i), files);
+        return Some(i);
     }
-    (None, files)
+    None
 }
 
 /// The files queue entry `e` of `t` may touch, read from git: a landing's
@@ -371,23 +351,10 @@ pub fn entry_files(w: &World, t: Tree, e: &Entry) -> BTreeSet<String> {
     }
 }
 
-/// The files a fork commit's changes touch, read from git: each change
-/// against its first parent; a squashed nested landing's, its graft's saves.
+/// The files a fork commit's change touches, read from git, against its
+/// first parent.
 pub fn change_files(w: &World, commit: &str) -> BTreeSet<String> {
-    let mut units = vec![commit.to_string()];
-    let squashed = w.policies.history == HistoryPolicy::Squashed;
-    while squashed
-        && let Some(c) = units
-            .iter()
-            .position(|u| w.trailer(u, "Agentfs-Cause") == "Landing")
-    {
-        let c = units.remove(c);
-        units.extend(commit_parents(w.repo(), &c, false).into_iter().skip(1));
-    }
-    units
-        .iter()
-        .flat_map(|u| diff_files(w, &format!("{u}^1"), u))
-        .collect()
+    diff_files(w, &format!("{commit}^1"), commit)
 }
 
 fn diff_files(w: &World, a: &str, b: &str) -> BTreeSet<String> {
@@ -575,9 +542,8 @@ fn decided_against(w: &World, t: Tree, path: &str, line: &str, token: &str) -> b
 /// the parent's head reaches that commit and no parent's commit a sync
 /// delivered into `t` (the sync's second parent, or the commit it
 /// fast-forwarded to) does, nor, for a result, `t`'s head. A commit the
-/// parent's head no longer reaches (under `Squashed`, a fast-forward to
-/// main's graft drops the parent's own commits) was delivered before it, or
-/// is decided by notes read from main. So a prefix sync that holds back
+/// parent's head does not reach is decided by notes read from main. So a
+/// prefix sync that holds back
 /// the parent's landing that carried a line upstream has not delivered
 /// main's decision against that line, nor a held-back commit's own.
 fn delivered(w: &World, t: Tree, c: &Collision) -> bool {
@@ -696,37 +662,19 @@ fn holds(w: &World, at: &str, token: &str) -> bool {
     PATHS.iter().any(|p| w.file(at, p).holds(token))
 }
 
-/// The take a collision or change was decided in, from the model's record.
-fn take_of<'a>(w: &'a World, tree: Tree, result: &str) -> Option<&'a Landed> {
-    w.landings
-        .iter()
-        .find(|l| l.tree == tree && l.result == result)
-}
-
-/// Whether one of `take`'s changes that won set version `v` of file `p`.
-fn set_by_winner(w: &World, take: &Landed, p: &str, v: &str) -> bool {
-    take.units.iter().any(|(u, base)| {
-        take.winners.contains(u) && w.file(u, p).holds(v) && !w.file(base, p).holds(v)
-    })
-}
-
 /// The parent's version wins every collision, decided only at the
 /// parent's queue (a landing, or a transaction's commit into its fork:
 /// [`Direction`] has no other case, and `sync` records none), and only a
 /// real one: in each recorded collision the result holds none of the lost
 /// versions and keeps the tree's own version of every lost line, as the
-/// tree had it before (or, in a squashed take, a version another save of
-/// that take set, which won), and holds each version named in `won`, as
-/// the tree did before (or, for a winning delete, a delete of its line
-/// that agrees with it: R10.3); the lost versions are the losing change's; each
+/// tree had it before, and holds each version named in `won`, as the tree
+/// did before; the lost versions are the losing change's; each
 /// lost and winning pair is concurrent (neither was written over the
 /// other; for a loss decided by a file rule, at least one pair; for a line
 /// lost only because its change lost whole, a real collision of that
 /// change: [`really_collided`]); the losing change stays reachable under
-/// the collision's ref; the result's stored parents are the tree's previous
-/// head and the losing change (a transaction, or a landing under
-/// `FullLineage`), or under `Squashed` the previous head alone, the losing
-/// save in no graft ([`changes_whole`]). Where it was decided is read from
+/// the collision's ref; the result's parents are the tree's previous
+/// head and the losing change. Where it was decided is read from
 /// git, not the model's record: the result is the deciding tree's own
 /// landing or transaction commit, and the losing commit was written below
 /// that tree (a fork under it, or the transaction of that fork).
@@ -740,29 +688,21 @@ fn parent_wins(w: &mut World) -> Result<(), String> {
                 w.trailer(&c.loser, "Agentfs-Tree"),
             ));
         }
-        let take = take_of(w, c.tree, &c.result).ok_or_else(|| format!("{c:?}: no take"))?;
         let (r, win, lose) = (
             w.file(&c.result, &c.path),
             w.file(&c.winner, &c.path),
             w.file(&c.loser, &c.path),
         );
-        // excuse: R10.3 a winning delete may be replaced by a delete agreeing with it
         let named = c.lines.len() == c.won.len()
             && c.lines.len() == c.lost.len()
-            && c.won.iter().all(|t| {
-                holds(w, &c.winner, t)
-                    && (holds(w, &c.result, t)
-                        || win.records().find(|v| v.id == *t).is_some_and(|v| {
-                            !v.live() && r.member(&v.line).is_some_and(|x| !x.live())
-                        }))
-            });
-        // excuse: R7.1 in a squashed take a later save that won may set the line
-        let kept = c.lines.iter().zip(&c.lost).all(|(l, x)| {
-            !r.holds(x)
-                && (r.member(l) == win.member(l)
-                    || r.member(l)
-                        .is_some_and(|v| set_by_winner(w, take, &c.path, &v.id)))
-        });
+            && c.won
+                .iter()
+                .all(|t| holds(w, &c.winner, t) && holds(w, &c.result, t));
+        let kept = c
+            .lines
+            .iter()
+            .zip(&c.lost)
+            .all(|(l, x)| !r.holds(x) && r.member(l) == win.member(l));
         if !kept || !named || c.lines.is_empty() {
             return Err(format!("{c:?}: the parent's version did not win"));
         }
@@ -798,13 +738,9 @@ fn parent_wins(w: &mut World) -> Result<(), String> {
                 c.result
             ));
         }
-        let stored = commit_parents(w.repo(), &c.result, true);
-        let ok = match (c.direction, w.policies.history) {
-            (Direction::Landing, HistoryPolicy::Squashed) => stored == [c.winner.clone()],
-            _ => stored == [c.winner.clone(), c.loser.clone()],
-        };
-        if !ok {
-            return Err(format!("{c:?}: result's parents are {stored:?}"));
+        let parents = commit_parents(w.repo(), &c.result);
+        if parents != [c.winner.clone(), c.loser.clone()] {
+            return Err(format!("{c:?}: result's parents are {parents:?}"));
         }
     }
     w.collisions_checked = w.collisions.len();
@@ -812,88 +748,61 @@ fn parent_wins(w: &mut World) -> Result<(), String> {
 }
 
 /// Rule 3e, read from git: no partial save or transaction ever reaches a
-/// parent. Each change a take judged (a save, a transaction's commit, a
+/// parent. The change a take judged (a save, a transaction's commit, a
 /// landing commit, or a transaction's branch at its commit) either lost,
 /// named by a collision of that take, or won, never both; the versions its
 /// own edit set (its diff from its base, read from git) are, for one that
 /// lost, none in the take's result (unless the tree held it before) and
 /// each named lost by that change's collisions (unless the tree before
 /// already held it, or a version written over it); for one that won,
-/// every one in the result, or a version written over it. And a squashed commit holds only
-/// judged winners: under `Squashed` a landing's lineage parents are the
-/// tree's previous head and exactly the changes of the take that won, and
-/// every version the squash sets was set by one of them.
+/// every one in the result, or a version written over it.
 fn changes_whole(w: &mut World) -> Result<(), String> {
     for l in &w.landings[w.landings_checked..] {
-        for (u, base) in &l.units {
-            let lost = w
-                .collisions
-                .iter()
-                .any(|c| c.tree == l.tree && c.result == l.result && c.loser == *u);
-            if lost == l.winners.contains(u) {
-                return Err(format!(
-                    "{u:.7} into {:?}: judged lost {lost}, among the winners {}",
-                    l.tree, !lost
-                ));
-            }
-            for e in w.edits(base, u) {
-                let (r, b) = (w.file(&l.result, &e.path), w.file(&l.before, &e.path));
-                let ends = |v: &Line| w.lineage.descends(&v.id, &e.token);
-                if !lost {
-                    if !r.member(&e.line).is_some_and(ends) {
-                        return Err(format!(
-                            "{u:.7} won in {:?}, but its {} of {}[{}] is not in {:.7}: a partial change",
-                            l.tree, e.token, e.path, e.line, l.result
-                        ));
-                    }
-                    continue;
-                }
-                // excuse: R3e.2 a version the tree held before costs the change nothing
-                if r.holds(&e.token) && !b.holds(&e.token) {
+        let u = &l.change;
+        let lost = w
+            .collisions
+            .iter()
+            .any(|c| c.tree == l.tree && c.result == l.result && c.loser == *u);
+        if lost == l.won {
+            return Err(format!(
+                "{u:.7} into {:?}: judged lost {lost}, among the winners {}",
+                l.tree, !lost
+            ));
+        }
+        for e in w.edits(&l.base, u) {
+            let (r, b) = (w.file(&l.result, &e.path), w.file(&l.before, &e.path));
+            let ends = |v: &Line| w.lineage.descends(&v.id, &e.token);
+            if !lost {
+                if !r.member(&e.line).is_some_and(ends) {
                     return Err(format!(
-                        "{u:.7} lost in {:?}, but its {} of {}[{}] reached {:.7}: a partial change",
+                        "{u:.7} won in {:?}, but its {} of {}[{}] is not in {:.7}: a partial change",
                         l.tree, e.token, e.path, e.line, l.result
                     ));
                 }
-                let named = w.collisions.iter().any(|c| {
-                    c.tree == l.tree
-                        && c.result == l.result
-                        && c.loser == *u
-                        && c.path == e.path
-                        && c.lines
-                            .iter()
-                            .zip(&c.lost)
-                            .any(|(x, t)| *x == e.line && *t == e.token)
-                });
-                // excuse: R3e.2 the tree before held it, or a version written over it
-                if !named && !b.member(&e.line).is_some_and(ends) {
-                    return Err(format!(
-                        "{u:.7} lost in {:?}, but no collision names its {} of {}[{}]",
-                        l.tree, e.token, e.path, e.line
-                    ));
-                }
+                continue;
             }
-        }
-        if l.direction != Direction::Landing || w.policies.history != HistoryPolicy::Squashed {
-            continue;
-        }
-        let lineage = commit_parents(w.repo(), &l.result, false);
-        let mut expect = vec![l.before.clone()];
-        expect.extend(l.winners.iter().cloned());
-        if lineage != expect {
-            return Err(format!(
-                "Squashed: {:.7}'s lineage parents are {lineage:?}, not the take's head and winners {expect:?}",
-                l.result
-            ));
-        }
-        for e in w.edits(&l.before, &l.result) {
-            let by_winner = l.units.iter().any(|(u, base)| {
-                l.winners.contains(u) && w.edits(base, u).iter().any(|x| x.token == e.token)
-            });
-            if !by_winner {
+            // excuse: R3e.2 a version the tree held before costs the change nothing
+            if r.holds(&e.token) && !b.holds(&e.token) {
                 return Err(format!(
-                    "Squashed: {:.7} sets {} of {}[{}], which no save that won set",
-                    l.result, e.token, e.path, e.line
+                    "{u:.7} lost in {:?}, but its {} of {}[{}] reached {:.7}: a partial change",
+                    l.tree, e.token, e.path, e.line, l.result
+                ));
+            }
+            let named = w.collisions.iter().any(|c| {
+                c.tree == l.tree
+                    && c.result == l.result
+                    && c.loser == *u
+                    && c.path == e.path
+                    && c.lines
+                        .iter()
+                        .zip(&c.lost)
+                        .any(|(x, t)| *x == e.line && *t == e.token)
+            });
+            // excuse: R3e.2 the tree before held it, or a version written over it
+            if !named && !b.member(&e.line).is_some_and(ends) {
+                return Err(format!(
+                    "{u:.7} lost in {:?}, but no collision names its {} of {}[{}]",
+                    l.tree, e.token, e.path, e.line
                 ));
             }
         }
@@ -921,16 +830,12 @@ fn noted_line(n: &Noted) -> String {
 /// stays there attributable (owner, 2026-11-03: "yes, \"losing\" patches
 /// should still be part of the history. i want to know who changed what
 /// when"). Run once Replication has drained ([`check_converged`]). Read from
-/// the remote alone, as stored (no grafts): its notes ref holds exactly the
+/// the remote alone: its notes ref holds exactly the
 /// run's collision records, each on its result commit; each record's ref
 /// names its losing commit; each lost version is in its file there and was
 /// written by a commit naming that version's writer (who, what); and a
 /// collision decided in main has its result in the remote main's history,
-/// which places the decision in main's order. And the grafts went too
-/// (rule 7): every `refs/replace/` ref is on the remote with the same
-/// commit, and under `Squashed` the remote, grafts applied, reads each of
-/// main's landings as its stored parent and the saves that won, so the
-/// remote alone says which saves won. The commit's date is kept as its
+/// which places the decision in main's order. The commit's date is kept as its
 /// audit "when" but never read to decide anything (rule 2), and not
 /// checked here.
 fn losers_pushed(w: &World) -> Result<(), String> {
@@ -977,7 +882,7 @@ fn losers_pushed(w: &World) -> Result<(), String> {
             }
             let origin = origin_in(
                 &c.reference,
-                |x| commit_parents(remote, x, true),
+                |x| commit_parents(remote, x),
                 |x| {
                     let spec = format!("{x}:{}", c.path);
                     Content::parse(&git(remote, &["cat-file", "-p", &spec]))
@@ -987,7 +892,6 @@ fn losers_pushed(w: &World) -> Result<(), String> {
             let by = git(
                 remote,
                 &[
-                    "--no-replace-objects",
                     "log",
                     "-1",
                     "--format=%(trailers:key=Agentfs-Writer,valueonly)",
@@ -1003,13 +907,7 @@ fn losers_pushed(w: &World) -> Result<(), String> {
         if c.tree == "main"
             && try_git(
                 remote,
-                &[
-                    "--no-replace-objects",
-                    "merge-base",
-                    "--is-ancestor",
-                    result,
-                    "refs/heads/main",
-                ],
+                &["merge-base", "--is-ancestor", result, "refs/heads/main"],
                 None,
             )
             .code
@@ -1018,39 +916,6 @@ fn losers_pushed(w: &World) -> Result<(), String> {
             return Err(format!(
                 "{c:?}: its result is not in the remote main's history"
             ));
-        }
-    }
-    let grafts = |repo: &Path| {
-        git(
-            repo,
-            &[
-                "for-each-ref",
-                "--format=%(refname) %(objectname)",
-                "refs/replace",
-            ],
-        )
-    };
-    let (local, pushed) = (grafts(w.repo()), grafts(remote));
-    if local != pushed {
-        return Err(format!(
-            "the remote's grafts {pushed:?} are not the repository's {local:?}"
-        ));
-    }
-    if w.policies.history == HistoryPolicy::Squashed {
-        for l in w
-            .landings
-            .iter()
-            .filter(|l| l.tree == Tree::Main && l.direction == Direction::Landing)
-        {
-            let lineage = commit_parents(remote, &l.result, false);
-            let mut expect = vec![l.before.clone()];
-            expect.extend(l.winners.iter().cloned());
-            if lineage != expect {
-                return Err(format!(
-                    "on the remote, main's landing {:.7} reads as {lineage:?}, not its head and winners {expect:?}",
-                    l.result
-                ));
-            }
         }
     }
     Ok(())
@@ -1113,11 +978,7 @@ fn syncs_deliver(w: &mut World) -> Result<(), String> {
                 .landings
                 .iter()
                 .filter(|l| l.tree == parent)
-                .filter(|l| {
-                    l.units
-                        .iter()
-                        .any(|(u, b)| w.edits(b, u).iter().any(|e| e.token == id))
-                })
+                .filter(|l| w.edits(&l.base, &l.change).iter().any(|e| e.token == id))
                 .peekable();
             takes.peek().is_some() && takes.all(|l| !w.is_ancestor(&l.result, up))
         };
@@ -1285,7 +1146,6 @@ fn one_writer(w: &mut World, all: &[String]) -> Result<(), String> {
         return Ok(());
     }
     let mut args = vec![
-        "--no-replace-objects".to_string(),
         "log".to_string(),
         "--no-walk=unsorted".into(),
         "--diff-merges=first-parent".into(),
@@ -1639,82 +1499,27 @@ fn discarded_leave_no_trace(w: &mut World, all: &[String]) -> Result<(), String>
     }
 }
 
-/// Rule 7: a tree's lineage reaches every change that won in it (and
-/// under `FullLineage` every change it took), or under `Squashed` a
-/// collision ref of a tree upstream keeps it; its stored history reaches
-/// every change it took under `FullLineage`, and under `Squashed` none,
-/// main's holding only main's own commits (a save that lost under
-/// `Squashed` is kept by its collision ref: [`parent_wins`]). Read by ancestry alone (`git
-/// rev-list <head>`, never a `from..to` range, whose walk stops early by
-/// commit date).
-fn history_setting(w: &mut World) -> Result<(), String> {
-    let full = w.policies.history == HistoryPolicy::FullLineage;
+/// Rule 7: a tree's history reaches every change it took, won or lost. Read
+/// by ancestry alone (`git rev-list <head>`, never a `from..to` range, whose
+/// walk stops early by commit date).
+fn full_lineage(w: &mut World) -> Result<(), String> {
     let repo = w.repo().to_path_buf();
-    let landed: Vec<(Tree, String, bool)> = w
+    let landed: Vec<(Tree, String)> = w
         .landings
         .iter()
         .filter(|l| l.direction == Direction::Landing && w.alive(l.tree))
-        .flat_map(|l| {
-            l.units
-                .iter()
-                .map(|(u, _)| (l.tree, u.clone(), l.winners.contains(u)))
-        })
+        .map(|l| (l.tree, l.change.clone()))
         .collect();
-    let mut heads: Vec<String> = landed.iter().map(|(t, _, _)| w.head(*t)).collect();
-    heads.push(w.main_head.clone());
-    for head in heads {
-        w.reach
+    for (t, c) in &landed {
+        let head = w.head(*t);
+        let history = w
+            .reach
             .entry(head.clone())
-            .or_insert_with(|| (reach(&repo, &head, false), reach(&repo, &head, true)));
-    }
-    for (t, c, won) in &landed {
-        let (history, lineage) = &w.reach[&w.head(*t)];
-        if history.contains(c) != full {
-            return Err(format!(
-                "{t:?}'s history reaches landed {c}: {}, under {:?}",
-                !full, w.policies.history
-            ));
-        }
-        // Under `Squashed` a change that won here and then lost, itself, in
-        // a tree above is in no graft there, so a sync that fast-forwards
-        // this tree to its parent's commit leaves it out of this tree's
-        // lineage: that collision's ref keeps it.
-        // excuse: R7 under Squashed a change that lost above is kept by its collision ref
-        let kept = || {
-            w.collisions
-                .iter()
-                .any(|x| w.upstream(*t)[1..].contains(&x.tree) && x.loser == *c)
-        };
-        if (*won || full) && !lineage.contains(c) && !kept() {
-            return Err(format!("{t:?}'s lineage lost landed {c}"));
+            .or_insert_with(|| reach(&repo, &head));
+        if !history.contains(c) {
+            return Err(format!("{t:?}'s history lost landed {c}"));
         }
     }
-    if full {
-        return Ok(());
-    }
-    let new: Vec<String> = w.reach[&w.main_head]
-        .0
-        .iter()
-        .filter(|c| !w.main_history.contains(*c))
-        .cloned()
-        .collect();
-    if new.is_empty() {
-        return Ok(());
-    }
-    let mut args = vec![
-        "--no-replace-objects",
-        "log",
-        "--no-walk=unsorted",
-        "--format=%H %(trailers:key=Agentfs-Tree,valueonly)",
-    ];
-    args.extend(new.iter().map(String::as_str));
-    if let Some(l) = git(&repo, &args)
-        .lines()
-        .find(|l| !l.is_empty() && !l.ends_with(" main"))
-    {
-        return Err(format!("Squashed: main's history reaches {l}"));
-    }
-    w.main_history.extend(new);
     Ok(())
 }
 
@@ -1732,93 +1537,84 @@ fn history_setting(w: &mut World) -> Result<(), String> {
 fn placed_and_unlinked(w: &mut World) -> Result<(), String> {
     let mut met = (0, 0);
     for l in &w.landings[w.placements_checked..] {
-        for (i, (u, base)) in l.units.iter().enumerate() {
-            for p in PATHS {
-                let b = w.file(&l.before, p);
-                // A file an earlier winning change of the same take created
-                // (a squash judges each save on the one before's result).
-                let created = l.units[..i].iter().any(|(v, vb)| {
-                    l.winners.contains(v) && {
-                        let (was, now) = (w.file(vb, p).name, w.file(v, p).name);
-                        !was.live() && now.live() && now.over.as_deref() == Some(was.id.as_str())
-                    }
+        let (u, base) = (&l.change, &l.base);
+        for p in PATHS {
+            let b = w.file(&l.before, p);
+            let edits: Vec<_> = w
+                .edits(base, u)
+                .into_iter()
+                .filter(|e| e.path == p)
+                .collect();
+            if edits.is_empty() {
+                continue;
+            }
+            let unlinks = edits.iter().any(|e| e.line == b.name.line && e.gone);
+            // A create: its name version written over the tree's deleted
+            // one (read from the change's line map), which only a new
+            // file's create can be.
+            let name = w.file(u, p).name;
+            let creates = edits.iter().any(|e| e.line == b.name.line && !e.gone)
+                && name.over.as_deref() == Some(b.name.id.as_str());
+            let applies = edits.iter().any(|e| {
+                b.member(&e.line)
+                    .is_none_or(|v| v.id != e.token && !w.lineage.descends(&v.id, &e.token))
+            });
+            // excuse: R11 a change that unlinks the file too, or creates it, is no edit of an unlinked file
+            if !b.name.live() && !unlinks && !creates && applies {
+                met.1 += 1;
+                let lost = w.collisions.iter().any(|c| {
+                    c.tree == l.tree
+                        && c.result == l.result
+                        && c.loser == *u
+                        && c.path == p
+                        && c.by == By::File
                 });
-                let edits: Vec<_> = w
-                    .edits(base, u)
-                    .into_iter()
-                    .filter(|e| e.path == p)
-                    .collect();
-                if edits.is_empty() {
+                if !lost {
+                    return Err(format!(
+                        "{u:.7} edits {p}, which {:?} had unlinked, and did not lose by a file rule",
+                        l.tree
+                    ));
+                }
+            }
+            if !l.won {
+                continue;
+            }
+            let (src, r, mine) = (w.file(u, p), w.file(&l.result, p), w.file(base, p));
+            let saw = |line: &str| src.lines.iter().any(|x| x.line == line);
+            for (k, n) in src.lines.iter().enumerate() {
+                if mine.member(&n.line).is_some() || b.member(&n.line).is_some() {
                     continue;
                 }
-                let unlinks = edits.iter().any(|e| e.line == b.name.line && e.gone);
-                // A create: its name version written over the tree's deleted
-                // one (read from the change's line map), which only a new
-                // file's create can be.
-                let name = w.file(u, p).name;
-                let creates = edits.iter().any(|e| e.line == b.name.line && !e.gone)
-                    && name.over.as_deref() == Some(b.name.id.as_str());
-                let applies = edits.iter().any(|e| {
-                    b.member(&e.line)
-                        .is_none_or(|v| v.id != e.token && !w.lineage.descends(&v.id, &e.token))
-                });
-                // excuse: R11 a change that unlinks the file too, or creates it, is no edit of an unlinked file
-                if !b.name.live() && !unlinks && !creates && !created && applies {
-                    met.1 += 1;
-                    let lost = w.collisions.iter().any(|c| {
-                        c.tree == l.tree
-                            && c.result == l.result
-                            && c.loser == *u
-                            && c.path == p
-                            && c.by == By::File
-                    });
-                    if !lost {
-                        return Err(format!(
-                            "{u:.7} edits {p}, which {:?} had unlinked, and did not lose by a file rule",
-                            l.tree
-                        ));
-                    }
-                }
-                if !l.winners.contains(u) {
+                let Some(i) = r.lines.iter().position(|x| x.line == n.line) else {
                     continue;
+                };
+                let anchor = src.lines[..k]
+                    .iter()
+                    .rev()
+                    .find(|x| r.lines.iter().any(|y| y.line == x.line))
+                    .map(|x| x.line.as_str());
+                let mut j = i;
+                while j > 0 && !saw(&r.lines[j - 1].line) {
+                    j -= 1;
                 }
-                let (src, r, mine) = (w.file(u, p), w.file(&l.result, p), w.file(base, p));
-                let saw = |line: &str| src.lines.iter().any(|x| x.line == line);
-                for (k, n) in src.lines.iter().enumerate() {
-                    if mine.member(&n.line).is_some() || b.member(&n.line).is_some() {
-                        continue;
-                    }
-                    let Some(i) = r.lines.iter().position(|x| x.line == n.line) else {
-                        continue;
-                    };
-                    let anchor = src.lines[..k]
-                        .iter()
-                        .rev()
-                        .find(|x| r.lines.iter().any(|y| y.line == x.line))
-                        .map(|x| x.line.as_str());
-                    let mut j = i;
-                    while j > 0 && !saw(&r.lines[j - 1].line) {
-                        j -= 1;
-                    }
-                    let prev = j.checked_sub(1).map(|j| r.lines[j].line.as_str());
-                    if prev != anchor {
-                        return Err(format!(
-                            "{u:.7}'s new line {} in {p} is placed after {prev:?}, not after {anchor:?}",
-                            n.id
-                        ));
-                    }
-                    if let Some(x) = r.lines.get(i + 1)
-                        && b.member(&x.line).is_some()
-                        && !saw(&x.line)
-                    {
-                        return Err(format!(
-                            "{u:.7}'s new line {} in {p} comes before the parent's {} at its place",
-                            n.id, x.id
-                        ));
-                    }
-                    if j < i && r.lines[j..i].iter().any(|x| b.member(&x.line).is_some()) {
-                        met.0 += 1;
-                    }
+                let prev = j.checked_sub(1).map(|j| r.lines[j].line.as_str());
+                if prev != anchor {
+                    return Err(format!(
+                        "{u:.7}'s new line {} in {p} is placed after {prev:?}, not after {anchor:?}",
+                        n.id
+                    ));
+                }
+                if let Some(x) = r.lines.get(i + 1)
+                    && b.member(&x.line).is_some()
+                    && !saw(&x.line)
+                {
+                    return Err(format!(
+                        "{u:.7}'s new line {} in {p} comes before the parent's {} at its place",
+                        n.id, x.id
+                    ));
+                }
+                if j < i && r.lines[j..i].iter().any(|x| b.member(&x.line).is_some()) {
+                    met.0 += 1;
                 }
             }
         }
@@ -1829,11 +1625,10 @@ fn placed_and_unlinked(w: &mut World) -> Result<(), String> {
     Ok(())
 }
 
-/// Every commit `head` reaches, as stored or in lineage (with grafts).
-fn reach(repo: &Path, head: &str, lineage: bool) -> BTreeSet<String> {
-    let mut args = vec!["rev-list", head];
-    if !lineage {
-        args.insert(0, "--no-replace-objects");
-    }
-    git(repo, &args).lines().map(str::to_string).collect()
+/// Every commit `head` reaches.
+fn reach(repo: &Path, head: &str) -> BTreeSet<String> {
+    git(repo, &["rev-list", head])
+        .lines()
+        .map(str::to_string)
+        .collect()
 }

@@ -14,8 +14,7 @@
 //! landing queue, per line: a line written over the parent's replaces it,
 //! and of two concurrent lines the parent's wins; a change (a save, the
 //! whole file at one close, or a transaction) with a line that lost loses
-//! whole. Under `Squashed` each save is judged before the winners are
-//! squashed. A sync decides nothing:
+//! whole. A sync decides nothing:
 //! the fork takes the parent's decided version, keeping only its own lines
 //! still on their way to that queue. Every losing commit keeps a collision
 //! ref and a note on its take's result commit, which a separate
