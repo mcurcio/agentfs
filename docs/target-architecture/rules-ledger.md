@@ -222,6 +222,8 @@ without seeing the other. MODEL.md's rules table holds the full wording; this pa
   if both deletes are recorded and then agree, my hope is that a merge reports no conflicts and life is good".
 - **R10.4** · owner · A line appended after the parent's unfinished last line (no final newline) collides with it,
   and the parent wins. agentfs never adds a newline no program wrote. Owner, 2026-11-05: "collide".
+- **R10.5** · owner · The same inside a transaction: a line the transaction appended after the sandbox's unfinished
+  last line collides at commit, the sandbox's line wins, and the program is told (R5). Owner, 2026-11-05: "A" (finding 30).
 - **R10.1** · approved · Of two inserts at one place, the parent's comes first. Approved by the owner, 2026-11-05 (approval page); he asked whether this is only inserts: yes; two edits of one line are a collision the parent wins (R3b). Tests: `r10_concurrent_inserts_at_one_place_keep_both_the_parents_first`
 - **R10.2** · rejected · A partial last line that a merge puts another line after reads as ending in a newline. Owner, 2026-11-05 (in chat, round 2): "collide": a line appended after the parent's unfinished last line collides with it (R10.4). Gone when: `r10_a_line_after_a_partial_line_reads_terminated`
 - **R11** · approved · A file keeps its identity through renames (like an inode). Its name and existence are one
