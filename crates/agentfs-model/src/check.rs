@@ -600,15 +600,18 @@ fn delivered(w: &World, t: Tree, c: &Collision) -> bool {
 /// deletes, or such a collision names it.
 fn no_silent_loss(w: &World, now: &Views) -> Result<(), String> {
     for (t, p, l, a, b) in moves(w, now) {
+        // excuse: NONE two deletes agree; no ledger rule says so (the owner's "(a) agree", 2026-11-05, is under rejected R3e.3)
         if !a.live() && !b.live() {
             continue;
         }
+        // excuse: R3b a collision decided against a: the parent's version may replace it
         if w.lineage.descends(&a.id, &b.id) && !decided_against(w, t, p, l, &a.id) {
             return Err(format!(
                 "stale revert in {t:?}:{p}[{l}]: {} became {}, which it was written over",
                 a.id, b.id
             ));
         }
+        // excuse: R3b a collision names a lost: it stays in history, named
         if !w.lineage.descends(&b.id, &a.id) && !flagged(w, t, p, l, &a.id) {
             return Err(format!(
                 "silent loss in {t:?}:{p}[{l}]: {} became {}, which was not written over it, and no collision names it",
@@ -623,11 +626,14 @@ fn no_silent_loss(w: &World, now: &Views) -> Result<(), String> {
         let lost = flagged(w, *t, &e.path, &e.line, &e.token);
         let Some(s) = files[&e.path].member(&e.line) else {
             // A new line that lost never entered the tree's file.
+            // excuse: R3b a new line that lost never entered the tree's file
             if lost {
                 continue;
             }
             return Err(format!("line {} of {} left {t:?}", e.line, e.path));
         };
+        // excuse: R3b a collision names it lost
+        // excuse: NONE two deletes agree; no ledger rule says so (the owner's "(a) agree", 2026-11-05, is under rejected R3e.3)
         if !lost && !w.lineage.descends(&s.id, &e.token) && !(e.gone && !s.live()) {
             return Err(format!(
                 "{} entered {t:?}:{}[{}] and is gone ({} there), with no collision naming it",
@@ -646,6 +652,7 @@ fn no_silent_loss(w: &World, now: &Views) -> Result<(), String> {
 fn no_flicker(w: &mut World, now: &Views) -> Result<(), String> {
     let mut left = Vec::new();
     for (t, p, l, a, b) in moves(w, now) {
+        // excuse: R3a the parent's queue decided against a: the line takes that decision
         if w.left
             .contains(&(t, p.to_string(), l.to_string(), b.id.clone()))
             && !decided_against(w, t, p, l, &a.id)
@@ -720,6 +727,7 @@ fn parent_wins(w: &mut World) -> Result<(), String> {
             && c.won
                 .iter()
                 .all(|t| holds(w, &c.result, t) && holds(w, &c.winner, t));
+        // excuse: R7.1 in a squashed take a later save that won may set the line
         let kept = c.lines.iter().zip(&c.lost).all(|(l, x)| {
             !r.holds(x)
                 && (r.member(l) == win.member(l)
@@ -732,7 +740,9 @@ fn parent_wins(w: &mut World) -> Result<(), String> {
         let mut pairs = c.lost.iter().zip(&c.won);
         let real = match c.by {
             By::Line => pairs.all(|(x, y)| concurrent(w, x, y)),
+            // excuse: R11 a loss by a file rule needs one concurrent pair, not all
             By::File => pairs.any(|(x, y)| concurrent(w, x, y)),
+            // excuse: R3e a line lost with its change needs a real collision of that change
             By::Whole => really_collided(w, c),
         };
         if !real {
@@ -800,6 +810,7 @@ fn changes_whole(w: &mut World) -> Result<(), String> {
             }
             for e in w.edits(base, u) {
                 let (r, b) = (w.file(&l.result, &e.path), w.file(&l.before, &e.path));
+                // excuse: NONE two deletes agree; no ledger rule says so (the owner's "(a) agree", 2026-11-05, is under rejected R3e.3)
                 let ends = |v: &Line| w.lineage.descends(&v.id, &e.token) || (e.gone && !v.live());
                 if !lost {
                     if !r.member(&e.line).is_some_and(ends) {
@@ -810,6 +821,7 @@ fn changes_whole(w: &mut World) -> Result<(), String> {
                     }
                     continue;
                 }
+                // excuse: R3e.2 a version the tree held before costs the change nothing
                 if r.holds(&e.token) && !b.holds(&e.token) {
                     return Err(format!(
                         "{u:.7} lost in {:?}, but its {} of {}[{}] reached {:.7}: a partial change",
@@ -826,6 +838,7 @@ fn changes_whole(w: &mut World) -> Result<(), String> {
                             .zip(&c.lost)
                             .any(|(x, t)| *x == e.line && *t == e.token)
                 });
+                // excuse: R3e.2 the tree before held it, or a version written over it
                 if !named && !b.member(&e.line).is_some_and(ends) {
                     return Err(format!(
                         "{u:.7} lost in {:?}, but no collision names its {} of {}[{}]",
@@ -1088,6 +1101,7 @@ fn syncs_deliver(w: &mut World) -> Result<(), String> {
         // there; the fork keeps showing `p` under the name it had (the one
         // exception). Grown from the undecided names, so no cycle of
         // files excuses itself.
+        // excuse: R11.1 the fork shows a file under its previous name until decided
         let mut kept: BTreeSet<&str> = PATHS
             .iter()
             .copied()
@@ -1122,9 +1136,12 @@ fn syncs_deliver(w: &mut World) -> Result<(), String> {
             });
             for x in r.records() {
                 let theirs = u.member(&x.line);
+                // excuse: R11.1 the name line of a file shown under its previous name
                 if clash && x.line == u.name.line {
                     continue;
                 }
+                // excuse: R3d the fork keeps its own lines the parent's queue has not decided
+                // excuse: R9.3 a prefix sync holds back the commits from the first to an open file
                 if theirs.is_none_or(|u| u.id != x.id) && decided(&x.id) && !held_back(&x.id) {
                     return Err(format!(
                         "a sync of {up:.7} into {t:?} left {p}[{}] at {}, which {parent:?} already took, not its {theirs:?}",
@@ -1161,6 +1178,7 @@ fn transactions_end_as_told(w: &mut World) -> Result<(), String> {
         // last staged version of the file's name line ended it: then the
         // file changed nothing anyone sees (an atomic save's new file), so
         // none of its staged versions is in the commit (`World::edits`).
+        // excuse: R11.2 a file a transaction created and ended changed nothing anyone sees
         let created_and_ended = |s: &crate::world::Edit| {
             let names = || {
                 e.staged
@@ -1356,6 +1374,7 @@ fn rename_overs_whole(w: &World) -> Result<(), String> {
                 continue;
             };
             let n = &files[by].name;
+            // excuse: R3a a fork keeps its own undecided name version until the parent decides
             let undecided = match t {
                 Tree::Fork(f) => {
                     w.file(&w.head(w.forks[f].parent), by).name.id != n.id
@@ -1633,6 +1652,7 @@ fn history_setting(w: &mut World) -> Result<(), String> {
         // a tree above is in no graft there, so a sync that fast-forwards
         // this tree to its parent's commit leaves it out of this tree's
         // lineage: that collision's ref keeps it.
+        // excuse: R7 under Squashed a change that lost above is kept by its collision ref
         let kept = || {
             w.collisions
                 .iter()
@@ -1711,6 +1731,7 @@ fn placed_and_unlinked(w: &mut World) -> Result<(), String> {
                 let name = w.file(u, p).name;
                 let creates = edits.iter().any(|e| e.line == b.name.line && !e.gone)
                     && name.over.as_deref() == Some(b.name.id.as_str());
+                // excuse: NONE two deletes agree; no ledger rule says so (the owner's "(a) agree", 2026-11-05, is under rejected R3e.3)
                 let applies = edits.iter().any(|e| {
                     b.member(&e.line).is_none_or(|v| {
                         v.id != e.token
@@ -1718,6 +1739,7 @@ fn placed_and_unlinked(w: &mut World) -> Result<(), String> {
                             && !w.lineage.descends(&v.id, &e.token)
                     })
                 });
+                // excuse: R11 a change that unlinks the file too, or creates it, is no edit of an unlinked file
                 if !b.name.live() && !unlinks && !creates && !created && applies {
                     met.1 += 1;
                     let lost = w.collisions.iter().any(|c| {
