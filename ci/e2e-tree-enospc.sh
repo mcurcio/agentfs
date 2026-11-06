@@ -16,6 +16,16 @@ cleanup() {
   mountpoint -q "$work/volume" && sudo umount "$work/volume" || true
 }
 trap cleanup EXIT
+expect_stopped() {
+  local log=$1 status=0
+  wait "$pid" || status=$?
+  pid=
+  if [ "$status" -ne 1 ] || ! grep -Fq 'actor stopped after a recording/save failure; reopen to recover' "$log"; then
+    echo "expected actor fail-stop exit 1; got $status" >&2
+    cat "$log" >&2
+    return 1
+  fi
+}
 sudo mount -t tmpfs -o size=32m,mode=0777 tmpfs "$work/volume"
 "$bin" --state "$work/volume/state" trees init
 "$bin" --state "$work/volume/state" trees mount "$work/main" --sandbox "$work/sandbox" >"$work/mount.log" 2>&1 & pid=$!
@@ -56,7 +66,7 @@ except OSError: pass
 PY
 rm "$work/volume/filler"
 fusermount3 -u "$work/main"; fusermount3 -u "$work/sandbox"
-wait "$pid"; pid=
+expect_stopped "$work/mount.log"
 "$bin" --state "$work/volume/state" trees init
 gitdir=$work/volume/state/history.git
 [ "$(tree_git_file "$gitdir" main file)" = acknowledged ]
@@ -125,7 +135,7 @@ kill -0 "$client" || { echo 'rename returned before filesystem was filled' >&2; 
 if ! wait "$client"; then cat "$work/rename.log" >&2; exit 1; fi
 rm "$work/volume/filler"
 fusermount3 -u "$work/main"; fusermount3 -u "$work/sandbox"
-wait "$pid"; pid=
+expect_stopped "$work/git-mount.log"
 "$bin" --state "$work/volume/state" trees init
 gitdir=$work/volume/state/history.git
 # Recovery may finish the WAL-recorded rename despite the failed reply.

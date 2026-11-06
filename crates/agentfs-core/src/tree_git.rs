@@ -82,6 +82,7 @@ impl TreeGit {
         };
         repo.run(&["init", "--bare", "--ref-format=reftable"], None, false)?;
         repo.finish_open()?;
+        sync_initialized_repository(&repo.path)?;
         Ok(repo)
     }
 
@@ -411,6 +412,32 @@ impl TreeGit {
         }
         Ok(())
     }
+}
+
+// Git creates HEAD, the config, the initial reftable and its list before
+// core.fsync is configured. Flush their contents first, then every containing
+// directory from the leaves up, including the state directory entry naming
+// the repository. Symlinks are entries in their parent, not files to follow.
+fn sync_initialized_repository(path: &Path) -> io::Result<()> {
+    fn sync_tree(dir: &Path) -> io::Result<()> {
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            let kind = entry.file_type()?;
+            if kind.is_dir() {
+                sync_tree(&entry.path())?;
+            } else if kind.is_file() {
+                std::fs::File::open(entry.path())?.sync_all()?;
+            }
+        }
+        std::fs::File::open(dir)?.sync_all()
+    }
+    sync_tree(path)?;
+    // The actor may have created the state directory immediately before the
+    // repository. Flush both its contents and its entry in its parent.
+    for dir in path.ancestors().skip(1).take(2) {
+        std::fs::File::open(dir)?.sync_all()?;
+    }
+    Ok(())
 }
 
 fn trim(bytes: &[u8]) -> &[u8] {

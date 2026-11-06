@@ -23,6 +23,7 @@ transaction behavior or snapshot-open mechanism is introduced.
 | `d9d4a81` | Shared mappings passed; anonymous open exposed an adapter `ENOENT` in [CI](https://github.com/mcurcio/agentfs/actions/runs/42161001368/job/127706373615) |
 | `798e6fa` | Anonymous open and first link passed after repairing handle-free inode attributes; shared mappings and the other tree-view checks also passed in [CI](https://github.com/mcurcio/agentfs/actions/runs/42176555005/job/127756236285) |
 | `e8d12a6` | Real mounts passed the fixed two-way flow, whole-save loss, neighboring edits, inserts, unfinished-tail, edited-place, P1/P2 and byte-call cases. The strict finding-32 case failed in [CI logs](https://github.com/mcurcio/agentfs/actions/runs/42220263763/job/127900249921); the initial log pipeline masked its exit status and is being corrected. Fault and power-loss jobs also failed and require diagnosis |
+| `4d90329` | Finding 32 correctly fails CI. The [two-writer page-cache job](https://github.com/mcurcio/agentfs/actions/runs/42221484166/job/127904349124) passes four of eight descriptor/mapping cases; shared mappings expose unsaved bytes to another mapping, and closing the first mapped writer may leave its save unpublished |
 
 Linux can request `GETATTR` without a handle during an anonymous inode's
 permission check. Searching only named paths caused the failure. The repair
@@ -46,6 +47,15 @@ ignored with an explanation; the mounted case has no expected-failure waiver.
 The failure is preserved for the owner to decide. No newline, refusal, reordering
 or collision exception is added to conceal it. Passing the other cases does not
 validate the whole phase.
+
+The page-cache probe uses independent opens in one tree. With two writable
+shared mappings and a separate read-only mapping, stores through the writers
+become readable through the observer before either writer closes, while ordinary
+`pread` still returns saved bytes. A first writer's close can also leave saved
+bytes unchanged until the other mapping closes. These are new filesystem
+observations against R1.1 and close publication, not a permission to exempt
+mappings. The failing checks remain enabled; no cache or save-policy workaround
+is introduced.
 
 ## Run the tree views
 
