@@ -589,7 +589,7 @@ impl Filesystem for View {
             // A descriptor read on direct I/O always names a lock owner; a page
             // fill never does. Through `v.volume`: a fill changes nothing a take
             // waits for, so it does not wake the queue worker.
-            if owner.is_none() {
+            if owner.is_none() && offset == u64::MAX {
                 let object = ino.0.checked_sub(2).ok_or(Errno::EBADF)?;
                 match v.volume.page_fill(&self.tree, object, offset, size) {
                     Err(Error::NotFound) => {}
