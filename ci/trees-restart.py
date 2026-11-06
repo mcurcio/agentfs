@@ -91,7 +91,8 @@ def main():
     # A file replaced while an open of its old object lives. At restart that open
     # must find its object by number: by name it would write the replacement.
     replaced = root / "replaced-before"
-    old = os.open(replaced, os.O_CREAT | os.O_RDWR, 0o600)
+    replaced.write_bytes(b"seed")
+    old = os.open(replaced, os.O_RDWR)
     os.pwrite(old, b"old object", 0)
     os.fsync(old)
     (root / "replaced-before.new").write_bytes(b"replacement before the kill")

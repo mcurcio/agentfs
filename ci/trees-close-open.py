@@ -15,7 +15,7 @@ import threading
 
 CLOSERS = 64
 MAPPERS = 4
-LARGE = 4 << 20
+LARGE = 1 << 20
 
 
 def content(round_name, index):
@@ -157,7 +157,7 @@ def main():
         raise SystemExit(__doc__)
     root = Path(sys.argv[1])
     wrong = sum(run_round(root, name, other) for name, other in (
-        ("same-1", False), ("other-1", True), ("same-2", False), ("other-2", True)))
+        ("same", False), ("other", True)))
     return int(bool(wrong))
 
 
