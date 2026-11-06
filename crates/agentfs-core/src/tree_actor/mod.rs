@@ -1344,6 +1344,18 @@ impl Volume {
 
     fn undecided(&self, fork: &referee::Snapshot, upstream: Oid) -> Result<Undecided> {
         let owners = &self.owners;
+        // Whether a commit is in `upstream`'s history never changes, and every
+        // line one save wrote has that save's commit: ask Git once per commit,
+        // not once per line (an 8 MiB file is 8,000 lines).
+        let mut reached: BTreeMap<Oid, bool> = BTreeMap::new();
+        let mut landed = |owner: Oid| -> Result<bool> {
+            if let Some(known) = reached.get(&owner) {
+                return Ok(*known);
+            }
+            let answer = self.repo.is_ancestor(owner, upstream)?;
+            reached.insert(owner, answer);
+            Ok(answer)
+        };
         let mut lines = BTreeSet::new();
         let mut names = BTreeSet::new();
         for file in fork.files.values() {
@@ -1354,14 +1366,14 @@ impl Volume {
                     .and_then(|(s, _)| s.parse::<u64>().ok())
                     .ok_or(Error::Format)?;
                 let owner = owners.get(&seq).ok_or(Error::Format)?;
-                if !self.repo.is_ancestor(*owner, upstream)? {
+                if !landed(*owner)? {
                     lines.insert(line.version.clone());
                 }
             }
         }
         for (id, history) in &fork.names {
             let owner = owners.get(&history.head).ok_or(Error::Format)?;
-            if !self.repo.is_ancestor(*owner, upstream)? {
+            if !landed(*owner)? {
                 names.insert((*id, history.head));
             }
         }

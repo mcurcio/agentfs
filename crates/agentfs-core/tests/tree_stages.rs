@@ -137,6 +137,42 @@ fn a_sync_costs_the_same_children_at_any_history_length() {
     assert_eq!(v.metrics().syncs, syncs + 1);
 }
 
+/// The held-log measurement found a sync of an 8 MiB file starting one Git child
+/// per line (8,234 children, 70 seconds). One save is one commit however many
+/// lines it wrote, so a sync costs the same children for 10 lines and 600.
+#[test]
+fn a_sync_costs_the_same_children_for_any_number_of_lines() {
+    let _one = ONE_AT_A_TIME.lock().unwrap();
+    // A volume of its own for each size, so each save meets the same tree.
+    let children = |lines: usize| {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut v = Volume::open(&tmp.path().join("state")).unwrap();
+        v.fork().unwrap();
+        let bytes: Vec<u8> = (0..lines)
+            .flat_map(|i| format!("line {i}\n").into_bytes())
+            .collect();
+        // The sandbox holds the first save's lines when the second one syncs.
+        put(&mut v, "a", &bytes);
+        while v.progress().unwrap() {}
+        let before = Stages::current().git_children;
+        put(
+            &mut v,
+            "a",
+            &bytes
+                .iter()
+                .map(|b| b.to_ascii_uppercase())
+                .collect::<Vec<_>>(),
+        );
+        while v.progress().unwrap() {}
+        Stages::current().git_children - before
+    };
+    let (few, many) = (children(10), children(600));
+    assert_eq!(
+        few, many,
+        "children per save and sync: {few} for 10 lines, {many} for 600"
+    );
+}
+
 /// Production sources of the actor's path, up to their first test module.
 fn production(path: &Path) -> String {
     let source = std::fs::read_to_string(path).unwrap();
