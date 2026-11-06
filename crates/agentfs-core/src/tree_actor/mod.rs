@@ -22,8 +22,6 @@ use serde::{Deserialize, Serialize};
 use crate::file_lock::{FileLock, Mode};
 use crate::paths::RepoPath;
 
-/// Phase 1's current per-file resource guard.
-pub const MAX_FILE_SIZE: usize = 16 << 20;
 const FORMAT: &str = "agentfs-trees-1\n";
 // Read state created by the first two development commits without changing
 // its journal, branches or history. New state uses the domain name above.
@@ -50,7 +48,7 @@ pub enum Error {
     NotFound,
     #[error("file already exists")]
     Exists,
-    #[error("tree file limit is 16 MiB")]
+    #[error("file offset or journal record is too large")]
     TooLarge,
     #[error("journal corruption at byte {0}; operator recovery required")]
     CorruptJournal(usize),
@@ -75,9 +73,6 @@ impl Call {
             } => {
                 let offset = usize::try_from(*offset).map_err(|_| Error::TooLarge)?;
                 let end = offset.checked_add(data.len()).ok_or(Error::TooLarge)?;
-                if end > MAX_FILE_SIZE {
-                    return Err(Error::TooLarge);
-                }
                 // A zero-length pwrite past EOF does not extend a file.
                 if !data.is_empty() {
                     bytes.resize(bytes.len().max(end), 0);
@@ -85,16 +80,11 @@ impl Call {
                 }
             }
             Self::Append(data) => {
-                if bytes.len().saturating_add(data.len()) > MAX_FILE_SIZE {
-                    return Err(Error::TooLarge);
-                }
+                bytes.len().checked_add(data.len()).ok_or(Error::TooLarge)?;
                 bytes.extend_from_slice(data);
             }
             Self::Truncate(size) => {
                 let size = usize::try_from(*size).map_err(|_| Error::TooLarge)?;
-                if size > MAX_FILE_SIZE {
-                    return Err(Error::TooLarge);
-                }
                 bytes.resize(size, 0);
             }
         }
@@ -362,29 +352,6 @@ impl Volume {
         let mut replay = self.tree(&h.tree)?.bytes[&h.object].clone();
         for c in h.calls.iter().chain(std::iter::once(&call)) {
             c.apply(&mut replay)?;
-        }
-        // Reserve enough space for EVERY close order. Without this, two
-        // accepted appends could exceed the limit only at RELEASE/restart.
-        let mut max_base = self.tree(&h.tree)?.bytes[&h.object].len() as u64;
-        let mut appended = 0u64;
-        for c in self
-            .handles
-            .values()
-            .filter(|other| other.tree == h.tree && other.object == h.object)
-            .flat_map(|other| other.calls.iter())
-            .chain(std::iter::once(&call))
-        {
-            match c {
-                Call::Append(data) => appended = appended.saturating_add(data.len() as u64),
-                Call::Write { offset, bytes } if !bytes.is_empty() => {
-                    max_base = max_base.max(offset.saturating_add(bytes.len() as u64));
-                }
-                Call::Truncate(size) => max_base = max_base.max(*size),
-                _ => {}
-            }
-        }
-        if max_base.saturating_add(appended) > MAX_FILE_SIZE as u64 {
-            return Err(Error::TooLarge);
         }
         self.record(Event::Call { handle, call })?;
         Ok(())

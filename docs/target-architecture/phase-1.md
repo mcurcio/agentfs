@@ -113,8 +113,7 @@ commit idempotent. Checkout failures retain the journal too.
 
 Only flat regular files with git-safe UTF-8 names; no directories, symlinks,
 permissions changes, hard links, `mmap`, `O_TMPFILE`, or direct access by another
-process. The current size guard is 16 MiB, conservatively reserved across pending
-writers. Writer labels are trusted operator inputs, not
+process. The WAL currently limits individual encoded frames to 96 MiB. Writer labels are trusted operator inputs, not
 authenticated client capabilities. All admitted names are recorded; ignore and
 attribute rules and view profiles are not wired yet.
 

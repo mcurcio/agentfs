@@ -309,16 +309,19 @@ fn crash_worker() {
 }
 
 #[test]
-fn concurrent_appends_cannot_exceed_the_limit_only_at_release() {
+fn concurrent_writers_are_not_reserved_against_an_arbitrary_size_limit() {
     let tmp = tempfile::tempdir().unwrap();
     let mut v = Volume::open(tmp.path()).unwrap();
     let a = v.write_open("main", "a", "one", true).unwrap();
     let b = v.write_open("main", "a", "two", false).unwrap();
-    v.truncate(a, agentfs_core::tree_actor::MAX_FILE_SIZE as u64)
-        .unwrap();
-    assert!(matches!(v.write(b, 0, b"x", true), Err(Error::TooLarge)));
+    let size = 100 * 1024 * 1024;
+    v.truncate(a, size).unwrap();
+    v.write(b, 0, b"x", true).unwrap();
     v.close(a).unwrap();
     v.close(b).unwrap();
+    let bytes = v.read("main", "a").unwrap();
+    assert_eq!(bytes.len(), size as usize + 1);
+    assert_eq!(bytes.last(), Some(&b'x'));
 }
 
 #[test]

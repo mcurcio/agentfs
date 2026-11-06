@@ -21,7 +21,7 @@ mkdir "$work/main" "$work/sandbox"
 fork=$("$bin" --state "$work/state" trees fork)
 start() {
     "$bin" --state "$work/state" trees mount "$work/main" \
-        --sandbox "$work/sandbox" --fork "$fork" >"$work/mount.log" 2>&1 &
+        --sandbox "$work/sandbox" --fork "$fork" >>"$work/mount.log" 2>&1 &
     pid=$!
     for _ in $(seq 1 200); do
         if mountpoint -q "$work/main" && mountpoint -q "$work/sandbox"; then return; fi
@@ -162,5 +162,12 @@ fusermount3 -u "$work/main"
 fusermount3 -u "$work/sandbox"
 wait "$pid"
 pid=
+# Both roots replace and unlink an open object. Check the actual RELEASE
+# outcomes after unmounting, and verify no orphan bytes entered history.
+test "$(grep -c 'tree OrphanDropped:' "$work/mount.log")" -eq 4
+if git --git-dir="$work/state/history.git" log --all -p --format= | grep '^+.*BAD' >/dev/null; then
+    echo "orphan bytes entered history" >&2
+    exit 1
+fi
 git --git-dir="$work/state/history.git" fsck --strict
 echo "tree-view recording, object and crash scenarios passed"
