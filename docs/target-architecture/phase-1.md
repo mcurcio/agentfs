@@ -41,7 +41,7 @@ correction, not a new landing rule.
 | Milestone | Status |
 |---|---|
 | Recording, byte calls and object lifetime | Descriptor, byte and orphan cases pass; multiple shared mappings fail visibility/publication checks |
-| Line-map storage and whole-save parent referee | Connected; mounted fixed-case comparisons pass except finding 32 |
+| Line-map storage and whole-save parent referee | Connected; R10.8 and R10.9 built; mounted result of findings 32 and 33: read the phase-1 conformance job |
 | Live landing/sync, P1/P2, writer locks, no alarm | Mounted finite progress scenarios pass; quantitative wait measurements are unavailable |
 | Journal kills, state exhaustion and power loss | The journal is the commit point for pointer steps; refs are a copy rebuilt on every open. Each row's evidence is in CI for the commit that claims it |
 | Model conformance and §18 measurements | Finding 32 blocks validation. Actual hour recorded; calls and 10,000-save jobs reached their two-hour limits without reports |
@@ -49,11 +49,11 @@ correction, not a new landing rule.
 Known model finding 32 reproduced on the real mount: a losing truncate to `y`,
 followed by an offset write of `n6` before the parent decision was readable,
 left live lines `n6` and `m1.1\n` joined as `n6m1.1\n`. Its pure diagnostic is
-ignored with an explanation; the mounted case has no expected-failure waiver.
-R10.8 now decides this as a parent-winning collision: the later save loses whole
-and stays in history. The recorded failure predates that approval; implementing
-and testing the decision remains due. Passing the other cases does not validate
-the whole phase.
+enabled and passes now; the mounted case has no expected-failure waiver.
+R10.8 decides this as a parent-winning collision: the later save loses whole
+and stays in history (`land_save`, `tree_line_rules.rs`). R10.9 hides the
+parent's later lines behind an undecided unfinished line at a sync. Passing these
+cases does not validate the whole phase.
 
 The page-cache probe uses independent opens in one tree. With two writable
 shared mappings and a separate read-only mapping, stores through the writers

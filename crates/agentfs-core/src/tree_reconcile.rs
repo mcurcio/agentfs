@@ -460,6 +460,34 @@ fn combined_graph(a: &LineMap, b: &LineMap) -> Result<BTreeMap<Id, Option<Id>>, 
     Ok(graph)
 }
 
+fn unfinished(line: &Line) -> bool {
+    line.bytes.as_ref().is_some_and(|b| !b.ends_with(b"\n"))
+}
+
+fn parents_unfinished_tail(parent: &LineMap) -> Option<&Line> {
+    parent
+        .lines
+        .iter()
+        .rev()
+        .find(|line| line.bytes.is_some())
+        .filter(|line| unfinished(line))
+}
+
+// R10.8: the first selected unfinished line with a live line after it, as its
+// identity and the next live line's version.
+fn unfinished_before_kept(placed: &[Line], selected: &BTreeSet<Id>) -> Option<(Id, Id)> {
+    let mut live = placed.iter().filter(|line| line.bytes.is_some()).peekable();
+    while let Some(line) = live.next() {
+        if unfinished(line)
+            && selected.contains(&line.identity)
+            && let Some(next) = live.peek()
+        {
+            return Some((line.identity.clone(), next.version.clone()));
+        }
+    }
+    None
+}
+
 // Replace existing identities in place; insert new identities after their
 // nearest predecessor in the source, past parent-only inserts at that point.
 fn place(parent: &[Line], source: &[Line], selected: &BTreeSet<Id>) -> Vec<Line> {
@@ -492,9 +520,9 @@ fn place(parent: &[Line], source: &[Line], selected: &BTreeSet<Id>) -> Vec<Line>
 /// save's map, and `parent` is the current parent map. Each changed version
 /// in the incoming map is judged; one loss rejects every applicable version.
 /// The actor must also account for file/name collisions, preserve the losing
-/// commit, and commit the result with both histories as parents. Finding 32
-/// remains unresolved: an incoming unfinished edit can precede a retained
-/// parent line, yielding a byte sequence neither writer wrote.
+/// commit, and commit the result with both histories as parents. An incoming
+/// unfinished line placed in front of a line the parent keeps loses to that
+/// line (R10.8), so no result holds bytes neither writer wrote.
 pub fn land_save(parent: &LineMap, base: &LineMap, incoming: &LineMap) -> Result<Landing, Error> {
     let graph = combined_graph(parent, incoming)?;
     let base_versions: BTreeMap<&str, &str> = base
@@ -526,12 +554,7 @@ pub fn land_save(parent: &LineMap, base: &LineMap, incoming: &LineMap) -> Result
     let placed = place(&parent.lines, &incoming.lines, &selected);
     // R10.4: an incoming line placed after a parent's unfinished last line
     // loses to that line. An edited existing line stays in its existing place.
-    if let Some(partial) = parent
-        .lines
-        .iter()
-        .rev()
-        .find(|line| line.bytes.is_some())
-        .filter(|line| line.bytes.as_ref().is_some_and(|b| !b.ends_with(b"\n")))
+    if let Some(partial) = parents_unfinished_tail(parent)
         && let Some(pos) = placed
             .iter()
             .position(|line| line.version == partial.version)
@@ -547,6 +570,16 @@ pub fn land_save(parent: &LineMap, base: &LineMap, incoming: &LineMap) -> Result
                 },
             );
         }
+    }
+    // R10.8: judged on what would still apply after R10.4.
+    let applying: BTreeSet<Id> = selected
+        .iter()
+        .filter(|id| decisions[*id] == Verdict::Apply)
+        .cloned()
+        .collect();
+    let kept = place(&parent.lines, &incoming.lines, &applying);
+    if let Some((identity, winner)) = unfinished_before_kept(&kept, &applying) {
+        decisions.insert(identity, Verdict::Lose { winner });
     }
     let decider = changed
         .iter()
@@ -606,12 +639,7 @@ pub fn sync(
     let mut lines = place(&parent.lines, &sandbox.lines, &selected);
     // R10.6: keep the undecided sandbox line visible without inventing a
     // newline after an unseen unfinished parent tail.
-    if let Some(partial) = parent
-        .lines
-        .iter()
-        .rev()
-        .find(|line| line.bytes.is_some())
-        .filter(|line| line.bytes.as_ref().is_some_and(|b| !b.ends_with(b"\n")))
+    if let Some(partial) = parents_unfinished_tail(parent)
         && let Some(pos) = lines
             .iter()
             .position(|line| line.version == partial.version)
@@ -620,6 +648,19 @@ pub fn sync(
             .any(|line| line.bytes.is_some() && selected.contains(&line.identity))
     {
         lines.remove(pos);
+    }
+    // R10.9, the mirror: keep an undecided unfinished line visible without
+    // joining the parent's later lines to it. They arrive with the decision.
+    if let Some(pos) = lines
+        .iter()
+        .position(|line| selected.contains(&line.identity) && unfinished(line))
+    {
+        let later = lines.split_off(pos + 1);
+        lines.extend(
+            later
+                .into_iter()
+                .filter(|line| line.bytes.is_none() || selected.contains(&line.identity)),
+        );
     }
     Ok(LineMap {
         lines,

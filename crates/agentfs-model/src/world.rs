@@ -12,7 +12,7 @@
 //! | 7. Full lineage | a landing is a merge with the fork's commit as second parent (or a fast-forward), so a tree's history reaches every change it took, the losers included; each fork commit lands on its own |
 //! | 8. A save records the write calls | [`World::write`] keeps each byte call ([`Write`]: an `O_APPEND` write, `pwrite`, `ftruncate`; [`World::open_trunc`] for `O_TRUNC`) on the open file; [`World::close`] applies them to the tree's head then: an append's bytes go after the file's last byte, finishing a partial last line (a version of it) and then making new lines; other calls leave bytes the save aligns with the head's lines (rule 10). [`World::edit`] makes a test's line edit as a program's byte calls (`program`) |
 //! | 9. A take locks the files it overwrites | [`World::open_write`]; a [`Step::Next`] whose sync or landing would overwrite a file open for writing in that tree waits ([`World::waits`]) until the close; then it holds its files ([`World::holds`]) until [`Step::Finish`] writes them; a write-open, [`World::unlink`] or [`World::rename`] of a held file waits until then; a client's death ([`World::end_client`], [`World::end_main_client`]) closes its files |
-//! | 10. Line identity | a save derives identities from the bytes at close: it aligns them with the head's lines once, by git's histogram diff (`align`), and records the result: each new line an identity, each changed line a new version written over the version it replaced; the referee and a sync then compare versions of one identity, never bytes or positions (`resolve`, `adopt`, `splice`); a line a landing would put after the parent's unfinished last line collides with it (R10.4) |
+//! | 10. Line identity | a save derives identities from the bytes at close: it aligns them with the head's lines once, by git's histogram diff (`align`), and records the result: each new line an identity, each changed line a new version written over the version it replaced; the referee and a sync then compare versions of one identity, never bytes or positions (`resolve`, `adopt`, `splice`); a line a landing would put after the parent's unfinished last line collides with it (R10.4), and so does an unfinished line a landing would put in front of a line the parent keeps (R10.8); until the parent decides, a sync hides the parent's unfinished last line in front of an undecided line (R10.6) and the parent's lines after an undecided unfinished line (R10.9) |
 //! | 9, progress (git-model.md §6) | P1: a [`Step::Next`] takes the first entry no earlier waiting entry shares a file or a source with (`scan`), so several may wait ([`World::waits`]); no call ever waits on a waiting entry (P3 is gone, the owner's decision of 2026-11-04): a new open of a file a waiting entry waits for is granted; P2, the prefix sync: a sync delivers the parent's commits in order up to the first whose delivery would overwrite a file open for writing in the fork, and waits for the rest (`prefix`) |
 //! | 11. Deletes and renames | a file's name line: [`World::rename`] writes a new version, [`World::unlink`] a deleted one; `resolve` applies the per-line rule to it and couples a file's existence with its content. [`World::create`] makes a file (an unborn identity); an open holds an object ([`Handle::object`]), so a close saves to the file its object is named by ([`World::named`]) or, for an orphan, nothing ([`Orphan`]); a rename-over from a new file is an atomic save, a rewrite of the replaced file |
 //! | 12. The journal (git-model.md §3) | an open's calls are its journal; [`World::crash`] saves each open from it once (the `Agentfs-Open` trailer, [`World::saved`]), drops calls that never returned and puts takes back in their queues |
@@ -1334,7 +1334,8 @@ impl World {
     /// file holds in the result loses.
     /// At a landing, a line placed after the parent's unfinished last line
     /// collides with it (R10.4, the owner, 2026-11-05: "collide"), so no
-    /// newline appears that no program wrote.
+    /// newline appears that no program wrote. So does an applied unfinished
+    /// line the parent would keep a line after (R10.8): the next line wins.
     /// Then the change is judged whole (rule 3e): if any version lost, none
     /// applies. The applied versions are placed by [`splice`], in the order
     /// `tip` (the incoming change) has them.
@@ -1451,6 +1452,17 @@ impl World {
                 let after = placed.live().skip_while(|l| l.id != q.id).skip(1);
                 for l in after {
                     verdicts.insert((p.to_string(), l.line.clone()), Verdict::Lose(q.id.clone()));
+                }
+            }
+            for (p, ins) in &by_path {
+                let applied: Vec<Line> = ins
+                    .iter()
+                    .filter(|i| verdicts[&key(i)] == Verdict::Apply)
+                    .map(|i| i.version.clone())
+                    .collect();
+                let placed = splice(&self.file(ours, p), &applied, &self.file(tip, p));
+                if let Some((line, next)) = unfinished_before_kept(&placed, &applied) {
+                    verdicts.insert((p.to_string(), line), Verdict::Lose(next));
                 }
             }
         }
@@ -1578,7 +1590,9 @@ impl World {
     /// history does not reach its writing commit: a line still on its way to
     /// the parent's queue, won or lost there being in that history alike)
     /// kept over the parent's version of that line, placed in the fork's
-    /// order ([`splice`]).
+    /// order ([`splice`]). No tree shows bytes nobody wrote: the parent's
+    /// unfinished last line in front of a kept line (R10.6) and the parent's
+    /// lines after a kept unfinished line (R10.9) wait for the decision.
     fn adopt(&self, ours: &str, up: &str) -> String {
         let mut files = BTreeMap::new();
         for p in self.changed(ours, up) {
@@ -1591,7 +1605,10 @@ impl World {
                 })
                 .cloned()
                 .collect();
-            let new = splice(&theirs, &keep, &mine);
+            let own: BTreeSet<String> = keep.iter().map(|l| l.line.clone()).collect();
+            let mut new = splice(&theirs, &keep, &mine);
+            hide_parents_unfinished(&mut new, &own);
+            hide_after_own_unfinished(&mut new, &own);
             if new != theirs {
                 files.insert(p, new);
             }
@@ -3582,8 +3599,8 @@ fn held(t: Tree, files: &BTreeSet<String>, holds: &BTreeSet<String>) {
     );
 }
 
-/// Rules 3 and 10: `base` with each version of `applied` set, its line's
-/// old version (if any) leaving its place, each placed in the order `src`
+/// Rules 3 and 10: `base` with each version of `applied` set. A line `base`
+/// holds keeps its place (R10.7); a new one is placed in the order `src`
 /// has the lines (design choice, as a sequence CRDT's left origin): after
 /// the nearest line before it in `src` that the result holds, then past
 /// any lines there that `src` lacks (lines `base` added that `src` never
@@ -3594,16 +3611,15 @@ fn held(t: Tree, files: &BTreeSet<String>, holds: &BTreeSet<String>) {
 fn splice(base: &Content, applied: &[Line], src: &Content) -> Content {
     let by_line: BTreeMap<&str, &Line> = applied.iter().map(|l| (l.line.as_str(), l)).collect();
     let in_src: BTreeSet<&str> = src.lines.iter().map(|l| l.line.as_str()).collect();
-    let mut lines: Vec<Line> = base
-        .lines
-        .iter()
-        .filter(|l| !by_line.contains_key(l.line.as_str()))
-        .cloned()
-        .collect();
+    let mut lines: Vec<Line> = base.lines.clone();
     for (k, s) in src.lines.iter().enumerate() {
         let Some(v) = by_line.get(s.line.as_str()) else {
             continue;
         };
+        if let Some(at) = lines.iter().position(|o| o.line == s.line) {
+            lines[at] = (*v).clone();
+            continue;
+        }
         let anchor = src.lines[..k]
             .iter()
             .rev()
@@ -3618,6 +3634,60 @@ fn splice(base: &Content, applied: &[Line], src: &Content) -> Content {
         .get(base.name.line.as_str())
         .map_or_else(|| base.name.clone(), |v| (*v).clone());
     Content { name, lines }
+}
+
+/// Whether a line's bytes end without a newline; false for a deleted line.
+fn unfinished(l: &Line) -> bool {
+    l.text().is_some_and(|t| !t.ends_with('\n'))
+}
+
+/// R10.8: the first applied unfinished line that `placed` keeps a live line
+/// after: (its line identity, the version of the next live line).
+fn unfinished_before_kept(placed: &Content, applied: &[Line]) -> Option<(String, String)> {
+    let mut live = placed.live().peekable();
+    while let Some(l) = live.next() {
+        if unfinished(l)
+            && applied.iter().any(|a| a.id == l.id)
+            && let Some(next) = live.peek()
+        {
+            return Some((l.line.clone(), next.id.clone()));
+        }
+    }
+    None
+}
+
+/// R10.6 at a sync: remove from `c` the parent's unfinished last line when any
+/// of `own` follows it. Nothing else.
+fn hide_parents_unfinished(c: &mut Content, own: &BTreeSet<String>) {
+    let front = c
+        .lines
+        .iter()
+        .position(|l| !own.contains(&l.line) && unfinished(l));
+    if let Some(at) = front
+        && c.lines[at + 1..]
+            .iter()
+            .any(|l| l.live() && own.contains(&l.line))
+    {
+        c.lines.remove(at);
+    }
+}
+
+/// R10.9 at a sync: remove from `c` the parent's live lines after a line of
+/// `own` that is unfinished. Nothing else.
+fn hide_after_own_unfinished(c: &mut Content, own: &BTreeSet<String>) {
+    let Some(at) = c
+        .lines
+        .iter()
+        .position(|l| own.contains(&l.line) && unfinished(l))
+    else {
+        return;
+    };
+    let later = c.lines.split_off(at + 1);
+    c.lines.extend(
+        later
+            .into_iter()
+            .filter(|l| !l.live() || own.contains(&l.line)),
+    );
 }
 
 /// One `@@ -a,b +c,d @@` header of a `-U0` diff as 0-based (old start, old

@@ -129,9 +129,8 @@ fn agreeing_delete_is_carried_and_clean_changes_land() {
 }
 
 #[test]
-#[ignore = "finding 32: the rules do not decide an incoming unfinished edit before a retained parent line"]
-fn unfinished_incoming_edit_before_retained_parent_line() {
-    use agentfs_core::tree_reconcile::land_save;
+fn unfinished_incoming_edit_before_retained_parent_line_loses_whole() {
+    use agentfs_core::tree_reconcile::{CollisionKind, land_save};
     let base = save(&LineMap::default(), b"first\nsecond\n", "r");
     let parent = save(&base, b"first\nparent\n", "p");
     let first = save(&base, b"partial", "c");
@@ -143,5 +142,52 @@ fn unfinished_incoming_edit_before_retained_parent_line() {
     );
     let later = save(&first, b"later", "d");
     let result = land_save(&parent, &first, &later).unwrap();
-    assert_ne!(result.content.bytes(), b"laterparent\n");
+    assert_eq!(result.content, parent);
+    assert_eq!(result.collisions.len(), 1);
+    assert_eq!(result.collisions[0].kind, CollisionKind::Line);
+    assert_eq!(result.collisions[0].winner, parent.lines[1].version);
+}
+
+#[test]
+fn an_unfinished_save_past_the_parents_lines_lands() {
+    use agentfs_core::tree_reconcile::land_save;
+    let base = save(&LineMap::default(), b"a\n", "r");
+    let parent = save(&base, b"a\nparent\n", "p");
+    let child = save(&base, b"a\nchild", "c");
+    let landing = land_save(&parent, &base, &child).unwrap();
+    assert!(landing.collisions.is_empty());
+    assert_eq!(landing.content.bytes(), b"a\nparent\nchild");
+}
+
+#[test]
+fn sync_hides_parent_lines_after_an_undecided_unfinished_line() {
+    use agentfs_core::tree_reconcile::sync;
+    use std::collections::BTreeSet;
+    let base = save(&LineMap::default(), b"a\nb\n", "r");
+    let parent = save(&base, b"a\nb\nm7\n", "p");
+    let changed = |child: &LineMap| -> BTreeSet<String> {
+        child
+            .lines
+            .iter()
+            .filter(|l| !base.ancestors.contains_key(&l.version))
+            .map(|l| l.version.clone())
+            .collect()
+    };
+    let child = save(&base, b"y", "c");
+    let before = sync(&parent, &child, &changed(&child)).unwrap();
+    assert_eq!(before.bytes(), b"y");
+    let after = sync(&parent, &before, &BTreeSet::new()).unwrap();
+    assert_eq!(after.bytes(), b"a\nb\nm7\n");
+    // An unfinished line past the parent's lines hides nothing.
+    let child = save(&base, b"a\nb\nchild", "d");
+    assert_eq!(
+        sync(&parent, &child, &changed(&child)).unwrap().bytes(),
+        b"a\nb\nm7\nchild"
+    );
+    // Nor does a finished line.
+    let child = save(&base, b"y\n", "e");
+    assert_eq!(
+        sync(&parent, &child, &changed(&child)).unwrap().bytes(),
+        b"y\nm7\n"
+    );
 }

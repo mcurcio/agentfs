@@ -251,23 +251,30 @@ without seeing the other. MODEL.md's rules table holds the full wording; this pa
   if both deletes are recorded and then agree, my hope is that a merge reports no conflicts and life is good".
   This holds for a file a rename-over named: an agreeing delete of it is not half a rename-over (finding 31). Owner,
   2026-11-06, accepting that recommendation: "we can take those recommendations for now, and i might change my mind later".
+  Tests: `r10_an_agreeing_delete_of_a_rename_overs_file_agrees`, `r10_two_deletes_of_one_line_agree_over_an_unseen_edit`
 - **R10.8** · approved · A sandbox save whose unfinished last line would land in front of a line the parent keeps
   collides: the parent wins and the save loses whole, retained in history. No tree shows bytes nobody wrote, and line
   order does not change (R10.7) (finding 32). Owner, 2026-11-06, accepting that recommendation: "we can take those
   recommendations for now, and i might change my mind later".
+  Tests: `r10_an_unfinished_line_before_a_kept_line_loses_whole`, `r10_an_unfinished_save_after_the_parents_last_line_lands`,
+  `a_save_with_an_unfinished_line_before_a_kept_line_loses_whole`
 - **R10.9** · approved · Until the parent decides, a sandbox holding an undecided unfinished last line shows that line
   and hides the parent's later lines that a sync would put after it, the mirror of R10.6. Nothing is lost: the sandbox
   gets the parent's version once decided, so R3d's decided version waits for that decision. Owner, 2026-11-06, choosing
   between this, showing the joined bytes and holding the sync: "a" (finding 33).
+  Tests: `r10_a_sync_hides_the_parents_lines_after_an_undecided_unfinished_line`,
+  `a_sync_hides_the_parents_later_lines_behind_an_undecided_unfinished_line`
 - **R10.4** · owner · A line appended after the parent's unfinished last line (no final newline) collides with it,
   and the parent wins. agentfs never adds a newline no program wrote. Owner, 2026-11-05: "collide".
 - **R10.6** · owner · Until the parent decides, a sandbox holding an undecided line does not show the parent's
   unfinished last line in front of it: the file shows the sandbox's line alone, then the parent's version once decided.
   No tree shows bytes nobody wrote. Owner, 2026-11-05: "1 a" (finding 29).
+  Tests: `r10_a_sync_hides_the_parents_unfinished_line_before_an_undecided_one`,
+  `a_sync_hides_the_parents_unfinished_line_until_decided`
 - **R10.7** · owner · An edited line keeps its place. When a parent appends a line after a line a sandbox edits, the
   merged file reads the edit, then the append. Owner, 2026-11-05: "B seems more correct. The magic words there are
   “edit” and “append”. From the perspective of each writer, their operations merged together naturally look like
-  option b".
+  option b". Tests: `r10_an_edited_line_keeps_its_place_before_an_append`
 - **R10.5** · owner · The same inside a transaction: a line the transaction appended after the sandbox's unfinished
   last line collides at commit, the sandbox's line wins, and the program is told (R5). Owner, 2026-11-05: "A" (finding 30).
 - **R10.1** · approved · Of two inserts at one place, the parent's comes first. Approved by the owner, 2026-11-05 (approval page); he asked whether this is only inserts: yes; two edits of one line are a collision the parent wins (R3b). Tests: `r10_concurrent_inserts_at_one_place_keep_both_the_parents_first`

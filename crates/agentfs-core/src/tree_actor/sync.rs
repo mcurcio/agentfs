@@ -247,6 +247,37 @@ mod tests {
         );
     }
 
+    // R10.9: the parent's later line waits for the decision on the sandbox's
+    // unfinished line, then the parent's version arrives whole.
+    #[test]
+    fn undecided_unfinished_line_hides_the_parents_later_line_until_decided() {
+        let key = MergeFileIdentity(1);
+        let mut parent = file(1, "a", "base", b"old\n");
+        let mut fork = parent.clone();
+        let lines = &mut parent.files.get_mut(&key).unwrap().lines;
+        lines.lines.push(Line {
+            identity: "later".into(),
+            version: "later".into(),
+            bytes: Some(b"later\n".to_vec()),
+        });
+        lines.ancestors.insert("later".into(), None);
+        let lines = &mut fork.files.get_mut(&key).unwrap().lines;
+        lines.lines[0].version = "own".into();
+        lines.lines[0].bytes = Some(b"own".to_vec());
+        lines.ancestors.insert("own".into(), Some("base".into()));
+        // Without the hide the sync would read `ownlater\n`.
+        let kept = sync(
+            &parent,
+            &fork,
+            &["own".into()].into_iter().collect(),
+            &BTreeSet::new(),
+        )
+        .unwrap();
+        assert_eq!(kept.files[&key].lines.bytes(), b"own");
+        let decided = sync(&parent, &kept, &BTreeSet::new(), &BTreeSet::new()).unwrap();
+        assert_eq!(decided.files[&key].lines.bytes(), b"old\nlater\n");
+    }
+
     #[test]
     fn names_fall_back_through_a_chain_then_take_parent_decision() {
         let mut fork = file(1, "a", "one", b"one\n");

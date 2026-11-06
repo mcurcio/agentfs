@@ -927,6 +927,34 @@ fn decided_at_the_parents_queue(w: &World, c: &Collision) -> bool {
     }
 }
 
+/// Whether the parent's line `x`, which a sync left out of `r`, stands in front
+/// of the sandbox's line `o`, read from the parent's file `u` and the sandbox's
+/// `ours` before the sync. A line `u` holds keeps its place there (R10.7), so
+/// where `u` holds `o`, by `u`'s order; where `ours` holds both, by its order.
+/// Otherwise a sync places `o` past lines the sandbox never saw, up to the next
+/// line it did see, so `x` stands behind `o` only if `u` has such a line before
+/// `x` that `r` holds after `o`.
+fn in_front_of(u: &Content, ours: &Content, r: &Content, x: &Line, o: &Line) -> bool {
+    let at = |c: &Content, line: &str| c.lines.iter().position(|l| l.line == line);
+    if let (Some(a), Some(b)) = (at(u, &x.line), at(u, &o.line)) {
+        return a < b;
+    }
+    if let (Some(a), Some(b)) = (at(ours, &x.line), at(ours, &o.line)) {
+        return a < b;
+    }
+    let Some(from) = at(r, &o.line) else {
+        return false;
+    };
+    let after: BTreeSet<&str> = r.lines[from + 1..]
+        .iter()
+        .map(|l| l.line.as_str())
+        .collect();
+    u.lines
+        .iter()
+        .take_while(|l| l.line != x.line)
+        .all(|l| !after.contains(l.line.as_str()))
+}
+
 /// Rule 3 per sync, as of the moment its take began: the fork now holds
 /// the parent's version of every line, except where it holds its own
 /// version the parent's queue had not decided then (that version had not
@@ -934,7 +962,10 @@ fn decided_at_the_parents_queue(w: &World, c: &Collision) -> bool {
 /// back (P2: the take's result commit is not in the parent commit the
 /// sync delivered, read from git). A sync carries the parent's decided
 /// state: a fork version the parent already took is replaced by the
-/// parent's version, whichever won.
+/// parent's version, whichever won. Two parent's lines may be absent while
+/// the sandbox's own line is undecided, each only where the rule says: its
+/// unfinished last line in front of that line (R10.6), and a line behind that
+/// line when it is unfinished (R10.9).
 fn syncs_deliver(w: &mut World) -> Result<(), String> {
     for (t, up, result, entered) in &w.syncs[w.syncs_checked..] {
         let Tree::Fork(f) = t else {
@@ -1011,7 +1042,31 @@ fn syncs_deliver(w: &mut World) -> Result<(), String> {
                     ));
                 }
             }
-            if let Some(x) = u.records().find(|x| r.member(&x.line).is_none()) {
+            // The sandbox's lines still undecided, for what a sync may hide.
+            let undecided = |o: &&Line| !decided(&o.id) || held_back(&o.id);
+            let ends_open = |l: &Line| l.text().is_some_and(|t| !t.ends_with('\n'));
+            let ours = commit_parents(w.repo(), result)
+                .first()
+                .map(|c| w.file(c, p));
+            let in_front =
+                |x: &Line, o: &Line| ours.as_ref().is_some_and(|m| in_front_of(&u, m, &r, x, o));
+            let hidden = |x: &Line| {
+                // excuse: R10.6 the parent's unfinished last line in front of an undecided line
+                let before_own = ends_open(x)
+                    && u.live().last() == Some(x)
+                    && r.live().filter(undecided).any(|o| in_front(x, o));
+                // excuse: R10.9 the parent's lines after an undecided unfinished line, unseen by the sandbox
+                let after_own = x.live()
+                    && ours.as_ref().is_some_and(|m| m.member(&x.line).is_none())
+                    && r.live()
+                        .filter(undecided)
+                        .any(|o| ends_open(o) && !in_front(x, o));
+                before_own || after_own
+            };
+            if let Some(x) = u
+                .records()
+                .find(|x| r.member(&x.line).is_none() && !hidden(x))
+            {
                 return Err(format!(
                     "a sync of {up:.7} into {t:?} dropped line {} of {p}",
                     x.line
@@ -1258,7 +1313,8 @@ fn one_writer(w: &mut World, all: &[String]) -> Result<(), String> {
 /// its parent's (it has not synced since the parent's queue decided it), or
 /// a sandbox's version main has not taken (a sync kept it as undecided, in
 /// this fork or a tree above it that this fork synced from); main has no
-/// such exception.
+/// such exception. A delete of the renamed file that agrees with one written
+/// over the rename is not half a rename-over (R10.3, [`deleted_over`]).
 fn rename_overs_whole(w: &World) -> Result<(), String> {
     for (t, files) in &w.views {
         for (x, c) in files {
@@ -1266,6 +1322,10 @@ fn rename_overs_whole(w: &World) -> Result<(), String> {
                 continue;
             };
             let n = &files[by].name;
+            // excuse: R10.3 a delete agreeing with one written over the rename is not half of it
+            if !n.live() && deleted_over(w, *t, by, by, v) {
+                continue;
+            }
             // excuse: R3a a fork keeps its own undecided name version until the parent decides
             let undecided = match t {
                 Tree::Fork(f) => {

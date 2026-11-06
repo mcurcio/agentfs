@@ -452,9 +452,18 @@ line. An append needs none (§6).
 sandbox appends a line, and placement (below) would put the sandbox's line after it. That line collides with main's
 and main wins, and the sandbox's save loses whole; agentfs never adds a newline no program wrote (the owner,
 2026-11-05, R10.4: "collide"; `r10_a_line_after_the_parents_unfinished_line_collides`). An append made after a sync
-brought that line finishes it (§6). Two cases R10.4 does not decide are open (MODEL.md findings 29, 30): a sync that
-keeps the sandbox's undecided line after the parent's unfinished one, and a transaction's line after its own
-sandbox's unfinished one. In both, two line identities make one line of bytes.
+brought that line finishes it (§6).
+
+The mirror case: an applied line with no final newline that the parent would keep a live line after. It collides
+with that next line and the parent wins, and the save loses whole, retained in history; an unfinished line with
+nothing after it lands (R10.8, MODEL.md finding 32; `r10_an_unfinished_line_before_a_kept_line_loses_whole`,
+`r10_an_unfinished_save_after_the_parents_last_line_lands`).
+
+A sync decides nothing, so until the parent decides the sandbox hides, rather than joins: the parent's unfinished
+last line in front of a sandbox's undecided line (R10.6, finding 29), and the parent's lines behind a sandbox's
+undecided unfinished line (R10.9, finding 33). Each arrives with the decision (§8). One case stays open
+(MODEL.md finding 30): a transaction's line after its own sandbox's unfinished one makes one line of bytes from two
+line identities.
 
 | What the bytes show | Recorded as | Against the parent's concurrent edit of that line | Tests |
 |---|---|---|---|
@@ -465,9 +474,10 @@ sandbox's unfinished one. In both, two line identities make one line of bytes.
 | a moved line | a delete plus a new line holding the same bytes | the delete loses to the parent's edit and the new line applies: the parent's edit at the old place, the old bytes at the new one, one collision recorded (the delete's) | `r10_a_move_is_a_delete_plus_an_insert` |
 | a run of identical lines, one more or less | the diff's pick: it trims the common prefix first, so an added blank line is the run's last | none, but a neighbouring edit can land one line off from where the program's bytes put it | `r10_repeated_identical_lines_align_by_the_diff` |
 
-**Placement** (as RGA's left origin): an applied version goes after the nearest line before it in the incoming
-file that the parent holds, past parent lines there the incoming file never had; a sync places the sandbox's
-undecided versions the same way.
+**Placement** (as RGA's left origin): a version of a line the parent holds takes that line's place (R10.7,
+`r10_an_edited_line_keeps_its_place_before_an_append`). A new line goes after the nearest line before it in the
+incoming file that the parent holds, past parent lines there the incoming file never had. A sync places the
+sandbox's undecided versions the same way.
 
 ### Deletes and renames (design choice)
 
@@ -588,7 +598,9 @@ sequenceDiagram
 ```
 
 A sync never records a collision (`step_checked`). Once main's queue has taken a fork's line, win or lose, the
-next sync replaces it with main's line (`syncs_deliver`).
+next sync replaces it with main's line (`syncs_deliver`). Until then a sync leaves out two kinds of main's lines,
+so no tree shows bytes nobody wrote: its unfinished last line in front of the fork's undecided line (R10.6), and its
+lines behind the fork's undecided unfinished line (R10.9). So the decided version R3d carries waits for that decision.
 
 ## 9. Transactions: a frozen branch
 
@@ -957,8 +969,9 @@ Open on 2026-11-05. Each names its context; none blocks phase 1 unless noted:
   would reopen R5.3, so it is his decision.
 - **Programs sharing one tree, during a transaction.** R5.3 conflicts with R1: a program that knows nothing of transactions
   closes a file with a deferred call, reopens it and reads the old bytes.
-- **Sandbox and parent.** MODEL.md findings 31 (seed 309) and 32 (seed 128), which is not about transactions and does touch
-  byte-level saves. The model's `OrphanDropped` stretches R11.3 for a file created in a transaction that lost.
+- **Sandbox and parent.** The model's `OrphanDropped` stretches R11.3 for a file created in a transaction that lost.
+  Answered 2026-11-06: findings 31 (R10.3), 32 (R10.8) and 33 (R10.9). Open: MODEL.md finding 35, R10.6 hiding a line the
+  sandbox already held.
 - **History.** R5.1's "which remote?": the commit's trailers name the tree, the loser and the versions, no remote.
 
 *History: 2026-11-03, from the model at 509a0ab; revised after review (save ordering, trees, recovery, grafts, slots); 2026-11-03, the owner's answers on losers and saves; review: Replication pushes losers, questions 2 and 3; 2026-11-03, the owner's answers on saves and locks; review: appends at close, main's clients' death, transactions with open files, the lock over path calls, the program-level hang; 2026-11-03, after the owner's "Go": close-to-open accepted, line identity, deletes and renames (§7); review: no POSIX call names a line, so a save aligns its bytes once (§6, §7), the atomic-save idiom, untracked files (§3), R9/R13/A8 put to the owner (§16), §17 cut; 2026-11-03, the owner's answer to question 3: a save or transaction lands whole or loses whole, only winning saves are squashed (§7, §9, §11, §15); 2026-11-04, answering the pull-request review: the journal (§3), progress (§6), objects (§7), why a custom protocol (§14), the phase 1 validation plan (§18), proof claims narrowed to the modelled executions; 2026-11-04, byte calls modelled (§6, §7), the notes ref built (§4, §8), Replication due on every move of main (§4); 2026-11-04, the adversarial review at `ee29551`: finding 24 (P3

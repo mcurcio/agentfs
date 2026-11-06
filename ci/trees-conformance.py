@@ -395,7 +395,7 @@ def byte_calls():
 
 
 def finding_32():
-    # Exact calls of finding_32_a_landing_leaves_a_line_unfinished_before_the_parents.
+    # Exact calls of r10_an_unfinished_line_before_a_kept_line_loses_whole (R10.8).
     # Both open handles hold the relevant automatic takes until the saves exist.
     model = json.loads(subprocess.check_output([ORACLE, "finding-32"]))
     seed("finding32", bytes.fromhex(model["base"]))
@@ -414,9 +414,12 @@ def finding_32():
     commit = git("rev-parse", "main").strip().decode()
     refs = git("for-each-ref", "--format=%(objectname)", "refs/collisions/").decode().splitlines()
     assert first in refs, ("first save did not lose whole", first, refs)
-    status = subprocess.run(["git", "--git-dir=" + str(REPO), "merge-base",
-                             "--is-ancestor", second, commit]).returncode
-    assert status == 0, ("second save was not landed", second, commit, status)
+    assert second in refs, ("second save did not lose whole", second, refs)
+    for save_commit in (first, second):
+        status = subprocess.run(["git", "--git-dir=" + str(REPO), "merge-base",
+                                 "--is-ancestor", save_commit, commit]).returncode
+        assert status == 0, ("losing save left history", save_commit, commit, status)
+    assert model["main"] == model["parent"], ("the model's main took a losing save", model)
     assert bytes_at(commit, "finding32") == bytes.fromhex(model["main"]), (
         "finding 32 bytes differ from model", bytes_at(commit, "finding32"), model["main"])
     message = git("show", "-s", "--format=%B", commit).decode().splitlines()
@@ -426,13 +429,34 @@ def finding_32():
     assert all(line.endswith(b"\n") for line in live[:-1]), (
         "finding 32: an unfinished line precedes another line", live, bytes_at(commit, "finding32"))
     assert b"".join(live) == bytes_at(commit, "finding32")
+    converged("finding32", bytes.fromhex(model["parent"]))
+
+
+def finding_33():
+    # R10.9: deliver the parent's later line while the child's unfinished line
+    # is still waiting at the parent. The sync must not join them as `ym7\n`.
+    seed("finding33", b"a\nb\n")
+    with (MAIN / "finding33").open("r+b", buffering=0):
+        save(FORK, FORK_REF, "finding33", b"y")
+        child = direct_commit(FORK_REF, "finding33", b"y")
+        save(MAIN, "main", "finding33", b"a\nb\nm7\n")
+        parent_commit = git("rev-parse", "main").strip().decode()
+        def parent_reached_fork():
+            return subprocess.run(["git", "--git-dir=" + str(REPO), "merge-base",
+                                   "--is-ancestor", parent_commit, FORK_REF]).returncode == 0
+        until("finding 33 sync", parent_reached_fork)
+        assert bytes_at(FORK_REF, "finding33") == b"y"
+        assert (FORK / "finding33").read_bytes() == b"y"
+    converged("finding33", b"a\nb\nm7\n")
+    refs = git("for-each-ref", "--format=%(objectname)", "refs/collisions/").decode().splitlines()
+    assert child in refs, ("child save did not lose whole", child, refs)
 
 
 def main():
     failed = []
     try:
         until("metrics output", lambda: METRICS.exists())
-        for case in (flow, standard_cases, undecided, progress_p1, progress_p2, byte_calls, finding_32):
+        for case in (flow, standard_cases, undecided, progress_p1, progress_p2, byte_calls, finding_32, finding_33):
             try:
                 case()
                 RESULTS[case.__name__] = {"status": "pass"}

@@ -1389,12 +1389,11 @@ fn r10_an_append_over_the_synced_unfinished_line_finishes_it() {
     assert_eq!(&bytes(&w, Tree::Main, "b")[12..], "};\n");
 }
 
-/// Coherence finding 29: a sync keeps the sandbox's undecided line after the
-/// parent's unfinished last line (R3a: a sync decides nothing). No rule says
-/// what the sandbox shows until the parent's queue decides.
+/// R10.6 (finding 29): a sync hides the parent's unfinished last line in front
+/// of the sandbox's undecided line, shows the parent's version once decided, and
+/// no tree shows bytes nobody wrote.
 #[test]
-#[ignore = "coherence finding 29: a sync puts the sandbox's undecided line after the parent's unfinished last line, and two lines read as one"]
-fn finding_29_a_sync_keeps_a_line_after_the_parents_unfinished_line() {
+fn r10_a_sync_hides_the_parents_unfinished_line_before_an_undecided_one() {
     let mut w = world();
     let f = w.create_fork(Tree::Main);
     calls(
@@ -1413,6 +1412,75 @@ fn finding_29_a_sync_keeps_a_line_after_the_parents_unfinished_line() {
         "{:?}: only a file's last line can lack a newline",
         b.bytes()
     );
+    assert!(b.bytes().ends_with("n9\n"), "{:?}", b.bytes());
+    assert!(!b.bytes().contains('}'), "{:?}", b.bytes());
+    drain(&mut w);
+    assert!(bytes(&w, Tree::Main, "b").ends_with('}'));
+    assert_eq!(bytes(&w, Tree::Fork(f), "b"), bytes(&w, Tree::Main, "b"));
+}
+
+/// R10.9 (finding 33): a sync hides the parent's later lines behind the
+/// sandbox's undecided unfinished last line, so `y` then `m7\n` never reads
+/// `ym7\n`. Nothing is lost: the save loses (R10.8), it stays in history, and
+/// the sandbox then shows the parent's version.
+#[test]
+fn r10_a_sync_hides_the_parents_lines_after_an_undecided_unfinished_line() {
+    let mut w = world();
+    let f = w.create_fork(Tree::Main);
+    let c = Client::Fork(f);
+    let cut = w.open_trunc(&c, "c");
+    w.write(
+        cut,
+        Write::Pwrite {
+            offset: 0,
+            bytes: "y".into(),
+        },
+    );
+    w.close(cut);
+    let loser = w.head(Tree::Fork(f));
+    calls(&mut w, &m1(), "c", &[Write::Append("m7\n".into())]);
+    let main = bytes(&w, Tree::Main, "c");
+    next(&mut w, Tree::Fork(f));
+    assert_eq!(bytes(&w, Tree::Fork(f), "c"), "y");
+    drain(&mut w);
+    assert_eq!(bytes(&w, Tree::Main, "c"), main);
+    assert_eq!(bytes(&w, Tree::Fork(f), "c"), main);
+    let lost = w
+        .collisions
+        .iter()
+        .find(|x| x.tree == Tree::Main && x.loser == loser)
+        .expect("the save lost, with its record");
+    assert!(w.is_ancestor(&lost.loser, &w.main_head));
+}
+
+/// Coherence finding 35: main cuts a line the sandbox already holds to an
+/// unfinished last line, in front of the sandbox's undecided line. R10.6 hides it,
+/// so the line the sandbox held leaves its file, which `no_silent_loss` forbids:
+/// the excuses R10.6 was given cover `syncs_deliver` only.
+#[test]
+#[ignore = "coherence finding 35: a sync hides a line the sandbox held, and `no_silent_loss` says it left the tree"]
+fn finding_35_a_sync_hides_a_line_the_sandbox_already_held() {
+    let mut w = world();
+    let f = w.create_fork(Tree::Main);
+    calls(
+        &mut w,
+        &m1(),
+        "c",
+        &[Write::Pwrite {
+            offset: 2,
+            bytes: "n3\n".into(),
+        }],
+    );
+    next(&mut w, Tree::Fork(f));
+    calls(
+        &mut w,
+        &Client::Fork(f),
+        "c",
+        &[Write::Append("n5\n".into())],
+    );
+    calls(&mut w, &m1(), "c", &[Write::Truncate(3)]);
+    next(&mut w, Tree::Fork(f));
+    assert_eq!(bytes(&w, Tree::Fork(f), "c").lines().last(), Some("n5"));
 }
 
 /// Coherence finding 30: a transaction's line after its sandbox's own
@@ -1940,13 +2008,12 @@ fn r5_a_deferred_save_holds_back_a_sync_of_its_file() {
     assert!(has(&w, Tree::Main, "a", &m), "and the parent wins");
 }
 
-/// Coherence finding 31: main renames d over c and then unlinks d, while a
-/// sandbox unlinks d. The two deletes agree (R10.3), so the sandbox's applies,
-/// and d's name is then a version not written over the rename-over's, which
-/// `rename_overs_whole` calls half a rename-over.
+/// R10.3 (finding 31): main renames d over c and then unlinks d, while a sandbox
+/// unlinks d. The two deletes agree, so the sandbox's applies, and d's name is
+/// then a version not written over the rename-over's, which is not half a
+/// rename-over.
 #[test]
-#[ignore = "coherence finding 31: an agreeing delete of a file a rename-over named fails rename_overs_whole"]
-fn finding_31_an_agreeing_delete_of_a_rename_overs_file() {
+fn r10_an_agreeing_delete_of_a_rename_overs_file_agrees() {
     let mut w = world();
     let f = w.create_fork(Tree::Main);
     assert_eq!(w.unlink(&Client::Fork(f), "d"), None);
@@ -1957,6 +2024,12 @@ fn finding_31_an_agreeing_delete_of_a_rename_overs_file() {
     ok(&mut w);
     next(&mut w, Tree::Main);
     drain(&mut w);
+    assert!(w.collisions.is_empty(), "{:?}", w.collisions);
+    for t in [Tree::Main, Tree::Fork(f)] {
+        let head = w.head(t);
+        assert_eq!(w.lookup(&head, "d"), None);
+        assert_eq!(w.lookup(&head, "c"), None);
+    }
 }
 
 /// R5.1 and R9.9, read from git: a take's decision lives in its own result
@@ -2002,14 +2075,13 @@ fn r5_a_decision_is_in_its_result_commit_with_its_tree() {
     }
 }
 
-/// Coherence finding 32: a save that makes a line unfinished (no final newline)
-/// lands over a parent whose later lines it lost to. A first save cuts the file
-/// to one unfinished line; main edits a line it deleted, so that save loses
-/// whole; the sandbox's next save, written over its own first line, lands on its
-/// own, and the parent's next line follows it on one line of bytes nobody wrote.
+/// R10.8 (finding 32): a save that makes a line unfinished (no final newline)
+/// would land in front of a line the parent keeps. A first save cuts the file to
+/// one unfinished line; main edits a line it deleted, so that save loses whole;
+/// the sandbox's next save, written over its own first line, would put the
+/// parent's next line on one line of bytes nobody wrote, so it loses whole too.
 #[test]
-#[ignore = "coherence finding 32: a landing leaves a middle line with no newline, so two lines read as one"]
-fn finding_32_a_landing_leaves_a_line_unfinished_before_the_parents() {
+fn r10_an_unfinished_line_before_a_kept_line_loses_whole() {
     let mut w = world();
     let f = w.create_fork(Tree::Main);
     let c = Client::Fork(f);
@@ -2023,6 +2095,7 @@ fn finding_32_a_landing_leaves_a_line_unfinished_before_the_parents() {
     );
     w.close(cut);
     w.save(&m1(), "c", 1);
+    let main = bytes(&w, Tree::Main, "c");
     let edit = w.open_write(&c, "c");
     w.write(
         edit,
@@ -2032,14 +2105,90 @@ fn finding_32_a_landing_leaves_a_line_unfinished_before_the_parents() {
         },
     );
     w.close(edit);
+    let second = w.head(Tree::Fork(f));
     next(&mut w, Tree::Main);
     next(&mut w, Tree::Main);
-    let bytes = w.read(Tree::Main, "c").bytes();
+    let read = w.read(Tree::Main, "c");
+    assert_eq!(read.bytes(), main, "main reads as before");
     assert_eq!(
-        bytes.lines().count(),
-        w.read(Tree::Main, "c").live().count(),
-        "{bytes:?}: only a file's last line can lack a newline"
+        read.bytes().lines().count(),
+        read.live().count(),
+        "{:?}: only a file's last line can lack a newline",
+        read.bytes()
     );
+    let lost = w
+        .collisions
+        .iter()
+        .find(|x| x.tree == Tree::Main && x.loser == second)
+        .expect("the second save lost, with its record");
+    assert_eq!(lost.by, By::Line);
+    assert!(w.is_ancestor(&second, &w.main_head), "and stays in history");
+    assert_eq!(git(w.repo(), &["rev-parse", &lost.reference]), second);
+    drain(&mut w);
+    assert_eq!(bytes(&w, Tree::Fork(f), "c"), main, "the sandbox converges");
+}
+
+/// R10.7: an edited line keeps its place. When main appends after the line a
+/// sandbox edits, the file reads the edit, then the append.
+#[test]
+fn r10_an_edited_line_keeps_its_place_before_an_append() {
+    let mut w = world();
+    let f = w.create_fork(Tree::Main);
+    let old = bytes(&w, Tree::Main, "b");
+    let edit = w.open_write(&Client::Fork(f), "b");
+    let last = old.trim_end_matches('\n').rfind('\n').map_or(0, |n| n + 1);
+    w.write(
+        edit,
+        Write::Pwrite {
+            offset: last,
+            bytes: "E".into(),
+        },
+    );
+    w.close(edit);
+    calls(&mut w, &m1(), "b", &[Write::Append("m7\n".into())]);
+    drain(&mut w);
+    assert!(w.collisions.is_empty(), "{:?}", w.collisions);
+    let now = bytes(&w, Tree::Main, "b");
+    assert_eq!(now.lines().last(), Some("m7"), "{now:?}");
+    assert!(now.contains("E"), "{now:?}");
+    assert_eq!(now.len(), old.len() + 3, "{now:?}");
+}
+
+/// R10.8's guard: an unfinished line past every line the parent added, with no
+/// live line after it, lands: no join and no collision.
+#[test]
+fn r10_an_unfinished_save_after_the_parents_last_line_lands() {
+    let mut w = world();
+    let f = w.create_fork(Tree::Main);
+    calls(&mut w, &m1(), "b", &[Write::Append("m7\n".into())]);
+    calls(&mut w, &Client::Fork(f), "b", &[Write::Append("n9".into())]);
+    drain(&mut w);
+    assert!(w.collisions.is_empty(), "{:?}", w.collisions);
+    let b = bytes(&w, Tree::Main, "b");
+    assert!(b.ends_with("m7\nn9"), "{b:?}");
+    assert_eq!(bytes(&w, Tree::Fork(f), "b"), b);
+}
+
+/// R10.8 and R10.6's guard: a sandbox's finished append and a parent's finished
+/// line neither lose nor hide: the sync shows both, and the save lands.
+#[test]
+fn r10_an_append_after_a_finished_line_still_lands() {
+    let mut w = world();
+    let f = w.create_fork(Tree::Main);
+    calls(
+        &mut w,
+        &Client::Fork(f),
+        "b",
+        &[Write::Append("n9\n".into())],
+    );
+    calls(&mut w, &m1(), "b", &[Write::Append("m7\n".into())]);
+    next(&mut w, Tree::Fork(f));
+    let b = bytes(&w, Tree::Fork(f), "b");
+    assert!(b.ends_with("m7\nn9\n"), "{b:?}");
+    drain(&mut w);
+    assert!(w.collisions.is_empty(), "{:?}", w.collisions);
+    assert_eq!(bytes(&w, Tree::Main, "b"), b);
+    assert_eq!(bytes(&w, Tree::Fork(f), "b"), b);
 }
 
 // ── rule 10: line identity ──────────────────────────────────────────────

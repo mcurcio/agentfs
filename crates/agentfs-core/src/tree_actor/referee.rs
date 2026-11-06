@@ -639,6 +639,50 @@ mod tests {
         );
     }
 
+    // R10.3, finding 31: an agreeing delete of a file a rename-over named.
+    #[test]
+    fn rename_over_then_unlink_agrees_with_a_sandbox_unlink() {
+        let base = base();
+        let mut parent = base.clone();
+        let mut child = base.clone();
+        unlink(&mut parent, 2, 10, Some(1));
+        rename(&mut parent, 1, "b", 10);
+        unlink(&mut parent, 1, 11, None);
+        unlink(&mut child, 1, 12, None);
+        let decision = judge(&parent, &base, &child, &BTreeMap::new()).unwrap();
+        assert!(decision.collisions.is_empty());
+        let name = &decision.snapshot.names[&MergeFileIdentity(1)];
+        assert_eq!(path(name).unwrap(), None);
+        assert_eq!(name.head, 12);
+        assert!(!decision.snapshot.files.contains_key(&MergeFileIdentity(1)));
+    }
+
+    // R10.8 through the whole-save judge: the later save, written over a save
+    // that lost, loses whole to the parent's next line, by a line collision.
+    #[test]
+    fn unfinished_line_before_a_kept_line_is_a_line_collision() {
+        let base = base();
+        let mut first = base.clone();
+        edit(&mut first, 1, b"y", 11);
+        let mut parent = base.clone();
+        edit(&mut parent, 1, b"one\nPARENT\n", 10);
+        assert!(
+            !judge(&parent, &base, &first, &BTreeMap::new())
+                .unwrap()
+                .collisions
+                .is_empty()
+        );
+        let mut later = first.clone();
+        edit(&mut later, 1, b"n6", 12);
+        let decision = judge(&parent, &first, &later, &BTreeMap::new()).unwrap();
+        assert_eq!(decision.collisions.len(), 1);
+        assert_eq!(decision.collisions[0].kind, CollisionKind::Line);
+        assert_eq!(
+            decision.snapshot.files[&MergeFileIdentity(1)].lines.bytes(),
+            b"one\nPARENT\n"
+        );
+    }
+
     #[test]
     fn atomic_rewrite_keeps_target_identity_and_merges_clean_lines() {
         let mut base = base();
