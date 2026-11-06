@@ -86,38 +86,34 @@ impl Volume {
         None
     }
 
-    /// Hook: a descriptor call on `object` is in the journal. Replays call it
+    /// Hook: a write-open of `object` in `tree` is on record. Recovery calls it
     /// too. No I/O.
-    pub(super) fn pages_note_call(
-        &mut self,
-        _tree: &str,
-        _object: u64,
-        _call: &Call,
-    ) -> Result<()> {
-        Ok(())
-    }
+    pub(super) fn pages_opened(&mut self, _tree: &str, _object: u64) {}
 
-    /// Hook: a page-write record at `seq` is in the journal. Replays call it
-    /// too, in journal order. No I/O.
-    pub(super) fn pages_note_writeback(
-        &mut self,
-        _seq: u64,
-        _handle: u64,
-        _runs: &[Run],
-    ) -> Result<()> {
-        Ok(())
-    }
+    /// Hook: a descriptor call on `object` is in the journal. No I/O.
+    pub(super) fn pages_note_call(&mut self, _tree: &str, _object: u64, _call: &Call) {}
 
-    /// Hook: `closing` has left the handle table and is about to save. Returns
-    /// the calls its save applies to the saved bytes, in arrival order: its own
-    /// and the file's page writes not saved yet.
-    pub(super) fn pages_calls_for_close(&mut self, closing: &Handle) -> Vec<Call> {
+    /// Hook: `closing` is about to save, on a copy of its tree: this cannot
+    /// change anything, because the save may still fail. Returns the calls its
+    /// save applies to the saved bytes, in arrival order: its own and the
+    /// file's page writes not saved yet.
+    pub(super) fn pages_calls_for_close(&self, closing: &Handle) -> Vec<Call> {
         closing.calls.iter().map(|(_, call)| call.clone()).collect()
     }
 
-    /// Hook: a close of `object` in `tree` has updated the saved bytes. Rebuilds
-    /// the image over them, or drops the page state with the last write-open.
-    pub(super) fn pages_saved(&mut self, _tree: &str, _object: u64) -> Result<()> {
-        Ok(())
+    /// Hook: the step `seq` that closed a write-open of `object` in `tree` is
+    /// past its commit point and installed. Rebuilds the image over the saved
+    /// bytes, or drops the page state with the last write-open. No I/O.
+    pub(super) fn pages_saved(&mut self, _tree: &str, _object: u64, _seq: u64) {}
+
+    /// Hook: recovery found these page writes and this `saved_through` for a
+    /// file with a live write-open, before its closes run. No I/O.
+    pub(super) fn pages_restore(
+        &mut self,
+        _tree: &str,
+        _object: u64,
+        _writes: Vec<(u64, Run)>,
+        _saved_through: u64,
+    ) {
     }
 }

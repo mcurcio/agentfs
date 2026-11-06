@@ -138,8 +138,8 @@ him to accept losing a call that returned, which the previous draft did (views.m
 | `RELEASE` (the last reference) | nothing to wait for: the actor saves from the journal (§6) | nothing can fail on recording, since every call is already recorded; the kernel ignores `RELEASE`'s answer anyway | — |
 
 Publication is the save, at `RELEASE`, as before: the actor builds the commit from the open's journaled calls and
-its base (the open's first record names its file, its object, its base commit and its target) and moves the branch;
-the open's records are dropped only once that ref transaction is durable. Then:
+its base (the open's first record names its file, its object and its tree), then appends one record with every pointer
+that step moves: the commit point (§12). The open's records leave the journal at a compaction after that. Then:
 
 - **A save that fails** (the repository's disk full, an object write failing): the calls stay journaled, readers
   keep the old content, `SaveFailed` is raised, and the actor saves it again at its next step in that tree and at
@@ -147,9 +147,10 @@ the open's records are dropped only once that ref transaction is durable. Then:
 - **A refusal that depends only on the path** (Rules' group refusal, rules.md) is answered at the write-open
   (`EACCES`), and a size rule at the write call (`EFBIG`), never at `RELEASE`, which cannot carry an error.
 - **A crash** of a view host, the history service or the node: at restart, before any view serves the tree, each
-  open whose journaled calls no save names is saved as its close would have been, the rule a client's death
-  already follows (§6). A save names its open in one more trailer, `Agentfs-Open: <n>` (a choice; the model's
-  format has three), so a replay never saves an open twice.
+  open with no record closing it is saved as its close would have been, the rule a client's death already follows
+  (§6). The step's record names the open it closes, so a replay never saves an open twice. A save still names its
+  open in one more trailer, `Agentfs-Open: <n>` (a choice; the model's format has three), for the audit; it decides
+  nothing.
 - `fsync` makes calls durable, never visible.
 - **Objects across a restart** (a choice; the review of 2026-11-04, P1-d). The object table, which says for each
   object (§7) its tree and the file identity whose path names it, or none, is journaled too: an open's first record
@@ -162,9 +163,9 @@ the open's records are dropped only once that ref transaction is durable. Then:
   byte oracle and object table catch it). The model's crash keeps its object table, which this rule rebuilds
   exactly. What a view host can rely on across its own restart (kernel inode numbers, handles after the mount
   reconnects) is for phase 1 (§18).
-- **Open numbers never repeat** (a choice; P2-e of that review). The `n` of `Agentfs-Open: <n>` comes from a
-  per-tree counter kept in the journal, never reset by a restart: a reused number would make a replay skip a new
-  open as "already saved". The model's numbers never repeat within a run.
+- **Open numbers never repeat** (a choice; P2-e of that review). The `n` of `Agentfs-Open: <n>` comes from the
+  journal's record number, which a checkpoint carries across compaction and a restart never resets: a reused number
+  would make a replay skip a new open as "already saved". The model's numbers never repeat within a run.
 
 | Shape | Gains | Costs |
 |---|---|---|
@@ -173,10 +174,16 @@ the open's records are dropped only once that ref transaction is durable. Then:
 | Calls held in the view's memory until close (the previous draft) | no journal | a view host's death loses every call it held, and a failed save loses its calls silently: breaks principle 1 |
 | Save at every `FLUSH`, as today's recorder does | close returns the save's error | `FLUSH` comes at every close of a duplicated descriptor, so it saves too often, and it would publish before the `RELEASE` that close-to-open waits for |
 
-The journal is one per tree, in the state area beside the repository, never under a tree or a mount (V4). Today's
-journal (`docs/design.md` §3.2, §3.3) carries over: checksummed frames, group commit, a torn tail discarded. Its
-records were whole states; these are calls, so replay needs the open's trailer to stay idempotent. How a view host
-appends without a path into the state area is parked (views.md).
+The journal is in the state area beside the repository, never under a tree or a mount (V4). In phase 1 there is one
+per actor, holding every tree's records, because a step can move two trees' queues at once. Frames are checksummed
+and salted; a bad frame with no good one after it is a torn tail, saved aside, and one with a good one after it refuses
+to serve (`docs/runbooks/recording-failures.md`). How a view host appends without a path into the state area is
+parked (views.md).
+
+Compaction replaces the file with one checkpoint (every pointer, the fork upstreams, the live opens, the next number)
+and then, unchanged, the calls and page writes of files with a live write-open: a file held open pins only its own
+calls, never other files' saves. It is due at a step once the file reaches `max(64 MiB, twice its length after the last
+compaction)`, and always runs at the end of a recovery.
 
 Every commit carries three trailers. The model's exact format (the `#` comments are not part of it):
 
@@ -681,21 +688,39 @@ One history mode. The owner, 2026-11-05: "drop squashing". Every sandbox commit 
 open saved once from the journal, takes put back, waiting calls dropped); the rest of a restart, and power loss, are
 not; the rest is a design choice.
 
-**One step, one ref transaction.** Each step writes its objects, then makes every ref change in one `update-ref
---stdin` transaction, each update naming its old value. That survives a crash only on the **reftable** backend
-(`git init --ref-format=reftable`, git 2.45+), which commits by one atomic swap; the files backend renames refs one
-by one, so a crash can leave half a step.
+**One step, one journal record** (a recommendation the owner accepted, revisable; `docs/design.md` §19.1). Each step
+writes its objects durably, then appends one synced journal record with every pointer it moves: the branch, queue
+entries, collision refs, the object table. That record is the commit point. Git's refs are then a copy, in the files
+format, and nothing decides from the copy: runtime reads come from the journal's pointers. Reftable's one atomic swap
+is no longer needed, and git's reftable writer could not survive a cut anyway (`reftable/writer.c` writes a table's
+footer after its last sync).
 
-| Step | Its one ref transaction | On restart |
+The order of a step:
+
+1. Build on a copy of the tree. Objects are fsynced, with their directories, as they are written.
+2. Check the pointers it moves against their current values.
+3. Append the record and fsync it: **the commit point**.
+4. Install the copy and apply the pointers.
+5. The copies: a fork's `config`, the refs, the private checkout.
+
+A failure in 1 to 3 changes nothing: the call returns its errno and the actor keeps serving (§3). A close stays pending,
+its handle still counting as open, and saves first at the next step in its tree and at restart. A take stays queued for
+the next event. Only a failed `fsync` or rollback of the journal stops the actor: the file cannot be trusted then.
+
+A failure in 4 and 5 is not a recording failure (AGENTS principle 5): the call succeeded. It is logged, and the next
+step rebuilds the refs whole and redoes that checkout.
+
+| Step | Its one journal record | On restart |
 |---|---|---|
-| save | the branch, the landing entry at the parent, a sync entry at each child | nothing to do: the move and its entries exist together, or neither |
-| queue take | the branch, the entry deleted, the entries the move causes, the collision ref | the entry is still there only if the take never happened: take it again; collision refs are named by the losing commit, so a rerun makes the same names |
-| transaction begin, commit, rollback | `txn/<n>` with `refs/txn-start/<n>`; commit adds the fork's move and its entries | a `txn/*` branch whose client has ended is deleted: an implicit rollback (A13); a client waiting to rebind after a history-service restart has not ended, and its transaction is restored at rebind (clients.md) |
-| fork create, drop | the branch (its upstream config written first); drop deletes it | a dropped fork's leftover entries are deleted |
-| journal | none: outside git; each call appended, and flushed at `fsync` and close, before it returns (§3) | before any view serves the tree, each open with journaled calls that no save's `Agentfs-Open` names is saved as its close would be; then its records are dropped. A torn last frame is discarded: its call never returned |
-| locks | none: held in memory by the actor | none survive: open files ended with their clients and are saved from the journal (row above); an unfinished take moved no ref, so its entry is still there and is taken again. Its entry ref is deleted in the take's last ref transaction, with the branch move; the model takes the entry off its in-memory queue when the take begins, and its crash puts it back in its place |
-| object table | none: journaled with the calls that move objects (§3) | rebuilt from the journal on the last committed trees, never by file identity; an open whose object no path names is replayed as an orphan (saves nothing, `OrphanDropped`) |
-| objects | none: written before any ref names them | unreferenced objects: git's garbage collection |
+| save | the branch, the landing entry at the parent, a sync entry at each child, the object table; names the open it closes | nothing to do: the move and its entries are one record, or neither happened |
+| queue take | the branch, the entry deleted, the entries the move causes, the collision ref, the object table | the entry is still there only if the take has no record: take it again; collision refs are named by the losing commit, so a rerun makes the same names |
+| transaction begin, commit, rollback | not built in phase 1 | a `txn/*` branch whose client has ended is deleted: an implicit rollback (A13); a client waiting to rebind after a history-service restart has not ended, and its transaction is restored at rebind (clients.md) |
+| fork create | the branch and its upstream | `config` is rewritten from the journal before any git command; a dropped fork is not built in phase 1 |
+| journal | each call appended and synced before it returns (§3) | before any view serves the tree, each open with no record closing it is saved as its close would be, exactly once. A torn last frame is saved aside and discarded |
+| refs, `config`, `HEAD` | a copy of the records | `config` and `HEAD` are rewritten, then `refs/` and `packed-refs` are removed and every pointer is created in one `update-ref --stdin`, on every open, so this path always runs. A live `git` reader may see a step half copied |
+| locks | none: held in memory by the actor | none survive: open files ended with their clients and are saved from the journal (row above); an unfinished take has no record, so its entry is still there and is taken again. The model takes the entry off its in-memory queue when the take begins, and its crash puts it back in its place |
+| object table | a blob per tree, named by the step's record | rebuilt on each branch's snapshot, never by file identity; an open whose object no path names is replayed as an orphan (saves nothing, `OrphanDropped`) |
+| objects | none: durable before a record names them | every pointer's commit, tree and blobs are checked (`rev-list --objects --no-walk --missing=print`): anything lost refuses to serve. Unreferenced objects: git's garbage collection |
 
 ## 13. Where the virtual filesystem sits
 
@@ -850,7 +875,8 @@ power loss, failed save or view-host restart.
 - A transaction's answer covers its commit into its own fork. A transaction committed there can still lose whole
   at main's queue later: a recorded collision, not part of the answer.
 - The referee and the actor are our own code; no git merge strategy carries them.
-- Atomic steps need the reftable backend (§12).
+- One step is one journal record, which needs compaction (§3), and a `git` command run during a step may see its refs
+  half copied (§12).
 - Losing commits and their refs are pushed and kept: a trim rule is not wanted unless it keeps who changed what when.
 - A stale truncate and rewrite overwrites a synced line in every tree, no collision, credited to its writer (§6).
 - The shared remote lags: a collision ref reaches it when Replication's next push lands, not with the take.

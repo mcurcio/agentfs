@@ -25,7 +25,16 @@ start() {
   done
   echo 'mount startup timed out' >&2; return 1
 }
-points=(tree.wal_before_header tree.wal_after_header tree.wal_after_payload tree.wal_before_fsync tree.wal_after_fsync tree.after_wal_before_apply tree.after_objects_durable tree.after_refs_durable tree.before_checkout tree.after_checkout)
+# Takes run on the view's worker. Let them finish before the kill, so the failpoint
+# meets the client's call rather than a leftover take.
+drain_queue() {
+  for _ in $(seq 1 300); do
+    [ -n "$(git --git-dir="$work/state/history.git" for-each-ref refs/queue)" ] || return 0
+    sleep .1
+  done
+  echo 'queue did not drain' >&2; return 1
+}
+points=(tree.wal_before_header tree.wal_after_header tree.wal_after_payload tree.wal_before_fsync tree.wal_after_fsync tree.before_objects tree.after_objects_durable tree.after_commit_point tree.after_ref_copy tree.before_checkout tree.after_checkout)
 for point in "${points[@]}"; do
   rm -rf "$work/state" "$work/main" "$work/sandbox"
   mkdir "$work/main" "$work/sandbox"
@@ -46,10 +55,11 @@ os.fsync(fd); receipt('fsync')
 os.close(fd); receipt('close')
 PY
   : > "$work/main/candidate"
+  drain_queue
   fusermount3 -u "$work/main"; fusermount3 -u "$work/sandbox"
   wait "$pid"; pid=
   case "$point" in
-    tree.wal_*|tree.after_wal_before_apply) spec="$point=kill@2" ;;
+    tree.wal_*) spec="$point=kill@2" ;; # The open is the first record.
     *) spec="$point=kill" ;;
   esac
   start "$spec"
@@ -87,8 +97,44 @@ PY
   [ "$(git --git-dir="$gitdir" rev-parse main)" = "$head" ]
   printf 'PASS\t%s\t%s\n' "$point" "$(tail -n 1 "$work/receipt")" | tee -a "$work/results.tsv"
 done
+# The failpoints a mounted process cannot reach: each opening of the state area
+# passes them. Killed there, the next open still finds every returned write.
+for point in tree.after_ref_rebuild tree.compact_before_rename tree.compact_after_rename; do
+  rm -rf "$work/state" "$work/main" "$work/sandbox"
+  mkdir "$work/main" "$work/sandbox"
+  "$bin" --state "$work/state" trees init
+  fork=$("$bin" --state "$work/state" trees fork)
+  start ''
+  printf saved > "$work/main/kept"
+  fusermount3 -u "$work/main"; fusermount3 -u "$work/sandbox"
+  wait "$pid"; pid=
+  status=0
+  AGENTFS_FAILPOINTS="$point=kill" "$bin" --state "$work/state" trees init >"$work/open.log" 2>&1 || status=$?
+  [ "$status" = 137 ] || { echo "$point did not kill: $status" >&2; cat "$work/open.log" >&2; exit 1; }
+  grep -F "agentfs failpoint $point triggered (kill)" "$work/open.log" >/dev/null
+  "$bin" --state "$work/state" trees init
+  gitdir=$work/state/history.git
+  [ "$(tree_git_file "$gitdir" main kept)" = saved ]
+  git --git-dir="$gitdir" fsck --full --strict --no-progress
+  tree_git_no_duplicate_opens "$gitdir"
+  printf 'PASS\t%s\t-\n' "$point" | tee -a "$work/results.tsv"
+done
+# A first init killed before its `format` starts over.
+rm -rf "$work/state"
+status=0
+AGENTFS_FAILPOINTS=tree.init_before_format=kill "$bin" --state "$work/state" trees init >"$work/open.log" 2>&1 || status=$?
+[ "$status" = 137 ] || { echo "tree.init_before_format did not kill: $status" >&2; cat "$work/open.log" >&2; exit 1; }
+[ -e "$work/state/initializing" ]
+"$bin" --state "$work/state" trees init
+[ ! -e "$work/state/initializing" ]
+git --git-dir="$work/state/history.git" fsck --full --strict --no-progress
+printf 'PASS\ttree.init_before_format\t-\n' | tee -a "$work/results.tsv"
 # Crash with a replaced object still held open: its acknowledged writes must
 # never be replayed onto the new object at that pathname.
+rm -rf "$work/state" "$work/main" "$work/sandbox"
+mkdir "$work/main" "$work/sandbox"
+"$bin" --state "$work/state" trees init
+fork=$("$bin" --state "$work/state" trees fork)
 start ''
 python3 - "$work/main" "$work/orphan-receipt" <<'PY' >"$work/orphan-client.log" 2>&1 & client=$!
 import os, sys, time

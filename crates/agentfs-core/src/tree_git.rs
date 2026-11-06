@@ -1,9 +1,12 @@
 //! Git plumbing for tree actors (target architecture §§3, 12).
 //!
-//! Reftable makes a transaction across multiple refs durable as one update.
-//! The Git executable must support reftable and `git refs migrate` for old
-//! files-backed repositories. The legacy history backend remains independent.
+//! The repository is in Git's files format, and its refs are a copy: the
+//! actor's journal is the commit point and `rebuild_refs` remakes them after a
+//! crash. Objects are durable before a record names them. agentfs writes
+//! `config` and `HEAD` itself, atomically, before any git command: git replaces
+//! `config` with no fsync, and an emptied one silently loses `core.fsync`.
 
+use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::io::{self, Write};
 use std::os::fd::{AsRawFd, BorrowedFd};
@@ -24,6 +27,8 @@ use thiserror::Error;
 pub enum Error {
     #[error("I/O: {0}")]
     Io(#[from] io::Error),
+    #[error("state area full: {0}")]
+    NoSpace(String),
     #[error("git failed: {0}")]
     Git(String),
     #[error("invalid git output: {0}")]
@@ -31,6 +36,21 @@ pub enum Error {
 }
 
 type Result<T> = std::result::Result<T, Error>;
+
+/// What git's stderr says went wrong. A full state area must reach the call as
+/// `ENOSPC`, and git's exit status does not say (children run under `LC_ALL=C`).
+fn classify(stderr: &[u8]) -> Error {
+    let text = String::from_utf8_lossy(stderr).trim().to_owned();
+    if text.contains("No space left on device") || text.contains("Disk quota exceeded") {
+        Error::NoSpace(text)
+    } else {
+        Error::Git(text)
+    }
+}
+
+// The repository's whole configuration; nothing else writes it.
+const CONFIG: &str = "[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n\tbare = true\n\tfsync = objects,derived-metadata\n\tfsyncMethod = fsync\n";
+const HEAD: &str = "ref: refs/heads/main\n";
 
 /// A single tree entry. Names are raw Unix filename bytes.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -56,7 +76,7 @@ pub struct RefUpdate {
     pub expected_old: Option<Oid>,
 }
 
-/// A bare Git repository with a reftable reference store.
+/// A bare Git repository whose refs are a copy of the journal's pointers.
 #[derive(Clone, Debug)]
 pub struct TreeGit {
     path: PathBuf,
@@ -80,8 +100,7 @@ impl TreeGit {
             path: std::fs::canonicalize(path)?,
             lease,
         };
-        repo.run(&["init", "--bare", "--ref-format=reftable"], None, false)?;
-        repo.finish_open()?;
+        repo.run(&["init", "--bare"], None, false)?;
         sync_initialized_repository(&repo.path)?;
         Ok(repo)
     }
@@ -91,58 +110,75 @@ impl TreeGit {
         Self::open_inner(path.as_ref(), None)
     }
 
-    /// Open while retaining the actor's exclusive lock across Git children.
+    /// Keeps the path and the actor's lock across Git children. Runs no git and
+    /// checks no format: after a crash `write_config` comes first.
     pub fn open_with_lease(path: impl AsRef<Path>, lease: Arc<FileLock>) -> Result<Self> {
         Self::open_inner(path.as_ref(), Some(lease))
     }
 
     fn open_inner(path: &Path, lease: Option<Arc<FileLock>>) -> Result<Self> {
-        let repo = Self {
+        Ok(Self {
             path: std::fs::canonicalize(path)?,
             lease,
-        };
-        repo.finish_open()?;
-        Ok(repo)
+        })
     }
 
-    fn finish_open(&self) -> Result<()> {
-        let format = self.run(&["rev-parse", "--show-ref-format"], None, true)?;
-        if trim(&format.stdout) != b"reftable" {
-            self.run(&["refs", "migrate", "--ref-format=reftable"], None, true)?;
-        }
-        self.configure_durability()
-    }
-
-    fn configure_durability(&self) -> Result<()> {
-        self.set_config("core.fsync", "all")?;
-        self.set_config("core.fsyncMethod", "fsync")
-    }
-
-    /// Set a repository-local configuration value and make changes durable.
-    pub fn set_config(&self, key: &str, value: &str) -> Result<()> {
-        let output = self
-            .command(true)
-            .args(["config", "--local", "--null", "--get-all", key])
-            .output()?;
-        let unchanged = if output.status.success() {
-            let mut desired = value.as_bytes().to_vec();
-            desired.push(0);
-            output.stdout == desired
-        } else if output.status.code() == Some(1) {
-            false
-        } else {
-            return Err(Error::Git(
-                String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+    /// Replaces `config` and `HEAD`, each atomically (temporary file, fsync,
+    /// rename, directory fsync). Runs no git, and leaves what git needs to call
+    /// this a repository, `refs/` included: a cut rebuild can leave none.
+    /// `upstreams` maps a fork's name to its parent's.
+    pub fn write_config(&self, upstreams: &BTreeMap<String, String>) -> Result<()> {
+        let mut config = CONFIG.to_owned();
+        for (fork, parent) in upstreams {
+            let section = fork.replace('\\', "\\\\").replace('"', "\\\"");
+            config.push_str(&format!(
+                "[branch \"{section}\"]\n\tremote = .\n\tmerge = refs/heads/{parent}\n"
             ));
-        };
-        if !unchanged {
-            self.run(&["config", "--local", key, value], None, true)?;
         }
-        // Git replaces config by rename. Also sync unchanged values: a prior
-        // process may have failed after the rename but before its sync.
-        std::fs::File::open(self.path.join("config"))?.sync_all()?;
-        std::fs::File::open(&self.path)?.sync_all()?;
+        replace_file(&self.path, "config", config.as_bytes())?;
+        replace_file(&self.path, "HEAD", HEAD.as_bytes())?;
+        std::fs::create_dir_all(self.path.join("refs"))?;
         Ok(())
+    }
+
+    /// Removes `refs/` and `packed-refs`, makes `refs/`, and creates every
+    /// pointer in one `update-ref --stdin`. No fsync: this is a copy.
+    pub fn rebuild_refs(&self, pointers: &[RefUpdate]) -> Result<()> {
+        let refs = self.path.join("refs");
+        match std::fs::remove_dir_all(&refs) {
+            Err(err) if err.kind() != io::ErrorKind::NotFound => return Err(err.into()),
+            _ => {}
+        }
+        match std::fs::remove_file(self.path.join("packed-refs")) {
+            Err(err) if err.kind() != io::ErrorKind::NotFound => return Err(err.into()),
+            _ => {}
+        }
+        std::fs::create_dir(&refs)?;
+        self.ref_transaction(pointers)
+    }
+
+    /// What is lost of each tip's commit, tree and blobs, parents not walked.
+    pub fn missing_objects(&self, tips: &[Oid]) -> Result<Vec<Oid>> {
+        let mut input = String::new();
+        for tip in tips {
+            input.push_str(&format!("{tip}\n"));
+        }
+        let out = self.run(
+            &[
+                "rev-list",
+                "--objects",
+                "--no-walk",
+                "--missing=print",
+                "--stdin",
+            ],
+            Some(input.as_bytes()),
+            true,
+        )?;
+        out.stdout
+            .split(|b| *b == b'\n')
+            .filter_map(|line| line.strip_prefix(b"?"))
+            .map(parse_oid)
+            .collect()
     }
 
     fn command(&self, bare: bool) -> Command {
@@ -166,39 +202,8 @@ impl TreeGit {
 
     fn run(&self, args: &[&str], input: Option<&[u8]>, bare: bool) -> Result<Output> {
         let mut cmd = self.command(bare);
-        cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
-        if input.is_some() {
-            cmd.stdin(Stdio::piped());
-        } else {
-            cmd.stdin(Stdio::null());
-        }
-        let mut child = cmd.spawn()?;
-        let (output, write_result) = std::thread::scope(|scope| {
-            let writer = input.map(|bytes| {
-                let mut stdin = child.stdin.take().expect("piped stdin");
-                scope.spawn(move || stdin.write_all(bytes))
-            });
-            let output = child.wait_with_output();
-            let write_result = writer
-                .map(|writer| {
-                    writer
-                        .join()
-                        .map_err(|_| io::Error::other("git stdin writer panicked"))
-                })
-                .transpose();
-            (output, write_result)
-        });
-        let output = output?;
-        let write_result = write_result?;
-        if !output.status.success() {
-            return Err(Error::Git(
-                String::from_utf8_lossy(&output.stderr).trim().to_owned(),
-            ));
-        }
-        if let Some(result) = write_result {
-            result?;
-        }
-        Ok(output)
+        cmd.args(args);
+        run_command(cmd, input)
     }
 
     /// Return a reference's value, or None when it does not exist.
@@ -213,9 +218,7 @@ impl TreeGit {
         } else if out.status.code() == Some(1) {
             Ok(None)
         } else {
-            Err(Error::Git(
-                String::from_utf8_lossy(&out.stderr).trim().to_owned(),
-            ))
+            Err(classify(&out.stderr))
         }
     }
 
@@ -352,28 +355,14 @@ impl TreeGit {
         cmd.env("GIT_AUTHOR_NAME", "agentfs")
             .env("GIT_AUTHOR_EMAIL", "agentfs@localhost")
             .env("GIT_COMMITTER_NAME", "agentfs")
-            .env("GIT_COMMITTER_EMAIL", "agentfs@localhost")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        let mut child = cmd.spawn()?;
-        child
-            .stdin
-            .take()
-            .expect("piped stdin")
-            .write_all(message.as_bytes())?;
-        let out = child.wait_with_output()?;
-        if !out.status.success() {
-            return Err(Error::Git(
-                String::from_utf8_lossy(&out.stderr).trim().into(),
-            ));
-        }
+            .env("GIT_COMMITTER_EMAIL", "agentfs@localhost");
+        let out = run_command(cmd, Some(message.as_bytes()))?;
         let oid = parse_oid(trim(&out.stdout))?;
         self.sync_object_dirs(oid)?;
         Ok(oid)
     }
 
-    // Git fsyncs loose object data under core.fsync=all. Persist the
+    // Git fsyncs loose object data under core.fsync=objects. Persist the
     // fan-out directory entry and any newly created fan-out directory before
     // a subsequent transaction can publish this object.
     fn sync_object_dirs(&self, oid: Oid) -> Result<()> {
@@ -418,9 +407,7 @@ impl TreeGit {
         match out.status.code() {
             Some(0) => Ok(true),
             Some(1) => Ok(false),
-            _ => Err(Error::Git(
-                String::from_utf8_lossy(&out.stderr).trim().into(),
-            )),
+            _ => Err(classify(&out.stderr)),
         }
     }
     /// Replace a private cache directory with the exact tree, without Git filters.
@@ -458,8 +445,8 @@ impl TreeGit {
     }
 }
 
-// Git creates HEAD, the config, the initial reftable and its list before
-// core.fsync is configured. Flush their contents first, then every containing
+// Git creates its skeleton before agentfs writes the config, with no
+// core.fsync. Flush the files first, then every containing
 // directory from the leaves up, including the state directory entry naming
 // the repository. Symlinks are entries in their parent, not files to follow.
 fn sync_initialized_repository(path: &Path) -> io::Result<()> {
@@ -482,6 +469,51 @@ fn sync_initialized_repository(path: &Path) -> io::Result<()> {
         std::fs::File::open(dir)?.sync_all()?;
     }
     Ok(())
+}
+
+// Spawn, feed stdin and wait. The exit status wins over a failed stdin write: a
+// git that died of a full disk also breaks the pipe, and stderr says why.
+fn run_command(mut cmd: Command, input: Option<&[u8]>) -> Result<Output> {
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    if input.is_some() {
+        cmd.stdin(Stdio::piped());
+    } else {
+        cmd.stdin(Stdio::null());
+    }
+    let mut child = cmd.spawn()?;
+    let (output, write_result) = std::thread::scope(|scope| {
+        let writer = input.map(|bytes| {
+            let mut stdin = child.stdin.take().expect("piped stdin");
+            scope.spawn(move || stdin.write_all(bytes))
+        });
+        let output = child.wait_with_output();
+        let write_result = writer
+            .map(|writer| {
+                writer
+                    .join()
+                    .map_err(|_| io::Error::other("git stdin writer panicked"))
+            })
+            .transpose();
+        (output, write_result)
+    });
+    let output = output?;
+    let write_result = write_result?;
+    if !output.status.success() {
+        return Err(classify(&output.stderr));
+    }
+    if let Some(result) = write_result {
+        result?;
+    }
+    Ok(output)
+}
+
+fn replace_file(dir: &Path, name: &str, bytes: &[u8]) -> io::Result<()> {
+    let temporary = dir.join(format!("{name}.agentfs-tmp"));
+    let mut file = std::fs::File::create(&temporary)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    std::fs::rename(&temporary, dir.join(name))?;
+    std::fs::File::open(dir)?.sync_all()
 }
 
 fn trim(bytes: &[u8]) -> &[u8] {
@@ -523,6 +555,24 @@ fn attach_lease_signal(cmd: &mut Command, lease: &FileLock, signal: i32) {
             rustix::io::fcntl_setfd(borrowed, flags)?;
             Ok(())
         });
+    }
+}
+
+#[cfg(test)]
+mod classify_tests {
+    use super::*;
+
+    #[test]
+    fn git_no_space_is_enospc() {
+        for stderr in [
+            &b"error: unable to create temporary file: No space left on device\nfatal: bad\n"[..],
+            b"fatal: write error: Disk quota exceeded\n",
+        ] {
+            let error = crate::tree_actor::Error::from(classify(stderr));
+            assert_eq!(error.errno(), libc::ENOSPC);
+        }
+        let error = crate::tree_actor::Error::from(classify(b"fatal: not a git repository\n"));
+        assert_eq!(error.errno(), libc::EIO);
     }
 }
 

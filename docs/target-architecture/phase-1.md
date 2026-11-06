@@ -8,8 +8,9 @@ can run real end-to-end tests and validate the model".
 defines the exit tests. The [rules ledger](rules-ledger.md) governs outcomes.
 Implementation is paused; the [handoff](phase-1-handoff.md) records the exit-test
 snapshot, measured hour and remaining work. Owner decisions in `921528b` now
-cover R10.8, R1.4, the R10.3 clarification and the journal pointer commit point;
-implementation and tests have not yet been updated to them.
+cover R10.8, R1.4, the R10.3 clarification and the journal pointer commit point.
+The journal pointer commit point is implemented (below); the jobs named under
+"Verification and recovery" judge it.
 The original recording commits (`43dad43`, `22b91ab`, `62457b8`) were outdated
 and untested against that ledger. They have since been audited and repaired;
 their original passing tests are not conformance evidence.
@@ -42,7 +43,7 @@ correction, not a new landing rule.
 | Recording, byte calls and object lifetime | Descriptor, byte and orphan cases pass; multiple shared mappings fail visibility/publication checks |
 | Line-map storage and whole-save parent referee | Connected; mounted fixed-case comparisons pass except finding 32 |
 | Live landing/sync, P1/P2, writer locks, no alarm | Mounted finite progress scenarios pass; quantitative wait measurements are unavailable |
-| Journal kills, state exhaustion and power loss | Ten kill boundaries, orphan recovery and full-state write pass; power-loss recovery fails on ext4 and XFS; supplementary full-state rename returns EIO |
+| Journal kills, state exhaustion and power loss | The journal is the commit point for pointer steps; refs are a copy rebuilt on every open. Each row's evidence is in CI for the commit that claims it |
 | Model conformance and §18 measurements | Finding 32 blocks validation. Actual hour recorded; calls and 10,000-save jobs reached their two-hour limits without reports |
 
 Known model finding 32 reproduced on the real mount: a losing truncate to `y`,
@@ -71,17 +72,16 @@ an additional storage issue: its reftable writer flushes before appending the
 footer, and table-list publication and obsolete-table cleanup lack the required
 directory ordering. Syncing a completed command cannot by itself protect a
 previously acknowledged state from a cut during another command. The current
-Git backend has not established §18's crash guarantee; its failing replay checks
-remain enabled. The owner's current pick in `921528b` makes a synced journal
-record the commit point for each step's pointer changes and makes Git refs
-rebuildable copies. This supersedes the old §12 storage choice; implementation,
-pointer replay, compaction and new crash proof remain due.
+reftable backend did not establish §18's crash guarantee. A synced journal record
+is now the commit point for each step's pointer changes and Git's refs are
+rebuildable copies in the files format (`docs/design.md` §19.1, git-model §12).
 
 ## Run the tree views
 
-Use Linux with `/dev/fuse`, `fusermount3` and Git supporting reftable initialization,
-reference transactions and `refs migrate`. `ci/check-tree-git.sh` probes those
-operations; Git 2.52 was tested locally. Build with `cargo build --locked -p agentfs`:
+Use Linux with `/dev/fuse`, `fusermount3` and Git with `core.fsync` (2.36) and
+`rev-list --missing=print` on a blob tip. `ci/check-tree-git.sh` probes the rebuild of
+the refs and that check; Git 2.47.3 was tested locally. Build with
+`cargo build --locked -p agentfs`:
 
 ```sh
 mkdir -p /tmp/agentfs-trees/main /tmp/agentfs-trees/sandbox
@@ -124,22 +124,29 @@ files under `files/`, line maps in `metadata.json`, and name versions in
 `namespace.json`; `Agentfs-Format: envelope-1` identifies this layout. These
 private metadata names do not reserve names in the workload's root. Collision
 decisions travel in their landing commits, and collision refs retain losers.
-Queue entries, branch moves and queue ordering use atomic reftable transactions.
-The Git executable supplies that backend because the current libgit2 cannot
-open reftable. Git children retain the actor lease across process death.
+Each step's pointer changes (branch moves, queue entries numbered by their step,
+collision refs, object tables) are one record in the journal, the commit point.
+Git's refs are a copy in the files format and nothing decides from them; a `git`
+command run during a step may see one half copied. Git children retain the actor
+lease across process death.
 
 The state area contains `history.git`, `calls.wal`, `actor.lock`, `format` and
-private checkout caches. Caches expose only the workload subtree, contain no
-`.git` entry, and are rebuilt before serving. Workloads use the views, not the
-caches. Compatibility with earlier recording state has local tests; general
+private checkout caches, and `calls.wal.torn` after a torn tail. Caches expose only
+the workload subtree, contain no `.git` entry, and are rebuilt before serving.
+Workloads use the views, not the caches. Earlier state formats and `refs migrate`
+are dropped: state from earlier commits of this work does not open, and general
 upgrades remain excluded.
 
-Every WAL append is fsynced before acknowledgement. Checksummed frames detect
-corruption; only an incomplete final frame is discarded. Recording failures
-stop the actor and retain its WAL. Recovery seeds committed snapshots, rebuilds
-open objects and replays outstanding calls, then closes abandoned opens once.
-Per-branch event watermarks and `Agentfs-Open` trailers prevent duplicate saves.
-The WAL is not compacted, so startup cost and space grow with recorded calls.
+Every journal append is fsynced before acknowledgement. A step writes its objects,
+checks and appends its record, then installs and copies; git-model §12 has the order
+and what each failure does. A failed save keeps serving and saves at the next step in
+its tree. Only a failed `fsync` or rollback of the journal, or a compaction failing
+after its rename, stops the actor. Recovery reads the journal, rewrites `config` and
+`HEAD`, refuses a lost object at any pointer's tip, rebuilds the refs, builds each
+tree from its branch snapshot and object table, closes abandoned opens once through
+the ordinary step, and compacts. It takes no queue entries: the view's worker does.
+Compaction keeps restart memory at most `max(64 MiB, twice the last compacted
+length)` plus live calls.
 
 The FUSE host wakes queue progress on mutations and releases the actor between
 takes. A waiting entry holds no client lock; writer closes wake it again. P1
@@ -157,9 +164,17 @@ processes. They are not FUSE or power-loss evidence. CI scripts exercise:
   anonymous first link, immediate reopen and process restart.
 - `e2e-tree-conformance.sh`: real calls compared with fixed existing model cases,
   independent byte/line-map checks and progress scenarios.
-- `e2e-tree-recording-faults.sh` and `e2e-tree-enospc.sh`: process kills at journal
-  and durable Git boundaries, acknowledged-call replay, and actual state exhaustion.
-- `power-loss-trees.sh`: ext4/XFS dm-log-writes replay of the tree path.
+- `e2e-tree-recording-faults.sh`: process kills at every journal, object, commit-point,
+  ref-copy and checkout failpoint, and at those only an open passes (the ref rebuild,
+  both compaction points, a first init). Every returned write is in the next save, none
+  twice.
+- `e2e-tree-enospc.sh`: actual state exhaustion. A write and a rename with its objects
+  failing answer `ENOSPC` and change nothing; a rename past its commit point answers 0
+  and stands, with the copies stale; both keep serving. A failed journal `fsync` stops
+  the actor.
+- `power-loss-trees.sh`: ext4/XFS dm-log-writes replay of the tree path, on main and on
+  a fork's branch. Each checkpoint also removes `refs/` and `packed-refs` and requires
+  the same heads from the journal alone.
 - `measure-trees.sh`: plain-FUSE comparison, an actual hour of writes, 10,000
   saves, 1 MiB/100 MiB saves/takes and queue waits. Measurements are not budgets.
 
@@ -169,11 +184,12 @@ must accompany results before any exit is marked passed.
 
 Only flat regular files with git-safe UTF-8 names are currently implemented.
 Directories, symlinks, permission changes and general hard links are not implemented;
-only anonymous first link is covered. WAL frames are limited to 96 MiB. Rules,
+only anonymous first link is covered. Journal frames are limited to 96 MiB. Rules,
 profiles, transactions, nested forks, replication, CSI, several view hosts and
 upgrades remain outside phase 1. No transaction model or `Client::Outside` behavior
-is changed. Telemetry export and journal compaction remain unwired.
+is changed. Telemetry export remains unwired.
 
-On recording failure, preserve state, fix the I/O or space problem, and reopen
-for replay. On complete-frame corruption or unknown format, preserve a copy and
-investigate. Do not truncate journal records or reset history as automatic repair.
+On a stopped actor, preserve state, fix the I/O or space problem, and reopen for
+replay. On `CorruptJournal`, `MissingObject` or an unknown format, follow the
+[runbook](../runbooks/recording-failures.md#5-a-tree-state-area-that-refuses-to-open).
+Nothing truncates journal records or resets history as automatic repair.

@@ -36,11 +36,21 @@ if ! "$AGENTFS_BIN" --state "$m/state" trees init >"$m/recovery.log" 2>&1; then
 fi
 gitdir=$m/state/history.git
 git --git-dir="$gitdir" fsck --full --strict --no-progress > /dev/null 2>&1 || fail 'git fsck'
+# A returned write's bytes: f<n> on main, s<n> on the fork's branch. The sandbox
+# files ride through the fork's own pointers, in the same journal.
+check_write() {
+  local kind=$1 n=$2 want got
+  if [ "$kind" = W ]; then
+    want=$(printf 'acknowledged-%s\n' "$n" | sha256sum | cut -d' ' -f1)
+    got=$(tree_git_file "$gitdir" main "f$n" | sha256sum | cut -d' ' -f1) || fail "missing acknowledged write $n"
+  else
+    want=$(printf 'sandbox-%s\n' "$n" | sha256sum | cut -d' ' -f1)
+    got=$(tree_git_file "$gitdir" "refs/heads/$FORK" "s$n" | sha256sum | cut -d' ' -f1) || fail "missing sandbox write $n"
+  fi
+  [ "$got" = "$want" ] || fail "wrong bytes for $kind write $n"
+}
 while read -r kind n; do
-  [ "$kind" = W ] || continue
-  want=$(printf 'acknowledged-%s\n' "$n" | sha256sum | cut -d' ' -f1)
-  got=$(tree_git_file "$gitdir" main "f$n" | sha256sum | cut -d' ' -f1) || fail "missing acknowledged write $n"
-  [ "$got" = "$want" ] || fail "wrong bytes for acknowledged write $n"
+  case "$kind" in W|SW) check_write "$kind" "$n" ;; esac
 done < "$m/receipts"
 if [ -n "${CHECK_MARK:-}" ]; then
   # Validate the external sequence through this mark, then require every
@@ -49,21 +59,30 @@ if [ -n "${CHECK_MARK:-}" ]; then
 import sys
 lines = open(sys.argv[1]).read().splitlines()
 kind, n = sys.argv[2], int(sys.argv[3])
-assert kind in ('F', 'C') and n > 0
+assert kind in ('F', 'C', 'SF', 'SC') and n > 0
 prefix = ['S']
-for i in range(1, n + 1):
+for i in range(1, (n if kind in ('F', 'C') else 8) + 1):
     prefix.extend([f'W {i}', f'F {i}'])
-    if i < n or kind == 'C': prefix.append(f'C {i}')
+    if i < n or kind != 'F': prefix.append(f'C {i}')
+if kind in ('SF', 'SC'):
+    for i in range(1, n + 1):
+        prefix.extend([f'SW {i}', f'SF {i}'])
+        if i < n or kind == 'SC': prefix.append(f'SC {i}')
 assert lines[:len(prefix)] == prefix, (lines, prefix)
 PYMARK
-  for n in $(seq 1 "$CHECK_MARK_N"); do
-    want=$(printf 'acknowledged-%s\n' "$n" | sha256sum | cut -d' ' -f1)
-    got=$(tree_git_file "$gitdir" main "f$n" | sha256sum | cut -d' ' -f1) || fail "missing marked write $n"
-    [ "$got" = "$want" ] || fail "wrong bytes for marked write $n"
-  done
+  case "$CHECK_MARK_KIND" in
+    F|C) main_files=$CHECK_MARK_N; sandbox_files=0 ;;
+    *) main_files=8; sandbox_files=$CHECK_MARK_N ;;
+  esac
+  for n in $(seq 1 "$main_files"); do check_write W "$n"; done
+  for n in $(seq 1 "$sandbox_files"); do check_write SW "$n"; done
 fi
 tree_git_no_duplicate_opens "$gitdir" || fail "duplicate Agentfs-Open"
-head=$(git --git-dir="$gitdir" rev-parse main)
+heads=$(git --git-dir="$gitdir" for-each-ref --format='%(refname) %(objectname)' refs/heads)
 "$AGENTFS_BIN" --state "$m/state" trees init >/dev/null 2>&1 || fail 'second recovery'
-[ "$(git --git-dir="$gitdir" rev-parse main)" = "$head" ] || fail 'second recovery changed head'
+[ "$(git --git-dir="$gitdir" for-each-ref --format='%(refname) %(objectname)' refs/heads)" = "$heads" ] || fail 'second recovery changed heads'
+# The refs are a copy: without them, the journal alone brings back the same heads.
+rm -rf "$gitdir/refs" "$gitdir/packed-refs"
+"$AGENTFS_BIN" --state "$m/state" trees init >/dev/null 2>&1 || fail 'recovery without refs'
+[ "$(git --git-dir="$gitdir" for-each-ref --format='%(refname) %(objectname)' refs/heads)" = "$heads" ] || fail 'refs differ after removing them'
 printf 'PASS\t%s\t%s\tlast receipt %s\n' "$FS" "$point" "$(tail -n 1 "$m/receipts")" >> "$RESULTS"

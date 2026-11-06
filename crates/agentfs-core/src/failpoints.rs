@@ -37,16 +37,21 @@ pub const ENV_VAR: &str = "AGENTFS_FAILPOINTS";
 /// the source.
 pub const POINTS: &[&str] = &[
     // Tree actor recording and publication (target git-model §3, §12).
+    "tree.init_before_format",
+    "tree.after_ref_rebuild",
     "tree.wal_before_header",
     "tree.wal_after_header",
     "tree.wal_after_payload",
     "tree.wal_before_fsync",
     "tree.wal_after_fsync",
-    "tree.after_wal_before_apply",
+    "tree.before_objects",
     "tree.after_objects_durable",
-    "tree.after_refs_durable",
+    "tree.after_commit_point",
+    "tree.after_ref_copy",
     "tree.before_checkout",
     "tree.after_checkout",
+    "tree.compact_before_rename",
+    "tree.compact_after_rename",
     // The synchronous step (design §3.2).
     "pending.after_freeze",
     "journal.before_write",

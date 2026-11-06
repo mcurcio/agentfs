@@ -65,9 +65,9 @@ mountpoint -q "$work/main"; mountpoint -q "$work/sandbox"
 # A dm-log-writes mark follows each returned fsync/close before any receipt
 # is written to this device. Off-device receipts associate marks with calls.
 # Only after both marks do we fsync on-device receipts for the sweep oracle.
-python3 - "$work/main" "$work/mnt/receipts" "$work/external-receipts" "$lw" "$work/marks" <<'PYWORK'
+python3 - "$work/main" "$work/sandbox" "$work/mnt/receipts" "$work/external-receipts" "$lw" "$work/marks" <<'PYWORK'
 import os, subprocess, sys
-root, disk, external, device, marks = sys.argv[1:]
+root, sandbox, disk, external, device, marks = sys.argv[1:]
 def append(name, value):
     with open(name, 'a') as f:
         f.write(value + '\n'); f.flush(); os.fsync(f.fileno())
@@ -89,6 +89,16 @@ for n in range(1, 9):
     os.close(fd); mark('C', n)
     for kind in ('W', 'F', 'C'):
         append(disk, f'{kind} {n}')
+# Two sandbox files: a step on the fork branch moves its pointers too.
+for n in range(1, 3):
+    fd = os.open(f'{sandbox}/s{n}', os.O_CREAT | os.O_WRONLY, 0o600)
+    data = f'sandbox-{n}\n'.encode()
+    assert os.write(fd, data) == len(data)
+    append(external, f'SW {n}')
+    os.fsync(fd); mark('SF', n)
+    os.close(fd); mark('SC', n)
+    for kind in ('SW', 'SF', 'SC'):
+        append(disk, f'{kind} {n}')
 PYWORK
 fusermount3 -u "$work/main"; fusermount3 -u "$work/sandbox"
 wait "$pid"; pid=
@@ -96,6 +106,9 @@ umount "$work/mnt"
 dmsetup remove "$lw"
 export REPLAY_DEV=$replay COW_DEV=$cow CHECK_MNT=$work/check CHECK_DM=$ck CHECK_COUNT=$work/count
 export FS=$fs AGENTFS_BIN RESULTS=$results EXTERNAL_RECEIPTS=$work/external-receipts
+export FORK
+FORK=$(sed -n 's/^sandbox tree: //p' "$work/mount.log")
+[ -n "$FORK" ] || notrun 'mount log names no sandbox tree'
 : > "$CHECK_COUNT"
 # Replay each returned-call mark from an empty device. Reusing the final image
 # would leave later sectors behind and could make a broken checkpoint pass.
@@ -103,6 +116,7 @@ python3 - "$work/marks" <<'PYMARKS' || { printf 'FAIL\t%s\tmarks\tmissing or inv
 import sys
 actual = open(sys.argv[1]).read().splitlines()
 expected = [f'ack-{kind.lower()}-{n} {kind} {n}' for n in range(1, 9) for kind in ('F', 'C')]
+expected += [f'ack-{kind.lower()}-{n} {kind} {n}' for n in range(1, 3) for kind in ('SF', 'SC')]
 assert actual == expected, (actual, expected)
 PYMARKS
 # Locate each mark and scan the pinned replay tool's flagged entries once.
@@ -111,7 +125,7 @@ while read -r mark kind n; do
   [[ "$entry" =~ ^[0-9]+@[0-9]+$ ]] || { printf 'FAIL\t%s\t%s\tinvalid replay entry\n' "$fs" "$mark" >> "$results"; exit 1; }
   printf '%s\t%s\t%s\t%s\n' "$mark" "$kind" "$n" "$entry" >> "$work/mark-entries.tsv"
 done < "$work/marks"
-"$REPLAY_LOG" --log "$log" --find -vv --end-mark ack-c-8 > "$work/entry-flags.log"
+"$REPLAY_LOG" --log "$log" --find -vv --end-mark ack-sc-2 > "$work/entry-flags.log"
 python3 - "$work/mark-entries.tsv" "$work/entry-flags.log" "$work/durable-entries.tsv" <<'PYDURABLE' || { printf 'FAIL\t%s\tmarks\tdurable entry mapping failed\n' "$fs" >> "$results"; exit 1; }
 import bisect, re, sys
 marks, flags_file, result = sys.argv[1:]

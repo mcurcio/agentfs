@@ -100,67 +100,133 @@ fn objects_references_and_private_checkout() {
     );
 }
 
-#[test]
-fn migrates_existing_refs_without_losing_history() {
-    let temp = tempfile::tempdir().unwrap();
-    let path = temp.path().join("old.git");
-    assert!(
-        Command::new("git")
-            .args(["init", "--bare", "--ref-format=files"])
-            .arg(&path)
-            .status()
-            .unwrap()
-            .success()
-    );
-    let repo = git2::Repository::open_bare(&path).unwrap();
-    let tree = repo.treebuilder(None).unwrap().write().unwrap();
-    let sig = git2::Signature::now("test", "test@example.com").unwrap();
-    let commit = repo
-        .commit(
-            Some("refs/heads/existing"),
-            &sig,
-            &sig,
-            "existing",
-            &repo.find_tree(tree).unwrap(),
-            &[],
-        )
-        .unwrap();
-    drop(repo);
-    let migrated = TreeGit::open(&path).unwrap();
-    assert_eq!(migrated.head("refs/heads/existing").unwrap(), Some(commit));
-    assert_eq!(migrated.read_commit(commit).unwrap().tree, tree);
+fn commit(repo: &TreeGit) -> Oid {
+    let tree = repo.write_tree(&[]).unwrap();
+    repo.write_commit(tree, &[], "initial\n").unwrap()
+}
+
+fn git(path: &std::path::Path, args: &[&str]) -> std::process::Output {
+    Command::new("git")
+        .arg("--git-dir")
+        .arg(path)
+        .args(args)
+        .output()
+        .unwrap()
 }
 
 #[test]
-fn reopen_keeps_config_and_changed_settings_preserve_reftable_refs() {
-    use std::os::unix::fs::MetadataExt;
+fn write_config_replaces_a_damaged_config_and_head_before_any_git_command() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("repo.git");
+    drop(TreeGit::init(&path).unwrap());
+    std::fs::write(path.join("config"), b"").unwrap();
+    std::fs::write(path.join("HEAD"), b"").unwrap();
+    let repo = TreeGit::open(&path).unwrap();
+    let upstreams = [("fork/7".to_owned(), "main".to_owned())]
+        .into_iter()
+        .collect();
+    repo.write_config(&upstreams).unwrap();
+    let get = |key: &str| {
+        let out = git(&path, &["config", "--get", key]);
+        assert!(out.status.success(), "{key}");
+        String::from_utf8(out.stdout).unwrap()
+    };
+    assert_eq!(get("core.fsync"), "objects,derived-metadata\n");
+    assert_eq!(get("core.fsyncMethod"), "fsync\n");
+    assert_eq!(get("core.bare"), "true\n");
+    assert_eq!(get("branch.fork/7.remote"), ".\n");
+    assert_eq!(get("branch.fork/7.merge"), "refs/heads/main\n");
+    assert_eq!(
+        std::fs::read(path.join("HEAD")).unwrap(),
+        b"ref: refs/heads/main\n"
+    );
+    assert!(git(&path, &["rev-parse", "--git-dir"]).status.success());
+    // Files format, so libgit2 can open what the actor's copy leaves.
+    let tip = commit(&repo);
+    repo.rebuild_refs(&[update("refs/heads/main", Some(tip), None)])
+        .unwrap();
+    assert_eq!(
+        git2::Repository::open_bare(&path)
+            .unwrap()
+            .head()
+            .unwrap()
+            .target(),
+        Some(tip)
+    );
+}
 
+#[test]
+fn rebuild_refs_replaces_everything_with_what_it_is_given() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("repo.git");
     let repo = TreeGit::init(&path).unwrap();
-    let tree = repo.write_tree(&[]).unwrap();
-    let commit = repo.write_commit(tree, &[], "initial\n").unwrap();
-    repo.ref_transaction(&[update("refs/heads/main", Some(commit), None)])
+    repo.write_config(&Default::default()).unwrap();
+    let tip = commit(&repo);
+    let blob = repo.write_blob(b"table").unwrap();
+    repo.ref_transaction(&[
+        update("refs/heads/main", Some(tip), None),
+        update("refs/heads/gone", Some(tip), None),
+        update("refs/queue/main/1", Some(tip), None),
+    ])
+    .unwrap();
+    assert!(git(&path, &["pack-refs", "--all"]).status.success());
+    std::fs::write(path.join("refs/heads/garbage"), b"not a ref\n").unwrap();
+    std::fs::write(path.join("refs/heads/main.lock"), b"stale").unwrap();
+    repo.rebuild_refs(&[
+        update("refs/heads/main", Some(tip), None),
+        update("refs/agentfs/objects/main", Some(blob), None),
+    ])
+    .unwrap();
+    assert_eq!(
+        repo.list_refs("refs/").unwrap(),
+        vec![
+            ("refs/agentfs/objects/main".to_owned(), blob),
+            ("refs/heads/main".to_owned(), tip),
+        ]
+    );
+    assert!(!path.join("packed-refs").exists());
+    let fsck = git(&path, &["fsck", "--full", "--strict", "--no-progress"]);
+    assert!(fsck.status.success(), "{fsck:?}");
+}
+
+#[test]
+fn missing_objects_names_what_is_lost_of_a_tip_and_not_its_parents() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("repo.git");
+    let repo = TreeGit::init(&path).unwrap();
+    repo.write_config(&Default::default()).unwrap();
+    let old_blob = repo.write_blob(b"parent's").unwrap();
+    let old_tree = repo
+        .write_tree(&[TreeEntry {
+            name: b"a".to_vec(),
+            mode: 0o100644,
+            oid: old_blob,
+        }])
         .unwrap();
-    let config = path.join("config");
-    let inode = std::fs::metadata(&config).unwrap().ino();
-    drop(repo);
-    let repo = TreeGit::open(&path).unwrap();
-    assert_eq!(
-        std::fs::metadata(&config).unwrap().ino(),
-        inode,
-        "open should not rewrite an unchanged configuration"
-    );
-    repo.set_config("branch.topic.remote", ".").unwrap();
-    let changed = std::fs::metadata(&config).unwrap().ino();
-    repo.set_config("branch.topic.remote", ".").unwrap();
-    assert_eq!(
-        std::fs::metadata(&config).unwrap().ino(),
-        changed,
-        "setting the same value should not rewrite the config"
-    );
-    drop(repo);
-    let reopened = TreeGit::open(&path).unwrap();
-    assert_eq!(reopened.head("refs/heads/main").unwrap(), Some(commit));
-    assert_eq!(std::fs::metadata(&config).unwrap().ino(), changed);
+    let parent = repo.write_commit(old_tree, &[], "parent\n").unwrap();
+    let blob = repo.write_blob(b"tip's").unwrap();
+    let tree = repo
+        .write_tree(&[TreeEntry {
+            name: b"a".to_vec(),
+            mode: 0o100644,
+            oid: blob,
+        }])
+        .unwrap();
+    let tip = repo.write_commit(tree, &[parent], "tip\n").unwrap();
+    let table = repo.write_blob(b"table").unwrap();
+    assert_eq!(repo.missing_objects(&[tip, table]).unwrap(), vec![]);
+    let lose = |oid: Oid| {
+        let name = oid.to_string();
+        std::fs::remove_file(path.join("objects").join(&name[..2]).join(&name[2..])).unwrap();
+    };
+    lose(old_blob);
+    assert_eq!(repo.missing_objects(&[tip, table]).unwrap(), vec![]);
+    lose(blob);
+    assert_eq!(repo.missing_objects(&[tip, table]).unwrap(), vec![blob]);
+    lose(table);
+    let mut lost = repo.missing_objects(&[tip, table]).unwrap();
+    lost.sort();
+    let mut expected = vec![blob, table];
+    expected.sort();
+    assert_eq!(lost, expected);
 }

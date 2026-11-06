@@ -19,6 +19,47 @@ fn entry(repo: &TreeGit, tree: git2::Oid, name: &str) -> git2::Oid {
         .oid
 }
 
+/// Each frame of a journal: where it starts and how long it is. Frozen format.
+fn frames(journal: &[u8]) -> Vec<(usize, usize)> {
+    let mut result = Vec::new();
+    let mut at = 0;
+    while at < journal.len() {
+        let field = |offset: usize| {
+            u32::from_le_bytes(journal[at + offset..at + offset + 4].try_into().unwrap()) as usize
+        };
+        let length = 24 + field(8) + field(12);
+        result.push((at, length));
+        at += length;
+    }
+    result
+}
+
+fn git(root: &std::path::Path, args: &[&str]) -> std::process::Output {
+    std::process::Command::new("git")
+        .arg("--git-dir")
+        .arg(root.join("history.git"))
+        .args(args)
+        .output()
+        .unwrap()
+}
+
+/// How many commits on main name this open.
+fn opens_saved(root: &std::path::Path, open: u64) -> usize {
+    let out = git(
+        root,
+        &[
+            "log",
+            "main",
+            "--format=%(trailers:key=Agentfs-Open,valueonly)",
+        ],
+    );
+    String::from_utf8(out.stdout)
+        .unwrap()
+        .lines()
+        .filter(|line| *line == open.to_string())
+        .count()
+}
+
 fn put(v: &mut Volume, tree: &str, path: &str, bytes: &[u8]) -> u64 {
     let h = v.write_open(tree, path, "test-writer", true).unwrap();
     v.truncate(h, 0).unwrap();
@@ -290,34 +331,10 @@ fn rename_after_rejected_create_keeps_rejected_content_out_of_parent() {
 }
 
 #[test]
-fn state_from_the_first_recording_increment_keeps_its_history_and_pending_calls() {
-    let tmp = tempfile::tempdir().unwrap();
-    let mut v = Volume::open(tmp.path()).unwrap();
-    put(&mut v, "main", "a", b"saved");
-    let saved_head = v.head("main").unwrap();
-    let h = v.write_open("main", "a", "writer", false).unwrap();
-    v.write(h, 0, b"-pending", true).unwrap();
-    drop(v);
-    fs::write(tmp.path().join("format"), b"agentfs-prototype-1\n").unwrap();
-    let v = Volume::open(tmp.path()).unwrap();
-    assert_eq!(v.read("main", "a").unwrap(), b"saved-pending");
-    let recovered_head = v.head("main").unwrap();
-    let repo = repo(tmp.path());
-    assert_eq!(
-        repo.read_commit(recovered_head).unwrap().parents[0],
-        saved_head
-    );
-    drop(v);
-    assert_eq!(
-        Volume::open(tmp.path()).unwrap().head("main").unwrap(),
-        recovered_head
-    );
-}
-
-#[test]
 fn single_actor_and_invalid_names_fail_before_recording() {
     let tmp = tempfile::tempdir().unwrap();
     let mut v = Volume::open(tmp.path()).unwrap();
+    let journal = fs::metadata(tmp.path().join("calls.wal")).unwrap().len();
     assert!(matches!(Volume::open(tmp.path()), Err(Error::Busy)));
     for path in ["../a", "a/b", ".git", ".GiT", "git~1", "", "/tmp"] {
         assert!(matches!(
@@ -329,40 +346,38 @@ fn single_actor_and_invalid_names_fail_before_recording() {
         v.write_open("main", "a", "w\nAgentfs-Writer: fake", true),
         Err(Error::Writer)
     ));
-    assert_eq!(fs::metadata(tmp.path().join("calls.wal")).unwrap().len(), 0);
+    assert_eq!(
+        fs::metadata(tmp.path().join("calls.wal")).unwrap().len(),
+        journal
+    );
 }
 
 #[test]
-fn incomplete_tail_is_discarded_but_a_complete_corrupt_record_is_not() {
+fn incomplete_tail_is_discarded_but_a_bad_frame_with_a_later_one_is_not() {
     let tmp = tempfile::tempdir().unwrap();
     let mut v = Volume::open(tmp.path()).unwrap();
     put(&mut v, "main", "a", b"saved");
     drop(v);
     let path = tmp.path().join("calls.wal");
     let valid = fs::read(&path).unwrap();
-    OpenOptions::new()
-        .append(true)
-        .open(&path)
-        .unwrap()
-        .write_all(b"AFP")
-        .unwrap();
-    drop(Volume::open(tmp.path()).unwrap());
-    assert_eq!(fs::read(&path).unwrap(), valid);
     let mut corrupt_header = valid.clone();
-    corrupt_header[4] ^= 0x80;
+    corrupt_header[frames(&valid)[1].0 + 8] ^= 0x80;
     fs::write(&path, corrupt_header).unwrap();
     assert!(matches!(
         Volume::open(tmp.path()),
         Err(Error::CorruptJournal(_))
     ));
-    let mut corrupt = valid;
-    let last = corrupt.len() - 1;
-    corrupt[last] ^= 1;
-    fs::write(&path, corrupt).unwrap();
-    assert!(matches!(
-        Volume::open(tmp.path()),
-        Err(Error::CorruptJournal(_))
-    ));
+    fs::write(&path, &valid).unwrap();
+    OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap()
+        .write_all(b"AFJ")
+        .unwrap();
+    let v = Volume::open(tmp.path()).unwrap();
+    assert_eq!(v.read("main", "a").unwrap(), b"saved");
+    drop(v);
+    assert_eq!(fs::read(tmp.path().join("calls.wal.torn")).unwrap(), b"AFJ");
 }
 
 #[test]
@@ -502,28 +517,40 @@ fn save_and_checkout_failures_keep_calls_and_recover_without_duplicate_commits()
     v.write(h, 0, b"journaled", true).unwrap();
     // A stale ref lock stands in for an interrupted Git ref update.
     fs::write(
-        tmp.path().join("history.git/reftable/tables.list.lock"),
+        tmp.path().join("history.git/refs/heads/main.lock"),
         b"stale",
     )
     .unwrap();
-    assert!(v.close(h).is_err());
-    assert!(v.is_stopped());
-    assert!(matches!(v.read("main", "a"), Err(Error::Stopped)));
+    assert!(matches!(v.close(h).unwrap(), Saved::Commit(_)));
+    assert!(!v.is_stopped());
+    assert_eq!(v.read("main", "a").unwrap(), b"basejournaled");
+    let recorded = v.head("main").unwrap();
+    assert_ne!(
+        repo(tmp.path()).head("refs/heads/main").unwrap(),
+        Some(recorded)
+    );
     drop(v);
     let mut v = Volume::open(tmp.path()).unwrap();
+    assert_eq!(v.head("main").unwrap(), recorded);
     assert_eq!(v.read("main", "a").unwrap(), b"basejournaled");
     let h = v.write_open("main", "a", "writer", false).unwrap();
     v.write(h, 0, b"once", true).unwrap();
     fs::remove_dir_all(tmp.path().join("trees/main")).unwrap();
     fs::write(tmp.path().join("trees/main"), b"checkout-blocked").unwrap();
-    assert!(v.close(h).is_err()); // Ref moved, checkout failed.
+    assert!(matches!(v.close(h).unwrap(), Saved::Commit(_))); // Checkout failed.
     let repo = repo(tmp.path());
     let committed = repo.head("refs/heads/main").unwrap().unwrap();
+    assert_eq!(committed, v.head("main").unwrap());
     drop(v);
     fs::remove_file(tmp.path().join("trees/main")).unwrap();
     let v = Volume::open(tmp.path()).unwrap();
     assert_eq!(v.head("main").unwrap(), committed);
     assert_eq!(v.read("main", "a").unwrap(), b"basejournaledonce");
+    assert_eq!(
+        fs::read(tmp.path().join("trees/main/a")).unwrap(),
+        b"basejournaledonce"
+    );
+    assert_eq!(opens_saved(tmp.path(), h), 1);
 }
 
 #[test]
@@ -725,9 +752,628 @@ fn name_history_keeps_rename_and_unlink_versions_in_the_commit() {
     );
 }
 
+// The journal is the commit point; Git's refs are a copy (git-model §12).
+
+fn all_refs(root: &std::path::Path) -> Vec<(String, git2::Oid)> {
+    repo(root).list_refs("refs/").unwrap()
+}
+
+#[test]
+fn a_corrupt_copy_is_rebuilt_from_the_journal() {
+    fn scribble(dir: &std::path::Path) {
+        for entry in fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                scribble(&path);
+            } else {
+                fs::write(path, b"garbage\n").unwrap();
+            }
+        }
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let mut v = Volume::open(tmp.path()).unwrap();
+    let fork = v.fork().unwrap();
+    put(&mut v, "main", "a", b"main\n");
+    put(&mut v, &fork, "b", b"fork\n");
+    let refs = all_refs(tmp.path());
+    assert!(refs.iter().any(|(name, _)| name.starts_with("refs/queue/")));
+    drop(v);
+    let gitdir = tmp.path().join("history.git");
+    scribble(&gitdir.join("refs"));
+    fs::write(gitdir.join("HEAD"), b"garbage\n").unwrap();
+    let v = Volume::open(tmp.path()).unwrap();
+    assert_eq!(all_refs(tmp.path()), refs);
+    assert_eq!(v.read("main", "a").unwrap(), b"main\n");
+    assert_eq!(v.read(&fork, "b").unwrap(), b"fork\n");
+    let fsck = git(tmp.path(), &["fsck", "--full", "--strict", "--no-progress"]);
+    assert!(fsck.status.success(), "{fsck:?}");
+}
+
+#[test]
+fn removed_refs_are_rebuilt_from_the_journal() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut v = Volume::open(tmp.path()).unwrap();
+    put(&mut v, "main", "a", b"main\n");
+    let refs = all_refs(tmp.path());
+    drop(v);
+    fs::remove_dir_all(tmp.path().join("history.git/refs")).unwrap();
+    let v = Volume::open(tmp.path()).unwrap();
+    assert_eq!(all_refs(tmp.path()), refs);
+    assert_eq!(v.read("main", "a").unwrap(), b"main\n");
+}
+
+#[test]
+fn an_emptied_config_is_rewritten() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut v = Volume::open(tmp.path()).unwrap();
+    let fork = v.fork().unwrap();
+    drop(v);
+    fs::write(tmp.path().join("history.git/config"), b"").unwrap();
+    fs::write(tmp.path().join("history.git/HEAD"), b"").unwrap();
+    let v = Volume::open(tmp.path()).unwrap();
+    assert_eq!(v.tree_names(), vec!["fork/1".to_owned(), "main".to_owned()]);
+    let get =
+        |key: &str| String::from_utf8(git(tmp.path(), &["config", "--get", key]).stdout).unwrap();
+    assert_eq!(get("core.fsync"), "objects,derived-metadata\n");
+    assert_eq!(get("core.fsyncMethod"), "fsync\n");
+    assert_eq!(get(&format!("branch.{fork}.merge")), "refs/heads/main\n");
+}
+
+#[test]
+fn recovery_reads_pointers_from_the_journal() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut v = Volume::open(tmp.path()).unwrap();
+    put(&mut v, "main", "a", b"first");
+    let first = v.head("main").unwrap();
+    put(&mut v, "main", "a", b"second");
+    let second = v.head("main").unwrap();
+    drop(v);
+    assert!(
+        git(
+            tmp.path(),
+            &["update-ref", "refs/heads/main", &first.to_string()]
+        )
+        .status
+        .success()
+    );
+    let v = Volume::open(tmp.path()).unwrap();
+    assert_eq!(v.head("main").unwrap(), second);
+    assert_eq!(v.read("main", "a").unwrap(), b"second");
+    assert_eq!(
+        repo(tmp.path()).head("refs/heads/main").unwrap(),
+        Some(second)
+    );
+}
+
+#[test]
+fn a_ref_copy_failure_is_not_a_call_failure() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut v = Volume::open(tmp.path()).unwrap();
+    put(&mut v, "main", "a", b"base");
+    let before = v.head("main").unwrap();
+    let h = v.write_open("main", "a", "writer", false).unwrap();
+    v.write(h, 0, b"!", true).unwrap();
+    let lock = tmp.path().join("history.git/refs/heads/main.lock");
+    fs::write(&lock, b"stale").unwrap();
+    assert!(matches!(v.close(h).unwrap(), Saved::Commit(_)));
+    assert!(!v.is_stopped());
+    let recorded = v.head("main").unwrap();
+    assert_ne!(recorded, before);
+    assert_eq!(v.read("main", "a").unwrap(), b"base!");
+    let copy = repo(tmp.path());
+    assert_eq!(copy.head("refs/heads/main").unwrap(), Some(before));
+    // The next step rebuilds the copy whole and redoes the checkout.
+    put(&mut v, "main", "b", b"next");
+    assert_eq!(
+        copy.head("refs/heads/main").unwrap(),
+        Some(v.head("main").unwrap())
+    );
+    assert!(copy.is_ancestor(recorded, v.head("main").unwrap()).unwrap());
+    assert!(!lock.exists());
+    assert_eq!(fs::read(tmp.path().join("trees/main/a")).unwrap(), b"base!");
+    assert_eq!(fs::read(tmp.path().join("trees/main/b")).unwrap(), b"next");
+}
+
+#[test]
+fn a_bad_final_frame_is_a_torn_tail() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut v = Volume::open(tmp.path()).unwrap();
+    let h = v.write_open("main", "a", "writer", true).unwrap();
+    v.write(h, 0, b"returned", false).unwrap();
+    v.write(h, 8, b"-torn", false).unwrap();
+    drop(v);
+    let path = tmp.path().join("calls.wal");
+    let mut journal = fs::read(&path).unwrap();
+    let last = journal.len() - 1;
+    journal[last] ^= 1;
+    let (offset, length) = *frames(&journal).last().unwrap();
+    fs::write(&path, &journal).unwrap();
+    let v = Volume::open(tmp.path()).unwrap();
+    // The last record is dropped; every one before it stands, closed once.
+    assert_eq!(v.read("main", "a").unwrap(), b"returned");
+    assert_eq!(opens_saved(tmp.path(), h), 1);
+    assert_eq!(
+        fs::read(tmp.path().join("calls.wal.torn")).unwrap(),
+        journal[offset..offset + length]
+    );
+}
+
+#[test]
+fn a_bad_frame_before_a_good_one_is_corruption() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut v = Volume::open(tmp.path()).unwrap();
+    let h = v.write_open("main", "a", "writer", true).unwrap();
+    v.write(h, 0, b"one", false).unwrap();
+    v.write(h, 3, b"two", false).unwrap();
+    drop(v);
+    let path = tmp.path().join("calls.wal");
+    let journal = fs::read(&path).unwrap();
+    let all = frames(&journal);
+    let (offset, length) = all[all.len() - 2];
+    // A flip in the body, then one in the header: both before a good frame.
+    for at in [offset + length - 1, offset + 9] {
+        let mut bad = journal.clone();
+        bad[at] ^= 1;
+        fs::write(&path, &bad).unwrap();
+        assert!(matches!(
+            Volume::open(tmp.path()),
+            Err(Error::CorruptJournal(found)) if found == offset
+        ));
+        assert_eq!(fs::read(&path).unwrap(), bad);
+    }
+    fs::write(&path, &journal).unwrap();
+    assert_eq!(
+        Volume::open(tmp.path()).unwrap().read("main", "a").unwrap(),
+        b"onetwo"
+    );
+}
+
+#[test]
+fn a_frame_in_a_workloads_bytes_is_not_a_frame() {
+    // A whole valid frame of some other journal, with a high number.
+    fn forged(salt: u32) -> Vec<u8> {
+        let head =
+            br#"{"seq":999999,"at_ns":0,"entry":{"AnonymousOpen":{"tree":"main","writer":"w"}}}"#;
+        let mut frame = b"AFJ2".to_vec();
+        frame.extend_from_slice(&salt.to_le_bytes());
+        frame.extend_from_slice(&(head.len() as u32).to_le_bytes());
+        frame.extend_from_slice(&0_u32.to_le_bytes());
+        frame.extend_from_slice(&crc32fast::hash(head).to_le_bytes());
+        let header_crc = crc32fast::hash(&frame);
+        frame.extend_from_slice(&header_crc.to_le_bytes());
+        frame.extend_from_slice(head);
+        frame
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let mut v = Volume::open(tmp.path()).unwrap();
+    let path = tmp.path().join("calls.wal");
+    let salt = u32::from_le_bytes(fs::read(&path).unwrap()[4..8].try_into().unwrap());
+    let h = v.write_open("main", "a", "writer", true).unwrap();
+    v.write(h, 0, b"returned", false).unwrap();
+    let mut bytes = b"workload ".to_vec();
+    bytes.extend_from_slice(&forged(salt ^ 1));
+    bytes.extend_from_slice(b" bytes");
+    v.write(h, 8, &bytes, false).unwrap();
+    drop(v);
+    // Whole, the frame reads as what it is: the workload's bytes.
+    let saved = {
+        let copy = tempfile::tempdir().unwrap();
+        copy_dir(tmp.path(), copy.path());
+        let v = Volume::open(copy.path()).unwrap();
+        v.read("main", "a").unwrap().to_vec()
+    };
+    assert_eq!(saved, [b"returned".as_slice(), &bytes].concat());
+    // Torn, the forged frame cannot make its tail look like corruption.
+    let journal = fs::read(&path).unwrap();
+    fs::write(&path, &journal[..journal.len() - 1]).unwrap();
+    let v = Volume::open(tmp.path()).unwrap();
+    assert_eq!(v.read("main", "a").unwrap(), b"returned");
+}
+
+fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
+    fs::create_dir_all(to).unwrap();
+    for entry in fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_type().unwrap().is_dir() {
+            copy_dir(&entry.path(), &to.join(entry.file_name()));
+        } else {
+            fs::copy(entry.path(), to.join(entry.file_name())).unwrap();
+        }
+    }
+}
+
+#[test]
+fn a_lost_blob_at_a_tip_refuses_to_serve() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut v = Volume::open(tmp.path()).unwrap();
+    put(&mut v, "main", "a", b"will be lost");
+    let copy = repo(tmp.path());
+    let root = copy.read_commit(v.head("main").unwrap()).unwrap().tree;
+    let blob = entry(&copy, entry(&copy, root, "files"), "a");
+    drop(v);
+    let name = blob.to_string();
+    fs::remove_file(
+        tmp.path()
+            .join("history.git/objects")
+            .join(&name[..2])
+            .join(&name[2..]),
+    )
+    .unwrap();
+    assert!(matches!(
+        Volume::open(tmp.path()),
+        Err(Error::MissingObject { name, oid })
+            if oid == blob && name.starts_with("refs/")
+    ));
+}
+
+#[test]
+fn a_missing_journal_refuses_and_keeps_history() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut v = Volume::open(tmp.path()).unwrap();
+    put(&mut v, "main", "a", b"history");
+    let head = v.head("main").unwrap();
+    drop(v);
+    fs::remove_file(tmp.path().join("calls.wal")).unwrap();
+    assert!(matches!(
+        Volume::open(tmp.path()),
+        Err(Error::CorruptJournal(0))
+    ));
+    fs::write(tmp.path().join("calls.wal"), b"").unwrap();
+    assert!(matches!(
+        Volume::open(tmp.path()),
+        Err(Error::CorruptJournal(0))
+    ));
+    assert_eq!(
+        repo(tmp.path()).head("refs/heads/main").unwrap(),
+        Some(head)
+    );
+    assert!(tmp.path().join("format").exists());
+    fs::remove_file(tmp.path().join("format")).unwrap();
+    assert!(matches!(Volume::open(tmp.path()), Err(Error::Format)));
+    assert_eq!(
+        repo(tmp.path()).head("refs/heads/main").unwrap(),
+        Some(head)
+    );
+}
+
+#[test]
+fn an_earlier_format_does_not_open() {
+    let tmp = tempfile::tempdir().unwrap();
+    drop(Volume::open(tmp.path()).unwrap());
+    fs::write(tmp.path().join("format"), b"agentfs-trees-1\n").unwrap();
+    assert!(matches!(Volume::open(tmp.path()), Err(Error::Format)));
+}
+
+#[test]
+fn open_numbers_never_repeat_across_compaction() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut v = Volume::open(tmp.path()).unwrap();
+    let first = put(&mut v, "main", "a", b"one");
+    drop(v);
+    // Every open compacts; the journal then holds only a checkpoint.
+    let mut v = Volume::open(tmp.path()).unwrap();
+    assert_eq!(
+        frames(&fs::read(tmp.path().join("calls.wal")).unwrap()).len(),
+        1
+    );
+    let second = v.write_open("main", "a", "writer", false).unwrap();
+    assert!(second > first);
+    v.write(second, 0, b"two", true).unwrap();
+    v.close(second).unwrap();
+    drop(v);
+    let mut v = Volume::open(tmp.path()).unwrap();
+    let third = v.write_open("main", "a", "writer", false).unwrap();
+    assert!(third > second);
+    assert_eq!(opens_saved(tmp.path(), second), 1);
+}
+
+/// Takes the journal past the compaction threshold through real calls, leaving
+/// `FILLED` in the file so its save stays cheap.
+const FILLED: &[u8] = b"xxxxxx";
+fn fill_journal(v: &mut Volume, path: &str) {
+    let h = v.write_open("main", path, "filler", true).unwrap();
+    let chunk = vec![b'x'; 33 << 20];
+    for _ in 0..2 {
+        v.write(h, 0, &chunk, true).unwrap();
+    }
+    v.truncate(h, FILLED.len() as u64).unwrap();
+    v.close(h).unwrap();
+}
+
+#[test]
+fn a_log_held_open_does_not_pin_other_saves() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut v = Volume::open(tmp.path()).unwrap();
+    let log = v.write_open("main", "log", "logger", true).unwrap();
+    v.write(log, 0, b"before\n", true).unwrap();
+    fill_journal(&mut v, "big");
+    // The step compacted: the other file's calls are gone, the log's stayed.
+    let length = fs::metadata(tmp.path().join("calls.wal")).unwrap().len();
+    assert!(length < 1 << 20, "journal holds {length} bytes");
+    v.write(log, 0, b"after\n", true).unwrap();
+    drop(v);
+    let v = Volume::open(tmp.path()).unwrap();
+    assert_eq!(v.read("main", "log").unwrap(), b"before\nafter\n");
+    assert_eq!(v.read("main", "big").unwrap(), FILLED);
+    assert_eq!(opens_saved(tmp.path(), log), 1);
+}
+
+// Run a worker test in a child process with this failpoint spec, and wait for
+// the failpoint to kill it. The child prints the open it was closing.
+#[cfg(feature = "failpoints")]
+fn run_killed_worker(worker: &str, root: &std::path::Path, spec: &str) -> u64 {
+    use std::process::{Command, Stdio};
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", worker, "--nocapture"])
+        .env("AGENTFS_TREE_STEP_WORKER", root)
+        .env(agentfs_core::failpoints::ENV_VAR, spec)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+    use std::os::unix::process::ExitStatusExt;
+    assert_eq!(
+        output.status.signal(),
+        Some(libc::SIGKILL),
+        "{spec} did not kill the worker: {output:?}"
+    );
+    String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .find_map(|line| line.strip_prefix("OPEN "))
+        .unwrap()
+        .parse()
+        .unwrap()
+}
+
 #[cfg(feature = "failpoints")]
 #[test]
-fn branch_and_queue_recover_together_after_ref_transaction() {
+fn step_worker() {
+    let Some(root) = std::env::var_os("AGENTFS_TREE_STEP_WORKER") else {
+        return;
+    };
+    let mut v = Volume::open(std::path::Path::new(&root)).unwrap();
+    let h = v.write_open("main", "a", "writer", true).unwrap();
+    v.write(h, 0, b"returned", false).unwrap();
+    println!("OPEN {h}");
+    std::io::stdout().flush().unwrap();
+    v.close(h).unwrap();
+    unreachable!("the failpoint kills this process");
+}
+
+#[cfg(feature = "failpoints")]
+#[test]
+fn compact_worker() {
+    let Some(root) = std::env::var_os("AGENTFS_TREE_STEP_WORKER") else {
+        return;
+    };
+    let mut v = Volume::open(std::path::Path::new(&root)).unwrap();
+    let log = v.write_open("main", "log", "logger", true).unwrap();
+    v.write(log, 0, b"returned\n", true).unwrap();
+    println!("OPEN {log}");
+    std::io::stdout().flush().unwrap();
+    fill_journal(&mut v, "big");
+    unreachable!("the failpoint kills this process");
+}
+
+#[cfg(feature = "failpoints")]
+#[test]
+fn a_step_killed_before_its_record_saves_at_restart() {
+    let tmp = tempfile::tempdir().unwrap();
+    // The create is the first hit; the close is the second.
+    for spec in [
+        "tree.before_objects=kill@2",
+        "tree.after_objects_durable=kill@2",
+    ] {
+        let state = tmp.path().join(spec);
+        let open = run_killed_worker("step_worker", &state, spec);
+        let v = Volume::open(&state).unwrap();
+        assert_eq!(v.read("main", "a").unwrap(), b"returned", "{spec}");
+        let head = v.head("main").unwrap();
+        assert_eq!(opens_saved(&state, open), 1, "{spec}");
+        drop(v);
+        let v = Volume::open(&state).unwrap();
+        assert_eq!(v.head("main").unwrap(), head, "{spec}");
+        assert_eq!(opens_saved(&state, open), 1, "{spec}");
+    }
+}
+
+#[cfg(feature = "failpoints")]
+#[test]
+fn a_step_killed_after_its_record_is_not_saved_again() {
+    let tmp = tempfile::tempdir().unwrap();
+    for spec in [
+        "tree.after_commit_point=kill@2",
+        "tree.after_ref_copy=kill@2",
+        "tree.before_checkout=kill@2",
+        "tree.after_checkout=kill@2",
+    ] {
+        let state = tmp.path().join(spec);
+        let open = run_killed_worker("step_worker", &state, spec);
+        let v = Volume::open(&state).unwrap();
+        assert_eq!(v.read("main", "a").unwrap(), b"returned", "{spec}");
+        assert_eq!(opens_saved(&state, open), 1, "{spec}");
+        assert_eq!(
+            repo(&state).head("refs/heads/main").unwrap(),
+            Some(v.head("main").unwrap()),
+            "{spec}"
+        );
+        assert_eq!(
+            fs::read(state.join("trees/main/a")).unwrap(),
+            b"returned",
+            "{spec}"
+        );
+    }
+}
+
+#[cfg(feature = "failpoints")]
+#[test]
+fn a_kill_at_either_compact_failpoint_loses_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    // The compaction at open is the first hit; the one at the step, the second.
+    for spec in [
+        "tree.compact_before_rename=kill@2",
+        "tree.compact_after_rename=kill@2",
+    ] {
+        let state = tmp.path().join(spec);
+        let log = run_killed_worker("compact_worker", &state, spec);
+        let v = Volume::open(&state).unwrap();
+        assert_eq!(v.read("main", "log").unwrap(), b"returned\n", "{spec}");
+        assert_eq!(v.read("main", "big").unwrap(), FILLED, "{spec}");
+        assert_eq!(opens_saved(&state, log), 1, "{spec}");
+    }
+}
+
+#[cfg(feature = "failpoints")]
+#[test]
+fn a_failure_after_the_rename_stops_the_actor() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut v = Volume::open(tmp.path()).unwrap();
+    put(&mut v, "main", "a", b"before");
+    let guard = agentfs_core::failpoints::configure("tree.compact_after_rename=error").unwrap();
+    fill_journal(&mut v, "big");
+    drop(guard);
+    // The step itself stands: its record is in the old file and the new one.
+    assert!(v.is_stopped());
+    assert!(matches!(v.read("main", "a"), Err(Error::Stopped)));
+    assert!(matches!(
+        v.write_open("main", "a", "writer", false),
+        Err(Error::Stopped)
+    ));
+    assert!(matches!(v.progress(), Err(Error::Stopped)));
+    drop(v);
+    let v = Volume::open(tmp.path()).unwrap();
+    assert_eq!(v.read("main", "a").unwrap(), b"before");
+    assert_eq!(v.read("main", "big").unwrap(), FILLED);
+}
+
+#[cfg(feature = "failpoints")]
+#[test]
+fn a_failure_before_the_rename_is_retried_at_the_next_step() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut v = Volume::open(tmp.path()).unwrap();
+    let guard = agentfs_core::failpoints::configure("tree.compact_before_rename=error").unwrap();
+    fill_journal(&mut v, "big");
+    drop(guard);
+    assert!(!v.is_stopped());
+    let path = tmp.path().join("calls.wal");
+    assert!(fs::metadata(&path).unwrap().len() > 64 << 20);
+    put(&mut v, "main", "a", b"next");
+    assert!(fs::metadata(&path).unwrap().len() < 1 << 20);
+    assert_eq!(v.read("main", "a").unwrap(), b"next");
+}
+
+#[cfg(feature = "failpoints")]
+#[test]
+fn a_cut_first_init_starts_over() {
+    let tmp = tempfile::tempdir().unwrap();
+    let guard = agentfs_core::failpoints::configure("tree.init_before_format=error").unwrap();
+    assert!(Volume::open(tmp.path()).is_err());
+    drop(guard);
+    assert!(tmp.path().join("initializing").exists());
+    assert!(tmp.path().join("history.git").exists());
+    assert!(!tmp.path().join("format").exists());
+    let mut v = Volume::open(tmp.path()).unwrap();
+    assert!(!tmp.path().join("initializing").exists());
+    put(&mut v, "main", "a", b"fresh");
+    assert_eq!(v.read("main", "a").unwrap(), b"fresh");
+}
+
+#[cfg(feature = "failpoints")]
+#[test]
+fn a_failed_save_keeps_serving_and_saves_at_the_next_step() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut v = Volume::open(tmp.path()).unwrap();
+    put(&mut v, "main", "a", b"base");
+    let h = v.write_open("main", "a", "writer", false).unwrap();
+    v.write(h, 0, b"+returned", true).unwrap();
+    let head = v.head("main").unwrap();
+    for point in ["tree.before_objects", "tree.after_objects_durable"] {
+        let guard = agentfs_core::failpoints::configure(&format!("{point}=error")).unwrap();
+        assert!(v.close(h).is_err(), "{point}");
+        drop(guard);
+        assert!(!v.is_stopped(), "{point}");
+        assert_eq!(v.read("main", "a").unwrap(), b"base", "{point}");
+        assert_eq!(v.head("main").unwrap(), head, "{point}");
+    }
+    // Other work goes on, the failed close's handle still counting as open.
+    let other = v.write_open("main", "other", "writer", true);
+    assert!(other.is_ok());
+    assert_eq!(v.read("main", "a").unwrap(), b"base+returned");
+    assert_eq!(opens_saved(tmp.path(), h), 1);
+    assert!(matches!(v.close(h), Err(Error::NotFound)));
+
+    // A failed save a restart finds saves there, once.
+    let h = v.write_open("main", "a", "writer", false).unwrap();
+    v.write(h, 0, b"+again", true).unwrap();
+    let guard = agentfs_core::failpoints::configure("tree.before_objects=error").unwrap();
+    assert!(v.close(h).is_err());
+    drop(guard);
+    drop(v);
+    let v = Volume::open(tmp.path()).unwrap();
+    assert_eq!(v.read("main", "a").unwrap(), b"base+returned+again");
+    assert_eq!(opens_saved(tmp.path(), h), 1);
+}
+
+#[cfg(feature = "failpoints")]
+#[test]
+fn a_failed_take_stays_queued_for_the_next_event() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut v = Volume::open(tmp.path()).unwrap();
+    let fork = v.fork().unwrap();
+    put(&mut v, &fork, "a", b"sandbox");
+    let guard = agentfs_core::failpoints::configure("tree.before_objects=error").unwrap();
+    assert!(!v.progress().unwrap());
+    drop(guard);
+    assert!(!v.is_stopped());
+    assert!(matches!(v.read("main", "a"), Err(Error::NotFound)));
+    assert!(v.progress().unwrap());
+    while v.progress().unwrap() {}
+    assert_eq!(v.read("main", "a").unwrap(), b"sandbox");
+}
+
+#[cfg(feature = "failpoints")]
+#[test]
+fn a_failed_write_changes_nothing_and_keeps_serving() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut v = Volume::open(tmp.path()).unwrap();
+    let h = v.write_open("main", "a", "writer", true).unwrap();
+    v.write(h, 0, b"one", false).unwrap();
+    let path = tmp.path().join("calls.wal");
+    let journal = fs::read(&path).unwrap();
+    for point in ["tree.wal_after_header", "tree.wal_after_payload"] {
+        let guard = agentfs_core::failpoints::configure(&format!("{point}=error")).unwrap();
+        assert!(v.write(h, 3, b"lost", false).is_err(), "{point}");
+        drop(guard);
+        assert!(!v.is_stopped(), "{point}");
+        assert_eq!(v.read_open(h).unwrap(), b"one", "{point}");
+        assert_eq!(fs::read(&path).unwrap(), journal, "{point}");
+    }
+    v.write(h, 3, b"two", false).unwrap();
+    v.close(h).unwrap();
+    assert_eq!(v.read("main", "a").unwrap(), b"onetwo");
+}
+
+#[cfg(feature = "failpoints")]
+#[test]
+fn a_failed_fsync_stops_the_actor() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut v = Volume::open(tmp.path()).unwrap();
+    let h = v.write_open("main", "a", "writer", true).unwrap();
+    v.write(h, 0, b"one", false).unwrap();
+    let guard = agentfs_core::failpoints::configure("tree.wal_before_fsync=error").unwrap();
+    assert!(v.write(h, 3, b"unknown", false).is_err());
+    drop(guard);
+    assert!(v.is_stopped());
+    assert!(matches!(v.read("main", "a"), Err(Error::Stopped)));
+    drop(v);
+    let v = Volume::open(tmp.path()).unwrap();
+    assert!(v.read("main", "a").unwrap().starts_with(b"one"));
+}
+
+#[cfg(feature = "failpoints")]
+#[test]
+fn branch_and_queue_recover_together_after_the_commit_point() {
     let tmp = tempfile::tempdir().unwrap();
     let mut volume = Volume::open(tmp.path()).unwrap();
     let fork = volume.fork().unwrap();
@@ -735,15 +1381,19 @@ fn branch_and_queue_recover_together_after_ref_transaction() {
     volume.write(h, 0, b"saved", false).unwrap();
     let repo = repo(tmp.path());
     let before = repo.list_refs("refs/queue/main/").unwrap().len();
-    let guard = agentfs_core::failpoints::configure("tree.after_refs_durable=error").unwrap();
-    assert!(volume.close(h).is_err());
+    let guard = agentfs_core::failpoints::configure("tree.after_commit_point=error").unwrap();
+    assert!(matches!(volume.close(h).unwrap(), Saved::Commit(_)));
     drop(guard);
-    let committed = repo.head(&format!("refs/heads/{fork}")).unwrap().unwrap();
+    let committed = volume.head(&fork).unwrap();
+    drop(volume);
+    let mut volume = Volume::open(tmp.path()).unwrap();
+    assert_eq!(
+        repo.head(&format!("refs/heads/{fork}")).unwrap(),
+        Some(committed)
+    );
     let queued = repo.list_refs("refs/queue/main/").unwrap();
     assert_eq!(queued.len(), before + 1);
     assert_eq!(queued.last().unwrap().1, committed);
-    drop(volume);
-    let mut volume = Volume::open(tmp.path()).unwrap();
     while volume.progress().unwrap() {}
     assert_eq!(volume.read(&fork, "a").unwrap(), b"saved");
     assert!(repo.list_refs("refs/queue/main/").unwrap().is_empty());
@@ -755,7 +1405,7 @@ fn branch_and_queue_recover_together_after_ref_transaction() {
 
 #[cfg(feature = "failpoints")]
 #[test]
-fn recovery_enqueues_once_after_failure_before_ref_transaction() {
+fn recovery_enqueues_once_after_failure_before_the_commit_point() {
     let tmp = tempfile::tempdir().unwrap();
     let mut volume = Volume::open(tmp.path()).unwrap();
     let fork = volume.fork().unwrap();

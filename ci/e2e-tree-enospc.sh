@@ -26,14 +26,20 @@ expect_stopped() {
     return 1
   fi
 }
+wait_mounted() {
+  local m
+  for m in "$@"; do
+    for _ in $(seq 1 200); do
+      if mountpoint -q "$m"; then break; fi
+      kill -0 "$pid"; sleep .1
+    done
+    mountpoint -q "$m"
+  done
+}
 sudo mount -t tmpfs -o size=32m,mode=0777 tmpfs "$work/volume"
 "$bin" --state "$work/volume/state" trees init
 "$bin" --state "$work/volume/state" trees mount "$work/main" --sandbox "$work/sandbox" >"$work/mount.log" 2>&1 & pid=$!
-for _ in $(seq 1 200); do
-  if mountpoint -q "$work/main" && mountpoint -q "$work/sandbox"; then break; fi
-  kill -0 "$pid"; sleep .1
-done
-mountpoint -q "$work/main"; mountpoint -q "$work/sandbox"
+wait_mounted "$work/main" "$work/sandbox"
 python3 - "$work/main" "$work/volume/filler" "$work/receipt" <<'PY'
 import errno, os, sys
 root, filler, receipt = sys.argv[1:]
@@ -64,9 +70,24 @@ else:
 try: os.close(fd)
 except OSError: pass
 PY
+# A full state area fails the call and stops nothing: the view still answers.
+python3 - "$work/main" <<'PY'
+import errno, os, sys
+try:
+    os.close(os.open(sys.argv[1] + '/while-full', os.O_CREAT | os.O_WRONLY, 0o600))
+except OSError as e:
+    assert e.errno == errno.ENOSPC, e
+else:
+    raise AssertionError('create succeeded while the state filesystem was full')
+assert os.listdir(sys.argv[1]) == ['file'], os.listdir(sys.argv[1])
+PY
 rm "$work/volume/filler"
 fusermount3 -u "$work/main"; fusermount3 -u "$work/sandbox"
-expect_stopped "$work/mount.log"
+status=0
+wait "$pid" || status=$?
+pid=
+if [ "$status" != 0 ]; then echo "mount exited $status after a full state area" >&2; cat "$work/mount.log" >&2; exit 1; fi
+grep -Fq 'tree SaveFailed' "$work/mount.log" || { cat "$work/mount.log" >&2; exit 1; }
 "$bin" --state "$work/volume/state" trees init
 gitdir=$work/volume/state/history.git
 [ "$(tree_git_file "$gitdir" main file)" = acknowledged ]
@@ -76,49 +97,42 @@ head=$(git --git-dir="$gitdir" rev-parse main)
 "$bin" --state "$work/volume/state" trees init
 [ "$(git --git-dir="$gitdir" rev-parse main)" = "$head" ]
 printf 'PASS\tenospc\twrite fsync\n' | tee "$work/results.tsv"
-# Fill the same real filesystem after a rename's WAL is durable but before
-# its Git publication. Rename is synchronous, so its errno reaches the caller.
-rm -rf "$work/volume/state"
-"$bin" --state "$work/volume/state" trees init
-fork=$("$bin" --state "$work/volume/state" trees fork)
-"$bin" --state "$work/volume/state" trees mount "$work/main" --sandbox "$work/sandbox" --fork "$fork" >"$work/setup-mount.log" 2>&1 & pid=$!
-for _ in $(seq 1 200); do
-  if mountpoint -q "$work/main" && mountpoint -q "$work/sandbox"; then break; fi
-  kill -0 "$pid"; sleep .1
-done
-mountpoint -q "$work/main"; mountpoint -q "$work/sandbox"
-python3 - "$work/main/source" "$work/git-receipt" <<'PY'
+# Run a rename held at `point` while the real filesystem fills, then release it.
+# Filling must finish before the stalled rename is released. Main only: with no
+# sandbox no queue entry can take the failpoint before the rename does.
+rename_while_full() {
+  local point=$1 log=$work/$1.log client
+  rm -rf "$work/volume/state"
+  "$bin" --state "$work/volume/state" trees init
+  "$bin" --state "$work/volume/state" trees mount "$work/main" >"$work/setup-mount.log" 2>&1 & pid=$!
+  wait_mounted "$work/main"
+  python3 - "$work/main/source" <<'PY'
 import os, sys
 fd = os.open(sys.argv[1], os.O_CREAT | os.O_WRONLY, 0o600)
 assert os.write(fd, b'git-acknowledged') == 16
 os.fsync(fd)
 os.close(fd)
-with open(sys.argv[2], 'w') as f:
-    f.write('write fsync close\n'); f.flush(); os.fsync(f.fileno())
 PY
-fusermount3 -u "$work/main"; fusermount3 -u "$work/sandbox"
-wait "$pid"; pid=
-AGENTFS_FAILPOINTS='tree.after_wal_before_apply=sleep(30000)' "$bin" --state "$work/volume/state" trees mount "$work/main" --sandbox "$work/sandbox" --fork "$fork" >"$work/git-mount.log" 2>&1 & pid=$!
-for _ in $(seq 1 200); do
-  if mountpoint -q "$work/main" && mountpoint -q "$work/sandbox"; then break; fi
-  kill -0 "$pid"; sleep .1
-done
-mountpoint -q "$work/main"; mountpoint -q "$work/sandbox"
-python3 - "$work/main/source" "$work/main/destination" <<'PY' >"$work/rename.log" 2>&1 & client=$!
+  fusermount3 -u "$work/main"
+  wait "$pid"; pid=
+  AGENTFS_FAILPOINTS="$point=sleep(30000)" "$bin" --state "$work/volume/state" trees mount "$work/main" >"$log" 2>&1 & pid=$!
+  wait_mounted "$work/main"
+  python3 - "$work/main/source" "$work/main/destination" "$2" <<'PY' >"$work/rename.log" 2>&1 & client=$!
 import errno, os, sys
+source, destination, want = sys.argv[1:]
+got = 0
 try:
-    os.rename(sys.argv[1], sys.argv[2])
+    os.rename(source, destination)
 except OSError as e:
-    assert e.errno == errno.ENOSPC, e
-else:
-    raise AssertionError('rename succeeded while Git state filesystem was full')
+    got = e.errno
+assert got == getattr(errno, want, 0), f'rename answered {got}, wanted {want}'
 PY
-for _ in $(seq 1 200); do
-  if grep -Fq 'agentfs failpoint tree.after_wal_before_apply triggered (sleep(30000))' "$work/git-mount.log"; then break; fi
-  kill -0 "$pid"; kill -0 "$client"; sleep .1
-done
-grep -Fq 'agentfs failpoint tree.after_wal_before_apply triggered (sleep(30000))' "$work/git-mount.log"
-python3 - "$work/volume/filler" <<'PY'
+  for _ in $(seq 1 200); do
+    if grep -Fq "agentfs failpoint $point triggered (sleep(30000))" "$log"; then break; fi
+    kill -0 "$pid"; kill -0 "$client"; sleep .1
+  done
+  grep -Fq "agentfs failpoint $point triggered (sleep(30000))" "$log"
+  python3 - "$work/volume/filler" <<'PY'
 import errno, sys
 with open(sys.argv[1], 'wb', buffering=0) as f:
     try:
@@ -130,24 +144,44 @@ with open(sys.argv[1], 'wb', buffering=0) as f:
     except OSError as e:
         assert e.errno == errno.ENOSPC, e
 PY
-# Filling must finish before the stalled rename is released.
-kill -0 "$client" || { echo 'rename returned before filesystem was filled' >&2; exit 1; }
-if ! wait "$client"; then cat "$work/rename.log" >&2; exit 1; fi
-rm "$work/volume/filler"
-fusermount3 -u "$work/main"; fusermount3 -u "$work/sandbox"
-expect_stopped "$work/git-mount.log"
+  kill -0 "$client" || { echo 'rename returned before filesystem was filled' >&2; exit 1; }
+  if ! wait "$client"; then cat "$work/rename.log" >&2; exit 1; fi
+  rm "$work/volume/filler"
+  fusermount3 -u "$work/main"
+  # Neither failure stops the actor.
+  wait "$pid"; pid=
+  "$bin" --state "$work/volume/state" trees init
+  gitdir=$work/volume/state/history.git
+  [ "$(tree_git_file "$gitdir" main "$3")" = git-acknowledged ]
+  git --git-dir="$gitdir" fsck --full --strict --no-progress
+  tree_git_no_duplicate_opens "$gitdir"
+  head=$(git --git-dir="$gitdir" rev-parse main)
+  "$bin" --state "$work/volume/state" trees init
+  [ "$(git --git-dir="$gitdir" rev-parse main)" = "$head" ]
+}
+# Objects cannot be written: nothing is recorded, ENOSPC, the name stays.
+rename_while_full tree.before_objects ENOSPC source
+printf 'PASS\tenospc-before-commit-point\trename ENOSPC; source\n' | tee -a "$work/results.tsv"
+# The record stands and only the copies fail: the call succeeded.
+rename_while_full tree.after_commit_point NONE destination
+grep -Fq 'tree CopyStale' "$work/tree.after_commit_point.log" || { cat "$work/tree.after_commit_point.log" >&2; exit 1; }
+printf 'PASS\tenospc-after-commit-point\trename 0; destination\n' | tee -a "$work/results.tsv"
+# Only a failed fsync stops the actor: the file can no longer be trusted.
+rm -rf "$work/volume/state"
 "$bin" --state "$work/volume/state" trees init
-gitdir=$work/volume/state/history.git
-# Recovery may finish the WAL-recorded rename despite the failed reply.
-if git --git-dir="$gitdir" cat-file -e main:files/destination 2>/dev/null; then
-  path=destination
-else
-  path=source
-fi
-[ "$(tree_git_file "$gitdir" main "$path")" = git-acknowledged ]
-git --git-dir="$gitdir" fsck --full --strict --no-progress
-tree_git_no_duplicate_opens "$gitdir"
-head=$(git --git-dir="$gitdir" rev-parse main)
+AGENTFS_FAILPOINTS='tree.wal_before_fsync=error' "$bin" --state "$work/volume/state" trees mount "$work/main" >"$work/fsync-mount.log" 2>&1 & pid=$!
+wait_mounted "$work/main"
+python3 - "$work/main/after-fsync" <<'PY'
+import errno, os, sys
+try:
+    os.close(os.open(sys.argv[1], os.O_CREAT | os.O_WRONLY, 0o600))
+except OSError as e:
+    assert e.errno == errno.EIO, e
+else:
+    raise AssertionError('create succeeded after a failed fsync')
+PY
+fusermount3 -u "$work/main"
+expect_stopped "$work/fsync-mount.log"
 "$bin" --state "$work/volume/state" trees init
-[ "$(git --git-dir="$gitdir" rev-parse main)" = "$head" ]
-printf 'PASS\tenospc-git-publication\twrite fsync close; rename ENOSPC\n' | tee -a "$work/results.tsv"
+git --git-dir="$work/volume/state/history.git" fsck --full --strict --no-progress
+printf 'PASS\tfailed-fsync-stops\tEIO; stopped\n' | tee -a "$work/results.tsv"

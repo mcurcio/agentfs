@@ -9,6 +9,7 @@ on:
       - 'vendor/**'
       - 'Cargo.*'
       - '.github/workflows/phase-1.yml'
+  workflow_dispatch:
 
 permissions:
   contents: read

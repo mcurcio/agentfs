@@ -1,18 +1,19 @@
-//! Tree actor for phase 1 of target git-model §3, §6, §7 and §18.
+//! Tree actor for phase 1 of target git-model §3, §6, §7, §12 and §18.
 //!
 //! One exclusively locked actor owns a repository, private checkouts and a
-//! byte-call WAL. The recording milestone supports flat regular files and
-//! full-lineage saves on main and forks. The actor is the implementation
-//! foundation for the landing referee and sync work still due in phase 1.
-//! Every call is fsynced before acknowledgement (deliberately stronger and
-//! slower than the target's group commit). Checkouts are disposable caches;
-//! the branches are authoritative. See docs/target-architecture/phase-1.md.
+//! journal. Every call is fsynced before acknowledgement (deliberately stronger
+//! and slower than the target's group commit). A step's pointer changes are one
+//! journal record, the commit point: objects are durable before it, and Git's
+//! refs and the private checkouts are copies made after it, rebuilt from the
+//! journal at every open and after any failed copy. Nothing decides from a copy.
+//! See docs/target-architecture/phase-1.md.
 
+mod journal;
 mod pages;
+mod pointers;
 pub mod queue;
 mod referee;
 mod sync;
-mod wal;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
@@ -20,7 +21,7 @@ use std::io;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use git2::Oid;
 use serde::{Deserialize, Serialize};
@@ -29,12 +30,14 @@ use crate::file_lock::{FileLock, Mode};
 use crate::paths::RepoPath;
 use crate::tree_git::{RefUpdate, TreeEntry, TreeGit};
 use crate::tree_reconcile::LineMap;
+use journal::{
+    CallHead, CompactError, Entry, Frame, Journal, OpenRecord, PointerChange, Record, RunHead,
+};
+use pointers::Pointers;
 
-const FORMAT: &str = "agentfs-trees-1\n";
-// Read state created by the first two development commits without changing
-// its journal, branches or history. New state uses the domain name above.
-const LEGACY_FORMAT: &str = "agentfs-prototype-1\n";
-const QUEUE_SEQUENCE: &str = "refs/agentfs/queue-sequence";
+const FORMAT: &str = "agentfs-trees-2\n";
+const JOURNAL: &str = "calls.wal";
+const INITIALIZING: &str = "initializing";
 type Result<T> = std::result::Result<T, Error>;
 type Undecided = (BTreeSet<String>, BTreeSet<(MergeFileIdentity, u64)>);
 
@@ -68,6 +71,10 @@ pub enum Error {
     CorruptJournal(usize),
     #[error("actor stopped after a recording/save failure; reopen to recover")]
     Stopped,
+    #[error("{name} names lost object {oid}; operator recovery required")]
+    MissingObject { name: String, oid: Oid },
+    #[error("pointer {name} is not at the value a step expected")]
+    PointerMoved { name: String },
 }
 
 impl Error {
@@ -79,14 +86,35 @@ impl Error {
             Self::Name | Self::Writer => libc::EINVAL,
             Self::TooLarge => libc::EFBIG,
             Self::Busy => libc::EBUSY,
-            Self::Io(e) => e.raw_os_error().unwrap_or(libc::EIO),
+            Self::TreeGit(crate::tree_git::Error::NoSpace(_)) => libc::ENOSPC,
+            Self::Io(e)
+            | Self::TreeGit(crate::tree_git::Error::Io(e))
+            | Self::Reconcile(crate::tree_reconcile::Error::Io(e)) => {
+                e.raw_os_error().unwrap_or(libc::EIO)
+            }
             _ => libc::EIO,
         }
     }
 }
 
+/// When a journal this long after its last compaction compacts again.
+/// Constants, not a setting: restart memory is at most this plus live calls.
+fn compact_at(len_after_last: u64) -> u64 {
+    (64_u64 << 20).max(len_after_last.saturating_mul(2))
+}
+
+fn now_ns() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
+}
+
+fn branch(tree: &str) -> String {
+    format!("refs/heads/{tree}")
+}
+
 /// Calls name byte positions, never lines. Append finds EOF at save time.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum Call {
     Write { offset: u64, bytes: Vec<u8> },
     Append(Vec<u8>),
@@ -119,74 +147,100 @@ impl Call {
         }
         Ok(())
     }
+
+    /// The call as a journal frame stores it: a JSON head and raw tail bytes.
+    fn to_frame(&self) -> (CallHead, &[u8]) {
+        match self {
+            Self::Write { offset, bytes } => (
+                CallHead::Write {
+                    offset: *offset,
+                    len: bytes.len() as u64,
+                },
+                bytes,
+            ),
+            Self::Append(bytes) => (
+                CallHead::Append {
+                    len: bytes.len() as u64,
+                },
+                bytes,
+            ),
+            Self::Truncate(size) => (CallHead::Truncate(*size), &[]),
+        }
+    }
+
+    fn from_frame(head: &CallHead, tail: &[u8]) -> Result<Self> {
+        let whole = |len: u64| {
+            (len == tail.len() as u64)
+                .then(|| tail.to_vec())
+                .ok_or(Error::Format)
+        };
+        match head {
+            CallHead::Write { offset, len } => Ok(Self::Write {
+                offset: *offset,
+                bytes: whole(*len)?,
+            }),
+            CallHead::Append { len } => Ok(Self::Append(whole(*len)?)),
+            CallHead::Truncate(size) => whole(0).map(|_| Self::Truncate(*size)),
+        }
+    }
 }
 
-#[derive(Clone, Serialize, Deserialize)]
-struct Record {
-    seq: u64,
-    event: Event,
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-enum Event {
-    Fork {
-        name: String,
-        parent: String,
-        at: String,
-    },
-    Open {
-        tree: String,
-        path: String,
-        writer: String,
-        object: u64,
-        create: bool,
-    },
-    AnonymousOpen {
-        tree: String,
-        writer: String,
-    },
-    FirstLink {
-        tree: String,
-        object: u64,
-        path: String,
-        writer: String,
-    },
-    Call {
-        handle: u64,
-        call: Call,
-    },
-    /// The bytes a page write changed (ledger R1.4; `pages`).
-    PageWrite {
-        handle: u64,
-        runs: Vec<pages::Run>,
-    },
-    Close {
-        handle: u64,
-    },
-    Rename {
-        tree: String,
-        from: String,
-        to: String,
-        writer: String,
-    },
-    Unlink {
-        tree: String,
-        path: String,
-        writer: String,
-    },
-}
-
-#[derive(Clone)]
+/// The saved state of one tree. A step builds on a copy and installs it after
+/// its commit point, so file bytes and line maps sit behind `Arc`.
+#[derive(Clone, Default)]
 struct Tree {
     names: BTreeMap<String, u64>,
     anonymous: BTreeSet<u64>,
-    bytes: BTreeMap<u64, Vec<u8>>,
-    lines: BTreeMap<u64, LineMap>,
+    bytes: BTreeMap<u64, Arc<Vec<u8>>>,
+    lines: BTreeMap<u64, Arc<LineMap>>,
     identities: BTreeMap<u64, MergeFileIdentity>,
     namespace: BTreeMap<MergeFileIdentity, NameHistory>,
     fresh_names: BTreeSet<u64>,
-    head: Oid,
-    committed: u64,
+}
+
+impl Tree {
+    /// Adds an object that has no name and no saved state.
+    fn add_anonymous(&mut self, object: u64) {
+        self.anonymous.insert(object);
+        self.bytes.insert(object, Arc::default());
+        self.lines.insert(object, Arc::default());
+        self.identities.insert(object, MergeFileIdentity(object));
+        self.fresh_names.insert(object);
+    }
+
+    fn drop_object(&mut self, object: u64) {
+        self.bytes.remove(&object);
+        self.lines.remove(&object);
+        self.identities.remove(&object);
+        self.fresh_names.remove(&object);
+    }
+
+    /// Replaces the names and files with `snapshot`'s.
+    fn install(&mut self, snapshot: referee::Snapshot) -> Result<()> {
+        self.names.clear();
+        self.fresh_names.clear();
+        for (id, file) in snapshot.files {
+            let history = snapshot.names.get(&id).ok_or(Error::Format)?;
+            let path = history
+                .versions
+                .get(&history.head)
+                .and_then(|version| version.path.clone())
+                .ok_or(Error::Format)?;
+            if history
+                .versions
+                .get(&history.head)
+                .is_some_and(|version| version.over.is_none())
+            {
+                self.fresh_names.insert(file.object);
+            }
+            self.names.insert(path, file.object);
+            self.bytes.insert(file.object, Arc::new(file.lines.bytes()));
+            self.lines.insert(file.object, Arc::new(file.lines));
+            self.identities.insert(file.object, id);
+        }
+        self.namespace = snapshot.names;
+        Ok(())
+    }
 }
 
 // Merge identity follows an atomic replacement; the object number follows an
@@ -259,7 +313,6 @@ struct SyncPlan {
 
 #[derive(Serialize, Deserialize)]
 struct ObjectTable {
-    committed: u64,
     files: BTreeMap<MergeFileIdentity, u64>,
 }
 
@@ -269,7 +322,7 @@ enum QueueAction {
 }
 
 /// Result of a release or crash-recovered release.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Saved {
     Unchanged,
     Commit(Oid),
@@ -297,18 +350,269 @@ pub struct Metrics {
     pub queued: u64,
 }
 
+/// A live open and its calls, as the journal leaves them.
+#[derive(Debug, PartialEq, Eq)]
+struct FoldedOpen {
+    open: OpenRecord,
+    calls: Vec<(u64, Call)>,
+}
+
+/// What a journal's frames add up to (git-model §12).
+#[derive(Debug, PartialEq, Eq)]
+struct Folded {
+    pointers: Pointers,
+    upstreams: BTreeMap<String, String>,
+    next_seq: u64,
+    opens: BTreeMap<u64, FoldedOpen>,
+    /// A file's page writes while a write-open of it lives.
+    page_writes: BTreeMap<(String, u64), Vec<(u64, pages::Run)>>,
+    /// The last step that closed a write-open of a file, while one lives.
+    saved_through: BTreeMap<(String, u64), u64>,
+}
+
+impl Folded {
+    fn add_open(&mut self, open: OpenRecord) {
+        self.opens.insert(
+            open.handle,
+            FoldedOpen {
+                open,
+                calls: Vec::new(),
+            },
+        );
+    }
+}
+
+fn parse_oid(hex: &str) -> Result<Oid> {
+    Oid::from_str(hex).map_err(|_| Error::Format)
+}
+
+fn parse_change(change: &PointerChange) -> Result<RefUpdate> {
+    Ok(RefUpdate {
+        refname: change.name.clone(),
+        new: change.new.as_deref().map(parse_oid).transpose()?,
+        expected_old: change.old.as_deref().map(parse_oid).transpose()?,
+    })
+}
+
+fn runs_from_frame(heads: &[RunHead], tail: &[u8]) -> Result<Vec<pages::Run>> {
+    let mut rest = tail;
+    let mut runs = Vec::with_capacity(heads.len());
+    for head in heads {
+        let len = usize::try_from(head.len).map_err(|_| Error::Format)?;
+        if rest.len() < len {
+            return Err(Error::Format);
+        }
+        let (bytes, after) = rest.split_at(len);
+        runs.push(pages::Run {
+            offset: head.offset,
+            bytes: bytes.to_vec(),
+        });
+        rest = after;
+    }
+    if rest.is_empty() {
+        Ok(runs)
+    } else {
+        Err(Error::Format)
+    }
+}
+
+/// Adds a journal's frames up. Pure. Frames that disagree with each other
+/// cannot come from a good journal: [`Error::Format`], or
+/// [`Error::PointerMoved`] for a pointer.
+fn fold(frames: &[Frame]) -> Result<Folded> {
+    let mut frames = frames.iter();
+    let Some((
+        Record {
+            entry:
+                Entry::Checkpoint {
+                    next_seq,
+                    pointers,
+                    upstreams,
+                    opens,
+                    page_saved,
+                },
+            ..
+        },
+        _,
+    )) = frames.next()
+    else {
+        return Err(Error::Format);
+    };
+    let mut folded = Folded {
+        pointers: Pointers::new(
+            pointers
+                .iter()
+                .map(|(name, hex)| Ok((name.clone(), parse_oid(hex)?)))
+                .collect::<Result<_>>()?,
+        ),
+        upstreams: upstreams.clone(),
+        next_seq: *next_seq,
+        opens: BTreeMap::new(),
+        page_writes: BTreeMap::new(),
+        saved_through: page_saved
+            .iter()
+            .map(|(tree, object, seq)| ((tree.clone(), *object), *seq))
+            .collect(),
+    };
+    for open in opens {
+        folded.add_open(open.clone());
+    }
+    for (record, tail) in frames {
+        let seq = record.seq;
+        folded.next_seq = folded.next_seq.max(seq.saturating_add(1));
+        match &record.entry {
+            Entry::Checkpoint { .. } => return Err(Error::Format),
+            Entry::Open {
+                tree,
+                writer,
+                object,
+                ..
+            } => folded.add_open(OpenRecord {
+                handle: seq,
+                tree: tree.clone(),
+                writer: writer.clone(),
+                object: *object,
+                anonymous: false,
+            }),
+            Entry::AnonymousOpen { tree, writer } => folded.add_open(OpenRecord {
+                handle: seq,
+                tree: tree.clone(),
+                writer: writer.clone(),
+                object: seq,
+                anonymous: true,
+            }),
+            Entry::Call { handle, call } => folded
+                .opens
+                .get_mut(handle)
+                .ok_or(Error::Format)?
+                .calls
+                .push((seq, Call::from_frame(call, tail)?)),
+            Entry::PageWrite { tree, object, runs } => folded
+                .page_writes
+                .entry((tree.clone(), *object))
+                .or_default()
+                .extend(runs_from_frame(runs, tail)?.into_iter().map(|r| (seq, r))),
+            Entry::Step {
+                closes,
+                opened,
+                linked,
+                fork,
+                pointers,
+                ..
+            } => {
+                let changes = pointers
+                    .iter()
+                    .map(parse_change)
+                    .collect::<Result<Vec<_>>>()?;
+                folded.pointers.check(&changes)?;
+                folded.pointers.apply(&changes);
+                if let Some((name, parent)) = fork {
+                    folded.upstreams.insert(name.clone(), parent.clone());
+                }
+                if let Some(open) = opened {
+                    folded.add_open(open.clone());
+                }
+                if let Some(object) = linked {
+                    folded
+                        .opens
+                        .values_mut()
+                        .filter(|o| o.open.object == *object)
+                        .for_each(|o| o.open.anonymous = false);
+                }
+                if let Some(handle) = closes {
+                    let open = folded.opens.remove(handle).ok_or(Error::Format)?.open;
+                    folded
+                        .saved_through
+                        .insert((open.tree.clone(), open.object), seq);
+                }
+            }
+        }
+    }
+    // Page state lives from a file's write-open to the close of its last one.
+    let live: BTreeSet<(String, u64)> = folded
+        .opens
+        .values()
+        .map(|o| (o.open.tree.clone(), o.open.object))
+        .collect();
+    folded.page_writes.retain(|key, _| live.contains(key));
+    folded.saved_through.retain(|key, _| live.contains(key));
+    Ok(folded)
+}
+
+/// A step built on a copy of its tree and not yet on record.
+struct Draft {
+    by: String,
+    tree: String,
+    built: Tree,
+    changes: Vec<RefUpdate>,
+    closes: Option<u64>,
+    opened: Option<OpenRecord>,
+    linked: Option<u64>,
+    fork: Option<(String, String)>,
+    saved: Saved,
+    enqueued: u64,
+    taken: u64,
+}
+
+impl Draft {
+    fn new(by: &str, tree: &str, built: Tree) -> Self {
+        Self {
+            by: by.to_owned(),
+            tree: tree.to_owned(),
+            built,
+            changes: Vec::new(),
+            closes: None,
+            opened: None,
+            linked: None,
+            fork: None,
+            saved: Saved::Unchanged,
+            enqueued: 0,
+            taken: 0,
+        }
+    }
+
+    fn entry(&self) -> Entry {
+        let hex = |oid: Option<Oid>| oid.map(|oid| oid.to_string());
+        Entry::Step {
+            by: self.by.clone(),
+            closes: self.closes,
+            opened: self.opened.clone(),
+            linked: self.linked,
+            fork: self.fork.clone(),
+            pointers: self
+                .changes
+                .iter()
+                .map(|change| PointerChange {
+                    name: change.refname.clone(),
+                    new: hex(change.new),
+                    old: hex(change.expected_old),
+                })
+                .collect(),
+        }
+    }
+}
+
 /// A single synchronous actor. Sharing requires a mutex; a second process
 /// cannot open this volume. No method exposes its state area to workloads.
 pub struct Volume {
     root: PathBuf,
     repo: TreeGit,
-    wal: wal::Wal,
+    journal: Journal,
+    /// Runtime pointer reads come from here, never from Git's copy.
+    pointers: Pointers,
+    upstreams: BTreeMap<String, String>,
     trees: BTreeMap<String, Tree>,
     handles: BTreeMap<u64, Handle>,
-    legacy_commits: BTreeMap<(String, u64), Oid>,
-    legacy_snapshots: BTreeMap<Oid, referee::Snapshot>,
+    /// Closes that could not save, in arrival order. Their handles count as
+    /// open until a later step in their tree saves them, or a restart does.
+    pending_closes: Vec<u64>,
+    saved_through: BTreeMap<(String, u64), u64>,
     next: u64,
     stopped: bool,
+    /// A copy failed: the next step rebuilds refs whole and redoes checkouts.
+    copies_stale: bool,
+    stale_checkouts: BTreeSet<String>,
+    compact_threshold: u64,
     metrics: Metrics,
     waiting_since: BTreeMap<String, Instant>,
     #[allow(dead_code)] // agentfs-eh5.3 reads it.
@@ -316,9 +620,91 @@ pub struct Volume {
     _lock: Arc<FileLock>,
 }
 
+// Only a first init deletes, and only under its own marker: a cut one holds
+// nothing a call returned for. Any other state area with no `format` or no
+// journal is refused by the caller, with nothing removed.
+fn prepare_state_area(root: &Path, lock: &Arc<FileLock>) -> Result<()> {
+    let marker = root.join(INITIALIZING);
+    if marker.exists() {
+        for dir in ["history.git", "trees"] {
+            if root.join(dir).exists() {
+                fs::remove_dir_all(root.join(dir))?;
+            }
+        }
+        for file in [JOURNAL, "format"] {
+            match fs::remove_file(root.join(file)) {
+                Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e.into()),
+                _ => {}
+            }
+        }
+    } else if fs::read_dir(root)?.any(|e| e.map_or(true, |e| e.file_name() != "actor.lock")) {
+        return Ok(());
+    }
+    fs::write(&marker, b"")?;
+    File::open(&marker)?.sync_all()?;
+    File::open(root)?.sync_all()?;
+    let repo = TreeGit::init_with_lease(root.join("history.git"), Arc::clone(lock))?;
+    repo.write_config(&BTreeMap::new())?;
+    let tree = repo.write_tree(&[])?;
+    let head = repo.write_commit(
+        tree,
+        &[],
+        "Root\n\nAgentfs-Writer: agentfs\nAgentfs-Cause: Root\nAgentfs-Tree: main\nAgentfs-Event: 0\n",
+    )?;
+    Journal::create(
+        &root.join(JOURNAL),
+        &Record {
+            seq: 0,
+            at_ns: now_ns(),
+            entry: Entry::Checkpoint {
+                next_seq: 1,
+                pointers: [(branch("main"), head.to_string())].into_iter().collect(),
+                upstreams: BTreeMap::new(),
+                opens: Vec::new(),
+                page_saved: Vec::new(),
+            },
+        },
+    )?;
+    crate::failpoints::hit("tree.init_before_format")?;
+    let temporary = root.join("format.tmp");
+    fs::write(&temporary, FORMAT)?;
+    File::open(&temporary)?.sync_all()?;
+    fs::rename(&temporary, root.join("format"))?;
+    File::open(root)?.sync_all()?;
+    fs::remove_file(&marker)?;
+    File::open(root)?.sync_all()?;
+    Ok(())
+}
+
+// What is lost of any pointer's commit, tree and blobs refuses to serve. The
+// second pass, on this failure path only, names the pointer.
+fn check_objects(repo: &TreeGit, pointers: &Pointers) -> Result<()> {
+    let missing = repo.missing_objects(&pointers.tips())?;
+    let Some(first) = missing.first() else {
+        return Ok(());
+    };
+    for (name, tip) in pointers.under("refs/") {
+        if let Some(oid) = repo.missing_objects(&[tip])?.first() {
+            return Err(Error::MissingObject { name, oid: *oid });
+        }
+    }
+    Err(Error::MissingObject {
+        name: "refs/".to_owned(),
+        oid: *first,
+    })
+}
+
 impl Volume {
     /// Initialize an empty directory or recover a tree volume before serving.
-    /// Recovery closes every abandoned write-open exactly once.
+    /// Recovery closes every abandoned write-open exactly once. It takes no
+    /// queue entries: the view's worker or a caller runs [`Volume::progress`].
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Format`] for a state area that is not this format,
+    /// [`Error::CorruptJournal`] and [`Error::MissingObject`] when the journal
+    /// or a pointer's objects are damaged (docs/runbooks/recording-failures.md),
+    /// and any failure of a recovery close.
     pub fn open(root: &Path) -> Result<Self> {
         crate::history::init_libgit2();
         if !root.exists() {
@@ -331,80 +717,76 @@ impl Volume {
         let lock = Arc::new(
             FileLock::try_take(&root.join("actor.lock"), Mode::Exclusive)?.ok_or(Error::Busy)?,
         );
-        let format = root.join("format");
-        if !format.exists() {
-            if fs::read_dir(&root)?.any(|e| e.map_or(true, |e| e.file_name() != "actor.lock")) {
-                return Err(Error::Format);
-            }
-            fs::write(&format, FORMAT)?;
-            File::open(&format)?.sync_all()?;
-            File::open(&root)?.sync_all()?;
-        }
-        let stored_format = fs::read_to_string(format)?;
-        if stored_format != FORMAT && stored_format != LEGACY_FORMAT {
-            return Err(Error::Format);
-        }
         // Never grant another user access to a newly initialized state area.
         fs::set_permissions(&root, fs::Permissions::from_mode(0o700))?;
-        if root.join("history.git").exists() {
-            remove_stale_locks(&root.join("history.git"))?;
+        prepare_state_area(&root, &lock)?;
+        match fs::read_to_string(root.join("format")) {
+            Ok(format) if format == FORMAT => {}
+            Ok(_) => return Err(Error::Format),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Err(Error::Format),
+            Err(e) => return Err(e.into()),
         }
-        let repo = if root.join("history.git").exists() {
-            TreeGit::open_with_lease(root.join("history.git"), Arc::clone(&lock))?
-        } else {
-            TreeGit::init_with_lease(root.join("history.git"), Arc::clone(&lock))?
-        };
-        let head = match repo.head("refs/heads/main")? {
-            Some(oid) => oid,
-            None => {
-                let tree = repo.write_tree(&[])?;
-                let head = repo.write_commit(tree, &[], "Root\n\nAgentfs-Writer: agentfs\nAgentfs-Cause: Root\nAgentfs-Tree: main\nAgentfs-Event: 0\n")?;
-                repo.ref_transaction(&[RefUpdate {
-                    refname: "refs/heads/main".into(),
-                    new: Some(head),
-                    expected_old: None,
-                }])?;
-                head
-            }
-        };
-        let legacy_commits = legacy_commit_index(&repo)?;
-        let (wal, records) = wal::Wal::open(&root.join("calls.wal"))?;
+        let (journal, frames) = Journal::open(&root.join(JOURNAL))?;
+        let folded = fold(&frames)?;
+        drop(frames);
+        let history = root.join("history.git");
+        remove_stale_locks(&history)?;
+        let repo = TreeGit::open_with_lease(&history, Arc::clone(&lock))?;
+        // Before any git command: an empty config silently loses core.fsync,
+        // and an empty HEAD is "not a git repository".
+        repo.write_config(&folded.upstreams)?;
+        check_objects(&repo, &folded.pointers)?;
+        repo.rebuild_refs(&folded.pointers.creates())?;
+        crate::failpoints::hit("tree.after_ref_rebuild")?;
         let mut volume = Self {
             root,
             repo,
-            wal,
+            journal,
+            pointers: folded.pointers,
+            upstreams: folded.upstreams,
             trees: BTreeMap::new(),
             handles: BTreeMap::new(),
-            legacy_commits,
-            legacy_snapshots: BTreeMap::new(),
-            next: records.len() as u64 + 1,
+            pending_closes: Vec::new(),
+            saved_through: folded.saved_through,
+            next: folded.next_seq,
             stopped: false,
+            copies_stale: false,
+            stale_checkouts: BTreeSet::new(),
+            compact_threshold: u64::MAX,
             metrics: Metrics::default(),
             waiting_since: BTreeMap::new(),
             pages: BTreeMap::new(),
             _lock: lock,
         };
-        let committed = volume.watermark(head)?;
-        volume.trees.insert(
-            "main".into(),
-            Tree {
-                names: BTreeMap::new(),
-                anonymous: BTreeSet::new(),
-                bytes: BTreeMap::new(),
-                lines: BTreeMap::new(),
-                identities: BTreeMap::new(),
-                namespace: BTreeMap::new(),
-                fresh_names: BTreeSet::new(),
-                head,
-                committed,
-            },
-        );
-        if volume.repo.head("refs/agentfs/reconcile-used")?.is_some() {
-            volume.recover_snapshots(&records)?;
-        } else {
-            for record in records {
-                volume.apply(record)?;
+        volume.build_trees()?;
+        for (handle, FoldedOpen { open, calls }) in folded.opens {
+            let tree = volume.trees.get_mut(&open.tree).ok_or(Error::Format)?;
+            if open.anonymous {
+                tree.add_anonymous(open.object);
             }
+            volume.handles.insert(
+                handle,
+                Handle {
+                    tree: open.tree.clone(),
+                    writer: open.writer,
+                    object: open.object,
+                    // Nothing reads it: this handle closes before serving.
+                    bytes: Vec::new(),
+                    calls,
+                },
+            );
+            volume.pages_opened(&open.tree, open.object);
+        }
+        let mut page_writes = folded.page_writes;
+        let page_files: BTreeSet<(String, u64)> = page_writes
+            .keys()
+            .chain(volume.saved_through.keys())
+            .cloned()
+            .collect();
+        for key in page_files {
+            let writes = page_writes.remove(&key).unwrap_or_default();
+            let saved_through = volume.saved_through.get(&key).copied().unwrap_or(0);
+            volume.pages_restore(&key.0, key.1, writes, saved_through);
         }
         let abandoned: Vec<_> = volume.handles.keys().copied().collect();
         for handle in abandoned {
@@ -413,9 +795,33 @@ impl Volume {
         for name in volume.tree_names() {
             volume.checkout(&name)?;
         }
-        volume.metrics.queued = volume.repo.list_refs("refs/queue/")?.len() as u64;
-        volume.progress()?;
+        volume.metrics.queued = volume.pointers.under("refs/queue/").len() as u64;
+        match volume.compact() {
+            Ok(()) => {}
+            Err(e @ CompactError::Before(_)) => eprintln!("tree CompactionFailed: {e}"),
+            Err(CompactError::After(e)) => return Err(e.into()),
+        }
+        volume.compact_threshold = compact_at(volume.journal.len());
         Ok(volume)
+    }
+
+    fn build_trees(&mut self) -> Result<()> {
+        for (reference, head) in self.pointers.under("refs/heads/") {
+            let name = reference
+                .strip_prefix("refs/heads/")
+                .ok_or(Error::Format)?
+                .to_owned();
+            let mut snapshot = self.snapshot_at(head)?;
+            self.restore_object_table(&name, &mut snapshot)?;
+            let mut tree = Tree::default();
+            tree.install(snapshot)?;
+            self.trees.insert(name, tree);
+        }
+        if self.trees.contains_key("main") {
+            Ok(())
+        } else {
+            Err(Error::Format)
+        }
     }
 
     pub fn tree_names(&self) -> Vec<String> {
@@ -439,19 +845,29 @@ impl Volume {
     }
 
     pub fn head(&self, tree: &str) -> Result<Oid> {
-        Ok(self.tree(tree)?.head)
+        self.tree(tree)?;
+        self.pointers.get(&branch(tree)).ok_or(Error::NotFound)
     }
 
     /// Fork IDs are numeric and never reused. Forking a fork is not exposed yet.
     pub fn fork(&mut self) -> Result<String> {
-        let name = format!("fork/{}", self.next);
-        let at = self.head("main")?.to_string();
-        self.record(Event::Fork {
-            name: name.clone(),
-            parent: "main".into(),
-            at,
+        let (seq, _) = self.step("main", |v, seq| {
+            let name = format!("fork/{seq}");
+            let at = v.head("main")?;
+            let mut tree = v.tree("main")?.clone();
+            for object in std::mem::take(&mut tree.anonymous) {
+                tree.drop_object(object);
+            }
+            let mut draft = Draft::new("agentfs", &name, tree);
+            draft.changes.push(RefUpdate {
+                refname: branch(&name),
+                new: Some(at),
+                expected_old: None,
+            });
+            draft.fork = Some((name, "main".to_owned()));
+            Ok(draft)
         })?;
-        Ok(name)
+        Ok(format!("fork/{seq}"))
     }
 
     /// Saved bytes; an independent reader never sees an unfinished save.
@@ -482,18 +898,35 @@ impl Volume {
     ) -> Result<u64> {
         name(path)?;
         writer_label(writer)?;
-        let object = self.tree(tree)?.names.get(path).copied();
-        if object.is_none() && !create {
-            return Err(Error::NotFound);
-        }
-        let handle = self.next;
-        self.record(Event::Open {
-            tree: tree.into(),
-            path: path.into(),
-            writer: writer.into(),
-            object: object.unwrap_or(handle),
-            create: object.is_none(),
-        })?;
+        let Some(object) = self.tree(tree)?.names.get(path).copied() else {
+            if !create {
+                return Err(Error::NotFound);
+            }
+            return self
+                .step(tree, |v, seq| v.build_create(tree, path, writer, seq))
+                .map(|(seq, _)| seq);
+        };
+        let handle = self.journal_record(
+            Entry::Open {
+                tree: tree.to_owned(),
+                path: path.to_owned(),
+                writer: writer.to_owned(),
+                object,
+            },
+            &[],
+        )?;
+        let bytes = self.tree(tree)?.bytes[&object].to_vec();
+        self.handles.insert(
+            handle,
+            Handle {
+                tree: tree.to_owned(),
+                writer: writer.to_owned(),
+                object,
+                bytes,
+                calls: Vec::new(),
+            },
+        );
+        self.pages_opened(tree, object);
         Ok(handle)
     }
 
@@ -501,11 +934,28 @@ impl Volume {
     pub fn anonymous_open(&mut self, tree: &str, writer: &str) -> Result<u64> {
         writer_label(writer)?;
         self.tree(tree)?;
-        let handle = self.next;
-        self.record(Event::AnonymousOpen {
-            tree: tree.into(),
-            writer: writer.into(),
-        })?;
+        let handle = self.journal_record(
+            Entry::AnonymousOpen {
+                tree: tree.to_owned(),
+                writer: writer.to_owned(),
+            },
+            &[],
+        )?;
+        self.trees
+            .get_mut(tree)
+            .ok_or(Error::NotFound)?
+            .add_anonymous(handle);
+        self.handles.insert(
+            handle,
+            Handle {
+                tree: tree.to_owned(),
+                writer: writer.to_owned(),
+                object: handle,
+                bytes: Vec::new(),
+                calls: Vec::new(),
+            },
+        );
+        self.pages_opened(tree, handle);
         Ok(handle)
     }
 
@@ -520,11 +970,17 @@ impl Volume {
         if !t.anonymous.contains(&object) {
             return Err(Error::NotFound);
         }
-        self.record(Event::FirstLink {
-            tree: tree.into(),
-            object,
-            path: path.into(),
-            writer: writer.into(),
+        self.step(tree, |v, seq| {
+            let mut t = v.tree(tree)?.clone();
+            t.anonymous.remove(&object);
+            t.namespace.insert(
+                t.identities[&object],
+                NameHistory::created(seq, path.to_owned()),
+            );
+            t.names.insert(path.to_owned(), object);
+            let mut draft = v.build_save(tree, t, writer, "Create", seq, None)?;
+            draft.linked = Some(object);
+            Ok(draft)
         })?;
         Ok(())
     }
@@ -564,12 +1020,43 @@ impl Volume {
         // Check both the writer's view and replay on the head before journaling.
         let mut bytes = h.bytes.clone();
         call.apply(&mut bytes)?;
-        let mut replay = self.tree(&h.tree)?.bytes[&h.object].clone();
+        let mut replay = self.tree(&h.tree)?.bytes[&h.object].to_vec();
         for c in h.calls.iter().map(|(_, c)| c).chain(std::iter::once(&call)) {
             c.apply(&mut replay)?;
         }
-        self.record(Event::Call { handle, call })?;
+        let (head, tail) = call.to_frame();
+        let seq = self.journal_record(Entry::Call { handle, call: head }, tail)?;
+        let h = self.handles.get_mut(&handle).ok_or(Error::NotFound)?;
+        h.bytes = bytes;
+        h.calls.push((seq, call.clone()));
+        let (tree, object) = (h.tree.clone(), h.object);
+        self.pages_note_call(&tree, object, &call);
         Ok(())
+    }
+
+    /// The journal call for a page write: only `pages` calls it (ledger R1.4).
+    /// Returns its journal number.
+    #[allow(dead_code)] // agentfs-eh5.3 calls it.
+    fn record_page_write(&mut self, tree: &str, object: u64, runs: &[pages::Run]) -> Result<u64> {
+        let heads = runs
+            .iter()
+            .map(|run| RunHead {
+                offset: run.offset,
+                len: run.bytes.len() as u64,
+            })
+            .collect();
+        let tail = runs.iter().fold(Vec::new(), |mut tail, run| {
+            tail.extend_from_slice(&run.bytes);
+            tail
+        });
+        self.journal_record(
+            Entry::PageWrite {
+                tree: tree.to_owned(),
+                object,
+                runs: heads,
+            },
+            &tail,
+        )
     }
 
     /// fsync/FLUSH records durability, not publication. Every call is already durable.
@@ -577,16 +1064,27 @@ impl Volume {
         if self.stopped {
             return Err(Error::Stopped);
         }
-        self.wal.sync()
+        self.journal.sync()
     }
 
-    /// RELEASE publishes calls against this tree's head, never the stale open base.
-    /// On failure the WAL remains intact; stop and reopen before serving again.
+    /// RELEASE publishes calls against this tree's head, never the stale open
+    /// base. A failed save changes nothing and answers its errno: the close
+    /// stays pending, its handle still counting as open, and saves first at the
+    /// next step in its tree and at restart.
     pub fn close(&mut self, handle: u64) -> Result<Saved> {
-        if !self.handles.contains_key(&handle) {
-            return Err(Error::NotFound);
+        if self.stopped {
+            return Err(Error::Stopped);
         }
-        self.record(Event::Close { handle })
+        let tree = self
+            .handles
+            .get(&handle)
+            .ok_or(Error::NotFound)?
+            .tree
+            .clone();
+        if !self.pending_closes.contains(&handle) {
+            self.pending_closes.push(handle);
+        }
+        self.run_pending_closes(&tree, Some(handle))
     }
 
     pub fn rename(&mut self, tree: &str, from: &str, to: &str, writer: &str) -> Result<()> {
@@ -597,12 +1095,7 @@ impl Volume {
             return Err(Error::NotFound);
         }
         if from != to {
-            self.record(Event::Rename {
-                tree: tree.into(),
-                from: from.into(),
-                to: to.into(),
-                writer: writer.into(),
-            })?;
+            self.step(tree, |v, seq| v.build_rename(tree, from, to, writer, seq))?;
         }
         Ok(())
     }
@@ -613,10 +1106,14 @@ impl Volume {
         if !self.tree(tree)?.names.contains_key(path) {
             return Err(Error::NotFound);
         }
-        self.record(Event::Unlink {
-            tree: tree.into(),
-            path: path.into(),
-            writer: writer.into(),
+        self.step(tree, |v, seq| {
+            let mut t = v.tree(tree)?.clone();
+            let object = t.names.remove(path).ok_or(Error::NotFound)?;
+            t.namespace
+                .get_mut(&t.identities[&object])
+                .ok_or(Error::Format)?
+                .advance(seq, None, None);
+            v.build_save(tree, t, writer, "Unlink", seq, None)
         })?;
         Ok(())
     }
@@ -637,7 +1134,7 @@ impl Volume {
                     tree.identities[object],
                     referee::File {
                         object: *object,
-                        lines: tree.lines[object].clone(),
+                        lines: (*tree.lines[object]).clone(),
                     },
                 )
             })
@@ -648,149 +1145,6 @@ impl Volume {
         }
     }
 
-    // Once queue takes can introduce objects, replay cannot reconstruct a
-    // tree from direct calls alone. Start from each durable branch snapshot,
-    // recover the opens that crossed its watermark, then replay later calls.
-    fn recover_snapshots(&mut self, records: &[Record]) -> Result<()> {
-        if let Some(last_legacy) = self.legacy_commits.keys().map(|(_, seq)| *seq).max() {
-            for record in records.iter().filter(|r| r.seq <= last_legacy) {
-                self.apply(record.clone())?;
-            }
-        }
-        self.trees.clear();
-        self.handles.clear();
-        let branches = self.repo.list_refs("refs/heads/")?;
-        let mut watermarks = BTreeMap::new();
-        for (branch, head) in branches {
-            let Some(name) = branch.strip_prefix("refs/heads/") else {
-                continue;
-            };
-            if name != "main" && !name.starts_with("fork/") {
-                continue;
-            }
-            let mut committed = self.watermark(head)?;
-            let mut snapshot = self.snapshot_at(head)?;
-            if let Some(saved) = self.restore_object_table(name, &mut snapshot)? {
-                committed = saved;
-            }
-            self.trees.insert(
-                name.into(),
-                Tree {
-                    names: BTreeMap::new(),
-                    anonymous: BTreeSet::new(),
-                    bytes: BTreeMap::new(),
-                    lines: BTreeMap::new(),
-                    identities: BTreeMap::new(),
-                    namespace: BTreeMap::new(),
-                    fresh_names: BTreeSet::new(),
-                    head,
-                    committed,
-                },
-            );
-            self.install_snapshot(name, snapshot, head)?;
-            watermarks.insert(name.to_owned(), committed);
-        }
-        let mut handle_trees = BTreeMap::new();
-        for record in records {
-            match &record.event {
-                Event::Open {
-                    tree,
-                    writer,
-                    object,
-                    ..
-                } => {
-                    handle_trees.insert(record.seq, tree.clone());
-                    if record.seq <= *watermarks.get(tree).unwrap_or(&0) {
-                        let bytes = self
-                            .trees
-                            .get(tree)
-                            .and_then(|t| t.bytes.get(object))
-                            .cloned()
-                            .unwrap_or_default();
-                        self.handles.insert(
-                            record.seq,
-                            Handle {
-                                tree: tree.clone(),
-                                writer: writer.clone(),
-                                object: *object,
-                                bytes,
-                                calls: Vec::new(),
-                            },
-                        );
-                    }
-                }
-                Event::AnonymousOpen { tree, writer } => {
-                    handle_trees.insert(record.seq, tree.clone());
-                    if record.seq <= *watermarks.get(tree).unwrap_or(&0) {
-                        let bytes = self
-                            .trees
-                            .get(tree)
-                            .and_then(|t| t.bytes.get(&record.seq))
-                            .cloned()
-                            .unwrap_or_default();
-                        self.handles.insert(
-                            record.seq,
-                            Handle {
-                                tree: tree.clone(),
-                                writer: writer.clone(),
-                                object: record.seq,
-                                bytes,
-                                calls: Vec::new(),
-                            },
-                        );
-                    }
-                }
-                Event::Call { handle, call } => {
-                    if let Some(h) = self.handles.get_mut(handle)
-                        && record.seq <= *watermarks.get(&h.tree).unwrap_or(&0)
-                    {
-                        call.apply(&mut h.bytes)?;
-                        h.calls.push((record.seq, call.clone()));
-                    }
-                }
-                Event::PageWrite { handle, runs } => {
-                    if let Some(h) = self.handles.get(handle)
-                        && record.seq <= *watermarks.get(&h.tree).unwrap_or(&0)
-                    {
-                        self.pages_note_writeback(record.seq, *handle, runs)?;
-                    }
-                }
-                Event::Close { handle } => {
-                    if let Some(h) = self.handles.get(handle)
-                        && record.seq <= *watermarks.get(&h.tree).unwrap_or(&0)
-                    {
-                        self.handles.remove(handle);
-                    }
-                }
-                _ => {}
-            }
-        }
-        for record in records {
-            let tree = match &record.event {
-                Event::Fork { name, .. } => {
-                    if !self.trees.contains_key(name) {
-                        self.apply(record.clone())?;
-                    }
-                    continue;
-                }
-                Event::Open { tree, .. }
-                | Event::AnonymousOpen { tree, .. }
-                | Event::FirstLink { tree, .. }
-                | Event::Rename { tree, .. }
-                | Event::Unlink { tree, .. } => tree,
-                Event::Call { handle, .. }
-                | Event::PageWrite { handle, .. }
-                | Event::Close { handle } => handle_trees
-                    .get(handle)
-                    .ok_or(Error::CorruptJournal(record.seq as usize))?,
-            };
-            if record.seq > *watermarks.get(tree).unwrap_or(&0) {
-                self.apply(record.clone())?;
-            }
-        }
-        Ok(())
-    }
-
     fn snapshot_at(&self, head: Oid) -> Result<referee::Snapshot> {
         let commit = self.repo.read_commit(head)?;
         let is_envelope = std::str::from_utf8(&commit.message).is_ok_and(|message| {
@@ -799,31 +1153,24 @@ impl Volume {
                 .any(|line| line == "Agentfs-Format: envelope-1")
         });
         if !is_envelope {
-            // The initial empty commit precedes the envelope format.
+            // The Root commit alone has no envelope, and an empty tree.
             if self.repo.list_tree(commit.tree)?.is_empty() {
                 return Ok(referee::Snapshot {
                     files: BTreeMap::new(),
                     names: BTreeMap::new(),
                 });
             }
-            return self
-                .legacy_snapshots
-                .get(&head)
-                .cloned()
-                .ok_or(Error::Format);
+            return Err(Error::Format);
         }
         let entries = self.repo.list_tree(commit.tree)?;
         let metadata = entries
             .iter()
             .find(|e| e.name == b"metadata.json")
             .ok_or(Error::Format)?;
-        let Some(namespace) = entries.iter().find(|e| e.name == b"namespace.json") else {
-            return self
-                .legacy_snapshots
-                .get(&head)
-                .cloned()
-                .ok_or(Error::Format);
-        };
+        let namespace = entries
+            .iter()
+            .find(|e| e.name == b"namespace.json")
+            .ok_or(Error::Format)?;
         let by_path: BTreeMap<String, (u64, MergeFileIdentity, LineMap)> =
             serde_json::from_slice(&self.repo.read_blob(metadata.oid)?)?;
         let names = serde_json::from_slice(&self.repo.read_blob(namespace.oid)?)?;
@@ -857,6 +1204,10 @@ impl Volume {
         let namespace = self
             .repo
             .write_blob(&serde_json::to_vec(&snapshot.names)?)?;
+        self.envelope(files, metadata, namespace)
+    }
+
+    fn envelope(&self, files: Oid, metadata: Oid, namespace: Oid) -> Result<Oid> {
         Ok(self.repo.write_tree(&[
             TreeEntry {
                 name: b"files".to_vec(),
@@ -880,7 +1231,6 @@ impl Volume {
         &self,
         tree: &str,
         snapshot: &referee::Snapshot,
-        committed: u64,
         updates: &mut Vec<RefUpdate>,
     ) -> Result<()> {
         let name = format!("refs/agentfs/objects/{tree}");
@@ -891,61 +1241,22 @@ impl Volume {
             .collect();
         let oid = self
             .repo
-            .write_blob(&serde_json::to_vec(&ObjectTable { committed, files })?)?;
+            .write_blob(&serde_json::to_vec(&ObjectTable { files })?)?;
         updates.push(RefUpdate {
-            expected_old: self.repo.head(&name)?,
+            expected_old: self.pointers.get(&name),
             refname: name,
             new: Some(oid),
         });
         Ok(())
     }
 
-    fn restore_object_table(
-        &self,
-        tree: &str,
-        snapshot: &mut referee::Snapshot,
-    ) -> Result<Option<u64>> {
-        let name = format!("refs/agentfs/objects/{tree}");
-        if let Some(oid) = self.repo.head(&name)? {
+    fn restore_object_table(&self, tree: &str, snapshot: &mut referee::Snapshot) -> Result<()> {
+        if let Some(oid) = self.pointers.get(&format!("refs/agentfs/objects/{tree}")) {
             let table: ObjectTable = serde_json::from_slice(&self.repo.read_blob(oid)?)?;
             for (id, file) in &mut snapshot.files {
                 file.object = *table.files.get(id).ok_or(Error::Format)?;
             }
-            return Ok(Some(table.committed));
         }
-        Ok(None)
-    }
-
-    fn install_snapshot(
-        &mut self,
-        tree: &str,
-        snapshot: referee::Snapshot,
-        head: Oid,
-    ) -> Result<()> {
-        let t = self.trees.get_mut(tree).ok_or(Error::NotFound)?;
-        t.names.clear();
-        t.fresh_names.clear();
-        for (id, file) in snapshot.files {
-            let history = snapshot.names.get(&id).ok_or(Error::Format)?;
-            let path = history
-                .versions
-                .get(&history.head)
-                .and_then(|version| version.path.clone())
-                .ok_or(Error::Format)?;
-            if history
-                .versions
-                .get(&history.head)
-                .is_some_and(|version| version.over.is_none())
-            {
-                t.fresh_names.insert(file.object);
-            }
-            t.names.insert(path, file.object);
-            t.bytes.insert(file.object, file.lines.bytes());
-            t.lines.insert(file.object, file.lines);
-            t.identities.insert(file.object, id);
-        }
-        t.namespace = snapshot.names;
-        t.head = head;
         Ok(())
     }
 
@@ -1082,31 +1393,18 @@ impl Volume {
         Ok(result)
     }
 
-    fn reconcile_marker(&self, updates: &mut Vec<RefUpdate>) -> Result<()> {
-        let name = "refs/agentfs/reconcile-used";
-        if self.repo.head(name)?.is_none() {
-            updates.push(RefUpdate {
-                refname: name.into(),
-                new: Some(self.repo.write_blob(b"1")?),
-                expected_old: None,
-            });
-        }
-        Ok(())
-    }
-
-    fn take_landing(&mut self, tree: &str, reference: &str, incoming: Oid) -> Result<()> {
-        let started = Instant::now();
-        let current = self.tree(tree)?.head;
+    fn build_landing(&self, tree: &str, reference: &str, incoming: Oid, seq: u64) -> Result<Draft> {
+        let current = self.head(tree)?;
+        let t = self.tree(tree)?;
         let incoming_commit = self.repo.read_commit(incoming)?;
         let base = *incoming_commit.parents.first().ok_or(Error::Format)?;
         let decision = referee::judge(
-            &Self::snapshot_of(self.tree(tree)?),
+            &Self::snapshot_of(t),
             &self.snapshot_at(base)?,
             &self.snapshot_at(incoming)?,
             &self.prior_decisions(current)?,
         )?;
         let content = self.snapshot_tree(&decision.snapshot)?;
-        let seq = self.tree(tree)?.committed;
         let mut message = format!(
             "Landing\n\nAgentfs-Writer: agentfs\nAgentfs-Cause: Landing\nAgentfs-Tree: {tree}\nAgentfs-Event: {seq}\nAgentfs-Format: envelope-1\n"
         );
@@ -1119,9 +1417,9 @@ impl Volume {
         let head = self
             .repo
             .write_commit(content, &[current, incoming], &message)?;
-        let mut updates = vec![
+        let mut changes = vec![
             RefUpdate {
-                refname: format!("refs/heads/{tree}"),
+                refname: branch(tree),
                 new: Some(head),
                 expected_old: Some(current),
             },
@@ -1133,27 +1431,30 @@ impl Volume {
         ];
         if !decision.collisions.is_empty() {
             let name = format!("refs/collisions/{tree}/{incoming}");
-            if self.repo.head(&name)?.is_none() {
-                updates.push(RefUpdate {
+            if self.pointers.get(&name).is_none() {
+                changes.push(RefUpdate {
                     refname: name,
                     new: Some(incoming),
                     expected_old: None,
                 });
             }
         }
-        self.reconcile_marker(&mut updates)?;
-        self.object_table_update(tree, &decision.snapshot, seq, &mut updates)?;
-        let enqueued = self.enqueue_moves(tree, head, &mut updates)?;
-        crate::failpoints::hit("tree.after_objects_durable")?;
-        self.repo.ref_transaction(&updates)?;
-        crate::failpoints::hit("tree.after_refs_durable")?;
-        self.install_snapshot(tree, decision.snapshot, head)?;
-        self.metrics.queued = self
-            .metrics
-            .queued
-            .saturating_sub(1)
-            .saturating_add(enqueued);
-        self.checkout(tree)?;
+        self.object_table_update(tree, &decision.snapshot, &mut changes)?;
+        let enqueued = self.enqueue_moves(tree, head, seq, &mut changes)?;
+        let mut built = t.clone();
+        built.install(decision.snapshot)?;
+        let mut draft = Draft::new("agentfs", tree, built);
+        draft.changes = changes;
+        draft.enqueued = enqueued;
+        draft.taken = 1;
+        Ok(draft)
+    }
+
+    fn take_landing(&mut self, tree: &str, reference: &str, incoming: Oid) -> Result<()> {
+        let started = Instant::now();
+        self.step(tree, |v, seq| {
+            v.build_landing(tree, reference, incoming, seq)
+        })?;
         let nanos = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
         self.metrics.takes = self.metrics.takes.saturating_add(1);
         self.metrics.take_nanos = self.metrics.take_nanos.saturating_add(nanos);
@@ -1165,10 +1466,11 @@ impl Volume {
 
     fn plan_sync(&self, tree: &str, open: &BTreeSet<queue::Key>) -> Result<SyncPlan> {
         let fork = self.tree(tree)?;
+        let fork_head = self.head(tree)?;
         let fork_snapshot = Self::snapshot_of(fork);
         let mut todo = Vec::new();
         let mut cursor = self.head("main")?;
-        while !self.repo.is_ancestor(cursor, fork.head)? {
+        while !self.repo.is_ancestor(cursor, fork_head)? {
             todo.push(cursor);
             let commit = self.repo.read_commit(cursor)?;
             let Some(parent) = commit.parents.first() else {
@@ -1183,7 +1485,7 @@ impl Volume {
         let mut remaining = false;
         for oid in todo {
             let parent = self.snapshot_at(oid)?;
-            let (lines, names) = self.undecided(&fork_snapshot, fork.head, oid)?;
+            let (lines, names) = self.undecided(&fork_snapshot, fork_head, oid)?;
             let next = sync::sync(&parent, &fork_snapshot, &lines, &names)?;
             let changes = Self::changed_keys(&current, &next);
             if !changes.is_disjoint(open) {
@@ -1206,7 +1508,7 @@ impl Volume {
     }
 
     fn pending_from(&self, tree: &str) -> Result<bool> {
-        for (_, oid) in self.repo.list_refs("refs/queue/main/")? {
+        for (_, oid) in self.pointers.under("refs/queue/main/") {
             let commit = self.repo.read_commit(oid)?;
             if std::str::from_utf8(&commit.message).is_ok_and(|m| {
                 m.lines()
@@ -1218,56 +1520,59 @@ impl Volume {
         Ok(false)
     }
 
-    fn take_sync(&mut self, tree: &str, reference: &str, value: Oid, plan: SyncPlan) -> Result<()> {
-        let started = Instant::now();
+    fn build_sync(
+        &self,
+        tree: &str,
+        reference: &str,
+        value: Oid,
+        plan: SyncPlan,
+        seq: u64,
+    ) -> Result<Draft> {
         let current = self.head(tree)?;
-        let mut updates = Vec::new();
-        let mut new_head = None;
-        let installed = plan.snapshot;
+        let mut built = self.tree(tree)?.clone();
+        let mut changes = Vec::new();
         if let Some(target) = plan.target {
             let parent = self.snapshot_at(target)?;
-            let head = if Self::changed_keys(&parent, &installed).is_empty()
+            let head = if Self::changed_keys(&parent, &plan.snapshot).is_empty()
                 && !self.pending_from(tree)?
                 && self.repo.is_ancestor(current, target)?
             {
                 target
             } else {
-                let content = self.snapshot_tree(&installed)?;
-                let seq = self.tree(tree)?.committed;
+                let content = self.snapshot_tree(&plan.snapshot)?;
                 let message = format!(
                     "Sync\n\nAgentfs-Writer: agentfs\nAgentfs-Cause: Sync\nAgentfs-Tree: {tree}\nAgentfs-Event: {seq}\nAgentfs-Format: envelope-1\n"
                 );
                 self.repo
                     .write_commit(content, &[current, target], &message)?
             };
-            updates.push(RefUpdate {
-                refname: format!("refs/heads/{tree}"),
+            changes.push(RefUpdate {
+                refname: branch(tree),
                 new: Some(head),
                 expected_old: Some(current),
             });
-            new_head = Some(head);
+            self.object_table_update(tree, &plan.snapshot, &mut changes)?;
+            built.install(plan.snapshot)?;
         }
-        if new_head.is_some() {
-            self.object_table_update(tree, &installed, self.tree(tree)?.committed, &mut updates)?;
-        }
-        if !plan.remaining {
-            updates.push(RefUpdate {
+        let taken = !plan.remaining;
+        if taken {
+            changes.push(RefUpdate {
                 refname: reference.into(),
                 new: None,
                 expected_old: Some(value),
             });
         }
-        self.reconcile_marker(&mut updates)?;
-        crate::failpoints::hit("tree.after_objects_durable")?;
-        self.repo.ref_transaction(&updates)?;
-        crate::failpoints::hit("tree.after_refs_durable")?;
-        if let Some(head) = new_head {
-            self.install_snapshot(tree, installed, head)?;
-            self.checkout(tree)?;
-        }
-        if !plan.remaining {
-            self.metrics.queued = self.metrics.queued.saturating_sub(1);
-        }
+        let mut draft = Draft::new("agentfs", tree, built);
+        draft.changes = changes;
+        draft.taken = u64::from(taken);
+        Ok(draft)
+    }
+
+    fn take_sync(&mut self, tree: &str, reference: &str, value: Oid, plan: SyncPlan) -> Result<()> {
+        let started = Instant::now();
+        self.step(tree, |v, seq| {
+            v.build_sync(tree, reference, value, plan, seq)
+        })?;
         let nanos = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
         self.metrics.takes = self.metrics.takes.saturating_add(1);
         self.metrics.take_nanos = self.metrics.take_nanos.saturating_add(nanos);
@@ -1278,26 +1583,36 @@ impl Volume {
     }
 
     /// Take at most one eligible queue entry. Callers can release the actor
-    /// mutex between calls, so opens do not wait behind a waiting entry.
+    /// mutex between calls, so opens do not wait behind a waiting entry. A take
+    /// that fails stays queued for the next event and this answers `Ok(false)`.
     pub fn progress(&mut self) -> Result<bool> {
         if self.stopped {
             return Err(Error::Stopped);
         }
-        let result = self.progress_one();
-        if result.is_err() {
-            self.stopped = true;
+        match self.progress_one() {
+            Err(e) if !self.stopped => {
+                eprintln!("tree SaveFailed: {e}");
+                Ok(false)
+            }
+            result => result,
         }
-        result
     }
 
     fn progress_one(&mut self) -> Result<bool> {
         let mut trees = self.tree_names();
         trees.sort_by_key(|name| name != "main");
         for tree in trees {
-            let entries = self.repo.list_refs(&format!("refs/queue/{tree}/"))?;
-            if entries.is_empty() {
+            if self
+                .pointers
+                .under(&format!("refs/queue/{tree}/"))
+                .is_empty()
+            {
                 continue;
             }
+            // A take is a step: pending closes save first, and its plan reads
+            // the tree they leave.
+            self.run_pending_closes(&tree, None)?;
+            let entries = self.pointers.under(&format!("refs/queue/{tree}/"));
             let open = self.open_keys(&tree);
             let mut plans = Vec::new();
             let mut actions = Vec::new();
@@ -1351,277 +1666,374 @@ impl Volume {
         Ok(false)
     }
 
-    fn record(&mut self, event: Event) -> Result<Saved> {
+    /// Appends one record that moves no pointer, or the step `run_step` built.
+    /// Only a file that can no longer be trusted stops the actor.
+    fn journal_record(&mut self, entry: Entry, tail: &[u8]) -> Result<u64> {
         if self.stopped {
             return Err(Error::Stopped);
         }
-        let started = Instant::now();
+        let seq = self.next;
         let record = Record {
-            seq: self.next,
-            event,
+            seq,
+            at_ns: now_ns(),
+            entry,
         };
-        if let Err(e) = self.wal.append(&record) {
-            self.stopped = true;
+        if let Err(e) = self.journal.append(&record, tail) {
+            self.stopped = self.journal.unknown();
             return Err(e);
         }
-        if let Err(e) = crate::failpoints::hit("tree.after_wal_before_apply") {
-            self.stopped = true;
-            return Err(e.into());
-        }
         self.next += 1;
-        let result = self.apply(record);
-        if matches!(result, Ok(Saved::Commit(_))) {
-            let nanos = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
-            self.metrics.saves = self.metrics.saves.saturating_add(1);
-            self.metrics.save_nanos = self.metrics.save_nanos.saturating_add(nanos);
-            self.metrics.max_save_nanos = self.metrics.max_save_nanos.max(nanos);
-        }
-        if result.is_err() {
-            self.stopped = true;
-        }
-        result
+        Ok(seq)
     }
 
-    fn apply(&mut self, record: Record) -> Result<Saved> {
-        let seq = record.seq;
-        let mut save = None;
-        let mut open_trailer = None;
+    /// Saves this tree's pending closes, then runs the step `build` makes.
+    fn step<F>(&mut self, tree: &str, build: F) -> Result<(u64, Saved)>
+    where
+        F: FnOnce(&Self, u64) -> Result<Draft>,
+    {
+        self.run_pending_closes(tree, None)?;
+        self.run_step(build)
+    }
+
+    /// Saves this tree's pending closes in arrival order, answering for `wanted`.
+    fn run_pending_closes(&mut self, tree: &str, wanted: Option<u64>) -> Result<Saved> {
+        let due: Vec<u64> = self
+            .pending_closes
+            .iter()
+            .copied()
+            .filter(|handle| self.handles.get(handle).is_some_and(|h| h.tree == tree))
+            .collect();
         let mut outcome = Saved::Unchanged;
-        match record.event {
-            Event::Fork { name, parent, at } => {
-                let mut tree = self.tree(&parent)?.clone();
-                for object in std::mem::take(&mut tree.anonymous) {
-                    tree.bytes.remove(&object);
-                    tree.lines.remove(&object);
-                    tree.identities.remove(&object);
-                    tree.fresh_names.remove(&object);
-                }
-                let branch = format!("refs/heads/{name}");
-                tree.head = match self.repo.head(&branch)? {
-                    Some(oid) => oid,
-                    None => {
-                        let oid = Oid::from_str(&at)?;
-                        self.repo.ref_transaction(&[RefUpdate {
-                            refname: branch.clone(),
-                            new: Some(oid),
-                            expected_old: None,
-                        }])?;
-                        oid
-                    }
-                };
-                tree.committed = self.watermark(tree.head)?;
-                self.repo
-                    .set_config(&format!("branch.{name}.remote"), ".")?;
-                self.repo.set_config(
-                    &format!("branch.{name}.merge"),
-                    &format!("refs/heads/{parent}"),
-                )?;
-                self.trees.insert(name.clone(), tree);
-                self.checkout(&name)?;
-            }
-            Event::Open {
-                tree,
-                path,
-                writer,
-                object,
-                create,
-            } => {
-                if create {
-                    let t = self.trees.get_mut(&tree).ok_or(Error::NotFound)?;
-                    t.names.insert(path.clone(), object);
-                    t.bytes.insert(object, Vec::new());
-                    t.lines.insert(object, LineMap::default());
-                    t.identities.insert(object, MergeFileIdentity(object));
-                    t.namespace.insert(
-                        MergeFileIdentity(object),
-                        NameHistory::created(seq, path.clone()),
-                    );
-                    t.fresh_names.insert(object);
-                    save = Some((tree.clone(), writer.clone(), "Create"));
-                }
-                let bytes = self.tree(&tree)?.bytes[&object].clone();
-                self.handles.insert(
-                    seq,
-                    Handle {
-                        tree,
-                        writer,
-                        object,
-                        bytes,
-                        calls: Vec::new(),
-                    },
-                );
-            }
-            Event::AnonymousOpen { tree, writer } => {
-                let t = self.trees.get_mut(&tree).ok_or(Error::NotFound)?;
-                t.anonymous.insert(seq);
-                t.bytes.insert(seq, Vec::new());
-                t.lines.insert(seq, LineMap::default());
-                t.identities.insert(seq, MergeFileIdentity(seq));
-                t.fresh_names.insert(seq);
-                self.handles.insert(
-                    seq,
-                    Handle {
-                        tree,
-                        writer,
-                        object: seq,
-                        bytes: Vec::new(),
-                        calls: Vec::new(),
-                    },
-                );
-            }
-            Event::FirstLink {
-                tree,
-                object,
-                path,
-                writer,
-            } => {
-                let t = self.trees.get_mut(&tree).ok_or(Error::NotFound)?;
-                if !t.anonymous.remove(&object) {
-                    return Err(Error::NotFound);
-                }
-                t.namespace.insert(
-                    t.identities[&object],
-                    NameHistory::created(seq, path.clone()),
-                );
-                t.names.insert(path, object);
-                save = Some((tree, writer, "Create"));
-            }
-            Event::Call { handle, call } => {
-                let h = self.handles.get_mut(&handle).ok_or(Error::NotFound)?;
-                call.apply(&mut h.bytes)?;
-                h.calls.push((seq, call.clone()));
-                let (tree, object) = (h.tree.clone(), h.object);
-                self.pages_note_call(&tree, object, &call)?;
-            }
-            Event::PageWrite { handle, runs } => {
-                self.pages_note_writeback(seq, handle, &runs)?;
-            }
-            Event::Close { handle } => {
-                let h = self.handles.remove(&handle).ok_or(Error::NotFound)?;
-                let calls = self.pages_calls_for_close(&h);
-                let (saved_tree, saved_object) = (h.tree.clone(), h.object);
-                let tree = self.trees.get_mut(&h.tree).ok_or(Error::NotFound)?;
-                if tree.anonymous.remove(&h.object) {
-                    tree.bytes.remove(&h.object);
-                    tree.lines.remove(&h.object);
-                    tree.identities.remove(&h.object);
-                    tree.fresh_names.remove(&h.object);
-                } else if !tree.names.values().any(|o| *o == h.object) {
-                    outcome = Saved::OrphanDropped;
-                } else if !calls.is_empty() {
-                    let mut bytes = tree.bytes[&h.object].clone();
-                    for call in &calls {
-                        call.apply(&mut bytes)?;
-                    }
-                    let mut index = 0_u64;
-                    let mut next_id = || {
-                        index += 1;
-                        format!("{seq}:{index}")
-                    };
-                    let lines = if calls.iter().all(|call| matches!(call, Call::Append(_))) {
-                        let suffix: Vec<u8> = calls
-                            .iter()
-                            .flat_map(|call| match call {
-                                Call::Append(bytes) => bytes.as_slice(),
-                                _ => unreachable!(),
-                            })
-                            .copied()
-                            .collect();
-                        tree.lines[&h.object].append(&suffix, &mut next_id)?
-                    } else {
-                        tree.lines[&h.object].align(&bytes, &mut next_id)?
-                    };
-                    tree.lines.insert(h.object, lines);
-                    tree.bytes.insert(h.object, bytes);
-                    open_trailer = Some(handle);
-                    save = Some((h.tree, h.writer, "Direct"));
-                }
-                self.pages_saved(&saved_tree, saved_object)?;
-            }
-            Event::Rename {
-                tree,
-                from,
-                to,
-                writer,
-            } => {
-                let t = self.trees.get_mut(&tree).ok_or(Error::NotFound)?;
-                let object = t.names.remove(&from).ok_or(Error::NotFound)?;
-                if let Some(replaced) = t.names.get(&to).copied()
-                    && t.fresh_names.contains(&object)
-                {
-                    let source_id = t.identities[&object];
-                    t.namespace
-                        .get_mut(&source_id)
-                        .ok_or(Error::Format)?
-                        .advance(seq, None, None);
-                    let mut index = 0_u64;
-                    let lines = t.lines[&replaced].align(&t.bytes[&object], || {
-                        index += 1;
-                        format!("{seq}:{index}")
-                    })?;
-                    t.lines.insert(object, lines);
-                    t.identities.insert(object, t.identities[&replaced]);
-                    if !t.fresh_names.contains(&replaced) {
-                        t.fresh_names.remove(&object);
-                    }
-                } else {
-                    let source_id = t.identities[&object];
-                    if let Some(replaced) = t.names.get(&to).copied() {
-                        let replaced_id = t.identities[&replaced];
-                        t.namespace
-                            .get_mut(&replaced_id)
-                            .ok_or(Error::Format)?
-                            .advance(seq, None, Some(source_id));
-                    }
-                    t.namespace
-                        .get_mut(&source_id)
-                        .ok_or(Error::Format)?
-                        .advance(seq, Some(to.clone()), None);
-                    t.fresh_names.remove(&object);
-                }
-                t.names.insert(to, object);
-                save = Some((tree, writer, "Rename"));
-            }
-            Event::Unlink { tree, path, writer } => {
-                let t = self.trees.get_mut(&tree).ok_or(Error::NotFound)?;
-                let object = t.names.remove(&path).ok_or(Error::NotFound)?;
-                t.namespace
-                    .get_mut(&t.identities[&object])
-                    .ok_or(Error::Format)?
-                    .advance(seq, None, None);
-                save = Some((tree, writer, "Unlink"));
-            }
-        }
-        if let Some((tree, writer, cause)) = save {
-            if let Some(head) = self.legacy_commits.get(&(tree.clone(), seq)).copied() {
-                self.legacy_snapshots
-                    .insert(head, Self::snapshot_of(self.tree(&tree)?));
-            }
-            if seq > self.tree(&tree)?.committed {
-                outcome = Saved::Commit(self.commit(&tree, &writer, cause, seq, open_trailer)?);
+        for handle in due {
+            let (_, saved) = self.run_step(|v, seq| v.build_close(handle, seq))?;
+            if wanted == Some(handle) {
+                outcome = saved;
             }
         }
         Ok(outcome)
     }
 
-    fn watermark(&self, head: Oid) -> Result<u64> {
-        let commit = self.repo.read_commit(head)?;
-        std::str::from_utf8(&commit.message)
-            .ok()
-            .and_then(|m| m.lines().find_map(|l| l.strip_prefix("Agentfs-Event: ")))
-            .and_then(|n| n.parse().ok())
-            .ok_or(Error::Format)
+    /// One step, in order. A failure up to and including the journal record
+    /// changes nothing and returns its errno. After the record, the commit
+    /// point, the step has happened: a failed copy is logged and the call
+    /// succeeds (AGENTS principle 5).
+    fn run_step<F>(&mut self, build: F) -> Result<(u64, Saved)>
+    where
+        F: FnOnce(&Self, u64) -> Result<Draft>,
+    {
+        if self.stopped {
+            return Err(Error::Stopped);
+        }
+        let started = Instant::now();
+        let seq = self.next;
+        let recorded = (|| -> Result<Draft> {
+            crate::failpoints::hit("tree.before_objects")?;
+            let draft = build(self, seq)?;
+            crate::failpoints::hit("tree.after_objects_durable")?;
+            self.pointers.check(&draft.changes)?;
+            self.journal_record(draft.entry(), &[])?;
+            Ok(draft)
+        })();
+        let draft = match recorded {
+            Ok(draft) => draft,
+            Err(e) => {
+                eprintln!("tree SaveFailed: {e}");
+                return Err(e);
+            }
+        };
+        let saved = draft.saved;
+        let is_fork = draft.fork.is_some();
+        let changes = draft.changes.clone();
+        let tree = draft.tree.clone();
+        self.install(draft, seq);
+        if matches!(saved, Saved::Commit(_)) {
+            let nanos = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            self.metrics.saves = self.metrics.saves.saturating_add(1);
+            self.metrics.save_nanos = self.metrics.save_nanos.saturating_add(nanos);
+            self.metrics.max_save_nanos = self.metrics.max_save_nanos.max(nanos);
+        }
+        if let Err(e) = self.copy_out(&tree, is_fork, &changes) {
+            self.copies_stale = true;
+            eprintln!("tree CopyStale: {e}");
+        }
+        self.compact_if_due();
+        Ok((seq, saved))
     }
 
-    fn commit(
-        &mut self,
+    /// Stage 6: the step is on record, so memory follows. Cannot fail.
+    fn install(&mut self, draft: Draft, seq: u64) {
+        let Draft {
+            tree,
+            built,
+            changes,
+            closes,
+            opened,
+            fork,
+            enqueued,
+            taken,
+            ..
+        } = draft;
+        if let Some((name, parent)) = fork {
+            self.upstreams.insert(name, parent);
+        }
+        let closed = closes.and_then(|handle| {
+            self.pending_closes.retain(|pending| *pending != handle);
+            self.handles.remove(&handle)
+        });
+        if let Some(open) = opened {
+            let bytes = built
+                .bytes
+                .get(&open.object)
+                .map_or_else(Vec::new, |bytes| bytes.to_vec());
+            self.handles.insert(
+                open.handle,
+                Handle {
+                    tree: open.tree.clone(),
+                    writer: open.writer,
+                    object: open.object,
+                    bytes,
+                    calls: Vec::new(),
+                },
+            );
+            self.pages_opened(&open.tree, open.object);
+        }
+        self.trees.insert(tree, built);
+        self.pointers.apply(&changes);
+        self.metrics.queued = self
+            .metrics
+            .queued
+            .saturating_sub(taken)
+            .saturating_add(enqueued);
+        if let Some(closed) = closed {
+            let key = (closed.tree, closed.object);
+            if self
+                .handles
+                .values()
+                .any(|h| h.tree == key.0 && h.object == key.1)
+            {
+                self.saved_through.insert(key.clone(), seq);
+            } else {
+                self.saved_through.remove(&key);
+            }
+            self.pages_saved(&key.0, key.1, seq);
+        }
+    }
+
+    /// Stage 7: Git's refs and the checkouts, both copies of what is on record.
+    fn copy_out(&mut self, tree: &str, is_fork: bool, changes: &[RefUpdate]) -> Result<()> {
+        // Named first, so that a failure anywhere below redoes this checkout.
+        if changes.iter().any(|change| change.refname == branch(tree)) {
+            self.stale_checkouts.insert(tree.to_owned());
+        }
+        crate::failpoints::hit("tree.after_commit_point")?;
+        if self.copies_stale {
+            self.repo.write_config(&self.upstreams)?;
+            self.repo.rebuild_refs(&self.pointers.creates())?;
+        } else if !changes.is_empty() {
+            if is_fork {
+                self.repo.write_config(&self.upstreams)?;
+            }
+            self.repo.ref_transaction(changes)?;
+        }
+        crate::failpoints::hit("tree.after_ref_copy")?;
+        if !self.stale_checkouts.is_empty() {
+            crate::failpoints::hit("tree.before_checkout")?;
+            for name in &self.stale_checkouts {
+                self.checkout(name)?;
+            }
+            self.stale_checkouts.clear();
+            crate::failpoints::hit("tree.after_checkout")?;
+        }
+        self.copies_stale = false;
+        Ok(())
+    }
+
+    /// A fuzzy checkpoint (ARIES): the pointers, the live opens, and unchanged
+    /// the calls and page writes of files with a live write-open. A file held
+    /// open pins only its own calls, never other files' saves.
+    fn compact(&mut self) -> std::result::Result<(), CompactError> {
+        let opens = self
+            .handles
+            .iter()
+            .map(|(handle, h)| OpenRecord {
+                handle: *handle,
+                tree: h.tree.clone(),
+                writer: h.writer.clone(),
+                object: h.object,
+                anonymous: self
+                    .trees
+                    .get(&h.tree)
+                    .is_some_and(|t| t.anonymous.contains(&h.object)),
+            })
+            .collect();
+        let checkpoint = Record {
+            seq: 0,
+            at_ns: now_ns(),
+            entry: Entry::Checkpoint {
+                next_seq: self.next,
+                pointers: self.pointers.to_hex(),
+                upstreams: self.upstreams.clone(),
+                opens,
+                page_saved: self
+                    .saved_through
+                    .iter()
+                    .map(|((tree, object), seq)| (tree.clone(), *object, *seq))
+                    .collect(),
+            },
+        };
+        let handles = &self.handles;
+        let retained = self
+            .journal
+            .retained(|record| match &record.entry {
+                Entry::Call { handle, .. } => handles.contains_key(handle),
+                Entry::PageWrite { tree, object, .. } => handles
+                    .values()
+                    .any(|h| h.tree == *tree && h.object == *object),
+                _ => false,
+            })
+            .map_err(CompactError::Before)?;
+        self.journal.compact(&checkpoint, &retained)
+    }
+
+    fn compact_if_due(&mut self) {
+        if self.journal.len() < self.compact_threshold {
+            return;
+        }
+        match self.compact() {
+            Ok(()) => self.compact_threshold = compact_at(self.journal.len()),
+            // Untouched: the next step retries.
+            Err(e @ CompactError::Before(_)) => eprintln!("tree CompactionFailed: {e}"),
+            // The open file may not be the named one.
+            Err(e @ CompactError::After(_)) => {
+                eprintln!("tree CompactionFailed: {e}");
+                self.stopped = true;
+            }
+        }
+    }
+
+    fn build_create(&self, tree: &str, path: &str, writer: &str, seq: u64) -> Result<Draft> {
+        let mut t = self.tree(tree)?.clone();
+        t.names.insert(path.to_owned(), seq);
+        t.bytes.insert(seq, Arc::default());
+        t.lines.insert(seq, Arc::default());
+        t.identities.insert(seq, MergeFileIdentity(seq));
+        t.namespace.insert(
+            MergeFileIdentity(seq),
+            NameHistory::created(seq, path.to_owned()),
+        );
+        t.fresh_names.insert(seq);
+        let mut draft = self.build_save(tree, t, writer, "Create", seq, None)?;
+        draft.opened = Some(OpenRecord {
+            handle: seq,
+            tree: tree.to_owned(),
+            writer: writer.to_owned(),
+            object: seq,
+            anonymous: false,
+        });
+        Ok(draft)
+    }
+
+    fn build_close(&self, handle: u64, seq: u64) -> Result<Draft> {
+        let h = self.handles.get(&handle).ok_or(Error::NotFound)?;
+        let calls = self.pages_calls_for_close(h);
+        let mut t = self.tree(&h.tree)?.clone();
+        let mut draft = if t.anonymous.remove(&h.object) {
+            t.drop_object(h.object);
+            Draft::new(&h.writer, &h.tree, t)
+        } else if !t.names.values().any(|o| *o == h.object) {
+            let mut draft = Draft::new(&h.writer, &h.tree, t);
+            draft.saved = Saved::OrphanDropped;
+            draft
+        } else if calls.is_empty() {
+            Draft::new(&h.writer, &h.tree, t)
+        } else {
+            let mut bytes = t.bytes[&h.object].to_vec();
+            for call in &calls {
+                call.apply(&mut bytes)?;
+            }
+            let mut index = 0_u64;
+            let mut next_id = || {
+                index += 1;
+                format!("{seq}:{index}")
+            };
+            let lines = if calls.iter().all(|call| matches!(call, Call::Append(_))) {
+                let suffix: Vec<u8> = calls
+                    .iter()
+                    .flat_map(|call| match call {
+                        Call::Append(bytes) => bytes.as_slice(),
+                        _ => unreachable!(),
+                    })
+                    .copied()
+                    .collect();
+                t.lines[&h.object].append(&suffix, &mut next_id)?
+            } else {
+                t.lines[&h.object].align(&bytes, &mut next_id)?
+            };
+            t.lines.insert(h.object, Arc::new(lines));
+            t.bytes.insert(h.object, Arc::new(bytes));
+            self.build_save(&h.tree, t, &h.writer, "Direct", seq, Some(handle))?
+        };
+        draft.closes = Some(handle);
+        Ok(draft)
+    }
+
+    fn build_rename(
+        &self,
+        tree: &str,
+        from: &str,
+        to: &str,
+        writer: &str,
+        seq: u64,
+    ) -> Result<Draft> {
+        let mut t = self.tree(tree)?.clone();
+        let object = t.names.remove(from).ok_or(Error::NotFound)?;
+        if let Some(replaced) = t.names.get(to).copied()
+            && t.fresh_names.contains(&object)
+        {
+            let source_id = t.identities[&object];
+            t.namespace
+                .get_mut(&source_id)
+                .ok_or(Error::Format)?
+                .advance(seq, None, None);
+            let mut index = 0_u64;
+            let lines = t.lines[&replaced].align(&t.bytes[&object], || {
+                index += 1;
+                format!("{seq}:{index}")
+            })?;
+            t.lines.insert(object, Arc::new(lines));
+            t.identities.insert(object, t.identities[&replaced]);
+            if !t.fresh_names.contains(&replaced) {
+                t.fresh_names.remove(&object);
+            }
+        } else {
+            let source_id = t.identities[&object];
+            if let Some(replaced) = t.names.get(to).copied() {
+                let replaced_id = t.identities[&replaced];
+                t.namespace
+                    .get_mut(&replaced_id)
+                    .ok_or(Error::Format)?
+                    .advance(seq, None, Some(source_id));
+            }
+            t.namespace
+                .get_mut(&source_id)
+                .ok_or(Error::Format)?
+                .advance(seq, Some(to.to_owned()), None);
+            t.fresh_names.remove(&object);
+        }
+        t.names.insert(to.to_owned(), object);
+        self.build_save(tree, t, writer, "Rename", seq, None)
+    }
+
+    /// Writes `t`'s commit and the pointer changes that publish it.
+    fn build_save(
+        &self,
         name: &str,
+        t: Tree,
         writer: &str,
         cause: &str,
         seq: u64,
         open: Option<u64>,
-    ) -> Result<Oid> {
-        let t = self.tree(name)?;
+    ) -> Result<Draft> {
         let mut files = Vec::new();
         for (path, object) in &t.names {
             let blob = self.repo.write_blob(&t.bytes[object])?;
@@ -1634,59 +2046,42 @@ impl Volume {
         let files = self.repo.write_tree(&files)?;
         let mut metadata = BTreeMap::new();
         for (path, object) in &t.names {
-            metadata.insert(path, (object, t.identities[object], &t.lines[object]));
+            metadata.insert(path, (object, t.identities[object], &*t.lines[object]));
         }
         let blob = self.repo.write_blob(&serde_json::to_vec(&metadata)?)?;
         let namespace = self.repo.write_blob(&serde_json::to_vec(&t.namespace)?)?;
-        let tree = self.repo.write_tree(&[
-            TreeEntry {
-                name: b"files".to_vec(),
-                mode: 0o040000,
-                oid: files,
-            },
-            TreeEntry {
-                name: b"metadata.json".to_vec(),
-                mode: 0o100644,
-                oid: blob,
-            },
-            TreeEntry {
-                name: b"namespace.json".to_vec(),
-                mode: 0o100644,
-                oid: namespace,
-            },
-        ])?;
+        let tree = self.envelope(files, blob, namespace)?;
         let mut message = format!(
             "{cause} by {writer}\n\nAgentfs-Writer: {writer}\nAgentfs-Cause: Direct\nAgentfs-Tree: {name}\nAgentfs-Event: {seq}\nAgentfs-Format: envelope-1\n"
         );
         if let Some(open) = open {
             message.push_str(&format!("Agentfs-Open: {open}\n"));
         }
-        let head = self.repo.write_commit(tree, &[t.head], &message)?;
-        let branch = format!("refs/heads/{name}");
-        let mut updates = vec![RefUpdate {
-            refname: branch,
+        let current = self.head(name)?;
+        let head = self.repo.write_commit(tree, &[current], &message)?;
+        let mut changes = vec![RefUpdate {
+            refname: branch(name),
             new: Some(head),
-            expected_old: Some(t.head),
+            expected_old: Some(current),
         }];
-        self.object_table_update(name, &Self::snapshot_of(t), seq, &mut updates)?;
-        let enqueued = self.enqueue_moves(name, head, &mut updates)?;
-        crate::failpoints::hit("tree.after_objects_durable")?;
-        self.repo.ref_transaction(&updates)?;
-        crate::failpoints::hit("tree.after_refs_durable")?;
-        let t = self.trees.get_mut(name).ok_or(Error::NotFound)?;
-        t.head = head;
-        t.committed = seq;
-        self.metrics.queued = self.metrics.queued.saturating_add(enqueued);
-        crate::failpoints::hit("tree.before_checkout")?;
-        self.checkout(name)?;
-        crate::failpoints::hit("tree.after_checkout")?;
-        Ok(head)
+        self.object_table_update(name, &Self::snapshot_of(&t), &mut changes)?;
+        let enqueued = self.enqueue_moves(name, head, seq, &mut changes)?;
+        let mut draft = Draft::new(writer, name, t);
+        draft.changes = changes;
+        draft.enqueued = enqueued;
+        draft.saved = Saved::Commit(head);
+        Ok(draft)
     }
 
-    // Queue refs and the branch move are committed by the same reftable
-    // transaction. The persisted counter supplies order across restart and is
-    // independent of commit dates and journal event numbers.
-    fn enqueue_moves(&self, tree: &str, head: Oid, updates: &mut Vec<RefUpdate>) -> Result<u64> {
+    // One entry per destination, numbered by the step that causes it: order
+    // across restart, independent of commit dates.
+    fn enqueue_moves(
+        &self,
+        tree: &str,
+        head: Oid,
+        seq: u64,
+        changes: &mut Vec<RefUpdate>,
+    ) -> Result<u64> {
         let destinations: Vec<(String, Oid)> = if tree == "main" {
             let sync = self.repo.write_blob(b"sync")?;
             self.trees
@@ -1697,40 +2092,22 @@ impl Volume {
         } else {
             vec![("main".to_owned(), head)]
         };
-        if destinations.is_empty() {
-            return Ok(0);
-        }
-        let old = self.repo.head(QUEUE_SEQUENCE)?;
-        let mut sequence: u64 = match old {
-            Some(oid) => std::str::from_utf8(&self.repo.read_blob(oid)?)
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .ok_or(Error::Format)?,
-            None => 0,
-        };
         for (destination, oid) in &destinations {
-            sequence = sequence.checked_add(1).ok_or(Error::TooLarge)?;
-            updates.push(RefUpdate {
-                refname: format!("refs/queue/{destination}/{sequence:020}"),
+            changes.push(RefUpdate {
+                refname: format!("refs/queue/{destination}/{seq:020}"),
                 new: Some(*oid),
                 expected_old: None,
             });
         }
-        let value = self.repo.write_blob(sequence.to_string().as_bytes())?;
-        updates.push(RefUpdate {
-            refname: QUEUE_SEQUENCE.into(),
-            new: Some(value),
-            expected_old: old,
-        });
         Ok(destinations.len() as u64)
     }
 
     fn checkout(&self, name: &str) -> Result<()> {
         let dir = self.root.join("trees").join(name);
         fs::create_dir_all(&dir)?;
-        // Rebuild from the BRANCH, never replay's intermediate in-memory state.
-        let commit = self.repo.read_commit(self.tree(name)?.head)?;
-        // The trailer distinguishes legacy roots even if a workload used our names.
+        // Rebuild from the branch, never from intermediate in-memory state.
+        let commit = self.repo.read_commit(self.head(name)?)?;
+        // The trailer tells the Root commit even if a workload used our names.
         let has_envelope = std::str::from_utf8(&commit.message)
             .is_ok_and(|m| m.lines().any(|l| l == "Agentfs-Format: envelope-1"));
         let tree = if has_envelope {
@@ -1746,50 +2123,6 @@ impl Volume {
         self.repo.checkout_tree(tree, &dir)?;
         Ok(())
     }
-}
-
-// Existing recording commits predate durable namespace maps. Rebuild their
-// snapshots from the same WAL used for object recovery, keyed by the commit's
-// event trailer. New commits carry both maps themselves.
-fn legacy_commit_index(repo: &TreeGit) -> Result<BTreeMap<(String, u64), Oid>> {
-    let mut todo: Vec<Oid> = repo
-        .list_refs("refs/heads/")?
-        .into_iter()
-        .map(|(_, oid)| oid)
-        .collect();
-    let mut seen = BTreeSet::new();
-    let mut result = BTreeMap::new();
-    while let Some(oid) = todo.pop() {
-        if !seen.insert(oid) {
-            continue;
-        }
-        let commit = repo.read_commit(oid)?;
-        todo.extend(commit.parents);
-        if let Ok(message) = std::str::from_utf8(&commit.message) {
-            let has_envelope = message
-                .lines()
-                .any(|line| line == "Agentfs-Format: envelope-1");
-            if has_envelope
-                && repo
-                    .list_tree(commit.tree)?
-                    .iter()
-                    .any(|e| e.name == b"namespace.json")
-            {
-                continue;
-            }
-            let tree = message
-                .lines()
-                .find_map(|line| line.strip_prefix("Agentfs-Tree: "));
-            let seq = message
-                .lines()
-                .find_map(|line| line.strip_prefix("Agentfs-Event: "))
-                .and_then(|s| s.parse::<u64>().ok());
-            if let (Some(tree), Some(seq)) = (tree, seq) {
-                result.insert((tree.to_owned(), seq), oid);
-            }
-        }
-    }
-    Ok(result)
 }
 
 // The exclusive actor lock is held first; no other writer can own these.
@@ -1811,13 +2144,7 @@ fn remove_stale_locks(gitdir: &Path) -> io::Result<()> {
         Ok(())
     }
     refs(&gitdir.join("refs"))?;
-    for name in [
-        "HEAD.lock",
-        "config.lock",
-        "packed-refs.lock",
-        "index.lock",
-        "reftable/tables.list.lock",
-    ] {
+    for name in ["HEAD.lock", "config.lock", "packed-refs.lock", "index.lock"] {
         let path = gitdir.join(name);
         if path.is_file() {
             fs::remove_file(path)?;
@@ -1839,4 +2166,106 @@ fn writer_label(writer: &str) -> Result<()> {
         return Err(Error::Writer);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn frames_of(root: &Path) -> Vec<Frame> {
+        Journal::open(&root.join(JOURNAL)).unwrap().1
+    }
+
+    #[test]
+    fn compaction_keeps_the_fold() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut v = Volume::open(tmp.path()).unwrap();
+        // Both kinds of live open with calls and page writes, closed opens with
+        // both, a fork and a queue entry.
+        let fork = v.fork().unwrap();
+        let held = v.write_open("main", "held", "w", true).unwrap();
+        v.write(held, 0, b"held-1", false).unwrap();
+        let shared = v.write_open("main", "shared", "w", true).unwrap();
+        v.write(shared, 0, b"shared", false).unwrap();
+        let object = v.open_object(shared).unwrap();
+        let other = v.write_open("main", "shared", "w", false).unwrap();
+        v.record_page_write(
+            "main",
+            object,
+            &[pages::Run {
+                offset: 1,
+                bytes: b"page".to_vec(),
+            }],
+        )
+        .unwrap();
+        v.close(other).unwrap();
+        let anonymous = v.anonymous_open("main", "w").unwrap();
+        v.write(anonymous, 0, b"unnamed", false).unwrap();
+        let closed = v.write_open("main", "closed", "w", true).unwrap();
+        v.write(closed, 0, b"closed", false).unwrap();
+        let closed_object = v.open_object(closed).unwrap();
+        v.record_page_write(
+            "main",
+            closed_object,
+            &[pages::Run {
+                offset: 0,
+                bytes: b"gone".to_vec(),
+            }],
+        )
+        .unwrap();
+        v.close(closed).unwrap();
+        v.write_open(&fork, "sandbox", "w", true).unwrap();
+
+        let mut whole = frames_of(tmp.path());
+        let folded = fold(&whole).unwrap();
+        assert_eq!(folded.opens.len(), 4);
+        assert_eq!(folded.opens[&held].calls.len(), 1);
+        assert!(folded.opens[&anonymous].open.anonymous);
+        assert_eq!(folded.upstreams[&fork], "main");
+        assert_eq!(
+            folded.page_writes[&("main".to_owned(), object)][0].1.bytes,
+            b"page"
+        );
+        assert!(
+            folded
+                .saved_through
+                .contains_key(&("main".to_owned(), object))
+        );
+        assert!(
+            !folded
+                .page_writes
+                .contains_key(&("main".to_owned(), closed_object))
+        );
+        assert_eq!(folded.next_seq, v.next);
+        assert_eq!(folded.pointers, v.pointers);
+
+        v.compact().unwrap();
+        let compacted = frames_of(tmp.path());
+        assert!(compacted.len() < whole.len());
+        assert_eq!(fold(&compacted).unwrap(), folded);
+
+        // What follows lands on either start and adds up the same.
+        v.write(held, 0, b"held-2", false).unwrap();
+        v.write(shared, 0, b"!", true).unwrap();
+        let again = v.write_open("main", "again", "w", true).unwrap();
+        v.close(shared).unwrap();
+        v.first_link("main", anonymous, "named", "w").unwrap();
+        v.close(again).unwrap();
+        while v.progress().unwrap() {}
+        let now = frames_of(tmp.path());
+        whole.extend_from_slice(&now[compacted.len()..]);
+        let folded = fold(&now).unwrap();
+        assert_eq!(fold(&whole).unwrap(), folded);
+        assert!(!folded.opens[&anonymous].open.anonymous);
+        assert_eq!(folded.opens[&held].calls.len(), 2);
+        assert_eq!(folded.pointers, v.pointers);
+        assert_eq!(folded.next_seq, v.next);
+    }
+
+    #[test]
+    fn a_compaction_threshold_is_constants() {
+        assert_eq!(compact_at(0), 64 << 20);
+        assert_eq!(compact_at(1 << 20), 64 << 20);
+        assert_eq!(compact_at(100 << 20), 200 << 20);
+    }
 }
