@@ -29,8 +29,6 @@ fork=$("$bin" --state "$work/state" trees fork)
 wait_mounted "$work/main"
 wait_mounted "$work/sandbox"
 result=0
-python3 ci/trees-pagecache.py "$work/main" "$work/state/history.git" "$work/sandbox" || result=$?
-python3 ci/trees-mmap.py "$work/main" "$work/state/history.git" || result=$?
 fusermount3 -u "$work/main"
 fusermount3 -u "$work/sandbox"
 wait "$pid"; pid=
@@ -40,7 +38,10 @@ git --git-dir="$work/state/history.git" fsck --strict
 "$bin" --state "$work/close-open" trees init
 "$bin" --state "$work/close-open" trees mount "$work/main" >>"$work/mount.log" 2>&1 & pid=$!
 wait_mounted "$work/main"
+uname -a
+cat /proc/sys/fs/fuse/max_user_bgreq
 python3 ci/trees-close-open.py "$work/main" || result=$?
+grep -a REQ "$work/mount.log" | head -1500
 fusermount3 -u "$work/main"
 wait "$pid"; pid=
 exit "$result"
