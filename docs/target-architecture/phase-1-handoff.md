@@ -160,6 +160,11 @@ through the full Git DAG after landing/fast-forward, and the lease test must
 keep Git's stdin open so EOF cannot outrun the tested death signal. Neither
 repair changes runtime outcomes or suppresses a failed invariant.
 
+Final routine CI also exposed an existing RPC-test startup race: a Unix socket
+pathname can exist before its listener accepts connections. The test helper now
+waits for a connected channel within the same bounded startup period. Its later
+shutdown/refusal assertion remains unchanged; no CSI runtime behavior changed.
+
 Continue in this order:
 
 1. Read the final handoff commit's CI/image results from PR #23. Known

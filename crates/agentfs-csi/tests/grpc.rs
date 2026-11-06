@@ -123,21 +123,25 @@ impl Driver {
 }
 
 async fn connect(socket: &Path) -> Channel {
-    for _ in 0..200 {
-        if socket.exists() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
     let socket: PathBuf = socket.to_path_buf();
-    Endpoint::try_from("http://[::]:50051")
-        .unwrap()
-        .connect_with_connector(service_fn(move |_: Uri| {
-            let socket = socket.clone();
-            async move { UnixStream::connect(socket).await.map(TokioIo::new) }
-        }))
-        .await
-        .unwrap()
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let socket = socket.clone();
+        // bind creates the pathname before listen makes connections possible.
+        // Readiness is a successful channel, not existence of the socket file.
+        let result = Endpoint::try_from("http://[::]:50051")
+            .unwrap()
+            .connect_with_connector(service_fn(move |_: Uri| {
+                let socket = socket.clone();
+                async move { UnixStream::connect(socket).await.map(TokioIo::new) }
+            }))
+            .await;
+        match result {
+            Ok(channel) => return channel,
+            Err(error) if Instant::now() >= deadline => panic!("CSI test startup: {error:?}"),
+            Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
+        }
+    }
 }
 
 fn mount_cap(mode: Mode) -> VolumeCapability {
