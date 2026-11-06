@@ -202,14 +202,19 @@ async fn run(cli: Cli) -> Result<(), String> {
         socket.display(),
         layout.base.display()
     );
-    let result = server::serve(
-        &socket,
-        IdentityService::new(),
-        ControllerService::new(layout, node_id, release),
-        NodeService::new(supervisor.clone()),
-        shutdown_signal(),
-    )
-    .await;
+    let result = match server::bind(&socket) {
+        Ok(bound) => {
+            bound
+                .serve(
+                    IdentityService::new(),
+                    ControllerService::new(layout, node_id, release),
+                    NodeService::new(supervisor.clone()),
+                    shutdown_signal(),
+                )
+                .await
+        }
+        Err(e) => Err(e),
+    };
     let _ = stop_tx.send(true);
     eprintln!("stopping the fronts and history services");
     supervisor.shutdown().await;

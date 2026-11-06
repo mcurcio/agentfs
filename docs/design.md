@@ -254,7 +254,10 @@ history service's socket, agentfs-csi's socket) goes through one type,
 `shutdown(SHUT_RDWR)`, which refuses every later connect, whatever shares
 the socket, and wakes a blocked accept. `clippy.toml` disallows building
 a listener any other way, test fakes included (beads agentfs-ew1,
-agentfs-4lb.10).
+agentfs-4lb.10). A socket's path exists before it listens: bind(2) creates
+the path and listen(2) follows, so a connect between them is refused and a
+path's existence does not mean ready. agentfs-csi's readiness is
+`server::bind` returning: connects then queue until the socket is served.
 
 ### 2.3 Single writer of history
 
