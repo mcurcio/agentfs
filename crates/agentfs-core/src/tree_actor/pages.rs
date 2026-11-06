@@ -311,6 +311,7 @@ impl Volume {
     pub fn inode_size(&self, tree: &str, object: u64) -> Option<u64> {
         self.pages
             .get(&(tree.to_owned(), object))
+            .filter(|state| state.image.is_some() || !state.bases.is_empty())
             .map(|state| state.len)
     }
 
