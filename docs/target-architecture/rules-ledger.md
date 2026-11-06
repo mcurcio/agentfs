@@ -115,12 +115,22 @@ without seeing the other. MODEL.md's rules table holds the full wording; this pa
   the decision. Approved by the owner, 2026-11-05 (approval page); his note: "its also necessary to record it with enough metadata so we know where that commit fits in the history. for example, which remote? did it "win" or "lose" a conflict? this cannot be a flat git history where any arbitrary checkout is a "correct" representation -- each commit is contextual to a branch/fork/remote". 
 - **R5.2** · rejected · A transaction's commit is refused while the same program holds open a file the commit
   would write. Owner, 2026-11-05: "if a file is held by program A, and program A tries to commit a transaction, then
-  it should be able to acquire a file lock." What replaces it is open (his question: does a transaction need to
-  declare the program it belongs to?). Gone when: `OpenFiles`
+  it should be able to acquire a file lock." Replaced: the commit goes ahead, and files still open save at close as
+  ordinary later saves. His question, whether a transaction declares its program, is answered by R5.4: it does not.
+  Gone when: `OpenFiles`
 - **R5.3** · owner · While a transaction is in progress, other I/O on its files is prohibited, locked or deferred
   until it completes. Owner, 2026-11-05: "additional I/O on that file must be prohibited/locked/deferred until the
   transaction is complete. else we risk a client trying to write the transaction while also writing the the file".
   Deferred: other writes to those files are accepted and applied in order after the transaction completes. Owner, 2026-11-05: "deferred, obviously. thats what i mean by "lock" -- its about ordering the operations so that agentfs has a change to mutate the filesystem without a client fighting it".
+  Its files, owner, 2026-11-05: "The changes that it adds to the transaction." A deferred call and a sync: the sync
+  waits until the transaction ends (owner picked this, 2026-11-05, cost stated). A deferred call at a crash: the crash
+  rolls the transaction back and applies the call (owner picked this, 2026-11-05). The model does not match these
+  yet: it counts files open for writing and keeps a deferred call behind a surviving transaction.
+- **R5.4** · owner · A transaction has no owner program. Owner, 2026-11-05: "There is no “who” in a transaction —
+  transactions stage file changes"; "A transaction is an agentfs concept, not a property of the local/shared fs."
+  Not built: the model still binds a transaction to a client and adds `Client::Outside`, which no rule supports.
+  The API of the integration that creates one is not defined (his question, 2026-11-05: "I hat is the API of an
+  integration that can create transactions?").
 
 ## 4. Who wrote what
 
