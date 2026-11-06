@@ -10,7 +10,7 @@
 
 mod wal;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
@@ -112,6 +112,16 @@ enum Event {
         object: u64,
         create: bool,
     },
+    AnonymousOpen {
+        tree: String,
+        writer: String,
+    },
+    FirstLink {
+        tree: String,
+        object: u64,
+        path: String,
+        writer: String,
+    },
     Call {
         handle: u64,
         call: Call,
@@ -135,6 +145,7 @@ enum Event {
 #[derive(Clone)]
 struct Tree {
     names: BTreeMap<String, u64>,
+    anonymous: BTreeSet<u64>,
     bytes: BTreeMap<u64, Vec<u8>>,
     head: Oid,
     committed: u64,
@@ -238,6 +249,7 @@ impl Volume {
             "main".into(),
             Tree {
                 names: BTreeMap::new(),
+                anonymous: BTreeSet::new(),
                 bytes: BTreeMap::new(),
                 head,
                 committed,
@@ -322,6 +334,48 @@ impl Volume {
             create: object.is_none(),
         })?;
         Ok(handle)
+    }
+
+    /// Create an unnamed open object. Its writes are journaled as usual.
+    pub fn anonymous_open(&mut self, tree: &str, writer: &str) -> Result<u64> {
+        writer_label(writer)?;
+        self.tree(tree)?;
+        let handle = self.next;
+        self.record(Event::AnonymousOpen {
+            tree: tree.into(),
+            writer: writer.into(),
+        })?;
+        Ok(handle)
+    }
+
+    /// Link an anonymous object for the first time, preserving its identity.
+    pub fn first_link(&mut self, tree: &str, object: u64, path: &str, writer: &str) -> Result<()> {
+        name(path)?;
+        writer_label(writer)?;
+        let t = self.tree(tree)?;
+        if t.names.contains_key(path) {
+            return Err(Error::Exists);
+        }
+        if !t.anonymous.contains(&object) {
+            return Err(Error::NotFound);
+        }
+        self.record(Event::FirstLink {
+            tree: tree.into(),
+            object,
+            path: path.into(),
+            writer: writer.into(),
+        })?;
+        Ok(())
+    }
+
+    /// Whether this object has never had a name in this tree.
+    pub fn is_anonymous(&self, tree: &str, object: u64) -> Result<bool> {
+        Ok(self.tree(tree)?.anonymous.contains(&object))
+    }
+
+    /// An open's stable object number, including before its first link.
+    pub fn open_object(&self, handle: u64) -> Result<u64> {
+        Ok(self.handles.get(&handle).ok_or(Error::NotFound)?.object)
     }
 
     pub fn read_open(&self, handle: u64) -> Result<&[u8]> {
@@ -441,6 +495,9 @@ impl Volume {
         match record.event {
             Event::Fork { name, parent, at } => {
                 let mut tree = self.tree(&parent)?.clone();
+                for object in std::mem::take(&mut tree.anonymous) {
+                    tree.bytes.remove(&object);
+                }
                 let branch = format!("refs/heads/{name}");
                 tree.head = match self.repo.refname_to_id(&branch) {
                     Ok(oid) => oid,
@@ -488,6 +545,34 @@ impl Volume {
                     },
                 );
             }
+            Event::AnonymousOpen { tree, writer } => {
+                let t = self.trees.get_mut(&tree).ok_or(Error::NotFound)?;
+                t.anonymous.insert(seq);
+                t.bytes.insert(seq, Vec::new());
+                self.handles.insert(
+                    seq,
+                    Handle {
+                        tree,
+                        writer,
+                        object: seq,
+                        bytes: Vec::new(),
+                        calls: Vec::new(),
+                    },
+                );
+            }
+            Event::FirstLink {
+                tree,
+                object,
+                path,
+                writer,
+            } => {
+                let t = self.trees.get_mut(&tree).ok_or(Error::NotFound)?;
+                if !t.anonymous.remove(&object) {
+                    return Err(Error::NotFound);
+                }
+                t.names.insert(path, object);
+                save = Some((tree, writer, "Create"));
+            }
             Event::Call { handle, call } => {
                 let h = self.handles.get_mut(&handle).ok_or(Error::NotFound)?;
                 call.apply(&mut h.bytes)?;
@@ -496,7 +581,9 @@ impl Volume {
             Event::Close { handle } => {
                 let h = self.handles.remove(&handle).ok_or(Error::NotFound)?;
                 let tree = self.trees.get_mut(&h.tree).ok_or(Error::NotFound)?;
-                if !tree.names.values().any(|o| *o == h.object) {
+                if tree.anonymous.remove(&h.object) {
+                    tree.bytes.remove(&h.object);
+                } else if !tree.names.values().any(|o| *o == h.object) {
                     outcome = Saved::OrphanDropped;
                 } else if !h.calls.is_empty() {
                     let mut bytes = tree.bytes[&h.object].clone();

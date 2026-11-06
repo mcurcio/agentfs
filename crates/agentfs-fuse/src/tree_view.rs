@@ -162,7 +162,13 @@ impl View {
                 FileType::RegularFile
             },
             perm: if dir { 0o700 } else { 0o600 },
-            nlink: if dir { 2 } else { 1 },
+            nlink: if dir {
+                2
+            } else if v.is_anonymous(&self.tree, ino.0 - 2).map_err(errno)? {
+                0
+            } else {
+                1
+            },
             uid: rustix::process::geteuid().as_raw(),
             gid: rustix::process::getegid().as_raw(),
             rdev: 0,
@@ -216,11 +222,15 @@ impl View {
 
 impl Filesystem for View {
     fn init(&mut self, _req: &Request, config: &mut KernelConfig) -> io::Result<()> {
-        if config
-            .capabilities()
-            .contains(InitFlags::FUSE_ATOMIC_O_TRUNC)
-        {
-            let _ = config.add_capabilities(InitFlags::FUSE_ATOMIC_O_TRUNC);
+        for flag in [
+            InitFlags::FUSE_ATOMIC_O_TRUNC,
+            InitFlags::FUSE_DIRECT_IO_ALLOW_MMAP,
+        ] {
+            if config.capabilities().contains(flag) {
+                config.add_capabilities(flag).map_err(|missing| {
+                    io::Error::other(format!("unsupported FUSE capabilities: {missing:?}"))
+                })?;
+            }
         }
         Ok(())
     }
@@ -292,6 +302,48 @@ impl Filesystem for View {
                 fh,
                 self.attr(&v, INodeNo(object + 2), Some(FileHandle(fh)))?,
             ))
+        })();
+        match result {
+            Ok((fh, attr)) => reply.created(
+                &TTL,
+                &attr,
+                Generation(0),
+                FileHandle(fh),
+                FopenFlags::FOPEN_DIRECT_IO,
+            ),
+            Err(e) => reply.error(e),
+        }
+    }
+    fn tmpfile(
+        &self,
+        _req: &Request,
+        parent: INodeNo,
+        _mode: u32,
+        _umask: u32,
+        flags: i32,
+        reply: ReplyCreate,
+    ) {
+        let result = (|| {
+            if parent.0 != 1 {
+                return Err(Errno::ENOTDIR);
+            }
+            let mut v = self.actor()?;
+            let handle = v.anonymous_open(&self.tree, &self.writer).map_err(errno)?;
+            let object = v.open_object(handle).map_err(errno)?;
+            let mut handles = self.handles()?;
+            let fh = handles.next;
+            handles.next += 1;
+            handles.entries.insert(
+                fh,
+                Open::Write {
+                    handle,
+                    append: flags & libc::O_APPEND != 0,
+                    readable: flags & libc::O_ACCMODE == libc::O_RDWR,
+                },
+            );
+            drop(handles);
+            let ino = INodeNo(object + 2);
+            Ok((fh, self.attr(&v, ino, Some(FileHandle(fh)))?))
         })();
         match result {
             Ok((fh, attr)) => reply.created(
@@ -458,6 +510,31 @@ impl Filesystem for View {
                 );
                 reply.error(e);
             }
+        }
+    }
+    fn link(&self, _req: &Request, ino: INodeNo, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
+        let result = (|| {
+            if parent.0 != 1 {
+                return Err(Errno::ENOTDIR);
+            }
+            let object = ino.0.checked_sub(2).ok_or(Errno::ENOENT)?;
+            let mut v = self.actor()?;
+            // Existing named-object hard links retain fuser's default EPERM.
+            if !v.is_anonymous(&self.tree, object).map_err(errno)? {
+                return Err(Errno::EPERM);
+            }
+            v.first_link(
+                &self.tree,
+                object,
+                name.to_str().ok_or(Errno::EINVAL)?,
+                &self.writer,
+            )
+            .map_err(errno)?;
+            self.attr(&v, ino, None)
+        })();
+        match result {
+            Ok(attr) => reply.entry(&TTL, &attr, Generation(0)),
+            Err(e) => reply.error(e),
         }
     }
     fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {

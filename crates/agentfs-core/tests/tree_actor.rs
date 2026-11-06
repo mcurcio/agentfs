@@ -356,3 +356,31 @@ fn save_and_checkout_failures_keep_calls_and_recover_without_duplicate_commits()
     assert_eq!(v.head("main").unwrap(), committed);
     assert_eq!(v.read("main", "a").unwrap(), b"basejournaledonce");
 }
+
+#[test]
+fn anonymous_object_first_link_and_recovery_preserve_identity() {
+    let tmp = tempfile::tempdir().unwrap();
+    let object;
+    {
+        let mut v = Volume::open(tmp.path()).unwrap();
+        let h = v.anonymous_open("main", "writer").unwrap();
+        object = v.open_object(h).unwrap();
+        v.write(h, 0, b"saved on recovery", false).unwrap();
+        assert!(v.files("main").unwrap().is_empty());
+        v.first_link("main", object, "named", "writer").unwrap();
+        assert_eq!(v.read("main", "named").unwrap(), b"");
+        assert_eq!(v.files("main").unwrap()[0].1, object);
+        // Drop with the handle still open; restart replays the journal and closes it.
+    }
+    let mut v = Volume::open(tmp.path()).unwrap();
+    assert_eq!(v.read("main", "named").unwrap(), b"saved on recovery");
+    assert_eq!(v.files("main").unwrap()[0].1, object);
+    assert!(matches!(
+        v.first_link("main", object, "other", "writer"),
+        Err(Error::NotFound)
+    ));
+    let h = v.anonymous_open("main", "writer").unwrap();
+    v.write(h, 0, b"unlinked", false).unwrap();
+    assert_eq!(v.close(h).unwrap(), Saved::Unchanged);
+    assert_eq!(v.files("main").unwrap().len(), 1);
+}

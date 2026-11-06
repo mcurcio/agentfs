@@ -63,8 +63,11 @@ must not overlap the state directory or one another. `--writer` and
 The FUSE adapter uses direct I/O and zero entry/attribute TTLs. A read-only open
 holds a snapshot of saved bytes; a writable open reads its own private bytes.
 Unsupported operations fail instead of passing through to an unrecorded backing
-file. Modes are fixed at 0700 for the root and 0600 for files. The adapter does
-not negotiate passthrough, shared writable mappings or writeback cache.
+file. Modes are fixed at 0700 for the root and 0600 for files. The adapter requests
+direct-I/O shared mapping support when the kernel offers it.
+The shared mapping and anonymous-file paths need the Linux CI scenarios in
+`ci/e2e-trees.sh` before they can be considered validated. The adapter does not
+negotiate passthrough or ordinary writeback cache.
 
 **Publication ordering remains incomplete.** `FLUSH`/`fsync` syncs the journal;
 `RELEASE` publishes the save. Linux sends `RELEASE` asynchronously; whether an immediate open after `close(2)`
@@ -112,10 +115,14 @@ commit idempotent. Checkout failures retain the journal too.
 ## Current implementation boundaries
 
 Only flat regular files with git-safe UTF-8 names; no directories, symlinks,
-permissions changes, hard links, `mmap`, `O_TMPFILE`, or direct access by another
-process. The WAL currently limits individual encoded frames to 96 MiB. Writer labels are trusted operator inputs, not
+permissions changes or general hard links. `O_TMPFILE` and its first link and shared mappings are under test;
+general hard-link behavior is not specified by the current model. The WAL currently
+limits individual encoded frames to 96 MiB. Writer labels are trusted operator inputs, not
 authenticated client capabilities. All admitted names are recorded; ignore and
 attribute rules and view profiles are not wired yet.
+
+Line identity and parent reconciliation primitives are present in the library but
+are not connected to the tree actor. Model finding 32 remains open.
 
 Still to implement in phase 1: line-map storage, the landing queue/referee,
 automatic sync, collision refs/notes and progress checks. Transactions,

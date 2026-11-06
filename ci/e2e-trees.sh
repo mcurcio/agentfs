@@ -121,6 +121,10 @@ for root in (main, sandbox):
 saved(main / "isolation", b"parent")
 saved(sandbox / "isolation", b"sandbox")
 PY
+mmap_status=0
+python3 ci/trees-mmap.py "$work/main" "$work/state/history.git" || mmap_status=$?
+tmpfile_status=0
+python3 ci/trees-tmpfile.py "$work/main" "$work/state/history.git" || tmpfile_status=$?
 # Keep the client handle open, then kill the actor after a returned write.
 python3 - "$work/main/crash" "$work/ack" <<'PY' >"$work/client.log" 2>&1 &
 import os
@@ -170,4 +174,6 @@ if git --git-dir="$work/state/history.git" log --all -p --format= | grep '^+.*BA
     exit 1
 fi
 git --git-dir="$work/state/history.git" fsck --strict
+test "$mmap_status" -eq 0
+test "$tmpfile_status" -eq 0
 echo "tree-view recording, object and crash scenarios passed"
