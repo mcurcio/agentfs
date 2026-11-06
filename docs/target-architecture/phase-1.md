@@ -30,13 +30,12 @@ Fresh Linux evidence is limited to these tested increments:
 |---|---|
 | `f418e03` | Strict immediate close/reopen, cross-process handoff, shared descriptor final close, writer/saved-reader bytes, concurrent closes, orphan release events and history checks passed in [CI](https://github.com/mcurcio/agentfs/actions/runs/42159661006/job/127702307383) |
 | `d9d4a81` | Shared writable mapping, `msync`, closing the descriptor while mapped, final unmap and history checks passed; anonymous-file open returned `ENOENT` in [CI](https://github.com/mcurcio/agentfs/actions/runs/42161001368/job/127706373615) |
-| Current attribute repair | Recognizes anonymous inode attributes when Linux requests them without a handle; local regression passes, mounted rerun pending |
+| `798e6fa` | Anonymous open and first link passed after recognizing handle-free inode attributes; the other tree-view checks passed in [Linux CI](https://github.com/mcurcio/agentfs/actions/runs/42176555005/job/127756236285) |
 
 The anonymous-file failure is an adapter defect: a zero-TTL permission lookup
 can request `GETATTR` without a handle, and the draft searched named paths only.
 The repair preserves anonymous object identity and its zero link count. It adds
-no reconciliation rule. A fresh CI result is required before claiming this case
-passes. Line maps, atomic ref storage, queue/referee/sync integration and the full
+no reconciliation rule. Line maps, atomic ref storage, queue/referee/sync integration and the full
 fault matrix remain work in progress; local primitive tests are not mounted
 conformance evidence.
 
