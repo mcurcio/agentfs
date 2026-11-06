@@ -13,6 +13,7 @@ mod pages;
 mod pointers;
 pub mod queue;
 mod referee;
+pub mod stages;
 mod sync;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -34,6 +35,7 @@ use journal::{
     CallHead, CompactError, Entry, Frame, Journal, OpenRecord, PointerChange, Record, RunHead,
 };
 use pointers::Pointers;
+use stages::{Stages, Timer, Which};
 
 const FORMAT: &str = "agentfs-trees-2\n";
 const JOURNAL: &str = "calls.wal";
@@ -348,6 +350,10 @@ pub struct Metrics {
     pub wait_nanos: u64,
     pub max_wait_nanos: u64,
     pub queued: u64,
+    /// Time and Git children by stage, process-wide (see [`stages`]).
+    pub stages: Stages,
+    /// The journal file's length now: what a held open file keeps from compaction.
+    pub journal_bytes: u64,
 }
 
 /// A live open and its calls, as the journal leaves them.
@@ -831,6 +837,8 @@ impl Volume {
     /// Snapshot measurements without exposing them through a workload view.
     pub fn metrics(&self) -> Metrics {
         let mut metrics = self.metrics;
+        metrics.stages = Stages::current();
+        metrics.journal_bytes = self.journal.len();
         for since in self.waiting_since.values() {
             let nanos = u64::try_from(since.elapsed().as_nanos()).unwrap_or(u64::MAX);
             metrics.wait_nanos = metrics.wait_nanos.saturating_add(nanos);
@@ -1146,6 +1154,7 @@ impl Volume {
     }
 
     fn snapshot_at(&self, head: Oid) -> Result<referee::Snapshot> {
+        let _timer = Timer::start(Which::SnapshotRead);
         let commit = self.repo.read_commit(head)?;
         let is_envelope = std::str::from_utf8(&commit.message).is_ok_and(|message| {
             message
@@ -1182,6 +1191,7 @@ impl Volume {
     }
 
     fn snapshot_tree(&self, snapshot: &referee::Snapshot) -> Result<Oid> {
+        let _timer = Timer::start(Which::Objects);
         let mut files = Vec::new();
         let mut metadata = BTreeMap::new();
         for (id, file) in &snapshot.files {
@@ -1314,6 +1324,7 @@ impl Volume {
     }
 
     fn event_owners(&self, start: Oid) -> Result<BTreeMap<u64, Oid>> {
+        let _timer = Timer::start(Which::EventOwners);
         let mut todo = vec![start];
         let mut seen = BTreeSet::new();
         let mut owners = BTreeMap::new();
@@ -1371,6 +1382,7 @@ impl Volume {
         &self,
         mut head: Oid,
     ) -> Result<BTreeMap<referee::Version, referee::Version>> {
+        let _timer = Timer::start(Which::PriorDecisions);
         let mut result = BTreeMap::new();
         loop {
             let commit = self.repo.read_commit(head)?;
@@ -1398,12 +1410,16 @@ impl Volume {
         let t = self.tree(tree)?;
         let incoming_commit = self.repo.read_commit(incoming)?;
         let base = *incoming_commit.parents.first().ok_or(Error::Format)?;
-        let decision = referee::judge(
-            &Self::snapshot_of(t),
-            &self.snapshot_at(base)?,
-            &self.snapshot_at(incoming)?,
-            &self.prior_decisions(current)?,
-        )?;
+        let (mine, base, theirs) = (
+            Self::snapshot_of(t),
+            self.snapshot_at(base)?,
+            self.snapshot_at(incoming)?,
+        );
+        let prior = self.prior_decisions(current)?;
+        let decision = {
+            let _timer = Timer::start(Which::Judge);
+            referee::judge(&mine, &base, &theirs, &prior)?
+        };
         let content = self.snapshot_tree(&decision.snapshot)?;
         let mut message = format!(
             "Landing\n\nAgentfs-Writer: agentfs\nAgentfs-Cause: Landing\nAgentfs-Tree: {tree}\nAgentfs-Event: {seq}\nAgentfs-Format: envelope-1\n"
@@ -1486,7 +1502,10 @@ impl Volume {
         for oid in todo {
             let parent = self.snapshot_at(oid)?;
             let (lines, names) = self.undecided(&fork_snapshot, fork_head, oid)?;
-            let next = sync::sync(&parent, &fork_snapshot, &lines, &names)?;
+            let next = {
+                let _timer = Timer::start(Which::SyncMerge);
+                sync::sync(&parent, &fork_snapshot, &lines, &names)?
+            };
             let changes = Self::changed_keys(&current, &next);
             if !changes.is_disjoint(open) {
                 remaining = true;
@@ -1616,6 +1635,7 @@ impl Volume {
             let open = self.open_keys(&tree);
             let mut plans = Vec::new();
             let mut actions = Vec::new();
+            let planning = Timer::start(Which::QueuePlan);
             for (_, oid) in &entries {
                 if tree == "main" {
                     let commit = self.repo.read_commit(*oid)?;
@@ -1641,6 +1661,7 @@ impl Volume {
                     actions.push(QueueAction::Sync(*oid, sync));
                 }
             }
+            drop(planning);
             let selected = queue::eligible(&plans, &open);
             let blocked = selected.unwrap_or(entries.len());
             for (reference, _) in entries.iter().take(blocked) {
@@ -1826,19 +1847,23 @@ impl Volume {
             self.stale_checkouts.insert(tree.to_owned());
         }
         crate::failpoints::hit("tree.after_commit_point")?;
-        if self.copies_stale {
-            self.repo.write_config(&self.upstreams)?;
-            self.repo.rebuild_refs(&self.pointers.creates())?;
-        } else if !changes.is_empty() {
-            if is_fork {
+        {
+            let _timer = Timer::start(Which::RefCopy);
+            if self.copies_stale {
                 self.repo.write_config(&self.upstreams)?;
+                self.repo.rebuild_refs(&self.pointers.creates())?;
+            } else if !changes.is_empty() {
+                if is_fork {
+                    self.repo.write_config(&self.upstreams)?;
+                }
+                self.repo.ref_transaction(changes)?;
             }
-            self.repo.ref_transaction(changes)?;
         }
         crate::failpoints::hit("tree.after_ref_copy")?;
         if !self.stale_checkouts.is_empty() {
             crate::failpoints::hit("tree.before_checkout")?;
             for name in &self.stale_checkouts {
+                let _timer = Timer::start(Which::Checkout);
                 self.checkout(name)?;
             }
             self.stale_checkouts.clear();
@@ -1852,6 +1877,7 @@ impl Volume {
     /// the calls and page writes of files with a live write-open. A file held
     /// open pins only its own calls, never other files' saves.
     fn compact(&mut self) -> std::result::Result<(), CompactError> {
+        let _timer = Timer::start(Which::Compaction);
         let opens = self
             .handles
             .iter()
@@ -1967,6 +1993,7 @@ impl Volume {
                     .collect();
                 t.lines[&h.object].append(&suffix, &mut next_id)?
             } else {
+                let _timer = Timer::start(Which::Align);
                 t.lines[&h.object].align(&bytes, &mut next_id)?
             };
             t.lines.insert(h.object, Arc::new(lines));
@@ -2034,6 +2061,7 @@ impl Volume {
         seq: u64,
         open: Option<u64>,
     ) -> Result<Draft> {
+        let _timer = Timer::start(Which::Objects);
         let mut files = Vec::new();
         for (path, object) in &t.names {
             let blob = self.repo.write_blob(&t.bytes[object])?;

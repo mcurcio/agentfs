@@ -209,10 +209,9 @@ impl TreeGit {
     /// Return a reference's value, or None when it does not exist.
     pub fn head(&self, name: &str) -> Result<Option<Oid>> {
         self.run(&["check-ref-format", name], None, true)?;
-        let out = self
-            .command(true)
-            .args(["rev-parse", "--verify", "--quiet", name])
-            .output()?;
+        let mut cmd = self.command(true);
+        cmd.args(["rev-parse", "--verify", "--quiet", name]);
+        let out = output(cmd)?;
         if out.status.success() {
             Ok(Some(parse_oid(trim(&out.stdout))?))
         } else if out.status.code() == Some(1) {
@@ -414,15 +413,14 @@ impl TreeGit {
     }
     /// Whether the first commit is an ancestor of the second.
     pub fn is_ancestor(&self, ancestor: Oid, descendant: Oid) -> Result<bool> {
-        let out = self
-            .command(true)
-            .args([
-                "merge-base",
-                "--is-ancestor",
-                &ancestor.to_string(),
-                &descendant.to_string(),
-            ])
-            .output()?;
+        let mut cmd = self.command(true);
+        cmd.args([
+            "merge-base",
+            "--is-ancestor",
+            &ancestor.to_string(),
+            &descendant.to_string(),
+        ]);
+        let out = output(cmd)?;
         match out.status.code() {
             Some(0) => Ok(true),
             Some(1) => Ok(false),
@@ -490,6 +488,14 @@ fn sync_initialized_repository(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+// Run with nothing on stdin and collect both streams; the status is the caller's.
+fn output(mut cmd: Command) -> io::Result<Output> {
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    crate::git_cli::counted(&mut cmd)?.wait_with_output()
+}
+
 // Spawn, feed stdin and wait. The exit status wins over a failed stdin write: a
 // git that died of a full disk also breaks the pipe, and stderr says why.
 fn run_command(mut cmd: Command, input: Option<&[u8]>) -> Result<Output> {
@@ -499,7 +505,7 @@ fn run_command(mut cmd: Command, input: Option<&[u8]>) -> Result<Output> {
     } else {
         cmd.stdin(Stdio::null());
     }
-    let mut child = cmd.spawn()?;
+    let mut child = crate::git_cli::counted(&mut cmd)?;
     let (output, write_result) = std::thread::scope(|scope| {
         let writer = input.map(|bytes| {
             let mut stdin = child.stdin.take().expect("piped stdin");

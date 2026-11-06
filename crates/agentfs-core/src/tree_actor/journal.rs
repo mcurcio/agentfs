@@ -22,6 +22,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use super::stages::{Timer, Which};
 use super::{Error, Result};
 
 const MAGIC: &[u8; 4] = b"AFJ2";
@@ -341,6 +342,7 @@ impl Journal {
         if self.unknown {
             return Err(Error::Stopped);
         }
+        let _timer = Timer::start(Which::JournalAppend);
         let head = serde_json::to_vec(record)?;
         let bytes = header(self.salt, &head, tail).ok_or(Error::TooLarge)?;
         let at = self.length;
@@ -366,6 +368,7 @@ impl Journal {
         }
         let synced = (|| -> io::Result<()> {
             crate::failpoints::hit("tree.wal_before_fsync")?;
+            let _timer = Timer::start(Which::JournalFsync);
             self.file.sync_all()?;
             crate::failpoints::hit("tree.wal_after_fsync")
         })();

@@ -158,15 +158,64 @@ jobs:
             ${{ runner.temp }}/tree-power-loss-artifacts/**/*.log
             ${{ runner.temp }}/tree-power-loss-artifacts/**/external-receipts
 
+  measure-harness:
+    name: phase 1 measurement harness (kill leaves a report)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: phase-1-measure
+      - run: sudo apt-get update && sudo apt-get install -y fuse3 git python3 util-linux curl gcc zlib1g-dev
+      - run: ci/check-tree-git.sh
+      - run: cargo test --locked -p agentfs-core --test tree_stages
+      - run: cargo build --locked -p agentfs
+      - run: ci/measure-trees.sh smoke-kill "$RUNNER_TEMP/smoke-kill.json"
+        env:
+          AGENTFS_BIN: ${{ github.workspace }}/target/debug/agentfs
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        if: always()
+        with:
+          name: phase-1-measure-smoke-kill
+          path: |
+            ${{ runner.temp }}/smoke-kill.json
+            ${{ runner.temp }}/smoke-kill.json.samples.jsonl
+
+  # `[phase1-pilot]` in the pushed commit message runs the 1,000-save pilot
+  # alone; `[phase1-measure]` runs every mode.
+  measure-plan:
+    name: phase 1 measurement plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      modes: ${{ steps.plan.outputs.modes }}
+    steps:
+      - id: plan
+        env:
+          MESSAGE: ${{ github.event.head_commit.message }}
+        run: |
+          if [[ "$MESSAGE" == *'[phase1-measure]'* ]]; then
+            echo 'modes=["pilot","held-log","calls","hour","storage"]' >> "$GITHUB_OUTPUT"
+          elif [[ "$MESSAGE" == *'[phase1-pilot]'* ]]; then
+            echo 'modes=["pilot"]' >> "$GITHUB_OUTPUT"
+          else
+            echo 'modes=[]' >> "$GITHUB_OUTPUT"
+          fi
+
   measurements:
     name: phase 1 measurements (${{ matrix.mode }})
-    if: contains(github.event.head_commit.message, '[phase1-measure]')
+    needs: measure-plan
+    if: needs.measure-plan.outputs.modes != '[]'
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
-        mode: [calls, hour, storage]
+        mode: ${{ fromJSON(needs.measure-plan.outputs.modes) }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
@@ -178,7 +227,10 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y fuse3 bindfs git python3 util-linux curl gcc zlib1g-dev
       - run: ci/check-tree-git.sh
       - run: cargo build --locked -p agentfs
+      # Inside the job's 120 minutes, so the upload below still runs when the
+      # step is cut: the report on disk says what the run reached.
       - run: ci/measure-trees.sh "${{ matrix.mode }}" "$RUNNER_TEMP/${{ matrix.mode }}.json"
+        timeout-minutes: 110
         env:
           AGENTFS_BIN: ${{ github.workspace }}/target/debug/agentfs
           MEASURE_TREES_LANDING: '1'
@@ -186,4 +238,6 @@ jobs:
         if: always()
         with:
           name: phase-1-measure-${{ matrix.mode }}
-          path: ${{ runner.temp }}/${{ matrix.mode }}.json
+          path: |
+            ${{ runner.temp }}/*.json
+            ${{ runner.temp }}/*.samples.jsonl

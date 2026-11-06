@@ -106,8 +106,10 @@ immediate reopen without publication polling. Its finite passing observations
 are listed above. Linux mapping lifetime and anonymous first-link cases are
 also tested; ordinary writeback cache and passthrough are not negotiated.
 
-`--metrics-output FILE` writes aggregate save, landing, sync and wait counters
-every 100 ms and at unmount. The existing parent directory must be outside state
+`--metrics-output FILE` writes aggregate save, landing, sync and wait counters,
+the journal's length and, for each actor stage, its runs and time, with the
+count of Git children started (`tree_actor/stages.rs`), every 100 ms and at
+unmount. The existing parent directory must be outside state
 and the views. Collection errors are returned after unmount. Measurements never
 participate in ordering or reconciliation.
 

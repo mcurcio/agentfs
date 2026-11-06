@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::os::unix::fs::DirBuilderExt;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
@@ -299,7 +299,8 @@ pub fn histogram(old: &[u8], new: &[u8]) -> Result<Vec<Hunk>, Error> {
     // Neither the caller's directory nor its git configuration may reach the
     // alignment: a directory inside a broken worktree stops `git diff`, and a
     // diff setting would change which lines keep their identity.
-    let out = Command::new("git")
+    let mut command = Command::new("git");
+    command
         .env_clear()
         .env("PATH", crate::git_cli::GIT_PATH)
         .env("LC_ALL", "C")
@@ -318,7 +319,10 @@ pub fn histogram(old: &[u8], new: &[u8]) -> Result<Vec<Hunk>, Error> {
         ])
         .arg(a)
         .arg(b)
-        .output()?;
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let out = crate::git_cli::counted(&mut command)?.wait_with_output()?;
     if !matches!(out.status.code(), Some(0 | 1)) {
         return Err(Error::Git(
             String::from_utf8_lossy(&out.stderr).into_owned(),

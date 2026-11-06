@@ -38,6 +38,7 @@ missing from these tables or a row names a module that no longer exists;
 | `tree_actor/pages.rs` | The kernel's one page cache per file: page fills, page writes and the size replies for shared mappings (ledger R1.4) |
 | `tree_actor/queue.rs` | P1 eligibility and P2 prefix selection for writer-locked queue entries |
 | `tree_actor/referee.rs` | Whole-save parent referee for line and namespace versions, with causal collision records |
+| `tree_actor/stages.rs` | Measurements only, never read by a decision: runs and time per actor stage, and the Git children the actor's path has started (counted at `git_cli::counted`, the one spawn site; target git-model §18) |
 | `tree_actor/sync.rs` | Sync snapshots preserving undecided child versions without deciding collisions |
 | `tree_reconcile.rs` | Histogram save alignment, line identities, whole-change reconciliation and undecided sync |
 | `tree_git.rs` | Git executable backend for durable objects, the rebuildable copy of the refs in files format, `config` and `HEAD`, snapshots and private caches; Git children retain the actor lease |

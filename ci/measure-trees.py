@@ -6,9 +6,82 @@ import json
 import os
 from pathlib import Path
 import platform
+import signal
 import statistics
 import subprocess
+import threading
 import time
+
+
+class Report:
+    """The report file, whole and parseable from the first moment.
+
+    It is written at once with status RUNNING and replaced atomically at each
+    measurement, so a killed or timed-out run leaves what it reached. Samples
+    are appended one JSON line at a time to <path>.samples.jsonl and flushed.
+    """
+
+    def __init__(self, path, header):
+        self.path = Path(path)
+        self.samples_path = Path(str(path) + '.samples.jsonl')
+        self.data = dict(header)
+        self.data['status'] = 'RUNNING'
+        self.data.setdefault('measurements', {})
+        self.lock = threading.Lock()
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.samples = open(self.samples_path, 'w')
+        self._write()
+
+    def _write(self):
+        temporary = self.path.with_name(self.path.name + '.tmp')
+        temporary.write_text(json.dumps(self.data, indent=2, sort_keys=True) + '\n')
+        os.replace(temporary, self.path)
+
+    def measured(self, name, value):
+        with self.lock:
+            self.data['measurements'][name] = value
+            self._write()
+
+    def sample(self, name, row):
+        with self.lock:
+            self.samples.write(json.dumps({'measurement': name, **row}, sort_keys=True) + '\n')
+            self.samples.flush()
+
+    def finish(self, error=None):
+        with self.lock:
+            if error is not None:
+                self.data['execution_error'] = error
+            self.data['status'] = 'FAILED' if error is not None else 'COMPLETE'
+            self._write()
+            self.samples.close()
+
+
+class Ambient:
+    """Samples the published metrics while a mode that is not driven by save
+    counts runs. Observation only: it decides nothing."""
+
+    def __init__(self, report, metrics, name, interval=30):
+        self.report, self.metrics, self.name, self.interval = report, metrics, name, interval
+        self.stop = threading.Event()
+        self.started = time.monotonic_ns()
+        self.thread = threading.Thread(target=self.run, daemon=True)
+
+    def run(self):
+        while True:
+            current = read_metrics(self.metrics)
+            if current is not None:
+                self.report.sample(self.name, {'elapsed_ns': time.monotonic_ns() - self.started,
+                                               'metrics': current})
+            if self.stop.wait(self.interval):
+                return
+
+    def __enter__(self):
+        self.thread.start()
+        return self
+
+    def __exit__(self, *_):
+        self.stop.set()
+        self.thread.join()
 
 
 def command(*args):
@@ -265,7 +338,7 @@ def await_save_count(metrics, target, timeout):
     raise RuntimeError('metrics did not reach %d saves before timeout' % target)
 
 
-def line_map_storage(root, state, count, metrics, timeout):
+def line_map_storage(root, state, count, metrics, timeout, report, name, sample_every):
     repo = state / 'history.git'
     # Create is a separate commit. Wait for its published count before the window.
     deadline = time.monotonic() + timeout
@@ -280,21 +353,43 @@ def line_map_storage(root, state, count, metrics, timeout):
     baseline = await_save_count(metrics, initial['saves'] + 1, timeout)
     before_head = git(repo, 'rev-parse', 'refs/heads/main').strip()
     before = disk_usage(repo)
-    before_reftable = disk_usage(repo / 'reftable')
+    # Git's files format: the refs are a copy under refs/ (git-model §3).
+    before_refs = disk_usage(repo / 'refs')
     started = time.monotonic_ns()
-    for i in range(count):
-        # Each close saves a distinct one-line version, including deleted history.
-        with open(root / 'line-map-measure', 'wb', buffering=0) as f:
-            data = ('%08d\n' % i).encode()
-            if f.write(data) != len(data):
-                raise RuntimeError('short save write')
-    # FUSE release can finish after close returns; wait for all save commits.
-    final = await_save_count(metrics, baseline['saves'] + count, timeout)
+    reached = 0
+    try:
+        for i in range(count):
+            # Each close saves a distinct one-line version, including deleted history.
+            with open(root / 'line-map-measure', 'wb', buffering=0) as f:
+                data = ('%08d\n' % i).encode()
+                if f.write(data) != len(data):
+                    raise RuntimeError('short save write')
+            if (i + 1) % sample_every == 0:
+                # FUSE release can finish after close returns: wait for the
+                # actor, then record where it is.
+                row = await_save_count(metrics, baseline['saves'] + i + 1, timeout)
+                reached = i + 1
+                report.sample(name, {'saves': reached, 'elapsed_ns': time.monotonic_ns() - started,
+                                     'metrics': row})
+        # The last saves, when count is not a multiple of the sample spacing.
+        final = await_save_count(metrics, baseline['saves'] + count, timeout)
+    except Exception as exc:
+        report.measured(name, {'status': 'PARTIAL', 'reason': '%s: %s' % (type(exc).__name__, exc),
+                               'saves_requested': count, 'saves_reached_at_last_sample': reached,
+                               'elapsed_ns': time.monotonic_ns() - started})
+        raise
     elapsed = time.monotonic_ns() - started
     if final['saves'] != baseline['saves'] + count:
         raise RuntimeError('unexpected number of save events')
-    after_head = git(repo, 'rev-parse', 'refs/heads/main').strip()
-    commits = git(repo, 'rev-list', after_head, '^' + before_head).splitlines()
+    # Git's refs are a copy made after the save is on record: read them once
+    # the last save's copy has landed.
+    deadline = time.monotonic() + timeout
+    while True:
+        after_head = git(repo, 'rev-parse', 'refs/heads/main').strip()
+        commits = git(repo, 'rev-list', after_head, '^' + before_head).splitlines()
+        if len(commits) >= count or time.monotonic() > deadline:
+            break
+        time.sleep(0.05)
     if len(commits) != count:
         raise RuntimeError('expected %d save commits, found %d' % (count, len(commits)))
     # Metadata is an envelope blob containing line maps and object/file IDs.
@@ -329,15 +424,78 @@ def line_map_storage(root, state, count, metrics, timeout):
             'commit_object_logical_bytes': sum(int(row[2]) for row in commit_sizes),
             'commit_git_object_bytes_on_disk': sum(int(row[3]) for row in commit_sizes),
             'repository_before': before, 'repository_after': disk_usage(repo),
-            'reftable_before': before_reftable,
-            'reftable_after': disk_usage(repo / 'reftable'),
-            'storage_note': 'object disk bytes use git cat-file; packed object attribution may include shared pack costs; repository totals include objects, reftable and other files',
+            'refs_before': before_refs,
+            'refs_after': disk_usage(repo / 'refs'),
+            'storage_note': 'object disk bytes use git cat-file; packed object attribution may include shared pack costs; repository totals include objects, refs and other files',
             'before_head': before_head, 'after_head': after_head}
+
+
+
+def held_log(root, metrics, timeout, report, name, saves=24, size=8 << 20):
+    # One log stays write-open while another file takes large saves. The
+    # journal grows with every saved byte; a compaction keeps only the held
+    # file's calls, so journal_bytes shows whether compaction holds (git-model §3).
+    initial = None
+    deadline = time.monotonic() + timeout
+    while initial is None and time.monotonic() < deadline:
+        initial = read_metrics(metrics)
+        if initial is None:
+            time.sleep(0.05)
+    if initial is None:
+        raise RuntimeError('save metrics unavailable')
+    with open(root / 'held-other', 'wb'):
+        pass
+    held = os.open(root / 'held-log', os.O_CREAT | os.O_WRONLY, 0o600)
+    started = time.monotonic_ns()
+    reached = 0
+    peak = 0
+    try:
+        os.write(held, b'one held line\n')
+        baseline = await_save_count(metrics, initial['saves'] + 2, timeout)
+        block = (b'0123456789abcdef' * 63 + b'\n') * 1024
+        for i in range(saves):
+            fd = os.open(root / 'held-other', os.O_WRONLY | os.O_TRUNC)
+            try:
+                for _ in range(size // len(block)):
+                    os.write(fd, block)
+            finally:
+                os.close(fd)
+            row = await_save_count(metrics, baseline['saves'] + i + 1, timeout)
+            reached = i + 1
+            peak = max(peak, row.get('journal_bytes', 0))
+            report.sample(name, {'saves': reached, 'elapsed_ns': time.monotonic_ns() - started,
+                                 'metrics': row})
+    except Exception as exc:
+        report.measured(name, {'status': 'PARTIAL', 'reason': '%s: %s' % (type(exc).__name__, exc),
+                               'saves_requested': saves, 'saves_reached_at_last_sample': reached,
+                               'journal_bytes_peak': peak})
+        raise
+    finally:
+        os.close(held)
+    final = read_metrics(metrics) or {}
+    return {'status': 'MEASURED', 'saves': saves, 'bytes_per_save': size,
+            'definition': 'one log stays write-open with one line written; another file is truncated and rewritten with the stated bytes, one close per save; journal_bytes sampled after each save',
+            'journal_bytes_peak': peak, 'journal_bytes_final': final.get('journal_bytes'),
+            'compactions': final.get('stages', {}).get('compaction', {}).get('count', 0)
+            - baseline.get('stages', {}).get('compaction', {}).get('count', 0),
+            'elapsed_ns': time.monotonic_ns() - started}
+
+
+class Terminated(Exception):
+    pass
+
+
+def terminate(signum, _frame):
+    raise Terminated('signal %d before the run finished' % signum)
+
+
+MODES = ['calls', 'hour', 'storage', 'smoke', 'pilot', 'held-log']
+
 
 def main():
     p = argparse.ArgumentParser()
     p.add_argument('--output', required=True)
-    p.add_argument('--mode', choices=['calls', 'hour', 'storage', 'smoke'], required=True)
+    p.add_argument('--mode', choices=MODES, required=True)
     p.add_argument('--reason')
     p.add_argument('--main')
     p.add_argument('--baseline')
@@ -347,13 +505,15 @@ def main():
     p.add_argument('--landing', action='store_true')
     p.add_argument('--visibility-timeout', type=float, default=120)
     p.add_argument('--bin', required=True)
-    p.add_argument('--count', type=int, default=1000)
+    p.add_argument('--count', type=int)
     p.add_argument('--interval', type=float, default=1.0)
+    p.add_argument('--sample-every', type=int, default=100)
     a = p.parse_args()
-    if a.count <= 0 or a.interval <= 0 or a.visibility_timeout <= 0:
-        p.error('count and interval must be positive')
+    if a.interval <= 0 or a.visibility_timeout <= 0 or a.sample_every <= 0 or (a.count is not None and a.count <= 0):
+        p.error('count, interval, sample-every and visibility-timeout must be positive')
+    count = a.count or (1000 if a.mode in ('calls', 'smoke', 'pilot') else 10000)
     reason = a.reason or 'requires landing/line-map measurement instrumentation'
-    report = {'schema_version': 1, 'mode': a.mode, 'source_sha': command('git', 'rev-parse', 'HEAD'),
+    header = {'schema_version': 2, 'mode': a.mode, 'source_sha': command('git', 'rev-parse', 'HEAD'),
               'source_status_porcelain': command('git', 'status', '--porcelain'),
               'binary_sha256': sha256(a.bin) if os.path.isfile(a.bin) else None,
               'tracked_diff_sha256': hashlib.sha256(subprocess.run(['git', 'diff', 'HEAD', '--binary'], stdout=subprocess.PIPE, check=True).stdout).hexdigest(),
@@ -362,34 +522,50 @@ def main():
                                 'state_path': a.state, 'baseline_path': a.baseline},
               'measurements': {k: notrun(reason) for k in ['journal_call_cost', 'hour_journal_bytes',
                    'line_map_bytes_per_10000_saves', 'save_take_1mib', 'save_take_100mib', 'queue_wait']}}
+    report = Report(a.output, header)
+    signal.signal(signal.SIGTERM, terminate)
+    signal.signal(signal.SIGINT, terminate)
+    error = None
     try:
         if not a.reason:
-            m = report['measurements']
             if a.mode in ('calls', 'smoke'):
                 if a.baseline:
-                    baseline = calls(Path(a.baseline), a.count)
-                    recorded = calls(Path(a.main), a.count)
-                    m['journal_call_cost'] = {'status': 'MEASURED' if a.mode == 'calls' else 'SMOKE',
+                    with Ambient(report, a.metrics, 'ambient'):
+                        baseline = calls(Path(a.baseline), count)
+                        recorded = calls(Path(a.main), count)
+                    report.measured('journal_call_cost', {'status': 'MEASURED' if a.mode == 'calls' else 'SMOKE',
                         'definition': 'wall time around pwrite syscall; includes FUSE and recording work, not isolated journal component time',
-                        'plain_fuse': baseline, 'recording_fuse': recorded}
+                        'plain_fuse': baseline, 'recording_fuse': recorded})
                 else:
-                    m['journal_call_cost'] = notrun('direct-I/O bindfs baseline unavailable')
+                    report.measured('journal_call_cost', notrun('direct-I/O bindfs baseline unavailable'))
             if a.mode == 'storage':
-                m['line_map_bytes_per_10000_saves'] = line_map_storage(Path(a.main), Path(a.state), 10000, a.metrics, a.visibility_timeout)
+                report.measured('line_map_bytes_per_10000_saves', line_map_storage(
+                    Path(a.main), Path(a.state), count, a.metrics, a.visibility_timeout,
+                    report, 'storage_saves', a.sample_every))
+            if a.mode == 'pilot':
+                report.measured('pilot', line_map_storage(
+                    Path(a.main), Path(a.state), count, a.metrics, a.visibility_timeout,
+                    report, 'pilot_saves', a.sample_every))
+            if a.mode == 'held-log':
+                report.measured('held_log', held_log(Path(a.main), a.metrics, a.visibility_timeout,
+                                                     report, 'held_log_saves'))
             if a.mode in ('hour', 'smoke'):
-                m['hour_journal_bytes'] = hour(Path(a.main), Path(a.state) / 'calls.wal',
-                                               3600 if a.mode == 'hour' else 2, a.interval)
+                with Ambient(report, a.metrics, 'ambient'):
+                    report.measured('hour_journal_bytes', hour(
+                        Path(a.main), Path(a.state) / 'calls.wal',
+                        3600 if a.mode == 'hour' else 2, a.interval))
             if a.landing and a.mode == 'calls':
-                for size in (1 << 20, 100 << 20):
-                    m['save_take_1mib' if size == 1 << 20 else 'save_take_100mib'] = save_and_observe(
-                        Path(a.sandbox), Path(a.main), size, a.visibility_timeout, a.metrics)
-                m['queue_wait'] = queue_progress(Path(a.sandbox), Path(a.main), a.metrics, a.visibility_timeout)
+                with Ambient(report, a.metrics, 'ambient'):
+                    for size in (1 << 20, 100 << 20):
+                        report.measured('save_take_1mib' if size == 1 << 20 else 'save_take_100mib',
+                                        save_and_observe(Path(a.sandbox), Path(a.main), size,
+                                                         a.visibility_timeout, a.metrics))
+                    report.measured('queue_wait', queue_progress(Path(a.sandbox), Path(a.main),
+                                                                 a.metrics, a.visibility_timeout))
     except Exception as exc:
-        report['execution_error'] = '%s: %s' % (type(exc).__name__, exc)
-    finally:
-        Path(a.output).parent.mkdir(parents=True, exist_ok=True)
-        Path(a.output).write_text(json.dumps(report, indent=2, sort_keys=True) + '\n')
-    return 1 if 'execution_error' in report else 0
+        error = '%s: %s' % (type(exc).__name__, exc)
+    report.finish(error)
+    return 1 if error else 0
 
 
 if __name__ == '__main__':

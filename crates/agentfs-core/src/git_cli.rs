@@ -10,11 +10,29 @@
 //! §4.4), and nothing in the daemon's environment (`GIT_CONFIG_*`,
 //! `GIT_EXEC_PATH`, `GIT_ATTR_SOURCE`) reaches it.
 
+use std::io;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// The `PATH` git is looked up in and runs with.
 pub const GIT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+
+static CHILDREN: AtomicU64 = AtomicU64::new(0);
+
+/// Starts a Git child on the tree actor's path, and counts it. The one spawn
+/// site there: children clear their `PATH`, so no wrapper could count them, and
+/// a source test (`tests/tree_stages.rs`) fails when another site appears.
+pub(crate) fn counted(cmd: &mut Command) -> io::Result<Child> {
+    let child = cmd.spawn()?;
+    CHILDREN.fetch_add(1, Ordering::Relaxed);
+    Ok(child)
+}
+
+/// Git children started through [`counted`] in this process. A measurement.
+pub(crate) fn children() -> u64 {
+    CHILDREN.load(Ordering::Relaxed)
+}
 
 /// `git` in an empty environment: `PATH=GIT_PATH`, `LC_ALL=C`,
 /// `HOME=GIT_DIR=git_dir`, `GIT_CONFIG_NOSYSTEM=1`,
