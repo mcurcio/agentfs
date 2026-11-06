@@ -53,6 +53,11 @@ without seeing the other. MODEL.md's rules table holds the full wording; this pa
   the kernel has flushed, which can include another program's mapped stores. No writer's bytes are lost that Linux would
   keep. Owner, 2026-11-06, accepting that recommendation with the handoff's evidence: "we can take those recommendations
   for now, and i might change my mind later".
+  The kernel keeps one size and one set of pages per file, so R1.1 holds for `read` and `pread` on read-only
+  descriptors. While a file is open for writing, `stat` reports the writers' size to everyone, a writable descriptor also
+  reads flushed mapped stores, and `sendfile`-family calls read what a mapping reads, which can include unsaved bytes.
+  Owner, 2026-11-06, choosing option A of three: "A is fine. but im still on the fence about memory mapped files, because
+  they seem to be causing issues. Go with (A) for now". Revisable: option C was to refuse shared mappings.
 - **R2** · owner · No clocks. Each tree takes its queue in order, and which of two lines is newer is read from
   git's ancestry, never from a date. Source: his premise, asking how last-writer-wins works with no shared
   clock (2026-11-02). Tests: `r2_one_queue_fixes_the_landing_order`, `r2_no_clock_commit_dates_decide_nothing`
@@ -209,6 +214,9 @@ without seeing the other. MODEL.md's rules table holds the full wording; this pa
   open: last writer wins, both versions kept in history. Owner, 2026-11-05: "a".
 - **R9.16** · owner · Two programs in one tree: the later close is final inside that tree. Only lines a sync brought
   are left for the parent to decide. Owner, 2026-11-05: "a".
+  This orders descriptor writes. When a program overwrites another's `pwrite` through a shared mapping, flushes and
+  closes, and the first program closes later, the mapped bytes stand (R1.4). Owner, 2026-11-06: "if the mapped bytes were
+  written second in this shared fs, then i would expect them to win".
 - **R9.1** · owner · A landing locks the files its changes touch, the same way. Source: "freezing only the files
   that a landing touches sounds reasonable" (2026-11-02). Tests: `r9_a_landing_waits_for_the_parents_open_writer`,
   `r9_a_landing_holds_the_files_of_its_losing_changes`
@@ -247,6 +255,10 @@ without seeing the other. MODEL.md's rules table holds the full wording; this pa
   collides: the parent wins and the save loses whole, retained in history. No tree shows bytes nobody wrote, and line
   order does not change (R10.7) (finding 32). Owner, 2026-11-06, accepting that recommendation: "we can take those
   recommendations for now, and i might change my mind later".
+- **R10.9** · approved · Until the parent decides, a sandbox holding an undecided unfinished last line shows that line
+  and hides the parent's later lines that a sync would put after it, the mirror of R10.6. Nothing is lost: the sandbox
+  gets the parent's version once decided, so R3d's decided version waits for that decision. Owner, 2026-11-06, choosing
+  between this, showing the joined bytes and holding the sync: "a" (finding 33).
 - **R10.4** · owner · A line appended after the parent's unfinished last line (no final newline) collides with it,
   and the parent wins. agentfs never adds a newline no program wrote. Owner, 2026-11-05: "collide".
 - **R10.6** · owner · Until the parent decides, a sandbox holding an undecided line does not show the parent's
