@@ -861,6 +861,19 @@ templates' variables, the commit trailers and the telemetry resource:
 |---|---|---|---|
 | `--namespace NAME`, `--pod NAME`, `--pod-uid UID`, `--node NAME`, `--replica NAME` | `AGENTFS_NAMESPACE`, `AGENTFS_POD`, `AGENTFS_POD_UID`, `AGENTFS_NODE`, `AGENTFS_REPLICA` | empty; `--pod-uid` defaults to the replica, and `--replica` (the committer's `{replica}`) to the pod name, else the host name. `mount` also records a given `--pod-uid` in `meta/attached.json` when the mount point is in that pod's own volume, so a different pod's start lands the patch queue over a mark the old pod's stop left (design §12) | `mount`, `run`, `record`, `flush`, `push`, `checkpoint`, `serve-history`, `serve-git` (passed to its hooks and `patch apply` as the variables), `restore`, `revert`, `patch apply`, `fork finish`, `status` (accepted and ignored) |
 
+**Tree view flags** (phase 1 of the proposed design; see [phase 1](target-architecture/phase-1.md)):
+
+| Flag | Environment | Default | Commands |
+|---|---|---|---|
+| `--sandbox DIR` | | no sandbox mount | `trees mount`: also mount an isolated sandbox |
+| `--fork fork/N` | | create a new fork | `trees mount`: reuse this existing sandbox; requires `--sandbox` |
+| `--writer LABEL` | | `main-client` | `trees mount`: trusted main writer label |
+| `--sandbox-writer LABEL` | | `sandbox-client` | `trees mount`: trusted sandbox writer label |
+
+The `trees` commands accept global `--state` and its environment equivalent. They refuse
+`--root` and nonzero `--wait-lock`; they fail immediately when the actor is busy.
+No production settings, rules or remotes are consumed.
+
 **Command flags:**
 
 | Flag | Environment | Default | Commands |

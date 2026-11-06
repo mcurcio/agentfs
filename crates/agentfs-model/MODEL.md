@@ -537,7 +537,7 @@ It found the model NOT SOUND: one P0, seven P1s, six P2s, from eight planted bug
   caught by `r9_a_prefix_sync_holds_back_a_transaction_whole`, not by the random runs.
 - **`syncs_deliver`'s held-back excuse** covers any version taken in a held-back landing, a sibling's included;
   a leak through a sibling's landing is unproven.
-- **What only a real-filesystem prototype can settle** (git-model.md §18): `RELEASE` ordering against a reopen,
+- **What phase 1 must validate on a real filesystem** (git-model.md §18): `RELEASE` ordering against a reopen,
   journal durability under power loss and `ENOSPC`, the object table after a view-host restart, shared `mmap`,
   `O_TMPFILE`, stale offsets through the page cache, costs at scale, reftable under a crash, and how often real
   workloads keep a file open long enough to postpone a landing.

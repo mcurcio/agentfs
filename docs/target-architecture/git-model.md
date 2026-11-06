@@ -11,7 +11,7 @@ owner approved it; it wins on status, this page on what each rule means in git.
 other page has a bug.
 **Revision of 2026-11-04** (answering the pull-request review's points 1, 3, 4 and 5): the journal that records every
 write call before it returns (§3), objects apart from file identities (§7), progress past a long-held file (§6),
-why a custom protocol on git primitives (§14), and the prototype plan (§18). All four are design choices. Since
+why a custom protocol on git primitives (§14), and the phase 1 validation plan (§18). All four are design choices. Since
 the commit that adds MODEL.md rule 12, the journal's crash replay (§3), creates, objects and the atomic save (§7)
 and progress rule P1 (§6) are **modelled** (MODEL.md rules 9, 11 and 12, findings 19 to 22). After the owner's
 decisions of 2026-11-04 (§6), P3 is deleted and P2 is the prefix sync, both modelled.
@@ -161,7 +161,7 @@ the open's records are dropped only once that ref transaction is durable. Then:
   the file that replaced it, the failure §7 exists to prevent (the review planted exactly that bug; the model's
   byte oracle and object table catch it). The model's crash keeps its object table, which this rule rebuilds
   exactly. What a view host can rely on across its own restart (kernel inode numbers, handles after the mount
-  reconnects) is for the prototype (§18).
+  reconnects) is for phase 1 (§18).
 - **Open numbers never repeat** (a choice; P2-e of that review). The `n` of `Agentfs-Open: <n>` comes from a
   per-tree counter kept in the journal, never reset by a restart: a reused number would make a replay skip a new
   open as "already saved". The model's numbers never repeat within a run.
@@ -588,7 +588,7 @@ next sync replaces it with main's line (`syncs_deliver`).
 **Not settled (the owner, 2026-11-05).** "There is no “who” in a transaction — transactions stage file changes"; "A
 transaction is an agentfs concept, not a property of the local/shared fs." (ledger R5.4). This section still describes the
 model, which binds a transaction to a client and adds `Client::Outside`: no rule supports that. The API of the integration
-that creates a transaction is not defined. Transactions stay out of the prototype (§18) until that API is designed.
+that creates a transaction is not defined. Transactions stay out of phase 1 (§18) until that API is designed.
 
 Begin creates `txn/<n>` and `refs/txn-start/<n>` at the fork's head: snapshot isolation. The program's saves
 commit there and it reads its own edits; the fork keeps syncing. One per fork; main's clients have none. A file
@@ -728,9 +728,10 @@ that works, so the second table weighs the other established designs (design cho
 | Jujutsu (git-backed): change ids and the operation log | a change's identity apart from its commit's; every operation logged, concurrent operations reconciled at the next load; conflicts stored in commits | its merge is three-way by content, so findings 1, 6 and 13(b) apply; it stores a conflict for a person rather than deciding it. Its operation log is prior art for the journal (§3) and for recovery; it is not adopted as a dependency |
 
 **What the custom protocol still owes**, none of it validated yet: where the line map is stored (§16 question 1);
-recovery, designed (§12), its crash replay of the journal modelled (MODEL.md rule 12) but none of it run on a real mount; metadata growth, since line maps keep every deleted version and
+recovery, designed (§12), its crash replay of the journal modelled (MODEL.md rule 12) but not validated on a real mount
+(phase 1's recording code is outdated and untested, [phase-1.md](phase-1.md)); metadata growth, since line maps keep every deleted version and
 each losing change adds a collision ref, none with a trim rule; performance, with no
-measurement of the alignment or the referee on large files. The prototype
+measurement of the alignment or the referee on large files. Phase 1
 (§18) measures these before the architecture is settled.
 
 Prior art: a merge queue (GitHub's, Bors) is a single referee taking changes in order; Gerrit's `refs/for/<branch>`
@@ -867,10 +868,13 @@ this model replaced (landing, forks, journal, history) and the earlier mechanism
 resolver chain, per-path merge bases, squash chains, squashed history and its grafts) are in git history only. Nothing left in the set should
 contradict this page; where something does, this page wins.
 
-## 18. Prototype plan (not built)
+## 18. Phase 1: implementation and end-to-end validation
 
-The review of 2026-11-04 recommends a small real-filesystem prototype before the architecture is settled, since
-more seeds against the model cannot test what the model leaves out. Its scope (a design choice):
+The owner clarified on 2026-11-05: "The goal is to build the phase 1 / MVP of the proposed design in the PR so we can run real end-to-end tests and validate the model".
+[Phase 1](phase-1.md) is the first implementation of this design, developed incrementally. Its recording
+milestone was written by an earlier session and is outdated and untested (the owner, 2026-11-05). The remaining work includes the referee, landing/sync and conformance tests on real
+mounts; passing the recording tests alone does not complete phase 1. The 2026-11-04 review identified the
+filesystem-boundary checks below. The full exit criteria are not yet met. Scope:
 
 | In scope | Answers | Exit criterion (pass or fail) |
 |---|---|---|
@@ -883,7 +887,7 @@ more seeds against the model cannot test what the model leaves out. Its scope (a
 
 Out of scope: nested forks, transactions, Rules and view profiles, replication,
 CSI, several view hosts, upgrades. **Exit:** every pass-or-fail row passes on CI's Linux runners (FUSE runs only
-there, AGENTS.md); any failure is a finding that changes this page before code for the domains starts; the
+there, AGENTS.md); any failure is a finding to resolve in the implementation or the model before phase 1 is validated; the
 measurements set the first budgets (no number here is a budget yet).
 
 ## New terms
@@ -916,9 +920,9 @@ an append onto a partial line). Answered 2026-11-04: no P3 (§6, MODEL.md findin
 the prefix sync (§6). Answered 2026-11-05: an agreeing delete is not dropped (MODEL.md
 findings 19, 26, 27), two deletes of one line agree with no collision (ledger rule R10.3, MODEL.md finding 28), squashing is dropped (§11), the alarm is gone (§6), and a line after the parent's unfinished last line collides (§7).
 
-Open on 2026-11-05. Each names its context; none blocks the prototype unless noted:
+Open on 2026-11-05. Each names its context; none blocks phase 1 unless noted:
 
-- **Transactions, not in the prototype.** The integration's API (R5.4). A sketch, not a rule: `begin(tree)` returns an id and
+- **Transactions, not in phase 1.** The integration's API (R5.4). A sketch, not a rule: `begin(tree)` returns an id and
   its own staging directory, normal file I/O writes there, `commit(id)` answers `Committed`, `Lost{lines}` or `Empty`, and
   `rollback(id)` drops it. Something must end a transaction whose integration died, so the id needs a holder, for its
   lifetime only. If staging is a separate directory, the owner's reason for deferring ("a client trying to write the
@@ -930,6 +934,6 @@ Open on 2026-11-05. Each names its context; none blocks the prototype unless not
   byte-level saves. The model's `OrphanDropped` stretches R11.3 for a file created in a transaction that lost.
 - **History.** R5.1's "which remote?": the commit's trailers name the tree, the loser and the versions, no remote.
 
-*History: 2026-11-03, from the model at 509a0ab; revised after review (save ordering, trees, recovery, grafts, slots); 2026-11-03, the owner's answers on losers and saves; review: Replication pushes losers, questions 2 and 3; 2026-11-03, the owner's answers on saves and locks; review: appends at close, main's clients' death, transactions with open files, the lock over path calls, the program-level hang; 2026-11-03, after the owner's "Go": close-to-open accepted, line identity, deletes and renames (§7); review: no POSIX call names a line, so a save aligns its bytes once (§6, §7), the atomic-save idiom, untracked files (§3), R9/R13/A8 put to the owner (§16), §17 cut; 2026-11-03, the owner's answer to question 3: a save or transaction lands whole or loses whole, only winning saves are squashed (§7, §9, §11, §15); 2026-11-04, answering the pull-request review: the journal (§3), progress (§6), objects (§7), why a custom protocol (§14), the prototype plan (§18), proof claims narrowed to the modelled executions; 2026-11-04, byte calls modelled (§6, §7), the notes ref built (§4, §8), Replication due on every move of main (§4); 2026-11-04, the adversarial review at `ee29551`: finding 24 (P3
+*History: 2026-11-03, from the model at 509a0ab; revised after review (save ordering, trees, recovery, grafts, slots); 2026-11-03, the owner's answers on losers and saves; review: Replication pushes losers, questions 2 and 3; 2026-11-03, the owner's answers on saves and locks; review: appends at close, main's clients' death, transactions with open files, the lock over path calls, the program-level hang; 2026-11-03, after the owner's "Go": close-to-open accepted, line identity, deletes and renames (§7); review: no POSIX call names a line, so a save aligns its bytes once (§6, §7), the atomic-save idiom, untracked files (§3), R9/R13/A8 put to the owner (§16), §17 cut; 2026-11-03, the owner's answer to question 3: a save or transaction lands whole or loses whole, only winning saves are squashed (§7, §9, §11, §15); 2026-11-04, answering the pull-request review: the journal (§3), progress (§6), objects (§7), why a custom protocol (§14), the phase 1 validation plan (§18), proof claims narrowed to the modelled executions; 2026-11-04, byte calls modelled (§6, §7), the notes ref built (§4, §8), Replication due on every move of main (§4); 2026-11-04, the adversarial review at `ee29551`: finding 24 (P3
 deadlocks cooperating programs, §6), squash runs cut at open files (§6), the object table and open numbers across a
 restart (§3, §12); 2026-11-04, the owner's decisions: no P3, P2 as the prefix sync (§6); findings 11 and 25 fixed in the rules (§7)*

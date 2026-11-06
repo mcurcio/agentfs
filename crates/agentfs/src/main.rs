@@ -70,6 +70,7 @@ mod reference_tests;
 mod serve_git;
 mod serve_history;
 mod start_cmd;
+mod trees_cmd;
 
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -136,6 +137,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Phase 1 of the target design: Git-backed main and sandbox trees.
+    Trees(trees_cmd::Args),
     /// Create a state area, or check an existing one: safe to run at every
     /// start (exit 0 when it already belongs to the volume, 1 when it
     /// belongs to another volume or branch). With --root, also creates the
@@ -444,6 +447,12 @@ fn real_main() -> Result<ExitCode> {
     let cli = Cli::parse();
     let state = StateDir::new(&cli.state);
     match cli.command {
+        Command::Trees(args) => {
+            if cli.root.is_some() || !cli.wait_lock.is_zero() {
+                bail!("trees uses --state only; --root and --wait-lock are not supported");
+            }
+            trees_cmd::run(&cli.state, args)?;
+        }
         Command::Init {
             volume,
             branch,

@@ -176,7 +176,7 @@ without seeing the other. MODEL.md's rules table holds the full wording; this pa
   agentfs knows when it has the runway to commit/land work"; "we absolutely must avoid deadlocking, while also trying
   to minimize starvation". A sync or landing waits for a moment when all its files are closed, tried again at each close (R9.4). Owner,
   2026-11-05, choosing between that and another round of snapshot opens: "Locks, keep snapshots on file". The cost
-  stays: overlapping opens can delay a landing indefinitely. The prototype measures how often; snapshot opens
+  stays: overlapping opens can delay a landing indefinitely. Phase 1 measures how often; snapshot opens
   ([parked design](snapshot-opens.md), R9.11 to R9.15 and R9.17) are the next step if that is a real problem.
 - **R9.11** · parked · Snapshot opens. A sync or landing never waits for a program's open file: it applies at once,
   as one atomic step. Each open keeps the version of the file it opened; at close its save is merged line by line
