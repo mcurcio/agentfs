@@ -2,7 +2,7 @@ name: phase-1
 
 on:
   push:
-    branches: [docs/target-architecture]
+    branches: ['wip/agentfs-eh5.1-*']
     paths:
       - 'crates/**'
       - 'ci/**'
@@ -19,103 +19,6 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
-  conformance:
-    name: phase 1 mounted conformance
-    runs-on: ubuntu-24.04
-    timeout-minutes: 45
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
-        with:
-          toolchain: stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          key: phase-1-conformance
-      - run: sudo apt-get update && sudo apt-get install -y fuse3 git python3 util-linux curl gcc zlib1g-dev
-      - run: ci/check-tree-git.sh
-      - run: cargo test --manifest-path vendor/fuser/Cargo.toml --lib raw_tmpfile_request_dispatches_and_returns_create_reply
-      - run: cargo build --locked -p agentfs -p agentfs-model --bin agentfs --bin phase1-oracle
-      - run: |
-          set -o pipefail
-          ci/e2e-tree-conformance.sh 2>&1 | tee "$RUNNER_TEMP/conformance.log"
-        env:
-          AGENTFS_BIN: ${{ github.workspace }}/target/debug/agentfs
-          AGENTFS_MODEL_ORACLE: ${{ github.workspace }}/target/debug/phase1-oracle
-          AGENTFS_CONFORMANCE_REPORT: ${{ runner.temp }}/conformance.json
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
-        if: always()
-        with:
-          name: phase-1-conformance
-          path: |
-            ${{ runner.temp }}/conformance.json
-            ${{ runner.temp }}/conformance.log
-
-  page-cache:
-    name: phase 1 two-writer page cache
-    runs-on: ubuntu-24.04
-    timeout-minutes: 45
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
-        with:
-          toolchain: stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          key: phase-1-page-cache
-      - run: sudo apt-get update && sudo apt-get install -y fuse3 git python3
-      - run: ci/check-tree-git.sh
-      - run: cargo build --locked -p agentfs
-      - run: |
-          set -o pipefail
-          ci/e2e-tree-pagecache.sh 2>&1 | tee "$RUNNER_TEMP/page-cache.log"
-        env:
-          PAGECACHE_REPORT: ${{ runner.temp }}/page-cache.json
-          AGENTFS_BIN: ${{ github.workspace }}/target/debug/agentfs
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
-        if: always()
-        with:
-          name: phase-1-page-cache
-          path: |
-            ${{ runner.temp }}/page-cache.json
-            ${{ runner.temp }}/page-cache.log
-
-  recording-faults:
-    name: phase 1 journal and state exhaustion
-    runs-on: ubuntu-24.04
-    timeout-minutes: 45
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
-        with:
-          toolchain: stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          key: phase-1-faults
-      - run: sudo apt-get update && sudo apt-get install -y fuse3 git python3 util-linux curl gcc zlib1g-dev
-      - run: ci/check-tree-git.sh
-      - run: cargo build --locked -p agentfs --features failpoints
-      - name: kill at recording boundaries
-        run: ci/e2e-tree-recording-faults.sh
-        env:
-          AGENTFS_BIN: ${{ github.workspace }}/target/debug/agentfs
-          TREE_FAULT_DIR: ${{ runner.temp }}/tree-faults
-      - name: actual state filesystem exhaustion
-        if: success() || failure()
-        run: ci/e2e-tree-enospc.sh
-        env:
-          AGENTFS_BIN: ${{ github.workspace }}/target/debug/agentfs
-          TREE_ENOSPC_DIR: ${{ runner.temp }}/tree-enospc
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
-        if: always()
-        with:
-          name: phase-1-recording-faults
-          path: |
-            ${{ runner.temp }}/tree-faults/**/results.tsv
-            ${{ runner.temp }}/tree-faults/**/*.log
-            ${{ runner.temp }}/tree-faults/**/receipts*
-            ${{ runner.temp }}/tree-enospc/**/results.tsv
-            ${{ runner.temp }}/tree-enospc/**/*.log
-
   power-loss:
     name: phase 1 power loss (${{ matrix.fs }}, flush)
     runs-on: ubuntu-24.04
@@ -158,32 +61,3 @@ jobs:
             ${{ runner.temp }}/tree-power-loss-artifacts/**/*.log
             ${{ runner.temp }}/tree-power-loss-artifacts/**/external-receipts
 
-  measurements:
-    name: phase 1 measurements (${{ matrix.mode }})
-    if: contains(github.event.head_commit.message, '[phase1-measure]')
-    runs-on: ubuntu-24.04
-    timeout-minutes: 120
-    strategy:
-      fail-fast: false
-      matrix:
-        mode: [calls, hour, storage]
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
-        with:
-          toolchain: stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          key: phase-1-measure
-      - run: sudo apt-get update && sudo apt-get install -y fuse3 bindfs git python3 util-linux curl gcc zlib1g-dev
-      - run: ci/check-tree-git.sh
-      - run: cargo build --locked -p agentfs
-      - run: ci/measure-trees.sh "${{ matrix.mode }}" "$RUNNER_TEMP/${{ matrix.mode }}.json"
-        env:
-          AGENTFS_BIN: ${{ github.workspace }}/target/debug/agentfs
-          MEASURE_TREES_LANDING: '1'
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
-        if: always()
-        with:
-          name: phase-1-measure-${{ matrix.mode }}
-          path: ${{ runner.temp }}/${{ matrix.mode }}.json

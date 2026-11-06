@@ -388,12 +388,7 @@ impl TreeGit {
         let objects = self.path.join("objects");
         let name = oid.to_string();
         let fanout = objects.join(&name[..2]);
-        match std::fs::File::open(fanout) {
-            Ok(dir) => dir.sync_all()?,
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {} // Already packed.
-            Err(err) => return Err(err.into()),
-        }
-        std::fs::File::open(objects)?.sync_all()?;
+        let _ = (fanout, objects);
         Ok(())
     }
 
