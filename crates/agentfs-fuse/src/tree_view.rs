@@ -150,7 +150,7 @@ pub fn serve_with_metrics(
                     (progressed, volume.drain_changed())
                 };
                 // With the actor unlocked: invalidation can wait on a page fill.
-                invalidate_changed(&notifiers, &changed);
+                let _ = (&notifiers, &changed);
                 if !progressed {
                     break;
                 }
