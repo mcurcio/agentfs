@@ -621,8 +621,9 @@ pub struct Volume {
     compact_threshold: u64,
     metrics: Metrics,
     waiting_since: BTreeMap<String, Instant>,
-    #[allow(dead_code)] // agentfs-eh5.3 reads it.
     pages: BTreeMap<(String, u64), pages::ObjectPages>,
+    /// Objects takes changed since the view last asked (`drain_changed`).
+    changed: Vec<(String, u64)>,
     _lock: Arc<FileLock>,
 }
 
@@ -762,6 +763,7 @@ impl Volume {
             metrics: Metrics::default(),
             waiting_since: BTreeMap::new(),
             pages: BTreeMap::new(),
+            changed: Vec::new(),
             _lock: lock,
         };
         volume.build_trees()?;
@@ -1044,7 +1046,6 @@ impl Volume {
 
     /// The journal call for a page write: only `pages` calls it (ledger R1.4).
     /// Returns its journal number.
-    #[allow(dead_code)] // agentfs-eh5.3 calls it.
     fn record_page_write(&mut self, tree: &str, object: u64, runs: &[pages::Run]) -> Result<u64> {
         let heads = runs
             .iter()
@@ -1468,7 +1469,7 @@ impl Volume {
 
     fn take_landing(&mut self, tree: &str, reference: &str, incoming: Oid) -> Result<()> {
         let started = Instant::now();
-        self.step(tree, |v, seq| {
+        self.pages_take(tree, |v, seq| {
             v.build_landing(tree, reference, incoming, seq)
         })?;
         let nanos = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
@@ -1589,7 +1590,7 @@ impl Volume {
 
     fn take_sync(&mut self, tree: &str, reference: &str, value: Oid, plan: SyncPlan) -> Result<()> {
         let started = Instant::now();
-        self.step(tree, |v, seq| {
+        self.pages_take(tree, |v, seq| {
             v.build_sync(tree, reference, value, plan, seq)
         })?;
         let nanos = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);

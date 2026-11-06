@@ -71,6 +71,11 @@ jobs:
         env:
           PAGECACHE_REPORT: ${{ runner.temp }}/page-cache.json
           AGENTFS_BIN: ${{ github.workspace }}/target/debug/agentfs
+      - name: view-host restart with handles open
+        if: success() || failure()
+        run: ci/e2e-tree-restart.sh
+        env:
+          AGENTFS_BIN: ${{ github.workspace }}/target/debug/agentfs
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         if: always()
         with:

@@ -41,7 +41,7 @@ correction, not a new landing rule.
 
 | Milestone | Status |
 |---|---|
-| Recording, byte calls and object lifetime | Descriptor, byte and orphan cases pass; multiple shared mappings fail visibility/publication checks |
+| Recording, byte calls and object lifetime | Descriptor, byte and orphan cases pass; shared mappings follow R1.4 and the restart row follows §18 as reworded: read the phase-1 page-cache job |
 | Line-map storage and whole-save parent referee | Connected; R10.8 and R10.9 built; mounted result of findings 32 and 33: read the phase-1 conformance job |
 | Live landing/sync, P1/P2, writer locks, no alarm | Mounted finite progress scenarios pass; quantitative wait measurements are unavailable |
 | Journal kills, state exhaustion and power loss | The journal is the commit point for pointer steps; refs are a copy rebuilt on every open. Each row's evidence is in CI for the commit that claims it |
@@ -58,13 +58,15 @@ cases does not validate the whole phase.
 
 The page-cache probe uses independent opens in one tree. With two writable
 shared mappings and a separate read-only mapping, stores through the writers
-become readable through the observer before either writer closes, while ordinary
-`pread` still returns saved bytes. A first writer's close can also leave saved
-bytes unchanged until the other mapping closes. Those observations led to R1.4:
-native shared pages are allowed, while descriptor privacy remains and Linux's
-bytes must not be lost. The probe still contains the earlier privacy assertions;
-its expectations and the mixed-write implementation need to follow R1.4 when
-work resumes.
+became readable through the observer before either writer closed, while ordinary
+`pread` still returned saved bytes. Those observations led to R1.4: mappings share
+pages as on Linux, read-only descriptors keep saved bytes, and no writer's bytes
+are lost that Linux would keep. The probe now expects that, each value from the
+same calls on a plain Linux file, and `tree_actor::pages` implements it. A store
+the kernel has not written back is in its page alone, so a view host's death loses
+it, which Linux would keep. Mapped files stay revisable (the owner is "still on the
+fence about memory mapped files"): the code is contained in `tree_actor/pages.rs`
+and the read, write and size paths of `tree_view.rs`.
 
 Power-loss recovery is also unresolved. Initial repository files now receive
 explicit file and directory syncs. Git configuration and loose-object directory
@@ -100,8 +102,13 @@ Mountpoints must be empty, separate from each other and outside state. Writer
 labels are trusted labels, not authenticated identities.
 
 The adapter uses zero entry/attribute TTLs and direct I/O. Read-only descriptors
-retain saved bytes; writable descriptors read their own private calls. `fsync`
-flushes the journal; final `RELEASE` publishes. The strict ordering script checks
+retain saved bytes; writable descriptors read their own calls and the file's page
+writes. A read with no lock owner is a page fill and a write with `FUSE_WRITE_CACHE`
+a page write, whatever `O_APPEND` says (R1.4). Every reply gives the arrival-order
+length while the file has a write-open. The queue worker drops the kernel's pages of
+each file a take changed, with the actor unlocked. `fsync` flushes the journal; final
+`RELEASE` publishes. `max_background` is as high as the kernel allows, to keep
+`RELEASE` ahead of a later `OPEN` (git-model §18). The strict ordering script checks
 immediate reopen without publication polling. Its finite passing observations
 are listed above. Linux mapping lifetime and anonymous first-link cases are
 also tested; ordinary writeback cache and passthrough are not negotiated.
@@ -167,6 +174,13 @@ processes. They are not FUSE or power-loss evidence. CI scripts exercise:
   anonymous first link, immediate reopen and process restart.
 - `e2e-tree-conformance.sh`: real calls compared with fixed existing model cases,
   independent byte/line-map checks and progress scenarios.
+- `e2e-tree-pagecache.sh`: writers in one tree in every descriptor and mapping mix,
+  with closes in both orders, three writers, a grown mapping, create then map, an
+  unlinked mapped file's `fstat`, a take refreshing a mapping and `sendfile` while
+  writing; then close-to-open (`trees-close-open.py`), 64 closes over a busy view.
+- `e2e-tree-restart.sh`: a view host killed with handles open. An old handle's writes
+  fail, the file holds what returned before the kill, saved once, and a file replaced
+  before the kill or through the new mount stays unchanged.
 - `e2e-tree-recording-faults.sh`: process kills at every journal, object, commit-point,
   ref-copy and checkout failpoint, and at those only an open passes (the ref rebuild,
   both compaction points, a first init). Every returned write is in the next save, none

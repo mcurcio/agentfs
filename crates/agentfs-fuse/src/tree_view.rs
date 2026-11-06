@@ -1,5 +1,8 @@
 //! Phase 1 flat-file view of the target actor (git-model §3/§7/§18).
 //! Direct I/O and zero TTLs; no passthrough or writeback-cache negotiation.
+//! Shared mappings go through the kernel's page cache all the same, so a read
+//! with no lock owner is a page fill and a write with `FUSE_WRITE_CACHE` a page
+//! write; `agentfs_core::tree_actor`'s `pages` module holds their rules (R1.4).
 
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
@@ -91,7 +94,9 @@ pub fn serve_with_metrics(
     let actor = Arc::new(Mutex::new(volume));
     let signal = Arc::new(ProgressSignal::default());
     let mut sessions = Vec::new();
+    let mut notifiers: Vec<(String, Notifier)> = Vec::new();
     for (binding, at) in bindings.into_iter().zip(points) {
+        let tree = binding.tree.clone();
         let view = View {
             actor: actor.clone(),
             signal: Arc::clone(&signal),
@@ -112,7 +117,9 @@ pub fn serve_with_metrics(
         ];
         config.acl = SessionACL::Owner;
         config.n_threads = Some(1);
-        sessions.push(fuser::spawn_mount(view, at, &config)?);
+        let session = fuser::spawn_mount(view, at, &config)?;
+        notifiers.push((tree, session.notifier()));
+        sessions.push(session);
     }
     let progress_actor = Arc::clone(&actor);
     let progress_signal = Arc::clone(&signal);
@@ -135,11 +142,15 @@ pub fn serve_with_metrics(
                 state.pending = false;
             }
             loop {
-                let progressed = progress_actor
-                    .lock()
-                    .map_err(|_| io::Error::other("tree actor poisoned"))?
-                    .progress()
-                    .map_err(io::Error::other)?;
+                let (progressed, changed) = {
+                    let mut volume = progress_actor
+                        .lock()
+                        .map_err(|_| io::Error::other("tree actor poisoned"))?;
+                    let progressed = volume.progress().map_err(io::Error::other)?;
+                    (progressed, volume.drain_changed())
+                };
+                // With the actor unlocked: invalidation can wait on a page fill.
+                invalidate_changed(&notifiers, &changed);
                 if !progressed {
                     break;
                 }
@@ -195,6 +206,19 @@ pub fn serve_with_metrics(
     progress_result?;
     metrics_result?;
     Ok(())
+}
+
+/// Drops the kernel's pages of files a take changed. A file holds no dirty page
+/// then, because takes wait for write-opens. A failure leaves old pages in
+/// mappings and stops nothing: fills read the new bytes once they go.
+fn invalidate_changed(notifiers: &[(String, Notifier)], changed: &[(String, u64)]) {
+    for (tree, object) in changed {
+        for (_, notifier) in notifiers.iter().filter(|(name, _)| name == tree) {
+            if let Err(e) = notifier.inval_inode(INodeNo(object + 2), 0, 0) {
+                eprintln!("tree InvalidateFailed: tree={tree} object={object}: {e}");
+            }
+        }
+    }
 }
 
 struct View {
@@ -298,8 +322,16 @@ impl View {
             .ok_or(Errno::ENOENT)
     }
     fn attr(&self, v: &Volume, ino: INodeNo, fh: Option<FileHandle>) -> Result<FileAttr> {
+        // First: the kernel keeps one size per inode, and an unlinked mapped
+        // file's fstat has no path.
+        let open_size = ino
+            .0
+            .checked_sub(2)
+            .and_then(|object| v.inode_size(&self.tree, object));
         let size = if ino.0 == 1 {
             0
+        } else if let Some(size) = open_size {
+            size as usize
         } else if let Some(fh) = fh {
             let handles = self.handles()?;
             match handles.entries.get(&fh.0).ok_or(Errno::EBADF)? {
@@ -401,6 +433,12 @@ impl View {
 
 impl Filesystem for View {
     fn init(&mut self, _req: &Request, config: &mut KernelConfig) -> io::Result<()> {
+        // Keeps RELEASE ahead of a later OPEN, short of thousands outstanding: the
+        // kernel queues background requests past this and an OPEN skips that
+        // queue. It clamps the value to `max_user_bgreq`.
+        config
+            .set_max_background(u16::MAX)
+            .map_err(|nearest| io::Error::other(format!("max_background: {nearest}")))?;
         for flag in [
             InitFlags::FUSE_ATOMIC_O_TRUNC,
             InitFlags::FUSE_DIRECT_IO_ALLOW_MMAP,
@@ -538,16 +576,26 @@ impl Filesystem for View {
     fn read(
         &self,
         _req: &Request,
-        _ino: INodeNo,
+        ino: INodeNo,
         fh: FileHandle,
         offset: u64,
         size: u32,
         _flags: OpenFlags,
-        _owner: Option<LockOwner>,
+        owner: Option<LockOwner>,
         reply: ReplyData,
     ) {
         let result = (|| {
-            let v = self.actor()?;
+            let mut v = self.actor()?;
+            // A descriptor read on direct I/O always names a lock owner; a page
+            // fill never does. Through `v.volume`: a fill changes nothing a take
+            // waits for, so it does not wake the queue worker.
+            if owner.is_none() {
+                let object = ino.0.checked_sub(2).ok_or(Errno::EBADF)?;
+                match v.volume.page_fill(&self.tree, object, offset, size) {
+                    Err(Error::NotFound) => {}
+                    filled => return filled.map_err(errno),
+                }
+            }
             let handles = self.handles()?;
             let bytes = match handles.entries.get(&fh.0).ok_or(Errno::EBADF)? {
                 Open::Read(bytes) => bytes.as_slice(),
@@ -575,7 +623,7 @@ impl Filesystem for View {
         fh: FileHandle,
         offset: u64,
         data: &[u8],
-        _write_flags: WriteFlags,
+        write_flags: WriteFlags,
         _flags: OpenFlags,
         _owner: Option<LockOwner>,
         reply: ReplyWrite,
@@ -584,6 +632,11 @@ impl Filesystem for View {
             let mut v = self.actor()?;
             let handles = self.handles()?;
             match handles.entries.get(&fh.0).ok_or(Errno::EBADF)? {
+                Open::Write { handle, .. }
+                    if write_flags.contains(WriteFlags::FUSE_WRITE_CACHE) =>
+                {
+                    v.page_writeback(*handle, offset, data).map_err(errno)
+                }
                 Open::Write { handle, append, .. } => {
                     v.write(*handle, offset, data, *append).map_err(errno)
                 }

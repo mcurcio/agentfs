@@ -58,6 +58,10 @@ without seeing the other. MODEL.md's rules table holds the full wording; this pa
   reads flushed mapped stores, and `sendfile`-family calls read what a mapping reads, which can include unsaved bytes.
   Owner, 2026-11-06, choosing option A of three: "A is fine. but im still on the fence about memory mapped files, because
   they seem to be causing issues. Go with (A) for now". Revisable: option C was to refuse shared mappings.
+  Tests: `a_fill_reads_every_opens_calls`, `a_stale_page_does_not_revert_a_descriptor_write`,
+  `the_first_close_saves_what_the_kernel_flushed`, `a_later_close_keeps_newer_mapped_stores`,
+  `a_later_close_does_not_revert_a_third_save`, `a_recovery_close_keeps_a_store_whose_handle_closed`,
+  `a_recovery_close_does_not_reapply_a_saved_store`, `two_writers_in_every_combination`
 - **R2** · owner · No clocks. Each tree takes its queue in order, and which of two lines is newer is read from
   git's ancestry, never from a date. Source: his premise, asking how last-writer-wins works with no shared
   clock (2026-11-02). Tests: `r2_one_queue_fixes_the_landing_order`, `r2_no_clock_commit_dates_decide_nothing`
