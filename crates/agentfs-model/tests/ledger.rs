@@ -226,7 +226,13 @@ fn cited_rules_exist() {
 #[test]
 fn named_tests_exist() {
     let mut fns = Vec::new();
-    for p in files(&crate_dir().join("tests")) {
+    // A rule about the filesystem boundary (R1.4) is shown by the library's
+    // tests: the model has no mappings.
+    let core_tests = repo_dir().join("crates/agentfs-core/tests");
+    for p in [crate_dir().join("tests"), core_tests]
+        .iter()
+        .flat_map(|d| files(d))
+    {
         if p.extension().is_some_and(|e| e == "rs") {
             for line in read(&p).lines() {
                 if let Some((_, rest)) = line.split_once("fn ") {

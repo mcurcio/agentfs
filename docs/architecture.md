@@ -33,6 +33,7 @@ missing from these tables or a row names a module that no longer exists;
 | `volume.rs` | Opens a state area: crash recovery, then the [`Recorder`](#the-synchronous-step) used at every boundary and the `Committer` that turns records into commits |
 | `record.rs` | What the journal stores: one record per change boundary, absolute state, never deltas (§3.1, §3.3) |
 | `tree_actor/mod.rs` | Phase 1 actor: recorded byte calls, object recovery, line-map storage, durable queue takes, main and one sandbox; separate from the production recorder |
+| `tree_actor/pages.rs` | The kernel's one page cache per file: page fills, page writes and the size replies for shared mappings (ledger R1.4) |
 | `tree_actor/queue.rs` | P1 eligibility and P2 prefix selection for writer-locked queue entries |
 | `tree_actor/referee.rs` | Whole-save parent referee for line and namespace versions, with causal collision records |
 | `tree_actor/sync.rs` | Sync snapshots preserving undecided child versions without deciding collisions |

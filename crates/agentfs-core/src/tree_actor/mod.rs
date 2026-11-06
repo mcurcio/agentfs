@@ -8,6 +8,7 @@
 //! slower than the target's group commit). Checkouts are disposable caches;
 //! the branches are authoritative. See docs/target-architecture/phase-1.md.
 
+mod pages;
 pub mod queue;
 mod referee;
 mod sync;
@@ -67,6 +68,21 @@ pub enum Error {
     CorruptJournal(usize),
     #[error("actor stopped after a recording/save failure; reopen to recover")]
     Stopped,
+}
+
+impl Error {
+    /// The errno a file call answers with for this error.
+    pub fn errno(&self) -> i32 {
+        match self {
+            Self::NotFound => libc::ENOENT,
+            Self::Exists => libc::EEXIST,
+            Self::Name | Self::Writer => libc::EINVAL,
+            Self::TooLarge => libc::EFBIG,
+            Self::Busy => libc::EBUSY,
+            Self::Io(e) => e.raw_os_error().unwrap_or(libc::EIO),
+            _ => libc::EIO,
+        }
+    }
 }
 
 /// Calls name byte positions, never lines. Append finds EOF at save time.
@@ -138,6 +154,11 @@ enum Event {
     Call {
         handle: u64,
         call: Call,
+    },
+    /// The bytes a page write changed (ledger R1.4; `pages`).
+    PageWrite {
+        handle: u64,
+        runs: Vec<pages::Run>,
     },
     Close {
         handle: u64,
@@ -225,7 +246,8 @@ struct Handle {
     writer: String,
     object: u64,
     bytes: Vec<u8>,
-    calls: Vec<Call>,
+    /// This open's calls, each with its journal number.
+    calls: Vec<(u64, Call)>,
 }
 
 struct SyncPlan {
@@ -289,6 +311,8 @@ pub struct Volume {
     stopped: bool,
     metrics: Metrics,
     waiting_since: BTreeMap<String, Instant>,
+    #[allow(dead_code)] // agentfs-eh5.3 reads it.
+    pages: BTreeMap<(String, u64), pages::ObjectPages>,
     _lock: Arc<FileLock>,
 }
 
@@ -357,6 +381,7 @@ impl Volume {
             stopped: false,
             metrics: Metrics::default(),
             waiting_since: BTreeMap::new(),
+            pages: BTreeMap::new(),
             _lock: lock,
         };
         let committed = volume.watermark(head)?;
@@ -540,7 +565,7 @@ impl Volume {
         let mut bytes = h.bytes.clone();
         call.apply(&mut bytes)?;
         let mut replay = self.tree(&h.tree)?.bytes[&h.object].clone();
-        for c in h.calls.iter().chain(std::iter::once(&call)) {
+        for c in h.calls.iter().map(|(_, c)| c).chain(std::iter::once(&call)) {
             c.apply(&mut replay)?;
         }
         self.record(Event::Call { handle, call })?;
@@ -720,7 +745,14 @@ impl Volume {
                         && record.seq <= *watermarks.get(&h.tree).unwrap_or(&0)
                     {
                         call.apply(&mut h.bytes)?;
-                        h.calls.push(call.clone());
+                        h.calls.push((record.seq, call.clone()));
+                    }
+                }
+                Event::PageWrite { handle, runs } => {
+                    if let Some(h) = self.handles.get(handle)
+                        && record.seq <= *watermarks.get(&h.tree).unwrap_or(&0)
+                    {
+                        self.pages_note_writeback(record.seq, *handle, runs)?;
                     }
                 }
                 Event::Close { handle } => {
@@ -746,7 +778,9 @@ impl Volume {
                 | Event::FirstLink { tree, .. }
                 | Event::Rename { tree, .. }
                 | Event::Unlink { tree, .. } => tree,
-                Event::Call { handle, .. } | Event::Close { handle } => handle_trees
+                Event::Call { handle, .. }
+                | Event::PageWrite { handle, .. }
+                | Event::Close { handle } => handle_trees
                     .get(handle)
                     .ok_or(Error::CorruptJournal(record.seq as usize))?,
             };
@@ -1455,10 +1489,17 @@ impl Volume {
             Event::Call { handle, call } => {
                 let h = self.handles.get_mut(&handle).ok_or(Error::NotFound)?;
                 call.apply(&mut h.bytes)?;
-                h.calls.push(call);
+                h.calls.push((seq, call.clone()));
+                let (tree, object) = (h.tree.clone(), h.object);
+                self.pages_note_call(&tree, object, &call)?;
+            }
+            Event::PageWrite { handle, runs } => {
+                self.pages_note_writeback(seq, handle, &runs)?;
             }
             Event::Close { handle } => {
                 let h = self.handles.remove(&handle).ok_or(Error::NotFound)?;
+                let calls = self.pages_calls_for_close(&h);
+                let (saved_tree, saved_object) = (h.tree.clone(), h.object);
                 let tree = self.trees.get_mut(&h.tree).ok_or(Error::NotFound)?;
                 if tree.anonymous.remove(&h.object) {
                     tree.bytes.remove(&h.object);
@@ -1467,9 +1508,9 @@ impl Volume {
                     tree.fresh_names.remove(&h.object);
                 } else if !tree.names.values().any(|o| *o == h.object) {
                     outcome = Saved::OrphanDropped;
-                } else if !h.calls.is_empty() {
+                } else if !calls.is_empty() {
                     let mut bytes = tree.bytes[&h.object].clone();
-                    for call in &h.calls {
+                    for call in &calls {
                         call.apply(&mut bytes)?;
                     }
                     let mut index = 0_u64;
@@ -1477,9 +1518,8 @@ impl Volume {
                         index += 1;
                         format!("{seq}:{index}")
                     };
-                    let lines = if h.calls.iter().all(|call| matches!(call, Call::Append(_))) {
-                        let suffix: Vec<u8> = h
-                            .calls
+                    let lines = if calls.iter().all(|call| matches!(call, Call::Append(_))) {
+                        let suffix: Vec<u8> = calls
                             .iter()
                             .flat_map(|call| match call {
                                 Call::Append(bytes) => bytes.as_slice(),
@@ -1496,6 +1536,7 @@ impl Volume {
                     open_trailer = Some(handle);
                     save = Some((h.tree, h.writer, "Direct"));
                 }
+                self.pages_saved(&saved_tree, saved_object)?;
             }
             Event::Rename {
                 tree,

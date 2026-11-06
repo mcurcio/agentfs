@@ -296,7 +296,16 @@ pub fn histogram(old: &[u8], new: &[u8]) -> Result<Vec<Hunk>, Error> {
     let b = dir.0.join("new");
     std::fs::write(&a, old)?;
     std::fs::write(&b, new)?;
+    // Neither the caller's directory nor its git configuration may reach the
+    // alignment: a directory inside a broken worktree stops `git diff`, and a
+    // diff setting would change which lines keep their identity.
     let out = Command::new("git")
+        .env_clear()
+        .env("PATH", crate::git_cli::GIT_PATH)
+        .env("LC_ALL", "C")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .current_dir(&dir.0)
         .args([
             "diff",
             "--no-index",

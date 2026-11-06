@@ -271,15 +271,7 @@ enum Open {
 }
 
 fn errno(error: Error) -> Errno {
-    match error {
-        Error::NotFound => Errno::ENOENT,
-        Error::Exists => Errno::EEXIST,
-        Error::Name | Error::Writer => Errno::EINVAL,
-        Error::TooLarge => Errno::EFBIG,
-        Error::Busy => Errno::EBUSY,
-        Error::Io(e) => Errno::from_i32(e.raw_os_error().unwrap_or(libc::EIO)),
-        _ => Errno::EIO,
-    }
+    Errno::from_i32(error.errno())
 }
 
 impl View {
