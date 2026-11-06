@@ -48,6 +48,11 @@ without seeing the other. MODEL.md's rules table holds the full wording; this pa
   it" (by R3c.2).
 - **R1.3** · approved · A program reads its own unsaved writes back through its own open file, as on Linux.
   Approved by the owner, 2026-11-05 (approval page). 
+- **R1.4** · approved · A shared memory mapping behaves as on Linux, so R1.1 holds for descriptors, not mappings. All
+  mappings of a file in one tree share its pages: another mapping can read unsaved stores, and each close saves what
+  the kernel has flushed, which can include another program's mapped stores. No writer's bytes are lost that Linux would
+  keep. Owner, 2026-11-06, accepting that recommendation with the handoff's evidence: "we can take those recommendations
+  for now, and i might change my mind later".
 - **R2** · owner · No clocks. Each tree takes its queue in order, and which of two lines is newer is read from
   git's ancestry, never from a date. Source: his premise, asking how last-writer-wins works with no shared
   clock (2026-11-02). Tests: `r2_one_queue_fixes_the_landing_order`, `r2_no_clock_commit_dates_decide_nothing`
@@ -236,6 +241,12 @@ without seeing the other. MODEL.md's rules table holds the full wording; this pa
 - **R10.3** · owner · Two deletes of one line agree: both are recorded as ordinary changes of their saves, the
   merge reports no collision, and the line stays deleted. Owner, 2026-11-05: "i want minimal "special cases", so
   if both deletes are recorded and then agree, my hope is that a merge reports no conflicts and life is good".
+  This holds for a file a rename-over named: an agreeing delete of it is not half a rename-over (finding 31). Owner,
+  2026-11-06, accepting that recommendation: "we can take those recommendations for now, and i might change my mind later".
+- **R10.8** · approved · A sandbox save whose unfinished last line would land in front of a line the parent keeps
+  collides: the parent wins and the save loses whole, retained in history. No tree shows bytes nobody wrote, and line
+  order does not change (R10.7) (finding 32). Owner, 2026-11-06, accepting that recommendation: "we can take those
+  recommendations for now, and i might change my mind later".
 - **R10.4** · owner · A line appended after the parent's unfinished last line (no final newline) collides with it,
   and the parent wins. agentfs never adds a newline no program wrote. Owner, 2026-11-05: "collide".
 - **R10.6** · owner · Until the parent decides, a sandbox holding an undecided line does not show the parent's
