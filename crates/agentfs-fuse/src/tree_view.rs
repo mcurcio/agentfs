@@ -437,7 +437,7 @@ impl Filesystem for View {
         // kernel queues background requests past this and an OPEN skips that
         // queue. It clamps the value to `max_user_bgreq`.
         config
-            .set_max_background(u16::MAX)
+            .set_max_background(16)
             .map_err(|nearest| io::Error::other(format!("max_background: {nearest}")))?;
         for flag in [
             InitFlags::FUSE_ATOMIC_O_TRUNC,
