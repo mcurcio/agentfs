@@ -633,7 +633,7 @@ impl Filesystem for View {
             let handles = self.handles()?;
             match handles.entries.get(&fh.0).ok_or(Errno::EBADF)? {
                 Open::Write { handle, .. }
-                    if write_flags.contains(WriteFlags::FUSE_WRITE_CACHE) =>
+                    if write_flags.contains(WriteFlags::FUSE_WRITE_CACHE) && offset == u64::MAX =>
                 {
                     v.page_writeback(*handle, offset, data).map_err(errno)
                 }
