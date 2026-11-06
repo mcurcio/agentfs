@@ -585,6 +585,11 @@ next sync replaces it with main's line (`syncs_deliver`).
 
 ## 9. Transactions: a frozen branch
 
+**Not settled (the owner, 2026-11-05).** "There is no “who” in a transaction — transactions stage file changes"; "A
+transaction is an agentfs concept, not a property of the local/shared fs." (ledger R5.4). This section still describes the
+model, which binds a transaction to a client and adds `Client::Outside`: no rule supports that. The API of the integration
+that creates a transaction is not defined. Transactions stay out of the prototype (§18) until that API is designed.
+
 Begin creates `txn/<n>` and `refs/txn-start/<n>` at the fork's head: snapshot isolation. The program's saves
 commit there and it reads its own edits; the fork keeps syncing. One per fork; main's clients have none. A file
 open before begin keeps writing to the fork (its target is fixed at open), so a long-lived open file blocks no
@@ -594,10 +599,12 @@ commit or rollback with none (`NoTransaction`), after the client ended (`Ended`)
 **Other I/O on its files is deferred** (ledger R5.3; the owner, 2026-11-05: "deferred, obviously. thats what i mean by
 "lock" -- its about ordering the operations so that agentfs has a change to mutate the filesystem without a client
 fighting it"). While a transaction is open, a close (so its truncates and rewrites), an unlink or a rename, in the fork,
-of a file it has saved or has open for writing is accepted, journaled and returns at once; nothing waits on a program.
+of a file with a change added to the transaction (the owner: "The changes that it adds to the transaction."; the model
+also counts files open for writing) is accepted, journaled and returns at once; nothing waits on a program.
 It applies in the order made after the commit or rollback, a client's death included, a save as any later close on the
 head then. The file counts as open until then (§6), so a sync or landing never writes it under a save that has not
-happened, and a crash leaves the call in the journal behind its transaction (§3).
+happened. A crash rolls the transaction back and then applies the call (the owner's pick, 2026-11-05; the model still keeps
+the call behind a surviving transaction).
 
 **Commit** lands the branch in the fork as a child lands in its parent, whole or not at all (rule 3e, the owner):
 the fork's concurrent line (one a sync brought in since begin) wins, and then none of the transaction applies; no
@@ -908,6 +915,20 @@ close-to-open visibility, accepted ("Go", §3). The 2026-11-04 revision (§3 jou
 an append onto a partial line). Answered 2026-11-04: no P3 (§6, MODEL.md finding 24); P2 as
 the prefix sync (§6). Answered 2026-11-05: an agreeing delete is not dropped (MODEL.md
 findings 19, 26, 27), two deletes of one line agree with no collision (ledger rule R10.3, MODEL.md finding 28), squashing is dropped (§11), the alarm is gone (§6), and a line after the parent's unfinished last line collides (§7).
+
+Open on 2026-11-05. Each names its context; none blocks the prototype unless noted:
+
+- **Transactions, not in the prototype.** The integration's API (R5.4). A sketch, not a rule: `begin(tree)` returns an id and
+  its own staging directory, normal file I/O writes there, `commit(id)` answers `Committed`, `Lost{lines}` or `Empty`, and
+  `rollback(id)` drops it. Something must end a transaction whose integration died, so the id needs a holder, for its
+  lifetime only. If staging is a separate directory, the owner's reason for deferring ("a client trying to write the
+  transaction while also writing the the file") no longer applies, and deferring might shrink to the moment of commit. That
+  would reopen R5.3, so it is his decision.
+- **Programs sharing one tree, during a transaction.** R5.3 conflicts with R1: a program that knows nothing of transactions
+  closes a file with a deferred call, reopens it and reads the old bytes.
+- **Sandbox and parent.** MODEL.md findings 31 (seed 309) and 32 (seed 128), which is not about transactions and does touch
+  byte-level saves. The model's `OrphanDropped` stretches R11.3 for a file created in a transaction that lost.
+- **History.** R5.1's "which remote?": the commit's trailers name the tree, the loser and the versions, no remote.
 
 *History: 2026-11-03, from the model at 509a0ab; revised after review (save ordering, trees, recovery, grafts, slots); 2026-11-03, the owner's answers on losers and saves; review: Replication pushes losers, questions 2 and 3; 2026-11-03, the owner's answers on saves and locks; review: appends at close, main's clients' death, transactions with open files, the lock over path calls, the program-level hang; 2026-11-03, after the owner's "Go": close-to-open accepted, line identity, deletes and renames (§7); review: no POSIX call names a line, so a save aligns its bytes once (§6, §7), the atomic-save idiom, untracked files (§3), R9/R13/A8 put to the owner (§16), §17 cut; 2026-11-03, the owner's answer to question 3: a save or transaction lands whole or loses whole, only winning saves are squashed (§7, §9, §11, §15); 2026-11-04, answering the pull-request review: the journal (§3), progress (§6), objects (§7), why a custom protocol (§14), the prototype plan (§18), proof claims narrowed to the modelled executions; 2026-11-04, byte calls modelled (§6, §7), the notes ref built (§4, §8), Replication due on every move of main (§4); 2026-11-04, the adversarial review at `ee29551`: finding 24 (P3
 deadlocks cooperating programs, §6), squash runs cut at open files (§6), the object table and open numbers across a

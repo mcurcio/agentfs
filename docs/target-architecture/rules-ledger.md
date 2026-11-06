@@ -40,6 +40,7 @@ without seeing the other. MODEL.md's rules table holds the full wording; this pa
 - **R1** · owner · A program's close is never refused, and its save is in its own tree at once. No collision
   holds back a sync, a landing or a transaction's commit. Changes flow both ways without anyone asking.
   Source: "I generally like the metaphor of a typical Linux filesystem. I want to try that out." (2026-11-02).
+  Open conflict: a call deferred by R5.3 is not in its tree at once (git-model, Questions for the owner).
   Tests: `r1_writes_never_wait_and_forks_sync_both_ways`
 - **R1.1** · owner · An open file is private until close: other readers see only saved content (close-to-open).
   Source: "Go" (2026-11-03), accepting that recommendation.

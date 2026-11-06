@@ -81,7 +81,7 @@ pub struct Binding {               // what the launcher hands to Views: no capab
     client: ClientId,
     session: SessionId,            // the authority: its caps stay in the history service
     serves: Served,                // Tree(TreeRef), or Snapshot(SnapshotId) for Sees::Snapshot
-    txn: Option<TxnDir>,           // its open transaction, restored at rebind (git-model §9)
+    txn: Option<TxnDir>,           // its open transaction, restored at rebind (git-model §9; not settled, ledger R5.4)
     grant: Attenuated,             // the Grant after both checks: never wider than the LaunchCap
     rules: RuleSetVersion,
 }

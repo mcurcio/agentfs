@@ -374,6 +374,10 @@ An open or rejected finding has a test marked `#[ignore = "coherence finding N: 
    A later non-append save then pairs the wrong records, and saves bytes its calls never left (the oracle reports it),
    finding 15's first symptom. R10.4 and R10.6 say what happens to a line after an unfinished last line; none says what
    happens when the line a parent keeps later lines after becomes unfinished. `finding_32_a_landing_leaves_a_line_unfinished_before_the_parents`.
+33. **Open (2026-11-05): the model does not match the owner's transaction answers.** `Client::Outside` and binding a
+   transaction to a client have no rule behind them (ledger R5.4). `txn_files` also counts files open for writing, and a
+   deferred call stays behind a surviving transaction at a crash; R5.3 says otherwise. Not changed, because the integration's
+   API is undefined (git-model, Questions for the owner). No test records this yet.
 
 ## Costs
 
