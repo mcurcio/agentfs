@@ -478,6 +478,7 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y fuse3
       - run: cargo build --locked -p agentfs
       - run: ci/e2e-trees.sh
+      - run: ci/e2e-trees-ordering.sh
 
   csi-sanity:
     name: e2e (csi-sanity against agentfs-csi)

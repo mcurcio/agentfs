@@ -67,10 +67,10 @@ file. Modes are fixed at 0700 for the root and 0600 for files. The adapter does
 not negotiate passthrough, shared writable mappings or writeback cache.
 
 **Publication ordering remains incomplete.** `FLUSH`/`fsync` syncs the journal;
-`RELEASE` publishes the save. Linux sends `RELEASE` asynchronously, so an immediate
-open after `close(2)` can still see the previous saved bytes. The mounted tests
-wait explicitly for publication. This is a known gap against §18's immediate
-close-to-open exit criterion, not an accepted change to that contract.
+`RELEASE` publishes the save. Linux sends `RELEASE` asynchronously; whether an immediate open after `close(2)`
+always sees the save has not yet been established. The existing mounted tests
+wait explicitly for publication and do not establish that ordering. The strict
+`ci/e2e-trees-ordering.sh` probe checks it without publication polling.
 
 ## Recording library
 
