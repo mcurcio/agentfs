@@ -37,11 +37,11 @@ correction, not a new landing rule.
 
 | Milestone | Status |
 |---|---|
-| Recording, byte calls and object lifetime | Mounted observations above; current integrated revision still needs CI |
-| Line-map storage and whole-save parent referee | Connected; local production tests pass, mounted comparison pending |
-| Live landing/sync, P1/P2, writer locks, no alarm | Connected; local production tests pass, mounted progress and wait measurements pending |
-| Journal kills, state exhaustion and power loss | CI harnesses prepared; no results claimed for the integrated revision |
-| Model conformance and §18 measurements | Fixed-case oracle and measurement harnesses prepared; mounted results pending |
+| Recording, byte calls and object lifetime | Descriptor, byte and orphan cases pass; multiple shared mappings fail visibility/publication checks |
+| Line-map storage and whole-save parent referee | Connected; mounted fixed-case comparisons pass except finding 32 |
+| Live landing/sync, P1/P2, writer locks, no alarm | Mounted finite progress scenarios pass; quantitative wait measurements are unavailable |
+| Journal kills, state exhaustion and power loss | Ten kill boundaries, orphan recovery and full-state write pass; power-loss recovery fails on ext4 and XFS; supplementary full-state rename returns EIO |
+| Model conformance and §18 measurements | Finding 32 blocks validation. Actual hour recorded; calls and 10,000-save jobs reached their two-hour limits without reports |
 
 Known model finding 32 reproduced on the real mount: a losing truncate to `y`,
 followed by an offset write of `n6` before the parent decision was readable,
@@ -62,7 +62,7 @@ is introduced.
 
 Power-loss recovery is also unresolved. Initial repository files now receive
 explicit file and directory syncs. Git configuration and loose-object directory
-syncs are being corrected separately. Source inspection of Git 2.56 identifies
+syncs have also been corrected. Source inspection of Git 2.52 and 2.56 identifies
 an additional storage issue: its reftable writer flushes before appending the
 footer, and table-list publication and obsolete-table cleanup lack the required
 directory ordering. Syncing a completed command cannot by itself protect a
