@@ -53,6 +53,7 @@
   - [The rules ledger](target-architecture/rules-ledger.md)
   - [Snapshot opens (parked)](target-architecture/snapshot-opens.md)
   - [Phase 1: implementation and validation](target-architecture/phase-1.md)
+  - [Phase 1 handoff](target-architecture/phase-1-handoff.md)
   - [The system](target-architecture/system.md)
   - [Rules](target-architecture/domains/rules.md)
   - [Clients](target-architecture/domains/clients.md)

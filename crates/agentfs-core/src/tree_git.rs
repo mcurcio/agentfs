@@ -544,11 +544,21 @@ mod tests {
             .unwrap();
         let mut command = Command::new("git");
         command
+            .env_clear()
+            .env("PATH", crate::git_cli::GIT_PATH)
+            .env("LC_ALL", "C")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_TERMINAL_PROMPT", "0")
             .args(["upload-pack", "--stateless-rpc"])
             .arg(root.join("repo.git"))
-            .stdin(Stdio::piped())
+            // The test driver retains the write end even after this helper is
+            // killed, so Git cannot exit on EOF before the death signal.
+            .stdin(Stdio::inherit())
             .stdout(Stdio::null())
-            .stderr(Stdio::null());
+            .stderr(Stdio::from(
+                std::fs::File::create(root.join("git.stderr")).unwrap(),
+            ));
         let signal = if std::env::var_os("AGENTFS_TREE_LEASE_STOP").is_some() {
             libc::SIGSTOP
         } else {
@@ -556,9 +566,8 @@ mod tests {
         };
         attach_lease_signal(&mut command, &lease, signal);
         let mut child = command.spawn().unwrap();
-        std::fs::write(root.join("pid"), child.id().to_string()).unwrap();
-        // Keep stdin and the lock open while Git waits for a request.
-        let _stdin = child.stdin.take().unwrap();
+        std::fs::write(root.join("pid.tmp"), child.id().to_string()).unwrap();
+        std::fs::rename(root.join("pid.tmp"), root.join("pid")).unwrap();
         child.wait().unwrap();
     }
 
@@ -573,24 +582,63 @@ mod tests {
                 "--nocapture",
             ])
             .env("AGENTFS_TREE_LEASE_TEST", temp.path())
+            .env_remove("AGENTFS_TREE_LEASE_STOP")
+            .stdin(Stdio::piped())
             .stdout(Stdio::null())
-            .stderr(Stdio::null());
+            .stderr(Stdio::from(
+                std::fs::File::create(temp.path().join("helper.stderr")).unwrap(),
+            ));
         if stop {
             command.env("AGENTFS_TREE_LEASE_STOP", "1");
         }
         let mut parent = command.spawn().unwrap();
+        let keep_stdin = parent.stdin.take().unwrap();
+        let diagnostic = || {
+            format!(
+                "helper stderr: {}; git stderr: {}",
+                std::fs::read_to_string(temp.path().join("helper.stderr")).unwrap_or_default(),
+                std::fs::read_to_string(temp.path().join("git.stderr")).unwrap_or_default(),
+            )
+        };
         let pidfile = temp.path().join("pid");
         let deadline = Instant::now() + Duration::from_secs(10);
         while !pidfile.exists() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
         }
-        let pid: i32 = std::fs::read_to_string(pidfile).unwrap().parse().unwrap();
+        let pid: i32 = std::fs::read_to_string(pidfile)
+            .unwrap_or_else(|err| panic!("helper did not publish Git pid: {err}; {}", diagnostic()))
+            .parse()
+            .unwrap();
+        // Wait until Git has entered its blocking read; merely spawning it
+        // does not prove it survived startup or is still attached to stdin.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let status = std::fs::read_to_string(format!("/proc/{pid}/status"))
+                .unwrap_or_else(|err| panic!("Git exited before ready: {err}; {}", diagnostic()));
+            if status.lines().any(|line| line.starts_with("State:\tS")) {
+                break;
+            }
+            assert!(
+                !status.lines().any(|line| line.starts_with("State:\tZ")),
+                "Git exited before ready; {}",
+                diagnostic()
+            );
+            assert!(
+                Instant::now() < deadline,
+                "Git did not become ready; {}",
+                diagnostic()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
         parent.kill().unwrap();
         parent.wait().unwrap();
         if stop {
             let deadline = Instant::now() + Duration::from_secs(10);
             loop {
-                let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
+                let status =
+                    std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap_or_else(|err| {
+                        panic!("Git exited before lease check: {err}; {}", diagnostic())
+                    });
                 if status.lines().any(|line| line.starts_with("State:\tT")) {
                     break;
                 }
@@ -621,6 +669,7 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(10));
         }
+        drop(keep_stdin);
         // A zombie has exited even if the system has not yet reaped it.
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {

@@ -55,8 +55,10 @@ def wait_ref(ref, name, data):
 
 
 def direct_commit(ref, name, data):
-    for commit in git("rev-list", "--first-parent", ref).decode().splitlines():
-        if "Agentfs-Cause: Direct" not in git("show", "-s", "--format=%B", commit).decode():
+    tree = ref.removeprefix("refs/heads/")
+    for commit in git("rev-list", "--topo-order", ref).decode().splitlines():
+        message = git("show", "-s", "--format=%B", commit).decode().splitlines()
+        if "Agentfs-Cause: Direct" not in message or f"Agentfs-Tree: {tree}" not in message:
             continue
         try:
             if bytes_at(commit, name) == data:

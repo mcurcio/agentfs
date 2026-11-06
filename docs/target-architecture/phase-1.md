@@ -6,6 +6,8 @@ can run real end-to-end tests and validate the model".
 
 **Phase 1 is not validated.** [git-model §18](git-model.md#18-phase-1-implementation-and-end-to-end-validation)
 defines the exit tests. The [rules ledger](rules-ledger.md) governs outcomes.
+Implementation is paused; the [handoff](phase-1-handoff.md) records the exit-test
+snapshot, three blocking areas, measured hour and remaining work.
 The original recording commits (`43dad43`, `22b91ab`, `62457b8`) were outdated
 and untested against that ledger. They have since been audited and repaired;
 their original passing tests are not conformance evidence.
