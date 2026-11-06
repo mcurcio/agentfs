@@ -300,4 +300,4 @@ without seeing the other. MODEL.md's rules table holds the full wording; this pa
 
 - **R12** · approved · Every write call is in its tree's journal before it returns. After a crash, each open
   file is saved from the journal as its close would have saved it, exactly once, before any tree is served again.
-  Approved by the owner, 2026-11-05 (approval page). Tests: `r12_a_crash_saves_every_open_from_the_journal`, `r12_a_crash_during_a_close_saves_the_open_once`; on the real journal (`crates/agentfs-core/tests/tree_actor.rs`): `a_step_killed_before_its_record_saves_at_restart`, `a_step_killed_after_its_record_is_not_saved_again`, `a_failed_save_keeps_serving_and_saves_at_the_next_step`, `compaction_keeps_the_fold`
+  Approved by the owner, 2026-11-05 (approval page). Tests: `r12_a_crash_saves_every_open_from_the_journal`, `r12_a_crash_during_a_close_saves_the_open_once`, and on the real journal `a_step_killed_before_its_record_saves_at_restart`, `a_step_killed_after_its_record_is_not_saved_again`, `a_failed_save_keeps_serving_and_saves_at_the_next_step`
