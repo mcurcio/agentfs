@@ -437,7 +437,7 @@ impl Filesystem for View {
         // kernel queues background requests past this and an OPEN skips that
         // queue. It clamps the value to `max_user_bgreq`.
         config
-            .set_max_background(u16::MAX)
+            .set_max_background(16)
             .map_err(|nearest| io::Error::other(format!("max_background: {nearest}")))?;
         for flag in [
             InitFlags::FUSE_ATOMIC_O_TRUNC,
@@ -452,6 +452,7 @@ impl Filesystem for View {
         Ok(())
     }
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
+        eprintln!("REQ LOOKUP {} {:?}", name.to_string_lossy(), std::time::SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default());
         let result = (|| {
             if parent.0 != 1 {
                 return Err(Errno::ENOTDIR);
@@ -478,6 +479,7 @@ impl Filesystem for View {
         }
     }
     fn open(&self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
+        eprintln!("REQ OPEN {} {:?}", ino.0, std::time::SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default());
         let result = (|| {
             let mut v = self.actor()?;
             let path = self.path(&v, ino)?;
@@ -733,6 +735,7 @@ impl Filesystem for View {
         _flush: bool,
         reply: ReplyEmpty,
     ) {
+        eprintln!("REQ RELEASE {} {:?}", fh.0, std::time::SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default());
         match self.finish(fh) {
             Ok(()) => reply.ok(),
             Err(e) => {
