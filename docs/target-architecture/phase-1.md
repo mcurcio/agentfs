@@ -24,6 +24,7 @@ transaction behavior or snapshot-open mechanism is introduced.
 | `798e6fa` | Anonymous open and first link passed after repairing handle-free inode attributes; shared mappings and the other tree-view checks also passed in [CI](https://github.com/mcurcio/agentfs/actions/runs/42176555005/job/127756236285) |
 | `e8d12a6` | Real mounts passed the fixed two-way flow, whole-save loss, neighboring edits, inserts, unfinished-tail, edited-place, P1/P2 and byte-call cases. The strict finding-32 case failed in [CI logs](https://github.com/mcurcio/agentfs/actions/runs/42220263763/job/127900249921); the initial log pipeline masked its exit status and is being corrected. Fault and power-loss jobs also failed and require diagnosis |
 | `4d90329` | Finding 32 correctly fails CI. The [two-writer page-cache job](https://github.com/mcurcio/agentfs/actions/runs/42221484166/job/127904349124) passes four of eight descriptor/mapping cases; shared mappings expose unsaved bytes to another mapping, and closing the first mapped writer may leave its save unpublished |
+| `2a33e90` | Journal-kill and allocation-forcing `ENOSPC` write checks pass in the [fault log](https://github.com/mcurcio/agentfs/actions/runs/42223004088/job/127909394344); the supplementary full-state rename returns `EIO` rather than its test's expected `ENOSPC`. Power replay still fails: [ext4](https://github.com/mcurcio/agentfs/actions/runs/42223004088/job/127909394603) reports a corrupt reftable; [XFS](https://github.com/mcurcio/agentfs/actions/runs/42223004088/job/127909394686) cannot recover the reference store |
 
 Linux can request `GETATTR` without a handle during an anonymous inode's
 permission check. Searching only named paths caused the failure. The repair
@@ -56,6 +57,16 @@ bytes unchanged until the other mapping closes. These are new filesystem
 observations against R1.1 and close publication, not a permission to exempt
 mappings. The failing checks remain enabled; no cache or save-policy workaround
 is introduced.
+
+Power-loss recovery is also unresolved. Initial repository files now receive
+explicit file and directory syncs. Git configuration and loose-object directory
+syncs are being corrected separately. Source inspection of Git 2.56 identifies
+an additional storage issue: its reftable writer flushes before appending the
+footer, and table-list publication and obsolete-table cleanup lack the required
+directory ordering. Syncing a completed command cannot by itself protect a
+previously acknowledged state from a cut during another command. The current
+Git backend has not established §18's crash guarantee; its failing replay checks
+remain enabled. Choosing a storage path that meets R12 requires further work.
 
 ## Run the tree views
 

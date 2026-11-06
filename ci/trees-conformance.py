@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import random
+import re
 import subprocess
 import sys
 import tempfile
@@ -76,6 +77,7 @@ def save(root, ref, name, data):
     # RELEASE is asynchronous. Once history proves the save, check its view
     # directly rather than polling close-to-open visibility.
     assert (root / name).read_bytes() == data
+    assert_aligned(direct_commit(ref, name, data), name)
 
 
 def converged(name, expected):
@@ -108,6 +110,7 @@ def concurrent(name, base, parent, child, result, losing=False):
     # Compare lineage with the model using commits read from the actual Git
     # graph. The parent save may already have been followed by a take.
     parent_commit = direct_commit("main", name, parent)
+    assert_aligned(parent_commit, name)
     for commit, key in ((parent_commit, "parent_reachable"), (child_commit, "child_reachable")):
         status = subprocess.run(["git", "--git-dir=" + str(REPO), "merge-base",
                                  "--is-ancestor", commit, "main"]).returncode
@@ -122,21 +125,101 @@ def concurrent(name, base, parent, child, result, losing=False):
 
 
 
+def split_lines(image):
+    parts = image.split(b"\n")
+    return [part + b"\n" for part in parts[:-1]] + ([parts[-1]] if parts[-1] else [])
+
+
+def histogram_hunks(old, new):
+    # no-index compares only immutable images, not the implementation's maps.
+    # --text forces Git to diff embedded NULs as bytes; LC_ALL fixes the header.
+    with tempfile.TemporaryDirectory() as directory:
+        a, b = Path(directory) / "old", Path(directory) / "new"
+        a.write_bytes(old)
+        b.write_bytes(new)
+        env = dict(os.environ, LC_ALL="C", GIT_CONFIG_NOSYSTEM="1")
+        proc = subprocess.run(["git", "-c", "core.attributesFile=/dev/null", "diff",
+                               "--no-index", "--text", "--histogram", "--unified=0",
+                               "--no-ext-diff", "--", str(a), str(b)],
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+        assert proc.returncode in (0, 1), proc.stderr
+    pattern = re.compile(rb"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+    hunks = []
+    for line in proc.stdout.split(b"\n"):
+        match = pattern.match(line)
+        if match:
+            old_start, old_count, new_start, new_count = match.groups()
+            old_count = int(old_count) if old_count is not None else 1
+            new_count = int(new_count) if new_count is not None else 1
+            old_start = int(old_start) - (old_count != 0)
+            new_start = int(new_start) - (new_count != 0)
+            hunks.append((old_start, old_count, new_start, new_count))
+    assert (old == new) == (not hunks), (old, new, proc.stdout)
+    return hunks
+
+
+def check_histogram(before, after, old_image, new_image):
+    old = [x for x in before["lines"] if x["bytes"] is not None]
+    new = [x for x in after["lines"] if x["bytes"] is not None]
+    old_bytes, new_bytes = split_lines(old_image), split_lines(new_image)
+    assert [bytes(x["bytes"]) for x in old] == old_bytes
+    assert [bytes(x["bytes"]) for x in new] == new_bytes
+    old_index = new_index = 0
+    for start, count, nstart, ncount in histogram_hunks(old_image, new_image):
+        assert start >= old_index and nstart >= new_index
+        # Unchanged runs, including equal edges a hunk encompasses, keep
+        # the exact record. Changed pairs keep identity and advance version.
+        assert start - old_index == nstart - new_index
+        for i in range(start - old_index):
+            assert old[old_index + i] == new[new_index + i]
+        while count and ncount and old_bytes[start] == new_bytes[nstart]:
+            assert old[start] == new[nstart]
+            start += 1; nstart += 1; count -= 1; ncount -= 1
+        while count and ncount and old_bytes[start + count - 1] == new_bytes[nstart + ncount - 1]:
+            assert old[start + count - 1] == new[nstart + ncount - 1]
+            count -= 1; ncount -= 1
+        for i in range(min(count, ncount)):
+            assert old[start + i]["identity"] == new[nstart + i]["identity"]
+            assert after["ancestors"][new[nstart + i]["version"]] == old[start + i]["version"]
+        for i in range(min(count, ncount), count):
+            removed = next(x for x in after["lines"] if x["identity"] == old[start + i]["identity"])
+            assert removed["bytes"] is None
+        for i in range(min(count, ncount), ncount):
+            line = new[nstart + i]
+            assert line["identity"] == line["version"] and after["ancestors"][line["version"]] is None
+        old_index, new_index = start + count, nstart + ncount
+        # Include a trimmed equal suffix in the next unchanged run.
+    assert len(old) - old_index == len(new) - new_index
+    assert old[old_index:] == new[new_index:]
+
+
 def assert_aligned(commit, name):
-    """Read save/parent metadata from Git and check R10's save alignment."""
+    """Read direct save and parent maps from Git; independently diff their images."""
     parent = git("rev-parse", commit + "^1").strip().decode()
-    def read_map(rev):
+    def read_map(rev, creation_allowed=False):
         message = git("show", "-s", "--format=%B", rev).decode().splitlines()
-        assert "Agentfs-Format: envelope-1" in message, (rev, "missing envelope")
-        line_map = json.loads(git("show", f"{rev}:metadata.json"))[name][2]
+        if "Agentfs-Format: envelope-1" not in message:
+            assert creation_allowed
+            probe = subprocess.run(["git", "--git-dir=" + str(REPO), "cat-file", "-e", f"{rev}:{name}"], stderr=subprocess.DEVNULL)
+            assert probe.returncode != 0, (rev, name, "legacy file has no map")
+            return {"lines": [], "ancestors": {}}, b""
+        metadata = json.loads(git("show", f"{rev}:metadata.json"))
+        if name not in metadata:
+            assert creation_allowed
+            probe = subprocess.run(["git", "--git-dir=" + str(REPO), "cat-file", "-e", f"{rev}:files/{name}"], stderr=subprocess.DEVNULL)
+            assert probe.returncode != 0, (rev, name, "file missing metadata")
+            return {"lines": [], "ancestors": {}}, b""
+        line_map = metadata[name][2]
         lines = line_map["lines"]
         ids = [line["identity"] for line in lines]
         versions = [line["version"] for line in lines]
         assert len(ids) == len(set(ids)) and len(versions) == len(set(versions))
-        assert b"".join(bytes(line["bytes"]) for line in lines if line["bytes"] is not None) == bytes_at(rev, name)
+        image = bytes_at(rev, name)
+        assert b"".join(bytes(line["bytes"]) for line in lines if line["bytes"] is not None) == image
         assert all(v in line_map["ancestors"] for v in versions)
-        return line_map
-    before, after = read_map(parent), read_map(commit)
+        return line_map, image
+    before, old_image = read_map(parent, creation_allowed=True)
+    after, new_image = read_map(commit)
     old = {line["identity"]: line for line in before["lines"]}
     new = {line["identity"]: line for line in after["lines"]}
     for identity, line in old.items():
@@ -147,6 +230,7 @@ def assert_aligned(commit, name):
         if identity not in old:
             assert identity == line["version"] and after["ancestors"][line["version"]] is None and line["bytes"] is not None, line
     assert [x["identity"] for x in before["lines"]] == [x["identity"] for x in after["lines"] if x["identity"] in old]
+    check_histogram(before, after, old_image, new_image)
 
 
 def flow():
@@ -223,8 +307,12 @@ def progress_p1():
         subprocess.run([sys.executable, "-c",
                         "import sys; open(sys.argv[1], 'ab').write(b'child\\n')",
                         str(MAIN / "log")], check=True, timeout=TIMEOUT)
+        wait_ref("main", "log", b"base\nchild\n")
+        assert_aligned(direct_commit("main", "log", b"base\nchild\n"), "log")
         subprocess.run(["sh", "-c", 'printf pipeline | cat > "$1"', "sh",
                         str(MAIN / "pipeline")], check=True, timeout=TIMEOUT)
+        wait_ref("main", "pipeline", b"pipeline")
+        assert_aligned(direct_commit("main", "pipeline", b"pipeline"), "pipeline")
     converged("later", b"later\n")
     expected = bytes.fromhex(json.loads(subprocess.check_output([ORACLE, "p1-append"]))["main"])
     converged("log", expected)
@@ -249,6 +337,34 @@ def progress_p2():
 
 
 def byte_calls():
+    # Separate close boundaries make the partial line, append, overlap, hole,
+    # growth and shrink observable as distinct saves against plain Linux.
+    with tempfile.TemporaryFile() as plain:
+        operations = [
+            ("wb", lambda fd: (os.write(fd, b"f"), os.write(fd, b"oo"))),
+            ("ab", lambda fd: (os.write(fd, b"b"), os.write(fd, b"ar"))),
+            ("r+b", lambda fd: (os.pwrite(fd, b"XY", 1), os.pwrite(fd, b"Z", 12))),
+            ("r+b", lambda fd: os.ftruncate(fd, 20)),
+            ("r+b", lambda fd: os.ftruncate(fd, 9)),
+        ]
+        for mode, operation in operations:
+            # O_APPEND is a property of the open file description; duplicate
+            # the plain file through /proc for the same mode and flags.
+            flags = os.O_WRONLY | (os.O_APPEND if mode == "ab" else 0)
+            if mode == "wb":
+                flags |= os.O_TRUNC
+            plain_fd = os.open(f"/proc/self/fd/{plain.fileno()}", flags)
+            try:
+                operation(plain_fd)
+            finally:
+                os.close(plain_fd)
+            with (MAIN / "byte-explicit").open(mode, buffering=0) as mounted:
+                operation(mounted.fileno())
+            expected = os.pread(plain.fileno(), 256, 0)
+            wait_ref("main", "byte-explicit", expected)
+            assert_aligned(direct_commit("main", "byte-explicit", expected), "byte-explicit")
+            converged("byte-explicit", expected)
+
     # A fixed deterministic byte-call workload. The plain Linux file is the
     # independent oracle; no random model seeds are added here.
     seed("bytes", b"foo")
@@ -288,6 +404,7 @@ def finding_32():
             save(MAIN, "main", "finding32", bytes.fromhex(model["parent"]))
             assert os.pwrite(edit.fileno(), b"n6", 0) == 2
         wait_ref(FORK_REF, "finding32", b"n6")
+        assert_aligned(direct_commit(FORK_REF, "finding32", b"n6"), "finding32")
         second = direct_commit(FORK_REF, "finding32", b"n6")
     def queues_empty():
         return not git("for-each-ref", "--format=%(refname)", "refs/queue/main/", "refs/queue/" + sys.argv[4] + "/").strip()

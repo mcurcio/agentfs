@@ -118,9 +118,30 @@ impl TreeGit {
         self.set_config("core.fsyncMethod", "fsync")
     }
 
-    /// Set a repository-local configuration value.
+    /// Set a repository-local configuration value and make changes durable.
     pub fn set_config(&self, key: &str, value: &str) -> Result<()> {
-        self.run(&["config", "--local", key, value], None, true)?;
+        let output = self
+            .command(true)
+            .args(["config", "--local", "--null", "--get-all", key])
+            .output()?;
+        let unchanged = if output.status.success() {
+            let mut desired = value.as_bytes().to_vec();
+            desired.push(0);
+            output.stdout == desired
+        } else if output.status.code() == Some(1) {
+            false
+        } else {
+            return Err(Error::Git(
+                String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+            ));
+        };
+        if !unchanged {
+            self.run(&["config", "--local", key, value], None, true)?;
+        }
+        // Git replaces config by rename. Also sync unchanged values: a prior
+        // process may have failed after the rename but before its sync.
+        std::fs::File::open(self.path.join("config"))?.sync_all()?;
+        std::fs::File::open(&self.path)?.sync_all()?;
         Ok(())
     }
 
@@ -229,11 +250,13 @@ impl TreeGit {
 
     /// Store raw blob bytes.
     pub fn write_blob(&self, bytes: &[u8]) -> Result<Oid> {
-        parse_oid(trim(
+        let oid = parse_oid(trim(
             &self
                 .run(&["hash-object", "-w", "--stdin"], Some(bytes), true)?
                 .stdout,
-        ))
+        ))?;
+        self.sync_object_dirs(oid)?;
+        Ok(oid)
     }
     /// Read raw blob bytes without filters.
     pub fn read_blob(&self, oid: Oid) -> Result<Vec<u8>> {
@@ -288,9 +311,11 @@ impl TreeGit {
             data.extend_from_slice(&e.name);
             data.push(0);
         }
-        parse_oid(trim(
+        let oid = parse_oid(trim(
             &self.run(&["mktree", "-z"], Some(&data), true)?.stdout,
-        ))
+        ))?;
+        self.sync_object_dirs(oid)?;
+        Ok(oid)
     }
     /// Read a commit's tree, parents, and message.
     pub fn read_commit(&self, oid: Oid) -> Result<Commit> {
@@ -343,8 +368,27 @@ impl TreeGit {
                 String::from_utf8_lossy(&out.stderr).trim().into(),
             ));
         }
-        parse_oid(trim(&out.stdout))
+        let oid = parse_oid(trim(&out.stdout))?;
+        self.sync_object_dirs(oid)?;
+        Ok(oid)
     }
+
+    // Git fsyncs loose object data under core.fsync=all. Persist the
+    // fan-out directory entry and any newly created fan-out directory before
+    // a subsequent transaction can publish this object.
+    fn sync_object_dirs(&self, oid: Oid) -> Result<()> {
+        let objects = self.path.join("objects");
+        let name = oid.to_string();
+        let fanout = objects.join(&name[..2]);
+        match std::fs::File::open(fanout) {
+            Ok(dir) => dir.sync_all()?,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {} // Already packed.
+            Err(err) => return Err(err.into()),
+        }
+        std::fs::File::open(objects)?.sync_all()?;
+        Ok(())
+    }
+
     /// Atomically apply all reference changes, checking every old value.
     pub fn ref_transaction(&self, updates: &[RefUpdate]) -> Result<()> {
         let mut data = Vec::new();

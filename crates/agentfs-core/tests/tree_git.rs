@@ -130,3 +130,37 @@ fn migrates_existing_refs_without_losing_history() {
     assert_eq!(migrated.head("refs/heads/existing").unwrap(), Some(commit));
     assert_eq!(migrated.read_commit(commit).unwrap().tree, tree);
 }
+
+#[test]
+fn reopen_keeps_config_and_changed_settings_preserve_reftable_refs() {
+    use std::os::unix::fs::MetadataExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("repo.git");
+    let repo = TreeGit::init(&path).unwrap();
+    let tree = repo.write_tree(&[]).unwrap();
+    let commit = repo.write_commit(tree, &[], "initial\n").unwrap();
+    repo.ref_transaction(&[update("refs/heads/main", Some(commit), None)])
+        .unwrap();
+    let config = path.join("config");
+    let inode = std::fs::metadata(&config).unwrap().ino();
+    drop(repo);
+    let repo = TreeGit::open(&path).unwrap();
+    assert_eq!(
+        std::fs::metadata(&config).unwrap().ino(),
+        inode,
+        "open should not rewrite an unchanged configuration"
+    );
+    repo.set_config("branch.topic.remote", ".").unwrap();
+    let changed = std::fs::metadata(&config).unwrap().ino();
+    repo.set_config("branch.topic.remote", ".").unwrap();
+    assert_eq!(
+        std::fs::metadata(&config).unwrap().ino(),
+        changed,
+        "setting the same value should not rewrite the config"
+    );
+    drop(repo);
+    let reopened = TreeGit::open(&path).unwrap();
+    assert_eq!(reopened.head("refs/heads/main").unwrap(), Some(commit));
+    assert_eq!(std::fs::metadata(&config).unwrap().ino(), changed);
+}
