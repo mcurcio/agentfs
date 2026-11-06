@@ -41,6 +41,7 @@ const FORMAT: &str = "agentfs-trees-2\n";
 const JOURNAL: &str = "calls.wal";
 const INITIALIZING: &str = "initializing";
 type Result<T> = std::result::Result<T, Error>;
+static PATHS: std::sync::Mutex<BTreeMap<u64, String>> = std::sync::Mutex::new(BTreeMap::new());
 type Undecided = (BTreeSet<String>, BTreeSet<(MergeFileIdentity, u64)>);
 
 #[derive(Debug, thiserror::Error)]
@@ -472,14 +473,17 @@ fn fold(frames: &[Frame]) -> Result<Folded> {
                 tree,
                 writer,
                 object,
-                ..
-            } => folded.add_open(OpenRecord {
+                path,
+            } => {
+                PATHS.lock().unwrap().insert(seq, path.clone());
+                folded.add_open(OpenRecord {
                 handle: seq,
                 tree: tree.clone(),
                 writer: writer.clone(),
                 object: *object,
                 anonymous: false,
-            }),
+            })
+            }
             Entry::AnonymousOpen { tree, writer } => folded.add_open(OpenRecord {
                 handle: seq,
                 tree: tree.clone(),
@@ -771,8 +775,16 @@ impl Volume {
         };
         volume.rebuild_owners()?;
         volume.build_trees()?;
-        for (handle, FoldedOpen { open, calls }) in folded.opens {
+        for (handle, FoldedOpen { mut open, calls }) in folded.opens {
             let tree = volume.trees.get_mut(&open.tree).ok_or(Error::Format)?;
+            if let Some(object) = PATHS
+                .lock()
+                .unwrap()
+                .get(&handle)
+                .and_then(|path| tree.names.get(path))
+            {
+                open.object = *object;
+            }
             if open.anonymous {
                 tree.add_anonymous(open.object);
             }
