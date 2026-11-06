@@ -29,7 +29,11 @@ off = open(sys.argv[2]).read().splitlines()
 assert on == off[:len(on)], (on, off)
 if os.environ.get('CHECK_FINAL') == '1': assert on == off, (on, off)
 PY
-"$AGENTFS_BIN" --state "$m/state" trees init >"$m/recovery.log" 2>&1 || fail 'tree recovery'
+if ! "$AGENTFS_BIN" --state "$m/state" trees init >"$m/recovery.log" 2>&1; then
+  install -m 0644 "$m/recovery.log" "$RECOVERY_LOG_DIR/recovery-$point.log" || true
+  cat "$m/recovery.log" >&2 || true
+  fail 'tree recovery'
+fi
 gitdir=$m/state/history.git
 git --git-dir="$gitdir" fsck --full --strict --no-progress > /dev/null 2>&1 || fail 'git fsck'
 while read -r kind n; do

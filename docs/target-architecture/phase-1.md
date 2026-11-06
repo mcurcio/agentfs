@@ -22,7 +22,7 @@ transaction behavior or snapshot-open mechanism is introduced.
 | `f418e03` | Immediate same/cross-process close/reopen, shared descriptor final close, writer/saved-reader bytes, concurrent closes, orphan release events and history checks passed in [CI](https://github.com/mcurcio/agentfs/actions/runs/42159661006/job/127702307383) |
 | `d9d4a81` | Shared mappings passed; anonymous open exposed an adapter `ENOENT` in [CI](https://github.com/mcurcio/agentfs/actions/runs/42161001368/job/127706373615) |
 | `798e6fa` | Anonymous open and first link passed after repairing handle-free inode attributes; shared mappings and the other tree-view checks also passed in [CI](https://github.com/mcurcio/agentfs/actions/runs/42176555005/job/127756236285) |
-| Current queue integration | Local real-repository tests cover two-way flow, whole-save loss with retained history, P1 ordering, P2 prefix sync, namespace changes and replay of an incoming object. Mounted conformance and failure matrices are pending |
+| `e8d12a6` | Real mounts passed the fixed two-way flow, whole-save loss, neighboring edits, inserts, unfinished-tail, edited-place, P1/P2 and byte-call cases. The strict finding-32 case failed in [CI logs](https://github.com/mcurcio/agentfs/actions/runs/42220263763/job/127900249921); the initial log pipeline masked its exit status and is being corrected. Fault and power-loss jobs also failed and require diagnosis |
 
 Linux can request `GETATTR` without a handle during an anonymous inode's
 permission check. Searching only named paths caused the failure. The repair
@@ -39,10 +39,13 @@ correction, not a new landing rule.
 | Journal kills, state exhaustion and power loss | CI harnesses prepared; no results claimed for the integrated revision |
 | Model conformance and §18 measurements | Fixed-case oracle and measurement harnesses prepared; mounted results pending |
 
-Known model finding 32 remains unresolved. Its pure diagnostic is ignored with
-an explanation; the mounted conformance case has no expected-failure waiver.
-A mounted reproduction must be reported before proposing a rule change.
-Passing a subset does not validate the whole phase.
+Known model finding 32 reproduced on the real mount: a losing truncate to `y`,
+followed by an offset write of `n6` before the parent decision was readable,
+left live lines `n6` and `m1.1\n` joined as `n6m1.1\n`. Its pure diagnostic is
+ignored with an explanation; the mounted case has no expected-failure waiver.
+The failure is preserved for the owner to decide. No newline, refusal, reordering
+or collision exception is added to conceal it. Passing the other cases does not
+validate the whole phase.
 
 ## Run the tree views
 

@@ -12,7 +12,7 @@ printf 'status\tpoint\tlast_receipt\n' > "$work/results.tsv"
 pid=
 cleanup() {
   [ -z "$pid" ] || { kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; }
-  for m in "$work/main" "$work/sandbox"; do mountpoint -q "$m" && fusermount3 -uz "$m" || true; done
+  for m in "$work/main" "$work/sandbox"; do fusermount3 -uz "$m" 2>/dev/null || true; done
 }
 trap cleanup EXIT
 start() {

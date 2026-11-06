@@ -12,7 +12,7 @@ mkdir -p "$work/volume" "$work/main" "$work/sandbox"
 pid=
 cleanup() {
   [ -z "$pid" ] || { kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; }
-  for m in "$work/main" "$work/sandbox"; do mountpoint -q "$m" && fusermount3 -uz "$m" || true; done
+  for m in "$work/main" "$work/sandbox"; do fusermount3 -uz "$m" 2>/dev/null || true; done
   mountpoint -q "$work/volume" && sudo umount "$work/volume" || true
 }
 trap cleanup EXIT
@@ -44,11 +44,13 @@ with open(filler, 'wb', buffering=0) as f:
     except OSError as e:
         assert e.errno == errno.ENOSPC, e
 try:
-    os.write(fd, b'unacknowledged')
+    # A short write may fit in the WAL's already allocated final block.
+    # Force allocation on the genuinely full state filesystem.
+    written = os.write(fd, b'x' * (1024 * 1024))
 except OSError as e:
     assert e.errno == errno.ENOSPC, e
 else:
-    raise AssertionError('write succeeded after state filesystem filled')
+    raise AssertionError(f'write returned {written} bytes after state filesystem filled')
 try: os.close(fd)
 except OSError: pass
 PY

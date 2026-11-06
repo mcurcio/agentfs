@@ -10,10 +10,17 @@ base=${POWER_LOSS_DIR:-${TMPDIR:-/tmp}}
 mkdir -p "$base"
 work=$(mktemp -d "$base/agentfs-tree-power-loss.XXXXXX")
 work=$(realpath "$work")
-printf "artifacts: %s\n" "$work"
+artifact_base=${POWER_LOSS_ARTIFACT_DIR:-${base}-artifacts}
+mkdir -p "$artifact_base"
+chmod 755 "$artifact_base"
+artifacts=$(mktemp -d "$artifact_base/agentfs-tree-power-loss.XXXXXX")
+chmod 755 "$artifacts"
+printf "artifacts: %s\n" "$artifacts"
 mkdir -p "$work/mnt" "$work/check" "$work/main" "$work/sandbox"
-results=$work/results.tsv
+results=$artifacts/results.tsv
+export RECOVERY_LOG_DIR=$artifacts
 printf 'status\tfilesystem\tcheckpoint\tdetail\n' > "$results"
+chmod 644 "$results"
 notrun() { printf 'NOTRUN\t%s\tsetup\t%s\n' "$fs" "$*" | tee -a "$results" >&2; exit 1; }
 [ "$(id -u)" = 0 ] || notrun 'requires root on a dedicated CI runner'
 [ -x "$REPLAY_LOG" ] && [ -x "$AGENTFS_BIN" ] || notrun 'missing replay-log or agentfs binary'
@@ -25,12 +32,17 @@ lw=agentfs-tree-lw-$suffix; ck=agentfs-tree-ck-$suffix
 devices=(); pid=
 cleanup() {
   [ -z "$pid" ] || { kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; }
-  for m in "$work/main" "$work/sandbox"; do mountpoint -q "$m" && fusermount3 -uz "$m" || true; done
+  for m in "$work/main" "$work/sandbox"; do fusermount3 -uz "$m" 2>/dev/null || true; done
   mountpoint -q "$work/check" && umount "$work/check" || true
   mountpoint -q "$work/mnt" && umount "$work/mnt" || true
   dmsetup remove "$ck" 2>/dev/null || true
   dmsetup remove "$lw" 2>/dev/null || true
   for dev in "${devices[@]}"; do losetup -d "$dev" 2>/dev/null || true; done
+  # Only publish diagnostic files; disk images and mounted state stay private.
+  for file in "$work"/*.log "$work"/*.tsv "$work"/external-receipts "$work"/marks "$work"/count; do
+    [ ! -f "$file" ] || install -m 0644 "$file" "$artifacts/$(basename "$file")" || true
+  done
+  chmod 644 "$results" 2>/dev/null || true
 }
 trap cleanup EXIT
 loop() { truncate -s "$2" "$1" || notrun "cannot create backing image"; dev=$(losetup -f --show "$1") || notrun "loop device unavailable"; devices+=("$dev"); }
