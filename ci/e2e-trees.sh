@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Recording slice of target git-model §18. Requires Linux FUSE; no sudo.
 set -euo pipefail
+. "$(dirname "$0")/tree-git-test-lib.sh"
 bin=${AGENTFS_BIN:-$PWD/target/debug/agentfs}
 work=$(mktemp -d)
 pid=
@@ -43,8 +44,10 @@ import time
 main, sandbox = map(Path, sys.argv[1:])
 
 def saved(path, expected):
-    # RELEASE is asynchronous. This is an explicit publication barrier for
-    # this first slice, NOT a claim of immediate close-to-open conformance.
+    assert path.read_bytes() == expected, (path, expected)
+
+def delivered(path, expected):
+    # Queue delivery is asynchronous; own-tree close assertions above are immediate.
     until = time.monotonic() + 10
     while time.monotonic() < until:
         try:
@@ -55,8 +58,8 @@ def saved(path, expected):
         time.sleep(0.01)
     raise AssertionError((path, expected, path.read_bytes()))
 
-for root in (main, sandbox):
-    p = root / "a"
+for label, root in (("main-", main), ("sandbox-", sandbox)):
+    p = root / (label + "a")
     with p.open("w+b", buffering=0) as writer:
         writer.write(b"foo")
         os.fsync(writer.fileno())
@@ -71,7 +74,7 @@ for root in (main, sandbox):
 
     # Rename over an open target; old writes must not reach the replacement.
     old = p.open("r+b", buffering=0)
-    tmp = root / "temp"
+    tmp = root / (label + "temp")
     tmp.write_bytes(b"replacement")
     saved(tmp, b"replacement")
     os.replace(tmp, p)
@@ -90,13 +93,13 @@ for root in (main, sandbox):
     # A rename of the open object follows it, even though its bytes save later.
     writer = p.open("ab", buffering=0)
     writer.write(b"-tail")
-    q = root / "renamed"
+    q = root / (label + "renamed")
     p.rename(q)
     writer.close()
     saved(q, b"new-object-tail")
 
     # Byte semantics checked against a plain Linux file, including holes.
-    with tempfile.TemporaryFile() as oracle, (root / "bytes").open("w+b", buffering=0) as f:
+    with tempfile.TemporaryFile() as oracle, (root / (label + "bytes")).open("w+b", buffering=0) as f:
         for fd in (oracle.fileno(), f.fileno()):
             os.pwrite(fd, b"foo", 0)
             os.pwrite(fd, b"bar", 3)
@@ -106,7 +109,7 @@ for root in (main, sandbox):
             os.ftruncate(fd, 13)
         expected = os.pread(oracle.fileno(), 100, 0)
         assert os.pread(f.fileno(), 100, 0) == expected
-    saved(root / "bytes", expected)
+    saved(root / (label + "bytes"), expected)
     assert not (root / ".git").exists()
     assert not (root / "calls.wal").exists()
     try:
@@ -117,9 +120,11 @@ for root in (main, sandbox):
         raise AssertionError("unsupported mkdir succeeded")
 
 (main / "isolation").write_bytes(b"parent")
-(sandbox / "isolation").write_bytes(b"sandbox")
 saved(main / "isolation", b"parent")
+delivered(sandbox / "isolation", b"parent")
+(sandbox / "isolation").write_bytes(b"sandbox")
 saved(sandbox / "isolation", b"sandbox")
+delivered(main / "isolation", b"sandbox")
 PY
 mmap_status=0
 python3 ci/trees-mmap.py "$work/main" "$work/state/history.git" || mmap_status=$?
@@ -155,12 +160,12 @@ fusermount3 -uz "$work/main"
 fusermount3 -uz "$work/sandbox"
 "$bin" --state "$work/state" trees init
 head=$(git --git-dir="$work/state/history.git" rev-parse main)
-test "$(git --git-dir="$work/state/history.git" show main:crash)" = acknowledged-before-kill
+test "$(tree_git_file "$work/state/history.git" main crash)" = acknowledged-before-kill
 "$bin" --state "$work/state" trees init
 test "$(git --git-dir="$work/state/history.git" rev-parse main)" = "$head"
 start
 test "$(cat "$work/main/crash")" = acknowledged-before-kill
-test "$(cat "$work/main/isolation")" = parent
+test "$(cat "$work/main/isolation")" = sandbox
 test "$(cat "$work/sandbox/isolation")" = sandbox
 fusermount3 -u "$work/main"
 fusermount3 -u "$work/sandbox"

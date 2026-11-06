@@ -3,8 +3,8 @@
 import mmap
 import os
 from pathlib import Path
-import subprocess
 import sys
+from tree_git_read import read
 
 root = Path(sys.argv[1])
 repo = sys.argv[2]
@@ -29,6 +29,6 @@ view.close()
 assert path.read_bytes() == new, "last unmap must publish before immediate open"
 assert prior.read() == old, "reader opened before mapping must retain its bytes"
 prior.close()
-recorded = subprocess.check_output(["git", "--git-dir=" + repo, "show", "main:mapped"])
+recorded = read(repo, "main", "mapped")
 assert recorded == new, "history must contain the mapped write"
 print("MAP_SHARED store, msync, saved readers, fd close, final unmap and history: passed", flush=True)

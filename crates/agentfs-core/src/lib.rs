@@ -60,6 +60,7 @@ pub mod stamps;
 pub mod telemetry;
 pub mod tracked;
 pub mod tree_actor;
+pub mod tree_git;
 pub mod tree_reconcile;
 pub mod visibility;
 pub mod volume;

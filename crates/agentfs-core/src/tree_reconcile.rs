@@ -120,6 +120,53 @@ impl LineMap {
         Ok(())
     }
 
+    /// Apply append-only calls without realigning existing lines.
+    pub fn append(&self, suffix: &[u8], mut next_id: impl FnMut() -> Id) -> Result<Self, Error> {
+        let mut result = self.clone();
+        let mut rest = suffix;
+        if let Some(line) = result
+            .lines
+            .iter_mut()
+            .rev()
+            .find(|line| line.bytes.is_some())
+            && line
+                .bytes
+                .as_ref()
+                .is_some_and(|bytes| !bytes.ends_with(b"\n"))
+            && !rest.is_empty()
+        {
+            let end = rest
+                .iter()
+                .position(|b| *b == b'\n')
+                .map_or(rest.len(), |n| n + 1);
+            let id = next_id();
+            if result.ancestors.contains_key(&id) {
+                return Err(Error::DuplicateId(id));
+            }
+            result
+                .ancestors
+                .insert(id.clone(), Some(line.version.clone()));
+            line.version = id;
+            if let Some(bytes) = &mut line.bytes {
+                bytes.extend_from_slice(&rest[..end]);
+            }
+            rest = &rest[end..];
+        }
+        for bytes in split(rest) {
+            let id = next_id();
+            if result.ancestors.contains_key(&id) {
+                return Err(Error::DuplicateId(id));
+            }
+            result.ancestors.insert(id.clone(), None);
+            result.lines.push(Line {
+                identity: id.clone(),
+                version: id,
+                bytes: Some(bytes.to_vec()),
+            });
+        }
+        Ok(result)
+    }
+
     /// Align a save once using Git's histogram diff. `next_id` must issue a
     /// fresh ID each time across the volume. `self` is the same-tree head at
     /// close: R9 holds upstream takes while a writer is open, and R9.16 orders

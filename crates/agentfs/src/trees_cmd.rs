@@ -1,6 +1,6 @@
 //! Target-model composition root (git-model §18).
 use agentfs_core::tree_actor::Volume;
-use agentfs_fuse::tree_view::{Binding, serve};
+use agentfs_fuse::tree_view::{Binding, serve_with_metrics};
 use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
 
@@ -26,6 +26,9 @@ enum Command {
         /// Reuse this sandbox (fork/N); otherwise create one when --sandbox is set.
         #[arg(long, requires = "sandbox")]
         fork: Option<String>,
+        /// Write process-local measurement counters to this private path.
+        #[arg(long)]
+        metrics_output: Option<PathBuf>,
         /// Main's trusted writer label (not an authenticated identity).
         #[arg(long, default_value = "main-client")]
         writer: String,
@@ -46,6 +49,7 @@ pub fn run(state: &Path, args: Args) -> Result<()> {
             fork,
             writer,
             sandbox_writer,
+            metrics_output,
         } => {
             let mut bindings = vec![Binding {
                 tree: "main".into(),
@@ -69,7 +73,8 @@ pub fn run(state: &Path, args: Args) -> Result<()> {
                     mountpoint,
                 });
             }
-            serve(state, volume, bindings).context("serving tree views")?;
+            serve_with_metrics(state, volume, bindings, metrics_output.as_deref())
+                .context("serving tree views")?;
         }
     }
     Ok(())

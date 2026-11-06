@@ -36,6 +36,17 @@ pub const ENV_VAR: &str = "AGENTFS_FAILPOINTS";
 /// (`every_hit_is_listed`) keeps this list equal to the `hit` calls in
 /// the source.
 pub const POINTS: &[&str] = &[
+    // Tree actor recording and publication (target git-model §3, §12).
+    "tree.wal_before_header",
+    "tree.wal_after_header",
+    "tree.wal_after_payload",
+    "tree.wal_before_fsync",
+    "tree.wal_after_fsync",
+    "tree.after_wal_before_apply",
+    "tree.after_objects_durable",
+    "tree.after_refs_durable",
+    "tree.before_checkout",
+    "tree.after_checkout",
     // The synchronous step (design §3.2).
     "pending.after_freeze",
     "journal.before_write",

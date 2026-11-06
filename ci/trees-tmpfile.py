@@ -3,8 +3,8 @@
 import ctypes
 import os
 from pathlib import Path
-import subprocess
 import sys
+from tree_git_read import read
 
 root = Path(sys.argv[1])
 repo = sys.argv[2]
@@ -24,5 +24,5 @@ assert os.fstat(fd).st_nlink == 1
 assert (root / "linked").read_bytes() == b"", "open writes remain private after link"
 os.close(fd)
 assert (root / "linked").read_bytes() == b"anonymous data"
-assert subprocess.check_output(["git", "--git-dir=" + repo, "show", "main:linked"]) == b"anonymous data"
+assert read(repo, "main", "linked") == b"anonymous data"
 print("O_TMPFILE, linkat, private writes, final close and history: passed", flush=True)

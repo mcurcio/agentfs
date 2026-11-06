@@ -4,8 +4,10 @@
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::io;
+use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use agentfs_core::tree_actor::{Error, Saved, Volume};
@@ -24,6 +26,17 @@ pub struct Binding {
 /// Mount until every view is unmounted. All mountpoints must be empty,
 /// outside the private state and separate from one another.
 pub fn serve(state: &Path, volume: Volume, bindings: Vec<Binding>) -> io::Result<()> {
+    serve_with_metrics(state, volume, bindings, None)
+}
+
+/// Serve views with optional process-local measurement snapshots. The output
+/// belongs outside the state area and views; no measurement affects decisions.
+pub fn serve_with_metrics(
+    state: &Path,
+    volume: Volume,
+    bindings: Vec<Binding>,
+    metrics_output: Option<&Path>,
+) -> io::Result<()> {
     let state = state.canonicalize()?;
     let mut points: Vec<PathBuf> = Vec::new();
     for binding in &bindings {
@@ -53,11 +66,35 @@ pub fn serve(state: &Path, volume: Volume, bindings: Vec<Binding>) -> io::Result
         }
         points.push(at);
     }
+    let metrics_output = metrics_output
+        .map(|path| {
+            let filename = path.file_name().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "metrics output needs a filename",
+                )
+            })?;
+            let parent = path
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(Path::new("."));
+            let path = parent.canonicalize()?.join(filename);
+            if path.starts_with(&state) || points.iter().any(|at| path.starts_with(at)) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "metrics output must be outside state and views",
+                ));
+            }
+            Ok(path)
+        })
+        .transpose()?;
     let actor = Arc::new(Mutex::new(volume));
+    let signal = Arc::new(ProgressSignal::default());
     let mut sessions = Vec::new();
     for (binding, at) in bindings.into_iter().zip(points) {
         let view = View {
             actor: actor.clone(),
+            signal: Arc::clone(&signal),
             tree: binding.tree,
             writer: binding.writer,
             handles: Mutex::new(Handles {
@@ -77,17 +114,148 @@ pub fn serve(state: &Path, volume: Volume, bindings: Vec<Binding>) -> io::Result
         config.n_threads = Some(1);
         sessions.push(fuser::spawn_mount(view, at, &config)?);
     }
-    for session in sessions {
-        session.join()?;
+    let progress_actor = Arc::clone(&actor);
+    let progress_signal = Arc::clone(&signal);
+    let progress_worker = std::thread::spawn(move || -> io::Result<()> {
+        loop {
+            {
+                let mut state = progress_signal
+                    .state
+                    .lock()
+                    .map_err(|_| io::Error::other("queue signal poisoned"))?;
+                while !state.pending && !state.stopped {
+                    state = progress_signal
+                        .changed
+                        .wait(state)
+                        .map_err(|_| io::Error::other("queue signal poisoned"))?;
+                }
+                if state.stopped {
+                    return Ok(());
+                }
+                state.pending = false;
+            }
+            loop {
+                let progressed = progress_actor
+                    .lock()
+                    .map_err(|_| io::Error::other("tree actor poisoned"))?
+                    .progress()
+                    .map_err(io::Error::other)?;
+                if !progressed {
+                    break;
+                }
+                // Release the actor between takes so new client opens can run.
+                std::thread::yield_now();
+            }
+        }
+    });
+    let stop = Arc::new(AtomicBool::new(false));
+    let metrics_worker = metrics_output.map(|output| {
+        let actor = Arc::clone(&actor);
+        let stop = Arc::clone(&stop);
+        std::thread::spawn(move || -> io::Result<()> {
+            loop {
+                let last = stop.load(Ordering::Acquire);
+                let metrics = actor
+                    .lock()
+                    .map_err(|_| io::Error::other("tree actor poisoned"))?
+                    .metrics();
+                let bytes = serde_json::to_vec(&metrics)?;
+                let temporary =
+                    output.with_extension(format!("metrics-{}.tmp", std::process::id()));
+                std::fs::write(&temporary, bytes)?;
+                std::fs::rename(&temporary, &output)?;
+                if last {
+                    return Ok(());
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        })
+    });
+    let result = sessions.into_iter().try_for_each(|session| session.join());
+    {
+        let mut state = signal
+            .state
+            .lock()
+            .map_err(|_| io::Error::other("queue signal poisoned"))?;
+        state.stopped = true;
+        signal.changed.notify_one();
     }
+    stop.store(true, Ordering::Release);
+    let progress_result = progress_worker
+        .join()
+        .map_err(|_| io::Error::other("queue worker panicked"))?;
+    let metrics_result = metrics_worker
+        .map(|worker| {
+            worker
+                .join()
+                .map_err(|_| io::Error::other("metrics worker panicked"))?
+        })
+        .transpose();
+    result?;
+    progress_result?;
+    metrics_result?;
     Ok(())
 }
 
 struct View {
     actor: Arc<Mutex<Volume>>,
+    signal: Arc<ProgressSignal>,
     tree: String,
     writer: String,
     handles: Mutex<Handles>,
+}
+
+struct ProgressState {
+    pending: bool,
+    stopped: bool,
+}
+
+struct ProgressSignal {
+    state: Mutex<ProgressState>,
+    changed: Condvar,
+}
+
+impl Default for ProgressSignal {
+    fn default() -> Self {
+        Self {
+            state: Mutex::new(ProgressState {
+                pending: true,
+                stopped: false,
+            }),
+            changed: Condvar::new(),
+        }
+    }
+}
+
+struct ActorGuard<'a> {
+    volume: MutexGuard<'a, Volume>,
+    signal: &'a ProgressSignal,
+    modified: bool,
+}
+
+impl Deref for ActorGuard<'_> {
+    type Target = Volume;
+    fn deref(&self) -> &Volume {
+        &self.volume
+    }
+}
+
+impl DerefMut for ActorGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Volume {
+        self.modified = true;
+        &mut self.volume
+    }
+}
+
+impl Drop for ActorGuard<'_> {
+    fn drop(&mut self) {
+        if self.modified
+            && let Ok(mut state) = self.signal.state.lock()
+        {
+            state.pending = true;
+            self.signal.changed.notify_one();
+        }
+    }
 }
 struct Handles {
     next: u64,
@@ -115,12 +283,16 @@ fn errno(error: Error) -> Errno {
 }
 
 impl View {
-    fn actor(&self) -> Result<MutexGuard<'_, Volume>> {
+    fn actor(&self) -> Result<ActorGuard<'_>> {
         let v = self.actor.lock().map_err(|_| Errno::EIO)?;
         if v.is_stopped() {
             return Err(Errno::EIO);
         }
-        Ok(v)
+        Ok(ActorGuard {
+            volume: v,
+            signal: &self.signal,
+            modified: false,
+        })
     }
     fn handles(&self) -> Result<MutexGuard<'_, Handles>> {
         self.handles.lock().map_err(|_| Errno::EIO)
@@ -679,6 +851,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let view = View {
             actor: Arc::new(Mutex::new(Volume::open(tmp.path()).unwrap())),
+            signal: Arc::new(ProgressSignal::default()),
             tree: "main".into(),
             writer: "client".into(),
             handles: Mutex::new(Handles {
@@ -708,6 +881,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let view = View {
             actor: Arc::new(Mutex::new(Volume::open(tmp.path()).unwrap())),
+            signal: Arc::new(ProgressSignal::default()),
             tree: "main".into(),
             writer: "client".into(),
             handles: Mutex::new(Handles {

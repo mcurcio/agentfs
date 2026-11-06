@@ -1,71 +1,54 @@
 # Phase 1: implementation and end-to-end validation
 
-**The recording code described here is outdated and untested** (the owner, 2026-11-05: it is to be noted as
-"outdated and untested"). A Codex session wrote it (43dad43, 22b91ab, 62457b8) before the rules ledger's latest decisions, and
-nobody has reviewed it against [the ledger](rules-ledger.md). Do not treat its tests or this page's status as
-evidence that a rule holds. The ledger wins wherever this page or that code differs from it.
+Phase 1 is the MVP of PR #23. The owner described its purpose on 2026-11-05:
+"The goal is to build the phase 1 / MVP of the proposed design in the PR so we
+can run real end-to-end tests and validate the model".
 
-Phase 1 is the MVP implementation of the proposed design in PR #23. The owner
-clarified its purpose on 2026-11-05: "The goal is to build the phase 1 / MVP of
-the proposed design in the PR so we can run real end-to-end tests and validate
-the model". This code is the implementation foundation to build on.
-
-The contract is [git-model.md](git-model.md). Its
-[§18 exit criteria](git-model.md#18-phase-1-implementation-and-end-to-end-validation)
-define what the real filesystem must validate. **Phase 1 is in progress.** The
-recording milestone is written, and outdated and untested (above). The
-landing/sync and model-conformance milestones remain to be built.
+**Phase 1 is not validated.** [git-model §18](git-model.md#18-phase-1-implementation-and-end-to-end-validation)
+defines the exit tests. The [rules ledger](rules-ledger.md) governs outcomes.
+The original recording commits (`43dad43`, `22b91ab`, `62457b8`) were outdated
+and untested against that ledger. They have since been audited and repaired;
+their original passing tests are not conformance evidence.
 
 ## Ledger audit and current filesystem evidence
 
-The older draft has now been inspected against the ledger. Keep the CLI
-composition, journal framing, object identities and Git history primitives;
-repair the actor, view and assertions toward the ledger. Remove the unsupported
-16 MiB cross-handle reservation rather than treating it as an approved rule.
-No existing passing test is treated as proof of full conformance.
+Keep the CLI composition, journal framing and useful object/history primitives.
+Repair the actor, view and assertions against the ledger. The unsupported
+16 MiB cross-handle reservation was removed. No new reconciliation rule,
+transaction behavior or snapshot-open mechanism is introduced.
 
-Fresh Linux evidence is limited to these tested increments:
-
-| Increment | Observation |
+| Increment | Linux observation |
 |---|---|
-| `f418e03` | Strict immediate close/reopen, cross-process handoff, shared descriptor final close, writer/saved-reader bytes, concurrent closes, orphan release events and history checks passed in [CI](https://github.com/mcurcio/agentfs/actions/runs/42159661006/job/127702307383) |
-| `d9d4a81` | Shared writable mapping, `msync`, closing the descriptor while mapped, final unmap and history checks passed; anonymous-file open returned `ENOENT` in [CI](https://github.com/mcurcio/agentfs/actions/runs/42161001368/job/127706373615) |
-| `798e6fa` | Anonymous open and first link passed after recognizing handle-free inode attributes; the other tree-view checks passed in [Linux CI](https://github.com/mcurcio/agentfs/actions/runs/42176555005/job/127756236285) |
+| `f418e03` | Immediate same/cross-process close/reopen, shared descriptor final close, writer/saved-reader bytes, concurrent closes, orphan release events and history checks passed in [CI](https://github.com/mcurcio/agentfs/actions/runs/42159661006/job/127702307383) |
+| `d9d4a81` | Shared mappings passed; anonymous open exposed an adapter `ENOENT` in [CI](https://github.com/mcurcio/agentfs/actions/runs/42161001368/job/127706373615) |
+| `798e6fa` | Anonymous open and first link passed after repairing handle-free inode attributes; shared mappings and the other tree-view checks also passed in [CI](https://github.com/mcurcio/agentfs/actions/runs/42176555005/job/127756236285) |
+| Current queue integration | Local real-repository tests cover two-way flow, whole-save loss with retained history, P1 ordering, P2 prefix sync, namespace changes and replay of an incoming object. Mounted conformance and failure matrices are pending |
 
-The anonymous-file failure is an adapter defect: a zero-TTL permission lookup
-can request `GETATTR` without a handle, and the draft searched named paths only.
-The repair preserves anonymous object identity and its zero link count. It adds
-no reconciliation rule. Line maps, atomic ref storage, queue/referee/sync integration and the full
-fault matrix remain work in progress; local primitive tests are not mounted
-conformance evidence.
+Linux can request `GETATTR` without a handle during an anonymous inode's
+permission check. Searching only named paths caused the failure. The repair
+uses the anonymous object and preserves its zero link count. This is an adapter
+correction, not a new landing rule.
 
 ## Milestones and completion
 
-| Milestone | Status | Validation |
-|---|---|---|
-| Tree actor, byte-call journal, main/sandbox branches and views | Written; outdated and untested | Library tests and mounted Linux scenarios cover byte calls, saved-reader snapshots, object lifetime and restart replay |
-| Line-map storage and parent referee; whole-save landing and preserved losers | Due in phase 1 | Drive parent-wins and nonconflicting-line cases through real mounts; inspect saved bytes, Git ancestry and collision records against the model |
-| Live landing and sync with P1 progress, P2 prefix sync and no P3 | Due in phase 1 | Exercise held files and cooperating programs; verify disjoint progress, ordered delivery, and measure how long landings wait (no alarm, ledger R9.10) |
-| Close-to-open ordering and recording failure/recovery boundaries | Partly covered; exit criteria remain open | Immediate reopen in the same and another process; kill at every durable step; full state area; power-loss replay; object/page-cache cases in §18 |
-| Model conformance on the implemented subset and measurements | Due in phase 1 | Reuse supported scenarios and seeded calls, comparing visible bytes and history with the model and independent oracles; record latency and space costs |
+| Milestone | Status |
+|---|---|
+| Recording, byte calls and object lifetime | Mounted observations above; current integrated revision still needs CI |
+| Line-map storage and whole-save parent referee | Connected; local production tests pass, mounted comparison pending |
+| Live landing/sync, P1/P2, writer locks, no alarm | Connected; local production tests pass, mounted progress and wait measurements pending |
+| Journal kills, state exhaustion and power loss | CI harnesses prepared; no results claimed for the integrated revision |
+| Model conformance and §18 measurements | Fixed-case oracle and measurement harnesses prepared; mounted results pending |
 
-Recording tests provide observations of their stated cases. Phase 1 completes when
-the pass-or-fail criteria in §18 pass on Linux CI and findings are resolved in
-the implementation or the model. Do not weaken a model invariant or silently
-exclude a failing scenario. The
-[conformance plan](../../crates/agentfs-model/VERIFYING.md#phase-1-the-model-as-the-conformance-suite-integration-still-due)
-describes integration options. The independent model stays independent of product
-code. Current tests compare recording bytes with Linux; they do not yet compare
-landing/sync behavior with the model.
-
-Phase 1 covers full lineage, the only history mode, with main and one sandbox. §18 places nested forks, transactions, Rules/view profiles, replication, CSI,
-several view hosts and upgrades beyond this phase. The implementation grows
-through the domain APIs below.
+Known model finding 32 remains unresolved. Its pure diagnostic is ignored with
+an explanation; the mounted conformance case has no expected-failure waiver.
+A mounted reproduction must be reported before proposing a rule change.
+Passing a subset does not validate the whole phase.
 
 ## Run the tree views
 
-On Linux with `/dev/fuse` and `fusermount3`, build with
-`cargo build --locked -p agentfs`, then use empty mountpoints and a dedicated state directory:
+Use Linux with `/dev/fuse`, `fusermount3` and Git supporting reftable initialization,
+reference transactions and `refs migrate`. `ci/check-tree-git.sh` probes those
+operations; Git 2.52 was tested locally. Build with `cargo build --locked -p agentfs`:
 
 ```sh
 mkdir -p /tmp/agentfs-trees/main /tmp/agentfs-trees/sandbox
@@ -74,114 +57,90 @@ target/debug/agentfs --state /tmp/agentfs-trees/state trees mount \
   /tmp/agentfs-trees/main --sandbox /tmp/agentfs-trees/sandbox
 ```
 
-From another terminal, use ordinary file calls in either mount. Files saved in
-one stay isolated from the other. The sandbox starts at main's saved head when
-created. The process prints its `fork/N` name; after stopping it, reuse that
-sandbox with `--fork fork/N`. `trees fork` creates one without a mount and
-prints its name. Unmount **both** directories with `fusermount3 -u PATH` to exit.
-Only the mounting user can access these views. Mountpoints must be empty and
-must not overlap the state directory or one another. `--writer` and
-`--sandbox-writer` set trusted labels; they do not authenticate clients.
+Use ordinary file calls in either view. Each close saves in its own tree;
+queues carry changes automatically between main and the sandbox. The parent
+referee decides collisions and retains losing saves. The process prints the
+sandbox's `fork/N` name. Reuse it with `--fork fork/N`; `trees fork` creates one
+without mounting. Unmount both views with `fusermount3 -u PATH` to exit.
+Mountpoints must be empty, separate from each other and outside state. Writer
+labels are trusted labels, not authenticated identities.
 
-The FUSE adapter uses direct I/O and zero entry/attribute TTLs. A read-only open
-holds a snapshot of saved bytes; a writable open reads its own private bytes.
-Unsupported operations fail instead of passing through to an unrecorded backing
-file. Modes are fixed at 0700 for the root and 0600 for files. The adapter requests
-direct-I/O shared mapping support when the kernel offers it.
-The shared mapping and anonymous-file paths need the Linux CI scenarios in
-`ci/e2e-trees.sh` before they can be considered validated. The adapter does not
-negotiate passthrough or ordinary writeback cache.
+The adapter uses zero entry/attribute TTLs and direct I/O. Read-only descriptors
+retain saved bytes; writable descriptors read their own private calls. `fsync`
+flushes the journal; final `RELEASE` publishes. The strict ordering script checks
+immediate reopen without publication polling. Its finite passing observations
+are listed above. Linux mapping lifetime and anonymous first-link cases are
+also tested; ordinary writeback cache and passthrough are not negotiated.
 
-**Publication ordering remains incomplete.** `FLUSH`/`fsync` syncs the journal;
-`RELEASE` publishes the save. Linux sends `RELEASE` asynchronously; whether an immediate open after `close(2)`
-always sees the save has not yet been established. The existing mounted tests
-wait explicitly for publication and do not establish that ordering. The strict
-`ci/e2e-trees-ordering.sh` probe checks it without publication polling.
+`--metrics-output FILE` writes aggregate save, landing, sync and wait counters
+every 100 ms and at unmount. The existing parent directory must be outside state
+and the views. Collection errors are returned after unmount. Measurements never
+participate in ordering or reconciliation.
 
-## Recording library
+## Recording library and storage
 
-`agentfs_core::tree_actor::Volume` is a synchronous actor owning one exclusively
-locked state area. `write_open` binds a handle to a tree, writer and object;
-`write` takes byte offsets or appends; `truncate` shrinks or grows with zero bytes.
-`sync` ensures durability without publication; `close` publishes by replaying the
-calls onto the tree's saved bytes at that moment. Each changed close commits one
-writer, with `Agentfs-Open`, `Agentfs-Tree` and `Agentfs-Writer` trailers. Creation,
-rename and unlink are recorded namespace changes too.
+`agentfs_core::tree_actor::Volume` owns an exclusive state-area lease.
+`write_open`, `write`, `truncate`, `sync` and `close` implement recorded calls.
+Close applies byte calls to the current saved file and aligns lines once using
+histogram diff. Merge-file identity is separate from an open object's identity;
+renaming a newly written temporary over a target preserves the target's merge
+identity while orphaning the old object. Old handles cannot modify a replacement.
 
-Main is `refs/heads/main`. `fork()` snapshots main into `refs/heads/fork/<n>`
-in the same bare repository and records main as its local upstream. Fork saves
-remain isolated. Landing and sync are the next implementation milestones:
-native Git merge cannot replace the model's line identities or parent referee.
+Main and one sandbox share a bare Git repository. Each new commit stores workload
+files under `files/`, line maps in `metadata.json`, and name versions in
+`namespace.json`; `Agentfs-Format: envelope-1` identifies this layout. These
+private metadata names do not reserve names in the workload's root. Collision
+decisions travel in their landing commits, and collision refs retain losers.
+Queue entries, branch moves and queue ordering use atomic reftable transactions.
+The Git executable supplies that backend because the current libgit2 cannot
+open reftable. Git children retain the actor lease across process death.
 
-The state area contains `history.git`, `calls.wal`, `actor.lock`, `format`, and
-private checkout caches at `trees/main` and `trees/fork/<n>`. No checkout contains
-a `.git` entry. These first caches use git2 checkout, not linked Git worktrees or
-on-disk indexes yet. They are rebuilt from the branches before serving after a
-restart. Workloads must use the view API, never mutate a checkout or state area.
-State written by the first recording increments remains readable. The namespace
-change does not rewrite its journal or Git history; new state uses the tree label.
+The state area contains `history.git`, `calls.wal`, `actor.lock`, `format` and
+private checkout caches. Caches expose only the workload subtree, contain no
+`.git` entry, and are rebuilt before serving. Workloads use the views, not the
+caches. Compatibility with earlier recording state has local tests; general
+upgrades remain excluded.
 
-The byte-call WAL stores checksummed frames and persistent, monotonic event/open
-numbers. Every call is fsynced before acknowledgement, a deliberate performance
-cost before group commit. A recording or save failure stops the actor: its WAL
-is retained, and reopening replays it. A complete corrupt frame refuses recovery;
-only an incomplete final frame is discarded. No acknowledged record is silently
-dropped as corruption. The WAL is not compacted: boot time and disk usage grow
-with all calls. Account for this limit when running long tests.
+Every WAL append is fsynced before acknowledgement. Checksummed frames detect
+corruption; only an incomplete final frame is discarded. Recording failures
+stop the actor and retain its WAL. Recovery seeds committed snapshots, rebuilds
+open objects and replays outstanding calls, then closes abandoned opens once.
+Per-branch event watermarks and `Agentfs-Open` trailers prevent duplicate saves.
+The WAL is not compacted, so startup cost and space grow with recorded calls.
 
-Recovery reconstructs object IDs from the journal, including rename-over and
-unlink, rather than matching paths. An old handle's later writes never change
-the replacement. The close returns `OrphanDropped`. Recovery appends closes for
-abandoned opens; a per-branch event trailer makes replay after an already-written
-commit idempotent. Checkout failures retain the journal too.
-
-## Current implementation boundaries
-
-Only flat regular files with git-safe UTF-8 names; no directories, symlinks,
-permissions changes or general hard links. `O_TMPFILE` and its first link and shared mappings are under test;
-general hard-link behavior is not specified by the current model. The WAL currently
-limits individual encoded frames to 96 MiB. Writer labels are trusted operator inputs, not
-authenticated client capabilities. All admitted names are recorded; ignore and
-attribute rules and view profiles are not wired yet.
-
-Line identity and parent reconciliation primitives are present in the library but
-are not connected to the tree actor. Model finding 32 remains open.
-
-Still to implement in phase 1: line-map storage, the landing queue/referee,
-automatic sync, collision refs/notes and progress checks. Transactions,
-nested forks, replication, multi-host views, CSI integration and upgrades
-are beyond §18’s initial phase. Authenticated RPC, telemetry export and journal
-compaction are not wired in this milestone.
-Existing model findings, including 27, are unchanged. This slice does not settle
-them and must not be presented as full model conformance.
+The FUSE host wakes queue progress on mutations and releases the actor between
+takes. A waiting entry holds no client lock; writer closes wake it again. P1
+preserves dependencies on files and sources; P2 holds the suffix beginning at
+the first overwritten file with a writer. No alarm is raised for waiting opens.
+Overlapping writers can postpone a take indefinitely under the approved locks;
+the measurement harness records finite workloads rather than asserting a budget.
 
 ## Verification and recovery
 
-`cargo test --locked -p agentfs-core --test tree_actor` checks byte calls against
-a plain Linux file, publication at close, append onto a partial line, replay onto
-the current head, object-safe rename/unlink, restart idempotence, checkout repair,
-fork isolation, the exclusive actor lock, unsafe names, and torn/corrupt tails.
-These tests use real repositories and disk files, including state compatibility
-with the first recording increment’s format label. They also SIGKILL a subprocess
-after an acknowledged write, inject a stale ref lock and fail a checkout after
-a branch move. Restart recovers without duplicating a save. This is process-crash
-evidence, not power-loss evidence.
+Local `tree_actor`, `tree_git`, referee and sync tests use real repositories and
+processes. They are not FUSE or power-loss evidence. CI scripts exercise:
 
-`ci/e2e-trees.sh`, in the CI workflow's tree-view job, drives main and sandbox
-mounts using actual file calls: write, read, append, `fsync`, offset writes and
-truncation against a plain-file oracle; atomic save over an old writer; unlink and
-recreate; rename of an open file; isolation; and killing the serving process with
-an acknowledged write still open, then remounting and checking replay twice.
-This script needs `/dev/fuse`; unit tests do not. It does not claim power-loss,
-full state-area `ENOSPC`, live landing, prefix sync or full conformance coverage.
+- `e2e-trees.sh` and `e2e-trees-ordering.sh`: recording, objects, mappings,
+  anonymous first link, immediate reopen and process restart.
+- `e2e-tree-conformance.sh`: real calls compared with fixed existing model cases,
+  independent byte/line-map checks and progress scenarios.
+- `e2e-tree-recording-faults.sh` and `e2e-tree-enospc.sh`: process kills at journal
+  and durable Git boundaries, acknowledged-call replay, and actual state exhaustion.
+- `power-loss-trees.sh`: ext4/XFS dm-log-writes replay of the tree path.
+- `measure-trees.sh`: plain-FUSE comparison, an actual hour of writes, 10,000
+  saves, 1 MiB/100 MiB saves/takes and queue waits. Measurements are not budgets.
 
-On `EIO` or a save failure, stop serving and preserve the state area. Fix space or
-I/O problems before reopening it; reopening replays pending calls. On a journal
-corruption or unknown format error, preserve a copy and investigate manually.
-Do not truncate records, reset branches, or reuse the directory with production
-commands. No automated repair procedure is claimed yet.
+The phase-1 workflow runs on this PR branch. Measurement jobs require
+`[phase1-measure]` in the pushed commit message. Artifacts and exact SHA links
+must accompany results before any exit is marked passed.
 
-Still required by §18: mounted-process crash injection at every step; power-loss
-replay; state-area `ENOSPC`; immediate close-to-open ordering across processes;
-page-cache and mapping semantics; long-lived-writer progress and prefix sync;
-the remaining model conformance scenarios; and latency/space measurements.
+Only flat regular files with git-safe UTF-8 names are currently implemented.
+Directories, symlinks, permission changes and general hard links are not implemented;
+only anonymous first link is covered. WAL frames are limited to 96 MiB. Rules,
+profiles, transactions, nested forks, replication, CSI, several view hosts and
+upgrades remain outside phase 1. No transaction model or `Client::Outside` behavior
+is changed. Telemetry export and journal compaction remain unwired.
+
+On recording failure, preserve state, fix the I/O or space problem, and reopen
+for replay. On complete-frame corruption or unknown format, preserve a copy and
+investigate. Do not truncate journal records or reset history as automatic repair.

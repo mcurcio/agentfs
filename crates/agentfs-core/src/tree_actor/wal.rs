@@ -74,9 +74,14 @@ impl Wal {
         let header_crc = crc32fast::hash(&header);
         header.extend_from_slice(&header_crc.to_le_bytes());
         let result = (|| {
+            crate::failpoints::hit("tree.wal_before_header")?;
             self.0.write_all(&header)?;
+            crate::failpoints::hit("tree.wal_after_header")?;
             self.0.write_all(&payload)?;
-            self.0.sync_all()
+            crate::failpoints::hit("tree.wal_after_payload")?;
+            crate::failpoints::hit("tree.wal_before_fsync")?;
+            self.0.sync_all()?;
+            crate::failpoints::hit("tree.wal_after_fsync")
         })();
         if let Err(e) = result {
             // The actor stops on ANY append failure, even if rollback fails.
