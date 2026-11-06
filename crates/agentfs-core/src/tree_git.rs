@@ -181,6 +181,42 @@ impl TreeGit {
             .collect()
     }
 
+    /// The event number and commit of every `Agentfs-Cause: Direct` commit
+    /// reachable from `tips`, in one Git child, not one per commit.
+    pub fn direct_events(&self, tips: &[Oid]) -> Result<Vec<(u64, Oid)>> {
+        if tips.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut input = String::new();
+        for tip in tips {
+            input.push_str(&format!("{tip}\n"));
+        }
+        let out = self.run(
+            &["log", "--stdin", "--no-color", "--format=%x01%H%n%B"],
+            Some(input.as_bytes()),
+            true,
+        )?;
+        let mut events = Vec::new();
+        for record in out.stdout.split(|b| *b == 1).filter(|r| !r.is_empty()) {
+            let (oid, message) = match record.iter().position(|b| *b == b'\n') {
+                Some(end) => (&record[..end], &record[end + 1..]),
+                None => (record, &[][..]),
+            };
+            let Ok(message) = std::str::from_utf8(message) else {
+                continue;
+            };
+            if message.lines().any(|line| line == "Agentfs-Cause: Direct")
+                && let Some(seq) = message
+                    .lines()
+                    .find_map(|line| line.strip_prefix("Agentfs-Event: "))
+                    .and_then(|s| s.parse::<u64>().ok())
+            {
+                events.push((seq, parse_oid(oid)?));
+            }
+        }
+        Ok(events)
+    }
+
     fn command(&self, bare: bool) -> Command {
         let mut cmd = Command::new("git");
         cmd.arg("-c").arg("core.hooksPath=/dev/null");

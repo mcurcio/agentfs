@@ -613,6 +613,8 @@ pub struct Volume {
     /// open until a later step in their tree saves them, or a restart does.
     pending_closes: Vec<u64>,
     saved_through: BTreeMap<(String, u64), u64>,
+    /// Each direct save's commit, by event number (see `rebuild_owners`).
+    owners: BTreeMap<u64, Oid>,
     next: u64,
     stopped: bool,
     /// A copy failed: the next step rebuilds refs whole and redoes checkouts.
@@ -755,6 +757,7 @@ impl Volume {
             handles: BTreeMap::new(),
             pending_closes: Vec::new(),
             saved_through: folded.saved_through,
+            owners: BTreeMap::new(),
             next: folded.next_seq,
             stopped: false,
             copies_stale: false,
@@ -766,6 +769,7 @@ impl Volume {
             changed: Vec::new(),
             _lock: lock,
         };
+        volume.rebuild_owners()?;
         volume.build_trees()?;
         for (handle, FoldedOpen { open, calls }) in folded.opens {
             let tree = volume.trees.get_mut(&open.tree).ok_or(Error::Format)?;
@@ -1324,37 +1328,22 @@ impl Volume {
         keys
     }
 
-    fn event_owners(&self, start: Oid) -> Result<BTreeMap<u64, Oid>> {
+    /// The commit of every direct save on record, by its event number: one Git
+    /// child over everything the pointers reach. An event has one commit, so
+    /// no walk from a fork's head is needed to find it. A copy: `owners` is
+    /// folded as saves land and is empty-then-rebuilt here at every open.
+    fn rebuild_owners(&mut self) -> Result<()> {
         let _timer = Timer::start(Which::EventOwners);
-        let mut todo = vec![start];
-        let mut seen = BTreeSet::new();
-        let mut owners = BTreeMap::new();
-        while let Some(oid) = todo.pop() {
-            if !seen.insert(oid) {
-                continue;
-            }
-            let commit = self.repo.read_commit(oid)?;
-            todo.extend(commit.parents);
-            if let Ok(message) = std::str::from_utf8(&commit.message)
-                && message.lines().any(|line| line == "Agentfs-Cause: Direct")
-                && let Some(seq) = message
-                    .lines()
-                    .find_map(|line| line.strip_prefix("Agentfs-Event: "))
-                    .and_then(|s| s.parse::<u64>().ok())
-            {
-                owners.insert(seq, oid);
-            }
+        let mut tips: Vec<Oid> = Vec::new();
+        for prefix in ["refs/heads/", "refs/queue/main/", "refs/collisions/"] {
+            tips.extend(self.pointers.under(prefix).into_iter().map(|(_, oid)| oid));
         }
-        Ok(owners)
+        self.owners = self.repo.direct_events(&tips)?.into_iter().collect();
+        Ok(())
     }
 
-    fn undecided(
-        &self,
-        fork: &referee::Snapshot,
-        fork_head: Oid,
-        upstream: Oid,
-    ) -> Result<Undecided> {
-        let owners = self.event_owners(fork_head)?;
+    fn undecided(&self, fork: &referee::Snapshot, upstream: Oid) -> Result<Undecided> {
+        let owners = &self.owners;
         let mut lines = BTreeSet::new();
         let mut names = BTreeSet::new();
         for file in fork.files.values() {
@@ -1502,7 +1491,7 @@ impl Volume {
         let mut remaining = false;
         for oid in todo {
             let parent = self.snapshot_at(oid)?;
-            let (lines, names) = self.undecided(&fork_snapshot, fork_head, oid)?;
+            let (lines, names) = self.undecided(&fork_snapshot, oid)?;
             let next = {
                 let _timer = Timer::start(Which::SyncMerge);
                 sync::sync(&parent, &fork_snapshot, &lines, &names)?
@@ -1768,6 +1757,9 @@ impl Volume {
         let changes = draft.changes.clone();
         let tree = draft.tree.clone();
         self.install(draft, seq);
+        if let Saved::Commit(head) = saved {
+            self.owners.insert(seq, head);
+        }
         if matches!(saved, Saved::Commit(_)) {
             let nanos = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
             self.metrics.saves = self.metrics.saves.saturating_add(1);

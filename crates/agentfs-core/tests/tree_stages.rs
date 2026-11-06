@@ -95,6 +95,48 @@ fn stages_add_up() {
     assert!(after.stages.objects.max_nanos > 0);
 }
 
+/// A save on main and the sync that carries it to a sandbox must cost the same
+/// Git children whether the history holds ten saves or ninety (the pilot found
+/// each sync walking the whole history, one child per commit).
+#[test]
+fn a_sync_costs_the_same_children_at_any_history_length() {
+    let _one = ONE_AT_A_TIME.lock().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let state = tmp.path().join("state");
+    let mut v = Volume::open(&state).unwrap();
+    v.fork().unwrap();
+    let cycle = |v: &mut Volume, i: u64| {
+        let before = Stages::current().git_children;
+        put(v, "a", format!("line {i}\n").as_bytes());
+        while v.progress().unwrap() {}
+        Stages::current().git_children - before
+    };
+    let mut early = 0;
+    let mut late = 0;
+    for i in 0..90 {
+        let children = cycle(&mut v, i);
+        if i == 9 {
+            early = children;
+        }
+        if i == 89 {
+            late = children;
+        }
+    }
+    let metrics = v.metrics();
+    assert_eq!(metrics.syncs, metrics.saves, "every save's sync was taken");
+    assert!(
+        late * 10 <= early * 12,
+        "children per save and sync: {early} at the tenth, {late} at the ninetieth"
+    );
+    // A reopened actor rebuilds what the syncs look up, from history.
+    drop(v);
+    let mut v = Volume::open(&state).unwrap();
+    let syncs = v.metrics().syncs;
+    put(&mut v, "a", b"after reopen\n");
+    while v.progress().unwrap() {}
+    assert_eq!(v.metrics().syncs, syncs + 1);
+}
+
 /// Production sources of the actor's path, up to their first test module.
 fn production(path: &Path) -> String {
     let source = std::fs::read_to_string(path).unwrap();

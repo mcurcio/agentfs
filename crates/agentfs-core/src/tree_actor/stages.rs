@@ -2,8 +2,9 @@
 //!
 //! Measurements only: nothing here is read by ordering, a conflict decision or
 //! a refusal. Each stage counts its runs and adds their durations; a stage may
-//! enclose another (`queue_plan` encloses `snapshot_read`, `event_owners` and
-//! `sync_merge`; `journal_append` encloses `journal_fsync`). Totals are
+//! enclose another (`queue_plan` encloses `snapshot_read` and `sync_merge`;
+//! `journal_append` encloses `journal_fsync`). `event_owners` is the one Git
+//! child that rebuilds the map of each save's commit at open. Totals are
 //! process-wide, like the counter of Git children in [`crate::git_cli`]: one
 //! actor runs per process, so a reader compares two snapshots.
 
