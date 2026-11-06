@@ -513,7 +513,12 @@ def main():
         p.error('count, interval, sample-every and visibility-timeout must be positive')
     count = a.count or (1000 if a.mode in ('calls', 'smoke', 'pilot') else 10000)
     reason = a.reason or 'requires landing/line-map measurement instrumentation'
-    header = {'schema_version': 2, 'mode': a.mode, 'source_sha': command('git', 'rev-parse', 'HEAD'),
+    run_url = None
+    if os.environ.get('GITHUB_RUN_ID'):
+        run_url = '%s/%s/actions/runs/%s' % (os.environ.get('GITHUB_SERVER_URL', 'https://github.com'),
+                                             os.environ.get('GITHUB_REPOSITORY', ''), os.environ['GITHUB_RUN_ID'])
+    header = {'schema_version': 2, 'mode': a.mode, 'ci_run': run_url,
+              'source_sha': command('git', 'rev-parse', 'HEAD'),
               'source_status_porcelain': command('git', 'status', '--porcelain'),
               'binary_sha256': sha256(a.bin) if os.path.isfile(a.bin) else None,
               'tracked_diff_sha256': hashlib.sha256(subprocess.run(['git', 'diff', 'HEAD', '--binary'], stdout=subprocess.PIPE, check=True).stdout).hexdigest(),
