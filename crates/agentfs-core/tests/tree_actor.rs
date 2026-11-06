@@ -1051,11 +1051,13 @@ fn open_numbers_never_repeat_across_compaction() {
     let first = put(&mut v, "main", "a", b"one");
     drop(v);
     // Every open compacts; the journal then holds only a checkpoint.
-    let mut v = Volume::open(tmp.path()).unwrap();
+    drop(Volume::open(tmp.path()).unwrap());
+    // Nothing but the checkpoint can say what the next number is now.
     assert_eq!(
         frames(&fs::read(tmp.path().join("calls.wal")).unwrap()).len(),
         1
     );
+    let mut v = Volume::open(tmp.path()).unwrap();
     let second = v.write_open("main", "a", "writer", false).unwrap();
     assert!(second > first);
     v.write(second, 0, b"two", true).unwrap();

@@ -7,7 +7,8 @@ trap 'rm -rf "$probe"' EXIT
 git --version
 repo=$probe/repo.git
 git init --bare "$repo"
-export GIT_DIR=$repo
+export GIT_DIR=$repo GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
+export GIT_AUTHOR_NAME=probe GIT_AUTHOR_EMAIL=probe@localhost GIT_COMMITTER_NAME=probe GIT_COMMITTER_EMAIL=probe@localhost
 printf '[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n\tbare = true\n\tfsync = objects,derived-metadata\n\tfsyncMethod = fsync\n' > "$repo/config"
 printf 'ref: refs/heads/main\n' > "$repo/HEAD"
 test "$(git config --get core.fsync)" = objects,derived-metadata
