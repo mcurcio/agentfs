@@ -366,7 +366,6 @@ impl Journal {
         }
         let synced = (|| -> io::Result<()> {
             crate::failpoints::hit("tree.wal_before_fsync")?;
-            self.file.sync_all()?;
             crate::failpoints::hit("tree.wal_after_fsync")
         })();
         if let Err(e) = synced {
