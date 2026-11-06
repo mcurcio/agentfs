@@ -7,7 +7,9 @@ can run real end-to-end tests and validate the model".
 **Phase 1 is not validated.** [git-model §18](git-model.md#18-phase-1-implementation-and-end-to-end-validation)
 defines the exit tests. The [rules ledger](rules-ledger.md) governs outcomes.
 Implementation is paused; the [handoff](phase-1-handoff.md) records the exit-test
-snapshot, three blocking areas, measured hour and remaining work.
+snapshot, measured hour and remaining work. Owner decisions in `921528b` now
+cover R10.8, R1.4, the R10.3 clarification and the journal pointer commit point;
+implementation and tests have not yet been updated to them.
 The original recording commits (`43dad43`, `22b91ab`, `62457b8`) were outdated
 and untested against that ledger. They have since been audited and repaired;
 their original passing tests are not conformance evidence.
@@ -47,18 +49,20 @@ Known model finding 32 reproduced on the real mount: a losing truncate to `y`,
 followed by an offset write of `n6` before the parent decision was readable,
 left live lines `n6` and `m1.1\n` joined as `n6m1.1\n`. Its pure diagnostic is
 ignored with an explanation; the mounted case has no expected-failure waiver.
-The failure is preserved for the owner to decide. No newline, refusal, reordering
-or collision exception is added to conceal it. Passing the other cases does not
-validate the whole phase.
+R10.8 now decides this as a parent-winning collision: the later save loses whole
+and stays in history. The recorded failure predates that approval; implementing
+and testing the decision remains due. Passing the other cases does not validate
+the whole phase.
 
 The page-cache probe uses independent opens in one tree. With two writable
 shared mappings and a separate read-only mapping, stores through the writers
 become readable through the observer before either writer closes, while ordinary
 `pread` still returns saved bytes. A first writer's close can also leave saved
-bytes unchanged until the other mapping closes. These are new filesystem
-observations against R1.1 and close publication, not a permission to exempt
-mappings. The failing checks remain enabled; no cache or save-policy workaround
-is introduced.
+bytes unchanged until the other mapping closes. Those observations led to R1.4:
+native shared pages are allowed, while descriptor privacy remains and Linux's
+bytes must not be lost. The probe still contains the earlier privacy assertions;
+its expectations and the mixed-write implementation need to follow R1.4 when
+work resumes.
 
 Power-loss recovery is also unresolved. Initial repository files now receive
 explicit file and directory syncs. Git configuration and loose-object directory
@@ -68,7 +72,10 @@ footer, and table-list publication and obsolete-table cleanup lack the required
 directory ordering. Syncing a completed command cannot by itself protect a
 previously acknowledged state from a cut during another command. The current
 Git backend has not established §18's crash guarantee; its failing replay checks
-remain enabled. Choosing a storage path that meets R12 requires further work.
+remain enabled. The owner's current pick in `921528b` makes a synced journal
+record the commit point for each step's pointer changes and makes Git refs
+rebuildable copies. This supersedes the old §12 storage choice; implementation,
+pointer replay, compaction and new crash proof remain due.
 
 ## Run the tree views
 
