@@ -42,3 +42,13 @@ mv "$probe/blob" "$repo/objects/${blob:0:2}/${blob:2}"
 mv "$repo/objects/${table:0:2}/${table:2}" "$probe/table"
 test "$(lost "$commit" "$table")" = "$table"
 mv "$probe/table" "$repo/objects/${table:0:2}/${table:2}"
+
+# Every object writer agentfs uses must read core.fsync (`git mktree` does not,
+# which is why agentfs does not use it: tree_git.rs).
+flushes() { grep -c '"category":"fsync","name":"hardware-flush"' "$1" || true; }
+printf 'another' | GIT_TRACE2_EVENT=$probe/blob-trace git hash-object -w --stdin >/dev/null
+[ "$(flushes "$probe/blob-trace")" -ge 1 ]
+printf '100644 bytes\0' | cat - <(printf '%s' "$blob" | sed 's/../\\x&/g' | xargs -0 printf) | GIT_TRACE2_EVENT=$probe/tree-trace git hash-object -t tree -w --stdin >/dev/null
+[ "$(flushes "$probe/tree-trace")" -ge 1 ]
+GIT_TRACE2_EVENT=$probe/commit-trace git commit-tree -m another "$tree" >/dev/null
+[ "$(flushes "$probe/commit-trace")" -ge 1 ]

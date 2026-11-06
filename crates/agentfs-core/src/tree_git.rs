@@ -297,25 +297,44 @@ impl TreeGit {
             })
             .collect()
     }
-    /// Store immediate entries. Git validates modes, names and object types.
+    /// Store immediate entries. Git checks the tree's format.
+    ///
+    /// Through `hash-object`, not `git mktree`: mktree reads no configuration,
+    /// so core.fsync never reaches it and its object can be an empty file after
+    /// a cut. Writing that tree again then finds the name taken and keeps the
+    /// empty file. ci/check-tree-git.sh checks that the writers used here sync.
     pub fn write_tree(&self, entries: &[TreeEntry]) -> Result<Oid> {
-        let mut data = Vec::new();
+        let mut sorted = Vec::with_capacity(entries.len());
         for e in entries {
-            let kind = match e.mode {
-                0o40000 => "tree",
-                0o100644 | 0o100755 | 0o120000 => "blob",
-                0o160000 => "commit",
-                _ => return Err(Error::Invalid("tree mode".into())),
-            };
+            if !matches!(e.mode, 0o40000 | 0o100644 | 0o100755 | 0o120000 | 0o160000) {
+                return Err(Error::Invalid("tree mode".into()));
+            }
             if e.name.is_empty() || e.name.contains(&0) || e.name.contains(&b'/') {
                 return Err(Error::Invalid("tree entry name".into()));
             }
-            write!(&mut data, "{:o} {} {}\t", e.mode, kind, e.oid)?;
+            // Git orders a directory as if its name ended in a slash.
+            let mut key = e.name.clone();
+            if e.mode == 0o40000 {
+                key.push(b'/');
+            }
+            sorted.push((key, e));
+        }
+        sorted.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut data = Vec::new();
+        for (_, e) in sorted {
+            write!(&mut data, "{:o} ", e.mode)?;
             data.extend_from_slice(&e.name);
             data.push(0);
+            data.extend_from_slice(e.oid.as_bytes());
         }
         let oid = parse_oid(trim(
-            &self.run(&["mktree", "-z"], Some(&data), true)?.stdout,
+            &self
+                .run(
+                    &["hash-object", "-t", "tree", "-w", "--stdin"],
+                    Some(&data),
+                    true,
+                )?
+                .stdout,
         ))?;
         self.sync_object_dirs(oid)?;
         Ok(oid)

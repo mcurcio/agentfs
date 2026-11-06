@@ -697,7 +697,8 @@ footer after its last sync).
 
 The order of a step:
 
-1. Build on a copy of the tree. Objects are fsynced, with their directories, as they are written.
+1. Build on a copy of the tree. Objects are fsynced, with their directories, as they are written. Trees go through
+   `git hash-object`: `git mktree` reads no configuration, so `core.fsync` never reaches it.
 2. Check the pointers it moves against their current values.
 3. Append the record and fsync it: **the commit point**.
 4. Install the copy and apply the pointers.

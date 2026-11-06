@@ -115,6 +115,57 @@ fn git(path: &std::path::Path, args: &[&str]) -> std::process::Output {
 }
 
 #[test]
+fn a_tree_is_the_one_git_itself_would_make() {
+    use std::io::Write;
+    use std::process::Stdio;
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("repo.git");
+    let repo = TreeGit::init(&path).unwrap();
+    let blob = repo.write_blob(b"bytes").unwrap();
+    let subtree = repo.write_tree(&[]).unwrap();
+    // Out of order, and with a directory that sorts as if it ended in a slash.
+    let entries = [
+        ("z", 0o100755, "blob", blob),
+        ("a.b", 0o100644, "blob", blob),
+        ("a", 0o40000, "tree", subtree),
+        ("a-b", 0o100644, "blob", blob),
+        ("tab\tline", 0o100644, "blob", blob),
+    ];
+    let mine = repo
+        .write_tree(
+            &entries
+                .iter()
+                .map(|(name, mode, _, oid)| TreeEntry {
+                    name: name.as_bytes().to_vec(),
+                    mode: *mode,
+                    oid: *oid,
+                })
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+    let mut child = Command::new("git")
+        .arg("--git-dir")
+        .arg(&path)
+        .args(["mktree", "-z"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    for (name, mode, kind, oid) in &entries {
+        write!(stdin, "{mode:o} {kind} {oid}\t{name}\0").unwrap();
+    }
+    drop(stdin);
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(
+        String::from_utf8(out.stdout).unwrap().trim(),
+        mine.to_string()
+    );
+    let fsck = git(&path, &["fsck", "--full", "--strict", "--no-progress"]);
+    assert!(fsck.status.success(), "{fsck:?}");
+}
+
+#[test]
 fn write_config_replaces_a_damaged_config_and_head_before_any_git_command() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("repo.git");
