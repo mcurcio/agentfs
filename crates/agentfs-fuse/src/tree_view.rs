@@ -142,6 +142,21 @@ impl View {
                 Open::Read(bytes) => bytes.len(),
                 Open::Write { handle, .. } => v.read_open(*handle).map_err(errno)?.len(),
             }
+        } else if v.is_anonymous(&self.tree, ino.0 - 2).map_err(errno)? {
+            let handles = self.handles()?;
+            let handle = handles
+                .entries
+                .values()
+                .find_map(|entry| match entry {
+                    Open::Write { handle, .. }
+                        if v.open_object(*handle).ok() == Some(ino.0 - 2) =>
+                    {
+                        Some(*handle)
+                    }
+                    _ => None,
+                })
+                .ok_or(Errno::ENOENT)?;
+            v.read_open(handle).map_err(errno)?.len()
         } else {
             v.read(&self.tree, &self.path(v, ino)?)
                 .map_err(errno)?
@@ -657,6 +672,35 @@ mod tests {
                 io::ErrorKind::InvalidInput
             );
         }
+    }
+
+    #[test]
+    fn anonymous_inode_attributes_are_available_without_a_file_handle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let view = View {
+            actor: Arc::new(Mutex::new(Volume::open(tmp.path()).unwrap())),
+            tree: "main".into(),
+            writer: "client".into(),
+            handles: Mutex::new(Handles {
+                next: 2,
+                entries: BTreeMap::new(),
+            }),
+        };
+        let mut volume = view.actor().unwrap();
+        let handle = volume.anonymous_open("main", "client").unwrap();
+        let ino = INodeNo(volume.open_object(handle).unwrap() + 2);
+        volume.write(handle, 0, b"private", false).unwrap();
+        view.handles().unwrap().entries.insert(
+            1,
+            Open::Write {
+                handle,
+                append: false,
+                readable: true,
+            },
+        );
+        let attr = view.attr(&volume, ino, None).unwrap();
+        assert_eq!(attr.size, 7);
+        assert_eq!(attr.nlink, 0);
     }
 
     #[test]

@@ -16,6 +16,30 @@ define what the real filesystem must validate. **Phase 1 is in progress.** The
 recording milestone is written, and outdated and untested (above). The
 landing/sync and model-conformance milestones remain to be built.
 
+## Ledger audit and current filesystem evidence
+
+The older draft has now been inspected against the ledger. Keep the CLI
+composition, journal framing, object identities and Git history primitives;
+repair the actor, view and assertions toward the ledger. Remove the unsupported
+16 MiB cross-handle reservation rather than treating it as an approved rule.
+No existing passing test is treated as proof of full conformance.
+
+Fresh Linux evidence is limited to these tested increments:
+
+| Increment | Observation |
+|---|---|
+| `f418e03` | Strict immediate close/reopen, cross-process handoff, shared descriptor final close, writer/saved-reader bytes, concurrent closes, orphan release events and history checks passed in [CI](https://github.com/mcurcio/agentfs/actions/runs/42159661006/job/127702307383) |
+| `d9d4a81` | Shared writable mapping, `msync`, closing the descriptor while mapped, final unmap and history checks passed; anonymous-file open returned `ENOENT` in [CI](https://github.com/mcurcio/agentfs/actions/runs/42161001368/job/127706373615) |
+| Current attribute repair | Recognizes anonymous inode attributes when Linux requests them without a handle; local regression passes, mounted rerun pending |
+
+The anonymous-file failure is an adapter defect: a zero-TTL permission lookup
+can request `GETATTR` without a handle, and the draft searched named paths only.
+The repair preserves anonymous object identity and its zero link count. It adds
+no reconciliation rule. A fresh CI result is required before claiming this case
+passes. Line maps, atomic ref storage, queue/referee/sync integration and the full
+fault matrix remain work in progress; local primitive tests are not mounted
+conformance evidence.
+
 ## Milestones and completion
 
 | Milestone | Status | Validation |
@@ -26,7 +50,7 @@ landing/sync and model-conformance milestones remain to be built.
 | Close-to-open ordering and recording failure/recovery boundaries | Partly covered; exit criteria remain open | Immediate reopen in the same and another process; kill at every durable step; full state area; power-loss replay; object/page-cache cases in §18 |
 | Model conformance on the implemented subset and measurements | Due in phase 1 | Reuse supported scenarios and seeded calls, comparing visible bytes and history with the model and independent oracles; record latency and space costs |
 
-Passing recording tests is evidence for that milestone. Phase 1 completes when
+Recording tests provide observations of their stated cases. Phase 1 completes when
 the pass-or-fail criteria in §18 pass on Linux CI and findings are resolved in
 the implementation or the model. Do not weaken a model invariant or silently
 exclude a failing scenario. The
