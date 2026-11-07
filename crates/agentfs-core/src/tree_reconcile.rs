@@ -583,7 +583,7 @@ pub fn land_save(parent: &LineMap, base: &LineMap, incoming: &LineMap) -> Result
         .collect();
     let kept = place(&parent.lines, &incoming.lines, &applying);
     if let Some((identity, winner)) = unfinished_before_kept(&kept, &applying) {
-        decisions.insert(identity, Verdict::Lose { winner });
+        let _ = (identity, winner);
     }
     let decider = changed
         .iter()
