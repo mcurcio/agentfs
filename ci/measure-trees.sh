@@ -20,7 +20,7 @@ cleanup() {
         if mountpoint -q "$m"; then fusermount3 -u "$m" || fusermount3 -uz "$m" || true; fi
     done
     if [ -n "$pid" ]; then kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; fi
-    if [ "$status" != 0 ]; then cat "$work"/*.log 2>/dev/null || true; fi
+    if [ "$status" != 0 ]; then cat "$work"/*.log "${mount_log:-/dev/null}" 2>/dev/null || true; fi
     rm -rf "$work"
 }
 trap cleanup EXIT
@@ -34,20 +34,22 @@ for cmd in mountpoint fusermount3 findmnt git python3; do
 done
 if [ ! -c /dev/fuse ] || [ ! -x "$bin" ]; then notrun 'missing /dev/fuse or executable agentfs binary'; exit 0; fi
 if ! "$bin" --state "$work/state" trees init >"$work/init.log" 2>&1; then notrun 'tree init failed; see CI log'; cat "$work/init.log" >&2; exit 1; fi
-"$bin" --state "$work/state" trees mount "$work/main" --sandbox "$work/sandbox" --metrics-output "$work/metrics.json" >"$work/mount.log" 2>&1 &
+# The mount's log sits beside the report, so a run that is cut still has it.
+mount_log="$out.mount.log"
+"$bin" --state "$work/state" trees mount "$work/main" --sandbox "$work/sandbox" --metrics-output "$work/metrics.json" >"$mount_log" 2>&1 &
 pid=$!
 for _ in $(seq 1 200); do
     if mountpoint -q "$work/main" && mountpoint -q "$work/sandbox"; then break; fi
     if ! kill -0 "$pid" 2>/dev/null; then break; fi
     sleep 0.1
 done
-if ! mountpoint -q "$work/main" || ! mountpoint -q "$work/sandbox"; then notrun 'tree FUSE mount failed; see CI log'; cat "$work/mount.log" >&2; exit 1; fi
-args+=(--main "$work/main" --sandbox "$work/sandbox" --metrics "$work/metrics.json")
+if ! mountpoint -q "$work/main" || ! mountpoint -q "$work/sandbox"; then notrun 'tree FUSE mount failed; see CI log'; cat "$mount_log" >&2; exit 1; fi
+args+=(--mount-pid "$pid" --main "$work/main" --sandbox "$work/sandbox" --metrics "$work/metrics.json")
 # Opt in only when automatic sandbox-to-parent landing is available.
 if [ "${MEASURE_TREES_LANDING:-0}" = 1 ]; then args+=(--landing); fi
 # A backlog of saves takes minutes to drain: the harness waits for events, and
 # the step's own time limit ends a run that does not finish.
-case "$mode" in storage|pilot|held-log|smoke-kill) args+=(--visibility-timeout 3600);; esac
+case "$mode" in calls|storage|pilot|held-log|smoke-kill) args+=(--visibility-timeout 3600);; esac
 if [[ "$mode" = calls || "$mode" = smoke ]] && command -v bindfs >/dev/null; then
     if bindfs -o direct_io "$work/backing" "$work/plain" >"$work/bindfs.log" 2>&1 &&
        [ "$(findmnt -n -o FSTYPE -T "$work/plain")" = fuse.bindfs ]; then

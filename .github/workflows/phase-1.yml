@@ -230,6 +230,8 @@ jobs:
         with:
           key: phase-1-measure
       - run: sudo apt-get update && sudo apt-get install -y fuse3 bindfs git python3 util-linux curl gcc zlib1g-dev
+      # bindfs, the plain-FUSE baseline, mounts with allow_other.
+      - run: echo user_allow_other | sudo tee -a /etc/fuse.conf
       - run: ci/check-tree-git.sh
       - run: cargo build --locked -p agentfs
       # Inside the job's 120 minutes, so the upload below still runs when the
@@ -246,3 +248,4 @@ jobs:
           path: |
             ${{ runner.temp }}/*.json
             ${{ runner.temp }}/*.samples.jsonl
+            ${{ runner.temp }}/*.mount.log

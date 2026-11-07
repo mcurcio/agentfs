@@ -56,12 +56,31 @@ class Report:
             self.samples.close()
 
 
+def threads(pid):
+    """What each thread of a process is doing, as /proc says: for a report that
+    must show where a stalled mount waits."""
+    found = []
+    for task in sorted(Path('/proc/%d/task' % pid).glob('*')):
+        row = {'tid': task.name}
+        for name in ('comm', 'wchan', 'syscall'):
+            try:
+                row[name] = (task / name).read_text().strip()
+            except OSError as exc:
+                row[name] = 'unreadable: %s' % exc.strerror
+        try:
+            row['state'] = [l.split(None, 1)[1].strip() for l in (task / 'status').read_text().splitlines() if l.startswith('State:')][0]
+        except (OSError, IndexError):
+            row['state'] = 'unreadable'
+        found.append(row)
+    return found
+
+
 class Ambient:
     """Samples the published metrics while a mode that is not driven by save
     counts runs. Observation only: it decides nothing."""
 
-    def __init__(self, report, metrics, name, interval=30):
-        self.report, self.metrics, self.name, self.interval = report, metrics, name, interval
+    def __init__(self, report, metrics, name, interval=30, pid=None):
+        self.report, self.metrics, self.name, self.interval, self.pid = report, metrics, name, interval, pid
         self.stop = threading.Event()
         self.started = time.monotonic_ns()
         self.thread = threading.Thread(target=self.run, daemon=True)
@@ -70,8 +89,14 @@ class Ambient:
         while True:
             current = read_metrics(self.metrics)
             if current is not None:
-                self.report.sample(self.name, {'elapsed_ns': time.monotonic_ns() - self.started,
-                                               'metrics': current})
+                row = {'elapsed_ns': time.monotonic_ns() - self.started, 'metrics': current}
+                # The mount rewrites the file every 100 ms, after taking the
+                # actor's lock: an old file with a live mount says the actor is held.
+                age = time.time() - Path(self.metrics).stat().st_mtime
+                row['metrics_file_age_s'] = age
+                if age > 60 and self.pid:
+                    row['mount_threads'] = threads(self.pid)
+                self.report.sample(self.name, row)
             if self.stop.wait(self.interval):
                 return
 
@@ -508,6 +533,7 @@ def main():
     p.add_argument('--count', type=int)
     p.add_argument('--interval', type=float, default=1.0)
     p.add_argument('--sample-every', type=int, default=100)
+    p.add_argument('--mount-pid', type=int)
     a = p.parse_args()
     if a.interval <= 0 or a.visibility_timeout <= 0 or a.sample_every <= 0 or (a.count is not None and a.count <= 0):
         p.error('count, interval, sample-every and visibility-timeout must be positive')
@@ -535,7 +561,7 @@ def main():
         if not a.reason:
             if a.mode in ('calls', 'smoke'):
                 if a.baseline:
-                    with Ambient(report, a.metrics, 'ambient'):
+                    with Ambient(report, a.metrics, 'ambient', pid=a.mount_pid):
                         baseline = calls(Path(a.baseline), count)
                         recorded = calls(Path(a.main), count)
                     report.measured('journal_call_cost', {'status': 'MEASURED' if a.mode == 'calls' else 'SMOKE',
@@ -555,12 +581,12 @@ def main():
                 report.measured('held_log', held_log(Path(a.main), a.metrics, a.visibility_timeout,
                                                      report, 'held_log_saves'))
             if a.mode in ('hour', 'smoke'):
-                with Ambient(report, a.metrics, 'ambient'):
+                with Ambient(report, a.metrics, 'ambient', pid=a.mount_pid):
                     report.measured('hour_journal_bytes', hour(
                         Path(a.main), Path(a.state) / 'calls.wal',
                         3600 if a.mode == 'hour' else 2, a.interval))
             if a.landing and a.mode == 'calls':
-                with Ambient(report, a.metrics, 'ambient'):
+                with Ambient(report, a.metrics, 'ambient', pid=a.mount_pid):
                     for size in (1 << 20, 100 << 20):
                         report.measured('save_take_1mib' if size == 1 << 20 else 'save_take_100mib',
                                         save_and_observe(Path(a.sandbox), Path(a.main), size,
