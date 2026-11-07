@@ -101,15 +101,13 @@ the expected failure.
 | Test | Finding | Fails with |
 |---|---|---|
 | `finding_1_git_merge_base_on_crossing_merges` | 1 | a sync leaves a line "which Main already took" |
-| `random_interleavings_git_merge_base` | 1 | 40 of 64 seeds, 2 of them (seeds 32 and 46) a "harness panic: a model file in git": a sync that leaves a line "which Main already took" or drops a line (with the calls of programs outside a transaction, 2026-11-05; 34 with no P3 and the prefix sync; 35 after the fix pass of the review of 2026-11-04, whose generator changes move the random calls; with creates, crashes and the progress rules 36; with the byte calls alone 32; before them 39 of 64, 2 of them a "harness panic: a model file in git", when git's merge leaves one line identity twice) |
+| `random_interleavings_git_merge_base` | 1 | 38 of 64 seeds since the name locks of finding 46 (2026-11-07; 40 before them), 2 of them (seeds 32 and 46) a "harness panic: a model file in git": a sync that leaves a line "which Main already took" or drops a line (with the calls of programs outside a transaction, 2026-11-05; 34 with no P3 and the prefix sync; 35 after the fix pass of the review of 2026-11-04, whose generator changes move the random calls; with creates, crashes and the progress rules 36; with the byte calls alone 32; before them 39 of 64, 2 of them a "harness panic: a model file in git", when git's merge leaves one line identity twice) |
 | `finding_6_git_hunks_on_neighbouring_lines` | 6 | a sync leaves a line "which Main already took" |
 | `finding_30_a_transactions_line_after_the_sandboxs_unfinished_line` | 30 | two lines read as one, `}n9` |
-| `finding_36_a_save_that_changes_nothing_commits_nothing` | 36 | replay: `take main empty`, "the system answered Taken" |
-| `finding_37_an_append_after_a_truncate_makes_new_lines` | 37 | replay: `Main:c shows "n\nyy"`, the trace `"-\nyy"` |
-| `finding_38_a_sync_past_an_open_file_it_leaves_as_it_is` | 38 | replay: `take f1 taken`, "the system answered Waiting" |
-| `finding_39_a_losing_atomic_save_keeps_two_files_apart` | 39 | replay: `commit_files_match_view`: the view's `c` differs from its commit's |
+| `finding_48_a_kept_file_takes_the_parents_last_lines_and_keeps_its_own` | 48 | replay: `one_writer: merge ... originates 24:1 of file 1` |
+| `finding_49_a_take_recorded_past_a_close_picks_the_earlier_entry` | 49 | the fresh model: `Main:c shows "-\n-\n-\n-\n-\n-\n"`, the trace `"-\nt\n..."` |
 
-Findings 36 to 39's tests are in `crates/agentfs-conformance/tests/replay.rs`; findings 40 and 41 have only their traces. These
+Findings 48 and 49's tests are in `crates/agentfs-conformance/tests/replay.rs`; findings 36 to 47 pass there since the owner's answers. These
 were the results at seeds 1..64 on 2026-11-05, unchanged on 2026-11-06; a change that moves a count says so in
 its pull request. Findings 29, 31, 32 and 33 pass since the owner's rules R10.6, R10.3, R10.8 and R10.9, under
 `r10_*` names (MODEL.md); finding 35 passes since the owner's answer of 2026-11-06 under R10.6, under its own name. Finding 27's and finding 28's tests pass since the owner's decisions of 2026-11-05 (one of them went
@@ -343,7 +341,7 @@ What a replay decides, each reported rather than hidden:
 The in-scope traces at CI's seeds are 72 from scenarios and 94 from seeds (64 and 16 of the phase 1 generators, and 14 of
 the ordinary ones that happened to stay in scope). The rest are excluded by the reasons above, and the replay prints the
 count of each. The floors
-in `.github/workflows/phase-1.yml` are what passes: 74 and 94 on the library, and 69 and 16 on mounts, where 81 in-scope traces are
+in `.github/workflows/phase-1.yml` are what passes: 74 and 94 on the library, and 71 and 16 on mounts, where 81 in-scope traces are
 not mountable. Library and model replay every in-scope trace. `[phase1-seeds]` in a pushed commit message, or a manual run, replays
 the phase 1 generators at seeds 1 to 500 on the library, in four shards (`ci/replay-seeds.sh`): too slow for every push, and fast
 enough for a job.
