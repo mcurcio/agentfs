@@ -445,9 +445,30 @@ An open or rejected finding has a test marked `#[ignore = "coherence finding N: 
    (`finding_43_model_and_library_agree_on_a_hidden_line_the_sandbox_deleted`). The check does not: its R10.9 excuse covers only a line the
    sandbox never held. It is not new: the same test fails on the code before this finding's lane. A fix pass may not widen an
    excuse, so `finding_43_a_sync_hides_a_line_the_sandbox_deleted_in_a_lost_save` is ignored and the question is the owner's.
+44. **Open, for the owner (2026-11-07): a file the parent unlinked reads empty in a sandbox whose rename of it is undecided (6 of 1,000
+   traces at seeds 1 to 500; none at CI's seeds).** A sandbox renames a file and main unlinks it. Until the parent decides, the sandbox
+   keeps its name (R3a, R11.1). The model's file keeps its lines; the library's sync has no parent's map once the parent unlinked, and
+   keeps only undecided lines, so a program reads an empty file with the right name. View and commit agree here: this is the two
+   sides differing, not finding 39's kind. No ledger rule says what the file holds. Options: (a) the library keeps the sandbox's lines
+   until the decision, as the model does, recommended; (b) the model shows the file empty, as the library does.
+   `finding_44_a_kept_rename_of_a_file_the_parent_unlinked_keeps_its_lines`.
+45. **Open, for the owner (2026-11-07): a landing on the parent's current head (10 of 1,000).** The model fast-forwards it
+   (`r3_fast_forward_when_the_base_is_current`). The library always writes a merge commit, so a later sync has one more commit to
+   deliver: past an open file `take_next` answers Taken where the model answers Waiting. No bytes differ; the first-parent history
+   does. Options: (a) the library fast-forwards too, recommended; (b) the model always merges. `finding_45_a_landing_on_the_parents_head_is_a_fast_forward`.
+46. **Open, for the owner (2026-11-07): what a landing locks (3 of 1,000).** R9.1 says the files its changes touch. The library's queue also
+   locks each name those changes touch, because two files can compete for a name, so a landing waits while another program holds open the
+   file that took that name. The model locks by file identity alone. Both end on an event, so nothing hangs; the library waits longer.
+   Options: (a) the model locks names too, as the library does, and R9.1 says so; (b) the library locks files alone, recommended unless a name
+   clash needs the lock. `finding_46_a_landing_locks_its_files_not_a_name_another_file_took`.
+47. **Open, for the owner (2026-11-07): the same calls, other bytes (5 of 1,000: seeds 78, 164, 189, 428, 484 of the phase 1 generator).** In 78 and
+   164 the library's landing collides (a line of main's written over the line the sandbox wrote), and the model's lands. 189 keeps one
+   line less, 428 names other lost lines, and 484 shows another path. The mechanism is not established and no small test reproduces it.
+   The losing version stays in history in each. These five traces are in `open-findings.txt`.
 
 ## Costs
 
+- A sandbox can read a file the parent unlinked as empty while its rename of it is undecided, until finding 44 is decided.
 - The history does not show that a program saved when its save changed nothing (R8.2, finding 36).
 - After a truncate, or with any call but an append in the open, a repeated line the program wrote can be an old line in the
   diff's reading (R8.3, finding 37), so a sandbox's concurrent edit of that line lands in the rewrite instead of colliding.

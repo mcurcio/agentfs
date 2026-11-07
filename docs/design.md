@@ -5360,6 +5360,9 @@ runner.
     edit of a repeated line can land elsewhere or collide after an upgrade. No bytes are lost. For the owner.
 15. **R10.9's check and a line the sandbox deleted in a save that lost (2026-11-07, MODEL.md finding 43).** Behaviour matches the rule; the
     check's excuse is narrower. For the owner.
+16. **The library's replay at seeds 1 to 500 (2026-11-07, MODEL.md findings 44 to 47).** 976 of 1,000 traces pass; the rest are a file reading
+    empty under an undecided rename, a landing as a merge against a fast-forward, what a landing locks, and five with other bytes, not
+    yet understood. CI's seeds pass. For the owner.
 
 ## 20. Prior art
 

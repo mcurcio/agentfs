@@ -303,3 +303,56 @@ fn an_old_writer_stays_orphaned_when_the_rename_over_loses() {
     assert_eq!(w.orphans.len(), 1, "the old writer saved nothing");
     passes(&w);
 }
+
+/// Finding 44: main unlinks a file a sandbox has renamed, and the rename is undecided, so
+/// the sandbox keeps the file under its name. The model's file keeps its lines until
+/// the parent decides; the library's sync finds no parent map and keeps only undecided
+/// lines, so the sandbox reads an empty file.
+#[test]
+#[ignore = "coherence finding 44: a file the parent unlinked reads empty in a sandbox whose rename of it is undecided"]
+fn finding_44_a_kept_rename_of_a_file_the_parent_unlinked_keeps_its_lines() {
+    let mut w = world();
+    let f = w.create_fork(agentfs_model::world::Tree::Main);
+    let s = Client::Fork(f);
+    World::rename(&mut w, &s, "a", "e");
+    World::unlink(&mut w, &m1(), "a");
+    assert_eq!(w.take_next(TreeId::Fork(1)).unwrap(), Took::Taken);
+    w.finish_take(TreeId::Fork(1)).unwrap();
+    passes(&w);
+}
+
+/// Finding 45: a sandbox's save landing on main's current head is a fast-forward in the
+/// model, and a merge commit in the library. So the model has nothing to deliver before
+/// main's next commit, which waits for an open file, and the library delivers that merge:
+/// `take_next` answers Waiting and Taken. No file's bytes differ.
+#[test]
+#[ignore = "coherence finding 45: a landing on the parent's head is a fast-forward in the model and a merge in the library"]
+fn finding_45_a_landing_on_the_parents_head_is_a_fast_forward() {
+    let mut w = world();
+    let f = w.create_fork(agentfs_model::world::Tree::Main);
+    let s = Client::Fork(f);
+    save(&mut w, &s, "a", &[at(0, "s\n")]);
+    assert_eq!(w.take_next(TreeId::Main).unwrap(), Took::Taken);
+    w.finish_take(TreeId::Main).unwrap();
+    let _held = w.open_write(&s, "a");
+    save(&mut w, &m1(), "a", &[at(2, "m\n")]);
+    assert_eq!(w.take_next(TreeId::Fork(1)).unwrap(), Took::Waiting);
+    passes(&w);
+}
+
+/// Finding 46: a queue step's locks. A landing's unlink of `a` waits in the library because
+/// main's open of another file now holds the name `a` (a name is a lock there), and goes
+/// ahead in the model, which locks only the files the change touches (R9.1).
+#[test]
+#[ignore = "coherence finding 46: the library's landing also locks the names its change touches, the model's only its files"]
+fn finding_46_a_landing_locks_its_files_not_a_name_another_file_took() {
+    let mut w = world();
+    let f = w.create_fork(agentfs_model::world::Tree::Main);
+    let s = Client::Fork(f);
+    let _held = w.open_write(&m1(), "b");
+    World::rename(&mut w, &m1(), "b", "a");
+    World::unlink(&mut w, &s, "a");
+    assert_eq!(w.take_next(TreeId::Main).unwrap(), Took::Taken);
+    w.finish_take(TreeId::Main).unwrap();
+    passes(&w);
+}

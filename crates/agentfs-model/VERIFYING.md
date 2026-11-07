@@ -320,7 +320,8 @@ What a replay decides, each reported rather than hidden:
 - **A take.** A real take is one step, at `take_next`, so a model call during a hold replays after it and trees are
   compared only with no take in progress. Three orderings follow from that, all in `world.rs`'s recording: a call that
   waited for a take is recorded when it runs, under the name its file has then; main's take is recorded after a fork or
-  a sandbox's queue step made during its hold, because those read main without it; and a queue step that only marks a
+  a sandbox's queue step made during its hold, because those read main without it, and after a call that commits on main during
+  it, because that commit goes before the landing in the model's history; and a queue step that only marks a
   wait while another entry is free is not a call, since a real take goes on to the free entry. A take a crash ended
   wrote nothing in the model, so it is not made.
 - **Mounts.** `mountable` takes at most one fork, made before any client call, and no open that both appends and
@@ -348,7 +349,8 @@ enough for a job.
 
 A mismatch is a finding (MODEL.md), never a change to either side without a ledger rule. Its traces
 go in `crates/agentfs-conformance/open-findings.txt` with its number and must keep failing, as an ignored test must, and
-its small reproduction is an ignored test in `crates/agentfs-conformance/tests/replay.rs`. That list is empty now.
+its small reproduction is an ignored test in `crates/agentfs-conformance/tests/replay.rs`. CI's seeds list none. Seeds 1 to 500 list 24 of
+their 1,000 traces (findings 44 to 47), and a listed trace that passes fails the job.
 
 The model and the library share the alignment's call (`agentfs_align`): one environment and one program lookup, so a replay runs one
 release of `git` on both sides. Which release is printed by `ci/check-tree-git.sh`; identities depend on it (MODEL.md, finding 42).
