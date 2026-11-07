@@ -51,11 +51,14 @@ if [ "${MEASURE_TREES_LANDING:-0}" = 1 ]; then args+=(--landing); fi
 # the step's own time limit ends a run that does not finish.
 case "$mode" in calls|storage|pilot|held-log|smoke-kill) args+=(--visibility-timeout 3600);; esac
 if [[ "$mode" = calls || "$mode" = smoke ]] && command -v bindfs >/dev/null; then
+    # A FUSE mount, whatever subtype this libfuse reports for bindfs.
     if bindfs -o direct_io "$work/backing" "$work/plain" >"$work/bindfs.log" 2>&1 &&
-       [ "$(findmnt -n -o FSTYPE -T "$work/plain")" = fuse.bindfs ]; then
+       [[ "$(findmnt -n -o FSTYPE -T "$work/plain")" == fuse* ]]; then
         args+=(--baseline "$work/plain")
     else
+        echo "plain-FUSE baseline unavailable: bindfs log and mount table follow" >&2
         cat "$work/bindfs.log" >&2
+        findmnt -T "$work/plain" >&2 || true
     fi
 fi
 if [ "$mode" != smoke-kill ]; then

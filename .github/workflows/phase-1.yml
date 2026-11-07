@@ -208,7 +208,7 @@ jobs:
             ${{ runner.temp }}/smoke-kill.json.samples.jsonl
 
   # `[phase1-pilot]` in the pushed commit message runs the 1,000-save pilot
-  # alone; `[phase1-measure]` runs every mode.
+  # alone, `[phase1-calls]` the calls mode alone, `[phase1-measure]` every mode.
   measure-plan:
     name: phase 1 measurement plan
     runs-on: ubuntu-24.04
@@ -224,6 +224,8 @@ jobs:
             echo 'modes=["pilot","held-log","calls","hour","storage"]' >> "$GITHUB_OUTPUT"
           elif [[ "$MESSAGE" == *'[phase1-pilot]'* ]]; then
             echo 'modes=["pilot"]' >> "$GITHUB_OUTPUT"
+          elif [[ "$MESSAGE" == *'[phase1-calls]'* ]]; then
+            echo 'modes=["calls"]' >> "$GITHUB_OUTPUT"
           else
             echo 'modes=[]' >> "$GITHUB_OUTPUT"
           fi
