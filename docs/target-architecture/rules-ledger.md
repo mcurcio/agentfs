@@ -279,6 +279,12 @@ without seeing the other. MODEL.md's rules table holds the full wording; this pa
   recommendations for now, and i might change my mind later".
   Tests: `r10_an_unfinished_line_before_a_kept_line_loses_whole`, `r10_an_unfinished_save_after_the_parents_last_line_lands`,
   `a_save_with_an_unfinished_line_before_a_kept_line_loses_whole`
+- **R10.10** · owner · One release of `git` aligns saves everywhere agentfs is built and tested: the image and CI run the
+  release in `ci/git-release`, and each fails if it has another. An upgrade is a known change: it changes how later saves
+  align repeated lines, and it changes no stored bytes or line identities. Owner, 2026-11-07: "1 b 2 a 3 a 4 a is fine 5 a sounds correct, right? 6 a". This is his 1, option (b)
+  of finding 42. Revisable: option (a) was to accept two releases and record it, and option (c) a Rust histogram diff, so
+  that identity no longer depends on the release. Cost: an upgrade can make a concurrent edit of a repeated line land
+  elsewhere or collide, and CI builds git from source, once per release.
 - **R10.9** · approved · Until the parent decides, a sandbox holding an undecided unfinished last line shows that line
   and hides the parent's later lines that a sync would put after it, the mirror of R10.6. Nothing is lost: the sandbox
   gets the parent's version once decided, so R3d's decided version waits for that decision. Owner, 2026-11-06, choosing

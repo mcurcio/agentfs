@@ -353,4 +353,4 @@ its small reproduction is an ignored test in `crates/agentfs-conformance/tests/r
 their 1,000 traces (findings 44 to 47), and a listed trace that passes fails the job.
 
 The model and the library share the alignment's call (`agentfs_align`): one environment and one program lookup, so a replay runs one
-release of `git` on both sides. Which release is printed by `ci/check-tree-git.sh`; identities depend on it (MODEL.md, finding 42).
+release of `git` on both sides. Identities depend on the release, so `ci/git-release` pins one for the image and for CI, and `ci/check-tree-git.sh` fails on another (R10.10).

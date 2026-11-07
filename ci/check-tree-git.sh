@@ -5,11 +5,18 @@ set -euo pipefail
 probe=$(mktemp -d)
 trap 'rm -rf "$probe"' EXIT
 # Which release answers matters: line identity depends on it (MODEL.md, finding 42).
-# The model and the library both look it up in agentfs_align::GIT_PATH.
-git --version
-for git in $(PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin type -ap git); do
+# The model and the library both look it up in agentfs_align::GIT_PATH, CI's jobs and
+# the image are pinned to one release (ci/git-release), and each fails if it has another.
+GIT_PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+for git in $(PATH=$GIT_PATH type -ap git); do
     echo "$git: $("$git" --version)"
 done
+release=$(sed -n 1p "$(dirname "$0")/git-release")
+found=$(PATH=$GIT_PATH git --version)
+if [ "$found" != "git version $release" ]; then
+    echo "agentfs runs $found, and ci/git-release pins $release" >&2
+    exit 1
+fi
 repo=$probe/repo.git
 git init --bare "$repo"
 export GIT_DIR=$repo GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1

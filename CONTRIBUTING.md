@@ -69,6 +69,11 @@ RUN apt-get update \
 EOF
 ```
 
+This image has the release of `git` that CI and the agentfs image run
+(`ci/git-release`; `ci/check-tree-git.sh` fails on another). Change that file
+when a base image brings a new release, and say so in the commit: later saves
+align repeated lines differently (MODEL.md, finding 42).
+
 Then run any cargo command against your checkout, with the build and the
 registry in named volumes so they survive between runs:
 

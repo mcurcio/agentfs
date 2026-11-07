@@ -428,15 +428,15 @@ An open or rejected finding has a test marked `#[ignore = "coherence finding N: 
    happen to name the same lines; on 2.56.0 they do not, so it showed only on CI. The model and the library now share one call,
    one environment and one program lookup (`agentfs_align`), so this cannot come from how git is called.
    `finding_41_an_offset_write_then_an_append_is_one_alignment`.
-42. **Open, for the owner (2026-11-07): line identity depends on the `git` release, and stored volumes keep what it decided.** CI
-   has git 2.56.0; the container image has Debian trixie's 2.47.3. Their histogram diffs differ: 31 of the 436 pairs above have
-   different hunks (six `-` lines against `x`, `-`, `y`, `-`, `-`, `-`: `-1,3 +1,3` on 2.47.3; `-0,0 +1` and `-2,2 +3` on 2.56.0), and
-   some of those pair other lines even after trimming. Identities are written into each commit's line map at the save and never
-   derived again, so an upgrade changes no stored line and no bytes. It does change how later saves align: the same save can
-   pair different repeated lines, so a concurrent edit can land on another line or collide, on a volume whose git was upgraded.
-   So CI's replay proves the rules on 2.56.0, and the image runs 2.47.3. Scenarios and CI's seeds passed on both releases locally
-   (the model and the library each on one release; mounts only on CI's). No test can fail on this; `ci/check-tree-git.sh` prints each
-   git on the path.
+42. **Resolved by the owner (2026-11-07, "1 b 2 a 3 a 4 a is fine 5 a sounds correct, right? 6 a"; his 1, option b): one release of `git` everywhere (R10.10).** Line identity
+   depends on the release: their histogram diffs differ, and 31 of 436 pairs of repeated-line files had different hunks between
+   2.47.3 and 2.56.0 (six `-` lines against `x`, `-`, `y`, `-`, `-`, `-`: `-1,3 +1,3` on 2.47.3; `-0,0 +1` and `-2,2 +3` on 2.56.0).
+   The image, the development image and CI now run 2.47.3, named in `ci/git-release`. The image's build and `ci/check-tree-git.sh` each
+   fail on another release. Debian trixie ships 2.47.3, so the two images pay nothing, and CI builds that release's tarball once, cached;
+   pinning 2.56.0 would have added a C build stage to the image and left it to carry git's security updates itself.
+   Identities are written into each commit's line map at the save and never derived again, so an upgrade changes no stored line
+   and no bytes. It does change how later saves align: the same save can pair different repeated lines. Revisable: option a was
+   to accept two releases, and option c a Rust histogram diff.
 43. **Open, for the owner (2026-11-07): R10.9 hides a line the sandbox itself deleted in a save that lost (seed 191 of 1 to 500 of
    `full_lineage`, `adjacent_lines` and `commit_dates_decide_nothing`).** A sandbox's save deletes the file's last lines and loses;
    before that decision reaches it, its next save leaves the line before them unfinished. The sync brings the parent's version: those
@@ -474,8 +474,10 @@ An open or rejected finding has a test marked `#[ignore = "coherence finding N: 
   diff's reading (R8.3, finding 37), so a sandbox's concurrent edit of that line lands in the rewrite instead of colliding.
 - A sandbox holding a file open waits longer for later commits (R9.3, finding 38): a parent's commit that writes that file holds
   back it and every later one, even when the sandbox's file would read the same after it.
-- Which repeated line a save keeps depends on the `git` release (finding 42): a volume keeps what it stored, and aligns later saves
-  by the release it runs now.
+- Which repeated line a save keeps depends on the `git` release, and all of agentfs is pinned to one (R10.10, finding 42). An upgrade
+  keeps every stored byte and identity, and aligns later saves by the new release, so a concurrent edit of a repeated line can land
+  elsewhere or collide. CI builds that release from upstream's tarball where the image has Debian's package of it; Debian's
+  `1:2.47.3-0+deb13u1` carries no patches, and a later Debian revision could.
 - A program in a sandbox can see a line it already read go away for a while (R10.6, finding 35): when main cuts that line to
   an unfinished last line in front of the sandbox's undecided line, the file shows neither version until the parent decides.
 - A change loses whole for one line (rule 3e): a save's or transaction's lines that collided with nothing are

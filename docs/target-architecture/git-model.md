@@ -938,8 +938,8 @@ Out of scope: nested forks, transactions, Rules and view profiles, replication,
 CSI, several view hosts, upgrades. **Exit:** every pass-or-fail row passes on CI's Linux runners (FUSE runs only
 there, AGENTS.md); any failure is a finding to resolve in the implementation or the model before phase 1 is validated; the
 measurements set the first budgets (no number here is a budget yet). The replay's alignment and the library's are one call
-(`agentfs_align`), so they run one release of `git`: 2.56.0 on CI, printed by `ci/check-tree-git.sh`, and Debian trixie's 2.47.3 in the
-image. The releases align some repeated lines differently (MODEL.md, finding 42).
+(`agentfs_align`), and the image and CI run one release of `git`, the one in `ci/git-release` (R10.10). An upgrade changes how later saves
+align repeated lines; stored bytes and identities do not change (MODEL.md, finding 42).
 
 ## New terms
 

@@ -4,7 +4,7 @@
 //!
 //! Which lines a diff pairs still depends on the `git` release (MODEL.md, finding
 //! 42): 2.47.3 and 2.56.0 align some files of repeated lines differently. This
-//! crate fixes how the program is called, not what the program answers.
+//! crate fixes how the program is called, and `ci/git-release` which release answers.
 
 use std::io;
 use std::os::unix::fs::DirBuilderExt;

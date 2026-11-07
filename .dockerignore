@@ -6,3 +6,4 @@
 !vendor/
 vendor/*
 !vendor/fuser/
+!ci/git-release

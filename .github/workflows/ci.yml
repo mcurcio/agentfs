@@ -76,6 +76,8 @@ jobs:
           key: ${{ matrix.features }}
       - run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config
       # cli_lfs.rs runs `git lfs pull` when git-lfs is installed; make sure.
+      # The model and the library align lines with the image's release of git.
+      - uses: ./.github/actions/pinned-git
       - run: git lfs version
       - run: cargo test --workspace --locked ${{ matrix.features == 'all' && '--all-features' || '' }}
 
@@ -476,6 +478,7 @@ jobs:
         with:
           key: trees
       - run: sudo apt-get update && sudo apt-get install -y fuse3
+      - uses: ./.github/actions/pinned-git
       - run: cargo build --locked -p agentfs
       - run: ci/e2e-trees.sh
       - run: ci/e2e-trees-ordering.sh

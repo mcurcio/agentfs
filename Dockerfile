@@ -89,6 +89,10 @@ RUN apt-get update \
 COPY --from=build /usr/local/bin/agentfs /usr/local/bin/agentfs-csi /usr/local/bin/
 COPY --from=mergiraf /out/bin/mergiraf /usr/local/bin/
 COPY --from=mergiraf /out/doc/ /usr/share/doc/mergiraf/
+# Fails the build if Debian's git is not the release CI runs: line identity depends
+# on it (MODEL.md, finding 42). An upgrade changes ci/git-release in the same commit.
+COPY ci/git-release /usr/share/agentfs/git-release
+RUN test "$(git --version)" = "git version $(sed -n 1p /usr/share/agentfs/git-release)"
 # Fails the build if a shared library is missing, or a stub (which exits
 # 1) was shipped.
 RUN agentfs --version && agentfs probe --help >/dev/null \
