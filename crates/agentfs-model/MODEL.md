@@ -407,6 +407,12 @@ An open or rejected finding has a test marked `#[ignore = "coherence finding N: 
 40. **Open, for the owner (2026-11-06): a line's place among repeated lines.** One trace
    (`random_interleavings_phase1_scope.seed50`): main reads `n3,-,},-,-,-,-,-`, the model `n3,-,-,},-,-,-,-`. Same lines, other
    order. Its mechanism is not established, and no small test reproduces it yet (1 of 94).
+41. **Open, for the owner (2026-11-06): the model's alignment and the library's can differ on one git.** On CI's git 2.56, seed
+   58's save of `n6`, `-`... to six `-` lines costs the model three lost lines and the library five, the same two `-` lines
+   more; on git 2.47.3 both report five. Both call `git diff --histogram` on the same bytes, the model on two blobs with the
+   environment's configuration and the library with `--no-index` and none. Which of those differs was not established: CI
+   alone has that git. Line identity should not depend on either. Only what a collision names differs here, not the
+   bytes. (1 of 94, on CI only.)
 
 ## Costs
 

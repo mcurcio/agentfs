@@ -524,8 +524,11 @@ impl Oracle {
                 continue;
             }
             let cur = w.file(&at, &file);
+            if !cur.name.live() {
+                continue;
+            }
             self.ran(w, &at, u, &file, to.as_deref());
-            if cur.name.live() && to.as_deref() != cur.path() {
+            if to.as_deref() != cur.path() {
                 at = chain.pop().expect("a granted call's commit");
             }
         }

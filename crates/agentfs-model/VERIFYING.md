@@ -109,7 +109,7 @@ the expected failure.
 | `finding_38_a_sync_past_an_open_file_it_leaves_as_it_is` | 38 | replay: `take f1 taken`, "the system answered Waiting" |
 | `finding_39_a_losing_atomic_save_keeps_two_files_apart` | 39 | replay: `commit_files_match_view`: the view's `c` differs from its commit's |
 
-Findings 36 to 39's tests are in `crates/agentfs-conformance/tests/replay.rs`; finding 40 has only its trace. These
+Findings 36 to 39's tests are in `crates/agentfs-conformance/tests/replay.rs`; findings 40 and 41 have only their traces. These
 were the results at seeds 1..64 on 2026-11-05, unchanged on 2026-11-06; a change that moves a count says so in
 its pull request. Findings 29, 31, 32 and 33 pass since the owner's rules R10.6, R10.3, R10.8 and R10.9, under
 `r10_*` names (MODEL.md); finding 35 passes since the owner's answer of 2026-11-06 under R10.6, under its own name. Finding 27's and finding 28's tests pass since the owner's decisions of 2026-11-05 (one of them went
@@ -307,7 +307,7 @@ what a trace's `Shown` exposes: each tree's files, and the lost lines of each co
 # Record (the same run CI makes), then replay. Without Linux and /dev/fuse, mounts stay NOT RUN.
 AGENTFS_MODEL_TRACE_DIR=$T cargo test --locked -p agentfs-model --test scenarios --test interleavings
 cargo run --locked -p agentfs-conformance --bin phase1-replay -- model   "$T" --min-scenarios 69 --min-seeds 94
-cargo run --locked -p agentfs-conformance --bin phase1-replay -- library "$T" --min-scenarios 69 --min-seeds 79
+cargo run --locked -p agentfs-conformance --bin phase1-replay -- library "$T" --min-scenarios 69 --min-seeds 78
 # One trace, its state kept to read with git:
 PHASE1_REPLAY_KEEP=/tmp/k phase1-replay library "$T" --min-scenarios 0 --min-seeds 0 --only NAME
 ```
@@ -338,6 +338,13 @@ What a replay decides, each reported rather than hidden:
 | Automatic takes (R1) | a mount takes only through the gate | mounted P1/P2 cases |
 | R1.3 an open's own read, R1.1 another reader | on the trait, not compared: `Shown` does not hold them | byte and page-cache jobs |
 
-A mismatch is a finding (MODEL.md, findings 36 to 40), never a change to either side without a ledger rule. Its traces
+The in-scope traces at CI's seeds are 69 from scenarios and 94 from seeds (64 and 16 of the phase 1 generators, and 14 of
+the ordinary ones that happened to stay in scope). The rest are excluded by the reasons above, and the replay prints the
+count of each. The floors
+in `.github/workflows/phase-1.yml` are what passes: 69 and 78 on the library, with 16 seed traces listed as open
+findings, and 66 and 16 on mounts, where 81 in-scope traces are not mountable. Library and model replay every in-scope
+trace.
+
+A mismatch is a finding (MODEL.md, findings 36 to 41), never a change to either side without a ledger rule. Its traces
 go in `crates/agentfs-conformance/open-findings.txt` with its number and must keep failing, as an ignored test must, and
 its small reproduction is an ignored test in `crates/agentfs-conformance/tests/replay.rs`.

@@ -15,3 +15,5 @@
 39 random_interleavings_phase1_scope.seed21.trace
 39 random_interleavings_phase1_scope.seed34.trace
 40 random_interleavings_phase1_scope.seed50.trace
+# Fails on CI's git 2.56, not on 2.47.3: replay reports this line as stale there.
+41 random_interleavings_phase1_scope.seed58.trace
