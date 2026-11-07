@@ -87,25 +87,81 @@ Use the individual case output when reading that earlier run.
 
 ## Measurements
 
-Only the hour result completed. It is an observation of `e8d12a6`, before the
-later Git durability corrections, with `FOPEN_DIRECT_IO` on the runner's ext4
-filesystem. The artifact records the binary hash, Git/kernel versions, mount
-options and clean source state. These figures are not budgets.
+Recorded, not gated: no figure here is a budget (git-model §18). Each report
+(`ci/measure-trees.py`) is written when the run starts with status `RUNNING`,
+replaced at every measurement, and carries a samples file (one JSON line per
+100 saves, or per 30 seconds) and the mount's log; a run that is cut leaves what
+it reached. The reports below are from commits `964618a` (run
+[42323052176](https://github.com/mcurcio/agentfs/actions/runs/42323052176)) and
+`12bd7a8` (run [42328771866](https://github.com/mcurcio/agentfs/actions/runs/42328771866),
+calls only). The product code is that of `7feba71` in both; the commits between
+changed only the harness. `FOPEN_DIRECT_IO`, the runner's ext4, Git 2.56.0,
+Linux 7.0 (azure), debug build. Two runs of one mode on this runner differed by
+up to 2 times (below), so read a figure as an observation.
 
 | Measurement | Result | CI |
 |---|---|---|
-| One-hour WAL growth | **415,628 bytes** over **3,600.000128498 seconds**; 3,597 eight-byte `pwrite` calls, 28,776 payload bytes, one-second pause after each call. Logical WAL delta excludes open/close records | [Hour job](https://github.com/mcurcio/agentfs/actions/runs/42220263763/job/127900250449), artifact `phase-1-measure-hour` (ID 13505399957) |
-| Journal median/p99 vs plain FUSE | **NOT RUN to a report**: calls job reached its 120-minute job limit | [Calls job](https://github.com/mcurcio/agentfs/actions/runs/42220263763/job/127900250331) |
-| Line-map bytes per 10,000 saves | **NOT RUN to a report**: storage job reached its 120-minute job limit | [Storage job](https://github.com/mcurcio/agentfs/actions/runs/42220263763/job/127900250209) |
-| Save/take time, 1 MiB and 100 MiB | **NOT RUN to a report**: no artifact was produced before the calls job timed out | Same calls job |
-| Landing wait incidence/duration | **NOT RUN to a report**: finite conformance progress passed, but the measurement artifact is absent | Same calls job |
+| Journal call cost against plain FUSE | 1,000 `pwrite` of 8 bytes at offset 0, one open descriptor. Plain FUSE (`bindfs -o direct_io`): median **27.4 us**, p99 **55.6 us**. Recording mount: median **407.5 us**, p99 **2,264.9 us**. Wall time around the syscall: it includes FUSE and the journal's `fsync`, not the journal alone | [calls job](https://github.com/mcurcio/agentfs/actions/runs/42328771866/job/128270258717), artifact `phase-1-measure-calls` (ID 13559071579) |
+| One hour of journal growth | **502,485 bytes** over **3,600.000157 seconds**; 3,597 eight-byte `pwrite` calls, 28,776 payload bytes, a pause of one second after each. Logical delta of `calls.wal`, open and close records excluded. (The earlier figure, 415,628 bytes at `e8d12a6`, was before the journal records changed.) | [hour job](https://github.com/mcurcio/agentfs/actions/runs/42323052176/job/128251890571), artifact `phase-1-measure-hour` (ID 13555984904) |
+| Line-map bytes per 10,000 saves | `metadata.json` is **195,676 bytes** after 10,000 one-line saves (about 19.6 bytes a save); the 10,000 snapshots are **960,893,676 bytes** logical and **241,234,350 bytes** as Git objects (10,000 distinct blobs); the 10,000 commits are 3,615,560 bytes logical and 2,256,009 on disk; the repository is 245,639,637 bytes of files, 425,697,280 allocated; `refs/` stays 164 bytes. The journal is 15,043,489 bytes after 10,001 saves (1,504 bytes a save). Elapsed **2,410.95 seconds** | [storage job](https://github.com/mcurcio/agentfs/actions/runs/42323052176/job/128251890644), artifact `phase-1-measure-storage` (ID 13555264336) |
+| Save and take, 1 MiB | Write and close **24.3 ms**; actor save 275.5 ms; landing 581.4 ms, of which the sync back is 294.3 ms; both views and an empty queue after **2.03 s** | calls job above |
+| Save and take, 100 MiB | Write and close **32.4 s**; actor save 25.7 s; landing 290.2 s; sync back 26.6 s; both views after **392.5 s**. (The run before, at `964618a`: 26.3 s, 16.7 s, 257.6 s, 11.2 s, 306.1 s) | calls job above; [earlier job](https://github.com/mcurcio/agentfs/actions/runs/42323052176/job/128251890610), artifact 13555421820 |
+| Waits | One held log, one waiting sandbox save: **1** wait, **1,465 s** in total. The five independent saves became visible while it was held after **387 to 394 s** each, and five more opens of the held log took a median **283.4 s**, p99 **284.1 s**. Each was slow because the 100 MiB file was in the tree: every save and take rereads and rewrites it (below). The earlier run: 1 wait of 624 s, saves visible after 184 to 200 s | calls job above |
+| Held log and compaction | A log held open while another file takes 24 saves of 8 MiB: the journal peaks at **66,149,105 bytes**, drops to 745 bytes at each of 2 compactions, and ends at 49,610,089 bytes. The held file's one line is all a compaction keeps. 24 saves took **159.7 s** | [held-log job](https://github.com/mcurcio/agentfs/actions/runs/42323052176/job/128251890523), artifact `phase-1-measure-held-log` (ID 13552934814) |
 
-Both timed-out jobs finished with cancellation conclusions at their configured
-limits; they were not manually cancelled as a fix. Do not extrapolate figures
-from them. The harness writes its report at the end, so intermediate samples
-were lost. Persist incremental measurements and investigate queue-planning and
-line-placement cost before repeating the large jobs. All these earlier runs
-had finished when this handoff was prepared.
+### Why 10,000 saves took over two hours: the pilot and its two causes
+
+The 1,000-save pilot of the storage pattern (a file truncated and written with one
+new line, closed each time, through the mount with a sandbox beside it) ran on
+the commit that added the stage counters (`db557f5`,
+[run 42302911952](https://github.com/mcurcio/agentfs/actions/runs/42302911952)).
+It took **957.8 seconds**, and Git children per save rose from 92 in the first
+hundred to 991 in the last. Per-stage totals, seconds: `event_owners` 865.3
+(`queue_plan` 891.7 encloses it), `snapshot_read` 15.5, `checkout` 14.5,
+`objects` 18.7, `ref_copy` 13.6, `align` 4.4, `journal_append` 1.8 (of which
+`fsync` 1.5), `sync_merge` 0.7. Of 541,546 children, about 500,000 were the
+`git cat-file` of one commit in a walk of the sandbox's whole history.
+
+Each hypothesis, read against the pilot (P), the held-log run (H) and the final
+calls and storage runs (C, S):
+
+| # | Hypothesis | Verdict |
+|---|---|---|
+| 1 | `prior_decisions` walks first-parent history | **Not shown.** It ran 0 times in P, S and H (nothing lands on main in those patterns) and 15.5 s in the whole calls run (under 1 percent of it). Not changed |
+| 2 | `event_owners` walks the DAG once per sync | **Confirmed, the main cause.** 865 of 958 s in P, and a child per commit: 92.0 children per save in the first hundred, 991.5 in the last. Fixed: one `git log` at open, then a map (design §17.3). After it, P took **92.5 s**, children per save were **40.9 at save 100 and 40.0 at save 900** (ratio 0.98), and S took 10,000 saves at a flat 40.0 |
+| 2b | (found by H, not in the page) `undecided` asked Git `is_ancestor` once per line of the sandbox's copy | **Confirmed.** An 8 MiB file is 8,234 lines: 8,234 children and 70 to 130 s of each save's sync plan; 24 saves took **1,771.8 s**. Fixed: ask once per commit. After it, 24 saves took **159.7 s** and the run started about 1,100 children in all |
+| 3 | `checkout_tree` rewrites every file on every save | **Not shown for a small tree.** 6.9 ms a run at save 100, 7.4 ms at 1,000, 9.9 ms at 9,900 with one file. Not isolated for many files, and with the 100 MiB file in the tree it is 50.3 s of the calls run. Not changed |
+| 4 | `commit` writes a blob for every file | **Confirmed where it hurts, not fixed.** `objects` is 18.1 ms a save at 100 and 37.0 ms at 9,900 in S (it grows with the line map). In the calls run it is 755 s: the 100 MiB blob is hashed and synced on each later save. The fix the page allows (write only the changed files) is not made |
+| 5 | `metadata.json` and `namespace.json` grow | **Confirmed, and it is the line-map measurement:** 19.6 bytes a save. It drives the remaining growth below. Never pruned |
+| 6 | `progress_one` replans every entry, quadratic in a backlog | **Not shown.** The queue held at most one entry in P and S (`queue_plan` ran once per sync). The calls run's waiting entry is the only backlog and its cost is the 100 MiB file's |
+| 7 | `call()` clones and replays the file on each write | **Not dominant.** A 100 MiB save is 26 to 32 s of write and close in C (of 306 to 393 s to converge). Tested only locally (Docker on macOS, debug build): 100 writes of 1 MiB took 27 s |
+| 8 | `align` forks `git diff` in a temporary directory per save | **Confirmed as one child a save, and growing:** 2.1 ms a run at save 100, 64.7 ms at 9,900 (S), 321.6 s or 13 percent of the 10,000 saves |
+
+What dominates the 10,000 saves now (S, 2,411 s, 40.0 children a save throughout,
+77 ms a save at save 100 and 400 ms at save 9,900): `queue_plan` 1,194 s (50
+percent: 218 ms a sync at the end), `snapshot_read` 338 s, `align` 322 s,
+`objects` 278 s, `checkout` 173 s, `ref_copy` 158 s. These grow with the line
+map and are not children any more. About **790 s (33 percent)** of the run is
+inside `queue_plan` but in none of its measured parts (`snapshot_read`,
+`sync_merge`): the copies of the sandbox's line maps, the comparison of two
+snapshots and the checks of each line version. The frozen `Stages` has no field
+for them, so the next measurement needs a new one.
+
+With the 100 MiB file in the tree, every later save and take costs minutes:
+`snapshot_read` is 2,899 s, `objects` 755 s and `judge` 244 s of the calls run
+(`queue_plan` 1,984 s). `judge` and the sync plan grew faster than linearly with
+the file's lines in a local run (Docker on macOS, debug): `judge` 28 s at 32 MiB,
+109 s at 64 MiB, 316 s at 100 MiB. A memo of parsed snapshots keyed by commit,
+writing only the files that changed, and the line referee's own cost are the
+allowed fixes left; this slice used its two fix rounds on the causes above.
+
+The first calls run, before the second fix (`36f07d2`,
+[run 42308260086](https://github.com/mcurcio/agentfs/actions/runs/42308260086)),
+reached its 110-minute step limit with its 100 MiB landing still queued: the
+report it left (status `RUNNING`, 221 samples) is what the harness keeps for a
+cut run. The mount publishes metrics between actor steps, so a long step looks
+like a stalled file. Pilot and storage on that commit: **93.3 s** and
+**2,092 s**, flat at 40 children a save.
 
 ## Approved continuation decisions
 

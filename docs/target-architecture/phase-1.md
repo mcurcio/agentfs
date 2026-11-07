@@ -45,9 +45,9 @@ correction, not a new landing rule.
 |---|---|
 | Recording, byte calls and object lifetime | Descriptor, byte and orphan cases pass; shared mappings follow R1.4 and the restart row follows §18 as reworded: read the phase-1 page-cache job |
 | Line-map storage and whole-save parent referee | Connected; R10.8 and R10.9 built; mounted result of findings 32 and 33: read the phase-1 conformance job |
-| Live landing/sync, P1/P2, writer locks, no alarm | Mounted finite progress scenarios pass; quantitative wait measurements are unavailable |
+| Live landing/sync, P1/P2, writer locks, no alarm | Mounted finite progress scenarios pass; the wait counts of one held-log run are in the [handoff](phase-1-handoff.md#measurements) |
 | Journal kills, state exhaustion and power loss | The journal is the commit point for pointer steps; refs are a copy rebuilt on every open. Each row's evidence is in CI for the commit that claims it |
-| Model conformance and §18 measurements | The replay (below) fails on findings 36 to 41, so conformance is not met. Actual hour recorded; calls and 10,000-save jobs reached their two-hour limits without reports |
+| Model conformance and §18 measurements | The replay (below) fails on findings 36 to 41, so conformance is not met. The §18 measurements report on `964618a` and `12bd7a8` ([handoff](phase-1-handoff.md#measurements)): journal against plain FUSE, hour, 10,000 saves, 1 and 100 MiB, waits and the held log. No figure is a budget; 10,000 saves took 2,411 s once the history walk and the per-line Git calls were fixed |
 
 Known model finding 32 reproduced on the real mount: a losing truncate to `y`,
 followed by an offset write of `n6` before the parent decision was readable,
