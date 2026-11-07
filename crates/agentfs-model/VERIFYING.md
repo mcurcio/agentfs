@@ -323,7 +323,8 @@ What a replay decides, each reported rather than hidden:
   a sandbox's queue step made during its hold, because those read main without it, and after a call that commits on main during
   it, because that commit goes before the landing in the model's history; and a queue step that only marks a
   wait while another entry is free is not a call, since a real take goes on to the free entry. A take a crash ended
-  wrote nothing in the model, so it is not made.
+  wrote nothing in the model, so it is not made. A take recorded later than it began can pick another entry at its recorded
+  place, when a call in between freed an earlier one: that is finding 49, open.
 - **Mounts.** `mountable` takes at most one fork, made before any client call, and no open that both appends and
   writes at an offset: Linux has no such descriptor. The take gate (`AGENTFS_TAKE_GATE`, a failpoints build) runs each
   take at the trace's point and answers by a fifo, and a synchronous request after `close(2)` proves its `RELEASE`
@@ -342,15 +343,15 @@ What a replay decides, each reported rather than hidden:
 The in-scope traces at CI's seeds are 72 from scenarios and 94 from seeds (64 and 16 of the phase 1 generators, and 14 of
 the ordinary ones that happened to stay in scope). The rest are excluded by the reasons above, and the replay prints the
 count of each. The floors
-in `.github/workflows/phase-1.yml` are what passes: 72 and 94 on the library, and 69 and 16 on mounts, where 81 in-scope traces are
+in `.github/workflows/phase-1.yml` are what passes: 74 and 94 on the library, and 69 and 16 on mounts, where 81 in-scope traces are
 not mountable. Library and model replay every in-scope trace. `[phase1-seeds]` in a pushed commit message, or a manual run, replays
 the phase 1 generators at seeds 1 to 500 on the library, in four shards (`ci/replay-seeds.sh`): too slow for every push, and fast
 enough for a job.
 
 A mismatch is a finding (MODEL.md), never a change to either side without a ledger rule. Its traces
 go in `crates/agentfs-conformance/open-findings.txt` with its number and must keep failing, as an ignored test must, and
-its small reproduction is an ignored test in `crates/agentfs-conformance/tests/replay.rs`. CI's seeds list none. Seeds 1 to 500 list 24 of
-their 1,000 traces (findings 44 to 47), and a listed trace that passes fails the job.
+its small reproduction is an ignored test in `crates/agentfs-conformance/tests/replay.rs`. CI's seeds list none. At seeds 1 to 500 the listed traces
+are findings 48 and 49, and a listed trace that passes fails the job.
 
 The model and the library share the alignment's call (`agentfs_align`): one environment and one program lookup, so a replay runs one
 release of `git` on both sides. Identities depend on the release, so `ci/git-release` pins one for the image and for CI, and `ci/check-tree-git.sh` fails on another (R10.10).

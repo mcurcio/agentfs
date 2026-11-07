@@ -1,27 +1,14 @@
 # Traces that fail for an open finding (MODEL.md), which replay requires to keep
 # failing: `<finding> <trace file>`. Take a line off when its finding closes.
-# Findings 44 to 47: seeds past CI's, seen by `[phase1-seeds]` (ci/replay-seeds.sh).
-44 random_interleavings_phase1_scope.seed259.trace
-44 random_interleavings_phase1_scope.seed291.trace
-44 random_interleavings_phase1_scope.seed280.trace
-44 random_interleavings_rounds_phase1_scope.seed43.trace
-44 random_interleavings_rounds_phase1_scope.seed239.trace
-44 random_interleavings_rounds_phase1_scope.seed51.trace
-45 random_interleavings_phase1_scope.seed67.trace
-45 random_interleavings_phase1_scope.seed142.trace
-45 random_interleavings_phase1_scope.seed240.trace
-45 random_interleavings_phase1_scope.seed242.trace
-45 random_interleavings_phase1_scope.seed244.trace
-45 random_interleavings_phase1_scope.seed268.trace
-45 random_interleavings_phase1_scope.seed292.trace
-45 random_interleavings_phase1_scope.seed323.trace
-45 random_interleavings_phase1_scope.seed404.trace
-45 random_interleavings_phase1_scope.seed426.trace
-46 random_interleavings_phase1_scope.seed205.trace
-46 random_interleavings_phase1_scope.seed214.trace
-46 random_interleavings_phase1_scope.seed297.trace
-47 random_interleavings_phase1_scope.seed78.trace
-47 random_interleavings_phase1_scope.seed164.trace
-47 random_interleavings_phase1_scope.seed189.trace
-47 random_interleavings_phase1_scope.seed428.trace
-47 random_interleavings_phase1_scope.seed484.trace
+# Findings 48 and 49: seeds past CI's, seen by `[phase1-seeds]` (ci/replay-seeds.sh).
+48 random_interleavings_phase1_scope.seed101.trace
+48 random_interleavings_phase1_scope.seed131.trace
+48 random_interleavings_phase1_scope.seed180.trace
+48 random_interleavings_phase1_scope.seed222.trace
+48 random_interleavings_phase1_scope.seed389.trace
+48 random_interleavings_phase1_scope.seed428.trace
+48 random_interleavings_rounds_phase1_scope.seed196.trace
+48 random_interleavings_rounds_phase1_scope.seed431.trace
+49 random_interleavings_phase1_scope.seed78.trace
+49 random_interleavings_phase1_scope.seed164.trace
+49 random_interleavings_phase1_scope.seed189.trace

@@ -437,38 +437,65 @@ An open or rejected finding has a test marked `#[ignore = "coherence finding N: 
    Identities are written into each commit's line map at the save and never derived again, so an upgrade changes no stored line
    and no bytes. It does change how later saves align: the same save can pair different repeated lines. Revisable: option a was
    to accept two releases, and option c a Rust histogram diff.
-43. **Open, for the owner (2026-11-07): R10.9 hides a line the sandbox itself deleted in a save that lost (seed 191 of 1 to 500 of
-   `full_lineage`, `adjacent_lines` and `commit_dates_decide_nothing`).** A sandbox's save deletes the file's last lines and loses;
-   before that decision reaches it, its next save leaves the line before them unfinished. The sync brings the parent's version: those
-   lines are live there and fall behind the undecided unfinished line, so R10.9 hides them, and they arrive with the decision. The
-   rule's words cover this, and the model and the library agree on every byte
-   (`finding_43_model_and_library_agree_on_a_hidden_line_the_sandbox_deleted`). The check does not: its R10.9 excuse covers only a line the
-   sandbox never held. It is not new: the same test fails on the code before this finding's lane. A fix pass may not widen an
-   excuse, so `finding_43_a_sync_hides_a_line_the_sandbox_deleted_in_a_lost_save` is ignored and the question is the owner's.
-44. **Open, for the owner (2026-11-07): a file the parent unlinked reads empty in a sandbox whose rename of it is undecided (6 of 1,000
-   traces at seeds 1 to 500; none at CI's seeds).** A sandbox renames a file and main unlinks it. Until the parent decides, the sandbox
-   keeps its name (R3a, R11.1). The model's file keeps its lines; the library's sync has no parent's map once the parent unlinked, and
-   keeps only undecided lines, so a program reads an empty file with the right name. View and commit agree here: this is the two
-   sides differing, not finding 39's kind. No ledger rule says what the file holds. Options: (a) the library keeps the sandbox's lines
-   until the decision, as the model does, recommended; (b) the model shows the file empty, as the library does.
-   `finding_44_a_kept_rename_of_a_file_the_parent_unlinked_keeps_its_lines`.
-45. **Open, for the owner (2026-11-07): a landing on the parent's current head (10 of 1,000).** The model fast-forwards it
-   (`r3_fast_forward_when_the_base_is_current`). The library always writes a merge commit, so a later sync has one more commit to
-   deliver: past an open file `take_next` answers Taken where the model answers Waiting. No bytes differ; the first-parent history
-   does. Options: (a) the library fast-forwards too, recommended; (b) the model always merges. `finding_45_a_landing_on_the_parents_head_is_a_fast_forward`.
-46. **Open, for the owner (2026-11-07): what a landing locks (3 of 1,000).** R9.1 says the files its changes touch. The library's queue also
-   locks each name those changes touch, because two files can compete for a name, so a landing waits while another program holds open the
-   file that took that name. The model locks by file identity alone. Both end on an event, so nothing hangs; the library waits longer.
-   Options: (a) the model locks names too, as the library does, and R9.1 says so; (b) the library locks files alone, recommended unless a name
-   clash needs the lock. `finding_46_a_landing_locks_its_files_not_a_name_another_file_took`.
-47. **Open, for the owner (2026-11-07): the same calls, other bytes (5 of 1,000: seeds 78, 164, 189, 428, 484 of the phase 1 generator).** In 78 and
-   164 the library's landing collides (a line of main's written over the line the sandbox wrote), and the model's lands. 189 keeps one
-   line less, 428 names other lost lines, and 484 shows another path. The mechanism is not established and no small test reproduces it.
-   The losing version stays in history in each. These five traces are in `open-findings.txt`.
+43. **Resolved by the owner (2026-11-07, "1 b 2 a 3 a 4 a is fine 5 a sounds correct, right? 6 a"; his 2, option a): R10.9 hides a line the sandbox itself deleted in a save that lost
+   (R10.9; seed 191 of 1 to 500 of `full_lineage`, `adjacent_lines` and `commit_dates_decide_nothing`).** A sandbox's save deletes the
+   file's last lines and loses; before that decision reaches it, its next save leaves the line before them unfinished. The sync brings
+   the parent's version: those lines are live there and fall behind the undecided unfinished line, so R10.9 hides them, and they
+   arrive with the decision. Model and library agreed on every byte. `syncs_deliver`'s excuse now also covers a line the sandbox holds
+   only as its own delete, written by that sandbox, and nothing wider. Revisable: option b was that the sync shows those lines.
+   `finding_43_a_sync_hides_a_line_the_sandbox_deleted_in_a_lost_save`.
+44. **Resolved by the owner (2026-11-07; his 3, option a): a file the parent unlinked keeps its lines in a sandbox whose rename of it is
+   undecided (R11.5; 6 of 1,000 traces at seeds 1 to 500).** A sandbox renames a file and main unlinks it. Until the parent decides, the
+   sandbox keeps its name (R3a, R11.1). The library's sync had no parent's map once the parent unlinked, and kept only undecided lines,
+   so a program read an empty file with the right name. The library now reads the lines of the parent's last version of that file
+   from its history and syncs against them, as the model does (`Volume::last_lines`). Revisable: option b was that the model shows the
+   file empty. `finding_44_a_kept_rename_of_a_file_the_parent_unlinked_keeps_its_lines`. The case where the parent edited the file first
+   is finding 48.
+45. **Resolved by the owner (2026-11-07; his 4, option a): a landing on the parent's head is a fast-forward in the library too (R6.2; 10 of
+   1,000).** The library always wrote a merge commit, so a later sync had one more commit to deliver: past an open file `take_next`
+   answered Taken where the model answered Waiting. Now the sandbox's commit becomes the head. The journal's record of the step moves
+   the pointer as for any step, and a kill on either side of the commit point lands the commit once
+   (`a_fast_forward_killed_at_any_step_lands_once`). What the history gives up is under Costs. Revisable: option b was that the model
+   always merges. `finding_45_a_landing_on_the_parents_head_is_a_fast_forward`.
+46. **Resolved by the owner (2026-11-07; his 5, option a): a landing locks names too (R9.1; 3 of 1,000).** The library's queue locks each
+   name a change touches, because two files can compete for a name, and the model locked file identities only. The model now locks both,
+   for a landing and a sync (`World::changed_keys`, `NAME_KEY`). R9.4 holds: a take acquires every key at once when none is open, and
+   holds nothing while it waits; R9.2 holds, since no call waits on a waiting take. The wait ends on an event: a close, or an unlink or
+   rename that leaves the name free, each wakes it (`wake`). Revisable: option b was that the library locks files alone.
+   `r9_a_landing_waits_for_an_open_file_that_took_a_name_it_touches`,
+   `finding_46_a_landing_waits_for_an_open_file_that_took_a_name_it_touches`.
+47. **Resolved by the owner's "6 a" (2026-11-07): the same calls, other bytes (5 of 1,000: seeds 78, 164, 189, 428, 484 of the phase 1
+   generator).** Shrunk and split by mechanism:
+   - Seed 484, the model was wrong (R10.3). Main edits a file and unlinks it, and a sandbox unlinks it or names it in a rename-over. The
+     model's unlink lost to the edit inside the file main had also unlinked; the library's two deletes agreed. Fixed in the model.
+     `finding_47_two_unlinks_agree_over_an_unseen_edit`, `finding_47_a_rename_over_agrees_with_an_unlink_over_an_unseen_edit`.
+   - Seed 428 is finding 48.
+   - Seeds 78, 164 and 189 are finding 49: neither side is wrong, the trace is.
+48. **Open, for the owner (2026-11-07): a kept file's lines where the parent edited it before unlinking it (seed 428 of the phase 1 generator
+   and any others listed in `open-findings.txt`).** Main edits `a` and unlinks it, and a sandbox's rename of `a` is undecided. By R3d a sync
+   brings the parent's decided lines, and the model does: the sandbox's file reads main's edit. The library now does too, but its sync
+   commit then holds a line that neither of its parents holds, since a parent that ended the file stores no map of it, so the replay's
+   `one_writer` ("a merge originates nothing") fails. No byte differs, and the line was written by a commit in the merge's history. A fix
+   pass may not widen that check. `finding_48_a_kept_file_takes_the_parents_last_lines_and_keeps_its_own`, ignored.
+49. **Open, for the owner (2026-11-07): a take recorded later picks another entry (seeds 78, 164, 189 of the phase 1 generator, and any others
+   listed in `open-findings.txt`).** The model's take is two steps, and a real take is one. A call that commits on main during main's hold goes
+   before that landing in the model's history, so the trace records main's take after that call (VERIFYING.md, "A take"). When a call in that
+   window also frees an earlier queue entry (a close, or a rename off its file), a take at the recorded place picks the earlier entry: the
+   fresh model and the library both do, and agree, and both differ from the run that recorded the trace, which picked its entry before that
+   call. Replaying the trace on a fresh model fails at the same call as the library. No rule is involved: the recording has no order
+   that says what the run did. `finding_49_a_take_recorded_past_a_close_picks_the_earlier_entry`, ignored.
 
 ## Costs
 
-- A sandbox can read a file the parent unlinked as empty while its rename of it is undecided, until finding 44 is decided.
+- A sync of a file a sandbox keeps under an undecided rename, after the parent unlinked it, reads the parent's history back to its last
+  version of that file (R11.5, finding 44). It costs one snapshot per commit walked, only in that case.
+- A landing on the parent's head leaves no landing commit (R6.2, finding 45). The history does not show when that landing happened or
+  that a queue took it, and `git log --first-parent` on the parent shows the sandbox's own commit, under its own writer and tree.
+  Who wrote it, and that it is in the parent's history, still show. The journal's record of the step goes at its next compaction.
+- A landing or a sync can wait on an open file it does not change, one that took a name its change touches (R9.1, finding 46): an
+  occasional unneeded wait.
+- A sandbox holding a line only as its own delete, in a save that lost, can show neither that line nor the parent's version of it until the
+  parent decides its later save (R10.9, finding 43).
 - The history does not show that a program saved when its save changed nothing (R8.2, finding 36).
 - After a truncate, or with any call but an append in the open, a repeated line the program wrote can be an old line in the
   diff's reading (R8.3, finding 37), so a sandbox's concurrent edit of that line lands in the rewrite instead of colliding.

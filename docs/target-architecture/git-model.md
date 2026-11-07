@@ -292,7 +292,7 @@ content is not.
 The model reads an offset write's position on `h` at close, so its base is `h`; a real base older than `h` (a
 sync arrived while the file was open) is not modelled.
 
-**Locks** (owner, 2026-11-03; for a landing into a tree too, a *choice*). A take into a tree lists the files
+**Locks** (owner, 2026-11-03; for a landing into a tree too, a *choice*; the names its files have on either side of the change too, R9.1). A take into a tree lists the files
 it will overwrite there, waits until no client of that tree has one open for writing, then holds them all
 while it writes; a write-open of a held file waits until it finishes. All at once, so it never holds one
 file while waiting for another (no deadlock). Each wait ends on an event: the last close wakes a take, its
@@ -544,7 +544,7 @@ one tree, as on Linux, an open file follows its object through a rename, and one
 close saves nothing. Such an open has no file open, so no take waits for its close (MODEL.md finding 22). Tests:
 `r11_an_old_writer_after_an_atomic_save_saves_nothing`, `r11_an_open_on_the_new_file_follows_it_through_the_atomic_save`.
 
-**Clean landing.** A fork commit made on the parent's current head is a fast-forward. Otherwise
+**Clean landing.** A fork commit made on the parent's current head is a fast-forward, in the library too (R6.2). Otherwise
 it is a merge: first parent the parent's head, second the fork commit, named for its writer (§11).
 
 ```mermaid

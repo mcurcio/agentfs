@@ -5018,6 +5018,11 @@ runner.
 | A truncate then writes (2026-11-07, owner, revisable) | Finding 37: "1. A 2. B 3. B", his 2, option b. It is a rewrite whichever call wrote the bytes: the model aligns unless every call is an append, like the library and git-model §6. Ledger R8.3. Cost: after a truncate, a repeated line the program wrote can be an old line in the diff's reading, so a sandbox's edit of it lands instead of colliding. |
 | What touches an open file (2026-11-07, owner, revisable) | Finding 38: "1. A 2. B 3. B", his 3, option b. Any change to the line map counts for a sync past an open file, and it waits, as the library does. Ledger R9.3. Cost: a sandbox holding a file open waits longer for later commits. |
 | One release of `git` (2026-11-07, owner, revisable) | Finding 42: "1 b 2 a 3 a 4 a is fine 5 a sounds correct, right? 6 a", his 1, option b. The image and CI run the release in `ci/git-release` (2.47.3, Debian trixie's), and each fails on another. An upgrade is a known change: later saves align repeated lines differently, and stored bytes and identities do not change. Ledger R10.10. Costs: a concurrent edit of a repeated line can land elsewhere or collide after an upgrade, and CI builds that release from source. Rejected for now: accepting two releases, and a Rust histogram diff. |
+| A hidden line the sandbox deleted (2026-11-07, owner, revisable) | Finding 43: "1 b 2 a 3 a 4 a is fine 5 a sounds correct, right? 6 a", his 2, option a. R10.9's words cover a line the sandbox holds only as its own delete, and the check now excuses exactly that. Cost: that line and the parent's version of it show nowhere in the sandbox until the parent decides. Rejected for now: that the sync shows those lines. |
+| A kept rename of a file the parent unlinked (2026-11-07, owner, revisable) | Finding 44: "1 b 2 a 3 a 4 a is fine 5 a sounds correct, right? 6 a", his 3, option a. The file keeps its lines until the decision, in the library as in the model. Ledger R11.5. Cost: that sync reads the parent's history back to its last version of the file. Rejected for now: the model showing it empty. |
+| A landing on the parent's head (2026-11-07, owner, revisable) | Finding 45: "1 b 2 a 3 a 4 a is fine 5 a sounds correct, right? 6 a", his 4, option a. It is a fast-forward in the library too. Ledger R6.2. Cost: no landing commit, so the history does not show when it landed or that a queue took it; writer and tree still show. Rejected for now: the model always merging. |
+| What a landing locks (2026-11-07, owner, revisable) | Finding 46: "1 b 2 a 3 a 4 a is fine 5 a sounds correct, right? 6 a", his 5, option a. On his question the main session answered yes, that (a) is correct, and said the cost is an occasional unneeded wait. The model locks names too, and R9.1 says so. Cost: a landing can wait on an open file it does not change. Rejected for now: the library locking files alone. |
+| The five other traces (2026-11-07, owner, revisable) | Finding 47: "1 b 2 a 3 a 4 a is fine 5 a sounds correct, right? 6 a", his 6, option a, to shrink them and find which side is wrong. One was the model's (R10.3, fixed), one is finding 48 and three are finding 49, both open in §19.2. |
 | One alignment call (2026-11-07, as the brief for finding 41 asked) | `agentfs-align` holds the histogram diff's call, environment and parse, and both the library and the model use it. The model therefore depends on one agentfs crate, a change to its "no agentfs dependency" (AGENTS.md). Costs: a small crate, and the model no longer has its own way of asking git, so a bug in the call cannot show as a model-library difference. The release of `git` still decides what a diff answers, so one release is pinned (R10.10). |
 | Phase 1 purpose and naming (2026-11-05, owner) | "It shouldn’t be named “prototype”. The goal is to build the phase 1 / MVP of the proposed design in the PR so we can run real end-to-end tests and validate the model". Build this as the implementation foundation. Domain names (`tree_actor`, `tree_view`, `trees`) are implementation choices; phase 1 stays in progress until its end-to-end validation criteria pass |
 | Target-model phase 1 (2026-11-05, implementation choice) | The recording milestone uses an isolated tree actor in `agentfs_core::tree_actor`: byte-call WAL, save at release, main/fork branches and object-safe rename/unlink. Fsync each call initially. Landing/sync and model conformance remain phase 1 milestones; the model rules are unchanged. Scope and remaining §18 checks: [phase 1](target-architecture/phase-1.md) |
@@ -5356,11 +5361,12 @@ runner.
      mount is a front (§14). Hosting it on a front was cut on
      2026-10-30 (§19.1 "The sandbox overlay (2026-10-30)") and waits for
      a consumer that needs it. Open.
-14. **R10.9's check and a line the sandbox deleted in a save that lost (2026-11-07, MODEL.md finding 43).** Behaviour matches the rule; the
-    check's excuse is narrower. For the owner.
-15. **The library's replay at seeds 1 to 500 (2026-11-07, MODEL.md findings 44 to 47).** 976 of 1,000 traces pass; the rest are a file reading
-    empty under an undecided rename, a landing as a merge against a fast-forward, what a landing locks, and five with other bytes, not
-    yet understood. CI's seeds pass. For the owner.
+14. **A kept file's lines where the parent edited it before unlinking it (2026-11-07, MODEL.md finding 48).** The library matches the model's
+    bytes, and its sync commit then holds a line neither of its parents holds, against the replay's check that a merge originates nothing. For
+    the owner.
+15. **A take recorded later than it began (2026-11-07, MODEL.md finding 49).** The model's two-step take has an interleaving no one-step take
+    can repeat, so three traces at seeds 1 to 500 of the replay name another entry than the real system takes. The test, not either side. For
+    the owner.
 
 ## 20. Prior art
 

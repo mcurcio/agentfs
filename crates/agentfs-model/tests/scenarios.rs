@@ -1562,13 +1562,12 @@ fn r11_an_old_writer_stays_orphaned_when_the_change_that_ended_its_file_loses() 
     }
 }
 
-/// Coherence finding 43 (seed 191 of 1 to 500 of `full_lineage`, `adjacent_lines` and
+/// Finding 43 (seed 191 of 1 to 500 of `full_lineage`, `adjacent_lines` and
 /// `commit_dates_decide_nothing`): R10.9 hides lines the sandbox itself deleted in a
-/// save that lost. The rule's words cover it, the model and the library both do it, and
-/// the parent's lines arrive with the decision; but `syncs_deliver` excuses only a line
-/// the sandbox never held. Changing that check is the owner's call (VERIFYING.md).
+/// save that lost, and they arrive with the decision. `syncs_deliver` excuses a line the
+/// sandbox holds only as its own delete (the owner, 2026-11-07, his 2, option a), and
+/// no other held line.
 #[test]
-#[ignore = "coherence finding 43: R10.9's excuse does not cover a line the sandbox deleted in a save that lost"]
 fn finding_43_a_sync_hides_a_line_the_sandbox_deleted_in_a_lost_save() {
     let mut w = world();
     let f = w.create_fork(Tree::Main);
@@ -1630,6 +1629,41 @@ fn finding_43_a_sync_hides_a_line_the_sandbox_deleted_in_a_lost_save() {
     // Decided: that save lost to the line the parent keeps after it (R10.8).
     assert_eq!(bytes(&w, Tree::Main, "c"), "M\n2\n3\n4\n5\n6\n");
     assert_eq!(bytes(&w, Tree::Fork(f), "c"), "M\n2\n3\n4\n5\n6\n");
+}
+
+/// R9.1, finding 46 (the owner, 2026-11-07, "5 a sounds correct, right?"): a landing also
+/// locks the names its change touches. A sandbox's unlink of `a` waits while main's open of
+/// another file holds that name, though its own change does not write that file; the close
+/// ends the wait (an event), all its keys are then free at once, and the take goes.
+#[test]
+fn r9_a_landing_waits_for_an_open_file_that_took_a_name_it_touches() {
+    let mut w = world();
+    let f = w.create_fork(Tree::Main);
+    let held = w.open_write(&m1(), "b");
+    ok(&mut w);
+    w.rename(&m1(), "b", "a");
+    w.unlink(&Client::Fork(f), "a");
+    ok(&mut w);
+    take(&mut w, &Step::Next(Tree::Main));
+    assert!(
+        w.waits()[&Tree::Main]
+            .values()
+            .any(|x| x.until.contains("name:a")),
+        "the landing's unlink touches the name the open file took"
+    );
+    assert!(
+        w.waiting_for(Tree::Main).is_empty(),
+        "and no file of its own"
+    );
+    assert!(
+        w.holds().is_empty(),
+        "it holds nothing while it waits (R9.4)"
+    );
+    w.close(held);
+    ok(&mut w);
+    assert!(w.waits().is_empty(), "the close woke it");
+    next(&mut w, Tree::Main);
+    drain(&mut w);
 }
 
 /// Coherence finding 30: a transaction's line after its sandbox's own

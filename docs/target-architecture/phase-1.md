@@ -49,7 +49,7 @@ correction, not a new landing rule.
 | Line-map storage and whole-save parent referee | Connected; R10.8 and R10.9 built; mounted result of findings 32 and 33: read the phase-1 conformance job |
 | Live landing/sync, P1/P2, writer locks, no alarm | Mounted finite progress scenarios pass; the wait counts of one held-log run are in the [handoff](phase-1-handoff.md#measurements) |
 | Journal kills, state exhaustion and power loss | The journal is the commit point for pointer steps; refs are a copy rebuilt on every open. Each row's evidence is in CI for the commit that claims it |
-| Model conformance and §18 measurements | The replay passes at CI's seeds on `b1e6d85`, findings 36 to 41 closed. Findings 42 to 47 are open for the owner, 44 to 47 from seeds 1 to 500 on the library. The §18 measurements report on `964618a` and `12bd7a8` ([handoff](phase-1-handoff.md#measurements)): journal against plain FUSE, hour, 10,000 saves, 1 and 100 MiB, waits and the held log. No figure is a budget; 10,000 saves took 2,411 s once the history walk and the per-line Git calls were fixed |
+| Model conformance and §18 measurements | The replay passes at CI's seeds, findings 36 to 47 closed by the owner's answers of 2026-11-07. Findings 48 and 49 are open for the owner, both from seeds 1 to 500 on the library. The §18 measurements report on `964618a` and `12bd7a8` ([handoff](phase-1-handoff.md#measurements)): journal against plain FUSE, hour, 10,000 saves, 1 and 100 MiB, waits and the held log. No figure is a budget; 10,000 saves took 2,411 s once the history walk and the per-line Git calls were fixed |
 
 Known model finding 32 reproduced on the real mount: a losing truncate to `y`,
 followed by an offset write of `n6` before the parent decision was readable,

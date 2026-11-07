@@ -34,13 +34,27 @@ fn combine(parent: &NameHistory, fork: &NameHistory) -> Result<NameHistory> {
     Ok(result)
 }
 
+/// Whether the parent ended this file: it has the file's name history and no file.
+pub(super) fn ended(parent: &Snapshot, id: MergeFileIdentity) -> Result<bool> {
+    Ok(!parent.files.contains_key(&id)
+        && match parent.names.get(&id) {
+            Some(name) => path(name)?.is_none(),
+            None => false,
+        })
+}
+
 /// Bring the parent's current snapshot into the fork without deciding any
 /// fork version. Name keys are scoped to the file; line IDs are volume-unique.
+/// `last_lines` holds the parent's last lines of each file it ended that the
+/// fork keeps under an undecided name: until the parent decides, that file reads
+/// as any other, the parent's decided lines and the fork's undecided ones (R3a,
+/// R3d, finding 44).
 pub(super) fn sync(
     parent: &Snapshot,
     fork: &Snapshot,
     undecided_lines: &BTreeSet<String>,
     undecided_names: &BTreeSet<(MergeFileIdentity, u64)>,
+    last_lines: &BTreeMap<MergeFileIdentity, LineMap>,
 ) -> Result<Snapshot> {
     let mut names = BTreeMap::new();
     let ids: BTreeSet<_> = parent
@@ -119,7 +133,11 @@ pub(super) fn sync(
             },
             (None, Some(f)) => File {
                 object: f.object,
-                lines: tree_reconcile::sync(&LineMap::default(), &f.lines, undecided_lines)?,
+                lines: tree_reconcile::sync(
+                    last_lines.get(&id).unwrap_or(&LineMap::default()),
+                    &f.lines,
+                    undecided_lines,
+                )?,
             },
             (None, None) => return Err(Error::Format),
         };
@@ -207,10 +225,18 @@ mod tests {
             &fork,
             &["fork".into()].into_iter().collect(),
             &BTreeSet::new(),
+            &BTreeMap::new(),
         )
         .unwrap();
         assert_eq!(kept.files[&MergeFileIdentity(1)].lines.bytes(), b"fork\n");
-        let decided = sync(&parent, &kept, &BTreeSet::new(), &BTreeSet::new()).unwrap();
+        let decided = sync(
+            &parent,
+            &kept,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+        )
+        .unwrap();
         assert_eq!(
             decided.files[&MergeFileIdentity(1)].lines.bytes(),
             b"parent\n"
@@ -242,10 +268,18 @@ mod tests {
             &fork,
             &["insert".into()].into_iter().collect(),
             &BTreeSet::new(),
+            &BTreeMap::new(),
         )
         .unwrap();
         assert_eq!(result.files[&MergeFileIdentity(1)].lines.bytes(), b"own\n");
-        let result = sync(&parent, &result, &BTreeSet::new(), &BTreeSet::new()).unwrap();
+        let result = sync(
+            &parent,
+            &result,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+        )
+        .unwrap();
         assert_eq!(
             result.files[&MergeFileIdentity(1)].lines.bytes(),
             b"partial"
@@ -276,10 +310,18 @@ mod tests {
             &fork,
             &["own".into()].into_iter().collect(),
             &BTreeSet::new(),
+            &BTreeMap::new(),
         )
         .unwrap();
         assert_eq!(kept.files[&key].lines.bytes(), b"own");
-        let decided = sync(&parent, &kept, &BTreeSet::new(), &BTreeSet::new()).unwrap();
+        let decided = sync(
+            &parent,
+            &kept,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+        )
+        .unwrap();
         assert_eq!(decided.files[&key].lines.bytes(), b"old\nlater\n");
     }
 
@@ -309,7 +351,7 @@ mod tests {
             .unwrap()
             .advance(13, Some("b".into()), None);
         let pending = [(MergeFileIdentity(1), 11)].into_iter().collect();
-        let result = sync(&parent, &fork, &BTreeSet::new(), &pending).unwrap();
+        let result = sync(&parent, &fork, &BTreeSet::new(), &pending, &BTreeMap::new()).unwrap();
         assert_eq!(
             path(&result.names[&MergeFileIdentity(1)]).unwrap(),
             Some("target")
@@ -322,7 +364,14 @@ mod tests {
             path(&result.names[&MergeFileIdentity(3)]).unwrap(),
             Some("c")
         );
-        let result = sync(&parent, &result, &BTreeSet::new(), &BTreeSet::new()).unwrap();
+        let result = sync(
+            &parent,
+            &result,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+        )
+        .unwrap();
         assert_eq!(
             path(&result.names[&MergeFileIdentity(1)]).unwrap(),
             Some("a")

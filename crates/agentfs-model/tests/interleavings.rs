@@ -34,8 +34,8 @@ use agentfs_model::content::{BLANK, Content, FILES, Layout, PATHS, UNBORN};
 use agentfs_model::git::{git, with_reversed_dates};
 use agentfs_model::program;
 use agentfs_model::world::{
-    By, Client, Direction, Entry, ForkId, HandleId, Kind, Life, LineEdit, MergeRule, Policies,
-    Step, Take, Target, Tree, TxnEnd, TxnOutcome, World, Write,
+    By, Client, Direction, Entry, ForkId, HandleId, Kind, Life, LineEdit, MergeRule, NAME_KEY,
+    Policies, Step, Take, Target, Tree, TxnEnd, TxnOutcome, World, Write, name_key,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -547,7 +547,7 @@ impl Oracle {
             if !self
                 .taking
                 .get(&t)
-                .is_some_and(|held| x.files().iter().any(|f| held.contains(f)))
+                .is_some_and(|held| !held.is_disjoint(&w.handle_keys(x)))
             {
                 return Err(format!(
                     "h{} ({:?} of {}) waits in {t:?}, but no take there is writing its file: a call waits on a waiting take",
@@ -662,6 +662,8 @@ fn take(w: &mut World, o: &mut Oracle, s: &Step, tally: &mut Tally) -> Result<()
                 }
                 files
             })
+            .flat_map(|f| [name_key(&w.file(&w.head(*t), &f)), Some(f)])
+            .flatten()
             .collect(),
         _ => BTreeSet::new(),
     };
@@ -1498,7 +1500,12 @@ impl Calls {
             .holds()
             .iter()
             .map(|(t, x)| {
-                let mut files: Vec<String> = x.files.iter().cloned().collect();
+                let mut files: Vec<String> = x
+                    .files
+                    .iter()
+                    .filter(|k| !k.starts_with(NAME_KEY))
+                    .cloned()
+                    .collect();
                 let mut lines = Vec::new();
                 if let Take::Landing { commit: c, .. } = &x.take {
                     let base = git(w.repo(), &["rev-parse", &format!("{c}^1")]);
@@ -1519,7 +1526,15 @@ impl Calls {
         let mut holds = holds;
         for (t, m) in w.waits() {
             for x in m.values() {
-                holds.push((*t, x.files.iter().cloned().collect(), Vec::new()));
+                holds.push((
+                    *t,
+                    x.files
+                        .iter()
+                        .filter(|k| !k.starts_with(NAME_KEY))
+                        .cloned()
+                        .collect(),
+                    Vec::new(),
+                ));
             }
         }
         let Some((t, held, contended)) = self.rng.pick(&holds) else {
@@ -1772,7 +1787,10 @@ fn run_as(
                     .map(|(t, m)| {
                         (
                             *t,
-                            m.values().flat_map(|x| x.files.iter().cloned()).collect(),
+                            m.values()
+                                .flat_map(|x| x.files.iter().cloned())
+                                .filter(|k| !k.starts_with(NAME_KEY))
+                                .collect(),
                         )
                     })
                     .collect();

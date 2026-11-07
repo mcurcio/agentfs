@@ -154,6 +154,12 @@ without seeing the other. MODEL.md's rules table holds the full wording; this pa
   COMMIT?!?" (2026-11-01). Tests: `r6_a_sync_is_a_merge_with_the_parent_second`
 - **R6.1** · approved · A sync that cannot fast-forward is a merge commit credited to `agentfs`, with no edits of
   its own. Approved by the owner, 2026-11-05 (approval page). 
+- **R6.2** · owner · A landing on the parent's current head is a fast-forward, in the model and the library: the sandbox's
+  commit is the parent's head, with no landing commit. Owner, 2026-11-07: "1 b 2 a 3 a 4 a is fine 5 a sounds correct, right? 6 a". This is his 4, option (a) of finding 45.
+  Revisable: option (b) was that the model always merges. Cost: the history does not show when that landing happened, or that
+  a queue took it; the commit still names its writer and its tree, and it is in the parent's history.
+  Tests: `r3_fast_forward_when_the_base_is_current`, `finding_45_a_landing_on_the_parents_head_is_a_fast_forward`,
+  `a_landing_on_the_parents_head_is_a_fast_forward_across_restart`
 
 ## 5. History settings
 
@@ -234,9 +240,15 @@ without seeing the other. MODEL.md's rules table holds the full wording; this pa
   This orders descriptor writes. When a program overwrites another's `pwrite` through a shared mapping, flushes and
   closes, and the first program closes later, the mapped bytes stand (R1.4). Owner, 2026-11-06: "if the mapped bytes were
   written second in this shared fs, then i would expect them to win".
-- **R9.1** · owner · A landing locks the files its changes touch, the same way. Source: "freezing only the files
-  that a landing touches sounds reasonable" (2026-11-02). Tests: `r9_a_landing_waits_for_the_parents_open_writer`,
-  `r9_a_landing_holds_the_files_of_its_losing_changes`
+- **R9.1** · owner · A landing locks the files its changes touch, the same way, and the names those files have on either
+  side of the change, because two files can compete for one name. A sync locks the same way (R9). Source: "freezing only
+  the files that a landing touches sounds reasonable" (2026-11-02). The names: owner, 2026-11-07: "1 b 2 a 3 a 4 a is fine 5 a sounds correct, right? 6 a". This is his 5,
+  option (a) of finding 46; asked whether (a) is correct, the main session answered yes and said the cost is an occasional
+  unneeded wait. Revisable: option (b) was that the library locks files alone. Cost: a landing can wait on an open file it
+  does not change, one that took a name the change touches.
+  Tests: `r9_a_landing_waits_for_the_parents_open_writer`, `r9_a_landing_holds_the_files_of_its_losing_changes`,
+  `r9_a_landing_waits_for_an_open_file_that_took_a_name_it_touches`,
+  `finding_46_a_landing_waits_for_an_open_file_that_took_a_name_it_touches`
 - **R9.2** · owner · No program's open ever waits on a landing that is still waiting; a landing may wait
   forever, and the parent then resolves its commits. Source: "it seems low risk for them to be indefinitely delayed
   while an application is keeping the fs busy with real work. In the worst case, the landing never occurs in a
@@ -272,7 +284,10 @@ without seeing the other. MODEL.md's rules table holds the full wording; this pa
   if both deletes are recorded and then agree, my hope is that a merge reports no conflicts and life is good".
   This holds for a file a rename-over named: an agreeing delete of it is not half a rename-over (finding 31). Owner,
   2026-11-06, accepting that recommendation: "we can take those recommendations for now, and i might change my mind later".
-  Tests: `r10_an_agreeing_delete_of_a_rename_overs_file_agrees`, `r10_two_deletes_of_one_line_agree_over_an_unseen_edit`
+  A file's name is one more line (R11), so a sandbox's unlink agrees with the parent's unlink of that file over an edit the
+  sandbox never saw (finding 47, seed 484).
+  Tests: `r10_an_agreeing_delete_of_a_rename_overs_file_agrees`, `r10_two_deletes_of_one_line_agree_over_an_unseen_edit`,
+  `finding_47_two_unlinks_agree_over_an_unseen_edit`, `finding_47_a_rename_over_agrees_with_an_unlink_over_an_unseen_edit`
 - **R10.8** · approved · A sandbox save whose unfinished last line would land in front of a line the parent keeps
   collides: the parent wins and the save loses whole, retained in history. No tree shows bytes nobody wrote, and line
   order does not change (R10.7) (finding 32). Owner, 2026-11-06, accepting that recommendation: "we can take those
@@ -288,9 +303,13 @@ without seeing the other. MODEL.md's rules table holds the full wording; this pa
 - **R10.9** · approved · Until the parent decides, a sandbox holding an undecided unfinished last line shows that line
   and hides the parent's later lines that a sync would put after it, the mirror of R10.6. Nothing is lost: the sandbox
   gets the parent's version once decided, so R3d's decided version waits for that decision. Owner, 2026-11-06, choosing
-  between this, showing the joined bytes and holding the sync: "a" (finding 33).
+  between this, showing the joined bytes and holding the sync: "a" (finding 33). It also covers a line the sandbox holds
+  only as its own delete, and no other line it holds. Owner, 2026-11-07: "1 b 2 a 3 a 4 a is fine 5 a sounds correct, right? 6 a". This is his 2, option (a) of finding 43.
+  Revisable: option (b) was to keep the check and have the sync show those lines.
   Tests: `r10_a_sync_hides_the_parents_lines_after_an_undecided_unfinished_line`,
-  `a_sync_hides_the_parents_later_lines_behind_an_undecided_unfinished_line`
+  `a_sync_hides_the_parents_later_lines_behind_an_undecided_unfinished_line`,
+  `finding_43_a_sync_hides_a_line_the_sandbox_deleted_in_a_lost_save`,
+  `finding_43_model_and_library_agree_on_a_hidden_line_the_sandbox_deleted`
 - **R10.4** · owner · A line appended after the parent's unfinished last line (no final newline) collides with it,
   and the parent wins. agentfs never adds a newline no program wrote. Owner, 2026-11-05: "collide".
 - **R10.6** · owner · Until the parent decides, a sandbox holding an undecided line does not show the parent's
@@ -318,6 +337,10 @@ without seeing the other. MODEL.md's rules table holds the full wording; this pa
   until no two files share a path. Owner, 2026-11-05: "before the landing, the filesystem should show the state of
   the files without the landing". Tests:
   `r11_two_renames_to_one_path_keep_the_sandboxs_name_until_decided`, `r11_a_chain_of_renames_to_one_path_keeps_every_previous_name`
+- **R11.5** · owner · A file the parent unlinked, which a sandbox keeps under its undecided rename, keeps its lines until
+  the parent decides. Owner, 2026-11-07: "1 b 2 a 3 a 4 a is fine 5 a sounds correct, right? 6 a". This is his 3, option (a) of finding 44: the library changes. Revisable: option
+  (b) was that the model shows the file empty. What the file holds where the parent edited it before the unlink is open
+  (finding 48). Tests: `finding_44_a_kept_rename_of_a_file_the_parent_unlinked_keeps_its_lines`
 - **R11.2** · approved · An editor's atomic save (write a new file, rename it over the old one) is a rewrite of
   the old file, so the file keeps its identity and merges per line. Approved by the owner, 2026-11-05 (approval page). Tests: `r11_an_atomic_save_keeps_the_files_identity_and_merges_per_line`, `finding_39_a_losing_atomic_save_keeps_two_files_apart`,
   `r11_a_losing_atomic_save_keeps_two_files_apart`

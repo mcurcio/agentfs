@@ -232,6 +232,50 @@ fn fork_saves_land_and_parent_changes_sync_across_restart() {
     );
 }
 
+// Finding 45 (the owner, 2026-11-07, his 4, option a): a landing on the parent's
+// current head is a fast-forward. The sandbox's commit is the head, it names who wrote
+// it, the journal's record moved the pointer, and a restart finds the same.
+#[test]
+fn a_landing_on_the_parents_head_is_a_fast_forward_across_restart() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut v = Volume::open(tmp.path()).unwrap();
+    put(&mut v, "main", "a", b"base\n");
+    let fork = v.fork().unwrap();
+    let h = v.write_open(&fork, "a", "sandbox-writer", true).unwrap();
+    v.write(h, 0, b"sandbox\n", true).unwrap();
+    v.close(h).unwrap();
+    let saved = v.head(&fork).unwrap();
+    assert_eq!(v.take_next("main").unwrap(), Took::Taken);
+    assert_eq!(
+        v.head("main").unwrap(),
+        saved,
+        "the save itself is the head"
+    );
+    assert_eq!(v.read("main", "a").unwrap(), b"base\nsandbox\n");
+    let last = String::from_utf8(git(tmp.path(), &["log", "-1", "--format=%B", "main"]).stdout);
+    let last = last.unwrap();
+    assert!(last.contains("Agentfs-Writer: sandbox-writer"), "{last}");
+    assert!(last.contains(&format!("Agentfs-Tree: {fork}")), "{last}");
+    assert!(last.contains("Agentfs-Cause: Direct"), "{last}");
+    drop(v);
+    let mut v = Volume::open(tmp.path()).unwrap();
+    assert_eq!(v.head("main").unwrap(), saved);
+    assert_eq!(v.read("main", "a").unwrap(), b"base\nsandbox\n");
+    // The next sync has nothing to bring, and a save on main still reaches the sandbox.
+    while v.progress().unwrap() {}
+    assert_eq!(v.head(&fork).unwrap(), saved);
+    let h = v.write_open("main", "a", "main-writer", true).unwrap();
+    v.write(h, 0, b"main\n", true).unwrap();
+    v.close(h).unwrap();
+    while v.progress().unwrap() {}
+    assert_eq!(v.read(&fork, "a").unwrap(), b"base\nsandbox\nmain\n");
+    assert!(
+        repo(tmp.path())
+            .is_ancestor(saved, v.head("main").unwrap())
+            .unwrap()
+    );
+}
+
 #[test]
 fn sync_delivers_prefix_before_open_file_and_holds_later_changes() {
     let tmp = tempfile::tempdir().unwrap();
@@ -1278,6 +1322,62 @@ fn a_step_killed_after_its_record_is_not_saved_again() {
     }
 }
 
+// A fast-forward killed on either side of its commit point: before, the entry is still
+// queued and is taken after the restart; after, the journal's record moved main. Either
+// way the sandbox's commit is main's head, once.
+#[cfg(feature = "failpoints")]
+#[test]
+fn a_fast_forward_killed_at_any_step_lands_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    // Hits: main's root save and the sandbox's create (none on main's fork), then the
+    // close, then the landing: the third pass over each failpoint.
+    for spec in [
+        "tree.before_objects=kill@3",
+        "tree.after_objects_durable=kill@3",
+        "tree.after_commit_point=kill@3",
+        "tree.after_ref_copy=kill@3",
+        "tree.before_checkout=kill@3",
+        "tree.after_checkout=kill@3",
+    ] {
+        let state = tmp.path().join(spec);
+        run_killed_worker("fast_forward_worker", &state, spec);
+        let mut v = Volume::open(&state).unwrap();
+        while v.progress().unwrap() {}
+        let fork = v
+            .tree_names()
+            .into_iter()
+            .find(|name| name != "main")
+            .unwrap();
+        assert_eq!(v.read("main", "a").unwrap(), b"sandbox", "{spec}");
+        assert_eq!(v.read(&fork, "a").unwrap(), b"sandbox", "{spec}");
+        assert_eq!(v.head("main").unwrap(), v.head(&fork).unwrap(), "{spec}");
+        let merges = git(&state, &["rev-list", "--count", "--merges", "main"]);
+        assert_eq!(
+            String::from_utf8(merges.stdout).unwrap().trim(),
+            "0",
+            "{spec}"
+        );
+    }
+}
+
+#[cfg(feature = "failpoints")]
+#[test]
+fn fast_forward_worker() {
+    let Some(root) = std::env::var_os("AGENTFS_TREE_STEP_WORKER") else {
+        return;
+    };
+    let mut v = Volume::open(std::path::Path::new(&root)).unwrap();
+    let fork = v.fork().unwrap();
+    let h = v.anonymous_open(&fork, "w").unwrap();
+    v.write(h, 0, b"sandbox", false).unwrap();
+    v.first_link(&fork, v.open_object(h).unwrap(), "a", "w")
+        .unwrap();
+    println!("OPEN {h}");
+    v.close(h).unwrap();
+    assert_eq!(v.take_next("main").unwrap(), Took::Taken);
+    panic!("a failpoint should have killed this worker");
+}
+
 #[cfg(feature = "failpoints")]
 #[test]
 fn a_kill_at_either_compact_failpoint_loses_nothing() {
@@ -1502,11 +1602,13 @@ fn recovery_enqueues_once_after_failure_before_the_commit_point() {
     assert_ne!(saved, before_head);
     assert!(!before.iter().any(|(_, oid)| *oid == saved));
     while volume.progress().unwrap() {}
+    // Taken once: as a fast-forward, the save itself on main's first parents (R6.2),
+    // or else a landing whose second parent it is.
     let mut cursor = volume.head("main").unwrap();
     let mut takes = 0;
     loop {
         let commit = repo.read_commit(cursor).unwrap();
-        if commit.parents.get(1) == Some(&saved) {
+        if cursor == saved || commit.parents.get(1) == Some(&saved) {
             takes += 1;
         }
         let Some(parent) = commit.parents.first() else {

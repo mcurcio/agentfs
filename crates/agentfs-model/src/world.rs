@@ -1064,15 +1064,16 @@ impl World {
             .into_iter()
             .flat_map(|m| m.values())
             .flat_map(|x| x.until.iter())
-            .filter(|p| open.contains(*p))
+            .filter(|p| open.contains(*p) && !p.starts_with(NAME_KEY))
             .cloned()
             .collect()
     }
 
-    /// The files a client of `t` has open for writing (granted opens), and
-    /// those of its deferred calls (R5.3), whose saves have not happened.
-    /// An open whose object no path names (an orphan) has no file open.
+    /// What a client of `t` has open for writing (granted opens), and what its
+    /// deferred calls (R5.3) will save: each file and the name it has now (R9.1,
+    /// [`NAME_KEY`]). An open whose object no path names (an orphan) has no file open.
     pub fn write_open(&self, t: Tree) -> BTreeSet<String> {
+        let at = self.head(t);
         self.handles
             .values()
             .filter(|h| !h.waiting && h.target == Target::Tree(t))
@@ -1083,7 +1084,28 @@ impl World {
                 }
                 files
             })
+            .flat_map(|f| [name_key(&self.file(&at, &f)), Some(f)])
+            .flatten()
             .collect()
+    }
+
+    /// What call `h` waits for while a take holds it: each file it names and
+    /// those files' names now; a rename, the name it takes too (R9, R9.1).
+    pub fn handle_keys(&self, h: &Handle) -> BTreeSet<String> {
+        let Target::Tree(t) = h.target else {
+            return BTreeSet::new();
+        };
+        let at = self.head(t);
+        let mut keys: BTreeSet<String> = h
+            .files()
+            .into_iter()
+            .flat_map(|f| [name_key(&self.file(&at, &f)), Some(f)])
+            .flatten()
+            .collect();
+        if let Kind::Rename { to, .. } = &h.kind {
+            keys.insert(format!("{NAME_KEY}{to}"));
+        }
+        keys
     }
 
     /// The file open `h`'s object is in its target now: the live file
@@ -1398,8 +1420,11 @@ impl World {
                 }
             } else if let Some(u) = unlink
                 && verdicts[&key(u)] == Verdict::Apply
+                && cur.name.live()
             {
-                // An unlink loses whole to a line its writer did not see.
+                // An unlink loses whole to a line its writer did not see. Not to a
+                // line of a file the parent unlinked too: two deletes of one name
+                // line agree (R10.3), whatever the file held (finding 47, seed 484).
                 let t = self.file(tip, p);
                 if let Some(q) = cur.live().find(|q| !self.seen(tip, &t, p, q)) {
                     for i in ins {
@@ -1978,7 +2003,7 @@ impl World {
             h.waiting = self
                 .holds
                 .get(&t)
-                .is_some_and(|x| h.files().iter().any(|f| x.files.contains(f)));
+                .is_some_and(|x| !x.files.is_disjoint(&self.handle_keys(&h)));
         }
         self.handles.insert(id, h);
         id
@@ -3187,19 +3212,21 @@ impl World {
         match e {
             Entry::Landing { commit, .. } => self.touches_of(commit),
             Entry::Sync => match t {
-                Tree::Fork(f) => self.changed(&self.head(t), &self.head(self.forks[&f].parent)),
+                Tree::Fork(f) => {
+                    self.changed_keys(&self.head(t), &self.head(self.forks[&f].parent))
+                }
                 Tree::Main => BTreeSet::new(),
             },
         }
     }
 
     /// The files a fork commit's own changes touch (each change against its
-    /// first parent), cached: commits never change.
+    /// first parent) and their names on both sides (R9.1), cached: commits never change.
     fn touches_of(&self, c: &str) -> BTreeSet<String> {
         if let Some(x) = self.touches.borrow().get(c) {
             return x.clone();
         }
-        let files = self.changed(&self.first_parent(c), c);
+        let files = self.changed_keys(&self.first_parent(c), c);
         self.touches
             .borrow_mut()
             .insert(c.to_string(), files.clone());
@@ -3247,7 +3274,7 @@ impl World {
                 };
                 let files = tree
                     .as_ref()
-                    .map(|tr| self.changed(&ours, tr))
+                    .map(|tr| self.changed_keys(&ours, tr))
                     .unwrap_or_default();
                 if let Some(until) = p.until {
                     // P2: it delivers the prefix now; the entry stays queued
@@ -3413,6 +3440,22 @@ impl World {
             .collect()
     }
 
+    /// What going from `ours` to `tree` locks (R9, R9.1): each file it changes, and
+    /// that file's name on each side, because two files can compete for a name.
+    fn changed_keys(&self, ours: &str, tree: &str) -> BTreeSet<String> {
+        self.keys_of(self.changed(ours, tree), ours, tree)
+    }
+
+    /// `files` as lock keys: each file, and its name in `ours` and in `tree`.
+    fn keys_of(&self, files: BTreeSet<String>, ours: &str, tree: &str) -> BTreeSet<String> {
+        let names: Vec<String> = files
+            .iter()
+            .flat_map(|f| [name_key(&self.file(ours, f)), name_key(&self.file(tree, f))])
+            .flatten()
+            .collect();
+        files.into_iter().chain(names).collect()
+    }
+
     /// Rule 3e, one take of commit `c` into the tree at `ours`: the change
     /// judged whole ([`World::resolve`]).
     fn judge(&self, ours: &str, c: &str) -> Merged {
@@ -3520,9 +3563,10 @@ impl World {
             let tree = self.sync_tree(ours, c);
             let mut now: BTreeSet<String> = tree
                 .as_ref()
-                .map(|tr| self.changed(ours, tr))
+                .map(|tr| self.changed_keys(ours, tr))
                 .unwrap_or_default();
-            now.extend(self.new_lines_of(ours, c));
+            let after = tree.as_deref().unwrap_or(ours);
+            now.extend(self.keys_of(self.new_lines_of(ours, c), ours, after));
             now.extend(before.iter().cloned());
             if !now.is_disjoint(&open) {
                 // It waits until no file this commit adds to the sync's
@@ -3862,6 +3906,14 @@ impl World {
 /// whether or not the parent has taken the create yet.
 pub fn fresh(c: &Content) -> bool {
     UNBORN.contains(&c.name.line.as_str()) && c.name.over.as_deref() == Some(c.name.line.as_str())
+}
+
+/// A lock key of a name, not a file (R9.1): two files can compete for one name.
+pub const NAME_KEY: &str = "name:";
+
+/// The lock key of the name file `c` shows, if it has one.
+pub fn name_key(c: &Content) -> Option<String> {
+    c.path().map(|p| format!("{NAME_KEY}{p}"))
 }
 
 fn held(t: Tree, files: &BTreeSet<String>, holds: &BTreeSet<String>) {

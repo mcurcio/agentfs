@@ -1,5 +1,5 @@
 //! Small traces through the real library: what the replay catches, and the findings
-//! it found (MODEL.md, 36 to 41), each asserting the model's result. These need `git`
+//! it found (MODEL.md, 36 to 49), each asserting the model's result. These need `git`
 //! only: no mount.
 use agentfs_conformance::{against_library, against_model};
 use agentfs_model::calls::{
@@ -304,29 +304,54 @@ fn an_old_writer_stays_orphaned_when_the_rename_over_loses() {
     passes(&w);
 }
 
-/// Finding 44: main unlinks a file a sandbox has renamed, and the rename is undecided, so
-/// the sandbox keeps the file under its name. The model's file keeps its lines until
-/// the parent decides; the library's sync finds no parent map and keeps only undecided
-/// lines, so the sandbox reads an empty file.
+/// Finding 44 (the owner, 2026-11-07, his 3, option a): main unlinks a file a sandbox has
+/// renamed, and the rename is undecided, so the sandbox keeps the file under its name, and
+/// its lines until the parent decides. Then the rename loses, and the file goes.
 #[test]
-#[ignore = "coherence finding 44: a file the parent unlinked reads empty in a sandbox whose rename of it is undecided"]
 fn finding_44_a_kept_rename_of_a_file_the_parent_unlinked_keeps_its_lines() {
     let mut w = world();
     let f = w.create_fork(agentfs_model::world::Tree::Main);
     let s = Client::Fork(f);
+    let lines = w.shown().trees[&TreeId::Main]["a"].clone();
+    assert!(!lines.is_empty());
     World::rename(&mut w, &s, "a", "e");
     World::unlink(&mut w, &m1(), "a");
     assert_eq!(w.take_next(TreeId::Fork(1)).unwrap(), Took::Taken);
     w.finish_take(TreeId::Fork(1)).unwrap();
+    assert_eq!(w.shown().trees[&TreeId::Fork(1)]["e"], lines);
+    let undecided = w.trace().len();
+    drain(&mut w);
+    assert!(w.trace().len() > undecided);
+    assert!(!w.shown().trees[&TreeId::Fork(1)].contains_key("e"));
     passes(&w);
 }
 
-/// Finding 45: a sandbox's save landing on main's current head is a fast-forward in the
-/// model, and a merge commit in the library. So the model has nothing to deliver before
-/// main's next commit, which waits for an open file, and the library delivers that merge:
-/// `take_next` answers Waiting and Taken. No file's bytes differ.
+/// Finding 48: the parent edited the file before its unlink. The edit arrives, as a sync
+/// brings any decided line (R3d), and the sandbox's undecided line stays (R3a), in the model
+/// and the library alike. But the library's sync commit then holds a line neither of its
+/// parents holds, since a parent that ended a file stores no map of it, and `one_writer`
+/// says a merge originates nothing.
 #[test]
-#[ignore = "coherence finding 45: a landing on the parent's head is a fast-forward in the model and a merge in the library"]
+#[ignore = "coherence finding 48: a sync commit holds a kept file's line from the parent's last version of it, which neither parent holds"]
+fn finding_48_a_kept_file_takes_the_parents_last_lines_and_keeps_its_own() {
+    let mut w = world();
+    let f = w.create_fork(agentfs_model::world::Tree::Main);
+    let s = Client::Fork(f);
+    save(&mut w, &s, "a", &[at(2, "s\n")]);
+    World::rename(&mut w, &s, "a", "e");
+    save(&mut w, &m1(), "a", &[at(4, "m\n")]);
+    World::unlink(&mut w, &m1(), "a");
+    assert_eq!(w.take_next(TreeId::Fork(1)).unwrap(), Took::Taken);
+    w.finish_take(TreeId::Fork(1)).unwrap();
+    let kept = &w.shown().trees[&TreeId::Fork(1)]["e"];
+    assert!(kept.starts_with(b"-\ns\nm\n"), "{kept:?}");
+    passes(&w);
+}
+
+/// Finding 45 (the owner, 2026-11-07, his 4, option a): a sandbox's save landing on main's
+/// current head is a fast-forward, in the library too. So there is nothing to deliver before
+/// main's next commit, which waits for an open file.
+#[test]
 fn finding_45_a_landing_on_the_parents_head_is_a_fast_forward() {
     let mut w = world();
     let f = w.create_fork(agentfs_model::world::Tree::Main);
@@ -340,19 +365,98 @@ fn finding_45_a_landing_on_the_parents_head_is_a_fast_forward() {
     passes(&w);
 }
 
-/// Finding 46: a queue step's locks. A landing's unlink of `a` waits in the library because
-/// main's open of another file now holds the name `a` (a name is a lock there), and goes
-/// ahead in the model, which locks only the files the change touches (R9.1).
+/// Finding 46 (the owner, 2026-11-07, his 5, option a; R9.1): a landing locks the names its
+/// change touches too. A landing's unlink of `a` waits while main's open of another file
+/// holds the name `a`, the close ends the wait, and the take goes.
 #[test]
-#[ignore = "coherence finding 46: the library's landing also locks the names its change touches, the model's only its files"]
-fn finding_46_a_landing_locks_its_files_not_a_name_another_file_took() {
+fn finding_46_a_landing_waits_for_an_open_file_that_took_a_name_it_touches() {
     let mut w = world();
     let f = w.create_fork(agentfs_model::world::Tree::Main);
     let s = Client::Fork(f);
-    let _held = w.open_write(&m1(), "b");
+    let held = w.open_write(&m1(), "b");
     World::rename(&mut w, &m1(), "b", "a");
     World::unlink(&mut w, &s, "a");
+    assert_eq!(w.take_next(TreeId::Main).unwrap(), Took::Waiting);
+    World::close(&mut w, held);
     assert_eq!(w.take_next(TreeId::Main).unwrap(), Took::Taken);
     w.finish_take(TreeId::Main).unwrap();
     passes(&w);
+}
+
+/// Finding 47, seed 484: a sandbox's unlink agrees with main's unlink of the same file,
+/// though main edited the file first and the sandbox never saw that edit (R10.3).
+#[test]
+fn finding_47_two_unlinks_agree_over_an_unseen_edit() {
+    let mut w = world();
+    let f = w.create_fork(agentfs_model::world::Tree::Main);
+    let s = Client::Fork(f);
+    save(&mut w, &m1(), "c", &[at(2, "m\n")]);
+    World::unlink(&mut w, &m1(), "c");
+    World::unlink(&mut w, &s, "c");
+    assert_eq!(w.take_next(TreeId::Main).unwrap(), Took::Taken);
+    w.finish_take(TreeId::Main).unwrap();
+    assert!(w.collisions.is_empty(), "{:?}", w.collisions);
+    passes(&w);
+}
+
+/// Finding 47, seed 484, as the seed had it: the sandbox's delete is half of a rename-over,
+/// which lands whole, so `b` takes the name `c`.
+#[test]
+fn finding_47_a_rename_over_agrees_with_an_unlink_over_an_unseen_edit() {
+    let mut w = world();
+    let f = w.create_fork(agentfs_model::world::Tree::Main);
+    let s = Client::Fork(f);
+    save(&mut w, &m1(), "c", &[at(2, "m\n")]);
+    World::unlink(&mut w, &m1(), "c");
+    World::rename(&mut w, &s, "b", "c");
+    assert_eq!(w.take_next(TreeId::Main).unwrap(), Took::Taken);
+    w.finish_take(TreeId::Main).unwrap();
+    assert!(w.collisions.is_empty(), "{:?}", w.collisions);
+    let shown = w.shown();
+    assert!(shown.trees[&TreeId::Main].contains_key("c"));
+    assert!(!shown.trees[&TreeId::Main].contains_key("b"));
+    passes(&w);
+}
+
+/// Finding 46, seed 124: a sync that changes no line or name of the sandbox's own view of a
+/// file locks no name of it. The sandbox replaced `d` with `a` by a rename-over, undecided,
+/// so main's edit of its old `d` keeps no name there, and the sandbox's open of the new `d`
+/// does not hold the sync back.
+#[test]
+fn finding_46_a_sync_of_a_file_the_sandbox_replaced_passes_the_name_it_took() {
+    let mut w = world();
+    let f = w.create_fork(agentfs_model::world::Tree::Main);
+    let s = Client::Fork(f);
+    World::rename(&mut w, &s, "a", "d");
+    save(&mut w, &m1(), "d", &[at(2, "m\n")]);
+    let _held = w.open_write(&s, "d");
+    assert_eq!(w.take_next(TreeId::Fork(1)).unwrap(), Took::Taken);
+    w.finish_take(TreeId::Fork(1)).unwrap();
+    passes(&w);
+}
+
+/// Finding 49 (seeds 78, 164 and 189): neither side is wrong, the trace is. Main takes `c`'s
+/// landing while `d`'s waits for an open file. During that hold the open closes and main
+/// commits, so the trace records the take after them, and there a one-step take picks `d`'s
+/// landing, which the run that recorded the trace did not.
+#[test]
+#[ignore = "coherence finding 49: a take recorded later than it began picks an earlier entry that a call in between freed"]
+fn finding_49_a_take_recorded_past_a_close_picks_the_earlier_entry() {
+    let mut w = world();
+    let tree = agentfs_model::world::Tree::Main;
+    let (f, g) = (w.create_fork(tree), w.create_fork(tree));
+    let held = w.open_write(&m1(), "d");
+    save(&mut w, &Client::Fork(f), "d", &[at(2, "s\n")]);
+    save(&mut w, &Client::Fork(g), "c", &[at(2, "t\n")]);
+    assert_eq!(w.take_next(TreeId::Main).unwrap(), Took::Taken);
+    World::close(&mut w, held);
+    save(&mut w, &m1(), "a", &[at(2, "m\n")]);
+    w.finish_take(TreeId::Main).unwrap();
+    assert_eq!(
+        &w.shown().trees[&TreeId::Main]["c"][..4],
+        b"-\nt\n",
+        "the run took c's landing"
+    );
+    let trace = parse(&render(w.trace())).unwrap();
+    against_model(&trace).unwrap();
 }

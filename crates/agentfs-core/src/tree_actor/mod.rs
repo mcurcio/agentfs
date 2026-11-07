@@ -1427,10 +1427,10 @@ impl Volume {
         let current = self.head(tree)?;
         let t = self.tree(tree)?;
         let incoming_commit = self.repo.read_commit(incoming)?;
-        let base = *incoming_commit.parents.first().ok_or(Error::Format)?;
+        let base_commit = *incoming_commit.parents.first().ok_or(Error::Format)?;
         let (mine, base, theirs) = (
             Self::snapshot_of(t),
-            self.snapshot_at(base)?,
+            self.snapshot_at(base_commit)?,
             self.snapshot_at(incoming)?,
         );
         let prior = self.prior_decisions(current)?;
@@ -1438,19 +1438,30 @@ impl Volume {
             let _timer = Timer::start(Which::Judge);
             referee::judge(&mine, &base, &theirs, &prior)?
         };
-        let content = self.snapshot_tree(&decision.snapshot)?;
-        let mut message = format!(
-            "Landing\n\nAgentfs-Writer: agentfs\nAgentfs-Cause: Landing\nAgentfs-Tree: {tree}\nAgentfs-Event: {seq}\nAgentfs-Format: envelope-1\n"
-        );
-        if !decision.collisions.is_empty() {
-            message.push_str(&format!(
-                "Agentfs-Collisions: {}\n",
-                serde_json::to_string(&decision.collisions)?
-            ));
-        }
-        let head = self
-            .repo
-            .write_commit(content, &[current, incoming], &message)?;
+        let head = if base_commit == current {
+            // Made on the parent's current version: every line replaces the
+            // parent's, so nothing collides, and the save itself is the head.
+            // The journal's record of this step moves the pointer (finding 45).
+            if !decision.collisions.is_empty()
+                || !Self::changed_keys(&decision.snapshot, &theirs).is_empty()
+            {
+                return Err(Error::Format);
+            }
+            incoming
+        } else {
+            let content = self.snapshot_tree(&decision.snapshot)?;
+            let mut message = format!(
+                "Landing\n\nAgentfs-Writer: agentfs\nAgentfs-Cause: Landing\nAgentfs-Tree: {tree}\nAgentfs-Event: {seq}\nAgentfs-Format: envelope-1\n"
+            );
+            if !decision.collisions.is_empty() {
+                message.push_str(&format!(
+                    "Agentfs-Collisions: {}\n",
+                    serde_json::to_string(&decision.collisions)?
+                ));
+            }
+            self.repo
+                .write_commit(content, &[current, incoming], &message)?
+        };
         let mut changes = vec![
             RefUpdate {
                 refname: branch(tree),
@@ -1520,9 +1531,10 @@ impl Volume {
         for oid in todo {
             let parent = self.snapshot_at(oid)?;
             let (lines, names) = self.undecided(&fork_snapshot, oid)?;
+            let last_lines = self.last_lines(&parent, oid, &names)?;
             let next = {
                 let _timer = Timer::start(Which::SyncMerge);
-                sync::sync(&parent, &fork_snapshot, &lines, &names)?
+                sync::sync(&parent, &fork_snapshot, &lines, &names, &last_lines)?
             };
             let changes = Self::changed_keys(&current, &next);
             if !changes.is_disjoint(open) {
@@ -1542,6 +1554,40 @@ impl Volume {
             remaining,
             keys,
         })
+    }
+
+    /// The lines each file held in the parent's last version of it, for the files
+    /// the parent at `at` has ended and a fork keeps under an undecided name. The
+    /// parent's snapshot has no file to read them from (finding 44).
+    fn last_lines(
+        &self,
+        parent: &referee::Snapshot,
+        at: Oid,
+        names: &BTreeSet<(MergeFileIdentity, u64)>,
+    ) -> Result<BTreeMap<MergeFileIdentity, LineMap>> {
+        let mut wanted = BTreeSet::new();
+        for (id, _) in names {
+            if sync::ended(parent, *id)? {
+                wanted.insert(*id);
+            }
+        }
+        let mut lines = BTreeMap::new();
+        let mut cursor = at;
+        while !wanted.is_empty() {
+            let Some(previous) = self.repo.read_commit(cursor)?.parents.first().copied() else {
+                break;
+            };
+            let snapshot = self.snapshot_at(previous)?;
+            wanted.retain(|id| match snapshot.files.get(id) {
+                Some(file) => {
+                    lines.insert(*id, file.lines.clone());
+                    false
+                }
+                None => true,
+            });
+            cursor = previous;
+        }
+        Ok(lines)
     }
 
     fn pending_from(&self, tree: &str) -> Result<bool> {

@@ -10,7 +10,7 @@ use crate::content::{Content, Line, PATHS, State, is_root, writer_of};
 use crate::git::{git, try_git};
 use crate::world::{
     By, Client, Collision, Decision, Direction, Entry, ForkId, Kind, Life, Step, Take, Target,
-    Tree, TxnEnd, TxnId, TxnOutcome, World, commit_parents, decisions_in, origin_in,
+    Tree, TxnEnd, TxnId, TxnOutcome, World, commit_parents, decisions_in, name_key, origin_in,
 };
 
 /// Every invariant that holds after any step.
@@ -197,9 +197,15 @@ fn prefix_cut(
                 .into_iter()
                 .map(|(_, x)| x.path),
         );
-        files
-            .into_iter()
-            .find(|f| open.contains(f) && w.file(c, f) != w.file(ours, f))
+        files.into_iter().find(|f| {
+            let (now, was) = (w.file(c, f), w.file(ours, f));
+            now != was
+                && (open.contains(f)
+                    || [name_key(&now), name_key(&was)]
+                        .iter()
+                        .flatten()
+                        .any(|k| open.contains(k)))
+        })
     };
     let delivered = match to {
         None => 0,
@@ -263,7 +269,7 @@ fn locks(w: &World) -> Result<(), String> {
                 (!h.waiting && h.kind == Kind::Write)
                     || w.holds()
                         .get(&t)
-                        .is_some_and(|x| h.files().iter().any(|f| x.files.contains(f)))
+                        .is_some_and(|x| !x.files.is_disjoint(&w.handle_keys(h)))
             }
         };
         if !alive {
@@ -346,15 +352,28 @@ pub fn p1_first(w: &World, t: Tree) -> Option<usize> {
 pub fn entry_files(w: &World, t: Tree, e: &Entry) -> BTreeSet<String> {
     match (e, t) {
         (Entry::Landing { commit, .. }, _) => change_files(w, commit),
-        (Entry::Sync, Tree::Fork(f)) => diff_files(w, &w.head(t), &w.head(w.forks[&f].parent)),
+        (Entry::Sync, Tree::Fork(f)) => {
+            let (ours, up) = (w.head(t), w.head(w.forks[&f].parent));
+            lock_keys(w, &ours, &up)
+        }
         (Entry::Sync, Tree::Main) => BTreeSet::new(),
     }
 }
 
-/// The files a fork commit's change touches, read from git, against its
-/// first parent.
+/// What a fork commit's change locks, read from git, against its first parent.
 pub fn change_files(w: &World, commit: &str) -> BTreeSet<String> {
-    diff_files(w, &format!("{commit}^1"), commit)
+    lock_keys(w, &format!("{commit}^1"), commit)
+}
+
+/// The files that differ from `a` to `b`, and each one's name on each side (R9.1).
+fn lock_keys(w: &World, a: &str, b: &str) -> BTreeSet<String> {
+    let files = diff_files(w, a, b);
+    let names: Vec<String> = files
+        .iter()
+        .flat_map(|f| [name_key(&w.file(a, f)), name_key(&w.file(b, f))])
+        .flatten()
+        .collect();
+    files.into_iter().chain(names).collect()
 }
 
 fn diff_files(w: &World, a: &str, b: &str) -> BTreeSet<String> {
@@ -1044,7 +1063,8 @@ fn hidden_by_r10_6(w: &World, t: Tree, path: &str, line: &str, token: &str) -> b
 /// parent's version, whichever won. Two parent's lines may be absent while
 /// the sandbox's own line is undecided, each only where the rule says: its
 /// unfinished last line in front of that line (R10.6), and a line behind that
-/// line when it is unfinished (R10.9).
+/// line when it is unfinished (R10.9), which the sandbox never held or holds
+/// only as its own delete (finding 43).
 fn syncs_deliver(w: &mut World) -> Result<(), String> {
     for (t, up, result, entered) in &w.syncs[w.syncs_checked..] {
         let Tree::Fork(f) = t else {
@@ -1109,6 +1129,7 @@ fn syncs_deliver(w: &mut World) -> Result<(), String> {
                 }
             }
             // The sandbox's lines still undecided, for what a sync may hide.
+            let own_writer = w.forks[f].writer.as_str();
             let undecided = |o: &Line| !decided(&o.id) || held_back(&o.id);
             let ours = commit_parents(w.repo(), result)
                 .first()
@@ -1118,9 +1139,12 @@ fn syncs_deliver(w: &mut World) -> Result<(), String> {
             let hidden = |x: &Line| {
                 // excuse: R10.6 the parent's unfinished last line in front of an undecided line
                 let before_own = r10_6_hides(&u, ours.as_ref(), &r, x, undecided);
-                // excuse: R10.9 the parent's lines after an undecided unfinished line, unseen by the sandbox
+                // excuse: R10.9 the parent's lines after an undecided unfinished line, which the sandbox never held or holds only as its own delete
                 let after_own = x.live()
-                    && ours.as_ref().is_some_and(|m| m.member(&x.line).is_none())
+                    && ours.as_ref().is_some_and(|m| {
+                        m.member(&x.line)
+                            .is_none_or(|o| !o.live() && writer_of(&o.id) == own_writer)
+                    })
                     && r.live()
                         .filter(|o| undecided(o))
                         .any(|o| ends_open(o) && !in_front(x, o));
