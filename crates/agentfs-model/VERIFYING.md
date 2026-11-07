@@ -104,8 +104,13 @@ the expected failure.
 | `random_interleavings_git_merge_base` | 1 | 40 of 64 seeds, 2 of them (seeds 32 and 46) a "harness panic: a model file in git": a sync that leaves a line "which Main already took" or drops a line (with the calls of programs outside a transaction, 2026-11-05; 34 with no P3 and the prefix sync; 35 after the fix pass of the review of 2026-11-04, whose generator changes move the random calls; with creates, crashes and the progress rules 36; with the byte calls alone 32; before them 39 of 64, 2 of them a "harness panic: a model file in git", when git's merge leaves one line identity twice) |
 | `finding_6_git_hunks_on_neighbouring_lines` | 6 | a sync leaves a line "which Main already took" |
 | `finding_30_a_transactions_line_after_the_sandboxs_unfinished_line` | 30 | two lines read as one, `}n9` |
+| `finding_36_a_save_that_changes_nothing_commits_nothing` | 36 | replay: `take main empty`, "the system answered Taken" |
+| `finding_37_an_append_after_a_truncate_makes_new_lines` | 37 | replay: `Main:c shows "n\nyy"`, the trace `"-\nyy"` |
+| `finding_38_a_sync_past_an_open_file_it_leaves_as_it_is` | 38 | replay: `take f1 taken`, "the system answered Waiting" |
+| `finding_39_a_losing_atomic_save_keeps_two_files_apart` | 39 | replay: `commit_files_match_view`: the view's `c` differs from its commit's |
 
-These were the results at seeds 1..64 on 2026-11-05, unchanged on 2026-11-06; a change that moves a count says so in
+Findings 36 to 39's tests are in `crates/agentfs-conformance/tests/replay.rs`; finding 40 has only its trace. These
+were the results at seeds 1..64 on 2026-11-05, unchanged on 2026-11-06; a change that moves a count says so in
 its pull request. Findings 29, 31, 32 and 33 pass since the owner's rules R10.6, R10.3, R10.8 and R10.9, under
 `r10_*` names (MODEL.md); finding 35 passes since the owner's answer of 2026-11-06 under R10.6, under its own name. Finding 27's and finding 28's tests pass since the owner's decisions of 2026-11-05 (one of them went
 with squashing; finding 28's are `r10_two_deletes_of_one_line_agree_over_an_unseen_edit` and
@@ -288,21 +293,51 @@ Review provenance before behaviour. For every finding, name the ledger rule that
 - Build output, scratch copies for planted bugs and long seed logs go on a disk with room, not a small system
   disk.
 
-## Phase 1: the model as the conformance suite (integration still due)
+## Phase 1: the model as the conformance suite
 
-[Phase 1](../../docs/target-architecture/phase-1.md) builds the proposed design so real end-to-end tests
-can validate this model. The tree actor and mounted recording scenarios exist. The shared conformance
-integration is still due: passing the byte and recording tests alone does not validate landing/sync or
-complete phase 1. Run the same supported scenarios and random calls against the implementation, so its
-visible bytes, history, collisions and progress are held to these rules. Two integration options:
+[Phase 1](../../docs/target-architecture/phase-1.md) builds the proposed design so real end-to-end tests can
+validate this model. The scenario bodies assert on the model's internals, so they are not ported. **The model runs
+them unchanged and records each call plus what each tree showed (`src/calls.rs`); the same calls replay against the
+real library and real mounts (`crates/agentfs-conformance`); the real run must show the same, and passes invariants
+of its own.** Those read `git`, the crate's own parse of `metadata.json` and `namespace.json` and its own byte
+oracle, never the library's bookkeeping. Assertions reach the real system only through that equality, so only for
+what a trace's `Shown` exposes: each tree's files, and the lost lines of each collision.
 
-- **A shared trait.** The calls the tests make (open, write, close, unlink, rename, take a queue step, begin
-  and end a transaction, sync, read a tree, read the history) become one trait. The model implements it,
-  and so does the real system's domain layer. The scenarios, the random runs and `check.rs` run against
-  either.
-- **A harness on the real mount.** A driver runs the same scenarios and seeds against a real FUSE mount and
-  its git repository, and the invariants read the real repository. Slower, and it needs Linux with
-  `/dev/fuse`, so it would run in CI.
+```sh
+# Record (the same run CI makes), then replay. Without Linux and /dev/fuse, mounts stay NOT RUN.
+AGENTFS_MODEL_TRACE_DIR=$T cargo test --locked -p agentfs-model --test scenarios --test interleavings
+cargo run --locked -p agentfs-conformance --bin phase1-replay -- model   "$T" --min-scenarios 69 --min-seeds 94
+cargo run --locked -p agentfs-conformance --bin phase1-replay -- library "$T" --min-scenarios 69 --min-seeds 79
+# One trace, its state kept to read with git:
+PHASE1_REPLAY_KEEP=/tmp/k phase1-replay library "$T" --min-scenarios 0 --min-seeds 0 --only NAME
+```
 
-Either way, the invariants must keep reading git and the harness's own record, never the implementation's
-bookkeeping.
+What a replay decides, each reported rather than hidden:
+
+- **Scope.** A trace is out if it used transactions, `Client::Outside`, nested forks, `Step::Drop` or another policy
+  (`scope_of`). `random_interleavings_phase1_scope` and `random_interleavings_rounds_phase1_scope` make none of the
+  first four, every invariant on.
+- **A take.** A real take is one step, at `take_next`, so a model call during a hold replays after it and trees are
+  compared only with no take in progress. Three orderings follow from that, all in `world.rs`'s recording: a call that
+  waited for a take is recorded when it runs, under the name its file has then; main's take is recorded after a fork or
+  a sandbox's queue step made during its hold, because those read main without it; and a queue step that only marks a
+  wait while another entry is free is not a call, since a real take goes on to the free entry. A take a crash ended
+  wrote nothing in the model, so it is not made.
+- **Mounts.** `mountable` takes at most one fork, made before any client call, and no open that both appends and
+  writes at an offset: Linux has no such descriptor. The take gate (`AGENTFS_TAKE_GATE`, a failpoints build) runs each
+  take at the trace's point and answers by a fifo, and a synchronous request after `close(2)` proves its `RELEASE`
+  ran, so the replay has no poll and no timer but the wait for a mount to appear.
+
+| Rule | Replay | Where else |
+|---|---|---|
+| R1.4 mappings | no mmap call | page-cache job |
+| R9, R9.7: a client call waiting on a take | assumed by replay order; only `Waiting` of takes is compared | mounted P1/P2 cases, finite, no seeds |
+| R12 mid-step or with unsynced loss | crash between calls only | recording-faults, power-loss jobs |
+| ENOSPC, EIO | no injected failure; `errno` compared only library against mount | enospc job |
+| Trace with two forks | library only (§18 asks one sandbox) | - |
+| Automatic takes (R1) | a mount takes only through the gate | mounted P1/P2 cases |
+| R1.3 an open's own read, R1.1 another reader | on the trait, not compared: `Shown` does not hold them | byte and page-cache jobs |
+
+A mismatch is a finding (MODEL.md, findings 36 to 40), never a change to either side without a ledger rule. Its traces
+go in `crates/agentfs-conformance/open-findings.txt` with its number and must keep failing, as an ignored test must, and
+its small reproduction is an ignored test in `crates/agentfs-conformance/tests/replay.rs`.

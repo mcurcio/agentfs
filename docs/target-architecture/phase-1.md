@@ -46,7 +46,7 @@ correction, not a new landing rule.
 | Line-map storage and whole-save parent referee | Connected; R10.8 and R10.9 built; mounted result of findings 32 and 33: read the phase-1 conformance job |
 | Live landing/sync, P1/P2, writer locks, no alarm | Mounted finite progress scenarios pass; quantitative wait measurements are unavailable |
 | Journal kills, state exhaustion and power loss | The journal is the commit point for pointer steps; refs are a copy rebuilt on every open. Each row's evidence is in CI for the commit that claims it |
-| Model conformance and §18 measurements | Finding 32 blocks validation. Actual hour recorded; calls and 10,000-save jobs reached their two-hour limits without reports |
+| Model conformance and §18 measurements | The replay (below) fails on findings 36 to 40, so conformance is not met. Actual hour recorded; calls and 10,000-save jobs reached their two-hour limits without reports |
 
 Known model finding 32 reproduced on the real mount: a losing truncate to `y`,
 followed by an offset write of `n6` before the parent decision was readable,
@@ -175,6 +175,10 @@ processes. They are not FUSE or power-loss evidence. CI scripts exercise:
   anonymous first link, immediate reopen and process restart.
 - `e2e-tree-conformance.sh`: real calls compared with fixed existing model cases,
   independent byte/line-map checks and progress scenarios.
+- `phase1-replay` and `e2e-tree-replay.sh`: every in-scope scenario and seed of the model,
+  its calls replayed on a fresh model, the real library and real mounts, what each tree
+  shows compared, invariants read from git. VERIFYING.md "Phase 1" says what this does not
+  prove.
 - `e2e-tree-pagecache.sh`: writers in one tree in every descriptor and mapping mix,
   with closes in both orders, three writers, a grown mapping, create then map, an
   unlinked mapped file's `fstat`, a take refreshing a mapping and `sendfile` while

@@ -389,6 +389,24 @@ An open or rejected finding has a test marked `#[ignore = "coherence finding N: 
    (`// excuse: R10.6`), and still fails if the next sync does not bring it back or it left any other way. Revisable: the
    rejected options were to keep showing the older version in front of the sandbox's line until decided, and to have the
    sandbox's save lose at once. `finding_35_a_sync_hides_a_line_the_sandbox_already_held`.
+36. **Open, for the owner (2026-11-06): a save that leaves the bytes as they were commits in the real library.** Found by
+   the replay. The model makes no commit ("none if nothing changed"), the library makes one and a queue entry, so the
+   queues differ from then on (8 of 94 in-scope seed traces fail first on this; no scenario). No ledger rule says either.
+   `finding_36_a_save_that_changes_nothing_commits_nothing`.
+37. **Open, for the owner (2026-11-06): an append after a truncate.** The model reads it as R8's "an append adds": new lines,
+   every old line deleted. The library aligns the whole result, so a kept `-` is the old line, and a sandbox's edit of that
+   line lands where the model's collides (2 of 94). `finding_37_an_append_after_a_truncate_makes_new_lines`.
+38. **Open, for the owner (2026-11-06): what touches an open file (R9.3).** A parent's commit can leave a sandbox's open
+   file as it is, because the sandbox keeps its own undecided line there. The model delivers it and holds back only a commit
+   that writes the file; the library compares line maps, whose version history changed, and waits (2 of 94).
+   `finding_38_a_sync_past_an_open_file_it_leaves_as_it_is`.
+39. **Open, for the owner (2026-11-06): after a losing atomic save the library's view is wrong.** A sandbox creates `t` and
+   renames it over `c`, and that save loses to main's edit of `c`. The sync gives `t` and `c` one object, so reads of `c` in
+   the sandbox show `t`'s bytes while the commit holds main's (2 of 94). This is not a difference of rules: a tree's view
+   must equal its commit. `finding_39_a_losing_atomic_save_keeps_two_files_apart`.
+40. **Open, for the owner (2026-11-06): a line's place among repeated lines.** One trace
+   (`random_interleavings_phase1_scope.seed50`): main reads `n3,-,},-,-,-,-,-`, the model `n3,-,-,},-,-,-,-`. Same lines, other
+   order. Its mechanism is not established, and no small test reproduces it yet (1 of 94).
 
 ## Costs
 

@@ -40,6 +40,7 @@
 //! This crate depends on no other agentfs crate: it models the rules, not
 //! today's code. What it leaves out is listed in `MODEL.md`.
 
+pub mod calls;
 pub mod check;
 pub mod content;
 pub mod git;

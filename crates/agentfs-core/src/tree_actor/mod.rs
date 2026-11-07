@@ -323,6 +323,16 @@ enum QueueAction {
     Sync(Oid, SyncPlan),
 }
 
+/// What [`Volume::take_next`] did: took one entry, found every entry waiting, or
+/// found none queued. Apart from the model's (`agentfs_model::calls::Took`):
+/// neither crate depends on the other.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Took {
+    Taken,
+    Waiting,
+    Empty,
+}
+
 /// Result of a release or crash-recovered release.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Saved {
@@ -1623,70 +1633,82 @@ impl Volume {
         let mut trees = self.tree_names();
         trees.sort_by_key(|name| name != "main");
         for tree in trees {
-            if self
-                .pointers
-                .under(&format!("refs/queue/{tree}/"))
-                .is_empty()
-            {
-                continue;
-            }
-            // A take is a step: pending closes save first, and its plan reads
-            // the tree they leave.
-            self.run_pending_closes(&tree, None)?;
-            let entries = self.pointers.under(&format!("refs/queue/{tree}/"));
-            let open = self.open_keys(&tree);
-            let mut plans = Vec::new();
-            let mut actions = Vec::new();
-            let planning = Timer::start(Which::QueuePlan);
-            for (_, oid) in &entries {
-                if tree == "main" {
-                    let commit = self.repo.read_commit(*oid)?;
-                    let base = *commit.parents.first().ok_or(Error::Format)?;
-                    let source = std::str::from_utf8(&commit.message)
-                        .ok()
-                        .and_then(|m| m.lines().find_map(|l| l.strip_prefix("Agentfs-Tree: ")))
-                        .ok_or(Error::Format)?
-                        .to_owned();
-                    let keys =
-                        Self::changed_keys(&self.snapshot_at(base)?, &self.snapshot_at(*oid)?);
-                    plans.push(queue::Plan {
-                        source,
-                        files: keys,
-                    });
-                    actions.push(QueueAction::Landing(*oid));
-                } else {
-                    let sync = self.plan_sync(&tree, &open)?;
-                    plans.push(queue::Plan {
-                        source: "main".into(),
-                        files: sync.keys.clone(),
-                    });
-                    actions.push(QueueAction::Sync(*oid, sync));
-                }
-            }
-            drop(planning);
-            let selected = queue::eligible(&plans, &open);
-            let blocked = selected.unwrap_or(entries.len());
-            for (reference, _) in entries.iter().take(blocked) {
-                if !self.waiting_since.contains_key(reference) {
-                    self.waiting_since.insert(reference.clone(), Instant::now());
-                    self.metrics.waits = self.metrics.waits.saturating_add(1);
-                }
-            }
-            if let Some(index) = selected {
-                let reference = &entries[index].0;
-                if let Some(since) = self.waiting_since.remove(reference) {
-                    let nanos = u64::try_from(since.elapsed().as_nanos()).unwrap_or(u64::MAX);
-                    self.metrics.wait_nanos = self.metrics.wait_nanos.saturating_add(nanos);
-                    self.metrics.max_wait_nanos = self.metrics.max_wait_nanos.max(nanos);
-                }
-                match actions.swap_remove(index) {
-                    QueueAction::Landing(oid) => self.take_landing(&tree, reference, oid)?,
-                    QueueAction::Sync(oid, plan) => self.take_sync(&tree, reference, oid, plan)?,
-                }
+            if self.take_next(&tree)? == Took::Taken {
                 return Ok(true);
             }
         }
         Ok(false)
+    }
+
+    /// One queue step in `tree`: its first entry P1 lets go is taken whole, in
+    /// this one call. Failures are not swallowed, unlike [`Volume::progress`].
+    pub fn take_next(&mut self, tree: &str) -> Result<Took> {
+        if self.stopped {
+            return Err(Error::Stopped);
+        }
+        self.tree(tree)?;
+        if self
+            .pointers
+            .under(&format!("refs/queue/{tree}/"))
+            .is_empty()
+        {
+            return Ok(Took::Empty);
+        }
+        // A take is a step: pending closes save first, and its plan reads
+        // the tree they leave.
+        self.run_pending_closes(tree, None)?;
+        let entries = self.pointers.under(&format!("refs/queue/{tree}/"));
+        let open = self.open_keys(tree);
+        let mut plans = Vec::new();
+        let mut actions = Vec::new();
+        let planning = Timer::start(Which::QueuePlan);
+        for (_, oid) in &entries {
+            if tree == "main" {
+                let commit = self.repo.read_commit(*oid)?;
+                let base = *commit.parents.first().ok_or(Error::Format)?;
+                let source = std::str::from_utf8(&commit.message)
+                    .ok()
+                    .and_then(|m| m.lines().find_map(|l| l.strip_prefix("Agentfs-Tree: ")))
+                    .ok_or(Error::Format)?
+                    .to_owned();
+                let keys = Self::changed_keys(&self.snapshot_at(base)?, &self.snapshot_at(*oid)?);
+                plans.push(queue::Plan {
+                    source,
+                    files: keys,
+                });
+                actions.push(QueueAction::Landing(*oid));
+            } else {
+                let sync = self.plan_sync(tree, &open)?;
+                plans.push(queue::Plan {
+                    source: "main".into(),
+                    files: sync.keys.clone(),
+                });
+                actions.push(QueueAction::Sync(*oid, sync));
+            }
+        }
+        drop(planning);
+        let selected = queue::eligible(&plans, &open);
+        let blocked = selected.unwrap_or(entries.len());
+        for (reference, _) in entries.iter().take(blocked) {
+            if !self.waiting_since.contains_key(reference) {
+                self.waiting_since.insert(reference.clone(), Instant::now());
+                self.metrics.waits = self.metrics.waits.saturating_add(1);
+            }
+        }
+        if let Some(index) = selected {
+            let reference = &entries[index].0;
+            if let Some(since) = self.waiting_since.remove(reference) {
+                let nanos = u64::try_from(since.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                self.metrics.wait_nanos = self.metrics.wait_nanos.saturating_add(nanos);
+                self.metrics.max_wait_nanos = self.metrics.max_wait_nanos.max(nanos);
+            }
+            match actions.swap_remove(index) {
+                QueueAction::Landing(oid) => self.take_landing(tree, reference, oid)?,
+                QueueAction::Sync(oid, plan) => self.take_sync(tree, reference, oid, plan)?,
+            }
+            return Ok(Took::Taken);
+        }
+        Ok(Took::Waiting)
     }
 
     /// Appends one record that moves no pointer, or the step `run_step` built.

@@ -1416,7 +1416,7 @@ fn rename_overs_whole(w: &World) -> Result<(), String> {
 /// parent's version; every other line is new (its identity its own id,
 /// written over nothing, live). So an alignment that drops, duplicates or
 /// reorders a line, or pairs a changed region out of order, fails here.
-fn save_aligned(base: &Content, now: &Content) -> Result<(), String> {
+pub fn save_aligned(base: &Content, now: &Content) -> Result<(), String> {
     for b in base.records() {
         let n = now
             .member(&b.line)

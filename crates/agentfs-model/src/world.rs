@@ -23,8 +23,13 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering};
 
+use crate::calls::{
+    CallError, Caller, Recorded, RecordedCall, Shown, ShownCollision, Took, TreeCalls, TreeId,
+    gather_collisions, out_of_scope,
+};
 use crate::content::{Content, Layout, Line, Lineage, PATHS, State, UNBORN, split_lines};
 use crate::git::{git, git_in, try_git};
 use crate::program;
@@ -802,6 +807,12 @@ pub struct World {
     pub prefix_syncs: usize,
     pub unlinked_edits: usize,
     pub(crate) placements_checked: usize,
+    /// The calls made, as [`crate::calls`] records them, when recording.
+    trace: Option<Vec<Recorded>>,
+    /// Inside a call that records itself as one: nothing it does records.
+    trace_mute: bool,
+    /// What tells this world's trace file from another's (a seed).
+    trace_label: Option<String>,
 }
 
 /// The trailer naming the open a save came from (git-model.md §3).
@@ -882,6 +893,9 @@ impl World {
             prefix_syncs: 0,
             unlinked_edits: 0,
             placements_checked: 0,
+            trace: std::env::var_os(TRACE_DIR).map(|_| Vec::new()),
+            trace_mute: false,
+            trace_label: None,
         };
         let files = PATHS
             .iter()
@@ -890,6 +904,9 @@ impl World {
         let tree = w.tree_with(None, &files);
         let c = w.commit(&[], &tree, "agentfs", "Root", "main");
         w.set_head(Tree::Main, &c);
+        if !matches!(policies.merge, MergeRule::PerLine) || policies.layout != Layout::Separated {
+            w.trace_call(out_of_scope("policy"));
+        }
         w
     }
 
@@ -958,6 +975,11 @@ impl World {
     /// The path file `f` has in tree `t`; none if unlinked there.
     pub fn path_of(&self, t: Tree, f: &str) -> Option<String> {
         self.file(&self.head(t), f).path().map(str::to_string)
+    }
+
+    /// The file at path `p` where client `c` reads, if any.
+    fn client_lookup(&self, c: &Client, p: &str) -> Option<String> {
+        self.lookup(&self.target_head(self.target_of(c)), p)
     }
 
     /// The path file `f` has where client `c` reads (its open
@@ -1874,6 +1896,10 @@ impl World {
         );
         self.set_head(Tree::Fork(id), &head);
         self.note(format!("create f{id} over {parent:?}"));
+        self.trace_call(match parent {
+            Tree::Main => RecordedCall::Fork { id: id as usize },
+            Tree::Fork(_) => out_of_scope("nested-fork"),
+        });
         id
     }
 
@@ -1976,13 +2002,14 @@ impl World {
     /// An `O_TRUNC` open: [`World::open_write`] whose first call truncates the
     /// file to nothing (applied at close, with the rest: close-to-open).
     pub fn open_trunc(&mut self, c: &Client, p: &str) -> HandleId {
-        let h = self.open_write(c, p);
+        let h = self.open_granted_or_waiting(c, p);
         self.handles
             .get_mut(&h)
             .expect("open")
             .calls
             .push(Write::Truncate(0));
         self.note(format!("h{h}: O_TRUNC"));
+        self.record_open(h);
         h
     }
 
@@ -1993,6 +2020,12 @@ impl World {
     /// frozen, so an open there never waits. The open names the file by
     /// its identity, so it follows the file through a rename.
     pub fn open_write(&mut self, c: &Client, p: &str) -> HandleId {
+        let h = self.open_granted_or_waiting(c, p);
+        self.record_open(h);
+        h
+    }
+
+    fn open_granted_or_waiting(&mut self, c: &Client, p: &str) -> HandleId {
         let target = self.target_of(c);
         let file = self
             .lookup(&self.target_head(target), p)
@@ -2022,6 +2055,22 @@ impl World {
         };
         assert!(bytes.is_ascii(), "the model's bytes are ASCII");
         self.note(format!("write h{h}: {call:?}"));
+        let at = u64::from(h);
+        self.trace_call(match &call {
+            Write::Append(b) => RecordedCall::Append {
+                h: at,
+                bytes: b.clone().into_bytes(),
+            },
+            Write::Pwrite { offset, bytes } => RecordedCall::Pwrite {
+                h: at,
+                offset: *offset as u64,
+                bytes: bytes.clone().into_bytes(),
+            },
+            Write::Truncate(n) => RecordedCall::Truncate {
+                h: at,
+                size: *n as u64,
+            },
+        });
         self.handles.get_mut(&h).expect("open").calls.push(call);
     }
 
@@ -2093,6 +2142,7 @@ impl World {
         if let Target::Tree(t) = target {
             self.wake(t);
         }
+        self.trace_call(RecordedCall::Close { h: u64::from(h) });
     }
 
     /// The writer an open's lines name, and the transaction it writes in:
@@ -2402,6 +2452,8 @@ impl World {
         if !cur.name.live() {
             return;
         }
+        // The path it has when it runs: a real path call comes after the take.
+        let from = cur.path().unwrap_or_default().to_string();
         let mut files = BTreeMap::new();
         let mut set = Vec::new();
         let name = |w: &mut Self, c: &Content, state: State| {
@@ -2507,6 +2559,15 @@ impl World {
         if let Target::Tree(t) = h.target {
             self.wake(t);
         }
+        let caller = self.caller_of(&h.client);
+        self.trace_call(match &h.kind {
+            Kind::Rename { to, .. } => RecordedCall::Rename {
+                caller,
+                from,
+                to: to.clone(),
+            },
+            _ => RecordedCall::Unlink { caller, path: from },
+        });
     }
 
     /// Rule 11: `open(p, O_CREAT | O_EXCL | O_WRONLY)` of a path no file
@@ -2555,6 +2616,12 @@ impl World {
         );
         let h = self.add_handle(c, target, f, p, Kind::Write);
         assert!(!self.handles[&h].waiting, "a new file is held by no take");
+        let caller = self.caller_of(c);
+        self.trace_call(RecordedCall::Create {
+            caller,
+            path: p.to_string(),
+            h: u64::from(h),
+        });
         Some(h)
     }
 
@@ -2588,6 +2655,7 @@ impl World {
             let x = self.handles.get_mut(&h).expect("open");
             x.waiting = false;
             self.note(format!("grant h{h}"));
+            self.record_open(h);
         } else {
             self.note(format!("grant h{h}: it goes"));
             self.path_call_goes(h);
@@ -2602,6 +2670,7 @@ impl World {
     /// fixed at open); only the client's opens after begin write in the
     /// transaction.
     pub fn begin(&mut self, f: ForkId) -> Result<TxnId, ModelError> {
+        self.trace_call(out_of_scope("transaction"));
         let fork = &self.forks[&f];
         if fork.life != Life::Open {
             return Err(ModelError::Ended);
@@ -2874,6 +2943,7 @@ impl World {
     /// ([`World::release`]). The fork's commits still land; it drops once
     /// that is done.
     pub fn end_client(&mut self, f: ForkId) {
+        let muted = std::mem::replace(&mut self.trace_mute, true);
         if self.forks[&f].txn.is_some() {
             let _ = self.rollback(f);
         }
@@ -2881,16 +2951,25 @@ impl World {
         self.forks.get_mut(&f).expect("fork").life = Life::Ended;
         self.wake(Tree::Fork(f));
         self.note(format!("end f{f}"));
+        self.trace_mute = muted;
+        self.trace_call(RecordedCall::EndClient {
+            caller: Caller::Fork(f as usize),
+        });
     }
 
     /// One of main's clients exits or dies (its end event): every lock it
     /// held is released ([`World::release`]), so main's queue, waiting for
     /// its open file, is woken. It opens nothing after.
     pub fn end_main_client(&mut self, writer: &str) {
+        let muted = std::mem::replace(&mut self.trace_mute, true);
         self.release(&[Client::Main(writer.to_string())]);
         self.ended_main.insert(writer.to_string());
         self.wake(Tree::Main);
         self.note(format!("end main client {writer}"));
+        self.trace_mute = muted;
+        self.trace_call(RecordedCall::EndClient {
+            caller: Caller::Main(writer.to_string()),
+        });
     }
 
     /// A client's end event releases its locks: its open files close as the
@@ -2969,12 +3048,18 @@ impl World {
                 replay.push(id);
             }
         }
+        self.trace_call(RecordedCall::Crash);
         replay
     }
 
     /// [`World::crash`]'s restart, for one open: saved from the journal as
     /// its close would save it, unless a save already names it; it ends.
     pub fn restart_open(&mut self, id: HandleId) {
+        self.restart_open_unshown(id);
+        self.reshow();
+    }
+
+    fn restart_open_unshown(&mut self, id: HandleId) {
         if self.saved(id) {
             self.handles.remove(&id);
             self.note(format!("crash: h{id} already saved: skipped"));
@@ -3013,6 +3098,7 @@ impl World {
         self.note(format!(
             "close h{h}: saved {tokens:?}; crash before its journal drops it"
         ));
+        self.trace_call(RecordedCall::Close { h: u64::from(h) });
     }
 
     /// Whether a save names open `h` (`Agentfs-Open`), read from git.
@@ -3056,12 +3142,17 @@ impl World {
     /// waits. Nothing is held by a collision.
     pub fn step(&mut self, s: &Step) -> usize {
         match s {
-            Step::Next(t) => self.acquire(*t),
+            Step::Next(t) => {
+                let taken = self.acquire(*t);
+                self.record_take(*t);
+                taken
+            }
             Step::Finish(t) => {
                 self.finish(*t);
                 0
             }
             Step::Drop(f) => {
+                self.trace_call(out_of_scope("drop"));
                 self.drop_fork(*f);
                 0
             }
@@ -3309,6 +3400,7 @@ impl World {
             }
         }
         self.taken = Some(self.head(t));
+        self.trace_call(RecordedCall::Finish { tree: tree_id(t) });
         // The release: every call waiting for the hold goes ahead (none
         // waits for anything else), then an entry waiting in `t` whose
         // files closed meanwhile is woken (a prefix sync's rest).
@@ -3573,6 +3665,178 @@ impl World {
         s
     }
 
+    // ── recording (crate::calls) ─────────────────────────────────────────
+
+    /// A world that records its calls whatever the environment says.
+    pub fn recording(policies: Policies) -> Self {
+        let mut w = Self::new(policies);
+        w.trace.get_or_insert_with(Vec::new);
+        w
+    }
+
+    /// The calls recorded so far: none unless recording.
+    pub fn trace(&self) -> &[Recorded] {
+        self.trace.as_deref().unwrap_or_default()
+    }
+
+    /// Names this world's trace file apart from others of its test.
+    pub fn label_trace(&mut self, label: String) {
+        self.trace_label = Some(label);
+    }
+
+    fn trace_call(&mut self, call: RecordedCall) {
+        if self.trace.is_none() || self.trace_mute {
+            return;
+        }
+        let shown = self.holds.is_empty().then(|| self.shown());
+        // A fork, and a sandbox's queue step, read main's head as it is in the
+        // model: without the landing main holds. A real landing happens at its
+        // take, so in the trace that take comes after them.
+        let reads_main = matches!(
+            call,
+            RecordedCall::Fork { .. }
+                | RecordedCall::Take {
+                    tree: TreeId::Fork(_),
+                    ..
+                }
+        );
+        let Some(trace) = &mut self.trace else {
+            return;
+        };
+        let mains_take = reads_main.then(|| {
+            trace.iter().rposition(|r| {
+                matches!(
+                    r.call,
+                    RecordedCall::Take {
+                        tree: TreeId::Main,
+                        took: Took::Taken
+                    }
+                )
+            })
+        });
+        let held = self.holds.contains_key(&Tree::Main);
+        let moved = mains_take
+            .flatten()
+            .filter(|_| held)
+            .map(|i| trace.remove(i));
+        trace.push(Recorded { call, shown });
+        trace.extend(moved);
+    }
+
+    /// What the last call shows now, for a call the model makes in parts.
+    fn reshow(&mut self) {
+        if self.trace.is_none() || self.trace_mute {
+            return;
+        }
+        let shown = self.holds.is_empty().then(|| self.shown());
+        if let Some(last) = self.trace.as_mut().and_then(|t| t.last_mut()) {
+            last.shown = shown;
+        }
+    }
+
+    /// A queue step that took nothing while another entry is free is not a
+    /// call: it only marks a wait the real system finds again by itself, and a
+    /// real `take_next` goes on to the free entry in one step.
+    fn record_take(&mut self, t: Tree) {
+        let took = if self.holds.contains_key(&t) {
+            Took::Taken
+        } else if self.scan(t).is_some() {
+            return;
+        } else {
+            Took::Waiting
+        };
+        self.trace_call(RecordedCall::Take {
+            tree: tree_id(t),
+            took,
+        });
+    }
+
+    /// An open, recorded when it is granted, under the name its file has then:
+    /// a real open comes after the take the model's open waited for.
+    fn record_open(&mut self, h: HandleId) {
+        if self.trace.is_none() || self.trace_mute {
+            return;
+        }
+        let x = self.handles[&h].clone();
+        if x.waiting || x.kind != Kind::Write {
+            return;
+        }
+        let at = u64::from(h);
+        let Some(path) = self
+            .named(&x)
+            .and_then(|f| self.path_of(tree_of(x.target), &f))
+        else {
+            self.trace_call(RecordedCall::OpenGone { h: at });
+            return;
+        };
+        let caller = self.caller_of(&x.client);
+        self.trace_call(if x.calls.is_empty() {
+            RecordedCall::OpenWrite {
+                caller,
+                path,
+                h: at,
+            }
+        } else {
+            RecordedCall::OpenTrunc {
+                caller,
+                path,
+                h: at,
+            }
+        });
+    }
+
+    fn caller_of(&mut self, c: &Client) -> Caller {
+        match c {
+            Client::Main(n) => Caller::Main(n.clone()),
+            Client::Fork(f) => Caller::Fork(*f as usize),
+            Client::Outside(f) => {
+                self.trace_call(out_of_scope("outside"));
+                Caller::Fork(*f as usize)
+            }
+        }
+    }
+
+    /// What every live tree shows by path, and every collision so far.
+    pub fn shown(&self) -> Shown {
+        let trees = self
+            .live_trees()
+            .into_iter()
+            .map(|t| {
+                let head = self.head(t);
+                let files = PATHS
+                    .iter()
+                    .filter_map(|f| {
+                        let c = self.file(&head, f);
+                        c.path().map(|p| (p.to_string(), c.bytes().into_bytes()))
+                    })
+                    .collect();
+                (tree_id(t), files)
+            })
+            .collect();
+        let collisions = gather_collisions(self.collisions.iter().map(|c| {
+            let lost = self.file(&c.loser, &c.path);
+            let path = self
+                .file(&c.result, &c.path)
+                .path()
+                .or(lost.path())
+                .unwrap_or_default()
+                .to_string();
+            ShownCollision {
+                tree: tree_id(c.tree),
+                path,
+                lost_bytes: c
+                    .lost
+                    .iter()
+                    .filter_map(|t| lost.lines.iter().find(|l| l.id == *t))
+                    .filter_map(|l| l.text())
+                    .map(|t| t.as_bytes().to_vec())
+                    .collect(),
+                whole: c.by == By::Whole,
+            }
+        }));
+        Shown { trees, collisions }
+    }
+
     /// Every ref's commits, for history checks.
     pub fn all_commits(&self) -> Vec<String> {
         git(&self.repo, &["rev-list", "--all"])
@@ -3735,8 +3999,239 @@ pub(crate) fn commit_parents(repo: &Path, c: &str) -> Vec<String> {
         .collect()
 }
 
+fn tree_id(t: Tree) -> TreeId {
+    match t {
+        Tree::Main => TreeId::Main,
+        Tree::Fork(f) => TreeId::Fork(f as usize),
+    }
+}
+
+fn tree_of_id(t: TreeId) -> Tree {
+    match t {
+        TreeId::Main => Tree::Main,
+        TreeId::Fork(f) => Tree::Fork(f as ForkId),
+    }
+}
+
+fn tree_of(t: Target) -> Tree {
+    match t {
+        Target::Tree(t) => t,
+        Target::Txn(f, _) => Tree::Fork(f),
+    }
+}
+
+fn client_of(c: &Caller) -> Client {
+    match c {
+        Caller::Main(n) => Client::Main(n.clone()),
+        Caller::Fork(f) => Client::Fork(*f as ForkId),
+    }
+}
+
+fn no_such(what: &str, path: &str) -> CallError {
+    CallError {
+        errno: Some(libc_enoent()),
+        message: format!("{what} of {path}: no such file"),
+    }
+}
+
+/// `ENOENT`: this crate has no dependencies, so not from a libc binding.
+const fn libc_enoent() -> i32 {
+    2
+}
+
+fn text(bytes: &[u8]) -> Result<String, CallError> {
+    String::from_utf8(bytes.to_vec()).map_err(|e| CallError::new(e.to_string()))
+}
+
+/// The model through the shared calls: the same replay that drives the real
+/// system drives a fresh model (`phase1-replay`'s own check of the recording).
+impl TreeCalls for World {
+    type Open = HandleId;
+
+    fn fork(&mut self) -> Result<usize, CallError> {
+        Ok(self.create_fork(Tree::Main) as usize)
+    }
+
+    fn open_write(&mut self, c: &Caller, path: &str) -> Result<HandleId, CallError> {
+        let client = client_of(c);
+        if self.client_lookup(&client, path).is_none() {
+            return Err(no_such("open", path));
+        }
+        Ok(World::open_write(self, &client, path))
+    }
+
+    fn open_trunc(&mut self, c: &Caller, path: &str) -> Result<HandleId, CallError> {
+        let client = client_of(c);
+        if self.client_lookup(&client, path).is_none() {
+            return Err(no_such("open", path));
+        }
+        Ok(World::open_trunc(self, &client, path))
+    }
+
+    fn create(&mut self, c: &Caller, path: &str) -> Result<HandleId, CallError> {
+        World::create(self, &client_of(c), path)
+            .ok_or_else(|| CallError::new("every unborn identity is taken"))
+    }
+
+    fn pwrite(&mut self, h: HandleId, offset: u64, bytes: &[u8]) -> Result<(), CallError> {
+        self.write(
+            h,
+            Write::Pwrite {
+                offset: offset as usize,
+                bytes: text(bytes)?,
+            },
+        );
+        Ok(())
+    }
+
+    fn append(&mut self, h: HandleId, bytes: &[u8]) -> Result<(), CallError> {
+        self.write(h, Write::Append(text(bytes)?));
+        Ok(())
+    }
+
+    fn truncate(&mut self, h: HandleId, size: u64) -> Result<(), CallError> {
+        self.write(h, Write::Truncate(size as usize));
+        Ok(())
+    }
+
+    fn close(&mut self, h: HandleId) -> Result<(), CallError> {
+        World::close(self, h);
+        Ok(())
+    }
+
+    fn unlink(&mut self, c: &Caller, path: &str) -> Result<(), CallError> {
+        let client = client_of(c);
+        if self.client_lookup(&client, path).is_none() {
+            return Err(no_such("unlink", path));
+        }
+        World::unlink(self, &client, path);
+        Ok(())
+    }
+
+    fn rename(&mut self, c: &Caller, from: &str, to: &str) -> Result<(), CallError> {
+        let client = client_of(c);
+        if self.client_lookup(&client, from).is_none() {
+            return Err(no_such("rename", from));
+        }
+        World::rename(self, &client, from, to);
+        Ok(())
+    }
+
+    fn end_client(&mut self, c: &Caller) -> Result<(), CallError> {
+        match c {
+            Caller::Main(n) => self.end_main_client(n),
+            Caller::Fork(f) => World::end_client(self, *f as ForkId),
+        }
+        Ok(())
+    }
+
+    fn take_next(&mut self, t: TreeId) -> Result<Took, CallError> {
+        let id = t;
+        let t = tree_of_id(t);
+        if self.queue_len(t) == 0 {
+            self.trace_call(RecordedCall::Take {
+                tree: id,
+                took: Took::Empty,
+            });
+            return Ok(Took::Empty);
+        }
+        let mut stepped = false;
+        while self.scan(t).is_some() {
+            stepped = true;
+            self.step(&Step::Next(t));
+            if self.holds.contains_key(&t) {
+                return Ok(Took::Taken);
+            }
+        }
+        // The last step recorded its wait; none ran if a wait was already marked.
+        if !stepped {
+            self.trace_call(RecordedCall::Take {
+                tree: id,
+                took: Took::Waiting,
+            });
+        }
+        Ok(Took::Waiting)
+    }
+
+    fn finish_take(&mut self, t: TreeId) -> Result<(), CallError> {
+        let t = tree_of_id(t);
+        if self.holds.contains_key(&t) {
+            self.step(&Step::Finish(t));
+        }
+        Ok(())
+    }
+
+    fn crash(&mut self) -> Result<(), CallError> {
+        World::crash(self);
+        Ok(())
+    }
+
+    fn read(&self, t: TreeId, path: &str) -> Result<Option<Vec<u8>>, CallError> {
+        let head = self.head(tree_of_id(t));
+        Ok(self
+            .lookup(&head, path)
+            .map(|f| self.file(&head, &f).bytes().into_bytes()))
+    }
+
+    fn view(&self, h: HandleId) -> Result<Vec<u8>, CallError> {
+        Ok(World::view(self, h).into_bytes())
+    }
+
+    fn client_read(&self, c: &Caller, path: &str) -> Result<Option<Vec<u8>>, CallError> {
+        let client = client_of(c);
+        Ok(self
+            .client_lookup(&client, path)
+            .map(|_| self.client_reads(&client, path).bytes().into_bytes()))
+    }
+
+    fn paths(&self, t: TreeId) -> Result<Vec<String>, CallError> {
+        let head = self.head(tree_of_id(t));
+        let mut paths: Vec<String> = PATHS
+            .iter()
+            .filter_map(|f| self.file(&head, f).path().map(str::to_string))
+            .collect();
+        paths.sort();
+        Ok(paths)
+    }
+}
+
+/// Where `World::drop` writes a recorded world's trace.
+const TRACE_DIR: &str = "AGENTFS_MODEL_TRACE_DIR";
+
+/// `<thread name>[.<label>][.<n>].trace`: the n-th world of that name in this
+/// process counts from 1 past the first.
+fn trace_file(dir: &Path, label: Option<&str>) -> PathBuf {
+    static NAMES: Mutex<BTreeMap<String, u32>> = Mutex::new(BTreeMap::new());
+    let thread = std::thread::current();
+    let mut name = thread.name().unwrap_or("unnamed").replace("::", "-");
+    if let Some(l) = label {
+        name = format!("{name}.{l}");
+    }
+    let n = {
+        let mut names = NAMES.lock().unwrap_or_else(|e| e.into_inner());
+        let n = names.entry(name.clone()).or_insert(0);
+        *n += 1;
+        *n
+    };
+    if n > 1 {
+        name = format!("{name}.{n}");
+    }
+    dir.join(format!("{name}.trace"))
+}
+
 impl Drop for World {
     fn drop(&mut self) {
+        if let (Some(dir), Some(trace), false) = (
+            std::env::var_os(TRACE_DIR),
+            &self.trace,
+            std::thread::panicking(),
+        ) {
+            let file = trace_file(Path::new(&dir), self.trace_label.as_deref());
+            // A trace that cannot be written must fail the job, not a floor later.
+            std::fs::create_dir_all(&dir)
+                .and_then(|()| std::fs::write(&file, crate::calls::render(trace)))
+                .unwrap_or_else(|e| panic!("write {}: {e}", file.display()));
+        }
         if std::env::var_os("AGENTFS_MODEL_KEEP").is_none() {
             let _ = std::fs::remove_dir_all(&self.root);
         }

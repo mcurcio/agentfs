@@ -157,7 +157,13 @@ fn every_module_is_in_the_architecture_map() {
         "architecture.md",
     ));
     let mut problems = Vec::new();
-    for krate in ["agentfs-core", "agentfs-fuse", "agentfs", "agentfs-csi"] {
+    for krate in [
+        "agentfs-core",
+        "agentfs-fuse",
+        "agentfs",
+        "agentfs-csi",
+        "agentfs-conformance",
+    ] {
         let heading = format!("`{krate}`");
         let Some(section) = doc_tables::section(&sections, &heading) else {
             problems.push(format!(

@@ -982,11 +982,12 @@ fn drain(
     o: &mut Oracle,
     tally: &mut Tally,
     at: usize,
+    g: Generator,
 ) -> Result<(), (usize, String)> {
     for _ in 0..100_000 {
         close_all_checked(w, o, tally).map_err(|e| (at, e))?;
         checkg(w, o).map_err(|e| (at, e))?;
-        let Some(s) = w.pending().into_iter().next() else {
+        let Some(s) = pending_of(w, g).into_iter().next() else {
             return check_converged(w).map_err(|e| (at, e));
         };
         take(w, o, &s, tally).map_err(|e| (at, e))?;
@@ -1000,6 +1001,39 @@ fn checkg(w: &mut World, o: &mut Oracle) -> Result<(), String> {
     gitledger::observe(w)?;
     o.no_wait_on_waiting(w)?;
     o.check(w)
+}
+
+/// What a generator may do beyond phase 1's scope. All on by default, so the
+/// existing runs replay as before: a switch only skips a call, and draws no
+/// random number the default would not.
+#[derive(Clone, Copy)]
+struct Generator {
+    transactions: bool,
+    nested: bool,
+    drops: bool,
+}
+
+const EVERYTHING: Generator = Generator {
+    transactions: true,
+    nested: true,
+    drops: true,
+};
+
+/// Phase 1 builds no transactions, nested forks or fork drops, so these seeds
+/// are the ones that can run against the real system.
+const PHASE_1: Generator = Generator {
+    transactions: false,
+    nested: false,
+    drops: false,
+};
+
+/// The steps `g` may take now.
+fn pending_of(w: &World, g: Generator) -> Vec<Step> {
+    let mut steps = w.pending();
+    if !g.drops {
+        steps.retain(|s| !matches!(s, Step::Drop(_)));
+    }
+    steps
 }
 
 /// A generator of one seed's client calls and steps.
@@ -1019,6 +1053,7 @@ fn run_seed_of(
     tally: &mut Tally,
 ) -> Result<String, String> {
     let mut w = World::new(policies);
+    w.label_trace(format!("seed{seed}"));
     let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         generate(&mut w, seed, tally)
     }));
@@ -1544,6 +1579,20 @@ impl Calls {
 }
 
 fn run(w: &mut World, seed: u64, tally: &mut Tally) -> Result<(), (usize, String)> {
+    run_as(EVERYTHING, w, seed, tally)
+}
+
+/// [`run`], the calls phase 1 builds.
+fn run_phase1(w: &mut World, seed: u64, tally: &mut Tally) -> Result<(), (usize, String)> {
+    run_as(PHASE_1, w, seed, tally)
+}
+
+fn run_as(
+    g: Generator,
+    w: &mut World,
+    seed: u64,
+    tally: &mut Tally,
+) -> Result<(), (usize, String)> {
     gitledger::enable(true);
     gitledger::observe(w).map_err(|e| (0, e))?;
     let mut k = Calls::new(seed);
@@ -1586,7 +1635,7 @@ fn run(w: &mut World, seed: u64, tally: &mut Tally) -> Result<(), (usize, String
                 let forks = live_clients(w);
                 if forks.len() < 4 {
                     let parent = match k.rng.pick(&forks) {
-                        Some(f) if k.rng.below(3) == 0 => {
+                        Some(f) if k.rng.below(3) == 0 && g.nested => {
                             tally.nested += 1;
                             Tree::Fork(f)
                         }
@@ -1605,7 +1654,7 @@ fn run(w: &mut World, seed: u64, tally: &mut Tally) -> Result<(), (usize, String
                     focus = Some((f, slot));
                 }
             }
-            7 => {
+            7 if g.transactions => {
                 if let Some(f) = k.rng.pick(&free_clients(w)) {
                     let _ = w.begin(f);
                     k.o.reload(w);
@@ -1748,7 +1797,7 @@ fn run(w: &mut World, seed: u64, tally: &mut Tally) -> Result<(), (usize, String
                 k.during_take(w, slot, tally).map_err(e)?;
             }
             _ => {
-                if let Some(s) = k.rng.pick(&w.pending()) {
+                if let Some(s) = k.rng.pick(&pending_of(w, g)) {
                     take(w, &mut k.o, &s, tally).map_err(e)?;
                 }
             }
@@ -1767,13 +1816,13 @@ fn run(w: &mut World, seed: u64, tally: &mut Tally) -> Result<(), (usize, String
         }
     }
     checkg(w, &mut k.o).map_err(|e| (STEPS, e))?;
-    drain(w, &mut k.o, tally, STEPS)?;
+    drain(w, &mut k.o, tally, STEPS, g)?;
     // Every program exits: every fork drops.
     for f in live_clients(w) {
         end_checked(w, &mut k.o, &Client::Fork(f)).map_err(|e| (STEPS + 1, e))?;
     }
-    drain(w, &mut k.o, tally, STEPS + 1)?;
-    if let Some(f) = w.forks.values().find(|f| f.life != Life::Dropped) {
+    drain(w, &mut k.o, tally, STEPS + 1, g)?;
+    if let (true, Some(f)) = (g.drops, w.forks.values().find(|f| f.life != Life::Dropped)) {
         return Err((STEPS + 1, format!("f{} never dropped", f.id)));
     }
     tally_run(w, tally);
@@ -1822,6 +1871,20 @@ fn run(w: &mut World, seed: u64, tally: &mut Tally) -> Result<(), (usize, String
 /// queued behind it, which steps between the calls keep apart: this generator
 /// found findings 25 to 28. Every invariant holds after every call and step.
 fn rounds(w: &mut World, seed: u64, tally: &mut Tally) -> Result<(), (usize, String)> {
+    rounds_as(EVERYTHING, w, seed, tally)
+}
+
+/// [`rounds`], the calls phase 1 builds.
+fn rounds_phase1(w: &mut World, seed: u64, tally: &mut Tally) -> Result<(), (usize, String)> {
+    rounds_as(PHASE_1, w, seed, tally)
+}
+
+fn rounds_as(
+    g: Generator,
+    w: &mut World,
+    seed: u64,
+    tally: &mut Tally,
+) -> Result<(), (usize, String)> {
     gitledger::enable(true);
     gitledger::observe(w).map_err(|e| (0, e))?;
     let mut k = Calls::new(seed);
@@ -1837,7 +1900,7 @@ fn rounds(w: &mut World, seed: u64, tally: &mut Tally) -> Result<(), (usize, Str
                     let forks = live_clients(w);
                     if forks.len() < 4 {
                         let parent = match k.rng.pick(&forks) {
-                            Some(f) if k.rng.below(3) == 0 => Tree::Fork(f),
+                            Some(f) if k.rng.below(3) == 0 && g.nested => Tree::Fork(f),
                             _ => Tree::Main,
                         };
                         w.create_fork(parent);
@@ -1868,7 +1931,7 @@ fn rounds(w: &mut World, seed: u64, tally: &mut Tally) -> Result<(), (usize, Str
                         k.one_call(w, &m1, &p, slot, tally).map_err(e)?;
                     }
                 }
-                11 => {
+                11 if g.transactions => {
                     if let Some(f) = k.rng.pick(&live_clients(w)) {
                         let _ = w.begin(f);
                         k.o.reload(w);
@@ -1912,7 +1975,7 @@ fn rounds(w: &mut World, seed: u64, tally: &mut Tally) -> Result<(), (usize, Str
             }
             checkg(w, &mut k.o).map_err(e)?;
         }
-        drain(w, &mut k.o, tally, round)?;
+        drain(w, &mut k.o, tally, round, g)?;
     }
     tally_run(w, tally);
     Ok(())
@@ -2042,6 +2105,50 @@ fn random_interleavings_rounds() {
             seeds.len()
         );
     }
+}
+
+/// One [`Run`] over the seeds, every invariant on, no tally floor: the floors
+/// of [`run_all`] count transactions, which these runs do not make.
+fn run_scoped(generate: Run, seeds: &[u64], at_least: impl Fn(&Tally) -> bool) {
+    let mut tally = Tally::default();
+    let failures: Vec<String> = seeds
+        .iter()
+        .filter_map(|seed| run_seed_of(generate, *seed, Policies::default(), &mut tally).err())
+        .collect();
+    eprintln!("phase 1 scope, {} seeds: {tally:?}", seeds.len());
+    assert!(
+        failures.is_empty(),
+        "{} of {} seeds failed:\n\n{}",
+        failures.len(),
+        seeds.len(),
+        failures.join("\n\n")
+    );
+    assert!(
+        seeds.len() < 8 || at_least(&tally),
+        "the phase 1 runs met too little: {tally:?}"
+    );
+}
+
+/// The random calls phase 1 builds, for `crates/agentfs-conformance` to replay.
+#[test]
+fn random_interleavings_phase1_scope() {
+    run_scoped(run_phase1, &seeds(), |t| {
+        t.take_waits > 0 && t.open_waits > 0 && t.overtakes > 0 && t.prefix_syncs > 0
+    });
+}
+
+/// [`rounds`], for the same replay.
+#[test]
+fn random_interleavings_rounds_phase1_scope() {
+    let explicit = ["AGENTFS_MODEL_SEED", "AGENTFS_MODEL_SEEDS"]
+        .iter()
+        .any(|v| std::env::var(v).is_ok());
+    let seeds = if explicit {
+        seeds()
+    } else {
+        (1..=ROUNDS_SEEDS).collect()
+    };
+    run_scoped(rounds_phase1, &seeds, |t| t.changes_lost > 0);
 }
 
 /// The per-line rule does not depend on slots being separate git hunks:

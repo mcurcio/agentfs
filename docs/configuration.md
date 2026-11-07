@@ -1011,7 +1011,9 @@ test 3, [architecture.md](architecture.md#crash-model)). Only a binary
 built with `--features agentfs/failpoints` reads it (its `--version` ends
 in `+failpoints`, and it warns at start when the variable is set); release
 builds and the image have no failpoints and ignore it. Never set it in
-production.
+production. In the same builds, `AGENTFS_TAKE_GATE=<dir>` stops `trees mount`'s
+queue worker: it takes only when a test asks through the fifos `go` and `took`
+in that directory (`agentfs_core::failpoints::TakeGate`).
 
 **Telemetry** (design §13). Every command with pod flags but `status` (`restore` and `revert` only
 without a mount) exports OpenTelemetry metrics, traces

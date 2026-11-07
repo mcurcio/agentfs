@@ -124,6 +124,10 @@ pub fn serve_with_metrics(
     let progress_actor = Arc::clone(&actor);
     let progress_signal = Arc::clone(&signal);
     let progress_worker = std::thread::spawn(move || -> io::Result<()> {
+        #[cfg(feature = "failpoints")]
+        if let Some(gate) = agentfs_core::failpoints::take_gate() {
+            return run_take_gate(gate, &progress_actor, &notifiers);
+        }
         loop {
             {
                 let mut state = progress_signal
@@ -205,6 +209,34 @@ pub fn serve_with_metrics(
     result?;
     progress_result?;
     metrics_result?;
+    Ok(())
+}
+
+/// A test's takes in place of the worker's: one at each line (failpoints'
+/// `TakeGate`), the actor locked only for that take.
+#[cfg(feature = "failpoints")]
+fn run_take_gate(
+    mut gate: agentfs_core::failpoints::TakeGate,
+    actor: &Mutex<Volume>,
+    notifiers: &[(String, Notifier)],
+) -> io::Result<()> {
+    while let Some(tree) = gate.next_tree()? {
+        let (took, changed) = {
+            let mut volume = actor
+                .lock()
+                .map_err(|_| io::Error::other("tree actor poisoned"))?;
+            let took = volume.take_next(&tree);
+            (took, volume.drain_changed())
+        };
+        invalidate_changed(notifiers, &changed);
+        let answer = match took {
+            Ok(agentfs_core::tree_actor::Took::Taken) => "taken".to_owned(),
+            Ok(agentfs_core::tree_actor::Took::Waiting) => "waiting".to_owned(),
+            Ok(agentfs_core::tree_actor::Took::Empty) => "empty".to_owned(),
+            Err(e) => format!("error {e}"),
+        };
+        gate.answer(&answer)?;
+    }
     Ok(())
 }
 

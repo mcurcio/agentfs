@@ -101,6 +101,71 @@ pub fn hit(_name: &'static str) -> io::Result<()> {
 pub use imp::{FailpointError, Guard, configure, hit, hits, trace};
 
 #[cfg(feature = "failpoints")]
+pub use take_gate::{TakeGate, take_gate};
+
+/// Takes at a test's points, not the queue worker's (git-model §18's replay).
+#[cfg(feature = "failpoints")]
+mod take_gate {
+    use std::fs::{File, OpenOptions};
+    use std::io::{self, BufRead, BufReader, Write};
+    use std::path::Path;
+
+    /// The variable naming the gate's directory.
+    const VAR: &str = "AGENTFS_TAKE_GATE";
+
+    /// `AGENTFS_TAKE_GATE=<dir>` with fifos `go` and `took`: the worker takes
+    /// nothing by itself; a line `tree` on `go` runs one `take_next(tree)` and
+    /// answers taken|waiting|empty on `took`, or `error ...`. An empty line ends
+    /// the gate, so an unmount can join the worker. The actor stays unlocked
+    /// while it waits.
+    pub struct TakeGate {
+        go: BufReader<File>,
+        took: File,
+    }
+
+    impl TakeGate {
+        /// The next tree to take in; none when the gate ends.
+        pub fn next_tree(&mut self) -> io::Result<Option<String>> {
+            let mut line = String::new();
+            if self.go.read_line(&mut line)? == 0 {
+                return Ok(None);
+            }
+            let tree = line.trim_end();
+            Ok((!tree.is_empty()).then(|| tree.to_owned()))
+        }
+
+        /// Answers the last tree.
+        pub fn answer(&mut self, answer: &str) -> io::Result<()> {
+            writeln!(self.took, "{answer}")
+        }
+    }
+
+    /// The gate, in a build with failpoints and the variable set. A gate that
+    /// cannot open aborts, as a misspelt failpoint does: a test must not pass
+    /// with the worker taking by itself.
+    pub fn take_gate() -> Option<TakeGate> {
+        let dir = std::env::var_os(VAR)?;
+        // Read and write: neither end ever sees end of file, nor blocks opening.
+        let open = |name: &str| {
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(Path::new(&dir).join(name))
+        };
+        match (open("go"), open("took")) {
+            (Ok(go), Ok(took)) => Some(TakeGate {
+                go: BufReader::new(go),
+                took,
+            }),
+            (Err(e), _) | (_, Err(e)) => {
+                eprintln!("{VAR}: {e}");
+                std::process::abort();
+            }
+        }
+    }
+}
+
+#[cfg(feature = "failpoints")]
 mod imp {
     use std::collections::HashMap;
     use std::io::{self, Write as _};

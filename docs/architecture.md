@@ -12,6 +12,7 @@ page says *where*. Section references (§) are to design.md.
 | `agentfs-fuse` | library | The FUSE layer: a passthrough filesystem over the backing tree that calls the engine at every change boundary (§2.1, §3.1, §6) |
 | `agentfs` | binary | The `agentfs` command (§17.1): `init`, `mount`, `run`, `record`, `flush`, `push`, `status`, `probe`, `serve-history`, `restore`, `revert`, `patch`, `fork`; OpenTelemetry export |
 | `agentfs-csi` | library and binary | The CSI driver (§14.2): `agentfs-csi`, one per node beside csi-provisioner, which makes the node's worktrees and supervises `agentfs serve-history`, `agentfs mount` and the release scan's `agentfs flush` and `agentfs push` children |
+| `agentfs-conformance` | library and binary, tests only | The model's recorded calls against the real tree library and real mounts (git-model §18). Depends on `agentfs-core` and `agentfs-model`; nothing depends on it |
 
 The dependencies run one way: `agentfs-csi` → (`agentfs` as a child
 process) → `agentfs-fuse` → `agentfs-core`. `agentfs-csi` links
@@ -180,6 +181,16 @@ missing from these tables or a row names a module that no longer exists;
 | `otel/tls.rs` | The `otlp-tls` feature: TLS to the collector (CA bundle or system store, client certificate) for the HTTP and gRPC exporters (§13) |
 | `doc_tables.rs` | Test only: a small markdown reader for the documentation tests |
 | `reference_tests.rs` | Test only: checks docs/configuration.md against the CLI's flags and variables |
+
+### `agentfs-conformance`
+
+| Module | Role |
+|---|---|
+| `lib.rs` | Crate root, one call per kind of replay, which traces fit a real mount |
+| `library.rs` | `Library`: the shared calls on `Volume`, seeded as the model's first commit |
+| `mounted.rs` | `Mounted`: the shared calls as real system calls on a mount of a failpoints build, each take through the take gate |
+| `invariants.rs` | What must hold in the real system, read from `git`, its own parse of `metadata.json` and `namespace.json` and its own byte oracle, never `tree_actor` |
+| `bin/phase1-replay.rs` | `phase1-replay model\|library\|mount DIR`: replays the traces, with floors, against `open-findings.txt` |
 
 ### `agentfs-csi`
 

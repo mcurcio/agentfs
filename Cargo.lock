@@ -72,6 +72,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "agentfs-conformance"
+version = "0.0.0"
+dependencies = [
+ "agentfs-core",
+ "agentfs-model",
+ "libc",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "agentfs-core"
 version = "0.1.0"
 dependencies = [
