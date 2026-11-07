@@ -1,0 +1,21 @@
+name: pinned git
+description: >-
+  Puts the release of git in ci/git-release first on the path agentfs looks it up in,
+  and checks it, so CI aligns lines with the image's release (MODEL.md, finding 42).
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: sudo install -d -o "$(id -u)" -g "$(id -g)" /opt/agentfs-git
+    - id: cache
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: /opt/agentfs-git
+        key: pinned-git-${{ runner.os }}-${{ hashFiles('ci/git-release', 'ci/install-git.sh') }}
+    - if: steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      run: ci/install-git.sh /opt/agentfs-git
+    - shell: bash
+      run: sudo ln -sf /opt/agentfs-git/bin/git /usr/local/bin/git
+    - shell: bash
+      run: ci/check-tree-git.sh

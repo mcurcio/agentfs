@@ -1,0 +1,16 @@
+[package]
+name = "agentfs-conformance"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Replays the model's recorded calls against the real tree library and real mounts"
+publish = false
+
+[dependencies]
+agentfs-core = { version = "0.1.0", path = "../agentfs-core" }
+agentfs-model = { version = "0.0.0", path = "../agentfs-model" }
+libc = "0.2.190"
+serde_json = "1.0.154"
+tempfile = "3.27.0"

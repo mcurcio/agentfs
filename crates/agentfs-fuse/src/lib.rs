@@ -39,6 +39,7 @@ pub mod overlay;
 pub mod privileges;
 pub mod session;
 pub mod sweep;
+pub mod tree_view;
 pub mod views;
 
 pub use fuse::{Passthrough, PassthroughStatus};

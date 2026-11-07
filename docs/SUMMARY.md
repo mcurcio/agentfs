@@ -45,3 +45,22 @@
 - [Performance](performance.md)
 - [Building and testing](development.md)
 - [Adversarial review, 2026-10-12](reviews/2026-10-12-adversarial.md)
+
+# Target architecture
+
+- [Overview](target-architecture/README.md)
+  - [agentfs in git terms](target-architecture/git-model.md)
+  - [The rules ledger](target-architecture/rules-ledger.md)
+  - [Snapshot opens (parked)](target-architecture/snapshot-opens.md)
+  - [Phase 1: implementation and validation](target-architecture/phase-1.md)
+  - [Phase 1 handoff](target-architecture/phase-1-handoff.md)
+  - [The system](target-architecture/system.md)
+  - [Rules](target-architecture/domains/rules.md)
+  - [Clients](target-architecture/domains/clients.md)
+  - [Views](target-architecture/domains/views.md)
+  - [Trees](target-architecture/domains/trees.md)
+  - [Replication](target-architecture/domains/replication.md)
+  - [Volume](target-architecture/domains/volume.md)
+  - [Health](target-architecture/domains/health.md)
+  - [Telemetry](target-architecture/domains/telemetry.md)
+  - [Verifying the design](target-architecture/verifying.md)
