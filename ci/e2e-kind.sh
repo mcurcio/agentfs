@@ -133,7 +133,7 @@ in_sidecar() { k exec "$POD" -c agentfs -- "$@"; }
 # Waits until the remote branch has <path> with <content>.
 wait_remote() { # path content [seconds]
   local deadline=$((SECONDS + ${3:-60}))
-  until [ "$(rgit show "$BRANCH:$1" 2>/dev/null)" = "$2" ]; do
+  until rgit cat-file -e "$BRANCH:$1" 2>/dev/null && [ "$(rgit show "$BRANCH:$1")" = "$2" ]; do
     [ $SECONDS -lt $deadline ] || fail "the remote never had $1 = '$2'"
     sleep 1
   done
@@ -206,6 +206,11 @@ assert_contains "$startup" "volume $VOLUME" "the sidecar mounted the volume"
 assert_contains "$(k logs "$POD" -c agentfs-init)" "initialised volume $VOLUME" "the init container created the state area"
 
 step "root and uid 10000 write with normal permissions (design §18 test 4)"
+# A shell's `>` is two records, the empty file and then its content, and a
+# busy machine puts the empty file in a commit of its own (design §3.1). Here
+# it always does, so the restore below meets that history in every run.
+in_root "cd $WS && : > root.txt"
+wait_remote root.txt ""
 in_root "cd $WS && printf root > root.txt && chmod 600 root.txt && mkdir u10000 && chown 10000:10000 u10000"
 sleep 1
 in_user 'printf user > /workspace/u10000/user.txt'
@@ -248,13 +253,16 @@ done
 pass "excluded and -agentfs paths are not in history"
 
 step "restore through the sidecar's control socket (design §18 test 11)"
-FIRST=$(rgit log --format=%H --diff-filter=A "$BRANCH" -- root.txt | tail -n1)
+# The remote's head: wait_remote saw it hold root.txt, and nothing wrote that
+# file since. Not the commit that added the file, which may hold it empty.
+SOURCE=$(rgit rev-parse "$BRANCH")
+assert_eq root "$(rgit show "$SOURCE:root.txt")" "the commit to restore from holds the content"
 in_root "printf changed > $WS/root.txt"
 wait_remote root.txt changed
-in_sidecar agentfs restore root.txt "$FIRST"
+in_sidecar agentfs restore root.txt "$SOURCE"
 assert_eq root "$(in_root "cat $WS/root.txt")" "the writer reads the restored content"
 wait_remote root.txt root
-assert_contains "$(remote_message root.txt)" "Agentfs-Restore: $FIRST" "the restore is its own commit"
+assert_contains "$(remote_message root.txt)" "Agentfs-Restore: $SOURCE" "the restore is its own commit"
 
 step "deleting the pod makes the final commit"
 follow_log "$POD" agentfs graceful
