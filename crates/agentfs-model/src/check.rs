@@ -580,7 +580,8 @@ fn delivered(w: &World, t: Tree, c: &Collision) -> bool {
 /// transaction, won or lost, or taken from the parent by a sync) is still
 /// its line's version there, or one written over it is, or a delete is
 /// that agrees with it or with a delete written over it
-/// ([`deleted_over`]), or such a collision names it.
+/// ([`deleted_over`]), or such a collision names it, or the tree's last sync
+/// hid its line under R10.6 ([`hidden_by_r10_6`]).
 fn no_silent_loss(w: &World, now: &Views) -> Result<(), String> {
     for (t, p, l, a, b) in moves(w, now) {
         // excuse: R10.3 two deletes of one line agree: the line stays deleted
@@ -615,6 +616,10 @@ fn no_silent_loss(w: &World, now: &Views) -> Result<(), String> {
             // A new line that lost never entered the tree's file.
             // excuse: R3b a new line that lost never entered the tree's file
             if lost {
+                continue;
+            }
+            // excuse: R10.6 the tree's last sync hid the parent's unfinished last line in front of an undecided line
+            if hidden_by_r10_6(w, *t, &e.path, &e.line, &e.token) {
                 continue;
             }
             return Err(format!("line {} of {} left {t:?}", e.line, e.path));
@@ -955,6 +960,80 @@ fn in_front_of(u: &Content, ours: &Content, r: &Content, x: &Line, o: &Line) -> 
         .all(|l| !after.contains(l.line.as_str()))
 }
 
+/// Whether a line ends without a newline; false for a deleted one.
+fn ends_open(l: &Line) -> bool {
+    l.text().is_some_and(|t| !t.ends_with('\n'))
+}
+
+/// The versions `parent` had taken within the first `entered` records.
+fn taken_by(w: &World, parent: Tree, entered: usize) -> BTreeSet<&str> {
+    w.entered[..entered]
+        .iter()
+        .filter(|(x, _)| *x == parent)
+        .map(|(_, e)| e.token.as_str())
+        .collect()
+}
+
+/// P2: a version `parent` took only in takes a sync of its commit `up` holds
+/// back (the take's result commit is not in `up`, read from git).
+fn held_back(w: &World, parent: Tree, up: &str, id: &str) -> bool {
+    let mut takes = w
+        .landings
+        .iter()
+        .filter(|l| l.tree == parent)
+        .filter(|l| w.edits(&l.base, &l.change).iter().any(|e| e.token == id))
+        .peekable();
+    takes.peek().is_some() && takes.all(|l| !w.is_ancestor(&l.result, up))
+}
+
+/// R10.6 at one sync: `x`, the parent's version in `u` of a line the sync's
+/// result `r` left out, is the parent's unfinished last line and stands in front
+/// of a live line of `r` still undecided at that sync.
+fn r10_6_hides(
+    u: &Content,
+    ours: Option<&Content>,
+    r: &Content,
+    x: &Line,
+    undecided: impl Fn(&Line) -> bool,
+) -> bool {
+    ends_open(x)
+        && u.live().last() == Some(x)
+        && r.live()
+            .filter(|o| undecided(o))
+            .any(|o| ours.is_some_and(|m| in_front_of(u, m, r, x, o)))
+}
+
+/// Line `line` of `path`, whose version `token` entered `t`, is out of `t`'s
+/// file because `t`'s last sync hid it under R10.6: that sync's result lacks it,
+/// and the parent's version in the commit it delivered was written over `token`
+/// and is hidden by [`r10_6_hides`]. So the next sync, which delivers the
+/// parent's decision, must bring the line back or fail here, and a line that
+/// left any other way (a save, a sync with no such reason, a parent's version
+/// not written over `token`) fails. The owner, 2026-11-06, finding 35: "A is fine".
+fn hidden_by_r10_6(w: &World, t: Tree, path: &str, line: &str, token: &str) -> bool {
+    let Tree::Fork(f) = t else {
+        return false;
+    };
+    let Some((_, up, result, entered)) = w.syncs.iter().rev().find(|s| s.0 == t) else {
+        return false;
+    };
+    let (u, r) = (w.file(up, path), w.file(result, path));
+    let Some(x) = u.member(line) else {
+        return false;
+    };
+    if r.member(line).is_some() || !w.lineage.descends(&x.id, token) {
+        return false;
+    }
+    let parent = w.forks[&f].parent;
+    let took = taken_by(w, parent, *entered);
+    let ours = commit_parents(w.repo(), result)
+        .first()
+        .map(|c| w.file(c, path));
+    r10_6_hides(&u, ours.as_ref(), &r, x, |o| {
+        !is_root(&o.id) && (!took.contains(o.id.as_str()) || held_back(w, parent, up, &o.id))
+    })
+}
+
 /// Rule 3 per sync, as of the moment its take began: the fork now holds
 /// the parent's version of every line, except where it holds its own
 /// version the parent's queue had not decided then (that version had not
@@ -972,21 +1051,8 @@ fn syncs_deliver(w: &mut World) -> Result<(), String> {
             return Err("main synced".into());
         };
         let parent = w.forks[f].parent;
-        let took: BTreeSet<&str> = w.entered[..*entered]
-            .iter()
-            .filter(|(x, _)| *x == parent)
-            .map(|(_, e)| e.token.as_str())
-            .collect();
-        // P2: a version the parent took only in takes the sync holds back.
-        let held_back = |id: &str| {
-            let mut takes = w
-                .landings
-                .iter()
-                .filter(|l| l.tree == parent)
-                .filter(|l| w.edits(&l.base, &l.change).iter().any(|e| e.token == id))
-                .peekable();
-            takes.peek().is_some() && takes.all(|l| !w.is_ancestor(&l.result, up))
-        };
+        let took = taken_by(w, parent, *entered);
+        let held_back = |id: &str| held_back(w, parent, up, id);
         let decided = |id: &str| is_root(id) || took.contains(id);
         // Finding 11: the parent gave file `p` a path that the fork's own
         // undecided name of another file holds there, or (a chain) a file
@@ -1043,8 +1109,7 @@ fn syncs_deliver(w: &mut World) -> Result<(), String> {
                 }
             }
             // The sandbox's lines still undecided, for what a sync may hide.
-            let undecided = |o: &&Line| !decided(&o.id) || held_back(&o.id);
-            let ends_open = |l: &Line| l.text().is_some_and(|t| !t.ends_with('\n'));
+            let undecided = |o: &Line| !decided(&o.id) || held_back(&o.id);
             let ours = commit_parents(w.repo(), result)
                 .first()
                 .map(|c| w.file(c, p));
@@ -1052,14 +1117,12 @@ fn syncs_deliver(w: &mut World) -> Result<(), String> {
                 |x: &Line, o: &Line| ours.as_ref().is_some_and(|m| in_front_of(&u, m, &r, x, o));
             let hidden = |x: &Line| {
                 // excuse: R10.6 the parent's unfinished last line in front of an undecided line
-                let before_own = ends_open(x)
-                    && u.live().last() == Some(x)
-                    && r.live().filter(undecided).any(|o| in_front(x, o));
+                let before_own = r10_6_hides(&u, ours.as_ref(), &r, x, undecided);
                 // excuse: R10.9 the parent's lines after an undecided unfinished line, unseen by the sandbox
                 let after_own = x.live()
                     && ours.as_ref().is_some_and(|m| m.member(&x.line).is_none())
                     && r.live()
-                        .filter(undecided)
+                        .filter(|o| undecided(o))
                         .any(|o| ends_open(o) && !in_front(x, o));
                 before_own || after_own
             };

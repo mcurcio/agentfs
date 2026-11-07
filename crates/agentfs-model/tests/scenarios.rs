@@ -1453,12 +1453,11 @@ fn r10_a_sync_hides_the_parents_lines_after_an_undecided_unfinished_line() {
     assert!(w.is_ancestor(&lost.loser, &w.main_head));
 }
 
-/// Coherence finding 35: main cuts a line the sandbox already holds to an
-/// unfinished last line, in front of the sandbox's undecided line. R10.6 hides it,
-/// so the line the sandbox held leaves its file, which `no_silent_loss` forbids:
-/// the excuses R10.6 was given cover `syncs_deliver` only.
+/// Finding 35, answered by the owner, 2026-11-06, "A is fine": main cuts a line the
+/// sandbox already holds to an unfinished last line, in front of the sandbox's
+/// undecided line. R10.6 covers it: the line leaves the sandbox's file until the
+/// parent decides, then the parent's version arrives.
 #[test]
-#[ignore = "coherence finding 35: a sync hides a line the sandbox held, and `no_silent_loss` says it left the tree"]
 fn finding_35_a_sync_hides_a_line_the_sandbox_already_held() {
     let mut w = world();
     let f = w.create_fork(Tree::Main);
@@ -1472,6 +1471,7 @@ fn finding_35_a_sync_hides_a_line_the_sandbox_already_held() {
         }],
     );
     next(&mut w, Tree::Fork(f));
+    assert!(bytes(&w, Tree::Fork(f), "c").contains("n3\n"));
     calls(
         &mut w,
         &Client::Fork(f),
@@ -1479,8 +1479,20 @@ fn finding_35_a_sync_hides_a_line_the_sandbox_already_held() {
         &[Write::Append("n5\n".into())],
     );
     calls(&mut w, &m1(), "c", &[Write::Truncate(3)]);
+    assert_eq!(bytes(&w, Tree::Main, "c"), "-\nn");
     next(&mut w, Tree::Fork(f));
-    assert_eq!(bytes(&w, Tree::Fork(f), "c").lines().last(), Some("n5"));
+    // Undecided: the sandbox's line alone, neither version of the held line.
+    assert_eq!(bytes(&w, Tree::Fork(f), "c"), "-\nn5\n");
+    drain(&mut w);
+    // Decided: the sandbox's line lost to the unfinished line (R10.4), and the
+    // parent's version arrived.
+    assert_eq!(bytes(&w, Tree::Main, "c"), "-\nn");
+    assert_eq!(bytes(&w, Tree::Fork(f), "c"), "-\nn");
+    assert!(
+        w.collisions
+            .iter()
+            .any(|x| x.tree == Tree::Main && x.path == "c")
+    );
 }
 
 /// Coherence finding 30: a transaction's line after its sandbox's own

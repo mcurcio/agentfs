@@ -382,14 +382,18 @@ An open or rejected finding has a test marked `#[ignore = "coherence finding N: 
    transaction to a client have no rule behind them (ledger R5.4). `txn_files` also counts files open for writing, and a
    deferred call stays behind a surviving transaction at a crash; R5.3 says otherwise. Not changed, because the integration's
    API is undefined (git-model, Questions for the owner). No test records this yet.
-35. **Open, for the owner (2026-11-06): R10.6 hides a line the sandbox already held (seed 133 of 1 to 500 of
+35. **Resolved by the owner (2026-11-06, "A is fine"): R10.6 hides a line the sandbox already held (seed 133 of 1 to 500 of
    `full_lineage`, seed 233 of `rounds`).** Main cuts a line the sandbox holds to an unfinished last line, in front of the
-   sandbox's undecided line. R10.6 says the file shows the sandbox's line alone, so that line leaves the sandbox's file until
-   the parent decides. `no_silent_loss` says a line that entered a tree stays in it, so it fails. The tree is what R10.6 says;
-   no check was changed for this (VERIFYING.md, "Fix passes"). `finding_35_a_sync_hides_a_line_the_sandbox_already_held`.
+   sandbox's undecided line. R10.6 covers it: that line leaves the sandbox's file until the parent decides, then the
+   parent's version arrives. No behaviour changed. `no_silent_loss` excuses exactly a line the tree's last sync hid this way
+   (`// excuse: R10.6`), and still fails if the next sync does not bring it back or it left any other way. Revisable: the
+   rejected options were to keep showing the older version in front of the sandbox's line until decided, and to have the
+   sandbox's save lose at once. `finding_35_a_sync_hides_a_line_the_sandbox_already_held`.
 
 ## Costs
 
+- A program in a sandbox can see a line it already read go away for a while (R10.6, finding 35): when main cuts that line to
+  an unfinished last line in front of the sandbox's undecided line, the file shows neither version until the parent decides.
 - A change loses whole for one line (rule 3e): a save's or transaction's lines that collided with nothing are
   dropped too, and the sandbox then takes the parent's version of them, newer lines of its own included. They
   stay in history, named by the collision. A program that wants a line to survive a collision elsewhere saves

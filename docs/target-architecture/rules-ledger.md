@@ -272,9 +272,11 @@ without seeing the other. MODEL.md's rules table holds the full wording; this pa
   and the parent wins. agentfs never adds a newline no program wrote. Owner, 2026-11-05: "collide".
 - **R10.6** · owner · Until the parent decides, a sandbox holding an undecided line does not show the parent's
   unfinished last line in front of it: the file shows the sandbox's line alone, then the parent's version once decided.
-  No tree shows bytes nobody wrote. Owner, 2026-11-05: "1 a" (finding 29).
+  No tree shows bytes nobody wrote. Owner, 2026-11-05: "1 a" (finding 29). This also covers a line the sandbox already
+  held: it leaves the sandbox's file until the parent decides, then the parent's version arrives. Owner, 2026-11-06:
+  "A is fine" (finding 35). Revisable: option b was to keep showing the older version.
   Tests: `r10_a_sync_hides_the_parents_unfinished_line_before_an_undecided_one`,
-  `a_sync_hides_the_parents_unfinished_line_until_decided`
+  `a_sync_hides_the_parents_unfinished_line_until_decided`, `finding_35_a_sync_hides_a_line_the_sandbox_already_held`
 - **R10.7** · owner · An edited line keeps its place. When a parent appends a line after a line a sandbox edits, the
   merged file reads the edit, then the append. Owner, 2026-11-05: "B seems more correct. The magic words there are
   “edit” and “append”. From the perspective of each writer, their operations merged together naturally look like
