@@ -313,10 +313,12 @@ without seeing the other. MODEL.md's rules table holds the full wording; this pa
   the files without the landing". Tests:
   `r11_two_renames_to_one_path_keep_the_sandboxs_name_until_decided`, `r11_a_chain_of_renames_to_one_path_keeps_every_previous_name`
 - **R11.2** · approved · An editor's atomic save (write a new file, rename it over the old one) is a rewrite of
-  the old file, so the file keeps its identity and merges per line. Approved by the owner, 2026-11-05 (approval page). Tests: `r11_an_atomic_save_keeps_the_files_identity_and_merges_per_line`, `finding_39_a_losing_atomic_save_keeps_two_files_apart`
+  the old file, so the file keeps its identity and merges per line. Approved by the owner, 2026-11-05 (approval page). Tests: `r11_an_atomic_save_keeps_the_files_identity_and_merges_per_line`, `finding_39_a_losing_atomic_save_keeps_two_files_apart`,
+  `r11_a_losing_atomic_save_keeps_two_files_apart`
 - **R11.3** · approved · Writes through a handle whose file was unlinked or replaced reach no file, and raise an
   `OrphanDropped` event. Owner, 2026-11-05 (in chat, round 2): approved. Tests: `r11_an_old_writer_after_an_atomic_save_saves_nothing`,
-  `an_old_writer_stays_orphaned_when_the_unlink_loses`, `an_old_writer_stays_orphaned_when_the_rename_over_loses`
+  `an_old_writer_stays_orphaned_when_the_unlink_loses`, `an_old_writer_stays_orphaned_when_the_rename_over_loses`,
+  `r11_an_old_writer_stays_orphaned_when_the_change_that_ended_its_file_loses`
 - **R11.4** · approved · A tracked file arriving at a path an untracked file holds wins the path; the untracked
   file stays hidden and shows again if the tracked one goes. Owner, 2026-11-05 (in chat, round 2): option 1, the tracked file shows.
 

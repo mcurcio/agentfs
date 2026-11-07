@@ -1495,6 +1495,73 @@ fn finding_35_a_sync_hides_a_line_the_sandbox_already_held() {
     );
 }
 
+/// Finding 39: a sandbox's atomic save that loses leaves two files, each with its own
+/// bytes, and a program reads them. Recorded so a real mount replays it too.
+#[test]
+fn r11_a_losing_atomic_save_keeps_two_files_apart() {
+    let mut w = world();
+    let f = w.create_fork(Tree::Main);
+    let s = Client::Fork(f);
+    let h = World::create(&mut w, &s, "t").unwrap();
+    w.write(h, Write::Append("n\n-\n-\n-\n-\n-\n".into()));
+    w.close(h);
+    w.rename(&s, "t", "c");
+    calls(
+        &mut w,
+        &m1(),
+        "c",
+        &[Write::Pwrite {
+            offset: 0,
+            bytes: "m\n".into(),
+        }],
+    );
+    drain(&mut w);
+    assert_eq!(bytes(&w, Tree::Fork(f), "c"), "m\n-\n-\n-\n-\n-\n");
+    assert_eq!(bytes(&w, Tree::Fork(f), "t"), "n\n-\n-\n-\n-\n-\n");
+    assert_eq!(bytes(&w, Tree::Main, "t"), "n\n-\n-\n-\n-\n-\n");
+}
+
+/// R11.3 and the same mechanism: an unlink, or a rename over the file, that loses brings
+/// the file back; a writer that held the old one still reaches no file.
+#[test]
+fn r11_an_old_writer_stays_orphaned_when_the_change_that_ended_its_file_loses() {
+    for rename in [false, true] {
+        let mut w = world();
+        let f = w.create_fork(Tree::Main);
+        let s = Client::Fork(f);
+        let old = w.open_write(&s, "c");
+        w.write(
+            old,
+            Write::Pwrite {
+                offset: 0,
+                bytes: "x\n".into(),
+            },
+        );
+        if rename {
+            w.rename(&s, "b", "c");
+        } else {
+            w.unlink(&s, "c");
+        }
+        calls(
+            &mut w,
+            &m1(),
+            "c",
+            &[Write::Pwrite {
+                offset: 0,
+                bytes: "m\n".into(),
+            }],
+        );
+        next(&mut w, Tree::Main);
+        next(&mut w, Tree::Fork(f));
+        next(&mut w, Tree::Fork(f));
+        assert_eq!(bytes(&w, Tree::Fork(f), "c"), "m\n-\n-\n-\n-\n-\n");
+        w.close(old);
+        drain(&mut w);
+        assert_eq!(w.orphans.len(), 1, "the old writer saved nothing");
+        assert_eq!(bytes(&w, Tree::Fork(f), "c"), "m\n-\n-\n-\n-\n-\n");
+    }
+}
+
 /// Coherence finding 43 (seed 191 of 1 to 500 of `full_lineage`, `adjacent_lines` and
 /// `commit_dates_decide_nothing`): R10.9 hides lines the sandbox itself deleted in a
 /// save that lost. The rule's words cover it, the model and the library both do it, and
