@@ -8,6 +8,10 @@ repository.workspace = true
 description = "An executable model of the target architecture's landing rules, built on the git CLI"
 publish = false
 
-# No dependencies, and none on another agentfs crate: this models the target
-# design (docs/target-architecture), not today's code. The randomized test
-# uses its own seeded generator so every failure replays from a printed seed.
+# This models the target design (docs/target-architecture), not today's code, so the
+# one agentfs crate it depends on is the alignment's call, which it shares with the
+# library so that line identity does not depend on how git is called (MODEL.md,
+# finding 41). The randomized test uses its own seeded generator so every failure
+# replays from a printed seed.
+[dependencies]
+agentfs-align = { version = "0.1.0", path = "../agentfs-align" }

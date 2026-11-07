@@ -217,11 +217,17 @@ impl Tree {
         self.fresh_names.remove(&object);
     }
 
-    /// Replaces the names and files with `snapshot`'s.
+    /// Replaces the names and files with `snapshot`'s. Two files on one object
+    /// would read each other's bytes, so a view could differ from its commit: a
+    /// step that would do it fails before its record (finding 39).
     fn install(&mut self, snapshot: referee::Snapshot) -> Result<()> {
         self.names.clear();
         self.fresh_names.clear();
+        let mut objects = BTreeSet::new();
         for (id, file) in snapshot.files {
+            if !objects.insert(file.object) {
+                return Err(Error::Format);
+            }
             let history = snapshot.names.get(&id).ok_or(Error::Format)?;
             let path = history
                 .versions
@@ -1997,13 +2003,7 @@ impl Volume {
             let mut draft = Draft::new(&h.writer, &h.tree, t);
             draft.saved = Saved::OrphanDropped;
             draft
-        } else if calls.is_empty() {
-            Draft::new(&h.writer, &h.tree, t)
-        } else {
-            let mut bytes = t.bytes[&h.object].to_vec();
-            for call in &calls {
-                call.apply(&mut bytes)?;
-            }
+        } else if let Some(bytes) = changed_bytes(&t.bytes[&h.object], &calls)? {
             let mut index = 0_u64;
             let mut next_id = || {
                 index += 1;
@@ -2026,6 +2026,8 @@ impl Volume {
             t.lines.insert(h.object, Arc::new(lines));
             t.bytes.insert(h.object, Arc::new(bytes));
             self.build_save(&h.tree, t, &h.writer, "Direct", seq, Some(handle))?
+        } else {
+            Draft::new(&h.writer, &h.tree, t)
         };
         draft.closes = Some(handle);
         Ok(draft)
@@ -2178,6 +2180,16 @@ impl Volume {
         self.repo.checkout_tree(tree, &dir)?;
         Ok(())
     }
+}
+
+/// The bytes `calls` leave on `saved`, or none if they leave it as it was: a save
+/// that changes nothing commits nothing (finding 36; the owner, 2026-11-07, "1. A").
+fn changed_bytes(saved: &[u8], calls: &[Call]) -> Result<Option<Vec<u8>>> {
+    let mut bytes = saved.to_vec();
+    for call in calls {
+        call.apply(&mut bytes)?;
+    }
+    Ok((bytes != saved).then_some(bytes))
 }
 
 // The exclusive actor lock is held first; no other writer can own these.

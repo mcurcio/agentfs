@@ -3,7 +3,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
 use std::os::unix::fs::FileExt;
 
-use agentfs_core::tree_actor::{Error, Saved, Volume};
+use agentfs_core::tree_actor::{Error, Saved, Took, Volume};
 use agentfs_core::tree_git::TreeGit;
 
 fn repo(root: &std::path::Path) -> TreeGit {
@@ -1156,6 +1156,76 @@ fn compact_worker() {
     std::io::stdout().flush().unwrap();
     fill_journal(&mut v, "big");
     unreachable!("the failpoint kills this process");
+}
+
+/// Finding 36 (the owner, 2026-11-07, "1. A"): a save that leaves the bytes as they
+/// were commits nothing and queues nothing, in main and in a sandbox, whichever
+/// calls made it. The close still ends the open, so a sync waiting on it goes, and a
+/// crash with such an open replays to the same result.
+#[test]
+fn a_save_that_changes_no_byte_commits_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = tmp.path().join("state");
+    let mut v = Volume::open(&state).unwrap();
+    let fork = v.fork().unwrap();
+    let h = v.write_open("main", "a", "w", true).unwrap();
+    v.write(h, 0, b"same\n", false).unwrap();
+    v.close(h).unwrap();
+    while v.progress().unwrap() {}
+    assert_eq!(v.read(&fork, "a").unwrap(), b"same\n");
+    let before = (v.head("main").unwrap(), v.head(&fork).unwrap());
+    let queues = || {
+        let out = git(&state, &["for-each-ref", "refs/queue/"]);
+        assert!(out.status.success());
+        String::from_utf8(out.stdout).unwrap()
+    };
+    assert_eq!(queues(), "");
+    for tree in ["main", fork.as_str()] {
+        let h = v.write_open(tree, "a", "w", false).unwrap();
+        v.truncate(h, 0).unwrap();
+        v.write(h, 0, b"same\n", false).unwrap();
+        assert_eq!(v.close(h).unwrap(), Saved::Unchanged, "{tree}: a rewrite");
+        assert!(matches!(v.read_open(h), Err(Error::NotFound)), "{tree}");
+        let h = v.write_open(tree, "a", "w", false).unwrap();
+        v.write(h, 0, b"sa", false).unwrap();
+        assert_eq!(v.close(h).unwrap(), Saved::Unchanged, "{tree}: an offset");
+        let h = v.write_open(tree, "a", "w", false).unwrap();
+        v.write(h, 0, b"", true).unwrap();
+        assert_eq!(v.close(h).unwrap(), Saved::Unchanged, "{tree}: an append");
+    }
+    assert_eq!(
+        before,
+        (v.head("main").unwrap(), v.head(&fork).unwrap()),
+        "no commit"
+    );
+    assert_eq!(queues(), "", "no queue entry");
+
+    // The close ends the open: the sync that waits for it goes.
+    let held = v.write_open(&fork, "a", "w", false).unwrap();
+    v.write(held, 0, b"same\n", false).unwrap();
+    let h = v.write_open("main", "a", "w", false).unwrap();
+    v.write(h, 0, b"more\n", true).unwrap();
+    v.close(h).unwrap();
+    assert_eq!(v.take_next(&fork).unwrap(), Took::Waiting);
+    assert_eq!(v.close(held).unwrap(), Saved::Unchanged);
+    assert_eq!(v.take_next(&fork).unwrap(), Took::Taken);
+    assert_eq!(v.read(&fork, "a").unwrap(), b"same\nmore\n");
+
+    // A crash with such an open: the journal replays it to the same result, once.
+    let at = (v.head("main").unwrap(), v.head(&fork).unwrap());
+    let open = v.write_open(&fork, "a", "w", false).unwrap();
+    v.truncate(open, 0).unwrap();
+    v.write(open, 0, b"same\nmore\n", false).unwrap();
+    drop(v);
+    let v = Volume::open(&state).unwrap();
+    assert_eq!(at, (v.head("main").unwrap(), v.head(&fork).unwrap()));
+    assert_eq!(opens_saved(&state, open), 0);
+    assert_eq!(queues(), "");
+    assert!(matches!(v.read_open(open), Err(Error::NotFound)));
+    drop(v);
+    let v = Volume::open(&state).unwrap();
+    assert_eq!(at, (v.head("main").unwrap(), v.head(&fork).unwrap()));
+    assert_eq!(v.read(&fork, "a").unwrap(), b"same\nmore\n");
 }
 
 #[cfg(feature = "failpoints")]

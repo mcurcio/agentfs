@@ -15,8 +15,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// The `PATH` git is looked up in and runs with.
-pub const GIT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+pub use agentfs_align::GIT_PATH;
 
 static CHILDREN: AtomicU64 = AtomicU64::new(0);
 

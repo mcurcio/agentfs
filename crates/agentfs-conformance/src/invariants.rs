@@ -437,10 +437,49 @@ impl Invariants {
         Ok(c)
     }
 
+    /// Tree `t`'s object behind each file identity, from its table in git. A
+    /// commit's own numbers are those of the tree that wrote it: a fast-forward
+    /// leaves a sandbox on main's commit, its objects still its own.
+    fn object_table(&self, t: TreeId) -> Result<BTreeMap<u64, u64>, String> {
+        let tree = self.refname(t)?;
+        let tree = tree.strip_prefix("refs/heads/").unwrap_or(&tree);
+        let oid = self.git.run(&[
+            "for-each-ref",
+            "--format=%(objectname)",
+            &format!("refs/agentfs/objects/{tree}"),
+        ])?;
+        if oid.trim().is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        let blob = self.git.run(&["cat-file", "blob", oid.trim()])?;
+        let table: Value = serde_json::from_str(&blob).map_err(|e| e.to_string())?;
+        table["files"]
+            .as_object()
+            .ok_or("the object table is not a map")?
+            .iter()
+            .map(|(id, object)| {
+                Ok((
+                    id.parse().map_err(|_| "bad file identity")?,
+                    object.as_u64().ok_or("bad object")?,
+                ))
+            })
+            .collect()
+    }
+
     /// The oracle takes tree `t` from git: only a take changes a tree by rules
     /// this oracle does not know.
     fn reload(&mut self, t: TreeId) -> Result<(), String> {
         let head = self.head(t)?;
+        let table = self.object_table(t)?;
+        let mut held = BTreeSet::new();
+        for map in head.maps.values() {
+            let real = table.get(&map.identity).copied().unwrap_or(map.object);
+            if !held.insert(real) {
+                return Err(format!(
+                    "one_object_one_file: {t:?}'s object {real} holds two files"
+                ));
+            }
+        }
         let mut objects: BTreeMap<u64, u64> = BTreeMap::new();
         let tree = self.trees.entry(t).or_default();
         for (own, real) in &tree.bound {
@@ -448,14 +487,15 @@ impl Invariants {
         }
         tree.names.clear();
         for map in head.maps.values() {
-            let own = *objects.entry(map.object).or_insert_with(|| {
+            let real = table.get(&map.identity).copied().unwrap_or(map.object);
+            let own = *objects.entry(real).or_insert_with(|| {
                 self.next_object += 1;
                 self.next_object
             });
             tree.names.insert(map.path.clone(), own);
             tree.bytes
                 .insert(own, head.files.get(&map.path).cloned().unwrap_or_default());
-            tree.bound.insert(own, map.object);
+            tree.bound.insert(own, real);
         }
         Ok(())
     }
@@ -463,9 +503,11 @@ impl Invariants {
     /// Bind a file this oracle just made to its real object number.
     fn bind(&mut self, t: TreeId, path: &str, own: u64) -> Result<(), String> {
         let head = self.head(t)?;
+        let table = self.object_table(t)?;
         let tree = self.trees.entry(t).or_default();
         if let Some(map) = head.maps.values().find(|m| m.path == path) {
-            tree.bound.insert(own, map.object);
+            let real = table.get(&map.identity).copied().unwrap_or(map.object);
+            tree.bound.insert(own, real);
         }
         Ok(())
     }

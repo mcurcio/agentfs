@@ -813,6 +813,8 @@ pub struct World {
     trace_mute: bool,
     /// What tells this world's trace file from another's (a seed).
     trace_label: Option<String>,
+    /// Main's head at the last recorded call.
+    trace_main: String,
 }
 
 /// The trailer naming the open a save came from (git-model.md §3).
@@ -896,6 +898,7 @@ impl World {
             trace: std::env::var_os(TRACE_DIR).map(|_| Vec::new()),
             trace_mute: false,
             trace_label: None,
+            trace_main: String::new(),
         };
         let files = PATHS
             .iter()
@@ -1698,33 +1701,15 @@ impl World {
     }
 
     /// Rule 10's alignment: git's histogram diff of the old lines' bytes
-    /// against the new (as text, whatever bytes they hold), as (old start, old count,
-    /// new start, new count) per changed region, 0-based.
-    fn hunks(&self, old: &[String], new: &[String]) -> Vec<(usize, usize, usize, usize)> {
-        let blob = |v: &[String]| {
-            let text: String = v.concat();
-            git_in(&self.repo, &["hash-object", "-w", "--stdin"], &text)
-        };
-        let (a, b) = (blob(old), blob(new));
-        if a == b {
-            return Vec::new();
-        }
-        git(
-            &self.repo,
-            &[
-                "diff",
-                "--no-color",
-                "--no-ext-diff",
-                "--histogram",
-                "--text",
-                "-U0",
-                &a,
-                &b,
-            ],
-        )
-        .lines()
-        .filter_map(parse_hunk)
-        .collect()
+    /// against the new (as text, whatever bytes they hold), through the call the
+    /// library shares (finding 41), as (old start, old count, new start, new count)
+    /// per changed region, 0-based.
+    fn hunks(old: &[String], new: &[String]) -> Vec<(usize, usize, usize, usize)> {
+        agentfs_align::histogram(old.concat().as_bytes(), new.concat().as_bytes())
+            .expect("the alignment's diff runs")
+            .into_iter()
+            .map(|h| (h.old_start, h.old_count, h.new_start, h.new_count))
+            .collect()
     }
 
     /// [`MergeRule::GitMergeBase`]: git's own three-way merge of `up` into
@@ -2249,31 +2234,27 @@ impl World {
     }
 
     /// Rules 8 and 10: an open's byte calls on `cur` (the head at close),
-    /// line identities derived from the bytes. An `O_APPEND` write is exact:
-    /// the kernel, and so the save, knows its bytes go after the end. If the
-    /// file then ends in a partial last line (no final newline), the
+    /// line identities derived from the bytes. An open of appends only is
+    /// exact: the kernel, and so the save, knows its bytes go after the end.
+    /// If the file then ends in a partial last line (no final newline), the
     /// appended bytes up to and including their first newline finish that
     /// line: a new version of it, written over it, not a new line ("foo"
     /// and an append of "bar" is one line, "foobar"). Every further line the
-    /// append wrote is a new line after the file's last. Every other call
-    /// changes the bytes (`image`), which the save aligns with the lines
-    /// once ([`World::align`]), before the next append and at close. So a
+    /// append wrote is a new line after the file's last. An open with any
+    /// other call is a rewrite whichever call wrote the bytes (finding 37;
+    /// the owner, 2026-11-07, "2. B"): the bytes all its calls leave are
+    /// aligned with the lines once, at close ([`World::align`]). So a
     /// program's insert, delete or move comes out as the alignment reads
     /// its bytes, and a move as a delete plus an insert.
     fn replay(&self, cur: &Content, calls: &[Write]) -> Vec<Replayed> {
         let mut seq: Vec<Replayed> = cur.lines.iter().cloned().map(Replayed::Kept).collect();
-        let mut image = cur.bytes().into_bytes();
-        let mut dirty = false;
+        if !calls.iter().all(|c| matches!(c, Write::Append(_))) {
+            return self.align(seq, &Write::apply_all(&cur.bytes(), calls));
+        }
         for call in calls {
             let Write::Append(x) = call else {
-                call.apply(&mut image);
-                dirty = true;
-                continue;
+                unreachable!("every call is an append here")
             };
-            if dirty {
-                seq = self.align(seq, &String::from_utf8(image.clone()).expect("ASCII"));
-                dirty = false;
-            }
             let mut rest = x.as_str();
             if let Some(k) = seq.iter().rposition(Replayed::live)
                 && !seq[k].text().ends_with('\n')
@@ -2291,10 +2272,6 @@ impl World {
                     state: State::Live(l),
                 });
             }
-            image.extend(x.bytes());
-        }
-        if dirty {
-            seq = self.align(seq, &String::from_utf8(image).expect("ASCII"));
         }
         seq
     }
@@ -2314,7 +2291,7 @@ impl World {
         let old: Vec<String> = lives.iter().map(|k| seq[*k].text()).collect();
         let mut instead: Vec<Vec<Replayed>> = lives.iter().map(|k| vec![seq[*k].clone()]).collect();
         let mut before: Vec<Vec<Replayed>> = vec![Vec::new(); old.len() + 1];
-        for (os, on, ns, nn) in self.hunks(&old, &texts) {
+        for (os, on, ns, nn) in Self::hunks(&old, &texts) {
             // git may put lines whose bytes did not change at either end of
             // a region (among repeated lines): they keep their versions.
             let same = |i: usize, j: usize| old[i] == texts[j];
@@ -3517,25 +3494,13 @@ impl World {
     /// parent's commits fork `t` (at `ours`) lacks are `whole`'s first
     /// parents back to the first the fork has, each one change as the
     /// parent took it (a save, a transaction's commit, a landing). It delivers them
-    /// in order up to, not including, the first whose delivery would
-    /// overwrite a file open for writing in `t` (the sync's own write, so
-    /// a commit that leaves the fork's file as it is touches nothing), and
-    /// holds back that one and every later one, the decisions they carry
-    /// included, until those files close.
+    /// in order up to, not including, the first that changes the line map of
+    /// a file open for writing in `t`, even where the fork's file would
+    /// read the same because it keeps its own undecided line there (finding
+    /// 38; the owner, 2026-11-07, "3. B"), and holds back that one and every
+    /// later one, the decisions they carry included, until those files close.
     fn prefix(&self, t: Tree, ours: &str, whole: &str) -> Prefix {
         let open = self.write_open(t);
-        let tree = self.sync_tree(ours, whole);
-        let writes = |tr: &Option<String>| -> BTreeSet<String> {
-            tr.as_ref()
-                .map(|tr| self.changed(ours, tr))
-                .unwrap_or_default()
-        };
-        if writes(&tree).is_disjoint(&open) {
-            return Prefix {
-                deliver: Some((whole.to_string(), tree)),
-                until: None,
-            };
-        }
         let mut chain = Vec::new();
         let mut c = whole.to_string();
         while !self.is_ancestor(&c, ours) {
@@ -3543,11 +3508,22 @@ impl World {
             c = self.first_parent(&c);
         }
         chain.reverse();
+        if open.is_empty() || chain.is_empty() {
+            return Prefix {
+                deliver: Some((whole.to_string(), self.sync_tree(ours, whole))),
+                until: None,
+            };
+        }
         let mut deliver = None;
         let mut before = BTreeSet::new();
         for c in &chain {
             let tree = self.sync_tree(ours, c);
-            let now = writes(&tree);
+            let mut now: BTreeSet<String> = tree
+                .as_ref()
+                .map(|tr| self.changed(ours, tr))
+                .unwrap_or_default();
+            now.extend(self.new_lines_of(ours, c));
+            now.extend(before.iter().cloned());
             if !now.is_disjoint(&open) {
                 // It waits until no file this commit adds to the sync's
                 // write is open (its own change's files, as for a landing).
@@ -3559,7 +3535,26 @@ impl World {
             deliver = Some((c.clone(), tree));
             before = now;
         }
-        unreachable!("the whole sync overwrites an open file, so one of its commits does")
+        Prefix {
+            deliver,
+            until: None,
+        }
+    }
+
+    /// The files in which the parent's commit `c` wrote a line version the
+    /// fork at `ours` has never had, so its line map changes at this sync
+    /// even if the fork's file goes on reading the same (finding 38).
+    fn new_lines_of(&self, ours: &str, c: &str) -> BTreeSet<String> {
+        let before = self.first_parent(c);
+        self.changed(&before, c)
+            .into_iter()
+            .filter(|p| {
+                let (was, now) = (self.file(&before, p), self.file(c, p));
+                now.lines.iter().any(|l| {
+                    !was.holds(&l.id) && !self.is_ancestor(&self.origin_of(c, p, &l.id), ours)
+                })
+            })
+            .collect()
     }
 
     /// The tree a sync of the parent's `up` into fork `x` (at `ours`)
@@ -3690,16 +3685,29 @@ impl World {
         }
         let shown = self.holds.is_empty().then(|| self.shown());
         // A fork, and a sandbox's queue step, read main's head as it is in the
-        // model: without the landing main holds. A real landing happens at its
-        // take, so in the trace that take comes after them.
-        let reads_main = matches!(
-            call,
-            RecordedCall::Fork { .. }
-                | RecordedCall::Take {
-                    tree: TreeId::Fork(_),
-                    ..
-                }
-        );
+        // model: without the landing main holds. A call that commits on main goes
+        // before that landing in the model's history. A real landing happens at its
+        // take, so in the trace that take comes after them all. A crash ends the take
+        // instead: its saves leave the take where it is, undone (`undone_takes`).
+        let main_moved = std::mem::replace(&mut self.trace_main, self.main_head.clone())
+            != self.main_head
+            && !matches!(
+                call,
+                RecordedCall::Crash
+                    | RecordedCall::Take {
+                        tree: TreeId::Main,
+                        ..
+                    }
+            );
+        let reads_main = main_moved
+            || matches!(
+                call,
+                RecordedCall::Fork { .. }
+                    | RecordedCall::Take {
+                        tree: TreeId::Fork(_),
+                        ..
+                    }
+            );
         let Some(trace) = &mut self.trace else {
             return;
         };
@@ -3952,23 +3960,6 @@ fn hide_after_own_unfinished(c: &mut Content, own: &BTreeSet<String>) {
             .into_iter()
             .filter(|l| !l.live() || own.contains(&l.line)),
     );
-}
-
-/// One `@@ -a,b +c,d @@` header of a `-U0` diff as 0-based (old start, old
-/// count, new start, new count); a count of 0 starts after the line named.
-fn parse_hunk(line: &str) -> Option<(usize, usize, usize, usize)> {
-    let h = line.strip_prefix("@@ -")?;
-    let (old, rest) = h.split_once(" +")?;
-    let new = rest.split_once(" @@")?.0;
-    let range = |r: &str| -> Option<(usize, usize)> {
-        let (s, n) = match r.split_once(',') {
-            Some((s, n)) => (s.parse::<usize>().ok()?, n.parse::<usize>().ok()?),
-            None => (r.parse::<usize>().ok()?, 1),
-        };
-        Some((if n == 0 { s } else { s - 1 }, n))
-    };
-    let ((os, on), (ns, nn)) = (range(old)?, range(new)?);
-    Some((os, on, ns, nn))
 }
 
 /// The commit that wrote version `id`, reached from commit `at`, which

@@ -1495,6 +1495,76 @@ fn finding_35_a_sync_hides_a_line_the_sandbox_already_held() {
     );
 }
 
+/// Coherence finding 43 (seed 191 of 1 to 500 of `full_lineage`, `adjacent_lines` and
+/// `commit_dates_decide_nothing`): R10.9 hides lines the sandbox itself deleted in a
+/// save that lost. The rule's words cover it, the model and the library both do it, and
+/// the parent's lines arrive with the decision; but `syncs_deliver` excuses only a line
+/// the sandbox never held. Changing that check is the owner's call (VERIFYING.md).
+#[test]
+#[ignore = "coherence finding 43: R10.9's excuse does not cover a line the sandbox deleted in a save that lost"]
+fn finding_43_a_sync_hides_a_line_the_sandbox_deleted_in_a_lost_save() {
+    let mut w = world();
+    let f = w.create_fork(Tree::Main);
+    let s = Client::Fork(f);
+    calls(
+        &mut w,
+        &m1(),
+        "c",
+        &[
+            Write::Truncate(0),
+            Write::Pwrite {
+                offset: 0,
+                bytes: "1\n2\n3\n4\n5\n6\n".into(),
+            },
+        ],
+    );
+    next(&mut w, Tree::Fork(f));
+    calls(
+        &mut w,
+        &m1(),
+        "c",
+        &[Write::Pwrite {
+            offset: 0,
+            bytes: "M".into(),
+        }],
+    );
+    // The sandbox edits line 1, which collides, and deletes lines 5 and 6.
+    calls(
+        &mut w,
+        &s,
+        "c",
+        &[
+            Write::Truncate(8),
+            Write::Pwrite {
+                offset: 0,
+                bytes: "S".into(),
+            },
+        ],
+    );
+    next(&mut w, Tree::Main);
+    assert!(!w.collisions.is_empty(), "that save lost");
+    // Before that decision reaches it, its next save leaves line 4 unfinished.
+    calls(
+        &mut w,
+        &s,
+        "c",
+        &[
+            Write::Truncate(6),
+            Write::Pwrite {
+                offset: 6,
+                bytes: "yy".into(),
+            },
+        ],
+    );
+    next(&mut w, Tree::Fork(f));
+    // Undecided: its unfinished line alone, the parent's lines 5 and 6 hidden (R10.9).
+    assert_eq!(bytes(&w, Tree::Fork(f), "c"), "M\n2\n3\nyy");
+    drain(&mut w);
+    // Decided: that save lost to the line the parent keeps after it (R10.8).
+    assert_eq!(bytes(&w, Tree::Main, "c"), "M\n2\n3\n4\n5\n6\n");
+    assert_eq!(bytes(&w, Tree::Fork(f), "c"), "M\n2\n3\n4\n5\n6\n");
+}
+
 /// Coherence finding 30: a transaction's line after its sandbox's own
 /// unfinished last line. R10.4 is about a parent and a sandbox; no rule says
 /// what happens inside one tree.

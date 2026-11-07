@@ -4,7 +4,12 @@
 set -euo pipefail
 probe=$(mktemp -d)
 trap 'rm -rf "$probe"' EXIT
+# Which release answers matters: line identity depends on it (MODEL.md, finding 42).
+# The model and the library both look it up in agentfs_align::GIT_PATH.
 git --version
+for git in $(PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin type -ap git); do
+    echo "$git: $("$git" --version)"
+done
 repo=$probe/repo.git
 git init --bare "$repo"
 export GIT_DIR=$repo GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1

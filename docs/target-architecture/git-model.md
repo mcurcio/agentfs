@@ -277,8 +277,12 @@ newline (a partial last line). Line identity is derived from the bytes at close 
 | The open's calls | The save |
 |---|---|
 | appends only (`O_APPEND`) | the bytes go after the file's last byte as `h` has it (the kernel seeks to the end and writes in one step), so each line they start is a new line after the file's last line and writes over none: two programs appending to one file at once both keep their lines, in close order (`r8_concurrent_appends_never_overwrite_each_other`). If `h` ends in a partial last line, the appended bytes up to and including their first newline finish that line: a new version of it, written over it, not a new line ("foo" and an append of "bar" is one line, "foobar"; `r8_an_append_onto_a_partial_last_line_finishes_it`). So two trees appending to a file with no final newline both write over its last line and collide, the parent winning (`r8_concurrent_appends_onto_a_partial_last_line_collide`). No alignment |
-| a truncate to 0 (or `O_TRUNC`), then writes | a rewrite: `h`'s lines aligned with the new bytes (§7). A program that read before a sync and rewrites the file really puts the old content back, recorded as its write over the synced line: it replaces that line upstream with no collision, and history keeps the overwritten version (`r8_a_stale_rewrite_*`). An `O_TRUNC` open that writes nothing saves an empty file (`r8_truncates_holes_and_an_empty_o_trunc`) |
-| writes at offsets, `ftruncate` | the bytes they leave (a gap past the end reads as NUL bytes, as a hole does), aligned with `h`'s lines once (§7); every line the bytes left unchanged keeps what `h` holds, a synced line or another writer's line included (`r8_an_offset_write_elsewhere_keeps_the_synced_line`). A line written in two calls is one version, and of two overlapping writes the later bytes count (`r8_split_and_overlapping_writes_make_one_version`). Two offset writes to one line end with the last close's, as two Linux writers at one offset end with the last write's |
+| a truncate to 0 (or `O_TRUNC`), then writes, by any call (R8.3; the owner, 2026-11-07, "1. A 2. B 3. B", finding 37) | a rewrite: `h`'s lines aligned with the new bytes (§7). A program that read before a sync and rewrites the file really puts the old content back, recorded as its write over the synced line: it replaces that line upstream with no collision, and history keeps the overwritten version (`r8_a_stale_rewrite_*`). An `O_TRUNC` open that writes nothing saves an empty file (`r8_truncates_holes_and_an_empty_o_trunc`) |
+| writes at offsets, `ftruncate`, with or without appends in the same open (R8.3) | the bytes they leave (a gap past the end reads as NUL bytes, as a hole does), aligned with `h`'s lines once (§7); every line the bytes left unchanged keeps what `h` holds, a synced line or another writer's line included (`r8_an_offset_write_elsewhere_keeps_the_synced_line`). A line written in two calls is one version, and of two overlapping writes the later bytes count (`r8_split_and_overlapping_writes_make_one_version`). Two offset writes to one line end with the last close's, as two Linux writers at one offset end with the last write's |
+
+A save whose calls leave the bytes as they were commits nothing and makes no queue entry (R8.2; the owner, 2026-11-07,
+finding 36). Its close still ends the open, and the journal replays it to the same result. Cost: the history does not show that the
+program saved.
 
 The model checks this against an independent byte oracle: the random runs keep their own byte array per tree and
 file and each open's calls, updated by the same calls by their own code, and every close must save exactly those
@@ -340,7 +344,7 @@ than across keys (as Kafka orders a partition).
 | Rule | What it says |
 |---|---|
 | P1 (a choice). An entry waits only for its own files and for earlier waiting entries it shares a file or a source with | a landing goes ahead of an earlier entry still waiting unless they touch a common file or come from the same child fork; one fork's entries keep their order, so a save that builds on an earlier one never reaches the parent first |
-| P2, the prefix sync (owner, 2026-11-04: "agreed — that sounds like the rule we had discussed. Every commit can be landed independently (according to the rules of the commit vs transaction, etc)") | a sync delivers the parent's commits in order, up to the first that touches a file the sandbox has open for writing, and holds that one and every later one back until the file closes; each commit is one change by its unit (a save, a transaction's commit whole, a landing as the parent took it) |
+| P2, the prefix sync (owner, 2026-11-04: "agreed — that sounds like the rule we had discussed. Every commit can be landed independently (according to the rules of the commit vs transaction, etc)") | a sync delivers the parent's commits in order, up to the first that touches a file the sandbox has open for writing, and holds that one and every later one back until the file closes. Any change to the file's line map touches it, even where its bytes would read the same (R9.3; the owner, 2026-11-07, finding 38); each commit is one change by its unit (a save, a transaction's commit whole, a landing as the parent took it) |
 | No P3 (owner, 2026-11-04: "it seems low risk for them to be indefinitely delayed while an application is keeping the fs busy with real work. In the worst case, the landing never occurs in a child fork, and the parent is left to resolve the commits") | no program's write-open, `unlink` or `rename(2)` ever waits on a waiting take; only on a take that is writing its held files |
 
 Unchanged: each change lands whole or loses whole; a take locks all its files at once.
@@ -519,6 +523,11 @@ the kept identity, so an old writer could overwrite an editor's new save.)
 | `rename(n, a)`, both in the parent | n's identity takes a; a's ends (a deleted version naming n) | a's object is named by no path; n's object is at a |
 | `rename(n, a)`, n new since its create, never renamed (the atomic save; finding 21) | a's identity **stays**: a rewrite with n's bytes, merged per line | as the row above: a's old object is named by no path; n's object is at a |
 | a write-open's `RELEASE` | the save goes to the identity at its object's path then | an object no path names saves nothing |
+
+An atomic save that loses leaves two files, each on its own object: the replaced file keeps the new object it took, and the new
+file comes back on an object numbered by the event that ended it (`finding_39_a_losing_atomic_save_keeps_two_files_apart`). So does
+a file whose unlink or rename-over lost: its old object stays orphaned (R11.3). The history and each tree's commit never held any of
+this; object numbers are the tree's own (§3).
 
 So an editor's atomic save and a long-lived writer of the old file never meet in one tree: the writer's later
 calls reach the old object, and its close saves nothing, as on Linux, where those bytes reach no path. Across trees
@@ -814,7 +823,7 @@ policy of this revision included. Every check runs after every step, in every sc
 | Trees converge when writes stop | `check_converged` | `convergence_when_writes_stop` |
 | No clock decides anything | fingerprint compare | `r2_no_clock_commit_dates_decide_nothing`, `random_interleavings_commit_dates_decide_nothing` |
 
-Ignored (open findings): `finding_1_git_merge_base_on_crossing_merges`, `random_interleavings_git_merge_base`,
+Ignored (open findings): `finding_43_a_sync_hides_a_line_the_sandbox_deleted_in_a_lost_save`, `finding_1_git_merge_base_on_crossing_merges`, `random_interleavings_git_merge_base`,
 `finding_6_git_hunks_on_neighbouring_lines`. Finding 3's tests went with the per-file setting (rule 3e).
 The model checks §3's journal and §12's recovery only as rule 12 models them: a death of every agentfs process,
 in which every journaled call and the object table survive (`crash_checked`, the r12 scenarios). It has no actor,
@@ -928,7 +937,9 @@ filesystem-boundary checks below. The full exit criteria are not yet met. Scope:
 Out of scope: nested forks, transactions, Rules and view profiles, replication,
 CSI, several view hosts, upgrades. **Exit:** every pass-or-fail row passes on CI's Linux runners (FUSE runs only
 there, AGENTS.md); any failure is a finding to resolve in the implementation or the model before phase 1 is validated; the
-measurements set the first budgets (no number here is a budget yet).
+measurements set the first budgets (no number here is a budget yet). The replay's alignment and the library's are one call
+(`agentfs_align`), so they run one release of `git`: 2.56.0 on CI, printed by `ci/check-tree-git.sh`, and Debian trixie's 2.47.3 in the
+image. The releases align some repeated lines differently (MODEL.md, finding 42).
 
 ## New terms
 
@@ -972,7 +983,8 @@ Open on 2026-11-05. Each names its context; none blocks phase 1 unless noted:
   closes a file with a deferred call, reopens it and reads the old bytes.
 - **Sandbox and parent.** The model's `OrphanDropped` stretches R11.3 for a file created in a transaction that lost.
   Answered 2026-11-06: findings 31 (R10.3), 32 (R10.8), 33 (R10.9) and 35 (R10.6 covers a line the sandbox already held).
-  Open from the replay, 2026-11-06: MODEL.md findings 36 to 41.
+  Answered 2026-11-07, "1. A 2. B 3. B": findings 36 (R8.2), 37 (R8.3), 38 (R9.3). Findings 39, 40 and 41 are closed without a rule.
+  Open from that work: MODEL.md findings 42 (line identity depends on the `git` release) and 43 (R10.9's check).
 - **History.** R5.1's "which remote?": the commit's trailers name the tree, the loser and the versions, no remote.
 
 *History: 2026-11-03, from the model at 509a0ab; revised after review (save ordering, trees, recovery, grafts, slots); 2026-11-03, the owner's answers on losers and saves; review: Replication pushes losers, questions 2 and 3; 2026-11-03, the owner's answers on saves and locks; review: appends at close, main's clients' death, transactions with open files, the lock over path calls, the program-level hang; 2026-11-03, after the owner's "Go": close-to-open accepted, line identity, deletes and renames (§7); review: no POSIX call names a line, so a save aligns its bytes once (§6, §7), the atomic-save idiom, untracked files (§3), R9/R13/A8 put to the owner (§16), §17 cut; 2026-11-03, the owner's answer to question 3: a save or transaction lands whole or loses whole, only winning saves are squashed (§7, §9, §11, §15); 2026-11-04, answering the pull-request review: the journal (§3), progress (§6), objects (§7), why a custom protocol (§14), the phase 1 validation plan (§18), proof claims narrowed to the modelled executions; 2026-11-04, byte calls modelled (§6, §7), the notes ref built (§4, §8), Replication due on every move of main (§4); 2026-11-04, the adversarial review at `ee29551`: finding 24 (P3

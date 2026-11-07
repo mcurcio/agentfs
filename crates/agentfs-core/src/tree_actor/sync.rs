@@ -108,8 +108,13 @@ pub(super) fn sync(
                 object: f.object,
                 lines: tree_reconcile::sync(&p.lines, &f.lines, undecided_lines)?,
             },
+            // A file this tree ended by an unlink or a rename-over that lost comes
+            // back as a new object, numbered by the event that ended it, which
+            // numbers nothing else. Its old object stays with whoever holds it: an
+            // old writer reaches no file (R11.3), and after an atomic save that
+            // object is now the replaced file's (finding 39).
             (Some(p), None) => File {
-                object: p.object,
+                object: fork.names.get(&id).map_or(p.object, |ended| ended.head),
                 lines: tree_reconcile::sync(&p.lines, &LineMap::default(), undecided_lines)?,
             },
             (None, Some(f)) => File {

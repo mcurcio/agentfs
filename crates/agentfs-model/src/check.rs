@@ -1455,13 +1455,15 @@ pub fn save_aligned(base: &Content, now: &Content) -> Result<(), String> {
 /// output). The appends after the save's last other call wrote the file's
 /// tail at close: the save's bytes are the earlier calls' bytes `b0`
 /// (computed here from the parent's bytes) followed by the appended bytes.
-/// Every line starting in the appended bytes is a new line (its own
-/// identity, written over nothing) after every line of the parent, so it
-/// wrote over no line, another writer's append included. If `b0` ends in a
-/// partial line, the appended bytes finish it: that line's bytes start with
-/// `b0`'s partial line, and when the save made only appends it is the
-/// parent's last line, a new version written over the parent's, not a new
-/// line ("foo" and an append of "bar" is one line, "foobar").
+/// In a save of appends only, every line starting in the appended bytes is a
+/// new line (its own identity, written over nothing) after every line of the
+/// parent, so it wrote over no line, another writer's append included. If the
+/// parent ends in a partial line, the appended bytes finish it: that line's
+/// bytes start with the partial line, a new version written over the parent's
+/// last line, not a new line ("foo" and an append of "bar" is one line,
+/// "foobar"). A save with any other call is a rewrite, aligned as a whole
+/// (finding 37; the owner, 2026-11-07, "2. B"), so only its bytes are checked
+/// here.
 fn appends_exact(
     base: &Content,
     now: &Content,
@@ -1488,6 +1490,9 @@ fn appends_exact(
             "its bytes {:?} are not its earlier calls' {b0:?} and then its appends' {tail:?}",
             now.bytes()
         ));
+    }
+    if k != 0 {
+        return Ok(());
     }
     let mut offset = 0;
     for (i, l) in now.lines.iter().enumerate() {
@@ -1517,7 +1522,7 @@ fn appends_exact(
                 ));
             }
             let last = base.live().last();
-            if k == 0 && last.is_none_or(|p| p.line != l.line || l.over.as_ref() != Some(&p.id)) {
+            if last.is_none_or(|p| p.line != l.line || l.over.as_ref() != Some(&p.id)) {
                 return Err(format!(
                     "an append onto the partial last line {last:?} made {l:?}, not a version of it"
                 ));

@@ -1,19 +1,2 @@
 # Traces that fail for an open finding (MODEL.md), which replay requires to keep
 # failing: `<finding> <trace file>`. Take a line off when its finding closes.
-36 random_interleavings_phase1_scope.seed11.trace
-36 random_interleavings_phase1_scope.seed17.trace
-36 random_interleavings_phase1_scope.seed32.trace
-36 random_interleavings_rounds.seed12.trace
-36 random_interleavings_rounds.seed16.trace
-36 random_interleavings_rounds_phase1_scope.seed1.trace
-36 random_interleavings_rounds_phase1_scope.seed11.trace
-36 random_interleavings_rounds_phase1_scope.seed7.trace
-36,37 random_interleavings_rounds.seed4.trace
-37 random_interleavings_rounds_phase1_scope.seed15.trace
-38 random_interleavings_phase1_scope.seed10.trace
-38 random_interleavings_phase1_scope.seed7.trace
-39 random_interleavings_phase1_scope.seed21.trace
-39 random_interleavings_phase1_scope.seed34.trace
-40 random_interleavings_phase1_scope.seed50.trace
-# Fails on CI's git 2.56, not on 2.47.3: replay reports this line as stale there.
-41 random_interleavings_phase1_scope.seed58.trace

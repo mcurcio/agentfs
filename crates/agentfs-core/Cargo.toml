@@ -8,6 +8,7 @@ repository.workspace = true
 description = "Recording, journal and history engine for agentfs"
 
 [dependencies]
+agentfs-align = { version = "0.1.0", path = "../agentfs-align" }
 # known_hosts key blobs and hashed host names, and OpenSSH private key
 # headers (design §11.1).
 base64 = "0.23.1"

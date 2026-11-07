@@ -227,9 +227,11 @@ fn cited_rules_exist() {
 fn named_tests_exist() {
     let mut fns = Vec::new();
     // A rule about the filesystem boundary (R1.4) is shown by the library's
-    // tests: the model has no mappings.
+    // tests: the model has no mappings. One the replay found (R8.2) is shown by the
+    // replay's own tests, which hold the model and the library to one trace.
     let core_tests = repo_dir().join("crates/agentfs-core/tests");
-    for p in [crate_dir().join("tests"), core_tests]
+    let replay_tests = repo_dir().join("crates/agentfs-conformance/tests");
+    for p in [crate_dir().join("tests"), core_tests, replay_tests]
         .iter()
         .flat_map(|d| files(d))
     {

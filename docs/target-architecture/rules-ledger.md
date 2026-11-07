@@ -175,6 +175,19 @@ without seeing the other. MODEL.md's rules table holds the full wording; this pa
   `r8_a_stale_rewrite_overwrites_the_synced_line_and_history_keeps_it`
 - **R8.1** · approved · An append to a file with no final newline finishes its last line ("foo" plus "bar" is one
   line, "foobar"), a new version of that line, so two such appends collide. Owner, 2026-11-05 (in chat, round 2): approved. Tests: `r8_an_append_onto_a_partial_last_line_finishes_it`, `r8_concurrent_appends_onto_a_partial_last_line_collide`
+- **R8.2** · owner · A save that leaves the file's bytes as they were commits nothing and makes no queue entry. Owner,
+  2026-11-07, answering three questions at once: "1. A 2. B 3. B". This is his 1, option (a) of finding 36: the library
+  skips the commit, as the model does. Revisable: option (b) was to commit every save that made calls. Cost: the history
+  does not show that the program saved.
+  Tests: `finding_36_a_save_that_changes_nothing_commits_nothing`, `a_save_that_changes_no_byte_commits_nothing`
+- **R8.3** · owner · An open whose calls are not all appends is a rewrite, whichever call wrote the bytes: the bytes its
+  calls leave align with the file's lines once (R10), `O_TRUNC` then appends and an append mixed with offset writes
+  included. Only an open of appends alone adds new lines. Owner, 2026-11-07: "1. A 2. B 3. B". This is his 2, option (b)
+  of finding 37: the model changes, not the library. Revisable: option (a) was that trailing appends always make new
+  lines. Cost: after a truncate, a repeated line the program appended can be an old line in the diff's reading, so a
+  sandbox's edit of that line lands instead of colliding.
+  Tests: `finding_37_a_truncate_then_an_append_is_a_rewrite`, `finding_40_an_append_mixed_with_an_offset_write_is_a_rewrite`,
+  `finding_41_an_offset_write_then_an_append_is_one_alignment`
 
 ## 7. Locks and waiting
 
@@ -231,7 +244,11 @@ without seeing the other. MODEL.md's rules table holds the full wording; this pa
   Tests: `r9_cooperating_programs_never_deadlock`
 - **R9.3** · owner · A sync delivers the parent's commits in order up to the first one that touches a file open
   in the sandbox, and holds back that one and the rest until the file closes. Source: "agreed — that sounds like
-  the rule we had discussed" (2026-11-04). Tests: `r9_a_sync_delivers_up_to_the_first_change_to_an_open_file`
+  the rule we had discussed" (2026-11-04). What touches the file is any change to its line map, even where its bytes
+  would read the same because the sandbox keeps its own undecided line there. Owner, 2026-11-07: "1. A 2. B 3. B". This is
+  his 3, option (b) of finding 38: the model changes, not the library. Revisable: option (a) was to count only a change to
+  what the file shows. Cost: a sandbox holding a file open waits longer for later commits.
+  Tests: `r9_a_sync_delivers_up_to_the_first_change_to_an_open_file`, `finding_38_a_sync_past_an_open_file_waits_for_any_line_map_change`
 - **R9.4** · approved · A sync or landing waits for all its files at once, never holding one while it waits for
   another. Approved by the owner, 2026-11-05 (approval page); he asked whether a fast writer can starve a landing (open, with R9.8). 
 - **R9.5** · approved · A waiting entry waits only for its own files, and for earlier entries that share a file
@@ -296,9 +313,10 @@ without seeing the other. MODEL.md's rules table holds the full wording; this pa
   the files without the landing". Tests:
   `r11_two_renames_to_one_path_keep_the_sandboxs_name_until_decided`, `r11_a_chain_of_renames_to_one_path_keeps_every_previous_name`
 - **R11.2** · approved · An editor's atomic save (write a new file, rename it over the old one) is a rewrite of
-  the old file, so the file keeps its identity and merges per line. Approved by the owner, 2026-11-05 (approval page). Tests: `r11_an_atomic_save_keeps_the_files_identity_and_merges_per_line`
+  the old file, so the file keeps its identity and merges per line. Approved by the owner, 2026-11-05 (approval page). Tests: `r11_an_atomic_save_keeps_the_files_identity_and_merges_per_line`, `finding_39_a_losing_atomic_save_keeps_two_files_apart`
 - **R11.3** · approved · Writes through a handle whose file was unlinked or replaced reach no file, and raise an
-  `OrphanDropped` event. Owner, 2026-11-05 (in chat, round 2): approved. Tests: `r11_an_old_writer_after_an_atomic_save_saves_nothing`
+  `OrphanDropped` event. Owner, 2026-11-05 (in chat, round 2): approved. Tests: `r11_an_old_writer_after_an_atomic_save_saves_nothing`,
+  `an_old_writer_stays_orphaned_when_the_unlink_loses`, `an_old_writer_stays_orphaned_when_the_rename_over_loses`
 - **R11.4** · approved · A tracked file arriving at a path an untracked file holds wins the path; the untracked
   file stays hidden and shows again if the tracked one goes. Owner, 2026-11-05 (in chat, round 2): option 1, the tracked file shows.
 

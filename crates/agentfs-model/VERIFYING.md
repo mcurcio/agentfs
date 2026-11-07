@@ -341,10 +341,14 @@ What a replay decides, each reported rather than hidden:
 The in-scope traces at CI's seeds are 69 from scenarios and 94 from seeds (64 and 16 of the phase 1 generators, and 14 of
 the ordinary ones that happened to stay in scope). The rest are excluded by the reasons above, and the replay prints the
 count of each. The floors
-in `.github/workflows/phase-1.yml` are what passes: 69 and 78 on the library, with 16 seed traces listed as open
-findings, and 66 and 16 on mounts, where 81 in-scope traces are not mountable. Library and model replay every in-scope
-trace.
+in `.github/workflows/phase-1.yml` are what passes: 69 and 94 on the library, and 66 and 16 on mounts, where 81 in-scope traces are
+not mountable. Library and model replay every in-scope trace. `[phase1-seeds]` in a pushed commit message, or a manual run, replays
+the phase 1 generators at seeds 1 to 500 on the library, in four shards (`ci/replay-seeds.sh`): too slow for every push, and fast
+enough for a job.
 
-A mismatch is a finding (MODEL.md, findings 36 to 41), never a change to either side without a ledger rule. Its traces
+A mismatch is a finding (MODEL.md), never a change to either side without a ledger rule. Its traces
 go in `crates/agentfs-conformance/open-findings.txt` with its number and must keep failing, as an ignored test must, and
-its small reproduction is an ignored test in `crates/agentfs-conformance/tests/replay.rs`.
+its small reproduction is an ignored test in `crates/agentfs-conformance/tests/replay.rs`. That list is empty now.
+
+The model and the library share the alignment's call (`agentfs_align`): one environment and one program lookup, so a replay runs one
+release of `git` on both sides. Which release is printed by `ci/check-tree-git.sh`; identities depend on it (MODEL.md, finding 42).

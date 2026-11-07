@@ -12,6 +12,7 @@ page says *where*. Section references (§) are to design.md.
 | `agentfs-fuse` | library | The FUSE layer: a passthrough filesystem over the backing tree that calls the engine at every change boundary (§2.1, §3.1, §6) |
 | `agentfs` | binary | The `agentfs` command (§17.1): `init`, `mount`, `run`, `record`, `flush`, `push`, `status`, `probe`, `serve-history`, `restore`, `revert`, `patch`, `fork`; OpenTelemetry export |
 | `agentfs-csi` | library and binary | The CSI driver (§14.2): `agentfs-csi`, one per node beside csi-provisioner, which makes the node's worktrees and supervises `agentfs serve-history`, `agentfs mount` and the release scan's `agentfs flush` and `agentfs push` children |
+| `agentfs-align` | library | Git's histogram diff, called one way, for line identity (git-model §7). `agentfs-core` and `agentfs-model` both depend on it, so line identity does not depend on how `git` is called; one module, `lib.rs` |
 | `agentfs-conformance` | library and binary, tests only | The model's recorded calls against the real tree library and real mounts (git-model §18). Depends on `agentfs-core` and `agentfs-model`; nothing depends on it |
 
 The dependencies run one way: `agentfs-csi` → (`agentfs` as a child

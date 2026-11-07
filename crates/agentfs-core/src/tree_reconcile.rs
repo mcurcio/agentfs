@@ -6,11 +6,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
-use std::os::unix::fs::DirBuilderExt;
-use std::path::PathBuf;
-use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
 
+pub use agentfs_align::Hunk;
 use serde::{Deserialize, Serialize};
 
 /// An opaque, volume-unique line or version identifier.
@@ -29,15 +26,6 @@ pub struct Line {
 pub struct LineMap {
     pub lines: Vec<Line>,
     pub ancestors: BTreeMap<Id, Option<Id>>,
-}
-
-/// A changed region of the histogram diff, with zero-based ranges.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Hunk {
-    pub old_start: usize,
-    pub old_count: usize,
-    pub new_start: usize,
-    pub new_count: usize,
 }
 
 /// Failure to produce or interpret the histogram alignment.
@@ -267,101 +255,13 @@ impl LineMap {
     }
 }
 
-static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-struct TempDir(PathBuf);
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
-/// Git's text-mode histogram diff, including NUL-containing input.
+/// Git's text-mode histogram diff, through the one call the model shares.
 pub fn histogram(old: &[u8], new: &[u8]) -> Result<Vec<Hunk>, Error> {
-    if old == new {
-        return Ok(Vec::new());
-    }
-    let dir = loop {
-        let path = std::env::temp_dir().join(format!(
-            "agentfs-diff-{}-{}",
-            std::process::id(),
-            TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
-        ));
-        match std::fs::DirBuilder::new().mode(0o700).create(&path) {
-            Ok(()) => break TempDir(path),
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(e.into()),
-        }
-    };
-    let a = dir.0.join("old");
-    let b = dir.0.join("new");
-    std::fs::write(&a, old)?;
-    std::fs::write(&b, new)?;
-    // Neither the caller's directory nor its git configuration may reach the
-    // alignment: a directory inside a broken worktree stops `git diff`, and a
-    // diff setting would change which lines keep their identity.
-    let mut command = Command::new("git");
-    command
-        .env_clear()
-        .env("PATH", crate::git_cli::GIT_PATH)
-        .env("LC_ALL", "C")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .current_dir(&dir.0)
-        .args([
-            "diff",
-            "--no-index",
-            "--no-color",
-            "--no-ext-diff",
-            "--histogram",
-            "--text",
-            "--unified=0",
-            "--",
-        ])
-        .arg(a)
-        .arg(b)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let out = crate::git_cli::counted(&mut command)?.wait_with_output()?;
-    if !matches!(out.status.code(), Some(0 | 1)) {
-        return Err(Error::Git(
-            String::from_utf8_lossy(&out.stderr).into_owned(),
-        ));
-    }
-    let mut hunks = Vec::new();
-    for line in out.stdout.split(|b| *b == b'\n') {
-        if !line.starts_with(b"@@ -") {
-            continue;
-        }
-        let header = std::str::from_utf8(line).map_err(|_| Error::InvalidDiff)?;
-        let (old, rest) = header[4..].split_once(" +").ok_or(Error::InvalidDiff)?;
-        let new = rest.split_once(" @@").ok_or(Error::InvalidDiff)?.0;
-        let parse = |range: &str| -> Result<(usize, usize), Error> {
-            let (start, count) = range.split_once(',').unwrap_or((range, "1"));
-            let start: usize = start.parse().map_err(|_| Error::InvalidDiff)?;
-            let count: usize = count.parse().map_err(|_| Error::InvalidDiff)?;
-            Ok((
-                if count == 0 {
-                    start
-                } else {
-                    start.checked_sub(1).ok_or(Error::InvalidDiff)?
-                },
-                count,
-            ))
-        };
-        let (old_start, old_count) = parse(old)?;
-        let (new_start, new_count) = parse(new)?;
-        hunks.push(Hunk {
-            old_start,
-            old_count,
-            new_start,
-            new_count,
-        });
-    }
-    if hunks.is_empty() {
-        return Err(Error::InvalidDiff);
-    }
-    Ok(hunks)
+    agentfs_align::histogram_with(old, new, crate::git_cli::counted).map_err(|e| match e {
+        agentfs_align::Error::Io(e) => Error::Io(e),
+        agentfs_align::Error::Git(message) => Error::Git(message),
+        agentfs_align::Error::Invalid => Error::InvalidDiff,
+    })
 }
 
 /// The parent's decision for one incoming version. The caller supplies the
