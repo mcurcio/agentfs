@@ -12,7 +12,7 @@ A view is one client's filesystem: the mount point a program uses, served by a v
 
 **The owner's words this page serves** (system §0): R3 "a virtual filesystem overlay for each client (including
 main) that is backed by a _real_ filesystem source-of-truth"; R7 "Agentfs is the gatekeeper that exposes only what
-we want sandboxes to see"; R13 "a default usage … can operate per-file"; A1 main is a view like any sandbox; A5 "It
+we want sandboxes to see"; R13 "a default usage … can operate per-file"; A1 main is a view like any fork; A5 "It
 depends on the config!"; A6 a pinned fork is an acceptable snapshot; A11 file watchers: "we can take the "no
 guarantee" path for now" (2026-11-02); close-to-open visibility, accepted: "Go" (2026-11-03, in reply to the
 recommendation). Everything else here is a design choice.
@@ -38,7 +38,7 @@ closed and saved, as in AFS. The close is FUSE `RELEASE` (the last reference, a 
 |---|---|---|
 | the writing program, through the open file itself | its own write calls at once (design choice, as Linux and AFS) | the view's open file |
 | any other open in the same tree: another client, or the writer's own new open | once the save at `RELEASE` has committed; a close returns once its calls are durable (git-model §3), and an open of a file whose save the view has received waits for it (an open that overtakes `RELEASE` in the kernel: NOT VERIFIED, §10) | the tree's working tree (git-model §6) |
-| a client of the parent or a child tree | once that tree's queue has taken the landing or the sync, and its view has applied the `TreeMoved` | git-model §5–§8 |
+| a client of the upstream or a child tree | once that tree's queue has taken the landing or the sync, and its view has applied the `TreeMoved` | git-model §5–§8 |
 | other clients of a fork with an open transaction | nothing of the transaction until its commit lands in the fork | git-model §9 |
 | the transaction's own program | its transaction's files, opened after begin; files opened before begin keep their fork target | git-model §9 |
 
@@ -177,7 +177,7 @@ pub struct ViewCaughtUp { view: ViewId, tree: TreeRef, to: CommitId }
 
 ## 6. Flows
 
-**A write and its save** (main and sandboxes alike).
+**A write and its save** (main and forks alike).
 
 ```mermaid
 sequenceDiagram
@@ -232,7 +232,7 @@ All against a real mount, a real history service and real git.
 |---|---|
 | A writer keeps p open and writes; a second client reads p: old content until `RELEASE`, new after; the writer reads its own calls through its handle | visibility before close; a writer blind to its own writes |
 | A process duplicates a descriptor and closes one: no save; the last close saves once | saving on `FLUSH` |
-| A take holds p: the sandbox's write-open, `unlink` and `rename` onto p wait; opens of q go on | a write under a take; a lock wider than its files |
+| A take holds p: the fork's write-open, `unlink` and `rename` onto p wait; opens of q go on | a write under a take; a lock wider than its files |
 | Hidden names, existing or not, and a landing that adds one | anything shown that the profile hides (S2) |
 | Paths, links and descriptors aimed at the state area from inside a view | history or credentials reachable |
 | One host hung (`SIGSTOP`) while others save and land | one view stalling the rest (S4) |
@@ -246,7 +246,7 @@ All against a real mount, a real history service and real git.
 1. **Nothing is visible before close**, and a file never closed is never saved (git-model §16): a log written for
    hours is unseen until its last close, and its open file stalls takes of it.
 2. **Every write call is a journal append** (git-model §3), and the journal holds an open file's calls until its
-   close. A view host's death loses none it answered, but its mounts go stale and a sandbox's restarted host
+   close. A view host's death loses none it answered, but its mounts go stale and a fork's restarted host
    starts on a new fork. `fsync` makes calls durable, not visible.
 3. **`RELEASE` reports nothing**, so every refusal is moved earlier (the write-open, the write call, `fsync`,
    close); a save that fails after that is retried from the journal and alarmed, never lost. Whether an open

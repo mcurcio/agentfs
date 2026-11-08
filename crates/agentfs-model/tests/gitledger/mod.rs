@@ -197,13 +197,13 @@ pub fn observe(w: &World) -> Result<(), String> {
                 }
             }
             if let Tree::Fork(f) = x {
-                let parent = w.forks[&f].parent;
-                let q = l.queues.entry(parent).or_default();
+                let upstream = w.forks[&f].upstream;
+                let q = l.queues.entry(upstream).or_default();
                 for c in &queued {
                     q.push(Q::Landing { from: f, commit: c.clone() });
                 }
             }
-            for child in w.forks.values().filter(|k| k.parent == x) {
+            for child in w.forks.values().filter(|k| k.upstream == x) {
                 if heads.contains_key(&name(Tree::Fork(child.id))) {
                     let q = l.queues.entry(Tree::Fork(child.id)).or_default();
                     for _ in 0..moves {
@@ -278,7 +278,7 @@ pub fn observe(w: &World) -> Result<(), String> {
                     let Some(Q::Landing { from, commit }) = q.get(i).cloned() else {
                         unreachable!("a landing entry");
                     };
-                    // One sandbox's entries keep their order (P1).
+                    // One fork's entries keep their order (P1).
                     if let Some(j) = open
                         .iter()
                         .find(|j| **j < i && matches!(&q[**j], Q::Landing { from: g, .. } if *g == from))

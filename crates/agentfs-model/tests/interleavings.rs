@@ -99,7 +99,7 @@ struct Tally {
     empty: usize,
     rolled_back: usize,
     /// R5.3: closes and path calls deferred behind a transaction, and
-    /// commits that went ahead with a file open in their sandbox.
+    /// commits that went ahead with a file open in their fork.
     deferred_closes: usize,
     deferred_path_calls: usize,
     commits_with_open: usize,
@@ -153,8 +153,8 @@ struct Tally {
     crashes_during_close: usize,
     /// Crashes while a transaction had a file open.
     crashes_in_txn: usize,
-    /// Takes in which a new line met a parent's new line at its place (rule
-    /// 10), and changes that edited a file the parent had unlinked (rule
+    /// Takes in which a new line met an upstream's new line at its place (rule
+    /// 10), and changes that edited a file the upstream had unlinked (rule
     /// 11), as `check` counted them.
     inserts_met: usize,
     unlinked_edits: usize,
@@ -188,7 +188,7 @@ fn blocked(w: &World, c: &Client) -> bool {
     w.handles().any(|h| h.client == *c && h.waiting)
 }
 
-/// The sandboxes' clients that can make a call now.
+/// The forks' clients that can make a call now.
 fn free_clients(w: &World) -> Vec<ForkId> {
     live_clients(w)
         .into_iter()
@@ -232,7 +232,7 @@ struct Oracle {
     /// from git, every file its taken changes touch; a sync's, the files
     /// it writes). A call waits only there, on one of those files.
     taking: BTreeMap<Tree, BTreeSet<String>>,
-    /// R5.3, the harness's own list: the calls each sandbox's open transaction
+    /// R5.3, the harness's own list: the calls each fork's open transaction
     /// has deferred, in the order they were made.
     deferred: BTreeMap<ForkId, Vec<Deferred>>,
 }
@@ -419,10 +419,10 @@ impl Oracle {
         self.no_wait_on_waiting(w)
     }
 
-    /// R5.3, the harness's own reading: target `t` is a sandbox's tree, and
-    /// one of `files` is a file of the sandbox's open transaction: one it has
+    /// R5.3, the harness's own reading: target `t` is a fork's tree, and
+    /// one of `files` is a file of the fork's open transaction: one it has
     /// saved (read from git), has open for writing, or has deferred a call on.
-    /// The sandbox, if so.
+    /// The fork, if so.
     fn defers(&self, w: &World, t: Target, files: &[String]) -> Option<ForkId> {
         let Target::Tree(Tree::Fork(f)) = t else {
             return None;
@@ -454,7 +454,7 @@ impl Oracle {
         self.defers(w, w.handle(h).target, &[file])
     }
 
-    /// A commit left transaction open `h` open: it now holds in the sandbox
+    /// A commit left transaction open `h` open: it now holds in the fork
     /// the object its file `file` has there; with none, an orphan.
     fn move_to_fork(&mut self, h: HandleId, f: ForkId, file: Option<String>) {
         let t = Target::Tree(Tree::Fork(f));
@@ -494,7 +494,7 @@ impl Oracle {
         for h in later {
             let (u, file, to) = self.waiting_calls.remove(&h).expect("listed");
             let Target::Tree(Tree::Fork(f)) = u else {
-                unreachable!("a deferred call in a sandbox's tree");
+                unreachable!("a deferred call in a fork's tree");
             };
             let _ = file;
             self.deferred
@@ -812,7 +812,7 @@ fn close_all_checked(w: &mut World, o: &mut Oracle, tally: &mut Tally) -> Result
 
 /// A client's end event: the oracle closes its granted opens in the order
 /// the model does (by handle), each as its close would, and drops its
-/// waiting ones; a sandbox's open transaction rolls back first.
+/// waiting ones; a fork's open transaction rolls back first.
 fn end_checked(w: &mut World, o: &mut Oracle, c: &Client) -> Result<(), String> {
     if let Client::Fork(f) = c
         && w.forks[f].txn.is_some()
@@ -898,7 +898,7 @@ fn crash_checked(w: &mut World, o: &mut Oracle, during: Option<HandleId>) -> Res
     o.check(w).map_err(|e| format!("crash: {e}"))
 }
 
-/// R5.3, once sandbox `f`'s transaction has ended: the model's deferred calls
+/// R5.3, once fork `f`'s transaction has ended: the model's deferred calls
 /// are the harness's, in order, and each applies now, the oracle following it
 /// by its own byte code on the head it finds.
 fn apply_deferred_checked(w: &mut World, o: &mut Oracle, f: ForkId) -> Result<(), String> {
@@ -948,10 +948,10 @@ fn rollback_checked(w: &mut World, o: &mut Oracle, f: ForkId) -> Result<(), Stri
     apply_deferred_checked(w, o, f)
 }
 
-/// A transaction's commit, with a take in progress in its sandbox finished
+/// A transaction's commit, with a take in progress in its fork finished
 /// first (rule 9), then the calls it deferred (R5.3). The files open in the
-/// sandbox or the transaction stay open; the transaction's write in the
-/// sandbox from now on.
+/// fork or the transaction stay open; the transaction's write in the
+/// fork from now on.
 fn commit_checked(
     w: &mut World,
     o: &mut Oracle,
@@ -1441,7 +1441,7 @@ impl Calls {
         Ok(())
     }
 
-    /// R5.3: another program in a sandbox whose transaction is open calls on
+    /// R5.3: another program in a fork whose transaction is open calls on
     /// one of the transaction's files, mostly: a save, an open it leaves open
     /// to write and close later, an unlink or a rename. Steering only.
     fn outside_a_transaction(
@@ -1484,8 +1484,8 @@ impl Calls {
     /// While a take holds files in a tree, a client of that tree calls on
     /// one of them (or another file): opens it (it waits if held), saves
     /// it at once if granted, or unlinks or renames it. This is the
-    /// pattern the 2026-11-03 review found by hand and 500 seeds missed (a
-    /// parent's save of a file a losing change touched, during the take).
+    /// pattern the 2026-11-03 review found by hand and 500 seeds missed (an
+    /// upstream's save of a file a losing change touched, during the take).
     fn during_take(
         &mut self,
         w: &mut World,
@@ -1628,7 +1628,7 @@ fn run_as(
         // Only a client not blocked in a waiting call makes one.
         let mut clients: Vec<Client> = k.mains.iter().cloned().map(Client::Main).collect();
         clients.extend(live_clients(w).into_iter().map(Client::Fork));
-        // Another program of a sandbox differs from its client only while a
+        // Another program of a fork differs from its client only while a
         // transaction is open there.
         clients.extend(in_txn(w).into_iter().map(Client::Outside));
         clients.retain(|c| !blocked(w, c));
@@ -1652,14 +1652,14 @@ fn run_as(
             3 => {
                 let forks = live_clients(w);
                 if forks.len() < 4 {
-                    let parent = match k.rng.pick(&forks) {
+                    let upstream = match k.rng.pick(&forks) {
                         Some(f) if k.rng.below(3) == 0 && g.nested => {
                             tally.nested += 1;
                             Tree::Fork(f)
                         }
                         _ => Tree::Main,
                     };
-                    w.create_fork(parent);
+                    w.create_fork(upstream);
                     k.o.reload(w);
                     tally.forks += 1;
                 }
@@ -1778,7 +1778,7 @@ fn run_as(
                 k.outside_a_transaction(w, slot, tally).map_err(e)?;
             }
             26..=29 if !w.waits().is_empty() && k.rng.below(2) == 0 => {
-                // An entry waits: a sandbox of that tree saves a file the
+                // An entry waits: a fork of that tree saves a file the
                 // entry does not lock, then a queue step there, so a later,
                 // unrelated entry goes ahead of the waiting one (P1).
                 let waiting: Vec<(Tree, Vec<String>)> = w
@@ -1802,7 +1802,7 @@ fn run_as(
                         .collect();
                     let kids: Vec<ForkId> = free_clients(w)
                         .into_iter()
-                        .filter(|f| w.forks[f].parent == t && w.forks[f].txn.is_none())
+                        .filter(|f| w.forks[f].upstream == t && w.forks[f].txn.is_none())
                         .collect();
                     if let (Some(c), Some(g)) = (k.rng.pick(&kids), k.rng.pick(&free))
                         && let Some(p) = w.client_path(&Client::Fork(c), g)
@@ -1920,11 +1920,11 @@ fn rounds_as(
                 0 => {
                     let forks = live_clients(w);
                     if forks.len() < 4 {
-                        let parent = match k.rng.pick(&forks) {
+                        let upstream = match k.rng.pick(&forks) {
                             Some(f) if k.rng.below(3) == 0 && g.nested => Tree::Fork(f),
                             _ => Tree::Main,
                         };
-                        w.create_fork(parent);
+                        w.create_fork(upstream);
                         k.o.reload(w);
                     }
                 }
@@ -1964,8 +1964,8 @@ fn rounds_as(
                     }
                 }
                 13 if k.rng.below(4) == 0 => {
-                    // A sandbox's client dies: its transaction rolls back,
-                    // its opens close, and the sandbox ends.
+                    // A fork's client dies: its transaction rolls back,
+                    // its opens close, and the fork ends.
                     if let Some(c) = fork {
                         end_checked(w, &mut k.o, &c).map_err(e)?;
                     }
@@ -2047,8 +2047,8 @@ fn run_all(policies: Policies) {
             seeds().len()
         );
         // Rules 10 and 11 met in the random runs, not in one scenario
-        // each: a new line placed beside a parent's concurrent new line,
-        // an edit of a file the parent had unlinked; and saves made while
+        // each: a new line placed beside an upstream's concurrent new line,
+        // an edit of a file the upstream had unlinked; and saves made while
         // a take held files in their tree.
         assert!(
             tally.inserts_met > 0 && tally.unlinked_edits > 0 && tally.saves_during_takes > 0,
@@ -2065,7 +2065,7 @@ fn run_all(policies: Policies) {
             seeds().len()
         );
         // R5.3 met: calls deferred behind a transaction, and commits that
-        // went ahead with a file open in their sandbox.
+        // went ahead with a file open in their fork.
         assert!(
             tally.deferred_closes > 0
                 && tally.deferred_path_calls > 0
@@ -2203,9 +2203,9 @@ fn random_interleavings_commit_dates_decide_nothing() {
 }
 
 /// Coherence finding 1: git's own merge base cannot tell a fork line the
-/// parent already decided against from one still on its way.
+/// upstream already decided against from one still on its way.
 #[test]
-#[ignore = "coherence finding 1: git's own merge base of crossing syncs and landings keeps a fork line the parent already decided against"]
+#[ignore = "coherence finding 1: git's own merge base of crossing syncs and landings keeps a fork line the upstream already decided against"]
 fn random_interleavings_git_merge_base() {
     run_all(Policies {
         merge: MergeRule::GitMergeBase,

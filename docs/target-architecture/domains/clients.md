@@ -17,13 +17,13 @@ the only place a `ClientCap`, an `ActorCap` or a `Writer::Client` is born. A cli
 | R3 | "a virtual filesystem overlay for each client (including main) that is backed by a _real_ filesystem source-of-truth" | 2026-11-01 | one client per view, main included |
 | R5 | "Agentfs history shouod distinguish between the various containers so we can track direct edits on main vs the forks that sandboxes edit" | 2026-11-01 | each client is its own writer |
 | R7 | "Security boundary. Agentfs is the gatekeeper that exposes only what we want sandboxes to see" | 2026-10-30 | a grant never exceeds its launcher's authority |
-| A1, A2 | main is a view like any sandbox; a sandbox's client is its own view mount, made by whoever starts the container | answers | one `attach` for every kind of client |
+| A1, A2 | main is a view like any fork; a fork's client is its own view mount, made by whoever starts the container | answers | one `attach` for every kind of client |
 | A5, A6 | consistency: "It depends on the config!"; a pinned fork is an acceptable snapshot | 2026-11-02 | the grant holds the consistency setting and the snapshot choice |
 | R16 | "The various agentfs components should be within the same version family" | 2026-11-02 | a launcher of another family never reaches `attach` |
 
 | Term | Meaning here | Is not |
 |---|---|---|
-| **client** | one view's user: main or a sandbox container, attached to one tree | a process, a uid, a pod |
+| **client** | one view's user: main's or a fork's container, attached to one tree | a process, a uid, a pod |
 | **launcher** | whoever starts a container and attaches its client; holds a `LaunchCap` | a client |
 | **grant** | what a client may do (`Access`), see (`ViewProfileId`), how it sees (`Sees`), and the owner its view presents | a role |
 | **binding** | what `attach` returns; it holds no capability | a mount |
@@ -139,7 +139,7 @@ names its writer through the self-describing `ClientId`; Telemetry keeps the att
 
 ## 5. Flows and scenarios
 
-**A sandbox client attaches.** `attach(live_read_write(Fork F, profile, PerFile), session, cap)`: Clients asks Trees'
+**A fork client attaches.** `attach(live_read_write(Fork F, profile, PerFile), session, cap)`: Clients asks Trees'
 `facts(F)` (created by this launcher, not ended), builds the `Attenuated` grant, and in one unit inserts the client,
 claims F (`ForkTaken` rolls it back), updates the index and stages `Attached`; it mints the `ClientCap` into the
 session and returns the `Binding`.
@@ -155,7 +155,7 @@ rest end (`Reconciled`). Open files' write calls survive it: each is in the tree
 | Scenario | What Clients does | What it never does |
 |---|---|---|
 | A take waits on a client's open file | nothing: when the client ends, `AttachmentEnded` lets the actor close its files | end a client because a take waits |
-| 1,000 sandboxes | one unit and one event per attach; `attached(t)` reads the index | put a `ClientId` in a metric label |
+| 1,000 forks | one unit and one event per attach; `attached(t)` reads the index | put a `ClientId` in a metric label |
 | A view host crashes | `Ended(SessionClosed)` while the service runs; across a service restart, `Resuming` until its launcher detaches or reconciles | end a client because a probe failed |
 | Disk full | `attach` fails cleanly; an end always succeeds (room reserved at attach) | refuse an end for space |
 | Upgrades | patch: rows restore as `Resuming`. Minor or major: the drain ends every client first | migrate a row |
@@ -170,20 +170,20 @@ rest end (`Reconciled`). Open files' write calls survive it: each is in the tree
 
 | Test | Rules out |
 |---|---|
-| A sandbox launcher asks for main, another launcher's fork, and a profile above its bound: refused each time, no row | a hostile in-pod launcher seeing or writing main (R7) |
+| A fork launcher asks for main, another launcher's fork, and a profile above its bound: refused each time, no row | a hostile in-pod launcher seeing or writing main (R7) |
 | A second read-write attach to a fork, before and after a service restart: `ForkTaken` | two writers on one fork's branch |
 | A view host's save names another client id: the commit's `Agentfs-Writer` is the session's own client | forged attribution |
-| Kill a sandbox's view host: `AttachmentEnded(SessionClosed)`, `LastDetached{F}`; main keeps writing | a dead client holding opens forever |
+| Kill a fork's view host: `AttachmentEnded(SessionClosed)`, `LastDetached{F}`; main keeps writing | a dead client holding opens forever |
 | Kill the service with three attachments; rebind two; reconcile: two `Bound`, one `Reconciled`, `LastDetached` once | ending clients by guess |
 | Compile-fail: build `ClientCap`, `ActorCap`, `Writer::Client` or a writable snapshot `Grant` in another crate | forging authority in code |
 
 ## 7. Costs
 
-1. **A session close ends the client:** a view host restarted in place comes back as a new client, a sandbox's on a
+1. **A session close ends the client:** a view host restarted in place comes back as a new client, a fork's on a
    new fork; the old fork ends, and what it saved still lands.
 2. **A launcher that never returns** leaves its clients attached, so the volume never releases until an operator
    calls `end`.
-3. **Labels are the launcher's word:** the launcher and fork in the `ClientId` keep a sandbox from passing as main.
+3. **Labels are the launcher's word:** the launcher and fork in the `ClientId` keep a fork from passing as main.
 
 ## For the code architects (parked)
 

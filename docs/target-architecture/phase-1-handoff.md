@@ -29,7 +29,7 @@ needed before implementing these recorded choices.
 
 ## What is implemented
 
-The core now connects recorded byte calls to line/name maps, the parent referee,
+The core now connects recorded byte calls to line/name maps, the upstream referee,
 whole-save landing, retained losers, durable queue entries, automatic sync,
 P1/P2 progress, and snapshot-seeded recovery. Per-tree object bindings and replay
 watermarks are separate from merge-file identities and move atomically with
@@ -70,7 +70,7 @@ resumes. The mixed descriptor/mapping byte-loss observations still require work.
 
 | §18 exit | Status | Evidence and limit |
 |---|---|---|
-| Main + one sandbox: model scenarios through real calls | **FAIL** | [Mounted conformance at 1513b97](https://github.com/mcurcio/agentfs/actions/runs/42225254439/job/127916990566): loss, neighbors, concurrent inserts, unfinished tail, edited-place, R10.6, P1/P2 and byte cases passed; finding 32 failed. Fixed-case coverage is a subset of the conformance plan |
+| Main + one fork: model scenarios through real calls | **FAIL** | [Mounted conformance at 1513b97](https://github.com/mcurcio/agentfs/actions/runs/42225254439/job/127916990566): loss, neighbors, concurrent inserts, unfinished tail, edited-place, R10.6, P1/P2 and byte cases passed; finding 32 failed. Fixed-case coverage is a subset of the conformance plan |
 | Journal: kill boundaries and exactly-once recovery | **PASS** for the combined host/actor cases | [Ten WAL/durable-Git/checkout boundaries plus replaced-open-object recovery](https://github.com/mcurcio/agentfs/actions/runs/42225254439/job/127916990975) passed. The current composition does not independently kill a separate phase-1 history-service process |
 | Journal: returned fsync/close survive power loss | **FAIL** | [ext4](https://github.com/mcurcio/agentfs/actions/runs/42225254439/job/127916990829) and [XFS](https://github.com/mcurcio/agentfs/actions/runs/42225254439/job/127916990908) fail recovery with a corrupt reftable at the first marked durability checkpoint |
 | Full state area: write returns ENOSPC | **PASS** | [Allocation-forcing write and recovery](https://github.com/mcurcio/agentfs/actions/runs/42225254439/job/127916990975) passed. A supplementary full-state rename test returns EIO instead of its expected ENOSPC; that remains an implementation issue |
@@ -79,7 +79,7 @@ resumes. The mixed descriptor/mapping byte-loss observations still require work.
 | Atomic replacement, unlink/rename while open, anonymous first link | **PASS** for the exercised cases | [Tree-view job](https://github.com/mcurcio/agentfs/actions/runs/42225263487/job/127917021965) and the journal orphan case check actual release and retained history |
 | Old handle writes after a view-host restart | **NOT RUN** in the literal reconnect form | Recovery tests preserve object identity and reject orphan replay. The mounted crash test terminates the old client; it does not reconnect the same kernel handle and write after remount |
 | Two stale-offset writers through page cache; shared mmap | **FAIL** | [Two-writer probe](https://github.com/mcurcio/agentfs/actions/runs/42225254439/job/127916990991): four of eight descriptor/map combinations pass; mapping privacy/publication and mixed-write byte results fail |
-| Progress: unrelated stream, held log, new writers, cooperating programs, prefix sync | **PASS** for the finite scenarios | [P1/P2 mounted cases](https://github.com/mcurcio/agentfs/actions/runs/42225254439/job/127916990566) passed, including a parent waiting for an appending child and a shell pipeline while a log take waits. Quantitative wait/starvation measurements remain unavailable |
+| Progress: unrelated stream, held log, new writers, cooperating programs, prefix sync | **PASS** for the finite scenarios | [P1/P2 mounted cases](https://github.com/mcurcio/agentfs/actions/runs/42225254439/job/127916990566) passed, including an upstream waiting for an appending child and a shell pipeline while a log take waits. Quantitative wait/starvation measurements remain unavailable |
 
 The first integration run's `tee` pipeline masked the conformance program's
 failure. `4d90329` added `pipefail`; subsequent phase-1 jobs correctly fail.
@@ -106,13 +106,13 @@ up to 2 times (below), so read a figure as an observation.
 | Line-map bytes per 10,000 saves | `metadata.json` is **195,676 bytes** after 10,000 one-line saves (about 19.6 bytes a save); the 10,000 snapshots are **960,893,676 bytes** logical and **241,234,350 bytes** as Git objects (10,000 distinct blobs); the 10,000 commits are 3,615,560 bytes logical and 2,256,009 on disk; the repository is 245,639,637 bytes of files, 425,697,280 allocated; `refs/` stays 164 bytes. The journal is 15,043,489 bytes after 10,001 saves (1,504 bytes a save). Elapsed **2,410.95 seconds** | [storage job](https://github.com/mcurcio/agentfs/actions/runs/42323052176/job/128251890644), artifact `phase-1-measure-storage` (ID 13555264336) |
 | Save and take, 1 MiB | Write and close **24.3 ms**; actor save 275.5 ms; landing 581.4 ms, of which the sync back is 294.3 ms; both views and an empty queue after **2.03 s** | calls job above |
 | Save and take, 100 MiB | Write and close **32.4 s**; actor save 25.7 s; landing 290.2 s; sync back 26.6 s; both views after **392.5 s**. (The run before, at `964618a`: 26.3 s, 16.7 s, 257.6 s, 11.2 s, 306.1 s) | calls job above; [earlier job](https://github.com/mcurcio/agentfs/actions/runs/42323052176/job/128251890610), artifact 13555421820 |
-| Waits | One held log, one waiting sandbox save: **1** wait, **1,465 s** in total. The five independent saves became visible while it was held after **387 to 394 s** each, and five more opens of the held log took a median **283.4 s**, p99 **284.1 s**. Each was slow because the 100 MiB file was in the tree: every save and take rereads and rewrites it (below). The earlier run: 1 wait of 624 s, saves visible after 184 to 200 s | calls job above |
+| Waits | One held log, one waiting fork save: **1** wait, **1,465 s** in total. The five independent saves became visible while it was held after **387 to 394 s** each, and five more opens of the held log took a median **283.4 s**, p99 **284.1 s**. Each was slow because the 100 MiB file was in the tree: every save and take rereads and rewrites it (below). The earlier run: 1 wait of 624 s, saves visible after 184 to 200 s | calls job above |
 | Held log and compaction | A log held open while another file takes 24 saves of 8 MiB: the journal peaks at **66,149,105 bytes**, drops to 745 bytes at each of 2 compactions, and ends at 49,610,089 bytes. The held file's one line is all a compaction keeps. 24 saves took **159.7 s** | [held-log job](https://github.com/mcurcio/agentfs/actions/runs/42323052176/job/128251890523), artifact `phase-1-measure-held-log` (ID 13552934814) |
 
 ### Why 10,000 saves took over two hours: the pilot and its two causes
 
 The 1,000-save pilot of the storage pattern (a file truncated and written with one
-new line, closed each time, through the mount with a sandbox beside it) ran on
+new line, closed each time, through the mount with a fork beside it) ran on
 the commit that added the stage counters (`db557f5`,
 [run 42302911952](https://github.com/mcurcio/agentfs/actions/runs/42302911952)).
 It took **957.8 seconds**, and Git children per save rose from 92 in the first
@@ -120,7 +120,7 @@ hundred to 991 in the last. Per-stage totals, seconds: `event_owners` 865.3
 (`queue_plan` 891.7 encloses it), `snapshot_read` 15.5, `checkout` 14.5,
 `objects` 18.7, `ref_copy` 13.6, `align` 4.4, `journal_append` 1.8 (of which
 `fsync` 1.5), `sync_merge` 0.7. Of 541,546 children, about 500,000 were the
-`git cat-file` of one commit in a walk of the sandbox's whole history.
+`git cat-file` of one commit in a walk of the fork's whole history.
 
 Each hypothesis, read against the pilot (P), the held-log run (H) and the final
 calls and storage runs (C, S):
@@ -129,7 +129,7 @@ calls and storage runs (C, S):
 |---|---|---|
 | 1 | `prior_decisions` walks first-parent history | **Not shown.** It ran 0 times in P, S and H (nothing lands on main in those patterns) and 15.5 s in the whole calls run (under 1 percent of it). Not changed |
 | 2 | `event_owners` walks the DAG once per sync | **Confirmed, the main cause.** 865 of 958 s in P, and a child per commit: 92.0 children per save in the first hundred, 991.5 in the last. Fixed: one `git log` at open, then a map (design §17.3). After it, P took **92.5 s**, children per save were **40.9 at save 100 and 40.0 at save 900** (ratio 0.98), and S took 10,000 saves at a flat 40.0 |
-| 2b | (found by H, not in the page) `undecided` asked Git `is_ancestor` once per line of the sandbox's copy | **Confirmed.** An 8 MiB file is 8,234 lines: 8,234 children and 70 to 130 s of each save's sync plan; 24 saves took **1,771.8 s**. Fixed: ask once per commit. After it, 24 saves took **159.7 s** and the run started about 1,100 children in all |
+| 2b | (found by H, not in the page) `undecided` asked Git `is_ancestor` once per line of the fork's copy | **Confirmed.** An 8 MiB file is 8,234 lines: 8,234 children and 70 to 130 s of each save's sync plan; 24 saves took **1,771.8 s**. Fixed: ask once per commit. After it, 24 saves took **159.7 s** and the run started about 1,100 children in all |
 | 3 | `checkout_tree` rewrites every file on every save | **Not shown for a small tree.** 6.9 ms a run at save 100, 7.4 ms at 1,000, 9.9 ms at 9,900 with one file. Not isolated for many files, and with the 100 MiB file in the tree it is 50.3 s of the calls run. Not changed |
 | 4 | `commit` writes a blob for every file | **Confirmed where it hurts, not fixed.** `objects` is 18.1 ms a save at 100 and 37.0 ms at 9,900 in S (it grows with the line map). In the calls run it is 755 s: the 100 MiB blob is hashed and synced on each later save. The fix the page allows (write only the changed files) is not made |
 | 5 | `metadata.json` and `namespace.json` grow | **Confirmed, and it is the line-map measurement:** 19.6 bytes a save. It drives the remaining growth below. Never pruned |
@@ -143,7 +143,7 @@ percent: 218 ms a sync at the end), `snapshot_read` 338 s, `align` 322 s,
 `objects` 278 s, `checkout` 173 s, `ref_copy` 158 s. These grow with the line
 map and are not children any more. About **790 s (33 percent)** of the run is
 inside `queue_plan` but in none of its measured parts (`snapshot_read`,
-`sync_merge`): the copies of the sandbox's line maps, the comparison of two
+`sync_merge`): the copies of the fork's line maps, the comparison of two
 snapshots and the checks of each line version. The frozen `Stages` has no field
 for them, so the next measurement needs a new one.
 
@@ -169,14 +169,14 @@ The owner recorded the following current picks in `921528b`, after the observed
 runs. They remain subject to the ledger's blocking-consideration rule. This
 handoff does not implement them or claim new passing results.
 
-1. **Sandbox and parent — queue; finding 32.** Start with six `-\n` lines.
-   Hold a main write-open. Sandbox: `open(O_TRUNC)`, `write("y")`, `close`;
-   then hold a sandbox write-open. Main: replace the second line with
-   `m1.1\n` and close that writer. Sandbox: `pwrite("n6", 0)`, close;
-   release the held main writer. The first sandbox save loses whole, but the
+1. **Fork and upstream — queue; finding 32.** Start with six `-\n` lines.
+   Hold a main write-open. Fork: `open(O_TRUNC)`, `write("y")`, `close`;
+   then hold a fork write-open. Main: replace the second line with
+   `m1.1\n` and close that writer. Fork: `pwrite("n6", 0)`, close;
+   release the held main writer. The first fork save loses whole, but the
    next landing retains live lines `n6` and `m1.1\n`, rendering
    `n6m1.1\n`. This reproduces model finding 32 and blocks line integrity.
-   **Recorded pick: R10.8.** This is a collision: the parent wins and the
+   **Recorded pick: R10.8.** This is a collision: the upstream wins and the
    later save loses whole, retained in history. Preserve line order under
    R10.7. The current model, runtime and mounted expectations need alignment
    with this approved rule.
@@ -194,7 +194,7 @@ handoff does not implement them or claim new passing results.
    mixed-write data loss and publication behavior still need implementation
    and tests against the new contract.
 
-3. **Sandbox and parent — durable queue storage.** Initialize and mount both
+3. **Fork and upstream — durable queue storage.** Initialize and mount both
    views, `open(main/f1, O_CREAT|O_WRONLY)`, write `acknowledged-1\n`, then
    `fsync` returns. Record an external receipt and dm-log-writes mark. Replaying
    the preceding logged durability boundary makes recovery fail with corrupt

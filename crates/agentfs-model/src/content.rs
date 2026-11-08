@@ -341,7 +341,7 @@ pub fn writer_of(token: &str) -> &str {
 /// version `b`'s writer saw of that line, or one that version was written
 /// over, and so on. From what the writer could read (R3c.2), never from which
 /// commits its version merged: a sync that kept the fork's own line over
-/// the parent's did not show the parent's version to the fork's writer.
+/// the upstream's did not show the upstream's version to the fork's writer.
 #[derive(Default, Debug)]
 pub struct Lineage {
     saw: BTreeMap<String, BTreeSet<String>>,

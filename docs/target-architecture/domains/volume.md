@@ -17,7 +17,7 @@ at that moment and keeps no copy.
 | — | "It's all event driven" | 2026-10-24 | release is re-judged on events, never on a scan interval |
 | — | "Remotes can come and go. It's not a error to have zero remotes" | 2026-10-17 | zero remotes is a normal input to the verdict |
 | — | "B. And if no remote is configured, the volume is lost, and that's a choice the user is allowed to make." (said of a fork with no remote of its own) | 2026-10-17 | read for every volume: §5 |
-| R7 | "Security boundary. Agentfs is the gatekeeper that exposes only what we want sandboxes to see" | 2026-10-30 | a sandbox launcher never creates, drains or stages the volume |
+| R7 | "Security boundary. Agentfs is the gatekeeper that exposes only what we want sandboxes to see" | 2026-10-30 | a fork launcher never creates, drains or stages the volume |
 | R16 | "i would like for the git history to remain compatible across minor versions, and only break on a major version change. The various agentfs components should be within the same version family" | 2026-11-02 | an upgrade's drain; another family refused (`FormatsOf`) |
 
 | Term | Meaning here |
@@ -106,7 +106,7 @@ Asked: Clients `attached_any`, the git model's queue depths, Trees `live`, Repli
 | VO3 | A transition and its event are one unit | repository write and outbox row commit together | construction time |
 | VO4 | The verdict reads only facts asked at judgement time; nothing is polled | no clock port; clippy bans timers in the crate | compile + build time |
 | VO5 | The start point never changes after create; acceptances only move forward along the start line | no setter; `accept_start` checks the tip (`StartDiverged`) | construction time |
-| VO6 | A sandbox launcher cannot create, drain or stage the volume (R7) | `LaunchCap` with `may: Main`; `drain_for_upgrade` needs the Operator role | construction time |
+| VO6 | A fork launcher cannot create, drain or stage the volume (R7) | `LaunchCap` with `may: Main`; `drain_for_upgrade` needs the Operator role | construction time |
 | VO7 | A release stages another family's volume only after that family's upgrade drain released it (S8) | `store` reports the family at open; `stage` answers `FormatsOf` | boot time |
 
 Ports: `VolumeRepository`, `StartRepository` (append-only acceptance rows), `Outbox`, `UnitOfWork` (`store`, audited).
@@ -133,7 +133,7 @@ branch, its history, the start record and the settings alone.
 
 | Test | Rules out |
 |---|---|
-| Unstage with a sandbox attached; kill its view host: `Wait(Attached)`, then `Wait(QueuesNotEmpty)` or `Wait(Remote)`, then `Released` | releasing over a live client or an untaken save |
+| Unstage with a fork attached; kill its view host: `Wait(Attached)`, then `Wait(QueuesNotEmpty)` or `Wait(Remote)`, then `Released` | releasing over a live client or an untaken save |
 | `drain_for_upgrade` with a live fork; `stage` meanwhile: `Draining(Upgrade)`; `Wait(ForksLeft)` until `ForkDropped` | an upgrade stranding fork branches |
 | Stage a 1.5 build on a 1.4 volume, before and after 1.4's upgrade drain | a release reading another family's formats |
 | A remote that refuses connections under `Remove`: `Wait(Remote(Failing))`, never `Removable` | release by timeout |

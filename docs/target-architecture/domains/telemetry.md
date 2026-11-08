@@ -97,7 +97,7 @@ generated from it, and CI checks they match.
 | Test | Rules out |
 |---|---|
 | Compile-fail: a `ClientId` or path as a label; content or a credential as an attribute; a wildcard catalogue match | series explosion; leaks; an untracked event |
-| The collector accepts and never answers; 1,000 sandboxes save: save latency as with export `Off` | a slow collector slowing file calls |
+| The collector accepts and never answers; 1,000 forks save: save latency as with export `Off` | a slow collector slowing file calls |
 | A collision: one `CollisionRecorded` with its writer and lines; a take waiting on an open file raises and clears `TakeWaiting` | an unseen loss or stall |
 | Hours of fake idle time raise nothing | alarms from elapsed time (T6) |
 | A generated reference that differs from the catalogue fails CI | docs drifting from code |

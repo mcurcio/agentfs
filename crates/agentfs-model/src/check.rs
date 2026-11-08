@@ -20,7 +20,7 @@ pub fn check(w: &mut World) -> Result<(), String> {
     no_flicker(w, &now)?;
     w.views = now;
     locks(w)?;
-    parent_wins(w)?;
+    upstream_wins(w)?;
     changes_whole(w)?;
     syncs_deliver(w)?;
     transactions_end_as_told(w)?;
@@ -40,16 +40,16 @@ pub fn check(w: &mut World) -> Result<(), String> {
 
 /// One step, with what only the step itself shows. A take (rule 9) that
 /// begins either waits, taking nothing, or holds its files; a sync's take
-/// reads the parent's head as it is then (read here before the step, not
+/// reads the upstream's head as it is then (read here before the step, not
 /// from the model's record). A take that ends writes no file a client of
 /// that tree has open for writing, nor any file it did not hold; a sync
-/// records no collision (only a parent's queue decides one) and carries
+/// records no collision (only an upstream's queue decides one) and carries
 /// the head its take read. Returns the queue entries taken.
 pub fn step_checked(w: &mut World, s: &Step) -> Result<usize, String> {
     match s {
         Step::Next(t) => {
             let up = match t {
-                Tree::Fork(f) => Some(w.head(w.forks[f].parent)),
+                Tree::Fork(f) => Some(w.head(w.forks[f].upstream)),
                 Tree::Main => None,
             };
             // P1, read before the step: the entry it must act on is the
@@ -85,7 +85,7 @@ pub fn step_checked(w: &mut World, s: &Step) -> Result<usize, String> {
                     ) => {
                         if *read != head {
                             return Err(format!(
-                                "a sync into {t:?} read {read:.7}, not the parent's head {head:.7}"
+                                "a sync into {t:?} read {read:.7}, not the upstream's head {head:.7}"
                             ));
                         }
                         prefix_cut(w, *t, &ours, &head, &open, Some(to))?;
@@ -103,7 +103,7 @@ pub fn step_checked(w: &mut World, s: &Step) -> Result<usize, String> {
             let up = up.filter(|_| q[i].1 == Entry::Sync);
             match (up, w.holds().get(t).map(|h| &h.take)) {
                 (Some(up), Some(Take::Sync { head: read, .. })) if *read != up => Err(format!(
-                    "a sync into {t:?} read {read:.7}, not the parent's head {up:.7}"
+                    "a sync into {t:?} read {read:.7}, not the upstream's head {up:.7}"
                 )),
                 (Some(head), Some(Take::Sync { up: to, .. })) => {
                     prefix_cut(w, *t, &ours, &head, &open, Some(to))?;
@@ -148,7 +148,7 @@ pub fn step_checked(w: &mut World, s: &Step) -> Result<usize, String> {
             };
             if w.collisions.len() != collisions {
                 return Err(format!(
-                    "a sync into {t:?} recorded a collision: only the parent's queue decides one"
+                    "a sync into {t:?} recorded a collision: only the upstream's queue decides one"
                 ));
             }
             match w.syncs.get(syncs) {
@@ -156,7 +156,7 @@ pub fn step_checked(w: &mut World, s: &Step) -> Result<usize, String> {
                     "a sync into {t:?} carried {carried:.7}, not the head {up:.7} its take read"
                 )),
                 None if !w.is_ancestor(up, &w.head(*t)) => Err(format!(
-                    "a sync into {t:?} did nothing, but it lacks the parent's head {up:.7}"
+                    "a sync into {t:?} did nothing, but it lacks the upstream's head {up:.7}"
                 )),
                 _ => Ok(0),
             }
@@ -166,8 +166,8 @@ pub fn step_checked(w: &mut World, s: &Step) -> Result<usize, String> {
 }
 
 /// P2, the prefix sync, read from git: a sync into fork `t` (at `ours`,
-/// with `open` open for writing there) of the parent's head `head`
-/// delivers the parent's first parents in order up to `to` (none: it
+/// with `open` open for writing there) of the upstream's head `head`
+/// delivers the upstream's first parents in order up to `to` (none: it
 /// delivers nothing and waits), and if it holds any back, the first it
 /// holds back touches a file open there: its own change (against its
 /// first parent) or a collision record in it names that file, and its
@@ -213,7 +213,7 @@ fn prefix_cut(
         Some(to) if chain.is_empty() && w.is_ancestor(to, ours) => 0,
         Some(to) => {
             1 + chain.iter().position(|c| c == to).ok_or(format!(
-                "a sync into {t:?} delivers {to:.7}, not one of the parent's commits it lacks"
+                "a sync into {t:?} delivers {to:.7}, not one of the upstream's commits it lacks"
             ))?
         }
     };
@@ -348,12 +348,12 @@ pub fn p1_first(w: &World, t: Tree) -> Option<usize> {
 
 /// The files queue entry `e` of `t` may touch, read from git: a landing's
 /// commit's own changes ([`change_files`]), a sync's every file its tree
-/// and its parent's head differ in.
+/// and its upstream's head differ in.
 pub fn entry_files(w: &World, t: Tree, e: &Entry) -> BTreeSet<String> {
     match (e, t) {
         (Entry::Landing { commit, .. }, _) => change_files(w, commit),
         (Entry::Sync, Tree::Fork(f)) => {
-            let (ours, up) = (w.head(t), w.head(w.forks[&f].parent));
+            let (ours, up) = (w.head(t), w.head(w.forks[&f].upstream));
             lock_keys(w, &ours, &up)
         }
         (Entry::Sync, Tree::Main) => BTreeSet::new(),
@@ -530,7 +530,7 @@ fn really_collided(w: &World, c: &Collision) -> bool {
 /// really collided (rule 3e, [`By::Whole`]). That decision may replace the
 /// lost version with any version, the one it was written over included (an
 /// unlink that lost to a line it never saw gives the file back; a line of a
-/// losing save goes back to the parent's). A version lost by no real
+/// losing save goes back to the upstream's). A version lost by no real
 /// collision of its change is no such decision.
 fn decided_against(w: &World, t: Tree, path: &str, line: &str, token: &str) -> bool {
     let trees = w.upstream(t);
@@ -554,30 +554,30 @@ fn decided_against(w: &World, t: Tree, path: &str, line: &str, token: &str) -> b
 
 /// Whether collision `c`, decided in `t` or a tree upstream of it, has
 /// reached `t` (causal order, P2), read from git. The commit that carries
-/// it to `t` is the parent's: for a decision of the parent, its result; for
-/// one further up, the parent's commit that carried the losing change up,
-/// which the parent's head reaches (even `t`'s own commit counts only once
-/// the parent's commit carrying it is delivered). It has reached `t` unless
-/// the parent's head reaches that commit and no parent's commit a sync
+/// it to `t` is the upstream's: for a decision of the upstream, its result; for
+/// one further up, the upstream's commit that carried the losing change up,
+/// which the upstream's head reaches (even `t`'s own commit counts only once
+/// the upstream's commit carrying it is delivered). It has reached `t` unless
+/// the upstream's head reaches that commit and no upstream's commit a sync
 /// delivered into `t` (the sync's second parent, or the commit it
 /// fast-forwarded to) does, nor, for a result, `t`'s head. So a
 /// prefix sync that holds back
-/// the parent's landing that carried a line upstream has not delivered
+/// the upstream's landing that carried a line upstream has not delivered
 /// main's decision against that line, nor a held-back commit's own.
 fn delivered(w: &World, t: Tree, c: &Collision) -> bool {
-    let Some(parent) = w.upstream(t).get(1).copied() else {
+    let Some(upstream) = w.upstream(t).get(1).copied() else {
         return true;
     };
     if c.tree == t {
         return true;
     }
-    let up = w.head(parent);
+    let up = w.head(upstream);
     let synced = |x: &str| {
         w.syncs
             .iter()
             .any(|(s, at, _, _)| *s == t && w.is_ancestor(x, at))
     };
-    let carrier = if c.tree == parent {
+    let carrier = if c.tree == upstream {
         &c.result
     } else {
         &c.loser
@@ -596,7 +596,7 @@ fn delivered(w: &World, t: Tree, c: &Collision) -> bool {
 /// as lost; never if a was written over b (b is stale), unless a collision
 /// decided against a ([`decided_against`]); (b) every version that
 /// entered a tree (written there, carried in by a landing or a
-/// transaction, won or lost, or taken from the parent by a sync) is still
+/// transaction, won or lost, or taken from the upstream by a sync) is still
 /// its line's version there, or one written over it is, or a delete is
 /// that agrees with it or with a delete written over it
 /// ([`deleted_over`]), or such a collision names it, or the tree's last sync
@@ -607,7 +607,7 @@ fn no_silent_loss(w: &World, now: &Views) -> Result<(), String> {
         if !a.live() && !b.live() {
             continue;
         }
-        // excuse: R3b a collision decided against a: the parent's version may replace it
+        // excuse: R3b a collision decided against a: the upstream's version may replace it
         if w.lineage.descends(&a.id, &b.id) && !decided_against(w, t, p, l, &a.id) {
             return Err(format!(
                 "stale revert in {t:?}:{p}[{l}]: {} became {}, which it was written over",
@@ -637,7 +637,7 @@ fn no_silent_loss(w: &World, now: &Views) -> Result<(), String> {
             if lost {
                 continue;
             }
-            // excuse: R10.6 the tree's last sync hid the parent's unfinished last line in front of an undecided line
+            // excuse: R10.6 the tree's last sync hid the upstream's unfinished last line in front of an undecided line
             if hidden_by_r10_6(w, *t, &e.path, &e.line, &e.token) {
                 continue;
             }
@@ -659,12 +659,12 @@ fn no_silent_loss(w: &World, now: &Views) -> Result<(), String> {
 /// No flip-flop: a version, once replaced in a tree, never shows there
 /// again, unless a collision decided against the version replacing it now
 /// ([`decided_against`]: then it is that decision). So a fork's line
-/// changes at most once per collision (its own x, then the parent's
+/// changes at most once per collision (its own x, then the upstream's
 /// winning m, never x again).
 fn no_flicker(w: &mut World, now: &Views) -> Result<(), String> {
     let mut left = Vec::new();
     for (t, p, l, a, b) in moves(w, now) {
-        // excuse: R3a the parent's queue decided against a: the line takes that decision
+        // excuse: R3a the upstream's queue decided against a: the line takes that decision
         if w.left
             .contains(&(t, p.to_string(), l.to_string(), b.id.clone()))
             && !decided_against(w, t, p, l, &a.id)
@@ -685,8 +685,8 @@ fn holds(w: &World, at: &str, token: &str) -> bool {
     PATHS.iter().any(|p| w.file(at, p).holds(token))
 }
 
-/// The parent's version wins every collision, decided only at the
-/// parent's queue (a landing, or a transaction's commit into its fork:
+/// The upstream's version wins every collision, decided only at the
+/// upstream's queue (a landing, or a transaction's commit into its fork:
 /// [`Direction`] has no other case, and `sync` records none), and only a
 /// real one: in each recorded collision the result holds none of the lost
 /// versions and keeps the tree's own version of every lost line, as the
@@ -701,11 +701,11 @@ fn holds(w: &World, at: &str, token: &str) -> bool {
 /// git, not the model's record: the result is the deciding tree's own
 /// landing or transaction commit, and the losing commit was written below
 /// that tree (a fork under it, or the transaction of that fork).
-fn parent_wins(w: &mut World) -> Result<(), String> {
+fn upstream_wins(w: &mut World) -> Result<(), String> {
     for c in &w.collisions[w.collisions_checked..] {
-        if !decided_at_the_parents_queue(w, c) {
+        if !decided_at_the_upstreams_queue(w, c) {
             return Err(format!(
-                "{c:?}: not decided at the parent's queue (result {} in {}, loser from {})",
+                "{c:?}: not decided at the upstream's queue (result {} in {}, loser from {})",
                 w.trailer(&c.result, "Agentfs-Cause"),
                 w.trailer(&c.result, "Agentfs-Tree"),
                 w.trailer(&c.loser, "Agentfs-Tree"),
@@ -727,7 +727,7 @@ fn parent_wins(w: &mut World) -> Result<(), String> {
             .zip(&c.lost)
             .all(|(l, x)| !r.holds(x) && r.member(l) == win.member(l));
         if !kept || !named || c.lines.is_empty() {
-            return Err(format!("{c:?}: the parent's version did not win"));
+            return Err(format!("{c:?}: the upstream's version did not win"));
         }
         let mut pairs = c.lost.iter().zip(&c.won);
         let real = match c.by {
@@ -770,8 +770,8 @@ fn parent_wins(w: &mut World) -> Result<(), String> {
     Ok(())
 }
 
-/// Rule 3e, read from git: no partial save or transaction ever reaches a
-/// parent. The change a take judged (a save, a transaction's commit, a
+/// Rule 3e, read from git: no partial save or transaction ever reaches an
+/// upstream. The change a take judged (a save, a transaction's commit, a
 /// landing commit, or a transaction's branch at its commit) either lost,
 /// named by a collision of that take, or won, never both; the versions its
 /// own edit set (its diff from its base, read from git) are, for one that
@@ -923,7 +923,7 @@ fn losers_pushed(w: &World) -> Result<(), String> {
 /// on `c.tree`, and its losing commit was made in a fork strictly below
 /// `c.tree` (a nested fork's commit can reach it by fast-forward), or on
 /// the branch of a transaction of fork `c.tree`.
-fn decided_at_the_parents_queue(w: &World, c: &Collision) -> bool {
+fn decided_at_the_upstreams_queue(w: &World, c: &Collision) -> bool {
     let cause = w.trailer(&c.result, "Agentfs-Cause");
     if w.trailer(&c.result, "Agentfs-Tree") != World::name(c.tree) {
         return false;
@@ -951,11 +951,11 @@ fn decided_at_the_parents_queue(w: &World, c: &Collision) -> bool {
     }
 }
 
-/// Whether the parent's line `x`, which a sync left out of `r`, stands in front
-/// of the sandbox's line `o`, read from the parent's file `u` and the sandbox's
+/// Whether the upstream's line `x`, which a sync left out of `r`, stands in front
+/// of the fork's line `o`, read from the upstream's file `u` and the fork's
 /// `ours` before the sync. A line `u` holds keeps its place there (R10.7), so
 /// where `u` holds `o`, by `u`'s order; where `ours` holds both, by its order.
-/// Otherwise a sync places `o` past lines the sandbox never saw, up to the next
+/// Otherwise a sync places `o` past lines the fork never saw, up to the next
 /// line it did see, so `x` stands behind `o` only if `u` has such a line before
 /// `x` that `r` holds after `o`.
 fn in_front_of(u: &Content, ours: &Content, r: &Content, x: &Line, o: &Line) -> bool {
@@ -984,29 +984,29 @@ fn ends_open(l: &Line) -> bool {
     l.text().is_some_and(|t| !t.ends_with('\n'))
 }
 
-/// The versions `parent` had taken within the first `entered` records.
-fn taken_by(w: &World, parent: Tree, entered: usize) -> BTreeSet<&str> {
+/// The versions `upstream` had taken within the first `entered` records.
+fn taken_by(w: &World, upstream: Tree, entered: usize) -> BTreeSet<&str> {
     w.entered[..entered]
         .iter()
-        .filter(|(x, _)| *x == parent)
+        .filter(|(x, _)| *x == upstream)
         .map(|(_, e)| e.token.as_str())
         .collect()
 }
 
-/// P2: a version `parent` took only in takes a sync of its commit `up` holds
+/// P2: a version `upstream` took only in takes a sync of its commit `up` holds
 /// back (the take's result commit is not in `up`, read from git).
-fn held_back(w: &World, parent: Tree, up: &str, id: &str) -> bool {
+fn held_back(w: &World, upstream: Tree, up: &str, id: &str) -> bool {
     let mut takes = w
         .landings
         .iter()
-        .filter(|l| l.tree == parent)
+        .filter(|l| l.tree == upstream)
         .filter(|l| w.edits(&l.base, &l.change).iter().any(|e| e.token == id))
         .peekable();
     takes.peek().is_some() && takes.all(|l| !w.is_ancestor(&l.result, up))
 }
 
-/// R10.6 at one sync: `x`, the parent's version in `u` of a line the sync's
-/// result `r` left out, is the parent's unfinished last line and stands in front
+/// R10.6 at one sync: `x`, the upstream's version in `u` of a line the sync's
+/// result `r` left out, is the upstream's unfinished last line and stands in front
 /// of a live line of `r` still undecided at that sync.
 fn r10_6_hides(
     u: &Content,
@@ -1024,10 +1024,10 @@ fn r10_6_hides(
 
 /// Line `line` of `path`, whose version `token` entered `t`, is out of `t`'s
 /// file because `t`'s last sync hid it under R10.6: that sync's result lacks it,
-/// and the parent's version in the commit it delivered was written over `token`
+/// and the upstream's version in the commit it delivered was written over `token`
 /// and is hidden by [`r10_6_hides`]. So the next sync, which delivers the
-/// parent's decision, must bring the line back or fail here, and a line that
-/// left any other way (a save, a sync with no such reason, a parent's version
+/// upstream's decision, must bring the line back or fail here, and a line that
+/// left any other way (a save, a sync with no such reason, an upstream's version
 /// not written over `token`) fails. The owner, 2026-11-06, finding 35: "A is fine".
 fn hidden_by_r10_6(w: &World, t: Tree, path: &str, line: &str, token: &str) -> bool {
     let Tree::Fork(f) = t else {
@@ -1043,38 +1043,38 @@ fn hidden_by_r10_6(w: &World, t: Tree, path: &str, line: &str, token: &str) -> b
     if r.member(line).is_some() || !w.lineage.descends(&x.id, token) {
         return false;
     }
-    let parent = w.forks[&f].parent;
-    let took = taken_by(w, parent, *entered);
+    let upstream = w.forks[&f].upstream;
+    let took = taken_by(w, upstream, *entered);
     let ours = commit_parents(w.repo(), result)
         .first()
         .map(|c| w.file(c, path));
     r10_6_hides(&u, ours.as_ref(), &r, x, |o| {
-        !is_root(&o.id) && (!took.contains(o.id.as_str()) || held_back(w, parent, up, &o.id))
+        !is_root(&o.id) && (!took.contains(o.id.as_str()) || held_back(w, upstream, up, &o.id))
     })
 }
 
 /// Rule 3 per sync, as of the moment its take began: the fork now holds
-/// the parent's version of every line, except where it holds its own
-/// version the parent's queue had not decided then (that version had not
-/// entered the parent), or had decided only in a take a prefix sync holds
-/// back (P2: the take's result commit is not in the parent commit the
-/// sync delivered, read from git). A sync carries the parent's decided
-/// state: a fork version the parent already took is replaced by the
-/// parent's version, whichever won. Two parent's lines may be absent while
-/// the sandbox's own line is undecided, each only where the rule says: its
+/// the upstream's version of every line, except where it holds its own
+/// version the upstream's queue had not decided then (that version had not
+/// entered the upstream), or had decided only in a take a prefix sync holds
+/// back (P2: the take's result commit is not in the upstream commit the
+/// sync delivered, read from git). A sync carries the upstream's decided
+/// state: a fork version the upstream already took is replaced by the
+/// upstream's version, whichever won. Two upstream's lines may be absent while
+/// the fork's own line is undecided, each only where the rule says: its
 /// unfinished last line in front of that line (R10.6), and a line behind that
-/// line when it is unfinished (R10.9), which the sandbox never held or holds
+/// line when it is unfinished (R10.9), which the fork never held or holds
 /// only as its own delete (finding 43).
 fn syncs_deliver(w: &mut World) -> Result<(), String> {
     for (t, up, result, entered) in &w.syncs[w.syncs_checked..] {
         let Tree::Fork(f) = t else {
             return Err("main synced".into());
         };
-        let parent = w.forks[f].parent;
-        let took = taken_by(w, parent, *entered);
-        let held_back = |id: &str| held_back(w, parent, up, id);
+        let upstream = w.forks[f].upstream;
+        let took = taken_by(w, upstream, *entered);
+        let held_back = |id: &str| held_back(w, upstream, up, id);
         let decided = |id: &str| is_root(id) || took.contains(id);
-        // Finding 11: the parent gave file `p` a path that the fork's own
+        // Finding 11: the upstream gave file `p` a path that the fork's own
         // undecided name of another file holds there, or (a chain) a file
         // shown under its previous name by this same exception holds
         // there; the fork keeps showing `p` under the name it had (the one
@@ -1119,16 +1119,16 @@ fn syncs_deliver(w: &mut World) -> Result<(), String> {
                 if clash && x.line == u.name.line {
                     continue;
                 }
-                // excuse: R3d the fork keeps its own lines the parent's queue has not decided
+                // excuse: R3d the fork keeps its own lines the upstream's queue has not decided
                 // excuse: R9.3 a prefix sync holds back the commits from the first to an open file
                 if theirs.is_none_or(|u| u.id != x.id) && decided(&x.id) && !held_back(&x.id) {
                     return Err(format!(
-                        "a sync of {up:.7} into {t:?} left {p}[{}] at {}, which {parent:?} already took, not its {theirs:?}",
+                        "a sync of {up:.7} into {t:?} left {p}[{}] at {}, which {upstream:?} already took, not its {theirs:?}",
                         x.line, x.id
                     ));
                 }
             }
-            // The sandbox's lines still undecided, for what a sync may hide.
+            // The fork's lines still undecided, for what a sync may hide.
             let own_writer = w.forks[f].writer.as_str();
             let undecided = |o: &Line| !decided(&o.id) || held_back(&o.id);
             let ours = commit_parents(w.repo(), result)
@@ -1137,9 +1137,9 @@ fn syncs_deliver(w: &mut World) -> Result<(), String> {
             let in_front =
                 |x: &Line, o: &Line| ours.as_ref().is_some_and(|m| in_front_of(&u, m, &r, x, o));
             let hidden = |x: &Line| {
-                // excuse: R10.6 the parent's unfinished last line in front of an undecided line
+                // excuse: R10.6 the upstream's unfinished last line in front of an undecided line
                 let before_own = r10_6_hides(&u, ours.as_ref(), &r, x, undecided);
-                // excuse: R10.9 the parent's lines after an undecided unfinished line, which the sandbox never held or holds only as its own delete
+                // excuse: R10.9 the upstream's lines after an undecided unfinished line, which the fork never held or holds only as its own delete
                 let after_own = x.live()
                     && ours.as_ref().is_some_and(|m| {
                         m.member(&x.line)
@@ -1397,8 +1397,8 @@ fn one_writer(w: &mut World, all: &[String]) -> Result<(), String> {
 /// without the rename. (The rename without the unlink would leave two
 /// files at one path, which the model refuses outright.) One exception, a
 /// cost: a fork that holds a name version of the renamed file other than
-/// its parent's (it has not synced since the parent's queue decided it), or
-/// a sandbox's version main has not taken (a sync kept it as undecided, in
+/// its upstream's (it has not synced since the upstream's queue decided it), or
+/// a fork's version main has not taken (a sync kept it as undecided, in
 /// this fork or a tree above it that this fork synced from); main has no
 /// such exception. A delete of the renamed file that agrees with one written
 /// over the rename is not half a rename-over (R10.3, [`deleted_over`]).
@@ -1413,10 +1413,10 @@ fn rename_overs_whole(w: &World) -> Result<(), String> {
             if !n.live() && deleted_over(w, *t, by, by, v) {
                 continue;
             }
-            // excuse: R3a a fork keeps its own undecided name version until the parent decides
+            // excuse: R3a a fork keeps its own undecided name version until the upstream decides
             let undecided = match t {
                 Tree::Fork(f) => {
-                    w.file(&w.head(w.forks[f].parent), by).name.id != n.id
+                    w.file(&w.head(w.forks[f].upstream), by).name.id != n.id
                         || (writer_of(&n.id).starts_with('c')
                             && w.file(&w.main_head, by).name.id != n.id)
                 }
@@ -1680,9 +1680,9 @@ fn full_lineage(w: &mut World) -> Result<(), String> {
 /// own file. Rule 10's placement: a new line a winning change added
 /// (an identity its base lacks) that the take placed is put after the
 /// nearest line before it in the change's file that the result holds,
-/// past only lines the change never saw (a parent's concurrent new lines:
-/// of two inserts at one place the parent's comes first), and no line the
-/// parent added that the change never saw directly follows it. Rule 11: a
+/// past only lines the change never saw (an upstream's concurrent new lines:
+/// of two inserts at one place the upstream's comes first), and no line the
+/// upstream added that the change never saw directly follows it. Rule 11: a
 /// change that edits a file the tree had unlinked before the take (and does
 /// not unlink it too, nor create it: an unborn file) loses, by a file rule. Counts each in the world, so
 /// a run can show it met them.
@@ -1690,7 +1690,7 @@ fn placed_and_unlinked(w: &mut World) -> Result<(), String> {
     let mut met = (0, 0);
     for l in &w.landings[w.placements_checked..] {
         let (u, base) = (&l.change, &l.base);
-        // R10.4, read from git: a landing leaves no line after the parent's
+        // R10.4, read from git: a landing leaves no line after the upstream's
         // unfinished last line.
         if l.direction == Direction::Landing {
             for p in PATHS {
@@ -1709,7 +1709,7 @@ fn placed_and_unlinked(w: &mut World) -> Result<(), String> {
                     .nth(1)
                 {
                     return Err(format!(
-                        "{u:.7}'s line {} in {p} comes after the parent's unfinished last line {}",
+                        "{u:.7}'s line {} in {p} comes after the upstream's unfinished last line {}",
                         x.id, q.id
                     ));
                 }
@@ -1786,7 +1786,7 @@ fn placed_and_unlinked(w: &mut World) -> Result<(), String> {
                     && !saw(&x.line)
                 {
                     return Err(format!(
-                        "{u:.7}'s new line {} in {p} comes before the parent's {} at its place",
+                        "{u:.7}'s new line {} in {p} comes before the upstream's {} at its place",
                         n.id, x.id
                     ));
                 }

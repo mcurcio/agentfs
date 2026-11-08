@@ -9,7 +9,7 @@ foundation the implementation follows); this page does not restate them.
 
 ## What the model is for
 
-`crates/agentfs-model` runs the target design on the real `git` program: main and each sandbox are branches,
+`crates/agentfs-model` runs the target design on the real `git` program: main and each fork are branches,
 every save is a commit, and the rules decide what each tree shows. It is tests only and depends on no other
 agentfs crate. A design rule counts as designed when the model encodes it, its scenario tests show it, and
 every invariant holds after every step of every run. A rule that exists only in prose is not yet designed.
@@ -103,7 +103,7 @@ the expected failure.
 | `finding_1_git_merge_base_on_crossing_merges` | 1 | a sync leaves a line "which Main already took" |
 | `random_interleavings_git_merge_base` | 1 | 38 of 64 seeds since the name locks of finding 46 (2026-11-07; 40 before them), 2 of them (seeds 32 and 46) a "harness panic: a model file in git": a sync that leaves a line "which Main already took" or drops a line (with the calls of programs outside a transaction, 2026-11-05; 34 with no P3 and the prefix sync; 35 after the fix pass of the review of 2026-11-04, whose generator changes move the random calls; with creates, crashes and the progress rules 36; with the byte calls alone 32; before them 39 of 64, 2 of them a "harness panic: a model file in git", when git's merge leaves one line identity twice) |
 | `finding_6_git_hunks_on_neighbouring_lines` | 6 | a sync leaves a line "which Main already took" |
-| `finding_30_a_transactions_line_after_the_sandboxs_unfinished_line` | 30 | two lines read as one, `}n9` |
+| `finding_30_a_transactions_line_after_the_forks_unfinished_line` | 30 | two lines read as one, `}n9` |
 | `finding_48_a_kept_file_takes_the_parents_last_lines_and_keeps_its_own` | 48 | replay: `one_writer: merge ... originates 24:1 of file 1` |
 | `finding_49_a_take_recorded_past_a_close_picks_the_earlier_entry` | 49 | the fresh model: `Main:c shows "-\n-\n-\n-\n-\n-\n"`, the trace `"-\nt\n..."` |
 
@@ -215,21 +215,21 @@ A planted bug is one deliberate mistake in a copy of the model. It shows which t
    `mkdir -p <scratch>/m1 && git ls-files -z -co --exclude-standard | tar --null -T - -cf - | tar -xf - -C <scratch>/m1`.
    (Restore or commit a deleted tracked file first: `tar` stops on a listed file that is gone.)
 2. Plant exactly one bug per copy, in the code a rule depends on. Bugs that have proved useful: a sync that
-   decides a collision itself; the sandbox winning instead of the parent; dropping a flag a later step reads;
+   decides a collision itself; the fork winning instead of the upstream; dropping a flag a later step reads;
    skipping a lock release when a client dies; an append that ignores where the file ends; skipping the ref
    that keeps a losing commit reachable; applying the lines of a losing save that did not collide; letting a
    transaction's clean lines apply when one of its lines lost; a file-rule loss that does not cost its whole change; a judge that skips one of a take's changes (only the
    `gitledger` check sees it at the step); a landing that locks only the files its plan writes; an append onto a partial last line that adds a line instead of finishing it; a landing that lets a line follow the
-   parent's unfinished last line; a
+   upstream's unfinished last line; a
    hole filled with other bytes than NUL; a collision record in the wrong commit, or none;
-   placing an incoming insert before the parent's at one place; letting an edit of a file the parent unlinked
-   apply; an entry going ahead of an earlier waiting one it shares a file with, or one of its own sandbox (P1); an
+   placing an incoming insert before the upstream's at one place; letting an edit of a file the upstream unlinked
+   apply; an entry going ahead of an earlier waiting one it shares a file with, or one of its own fork (P1); an
    atomic save that
    leaves the replaced file's old object at its path; a crash whose replay saves an open a save already names, or
    drops the journal. From the review of 2026-11-04: a crash replay that re-links each open to its file identity
    (a dead handle saved into the file that replaced it); a waiting take that records only its files open now; a
    crash that drops a transaction's journaled calls. From the owner's decisions of 2026-11-04: P3 reintroduced (a
-   new write-open waits behind a waiting take); a sync that delivers the parent's head whatever is open (past an open
+   new write-open waits behind a waiting take); a sync that delivers the upstream's head whatever is open (past an open
    file); a sync that never delivers a prefix (it waits whole); and
    each fix of findings 11, 25 and 26 reverted. From R5.3: a close of a transaction's file that saves at once; deferred
    calls applied out of order; a rollback that drops them; a crash that drops them.
@@ -318,7 +318,7 @@ What a replay decides, each reported rather than hidden:
 - **A take.** A real take is one step, at `take_next`, so a model call during a hold replays after it and trees are
   compared only with no take in progress. Three orderings follow from that, all in `world.rs`'s recording: a call that
   waited for a take is recorded when it runs, under the name its file has then; main's take is recorded after a fork or
-  a sandbox's queue step made during its hold, because those read main without it, and after a call that commits on main during
+  a fork's queue step made during its hold, because those read main without it, and after a call that commits on main during
   it, because that commit goes before the landing in the model's history; and a queue step that only marks a
   wait while another entry is free is not a call, since a real take goes on to the free entry. A take a crash ended
   wrote nothing in the model, so it is not made. A take recorded later than it began can pick another entry at its recorded
@@ -334,7 +334,7 @@ What a replay decides, each reported rather than hidden:
 | R9, R9.7: a client call waiting on a take | assumed by replay order; only `Waiting` of takes is compared | mounted P1/P2 cases, finite, no seeds |
 | R12 mid-step or with unsynced loss | crash between calls only | recording-faults, power-loss jobs |
 | ENOSPC, EIO | no injected failure; `errno` compared only library against mount | enospc job |
-| Trace with two forks | library only (§18 asks one sandbox) | - |
+| Trace with two forks | library only (§18 asks one fork) | - |
 | Automatic takes (R1) | a mount takes only through the gate | mounted P1/P2 cases |
 | R1.3 an open's own read, R1.1 another reader | on the trait, not compared: `Shown` does not hold them | byte and page-cache jobs |
 

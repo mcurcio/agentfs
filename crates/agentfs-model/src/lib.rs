@@ -10,12 +10,12 @@
 //!
 //! [`world`] drives the real `git` program in a temporary repository: main
 //! and each fork are branches, each save a commit naming one writer. A
-//! collision between a fork and its parent is decided only at the parent's
-//! landing queue, per line: a line written over the parent's replaces it,
-//! and of two concurrent lines the parent's wins; a change (a save, the
+//! collision between a fork and its upstream is decided only at the upstream's
+//! landing queue, per line: a line written over the upstream's replaces it,
+//! and of two concurrent lines the upstream's wins; a change (a save, the
 //! whole file at one close, or a transaction) with a line that lost loses
 //! whole. A sync decides nothing:
-//! the fork takes the parent's decided version, keeping only its own lines
+//! the fork takes the upstream's decided version, keeping only its own lines
 //! still on their way to that queue. Every losing commit keeps a collision
 //! ref and a record in its take's result commit, which a separate
 //! Replication step pushes with main to a bare shared remote. A file is a

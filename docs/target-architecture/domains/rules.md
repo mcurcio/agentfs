@@ -34,7 +34,7 @@ program cannot steer its own recording. Not chosen: tree rules, which let a rule
 recording once it lands or syncs.
 
 **Design choice: a view profile is a base plus operator hide patterns, narrowing only.** `Everything` (main) or
-`Recordable` (sandboxes), plus patterns that hide more; a profile never shows what its base hides (RU3).
+`Recordable` (forks), plus patterns that hide more; a profile never shows what its base hides (RU3).
 
 ## 2. The public contract
 
@@ -148,9 +148,9 @@ recorded. Names that are not `RelPath`s (a `.git` component, git's refused spell
 | Test (through the real artifact unless marked) | Rules out |
 |---|---|
 | A corpus of paths and rule files gives the same answers as `git check-ignore` and `git check-attr` | drift from git's semantics |
-| Through a mounted sandbox view: a hidden name present and absent gives the same lookup, listing and create answers | existence leaking through a profile (RU3) |
-| A landing that adds a hidden name; the sandbox never sees it | a landed name judged differently from a written one |
-| A database with its `-wal` excluded: the sandbox sees neither file; a save is refused whole | half a database shown or recorded (RU4) |
+| Through a mounted fork view: a hidden name present and absent gives the same lookup, listing and create answers | existence leaking through a profile (RU3) |
+| A landing that adds a hidden name; the fork never sees it | a landed name judged differently from a written one |
+| A database with its `-wal` excluded: the fork sees neither file; a save is refused whole | half a database shown or recorded (RU4) |
 | A bad attribute, an unknown group kind, an unreadable source: the service refuses to start, naming the line | a typo turning recording or a profile off (RU2) |
 | Unit (pure): `Containment::Unknown` answers like `InRepository`; hide patterns never turn `Hide` into `Show` | fail-open on missing facts |
 
@@ -161,7 +161,7 @@ recorded. Names that are not `RelPath`s (a `.git` component, git's refused spell
 3. **A move is two judgements:** a removal at the source and a placement at the target, so moving a recorded file to
    a scratch name removes it from the tree's history.
 4. **Group kinds list their member suffixes:** a database whose sidecar files no kind lists is recorded without them.
-5. **Sandboxes see symlinks read-only** and cannot create them, as today.
+5. **Forks see symlinks read-only** and cannot create them, as today.
 
 ## New terms
 

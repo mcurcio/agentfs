@@ -1,6 +1,6 @@
 //! Fixed phase 1 mounted conformance cases driven by the existing model.
 //!
-//! Each case starts with its base, forks, saves the child then the parent,
+//! Each case starts with its base, forks, saves the child then the upstream,
 //! and drains their queues. Output is JSON with byte strings encoded as hex.
 //! This runs only the named cases, not the model's random or verification suites.
 use agentfs_model::git::git;

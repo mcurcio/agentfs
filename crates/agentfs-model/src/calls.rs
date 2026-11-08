@@ -18,7 +18,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
-/// Who makes a call: one of main's programs, or a sandbox's.
+/// Who makes a call: one of main's programs, or a fork's.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Caller {
     Main(String),

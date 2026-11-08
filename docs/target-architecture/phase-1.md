@@ -32,7 +32,7 @@ transaction behavior or snapshot-open mechanism is introduced.
 | `2a33e90` | Journal-kill and allocation-forcing `ENOSPC` write checks pass in the [fault log](https://github.com/mcurcio/agentfs/actions/runs/42223004088/job/127909394344); the supplementary full-state rename returns `EIO` rather than its test's expected `ENOSPC`. Power replay still fails: [ext4](https://github.com/mcurcio/agentfs/actions/runs/42223004088/job/127909394603) reports a corrupt reftable; [XFS](https://github.com/mcurcio/agentfs/actions/runs/42223004088/job/127909394686) cannot recover the reference store |
 | `06663b4` | The journal as commit point. Kills at every journal, object, commit-point, ref-copy, checkout, rebuild, compaction and first-init failpoint, and real `ENOSPC` before and after the commit point, pass in the [fault job](https://github.com/mcurcio/agentfs/actions/runs/42295808940/job/128160614784). Power replay passes on [ext4](https://github.com/mcurcio/agentfs/actions/runs/42295808940/job/128160614975) (724 checkpoints) and [XFS](https://github.com/mcurcio/agentfs/actions/runs/42295808940/job/128160614951) (408), each also rebuilding the refs from the journal alone. Planted bugs: dropping `core.fsync` for objects [fails both](https://github.com/mcurcio/agentfs/actions/runs/42296893603). Dropping the journal's fsync per record ([run](https://github.com/mcurcio/agentfs/actions/runs/42296883413), branch `wip/agentfs-eh5.1-m1.15`) and the object directory syncs ([run](https://github.com/mcurcio/agentfs/actions/runs/42296888045), `wip/agentfs-eh5.1-m1.16`) pass both, so **those two orderings are unproved**: the workload fsyncs before every close, and a fsync on these filesystems may carry the new directory entry too |
 | `3016140` | Shared mappings as R1.4 words them, on kernel 7.0.0-1017-azure. All 21 page-cache cases, `trees-mmap`, 64 closes reopened at once over a busy view (same process and another) and the view-host restart pass in the [page-cache job](https://github.com/mcurcio/agentfs/actions/runs/42312178878/job/128216066550). Planted bugs: ignoring `FUSE_WRITE_CACHE` [passes 13 of 21 cases](https://github.com/mcurcio/agentfs/actions/runs/42309475616) (M3.8, branch `wip/agentfs-eh5.3-m3.8`), no lock-owner route [passes 5 of 21](https://github.com/mcurcio/agentfs/actions/runs/42309478789) (M3.9), a size only with page state [fails `create-then-map` and `grown-mapping`](https://github.com/mcurcio/agentfs/actions/runs/42309480548) (M3.10), no invalidation after a take [fails `take-refreshes-mapping`](https://github.com/mcurcio/agentfs/actions/runs/42309484689) (M3.11), `max_background` 16 [reads old bytes in 4 and 1 of 64 reopens](https://github.com/mcurcio/agentfs/actions/runs/42312191546) (M3.12), an object found by name at restart [fails the replaced file](https://github.com/mcurcio/agentfs/actions/runs/42309490679) (M3.13). The close-to-open row rests on this kernel and on the source of v6.8, v6.14 and v7.0: a readahead in flight on the handle was not exercised |
-| `e270061` | The model's recorded calls, [replayed on CI](https://github.com/mcurcio/agentfs/actions/runs/42330151965/job/128274575889). A fresh model: 69 scenario traces and all 94 seed traces. The library: 69 and 78, with 16 seed traces failing on findings 36 to 41. Real mounts, on kernel and git as the other rows: 66 and 16, none mismatched; 81 in-scope traces are not mountable (two forks, a fork after a client call, or one open that both appends and writes at an offset), and those include all 16 that fail on the library. **So the mount replay passing does not cover the findings.** Planted bugs, all caught: on mounts, [R10.8 off](https://github.com/mcurcio/agentfs/actions/runs/42330173796) (M4.1, branch `wip/agentfs-eh5.4-m4.1`); locally on the library, M4.2 to M4.7 and three more for `one_writer`, `no_duplicate_opens` and `loser_reachable`; M4.8 on the model. Not tripped by any planted bug: `full_lineage`, `converged`, `parent_kept` |
+| `e270061` | The model's recorded calls, [replayed on CI](https://github.com/mcurcio/agentfs/actions/runs/42330151965/job/128274575889). A fresh model: 69 scenario traces and all 94 seed traces. The library: 69 and 78, with 16 seed traces failing on findings 36 to 41. Real mounts, on kernel and git as the other rows: 66 and 16, none mismatched; 81 in-scope traces are not mountable (two forks, a fork after a client call, or one open that both appends and writes at an offset), and those include all 16 that fail on the library. **So the mount replay passing does not cover the findings.** Planted bugs, all caught: on mounts, [R10.8 off](https://github.com/mcurcio/agentfs/actions/runs/42330173796) (M4.1, branch `wip/agentfs-eh5.4-m4.1`); locally on the library, M4.2 to M4.7 and three more for `one_writer`, `no_duplicate_opens` and `loser_reachable`; M4.8 on the model. Not tripped by any planted bug: `full_lineage`, `converged`, `upstream_kept` |
 | `b1e6d85` | Findings 36 to 41 closed, [replayed on CI](https://github.com/mcurcio/agentfs/actions/runs/42395719726/job/128472547246) on git 2.56.0: a fresh model and the library each 72 scenario traces and all 94 seed traces, mounts 69 and 16, none mismatched, none listed. [ci](https://github.com/mcurcio/agentfs/actions/runs/42395719692) and [image](https://github.com/mcurcio/agentfs/actions/runs/42395719725) passed. |
 | `e881bca` | The library at seeds 1 to 500 of the phase 1 generators, [four jobs](https://github.com/mcurcio/agentfs/actions/runs/42393965025) of about 50 minutes: 976 of 1,000 traces pass, 24 mismatch (findings 44 to 47). The same seeds' mechanisms fail on the code before these fixes. |
 | `5871b19` | Findings 42 to 47 closed by the owner's answers of 2026-11-07, on git 2.47.3 in every job ([phase-1 run](https://github.com/mcurcio/agentfs/actions/runs/42415551804)): a fresh model and the library each 74 scenario traces and all 94 seed traces, mounts 71 and 16, none mismatched. At seeds 1 to 500 the library passes 989 of 1,000 traces; the other 11 are findings 48 (8) and 49 (3), open for the owner. The model passes all 3,000 runs of seeds 1 to 500, locally. |
@@ -47,18 +47,18 @@ correction, not a new landing rule.
 | Milestone | Status |
 |---|---|
 | Recording, byte calls and object lifetime | Descriptor, byte and orphan cases pass; shared mappings follow R1.4 and the restart row follows §18 as reworded: read the phase-1 page-cache job |
-| Line-map storage and whole-save parent referee | Connected; R10.8 and R10.9 built; mounted result of findings 32 and 33: read the phase-1 conformance job |
+| Line-map storage and whole-save upstream referee | Connected; R10.8 and R10.9 built; mounted result of findings 32 and 33: read the phase-1 conformance job |
 | Live landing/sync, P1/P2, writer locks, no alarm | Mounted finite progress scenarios pass; the wait counts of one held-log run are in the [handoff](phase-1-handoff.md#measurements) |
 | Journal kills, state exhaustion and power loss | The journal is the commit point for pointer steps; refs are a copy rebuilt on every open. Each row's evidence is in CI for the commit that claims it |
 | Model conformance and §18 measurements | The replay passes at CI's seeds, findings 36 to 47 closed by the owner's answers of 2026-11-07. Findings 48 and 49 are open for the owner, both from seeds 1 to 500 on the library. The §18 measurements report on `964618a` and `12bd7a8` ([handoff](phase-1-handoff.md#measurements)): journal against plain FUSE, hour, 10,000 saves, 1 and 100 MiB, waits and the held log. No figure is a budget; 10,000 saves took 2,411 s once the history walk and the per-line Git calls were fixed |
 
 Known model finding 32 reproduced on the real mount: a losing truncate to `y`,
-followed by an offset write of `n6` before the parent decision was readable,
+followed by an offset write of `n6` before the upstream decision was readable,
 left live lines `n6` and `m1.1\n` joined as `n6m1.1\n`. Its pure diagnostic is
 enabled and passes now; the mounted case has no expected-failure waiver.
-R10.8 decides this as a parent-winning collision: the later save loses whole
+R10.8 decides this as an upstream-winning collision: the later save loses whole
 and stays in history (`land_save`, `tree_line_rules.rs`). R10.9 hides the
-parent's later lines behind an undecided unfinished line at a sync. Passing these
+upstream's later lines behind an undecided unfinished line at a sync. Passing these
 cases does not validate the whole phase.
 
 The page-cache probe uses independent opens in one tree. With two writable
@@ -99,9 +99,9 @@ target/debug/agentfs --state /tmp/agentfs-trees/state trees mount \
 ```
 
 Use ordinary file calls in either view. Each close saves in its own tree;
-queues carry changes automatically between main and the sandbox. The parent
+queues carry changes automatically between main and the fork. The upstream
 referee decides collisions and retains losing saves. The process prints the
-sandbox's `fork/N` name. Reuse it with `--fork fork/N`; `trees fork` creates one
+fork's `fork/N` name. Reuse it with `--fork fork/N`; `trees fork` creates one
 without mounting. Unmount both views with `fusermount3 -u PATH` to exit.
 Mountpoints must be empty, separate from each other and outside state. Writer
 labels are trusted labels, not authenticated identities.
@@ -134,7 +134,7 @@ histogram diff. Merge-file identity is separate from an open object's identity;
 renaming a newly written temporary over a target preserves the target's merge
 identity while orphaning the old object. Old handles cannot modify a replacement.
 
-Main and one sandbox share a bare Git repository. Each new commit stores workload
+Main and one fork share a bare Git repository. Each new commit stores workload
 files under `files/`, line maps in `metadata.json`, and name versions in
 `namespace.json`; `Agentfs-Format: envelope-1` identifies this layout. These
 private metadata names do not reserve names in the workload's root. Collision

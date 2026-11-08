@@ -141,13 +141,13 @@ R5.2's question, does a transaction declare its program: this design does not ne
 | Rule | Becomes | `Gone when` (all found in the model; a rejected rule must drop its `Tests:`, which the check also reads) |
 |---|---|---|
 | R9 | rejected | `struct Hold`, `fn grant`, `fn wake`, `waiting_for`, `pub waiting`, `r9_a_sync_waits_for_an_open_writer_then_applies`, `r9_a_write_open_waits_while_a_sync_holds_the_file` |
-| R9.1 | rejected | `r9_a_landing_waits_for_the_parents_open_writer`, `r9_a_landing_holds_the_files_of_its_losing_changes` |
+| R9.1 | rejected | `r9_a_landing_waits_for_the_upstreams_open_writer`, `r9_a_landing_holds_the_files_of_its_losing_changes` |
 | R9.3 | rejected | `struct Prefix`, `fn prefix`, `held_back`, `r9_a_sync_delivers_up_to_the_first_change_to_an_open_file`, `r9_a_prefix_sync_holds_back_a_transaction_whole` |
 | R9.4 | rejected | `fn acquire` |
 | R9.5 | rejected | `struct Waiting`, `p1_scan`, `fn eligible`, `fn hint`, `r9_a_long_lived_main_writer_holds_back_only_its_own_file`, `r9_under_either_setting_a_held_file_holds_back_only_its_saves`, `r9_a_writer_holding_a_waited_file_is_not_made_to_wait`, `r9_new_writers_postpone_a_waiting_take_and_raise_an_alarm` |
 | R9.7 | rejected | `r11_an_unlink_or_rename_of_a_held_file_waits` |
 | R9.9 | rejected | `r9_a_prefix_sync_delivers_no_upstream_decision_before_its_commit`, `r9_a_prefix_sync_holds_back_the_notes_of_the_commits_it_holds_back` |
-| R6.1, if Q3 (a) | rejected | `fn adopt`, `fn keep_own_names`, `r6_a_sync_is_a_merge_with_the_parent_second`, `r3_a_sync_keeps_the_undecided_saves` (R6 then names another test) |
+| R6.1, if Q3 (a) | rejected | `fn adopt`, `fn keep_own_names`, `r6_a_sync_is_a_merge_with_the_upstream_second`, `r3_a_sync_keeps_the_undecided_saves` (R6 then names another test) |
 
 "Rejected" here means superseded: R9.11 says these parts go, and the ledger has no other status (P2-17; I add none).
 **Change wording:** R9.2 keeps "no program's open ever waits on a landing", loses "may wait forever" (P2-14). R9.11 "merged line by line" points to R9.12; under Q3 (a) "applies at once" reads "never waits for a file; a sync waits for the sandbox's own landings". R3d's "keeps ... undecided lines" goes under Q3 (a). R8, R10 "the file's old lines" mean the base's. R12 gains the replay order. R1 "at once" notes R5.3. R3b, R9.15 and R9.16 by Q1. MODEL rule 1's "whatever the tree held" (R1.2's leftover) goes.
@@ -158,7 +158,7 @@ R5.2's question, does a transaction declare its program: this design does not ne
 | `locks`, `alarmed`, `p1_scan`, `prefix_cut`, `step_checked`'s "no sync writes an open file" | go with the rules they check. `no_wait_on_waiting` restated: a call waits only on an actor step |
 | Byte oracle, `save_aligned`, `appends_exact`; new `close_reconciled` | stronger: edit commit = base plus calls, read from its first parent; and (P1-5's gap) every claimed line is in the merge by stage 2's rule, read from git |
 | `one_writer` | the merge may add versions only for its own named writer, with the edit's bytes. R6 unchanged; this drops a design clause, so please see it. All other checks passed in the run |
-| `no_flicker`, `parent_wins`, `changes_whole`; `syncs_deliver` | unchanged, passed in the run; stronger under Q3 (a): after a sync the heads are equal |
+| `no_flicker`, `upstream_wins`, `changes_whole`; `syncs_deliver` | unchanged, passed in the run; stronger under Q3 (a): after a sync the heads are equal |
 | `no_silent_loss` | **weaker, per step, in Q2's window only.** Run: "m1.1 entered Fork(1):a[a0] and is gone"; passes once the parent decides. Not changed without your answer |
 
 | Review finding | Answer | | Review finding | Answer |

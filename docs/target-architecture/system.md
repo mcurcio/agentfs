@@ -39,9 +39,9 @@ Nothing else on these pages is his; everything else is a design choice and says 
 
 | # | His answer | Date | Designed in |
 |---|---|---|---|
-| A1 | Main is a view like any sandbox | 2026-11-01 | [views](domains/views.md) |
-| A2 | A sandbox's client is its own view mount, made by whoever starts the container | 2026-11-01 | [clients](domains/clients.md) |
-| A3 | Sandbox saves land live ("continuous"); integrator patches stay "whenDetached" until he opens them | 2026-11-01 | sandbox saves: git-model §5; patches: not yet designed (§5) |
+| A1 | Main is a view like any fork | 2026-11-01 | [views](domains/views.md) |
+| A2 | A fork's client is its own view mount, made by whoever starts the container | 2026-11-01 | [clients](domains/clients.md) |
+| A3 | Fork saves land live ("continuous"); integrator patches stay "whenDetached" until he opens them | 2026-11-01 | fork saves: git-model §5; patches: not yet designed (§5) |
 | A4 | "A fork whose branches are rejected and never land in the main branch will inevitably be lost, and that's acceptable" | 2026-11-01 | replaced for losing changes by "yes, \"losing\" patches should still be part of the history. i want to know who changed what when" (2026-11-03, git-model §4); still holds for a fork's whole line ([replication](domains/replication.md) §4) |
 | A5 | Consistency: "It depends on the config!" | 2026-11-02 | [views](domains/views.md) §3 |
 | A6 | A pinned fork is an acceptable snapshot | 2026-11-02 | [trees](domains/trees.md), [views](domains/views.md) |
@@ -118,7 +118,7 @@ pub struct TreeName(/* private */);  // a confined name that may fail fsck (a ne
 
 pub enum TreeRef {
     Main,                            // refs/heads/main
-    Fork(ForkId),                    // refs/heads/fork/<id>; its upstream is its parent tree (git-model §2)
+    Fork(ForkId),                    // refs/heads/fork/<id>; its branch tracks its upstream tree's branch (git-model §2)
 }
 pub enum Served {                    // what a view serves
     Tree(TreeRef),
@@ -157,7 +157,7 @@ capabilities bound to it.
 
 | Capability | Minted by | Held by | It can never |
 |---|---|---|---|
-| `LaunchCap { launcher, may: Main \| ForksItCreates, view_profiles }` | the composition root, from deployment config | a launcher | (sandbox launcher) attach to main or a fork it did not create, widen a view profile, create, stage or unstage the volume |
+| `LaunchCap { launcher, may: Main \| ForksItCreates, view_profiles }` | the composition root, from deployment config | a launcher | (fork launcher) attach to main or a fork it did not create, widen a view profile, create, stage or unstage the volume |
 | `ClientCap` | `Clients::attach`, `rebind` (read-write grants only) | the client's session, in the history service | save into another tree or as another writer |
 | `PinCap` | the composition root | Clients | (anyone else) pin a snapshot |
 | `StartCap` | the composition root | Volume (lent to Replication's `fetch_start`) | (anyone else) set where main's line starts |
@@ -165,7 +165,7 @@ capabilities bound to it.
 
 **The view host's calls name no client and no tree.** A write-open, a path call, a save at close and a transaction
 call arrive over a session, whose edge supplies the client, its tree and its `ClientCap`, and refuses writes from a
-session with none: a sandbox never writes main. A session opens only within one `Family`; the rpc edge refuses
+session with none: a fork never writes main. A session opens only within one `Family`; the rpc edge refuses
 another (`OtherFamily(Version)`) before any domain is called.
 
 ### 2.3 Events
@@ -240,7 +240,7 @@ Each mode composes the same domains; none reads a mode flag.
 
 | Composition | History service | View hosts | Health | Who launches clients |
 |---|---|---|---|---|
-| **Sidecar** (`mount`, `run`) | a child process of the sidecar's supervisor | main and each sandbox view, as child processes | the supervisor; the platform's probe judges it | the sidecar |
+| **Sidecar** (`mount`, `run`) | a child process of the sidecar's supervisor | main and each fork view, as child processes | the supervisor; the platform's probe judges it | the sidecar |
 | **History service with view hosts** | `serve-history` | one process per host, many views each | the supervising launcher | each host's launcher |
 | **CSI** | started at stage, runs through Draining | one per publish, plus in-pod launchers' views | the node plugin, told by the in-pod launcher's `watch` | publish and unpublish; the in-pod launcher (`ForksItCreates` only) |
 | **CLI** (`fork`, `status`; `status` opens read-only, lock-free) | lock held: a short-lived service; busy: a control-socket client | none | none | none |
@@ -263,10 +263,10 @@ go", 2026-10-17).
 
 ## 7. Costs and tracer bullet
 
-1. **A sandbox sees a change only once it is closed** (close-to-open, accepted 2026-11-03), and landed changes
+1. **A fork sees a change only once it is closed** (close-to-open, accepted 2026-11-03), and landed changes
    rewrite working-tree files, so hard links across a landing break.
 2. **Every write call is a journal append** before it returns (git-model §3), so a view host's death or restart
-   loses no answered call; it still ends its clients' mounts, and a sandbox's restarted host gets a new fork, since
+   loses no answered call; it still ends its clients' mounts, and a fork's restarted host gets a new fork, since
    a fork has one writer for life ([clients](domains/clients.md)).
 3. **File watchers have no guarantee** (A11): `TreeMoved` and `ViewCaughtUp` are the reliable notices.
 4. **A full checkout per fork** until Trees' storage optimisation serves the same files from less space.
@@ -274,11 +274,11 @@ go", 2026-10-17).
 6. **The architecture is not settled until phase 1 passes** (end-to-end tests, not yet run against current rules) (git-model §18): durable writes, byte-level
    calls, rename-over with open handles and queue progress on a real mount, none of which the model runs.
 
-**Tracer bullet** (design choice). A sidecar runs main's view and one sandbox view: (1) the sandbox closes p; main's
-queue takes it and main's view shows it once caught up; (2) main closes s; the sandbox's queue syncs it and the
-sandbox's view shows it; (3) a main client holds p open while the sandbox's p lands: the take waits, then writes;
-(4) killing the sandbox's view host mid-write leaves main untouched, and the sandbox's answered write calls are
-saved from the journal; (5) while main holds p open, the sandbox's change to q lands without waiting. The git side of each step is git-model's; this bullet
+**Tracer bullet** (design choice). A sidecar runs main's view and one fork view: (1) the fork closes p; main's
+queue takes it and main's view shows it once caught up; (2) main closes s; the fork's queue syncs it and the
+fork's view shows it; (3) a main client holds p open while the fork's p lands: the take waits, then writes;
+(4) killing the fork's view host mid-write leaves main untouched, and the fork's answered write calls are
+saved from the journal; (5) while main holds p open, the fork's change to q lands without waiting. The git side of each step is git-model's; this bullet
 proves the views, sessions and events around it.
 
 **Prior art.** AFS close-to-open consistency · NFS `COMMIT` and write-ahead logging (the journal) · fair
@@ -290,7 +290,7 @@ object capabilities · the transactional outbox · Kubernetes liveness probes ·
 | Term | Definition | Why needed | Could be |
 |---|---|---|---|
 | view host; session | the process serving views, never inside a client; its connection for one client (capabilities stay in the service) | A2, §2.2 | the `mount` process |
-| tree | main or one sandbox's fork: a branch with its working tree (git-model §2) | R3, R5 | backing tree |
+| tree | main (the tree with no upstream) or one fork: a branch with its working tree (git-model §2) | R3, R5 | backing tree |
 | `TreeMoved` | the actor's notice that a tree's branch and working tree moved | views drop caches; pushes start | the older feed's `Recorded` |
 | version, family | a component's semantic version; its major and minor | R16 | release |
 | grant, view profile | what a client may do and see, as data | R7 | role |

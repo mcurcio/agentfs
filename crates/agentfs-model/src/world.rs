@@ -5,15 +5,15 @@
 //! |---|---|
 //! | 1. Like a Linux filesystem | a close ([`World::close`]) is never refused; its save is a commit on the writer's tree at once, its first parent the tree's head at that moment |
 //! | 2. One landing queue per tree | [`World::queue_len`]: a FIFO of [`Entry`]s per tree; a [`Step::Next`] takes its head, or records that it waits (rule 9) |
-//! | 3. The parent's queue decides | `land` (a fork's commit into its parent) is the only place a collision with the parent is decided, through `judge` and `resolve`: per line, a line written over the parent's replaces it, a stale one is dropped, and of two concurrent lines the parent's wins; then each change (a save, a transaction's commit) is judged whole: one lost line and none of it applies (rule 3e). `sync` decides nothing: it takes the parent's version and keeps only the fork's lines the parent's queue has not taken yet |
+//! | 3. The upstream's queue decides | `land` (a fork's commit into its upstream) is the only place a collision with the upstream is decided, through `judge` and `resolve`: per line, a line written over the upstream's replaces it, a stale one is dropped, and of two concurrent lines the upstream's wins; then each change (a save, a transaction's commit) is judged whole: one lost line and none of it applies (rule 3e). `sync` decides nothing: it takes the upstream's version and keeps only the fork's lines the upstream's queue has not taken yet |
 //! | 4. Nothing waits behind a collision | there is no held state: a collision is recorded as a [`Collision`] and in git (a trailer of the take's result commit, [`COLLISION`]), the fork's losing commit kept under `refs/collisions/<n>`, which Replication later pushes to the shared remote with main ([`Step::Replicate`], due on every move of main and every collision), and the queue moves on |
-//! | 5. Transactions | [`World::begin`]: a branch `txn/<n>` frozen at the fork's head; [`World::commit_txn`] lands it in the fork like a child's commit, whole or not at all (the fork is its parent, so the fork's lines win), and answers whether it lost, with every staged line that did not apply; [`World::rollback`] drops it. While one is open, other I/O on its files in the sandbox is accepted and applies in order after it ends ([`Fork::deferred`], R5.3) |
-//! | 6. Attribution | every commit names one writer in an `Agentfs-Writer` trailer; a sync is a merge with the parent's commit as second parent |
+//! | 5. Transactions | [`World::begin`]: a branch `txn/<n>` frozen at the fork's head; [`World::commit_txn`] lands it in the fork like a child's commit, whole or not at all (the fork is its upstream, so the fork's lines win), and answers whether it lost, with every staged line that did not apply; [`World::rollback`] drops it. While one is open, other I/O on its files in the fork is accepted and applies in order after it ends ([`Fork::deferred`], R5.3) |
+//! | 6. Attribution | every commit names one writer in an `Agentfs-Writer` trailer; a sync is a merge with the upstream's commit as second parent |
 //! | 7. Full lineage | a landing is a merge with the fork's commit as second parent (or a fast-forward), so a tree's history reaches every change it took, the losers included; each fork commit lands on its own |
 //! | 8. A save records the write calls | [`World::write`] keeps each byte call ([`Write`]: an `O_APPEND` write, `pwrite`, `ftruncate`; [`World::open_trunc`] for `O_TRUNC`) on the open file; [`World::close`] applies them to the tree's head then: an append's bytes go after the file's last byte, finishing a partial last line (a version of it) and then making new lines; other calls leave bytes the save aligns with the head's lines (rule 10). [`World::edit`] makes a test's line edit as a program's byte calls (`program`) |
 //! | 9. A take locks the files it overwrites | [`World::open_write`]; a [`Step::Next`] whose sync or landing would overwrite a file open for writing in that tree waits ([`World::waits`]) until the close; then it holds its files ([`World::holds`]) until [`Step::Finish`] writes them; a write-open, [`World::unlink`] or [`World::rename`] of a held file waits until then; a client's death ([`World::end_client`], [`World::end_main_client`]) closes its files |
-//! | 10. Line identity | a save derives identities from the bytes at close: it aligns them with the head's lines once, by git's histogram diff (`align`), and records the result: each new line an identity, each changed line a new version written over the version it replaced; the referee and a sync then compare versions of one identity, never bytes or positions (`resolve`, `adopt`, `splice`); a line a landing would put after the parent's unfinished last line collides with it (R10.4), and so does an unfinished line a landing would put in front of a line the parent keeps (R10.8); until the parent decides, a sync hides the parent's unfinished last line in front of an undecided line (R10.6) and the parent's lines after an undecided unfinished line (R10.9) |
-//! | 9, progress (git-model.md §6) | P1: a [`Step::Next`] takes the first entry no earlier waiting entry shares a file or a source with (`scan`), so several may wait ([`World::waits`]); no call ever waits on a waiting entry (P3 is gone, the owner's decision of 2026-11-04): a new open of a file a waiting entry waits for is granted; P2, the prefix sync: a sync delivers the parent's commits in order up to the first whose delivery would overwrite a file open for writing in the fork, and waits for the rest (`prefix`) |
+//! | 10. Line identity | a save derives identities from the bytes at close: it aligns them with the head's lines once, by git's histogram diff (`align`), and records the result: each new line an identity, each changed line a new version written over the version it replaced; the referee and a sync then compare versions of one identity, never bytes or positions (`resolve`, `adopt`, `splice`); a line a landing would put after the upstream's unfinished last line collides with it (R10.4), and so does an unfinished line a landing would put in front of a line the upstream keeps (R10.8); until the upstream decides, a sync hides the upstream's unfinished last line in front of an undecided line (R10.6) and the upstream's lines after an undecided unfinished line (R10.9) |
+//! | 9, progress (git-model.md §6) | P1: a [`Step::Next`] takes the first entry no earlier waiting entry shares a file or a source with (`scan`), so several may wait ([`World::waits`]); no call ever waits on a waiting entry (P3 is gone, the owner's decision of 2026-11-04): a new open of a file a waiting entry waits for is granted; P2, the prefix sync: a sync delivers the upstream's commits in order up to the first whose delivery would overwrite a file open for writing in the fork, and waits for the rest (`prefix`) |
 //! | 11. Deletes and renames | a file's name line: [`World::rename`] writes a new version, [`World::unlink`] a deleted one; `resolve` applies the per-line rule to it and couples a file's existence with its content. [`World::create`] makes a file (an unborn identity); an open holds an object ([`Handle::object`]), so a close saves to the file its object is named by ([`World::named`]) or, for an orphan, nothing ([`Orphan`]); a rename-over from a new file is an atomic save, a rewrite of the replaced file |
 //! | 12. The journal (git-model.md §3) | an open's calls are its journal; [`World::crash`] saves each open from it once (the `Agentfs-Open` trailer, [`World::saved`]), drops calls that never returned and puts takes back in their queues |
 //!
@@ -50,16 +50,16 @@ pub enum Tree {
 /// new version.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MergeRule {
-    /// Per line, from git alone. A sync takes the parent's current version
+    /// Per line, from git alone. A sync takes the upstream's current version
     /// and keeps each fork line whose writing commit (`git blame`) the
-    /// parent's lineage does not reach yet: a line still waiting for the
-    /// parent's queue to decide it. The model's choice.
+    /// upstream's lineage does not reach yet: a line still waiting for the
+    /// upstream's queue to decide it. The model's choice.
     PerLine,
-    /// git's own three-way merge of the parent's current version into the
+    /// git's own three-way merge of the upstream's current version into the
     /// fork (`git merge-tree -X ours`, git's merge base): a conflicting
     /// hunk keeps the fork's side, since a fork never decides a collision.
     /// Crossing syncs and landings give two merge bases, so the fork keeps
-    /// a line the parent already decided against (coherence finding 1); a
+    /// a line the upstream already decided against (coherence finding 1); a
     /// hunk spans neighbouring lines (coherence finding 6).
     GitMergeBase,
 }
@@ -113,7 +113,7 @@ pub struct Txn {
 
 pub struct Fork {
     pub id: ForkId,
-    pub parent: Tree,
+    pub upstream: Tree,
     /// Its one client's writer name.
     pub writer: String,
     pub life: Life,
@@ -130,45 +130,45 @@ pub struct Fork {
 pub enum Entry {
     /// A child fork's commit, to land in this tree.
     Landing { from: ForkId, commit: String },
-    /// The parent moved: bring its current decided version into this fork
-    /// (a sync carries the parent's current version, never a stale one).
+    /// The upstream moved: bring its current decided version into this fork
+    /// (a sync carries the upstream's current version, never a stale one).
     Sync,
 }
 
-/// Where a collision was decided: always a parent's queue.
+/// Where a collision was decided: always an upstream's queue.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Direction {
-    /// A fork's commit into its parent.
+    /// A fork's commit into its upstream.
     Landing,
     /// A transaction's branch into its fork, at commit: the fork is the
-    /// transaction's parent.
+    /// transaction's upstream.
     Transaction,
 }
 
 /// Why a version lost (rule 3).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum By {
-    /// A same-line collision: the version and the parent's were each
+    /// A same-line collision: the version and the upstream's were each
     /// written without seeing the other. Or a line placed after the
-    /// parent's unfinished last line, unseen by its writer (R10.4).
+    /// upstream's unfinished last line, unseen by its writer (R10.4).
     Line,
-    /// A file rule (rule 11): an unlink the parent's unseen line defeated,
-    /// an edit of a file the parent unlinked, half of a rename-over, a
+    /// A file rule (rule 11): an unlink the upstream's unseen line defeated,
+    /// an edit of a file the upstream unlinked, half of a rename-over, a
     /// path clash. Its lost and won versions may be of different lines.
     File,
     /// A line that did not collide itself, of a change that lost whole
     /// (rule 3e: a save, or a transaction, lands whole or loses whole): its
-    /// `won` is the parent's version that decided the change's loss, named
+    /// `won` is the upstream's version that decided the change's loss, named
     /// by a `Line` or `File` collision of the same change.
     Whole,
 }
 
-/// Rule 3's event: a change into a parent lost, whole (rule 3e). One
+/// Rule 3's event: a change into an upstream lost, whole (rule 3e). One
 /// record per file and cause ([`By`]); every record of one change names
 /// the same `loser` and `result`.
 #[derive(Clone, Debug)]
 pub struct Collision {
-    /// The tree that decided it: the parent the incoming change landed in.
+    /// The tree that decided it: the upstream the incoming change landed in.
     pub tree: Tree,
     pub direction: Direction,
     /// The file (its identity) the lost versions are of.
@@ -182,10 +182,10 @@ pub struct Collision {
     /// the same line, or, per [`By`] or R10.4, the line that decided the loss.
     pub won: Vec<String>,
     pub by: By,
-    /// The tree's head before the take: the parent's version, which won.
+    /// The tree's head before the take: the upstream's version, which won.
     pub winner: String,
     /// The change that lost, whole: a save, a transaction's commit or (a
-    /// nested sandbox's) landing commit, or the transaction's branch at
+    /// nested fork's) landing commit, or the transaction's branch at
     /// its commit. Kept reachable by `reference`.
     pub loser: String,
     /// The tree's commit after the take (or the transaction's commit).
@@ -215,7 +215,7 @@ pub enum TxnEnd {
 
 /// What a transaction's commit tells the program (rule 5). Nothing refuses
 /// a commit. It lands in the fork as a child's change
-/// does in its parent, whole or not at all (rule 3e): the fork's own
+/// does in its upstream, whole or not at all (rule 3e): the fork's own
 /// concurrent line wins a collision, and then none of the transaction's
 /// lines apply; the answer names every staged line that did not, so the
 /// program is told.
@@ -470,13 +470,13 @@ pub struct Orphan {
 /// What a tree's take holds its files for (rule 9).
 #[derive(Clone, Debug)]
 pub enum Take {
-    /// The parent's head when the take began, the tree it plans, and whether
-    /// a commit of the fork was then on its way to the parent.
+    /// The upstream's head when the take began, the tree it plans, and whether
+    /// a commit of the fork was then on its way to the upstream.
     Sync {
         up: String,
         tree: Option<String>,
         landing: bool,
-        /// The parent's head when the take began: `up` is it, or under P2
+        /// The upstream's head when the take began: `up` is it, or under P2
         /// the last of its first parents the take may deliver.
         head: String,
     },
@@ -498,7 +498,7 @@ pub struct Hold {
     pub seq: Option<u64>,
     /// The tree's head its plan was made on.
     ours: String,
-    /// `entered.len()` when it began: what the parent had decided then.
+    /// `entered.len()` when it began: what the upstream had decided then.
     entered: usize,
 }
 
@@ -519,8 +519,8 @@ pub struct Waiting {
 /// Where a queue entry comes from: its order is kept per source (P1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Source {
-    /// A sync: the tree's parent.
-    Parent,
+    /// A sync: the tree's upstream.
+    Upstream,
     /// A landing of a child fork's commit.
     Child(ForkId),
 }
@@ -529,12 +529,12 @@ impl Entry {
     pub fn source(&self) -> Source {
         match self {
             Entry::Landing { from, .. } => Source::Child(*from),
-            Entry::Sync => Source::Parent,
+            Entry::Sync => Source::Upstream,
         }
     }
 }
 
-/// What a prefix sync (P2) delivers now: the parent's commit it goes up
+/// What a prefix sync (P2) delivers now: the upstream's commit it goes up
 /// to, the tree it makes (none: the fork has it) and the commits it holds
 /// back; and the open files whose close it waits for to deliver the rest.
 struct Prefix {
@@ -609,7 +609,7 @@ enum Verdict {
     Apply,
     /// The same version, or a stale one.
     Drop,
-    /// The parent's version (or the line that decided a whole loss) wins.
+    /// The upstream's version (or the line that decided a whole loss) wins.
     Lose(String),
 }
 
@@ -740,9 +740,9 @@ pub struct World {
     pub collisions: Vec<Collision>,
     /// Every token that entered a tree: written in it, carried into it by a
     /// landing or a transaction (whether it won or lost there), or taken
-    /// from the parent by a sync.
+    /// from the upstream by a sync.
     pub entered: Vec<(Tree, Edit)>,
-    /// Every sync that moved a fork: (the fork, the parent's head it
+    /// Every sync that moved a fork: (the fork, the upstream's head it
     /// carried, the fork's head after, `entered.len()` when it began).
     pub syncs: Vec<(Tree, String, String, usize)>,
     /// Every take of changes into a tree, a transaction's commit included.
@@ -798,11 +798,11 @@ pub struct World {
     pub(crate) ref_moves: u64,
     pub(crate) refs_checked: Option<u64>,
     /// Counted by `check` (rules 10 and 11 met in a take, so a run can show
-    /// it exercised them): a new line placed beside a parent's concurrent
-    /// new line at its place, and a change that edited a file the parent
+    /// it exercised them): a new line placed beside an upstream's concurrent
+    /// new line at its place, and a change that edited a file the upstream
     /// had unlinked.
     pub inserts_met: usize,
-    /// Syncs that delivered only a prefix of the parent's commits (P2),
+    /// Syncs that delivered only a prefix of the upstream's commits (P2),
     /// counted so a run can show it met them.
     pub prefix_syncs: usize,
     pub unlinked_edits: usize,
@@ -1151,7 +1151,7 @@ impl World {
     pub fn upstream(&self, t: Tree) -> Vec<Tree> {
         let mut v = vec![t];
         while let Some(Tree::Fork(f)) = v.last().copied() {
-            v.push(self.forks[&f].parent);
+            v.push(self.forks[&f].upstream);
         }
         v
     }
@@ -1159,7 +1159,7 @@ impl World {
     fn children(&self, t: Tree) -> Vec<ForkId> {
         self.forks
             .values()
-            .filter(|f| f.parent == t && f.life != Life::Dropped)
+            .filter(|f| f.upstream == t && f.life != Life::Dropped)
             .map(|f| f.id)
             .collect()
     }
@@ -1302,7 +1302,7 @@ impl World {
     /// `origin`'s first parent), the one that one was written over, and so
     /// on, read from git (the records, first parents and `git blame`). Never
     /// from which commits a version merged: a sync merge that kept the fork's
-    /// version over the parent's showed the fork's writer no parent's version
+    /// version over the upstream's showed the fork's writer no upstream's version
     /// (R3c.2: it could not read it), so the fork's next edit is not written
     /// over that. Cached: versions never change.
     fn written_over(&self, origin: &str, p: &str, v: &Line) -> Vec<String> {
@@ -1372,17 +1372,17 @@ impl World {
         out
     }
 
-    /// Rules 3, 10 and 11 at the parent's queue. Each incoming version
-    /// meets the version `ours` (the parent's head) holds of the same line
+    /// Rules 3, 10 and 11 at the upstream's queue. Each incoming version
+    /// meets the version `ours` (the upstream's head) holds of the same line
     /// identity ([`World::verdict`]). Then a file's existence couples with
-    /// its content (rule 11): an edit of a file the parent unlinked loses,
-    /// all of it; an unlink loses whole if the parent has a live line its
+    /// its content (rule 11): an edit of a file the upstream unlinked loses,
+    /// all of it; an unlink loses whole if the upstream has a live line its
     /// writer did not see ([`World::seen`]); a rename onto a path another
     /// file holds in the result loses.
-    /// At a landing, a line placed after the parent's unfinished last line
+    /// At a landing, a line placed after the upstream's unfinished last line
     /// collides with it (R10.4, the owner, 2026-11-05: "collide"), so no
     /// newline appears that no program wrote. So does an applied unfinished
-    /// line the parent would keep a line after (R10.8): the next line wins.
+    /// line the upstream would keep a line after (R10.8): the next line wins.
     /// Then the change is judged whole (rule 3e): if any version lost, none
     /// applies. The applied versions are placed by [`splice`], in the order
     /// `tip` (the incoming change) has them.
@@ -1402,7 +1402,7 @@ impl World {
             let unlink = ins
                 .iter()
                 .find(|i| i.version.line == cur.name.line && !i.version.live());
-            // A create: a live name version written over the parent's
+            // A create: a live name version written over the upstream's
             // deleted one, which only an unborn file's create can be (a
             // program cannot rename a file no path names).
             let creates = ins.iter().any(|i| {
@@ -1411,7 +1411,7 @@ impl World {
                     && verdicts[&key(i)] == Verdict::Apply
             });
             if !cur.name.live() && unlink.is_none() && !creates {
-                // An edit of a file the parent unlinked: the unlink wins.
+                // An edit of a file the upstream unlinked: the unlink wins.
                 for i in ins {
                     if verdicts[&key(i)] != Verdict::Drop {
                         verdicts.insert(key(i), Verdict::Lose(cur.name.id.clone()));
@@ -1423,7 +1423,7 @@ impl World {
                 && cur.name.live()
             {
                 // An unlink loses whole to a line its writer did not see. Not to a
-                // line of a file the parent unlinked too: two deletes of one name
+                // line of a file the upstream unlinked too: two deletes of one name
                 // line agree (R10.3), whatever the file held (finding 47, seed 484).
                 let t = self.file(tip, p);
                 if let Some(q) = cur.live().find(|q| !self.seen(tip, &t, p, q)) {
@@ -1447,7 +1447,7 @@ impl World {
             .collect();
         loop {
             let mut changed = false;
-            // Two files claiming one path: the parent's keeps it.
+            // Two files claiming one path: the upstream's keeps it.
             let names: Vec<(String, Line)> = PATHS
                 .iter()
                 .map(|f| {
@@ -1578,12 +1578,12 @@ impl World {
     }
 
     /// Rule 3, per line identity: an incoming version against the version
-    /// `cur` (the parent's, at `ours`) holds of the same line. None there
-    /// (a line new to the parent): it applies. The same version: nothing.
-    /// Written over the parent's: it replaces it. The parent's written over
+    /// `cur` (the upstream's, at `ours`) holds of the same line. None there
+    /// (a line new to the upstream): it applies. The same version: nothing.
+    /// Written over the upstream's: it replaces it. The upstream's written over
     /// it: stale, dropped. Two concurrent deletes agree: the incoming one
     /// applies, an ordinary version of its change. Else the two are
-    /// concurrent, and the parent's wins.
+    /// concurrent, and the upstream's wins.
     fn verdict(&self, ours: &str, cur: &Content, i: &Incoming) -> Verdict {
         let Some(p) = cur.member(&i.version.line) else {
             return Verdict::Apply;
@@ -1608,7 +1608,7 @@ impl World {
     }
 
     /// Whether the writer of commit `tip` (its file `p` is `t`) saw the
-    /// parent's version `q`: `tip` holds it, or a version written over it.
+    /// upstream's version `q`: `tip` holds it, or a version written over it.
     fn seen(&self, tip: &str, t: &Content, p: &str, q: &Line) -> bool {
         t.member(&q.line).is_some_and(|v| {
             v.id == q.id
@@ -1635,13 +1635,13 @@ impl World {
             .collect()
     }
 
-    /// [`MergeRule::PerLine`]'s sync: the parent's version `up`, with each
-    /// version of the fork's `ours` the parent has not decided yet (`up`'s
+    /// [`MergeRule::PerLine`]'s sync: the upstream's version `up`, with each
+    /// version of the fork's `ours` the upstream has not decided yet (`up`'s
     /// history does not reach its writing commit: a line still on its way to
-    /// the parent's queue, won or lost there being in that history alike)
-    /// kept over the parent's version of that line, placed in the fork's
-    /// order ([`splice`]). No tree shows bytes nobody wrote: the parent's
-    /// unfinished last line in front of a kept line (R10.6) and the parent's
+    /// the upstream's queue, won or lost there being in that history alike)
+    /// kept over the upstream's version of that line, placed in the fork's
+    /// order ([`splice`]). No tree shows bytes nobody wrote: the upstream's
+    /// unfinished last line in front of a kept line (R10.6) and the upstream's
     /// lines after a kept unfinished line (R10.9) wait for the decision.
     fn adopt(&self, ours: &str, up: &str) -> String {
         let mut files = BTreeMap::new();
@@ -1657,7 +1657,7 @@ impl World {
                 .collect();
             let own: BTreeSet<String> = keep.iter().map(|l| l.line.clone()).collect();
             let mut new = splice(&theirs, &keep, &mine);
-            hide_parents_unfinished(&mut new, &own);
+            hide_upstreams_unfinished(&mut new, &own);
             hide_after_own_unfinished(&mut new, &own);
             if new != theirs {
                 files.insert(p, new);
@@ -1673,15 +1673,15 @@ impl World {
         tree
     }
 
-    /// Finding 11, two renames to one path before the parent decides (a
+    /// Finding 11, two renames to one path before the upstream decides (a
     /// choice, recommended on 2026-11-04 without objection): a sync keeps
-    /// the fork's undecided name; had the parent meanwhile given that path
+    /// the fork's undecided name; had the upstream meanwhile given that path
     /// to another file (a rename, a rename-over, a create), the fork shows
-    /// the parent's file under the name it has in the fork (its previous
+    /// the upstream's file under the name it has in the fork (its previous
     /// name; none, so not shown, for a file the fork has never had) until
-    /// the parent's queue decides the fork's rename. A chain (the parent
+    /// the upstream's queue decides the fork's rename. A chain (the upstream
     /// then gave that previous name to a third file) is the same rule
-    /// again: each file whose parent's name clashes with a name the sync
+    /// again: each file whose upstream's name clashes with a name the sync
     /// shows is shown under its fork's name, until no two clash; the fork's
     /// own tree has no clash, so this ends. `files`: the sync's changed
     /// files, by identity, over `up`.
@@ -1859,15 +1859,15 @@ impl World {
         );
     }
 
-    /// `t`'s head moved: a fork's new commit queues for its parent (`up`),
+    /// `t`'s head moved: a fork's new commit queues for its upstream (`up`),
     /// and the new content queues for every child (rule 1: both ways).
     fn moved(&mut self, t: Tree, up: bool) {
         let head = self.head(t);
         if up && let Tree::Fork(f) = t {
-            let parent = self.forks[&f].parent;
+            let upstream = self.forks[&f].upstream;
             self.next_seq += 1;
             let n = self.next_seq;
-            self.queues.entry(parent).or_default().push_back((
+            self.queues.entry(upstream).or_default().push_back((
                 n,
                 Entry::Landing {
                     from: f,
@@ -1887,16 +1887,16 @@ impl World {
 
     // ── clients ──────────────────────────────────────────────────────────
 
-    /// A launcher creates a fork over `parent`, a branch at its head.
-    pub fn create_fork(&mut self, parent: Tree) -> ForkId {
+    /// A launcher creates a fork over `upstream`, a branch at its head.
+    pub fn create_fork(&mut self, upstream: Tree) -> ForkId {
         let id = self.next_fork;
         self.next_fork += 1;
-        let head = self.head(parent);
+        let head = self.head(upstream);
         self.forks.insert(
             id,
             Fork {
                 id,
-                parent,
+                upstream,
                 writer: format!("c{id}"),
                 life: Life::Open,
                 head: head.clone(),
@@ -1905,8 +1905,8 @@ impl World {
             },
         );
         self.set_head(Tree::Fork(id), &head);
-        self.note(format!("create f{id} over {parent:?}"));
-        self.trace_call(match parent {
+        self.note(format!("create f{id} over {upstream:?}"));
+        self.trace_call(match upstream {
             Tree::Main => RecordedCall::Fork { id: id as usize },
             Tree::Fork(_) => out_of_scope("nested-fork"),
         });
@@ -2777,9 +2777,9 @@ impl World {
     }
 
     /// The commit alone: the transaction's branch lands in the fork's
-    /// current head as a child's change lands in its parent, as one merge
+    /// current head as a child's change lands in its upstream, as one merge
     /// commit named for the client, which then lands like any fork commit.
-    /// Never refused. The fork is the transaction's parent, so a fork line
+    /// Never refused. The fork is the transaction's upstream, so a fork line
     /// concurrent with a staged line (one a sync brought in since begin)
     /// wins, and the transaction loses whole (rule 3e): none of its lines
     /// apply, the merge keeps the fork's tree (so history shows the decision)
@@ -3184,7 +3184,7 @@ impl World {
     /// keep their order and no two entries sharing a file pass each other.
     /// Which files an entry not yet planned touches is read from git: a
     /// landing's own changes (each against its first parent), a sync's
-    /// every file its tree and the parent's head differ in (all it may
+    /// every file its tree and the upstream's head differ in (all it may
     /// write).
     fn scan(&self, t: Tree) -> Option<usize> {
         let waiting = self.waits.get(&t);
@@ -3213,7 +3213,7 @@ impl World {
             Entry::Landing { commit, .. } => self.touches_of(commit),
             Entry::Sync => match t {
                 Tree::Fork(f) => {
-                    self.changed_keys(&self.head(t), &self.head(self.forks[&f].parent))
+                    self.changed_keys(&self.head(t), &self.head(self.forks[&f].upstream))
                 }
                 Tree::Main => BTreeSet::new(),
             },
@@ -3251,11 +3251,11 @@ impl World {
         let (take, files) = match head {
             Entry::Sync => {
                 let Tree::Fork(f) = t else {
-                    unreachable!("main has no parent")
+                    unreachable!("main has no upstream")
                 };
-                let parent = self.forks[&f].parent;
-                let whole = self.head(parent);
-                let landing = self.landing_pending(self.forks[&f].parent, f);
+                let upstream = self.forks[&f].upstream;
+                let whole = self.head(upstream);
+                let landing = self.landing_pending(self.forks[&f].upstream, f);
                 let p = self.prefix(t, &ours, &whole);
                 let Some((up, tree)) = p.deliver else {
                     // Its first commit would overwrite an open file: it
@@ -3424,7 +3424,7 @@ impl World {
     /// its change touches (read from git, against its first parent), whether
     /// the plan says it wins or loses, and every file the plan writes.
     /// Locking only what the plan writes would leave
-    /// a losing change's file open to a write-open of the parent's, whose
+    /// a losing change's file open to a write-open of the upstream's, whose
     /// save could flip that change to a win at the replan in `finish`.
     fn touched(&self, c: &str, m: &Merged) -> BTreeSet<String> {
         let mut files = m.files.clone();
@@ -3467,10 +3467,10 @@ impl World {
         )
     }
 
-    /// Rule 3, a fork's change into its parent `x`, the one place a
+    /// Rule 3, a fork's change into its upstream `x`, the one place a
     /// collision between them is decided. A fast-forward when the commit's
     /// base is the target's head, else the change is judged whole
-    /// ([`World::judge`]): the parent's line wins a collision, and the
+    /// ([`World::judge`]): the upstream's line wins a collision, and the
     /// change that lost it applies nothing. `m`: the take planned on `x`'s
     /// current head.
     fn land(&mut self, x: Tree, from: ForkId, tip: &str, m: Merged) {
@@ -3486,8 +3486,8 @@ impl World {
             self.entered.push((x, i.edit()));
         }
         if base == ours {
-            // Made on the parent's current version: every line replaces
-            // the parent's, so nothing collides.
+            // Made on the upstream's current version: every line replaces
+            // the upstream's, so nothing collides.
             assert!(
                 won && m.tree == self.tree_of(tip),
                 "a fast-forward is a plain replacement"
@@ -3534,9 +3534,9 @@ impl World {
     /// Progress rule P2, the prefix sync (the owner, 2026-11-04: "agreed",
     /// on "a sync delivers the parent's changes in order up to the first
     /// change that touches a file the sandbox has open for writing"): the
-    /// parent's commits fork `t` (at `ours`) lacks are `whole`'s first
+    /// upstream's commits fork `t` (at `ours`) lacks are `whole`'s first
     /// parents back to the first the fork has, each one change as the
-    /// parent took it (a save, a transaction's commit, a landing). It delivers them
+    /// upstream took it (a save, a transaction's commit, a landing). It delivers them
     /// in order up to, not including, the first that changes the line map of
     /// a file open for writing in `t`, even where the fork's file would
     /// read the same because it keeps its own undecided line there (finding
@@ -3585,7 +3585,7 @@ impl World {
         }
     }
 
-    /// The files in which the parent's commit `c` wrote a line version the
+    /// The files in which the upstream's commit `c` wrote a line version the
     /// fork at `ours` has never had, so its line map changes at this sync
     /// even if the fork's file goes on reading the same (finding 38).
     fn new_lines_of(&self, ours: &str, c: &str) -> BTreeSet<String> {
@@ -3601,7 +3601,7 @@ impl World {
             .collect()
     }
 
-    /// The tree a sync of the parent's `up` into fork `x` (at `ours`)
+    /// The tree a sync of the upstream's `up` into fork `x` (at `ours`)
     /// makes, per [`MergeRule`]; none if the fork already has `up`.
     fn sync_tree(&self, ours: &str, up: &str) -> Option<String> {
         if self.is_ancestor(up, ours) {
@@ -3617,22 +3617,22 @@ impl World {
         })
     }
 
-    /// Rule 3, parent into fork: the parent's decided version `up`, read
+    /// Rule 3, upstream into fork: the upstream's decided version `up`, read
     /// when the take began (never the one current when the sync was
-    /// queued). It decides nothing: each fork line the parent's queue has
+    /// queued). It decides nothing: each fork line the upstream's queue has
     /// not taken yet stays until that queue decides it. Nothing if the
-    /// fork has the parent's version; the parent's head itself (a
-    /// fast-forward: the fork adopts the parent's decisions) when no fork
-    /// line or commit is still waiting for the parent; else a merge commit
-    /// labelled `Sync` with the parent's head as second parent.
+    /// fork has the upstream's version; the upstream's head itself (a
+    /// fast-forward: the fork adopts the upstream's decisions) when no fork
+    /// line or commit is still waiting for the upstream; else a merge commit
+    /// labelled `Sync` with the upstream's head as second parent.
     /// `planned`: the tree planned on the fork's current head (none: it has
-    /// `up`); `landing`: a fork commit was on its way to the parent when the
+    /// `up`); `landing`: a fork commit was on its way to the upstream when the
     /// take began, so `up` may lack it.
     fn sync(&mut self, x: Tree, up: &str, planned: Option<String>, landing: bool, entered: usize) {
         let Tree::Fork(f) = x else {
-            unreachable!("main has no parent")
+            unreachable!("main has no upstream")
         };
-        let parent = self.forks[&f].parent;
+        let upstream = self.forks[&f].upstream;
         let ours = self.head(x);
         let Some(tree) = planned else {
             return;
@@ -3640,7 +3640,7 @@ impl World {
         for e in self.edits(&ours, &tree) {
             self.entered.push((x, e));
         }
-        let waiting = landing || self.landing_pending(parent, f);
+        let waiting = landing || self.landing_pending(upstream, f);
         let new = if tree == self.tree_of(up) && !waiting {
             self.note(format!("synced {up:.7} into f{f}: fast-forward"));
             up.to_string()
@@ -3660,16 +3660,16 @@ impl World {
             && self.children(t).is_empty()
             && !self.holds.contains_key(&t)
             && !self.waits.contains_key(&t)
-            && !self.landing_pending(fork.parent, f)
+            && !self.landing_pending(fork.upstream, f)
     }
 
-    /// Whether a commit of fork `f` waits in `parent`'s queue or is being
+    /// Whether a commit of fork `f` waits in `upstream`'s queue or is being
     /// taken there.
-    fn landing_pending(&self, parent: Tree, f: ForkId) -> bool {
-        self.queue(parent)
+    fn landing_pending(&self, upstream: Tree, f: ForkId) -> bool {
+        self.queue(upstream)
             .iter()
             .any(|e| matches!(e, Entry::Landing { from, .. } if *from == f))
-            || matches!(self.holds.get(&parent),
+            || matches!(self.holds.get(&upstream),
                 Some(Hold { take: Take::Landing { from, .. }, .. }) if *from == f)
     }
 
@@ -3728,7 +3728,7 @@ impl World {
             return;
         }
         let shown = self.holds.is_empty().then(|| self.shown());
-        // A fork, and a sandbox's queue step, read main's head as it is in the
+        // A fork, and a fork's queue step, read main's head as it is in the
         // model: without the landing main holds. A call that commits on main goes
         // before that landing in the model's history. A real landing happens at its
         // take, so in the trace that take comes after them all. A crash ends the take
@@ -3903,7 +3903,7 @@ impl World {
 /// name version is still the one its create wrote (never renamed since).
 /// A rename-over from such a file is an atomic save (git-model.md §7).
 /// Read from git alone, so it is the same whenever the save runs and
-/// whether or not the parent has taken the create yet.
+/// whether or not the upstream has taken the create yet.
 pub fn fresh(c: &Content) -> bool {
     UNBORN.contains(&c.name.line.as_str()) && c.name.over.as_deref() == Some(c.name.line.as_str())
 }
@@ -3929,8 +3929,8 @@ fn held(t: Tree, files: &BTreeSet<String>, holds: &BTreeSet<String>) {
 /// the nearest line before it in `src` that the result holds, then past
 /// any lines there that `src` lacks (lines `base` added that `src` never
 /// saw), so of two inserts at one place the base's comes first. The
-/// referee calls it with the parent's file as `base` and the incoming one
-/// as `src`; a sync with the parent's file as `base` and the fork's as
+/// referee calls it with the upstream's file as `base` and the incoming one
+/// as `src`; a sync with the upstream's file as `base` and the fork's as
 /// `src`. A version of the name line replaces the name.
 fn splice(base: &Content, applied: &[Line], src: &Content) -> Content {
     let by_line: BTreeMap<&str, &Line> = applied.iter().map(|l| (l.line.as_str(), l)).collect();
@@ -3980,9 +3980,9 @@ fn unfinished_before_kept(placed: &Content, applied: &[Line]) -> Option<(String,
     None
 }
 
-/// R10.6 at a sync: remove from `c` the parent's unfinished last line when any
+/// R10.6 at a sync: remove from `c` the upstream's unfinished last line when any
 /// of `own` follows it. Nothing else.
-fn hide_parents_unfinished(c: &mut Content, own: &BTreeSet<String>) {
+fn hide_upstreams_unfinished(c: &mut Content, own: &BTreeSet<String>) {
     let front = c
         .lines
         .iter()
@@ -3996,7 +3996,7 @@ fn hide_parents_unfinished(c: &mut Content, own: &BTreeSet<String>) {
     }
 }
 
-/// R10.9 at a sync: remove from `c` the parent's live lines after a line of
+/// R10.9 at a sync: remove from `c` the upstream's live lines after a line of
 /// `own` that is unfinished. Nothing else.
 fn hide_after_own_unfinished(c: &mut Content, own: &BTreeSet<String>) {
     let Some(at) = c

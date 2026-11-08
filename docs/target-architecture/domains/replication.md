@@ -149,7 +149,7 @@ with a lease touches the remote ref.
 | Scenario | Replication's behaviour |
 |---|---|
 | A collision | the take's `TreeMoved` names it; its ref goes in the next attempt, create-only |
-| 1,000 sandboxes | `Main`: one replica set per remote, whatever the fork count; `MainAndForks`: one more per live fork |
+| 1,000 forks | `Main`: one replica set per remote, whatever the fork count; `MainAndForks`: one more per live fork |
 | A slow, dead or refusing remote | `Unreachable` at an I/O deadline, then `Backoff`; other remotes settle on their own |
 | Crash mid-attempt | each remote is `Due` at restart; the next listing shows what it holds, so a push that landed is `UpToDate`, never a false divergence |
 | Upgrade (R16) | a minor continues the same refs; **a major pushes under its own refs** (design choice), so another major's history is never diverged, forced or deleted |
@@ -167,7 +167,7 @@ with a lease touches the remote ref.
 |---|---|
 | Zero remotes: saves, takes and release all work; status says local-only; no alarm | a missing remote treated as an error |
 | The server redirects to another host; an LFS endpoint on another origin | a secret sent to the wrong host |
-| A credential file under a tree or mount; a view lists everything it can | a sandbox reading a credential |
+| A credential file under a tree or mount; a view lists everything it can | a fork reading a credential |
 | Another writer moves main's ref; kill the service between Pending and Confirmed | a forced push; one divergence under many names |
 | One remote blackholed, one live: save and take rates unchanged | a dead remote stalling the volume |
 | A run with collisions, then drain: every collision is re-read on the remote alone, writer and line | a losing change lost (RP8) |
