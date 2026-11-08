@@ -38,130 +38,114 @@ pub fn check(w: &mut World) -> Result<(), String> {
     Ok(())
 }
 
-/// One step, with what only the step itself shows. A take (rule 9) that
-/// begins either waits, taking nothing, or holds its files; a sync's take
+/// One step, with what only the step itself shows. A take (rule 9) is one
+/// step (the owner, 2026-11-08, finding 49: "B"): it either waits, taking
+/// nothing, or takes the first entry P1 lets go and writes it. A sync's take
 /// reads the upstream's head as it is then (read here before the step, not
-/// from the model's record). A take that ends writes no file a client of
-/// that tree has open for writing, nor any file it did not hold; a sync
-/// records no collision (only an upstream's queue decides one) and carries
-/// the head its take read. Returns the queue entries taken.
+/// from the model's record). A landing locks every file its change touches,
+/// read from git, a losing change's included (R9.1). A take writes no file a
+/// client of that tree has open for writing, nor any file it did not lock; a
+/// sync records no collision (only an upstream's queue decides one) and
+/// carries the head its take read. Returns the queue entries taken.
 pub fn step_checked(w: &mut World, s: &Step) -> Result<usize, String> {
-    match s {
-        Step::Next(t) => {
-            let up = match t {
-                Tree::Fork(f) => Some(w.head(w.forks[f].upstream)),
-                Tree::Main => None,
-            };
-            // P1, read before the step: the entry it must act on is the
-            // first one no earlier waiting entry shares a file or a source
-            // with (the files read from git, not from the model's plan).
-            let q = w.queue_numbered(*t);
-            let Some(i) = p1_first(w, *t) else {
-                return Err(format!("{t:?}: a queue step with no entry free to go"));
-            };
-            let n = q[i].0;
-            let was = w.waits().get(t).is_some_and(|m| m.contains_key(&n));
-            let ours = w.head(*t);
-            let open = w.write_open(*t);
-            let taken = w.step(s);
-            if taken == 0 {
-                let waits = w.waits().get(t).is_some_and(|m| m.contains_key(&n)) && !was;
-                let up = up.filter(|_| q[i].1 == Entry::Sync);
-                return match (waits, up, w.holds().get(t).map(|h| &h.take)) {
-                    // A landing, or a sync whose first commit would
-                    // overwrite an open file, waits and takes nothing.
-                    (true, None, None) => Ok(0),
-                    (true, Some(head), None) => {
-                        prefix_cut(w, *t, &ours, &head, &open, None)?;
-                        Ok(0)
-                    }
-                    // P2: a sync delivers a prefix and waits for the rest.
-                    (
-                        true,
-                        Some(head),
-                        Some(Take::Sync {
-                            up: to, head: read, ..
-                        }),
-                    ) => {
-                        if *read != head {
-                            return Err(format!(
-                                "a sync into {t:?} read {read:.7}, not the upstream's head {head:.7}"
-                            ));
-                        }
-                        prefix_cut(w, *t, &ours, &head, &open, Some(to))?;
-                        Ok(0)
-                    }
-                    _ => Err(format!("{t:?}'s entry {n} neither waits nor is taken")),
-                };
+    let Step::Next(t) = s else {
+        return Ok(w.step(s));
+    };
+    let up = match t {
+        Tree::Fork(f) => Some(w.head(w.forks[f].upstream)),
+        Tree::Main => None,
+    };
+    // P1, read before the step: the entry it must act on is the first one no
+    // earlier waiting entry shares a file or a source with (the files read
+    // from git, not from the model's plan).
+    let q = w.queue_numbered(*t);
+    let Some(i) = p1_first(w, *t) else {
+        return Err(format!("{t:?}: a queue step with no entry free to go"));
+    };
+    let n = q[i].0;
+    let was = w.waits().get(t).is_some_and(|m| m.contains_key(&n));
+    let ours = w.head(*t);
+    let open = w.write_open(*t);
+    let (collisions, syncs) = (w.collisions.len(), w.syncs.len());
+    let taken = w.step(s);
+    let up = up.filter(|_| q[i].1 == Entry::Sync);
+    let waits = w.waits().get(t).is_some_and(|m| m.contains_key(&n)) && !was;
+    let Some((_, take)) = w.last_take().filter(|(x, _)| x == t).cloned() else {
+        // A landing, or a sync whose first commit would overwrite an open
+        // file, waits and takes nothing.
+        return match (waits, up) {
+            (true, None) => Ok(0),
+            (true, Some(head)) => {
+                prefix_cut(w, *t, &ours, &head, &open, None)?;
+                Ok(0)
             }
-            if w.holds().get(t).map(|h| h.seq) != Some(Some(n)) {
-                return Err(format!(
-                    "{t:?} took {:?}, not entry {n}, the first P1 lets go",
-                    w.holds().get(t).map(|h| h.seq)
-                ));
-            }
-            let up = up.filter(|_| q[i].1 == Entry::Sync);
-            match (up, w.holds().get(t).map(|h| &h.take)) {
-                (Some(up), Some(Take::Sync { head: read, .. })) if *read != up => Err(format!(
-                    "a sync into {t:?} read {read:.7}, not the upstream's head {up:.7}"
-                )),
-                (Some(head), Some(Take::Sync { up: to, .. })) => {
-                    prefix_cut(w, *t, &ours, &head, &open, Some(to))?;
-                    Ok(taken)
-                }
-                (_, None) => Err(format!("{t:?} took {taken} entries and holds nothing")),
-                _ => Ok(taken),
-            }
+            _ => Err(format!("{t:?}'s entry {n} neither waits nor is taken")),
+        };
+    };
+    // It took entry n, or (P2) a sync delivered a prefix and waits for the rest.
+    match take.seq {
+        Some(m) if m == n && taken == 1 && !waits => {}
+        None if taken == 0 && waits && up.is_some() => {}
+        x => {
+            return Err(format!(
+                "{t:?} took {x:?} ({taken} entries), not entry {n}, the first P1 lets go"
+            ));
         }
-        Step::Finish(t) => {
-            let hold = w.holds().get(t).cloned().ok_or("no take to finish")?;
-            let open = w.write_open(*t);
-            let before = w.head(*t);
-            let (collisions, syncs) = (w.collisions.len(), w.syncs.len());
-            w.taken = None;
-            w.step(s);
-            // What the take wrote, before the calls its release granted ran.
-            let after = w.taken.clone().ok_or("a finished take left no head")?;
-            let wrote: Vec<String> = if before == after {
-                Vec::new()
-            } else {
-                git(
-                    w.repo(),
-                    &["diff-tree", "-r", "--name-only", &before, &after],
-                )
-                .lines()
-                .map(str::to_string)
-                .collect()
-            };
-            if let Some(p) = wrote.iter().find(|p| open.contains(*p)) {
-                return Err(format!(
-                    "a take into {t:?} wrote {p}, which a client there has open for writing"
-                ));
-            }
-            if let Some(p) = wrote.iter().find(|p| !hold.files.contains(*p)) {
-                return Err(format!(
-                    "a take into {t:?} wrote {p}, which it did not hold"
-                ));
-            }
-            let Take::Sync { up, .. } = &hold.take else {
-                return Ok(0);
-            };
-            if w.collisions.len() != collisions {
-                return Err(format!(
-                    "a sync into {t:?} recorded a collision: only the upstream's queue decides one"
-                ));
-            }
-            match w.syncs.get(syncs) {
-                Some((_, carried, _, _)) if carried != up => Err(format!(
-                    "a sync into {t:?} carried {carried:.7}, not the head {up:.7} its take read"
-                )),
-                None if !w.is_ancestor(up, &w.head(*t)) => Err(format!(
-                    "a sync into {t:?} did nothing, but it lacks the upstream's head {up:.7}"
-                )),
-                _ => Ok(0),
-            }
-        }
-        _ => Ok(w.step(s)),
+    }
+    // Rule 9, read from git: a landing locks every file its change touches, a
+    // losing change's included (not only what its plan writes).
+    if let Take::Landing { commit: c, .. } = &take.take
+        && let Some(p) = change_files(w, c).difference(&take.files).next()
+    {
+        return Err(format!(
+            "{t:?}: a landing locks {:?}, not {p}, which its change {c:.7} touches",
+            take.files
+        ));
+    }
+    let after = w.head(*t);
+    let wrote: Vec<String> = if ours == after {
+        Vec::new()
+    } else {
+        diff_files(w, &ours, &after).into_iter().collect()
+    };
+    if let Some(p) = wrote.iter().find(|p| open.contains(*p)) {
+        return Err(format!(
+            "a take into {t:?} wrote {p}, which a client there has open for writing"
+        ));
+    }
+    if let Some(p) = wrote.iter().find(|p| !take.files.contains(*p)) {
+        return Err(format!(
+            "a take into {t:?} wrote {p}, which it did not lock"
+        ));
+    }
+    let Take::Sync {
+        up: to, head: read, ..
+    } = &take.take
+    else {
+        return Ok(taken);
+    };
+    let Some(head) = up else {
+        return Err(format!("{t:?}'s entry {n}, a landing, was taken as a sync"));
+    };
+    if *read != head {
+        return Err(format!(
+            "a sync into {t:?} read {read:.7}, not the upstream's head {head:.7}"
+        ));
+    }
+    prefix_cut(w, *t, &ours, &head, &open, Some(to))?;
+    if w.collisions.len() != collisions {
+        return Err(format!(
+            "a sync into {t:?} recorded a collision: only the upstream's queue decides one"
+        ));
+    }
+    match w.syncs.get(syncs) {
+        Some((_, carried, _, _)) if carried != to => Err(format!(
+            "a sync into {t:?} carried {carried:.7}, not the head {to:.7} its take read"
+        )),
+        None if !w.is_ancestor(to, &after) => Err(format!(
+            "a sync into {t:?} did nothing, but it lacks the upstream's head {to:.7}"
+        )),
+        _ => Ok(taken),
     }
 }
 
@@ -174,7 +158,7 @@ pub fn step_checked(w: &mut World, s: &Step) -> Result<usize, String> {
 /// version differs from the fork's (a necessary condition: the fork may
 /// keep its own undecided lines over it). That it never delivers past
 /// that commit is the take's write: it overwrites no open file
-/// (`step_checked`'s finish), so no change to an open file is delivered.
+/// (`step_checked`), so no change to an open file is delivered.
 fn prefix_cut(
     w: &World,
     t: Tree,
@@ -225,34 +209,15 @@ fn prefix_cut(
     }
 }
 
-/// Rule 9's locks, after every step and call. No write-open succeeds
-/// while a take holds the file in that tree. No lock outlives its holder:
-/// every open file's client is alive (and its transaction open), every
-/// take's and every wait's tree alive. Every lock wait ends on an event:
-/// a waiting queue head waits only while one of its files is still open
-/// for writing there (the last close wakes it), a waiting open only while
-/// a take holds its file (the release grants it). No timer is modelled.
+/// Rule 9's locks, after every step and call. A take is one step, so no
+/// take holds a file between steps and calls (what it locks is checked in
+/// `step_checked`). No lock outlives its holder: every open file's client
+/// is alive (and its transaction open), every wait's tree alive, and no
+/// call is left that neither ran nor was deferred (R5.3). Every lock wait
+/// ends on an event: a waiting queue head waits only while one of its files
+/// is still open for writing there (the last close wakes it). No timer is
+/// modelled.
 fn locks(w: &World) -> Result<(), String> {
-    for (t, hold) in w.holds() {
-        if !w.alive(*t) {
-            return Err(format!("a take outlives {t:?}"));
-        }
-        // Rule 9, read from git: a landing locks every file its change
-        // touches, a losing change's included (not only what its plan writes).
-        if let Take::Landing { commit: c, .. } = &hold.take
-            && let Some(p) = change_files(w, c).difference(&hold.files).next()
-        {
-            return Err(format!(
-                "{t:?}: a landing holds {:?}, not {p}, which its change {c:.7} touches",
-                hold.files
-            ));
-        }
-        if let Some(p) = w.write_open(*t).intersection(&hold.files).next() {
-            return Err(format!(
-                "{t:?}: a write-open of {p} succeeded while a take holds it"
-            ));
-        }
-    }
     let queued = |t: Tree, n: u64| w.queue_numbered(t).iter().any(|(m, _)| *m == n);
     for h in w.handles() {
         let alive = match &h.client {
@@ -260,26 +225,20 @@ fn locks(w: &World) -> Result<(), String> {
             Client::Fork(f) | Client::Outside(f) => w.forks[f].life == Life::Open,
         };
         let held = match h.target {
-            Target::Txn(f, n) => !h.waiting && w.forks[&f].txn.as_ref().is_some_and(|x| x.id == n),
+            Target::Txn(f, n) => w.forks[&f].txn.as_ref().is_some_and(|x| x.id == n),
             // R5.3: a deferred call lives only behind its open transaction.
             Target::Tree(Tree::Fork(f)) if h.deferred => {
                 w.forks[&f].txn.is_some() && w.forks[&f].deferred.contains(&h.id)
             }
-            Target::Tree(t) => {
-                (!h.waiting && h.kind == Kind::Write)
-                    || w.holds()
-                        .get(&t)
-                        .is_some_and(|x| !x.files.is_disjoint(&w.handle_keys(h)))
-            }
+            Target::Tree(_) => h.kind == Kind::Write,
         };
         if !alive {
             return Err(format!("h{} outlives its client {:?}", h.id, h.client));
         }
         if !held {
-            // No program's call ever waits on a waiting landing (the owner,
-            // 2026-11-04): only on a take writing its file.
+            // No program's call ever waits (R9.2, and a take is one step).
             return Err(format!(
-                "h{} ({:?} {:?}:{}) waits with no take holding its file, or outlives its transaction",
+                "h{} ({:?} {:?}:{}) waits, or outlives its transaction",
                 h.id, h.kind, h.target, h.file
             ));
         }
@@ -311,10 +270,7 @@ fn locks(w: &World) -> Result<(), String> {
             }
         }
         // P1: an entry no waiting one shares a file or a source with goes.
-        if w.holds().get(t).is_none()
-            && p1_first(w, *t).is_some()
-            && !w.pending().contains(&Step::Next(*t))
-        {
+        if p1_first(w, *t).is_some() && !w.pending().contains(&Step::Next(*t)) {
             return Err(format!("{t:?}: an entry free to go is not offered"));
         }
     }
@@ -392,19 +348,15 @@ pub fn check_converged(w: &World) -> Result<(), String> {
     if let Some(s) = w
         .pending()
         .iter()
-        .find(|s| matches!(s, Step::Next(_) | Step::Finish(_) | Step::Replicate))
+        .find(|s| matches!(s, Step::Next(_) | Step::Replicate))
     {
         return Err(format!("not drained: {s:?} still pending"));
     }
     if let Some(h) = w.handles().next() {
         return Err(format!("h{} still open at the end", h.id));
     }
-    if !w.waits().is_empty() || !w.holds().is_empty() {
-        return Err(format!(
-            "a lock outlives the run: waits {:?}, holds {:?}",
-            w.waits(),
-            w.holds().keys().collect::<Vec<_>>()
-        ));
+    if !w.waits().is_empty() {
+        return Err(format!("a lock outlives the run: waits {:?}", w.waits()));
     }
     losers_pushed(w)?;
     for t in w.live_trees() {

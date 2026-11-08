@@ -295,23 +295,21 @@ sync arrived while the file was open) is not modelled.
 **Locks** (owner, 2026-11-03; for a landing into a tree too, a *choice*; the names its files have on either side of the change too, R9.1). A take into a tree lists the files
 it will overwrite there, waits until no client of that tree has one open for writing, then holds them all
 while it writes; a write-open of a held file waits until it finishes. All at once, so it never holds one
-file while waiting for another (no deadlock). Each wait ends on an event: the last close wakes a take, its
-release grants waiting opens, and a client's end event (exit or death, a client of any tree alike)
-closes its files, saving their write calls as the kernel's close would (a choice), and drops its waiting
-opens (`r9_client_death_releases_its_locks`, `r9_a_main_clients_death_releases_its_locks`). A transaction's
-opens are on its frozen branch and never wait. If a save of another file moves the tree's head while a take
-holds its files, the take plans its change again on the new head when it writes; the new plan must write
-only files it holds, and the model stops loudly if not. *Choice:* so that it can, a landing locks every file
-its changes touch, fixed when it begins, a losing change's files included, not only the files its first plan
-writes: otherwise an upstream's save could change a file a losing change touched, flip that change to a win at
-the replan, and the take would write a file it never held
-(`r9_a_landing_holds_the_files_of_its_losing_changes`). Cost: a take waits for a file's open writer even
-when its change to that file loses.
+file while waiting for another (no deadlock). A take is one atomic step, in the model as in the library: it
+chooses its entry, locks its files and writes them, with no call in between, so a call that would wait for it
+simply comes after it (the owner, 2026-11-08, finding 49: "Without any other information, B sounds reasonable.
+Obviously atomic operations are more reliable"; R9). Each wait ends on an event: the last close wakes a take,
+and a client's end event (exit or death, a client of any tree alike) closes its files, saving their write
+calls as the kernel's close would (a choice) (`r9_client_death_releases_its_locks`,
+`r9_a_main_clients_death_releases_its_locks`). A transaction's opens are on its frozen branch and never wait.
+*Choice:* a landing locks every file its changes touch, a losing change's files included, not only the files
+its plan writes (R9.1, `r9_a_landing_holds_the_files_of_its_losing_changes`). Cost: a take waits for a file's
+open writer even when its change to that file loses.
 
 *Choice:* the lock covers every call that changes a held file, not only a write-open. `unlink`, and
-`rename(2)` onto or away from a held file (the usual atomic-save idiom), wait like a write-open while a take
-holds the file, and the take's release runs them; each is one call, so a take never waits for one
-(`r11_an_unlink_or_rename_of_a_held_file_waits`). A take that brings an unlink or a rename waits for that file's
+`rename(2)` onto or away from a held file (the usual atomic-save idiom), come after the take like a
+write-open; each is one call, so a take never waits for one
+(`r11_an_unlink_or_rename_of_a_held_file_runs_after_the_take`). A take that brings an unlink or a rename waits for that file's
 write-opens like any take. `truncate(2)` by path follows the same rule but is not modelled. A shared writable
 mapping needs a write-open and keeps the file open until its last reference goes (`RELEASE`, §3). Costs: §16.
 
@@ -707,7 +705,7 @@ One history mode. The owner, 2026-11-05: "drop squashing". Every fork commit sta
 
 **Convergence is checked for the modelled executions (the scenarios and the seeds run), not proven:** when writes stop and every queue drains, every fork equals its upstream (`check_converged`,
 `convergence_when_writes_stop`). **A crash with the journal's replay is modelled** (MODEL.md rule 12: every
-open saved once from the journal, takes put back, waiting calls dropped); the rest of a restart, and power loss, are
+open saved once from the journal; a take is one step, so none is in progress); the rest of a restart, and power loss, are
 not; the rest is a design choice.
 
 **One step, one journal record** (a recommendation the owner accepted, revisable; `docs/design.md` §19.1). Each step
@@ -804,7 +802,7 @@ policy of this revision included. Every check runs after every step, in every sc
 | No flip-flop: a line once replaced in a tree never shows there again | `no_flicker` | `r3_a_fork_never_flips_back_to_its_own_edit` |
 | A save is its write calls on the head at close: appends and offset writes keep the lines they did not write | every check | `r8_an_append_after_the_sync_keeps_the_synced_line`, `r8_an_offset_write_elsewhere_keeps_the_synced_line`, `r8_a_stale_rewrite_*` |
 | An append writes over no line but a partial last line it finishes: read from the save's blobs and its program's calls, each line starting in the appended bytes is new, after every line of the upstream, and a finished line is the upstream's last, one version on | `appends_exact` (in `one_writer`) | `r8_concurrent_appends_never_overwrite_each_other`, every random run |
-| No take writes a file open for writing in that tree or one it did not hold; no write-open succeeds while a take holds the file; no lock outlives its holder (any tree's client, a transaction, a tree); every wait ends on an event | `step_checked`, `locks`, `check_converged` | `r9_*`, `r11_an_unlink_or_rename_of_a_held_file_waits`, `r5_open_files_and_transactions`, every random run (clients of every tree die in them) |
+| No take writes a file open for writing in that tree or one it did not lock; a take is one step, so no call runs while it holds a file; no lock outlives its holder (any tree's client, a transaction, a tree); every wait ends on an event | `step_checked`, `locks`, `check_converged` | `r9_*`, `r11_an_unlink_or_rename_of_a_held_file_runs_after_the_take`, `r5_open_files_and_transactions`, every random run (clients of every tree die in them) |
 | While a transaction is open, no save reaches its fork on a file it has saved; each deferred call applies in order once it ends (§9) | `transactions_undisturbed`, `locks`, `interleavings.rs` `Oracle::defers` | `r5_io_on_a_transactions_files_is_deferred_past_its_commit`, `r5_a_rollback_applies_what_it_deferred`, `r5_a_clients_death_applies_what_its_transaction_deferred`, `r5_a_crash_keeps_what_a_transaction_deferred`, every random run |
 | No program's open, `unlink` or `rename(2)` ever waits on a waiting landing, only on a take writing its file (no P3, §6) | `Oracle::no_wait_on_waiting` (interleavings.rs, the harness's own record), `locks` | `r9_cooperating_programs_never_deadlock`, `r9_new_writers_postpone_a_waiting_take`, every random run |
 | A sync never delivers past the first change to an open file: it delivers an upstream commit, in order, overwrites no open file, and the first commit it holds back names an open file (P2, §6) | `step_checked` (`prefix_cut`) | `r9_a_sync_delivers_up_to_the_first_change_to_an_open_file`, `r9_a_prefix_sync_holds_back_a_transaction_whole`, every random run |

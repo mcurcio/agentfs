@@ -55,7 +55,6 @@ fn finding_32() {
     w.close(edit);
     for _ in 0..2 {
         w.step(&Step::Next(Tree::Main));
-        w.step(&Step::Finish(Tree::Main));
     }
     let content = w.read(Tree::Main, "c");
     let lines = content

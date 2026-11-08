@@ -388,10 +388,6 @@ impl TreeCalls for Mounted {
         }
     }
 
-    fn finish_take(&mut self, _t: TreeId) -> Result<(), CallError> {
-        Ok(())
-    }
-
     /// `SIGKILL`, wait on the pid, drop what the harness holds, `fusermount3 -uz`,
     /// mount. The new process's recovery closes every open once.
     fn crash(&mut self) -> Result<(), CallError> {

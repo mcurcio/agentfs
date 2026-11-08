@@ -9,10 +9,11 @@
 //! some overlapping; `ftruncate`s; and the byte calls a program makes for a
 //! line edit (a line written in place, inserted, deleted or moved, some with
 //! bytes other lines repeat) or a whole-file rewrite of an earlier read.
-//! They close them, so takes wait for write-opens and opens wait for takes
-//! (rule 9), and while a take holds files they often open, save, unlink or
-//! rename one of that tree's files; they unlink and rename files (rule
-//! 11), to a new path or over another file. On top of `check`, the run
+//! They close them, so takes wait for write-opens (rule 9), and while an
+//! entry waits they often open, save, unlink or rename one of its files; a
+//! take is one step (the owner, 2026-11-08, finding 49: "B"), so no call runs
+//! during one. They unlink and rename files (rule 11), to a new path or over
+//! another file. On top of `check`, the run
 //! itself asserts that nothing else waits: every close returns at once, and
 //! every queue step takes its queue's head, leaving
 //! the rest of the queue in order, or records that it waits. And it keeps
@@ -29,13 +30,13 @@
 //! panic too reports its seed and the event log. The generator is a
 //! SplitMix64 written here: fixed seeds replay exactly.
 
-use agentfs_model::check::{change_files, check, check_converged, entry_files, step_checked};
+use agentfs_model::check::{change_files, check, check_converged, step_checked};
 use agentfs_model::content::{BLANK, Content, FILES, Layout, PATHS, UNBORN};
 use agentfs_model::git::{git, with_reversed_dates};
 use agentfs_model::program;
 use agentfs_model::world::{
     By, Client, Direction, Entry, ForkId, HandleId, Kind, Life, LineEdit, MergeRule, NAME_KEY,
-    Policies, Step, Take, Target, Tree, TxnEnd, TxnOutcome, World, Write, name_key,
+    Policies, Step, Target, Tree, TxnEnd, TxnOutcome, World, Write, name_key,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -105,14 +106,12 @@ struct Tally {
     commits_with_open: usize,
     forks: usize,
     nested: usize,
-    /// Queue heads that waited for a write-open, and opens that waited for
-    /// a take.
+    /// Queue heads that waited for a write-open.
     take_waits: usize,
-    open_waits: usize,
-    /// Opens, unlinks and renames made while a take held files in that
+    /// Opens, unlinks and renames made on a waiting entry's files in that
     /// tree, and saves closed then.
-    calls_during_takes: usize,
-    saves_during_takes: usize,
+    calls_while_waiting: usize,
+    saves_while_waiting: usize,
     rewrites: usize,
     /// Appends, and those two opens made to one file at once.
     appends: usize,
@@ -181,25 +180,10 @@ fn live_clients(w: &World) -> Vec<ForkId> {
         .collect()
 }
 
-/// A client blocked in a call that waits (an open or a path call waiting
-/// for a take): a program makes no other call until it returns, but it can
-/// still die.
-fn blocked(w: &World, c: &Client) -> bool {
-    w.handles().any(|h| h.client == *c && h.waiting)
-}
-
-/// The forks' clients that can make a call now.
-fn free_clients(w: &World) -> Vec<ForkId> {
-    live_clients(w)
-        .into_iter()
-        .filter(|f| !blocked(w, &Client::Fork(*f)))
-        .collect()
-}
-
-/// Whether a granted open writes in a transaction.
+/// Whether an open writes in a transaction.
 fn txn_open(w: &World) -> bool {
     w.handles()
-        .any(|h| !h.waiting && h.kind == Kind::Write && matches!(h.target, Target::Txn(..)))
+        .any(|h| h.kind == Kind::Write && matches!(h.target, Target::Txn(..)))
 }
 
 fn in_txn(w: &World) -> Vec<ForkId> {
@@ -223,15 +207,6 @@ struct Oracle {
     inodes: BTreeMap<(Target, String), u64>,
     held: BTreeMap<HandleId, (Target, u64, String, String)>,
     next_inode: u64,
-    /// Path calls that wait for a take: (target, file, rename's path).
-    waiting_calls: BTreeMap<HandleId, (Target, String, Option<String>)>,
-    /// The referee of "no program's call waits on a waiting landing" (the
-    /// owner, 2026-11-04), the harness's own record, not the model's
-    /// `waits`: each tree with a take in progress (a queue step that began
-    /// one and no finish since), with the files it holds (a landing's read
-    /// from git, every file its taken changes touch; a sync's, the files
-    /// it writes). A call waits only there, on one of those files.
-    taking: BTreeMap<Tree, BTreeSet<String>>,
     /// R5.3, the harness's own list: the calls each fork's open transaction
     /// has deferred, in the order they were made.
     deferred: BTreeMap<ForkId, Vec<Deferred>>,
@@ -321,8 +296,7 @@ impl Oracle {
         self.held.retain(|h, _| w.handles().any(|x| x.id == *h));
     }
 
-    /// A new open, granted or waiting: it holds its file's object in its
-    /// target from now on.
+    /// A new open: it holds its file's object in its target from now on.
     fn opened(&mut self, w: &World, h: HandleId) {
         let x = w.handle(h);
         let key = (x.target, x.file.clone());
@@ -374,7 +348,7 @@ impl Oracle {
     }
 
     /// Unlinks `p` (`to` none) or renames it as `c`: the oracle follows the
-    /// call when it runs, at once or when a take's release runs it.
+    /// call when it runs, at once or after the transaction that defers it.
     fn path_call(
         &mut self,
         w: &mut World,
@@ -395,13 +369,12 @@ impl Oracle {
         let mut files = vec![file.clone()];
         files.extend(to.and_then(|to| w.lookup(&at, to)));
         let defers = self.defers(w, t, &files);
-        let waits = match to {
+        match to {
             None => w.unlink(c, p),
             Some(to) => w.rename(c, p, to),
-        };
-        match waits {
-            None if defers.is_some() => {
-                let f = defers.expect("checked");
+        }
+        match defers {
+            Some(f) => {
                 let id = *w.forks[&f].deferred.back().ok_or_else(|| {
                     format!("R5.3: a path call on {files:?} ran during its transaction")
                 })?;
@@ -411,12 +384,8 @@ impl Oracle {
                     .push(Deferred::Path(id, to.map(str::to_string)));
             }
             None => self.ran(w, &at, t, &file, to),
-            Some(h) => {
-                self.waiting_calls
-                    .insert(h, (t, file, to.map(str::to_string)));
-            }
         }
-        self.no_wait_on_waiting(w)
+        Ok(())
     }
 
     /// R5.3, the harness's own reading: target `t` is a fork's tree, and
@@ -477,80 +446,22 @@ impl Oracle {
         held.1 = o;
     }
 
-    /// After a take's release in `t`: the waiting path calls it ran, in
-    /// the order it ran them (by handle), each on the state the one before
-    /// left: the head the take's write left, then each call's own commit
-    /// (read down the tree's first parents). A call on a file no path names
-    /// then, or a rename to the path it has, makes no commit. Calls dropped
-    /// with their client go too.
-    fn released(&mut self, w: &World, t: Tree) {
-        // R5.3: a call its release let go that a transaction's file defers.
-        let later: Vec<HandleId> = self
-            .waiting_calls
-            .keys()
-            .filter(|h| w.handles().any(|x| x.id == **h && x.deferred))
-            .copied()
-            .collect();
-        for h in later {
-            let (u, file, to) = self.waiting_calls.remove(&h).expect("listed");
-            let Target::Tree(Tree::Fork(f)) = u else {
-                unreachable!("a deferred call in a fork's tree");
-            };
-            let _ = file;
-            self.deferred
-                .entry(f)
-                .or_default()
-                .push(Deferred::Path(h, to));
-        }
-        let gone: Vec<HandleId> = self
-            .waiting_calls
-            .keys()
-            .filter(|h| !w.handles().any(|x| x.id == **h))
-            .copied()
-            .collect();
-        let Some(start) = w.taken_head().map(str::to_string) else {
-            return;
-        };
-        let mut chain = Vec::new();
-        let mut c = w.head(t);
-        while c != start {
-            chain.push(c.clone());
-            c = git(w.repo(), &["rev-parse", &format!("{c}^1")]);
-        }
-        let mut at = start;
-        for h in gone {
-            let (u, file, to) = self.waiting_calls.remove(&h).expect("listed");
-            if u != Target::Tree(t) {
-                continue;
-            }
-            let cur = w.file(&at, &file);
-            if !cur.name.live() {
-                continue;
-            }
-            self.ran(w, &at, u, &file, to.as_deref());
-            if to.as_deref() != cur.path() {
-                at = chain.pop().expect("a granted call's commit");
-            }
-        }
-    }
-
-    /// No program's call ever waits on a waiting landing (the owner,
-    /// 2026-11-04; P3 deleted), judged by the harness's record alone: every
-    /// call that waits, waits in a tree with a take in progress, on a file
-    /// that take holds (the owner's lock of 2026-11-03: a take writing its
-    /// files holds new write-opens back until it finishes).
-    fn no_wait_on_waiting(&self, w: &World) -> Result<(), String> {
-        for x in w.handles().filter(|x| x.waiting) {
-            let Target::Tree(t) = x.target else {
-                return Err(format!("h{} waits in a transaction", x.id));
-            };
-            if !self
-                .taking
-                .get(&t)
-                .is_some_and(|held| !held.is_disjoint(&w.handle_keys(x)))
-            {
+    /// No program's call ever waits (the owner, 2026-11-04, R9.2: none on a
+    /// waiting landing; 2026-11-08, finding 49: a take is one step, so none
+    /// on a take either), judged by the harness's record alone: every handle
+    /// the model keeps is an open the oracle saw made, or a path call the
+    /// oracle saw a transaction defer (R5.3).
+    fn no_call_waits(&self, w: &World) -> Result<(), String> {
+        for x in w.handles() {
+            let deferred = self
+                .deferred
+                .values()
+                .flatten()
+                .any(|d| matches!(d, Deferred::Path(h, _) if *h == x.id));
+            let open = x.kind == Kind::Write && self.held.contains_key(&x.id);
+            if !open && !deferred {
                 return Err(format!(
-                    "h{} ({:?} of {}) waits in {t:?}, but no take there is writing its file: a call waits on a waiting take",
+                    "h{} ({:?} of {}) did not return: a call waits",
                     x.id, x.kind, x.file
                 ));
             }
@@ -637,12 +548,11 @@ impl Oracle {
 
 /// One step ([`step_checked`]), asserting it took its queue's head and left
 /// the rest in order, or waits and left the queue as it was; and that only the
-/// tree a take finished in changed bytes (the oracle reads them again
-/// after).
+/// tree a take wrote in changed bytes (the oracle reads them again after).
 fn take(w: &mut World, o: &mut Oracle, s: &Step, tally: &mut Tally) -> Result<(), String> {
     w.note_step(s);
     let before = match s {
-        Step::Next(t) | Step::Finish(t) => w.queue(*t),
+        Step::Next(t) => w.queue(*t),
         Step::Drop(_) | Step::Replicate => Vec::new(),
     };
     let numbered = match s {
@@ -654,7 +564,7 @@ fn take(w: &mut World, o: &mut Oracle, s: &Step, tally: &mut Tally) -> Result<()
     let open_before: BTreeSet<String> = match s {
         Step::Next(t) => w
             .handles()
-            .filter(|h| !h.waiting && h.target == Target::Tree(*t))
+            .filter(|h| h.target == Target::Tree(*t))
             .flat_map(|h| {
                 let mut files: Vec<String> = o.named(w, h.id).into_iter().collect();
                 if h.kind != Kind::Write {
@@ -676,40 +586,12 @@ fn take(w: &mut World, o: &mut Oracle, s: &Step, tally: &mut Tally) -> Result<()
     };
     let taken = step_checked(w, s)?;
     tally.steps += 1;
-    match s {
-        Step::Finish(t) => {
-            o.taking.remove(t);
-        }
-        Step::Next(t) if w.holds().contains_key(t) => {
-            // The files it holds: a landing's read from git (every file its
-            // taken changes touch); a sync's are the files it writes.
-            let held = match &w.holds()[t].take {
-                Take::Landing { .. } => numbered
-                    .iter()
-                    .skip(first.unwrap_or(0))
-                    .take(taken)
-                    .flat_map(|(_, e)| entry_files(w, *t, e))
-                    .collect(),
-                Take::Sync { .. } => w.holds()[t].files.clone(),
-            };
-            o.taking.insert(*t, held);
-        }
-        _ => {}
-    }
     let skip = match s {
-        Step::Finish(t) => Some(Target::Tree(*t)),
+        Step::Next(t) => Some(Target::Tree(*t)),
         _ => None,
     };
     o.check_but(w, skip)?;
     o.reload(w);
-    if let Step::Finish(t) = s {
-        o.released(w, *t);
-    }
-    if let Step::Finish(t) = s
-        && w.queue(*t) != before
-    {
-        return Err(format!("{s:?} changed {t:?}'s own queue"));
-    }
     if let Step::Next(t) = s
         && w.alive(*t)
     {
@@ -796,12 +678,11 @@ fn dropped(w: &World, n: usize, expect: Vec<Dropped>) -> Result<(), String> {
     Ok(())
 }
 
-/// Every program closes the files it has open (granted ones; a waiting
-/// open is closed once a take's release grants it).
+/// Every program closes the files it has open.
 fn close_all_checked(w: &mut World, o: &mut Oracle, tally: &mut Tally) -> Result<(), String> {
     let open: Vec<_> = w
         .handles()
-        .filter(|h| !h.waiting && !h.deferred && h.kind == Kind::Write)
+        .filter(|h| !h.deferred && h.kind == Kind::Write)
         .map(|h| h.id)
         .collect();
     for h in open {
@@ -810,9 +691,9 @@ fn close_all_checked(w: &mut World, o: &mut Oracle, tally: &mut Tally) -> Result
     Ok(())
 }
 
-/// A client's end event: the oracle closes its granted opens in the order
-/// the model does (by handle), each as its close would, and drops its
-/// waiting ones; a fork's open transaction rolls back first.
+/// A client's end event: the oracle closes its opens in the order the model
+/// does (by handle), each as its close would; a fork's open transaction rolls
+/// back first.
 fn end_checked(w: &mut World, o: &mut Oracle, c: &Client) -> Result<(), String> {
     if let Client::Fork(f) = c
         && w.forks[f].txn.is_some()
@@ -825,7 +706,7 @@ fn end_checked(w: &mut World, o: &mut Oracle, c: &Client) -> Result<(), String> 
     };
     let mine: Vec<HandleId> = w
         .handles()
-        .filter(|h| of_it(&h.client) && !h.waiting && h.kind == Kind::Write)
+        .filter(|h| of_it(&h.client) && h.kind == Kind::Write)
         .map(|h| h.id)
         .collect();
     let n = w.orphans.len();
@@ -841,20 +722,17 @@ fn end_checked(w: &mut World, o: &mut Oracle, c: &Client) -> Result<(), String> 
     gitledger::observe(w)?;
     o.calls.retain(|h, _| w.handles().any(|x| x.id == *h));
     o.held.retain(|h, _| w.handles().any(|x| x.id == *h));
-    o.waiting_calls
-        .retain(|h, _| w.handles().any(|x| x.id == *h));
     o.check(w).map_err(|e| format!("end of {c:?}: {e}"))
 }
 
 /// A crash of every agentfs process (git-model.md §3), during open
-/// `during`'s close if one is given: the oracle saves every granted open's
+/// `during`'s close if one is given: the oracle saves every open's
 /// calls as its close would (`during` first, then the rest in the model's
 /// order, by handle), so every write call that returned survives; an
 /// orphan's event comes once per close the journal replays (twice for an
-/// orphan whose close the crash interrupted: events are at least once);
-/// waiting opens and path calls are dropped. A call a transaction deferred
-/// stays behind it, and a close that would defer defers (R5.3). Takes in
-/// progress go back to their queues and change no bytes.
+/// orphan whose close the crash interrupted: events are at least once). A
+/// call a transaction deferred stays behind it, and a close that would defer
+/// defers (R5.3). A take is one step, so none is in progress.
 fn crash_checked(w: &mut World, o: &mut Oracle, during: Option<HandleId>) -> Result<(), String> {
     let n = w.orphans.len();
     let mut expect = Vec::new();
@@ -889,11 +767,8 @@ fn crash_checked(w: &mut World, o: &mut Oracle, during: Option<HandleId>) -> Res
     if let Some(h) = w.handles().find(|h| !h.deferred) {
         return Err(format!("h{} outlived the crash", h.id));
     }
-    o.waiting_calls.clear();
     o.calls.retain(|h, _| w.handles().any(|x| x.id == *h));
     o.held.retain(|h, _| w.handles().any(|x| x.id == *h));
-    // A crash ends every take (they go back to their queues).
-    o.taking.clear();
     gitledger::observe(w)?;
     o.check(w).map_err(|e| format!("crash: {e}"))
 }
@@ -948,8 +823,7 @@ fn rollback_checked(w: &mut World, o: &mut Oracle, f: ForkId) -> Result<(), Stri
     apply_deferred_checked(w, o, f)
 }
 
-/// A transaction's commit, with a take in progress in its fork finished
-/// first (rule 9), then the calls it deferred (R5.3). The files open in the
+/// A transaction's commit, then the calls it deferred (R5.3). The files open in the
 /// fork or the transaction stay open; the transaction's write in the
 /// fork from now on.
 fn commit_checked(
@@ -958,9 +832,6 @@ fn commit_checked(
     f: ForkId,
     tally: &mut Tally,
 ) -> Result<(), String> {
-    if w.holds().contains_key(&Tree::Fork(f)) {
-        take(w, o, &Step::Finish(Tree::Fork(f)), tally)?;
-    }
     let txn = w.forks[&f].txn.as_ref().expect("open").id;
     let stay: Vec<(HandleId, Option<String>)> = o
         .held
@@ -969,9 +840,7 @@ fn commit_checked(
         .map(|(h, _)| (*h, o.named(w, *h)))
         .collect();
     tally.commits_with_open += usize::from(w.handles().any(|h| {
-        !h.waiting
-            && !h.deferred
-            && (h.target == Target::Txn(f, txn) || h.target == Target::Tree(Tree::Fork(f)))
+        !h.deferred && (h.target == Target::Txn(f, txn) || h.target == Target::Tree(Tree::Fork(f)))
     }));
     w.commit_txn_only(f).expect("open");
     gitledger::observe(w)?;
@@ -1004,7 +873,7 @@ fn drain(
 fn checkg(w: &mut World, o: &mut Oracle) -> Result<(), String> {
     check(w)?;
     gitledger::observe(w)?;
-    o.no_wait_on_waiting(w)?;
+    o.no_call_waits(w)?;
     o.check(w)
 }
 
@@ -1286,8 +1155,7 @@ impl Calls {
         h
     }
 
-    /// Opens `p` for writing as `c` and, if granted, writes line `slot` and
-    /// closes: a save. A waiting open stays, to be written once granted.
+    /// Opens `p` for writing as `c`, writes line `slot` and closes: a save.
     fn save(
         &mut self,
         w: &mut World,
@@ -1298,17 +1166,12 @@ impl Calls {
     ) -> Result<(), String> {
         let h = w.open_write(c, p);
         self.o.opened(w, h);
-        if w.handle(h).waiting {
-            tally.open_waits += 1;
-            return Ok(());
-        }
         let t = self.text(tally);
         self.line_edit(w, h, &LineEdit::At(slot), &t);
         close_checked(w, &mut self.o, h, tally)
     }
 
-    /// Opens `p` as `c`, makes one random write call and closes, if the
-    /// open is granted.
+    /// Opens `p` as `c`, makes one random write call and closes.
     fn one_call(
         &mut self,
         w: &mut World,
@@ -1318,10 +1181,6 @@ impl Calls {
         tally: &mut Tally,
     ) -> Result<(), String> {
         let h = self.open(w, c, p, tally);
-        if w.handle(h).waiting {
-            tally.open_waits += 1;
-            return Ok(());
-        }
         self.write(w, h, slot, tally);
         close_checked(w, &mut self.o, h, tally)
     }
@@ -1398,9 +1257,7 @@ impl Calls {
         if atomic && self.rng.below(2) == 0 {
             let h = self.open(w, c, p, tally);
             tally.old_writers += 1;
-            if !w.handle(h).waiting {
-                self.write(w, h, slot, tally);
-            }
+            self.write(w, h, slot, tally);
         }
         let tmp = format!("t{}", self.next_name);
         self.next_name += 1;
@@ -1454,9 +1311,6 @@ impl Calls {
             return Ok(());
         };
         let c = Client::Outside(f);
-        if blocked(w, &c) {
-            return Ok(());
-        }
         let txn = w.forks[&f].txn.as_ref().expect("open");
         let staged: Vec<String> = txn.staged.iter().map(|e| e.path.clone()).collect();
         let file = match self.rng.pick(&staged) {
@@ -1470,10 +1324,7 @@ impl Calls {
             0 => self.save(w, &c, &p, slot, tally),
             1 => {
                 let h = self.open(w, &c, &p, tally);
-                tally.open_waits += usize::from(w.handle(h).waiting);
-                if !w.handle(h).waiting {
-                    self.write(w, h, slot, tally);
-                }
+                self.write(w, h, slot, tally);
                 Ok(())
             }
             2 => self.path_call(w, &c, &file, &p, true, tally),
@@ -1481,25 +1332,27 @@ impl Calls {
         }
     }
 
-    /// While a take holds files in a tree, a client of that tree calls on
-    /// one of them (or another file): opens it (it waits if held), saves
-    /// it at once if granted, or unlinks or renames it. This is the
-    /// pattern the 2026-11-03 review found by hand and 500 seeds missed (an
-    /// upstream's save of a file a losing change touched, during the take).
-    fn during_take(
+    /// While an entry waits for files in a tree, a client of that tree calls
+    /// on one of them (or another file): opens it, saves it at once, or
+    /// unlinks or renames it (each is granted, P3 being gone, and postpones the
+    /// entry). The saves mostly touch a line in contention with a waiting
+    /// landing, the pattern the 2026-11-03 review found by hand and 500 seeds
+    /// missed (an upstream's save of a file a losing change touched); a take is
+    /// one step (finding 49), so such a save comes before or after it whole.
+    fn while_waiting(
         &mut self,
         w: &mut World,
         slot: usize,
         tally: &mut Tally,
     ) -> Result<bool, String> {
-        // Each take with the files its changes touch and the lines in
-        // contention there, read from git: the lines the commit of the
-        // take set over its first parent, and those the tree's head set
-        // over that first parent (the commit against its base).
-        let holds: Vec<Contention> = w
-            .holds()
-            .iter()
-            .map(|(t, x)| {
+        // Each waiting entry with the files it locks and, for a landing, the
+        // lines in contention there, read from git: the lines its commit set
+        // over its first parent, and those the tree's head set over that
+        // first parent (the commit against its base).
+        let mut waiting: Vec<Contention> = Vec::new();
+        for (t, m) in w.waits() {
+            let queue = w.queue_numbered(*t);
+            for (n, x) in m {
                 let mut files: Vec<String> = x
                     .files
                     .iter()
@@ -1507,7 +1360,9 @@ impl Calls {
                     .cloned()
                     .collect();
                 let mut lines = Vec::new();
-                if let Take::Landing { commit: c, .. } = &x.take {
+                if let Some((_, Entry::Landing { commit: c, .. })) =
+                    queue.iter().find(|(q, _)| q == n)
+                {
                     let base = git(w.repo(), &["rev-parse", &format!("{c}^1")]);
                     for e in w
                         .edits(&base, c)
@@ -1518,26 +1373,10 @@ impl Calls {
                         lines.push((e.path, e.line));
                     }
                 }
-                (*t, files, lines)
-            })
-            .collect();
-        // And each entry waiting for its files (a new call on one of them
-        // is granted and postpones it). Steering only.
-        let mut holds = holds;
-        for (t, m) in w.waits() {
-            for x in m.values() {
-                holds.push((
-                    *t,
-                    x.files
-                        .iter()
-                        .filter(|k| !k.starts_with(NAME_KEY))
-                        .cloned()
-                        .collect(),
-                    Vec::new(),
-                ));
+                waiting.push((*t, files, lines));
             }
         }
-        let Some((t, held, contended)) = self.rng.pick(&holds) else {
+        let Some((t, held, contended)) = self.rng.pick(&waiting) else {
             return Ok(false);
         };
         let c = match t {
@@ -1545,9 +1384,6 @@ impl Calls {
             Tree::Fork(f) if w.forks[&f].life == Life::Open => Client::Fork(f),
             Tree::Fork(_) => return Ok(false),
         };
-        if blocked(w, &c) {
-            return Ok(false);
-        }
         let file = match self.rng.pick(&held) {
             Some(x) if self.rng.below(4) != 0 => x,
             _ => FILES[self.rng.below(FILES.len())].to_string(),
@@ -1555,41 +1391,36 @@ impl Calls {
         let Some(p) = w.client_path(&c, &file) else {
             return Ok(false);
         };
-        tally.calls_during_takes += 1;
+        tally.calls_while_waiting += 1;
         match self.rng.below(6) {
             0 => {
                 let unlink = self.rng.below(2) == 0;
                 self.path_call(w, &c, &file, &p, unlink, tally)?;
             }
             1 | 2 => {
-                let h = self.open(w, &c, &p, tally);
-                tally.open_waits += usize::from(w.handle(h).waiting);
+                self.open(w, &c, &p, tally);
             }
             _ => {
                 let h = w.open_write(&c, &p);
                 self.o.opened(w, h);
-                if w.handle(h).waiting {
-                    tally.open_waits += 1;
+                // Mostly on a line in contention: removed (a save that
+                // can turn a losing change of this file into one that
+                // wins when it is taken) or written.
+                tally.saves_while_waiting += 1;
+                let at = w.client_reads(&c, &p);
+                let spots: Vec<usize> = at
+                    .live()
+                    .enumerate()
+                    .filter(|(_, l)| contended.contains(&(file.clone(), l.line.clone())))
+                    .map(|(i, _)| i)
+                    .collect();
+                let spot = self.rng.pick(&spots).unwrap_or(slot);
+                if self.rng.below(2) == 0 {
+                    self.line_edit(w, h, &LineEdit::Delete(spot), "");
                 } else {
-                    // Mostly on a line in contention: removed (a save that
-                    // can turn a losing change of this file into one that
-                    // wins at the take's replan) or written.
-                    tally.saves_during_takes += 1;
-                    let at = w.client_reads(&c, &p);
-                    let spots: Vec<usize> = at
-                        .live()
-                        .enumerate()
-                        .filter(|(_, l)| contended.contains(&(file.clone(), l.line.clone())))
-                        .map(|(i, _)| i)
-                        .collect();
-                    let spot = self.rng.pick(&spots).unwrap_or(slot);
-                    if self.rng.below(2) == 0 {
-                        self.line_edit(w, h, &LineEdit::Delete(spot), "");
-                    } else {
-                        self.write(w, h, spot, tally);
-                    }
-                    close_checked(w, &mut self.o, h, tally)?;
+                    self.write(w, h, spot, tally);
                 }
+                close_checked(w, &mut self.o, h, tally)?;
             }
         }
         Ok(true)
@@ -1625,27 +1456,21 @@ fn run_as(
             Some(x) if k.rng.below(2) == 0 => x,
             _ => (FILES[k.rng.below(FILES.len())], k.rng.below(HOT_SLOTS)),
         };
-        // Only a client not blocked in a waiting call makes one.
         let mut clients: Vec<Client> = k.mains.iter().cloned().map(Client::Main).collect();
         clients.extend(live_clients(w).into_iter().map(Client::Fork));
         // Another program of a fork differs from its client only while a
         // transaction is open there.
         clients.extend(in_txn(w).into_iter().map(Client::Outside));
-        clients.retain(|c| !blocked(w, c));
         let open: Vec<_> = w
             .handles()
-            .filter(|h| {
-                !h.waiting && !h.deferred && h.kind == Kind::Write && !blocked(w, &h.client)
-            })
+            .filter(|h| !h.deferred && h.kind == Kind::Write)
             .map(|h| h.id)
             .collect();
         let e = |e| (step, e);
         match k.rng.below(34) {
             0..=2 => {
                 let who = Client::Main(k.mains[k.rng.below(k.mains.len())].clone());
-                if !blocked(w, &who)
-                    && let Some(p) = w.client_path(&who, f)
-                {
+                if let Some(p) = w.client_path(&who, f) {
                     k.save(w, &who, &p, slot, tally).map_err(e)?;
                 }
             }
@@ -1665,7 +1490,7 @@ fn run_as(
                 }
             }
             4..=6 => {
-                if let Some(c) = k.rng.pick(&free_clients(w)).map(Client::Fork)
+                if let Some(c) = k.rng.pick(&live_clients(w)).map(Client::Fork)
                     && let Some(p) = w.client_path(&c, f)
                 {
                     k.save(w, &c, &p, slot, tally).map_err(e)?;
@@ -1673,7 +1498,7 @@ fn run_as(
                 }
             }
             7 if g.transactions => {
-                if let Some(f) = k.rng.pick(&free_clients(w)) {
+                if let Some(f) = k.rng.pick(&live_clients(w)) {
                     let _ = w.begin(f);
                     k.o.reload(w);
                 }
@@ -1682,7 +1507,6 @@ fn run_as(
                 // Mostly commit a transaction that staged something, so
                 // commits meet concurrent lines.
                 if let Some(f) = k.rng.pick(&in_txn(w))
-                    && !blocked(w, &Client::Fork(f))
                     && (w.forks[&f]
                         .txn
                         .as_ref()
@@ -1694,7 +1518,6 @@ fn run_as(
             }
             9 => {
                 if let Some(f) = k.rng.pick(&in_txn(w))
-                    && !blocked(w, &Client::Fork(f))
                     && k.rng.below(2) == 0
                 {
                     rollback_checked(w, &mut k.o, f).map_err(e)?;
@@ -1719,8 +1542,7 @@ fn run_as(
                 if let Some(c) = k.rng.pick(&clients)
                     && let Some(p) = w.client_path(&c, f)
                 {
-                    let h = k.open(w, &c, &p, tally);
-                    tally.open_waits += usize::from(w.handle(h).waiting);
+                    k.open(w, &c, &p, tally);
                 }
             }
             13..=15 => {
@@ -1800,7 +1622,7 @@ fn run_as(
                         .copied()
                         .filter(|f| !locked.iter().any(|l| l == f))
                         .collect();
-                    let kids: Vec<ForkId> = free_clients(w)
+                    let kids: Vec<ForkId> = live_clients(w)
                         .into_iter()
                         .filter(|f| w.forks[f].upstream == t && w.forks[f].txn.is_none())
                         .collect();
@@ -1814,8 +1636,8 @@ fn run_as(
                     }
                 }
             }
-            26..=33 if !w.holds().is_empty() || !w.waits().is_empty() => {
-                k.during_take(w, slot, tally).map_err(e)?;
+            26..=33 if !w.waits().is_empty() => {
+                k.while_waiting(w, slot, tally).map_err(e)?;
             }
             _ => {
                 if let Some(s) = k.rng.pick(&pending_of(w, g)) {
@@ -2040,19 +1862,19 @@ fn run_all(policies: Policies) {
             "no change lost whole with a clean line in {} seeds",
             seeds().len()
         );
-        // Takes really wait for write-opens (rule 9), and opens for takes.
+        // Takes really wait for write-opens (rule 9).
         assert!(
-            tally.take_waits > 0 && tally.open_waits > 0,
-            "no take or no open waited in {} seeds: {tally:?}",
+            tally.take_waits > 0,
+            "no take waited in {} seeds: {tally:?}",
             seeds().len()
         );
         // Rules 10 and 11 met in the random runs, not in one scenario
         // each: a new line placed beside an upstream's concurrent new line,
         // an edit of a file the upstream had unlinked; and saves made while
-        // a take held files in their tree.
+        // an entry waited for files in their tree.
         assert!(
-            tally.inserts_met > 0 && tally.unlinked_edits > 0 && tally.saves_during_takes > 0,
-            "rules 10 and 11, or saves during takes, not met in {} seeds: {tally:?}",
+            tally.inserts_met > 0 && tally.unlinked_edits > 0 && tally.saves_while_waiting > 0,
+            "rules 10 and 11, or saves while an entry waits, not met in {} seeds: {tally:?}",
             seeds().len()
         );
         // Atomic saves, and old writers whose calls an atomic save, an
@@ -2154,7 +1976,7 @@ fn run_scoped(generate: Run, seeds: &[u64], at_least: impl Fn(&Tally) -> bool) {
 #[test]
 fn random_interleavings_phase1_scope() {
     run_scoped(run_phase1, &seeds(), |t| {
-        t.take_waits > 0 && t.open_waits > 0 && t.overtakes > 0 && t.prefix_syncs > 0
+        t.take_waits > 0 && t.overtakes > 0 && t.prefix_syncs > 0
     });
 }
 

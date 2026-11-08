@@ -31,12 +31,10 @@ fn take(w: &mut World, s: &Step) {
     ok(w);
 }
 
-/// One queued change taken whole (its take begins and ends: rule 9),
-/// checking after each step.
+/// One queued change taken whole (rule 9: one step), then every invariant.
 fn next(w: &mut World, t: Tree) {
     take(w, &Step::Next(t));
     assert!(w.waits().get(&t).is_none(), "{t:?}'s queue waits");
-    take(w, &Step::Finish(t));
 }
 
 /// Every step until none is left, checking after each; then convergence.
@@ -1653,8 +1651,8 @@ fn r9_a_landing_waits_for_an_open_file_that_took_a_name_it_touches() {
         "and no file of its own"
     );
     assert!(
-        w.holds().is_empty(),
-        "it holds nothing while it waits (R9.4)"
+        w.last_take().is_none(),
+        "it locks nothing while it waits (R9.4)"
     );
     w.close(held);
     ok(&mut w);
@@ -1799,51 +1797,54 @@ fn r9_a_landing_waits_for_the_upstreams_open_writer() {
     drain(&mut w);
 }
 
-/// Rule 9: a landing holds every file its changes touch, a losing change's
-/// included, fixed when it begins. Here the fork's unlink of `a` loses
-/// (main's unseen line), so the plan writes nothing; main's write-open of
-/// `a` still waits, so no save of main's can delete that line mid-take and
-/// flip the unlink to a win that writes a file the take never held.
+/// Rule 9 (R9.1): a landing locks every file its changes touch, a losing
+/// change's included, not only what its plan writes. Here the fork's unlink
+/// of `a` loses (main's unseen line), so the plan writes nothing; the landing
+/// still waits while main's program has `a` open for writing, and its take,
+/// one step, goes once that open closes.
 #[test]
 fn r9_a_landing_holds_the_files_of_its_losing_changes() {
     let mut w = world();
     let f = w.create_fork(Tree::Main);
     w.unlink(&Client::Fork(f), "a");
     let m = w.save(&m1(), "a", 0);
+    let h = w.open_write(&m1(), "a");
     take(&mut w, &Step::Next(Tree::Main));
     assert!(
-        w.holds()[&Tree::Main].files.contains("a"),
-        "the losing unlink's file is held"
+        w.waiting_for(Tree::Main).contains("a") && w.last_take().is_none(),
+        "the losing unlink's file is locked: the landing waits for its writer"
     );
-    let h = w.open_write(&m1(), "a");
+    w.close(h);
     ok(&mut w);
-    assert!(w.handle(h).waiting, "the open waits");
-    take(&mut w, &Step::Finish(Tree::Main));
-    assert!(!w.handle(h).waiting, "the release granted it");
+    next(&mut w, Tree::Main);
+    let (_, taken) = w.last_take().expect("the landing is taken");
+    assert!(taken.files.contains("a"), "{:?}", taken.files);
     assert!(has(&w, Tree::Main, "a", &m), "the unlink lost");
     let c = w.collisions.last().expect("a collision").clone();
     assert!(c.by == By::File && c.won == [m.clone()], "{c:?}");
-    w.edit(h, LineEdit::Delete(0));
-    w.close(h);
     drain(&mut w);
 }
 
-/// Rule 9: while a sync holds `a`, a new write-open of `a` waits; the
-/// sync's release (an event) grants it, showing the synced file.
+/// Rule 9: a take is one step (the owner, 2026-11-08, finding 49: "B"), so
+/// a sync locks `a` and writes it with no call in between: a write-open of
+/// `a` made after it shows the synced file at once, and one of another file
+/// is unaffected.
 #[test]
-fn r9_a_write_open_waits_while_a_sync_holds_the_file() {
+fn r9_a_write_open_after_a_sync_shows_the_synced_file() {
     let mut w = world();
     let f = w.create_fork(Tree::Main);
     let m = w.save(&m1(), "a", 0);
     take(&mut w, &Step::Next(Tree::Fork(f)));
-    assert!(w.holds()[&Tree::Fork(f)].files.contains("a"));
+    let (t, taken) = w.last_take().expect("the sync is taken").clone();
+    assert!(t == Tree::Fork(f) && taken.files.contains("a"));
     let h = w.open_write(&Client::Fork(f), "a");
     ok(&mut w);
-    assert!(w.handle(h).waiting, "the open waits");
+    assert_eq!(
+        w.view(h),
+        w.read(Tree::Main, "a").bytes(),
+        "it shows the synced file"
+    );
     let other = w.open_write(&Client::Fork(f), "b");
-    assert!(!w.handle(other).waiting, "an unheld file opens at once");
-    take(&mut w, &Step::Finish(Tree::Fork(f)));
-    assert!(!w.handle(h).waiting, "the release granted it");
     let x = w.edit(h, LineEdit::Append).unwrap();
     w.close(h);
     w.close(other);
@@ -1854,7 +1855,7 @@ fn r9_a_write_open_waits_while_a_sync_holds_the_file() {
 
 /// Rule 9, the client's death (its end event) releases its locks: its
 /// open file closes, saving its write calls, which wakes the waiting sync;
-/// its waiting open is dropped.
+/// another fork's client's open closes with it.
 #[test]
 fn r9_client_death_releases_its_locks() {
     let mut w = world();
@@ -1866,8 +1867,7 @@ fn r9_client_death_releases_its_locks() {
     assert!(w.waits().contains_key(&Tree::Fork(f)));
     let n = w.save(&m1(), "b", 0);
     take(&mut w, &Step::Next(Tree::Fork(g)));
-    let waiting = w.open_write(&Client::Fork(g), "a");
-    assert!(w.handle(waiting).waiting);
+    w.open_write(&Client::Fork(g), "a");
     w.end_client(f);
     w.end_client(g);
     ok(&mut w);
@@ -1878,21 +1878,18 @@ fn r9_client_death_releases_its_locks() {
 }
 
 /// Rule 9, one of main's clients dies (its end event) holding `a` open
-/// for writing while main's queue waits for it, and waiting to open `b`,
-/// which a landing holds: its write calls are saved as the kernel's close
-/// on exit would, which wakes the queue; its waiting open is dropped; and
-/// no lock of it outlives it (`locks`).
+/// for writing while main's queue waits for it: its write calls are saved
+/// as the kernel's close on exit would, which wakes the queue; and no lock
+/// of it outlives it (`locks`).
 #[test]
 fn r9_a_main_clients_death_releases_its_locks() {
     let mut w = world();
     let f = w.create_fork(Tree::Main);
     let x = w.save(&Client::Fork(f), "b", 0);
     take(&mut w, &Step::Next(Tree::Main));
-    assert!(w.holds()[&Tree::Main].files.contains("b"));
-    let waiting = w.open_write(&m1(), "b");
-    assert!(w.handle(waiting).waiting);
-    take(&mut w, &Step::Finish(Tree::Main));
-    w.close(waiting);
+    assert!(w.last_take().is_some_and(|(_, x)| x.files.contains("b")));
+    let after = w.open_write(&m1(), "b");
+    w.close(after);
     let h = w.open_write(&m1(), "a");
     let y = w.edit(h, LineEdit::At(0)).unwrap();
     let z = w.save(&Client::Fork(f), "a", 2);
@@ -1904,7 +1901,10 @@ fn r9_a_main_clients_death_releases_its_locks() {
     ok(&mut w);
     assert!(w.waits().is_empty(), "the death woke main's queue");
     assert!(has(&w, Tree::Main, "a", &y), "its write calls were saved");
-    assert!(!w.handle(other).waiting, "another client's open stays");
+    assert!(
+        w.handles().any(|h| h.id == other),
+        "another client's open stays"
+    );
     next(&mut w, Tree::Main);
     assert!(has(&w, Tree::Main, "a", &z));
     w.close(other);
@@ -2020,8 +2020,8 @@ fn r5_io_on_a_transactions_files_is_deferred_past_its_commit() {
 
     let x = w.edit(open, LineEdit::Append).unwrap();
     w.close(open);
-    assert_eq!(w.unlink(&other, "b"), None, "an unlink returns at once");
-    assert_eq!(w.rename(&other, "d", "d2"), None, "so does a rename");
+    w.unlink(&other, "b"); // returns at once
+    w.rename(&other, "d", "d2"); // so does a rename
     let reopened = w.open_write(&other, "a");
     w.write(reopened, Write::Truncate(0));
     w.close(reopened);
@@ -2048,11 +2048,11 @@ fn r5_io_on_a_transactions_files_is_deferred_past_its_commit() {
     drain(&mut w);
 }
 
-/// R5.3 with rule 9: a path call that waited for a take's hold, and whose file
-/// is a transaction's when the release lets it go, defers: no call waits on a
-/// transaction.
+/// R5.3 with rule 9: a path call made right after a take of its file, whose
+/// file is a transaction's, defers: no call waits on a take (one step) or on
+/// a transaction.
 #[test]
-fn r5_a_path_call_a_take_let_go_defers() {
+fn r5_a_path_call_after_a_take_defers() {
     let mut w = world();
     let f = w.create_fork(Tree::Main);
     let t = Tree::Fork(f);
@@ -2061,10 +2061,9 @@ fn r5_a_path_call_a_take_let_go_defers() {
     w.save(&c, "b", 0);
     w.save(&m1(), "b", 1);
     take(&mut w, &Step::Next(t));
-    let h = w.unlink(&other, "b").expect("it waits for the hold");
-    assert!(w.handle(h).waiting);
-    take(&mut w, &Step::Finish(t));
-    assert!(!w.handle(h).waiting && w.handle(h).deferred);
+    w.unlink(&other, "b");
+    let h = *w.forks[&f].deferred.back().expect("it defers");
+    assert!(w.handle(h).deferred);
     assert!(w.path_of(t, "b").is_some());
     assert_eq!(w.commit_txn(f), Ok(TxnOutcome::Committed));
     ok(&mut w);
@@ -2086,7 +2085,7 @@ fn r5_a_rollback_applies_what_it_deferred() {
     let start = w.head(t);
     let x = w.edit(open, LineEdit::Append).unwrap();
     w.close(open);
-    assert_eq!(w.unlink(&other, "a"), None);
+    w.unlink(&other, "a");
     assert_eq!(w.head(t), start);
     w.rollback(f).unwrap();
     ok(&mut w);
@@ -2139,7 +2138,7 @@ fn r5_a_crash_keeps_what_a_transaction_deferred() {
     let staged_b = w.save(&c, "b", 0);
     let x = w.edit(closed, LineEdit::Append).unwrap();
     w.close(closed);
-    assert_eq!(w.unlink(&other, "b"), None);
+    w.unlink(&other, "b");
     let y = w.edit(open, LineEdit::Append).unwrap();
     let start = w.head(t);
     w.crash();
@@ -2196,11 +2195,11 @@ fn r5_a_deferred_save_holds_back_a_sync_of_its_file() {
 fn r10_an_agreeing_delete_of_a_rename_overs_file_agrees() {
     let mut w = world();
     let f = w.create_fork(Tree::Main);
-    assert_eq!(w.unlink(&Client::Fork(f), "d"), None);
+    w.unlink(&Client::Fork(f), "d");
     ok(&mut w);
-    assert_eq!(w.rename(&m1(), "d", "c"), None);
+    w.rename(&m1(), "d", "c");
     ok(&mut w);
-    assert_eq!(w.unlink(&m1(), "c"), None);
+    w.unlink(&m1(), "c");
     ok(&mut w);
     next(&mut w, Tree::Main);
     drain(&mut w);
@@ -2596,7 +2595,7 @@ fn r10_repeated_identical_lines_align_by_the_diff() {
 fn r11_an_unlink_against_a_concurrent_edit_the_upstream_wins() {
     let mut w = world();
     let f = w.create_fork(Tree::Main);
-    assert_eq!(w.unlink(&Client::Fork(f), "a"), None);
+    w.unlink(&Client::Fork(f), "a");
     assert_eq!(w.path_of(Tree::Fork(f), "a"), None, "unlinked at once");
     let m = w.save(&m1(), "a", 0);
     drain(&mut w);
@@ -2772,25 +2771,25 @@ fn r11_a_rename_over_whose_rename_loses_keeps_the_replaced_file() {
     assert_eq!(lost, BTreeSet::from(["a", "b"]), "both halves lose");
 }
 
-/// Rule 11 with rule 9: an unlink or a rename of a file a take holds waits
-/// like a write-open, and the take's release runs it; a rename onto a held
-/// file waits too. A take that brings an unlink waits for the fork's
-/// open writer of that file.
+/// Rule 11 with rule 9 (R9.7): a take is one step (the owner, 2026-11-08,
+/// finding 49: "B"), so an unlink or a rename of a file it locked, or onto
+/// one, runs after its write, on the synced file. A take that brings an
+/// unlink waits for the fork's open writer of that file.
 #[test]
-fn r11_an_unlink_or_rename_of_a_held_file_waits() {
+fn r11_an_unlink_or_rename_of_a_held_file_runs_after_the_take() {
     let mut w = world();
     let f = w.create_fork(Tree::Main);
     let c = Client::Fork(f);
-    w.save(&m1(), "a", 0);
+    let m = w.save(&m1(), "a", 0);
     take(&mut w, &Step::Next(Tree::Fork(f)));
-    let h = w.unlink(&c, "a").expect("waits");
-    assert!(w.handle(h).waiting && w.path_of(Tree::Fork(f), "a").is_some());
-    take(&mut w, &Step::Finish(Tree::Fork(f)));
+    assert!(w.last_take().is_some_and(|(_, x)| x.files.contains("a")));
+    assert!(has(&w, Tree::Fork(f), "a", &m), "the take wrote a");
+    w.unlink(&c, "a");
     assert_eq!(w.path_of(Tree::Fork(f), "a"), None, "it ran");
-    w.save(&m1(), "c", 0);
+    let n = w.save(&m1(), "c", 0);
     take(&mut w, &Step::Next(Tree::Fork(f)));
-    assert!(w.rename(&c, "d", "c").is_some(), "onto a held file");
-    take(&mut w, &Step::Finish(Tree::Fork(f)));
+    assert!(has(&w, Tree::Fork(f), "c", &n), "the take wrote c");
+    w.rename(&c, "d", "c");
     assert_eq!(w.path_of(Tree::Fork(f), "d").as_deref(), Some("c"));
     drain(&mut w);
     w.unlink(&m1(), "b");
@@ -2843,7 +2842,7 @@ fn atomic_save(
     let h = w.create(c, tmp).expect("an unborn identity left");
     w.write(h, Write::Append(new.clone()));
     w.close(h);
-    assert!(w.rename(c, tmp, p).is_none(), "the rename ran at once");
+    w.rename(c, tmp, p);
     new
 }
 
@@ -2923,7 +2922,6 @@ fn r11_an_old_writer_after_an_atomic_save_saves_nothing() {
         w.save(&Client::Fork(g), "a", 3);
         take(&mut w, &Step::Next(t));
         assert!(!w.waits().contains_key(&t), "the landing does not wait");
-        take(&mut w, &Step::Finish(t));
         w.write(
             h,
             Write::Pwrite {
@@ -2969,7 +2967,7 @@ fn r11_an_open_on_the_new_file_follows_it_through_the_atomic_save() {
     let mut w = world();
     let h = w.create(&m1(), "a.tmp").unwrap();
     w.write(h, Write::Append("x\n".into()));
-    assert!(w.rename(&m1(), "a.tmp", "a").is_none());
+    w.rename(&m1(), "a.tmp", "a");
     ok(&mut w);
     assert_eq!(
         w.read(Tree::Main, "a").bytes(),
@@ -2989,8 +2987,7 @@ fn r11_an_open_on_the_new_file_follows_it_through_the_atomic_save() {
 
 /// Rule 12: a crash of every agentfs process saves each open from the
 /// journal as its close would have, so every write call that returned
-/// survives, each save naming its open (`Agentfs-Open`); a waiting open,
-/// which never returned, is dropped.
+/// survives, each save naming its open (`Agentfs-Open`).
 #[test]
 fn r12_a_crash_saves_every_open_from_the_journal() {
     let mut w = world();
@@ -3028,14 +3025,15 @@ fn r12_a_crash_saves_every_open_from_the_journal() {
 
 /// Rule 12: a crash after a close's save but before its journal records
 /// are dropped: the replay finds the save naming the open and does not
-/// save it again. A take in progress is lost and taken again.
+/// save it again. A take is one step (finding 49), so the take before it
+/// wrote whole and stays.
 #[test]
 fn r12_a_crash_during_a_close_saves_the_open_once() {
     let mut w = world();
     let f = w.create_fork(Tree::Main);
     w.save(&Client::Fork(f), "b", 0);
     take(&mut w, &Step::Next(Tree::Main));
-    assert!(!w.holds().is_empty());
+    assert!(w.last_take().is_some());
     let h = w.open_write(&m1(), "a");
     w.write(h, Write::Append("x\n".into()));
     let head = w.main_head.clone();
@@ -3050,10 +3048,7 @@ fn r12_a_crash_during_a_close_saves_the_open_once() {
         git(w.repo(), &["rev-parse", &format!("{}^1", w.main_head)]),
         head
     );
-    assert!(
-        w.holds().is_empty() && w.queue_len(Tree::Main) == 1,
-        "the take went back"
-    );
+    assert_eq!(w.queue_len(Tree::Main), 0, "the take stays taken");
     drain(&mut w);
     assert_eq!(w.read(Tree::Main, "a").bytes().matches("x\n").count(), 1);
     assert_eq!(w.read(Tree::Main, "b"), w.read(Tree::Fork(f), "b"));
@@ -3310,8 +3305,7 @@ fn r9_a_long_lived_main_writer_holds_back_only_its_own_file() {
         "f's landing of a waits for the writer"
     );
     take(&mut w, &Step::Next(Tree::Main));
-    assert!(w.holds().contains_key(&Tree::Main), "g's landing is taken");
-    take(&mut w, &Step::Finish(Tree::Main));
+    assert!(w.last_take().is_some(), "g's landing is taken");
     assert!(
         has(&w, Tree::Main, "b", &y),
         "g's unrelated change went ahead"
@@ -3350,7 +3344,7 @@ fn r9_new_writers_postpone_a_waiting_take() {
     assert!(w.waits().contains_key(&Tree::Main));
     let second = w.open_write(&m2, "a");
     assert!(
-        !w.handle(second).waiting,
+        w.handles().any(|h| h.id == second),
         "the new open is granted, not made to wait behind the take"
     );
     w.close(first);
@@ -3360,7 +3354,7 @@ fn r9_new_writers_postpone_a_waiting_take() {
         "the second writer still has it open: the take still waits"
     );
     let third = w.open_write(&Client::Main("m3".into()), "a");
-    assert!(!w.handle(third).waiting);
+    assert!(w.handles().any(|h| h.id == third));
     w.close(second);
     ok(&mut w);
     assert!(w.waits().contains_key(&Tree::Main));
@@ -3400,10 +3394,13 @@ fn r9_a_writer_holding_a_waited_file_is_not_made_to_wait() {
         "the landing of a and b waits for a"
     );
     let b = w.open_write(&m1(), "b");
-    assert!(!w.handle(b).waiting, "m1 holds a: not made to wait");
+    assert!(
+        w.handles().any(|h| h.id == b),
+        "m1 holds a: not made to wait"
+    );
     let other = w.open_write(&Client::Main("m2".into()), "b");
     assert!(
-        !w.handle(other).waiting,
+        w.handles().any(|h| h.id == other),
         "another client's open of b is granted too"
     );
     w.close(b);
@@ -3461,10 +3458,9 @@ fn r9_a_held_file_holds_back_only_its_saves() {
     let y = w.save(&Client::Fork(f), "b", 0);
     take(&mut w, &Step::Next(Tree::Main));
     assert!(
-        w.holds().contains_key(&Tree::Main),
+        w.last_take().is_some(),
         "the save of a is taken, not held back by b"
     );
-    take(&mut w, &Step::Finish(Tree::Main));
     assert!(has(&w, Tree::Main, "a", &x));
     assert!(!has(&w, Tree::Main, "b", &y));
     take(&mut w, &Step::Next(Tree::Main));
@@ -3488,7 +3484,7 @@ fn r9_a_held_file_holds_back_only_its_saves() {
     assert!(w.waits().contains_key(&Tree::Main));
     let other = w.open_write(&Client::Main("m3".into()), "b");
     assert!(
-        !w.handle(other).waiting,
+        w.handles().any(|h| h.id == other),
         "the waiting save of a does not lock b"
     );
     w.close(other);
@@ -3518,7 +3514,7 @@ fn r9_cooperating_programs_never_deadlock() {
     );
     let child = w.open_write(&Client::Main("m2".into()), "a");
     assert!(
-        !w.handle(child).waiting,
+        w.handles().any(|h| h.id == child),
         "m2's open is granted: nothing waits on m1's close but the take"
     );
     w.write(child, Write::Append("m2\n".into()));
@@ -3549,10 +3545,9 @@ fn r9_a_sync_delivers_up_to_the_first_change_to_an_open_file() {
     let mc = w.save(&m1(), "c", 0);
     take(&mut w, &Step::Next(t));
     assert!(
-        w.holds().contains_key(&t) && w.waits().get(&t).is_some_and(|m| m.len() == 1),
+        w.last_take().is_some() && w.waits().get(&t).is_some_and(|m| m.len() == 1),
         "it delivers a prefix and waits for the rest"
     );
-    take(&mut w, &Step::Finish(t));
     assert!(
         has(&w, t, "b", &mb),
         "b, before the change to a, is delivered"
@@ -3636,9 +3631,6 @@ fn r9_a_prefix_sync_delivers_no_upstream_decision_before_its_commit() {
     }
     assert!(has(&w, Tree::Main, "a", &m) && !has(&w, Tree::Main, "a", &x));
     take(&mut w, &Step::Next(tg));
-    if w.holds().contains_key(&tg) {
-        take(&mut w, &Step::Finish(tg));
-    }
     assert!(w.prefix_syncs > 0, "a prefix sync");
     assert!(has(&w, tg, "a", &x), "G keeps x until the decision arrives");
     w.close(hb);
@@ -3671,9 +3663,6 @@ fn r9_a_prefix_sync_holds_back_the_decisions_of_the_commits_it_holds_back() {
         "x lost in P"
     );
     take(&mut w, &Step::Next(tg));
-    if w.holds().contains_key(&tg) {
-        take(&mut w, &Step::Finish(tg));
-    }
     assert!(w.prefix_syncs > 0, "a prefix sync");
     assert!(has(&w, tg, "a", &x), "G keeps x until the decision arrives");
     w.close(hb);
@@ -3714,9 +3703,6 @@ fn r9_a_prefix_sync_holds_back_a_transaction_whole() {
     // transaction. The first two deliver; the transaction waits whole.
     while w.pending().contains(&Step::Next(t)) {
         take(&mut w, &Step::Next(t));
-        if w.holds().contains_key(&t) {
-            take(&mut w, &Step::Finish(t));
-        }
     }
     assert!(has(&w, t, "a", &own) && has(&w, t, "b", &mb));
     assert!(
@@ -3727,4 +3713,35 @@ fn r9_a_prefix_sync_holds_back_a_transaction_whole() {
     ok(&mut w);
     drain(&mut w);
     assert!(has(&w, t, "c", &gc));
+}
+
+/// Coherence finding 50 (seed 401 of the random runs at 500 seeds, 2026-11-08; the
+/// model before finding 49's fix fails the same calls the same way): f2 is a fork of
+/// f1, made while f1's save x of `b` is undecided. Main's save m of `b` wins against x,
+/// and f1, having no other commit, then syncs by fast-forwarding to main's landing, so
+/// f1's first parents are main's. f2 keeps `b` open, so its prefix sync (R9.3) delivers
+/// only main's save of `c`, a commit with neither x nor the decision against x, which
+/// it holds back (R9.9). f2 keeps x; `syncs_deliver` wants the upstream's version
+/// there, since x is f1's own line, not f2's.
+#[test]
+#[ignore = "coherence finding 50: a nested fork's prefix sync past its upstream's fast-forward keeps the upstream's lost line, which syncs_deliver does not excuse"]
+fn finding_50_a_nested_prefix_sync_past_a_fast_forward_keeps_the_upstreams_lost_line() {
+    let mut w = world();
+    let f1 = w.create_fork(Tree::Main);
+    let x = w.save(&Client::Fork(f1), "b", 0);
+    w.save(&m1(), "c", 0);
+    let m = w.save(&m1(), "b", 0);
+    let f2 = w.create_fork(Tree::Fork(f1));
+    let held = w.open_write(&Client::Fork(f2), "b");
+    next(&mut w, Tree::Main);
+    assert!(has(&w, Tree::Main, "b", &m) && !has(&w, Tree::Main, "b", &x));
+    next(&mut w, Tree::Fork(f1));
+    assert_eq!(
+        w.head(Tree::Fork(f1)),
+        w.main_head,
+        "f1 fast-forwards to main"
+    );
+    take(&mut w, &Step::Next(Tree::Fork(f2)));
+    w.close(held);
+    drain(&mut w);
 }

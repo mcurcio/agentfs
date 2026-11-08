@@ -1,14 +1,2 @@
 # Traces that fail for an open finding (MODEL.md), which replay requires to keep
 # failing: `<finding> <trace file>`. Take a line off when its finding closes.
-# Findings 48 and 49: seeds past CI's, seen by `[phase1-seeds]` (ci/replay-seeds.sh).
-48 random_interleavings_phase1_scope.seed101.trace
-48 random_interleavings_phase1_scope.seed131.trace
-48 random_interleavings_phase1_scope.seed180.trace
-48 random_interleavings_phase1_scope.seed222.trace
-48 random_interleavings_phase1_scope.seed389.trace
-48 random_interleavings_phase1_scope.seed428.trace
-48 random_interleavings_rounds_phase1_scope.seed196.trace
-48 random_interleavings_rounds_phase1_scope.seed431.trace
-49 random_interleavings_phase1_scope.seed78.trace
-49 random_interleavings_phase1_scope.seed164.trace
-49 random_interleavings_phase1_scope.seed189.trace

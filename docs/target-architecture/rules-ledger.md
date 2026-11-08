@@ -205,7 +205,12 @@ of their day: "main" is the root, a "sandbox" is a fork, a "parent" is an upstre
 - **R9** · owner · A sync locks every file it will overwrite: it waits until no program has the file open for
   writing, holds the files while it writes, and new write-opens wait for it to finish. Every wait ends on an event,
   never a timer. Source: "A sync should acquire a lock on every file that it aims to overwrite, yes" (2026-11-03).
-  Tests: `r9_a_sync_waits_for_an_open_writer_then_applies`, `r9_a_write_open_waits_while_a_sync_holds_the_file`
+  In the model, as in the library, a take is one atomic step: it chooses its entry, locks its files and writes them with
+  no call in between, so a write-open waiting for it is the order itself. Owner, 2026-11-08, choosing between excluding
+  the traces of finding 49 and this: "Without any other information, B sounds reasonable. Obviously atomic operations
+  are more reliable". Revisable: option A was to exclude and count those traces.
+  Tests: `r9_a_sync_waits_for_an_open_writer_then_applies`, `r9_a_write_open_after_a_sync_shows_the_synced_file`,
+  `finding_49_a_take_is_one_step_so_its_trace_replays`
 - **R9.10** · owner · Locks order agentfs's own writes against clients only. Clients are never locked or
   serialized against each other (two programs on one file: last writer wins); agentfs only tracks their opens to
   know when it has the runway to sync or land. Locking must never deadlock and should starve as little as possible.
@@ -279,7 +284,8 @@ of their day: "main" is the root, a "sandbox" is a fork, a "parent" is an upstre
 - **R9.6** · approved · A client's death closes its open files and saves them, as Linux's close on exit does.
   Approved by the owner, 2026-11-05 (approval page). Tests: `r9_client_death_releases_its_locks`
 - **R9.7** · approved · `unlink` and `rename` of a locked file wait like a write-open.
-  Approved by the owner, 2026-11-05 (approval page). Tests: `r11_an_unlink_or_rename_of_a_held_file_waits`
+  Approved by the owner, 2026-11-05 (approval page). In the model a take is one step (R9), so such a call runs after it.
+  Tests: `r11_an_unlink_or_rename_of_a_held_file_runs_after_the_take`
 - **R9.8** · rejected · Each open that keeps a waiting landing waiting raises an alarm event. Owner, 2026-11-05:
   "no alarm is needed". Gone when: `Delayed`
 - **R9.9** · approved · A held-back commit's decisions are held back with it, so a decision never arrives before
@@ -359,8 +365,12 @@ of their day: "main" is the root, a "sandbox" is a fork, a "parent" is an upstre
   `r11_two_renames_to_one_path_keep_the_forks_name_until_decided`, `r11_a_chain_of_renames_to_one_path_keeps_every_previous_name`
 - **R11.5** · owner · A file the upstream unlinked, which a fork keeps under its undecided rename, keeps its lines until
   the upstream decides. Owner, 2026-11-07: "1 b 2 a 3 a 4 a is fine 5 a sounds correct, right? 6 a". This is his 3, option (a) of finding 44: the library changes. Revisable: option
-  (b) was that the model shows the file empty. What the file holds where the upstream edited it before the unlink is open
-  (finding 48). Tests: `finding_44_a_kept_rename_of_a_file_the_parent_unlinked_keeps_its_lines`
+  (b) was that the model shows the file empty. Where the upstream edited the file before the unlink, the fork never touched
+  its contents, so it shows the upstream's last edit (R3d), in the model and the library; the library's sync commit then
+  holds a line neither of its git parents holds, written by a commit in its own history, and the replay's `one_writer`
+  accepts exactly that. Owner, 2026-11-08, finding 48: "A". Revisable: option B was the contents before that edit.
+  Tests: `finding_44_a_kept_rename_of_a_file_the_parent_unlinked_keeps_its_lines`,
+  `finding_48_a_kept_file_takes_the_upstreams_last_lines_and_keeps_its_own`
 - **R11.2** · approved · An editor's atomic save (write a new file, rename it over the old one) is a rewrite of
   the old file, so the file keeps its identity and merges per line. Approved by the owner, 2026-11-05 (approval page). Tests: `r11_an_atomic_save_keeps_the_files_identity_and_merges_per_line`, `finding_39_a_losing_atomic_save_keeps_two_files_apart`,
   `r11_a_losing_atomic_save_keeps_two_files_apart`

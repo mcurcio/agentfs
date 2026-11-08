@@ -8,8 +8,9 @@
 //! ([`invariants`]).
 //!
 //! The replay does not prove what no call of it makes: shared mappings (the
-//! page-cache job), a client call waiting on a take, which replay order assumes
-//! (the mounted P1 and P2 cases), a crash inside a step or with unsynced loss
+//! page-cache job), a client call waiting on a take, which a one-step take never
+//! meets in the model and the replay order stands for (the mounted P1 and P2
+//! cases), a crash inside a step or with unsynced loss
 //! (the recording-faults and power-loss jobs), `ENOSPC` and `EIO` (the enospc
 //! job).
 
@@ -20,9 +21,7 @@ pub mod mounted;
 pub use library::Library;
 pub use mounted::Mounted;
 
-use agentfs_model::calls::{
-    Recorded, RecordedCall, TreeCalls, gather_collisions, replay, undone_takes,
-};
+use agentfs_model::calls::{Recorded, RecordedCall, TreeCalls, gather_collisions, replay};
 use agentfs_model::world::{Policies, World};
 use invariants::Invariants;
 use std::path::{Path, PathBuf};
@@ -30,13 +29,7 @@ use std::path::{Path, PathBuf};
 /// The trace against `t`, with the real system's invariants read from `repo`.
 fn against_real<T: TreeCalls>(trace: &[Recorded], t: &mut T, repo: &Path) -> Result<(), String> {
     let mut invariants = Invariants::new(repo)?;
-    let undone = undone_takes(trace);
-    let mut i = 0;
-    replay(trace, t, &mut |t, r| {
-        let was_undone = undone.contains(&i);
-        i += 1;
-        invariants.after(t, r, was_undone)
-    })
+    replay(trace, t, &mut |t, r| invariants.after(t, r))
 }
 
 /// The trace against a new real library.
@@ -98,7 +91,7 @@ pub fn mountable(trace: &[Recorded]) -> bool {
                     return false;
                 }
             }
-            RecordedCall::Take { .. } | RecordedCall::Finish { .. } => {}
+            RecordedCall::Take { .. } => {}
             _ => called = true,
         }
     }

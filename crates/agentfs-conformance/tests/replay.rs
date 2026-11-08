@@ -30,13 +30,12 @@ fn at(offset: usize, bytes: &str) -> Write {
     }
 }
 
-/// Every take the world's queues offer, finished.
+/// Every take the world's queues offer.
 fn drain(w: &mut World) {
     loop {
         let mut took = false;
         for t in [TreeId::Main, TreeId::Fork(1)] {
             if w.take_next(t).unwrap() == Took::Taken {
-                w.finish_take(t).unwrap();
                 took = true;
             }
         }
@@ -85,10 +84,10 @@ fn a_changed_byte_in_the_trace_is_a_mismatch() {
     assert!(e.contains("Main:c"), "{e}");
 }
 
-/// A crash in the middle of a take: the model's take went back to its queue, so
-/// the replay does not make it, and the entry is taken after the restart.
+/// A crash right after a take, with another file open: the take is one step, so it
+/// wrote whole before the crash (finding 49), and the restart saves the open.
 #[test]
-fn a_crash_during_a_take_undoes_it() {
+fn a_crash_after_a_take_keeps_it_and_saves_the_open() {
     let mut w = world();
     let f = w.create_fork(agentfs_model::world::Tree::Main);
     save(&mut w, &Client::Fork(f), "c", &[at(2, "s\n")]);
@@ -96,6 +95,7 @@ fn a_crash_during_a_take_undoes_it() {
     w.write(open, at(0, "m\n"));
     assert_eq!(w.take_next(TreeId::Main).unwrap(), Took::Taken);
     World::crash(&mut w);
+    assert_eq!(w.queue_len(agentfs_model::world::Tree::Main), 0);
     drain(&mut w);
     assert!(w.trace().iter().any(|r| r.call == RecordedCall::Crash));
     passes(&w);
@@ -203,14 +203,11 @@ fn finding_43_model_and_library_agree_on_a_hidden_line_the_sandbox_deleted() {
         &[Write::Truncate(0), at(0, "1\n2\n3\n4\n5\n6\n")],
     );
     assert_eq!(w.take_next(TreeId::Fork(1)).unwrap(), Took::Taken);
-    w.finish_take(TreeId::Fork(1)).unwrap();
     save(&mut w, &m1(), "c", &[at(0, "M")]);
     save(&mut w, &s, "c", &[Write::Truncate(8), at(0, "S")]);
     assert_eq!(w.take_next(TreeId::Main).unwrap(), Took::Taken);
-    w.finish_take(TreeId::Main).unwrap();
     save(&mut w, &s, "c", &[Write::Truncate(6), at(6, "yy")]);
     assert_eq!(w.take_next(TreeId::Fork(1)).unwrap(), Took::Taken);
-    w.finish_take(TreeId::Fork(1)).unwrap();
     assert_eq!(
         w.shown().trees[&TreeId::Fork(1)]["c"].as_slice(),
         b"M\n2\n3\nyy"
@@ -237,7 +234,6 @@ fn finding_38_a_sync_past_an_open_file_waits_for_any_line_map_change() {
     assert_eq!(w.take_next(TreeId::Fork(1)).unwrap(), Took::Waiting);
     World::close(&mut w, open);
     assert_eq!(w.take_next(TreeId::Fork(1)).unwrap(), Took::Taken);
-    w.finish_take(TreeId::Fork(1)).unwrap();
     passes(&w);
 }
 
@@ -317,7 +313,6 @@ fn finding_44_a_kept_rename_of_a_file_the_parent_unlinked_keeps_its_lines() {
     World::rename(&mut w, &s, "a", "e");
     World::unlink(&mut w, &m1(), "a");
     assert_eq!(w.take_next(TreeId::Fork(1)).unwrap(), Took::Taken);
-    w.finish_take(TreeId::Fork(1)).unwrap();
     assert_eq!(w.shown().trees[&TreeId::Fork(1)]["e"], lines);
     let undecided = w.trace().len();
     drain(&mut w);
@@ -326,14 +321,14 @@ fn finding_44_a_kept_rename_of_a_file_the_parent_unlinked_keeps_its_lines() {
     passes(&w);
 }
 
-/// Finding 48: the parent edited the file before its unlink. The edit arrives, as a sync
-/// brings any decided line (R3d), and the sandbox's undecided line stays (R3a), in the model
-/// and the library alike. But the library's sync commit then holds a line neither of its
-/// parents holds, since a parent that ended a file stores no map of it, and `one_writer`
-/// says a merge originates nothing.
+/// Finding 48 (the owner, 2026-11-08, "A"; R11.5): the upstream edited the file before its
+/// unlink. The edit arrives, as a sync brings any decided line (R3d), and the fork's
+/// undecided line stays (R3a), in the model and the library alike. The library's sync
+/// commit then holds a line neither of its git parents holds, since an upstream that ended
+/// a file stores no map of it; a commit in the merge's own history wrote it, so
+/// `one_writer` accepts it.
 #[test]
-#[ignore = "coherence finding 48: a sync commit holds a kept file's line from the parent's last version of it, which neither parent holds"]
-fn finding_48_a_kept_file_takes_the_parents_last_lines_and_keeps_its_own() {
+fn finding_48_a_kept_file_takes_the_upstreams_last_lines_and_keeps_its_own() {
     let mut w = world();
     let f = w.create_fork(agentfs_model::world::Tree::Main);
     let s = Client::Fork(f);
@@ -342,7 +337,6 @@ fn finding_48_a_kept_file_takes_the_parents_last_lines_and_keeps_its_own() {
     save(&mut w, &m1(), "a", &[at(4, "m\n")]);
     World::unlink(&mut w, &m1(), "a");
     assert_eq!(w.take_next(TreeId::Fork(1)).unwrap(), Took::Taken);
-    w.finish_take(TreeId::Fork(1)).unwrap();
     let kept = &w.shown().trees[&TreeId::Fork(1)]["e"];
     assert!(kept.starts_with(b"-\ns\nm\n"), "{kept:?}");
     passes(&w);
@@ -358,7 +352,6 @@ fn finding_45_a_landing_on_the_parents_head_is_a_fast_forward() {
     let s = Client::Fork(f);
     save(&mut w, &s, "a", &[at(0, "s\n")]);
     assert_eq!(w.take_next(TreeId::Main).unwrap(), Took::Taken);
-    w.finish_take(TreeId::Main).unwrap();
     let _held = w.open_write(&s, "a");
     save(&mut w, &m1(), "a", &[at(2, "m\n")]);
     assert_eq!(w.take_next(TreeId::Fork(1)).unwrap(), Took::Waiting);
@@ -379,7 +372,6 @@ fn finding_46_a_landing_waits_for_an_open_file_that_took_a_name_it_touches() {
     assert_eq!(w.take_next(TreeId::Main).unwrap(), Took::Waiting);
     World::close(&mut w, held);
     assert_eq!(w.take_next(TreeId::Main).unwrap(), Took::Taken);
-    w.finish_take(TreeId::Main).unwrap();
     passes(&w);
 }
 
@@ -394,7 +386,6 @@ fn finding_47_two_unlinks_agree_over_an_unseen_edit() {
     World::unlink(&mut w, &m1(), "c");
     World::unlink(&mut w, &s, "c");
     assert_eq!(w.take_next(TreeId::Main).unwrap(), Took::Taken);
-    w.finish_take(TreeId::Main).unwrap();
     assert!(w.collisions.is_empty(), "{:?}", w.collisions);
     passes(&w);
 }
@@ -410,7 +401,6 @@ fn finding_47_a_rename_over_agrees_with_an_unlink_over_an_unseen_edit() {
     World::unlink(&mut w, &m1(), "c");
     World::rename(&mut w, &s, "b", "c");
     assert_eq!(w.take_next(TreeId::Main).unwrap(), Took::Taken);
-    w.finish_take(TreeId::Main).unwrap();
     assert!(w.collisions.is_empty(), "{:?}", w.collisions);
     let shown = w.shown();
     assert!(shown.trees[&TreeId::Main].contains_key("c"));
@@ -431,17 +421,16 @@ fn finding_46_a_sync_of_a_file_the_sandbox_replaced_passes_the_name_it_took() {
     save(&mut w, &m1(), "d", &[at(2, "m\n")]);
     let _held = w.open_write(&s, "d");
     assert_eq!(w.take_next(TreeId::Fork(1)).unwrap(), Took::Taken);
-    w.finish_take(TreeId::Fork(1)).unwrap();
     passes(&w);
 }
 
-/// Finding 49 (seeds 78, 164 and 189): neither side is wrong, the trace is. Main takes `c`'s
-/// landing while `d`'s waits for an open file. During that hold the open closes and main
-/// commits, so the trace records the take after them, and there a one-step take picks `d`'s
-/// landing, which the run that recorded the trace did not.
+/// Finding 49 (seeds 78, 164 and 189; the owner, 2026-11-08, "B"): a take is one atomic
+/// step in the model too. Main takes `c`'s landing while `d`'s waits for an open file: the
+/// take has written `c` when `take_next` returns, before the close that frees `d`'s landing
+/// and main's next save. The trace is the order the calls ran in, so a fresh model and the
+/// library take the same entries at the same calls.
 #[test]
-#[ignore = "coherence finding 49: a take recorded later than it began picks an earlier entry that a call in between freed"]
-fn finding_49_a_take_recorded_past_a_close_picks_the_earlier_entry() {
+fn finding_49_a_take_is_one_step_so_its_trace_replays() {
     let mut w = world();
     let tree = agentfs_model::world::Tree::Main;
     let (f, g) = (w.create_fork(tree), w.create_fork(tree));
@@ -449,14 +438,21 @@ fn finding_49_a_take_recorded_past_a_close_picks_the_earlier_entry() {
     save(&mut w, &Client::Fork(f), "d", &[at(2, "s\n")]);
     save(&mut w, &Client::Fork(g), "c", &[at(2, "t\n")]);
     assert_eq!(w.take_next(TreeId::Main).unwrap(), Took::Taken);
-    World::close(&mut w, held);
-    save(&mut w, &m1(), "a", &[at(2, "m\n")]);
-    w.finish_take(TreeId::Main).unwrap();
     assert_eq!(
         &w.shown().trees[&TreeId::Main]["c"][..4],
         b"-\nt\n",
-        "the run took c's landing"
+        "c's landing is written when its take returns"
     );
-    let trace = parse(&render(w.trace())).unwrap();
-    against_model(&trace).unwrap();
+    World::close(&mut w, held);
+    save(&mut w, &m1(), "a", &[at(2, "m\n")]);
+    assert_eq!(w.take_next(TreeId::Main).unwrap(), Took::Taken);
+    assert_eq!(&w.shown().trees[&TreeId::Main]["d"][..4], b"-\ns\n");
+    let takes: Vec<&RecordedCall> = w
+        .trace()
+        .iter()
+        .map(|r| &r.call)
+        .filter(|c| matches!(c, RecordedCall::Take { .. }))
+        .collect();
+    assert_eq!(takes.len(), 2, "one recorded call per take: {takes:?}");
+    passes(&w);
 }

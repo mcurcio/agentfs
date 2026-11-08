@@ -104,10 +104,9 @@ the expected failure.
 | `random_interleavings_git_merge_base` | 1 | 38 of 64 seeds since the name locks of finding 46 (2026-11-07; 40 before them), 2 of them (seeds 32 and 46) a "harness panic: a model file in git": a sync that leaves a line "which Main already took" or drops a line (with the calls of programs outside a transaction, 2026-11-05; 34 with no P3 and the prefix sync; 35 after the fix pass of the review of 2026-11-04, whose generator changes move the random calls; with creates, crashes and the progress rules 36; with the byte calls alone 32; before them 39 of 64, 2 of them a "harness panic: a model file in git", when git's merge leaves one line identity twice) |
 | `finding_6_git_hunks_on_neighbouring_lines` | 6 | a sync leaves a line "which Main already took" |
 | `finding_30_a_transactions_line_after_the_forks_unfinished_line` | 30 | two lines read as one, `}n9` |
-| `finding_48_a_kept_file_takes_the_parents_last_lines_and_keeps_its_own` | 48 | replay: `one_writer: merge ... originates 24:1 of file 1` |
-| `finding_49_a_take_recorded_past_a_close_picks_the_earlier_entry` | 49 | the fresh model: `Main:c shows "-\n-\n-\n-\n-\n-\n"`, the trace `"-\nt\n..."` |
+| `finding_50_a_nested_prefix_sync_past_a_fast_forward_keeps_the_upstreams_lost_line` | 50 | a sync into `Fork(2)` "left b[b0] at c1.1, which Fork(1) already took" |
 
-Findings 48 and 49's tests are in `crates/agentfs-conformance/tests/replay.rs`; findings 36 to 47 pass there since the owner's answers. These
+Findings 36 to 49 pass in `crates/agentfs-conformance/tests/replay.rs` since the owner's answers (48 and 49 on 2026-11-08). These
 were the results at seeds 1..64 on 2026-11-05, unchanged on 2026-11-06; a change that moves a count says so in
 its pull request. Findings 29, 31, 32 and 33 pass since the owner's rules R10.6, R10.3, R10.8 and R10.9, under
 `r10_*` names (MODEL.md); finding 35 passes since the owner's answer of 2026-11-06 under R10.6, under its own name. Finding 27's and finding 28's tests pass since the owner's decisions of 2026-11-05 (one of them went
@@ -315,14 +314,13 @@ What a replay decides, each reported rather than hidden:
 - **Scope.** A trace is out if it used transactions, `Client::Outside`, nested forks, `Step::Drop` or another policy
   (`scope_of`). `random_interleavings_phase1_scope` and `random_interleavings_rounds_phase1_scope` make none of the
   first four, every invariant on.
-- **A take.** A real take is one step, at `take_next`, so a model call during a hold replays after it and trees are
-  compared only with no take in progress. Three orderings follow from that, all in `world.rs`'s recording: a call that
-  waited for a take is recorded when it runs, under the name its file has then; main's take is recorded after a fork or
-  a fork's queue step made during its hold, because those read main without it, and after a call that commits on main during
-  it, because that commit goes before the landing in the model's history; and a queue step that only marks a
-  wait while another entry is free is not a call, since a real take goes on to the free entry. A take a crash ended
-  wrote nothing in the model, so it is not made. A take recorded later than it began can pick another entry at its recorded
-  place, when a call in between freed an earlier one: that is finding 49, open.
+- **A take.** A take is one atomic step, at `take_next`, in the model as in the real system (the owner, 2026-11-08,
+  finding 49: "Without any other information, B sounds reasonable. Obviously atomic operations are more reliable"): it
+  chooses its entry, locks its keys and writes, with no call in between. So the trace is the order the calls ran in, a
+  take is recorded once, after its write, and the trees are compared after every call. One ordering is left in
+  `world.rs`'s recording: a queue step that only marks a wait while another entry is free is not a call, since a real
+  take goes on to the free entry. No take is in progress at a crash. Until 2026-11-08 the model's take was two steps,
+  and a take recorded later than it began could pick another entry at its recorded place (finding 49).
 - **Mounts.** `mountable` takes at most one fork, made before any client call, and no open that both appends and
   writes at an offset: Linux has no such descriptor. The take gate (`AGENTFS_TAKE_GATE`, a failpoints build) runs each
   take at the trace's point and answers by a fifo, and a synchronous request after `close(2)` proves its `RELEASE`
@@ -331,7 +329,7 @@ What a replay decides, each reported rather than hidden:
 | Rule | Replay | Where else |
 |---|---|---|
 | R1.4 mappings | no mmap call | page-cache job |
-| R9, R9.7: a client call waiting on a take | assumed by replay order; only `Waiting` of takes is compared | mounted P1/P2 cases, finite, no seeds |
+| R9, R9.7: a client call waiting on a take | none in the model, whose take is one step; the replay order stands for it, and only `Waiting` of takes is compared | mounted P1/P2 cases, finite, no seeds |
 | R12 mid-step or with unsynced loss | crash between calls only | recording-faults, power-loss jobs |
 | ENOSPC, EIO | no injected failure; `errno` compared only library against mount | enospc job |
 | Trace with two forks | library only (§18 asks one fork) | - |
@@ -348,8 +346,8 @@ enough for a job.
 
 A mismatch is a finding (MODEL.md), never a change to either side without a ledger rule. Its traces
 go in `crates/agentfs-conformance/open-findings.txt` with its number and must keep failing, as an ignored test must, and
-its small reproduction is an ignored test in `crates/agentfs-conformance/tests/replay.rs`. CI's seeds list none. At seeds 1 to 500 the listed traces
-are findings 48 and 49, and a listed trace that passes fails the job.
+its small reproduction is an ignored test in `crates/agentfs-conformance/tests/replay.rs`. CI's seeds list none, and since findings
+48 and 49 closed (2026-11-08) neither do seeds 1 to 500. A listed trace that passes fails the job.
 
 The model and the library share the alignment's call (`agentfs_align`): one environment and one program lookup, so a replay runs one
 release of `git` on both sides. Identities depend on the release, so `ci/git-release` pins one for the image and for CI, and `ci/check-tree-git.sh` fails on another (R10.10).

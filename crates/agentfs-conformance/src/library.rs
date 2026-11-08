@@ -175,10 +175,6 @@ impl TreeCalls for Library {
         })
     }
 
-    fn finish_take(&mut self, _t: TreeId) -> Result<(), CallError> {
-        Ok(())
-    }
-
     /// Drop the volume and open it again: recovery closes every open once.
     fn crash(&mut self) -> Result<(), CallError> {
         self.volume = None;

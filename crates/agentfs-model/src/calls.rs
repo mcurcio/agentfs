@@ -6,16 +6,15 @@
 //! tree showed after it ([`Recorded`]). [`replay`] makes the same calls of any
 //! [`TreeCalls`], and that system must show the same.
 //!
-//! A take is two steps in the model and one in the real system. A real take
-//! happens at [`TreeCalls::take_next`], so a model call made during a hold
-//! replays after the take, and what the trees show is compared only where the
-//! model has no take in progress. A take a crash ended wrote nothing in the
-//! model (it went back to its queue), so [`replay`] does not make it.
+//! A take is one atomic step in the model, as in the real system (the owner,
+//! 2026-11-08, finding 49: "B"): [`TreeCalls::take_next`] chooses its entry,
+//! locks its files and writes them, and no call runs in between. So the trace
+//! is the order the calls ran in, and the trees are compared after every call.
 //!
 //! This crate has no dependencies, so [`CallError`] is written by hand and the
 //! trace format is [`render`] and [`parse`], one line per call with hex bytes.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fmt;
 
 /// Who makes a call: one of main's programs, or a fork's.
@@ -83,9 +82,8 @@ pub trait TreeCalls {
     fn unlink(&mut self, c: &Caller, path: &str) -> Result<(), CallError>;
     fn rename(&mut self, c: &Caller, from: &str, to: &str) -> Result<(), CallError>;
     fn end_client(&mut self, c: &Caller) -> Result<(), CallError>;
+    /// One take, whole: the first entry the tree's queue lets go, written.
     fn take_next(&mut self, t: TreeId) -> Result<Took, CallError>;
-    /// A no-op where a take is one step.
-    fn finish_take(&mut self, t: TreeId) -> Result<(), CallError>;
     fn crash(&mut self) -> Result<(), CallError>;
     fn read(&self, t: TreeId, path: &str) -> Result<Option<Vec<u8>>, CallError>;
     /// R1.3: an open's own read.
@@ -116,9 +114,8 @@ pub enum RecordedCall {
         path: String,
         h: u64,
     },
-    /// An open that waited for a take, whose file that take left with no name.
-    /// In the model it holds the file's old object, so its calls reach no path.
-    /// A real open comes after the take, so it finds nothing to open.
+    /// An open whose file no path names in its tree when it is recorded (a
+    /// transaction's new file): its calls reach no path there.
     OpenGone {
         h: u64,
     },
@@ -154,16 +151,12 @@ pub enum RecordedCall {
         tree: TreeId,
         took: Took,
     },
-    Finish {
-        tree: TreeId,
-    },
     Crash,
     /// Something phase 1 does not build happened in this trace.
     OutOfScope(&'static str),
 }
 
-/// One recorded call with what the trees showed after it (at a point with no
-/// take in progress).
+/// One recorded call with what the trees showed after it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Recorded {
     pub call: RecordedCall,
@@ -347,7 +340,6 @@ fn render_call(c: &RecordedCall) -> String {
             };
             format!("take {} {took}", tree(*t))
         }
-        RecordedCall::Finish { tree: t } => format!("finish {}", tree(*t)),
         RecordedCall::Crash => "crash".into(),
         RecordedCall::OutOfScope(why) => format!("out {why}"),
     }
@@ -410,9 +402,6 @@ fn parse_call(s: &str) -> Result<RecordedCall, CallError> {
                 "empty" => Took::Empty,
                 _ => return Err(bad()),
             },
-        },
-        ["finish", t] => RecordedCall::Finish {
-            tree: parse_tree(t)?,
         },
         ["crash"] => RecordedCall::Crash,
         ["out", why] => {
@@ -512,32 +501,6 @@ pub fn parse(text: &str) -> Result<Vec<Recorded>, CallError> {
         .collect()
 }
 
-/// The takes a crash ended before they finished, by index, each with its
-/// finish if any: the model's take wrote nothing and went back to its queue.
-pub fn undone_takes(trace: &[Recorded]) -> BTreeSet<usize> {
-    let mut undone = BTreeSet::new();
-    for (i, r) in trace.iter().enumerate() {
-        let RecordedCall::Take {
-            tree: t,
-            took: Took::Taken,
-        } = r.call
-        else {
-            continue;
-        };
-        for later in &trace[i + 1..] {
-            match later.call {
-                RecordedCall::Finish { tree } if tree == t => break,
-                RecordedCall::Crash => {
-                    undone.insert(i);
-                    break;
-                }
-                _ => {}
-            }
-        }
-    }
-    undone
-}
-
 fn compare_trees<T: TreeCalls>(t: &T, shown: &Shown) -> Result<(), String> {
     for (id, files) in &shown.trees {
         let paths = t.paths(*id).map_err(|e| e.to_string())?;
@@ -567,7 +530,6 @@ pub fn replay<T: TreeCalls>(
     t: &mut T,
     each: &mut dyn FnMut(&T, &Recorded) -> Result<(), String>,
 ) -> Result<(), String> {
-    let undone = undone_takes(trace);
     let mut opens: BTreeMap<u64, Option<T::Open>> = BTreeMap::new();
     for (i, r) in trace.iter().enumerate() {
         let at = |e: &dyn fmt::Display| format!("call {i} ({}): {e}", render_call(&r.call));
@@ -630,15 +592,10 @@ pub fn replay<T: TreeCalls>(
                 t.end_client(caller).map_err(|e| at(&e))?;
             }
             RecordedCall::Take { tree, took } => {
-                if !undone.contains(&i) {
-                    let got = t.take_next(*tree).map_err(|e| at(&e))?;
-                    if got != *took {
-                        return Err(at(&format!("the system answered {got:?}")));
-                    }
+                let got = t.take_next(*tree).map_err(|e| at(&e))?;
+                if got != *took {
+                    return Err(at(&format!("the system answered {got:?}")));
                 }
-            }
-            RecordedCall::Finish { tree } => {
-                t.finish_take(*tree).map_err(|e| at(&e))?;
             }
             RecordedCall::Crash => {
                 t.crash().map_err(|e| at(&e))?;
@@ -701,33 +658,14 @@ mod tests {
                 shown: Some(shown.clone()),
             })
             .chain([Recorded {
-                call: RecordedCall::Finish { tree: TreeId::Main },
+                call: RecordedCall::Take {
+                    tree: TreeId::Main,
+                    took: Took::Taken,
+                },
                 shown: None,
             }])
             .collect();
         assert_eq!(parse(&render(&trace)).unwrap(), trace);
         assert_eq!(scope_of(&trace), Scope::OutOfScope("drop"));
-    }
-
-    #[test]
-    fn a_crash_undoes_only_the_takes_it_ended() {
-        let at = |call| Recorded { call, shown: None };
-        let take = |tree| {
-            at(RecordedCall::Take {
-                tree,
-                took: Took::Taken,
-            })
-        };
-        let trace = [
-            take(TreeId::Main),
-            at(RecordedCall::Finish { tree: TreeId::Main }),
-            take(TreeId::Main),
-            take(TreeId::Fork(1)),
-            at(RecordedCall::Finish {
-                tree: TreeId::Fork(1),
-            }),
-            at(RecordedCall::Crash),
-        ];
-        assert_eq!(undone_takes(&trace), BTreeSet::from([2]));
     }
 }

@@ -558,7 +558,7 @@ impl Invariants {
         Ok(())
     }
 
-    fn note_call(&mut self, r: &Recorded, undone: bool) -> Result<(), String> {
+    fn note_call(&mut self, r: &Recorded) -> Result<(), String> {
         match &r.call {
             RecordedCall::Fork { id } => {
                 let listed = self.git.run(&[
@@ -624,11 +624,10 @@ impl Invariants {
                 }
             }
             RecordedCall::Take { tree, took } => {
-                if *took == Took::Taken && !undone {
+                if *took == Took::Taken {
                     self.reload(*tree)?;
                 }
             }
-            RecordedCall::Finish { .. } => {}
             RecordedCall::Crash => {
                 let all: Vec<u64> = self.opens.keys().copied().collect();
                 for h in all {
@@ -913,10 +912,9 @@ impl Invariants {
         Ok(())
     }
 
-    /// After one recorded call. `undone`: a take a crash ended, which the replay
-    /// did not make.
-    pub fn after<T: TreeCalls>(&mut self, t: &T, r: &Recorded, undone: bool) -> Result<(), String> {
-        self.note_call(r, undone)?;
+    /// After one recorded call.
+    pub fn after<T: TreeCalls>(&mut self, t: &T, r: &Recorded) -> Result<(), String> {
+        self.note_call(r)?;
         let refs = self.git.run(&["for-each-ref"])?;
         if refs != self.refs {
             self.refs = refs;
@@ -949,7 +947,11 @@ impl Invariants {
     }
 }
 
-/// R6: every commit names one writer, and a merge originates nothing.
+/// R6: every commit names one writer, and a merge originates nothing. A merge holds
+/// only lines one of its parents holds, or a line written by a commit in its own
+/// history: a fork keeping a file under an undecided rename takes the upstream's last
+/// lines of it, which the upstream, having ended the file, no longer stores (R11.5,
+/// the owner's "A" of 2026-11-08, finding 48).
 fn one_writer(oid: &str, c: &Commit, inv: &mut Invariants) -> Result<(), String> {
     let writers = c.trailers("Agentfs-Writer");
     if writers.len() != 1 {
@@ -964,16 +966,50 @@ fn one_writer(oid: &str, c: &Commit, inv: &mut Invariants) -> Result<(), String>
         .iter()
         .map(|p| inv.commit(p))
         .collect::<Result<_, _>>()?;
-    for (file, map) in &c.maps {
-        for (version, _, _) in &map.lines {
-            if !parents.iter().any(|p| p.holds_line(*file, version)) {
-                return Err(format!(
-                    "one_writer: merge {oid:.7} originates {version} of file {file}"
-                ));
-            }
-        }
+    // The history is read only for a line neither parent holds.
+    if merge_originates(c, &parents, &[]).is_none() {
+        return Ok(());
     }
-    Ok(())
+    let mut args = vec!["rev-list"];
+    args.extend(c.parents.iter().map(String::as_str));
+    let mut history = Vec::new();
+    for ancestor in inv.git.run(&args)?.lines() {
+        let a = inv.commit(ancestor)?;
+        let parents = a
+            .parents
+            .iter()
+            .map(|p| inv.commit(p))
+            .collect::<Result<_, _>>()?;
+        history.push((a, parents));
+    }
+    match merge_originates(c, &parents, &history) {
+        Some((file, version)) => Err(format!(
+            "one_writer: merge {oid:.7} originates {version} of file {file}"
+        )),
+        None => Ok(()),
+    }
+}
+
+/// The first line version merge `c` holds that neither one of its `parents` holds
+/// nor a commit of its `history` wrote: a commit there that holds it while none of
+/// its own parents does. `history` is every ancestor of `c`'s parents, each with its
+/// parents.
+fn merge_originates(
+    c: &Commit,
+    parents: &[Commit],
+    history: &[(Commit, Vec<Commit>)],
+) -> Option<(u64, String)> {
+    let written = |file: u64, version: &str| {
+        history.iter().any(|(a, ps)| {
+            a.holds_line(file, version) && !ps.iter().any(|p| p.holds_line(file, version))
+        })
+    };
+    c.maps
+        .iter()
+        .flat_map(|(file, map)| map.lines.iter().map(move |l| (*file, l.0.clone())))
+        .find(|(file, version)| {
+            !parents.iter().any(|p| p.holds_line(*file, version)) && !written(*file, version)
+        })
 }
 
 fn print(files: &BTreeMap<String, Vec<u8>>) -> String {
@@ -982,4 +1018,61 @@ fn print(files: &BTreeMap<String, Vec<u8>>) -> String {
         .map(|(p, b)| format!("{p}={:?}", String::from_utf8_lossy(b)))
         .collect();
     shown.join(" ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A commit whose one file, identity 1, holds `versions`.
+    fn holding(versions: &[&str]) -> Commit {
+        let lines = versions
+            .iter()
+            .map(|v| (v.to_string(), v.to_string(), Some(b"x\n".to_vec())))
+            .collect();
+        let map = FileMap {
+            path: "a".into(),
+            object: 1,
+            identity: 1,
+            lines,
+            ancestors: BTreeMap::new(),
+        };
+        Commit {
+            maps: BTreeMap::from([(1, map)]),
+            ..Commit::default()
+        }
+    }
+
+    /// Finding 48 (the owner's "A", 2026-11-08): a merge may hold a line a commit
+    /// in its own history wrote, though neither parent holds it.
+    #[test]
+    fn a_merge_may_hold_a_line_its_history_wrote() {
+        let (root, ended) = (holding(&["1:0"]), Commit::default());
+        let edit = holding(&["1:0", "2:0"]);
+        let merge = holding(&["1:0", "2:0"]);
+        let parents = [root.clone(), ended.clone()];
+        let history = vec![
+            (edit, vec![root.clone()]),
+            (root, Vec::new()),
+            (ended, Vec::new()),
+        ];
+        assert_eq!(merge_originates(&merge, &parents, &history), None);
+    }
+
+    /// And nothing wider: a line no parent holds and no commit of its history wrote
+    /// is a merge originating it.
+    #[test]
+    fn a_merge_originates_a_line_from_outside_its_history() {
+        let (root, ended) = (holding(&["1:0"]), Commit::default());
+        let merge = holding(&["1:0", "2:0"]);
+        let parents = [root.clone(), ended.clone()];
+        let history = vec![(root, Vec::new()), (ended, Vec::new())];
+        let originated = Some((1, "2:0".to_string()));
+        assert_eq!(merge_originates(&merge, &parents, &history), originated);
+        // A commit of the history that holds the line only because its parent
+        // already did wrote nothing.
+        let carried = holding(&["2:0"]);
+        let history = vec![(carried.clone(), vec![carried])];
+        assert_eq!(merge_originates(&merge, &parents, &history), originated);
+    }
 }
