@@ -456,3 +456,28 @@ fn finding_49_a_take_is_one_step_so_its_trace_replays() {
     assert_eq!(takes.len(), 2, "one recorded call per take: {takes:?}");
     passes(&w);
 }
+
+/// Finding 51 (CI seed 37 of the phase 1 generator, 2026-11-08; R6.1, R6.2): a fork's save
+/// loses to main's, and the fork's sync can then fast-forward to main's landing, since that
+/// landing holds the fork's commit and nothing of the fork waits. The library merged instead,
+/// because its fork still listed the lost version in its line map's ancestry, so the fork's
+/// next save landed as a merge too, and a later sync had one more commit to deliver past an
+/// open file: it answered Taken where the model waits.
+#[test]
+fn finding_51_a_sync_after_a_lost_save_fast_forwards() {
+    let mut w = world();
+    let f = w.create_fork(agentfs_model::world::Tree::Main);
+    let s = Client::Fork(f);
+    save(&mut w, &s, "c", &[at(2, "s\n")]);
+    save(&mut w, &m1(), "c", &[at(2, "m\n")]);
+    assert_eq!(w.take_next(TreeId::Main).unwrap(), Took::Taken);
+    assert_eq!(w.collisions.len(), 1, "the fork's save lost");
+    assert_eq!(w.take_next(TreeId::Fork(1)).unwrap(), Took::Taken);
+    assert_eq!(w.head(agentfs_model::world::Tree::Fork(f)), w.main_head);
+    let _held = w.open_write(&s, "c");
+    save(&mut w, &s, "a", &[at(2, "t\n")]);
+    assert_eq!(w.take_next(TreeId::Main).unwrap(), Took::Taken);
+    save(&mut w, &m1(), "c", &[at(4, "n\n")]);
+    assert_eq!(w.take_next(TreeId::Fork(1)).unwrap(), Took::Waiting);
+    passes(&w);
+}

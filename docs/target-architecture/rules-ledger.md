@@ -158,7 +158,8 @@ of their day: "main" is the root, a "sandbox" is a fork, a "parent" is an upstre
   Source: "Agentfs history shouod distinguish between the various containers" and "THE EDITS CAN LAND IN ONE
   COMMIT?!?" (2026-11-01). Tests: `r6_a_sync_is_a_merge_with_the_upstream_second`
 - **R6.1** · approved · A sync that cannot fast-forward is a merge commit credited to `agentfs`, with no edits of
-  its own. Approved by the owner, 2026-11-05 (approval page). 
+  its own. Approved by the owner, 2026-11-05 (approval page).
+  Tests: `finding_51_a_sync_after_a_lost_save_fast_forwards`
 - **R6.2** · owner · A landing on the upstream's current head is a fast-forward, in the model and the library: the fork's
   commit is the upstream's head, with no landing commit. Owner, 2026-11-07: "1 b 2 a 3 a 4 a is fine 5 a sounds correct, right? 6 a". This is his 4, option (a) of finding 45.
   Revisable: option (b) was that the model always merges. Cost: the history does not show when that landing happened, or that

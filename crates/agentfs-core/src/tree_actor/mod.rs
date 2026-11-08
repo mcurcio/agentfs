@@ -1291,6 +1291,24 @@ impl Volume {
         Ok(())
     }
 
+    /// Whether two snapshots show the same: the same files, each with the same line
+    /// versions in the same order, and the same name versions. The versions each line
+    /// version was written over may differ.
+    fn shows_the_same(a: &referee::Snapshot, b: &referee::Snapshot) -> bool {
+        a.files.len() == b.files.len()
+            && a.names.len() == b.names.len()
+            && a.files.iter().all(|(id, file)| {
+                b.files
+                    .get(id)
+                    .is_some_and(|other| other.lines.lines == file.lines.lines)
+            })
+            && a.names.iter().all(|(id, history)| {
+                b.names
+                    .get(id)
+                    .is_some_and(|other| other.head == history.head)
+            })
+    }
+
     fn changed_keys(before: &referee::Snapshot, after: &referee::Snapshot) -> BTreeSet<queue::Key> {
         let ids: BTreeSet<_> = before
             .names
@@ -1616,13 +1634,24 @@ impl Volume {
         let mut changes = Vec::new();
         if let Some(target) = plan.target {
             let parent = self.snapshot_at(target)?;
-            let head = if Self::changed_keys(&parent, &plan.snapshot).is_empty()
+            let mut snapshot = plan.snapshot;
+            // R6.1: a sync that can fast-forward does. It can when the fork's head is in
+            // the upstream's history, nothing of the fork waits there, and the sync shows
+            // what the upstream's commit shows. The fork then takes that commit's line maps
+            // too: a version the upstream decided against stays in history only (finding 51).
+            let head = if Self::shows_the_same(&parent, &snapshot)
                 && !self.pending_from(tree)?
                 && self.repo.is_ancestor(current, target)?
             {
+                for (id, file) in &mut snapshot.files {
+                    if let Some(theirs) = parent.files.get(id) {
+                        file.lines = theirs.lines.clone();
+                    }
+                }
+                snapshot.names = parent.names.clone();
                 target
             } else {
-                let content = self.snapshot_tree(&plan.snapshot)?;
+                let content = self.snapshot_tree(&snapshot)?;
                 let message = format!(
                     "Sync\n\nAgentfs-Writer: agentfs\nAgentfs-Cause: Sync\nAgentfs-Tree: {tree}\nAgentfs-Event: {seq}\nAgentfs-Format: envelope-1\n"
                 );
@@ -1634,8 +1663,8 @@ impl Volume {
                 new: Some(head),
                 expected_old: Some(current),
             });
-            self.object_table_update(tree, &plan.snapshot, &mut changes)?;
-            built.install(plan.snapshot)?;
+            self.object_table_update(tree, &snapshot, &mut changes)?;
+            built.install(snapshot)?;
         }
         let taken = !plan.remaining;
         if taken {

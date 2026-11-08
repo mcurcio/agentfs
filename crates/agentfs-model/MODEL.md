@@ -506,6 +506,14 @@ An open or rejected finding has a test marked `#[ignore = "coherence finding N: 
    (same commits); the random calls only now reach it, because the generator draws differently. Not changed: either the check's excuse
    widens or the prefix sync's rule changes, each the owner's call. `finding_50_a_nested_prefix_sync_past_a_fast_forward_keeps_the_upstreams_lost_line`,
    ignored.
+51. **Fixed (2026-11-08): the library merged a sync that could fast-forward (R6.1; CI seed 37 of the phase 1 generator).** A fork's save
+   loses to main's; the fork's sync can then fast-forward to main's landing, which holds the fork's commit, with nothing of the fork
+   waiting. The model did. The library merged, because its fork's line map still listed the lost version in its ancestry, so its
+   snapshot differed from main's in that alone. The fork's next save then landed as a merge rather than a fast-forward (R6.2), and a
+   later sync past an open file had that merge to deliver: the library answered Taken where the model waits. No byte differed. The
+   library now fast-forwards when the sync shows what main's commit shows and nothing of the fork waits, and takes that commit's line
+   maps (`Volume::shows_the_same`). The model before finding 49's fix gives the same trace, so the change did not cause it; the
+   random calls reach it now. `finding_51_a_sync_after_a_lost_save_fast_forwards`.
 
 ## Costs
 

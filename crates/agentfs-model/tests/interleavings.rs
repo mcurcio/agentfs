@@ -949,8 +949,8 @@ fn run_seed_of(
     ))
 }
 
-/// A take in progress: its tree, the files its changes touch, and the
-/// (file, line identity) pairs in contention there.
+/// A waiting entry: its tree, the files it locks, and the (file, line
+/// identity) pairs in contention there.
 type Contention = (Tree, Vec<String>, Vec<(String, String)>);
 
 /// The client calls of a run, with the harness's state across them.
