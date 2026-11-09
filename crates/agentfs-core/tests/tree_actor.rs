@@ -1487,6 +1487,71 @@ fn a_failed_save_keeps_serving_and_saves_at_the_next_step() {
     assert_eq!(opens_saved(tmp.path(), h), 1);
 }
 
+/// Finding 51 (R6.1): a fast-forward takes the upstream's line maps, so the fork's lost
+/// version is in the history only: the fork's next save of the file lists none of it.
+#[test]
+fn a_fast_forward_takes_the_upstreams_line_maps() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut v = Volume::open(tmp.path()).unwrap();
+    put(&mut v, "main", "c", b"x\n");
+    let fork = v.fork().unwrap();
+    put(&mut v, &fork, "c", b"s\n");
+    let lost = v.head(&fork).unwrap();
+    put(&mut v, "main", "c", b"m\n");
+    assert_eq!(v.take_next("main").unwrap(), Took::Taken);
+    assert_eq!(v.take_next(&fork).unwrap(), Took::Taken);
+    assert_eq!(v.head(&fork).unwrap(), v.head("main").unwrap());
+    put(&mut v, &fork, "c", b"t\n");
+    let map = |commit: String| -> serde_json::Value {
+        let out = git(tmp.path(), &["show", &format!("{commit}:metadata.json")]);
+        serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap()["c"][2].clone()
+    };
+    let lost_lines: Vec<String> = map(lost.to_string())["lines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|l| l["version"].as_str().unwrap().to_owned())
+        .collect();
+    let now = map(format!("refs/heads/{fork}"));
+    for version in &lost_lines {
+        assert!(
+            now["ancestors"].get(version).is_none(),
+            "the lost version {version} is still in {now}"
+        );
+    }
+}
+
+/// Finding 51 (R6.1): a fast-forward takes the upstream's name histories, so a fork's
+/// rename that lost is in the history only, and the fork's next commit does not carry it.
+#[test]
+fn a_fast_forward_takes_the_upstreams_names() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut v = Volume::open(tmp.path()).unwrap();
+    put(&mut v, "main", "a", b"x\n");
+    let fork = v.fork().unwrap();
+    v.rename(&fork, "a", "b", "w").unwrap();
+    v.rename("main", "a", "c", "w").unwrap();
+    assert_eq!(v.take_next("main").unwrap(), Took::Taken);
+    assert_eq!(v.take_next(&fork).unwrap(), Took::Taken);
+    assert_eq!(v.head(&fork).unwrap(), v.head("main").unwrap());
+    // The fork's next commit writes out the names it holds now.
+    put(&mut v, &fork, "d", b"y\n");
+    let names = |reference: &str| -> serde_json::Value {
+        let out = git(
+            tmp.path(),
+            &["show", &format!("{reference}:namespace.json")],
+        );
+        serde_json::from_slice(&out.stdout).unwrap()
+    };
+    let (forked, upstream) = (
+        names(&format!("refs/heads/{fork}")),
+        names("refs/heads/main"),
+    );
+    for (id, history) in upstream.as_object().unwrap() {
+        assert_eq!(forked[id]["versions"], history["versions"], "file {id}");
+    }
+}
+
 /// R9.10: an `open(O_TRUNC)` that fails answers an error, so no RELEASE ever comes. It
 /// leaves no open behind to hold its file's takes.
 #[cfg(feature = "failpoints")]

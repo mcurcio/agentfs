@@ -511,8 +511,10 @@ An open or rejected finding has a test marked `#[ignore = "coherence finding N: 
    waiting. The model did. The library merged, because its fork's line map still listed the lost version in its ancestry, so its
    snapshot differed from main's in that alone. The fork's next save then landed as a merge rather than a fast-forward (R6.2), and a
    later sync past an open file had that merge to deliver: the library answered Taken where the model waits. No byte differed. The
-   library now fast-forwards when the sync shows what main's commit shows and nothing of the fork waits, and takes that commit's line
-   maps (`Volume::shows_the_same`). The model before finding 49's fix gives the same trace, so the change did not cause it; the
+   library now fast-forwards whenever nothing of the fork waits, as the model does, and takes that commit's line maps and names
+   (`a_fast_forward_takes_the_upstreams_line_maps`, `a_fast_forward_takes_the_upstreams_names`), so a version the upstream
+   decided against stays in history only. Each take's new head is compared with the model's: its cause and parent count (`history_shape`,
+   in the replay's invariants). The model before finding 49's fix gives the same trace, so the change did not cause it; the
    random calls reach it now. `finding_51_a_sync_after_a_lost_save_fast_forwards`.
 
 ## Costs

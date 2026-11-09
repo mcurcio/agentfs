@@ -741,7 +741,7 @@ step rebuilds the refs whole and redoes that checkout.
 | fork create | the branch and its upstream | `config` is rewritten from the journal before any git command; a dropped fork is not built in phase 1 |
 | journal | each call appended and synced before it returns (§3) | before any view serves the tree, each open with no record closing it is saved as its close would be, exactly once. A torn last frame is saved aside and discarded |
 | refs, `config`, `HEAD` | a copy of the records | `config` and `HEAD` are rewritten, then `refs/` and `packed-refs` are removed and every pointer is created in one `update-ref --stdin`, on every open, so this path always runs. A live `git` reader may see a step half copied |
-| locks | none: held in memory by the actor | none survive: open files ended with their clients and are saved from the journal (row above); an unfinished take has no record, so its entry is still there and is taken again. The model takes the entry off its in-memory queue when the take begins, and its crash puts it back in its place |
+| locks | none: held in memory by the actor | none survive: open files ended with their clients and are saved from the journal (row above); an unfinished take has no record, so its entry is still there and is taken again. In the model a take is one step, so none is unfinished at a crash |
 | object table | a blob per tree, named by the step's record | rebuilt on each branch's snapshot, never by file identity; an open whose object no path names is replayed as an orphan (saves nothing, `OrphanDropped`) |
 | objects | none: durable before a record names them | every pointer's commit, tree and blobs are checked (`rev-list --objects --no-walk --missing=print`): anything lost refuses to serve. Unreferenced objects: git's garbage collection |
 
@@ -956,7 +956,7 @@ The Rust model stays the testbed; the script only demonstrates. His current choi
 | change | the unit the referee judges whole: an ordinary save (the whole file at one close) or a transaction's commit (all its files) (§7) | rule 3e: a collision costs the whole change, no more | commit; transaction |
 | actor | the one place a tree's branch is moved, one step at a time | one mover per branch, so no two moves race | the Trees domain's writer |
 | sync commit | the `Sync` merge a sync makes when the fork has commits its upstream has not taken; no edits of its own | why a sync is not always a fast-forward | the older pages' sync landing |
-| take; hold | a queue entry being written into its tree; the files it locks meanwhile | names rule 9's lock holder | landing |
+| take | a queue entry being written into its tree, one atomic step that locks the files it overwrites | names rule 9's lock holder | landing |
 | line identity, version, deleted version, name line | as §2 defines them | a position or bytes cannot say which versions are one line; unlinks and renames must meet edits under one rule (§7) | slot; tombstone (CRDTs); inode |
 | alignment | the one histogram diff a save makes of its base against the program's bytes (§7) | the calls do not say which lines changed | git's diff |
 | untracked area | where a tree's skipped and scratch files live, beside its working tree (§3) | `read-tree -u` refuses to overwrite untracked files | git's untracked files |

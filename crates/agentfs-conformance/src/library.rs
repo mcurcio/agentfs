@@ -191,18 +191,6 @@ impl TreeCalls for Library {
         }
     }
 
-    fn view(&self, h: u64) -> Result<Vec<u8>, CallError> {
-        self.v()?.read_open(h).map(<[u8]>::to_vec).map_err(fail)
-    }
-
-    fn client_read(&self, c: &Caller, path: &str) -> Result<Option<Vec<u8>>, CallError> {
-        let t = match c {
-            Caller::Main(_) => TreeId::Main,
-            Caller::Fork(f) => TreeId::Fork(*f),
-        };
-        self.read(t, path)
-    }
-
     fn paths(&self, t: TreeId) -> Result<Vec<String>, CallError> {
         let mut paths: Vec<String> = self
             .v()?

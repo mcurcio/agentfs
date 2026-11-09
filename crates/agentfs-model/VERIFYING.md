@@ -334,7 +334,7 @@ What a replay decides, each reported rather than hidden:
 | ENOSPC, EIO | no injected failure; `errno` compared only library against mount | enospc job |
 | Trace with two forks | library only (§18 asks one fork) | - |
 | Automatic takes (R1) | a mount takes only through the gate | mounted P1/P2 cases |
-| R1.3 an open's own read, R1.1 another reader | on the trait, not compared: `Shown` does not hold them | byte and page-cache jobs |
+| R1.3 an open's own read, R1.1 another reader | no calls: the replay makes neither read, so nothing compares them | byte and page-cache jobs |
 
 The in-scope traces at CI's seeds are 72 from scenarios and 94 from seeds (64 and 16 of the phase 1 generators, and 14 of
 the ordinary ones that happened to stay in scope). The rest are excluded by the reasons above, and the replay prints the

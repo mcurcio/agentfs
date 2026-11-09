@@ -86,10 +86,6 @@ pub trait TreeCalls {
     fn take_next(&mut self, t: TreeId) -> Result<Took, CallError>;
     fn crash(&mut self) -> Result<(), CallError>;
     fn read(&self, t: TreeId, path: &str) -> Result<Option<Vec<u8>>, CallError>;
-    /// R1.3: an open's own read.
-    fn view(&self, h: Self::Open) -> Result<Vec<u8>, CallError>;
-    /// R1.1: another reader.
-    fn client_read(&self, c: &Caller, path: &str) -> Result<Option<Vec<u8>>, CallError>;
     fn paths(&self, t: TreeId) -> Result<Vec<String>, CallError>;
 }
 
@@ -156,11 +152,14 @@ pub enum RecordedCall {
     OutOfScope(&'static str),
 }
 
-/// One recorded call with what the trees showed after it.
+/// One recorded call with what the trees showed after it. `head`, for a take that
+/// took an entry: the moved tree's head's `Agentfs-Cause` and its number of parents,
+/// so a replay also compares the commit graph, a merge against a fast-forward (R6.1).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Recorded {
     pub call: RecordedCall,
     pub shown: Option<Shown>,
+    pub head: Option<(String, usize)>,
 }
 
 /// What the trees show: each tree's files by path, and every collision so far.
@@ -470,12 +469,16 @@ fn parse_shown(s: &str) -> Result<Shown, CallError> {
     Ok(shown)
 }
 
-/// One line per call, hex bytes, no serde: `<call> |` then, when the call has
-/// one, what the trees showed.
+/// One line per call, hex bytes, no serde: `<call>`, then ` ^<cause>:<parents>` when
+/// the call moved a tree's head, then ` |` and, when the call has one, what the
+/// trees showed.
 pub fn render(trace: &[Recorded]) -> String {
     let mut out = String::new();
     for r in trace {
         out.push_str(&render_call(&r.call));
+        if let Some((cause, parents)) = &r.head {
+            out.push_str(&format!(" ^{cause}:{parents}"));
+        }
         if let Some(s) = &r.shown {
             out.push_str(" |");
             out.push_str(&render_shown(s));
@@ -493,9 +496,19 @@ pub fn parse(text: &str) -> Result<Vec<Recorded>, CallError> {
                 Some((c, s)) => (c, Some(parse_shown(s)?)),
                 None => (line, None),
             };
+            let (call, head) = match call.split_once(" ^") {
+                Some((c, h)) => {
+                    let (cause, parents) = h
+                        .split_once(':')
+                        .ok_or_else(|| CallError::new(format!("bad head {h:?}")))?;
+                    (c, Some((cause.to_owned(), number(parents)? as usize)))
+                }
+                None => (call, None),
+            };
             Ok(Recorded {
                 call: parse_call(call)?,
                 shown,
+                head,
             })
         })
         .collect()
@@ -656,6 +669,7 @@ mod tests {
             .map(|call| Recorded {
                 call,
                 shown: Some(shown.clone()),
+                head: None,
             })
             .chain([Recorded {
                 call: RecordedCall::Take {
@@ -663,6 +677,7 @@ mod tests {
                     took: Took::Taken,
                 },
                 shown: None,
+                head: Some(("Sync".into(), 2)),
             }])
             .collect();
         assert_eq!(parse(&render(&trace)).unwrap(), trace);

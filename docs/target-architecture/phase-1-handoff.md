@@ -1,5 +1,9 @@
 # Phase 1 handoff — 2026-11-06
 
+**Status: the current state of the build is in [phase-1.md](phase-1.md); this page is the
+2026-11-06 checkpoint and its measurements, kept as history.** The sentences below that say
+implementation is paused or that a choice is pending describe that day.
+
 **Implementation is paused at a reproducible checkpoint. Phase 1 is not
 validated.** Real mounts exposed finding 32, shared-mapping behavior and Git
 reference-store power-loss recovery gaps. The owner recorded current picks for

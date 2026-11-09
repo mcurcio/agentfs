@@ -3566,7 +3566,11 @@ impl World {
         // the order the calls ran in (finding 49).
         let shown = Some(self.shown());
         if let Some(trace) = &mut self.trace {
-            trace.push(Recorded { call, shown });
+            trace.push(Recorded {
+                call,
+                shown,
+                head: None,
+            });
         }
     }
 
@@ -3593,10 +3597,29 @@ impl World {
         } else {
             Took::Waiting
         };
-        self.trace_call(RecordedCall::Take {
-            tree: tree_id(t),
-            took,
-        });
+        let id = tree_id(t);
+        let moved = (took == Took::Taken).then(|| self.head_shape(t));
+        self.trace_call(RecordedCall::Take { tree: id, took });
+        if let (Some(head), false, Some(last)) = (
+            moved,
+            self.trace_mute,
+            self.trace.as_mut().and_then(|t| t.last_mut()),
+        ) {
+            last.head = Some(head);
+        }
+    }
+
+    /// The `Agentfs-Cause` of tree `t`'s head and its number of parents.
+    fn head_shape(&self, t: Tree) -> (String, usize) {
+        let head = self.head(t);
+        let body = git(&self.repo, &["log", "-1", "--format=%B", &head]);
+        let cause = body
+            .lines()
+            .find_map(|l| l.strip_prefix("Agentfs-Cause: "))
+            .unwrap_or_default()
+            .to_owned();
+        let parents = git(&self.repo, &["rev-list", "--parents", "-n", "1", &head]);
+        (cause, parents.split_whitespace().count().saturating_sub(1))
     }
 
     /// An open, recorded under the name its file has in its tree.
@@ -3693,7 +3716,6 @@ impl World {
     }
 }
 
-/// Rule 9: a take writes only files it holds.
 /// Whether file `c` is new since its create: an [`UNBORN`] identity whose
 /// name version is still the one its create wrote (never renamed since).
 /// A rename-over from such a file is an atomic save (git-model.md §7).
@@ -3711,6 +3733,7 @@ pub fn name_key(c: &Content) -> Option<String> {
     c.path().map(|p| format!("{NAME_KEY}{p}"))
 }
 
+/// Rule 9: a take writes only files it holds.
 fn held(t: Tree, files: &BTreeSet<String>, holds: &BTreeSet<String>) {
     assert!(
         files.is_subset(holds),
@@ -4001,17 +4024,6 @@ impl TreeCalls for World {
         Ok(self
             .lookup(&head, path)
             .map(|f| self.file(&head, &f).bytes().into_bytes()))
-    }
-
-    fn view(&self, h: HandleId) -> Result<Vec<u8>, CallError> {
-        Ok(World::view(self, h).into_bytes())
-    }
-
-    fn client_read(&self, c: &Caller, path: &str) -> Result<Option<Vec<u8>>, CallError> {
-        let client = client_of(c);
-        Ok(self
-            .client_lookup(&client, path)
-            .map(|_| self.client_reads(&client, path).bytes().into_bytes()))
     }
 
     fn paths(&self, t: TreeId) -> Result<Vec<String>, CallError> {

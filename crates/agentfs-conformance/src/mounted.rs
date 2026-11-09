@@ -412,37 +412,6 @@ impl TreeCalls for Mounted {
         }
     }
 
-    fn view(&self, h: RawFd) -> Result<Vec<u8>, CallError> {
-        let mut out = Vec::new();
-        let mut buf = [0u8; 65536];
-        loop {
-            // SAFETY: the pointer and length name `buf`.
-            let n = unsafe {
-                libc::pread(
-                    h,
-                    buf.as_mut_ptr().cast(),
-                    buf.len(),
-                    out.len() as libc::off_t,
-                )
-            };
-            if n < 0 {
-                return Err(last_error("pread"));
-            }
-            if n == 0 {
-                return Ok(out);
-            }
-            out.extend_from_slice(&buf[..n as usize]);
-        }
-    }
-
-    fn client_read(&self, c: &Caller, path: &str) -> Result<Option<Vec<u8>>, CallError> {
-        match std::fs::read(self.at(c, path)) {
-            Ok(b) => Ok(Some(b)),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(io_fail("read", &e)),
-        }
-    }
-
     fn paths(&self, t: TreeId) -> Result<Vec<String>, CallError> {
         let mut paths = Vec::new();
         for entry in std::fs::read_dir(self.root(t)).map_err(|e| io_fail("readdir", &e))? {

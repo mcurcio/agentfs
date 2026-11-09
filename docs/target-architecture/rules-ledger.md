@@ -48,15 +48,21 @@ of their day: "main" is the root, a "sandbox" is a fork, a "parent" is an upstre
   Open conflict: a call deferred by R5.3 is not in its tree at once (git-model, Questions for the owner).
   Tests: `r1_writes_never_wait_and_forks_sync_both_ways`
 - **R1.1** · owner · An open file is private until close: other readers see only saved content (close-to-open).
-  Source: "Go" (2026-11-03), accepting that recommendation.
+  Source: "Go" (2026-11-03), accepting that recommendation. The replay does not compare reads (VERIFYING.md);
+  the mounted page-cache job (`ci/trees-pagecache.py`) does.
+  Tests: `two_writers_in_every_combination`, `a_writable_descriptor_reads_page_writes_and_a_read_only_one_keeps_its_snapshot`
 - **R1.2** · rejected · Whatever a tree held when a save was made counts as seen. Owner, 2026-11-05: "yes, replace
   it" (by R3c.2).
 - **R1.3** · approved · A program reads its own unsaved writes back through its own open file, as on Linux.
-  Approved by the owner, 2026-11-05 (approval page). 
+  Approved by the owner, 2026-11-05 (approval page). The replay does not compare reads (VERIFYING.md); the mounted
+  byte and page-cache jobs do (`ci/trees-ordering.py`, `ci/trees-mmap.py`).
+  Tests: `byte_calls_match_a_plain_linux_file_and_publish_only_at_release`,
+  `a_writable_descriptor_reads_page_writes_and_a_read_only_one_keeps_its_snapshot`
 - **R1.4** · approved · A shared memory mapping behaves as on Linux, so R1.1 holds for descriptors, not mappings. All
   mappings of a file in one tree share its pages: another mapping can read unsaved stores, and each close saves what
   the kernel has flushed, which can include another program's mapped stores. No writer's bytes are lost that Linux would
-  keep. Owner, 2026-11-06, accepting that recommendation with the handoff's evidence: "we can take those recommendations
+  keep, with one gap on record, open for the owner: a mapped store that writes the bytes its page last held records no
+  run, so a descriptor write made meanwhile stands where Linux would keep the store. Owner, 2026-11-06, accepting that recommendation with the handoff's evidence: "we can take those recommendations
   for now, and i might change my mind later".
   The kernel keeps one size and one set of pages per file, so R1.1 holds for `read` and `pread` on read-only
   descriptors. While a file is open for writing, `stat` reports the writers' size to everyone, a writable descriptor also
@@ -159,7 +165,9 @@ of their day: "main" is the root, a "sandbox" is a fork, a "parent" is an upstre
   COMMIT?!?" (2026-11-01). Tests: `r6_a_sync_is_a_merge_with_the_upstream_second`
 - **R6.1** · approved · A sync that cannot fast-forward is a merge commit credited to `agentfs`, with no edits of
   its own. Approved by the owner, 2026-11-05 (approval page).
-  Tests: `finding_51_a_sync_after_a_lost_save_fast_forwards`
+  The replay compares each take's new head with the model's: its `Agentfs-Cause` and parent count (`history_shape`).
+  Tests: `finding_51_a_sync_after_a_lost_save_fast_forwards`, `a_fast_forward_takes_the_upstreams_line_maps`,
+  `a_fast_forward_takes_the_upstreams_names`
 - **R6.2** · owner · A landing on the upstream's current head is a fast-forward, in the model and the library: the fork's
   commit is the upstream's head, with no landing commit. Owner, 2026-11-07: "1 b 2 a 3 a 4 a is fine 5 a sounds correct, right? 6 a". This is his 4, option (a) of finding 45.
   Revisable: option (b) was that the model always merges. Cost: the history does not show when that landing happened, or that
@@ -209,7 +217,10 @@ of their day: "main" is the root, a "sandbox" is a fork, a "parent" is an upstre
   In the model, as in the library, a take is one atomic step: it chooses its entry, locks its files and writes them with
   no call in between, so a write-open waiting for it is the order itself. Owner, 2026-11-08, choosing between excluding
   the traces of finding 49 and this: "Without any other information, B sounds reasonable. Obviously atomic operations
-  are more reliable". Revisable: option A was to exclude and count those traces.
+  are more reliable". Revisable: option A was to exclude and count those traces. Cost, recorded 2026-11-08: since a take is
+  one step, the waits of R9 and R9.7 are the order of the replay and hold for any order of calls, so no test makes a
+  client call wait on a running take; the real system does (the actor's mutex), and the mounted P1 and P2 cases are its
+  only evidence.
   Tests: `r9_a_sync_waits_for_an_open_writer_then_applies`, `r9_a_write_open_after_a_sync_shows_the_synced_file`,
   `finding_49_a_take_is_one_step_so_its_trace_replays`
 - **R9.10** · owner · Locks order agentfs's own writes against clients only. Clients are never locked or

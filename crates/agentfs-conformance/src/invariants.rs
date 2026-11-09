@@ -926,6 +926,15 @@ impl Invariants {
             Self::lines_whole(id, &head)?;
             self.bytes_match(t, id, &head)?;
         }
+        if let (RecordedCall::Take { tree, .. }, Some(want)) = (&r.call, &r.head) {
+            let head = self.head(*tree)?;
+            let got = (head.trailers("Agentfs-Cause").concat(), head.parents.len());
+            if got != *want {
+                return Err(format!(
+                    "history_shape: {tree:?}'s head is {got:?}, the trace {want:?}"
+                ));
+            }
+        }
         if matches!(r.call, RecordedCall::Take { .. } | RecordedCall::Crash) {
             self.drained(t)?;
         }
@@ -1052,6 +1061,10 @@ mod tests {
                 .arg("--git-dir")
                 .arg(self.dir.path())
                 .args(args)
+                .env("GIT_AUTHOR_NAME", "agentfs")
+                .env("GIT_AUTHOR_EMAIL", "agentfs@localhost")
+                .env("GIT_COMMITTER_NAME", "agentfs")
+                .env("GIT_COMMITTER_EMAIL", "agentfs@localhost")
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .spawn()
