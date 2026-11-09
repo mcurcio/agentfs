@@ -74,7 +74,7 @@ in the repository:
 [LICENSE-APACHE](https://github.com/mcurcio/agentfs/blob/main/LICENSE-APACHE) and
 [LICENSE-MIT](https://github.com/mcurcio/agentfs/blob/main/LICENSE-MIT).
 
-[Phase 1 of the proposed design](target-architecture/phase-1.md) implements Git-backed main/sandbox trees and validates the model through real end-to-end tests. Its exit table, limits and open questions are there.
+[Phase 1 of the proposed design](target-architecture/phase-1.md) implements Git-backed main/sandbox trees and validates the model through real end-to-end tests. Its limits are there.
 The [phase 1 handoff](target-architecture/phase-1-handoff.md) records each exit row's
 evidence and the measurements.
 [The fork and upstream rules in plain git](target-architecture/demo/walkthrough.md) shows those rules with a shell script
