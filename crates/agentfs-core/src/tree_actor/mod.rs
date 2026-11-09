@@ -628,7 +628,6 @@ pub struct Volume {
     /// Closes that could not save, in arrival order. Their handles count as
     /// open until a later step in their tree saves them, or a restart does.
     pending_closes: Vec<u64>,
-    saved_through: BTreeMap<(String, u64), u64>,
     /// Each direct save's commit, by event number (see `rebuild_owners`).
     owners: BTreeMap<u64, Oid>,
     next: u64,
@@ -772,7 +771,6 @@ impl Volume {
             trees: BTreeMap::new(),
             handles: BTreeMap::new(),
             pending_closes: Vec::new(),
-            saved_through: folded.saved_through,
             owners: BTreeMap::new(),
             next: folded.next_seq,
             stopped: false,
@@ -806,14 +804,12 @@ impl Volume {
             volume.pages_opened(&open.tree, open.object);
         }
         let mut page_writes = folded.page_writes;
-        let page_files: BTreeSet<(String, u64)> = page_writes
-            .keys()
-            .chain(volume.saved_through.keys())
-            .cloned()
-            .collect();
+        let saved = folded.saved_through;
+        let page_files: BTreeSet<(String, u64)> =
+            page_writes.keys().chain(saved.keys()).cloned().collect();
         for key in page_files {
             let writes = page_writes.remove(&key).unwrap_or_default();
-            let saved_through = volume.saved_through.get(&key).copied().unwrap_or(0);
+            let saved_through = saved.get(&key).copied().unwrap_or(0);
             volume.pages_restore(&key.0, key.1, writes, saved_through);
         }
         let abandoned: Vec<_> = volume.handles.keys().copied().collect();
@@ -1934,17 +1930,7 @@ impl Volume {
             .saturating_sub(taken)
             .saturating_add(enqueued);
         if let Some(closed) = closed {
-            let key = (closed.tree, closed.object);
-            if self
-                .handles
-                .values()
-                .any(|h| h.tree == key.0 && h.object == key.1)
-            {
-                self.saved_through.insert(key.clone(), seq);
-            } else {
-                self.saved_through.remove(&key);
-            }
-            self.pages_saved(&key.0, key.1, seq);
+            self.pages_saved(&closed.tree, closed.object, seq);
         }
     }
 
@@ -1982,8 +1968,9 @@ impl Volume {
     }
 
     /// A fuzzy checkpoint (ARIES): the pointers, the live opens, and unchanged
-    /// the calls and page writes of files with a live write-open. A file held
-    /// open pins only its own calls, never other files' saves.
+    /// the live opens' calls and the page writes memory still holds. A file held
+    /// open pins only its own calls, never other files' saves, and a closed
+    /// generation's page write stays out of the fold (R12).
     fn compact(&mut self) -> std::result::Result<(), CompactError> {
         let _timer = Timer::start(Which::Compaction);
         let opens = self
@@ -2008,21 +1995,17 @@ impl Volume {
                 pointers: self.pointers.to_hex(),
                 upstreams: self.upstreams.clone(),
                 opens,
-                page_saved: self
-                    .saved_through
-                    .iter()
-                    .map(|((tree, object), seq)| (tree.clone(), *object, *seq))
-                    .collect(),
+                page_saved: self.pages_saved_through(),
             },
         };
-        let handles = &self.handles;
+        let (handles, pages) = (&self.handles, &self.pages);
         let retained = self
             .journal
             .retained(|record| match &record.entry {
                 Entry::Call { handle, .. } => handles.contains_key(handle),
-                Entry::PageWrite { tree, object, .. } => handles
-                    .values()
-                    .any(|h| h.tree == *tree && h.object == *object),
+                Entry::PageWrite { tree, object, .. } => {
+                    pages::holds(pages, tree, *object, record.seq)
+                }
                 _ => false,
             })
             .map_err(CompactError::Before)?;
@@ -2331,15 +2314,7 @@ mod tests {
         v.write(shared, 0, b"shared", false).unwrap();
         let object = v.open_object(shared).unwrap();
         let other = v.write_open("main", "shared", "w", false).unwrap();
-        v.record_page_write(
-            "main",
-            object,
-            &[pages::Run {
-                offset: 1,
-                bytes: b"page".to_vec(),
-            }],
-        )
-        .unwrap();
+        v.page_writeback(other, 1, b"WXYZ").unwrap();
         v.close(other).unwrap();
         let anonymous = v.anonymous_open("main", "w").unwrap();
         v.write(anonymous, 0, b"unnamed", false).unwrap();
@@ -2366,7 +2341,7 @@ mod tests {
         assert_eq!(folded.upstreams[&fork], "main");
         assert_eq!(
             folded.page_writes[&("main".to_owned(), object)][0].1.bytes,
-            b"page"
+            b"WXYZ"
         );
         assert!(
             folded
@@ -2402,6 +2377,27 @@ mod tests {
         assert_eq!(folded.opens[&held].calls.len(), 2);
         assert_eq!(folded.pointers, v.pointers);
         assert_eq!(folded.next_seq, v.next);
+    }
+
+    /// R1.4, R12: a compaction keeps only the page writes memory still holds. A
+    /// closed generation's write stays out of the fold, so a recovery close does
+    /// not lay it over the saves that came after it.
+    #[test]
+    fn a_compaction_keeps_a_closed_opens_page_write_out_of_recovery() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut v = Volume::open(tmp.path()).unwrap();
+        let first = v.write_open("main", "f", "w", true).unwrap();
+        v.page_writeback(first, 0, b"XXXX").unwrap();
+        v.close(first).unwrap();
+        let second = v.write_open("main", "f", "w", false).unwrap();
+        v.write(second, 0, b"YYYY", false).unwrap();
+        v.close(second).unwrap();
+        // Held open across the compaction, as a long-lived log is.
+        let _held = v.write_open("main", "f", "w", false).unwrap();
+        v.compact().unwrap();
+        drop(v);
+        let v = Volume::open(tmp.path()).unwrap();
+        assert_eq!(v.read("main", "f").unwrap(), b"YYYY");
     }
 
     #[test]

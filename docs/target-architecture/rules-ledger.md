@@ -386,4 +386,6 @@ of their day: "main" is the root, a "sandbox" is a fork, a "parent" is an upstre
 
 - **R12** · approved · Every write call is in its tree's journal before it returns. After a crash, each open
   file is saved from the journal as its close would have saved it, exactly once, before any tree is served again.
-  Approved by the owner, 2026-11-05 (approval page). Tests: `r12_a_crash_saves_every_open_from_the_journal`, `r12_a_crash_during_a_close_saves_the_open_once`, and on the real journal `a_step_killed_before_its_record_saves_at_restart`, `a_step_killed_after_its_record_is_not_saved_again`, `a_failed_save_keeps_serving_and_saves_at_the_next_step`
+  Approved by the owner, 2026-11-05 (approval page). A compaction keeps that fold: only the page writes memory still
+  holds stay in the journal, so a recovery close never lays a closed open's page write over later saves
+  (`a_compaction_keeps_a_closed_opens_page_write_out_of_recovery`, a unit test in `tree_actor/mod.rs`). Tests: `r12_a_crash_saves_every_open_from_the_journal`, `r12_a_crash_during_a_close_saves_the_open_once`, and on the real journal `a_step_killed_before_its_record_saves_at_restart`, `a_step_killed_after_its_record_is_not_saved_again`, `a_failed_save_keeps_serving_and_saves_at_the_next_step`

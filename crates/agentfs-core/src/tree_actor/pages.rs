@@ -458,6 +458,16 @@ impl Volume {
         }
     }
 
+    /// The files with a live write-open whose earlier close moved `saved_through`,
+    /// for a checkpoint. This is the only home of that number while serving.
+    pub(super) fn pages_saved_through(&self) -> Vec<(String, u64, u64)> {
+        self.pages
+            .iter()
+            .filter(|(_, state)| state.saved_through > 0)
+            .map(|((tree, object), state)| (tree.clone(), *object, state.saved_through))
+            .collect()
+    }
+
     /// Hook: recovery found these page writes and this `saved_through` for a
     /// file with a live write-open, before its closes run. No I/O.
     pub(super) fn pages_restore(
@@ -471,6 +481,22 @@ impl Volume {
         state.writes = writes;
         state.saved_through = saved_through;
     }
+}
+
+/// Whether memory holds the page write numbered `seq` of `object` in `tree`: what
+/// a compaction keeps. `writes` is in journal order.
+pub(super) fn holds(
+    pages: &BTreeMap<(String, u64), ObjectPages>,
+    tree: &str,
+    object: u64,
+    seq: u64,
+) -> bool {
+    pages.get(&(tree.to_owned(), object)).is_some_and(|state| {
+        state
+            .writes
+            .binary_search_by_key(&seq, |(number, _)| *number)
+            .is_ok()
+    })
 }
 
 /// Up to `size` bytes of `bytes` from `offset`, short at the end.
