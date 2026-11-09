@@ -1,4 +1,4 @@
-//! End-to-end tests of `agentfs record` and its path rules (design §4, §5).
+//! End-to-end tests of `agentfs record` and its path rules.
 
 use std::fs;
 use std::path::PathBuf;

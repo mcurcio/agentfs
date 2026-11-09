@@ -1,4 +1,4 @@
-//! Mounting and unmounting (design §1.1, §17.1).
+//! Mounting and unmounting.
 //!
 //! [`preflight`] runs before anything is mounted and refuses layouts that
 //! would break invisibility or recurse into the mount:
@@ -15,14 +15,14 @@
 //!   the secret to the workload;
 //! - a mount point left by a crashed daemon (`ENOTCONN`) is reported with
 //!   the command that clears it;
-//! - no config fragment (`include.path`, design §4.3) may be under the
+//! - no config fragment (`include.path`) may be under the
 //!   backing tree or the mount point, for the same reason as credentials.
 //!
 //! [`mount_state`] tells a live agentfs mount from a stale one (its daemon
 //! gone), from nothing and from another filesystem, using
 //! `/proc/self/mountinfo` ([`agentfs_core::mountinfo`]) and a `statfs`; `agentfs
 //! probe` and the hold mode of a restarted sidecar use it, and [`detach`]
-//! clears a stale mount (design §17.1).
+//! clears a stale mount.
 //!
 //! [`Mount::start`] mounts with fuser (multi-threaded, one cloned
 //! `/dev/fuse` descriptor per thread) and these options: `fsname` agentfs
@@ -33,11 +33,10 @@
 //! directory beneath it to writes nothing would record. Mounting is done
 //! with `mount(2)` as root and `fusermount3` otherwise. Before it mounts,
 //! it repairs the paths a previous mount could not record
-//! ([`MountConfig::repair_store`], design §3.5), and refuses
+//! ([`MountConfig::repair_store`]), and refuses
 //! `--passthrough on` without the privilege for it ([`crate::privileges`]).
 //!
-//! With [`MountConfig::stack_over`] (`--on-stale-mount recover`, design
-//! §17.1) the mount point is a stale agentfs mount: FUSE is mounted at a
+//! With [`MountConfig::stack_over`] (`--on-stale-mount recover`, design) the mount point is a stale agentfs mount: FUSE is mounted at a
 //! private directory of the state area, bind-mounted over the stale mount
 //! (made shared, so propagation carries it into every copy of the stale
 //! mount: workload containers, subPath binds), and the private directory is
@@ -96,15 +95,14 @@ pub struct MountConfig {
     /// FUSE threads; 0 picks the number of CPUs, between 2 and 16.
     pub threads: usize,
     pub sweep_interval: Duration,
-    /// Where the repair queue is kept across mounts (design §3.5); `None`
+    /// Where the repair queue is kept across mounts; `None`
     /// keeps it in memory only.
     pub repair_store: Option<PathBuf>,
     /// Mount over the stale agentfs mount at `mountpoint` instead of on it
-    /// (`--on-stale-mount recover`, design §17.1); `None` mounts normally.
+    /// (`--on-stale-mount recover`); `None` mounts normally.
     pub stack_over: Option<StackOver>,
     /// Mount read-only (`ro`): the kernel refuses every change with
-    /// `EROFS`, through any bind of the mount (a finished fork, design
-    /// §11.5).
+    /// `EROFS`, through any bind of the mount (a finished fork, design).
     pub read_only: bool,
     /// Also serve the sandbox overlay ([`crate::overlay`]) over the same
     /// operations, at its own mount point; `None` serves the main mount
@@ -194,7 +192,7 @@ pub struct OverlayConfig {
     pub mountpoint: PathBuf,
     pub owner: ViewOwner,
     /// Stack the overlay over the stale overlay mount a crashed daemon
-    /// left at its mount point (`--on-stale-mount recover`, design §17.1),
+    /// left at its mount point (`--on-stale-mount recover`),
     /// as [`MountConfig::stack_over`] does for the main mount; `None`
     /// mounts normally. Its source is not the main mount's.
     pub stack_over: Option<StackOver>,
@@ -283,8 +281,8 @@ pub enum PreflightError {
         outer: &'static str,
         outer_path: PathBuf,
     },
-    /// An operator config fragment (`include.path`, design §4.3, or an
-    /// unlinked fork's `agentfs.fork.remotes`, §11.5) is under the backing
+    /// An operator config fragment (`include.path`, or an
+    /// unlinked fork's `agentfs.fork.remotes`) is under the backing
     /// tree or the mount point: the workload could rewrite the operator's
     /// settings and remotes.
     #[error(
@@ -375,10 +373,9 @@ fn why(inner: &'static str, outer: &'static str) -> &'static str {
 }
 
 /// Checks that mounting `backing` at `mountpoint` with state area `state`
-/// keeps everything of the state area out of the mount (design §1.1,
-/// §18 test 5), and every remote section's credentials, SSH key and
+/// keeps everything of the state area out of the mount, and every remote section's credentials, SSH key and
 /// known_hosts file out of the backing tree and the mount point, invalid
-/// sections included (design §17.1). Returns the canonical backing tree and
+/// sections included. Returns the canonical backing tree and
 /// mount point. `kind` names the mount point in errors
 /// ([`MountKind::label`]).
 pub fn preflight(
@@ -433,7 +430,7 @@ pub fn preflight_overlay(main: &Path, overlay: &Path) -> Result<PathBuf, Preflig
 }
 
 /// [`preflight`] for a mount stacked over the stale agentfs mount at
-/// `mountpoint` (`--on-stale-mount recover`, design §17.1): the same
+/// `mountpoint` (`--on-stale-mount recover`): the same
 /// checks, with the mount point resolved through its parent, since a
 /// stale mount answers every `stat` with `ENOTCONN`. Refuses anything but
 /// a stale agentfs mount of this volume and of kind `kind` there (source
@@ -565,7 +562,7 @@ fn check_layout(
 }
 
 /// What is mounted at a path, as `agentfs probe` and the hold mode of a
-/// restarted sidecar see it (design §17.1).
+/// restarted sidecar see it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MountState {
     /// An agentfs mount whose daemon answers.
@@ -630,7 +627,7 @@ fn mount_state_in(entries: &[MountEntry], path: &Path) -> io::Result<MountState>
 
 /// Detaches whatever is mounted at `path` lazily: `umount2(MNT_DETACH)`
 /// with the privilege to unmount, `fusermount3 -u -z` otherwise. Used to
-/// clear a stale agentfs mount (design §17.1).
+/// clear a stale agentfs mount.
 pub fn detach(path: &Path) -> io::Result<()> {
     if Privileges::current().can_unmount() {
         return rustix::mount::unmount(path, rustix::mount::UnmountFlags::DETACH)
@@ -652,7 +649,7 @@ pub fn detach(path: &Path) -> io::Result<()> {
 /// Detaches the stale agentfs mounts at `path`, topmost first, until the
 /// topmost is not one, at most `max`; returns how many it detached. Each
 /// crash of a recovered daemon leaves one stale layer under the mount
-/// stacked over it (design §17.1).
+/// stacked over it.
 pub fn detach_stale_layers(path: &Path, max: usize) -> io::Result<usize> {
     let mut n = 0;
     while n < max && matches!(mount_state(path)?, MountState::Stale { .. }) {
@@ -738,7 +735,7 @@ pub enum MountError {
     /// `--passthrough on` cannot be honoured with these privileges.
     #[error("--passthrough on: {0}")]
     Passthrough(&'static str),
-    /// Stacking over the stale mount failed (design §17.1).
+    /// Stacking over the stale mount failed.
     #[error("stacking over the stale mount at {}", path.display())]
     Stack { path: PathBuf, source: io::Error },
     /// The volume cannot have the sandbox overlay's visibility gate.
@@ -777,7 +774,7 @@ pub struct UnmountReport {
     pub session_abandoned: bool,
     /// Open, changed files the final sweep recorded.
     pub swept: usize,
-    /// fsync-class groups captured at unmount (design §8).
+    /// fsync-class groups captured at unmount.
     pub captured: usize,
     /// Failed records the final sweep repaired, and those still failing.
     pub repaired: usize,
@@ -843,7 +840,7 @@ pub fn fuser_config(config: &MountConfig, kind: MountKind) -> fuser::Config {
 }
 
 /// Raises the open-file soft limit to the hard limit: a directory rename
-/// holds one descriptor per file of a record (design §3.1).
+/// holds one descriptor per file of a record.
 fn raise_nofile() {
     use rustix::process::{Resource, getrlimit, setrlimit};
     let limit = getrlimit(Resource::Nofile);
@@ -1239,7 +1236,7 @@ impl Mount {
         self.overlay.as_ref().map(|o| o.mountpoint.as_path())
     }
 
-    /// What a restore through the mount needs of it (design §15).
+    /// What a restore through the mount needs of it.
     pub fn view(&self) -> MountView {
         MountView {
             mountpoint: self.mountpoint.clone(),
@@ -1247,8 +1244,7 @@ impl Mount {
         }
     }
 
-    /// What a front's listener answers the history service with (design
-    /// §15): see [`MountHooks`].
+    /// What a front's listener answers the history service with: see [`MountHooks`].
     pub fn hooks(&self) -> MountHooks {
         MountHooks {
             ops: self.ops.clone(),
@@ -1316,7 +1312,7 @@ impl Mount {
 }
 
 /// A running mount as a restore sees it: where to write, and which files
-/// the workload holds open for writing (design §15). Cheap to clone.
+/// the workload holds open for writing. Cheap to clone.
 #[derive(Clone)]
 pub struct MountView {
     mountpoint: PathBuf,
@@ -1329,7 +1325,7 @@ impl MountView {
     }
 
     /// Records every fsync-class group the running operator operation
-    /// changed, each whole (design §8, §15). Call it after the operation's
+    /// changed, each whole. Call it after the operation's
     /// last write, before it ends: until then no other trigger records
     /// those groups. Returns how many captures were journaled.
     pub fn capture_operation(&self) -> Result<usize, agentfs_core::volume::VolumeError> {
@@ -1348,7 +1344,7 @@ impl agentfs_core::restore::Liveness for MountView {
     }
 }
 
-/// A front mount's answers to the history service's calls (design §15),
+/// A front mount's answers to the history service's calls,
 /// for a restore the service writes into the backing tree directly:
 ///
 /// - settle: the sweep, as at every interval (the repair queue, then every
@@ -1619,7 +1615,7 @@ mod tests {
         fs::write(l.p("token"), "secret").unwrap();
         let s = settings(vec![remote(l.p("token"))]);
         l.check_with("state", "backing", "mnt", &s).unwrap();
-        // The LFS credential file is held to the same rule (design §7).
+        // The LFS credential file is held to the same rule.
         let mut lfs = remote(l.p("token"));
         lfs.lfs_credentials = Some(l.p("mnt/lfs-token"));
         let err = l
@@ -1711,7 +1707,7 @@ mod tests {
             );
             assert!(err.to_string().contains("include.path"), "{err}");
         }
-        // An unlinked fork's own remotes file likewise (design §11.5).
+        // An unlinked fork's own remotes file likewise.
         s.includes = vec![l.p("operator.conf")];
         s.fork_remotes = Some(l.p("operator-remotes.conf"));
         l.check_with("state", "backing", "mnt", &s).unwrap();

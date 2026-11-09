@@ -1,6 +1,6 @@
-//! The node plugin's release scan (design §14.2, F8 D1): it pushes every
+//! The node plugin's release scan (F8 D1): it pushes every
 //! worktree on this node that no pod stages, and finishes and publishes
-//! the forks whose deletion asked for it (design §11.5).
+//! the forks whose deletion asked for it.
 //!
 //! A worktree with unpushed commits and no history service (between pods,
 //! after its claim was deleted, or kept by a static PV with `Retain`)
@@ -629,7 +629,7 @@ mod tests {
         fs::create_dir_all(layout.staged_dir()).unwrap();
         fs::write(layout.staged_record("staged"), "{}").unwrap();
         // An unlinked fork is never finished: it is pushed like any
-        // worktree, even when its deletion asked (design §11.5).
+        // worktree, even when its deletion asked.
         volume_linked(&layout, "solo", Some(ForkLink::Unlinked), true);
         commit(&layout, "solo");
 

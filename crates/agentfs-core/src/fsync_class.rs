@@ -1,9 +1,8 @@
 //! The `fsync` class for databases: which paths belong to it and how they
-//! group (design §8). Pure policy, no I/O.
+//! group. Pure policy, no I/O.
 //!
 //! A path is in the class when the operator's `info/attributes` gives it
-//! `agentfs.commit=fsync` (`agentfs.*` never comes from tree files, design
-//! §4.1). Class paths are recorded in **groups**: the paths in one
+//! `agentfs.commit=fsync` (`agentfs.*` never comes from tree files, design). Class paths are recorded in **groups**: the paths in one
 //! directory with the same `agentfs.group` value and the same *stem*, the
 //! file name without a trailing `-wal`, `-journal` or `-shm`. So
 //! `state.db`, `state.db-wal` and `state.db-journal` with
@@ -23,7 +22,7 @@ use crate::config::{parse_duration, parse_size};
 use crate::paths::RepoPath;
 use crate::rules::{AttrState, Attributes};
 
-/// `agentfs.commit`: the boundary class (design §4.2).
+/// `agentfs.commit`: the boundary class.
 pub const COMMIT_ATTR: &str = "agentfs.commit";
 /// `agentfs.coalesce`: the shortest interval between captures of a group.
 pub const COALESCE_ATTR: &str = "agentfs.coalesce";
@@ -209,7 +208,7 @@ pub fn group_members(
 }
 
 /// Checks the value of an attribute the operator wrote in
-/// `info/attributes` (design §4.2): `agentfs.commit` is `close` or
+/// `info/attributes`: `agentfs.commit` is `close` or
 /// `fsync`, `agentfs.coalesce` a duration of at least [`MIN_COALESCE`],
 /// `agentfs.maxSize` a positive size (`512k`, `100m`, `2g`). Other
 /// attributes are not checked. `None` is an attribute set without a value

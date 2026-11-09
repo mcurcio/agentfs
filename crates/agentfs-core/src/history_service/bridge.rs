@@ -1,4 +1,4 @@
-//! Synchronous callers on an async runtime (design §14): Tokio's "bridging
+//! Synchronous callers on an async runtime: Tokio's "bridging
 //! with sync code" pattern (tokio.rs/tokio/topics/bridging).
 //!
 //! A [`super::HistoryClient`] or [`super::HistoryServer`] owns a runtime

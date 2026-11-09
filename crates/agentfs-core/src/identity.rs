@@ -1,4 +1,4 @@
-//! Committer and author identities from templates (design §9).
+//! Committer and author identities from templates.
 
 use std::collections::BTreeMap;
 

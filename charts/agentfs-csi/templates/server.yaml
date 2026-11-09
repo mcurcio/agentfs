@@ -1,5 +1,5 @@
 {{- /*
-The chart's minimal git server (server.enabled; design §14.2 "The
+The chart's minimal git server (server.enabled; "The
 server", docs/helm.md "The git server"): one pod of the
 examples/docker/git-server image, its repositories on a claim of any
 StorageClass, behind the Service agentfs-git-server. Its credentials are

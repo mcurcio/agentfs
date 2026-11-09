@@ -1,4 +1,4 @@
-//! TLS to the OpenTelemetry collector (design §13), built with the
+//! TLS to the OpenTelemetry collector, built with the
 //! `otlp-tls` feature: rustls on ring, no OpenSSL.
 //!
 //! The CA bundle (`OTEL_EXPORTER_OTLP_CERTIFICATE`), when set, is the only

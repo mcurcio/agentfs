@@ -7,7 +7,7 @@
 	url = http://git-server.agentfs-e2e.svc.cluster.local:8080/git/history.git
 	agentfsCredentials = /run/secrets/agentfs/origin
 
-# Custom identity templates (design §9), checked exactly by ci/e2e-kind.sh.
+# Custom identity templates, checked exactly by ci/e2e-kind.sh.
 [agentfs "identity"]
 	committerName = {pod} on {node}
 	committerEmail = {podUid}@{namespace}.{volume}.ci.invalid

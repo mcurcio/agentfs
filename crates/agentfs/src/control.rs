@@ -1,4 +1,4 @@
-//! The control socket of a running daemon (design §2.2, §2.3, §15).
+//! The control socket of a running daemon.
 //!
 //! `agentfs mount`, `agentfs run` and `agentfs serve-history` listen on
 //! `<state>/meta/control/agentfs.sock` while they hold the state-area
@@ -73,7 +73,7 @@ pub const READ_TIMEOUT: Duration = Duration::from_secs(10);
 pub enum Op {
     Restore,
     Revert,
-    /// Commit and push now (design §2.3): every daemon serves it.
+    /// Commit and push now: every daemon serves it.
     Push,
     /// Receive a finished fork into this local-only volume's history (F8
     /// S3): every daemon serves it, beside the others.

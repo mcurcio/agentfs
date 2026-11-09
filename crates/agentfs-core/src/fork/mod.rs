@@ -1,4 +1,4 @@
-//! Forked volumes (design §19.1, "Forked volumes", 2026-10-16).
+//! Forked volumes (2026-10-16).
 //!
 //! A fork is an ordinary volume started from another volume's latest
 //! commit, its source. It records, pushes and recovers like any volume.
@@ -21,7 +21,7 @@
 //!   branch, command, webhook), for a receiver to program; never run by
 //!   the CSI driver.
 //!
-//! Design §11.5 has the whole model.
+//! The fork model is in `docs/forks.md`.
 
 pub mod create;
 pub mod deliver;

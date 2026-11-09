@@ -1,4 +1,4 @@
-//! The Git LFS pointer format (design §7; git-lfs `docs/spec.md`, v1).
+//! The Git LFS pointer format (git-lfs `docs/spec.md`, v1).
 //!
 //! A pointer is the blob history holds in place of LFS-stored content:
 //!

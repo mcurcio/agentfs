@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Writes the certificates for OTLP over TLS (design §13) into DIR:
+# Writes the certificates for OTLP over TLS into DIR:
 #
 #   ca.pem, ca.key           a CA no system store trusts
 #   server.pem, server.key   the collector, for localhost and 127.0.0.1

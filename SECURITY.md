@@ -29,7 +29,7 @@ branches.
 
 ## Scope
 
-agentfs's threat model is in [design §1.1](docs/design.md#11-threat-model):
+agentfs's threat model is in [guarantees](docs/guarantees.md#threat-model):
 it protects against a workload's mistakes, not against a workload actively
 trying to defeat it, except that what a sandbox writes into a fork is
 treated as hostile by agentfs itself. In scope, for example:
@@ -42,4 +42,4 @@ treated as hostile by agentfs itself. In scope, for example:
 
 Out of scope: secrets a workload writes into its own tree. agentfs records
 them like any other file and does not scan content
-([design §10](docs/design.md#10-secrets-not-in-scope)).
+([guarantees](docs/guarantees.md#secrets)).

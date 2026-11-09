@@ -1,4 +1,4 @@
-//! Fetching the patch queue from a remote (design §12): the inbox and
+//! Fetching the patch queue from a remote: the inbox and
 //! approved refs of this volume only, forced, with deleted ones pruned;
 //! failures and the time limit are outcomes, never errors.
 

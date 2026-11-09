@@ -1,4 +1,4 @@
-//! `agentfs patch` and the mount's patch phase (design §12, §17.1).
+//! `agentfs patch` and the mount's patch phase.
 //!
 //! - `patch submit` and `patch approve` are the producer side: they run in
 //!   the producer's git repository and drive its `git`
@@ -49,8 +49,7 @@ use agentfs_core::volume::{Committer, Recorder, StateDir};
 use crate::control::{self, ClientError, Reply, Request};
 use crate::{EXIT_LOCKED, Pod, Session, current_gid, current_uid};
 
-/// What `patch apply` is answered while a daemon holds the volume (design
-/// §19.1 "No live landing yet").
+/// What `patch apply` is answered while a daemon holds the volume.
 pub const ATTACHED: &str = "workload attached; lands at next mount";
 
 #[derive(Subcommand)]
@@ -524,7 +523,7 @@ fn status_cmd(state: &StateDir, json: bool) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// The patch phase of a daemon's start (design §12 "When it runs"): with
+/// The patch phase of a daemon's start: with
 /// nothing attached (`deferred` is `None`) the queue lands
 /// ([`apply_queue`]). Otherwise it is judged as an apply under a daemon
 /// is ([`Queue::judge`], fetching the inbox), the integrator is told, and
@@ -574,7 +573,7 @@ pub fn queue_at_start(
     }
 }
 
-/// The patch phase (design §12, §17.1): with the volume open and nothing
+/// The patch phase: with the volume open and nothing
 /// serving the tree, fetch the inbox from the patch remote (best effort,
 /// unless `fetch` is false or `agentfs.patchFetchTimeout` is 0) and apply
 /// the queue. A blocked queue is an alarm, not an error: the volume

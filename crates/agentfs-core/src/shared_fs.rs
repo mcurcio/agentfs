@@ -1,4 +1,4 @@
-//! Which filesystems a state area may live on (design §2.3, §14.2).
+//! Which filesystems a state area may live on.
 //!
 //! The state lock ([`crate::lock::StateLock`]) is the only thing that keeps
 //! a second history service off a volume. On NFS it holds across nodes
@@ -8,8 +8,7 @@
 //!
 //! [`network_filesystem`] tells a node's own disk from a network
 //! filesystem: agentfs-csi keeps every worktree on its node's disk and
-//! refuses a `--base-path` on a network filesystem at start (F8 R1,
-//! design §14.2).
+//! refuses a `--base-path` on a network filesystem at start (F8 R1).
 
 use std::path::{Path, PathBuf};
 
@@ -19,7 +18,7 @@ use crate::mountinfo::{self, MountEntry};
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum UnsafeLocks {
     #[error(
-        "{} is on NFS version {version} ({export}): agentfs needs NFS 4.1 or later, whose server enforces every client's locks (design §14.2)",
+        "{} is on NFS version {version} ({export}): agentfs needs NFS 4.1 or later, whose server enforces every client's locks",
         path.display()
     )]
     NfsVersion {
@@ -28,7 +27,7 @@ pub enum UnsafeLocks {
         version: String,
     },
     #[error(
-        "{} is on NFS mounted with {option} ({export}): its locks exclude only processes on this node, so a second history service could run on another (design §14.2)",
+        "{} is on NFS mounted with {option} ({export}): its locks exclude only processes on this node, so a second history service could run on another",
         path.display()
     )]
     LocalLocks {

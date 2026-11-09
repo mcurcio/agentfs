@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# End-to-end test of the CSI chart's git server (server.enabled, F8, design
-# §14.2 "The server", docs/helm.md "The git server") on a one-node kind
+# End-to-end test of the CSI chart's git server (server.enabled, F8, design, docs/helm.md "The git server") on a one-node kind
 # cluster: the chart from this tree with charts/agentfs-csi/ci/server.yaml,
 # its server on the cluster's default StorageClass with the chart's own
 # random password, and a profile pushing to it with the credentials the

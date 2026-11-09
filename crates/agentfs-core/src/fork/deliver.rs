@@ -1,5 +1,4 @@
-//! Delivering a published change (design §11.5 "Delivery", §19.1 "Fork
-//! delivery"): the library's four built-in methods, for a receiver to
+//! Delivering a published change: the library's four built-in methods, for a receiver to
 //! program. The CSI driver never delivers (gate answer "2 a for CSI and b
 //! for the library"); it only publishes.
 //!
@@ -13,7 +12,7 @@
 //!   into the inbox of the volume the runner names (never the change's
 //!   own `Agentfs-Source`); the remote already queuing or having applied
 //!   it is [`Delivered::AlreadyDelivered`], and the queue's duplicate rule
-//!   (§12) is the guarantee.
+//!   is the guarantee.
 //! - [`BranchDelivery`]: a pull request's head, `<prefix><fork>`, created
 //!   only if absent. "Already delivered" means the ref is at exactly the
 //!   commit this delivery creates (deterministic, so content-based, never
@@ -106,7 +105,7 @@ pub enum Shape {
 /// change's.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeliveryMethod {
-    /// At most once (the §12 duplicate rule). `volume` comes from the
+    /// At most once (the duplicate rule). `volume` comes from the
     /// runner's flags, never from the change.
     Inbox {
         remote: String,

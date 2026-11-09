@@ -1,4 +1,4 @@
-//! The sandbox overlay's tmp layer (design §1.1, §2.4):
+//! The sandbox overlay's tmp layer:
 //! the files a sandbox creates through the overlay under names the rules
 //! skip ([`agentfs_core::visibility::Placement::TmpLayer`]).
 //!

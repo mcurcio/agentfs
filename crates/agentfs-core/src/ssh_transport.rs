@@ -1,4 +1,4 @@
-//! agentfs's SSH transport for libgit2 (design §11.1, `ssh` feature).
+//! agentfs's SSH transport for libgit2 (`ssh` feature).
 //!
 //! libgit2 is built without libssh2. Instead, [`register`] installs this
 //! module as libgit2's smart subtransport for `ssh://`, `ssh+git://`,
@@ -41,7 +41,7 @@
 //!
 //! [`run_command`] runs one other command the same way, bound to the same
 //! remote's host and port with the same checks, and returns its output:
-//! `git-lfs-authenticate` for the LFS client (design §7).
+//! `git-lfs-authenticate` for the LFS client.
 
 use std::borrow::Cow;
 use std::cell::RefCell;

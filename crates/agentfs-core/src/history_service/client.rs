@@ -1,4 +1,4 @@
-//! A front's connection to the history service (design §14, §3.5).
+//! A front's connection to the history service.
 //!
 //! Two HTTP/2 connections per front, each starting with `Hello`, which the
 //! service admits and binds to the connection:
@@ -306,7 +306,7 @@ impl HistoryClient {
         &self.front
     }
 
-    /// Whether each of `paths` is tracked now (design §4).
+    /// Whether each of `paths` is tracked now.
     pub fn tracked(&self, paths: &[RepoPath]) -> Result<Vec<bool>, ClientError> {
         let request = pb::TrackedRequest {
             paths: paths.iter().map(|p| p.as_str().to_owned()).collect(),
@@ -328,7 +328,7 @@ impl HistoryClient {
 
     /// Hands `draft` to the service and waits until it is durable there.
     /// The service decides each change again, skips writes older than the
-    /// state it last journaled at their path (by `stamps`, design §14.1),
+    /// state it last journaled at their path (by `stamps`),
     /// and stamps the record with this front's origin (or, for a sweep
     /// record, the origin the draft carries, if it can render it).
     pub fn record(&self, draft: Draft, stamps: Vec<PathStamp>) -> Result<Recorded, ClientError> {
@@ -372,7 +372,7 @@ impl HistoryClient {
     }
 
     /// Whether the last change the service journaled at `path` is still
-    /// the write of this front's frozen copy `copy` (design §3.1). False,
+    /// the write of this front's frozen copy `copy`. False,
     /// without asking, from a service without the `still_last` feature.
     pub fn still_last(&self, path: &RepoPath, copy: PendingId) -> Result<bool, ClientError> {
         if !self.supports("still_last") {
@@ -421,7 +421,7 @@ impl HistoryClient {
         self.observe("ping", start, result)
     }
 
-    /// Opens the listening stream on the current connection (design §15):
+    /// Opens the listening stream on the current connection:
     /// the sender of the front's answers and the service's calls. Returns
     /// once the service has answered with its headers: it is listening.
     pub(super) async fn open_listen(&self) -> Result<Listening, ClientError> {
@@ -733,7 +733,7 @@ impl HistoryClient {
     }
 }
 
-/// An open listening stream (design §15).
+/// An open listening stream.
 pub(super) struct Listening {
     /// The front's answers, in the request stream.
     pub(super) answers: tokio::sync::mpsc::Sender<pb::FrontAnswer>,

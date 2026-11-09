@@ -1,4 +1,4 @@
-//! Running an operator's program (design §11.5 "Delivery", §12; beads
+//! Running an operator's program (beads
 //! agentfs-mia.2, mia.5): the one runner behind fork delivery's command
 //! method ([`crate::fork::deliver`]) and the patch queue's `patch-accept`
 //! hook ([`crate::patch::accept`]).

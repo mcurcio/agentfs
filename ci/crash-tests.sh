@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Crash injection (design §18 test 3): the failpoint harness built with
+# Crash injection: the failpoint harness built with
 # the `failpoints` feature.
 #
 # - crates/agentfs-core/tests/crash_points.rs: every engine failpoint,

@@ -1,6 +1,6 @@
 //! [`Listener`], the one way agentfs listens on a Unix socket: the control
-//! socket of a daemon (design §2.2, §15), the history service's socket
-//! (§14) and agentfs-csi's socket (§14.2).
+//! socket of a daemon, the history service's socket
+//! and agentfs-csi's socket.
 //!
 //! **Shut down, not only closed.** A listening socket is an open file, and
 //! a child process spawned by any thread of this process shares it from its
@@ -15,7 +15,7 @@
 //! `shutdown(SHUT_RDWR)`, which refuses every later connect at once,
 //! whatever shares the socket, and wakes an accept waiting on it. Dropping
 //! a [`Listener`], an [`AsyncListener`] or a [`Stopper`] stops it, as a
-//! [`crate::file_lock::FileLock`] unlocks before it closes (§2.2).
+//! [`crate::file_lock::FileLock`] unlocks before it closes.
 //!
 //! Once stopped, [`Listener::accept`] answers `None` and an
 //! [`AsyncListener`] ends, so an accept loop ends with it rather than spin

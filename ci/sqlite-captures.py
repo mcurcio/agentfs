@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Checks how often an fsync-class database was captured (design §8).
+"""Checks how often an fsync-class database was captured.
 
 Lists every commit on BRANCH that changed PATH, PATH-wal or PATH-journal,
 oldest first, with its author time (the time of its last record, whole

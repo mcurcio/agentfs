@@ -1,4 +1,4 @@
-//! `agentfs-csi`: the agentfs CSI driver (design §14.2, docs/csi.md).
+//! `agentfs-csi`: the agentfs CSI driver (docs/csi.md).
 //!
 //! Runs in the node DaemonSet on every node, privileged, beside
 //! csi-provisioner (`--node-deployment`) and node-driver-registrar, and
@@ -87,8 +87,7 @@ struct Cli {
     #[arg(long, env = "AGENTFS_CSI_NAMESPACE", default_value = "")]
     namespace: String,
     /// How often the release scan pushes the worktrees no pod stages, and
-    /// finishes the forks whose deletion asked for it (F8 D1, design
-    /// §11.5); the first delay after a failed push.
+    /// finishes the forks whose deletion asked for it (F8 D1, design); the first delay after a failed push.
     #[arg(long, env = "AGENTFS_CSI_RELEASE_SCAN_INTERVAL", default_value = "30s", value_parser = duration)]
     release_scan_interval: Duration,
 }
@@ -137,7 +136,7 @@ async fn run(cli: Cli) -> Result<(), String> {
             None => Ok(()),
             Some(mount) => Err(format!(
                 "it is on {} ({} at {}), a network filesystem: each node keeps its worktrees \
-                 on its own disk (design §14.2); use a local directory, ideally on a disk of its \
+                 on its own disk; use a local directory, ideally on a disk of its \
                  own",
                 mount.fstype,
                 mount.source,

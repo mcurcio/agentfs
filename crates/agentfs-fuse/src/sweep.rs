@@ -1,4 +1,4 @@
-//! The periodic sweep (design §3.1, §3.5): every `agentfs.sweepInterval`
+//! The periodic sweep: every `agentfs.sweepInterval`
 //! it retries records that failed (the repair queue) and records files that
 //! are held open and changed, which no close would ever record. Both are
 //! late by design: the sweep is a backstop, not a boundary.
@@ -42,7 +42,7 @@ impl Sweeper {
     }
 }
 
-/// The fsync-class trailing timer (design §8): captures each changed group
+/// The fsync-class trailing timer: captures each changed group
 /// `agentfs.coalesce` after its first change since its last capture
 /// ([`crate::groups`]), sleeping until the next one is due.
 pub struct Capturer {

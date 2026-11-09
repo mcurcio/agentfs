@@ -1,6 +1,5 @@
-//! Confined access to a directory tree, for restores (design §6
-//! "Confinement", §15) and for the history engine's own reads of the
-//! backing tree (a moved tree's reconciliation and resyncs, §3.1, §14.1).
+//! Confined access to a directory tree, for restores ("Confinement") and for the history engine's own reads of the
+//! backing tree (a moved tree's reconciliation and resyncs).
 //!
 //! A restore reads and writes a tree the workload may change at any
 //! moment: the backing tree when no mount runs, or the mount point itself;
@@ -57,7 +56,7 @@ pub enum Current {
 pub struct FileState {
     /// Its content's git blob id.
     pub oid: git2::Oid,
-    /// Any execute bit is set (git's executable bit, design §6).
+    /// Any execute bit is set (git's executable bit).
     pub executable: bool,
     /// Permission bits (`mode & 0o7777`).
     pub mode: u32,
@@ -230,8 +229,7 @@ impl Dir {
         Ok((st.st_uid, st.st_gid))
     }
 
-    /// The SHA-256 and length of the regular file `rel` (an LFS object id,
-    /// design §7), read without following a symlink.
+    /// The SHA-256 and length of the regular file `rel` (an LFS object id), read without following a symlink.
     pub fn sha256_at(&self, rel: &str) -> io::Result<(LfsOid, u64)> {
         let fd = self.open_at(rel, OFlags::RDONLY, Mode::empty())?;
         if kind_of(&rustix::fs::fstat(&fd)?) != Kind::File {
@@ -247,13 +245,13 @@ impl Dir {
     /// The space the new content needs is allocated before the first byte
     /// changes, so the usual failures (`ENOSPC`, `EFBIG`, a quota) leave
     /// the file as it was. A failure while writing (`EIO`) can still leave
-    /// it part written; the caller records what is there (design §15).
+    /// it part written; the caller records what is there.
     pub fn write_in_place(&self, rel: &str, content: &[u8]) -> io::Result<()> {
         self.write_in_place_from(rel, &mut &content[..], content.len() as u64)
     }
 
     /// [`Dir::write_in_place`] with the `len` bytes of `src`, streamed (an
-    /// LFS object from the cache, design §7).
+    /// LFS object from the cache).
     pub fn write_in_place_from(&self, rel: &str, src: &mut dyn Read, len: u64) -> io::Result<()> {
         let fd = self.open_at(rel, OFlags::WRONLY, Mode::empty())?;
         let st = rustix::fs::fstat(&fd)?;

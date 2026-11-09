@@ -1,5 +1,5 @@
 //! End-to-end tests of `agentfs push`, `agentfs run` and the remote lines of
-//! `agentfs status` (design §11, §17.1).
+//! `agentfs status`.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -266,7 +266,7 @@ fn status_shows_remote_state() {
 }
 
 /// SSH remotes that are misconfigured, or that this build cannot push to,
-/// are reported and never stop the other remotes (design §11.1).
+/// are reported and never stop the other remotes.
 #[test]
 fn ssh_remotes_are_validated() {
     let v = Volume::new();
@@ -492,7 +492,7 @@ fn idle_remote() -> (Volume, PathBuf) {
     (v, remote)
 }
 
-/// Stopping `run` pushes the final commit once (design §11.2).
+/// Stopping `run` pushes the final commit once.
 #[test]
 fn run_pushes_once_at_shutdown() {
     let (v, remote) = idle_remote();
@@ -543,7 +543,7 @@ fn run_push_grace_zero_skips_final_push() {
 }
 
 /// `agentfs push` asks a running `run` to commit and push now, past its
-/// push interval (design §2.3, §11.2).
+/// push interval.
 #[test]
 fn push_now_reaches_a_running_run() {
     let (v, remote) = idle_remote();
@@ -626,8 +626,7 @@ fn limited_backlog() -> (Volume, PathBuf) {
 }
 
 /// A backlog over `agentfsMaxPushSize` is pushed in steps until the remote
-/// is up to date; a single commit over it fails as `too_large` (design
-/// §11.3).
+/// is up to date; a single commit over it fails as `too_large`.
 #[test]
 fn push_steps_through_a_push_size_limit() {
     let (v, remote) = limited_backlog();

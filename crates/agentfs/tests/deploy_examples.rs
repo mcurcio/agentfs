@@ -1,4 +1,4 @@
-//! The operator files under `deploy/` (design §16, §17.1), checked through
+//! The operator files under `deploy/`, checked through
 //! the CLI exactly as the init container and the sidecar use them: the
 //! config fragment is included with `agentfs init --include`, and the rule
 //! files become `<state>/git/info/exclude` and `info/attributes`. The
@@ -30,7 +30,7 @@ impl Volume {
     }
 
     /// A CSI profile: `deploy/csi/profiles/<name>.{config,exclude,attributes}`,
-    /// included and installed as the driver does (design §14.2).
+    /// included and installed as the driver does.
     fn profile(name: &str) -> Self {
         let dir = repo_root().join("deploy/csi/profiles");
         Self::from_files(
@@ -227,8 +227,7 @@ fn the_csi_example_profile_loads() {
     assert_eq!(v.history(), set(&kept));
 }
 
-/// The example unlinked fork class's own remotes (docs/helm.md, csi.md
-/// §14): `deploy/csi/profiles/sandbox-remotes.config` is accepted as a
+/// The example unlinked fork class's own remotes (docs/helm.md, csi.md): `deploy/csi/profiles/sandbox-remotes.config` is accepted as a
 /// fork's `remotes` file, and the fork's only remote is its own.
 #[test]
 fn the_csi_example_fork_remotes_load() {
@@ -272,7 +271,7 @@ fn sidecar_manifest() -> Vec<String> {
         .collect()
 }
 
-/// The shipped sidecar recovers in place after a crash (design §17.1).
+/// The shipped sidecar recovers in place after a crash.
 #[test]
 fn the_sidecar_recovers_stale_mounts() {
     let lines = sidecar_manifest();
@@ -285,7 +284,7 @@ fn the_sidecar_recovers_stale_mounts() {
 }
 
 /// The shipped sidecar seals the bare mount point, the fence for subPath
-/// consumers while no daemon is mounted (design §17.1).
+/// consumers while no daemon is mounted.
 #[test]
 fn the_sidecar_seals_the_mount_point() {
     let lines = sidecar_manifest();
@@ -298,7 +297,7 @@ fn the_sidecar_seals_the_mount_point() {
 }
 
 /// The workload mounts the shared emptyDir read-only: the fence while no
-/// daemon is mounted (design §17.1).
+/// daemon is mounted.
 #[test]
 fn the_workload_mounts_the_emptydir_read_only() {
     let lines = sidecar_manifest();

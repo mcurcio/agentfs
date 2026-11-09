@@ -1,6 +1,5 @@
 //! Generates the CSI gRPC code from the vendored specification
-//! (`proto/csi.proto`, v1.13.0) with protox, so no `protoc` is needed
-//! (design §17.3).
+//! (`proto/csi.proto`, v1.13.0) with protox, so no `protoc` is needed.
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-changed=proto");

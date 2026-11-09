@@ -1,5 +1,4 @@
-//! Ending a push at shutdown without leaving a remote broken (design
-//! §11.2).
+//! Ending a push at shutdown without leaving a remote broken.
 //!
 //! As with git's receive-pack, a transfer may be dropped but a ref
 //! update either completes or never starts. A push over the network

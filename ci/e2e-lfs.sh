@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# End-to-end tests of Git LFS (design §7) against git-lfs's reference
+# End-to-end tests of Git LFS against git-lfs's reference
 # server behind nginx, and the real git-lfs client:
 #
 #  1. content over agentfs.lfsThreshold, or with filter=lfs, is a pointer

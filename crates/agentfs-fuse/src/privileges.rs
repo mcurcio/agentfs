@@ -1,4 +1,4 @@
-//! What the daemon is allowed to do (design §6, §17.1).
+//! What the daemon is allowed to do.
 //!
 //! Decided from the effective capability set (`CapEff` in
 //! `/proc/self/status`), not from the effective uid, so a non-root daemon

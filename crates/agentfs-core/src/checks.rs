@@ -1,4 +1,4 @@
-//! Checks before a path is recorded and committed (design §3.4).
+//! Checks before a path is recorded and committed.
 //!
 //! A commit no remote accepts can never be pushed, so every path is checked
 //! against git's fsck rules and the remotes' limits before it is journaled
@@ -35,7 +35,7 @@
 //! Content scans (the `.gitattributes` line length, the `.gitmodules` rules
 //! of [`crate::gitmodules`]) run in the synchronous
 //! step ([`CheckStage::Record`]) only for files up to [`SYNC_SCAN_LIMIT`],
-//! the bound tree rule files already have (design §4.1); a larger file is
+//! the bound tree rule files already have; a larger file is
 //! scanned in full at commit time ([`CheckStage::Commit`]), where a refusal
 //! drops the change and raises `PathRefused` with stage `commit`.
 
@@ -80,7 +80,7 @@ pub const ATTR_MAX_FILE_SIZE: u64 = 100 << 20;
 pub const ATTR_MAX_LINE_LENGTH: usize = 2048;
 /// The largest file whose content is scanned in the synchronous step
 /// ([`CheckStage::Record`]); larger ones are scanned at commit time. The
-/// same bound as tree rule files (design §4.1).
+/// same bound as tree rule files.
 pub const SYNC_SCAN_LIMIT: u64 = 1 << 20;
 /// Largest `.gitmodules` git's fsck parses: above `core.bigFileThreshold`
 /// (512 MiB by default) it reports `gitmodulesLarge`.
@@ -100,11 +100,11 @@ pub struct LfsLimit {
     pub remote: String,
 }
 
-/// Limits from the configured remotes (design §11.3).
+/// Limits from the configured remotes.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Limits {
     pub max_blob_size: Option<BlobLimit>,
-    /// `agentfsMaxLfsObjectSize`: content stored as LFS (design §7).
+    /// `agentfsMaxLfsObjectSize`: content stored as LFS.
     pub max_lfs_object_size: Option<LfsLimit>,
 }
 
@@ -150,7 +150,7 @@ pub enum Refusal {
     /// The path is beneath a directory named `.gitmodules` or
     /// `.gitattributes` (in any spelling): git's fsck requires those to be
     /// blobs (`gitmodulesBlob`, `gitattributesBlob`), and a directory there
-    /// would leave no room for the managed LFS block (design §7).
+    /// would leave no room for the managed LFS block.
     SpecialFileNotBlob {
         file: SpecialFile,
     },
@@ -174,7 +174,7 @@ pub enum Refusal {
         remote: String,
     },
     /// Content stored as LFS over the smallest
-    /// `agentfsMaxLfsObjectSize` (design §7): refused, never stored as a
+    /// `agentfsMaxLfsObjectSize`: refused, never stored as a
     /// blob instead.
     LfsObjectTooLarge {
         bytes: u64,
@@ -183,7 +183,7 @@ pub enum Refusal {
     },
     /// git's config parser cannot read the `.gitmodules`
     /// (`gitmodulesParse`, which git only reports; agentfs refuses it, as
-    /// it does the other `.gitmodules` rules, design §3.4).
+    /// it does the other `.gitmodules` rules).
     GitmodulesParse {
         line: usize,
     },
@@ -202,13 +202,13 @@ pub enum Refusal {
     GitmodulesTooLarge {
         bytes: u64,
     },
-    /// The content is over the path's `agentfs.maxSize` (design §4.2), an
+    /// The content is over the path's `agentfs.maxSize`, an
     /// operator cap that applies whatever the store.
     MaxSize {
         bytes: u64,
         limit: u64,
     },
-    /// A member of an fsync-class group (design §8) that the path rules
+    /// A member of an fsync-class group that the path rules
     /// skip (an operator exclude, an ignore rule): the group would be
     /// recorded without it, so it is refused whole.
     GroupMemberSkipped {
@@ -418,8 +418,8 @@ impl Checks {
     /// files, and in the synchronous step ([`CheckStage::Record`]) only
     /// those up to [`SYNC_SCAN_LIMIT`]; at [`CheckStage::Commit`] they are
     /// read in full (bounded by their size limits, checked first by length
-    /// alone). The blob size limit does not apply to content stored as LFS
-    /// (design §7): history then holds only a pointer.
+    /// alone). The blob size limit does not apply to content stored as LFS:
+    /// history then holds only a pointer.
     pub fn check_file_stored(
         &self,
         path: &RepoPath,
@@ -453,7 +453,7 @@ impl Checks {
 
     /// Every rule for a regular file at `path` holding `bytes`, stored in
     /// `store`, as at commit time (content scans run in full). A restore
-    /// checks content with this before writing it back (design §15).
+    /// checks content with this before writing it back.
     pub fn check_blob_stored(
         &self,
         path: &RepoPath,
@@ -479,7 +479,7 @@ impl Checks {
 
     /// The size limit of `store` (decided on the size on disk) on the
     /// live backing file, before it is frozen, so a file far over the
-    /// limit is never copied (design §3.2, §7). Advisory: the file can
+    /// limit is never copied. Advisory: the file can
     /// change before the freeze, so [`Checks::check_file_stored`] on the
     /// frozen copy stays the authoritative check. A file that cannot be
     /// stat'ed passes here and fails in the freeze.
@@ -878,8 +878,8 @@ mod tests {
         );
         assert_eq!(refused.fsck_id(), None);
         assert!(refused.to_string().contains("remote b"), "{refused}");
-        // Content stored as LFS is a pointer in history: no blob limit
-        // (design §7). Every other rule still applies.
+        // Content stored as LFS is a pointer in history: no blob limit.
+        // Every other rule still applies.
         for stage in [Record, Commit] {
             assert_eq!(
                 c.check_file_stored(&p("f"), &six, stage, Store::Lfs)

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Timed workloads for the end-to-end benchmark (design §18 test 13).
+"""Timed workloads for the end-to-end benchmark.
 
 Each subcommand runs one workload and prints one JSON object on stdout.
 ci/bench.sh runs them through an agentfs mount and, as the baseline, in a

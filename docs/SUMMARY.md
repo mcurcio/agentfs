@@ -4,12 +4,22 @@
 
 # Using agentfs
 
+- [Guarantees and limits](guarantees.md)
+- [How agentfs records changes](recording.md)
+- [Remotes and pushing](remotes.md)
 - [Operator guide](operator-guide.md)
 - [Patches](patches.md)
 - [Forked volumes](forks.md)
+- [Tree views](trees.md)
 - [Telemetry](telemetry.md)
 - [Configuration reference](configuration.md)
 - [Supported configurations](supported-configurations.md)
+
+# Library
+
+- [The library: agentfs-core](library/core.md)
+- [The filesystem: agentfs-fuse and agentfs](library/filesystem.md)
+- [The Kubernetes adapter: agentfs-csi](library/kubernetes.md)
 
 # Deploying
 
@@ -40,21 +50,16 @@
 
 # How it works
 
-- [Design](design.md)
 - [Architecture](architecture.md)
 - [Performance](performance.md)
 - [Building and testing](development.md)
-- [Adversarial review, 2026-10-12](reviews/2026-10-12-adversarial.md)
+- [agentfs in git terms](target-architecture/git-model.md)
+- [The rules ledger](target-architecture/rules-ledger.md)
+- [The fork and upstream rules in plain git](target-architecture/demo/walkthrough.md)
 
-# Target architecture
+# Future designs
 
 - [Overview](target-architecture/README.md)
-  - [agentfs in git terms](target-architecture/git-model.md)
-  - [The rules ledger](target-architecture/rules-ledger.md)
-  - [The fork and upstream rules in plain git](target-architecture/demo/walkthrough.md)
-  - [Snapshot opens (parked)](target-architecture/snapshot-opens.md)
-  - [Phase 1: implementation and validation](target-architecture/phase-1.md)
-  - [Phase 1 handoff](target-architecture/phase-1-handoff.md)
   - [The system](target-architecture/system.md)
   - [Rules](target-architecture/domains/rules.md)
   - [Clients](target-architecture/domains/clients.md)
@@ -64,4 +69,24 @@
   - [Volume](target-architecture/domains/volume.md)
   - [Health](target-architecture/domains/health.md)
   - [Telemetry](target-architecture/domains/telemetry.md)
-  - [Verifying the design](target-architecture/verifying.md)
+  - [Snapshot opens (parked)](target-architecture/snapshot-opens.md)
+  - [Module cut](target-architecture/future/module-cut.md)
+  - [Transactions](target-architecture/future/transactions.md)
+  - [Nested forks](target-architecture/future/nested-forks.md)
+  - [Beyond flat files](target-architecture/future/tree-views-beyond-flat-files.md)
+  - [Tree-view telemetry](target-architecture/future/tree-view-telemetry.md)
+  - [Landing approvals](target-architecture/future/landing-approvals.md)
+  - [Integrator patches](target-architecture/future/integrator-patches.md)
+  - [Open files and groups](target-architecture/future/files-open-groups.md)
+  - [Large and binary files](target-architecture/future/large-and-binary-files.md)
+  - [Space limits](target-architecture/future/space-limits.md)
+  - [Line map and renames](target-architecture/future/line-map-and-renames.md)
+  - [Shared mappings](target-architecture/future/shared-mappings.md)
+  - [Save and take speed](target-architecture/future/save-and-take-speed.md)
+  - [Live landing](target-architecture/future/live-landing.md)
+  - [Recovery tooling](target-architecture/future/recovery-tooling.md)
+  - [Overlay gaps](target-architecture/future/sandbox-overlay-gaps.md)
+  - [Power-loss coverage](target-architecture/future/power-loss-coverage.md)
+  - [OTLP TLS reload](target-architecture/future/otlp-tls-reload.md)
+  - [Clone in use](target-architecture/future/clone-in-use.md)
+  - [Forge CI on hidden refs](target-architecture/future/forge-ci-on-hidden-refs.md)

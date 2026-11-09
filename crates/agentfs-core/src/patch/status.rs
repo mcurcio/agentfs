@@ -1,4 +1,4 @@
-//! The patch queue's state (design §12): the status ref iac reads, and
+//! The patch queue's state: the status ref iac reads, and
 //! the local cache in `meta/patch.json`.
 //!
 //! `refs/agentfs/<volume>/status` holds a commit without parents whose
@@ -49,7 +49,7 @@ pub struct PatchState {
     pub updated_ms: u64,
     /// The patch being written into the tree: set just before the write,
     /// cleared when the run saves its state. Present at the start of a run
-    /// only after a crash between the write and the record (design §12).
+    /// only after a crash between the write and the record.
     pub in_flight: Option<InFlight>,
     /// Patches set aside at the last run (held, waiting, awaiting or not
     /// judged; bead agentfs-mia.2), counted in `queue_depth` too.
@@ -124,7 +124,7 @@ pub struct QueueEntry {
     pub verdict: Option<Verdict>,
 }
 
-/// A patch consumed as a duplicate in this run (design §12): the same
+/// A patch consumed as a duplicate in this run: the same
 /// patch commit as an earlier inbox number, so not applied again.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DuplicateEntry {

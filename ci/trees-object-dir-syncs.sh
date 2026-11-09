@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # The fan-out directory and `objects/` are fsynced before a step's journal record
-# names the object (phase-1.md M1.16). A prefix replay on ext4 or XFS cannot judge
+# names the object (`docs/trees.md`). A prefix replay on ext4 or XFS cannot judge
 # this ordering: the record's own fsync carries the rename's directory entry too. So
 # this reads the system calls of one save on a real mount, under strace. As root, for
 # strace to follow fusermount3.

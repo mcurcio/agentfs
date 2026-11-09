@@ -1,5 +1,4 @@
-# An NFS server on the runner, and NFS clients of its export (design
-# §14.2). Source after lib.sh; don't run. GitHub ubuntu-24.04 runners only
+# An NFS server on the runner, and NFS clients of its export. Source after lib.sh; don't run. GitHub ubuntu-24.04 runners only
 # (it installs packages and changes the host).
 #
 #   nfs_server DIR             exports DIR (rw, sync, no_root_squash) as

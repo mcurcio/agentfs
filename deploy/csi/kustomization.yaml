@@ -1,4 +1,4 @@
-# The agentfs CSI driver (design §14.2, docs/csi.md).
+# The agentfs CSI driver (docs/csi.md).
 #
 #   kubectl apply -k deploy/csi     # after editing profiles/ and credentials.yaml
 #

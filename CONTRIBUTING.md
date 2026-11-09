@@ -2,8 +2,8 @@
 
 Thanks for helping. agentfs is a FUSE filesystem that records every change
 a workload makes into git history the workload cannot see; start with the
-[README](README.md) for what it does and [docs/design.md](docs/design.md)
-for why.
+[README](README.md) for what it does and [docs/guarantees.md](docs/guarantees.md)
+for what it promises.
 
 By contributing you agree that your work is dual-licensed under the
 [MIT](LICENSE-MIT) and [Apache-2.0](LICENSE-APACHE) licences, as the
@@ -13,13 +13,16 @@ not in an issue.
 
 ## Before you start
 
-- **Read the design.** [docs/design.md](docs/design.md) is authoritative:
-  behaviour and guarantees, decisions (§19.1, dated) and open questions
-  (§19.2). A change that alters behaviour updates it in the same commit.
+- **Read the docs.** [docs/README.md](docs/README.md) indexes them: the
+  guarantees, how recording and pushing work, and the library pages. A change
+  that alters behaviour updates them in the same commit.
+  [OWNER-GUIDANCE.md](OWNER-GUIDANCE.md) holds the owner's standing answers.
+  A design page exists only until its slice is built: the commit that lands
+  the slice deletes it and moves the behaviour into the library or human docs.
 - **Open an issue first** for anything larger than a fix, so the approach
   can be agreed before you build it.
 - **Every fact has one home.** [AGENTS.md](AGENTS.md) lists where each kind
-  of fact lives (README, design, configuration and architecture
+  of fact lives (README, guarantees, configuration and architecture
   references, runbooks); link to it rather than copying it.
 
 ## Building and testing

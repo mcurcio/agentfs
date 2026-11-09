@@ -1,5 +1,4 @@
-//! Acceptance rules: whether a cleanly merged patch may land (design §12,
-//! §19.2 item 11; bead agentfs-mia.2).
+//! Acceptance rules: whether a cleanly merged patch may land (bead agentfs-mia.2).
 //!
 //! The owner, 2026-10-16: "Not A, because that assumes that a clean merge
 //! is an acceptable merge"; 2026-10-29: "Configurable with a sensible

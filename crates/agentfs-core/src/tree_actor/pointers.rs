@@ -1,6 +1,5 @@
 //! The tree actor's pointers: branches, queue entries, collision refs and
-//! object tables, as the journal's records leave them (target git-model §3,
-//! §12). The journal is the commit point; Git's refs are a copy of this map.
+//! object tables, as the journal's records leave them (target git-model §3). The journal is the commit point; Git's refs are a copy of this map.
 //!
 //! Pure: no I/O, so recovery and a running actor share one definition.
 

@@ -1,4 +1,4 @@
-//! The mount operations of the node plugin (design §14.2): what is
+//! The mount operations of the node plugin: what is
 //! mounted at a path, bind mounts of a front's own mount onto the
 //! kubelet's target, and lazy detaches. A trait so tests can keep an
 //! in-memory mount table.

@@ -1,4 +1,4 @@
-//! The crash harnesses' oracle (design §18 test 3): after a kill or an
+//! The crash harnesses' oracle: after a kill or an
 //! injected failure at a failpoint, and the recovery that follows, nothing
 //! promised is lost and nothing is committed twice.
 //!
@@ -140,7 +140,7 @@ pub fn tree_of(repo: &Repository, commit: Oid, lfs_objects: Option<&Path>) -> Tr
         if entry.kind() == Some(ObjectType::Blob) {
             let path = format!("{dir}{}", entry.name().unwrap());
             if path == ".gitattributes" {
-                // The managed LFS block (design §7), not workload content.
+                // The managed LFS block, not workload content.
                 return TreeWalkResult::Ok;
             }
             let blob = repo.find_blob(entry.id()).unwrap();
@@ -219,7 +219,7 @@ fn seq_of(repo: &Repository, commit: Oid) -> Option<u64> {
 ///
 /// One exception: a root commit may hold the empty tree, state 0. With no
 /// branch yet, records that leave the tree empty still commit, so the
-/// head carries their `Agentfs-Seq` (design §3.3): a failed write dropped
+/// head carries their `Agentfs-Seq`: a failed write dropped
 /// because its copy is gone, alone in its commit window, makes one.
 pub fn check_history(
     git_dir: &Path,

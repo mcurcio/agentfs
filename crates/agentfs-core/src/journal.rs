@@ -1,4 +1,4 @@
-//! The durable change log (design §3.2 steps 2–3, §3.3).
+//! The durable change log.
 //!
 //! Each record is framed as `magic | length | crc32 | JSON payload`. A torn or
 //! corrupt frame ends the log: its call never returned, so nothing was
@@ -179,7 +179,7 @@ impl Journal {
     }
 
     /// How many durable records are not yet committed to history, without
-    /// copying them. Cheap enough for a metric callback (design §13); a
+    /// copying them. Cheap enough for a metric callback; a
     /// poisoned lock still reports, since the count is only read.
     pub fn backlog(&self) -> usize {
         self.state
@@ -295,7 +295,7 @@ fn encode(record: &Record, out: &mut Vec<u8>) -> io::Result<()> {
 /// Reads the journal at `path` without changing it: the valid records, and
 /// how many bytes follow the last valid frame. Unlike [`Journal::open`] a
 /// torn tail is left in place, so this is safe while another process is
-/// appending (design §2.3). A missing file reads as empty.
+/// appending. A missing file reads as empty.
 pub fn read_records(path: &Path) -> io::Result<(Vec<Record>, u64)> {
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,

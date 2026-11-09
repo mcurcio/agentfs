@@ -1,4 +1,4 @@
-# The agentfs CSI driver (design §14.2, docs/csi.md, docs/helm.md).
+# The agentfs CSI driver (docs/csi.md, docs/helm.md).
 # Install into a namespace labelled for privileged pods (docs/helm.md).
 
 image:

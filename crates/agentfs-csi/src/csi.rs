@@ -1,5 +1,5 @@
 //! The CSI v1 protocol (spec v1.13.0), generated at build time from
-//! `proto/csi.proto` (design §17.2).
+//! `proto/csi.proto`.
 
 /// `csi.v1`: messages, and the Identity, Controller, Node (and unused
 /// GroupController and SnapshotMetadata) services.

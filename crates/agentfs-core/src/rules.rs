@@ -1,12 +1,12 @@
 //! Path rules: decides whether a change to a path is recorded or skipped,
-//! and why (design §4, §5).
+//! and why.
 //!
 //! Rules follow git's model: ignore rules and nested-repository exclusion
 //! only affect paths that are not tracked. The caller says whether a path is
 //! tracked ([`crate::tracked`]); this module is pure policy over the rule
 //! files and the backing tree.
 //!
-//! Sources (design §4.1):
+//! Sources:
 //!
 //! - **Operator rules**, `$GIT_DIR/info/exclude` and `$GIT_DIR/info/attributes`,
 //!   always apply. They are read once, when the volume is opened; changing
@@ -17,7 +17,7 @@
 //!   ([`crate::probe`]), and can never set `agentfs.*` attributes.
 //! - System and user-global git config, excludes and attributes are never
 //!   read: rule files are parsed from buffers this module reads itself, with
-//!   the pure-Rust `gix-ignore` and `gix-attributes` parsers (design §4.4).
+//!   the pure-Rust `gix-ignore` and `gix-attributes` parsers.
 //!
 //! Operator and tree ignore rules are separate layers and either one
 //! excludes, so a tree `!pattern` cannot re-include an operator exclude.
@@ -50,8 +50,7 @@ pub enum RulesError {
         #[source]
         source: io::Error,
     },
-    /// An `agentfs.*` value in `info/attributes` that is not valid (design
-    /// §4.2): the volume refuses to open rather than guess.
+    /// An `agentfs.*` value in `info/attributes` that is not valid: the volume refuses to open rather than guess.
     #[error("info/attributes line {line}: {name}={value}: {reason}")]
     BadAttribute {
         line: usize,
@@ -66,7 +65,7 @@ fn io_error(path: impl Into<PathBuf>) -> impl FnOnce(io::Error) -> RulesError {
     move |source| RulesError::Io { path, source }
 }
 
-/// The settings that shape rule evaluation (design §4.3).
+/// The settings that shape rule evaluation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RuleOptions {
     pub respect_tree_rules: bool,
@@ -112,35 +111,34 @@ impl fmt::Display for RuleSource {
 /// Why a change is not recorded.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SkipReason {
-    /// The operator marked the path `-agentfs` (design §4.2).
+    /// The operator marked the path `-agentfs`.
     NeverRecord,
     /// An ignore rule matches the untracked path or one of its directories.
     Ignored { source: RuleSource, pattern: String },
-    /// The untracked path is inside a nested repository (design §5).
+    /// The untracked path is inside a nested repository.
     Nested { repo: RepoPath, kind: NestedKind },
     /// A removal of a path with nothing tracked at or below it.
     Untracked,
-    /// git's fsck or a remote's limit would refuse the path (design §3.4,
-    /// [`crate::checks`]).
+    /// git's fsck or a remote's limit would refuse the path ([`crate::checks`]).
     Refused(Refusal),
     /// A SQLite shared-memory file (`<stem>-shm`) of an fsync-class
-    /// database: SQLite rebuilds it, so it is never recorded (design §8).
+    /// database: SQLite rebuilds it, so it is never recorded.
     SharedMemory,
     /// A front's write or symlink whose path left the backing tree before
     /// the history service journaled it: another front removed or renamed
     /// it, or renamed another file over it, and that front's boundary
-    /// records the change (design §14).
+    /// records the change.
     Gone,
     /// A front's write frozen before a newer state of the path that the
-    /// history service has already journaled (design §14.1): the newer
+    /// history service has already journaled: the newer
     /// state is in history, and recording this one would put HEAD back.
     Superseded,
     /// Another member of the path's fsync-class group was refused, and a
-    /// group is recorded whole or not at all (design §8).
+    /// group is recorded whole or not at all.
     GroupRefused { member: RepoPath },
     /// An NFS client's "silly rename" of a file removed while open
     /// (`.nfs` and 24 hex digits): the client's, removed by it at the last
-    /// close, never the workload's (design §4, §14.2).
+    /// close, never the workload's.
     NfsSillyRename,
 }
 
@@ -209,10 +207,10 @@ impl Attributes {
     }
 }
 
-/// `-agentfs`: never record a path's content (design §4.2).
+/// `-agentfs`: never record a path's content.
 pub const RECORD_ATTR: &str = "agentfs";
 
-/// Every operator-only attribute agentfs reads (design §4.2, §7, §8), in
+/// Every operator-only attribute agentfs reads, in
 /// the order docs/configuration.md lists them; `"agentfs"` is the one set
 /// as `-agentfs`. `tests/docs_reference.rs` checks the configuration
 /// reference against this list.
@@ -320,7 +318,7 @@ impl Rules {
         self.fsync_class
     }
 
-    /// The fsync-class settings for `path` (design §8), from operator rules
+    /// The fsync-class settings for `path`, from operator rules
     /// only: tree files can never set `agentfs.*`.
     pub fn fsync_class(&self, path: &RepoPath) -> Option<FsyncClass> {
         if !self.fsync_class {
@@ -329,8 +327,8 @@ impl Rules {
         FsyncClass::from_attributes(&self.operator_attrs_of(path))
     }
 
-    /// `agentfs.maxSize` for `path`: the largest content recorded there
-    /// (design §4.2), from operator rules only.
+    /// `agentfs.maxSize` for `path`: the largest content recorded there,
+    /// from operator rules only.
     pub fn max_size(&self, path: &RepoPath) -> Option<u64> {
         fsync_class::max_size(&self.operator_attrs_of(path))
     }
@@ -407,8 +405,8 @@ impl Rules {
         self.ignored_as(path, false)
     }
 
-    /// Whether nothing untracked beneath directory `dir` could be recorded
-    /// (design §3.1): `dir` or a directory above it is ignored, or lies in a
+    /// Whether nothing untracked beneath directory `dir` could be recorded:
+    /// `dir` or a directory above it is ignored, or lies in a
     /// nested repository. Rules that name files beneath it are not looked
     /// at, so `false` only means something might be recorded.
     pub fn excludes_dir(&self, dir: &RepoPath) -> Result<bool, RulesError> {
@@ -696,7 +694,7 @@ fn collect_attrs(
 /// Whether `name` is an NFS client's silly-rename name: `.nfs` and 24
 /// hex digits (Linux's client; the server never shows it to other
 /// clients as anything but a file). Built in, since every NFS-backed tree
-/// has them and they are never the workload's (design §4).
+/// has them and they are never the workload's.
 pub fn is_nfs_silly_rename(name: &[u8]) -> bool {
     name.len() == 4 + 24 && name.starts_with(b".nfs") && name[4..].iter().all(u8::is_ascii_hexdigit)
 }

@@ -1,4 +1,4 @@
-//! Credential files for pushing (design §11.1).
+//! Credential files for pushing.
 //!
 //! `remote.<name>.agentfsCredentials` names an absolute path holding either
 //!

@@ -1,6 +1,6 @@
 # agentfs-csi
 
-The agentfs CSI driver: volumes whose every change is recorded in git history the workload cannot see (design §14.2).
+The agentfs CSI driver: volumes whose every change is recorded in git history the workload cannot see.
 
 Generated from `values.yaml` by [helm-docs](https://github.com/norwoodj/helm-docs)
 (`helm-docs --chart-search-root charts`); CI fails when it is stale. How to

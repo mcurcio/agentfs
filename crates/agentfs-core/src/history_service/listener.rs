@@ -1,5 +1,4 @@
-//! A front's listening stream: the service calls the front (design §14.1,
-//! §15).
+//! A front's listening stream: the service calls the front.
 //!
 //! A restore or revert served by the history service writes the backing
 //! tree that live fronts serve. Before it plans, the service needs each

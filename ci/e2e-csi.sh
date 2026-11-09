@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# End-to-end test of the CSI driver (design §14.2, docs/csi.md) in a kind
+# End-to-end test of the CSI driver (docs/csi.md) in a kind
 # cluster: deploys ci/k8s-csi/driver (the CI overlay of deploy/csi) and
 # ci/k8s-csi/apps, and checks, from real pods:
 #
@@ -262,7 +262,7 @@ until [ "$(kubectl get node "$NODE_NAME" -o go-template="{{index .metadata.label
 done
 pass "the node is labelled $TOPOLOGY=$NODE_NAME"
 
-step "(c) the RBAC inventory (design §14.2)"
+step "(c) the RBAC inventory"
 for check in "get secrets" "list secrets" "create pods" "get pods" "get volumeattachments.storage.k8s.io" "update leases.coordination.k8s.io"; do
   # shellcheck disable=SC2086
   assert_eq no "$(can_i agentfs-csi-node $check)" "the node plugin's account cannot $check"
@@ -388,7 +388,7 @@ assert_contains "$status" "pod=writer-b" "status lists writer-b's front"
 SLOT_A=$(sed -n 's/^fronts: *slot \([0-9]*\): .*pod=writer-a .*/\1/p' <<<"$status")
 [ -n "$SLOT_A" ] || fail "no slot for writer-a in: $status"
 
-step "(e2) both pods create the same new names at once (design §6)"
+step "(e2) both pods create the same new names at once"
 # runAsGroup is not the fsGroup: each pod may create in the shared
 # directory only through its supplementary fsGroup, which its front sees
 # through the node plugin's hostPID. Each loop opens f$i with O_CREAT and
@@ -436,7 +436,7 @@ assert_contains "$(plugin_log)" "service for $PV exited" "the plugin restarted t
 step "(h) restart the node plugin: reconcile"
 # Bead agentfs-4do: a patch queued while both pods run (plain git, as
 # docs/runbooks/patch-queue.md "With plain git") must not land under them
-# when the plugin restarts (design §12): reconcile starts the service with
+# when the plugin restarts: reconcile starts the service with
 # --workload-attached, the pods being published. Checked after the
 # restart; a landing fails the script at its end, so the rest still runs.
 PATCH_FILE=patched-under-pod.txt
@@ -504,7 +504,7 @@ kubectl delete -k ci/k8s-csi/negative --wait --timeout=120s
 
 step "(j) restore and revert live through the history service"
 # The service settles both fronts, writes the volume and has both drop
-# their kernel caches (design §15): both pods see the restore at once.
+# their kernel caches: both pods see the restore at once.
 lgit() { in_plugin git --git-dir "$STATE/git" "$@"; }
 in_pod writer-a 'umask 002 && printf r1 > /data/restored.txt'
 wait_remote restored.txt r1
@@ -542,7 +542,7 @@ done
 pass "the history service stopped and removed its socket"
 assert_eq final "$(in_plugin git --git-dir "$STATE/git" show "$BRANCH:final.txt")" "the final commit is in the volume's history"
 # The service has exited: the final push at NodeUnstage sent the final
-# commit (design §14.2), or the release scan's push of the unstaged
+# commit, or the release scan's push of the unstaged
 # worktree does at once.
 deadline=$((SECONDS + 60))
 until [ "$(in_plugin git --git-dir "$STATE/git" rev-parse "$BRANCH")" = "$(rgit rev-parse "$BRANCH")" ]; do

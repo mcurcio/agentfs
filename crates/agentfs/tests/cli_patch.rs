@@ -1,5 +1,5 @@
 //! End-to-end tests of `agentfs patch` and the queue lines of `agentfs
-//! status` and `agentfs push` (design §12, §18 test 15), against a
+//! status` and `agentfs push`, against a
 //! `file://` bare remote and the real `git`, which `patch submit` drives.
 //!
 //! Skipped, with a message, when `git` is not installed. The CI `test` job
@@ -379,7 +379,6 @@ fn submit_builds_replaces_skips_and_refuses() {
     assert_eq!(s.remote_ref(&inbox(2)), None);
 }
 
-/// Design §18 test 15 at the CLI.
 /// Acceptance 1 (bead agentfs-mia.2): 2 conflicts and is held whole
 /// while 1 and 3 land; a fetch that brings inbox/2 again does not call it
 /// stale; replaced with a rebased patch, it lands after 3.

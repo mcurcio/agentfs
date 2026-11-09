@@ -1,4 +1,4 @@
-//! The LFS cache lock, `<state>/lfs/lock` (design §2.2, §7): a `flock`
+//! The LFS cache lock, `<state>/lfs/lock`: a `flock`
 //! ([`crate::file_lock`]) that keeps `agentfs lfs prune` from deleting an
 //! object while anything that reads objects for writing them into the
 //! tree holds it.

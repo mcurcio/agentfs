@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# End-to-end tests of Git LFS for SSH remotes (design §7): agentfs runs
+# End-to-end tests of Git LFS for SSH remotes: agentfs runs
 # git-lfs-authenticate over its own SSH transport against a real OpenSSH
 # server, whose git-shell custom command (ci/git-ssh-server.sh with
 # GIT_SSH_LFS_AUTH=1) logs every call and names git-lfs's lfs-test-server

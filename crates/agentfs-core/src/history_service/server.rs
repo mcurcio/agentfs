@@ -1,4 +1,4 @@
-//! The history service's socket (design §14): `agentfs.history.v2.History`
+//! The history service's socket: `agentfs.history.v2.History`
 //! and `grpc.health.v1.Health`, served by tonic on the node-local Unix
 //! socket.
 //!
@@ -11,7 +11,7 @@
 //! - it speaks [`PROTOCOL_VERSION`] and names this volume;
 //! - it holds the lease on the slot it names ([`FrontLease`]), so its
 //!   frozen copies are its own;
-//! - the volume's identity templates render for its pod (design §9), so
+//! - the volume's identity templates render for its pod, so
 //!   its commits can carry its committer;
 //! - fewer than [`MAX_CONNECTIONS`] connections are admitted.
 //!
@@ -355,7 +355,7 @@ fn admit(admission: &Admission, peer: Peer, hello: pb::HelloRequest) -> Result<F
     )
     .map_err(|e| {
         Status::failed_precondition(format!(
-            "the volume's identity templates do not render for pod {:?} (design §9): {e}",
+            "the volume's identity templates do not render for pod {:?}: {e}",
             front.origin.pod
         ))
     })?;
@@ -370,15 +370,14 @@ struct Shared {
     registry: Arc<Registry>,
     /// Front instances whose slot was reclaimed when they first connected.
     reclaimed: Mutex<HashSet<u64>>,
-    /// Fronts listening for the service's calls (design §15).
+    /// Fronts listening for the service's calls.
     fronts: Fronts,
     in_flight: Arc<InFlight>,
 }
 
 impl Shared {
     /// At a front instance's first connection, removes the frozen copies a
-    /// previous holder of its slot left and never got journaled (design
-    /// §14). A failure only leaves them for the slot's next holder.
+    /// previous holder of its slot left and never got journaled. A failure only leaves them for the slot's next holder.
     fn reclaim(&self, front: &FrontInfo) {
         let first = self
             .reclaimed
@@ -395,7 +394,7 @@ impl Shared {
 
     /// The origin a front's record is journaled with: the front's own, or,
     /// for a sweep record that names another (a repair the front inherited
-    /// from a dead predecessor in its slot, design §14.1), that one, if the
+    /// from a dead predecessor in its slot), that one, if the
     /// volume's identity templates render for it. A record of any other
     /// trigger that names another origin is journaled as the front's own.
     fn record_origin(&self, front: &FrontInfo, draft: &Draft) -> Origin {
@@ -474,7 +473,7 @@ impl pb::history_server::History for Svc {
         self.shared.registry.admit(conn.id, front.clone())?;
         let (shared, admitted) = (self.shared.clone(), front.clone());
         blocking(move || shared.reclaim(&admitted)).await?;
-        // Its workloads' views of the tree, for nested repositories (design §5).
+        // Its workloads' views of the tree, for nested repositories.
         crate::nested::add_views(front.views.iter().cloned());
         Ok(Response::new(pb::Welcome {
             protocol_version: PROTOCOL_VERSION,
@@ -567,7 +566,7 @@ impl pb::history_server::History for Svc {
             }
         });
         // The stream is the front's link from now on: the service calls,
-        // the front answers (design §15).
+        // the front answers.
         self.shared.fronts.add(front, Link::new(calls, answered));
         Ok(Response::new(ReceiverStream::new(outbound)))
     }
@@ -746,7 +745,7 @@ impl HistoryServer {
     }
 
     /// The fronts listening for the service's calls, for restores served
-    /// live (design §15).
+    /// live.
     pub fn listening_fronts(&self) -> Fronts {
         self.shared.fronts.clone()
     }

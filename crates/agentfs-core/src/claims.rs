@@ -1,4 +1,4 @@
-//! Per-path ordering for the recorder (design §3.2, §4).
+//! Per-path ordering for the recorder.
 //!
 //! Whether a change is recorded depends on the tracked set, and the tracked
 //! set changes only once a record is durable. A record therefore claims its

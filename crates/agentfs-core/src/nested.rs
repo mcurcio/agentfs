@@ -1,4 +1,4 @@
-//! Detects nested git repositories in the backing tree (design §5).
+//! Detects nested git repositories in the backing tree.
 //!
 //! A directory is a nested repository if it contains a `.git` directory, a
 //! `.git` file or symlink pointing at a git directory inside the tree, or is
@@ -20,7 +20,7 @@
 //! differs between filesystems, so any of them can come first. Only a
 //! custom template's files written before `HEAD` can still be recorded; the
 //! committer drops them at commit time once `HEAD` exists
-//! ([`crate::volume::Committer`], design §5).
+//! ([`crate::volume::Committer`]).
 //!
 //! **Where `gitdir:` and `.git` symlinks point.** Their targets are paths in
 //! the workload's view of the mount, never followed on the host. A relative

@@ -10,7 +10,7 @@ description = "Recording, journal and history engine for agentfs"
 [dependencies]
 agentfs-align = { version = "0.1.0", path = "../agentfs-align" }
 # known_hosts key blobs and hashed host names, and OpenSSH private key
-# headers (design §11.1).
+# headers.
 base64 = "0.23.1"
 bstr = "1.13.1"
 crc32fast = "1.5.2"
@@ -21,9 +21,9 @@ gix-ignore = "0.24.0"
 # `Arc` instead of `Rc`, so the rules engine is `Send + Sync`.
 gix-parallel = { version = "0.50.0", features = ["parallel"] }
 libgit2-sys = { version = "0.18.8", default-features = false }
-# The API only: the binary picks the SDK and exporters (design §13).
+# The API only: the binary picks the SDK and exporters.
 opentelemetry = { version = "0.33.1", default-features = false, features = ["trace", "metrics", "logs"] }
-# SO_PEERCRED on local sockets (design §14, §15):
+# SO_PEERCRED on local sockets:
 # bindings only, no C build.
 libc = "0.2.190"
 rustix = { version = "1.1.5", features = ["fs", "process"] }
@@ -32,16 +32,16 @@ serde_json = "1.0.154"
 # SHA-1 for the HMAC-SHA1 of hashed known_hosts entries; pure Rust, no
 # dependencies.
 sha1_smol = "1"
-# SHA-256 object ids of Git LFS content (design §7); pure Rust.
+# SHA-256 object ids of Git LFS content; pure Rust.
 sha2 = "0.11"
-# The Git LFS batch API client (design §7): synchronous and pure Rust, with no
+# The Git LFS batch API client: synchronous and pure Rust, with no
 # TLS unless the `https` feature adds native-tls (OpenSSL, as libgit2 uses).
 ureq = { version = "3.4", default-features = false }
 thiserror = "2.0.21"
-# The SSH transport (`ssh` feature, design §11.1): russh with ring, the
+# The SSH transport (`ssh` feature): russh with ring, the
 # runtime that drives one connection.
 russh = { version = "0.64", default-features = false, features = ["ring", "rsa"], optional = true }
-# The history service's gRPC (design §14): tonic over the node-local Unix
+# The history service's gRPC: tonic over the node-local Unix
 # socket, with its own hyper HTTP/2 client connection. No channel and no
 # TLS: pure Rust, no ring or rustls.
 tonic = { version = "0.14.6", default-features = false, features = ["codegen", "router", "server"] }
@@ -51,11 +51,11 @@ prost = "0.14"
 hyper = { version = "1", features = ["client", "http2"] }
 hyper-util = { version = "0.1.21", features = ["tokio"] }
 tokio-stream = { version = "0.1.19", features = ["net"] }
-# The history service's runtimes (design §14), and the SSH transport's.
+# The history service's runtimes, and the SSH transport's.
 tokio = { version = "1.53", default-features = false, features = ["rt-multi-thread", "net", "time", "sync", "io-util", "macros"] }
 
 [build-dependencies]
-# Compiles the history service's .proto without protoc (design §17.3).
+# Compiles the history service's .proto without protoc.
 protox = "0.10.0"
 tonic-prost-build = { version = "0.14.6", default-features = false }
 
@@ -83,13 +83,12 @@ tokio = { version = "1.53", default-features = false, features = ["rt-multi-thre
 https = ["git2/https", "ureq/native-tls"]
 # Push to ssh:// and scp-like remotes through agentfs's own libgit2
 # subtransport on russh (ring for crypto; no OpenSSL or libssh2). Without
-# it an ssh remote is reported as misconfigured (design §11.1).
+# it an ssh remote is reported as misconfigured.
 ssh = ["dep:russh"]
-# Test builds only: failpoints on the durable path (design §18 test 3,
-# `failpoints`). Never in a release or image.
+# Test builds only: failpoints on the durable path (`failpoints`). Never in a release or image.
 failpoints = []
 
-# The synchronous step's cost (design §3.2, §18 test 13): a plain binary,
+# The synchronous step's cost: a plain binary,
 # no harness or new dependencies; docs/performance.md describes it.
 [[bench]]
 name = "record_step"

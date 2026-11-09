@@ -1,4 +1,4 @@
-//! Where workloads see the mount (design §5).
+//! Where workloads see the mount.
 //!
 //! `git worktree add` writes an absolute `gitdir:` into the new worktree's
 //! `.git` file: a path in the workload's view of the mount. The engine maps

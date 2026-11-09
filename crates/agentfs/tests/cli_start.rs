@@ -1,5 +1,5 @@
 //! End-to-end tests of a started volume through the `agentfs` binary
-//! (F8 S1, design §11.3): `status` names its start point and, while it is
+//! (F8 S1): `status` names its start point and, while it is
 //! raised, the start-branch alarm; `push` raises the alarm and still
 //! succeeds; `start accept --tip` clears it, and the accepted tip reaches
 //! the remote under the volume's own name.

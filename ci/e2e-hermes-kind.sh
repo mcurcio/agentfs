@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# End-to-end tests of upstream Hermes (NousResearch/hermes-agent, design
-# §16) on agentfs in a kind cluster, one configuration per run, with the
+# End-to-end tests of upstream Hermes (NousResearch/hermes-agent, design) on agentfs in a kind cluster, one configuration per run, with the
 # checks of the Compose suite (ci/hermes/lib.sh): Hermes' root start-up
 # on the mount (1), a skill Hermes writes with its own tool recorded and
 # pushed (2), secrets, sessions, logs and databases never recorded (3), a
@@ -21,7 +20,7 @@
 #             and a queued patch is not applied (PatchQueueDeferred); it
 #             lands at the next pod restart (4), over the mark the old
 #             pod's stop left while the kubelet's subPath binds held the
-#             mount (design §12 "Only with nothing attached").
+#             mount.
 #   fence     the read-only fence alternative of §10 (ci/hermes/k8s/fence):
 #             the emptyDir read-only at /agentfs and
 #             HERMES_HOME=/agentfs/workspace, on a fresh volume; 1-5.

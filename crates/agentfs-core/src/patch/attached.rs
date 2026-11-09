@@ -1,6 +1,5 @@
 //! Whether a workload may be attached when a daemon starts, so the patch
-//! queue waits (design §12 "When it runs", §19.1 "No live landing yet"
-//! and "Patches land after a clean stop").
+//! queue waits (and "Patches land after a clean stop").
 //!
 //! Patches land only at a start with nothing attached. A start lands them
 //! only on evidence that nothing is: anything else defers the queue with
@@ -20,8 +19,8 @@
 //!   launcher says a workload is attached (the CSI node plugin, while a
 //!   pod of the volume is published on its node).
 //!
-//! **Another pod's mark** (design §19.1 "Patches land after a clean
-//! stop", 2026-10-30). A mount whose mount point lies in its own pod's
+//! **Another pod's mark** (patches land after a clean
+//! stop). A mount whose mount point lies in its own pod's
 //! volume ([`PodScope`]) records that pod's uid in the mark. A start in a
 //! different pod, whose mount point lies in that pod's own volume too,
 //! lands the queue over such a mark: nothing attached to the old pod's
@@ -178,8 +177,8 @@ impl Judgement {
     }
 }
 
-/// Judges a single-process mount's start from the attached mark
-/// (design §12 "Only with nothing attached"): no mark lands; a mark from
+/// Judges a single-process mount's start from the attached mark:
+/// no mark lands; a mark from
 /// another pod lands when `scope` is this start's pod scope; anything
 /// else, including a mark that cannot be read, defers
 /// ([`Deferred::UncleanStop`]).

@@ -22,7 +22,7 @@
 <p align="center">
   <a href="#quick-start">Quick start</a> ·
   <a href="https://mcurcio.github.io/agentfs/">Documentation</a> ·
-  <a href="docs/design.md">Design</a> ·
+  <a href="docs/guarantees.md">Guarantees</a> ·
   <a href="#status-and-roadmap">Status</a>
 </p>
 
@@ -63,19 +63,19 @@ audit trail can use it.
 - **Recorded before return.** Each change boundary (a close after a
   change, a rename, delete, link or `chmod +x`) is journaled durably
   before the call returns; commits follow within `agentfs.commitWindow`.
-  A recording failure fails the call loudly ([design §3](docs/design.md#3-recording)).
+  A recording failure fails the call loudly ([guarantees](docs/guarantees.md#recording-comes-first)).
 - **Invisible and untouchable.** History, journal, state and credentials
-  live in a state area outside the mount ([design §1.1](docs/design.md#11-threat-model)).
+  live in a state area outside the mount ([guarantees](docs/guarantees.md#threat-model)).
 - **Any user.** Root and non-root processes share one volume with normal
   permissions; with the daemon running as root, new files belong to the
   user who created them ([operator guide](docs/operator-guide.md#1-requirements)).
 - **Git idioms for rules.** `.gitignore`, `.gitattributes`, `.lfsconfig`,
   `$GIT_DIR/info/*` and git-config syntax; nested repositories are
-  excluded by default ([design §4](docs/design.md#4-path-rules)).
+  excluded by default ([recording](docs/recording.md#which-paths-are-recorded)).
 - **Any remote, several, or none.** Local paths, `file://`, `http(s)://` with a
   token file, and SSH with verified host keys. Pushes are fast-forward
   only and never forced; a divergence is saved and raises an alarm
-  ([design §11](docs/design.md#11-remotes-and-pushing)). Remotes can come
+  ([remotes](docs/remotes.md)). Remotes can come
   and go: a volume with none is local-only, not an error, and a remote
   added later gets all its history.
 - **Git LFS** for large files, uploaded before the commits that use them
@@ -93,7 +93,7 @@ audit trail can use it.
   one reviewable change ([forks](docs/forks.md)).
 - **The sandbox overlay.** A second mount point that shows sandboxes
   only the recordable files; their edits reach the main mount at once
-  ([design §2.4](docs/design.md#24-the-sandbox-overlay)).
+  ([guarantees](docs/guarantees.md#the-sandbox-overlay)).
 - **Several pods, one volume.** A history service with one front per pod
   on one node, each pod committing as itself
   ([operator guide](docs/operator-guide.md#16-several-mounts-of-one-volume-history-service)).
@@ -230,8 +230,8 @@ flowchart LR
 
 The workload never sees the state area. Under the CSI driver, a history
 service owns each volume's state area and every pod's mount is a front
-that hands it the changes. The full model: [docs/architecture.md](docs/architecture.md)
-and [docs/design.md](docs/design.md).
+that hands it the changes. The full model: [docs/architecture.md](docs/architecture.md),
+[docs/recording.md](docs/recording.md) and [docs/guarantees.md](docs/guarantees.md).
 
 ## Documentation
 
@@ -244,7 +244,8 @@ The documentation is published at <https://mcurcio.github.io/agentfs/>;
 | [Docker](docs/docker.md), [Kubernetes sidecar](docs/deployment.md), [CSI driver](docs/csi.md), [Helm](docs/helm.md) | Deploying it |
 | [Configuration](docs/configuration.md) | Every setting, attribute, flag and environment variable |
 | [Runbooks](docs/README.md#runbooks) | One procedure per failure mode |
-| [Design](docs/design.md) | The specification: guarantees, decisions and open questions |
+| [Guarantees](docs/guarantees.md), [Recording](docs/recording.md), [Remotes](docs/remotes.md) | What agentfs promises, what it records and when, and how it pushes |
+| [Library](docs/library/core.md) | Building on `agentfs-core`, `agentfs-fuse` and `agentfs-csi` |
 | [Architecture](docs/architecture.md) | The crates and modules, and how a change flows through them |
 
 ## Status and roadmap
@@ -263,16 +264,14 @@ passes its tests, and the Helm charts as `<version>-main.<run>`.
 | Docker examples, Helm charts, example alert rules | Built and tested in CI |
 | Node-local worktrees, one branch each, with any remote as the backend | Built (CSI driver) |
 | Local-only volumes (no remote section), whose forks publish into their own history | Built ([configuration](docs/configuration.md#remotes-modes)) |
-| Several nodes writing one volume | Not supported, by decision ([design §19.1](docs/design.md#191-decisions-2026-10-12)) |
+| Several nodes writing one volume | Not supported: a volume has one node ([CSI driver](docs/csi.md)) |
 
-Each phase's scope is in [design §1.3](docs/design.md#13-baseline-extras-phases),
-open questions in [§19.2](docs/design.md#192-open-questions), and the
-measured costs and performance budget in [docs/performance.md](docs/performance.md).
+The measured costs and performance budget are in [docs/performance.md](docs/performance.md).
+Designs for work that is not built are in
+[docs/target-architecture](docs/target-architecture/README.md).
 Known limits: LFS over SSH needs a server with `git-lfs-authenticate`;
 proxies are plain `http://` proxies without authentication; restoring a
-database needs its workload stopped. The design was reviewed
-adversarially before any code was written
-([review record](docs/reviews/2026-10-12-adversarial.md)).
+database needs its workload stopped.
 
 ## Contributing
 
@@ -293,5 +292,3 @@ Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or
 otherwise, any contribution intentionally submitted for inclusion in
 agentfs by you, as defined in the Apache-2.0 license, shall be dual
 licensed as above, without any additional terms or conditions.
-
-[Phase 1 of the proposed design](docs/target-architecture/phase-1.md) builds Git-backed main/sandbox trees and real end-to-end tests to validate the model. Phase 1 is built and validated against its exit rows on CI, with named limits.

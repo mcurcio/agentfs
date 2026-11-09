@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# End-to-end multi-pod at single-node level (design §14, §18 test 16): two
+# End-to-end multi-pod at single-node level: two
 # real FUSE front mounts of one backing tree, as pods pod-a and pod-b,
 # feeding one `agentfs serve-history`. Checks that every commit carries the
 # committer and pod trailers of the mount that made the change, that a
@@ -251,8 +251,7 @@ wait_history dir2/sub/f x
 wait_history dir2/g y
 wait_history dir/sub/f -
 wait_history dir/g -
-# One move, journaled by pod-b's front, reconciled by the service (design
-# §3.1).
+# One move, journaled by pod-b's front, reconciled by the service.
 assert_eq "rename: dir -> dir2" "$(sgit log -1 --format=%s refs/heads/agentfs/demo -- dir2/g)" \
   "the directory rename is one move"
 assert_eq pod-b "$(committer_of dir2/g)" "the move is pod-b's"
@@ -272,7 +271,7 @@ wait_history held2/f 12
 wait_history held/f -
 
 step "absolute gitdir targets map exactly through the fronts' views"
-# Fronts run with AGENTFS_WORKLOAD_MOUNTS=/workspace (design §5).
+# Fronts run with AGENTFS_WORKLOAD_MOUNTS=/workspace.
 as_agent "$MNT_A" 'set -e
   git init -q wsmain
   cd wsmain
@@ -299,7 +298,7 @@ done
 assert_eq 4 "$(sudo cat "$BACKING/shared.txt")" "last writer wins in the tree"
 # Each version, with the pod that committed it. A front's late record
 # (RELEASE) can catch the other front's O_TRUNC before its write and
-# commit that empty state as its own (design §14.1): skipped here.
+# commit that empty state as its own: skipped here.
 VERSIONS=$(for c in $(sgit log --format=%H refs/heads/agentfs/demo -- shared.txt); do
   content=$(sgit show "$c:shared.txt" 2>/dev/null) || continue
   if [ -n "$content" ]; then printf '%s:%s ' "$(sgit log -1 --format=%cn "$c")" "$content"; fi
@@ -307,7 +306,7 @@ done)
 assert_eq "pod-b:4 pod-a:3 pod-b:2 pod-a:1 " "$VERSIONS" "every boundary of shared.txt is in history"
 
 step "a shared file, written by both at once"
-# Every write must succeed: each front creates as the caller (design §6),
+# Every write must succeed: each front creates as the caller,
 # so a create racing the other front's create of the same name never finds
 # a file that is root's for an instant (EACCES).
 burst() { # mountpoint pod
@@ -324,7 +323,7 @@ TREE=$(sudo cat "$BACKING/burst.txt")
 # the service is committed, then check once.
 wait_for 30 sh -c "sudo '$AGENTFS_BIN' --state '$STATE' status | grep -Eq '^backlog: +0 record'" ||
   fail "the backlog never drained: $(sudo "$AGENTFS_BIN" --state "$STATE" status 2>&1)"
-# Freeze stamps order the racing records (design §14.1): HEAD ends on the
+# Freeze stamps order the racing records: HEAD ends on the
 # tree's last state, with no later boundary to fix it.
 assert_eq "$TREE" "$(sgit show refs/heads/agentfs/demo:burst.txt)" \
   "after the burst, HEAD has the tree's burst.txt"
@@ -395,7 +394,7 @@ pass "front a saw the service back"
 step "a repair inherited from a dead front commits as its pod"
 # Front a fails a close while the service is down, then dies (kill -9)
 # before it can retry; a front of another pod takes its slot and repairs
-# the path, under pod a's committer (design §14.1).
+# the path, under pod a's committer.
 A_SLOT=$(sed -n 's/^mounted .* slot \([0-9]*\),.*/\1/p' "$A_LOG" | tail -n 1)
 [ -n "$A_SLOT" ] || fail "no slot in front a's startup line"
 kill_service
@@ -435,8 +434,8 @@ assert_eq pod-c "$(committer_of from-c.txt)" "pod-c's own writes are its own"
 
 step "restore and revert while the service serves both fronts"
 # The service settles both fronts, refuses a path one holds open for
-# writing, writes the backing tree and has both drop their kernel caches
-# (design §15): each mount shows the restored content at once.
+# writing, writes the backing tree and has both drop their kernel caches:
+# each mount shows the restored content at once.
 as_agent "$MNT_A" 'printf r1 > restored.txt'
 wait_history restored.txt r1
 R1=$(sgit log -1 --format=%H refs/heads/agentfs/demo -- restored.txt)

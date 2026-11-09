@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# mergiraf as a merge driver in the built image (design §12, §17.3; bead
+# mergiraf as a merge driver in the built image (bead
 # agentfs-mia.3, acceptance 5). Two volumes, each with two patches that
 # change different functions on adjacent lines of one .rs file, which a
 # line merge calls a conflict:

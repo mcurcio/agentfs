@@ -1,6 +1,6 @@
-//! Every advisory file lock agentfs takes (design §2.2): the state-area
-//! lock (§2.3), the push locks (§11.2), the LFS cache lock and each partial
-//! download's lock (§7), and the fronts' slot leases (§14). They are all
+//! Every advisory file lock agentfs takes: the state-area
+//! lock, the push locks, the LFS cache lock and each partial
+//! download's lock, and the fronts' slot leases. They are all
 //! `flock`s, through std's [`File::lock`] family, and all go through
 //! [`FileLock`].
 //!

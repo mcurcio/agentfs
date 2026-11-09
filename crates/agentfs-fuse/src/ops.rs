@@ -1,4 +1,4 @@
-//! Every filesystem operation, without the kernel (design §2.1, §3.1, §6).
+//! Every filesystem operation, without the kernel.
 //!
 //! [`Ops`] works on the backing tree ([`crate::backing`]) and keeps the
 //! inode table ([`crate::inodes`]). Each operation returns `Result<T,
@@ -6,7 +6,7 @@
 //! so all behaviour here is unit-tested against a real directory and a real
 //! state area, without `/dev/fuse`.
 //!
-//! **Change boundaries** (design §3.1) record synchronously, before the
+//! **Change boundaries** record synchronously, before the
 //! operation returns:
 //!
 //! | Operation | Recorded |
@@ -24,7 +24,7 @@
 //! empty; an `open` with `O_TRUNC` likewise. `mkdir`, `chown`, `utimens`,
 //! `chmod` of other bits and extended attributes pass through unrecorded.
 //!
-//! **fsync-class files** (design §8, [`crate::groups`]) are the exception:
+//! **fsync-class files** ([`crate::groups`]) are the exception:
 //! no boundary records one alone. Each change to a member of a group (a
 //! database and its `-wal` and `-journal`) is held against captures and
 //! marks the group changed; the whole group is then captured as one record
@@ -35,7 +35,7 @@
 //! group, only the operation records it, whole, at its end
 //! ([`Ops::capture_operation`]).
 //!
-//! **Permissions** (design §6) are checked by the kernel
+//! **Permissions** are checked by the kernel
 //! (`default_permissions`) before a request arrives; the daemon then acts
 //! with its own privileges. When it also has `CAP_SETUID` and `CAP_SETGID`
 //! (root) it creates each new object as the caller ([`crate::creds`]), so
@@ -46,8 +46,8 @@
 //! group the backing filesystem chose under a setgid directory, then sets
 //! the exact mode the caller asked for. Both are done on a descriptor of
 //! the new object, opened without following and checked to be the object
-//! just made, never by name: the backing tree may change under the daemon
-//! (design §6 "Confinement"). `create` never takes over an existing file.
+//! just made, never by name: the backing tree may change under the daemon.
+//! `create` never takes over an existing file.
 //!
 //! **Locking.** The inode table and the handle map are each behind a mutex
 //! that is never held across a system call on the tree or a record.
@@ -123,7 +123,7 @@ pub struct Handle {
     pub node: u64,
     pub fd: OwnedFd,
     pub write: bool,
-    /// The fsync-class group of the file (design §8): its writes are held
+    /// The fsync-class group of the file: its writes are held
     /// during captures. Found when the file is opened at a path in the
     /// class, and again after any rename on the mount ([`Ops::rename`]), so
     /// a database whose directory moved is captured at its new path.
@@ -265,7 +265,7 @@ pub struct Ops {
     /// Renames made so far: a handle finds its group again after one.
     renames: AtomicU64,
     boundary: Boundary,
-    /// fsync-class groups (design §8).
+    /// fsync-class groups.
     groups: Groups,
     config: OpsConfig,
     /// The daemon may give new objects to their caller
@@ -452,7 +452,7 @@ impl Ops {
 
     /// [`creds::create_as`] with this mount's setting; an object made as
     /// the daemon when it was to be made as the caller is counted
-    /// (`agentfs.fuse.create_as_caller_fallbacks`, design §6).
+    /// (`agentfs.fuse.create_as_caller_fallbacks`).
     fn create_as<T>(
         &self,
         actor: Actor<'_>,
@@ -497,7 +497,7 @@ impl Ops {
 
     /// The group of handle `h` now. A handle opened in the class finds its
     /// group again after any rename on the mount, from its node's current
-    /// paths (design §8): a database whose directory was renamed is
+    /// paths: a database whose directory was renamed is
     /// captured at its new path from its next change on. A file with no
     /// name left keeps the group it had.
     fn handle_group(&self, h: &Handle) -> Option<Arc<Group>> {
@@ -535,8 +535,8 @@ impl Ops {
         now
     }
 
-    /// Records `changes` as one record, except changes at fsync-class paths
-    /// (design §8): those mark their group changed instead, to be captured
+    /// Records `changes` as one record, except changes at fsync-class paths:
+    /// those mark their group changed instead, to be captured
     /// whole later (by an operator operation's actor, at the operation's
     /// end: [`Ops::capture_operation`]). The caller holds `names` for
     /// reading and no group hold.
@@ -549,8 +549,7 @@ impl Ops {
         self.record_as(trigger, caller, changes, None)
     }
 
-    /// [`Ops::record`] as the pod `origin`, when given: an inherited repair
-    /// (design §14.1).
+    /// [`Ops::record`] as the pod `origin`, when given: an inherited repair.
     fn record_as(
         &self,
         trigger: Trigger,
@@ -577,7 +576,7 @@ impl Ops {
         self.boundary.record_as(trigger, caller, changes, origin)
     }
 
-    /// Captures `group` (design §8) if `when` says it is due: freezes its
+    /// Captures `group` if `when` says it is due: freezes its
     /// gate, so no member changes meanwhile, and records every member's
     /// current state (content, or removal) as one all-or-nothing record.
     /// `caller` defaults to whoever changed the group last. Returns whether
@@ -680,7 +679,7 @@ impl Ops {
     }
 
     /// A capture of `group` could not read `member`: raises
-    /// `RecordFailed` (design §13) and returns the error.
+    /// `RecordFailed` and returns the error.
     fn capture_failed(
         &self,
         trigger: Trigger,
@@ -715,8 +714,7 @@ impl Ops {
         VolumeError::Io(error)
     }
 
-    /// Captures every group the trailing timer has due at `now` (design
-    /// §8), then forgets groups nothing uses. Returns how many captures
+    /// Captures every group the trailing timer has due at `now`, then forgets groups nothing uses. Returns how many captures
     /// were journaled.
     pub fn capture_due(&self, now: Instant) -> usize {
         let mut n = 0;
@@ -731,7 +729,7 @@ impl Ops {
     }
 
     /// Captures every group the running operator operation changed, each
-    /// whole as one record of the operation (design §8, §15): called by
+    /// whole as one record of the operation: called by
     /// the operation before it ends. Returns how many captures were
     /// journaled, or the first failure (the others are still tried).
     pub fn capture_operation(&self) -> Result<usize, VolumeError> {
@@ -879,8 +877,7 @@ impl Ops {
 
     /// Drops the names of node `id`, other than `parent/name`, that no
     /// longer lead to its backing inode. Another process changed the
-    /// backing tree under them: a second front of the same tree (design
-    /// §14) renamed or removed the file, and the filesystem may since have
+    /// backing tree under them: a second front of the same tree renamed or removed the file, and the filesystem may since have
     /// reused its inode number for the file just looked up. Left alone, a
     /// stale first name would be the node's path: opens would fail and
     /// records would name the wrong path. Only nodes with several names
@@ -895,8 +892,8 @@ impl Ops {
         }
     }
 
-    /// The paths of node `id` that still lead to its backing inode `inode`
-    /// (design §14). Names another front renamed or removed under this
+    /// The paths of node `id` that still lead to its backing inode `inode`.
+    /// Names another front renamed or removed under this
     /// mount, or whose inode number the filesystem has reused, are dropped
     /// from the node and left out. A name that cannot be checked (any
     /// failure but a missing path) is kept. `known`, a name just looked
@@ -952,8 +949,8 @@ impl Ops {
         }
     }
 
-    /// The paths to record an open file `fd` (node `id`, now `st`) under
-    /// (design §14): its names that still lead to it. A file with none
+    /// The paths to record an open file `fd` (node `id`, now `st`) under:
+    /// its names that still lead to it. A file with none
     /// left that is still in the tree was moved by another front, or its
     /// directory was: it is recorded at the path the kernel knows for the
     /// descriptor, if that leads to it. A file removed from the tree is
@@ -974,7 +971,7 @@ impl Ops {
     /// write unseen ([`Ops::mapping_may_write`]) with no handle open is
     /// recorded first if it changed: the kernel forgets a node only once
     /// its inode is evicted, which a live mapping prevents (it pins the
-    /// dentry), so every write through it has landed (design §3.1).
+    /// dentry), so every write through it has landed.
     pub fn forget(&self, id: u64, n: u64) {
         let watched = self
             .table()
@@ -996,7 +993,7 @@ impl Ops {
 
     /// A handle that can write on node `id` was given a passthrough
     /// backing id another handle had open (the kernel allows no other
-    /// handle there, design §17.1). A shared mapping it makes holds the
+    /// handle there). A shared mapping it makes holds the
     /// backing file, not the FUSE file, so RELEASE can come while the
     /// mapping still writes: the node stays armed and swept until the
     /// kernel forgets it ([`Ops::forget`]).
@@ -1156,8 +1153,8 @@ impl Ops {
 
     // ---- creating ----
 
-    /// Gives a new object to its caller and sets the mode it asked for
-    /// (design §6); an object made `as_caller` ([`crate::creds`]) is
+    /// Gives a new object to its caller and sets the mode it asked for;
+    /// an object made `as_caller` ([`crate::creds`]) is
     /// already the caller's. `fd` is the object itself when it is open; otherwise
     /// `name` in `dir` is opened first ([`Ops::open_new`]), so neither the
     /// owner nor the mode is ever changed by name: a name swapped for a
@@ -1557,11 +1554,11 @@ impl Ops {
         }
         self.table()
             .rename(parent, name, newparent, newname, exchange);
-        // Open fsync-class handles find their group again (design §8).
+        // Open fsync-class handles find their group again.
         self.renames.fetch_add(1, Ordering::AcqRel);
         let is_dir = Kind::from_mode(mode_of(&src)) == Kind::Dir;
         if is_dir && !exchange {
-            // One move, O(1) in the paths beneath (design §3.1), journaled
+            // One move, O(1) in the paths beneath, journaled
             // before any other boundary can name a path beneath either
             // directory: the names stay locked until it is durable.
             match self
@@ -1937,14 +1934,14 @@ impl Ops {
     }
 
     /// `close` of a descriptor: records the inode if it changed since its
-    /// last record (design §3.1). `EIO` if recording fails; the inode stays
+    /// last record. `EIO` if recording fails; the inode stays
     /// dirty, so the next boundary records it.
     pub fn flush(&self, fh: u64, actor: Actor<'_>) -> OpResult<()> {
         let caller = actor.caller;
         let h = self.handle(fh)?;
         let _names = self.read_names();
         if let Some(group) = self.handle_group(&h) {
-            // An fsync-class file (design §8): its whole group, if it
+            // An fsync-class file: its whole group, if it
             // changed and this is the group's last open handle. Closing one
             // member while another stays open (SQLite's `-journal` in
             // DELETE mode, every transaction) leaves the change to the
@@ -1958,7 +1955,7 @@ impl Ops {
                 .map_err(|_| Errno::EIO);
         }
         self.record_node(h.node, &h.fd, Trigger::Close, caller)?;
-        // Recorded, not yet answered (design §18 test 3).
+        // Recorded, not yet answered.
         agentfs_core::failpoints::hit("fuse.after_record").map_err(|_| Errno::EIO)
     }
 
@@ -1993,13 +1990,12 @@ impl Ops {
                 .racy_only(&current)
                 .then(|| node.dirty.frozen.clone())
         };
-        // Never a cached name another front has since moved or removed
-        // (design §14).
+        // Never a cached name another front has since moved or removed.
         let paths = self.record_paths(id, fd, &st);
         if let Some(pinned) = pinned {
             // Recording again only because the last record was racy: not
             // if the bytes are the copy that record froze, and that copy
-            // is still the last state journaled at the path (design §3.1).
+            // is still the last state journaled at the path.
             // The bytes compared were read after `before`, so the proof
             // stands for the stamp as of then, as a record would.
             let before = now_ns();
@@ -2066,8 +2062,7 @@ impl Ops {
 
     /// Whether node's content, open as `fd` with stat `st` and named
     /// `paths` now, is exactly the copy `pin` a racy record froze, and
-    /// that copy is still the last state journaled at its path (design
-    /// §3.1). Any doubt is a no: the boundary records.
+    /// that copy is still the last state journaled at its path. Any doubt is a no: the boundary records.
     fn still_recorded(
         &self,
         pin: &FrozenRef,
@@ -2093,7 +2088,7 @@ impl Ops {
     /// The last reference to an open file is gone. If it was the last
     /// handle that could write and the inode changed since its last record
     /// (a write through a mapping, or after the last close), it is recorded
-    /// now, late (design §3.1).
+    /// now, late.
     pub fn release(&self, fh: u64) -> OpResult<()> {
         let Some(h) = self.handles().remove(&fh) else {
             return Err(Errno::EBADF);
@@ -2164,7 +2159,7 @@ impl Ops {
             rustix::fs::fsync(&h.fd).eno()?;
         }
         if let Some(group) = self.handle_group(&h) {
-            // At most once per `agentfs.coalesce` (design §8). A failed
+            // At most once per `agentfs.coalesce`. A failed
             // capture does not fail the fsync, which did reach the disk:
             // the group stays changed and the timer retries it.
             let _names = self.read_names();
@@ -2380,7 +2375,7 @@ impl Ops {
 
     // ---- backstops ----
 
-    /// One sweep (design §3.1, §3.5): retries the repair queue, then
+    /// One sweep: retries the repair queue, then
     /// records every inode open for writing that changed since its last
     /// record. With `all`, every armed inode with any open handle is
     /// checked: the final sweep at unmount.
@@ -2455,7 +2450,7 @@ impl Ops {
 
     /// What the kernel may have cached of the path `rel` (relative to the
     /// root), for a change made to the backing tree by someone else (the
-    /// history service's restore, design §15): the entry of each component
+    /// history service's restore): the entry of each component
     /// in its parent, up to the first the table does not know (the kernel
     /// may hold it as a negative entry), and the node at the path, if known
     /// (its attributes and pages).
@@ -2478,7 +2473,7 @@ impl Ops {
 
     /// Whether the file at `rel` (a path from the mount root) has a handle
     /// open for writing through the mount. A path the mount has never
-    /// looked up has no open handle (design §15: a restore through the
+    /// looked up has no open handle (: a restore through the
     /// mount refuses such files without `--force`).
     pub fn open_for_writing(&self, rel: &[u8]) -> bool {
         let table = self.table();

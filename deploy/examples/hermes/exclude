@@ -1,4 +1,4 @@
-# Hermes (design §16): record only what the agent authors. An allowlist:
+# Hermes: record only what the agent authors. An allowlist:
 # everything at the top of HERMES_HOME is excluded when new, then the
 # definitions are re-included. Tracked paths stay recorded whatever these
 # rules say; attributes (-agentfs) are the hard stop for secrets.

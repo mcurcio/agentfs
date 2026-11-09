@@ -1,4 +1,4 @@
-//! The driver's persisted records (design §14.2): `csi.json` per worktree
+//! The driver's persisted records: `csi.json` per worktree
 //! on its node's disk, and the node's staged and published records, from
 //! which a restarted node plugin reconciles. Written atomically (mode
 //! 0600) with [`agentfs_core::fsutil::write_json_atomic`]. A field this
@@ -29,7 +29,7 @@ pub struct VolumeRecord {
     /// created by CreateVolume.
     #[serde(default)]
     pub static_volume: bool,
-    /// DeleteVolume of a fork asked for it to be finished (design §11.5);
+    /// DeleteVolume of a fork asked for it to be finished;
     /// never cleared. The node plugin's release scan finishes and
     /// publishes it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]

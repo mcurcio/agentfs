@@ -1,5 +1,5 @@
 //! Queues a one-commit patch in a volume's own history repository, as a
-//! producer pushing to the state area's git directory would (design §12).
+//! producer pushing to the state area's git directory would.
 //!
 //! Shared (through `#[path]`) by `crates/agentfs/tests`.
 

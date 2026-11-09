@@ -1,6 +1,5 @@
 //! Committer and author identities from the `[agentfs "identity"]`
-//! templates, end to end through the command line (design §9, §18 test
-//! 10): every variable from the pod flags, the `{replica}` and `{podUid}`
+//! templates, end to end through the command line: every variable from the pod flags, the `{replica}` and `{podUid}`
 //! fallbacks, the refusal of a bad template, fronts of a history service
 //! committing as their own pods, and a template change across a restart
 //! of the service. No FUSE; the mounts are in `tests/mount.rs`
@@ -336,7 +335,7 @@ fn every_variable_renders_from_flags_and_environment() {
 }
 
 /// `{replica}` falls back to the pod name, and `{podUid}` to the replica
-/// (design §9; docs/configuration.md); the defaults render as documented.
+/// (docs/configuration.md); the defaults render as documented.
 #[test]
 fn replica_and_pod_uid_fall_back_as_documented() {
     let v = Volume::new();

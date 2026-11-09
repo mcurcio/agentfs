@@ -1,4 +1,4 @@
-//! The managed `.gitattributes` block (design §7) against the real `git`
+//! The managed `.gitattributes` block against the real `git`
 //! binary and against gix-attributes, which agentfs's own rules use.
 //!
 //! A root `.gitattributes` composed by `agentfs_core::lfs::attributes` must

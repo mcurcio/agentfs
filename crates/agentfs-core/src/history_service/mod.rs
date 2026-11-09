@@ -1,4 +1,4 @@
-//! One history service per volume, fed by a front per pod (design §14).
+//! One history service per volume, fed by a front per pod.
 //!
 //! In single-process mode (the default) every mount is its own writer of
 //! the branch and holds the state-area lock. With a history service, one
@@ -7,9 +7,9 @@
 //! into the shared `pending/` in a slot it leases ([`FrontLease`]) and sends
 //! the record to the service, which journals it and replies once it is
 //! durable. The front fails the boundary with `EIO` if no durable reply
-//! comes (design §3.5). Each front also keeps a listening stream
+//! comes. Each front also keeps a listening stream
 //! ([`HistoryClient::listen`]) on which the service calls it, so the
-//! service can serve restores live ([`Fronts`], design §15).
+//! service can serve restores live ([`Fronts`]).
 //!
 //! Fronts and service speak gRPC, `agentfs.history.v2` ([`wire`]), over
 //! the node-local Unix socket: two HTTP/2 connections per front, each
@@ -51,10 +51,10 @@ pub const PROTOCOL_VERSION: u32 = 2;
 pub const MAX_MESSAGE: usize = 64 << 20;
 
 /// What this build's service supports, in `Welcome.features`: `stamps`
-/// (freeze stamps on records, design §14.1), `repair_origin` (a repair's
-/// own origin on a sweep record, design §14.1), `listen` (the reversed
-/// channel, design §15), `still_last` (design §3.1) and `move` (a record may
-/// hold a [`crate::record::Change::Move`], design §3.1).
+/// (freeze stamps on records), `repair_origin` (a repair's
+/// own origin on a sweep record), `listen` (the reversed
+/// channel), `still_last` and `move` (a record may
+/// hold a [`crate::record::Change::Move`]).
 pub const FEATURES: &[&str] = &["stamps", "repair_origin", "listen", "still_last", "move"];
 
 /// The service's name in `grpc.health.v1` ([`HistoryClient::ping`]).
@@ -63,7 +63,7 @@ pub const SERVICE_NAME: &str = "agentfs.history.v2.History";
 /// Who a front is.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FrontInfo {
-    /// Its pod's metadata, journaled with each of its records (design §9).
+    /// Its pod's metadata, journaled with each of its records.
     pub origin: Origin,
     /// The pending slot it leases ([`FrontLease`]).
     pub slot: u16,
@@ -72,20 +72,20 @@ pub struct FrontInfo {
     pub pid: u32,
     /// The front's agentfs version, for the service's log.
     pub version: String,
-    /// Where its workloads see the tree (design §5): absolute `gitdir:`
+    /// Where its workloads see the tree: absolute `gitdir:`
     /// targets under these map exactly.
     pub views: Vec<View>,
 }
 
 /// A write's freeze stamp: the stamp of its backing file, taken just
-/// before its freeze (design §14.1).
+/// before its freeze.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PathStamp {
     pub path: RepoPath,
     pub stamp: FreezeStamp,
 }
 
-/// A call from the service to a listening front (design §15).
+/// A call from the service to a listening front.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Call {
     /// Record now what changed through the front and is not recorded yet
@@ -150,7 +150,7 @@ impl fmt::Display for Address {
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum AddressError {
     #[error(
-        "history service address {0:?} is not supported: a front reaches its history service only over the Unix socket on its own node (unix:<path>, design §14.1)"
+        "history service address {0:?} is not supported: a front reaches its history service only over the Unix socket on its own node (unix:<path>)"
     )]
     Unsupported(String),
     #[error("history service address {0:?} must be an absolute path or unix:<absolute path>")]

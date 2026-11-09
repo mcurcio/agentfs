@@ -1,5 +1,4 @@
-//! Reads small files the workload controls from the backing tree (design §4.1,
-//! §5): `.gitignore`, `.gitattributes`, `.git` files and git-directory
+//! Reads small files the workload controls from the backing tree: `.gitignore`, `.gitattributes`, `.git` files and git-directory
 //! markers such as `HEAD`.
 //!
 //! These reads happen in the synchronous step of a record, so they must not

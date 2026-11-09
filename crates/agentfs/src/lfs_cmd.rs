@@ -1,4 +1,4 @@
-//! `agentfs lfs` (design §7, §17.1): the local LFS object cache.
+//! `agentfs lfs`: the local LFS object cache.
 //!
 //! - `fetch` downloads into `<state>/lfs/objects` the objects that
 //!   commits reference: the branch head's tree by default, the trees of

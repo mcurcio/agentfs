@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# End-to-end recovery (design §15, §18 test 11) through a real FUSE mount,
+# End-to-end recovery through a real FUSE mount,
 # following docs/runbooks/recovery-and-undo.md: find a change, restore a
 # file and revert a commit while mounted, undo a restore, then, with the
 # workload stopped, the plain-git alternative and a direct-mode restore,
@@ -80,9 +80,9 @@ af init --volume demo >/dev/null
 # GOOD and BAD below must each be one commit holding all of its step's
 # writes. A timed commit window cannot promise that: a shell `>` records
 # twice (the file empty at the close of the descriptor it dups onto stdout,
-# then its content, design §3.1), and a busy runner can spread a step's
+# then its content), and a busy runner can spread a step's
 # records past any window. So nothing commits on its own while the workload
-# writes; `agentfs push` commits each step whole (design §11.2).
+# writes; `agentfs push` commits each step whole.
 sgit config agentfs.commitWindow 1h
 sudo git init -q --bare "$REMOTE"
 sgit config remote.origin.url "$REMOTE"

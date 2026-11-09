@@ -1,4 +1,4 @@
-//! `agentfs fork` (design §11.5, §17.1): create a fork of a volume,
+//! `agentfs fork`: create a fork of a volume,
 //! finish and publish it, read its status, abandon it, and list the
 //! published changes on a fork remote.
 //!
@@ -127,8 +127,7 @@ pub struct CreateArgs {
     #[arg(long, value_name = "NAME")]
     pub name: Option<String>,
     /// linked: its finish delivers the change back to the source;
-    /// unlinked: an independent fork, nothing ever delivered (design
-    /// §11.5). Fixed at create.
+    /// unlinked: an independent fork, nothing ever delivered. Fixed at create.
     #[arg(long, value_enum, default_value = "linked")]
     pub link: LinkArg,
     /// With --link unlinked: a config file of the fork's own `[remote

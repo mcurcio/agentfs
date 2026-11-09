@@ -1,11 +1,11 @@
-//! Where the driver keeps things (design §14.2).
+//! Where the driver keeps things.
 //!
 //! ```text
 //! <base>/                         --base-path: a directory on this node's own
 //!                                 disk, never a network filesystem (F8 R1)
 //!   <handle>/                     a worktree (the PV name), 0700
 //!     backing/                    the files the pods see
-//!     state/                      the state area (design §2.2)
+//!     state/                      the state area
 //!     csi.json                    the record of the volume (CreateVolume, or
 //!                                 a static PV adopted over the worktree)
 //!     csi.retained.json           the record once DeleteVolume kept the worktree

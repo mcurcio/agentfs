@@ -1,4 +1,4 @@
-//! `agentfs lfs prune` (design §7): deleting from the local LFS cache the
+//! `agentfs lfs prune`: deleting from the local LFS cache the
 //! objects every remote's LFS servers hold. Never automatic, and never
 //! anything on a server.
 //!

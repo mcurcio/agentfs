@@ -1,5 +1,5 @@
 //! `Ops` against a real backing directory and a real state area, without
-//! the kernel: every boundary of design §3.1 and the backstops.
+//! the kernel: every boundary and the backstops.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -307,7 +307,7 @@ fn same_size_rewrites_are_caught_by_the_racy_rule() {
 /// A fixture whose file timestamps (this thread's stamps) and racy window
 /// are both far coarser than the test: every record is racy, and a write
 /// of the same size leaves the stamp unchanged, as a write within one tick
-/// of the kernel's coarse clock does (design §3.1).
+/// of the kernel's coarse clock does.
 fn coarse_clock() -> Fx {
     const TICK: i128 = 1_000_000 * 1_000_000_000;
     crate::dirty::TEST_TICK_NS.with(|t| t.set(TICK));
@@ -328,7 +328,7 @@ fn write_behind(fx: &Fx, path: &str, content: &str) {
         .unwrap();
 }
 
-/// Design §3.1 and §19.2 item 4: a file written and closed within the
+/// A file written and closed within the
 /// racy-timestamp window is recorded once. RELEASE finds its stamp
 /// unchanged but racy, compares its bytes with the copy FLUSH froze, and
 /// skips the record since they are equal and that copy is still the last
@@ -914,7 +914,7 @@ fn release_and_sweep_backstops() {
     assert_eq!(fx.backlog(), 0);
 }
 
-/// A writer that shared a passthrough backing id (design §17.1): its
+/// A writer that shared a passthrough backing id: its
 /// mapping may write after RELEASE without the daemon seeing it, so the
 /// node is swept with no handle open and recorded at FORGET.
 #[test]
@@ -964,7 +964,7 @@ fn stale_backing_inodes_are_detected() {
 
 #[test]
 fn names_another_process_moved_away_are_dropped_at_lookup() {
-    // Another front of the same backing tree (design §14) renames a file
+    // Another front of the same backing tree renames a file
     // this mount knows by its old name.
     let fx = Fx::new();
     fx.put("old", "1");
@@ -991,7 +991,7 @@ fn names_another_process_moved_away_are_dropped_at_lookup() {
 
 #[test]
 fn an_open_file_another_process_renamed_is_recorded_at_its_new_name() {
-    // Another front renames a file open here (design §14); its own boundary
+    // Another front renames a file open here; its own boundary
     // records the rename. This mount's close must not record the old name.
     let fx = Fx::new();
     fx.put("old", "1");
@@ -1026,8 +1026,8 @@ fn an_open_file_another_process_renamed_is_recorded_at_its_new_name() {
 
 #[test]
 fn an_open_file_another_process_removed_is_recorded_nowhere() {
-    // Another front removes a file open here and records the removal
-    // (design §14); this mount's close must not bring the path back.
+    // Another front removes a file open here and records the removal;
+    // this mount's close must not bring the path back.
     let fx = Fx::new();
     fx.put("x", "1");
     let fh = fx.open("x", O_WRONLY | O_TRUNC);
@@ -1518,7 +1518,7 @@ fn a_queue_left_in_the_temporary_file_is_repaired() {
 #[test]
 fn an_inherited_repair_keeps_the_pod_that_failed_it() {
     // A slot's repair file left by a dead front (pod-a): its entries are
-    // recorded as pod-a's, by a sweep (design §14.1).
+    // recorded as pod-a's, by a sweep.
     let fx = Fx::new();
     fx.put("a.log", "data");
     let store = fx.state().fronts_dir().join("slot-1.repairs");
@@ -1562,7 +1562,7 @@ fn a_repair_never_drops_a_path_queued_again_meanwhile() {
     assert_eq!(fx.ops.boundary().pending_repairs(), 0);
 }
 
-// ---- restores through the mount (design §15) ----
+// ---- restores through the mount ----
 
 #[test]
 fn open_for_writing_tracks_write_handles() {
@@ -1666,7 +1666,7 @@ fn records_by_a_restore_actor_belong_to_the_operation() {
     );
 }
 
-// ---- the fsync class (design §8) ----
+// ---- the fsync class ----
 
 const SQLITE: &str = "*.db* agentfs.commit=fsync agentfs.group=sqlite agentfs.coalesce=5s\n";
 

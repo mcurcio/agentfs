@@ -1,5 +1,4 @@
-//! The one place the history service's wire messages meet agentfs types
-//! (design §14).
+//! The one place the history service's wire messages meet agentfs types.
 //!
 //! [`pb`] is `agentfs.history.v2`, generated at build time from
 //! `proto/agentfs/history/v2/history.proto`. Every conversion to the wire is

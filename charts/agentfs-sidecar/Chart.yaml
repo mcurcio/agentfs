@@ -2,7 +2,7 @@ apiVersion: v2
 name: agentfs-sidecar
 description: >-
   Helpers that add agentfs to a workload's chart as a phase 1 native
-  sidecar (design §17.1): its containers, volumes, settings and claim.
+  sidecar: its containers, volumes, settings and claim.
 type: library
 # The repository's version; CI publishes it like charts/agentfs-csi
 # (docs/helm.md).

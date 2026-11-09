@@ -2,19 +2,18 @@
 //! on every change boundary) and a [`Committer`] (which turns records into
 //! history in the background).
 //!
-//! Opening a volume is also crash recovery (design §3.3): records already in
+//! Opening a volume is also crash recovery: records already in
 //! history are dropped from the journal, the rest stay uncommitted, and
 //! frozen copies nothing refers to are removed.
 //!
-//! The recorder applies path rules (design §4, §5) before freezing anything:
+//! The recorder applies path rules before freezing anything:
 //! each input is recorded or skipped with a reason, and the set of tracked
 //! paths (branch head plus uncommitted records) is kept current so ignore
 //! rules only ever affect untracked paths. Each record claims its paths
 //! ([`crate::claims`]) from the decision until the tracked set is updated, so
 //! records touching the same path are decided and journaled in order.
 //!
-//! Kept inputs then go through the pre-commit checks ([`crate::checks`],
-//! design §3.4). A refused path is skipped with [`SkipReason::Refused`] and
+//! Kept inputs then go through the pre-commit checks ([`crate::checks`]). A refused path is skipped with [`SkipReason::Refused`] and
 //! raises [`Event::PathRefused`]; the rest of the record carries on. The
 //! committer checks every change again before committing it, for records
 //! journaled before the limits changed.
@@ -60,7 +59,7 @@ pub const CONTROL_SOCKET: &str = "agentfs.sock";
 /// The history service's default socket name in `meta/history`.
 pub const HISTORY_SOCKET: &str = "history.sock";
 
-/// Layout of a state area (design §2.2).
+/// Layout of a state area.
 #[derive(Debug, Clone)]
 pub struct StateDir {
     root: PathBuf,
@@ -93,12 +92,12 @@ impl StateDir {
     }
 
     /// Paths the FUSE layer could not record, kept for the next mount to
-    /// repair (design §3.5).
+    /// repair.
     pub fn repairs(&self) -> PathBuf {
         self.meta().join("repairs")
     }
 
-    /// Per-remote push state (design §11.2).
+    /// Per-remote push state.
     pub fn push_dir(&self) -> PathBuf {
         self.meta().join("push")
     }
@@ -108,7 +107,7 @@ impl StateDir {
         self.push_dir().join(format!("{remote}.json"))
     }
 
-    /// The patch queue's cached state (design §12): `meta/patch.json`.
+    /// The patch queue's cached state: `meta/patch.json`.
     pub fn patch_state(&self) -> PathBuf {
         self.meta().join("patch.json")
     }
@@ -122,13 +121,13 @@ impl StateDir {
     }
 
     /// `meta/attached.json`: a mount may have a workload attached
-    /// ([`crate::patch::attached`], design §12). Written as a mount
+    /// ([`crate::patch::attached`]). Written as a mount
     /// starts, removed only when it stops with nothing attached.
     pub fn attached_mark(&self) -> PathBuf {
         self.meta().join("attached.json")
     }
 
-    /// `meta/fork.json`: the finisher's marks (design §2.2, §11.5).
+    /// `meta/fork.json`: the finisher's marks.
     pub fn fork_mark(&self) -> PathBuf {
         self.meta().join("fork.json")
     }
@@ -138,26 +137,25 @@ impl StateDir {
         self.push_dir().join(format!("{remote}.lock"))
     }
 
-    /// Where a running mount listens for restores (design §2.2, §15),
+    /// Where a running mount listens for restores,
     /// readable only by the daemon's user.
     pub fn control_dir(&self) -> PathBuf {
         self.meta().join("control")
     }
 
     /// Where a mount recovering over a stale one mounts FUSE before it
-    /// stacks it over the mount point (design §2.2, §17.1).
+    /// stacks it over the mount point.
     pub fn stack_source(&self) -> PathBuf {
         self.meta().join("stack").join("mnt")
     }
 
-    /// [`StateDir::stack_source`] for the sandbox overlay's mount point
-    /// (design §2.2, §17.1).
+    /// [`StateDir::stack_source`] for the sandbox overlay's mount point.
     pub fn overlay_stack_source(&self) -> PathBuf {
         self.meta().join("stack").join("overlay")
     }
 
     /// The sandbox overlay's tmp layer: the store of the files a sandbox
-    /// creates under names the rules skip (design §2.2, §1.1; sandbox
+    /// creates under names the rules skip (sandbox
     /// overlay slice 3), `<state>/tmp-layer`. Wiped at every start and
     /// stop; counted in [`StateDir::usage`] as part `tmp_layer`.
     pub fn tmp_layer(&self) -> PathBuf {
@@ -169,8 +167,7 @@ impl StateDir {
         self.control_dir().join(CONTROL_SOCKET)
     }
 
-    /// Leases and repair lists of the fronts feeding a history service
-    /// (design §2.2, §14).
+    /// Leases and repair lists of the fronts feeding a history service.
     pub fn fronts_dir(&self) -> PathBuf {
         self.meta().join("fronts")
     }
@@ -182,14 +179,14 @@ impl StateDir {
     }
 
     /// The paths a front in `slot` could not record, kept for the next
-    /// front in that slot to repair (design §3.5); the counterpart of
+    /// front in that slot to repair; the counterpart of
     /// [`StateDir::repairs`].
     pub fn front_repairs(&self, slot: u16) -> PathBuf {
         self.fronts_dir().join(format!("slot-{slot}.repairs"))
     }
 
     /// Where the history service listens by default, readable only by the
-    /// daemon's user (design §14).
+    /// daemon's user.
     pub fn history_dir(&self) -> PathBuf {
         self.meta().join("history")
     }
@@ -199,12 +196,12 @@ impl StateDir {
         self.history_dir().join(HISTORY_SOCKET)
     }
 
-    /// The state-area lock (design §2.3, [`crate::lock`]).
+    /// The state-area lock ([`crate::lock`]).
     pub fn lock_file(&self) -> PathBuf {
         self.meta().join("lock")
     }
 
-    /// Large-file objects (design §7).
+    /// Large-file objects.
     pub fn lfs(&self) -> PathBuf {
         self.root.join("lfs")
     }
@@ -222,7 +219,7 @@ impl StateDir {
 
     /// The apparent size in bytes (the sum of regular files' lengths) of
     /// each part of the state area: `git`, `journal`, `pending`, `lfs`,
-    /// `meta` and `tmp_layer` (design §13). Symlinks are not followed; a missing part, and
+    /// `meta` and `tmp_layer`. Symlinks are not followed; a missing part, and
     /// files that vanish while it is walked, count 0.
     pub fn usage(&self) -> Vec<(&'static str, u64)> {
         [
@@ -274,7 +271,7 @@ pub enum VolumeError {
     Rules(#[from] RulesError),
     #[error(transparent)]
     ActorBusy(#[from] ActorBusy),
-    /// A front could not get its record durable (design §3.5, §14).
+    /// A front could not get its record durable.
     #[error(transparent)]
     HistoryService(#[from] ClientError),
     /// The history service will not journal a front's record as sent.
@@ -301,7 +298,7 @@ pub enum VolumeError {
     /// node's disk.
     #[error("no worktree at {}", path.display())]
     NoWorktree { path: PathBuf },
-    #[error("fork {fork} is finished: it is read-only (design §19.1)")]
+    #[error("fork {fork} is finished: it is read-only")]
     ForkFinished { fork: String },
 }
 
@@ -390,7 +387,7 @@ pub fn init(state: &StateDir, volume: &str, branch: Option<&str>) -> Result<Init
 }
 
 /// Creates a state area for `volume`, or accepts an existing one, so it
-/// can run at every start of a pod (design §2.3, §17.1).
+/// can run at every start of a pod.
 ///
 /// - A state area whose config already names `volume` (and `branch`, when
 ///   given) is [`Init::AlreadyInitialised`]: missing directories are
@@ -450,7 +447,7 @@ pub fn reopen_with(
     }
 }
 
-/// Creates the state area of the fork `identity` (design §11.5), or
+/// Creates the state area of the fork `identity`, or
 /// accepts the one an earlier try created, as [`init_with`] does: the
 /// identity goes in the state area's own config (`agentfs.volume`,
 /// `agentfs.fork.source`, `agentfs.fork.base`, never `agentfs.branch`),
@@ -688,7 +685,7 @@ fn config_error(e: ConfigError) -> VolumeError {
 }
 
 /// The fork `history` belongs to, if it is a fork whose branch head is
-/// its finish commit (design §11.5): a finished fork is read-only.
+/// its finish commit: a finished fork is read-only.
 fn finished_fork(history: &History) -> Result<Option<String>, VolumeError> {
     let Some(identity) = &history.settings().fork else {
         return Ok(None);
@@ -702,7 +699,7 @@ fn finished_fork(history: &History) -> Result<Option<String>, VolumeError> {
     Ok(finished.then(|| identity.fork.clone()))
 }
 
-/// [`VolumeError::ForkFinished`] for a finished fork (design §11.5), read
+/// [`VolumeError::ForkFinished`] for a finished fork, read
 /// without a lock: what `mount`, `run`, `record`, `restore`, `revert` and
 /// `patch apply` check before they change anything, and the CSI node
 /// plugin before it publishes a fork.
@@ -719,7 +716,7 @@ pub fn refuse_finished(state: &StateDir) -> Result<(), VolumeError> {
 /// Alarms go to `events`, which the caller has already wrapped with
 /// [`Telemetry::sink`] if telemetry is on; spans, `agentfs.record.duration`,
 /// `agentfs.commit.count` and the `agentfs.journal.backlog` gauge go to
-/// `telemetry` (design §13). Open a volume once per process: each open
+/// `telemetry`. Open a volume once per process: each open
 /// registers another backlog gauge.
 pub fn open(
     state: &StateDir,
@@ -732,7 +729,7 @@ pub fn open(
     // The caller holds the state-area lock: a ref lock is a crash's.
     let removed_ref_locks = history.remove_stale_ref_locks()?;
     let finished = finished_fork(&history)?;
-    // A bad remote section only stops that remote's pushes (design §11.1).
+    // A bad remote section only stops that remote's pushes.
     for bad in &history.settings().invalid_remotes {
         events.emit(Event::RemoteMisconfigured {
             remote: bad.name.clone(),
@@ -747,7 +744,7 @@ pub fn open(
     let committed_through = history.head_seq()?;
 
     // Fronts feeding a history service write into the same `pending/`;
-    // their copies are theirs to clean up while they live (design §14).
+    // their copies are theirs to clean up while they live.
     let live_fronts = FrontLease::live(state)?;
     let pending = Arc::new(PendingStore::open_slot(state.pending(), 0, |slot| {
         !live_fronts.contains(&slot)
@@ -778,8 +775,7 @@ pub fn open(
     for record in &uncommitted {
         for change in &record.draft.changes {
             tracked.apply(change);
-            // A move journaled before the crash is reconciled again
-            // (design §3.1).
+            // A move journaled before the crash is reconciled again.
             if let Change::Move { from, to } = change {
                 duties.add(Duty {
                     seq: record.seq,
@@ -844,7 +840,7 @@ pub fn open(
     Ok((recorder, committer, recovery))
 }
 
-/// Opens a front's recorder for the backing tree at `tree` (design §14):
+/// Opens a front's recorder for the backing tree at `tree`:
 /// it records through `client`'s history service, freezing into the slot
 /// the client's front leases.
 ///
@@ -905,7 +901,7 @@ pub struct Inspection {
 ///
 /// Unlike [`open`], this runs no recovery: it never truncates the journal or
 /// prunes frozen copies, so it is safe while another process holds the
-/// state-area lock and is writing (design §2.3). A record being appended at
+/// state-area lock and is writing. A record being appended at
 /// that moment may be missed, or counted in [`Inspection::torn_bytes`].
 pub fn inspect(state: &StateDir) -> Result<(History, Inspection), VolumeError> {
     let history = History::open(&state.git())?;
@@ -942,7 +938,7 @@ pub struct Recorded {
     pub seq: Option<u64>,
     pub skipped: Vec<Skipped>,
     /// The frozen copy of each write journaled, by path: what
-    /// [`Recorder::still_last`] asks about (design §3.1). Filled by the
+    /// [`Recorder::still_last`] asks about. Filled by the
     /// recorder that froze them; empty in the service's answer to a front.
     pub written: Vec<(RepoPath, PendingId)>,
 }
@@ -982,11 +978,11 @@ impl OperationSpec {
 ///
 /// A local recorder ([`open`]) journals itself; a front's ([`open_front`])
 /// does the same synchronous step up to the freeze and hands the record to
-/// the history service (design §14).
+/// the history service.
 #[derive(Clone)]
 pub struct Recorder {
     backend: Backend,
-    /// The fork's name when it was finished at open (design §11.5): every
+    /// The fork's name when it was finished at open: every
     /// record then fails with [`VolumeError::ForkFinished`].
     finished: Option<String>,
     operations: Arc<Operations>,
@@ -1002,12 +998,12 @@ pub struct Recorder {
     /// journal is reclaimed meanwhile.
     reclaim: Arc<RwLock<()>>,
     /// The last journaled freeze stamp of each path, in the history
-    /// service ([`Recorder::enable_stamps`], design §14.1).
+    /// service ([`Recorder::enable_stamps`]).
     stamps: Arc<std::sync::OnceLock<StampBook>>,
     /// The frozen copy of the last write journaled at each recently
-    /// written path, where this process journals (design §3.1).
+    /// written path, where this process journals.
     last_writes: Arc<LastWrites>,
-    /// Moves journaled here and not yet reconciled (design §3.1).
+    /// Moves journaled here and not yet reconciled.
     duties: Arc<Duties>,
 }
 
@@ -1020,7 +1016,7 @@ enum Backend {
         journal: Arc<Journal>,
         tracked: Arc<Tracked>,
     },
-    /// A front: the history service journals (design §14).
+    /// A front: the history service journals.
     Front { client: Arc<HistoryClient> },
 }
 
@@ -1043,7 +1039,7 @@ impl Recorder {
     /// tree for tracked paths.
     ///
     /// Writes and symlinks the rules keep then go through the pre-commit
-    /// checks (design §3.4). A refused input is skipped with
+    /// checks. A refused input is skipped with
     /// [`SkipReason::Refused`], its frozen copy is removed at once, and
     /// [`Event::PathRefused`] is raised; the other inputs are still
     /// recorded. Removals are never refused. If the record fails,
@@ -1068,7 +1064,7 @@ impl Recorder {
         self.record_with(trigger, caller, inputs, false, None)
     }
 
-    /// Records an fsync-class group (design §8) as one all-or-nothing
+    /// Records an fsync-class group as one all-or-nothing
     /// record: like [`Recorder::record`], except that if any input is
     /// refused, by the checks or by `agentfs.maxSize`, none is recorded and
     /// the others are skipped with [`SkipReason::GroupRefused`]. The record
@@ -1086,7 +1082,7 @@ impl Recorder {
 
     /// Records like [`Recorder::record`], for the pod `origin` rather than
     /// this front's own: a repair a front inherited from a dead predecessor
-    /// in its slot, recorded with the trigger `sweep` (design §14.1). The
+    /// in its slot, recorded with the trigger `sweep`. The
     /// history service accepts the origin only for sweep records whose
     /// committer it can render, and uses the front's own otherwise. A
     /// local recorder journals it as given.
@@ -1110,8 +1106,7 @@ impl Recorder {
     ) -> Result<Recorded, VolumeError> {
         self.refuse_if_finished()?;
         let start = Instant::now();
-        // A record by an operation's actor is part of that operation (design
-        // §15): trigger `restore`, made by the operator who asked for it.
+        // A record by an operation's actor is part of that operation: trigger `restore`, made by the operator who asked for it.
         let actor = caller.pid;
         let operation = self.operations.of_actor(actor);
         let (trigger, caller) = match &operation {
@@ -1175,7 +1170,7 @@ impl Recorder {
                 Decision::Record => kept.push(input),
                 // A group member the rules leave out (other than `-shm`)
                 // would be missing from the capture: a database without
-                // its WAL. The group is refused instead (design §8).
+                // its WAL. The group is refused instead.
                 Decision::Skip(reason)
                     if atomic
                         && !matches!(input, Input::Remove { .. })
@@ -1332,7 +1327,7 @@ impl Recorder {
                         ..Recorded::default()
                     })
                 }
-                // The service decides again and journals (design §14); its
+                // The service decides again and journals; its
                 // skips come back with the reply.
                 Backend::Front { client } => Ok(client.record(draft, std::mem::take(&mut stamps))?),
             }
@@ -1350,7 +1345,7 @@ impl Recorder {
                         self.note_journaled(change, stamp.map(|s| s.stamp));
                     }
                     // This process's own writes (a restore the service
-                    // applies) order fronts' records too (design §14.1).
+                    // applies) order fronts' records too.
                     if let Some(book) = self.stamps.get()
                         && seq.is_some()
                     {
@@ -1394,7 +1389,7 @@ impl Recorder {
                 // Copies frozen for a record that never became durable. A
                 // front's request that may have reached the service keeps
                 // them: the service may have journaled it, and will commit
-                // or prune them (design §3.5).
+                // or prune them.
                 let maybe_journaled =
                     matches!(&e, VolumeError::HistoryService(c) if c.maybe_journaled());
                 if !maybe_journaled {
@@ -1405,13 +1400,12 @@ impl Recorder {
         }
     }
 
-    /// The record-time half of a write (design §3.2, §3.4, §7): the checks
+    /// The record-time half of a write: the checks
     /// on the path, `agentfs.maxSize` and the blob limit on the size on
     /// disk, the freeze, then `agentfs.maxSize` and the content checks on
     /// the frozen copy, and the store. The copy is pushed to `frozen`
     /// unless refused, in which case it is already removed. The backing
-    /// file's stamp, taken before the freeze, comes with the change
-    /// (design §14.1).
+    /// file's stamp, taken before the freeze, comes with the change.
     #[allow(clippy::type_complexity)]
     fn prepare_write(
         &self,
@@ -1424,7 +1418,7 @@ impl Recorder {
             return Ok(Err((path, refusal)));
         }
         // The store decides which limit applies, the blob limit or the
-        // LFS object limit (design §7): first by the size on disk, so a
+        // LFS object limit: first by the size on disk, so a
         // file far over either limit is never copied, then by the frozen
         // copy's, which is what is journaled.
         let attrs = self.rules.attributes(&path)?;
@@ -1472,29 +1466,28 @@ impl Recorder {
         )))
     }
 
-    /// Journals a front's record (design §14): the history service's side
+    /// Journals a front's record: the history service's side
     /// of [`Recorder::record`], on its local recorder.
     ///
     /// The front decided with the tracked set as it was; this decides each
     /// change again with the paths claimed, as [`Recorder::record`] does: a
     /// removal of nothing tracked and a write the rules now skip are
     /// skipped, and their copies removed; in an atomic group such a write
-    /// refuses the whole group (design §8). A write or symlink whose path
+    /// refuses the whole group. A write or symlink whose path
     /// is no longer in the backing tree as sent is skipped
     /// ([`SkipReason::Gone`]): another front removed or renamed it after
     /// this front froze it, and that front's boundary, journaled after
     /// this check under the same claim, records it. A write frozen before
     /// a newer state of its path that is already journaled is skipped
     /// ([`SkipReason::Superseded`], by its freeze stamp in `stamps`, once
-    /// [`Recorder::enable_stamps`] is on; design §14.1). Atomic groups are
+    /// [`Recorder::enable_stamps`] is on). Atomic groups are
     /// recorded whole: neither check applies to them. Every write's copy
     /// must exist and be in the front's `slot`; operations come only from
     /// this process. The record is journaled with `origin`, so it commits
-    /// with the front's committer (design §9), and this returns once it is
+    /// with the front's committer, and this returns once it is
     /// durable.
     ///
-    /// Some journaled changes cannot be ordered against the tree (design
-    /// §14.1): a write whose freeze stamp is identical to the last one
+    /// Some journaled changes cannot be ordered against the tree: a write whose freeze stamp is identical to the last one
     /// journaled at its path from another slot, a removal of a path that
     /// is in the backing tree again, and a symlink whose target is not the
     /// one the tree has now. For each, once the record is journaled and
@@ -1758,7 +1751,7 @@ impl Recorder {
     }
 
     /// Records `path` as the backing tree has it now, as the service's own
-    /// `sweep` record by `caller` (design §14.1): after a front's change
+    /// `sweep` record by `caller`: after a front's change
     /// that cannot be ordered against the tree ([`Recorder::sequence`]).
     /// A file is frozen again, a symlink read again; a path that is
     /// neither now records nothing (its removal is another front's to
@@ -1766,7 +1759,7 @@ impl Recorder {
     /// journaled leaves the tree, and so history, unchanged. A failure
     /// leaves the path to its next change, with a warning.
     fn resync(&self, path: &RepoPath, caller: Caller) {
-        // Read confined when recorded (design §6 "Confinement"): the
+        // Read confined when recorded: the
         // workload may change the tree at any moment.
         let input = Input::Tree { path: path.clone() };
         self.telemetry.resynced();
@@ -1779,8 +1772,8 @@ impl Recorder {
     }
 
     /// Keeps the freeze stamp of the last write journaled at each path, so
-    /// [`Recorder::sequence`] skips a front's write frozen before it
-    /// (design §14.1). The history service turns it on before it serves;
+    /// [`Recorder::sequence`] skips a front's write frozen before it.
+    /// The history service turns it on before it serves;
     /// every clone shares it.
     pub fn enable_stamps(&self) {
         if matches!(self.backend, Backend::Local { .. }) {
@@ -1789,7 +1782,7 @@ impl Recorder {
     }
 
     /// Whether a front's write of `path` from `slot`, frozen with `stamp`,
-    /// is out of date (design §14.1), given `now`, the backing file's
+    /// is out of date, given `now`, the backing file's
     /// stamp at the path: skipped as [`SkipReason::Gone`] if another file
     /// has replaced the one it froze (a rename over the path: whoever did
     /// that records it), and as [`SkipReason::Superseded`] if a newer state
@@ -1831,16 +1824,16 @@ impl Recorder {
     }
 
     /// Whether each of `paths` is tracked now: the history service's answer
-    /// to a front's `Tracked` query (design §14). A front has no tracked
+    /// to a front's `Tracked` query. A front has no tracked
     /// set and answers `false` for each.
-    /// Opens the frozen copy `copy` for reading, while it is still pending
-    /// (design §3.1): an open copy outlives its removal at commit.
+    /// Opens the frozen copy `copy` for reading, while it is still pending:
+    /// an open copy outlives its removal at commit.
     pub fn open_copy(&self, copy: PendingId) -> io::Result<std::fs::File> {
         std::fs::File::open(self.pending.path(copy))
     }
 
     /// Whether the last change journaled at `path` is still the write of
-    /// the frozen copy `copy` (design §3.1): no later change at the path,
+    /// the frozen copy `copy`: no later change at the path,
     /// above or below it, by anyone. A front asks its history service; a
     /// service too old to answer, or any failure, is a no, which only
     /// costs one record more.
@@ -1868,7 +1861,7 @@ impl Recorder {
     }
 
     /// Records the rename of directory `from` to `to` as one
-    /// [`Change::Move`] (design §3.1): O(1) in the number of paths beneath
+    /// [`Change::Move`]: O(1) in the number of paths beneath
     /// it. The tree beneath `to` is reconciled by the commit loop before
     /// the move is committed. Nothing is journaled when nothing is tracked
     /// at or beneath either path and the rules exclude everything beneath
@@ -1965,8 +1958,7 @@ impl Recorder {
             || !self.rules.excludes_dir(to)?)
     }
 
-    /// Reconciles the tree beneath a move's destination (design §3.1,
-    /// [`crate::reconcile`]): records what recording every file beneath it
+    /// Reconciles the tree beneath a move's destination ([`crate::reconcile`]): records what recording every file beneath it
     /// would have decided differently from moving what history held.
     /// Returns the last record made, if any.
     pub fn reconcile(&self, duty: &Duty) -> Result<Option<u64>, VolumeError> {
@@ -2002,7 +1994,7 @@ impl Recorder {
                 // Refused at its new path (beneath a `.gitmodules`, too
                 // long, over its `agentfs.maxSize`): the move carried it
                 // there unchecked, so it leaves history, as recording the
-                // tree would have refused it (design §3.1).
+                // tree would have refused it.
                 let refusal = self.checks.check_path(&path).or_else(|| {
                     meta.is_file()
                         .then(|| over_max_size(meta.len(), self.rules.max_size(&path)))
@@ -2078,7 +2070,7 @@ impl Recorder {
         }
     }
 
-    /// Removes the frozen copies a dead front left in `slot` (design §14):
+    /// Removes the frozen copies a dead front left in `slot`:
     /// copies frozen before `leased_at`, when the slot's current holder
     /// leased it, that no journaled record references. They were frozen
     /// for records that never reached the journal (the front died between
@@ -2113,7 +2105,7 @@ impl Recorder {
         }
     }
 
-    /// The pod a front records for (design §9, §14); `None` for a local
+    /// The pod a front records for; `None` for a local
     /// recorder.
     pub fn front_origin(&self) -> Option<&Origin> {
         self.history_client().map(|c| &c.front().origin)
@@ -2132,7 +2124,7 @@ impl Recorder {
     }
 
     /// Reports a path the caller could not record at all because git cannot
-    /// store it (design §5): a `.git` component or one of its look-alikes,
+    /// store it: a `.git` component or one of its look-alikes,
     /// or another [`PathError`]. Raises [`Event::PathRefused`].
     pub fn refuse_invalid(&self, raw: &str, error: PathError) {
         self.events.emit(Event::PathRefused {
@@ -2142,7 +2134,7 @@ impl Recorder {
         });
     }
 
-    /// Starts an operator operation (design §15). Until the guard is
+    /// Starts an operator operation. Until the guard is
     /// finished or dropped, every record whose caller pid is one of
     /// `actors` is part of it: trigger `restore`, `caller` as its author,
     /// and the operation in the journal record, so the committer gives it
@@ -2159,7 +2151,7 @@ impl Recorder {
     }
 
     /// [`Recorder::begin_operation`] with every field of the operation,
-    /// including a patch's inbox number and author (design §12).
+    /// including a patch's inbox number and author.
     pub fn begin_operation_spec(
         &self,
         spec: OperationSpec,
@@ -2180,8 +2172,8 @@ impl Recorder {
 
     /// Why a write at `path` (a regular file, or a symlink to
     /// `symlink_target`) would not be recorded now, if it would not: the
-    /// path rules, given whether the path is tracked (design §4, §5), and
-    /// the checks on the path and symlink target (§3.4). A file's content
+    /// path rules, given whether the path is tracked, and
+    /// the checks on the path and symlink target. A file's content
     /// is checked with [`Checks::check_blob`].
     pub fn would_record(
         &self,
@@ -2204,7 +2196,7 @@ impl Recorder {
     }
 
     /// Where a regular file at `path` holding `size` bytes would be stored
-    /// if it were recorded now (design §7): the attributes in force and
+    /// if it were recorded now: the attributes in force and
     /// `agentfs.lfsThreshold`.
     pub fn store_for(&self, path: &RepoPath, size: u64) -> Result<Store, VolumeError> {
         let attrs = self.rules.attributes(path)?;
@@ -2245,13 +2237,13 @@ impl Recorder {
         &self.events
     }
 
-    /// The fsync-class settings for `path` (design §8), if it is in the
+    /// The fsync-class settings for `path`, if it is in the
     /// class.
     pub fn fsync_class(&self, path: &RepoPath) -> Option<FsyncClass> {
         self.rules.fsync_class(path)
     }
 
-    /// The volume's path rules, read when it was opened (design §4.1):
+    /// The volume's path rules, read when it was opened:
     /// the sandbox overlay's visibility gate judges by them
     /// ([`crate::visibility::Gate`]).
     pub fn rules(&self) -> &Arc<Rules> {
@@ -2270,8 +2262,7 @@ impl Recorder {
         fsync_class::group_members(path, &class, |p| self.rules.fsync_class(p))
     }
 
-    /// Whether process `pid` is an actor of an operator operation now
-    /// (design §15).
+    /// Whether process `pid` is an actor of an operator operation now.
     pub fn in_operation(&self, pid: u32) -> bool {
         self.operations.of_actor(pid).is_some()
     }
@@ -2292,11 +2283,11 @@ impl Recorder {
         }
     }
 
-    /// The rules' decision for each input (design §4). A front asks the
+    /// The rules' decision for each input. A front asks the
     /// history service whether a path is tracked only when the decision
     /// depends on it (an ignored or nested path), in one query for the
     /// whole record, and leaves removals to the service, which holds the
-    /// tracked set (design §14).
+    /// tracked set.
     fn decide_all(&self, inputs: &[Input]) -> Result<Vec<Decision>, VolumeError> {
         let Backend::Front { client } = &self.backend else {
             return inputs.iter().map(|i| self.decide(i)).collect();
@@ -2387,7 +2378,7 @@ enum FrontDecision {
 
 /// Turns recorded changes into commits.
 pub struct Committer {
-    /// Reconciles moved trees before each commit pass (design §3.1): the
+    /// Reconciles moved trees before each commit pass: the
     /// recorder of the journal it commits.
     reconciler: Option<Recorder>,
     duties: Arc<Duties>,
@@ -2398,7 +2389,7 @@ pub struct Committer {
     lfs: Arc<ObjectCache>,
     identities: IdentityRenderer,
     context: Context,
-    /// Each front's identity (design §9, §14), rendered once per origin;
+    /// Each front's identity, rendered once per origin;
     /// `None` when the origin no longer renders with the templates in
     /// force, so the service's own committer is used instead.
     origins: Mutex<HashMap<Origin, Option<IdentityRenderer>>>,
@@ -2416,10 +2407,10 @@ pub struct CommitReport {
     pub records: usize,
     pub commits: usize,
     pub last_seq: Option<u64>,
-    /// Changes dropped by the commit-time checks (design §3.4).
+    /// Changes dropped by the commit-time checks.
     pub refused: usize,
     /// Writes dropped because their directory has since become a git
-    /// directory (design §5).
+    /// directory.
     pub git_dir_dropped: usize,
 }
 
@@ -2428,21 +2419,21 @@ impl Committer {
         &self.history
     }
 
-    /// The replica's committer identity (design §9), for work outside the
+    /// The replica's committer identity, for work outside the
     /// committer that signs as it (a daemon's patch judging, bead
     /// agentfs-mia.5).
     pub fn committer_identity(&self) -> crate::identity::Identity {
         self.identities.committer().clone()
     }
 
-    /// The replica's committer signature, now (design §9).
+    /// The replica's committer signature, now.
     pub fn committer_signature(&self) -> Result<git2::Signature<'static>, git2::Error> {
         let c = self.identities.committer();
         git2::Signature::now(&c.name, &c.email)
     }
 
     /// The author signature for `caller`, now, from the volume's author
-    /// templates (design §9): a checkpoint's author
+    /// templates: a checkpoint's author
     /// ([`crate::checkpoint::cut`]).
     pub fn author_signature(
         &self,
@@ -2453,7 +2444,7 @@ impl Committer {
     }
 
     /// Commits that the patch of `op` is applied when it changes nothing
-    /// ([`History::commit_patch_marker`], design §12).
+    /// ([`History::commit_patch_marker`]).
     pub fn commit_patch_marker(&self, op: &Operation) -> Result<git2::Oid, VolumeError> {
         let commit = self
             .history
@@ -2462,7 +2453,7 @@ impl Committer {
         Ok(commit)
     }
 
-    /// The local LFS object cache (design §7).
+    /// The local LFS object cache.
     pub fn lfs_cache(&self) -> &Arc<ObjectCache> {
         &self.lfs
     }
@@ -2494,7 +2485,7 @@ impl Committer {
         if let Some(last) = groups.last() {
             let first = last[0].draft.time_ms;
             let settled = match &last[0].draft.operation {
-                // An operation's group grows until it ends (design §15).
+                // An operation's group grows until it ends.
                 Some(op) => !self.operations.is_active(op.id),
                 None => now_ms > first.saturating_add(window_ms) || now_ms < first,
             };
@@ -2506,9 +2497,8 @@ impl Committer {
     }
 
     /// Commits everything recorded so far, as [`Committer::commit_pending`]
-    /// does, except the group of an operation still running (a restore,
-    /// design §15), which would otherwise be published half done. What
-    /// `agentfs push` against a running daemon commits first (§2.3).
+    /// does, except the group of an operation still running (a restore), which would otherwise be published half done. What
+    /// `agentfs push` against a running daemon commits first.
     pub fn commit_now(&self) -> Result<CommitReport, VolumeError> {
         self.commit_settled(u64::MAX)
     }
@@ -2580,7 +2570,7 @@ impl Committer {
     }
 
     /// The committer identity and trailer context for records from
-    /// `origin` (design §9, §14): the process's own without one, else the
+    /// `origin`: the process's own without one, else the
     /// front's pod rendered with the volume's templates. A front's origin
     /// that no longer renders (the templates changed across a restart of
     /// the history service) keeps its pod trailers but gets the service's
@@ -2682,7 +2672,7 @@ impl Committer {
                     lfs_as_blobs,
                 }) => {
                     // The managed .gitattributes block could not be
-                    // written as is (design §7): changes dropped, LFS
+                    // written as is: changes dropped, LFS
                     // content stored as blobs.
                     if !refused.is_empty() {
                         report.refused += refused.len();
@@ -2734,7 +2724,7 @@ impl Committer {
         result.map(|()| report)
     }
 
-    /// Runs the pre-commit checks again over `group` (design §3.4) and
+    /// Runs the pre-commit checks again over `group` and
     /// returns it without the changes they refuse, with the count refused.
     /// This catches records journaled before the limits changed, such as
     /// records recovered after a remount with a stricter remote.
@@ -2742,7 +2732,7 @@ impl Committer {
     /// With the backing tree known ([`Committer::set_tree_known`]), it
     /// also drops, silently, every write or symlink at a path new to
     /// history whose ancestor directory has since become a git directory
-    /// (a bare layout, design §5): git's own data written by a custom
+    /// (a bare layout): git's own data written by a custom
     /// template before `HEAD` existed, which the recorder could not yet
     /// tell from ordinary files.
     fn recheck(&self, group: &[Record]) -> Result<Rechecked, VolumeError> {
@@ -2766,7 +2756,7 @@ impl Committer {
                 // truncation of a failed batch and the removal of its
                 // copies): its call returned an error, so nothing was
                 // promised. Dropped whole, never committed in part, and
-                // never blocking the records after it (design §3.3).
+                // never blocking the records after it.
                 self.events.emit(Event::RecordFailed {
                     trigger: record.draft.trigger,
                     paths: record
@@ -2829,7 +2819,7 @@ impl Committer {
                 }
                 kept.push(change);
             }
-            // An fsync-class group is only consistent whole (design §8).
+            // An fsync-class group is only consistent whole.
             if refused_any && record.draft.atomic {
                 kept.clear();
             }
@@ -2922,7 +2912,7 @@ enum Judged {
 }
 
 /// Whether `path` is still in the backing tree at `tree` as a front
-/// recorded it (design §14): a regular file (or, with `symlink`, a
+/// recorded it: a regular file (or, with `symlink`, a
 /// symlink) whose every directory is a real directory. Another front
 /// that removed or renamed the path since records that itself, so a late
 /// write must not bring it back. `None`: gone. A failure other than a
@@ -2959,11 +2949,11 @@ fn in_backing(tree: &Path, path: &RepoPath, symlink: bool) -> Option<Option<std:
 }
 
 /// Splits records into runs where each record is within `window_ms` of the
-/// run's first record. Records of an operator operation (design §15) form
+/// run's first record. Records of an operator operation form
 /// runs of their own, however long the operation takes; workload records
 /// interleaved with them (a live restore) split them, since commits
 /// follow the journal's order. Records from different fronts of a history
-/// service (design §14) never share a run either: a run is one origin's,
+/// service never share a run either: a run is one origin's,
 /// so its commit carries that pod's committer.
 fn group_by_window(records: &[Record], window_ms: u64) -> Vec<&[Record]> {
     let op = |r: &Record| r.draft.operation.as_ref().map(|o| o.id);
@@ -3477,7 +3467,7 @@ mod tests {
 
     /// Content stored as LFS over the smallest `agentfsMaxLfsObjectSize`
     /// is refused when recorded, before it is frozen, and at commit time
-    /// for what was journaled before the limit was lowered (design §7).
+    /// for what was journaled before the limit was lowered.
     #[test]
     fn lfs_objects_over_the_lfs_limit_are_refused() {
         let (dir, state) = setup();
@@ -4521,7 +4511,7 @@ mod tests {
             rec.checks().check_blob(&p("big"), b"more than ten bytes"),
             Some(Refusal::BlobTooLarge { .. })
         ));
-        // An ignored path that is tracked is recorded (design §4).
+        // An ignored path that is tracked is recorded.
         fs::write(dir.path().join("y.log"), "1").unwrap();
         exclude(&state, "");
         drop((rec, com));
@@ -5300,7 +5290,7 @@ mod tests {
         fs::create_dir_all(&tree).unwrap();
         let (rec, com, _) = open(&state, &tree, context(), null(), &Telemetry::noop()).unwrap();
         // Committed before the directory became a git directory: tracked,
-        // so later writes stay recorded (design §5).
+        // so later writes stay recorded.
         close_in_tree(&rec, &tree, "store/notes", "1");
         com.commit_pending().unwrap();
         make_head(&tree, "store");
@@ -5975,7 +5965,7 @@ mod tests {
         }
         assert_eq!(rec.journal_for_tests().backlog(), 0);
     }
-    // ---- directory moves (design §3.1) ----
+    // ---- directory moves ----
 
     fn path(s: &str) -> RepoPath {
         RepoPath::new(s).unwrap()

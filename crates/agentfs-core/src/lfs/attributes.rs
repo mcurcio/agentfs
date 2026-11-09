@@ -1,5 +1,5 @@
-//! The `.gitattributes` lines agentfs maintains for LFS-stored paths
-//! (design §7), so ordinary clones turn pointers back into content.
+//! The `.gitattributes` lines agentfs maintains for LFS-stored paths,
+//! so ordinary clones turn pointers back into content.
 //!
 //! Every commit rebuilds a block at the end of the root `.gitattributes`
 //! **in history only** (the backing tree is never written):

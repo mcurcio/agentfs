@@ -1,4 +1,4 @@
-//! The node plugin's supervisor (design §14.2): one `agentfs
+//! The node plugin's supervisor: one `agentfs
 //! serve-history` per staged volume, one `agentfs mount --history-service`
 //! front per published target, and their recovery.
 //!
@@ -15,7 +15,7 @@
 //!   own source directory, waits until that mount is live, bind-mounts it
 //!   onto the kubelet's target and records the target in
 //!   `<node-state>/published/`. A finished fork is published read-only
-//!   (`MS_RDONLY`) whatever the request asks (design §11.5); its service
+//!   (`MS_RDONLY`) whatever the request asks; its service
 //!   still starts and refuses every record, and its front mounts it
 //!   read-only, so the kernel refuses writes through any bind.
 //! - **A front that exits unasked** (a crash, `kill -9`, an external
@@ -155,7 +155,7 @@ pub struct PublishRequest {
     pub single_writer: bool,
     pub pod: Option<PodInfo>,
     /// `--workload-mount` values for the front (the `workloadMounts`
-    /// volume attribute, design §5).
+    /// volume attribute).
     pub workload_mounts: Vec<String>,
 }
 
@@ -375,7 +375,7 @@ impl Supervisor {
         records::remove(&address).map_err(io_error(format!("removing {}", address.display())))?;
         // A pod of the volume published on this node is attached, whether
         // or not its front runs yet: the service must not land the patch
-        // queue (design §12). Only no published record at all is evidence
+        // queue. Only no published record at all is evidence
         // that nothing is; a directory that cannot be listed is not.
         let attached = records::any(&layout.published_dir(handle)).unwrap_or(true);
         let spec = launcher::service_spec(layout, handle, &self.cfg.plugin, attached);
@@ -719,8 +719,7 @@ impl Supervisor {
         self.attach_target(target, &source).await
     }
 
-    /// Whether the volume is a finished fork, which is read-only (design
-    /// §11.5). Anything else wrong with its state area is the front's to
+    /// Whether the volume is a finished fork, which is read-only. Anything else wrong with its state area is the front's to
     /// report.
     fn fork_finished(&self, handle: &str) -> bool {
         let state = StateDir::new(self.layout().state(handle));
@@ -1103,7 +1102,7 @@ impl Supervisor {
     /// At plugin start: starts the services of staged volumes and recovers
     /// published targets (in the background). Published records whose
     /// target is gone are dropped first, so each service starts knowing
-    /// which of its pods are still attached (design §12: a volume with a
+    /// which of its pods are still attached (: a volume with a
     /// published pod never lands its patch queue, whenever its fronts come
     /// back).
     pub async fn reconcile(self: &Arc<Self>) -> Result<ReconcileReport, Error> {

@@ -1,4 +1,4 @@
-//! Crash injection at every engine failpoint (design §18 test 3; the crash
+//! Crash injection at every engine failpoint (the crash
 //! model of docs/architecture.md). Built only with the `failpoints`
 //! feature: `cargo test -p agentfs-core --features failpoints --test
 //! crash_points`. No FUSE and no root.
@@ -6,7 +6,7 @@
 //! A scripted workload (writes, an overwrite, a removal, a directory move,
 //! LFS content, a commit after every few records, a push after every
 //! commit to a local remote `origin`, and a remote `side` that someone
-//! else advances, so its pushes take the divergence path of §11.3) runs
+//! else advances, so its pushes take the divergence path) runs
 //! in a child process: this test binary again, with `CRASH_CHILD` set.
 //! For every engine failpoint the child is:
 //!
@@ -60,7 +60,7 @@ use crash_oracle::{Mode, Model, PromiseLog};
 
 const BRANCH: &str = "refs/heads/agentfs/vol";
 const VOLUME: &str = "vol";
-/// Content over this many bytes is stored with LFS (design §7).
+/// Content over this many bytes is stored with LFS.
 const LFS_THRESHOLD: usize = 64;
 
 /// The failpoints this workload passes. The FUSE, history service,
@@ -92,7 +92,7 @@ const ENGINE_POINTS: &[&str] = &[
 enum Op {
     Write(&'static str, Vec<u8>),
     Remove(&'static str),
-    /// A directory rename, recorded as one move (design §3.1).
+    /// A directory rename, recorded as one move.
     Move(&'static str, &'static str),
     Commit,
     Push,

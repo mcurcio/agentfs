@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Power loss and fsync ordering (design §3.3, §18 test 3): a workload of
+# Power loss and fsync ordering: a workload of
 # `agentfs record` and `agentfs push` on a filesystem on dm-log-writes,
 # which logs every write, flush and FUA the filesystem sends the disk.
 # The log is then replayed onto a second device, and at every FUA (or

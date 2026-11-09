@@ -1,4 +1,4 @@
-//! Checks docs/configuration.md against the CLI (design §17.1): every flag
+//! Checks docs/configuration.md against the CLI: every flag
 //! of every subcommand, with its environment variable, and every `OTEL_*`
 //! variable agentfs reads.
 //!
@@ -8,7 +8,7 @@
 //! environment", the flag as a code span starting the first cell
 //! (`` `--state DIR` ``), its variable as a code span in the row, and the
 //! subcommands in the Commands column as code spans (`` `patch submit` ``),
-//! or `all` for the global flags. Also checks that design §17.1 lists
+//! or `all` for the global flags. Also checks that the Commands section lists
 //! every subcommand.
 
 use clap::CommandFactory;
@@ -180,13 +180,10 @@ fn named_flags_reads_first_cells() {
 }
 
 #[test]
-fn every_command_is_in_design_17_1() {
-    let sections = doc_tables::sections(&doc_tables::read_doc(
-        env!("CARGO_MANIFEST_DIR"),
-        "design.md",
-    ));
-    let section = doc_tables::section(&sections, "17.1 Layer 1: core and daemon (Rust)")
-        .expect("docs/design.md has no `### 17.1 Layer 1: core and daemon (Rust)`");
+fn every_command_is_in_the_commands_section() {
+    let sections = doc();
+    let section = doc_tables::section(&sections, "Commands")
+        .expect("docs/configuration.md has no `## Commands` section");
     let spans = doc_tables::code_spans(&section.text);
     let cli = Cli::command();
     let mut missing = Vec::new();
@@ -202,6 +199,6 @@ fn every_command_is_in_design_17_1() {
     }
     assert!(
         missing.is_empty(),
-        "docs/design.md §17.1 does not list these commands (as code spans): {missing:?}"
+        "docs/configuration.md, \"Commands\": list these commands (as code spans): {missing:?}"
     );
 }

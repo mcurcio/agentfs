@@ -5,8 +5,9 @@ body:
   - type: markdown
     attributes:
       value: |
-        docs/design.md records the decisions taken so far (§19.1) and the
-        open questions (§19.2). If your idea touches one, say which.
+        OWNER-GUIDANCE.md records the owner's standing answers, and
+        docs/target-architecture holds designs for work that is not built.
+        If your idea touches one, say which.
   - type: textarea
     id: problem
     attributes:

@@ -1,5 +1,4 @@
-//! Restore and revert: writing content from history back into the tree
-//! (design §15).
+//! Restore and revert: writing content from history back into the tree.
 //!
 //! Three phases, all independent of how the tree is reached (the backing
 //! tree directly when no mount runs, or the mount point of a running
@@ -41,7 +40,7 @@
 //!    New files and directories take the owner of their nearest existing
 //!    parent when the process may chown, with mode 0644 or 0755.
 //!
-//! **Git LFS** (design §7): a pointer at a path its commit's managed
+//! **Git LFS**: a pointer at a path its commit's managed
 //! `.gitattributes` block lists is checked out as the object's content,
 //! taken from the local cache or downloaded from a remote
 //! ([`crate::lfs::fetch`]) during the check, before anything is written;
@@ -123,7 +122,7 @@ pub enum EntryKind {
     Symlink,
 }
 
-/// How a history entry's blob becomes the tree's content (design §7).
+/// How a history entry's blob becomes the tree's content.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stored {
     /// The blob is the content.
@@ -219,7 +218,7 @@ pub struct Plan {
     /// Restore only: the deepest directory removals may prune up to
     /// (exclusive): the parent of the restored path, or the root.
     pub prune_floor: String,
-    /// Patch only: the merged tree the steps lead to (design §12).
+    /// Patch only: the merged tree the steps lead to.
     pub target_tree: Option<Oid>,
 }
 
@@ -606,7 +605,7 @@ pub fn plan(repo: &Repository, branch_ref: &str, request: &Request) -> Result<Pl
 }
 
 /// The plan that brings the tree from the branch head `head` to `merged`,
-/// the result of merging patch `source` onto it (design §12): one step per
+/// the result of merging patch `source` onto it: one step per
 /// path whose entry differs.
 pub fn plan_tree(
     repo: &Repository,
@@ -659,15 +658,14 @@ pub trait RecordPolicy {
     /// would not be recorded, if it would not.
     fn refuses(&self, path: &RepoPath, symlink_target: Option<&str>) -> io::Result<Option<String>>;
     /// Where a file at `path` holding `size` bytes would be stored when
-    /// recorded (design §7).
+    /// recorded.
     fn store_for(&self, path: &RepoPath, size: u64) -> io::Result<Store>;
     /// The content checks for a file holding `content`, stored in `store`.
     fn check_content(&self, path: &RepoPath, content: &[u8], store: Store) -> Option<Refusal>;
     /// The checks for a file of `size` bytes whose content is not read (an
     /// LFS object), stored in `store`.
     fn check_size(&self, path: &RepoPath, size: u64, store: Store) -> Option<Refusal>;
-    /// Every member of the fsync-class group `path` belongs to (design
-    /// §8), `path` included; empty when it is in no group.
+    /// Every member of the fsync-class group `path` belongs to, `path` included; empty when it is in no group.
     fn group_of(&self, _path: &RepoPath) -> Vec<RepoPath> {
         Vec::new()
     }
@@ -785,7 +783,7 @@ fn ancestors(path: &str) -> Vec<&str> {
     path.match_indices('/').map(|(i, _)| &path[..i]).collect()
 }
 
-/// Brings every member of an fsync-class group (design §8) a step touches
+/// Brings every member of an fsync-class group a step touches
 /// into the plan, with its state in the same commit: a restore of
 /// `app.db` restores `app.db-wal` and `app.db-journal` with it, and a
 /// revert of a commit that changed one member puts every member back to
@@ -1224,9 +1222,9 @@ pub fn apply(
 pub enum RecordMode {
     /// Restore and revert: records of at most this many inputs, as a
     /// directory rename does in the FUSE layer, plus one atomic record per
-    /// fsync-class group (design §8).
+    /// fsync-class group.
     Chunked(usize),
-    /// A patch (design §12): every change in one atomic record, so a
+    /// A patch: every change in one atomic record, so a
     /// refusal at record or commit time records none of it.
     Atomic,
 }
@@ -1234,7 +1232,7 @@ pub enum RecordMode {
 /// Records what [`apply`] changed in `tree` (written directly, not through
 /// a mount), from confined descriptors so no symlink is ever followed, as
 /// records of the running operation: `caller` must be one of its actors. A
-/// path in the fsync class records its whole group (design §8) atomically,
+/// path in the fsync class records its whole group atomically,
 /// so history never pairs one version's database with another's `-wal` or
 /// `-journal`. Returns the problems, joined, if anything was not recorded.
 pub fn record_applied(

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# End-to-end tests of pushing to real SSH remotes (design §11.1): Ed25519
+# End-to-end tests of pushing to real SSH remotes: Ed25519
 # OpenSSH and RSA PEM keys with plain and hashed known_hosts, a wrong key
 # that fails only its own remote, unknown and changed host keys refused
 # before the key is ever offered, a key rotated under a running

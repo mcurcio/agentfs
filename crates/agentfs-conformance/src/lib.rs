@@ -77,7 +77,7 @@ pub fn against_model(trace: &[Recorded]) -> Result<(), String> {
     })
 }
 
-/// Whether a trace fits §18's "main and one sandbox" on a real mount: at most one
+/// Whether a trace fits "main and one sandbox" on a real mount: at most one
 /// fork, made before the first client call, and no open that both appends and
 /// writes at an offset. Linux has no such descriptor: `pwrite` on an `O_APPEND`
 /// file appends, and the view reads `O_APPEND` when the file opens.

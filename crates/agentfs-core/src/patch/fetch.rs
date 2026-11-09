@@ -1,4 +1,4 @@
-//! Fetching the volume's patch queue from the patch remote (design §12).
+//! Fetching the volume's patch queue from the patch remote.
 //!
 //! Only `refs/agentfs/<volume>/inbox/*` and `refs/agentfs/<volume>/approved/*`
 //! (`agentfs patch approve`, bead agentfs-mia.2) are fetched, forced (a

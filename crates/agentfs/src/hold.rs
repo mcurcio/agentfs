@@ -1,9 +1,9 @@
 //! `mount --on-stale-mount hold`: what a restarted sidecar does when its
 //! previous daemon died and left the mount point, the sandbox overlay's
-//! mount point, or both, stale (design §17.1).
+//! mount point, or both, stale.
 //!
 //! `--on-stale-mount recover` (the shipped sidecar's mode) mounts over the
-//! stale mount instead (design §17.1); hold is for operators who want to
+//! stale mount instead; hold is for operators who want to
 //! recover by hand. With hold, phase 1 recovers a crashed daemon by
 //! restarting the pod. Detaching the dead mount
 //! and mounting afresh is not safe: workload containers still hold the

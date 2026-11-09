@@ -1,10 +1,10 @@
-//! Crash injection in a real FUSE mount (design §18 test 3; the crash
+//! Crash injection in a real FUSE mount (the crash
 //! model of docs/architecture.md): the daemon killed (SIGKILL to itself)
 //! after a close was recorded but before FLUSH replied, and while saving
 //! the repair queue of a rename whose record failed. The stale mount is
 //! detached and the next command recovers; nothing journaled is lost and
 //! the repair is made. And a killed daemon's next mount holds the patch
-//! queue (design §12): a workload may still be attached.
+//! queue: a workload may still be attached.
 //!
 //! Built only with the `failpoints` feature, and needs `/dev/fuse` and
 //! root, so every test is `#[ignore]`d; the `crash` CI job runs them
@@ -263,7 +263,7 @@ fn killed_while_saving_the_repair_queue() {
     crash_oracle::check_clean(&v.state(), BRANCH).unwrap();
 }
 
-/// Bead agentfs-4do (design §12): a mount killed (`kill -9`) may leave a
+/// Bead agentfs-4do: a mount killed (`kill -9`) may leave a
 /// workload attached, so the next mount does not land the patch queue; it
 /// says why and the patch stays queued. Once a mount stops with nothing
 /// attached, the next one lands it.
@@ -302,7 +302,7 @@ fn a_killed_mount_holds_the_patch_queue_until_a_clean_stop() {
     crash_oracle::check_clean(&v.state(), BRANCH).unwrap();
 }
 
-/// Bead agentfs-4do (design §12): a mount stopped while a workload holds
+/// Bead agentfs-4do: a mount stopped while a workload holds
 /// it (its working directory in the mount, as in a container restarted
 /// under a running workload) is detached lazily, so the next mount does
 /// not land the patch queue.

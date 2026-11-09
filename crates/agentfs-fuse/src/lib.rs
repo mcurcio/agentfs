@@ -1,4 +1,4 @@
-//! The agentfs FUSE layer (design §2.1, §3.1, §6, §17.1).
+//! The agentfs FUSE layer.
 //!
 //! A passthrough filesystem over a real backing directory that records
 //! every change boundary through [`agentfs_core::volume::Recorder`] before
@@ -12,7 +12,7 @@
 //!   visibility gate and the view owner in front of `Ops` for the sandbox
 //!   overlay's session.
 //! - [`groups`] holds writes to fsync-class databases while they are
-//!   captured and schedules the captures (design §8).
+//!   captured and schedules the captures.
 //! - [`sweep`] runs the periodic backstop and retries failed records, and
 //!   the fsync-class trailing timer.
 //! - [`mount`] checks the layout (nothing of the state area may be

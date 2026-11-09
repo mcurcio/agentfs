@@ -1,4 +1,4 @@
-//! `agentfs restore` and `agentfs revert` (design §15).
+//! `agentfs restore` and `agentfs revert`.
 //!
 //! Both write content from history back into the tree and record the
 //! result as one commit with `Agentfs-Trigger: restore`. The planning,
@@ -144,7 +144,7 @@ impl Ask {
     }
 }
 
-/// Where a plan's LFS content comes from (design §7, §15): the cache, else
+/// Where a plan's LFS content comes from: the cache, else
 /// the remotes; a dry run only looks in the cache, so it downloads and
 /// writes nothing.
 enum Objects {
@@ -336,7 +336,7 @@ fn direct(
         .context("committing what is already recorded")?;
     let tree = Dir::open(root).with_context(|| format!("opening {}", root.display()))?;
     let history = committer.history();
-    // LFS content comes from the cache, else from the remotes (design §7).
+    // LFS content comes from the cache, else from the remotes.
     let objects =
         Objects::new(state, history.settings(), ask.dry_run).context("opening the LFS cache")?;
     let checked = restore::plan(history.repo(), &history.settings().branch_ref, &ask.request)
@@ -524,7 +524,7 @@ impl Daemon {
             )
             .map_err(other)?;
         let result = restore::apply(&plan, repo, objects.get(), &tree, live, ask.force);
-        // Databases (design §8): each group the operation changed is
+        // Databases: each group the operation changed is
         // recorded whole now, as part of it; nothing recorded them before.
         let captured = self.view.capture_operation();
         let last = guard.finish();
@@ -561,7 +561,7 @@ impl Daemon {
 /// listening before it refuses a restore as busy.
 pub const LISTEN_GRACE: Duration = Duration::from_secs(5);
 
-/// The history service's side of restores and reverts (design §15): it
+/// The history service's side of restores and reverts: it
 /// holds the state area, so it writes the backing tree itself, live, with
 /// every front's help ([`Fronts`]):
 ///

@@ -1,5 +1,4 @@
-# What RBAC cannot scope (design §14.2 "RBAC inventory"; docs/csi.md
-# §10): the node plugin's account, csi-provisioner on every node, may
+# What RBAC cannot scope (docs/csi.md): the node plugin's account, csi-provisioner on every node, may
 # create, change and delete only this driver's PVs pinned to its own node
 # (the node its pod-bound token names), and update only this driver's
 # claims. Without it one compromised node could delete any PV in the

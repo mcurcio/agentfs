@@ -1,4 +1,4 @@
-//! Per-path freeze stamps (design §14.1): ordering front records that
+//! Per-path freeze stamps: ordering front records that
 //! race for one path.
 //!
 //! A front freezes a file's content under its own path claim, but the
@@ -30,7 +30,7 @@
 //!   by the file: if it still has the journaled stamp, the incoming write
 //!   is older.
 //! - Identical stamps from one slot are a front's own re-record (the
-//!   racy-timestamp rule records a file twice on purpose, §3.1), ordered
+//!   racy-timestamp rule records a file twice on purpose), ordered
 //!   by that front's claim: journaled. Identical stamps from two slots
 //!   (two fronts' same-size writes within one tick of a coarse timestamp
 //!   clock) cannot be ordered at all: the write is journaled, and the
@@ -44,7 +44,7 @@
 //! [`LastWrites`] is the other per-path memory of whoever journals: the
 //! frozen copy of the last write at each recently written path, which
 //! lets a RELEASE skip re-recording a file whose close was just recorded
-//! with the same bytes (design §3.1).
+//! with the same bytes.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs::Metadata;
@@ -235,7 +235,7 @@ const LAST_WRITE_CAP: usize = 1 << 16;
 /// copy and the stamp taken before the freeze. Kept by whoever journals (a
 /// single-process daemon, or the history service for its fronts). It lets
 /// a RELEASE skip re-recording a file whose close was just recorded
-/// ([`LastWrites::is_last`], design §3.1), and a move's reconciliation
+/// ([`LastWrites::is_last`]), and a move's reconciliation
 /// skip files whose journaled state is the one they have
 /// ([`LastWrites::stamp_of`]). Any later change at the path, or above or
 /// below it, forgets it; a move carries it along. Forgetting is always

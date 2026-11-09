@@ -1,10 +1,9 @@
-//! Starting the `agentfs` children the node plugin supervises (design
-//! §14.2, §17.2): one `agentfs serve-history` per staged volume, one
+//! Starting the `agentfs` children the node plugin supervises: one `agentfs serve-history` per staged volume, one
 //! `agentfs mount --history-service` front per published target, and the
 //! release scan's children ([`crate::release_scan`]): one `agentfs flush`
 //! then one `agentfs push` per worktree no pod stages, and one `agentfs
 //! fork finish` per fork
-//! whose deletion asked for it to be finished (design §11.5).
+//! whose deletion asked for it to be finished.
 //!
 //! The children are the same commands the single-node deployments run, so
 //! a crashed front or service never takes the gRPC server down. Their
@@ -226,7 +225,7 @@ pub const SERVICE_LOCK_WAIT: Duration = Duration::from_secs(30);
 /// finisher or DeleteVolume's listing may hold for a moment as the volume
 /// is staged. `workload_attached` (a pod of the volume is published on
 /// the node) adds `--workload-attached`: the service judges the patch
-/// queue and does not land it (design §12).
+/// queue and does not land it.
 pub fn service_spec(
     layout: &Layout,
     handle: &str,
@@ -304,8 +303,7 @@ fn identity_env(identity: &PluginIdentity) -> Vec<(OsString, OsString)> {
 
 /// How long one finisher child publishes before it exits 1 and frees the
 /// fork's state lock; the release scan's next pass starts another. Between
-/// them an operator's `fork abandon --wait-lock` gets the lock (design
-/// §11.5).
+/// them an operator's `fork abandon --wait-lock` gets the lock.
 pub const FINISH_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// argv of the finisher child, with the plugin's identity flags: `--state
@@ -346,7 +344,7 @@ pub fn anonymous_replica(key: &str) -> String {
 }
 
 /// `agentfs --state S mount --history-service unix:<socket> ... B <source>`,
-/// with a `--workload-mount` for each of `workload_mounts` (design §5).
+/// with a `--workload-mount` for each of `workload_mounts`.
 #[allow(clippy::too_many_arguments)]
 pub fn front_spec(
     layout: &Layout,

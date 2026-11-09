@@ -1,4 +1,4 @@
-//! Operator operations in progress: restores and reverts (design §15).
+//! Operator operations in progress: restores and reverts.
 //!
 //! A restore writes into the tree like any workload, so its writes reach
 //! the recorder as ordinary change boundaries: from the CLI's own process

@@ -1,11 +1,11 @@
 //! The history repository: turns journal records into commits on the
-//! volume's branch (design §3.3, §3.4, §9).
+//! volume's branch.
 //!
 //! The repository is bare and lives in the state area, never in the mount.
 //! Each commit carries `Agentfs-Seq: <n>`, the last journal record it
 //! includes, which is where recovery resumes after a crash.
 //!
-//! An operator restore or revert (design §15) is its own commit: its
+//! An operator restore or revert is its own commit: its
 //! subject is the operation's summary, and `Agentfs-Restore: <commit>` or
 //! `Agentfs-Revert: <commit>` follows `Agentfs-Trigger: restore`.
 
@@ -28,7 +28,7 @@ use crate::pending::PendingStore;
 use crate::record::{Change, Operation, OperationKind, PatchAuthor, Record};
 
 pub const SEQ_TRAILER: &str = "Agentfs-Seq";
-/// The inbox number of the patch a commit applies (design §12).
+/// The inbox number of the patch a commit applies.
 pub const INBOX_TRAILER: &str = "Agentfs-Inbox";
 
 /// How long libgit2 waits for a remote to accept a connection.
@@ -65,17 +65,16 @@ pub enum HistoryError {
 
 /// Process-wide libgit2 setup, done once before any repository is opened:
 ///
-/// - objects and refs are fsynced (libgit2 does not by default; design
-///   §3.3);
+/// - objects and refs are fsynced (libgit2 does not by default; design);
 /// - the system, XDG, global and ProgramData config search paths are
 ///   cleared, so no config outside the history repository's own file can
 ///   reach a volume: not `url.<base>.insteadOf` redirecting a push, not
-///   `http.*`, not `core.excludesFile` (design §4.4, §11.1);
+///   `http.*`, not `core.excludesFile`;
 /// - the home directory is cleared, so `~/.ssh/known_hosts` never decides
-///   or steers an SSH host key check (design §11.1);
+///   or steers an SSH host key check;
 /// - remote connections and reads/writes time out
 ///   ([`SERVER_CONNECT_TIMEOUT_MS`], [`SERVER_IO_TIMEOUT_MS`]), so a hung
-///   remote ends as an unreachable push (design §11.2).
+///   remote ends as an unreachable push.
 pub(crate) fn init_libgit2() {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
@@ -105,7 +104,7 @@ pub(crate) fn init_libgit2() {
         }
         // No home directory either: libgit2's SSH transport reads
         // `~/.ssh/known_hosts` from it, and agentfs checks host keys only
-        // against each remote's own agentfsKnownHosts (design §11.1).
+        // against each remote's own agentfsKnownHosts.
         // SAFETY: GIT_OPT_SET_HOMEDIR takes one C string, which libgit2
         // copies; called once, before any transport is created.
         let rc = unsafe {
@@ -116,7 +115,7 @@ pub(crate) fn init_libgit2() {
         };
         assert_eq!(rc, 0, "libgit2 rejected GIT_OPT_SET_HOMEDIR");
         // A remote that accepts the connection and then stalls must end as
-        // a failed push, not hang its thread forever (design §11.2).
+        // a failed push, not hang its thread forever.
         // SAFETY: plain integer options, set once before any transport is
         // created.
         let connect = unsafe {
@@ -129,7 +128,7 @@ pub(crate) fn init_libgit2() {
         // SAFETY: as above.
         let io = unsafe { git2::opts::set_server_timeout_in_milliseconds(SERVER_IO_TIMEOUT_MS) };
         assert!(io.is_ok(), "libgit2 rejected the I/O timeout: {io:?}");
-        // SSH remotes go through agentfs's own transport (design §11.1).
+        // SSH remotes go through agentfs's own transport.
         #[cfg(feature = "ssh")]
         crate::ssh_transport::register();
     });
@@ -147,7 +146,7 @@ pub struct Committed {
     pub commit: Option<Oid>,
     pub last_seq: u64,
     /// Changes dropped at commit time because the managed `.gitattributes`
-    /// block could not be written otherwise (design §7), with why: raise
+    /// block could not be written otherwise, with why: raise
     /// `PathRefused` with stage `commit` for each.
     pub refused: Vec<(RepoPath, Refusal)>,
     /// LFS writes stored as blobs for the same reason.
@@ -192,7 +191,7 @@ impl History {
     }
 
     /// Makes `includes` exactly the `include.path` entries of the
-    /// repository's own config, in order (design §4.3). The settings of
+    /// repository's own config, in order. The settings of
     /// this `History` are not reloaded; open it again to see them.
     pub fn set_includes(&self, includes: &[PathBuf]) -> Result<(), HistoryError> {
         write_includes(self.repo.path(), includes)
@@ -224,7 +223,7 @@ impl History {
 
     /// Commits `records` (already grouped) as one commit on the branch.
     ///
-    /// Writes stored as LFS (design §7) are hashed into `lfs`, the object
+    /// Writes stored as LFS are hashed into `lfs`, the object
     /// cache, and committed as pointer blobs; the root `.gitattributes` in
     /// history then gets its managed block rebuilt
     /// ([`crate::lfs::attributes`]). The cache object is durable before the
@@ -233,7 +232,7 @@ impl History {
     /// A pointer is only committed when its managed line can be written
     /// too, so it never lands at a path no clone or upload treats as LFS.
     /// When the block cannot be placed (the root `.gitattributes` is not a
-    /// regular file) or the composed file fails `checks` (design §3.4), the
+    /// regular file) or the composed file fails `checks`, the
     /// commit falls back, step by step, and never fails for it:
     ///
     /// 1. this commit's LFS writes are stored as blobs, each checked
@@ -378,7 +377,7 @@ impl History {
         let commit = self
             .repo
             .commit(None, &author, &committer, &message, &tree, &parents)?;
-        // Objects before the ref that names them (design §3.3).
+        // Objects before the ref that names them.
         self.sync_object_dirs()?;
         crate::failpoints::hit("commit.after_object")?;
 
@@ -455,8 +454,8 @@ impl History {
         Ok(())
     }
 
-    /// Rebuilds the managed block of the root `.gitattributes` in `index`
-    /// (design §7): one line for every path stored as LFS. `managed` is the
+    /// Rebuilds the managed block of the root `.gitattributes` in `index`:
+    /// one line for every path stored as LFS. `managed` is the
     /// head's block (agentfs wrote it), `written` what this commit wrote. A
     /// path stays managed while it is a regular file not since rewritten
     /// as a blob or symlink; the workload's own content is kept byte for
@@ -492,7 +491,7 @@ impl History {
             }
             // Nothing to add, nothing to remove: the common case.
             Some(_) | None if paths.is_empty() => return Ok(None),
-            // Not recorded since agentfs refuses it (design §3.4), but
+            // Not recorded since agentfs refuses it, but
             // history may hold one from before.
             Some(_) => {
                 return Ok(Some(Refusal::SymlinkedSpecialFile {
@@ -560,8 +559,7 @@ impl History {
         Ok(())
     }
 
-    /// Makes a commit's objects durable before its ref moves (design
-    /// §3.3): with fsync enabled, libgit2 fsyncs each loose object and its
+    /// Makes a commit's objects durable before its ref moves: with fsync enabled, libgit2 fsyncs each loose object and its
     /// fan-out directory (`objects/xx`), but not `objects/` when it
     /// creates a fan-out directory there. Without this, a power cut after
     /// the ref update could leave the branch naming a commit whose
@@ -589,12 +587,12 @@ impl History {
     }
 
     /// Removes the ref lock files a crash left: `HEAD.lock`,
-    /// `packed-refs.lock` and every `refs/**/*.lock` (design §3.3). A ref
+    /// `packed-refs.lock` and every `refs/**/*.lock`. A ref
     /// update writes `<ref>.lock` and renames it over the ref; a process
     /// killed, or a power cut, in between leaves the lock, and libgit2
     /// then refuses every later update of that ref, so no commit could
     /// ever be made again. Only the holder of the state-area lock may call
-    /// this (design §2.3): it is the one process that writes the history,
+    /// this: it is the one process that writes the history,
     /// so any lock it finds at open is stale. Returns what it removed.
     pub fn remove_stale_ref_locks(&self) -> io::Result<Vec<PathBuf>> {
         let git_dir = self.repo.path();
@@ -711,7 +709,7 @@ pub(crate) fn reroot(path: &RepoPath, from: &RepoPath, to: &RepoPath) -> Option<
 }
 
 /// Moves every entry at and beneath `from` to its place beneath `to`,
-/// replacing whatever was at and beneath `to` (design §3.1): same blob,
+/// replacing whatever was at and beneath `to`: same blob,
 /// same mode. An entry the path rules refuse at its new place
 /// ([`crate::checks::path_refusal`]: beneath a `.gitmodules` or
 /// `.gitattributes`, or too long) leaves history instead: recording it
@@ -756,7 +754,7 @@ enum Fallback {
     KeepHeadAttributes,
 }
 
-/// A commit on the branch that applies a patch (design §12).
+/// A commit on the branch that applies a patch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InboxCommit {
     /// The branch commit.
@@ -767,8 +765,8 @@ pub struct InboxCommit {
 
 impl History {
     /// Records that the patch of `op` (kind patch, with an inbox number)
-    /// is applied when it changes nothing (design §12, the exception to
-    /// §3.4's no empty commits): a commit with the head's tree and
+    /// is applied when it changes nothing (the exception to
+    ///'s no empty commits): a commit with the head's tree and
     /// `Agentfs-Seq`, `Agentfs-Trigger: patch`, `Agentfs-Patch` and
     /// `Agentfs-Inbox`, authored like any patch commit.
     pub fn commit_patch_marker(
@@ -810,7 +808,7 @@ impl History {
     }
 
     /// An empty commit on the branch with the head's tree and `message`
-    /// (§3.4's exceptions: the patch marker, the checkpoint marker and a
+    /// ('s exceptions: the patch marker, the checkpoint marker and a
     /// fork's finish commit), objects and refs synced. Fails if the branch
     /// does not exist.
     pub fn commit_marker(
@@ -821,11 +819,10 @@ impl History {
         self.marker(message, signature, signature, "agentfs: marker commit")
     }
 
-    /// Merges the checkpoint commit `change` back into the branch (design
-    /// §19.2 item 11, [`crate::checkpoint`]): a marker with parents
+    /// Merges the checkpoint commit `change` back into the branch ([`crate::checkpoint`]): a marker with parents
     /// `[head, change]` and the head's tree, its message `message` then
     /// `Agentfs-Seq` (the head's), `Agentfs-Trigger: checkpoint` and
-    /// `Agentfs-Checkpoint: <change>`. §3.4's marker exception, like the
+    /// `Agentfs-Checkpoint: <change>`. The marker exception, like the
     /// patch marker: it writes no file. First-parent scans (the inbox
     /// trailers, the sequence) pass it as any marker. Objects and refs
     /// synced; the branch moves only if it is still at the head read.
@@ -918,7 +915,7 @@ impl History {
     }
 
     /// A commit of `tree` on `parent`, outside the branch, and `refname`
-    /// created at it (design §11.5, a fork's change). Create-only: when
+    /// created at it (a fork's change). Create-only: when
     /// `refname` already names a commit of `tree` on `parent`, that commit
     /// is returned and nothing is written; when it names anything else,
     /// this fails. Objects and the ref are synced.
@@ -955,7 +952,7 @@ impl History {
 
     /// Every patch commit on the branch's first-parent history from the
     /// head back to `since` (exclusive; the whole history when `None` or
-    /// when `since` is not on it), by inbox number (design §12). Only a
+    /// when `since` is not on it), by inbox number. Only a
     /// commit whose last message paragraph carries `Agentfs-Trigger:
     /// patch`, `Agentfs-Patch` and `Agentfs-Inbox` counts. For a fork,
     /// only the first-parent history after the fork's base: its inbox
@@ -1002,7 +999,7 @@ impl History {
 
 /// The inbox number and patch of a commit that applies a patch: read only
 /// from the message's last paragraph, which agentfs writes itself, and only
-/// with `Agentfs-Trigger: patch` there (design §12). A path in the change
+/// with `Agentfs-Trigger: patch` there. A path in the change
 /// list or a line of the patch's own message cannot forge it.
 pub fn inbox_from_message(message: &str) -> Option<(u64, Oid)> {
     let trimmed = message.trim_end_matches('\n');
@@ -1027,8 +1024,7 @@ pub fn inbox_from_message(message: &str) -> Option<(u64, Oid)> {
     }
 }
 
-/// The checkpoint commit a checkpoint marker merged back (design §19.2
-/// item 11): read only from the message's last paragraph, which agentfs
+/// The checkpoint commit a checkpoint marker merged back: read only from the message's last paragraph, which agentfs
 /// writes itself, and only with `Agentfs-Trigger: checkpoint` there, like
 /// [`inbox_from_message`].
 pub fn checkpoint_from_message(message: &str) -> Option<Oid> {
@@ -1049,7 +1045,7 @@ pub fn checkpoint_from_message(message: &str) -> Option<Oid> {
     change.filter(|_| trigger)
 }
 
-/// The finish record of the fork's finish commit `finish` (design §11.5):
+/// The finish record of the fork's finish commit `finish`:
 /// read only from the message's last paragraph, which agentfs writes
 /// itself, and only with `Agentfs-Trigger: finish` there. Every field is
 /// checked against its grammar (names as volume names, full commit ids, a
@@ -1447,7 +1443,7 @@ mod tests {
     }
 
     /// Objects are made durable before the ref moves, and the ref's
-    /// directories after (design §3.3): the failpoints mark the steps.
+    /// directories after: the failpoints mark the steps.
     #[cfg(feature = "failpoints")]
     #[test]
     fn objects_are_synced_before_the_ref_moves() {

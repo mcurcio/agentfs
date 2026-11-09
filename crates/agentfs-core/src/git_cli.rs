@@ -1,13 +1,11 @@
-//! Running the `git` program on a state area's git directory (design §8,
-//! §12, §17.3).
+//! Running the `git` program on a state area's git directory.
 //!
 //! agentfs runs the `git` program where git does the job better than
 //! libgit2 (AGENTS.md principle 4): `git repack` ([`crate::repack`]) and
 //! `git merge-tree` ([`crate::patch::integrate`]). Both run it here, in an
 //! environment of its own: a fixed `PATH`, `LC_ALL=C`, `HOME` set to the
 //! git directory, and the system and global git config switched off, so the
-//! program reads only the repository's own config, as libgit2 does (design
-//! §4.4), and nothing in the daemon's environment (`GIT_CONFIG_*`,
+//! program reads only the repository's own config, as libgit2 does, and nothing in the daemon's environment (`GIT_CONFIG_*`,
 //! `GIT_EXEC_PATH`, `GIT_ATTR_SOURCE`) reaches it.
 
 use std::io;

@@ -1,4 +1,4 @@
-//! Git LFS through the binary (design §7): `record` stores large files as
+//! Git LFS through the binary: `record` stores large files as
 //! pointers with a managed `.gitattributes` block, `push` uploads the
 //! objects to local and `file://` remotes before their refs, a failed
 //! upload pushes no ref, `restore` brings LFS content back from the cache

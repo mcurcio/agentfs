@@ -1,4 +1,4 @@
-//! Which LFS objects commits reference (design §7), for pushes
+//! Which LFS objects commits reference, for pushes
 //! ([`super::upload`]), `agentfs lfs fetch` and `agentfs lfs prune`.
 //!
 //! Only agentfs's own pointers count: a blob at a path in the commit's

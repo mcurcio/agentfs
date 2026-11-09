@@ -1,4 +1,4 @@
-//! Alarm and event signals (design §13).
+//! Alarm and event signals.
 //!
 //! The engine reports what operators need to see (refused paths, failed
 //! records and commits, push failures and divergence) as [`Event`]s handed
@@ -7,8 +7,8 @@
 //! alarms to stderr.
 //! This module holds no telemetry or IO policy of its own.
 //!
-//! [`EventSink::emit`] is called from the synchronous step of a record
-//! (design §3.2), on the FUSE threads, so a sink must never block: count,
+//! [`EventSink::emit`] is called from the synchronous step of a record,
+//! on the FUSE threads, so a sink must never block: count,
 //! enqueue or drop, but do not wait on IO or locks held for long.
 
 use std::fmt;
@@ -22,7 +22,7 @@ use crate::checks::Refusal;
 use crate::paths::RepoPath;
 use crate::record::Trigger;
 
-/// Where a path was refused (design §3.4).
+/// Where a path was refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CheckStage {
     /// In the synchronous step: the path was never journaled.
@@ -46,7 +46,7 @@ impl fmt::Display for CheckStage {
     }
 }
 
-/// Why a push failed (design §11.3), as a telemetry label.
+/// Why a push failed, as a telemetry label.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PushFailureKind {
@@ -68,7 +68,7 @@ pub enum PushFailureKind {
     /// A problem on this side: the history repository or the push state.
     Local,
     /// A single commit's git pack is larger than the remote's
-    /// `agentfsMaxPushSize` (design §11.3), so it can never be pushed in
+    /// `agentfsMaxPushSize`, so it can never be pushed in
     /// steps; nothing was sent.
     TooLarge,
 }
@@ -93,7 +93,7 @@ impl fmt::Display for PushFailureKind {
     }
 }
 
-/// Which part of a push attempt failed (design §7, §13).
+/// Which part of a push attempt failed.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PushStage {
@@ -104,7 +104,7 @@ pub enum PushStage {
     /// the git push; no ref was pushed.
     Lfs,
     /// Pushing the patch queue's refs (status, applied, inbox deletions)
-    /// to the patch remote, after the branch push (design §12). Never
+    /// to the patch remote, after the branch push. Never
     /// affects the branch's backoff or divergence.
     Queue,
 }
@@ -129,11 +129,11 @@ impl fmt::Display for PushStage {
 /// [`Event::PatchApplied`], [`Event::PatchDuplicate`],
 /// [`Event::ForkFinished`], [`Event::ForkPublished`],
 /// [`Event::ForkAbandoned`] and [`Event::HistoryServiceRestored`] is an
-/// alarm condition (design §13).
+/// alarm condition.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
     /// A path was not recorded, or dropped from a commit, because git's
-    /// fsck or a remote's limit would refuse it (design §3.4, §5).
+    /// fsck or a remote's limit would refuse it.
     PathRefused {
         /// The path as given; for [`Refusal::InvalidPath`] it may not be a
         /// valid [`RepoPath`].
@@ -141,8 +141,7 @@ pub enum Event {
         reason: Refusal,
         stage: CheckStage,
     },
-    /// The synchronous step failed; the triggering call gets an error
-    /// (design §3.5).
+    /// The synchronous step failed; the triggering call gets an error.
     RecordFailed {
         trigger: Trigger,
         paths: Vec<RepoPath>,
@@ -151,11 +150,11 @@ pub enum Event {
     /// Turning records into a commit failed; the records stay in the
     /// journal and are retried.
     CommitFailed { error: String, backlog: usize },
-    /// The periodic repack of the state area's git directory failed
-    /// (design §8); it is retried one `agentfs.repackInterval` later.
+    /// The periodic repack of the state area's git directory failed;
+    /// it is retried one `agentfs.repackInterval` later.
     /// History is intact, only less compact.
     RepackFailed { error: String },
-    /// A moved tree could not be reconciled (design §3.1) after
+    /// A moved tree could not be reconciled after
     /// [`crate::reconcile::MAX_FAILURES`] attempts over at least
     /// [`crate::reconcile::GIVE_UP_AFTER`]: the move commits as
     /// journaled, so history may hold files the rules exclude at `to`,
@@ -166,7 +165,7 @@ pub enum Event {
         to: RepoPath,
         error: String,
     },
-    /// A push attempt failed (design §11.3).
+    /// A push attempt failed.
     PushFailed {
         remote: String,
         kind: PushFailureKind,
@@ -181,7 +180,7 @@ pub enum Event {
         stage: PushStage,
     },
     /// The remote branch was written by someone else; the local head was
-    /// saved under `diverged_ref` (design §11.3).
+    /// saved under `diverged_ref`.
     Diverged {
         remote: String,
         local_head: Oid,
@@ -197,7 +196,7 @@ pub enum Event {
         tip: Oid,
     },
     /// The backlog was larger than the remote's `agentfsMaxPushSize`, so
-    /// only part of it was pushed (design §11.3): the branch now stands at
+    /// only part of it was pushed: the branch now stands at
     /// `pushed`, a first-parent ancestor of `head`, with `commits_left`
     /// first-parent commits to go. The next attempt follows at once. A
     /// warning.
@@ -209,7 +208,7 @@ pub enum Event {
         commits_left: usize,
     },
     /// A `[remote "<name>"]` section is invalid, so the remote is never
-    /// pushed; recording and other remotes carry on (design §11.1).
+    /// pushed; recording and other remotes carry on.
     RemoteMisconfigured { remote: String, error: String },
     /// A push attempt succeeded, including one with nothing new to send.
     PushSucceeded {
@@ -217,7 +216,7 @@ pub enum Event {
         head: Oid,
         previous: Option<Oid>,
     },
-    /// A queued patch was applied at mount (design §12). Not an alarm.
+    /// A queued patch was applied at mount. Not an alarm.
     PatchApplied {
         inbox: u64,
         patch: Oid,
@@ -226,7 +225,7 @@ pub enum Event {
     },
     /// A queued patch commit was already applied under an earlier inbox
     /// number, so it was consumed with a marker commit and not applied
-    /// again (design §12). Not an alarm.
+    /// again. Not an alarm.
     PatchDuplicate {
         inbox: u64,
         patch: Oid,
@@ -234,7 +233,7 @@ pub enum Event {
         applied_as: u64,
     },
     /// The patch queue stopped at a patch it could not apply; it and the
-    /// later ones stay queued (design §12).
+    /// later ones stay queued.
     PatchBlocked {
         inbox: u64,
         patch: Option<Oid>,
@@ -244,8 +243,8 @@ pub enum Event {
         /// Patches still queued, the blocked one included.
         queued: usize,
     },
-    /// An inbox entry the queue does not apply and that does not block it
-    /// (design §12): `stale` (numbered at or below the last applied patch,
+    /// An inbox entry the queue does not apply and that does not block it:
+    /// `stale` (numbered at or below the last applied patch,
     /// with another commit; the queue push deletes it on the remote) or
     /// `malformed`. A warning: a producer's change was not applied.
     PatchIgnored {
@@ -255,7 +254,7 @@ pub enum Event {
         why: String,
     },
     /// A patch set aside whole (held or not judged) while the queue goes
-    /// on (design §12; bead agentfs-mia.2): nothing of it is written, and
+    /// on (bead agentfs-mia.2): nothing of it is written, and
     /// it is judged again at the next run. An alarm.
     PatchHeld {
         inbox: u64,
@@ -268,7 +267,7 @@ pub enum Event {
         message: String,
     },
     /// The acceptance rule could not judge a patch (a hook that did not
-    /// start, failed, or ran out of time; design §12): the patch is not
+    /// start, failed, or ran out of time): the patch is not
     /// judged and stays queued. An alarm.
     PatchRuleFailed {
         inbox: u64,
@@ -285,7 +284,7 @@ pub enum Event {
         message: String,
     },
     /// A start did not land the patch queue because a workload may be
-    /// attached ([`crate::patch::attached`], design §12): the queue was
+    /// attached ([`crate::patch::attached`]): the queue was
     /// judged instead, and its patches stay queued for the next start with
     /// nothing attached. A warning.
     PatchQueueDeferred {
@@ -295,13 +294,13 @@ pub enum Event {
         queued: usize,
     },
     /// Fetching the patch queue from its remote failed; the queue ran with
-    /// what was already fetched (design §12).
+    /// what was already fetched.
     PatchFetchFailed {
         remote: String,
         kind: PushFailureKind,
         message: String,
     },
-    /// A fork wrote its finish commit (design §11.5): it takes no changes
+    /// A fork wrote its finish commit: it takes no changes
     /// from now on, and publishing starts. Raised once, when the finish
     /// commit is written. Not an alarm.
     ForkFinished {
@@ -310,11 +309,10 @@ pub enum Event {
         change: Option<Oid>,
     },
     /// A fork's fork remote holds its change and finish refs at exactly
-    /// their ids (design §11.5). Raised once, when the published mark is
+    /// their ids. Raised once, when the published mark is
     /// written. Not an alarm.
     ForkPublished { fork: String, remote: String },
-    /// A fork's fork remote refuses its publish for good (design §11.5,
-    /// `fork::finish::refused_reason`): the fork is refused, and nothing
+    /// A fork's fork remote refuses its publish for good (`fork::finish::refused_reason`): the fork is refused, and nothing
     /// retries it until an operator runs `agentfs fork finish --retry` or
     /// abandons it. Raised once, when the refusal is recorded.
     ForkRefused {
@@ -331,7 +329,7 @@ pub enum Event {
     /// published mark is written.
     ForkParentFinished { fork: String, parent: String },
     /// A fork published to its fork remote whose inbox there holds entries
-    /// its finished history did not land (design §12 "Forks of forks"):
+    /// its finished history did not land:
     /// most often a fork of it that finished after the fork's last queue
     /// run. The fork's change does not carry them, and nothing lands them;
     /// each stays at `refs/agentfs/<fork>/inbox/<n>` on the remote.
@@ -341,12 +339,12 @@ pub enum Event {
         remote: String,
         inboxes: Vec<u64>,
     },
-    /// An operator abandoned a fork on record (design §11.5): nothing
+    /// An operator abandoned a fork on record: nothing
     /// agentfs runs pushes it again, and DeleteVolume may proceed. Not an
     /// alarm.
     ForkAbandoned { fork: String, reason: String },
     /// A front could not reach its volume's history service, or the
-    /// service did not answer in time or refused it (design §14, §3.5):
+    /// service did not answer in time or refused it:
     /// the boundary failed with `EIO`. Raised once per outage, at its
     /// first failure; [`Event::HistoryServiceRestored`] ends it.
     HistoryServiceUnavailable { address: String, error: String },
@@ -356,7 +354,7 @@ pub enum Event {
     /// Records from a front whose pod no longer renders with the identity
     /// templates in force (they changed across a restart of the history
     /// service) are committed with the service's own committer, keeping
-    /// the pod's trailers (design §9, §14). A warning, once per pod.
+    /// the pod's trailers. A warning, once per pod.
     IdentityFallback { replica: String, error: String },
 }
 
@@ -377,8 +375,7 @@ impl Event {
         )
     }
 
-    /// True for what the telemetry layer turns into a log record (design
-    /// §13): every alarm, and a fork's lifecycle (finished, published,
+    /// True for what the telemetry layer turns into a log record: every alarm, and a fork's lifecycle (finished, published,
     /// abandoned), at INFO, so a fork's life is on record where its
     /// refusal is.
     pub fn is_logged(&self) -> bool {

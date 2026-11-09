@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# Starts an HTTP proxy for the end-to-end tests of proxy settings (design
-# §11.1): tinyproxy on 127.0.0.1:3128, in the foreground of a background
+# Starts an HTTP proxy for the end-to-end tests of proxy settings: tinyproxy on 127.0.0.1:3128, in the foreground of a background
 # job, allowing CONNECT to every port (no ConnectPort line) and logging
 # every request (LogLevel Info) to <dir>/tinyproxy.log.
 #

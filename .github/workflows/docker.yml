@@ -3,7 +3,7 @@ name: docker
 # The Docker examples (examples/docker, docs/docker.md): the image built
 # from this commit, then every example run on the runner with docker and
 # docker compose by ci/e2e-docker.sh, one job each, in parallel; and
-# upstream Hermes on the compose example (ci/e2e-hermes.sh, design §16).
+# upstream Hermes on the compose example (ci/e2e-hermes.sh).
 
 on:
   push:
@@ -84,7 +84,7 @@ jobs:
         run: ci/e2e-docker.sh diagnose
 
   # Bead agentfs-4do: restarting only the agentfs container under a running
-  # workload must not land queued patches under it (design §12); the log
+  # workload must not land queued patches under it; the log
   # shows what the workload saw.
   restart-patch:
     name: e2e (docker restart under a workload, queued patch)
@@ -108,7 +108,7 @@ jobs:
 
   # Bead agentfs-4af: upstream Hermes' published image on the compose
   # example, with its tool containers on docker-in-docker and a scripted
-  # model server (design §16, deployment.md §10).
+  # model server (deployment.md §10).
   hermes:
     name: e2e (docker compose, upstream Hermes)
     needs: build

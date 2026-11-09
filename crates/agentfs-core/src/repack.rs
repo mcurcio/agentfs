@@ -1,4 +1,4 @@
-//! Periodic repack of the history (design §8).
+//! Periodic repack of the history.
 //!
 //! Every commit writes its new blobs as loose objects, and a database in
 //! the fsync class is captured whole every `agentfs.coalesce`: without
@@ -28,8 +28,7 @@
 //! **Environment.** The child starts from an empty environment
 //! ([`crate::git_cli::command`]): a fixed `PATH`, `LC_ALL=C`, `HOME` set to
 //! the git directory, and the system and global git config switched off, so
-//! the CLI reads only the repository's own config, as libgit2 does (design
-//! §4.4), and nothing in the daemon's environment (`GIT_CONFIG_*`,
+//! the CLI reads only the repository's own config, as libgit2 does, and nothing in the daemon's environment (`GIT_CONFIG_*`,
 //! `GIT_EXEC_PATH`) reaches it.
 //!
 //! A repack runs on the commit thread, between commits, so it never races

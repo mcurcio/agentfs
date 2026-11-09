@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# End-to-end test of upstream Hermes (NousResearch/hermes-agent, design
-# §16, deployment.md §10) on an agentfs volume under Docker Compose:
+# End-to-end test of upstream Hermes (NousResearch/hermes-agent, design, deployment.md §10) on an agentfs volume under Docker Compose:
 # examples/docker/compose.yaml + compose.remote.yaml + ci/hermes/compose.yaml.
 # Hermes runs its published image as shipped, root start-up included, with
 # the mount at its data path; its docker terminal backend runs tool

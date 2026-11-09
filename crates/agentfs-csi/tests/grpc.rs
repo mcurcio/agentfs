@@ -1,5 +1,5 @@
 //! The CSI gRPC services end to end over a Unix socket: Identity,
-//! Controller and Node validation (design §14.2), with the error codes
+//! Controller and Node validation, with the error codes
 //! csi-sanity expects, the release decider against prepared `file://`
 //! remotes, and start classes.
 
@@ -452,7 +452,7 @@ async fn create_volume_refuses_what_it_does_not_support() {
 
 /// F8 R2: a start class starts a new worktree from a pinned commit of
 /// another worktree's branch, fetched once from the start remote, with
-/// each refusal's code (design §14.2 error table).
+/// each refusal's code.
 #[tokio::test]
 async fn create_volume_on_a_start_class() {
     let d = Driver::start().await;

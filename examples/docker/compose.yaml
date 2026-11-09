@@ -55,9 +55,9 @@ services:
       <<: *agentfs-env
       # Restarted after a crash: mount over the stale mount the dead daemon
       # left; the new mount reaches the workload through propagation, with
-      # no restart of the workload (design §17.1).
+      # no restart of the workload.
       AGENTFS_ON_STALE_MOUNT: recover
-      # The bare mount point becomes root's with mode 0000 (design §17.1).
+      # The bare mount point becomes root's with mode 0000.
       AGENTFS_SEAL_MOUNTPOINT: "true"
       # Point this at your collector instead (docs/telemetry.md).
       OTEL_SDK_DISABLED: "true"

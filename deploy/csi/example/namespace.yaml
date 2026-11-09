@@ -1,5 +1,5 @@
 # Workloads need no privilege with the CSI driver: their namespace can
-# enforce the restricted Pod Security standard (design §14.2).
+# enforce the restricted Pod Security standard.
 apiVersion: v1
 kind: Namespace
 metadata:

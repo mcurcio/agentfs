@@ -1,7 +1,6 @@
-//! `agentfs mount` refusals that need no FUSE device (design §1.1, §2.3,
-//! §18 test 5): every one happens before anything is mounted, so these run
+//! `agentfs mount` refusals that need no FUSE device: every one happens before anything is mounted, so these run
 //! anywhere. Real mounts are tested in `mount.rs`, in CI. Also `agentfs
-//! probe` on paths with no agentfs mount (design §17.1).
+//! probe` on paths with no agentfs mount.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -293,8 +292,8 @@ fn hold_without_a_stale_mount_behaves_like_refuse() {
     assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
 }
 
-/// `--seal-mountpoint` needs root, and says so before anything is mounted
-/// (design §17.1). Root (as in the FUSE job) seals instead: `mount.rs`.
+/// `--seal-mountpoint` needs root, and says so before anything is mounted.
+/// Root (as in the FUSE job) seals instead: `mount.rs`.
 #[test]
 fn seal_mountpoint_needs_root() {
     if rustix::process::geteuid().is_root() {

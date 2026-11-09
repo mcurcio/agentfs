@@ -1,4 +1,4 @@
-//! Serving the CSI services on a Unix socket (design §14.2, §17.2).
+//! Serving the CSI services on a Unix socket.
 
 use std::fs;
 use std::future::Future;

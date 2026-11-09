@@ -1,4 +1,4 @@
-//! Recording a change boundary (design §3.1, §3.2, §3.5).
+//! Recording a change boundary.
 //!
 //! The FUSE operations describe what changed as [`Change`]s on raw paths.
 //! [`Boundary::record`] classifies each path ([`crate::names`]): paths under
@@ -9,7 +9,7 @@
 //! [`Recorder::record`] as one record, synchronously, before the operation
 //! replies.
 //!
-//! When recording fails (design §3.5) the core has already raised
+//! When recording fails the core has already raised
 //! `RecordFailed`. FLUSH returns `EIO` and leaves the inode dirty, so the
 //! next boundary records it again. A namespace operation (rename, unlink,
 //! link, ...) has already changed the backing tree by then, so its paths go
@@ -24,7 +24,7 @@
 //! area is full), shutdown lists the paths: history differs from the
 //! backing tree there until each is changed again.
 //!
-//! A front of a history service (design §14) keeps its queue in its slot's
+//! A front of a history service keeps its queue in its slot's
 //! file, which the next front leasing the slot loads. Each entry keeps the
 //! pod that failed to record it (`@origin` lines), so a repair a front
 //! inherits from a dead predecessor is committed as that pod's
@@ -150,7 +150,7 @@ impl Boundary {
     }
 
     /// Keeps the repair queue in the file `store` from now on, first
-    /// loading what a previous mount left there (design §3.5). Returns how
+    /// loading what a previous mount left there. Returns how
     /// many paths were loaded.
     pub fn persist_repairs(&self, store: PathBuf) -> io::Result<usize> {
         // A crash between writing the new queue and renaming it over the
@@ -230,7 +230,7 @@ impl Boundary {
     }
 
     /// Records the rename of directory `from` to `to` as one move
-    /// ([`Recorder::record_move`], design §3.1). Repairs queued beneath
+    /// ([`Recorder::record_move`]). Repairs queued beneath
     /// `from` are queued again beneath `to`, where the files now are.
     /// [`MoveOutcome::Unsupported`] when either path is not one to record
     /// (inside a `.git`, or not a valid name) or the history service
@@ -283,7 +283,7 @@ impl Boundary {
     }
 
     /// Records an fsync-class group's members as one all-or-nothing record
-    /// ([`Recorder::record_group`], design §8). Returns whether anything was
+    /// ([`Recorder::record_group`]). Returns whether anything was
     /// journaled; a refusal is not an error.
     pub fn record_group(
         &self,
@@ -363,7 +363,7 @@ impl Boundary {
     }
 
     /// New content at `raw`, under `dir/.git`: silent if that `.git` is
-    /// git's own data, else `PathRefused`, once per `.git` (design §5).
+    /// git's own data, else `PathRefused`, once per `.git`.
     fn check_git_dir(&self, dir: &[u8], raw: &[u8]) {
         {
             let known = self.git_dirs();
@@ -398,7 +398,7 @@ impl Boundary {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Queues `paths` for the sweep to re-derive and record (design §3.5),
+    /// Queues `paths` for the sweep to re-derive and record,
     /// and saves the queue.
     pub fn queue_repair(&self, paths: impl IntoIterator<Item = Vec<u8>>, caller: Caller) {
         let mut repairs = self.lock();

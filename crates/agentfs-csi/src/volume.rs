@@ -1,7 +1,7 @@
 //! Worktrees on this node's disk: creating one (CreateVolume: an empty
 //! one, one started from another worktree's branch, or a fork), adopting
 //! one through a static PV, the profile's rules, and the access modes the
-//! driver supports (design §14.2).
+//! driver supports.
 //!
 //! A worktree is a volume while `<base>/<handle>/csi.json` exists. It is
 //! written last, after the backing tree and the state area, so a
@@ -32,7 +32,7 @@ use crate::records::{self, VolumeRecord};
 /// it is recorded. `ci/e2e-csi.sh` waits for "multi-node" in it.
 pub const MULTI_NODE: &str = "multi-node access modes are not supported: an agentfs volume is \
                               used from one node at a time; pods on other nodes read its \
-                              history from the remote it pushes to (design §19.1, 2026-10-15)";
+                              history from the remote it pushes to (2026-10-15)";
 
 /// The access modes the driver supports: one node at a time.
 pub const SUPPORTED_MODES: [Mode; 4] = [
@@ -246,8 +246,7 @@ pub fn reopen_error(layout: &Layout, node_id: &str, e: volume::VolumeError) -> E
     }
 }
 
-/// Creates a fork of `source_handle` (CreateVolume with a fork class,
-/// design §11.5): directories as [`create`], then
+/// Creates a fork of `source_handle` (CreateVolume with a fork class): directories as [`create`], then
 /// [`agentfs_core::fork::create::create`] with the source profile's config
 /// as the fork's include, an unlinked fork class's `remotes` profile's
 /// config as its own remotes, the source's profile rules, and `csi.json`
@@ -456,7 +455,7 @@ mod tests {
             MULTI_NODE,
             "multi-node access modes are not supported: an agentfs volume is used from one node \
              at a time; pods on other nodes read its history from the remote it pushes to \
-             (design §19.1, 2026-10-15)"
+             (2026-10-15)"
         );
     }
 

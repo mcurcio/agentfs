@@ -2,40 +2,40 @@
 //!
 //! `mount` mounts a backing tree through the FUSE layer (`agentfs_fuse`)
 //! and runs the commit and push loops in the same process until SIGINT,
-//! SIGTERM or an unmount (design §17.1). `record` records paths from a
+//! SIGTERM or an unmount. `record` records paths from a
 //! directory directly, through the same recorder, including its path rules:
 //! paths the rules exclude are reported as skipped, with the reason.
 //!
 //! `push` pushes once to the configured remotes, or asks a running daemon
 //! (`mount`, `run`, `serve-history`) to commit and push now over its
-//! control socket ([`push_now`], design §2.3); `run` runs the commit and
-//! push loops in the foreground until SIGINT or SIGTERM (design §11.2).
+//! control socket ([`push_now`]); `run` runs the commit and
+//! push loops in the foreground until SIGINT or SIGTERM.
 //!
 //! `restore` and `revert` write content from history back into the tree,
-//! recorded as one commit (design §15; [`recovery`]).
+//! recorded as one commit ([`recovery`]).
 //!
 //! `init` creates a state area or accepts one that already belongs to the
 //! volume, so a pod can run it at every start; `probe` reports whether a
 //! mount point holds a live agentfs mount, for Kubernetes probes; and
 //! `mount --on-stale-mount recover` makes a sidecar restarted after a crash
 //! mount over the stale mount its predecessor left, and `hold` makes it
-//! wait for a pod restart instead ([`hold`], design §17.1).
+//! wait for a pod restart instead ([`hold`]).
 //!
 //! `serve-history` is a volume's history service and `mount
 //! --history-service` and `record --history-service` are its fronts, one
-//! per pod (design §14; [`serve_history`], [`front`]): the service is the
+//! per pod ([`serve_history`], [`front`]): the service is the
 //! only writer of the journal and branch, and each front records its pod's
 //! changes through it, carrying its pod's committer.
 //!
 //! `mount`, `run`, `record`, `flush`, `serve-history`, and `push`,
 //! `restore` and `revert` when no daemon answers, take the state-area lock
-//! (design §2.3) and exit 75 while another process holds it; fronts take
+//! and exit 75 while another process holds it; fronts take
 //! no lock; `status` is read-only and takes no lock.
 //!
 //! `fork create` makes a fork of a volume, `fork finish` finishes and
 //! publishes it, `fork status` reads its state, `fork abandon` discards it
 //! on record and `fork list` lists the published changes on a fork remote
-//! ([`fork_cmd`], design §11.5). A finished fork is read-only: `mount`
+//! ([`fork_cmd`]). A finished fork is read-only: `mount`
 //! (but not a front), `run`, `record`, `restore`, `revert` and `patch
 //! apply` refuse it.
 //!
@@ -44,12 +44,12 @@
 //! agentfs-mia.9): it takes no lock, and its hooks judge each push.
 //!
 //! `start accept --tip OID` accepts a tip of the branch a volume started
-//! from, clearing the start-branch alarm ([`start_cmd`], design §11.3); it
+//! from, clearing the start-branch alarm ([`start_cmd`]); it
 //! takes no lock.
 //!
 //! `mount`, `flush`, `record`, `push` and `run` export telemetry over OTLP
 //! when the standard `OTEL_*` variables configure an endpoint (see
-//! [`otel`], design §13); alarms are also printed to stderr. `init` and
+//! [`otel`]); alarms are also printed to stderr. `init` and
 //! `status` export nothing.
 
 mod checkpoint_cmd;
@@ -102,13 +102,13 @@ use agentfs_fuse::{
 };
 
 /// Most stale layers a stop (or a hold) detaches at the mount point: one
-/// per crash recovered by stacking (design §17.1).
+/// per crash recovered by stacking.
 pub const STALE_LAYERS: usize = 16;
 
 use crate::daemon::{Daemon, Wake};
 
 /// `--version`: the package version, with `+failpoints` in a test build
-/// with failpoints compiled in (design §18 test 3), so such a binary is
+/// with failpoints compiled in, so such a binary is
 /// never mistaken for a release.
 #[cfg(not(feature = "failpoints"))]
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -127,7 +127,7 @@ struct Cli {
     #[arg(long, global = true, env = "AGENTFS_ROOT")]
     root: Option<PathBuf>,
     /// How long to wait for another agentfs process to release the state
-    /// area (every command that writes it takes it; design §2.3). By
+    /// area (every command that writes it takes it). By
     /// default a busy state area exits 75 at once.
     #[arg(long, global = true, env = "AGENTFS_WAIT_LOCK", default_value = "0s", value_parser = parse_grace, value_name = "DURATION")]
     wait_lock: Duration,
@@ -150,8 +150,7 @@ enum Command {
         /// History branch (default: agentfs/<volume>).
         #[arg(long)]
         branch: Option<String>,
-        /// An operator config fragment to include (`include.path`, design
-        /// §4.3); repeatable. When given, these become exactly the
+        /// An operator config fragment to include (`include.path`, design); repeatable. When given, these become exactly the
         /// state area's includes.
         #[arg(long = "include", value_name = "FILE")]
         includes: Vec<PathBuf>,
@@ -162,7 +161,7 @@ enum Command {
     Flush(Pod),
     /// Record the current state of PATHs under ROOT, then commit. With
     /// --history-service, record through the history service instead,
-    /// which commits them (design §14).
+    /// which commits them.
     Record {
         /// Paths relative to ROOT. A missing path is recorded as removed. A
         /// path in the fsync class records its whole group (database,
@@ -176,7 +175,7 @@ enum Command {
     },
     /// Serve the volume's history to fronts (`mount --history-service`)
     /// until SIGINT or SIGTERM: the only writer of the journal and the
-    /// branch, with the commit and push loops (design §14). Needs --root,
+    /// branch, with the commit and push loops. Needs --root,
     /// the backing tree the fronts mount. A second signal exits at once.
     ServeHistory {
         /// Where to listen: `unix:<path>` or an absolute socket path
@@ -259,7 +258,7 @@ enum Command {
     },
     /// Write PATH (a file, symlink or directory, or `.` for the whole
     /// tree) back as it was in COMMIT, removing what COMMIT did not have
-    /// there; recorded as one commit (design §15). Goes through a running
+    /// there; recorded as one commit. Goes through a running
     /// mount or history service when there is one; otherwise writes --root
     /// directly.
     Restore {
@@ -277,7 +276,7 @@ enum Command {
         pod: Pod,
     },
     /// Undo COMMIT's changes (against its first parent); recorded as one
-    /// commit (design §15). Through a running mount or history service when
+    /// commit. Through a running mount or history service when
     /// there is one; otherwise writes --root directly.
     Revert {
         /// A commit on the volume's branch (any git revision syntax).
@@ -300,7 +299,7 @@ enum Command {
     /// Report what is mounted at MOUNTPOINT: a live agentfs mount (exit 0),
     /// a stale one whose daemon died, nothing, or another filesystem (exit
     /// 1). Takes no lock and reads no state area: for startup and readiness
-    /// probes (design §17.1).
+    /// probes.
     Probe {
         mountpoint: PathBuf,
         /// Exit 0 for a stale agentfs mount too (a sidecar holding after a
@@ -312,25 +311,25 @@ enum Command {
         #[arg(long)]
         sandbox_overlay: bool,
     },
-    /// The patch queue (design §12): submit a patch for a volume, apply
+    /// The patch queue: submit a patch for a volume, apply
     /// the queue now, or show it.
     Patch {
         #[command(subcommand)]
         command: patch_cmd::PatchCommand,
     },
-    /// The local Git LFS object cache (design §7): fetch the objects
+    /// The local Git LFS object cache: fetch the objects
     /// commits reference, or prune those every remote holds.
     Lfs {
         #[command(subcommand)]
         command: lfs_cmd::LfsCommand,
     },
-    /// Forked volumes (design §11.5, §19.1): create a fork; finish and
+    /// Forked volumes: create a fork; finish and
     /// publish it.
     Fork {
         #[command(subcommand)]
         command: fork_cmd::ForkCommand,
     },
-    /// A volume started from another branch (F8, design §11.3): accept a
+    /// A volume started from another branch (F8): accept a
     /// tip of that branch, which clears the start-branch alarm.
     Start {
         #[command(subcommand)]
@@ -349,7 +348,7 @@ enum ServeGitHook {
     Arrived,
 }
 
-/// Being a front of a history service (design §14).
+/// Being a front of a history service.
 #[derive(Args)]
 struct HistoryArgs {
     /// Record through the history service at ADDR (`unix:<path>` or an
@@ -367,7 +366,7 @@ struct HistoryArgs {
     /// Prefer pending slot N (1..=1023) when leasing as a front, else the
     /// lowest free slot. A front restarted after a crash passes its
     /// predecessor's slot so it drains that slot's repairs (the CSI
-    /// driver does this, design §14.2).
+    /// driver does this).
     #[arg(long, env = "AGENTFS_HISTORY_SLOT", value_name = "N", value_parser = clap::value_parser!(u16).range(1..=1023))]
     history_slot: Option<u16>,
 }
@@ -467,7 +466,7 @@ fn real_main() -> Result<ExitCode> {
         )?,
         Command::Status(_pod) => {
             // Read-only: no recovery, no lock, so it is safe beside a
-            // running `mount` or `run` (design §2.3).
+            // running `mount` or `run`.
             let (history, inspection) = volume::inspect(&state)
                 .with_context(|| format!("opening {}", state.root().display()))?;
             println!("volume:    {}", history.settings().volume);
@@ -643,7 +642,7 @@ fn real_main() -> Result<ExitCode> {
             pod,
         } => {
             // A lease push is always direct, under the remote's push lock
-            // only: never through a daemon, never the state lock (§15).
+            // only: never through a daemon, never the state lock.
             if let Some(lease) = force_with_lease {
                 let session = Session::start(&state, &pod)?;
                 let code = push_with_lease(&state, &remotes, &lease, &session)?;
@@ -661,7 +660,7 @@ fn real_main() -> Result<ExitCode> {
                 println!("{LOCAL_ONLY_PUSH}");
                 return Ok(ExitCode::SUCCESS);
             }
-            // A running daemon pushes for us (design §2.3).
+            // A running daemon pushes for us.
             if let Some(code) = push_now::client(&state, &remotes, timeout) {
                 return Ok(code);
             }
@@ -726,7 +725,7 @@ fn real_main() -> Result<ExitCode> {
         Command::Start { command } => return start_cmd::run(command, &state),
         Command::Mount(args) => {
             let daemon = Daemon::start()?;
-            // A restarted sidecar whose daemon died (design §17.1): the
+            // A restarted sidecar whose daemon died: the
             // mount point, the sandbox overlay's, or both, are stale.
             let stale = stale_source(&args.mountpoint);
             let overlay_stale = args.sandbox_overlay.as_deref().and_then(stale_source);
@@ -773,7 +772,7 @@ fn real_main() -> Result<ExitCode> {
                 return front::mount_front(daemon, &state, cli.root.as_deref(), &args, address);
             }
             // A front of a finished fork mounts (the CSI node plugin binds
-            // it read-only, design §11.5); its history service refuses
+            // it read-only); its history service refuses
             // every record.
             refuse_finished(&state)?;
             // The dead daemon's lock went with it.
@@ -807,7 +806,7 @@ fn detach_layers_left(at: &Path) -> bool {
     }
 }
 
-/// A finished fork is read-only (design §11.5): `mount`, `run`, `record`,
+/// A finished fork is read-only: `mount`, `run`, `record`,
 /// `restore`, `revert` and `patch apply` refuse it before they change
 /// anything. Any other problem opening the state area is the command's own
 /// to report.
@@ -818,8 +817,8 @@ fn refuse_finished(state: &StateDir) -> Result<()> {
     }
 }
 
-/// `agentfs init`: creates the state area or checks an existing one
-/// (design §2.3, §17.1), and creates `--root` when it is missing.
+/// `agentfs init`: creates the state area or checks an existing one,
+/// and creates `--root` when it is missing.
 fn init(
     state: &StateDir,
     root: Option<&Path>,
@@ -916,8 +915,7 @@ fn push_once(state: &StateDir, only: &[String], session: &Session) -> Result<Exi
     for remote in selected {
         let mut pusher =
             RemotePusher::open(state, settings, remote, events.clone(), session.telemetry())?;
-        // A backlog over the push size limit goes out in steps (design
-        // §11.3): each limited step is followed at once by the next.
+        // A backlog over the push size limit goes out in steps: each limited step is followed at once by the next.
         let mut outcome = pusher.push_once();
         while outcome.is_limited() {
             println!("{}: {}", remote.name, describe(&outcome));
@@ -937,7 +935,7 @@ fn push_once(state: &StateDir, only: &[String], session: &Session) -> Result<Exi
     })
 }
 
-/// `agentfs push --force-with-lease OID` (§15; the divergence and
+/// `agentfs push --force-with-lease OID` (the divergence and
 /// history-rewrite runbooks): replaces this volume's own branch on exactly
 /// one remote with the local head, if the remote holds `lease`, it shares
 /// a commit with the head, and the commits it would drop are no
@@ -1083,8 +1081,7 @@ fn describe(outcome: &PushOutcome) -> String {
 /// What `agentfs push` prints for a local-only volume (no remote section).
 const LOCAL_ONLY_PUSH: &str = "local-only: nothing to push";
 
-/// `agentfs status`'s `remotes:` line: the volume's remotes mode (design
-/// §11.1).
+/// `agentfs status`'s `remotes:` line: the volume's remotes mode.
 fn remotes_line(remotes: &Remotes) -> String {
     match remotes {
         Remotes::Pushed(list) => format!("{} pushed", list.len()),
@@ -1155,8 +1152,7 @@ fn run(
     let names: Vec<String> = pushers.iter().map(|p| p.name().to_owned()).collect();
     let applier = patch_cmd::Applier::new(&committer, events.clone(), session.telemetry());
     let service = Service::start(committer, pushers, events).context("starting the service")?;
-    // `agentfs push` asks it to push now; restores are refused (design
-    // §2.3).
+    // `agentfs push` asks it to push now; restores are refused.
     let control = start_control(
         state,
         push_now::handler(
@@ -1195,7 +1191,7 @@ fn misconfigured(settings: &agentfs_core::config::Settings) -> Vec<(String, Stri
         .collect()
 }
 
-/// Starts the control socket (design §2.2), or warns: the daemon works
+/// Starts the control socket, or warns: the daemon works
 /// without it, but `agentfs push` then pushes directly and the lock
 /// refuses it.
 fn start_control(state: &StateDir, handler: control::Handler) -> Option<control::Server> {
@@ -1258,7 +1254,7 @@ fn describe_wake(wake: Wake) -> String {
 }
 
 /// Stops the service: the final commit, then one final push of what the
-/// remotes lack, within `push_grace` (design §11.2). Exit status 1 if the
+/// remotes lack, within `push_grace`. Exit status 1 if the
 /// final commit failed.
 fn stop_service(service: Service, push_grace: Duration) -> ExitCode {
     report_stop(service.shutdown(push_grace))
@@ -1339,7 +1335,7 @@ struct MountArgs {
     /// restarted sidecar: mount nothing, wait for SIGTERM, then detach the
     /// stale mount) or `recover` (a restarted sidecar: mount over the stale
     /// mount, so the workload's copies of it reach the new daemon; needs
-    /// CAP_SYS_ADMIN; design §17.1).
+    /// CAP_SYS_ADMIN).
     #[arg(
         long,
         env = "AGENTFS_ON_STALE_MOUNT",
@@ -1351,13 +1347,13 @@ struct MountArgs {
     /// mounting: owned by root, mode 0000, so a non-root workload that
     /// reaches it while no daemon is mounted (a `subPath` bound while the
     /// sidecar restarts) gets EACCES instead of writing where nothing
-    /// records it. Needs root (design §17.1).
+    /// records it. Needs root.
     #[arg(long, env = "AGENTFS_SEAL_MOUNTPOINT")]
     seal_mountpoint: bool,
     /// Where a workload sees the mount when not at MOUNTPOINT (a container's
     /// `mountPath`): `PATH`, or `PATH=DIR` for the tree's directory DIR (a
     /// `subPath`). Absolute `gitdir:` targets under it, written by `git
-    /// worktree add`, then map exactly (design §5). Repeatable; the variable
+    /// worktree add`, then map exactly. Repeatable; the variable
     /// takes a comma-separated list.
     #[arg(
         long = "workload-mount",
@@ -1475,7 +1471,7 @@ fn describe_overlay(mounted: &Mount, args: &MountArgs) -> String {
     }
 }
 
-/// Where workloads see the tree before it is mounted (design §5): the mount
+/// Where workloads see the tree before it is mounted: the mount
 /// point and `--workload-mount`.
 fn workload_views(mountpoint: &Path, args: &MountArgs) -> Vec<agentfs_core::nested::View> {
     mountpoint
@@ -1487,7 +1483,7 @@ fn workload_views(mountpoint: &Path, args: &MountArgs) -> Vec<agentfs_core::nest
 }
 
 /// Adds the other mounts of the mount at `mountpoint` this namespace shows
-/// (bind mounts) to the views (design §5).
+/// (bind mounts) to the views.
 fn add_mounted_views(mountpoint: &Path) {
     match agentfs_fuse::views::mounted_views(mountpoint) {
         Ok(views) => agentfs_core::nested::add_views(views),
@@ -1514,7 +1510,7 @@ enum OnStaleMount {
 /// Why `--on-stale-mount recover` cannot stack over a stale mount here.
 fn recover_refusal(args: &MountArgs) -> Option<&'static str> {
     if args.history.history_service.is_some() {
-        // A front's mount is the CSI driver's to stack (design §14.2).
+        // A front's mount is the CSI driver's to stack.
         Some("fronts (--history-service) do not recover in place")
     } else if !agentfs_fuse::privileges::Privileges::current().can_unmount() {
         Some("stacking a mount needs CAP_SYS_ADMIN (run as root)")
@@ -1612,8 +1608,8 @@ fn create_mountpoint(mountpoint: &Path, kind: MountKind) -> Result<()> {
     }
 }
 
-/// `--seal-mountpoint`: makes the bare mount point root's with mode 0000
-/// (design §17.1). The mount on top is unaffected; what it hides is a
+/// `--seal-mountpoint`: makes the bare mount point root's with mode 0000.
+/// The mount on top is unaffected; what it hides is a
 /// directory no non-root process (nor root without `CAP_DAC_OVERRIDE`) can
 /// write, so a workload that binds it while no daemon is mounted (a
 /// `subPath` bound while the sidecar restarts) gets EACCES instead of
@@ -1707,7 +1703,7 @@ fn mount(
     agentfs_core::nested::add_views(workload_views(&mountpoint, args));
     let events = session.events.clone();
     let (recorder, committer, recovery) = session.open(state, &backing, &args.pod)?;
-    // The patch queue, before anything can see the tree (design §12): it
+    // The patch queue, before anything can see the tree: it
     // lands only when the last mount stopped with nothing attached, or was
     // another pod's while this mount point is in this pod's own volume,
     // and no stale mount is below this one; otherwise it is judged and
@@ -1785,9 +1781,9 @@ fn mount(
             return Err(e.into());
         }
     };
-    // Restores and reverts through the mount (design §15). Without the
+    // Restores and reverts through the mount. Without the
     // socket the mount still works; restores then need it stopped.
-    // `agentfs push` through it too (design §2.3).
+    // `agentfs push` through it too.
     let control = start_control(
         state,
         push_now::handler(
@@ -1872,7 +1868,7 @@ fn mount(
     }
     // Nothing attached: the unmount was not busy, no file stayed open and
     // no stale layer (which a workload may still hold) was below. Else the
-    // mark stays, and the next mount holds the patch queue (design §12).
+    // mark stays, and the next mount holds the patch queue.
     if report.unmount_errors.is_empty() && !report.lazy && !report.session_abandoned && !stale_left
     {
         clear_attached(state);
@@ -1894,7 +1890,7 @@ fn mount(
     Ok(if failed { ExitCode::FAILURE } else { code })
 }
 
-/// Removes the attached mark (design §12): a mount stopped with nothing
+/// Removes the attached mark: a mount stopped with nothing
 /// attached. A failure leaves it, and the next mount holds the queue.
 fn clear_attached(state: &StateDir) {
     if let Err(e) = attached::clear(state) {
@@ -1973,8 +1969,7 @@ fn volume_name(state: &StateDir) -> Result<String> {
         .clone())
 }
 
-/// Telemetry and alarms for one command on an existing volume (design
-/// §13). Telemetry is flushed when this is dropped, waiting at most
+/// Telemetry and alarms for one command on an existing volume. Telemetry is flushed when this is dropped, waiting at most
 /// [`otel::TELEMETRY_SHUTDOWN_GRACE`]; declare it before anything that
 /// records, so it is dropped after them.
 struct Session {
@@ -2039,7 +2034,7 @@ fn record_paths(recorder: &volume::Recorder, root: &Path, paths: &[String]) -> R
     let mut groups_done = std::collections::HashSet::new();
     for path in paths {
         // A path in the fsync class records its whole group as one
-        // record (design §8).
+        // record.
         if let Ok(repo_path) = RepoPath::new(path.as_str())
             && let Some(group) = recorder.fsync_group(&repo_path)
         {
@@ -2091,7 +2086,7 @@ fn record_paths(recorder: &volume::Recorder, root: &Path, paths: &[String]) -> R
     }
     Ok(())
 }
-/// Prints alarms (design §13) to stderr, alongside any telemetry export.
+/// Prints alarms to stderr, alongside any telemetry export.
 fn stderr_sink() -> Events {
     Arc::new(|event: Event| {
         if event.is_alarm() {

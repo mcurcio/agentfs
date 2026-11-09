@@ -1,5 +1,5 @@
 //! `agentfs start`: a started volume's answer to the start-branch alarm
-//! (design §11.3, F8 D2; docs/runbooks/start-branch-moved.md).
+//! (F8 D2; docs/runbooks/start-branch-moved.md).
 //!
 //! `start accept --tip OID` saves OID, a commit of the branch this volume
 //! started from, as `refs/agentfs/<volume>/accepted/<OID>`

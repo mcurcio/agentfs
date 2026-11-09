@@ -1,4 +1,4 @@
-# A workload with agentfs as a phase 1 native sidecar (design §17.1). The
+# A workload with agentfs as a phase 1 native sidecar. The
 # layout and every choice here are explained in docs/deployment.md.
 #
 #   /data                 the PVC: backing/ (the files) and state/ (history)
@@ -66,13 +66,13 @@ spec:
             # Restarted by the kubelet after a crash: mount over the stale
             # mount the dead daemon left, so the workload's copies of it
             # (and subPath binds) reach the new daemon with no manual step
-            # (design §17.1, docs/runbooks/crashed-sidecar.md). `hold`
+            # (docs/runbooks/crashed-sidecar.md). `hold`
             # instead waits for you to restart the pod.
             - { name: AGENTFS_ON_STALE_MOUNT, value: recover }
             # The bare /agentfs/workspace (what a workload sees while no
             # daemon is mounted) becomes root's with mode 0000: a non-root
             # workload whose subPath is bound in that gap gets EACCES
-            # instead of writing where nothing records it (design §17.1).
+            # instead of writing where nothing records it.
             - { name: AGENTFS_SEAL_MOUNTPOINT, value: "true" }
             # Commit trailers, committer identity and telemetry resource.
             - name: AGENTFS_POD

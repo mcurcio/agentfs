@@ -1,6 +1,6 @@
 name: power-loss
 
-# Power loss and fsync ordering (design §3.3, §18 test 3): ci/power-loss.sh
+# Power loss and fsync ordering: ci/power-loss.sh
 # runs `agentfs record` and `agentfs push` on ext4 and XFS over
 # dm-log-writes, then replays the log with xfstests' replay-log (pinned,
 # ci/install-replay-log.sh) and checks the state a power cut would leave

@@ -1,5 +1,5 @@
 //! The set of tracked paths: what history will contain once every durable
-//! record is committed (design §4).
+//! record is committed.
 //!
 //! This plays the part of git's index. Ignore rules and nested-repository
 //! exclusion only apply to paths that are not tracked, and a path counts as
@@ -10,7 +10,7 @@
 //! It is a tree of path components, so a move ([`Change::Move`], a
 //! directory rename) detaches one subtree and attaches it elsewhere: its
 //! cost depends on the depth of the two paths, not on how many paths are
-//! beneath them (design §3.1).
+//! beneath them.
 
 use std::collections::BTreeMap;
 use std::sync::RwLock;

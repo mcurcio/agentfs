@@ -1,11 +1,11 @@
-//! Checks the documentation against the code (design §4.2, §4.3):
+//! Checks the documentation against the code:
 //!
 //! - every git config key agentfs reads ([`config::KEYS`]) has a row in
 //!   its section of docs/configuration.md, and every key row there is a
 //!   key agentfs reads;
 //! - the same for the operator attributes ([`rules::OPERATOR_ATTRIBUTES`]);
 //! - every relative link and `#anchor` in README.md and docs/ resolves;
-//! - every CI job runs on the pinned runner, `ubuntu-24.04` (design §18);
+//! - every CI job runs on the pinned runner, `ubuntu-24.04`;
 //! - every script under ci/ is executable;
 //! - every page under docs/ is in the book's docs/SUMMARY.md;
 //! - every `git push` in a runbook writes only refs literally under
@@ -353,7 +353,7 @@ fn slugs_follow_github() {
     );
 }
 
-/// The runner every CI job uses (design §18). Pinned, not `-latest`, so a
+/// The runner every CI job uses. Pinned, not `-latest`, so a
 /// new image cannot change the kernel, FUSE, kind or nginx under the
 /// tests.
 const RUNNER: &str = "ubuntu-24.04";
@@ -543,11 +543,11 @@ fn shell_words(line: &str) -> Vec<String> {
 /// Why the `git push` whose arguments (after `push`) are `args` breaks the
 /// runbooks' push rule, if it does (F8 S2): a runbook writes only refs
 /// literally under `refs/agentfs/`, and never forces. A volume's own
-/// branch is replaced only by `agentfs push --force-with-lease` (§15).
+/// branch is replaced only by `agentfs push --force-with-lease`.
 /// Two leases are allowed, each on a destination of the same push
 /// literally under `refs/agentfs/`: the create-only one,
 /// `--force-with-lease=<ref>:` with an empty expected value (patch
-/// submission, §12 and §19.1), which can create a ref, never replace one;
+/// submission), which can create a ref, never replace one;
 /// and `--force-with-lease=<ref>:<oid>` on a ref the push deletes
 /// (`--delete`, or a `:<ref>` refspec), which deletes it only while it
 /// holds the oid listed (history rewrite, step 9).

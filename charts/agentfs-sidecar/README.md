@@ -1,6 +1,6 @@
 # agentfs-sidecar
 
-Helpers that add agentfs to a workload's chart as a phase 1 native sidecar (design §17.1): its containers, volumes, settings and claim.
+Helpers that add agentfs to a workload's chart as a phase 1 native sidecar: its containers, volumes, settings and claim.
 
 Generated from `values.yaml` by [helm-docs](https://github.com/norwoodj/helm-docs)
 (`helm-docs --chart-search-root charts`); CI fails when it is stale. How to
@@ -33,12 +33,12 @@ Each takes this library's values, e.g.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| claim.accessModes | list | `["ReadWriteOncePod"]` | Its access modes. ReadWriteOncePod makes this pod the single writer (design §2.3). |
+| claim.accessModes | list | `["ReadWriteOncePod"]` | Its access modes. ReadWriteOncePod makes this pod the single writer. |
 | claim.name | string | `"agentfs-data"` | The claim holding the backing tree and the state area, mounted at `/data` in the agentfs containers only. |
 | claim.size | string | `"10Gi"` | Its size. |
 | claim.storageClassName | string | `""` | Its StorageClass; empty means the cluster default. XFS or btrfs make recording cost the same whatever a file's size (reflinks). |
-| config.attributes | string | `""` | Mounted over `<state>/git/info/attributes`: agentfs attributes (design §4.2). |
-| config.exclude | string | `""` | Mounted over `<state>/git/info/exclude`: paths never recorded when new (design §4.1). |
+| config.attributes | string | `""` | Mounted over `<state>/git/info/attributes`: agentfs attributes. |
+| config.exclude | string | `""` | Mounted over `<state>/git/info/exclude`: paths never recorded when new. |
 | config.name | string | `"agentfs-config"` | The ConfigMap the helpers render and mount. |
 | config.settings | string | `""` | Operator settings and remotes, included from the state area's config (git-config syntax; every key is in docs/configuration.md). Must not set agentfs.volume or agentfs.branch. |
 | credentials.secretName | string | `"agentfs-credentials"` | The Secret mounted at `/run/secrets/agentfs` in the sidecar. Create it out of band, or set `stringData` for the helpers to render it. |
@@ -49,11 +49,11 @@ Each takes this library's values, e.g.
 | image.repository | string | `"ghcr.io/mcurcio/agentfs"` | The agentfs image. |
 | image.tag | string | `""` | Its tag: required unless `digest` is set. Pin a commit tag (`<40-char sha>`); `latest` follows main. |
 | labels | object | `{}` | Labels of the ConfigMap, Secret and claim the helpers render. |
-| onStaleMount | string | `"recover"` | What the sidecar does on a stale mount after a crash: `recover` mounts over it, `hold` waits for a pod restart (design §17.1). |
+| onStaleMount | string | `"recover"` | What the sidecar does on a stale mount after a crash: `recover` mounts over it, `hold` waits for a pod restart. |
 | resources | object | `{"limits":{"memory":"512Mi"},"requests":{"cpu":"50m","memory":"64Mi"}}` | The sidecar's resources. An OOM kill is a crash: size the limit for the volume. |
-| sandboxOverlay.enabled | bool | `false` | Also serve the sandbox overlay (design §2.4, docs/deployment.md §12): a second mount point of the volume, at `<mountPath>/overlay`, that shows only the files the operator's rules would record. Give it to a container that starts other containers, with `agentfs-sidecar.sandboxOverlayMount`, never the main mount. |
+| sandboxOverlay.enabled | bool | `false` | Also serve the sandbox overlay (docs/deployment.md §12): a second mount point of the volume, at `<mountPath>/overlay`, that shows only the files the operator's rules would record. Give it to a container that starts other containers, with `agentfs-sidecar.sandboxOverlayMount`, never the main mount. |
 | sandboxOverlay.mountPath | string | `"/agentfs-sandbox"` | Where the sidecar mounts that emptyDir; it must not be `/agentfs` or inside it (the two mount points may not share a parent). |
 | sandboxOverlay.owner | string | `""` | The view owner, `UID:GID` (required when enabled): every operation through the overlay is checked and done as this user, whoever the sandbox runs as. |
 | sandboxOverlay.volumeName | string | `"agentfs-sandbox"` | The emptyDir holding the overlay's mount point. |
-| sealMountpoint | bool | `true` | Seal the bare mount point (root's, mode 0000) so a non-root workload cannot write where nothing records it (design §17.1). |
-| volume | string | `""` | The agentfs volume name (required); the history branch is `agentfs/<volume>` (design §4.3). |
+| sealMountpoint | bool | `true` | Seal the bare mount point (root's, mode 0000) so a non-root workload cannot write where nothing records it. |
+| volume | string | `""` | The agentfs volume name (required); the history branch is `agentfs/<volume>`. |

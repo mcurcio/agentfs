@@ -291,7 +291,7 @@ Review provenance before behaviour. For every finding, name the ledger rule that
 
 ## Phase 1: the model as the conformance suite
 
-[Phase 1](../../docs/target-architecture/phase-1.md) builds the proposed design so real end-to-end tests can
+[The tree library](../../docs/trees.md) builds the proposed design so real end-to-end tests can
 validate this model. The scenario bodies assert on the model's internals, so they are not ported. **The model runs
 them unchanged and records each call plus what each tree showed (`src/calls.rs`); the same calls replay against the
 real library and real mounts (`crates/agentfs-conformance`); the real run must show the same, and passes invariants
@@ -342,7 +342,7 @@ in `.github/workflows/phase-1.yml` are what passes: 74 and 94 on the library, an
 not mountable. Library and model replay every in-scope trace. `[phase1-seeds]` in a pushed commit message, or a manual run, replays
 the phase 1 generators at seeds 1 to 500 on the library, in four shards (`ci/replay-seeds.sh`): too slow for every push, and fast
 enough for a job. `[phase1-measure]` runs every measurement mode, and `[phase1-held]`, `[phase1-calls]` or
-`[phase1-pilot]` one; the [handoff](../../docs/target-architecture/phase-1-handoff.md) has each exit row's run.
+`[phase1-pilot]` one; the [tree views page](../../docs/trees.md#how-it-is-verified) has each exit row's run.
 
 A mismatch is a finding (MODEL.md), never a change to either side without a ledger rule. Its traces
 go in `crates/agentfs-conformance/open-findings.txt` with its number and must keep failing, as an ignored test must, and

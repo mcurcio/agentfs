@@ -1,4 +1,4 @@
-//! Creating a fork (design §19.1, "Forked volumes"): from a source's state
+//! Creating a fork: from a source's state
 //! area, read without the source's lock and with no credentials, so the
 //! CSI controller can run it inside CreateVolume.
 //!
@@ -8,7 +8,7 @@
 //! fork, a fork whose history is hidden, or a fork of a local-only source.
 //! A fork of a fork records `agentfs.fork.sourceIsFork`. It then
 //! makes the fork's state area: the identity in the fork's own config,
-//! with its link (design §11.5), and, for a linked fork of a local-only
+//! with its link, and, for a linked fork of a local-only
 //! source, the source's state area (F8 S3: the fork publishes into its
 //! history, [`super::receive`]; an unlinked fork records no path to it),
 //! for an unlinked fork its own remotes file, if any (it never pushes to
@@ -16,7 +16,7 @@
 //! history copied in (no alternates, so a fork outlives its source), the
 //! fork's history ref at base, and base's tree written into the fork's
 //! backing tree before anything can mount it. When the source has a
-//! change line whose tip base reaches (design §19.2 item 11), that tip is
+//! change line whose tip base reaches, that tip is
 //! recorded as the fork's `agentfs.fork.baseChangeLine`, the first parent
 //! of the fork's first checkpoint ([`crate::checkpoint`]). It is idempotent per name:
 //! a fork that already exists with the same source is returned as it is,
@@ -99,7 +99,7 @@ pub enum CreateError {
     #[error(
         "volume {volume} has no fork remote: forks push to its patch remote, or to the one \
          remote with agentfsForkRemote = true, or into its own history when it has no \
-         remote (design §11.5)"
+         remote"
     )]
     NoForkRemote { volume: String },
     #[error(
@@ -358,7 +358,7 @@ fn copy_objects(source: &Repository, fork: &Repository, base: Oid) -> Result<(),
     Ok(())
 }
 
-/// The source's `info/exclude` and `info/attributes` (design §4.3): the
+/// The source's `info/exclude` and `info/attributes`: the
 /// fork records by the same operator rules.
 fn copy_rules(source: &StateDir, fork: &StateDir) -> Result<(), CreateError> {
     for name in ["exclude", "attributes"] {
@@ -559,7 +559,7 @@ fn for_each_entry(
 }
 
 /// The source's `include.path` entries, the files a CLI fork reads its
-/// settings from (design §11.5). Refuses
+/// settings from. Refuses
 /// [`CreateError::SourceSettingsNotIncluded`] when the source's own config
 /// sets any `agentfs.*`, `remote.*`, `lfs.*` or `http.*` key other than
 /// [`OWN_KEYS`]: the fork would not see it.

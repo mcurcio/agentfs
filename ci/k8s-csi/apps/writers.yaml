@@ -1,7 +1,7 @@
 # writer-a mounts with HostToContainer (a replaced front reaches it live);
 # writer-b without propagation (it sees a replaced front after a container
 # restart). Different uids and primary groups, one fsGroup: they share
-# files through a supplementary group (design §6).
+# files through a supplementary group.
 apiVersion: v1
 kind: Pod
 metadata:

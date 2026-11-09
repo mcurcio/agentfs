@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# agentfs state areas on NFS (design §2.3, §14.2, §18 test 16): an NFS
+# agentfs state areas on NFS: an NFS
 # server on the runner exports one directory, mounted by two NFSv4
 # clients: client A in the host's network namespace ("node-1") and client
 # B in a network and UTS namespace of its own ("node-2"), each with its

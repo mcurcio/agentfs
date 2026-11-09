@@ -1,4 +1,4 @@
-//! git fsck's `.gitmodules` content rules (design §3.4).
+//! git fsck's `.gitmodules` content rules.
 //!
 //! A remote with `receive.fsckObjects` refuses a push whose history holds a
 //! hostile `.gitmodules`, so agentfs refuses such content before it is

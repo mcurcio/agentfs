@@ -1,4 +1,4 @@
-//! The CSI Controller service (design §14.2), served by every node plugin
+//! The CSI Controller service, served by every node plugin
 //! pod, with csi-provisioner beside it (`--node-deployment`, F8 R8): each
 //! node provisions and deletes the worktrees on its own disk.
 //!
@@ -8,7 +8,7 @@
 //!   node's topology. A start class (`startFrom`) starts the worktree from
 //!   another worktree's branch, fetched once from the start remote
 //!   ([`agentfs_core::fork::start::start_from`]). A fork class (`fork:
-//!   "true"`) with a `dataSource` claim makes a fork (design §11.5) of a
+//!   "true"`) with a `dataSource` claim makes a fork of a
 //!   source on this node, from its local history, without its lock or any
 //!   credentials.
 //! - DeleteVolume asks the one release decider
@@ -298,7 +298,7 @@ pub(crate) fn delete_volume(
         )));
     }
     let state = StateDir::new(layout.state(handle));
-    // A fork's deletion asks for it to be finished (design §11.5): checked
+    // A fork's deletion asks for it to be finished: checked
     // before the lock, which the finisher holds while it publishes, and
     // again under it. A fork not yet published or abandoned is answered
     // here, without the lock: the decider asks it nothing else.

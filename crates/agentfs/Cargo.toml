@@ -16,7 +16,7 @@ signal-hook = "0.4.5"
 opentelemetry = { version = "0.33.1", default-features = false, features = ["trace", "metrics", "logs"] }
 opentelemetry_sdk = { version = "0.33.1", default-features = false, features = ["trace", "metrics", "logs"] }
 # OTLP over http/protobuf, http/json (a blocking client) and gRPC (tonic):
-# pure Rust, no protoc, no C (design §13, §17.3).
+# pure Rust, no protoc, no C.
 opentelemetry-otlp = { version = "0.33.1", default-features = false, features = ["http-proto", "http-json", "grpc-tonic", "reqwest-blocking-client", "trace", "metrics", "logs"] }
 # The runtime the gRPC exporter runs on (one worker, started only for gRPC).
 tokio = { version = "1.53", default-features = false, features = ["rt-multi-thread", "time"] }
@@ -31,14 +31,14 @@ tonic = { version = "0.14", default-features = false, features = ["tls-ring", "t
 # The restore thread's id (`thread`), and signals in tests (`process`).
 rustix = { version = "1.1.5", features = ["fs", "process", "thread"] }
 # close(2) and its errno in the FUSE tests (a front failing a boundary with
-# EIO, design §14).
+# EIO).
 libc = "0.2.190"
 # The control socket's JSON-lines protocol.
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 thiserror = "2.0.21"
 # serve-git's HTTP/1.1 server in front of `git http-backend` (bead
-# agentfs-mia.9, design §17.3): synchronous, a thread per request, no
+# agentfs-mia.9): synchronous, a thread per request, no
 # async runtime.
 tiny_http = "0.12.0"
 # serve-git's pre-receive hook reads the pushed (quarantined) objects.
@@ -68,7 +68,7 @@ ssh = ["agentfs-core/ssh"]
 # OTLP export to https:// collectors, with a CA bundle and client
 # certificates (rustls on ring).
 otlp-tls = ["dep:reqwest", "dep:rustls", "dep:rustls-native-certs", "dep:rustls-pki-types", "dep:tonic", "opentelemetry-otlp/tls-ring"]
-# Test builds only: failpoints on the durable path (design §18 test 3),
+# Test builds only: failpoints on the durable path,
 # set by AGENTFS_FAILPOINTS. `--version` says `+failpoints`. Never in a
 # release or image.
 failpoints = ["agentfs-core/failpoints", "agentfs-fuse/failpoints"]
