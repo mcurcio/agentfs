@@ -481,6 +481,10 @@ def held_log(root, metrics, timeout, report, name, saves=24, size=8 << 20):
         for i in range(saves):
             fd = os.open(root / 'held-other', os.O_WRONLY | os.O_TRUNC)
             try:
+                # A save that leaves the file's bytes as they were commits nothing
+                # (ledger R8.2, finding 36), so each save's bytes must differ or the
+                # wait below for its count never ends.
+                os.write(fd, b'save %012d\n' % i)
                 for _ in range(size // len(block)):
                     os.write(fd, block)
             finally:
@@ -499,7 +503,7 @@ def held_log(root, metrics, timeout, report, name, saves=24, size=8 << 20):
         os.close(held)
     final = read_metrics(metrics) or {}
     return {'status': 'MEASURED', 'saves': saves, 'bytes_per_save': size,
-            'definition': 'one log stays write-open with one line written; another file is truncated and rewritten with the stated bytes, one close per save; journal_bytes sampled after each save',
+            'definition': 'one log stays write-open with one line written; another file is truncated and rewritten with the stated bytes after an 18-byte line that differs per save (R8.2), one close per save; journal_bytes sampled after each save',
             'journal_bytes_peak': peak, 'journal_bytes_final': final.get('journal_bytes'),
             'compactions': final.get('stages', {}).get('compaction', {}).get('count', 0)
             - baseline.get('stages', {}).get('compaction', {}).get('count', 0),

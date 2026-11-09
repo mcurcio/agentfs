@@ -14,8 +14,8 @@ organised: [architecture.md](architecture.md).
 
 [Phase 1 of the proposed architecture](target-architecture/phase-1.md) implements
 the [Git model](target-architecture/git-model.md) incrementally, with real
-end-to-end tests validating its filesystem behavior. The recording milestone is
-built; phase 1 remains in progress. Its `trees` commands use their own state area
+end-to-end tests validating its filesystem behavior. Phase 1 is built and validated against its §18 exit rows on CI, with the limits and
+open questions the phase 1 page names. Its `trees` commands use their own state area
 while the earlier implementation described below keeps its existing commands.
 
 ## 1. Objective
@@ -5032,7 +5032,7 @@ runner.
 | What a landing locks (2026-11-07, owner, revisable) | Finding 46: "1 b 2 a 3 a 4 a is fine 5 a sounds correct, right? 6 a", his 5, option a. On his question the main session answered yes, that (a) is correct, and said the cost is an occasional unneeded wait. The model locks names too, and R9.1 says so. Cost: a landing can wait on an open file it does not change. Rejected for now: the library locking files alone. |
 | The five other traces (2026-11-07, owner, revisable) | Finding 47: "1 b 2 a 3 a 4 a is fine 5 a sounds correct, right? 6 a", his 6, option a, to shrink them and find which side is wrong. One was the model's (R10.3, fixed), one is finding 48 and three are finding 49, both resolved on 2026-11-08 (above). |
 | One alignment call (2026-11-07, as the brief for finding 41 asked) | `agentfs-align` holds the histogram diff's call, environment and parse, and both the library and the model use it. The model therefore depends on one agentfs crate, a change to its "no agentfs dependency" (AGENTS.md). Costs: a small crate, and the model no longer has its own way of asking git, so a bug in the call cannot show as a model-library difference. The release of `git` still decides what a diff answers, so one release is pinned (R10.10). |
-| Phase 1 purpose and naming (2026-11-05, owner) | "It shouldn’t be named “prototype”. The goal is to build the phase 1 / MVP of the proposed design in the PR so we can run real end-to-end tests and validate the model". Build this as the implementation foundation. Domain names (`tree_actor`, `tree_view`, `trees`) are implementation choices; phase 1 stays in progress until its end-to-end validation criteria pass |
+| Phase 1 purpose and naming (2026-11-05, owner) | "It shouldn’t be named “prototype”. The goal is to build the phase 1 / MVP of the proposed design in the PR so we can run real end-to-end tests and validate the model". Build this as the implementation foundation. Domain names (`tree_actor`, `tree_view`, `trees`) are implementation choices; phase 1 stays in progress until its end-to-end validation criteria pass (they pass on CI as of 2026-11-09, with the limits on the [phase 1 page](target-architecture/phase-1.md)) |
 | Target-model phase 1 (2026-11-05, implementation choice) | The recording milestone uses an isolated tree actor in `agentfs_core::tree_actor`: byte-call WAL, save at release, main/fork branches and object-safe rename/unlink. Fsync each call initially. Landing/sync and model conformance remain phase 1 milestones; the model rules are unchanged. Scope and remaining §18 checks: [phase 1](target-architecture/phase-1.md) |
 | Storage model | Real backing tree with FUSE passthrough; the projection is logical only |
 | Several pods on one volume | Supported by the CSI driver, one committer identity per replica (§14, §9); built at single-node level as `serve-history` and front mounts (§14.1), started per volume and per pod by the CSI driver, one node per volume (§14.2) |
