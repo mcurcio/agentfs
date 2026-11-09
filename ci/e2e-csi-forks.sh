@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # End-to-end test of forked volumes on the CSI driver
-# (docs/csi.md §14) in a kind cluster: deploys ci/k8s-csi/forks/driver (the
+# (docs/csi.md) in a kind cluster: deploys ci/k8s-csi/forks/driver (the
 # e2e-csi overlay with a `cifork` profile whose fork remote is forks.git)
 # and ci/k8s-csi/forks/apps, and checks, in order:
 #

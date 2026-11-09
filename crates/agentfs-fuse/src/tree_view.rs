@@ -1,4 +1,4 @@
-//! Phase 1 flat-file view of the target actor (git-model §3/§7/§18).
+//! Flat-file view of the target actor (git-model.md).
 //! Direct I/O and zero TTLs; no passthrough or writeback-cache negotiation.
 //! Shared mappings go through the kernel's page cache all the same, so a read
 //! with no lock owner is a page fill and a write with `FUSE_WRITE_CACHE` a page

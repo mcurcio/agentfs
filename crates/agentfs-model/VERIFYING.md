@@ -289,9 +289,9 @@ Review provenance before behaviour. For every finding, name the ledger rule that
 - Build output, scratch copies for planted bugs and long seed logs go on a disk with room, not a small system
   disk.
 
-## Phase 1: the model as the conformance suite
+## The model as the conformance suite
 
-[The tree library](../../docs/trees.md) builds the proposed design so real end-to-end tests can
+[The tree library](../../docs/trees.md) implements the proposed design so real end-to-end tests can
 validate this model. The scenario bodies assert on the model's internals, so they are not ported. **The model runs
 them unchanged and records each call plus what each tree showed (`src/calls.rs`); the same calls replay against the
 real library and real mounts (`crates/agentfs-conformance`); the real run must show the same, and passes invariants
@@ -335,12 +335,12 @@ What a replay decides, each reported rather than hidden:
 | Automatic takes (R1) | a mount takes only through the gate | mounted P1/P2 cases |
 | R1.3 an open's own read, R1.1 another reader | no calls: the replay makes neither read, so nothing compares them | byte and page-cache jobs |
 
-The in-scope traces at CI's seeds are 74 from scenarios and 94 from seeds (64 and 16 of the phase 1 generators, and 14 of
+The in-scope traces at CI's seeds are 74 from scenarios and 94 from seeds (64 and 16 of the tree-library generators, and 14 of
 the ordinary ones that happened to stay in scope). The rest are excluded by the reasons above, and the replay prints the
 count of each. The floors
 in `.github/workflows/phase-1.yml` are what passes: 74 and 94 on the library, and 71 and 16 on mounts, where 81 in-scope traces are
 not mountable. Library and model replay every in-scope trace. `[phase1-seeds]` in a pushed commit message, or a manual run, replays
-the phase 1 generators at seeds 1 to 500 on the library, in four shards (`ci/replay-seeds.sh`): too slow for every push, and fast
+the tree-library generators at seeds 1 to 500 on the library, in four shards (`ci/replay-seeds.sh`): too slow for every push, and fast
 enough for a job. `[phase1-measure]` runs every measurement mode, and `[phase1-held]`, `[phase1-calls]` or
 `[phase1-pilot]` one; the [tree views page](../../docs/trees.md#how-it-is-verified) has each exit row's run.
 

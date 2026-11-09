@@ -77,14 +77,14 @@ that point to it.
 | [Performance](performance.md) | Measured costs, the benchmark and the performance budget |
 | [Building and testing](development.md) | Building, the features, what each CI workflow runs, and running the end-to-end tests yourself |
 | [agentfs in git terms](target-architecture/git-model.md) | Every tree, save, lock, landing and sync of the tree model as git branches, commits and refs. The baseline the model and its tests prove |
-| [The rules ledger](target-architecture/rules-ledger.md) | Every rule of that model in plain words, and whether the owner approved it |
+| [The rules ledger](target-architecture/rules-ledger.md) | Every rule of that model in plain words, with the tests that check it |
 | [The fork and upstream rules in plain git](target-architecture/demo/walkthrough.md) | The rules run with a shell script that uses only `git` and coreutils, run in CI |
 
 ## Future designs
 
-[Overview](target-architecture/README.md). Each page is a design for work that
-is not built. When its slice is built, the page is deleted and the behaviour
-is in the pages above.
+[Overview](target-architecture/README.md). The designs of slices that are not
+built are under `target-architecture/`; the baseline pages are listed above. When
+a slice is built, its page is deleted and the behaviour is in the pages above.
 
 ## The project
 

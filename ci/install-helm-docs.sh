@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Installs pinned helm-docs into <dir>/bin, checking its sha256 sum, for
-# the helm workflow's lint job (the chart READMEs, docs/helm.md §6).
+# the helm workflow's lint job (the chart READMEs, docs/helm.md).
 # Linux amd64 only. Add <dir>/bin to PATH yourself.
 #
 # Usage: ci/install-helm-docs.sh <dir>

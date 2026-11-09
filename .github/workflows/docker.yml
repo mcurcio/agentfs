@@ -108,7 +108,7 @@ jobs:
 
   # Bead agentfs-4af: upstream Hermes' published image on the compose
   # example, with its tool containers on docker-in-docker and a scripted
-  # model server (deployment.md §10).
+  # model server (deployment.md).
   hermes:
     name: e2e (docker compose, upstream Hermes)
     needs: build

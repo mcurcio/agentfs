@@ -483,7 +483,10 @@ record what is dirty in it: retry, or restart that pod. With the volume
 unstaged, `agentfs restore` runs
 directly instead, with `--root <basePath>/<pv>/backing` as well.
 
-**Upgrading the node plugin.** The DaemonSet is `updateStrategy:
+**Upgrading the node plugin.** A live hand-over of a node's FUSE sessions to a
+new plugin is not supported: the sessions cannot be passed between processes
+without running INIT again, and the kernel's node ids, lookup counts and
+backing ids cannot be transferred. The DaemonSet is `updateStrategy:
 OnDelete`. A node plugin's restart stops that node's fronts and services
 (its FUSE mounts are the plugin's children; a FUSE session cannot be
 handed to another process), so upgrade node by node, draining first:

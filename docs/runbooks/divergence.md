@@ -29,7 +29,7 @@ Throughout:
 
 ```sh
 STATE=/data/state                                  # the state area
-VOL=hermes                                         # the volume
+VOL=demo                                           # the volume
 NAME=origin                                        # the diverged remote's name
 URL=https://github.com/acme/agent-history.git      # its push URL
 BRANCH=refs/heads/agentfs/$VOL

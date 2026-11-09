@@ -1,4 +1,4 @@
-# What every kind scenario of ci/e2e-hermes-kind.sh shares (docs/deployment.md §10): the scripted model server (ci/hermes/model) as
+# What every kind scenario of ci/e2e-hermes-kind.sh shares (docs/deployment.md): the scripted model server (ci/hermes/model) as
 # the Service `model`, Hermes' CI config (ci/hermes/hermes/config.yaml),
 # Hermes and its docker-in-docker sidecar added to each scenario's
 # Deployment (hermes.yaml; each scenario mounts the volume its own way),

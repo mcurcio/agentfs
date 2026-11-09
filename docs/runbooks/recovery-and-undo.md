@@ -16,7 +16,7 @@ Throughout:
 ```sh
 STATE=/data/state       # the state area
 BACKING=/data/backing   # the backing tree
-VOL=hermes              # the volume (agentfs.volume)
+VOL=demo                # the volume (agentfs.volume)
 BRANCH=refs/heads/agentfs/$VOL
 ```
 

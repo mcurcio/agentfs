@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Compares two streams of Kubernetes objects: the kustomize render of a
 deploy/ directory (expected) and the helm render of its chart (actual).
-Used by ci/helm-equivalence.sh (docs/helm.md §5).
+Used by ci/helm-equivalence.sh (docs/helm.md).
 
 Only what Helm adds by design is ignored:
   - the release's own Namespace object in the expected side (Helm installs

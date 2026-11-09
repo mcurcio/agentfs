@@ -19,7 +19,7 @@ pub enum IdentityError {
     Invalid(String),
 }
 
-/// Where the mount runs. Phase 1 fills this from the downward API; the CSI
+/// Where the mount runs. The sidecar fills this from the downward API; the CSI
 /// driver from `podInfoOnMount`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Context {

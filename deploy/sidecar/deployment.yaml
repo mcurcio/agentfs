@@ -1,4 +1,4 @@
-# A workload with agentfs as a phase 1 native sidecar. The
+# A workload with agentfs as a privileged native sidecar. The
 # layout and every choice here are explained in docs/deployment.md.
 #
 #   /data                 the PVC: backing/ (the files) and state/ (history)
@@ -162,7 +162,7 @@ spec:
           # mount point (AGENTFS_SEAL_MOUNTPOINT) refuses the writes of a
           # non-root container (or root without CAP_DAC_OVERRIDE) in the
           # gap. Give the container this probe too, so it restarts onto the
-          # new mount after the daemon exited (docs/deployment.md §3).
+          # new mount after the daemon exited (docs/deployment.md).
           # livenessProbe:
           #   exec:
           #     # Fails on the dead mount (ENOTCONN) and on a bare directory.

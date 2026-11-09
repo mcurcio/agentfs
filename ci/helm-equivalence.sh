@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Checks that the charts render what deploy/ holds (docs/helm.md §5):
+# Checks that the charts render what deploy/ holds (docs/helm.md):
 # charts/agentfs-csi against deploy/csi and the StorageClasses of deploy/csi/example, and the sidecar library through
 # deploy/examples/helm-sidecar against deploy/sidecar, the same with the
 # sandbox overlay on (ci/helm/sidecar-sandbox-overlay-values.yaml) against

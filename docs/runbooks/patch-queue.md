@@ -16,7 +16,7 @@ Throughout:
 ```sh
 STATE=/data/state                                  # the state area
 BACKING=/data/backing                              # the backing tree
-VOL=hermes                                         # the volume
+VOL=demo                                           # the volume
 BRANCH=agentfs/$VOL                                # the volume's branch
 ```
 
@@ -408,7 +408,7 @@ with those of the last notice it delivered, and if any changed, sends one
 A notice (schema 1):
 
 ```json
-{"schema":1,"volume":"hermes","branch":"refs/heads/agentfs/hermes","head":"9a0b...",
+{"schema":1,"volume":"demo","branch":"refs/heads/agentfs/demo","head":"9a0b...",
  "status":"c41e...","changes":[
    {"inbox":3,"patch":"5d2f...","from":null,"to":null,"landed":"6f1c..."},
    {"inbox":4,"patch":"8e77...","from":null,"to":{"kind":"held","reason":"conflict","message":"...","paths":["config/app.yaml"]},"landed":null}],

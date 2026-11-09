@@ -1,4 +1,4 @@
-# Defaults of the agentfs sidecar helpers (docs/helm.md §4). A workload
+# Defaults of the agentfs sidecar helpers (docs/helm.md). A workload
 # chart depends on this library under an alias (`alias: agentfs`) and
 # sets these under that key; each helper takes
 # that values map, e.g. `include "agentfs-sidecar.initContainers"

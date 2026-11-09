@@ -10,7 +10,7 @@ parameters:
   profile: example
   # The agentfs volume name; the history branch is agentfs/<volumeName>.
   # It must contain {pvName}: each claim is a worktree with its own branch,
-  # for good (docs/csi.md §5).
+  # for good (docs/csi.md).
   volumeName: "{pvcNamespace}.{pvcName}.{pvName}"
   # DeleteVolume keeps the worktree on its node once every remote holds
   # its head (reusable through a static PV there); `delete` removes it then.

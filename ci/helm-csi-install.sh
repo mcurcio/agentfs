@@ -2,7 +2,7 @@
 # Installs the CSI driver from charts/agentfs-csi with chart-testing
 # (`ct install`, its values in charts/agentfs-csi/ci/) into the kind
 # cluster of the helm workflow's e2e job, for ci/e2e-csi.sh to test with
-# CSI_INSTALL=chart (docs/helm.md §6). The release is kept
+# CSI_INSTALL=chart (docs/helm.md). The release is kept
 # (--skip-clean-up) so the e2e runs against it.
 #
 # Before the install, what the CI overlay ci/k8s-csi/driver adds to

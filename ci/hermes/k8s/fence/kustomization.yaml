@@ -1,4 +1,4 @@
-# The read-only fence alternative of docs/deployment.md §10
+# The read-only fence alternative of docs/deployment.md
 # (ci/e2e-hermes-kind.sh fence): the sidecar scenario's pod, but Hermes and
 # docker-in-docker mount the emptyDir read-only at /agentfs, as
 # deploy/sidecar's workload does, and Hermes' home is

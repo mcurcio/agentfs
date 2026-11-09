@@ -1,6 +1,6 @@
 # agentfs-sidecar
 
-Helpers that add agentfs to a workload's chart as a phase 1 native sidecar: its containers, volumes, settings and claim.
+Helpers that add agentfs to a workload's chart as a privileged native sidecar: its containers, volumes, settings and claim.
 
 Generated from `values.yaml` by [helm-docs](https://github.com/norwoodj/helm-docs)
 (`helm-docs --chart-search-root charts`); CI fails when it is stale. How to
@@ -21,7 +21,7 @@ dependencies:
 |---|---|
 | `agentfs-sidecar.initContainers` | the init container and the recorder (a native sidecar), for `initContainers` |
 | `agentfs-sidecar.workspaceMount` | the workload container's mount of `/agentfs` (read-only; the workspace is `/agentfs/workspace`) |
-| `agentfs-sidecar.sandboxOverlayMount` | with `sandboxOverlay.enabled`, the mount of the sandbox overlay's emptyDir for a container that starts other containers (the overlay is `<mountPath>/overlay`; docs/deployment.md §12) |
+| `agentfs-sidecar.sandboxOverlayMount` | with `sandboxOverlay.enabled`, the mount of the sandbox overlay's emptyDir for a container that starts other containers (the overlay is `<mountPath>/overlay`; docs/deployment.md) |
 | `agentfs-sidecar.volumes` | the pod's volumes: the claim, the shared emptyDir, the ConfigMap and the Secret, and the sandbox overlay's emptyDir when enabled |
 | `agentfs-sidecar.podAnnotations` | a checksum of the settings, so changing them rolls the pod |
 | `agentfs-sidecar.configMap`, `.secret`, `.claim` | the ConfigMap, the credentials Secret and the claim |
@@ -51,7 +51,7 @@ Each takes this library's values, e.g.
 | labels | object | `{}` | Labels of the ConfigMap, Secret and claim the helpers render. |
 | onStaleMount | string | `"recover"` | What the sidecar does on a stale mount after a crash: `recover` mounts over it, `hold` waits for a pod restart. |
 | resources | object | `{"limits":{"memory":"512Mi"},"requests":{"cpu":"50m","memory":"64Mi"}}` | The sidecar's resources. An OOM kill is a crash: size the limit for the volume. |
-| sandboxOverlay.enabled | bool | `false` | Also serve the sandbox overlay (docs/deployment.md §12): a second mount point of the volume, at `<mountPath>/overlay`, that shows only the files the operator's rules would record. Give it to a container that starts other containers, with `agentfs-sidecar.sandboxOverlayMount`, never the main mount. |
+| sandboxOverlay.enabled | bool | `false` | Also serve the sandbox overlay (docs/deployment.md): a second mount point of the volume, at `<mountPath>/overlay`, that shows only the files the operator's rules would record. Give it to a container that starts other containers, with `agentfs-sidecar.sandboxOverlayMount`, never the main mount. |
 | sandboxOverlay.mountPath | string | `"/agentfs-sandbox"` | Where the sidecar mounts that emptyDir; it must not be `/agentfs` or inside it (the two mount points may not share a parent). |
 | sandboxOverlay.owner | string | `""` | The view owner, `UID:GID` (required when enabled): every operation through the overlay is checked and done as this user, whoever the sandbox runs as. |
 | sandboxOverlay.volumeName | string | `"agentfs-sandbox"` | The emptyDir holding the overlay's mount point. |

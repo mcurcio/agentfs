@@ -4,7 +4,8 @@
 
 ## What stands until then
 
-Nothing limits a tree's size, and the line maps keep deleted versions and unlinked files with no trim rule. Losing
+Nothing limits a tree's size beyond `agentfs.maxSize` per file, there is no per-group storage budget, old versions of a
+fsync-class member are never pruned ([recording](../../recording.md)), and the line maps keep deleted versions and unlinked files with no trim rule. Losing
 commits and their refs are pushed and kept.
 
 ## What it proposes

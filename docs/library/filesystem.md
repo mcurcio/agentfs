@@ -511,7 +511,7 @@ daemon answering. Fronts take no lock.
 |---|---|
 | 0 | Done |
 | 1 | Refused or failed. The message says why and, where there is one, the next command |
-| 75 | The state area, or the cache lock, is busy: try again |
+| 75 | The state area, or the cache lock, is busy, or a remote is being pushed (`push --lease`): try again |
 | 130 | A second signal arrived during shutdown: the process exits at once |
 
 ### `mount`: order and shutdown

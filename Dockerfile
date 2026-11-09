@@ -3,7 +3,7 @@
 # The agentfs image: the `agentfs` binary built with the `https` and `ssh`
 # features and the `agentfs-csi` CSI driver, on Debian trixie with fuse3,
 # git, tini, mergiraf and the CA certificates. It runs as root, deliberately: the
-# phase 1 sidecar must be root and privileged to mount FUSE with
+# sidecar must be root and privileged to mount FUSE with
 # Bidirectional propagation (docs/deployment.md "Security
 # trade-offs"). The CSI node plugin runs it as `tini -- agentfs-csi`, root
 # and privileged in the driver's namespace only (docs/csi.md).

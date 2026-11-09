@@ -528,7 +528,7 @@ checked (a server that drops it) is `unreachable`. libgit2 uses the system's CA 
   write access:
 
   ```sh
-  ssh-keygen -t ed25519 -N '' -C agentfs-hermes -f ./ssh-privatekey
+  ssh-keygen -t ed25519 -N '' -C agentfs-demo -f ./ssh-privatekey
   cat ./ssh-privatekey.pub   # add as a deploy key with write access
   ```
 

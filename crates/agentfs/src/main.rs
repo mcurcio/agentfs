@@ -137,7 +137,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Phase 1 of the target design: Git-backed main and sandbox trees.
+    /// The tree library: Git-backed main and sandbox trees.
     Trees(trees_cmd::Args),
     /// Create a state area, or check an existing one: safe to run at every
     /// start (exit 0 when it already belongs to the volume, 1 when it

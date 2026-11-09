@@ -871,7 +871,7 @@ mod tests {
 
     #[test]
     fn a_static_pv_names_its_volume_with_volume_name() {
-        // As docs/csi.md §5 documents it.
+        // As docs/csi.md documents it.
         let p = VolumeParams::from_context(
             "pvc-0b6f",
             &map(&[("profile", "p"), ("volumeName", "research.notes")]),

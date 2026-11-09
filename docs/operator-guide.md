@@ -86,7 +86,7 @@ cat > /etc/agentfs/config <<'EOF'
 	url = https://github.com/acme/agent-history.git
 	agentfsCredentials = /run/secrets/agentfs/origin
 EOF
-agentfs --state /data/state init --volume hermes --include /etc/agentfs/config
+agentfs --state /data/state init --volume demo --include /etc/agentfs/config
 agentfs --state /data/state mount /data/backing /workspace
 ```
 
@@ -119,11 +119,11 @@ The daemon stays in the foreground. Its first line says what it mounted
 and how:
 
 ```
-mounted /data/backing at /workspace (volume hermes, passthrough: on, threads 8, 0 uncommitted record(s) recovered, remotes: origin); stop with SIGINT or SIGTERM
+mounted /data/backing at /workspace (volume demo, passthrough: on, threads 8, 0 uncommitted record(s) recovered, remotes: origin); stop with SIGINT or SIGTERM
 ```
 
 Every change made under `/workspace` is now recorded before the call that
-made it returns, committed to the branch `agentfs/hermes` in
+made it returns, committed to the branch `agentfs/demo` in
 `/data/state/git` a moment later, and pushed every `pushInterval`.
 
 ## 4. Flags and environment

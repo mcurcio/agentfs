@@ -26,7 +26,7 @@ Throughout:
 ```sh
 STATE=/data/state                    # the state area
 BACKING=/data/backing                # the backing tree
-VOL=hermes                           # the volume
+VOL=demo                             # the volume
 BRANCH=refs/heads/agentfs/$VOL
 SECRET_PATH=config/.env              # the recorded file, relative to the tree
 BACKUP=/data/state.before-rewrite    # where the state area is backed up

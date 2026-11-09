@@ -1,5 +1,5 @@
 {{- $agentfs := include "example.agentfs" . | fromYaml }}
-# A workload with agentfs as a phase 1 native sidecar (docs/deployment.md), through the helpers of charts/agentfs-sidecar.
+# A workload with agentfs as a privileged native sidecar (docs/deployment.md), through the helpers of charts/agentfs-sidecar.
 apiVersion: apps/v1
 kind: Deployment
 metadata:

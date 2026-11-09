@@ -1,4 +1,4 @@
-# The sandbox overlay (docs/deployment.md §12) for the
+# The sandbox overlay (docs/deployment.md) for the
 # sidecar of deploy/sidecar: a second mount point of the volume, served by
 # the same daemon, that shows only the files the operator's rules would
 # record. Give it to a container that starts other containers (for example

@@ -4,7 +4,7 @@
 //!
 //! `--on-stale-mount recover` (the shipped sidecar's mode) mounts over the
 //! stale mount instead; hold is for operators who want to
-//! recover by hand. With hold, phase 1 recovers a crashed daemon by
+//! recover by hand. With hold, the sidecar recovers a crashed daemon by
 //! restarting the pod. Detaching the dead mount
 //! and mounting afresh is not safe: workload containers still hold the
 //! dead mount (`ENOTCONN`), and detaching it while they run would let their
@@ -42,7 +42,7 @@ pub fn hold(daemon: Daemon, stale: &[(&Path, &str)]) -> ExitCode {
         );
     }
     eprintln!(
-        "Phase 1 recovers by restarting the pod (kubectl delete pod <pod>); its next start \
+        "A held sidecar recovers by restarting the pod (kubectl delete pod <pod>); its next start \
          recovers the journal. Holding until SIGTERM, then detaching the stale mount(s)."
     );
     let wake = daemon.wait();

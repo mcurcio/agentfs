@@ -1,5 +1,5 @@
 # shellcheck shell=bash
-# The checks the Hermes suites share (deployment.md §10):
+# The checks the Hermes suites share (deployment.md):
 # ci/e2e-hermes.sh under Docker Compose and ci/e2e-hermes-kind.sh on kind.
 # Source it after ci/lib.sh. The caller defines how to reach each piece:
 #

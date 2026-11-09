@@ -2,7 +2,7 @@ name: hermes
 
 # Upstream Hermes on agentfs in kind, one configuration per
 # job, each on its own runner (ci/e2e-hermes-kind.sh): the sidecar pod of
-# docs/deployment.md §10 with the migration of existing data and a
+# docs/deployment.md with the migration of existing data and a
 # sidecar-only restart, its read-only fence alternative, and Hermes on a
 # CSI volume. The Compose suite is docker.yml's hermes job.
 

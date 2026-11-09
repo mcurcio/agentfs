@@ -1,5 +1,5 @@
 //! The model's recorded calls against the real system (git-model.md §18, the
-//! first row; VERIFYING.md, "Phase 1").
+//! first row; VERIFYING.md, "The model as the conformance suite").
 //!
 //! The model runs its scenarios and seeds unchanged and records each call with
 //! what each tree showed (`agentfs_model::calls`). [`Library`] and [`Mounted`]

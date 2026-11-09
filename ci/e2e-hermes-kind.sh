@@ -9,7 +9,7 @@
 # scripted stand-in (ci/hermes/model); tool containers run on a
 # docker-in-docker sidecar in Hermes' pod.
 #
-#   sidecar   the pod of docs/deployment.md §10 (ci/hermes/k8s/sidecar):
+#   sidecar   the pod of docs/deployment.md (ci/hermes/k8s/sidecar):
 #             Hermes and dind with the mount at /opt/data through subPath
 #             and the liveness probe; first Hermes on the plain volume
 #             (ci/hermes/k8s/before), then the migration Job of §10 as
@@ -297,7 +297,7 @@ if [ "$MODE" = sidecar ]; then
   wait_gone app.kubernetes.io/name=hermes-before
   pass "Hermes is scaled to zero"
 
-  step "2a. the one-time migration Job of docs/deployment.md §10, as written"
+  step "2a. the one-time migration Job of docs/deployment.md, as written"
   CONFIG=$(k get deployment agentfs-example -o jsonpath='{.spec.template.spec.volumes[?(@.name=="config")].configMap.name}')
   script=$(runbook_block ../deployment.md hermes-migration)
   [ -n "$script" ] || fail "no hermes-migration block in docs/deployment.md"
@@ -349,7 +349,7 @@ EOF
     '(^|/)(\.env|auth\.json)$|\.(db|db-wal|db-shm|db-journal)$|(^|/)(sessions|logs)/|^skills/agentfs-cloned/' \
     "a secret, database, log or nested repository of the existing data"
 
-  step "the Hermes pod of docs/deployment.md §10"
+  step "the Hermes pod of docs/deployment.md"
   k scale deployment/agentfs-example --replicas=1
   wait_ready
   assert_contains "$(k logs "$POD" -c agentfs-init)" "volume hermes already initialised" "agentfs-init accepted the migrated volume"

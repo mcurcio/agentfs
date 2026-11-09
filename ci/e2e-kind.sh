@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# End-to-end test of the phase 1 deployment (docs/deployment.md) in a kind cluster: deploys ci/k8s (the CI overlay of
+# End-to-end test of the sidecar deployment (docs/deployment.md) in a kind cluster: deploys ci/k8s (the CI overlay of
 # deploy/sidecar) and checks, from real pods:
 #
 #   - root and uid 10000 write through the mount with normal permissions,

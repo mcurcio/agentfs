@@ -62,7 +62,7 @@ of their day: "main" is the root, a "sandbox" is a fork, a "parent" is an upstre
   mappings of a file in one tree share its pages: another mapping can read unsaved stores, and each close saves what
   the kernel has flushed, which can include another program's mapped stores. No writer's bytes are lost that Linux would
   keep, with one gap on record, open for the owner: a mapped store that writes the bytes its page last held records no
-  run, so a descriptor write made meanwhile stands where Linux would keep the store. Owner, 2026-11-06, accepting that recommendation with the handoff's evidence: "we can take those recommendations
+  run, so a descriptor write made meanwhile stands where Linux would keep the store. Owner, 2026-11-06, accepting that recommendation with the evidence on the [tree views page](../trees.md#limits): "we can take those recommendations
   for now, and i might change my mind later".
   The kernel keeps one size and one set of pages per file, so R1.1 holds for `read` and `pread` on read-only
   descriptors. While a file is open for writing, `stat` reports the writers' size to everyone, a writable descriptor also
@@ -165,6 +165,8 @@ of their day: "main" is the root, a "sandbox" is a fork, a "parent" is an upstre
   COMMIT?!?" (2026-11-01). Tests: `r6_a_sync_is_a_merge_with_the_upstream_second`
 - **R6.1** · approved · A sync that cannot fast-forward is a merge commit credited to `agentfs`, with no edits of
   its own. Approved by the owner, 2026-11-05 (approval page).
+  Owner, 2026-11-09, asked whether a sync may fast-forward past the fork's own sync merge: "A". Cost: no ref reaches that
+  merge any more, against the letter of never rewriting history (47 of 168 local traces). Revisable.
   The replay compares each take's new head with the model's: its `Agentfs-Cause` and parent count (`history_shape`).
   Tests: `finding_51_a_sync_after_a_lost_save_fast_forwards`, `finding_51_a_sync_that_cannot_show_the_upstreams_commit_merges`,
   `a_fast_forward_takes_the_upstreams_line_maps`,
@@ -232,7 +234,7 @@ of their day: "main" is the root, a "sandbox" is a fork, a "parent" is an upstre
   agentfs knows when it has the runway to commit/land work"; "we absolutely must avoid deadlocking, while also trying
   to minimize starvation". A sync or landing waits for a moment when all its files are closed, tried again at each close (R9.4). Owner,
   2026-11-05, choosing between that and another round of snapshot opens: "Locks, keep snapshots on file". The cost
-  stays: overlapping opens can delay a landing indefinitely. Phase 1 measures how often; snapshot opens
+  stays: overlapping opens can delay a landing indefinitely. The tree library measures how often; snapshot opens
   ([parked design](snapshot-opens.md), R9.11 to R9.15 and R9.17) are the next step if that is a real problem.
 - **R9.11** · parked · Snapshot opens. A sync or landing never waits for a program's open file: it applies at once,
   as one atomic step. Each open keeps the version of the file it opened; at close its save is merged line by line

@@ -59,7 +59,7 @@ When you learn something durable, write it to its home in the same commit. Never
 
 - Write docs for a future reader who uses or operates agentfs, or builds on its library: what it does and how to use it, in the present tense. Not history, plans, drafts, review findings or who decided what.
 - The one exception is the rules ledger and `docs/target-architecture/git-model.md`, with the model's `MODEL.md` and `VERIFYING.md` and the walkthrough. The owner, 2026-11-09: "These stay as the baseline proof and testbed".
-- Code comments do not cite document section numbers. Name the page, or keep the sentence without a citation.
+- Code comments name a page, not a section number of it, because pages are rewritten. The baseline pages keep their numbering and may be cited by section: `docs/target-architecture/git-model.md`, and the model's `MODEL.md` and `VERIFYING.md`.
 
 ## Read first
 

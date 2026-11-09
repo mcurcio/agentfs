@@ -12,11 +12,11 @@ resources:
   - csidriver.yaml
   - rbac.yaml
   # What RBAC cannot scope: the node plugin's account touches only this
-  # driver's PVs on its own node (docs/csi.md §10).
+  # driver's PVs on its own node (docs/csi.md).
   - provisioner-admission.yaml
   - credentials.yaml
   - node.yaml
-  # Every class of the driver must have reclaim policy Delete (docs/csi.md §5).
+  # Every class of the driver must have reclaim policy Delete (docs/csi.md).
   - class-admission.yaml
 
 # One profile per `<name>.config` (with optional `.exclude` and

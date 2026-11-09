@@ -1,4 +1,4 @@
-# docs/deployment.md §10, "The pod changes": Hermes (and the
+# docs/deployment.md, "The pod changes": Hermes (and the
 # docker-in-docker sidecar) keep their data path by mounting the FUSE
 # mount itself at /opt/data (subPath, HostToContainer), with the liveness
 # probe a subPath consumer needs so a clean exit of the daemon

@@ -1,6 +1,6 @@
 {{/*
-agentfs as a phase 1 native sidecar (docs/deployment.md),
-as helpers for a workload's own chart (docs/helm.md §4). Each takes the
+agentfs as a privileged native sidecar (docs/deployment.md),
+as helpers for a workload's own chart (docs/helm.md). Each takes the
 values map of this library (its alias's key):
 
   initContainers:          {{ include "agentfs-sidecar.initContainers" .Values.agentfs | nindent 8 }}
@@ -159,7 +159,7 @@ Docker daemon), with sandboxOverlay.enabled: only the sandbox overlay's
 emptyDir, never the main mount's. It binds paths under
 <mountPath>/overlay into its sandboxes; a container runtime binds with
 private propagation by default, so sandboxes started before a sidecar
-recovery keep the dead mount (docs/deployment.md §12).
+recovery keep the dead mount (docs/deployment.md).
 */}}
 {{- define "agentfs-sidecar.sandboxOverlayMount" -}}
 - name: {{ .sandboxOverlay.volumeName }}
