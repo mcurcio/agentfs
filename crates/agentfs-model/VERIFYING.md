@@ -342,7 +342,8 @@ count of each. The floors
 in `.github/workflows/phase-1.yml` are what passes: 74 and 94 on the library, and 71 and 16 on mounts, where 81 in-scope traces are
 not mountable. Library and model replay every in-scope trace. `[phase1-seeds]` in a pushed commit message, or a manual run, replays
 the phase 1 generators at seeds 1 to 500 on the library, in four shards (`ci/replay-seeds.sh`): too slow for every push, and fast
-enough for a job.
+enough for a job. `[phase1-measure]` runs every measurement mode, and `[phase1-held]`, `[phase1-calls]` or
+`[phase1-pilot]` one; the [handoff](../../docs/target-architecture/phase-1-handoff.md) has each exit row's run.
 
 A mismatch is a finding (MODEL.md), never a change to either side without a ledger rule. Its traces
 go in `crates/agentfs-conformance/open-findings.txt` with its number and must keep failing, as an ignored test must, and

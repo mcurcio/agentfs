@@ -775,12 +775,12 @@ that works, so the second table weighs the other established designs (design cho
 | Patch theory: Pijul, Darcs | line identity and commuting patches are its core; conflicts are first-class; Pijul's graph of lines is the nearest prior art to the line map | not git: no git remote carries its history (AGENTS.md principles 3 and 6); it records a conflict for a person to resolve rather than deciding it, so the referee would still be ours; Darcs has had exponential merge cases, and Pijul is younger than git's tooling |
 | Jujutsu (git-backed): change ids and the operation log | a change's identity apart from its commit's; every operation logged, concurrent operations reconciled at the next load; conflicts stored in commits | its merge is three-way by content, so findings 1, 6 and 13(b) apply; it stores a conflict for a person rather than deciding it. Its operation log is prior art for the journal (§3) and for recovery; it is not adopted as a dependency |
 
-**What the custom protocol still owes**, none of it validated yet: where the line map is stored (§16 question 1);
-recovery, designed (§12), its crash replay of the journal modelled (MODEL.md rule 12) but not validated on a real mount
-(phase 1's recording code is outdated and untested, [phase-1.md](phase-1.md)); metadata growth, since line maps keep every deleted version and
-each losing change adds a collision ref, none with a trim rule; performance, with no
-measurement of the alignment or the referee on large files. Phase 1
-(§18) measures these before the architecture is settled.
+**What the custom protocol still owes**, after phase 1 ([phase-1.md](phase-1.md), the [exit table](phase-1-handoff.md)): where the line map
+is stored (§16 question 1); recovery, now run on real mounts (journal kills, ext4 and XFS power loss; §12, §18) with the limits the
+handoff states; metadata growth, measured at 19.6 bytes of line map a save over 10,000 saves, with every deleted version kept and
+each losing change adding a collision ref, none with a trim rule; and performance, measured but not budgeted: a 100 MiB file in the
+tree makes every later save and take cost minutes, because each rereads and rewrites the tree (handoff, "What a 100 MiB file in the
+tree costs"). The cost of a take that blocks a client call is untested by the replay (MODEL.md finding 49).
 
 Prior art: a merge queue (GitHub's, Bors) is a single referee taking changes in order; Gerrit's `refs/for/<branch>`
 pushes into a queue, not a branch; commit trailers record facts in history; `remote = .` is plain
@@ -921,13 +921,12 @@ contradict this page; where something does, this page wins.
 
 The owner clarified on 2026-11-05: "The goal is to build the phase 1 / MVP of the proposed design in the PR so we can run real end-to-end tests and validate the model".
 [Phase 1](phase-1.md) is the first implementation of this design, developed incrementally. Its recording
-milestone was written by an earlier session and is outdated and untested (the owner, 2026-11-05). The remaining work includes the referee, landing/sync and conformance tests on real
-mounts; passing the recording tests alone does not complete phase 1. The 2026-11-04 review identified the
-filesystem-boundary checks below. The full exit criteria are not yet met. Scope:
+milestone was written by an earlier session and was rebuilt against this design (the owner, 2026-11-05, called the first draft outdated and untested). The 2026-11-04 review identified the
+filesystem-boundary checks below. Their results, row by row, are in the [handoff](phase-1-handoff.md#exit-table-git-model-18). Scope:
 
 | In scope | Answers | Exit criterion (pass or fail) |
 |---|---|---|
-| A FUSE mount of main and one fork on one real repository: a tree actor and a queue each | the model on real calls | the model's scenarios, driven as real file calls (VERIFYING.md's conformance plan), pass. Built as a replay of each scenario's recorded calls, so it compares what each tree shows and the lost lines of each collision: no mapping call, a client call waiting on a take assumed by replay order, a crash only between calls, no injected `ENOSPC` (VERIFYING.md has the table). Evidence and counts: [phase 1](phase-1.md), `replay` row |
+| A FUSE mount of main and one fork on one real repository: a tree actor and a queue each | the model on real calls | the model's scenarios, driven as real file calls (VERIFYING.md's conformance plan), pass. Built as a replay of each scenario's recorded calls, so it compares what each tree shows and the lost lines of each collision: no mapping call, a client call waiting on a take assumed by replay order, a crash only between calls, no injected `ENOSPC` (VERIFYING.md has the table). Evidence and counts: the [handoff](phase-1-handoff.md#exit-table-git-model-18), first row |
 | The journal (§3) | review point 1 | a kill of the one process that hosts the view and the tree actors (phase 1 has no separate history service) after each journal step: every write call that returned is in the next save, and none is saved twice; under power loss (dm-log-writes, as the power-loss workflow): every call before a returned `fsync` or close survives; a full state area fails the write call with `ENOSPC`; a close followed at once by an open, in the same process and in another, reads the new content (`RELEASE` is a background request: it goes to `/dev/fuse` in order, before `close` returns, while fewer than `max_background` requests are outstanding and no readahead of that handle is in flight, and a synchronous `OPEN` skips that queue. The view sets `max_background` as high as the kernel's `max_user_bgreq` allows. Read from fs/fuse at v6.8 and v6.14 and tested on CI's kernel (7.0) with 64 closes over a busy view, `ci/trees-close-open.py`. Limits: thousands outstanding, or a readahead of that handle in flight, can still let an open pass) |
 | Byte-level calls (modelled since 2026-11-04: §6, MODEL.md rules 8 and 10) | review point 2, on a real mount | random `pwrite` at any offset, partial lines, split writes, a missing final newline (appending `bar` to a file holding `foo`), overlapping writes, `ftruncate` shrinking and growing, `O_APPEND`; the bytes are the independent oracle: each saved file equals what the same calls leave on a plain Linux filesystem, and its line map passes `save_aligned` |
 | Objects (§7) | review point 3 | an atomic save (write `n`, `rename(n, a)`) while another process holds `a` open for writing and keeps writing: the new `a` never changes; `O_TMPFILE` with `linkat`; an unlink while open; a rename of an open file; a view-host restart with handles open (the object table rebuilt from the journal, §3; plain FUSE ends the connection with its server): an old handle's later writes fail, the file holds what returned before the kill, and a file replaced through the new mount stays unchanged; two writers at stale offsets through the page cache; shared `mmap` writeback |
