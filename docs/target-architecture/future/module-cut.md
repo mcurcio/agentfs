@@ -87,8 +87,8 @@ names (to a fixed point), placing, whole (land only). Land and sync run the same
 
 ## Costs
 
-- The longest function falls from 248 lines to about 85 (estimate), but rule branches and the checker's 24 excuses
-  move rather than disappear. The rules set the number of edge cases.
+- The longest functions get shorter, but rule branches and the checker's 24 excuses move rather than disappear. The
+  rules set the number of edge cases.
 - The model and the engine share one decomposition, so a wrong grouping shows up in both. The checker shares none of it.
 - Rule work pauses while the split runs: about 6 to 8 days in all (estimate).
 - Each engine step needs the full tree-view CI run, about 2 to 3 hours.
