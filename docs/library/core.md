@@ -356,7 +356,11 @@ Every Unix socket agentfs listens on goes through
 `listening_socket::Listener`, which is shut down (`SHUT_RDWR`) when stopped
 or dropped. A socket that is only closed keeps taking connections for as
 long as a forked child shares it before its exec, and each connection would
-wait for a reply no one sends. `local_socket` binds sockets in the state
+wait for a reply no one sends. A socket's path exists before it listens:
+`bind(2)` creates the path and `listen(2)` follows, so a connect between them
+is refused and a path's existence does not mean ready. agentfs-csi is ready
+when `server::bind` returns: connects then queue until the socket is served.
+`local_socket` binds sockets in the state
 area, addresses them through `/proc/self/fd/<dir>/<name>` so a long path
 never hits the 108-byte limit, and accepts only peers whose `SO_PEERCRED`
 uid is root or the daemon's own (`local_socket::allowed`).
