@@ -303,8 +303,8 @@ what a trace's `Shown` exposes: each tree's files, and the lost lines of each co
 ```sh
 # Record (the same run CI makes), then replay. Without Linux and /dev/fuse, mounts stay NOT RUN.
 AGENTFS_MODEL_TRACE_DIR=$T cargo test --locked -p agentfs-model --test scenarios --test interleavings
-cargo run --locked -p agentfs-conformance --bin phase1-replay -- model   "$T" --min-scenarios 72 --min-seeds 94
-cargo run --locked -p agentfs-conformance --bin phase1-replay -- library "$T" --min-scenarios 72 --min-seeds 94
+cargo run --locked -p agentfs-conformance --bin phase1-replay -- model   "$T" --min-scenarios 74 --min-seeds 94
+cargo run --locked -p agentfs-conformance --bin phase1-replay -- library "$T" --min-scenarios 74 --min-seeds 94
 # One trace, its state kept to read with git:
 PHASE1_REPLAY_KEEP=/tmp/k phase1-replay library "$T" --min-scenarios 0 --min-seeds 0 --only NAME
 ```
@@ -336,7 +336,7 @@ What a replay decides, each reported rather than hidden:
 | Automatic takes (R1) | a mount takes only through the gate | mounted P1/P2 cases |
 | R1.3 an open's own read, R1.1 another reader | no calls: the replay makes neither read, so nothing compares them | byte and page-cache jobs |
 
-The in-scope traces at CI's seeds are 72 from scenarios and 94 from seeds (64 and 16 of the phase 1 generators, and 14 of
+The in-scope traces at CI's seeds are 74 from scenarios and 94 from seeds (64 and 16 of the phase 1 generators, and 14 of
 the ordinary ones that happened to stay in scope). The rest are excluded by the reasons above, and the replay prints the
 count of each. The floors
 in `.github/workflows/phase-1.yml` are what passes: 74 and 94 on the library, and 71 and 16 on mounts, where 81 in-scope traces are
