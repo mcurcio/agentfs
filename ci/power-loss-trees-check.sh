@@ -49,8 +49,27 @@ check_write() {
   fi
   [ "$got" = "$want" ] || fail "wrong bytes for $kind write $n"
 }
+# A write marked as soon as it returned: its bytes, saved at recovery (R12).
+check_unsynced() {
+  local n=$1 want got
+  want=$(printf 'unsynced-%s\n' "$n" | sha256sum | cut -d' ' -f1)
+  got=$(tree_git_file "$gitdir" main "x$n" | sha256sum | cut -d' ' -f1) || fail "missing unsynced write $n"
+  [ "$got" = "$want" ] || fail "wrong bytes for unsynced write $n"
+}
+# A rename marked as soon as it returned: the new name, with the old one gone.
+check_rename() {
+  local want got
+  want=$(printf 'renamed\n' | sha256sum | cut -d' ' -f1)
+  got=$(tree_git_file "$gitdir" main r | sha256sum | cut -d' ' -f1) || fail "missing renamed file"
+  [ "$got" = "$want" ] || fail "wrong bytes for renamed file"
+  ! tree_git_file "$gitdir" main y >/dev/null 2>&1 || fail "old name of the rename still present"
+}
 while read -r kind n; do
-  case "$kind" in W|SW) check_write "$kind" "$n" ;; esac
+  case "$kind" in
+    W|SW) check_write "$kind" "$n" ;;
+    XW) check_unsynced "$n" ;;
+    RN) check_rename ;;
+  esac
 done < "$m/receipts"
 if [ -n "${CHECK_MARK:-}" ]; then
   # Validate the external sequence through this mark, then require every
@@ -59,23 +78,32 @@ if [ -n "${CHECK_MARK:-}" ]; then
 import sys
 lines = open(sys.argv[1]).read().splitlines()
 kind, n = sys.argv[2], int(sys.argv[3])
-assert kind in ('F', 'C', 'SF', 'SC') and n > 0
+assert kind in ('F', 'C', 'SF', 'SC', 'XW', 'RN') and n > 0
+main = n if kind in ('F', 'C') else 8
+forked = n if kind in ('SF', 'SC') else (2 if kind in ('XW', 'RN') else 0)
 prefix = ['S']
-for i in range(1, (n if kind in ('F', 'C') else 8) + 1):
+for i in range(1, main + 1):
     prefix.extend([f'W {i}', f'F {i}'])
     if i < n or kind != 'F': prefix.append(f'C {i}')
-if kind in ('SF', 'SC'):
-    for i in range(1, n + 1):
-        prefix.extend([f'SW {i}', f'SF {i}'])
-        if i < n or kind == 'SC': prefix.append(f'SC {i}')
+for i in range(1, forked + 1):
+    prefix.extend([f'SW {i}', f'SF {i}'])
+    if i < forked or kind != 'SF': prefix.append(f'SC {i}')
+if kind in ('XW', 'RN'):
+    prefix.extend(f'XW {i}' for i in range(1, (n if kind == 'XW' else 2) + 1))
+if kind == 'RN': prefix.append('RN 1')
 assert lines[:len(prefix)] == prefix, (lines, prefix)
 PYMARK
   case "$CHECK_MARK_KIND" in
     F|C) main_files=$CHECK_MARK_N; sandbox_files=0 ;;
-    *) main_files=8; sandbox_files=$CHECK_MARK_N ;;
+    SF|SC) main_files=8; sandbox_files=$CHECK_MARK_N ;;
+    *) main_files=8; sandbox_files=2 ;;
   esac
   for n in $(seq 1 "$main_files"); do check_write W "$n"; done
   for n in $(seq 1 "$sandbox_files"); do check_write SW "$n"; done
+  case "$CHECK_MARK_KIND" in
+    XW) for n in $(seq 1 "$CHECK_MARK_N"); do check_unsynced "$n"; done ;;
+    RN) for n in 1 2; do check_unsynced "$n"; done; check_rename ;;
+  esac
 fi
 tree_git_no_duplicate_opens "$gitdir" || fail "duplicate Agentfs-Open"
 heads=$(git --git-dir="$gitdir" for-each-ref --format='%(refname) %(objectname)' refs/heads)

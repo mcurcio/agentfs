@@ -184,7 +184,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: phase-1-power-loss
-      - run: sudo apt-get update && sudo apt-get install -y fuse3 git python3 util-linux e2fsprogs xfsprogs kmod dmsetup curl gcc zlib1g-dev
+      - run: sudo apt-get update && sudo apt-get install -y fuse3 git python3 util-linux e2fsprogs xfsprogs kmod dmsetup curl gcc zlib1g-dev strace
       - uses: ./.github/actions/pinned-git
       - name: device mapper modules
         run: |
@@ -201,6 +201,11 @@ jobs:
         env:
           AGENTFS_BIN: ${{ github.workspace }}/target/debug/agentfs
           POWER_LOSS_DIR: ${{ runner.temp }}/tree-power-loss
+      - name: object directories sync before the record
+        if: matrix.fs == 'ext4'
+        run: sudo env PATH="$PATH" AGENTFS_BIN="$AGENTFS_BIN" TMPDIR="$RUNNER_TEMP" ci/trees-object-dir-syncs.sh
+        env:
+          AGENTFS_BIN: ${{ github.workspace }}/target/debug/agentfs
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         if: always()
         with:
