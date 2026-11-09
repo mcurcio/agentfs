@@ -25,7 +25,7 @@ VERIFYING.md, the held-log harness and a workflow trigger).
 - **Shared mappings, R1.4.** No replay makes an `mmap` call. The page-cache job
   does, in 21 cases, and it records one gap: a mapped store that writes the bytes its
   page last held records nothing, so a descriptor write made meanwhile stands where
-  Linux would keep the store. Open for the owner.
+  Linux would keep the store. The owner accepted it for now (design §19.1).
 - **Close-to-open** rests on kernel 7.0 and the source of v6.8, v6.14 and v7.0: 64
   closes over a busy view, same process and another. A readahead in flight on the
   handle was not exercised.
@@ -35,26 +35,16 @@ VERIFYING.md, the held-log harness and a workflow trigger).
 - **Nested forks, transactions, `Client::Outside`, Rules and profiles, replication,
   CSI, several view hosts, upgrades, snapshot opens, directories and symlinks** are
   outside phase 1. Finding 50 (a nested fork's prefix sync past its upstream's
-  fast-forward) is open and outside it.
+  fast-forward) is answered in design §19.1 and checked in the model only.
 - **Seeds 1 to 500** ran on `e9ab747`, not on every later commit.
 - **A debug build and one runner.** Each measurement is one run, on the runner's ext4
   and git 2.47.3. Two runs of one mode have differed by up to 2 times.
 
-## Open for the owner
+## The owner's answers
 
-Each is general guidance, revisable; none changes an exit row.
-
-1. **Finding 50**, see MODEL.md.
-2. **Finding 49's cost.** It was recorded as nothing; the real system does have a
-   client call waiting behind a running take. Options: keep B and accept the wait
-   stays untested outside the mounted cases (recommended); a seeded mounted test of a
-   client call during a long take; return to option A.
-3. **R1.4's gap**, above. Options: accept it as the cost of recording changed bytes
-   only (recommended); refuse shared mappings (earlier option C); record whole pages.
-4. **A fast-forward can move a fork past its own Sync merge**, which then has no
-   reference (R7, principle 7). The model and the library now agree; the Sync commit
-   carries no edits. Options: accept (recommended); require ancestry and change the
-   model; keep such commits reachable under a ref.
+Finding 50, finding 49's cost, R1.4's gap and a fast-forward past a fork's own Sync
+merge are answered in design §19.1. Each is general guidance, revisable; none changes
+an exit row.
 
 ## What is built
 

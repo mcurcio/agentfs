@@ -34,7 +34,7 @@ PASS means the job ran and every check in it passed. Limits are stated, not hidd
 | Byte calls and save alignment | **PASS** | Conformance job, `byte_calls`: split writes, append, overlap, holes, growth and shrink match a plain Linux file; line maps pass an independent git histogram diff |
 | Atomic replacement, `O_TMPFILE` and `linkat`, unlink and rename while open | **PASS** | [ci, "e2e (phase 1 tree views)", C](https://github.com/mcurcio/agentfs/actions/runs/42563672713/job/128985382505) |
 | A view-host restart with handles open | **PASS** as §18 words it | [Page-cache job, P](https://github.com/mcurcio/agentfs/actions/runs/42563670392/job/128985375366): the old handle's writes fail, the file holds what returned before the kill, saved once, and a file replaced through the new mount stays unchanged. A kernel handle cannot outlive its connection, so the same-handle reconnect form cannot occur |
-| Two writers at stale offsets through the page cache; shared `mmap` | **PASS** | Same job: 21 of 21 cases and the strict mapping script. Limit: R1.4's open gap (phase-1.md) was found by reading, not run |
+| Two writers at stale offsets through the page cache; shared `mmap` | **PASS** | Same job: 21 of 21 cases and the strict mapping script. Limit: R1.4's accepted gap (phase-1.md) was found by reading, not run |
 | Progress: unrelated stream, held log, new writers, cooperating programs, prefix sync | **PASS** for the finite scenarios | Conformance job, `progress_p1`, `progress_p2`, and the waits measured below. No starvation bound is claimed; overlapping writers can postpone a take indefinitely under the approved locks |
 | Measurements, recorded, not gated | **RECORDED**, figures below | Below |
 

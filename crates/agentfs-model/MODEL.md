@@ -15,6 +15,9 @@ The owner's words this model rests on:
 - 2026-11-07, answering findings 36, 37 and 38: "1. A 2. B 3. B" (revisable; below, and ledger R8.2, R8.3, R9.3).
 - 2026-11-08, answering finding 48: "A"; and finding 49: "Without any other information, B sounds reasonable. Obviously
   atomic operations are more reliable" (revisable; below, and ledger R11.5, R9).
+- 2026-11-08, on finding 50 (general guidance): "shouldnt a fork receive all changes from its upstream? barring transactions and
+  locks, a fork configured to sync should stay up to date"; and on the model: "from the perspective of f2, f1 is its upstream.
+  remember, there is no "main" in this new model of upstreams and forks".
 - 2026-11-02, agreeing to the upstream rule below (every collision between a fork and its upstream is decided in
   one place, the upstream's landing queue; the fork adopts that decision): "ok, that tracks".
 - 2026-11-03, on who wins there: "i think i would assume main wins. because if sandbox forked from main and
@@ -496,20 +499,23 @@ An open or rejected finding has a test marked `#[ignore = "coherence finding N: 
    (`locks`). The random runs no longer make calls during a take (none can be), so their floor on opens that waited for a take is gone;
    they still make calls, saves included, while an entry waits. Revisable: option A was to exclude those traces and count them.
    `finding_49_a_take_is_one_step_so_its_trace_replays`.
-50. **Open, for the owner (2026-11-08): a nested fork's prefix sync past its upstream's fast-forward (seed 401 of `full_lineage`,
-   `adjacent_lines` and `commit_dates_decide_nothing` at seeds 1 to 500; nested forks, so outside phase 1's generators).** f2 is a fork
-   of f1, made while f1's save x of `b` is undecided. Main's save m of `b` wins against x, and f1, with no other commit, syncs by
-   fast-forwarding to main's landing, so f1's first parents are now main's. f2 keeps `b` open, so its prefix sync (R9.3) delivers only an
-   earlier main commit, one with neither x nor the decision against x, and holds that decision back (R9.9). f2 keeps x, as R9.9 reads;
-   `syncs_deliver` wants the delivered commit's version there, because x is f1's own line, not f2's, and its excuse for held-back
-   decisions covers only the fork's own lines. Not caused by finding 49's fix: the model before it fails the same calls the same way
-   (same commits); the random calls only now reach it, because the generator draws differently. Not changed: either the check's excuse
-   widens or the prefix sync's rule changes, each the owner's call. `finding_50_a_nested_prefix_sync_past_a_fast_forward_keeps_the_upstreams_lost_line`,
-   ignored.
+50. **Closed by the owner (2026-11-08, option A, general guidance: "shouldnt a fork receive all changes from its upstream? barring
+   transactions and locks, a fork configured to sync should stay up to date"): a fork's prefix sync past its upstream's fast-forward (seed
+   401 of `full_lineage`, `adjacent_lines` and `commit_dates_decide_nothing` at seeds 1 to 500; a fork of a fork, so outside phase 1's
+   generators).** f2 is a fork of f1, made while f1's save x of `b` is undecided. The save m of `b` in f1's upstream wins against x, and
+   f1, with no other commit, syncs by fast-forwarding to that landing, so f1's first parents are now its upstream's. f2 keeps `b` open, so
+   its prefix sync of f1 (R9.3) delivers only an earlier commit, one with neither x nor the decision against x, and holds that decision
+   back (R9.9). f2 keeps x, as R9.9 reads. Sync behaviour does not change: f2 gets the unlocked `c`; `b` and its decision wait; the rest
+   arrives when the file closes. The check changes: `syncs_deliver`'s R9.3 excuse now covers any line whose decision a lock holds back,
+   whoever wrote it, and nothing wider: the decision is in the head of f2's upstream and not in the commit delivered, and the first commit
+   held back touches a file open in f2. Not caused by finding 49's fix: the model before it fails the same calls the same way (same
+   commits); the random calls only now reach it, because the generator draws differently. Revisable: the alternative was to change the
+   prefix sync's rule. `finding_50_a_prefix_sync_holds_back_a_decision_on_the_upstreams_line_until_the_close`,
+   `finding_50_a_held_back_decision_is_excused_only_while_a_lock_holds_it`.
 51. **Fixed (2026-11-08): the library merged a sync that could fast-forward (R6.1; CI seed 37 of the phase 1 generator).** A fork's save
-   loses to main's; the fork's sync can then fast-forward to main's landing, which holds the fork's commit, with nothing of the fork
-   waiting. The model did. The library merged, because its fork's line map still listed the lost version in its ancestry, so its
-   snapshot differed from main's in that alone. The fork's next save then landed as a merge rather than a fast-forward (R6.2), and a
+   loses to its upstream's; the fork's sync can then fast-forward to its upstream's landing, which holds the fork's commit, with nothing of
+   the fork waiting. The model did. The library merged, because its fork's line map still listed the lost version in its ancestry, so its
+   snapshot differed from its upstream's in that alone. The fork's next save then landed as a merge rather than a fast-forward (R6.2), and a
    later sync past an open file had that merge to deliver: the library answered Taken where the model waits. No byte differed. The
    library now fast-forwards when nothing of the fork waits and the sync shows what the upstream's commit shows, as the model does (`finding_51_a_sync_that_cannot_show_the_upstreams_commit_merges`), and takes that commit's line maps and names
    (`a_fast_forward_takes_the_upstreams_line_maps`, `a_fast_forward_takes_the_upstreams_names`), so a version the upstream
@@ -699,7 +705,8 @@ It found the model NOT SOUND: one P0, seven P1s, six P2s, from eight planted bug
   or fast-forward target in git).
 - **Whole-commit delivery is caught only by a scenario** (P2-3): a sync that splits a transaction's commit is
   caught by `r9_a_prefix_sync_holds_back_a_transaction_whole`, not by the random runs.
-- **`syncs_deliver`'s held-back excuse** covers any version taken in a held-back landing, a sibling's included;
+- **`syncs_deliver`'s held-back excuse** covers any version taken in a held-back landing, a sibling's included, and
+  since finding 50 any line whose decision a lock holds back, in any tree's landing the upstream's head holds;
   a leak through a sibling's landing is unproven.
 - **What phase 1 must validate on a real filesystem** (git-model.md §18): `RELEASE` ordering against a reopen,
   journal durability under power loss and `ENOSPC`, the object table after a view-host restart, shared `mmap`,
