@@ -763,13 +763,13 @@ impl Invariants {
         for d in &lost {
             if c.holds(&d.lost) {
                 return Err(format!(
-                    "parent_kept: {oid:.7} still holds lost {:?}",
+                    "upstream_kept: {oid:.7} still holds lost {:?}",
                     d.lost
                 ));
             }
             if !c.holds(&d.winner) && !d.whole {
                 return Err(format!(
-                    "parent_kept: {oid:.7} lacks the winner {:?}",
+                    "upstream_kept: {oid:.7} lacks the winner {:?}",
                     d.winner
                 ));
             }
@@ -947,11 +947,11 @@ impl Invariants {
     }
 }
 
-/// R6: every commit names one writer, and a merge originates nothing. A merge holds
-/// only lines one of its parents holds, or a line written by a commit in its own
-/// history: a fork keeping a file under an undecided rename takes the upstream's last
-/// lines of it, which the upstream, having ended the file, no longer stores (R11.5,
-/// the owner's "A" of 2026-11-08, finding 48).
+/// R6: every commit names one writer, and a merge originates nothing: it holds only
+/// lines one of its parents holds. One exception: a sync (R11.5, the owner's "A" of
+/// 2026-11-08, finding 48) may hold a line of the upstream's last version of a file the
+/// upstream has ended, because a fork keeping that file shows the upstream's last edit
+/// and an upstream that ended the file stores no map of it. Nothing wider.
 fn one_writer(oid: &str, c: &Commit, inv: &mut Invariants) -> Result<(), String> {
     let writers = c.trailers("Agentfs-Writer");
     if writers.len() != 1 {
@@ -966,23 +966,35 @@ fn one_writer(oid: &str, c: &Commit, inv: &mut Invariants) -> Result<(), String>
         .iter()
         .map(|p| inv.commit(p))
         .collect::<Result<_, _>>()?;
-    // The history is read only for a line neither parent holds.
-    if merge_originates(c, &parents, &[]).is_none() {
+    if merge_originates(c, &parents, &BTreeMap::new()).is_none() {
         return Ok(());
     }
-    let mut args = vec!["rev-list"];
-    args.extend(c.parents.iter().map(String::as_str));
-    let mut history = Vec::new();
-    for ancestor in inv.git.run(&args)?.lines() {
-        let a = inv.commit(ancestor)?;
-        let parents = a
-            .parents
-            .iter()
-            .map(|p| inv.commit(p))
-            .collect::<Result<_, _>>()?;
-        history.push((a, parents));
+    let mut last = BTreeMap::new();
+    if let ([_, upstream], ["Sync"]) = (parents.as_slice(), c.trailers("Agentfs-Cause").as_slice())
+    {
+        let ended: BTreeSet<u64> = c
+            .maps
+            .keys()
+            .filter(|file| !upstream.maps.contains_key(*file))
+            .copied()
+            .collect();
+        if !ended.is_empty() {
+            // The upstream parent's first parents are that tree's own history.
+            for commit in inv
+                .git
+                .run(&["rev-list", "--first-parent", &c.parents[1]])?
+                .lines()
+            {
+                let commit = inv.commit(commit)?;
+                for file in &ended {
+                    if !last.contains_key(file) && commit.maps.contains_key(file) {
+                        last.insert(*file, commit.clone());
+                    }
+                }
+            }
+        }
     }
-    match merge_originates(c, &parents, &history) {
+    match merge_originates(c, &parents, &last) {
         Some((file, version)) => Err(format!(
             "one_writer: merge {oid:.7} originates {version} of file {file}"
         )),
@@ -990,25 +1002,19 @@ fn one_writer(oid: &str, c: &Commit, inv: &mut Invariants) -> Result<(), String>
     }
 }
 
-/// The first line version merge `c` holds that neither one of its `parents` holds
-/// nor a commit of its `history` wrote: a commit there that holds it while none of
-/// its own parents does. `history` is every ancestor of `c`'s parents, each with its
-/// parents.
+/// The first line version merge `c` holds that none of its `parents` holds and that
+/// `last`, the upstream's last version of each file it ended, does not hold either.
 fn merge_originates(
     c: &Commit,
     parents: &[Commit],
-    history: &[(Commit, Vec<Commit>)],
+    last: &BTreeMap<u64, Commit>,
 ) -> Option<(u64, String)> {
-    let written = |file: u64, version: &str| {
-        history.iter().any(|(a, ps)| {
-            a.holds_line(file, version) && !ps.iter().any(|p| p.holds_line(file, version))
-        })
-    };
     c.maps
         .iter()
         .flat_map(|(file, map)| map.lines.iter().map(move |l| (*file, l.0.clone())))
         .find(|(file, version)| {
-            !parents.iter().any(|p| p.holds_line(*file, version)) && !written(*file, version)
+            !parents.iter().any(|p| p.holds_line(*file, version))
+                && !last.get(file).is_some_and(|l| l.holds_line(*file, version))
         })
 }
 
@@ -1024,55 +1030,134 @@ fn print(files: &BTreeMap<String, Vec<u8>>) -> String {
 mod tests {
     use super::*;
 
-    /// A commit whose one file, identity 1, holds `versions`.
-    fn holding(versions: &[&str]) -> Commit {
-        let lines = versions
-            .iter()
-            .map(|v| (v.to_string(), v.to_string(), Some(b"x\n".to_vec())))
-            .collect();
-        let map = FileMap {
-            path: "a".into(),
-            object: 1,
-            identity: 1,
-            lines,
-            ancestors: BTreeMap::new(),
-        };
-        Commit {
-            maps: BTreeMap::from([(1, map)]),
-            ..Commit::default()
+    /// A bare repository whose commits the real `one_writer` reads.
+    struct Repo {
+        dir: tempfile::TempDir,
+    }
+
+    impl Repo {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let status = Command::new("git")
+                .args(["init", "--bare", "-q"])
+                .arg(dir.path())
+                .status()
+                .unwrap();
+            assert!(status.success());
+            Self { dir }
+        }
+
+        fn git(&self, args: &[&str], input: &[u8]) -> String {
+            let mut child = Command::new("git")
+                .arg("--git-dir")
+                .arg(self.dir.path())
+                .args(args)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap();
+            child.stdin.take().unwrap().write_all(input).unwrap();
+            let out = child.wait_with_output().unwrap();
+            assert!(out.status.success(), "git {args:?}");
+            String::from_utf8(out.stdout).unwrap().trim().to_owned()
+        }
+
+        /// A commit with `parents`, `cause` and, for file 1, the line versions it
+        /// holds; `None` for a tree that ended the file.
+        fn commit(&self, parents: &[&str], cause: &str, lines: Option<&[&str]>) -> String {
+            let (metadata, namespace) = match lines {
+                Some(lines) => {
+                    let lines: Vec<String> = lines
+                        .iter()
+                        .map(|v| {
+                            format!(r#"{{"version":"{v}","identity":"{v}","bytes":[120,10]}}"#)
+                        })
+                        .collect();
+                    (
+                        format!(
+                            r#"{{"a":[1,1,{{"lines":[{}],"ancestors":{{}}}}]}}"#,
+                            lines.join(",")
+                        ),
+                        r#"{"1":{"head":1,"versions":{"1":{"path":"a","over":null}}}}"#.to_owned(),
+                    )
+                }
+                None => (
+                    "{}".to_owned(),
+                    r#"{"1":{"head":2,"versions":{"2":{"path":null,"over":1}}}}"#.to_owned(),
+                ),
+            };
+            let blob = |text: &str| self.git(&["hash-object", "-w", "--stdin"], text.as_bytes());
+            let tree = self.git(
+                &["mktree"],
+                format!(
+                    "100644 blob {}\tmetadata.json\n100644 blob {}\tnamespace.json\n",
+                    blob(&metadata),
+                    blob(&namespace)
+                )
+                .as_bytes(),
+            );
+            let mut args = vec!["commit-tree", tree.as_str()];
+            for parent in parents {
+                args.extend(["-p", parent]);
+            }
+            args.extend(["-F", "-"]);
+            self.git(
+                &args,
+                format!(
+                    "{cause}\n\nAgentfs-Writer: agentfs\nAgentfs-Cause: {cause}\nAgentfs-Format: envelope-1\n"
+                )
+                .as_bytes(),
+            )
+        }
+
+        fn invariants(&self) -> Invariants {
+            let root = self.commit(&[], "Root", Some(&[]));
+            self.git(&["update-ref", "refs/heads/main", &root], b"");
+            Invariants::new(self.dir.path()).unwrap()
         }
     }
 
-    /// Finding 48 (the owner's "A", 2026-11-08): a merge may hold a line a commit
-    /// in its own history wrote, though neither parent holds it.
-    #[test]
-    fn a_merge_may_hold_a_line_its_history_wrote() {
-        let (root, ended) = (holding(&["1:0"]), Commit::default());
-        let edit = holding(&["1:0", "2:0"]);
-        let merge = holding(&["1:0", "2:0"]);
-        let parents = [root.clone(), ended.clone()];
-        let history = vec![
-            (edit, vec![root.clone()]),
-            (root, Vec::new()),
-            (ended, Vec::new()),
-        ];
-        assert_eq!(merge_originates(&merge, &parents, &history), None);
+    /// The real `one_writer` on `merge`.
+    fn check(inv: &mut Invariants, merge: &str) -> Result<(), String> {
+        let c = inv.commit(merge).unwrap();
+        one_writer(merge, &c, inv)
     }
 
-    /// And nothing wider: a line no parent holds and no commit of its history wrote
-    /// is a merge originating it.
+    /// Upstream: a root holding `9:0`, an edit replacing it with `2:0`, an unlink.
+    /// The fork made its own line on the root and never held either.
+    fn upstream_ended_a_file() -> (Repo, String, String, String) {
+        let repo = Repo::new();
+        let root = repo.commit(&[], "Root", Some(&["9:0"]));
+        let edit = repo.commit(&[&root], "Direct", Some(&["2:0"]));
+        let unlink = repo.commit(&[&edit], "Direct", None);
+        let fork = repo.commit(&[&root], "Direct", Some(&["s"]));
+        (repo, edit, unlink, fork)
+    }
+
+    /// Finding 48 (the owner's "A", 2026-11-08): a sync may hold a line of the
+    /// upstream's last version of a file the upstream ended.
     #[test]
-    fn a_merge_originates_a_line_from_outside_its_history() {
-        let (root, ended) = (holding(&["1:0"]), Commit::default());
-        let merge = holding(&["1:0", "2:0"]);
-        let parents = [root.clone(), ended.clone()];
-        let history = vec![(root, Vec::new()), (ended, Vec::new())];
-        let originated = Some((1, "2:0".to_string()));
-        assert_eq!(merge_originates(&merge, &parents, &history), originated);
-        // A commit of the history that holds the line only because its parent
-        // already did wrote nothing.
-        let carried = holding(&["2:0"]);
-        let history = vec![(carried.clone(), vec![carried])];
-        assert_eq!(merge_originates(&merge, &parents, &history), originated);
+    fn one_writer_accepts_a_line_of_the_upstreams_last_version() {
+        let (repo, _, unlink, fork) = upstream_ended_a_file();
+        let merge = repo.commit(&[&fork, &unlink], "Sync", Some(&["2:0", "s"]));
+        let mut inv = repo.invariants();
+        assert_eq!(check(&mut inv, &merge), Ok(()));
+    }
+
+    /// And nothing wider: a superseded version, the upstream still holding the file,
+    /// a merge that is not a sync, or a line from nowhere all originate it.
+    #[test]
+    fn one_writer_refuses_anything_wider() {
+        let (repo, edit, unlink, fork) = upstream_ended_a_file();
+        let stale = repo.commit(&[&fork, &unlink], "Sync", Some(&["9:0", "s"]));
+        let kept = repo.commit(&[&edit], "Direct", Some(&["2:0"]));
+        let held = repo.commit(&[&fork, &kept], "Sync", Some(&["9:0", "2:0", "s"]));
+        let not_a_sync = repo.commit(&[&fork, &unlink], "Landing", Some(&["2:0", "s"]));
+        let nowhere = repo.commit(&[&fork, &unlink], "Sync", Some(&["7:7", "s"]));
+        let mut inv = repo.invariants();
+        for merge in [stale, held, not_a_sync, nowhere] {
+            let error = check(&mut inv, &merge).unwrap_err();
+            assert!(error.contains("one_writer"), "{error}");
+        }
     }
 }

@@ -368,8 +368,9 @@ of their day: "main" is the root, a "sandbox" is a fork, a "parent" is an upstre
   the upstream decides. Owner, 2026-11-07: "1 b 2 a 3 a 4 a is fine 5 a sounds correct, right? 6 a". This is his 3, option (a) of finding 44: the library changes. Revisable: option
   (b) was that the model shows the file empty. Where the upstream edited the file before the unlink, the fork never touched
   its contents, so it shows the upstream's last edit (R3d), in the model and the library; the library's sync commit then
-  holds a line neither of its git parents holds, written by a commit in its own history, and the replay's `one_writer`
-  accepts exactly that. Owner, 2026-11-08, finding 48: "A". Revisable: option B was the contents before that edit.
+  holds a line neither of its git parents holds, and the replay's `one_writer` accepts exactly that: a line of the
+  upstream's last version of a file the upstream ended, in a commit the replay reads as a sync, and nothing wider. Owner,
+  2026-11-08, finding 48: "A". Revisable: option B was the contents before that edit.
   Tests: `finding_44_a_kept_rename_of_a_file_the_parent_unlinked_keeps_its_lines`,
   `finding_48_a_kept_file_takes_the_upstreams_last_lines_and_keeps_its_own`
 - **R11.2** · approved · An editor's atomic save (write a new file, rename it over the old one) is a rewrite of

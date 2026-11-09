@@ -213,7 +213,9 @@ Agentfs-Collision: main a Line <losing commit> refs/collisions/1 a1 c3.2 m1.1
 ```
 
 A merge originates nothing: each line it adds comes from a non-first parent, and it names its second parent's
-writer, or `agentfs` for a sync. So every line traces to the one plain commit that wrote it (`one_writer`).
+writer, or `agentfs` for a sync. So every line traces to the one plain commit that wrote it (`one_writer`). One
+exception: a sync may hold a line of the upstream's last version of a file the upstream ended, because that upstream
+stores no map of it (R11.5, finding 48).
 The "when" of who changed what when is the commit's committer date, kept as its audit field; no rule reads it
 (rule 2), and the order of decisions is read from ancestry.
 

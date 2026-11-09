@@ -480,10 +480,10 @@ An open or rejected finding has a test marked `#[ignore = "coherence finding N: 
    the fork keeps the file under its new name (R11.5), and the fork never touched its contents, so a sync brings the upstream's last edit
    (R3d): the model and the library both show it, byte for byte. The library's sync commit then holds a line neither of its git parents
    holds, since an upstream that ended the file stores no map of it. The replay's `one_writer` ("a merge originates nothing") now also
-   accepts a line written by a commit in the merge's own history (an ancestor of one of its parents that holds the line while none of its
-   own parents does), and nothing wider: a line from outside that history still fails (`a_merge_originates_a_line_from_outside_its_history`,
-   in `crates/agentfs-conformance/src/invariants.rs`). Revisable: option B was the contents before that edit.
-   `finding_48_a_kept_file_takes_the_upstreams_last_lines_and_keeps_its_own`, `a_merge_may_hold_a_line_its_history_wrote`.
+   accepts, in a sync, a line of the upstream's last version of a file the upstream ended, and nothing wider: a superseded version, a file
+   the upstream still holds, a merge that is not a sync and a line from nowhere all fail, through `one_writer` itself
+   (`one_writer_refuses_anything_wider`, in `crates/agentfs-conformance/src/invariants.rs`). Revisable: option B was the contents before
+   that edit. `finding_48_a_kept_file_takes_the_upstreams_last_lines_and_keeps_its_own`, `one_writer_accepts_a_line_of_the_upstreams_last_version`.
 49. **Resolved by the owner (2026-11-08, "Without any other information, B sounds reasonable. Obviously atomic operations are more
    reliable"): a take is one atomic step in the model (seeds 78, 164, 189 of the phase 1 generator).** The model's take was two steps, a
    hold and a finish, with calls between them, and a real take is one. The trace recorded a take after the calls made during its hold, and
