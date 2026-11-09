@@ -33,7 +33,7 @@ What this changes in the code:
 - `Tree::Main` and `Tree::Fork` in the model become one tree identity with an optional upstream. The root is simply
   the tree without one. No module asks whether a tree is "main".
 - The referee takes one pair at a time: land is a fork into its upstream, sync is an upstream into a fork.
-- The model's built-in `remote` leaves `World`. Tree history publishes that a tree moved; mirrors subscribe.
+- The model's built-in `remote` leaves `World` (step 6). Tree history publishes that a tree moved; mirrors subscribe.
   What a mirror may send back, pull requests included, belongs to the mirror's own design
   ([Replication](../domains/replication.md)).
 
@@ -100,12 +100,12 @@ Each step starts with an architect, who designs that step before anyone implemen
 
 | # | Step | Gate |
 |---|---|---|
-| 0 | Safety baseline: a golden digest of final refs and commit ids over every scenario and seeds 1 to 500; the planted-bug corpus as patches, with a runner and a baseline matrix | Digest reproduces; every planted bug is caught |
+| 0 | Safety baseline: a golden digest over every scenario and seeds 1 to 500 of each run's refs and commits, with tree names normalised and commit ids and dates left out, so a rename cannot change it and an outcome change must; the planted-bug corpus as anchored mutants that survive code moves, with a runner and a baseline matrix | Digest reproduces; every planted bug is caught |
 | 1 | Model: checker state out of `World` | Digest, scenarios, 500 seeds and the bug matrix unchanged |
 | 2 | Model: referee units out of `resolve`, `adopt` and `splice` | Same |
-| 3 | Model: queue and locks, and recording, split out; one tree identity with an optional upstream; `World` is the composition root | Same. Names may change, outcomes may not |
+| 3 | Model: queue and locks, and recording, split out; one tree identity with an optional upstream, keeping today's order (root first, forks ascending); `World` is the composition root; the replicate step keeps its place among the pending steps, because random runs draw from that list | Same. Names may change, outcomes may not |
 | 4 | Recorder: an engine call sequence becomes a model trace, so a regression found on a mount replays in the model. Guidance, owner, 2026-11-07: "if new regressions are found in the implementation, then those regressions can be verified and fixed via the git model" | One known regression replays |
 | 5 | Engine: remove the duplicated ancestry check, name combining and R3e; a typed version; then split `tree_actor/mod.rs` | Conformance traces on every scenario and seed stay at 0 mismatched |
-| 6 | Model: R9.18, R10.5 and R10.11 (see [transactions](transactions.md)) | The digest is re-baselined on purpose; finding 30's test is no longer ignored |
+| 6 | Model: R9.18, R10.5 and R10.11 (see [transactions](transactions.md)); the built-in `remote` and its replicate step leave `World` | The digest is re-baselined on purpose; finding 30's test is no longer ignored |
 
 Not in this slice: the older engine (`volume.rs`, `push.rs`), and building mirrors on the tree model.
