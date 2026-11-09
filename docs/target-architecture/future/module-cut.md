@@ -95,6 +95,9 @@ names (to a fixed point), placing, whole (land only). Land and sync run the same
 
 ## Steps
 
+Each step starts with an architect, who designs that step before anyone implements it. Guidance, owner, 2026-11-09:
+"I want each phase of the work to start with an architect".
+
 | # | Step | Gate |
 |---|---|---|
 | 0 | Safety baseline: a golden digest of final refs and commit ids over every scenario and seeds 1 to 500; the planted-bug corpus as patches, with a runner and a baseline matrix | Digest reproduces; every planted bug is caught |

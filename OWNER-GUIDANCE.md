@@ -46,6 +46,7 @@ on his answer.
 - **Guidance**, 2026-11-09. Asked whether to keep accepting the gap or refuse shared mappings: "A for now, but C might be reasonable in the future". Applies to: `docs/target-architecture/future/shared-mappings.md`.
 - **Guidance**, 2026-11-06. On state formats from earlier work: "drop support. we are pre-production and there is no need to worry about "supporting" old concepts".
 - **Guidance**, 2026-11-08. On how to cut the tree actor into modules, he picked option "B" [six modules: recording, queue and locks, referee, transactions, tree history and journal, with the tree actor only composing them]. To start when the module is next opened. Applies to: `docs/target-architecture/future/module-cut.md`.
+- **Guidance**, 2026-11-09. On the revised module cut: "I generally approve. I want each phase of the work to start with an architect". Applies to: every step of `docs/target-architecture/future/module-cut.md`.
 
 ## History and versions
 
