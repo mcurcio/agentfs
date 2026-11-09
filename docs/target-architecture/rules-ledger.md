@@ -166,7 +166,8 @@ of their day: "main" is the root, a "sandbox" is a fork, a "parent" is an upstre
 - **R6.1** · approved · A sync that cannot fast-forward is a merge commit credited to `agentfs`, with no edits of
   its own. Approved by the owner, 2026-11-05 (approval page).
   The replay compares each take's new head with the model's: its `Agentfs-Cause` and parent count (`history_shape`).
-  Tests: `finding_51_a_sync_after_a_lost_save_fast_forwards`, `a_fast_forward_takes_the_upstreams_line_maps`,
+  Tests: `finding_51_a_sync_after_a_lost_save_fast_forwards`, `finding_51_a_sync_that_cannot_show_the_upstreams_commit_merges`,
+  `a_fast_forward_takes_the_upstreams_line_maps`,
   `a_fast_forward_takes_the_upstreams_names`
 - **R6.2** · owner · A landing on the upstream's current head is a fast-forward, in the model and the library: the fork's
   commit is the upstream's head, with no landing commit. Owner, 2026-11-07: "1 b 2 a 3 a 4 a is fine 5 a sounds correct, right? 6 a". This is his 4, option (a) of finding 45.

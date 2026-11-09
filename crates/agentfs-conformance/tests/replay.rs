@@ -457,6 +457,27 @@ fn finding_49_a_take_is_one_step_so_its_trace_replays() {
     passes(&w);
 }
 
+/// Finding 51 (seed 198 of the phase 1 generator, 2026-11-08; R6.1): nothing of the fork
+/// waits, but a sync to the upstream's commit shows a held-open file differently, so it
+/// is a merge, not a fast-forward: the model keeps the file's saved line, and so must the
+/// library, and the replay's `history_shape` reads the same merge.
+#[test]
+fn finding_51_a_sync_that_cannot_show_the_upstreams_commit_merges() {
+    let mut w = world();
+    let f = w.create_fork(agentfs_model::world::Tree::Main);
+    let s = Client::Fork(f);
+    save(&mut w, &m1(), "a", &[at(4, "n2\n")]);
+    World::rename(&mut w, &m1(), "d", "c");
+    let held = w.open_write(&s, "d");
+    save(&mut w, &m1(), "a", &[at(0, "n3\n")]);
+    save(&mut w, &s, "d", &[at(0, "n4\n")]);
+    assert_eq!(w.take_next(TreeId::Main).unwrap(), Took::Taken);
+    w.write(held, at(0, "-\n-\n-\n-\n-\n-\n"));
+    w.write(held, Write::Truncate(12));
+    assert_eq!(w.take_next(TreeId::Fork(1)).unwrap(), Took::Taken);
+    passes(&w);
+}
+
 /// Finding 51 (CI seed 37 of the phase 1 generator, 2026-11-08; R6.1, R6.2): a fork's save
 /// loses to main's, and the fork's sync can then fast-forward to main's landing, since that
 /// landing holds the fork's commit and nothing of the fork waits. The library merged instead,

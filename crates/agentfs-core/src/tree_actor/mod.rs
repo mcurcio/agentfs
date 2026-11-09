@@ -1309,6 +1309,24 @@ impl Volume {
         Ok(())
     }
 
+    /// Whether two snapshots show the same: the same files, each with the same line
+    /// versions in the same order, and the same name versions. The versions each line
+    /// version was written over may differ.
+    fn shows_the_same(a: &referee::Snapshot, b: &referee::Snapshot) -> bool {
+        a.files.len() == b.files.len()
+            && a.names.len() == b.names.len()
+            && a.files.iter().all(|(id, file)| {
+                b.files
+                    .get(id)
+                    .is_some_and(|other| other.lines.lines == file.lines.lines)
+            })
+            && a.names.iter().all(|(id, history)| {
+                b.names
+                    .get(id)
+                    .is_some_and(|other| other.head == history.head)
+            })
+    }
+
     fn changed_keys(before: &referee::Snapshot, after: &referee::Snapshot) -> BTreeSet<queue::Key> {
         let ids: BTreeSet<_> = before
             .names
@@ -1636,10 +1654,10 @@ impl Volume {
             let parent = self.snapshot_at(target)?;
             let mut snapshot = plan.snapshot;
             // R6.1: a sync that can fast-forward does. It can when nothing of the fork waits
-            // for the upstream: the sync then shows what the upstream's commit shows. The
-            // fork takes that commit's line maps and names too, so a version the upstream
-            // decided against stays in history only (finding 51). Model: `World::sync`.
-            let head = if !self.pending_from(tree)? {
+            // for the upstream and the sync shows what the upstream's commit shows (the
+            // model's `World::sync`). The fork then takes that commit's line maps and names,
+            // so a version the upstream decided against stays in history only (finding 51).
+            let head = if Self::shows_the_same(&parent, &snapshot) && !self.pending_from(tree)? {
                 for (id, file) in &mut snapshot.files {
                     if let Some(theirs) = parent.files.get(id) {
                         file.lines = theirs.lines.clone();
