@@ -1,8 +1,6 @@
 # agentfs target architecture: the Telemetry domain
 
-**Layer:** System › **Domain: Telemetry** › Feature.
-**Status:** draft 7, proposed, under [system.md](../system.md) revision 10 and [git-model.md](../git-model.md). The
-target, not today's code; sketches are Rust surfaces.
+**Proposed, not built.** This page proposes the Telemetry domain (metrics, traces and alarms), one part of the system around the git model ([the system](../system.md)). The git model ([git-model.md](../git-model.md)) wins wherever the two disagree. Rust sketches show surfaces only. The commit that lands the slice that builds this domain deletes this page and moves the behaviour into the library or operator docs.
 
 ## 1. What Telemetry owns, and what it is not
 
@@ -10,11 +8,7 @@ Telemetry turns the events every domain publishes into metrics, traces, log reco
 operator's monitoring. It is the one home of alarms. It never blocks a caller, never fails one, and nothing in agentfs
 reads anything back from it.
 
-| # | The owner's words | Date | What it asks of Telemetry |
-|---|---|---|---|
-| R7 | "Security boundary. Agentfs is the gatekeeper that exposes only what we want sandboxes to see" | 2026-10-30 | no file content and no credential leaves through a signal |
-| R16 | "The various agentfs components should be within the same version family" | 2026-11-02 | each signal names its version; a version refusal is visible |
-| — | "It's all event driven" | 2026-10-24 | alarms raise and clear on events; no timer judges anything here |
+The owner's guidance that applies here is in `OWNER-GUIDANCE.md` at the repository root. Everything else on this page is a design choice.
 
 **Owns:** the catalogue (every metric, span, log and alarm name), the alarm board, trace identity, export. **Is not:**
 a judge of any fact, a source of events, dashboards or alert thresholds, persistence.
@@ -69,7 +63,7 @@ files, git-model §6) exist only so the operator sees a stalled queue; nothing r
 | T2 | Nothing depends on Telemetry | no query; `cargo deny`; the port is always bound, export `Off` a value | build + boot time |
 | T3 | Every event kind has exactly one catalogue entry | `Event` is closed; one exhaustive `match`, wildcards denied | compile time |
 | T4 | No identity or path is ever a metric label | labels take only sealed `LabelValue` | compile time |
-| T5 | No file content and no credential reaches any signal (R7) | attributes take only sealed `AttrValue` | compile time |
+| T5 | No file content and no credential reaches any signal | attributes take only sealed `AttrValue` | compile time |
 | T6 | Each condition alarm is raised and cleared only by its judge's events, never by silence or elapsed time | tested over the catalogue; clippy bans timers | construction + test |
 | T7 | Telemetry persists nothing; its board is rebuilt from the judges' re-published state before `ServiceReady` | no repository port | construction + test |
 
@@ -89,7 +83,7 @@ alarm change, whatever the export policy), `Clock` (stamps only).
 | Export | `Off` unless an `OTEL_*` endpoint is set |
 | Trace sampling | ratio on the trace id, 1.0 (operator, `OTEL_TRACES_SAMPLER`) |
 | Metric export interval | 60 s (the SDK's default; a listed operator schedule) |
-| Resource attributes | volume, process role, `service.version` (full semantic version, R16), pod and node |
+| Resource attributes | volume, process role, `service.version` (full semantic version), pod and node |
 
 The catalogue is the one home of every signal name: the metric and alarm reference and example alert rules are
 generated from it, and CI checks they match.
@@ -108,10 +102,9 @@ generated from it, and CI checks they match.
 2. **The caller pays the translation:** a catalogue lookup and a few atomic updates on its thread.
 3. **Paths in logs** put path names in the operator's collector.
 
-## Reconcile with existing code (agentfs origin/main b5c0dc8)
+## Where it meets the existing code
 
 - `EventSink` becomes the port with a closed `Event`; free-form fields become per-domain diagnostics.
 - Telemetry stops being optional: the port is always bound, `Off` an export value; the once-a-minute stderr warning becomes one line per export-link change.
 - Alarm gauges set by each subsystem (`patch.blocked`, `push.diverged`) move onto the board. Cost: every name is regenerated from the catalogue in one release, with no aliases.
 
-*History: drafts 1–6 are in git; draft 7 (2026-11-03) conforms to the git model.*

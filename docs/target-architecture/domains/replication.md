@@ -1,8 +1,7 @@
 # Domain: Replication
 
-**Layer:** System › **Domain (Replication)** › Feature.
-**Status:** draft 5, proposed, under [system.md](../system.md) revision 10 and [git-model.md](../git-model.md). The
-target, not today's code; Rust sketches show surfaces only.
+**Proposed, not built.** This page proposes the Replication domain (remotes, credentials, pushes and divergence), one part of the system around the git model ([the system](../system.md)). The git model ([git-model.md](../git-model.md)) wins wherever the two disagree. Rust sketches show surfaces only. The commit that lands the slice that builds this domain deletes this page and moves the behaviour into the library or operator docs.
+
 **What the git model already fixes** (git-model §4): Replication is the shared remote's only pusher; its refspec
 carries main's branch and every collision ref; a recorded collision makes a
 push due; no queue step waits on the network. This page covers the rest: remotes, credentials, attempts, divergence
@@ -13,18 +12,8 @@ and settlement.
 Replication copies refs the git model has already written to zero or more git remotes, and fetches from them. It is
 the only domain that talks to a remote and the only one that holds a credential. It never moves a local branch.
 
-**The owner's words this domain rests on.** Everything else here is a design choice.
+The owner's guidance that applies here is in `OWNER-GUIDANCE.md` at the repository root. Everything else on this page is a design choice.
 
-| # | His words | Date | What it asks of Replication |
-|---|---|---|---|
-| — | "Remotes can come and go. It's not a error to have zero remotes" | 2026-10-17 | an empty remote set is normal |
-| — | "B. And if no remote is configured, the volume is lost, and that's a choice the user is allowed to make." | 2026-10-17 | no remote, no alarm; release does not wait for one |
-| R7 | "Security boundary. Agentfs is the gatekeeper that exposes only what we want sandboxes to see" | 2026-10-30 | no credential reachable through a view |
-| R16 | "i would like for the git history to remain compatible across minor versions, and only break on a major version change" | 2026-11-02 | a new major never overwrites an older one's refs |
-| — | "yes, \"losing\" patches should still be part of the history. i want to know who changed what when" | 2026-11-03 | every collision ref is pushed and kept (git-model §4) |
-| A4 | "A fork whose branches are rejected and never land in the main branch will inevitably be lost, and that's acceptable" (replaced above for losing changes) | answer | pushing a fork's whole branch stays optional (§4) |
-| — | "an admin should have more expansive abilities to fix issues and overwrite history. it should be documented and auditable (where possible), but "admin" users are a specific class" | 2026-10-18 | an operator-only, audited replace of a diverged remote ref |
-| — | "It's all event driven" | 2026-10-24 | pushes follow `TreeMoved`; the only timers are operator schedules |
 
 | Term | Meaning here |
 |---|---|
@@ -87,7 +76,7 @@ pub enum PushError {
 }
 pub enum FetchError { Unreachable(IoKind), CredentialRefused, UntrustedHost, UnknownRemote, NoSuchRef, OtherMajor(Version) }
 pub enum Settlement {
-    NoRemotes,                                  // nothing will be pushed (his 2026-10-17 "B")
+    NoRemotes,                                  // nothing will be pushed (a volume with no remote is the user's choice)
     Held,                                       // every remote carrying main holds `through`
     Pending { remotes: Vec<RemoteName> },
     Failing { remotes: Vec<(RemoteName, PushError)> },
@@ -126,9 +115,9 @@ Called by operators (`push`, `replace_diverged`, `status`) and Volume (`settleme
 |---|---|---|---|
 | RP1 | Zero remotes is normal: no alarm, nothing waits, `settlement` says `NoRemotes` | `Settlement::NoRemotes` is a value, not an error | compile time |
 | RP2 | A credential is presented only to the origin it is bound to; redirects are never followed | `Endpoint::bind` is the only constructor; the transport takes `&Endpoint` | compile + construction + test |
-| RP3 | No secret byte enters state, logs or events; no credential lies under a tree, mount or view (R7) | `CredentialRef` has no byte accessor; `bind` refuses a location under a tree root | compile + construction |
+| RP3 | No secret byte enters state, logs or events; no credential lies under a tree, mount or view | `CredentialRef` has no byte accessor; `bind` refuses a location under a tree root | compile + construction |
 | RP4 | A remote ref is only created or fast-forwarded, judged from the value the remote reports in the same connection; never forced, except `replace_diverged` | the claim runs inside the attempt; the only replace takes an Operator `ActorCap` and a `Lease` | compile + test |
-| RP5 | Replication touches only this volume's refs of this release's major; another major's refs are never listed, moved or deleted (R16) | refspecs are built only from `OwnedRef` | compile + construction |
+| RP5 | Replication touches only this volume's refs of this release's major; another major's refs are never listed, moved or deleted | refspecs are built only from `OwnedRef` | compile + construction |
 | RP6 | A failing, slow or diverged remote never delays a save, a take or another remote | no port to the git model's actors; one attempt per remote | compile + test |
 | RP7 | What a remote holds is the remote's fact: push state records the last claim, never the truth; only a pending divergence name is authority, persisted before its push | the claim reads only the attempt's listing | construction + crash test |
 | RP8 | Every losing commit reaches every remote, eventually, and stays (git-model §15, `losers_pushed`) | collision refs are create-only and in every remote's refspec | test |
@@ -152,7 +141,7 @@ with a lease touches the remote ref.
 | 1,000 forks | `Main`: one replica set per remote, whatever the fork count; `MainAndForks`: one more per live fork |
 | A slow, dead or refusing remote | `Unreachable` at an I/O deadline, then `Backoff`; other remotes settle on their own |
 | Crash mid-attempt | each remote is `Due` at restart; the next listing shows what it holds, so a push that landed is `UpToDate`, never a false divergence |
-| Upgrade (R16) | a minor continues the same refs; **a major pushes under its own refs** (design choice), so another major's history is never diverged, forced or deleted |
+| Upgrade | a minor continues the same refs; **a major pushes under its own refs** (design choice), so another major's history is never diverged, forced or deleted |
 
 | Setting | Current choice (design choice unless cited) |
 |---|---|
@@ -171,7 +160,7 @@ with a lease touches the remote ref.
 | Another writer moves main's ref; kill the service between Pending and Confirmed | a forced push; one divergence under many names |
 | One remote blackholed, one live: save and take rates unchanged | a dead remote stalling the volume |
 | A run with collisions, then drain: every collision is re-read on the remote alone, writer and line | a losing change lost (RP8) |
-| A remote holding a previous major's refs receives a new major's pushes | old history overwritten (R16) |
+| A remote holding a previous major's refs receives a new major's pushes | old history overwritten |
 
 ## 7. Costs
 
@@ -187,13 +176,12 @@ with a lease touches the remote ref.
 Ref names on the remote (git-model §4 gives the collision prefix); batching many fork refs in one
 attempt; SSH host-certificate rules (keep today's); the push-state row layout.
 
-## Reconcile with existing code (agentfs origin/main b5c0dc8)
+## Where it meets the existing code
 
 - **The interval push loop** becomes attempts started by `TreeMoved`, with `pushInterval` as spacing.
 - **`meta/push/<remote>.json`** becomes an audited row; only the Pending divergence name gains authority.
 - **Remote sections in the repository config** move to the deployment config; origin binding, SSH, proxies and limits stay. **The final push within `--push-grace`** goes: release is Volume's verdict on `settlement`.
 - **Ref names gain the major** and the collision refs.
 
-**NOT RUN:** no code was built or tested.
+**Not verified:** no code was built or tested.
 
-*History: drafts 1–4 are in git; draft 5 (2026-11-03) conforms to the git model.*

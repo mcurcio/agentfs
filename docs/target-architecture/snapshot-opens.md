@@ -1,8 +1,9 @@
 # Snapshot opens (parked)
 
-**Status:** parked, not in force, not built. Owner, 2026-11-05: "Locks, keep snapshots on file". The landing model
-uses locks ([rules ledger](rules-ledger.md) R9, R9.10). This page is the next step if the prototype shows that
-overlapping opens really do starve landings.
+**Parked, not built.** This page proposes snapshot opens as the replacement for the landing model's locks
+([rules ledger](rules-ledger.md) R9, R9.10), to be built only if mounted use shows that overlapping opens starve
+landings. The owner asked to keep it on file. The commit that builds it deletes this page and moves the behaviour
+into the library and operator docs. If the idea is dropped, the page is deleted.
 
 **The idea:** a sync or landing never waits for an open file. Each open is tracked against the commit it opened. At
 close, agentfs first builds the program's edit on that commit, then reconciles it with what has landed since. It
@@ -39,14 +40,11 @@ The rest of this page is the design as reviewed, unchanged.
 
 ## Design as reviewed: The staged close: a save is built first, reconciled after
 
-**Layer:** system · **module (the landing model: saves, syncs, landings)** · feature. **Status:** proposed, replaces `snapshot-opens-design.md`. **Asked of you:** three questions (§7). Holes are marked **HOLE**.
+**Scope:** the landing model (saves, syncs, landings). Three questions are open (§7). Holes are marked **HOLE**.
 
-### 0. Your words (2026-11-05)
-- "it seems that a few of these questions are related to this new lock-free-snapshot-merge strategy. Under that philosophy, the collision detection must occur downstream of the file edit computation. That is -- when the client closes the file, the first stage is simply trying to build the edit that the client just made, either for a commit or for the impending transaction. The reconciliation with the prior landed commits occurs _after_ that edit has been calculated. If we build this as a properly staged approach, then hopefully items 1,2, and 3 are no longer special cases."
-- "The other reason that I think this deserved a real stages architecture consideration is that it implies an implicit fork whenever a landing occurs. My mental model is that whenever a landing is about to occur, the client view becomes sticky to whatever commit predates the client landing. And the client view can only be fast-forwarded after the landing(s) have been fully resolved and also only when the client opens a file again."
-- "note that the view can only move forward for each file that has opened after the landing. so we would likely need to track each open file against the SHA that it opened"
-- "alright, lets try option 4 until it becomes a problem."; "we absolutely must avoid deadlocking, while also trying to minimize starvation"; "the lock mechanism only really applies to agentfs interactions -- we do not need to lock/serialize multiple clients from competing with one another"; "i want minimal "special cases""
-- Item 3, a sandbox program opens a file, a sync brings main's line, the program changes that line and closes: "is the correct experience that the main file shows at the end? how do we make this _not_ a special case?"
+### 0. The owner's guidance
+
+His words on lock-free snapshot merging, with their date, are in `OWNER-GUIDANCE.md` at the repository root. In short: collision detection happens after the client's edit is computed; a client's view stays at the commit that predates a landing until the landing resolves; each open is tracked against the commit it opened; deadlock must be avoided and starvation minimised.
 
 | New term | Means | Why needed | Existing term it could be |
 |---|---|---|---|
@@ -55,7 +53,7 @@ The rest of this page is the design as reviewed, unchanged.
 | reconcile commit | a merge on the tree's head, second parent the edit commit, made only when something arrived since the base | stage 2's output when it is not a fast-forward | a landing's merge |
 | claim | which lines the calls took: an append the new tail, an offset write the lines it changed, a truncate and rewrite every line (R8) | what stage 2 compares | none |
 | left for the parent | the tree shows the program's line over a line a sync brought, undecided (R9.16, R3a) | names stage 2's one non-final result | "undecided" |
-| resolved | the sandbox has no entry left in its parent's queue | your "fully resolved", as an event | none |
+| resolved | the sandbox has no entry left in its parent's queue | the owner's "fully resolved", as an event | none |
 
 Existing terms: *referee*, *actor* (the one worker per tree), *queue*, *version*, *written over*, *journal*, *orphan* (git-model §3, §5, §7).
 
@@ -92,7 +90,7 @@ flowchart LR
 
 **Does the real commit work? Yes.** I ran it (`staged-spike/`, `spike.log`, seven sequences on real git, unchanged `written_over`). P0-2: the edit's first parent holds b, so the chain reads c over b, and c collides with p instead of silently replacing it. Finding 8: y's first parent is x's commit; main's commit is not in y's ancestry at all, so both readings of "saw" agree; x and y both lose; every check passes at every step. Two changes needed: `land` treats "first parent is the parent's head" as "saw everything" (it panicked: a merge's first parent can be that head and still lose), and `one_writer`'s "a merge originates nothing" (§5).
 
-| Your item (I read 1 and 2 as your neighbouring answers; please confirm) | Sequence | Result | Special case? |
+| The owner's item (1 and 2 read as his neighbouring answers) | Sequence | Result | Special case? |
 |---|---|---|---|
 | 1. Arriving delete (R9.14) | open a at B; sync unlinks a; write; close | Build: edit as ever. Reconcile: the edit goes in the line map under the deleted name, so the file stays gone. Land: an edit of a file the parent deleted loses, in history (R11) | No. Not an orphan (P0-1): only a delete in the same tree orphans (R11.3) |
 | 2. Rewrite (R9.15) | open a with `O_TRUNC` at B; sync brings p; write; close | Claim is every line, so the tree holds exactly the program's bytes, never a file neither wrote (P0-4) | No inside the tree. **Upstream, see item 3** |
@@ -159,7 +157,7 @@ R5.2's question, does a transaction declare its program: this design does not ne
 | Byte oracle, `save_aligned`, `appends_exact`; new `close_reconciled` | stronger: edit commit = base plus calls, read from its first parent; and (P1-5's gap) every claimed line is in the merge by stage 2's rule, read from git |
 | `one_writer` | the merge may add versions only for its own named writer, with the edit's bytes. R6 unchanged; this drops a design clause, so please see it. All other checks passed in the run |
 | `no_flicker`, `upstream_wins`, `changes_whole`; `syncs_deliver` | unchanged, passed in the run; stronger under Q3 (a): after a sync the heads are equal |
-| `no_silent_loss` | **weaker, per step, in Q2's window only.** Run: "m1.1 entered Fork(1):a[a0] and is gone"; passes once the parent decides. Not changed without your answer |
+| `no_silent_loss` | **weaker, per step, in Q2's window only.** Run: "m1.1 entered Fork(1):a[a0] and is gone"; passes once the parent decides. Not changed without the owner's answer |
 
 | Review finding | Answer | | Review finding | Answer |
 |---|---|---|---|---|
@@ -179,7 +177,7 @@ R5.2's question, does a transaction declare its program: this design does not ne
 3. A busy sandbox sees nothing of main, and neither do sandboxes inside it, until it is resolved (§3).
 4. An arriving delete makes a save vanish from view; it is in history and named. In main too.
 5. Offsets are the base's: a `pwrite` after an arrival grew the file lands where the base had it, unlike Linux.
-6. A save deferred behind a transaction (R5.3) is unseen until it ends. A program polling for it while the transaction's owner waits on that program hangs until the owner gives up. No agentfs wait; your "deferred, obviously" stands, but you should know. Unrelated programs in a sandbox also join its transaction (git-model §9).
+6. A save deferred behind a transaction (R5.3) is unseen until it ends. A program polling for it while the transaction's owner waits on that program hangs until the owner gives up. No agentfs wait; the owner's "deferred, obviously" stands, with this cost. Unrelated programs in a sandbox also join its transaction (git-model §9).
 
 **Prototype only:** the kernel caches pages per file, not per open, so serving two opens at two commits needs a cost measured; shared memory maps across two bases; `RELEASE` arriving after a reopen, and whether its order is the true "later close"; whether `stat` and listings move with the tree or wait for an open (R9.13 speaks only of opens); how often real programs hold a file across an arrival; take time against close rate (Q3); both-create at one path; large files.
 **Not run:** random seeds, appends, partial lines, renames, nesting, transactions, crash replay, Q1 (b) on the chain. The spike writes whole images, with the old locks left in place, and is a test of the commit shape, not the design's code.
@@ -194,7 +192,6 @@ R5.2's question, does a transaction declare its program: this design does not ne
 - **(b) No: stickiness starts at the write-open.** No flip, check unchanged. Cost: one log held open stops all syncs into that sandbox, for hours if it stays open, and a program in it waiting on a file from main hangs: the wait option 4 removed.
 
 **Q3. What must be resolved before a sync shows?** Sequence: a sandbox's x is in main's queue; main changes another file g; the program opens g.
-- **(a) Recommended: all its landings.** It reads the old g, then the new one after main decides x. Your words as I read them: "the client landing" is its own save going up. Removes sync merges, `adopt`, `keep_own_names`, finding 17's half-shown rename. Cost: §3's busy sandbox; try until it becomes a problem.
+- **(a) Recommended: all its landings.** It reads the old g, then the new one after main decides x. His words, as read here: "the client landing" is its own save going up. Removes sync merges, `adopt`, `keep_own_names`, finding 17's half-shown rename. Cost: §3's busy sandbox; try until it becomes a problem.
 - **(b) Nothing: a sync shows at the next open, own undecided lines kept on top.** It reads the new g at once. This is how the words read if "landing" meant the sync coming in; atomic moves already meet that. Never stale. Cost: all that machinery stays, and a view moves before its landing is resolved.
 
-*History: 2026-11-05, replaces snapshot opens after review 1; R9.17 added mid-draft.*
