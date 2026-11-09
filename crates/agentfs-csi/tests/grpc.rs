@@ -72,8 +72,8 @@ impl Driver {
             Duration::from_secs(30),
             Backoff::default(),
         ));
+        let bound = server::bind(&socket).unwrap();
         let task = tokio::spawn({
-            let socket = socket.clone();
             let controller = ControllerService::new(layout.clone(), "node-1".into(), release);
             let node = NodeService::new(Supervisor::new(
                 NodeConfig::new("node-1", layout.clone()),
@@ -81,11 +81,12 @@ impl Driver {
                 Arc::new(KernelMounter),
             ));
             async move {
-                server::serve(&socket, IdentityService::new(), controller, node, async {
-                    let _ = stopped.await;
-                })
-                .await
-                .unwrap();
+                bound
+                    .serve(IdentityService::new(), controller, node, async {
+                        let _ = stopped.await;
+                    })
+                    .await
+                    .unwrap();
             }
         });
         let channel = connect(&socket).await;
@@ -122,6 +123,7 @@ impl Driver {
     }
 }
 
+/// A channel to a socket `server::bind` has returned: it is listening.
 async fn connect(socket: &Path) -> Channel {
     let socket: PathBuf = socket.to_path_buf();
     let deadline = Instant::now() + Duration::from_secs(2);
@@ -1605,15 +1607,14 @@ async fn a_stopping_driver_refuses_connects_while_calls_finish() {
     };
     let socket = dir.path().join("csi.sock");
     let (stop, stopped) = oneshot::channel::<()>();
-    let task = tokio::spawn({
-        let socket = socket.clone();
-        async move {
-            server::serve(&socket, IdentityService::new(), controller, node, async {
+    let bound = server::bind(&socket).unwrap();
+    let task = tokio::spawn(async move {
+        bound
+            .serve(IdentityService::new(), controller, node, async {
                 let _ = stopped.await;
             })
             .await
             .unwrap();
-        }
     });
     let channel = connect(&socket).await;
     let call = tokio::spawn(async move {
@@ -1639,4 +1640,15 @@ async fn a_stopping_driver_refuses_connects_while_calls_finish() {
     call.await.unwrap().unwrap();
     task.await.unwrap();
     assert!(!socket.exists());
+}
+
+/// `server::bind` returning is the readiness a client waits on: the socket
+/// is listening, and a connect succeeds with nothing serving it yet (design
+/// §2.2).
+#[tokio::test]
+async fn a_bound_socket_takes_a_connect_before_anything_serves_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("csi.sock");
+    let _bound = server::bind(&socket).unwrap();
+    UnixStream::connect(&socket).await.unwrap();
 }

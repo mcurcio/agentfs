@@ -6,7 +6,7 @@ use std::io;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
-use agentfs_core::listening_socket::Listener;
+use agentfs_core::listening_socket::{AsyncListener, Listener, Stopper};
 
 use crate::controller::ControllerService;
 use crate::csi::v1::controller_server::ControllerServer;
@@ -45,17 +45,20 @@ pub fn parse_endpoint(endpoint: &str) -> Result<PathBuf, EndpointError> {
     }
 }
 
-/// Binds `socket` (replacing a stale one, mode 0660) and serves Identity,
-/// Controller and Node (every node plugin serves all three, F8 R8) until
-/// `shutdown` completes; then stops accepting calls, lets running ones
-/// finish, and removes the socket.
-pub async fn serve<N: Node>(
-    socket: &Path,
-    identity: IdentityService,
-    controller: ControllerService,
-    node: N,
-    shutdown: impl Future<Output = ()>,
-) -> Result<(), ServerError> {
+/// A socket that is listening and not yet served. Dropping it
+/// stops the listener, so a connect is refused, and leaves the file behind.
+pub struct BoundSocket {
+    path: PathBuf,
+    listener: AsyncListener,
+    stopper: Stopper,
+}
+
+/// Binds `socket`, replacing a stale one, with mode 0660. When this returns
+/// the socket is listening: a connect succeeds and queues until
+/// [`BoundSocket::serve`] takes it, so the return is the readiness to wait
+/// on, not the path's existence. Must run inside a tokio
+/// runtime.
+pub fn bind(socket: &Path) -> Result<BoundSocket, ServerError> {
     let io_err = |what, source| ServerError::Io {
         what,
         path: socket.to_path_buf(),
@@ -80,24 +83,48 @@ pub async fn serve<N: Node>(
     let listener = Listener::bind(socket)
         .and_then(Listener::into_async)
         .map_err(|e| io_err("binding", e))?;
-    // Stops the listener once `shutdown` completes: tonic keeps its
-    // incoming stream while calls finish, and a connect then must be
-    // refused, not left unanswered (`agentfs_core::listening_socket`).
     let stopper = listener.stopper().map_err(|e| io_err("binding", e))?;
-    let shutdown = async move {
-        shutdown.await;
-        let _ = stopper.stop();
-    };
     fs::set_permissions(socket, fs::Permissions::from_mode(0o660))
         .map_err(|e| io_err("setting the mode of", e))?;
-    let result = tonic::transport::Server::builder()
-        .add_service(IdentityServer::new(identity))
-        .add_service(ControllerServer::new(controller))
-        .add_service(NodeServer::new(node))
-        .serve_with_incoming_shutdown(listener, shutdown)
-        .await;
-    let _ = fs::remove_file(socket);
-    result.map_err(ServerError::from)
+    Ok(BoundSocket {
+        path: socket.to_path_buf(),
+        listener,
+        stopper,
+    })
+}
+
+impl BoundSocket {
+    /// Serves Identity, Controller and Node (every node plugin serves all
+    /// three, F8 R8) until `shutdown` completes; then stops accepting calls,
+    /// lets running ones finish, and removes the socket.
+    pub async fn serve<N: Node>(
+        self,
+        identity: IdentityService,
+        controller: ControllerService,
+        node: N,
+        shutdown: impl Future<Output = ()>,
+    ) -> Result<(), ServerError> {
+        let Self {
+            path,
+            listener,
+            stopper,
+        } = self;
+        // Stops the listener once `shutdown` completes: tonic keeps its
+        // incoming stream while calls finish, and a connect then must be
+        // refused, not left unanswered (`agentfs_core::listening_socket`).
+        let shutdown = async move {
+            shutdown.await;
+            let _ = stopper.stop();
+        };
+        let result = tonic::transport::Server::builder()
+            .add_service(IdentityServer::new(identity))
+            .add_service(ControllerServer::new(controller))
+            .add_service(NodeServer::new(node))
+            .serve_with_incoming_shutdown(listener, shutdown)
+            .await;
+        let _ = fs::remove_file(&path);
+        result.map_err(ServerError::from)
+    }
 }
 
 #[cfg(test)]
