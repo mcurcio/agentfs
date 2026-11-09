@@ -1,22 +1,23 @@
 # Supported configurations
 
 The ways agentfs can be put together, as reference material to check a
-design against. Section 1 lists the dimensions a configuration varies
+change or a design against. Section 1 lists the dimensions a configuration varies
 on. Section 2 gives named example configurations, each a combination of
 those values. Section 3 says how to use them.
 
-This page links to the homes of each fact rather than restating them.
-[design.md](design.md) is authoritative, and every key and flag is in
-the [configuration reference](configuration.md). Section numbers (§)
-refer to design.md.
+This page links to the homes of each fact rather than restating them:
+[guarantees](guarantees.md), [recording](recording.md),
+[remotes](remotes.md), [patches](patches.md), [forks](forks.md) and
+[csi.md](csi.md). Every key and flag is in the
+[configuration reference](configuration.md).
 
 Every value is marked:
 
 | Mark | Meaning |
 |---|---|
-| **built** | In the code today; the cell names its design section, key or flag |
-| **not built** | Not in the code. The cell says whether it is an open gate ([open questions](design.md#192-open-questions)). Do not rely on it |
-| **not supported** | Refused by a recorded decision (§19.1) |
+| **built** | In the code today; the cell names the key, flag or page |
+| **not built** | Not in the code. Do not rely on it |
+| **not supported** | Refused on purpose |
 
 There are two different worlds, and a design must say which one it is
 in:
@@ -30,10 +31,10 @@ in:
   share commits through remotes. What matters is refs, order, merging and
   gating.
 
-[Phase 1 of the proposed architecture](target-architecture/phase-1.md) currently
-supports one local actor, main and an optional isolated sandbox mount, flat files
-only, without remotes or CSI. Its end-to-end validation work continues on this
-implementation. The combinations below describe the earlier implementation.
+Tree views (`agentfs trees`, [trees](trees.md)) are a separate mode: one
+local actor, a main mount and an optional isolated sandbox mount, flat files
+only, without remotes or CSI. The combinations below describe `agentfs
+mount` and the layers around it.
 
 ## 1. Dimensions
 
@@ -45,16 +46,16 @@ the lower ones ([architecture.md](architecture.md#crates)).
 | Layer | Crate | What a consumer uses | Status |
 |---|---|---|---|
 | Library | `agentfs-core` | Rust calls with no mount and no agentfs process: opening a state area and recording (`volume`, the `Recorder`), restore and revert planning (`restore`), the patch queue (`patch`), forks (`fork::create`, `fork::finish`, `fork::listing`), delivering a fork's change through the `Delivery` contract (`fork::deliver`), the deletion decider (`release::decide`) | **built** (module map: [architecture.md](architecture.md#agentfs-core)) |
-| Filesystem | `agentfs-fuse` and the `agentfs` binary | `agentfs mount` (the FUSE mount); `run` (the commit and push loops without a mount); `serve-history` with `mount --history-service` fronts (§14.1); one-shot commands: `init`, `record`, `flush`, `push`, `checkpoint`, `status`, `probe`, `restore`, `revert`, `patch submit`, `patch approve`, `patch apply`, `patch status`, `fork create`, `fork finish`, `fork status`, `fork abandon`, `fork list`, `fork deliver`, `start accept`, `lfs fetch`, `lfs prune` | **built** ([flags](configuration.md#flags-and-environment)) |
-| Filesystem | the control socket, `meta/control/agentfs.sock` | `push` (push now), `restore`, `revert`, `apply`, `checkpoint` and `judge` against a running daemon; JSON lines, version 1, root or the daemon's user only | **built** (§2.3, §15) |
+| Filesystem | `agentfs-fuse` and the `agentfs` binary | `agentfs mount` (the FUSE mount); `run` (the commit and push loops without a mount); `serve-history` with `mount --history-service` fronts; one-shot commands: `init`, `record`, `flush`, `push`, `checkpoint`, `status`, `probe`, `restore`, `revert`, `patch submit`, `patch approve`, `patch apply`, `patch status`, `fork create`, `fork finish`, `fork status`, `fork abandon`, `fork list`, `fork deliver`, `start accept`, `lfs fetch`, `lfs prune` | **built** ([flags](configuration.md#flags-and-environment)) |
+| Filesystem | the control socket, `meta/control/agentfs.sock` | `push` (push now), `restore`, `revert`, `apply`, `checkpoint` and `judge` against a running daemon; JSON lines, version 1, root or the daemon's user only | **built** |
 | Filesystem, packaged for Kubernetes | the sidecar manifests and the sidecar library chart | the binary as a privileged native sidecar, one pod per volume | **built** ([deployment.md](deployment.md), [helm.md](helm.md)) |
-| Kubernetes adapter | `agentfs-csi` | StorageClass parameters (`profile`, `volumeName`, `onDelete`, `startFrom`, `workloadMounts`, `fork`, `link`, `remotes`), profiles in a ConfigMap, credentials in a Secret, claims, DeleteVolume's release decider | **built** ([parameters](configuration.md#the-csi-driver-agentfs-csi), §14.2) |
-| Every layer | what agentfs writes for others to read | the history branch and `refs/agentfs/<volume>/*` on remotes (§11.4); the patch status ref; OpenTelemetry metrics, traces and alarms (§13); `status`, `patch status --json` and `fork status --json` | **built** |
-| Filesystem | checkpoint: an integrator says a batch of work is done, which cuts one commit for it | `agentfs checkpoint [-m TEXT]`, or the control socket's `checkpoint`: one commit on `refs/agentfs/<volume>/change-line` | **built** (§12 "Checkpoints and the change line") |
-| Filesystem | notify: agentfs tells an integrator the queue's verdicts changed | the hook `$GIT_DIR/hooks/patch-notify`; the webhook `agentfs.patchNotifyUrl` | **built** (§12 "Notify", [keys](configuration.md)) |
-| Filesystem | apply: an integrator asks agentfs to land waiting patches now | `agentfs patch apply`; `serve-git`'s `POST /agentfs/apply`. It lands only with nothing attached. Under a running daemon it only judges and answers "workload attached; lands at next mount" (exit 75) | **built** (§12 "Apply") |
-| Filesystem | `agentfs serve-git --listen HOST:PORT`: agentfs as a git server that takes patch pushes | git's smart HTTP; pushers are `[agentfsPusher "<name>"]` sections with rights `offer`, `approve`, `barrier`, `integrator` | **built** (§12, §19.1 "serve-git") |
-| Kubernetes adapter | a git endpoint per node plugin for offers, approvals and a sidecar's checkpoints | `agentfs-csi` runs no `serve-git` | **not built**; not in the design |
+| Kubernetes adapter | `agentfs-csi` | StorageClass parameters (`profile`, `volumeName`, `onDelete`, `startFrom`, `workloadMounts`, `fork`, `link`, `remotes`), profiles in a ConfigMap, credentials in a Secret, claims, DeleteVolume's release decider | **built** ([parameters](configuration.md#the-csi-driver-agentfs-csi)) |
+| Every layer | what agentfs writes for others to read | the history branch and `refs/agentfs/<volume>/*` on remotes; the patch status ref; OpenTelemetry metrics, traces and alarms; `status`, `patch status --json` and `fork status --json` | **built** |
+| Filesystem | checkpoint: an integrator says a batch of work is done, which cuts one commit for it | `agentfs checkpoint [-m TEXT]`, or the control socket's `checkpoint`: one commit on `refs/agentfs/<volume>/change-line` | **built** |
+| Filesystem | notify: agentfs tells an integrator the queue's verdicts changed | the hook `$GIT_DIR/hooks/patch-notify`; the webhook `agentfs.patchNotifyUrl` | **built** ([patches](patches.md), [keys](configuration.md)) |
+| Filesystem | apply: an integrator asks agentfs to land waiting patches now | `agentfs patch apply`; `serve-git`'s `POST /agentfs/apply`. It lands only with nothing attached. Under a running daemon it only judges and answers "workload attached; lands at next mount" (exit 75) | **built** |
+| Filesystem | `agentfs serve-git --listen HOST:PORT`: agentfs as a git server that takes patch pushes | git's smart HTTP; pushers are `[agentfsPusher "<name>"]` sections with rights `offer`, `approve`, `barrier`, `integrator` | **built** |
+| Kubernetes adapter | a git endpoint per node plugin for offers, approvals and a sidecar's checkpoints | `agentfs-csi` runs no `serve-git` | **not built** |
 
 ### 1.2 Sharing topology
 
@@ -63,13 +64,13 @@ sharing-one-volume world.
 
 | Value | How | What clients get | Status |
 |---|---|---|---|
-| One process, one mount | `agentfs mount BACKING MOUNTPOINT`; one workload process | Every change boundary recorded before the call returns (§3.1, §3.2) | **built** |
-| Several processes, one mount | Several processes or containers use one FUSE mount: one pod's containers (deployment.md §10, Hermes and its tool containers), or several Docker workload containers on one host mount ([docker.md](docker.md#2-the-layout)) | One kernel and one daemon. Grouped commits carry one `Agentfs-Uid` and `Agentfs-Pid` line per writer (§9) | **built** |
-| Several pods, one volume, one node | CSI only: one front per pod (`mount --history-service`), one history service per volume (`serve-history`) | Files shared with the backing filesystem's semantics: two pods writing one file is last writer wins; POSIX locks are not shared between pods, so a SQLite database is written from one pod ([csi.md](csi.md#6-using-a-volume)). A commit never holds two pods' changes; each pod has its own committer (§9, §14) | **built** (§14.1, §14.2) |
-| One daemon, two mount points: the main mount and the sandbox overlay | `agentfs mount --sandbox-overlay PATH --sandbox-owner UID:GID` (example 12) | One set of names, one set of open files, one recorder. The overlay shows only recordable files and keeps other new files in a private tmp layer; each kernel caches its own names, invalidated by events from the other; POSIX and BSD locks are not shared between the two mounts (§1.1, §2.4) | **built** (single-process `mount` only); on a front or a CSI volume **not built** (open, §19.2 item 13) |
+| One process, one mount | `agentfs mount BACKING MOUNTPOINT`; one workload process | Every change boundary recorded before the call returns | **built** |
+| Several processes, one mount | Several processes or containers use one FUSE mount: one pod's containers ([deployment.md](deployment.md#10-hermes): Hermes and its tool containers), or several Docker workload containers on one host mount ([docker.md](docker.md#2-the-layout)) | One kernel and one daemon. Grouped commits carry one `Agentfs-Uid` and `Agentfs-Pid` line per writer | **built** |
+| Several pods, one volume, one node | CSI only: one front per pod (`mount --history-service`), one history service per volume (`serve-history`) | Files shared with the backing filesystem's semantics: two pods writing one file is last writer wins; POSIX locks are not shared between pods, so a SQLite database is written from one pod ([csi.md](csi.md#6-using-a-volume)). A commit never holds two pods' changes; each pod has its own committer | **built** |
+| One daemon, two mount points: the main mount and the sandbox overlay | `agentfs mount --sandbox-overlay PATH --sandbox-owner UID:GID` (example 12) | One set of names, one set of open files, one recorder. The overlay shows only recordable files and keeps other new files in a private tmp layer; each kernel caches its own names, invalidated by events from the other; POSIX and BSD locks are not shared between the two mounts | **built** (single-process `mount` only); on a front or a CSI volume **not built** (not built) |
 | Several pods through the sidecar | | The sidecar is one pod per volume ([deployment.md](deployment.md#11-limitations)) | use the CSI driver |
-| Several nodes, one volume | `ReadWriteMany`, `ReadOnlyMany` | Refused: the claim stays Pending. Pods on other nodes read the history from a remote | **not supported** (§19.1, 2026-10-15) |
-| A volume moving between nodes | | A worktree stays on its node for good. Continuing elsewhere is a new volume started from the old branch (example 10) | **not supported** as a move (§14.2, [moving.md](runbooks/moving.md)) |
+| Several nodes, one volume | `ReadWriteMany`, `ReadOnlyMany` | Refused: the claim stays Pending. Pods on other nodes read the history from a remote | **not supported** |
+| A volume moving between nodes | | A worktree stays on its node for good. Continuing elsewhere is a new volume started from the old branch (example 10) | **not supported** as a move ([moving.md](runbooks/moving.md)) |
 
 ### 1.3 Remote topology
 
@@ -78,53 +79,53 @@ exchanging-through-git world.
 
 | Value | How | What happens | Status |
 |---|---|---|---|
-| No remote (local-only) | No `[remote "<name>"]` section | Records and commits; pushes nothing; no alarm. A remote added later gets all the history. The history dies with the disk ([remotes modes](configuration.md#remotes-modes)) | **built** (§11.1, §19.1 "Zero remotes") |
-| One remote | One section with `url` | Pushed every `agentfs.pushInterval`. It is also the patch remote by default | **built** (§11.1, §11.2) |
-| Several remotes | Several sections | Each has its own push thread, push state and alarms. The smallest `agentfsMaxBlobSize` and `agentfsMaxLfsObjectSize` apply to recording. There is no patch remote unless `agentfs.patchRemote` names one | **built** (§11.1, §11.3, §12) |
-| Volumes sharing one repository | Several volumes, one remote URL, unique `agentfs.volume` names | Each writes only `refs/heads/agentfs/<volume>` and `refs/agentfs/<volume>/*`. Another writer is detected as a divergence, not prevented | **built** (§11.4) |
-| Linked fork | `agentfs fork create` (default `--link linked`), or a CSI fork class | Pushes its history to the fork remote: the section with `agentfsForkRemote = true`, else the source's patch remote. A local-only source's forks publish into the source's own history. On finish it publishes one change on its base; the receiver gates it | **built** (§11.5) |
-| Unlinked fork | `fork create --link unlinked [--remotes FILE]`, or a fork class with `link: unlinked` and `remotes` | Never delivers to its source and never pushes to the source's remotes. With no remotes of its own it is local-only and lost when deleted, the owner's choice | **built** (§11.5 "The link", §19.1 "Unlinked fork remotes") |
-| Hidden fork history | `agentfs.forkRefs = hidden` in the source | New forks keep their history at `refs/agentfs/<fork>/history`, not under `refs/heads/` | **built**; whether a forge runs CI on it is open (§19.2 item 9) |
-| Forks of forks | `agentfs fork create` from a linked fork's state area, or a fork class claim whose `dataSource` is a linked fork's claim | When the child finishes, its change is queued as the parent's next inbox number on the fork remote. The parent lands it at its next mount with nothing attached, and the parent's own change carries it up. A child that finishes after its parent is published as a top-level fork (`ForkParentFinished`). Refused: a fork of an unlinked fork, of a fork with hidden history, or of a fork of a local-only source | **built** (§12 "Forks of forks", [runbook](runbooks/patch-queue.md#9-forks-of-forks)) |
-| Started from another worktree's branch | CSI start class, `startFrom: "<remote>:<branch>@<commit>"` | A new volume with its own branch whose history begins at that commit. `StartBranchMoved` alarms if the old branch gains commits | **built** (§11.3, §14.2) |
-| Patch producers | iac, CI or a person: `agentfs patch submit` or plain git, to `refs/agentfs/<volume>/inbox/<n>` on the patch remote, or pushed to `agentfs serve-git` | Applied in order with nothing attached. A patch that cannot land is set aside and the rest go on; the run stops only at a `gap`, `unrecorded` changes or a failure. Status in `refs/agentfs/<volume>/status` | **built** (§12, [patches.md](patches.md)) |
-| A fork's change delivered | `agentfs fork deliver <fork> --to inbox\|branch\|command\|webhook`, run by the receiver with its own credentials | `inbox` queues it as a patch; `branch` creates a pull request's head branch; `command` and `webhook` hand the payload to a program. The CSI driver never delivers | **built** (§11.5 "Delivery", [forks.md](forks.md#delivering-a-change)) |
-| A forge in the loop (GitHub, Gitea) | An ordinary remote | agentfs pushes its own refs. It never opens, reads, reviews or merges a pull request. Anyone writing the volume's branch there is another writer: a divergence (§11.3) | **built** as a plain remote; nothing forge-specific |
-| A patch landed live into a running volume | | Patches land only with nothing attached: at mount, or `agentfs patch apply` with no daemon. The owner, 2026-10-29: "No live landing yet" | **not built**; a later gate (§19.1 "No live landing yet", §19.2 item 11) |
-| A patch that is a branch | Any line of single-parent commits on an ancestor of the head, pushed to `inbox/<n>` | Merged by the `git` program and landed as one commit | **built** (§12 "What a patch is") |
-| A conflicting patch held while the rest go on; barriers | `patch submit --barrier` (an `Agentfs-Barrier: yes` tip) | A patch that cannot land is set aside whole (`PatchHeld`) and later patches go on. While a barrier is set aside, every later patch waits | **built** (§12) |
+| No remote (local-only) | No `[remote "<name>"]` section | Records and commits; pushes nothing; no alarm. A remote added later gets all the history. The history dies with the disk ([remotes modes](configuration.md#remotes-modes)) | **built** |
+| One remote | One section with `url` | Pushed every `agentfs.pushInterval`. It is also the patch remote by default | **built** |
+| Several remotes | Several sections | Each has its own push thread, push state and alarms. The smallest `agentfsMaxBlobSize` and `agentfsMaxLfsObjectSize` apply to recording. There is no patch remote unless `agentfs.patchRemote` names one | **built** |
+| Volumes sharing one repository | Several volumes, one remote URL, unique `agentfs.volume` names | Each writes only `refs/heads/agentfs/<volume>` and `refs/agentfs/<volume>/*`. Another writer is detected as a divergence, not prevented | **built** |
+| Linked fork | `agentfs fork create` (default `--link linked`), or a CSI fork class | Pushes its history to the fork remote: the section with `agentfsForkRemote = true`, else the source's patch remote. A local-only source's forks publish into the source's own history. On finish it publishes one change on its base; the receiver gates it | **built** |
+| Unlinked fork | `fork create --link unlinked [--remotes FILE]`, or a fork class with `link: unlinked` and `remotes` | Never delivers to its source and never pushes to the source's remotes. With no remotes of its own it is local-only and lost when deleted, which is the user's choice | **built** |
+| Hidden fork history | `agentfs.forkRefs = hidden` in the source | New forks keep their history at `refs/agentfs/<fork>/history`, not under `refs/heads/` | **built**; whether a forge runs CI on it is not verified |
+| Forks of forks | `agentfs fork create` from a linked fork's state area, or a fork class claim whose `dataSource` is a linked fork's claim | When the child finishes, its change is queued as the parent's next inbox number on the fork remote. The parent lands it at its next mount with nothing attached, and the parent's own change carries it up. A child that finishes after its parent is published as a top-level fork (`ForkParentFinished`). Refused: a fork of an unlinked fork, of a fork with hidden history, or of a fork of a local-only source | **built** ([patches](patches.md#forks-of-forks), [runbook](runbooks/patch-queue.md#9-forks-of-forks)) |
+| Started from another worktree's branch | CSI start class, `startFrom: "<remote>:<branch>@<commit>"` | A new volume with its own branch whose history begins at that commit. `StartBranchMoved` alarms if the old branch gains commits | **built** |
+| Patch producers | iac, CI or a person: `agentfs patch submit` or plain git, to `refs/agentfs/<volume>/inbox/<n>` on the patch remote, or pushed to `agentfs serve-git` | Applied in order with nothing attached. A patch that cannot land is set aside and the rest go on; the run stops only at a `gap`, `unrecorded` changes or a failure. Status in `refs/agentfs/<volume>/status` | **built** ([patches.md](patches.md)) |
+| A fork's change delivered | `agentfs fork deliver <fork> --to inbox\|branch\|command\|webhook`, run by the receiver with its own credentials | `inbox` queues it as a patch; `branch` creates a pull request's head branch; `command` and `webhook` hand the payload to a program. The CSI driver never delivers | **built** ([forks.md](forks.md#listing-and-delivering-a-change)) |
+| A forge in the loop (GitHub, Gitea) | An ordinary remote | agentfs pushes its own refs. It never opens, reads, reviews or merges a pull request. Anyone writing the volume's branch there is another writer: a divergence | **built** as a plain remote; nothing forge-specific |
+| A patch landed live into a running volume | | Patches land only with nothing attached: at mount, or `agentfs patch apply` with no daemon. Patches never land while a workload runs | **not built** |
+| A patch that is a branch | Any line of single-parent commits on an ancestor of the head, pushed to `inbox/<n>` | Merged by the `git` program and landed as one commit | **built** |
+| A conflicting patch held while the rest go on; barriers | `patch submit --barrier` (an `Agentfs-Barrier: yes` tip) | A patch that cannot land is set aside whole (`PatchHeld`) and later patches go on. While a barrier is set aside, every later patch waits | **built** |
 
 ### 1.4 Knobs that change commits, pushes and patches
 
 | Knob | Set in | What it changes | Status |
 |---|---|---|---|
-| `agentfs.commitWindow` | config, default `200ms` | Records this close in time become one commit. Grouping changes how history reads, not what is kept (§3.4) | **built** |
-| Fixed commit boundaries | none | Restores, reverts and patches are commits of their own. A commit never mixes pods. With `agentfs.nested = working-tree`, a nested repository's `index.lock` bounds a group (§3.4, §9) | **built** |
-| `agentfs.commit=fsync`, `agentfs.group`, `agentfs.coalesce` | `info/attributes` only | Databases: a group (`app.db`, `-wal`, `-journal`) recorded whole as one atomic record at `fsync`, by a timer, at its last close and at unmount; up to one `agentfs.coalesce` late (§8) | **built** |
-| `agentfs.sweepInterval` | config, default `30s` | The backstop that records files held open and retries failed records (§3.1, §3.5) | **built** |
-| `agentfs.pushInterval` | config, default `60s` | How often each remote is pushed, and the base of the failure backoff (§11.2) | **built** |
-| Push now | `agentfs push` against a running daemon | Commits what is recorded and wakes each remote's push at once (§2.3, §11.2) | **built** |
-| `--push-grace` | `mount`, `run`, `serve-history`, default `5s` | One last push of the final commit at shutdown; `0s` skips it (§11.2) | **built** |
-| `agentfsMaxPushSize` | per remote | A backlog too large for one push goes out in first-parent steps (§11.3) | **built** |
-| `agentfsMaxBlobSize`, `agentfsMaxLfsObjectSize` | per remote | Content over the smallest limit is refused at record time (`PathRefused`) unless stored as LFS (§3.4, §11.3) | **built** |
-| `--passthrough auto\|on\|off` | `mount`; `agentfs-csi --passthrough` for fronts | Whether data reads and writes bypass the daemon (§2.1). `fsync`-class paths never use passthrough (§3.1) | **built** |
-| Git LFS: `agentfs.lfsThreshold`, `agentfs.store`, `filter=lfs`, `lfs.url`, `remote.<name>.lfsurl` | config, `info/attributes` | Which content is stored as LFS and where it is uploaded ([Git LFS](configuration.md#git-lfs), §7) | **built** |
-| Path rules: `info/exclude`, `-agentfs`, `agentfs.maxSize` | the git directory, set by the operator | Which new paths are recorded; `-agentfs` is never recorded even if tracked (§4) | **built** |
-| `agentfs.respectTreeRules` | config, default `false` | Whether tracked `.gitignore` and `.gitattributes` take part in path rules. They can never set `agentfs.*` attributes (§4.1) | **built** |
-| `agentfs.nested` | config, default `exclude` | Nested git repositories: record nothing in them, or their working files (§5) | **built** |
-| `agentfs.repackInterval` | config, default `1h` | Storage only: repacks history; changes no commit (§3.4) | **built** |
-| `agentfs.patchRemote`, `agentfs.patchFetchTimeout` | config | Where the inbox is fetched from and the queue status pushed; how long start waits for the fetch (§12) | **built** |
-| When patches are applied | none | At `mount`; at `serve-history` start with no fronts running, which under CSI is NodeStage; by `agentfs patch apply` with the volume stopped. `agentfs run` does not apply them (§12, §14.2) | **built** |
-| `patch submit --replace N`, `--skip N` | the producer | Replaces or skips patch N: a set-aside patch, or the one a stopped queue stopped at (§12) | **built** |
-| `agentfs.forkRefs`, `--link`, `--remotes`, `onDelete` | source config; `fork create`; StorageClass | Where forks push, whether they deliver back, and what deleting a claim does (§11.5, §14.2) | **built** |
-| `[agentfs "identity"]` templates | config | Committer and author of each commit (§9) | **built** |
-| Restore and revert modes | `agentfs restore`, `revert`; `--dry-run`, `--force` | Through a running mount, through the history service, or directly with `--root` when nothing runs. Each is one commit. `run` serves none and the command exits 75 (§15) | **built** |
-| Checkpoint | `agentfs checkpoint`, `-m TEXT` | Cuts one commit per change intent on the change line (§12) | **built** |
-| Notify | `$GIT_DIR/hooks/patch-notify`; `agentfs.patchNotifyUrl`, `agentfs.patchNotifyCredentialFile`, `agentfs.patchNotifyTimeout` | One notice when the queue's verdicts change, after each queue run and each judging. A failure raises `NotifyFailed`, and the next queue event sends it again (§12) | **built** |
-| Apply | `agentfs patch apply`, `--no-fetch` | Lands waiting patches when nothing is attached. Under a running daemon it only judges, and each patch that would land is `ready` (§12) | **built**; landing into a running volume is **not built** |
-| Acceptance rule | `agentfs.patchAccept` = `cleanMerge` (default), `approval` (`agentfs patch approve N`) or `command` (`$GIT_DIR/hooks/patch-accept`); `agentfs.patchAcceptTimeout` | Whether a patch that merges cleanly may land (§12) | **built** |
-| Merge or rebase | `agentfs.patchIntegrate` = `merge` (default) or `rebase`; merge drivers from `$GIT_DIR/info/attributes` | How a patch is merged onto the head, by the `git` program. Either way it lands as one commit (§12) | **built** |
-| Which line a remote gets | `remote.<name>.agentfsPush` = `branch` (default) or `changeLine` | Every recorded commit, or only the checkpoints and the patches they merged (§12) | **built** |
+| `agentfs.commitWindow` | config, default `200ms` | Records this close in time become one commit. Grouping changes how history reads, not what is kept | **built** |
+| Fixed commit boundaries | none | Restores, reverts and patches are commits of their own. A commit never mixes pods. With `agentfs.nested = working-tree`, a nested repository's `index.lock` bounds a group | **built** |
+| `agentfs.commit=fsync`, `agentfs.group`, `agentfs.coalesce` | `info/attributes` only | Databases: a group (`app.db`, `-wal`, `-journal`) recorded whole as one atomic record at `fsync`, by a timer, at its last close and at unmount; up to one `agentfs.coalesce` late | **built** |
+| `agentfs.sweepInterval` | config, default `30s` | The backstop that records files held open and retries failed records | **built** |
+| `agentfs.pushInterval` | config, default `60s` | How often each remote is pushed, and the base of the failure backoff | **built** |
+| Push now | `agentfs push` against a running daemon | Commits what is recorded and wakes each remote's push at once | **built** |
+| `--push-grace` | `mount`, `run`, `serve-history`, default `5s` | One last push of the final commit at shutdown; `0s` skips it | **built** |
+| `agentfsMaxPushSize` | per remote | A backlog too large for one push goes out in first-parent steps | **built** |
+| `agentfsMaxBlobSize`, `agentfsMaxLfsObjectSize` | per remote | Content over the smallest limit is refused at record time (`PathRefused`) unless stored as LFS | **built** |
+| `--passthrough auto\|on\|off` | `mount`; `agentfs-csi --passthrough` for fronts | Whether data reads and writes bypass the daemon. `fsync`-class paths never use passthrough | **built** |
+| Git LFS: `agentfs.lfsThreshold`, `agentfs.store`, `filter=lfs`, `lfs.url`, `remote.<name>.lfsurl` | config, `info/attributes` | Which content is stored as LFS and where it is uploaded ([Git LFS](configuration.md#git-lfs)) | **built** |
+| Path rules: `info/exclude`, `-agentfs`, `agentfs.maxSize` | the git directory, set by the operator | Which new paths are recorded; `-agentfs` is never recorded even if tracked | **built** |
+| `agentfs.respectTreeRules` | config, default `false` | Whether tracked `.gitignore` and `.gitattributes` take part in path rules. They can never set `agentfs.*` attributes | **built** |
+| `agentfs.nested` | config, default `exclude` | Nested git repositories: record nothing in them, or their working files | **built** |
+| `agentfs.repackInterval` | config, default `1h` | Storage only: repacks history; changes no commit | **built** |
+| `agentfs.patchRemote`, `agentfs.patchFetchTimeout` | config | Where the inbox is fetched from and the queue status pushed; how long start waits for the fetch | **built** |
+| When patches are applied | none | At `mount`; at `serve-history` start with no fronts running, which under CSI is NodeStage; by `agentfs patch apply` with the volume stopped. `agentfs run` does not apply them | **built** |
+| `patch submit --replace N`, `--skip N` | the producer | Replaces or skips patch N: a set-aside patch, or the one a stopped queue stopped at | **built** |
+| `agentfs.forkRefs`, `--link`, `--remotes`, `onDelete` | source config; `fork create`; StorageClass | Where forks push, whether they deliver back, and what deleting a claim does | **built** |
+| `[agentfs "identity"]` templates | config | Committer and author of each commit | **built** |
+| Restore and revert modes | `agentfs restore`, `revert`; `--dry-run`, `--force` | Through a running mount, through the history service, or directly with `--root` when nothing runs. Each is one commit. `run` serves none and the command exits 75 | **built** |
+| Checkpoint | `agentfs checkpoint`, `-m TEXT` | Cuts one commit per change intent on the change line | **built** |
+| Notify | `$GIT_DIR/hooks/patch-notify`; `agentfs.patchNotifyUrl`, `agentfs.patchNotifyCredentialFile`, `agentfs.patchNotifyTimeout` | One notice when the queue's verdicts change, after each queue run and each judging. A failure raises `NotifyFailed`, and the next queue event sends it again | **built** |
+| Apply | `agentfs patch apply`, `--no-fetch` | Lands waiting patches when nothing is attached. Under a running daemon it only judges, and each patch that would land is `ready` | **built**; landing into a running volume is **not built** |
+| Acceptance rule | `agentfs.patchAccept` = `cleanMerge` (default), `approval` (`agentfs patch approve N`) or `command` (`$GIT_DIR/hooks/patch-accept`); `agentfs.patchAcceptTimeout` | Whether a patch that merges cleanly may land | **built** |
+| Merge or rebase | `agentfs.patchIntegrate` = `merge` (default) or `rebase`; merge drivers from `$GIT_DIR/info/attributes` | How a patch is merged onto the head, by the `git` program. Either way it lands as one commit | **built** |
+| Which line a remote gets | `remote.<name>.agentfsPush` = `branch` (default) or `changeLine` | Every recorded commit, or only the checkpoints and the patches they merged | **built** |
 
 ## 2. Example configurations
 
@@ -186,15 +187,15 @@ repository.
 - **History:** `agentfs/<volume>` on GitHub, pushed every 60 s and at
   shutdown within `--push-grace`. The credentials file holds a token
   (or `username=` and `password=` lines) and is re-read when the Secret
-  rotates (§11.1).
+  rotates.
 - **Limits:** a privileged sidecar
   ([deployment.md](deployment.md#9-security-trade-offs-of-the-privileged-sidecar));
   one pod per volume. A failed push alarms and retries; recording carries
-  on (§11.3).
+  on.
 
 ### Example 3: Hermes as the deploy example describes it
 
-**For:** the first consumer (§16): an agent that edits its own skills,
+**For:** an agent that edits its own skills,
 persona and profiles, whose configuration iac also changes.
 
 | Dimension | Value |
@@ -206,7 +207,7 @@ persona and profiles, whose configuration iac also changes.
 
 The files are in [`deploy/examples/hermes`](../deploy/examples/hermes),
 and the pod changes are in
-[deployment.md §10](deployment.md#10-hermes). iac queues a change in its
+[deployment.md section 10](deployment.md#10-hermes). iac queues a change in its
 clone of the history repository, then restarts the pod:
 
 ```sh
@@ -300,9 +301,9 @@ agentfs fork deliver <fork> --to inbox --volume <source volume>
   commit on the source's branch.
 - **Limits:** the source applies the change at its next start (for CSI,
   its next NodeStage), not while it runs; landing it live is **not built**. A change that
-  conflicts is set aside whole and later patches go on (§12). The sandbox
+  conflicts is set aside whole and later patches go on. The sandbox
   must run on the source's node. Delivery pushes unreviewed output where
-  the target's own CI acts on it (§19.1 "Fork content").
+  the target's own CI acts on it.
 
 ### Example 6: forks of forks
 
@@ -321,8 +322,7 @@ change rolled up into its parent.
   as its parent's next `inbox/<n>` on the fork remote, and the child
   pushes its `finish` ref, not a `change` ref. The parent lands it at its
   next mount (for CSI, its next NodeStage) with nothing attached. The
-  parent's own change then carries it one level up (§12 "Forks of
-  forks").
+  parent's own change then carries it one level up ([patches](patches.md#forks-of-forks)).
 - **Limits:** a child that finishes after its parent is published as a
   top-level fork and raises `ForkParentFinished`. A child's change that
   reaches the parent's inbox after the parent's last mount is not in the
@@ -360,8 +360,7 @@ name unique.
 
 - **Each workload sees** only its own volume.
 - **History:** `refs/heads/agentfs/agent-a` and `agentfs/agent-b`, with
-  each volume's patch queue under its own `refs/agentfs/<volume>/`
-  (§11.4). Pushes from different volumes never contend.
+  each volume's patch queue under its own `refs/agentfs/<volume>/`. Pushes from different volumes never contend.
 - **Limits:** a token is scoped to the repository, so every volume can
   write every other's refs. agentfs detects another writer as a
   divergence; it does not prevent one. Two volumes with the same name see
@@ -401,7 +400,7 @@ or CI still opens the pull request.
   Recording carries on. Changes the reviewers want
   in the volume go through the patch queue (`agentfs patch submit`) and
   land at its next start. Whether GitHub runs CI on a hidden fork ref is
-  open (§19.2 item 9).
+  open.
 
 ### Example 9: an operator restores or reverts
 
@@ -429,7 +428,7 @@ kubectl -n agentfs-csi exec <node plugin pod> -c agentfs-csi -- \
   history service writes them.
 - **History:** one commit per operation, `restore <path> from <id>` or
   `revert <id>: <subject>`, with `Agentfs-Trigger: restore` and the
-  operator as author (§9).
+  operator as author.
 - **Limits:** the commit must be on the volume's branch; a diverged ref
   is restored with plain git. A workload writing the same files can
   overwrite the restore (its writes are recorded too). While `agentfs run`
@@ -535,13 +534,13 @@ The container that starts other containers mounts only the
   could hold them; everything else answers "no such file". A file it
   creates under a name the rules skip is a tmp file only sandboxes see,
   never recorded, gone when the sidecar stops; renaming it onto a
-  recordable name records it there (§2.4). Every operation is done as
+  recordable name records it there. Every operation is done as
   the view owner, whatever user the sandbox runs as.
 - **History:** as example 2. Changes through the overlay are recorded
   with the view owner as `Agentfs-Uid`. No tmp name reaches history.
 - **Restores and reverts** (example 9) check and settle the files open
   through either mount point.
-- **Limits:** the boundary is for names only (§1.1): a file a sandbox
+- **Limits:** the boundary is for names only: a file a sandbox
   holds open stays writable after it leaves view; volume-wide facts
   leak; locks are not shared between the mounts. Sandboxes lose hard
   links, creating symlinks, directory moves (`EXDEV`), WAL databases,
@@ -564,10 +563,9 @@ The container that starts other containers mounts only the
 - **Hermes combines several examples.** As deployed by the example it is
   example 3 (several processes, iac patches) and can be example 8 (its
   branch reviewed on GitHub). Receiving sandbox forks (example 5) and
-  forks of forks (example 6) use the merge queue (§12).
+  forks of forks (example 6) use the patch queue.
 - **Never count an unbuilt value as available.** If a design needs a
   value marked **not built**, such as landing into a running volume, say
-  so; that one is a later gate of the owner's (§19.1 "No live landing
-  yet").
+  so.
 - **Add an example** when a new consumer or a new combination appears,
   with the same fields, and mark every value.

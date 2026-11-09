@@ -1,13 +1,12 @@
 # Runbook: recording failures
 
 agentfs could not record a change, or could not turn records into
-commits. These are the only failures the workload sees (design
-[§3.5](../design.md#35-when-recording-fails)): every other failure, such
+commits. These are the only failures the workload sees ([guarantees](../guarantees.md)): every other failure, such
 as a push, raises an alarm and is retried. Nothing the workload wrote is
 lost from the backing tree; what may be missing is its history. The
 usual cause is a state area that is full or cannot be written.
 
-The commands below are for the phase 1 sidecar of
+The commands below are for the sidecar of
 [deployment.md](../deployment.md), where the state area is `/data/state`
 and the backing tree `/data/backing`, on one claim. Elsewhere, use your
 own paths with `agentfs --state <state>`.
@@ -27,8 +26,8 @@ kubectl exec "$POD" -c agentfs -- agentfs status
 | `alarm: repack failed: <error>` | stderr; log event `agentfs.repack_failed`; counter `agentfs.repack.failures`; alert `AgentfsRepackFailed` | [1](#1-the-state-area-is-full-or-unwritable) |
 | `<n> path(s) a previous mount could not record: <r> repaired from the backing tree, <s> still failing` | the sidecar's log at start | [4](#4-paths-a-mount-could-not-record-metarepairs) |
 | `<n> path(s) could not be recorded ...` | the sidecar's log at stop | [4](#4-paths-a-mount-could-not-record-metarepairs) |
-| `journal corruption at byte <offset>`, or `<ref> names lost object <oid>`, opening a phase 1 tree state area | `agentfs trees` | [5](#5-a-tree-state-area-that-refuses-to-open) |
-| `tree JournalTail: <n> bytes at <offset>` | a phase 1 tree actor's stderr at open | [5](#5-a-tree-state-area-that-refuses-to-open) |
+| `journal corruption at byte <offset>`, or `<ref> names lost object <oid>`, opening a tree state area | `agentfs trees` | [5](#5-a-tree-state-area-that-refuses-to-open) |
+| `tree JournalTail: <n> bytes at <offset>` | a tree actor's stderr at open | [5](#5-a-tree-state-area-that-refuses-to-open) |
 
 The `<error>` says what failed: `No space left on device` (`ENOSPC`),
 `Disk quota exceeded`, `Read-only file system` (`EROFS`), `Permission
@@ -107,7 +106,7 @@ kubectl exec "$POD" -c agentfs -- git --git-dir /data/state/git log --oneline -3
 ```
 
 A record whose frozen copies are gone is dropped with `RecordFailed` instead of
-failing every later commit (design §19.1, "Crash findings"); record that
+failing every later commit; record that
 path again (section 4, last step).
 
 ## 3. Commits failing (CommitFailed)
@@ -166,7 +165,7 @@ anything. Its start shows the result:
 
 ## 5. A tree state area that refuses to open
 
-This section is for phase 1's tree actor ([phase 1](../target-architecture/phase-1.md)),
+This section is for the tree actor ([trees](../trees.md)),
 whose journal is `calls.wal` and whose refs are a copy of it. Recovery is manual:
 agentfs repairs neither case itself.
 

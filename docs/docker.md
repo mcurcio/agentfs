@@ -1,13 +1,12 @@
 # agentfs with Docker
 
-agentfs runs under plain Docker the way it runs on Kubernetes (design
-§17.1): one container mounts the volume with FUSE, and the workload's
+agentfs runs under plain Docker the way it runs on Kubernetes: one container mounts the volume with FUSE, and the workload's
 containers use the mount like any directory. This page covers the
 examples in [`examples/docker`](../examples/docker), how they are wired
 and why, operations, what is and is not tested, and why there is no
 Docker volume plugin.
 
-Section numbers (§) refer to [design.md](design.md). The Kubernetes
+Section numbers (§) on this page are this page's own. What agentfs promises is in [guarantees](guarantees.md). The Kubernetes
 sidecar is in [deployment.md](deployment.md); every setting is in the
 [configuration reference](configuration.md).
 
@@ -50,7 +49,7 @@ workload       <dir> bound at /agentfs, read-only, rslave, recursive writable
   area are siblings on one filesystem, as on Kubernetes ([deployment.md
   §3](deployment.md#3-the-pod-piece-by-piece)): reflinks fail across
   mounts. The workload never mounts it, so the history, journal, state
-  and credentials are out of its sight (§1.1).
+  and credentials are out of its sight ([guarantees](guarantees.md)).
 - **The agentfs container binds the host directory with `rshared`
   propagation** and mounts FUSE at `workspace/` inside it, so the mount
   appears on the host. It is a subdirectory, not the bound directory
@@ -184,7 +183,7 @@ write at the top of the volume; directories are not recorded, their
 files are. Files belong to the user who created them, with the mode they
 asked for ([deployment.md §5](deployment.md#5-users-and-permissions)).
 The daemon cannot read the supplementary groups of a caller in another
-container's pid namespace ([design §6](design.md#6-metadata-and-permissions)),
+container's pid namespace ([recording](recording.md)),
 the same limit as the Kubernetes sidecar.
 
 **Operations** run in the agentfs container, whose environment names the
@@ -242,7 +241,7 @@ was evaluated and not built, because it is not a small addition:
   restart a crashed daemon over its stale mount, and keep each volume's
   options (remote, credentials) on disk so `List` and `Get` survive a
   plugin restart. That is what the CSI node plugin does for Kubernetes
-  (§14.2). A plugin would duplicate it or need it factored out of
+  ([csi.md](csi.md)). A plugin would duplicate it or need it factored out of
   `agentfs-csi` into a shared crate first.
 - **A new release path.** Plugins are packaged as a root filesystem and
   a `config.json` and published with `docker plugin push`, which the
@@ -251,7 +250,7 @@ was evaluated and not built, because it is not a small addition:
   `docker plugin disable` takes every volume's mount at once; the
   examples keep one agentfs container per volume.
 
-Together that is a milestone of its own, so this one documents the
+Together that is a project of its own, so this page documents the
 container pattern instead. A route that would reuse the CSI driver as it
 is: Docker Swarm's cluster volumes take a CSI plugin packaged as a
 managed plugin. It is Swarm-only and has not been tried.

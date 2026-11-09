@@ -5,8 +5,7 @@ The agentfs daemon in a pod's sidecar died (a crash, an OOM kill, `kill
 returned, so nothing is lost. The shipped sidecar recovers by itself:
 the kubelet restarts the container, and it mounts over the dead mount
 (`AGENTFS_ON_STALE_MOUNT=recover`). This runbook is for checking that
-recovery, and for the cases where it does not happen. Design:
-[§17.1](../design.md#171-layer-1-core-and-daemon-rust); deployment:
+recovery, and for the cases where it does not happen. Library: [filesystem](../library/filesystem.md); deployment:
 [deployment.md](../deployment.md#7-a-crashed-daemon).
 
 ## What automatic recovery looks like
@@ -103,7 +102,7 @@ report it with the log.
 - **Files open with passthrough at the crash**: with `--passthrough auto`
   as root, writes through descriptors the workload opened for writing
   while another had the file open read-only (the only writers given
-  passthrough, design §17.1) before the crash go straight to the backing file and are not recorded until the
+  passthrough) before the crash go straight to the backing file and are not recorded until the
   file changes again through the mount. If every write must be recorded,
   restart the workload after a crash, or run with `--passthrough off`.
 - **A clean exit while the pod runs** (someone sent the sidecar SIGTERM,

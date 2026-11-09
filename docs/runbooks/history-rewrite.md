@@ -1,9 +1,9 @@
 # Runbook: removing a recorded secret from history
 
 agentfs never scans content and never rewrites history on its own
-([§10](../design.md#10-secrets-not-in-scope)). A secret that was recorded
+([guarantees](../guarantees.md)). A secret that was recorded
 is in the state area's history and on every remote it reached. Removing
-it is this operator procedure ([§15](../design.md#15-recovery-and-undo)):
+it is this operator procedure ("Rewriting history" below):
 rewrite the volume's branch with `git filter-repo`, outside the state
 area, bring it back, and replace it on each remote with `agentfs push
 --force-with-lease`. It is the one case where the volume's branch is
@@ -17,7 +17,7 @@ state area and the remote, that pushes are fast-forwards again and that
 `Agentfs-Seq` keeps increasing. `ci/e2e-runbooks.sh forks` runs the
 whole procedure again with [Forks](#forks), on a volume with two forks.
 
-If the volume has forks (design [§11.5](../design.md#115-forks)), read
+If the volume has forks ([forks](../forks.md)), read
 [Forks](#forks) before you start: two of its steps come between steps 2
 and 3, and one after step 9.
 
@@ -61,7 +61,7 @@ agentfs --state "$STATE" status
 Mark the path `-agentfs` in the operator attributes (it is then never
 recorded, even if the workload writes it again), or move the file out of
 the backing tree. A path in history keeps being recorded otherwise
-(§4).
+(section 4).
 
 <!-- ci: rewrite-exclude -->
 ```sh
@@ -76,7 +76,7 @@ cp -a "$STATE" "$BACKUP"
 ```
 
 The backup holds the secret: delete it once the procedure is verified
-(§9).
+(section 9).
 
 ## 4. Rewrite the branch in a mirror clone
 
@@ -84,7 +84,7 @@ The backup holds the secret: delete it once the procedure is verified
 it cannot change the state area's config, remotes or reflogs.
 `--prune-empty never` keeps every commit, even one that only held the
 secret, so the `Agentfs-Seq` trailers recovery depends on stay in order
-(§3.3). filter-repo also rewrites commit ids quoted in messages, such as
+([library/core](../library/core.md)). filter-repo also rewrites commit ids quoted in messages, such as
 `Agentfs-Restore` trailers.
 
 <!-- ci: rewrite-filter -->
@@ -133,9 +133,9 @@ rewrite; the checks must print nothing and succeed.
 ## 8. Forget the push bookkeeping
 
 Each remote's push state names commits that no longer exist. It is only
-bookkeeping (§11.2), rebuilt on the next push. A remote with
+bookkeeping ([remotes](../remotes.md)), rebuilt on the next push. A remote with
 `agentfsMaxPushSize` measures that push from the branch the remote
-advertises (§11.3), so an up-to-date remote is not pushed again in steps:
+advertises ([remotes](../remotes.md)), so an up-to-date remote is not pushed again in steps:
 
 <!-- ci: rewrite-push-state -->
 ```sh
@@ -369,7 +369,7 @@ pushes an abandoned fork again, and under CSI the next DeleteVolume
 applies its `onDelete`. A published fork cannot be abandoned (it says
 so): its refs are in `$FORK_WORK/affected` and go in F3, and its change,
 not landed yet, can no longer land: its parent is not in the rewritten
-history (`parent_not_in_history`, design §12).
+history (`parent_not_in_history`, [patches](../patches.md)).
 
 <!-- ci: rewrite-fork-abandon -->
 ```sh

@@ -8,8 +8,7 @@ rest go on; integrators are notified of every verdict change; the queue
 can also be served over git ([section 8](#8-serving-the-queue-over-git-serve-git)),
 and forks of forks roll up through it ([section 9](#9-forks-of-forks)).
 A start that may have a workload attached holds the queue
-([section 10](#10-patches-held-after-an-unclean-stop)). Design: [§12](../design.md#12-patch-queue-for-iac-phase-3-built),
-[§11.3](../design.md#113-limits-and-rejected-pushes). `ci/e2e-patches.sh`
+([section 10](#10-patches-held-after-an-unclean-stop)). How it works: [patches](../patches.md), [remotes](../remotes.md). `ci/e2e-patches.sh`
 follows this runbook against a smart-HTTP remote and a real mount.
 
 Throughout:
@@ -190,8 +189,7 @@ After the next push to the patch remote, `refs/agentfs/<volume>/applied/<n>`
 holds each applied patch and its `inbox/<n>` is gone.
 
 **The same patch commit twice** (two receivers submitting one fork's
-change at once, or a producer pushing a commit again) applies once (design
-§12): the later number gets a marker commit with the head's tree, whose
+change at once, or a producer pushing a commit again) applies once: the later number gets a marker commit with the head's tree, whose
 subject is `duplicate of patch <m>: ...`, its refs move like an applied
 patch's, and the `PatchDuplicate` event (not an alarm) and `status.json`'s
 `duplicate_now` say so. Nothing is merged, so a change the workload has
@@ -439,7 +437,7 @@ once: a receiver dedupes on volume, inbox, patch and verdict. Deleting
 `agentfs serve-git` makes the state area's history repository the
 volume's patch source: producers push patches to it with plain git, and
 `agentfs patch submit` and `patch approve` work against its URL unchanged
-(design §12, configuration
+([patches](../patches.md), configuration
 [`[agentfsPusher "<name>"]`](../configuration.md#agentfspusher-name)).
 It refuses to start while `agentfs.patchRemote` names a remote, whose
 fetch would prune what pushers write:
@@ -478,7 +476,7 @@ volume (its JSON reply is the body).
 ## 9. Forks of forks
 
 A linked fork's patch remote is its fork remote, so a fork can be forked
-(design §11.5, §12 "Forks of forks"). When the child finishes, it queues
+([forks](../forks.md), [patches](../patches.md)). When the child finishes, it queues
 its change as its parent's next inbox number on the fork remote, using
 that remote's credentials; the parent's queue lands it at its next mount
 with nothing attached, and the parent's own change, when it finishes,
@@ -499,7 +497,7 @@ top-level fork's instead, at `refs/agentfs/<fork>/change` and
 `refs/agentfs/<fork>/finish` on the fork remote. Nothing is lost, but
 nothing lands it either: it is a published change like any top-level
 fork's, which `agentfs fork list` shows and `agentfs fork deliver` hands
-to a receiver (design §11.5 "Delivery"). Its base is a commit of the
+to a receiver ([forks](../forks.md)). Its base is a commit of the
 parent's history, not of the source's branch: deliver it where that
 history is reviewed, or leave it. The child also lists its parent again
 after queueing its change, so a parent that finished in that moment
@@ -537,7 +535,7 @@ each parent mount once after its children finished:
 
 ## 10. Patches held after an unclean stop
 
-Patches land only at a start with nothing attached (design §12, "Only
+Patches land only at a start with nothing attached ([patches](../patches.md), "Only
 with nothing attached"). A start that cannot show that judges the queue
 instead (verdicts, status and notice as in [section 2](#2-when-patches-apply)),
 lands nothing, and raises the warning `PatchQueueDeferred` while anything
@@ -550,7 +548,7 @@ alarm: patch queue deferred (unclean_stop): a workload may be attached, so 1 pat
 
 | Reason | Why the start may have a workload attached |
 |---|---|
-| `unclean_stop` | The previous mount left `$STATE/meta/attached.json`: it was killed or crashed, or it stopped while a workload held it (its log said `the mount was busy: detached lazily`, `files were still open after ...`, `the filesystem was still mounted elsewhere after ...`, or `a workload may still be attached`), and the mark was not another pod's. Typical: `docker restart` or a crash of the agentfs container alone, or a sidecar restart inside a running pod. A sidecar whose mount point is in its pod's own `emptyDir` records the pod's uid in the mark, and a new pod lands the queue over it (its log says `this is another pod`; design §12) |
+| `unclean_stop` | The previous mount left `$STATE/meta/attached.json`: it was killed or crashed, or it stopped while a workload held it (its log said `the mount was busy: detached lazily`, `files were still open after ...`, `the filesystem was still mounted elsewhere after ...`, or `a workload may still be attached`), and the mark was not another pod's. Typical: `docker restart` or a crash of the agentfs container alone, or a sidecar restart inside a running pod. A sidecar whose mount point is in its pod's own `emptyDir` records the pod's uid in the mark, and a new pod lands the queue over it (its log says `this is another pod`) |
 | `stale_mount` | The mount stacked over a stale mount a crashed daemon left (`--on-stale-mount recover`). Its own stop keeps the mark too (a workload may still hold the stale layers it detaches), so it takes one more clean stop and start |
 | `fronts_running` | `serve-history` started while fronts hold leases |
 | `workload_attached` | `serve-history` was given `--workload-attached`: the CSI node plugin passes it while a pod of the volume is published on the node (a node-plugin restart, a crashed service's restart) |

@@ -2,9 +2,8 @@
 
 A remote stopped accepting the volume's history. Recording and
 committing are unaffected: commits stay safe in the state area and go out
-with the next successful push. Design:
-[§11](../design.md#11-remotes-and-pushing), alarms and metrics:
-[§13](../design.md#13-observability-opentelemetry).
+with the next successful push. How it works: [remotes](../remotes.md), alarms and metrics:
+[telemetry](../telemetry.md).
 
 ## Symptoms
 
@@ -32,7 +31,7 @@ with the next successful push. Design:
 | `unreachable` | No answer: DNS, connection refused, a TLS handshake that fails before the certificate is checked, or no reply within the timeouts (30 s to connect, 5 min for a stalled transfer) | From the same pod or host: `git ls-remote <url>`. Proxies and network policies: agentfs uses only the proxy in `remote.<name>.proxy` or `http.proxy` (shown by `agentfs status` as `proxy:`), never `HTTP(S)_PROXY`; a proxy that is down or refuses the connection is `unreachable` too. For `https://` the binary must be built with the `https` feature |
 | `untrusted_host` | The remote host is not trusted. SSH: its host key is not in the remote's `agentfsKnownHosts` for that host and port (unknown host), differs from the one listed (changed key), is of a type the file does not list, or is marked `@revoked`; or its host certificate is not trusted (no matching `@cert-authority` line lists its CA, or the CA is `@revoked`, or it is expired or not yet valid, not for the URL's host, not a host certificate, has critical options or a bad signature); or the file is missing or unreadable. HTTPS: libgit2 refused its TLS certificate (a host name it does not cover, an untrusted, self-signed or expired certificate). The key or credential was **not** sent | The message names the file, the host as looked up (`[host]:port` on a port other than 22), the key type and its `SHA256:` fingerprint. Compare with the provider's published fingerprints or `ssh-keyscan -p <port> <host> \| ssh-keygen -lf -`. **A changed key may be an attack:** confirm the new fingerprint out of band before replacing known_hosts. "Lists only ..." means known_hosts lacks the key type the server offered: add every type `ssh-keyscan` prints. A refused certificate names its CA's fingerprint: inspect the server's certificate with `ssh-keygen -L -f <cert>` (validity, principals, signing CA) and check the `@cert-authority` line's host patterns and key. For HTTPS: the system CA certificates, and that the URL's host is the certificate's |
 | `auth` | The remote refused the credential or key, or none could be read | HTTP(S): the file named by `remote.<name>.agentfsCredentials`: `username=` and `password=` lines, or a bare token (used as the password, with the URL's username or `x-access-token`). Token scopes: it must be allowed to push to the repository (GitHub: contents write). SSH: the file named by `remote.<name>.agentfsSshKey` must be a private key (the message says if it is a `.pub` file or unreadable) whose public half is authorized for the URL's user (else `git`) with write access (GitHub: a deploy key with write access). An encrypted key needs `agentfsSshKeyPassphrase`; `cannot decrypt <key> with <file>` means the passphrase file does not match the key (after `ssh-keygen -p`, update both). With `agentfsSshAgent`: `ssh-agent at <socket>` means the agent could not be reached or holds no identity (is it running, is the socket path right?); "rejected every identity" lists the fingerprints offered, none of which the server authorizes (sshd also stops after `MaxAuthTries`, default 6). Either file is re-read when it changes, so a rotated Secret is picked up without a restart. A credential or key is only sent to the host (and port) of the push URL: check `pushurl` and `url` agree with where it is valid |
-| `refused` | Connected and authenticated, but the push was rejected | The message says why: branch protection or rules on `agentfs/*`, a server-side hook, `receive.fsckObjects` (agentfs checks git's fsck rules before committing, §3.4, so this points at another policy), a file size limit lower than `remote.<name>.agentfsMaxBlobSize`, a quota |
+| `refused` | Connected and authenticated, but the push was rejected | The message says why: branch protection or rules on `agentfs/*`, a server-side hook, `receive.fsckObjects` (agentfs checks git's fsck rules before committing ([recording](../recording.md)), so this points at another policy), a file size limit lower than `remote.<name>.agentfsMaxBlobSize`, a quota |
 | `non_fast_forward` | Someone else moved the branch | [divergence.md](divergence.md) |
 | `local` | A problem on this side: the per-remote lock, reading the branch, or saving `meta/push/<remote>.json` | Disk space and permissions of the state area |
 | `too_large` | One commit's git pack is larger than the remote's `agentfsMaxPushSize`, so it cannot be pushed even in steps (or the last pushed commit is not an ancestor of the head, so the backlog cannot be stepped). Nothing was sent | The message names the commit, the size reached and the limit. If the server takes more, raise `remote.<name>.agentfsMaxPushSize`. If it does not: route large files to LFS from now on (`agentfs.lfsThreshold`, [Git LFS](../configuration.md#git-lfs)); a commit already made can only go out by [rewriting history](history-rewrite.md) |
@@ -74,7 +73,7 @@ A failure with **stage `lfs`** (`failed (auth, stage lfs)` in
 `agentfs push` and the alarm, `stage="lfs"` on
 `agentfs.push.failures`, `agentfs.push.stage` on the log record, `last
 error (…, stage lfs)` in `status`) happened while uploading the Git LFS
-objects the unpushed commits reference (design §7). **No ref was pushed**:
+objects the unpushed commits reference ([remotes](../remotes.md)). **No ref was pushed**:
 the git push runs only after every upload succeeded. First find the
 endpoint and where its credentials come from:
 
@@ -135,7 +134,7 @@ not a failure. Nothing is lost; the commits are pushed by the next start.
 A push to a path or `file://` remote writes that remote's pack and refs
 from this process, so one already doing so at the deadline is let
 finish, at most 10 s more: shutdown spends at most `--push-grace` + 10 s
-on pushes (design §11.2). Only a stalled disk outlasts that, or a kill
+on pushes ([remotes](../remotes.md)). Only a stalled disk outlasts that, or a kill
 that comes before it (the CSI node plugin kills the service 30 s after
 NodeUnstage; a pod, after its `terminationGracePeriodSeconds`). Shutdown
 then prints

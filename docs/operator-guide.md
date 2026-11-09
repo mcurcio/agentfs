@@ -2,8 +2,10 @@
 
 How to run `agentfs mount`: what it needs, how to lay out a volume, its
 flags and settings, what it records and when, how it starts and stops, and
-what to do when something goes wrong. The design behind it is
-[design.md](design.md); section numbers below (§) refer to it.
+what to do when something goes wrong. What agentfs promises is in
+[guarantees](guarantees.md); how it records is in [recording](recording.md);
+the pushing side is in [remotes](remotes.md). Section numbers below refer to
+this page.
 
 ## 1. Requirements
 
@@ -13,7 +15,7 @@ what to do when something goes wrong. The design behind it is
 - **Linux 6.9 or later for passthrough** (optional). With it, reads and
   `mmap` of files opened read-only go straight to the backing files without
   passing through the daemon; files opened for writing always go through
-  the daemon (design §17.1). Without it everything still works, through the
+  the daemon. Without it everything still works, through the
   daemon.
 - **`/dev/fuse`.** In a container, give it the device (and, for a mount
   other containers see, a privileged sidecar: see section 11 below).
@@ -35,13 +37,13 @@ what to do when something goes wrong. The design behind it is
   `--no-allow-other`.
 - **Filesystem.** XFS (or btrfs) is recommended for the backing tree and
   state area: recording freezes a file's content with a reflink, which costs
-  the same whatever the file's size. On ext4 it is a copy (§3.2): measured
+  the same whatever the file's size. On ext4 it is a copy: measured
   on CI, closing a clean 1 GiB file takes 3 ms on XFS and 2.9 s on ext4,
   while a small file's change costs about 2 to 4 ms through the mount on both.
   Workloads of many small files run 14 to 83 times slower than in a plain
   directory, and excluded paths still pay about 0.6 ms per file in FUSE.
   See [performance.md](performance.md) for the numbers and the budget.
-- **`git` 2.32 or later on `PATH`** for the hourly repack (§8); the
+- **`git` 2.32 or later on `PATH`** for the hourly repack ([recording](recording.md)); the
   container image has it. Without it each repack fails with a
   `RepackFailed` alarm and nothing else changes; set
   `agentfs.repackInterval = off` to stop trying.
@@ -65,7 +67,7 @@ A volume is three directories, side by side:
 | the mount point is inside the backing tree or the state area, or either is inside the mount point | the mount would recurse into itself, or the daemon would reach its own files through its own mount |
 | a remote's `agentfsCredentials`, `agentfsSshKey`, `agentfsSshKeyPassphrase`, `agentfsSshAgent`, `agentfsKnownHosts` or `agentfsLfsCredentials` file is under the backing tree or the mount point, for any `[remote]` section, valid or not | the workload could read the secret, or rewrite known_hosts to trust any host (a man in the middle). This is an error, not an alarm |
 | `--root` / `AGENTFS_ROOT` is set and is not the backing tree | the two would disagree about which tree is recorded |
-| the mount point is a stale FUSE mount (`ENOTCONN`) | a daemon died; see §10 |
+| the mount point is a stale FUSE mount (`ENOTCONN`) | a daemon died; see section 10 |
 
 Paths are compared after resolving symlinks, so a symlinked path to inside
 the backing tree is caught too.
@@ -132,7 +134,7 @@ Global flags (every command):
 |---|---|---|---|
 | `--state DIR` | `AGENTFS_STATE` | `.` | The state area |
 | `--root DIR` | `AGENTFS_ROOT` | | The backing tree, for `record`, `flush` and `run`, and for `restore` and `revert` when no mount is running. With `mount` it must match the positional backing tree |
-| `--wait-lock DURATION` | `AGENTFS_WAIT_LOCK` | `0s` | Wait this long for another process to release the state area instead of exiting 75 (§9) |
+| `--wait-lock DURATION` | `AGENTFS_WAIT_LOCK` | `0s` | Wait this long for another process to release the state area instead of exiting 75 (section 9) |
 
 `agentfs init` takes `--volume NAME` (`AGENTFS_VOLUME`), `--branch NAME`,
 `--include FILE` (repeatable: operator config fragments, set as the
@@ -147,19 +149,19 @@ it exits 1 and changes nothing
 
 | Flag | Environment | Default | Meaning |
 |---|---|---|---|
-| `--passthrough auto\|on\|off` | `AGENTFS_PASSTHROUGH` | `auto` | Kernel passthrough for files opened read-only (files opened for writing always go through the daemon): `auto` uses it when the kernel (6.9+) and privileges (`CAP_SYS_ADMIN`, see §1) allow, `on` refuses to mount without it and stops the mount (exit 1) if a file cannot be given a backing file later, `off` never uses it |
+| `--passthrough auto\|on\|off` | `AGENTFS_PASSTHROUGH` | `auto` | Kernel passthrough for files opened read-only (files opened for writing always go through the daemon): `auto` uses it when the kernel (6.9+) and privileges (`CAP_SYS_ADMIN`, see section 1) allow, `on` refuses to mount without it and stops the mount (exit 1) if a file cannot be given a backing file later, `off` never uses it |
 | `--threads N` | `AGENTFS_THREADS` | CPUs, 2 to 16 | FUSE request threads |
 | `--no-allow-other` | | | Only the mounting user can use the mount |
 | `--unmount-grace DURATION` | | `10s` | At shutdown, how long to wait for open files on a busy mount after detaching it |
-| `--push-grace DURATION` | | `5s` | At shutdown, how long to spend on pushes in progress and one last push of the final commit to each remote that lacks commits; `0s` skips the last push (§8) |
-| `--on-stale-mount refuse\|hold\|recover` | `AGENTFS_ON_STALE_MOUNT` | `refuse` | When the mount point is an agentfs mount whose daemon died: `refuse` exits 1 with the command that clears it; `recover` (the shipped sidecar, §10) mounts over the stale mount, if it is a mount of this volume (another volume's is refused, exit 1), so every copy of it reaches the new daemon, and detaches the stale layers when it stops (needs `CAP_SYS_ADMIN`; refused for fronts); `hold` mounts nothing and takes no lock, waits for SIGINT or SIGTERM, then detaches the stale mount and exits 1. With nothing stale, `recover` and `hold` mount normally |
-| `--seal-mountpoint` | `AGENTFS_SEAL_MOUNTPOINT` | off | Before mounting, make the bare mount point root's with mode 0000 (needs root). The mount on top is unaffected; between mounts (a sidecar restarting after a clean exit), a non-root process, or root without `CAP_DAC_OVERRIDE`, that reaches the bare directory, such as a `subPath` bound in that gap, gets `EACCES` instead of writing unrecorded. The shipped sidecar sets it (§10) |
+| `--push-grace DURATION` | | `5s` | At shutdown, how long to spend on pushes in progress and one last push of the final commit to each remote that lacks commits; `0s` skips the last push ([remotes](remotes.md)) |
+| `--on-stale-mount refuse\|hold\|recover` | `AGENTFS_ON_STALE_MOUNT` | `refuse` | When the mount point is an agentfs mount whose daemon died: `refuse` exits 1 with the command that clears it; `recover` (the shipped sidecar, section 10) mounts over the stale mount, if it is a mount of this volume (another volume's is refused, exit 1), so every copy of it reaches the new daemon, and detaches the stale layers when it stops (needs `CAP_SYS_ADMIN`; refused for fronts); `hold` mounts nothing and takes no lock, waits for SIGINT or SIGTERM, then detaches the stale mount and exits 1. With nothing stale, `recover` and `hold` mount normally |
+| `--seal-mountpoint` | `AGENTFS_SEAL_MOUNTPOINT` | off | Before mounting, make the bare mount point root's with mode 0000 (needs root). The mount on top is unaffected; between mounts (a sidecar restarting after a clean exit), a non-root process, or root without `CAP_DAC_OVERRIDE`, that reaches the bare directory, such as a `subPath` bound in that gap, gets `EACCES` instead of writing unrecorded. The shipped sidecar sets it (section 10) |
 
 A missing mount point is created (mode `0755`; its parent must exist), so
 a sidecar can mount into a subdirectory of a fresh `emptyDir`.
 
 `agentfs serve-history` (needs `--root`, the backing tree the fronts
-mount; §16):
+mount; section 16):
 
 | Flag | Environment | Default | Meaning |
 |---|---|---|---|
@@ -168,7 +170,7 @@ mount; §16):
 | `--push-grace DURATION` | | `5s` | At shutdown, how long to spend on pushes in progress and one last push of the final commit to each remote that lacks commits, as `mount` does; `0s` skips the last push |
 
 `agentfs mount` and `agentfs record` as fronts of a history service
-(§16):
+(section 16):
 
 | Flag | Environment | Default | Meaning |
 |---|---|---|---|
@@ -191,7 +193,7 @@ Pod flags (`mount`, `run`, `record`, `flush`, `push`, `serve-history`), from the
 API in Kubernetes: `--namespace` (`AGENTFS_NAMESPACE`), `--pod`
 (`AGENTFS_POD`), `--pod-uid` (`AGENTFS_POD_UID`), `--node`
 (`AGENTFS_NODE`), `--replica` (`AGENTFS_REPLICA`). They fill the commit
-trailers and the committer identity (§9) and the telemetry resource.
+trailers and the committer identity ([recording](recording.md)) and the telemetry resource.
 
 Telemetry is configured with the standard `OTEL_*` variables; see
 [telemetry.md](telemetry.md).
@@ -199,7 +201,7 @@ Telemetry is configured with the standard `OTEL_*` variables; see
 ## 5. Settings that affect the mount
 
 Settings live in the history repository's own config,
-`<state>/git/config` (§4.3). The mount reads them when it starts; changing
+`<state>/git/config`. The mount reads them when it starts; changing
 them takes a remount. Every key, including the per-remote ones, is in the
 [configuration reference](configuration.md).
 
@@ -209,10 +211,10 @@ them takes a remount. Every key, including the per-remote ones, is in the
 | `agentfs.pushInterval` | `60s` | How often each remote is pushed |
 | `agentfs.sweepInterval` | `30s` | How often files held open are checked and recorded, and failed records retried (minimum `1s`) |
 | `agentfs.repackInterval` | `1h` | How often the history is repacked with `git repack` (`0` or `off`: never; minimum `1m`); see [Databases](#14-databases-the-fsync-class) |
-| `agentfs.nested` | `exclude` | Nested git repositories: `exclude` records nothing in them, `working-tree` records their working files (§5) |
+| `agentfs.nested` | `exclude` | Nested git repositories: `exclude` records nothing in them, `working-tree` records their working files ([recording](recording.md)) |
 | `agentfs.respectTreeRules` | `false` | Whether `.gitignore` and `.gitattributes` in the tree take part in rules |
 | `$GIT_DIR/info/exclude` | | Paths never recorded when new (git ignore syntax) |
-| `$GIT_DIR/info/attributes` | | `-agentfs` and the other `agentfs.*` attributes (§4.2) |
+| `$GIT_DIR/info/attributes` | | `-agentfs` and the other `agentfs.*` attributes ([recording](recording.md)) |
 
 ## 6. Permissions
 
@@ -231,7 +233,7 @@ them takes a remount. Every key, including the per-remote ones, is in the
 - **POSIX ACLs are not enforced** through the mount; only mode bits are.
 - **What history keeps:** file content, the executable bit and symlinks.
   Ownership, other mode bits, timestamps and extended attributes stay in the
-  backing tree only (§6).
+  backing tree only ([recording](recording.md)).
 - `st_ino` through the mount is agentfs's node number: the same for every
   hard link of a file and stable while mounted, but not across remounts.
   Tools that cache inode numbers (`git status` on a repository in the mount)
@@ -239,7 +241,7 @@ them takes a remount. Every key, including the per-remote ones, is in the
 
 ## 7. What is recorded, and when
 
-Each of these is recorded before the call returns (§3.1):
+Each of these is recorded before the call returns ([guarantees](guarantees.md)):
 
 | The workload does | History gets |
 |---|---|
@@ -253,7 +255,7 @@ A shell redirection (`cmd > file`) is two records: the shell closes a
 duplicate of the descriptor before `cmd` writes, which records the file
 empty, and `cmd`'s close records its content. A slow command can put the
 empty file in a commit of its own; reverting the commit with the content
-then leaves the file empty, not gone (design §3.1).
+then leaves the file empty, not gone.
 
 Two late backstops cover writes no close follows:
 
@@ -282,9 +284,9 @@ and up to one interval late: see [Databases](#14-databases-the-fsync-class).
 
 - **Start.** The daemon takes the state-area lock, checks the layout,
   recovers the journal (records made before a crash are committed),
-  fetches and applies the patch queue (§12; at most
+  fetches and applies the patch queue ([patches](patches.md); at most
   `agentfs.patchFetchTimeout` waiting for the remote), starts
-  the commit and push loops, mounts, and prints the line shown in §3.
+  the commit and push loops, mounts, and prints the line shown in section 3.
 - **Stop.** On SIGINT or SIGTERM it:
   1. stops serving restores (waiting up to `--unmount-grace` for one in
      progress), then unmounts; if files are still open, the mount is
@@ -301,7 +303,7 @@ and up to one interval late: see [Databases](#14-databases-the-fsync-class).
      still pushing at the deadline is left (`... abandoned`), but a push
      already updating a local (path or `file://`) remote is let finish,
      at most 10 s more: pushes take at most `--push-grace` + 10 s
-     (design §11.2), and with
+     ([remotes](remotes.md)), and with
      `--push-grace 0s` nothing more is pushed (`... skipped, push grace
      spent`, or `nothing new`);
   5. flushes telemetry and releases the lock.
@@ -319,13 +321,13 @@ commit and its push always happen. Pushing never delays shutdown beyond
 
 ## 9. The state-area lock
 
-One process uses a state area at a time (§2.3). Every command that
+One process uses a state area at a time. Every command that
 writes it takes an exclusive lock on `<state>/meta/lock` before opening
 the volume: `mount`, `run`, `serve-history`, `record`, `flush`,
 `patch apply`, `fork create`, `fork finish` and `fork abandon`; `init`
 when the state area already exists; and `push`, `restore` and `revert`
 when no daemon answers on the control socket. A front (`mount` or
-`record` with `--history-service`) takes none (§16). A second one exits
+`record` with `--history-service`) takes none (section 16). A second one exits
 with status 75 and names the holder:
 
 ```
@@ -340,11 +342,12 @@ holder:
 lock:      held by pid=4711 command=mount since=20261012T110302Z
 ```
 
-While a daemon runs, `agentfs push`, `agentfs restore` and `agentfs
-revert` are not refused: they go to it over its control socket. `push`
-asks `mount`, `run` or `serve-history` to commit and push now (below);
-restores and reverts are served by a mount (section 12), while `run` and
-`serve-history` answer that they serve none (exit 75). The kernel
+While a daemon runs, `agentfs push`, `agentfs restore`, `agentfs
+revert` and the patch commands `agentfs patch apply`, `judge` and
+`checkpoint` are not refused: they go to it over its control socket.
+`push` asks `mount`, `run` or `serve-history` to commit and push now
+(below); restores and reverts are served by a mount (section 12), while
+`run` and `serve-history` answer that they serve none (exit 75). The kernel
 releases the lock when the holder dies, even after `kill -9`.
 
 **Pushing now.** `agentfs push [--remote NAME]... [--timeout DURATION]`
@@ -410,7 +413,7 @@ stopped.
   `agentfs mount` refuses a stale mount point with exactly this advice.
 - At start, records in the journal that are not in history yet are
   committed (`N uncommitted record(s) recovered` in the startup line).
-- In Kubernetes the shipped sidecar recovers by itself (design §17.1).
+- In Kubernetes the shipped sidecar recovers by itself.
   The kubelet restarts the crashed container, which runs with
   `--on-stale-mount recover`: it takes the lock the dead daemon's exit
   released, recovers the journal, mounts FUSE at a private directory
@@ -434,8 +437,7 @@ stopped.
 
 ## 11. Kubernetes
 
-Phase 1 runs agentfs as a privileged native sidecar in the workload's pod
-(§17.1). The example manifests are in [`deploy/sidecar`](../deploy/sidecar)
+agentfs runs as a privileged native sidecar in the workload's pod. The example manifests are in [`deploy/sidecar`](../deploy/sidecar)
 and [deployment.md](deployment.md) explains them. In short:
 
 - one `ReadWriteOncePod` PVC mounted once at `/data`, holding
@@ -454,7 +456,7 @@ and [deployment.md](deployment.md) explains them. In short:
   (workloads start once the mount is live), `agentfs probe` its readiness
   probe, and there is no liveness probe; `AGENTFS_ON_STALE_MOUNT=recover`
   makes a sidecar restarted after a crash mount over the stale mount
-  (§10);
+  (section 10);
 - settings and remotes come from a ConfigMap fragment (`include.path`),
   the rules from the same ConfigMap mounted over `info/exclude` and
   `info/attributes`, credentials from a Secret outside the backing tree
@@ -464,7 +466,7 @@ and [deployment.md](deployment.md) explains them. In short:
 
 ## 12. Recovery and undo
 
-Bring files back as they were in a commit, or undo a commit (§15). Both
+Bring files back as they were in a commit, or undo a commit. Both
 commands write the tree and record the result as **one commit**
 (`Agentfs-Trigger: restore`, plus `Agentfs-Restore: <commit>` or
 `Agentfs-Revert: <commit>`), authored by whoever ran them.
@@ -519,7 +521,7 @@ Runbooks, with the full procedures:
   queue, submitting with plain git;
 - [history-service-down.md](runbooks/history-service-down.md): fronts
   failing with `EIO` because the history service is down, hung or
-  refusing them (§16);
+  refusing them (section 16);
 - [moving.md](runbooks/moving.md): a CSI volume continued on another
   node (a node lost or retired) as a new volume started from its branch;
   each worktree stays on its node's disk
@@ -527,7 +529,7 @@ Runbooks, with the full procedures:
 - [start-branch-moved.md](runbooks/start-branch-moved.md): the old branch
   received commits after a move (`StartBranchMoved`).
 
-**Patches** (§12) are the other way to change the tree from outside:
+**Patches** ([patches](patches.md)) are the other way to change the tree from outside:
 producers queue them on the remote (`agentfs patch submit`), and every
 mount applies them, in order, after journal recovery and before it
 serves. `agentfs status` shows a `patches:` line, `agentfs patch status`
@@ -537,7 +539,7 @@ without stopping the mount. See [patches.md](patches.md).
 
 ## 13. Large files (LFS)
 
-Git LFS (design §7) keeps large content out of git history: history holds
+Git LFS ([recording](recording.md), [remotes](remotes.md)) keeps large content out of git history: history holds
 a pointer, the content goes to an LFS server. It is off by default.
 
 - **Enabling.** Set `agentfs.lfsThreshold` (for example `8m`), or add
@@ -597,7 +599,7 @@ a pointer, the content goes to an LFS server. It is off by default.
 
 A database is held open and changed in place, so "recorded at close" could
 mean never, and a copy of the main file alone, taken while the writer is
-busy, may not open. The `fsync` class (design §8) records such files as
+busy, may not open. The `fsync` class ([recording](recording.md)) records such files as
 whole, consistent groups instead.
 
 - **Opting in.** Add a line to the operator's
@@ -692,7 +694,7 @@ whole, consistent groups instead.
   still changed in the backing tree and stays marked as changed, so its next
   close records it. A rename, delete or link whose record failed also
   returns `EIO` after it happened; the sweep records the affected paths once
-  recording works again (§3.5). Paths still queued at shutdown are saved in
+  recording works again ([guarantees](guarantees.md)). Paths still queued at shutdown are saved in
   `<state>/meta/repairs` and recorded by the next mount before it serves
   anything ("N path(s) a previous mount could not record: ..." at start).
   If that file could not be written either, the shutdown message lists the
@@ -712,7 +714,7 @@ whole, consistent groups instead.
   `PatchQueueDeferred`, `IdentityFallback` and `PushLimited` are logged as
   warnings, the rest as
   errors. When each is raised and what it carries: the events table in
-  [design §13](design.md#13-observability-opentelemetry).
+  [telemetry](telemetry.md).
 - **`patch N held (<reason>)`** at mount: patch N could not be applied
   and is set aside whole; the mount serves without it, and the patches
   after it that do not wait on it are applied. **`patches: blocked at N
@@ -767,7 +769,7 @@ whole, consistent groups instead.
 ## 16. Several mounts of one volume (history service)
 
 A volume can be mounted more than once on one node, for example by two
-pods that share a backing tree, with one history (design §14). One
+pods that share a backing tree, with one history. One
 process, `agentfs serve-history`, is the volume's history service: it
 holds the state-area lock and is the only writer of the journal and the
 branch, and runs the commit and push loops. Every mount is a **front**,
@@ -781,8 +783,7 @@ the single-process mount of the rest of this guide.
 same state area and backing tree (the socket is a Unix socket in the
 state area). The fronts run as root or as the service's user: the
 service refuses any other peer. They speak gRPC over that socket
-(design §14.1). Mounts on several nodes of one volume are not supported
-(decided 2026-10-15, design §19.1).
+([library/core](library/core.md) has the protocol). Mounts on several nodes of one volume are not supported.
 
 **On Kubernetes**, the CSI driver runs this for you: a service per staged
 volume, a front per pod with that pod's identity, restarts in the same
@@ -816,7 +817,7 @@ same way, without a mount.
 | a front | `meta/fronts/slot-N.lock`, an `flock` lease of pending-id slot N (1 to 1023), its frozen copies in `pending/` and its repair queue `meta/fronts/slot-N.repairs` |
 
 **Commits.** A commit holds the changes of one front only. Its committer
-is rendered from the identity templates (§9 of the design,
+is rendered from the identity templates ([recording](recording.md),
 [configuration](configuration.md#agentfs-identity)) with that front's pod
 flags (`AGENTFS_POD`, `AGENTFS_REPLICA`, ...), and it carries that pod's
 `Agentfs-Pod`, `Agentfs-Pod-Uid`, `Agentfs-Node` and `Agentfs-Namespace`
@@ -848,7 +849,7 @@ final state of what failed. States in between are lost. See
 Metrics: `agentfs.front.round_trip`, `agentfs.front.service_failures` and,
 on the service, `agentfs.history_service.fronts`.
 
-**Crashes.** A front that dies leaves a stale mount, handled as in §10
+**Crashes.** A front that dies leaves a stale mount, handled as in section 10
 (its lease is released by the kernel; its unsent frozen copies are
 removed when a front next leases its slot). A service that dies is restarted the
 same way it was started: it recovers its journal, commits what fronts had
@@ -882,7 +883,7 @@ next start or an `agentfs push`.
   write, is not seen (it is still recorded when that front closes it).
 - POSIX and BSD locks are kept by each mount's kernel and are not shared
   between fronts. A database or any lock-coordinated file must be written
-  through one front only, and the `fsync` class (§14) is per front.
+  through one front only, and the `fsync` class is per front.
 - Patches are applied only when the service starts with no front
   running.
 - Two fronts changing one path at nearly the same instant are ordered by
@@ -921,3 +922,53 @@ next start or an `agentfs push`.
   refuses anything else, so a socket in a directory other users can
   write cannot be answered by them. Keep `--listen` in a directory only
   the service's user can write (the default `meta/history/` is 0700).
+
+## 17. The sandbox overlay
+
+The sandbox overlay is a second mount point of one volume, served by the
+same daemon. It shows only the names the operator's rules would record if
+they were new (*recordable* names). Give it to a container that starts
+other containers, for example a Docker daemon, so the sandboxes it starts
+see and change only recordable files. What they change is recorded like
+any other change and is visible through the main mount at once.
+
+```
+agentfs mount --sandbox-overlay /agentfs-sandbox/overlay --sandbox-owner 10000:10000 ...
+```
+
+- **Flags.** `--sandbox-overlay PATH` (`AGENTFS_SANDBOX_OVERLAY`) and
+  `--sandbox-owner UID:GID` (`AGENTFS_SANDBOX_OWNER`) come in pairs. The
+  owner is the one user every operation through the overlay is checked
+  and done as, whoever the caller is. The daemon must run as that user or
+  as root.
+- **What a sandbox sees.** A recordable file or symlink is shown; a
+  directory is shown when the rules could record something beneath it; a
+  special file never is. A database's `fsync`-class group is shown whole
+  or not at all, and `-shm` files never. A new file whose name the rules
+  skip goes to a private tmp layer in `<state>/tmp-layer/`, so saving by
+  temp file and rename works. The main mount and the history never see the
+  tmp layer. It is wiped when the daemon starts and when it stops.
+- **What a sandbox cannot do.** Create hard links, symlinks or special
+  files; move a directory (`EXDEV`); move a recorded file to a name the
+  rules skip (`EACCES`); change owners or set-id bits (`EPERM`);
+  `git init` or `git clone`; and use WAL databases. Each refused change
+  is counted in `agentfs.sandbox_overlay.refusals` by `reason`
+  ([telemetry](telemetry.md)).
+- **Lifecycle.** The overlay mounts after the main mount. If it fails to
+  mount, the main mount is stopped cleanly. An unmount of either mount
+  point from outside stops the daemon, which unmounts the other, commits
+  and pushes. `--seal-mountpoint`, `--on-stale-mount` and
+  `agentfs probe --sandbox-overlay PATH` cover both mount points.
+- **Refused at start** (exit 1, nothing mounted): tree rules
+  (`agentfs.respectTreeRules`), an overlay mount point that is the main
+  one, nested with it or in the same parent directory, a tmp layer on a
+  different filesystem than the backing tree, a front
+  (`--history-service`), and an owner the daemon cannot act as. The
+  messages and fixes are in
+  [the runbook](runbooks/sandbox-overlay.md#boot-refusals).
+- **Limits.** The overlay is a boundary for names, not for content: see
+  [guarantees](guarantees.md). Locks are not shared between the two
+  mounts. Shown entries' inode numbers skip one per hidden entry. Nothing
+  limits the tmp layer's size. The overlay is served only by a
+  single-process `mount`, so it is not available on fronts or CSI
+  volumes. Deployment is in [deployment.md](deployment.md#12-the-sandbox-overlay).

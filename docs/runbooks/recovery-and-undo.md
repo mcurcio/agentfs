@@ -1,7 +1,7 @@
 # Runbook: recovery and undo
 
 Bring files back to an earlier state after an agent (or anyone) changed
-them by mistake. Design: [§15](../design.md#15-recovery-and-undo).
+them by mistake. Safety promise: [guarantees](../guarantees.md).
 `ci/e2e-recovery.sh` runs this procedure end to end through a real mount
 in CI.
 
@@ -34,7 +34,7 @@ git --git-dir "$STATE/git" show <commit>:notes/plan.md
 git --git-dir "$STATE/git" show --stat <commit>
 ```
 
-- **Trailers** ([§9](../design.md#9-commit-metadata)) say who made each
+- **Trailers** ([recording](../recording.md)) say who made each
   change: `Agentfs-Uid` and `Agentfs-Pid` (the writing process),
   `Agentfs-Trigger` (`close`, `rename`, `unlink`, ...), `Agentfs-Pod` and
   `Agentfs-Node`, and `Agentfs-Seq`, the journal position.
@@ -88,7 +88,7 @@ recorded (untracked) are never touched. **Revert** applies the inverse of
 the commit's diff: files it added are removed, files it changed or
 removed come back. Merge commits are refused. The commit must be on the
 volume's branch; for anything else (another branch, a diverged ref) use
-plain git (§5).
+plain git (section 5).
 
 ### Which mode runs
 
@@ -100,7 +100,7 @@ plain git (§5).
   them. `--root` is not needed.
 - **Nothing runs**: the command takes the state-area lock itself, commits
   anything journaled, writes `--root` directly and records what it wrote.
-- **`agentfs serve-history` runs** (fronts mount the volume, design §14):
+- **`agentfs serve-history` runs** (fronts mount the volume):
   the command asks the service over the same control socket. Every live
   front must be listening for the service's calls (otherwise exit status
   75: a front from an older release, or one reconnecting; retry, or
@@ -142,8 +142,8 @@ nothing.
 
 | Refusal | Why | What to do |
 |---|---|---|
-| `... is not a commit in the history repository` | Unknown revision | Find it with `git log` (§1) |
-| `commit ... is not on the volume's branch` | Another branch, a diverged ref, a foreign commit | Plain git (§5) |
+| `... is not a commit in the history repository` | Unknown revision | Find it with `git log` (section 1) |
+| `commit ... is not on the volume's branch` | Another branch, a diverged ref, a foreign commit | Plain git (section 5) |
 | `nothing at <path> in commit ... or in the branch head` | Wrong path | `git show --stat <commit>` |
 | `commit ... changes nothing` / `is a merge` | Revert of an empty or merge commit | Restore the paths instead |
 | `<path> would not be recorded: ...` | The rules (`info/exclude`, `-agentfs`, an ignore for an untracked path) or the checks (blob size limit, git fsck rules) keep it out of history; a restore never writes what history would not show | Change the rules, or restore it with plain git |
@@ -181,7 +181,7 @@ agentfs --state "$STATE" revert <restore commit>
 ## 5. Plain-git alternatives
 
 For anything the commands refuse, plain git always works. With the
-workload stopped (§2), write the files into the backing tree, then
+workload stopped (section 2), write the files into the backing tree, then
 record them so history follows:
 
 ```sh
@@ -205,7 +205,7 @@ it.
 ## 6. What history does and does not restore
 
 History holds file content, the executable bit and symlinks
-([§6](../design.md#6-metadata-and-permissions)). A restore writes those.
+([recording](../recording.md)). A restore writes those.
 
 - A file rewritten in place keeps its inode, owner, other mode bits and
   extended attributes; only its exec bits follow history.
@@ -221,7 +221,7 @@ History holds file content, the executable bit and symlinks
 ## 7. Restoring a database
 
 A database in the `fsync` class
-([§8](../design.md#8-files-changed-in-place-the-fsync-class-phase-2),
+([recording](../recording.md),
 [operator guide](../operator-guide.md#14-databases-the-fsync-class)) is
 recorded as a group: `app.db` with its `-wal` or `-journal`, captured at
 one point in time. Every commit holds a consistent group, which SQLite
@@ -249,7 +249,7 @@ in CI, both through a mount and directly.
    change under an open connection, and the restore refuses a member open
    for writing. The mount may keep running: through it, the group is
    captured once, whole, when the restore ends. Without a mount, stop
-   everything (§2, "Stop everything").
+   everything (section 2, "Stop everything").
 
 3. **Restore the database** (any member names the group):
 

@@ -4,7 +4,7 @@
 `.git` file: a path as the workload sees the mount, such as
 `/workspace/main/.git/worktrees/wt`. agentfs maps it to a directory in
 the tree through the places it knows the tree is seen (its *views*,
-design [§5](../design.md#5-nested-repositories)). When the path is under
+[recording](../recording.md)). When the path is under
 none of them, agentfs tries each suffix of the path from the tree root
 instead (`main/.git/...`, then `.git/...`, and so on). That usually
 finds the right repository, but it can be fooled: two repositories
@@ -43,7 +43,7 @@ A sidecar whose workload container mounts the shared volume at another
 - **CSI:** set the `workloadMounts` StorageClass parameter (or the
   static PV's volume attribute) to the `mountPath`s pods use, comma
   separated, with the same `PATH[=DIR]` syntax
-  ([csi.md §5](../csi.md#5-parameters)). A StorageClass change reaches
+  ([csi.md section 5](../csi.md#5-parameters)). A StorageClass change reaches
   only PVs provisioned after it: each PV keeps the volume context it was
   provisioned with (a PV's `csi` source is immutable), so recreate a
   static PV with the attribute added, or re-provision.

@@ -4,9 +4,9 @@ With several mounts of one volume, every front (`agentfs mount
 --history-service`) hands each change boundary to the volume's history
 service (`agentfs serve-history`) and waits for it. While the service is
 down, hung or refusing a front, changes through that front are not
-recorded. Design: [§14](../design.md#14-volumes-mounted-by-several-pods-csi-phase-4),
-failures: [§3.5](../design.md#35-when-recording-fails), the operator
-guide: [§16](../operator-guide.md#16-several-mounts-of-one-volume-history-service).
+recorded. Protocol: [library/core](../library/core.md), failures:
+[guarantees](../guarantees.md), the operator
+guide: [section 16](../operator-guide.md#16-several-mounts-of-one-volume-history-service).
 
 ## Symptoms
 
@@ -60,7 +60,7 @@ guide: [§16](../operator-guide.md#16-several-mounts-of-one-volume-history-servi
 
    A front that says `history service ... is busy: ... already serves 1024
    connections` is not refused and raises no `HistoryServiceUnavailable`:
-   too many fronts are busy at once (design §14). Spread the fronts over
+   too many fronts are busy at once. Spread the fronts over
    more volumes, or lower their `--threads`.
 
 ## Restart the service

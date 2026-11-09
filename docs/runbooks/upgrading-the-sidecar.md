@@ -1,4 +1,4 @@
-# Runbook: upgrading the phase 1 sidecar
+# Runbook: upgrading the sidecar
 
 Moving a workload's agentfs sidecar ([deployment.md](../deployment.md),
 [`deploy/sidecar`](../../deploy/sidecar)) to another image, and back.
@@ -18,8 +18,8 @@ POD=$(kubectl get pod -l app.kubernetes.io/name=agentfs-example -o name | head -
    or a digest, never `latest`
    ([deployment.md](../deployment.md#1-the-image)). The commits between
    the running one and the new one (`git log --oneline <old>..<new>` in a
-   clone of agentfs) say what changed; design §19.1 lists decisions by
-   date.
+   clone of agentfs) say what changed, and [CHANGELOG.md](../../CHANGELOG.md) lists the
+releases.
 2. **Note where the volume is:**
 
    ```sh
@@ -50,7 +50,7 @@ grace of 5 s and the final commit):
 
 1. the workload containers stop first, then the sidecar gets SIGTERM;
 2. it unmounts, commits what is journaled and pushes each remote that
-   lacks commits once, within the push grace (design §11.2);
+   lacks commits once, within the push grace ([remotes](../remotes.md));
 3. commits that did not get out are pushed by the new pod.
 
 If the old pod is killed before its final commit (the grace ran out, or
@@ -84,8 +84,7 @@ kubectl logs "$POD" -c agentfs | head -n 20
 
 A newer version can journal changes an older one cannot read (a
 directory move): the older one then refuses to open the state area, with
-an error naming `agentfs flush` (design
-[§3.3](../design.md#33-journal-and-replay)). Nothing is discarded.
+an error naming `agentfs flush`. Nothing is discarded.
 
 - **The newer pod stopped normally:** its final commit emptied the
   journal. Set the older image and apply.

@@ -3,7 +3,7 @@
 `agentfs-csi` gives Kubernetes workloads agentfs volumes as ordinary
 PersistentVolumeClaims: the pods mount a claim, and every change they
 make is recorded and pushed as git history, by a recorder they cannot
-see or configure. It is phase 4 of the design (design §14.2, §17.2); this
+see or configure. The code's API is in [library/kubernetes](library/kubernetes.md); this
 page is the operator's guide and reference.
 
 - [1. What it is](#1-what-it-is)
@@ -34,7 +34,7 @@ There are two ways to run agentfs on Kubernetes:
 | Settings | a ConfigMap and Secret in the workload's namespace | profiles chosen by StorageClass, in the driver's namespace only |
 | Crash recovery | a pod restart, by hand | automatic: the plugin restarts the crashed front or service |
 
-One branch per worktree, for good (design §19.1, 2026-10-16): a worktree
+One branch per worktree, for good: a worktree
 writes only its own branch, creating it or fast-forwarding it, and a
 claim made again is a new worktree with a new branch. Continuing a
 volume's work on another node is a new volume **started from** the old
@@ -60,7 +60,7 @@ The image is the same (`ghcr.io/mcurcio/agentfs`): it ships `agentfs`,
 
 There is no controller Deployment and no attach step. **Every node
 plugin** serves all three CSI services, beside its own csi-provisioner in
-`--node-deployment` mode (design §19.1, 2026-10-16, R8):
+`--node-deployment` mode:
 
 - **csi-provisioner** provisions the claims whose pods the scheduler put
   on its node (`WaitForFirstConsumer`), and deletes the PVs of its node's
@@ -69,13 +69,13 @@ plugin** serves all three CSI services, beside its own csi-provisioner in
   answers this node's topology (`topology.agentfs.mcurcio.github.io/node`):
   the PV's node affinity keeps every later pod of the claim on this node.
   A start class fetches its start branch once (§5).
-- **DeleteVolume** asks the one release decider (design §14.2): it lists
+- **DeleteVolume** asks the one release decider (see [library/kubernetes](library/kubernetes.md)): it lists
   each remote once and removes or keeps the worktree only when nothing
   would be lost (§7).
 - **The node services** supervise child processes of the `agentfs`
   binary, exactly the ones the single-node tests exercise: one `agentfs
   serve-history` per staged volume (the volume's single writer of
-  history, design §2.3), started at NodeStage; one front, `agentfs mount
+  history), started at NodeStage; one front, `agentfs mount
   --history-service`, per pod using the volume, started at NodePublish
   with that pod's name, namespace and uid. The front mounts FUSE at a
   private source directory, which is bind-mounted onto the kubelet's
@@ -90,7 +90,7 @@ A crashed child does not take the plugin down; the plugin restarts it
 pid namespace (`hostPID: true`), so `tini` is not PID 1 and runs as a
 subreaper (`-s`). The fronts need that namespace: FUSE reports a caller
 in a pod's own pid namespace as pid 0, and its supplementary groups (the
-pod's `fsGroup`) are then unknown (design §6).
+pod's `fsGroup`) are then unknown (see [recording](recording.md)).
 
 **On disk.** Under `--base-path` (default `/var/lib/agentfs-csi/volumes`,
 a hostPath on each node), one directory per worktree, named after the
@@ -127,8 +127,7 @@ the target path.
   disk of its own (§11). A network filesystem is refused at start.
 - **One node per volume, for good.** Several pods on one node share a
   volume (`ReadWriteOnce`, or `ReadWriteOncePod` for one pod). Every
-  multi-node access mode (`ReadWriteMany`, `ReadOnlyMany`) is refused
-  (design §19.1, 2026-10-15): pods on other nodes read the volume's
+  multi-node access mode (`ReadWriteMany`, `ReadOnlyMany`) is refused: pods on other nodes read the volume's
   history from the remote it pushes to.
 - **A remote to move by.** A volume continues on another node only
   through a remote holding its branch ([moving](runbooks/moving.md)); a
@@ -165,9 +164,9 @@ ConfigMap, mounted into the driver's pods at `/etc/agentfs-csi/profiles`:
 
 | File | Becomes | Required |
 |---|---|---|
-| `<profile>.config` | a git-config fragment included by every volume's state area (design §4.3): settings and remotes; a profile with no `[remote]` section makes local-only volumes ([configuration](configuration.md#remotes-modes)) | yes |
-| `<profile>.exclude` | the volume's `info/exclude` (design §4.1) | no |
-| `<profile>.attributes` | the volume's `info/attributes` (design §4.2) | no |
+| `<profile>.config` | a git-config fragment included by every volume's state area (see [recording](recording.md)): settings and remotes; a profile with no `[remote]` section makes local-only volumes ([configuration](configuration.md#remotes-modes)) | yes |
+| `<profile>.exclude` | the volume's `info/exclude` (see [recording](recording.md)) | no |
+| `<profile>.attributes` | the volume's `info/attributes` (see [recording](recording.md)) | no |
 
 A fragment must not set `agentfs.volume`, `agentfs.branch` or the start
 keys (`agentfs.start.*`); the driver sets a volume's identity in its own
@@ -210,7 +209,7 @@ A StorageClass's `parameters`:
 | `volumeName` | the agentfs volume name (commit trailers, identity templates), a template over `{pvcNamespace}`, `{pvcName}` and `{pvName}` that must contain `{pvName}`. The branch is always `agentfs/<volumeName>` | `{pvcNamespace}.{pvcName}.{pvName}` (the provisioner runs with `--extra-create-metadata`), else the PV name |
 | `onDelete` | what DeleteVolume does once nothing would be lost: `retain` keeps the worktree on its node (renaming `csi.json` to `csi.retained.json`), `delete` removes it. Either way DeleteVolume waits while a remote lacks the head, or the journal holds records not yet committed (§7) | `retain` |
 | `startFrom` | `<remote>:<branch>@<commit>`: a **start class**. A claim on it is a new worktree whose history begins at that commit of another worktree's branch (§11, [moving](runbooks/moving.md)) | none |
-| `workloadMounts` | where pods mount the volume, comma-separated `PATH` or `PATH=DIR` (a `subPath` of the tree's directory `DIR`): passed to every front as `--workload-mount`, so the absolute `gitdir:` that `git worktree add` writes maps exactly to its repository (design §5). The node plugin cannot learn a container's `mountPath` otherwise; without it worktree paths are resolved by their suffixes and counted in `agentfs.nested.gitdir_heuristic` ([runbook](runbooks/worktree-heuristic.md)) | none |
+| `workloadMounts` | where pods mount the volume, comma-separated `PATH` or `PATH=DIR` (a `subPath` of the tree's directory `DIR`): passed to every front as `--workload-mount`, so the absolute `gitdir:` that `git worktree add` writes maps exactly to its repository (see [recording](recording.md)). The node plugin cannot learn a container's `mountPath` otherwise; without it worktree paths are resolved by their suffixes and counted in `agentfs.nested.gitdir_heuristic` ([runbook](runbooks/worktree-heuristic.md)) | none |
 
 Keys under `csi.storage.k8s.io/` are the provisioner's and are otherwise
 ignored; any other key is refused (`InvalidArgument`), `branch` included.
@@ -221,7 +220,7 @@ is what keeps one. The `agentfs-class` admission policy
 (`deploy/csi/class-admission.yaml`, chart value `classAdmission.enabled`)
 refuses any other.
 
-**One branch per worktree** (design §11.4, §14.2). The name must contain
+**One branch per worktree** (see [remotes](remotes.md)). The name must contain
 `{pvName}`, which the provisioner never reuses, so every claim is a new
 worktree with a new branch: a claim deleted and created again never
 writes the old claim's branch. A worktree writes its branch only where
@@ -304,7 +303,7 @@ See `deploy/csi/example/deployment.yaml`.
   `ReadWriteOncePod` (`SINGLE_NODE_SINGLE_WRITER`); a read-only mount of
   either is `SINGLE_NODE_READER_ONLY`. Every multi-node mode
   (`ReadWriteMany`, `ReadOnlyMany`) is refused with one message, which
-  names the decision (design §19.1, 2026-10-15): the claim stays Pending
+  names the decision: the claim stays Pending
   with a `ProvisioningFailed` event that says `multi-node access modes are
   not supported`. A pod on another node that needs the files reads the
   volume's history from the remote it pushes to.
@@ -319,7 +318,7 @@ See `deploy/csi/example/deployment.yaml`.
   chown is a recorded metadata change).
   Pods whose primary group is not their `fsGroup` create files through a
   supplementary group: the node plugin's `hostPID` lets their fronts see
-  it (design §6). A plugin deployed without it still works, but such
+  it (see [recording](recording.md)). A plugin deployed without it still works, but such
   creates fall back to root-then-chown
   (`agentfs.fuse.create_as_caller_fallbacks`), and two pods creating the
   same new name at once can see `EACCES`.
@@ -330,11 +329,11 @@ See `deploy/csi/example/deployment.yaml`.
   allowed under `restricted`.
 - **Several pods.** Every pod on the node gets its own front and pending
   slot; one history service orders their changes. Pods share the files with
-  the backing filesystem's semantics (design §14): two pods writing one
+  the backing filesystem's semantics (see [library/core](library/core.md)): two pods writing one
   file is last-writer-wins, and POSIX locks are not shared between pods,
   so a SQLite database must be written from one pod.
 - **Identity.** `podInfoOnMount` gives each front its pod's name,
-  namespace and uid. With the default templates (design §9) the committer
+  namespace and uid. With the default templates (see [recording](recording.md)) the committer
   is the pod name (`{replica}`), the committer email
   `<pod uid>@<volume>.agentfs.invalid`, the author `uid-<uid>` of the
   writing process, and every commit carries `Agentfs-Pod`,
@@ -363,17 +362,16 @@ only into a fork class (§14).
 its start branch once; DeleteVolume lists each remote once. No call
 pushes. A fork's CreateVolume copies a local volume's history and writes
 its tree, with no network and no credentials. The history service pushes
-in the background on its interval (design §11.2), and once more as it
+in the background on its interval (see [remotes](remotes.md)), and once more as it
 stops, so NodeUnstage waits up to `--push-grace` (5 s) for that final
 push; the release scan pushes an unstaged worktree after that. NodeStage
 only waits, at most `--stage-wait`, for the service to listen; before
-listening the service fetches the patch inbox (design §12), bounded by
+listening the service fetches the patch inbox (see [patches](patches.md)), bounded by
 `agentfs.patchFetchTimeout`, and applies queued patches.
 
 **Patches land only at NodeStage.** Queued patches are written into a
 volume only when its history service starts with no front attached; the
-driver has no call that lands them later ("No live landing yet", design
-§19.1). To hear about patches, set the notify webhook in the profile's
+driver has no call that lands them later: patches never land while a workload runs. To hear about patches, set the notify webhook in the profile's
 config: `agentfs.patchNotifyUrl`, with `agentfs.patchNotifyCredentialFile`
 for a bearer token (a file the node plugin can read) and
 `agentfs.patchNotifyTimeout` ([configuration](configuration.md#agentfs)).
@@ -384,7 +382,7 @@ like any other, and no CSI test sends a notice.
 
 ## 8. Recovery
 
-The plugin specifies and tests each of these (§13; design §14.2):
+The plugin specifies and tests each of these (section 13):
 
 - **A front crashes** (`kill -9`, a bug): its pod's mount answers `ENOTCONN`.
   The plugin restarts the front with backoff (1 s, doubling to
@@ -396,7 +394,7 @@ The plugin specifies and tests each of these (§13; design §14.2):
   `mountPropagation: HostToContainer` see the new mount at once; others
   after a container restart. Other pods on the volume are unaffected.
 - **The history service crashes**: the fronts' boundaries fail with `EIO`
-  and alarm (design §3.5) until it is back; the plugin restarts it with
+  and alarm (see [guarantees](guarantees.md)) until it is back; the plugin restarts it with
   backoff, it recovers its journal (journaled records are committed under
   their original pod's committer) and the fronts reconnect by themselves.
 - **A restart cannot start** (a failed fork under PID or memory pressure,
@@ -428,8 +426,7 @@ The plugin specifies and tests each of these (§13; design §14.2):
   the missing worktree with `NotFound`, and the pod waits, its events
   naming the node.
 
-What is lost in a crash is the same as for a single process (design
-§3.5): boundaries that failed with `EIO` keep their final state through
+What is lost in a crash is the same as for a single process (see [guarantees](guarantees.md)): boundaries that failed with `EIO` keep their final state through
 the repairs and the sweep, not their intermediate states.
 
 ## 9. Operations
@@ -450,7 +447,7 @@ its start point (`start:`) and, while it is raised, the start-branch
 alarm (`start branch moved: <pinned>..<tip>`). `git` is in the image:
 `git --git-dir /var/lib/agentfs-csi/volumes/<pv>/state/git log`.
 
-**The LFS cache** (design §7) is the volume's
+**The LFS cache** (see [recording](recording.md)) is the volume's
 `<basePath>/<pv>/state/lfs`. `agentfs lfs fetch` and `agentfs lfs prune`
 run in the same container, beside the history service, with `--state`
 as above (the [LFS storage runbook](runbooks/lfs-storage.md)):
@@ -467,7 +464,7 @@ release scan) or `[fork <pv>]`. Restarts are logged (`front for …
 exited (…); restarting in 2s in slot 3`). The provisioner's container,
 `csi-provisioner`, logs each CreateVolume and DeleteVolume answer.
 
-**Restores** (design §15) run live, through the volume's history
+**Restores** (see [operator guide](operator-guide.md#12-recovery-and-undo)) run live, through the volume's history
 service, from the node plugin pod of the node that stages it:
 
 ```sh
@@ -525,7 +522,7 @@ with `agentfs flush`. Every failed push raises
 `PushFailed` through that push's own alarms and telemetry. That covers a
 worktree between pods, one whose claim was deleted (DeleteVolume waits
 meanwhile, and wakes the scan), and one kept on the node. A diverged
-remote (design §11.3) never takes the commits; resolve it first
+remote (see [remotes](remotes.md)) never takes the commits; resolve it first
 ([runbook](runbooks/divergence.md)); DeleteVolume keeps the worktree
 until then. To discard a worktree's unpushed history instead, remove
 `<basePath>/<pv>` on its node by hand.
@@ -565,7 +562,7 @@ cluster administrators.
 
 | Namespace | Pod | Level | Why |
 |---|---|---|---|
-| `agentfs-csi` (enforce `privileged`, warn and audit `baseline`) | node plugin `agentfs-csi` | privileged, root, `hostPID` | FUSE `mount(2)`, the workloads' real pids so fronts create files as their callers with their supplementary groups (design §6), `Bidirectional` propagation into `/var/lib/kubelet`, hostPath volumes, passthrough (`CAP_SYS_ADMIN`), giving files to their owners (`CAP_CHOWN`, `CAP_FOWNER`), removing a released worktree |
+| `agentfs-csi` (enforce `privileged`, warn and audit `baseline`) | node plugin `agentfs-csi` | privileged, root, `hostPID` | FUSE `mount(2)`, the workloads' real pids so fronts create files as their callers with their supplementary groups (see [recording](recording.md)), `Bidirectional` propagation into `/var/lib/kubelet`, hostPath volumes, passthrough (`CAP_SYS_ADMIN`), giving files to their owners (`CAP_CHOWN`, `CAP_FOWNER`), removing a released worktree |
 | | csi-provisioner, node-driver-registrar, livenessprobe | root, no capabilities, read-only root filesystem | reach the root-owned 0660 CSI socket |
 | workloads (e.g. `agentfs-example`, enforce `restricted`) | anything | restricted | they only mount a claim |
 
@@ -591,8 +588,8 @@ pinned commit ([moving](runbooks/moving.md)).
 ## 11. Where worktrees live
 
 Each node keeps its worktrees under its own `--base-path`, on its own
-disk (design §19.1, 2026-10-16, R1: "use local disk for working code").
-The optional shared storage the owner described is an ordinary git
+disk.
+Optional shared storage is an ordinary git
 remote (a server on a claim of any StorageClass, NFS 4.0 or iSCSI
 included), never the base path.
 
@@ -603,7 +600,7 @@ included), never the base path.
   (any version), SMB, CephFS, GlusterFS, Lustre, GPFS or AFS before it
   serves anything, naming the filesystem type. (A CLI or sidecar state
   area may still live on NFS 4.1 or later, whose locks the state lock
-  checks: design §2.3.)
+  checks; see the [operator guide](operator-guide.md#9-the-state-area-lock).)
 - **Moving is a new volume.** A worktree never leaves its node. To go
   on elsewhere, a start class (§5) makes a new worktree on the new node
   from a pinned commit of the old branch on a remote
@@ -622,8 +619,7 @@ included), never the base path.
 ## 12. Limitations
 
 - One node per volume, for good; every multi-node access mode
-  (`ReadWriteMany`, `ReadOnlyMany`) is refused (design §19.1,
-  2026-10-15). Pods on other nodes read the volume's history from its
+  (`ReadWriteMany`, `ReadOnlyMany`) is refused. Pods on other nodes read the volume's history from its
   remote. A volume continues elsewhere only as a new volume started from
   its branch (§11).
 - Draining a node leaves its agentfs pods `Pending` until its plugin
@@ -724,8 +720,7 @@ included), never the base path.
 
 ## 14. Forks
 
-A **fork** is a volume started from another volume's latest commit
-(design §11.5). A sandbox pod gets one through a claim whose `dataSource`
+A **fork** is a volume started from another volume's latest commit (see [forks](forks.md)). A sandbox pod gets one through a claim whose `dataSource`
 is the source's claim, on a **fork class**: a StorageClass with
 `fork: "true"` and reclaim policy `Delete`
 ([example](../deploy/csi/example/fork-storageclass.yaml)). The fork has the
@@ -736,22 +731,20 @@ source's patch remote), never the source's branch, or with
 off every branch ([configuration](configuration.md#agentfs)).
 
 - **Linked or unlinked.** A fork class's `link` parameter sets whether its
-  forks deliver back to their source (design §11.5 "Fork link"):
+  forks deliver back to their source ([forks](forks.md)):
   `linked`, the default, is everything below; `unlinked` makes
   independent forks. Nothing is ever delivered from an unlinked fork to
   the source: it is never finished, `fork status` has nothing to show,
   and DeleteVolume treats it as any worktree. It never pushes to the
-  source's remotes, its fork remote included (design §19.1 "Unlinked
-  fork remotes"): only to the remotes of the class's `remotes`
+  source's remotes, its fork remote included: only to the remotes of the class's `remotes`
   parameter, a profile whose `<remotes>.config` in the profiles
   ConfigMap holds the fork's own `[remote "<name>"]` sections (and, if
   its LFS store is not derived from them, `lfs.url` or `lfs.pushurl`;
   nothing else). With them, DeleteVolume waits while one of them lacks
   the head, then applies `onDelete`. Without them the fork is local-only,
   and DeleteVolume with `onDelete: delete` (a fork class's default)
-  removes it with its history unpushed: the owner, 2026-10-17: "if no
-  remote is configured, the volume is lost, and that's a choice the user
-  is allowed to make". `link` and `remotes` are written into each fork's
+  removes it with its history unpushed: with no remote configured, the
+  volume is lost, which is the user's choice. `link` and `remotes` are written into each fork's
   identity at CreateVolume (`agentfs.fork.link`, `agentfs.fork.remotes`,
   the path of that config); editing the class moves no fork that exists,
   while editing the profile changes the remotes of every fork made with
@@ -773,8 +766,7 @@ off every branch ([configuration](configuration.md#agentfs)).
   answers `FailedPrecondition`, naming the remedy). Kubernetes'
   documentation says a clone's source claim must not be in use, but the
   external-provisioner does not check it, and the kind test
-  (`ci/e2e-csi-forks.sh`) clones a claim a running pod writes to (design
-  §19.2, question 8).
+  (`ci/e2e-csi-forks.sh`) clones a claim a running pod writes to. Kubernetes' documentation says a clone's source claim must not be in use; the provisioner this driver pins checks only that it is bound, not being deleted and of the same driver, so the clone works today. A later provisioner or Kubernetes release may add the check, and the kind job would show it.
 - **Admission.** The class admission policy
   (`deploy/csi/class-admission.yaml`) refuses any StorageClass of this
   driver, a fork class too, whose reclaim policy is not `Delete`: with
@@ -798,8 +790,7 @@ off every branch ([configuration](configuration.md#agentfs)).
   the fork's branch, or `agentfs patch submit <change>` into the source's
   inbox, which applies a given change commit at most once.
 - **Forks of forks.** A fork class claim whose `dataSource` is a linked
-  fork's claim makes a fork of that fork, on the same node (design §11.5,
-  §12 "Forks of forks"). When it finishes, the release scan's finisher
+  fork's claim makes a fork of that fork, on the same node (see [forks](forks.md)). When it finishes, the release scan's finisher
   queues its change as the parent fork's next inbox number on the fork
   remote, with the fork remote's credentials, instead of publishing
   a change ref (it pushes its finish ref, so its own forks see it
