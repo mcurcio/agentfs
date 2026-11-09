@@ -1,4 +1,4 @@
-//! Submitting a patch (design §12, §19.1): the producer side.
+//! Submitting a patch: the producer side.
 //!
 //! A producer (iac, CI, an operator) runs `agentfs patch submit` in its own
 //! git repository. It drives the producer's `git`, so the repository's
@@ -17,7 +17,7 @@
 //!    ref) is refused early
 //!    ([`SubmitError::AlreadySubmitted`]), pushing nothing: a change lands
 //!    at most once. Two submits at once can both pass this check; the
-//!    queue's duplicate rule (§12) is the guarantee.
+//!    queue's duplicate rule is the guarantee.
 //! 4. Its number is one past the highest inbox or applied number on the
 //!    remote, or, for `--replace N`/`--skip N`, `N`: a queued patch, or a
 //!    gap (a number below the highest one that the remote has neither as
@@ -585,7 +585,7 @@ pub fn approve(git: &impl GitRunner, req: &ApproveRequest) -> Result<Approved, S
 /// [`SubmitError::AlreadySubmitted`] when `oid` is a queued or applied
 /// patch commit on the remote: an `inbox/*` or `applied/*` ref at it, or
 /// the status ref's `last_applied` patch. An early refusal only: two
-/// submits at once both pass it, and the queue's duplicate rule (§12) is
+/// submits at once both pass it, and the queue's duplicate rule is
 /// what makes a change land at most once.
 fn refuse_submitted(
     git: &impl GitRunner,

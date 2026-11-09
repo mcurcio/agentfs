@@ -1,5 +1,4 @@
-//! Telling the integrator what the patch queue decided (bead agentfs-mia.5;
-//! design §19.1 "Integrators decide when patches are applied": the
+//! Telling the integrator what the patch queue decided (bead agentfs-mia.5: the
 //! *notify* primitive).
 //!
 //! After every queue run ([`super::queue::Queue::process`], at mount or by

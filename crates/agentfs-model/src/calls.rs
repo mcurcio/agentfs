@@ -1,5 +1,5 @@
 //! The calls a test makes of a tree system, shared by the model and the real
-//! system (VERIFYING.md, "Phase 1"; git-model.md §18, the first row).
+//! system (VERIFYING.md, "The model as the conformance suite"; git-model.md §18, the first row).
 //!
 //! The scenario bodies assert on the model's internals, so they are not
 //! ported. The model runs them unchanged and records each call with what each

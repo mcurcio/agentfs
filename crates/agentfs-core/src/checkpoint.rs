@@ -1,7 +1,6 @@
-//! Checkpoints: one change-line commit per intent (design §3.4, §19.2
-//! item 11).
+//! Checkpoints: one change-line commit per intent.
 //!
-//! The volume's branch records every change (§3); the **change line**,
+//! The volume's branch records every change; the **change line**,
 //! `refs/agentfs/<volume>/change-line`, is a coarser history beside it:
 //! one commit per checkpoint, which a caller cuts when an intent is done
 //! (`agentfs checkpoint -m MESSAGE`, or the control socket's
@@ -12,7 +11,7 @@
 //! a fork whose source had a change line at create:
 //! [`BASE_CHANGE_LINE_KEY`]), and its further parents are the tips
 //! (`applied/<n>`) of the patches landed on the branch since that tip,
-//! by inbox number. Its author is the caller (§9), its committer the
+//! by inbox number. Its author is the caller, its committer the
 //! replica, its message the caller's, then `Agentfs-Trigger: checkpoint`
 //! and `Agentfs-Branch-Head: <head>`.
 //!
@@ -54,7 +53,7 @@ pub fn change_line_ref(volume: &str) -> String {
 pub struct CheckpointRequest {
     /// The checkpoint's message; [`DEFAULT_MESSAGE`] when `None` or blank.
     pub message: Option<String>,
-    /// Who asked: the checkpoint's author (§9).
+    /// Who asked: the checkpoint's author.
     pub caller: Caller,
 }
 

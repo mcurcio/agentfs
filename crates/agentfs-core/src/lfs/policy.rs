@@ -1,4 +1,4 @@
-//! Which store a recorded file's content goes to (design §7, §4.2).
+//! Which store a recorded file's content goes to.
 //!
 //! In order:
 //!
@@ -26,8 +26,7 @@ use super::attributes::pattern_for;
 use crate::paths::{RepoPath, special_file};
 use crate::rules::{AttrState, Attributes};
 
-/// `agentfs.store`: `blob` or `lfs`, operator attributes only (design §4.2,
-/// §7).
+/// `agentfs.store`: `blob` or `lfs`, operator attributes only.
 pub const STORE_ATTR: &str = "agentfs.store";
 
 /// Where a recorded file's content is stored.

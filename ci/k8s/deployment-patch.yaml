@@ -48,7 +48,7 @@ spec:
           volumeMounts:
             - { name: agentfs-mount, mountPath: /workspace, subPath: workspace, mountPropagation: HostToContainer }
           # A subPath of the mount cannot be fenced read-only: restart onto
-          # the new mount once the daemon has exited (docs/deployment.md §3).
+          # the new mount once the daemon has exited (docs/deployment.md).
           livenessProbe:
             exec:
               # Fails on the dead mount (ENOTCONN) and on a bare directory.

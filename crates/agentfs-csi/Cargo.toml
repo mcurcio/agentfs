@@ -10,10 +10,10 @@ description = "The agentfs CSI driver: persistent volumes with a history service
 [dependencies]
 agentfs-core = { version = "0.1.0", path = "../agentfs-core" }
 # Only mount_state (live or stale FUSE mounts) and MountState; the FUSE
-# session itself runs in `agentfs` children (design §17.2).
+# session itself runs in `agentfs` children.
 agentfs-fuse = { version = "0.1.0", path = "../agentfs-fuse" }
 clap = { version = "4.6.7", features = ["derive", "env"] }
-# gRPC over a Unix socket, as CSI requires (design §17.2, §17.3). Default
+# gRPC over a Unix socket, as CSI requires. Default
 # features (router, transport, codegen) and no TLS: pure Rust.
 tonic = "0.14.6"
 tonic-prost = "0.14.6"
@@ -29,7 +29,7 @@ tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "net", "pro
 tokio-stream = { version = "0.1.19", features = ["net"] }
 
 [build-dependencies]
-# Compiles the vendored csi.proto without protoc (design §17.3).
+# Compiles the vendored csi.proto without protoc.
 protox = "0.10.0"
 tonic-prost-build = { version = "0.14.6", default-features = false, features = ["transport"] }
 

@@ -1,4 +1,4 @@
-//! Serving the CSI services on a Unix socket (design §14.2, §17.2).
+//! Serving the CSI services on a Unix socket.
 
 use std::fs;
 use std::future::Future;
@@ -45,7 +45,7 @@ pub fn parse_endpoint(endpoint: &str) -> Result<PathBuf, EndpointError> {
     }
 }
 
-/// A socket that is listening and not yet served (design §2.2). Dropping it
+/// A socket that is listening and not yet served. Dropping it
 /// stops the listener, so a connect is refused, and leaves the file behind.
 pub struct BoundSocket {
     path: PathBuf,
@@ -56,7 +56,7 @@ pub struct BoundSocket {
 /// Binds `socket`, replacing a stale one, with mode 0660. When this returns
 /// the socket is listening: a connect succeeds and queues until
 /// [`BoundSocket::serve`] takes it, so the return is the readiness to wait
-/// on, not the path's existence (design §2.2). Must run inside a tokio
+/// on, not the path's existence. Must run inside a tokio
 /// runtime.
 pub fn bind(socket: &Path) -> Result<BoundSocket, ServerError> {
     let io_err = |what, source| ServerError::Io {

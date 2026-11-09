@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 # csi-sanity (kubernetes-csi/csi-test) against `agentfs-csi`, which serves
-# the identity, controller and node services of one node (design §14.2,
-# §18 test 16): every CSI call, with real history services and FUSE
+# the identity, controller and node services of one node: every CSI call, with real history services and FUSE
 # fronts, checked for the spec's error codes, idempotency, topology and
 # cleanup. Then checks that no agentfs mount is left behind.
 #
@@ -72,8 +71,7 @@ step "csi-sanity"
 # --csi.testvolumeexpandsize is unset (no expansion); the capability-gated
 # tests (snapshots, expansion, stats, list) skip themselves because the
 # driver does not advertise them. The clone tests ("source volume") are
-# skipped: the driver clones only into a fork class (fork: "true", design
-# §11.5), which the test parameters are not; crates/agentfs-csi/tests/grpc.rs
+# skipped: the driver clones only into a fork class (fork: "true", design), which the test parameters are not; crates/agentfs-csi/tests/grpc.rs
 # and ci/e2e-csi-forks.sh cover cloning.
 sudo "$CSI_SANITY" \
   --csi.endpoint "unix://$SOCK" \

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # A TCP server that accepts every connection and never answers: a git
-# remote that hangs mid-request (design §11.2, "Network timeouts"). Each
+# remote that hangs mid-request. Each
 # connection is held open by a child that sleeps for an hour.
 #
 # Usage: ci/hung-server.sh start <port> <pidfile>

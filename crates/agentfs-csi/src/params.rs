@@ -1,5 +1,5 @@
 //! StorageClass and PersistentVolume parameters, and what the CO tells a
-//! node about the pod (design §14.2).
+//! node about the pod.
 //!
 //! Every setting of a volume is the operator's: a StorageClass's
 //! `parameters` (or a static PV's `volumeAttributes`) name a **profile**,
@@ -12,7 +12,7 @@
 //! | `volumeName` | the agentfs volume name, a template over `{pvcNamespace}`, `{pvcName}` and `{pvName}` that must contain `{pvName}`; default [`DEFAULT_TEMPLATE`] (with the provisioner's `--extra-create-metadata`), else the PV name. In a static PV's attributes, a literal name |
 //! | `onDelete` | `retain` (default: DeleteVolume keeps the directory) or `delete` ([`OnDelete`]) |
 //! | `startFrom` | `<remote>:<branch>@<commit>`: the new worktree starts from that commit of another worktree's branch (F8 R2; [`StartPoint`]) |
-//! | `fork` | `"true"`: a fork class ([`ForkClass`], design §11.5); `"false"` or absent: an ordinary one |
+//! | `fork` | `"true"`: a fork class ([`ForkClass`]); `"false"` or absent: an ordinary one |
 //! | `link` | a fork class only: `linked` (default: the fork's finish delivers its change back to the source) or `unlinked` (an independent fork, nothing ever delivered; [`ForkLink`]) |
 //! | `remotes` | a fork class with `link: unlinked` only: a profile whose `<remotes>.config` holds the fork's own `[remote "<name>"]` sections (`agentfs.fork.remotes`); without it the fork is local-only, and DeleteVolume with `onDelete: delete` removes it unpushed |
 //!
@@ -21,8 +21,7 @@
 //! `branch` too: a worktree's branch is always `agentfs/<volume>` (F8
 //! rule 1, one branch per worktree, for good).
 //!
-//! The name must include the PV name, so it is unique per volume (design
-//! §11.4, F8 rule 1): a claim deleted and created again is a new worktree
+//! The name must include the PV name, so it is unique per volume (F8 rule 1): a claim deleted and created again is a new worktree
 //! with a new branch, never a second writer of the old claim's branch.
 
 use std::collections::HashMap;
@@ -63,7 +62,7 @@ pub const MAX_PROFILE_LEN: usize = 63;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ParamError {
-    #[error("the StorageClass parameter `profile` is required (design §14.2)")]
+    #[error("the StorageClass parameter `profile` is required")]
     MissingProfile,
     #[error(
         "profile {0:?} is not a valid name: lower-case letters, digits and '-', starting and \
@@ -138,7 +137,7 @@ pub struct VolumeParams {
     pub start_from: Option<String>,
     /// Where pods mount the volume (`workloadMounts`: comma-separated
     /// `PATH` or `PATH=DIR`), passed to every front as `--workload-mount`
-    /// so absolute worktree `gitdir:` targets map exactly (design §5).
+    /// so absolute worktree `gitdir:` targets map exactly.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub workload_mounts: Vec<String>,
 }
@@ -314,7 +313,7 @@ fn volume_name(
     Ok(volume)
 }
 
-/// A fork class's settings (design §11.5): a StorageClass with `fork:
+/// A fork class's settings: a StorageClass with `fork:
 /// "true"`, whose claims clone a `dataSource` claim.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForkClass {
@@ -324,10 +323,10 @@ pub struct ForkClass {
     pub on_delete: OnDelete,
     pub workload_mounts: Vec<String>,
     /// `link`: whether the fork delivers back to its source, written into
-    /// its identity at create and never changed after (design §11.5).
+    /// its identity at create and never changed after.
     pub link: ForkLink,
     /// `remotes`: an unlinked fork's own remotes, the profile whose
-    /// `.config` holds them (design §11.5); `None`, it is local-only.
+    /// `.config` holds them; `None`, it is local-only.
     pub remotes: Option<String>,
 }
 
@@ -335,8 +334,7 @@ impl ForkClass {
     /// `Ok(None)` unless `parameters` has `fork: "true"`. A fork class must
     /// not set `profile`, `branch` or `startFrom`, and its `volumeName`
     /// template must contain `{pvName}`, as every class's; `onDelete`
-    /// defaults to `delete` (publishing already gates deletion, design
-    /// §19.1 "Fork onDelete").
+    /// defaults to `delete` (publishing already gates deletion, design).
     pub fn from_create(
         name: &str,
         parameters: &HashMap<String, String>,
@@ -400,7 +398,7 @@ impl ForkClass {
 /// the volume.
 pub const WORKLOAD_MOUNTS: &str = "workloadMounts";
 
-/// `workloadMounts`: comma-separated `PATH` or `PATH=DIR` (design §5),
+/// `workloadMounts`: comma-separated `PATH` or `PATH=DIR`,
 /// each as `agentfs mount --workload-mount` takes it.
 pub fn parse_workload_mounts(value: &str) -> Result<Vec<String>, ParamError> {
     value
@@ -873,7 +871,7 @@ mod tests {
 
     #[test]
     fn a_static_pv_names_its_volume_with_volume_name() {
-        // As docs/csi.md §5 documents it.
+        // As docs/csi.md documents it.
         let p = VolumeParams::from_context(
             "pvc-0b6f",
             &map(&[("profile", "p"), ("volumeName", "research.notes")]),

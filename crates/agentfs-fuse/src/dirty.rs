@@ -1,9 +1,9 @@
-//! Whether an inode changed since it was last recorded (design §3.1:
+//! Whether an inode changed since it was last recorded (:
 //! "FLUSH records only if the inode changed").
 //!
 //! The daemon does not see every write (writes through a shared mapping
 //! reach it only at writeback, and a writer sharing a passthrough backing
-//! id not at all: design §17.1), so change is detected from the inode
+//! id not at all), so change is detected from the inode
 //! itself. An inode is *armed* once something could
 //! have changed it: a write-open, a write the daemon served, or a size
 //! change. Only an armed inode is `fstat`ed at FLUSH; its [`Stamp`] (device,
@@ -18,14 +18,14 @@
 //! RELEASE comes once every handle is closed and every mapping made through
 //! a daemon handle is gone; that is every writer's, except a writer sharing
 //! a passthrough backing id, whose mapping does not hold the FUSE file
-//! open, so its node stays armed until FORGET (design §3.1, §17.1).
+//! open, so its node stays armed until FORGET.
 //! RELEASE is the only backstop for a same-tick write through a shared
 //! mapping, and for a file without one it follows the last close at once,
 //! so a file written and closed within the window would be recorded twice. Instead, a racy record pins
 //! its frozen copy ([`FrozenRef`]); a boundary that would record again only
 //! because of the racy rule compares the file's bytes with that copy, and
 //! skips the record if they are equal and the copy is still the last state
-//! journaled at the path ([`DirtyState::racy_only`], design §3.1).
+//! journaled at the path ([`DirtyState::racy_only`]).
 
 use std::fs::File;
 use std::sync::Arc;
@@ -109,7 +109,7 @@ pub struct DirtyState {
     /// useful caller.
     pub last_writer: Option<Caller>,
     /// The frozen copy of the last record, pinned open while that record
-    /// is racy (design §3.1).
+    /// is racy.
     pub frozen: Option<FrozenRef>,
 }
 
@@ -168,7 +168,7 @@ impl DirtyState {
     /// Whether a boundary that [`DirtyState::needs_record`] needs it only
     /// because of the racy-timestamp rule: the stamp is the last record's,
     /// nothing forces a record. Only then may the record be skipped when
-    /// the bytes are proven to be the pinned copy's (design §3.1).
+    /// the bytes are proven to be the pinned copy's.
     pub fn racy_only(&self, current: &Stamp) -> bool {
         self.armed && !self.force && self.racy && self.baseline.as_ref() == Some(current)
     }

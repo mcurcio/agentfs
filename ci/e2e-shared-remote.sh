@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# Two volumes pushing to one shared remote at the same time (design §11.3,
-# §18 test 10): vol-a and vol-b, each a real FUSE mount with a writer, push
+# Two volumes pushing to one shared remote at the same time: vol-a and vol-b, each a real FUSE mount with a writer, push
 # every second to one smart-HTTP repository (as different users) and to
 # one file:// bare repository, each on its own branch and ref namespace,
 # plus ten rounds of `agentfs push` started together on both. The shared

@@ -1,4 +1,4 @@
-//! Reconciling a moved tree (design §3.1).
+//! Reconciling a moved tree.
 //!
 //! A directory rename is journaled as one [`crate::record::Change::Move`]:
 //! history carries whatever it holds beneath the source to the

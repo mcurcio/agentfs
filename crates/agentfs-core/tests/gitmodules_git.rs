@@ -1,4 +1,4 @@
-//! `agentfs_core::gitmodules` against the real `git` binary (design §3.4).
+//! `agentfs_core::gitmodules` against the real `git` binary.
 //!
 //! - The config parser must read every corpus file as
 //!   `git config --file F --list -z --no-includes` does, and fail where it

@@ -1,4 +1,4 @@
-//! The agentfs CSI driver (design §14.2, §17.2).
+//! The agentfs CSI driver.
 //!
 //! One binary, `agentfs-csi`, runs in the node plugin DaemonSet on every
 //! node, beside csi-provisioner in `--node-deployment` mode (F8 R8), and
@@ -16,7 +16,7 @@
 //!   the kubelet's target, and recovers them when they crash;
 //! - the release scan ([`release_scan`]) pushes every worktree no pod
 //!   stages until a remote holds its head, and finishes and publishes the
-//!   forks whose deletion asked for it (design §11.5).
+//!   forks whose deletion asked for it.
 //!
 //! The history services, the release scan's children and a start class's
 //! CreateVolume (one fetch) do the network work; DeleteVolume lists each

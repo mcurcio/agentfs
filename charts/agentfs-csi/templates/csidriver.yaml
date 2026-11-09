@@ -1,4 +1,4 @@
-# How Kubernetes calls the driver (design §14.2, docs/csi.md).
+# How Kubernetes calls the driver (docs/csi.md).
 apiVersion: storage.k8s.io/v1
 kind: CSIDriver
 metadata:

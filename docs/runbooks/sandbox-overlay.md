@@ -3,8 +3,9 @@
 The sandbox overlay is a second mount point of a volume, served by the
 same daemon, that shows sandboxes only the files the operator's rules
 would record and keeps their other new files in a private tmp layer.
-Design: [§2.4](../design.md#24-the-sandbox-overlay), its limits in
-[§1.1](../design.md#11-threat-model); deployment:
+What it guarantees and what it costs: [guarantees](../guarantees.md); how it
+works: [library/filesystem](../library/filesystem.md); flags and lifecycle:
+[operator guide](../operator-guide.md#17-the-sandbox-overlay); deployment:
 [deployment.md §12](../deployment.md#12-the-sandbox-overlay); flags:
 [configuration](../configuration.md#flags-and-environment).
 
@@ -16,11 +17,11 @@ the same message until the cause is fixed.
 
 | Message | Cause | Fix |
 |---|---|---|
-| `the sandbox overlay needs agentfs.respectTreeRules = false: rule files read from the tree could be edited through the overlay` | The volume reads rule files (`.gitignore`, `.gitattributes`) from its tree; a sandbox could edit the rules behind its own view | Set `agentfs.respectTreeRules = false` and keep the rules in the operator's `info/exclude` and `info/attributes` (design §4.1) |
+| `the sandbox overlay needs agentfs.respectTreeRules = false: rule files read from the tree could be edited through the overlay` | The volume reads rule files (`.gitignore`, `.gitattributes`) from its tree; a sandbox could edit the rules behind its own view | Set `agentfs.respectTreeRules = false` and keep the rules in the operator's `info/exclude` and `info/attributes` ([recording](../recording.md)) |
 | `the sandbox overlay's mount point <A> and the mount point <B> are the same directory or one is inside the other; give each its own directory` | `--sandbox-overlay` is the mount point, or nested with it | Give the overlay a directory outside the mount point, in another `emptyDir` |
 | `the sandbox overlay's mount point <A> and the mount point <B> are both in <P>: a container given that directory would reach both; give the sandbox overlay a directory of its own` | The two mount points share a parent directory (both in one `emptyDir`) | Mount a second `emptyDir` for the overlay (`/agentfs-sandbox`, mount point `/agentfs-sandbox/overlay`) |
 | `the sandbox overlay's tmp layer <P> is on another filesystem than the backing tree (device <S>, the tree's <T>): ...; keep the state area and the backing tree on one filesystem` | The state area and the backing tree are on different filesystems, so a tmp file cannot be renamed into the tree atomically | Put both on one filesystem: one claim mounted once, with `backing/` and `state/` as siblings (deployment.md §3) |
-| A usage error naming `--history-service` (exit 2) | The overlay was asked for on a front | The overlay is served only by a single-process `mount`, not on fronts or CSI volumes (design §19.2 item 13) |
+| A usage error naming `--history-service` (exit 2) | The overlay was asked for on a front | The overlay is served only by a single-process `mount`, not on fronts or CSI volumes |
 | `--sandbox-owner <U>:<G>: the daemon (uid <E>) can act only as itself without CAP_SETUID, CAP_SETGID, CAP_CHOWN and CAP_FOWNER (run it as root, or as the owner)` | A non-root daemon cannot act as another user | Run the sidecar as root (the shipped one is), or set the owner to the daemon's own uid |
 | `creating the sandbox overlay's mount point <P>: ...` | The overlay's parent directory is missing; only one level is created | Mount the `emptyDir` at the parent (`/agentfs-sandbox`) |
 | `the sandbox overlay's mount point <P> is a stale FUSE mount (transport endpoint is not connected), probably left by a daemon that died; ...` | A crash left the overlay's mount dead and the sidecar runs with `--on-stale-mount refuse` | Use `recover` (the shipped setting) or `hold`; see [a crashed sidecar](crashed-sidecar.md) |
@@ -34,7 +35,7 @@ other is a usage error (exit 2).
 A sandbox's tool fails to write a file through the overlay, and
 `agentfs.sandbox_overlay.refusals` counts it by `reason`
 ([telemetry](../telemetry.md#signals)). The overlay offers only what
-keeps it a boundary for names (design §1.1), so some ways of saving fail
+keeps it a boundary for names ([guarantees](../guarantees.md)), so some ways of saving fail
 by design:
 
 - **`EACCES` (Permission denied) moving a recorded file out**
@@ -67,7 +68,7 @@ by design:
 - **"No such file" for a file the main container sees**: it is not
   recordable, so the overlay hides it. Allowlist it in the operator's
   rules if sandboxes should edit it (a change of rules needs a pod
-  restart, design §4.1).
+  restart).
 
 ## Tmp files gone after a restart
 

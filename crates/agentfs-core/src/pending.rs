@@ -1,11 +1,10 @@
-//! Frozen copies of recorded content, waiting to become git objects
-//! (design §3.2 step 1).
+//! Frozen copies of recorded content, waiting to become git objects.
 //!
 //! Freezing must not depend on file size where the filesystem allows it, so
 //! it tries a reflink (`FICLONE`, supported by XFS and btrfs) before falling
 //! back to a copy.
 //!
-//! **Slots** (design §2.2, §14). Several processes freeze into one
+//! **Slots**. Several processes freeze into one
 //! `pending/` when fronts feed a history service, so ids carry the
 //! freezing process's slot in their high 16 bits ([`SLOT_SHIFT`]) and each
 //! process counts only within its own. Slot 0 is single-process mode and
@@ -171,7 +170,7 @@ impl PendingStore {
     /// Removes every copy not in `keep` and not frozen in one of
     /// `spare_slots`: copies frozen for records that never became durable,
     /// or already committed before a crash. A live front's copies are
-    /// spared, since its record may still be on its way (design §14).
+    /// spared, since its record may still be on its way.
     pub fn prune_except(
         &self,
         keep: &HashSet<PendingId>,
@@ -196,7 +195,7 @@ impl PendingStore {
 
     /// Removes the copies in `slot` made before `before` and not in
     /// `keep`: a dead front's orphans, once another front leased the slot
-    /// at `before` (design §14). The new holder's own copies are newer.
+    /// at `before`. The new holder's own copies are newer.
     pub fn reclaim_slot(
         &self,
         slot: u16,

@@ -34,7 +34,7 @@ struct Policy {
     /// Content over this size would be stored as LFS.
     lfs_over: Option<u64>,
     checks: crate::checks::Checks,
-    /// fsync-class groups (design §8), each listed whole.
+    /// fsync-class groups, each listed whole.
     groups: Vec<&'static [&'static str]>,
 }
 
@@ -1354,7 +1354,7 @@ mod lfs {
 
 const DB: &[&str] = &["d/s.db", "d/s.db-journal", "d/s.db-wal"];
 
-/// Plan and check with the database group `DB` (design §8).
+/// Plan and check with the database group `DB`.
 fn check_db(fx: &Fixture, request: &Request, force: bool) -> Result<Plan, RestoreError> {
     let policy = Policy {
         groups: vec![DB],

@@ -1,4 +1,4 @@
-//! Host key verification for SSH remotes (design §11.1).
+//! Host key verification for SSH remotes.
 //!
 //! `remote.<name>.agentfsKnownHosts` names an OpenSSH known_hosts file. It
 //! is parsed here, in pure Rust, following sshd(8) "SSH_KNOWN_HOSTS FILE
@@ -328,7 +328,7 @@ impl KnownHosts {
     }
 
     /// Whether `cert` is a trusted host certificate of `host` on `port` at
-    /// Unix time `now` (design §11.1). All of these must hold, as for
+    /// Unix time `now`. All of these must hold, as for
     /// OpenSSH: it is a host certificate; neither its key nor its CA is
     /// `@revoked`; a `@cert-authority` line matching the host lists its CA;
     /// the CA's signature verifies; `now` is within its validity; its

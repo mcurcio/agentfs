@@ -1,4 +1,4 @@
-//! Finishing and publishing a fork (design §19.1, "Forked volumes"): the
+//! Finishing and publishing a fork: the
 //! finisher is the one owner of `finished` and `published`.
 //!
 //! [`Finisher::finish`] runs once, with the state-area lock held. It
@@ -8,7 +8,7 @@
 //! commit: the last commit of the fork's history, the single home of
 //! base, change and fork remote, after which the fork takes no changes.
 //! [`Finisher::publish`] pushes the history, the change and the finish
-//! commit to the fork remote, with §11.2 backoff, until the remote holds
+//! commit to the fork remote, with backoff, until the remote holds
 //! the change and finish refs at exactly their ids, and only then writes
 //! the published mark. A fork of a local-only source publishes into the
 //! source's own history instead ([`super::receive`], F8 S3), through its
@@ -18,7 +18,7 @@
 //! [`abandon`] records the operator's discard, after which nothing agentfs
 //! runs pushes the fork. [`status`] reads, without a lock or credentials,
 //! what DeleteVolume asks: whether the fork is published or abandoned.
-//! An unlinked fork (design §11.5, [`ForkLink::Unlinked`]) delivers
+//! An unlinked fork ([`ForkLink::Unlinked`]) delivers
 //! nothing: it never finishes ([`FinishError::Unlinked`]) and has no
 //! status, so DeleteVolume and the release scan treat it as any worktree.
 //!
@@ -40,7 +40,7 @@
 //! Every fork published to a fork remote, once its finish ref is held
 //! there, lists its own inbox on that remote and raises
 //! [`Event::ForkInboxNotCarried`] for each entry its finished history did
-//! not land (design §12 "Forks of forks"): a fork's change rolled up into
+//! not land: a fork's change rolled up into
 //! it after its last queue run, which its own change does not carry. With
 //! the child's listing after its push, one of the two always sees the
 //! other: a change is never stranded unannounced.
@@ -159,7 +159,7 @@ pub struct ForkStatus {
 pub enum RefusedReason {
     /// A create-only ref on the fork remote holds another object.
     AnotherWriter,
-    /// The remote's size limit refuses a single commit (§11.3).
+    /// The remote's size limit refuses a single commit.
     TooLarge,
     /// The remote refuses the refs or their content.
     Rejected,
@@ -209,17 +209,17 @@ pub enum Met {
     Unsafe,
 }
 
-/// The single decider of "permanent" (design §11.5): what makes a publish
+/// The single decider of "permanent": what makes a publish
 /// refused, alarmed once and never retried by the node plugin's release
 /// scan. Everything else (unreachable, auth, a moved branch, a busy
-/// remote) is pending and retried with backoff (§11.3).
+/// remote) is pending and retried with backoff.
 pub fn refused_reason(met: Met) -> Option<RefusedReason> {
     match met {
         Met::AnotherWriter => Some(RefusedReason::AnotherWriter),
         Met::RemoteGone => Some(RefusedReason::RemoteGone),
         Met::Unsafe => Some(RefusedReason::Unsafe),
         // One commit over agentfsMaxPushSize, or one LFS object over
-        // agentfsMaxLfsObjectSize (§11.3): no retry can send it.
+        // agentfsMaxLfsObjectSize: no retry can send it.
         Met::Branch(PushFailureKind::TooLarge) | Met::CreateOnly(PushFailureKind::TooLarge) => {
             Some(RefusedReason::TooLarge)
         }
@@ -239,7 +239,7 @@ pub enum PublishOutcome {
     /// there); the published mark is written.
     Submitted { inbox: u64 },
     /// Not yet: the deadline passed while the last attempt failed in a way
-    /// that is retried (§11.3).
+    /// that is retried.
     Pending {
         kind: PushFailureKind,
         message: String,
@@ -255,7 +255,7 @@ pub enum PublishOutcome {
 /// The version of `meta/fork.json`.
 pub const MARK_VERSION: u32 = 1;
 
-/// `meta/fork.json` (design §2.2): the finisher's marks, written only
+/// `meta/fork.json`: the finisher's marks, written only
 /// after the remote confirmed what they say, and the operator's discard.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -650,7 +650,7 @@ impl Finisher {
         Ok(())
     }
 
-    /// Records each path the FUSE layer could not record (design §3.5) as
+    /// Records each path the FUSE layer could not record as
     /// the tree holds it: `meta/repairs`, and every front slot's queue
     /// (`meta/fronts/slot-<n>.repairs`), which would otherwise wait for a
     /// next front in that slot that a finished fork never gets. Each entry
@@ -750,7 +750,7 @@ impl Finisher {
         Ok(())
     }
 
-    /// Publishes the finished fork: attempts with §11.2 backoff until it
+    /// Publishes the finished fork: attempts with backoff until it
     /// is published or refused, or, with a `deadline`, until then. Safe to
     /// run again; a fork already published returns at once, and one
     /// refused returns its refusal without pushing. Finishes the fork
@@ -1020,7 +1020,7 @@ impl Finisher {
         }
         let pusher = pusher.as_mut().expect("opened just above");
         // The history: held once pushed, or saved as diverged when a forge
-        // moved the fork's branch (§11.3, alarmed; it never blocks).
+        // moved the fork's branch (alarmed; it never blocks).
         loop {
             match pusher.push_once() {
                 outcome if outcome.is_limited() => continue,
@@ -1172,8 +1172,8 @@ impl Finisher {
             }];
             match pusher.push_create_only(&refs) {
                 // Listed again: a parent that finished after the listing
-                // above did not see this entry (design §12 "Forks of
-                // forks").
+                // above did not see this entry (forks of
+                // forks).
                 CreateOnlyOutcome::Held => pushed = Some(inbox),
                 // Someone took the number: list again and decide again.
                 CreateOnlyOutcome::AnotherWriter { .. } => lost += 1,
@@ -1252,7 +1252,7 @@ fn refuse_abandoned(state: &StateDir, fork: &str) -> Result<(), FinishError> {
 /// fork: [`Finisher::open`], [`Finisher::finish`] and every publish
 /// attempt re-read the mark first and stop with [`FinishError::Abandoned`].
 /// A push already running finishes or times out (libgit2 cannot cancel
-/// one, §11.2): abandon does not wait for it, and a fork remote may then
+/// one): abandon does not wait for it, and a fork remote may then
 /// still receive it. Abandoning an abandoned fork returns its status
 /// unchanged.
 pub fn abandon(
@@ -1302,7 +1302,7 @@ fn now_ms() -> u64 {
 
 /// The fork status of the state area at `state`, read without a lock or
 /// credentials: `Ok(None)` for a volume that is not a fork, and for an
-/// unlinked fork, which delivers nothing (design §11.5). What cannot be
+/// unlinked fork, which delivers nothing. What cannot be
 /// read is an error, never a state, so a caller deciding whether to
 /// delete waits. Abandoned wins, then published, then refused (each
 /// naming the branch head's finish commit), then finished or active.

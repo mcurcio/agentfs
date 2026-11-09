@@ -1,4 +1,4 @@
-//! The patch queue against real volumes (design §12, §18 test 15): a state
+//! The patch queue against real volumes: a state
 //! area, a backing tree, the recorder and committer, the `git` program
 //! merging, no FUSE.
 //!
@@ -328,7 +328,7 @@ fn inbox_trailers_only_count_from_patch_commits() {
     );
 }
 
-/// Design §18 test 15: three patches, the second conflicts.
+/// Three patches, the second conflicts.
 /// Keep going (bead agentfs-mia.2): 2 conflicts and is held whole; 1 and
 /// 3 land; a rerun retries 2; rebased, it lands below the high-water.
 #[test]

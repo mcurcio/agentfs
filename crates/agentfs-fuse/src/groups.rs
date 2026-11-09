@@ -1,4 +1,4 @@
-//! fsync-class groups in the mount (design §8): which group a write
+//! fsync-class groups in the mount: which group a write
 //! belongs to, holding writes while a group is captured, and when each
 //! group is due.
 //!
@@ -28,8 +28,7 @@
 //!   open (SQLite's `-journal` in DELETE mode, every transaction) leaves
 //!   the change to the two rules above, so the rate stays bounded.
 //!
-//! **Operator operations** (a restore or revert through the mount, design
-//! §15): a change made by an operation's actor marks the group
+//! **Operator operations** (a restore or revert through the mount, design): a change made by an operation's actor marks the group
 //! ([`GroupState::actor`]). While the operation runs, no trigger but the
 //! operation's own capture ([`Groups::in_operation`]) records the group, so
 //! history never holds a group half restored.
@@ -150,7 +149,7 @@ pub struct GroupState {
     pub caller: Option<Caller>,
     /// Handles open on members.
     pub handles: usize,
-    /// The operator operation's actor that changed the group (design §15):
+    /// The operator operation's actor that changed the group:
     /// while it is one, only the operation's own capture records the group.
     pub actor: Option<Caller>,
 }

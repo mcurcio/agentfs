@@ -1,8 +1,6 @@
 # Domain: Volume
 
-**Layer:** System › **Domain (Volume)** › Feature.
-**Status:** draft 6, proposed, under [system.md](../system.md) revision 10 and [git-model.md](../git-model.md). The
-target, not today's code; sketches are Rust surfaces.
+**Proposed, not built.** This page proposes the Volume domain (lifecycle, start point and the release verdict), one part of the system around the git model ([the system](../system.md)). The git model ([git-model.md](../git-model.md)) wins wherever the two disagree. Rust sketches show surfaces only. The commit that lands the slice that builds this domain deletes this page and moves the behaviour into the library or operator docs.
 
 ## 1. What Volume owns, and what it is not
 
@@ -10,15 +8,8 @@ Volume answers three questions about one volume: is it in use (its lifecycle), w
 start point), and may its history service stop and its directory go (the release verdict). It asks each fact's owner
 at that moment and keeps no copy.
 
-**The owner's words this domain rests on.** Everything else here is a design choice.
+The owner's guidance that applies here is in `OWNER-GUIDANCE.md` at the repository root. Everything else on this page is a design choice.
 
-| # | His words | Date | What it asks of Volume |
-|---|---|---|---|
-| — | "It's all event driven" | 2026-10-24 | release is re-judged on events, never on a scan interval |
-| — | "Remotes can come and go. It's not a error to have zero remotes" | 2026-10-17 | zero remotes is a normal input to the verdict |
-| — | "B. And if no remote is configured, the volume is lost, and that's a choice the user is allowed to make." (said of a fork with no remote of its own) | 2026-10-17 | read for every volume: §5 |
-| R7 | "Security boundary. Agentfs is the gatekeeper that exposes only what we want sandboxes to see" | 2026-10-30 | a fork launcher never creates, drains or stages the volume |
-| R16 | "i would like for the git history to remain compatible across minor versions, and only break on a major version change. The various agentfs components should be within the same version family" | 2026-11-02 | an upgrade's drain; another family refused (`FormatsOf`) |
 
 | Term | Meaning here |
 |---|---|
@@ -106,7 +97,7 @@ Asked: Clients `attached_any`, the git model's queue depths, Trees `live`, Repli
 | VO3 | A transition and its event are one unit | repository write and outbox row commit together | construction time |
 | VO4 | The verdict reads only facts asked at judgement time; nothing is polled | no clock port; clippy bans timers in the crate | compile + build time |
 | VO5 | The start point never changes after create; acceptances only move forward along the start line | no setter; `accept_start` checks the tip (`StartDiverged`) | construction time |
-| VO6 | A fork launcher cannot create, drain or stage the volume (R7) | `LaunchCap` with `may: Main`; `drain_for_upgrade` needs the Operator role | construction time |
+| VO6 | A fork launcher cannot create, drain or stage the volume | `LaunchCap` with `may: Main`; `drain_for_upgrade` needs the Operator role | construction time |
 | VO7 | A release stages another family's volume only after that family's upgrade drain released it (S8) | `store` reports the family at open; `stage` answers `FormatsOf` | boot time |
 
 Ports: `VolumeRepository`, `StartRepository` (append-only acceptance rows), `Outbox`, `UnitOfWork` (`store`, audited).
@@ -117,7 +108,7 @@ Ports: `VolumeRepository`, `StartRepository` (append-only acceptance rows), `Out
 |---|---|
 | On release, per volume | `Keep` (today's `onDelete` default) |
 | Start point, per volume | `Empty`; fixed at create |
-| Zero remotes with `Remove` | `Removable`, from his 2026-10-17 answer. Cost: a deployment that forgot its remotes loses the volume on delete |
+| Zero remotes with `Remove` | `Removable`, from the owner's guidance on a volume with no remote. Cost: a deployment that forgot its remotes loses the volume on delete |
 | A `stage` during a `Stop` drain | cancels the drain. Cost: a volume whose pods come and go may rarely reach `Released` |
 | A `stage` during an `Upgrade` drain | answers `Draining(Upgrade)`: the launcher waits for the new family |
 
@@ -152,13 +143,12 @@ branch, its history, the start record and the settings alone.
 The outbox dedup key; how room for a drain is reserved at create; how the CSI edge reaches `release_verdict`; the
 on-disk shape of settings kept across upgrades.
 
-## Reconcile with existing code (agentfs origin/main b5c0dc8)
+## Where it meets the existing code
 
 - **The pure release decider** keeps its shape; its facts are asked of their owners.
 - **The release scan** (30 s) and **NodeUnstage's push grace** (5 s) go: the service runs through Draining.
 - **`startFrom`, `agentfs.start.*`** become the `StartRecord`; **`accepted/<tip>` refs** become acceptance rows; **`onDelete`** becomes `on_release`.
 - **Upgrades:** the family check and upgrade drain are new.
 
-**NOT RUN:** no code built or tested.
+**Not verified:** no code built or tested.
 
-*History: drafts 1–5 are in git; draft 6 (2026-11-03) conforms to the git model.*

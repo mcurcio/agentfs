@@ -1,4 +1,4 @@
-//! Crash injection through the `agentfs` binary (design §18 test 3; the
+//! Crash injection through the `agentfs` binary (the
 //! crash model of docs/architecture.md): `record`, `push`, `run`,
 //! `serve-history` with `record --history-service` fronts, and `patch
 //! apply`, each killed (SIGKILL to itself) at a failpoint, then recovered

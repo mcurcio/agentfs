@@ -1,4 +1,4 @@
-//! Which LFS objects a push must upload first (design §7): those the
+//! Which LFS objects a push must upload first: those the
 //! commits the remote lacks reference ([`super::referenced::in_history`]).
 //!
 //! Every commit not yet on the remote (`head ^ last_pushed`, or the whole

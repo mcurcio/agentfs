@@ -1,5 +1,5 @@
 //! The CSI node plugin's supervisor running the real `agentfs
-//! serve-history` (design §14.2): NodeStage brings the service up on its
+//! serve-history`: NodeStage brings the service up on its
 //! node-local socket, fronts (`record --history-service`, which takes the
 //! same path as a front mount) commit under their own pods' identities,
 //! a `kill -9` of the service is recovered by the supervisor with the
@@ -221,7 +221,7 @@ async fn the_supervisor_runs_and_recovers_a_real_history_service() {
     assert!(!layout.socket("pvc-1").exists());
     assert!(!layout.staged_record("pvc-1").exists());
     assert!(sup.service_pid("pvc-1").is_none());
-    // The final commit reaches the remote (design §14.2). The service's
+    // The final commit reaches the remote. The service's
     // final push tries once within `--push-grace` and is abandoned if it
     // is still running at its end, as it is on a slow disk ("still
     // running at the push grace's end; abandoned"). The release scan then

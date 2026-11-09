@@ -1,5 +1,4 @@
-//! Signals and shutdown for the long-running commands, `run` and `mount`
-//! (design §11.2, §17.1).
+//! Signals and shutdown for the long-running commands, `run` and `mount`.
 //!
 //! SIGINT and SIGTERM, the end of a FUSE session (something else
 //! unmounted the volume) and a failure of `--passthrough on` all arrive on

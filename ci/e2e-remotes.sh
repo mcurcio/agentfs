@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# End-to-end tests of pushing to real smart-HTTP remotes (design §11):
+# End-to-end tests of pushing to real smart-HTTP remotes:
 # credential files, auth failures that do not block other remotes, credential
 # rotation picked up by a running `agentfs run`, divergence over HTTP, and,
 # with E2E_HTTPS=1 (binary built with --features https), TLS with certificate

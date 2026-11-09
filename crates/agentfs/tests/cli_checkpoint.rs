@@ -1,5 +1,4 @@
-//! End-to-end tests of `agentfs checkpoint` (design §17.1, §19.2 item 11;
-//! bead agentfs-mia.6): one change-line commit per intent, merged back
+//! End-to-end tests of `agentfs checkpoint` (bead agentfs-mia.6): one change-line commit per intent, merged back
 //! into the branch, with and without a daemon, and a remote that pushes
 //! the change line instead of the branch. The patch tests drive the real
 //! `git` through `patch submit`; they are skipped, with a message, when it

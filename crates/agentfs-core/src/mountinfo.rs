@@ -1,6 +1,6 @@
 //! `/proc/self/mountinfo` (proc(5)): what is mounted where, with which
 //! options. The one parser of it: agentfs-fuse's mount state and views and
-//! [`crate::shared_fs`] read it here (design §2.3, §5, §17.1).
+//! [`crate::shared_fs`] read it here.
 
 use std::ffi::OsStr;
 use std::io;

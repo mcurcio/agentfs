@@ -1,5 +1,4 @@
-//! Where a remote's LFS objects go, and with which credentials (design
-//! §7, §11.1).
+//! Where a remote's LFS objects go, and with which credentials.
 //!
 //! **Endpoints** follow git-lfs's precedence, from operator config only
 //! (never a tracked `.lfsconfig`):
@@ -12,7 +11,7 @@
 //! | `remote.<name>.lfsurl` | `remote.<name>.lfsurl` |
 //! | derived from `pushurl`, else `url` | derived from `url` |
 //!
-//! A flagged fork remote (`agentfsForkRemote`, design §11.5) reads its own
+//! A flagged fork remote (`agentfsForkRemote`) reads its own
 //! `lfspushurl` and `lfsurl` before the global keys: it must name one while
 //! `lfs.url` or `lfs.pushurl` is set (the section is invalid otherwise), so
 //! a fork's LFS objects never reach the source's store.
@@ -441,7 +440,7 @@ mod tests {
     }
 
     /// A flagged fork remote's own endpoints come before the global ones,
-    /// which name the source's store (design §11.5).
+    /// which name the source's store.
     #[test]
     fn a_fork_remote_prefers_its_own_endpoints() {
         let all = LfsSettings {

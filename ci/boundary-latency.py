@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Per-close latency of a change boundary (design §14, §19.2 item 2).
+"""Per-close latency of a change boundary.
 
 Runs N cycles of open, write 4 KiB, close in DIR and prints the close(2)
 latency percentiles in microseconds. Through an agentfs mount, close is
-where the synchronous step happens (design §3.2): through a front it
+where the synchronous step happens: through a front it
 includes the round trip to the history service.
 
     boundary-latency.py [--json] DIR [N] [LABEL] [DIR LABEL]...

@@ -1,5 +1,5 @@
 //! `agentfs serve-history` and `record --history-service` from the command
-//! line (design §14). No FUSE: fronts here are `record` commands, which
+//! line. No FUSE: fronts here are `record` commands, which
 //! take the same path through the history service as a front mount.
 
 use std::ffi::OsStr;
@@ -399,8 +399,7 @@ fn a_front_prefers_the_slot_it_is_given() {
     service.stop();
 }
 
-/// The history service answers `agentfs push` over the control socket
-/// (design §2.3).
+/// The history service answers `agentfs push` over the control socket.
 #[test]
 fn the_history_service_pushes_now() {
     let v = Volume::new();
@@ -569,7 +568,7 @@ impl Volume {
     }
 }
 
-/// `restore` and `revert` while the history service runs (design §15):
+/// `restore` and `revert` while the history service runs:
 /// served by the service, which writes the backing tree, records it as
 /// the operation and commits, with no front, and with a listening front
 /// it settles, asks about open files and tells to drop its caches.
@@ -647,7 +646,7 @@ fn the_history_service_restores_and_reverts_live() {
 
 /// A file a pod opens for writing while a live restore is already writing
 /// (after the check) is refused at its own step: the service asks the
-/// fronts again just before writing each path (design §15).
+/// fronts again just before writing each path.
 #[test]
 fn a_file_opened_during_a_live_restore_is_left_alone() {
     let v = Volume::new();
@@ -704,7 +703,7 @@ fn a_file_opened_during_a_live_restore_is_left_alone() {
     service.stop();
 }
 
-/// Bead agentfs-4do (design §12): a history service told a workload is
+/// Bead agentfs-4do: a history service told a workload is
 /// attached (the CSI node plugin, while a pod of the volume is published)
 /// lands no patch: it judges the queue, says why, and the patch stays
 /// queued; the next start with nothing attached lands it.

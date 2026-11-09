@@ -1,6 +1,4 @@
-//! Generates the history service's gRPC code (`agentfs.history.v2`,
-//! design §14) from `proto/` with protox, so no `protoc` is needed (design
-//! §17.3). Client and server only: the transport is the crate's own, over
+//! Generates the history service's gRPC code (`agentfs.history.v2`) from `proto/` with protox, so no `protoc` is needed. Client and server only: the transport is the crate's own, over
 //! the node-local Unix socket.
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

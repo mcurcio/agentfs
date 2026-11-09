@@ -1,4 +1,4 @@
-//! Applying the patch queue (design §12).
+//! Applying the patch queue.
 //!
 //! [`Queue::process`] runs with the volume open and nothing serving the
 //! tree: at mount, after journal replay and before the FUSE layer starts,
@@ -518,7 +518,7 @@ impl<'a> Queue<'a> {
         }
 
         // The rest, in order. A patch commit already applied under an
-        // earlier number is consumed, not applied again (design §12): the
+        // earlier number is consumed, not applied again: the
         // whole history is scanned once to know them all.
         let mut applied = Vec::new();
         let mut duplicates = Vec::new();
@@ -690,8 +690,8 @@ impl<'a> Queue<'a> {
         })
     }
 
-    /// Consumes patch `n`, the same patch commit that `m` applied first
-    /// (design §12): a marker commit with the head's tree carrying
+    /// Consumes patch `n`, the same patch commit that `m` applied first:
+    /// a marker commit with the head's tree carrying
     /// `Agentfs-Inbox: <n>`, so the branch's trailers record it as done and
     /// every crash point converges. Nothing is merged or written.
     fn consume_duplicate(&self, n: u64, patch_oid: Oid, m: u64) -> Result<Oid, PatchError> {
@@ -830,7 +830,7 @@ impl<'a> Queue<'a> {
         };
         let plan = restore::plan_tree(repo, head, patch_oid, merged, spec.summary.clone())?;
         if plan.steps.is_empty() {
-            // Nothing the tree shows changes: a marker commit (design §3.4).
+            // Nothing the tree shows changes: a marker commit.
             let op = Operation {
                 id: 0,
                 kind: spec.kind,
@@ -1565,7 +1565,7 @@ fn now_ms() -> u64 {
         .map_or(0, |d| d.as_millis() as u64)
 }
 
-/// Records that the patch queue could not run at all (design §12): blocked
+/// Records that the patch queue could not run at all: blocked
 /// with reason `failed` at inbox 0 in `meta/patch.json`, so the
 /// `agentfs.patch.blocked` gauge and `agentfs status` show it, and, when
 /// `committer` is given and the repository can be written, in a new status

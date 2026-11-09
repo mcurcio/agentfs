@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Checks what C and crypto the agentfs binary links, per feature set
-# (design §17.3): the default build is pure Rust apart from libgit2 (no
+# Checks what C and crypto the agentfs binary links, per feature set:
+# the default build is pure Rust apart from libgit2 (no
 # OpenSSL, no ring, no aws-lc); `otlp-tls` adds ring and rustls only; `ssh`
 # adds russh with ring and never OpenSSL or libssh2; only `https` brings
 # OpenSSL.

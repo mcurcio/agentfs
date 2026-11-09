@@ -1,4 +1,4 @@
-//! Telemetry export for the `agentfs` process (design §13).
+//! Telemetry export for the `agentfs` process.
 //!
 //! Export is configured with the standard `OTEL_*` environment variables.
 //! A signal (traces, metrics, logs) is exported only when an OTLP endpoint
@@ -397,7 +397,7 @@ pub fn plan(env: &dyn Fn(&str) -> Option<String>) -> Plan {
 /// How often a signal that keeps failing is reported again on stderr.
 pub const EXPORT_WARNING_INTERVAL: Duration = Duration::from_secs(60);
 
-/// Failed exports, made visible (design §13): each failure counts in
+/// Failed exports, made visible: each failure counts in
 /// `agentfs.telemetry.export_failures{signal}` (once metrics are set up)
 /// and is reported on stderr, at once for the first failure, then at most
 /// once per [`EXPORT_WARNING_INTERVAL`] with the count, and once more

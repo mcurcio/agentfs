@@ -7,7 +7,7 @@ export const meta = {
     { title: 'Implement', detail: 'implementer builds, passes local gates, pushes, gets CI green' },
     { title: 'Review', detail: 'adversarial review of the milestone' },
     { title: 'Fix', detail: 'one fix round for blocker/major findings, CI green again' },
-    { title: 'Critic', detail: 'completeness check against design §18/§19 and this run\'s goals' },
+    { title: 'Critic', detail: 'completeness check against the docs and this run\'s goals' },
   ],
 }
 
@@ -17,7 +17,7 @@ const REPO = args.repo || '/home/claude/Code/agents/agentfs'
 // only adds what a workflow agent needs on top of it.
 const CONTEXT = `
 You are working on agentfs at ${REPO} (GitHub: mcurcio/agentfs, default branch main).
-- Read ${REPO}/AGENTS.md first and follow it: local gates, what only CI can test, CI workflow durations, commit and push rules, docs-travel-with-code, the no-root toolchain. Then read docs/design.md (authoritative; decisions in §19) and the docs and code the brief touches.
+- Read ${REPO}/AGENTS.md first and follow it: local gates, what only CI can test, CI workflow durations, commit and push rules, docs-travel-with-code, the no-root toolchain. Then read docs/README.md (the index), OWNER-GUIDANCE.md, the design page the brief names (a page in docs/target-architecture exists only until its slice is built, and the commit that lands the slice deletes it and moves the behaviour into library or human docs) and the docs and code the brief touches.
 - Do NOT install system packages globally or modify ~/.local/bin, ~/.devenv or ~/.cargo/config.toml unless AGENTS.md says how.
 - After local gates pass: \`git pull --ff-only origin main\`, push to origin main (retry up to 4 times on network errors; never force-push), then wait for EVERY workflow run for YOUR pushed SHA, including the slow ones listed in AGENTS.md, and fix until all are green (at most 6 attempts). A run cancelled because your newer commit superseded it is fine; judge the runs for your final head.
 - Be honest in your report: list anything unfinished, untested, or only tested locally.
@@ -122,7 +122,7 @@ for (const m of args.milestones) {
   log(`${m.id}: ${m.title} (base ${base.slice(0, 7)})`)
 
   const plan = await agent(
-    `${CONTEXT}\nYou are the ARCHITECT for ${m.id}: ${m.title}. Do not edit files.\n\nBrief:\n${m.brief}\n\nRead the design sections and current code (git log, relevant modules, existing CI) and produce a concrete, implementable plan, including the CI jobs and docs it needs. Where the design leaves a question open, decide it and say so. Prefer pure-Rust dependencies; anything needing system libraries must build in CI and be feature-gated if it cannot build locally. Cover every item in the brief; if one item is genuinely infeasible, say why under risks and plan the closest honest alternative (documented as such).`,
+    `${CONTEXT}\nYou are the ARCHITECT for ${m.id}: ${m.title}. Do not edit files.\n\nBrief:\n${m.brief}\n\nRead the design page the brief names, the docs and current code (git log, relevant modules, existing CI) and produce a concrete, implementable plan, including the CI jobs and docs it needs. Where the design leaves a question open, decide it and say so. Prefer pure-Rust dependencies; anything needing system libraries must build in CI and be feature-gated if it cannot build locally. Cover every item in the brief; if one item is genuinely infeasible, say why under risks and plan the closest honest alternative (documented as such).`,
     { label: `architect:${m.id}`, phase: 'Plan', schema: PLAN_SCHEMA, agentType: 'Plan', effort: 'high' },
   )
   if (!plan) { log(`${m.id}: no plan, stopping`); break }
@@ -134,7 +134,7 @@ for (const m of args.milestones) {
   if (!impl || !impl.head) { log(`${m.id}: implementer failed, stopping`); results.push({ id: m.id, title: m.title, plan_summary: plan.summary, impl }); break }
 
   const review = await agent(
-    `${CONTEXT}\nYou are an ADVERSARIAL REVIEWER for ${m.id}: ${m.title}. Do not edit files or push. Find what is wrong; do not praise.\n\nBrief:\n${m.brief}\n\nThe change is \`git -C ${REPO} diff ${base}..${impl.head}\`. Plan:\n${JSON.stringify(plan, null, 2)}\n\nThe implementer reported CI ${impl.ci_green ? 'green' : 'NOT green'} (${impl.ci_run_url}); verify every workflow for that SHA with gh. Check: every brief item is actually done; correctness against docs/design.md; durability and crash safety; concurrency; error handling; security of anything privileged (FUSE, containers, credentials, network transport auth, Kubernetes RBAC, Helm defaults); that tests and CI jobs actually exercise the behaviour (not tautologies, not silently skipped); and that docs match the code. Run the local gates yourself. Every finding needs a concrete failure scenario. Verdict "changes" only for at least one blocker or major.`,
+    `${CONTEXT}\nYou are an ADVERSARIAL REVIEWER for ${m.id}: ${m.title}. Do not edit files or push. Find what is wrong; do not praise.\n\nBrief:\n${m.brief}\n\nThe change is \`git -C ${REPO} diff ${base}..${impl.head}\`. Plan:\n${JSON.stringify(plan, null, 2)}\n\nThe implementer reported CI ${impl.ci_green ? 'green' : 'NOT green'} (${impl.ci_run_url}); verify every workflow for that SHA with gh. Check: every brief item is actually done; correctness against the brief and the docs; durability and crash safety; concurrency; error handling; security of anything privileged (FUSE, containers, credentials, network transport auth, Kubernetes RBAC, Helm defaults); that tests and CI jobs actually exercise the behaviour (not tautologies, not silently skipped); and that docs match the code. Run the local gates yourself. Every finding needs a concrete failure scenario. Verdict "changes" only for at least one blocker or major.`,
     { label: `review:${m.id}`, phase: 'Review', schema: REVIEW_SCHEMA, effort: 'high' },
   )
 
@@ -182,7 +182,7 @@ for (const m of args.milestones) {
 
 phase('Critic')
 const critic = await agent(
-  `${CONTEXT}\nYou are the COMPLETENESS CRITIC. Do not edit files or push. HEAD is ${base}.\n\nThis run's goals (every one must be judged in run_goals):\n${args.goals.map((g, i) => `${i + 1}. ${g}`).join('\n')}\n\nAlso: for every acceptance test in design §18 say whether it is covered in CI, covered only locally, partial or missing (cite tests, CI jobs, scripts); list what is still missing (most important first); list §19 open questions still open; list places where README/docs disagree with the code. Check every workflow run for HEAD with gh.`,
+  `${CONTEXT}\nYou are the COMPLETENESS CRITIC. Do not edit files or push. HEAD is ${base}.\n\nThis run's goals (every one must be judged in run_goals):\n${args.goals.map((g, i) => `${i + 1}. ${g}`).join('\n')}\n\nAlso: for every acceptance test the brief and the docs name say whether it is covered in CI, covered only locally, partial or missing (cite tests, CI jobs, scripts); list what is still missing (most important first); list open questions on the design pages still open; list places where README/docs disagree with the code. Check every workflow run for HEAD with gh.`,
   { label: 'critic', phase: 'Critic', schema: CRITIC_SCHEMA, effort: 'high' },
 )
 

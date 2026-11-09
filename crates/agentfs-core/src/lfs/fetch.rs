@@ -1,5 +1,4 @@
-//! LFS objects for restores, reverts and `agentfs lfs fetch` (design §7,
-//! §15): from the local cache, else downloaded from the remotes, in name
+//! LFS objects for restores, reverts and `agentfs lfs fetch`: from the local cache, else downloaded from the remotes, in name
 //! order, into it. Every user holds the cache lock shared
 //! ([`super::lock::CacheLock`]) while it uses the cache, so `agentfs lfs
 //! prune` never deletes an object between a restore's check and its
@@ -9,7 +8,7 @@
 //! writes anything, so a missing object refuses the restore instead of
 //! leaving it half done. It first hands every object it will need to
 //! [`LfsObjects::prefetch`], which downloads those missing from the cache
-//! concurrently (`lfs.concurrenttransfers`, design §7), each remote in
+//! concurrently (`lfs.concurrenttransfers`), each remote in
 //! name order taking what the ones before it could not provide; then it
 //! asks for each object with [`LfsObjects::ensure`], whose errors name the
 //! path.
@@ -313,7 +312,7 @@ fn download(
     report
 }
 
-/// `agentfs lfs fetch` (design §7): downloads into the cache at `state`
+/// `agentfs lfs fetch`: downloads into the cache at `state`
 /// each of `pointers` it lacks, from `remotes` (names; every valid remote
 /// when `None`), in name order. Holds the cache lock shared meanwhile and
 /// no state-area lock, so it runs beside a daemon.

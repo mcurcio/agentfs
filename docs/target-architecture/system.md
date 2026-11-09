@@ -1,61 +1,19 @@
-# agentfs target architecture: the system around the git model
+# The system around the git model
 
-**Layer:** **System (domains, contracts, flows)** › Domain (one page each) › Feature.
-**Status:** revision 11, proposed: the target, not today's code; sketches are Rust surfaces. Revision 3 was approved
-by the owner on 2026-11-02; revision 10 cuts the page to what [agentfs in git terms](git-model.md) does not cover.
-**Read [git-model.md](git-model.md) first.** It is the one source of truth for trees as branches, saves, locks, the
-queue and its referee, collisions, syncs, transactions, nested forks and crash recovery. There is one history mode, full lineage: the owner dropped squashing on 2026-11-05
-("drop squashing"), and the history setting and its grafts with it.
-This page and the domain pages cover only the rest: clients, views and what each shows, tree storage and lifecycle,
-replication, the volume, health, telemetry, deployment and versions. Where a page here seems to disagree with
-git-model.md, git-model.md wins and the page has a bug.
+**Proposed, not built.** This page proposes how the parts around [the git model](git-model.md) fit together: clients,
+views, tree storage and lifecycle, replication, the volume, health, telemetry, versions and deployment. It sketches
+their contracts and events in Rust surfaces. Nothing here is implemented. The commit that lands a slice of it deletes
+the part it builds and moves the behaviour into the library or operator docs.
 
-## 0. The owner's words, and where each is designed
+[git-model.md](git-model.md) is the one source of truth for trees as branches, saves, locks, the queue and its
+referee, collisions, syncs, transactions, nested forks and crash recovery. Where a page here seems to disagree with
+it, git-model.md wins and the page has a bug. There is one history mode, full lineage: squashing is not offered.
+The owner's guidance behind this design is in `OWNER-GUIDANCE.md` at the repository root; everything else on these
+pages is a design choice and says so.
 
-Nothing else on these pages is his; everything else is a design choice and says so.
-
-| # | The owner's words | Date | Designed in |
-|---|---|---|---|
-| R1 | "I want the DDD to target the *ideal* design, and not just the easy one. It should be unbiased on the current shape of the code, and instead design the shape that makes the most functional sense — treating each domain as a hard boundary with strict contracts." | 2026-11-01 | every page |
-| R2 | "a new set of architecture docs which lay out the overarching system architecture first, and then a per-domain doc of the domain architecture"; "Give the high level architecture first. I will review that before we waste time writing each domain doc" | 2026-11-01 | this set |
-| R3 | "a virtual filesystem overlay for each client (including main) that is backed by a _real_ filesystem source-of-truth" | 2026-11-01 | [views](domains/views.md), [trees](domains/trees.md); git-model §3 |
-| R4 | "the sandbox fs edits need to land back in the main container, and then future sandboxes should start from the edited files" | 2026-11-01 | git-model §5–§7; [trees](domains/trees.md) §2 |
-| R5 | "Agentfs history shouod distinguish between the various containers so we can track direct edits on main vs the forks that sandboxes edit" | 2026-11-01 | git-model §3 (trailers); [clients](domains/clients.md) |
-| R6 | "THE EDITS CAN LAND IN ONE COMMIT?!?" (read as: no commit holds two writers) | 2026-11-01 | git-model §3 |
-| R7 | "Security boundary. Agentfs is the gatekeeper that exposes only what we want sandboxes to see" | 2026-10-30 | [rules](domains/rules.md), [views](domains/views.md), [clients](domains/clients.md) |
-| R8 | a consumer's personal information never enters the agentfs repo (his exact words name the consumer, so they stay in the session notes) | 2026-10-30 | these pages name no consumer |
-| R9 | "Whole seems best, right? A partial application has unknown side effects" | 2026-10-16 | git-model §6 (a take holds all its files); git-model §7: a save or transaction lands whole or loses whole (rule 3e, the owner's answer of 2026-11-03 to git-model §16 question 3) |
-| R10 | "agentfs should support merging live" (2026-10-28); "No live landing yet", then "Build incrementally" (2026-10-29) | 2026-10-28/29 | git-model §5 |
-| R11 | "Nothing is locked in. Everything is on the table" | 2026-11-01 | every page |
-| R12 | "The general history should be preserved, yes. But I think it could be configurable if it needs to be every single commit, or whether a fork can be squashed so that mainline is just a merge tree of squashed fork lineage." Replaced 2026-11-05: "drop squashing"; history stays preserved | 2026-11-02 | git-model §11 |
-| R13 | "A cooperating integration can define batches/transactions across files, and they must all land together. But a default usage, like the CNI provides, can operate per-file." (read: "CNI" is agentfs's CSI driver) | 2026-11-02 | git-model §7, §9: a transaction's commit lands whole or loses whole at every level (rule 3e); [views](domains/views.md) |
-| R14 | "Not A, because that assumes that a clean merge is an acceptable merge" (quoted in agentfs `docs/design.md` §12) | 2026-10-16 | not yet designed (§5) |
-| R15 | "Configurable with a sensible default" (of accepting a clean merge; `docs/design.md` §12) | 2026-10-29 | not yet designed (§5) |
-| R16 | "i would like for the git history to remain compatible across minor versions, and only break on a major version change. The various agentfs components should be within the same version family (major for sure, maybe minor too, patch doesnt need to match)" | 2026-11-02 | §4 below |
-| R17 | "no no no, dont go back on the fork design. thats a cleaner model. Im not arguing for one shared backend fs -- im arguing for making the fork design so rock-solid that it is almost as effective, by syncing forks quickly and efficiently to minimize conflict drift" | 2026-11-02 | git-model §8 |
-| R18 | "If the changes are passing bi-directionally, then keeping the two trees relatively in-sync should minimize conflicts, right? Ideally, the two conflicting changes would be interleaved in commits, and both clients would see the others changes -- this would be the ideal parallel of a real, local filsystem, and those clients dont need to know that its all virtualized and backed by git." | 2026-11-02 | git-model §7–§8 |
-
-**His answers still in force** (current choices, not rules):
-
-| # | His answer | Date | Designed in |
-|---|---|---|---|
-| A1 | Main is a view like any fork | 2026-11-01 | [views](domains/views.md) |
-| A2 | A fork's client is its own view mount, made by whoever starts the container | 2026-11-01 | [clients](domains/clients.md) |
-| A3 | Fork saves land live ("continuous"); integrator patches stay "whenDetached" until he opens them | 2026-11-01 | fork saves: git-model §5; patches: not yet designed (§5) |
-| A4 | "A fork whose branches are rejected and never land in the main branch will inevitably be lost, and that's acceptable" | 2026-11-01 | replaced for losing changes by "yes, \"losing\" patches should still be part of the history. i want to know who changed what when" (2026-11-03, git-model §4); still holds for a fork's whole line ([replication](domains/replication.md) §4) |
-| A5 | Consistency: "It depends on the config!" | 2026-11-02 | [views](domains/views.md) §3 |
-| A6 | A pinned fork is an acceptable snapshot | 2026-11-02 | [trees](domains/trees.md), [views](domains/views.md) |
-| A11 | File watchers: "we can take the "no guarantee" path for now" | 2026-11-02 | [views](domains/views.md) |
-| A12 | "Yes, I think so. The sandboxes are generally peers and parallelism is assumed." | 2026-11-02 | git-model §5 |
-| A13 | "Agreed. It’s a transaction, so a failure is an implicit rollback." | 2026-11-02 | git-model §9, §12 |
-| A15 | "a transaction starting effectively creates a new index —maybe even an implicit branch in the local history" (in full: git-model §0) | 2026-11-02 | git-model §9 |
-| — | **Close-to-open visibility accepted:** "Go", in reply to the recommendation to accept close-to-open visibility (other clients see a file's new content only once it is closed and saved) | 2026-11-03 | [views](domains/views.md) §2 |
-
-A9's words ("freezing only the files that a landing touches sounds reasonable", 2026-11-02) still bind and are built
-as the git model's locks (git-model §0, §6). A10's resolver chain and A14's `Lock` setting are replaced by the git
-model's own answers (§7, §9). A8, his accepted question "This does assume that a *commit* is landed altogether,
-not just a file" (2026-11-02), is met: a save (the whole file at one close) or a transaction's commit lands whole
-or loses whole (git-model §7, rule 3e; his answer of 2026-11-03 to git-model §16 question 3).
+The domains, each on its own page: [rules](domains/rules.md), [clients](domains/clients.md),
+[views](domains/views.md), [trees](domains/trees.md), [replication](domains/replication.md),
+[volume](domains/volume.md), [health](domains/health.md), [telemetry](domains/telemetry.md).
 
 ## 1. The system in one picture
 
@@ -189,25 +147,24 @@ unit of work of the change it reports (a transactional outbox).
 
 ## 3. System-wide invariants
 
-The git model's invariants are git-model §15. These are the rest; all are design choices except where a column
-cites the owner.
+The git model's invariants are git-model §15. These are the rest; all are design choices.
 
 | # | Invariant | Guaranteed by | How strongly |
 |---|---|---|---|
 | S1 | A client changes only its own tree (or its open transaction's directory); content from elsewhere enters a tree only through its queue (git-model §5) | the session edge; Views' write handle exists only for the own tree | construction + build time |
-| S2 | A view shows only what its grant's view profile shows; a rules error hides, never shows; no history, credential or state area is reachable through a view (R7) | Rules, Views | test |
+| S2 | A view shows only what its grant's view profile shows; a rules error hides, never shows; no history, credential or state area is reachable through a view | Rules, Views | test |
 | S3 | A reader sees each file whole old or whole new; an open handle keeps the content it opened | the working-tree update (git-model §3), Views | test |
 | S4 | Each fact has one judge: the tree's actor a tree's head; Clients attachment; each view what it shows (`ViewCaughtUp`); Health liveness; Volume release. Nothing waits for another view | all | review + test |
 | S5 | Every wait ends on a named event. The only timers are operator schedules (push spacing and retry, repack, telemetry export), Health's probes, a launcher's restart window and the kernel's cache backstop | all | review |
 | S6 | Every persisted row carries audit stamps written by the repository layer; commits carry their writer and time (git-model §3) | the `store` adapter | construction time |
 | S7 | One node per volume and one history service per volume, held by a kernel lock | `store`, before any domain is built | boot time |
-| S8 | Components that talk share one `Family`; internal formats are read only by their own family; history is read and continued by every release of its major (R16) | the rpc edge, `store`, the git model at boot | boot + connect time |
+| S8 | Components that talk share one `Family`; internal formats are read only by their own family; history is read and continued by every release of its major | the rpc edge, `store`, the git model at boot | boot + connect time |
 
-## 4. Versions and upgrades (R16)
+## 4. Versions and upgrades
 
 | What | Kept across | May break at | Checked by |
 |---|---|---|---|
-| Git history: branches, trailers, refs (git-model §3, §4) | every minor and patch of a major (R16) | a major | at boot: a branch last written by another major is refused (`OtherMajor`) |
+| Git history: branches, trailers, refs (git-model §3, §4) | every minor and patch of a major | a major | at boot: a branch last written by another major is refused (`OtherMajor`) |
 | Components that talk: history service, view hosts, launchers, CSI plugin, CLI | one family: same major **and minor** (a design choice from his "maybe minor too"; revisable); patch free | any minor | the rpc edge: `OtherFamily` |
 | Settings: Rules' files, space limits, start point and acceptances, `on_release`, remotes | every release, each by its owner | never: a release that cannot read one refuses to stage, naming it | each owner at boot |
 | Internal formats: `store` rows, tree storage layout, rpc | one family | any minor | `store` at boot: `FormatsOf(family)` until that family drains the volume |
@@ -217,22 +174,21 @@ cites the owner.
 | Patch | replace a component in place; a view host's restart ends its clients' open files (no live hand-over: design choice) |
 | Minor or major | **drain, then upgrade:** an operator's `drain_for_upgrade`; every client detaches (its open files saved at its end), every queue drains, pushes settle, every fork drops; `Released`; the new release stages on main's branch alone ([volume](domains/volume.md)) |
 
-Releases come from semantic-release on merge (owner, 2026-11-01): a format or rpc change is at least a minor, a
+Releases come from semantic-release on merge: a format or rpc change is at least a minor, a
 history break a major. Cost: every `feat` is a minor, so every feature release is a full drain.
 
 ## 5. What the git model does not design yet
 
-Each needs its own gate; none is designed on these pages, and the older mechanisms for them (a held landing, a
-resolver chain, a journal) are gone with the pages that held them. Only the rows that cite R or A numbers rest on
-the owner's words (§0); the others are gaps found by review, not requirements of his.
+Each row is a slice with its own page under [future/](future/). None is designed on the system pages. Until a slice
+is built, the behaviour in the right column stands.
 
-| Gap | What is missing |
+| Slice | What stands until it is built |
 |---|---|
-| R14, R15 (whether a clean merge is acceptable); A3 (integrator patches wait until "whenDetached") | approvals and landing timing are not modelled (git-model §16); every landing is accepted when its queue takes it |
-| Integrator patches (A3); restore, revert (no owner words on these pages) | no source other than a fork's commits and syncs enters a queue (git-model §5) |
-| R9, R13 for files changed while open (a database and its `-wal`, Rules' groups) | a save happens at close (git-model §6): a file held open is recorded call by call in the journal (git-model §3) but saves nothing until its close, and holds back the incoming changes to it (git-model §6, "Progress") |
-| Large and binary files, LFS (no owner words on these pages) | binary files are not modelled (git-model §16) |
-| Space limits and history truncation (no owner words on these pages) | not modelled (git-model §16); [trees](domains/trees.md) §4 keeps the per-tree quota as a design choice |
+| [Landing approvals and timing on trees](future/landing-approvals.md) | every landing is accepted when its queue takes it |
+| [Integrator patches, restore and revert on trees](future/integrator-patches.md) | no source other than a fork's commits and syncs enters a queue |
+| [Files changed while open, database groups](future/files-open-groups.md) | a file held open saves nothing until its close and holds back the incoming changes to it |
+| [Large and binary files on trees](future/large-and-binary-files.md) | binary files beyond NUL bytes are not modelled |
+| [Space limits and history truncation](future/space-limits.md) | not modelled; [trees](domains/trees.md) §4 proposes a per-tree quota |
 
 ## 6. Deployment compositions and crate layout
 
@@ -258,21 +214,21 @@ apps         agentfs, agentfs-csi: composition roots; they make the minters, wir
 Boundaries, strongest first. **Compile time:** no domain crate sees another's internals. **Construction time:**
 capabilities and `Writer` come only from minters. **Build time:** `cargo deny` bans domain-to-domain and
 domain-to-adapter dependencies; clippy bans stray minters and I/O crates in domains. **Boot and connect time:** an
-unbound port, or a volume or peer of another family, is refused (S8); zero remotes is normal ("Remotes can come and
-go", 2026-10-17).
+unbound port, or a volume or peer of another family, is refused (S8); zero remotes is normal.
 
 ## 7. Costs and tracer bullet
 
-1. **A fork sees a change only once it is closed** (close-to-open, accepted 2026-11-03), and landed changes
+1. **A fork sees a change only once it is closed** (close-to-open), and landed changes
    rewrite working-tree files, so hard links across a landing break.
 2. **Every write call is a journal append** before it returns (git-model §3), so a view host's death or restart
    loses no answered call; it still ends its clients' mounts, and a fork's restarted host gets a new fork, since
    a fork has one writer for life ([clients](domains/clients.md)).
-3. **File watchers have no guarantee** (A11): `TreeMoved` and `ViewCaughtUp` are the reliable notices.
+3. **File watchers have no guarantee**: `TreeMoved` and `ViewCaughtUp` are the reliable notices.
 4. **A full checkout per fork** until Trees' storage optimisation serves the same files from less space.
-5. **Five gaps wait for their own gate** (§5), three of them resting on the owner's words (R9, R13, R14, R15, A3).
-6. **The architecture is not settled until phase 1 passes** (end-to-end tests, not yet run against current rules) (git-model §18): durable writes, byte-level
-   calls, rename-over with open handles and queue progress on a real mount, none of which the model runs.
+5. **Five gaps wait for their own slice** (§5).
+6. **Only flat files are built on trees.** The tree views run flat regular files with git-safe UTF-8 names. The
+   rest of this page rests on the git model's rules, which the executable model checks, and on no mounted test
+   (see [the index](README.md)).
 
 **Tracer bullet** (design choice). A sidecar runs main's view and one fork view: (1) the fork closes p; main's
 queue takes it and main's view shows it once caught up; (2) main closes s; the fork's queue syncs it and the
@@ -289,20 +245,18 @@ object capabilities · the transactional outbox · Kubernetes liveness probes ·
 
 | Term | Definition | Why needed | Could be |
 |---|---|---|---|
-| view host; session | the process serving views, never inside a client; its connection for one client (capabilities stay in the service) | A2, §2.2 | the `mount` process |
-| tree | main (the tree with no upstream) or one fork: a branch with its working tree (git-model §2) | R3, R5 | backing tree |
-| `TreeMoved` | the actor's notice that a tree's branch and working tree moved | views drop caches; pushes start | the older feed's `Recorded` |
-| version, family | a component's semantic version; its major and minor | R16 | release |
-| grant, view profile | what a client may do and see, as data | R7 | role |
-| launcher, actor (operator) | who attaches clients; an authenticated operator. Not the git model's tree actor | A2, §2.2 | CSI node plugin |
+| view host; session | the process serving views, never inside a client; its connection for one client (capabilities stay in the service) | who hosts a view, and what it may hold; §2.2 | the `mount` process |
+| tree | main (the tree with no upstream) or one fork: a branch with its working tree (git-model §2) | one name for main and every fork | backing tree |
+| `TreeMoved` | the actor's notice that a tree's branch and working tree moved | views drop caches; pushes start | the existing feed's `Recorded` |
+| version, family | a component's semantic version; its major and minor | versions that may talk (§4) | release |
+| grant, view profile | what a client may do and see, as data | what a client may reach | role |
+| launcher, actor (operator) | who attaches clients; an authenticated operator. Not the git model's tree actor | who may attach which client; §2.2 | CSI node plugin |
 
-## Reconcile with existing code (agentfs origin/main b5c0dc8, from `docs/design.md`)
+## Where it meets the existing code
 
-- **The sandbox overlay** (§2.4) becomes a fork with its own branch and working tree; it stops writing the shared tree.
-- **The attached mark** (§19.1) goes with `WhenDetached` until §5's timing gate. **Locks** (§19.2 item 13) become forwarded kernel locks plus the git model's take locks.
-- **The journal, the patch queue and restore** have no home until §5's gates; the commit loop becomes the actor's save at close.
-- **Formats and versions:** semantic-release and the family check are new (today's release flow NOT VERIFIED).
+- **The sandbox overlay** becomes a fork with its own branch and working tree; it stops writing the shared tree.
+- **The attached mark** goes with the patch queue's "land only when nothing is attached" rule once the landing-timing slice is built. **Locks** become forwarded kernel locks plus the git model's take locks.
+- **The journal, the patch queue and restore** have no home on trees until the slices in §5 are built; the commit loop becomes the actor's save at close.
+- **Formats and versions:** the family check is new, and so is the upgrade drain.
 
-**NOT RUN:** the agentfs source was not read; the Rust is reasoned, not compiled.
-
-*History: revisions 1–9 are in git; revision 10 (2026-11-03) removes everything git-model.md now owns; revision 11 (2026-11-04) follows git-model's journal, progress rules and filesystem validation plan.*
+**Not verified:** none of the Rust here is compiled.

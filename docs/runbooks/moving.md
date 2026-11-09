@@ -2,8 +2,7 @@
 
 Each claim's worktree (its files and its branch `agentfs/<volume>`) lives
 on the disk of the node that created it, for good: one branch per
-worktree ([design §14.2](../design.md#142-csi-driver-built), §19.1
-2026-10-16). A volume never moves. To continue its work on another node,
+worktree ([csi.md](../csi.md)). A volume never moves. To continue its work on another node,
 you make a **new volume started from the old branch**: a claim on a
 start class (`startFrom: <remote>:agentfs/<old volume>@<commit>`) gets a
 new worktree on the node its pod is scheduled to, whose history begins at

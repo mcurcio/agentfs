@@ -1,5 +1,4 @@
-//! End-to-end tests of `agentfs serve-git` (design §12, §19.2 item 11;
-//! bead agentfs-mia.9): the real binary serving a state area over git's
+//! End-to-end tests of `agentfs serve-git` (bead agentfs-mia.9): the real binary serving a state area over git's
 //! smart HTTP on 127.0.0.1, `git http-backend` behind it, and the real
 //! `git` and `agentfs patch` as pushers.
 //!

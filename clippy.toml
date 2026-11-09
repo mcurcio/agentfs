@@ -1,7 +1,7 @@
 disallowed-methods = [
     # Every advisory file lock goes through agentfs_core::file_lock::FileLock,
     # which unlocks before it closes: a lock released only by closing stays
-    # held by a child process between its fork and its exec (design §2.2).
+    # held by a child process between its fork and its exec.
     { path = "std::fs::File::lock", reason = "take file locks through agentfs_core::file_lock::FileLock" },
     { path = "std::fs::File::lock_shared", reason = "take file locks through agentfs_core::file_lock::FileLock" },
     { path = "std::fs::File::try_lock", reason = "take file locks through agentfs_core::file_lock::FileLock" },
@@ -20,7 +20,7 @@ disallowed-methods = [
     # agentfs_core::listening_socket::Listener, which shuts the socket down
     # when it is stopped or dropped: a listener only closed goes on taking
     # connections no one answers while a child process shares it between its
-    # fork and its exec (design §2.2).
+    # fork and its exec.
     { path = "std::os::unix::net::UnixListener::bind", reason = "listen through agentfs_core::listening_socket::Listener" },
     { path = "std::os::unix::net::UnixListener::bind_addr", reason = "listen through agentfs_core::listening_socket::Listener" },
     { path = "tokio::net::UnixListener::bind", reason = "listen through agentfs_core::listening_socket::Listener::into_async", allow-invalid = true },

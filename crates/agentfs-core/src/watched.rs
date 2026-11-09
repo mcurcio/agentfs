@@ -1,4 +1,4 @@
-//! Files re-read when they change (design §11.1): token credentials, SSH
+//! Files re-read when they change: token credentials, SSH
 //! keys and known_hosts files.
 //!
 //! A [`WatchedFile`] keeps the parsed content with the file's stat stamp

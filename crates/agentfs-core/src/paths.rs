@@ -2,7 +2,7 @@
 //!
 //! Every recorded path is checked here before it reaches the journal, so a
 //! commit can never contain a path that git's fsck (and therefore a remote)
-//! would reject. See design §3.4 and §5.
+//! would reject.
 
 use std::fmt;
 

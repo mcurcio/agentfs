@@ -1,5 +1,5 @@
 //! `agentfs serve-git`: the volume's history repository as a git server for
-//! patch pushes (design §12, §17.1, §19.2 item 11; bead agentfs-mia.9).
+//! patch pushes (bead agentfs-mia.9).
 //!
 //! The owner, 2026-10-28: "agentfs should be a legitimate git server, and
 //! its up to the specific use case to wire up the relationship of the
@@ -7,7 +7,7 @@
 //!
 //! - **Transport.** git's smart HTTP, served by git's own CGI program, `git
 //!   http-backend`, behind a small HTTP/1.1 server in the binary
-//!   (`tiny_http`, design §17.3). Only the smart endpoints are served
+//!   (`tiny_http`). Only the smart endpoints are served
 //!   (`GET /info/refs?service=...`, `POST /git-upload-pack`, `POST
 //!   /git-receive-pack`), never dumb HTTP, which would hand out every
 //!   object. Every pusher speaks plain git: `agentfs patch submit` and
@@ -26,7 +26,7 @@
 //!   connectivity check finds the object already there; v0 too)
 //!   (git-config(1) `transfer.hideRefs`, gitnamespaces(7) "SECURITY"). Every client is a
 //!   pusher the operator configured, and the threat is mistakes, not
-//!   malice (design §1.1), so this is kept; data no pusher may read
+//!   malice, so this is kept; data no pusher may read
 //!   belongs in another repository.
 //! - **Pushers.** Every request authenticates as a pusher of the volume's
 //!   config ([`agentfs_core::patch::admit`]): HTTP Basic with the pusher's
@@ -215,7 +215,7 @@ fn pushers(state: &StateDir) -> Result<Vec<Pusher>> {
 
 /// The `-c` settings `git http-backend` runs with: agentfs's hooks, the
 /// visible refs, smart HTTP only, durable objects and refs before a push
-/// is acknowledged, and no gc (agentfs repacks, design §8).
+/// is acknowledged, and no gc (agentfs repacks).
 fn git_config(volume: &str, branch_ref: &str, hooks: &Path) -> Vec<String> {
     let mut config = vec![
         format!("core.hooksPath={}", hooks.display()),

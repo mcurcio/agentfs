@@ -158,8 +158,7 @@ jobs:
           kind delete cluster --name agentfs-csi || true
           ci/git-http-server.sh stop "$RUNNER_TEMP/git-server"
 
-  # mergiraf as a merge driver in the built image (ci/e2e-mergiraf.sh;
-  # design §17.3): two patches to one .rs file land at one apply.
+  # mergiraf as a merge driver in the built image (ci/e2e-mergiraf.sh): two patches to one .rs file land at one apply.
   e2e-mergiraf:
     name: e2e (mergiraf in the image)
     needs: build

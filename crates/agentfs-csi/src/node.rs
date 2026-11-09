@@ -1,4 +1,4 @@
-//! The CSI Node service (design §14.2): validates the calls and hands them
+//! The CSI Node service: validates the calls and hands them
 //! to the [`Supervisor`]. NodeGetInfo reports this node's topology
 //! ([`crate::identity::TOPOLOGY_KEY`]), which the kubelet puts on the node
 //! as a label and the PVs' node affinity matches.

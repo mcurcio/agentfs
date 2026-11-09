@@ -1,4 +1,4 @@
-//! Access to the backing tree (design §2.1).
+//! Access to the backing tree.
 //!
 //! The tree is reached only through a directory file descriptor opened when
 //! the mount starts. Every path is resolved with `openat2` and
@@ -91,7 +91,7 @@ impl Backing {
 
     /// The path of the open file `fd` relative to the root, as the kernel
     /// knows it now (`/proc/self/fd`): it follows renames by any process,
-    /// such as another front of the tree (design §14). `None` if the file
+    /// such as another front of the tree. `None` if the file
     /// is not under the root. The caller checks that the path leads to the
     /// file: an unlinked file's name ends in ` (deleted)`.
     pub fn rel_of(&self, fd: &impl AsFd) -> Option<Vec<u8>> {

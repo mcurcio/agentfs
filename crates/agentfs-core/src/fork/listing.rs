@@ -1,4 +1,4 @@
-//! Published changes on a fork remote (design §11.5), read in the
+//! Published changes on a fork remote, read in the
 //! receiver's repository with its own git and credentials, like `patch
 //! submit` ([`crate::patch::submit`]): no state area is ever read.
 //!

@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# End-to-end test of forks of forks on the CSI driver (bead agentfs-mia.7,
-# design §11.5) in a kind cluster: deploys ci/k8s-csi/forks/driver (the
+# End-to-end test of forks of forks on the CSI driver (bead agentfs-mia.7) in a kind cluster: deploys ci/k8s-csi/forks/driver (the
 # e2e-csi overlay with the `cifork` profile, whose fork remote forks.git
 # needs a password: agentfsCredentials, nginx auth_basic) and
 # ci/k8s-csi/forks/apps (a source claim kept in use by a writer), and

@@ -1,5 +1,4 @@
-// The contract between fronts and the history service of a volume (design
-// §14): gRPC over the node-local Unix socket
+// The contract between fronts and the history service of a volume: gRPC over the node-local Unix socket
 // <state>/meta/history/history.sock. Field numbers are frozen: add fields
 // and variants, never renumber or reuse one.
 //

@@ -1,6 +1,6 @@
 name: f8
 
-# F8, one branch per worktree (design §14.2): end-to-end jobs on kind,
+# F8, one branch per worktree: end-to-end jobs on kind,
 # each on its own runner. e2e-csi-move moves a volume between the two
 # workers of ci/kind/two-workers.yaml (ci/e2e-csi-move.sh,
 # docs/runbooks/moving.md), with the CSI chart from this tree and the

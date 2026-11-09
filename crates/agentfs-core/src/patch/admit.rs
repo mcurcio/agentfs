@@ -1,5 +1,4 @@
-//! Who may push what to `agentfs serve-git` (design §12, §19.2 item 11;
-//! bead agentfs-mia.9).
+//! Who may push what to `agentfs serve-git` (bead agentfs-mia.9).
 //!
 //! `serve-git` makes the state area's history repository a git server for
 //! patch pushes. Its pushers are the operator's, in the volume's git

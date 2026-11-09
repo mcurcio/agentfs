@@ -1,4 +1,4 @@
-//! The branch rule's two pure deciders (design §11.3; F8 "one branch per
+//! The branch rule's two pure deciders (F8 "one branch per
 //! worktree", rule 2).
 //!
 //! - [`claim`]: may this worktree write a ref the remote advertises? It
@@ -10,7 +10,7 @@
 //!   (its [`StartPoint`]) moved past the commit it was pinned at, to
 //!   commits this worktree does not have? The one decider of the
 //!   start-branch alarm, raised by the new volume, never by the old node.
-//! - [`lease_claim`]: may the operator's lease push (design §15) drop the
+//! - [`lease_claim`]: may the operator's lease push drop the
 //!   commits the remote's branch holds beyond the head? Only those no
 //!   agentfs recorder made (divergence case A), or ones the head holds
 //!   rewritten (a history rewrite); never history a recorder wrote that
@@ -18,8 +18,8 @@
 //!
 //! All are pure: the inputs are what the remote advertised and a
 //! predicate over, or facts from, this worktree's own history. The push record
-//! ([`super::PushState`]) is never an input: it stays bookkeeping
-//! (§11.2), and `measure_base` stays a hint. A remote's value that is not
+//! ([`super::PushState`]) is never an input: it stays bookkeeping,
+//! and `measure_base` stays a hint. A remote's value that is not
 //! in this repository is never fetched to decide: it counts as not on
 //! this history.
 
@@ -42,7 +42,7 @@ pub enum Claim {
     /// of the head: push the head, leased on that value.
     FastForward,
     /// The remote holds a commit unknown here, or one that is not an
-    /// ancestor of the head: someone else wrote it (§11.3). Nothing is
+    /// ancestor of the head: someone else wrote it. Nothing is
     /// written to it; the branch's divergence is saved and alarmed.
     Diverged,
 }
@@ -125,9 +125,9 @@ pub fn start_branch_moved(
     })
 }
 
-/// A commit as an agentfs recorder made it (design §9): its
+/// A commit as an agentfs recorder made it: its
 /// `Agentfs-Seq` and its author and committer. A history rewrite (`git
-/// filter-repo`, design §15) keeps all of these and changes the tree, the
+/// filter-repo`) keeps all of these and changes the tree, the
 /// id and the ids quoted in the message; the same sequence number recorded
 /// again from a stale state area differs in its time at least.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -165,17 +165,17 @@ pub enum LeaseClaim {
 /// branch that the head lacks, each with its [`Recording`] (`None`: no
 /// recorder made it). `kept` holds the recordings of the commits on the
 /// head that the remote's branch lacks: a dropped recording found there is
-/// the same record rewritten (design §15). The first dropped recording not
+/// the same record rewritten. The first dropped recording not
 /// found there is [`LeaseClaim::Recorded`].
 ///
 /// Git keeps no record of who created a remote branch, and the push record
-/// is never an input (it stays bookkeeping, §11.2): who made each commit
-/// (its trailers, §9) is what tells a foreign writer (case A) from this
+/// is never an input (it stays bookkeeping): who made each commit
+/// (its trailers) is what tells a foreign writer (case A) from this
 /// volume's own newer history (case B). A person's commit that keeps an
 /// agentfs message (an amend, rebase, cherry-pick or squash-merge) counts
 /// as recorded and is refused: the safe side. A branch a person made on
 /// this volume's pushed commits drops only untrailered commits and is
-/// replaced, like case A (design §15 "Not covered").
+/// replaced, like case A.
 pub fn lease_claim(
     dropped: impl IntoIterator<Item = (Oid, Option<Recording>)>,
     kept: &HashSet<Recording>,

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Starts OpenSSH servers for the SSH end-to-end tests (design §11.1): a
+# Starts OpenSSH servers for the SSH end-to-end tests: a
 # root sshd of its own on localhost:2222, key authentication only, for one
 # system user whose shell is git-shell, with repositories under
 #   ssh://agentfs-git@localhost:2222/home/agentfs-git/repos/<repo>.git
@@ -21,7 +21,7 @@
 #
 # GIT_SSH_LFS_AUTH=1 also installs a git-shell custom command,
 # ~agentfs-git/git-shell-commands/git-lfs-authenticate (root-owned, 0755),
-# for ci/e2e-lfs-ssh.sh (design §7): it checks its two arguments (a path
+# for ci/e2e-lfs-ssh.sh: it checks its two arguments (a path
 # and upload or download), appends `<time> <operation> <path>` to
 # ~/lfs-auth/log, and prints {"href": <base>/<basename of the path less
 # .git>, "header": {"Authorization": "Basic <token>"}, "expires_in": <n>}
@@ -91,7 +91,7 @@ SCRIPT
 fi
 
 # Host keys of every type, so known_hosts has them all (agentfs asks for the
-# types known_hosts lists first, design §11.1).
+# types known_hosts lists first).
 sudo install -d -m 0755 "$conf" "$conf/authorized_keys"
 for type in ed25519 ecdsa rsa; do
   sudo ssh-keygen -q -t "$type" -N '' -f "$conf/ssh_host_${type}_key"

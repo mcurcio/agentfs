@@ -11,7 +11,7 @@ owner approved it; it wins on status, this page on what each rule means in git.
 other page has a bug.
 **Revision of 2026-11-04** (answering the pull-request review's points 1, 3, 4 and 5): the journal that records every
 write call before it returns (§3), objects apart from file identities (§7), progress past a long-held file (§6),
-why a custom protocol on git primitives (§14), and the phase 1 validation plan (§18). All four are design choices. Since
+why a custom protocol on git primitives (§14), and the validation plan (§18). All four are design choices. Since
 the commit that adds MODEL.md rule 12, the journal's crash replay (§3), creates, objects and the atomic save (§7)
 and progress rule P1 (§6) are **modelled** (MODEL.md rules 9, 11 and 12, findings 19 to 22). After the owner's
 decisions of 2026-11-04 (§6), P3 is deleted and P2 is the prefix sync, both modelled.
@@ -163,7 +163,7 @@ that step moves: the commit point (§12). The open's records leave the journal a
   the file that replaced it, the failure §7 exists to prevent (the review planted exactly that bug; the model's
   byte oracle and object table catch it). The model's crash keeps its object table, which this rule rebuilds
   exactly. What a view host can rely on across its own restart (kernel inode numbers, handles after the mount
-  reconnects) is for phase 1 (§18).
+  reconnects) is part of the validation (§18).
 - **Open numbers never repeat** (a choice; P2-e of that review). The `n` of `Agentfs-Open: <n>` comes from the
   journal's record number, which a checkpoint carries across compaction and a restart never resets: a reused number
   would make a replay skip a new open as "already saved". The model's numbers never repeat within a run.
@@ -171,12 +171,12 @@ that step moves: the commit point (§12). The open's records leave the journal a
 | Shape | Gains | Costs |
 |---|---|---|
 | **Journal each call; durable at `fsync` and close (chosen)** | the Linux promise: a returned write survives any process death, and power loss once `fsync` or close has returned; every recording failure reaches the call that caused it | a journal append per write call (no flush), and a close that wrote waits for one flush, as today's close does; the state area holds each open file's calls until close, so a file written for hours keeps hours of calls there (the tree's space limit counts them) |
-| Flush the journal at every write call | survives power loss at every write | a disk flush per write: today's step costs 1.3 to 1.9 ms for one (`docs/design.md` §3.2), so a program writing small pieces runs hundreds of times slower than on Linux |
+| Flush the journal at every write call | survives power loss at every write | a disk flush per write: today's step costs 1.3 to 1.9 ms for one ([recording](../recording.md)), so a program writing small pieces runs hundreds of times slower than on Linux |
 | Calls held in the view's memory until close (the previous draft) | no journal | a view host's death loses every call it held, and a failed save loses its calls silently: breaks principle 1 |
 | Save at every `FLUSH`, as today's recorder does | close returns the save's error | `FLUSH` comes at every close of a duplicated descriptor, so it saves too often, and it would publish before the `RELEASE` that close-to-open waits for |
 
-The journal is in the state area beside the repository, never under a tree or a mount (V4). In phase 1 there is one
-per actor, holding every tree's records, because a step can move two trees' queues at once. Frames are checksummed
+The journal is in the state area beside the repository, never under a tree or a mount (V4). The tree library has one
+journal per actor, holding every tree's records, because a step can move two trees' queues at once. Frames are checksummed
 and salted; a bad frame with no good one after it is a torn tail, saved aside, and one with a good one after it refuses
 to serve (`docs/runbooks/recording-failures.md`). How a view host appends without a path into the state area is
 parked (views.md).
@@ -536,7 +536,7 @@ save carries a's identity and meets the upstream's atomic save per line, where t
 
 *Choice:* an orphan's calls (an object no path names at close) were recorded before each returned (§3); at close
 they are dropped with an event to Telemetry naming the writer, path and size, not committed: they never changed any
-state of the directory (`docs/design.md` §1.2's "every change"). Alternative: commit them under their own ref, as a
+state of the directory (the guarantee covers every change that reached the state of the directory; [guarantees](../guarantees.md)). Alternative: commit them under their own ref, as a
 losing change is kept; cost, every unlink-after-open scratch file, a common temporary-file idiom, enters history.
 
 An unlink made after a sync saw the upstream's lines and wins by lineage (`r11_an_unlink_after_the_sync_wins`). In
@@ -617,7 +617,7 @@ lines behind the fork's undecided unfinished line (R10.9). So the decided versio
 **Not settled (the owner, 2026-11-05).** "There is no “who” in a transaction — transactions stage file changes"; "A
 transaction is an agentfs concept, not a property of the local/shared fs." (ledger R5.4). This section still describes the
 model, which binds a transaction to a client and adds `Client::Outside`: no rule supports that. The API of the integration
-that creates a transaction is not defined. Transactions stay out of phase 1 (§18) until that API is designed.
+that creates a transaction is not defined. Transactions are not built (§18) until that API is designed.
 
 Begin creates `txn/<n>` and `refs/txn-start/<n>` at the fork's head: snapshot isolation. The program's saves
 commit there and it reads its own edits; the fork keeps syncing. One per fork; a tree with no upstream has none. A file
@@ -710,7 +710,7 @@ One history mode. The owner, 2026-11-05: "drop squashing". Every fork commit sta
 open saved once from the journal; a take is one step, so none is in progress); the rest of a restart, and power loss, are
 not; the rest is a design choice.
 
-**One step, one journal record** (a recommendation the owner accepted, revisable; `docs/design.md` §19.1). Each step
+**One step, one journal record** (a recommendation the owner accepted, revisable; [OWNER-GUIDANCE.md](../../OWNER-GUIDANCE.md)). Each step
 writes its objects durably, then appends one synced journal record with every pointer it moves: the branch, queue
 entries, collision refs, the object table. That record is the commit point. Git's refs are then a copy, in the files
 format, and nothing decides from the copy: runtime reads come from the journal's pointers. Reftable's one atomic swap
@@ -737,8 +737,8 @@ step rebuilds the refs whole and redoes that checkout.
 |---|---|---|
 | save | the branch, the landing entry at the upstream, a sync entry at each child, the object table; names the open it closes | nothing to do: the move and its entries are one record, or neither happened |
 | queue take | the branch, the entry deleted, the entries the move causes, the collision ref, the object table | the entry is still there only if the take has no record: take it again; collision refs are named by the losing commit, so a rerun makes the same names |
-| transaction begin, commit, rollback | not built in phase 1 | a `txn/*` branch whose client has ended is deleted: an implicit rollback (A13); a client waiting to rebind after a history-service restart has not ended, and its transaction is restored at rebind (clients.md) |
-| fork create | the branch and its upstream | `config` is rewritten from the journal before any git command; a dropped fork is not built in phase 1 |
+| transaction begin, commit, rollback | not built | a `txn/*` branch whose client has ended is deleted: an implicit rollback (A13); a client waiting to rebind after a history-service restart has not ended, and its transaction is restored at rebind (clients.md) |
+| fork create | the branch and its upstream | `config` is rewritten from the journal before any git command; a dropped fork is not built |
 | journal | each call appended and synced before it returns (§3) | before any view serves the tree, each open with no record closing it is saved as its close would be, exactly once. A torn last frame is saved aside and discarded |
 | refs, `config`, `HEAD` | a copy of the records | `config` and `HEAD` are rewritten, then `refs/` and `packed-refs` are removed and every pointer is created in one `update-ref --stdin`, on every open, so this path always runs. A live `git` reader may see a step half copied |
 | locks | none: held in memory by the actor | none survive: open files ended with their clients and are saved from the journal (row above); an unfinished take has no record, so its entry is still there and is taken again. In the model a take is one step, so none is unfinished at a crash |
@@ -775,12 +775,10 @@ that works, so the second table weighs the other established designs (design cho
 | Patch theory: Pijul, Darcs | line identity and commuting patches are its core; conflicts are first-class; Pijul's graph of lines is the nearest prior art to the line map | not git: no git remote carries its history (AGENTS.md principles 3 and 6); it records a conflict for a person to resolve rather than deciding it, so the referee would still be ours; Darcs has had exponential merge cases, and Pijul is younger than git's tooling |
 | Jujutsu (git-backed): change ids and the operation log | a change's identity apart from its commit's; every operation logged, concurrent operations reconciled at the next load; conflicts stored in commits | its merge is three-way by content, so findings 1, 6 and 13(b) apply; it stores a conflict for a person rather than deciding it. Its operation log is prior art for the journal (§3) and for recovery; it is not adopted as a dependency |
 
-**What the custom protocol still owes**, after phase 1 ([phase-1.md](phase-1.md), the [exit table](phase-1-handoff.md)): where the line map
-is stored (§16 question 1); recovery, now run on real mounts (journal kills, ext4 and XFS power loss; §12, §18) with the limits the
-handoff states; metadata growth, measured at 19.6 bytes of line map a save over 10,000 saves, with every deleted version kept and
+**What the custom protocol still owes**, after the tree library ([trees](../trees.md)): where the line map
+is stored (§16 question 1); recovery, now run on real mounts (journal kills, ext4 and XFS power loss; §12, §18) with the limits [the tree views page](../trees.md#limits) states; metadata growth, measured at 19.6 bytes of line map a save over 10,000 saves, with every deleted version kept and
 each losing change adding a collision ref, none with a trim rule; and performance, measured but not budgeted: a 100 MiB file in the
-tree makes every later save and take cost minutes, because each rereads and rewrites the tree (handoff, "What a 100 MiB file in the
-tree costs"). The cost of a take that blocks a client call is untested by the replay (MODEL.md finding 49).
+tree makes every later save and take cost minutes, because each rereads and rewrites the tree ([performance](../performance.md) and the tree views page). The cost of a take that blocks a client call is untested by the replay (MODEL.md finding 49).
 
 Prior art: a merge queue (GitHub's, Bors) is a single referee taking changes in order; Gerrit's `refs/for/<branch>`
 pushes into a queue, not a branch; commit trailers record facts in history; `remote = .` is plain
@@ -917,17 +915,15 @@ this model replaced (landing, forks, journal, history) and the earlier mechanism
 resolver chain, per-path merge bases, squash chains, squashed history and its grafts) are in git history only. Nothing left in the set should
 contradict this page; where something does, this page wins.
 
-## 18. Phase 1: implementation and end-to-end validation
+## 18. Validation on the tree library and mounts
 
-The owner clarified on 2026-11-05: "The goal is to build the phase 1 / MVP of the proposed design in the PR so we can run real end-to-end tests and validate the model".
-[Phase 1](phase-1.md) is the first implementation of this design, developed incrementally. Its recording
-milestone was written by an earlier session and was rebuilt against this design (the owner, 2026-11-05, called the first draft outdated and untested). The 2026-11-04 review identified the
-filesystem-boundary checks below. Their results, row by row, are in the [handoff](phase-1-handoff.md#exit-table-git-model-18). Scope:
+The goal is a real implementation of the proposed design, so that end-to-end tests can validate the model.
+[The tree library](../trees.md) is the implementation of this design. The filesystem-boundary checks are below. Their results, row by row, are in the [tree views page](../trees.md#how-it-is-verified). Scope:
 
 | In scope | Answers | Exit criterion (pass or fail) |
 |---|---|---|
-| A FUSE mount of main and one fork on one real repository: a tree actor and a queue each | the model on real calls | the model's scenarios, driven as real file calls (VERIFYING.md's conformance plan), pass. Built as a replay of each scenario's recorded calls, so it compares what each tree shows and the lost lines of each collision: no mapping call, a client call waiting on a take assumed by replay order, a crash only between calls, no injected `ENOSPC` (VERIFYING.md has the table). Evidence and counts: the [handoff](phase-1-handoff.md#exit-table-git-model-18), first row |
-| The journal (§3) | review point 1 | a kill of the one process that hosts the view and the tree actors (phase 1 has no separate history service) after each journal step: every write call that returned is in the next save, and none is saved twice; under power loss (dm-log-writes, as the power-loss workflow): every call before a returned `fsync` or close survives; a full state area fails the write call with `ENOSPC`; a close followed at once by an open, in the same process and in another, reads the new content (`RELEASE` is a background request: it goes to `/dev/fuse` in order, before `close` returns, while fewer than `max_background` requests are outstanding and no readahead of that handle is in flight, and a synchronous `OPEN` skips that queue. The view sets `max_background` as high as the kernel's `max_user_bgreq` allows. Read from fs/fuse at v6.8 and v6.14 and tested on CI's kernel (7.0) with 64 closes over a busy view, `ci/trees-close-open.py`. Limits: thousands outstanding, or a readahead of that handle in flight, can still let an open pass) |
+| A FUSE mount of main and one fork on one real repository: a tree actor and a queue each | the model on real calls | the model's scenarios, driven as real file calls (VERIFYING.md's conformance plan), pass. Built as a replay of each scenario's recorded calls, so it compares what each tree shows and the lost lines of each collision: no mapping call, a client call waiting on a take assumed by replay order, a crash only between calls, no injected `ENOSPC` (VERIFYING.md has the table). Evidence and counts: the [tree views page](../trees.md#how-it-is-verified), first row |
+| The journal (§3) | review point 1 | a kill of the one process that hosts the view and the tree actors (there is no separate history service) after each journal step: every write call that returned is in the next save, and none is saved twice; under power loss (dm-log-writes, as the power-loss workflow): every call before a returned `fsync` or close survives; a full state area fails the write call with `ENOSPC`; a close followed at once by an open, in the same process and in another, reads the new content (`RELEASE` is a background request: it goes to `/dev/fuse` in order, before `close` returns, while fewer than `max_background` requests are outstanding and no readahead of that handle is in flight, and a synchronous `OPEN` skips that queue. The view sets `max_background` as high as the kernel's `max_user_bgreq` allows. Read from fs/fuse at v6.8 and v6.14 and tested on CI's kernel (7.0) with 64 closes over a busy view, `ci/trees-close-open.py`. Limits: thousands outstanding, or a readahead of that handle in flight, can still let an open pass) |
 | Byte-level calls (modelled since 2026-11-04: §6, MODEL.md rules 8 and 10) | review point 2, on a real mount | random `pwrite` at any offset, partial lines, split writes, a missing final newline (appending `bar` to a file holding `foo`), overlapping writes, `ftruncate` shrinking and growing, `O_APPEND`; the bytes are the independent oracle: each saved file equals what the same calls leave on a plain Linux filesystem, and its line map passes `save_aligned` |
 | Objects (§7) | review point 3 | an atomic save (write `n`, `rename(n, a)`) while another process holds `a` open for writing and keeps writing: the new `a` never changes; `O_TMPFILE` with `linkat`; an unlink while open; a rename of an open file; a view-host restart with handles open (the object table rebuilt from the journal, §3; plain FUSE ends the connection with its server): an old handle's later writes fail, the file holds what returned before the kill, and a file replaced through the new mount stays unchanged; two writers at stale offsets through the page cache; shared `mmap` writeback |
 | Progress (§6) | review point 4 | a main process holds a log open for the whole run while a fork lands a stream of changes to other files: each lands without waiting for the log; a change to the log waits, new writers of the log are never made to wait, and the change lands once no writer has the log open; real programs that wait on each other while one holds a file a take waits for (a shell pipeline, a parent process waiting for a child that appends to its log) never hang (finding 24, the reason P3 was dropped); a prefix sync into a fork holding a file open delivers the upstream's commits before the first that touches it, and the rest at the close |
@@ -935,7 +931,7 @@ filesystem-boundary checks below. Their results, row by row, are in the [handoff
 
 Out of scope: nested forks, transactions, Rules and view profiles, replication,
 CSI, several view hosts, upgrades. **Exit:** every pass-or-fail row passes on CI's Linux runners (FUSE runs only
-there, AGENTS.md); any failure is a finding to resolve in the implementation or the model before phase 1 is validated; the
+there, AGENTS.md); any failure is a finding to resolve in the implementation or the model before the model is validated; the
 measurements set the first budgets (no number here is a budget yet). The replay's alignment and the library's are one call
 (`agentfs_align`), and the image and CI run one release of `git`, the one in `ci/git-release` (R10.10). An upgrade changes how later saves
 align repeated lines; stored bytes and identities do not change (MODEL.md, finding 42).
@@ -959,7 +955,7 @@ The Rust model stays the testbed; the script only demonstrates. His current choi
 | line identity, version, deleted version, name line | as §2 defines them | a position or bytes cannot say which versions are one line; unlinks and renames must meet edits under one rule (§7) | slot; tombstone (CRDTs); inode |
 | alignment | the one histogram diff a save makes of its base against the program's bytes (§7) | the calls do not say which lines changed | git's diff |
 | untracked area | where a tree's skipped and scratch files live, beside its working tree (§3) | `read-tree -u` refuses to overwrite untracked files | git's untracked files |
-| journal | a tree's write-ahead log of write calls and path calls, in the state area (§3) | a call is recorded before it returns, though it is saved at close | today's journal (`docs/design.md` §3.3) |
+| journal | a tree's write-ahead log of write calls and path calls, in the state area (§3) | a call is recorded before it returns, though it is saved at close | today's journal ([recording](../recording.md)) |
 | object; orphan | what an open handle holds (the inode); an object no path names (§7) | writes through an old handle must never reach the file that replaced it | inode |
 | source (of a queue entry) | the child fork a landing came from; for a sync's changes, their writer (§6) | P1 and P2 keep each source's order | — |
 | held-back part | the upstream's commits a prefix sync does not deliver yet: the first that touches a file open in the fork, and every later one (§6, P2) | a held file holds back a sync only from its first change on | a waiting take |
@@ -975,9 +971,9 @@ an append onto a partial line). Answered 2026-11-04: no P3 (§6, MODEL.md findin
 the prefix sync (§6). Answered 2026-11-05: an agreeing delete is not dropped (MODEL.md
 findings 19, 26, 27), two deletes of one line agree with no collision (ledger rule R10.3, MODEL.md finding 28), squashing is dropped (§11), the alarm is gone (§6), and a line after the upstream's unfinished last line collides (§7).
 
-Open on 2026-11-05. Each names its context; none blocks phase 1 unless noted:
+Open on 2026-11-05. Each names its context; none blocks the validation unless noted:
 
-- **Transactions, not in phase 1.** The integration's API (R5.4). A sketch, not a rule: `begin(tree)` returns an id and
+- **Transactions, not built.** The integration's API (R5.4). A sketch, not a rule: `begin(tree)` returns an id and
   its own staging directory, normal file I/O writes there, `commit(id)` answers `Committed`, `Lost{lines}` or `Empty`, and
   `rollback(id)` drops it. Something must end a transaction whose integration died, so the id needs a holder, for its
   lifetime only. If staging is a separate directory, the owner's reason for deferring ("a client trying to write the
@@ -993,6 +989,3 @@ Open on 2026-11-05. Each names its context; none blocks phase 1 unless noted:
   locks), 47 (other bytes, mechanism not established).
 - **History.** R5.1's "which remote?": the commit's trailers name the tree, the loser and the versions, no remote.
 
-*History: 2026-11-03, from the model at 509a0ab; revised after review (save ordering, trees, recovery, grafts, slots); 2026-11-03, the owner's answers on losers and saves; review: Replication pushes losers, questions 2 and 3; 2026-11-03, the owner's answers on saves and locks; review: appends at close, main's clients' death, transactions with open files, the lock over path calls, the program-level hang; 2026-11-03, after the owner's "Go": close-to-open accepted, line identity, deletes and renames (§7); review: no POSIX call names a line, so a save aligns its bytes once (§6, §7), the atomic-save idiom, untracked files (§3), R9/R13/A8 put to the owner (§16), §17 cut; 2026-11-03, the owner's answer to question 3: a save or transaction lands whole or loses whole, only winning saves are squashed (§7, §9, §11, §15); 2026-11-04, answering the pull-request review: the journal (§3), progress (§6), objects (§7), why a custom protocol (§14), the phase 1 validation plan (§18), proof claims narrowed to the modelled executions; 2026-11-04, byte calls modelled (§6, §7), the notes ref built (§4, §8), Replication due on every move of main (§4); 2026-11-04, the adversarial review at `ee29551`: finding 24 (P3
-deadlocks cooperating programs, §6), squash runs cut at open files (§6), the object table and open numbers across a
-restart (§3, §12); 2026-11-04, the owner's decisions: no P3, P2 as the prefix sync (§6); findings 11 and 25 fixed in the rules (§7)*

@@ -1,4 +1,4 @@
-//! End-to-end tests of `agentfs fork deliver` (design §11.5 "Delivery")
+//! End-to-end tests of `agentfs fork deliver`
 //! against `file://` bare remotes: a fork of `src` is published to
 //! `origin`, and a receiver's clone delivers its change by each method:
 //! inbox and branch with the real `git`, command with a receiver script,

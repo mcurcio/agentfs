@@ -3,8 +3,8 @@
 # The agentfs image: the `agentfs` binary built with the `https` and `ssh`
 # features and the `agentfs-csi` CSI driver, on Debian trixie with fuse3,
 # git, tini, mergiraf and the CA certificates. It runs as root, deliberately: the
-# phase 1 sidecar must be root and privileged to mount FUSE with
-# Bidirectional propagation (design §17.1, docs/deployment.md "Security
+# sidecar must be root and privileged to mount FUSE with
+# Bidirectional propagation (docs/deployment.md "Security
 # trade-offs"). The CSI node plugin runs it as `tini -- agentfs-csi`, root
 # and privileged in the driver's namespace only (docs/csi.md).
 #
@@ -55,7 +55,7 @@ RUN find crates -name '*.rs' -exec touch {} + \
  && install -m 0755 target/release/agentfs target/release/agentfs-csi /usr/local/bin/
 
 # mergiraf, a syntax-aware git merge driver an operator may name in a
-# volume's `$GIT_DIR/info/attributes` (design §12, §17.3): its own
+# volume's `$GIT_DIR/info/attributes`: its own
 # program, run by `git merge-tree` as `merge.<name>.driver`, never linked
 # (GPL-3.0-only). A pinned release's static (musl) binary and the licence
 # of its tag, both checked by sha256.
@@ -79,10 +79,10 @@ RUN set -eu; version=0.20.0; \
 FROM ${RUNTIME_IMAGE}
 # fuse3: fusermount3 and /etc/fuse.conf (a non-root daemon); libssl3t64:
 # the `https` and `ssh` transports link OpenSSL; ca-certificates: the TLS
-# trust store; git: the daemon repacks the history with it (design §8),
+# trust store; git: the daemon repacks the history with it,
 # and operators follow the runbooks (git log, show) with kubectl exec;
 # tini: PID 1 of the CSI node plugin, reaping the orphans its children
-# leave (design §14.2); mergiraf: see its stage above.
+# leave; mergiraf: see its stage above.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends fuse3 libssl3t64 ca-certificates git tini \
  && rm -rf /var/lib/apt/lists/*

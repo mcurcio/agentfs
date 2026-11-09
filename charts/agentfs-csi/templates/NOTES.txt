@@ -9,14 +9,14 @@ Check it (one node plugin per node, each provisioning its own node's worktrees):
 {{- if and $enforce (ne $enforce "privileged") }}
 
 WARNING: namespace {{ $.Release.Namespace }} enforces the "{{ $enforce }}" Pod Security
-standard; the node plugin needs "privileged" (docs/helm.md §2):
+standard; the node plugin needs "privileged" (docs/helm.md):
   kubectl label --overwrite namespace {{ $.Release.Namespace }} pod-security.kubernetes.io/enforce=privileged
 {{- end }}
 {{- end }}
 {{- if not .Values.profiles }}
 
 No profiles are set: a StorageClass names one with `profile: <name>`. Add
-one with --set-file profiles.<name>.config=<file> (docs/csi.md §4).
+one with --set-file profiles.<name>.config=<file> (docs/csi.md).
 {{- end }}
 {{- if .Values.credentials.existingSecret }}
 
@@ -40,5 +40,5 @@ StorageClasses: {{ range $i, $c := .Values.storageClasses }}{{ if $i }}, {{ end 
 {{- else }}
 
 No StorageClasses are set (storageClasses): create one that names a profile,
-then claims on it (docs/csi.md §6).
+then claims on it (docs/csi.md).
 {{- end }}

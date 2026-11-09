@@ -1,9 +1,8 @@
-//! Real FUSE mounts (design §18 tests 1, 2, 4, 5, 6, 7, 11 and 15, plus SQLite
-//! in and out of the fsync class (design §8),
+//! Real FUSE mounts: SQLite in and out of the fsync class,
 //! git on the mount, restores through the mount, the daemon's lifecycle, and
-//! `probe`, `--on-stale-mount hold` and `recover` after a crash (design §17.1), two
-//! front mounts of one backing tree feeding one history service (design §14), and
-//! writes through a shared mapping after the file's last close (design §3.1, bead
+//! `probe`, `--on-stale-mount hold` and `recover` after a crash, two
+//! front mounts of one backing tree feeding one history service, and
+//! writes through a shared mapping after the file's last close (bead
 //! agentfs-dyu).
 //!
 //! Every test needs `/dev/fuse` and root, so all are `#[ignore]`d; the
@@ -391,7 +390,7 @@ impl Drop for Mounted {
     }
 }
 
-// ---- design §18 test 1: no gaps ----
+// ---- no gaps ----
 
 #[test]
 #[ignore = "needs /dev/fuse and root: ci/fuse-tests.sh"]
@@ -473,7 +472,7 @@ fn no_gaps() {
     m.stop();
 }
 
-// ---- design §18 test 2: before return ----
+// ---- before return ----
 
 #[test]
 #[ignore = "needs /dev/fuse and root: ci/fuse-tests.sh"]
@@ -535,7 +534,7 @@ fn recorded_before_close_returns() {
     m.stop();
 }
 
-// ---- design §18 test 4: any user ----
+// ---- any user ----
 
 #[test]
 #[ignore = "needs /dev/fuse and root: ci/fuse-tests.sh"]
@@ -597,7 +596,7 @@ fn any_user() {
     m.stop();
 }
 
-// A daemon running as root creates each object as its caller (design §6):
+// A daemon running as root creates each object as its caller:
 // it is the caller's from the instant it exists, never root's first, and
 // a directory the caller reaches through a supplementary group works.
 #[test]
@@ -662,7 +661,7 @@ fn new_objects_are_the_callers_from_the_start() {
     m.stop();
 }
 
-// ---- design §18 test 5: invisible ----
+// ---- invisible ----
 
 fn walk(root: &Path) -> Vec<String> {
     let mut out = Vec::new();
@@ -732,7 +731,7 @@ fn nothing_of_the_state_area_is_visible() {
     m.stop();
 }
 
-// ---- design §18 test 6: rules ----
+// ---- rules ----
 
 #[test]
 #[ignore = "needs /dev/fuse and root: ci/fuse-tests.sh"]
@@ -766,7 +765,7 @@ fn rules_through_the_mount() {
     m.stop();
 }
 
-// ---- design §18 test 7: nested repositories ----
+// ---- nested repositories ----
 
 fn source_repo(v: &Vol) -> PathBuf {
     let src = v.p("src");
@@ -829,7 +828,7 @@ fn nested_repositories() {
     assert!(!log.contains("alarm:"), "{log}");
 }
 
-/// Paths ever deleted on the branch's history (design §5: nothing is
+/// Paths ever deleted on the branch's history (: nothing is
 /// deleted from history by nesting).
 fn deleted_paths(v: &Vol) -> String {
     let out = Command::new("git")
@@ -848,7 +847,7 @@ fn deleted_paths(v: &Vol) -> String {
     text(&out.stdout)
 }
 
-/// Design §5 and §18 test 7: tracked paths stay tracked when a directory
+/// Tracked paths stay tracked when a directory
 /// around them becomes a nested repository (`git init`, `git init
 /// --bare`, a `git worktree add` gitfile), only new paths under it are
 /// left out (or, with `nested = working-tree`, its working files are
@@ -981,7 +980,7 @@ fn sqlite_on_the_mount() {
     m.stop();
 }
 
-// ---- the fsync class (design §8) ----
+// ---- the fsync class ----
 
 /// The attribute line that puts SQLite databases in the fsync class.
 const SQLITE_CLASS: &str = "*.db* agentfs.commit=fsync agentfs.group=sqlite agentfs.coalesce=1s\n";
@@ -1159,7 +1158,7 @@ fn sigterm_with_a_file_open_for_writing() {
     let mut m = v.mount(&[]);
     // A writer that never closes its file after writing. (`printf >&3`
     // would close a duplicate of it afterwards: a FLUSH that records the
-    // data, leaving the final sweep nothing to record, design §3.1.)
+    // data, leaving the final sweep nothing to record.)
     let mut writer = Command::new("sh")
         .args(["-c", "exec 3>held; exec 1>&3; printf data; exec sleep 60"])
         .current_dir(v.mnt())
@@ -1223,7 +1222,7 @@ fn the_lock_holds_while_mounted() {
             text(&out.stderr)
         );
     }
-    // `push` is not refused: the mount pushes for it (design §2.3).
+    // `push` is not refused: the mount pushes for it.
     let out = v.agentfs(&["push", "--timeout", "10s"]);
     assert!(out.status.success(), "{}", text(&out.stderr));
     assert!(
@@ -1346,13 +1345,13 @@ fn released(m: &Mounted, path: &Path, limit: Duration) -> bool {
 }
 
 /// A write through a shared mapping after the last close is recorded late
-/// but recorded (design §3.1). Under FUSE passthrough the kernel's
+/// but recorded. Under FUSE passthrough the kernel's
 /// `backing_file_mmap` points the mapping at the backing file
 /// (`vma_set_file`), so the mapping does not hold the FUSE file open:
 /// RELEASE was served at the last close, before the write, and the sweep
 /// looks only at open files (agentfs-dyu, red under passthrough on and
 /// auto in CI run 40993499943). So a handle that can write is never given
-/// passthrough (design §17.1): its mapping holds the FUSE file, and
+/// passthrough: its mapping holds the FUSE file, and
 /// RELEASE waits for munmap in every mode. Should a writer get passthrough
 /// of its own again, its mapping would be on the backing file, which the
 /// assertion on `mapped_backing` catches. A writer sharing a reader's
@@ -1472,7 +1471,7 @@ fn a_shared_mapping_written_after_the_last_close_is_recorded() {
     );
 
     // A writer's mapping is on the FUSE file in every mode: a handle that
-    // can write never gets passthrough (design §17.1).
+    // can write never gets passthrough.
     for (name, _, mapped_backing) in &evidence {
         assert!(
             !*mapped_backing,
@@ -1486,8 +1485,8 @@ fn a_shared_mapping_written_after_the_last_close_is_recorded() {
 }
 
 /// A writer opened while a read-only passthrough handle is open shares
-/// its backing id: the kernel allows no other kind of handle on the inode
-/// (design §17.1). Its shared mapping then holds the backing file, not the
+/// its backing id: the kernel allows no other kind of handle on the inode.
+/// Its shared mapping then holds the backing file, not the
 /// FUSE file, so RELEASE comes at its last close and the mapping writes
 /// after it. The write is made only once that RELEASE has been served:
 /// with the reader still open, and after the reader closed too. Both must
@@ -1705,7 +1704,7 @@ fn a_dot_git_that_is_no_repository_alarms() {
     assert!(alarms[0].contains("notes/.git/report.txt"), "{log}");
 }
 
-// ---- design §15, §18 test 11: recovery ----
+// ---- recovery ----
 
 #[test]
 #[ignore = "needs /dev/fuse and root: ci/fuse-tests.sh"]
@@ -1795,7 +1794,7 @@ fn revert_through_the_mount() {
     // One open, one write, one close: one record, so the head is the commit
     // that added x. A shell `printf x > x` would not do: dash opens x, dups it
     // onto stdout and closes the original before printf writes, and that
-    // close's FLUSH records x empty (design §3.1). When the write's FLUSH
+    // close's FLUSH records x empty. When the write's FLUSH
     // comes more than a commit window later, the head adds nothing and only
     // writes x, and reverting it writes x back to empty.
     v.sh_as(Some(UID), "printf x | tee x >/dev/null", true);
@@ -2044,7 +2043,7 @@ fn restore_by_another_user_is_refused() {
     m.stop();
 }
 
-// ---- design §17.1: probes, and a sidecar restarted after a crash ----
+// ---- probes, and a sidecar restarted after a crash ----
 
 /// The mountinfo line for `mnt`, as the runner's kernel reports it.
 fn mountinfo_line(mnt: &Path) -> Option<String> {
@@ -2179,7 +2178,7 @@ fn crash(m: &mut Mounted) {
     );
 }
 
-/// `--on-stale-mount recover` (design §17.1): a daemon killed with -9 is
+/// `--on-stale-mount recover`: a daemon killed with -9 is
 /// replaced by one stacked over its stale mount, which every copy of the
 /// stale mount then reaches: a bind of it (as a kubelet subPath) and a
 /// slave mount namespace (as a workload container). Refused without
@@ -2332,7 +2331,7 @@ fn recover_stacks_over_a_crashed_mount() {
 }
 
 /// With nothing stale, `recover` is a normal mount; files left in the bare
-/// mount point are warned about (design §17.1).
+/// mount point are warned about.
 #[test]
 #[ignore = "needs /dev/fuse and root: ci/fuse-tests.sh"]
 fn recover_on_a_healthy_mount_point_is_a_normal_mount() {
@@ -2360,7 +2359,7 @@ fn mount_creates_a_missing_mount_point() {
     assert!(v.mnt().is_dir());
 }
 
-/// `--seal-mountpoint` (design §17.1): the bare mount point is root's with
+/// `--seal-mountpoint`: the bare mount point is root's with
 /// mode 0000, so between mounts a non-root writer is refused; the mount on
 /// top is unaffected, and a sealed mount point mounts again.
 #[test]
@@ -2383,10 +2382,10 @@ fn a_sealed_mount_point_refuses_writes_between_mounts() {
     m.stop();
 }
 
-// ---- design §11.2: the final push at shutdown ----
+// ---- the final push at shutdown ----
 
-/// Stopping `agentfs mount` pushes what the push interval had not yet sent
-/// (design §11.2), here a whole hour of it.
+/// Stopping `agentfs mount` pushes what the push interval had not yet sent,
+/// here a whole hour of it.
 #[test]
 #[ignore = "needs /dev/fuse and root: ci/fuse-tests.sh"]
 fn mount_pushes_its_final_commit_at_shutdown() {
@@ -2416,7 +2415,7 @@ fn mount_pushes_its_final_commit_at_shutdown() {
     assert_eq!(remote_head(), Some(head));
 }
 
-// ---- design §18 test 15: the patch queue at mount (design §12) ----
+// ---- the patch queue at mount ----
 
 /// Queues patch `n` in the volume's own repository: `parent` with `path`
 /// set to `content`.
@@ -2505,7 +2504,7 @@ fn patches_apply_before_the_mount_serves() {
     m.stop();
 }
 
-// ---- design §14: two fronts, one history service ----
+// ---- two fronts, one history service ----
 
 /// Starts `agentfs serve-history` for `v`, logging to its own log, and waits
 /// for it to serve.
@@ -2667,7 +2666,7 @@ fn two_fronts_one_service() {
     assert!(status.contains("command=mount pod=pod-b"), "{status}");
 
     // A file open in A that B renames, or removes: A's close records it
-    // under its current name, or nowhere (design §14).
+    // under its current name, or nowhere.
     {
         write_and_close(&v.mnt().join("app.log"), "1").unwrap();
         write_and_close(&v.mnt().join("gone.log"), "1").unwrap();
@@ -2748,8 +2747,8 @@ fn two_fronts_one_service() {
     );
 }
 
-/// `restore` and `revert` while the history service serves two fronts
-/// (design §15): the service settles both, writes the backing tree, and
+/// `restore` and `revert` while the history service serves two fronts:
+/// the service settles both, writes the backing tree, and
 /// each front's kernel drops what it cached, so both mounts show the
 /// restored content at once.
 #[test]
@@ -2831,7 +2830,7 @@ fn restores_through_the_service_reach_every_front() {
     write_and_close(&mnt2.join("f.txt"), "after").unwrap();
     v.expect(&tree(&[("f.txt", f("after"))]));
 
-    // Fronts settle first (design §15): a write through a front that is
+    // Fronts settle first: a write through a front that is
     // not closed yet, which only its sweep would record (an hour away
     // here), is recorded and committed before the restore's commit.
     write_and_close(&mnt2.join("k.txt"), "k1").unwrap();
@@ -2870,14 +2869,14 @@ fn restores_through_the_service_reach_every_front() {
     service.stop();
 }
 
-// ---- design §3.1: one record per close, directory moves ----
+// ---- one record per close, directory moves ----
 
 #[test]
 #[ignore = "needs /dev/fuse and root: ci/fuse-tests.sh"]
 fn a_close_is_recorded_once() {
     // A file written and closed within one timestamp tick is recorded at
     // the close, racily; its RELEASE finds the same bytes and records
-    // nothing more (design §3.1, §19.2 item 4).
+    // nothing more.
     let v = Vol::new("one_record");
     v.config("agentfs.commitWindow", "10m");
     let src = v.p("src");
@@ -2943,7 +2942,7 @@ fn directory_renames_are_one_move() {
     m.stop();
 }
 
-// ---- design §5: absolute gitdir targets ----
+// ---- absolute gitdir targets ----
 
 #[test]
 #[ignore = "needs /dev/fuse and root: ci/fuse-tests.sh"]
@@ -2985,7 +2984,7 @@ fn head_identities(v: &Vol) -> (String, String) {
     (sig(commit.committer()), sig(commit.author()))
 }
 
-/// Design §9 and §18 test 10: custom identity templates through a
+/// Custom identity templates through a
 /// single-process mount and through a front of a history service, with
 /// a uid 10000 writer: the committer is the mount's (or the front's)
 /// pod, the author the writer's uid and gid.
@@ -3037,7 +3036,7 @@ fn identity_templates_through_mount() {
     service.stop();
 }
 
-// ---- the sandbox overlay (design §1.1) ----
+// ---- the sandbox overlay ----
 
 /// The worked examples' allowlist, plus a skipped pattern.
 const SANDBOX_EXCLUDE: &str = "/*\n!/config.yaml\n!/skills/\n*.key\n";
@@ -3570,7 +3569,7 @@ fn overlay_refusals() {
 }
 
 /// A daemon serving the sandbox overlay killed with -9 leaves both mount
-/// points stale (design §17.1). Refuse names the overlay's; a hold detaches
+/// points stale. Refuse names the overlay's; a hold detaches
 /// it; recover stacks over both, and its stop detaches the stale layers.
 #[test]
 #[ignore = "needs /dev/fuse and root: ci/fuse-tests.sh"]
@@ -3668,8 +3667,8 @@ fn overlay_recovers_from_a_crashed_daemon() {
     assert_eq!(layers(&mnt), 0, "{log}");
 }
 
-/// `--seal-mountpoint` seals the sandbox overlay's bare mount point too
-/// (design §17.1): a sandbox that binds it while no daemon is mounted
+/// `--seal-mountpoint` seals the sandbox overlay's bare mount point too:
+/// a sandbox that binds it while no daemon is mounted
 /// cannot write there unrecorded.
 #[test]
 #[ignore = "needs /dev/fuse and root: ci/fuse-tests.sh"]
@@ -3761,8 +3760,8 @@ fn overlay_and_main_mount_rename_at_once() {
 
 /// A file saved through one mount by a temp file and a rename is seen
 /// through the other at once, though that mount's kernel had just cached
-/// its entry: every change invalidates every other session's kernel cache
-/// (design §2.4). A cached entry lives for one second (fuse.rs'
+/// its entry: every change invalidates every other session's kernel cache.
+/// A cached entry lives for one second (fuse.rs'
 /// `ENTRY_TTL`), so seeing the new file well inside that second, counted
 /// from before the entry was cached, proves the invalidation and not the
 /// expiry. A round whose own save outlasted half of it judges nothing and

@@ -1,5 +1,5 @@
 //! Two fronts and one history service in one process, over a real Unix
-//! socket (design §14). No FUSE: fronts record through their `Recorder`
+//! socket. No FUSE: fronts record through their `Recorder`
 //! exactly as a FUSE mount's boundary layer would.
 
 use std::collections::{BTreeMap, HashMap};
@@ -86,7 +86,7 @@ impl Service {
             &Telemetry::noop(),
         )
         .unwrap();
-        // As `serve-history` does (design §14.1).
+        // As `serve-history` does.
         recorder.enable_stamps();
         let mut service = Self {
             recorder,
@@ -272,7 +272,7 @@ fn concurrent_fronts_commit_with_their_own_committers() {
     const PER_THREAD: usize = 25;
     // Writes of the shared path are serialized (write, then record), as
     // two boundaries a moment apart: two at the same instant race between
-    // freeze and journal (design §14), which this test does not cover.
+    // freeze and journal, which this test does not cover.
     let shared_lock = std::sync::Mutex::new(());
     // Each record of the shared path, by the sequence number it got.
     let shared: BTreeMap<u64, String> = std::thread::scope(|s| {
@@ -348,7 +348,7 @@ fn a_write_whose_path_another_front_removed_meanwhile_is_skipped() {
     // Front A froze `log` from its open descriptor; before its record
     // reaches the service, front B removed `log` from the tree (and
     // records the removal itself). A's late write must not bring the path
-    // back into HEAD (design §14).
+    // back into HEAD.
     let env = env();
     let service = Service::start(&env);
     let a = front(&env, "pod-a");
@@ -1309,7 +1309,7 @@ fn stamp_of(env: &Env, path: &str) -> FreezeStamp {
 fn a_write_frozen_before_a_newer_journaled_one_is_superseded() {
     // Front A froze `shared` and its record is late; front B wrote and
     // recorded a newer state meanwhile. A's late record must not put HEAD
-    // back on A's state (design §14.1).
+    // back on A's state.
     let env = env();
     let service = Service::start(&env);
     let a = front(&env, "pod-a");
@@ -1381,7 +1381,7 @@ fn nfs_silly_renames_are_never_recorded_through_a_front() {
 fn a_write_of_a_file_renamed_over_meanwhile_is_skipped() {
     // Front A froze `f` from its descriptor; front B renamed a new file
     // over `f` before A's record arrived: A's file is no longer at the
-    // path (design §14.1).
+    // path.
     let env = env();
     let service = Service::start(&env);
     let a = front(&env, "pod-a");
@@ -1405,7 +1405,7 @@ fn a_write_of_a_file_renamed_over_meanwhile_is_skipped() {
 #[test]
 fn the_services_own_writes_supersede_older_front_writes() {
     // A restore the service applies records through its local recorder:
-    // a front's record frozen before it is older (design §14.1, §15).
+    // a front's record frozen before it is older.
     let env = env();
     let service = Service::start(&env);
     let a = front(&env, "pod-a");
@@ -1445,7 +1445,7 @@ fn atomic_groups_are_never_superseded() {
 
 #[test]
 fn identical_stamps_from_two_fronts_end_on_the_trees_state() {
-    // A coarse timestamp clock (design §14.1): two fronts write the same
+    // A coarse timestamp clock: two fronts write the same
     // number of bytes to one path within one tick, so both freezes carry
     // the same stamp; the tree ends on B's "BBBB". Whichever record
     // arrives last, HEAD must end on what the tree holds.
@@ -1487,7 +1487,7 @@ fn identical_stamps_from_two_fronts_end_on_the_trees_state() {
 fn a_late_removal_of_a_path_made_again_ends_on_the_trees_state() {
     // Front B removed `lock.json`, and its record is late; front A made
     // the path again and recorded it meanwhile. B's removal is journaled,
-    // then the service records the path as the tree has it (design §14.1).
+    // then the service records the path as the tree has it.
     let env = env();
     let service = Service::start(&env);
     let a = front(&env, "pod-a");
@@ -1592,8 +1592,7 @@ fn splitmix(x: u64) -> u64 {
 
 /// Two fronts, two threads each, write `shared` `writes` times per thread
 /// with `write_one(n, front)`; after each round HEAD must be what the tree
-/// holds, whatever order the records reached the service in (design
-/// §14.1).
+/// holds, whatever order the records reached the service in.
 fn race(writes: usize, write_one: impl Fn(&Env, &Recorder, usize) + Sync) {
     let env = env();
     let service = Service::start(&env);
@@ -1637,7 +1636,7 @@ fn racing_in_place_writes_leave_head_on_the_trees_last_state() {
 #[test]
 fn racing_same_size_writes_leave_head_on_the_trees_last_state() {
     // Every state has the same size: only ctime (and, within one tick of a
-    // coarse clock, the resync) orders them (design §14.1).
+    // coarse clock, the resync) orders them.
     race(10, |env, recorder, n| {
         let backing = env.tree.join("shared");
         std::fs::write(&backing, format!("{n:08}")).unwrap();
@@ -1871,8 +1870,7 @@ fn a_record_over_4_mib_is_journaled() {
 #[test]
 fn the_service_says_whether_a_fronts_copy_is_still_last() {
     // A front's RELEASE skips re-recording a racy close only while the
-    // copy it froze is the last state the service journaled at the path
-    // (design §3.1).
+    // copy it froze is the last state the service journaled at the path.
     let env = env();
     let _service = Service::start(&env);
     let a = front(&env, "a");
@@ -1963,8 +1961,8 @@ fn time_records(
     })
 }
 
-/// The cost of a boundary through a front against single-process mode
-/// (design §14, §19.2). Prints numbers; asserts nothing about them.
+/// The cost of a boundary through a front against single-process mode.
+/// Prints numbers; asserts nothing about them.
 #[test]
 #[ignore = "benchmark: run with --release --ignored --nocapture"]
 fn round_trip_cost() {
@@ -1983,7 +1981,7 @@ fn round_trip_cost() {
     )
     .unwrap();
 
-    println!("### Boundary cost, 4 KiB close, {N} records (design §14)");
+    println!("### Boundary cost, 4 KiB close, {N} records");
     println!();
     println!("```");
     let pings: Vec<Duration> = (0..N).map(|_| client.ping().unwrap()).collect();
@@ -2019,7 +2017,7 @@ fn round_trip_cost() {
     );
 }
 
-// ---- listening fronts: the service calls them for live restores (§15) ----
+// ---- listening fronts: the service calls them for live restores ----
 
 /// Hooks that note every call; `open` paths answer open for writing.
 #[derive(Default)]
@@ -2254,7 +2252,7 @@ fn a_listener_comes_back_after_the_service_restarts() {
 #[test]
 fn a_fronts_directory_move_is_one_record_reconciled_by_the_service() {
     // A front journals a directory rename as one move; the service
-    // reconciles the tree beneath it before committing it (design §3.1).
+    // reconciles the tree beneath it before committing it.
     let env = env();
     let service = Service::start(&env);
     let a = front(&env, "pod-a");

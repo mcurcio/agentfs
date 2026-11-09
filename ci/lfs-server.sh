@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Starts Git LFS servers for the end-to-end tests of design §7: git-lfs's
+# Starts Git LFS servers for the end-to-end tests: git-lfs's
 # reference lfs-test-server, three instances, behind the nginx of
 # ci/git-http-server.sh (started with GIT_SERVER_LFS=1), which does the
 # authentication:

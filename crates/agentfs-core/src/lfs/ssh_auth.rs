@@ -1,4 +1,4 @@
-//! `git-lfs-authenticate` (design §7): how an SSH remote without an
+//! `git-lfs-authenticate`: how an SSH remote without an
 //! explicit LFS endpoint finds one. git-lfs's SSH protocol runs
 //! `git-lfs-authenticate <path> <upload|download>` on the git server,
 //! which prints JSON naming the HTTP(S) endpoint and the header to send to

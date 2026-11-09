@@ -1,5 +1,5 @@
 //! The sandbox overlay's session: the visibility gate and the view owner in
-//! front of the shared operations (design §1.1, §2.4).
+//! front of the shared operations.
 //!
 //! [`Overlay`] decorates an [`Operations`] (the daemon's one
 //! [`crate::ops::Ops`]). It asks the gate ([`agentfs_core::visibility`])

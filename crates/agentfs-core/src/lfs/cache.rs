@@ -1,4 +1,4 @@
-//! The local LFS object cache (design §2.2, §7): `<state>/lfs/objects/aa/bb/<oid>`,
+//! The local LFS object cache: `<state>/lfs/objects/aa/bb/<oid>`,
 //! the layout git-lfs uses in `.git/lfs/objects`, plus `<state>/lfs/tmp`
 //! for objects being written and `<state>/lfs/incomplete/<oid>` for
 //! downloads that can resume.

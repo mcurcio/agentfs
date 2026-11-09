@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # End-to-end test of one branch per worktree on a two-worker kind cluster
-# (F8, design §14.2, docs/runbooks/moving.md): node-local worktrees, a
+# (F8, docs/runbooks/moving.md): node-local worktrees, a
 # volume continued on another node by a new volume started from the old
 # branch, the old node's late commits reaching the old branch and alarming
 # on the new volume, and DeleteVolume removing nothing a remote lacks.

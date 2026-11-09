@@ -1,5 +1,5 @@
 //! The model's recorded calls against the real system (git-model.md §18, the
-//! first row; VERIFYING.md, "Phase 1").
+//! first row; VERIFYING.md, "The model as the conformance suite").
 //!
 //! The model runs its scenarios and seeds unchanged and records each call with
 //! what each tree showed (`agentfs_model::calls`). [`Library`] and [`Mounted`]
@@ -77,7 +77,7 @@ pub fn against_model(trace: &[Recorded]) -> Result<(), String> {
     })
 }
 
-/// Whether a trace fits §18's "main and one sandbox" on a real mount: at most one
+/// Whether a trace fits "main and one sandbox" on a real mount: at most one
 /// fork, made before the first client call, and no open that both appends and
 /// writes at an offset. Linux has no such descriptor: `pwrite` on an `O_APPEND`
 /// file appends, and the view reads `O_APPEND` when the file opens.

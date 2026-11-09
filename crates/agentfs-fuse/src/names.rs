@@ -1,9 +1,9 @@
-//! What a path in the mount is, for recording (design §5).
+//! What a path in the mount is, for recording.
 //!
 //! Every path the FUSE layer is about to record is classified first:
 //!
 //! - [`Class::Record`]: a valid repository path, handed to the recorder
-//!   (which still applies the path rules and checks of design §4 and §3.4);
+//!   (which still applies the path rules and checks);
 //! - [`Class::InGitDir`]: a path with a component that is exactly `.git`.
 //!   It is never recorded (git cannot store it). Whether it raises an alarm
 //!   depends on what that `.git` is, which only the backing tree can tell

@@ -23,7 +23,7 @@
 # clients that cannot reach the runner's loopback (pods in a kind cluster
 # reach the kind network's gateway). 127.0.0.1 is always served.
 #
-# GIT_SERVER_LFS=1 adds Git LFS routes for ci/lfs-server.sh (design §7):
+# GIT_SERVER_LFS=1 adds Git LFS routes for ci/lfs-server.sh:
 #   http://localhost:8080/git/<repo>.git/info/lfs/...   the derived endpoint,
 #     and /git/<repo>/objects/... its object hrefs, proxied to 127.0.0.1:9002
 #     under the git server's own users (htpasswd);

@@ -1,5 +1,4 @@
-# Every StorageClass of the driver must have reclaim policy Delete (design
-# §14.2, §19.1 "Release decider"; docs/csi.md §5): DeleteVolume then always
+# Every StorageClass of the driver must have reclaim policy Delete (docs/csi.md): DeleteVolume then always
 # runs, and the driver's one release decider answers, waiting while a
 # remote lacks the branch's head and keeping the worktree on its node with
 # `onDelete: retain`. With Retain, a fork would never finish, and an
@@ -25,7 +24,7 @@ spec:
         an agentfs StorageClass must have reclaimPolicy Delete: DeleteVolume
         must run so the driver can decide what a released worktree needs
         (it waits while a remote lacks its head, and onDelete: retain keeps
-        it on its node); a fork finishes only then (docs/csi.md §5)
+        it on its node); a fork finishes only then (docs/csi.md)
 ---
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicyBinding

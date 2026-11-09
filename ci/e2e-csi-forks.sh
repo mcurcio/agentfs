@@ -1,12 +1,11 @@
 #!/usr/bin/env bash
-# End-to-end test of forked volumes on the CSI driver (design §11.5,
-# docs/csi.md §14) in a kind cluster: deploys ci/k8s-csi/forks/driver (the
+# End-to-end test of forked volumes on the CSI driver
+# (docs/csi.md) in a kind cluster: deploys ci/k8s-csi/forks/driver (the
 # e2e-csi overlay with a `cifork` profile whose fork remote is forks.git)
 # and ci/k8s-csi/forks/apps, and checks, in order:
 #
 #   1. a sandbox pod's ephemeral claim on a fork class clones a source
-#      claim that a writing pod keeps in use (the premise of design §19.2
-#      question 8: if Kubernetes refuses, the test fails with "premise
+#      claim that a writing pod keeps in use (if Kubernetes refuses, the test fails with "premise
 #      refuted"), and the sandbox sees the source's files;
 #   2. the sandbox's writes reach refs/heads/agentfs/<fork> on the fork
 #      remote by its interval pushes, and nothing of the fork reaches the
@@ -197,7 +196,7 @@ kubectl apply -f "$HERE/k8s-csi/forks/sandbox.yaml"
 if ! ka wait --for=condition=Ready pod/sandbox --timeout=240s >/dev/null; then
   ka get events --field-selector involvedObject.name=sandbox-data -o wide || true
   provisioner_log | grep -i -E "sandbox-data|clone|dataSource" | tail -n 20 || true
-  fail "premise refuted: the sandbox's clone of the source claim, in use by the writer, never became usable (design §19.2 question 8)"
+  fail "premise refuted: the sandbox's clone of the source claim, in use by the writer, never became usable"
 fi
 pass "the sandbox is Ready: Kubernetes cloned a claim in use"
 FORK_PV=$(ka get pvc sandbox-data -o jsonpath='{.spec.volumeName}')
@@ -275,8 +274,7 @@ pass "the source stayed in use throughout"
 
 step "(5) a fork whose remote refuses its refs is refused"
 # The hook refuses refs/agentfs/* (the change and finish refs), not the
-# fork's branch: the publish is refused for good (design §11.5,
-# `rejected`).
+# fork's branch: the publish is refused for good (`rejected`).
 cat >"$FORKS_REMOTE/hooks/pre-receive" <<'HOOK'
 #!/bin/sh
 while read -r _old _new ref; do

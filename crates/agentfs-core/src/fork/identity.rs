@@ -1,4 +1,4 @@
-//! A fork's identity (design §19.1, "Forked volumes"): fixed at create,
+//! A fork's identity: fixed at create,
 //! kept in the fork's own state-area config beside `agentfs.volume`, and
 //! never set by an include. [`crate::config::Settings`], the single
 //! decider of a volume's refs and remotes, reads it; every other setting
@@ -15,16 +15,14 @@ pub const PUSH_TARGET_KEY: &str = "agentfs.fork.pushTarget";
 /// `agentfs.fork.link`: `linked` (unset) or `unlinked` ([`ForkLink`]).
 pub const LINK_KEY: &str = "agentfs.fork.link";
 /// `agentfs.fork.remotes`: an unlinked fork's own remotes, an absolute
-/// path to a config file of `[remote "<name>"]` sections (design §11.5,
-/// §19.1 "Unlinked fork remotes"); unset, the fork is local-only.
+/// path to a config file of `[remote "<name>"]` sections; unset, the fork is local-only.
 pub const REMOTES_KEY: &str = "agentfs.fork.remotes";
 /// `agentfs.fork.sourceIsFork`: `true` when the source was itself a fork
 /// at create; unset otherwise. Identity: written by create, never by an
 /// include.
 pub const SOURCE_IS_FORK_KEY: &str = "agentfs.fork.sourceIsFork";
 
-/// Whether a fork delivers back to its source, fixed at create (design
-/// §11.5; §19.1 "Fork link", 2026-10-17). The owner: "A fork can be
+/// Whether a fork delivers back to its source, fixed at create. The owner (2026-10-17): "A fork can be
 /// created with or without a remote link back to its parent.
 /// Configurable."
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

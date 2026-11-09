@@ -9,8 +9,7 @@ spec:
     requests:
       storage: 1Gi
 ---
-# HostToContainer: a replaced front reaches both containers live (csi.md
-# §6).
+# HostToContainer: a replaced front reaches both containers live (csi.md).
 apiVersion: apps/v1
 kind: Deployment
 metadata:

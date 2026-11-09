@@ -1,17 +1,19 @@
 # Architecture
 
 How the code is organised and how a change travels from a write to a
-remote. [design.md](design.md) is the specification and says *why*; this
-page says *where*. Section references (§) are to design.md.
+remote. [guarantees](guarantees.md) says what agentfs promises and
+[recording](recording.md) how it records; this page says *where* the code
+is. The libraries behind it, and why each was chosen, are under
+[Technology choices](#technology-choices).
 
 ## Crates
 
 | Crate | Kind | What it is |
 |---|---|---|
 | `agentfs-core` | library | The engine: path rules, the journal, frozen copies, commits, pushes, restores, the patch queue, the history service, LFS, telemetry. No FUSE and no CLI |
-| `agentfs-fuse` | library | The FUSE layer: a passthrough filesystem over the backing tree that calls the engine at every change boundary (§2.1, §3.1, §6) |
-| `agentfs` | binary | The `agentfs` command (§17.1): `init`, `mount`, `run`, `record`, `flush`, `push`, `status`, `probe`, `serve-history`, `restore`, `revert`, `patch`, `fork`; OpenTelemetry export |
-| `agentfs-csi` | library and binary | The CSI driver (§14.2): `agentfs-csi`, one per node beside csi-provisioner, which makes the node's worktrees and supervises `agentfs serve-history`, `agentfs mount` and the release scan's `agentfs flush` and `agentfs push` children |
+| `agentfs-fuse` | library | The FUSE layer: a passthrough filesystem over the backing tree that calls the engine at every change boundary |
+| `agentfs` | binary | The `agentfs` command (every subcommand is listed in [configuration](configuration.md#commands)); OpenTelemetry export |
+| `agentfs-csi` | library and binary | The CSI driver: `agentfs-csi`, one per node beside csi-provisioner, which makes the node's worktrees and supervises `agentfs serve-history`, `agentfs mount` and the release scan's `agentfs flush` and `agentfs push` children |
 | `agentfs-align` | library | Git's histogram diff, called one way, for line identity (git-model §7). `agentfs-core` and `agentfs-model` both depend on it, so line identity does not depend on how `git` is called; one module, `lib.rs` |
 | `agentfs-conformance` | library and binary, tests only | The model's recorded calls against the real tree library and real mounts (git-model §18). Depends on `agentfs-core` and `agentfs-model`; nothing depends on it |
 
@@ -33,84 +35,84 @@ missing from these tables or a row names a module that no longer exists;
 |---|---|
 | `lib.rs` | Crate root: the module list and the engine's overview |
 | `volume.rs` | Opens a state area: crash recovery, then the [`Recorder`](#the-synchronous-step) used at every boundary and the `Committer` that turns records into commits |
-| `record.rs` | What the journal stores: one record per change boundary, absolute state, never deltas (§3.1, §3.3) |
-| `tree_actor/mod.rs` | Phase 1 actor: recorded byte calls, the ordered step, recovery from the journal, line-map storage, queue takes, main and one sandbox; separate from the production recorder |
-| `tree_actor/journal.rs` | The actor's journal: salted checksummed frames, the commit point for calls and pointer steps, torn-tail and corruption rules, compaction (target git-model §3, §12) |
+| `record.rs` | What the journal stores: one record per change boundary, absolute state, never deltas |
+| `tree_actor/mod.rs` | The tree actor: recorded byte calls, the ordered step, recovery from the journal, line-map storage, queue takes, main and one sandbox; separate from the production recorder |
+| `tree_actor/journal.rs` | The actor's journal: salted checksummed frames, the commit point for calls and pointer steps, torn-tail and corruption rules, compaction (target git-model §3) |
 | `tree_actor/pointers.rs` | Branches, queue entries, collision refs and object tables as the journal leaves them: pure, no I/O |
-| `tree_actor/pages.rs` | The kernel's one page cache per file: page fills, page writes and the size replies for shared mappings (ledger R1.4) |
-| `tree_actor/queue.rs` | P1 eligibility and P2 prefix selection for writer-locked queue entries |
+| `tree_actor/pages.rs` | The kernel's one page cache per file: page fills, page writes and the size replies for shared mappings (rules ledger, R1.4) |
+| `tree_actor/queue.rs` | Eligibility and prefix selection for writer-locked queue entries |
 | `tree_actor/referee.rs` | Whole-save parent referee for line and namespace versions, with causal collision records |
 | `tree_actor/stages.rs` | Measurements only, never read by a decision: runs and time per actor stage, and the Git children the actor's path has started (counted at `git_cli::counted`, the one spawn site; target git-model §18) |
 | `tree_actor/sync.rs` | Sync snapshots preserving undecided child versions without deciding collisions |
 | `tree_reconcile.rs` | Histogram save alignment, line identities, whole-change reconciliation and undecided sync |
 | `tree_git.rs` | Git executable backend for durable objects, the rebuildable copy of the refs in files format, `config` and `HEAD`, snapshots and private caches; Git children retain the actor lease |
-| `journal.rs` | The durable change log: framed, checksummed records with group-commit `fsync` (§3.2, §3.3) |
-| `pending.rs` | Frozen copies in `pending/`: `FICLONE` reflink, else copy plus `fsync`; slot-numbered ids for fronts (§3.2 step 1) |
-| `claims.rs` | Per-path ordering: a record claims its paths from decision to tracked-set update (§3.2, §4) |
-| `stamps.rs` | Freeze stamps: the history service orders fronts' writes of one path by the backing file's stat stamp at freeze (§14.1); the last write journaled at each path (§3.1) |
-| `tracked.rs` | The tracked set, git's index in agentfs: branch head plus durable records (§4), a tree so a directory move is O(1) (§3.1) |
-| `reconcile.rs` | Directory moves: the duties that reconcile a moved tree before its move is committed (§3.1) |
-| `rules.rs` | Path rules: recorded or skipped, and why, from `info/exclude`, `info/attributes` and optionally tree rules (§4, §5) |
-| `visibility.rs` | The sandbox overlay's visibility gate: which names it shows and where a new or moved name goes, decided from the rules alone (§1.1, §4) |
-| `nested.rs` | Detects nested git repositories, including ones being created (§5) |
+| `journal.rs` | The durable change log: framed, checksummed records with group-commit `fsync` |
+| `pending.rs` | Frozen copies in `pending/`: `FICLONE` reflink, else copy plus `fsync`; slot-numbered ids for fronts |
+| `claims.rs` | Per-path ordering: a record claims its paths from decision to tracked-set update |
+| `stamps.rs` | Freeze stamps: the history service orders fronts' writes of one path by the backing file's stat stamp at freeze; the last write journaled at each path |
+| `tracked.rs` | The tracked set, git's index in agentfs: branch head plus durable records, a tree so a directory move is O(1) |
+| `reconcile.rs` | Directory moves: the duties that reconcile a moved tree before its move is committed |
+| `rules.rs` | Path rules: recorded or skipped, and why, from `info/exclude`, `info/attributes` and optionally tree rules |
+| `visibility.rs` | The sandbox overlay's visibility gate: which names it shows and where a new or moved name goes, decided from the rules alone |
+| `nested.rs` | Detects nested git repositories, including ones being created |
 | `non_empty.rs` | A list with at least one element by construction (`config::Remotes::Pushed`) |
 | `probe.rs` | Bounded, non-blocking reads of small workload files (`.gitignore`, `.git` files) during the synchronous step |
 | `paths.rs` | Repository-relative paths and the names git refuses to store |
-| `checks.rs` | git fsck rules and remote limits, checked at record time and again at commit (§3.4) |
-| `gitmodules.rs` | A port of git fsck's `.gitmodules` rules (§3.4) |
-| `fsync_class.rs` | The `fsync` class for databases: membership and groups (§8) |
-| `history.rs` | The bare history repository: records to commits with `Agentfs-*` trailers (§3.3, §3.4, §9) |
-| `fork/mod.rs` | Forked volumes: a volume started from another's latest commit that publishes one change for a receiver to gate (§11.5, §19.1 "Forked volumes") |
+| `checks.rs` | git fsck rules and remote limits, checked at record time and again at commit |
+| `gitmodules.rs` | A port of git fsck's `.gitmodules` rules |
+| `fsync_class.rs` | The `fsync` class for databases: membership and groups |
+| `history.rs` | The bare history repository: records to commits with `Agentfs-*` trailers |
+| `fork/mod.rs` | Forked volumes: a volume started from another's latest commit that publishes one change for a receiver to gate |
 | `fork/identity.rs` | A fork's identity, fixed at create (source, base, push target, link: linked or unlinked), and its ref names |
 | `fork/create.rs` | Creating a fork from a source's state area, without the source's lock or any credentials |
 | `fork/finish.rs` | The finisher: the change and finish commits, publishing to the fork remote, the single decider of a refused publish, the operator's abandon, and the fork status DeleteVolume reads |
-| `fork/listing.rs` | The published changes on a fork remote, each checked (fork name, finish trailers, change id, parent, tree), read in a receiver's repository with its own git (§11.5) |
-| `fork/deliver.rs` | Library delivery of a published change (§11.5 "Delivery"): the `Delivery` contract, its four methods (inbox, branch, command, webhook), the payload (schema 1) and the one factory that validates a method; never used by the CSI driver |
-| `fork/start.rs` | Starting a volume from a pinned commit of another worktree's branch on a remote (F8 R2), and the operator's `start accept` that saves an old-branch tip under the volume's own `accepted/*` refs |
-| `fork/receive.rs` | A local-only source receiving its fork's branch, change and finish refs into its own history, never applied (F8 R4) |
-| `identity.rs` | Committer and author identities from templates (§9) |
-| `service.rs` | The background loops: commit loop, one push loop per remote, repack (§3.4, §11.2) |
-| `push.rs` | Pushing the volume's own refs to each remote, with per-remote state and backoff (§11) |
+| `fork/listing.rs` | The published changes on a fork remote, each checked (fork name, finish trailers, change id, parent, tree), read in a receiver's repository with its own git |
+| `fork/deliver.rs` | Library delivery of a published change: the `Delivery` contract, its four methods (inbox, branch, command, webhook), the payload (schema 1) and the one factory that validates a method; never used by the CSI driver |
+| `fork/start.rs` | Starting a volume from a pinned commit of another worktree's branch on a remote, and the operator's `start accept` that saves an old-branch tip under the volume's own `accepted/*` refs |
+| `fork/receive.rs` | A local-only source receiving its fork's branch, change and finish refs into its own history, never applied |
+| `identity.rs` | Committer and author identities from templates |
+| `service.rs` | The background loops: commit loop, one push loop per remote, repack |
+| `push.rs` | Pushing the volume's own refs to each remote, with per-remote state and backoff |
 | `push/claim.rs` | The branch rule's pure deciders: `claim` (create or fast-forward, from the remote's value in the connection) and `start_branch_moved` (the start-branch alarm) |
-| `push/stop.rs` | A push thread's phase (idle, attempting, updating a local remote, finishing) under one lock, and cancelling it at shutdown: nothing is sent after the cancel, and a local push already updating the remote's pack and refs is waited for until it reports, never cut off (§11.2) |
-| `release.rs` | The one deletion decider: delete, keep or wait for a worktree, from its remotes mode, what each remote advertises, the journal's backlog, `onDelete` and a fork's status (F8 rule 3) |
-| `push_size.rs` | Measuring a push's git pack against `agentfsMaxPushSize` before connecting, and the first-parent step that fits (§11.3) |
-| `remote_auth.rs` | Credentials and host-key checks for one remote, shared by push and patch fetch, and the scope that hands an SSH remote to the transport (§11.1) |
-| `ssh_transport.rs` | `ssh` feature: agentfs's libgit2 subtransport for SSH URLs over russh: host key or certificate check before authentication, the key (decrypted) or ssh-agent identities, timeouts (§11.1) |
-| `remote_url.rs` | Pure URL helpers: transport, host, port, userinfo, SSH path, as libgit2 sees them (§11.1) |
-| `proxy.rs` | `http.proxy` and `remote.<name>.proxy`: parsing, and libgit2's proxy options (§11.1) |
-| `credentials.rs` | Credential, SSH key and passphrase files for remotes (§11.1) |
-| `known_hosts.rs` | OpenSSH known_hosts parsing and matching, and `@cert-authority` host certificate checks (§11.1) |
+| `push/stop.rs` | A push thread's phase (idle, attempting, updating a local remote, finishing) under one lock, and cancelling it at shutdown: nothing is sent after the cancel, and a local push already updating the remote's pack and refs is waited for until it reports, never cut off |
+| `release.rs` | The one deletion decider: delete, keep or wait for a worktree, from its remotes mode, what each remote advertises, the journal's backlog, `onDelete` and a fork's status |
+| `push_size.rs` | Measuring a push's git pack against `agentfsMaxPushSize` before connecting, and the first-parent step that fits |
+| `remote_auth.rs` | Credentials and host-key checks for one remote, shared by push and patch fetch, and the scope that hands an SSH remote to the transport |
+| `ssh_transport.rs` | `ssh` feature: agentfs's libgit2 subtransport for SSH URLs over russh: host key or certificate check before authentication, the key (decrypted) or ssh-agent identities, timeouts |
+| `remote_url.rs` | Pure URL helpers: transport, host, port, userinfo, SSH path, as libgit2 sees them |
+| `proxy.rs` | `http.proxy` and `remote.<name>.proxy`: parsing, and libgit2's proxy options |
+| `credentials.rs` | Credential, SSH key and passphrase files for remotes |
+| `known_hosts.rs` | OpenSSH known_hosts parsing and matching, and `@cert-authority` host certificate checks |
 | `watched.rs` | Files re-read when their stat stamp changes: credentials, keys, known_hosts |
-| `repack.rs` | Periodic `git repack --geometric=2` of the history (§8) |
-| `checkpoint.rs` | Checkpoints: one change-line commit per intent (`refs/agentfs/<volume>/change-line`), with the head's tree and the patches landed since as parents, merged back into the branch by a two-parent marker (§19.2 item 11) |
-| `git_cli.rs` | Running the `git` program on a state area's git directory, in an environment of its own: the one home for `repack.rs` and the patch merge (§8, §12, §17.3) |
-| `command.rs` | Running an operator's program without a shell: `PATH` only, its own process group killed at the deadline, input on stdin; the one runner of fork delivery's command method and the `patch-accept` hook (§11.5, §12) |
-| `restore.rs` | Restore and revert: plan from history, check, apply to a tree (§15) |
-| `confined.rs` | `openat2`-confined access to the tree for restores (§6, §15) |
-| `operations.rs` | Restores and reverts in progress: their writes become one operation commit (§15) |
-| `file_lock.rs` | `FileLock`, the one way agentfs takes an advisory file lock (`flock`, shared or exclusive, waiting or not), unlocked before its file is closed so a child process still sharing the file cannot hold it on; `clippy.toml` disallows the lock calls elsewhere (§2.2) |
-| `lock.rs` | The state-area lock, an `flock` on `meta/lock`, taken only on a filesystem whose locks keep other nodes out (§2.3) |
-| `shared_fs.rs` | Which filesystems a state area may live on: refuses NFS below 4.1, `nolock` and `local_lock` other than `none` whenever the lock is taken (§2.3); tells a network filesystem from a node's own disk for agentfs-csi's base path (§14.2) |
+| `repack.rs` | Periodic `git repack --geometric=2` of the history |
+| `checkpoint.rs` | Checkpoints: one change-line commit per intent (`refs/agentfs/<volume>/change-line`), with the head's tree and the patches landed since as parents, merged back into the branch by a two-parent marker |
+| `git_cli.rs` | Running the `git` program on a state area's git directory, in an environment of its own: the one home for `repack.rs` and the patch merge |
+| `command.rs` | Running an operator's program without a shell: `PATH` only, its own process group killed at the deadline, input on stdin; the one runner of fork delivery's command method and the `patch-accept` hook |
+| `restore.rs` | Restore and revert: plan from history, check, apply to a tree |
+| `confined.rs` | `openat2`-confined access to the tree for restores |
+| `operations.rs` | Restores and reverts in progress: their writes become one operation commit |
+| `file_lock.rs` | `FileLock`, the one way agentfs takes an advisory file lock (`flock`, shared or exclusive, waiting or not), unlocked before its file is closed so a child process still sharing the file cannot hold it on; `clippy.toml` disallows the lock calls elsewhere |
+| `lock.rs` | The state-area lock, an `flock` on `meta/lock`, taken only on a filesystem whose locks keep other nodes out |
+| `shared_fs.rs` | Which filesystems a state area may live on: refuses NFS below 4.1, `nolock` and `local_lock` other than `none` whenever the lock is taken; tells a network filesystem from a node's own disk for agentfs-csi's base path |
 | `mountinfo.rs` | The one parser of `/proc/self/mountinfo`: device, root, mount point, fstype, source and super options of each mount, and the mount holding a path |
 | `local_socket.rs` | Unix sockets in the state area with peer-credential checks, for the control socket and the history service |
-| `listening_socket.rs` | `Listener`, the one way agentfs listens on a Unix socket (control socket, history service, agentfs-csi), shut down (`SHUT_RDWR`) when stopped or dropped so a child process still sharing it cannot take connections no one answers; `clippy.toml` disallows raw listener construction elsewhere (§2.2) |
+| `listening_socket.rs` | `Listener`, the one way agentfs listens on a Unix socket (control socket, history service, agentfs-csi), shut down (`SHUT_RDWR`) when stopped or dropped so a child process still sharing it cannot take connections no one answers; `clippy.toml` disallows raw listener construction elsewhere |
 | `fsutil.rs` | Small helpers for the state files under `<state>/meta` |
-| `config.rs` | Operator settings from the history repository's own git config, and `config::KEYS` (§4.3, §11.1) |
-| `events.rs` | Alarm and event signals, handed to a non-blocking sink (§13) |
-| `failpoints.rs` | Named failpoints on the durable path, acting only in test builds with the `failpoints` feature ([crash model](#crash-model), §18 test 3) |
-| `telemetry.rs` | OpenTelemetry instruments and spans over the API only; the binary picks exporters (§13) |
-| `history_service/mod.rs` | One history service per volume fed by fronts (§14) |
-| `history_service/wire.rs` | The gRPC contract `agentfs.history.v2` (generated from `proto/`) and its validated conversions to agentfs types (§14) |
+| `config.rs` | Operator settings from the history repository's own git config, and `config::KEYS` |
+| `events.rs` | Alarm and event signals, handed to a non-blocking sink |
+| `failpoints.rs` | Named failpoints on the durable path, acting only in test builds with the `failpoints` feature ([crash model](#crash-model)) |
+| `telemetry.rs` | OpenTelemetry instruments and spans over the API only; the binary picks exporters |
+| `history_service/mod.rs` | One history service per volume fed by fronts |
+| `history_service/wire.rs` | The gRPC contract `agentfs.history.v2` (generated from `proto/`) and its validated conversions to agentfs types |
 | `history_service/bridge.rs` | Synchronous callers on a tokio runtime (Tokio's bridging pattern): multi-thread, or current-thread driven by its callers; for the client and the server |
 | `history_service/server.rs` | The service's socket: tonic, per-connection admission by `Hello` (peer credentials, lease, identity) within a deadline, `grpc.health.v1`; `Recorder` calls off the runtime's workers |
-| `history_service/client.rs` | A front's HTTP/2 connections to the service: multiplexed calls driven by the calling threads, and the listening stream's; deadlines on every call, never resends (§3.5) |
-| `history_service/lease.rs` | A front's `flock` lease on its pending slot (§2.2, §14) |
-| `history_service/listener.rs` | A front's listening stream: answers the service's settle, open-for-writing and invalidate calls (§14.1, §15) |
-| `history_service/fronts.rs` | The service's links to listening fronts, called to serve live restores (§14.1, §15) |
-| `lfs/mod.rs` | Git LFS (§7): large content as LFS objects with pointer blobs in history |
+| `history_service/client.rs` | A front's HTTP/2 connections to the service: multiplexed calls driven by the calling threads, and the listening stream's; deadlines on every call, never resends |
+| `history_service/lease.rs` | A front's `flock` lease on its pending slot |
+| `history_service/listener.rs` | A front's listening stream: answers the service's settle, open-for-writing and invalidate calls |
+| `history_service/fronts.rs` | The service's links to listening fronts, called to serve live restores |
+| `lfs/mod.rs` | Git LFS: large content as LFS objects with pointer blobs in history |
 | `lfs/pointer.rs` | The canonical LFS pointer format |
-| `lfs/policy.rs` | Which store a recorded file goes to: blob or LFS (§7, §4.2) |
+| `lfs/policy.rs` | Which store a recorded file goes to: blob or LFS |
 | `lfs/attributes.rs` | The managed `filter=lfs` block in the root `.gitattributes`, in history only |
 | `lfs/cache.rs` | The local LFS object cache, `<state>/lfs/objects` |
 | `lfs/endpoint.rs` | Each remote's LFS endpoint and credentials, in git-lfs's precedence |
@@ -123,7 +125,7 @@ missing from these tables or a row names a module that no longer exists;
 | `lfs/upload.rs` | Which LFS objects a push must upload first |
 | `lfs/fetch.rs` | LFS objects for restores and `agentfs lfs fetch`: cache first, then the remotes |
 | `lfs/fake.rs` | An in-process LFS server for tests |
-| `patch/mod.rs` | The patch queue for iac (§12) |
+| `patch/mod.rs` | The patch queue for iac |
 | `patch/attached.rs` | Whether a workload may be attached when a daemon starts, so the queue waits: the mount's attached mark (`meta/attached.json`), the pod scope it records (`PodScope`, from mountinfo) and the judgement of a start (`judge`: another pod's mark lands, anything else defers with a reason) |
 | `patch/admit.rs` | `serve-git`'s pushers and their rights, and admitting a push whole before git keeps it |
 | `patch/accept.rs` | Acceptance rules: whether a cleanly merged patch may land (clean merge, approval, the `patch-accept` hook) |
@@ -138,25 +140,25 @@ missing from these tables or a row names a module that no longer exists;
 
 | Module | Role |
 |---|---|
-| `tree_view.rs` | Main/sandbox FUSE views over one target-model actor: direct I/O, saved-reader snapshots, byte-call writes, and the kernel's page fills, page writes and invalidations for shared mappings (R1.4) |
+| `tree_view.rs` | Main/sandbox FUSE views over one target-model actor: direct I/O, saved-reader snapshots, byte-call writes, and the kernel's page fills, page writes and invalidations for shared mappings (rules ledger, R1.4) |
 | `lib.rs` | Crate root and overview |
 | `ops.rs` | Every filesystem operation without the kernel, unit-tested against a real directory and state area |
 | `fuse.rs` | The kernel adapter: `fuser::Filesystem` over `Ops`, and kernel passthrough negotiation |
 | `session.rs` | What one FUSE session serves: the `Operations` trait that `fuse.rs` calls, implemented by `Ops` and by the overlay |
-| `overlay.rs` | The sandbox overlay's session: the visibility gate and the view owner in front of the shared `Ops` (§1.1, §6) |
-| `overlay/tmp.rs` | The sandbox overlay's tmp layer: files a sandbox creates under names the rules skip, private to the overlay, in a store of the state area, moved into the tree by rename (§1.1) |
-| `invalidate.rs` | Kernel cache coherence across a daemon's FUSE sessions: each session reports the changes it served (`Coherent`), and a worker thread sends them to the other sessions' kernels (`Invalidator`, §17.1) |
-| `access.rs` | Mode-bit permission checks, as the kernel's `generic_permission` decides them (§6) |
-| `boundary.rs` | Recording a change boundary: builds the inputs and calls the recorder, or a front's client (§3.1, §3.2, §3.5) |
-| `creds.rs` | Creating as the caller: a worker thread's filesystem uid, gid and groups switched for one system call (§6) |
+| `overlay.rs` | The sandbox overlay's session: the visibility gate and the view owner in front of the shared `Ops` |
+| `overlay/tmp.rs` | The sandbox overlay's tmp layer: files a sandbox creates under names the rules skip, private to the overlay, in a store of the state area, moved into the tree by rename |
+| `invalidate.rs` | Kernel cache coherence across a daemon's FUSE sessions: each session reports the changes it served (`Coherent`), and a worker thread sends them to the other sessions' kernels (`Invalidator`) |
+| `access.rs` | Mode-bit permission checks, as the kernel's `generic_permission` decides them |
+| `boundary.rs` | Recording a change boundary: builds the inputs and calls the recorder, or a front's client |
+| `creds.rs` | Creating as the caller: a worker thread's filesystem uid, gid and groups switched for one system call |
 | `dirty.rs` | Whether an inode changed since it was last recorded, so clean closes record nothing |
 | `inodes.rs` | The inode table: FUSE node ids, backing inodes and their paths |
-| `names.rs` | What a path in the mount is, for recording (§5) |
-| `views.rs` | Where workloads see the mount: the mount point, its bind mounts (mountinfo read through `agentfs_core::mountinfo`), `--workload-mount` (§5) |
-| `backing.rs` | Confined access to the backing tree (§2.1, §6) |
-| `groups.rs` | fsync-class groups: holding writes while a group is captured, and scheduling captures (§8) |
-| `sweep.rs` | The periodic sweep: files held open, failed records, the fsync-class timer (§3.1, §3.5) |
-| `privileges.rs` | What the daemon may do as the caller or as itself (§6) |
+| `names.rs` | What a path in the mount is, for recording |
+| `views.rs` | Where workloads see the mount: the mount point, its bind mounts (mountinfo read through `agentfs_core::mountinfo`), `--workload-mount` |
+| `backing.rs` | Confined access to the backing tree |
+| `groups.rs` | fsync-class groups: holding writes while a group is captured, and scheduling captures |
+| `sweep.rs` | The periodic sweep: files held open, failed records, the fsync-class timer |
+| `privileges.rs` | What the daemon may do as the caller or as itself |
 | `mount.rs` | Layout checks, mounting (also stacked over a stale mount, for `--on-stale-mount recover`), unmounting, detaching stale layers, and the mount state at a path (mountinfo read through `agentfs_core::mountinfo`) |
 
 ### `agentfs`
@@ -166,20 +168,20 @@ missing from these tables or a row names a module that no longer exists;
 | `trees_cmd.rs` | `trees init`, `fork` and `mount` composition root; separate state format |
 | `main.rs` | The CLI (`Cli`), command dispatch, `init`, `status`, `record`, `flush`, `push` (direct), `run` and `mount` |
 | `daemon.rs` | Signals and shutdown for `run` and `mount` |
-| `front.rs` | `mount --history-service`: a front of a history service (§14) |
-| `serve_history.rs` | `agentfs serve-history`: the history service of a volume (§14) |
+| `front.rs` | `mount --history-service`: a front of a history service |
+| `serve_history.rs` | `agentfs serve-history`: the history service of a volume |
 | `serve_git.rs` | `agentfs serve-git`: the history repository as a git server for patch pushes (`git http-backend` behind an HTTP server), and its `pre-receive` and `post-receive` hooks |
 | `hold.rs` | `mount --on-stale-mount hold`: a restarted sidecar waiting out a stale mount (`recover`, which mounts over it, is in `main.rs`) |
-| `control.rs` | The control socket of a running daemon (`mount`, `run`, `serve-history`), through which `push`, `restore` and `revert` act (§2.2, §2.3, §15) |
-| `push_now.rs` | `agentfs push` through a running daemon: the daemon's handler and the client (§2.3, §11.2) |
-| `recovery.rs` | `agentfs restore` and `agentfs revert`, through a mount, through the history service, or directly (§15) |
-| `patch_cmd.rs` | `agentfs patch` and the mount's patch phase (§12) |
-| `checkpoint_cmd.rs` | `agentfs checkpoint`: through a running daemon's control socket (its commit loop cuts it), else under the state-area lock (§19.2 item 11) |
-| `fork_cmd.rs` | `agentfs fork create`, `finish` (`--retry`), `status`, `abandon`, `list` and `deliver` (§11.5) |
-| `start_cmd.rs` | `agentfs start accept --tip`: a started volume's answer to the start-branch alarm (§11.3) |
-| `lfs_cmd.rs` | `agentfs lfs`: fetching objects into the local LFS cache, and pruning it (§7) |
-| `otel.rs` | Telemetry export: the OpenTelemetry SDK, exporters (http/protobuf, http/json, gRPC on its own runtime) and the environment it reads (§13) |
-| `otel/tls.rs` | The `otlp-tls` feature: TLS to the collector (CA bundle or system store, client certificate) for the HTTP and gRPC exporters (§13) |
+| `control.rs` | The control socket of a running daemon (`mount`, `run`, `serve-history`), through which `push`, `restore` and `revert` act |
+| `push_now.rs` | `agentfs push` through a running daemon: the daemon's handler and the client |
+| `recovery.rs` | `agentfs restore` and `agentfs revert`, through a mount, through the history service, or directly |
+| `patch_cmd.rs` | `agentfs patch` and the mount's patch phase |
+| `checkpoint_cmd.rs` | `agentfs checkpoint`: through a running daemon's control socket (its commit loop cuts it), else under the state-area lock |
+| `fork_cmd.rs` | `agentfs fork create`, `finish` (`--retry`), `status`, `abandon`, `list` and `deliver` |
+| `start_cmd.rs` | `agentfs start accept --tip`: a started volume's answer to the start-branch alarm |
+| `lfs_cmd.rs` | `agentfs lfs`: fetching objects into the local LFS cache, and pruning it |
+| `otel.rs` | Telemetry export: the OpenTelemetry SDK, exporters (http/protobuf, http/json, gRPC on its own runtime) and the environment it reads |
+| `otel/tls.rs` | The `otlp-tls` feature: TLS to the collector (CA bundle or system store, client certificate) for the HTTP and gRPC exporters |
 | `doc_tables.rs` | Test only: a small markdown reader for the documentation tests |
 | `reference_tests.rs` | Test only: checks docs/configuration.md against the CLI's flags and variables |
 
@@ -206,7 +208,7 @@ missing from these tables or a row names a module that no longer exists;
 | `node.rs` | The Node service: validates calls and hands them to the supervisor; this node's topology |
 | `supervisor.rs` | One `serve-history` per staged volume and one front per pod, restarted when they crash; NodeStage never creates a worktree; a finished fork published read-only |
 | `launcher.rs` | Starting the `agentfs` children |
-| `release_scan.rs` | The release scan: one `agentfs flush` per worktree no pod stages whose journal holds records history lacks, then one `agentfs push` until it exits 0 at the head and remotes, with backoff; one `agentfs fork finish` per fork whose deletion asked for it, skipping refused and abandoned forks (§11.5, §14.2) |
+| `release_scan.rs` | The release scan: one `agentfs flush` per worktree no pod stages whose journal holds records history lacks, then one `agentfs push` until it exits 0 at the head and remotes, with backoff; one `agentfs fork finish` per fork whose deletion asked for it, skipping refused and abandoned forks |
 | `mounter.rs` | The node plugin's mount operations: bind mounts onto the kubelet's targets |
 | `params.rs` | StorageClass and PersistentVolume parameters |
 | `volume.rs` | Worktrees on this node's disk: creating one (empty, started, a fork), adopting a static PV over its worktree |
@@ -220,7 +222,7 @@ missing from these tables or a row names a module that no longer exists;
 
 What happens before a change boundary's call (`close` after a write,
 `unlink`, `rename`, `fsync` in the fsync class, ...) returns to the
-workload (§3.1, §3.2). Its cost is measured in
+workload. Its cost is measured in
 [performance.md](performance.md).
 
 ```text
@@ -229,7 +231,7 @@ workload ── close(2) ──▶ kernel FUSE ──▶ fuse.rs ──▶ ops.r
                                                      ▼
                                                boundary.rs
                                                      │
-                       ┌─────────── single process ──┴── front (§14) ──────────────┐
+                       ┌─────────── single process ──┴── front ──────────────┐
                        ▼                                                           ▼
           volume.rs Recorder::record                                 volume.rs Recorder (front)
             claims.rs   claim the paths                                rules.rs, checks.rs
@@ -245,7 +247,7 @@ workload ── close(2) ──▶ kernel FUSE ──▶ fuse.rs ──▶ ops.r
                                         the call returns to the workload
 ```
 
-A record that cannot be made durable fails the call with `EIO` (§3.5); a
+A record that cannot be made durable fails the call with `EIO`; a
 path the rules skip returns at once with nothing frozen.
 
 ### After the call returns
@@ -283,7 +285,7 @@ record in-process.
 ### The push loop
 
 One loop per remote (`service.rs`), every `pushInterval`, with backoff
-after failures (§11.2). Each attempt (`push.rs`, `push_once`), in this
+after failures. Each attempt (`push.rs`, `push_once`), in this
 order:
 
 1. takes the remote's push lock (a repack waits a second and tries again
@@ -293,11 +295,11 @@ order:
    (`push_size.rs`) before connecting: over the limit, only the longest
    first-parent step that fits is pushed below (branch only, its LFS
    objects, applied refs held), and a single commit over it fails as
-   `too_large` (§11.3);
+   `too_large`;
 2. **LFS objects first** (`lfs/upload.rs`, `lfs/client.rs`): every
    object referenced at a managed path by a commit the remote lacks is
    uploaded through the batch API before any ref, so a ref never reaches
-   the remote ahead of its objects (§7), up to `lfs.concurrenttransfers`
+   the remote ahead of its objects, up to `lfs.concurrenttransfers`
    at once (`lfs/pool.rs`), with objects over the remote's
    `agentfsMaxLfsObjectSize` refused first. A failure ends the attempt at
    stage `lfs` with no ref pushed. The remote's proxy (`proxy.rs`), if
@@ -306,12 +308,12 @@ order:
    refs, never forced. In libgit2's push negotiation, from the branch's
    old value in that connection, `push/claim.rs` decides: the branch is
    created or fast-forwarded only; one another worktree wrote stops the
-   push before anything is sent, and is a divergence (§11.3, F8 rule 2).
+   push before anything is sent, and is a divergence.
    The push state records the last pushed commit. For a started volume
    pushing to its start remote, the start branch is listed first and
-   `start_branch_moved` raises the start-branch alarm (§11.3);
+   `start_branch_moved` raises the start-branch alarm;
 4. **the queue**, for the patch remote only and after every branch
-   attempt, failed or not (§12): the status ref (forced, a snapshot) and,
+   attempt, failed or not: the status ref (forced, a snapshot) and,
    only when the branch push worked, the `applied/<n>` refs; then, once
    those are on the remote, the deletion of each applied `inbox/<n>`,
    leased on the oid listed. Its failures never count against the branch.
@@ -329,9 +331,8 @@ signal exits at once with status 130, which the journal makes safe. For
    abandoned, and their later changes are not recorded;
 3. the sweep and the fsync-class timer stop; a final sweep records every
    armed inode with a handle still open and retries the repair queue,
-   and every changed fsync-class group is captured (§3.1, §8);
-4. paths still unrepaired are saved in `meta/repairs` and listed on exit
-   (§3.5);
+   and every changed fsync-class group is captured;
+4. paths still unrepaired are saved in `meta/repairs` and listed on exit;
 5. the commit loop stops after a final commit of everything journaled
    (exit status 1 if it fails: the records stay journaled for the next
    open);
@@ -341,14 +342,40 @@ signal exits at once with status 130, which the journal makes safe. For
    one still running is abandoned on its thread, unless it is updating a
    local remote's pack and refs, which is waited for up to
    `LOCAL_UPDATE_CAP`, and `--push-grace 0s` skips the final push. `run` and
-   `serve-history` stop the same way (`Service::shutdown`, §11.2), so the
+   `serve-history` stop the same way (`Service::shutdown`), so the
    last commit before a stop reaches the remotes when they answer in
    time, and otherwise goes out on the next start.
 
+## Technology choices
+
+Each choice is the right technology for its job. agentfs uses libgit2
+through `git2` and its own LFS, HTTP and SSH clients, and runs the `git`
+program where git does the job better.
+
+| Need | Choice | Why |
+|---|---|---|
+| FUSE | `fuser` 0.18, vendored with the upstream `FUSE_TMPFILE` dispatch backport | Multi-threaded dispatch with cloned fds and passthrough (`BackingId`). Its default features are pure Rust: `mount(2)` as root, `fusermount3` otherwise, no libfuse. The backport exposes anonymous file creation; provenance is in `vendor/fuser/AGENTFS-PATCH.md`. It sends the attribute inode number as the node id, so `st_ino` is the node id |
+| Git objects, commits, push, credentials | `git2` (libgit2) | It has no filter or merge-driver registration, and its fsync option is only reachable through `libgit2-sys` |
+| TLS and SSH transports | `git2`'s `https` feature (OpenSSL) behind agentfs's `https` cargo feature. For SSH, agentfs's own libgit2 subtransport over `russh` (ring and the pure-Rust `rsa` crate), with libgit2 built without libssh2 | `https` is a C library, so it is feature-gated and default builds stay free of OpenSSL. `ssh` needs no OpenSSL or libssh2 (`ci/check-deps.sh` checks), and russh gives the transport the host key before authentication, a host key algorithm preference and host certificates, which libssh2 cannot negotiate. The `rsa` crate has a timing side-channel advisory on private-key operations: Ed25519 keys are recommended |
+| SSH host keys | agentfs's own known_hosts parser over `base64` and `sha1_smol` | Pure Rust. The transport checks host keys with it before any authentication and never reads `~/.ssh` |
+| Ignore and attribute rules | `gix-ignore`, `gix-attributes` | Pure Rust, fed only buffers agentfs reads itself, so nothing global can leak in. libgit2's rules cannot do this: it always loads every working-tree `.gitignore` on the path, merges every source by git's precedence without saying which file an attribute came from, takes `core.excludesFile` from the merged system and global config, and `git2::Repository` is not `Sync`. gitoxide has no push, so it does not replace `git2` |
+| LFS | agentfs's own client over `ureq` 3 and `sha2` | No LFS client library exists. `ureq` is pure Rust with no TLS by default and proxies through its built-in `CONNECT` support. The `https` feature adds its `native-tls` (OpenSSL). agentfs builds `ureq`'s connector chain itself, through `ureq`'s `unversioned::transport` API, which is outside its semver promise: a `ureq` upgrade must check the chain against `ureq`'s `DefaultConnector`. The reason is that `ureq`'s TCP transport fails a read that returns `EINTR`, and Linux never restarts such a read after a signal |
+| Telemetry | `opentelemetry` (API) in the core; `opentelemetry_sdk` and `opentelemetry-otlp` in the binary, with `tokio` (one worker, started only for gRPC). The `otlp-tls` feature adds rustls (ring) | OTLP http/protobuf, http/json and gRPC. The default build is pure Rust with no OpenSSL, ring, aws-lc, cmake or protoc. `otlp-tls` adds ring only. `ci/check-deps.sh` checks both |
+| Patch pushes to agentfs | `agentfs serve-git`: git's own `git http-backend` behind `tiny_http` | git's server is the prior art for serving git: receive-pack's quarantine and `pre-receive` give "admit before keeping", and `transfer.hideRefs` limits visible refs (names only). `tiny_http` over `hyper`: the binary has no async runtime outside OTLP gRPC, and a request is a CGI run. Plain HTTP, with TLS left to a fronting proxy. Only the smart endpoints are routed, since dumb HTTP would hand out every object |
+| Patch submission | the producer's `git` CLI (`ls-remote`, `fetch`, `commit-tree`, `push --force-with-lease`) | It runs with the producer's own credentials and config, and the lease makes a number create-only |
+| Tree actor | the `git` program for objects, the copy of the refs and private caches; serde and CRC32 for the journal; histogram alignment and a line and name referee in the core | The journal is the commit point for pointer steps, so refs are a copy in git's files format that libgit2 can also open. The `git` program stays where it does the job: `rev-list --missing=print` checks each tip at recovery, and loose objects are fsynced under `core.fsync=objects,derived-metadata`. agentfs writes `config` and `HEAD` itself, because git's `config` rename has no fsync. Every git child on the actor's path starts at one counted site (`git_cli::counted`) |
+| Line identity | `agentfs-align`: git's histogram diff, called one way | The library and the model use the same call, so line identity does not depend on how `git` is called. The release of `git` still decides what a diff answers, so one release is pinned (`ci/git-release`) |
+| Repack | the `git` CLI (`git repack --geometric=2`, git 2.32 or later) | libgit2 has no repack or gc. The commit loop runs it with system and global config off |
+| Patch merge | the `git` CLI: `git merge-tree --write-tree --merge-base` (git 2.40 or later), merge drivers from `$GIT_DIR/info/attributes` and `merge.<name>.driver`; mergiraf in the image | libgit2 cannot register merge drivers, so git merges. `rebase` lands as one commit like `merge`, since N commits would need N records and break "held whole" on a crash between them. Before merging, each configured driver's first word must be an executable, else the patch is not judged, because git reads a driver that cannot run as a conflict. mergiraf is a syntax-aware merge driver run as its own program and never linked; the image installs a checksummed static binary, with its licence and source location in `/usr/share/doc/mergiraf` |
+| Container image | `debian:trixie-slim` with `fuse3`, `libssl3t64`, `ca-certificates`, `git`, `tini` and `mergiraf`; both build and base images pinned by digest. Ships `agentfs` and `agentfs-csi` | Not distroless: the daemon runs `git repack`, and operators follow the runbooks with `git` through `kubectl exec`. `tini` is a subreaper, since the node plugin shares the host's pid namespace. It runs as root. `linux/amd64` only |
+| Front and CSI gRPC | `tonic` and `prost`, on `tokio`. The front's client is `hyper`'s HTTP/2 over the Unix socket | A request `hyper` hands back unsent is known never to have left, which tonic's `channel` would hide. No TLS: the sockets are node-local. `ci/check-deps.sh` checks the default build links no ring or rustls |
+| gRPC codegen | `protox` and `tonic-prost-build` in `build.rs` | A pure-Rust protobuf compiler: no `protoc` on build hosts or in the image |
+| CSI spec | `csi.proto` v1.13.0, vendored in `crates/agentfs-csi/proto` | Pinned by copy; updating it is a deliberate change |
+| CSI sidecars | csi-provisioner (`--node-deployment`, in the node plugin pod), csi-node-driver-registrar and livenessprobe from `registry.k8s.io/sig-storage` | Pinned by digest in `deploy/csi/kustomization.yaml` |
+
 ## Crash model
 
-What a crash at each point leaves, and what the next open does (§3.3,
-§15). "Returned" means the workload's call returned success.
+What a crash at each point leaves, and what the next open does. "Returned" means the workload's call returned success.
 
 | Crash during | State left | On the next open | Failpoint |
 |---|---|---|---|
@@ -356,32 +383,32 @@ What a crash at each point leaves, and what the next open does (§3.3,
 | The journal append or its `fsync` | A torn final frame | Fails its checksum and is discarded; the call never returned | `journal.before_fsync` |
 | After the journal `fsync` (call returned) | A durable record and its frozen copy | Replayed: committed by the next commit loop. Records hold absolute state, so replaying twice gives the same tree | `journal.after_fsync`, `record.after_journal`, `fuse.after_record` |
 | A commit, before the branch ref moves | Loose objects only | The records are still uncommitted and are committed again; the objects are reused or left for gc | `lfs.after_cache_insert`, `commit.after_tree`, `commit.sync_objects`, `commit.after_object` |
-| A commit, inside the branch ref update (libgit2 writes `<ref>.lock`, then renames it) | Maybe `refs/heads/agentfs/<volume>.lock` | Ref lock files are removed at open, with a warning (design §3.3); the records are committed again | none (the power-loss workflow, design §18) |
+| A commit, inside the branch ref update (libgit2 writes `<ref>.lock`, then renames it) | Maybe `refs/heads/agentfs/<volume>.lock` | Ref lock files are removed at open, with a warning (see [recording](recording.md)); the records are committed again | none (the power-loss workflow) |
 | After the branch ref moves | The commit's `Agentfs-Seq` names its last record | Records up to that sequence are dropped from the journal and their frozen copies removed | `commit.after_ref`, `commit.after_sync`, `journal.truncate.after_tmp`, `journal.truncate.after_rename`, `commit.before_pending_remove`, `pending.remove.between` |
-| A push | The remote either has the new ref or not; pushes are never forced | The push loop pushes again at start; a push that already landed changes nothing the second time (§11.2) | `push.after_remote_update`, `state.json.before_rename` |
-| A front's process (§14) | Its leased slot's frozen copies; maybe a request in flight | The kernel releases the lease. A request that may have been journaled is never resent; the boundary failed with `EIO`. A restarted front passes its old slot to drain it | `front.after_reply` |
+| A push | The remote either has the new ref or not; pushes are never forced | The push loop pushes again at start; a push that already landed changes nothing the second time | `push.after_remote_update`, `state.json.before_rename` |
+| A front's process | Its leased slot's frozen copies; maybe a request in flight | The kernel releases the lease. A request that may have been journaled is never resent; the boundary failed with `EIO`. A restarted front passes its old slot to drain it | `front.after_reply` |
 | The history service | Fronts' requests fail with `EIO` until it is back | The service reopens the volume as above; fronts reconnect | `service.after_record` |
-| A restore | Some paths written, each recorded as an ordinary boundary | The partial apply is recorded and committed; re-running the restore finishes the job (§15) | none |
-| A push, after the LFS upload and before the ref push | Objects on the LFS server that no pushed ref references yet | The next attempt computes the objects again from the commits the remote lacks; the batch API skips those the server already has (§7) | `push.after_lfs_upload` |
-| A push that found the branch diverged, after naming the ref the local head is saved as (§11.3) | The name in the push state as `pending_ref`; maybe the ref on the remote | The next attempt pushes the same name again (a no-op or a fast-forward), so the head is saved once, never under a second name | `push.diverged.after_pending`, `push.diverged.after_ref` |
-| A push, between the branch push and the queue push | The branch on the remote; the queue refs as they were | The queue push follows the next attempt. Inbox refs are deleted only after their applied refs are on the remote, so the highest inbox number there never goes down (§11.3, §12) | none |
-| A repack (`repack.rs`; also a stop, which kills it) | git writes new packs before it deletes old ones, so every object is still in some pack or loose; maybe a temporary pack file | Nothing to do: the next round repacks again and ignores the temporary file. A repack never prunes, so nothing the journal or a ref needs is lost (§8) | `repack.running` |
-| The patch phase at mount, after a patch's tree write and before its record (`patch/queue.rs`) | The backing tree holds the patch's content; history does not; `meta/patch.json` names the patch in flight | The next run's check finds those paths already written and records them as the patch. If the producer replaced or withdrew the patch meanwhile, the paths are put back to the branch head's state first (§12) | `patch.after_tree_write` |
-| The patch phase, after the record and before its commit | A journaled patch record | Journal replay commits it with its `Agentfs-Inbox` trailer, and the trailer scan finds it applied; it is never applied twice (§12) | `patch.after_record` |
-| The patch phase, after the commit and before the ref moves | The commit on the branch; `inbox/<n>` still there, no `applied/<n>` | The next run finds the commit by its trailers and finishes the ref moves (`applied/<n>` set, `inbox/<n>` deleted): what is applied is decided by the branch, never by refs (§12) | `patch.after_commit`, `queue.after_status` |
-| A namespace record that failed (`EIO`), with paths on the repair queue | `meta/repairs`, rewritten whenever the queue changes (`meta/fronts/slot-N.repairs` for a front) | The next mount (or the front reusing the slot) re-derives each path's absolute state from the backing tree and records it before it serves any request; a queue left in the temporary file (a crash before its rename) is loaded too (§3.5) | `repairs.before_rename` |
-| The daemon of a mount in a pod (§17.1) | A stale FUSE mount: the workload's calls fail with `ENOTCONN`, never reaching the bare directory beneath | The kubelet restarts the sidecar, which runs `mount --on-stale-mount recover`: it takes the lock, replays the journal and bind-stacks a new mount over the stale one, which propagation carries into the workload containers; at its stop it detaches the stale layers. With `hold` it mounts nothing and the pod is restarted by hand ([runbook](runbooks/crashed-sidecar.md)) | none |
-| A CSI front or service (§14.2) | A stale mount at the pod's target, or fronts failing with `EIO` | The supervisor restarts it with backoff (1 s to 30 s): a front in its predecessor's slot, its new mount bind-stacked over the stale target; a service replays its journal | none |
-| The CSI node plugin (deleted, upgraded or crashed) | Its children stop with it (with final commits when it is stopped gracefully); the staged and published records on the hostPath | Reconcile at plugin start: services for staged volumes (journal replay), fronts recovered for targets whose mount is still there, live or stale; targets the kubelet removed are forgotten. Containers that mount with `HostToContainer` see the new mount; others after a container restart (§14.2, [runbook](runbooks/csi-recovery.md)) | none |
+| A restore | Some paths written, each recorded as an ordinary boundary | The partial apply is recorded and committed; re-running the restore finishes the job | none |
+| A push, after the LFS upload and before the ref push | Objects on the LFS server that no pushed ref references yet | The next attempt computes the objects again from the commits the remote lacks; the batch API skips those the server already has | `push.after_lfs_upload` |
+| A push that found the branch diverged, after naming the ref the local head is saved as | The name in the push state as `pending_ref`; maybe the ref on the remote | The next attempt pushes the same name again (a no-op or a fast-forward), so the head is saved once, never under a second name | `push.diverged.after_pending`, `push.diverged.after_ref` |
+| A push, between the branch push and the queue push | The branch on the remote; the queue refs as they were | The queue push follows the next attempt. Inbox refs are deleted only after their applied refs are on the remote, so the highest inbox number there never goes down | none |
+| A repack (`repack.rs`; also a stop, which kills it) | git writes new packs before it deletes old ones, so every object is still in some pack or loose; maybe a temporary pack file | Nothing to do: the next round repacks again and ignores the temporary file. A repack never prunes, so nothing the journal or a ref needs is lost | `repack.running` |
+| The patch phase at mount, after a patch's tree write and before its record (`patch/queue.rs`) | The backing tree holds the patch's content; history does not; `meta/patch.json` names the patch in flight | The next run's check finds those paths already written and records them as the patch. If the producer replaced or withdrew the patch meanwhile, the paths are put back to the branch head's state first | `patch.after_tree_write` |
+| The patch phase, after the record and before its commit | A journaled patch record | Journal replay commits it with its `Agentfs-Inbox` trailer, and the trailer scan finds it applied; it is never applied twice | `patch.after_record` |
+| The patch phase, after the commit and before the ref moves | The commit on the branch; `inbox/<n>` still there, no `applied/<n>` | The next run finds the commit by its trailers and finishes the ref moves (`applied/<n>` set, `inbox/<n>` deleted): what is applied is decided by the branch, never by refs | `patch.after_commit`, `queue.after_status` |
+| A namespace record that failed (`EIO`), with paths on the repair queue | `meta/repairs`, rewritten whenever the queue changes (`meta/fronts/slot-N.repairs` for a front) | The next mount (or the front reusing the slot) re-derives each path's absolute state from the backing tree and records it before it serves any request; a queue left in the temporary file (a crash before its rename) is loaded too | `repairs.before_rename` |
+| The daemon of a mount in a pod | A stale FUSE mount: the workload's calls fail with `ENOTCONN`, never reaching the bare directory beneath | The kubelet restarts the sidecar, which runs `mount --on-stale-mount recover`: it takes the lock, replays the journal and bind-stacks a new mount over the stale one, which propagation carries into the workload containers; at its stop it detaches the stale layers. With `hold` it mounts nothing and the pod is restarted by hand ([runbook](runbooks/crashed-sidecar.md)) | none |
+| A CSI front or service | A stale mount at the pod's target, or fronts failing with `EIO` | The supervisor restarts it with backoff (1 s to 30 s): a front in its predecessor's slot, its new mount bind-stacked over the stale target; a service replays its journal | none |
+| The CSI node plugin (deleted, upgraded or crashed) | Its children stop with it (with final commits when it is stopped gracefully); the staged and published records on the hostPath | Reconcile at plugin start: services for staged volumes (journal replay), fronts recovered for targets whose mount is still there, live or stale; targets the kubelet removed are forgotten. Containers that mount with `HostToContainer` see the new mount; others after a container restart ([runbook](runbooks/csi-recovery.md)) | none |
 
 The Failpoint column names the failpoints (`agentfs_core::failpoints`,
 test builds only) that stop the process at that point; the crash
-harnesses of design §18 test 3 kill or fail at each of them and check
+harnesses kill or fail at each of them and check
 that nothing promised is lost and nothing is committed twice: the engine
 matrix in `agentfs-core/tests/crash_points.rs`, the processes in
 `agentfs/tests/crash_daemon.rs` and the FUSE mount in
 `agentfs/tests/crash_mount.rs` (run by `ci/crash-tests.sh`). `none`:
-covered by the process-level tests named in design §18 instead.
+covered by the process-level tests named in [development](development.md) instead.
 
 The daemon never holds the only copy of anything a returned call
 promised: content is in `pending/` and the journal, both `fsync`ed, until

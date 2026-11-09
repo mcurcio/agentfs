@@ -9,7 +9,7 @@
 #
 # Each checks, from real containers:
 #   - a root and a uid 10000 workload container write through the mount
-#     with normal permissions (design §18 test 4), and the bare directory
+#     with normal permissions, and the bare directory
 #     under the mount is read-only to them (the fence);
 #   - nothing of the state area is visible to them: /agentfs holds only
 #     the mount, the tree only their files, /data and the Docker volume
@@ -21,8 +21,7 @@
 #     and leaves nothing mounted on the host.
 # `compose` also kills the daemon with SIGKILL from the host: Docker
 # restarts the container, which mounts over the stale mount, and the
-# running workload reaches the new mount with no restart of its own
-# (design §17.1, §18 test 2).
+# running workload reaches the new mount with no restart of its own.
 #
 # Needs the agentfs image as $AGENTFS_IMAGE (default agentfs:ci), the fuse
 # module loaded, and sudo (to SIGKILL the daemon from the host).
@@ -117,10 +116,10 @@ esac
 assert_contains "$(agentfs_logs)" "mounted " "agentfs mounted the volume"
 assert_contains "$(agentfs_logs)" "volume $VOLUME" "the mount is volume $VOLUME"
 
-step "root and uid 10000 write with normal permissions (design §18 test 4)"
+step "root and uid 10000 write with normal permissions"
 in_root "printf root > $WS/root.txt && chmod 600 $WS/root.txt"
 # Records within agentfs.commitWindow of each other share one commit (and
-# its author, §3.4): keep the writers' commits apart.
+# its author): keep the writers' commits apart.
 sleep 1
 in_user "printf user > $WS/user.txt"
 assert_eq 10000 "$(in_root "stat -c %u $WS/user.txt")" "uid 10000's file is its own"
@@ -135,7 +134,7 @@ if out=$(in_root 'touch /agentfs/outside' 2>&1); then
 fi
 assert_contains "$out" "Read-only file system" "the directory under the mount is read-only (the fence)"
 
-step "the state area is invisible to the workload (design §18 test 5)"
+step "the state area is invisible to the workload"
 for writer in in_root in_user; do
   assert_eq workspace "$("$writer" 'ls -A /agentfs')" "$writer: /agentfs holds only the mount"
   assert_eq "root.txt user.txt" "$("$writer" "ls -A $WS" | tr '\n' ' ' | sed 's/ $//')" \
@@ -159,7 +158,7 @@ in_agentfs agentfs status
 pass "agentfs status runs in the agentfs container"
 
 if [ "$EXAMPLE" = compose ]; then
-  step "SIGKILL the daemon: Docker restarts it over the stale mount (design §18 test 2)"
+  step "SIGKILL the daemon: Docker restarts it over the stale mount"
   in_user "printf before > $WS/before-crash.txt"
   wait_content history before-crash.txt before
   cid=$(dc ps -q agentfs)

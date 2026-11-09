@@ -1,4 +1,4 @@
-//! Mode-bit permission checks (design §6).
+//! Mode-bit permission checks.
 //!
 //! Which of read, write and execute (search, for a directory) an identity
 //! gets on an object, decided as the kernel's `generic_permission` decides

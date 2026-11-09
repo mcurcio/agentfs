@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Runs a README.md quick start as written (design §11.2, §18): the first
+# Runs a README.md quick start as written: the first
 # ```sh block under its heading in "## Quick start", in one bash with
 # `set -euxo pipefail`, then checks what it should have left.
 #

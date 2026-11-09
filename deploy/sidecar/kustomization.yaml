@@ -1,4 +1,4 @@
-# agentfs as a phase 1 native sidecar (design §17.1, docs/deployment.md).
+# agentfs as a privileged native sidecar (docs/deployment.md).
 #
 #   kubectl apply -k deploy/sidecar        # after editing config/ and secret.yaml
 #
@@ -14,7 +14,7 @@ resources:
 
 # The operator's settings and rules. The generated name carries a hash of
 # the content, so changing a rule or a remote rolls the pod: rules are read
-# at mount time (design §4.1).
+# at mount time.
 configMapGenerator:
   - name: agentfs-config
     options:

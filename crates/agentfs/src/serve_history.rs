@@ -1,4 +1,4 @@
-//! `agentfs serve-history`: the history service of a volume (design §14).
+//! `agentfs serve-history`: the history service of a volume.
 //!
 //! It holds the state-area lock, opens the volume (recovery included), and
 //! is the only writer of the journal and the branch: fronts
@@ -7,11 +7,10 @@
 //!
 //! Start order: lock, open (recovery), the patch queue (landed only when no
 //! front holds a lease and `--workload-attached` was not given: patches
-//! write the backing tree, which fronts serve; else judged, design §12),
+//! write the backing tree, which fronts serve; else judged),
 //! the commit and push loops, the socket fronts use, then the control
 //! socket (`agentfs push` asks it to push now; `restore` and `revert` it
-//! serves live, writing the backing tree with its fronts' help, design
-//! §2.3, §15). On SIGINT or SIGTERM it stops the control socket: a
+//! serves live, writing the backing tree with its fronts' help, design). On SIGINT or SIGTERM it stops the control socket: a
 //! restore in progress stops before its next path, records what it wrote
 //! and replies, and the service waits for that (up to `--shutdown-grace`,
 //! and at least the control socket's own grace). Then it stops accepting
@@ -19,7 +18,7 @@
 //! requests in progress finish (up to `--shutdown-grace`), then makes the
 //! final commit and pushes it, as every
 //! long-running mode does: every remote that lacks commits gets one more
-//! attempt, all within `--push-grace` (design §11.2, §14.2). Under the CSI
+//! attempt, all within `--push-grace`. Under the CSI
 //! driver the service stops after the volume's last pod, and nothing else
 //! would push it.
 
@@ -79,7 +78,7 @@ pub(crate) fn serve(
     let events = session.events.clone();
     let (recorder, committer, recovery) = session.open(state, &backing, pod)?;
     let commit_window = committer.history().settings().commit_window;
-    // Orders fronts' records that race for one path (design §14.1).
+    // Orders fronts' records that race for one path.
     recorder.enable_stamps();
     let settings = committer.history().settings().clone();
     if std::fs::metadata(state.repairs()).is_ok_and(|m| m.len() > 0) {
@@ -89,7 +88,7 @@ pub(crate) fn serve(
             state.repairs().display()
         );
     }
-    // The patch queue lands only with nothing attached (design §12): no
+    // The patch queue lands only with nothing attached: no
     // front holds a lease, and the launcher did not say a workload is
     // attached (the CSI node plugin says so while a pod of the volume is
     // published, whether or not its front is back yet).
@@ -131,7 +130,7 @@ pub(crate) fn serve(
         }
     };
     // `agentfs push` asks it to push now; restores and reverts it writes
-    // into the backing tree, calling its fronts (design §2.3, §15).
+    // into the backing tree, calling its fronts.
     // Set at shutdown: a restore in progress stops before its next path.
     let stopping = Arc::new(AtomicBool::new(false));
     let control = start_control(

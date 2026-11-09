@@ -3,9 +3,7 @@
 # workload container keeps running on the mount, must not apply queued
 # patches under that live workload.
 #
-# Patches land only when no workload is attached (design §12 "Only with
-# nothing attached", §19.1 "No live landing yet", "Patches land after a
-# clean stop"): the old daemon's busy (lazy) unmount, or its SIGKILL,
+# Patches land only when no workload is attached: the old daemon's busy (lazy) unmount, or its SIGKILL,
 # leaves meta/attached.json, so the new mount judges the queue and holds
 # it. This test asserts that behaviour from the workload's side, with
 # examples/docker/docker-run.sh (docs/docker.md):

@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# The end-to-end benchmark (design §18 test 13, §19.2 item 1;
-# docs/performance.md): the synchronous record step without FUSE
+# The end-to-end benchmark (docs/performance.md): the synchronous record step without FUSE
 # (crates/agentfs-core/benches/record_step.rs), then workloads through a
 # real agentfs mount, each beside a baseline in a plain directory on the
 # same filesystem:
@@ -9,7 +8,7 @@
 #   clone    `git clone` of git.git v2.47.0 with agentfs.nested=working-tree;
 #   npm      30,000 small files written into an excluded node_modules/;
 #   create   100,000 small files, then
-#   mvdir    a rename of their directory (one move, design §3.1), then
+#   mvdir    a rename of their directory (one move), then
 #   rm       `rm -rf` of them;
 #   bigclose closing a 1 GiB file, dirty and after fsync (reflink on XFS,
 #            copy on ext4).
@@ -256,10 +255,10 @@ measured() { # workload-name workload-args...
   echo "$LAST"
 }
 
-# Bounds the records a workload of N change boundaries made (design §3.1):
+# Bounds the records a workload of N change boundaries made:
 # one per boundary. A file written and closed at once is racy at RELEASE,
 # which compares it with the copy FLUSH froze rather than recording it
-# again (design §19.2 item 4); a small slack covers the sweep recording
+# again; a small slack covers the sweep recording
 # files still open and a comparison that could not be made.
 check_records() { # label boundaries
   local records
@@ -364,7 +363,7 @@ if in_shard many; then
   check_records create "$MANY"
   n=$(sgit ls-tree -r --name-only refs/heads/agentfs/many | grep -c '^many/' || true)
   assert_eq "$MANY" "$n" "every created file is in the history"
-  # A directory rename is one record whatever is beneath it (design §3.1),
+  # A directory rename is one record whatever is beneath it,
   # its reconciliation none here.
   measured mvdir mvdir "$MNT/many" "$MNT/moved"
   assert_eq 1 "$(echo "$LAST" | jq .records)" "mvdir: the rename of $MANY files is one record"

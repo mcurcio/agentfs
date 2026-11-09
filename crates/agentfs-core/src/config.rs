@@ -1,12 +1,11 @@
-//! Operator settings from the history repository's git config (design §4.3,
-//! §11.1).
+//! Operator settings from the history repository's git config.
 //!
 //! Only the repository's own config file is read: system and global git
 //! config never influence a volume. Remotes are the standard
 //! `[remote "<name>"]` sections with `url` (and optionally `pushurl`), plus
 //! agentfs's own per-remote keys.
 //!
-//! The one exception is `include.path` (design §4.3): an operator-owned
+//! The one exception is `include.path`: an operator-owned
 //! fragment, such as a Kubernetes ConfigMap, that libgit2 expands in place.
 //! agentfs is stricter than git about it: every include must be an
 //! absolute path to a readable regular file (git skips a missing one
@@ -16,7 +15,7 @@
 //! includes out of the backing tree and the mount point is the mount
 //! preflight's job.
 //!
-//! Git LFS settings (design §7) come from the same file only: the size
+//! Git LFS settings come from the same file only: the size
 //! threshold `agentfs.lfsThreshold`, git-lfs's `lfs.url`, `lfs.pushurl`
 //! and `lfs.concurrenttransfers`, and per remote `lfsurl`, `lfspushurl` and `agentfsLfsCredentials`. A
 //! tracked `.lfsconfig` is content and is never read.
@@ -63,11 +62,11 @@ pub enum ConfigError {
     RelativePath { key: String, value: String },
     #[error("{key} applies only to ssh remotes, and this remote pushes to a non-ssh URL")]
     SshOnly { key: String },
-    #[error("{key} must be set for an ssh remote: an absolute path (design §11.1)")]
+    #[error("{key} must be set for an ssh remote: an absolute path")]
     SshNeeds { key: String },
     #[error(
         "{remote}.agentfsSshKey or {remote}.agentfsSshAgent must be set for an ssh remote: an \
-         absolute path (design §11.1)"
+         absolute path"
     )]
     SshNoIdentity { remote: String },
     #[error(
@@ -152,7 +151,7 @@ pub enum ConfigError {
     ForkRemoteGlobalLfs { remote: String },
     #[error(
         "{key}: {value:?} is not an LFS endpoint agentfs can use (an http:// or https:// \
-         URL, a file:// URL or a path; design §7)"
+         URL, a file:// URL or a path)"
     )]
     LfsUrl { key: String, value: String },
     #[error("{key}: {value:?} is not a webhook agentfs can POST to: {why}")]
@@ -185,7 +184,7 @@ pub enum ConfigError {
 }
 
 /// Every git config key agentfs reads, in the order docs/configuration.md
-/// lists them (design §4.3, §7, §9, §11.1). `<name>` stands for a
+/// lists them. `<name>` stands for a
 /// remote's name and `<condition>` for an `includeIf` condition.
 ///
 /// Every read goes through this module's helpers, which note the key in
@@ -298,14 +297,14 @@ pub(crate) mod reads {
     }
 }
 
-/// How nested repositories are handled (design §5).
+/// How nested repositories are handled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Nested {
     Exclude,
     WorkingTree,
 }
 
-/// One push remote (design §11.1, §11.3).
+/// One push remote.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteSettings {
     pub name: String,
@@ -317,11 +316,10 @@ pub struct RemoteSettings {
     /// accepts, in bytes.
     pub max_blob_size: Option<u64>,
     /// `remote.<name>.agentfsMaxPushSize`: the largest git pack one push
-    /// to this remote may send, in bytes (design §11.3,
-    /// [`crate::push_size`]). LFS uploads are not counted.
+    /// to this remote may send, in bytes ([`crate::push_size`]). LFS uploads are not counted.
     pub max_push_size: Option<u64>,
     /// `remote.<name>.agentfsMaxLfsObjectSize`: the largest LFS object
-    /// this remote's LFS server accepts, in bytes (design §7, §11.3).
+    /// this remote's LFS server accepts, in bytes.
     pub max_lfs_object_size: Option<u64>,
     /// `remote.<name>.agentfsCredentials`: an absolute path to the
     /// credential file ([`crate::credentials`]). Not for ssh remotes.
@@ -337,14 +335,14 @@ pub struct RemoteSettings {
     pub known_hosts: Option<PathBuf>,
     /// `remote.<name>.agentfsSshAgent`: an absolute path to the socket of
     /// the ssh-agent an ssh remote authenticates with, instead of
-    /// `agentfsSshKey` (design §11.1).
+    /// `agentfsSshKey`.
     pub ssh_agent: Option<PathBuf>,
     /// `remote.<name>.agentfsSshKeyPassphrase`: an absolute path to the
     /// file holding the passphrase of `agentfsSshKey`
     /// ([`crate::credentials::PassphraseFile`]).
     pub ssh_key_passphrase: Option<PathBuf>,
     /// `remote.<name>.lfsurl`: the LFS endpoint for this remote, unless
-    /// `lfs.url` is set (design §7).
+    /// `lfs.url` is set.
     pub lfs_url: Option<String>,
     /// `remote.<name>.lfspushurl`: the LFS endpoint uploads go to, unless
     /// `lfs.pushurl` or `lfs.url` is set.
@@ -358,12 +356,12 @@ pub struct RemoteSettings {
     /// empty `remote.<name>.proxy` means none.
     pub proxy: Option<ProxySetting>,
     /// `remote.<name>.agentfsForkRemote` (bool, default false): this
-    /// section is only for forks of the volume (design §11.5). It is never
+    /// section is only for forks of the volume. It is never
     /// one of the volume's own push remotes.
     pub fork_remote: bool,
     /// `remote.<name>.agentfsPush` (`branch`, the default, or
     /// `changeLine`): what this remote's push sends to the volume's branch
-    /// ref there (design §19.2 item 11, [`crate::checkpoint`]).
+    /// ref there ([`crate::checkpoint`]).
     pub push_source: PushSource,
 }
 
@@ -380,7 +378,7 @@ pub enum PushSource {
 }
 
 /// The agentfs keys of a remote section that name files, which the mount
-/// preflight keeps out of the backing tree (design §17.1).
+/// preflight keeps out of the backing tree.
 pub const REMOTE_FILE_KEYS: [&str; 6] = [
     "agentfsCredentials",
     "agentfsSshKey",
@@ -437,7 +435,7 @@ pub const DEFAULT_CONCURRENT_TRANSFERS: usize = 8;
 /// The largest `lfs.concurrenttransfers` accepted.
 pub const MAX_CONCURRENT_TRANSFERS: usize = 64;
 
-/// Git LFS settings (design §7), all optional.
+/// Git LFS settings, all optional.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LfsSettings {
     /// `agentfs.lfsThreshold`: content larger than this many bytes is
@@ -449,7 +447,7 @@ pub struct LfsSettings {
     /// `lfs.pushurl`: the LFS endpoint uploads go to, for every remote.
     pub push_url: Option<String>,
     /// `lfs.concurrenttransfers`: how many objects one remote's transfer
-    /// moves at once (design §7), [`DEFAULT_CONCURRENT_TRANSFERS`] unless
+    /// moves at once, [`DEFAULT_CONCURRENT_TRANSFERS`] unless
     /// set; 1 to [`MAX_CONCURRENT_TRANSFERS`].
     pub concurrent_transfers: usize,
     /// Why `lfs.concurrenttransfers` cannot be used, if it cannot: then
@@ -500,42 +498,41 @@ pub struct Settings {
     pub commit_window: Duration,
     pub push_interval: Duration,
     /// `agentfs.sweepInterval`: how often the FUSE layer's sweep records
-    /// files that stay open and changed, and retries failed records (design
-    /// §3.1, §3.5). At least [`MIN_SWEEP_INTERVAL`].
+    /// files that stay open and changed, and retries failed records. At least [`MIN_SWEEP_INTERVAL`].
     pub sweep_interval: Duration,
     /// `agentfs.repackInterval`: how often the daemon repacks the history
-    /// with the git CLI (design §8). `None` (`0` or `off`) never repacks.
+    /// with the git CLI. `None` (`0` or `off`) never repacks.
     /// At least [`MIN_REPACK_INTERVAL`].
     pub repack_interval: Option<Duration>,
     pub identity: Templates,
-    /// Git LFS (design §7).
+    /// Git LFS.
     pub lfs: LfsSettings,
     /// `http.proxy`, normalised ([`crate::proxy`]): the proxy of every
     /// remote without its own `remote.<name>.proxy`. A bad value
     /// misconfigures every remote; `None` then.
     pub http_proxy: Option<String>,
     /// How the volume declares its push remotes, and the valid ones,
-    /// sorted by name (design §11.1; F8 S3).
+    /// sorted by name (F8 S3).
     pub remotes: Remotes,
     /// Remote sections that could not be used, sorted by name. They are
     /// left out of `remotes` and reported as alarms; they never fail the
-    /// volume (design §11.1).
+    /// volume.
     pub invalid_remotes: Vec<InvalidRemote>,
     /// `agentfs.patchRemote`: where the patch queue is fetched from and
-    /// its refs pushed to (design §12).
+    /// its refs pushed to.
     pub patch_remote: PatchRemote,
     /// `agentfs.patchFetchTimeout`: how long the mount waits for the
-    /// patch fetch (design §12). Default 30s.
+    /// patch fetch. Default 30s.
     pub patch_fetch_timeout: Duration,
     /// `agentfs.patchAccept`: the acceptance rule that judges each cleanly
-    /// merged patch (design §12; bead agentfs-mia.2). Default
+    /// merged patch (bead agentfs-mia.2). Default
     /// `cleanMerge`.
     pub patch_accept: AcceptMode,
     /// `agentfs.patchAcceptTimeout`: how long the `patch-accept` hook may
     /// run. Default [`DEFAULT_PATCH_ACCEPT_TIMEOUT`]; `0` is refused.
     pub patch_accept_timeout: Duration,
     /// `agentfs.patchIntegrate`: how a patch is merged onto the head,
-    /// `merge` (the default) or `rebase` (design §12, §17.3; bead
+    /// `merge` (the default) or `rebase` (bead
     /// agentfs-mia.3).
     pub patch_integrate: IntegrateMode,
     /// `agentfs.patchNotifyUrl`: where the patch queue's verdict changes
@@ -550,17 +547,16 @@ pub struct Settings {
     /// `0` is refused.
     pub patch_notify_timeout: Duration,
     /// Every `include.path`, in order: absolute, readable config fragments
-    /// whose keys count as the repository's own (design §4.3).
+    /// whose keys count as the repository's own.
     pub includes: Vec<PathBuf>,
-    /// This volume's fork identity; `None` when it is not a fork (design
-    /// §11.5).
+    /// This volume's fork identity; `None` when it is not a fork.
     pub fork: Option<ForkIdentity>,
     /// Where forks of this volume publish, and where a fork publishes: the
     /// one valid section with `agentfsForkRemote = true`, else for a
     /// local-only volume (or a fork recording its local-only source's
     /// state area, [`Settings::source_state`]) the source's own history
     /// ([`ForkRemote::SourceHistory`]), else the remote the patch remote
-    /// resolves to (design §19.1, gate answer Q1 b), else `None`. `None`
+    /// resolves to (gate answer Q1 b), else `None`. `None`
     /// too when a flagged section is invalid or more than one is flagged:
     /// a fork never falls back past the operator's choice. Always `None`
     /// in an unlinked fork, which delivers nothing ([`ForkLink`]) and
@@ -570,7 +566,7 @@ pub struct Settings {
     /// written at create from the fork's own config only, like the fork
     /// identity): its push remotes, and its `lfs.url` and `lfs.pushurl`,
     /// come from this file alone, never from its source's settings
-    /// (design §11.5; owner, 2026-10-17: "B. And if no remote is
+    /// (owner, 2026-10-17: "B. And if no remote is
     /// configured, the volume is lost, and that's a choice the user is
     /// allowed to make."). `None` for any other volume, and for an
     /// unlinked fork with no remotes of its own, which is local-only.
@@ -580,16 +576,15 @@ pub struct Settings {
     /// config only, like the fork identity), into whose history the fork
     /// publishes ([`crate::fork::receive`]). `None` for any other volume.
     pub source_state: Option<PathBuf>,
-    /// `agentfs.forkRefs`: the push target new forks of this volume get
-    /// (design §11.5), fixed in each fork's identity at create, so a
+    /// `agentfs.forkRefs`: the push target new forks of this volume get,
+    /// fixed in each fork's identity at create, so a
     /// change here never moves a fork that exists.
     pub fork_refs: PushTarget,
     /// This volume's start point (agentfs.start.*), read only from the volume's own config, like
     /// the fork identity; `None` when it was not started from another branch.
     pub start: Option<crate::fork::identity::StartPoint>,
     /// `agentfs.fork.baseChangeLine`: a fork's source's change-line tip at
-    /// create, the first parent of the fork's first checkpoint (design
-    /// §19.2 item 11, [`crate::checkpoint`]); written by fork create only
+    /// create, the first parent of the fork's first checkpoint ([`crate::checkpoint`]); written by fork create only
     /// when the source had a change line, read only beside a fork
     /// identity, never from an include.
     pub fork_base_change_line: Option<git2::Oid>,
@@ -600,7 +595,7 @@ pub struct Settings {
     pub source_is_fork: bool,
 }
 
-/// Which push remotes a volume has (design §11.1); [`Settings::load`] is the
+/// Which push remotes a volume has; [`Settings::load`] is the
 /// one decider. Zero remotes is never an error and needs no declaration
 /// (owner, 2026-10-17: "Remotes can come and go. It's not a error to have
 /// zero remotes"): a volume with no push section is local-only, and one
@@ -613,7 +608,7 @@ pub struct Settings {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Remotes {
     /// One or more valid push sections, sorted by name; invalid sections
-    /// beside them alarm (§11.1).
+    /// beside them alarm.
     Pushed(crate::non_empty::NonEmpty<RemoteSettings>),
     /// Push sections, all invalid: each alarms; commits wait. Never
     /// reported local-only.
@@ -666,7 +661,7 @@ fn mode_of(own: Vec<RemoteSettings>, invalid: &[InvalidRemote]) -> Remotes {
     }
 }
 
-/// Where a volume's forks publish (design §11.5; F8 S3). `None` in
+/// Where a volume's forks publish (F8 S3). `None` in
 /// `Settings`: forks are refused, as today.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ForkRemote {
@@ -680,7 +675,7 @@ pub enum ForkRemote {
     SourceHistory,
 }
 
-/// `agentfs.patchRemote` (design §12).
+/// `agentfs.patchRemote`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PatchRemote {
     /// Unset: the only remote, if exactly one is configured and valid.
@@ -694,7 +689,7 @@ pub enum PatchRemote {
 }
 
 impl Settings {
-    /// The remote the patch queue uses, if any (design §12). A section
+    /// The remote the patch queue uses, if any. A section
     /// with `agentfsForkRemote` is never one: it is not in `remotes`, and
     /// an invalid one does not count against the automatic choice. A
     /// linked fork's queue is on its fork remote section, where its own
@@ -733,7 +728,7 @@ impl Settings {
         }
     }
 
-    /// Whether this volume is a fork (design §11.5).
+    /// Whether this volume is a fork.
     pub fn is_fork(&self) -> bool {
         self.fork.is_some()
     }
@@ -749,8 +744,7 @@ impl Settings {
             .map(|f| f.source.as_str())
     }
 
-    /// Whether this volume is an unlinked fork (design §11.5,
-    /// [`ForkLink::Unlinked`]).
+    /// Whether this volume is an unlinked fork ([`ForkLink::Unlinked`]).
     pub fn is_unlinked_fork(&self) -> bool {
         self.fork
             .as_ref()
@@ -779,7 +773,7 @@ fn resolve_patch_remote<'r>(
 /// The error of each flagged section when more than one is flagged.
 const MANY_FORK_REMOTES: &str = "more than one remote sets agentfsForkRemote";
 
-/// The fork identity in `config` (design §11.5): both keys or neither.
+/// The fork identity in `config`: both keys or neither.
 fn fork_identity_of(
     config: &git2::Config,
     volume: &str,
@@ -816,7 +810,7 @@ fn fork_identity_of(
     }))
 }
 
-/// `agentfs.fork.link` (design §11.5): `linked` or `unlinked`; unset is
+/// `agentfs.fork.link`: `linked` or `unlinked`; unset is
 /// `None`.
 fn fork_link(config: &git2::Config) -> Result<Option<ForkLink>, ConfigError> {
     let key = fork_identity::LINK_KEY;
@@ -889,7 +883,7 @@ fn source_is_fork_of(
     }
 }
 
-/// `agentfs.fork.remotes` (design §11.5): an absolute path, set only
+/// `agentfs.fork.remotes`: an absolute path, set only
 /// beside an unlinked fork's identity.
 fn fork_remotes_of(
     config: &git2::Config,
@@ -994,7 +988,7 @@ pub fn is_full_oid(value: &str) -> bool {
 }
 
 /// The volume's own remotes and the fork remote, from every valid and
-/// invalid section (design §11.5): see [`Settings::fork_remote`].
+/// invalid section: see [`Settings::fork_remote`].
 struct SplitRemotes {
     remotes: Remotes,
     invalid: Vec<InvalidRemote>,
@@ -1140,7 +1134,7 @@ impl Settings {
         let fork_remotes_file = fork_remotes.as_deref().map(open_fork_remotes).transpose()?;
         // Where the remote sections and the global LFS endpoints are read:
         // an unlinked fork's own remotes file, or nothing, never its
-        // source's settings (design §11.5); every other volume's config.
+        // source's settings; every other volume's config.
         let remotes_config = if unlinked {
             fork_remotes_file.as_ref()
         } else {
@@ -1243,7 +1237,7 @@ impl Settings {
                 author_email: string(config, "agentfs.identity.authorEmail")?
                     .unwrap_or(defaults.author_email),
             },
-            // A fork has no patch queue (design §11.5).
+            // A fork has no patch queue.
             patch_remote: if fork.is_some() {
                 PatchRemote::Disabled
             } else {
@@ -1324,7 +1318,7 @@ fn includes(config: &git2::Config) -> Result<Vec<PathBuf>, ConfigError> {
         // The volume's identity belongs to its state area (`agentfs
         // init`): a shared fragment naming one would silently turn every
         // volume using it into the same volume.
-        // A fork's identity likewise (design §11.5), and a started
+        // A fork's identity likewise, and a started
         // volume's start point (F8 S1).
         let fragment = git2::Config::open(&path)?;
         for key in [
@@ -1353,7 +1347,7 @@ fn includes(config: &git2::Config) -> Result<Vec<PathBuf>, ConfigError> {
 
 /// Every `[remote "<name>"]` with a `url`, sorted by name: the valid ones,
 /// and the invalid ones with their errors. A remote only affects pushing,
-/// so a mistake in one never fails the volume (design §11.1).
+/// so a mistake in one never fails the volume.
 fn remotes(
     config: &git2::Config,
     lfs: &LfsSettings,
@@ -1467,7 +1461,7 @@ fn push_source(config: &git2::Config, key: &str) -> Result<PushSource, ConfigErr
     }
 }
 
-/// A remote's effective proxy (design §11.1): `remote.<name>.proxy` (empty:
+/// A remote's effective proxy: `remote.<name>.proxy` (empty:
 /// none), else `http.proxy`. A bad `http.proxy` misconfigures every
 /// remote.
 fn remote_proxy(
@@ -1497,8 +1491,7 @@ fn remote_proxy(
     }
 }
 
-/// Checks the agentfs keys against the push URL's transport (design
-/// §11.1): ssh remotes need a known_hosts file and either a key (with an
+/// Checks the agentfs keys against the push URL's transport: ssh remotes need a known_hosts file and either a key (with an
 /// optional passphrase file) or an ssh-agent socket, and take no password
 /// or token; other remotes take none of the ssh keys.
 fn validate_transport(remote: &RemoteSettings) -> Result<(), ConfigError> {
@@ -1562,7 +1555,7 @@ fn validate_transport(remote: &RemoteSettings) -> Result<(), ConfigError> {
     Ok(())
 }
 
-/// Checks every LFS endpoint that could apply to `remote` (design §7): the
+/// Checks every LFS endpoint that could apply to `remote`: the
 /// global `lfs.url` and `lfs.pushurl` and the remote's own `lfsurl` and
 /// `lfspushurl`. Each must be an `http(s)://` URL, a `file://` URL or a
 /// path; `https` needs the `https` cargo feature. A bad global key
@@ -1597,7 +1590,7 @@ fn validate_lfs(remote: &RemoteSettings, lfs: &LfsSettings) -> Result<(), Config
     Ok(())
 }
 
-/// A flagged fork remote (design §11.5) needs its own LFS endpoint while
+/// A flagged fork remote needs its own LFS endpoint while
 /// `lfs.url` or `lfs.pushurl` is set: those name the source's store, and a
 /// fork's LFS objects must not reach it. The section is invalid otherwise
 /// (fails closed: forks are refused, the source pushes as before). The
@@ -1614,7 +1607,7 @@ fn validate_fork_lfs(remote: &RemoteSettings, lfs: &LfsSettings) -> Result<(), C
     Ok(())
 }
 
-/// Checks a volume or remote name (design §11.4). Names become ref path
+/// Checks a volume or remote name. Names become ref path
 /// components (`refs/agentfs/<volume>/…`) and state file names, so they are
 /// limited to `[A-Za-z0-9][A-Za-z0-9._-]*`, without `..` or a `.lock`
 /// suffix. A `/` would let one volume's namespace contain another's.
@@ -1766,7 +1759,7 @@ pub const MIN_REPACK_INTERVAL: Duration = Duration::from_secs(60);
 /// The default `agentfs.repackInterval`.
 pub const DEFAULT_REPACK_INTERVAL: Duration = Duration::from_secs(3600);
 
-/// The default `agentfs.patchFetchTimeout` (design §12).
+/// The default `agentfs.patchFetchTimeout`.
 pub const DEFAULT_PATCH_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// `agentfs.patchFetchTimeout`: default [`DEFAULT_PATCH_FETCH_TIMEOUT`],
@@ -1779,7 +1772,7 @@ fn patch_fetch_timeout(config: &git2::Config) -> Result<Duration, ConfigError> {
     }
 }
 
-/// The default `agentfs.patchAcceptTimeout` (design §12).
+/// The default `agentfs.patchAcceptTimeout`.
 pub const DEFAULT_PATCH_ACCEPT_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// `agentfs.patchAccept`: `cleanMerge` (the default), `approval` or
@@ -3221,7 +3214,7 @@ mod tests {
         ));
     }
 
-    /// A fork's link (design §11.5, §19.1 "Fork link"): its own config's,
+    /// A fork's link: its own config's,
     /// `linked` when unset. An unlinked fork has no fork remote, never
     /// takes its source's sections (flagged or not), is local-only without
     /// remotes of its own, and may not record a source path. Any other
@@ -3283,7 +3276,7 @@ mod tests {
         ));
     }
 
-    /// An unlinked fork's own remotes (design §11.5, `agentfs.fork.remotes`):
+    /// An unlinked fork's own remotes (`agentfs.fork.remotes`):
     /// the sections of its remotes file alone, with that file's `lfs.url`
     /// and `lfs.pushurl` and never the source's; anything else in the file,
     /// a file that cannot be read, a relative path and the key in a linked

@@ -12,7 +12,7 @@
 //! branch, its patch queue or its tree: whatever reads the source's
 //! history does the gating (principle 9).
 //!
-//! The fork's output is untrusted (design §11.5, "potentially hostile"),
+//! The fork's output is untrusted,
 //! so each way it enters the source has one judged path: refs only
 //! through `ForkRefs`, which refuses the source's own branch and
 //! namespace; objects only less a base `OnBranch` proved on the
@@ -23,7 +23,7 @@
 //! Once the source declares a remote, its pushes carry those refs
 //! ([`received_refs`]). The fork and the source are on one node (forks are placed on their source's node). The CLI and the
 //! node plugin run it through the source's control socket when its
-//! service is up (design §2.3), else directly under the source's state
+//! service is up, else directly under the source's state
 //! lock.
 //!
 //! The fork finds its source by [`SOURCE_STATE_KEY`], written into the
@@ -342,7 +342,7 @@ mod judged {
     impl OnBranch {
         /// `base` when the source's branch `branch_ref` is at it or
         /// descends from it; else [`ReceiveError::BaseNotOnBranch`]: a base
-        /// the source never had, or one its rewritten history (design §15)
+        /// the source never had, or one its rewritten history
         /// no longer holds, whose fork would bring that history back, or a
         /// source with no branch at all.
         pub(super) fn judge(

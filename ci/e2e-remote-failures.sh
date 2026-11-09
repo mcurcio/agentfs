@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # The filesystem keeps working through a live FUSE mount while its remotes
-# fail (design §11, §18 test 8). One mount pushes every second to a good
+# fail. One mount pushes every second to a good
 # smart-HTTP remote and to six failing ones:
 #
 #   gone       http://127.0.0.1:9/      nothing listens: unreachable

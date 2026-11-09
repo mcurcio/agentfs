@@ -1,25 +1,14 @@
 # Trees: storage and lifecycle
 
-**Layer:** System › **Domain (Trees)** › Feature.
-**Status:** draft 7, proposed, under [system.md](../system.md) revision 10 and [git-model.md](../git-model.md). The
-target, not today's code; sketches are Rust surfaces. Draft 7 folds in what the older Forks page held that the git
-model does not: when a fork is created, ends and drops, pinned snapshots and space limits.
+**Proposed, not built.** This page proposes the Trees domain (where working trees live and the fork lifecycle), one part of the system around the git model ([the system](../system.md)). The git model ([git-model.md](../git-model.md)) wins wherever the two disagree. Rust sketches show surfaces only. The commit that lands the slice that builds this domain deletes this page and moves the behaviour into the library or operator docs.
 
 **What this page covers.** In git terms a tree is a branch with its own index and working tree (git-model §2, §3);
 its branch, saves, queue, syncs and transactions are the git model's. Trees owns the rest: where the working tree's
 files live, their confinement and space, and each fork's lifecycle.
 
-## 0. The owner's words this domain serves
+## 0. Guidance this domain serves
 
-| # | His words | Date | What it sets here |
-|---|---|---|---|
-| R3 | "a virtual filesystem overlay for each client (including main) that is backed by a _real_ filesystem source-of-truth" | 2026-11-01 | the working tree is real files |
-| R4 | "the sandbox fs edits need to land back in the main container, and then future sandboxes should start from the edited files" | 2026-11-01 | a new fork starts at its upstream's head |
-| R7 | "Security boundary. Agentfs is the gatekeeper that exposes only what we want sandboxes to see" | 2026-10-30 | confinement; a per-tree space limit (our reading, not his words) |
-| R17 | "dont go back on the fork design. thats a cleaner model" | 2026-11-02 | each workload container has its own fork |
-| A6 | A pinned fork is an acceptable snapshot (his answer, a current choice) | 2026-11-02 | pinned snapshots |
-
-Everything else here is a design choice.
+The owner's guidance that applies here is in `OWNER-GUIDANCE.md` at the repository root. Everything else on this page is a design choice.
 
 ## 1. What Trees owns, and what it is not
 
@@ -35,7 +24,7 @@ Everything else here is a design choice.
 
 A fork's upstream is main or another fork (git-model §10). Creating it creates its branch at the upstream's head with
 its upstream set, and its working tree (git-model §12, "fork create"); so a new fork starts from everything landed
-so far (R4).
+so far.
 
 ```mermaid
 stateDiagram-v2
@@ -56,7 +45,7 @@ stateDiagram-v2
 
 A pinned snapshot is a read-only checkout of one commit of a tree's branch, made complete before it is visible and
 never written; a snapshot client's `advance` makes a fresh one, and each is deleted at its `LastDetached` (design
-choice, A6). It has no branch and no queue: nothing lands in it.
+choice). It has no branch and no queue: nothing lands in it.
 
 ## 4. Storage, confinement and space
 
@@ -69,7 +58,7 @@ choice, A6). It has no branch and no queue: nothing lands in it.
 | T5. Storage is an optimisation, never a second truth: whatever serves a working tree serves exactly the files the git model's checkout would write | one test suite runs against full checkouts and the optimised storage | test |
 
 **Storage** (design choice). Each working tree is, in git-model §3, a full checkout. Trees may serve it from a reflink
-clone of its upstream's working tree, or an overlay over it (the older pages' "fork layer"), only if T5 holds.
+clone of its upstream's working tree, or an overlay over it (a "fork layer"), only if T5 holds.
 
 | Setting | Values | Current choice |
 |---|---|---|
@@ -126,12 +115,11 @@ Volume). Persists each fork's row (`Audited`, S6) in `store`; the filesystem hol
 Quota mechanics per filesystem and project-id limits at 1,000 forks; reflink or overlay layout for optimised storage;
 whether `git worktree add` or a plain checkout makes each working tree; snapshot naming.
 
-## Reconcile with existing code (agentfs origin/main b5c0dc8)
+## Where it meets the existing code
 
 - **Confinement** (`agentfs-core` `confined.rs` and `agentfs-fuse` `backing.rs`, a duplicate by the module's own words) becomes one confined `fs` adapter.
 - **The tmp layer** (`overlay/tmp.rs`) becomes a fork's working tree; recordable names stop going to the shared tree.
-- **Today's volume fork** (a whole volume cloned from another's latest commit) becomes an in-volume fork with its own branch. Cost: quotas, snapshots and the drop rule are new code.
+- **The existing volume fork** (a whole volume cloned from another's latest commit) becomes an in-volume fork with its own branch. Cost: quotas, snapshots and the drop rule are new code.
 
-**NOT RUN:** reflink, project quotas, beneath-only resolution and rename atomicity were not tested.
+**Not verified:** reflink, project quotas, beneath-only resolution and rename atomicity were not tested.
 
-*History: drafts 1–6 are in git; draft 7 (2026-11-03) cuts the page to storage and lifecycle and absorbs the Forks page's remainder.*

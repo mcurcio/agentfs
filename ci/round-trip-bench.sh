@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# A front's round trip against the single-process record (design §14.1,
-# §19.1 "Front round-trip limit"): runs the history service bench
+# A front's round trip against the single-process record: runs the history service bench
 # (crates/agentfs-core/tests/history_service.rs, `round_trip_cost`, no
 # FUSE) RUNS times, takes each run's ratio of the 1-thread record p50
 # through a front to the single-process one, and fails when the median
@@ -41,5 +40,5 @@ echo "$RESULT"
 summary "" "$RESULT"
 notice_summary "round trip ratio (${AGENTFS_TEST_PASSTHROUGH:-auto})" "$RESULT"
 awk -v m="$MEDIAN" -v l="$LIMIT" 'BEGIN { exit !(m <= l) }' ||
-  fail "a front's record costs $MEDIAN times the single-process one at the median of $RUNS runs, over the limit of $LIMIT (design §19.1): ${RATIOS[*]}"
+  fail "a front's record costs $MEDIAN times the single-process one at the median of $RUNS runs, over the limit of $LIMIT: ${RATIOS[*]}"
 pass "round trip: median ratio $MEDIAN within $LIMIT"

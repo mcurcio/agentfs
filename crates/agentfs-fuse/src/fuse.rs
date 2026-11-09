@@ -1,5 +1,5 @@
 //! The kernel adapter: [`fuser::Filesystem`] over an [`Operations`]
-//! ([`Ops`], or the sandbox overlay in front of it; design §2.1, §17.1).
+//! ([`Ops`], or the sandbox overlay in front of it).
 //!
 //! Each request is handed to the session's [`Operations`] with its caller,
 //! and the result mapped to the reply. What this layer decides itself:
@@ -15,8 +15,7 @@
 //!   register backing files (`CAP_SYS_ADMIN` in the initial user namespace;
 //!   [`crate::privileges`]), regular files opened read-only are opened with
 //!   a backing file, so their reads and mmap go straight to the backing
-//!   inode without the daemon. A handle that can write never is ([`way`],
-//!   design §17.1): a mapping of a passthrough file holds the backing file,
+//!   inode without the daemon. A handle that can write never is ([`way`]): a mapping of a passthrough file holds the backing file,
 //!   not the FUSE file, so RELEASE can come while a shared writable mapping
 //!   is live, and writes through it would go unrecorded. One backing id is
 //!   kept per inode while any handle on it is open. The kernel refuses to
@@ -165,7 +164,7 @@ enum Way {
     Register,
 }
 
-/// The passthrough rule (design §17.1), for a handle that is an
+/// The passthrough rule, for a handle that is an
 /// fsync-class file (`daemon_only`), can write (`write`: opened for
 /// writing or truncating), on an inode that has a backing id open
 /// (`backing_open`) or daemon handles open (`daemon_open`).
@@ -179,7 +178,7 @@ enum Way {
 /// fails any open without one (`EIO`), so a writer there shares the id,
 /// and its node is watched until the kernel forgets it instead
 /// ([`Ops::mapping_may_write`]). An fsync-class file always goes through
-/// the daemon (design §8).
+/// the daemon.
 fn way(daemon_only: bool, write: bool, backing_open: bool, daemon_open: bool) -> Way {
     if daemon_only {
         Way::Daemon

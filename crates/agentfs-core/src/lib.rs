@@ -1,5 +1,6 @@
 //! The agentfs engine: records change boundaries durably, then turns them
-//! into git history. See `docs/design.md`.
+//! into git history. See `docs/architecture.md` and
+//! `docs/library/core.md`.
 //!
 //! The FUSE layer calls [`volume::Recorder::record`] at each change boundary
 //! and lets the triggering call return once it succeeds. A

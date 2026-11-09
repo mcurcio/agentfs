@@ -1,11 +1,11 @@
-//! Pushing the volume's refs to its remotes (design §11).
+//! Pushing the volume's refs to its remotes.
 //!
 //! Each configured remote gets a [`RemotePusher`] with its own repository
 //! handle and its own persisted [`PushState`] in
 //! `<state>/meta/push/<remote>.json`, so one failing remote never blocks or
 //! colours another.
 //!
-//! A push sends only the volume's own refs (design §11.4): the history
+//! A push sends only the volume's own refs: the history
 //! branch and `refs/agentfs/<volume>/*` (and the forks it received, below),
 //! as explicit `<oid>:<ref>` refspecs
 //! on an anonymous remote, never forced. Remote configuration such as
@@ -13,7 +13,7 @@
 //! global and XDG git config are not read at all
 //! (see `history::init_libgit2`).
 //!
-//! Outcomes (design §11.3):
+//! Outcomes:
 //!
 //! - **Success** records the pushed head and clears failures and any
 //!   divergence.
@@ -40,7 +40,7 @@
 //!   [`Event::PushFailed`] and backs off: the delay doubles from
 //!   `pushInterval` up to `max(pushInterval, 15m)`.
 //!
-//! Authentication (design §11.1): the credentials callback gives one
+//! Authentication: the credentials callback gives one
 //! credential per connection, for the push URL's host only. HTTP(S)
 //! remotes get a username and password (token) from `agentfsCredentials`;
 //! SSH remotes get only their private key from `agentfsSshKey`, and only
@@ -52,8 +52,8 @@
 //! None of these affect recording or committing. A per-remote `flock` on
 //! `<remote>.lock` keeps two processes (`agentfs push` and `agentfs run`)
 //! from pushing the same remote at once. The lease push's scratch
-//! repository, `<remote>.lease.git` beside it, holds the remote's history
-//! (design §15): it is removed on every exit path, and whoever next takes
+//! repository, `<remote>.lease.git` beside it, holds the remote's history:
+//! it is removed on every exit path, and whoever next takes
 //! a push lock removes any a killed push left.
 //!
 //! libgit2's local transport updates a remote ref without compare-and-swap
@@ -160,7 +160,7 @@ pub struct LastError {
     pub stage: PushStage,
 }
 
-/// An unresolved divergence (design §11.3).
+/// An unresolved divergence.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Divergence {
     /// When it was first seen.
@@ -195,7 +195,7 @@ pub struct PushState {
     pub consecutive_failures: u32,
     pub last_error: Option<LastError>,
     pub diverged: Option<Divergence>,
-    /// The patch queue push's last failure (design §11.3, §12): kept apart
+    /// The patch queue push's last failure: kept apart
     /// from `last_error` so it never backs off or blocks the branch.
     pub queue_error: Option<LastError>,
     /// When the queue's refs were last fully pushed.
@@ -249,7 +249,7 @@ pub enum PushOutcome {
         to: Oid,
         /// Set when the backlog was larger than the remote's
         /// `agentfsMaxPushSize`: only up to `to` was pushed, and this many
-        /// first-parent commits are left for the next steps (design §11.3).
+        /// first-parent commits are left for the next steps.
         limited: Option<usize>,
     },
     /// Someone else wrote the remote branch. `diverged_ref` is where the
@@ -263,17 +263,16 @@ pub enum PushOutcome {
         kind: PushFailureKind,
         message: String,
         retry_in: Duration,
-        /// The git push, or the LFS upload before it (design §7).
+        /// The git push, or the LFS upload before it.
         stage: PushStage,
     },
     /// Another process holds this remote's push lock.
     Busy,
-    /// The shutdown cancelled the attempt before it sent anything (design
-    /// §11.2). Not a failure: no alarm, nothing saved, no backoff.
+    /// The shutdown cancelled the attempt before it sent anything. Not a failure: no alarm, nothing saved, no backoff.
     Cancelled,
 }
 
-/// What the patch queue push of one attempt did (design §11.3, §12).
+/// What the patch queue push of one attempt did.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct QueuePush {
     /// The status ref was pushed.
@@ -320,7 +319,7 @@ impl QueuePush {
 }
 
 impl PushOutcome {
-    /// A push that sent only part of the backlog (design §11.3); the next
+    /// A push that sent only part of the backlog; the next
     /// step should follow at once.
     pub fn is_limited(&self) -> bool {
         matches!(
@@ -354,7 +353,7 @@ impl PushOutcome {
 }
 
 /// One ref of [`RemotePusher::push_create_only`]: created on the remote
-/// at `oid` if absent, never moved (design §11.5).
+/// at `oid` if absent, never moved.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateOnlyRef {
     pub name: String,
@@ -367,7 +366,7 @@ pub enum CreateOnlyOutcome {
     /// Every ref is on the remote at exactly its oid (listed after the
     /// push).
     Held,
-    /// Not yet: retried like any failed push (design §11.3).
+    /// Not yet: retried like any failed push.
     Failed {
         kind: PushFailureKind,
         message: String,
@@ -436,14 +435,13 @@ pub struct RemotePusher {
     /// The volume's branch ref: the name pushed to on the remote.
     branch_ref: String,
     /// The local ref pushed there: the branch, or the change line for a
-    /// remote with `agentfsPush = changeLine` ([`Settings::push_source_ref`],
-    /// design §19.2 item 11). Claims and divergence are judged against it.
+    /// remote with `agentfsPush = changeLine` ([`Settings::push_source_ref`]). Claims and divergence are judged against it.
     source_ref: String,
     push_interval: Duration,
     remote: RemoteSettings,
-    /// Credentials, SSH key and known hosts (design §11.1).
+    /// Credentials, SSH key and known hosts.
     auth: RemoteAuth,
-    /// For resolving the LFS endpoint (design §7).
+    /// For resolving the LFS endpoint.
     settings: Settings,
     lfs: ObjectCache,
     /// The LFS upload transfer, resolved the first time a push has
@@ -456,10 +454,10 @@ pub struct RemotePusher {
     patch_remote: bool,
     /// What the last attempt's queue push did.
     queue: Option<QueuePush>,
-    /// The last attempt pushed only part of the backlog (design §11.3):
+    /// The last attempt pushed only part of the backlog:
     /// the next follows at once.
     step_pending: bool,
-    /// Cancels its attempts at shutdown (design §11.2).
+    /// Cancels its attempts at shutdown.
     stop: Arc<PushStop>,
     /// Runs at the end of a push's negotiation, once its update began: a
     /// test holds a push there.
@@ -490,7 +488,7 @@ pub struct RemotePusher {
 impl RemotePusher {
     /// A pusher for `remote`. Alarms go to `events`, which the caller has
     /// already wrapped with [`Telemetry::sink`] if telemetry is on; spans go
-    /// to `telemetry` (design §13).
+    /// to `telemetry`.
     pub fn open(
         state: &StateDir,
         settings: &Settings,
@@ -539,7 +537,7 @@ impl RemotePusher {
         })
     }
 
-    /// What cancels this pusher's attempts (design §11.2).
+    /// What cancels this pusher's attempts.
     pub fn stop_handle(&self) -> Arc<PushStop> {
         self.stop.clone()
     }
@@ -593,7 +591,7 @@ impl RemotePusher {
 
     /// How long to wait before the next attempt: `pushInterval` after a
     /// success, the backoff after failures, and none after a push that
-    /// sent only part of the backlog (design §11.3).
+    /// sent only part of the backlog.
     pub fn next_delay(&self) -> Duration {
         if self.step_pending {
             return Duration::ZERO;
@@ -620,8 +618,7 @@ impl RemotePusher {
     /// except for [`PushOutcome::Busy`], an event.
     ///
     /// Runs in an `agentfs.push` span carrying the remote, the last pushed
-    /// commit, the head, the outcome and, on failure, the reason (design
-    /// §13).
+    /// commit, the head, the outcome and, on failure, the reason.
     pub fn push_once(&mut self) -> PushOutcome {
         let span = self.telemetry.span(spans::PUSH, || {
             let mut attrs = vec![KeyValue::new("agentfs.remote", self.remote.name.clone())];
@@ -711,10 +708,10 @@ impl RemotePusher {
             outcome
         };
         self.step_pending = limited;
-        // The queue push follows every branch attempt, failed or not
-        // (design §12): the status ref reaches the remote even while the
+        // The queue push follows every branch attempt, failed or not:
+        // the status ref reaches the remote even while the
         // branch cannot; applied refs wait for a branch push that worked,
-        // and for the last step of a limited one (design §11.3).
+        // and for the last step of a limited one.
         if self.patch_remote {
             self.queue = self.queue_push(outcome.is_success() && !limited);
         }
@@ -808,7 +805,7 @@ impl RemotePusher {
         };
         *head_out = Some(head);
         self.check_start(head);
-        // A maximum push size (design §11.3): measured before pushing, from
+        // A maximum push size: measured before pushing, from
         // the branch the remote advertises.
         let mut step = None;
         if let Some(limit) = self.remote.max_push_size {
@@ -860,7 +857,7 @@ impl RemotePusher {
             Err(e) => return self.failed(PushFailureKind::Local, e.to_string(), Some(head)),
         };
         // LFS objects first: a ref is never pushed before the objects its
-        // commits reference (design §7).
+        // commits reference.
         match self.upload_lfs(head) {
             Ok(report) => *lfs_out = report,
             Err(e) => return self.failed_at(e.kind, e.message, Some(head), PushStage::Lfs),
@@ -932,8 +929,8 @@ impl RemotePusher {
             && (oid == head || self.repo.graph_descendant_of(head, oid).unwrap_or(false))
     }
 
-    /// One step of a backlog larger than the remote's `agentfsMaxPushSize`
-    /// (design §11.3): the branch alone, up to `commit`, with the LFS
+    /// One step of a backlog larger than the remote's `agentfsMaxPushSize`:
+    /// the branch alone, up to `commit`, with the LFS
     /// objects of that step only. Diverged refs wait for the full push.
     fn step_push(
         &mut self,
@@ -1050,8 +1047,8 @@ impl RemotePusher {
         }
     }
 
-    /// Uploads the LFS objects that the commits the remote lacks reference
-    /// (design §7), before any ref is pushed. `None` when they reference
+    /// Uploads the LFS objects that the commits the remote lacks reference,
+    /// before any ref is pushed. `None` when they reference
     /// none: then no LFS endpoint is resolved or contacted. Only the
     /// objects the server lacks must be in the local cache: an object it
     /// already has needs no local copy (after `agentfs lfs prune`).
@@ -1061,7 +1058,7 @@ impl RemotePusher {
             return Ok(None);
         }
         // This remote's own object limit, before anything is sent: a
-        // limit set after the objects were committed (design §7, §11.3).
+        // limit set after the objects were committed.
         if let Some(limit) = self.remote.max_lfs_object_size {
             let over: Vec<String> = objects
                 .iter()
@@ -1121,7 +1118,7 @@ impl RemotePusher {
     /// (never `+`), under this remote's push lock, with the same
     /// authentication and proxy as the branch push and the LFS objects
     /// their commits reference uploaded first; then a listing that checks
-    /// each is at exactly its oid (design §11.5). A ref the remote holds at
+    /// each is at exactly its oid. A ref the remote holds at
     /// another oid, before or after the push, is
     /// [`CreateOnlyOutcome::AnotherWriter`] and is left alone. Never
     /// touches the branch or the queue refs, nor this remote's push state.
@@ -1236,7 +1233,7 @@ impl RemotePusher {
 
     /// Replaces this worktree's own branch on the remote with the local
     /// head, leased on `lease`: the value the operator saw on the remote
-    /// (F8 S2; design §15). Under this remote's push lock, not the state
+    /// (F8 S2). Under this remote's push lock, not the state
     /// lock. `lease` is fetched from the remote when it is not in this
     /// repository; the push is refused ([`LeaseOutcome::Unrelated`]) when
     /// `lease` and the head share no commit, refused
@@ -1287,7 +1284,7 @@ impl RemotePusher {
             Err((kind, message)) => return failed(kind, message),
         }
         // LFS objects first: a ref is never pushed before the objects its
-        // commits reference (design §7).
+        // commits reference.
         if let Err(e) = self.upload_lfs(head) {
             return failed(e.kind, e.message);
         }
@@ -1436,7 +1433,7 @@ impl RemotePusher {
         Ok(refspecs)
     }
 
-    /// The patch queue push (design §11.3, §12), after the branch push,
+    /// The patch queue push, after the branch push,
     /// for the patch remote only.
     ///
     /// It writes only by the branch rule (F8 rule 2): one listing of the
@@ -1618,7 +1615,7 @@ impl RemotePusher {
         Ok(())
     }
 
-    /// Where a measured push starts (design §11.3): the branch the remote
+    /// Where a measured push starts: the branch the remote
     /// advertises, when this repository has that commit and it is the head
     /// or an ancestor of it. It is then recorded as the last pushed commit:
     /// the push state can lag the remote (deleted by the history-rewrite
@@ -2105,7 +2102,7 @@ fn lease_scratch(lock: &Path) -> PathBuf {
     lock.with_file_name(name)
 }
 
-/// The lease check's scratch repository (design §15), which holds the
+/// The lease check's scratch repository, which holds the
 /// remote's history, the old history a rewrite removed included: removed
 /// when created (a leftover is never reused) and when dropped, so no exit
 /// path, an error or a panic unwinding, leaves it behind. A process killed
@@ -2189,7 +2186,7 @@ fn commits_beyond(
 }
 
 /// `commit` as a recorder made it: `None` without an `Agentfs-Seq`
-/// trailer (design §9), which every agentfs commit carries.
+/// trailer, which every agentfs commit carries.
 fn recording(commit: &git2::Commit) -> Option<Recording> {
     let seq = crate::history::seq_from_message(&String::from_utf8_lossy(commit.message_bytes()))?;
     let stamp = |sig: git2::Signature| Stamp {
@@ -2252,8 +2249,7 @@ pub fn status(state: &StateDir, settings: &Settings) -> Result<Vec<RemoteStatus>
         .collect()
 }
 
-/// One remote's push backlog, as the telemetry gauges report it (design
-/// §13).
+/// One remote's push backlog, as the telemetry gauges report it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteBacklog {
     pub remote: String,
@@ -2262,7 +2258,7 @@ pub struct RemoteBacklog {
     pub unpushed: usize,
     /// The committer time (Unix seconds) of the oldest unpushed commit.
     pub oldest_unpushed_s: Option<i64>,
-    /// The remote branch has diverged and is not resolved (design §11.3).
+    /// The remote branch has diverged and is not resolved.
     pub diverged: bool,
 }
 
@@ -2408,7 +2404,7 @@ pub fn utc_basic(unix_secs: u64) -> String {
     )
 }
 
-/// Where a diverged head is saved (design §11.3, §11.4).
+/// Where a diverged head is saved.
 pub fn diverged_ref(volume: &str, unix_secs: u64) -> String {
     format!("refs/agentfs/{volume}/diverged/{}", utc_basic(unix_secs))
 }
@@ -3513,7 +3509,7 @@ mod tests {
         assert!(diverged_refs(remote, "vol").is_empty());
     }
 
-    /// Design §11.5: create-only refs are created where absent, confirmed
+    /// Create-only refs are created where absent, confirmed
     /// by a listing, and never moved.
     #[test]
     fn create_only_refs_are_created_and_never_moved() {
@@ -4636,8 +4632,7 @@ mod tests {
         assert_eq!(remote_ref(remote, "refs/heads/agentfs/b"), Some(b_head2));
     }
 
-    /// Volumes committing and pushing to one remote at the same time (design
-    /// §11.3, §18): two volumes, and a third misconfigured with `a`'s name.
+    /// Volumes committing and pushing to one remote at the same time: two volumes, and a third misconfigured with `a`'s name.
     /// Each volume's branch ends at its head, never overwritten; of the two
     /// `a`s the first to push owns the branch and the other diverges, saved
     /// once; the remote passes `git fsck --full --strict`.

@@ -1,4 +1,4 @@
-//! Pure helpers for remote URLs (design §11.1): which transport a URL
+//! Pure helpers for remote URLs: which transport a URL
 //! selects, its host and port, and its userinfo.
 //!
 //! They follow libgit2's own rules, so that what agentfs validates and binds
@@ -139,8 +139,8 @@ pub fn ssh_endpoint(url: &str) -> Option<Endpoint> {
     (!host.is_empty()).then_some(Endpoint { host, port })
 }
 
-/// The repository path of an SSH URL, as the remote command gets it
-/// (design §11.1): the percent-decoded path of `ssh://host/path`, without
+/// The repository path of an SSH URL, as the remote command gets it:
+/// the percent-decoded path of `ssh://host/path`, without
 /// its leading `/` when it starts with `/~` (a home directory, as git
 /// does), or the `path` of scp-like `host:path` as written. `None` for any
 /// other transport or an empty path.

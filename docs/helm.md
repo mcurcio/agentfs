@@ -18,7 +18,7 @@ checks that they do (§5).
 | Chart | Type | What |
 |---|---|---|
 | [`charts/agentfs-csi`](../charts/agentfs-csi) | application | The CSI driver ([csi.md](csi.md)): CSIDriver, RBAC with the provisioner admission policy that narrows it, the node plugin DaemonSet with its per-node csi-provisioner, profiles, credentials, the class admission policy and StorageClasses; optionally a minimal git server (§2) |
-| [`charts/agentfs-sidecar`](../charts/agentfs-sidecar) | library | Helpers that add the phase 1 sidecar ([deployment.md](deployment.md)) to a workload's own chart |
+| [`charts/agentfs-sidecar`](../charts/agentfs-sidecar) | library | Helpers that add the sidecar ([deployment.md](deployment.md)) to a workload's own chart |
 | [`deploy/examples/helm-sidecar`](../deploy/examples/helm-sidecar) | application, not published | A workload using the helpers: `deploy/sidecar` as Helm renders it |
 
 Both published charts are at `oci://ghcr.io/mcurcio/charts` (§7).
@@ -91,9 +91,8 @@ the running pods without a restart (csi.md §4).
 ### The git server
 
 `server.enabled=true` runs the chart's minimal git server, a remote for
-the profiles inside the cluster: the owner asked for "Something lighter.
-This is a minimal fit remote" and "Ideally it's optional config in the
-one helm chart" (2026-10-16, design §19.1). It is off by default.
+the profiles inside the cluster. It is a minimal git remote, an optional
+part of the one chart, and off by default.
 
 - **What runs.** One pod of the StatefulSet `agentfs-git-server`, the
   image `ghcr.io/mcurcio/agentfs-git-server`
@@ -144,7 +143,7 @@ one helm chart" (2026-10-16, design §19.1). It is off by default.
   above).
 
 What it does not do: there is one replica and no fencing, no per-volume
-keys and no hooks (design "The server"), so any profile with the token
+keys and no hooks, so any profile with the token
 can write any ref. It speaks plain HTTP inside the cluster, with no TLS.
 If its node is lost and its claim is on that node's disk, the remote is
 down until the node returns. Pull requests and the like come from adding
@@ -269,8 +268,7 @@ leaves the node plugin's credentials volume the plain Secret of
 their own manifests.
 
 The comparison ([`ci/helm-equivalence.py`](../ci/helm-equivalence.py))
-is object by object and field by field. It ignores only what Helm adds by
-design: the release's Namespace object, Helm's standard labels, `checksum/`
+is object by object and field by field. It ignores only what Helm adds on its own: the release's Namespace object, Helm's standard labels, `checksum/`
 annotations, and kustomize's hash suffix on the sidecar's ConfigMap. A
 change to either side without the other fails the lint job with a diff.
 

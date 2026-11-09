@@ -1,4 +1,4 @@
-//! Releasing a worktree (F8 rule 3, design §14.2): the one decider of
+//! Releasing a worktree (F8 rule 3): the one decider of
 //! whether DeleteVolume removes a worktree, keeps it, or waits.
 //!
 //! [`decide`] is pure. Its inputs are the worktree's declared remotes,
@@ -13,7 +13,7 @@
 //!   worktree has no history, its journal holds nothing history lacks,
 //!   and `onDelete` is `delete`; or it is an unlinked fork with no remote
 //!   of its own and `onDelete` is `delete`, whatever its history and
-//!   journal hold (design §11.5; owner, 2026-10-17: "if no remote is
+//!   journal hold (owner, 2026-10-17: "if no remote is
 //!   configured, the volume is lost, and that's a choice the user is
 //!   allowed to make"). That is the one exception to "never remove
 //!   unpushed history": a linked fork, and every other worktree, keeps it;
@@ -136,7 +136,7 @@ pub struct Worktree<'a> {
     pub kind: Kind,
 }
 
-/// Which worktree [`decide`] weighs (design §11.5): one value, so a
+/// Which worktree [`decide`] weighs: one value, so a
 /// linked fork's status and an unlinked fork cannot both be claimed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
@@ -227,7 +227,7 @@ pub fn decide(worktree: &Worktree<'_>) -> Release {
         OnDelete::Retain => Release::Keep(Kept::Retained),
     };
     // The user chose no remote for an unlinked fork: deleting it loses
-    // its history, and nothing waits (design §11.5).
+    // its history, and nothing waits.
     if worktree.kind == Kind::UnlinkedFork && worktree.remotes == Declared::LocalOnly {
         return match worktree.on_delete {
             OnDelete::Delete => Release::Delete,
@@ -530,7 +530,7 @@ mod tests {
         assert_eq!(decide(&fork), Release::Delete);
     }
 
-    /// An unlinked fork with no remote of its own (design §11.5; owner,
+    /// An unlinked fork with no remote of its own (owner,
     /// 2026-10-17: "B. And if no remote is configured, the volume is lost,
     /// and that's a choice the user is allowed to make."): `onDelete:
     /// delete` removes it unpushed, its journal and all, with history or

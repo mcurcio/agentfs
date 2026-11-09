@@ -1,4 +1,4 @@
-# Hermes in the sidecar pod of docs/deployment.md §10 (ci/e2e-hermes-kind.sh
+# Hermes in the sidecar pod of docs/deployment.md (ci/e2e-hermes-kind.sh
 # sidecar): the CI overlay of deploy/sidecar, as ci/k8s is (its namespace,
 # git server Service, remote config and Secret), with the Hermes rule files
 # (deploy/examples/hermes) as the ConfigMap's exclude and attributes,

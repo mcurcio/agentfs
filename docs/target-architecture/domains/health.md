@@ -1,19 +1,14 @@
 # Domain: Health
 
-**Layer:** System › **Domain: Health** › Feature.
-**Status:** draft 5, proposed, under [system.md](../system.md) revision 10. The target, not today's code; sketches
-are Rust surfaces. The git model (git-model.md) does not reach this domain: Health judges processes, never trees.
+**Proposed, not built.** This page proposes the Health domain (liveness of the history service and view hosts), one part of the system around the git model ([the system](../system.md)). The git model ([git-model.md](../git-model.md)) wins wherever the two disagree. Rust sketches show surfaces only. The commit that lands the slice that builds this domain deletes this page and moves the behaviour into the library or operator docs.
+The git model does not reach this domain: Health judges processes, never trees.
 
 ## 1. What Health owns, and what it is not
 
 Health answers one question: is this history service, or this view host, alive? It judges from outside, by probing,
 and decides nothing else.
 
-| Source | Words | What it asks of Health |
-|---|---|---|
-| global rules, owner 2026-10-24 | "It's all event driven"; health is its own process, never judged from another domain's missed events | probes are Health's own process |
-| global rules, owner 2026-10-08 | verification "checks a capability, not a status that can stay green while the capability is dead" | a probe proves work is being finished, not that a socket answers |
-| system S4, S5 | Health is the one judge of liveness; its probes are one of the only timers | no other domain judges liveness |
+Health is the one judge of liveness (S4), and its probes are one of the only timers (S5). A probe proves that work is being finished, not that a socket answers. The owner's guidance that applies here is in `OWNER-GUIDANCE.md` at the repository root.
 
 | Term | Meaning here | Is not |
 |---|---|---|
@@ -140,12 +135,11 @@ refusal), `Clock` (probes and deadlines only), `Publish`.
 **Prior art.** Kubernetes liveness probes; the gRPC health protocol; unreliable failure detectors (Chandra and Toueg);
 Linux pidfd; systemd's watchdog; Erlang/OTP supervisors (detector and restart policy apart).
 
-## Reconcile with existing code (agentfs origin/main b5c0dc8)
+## Where it meets the existing code
 
 - **`HistoryClient::ping`** (one `grpc.health.v1` Check) becomes `report()`.
 - **The CSI supervisor's** exit-based restart is kept as `LivenessChanged(Gone)`; it gains `Unresponsive` handling.
 - **The `AgentfsHistoryServiceUnreachable` alert** moves to Telemetry, driven by `LivenessChanged`.
 
-**NOT RUN:** pidfd across the CSI node plugin's process tree and a probe stuck on a hung FUSE mount were not tested.
+**Not verified:** pidfd across the CSI node plugin's process tree and a probe stuck on a hung FUSE mount were not tested.
 
-*History: drafts 1–4 are in git; draft 5 (2026-11-03) conforms to the git model.*

@@ -1,6 +1,5 @@
 //! Failpoints: named places on the durable path where a test build can
-//! kill the process, fail with an I/O error, panic or stall (design §18
-//! test 3, the crash model of §3.3 and §3.4).
+//! kill the process, fail with an I/O error, panic or stall.
 //!
 //! Every step of record → commit → ref update → push that leaves
 //! something on disk calls [`hit`] with its name, listed in [`POINTS`].
@@ -52,7 +51,7 @@ pub const POINTS: &[&str] = &[
     "tree.after_checkout",
     "tree.compact_before_rename",
     "tree.compact_after_rename",
-    // The synchronous step (design §3.2).
+    // The synchronous step.
     "pending.after_freeze",
     "journal.before_write",
     "journal.before_fsync",
@@ -62,7 +61,7 @@ pub const POINTS: &[&str] = &[
     "front.after_reply",
     "fuse.after_record",
     "repairs.before_rename",
-    // Commits (design §3.3, §3.4).
+    // Commits.
     "lfs.after_cache_insert",
     "commit.after_tree",
     "commit.sync_objects",
@@ -73,19 +72,19 @@ pub const POINTS: &[&str] = &[
     "journal.truncate.after_rename",
     "commit.before_pending_remove",
     "pending.remove.between",
-    // Pushes (design §11).
+    // Pushes.
     "push.after_lfs_upload",
     "push.after_remote_update",
     "push.diverged.after_pending",
     "push.diverged.after_ref",
     "state.json.before_rename",
-    // The patch queue (design §12) and repack (§3.4).
+    // The patch queue and repack.
     "patch.after_tree_write",
     "patch.after_record",
     "patch.after_commit",
     "queue.after_status",
     "repack.running",
-    // Mounting (design §17.1).
+    // Mounting.
     "mount.before_overlay",
 ];
 

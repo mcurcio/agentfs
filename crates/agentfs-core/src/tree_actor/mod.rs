@@ -1,4 +1,4 @@
-//! Tree actor for phase 1 of target git-model §3, §6, §7, §12 and §18.
+//! The tree actor (git-model §3, §6, §7, §12 and §18; `docs/trees.md`).
 //!
 //! One exclusively locked actor owns a repository, private checkouts and a
 //! journal. Every call is fsynced before acknowledgement (deliberately stronger
@@ -6,7 +6,6 @@
 //! journal record, the commit point: objects are durable before it, and Git's
 //! refs and the private checkouts are copies made after it, rebuilt from the
 //! journal at every open and after any failed copy. Nothing decides from a copy.
-//! See docs/target-architecture/phase-1.md.
 
 mod journal;
 mod pages;

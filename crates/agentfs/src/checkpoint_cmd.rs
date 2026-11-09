@@ -1,4 +1,4 @@
-//! `agentfs checkpoint` (design §17.1, §19.2 item 11; bead agentfs-mia.6):
+//! `agentfs checkpoint` (bead agentfs-mia.6):
 //! one change-line commit per intent ([`agentfs_core::checkpoint`]).
 //!
 //! The command asks a running daemon first (the control socket's

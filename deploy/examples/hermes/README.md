@@ -1,6 +1,6 @@
 # Hermes rules for agentfs
 
-The operator files for running Hermes (design §16) on an agentfs volume:
+The operator files for running Hermes on an agentfs volume:
 
 | File | Becomes | What it does |
 |---|---|---|

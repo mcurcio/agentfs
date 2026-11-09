@@ -1,5 +1,5 @@
 //! Errors of the CSI services, mapped onto gRPC status codes as the CSI
-//! specification asks (design §14.2).
+//! specification asks.
 
 /// A CSI call's failure. Each variant is the gRPC code the CO sees; the
 /// message says what to do about it.

@@ -1,5 +1,4 @@
-//! The background service: the commit loop and one push loop per remote
-//! (design §3.4, §11.2).
+//! The background service: the commit loop and one push loop per remote.
 //!
 //! - **Commit loop** (thread `agentfs-commit`): every `commitWindow` it
 //!   commits the groups that can no longer grow
@@ -11,7 +10,7 @@
 //!   success, the backoff after a failure. A thread per remote means a slow
 //!   or hung remote never delays another.
 //!
-//! - **Repack** (on the commit thread): every `repackInterval` (design §8)
+//! - **Repack** (on the commit thread): every `repackInterval`
 //!   the commit loop runs [`crate::repack::repack`] between commits, then
 //!   refreshes the committer's object database. A failure emits
 //!   [`Event::RepackFailed`] and is tried again an interval later; a round
@@ -20,7 +19,7 @@
 //!
 //! [`Service::shutdown`] stops every loop, makes the final commit, then
 //! gives each remote that lacks commits one more push attempt, all within
-//! one grace period (design §11.2), and a grace of zero skips the final
+//! one grace period, and a grace of zero skips the final
 //! push. At the grace's end each push is cancelled ([`PushStop`]): one
 //! that has not finished its negotiation sends nothing, and one still
 //! sending over the network is left on its detached thread until the
@@ -32,7 +31,7 @@
 //! before a stop reaches the remotes when they answer in time, and
 //! otherwise waits for the next start.
 //!
-//! **Push now** ([`ServiceHandle::push_now`], design §2.3): `agentfs push`
+//! **Push now** ([`ServiceHandle::push_now`]): `agentfs push`
 //! against a running daemon asks the commit loop to commit everything
 //! recorded (but an operation still running, so a restore is never
 //! published half done), then wakes each chosen push loop past its
@@ -41,7 +40,7 @@
 //! pushes; requests are counted in generations, and an attempt serves
 //! every request made before it started.
 //!
-//! **Checkpoint** ([`ServiceHandle::checkpoint`], design §19.2 item 11):
+//! **Checkpoint** ([`ServiceHandle::checkpoint`]):
 //! the commit loop serves it between commits, as it repacks, so the
 //! branch keeps one writer: it commits everything recorded (as push now
 //! does), then cuts the checkpoint ([`crate::checkpoint::cut`]).
@@ -78,8 +77,8 @@ const DECISION_SETTLE: Duration = Duration::from_secs(2);
 const SHUTDOWN_POLL: Duration = Duration::from_millis(100);
 
 /// How long past the push grace [`Service::shutdown`] still waits for a
-/// push to a local remote that is updating the remote's pack and refs
-/// (design §11.2). That is disk work only (the transfer over a network
+/// push to a local remote that is updating the remote's pack and refs.
+/// That is disk work only (the transfer over a network
 /// never waits), so it is short unless the disk is stalled; the cap keeps
 /// a hung filesystem from holding the stop forever. It is also the
 /// shutdown's ceiling: past the grace plus this, nothing at all is waited
@@ -94,7 +93,7 @@ pub const LOCAL_UPDATE_CAP: Duration = Duration::from_secs(10);
 const COMMIT_RESULTS_KEPT: usize = 64;
 
 /// The time the service's deadlines run on: [`Service::shutdown`]'s grace
-/// period (design §11.2) and [`ServiceHandle::push_now`]'s timeout. The
+/// period and [`ServiceHandle::push_now`]'s timeout. The
 /// system's monotonic clock, or a test's that stands still.
 trait Clock: Send + Sync + std::fmt::Debug {
     fn now(&self) -> Instant;
@@ -144,7 +143,7 @@ impl Stop {
     }
 }
 
-/// What the final push at shutdown did for one remote (design §11.2).
+/// What the final push at shutdown did for one remote.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FinalPush {
     /// One more attempt was made: its outcome.
@@ -184,7 +183,7 @@ pub struct RemoteResult {
     /// or there is no branch yet.
     pub unpushed: Option<usize>,
     /// Earlier attempts of the same request that each sent only part of
-    /// the backlog (design §11.3), oldest first; filled by callers that
+    /// the backlog, oldest first; filled by callers that
     /// follow the steps, empty from the service.
     pub steps: Vec<PushOutcome>,
 }
@@ -326,7 +325,7 @@ impl Signal {
     }
 }
 
-/// Asks a running [`Service`] to commit and push now (design §2.3, §11.2):
+/// Asks a running [`Service`] to commit and push now:
 /// `agentfs push` against a running daemon. Cheap to clone; usable from
 /// any thread.
 #[derive(Debug, Clone)]
@@ -438,7 +437,7 @@ impl ServiceHandle {
         Ok(report)
     }
 
-    /// Cuts a checkpoint (design §19.2 item 11): the commit loop commits
+    /// Cuts a checkpoint: the commit loop commits
     /// everything recorded (but an operation still running) after its
     /// current commit, then runs [`checkpoint::cut`], so the branch keeps
     /// one writer. Waits for it up to `timeout`; a checkpoint not cut by
@@ -925,7 +924,7 @@ fn commit_loop(
             continue;
         }
         if let Some(generation) = generation {
-            // Push now (design §2.3): everything recorded, except an
+            // Push now: everything recorded, except an
             // operation still running.
             let result = committer.commit_now();
             match &result {
@@ -1949,7 +1948,7 @@ mod tests {
     /// A push to a local remote that is updating the remote when the
     /// grace ends is waited for, not left to die with the process inside
     /// the remote's ref update, which left `<remote>/refs/...lock` and
-    /// every later push refused (design §11.2).
+    /// every later push refused.
     #[test]
     fn a_local_update_running_at_the_grace_end_is_waited_for() {
         let held = held_final_push(Hold::InUpdate);
@@ -2073,7 +2072,7 @@ mod tests {
 
     /// One remote's thread held deciding its final push, another's held
     /// in its local update: the shutdown still returns once the clock
-    /// passes the deadline plus the cap, naming both (design §11.2: the
+    /// passes the deadline plus the cap, naming both (: the
     /// stop is bounded however its pushes hang).
     #[test]
     fn a_stop_is_bounded_with_a_hung_update_and_a_hung_decision() {

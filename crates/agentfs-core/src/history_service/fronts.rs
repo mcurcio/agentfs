@@ -1,4 +1,4 @@
-//! The service's side of listening fronts (design §14.1, §15).
+//! The service's side of listening fronts.
 //!
 //! A front that opens a `Listen` stream hands it to the service's
 //! [`Fronts`] as its link, one per slot (a front's new stream replaces its

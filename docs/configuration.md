@@ -1,8 +1,8 @@
 # Configuration reference
 
 Every setting agentfs reads, what it accepts, and what happens when it is
-wrong. The design is in [design.md](design.md) (§4.3 settings, §9
-identities, §11 remotes); how to run a mount is in the
+wrong. What the settings do is in [recording](recording.md) (rules, attributes,
+commit identities) and [remotes](remotes.md); how to run a mount is in the
 [operator guide](operator-guide.md). The Helm charts' values are in their
 READMEs, generated from `values.yaml` and checked in CI
 ([helm.md](helm.md#3-values)).
@@ -32,7 +32,7 @@ Settings are git config keys in the history repository's **own** config
 file, `<state>/git/config`. Nothing else is read: libgit2's system, XDG,
 global and ProgramData config, and its home directory, are cleared once per
 process, so `~/.gitconfig`, `url.<base>.insteadOf`, `http.*` and
-`~/.ssh/known_hosts` never affect a volume (design §11.1).
+`~/.ssh/known_hosts` never affect a volume (see [remotes](remotes.md)).
 
 **The one exception: `include.path`.** The repository's config may
 include operator-owned fragments, for example a Kubernetes ConfigMap
@@ -95,31 +95,31 @@ suffix (`512k`, `100m`).
 
 | Key | Type | Default | Meaning and validation |
 |---|---|---|---|
-| `agentfs.volume` | name | none: required | The volume's name, set by `agentfs init --volume`. Unique within any repository it pushes to; it names the branch and `refs/agentfs/<volume>/*` (§11.4). Letters, digits, `.`, `_`, `-`, starting with a letter or digit, no `..`, not ending in `.lock` or `.` |
+| `agentfs.volume` | name | none: required | The volume's name, set by `agentfs init --volume`. Unique within any repository it pushes to; it names the branch and `refs/agentfs/<volume>/*`. Letters, digits, `.`, `_`, `-`, starting with a letter or digit, no `..`, not ending in `.lock` or `.` |
 | `agentfs.branch` | branch name | `agentfs/<volume>` | The history branch, set by `agentfs init --branch` |
-| `agentfs.respectTreeRules` | boolean | `false` | Whether `.gitignore` and `.gitattributes` tracked in the tree take part in path rules (§4). With `false` they are content only |
-| `agentfs.nested` | `exclude` or `working-tree` | `exclude` | Nested git repositories: `exclude` records nothing in them, `working-tree` records their working files but never their git directory (§5) |
-| `agentfs.commitWindow` | duration | `200ms` | Records this close in time become one commit (§3.4) |
-| `agentfs.pushInterval` | duration | `60s` | How often each remote is pushed; also the base of the failure backoff, which doubles up to `max(pushInterval, 15m)` (§11.2) |
-| `agentfs.sweepInterval` | duration, at least `1s` | `30s` | How often the mount records files held open and retries failed records (§3.1, §3.5) |
-| `agentfs.repackInterval` | duration, at least `1m`, or `0`/`off` | `1h` | How often the commit loop (`mount`, `run`) repacks the history with `git repack -d --geometric=2`, delta-compressing versions of files changed in place (§8). Needs the `git` CLI; skipped when nothing is loose, and tried again a second later while a push runs; a failure raises `RepackFailed`. git runs with one thread and bounded windows, about 256 MiB, in a cleared environment; commits wait while it runs, and a stop kills it. `0` or `off` never repacks |
-| `agentfs.patchRemote` | remote name, or `none` | the only remote, when exactly one is configured; else none | Where the patch queue (§12) is fetched from at mount, and the only remote that gets the queue push (status ref, `applied/<n>`, deleted `inbox/<n>`). A name that is not a valid remote means none. With none, patches already in the local inbox still apply. A linked fork does not read this key: its queue is always on its fork remote (§11.5), so `none` on a source (as `serve-git` needs) leaves its forks' queues on |
+| `agentfs.respectTreeRules` | boolean | `false` | Whether `.gitignore` and `.gitattributes` tracked in the tree take part in path rules. With `false` they are content only |
+| `agentfs.nested` | `exclude` or `working-tree` | `exclude` | Nested git repositories: `exclude` records nothing in them, `working-tree` records their working files but never their git directory |
+| `agentfs.commitWindow` | duration | `200ms` | Records this close in time become one commit |
+| `agentfs.pushInterval` | duration | `60s` | How often each remote is pushed; also the base of the failure backoff, which doubles up to `max(pushInterval, 15m)` |
+| `agentfs.sweepInterval` | duration, at least `1s` | `30s` | How often the mount records files held open and retries failed records |
+| `agentfs.repackInterval` | duration, at least `1m`, or `0`/`off` | `1h` | How often the commit loop (`mount`, `run`) repacks the history with `git repack -d --geometric=2`, delta-compressing versions of files changed in place. Needs the `git` CLI; skipped when nothing is loose, and tried again a second later while a push runs; a failure raises `RepackFailed`. git runs with one thread and bounded windows, about 256 MiB, in a cleared environment; commits wait while it runs, and a stop kills it. `0` or `off` never repacks |
+| `agentfs.patchRemote` | remote name, or `none` | the only remote, when exactly one is configured; else none | Where the patch queue is fetched from at mount, and the only remote that gets the queue push (status ref, `applied/<n>`, deleted `inbox/<n>`). A name that is not a valid remote means none. With none, patches already in the local inbox still apply. A linked fork does not read this key: its queue is always on its fork remote, so `none` on a source (as `serve-git` needs) leaves its forks' queues on |
 | `agentfs.patchFetchTimeout` | duration, or `0`/`off` | `30s` | How long a mount (or `agentfs patch apply`) waits for the inbox fetch; on timeout or failure it raises `PatchFetchFailed` and applies what is already fetched. `0` or `off` skips the fetch |
-| `agentfs.patchAccept` | `cleanMerge`, `approval` or `command` | `cleanMerge` | The acceptance rule: whether a patch that merges cleanly onto the head may land (§12). `cleanMerge` lands it. `approval` lands it once `refs/agentfs/<volume>/approved/<n>` on the patch remote names its tip (`agentfs patch approve N`); until then it is set aside, awaiting approval, and a replaced patch needs approving again. `command` runs `$GIT_DIR/hooks/patch-accept` without a shell, in an empty environment but `PATH`, with the candidate as JSON on stdin (schema 1: `volume`, `inbox`, `tip`, `base`, `head`, `merged_tree`, `commits`, `paths`, `barrier`): exit 0 lands it, 1 holds it as `refused` (its first line of stderr is the message), 75 sets it aside awaiting the hook; any other status, a signal, the timeout or a hook that cannot start leaves it not judged and raises `PatchRuleFailed`. A set-aside patch is judged again at every run. Any other value fails the volume (`BadChoice`) |
+| `agentfs.patchAccept` | `cleanMerge`, `approval` or `command` | `cleanMerge` | The acceptance rule: whether a patch that merges cleanly onto the head may land. `cleanMerge` lands it. `approval` lands it once `refs/agentfs/<volume>/approved/<n>` on the patch remote names its tip (`agentfs patch approve N`); until then it is set aside, awaiting approval, and a replaced patch needs approving again. `command` runs `$GIT_DIR/hooks/patch-accept` without a shell, in an empty environment but `PATH`, with the candidate as JSON on stdin (schema 1: `volume`, `inbox`, `tip`, `base`, `head`, `merged_tree`, `commits`, `paths`, `barrier`): exit 0 lands it, 1 holds it as `refused` (its first line of stderr is the message), 75 sets it aside awaiting the hook; any other status, a signal, the timeout or a hook that cannot start leaves it not judged and raises `PatchRuleFailed`. A set-aside patch is judged again at every run. Any other value fails the volume (`BadChoice`) |
 | `agentfs.patchAcceptTimeout` | duration above zero | `60s` | How long the `patch-accept` hook may run; at the timeout its process group is killed and the patch is not judged. `0` is refused (`TooShort`) |
-| `agentfs.patchIntegrate` | `merge` or `rebase` | `merge` | How a patch is merged onto the branch head (§12), by the `git` program. `merge` merges the patch's whole diff (`git merge-tree` against its base); `rebase` replays its commits one by one and holds it as a `conflict` at the first that conflicts. Either way it lands as one commit. Both use the merge drivers the operator's `$GIT_DIR/info/attributes` names: a built-in one (`merge=union`) or a `merge.<name>.driver` of the repository's config; the tree's `.gitattributes` never steer a merge. A configured driver whose program is not an executable file (looked up in a fixed `PATH`), or one that is killed or exits above 128, leaves the patch not judged (`merge driver <name>`) and raises `PatchRuleFailed` (rule `merge`); one that exits 1 to 128 is a conflict. The image ships `mergiraf` for a `merge.mergiraf.driver` (docs: its `--git` form). Any other value fails the volume (`BadChoice`) |
-| `agentfs.patchNotifyUrl` | an `http://` URL, or `https://` in a build with the `https` feature, with no user or password | unset: no webhook | Where every change of the patch queue's verdicts is POSTed (§12, design §19.1 "Integrators decide when patches are applied"): after each queue run (at mount or `agentfs patch apply`) and each judging under a daemon, one notice as `application/json` (schema 1: `schema`, `volume`, `branch`, `head`, `status`, `changes` of `inbox`, `patch`, `from`, `to`, `landed`, and `apply` when it answers an apply call: `{"kind":"landed","landed":[...]}` or `{"kind":"attached","message":...}`), with `Idempotency-Key: <volume>:<status commit>`, no redirects followed. A 2xx is delivered; anything else raises `NotifyFailed`, and the next queue run or apply sends the same changes again (at least once: dedupe on volume, inbox, patch and verdict). The `$GIT_DIR/hooks/patch-notify` hook, when it exists, gets the same notice on stdin, run without a shell in an empty environment but `PATH`; exit 0 is delivered. Under CSI a profile's config sets it. Another scheme, or a URL carrying userinfo (`user:token@`), fails the volume (`NotifyUrl`, the value echoed with its userinfo as `***`): the token goes in `agentfs.patchNotifyCredentialFile` |
+| `agentfs.patchIntegrate` | `merge` or `rebase` | `merge` | How a patch is merged onto the branch head, by the `git` program. `merge` merges the patch's whole diff (`git merge-tree` against its base); `rebase` replays its commits one by one and holds it as a `conflict` at the first that conflicts. Either way it lands as one commit. Both use the merge drivers the operator's `$GIT_DIR/info/attributes` names: a built-in one (`merge=union`) or a `merge.<name>.driver` of the repository's config; the tree's `.gitattributes` never steer a merge. A configured driver whose program is not an executable file (looked up in a fixed `PATH`), or one that is killed or exits above 128, leaves the patch not judged (`merge driver <name>`) and raises `PatchRuleFailed` (rule `merge`); one that exits 1 to 128 is a conflict. The image ships `mergiraf` for a `merge.mergiraf.driver` (docs: its `--git` form). Any other value fails the volume (`BadChoice`) |
+| `agentfs.patchNotifyUrl` | an `http://` URL, or `https://` in a build with the `https` feature, with no user or password | unset: no webhook | Where every change of the patch queue's verdicts is POSTed ([patches](patches.md)): after each queue run (at mount or `agentfs patch apply`) and each judging under a daemon, one notice as `application/json` (schema 1: `schema`, `volume`, `branch`, `head`, `status`, `changes` of `inbox`, `patch`, `from`, `to`, `landed`, and `apply` when it answers an apply call: `{"kind":"landed","landed":[...]}` or `{"kind":"attached","message":...}`), with `Idempotency-Key: <volume>:<status commit>`, no redirects followed. A 2xx is delivered; anything else raises `NotifyFailed`, and the next queue run or apply sends the same changes again (at least once: dedupe on volume, inbox, patch and verdict). The `$GIT_DIR/hooks/patch-notify` hook, when it exists, gets the same notice on stdin, run without a shell in an empty environment but `PATH`; exit 0 is delivered. Under CSI a profile's config sets it. Another scheme, or a URL carrying userinfo (`user:token@`), fails the volume (`NotifyUrl`, the value echoed with its userinfo as `***`): the token goes in `agentfs.patchNotifyCredentialFile` |
 | `agentfs.patchNotifyCredentialFile` | absolute path | unset: no `Authorization` header | A file whose contents (trimmed) the notify webhook sends as `Authorization: Bearer <token>`; read at each notice, and one that cannot be read fails that notice (`NotifyFailed`). A relative path fails the volume (`RelativePath`) |
 | `agentfs.patchNotifyTimeout` | duration above zero | `30s` | How long the `patch-notify` hook (its process group is then killed) and the notify webhook may take; past it the notice failed (`NotifyFailed`). `0` is refused (`TooShort`) |
-| `agentfs.lfsThreshold` | positive size | unset: no size rule | Content larger than this (strictly `>`) is stored as Git LFS instead of a git blob (§7). Unset, only `agentfs.store=lfs` and `filter=lfs` in `info/attributes` select LFS. Setting it needs an LFS server for every remote (see [Git LFS](#git-lfs)) |
-| `agentfs.forkRefs` | `branch` or `hidden` | `branch` | The push target new forks of this volume get (design §11.5), written into each fork's identity as `agentfs.fork.pushTarget`: `branch` pushes a fork's history to `refs/heads/agentfs/<fork>` on its fork remote, where CI and pull requests can act on it; `hidden` keeps it at `refs/agentfs/<fork>/history`, never under `refs/heads/`. Read only when a fork is created: changing it moves no fork that exists, so forks already pushing branches keep doing so until they finish or are abandoned. Any other value fails the volume (`BadChoice`). Under CSI, set it in the source's profile config |
+| `agentfs.lfsThreshold` | positive size | unset: no size rule | Content larger than this (strictly `>`) is stored as Git LFS instead of a git blob. Unset, only `agentfs.store=lfs` and `filter=lfs` in `info/attributes` select LFS. Setting it needs an LFS server for every remote (see [Git LFS](#git-lfs)) |
+| `agentfs.forkRefs` | `branch` or `hidden` | `branch` | The push target new forks of this volume get (see [forks](forks.md)), written into each fork's identity as `agentfs.fork.pushTarget`: `branch` pushes a fork's history to `refs/heads/agentfs/<fork>` on its fork remote, where CI and pull requests can act on it; `hidden` keeps it at `refs/agentfs/<fork>/history`, never under `refs/heads/`. Read only when a fork is created: changing it moves no fork that exists, so forks already pushing branches keep doing so until they finish or are abandoned. Any other value fails the volume (`BadChoice`). Under CSI, set it in the source's profile config |
 
 Operator path rules are not config keys: they are `<state>/git/info/exclude`
 (git ignore syntax: paths never recorded when new) and
 `<state>/git/info/attributes` (`-agentfs` and the other `agentfs.*`
-attributes, §4.2; see [Operator attributes](#operator-attributes)).
+attributes; see [Operator attributes](#operator-attributes)).
 
-The `agentfs.patch*` keys configure the patch queue (design §12). With
+The `agentfs.patch*` keys configure the patch queue (see [patches](patches.md)). With
 none set, a volume with one remote takes patches from it, lands a patch
 that merges cleanly (`cleanMerge`, by `merge`) and notifies no one. A
 volume whose integrator approves each patch, rebases, and hears every
@@ -143,11 +143,10 @@ Under CSI, the keys go in the profile's config.
 
 ### Remotes modes
 
-A volume's push sections decide how its history leaves the node (design
-§11.1), in one of three modes, which `agentfs status` prints as its
+A volume's push sections decide how its history leaves the node (see [remotes](remotes.md)), in one of three modes, which `agentfs status` prints as its
 `remotes:` line and telemetry reports as the gauge `agentfs.remotes.mode`
 (attribute `mode`, value 1). Zero remotes is never an error and needs
-nothing declared: remotes can come and go (design §19.1, 2026-10-17).
+nothing declared: remotes can come and go.
 
 | Mode (`mode`) | When | What happens |
 |---|---|---|
@@ -164,7 +163,7 @@ holds them too. A remote removed again makes the volume local-only
 again.
 
 A fork of a local-only source with no `agentfsForkRemote` section
-publishes into the source's own history (R4): `refs/heads/agentfs/<fork>`
+publishes into the source's own history: `refs/heads/agentfs/<fork>`
 (or its hidden ref), `refs/agentfs/<fork>/change` and `/finish` in the
 source's state area, through the source's running daemon when one holds
 its lock, else under that lock. Nothing applies it: whatever reads the
@@ -177,12 +176,11 @@ An unlinked fork of any source never pushes to the source's remotes,
 flagged or not: its remotes mode comes from its own remotes file
 (`agentfs.fork.remotes`) alone, and without one it is local-only. A
 local-only unlinked fork is the one volume whose history is not held:
-DeleteVolume with `onDelete: delete` removes it unpushed (design §19.1
-"Unlinked fork remotes").
+DeleteVolume with `onDelete: delete` removes it unpushed.
 
 ### `[agentfs "identity"]`
 
-Templates for commit identities (design §9). Variables: `{volume}`,
+Templates for commit identities (see [recording](recording.md)). Variables: `{volume}`,
 `{namespace}`, `{pod}`, `{podUid}`, `{node}`, `{replica}`, and in author
 templates also `{uid}` and `{gid}`. They come from the pod flags
 (`--namespace`/`AGENTFS_NAMESPACE`, `--pod`/`AGENTFS_POD`,
@@ -191,7 +189,7 @@ templates also `{uid}` and `{gid}`. They come from the pod flags
 rendered identity that is empty or contains `<`, `>` or a newline is an
 error.
 
-With several mounts of one volume (design §14), the history service
+With several mounts of one volume (see [library/core](library/core.md)), the history service
 renders these templates once per front, with that front's pod flags,
 and commits each front's changes with its own identity. A template that
 does not render for a front's pod flags refuses that front when it
@@ -209,7 +207,7 @@ with the service's own committer, keeping the pod's trailers, and the
 
 ### `[agentfs "fork"]`
 
-A fork's identity (design §11.5), fixed when the fork is created
+A fork's identity (see [forks](forks.md)), fixed when the fork is created
 (`agentfs fork create`, or CSI CreateVolume with a fork class) and written
 in the fork's own state-area config, beside `agentfs.volume`. Never set
 them by hand, and never in an include: a fragment that sets any of them
@@ -230,16 +228,16 @@ has none.
 |---|---|---|---|
 | `agentfs.fork.source` | name | unset: not a fork | The source volume's name, as `agentfs.volume` |
 | `agentfs.fork.base` | full commit id | unset: not a fork | The source branch's head when the fork was created: 40 lowercase hex digits |
-| `agentfs.fork.baseChangeLine` | full commit id | unset: the fork's first checkpoint starts its own change line | The source's change-line tip (`refs/agentfs/<source>/change-line`) when the fork was created, written by fork create only when the source had one and base reaches it: the first parent of the fork's first checkpoint (design §19.2 item 11). Set without a fork identity, it fails the fork (`PartialForkIdentity`); not a full commit id, `BadForkBase` |
-| `agentfs.fork.sourceState` | absolute path | unset: publishes to a fork remote | A linked fork of a local-only source (F8 S3): the source's state area, written at create; the fork publishes into its history there, unless a section sets `agentfsForkRemote`. A relative path fails the fork (`RelativePath`), and so does any value in an unlinked fork (`UnlinkedSourceState`) |
-| `agentfs.fork.link` | `linked` or `unlinked` | `linked` | Whether the fork delivers back to its source (design §11.5 "Fork link"), from `fork create --link` or a fork class's `link` at create (written only for `unlinked`), never changed after. `linked`: its finish publishes the change to its fork remote, or into a local-only source's history; it waits and alarms while it cannot reach it, and never delivers anywhere else. `unlinked`: an independent fork that pushes its history ref only to its own remotes (`agentfs.fork.remotes`; none: local-only) and delivers nothing: `fork finish` refuses it (`Unlinked`), it has no `fork status`, and DeleteVolume treats it as any worktree. Any other value fails the fork (`BadChoice`) |
-| `agentfs.fork.remotes` | absolute path | unset: an unlinked fork is local-only | An unlinked fork's own remotes (design §11.5, §19.1 "Unlinked fork remotes"), from `fork create --remotes FILE` or a fork class's `remotes` profile at create. The file is read alone at every open: its `[remote "<name>"]` sections are the fork's push remotes, with the same keys and modes as any volume's, and its `lfs.url` and `lfs.pushurl` the fork's (the source's are never read); it may hold nothing else (`ForkRemotesKey`, also for `agentfsForkRemote`), must be a readable file (`ForkRemotesUnreadable`) and must not be inside the backing tree or the mount point (`IncludeExposed`). A relative path fails the fork (`RelativePath`), and so does any value in a linked fork (`LinkedForkRemotes`) |
-| `agentfs.fork.sourceIsFork` | boolean | unset: the source is not a fork | `true` when the fork's source was itself a fork at create (bead agentfs-mia.7), written by fork create: the fork's finish rolls its change up into the source's patch queue on the fork remote, as the source's next inbox number, instead of publishing change and finish refs; once the source has finished, it publishes as a top-level fork and raises `ForkParentFinished`. Set without a fork identity, or by an include, it fails the fork (`PartialForkIdentity`, `IncludeSetsIdentity`) |
+| `agentfs.fork.baseChangeLine` | full commit id | unset: the fork's first checkpoint starts its own change line | The source's change-line tip (`refs/agentfs/<source>/change-line`) when the fork was created, written by fork create only when the source had one and base reaches it: the first parent of the fork's first checkpoint. Set without a fork identity, it fails the fork (`PartialForkIdentity`); not a full commit id, `BadForkBase` |
+| `agentfs.fork.sourceState` | absolute path | unset: publishes to a fork remote | A linked fork of a local-only source: the source's state area, written at create; the fork publishes into its history there, unless a section sets `agentfsForkRemote`. A relative path fails the fork (`RelativePath`), and so does any value in an unlinked fork (`UnlinkedSourceState`) |
+| `agentfs.fork.link` | `linked` or `unlinked` | `linked` | Whether the fork delivers back to its source ([forks](forks.md)), from `fork create --link` or a fork class's `link` at create (written only for `unlinked`), never changed after. `linked`: its finish publishes the change to its fork remote, or into a local-only source's history; it waits and alarms while it cannot reach it, and never delivers anywhere else. `unlinked`: an independent fork that pushes its history ref only to its own remotes (`agentfs.fork.remotes`; none: local-only) and delivers nothing: `fork finish` refuses it (`Unlinked`), it has no `fork status`, and DeleteVolume treats it as any worktree. Any other value fails the fork (`BadChoice`) |
+| `agentfs.fork.remotes` | absolute path | unset: an unlinked fork is local-only | An unlinked fork's own remotes (see [forks](forks.md)), from `fork create --remotes FILE` or a fork class's `remotes` profile at create. The file is read alone at every open: its `[remote "<name>"]` sections are the fork's push remotes, with the same keys and modes as any volume's, and its `lfs.url` and `lfs.pushurl` the fork's (the source's are never read); it may hold nothing else (`ForkRemotesKey`, also for `agentfsForkRemote`), must be a readable file (`ForkRemotesUnreadable`) and must not be inside the backing tree or the mount point (`IncludeExposed`). A relative path fails the fork (`RelativePath`), and so does any value in a linked fork (`LinkedForkRemotes`) |
+| `agentfs.fork.sourceIsFork` | boolean | unset: the source is not a fork | `true` when the fork's source was itself a fork at create, written by fork create: the fork's finish rolls its change up into the source's patch queue on the fork remote, as the source's next inbox number, instead of publishing change and finish refs; once the source has finished, it publishes as a top-level fork and raises `ForkParentFinished`. Set without a fork identity, or by an include, it fails the fork (`PartialForkIdentity`, `IncludeSetsIdentity`) |
 | `agentfs.fork.pushTarget` | `branch` or `hidden` | `branch` | Where the fork's history is kept and pushed, from the source's `agentfs.forkRefs` at create (written only for `hidden`): `branch` is `refs/heads/agentfs/<fork>`, `hidden` is `refs/agentfs/<fork>/history`. Any other value fails the fork (`BadChoice`) |
 
 ### `[agentfs "start"]`
 
-A started volume's start point (design §11.3, §14.2): the commit of
+A started volume's start point (see [remotes](remotes.md)): the commit of
 another worktree's branch it began from, written once in its own
 state-area config when it is created (CSI CreateVolume with a class's
 `startFrom`) and never changed. Never set them by hand, and never in an
@@ -262,13 +260,13 @@ or accepted ([start-branch-moved runbook](runbooks/start-branch-moved.md)).
 `<state>/git/info/attributes` uses git's attribute syntax. `agentfs.store`,
 `agentfs.commit`, `agentfs.coalesce`, `agentfs.group` and `agentfs.maxSize`
 count only there, never in a tracked `.gitattributes`, whatever
-`agentfs.respectTreeRules` says (§4.1 covers `-agentfs` and `filter=lfs`).
+`agentfs.respectTreeRules` says ([recording](recording.md) covers `-agentfs` and `filter=lfs`).
 
 | Attribute | Values | Default | Meaning and validation |
 |---|---|---|---|
-| `-agentfs` | | | Never record this path's content (a removal of a tracked path is still recorded) (§4.2) |
-| `agentfs.store` | `blob` or `lfs` | §7 | Force a git blob or Git LFS; `blob` does not override `filter=lfs` ([Git LFS](#git-lfs)) |
-| `agentfs.commit` | `close` or `fsync` | `close` | `fsync` puts the path in the `fsync` class for databases (§8): recorded as a whole group, at `fsync`, by a timer, at the group's last close and at unmount |
+| `-agentfs` | | | Never record this path's content (a removal of a tracked path is still recorded) |
+| `agentfs.store` | `blob` or `lfs` | unset: by size and attributes | Force a git blob or Git LFS; `blob` does not override `filter=lfs` ([Git LFS](#git-lfs)) |
+| `agentfs.commit` | `close` or `fsync` | `close` | `fsync` puts the path in the `fsync` class for databases: recorded as a whole group, at `fsync`, by a timer, at the group's last close and at unmount |
 | `agentfs.coalesce` | duration, at least `1s` | `30s` | For the `fsync` class: the least time between two captures of a group at `fsync`, and the timer's delay, so the most a change waits. A group uses its members' smallest |
 | `agentfs.group` | name | unset: the path alone | For the `fsync` class: paths in one directory with the same group and the same stem (`app.db`, `app.db-wal`, `app.db-journal`) are captured together |
 | `agentfs.maxSize` | positive size (`k`, `m`, `g`: powers of 1024) | unset | Any path: content larger than this is refused (`PathRefused`, reason `max_size`), whether stored as a blob or LFS. In a group, it refuses the whole capture |
@@ -313,15 +311,15 @@ environment variables (`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`,
 One section per push remote; every section with a `url` is a remote. The
 standard git keys are read, plus agentfs's own. `remote.<name>.push`,
 `fetch` and every other git key are ignored: pushes send only the volume's
-own refs, as explicit refspecs, never forced (§11.4).
+own refs, as explicit refspecs, never forced.
 
 | Key | Type | Default | Meaning and validation |
 |---|---|---|---|
 | `url` | URL or path | none: required | Where the remote is |
 | `pushurl` | URL or path | `url` | Where pushes go; wins over `url`, as in git. Everything below is checked against the push URL |
-| `agentfsMaxBlobSize` | positive size | no limit | The largest blob this remote accepts. Checked before each commit; with several remotes the smallest limit applies (§3.4, §11.3) |
+| `agentfsMaxBlobSize` | positive size | no limit | The largest blob this remote accepts. Checked before each commit; with several remotes the smallest limit applies |
 | `agentfsMaxLfsObjectSize` | positive size | no limit | The largest LFS object this remote's LFS server accepts. With several remotes the smallest applies when files are recorded: larger content stored as LFS is refused (`PathRefused`, `lfs_object_too_large`). A push also checks its own remote's limit before uploading (see [Size limit](#size-limit)) |
-| `agentfsMaxPushSize` | positive size | no limit | The largest git pack one push to this remote may send, measured before connecting. A larger backlog is pushed in first-parent steps (`PushLimited`); a single commit over it fails as `too_large`. LFS uploads are not counted (see [Push size](#push-size), §11.3) |
+| `agentfsMaxPushSize` | positive size | no limit | The largest git pack one push to this remote may send, measured before connecting. A larger backlog is pushed in first-parent steps (`PushLimited`); a single commit over it fails as `too_large`. LFS uploads are not counted (see [Push size](#push-size)) |
 | `agentfsCredentials` | absolute path | none | HTTP and HTTPS only: a file holding a token or `username=`/`password=` lines (see [HTTPS](#https-and-http-remotes)) |
 | `agentfsSshKey` | absolute path | none | SSH only: the private key (see [SSH](#ssh-remotes)). An SSH remote needs exactly one of this and `agentfsSshAgent` |
 | `agentfsSshKeyPassphrase` | absolute path | none | SSH only, with `agentfsSshKey`: a file holding the key's passphrase (one trailing newline dropped). Needed for an encrypted key; not read for an unencrypted one |
@@ -331,8 +329,8 @@ own refs, as explicit refspecs, never forced (§11.4).
 | `lfspushurl` | as `lfsurl` | `lfsurl` | Where LFS uploads go, unless `lfs.pushurl` or `lfs.url` is set; on an `agentfsForkRemote` section, before them |
 | `agentfsLfsCredentials` | absolute path | none | The credential file (same format as `agentfsCredentials`) for an LFS endpoint on another host or port than the push URL; never sent to any other host |
 | `proxy` | as `http.proxy`, or empty | `http.proxy` | This remote's HTTP proxy, as in git; an empty value means no proxy for this remote. It carries the remote's `https` git traffic and all its LFS requests, never SSH or plain `http://` git traffic (see [Proxies](#proxies)) |
-| `agentfsPush` | `branch` or `changeLine` | `branch` | What this remote's push sends to the volume's branch ref there (`refs/heads/agentfs/<volume>`, or `agentfs.branch`): `branch`, every recorded commit; `changeLine`, the change line (`refs/agentfs/<volume>/change-line`): only the checkpoints `agentfs checkpoint` cuts and the patches they merged (design §19.2 item 11). Claims, divergence, backlog and the LFS upload are judged against what it sends; nothing is pushed there before the first checkpoint. The patch queue's push is unchanged. Any other value misconfigures the remote |
-| `agentfsForkRemote` | boolean | `false` | This section is only for forks of the volume (design §11.5): never one of the volume's own push remotes, never its patch remote, and its limits never apply to the volume's records. With one such section, forks push there; with none, forks push to the volume's patch remote; two or more such sections are all invalid and forks are refused (`NoForkRemote`). While `lfs.url` or `lfs.pushurl` is set (the source's LFS store), such a section must set its own `lfsurl` or `lfspushurl`, which it then uses before the global keys; without one it is invalid (`RemoteMisconfigured`: a fork remote must name its own LFS endpoint), so a fork's LFS objects never reach the source's store |
+| `agentfsPush` | `branch` or `changeLine` | `branch` | What this remote's push sends to the volume's branch ref there (`refs/heads/agentfs/<volume>`, or `agentfs.branch`): `branch`, every recorded commit; `changeLine`, the change line (`refs/agentfs/<volume>/change-line`): only the checkpoints `agentfs checkpoint` cuts and the patches they merged. Claims, divergence, backlog and the LFS upload are judged against what it sends; nothing is pushed there before the first checkpoint. The patch queue's push is unchanged. Any other value misconfigures the remote |
+| `agentfsForkRemote` | boolean | `false` | This section is only for forks of the volume (see [forks](forks.md)): never one of the volume's own push remotes, never its patch remote, and its limits never apply to the volume's records. With one such section, forks push there; with none, forks push to the volume's patch remote; two or more such sections are all invalid and forks are refused (`NoForkRemote`). While `lfs.url` or `lfs.pushurl` is set (the source's LFS store), such a section must set its own `lfsurl` or `lfspushurl`, which it then uses before the global keys; without one it is invalid (`RemoteMisconfigured`: a fork remote must name its own LFS endpoint), so a fork's LFS objects never reach the source's store |
 
 The remote's name must be a valid agentfs name (as for `agentfs.volume`;
 git accepts `team/backup`, agentfs does not), because it names the push
@@ -530,7 +528,7 @@ checked (a server that drops it) is `unreachable`. libgit2 uses the system's CA 
   write access:
 
   ```sh
-  ssh-keygen -t ed25519 -N '' -C agentfs-hermes -f ./ssh-privatekey
+  ssh-keygen -t ed25519 -N '' -C agentfs-demo -f ./ssh-privatekey
   cat ./ssh-privatekey.pub   # add as a deploy key with write access
   ```
 
@@ -609,7 +607,7 @@ enforces.
 
 ## `[agentfsPusher "<name>"]`
 
-The pushers `agentfs serve-git` accepts (design §19.1 "serve-git"): one
+The pushers `agentfs serve-git` accepts ([patches](patches.md#serving-the-queue-over-git)): one
 section per pusher, read at every request, so a change needs no restart.
 A request authenticates as a pusher with HTTP Basic (user `<name>`,
 password its token: `http://<name>:<token>@host:port/`) or
@@ -633,7 +631,7 @@ whole before git keeps anything:
 
 Large files can be stored as Git LFS objects: history holds a small
 pointer, and the content goes to an LFS server before the commits that
-reference it are pushed (design §7). Ordinary clones get the content with
+reference it are pushed (see [recording](recording.md)). Ordinary clones get the content with
 `git lfs pull`. It is off until you choose what goes to LFS.
 
 ### What is stored as LFS
@@ -675,7 +673,7 @@ wins):
 | `remote.<name>.lfsurl` | `remote.<name>.lfsurl` |
 | derived from the remote's `pushurl`, else `url` | derived from the remote's `url` |
 
-A section with `agentfsForkRemote` (design §11.5) reads its own
+A section with `agentfsForkRemote` (see [forks](forks.md)) reads its own
 `lfspushurl` and `lfsurl` before `lfs.pushurl` and `lfs.url`, and while a
 global key is set it must have one, or it is invalid: the global keys name
 the source's store, which a fork's objects must not reach.
@@ -839,6 +837,54 @@ the usual backoff applies. A remote with no LFS content to push never
 contacts an LFS endpoint. See
 [stuck-pushes.md](runbooks/stuck-pushes.md#lfs-stage-failures).
 
+## Commands
+
+`agentfs` has these subcommands. Every flag of each is in the next
+section. A subcommand with its own subcommands lists them after it.
+
+- `init`: create a volume's state area. It is safe to run again: exit 0
+  for the volume the state area already holds, 1 for another volume or
+  branch. `--root` creates the backing tree.
+- `mount`: run the FUSE session, the commit loop and the push loops in one
+  process. `--sandbox-overlay` also serves the sandbox overlay
+  ([operator guide](operator-guide.md#17-the-sandbox-overlay)).
+- `run`: run the service in the foreground without a mount: it serves
+  `push` on the control socket until a signal, makes a final commit, and
+  gives each remote that lacks commits one more push.
+- `serve-history`: the volume's history service, for several mounts of one
+  volume ([operator guide](operator-guide.md#16-several-mounts-of-one-volume-history-service)).
+- `serve-git`: serve the volume's history repository as a patch source
+  over smart HTTP ([patches](patches.md#serving-the-queue-over-git)). It
+  has two git hooks, `admit` and `arrived`, hidden from help.
+- `probe`: report what is mounted at a mount point: a live agentfs mount
+  (exit 0), a stale one whose daemon died (exit 1, or 0 with
+  `--allow-stale`), nothing, or another filesystem (exit 1). It takes no
+  lock and reads no state area, for startup and readiness probes.
+- `status`: print the head, the backlog, the lock's holder and each
+  remote. It is read-only.
+- `flush`: commit what is journaled.
+- `record`: record paths of a backing tree directly, without a mount.
+- `push`: push once to every remote, or those named with `--remote`.
+  With a daemon running it asks the daemon over its control socket.
+- `restore` and `revert`: write content from history back into the tree,
+  recorded as one commit. Exit 0 done, 1 refused or failed, 75 busy.
+- `checkpoint`: cut one commit on the change line
+  ([patches](patches.md#checkpoints)).
+- `patch`: the patch queue ([patches](patches.md)), with `submit`,
+  `approve`, `apply` and `status`.
+- `lfs`: the LFS cache, with `fetch` and `prune`
+  ([operator guide](operator-guide.md#13-large-files-lfs)).
+- `fork`: forked volumes ([forks](forks.md)), with `create`, `finish`,
+  `status`, `abandon`, `list` and `deliver`.
+- `start`: for a volume started from another worktree's branch
+  ([moving](runbooks/moving.md)), with `accept`, which accepts a tip of
+  the start branch and clears the start-branch alarm. It takes no lock.
+- `trees`: tree views ([trees](trees.md)), with `init`, `fork` and
+  `mount`.
+
+Commands that write the state area take its lock and exit 75 while
+another process holds it ([operator guide](operator-guide.md#9-the-state-area-lock)).
+
 ## Flags and environment
 
 The settings above are per volume, in its config. The commands also take
@@ -853,15 +899,14 @@ variable). `agentfs <command> --help` prints them too.
 | `--root DIR` | `AGENTFS_ROOT` | the current directory | all: required by `record` and `serve-history`; used by `flush`, `checkpoint`, `run`, `patch apply` (and `serve-git`'s `POST /agentfs/apply`), and `restore` and `revert` without a mount; must match the backing tree for `mount`; `init` creates it (mode 0755) when missing |
 | `--wait-lock DURATION` | `AGENTFS_WAIT_LOCK` | `0s`: exit 75 at once | all: those that take the state-area lock wait this long for it; `lfs prune` waits this long for the LFS cache lock that restores and fetches hold |
 
-**Pod flags**, which name where the volume is mounted (design §9; in
-Kubernetes they come from the downward API). They fill the identity
+**Pod flags**, which name where the volume is mounted (see [recording](recording.md)). They fill the identity
 templates' variables, the commit trailers and the telemetry resource:
 
 | Flag | Environment | Default | Commands |
 |---|---|---|---|
-| `--namespace NAME`, `--pod NAME`, `--pod-uid UID`, `--node NAME`, `--replica NAME` | `AGENTFS_NAMESPACE`, `AGENTFS_POD`, `AGENTFS_POD_UID`, `AGENTFS_NODE`, `AGENTFS_REPLICA` | empty; `--pod-uid` defaults to the replica, and `--replica` (the committer's `{replica}`) to the pod name, else the host name. `mount` also records a given `--pod-uid` in `meta/attached.json` when the mount point is in that pod's own volume, so a different pod's start lands the patch queue over a mark the old pod's stop left (design §12) | `mount`, `run`, `record`, `flush`, `push`, `checkpoint`, `serve-history`, `serve-git` (passed to its hooks and `patch apply` as the variables), `restore`, `revert`, `patch apply`, `fork finish`, `status` (accepted and ignored) |
+| `--namespace NAME`, `--pod NAME`, `--pod-uid UID`, `--node NAME`, `--replica NAME` | `AGENTFS_NAMESPACE`, `AGENTFS_POD`, `AGENTFS_POD_UID`, `AGENTFS_NODE`, `AGENTFS_REPLICA` | empty; `--pod-uid` defaults to the replica, and `--replica` (the committer's `{replica}`) to the pod name, else the host name. `mount` also records a given `--pod-uid` in `meta/attached.json` when the mount point is in that pod's own volume, so a different pod's start lands the patch queue over a mark the old pod's stop left (see [patches](patches.md)) | `mount`, `run`, `record`, `flush`, `push`, `checkpoint`, `serve-history`, `serve-git` (passed to its hooks and `patch apply` as the variables), `restore`, `revert`, `patch apply`, `fork finish`, `status` (accepted and ignored) |
 
-**Tree view flags** (phase 1 of the proposed design; see [phase 1](target-architecture/phase-1.md)):
+**Tree view flags** (`agentfs trees mount`; see [trees](trees.md)):
 
 | Flag | Environment | Default | Commands |
 |---|---|---|---|
@@ -882,30 +927,30 @@ No production settings, rules or remotes are consumed.
 | `--volume NAME` | `AGENTFS_VOLUME` | none: required | `init`: the volume's name; `patch submit`, `patch approve`: the volume the patch is for |
 | `--branch NAME` | | `agentfs/<volume>` | `init`: the history branch; `patch submit`: the volume's branch |
 | `--include FILE` (repeatable) | | keep the existing includes | `init`: exactly these `include.path` entries |
-| `--passthrough auto\|on\|off` | `AGENTFS_PASSTHROUGH` | `auto` | `mount`: kernel passthrough for files opened read-only; files opened for writing always go through the daemon (design §17.1) |
+| `--passthrough auto\|on\|off` | `AGENTFS_PASSTHROUGH` | `auto` | `mount`: kernel passthrough for files opened read-only; files opened for writing always go through the daemon (see [library/filesystem](library/filesystem.md)) |
 | `--threads N` | `AGENTFS_THREADS` | CPUs, 2 to 16 | `mount` |
 | `--no-allow-other` | | | `mount`: only the mounting user can use the mount |
-| `--unmount-grace DURATION` | | `10s` | `mount`: how long shutdown waits for the session to end; a stop that was busy, left files open or left the filesystem mounted elsewhere (a kubelet `subPath` bind) keeps `meta/attached.json`, so the next mount in the same pod, or outside a pod, holds the patch queue (design §12) |
+| `--unmount-grace DURATION` | | `10s` | `mount`: how long shutdown waits for the session to end; a stop that was busy, left files open or left the filesystem mounted elsewhere (a kubelet `subPath` bind) keeps `meta/attached.json`, so the next mount in the same pod, or outside a pod, holds the patch queue (see [patches](patches.md)) |
 | `--on-stale-mount refuse\|hold\|recover` | `AGENTFS_ON_STALE_MOUNT` | `refuse` | `mount`: when the mount point (or the sandbox overlay's) is an agentfs mount whose daemon died, `refuse` exits 1, `hold` waits for SIGTERM and detaches every stale one, `recover` mounts over each (needs `CAP_SYS_ADMIN`; not for fronts) |
 | `--seal-mountpoint` | `AGENTFS_SEAL_MOUNTPOINT` | off | `mount`: before mounting, make the bare mount point (and the sandbox overlay's) root's with mode 0000, so a non-root workload that reaches it while no daemon is mounted (a `subPath` bound while a sidecar restarts) gets `EACCES` instead of writing unrecorded; needs root; the shipped manifests set it |
-| `--workload-mount PATH[=DIR]` (repeatable) | `AGENTFS_WORKLOAD_MOUNTS` (comma-separated) | the mount point, and its bind mounts | `mount`: where a workload sees the mount when not at the mount point (a container's `mountPath`; `=DIR` when it sees the tree's directory `DIR`, a `subPath`), so absolute `gitdir:` targets that `git worktree add` writes map exactly to nested repositories (design §5); a front sends them to its history service |
-| `--sandbox-overlay PATH` | `AGENTFS_SANDBOX_OVERLAY` | none | `mount`: also serve the sandbox overlay at `PATH`, a second mount point of the volume over the same operations that shows only the names the operator's rules would record, and refuses symlinks, hard links, special files, ownership changes and directory moves (`EXDEV`) (design §2.4). A file a sandbox creates under a name the rules skip goes to the tmp layer, `<state>/tmp-layer`, private to the overlay, never recorded, moved into the tree by a rename onto a recordable name, and wiped at start and stop; it must be on the backing tree's filesystem. Needs `--sandbox-owner`. `PATH` must not be the mount point, nested with it, or in the same parent directory (a container given that directory would reach both). Mounted after the main mount; an unmount of either stops both. Refused on a front (`--history-service`) and with `agentfs.respectTreeRules`. Sealed by `--seal-mountpoint` and recovered by `--on-stale-mount` like the mount point |
+| `--workload-mount PATH[=DIR]` (repeatable) | `AGENTFS_WORKLOAD_MOUNTS` (comma-separated) | the mount point, and its bind mounts | `mount`: where a workload sees the mount when not at the mount point (a container's `mountPath`; `=DIR` when it sees the tree's directory `DIR`, a `subPath`), so absolute `gitdir:` targets that `git worktree add` writes map exactly to nested repositories (see [recording](recording.md)); a front sends them to its history service |
+| `--sandbox-overlay PATH` | `AGENTFS_SANDBOX_OVERLAY` | none | `mount`: also serve the sandbox overlay at `PATH`, a second mount point of the volume over the same operations that shows only the names the operator's rules would record, and refuses symlinks, hard links, special files, ownership changes and directory moves (`EXDEV`) (see [guarantees](guarantees.md)). A file a sandbox creates under a name the rules skip goes to the tmp layer, `<state>/tmp-layer`, private to the overlay, never recorded, moved into the tree by a rename onto a recordable name, and wiped at start and stop; it must be on the backing tree's filesystem. Needs `--sandbox-owner`. `PATH` must not be the mount point, nested with it, or in the same parent directory (a container given that directory would reach both). Mounted after the main mount; an unmount of either stops both. Refused on a front (`--history-service`) and with `agentfs.respectTreeRules`. Sealed by `--seal-mountpoint` and recovered by `--on-stale-mount` like the mount point |
 | `--sandbox-owner UID:GID` | `AGENTFS_SANDBOX_OWNER` | none | `mount`: the sandbox overlay's view owner, the one user and group every operation through it is checked and done as, whoever the caller is, with no supplementary groups (like NFS `all_squash`); the overlay checks access itself against the stored mode bits, with no `default_permissions`; the daemon must run as that uid or as root; needs `--sandbox-overlay` |
 | `--push-grace DURATION` | | `5s` | `mount`, `run`, `serve-history`: how long shutdown may spend on a last push of the final commit (one attempt per remote that lacks commits); `0s` skips it. A push to a path or `file://` remote already updating it is waited for up to 10 s more, so shutdown spends at most this + 10 s on pushes; keep this + 10 s + the final commit under the pod's `terminationGracePeriodSeconds` (the CSI driver sets `5s` against its 30 s unstage grace), or a kill can leave a ref lock in a local remote ([stuck-pushes.md](runbooks/stuck-pushes.md#at-shutdown)) |
 | `--listen ADDR` | `AGENTFS_HISTORY_LISTEN` | `<state>/meta/history/history.sock` | `serve-history`: `unix:<path>` or an absolute socket path |
 | `--shutdown-grace DURATION` | | `10s` | `serve-history`: how long shutdown waits for fronts' requests |
-| `--workload-attached` | | off | `serve-history`: a workload may be attached, so the patch queue is judged at start and not applied (design §12); the CSI node plugin passes it while a pod of the volume is published on the node |
+| `--workload-attached` | | off | `serve-history`: a workload may be attached, so the patch queue is judged at start and not applied (see [patches](patches.md)); the CSI node plugin passes it while a pod of the volume is published on the node |
 | `--listen ADDR` | | none: required | `serve-git`: `HOST:PORT` to serve git's smart HTTP on (port `0` picks one); it prints `serve-git: listening on http://HOST:PORT/` once it listens. Plain HTTP: put TLS in front. It refuses to start while `agentfs.patchRemote` names a remote (set it to `none`), and waits up to 10 s for requests in progress when stopped |
 | `--history-service ADDR` | `AGENTFS_HISTORY_SERVICE` | | `mount`, `record`: run as a front of the history service at ADDR |
 | `--history-timeout DURATION` | `AGENTFS_HISTORY_TIMEOUT` | `10s` | `mount`, `record` with `--history-service`: how long a boundary waits for the service before `EIO` |
 | `--history-wait DURATION` | `AGENTFS_HISTORY_WAIT` | `30s` | `mount`, `record` with `--history-service`: how long to wait for the service at start |
 | `--history-slot N` | `AGENTFS_HISTORY_SLOT` | the lowest free slot | `mount`, `record` with `--history-service`: lease pending slot N (1 to 1023) when it is free, else the lowest free slot; a front restarted after a crash passes its predecessor's slot to drain that slot's repairs |
 | `--allow-stale` | | | `probe`: exit 0 for a stale agentfs mount too |
-| `--sandbox-overlay` | | | `probe`: expect the sandbox overlay's mount (source `agentfs:<volume>:sandbox-overlay`) instead of the main mount; a mount of the other kind is exit 1. The overlay is mounted last, so a sidecar probing it gates on both mounts (design §17.1) |
+| `--sandbox-overlay` | | | `probe`: expect the sandbox overlay's mount (source `agentfs:<volume>:sandbox-overlay`) instead of the main mount; a mount of the other kind is exit 1. The overlay is mounted last, so a sidecar probing it gates on both mounts (see [library/filesystem](library/filesystem.md)) |
 | `--remote NAME` (repeatable) | | every remote | `push`: push only these remotes; `lfs fetch`: fetch only from these (in name order) |
 | `--timeout DURATION` | | `120s` | `push` through a running daemon: how long to wait for its pushes (clamped to 1s..10m); a push still running then carries on in the background, and the command exits 1 (also when a push stepped under `agentfsMaxPushSize` still has commits left). Pushing directly ignores it and keeps stepping until up to date or a failure |
-| `--force-with-lease OID` | | | `push`: replace this volume's own branch on one remote (`--remote NAME`, or the volume's only remote) with the local head, if the remote's branch is OID (a full commit id), OID shares a commit with the head, and the commits it would drop hold no history an agentfs recorder wrote that the head lacks (divergence case B is refused; design §15); nothing else is pushed. Always direct (never through a running daemon), under that remote's push lock only. Exit 0 pushed or up to date; 1 lease broken, unrelated history, recorded history or failure; 75 while another push to that remote runs. For the divergence and history-rewrite runbooks (design §15) |
-| `--force` | | | `restore`: write even files open for writing through the mount; `revert`: also revert paths changed again since the commit, and write files open for writing (§15) |
+| `--force-with-lease OID` | | | `push`: replace this volume's own branch on one remote (`--remote NAME`, or the volume's only remote) with the local head, if the remote's branch is OID (a full commit id), OID shares a commit with the head, and the commits it would drop hold no history an agentfs recorder wrote that the head lacks (divergence case B is refused); nothing else is pushed. Always direct (never through a running daemon), under that remote's push lock only. Exit 0 pushed or up to date; 1 lease broken, unrelated history, recorded history or failure; 75 while another push to that remote runs. For the divergence and history-rewrite runbooks (see [operator guide](operator-guide.md#12-recovery-and-undo)) |
+| `--force` | | | `restore`: write even files open for writing through the mount; `revert`: also revert paths changed again since the commit, and write files open for writing |
 | `--dry-run` | | | `restore`, `revert`: print the plan and write nothing; `lfs fetch`: report the objects (and bytes) missing from the cache, contacting no server; `lfs prune`: report what would be deleted, deleting nothing |
 | `--older-than DURATION` | | every object | `lfs prune`: keep objects cached less than DURATION ago |
 | `--all` | | the branch head | `lfs fetch`: every object any commit on the branch references, instead of the head's (or the revisions given) |
@@ -921,7 +966,7 @@ No production settings, rules or remotes are consumed.
 | `--skip N` | | | `patch submit`: replace queued patch N with an empty patch, so the queue moves on |
 | `--depth N` | | full history | `patch submit`: fetch only this many commits (shallow producers) |
 | `--attempts N` | | `10` | `patch submit`: inbox numbers to try when other submitters race |
-| `--barrier` | | off | `patch submit`: make the patch a barrier: while it is set aside, every later patch of the volume waits behind it (design §12). A built or `--skip` patch gets the trailer `Agentfs-Barrier: yes`; a given COMMIT must already carry it in its last message paragraph, else it is refused |
+| `--barrier` | | off | `patch submit`: make the patch a barrier: while it is set aside, every later patch of the volume waits behind it (see [patches](patches.md)). A built or `--skip` patch gets the trailer `Agentfs-Barrier: yes`; a given COMMIT must already carry it in its last message paragraph, else it is refused |
 | `--patch OID` | | the tip listed | `patch approve`: the tip you mean, a full commit id; refused when the queued patch N is now another commit |
 | `--source-state DIR` | | none: required | `fork create`: the source volume's state area, read without its lock; its settings must be in included files, which the fork includes too |
 | `--name NAME` | | the source's name | `fork create`: the fork's name before its random suffix (`<name>-<8 hex digits>`) |
@@ -935,7 +980,7 @@ No production settings, rules or remotes are consumed.
 | `--source VOLUME` | | every source | `fork list`: only the changes of forks of this source volume |
 | `--repo DIR` | | `.` | `fork list`: the receiver's git repository, whose `git` and credentials are used; no state area is read |
 | `--from NAME\|URL` | | `origin` | `fork deliver`: the fork remote the published change is read from (checked as `fork list` checks it), as the receiver's repository names it; the payload's `fetch.remote` carries it as given |
-| `--to inbox\|branch\|command\|webhook` | | none: required | `fork deliver`: the delivery method (design §11.5 "Delivery"); a flag of another method is refused |
+| `--to inbox\|branch\|command\|webhook` | | none: required | `fork deliver`: the delivery method ([forks](forks.md)); a flag of another method is refused |
 | `--volume VOLUME` | | none: required by `inbox` | `fork deliver`: inbox, the volume whose inbox the change is queued in (the runner's choice, never the change's `Agentfs-Source`) |
 | `--remote NAME\|URL` | | `--from` | `fork deliver`: inbox and branch, where to push (the volume's patch remote, or the repository the pull request is opened in) |
 | `--prefix PREFIX` | | `agentfs-review/` | `fork deliver`: branch, the branch is `<prefix><fork>`, created only if absent |
@@ -948,14 +993,14 @@ No production settings, rules or remotes are consumed.
 | `--tip OID` | | none: required | `start accept`: a full commit id of the branch the volume started from (the one `status` names on its `start branch moved:` line), saved as `refs/agentfs/<volume>/accepted/<OID>` after fetching it from the start remote; the next push pushes it and no longer alarms for the commits it reaches. Takes no lock; exit 0 accepted or already, 1 refused (not a full id, not on the start branch, not a started volume) |
 
 `fork deliver ... --to command -- PROGRAM [ARGS...]` runs PROGRAM
-without a shell, with the payload (design §11.5, schema 1) as JSON on
+without a shell, with the payload (see [forks](forks.md)) as JSON on
 stdin and an environment of `PATH` alone; its stdout goes to `fork
 deliver`'s stderr. Exit 0 accepts, 75 means try again, anything else
 refuses. `fork deliver` exits 0 delivered or already delivered, 1 refused
 (or not published), 75 unavailable: run it again.
 
-The [operator guide](operator-guide.md) §4 describes the mount flags in
-full, and §16 the history service and fronts; the
+The [operator guide](operator-guide.md) section 4 describes the mount flags in
+full, and section 16 the history service and fronts; the
 [patch queue runbook](runbooks/patch-queue.md) the patch commands.
 
 ### `agentfs init`
@@ -1006,8 +1051,7 @@ equivalents above; a flag given on the command line wins.
 | `CSI_ENDPOINT`, `NODE_NAME`, `AGENTFS_CSI_POD`, `AGENTFS_CSI_NAMESPACE`, `AGENTFS_CSI_RELEASE_SCAN_INTERVAL` | `--endpoint`, `--node-id`, `--pod`, `--namespace`, `--release-scan-interval` | `agentfs-csi` ([below](#the-csi-driver-agentfs-csi)) |
 
 **Test builds only.** `AGENTFS_FAILPOINTS` sets failpoints on the durable
-path (`name=kill|error|panic|sleep(ms)[@n]`, joined with `;`; design §18
-test 3, [architecture.md](architecture.md#crash-model)). Only a binary
+path (`name=kill|error|panic|sleep(ms)[@n]`, joined with `;`, [architecture.md](architecture.md#crash-model)). Only a binary
 built with `--features agentfs/failpoints` reads it (its `--version` ends
 in `+failpoints`, and it warns at start when the variable is set); release
 builds and the image have no failpoints and ignore it. Never set it in
@@ -1015,7 +1059,7 @@ production. In the same builds, `AGENTFS_TAKE_GATE=<dir>` stops `trees mount`'s
 queue worker: it takes only when a test asks through the fifos `go` and `took`
 in that directory (`agentfs_core::failpoints::TakeGate`).
 
-**Telemetry** (design §13). Every command with pod flags but `status` (`restore` and `revert` only
+**Telemetry** (see [telemetry](telemetry.md)). Every command with pod flags but `status` (`restore` and `revert` only
 without a mount) exports OpenTelemetry metrics, traces
 and logs over OTLP when an endpoint is set; with none, telemetry is off
 and costs nothing. agentfs itself reads these to decide what to export:
@@ -1051,7 +1095,7 @@ batch settings `OTEL_BSP_*` and `OTEL_BLRP_*`, and sampling:
 `OTEL_TRACES_SAMPLER` and `OTEL_TRACES_SAMPLER_ARG` (every record makes an
 `agentfs.record` span, so on a busy volume use
 `parentbased_traceidratio` with `0.01`). [telemetry.md](telemetry.md) has
-the resource attributes, and design §13 the metrics and spans.
+the resource attributes, the metrics and spans.
 
 ## The CSI driver (`agentfs-csi`)
 
@@ -1078,8 +1122,8 @@ disk of the node that created it, for good.
 | `volumeName` | `{pvcNamespace}.{pvcName}.{pvName}`, else the PV name | the agentfs volume name; a template over `{pvcNamespace}`, `{pvcName}`, `{pvName}` that must contain `{pvName}` (`INVALID_ARGUMENT` otherwise): each claim is a worktree with its own branch, `agentfs/<volumeName>`, and a claim deleted and created again is a new one. There is no `branch` parameter. In a static PV's attributes, a literal name (`volume` is the same key), default the volume handle |
 | `onDelete` | `retain` | what DeleteVolume does once nothing would be lost: `retain` keeps the worktree on its node (`csi.retained.json`), `delete` removes it. Either way it waits (`UNAVAILABLE`, retried) while a remote lacks the branch's head, and a worktree with no remote section (local-only) is kept whatever this says, except an unlinked fork with no remote of its own, which `delete` removes unpushed |
 | `startFrom` | none | `<remote>:<branch>@<commit>`: a start class. Each claim on it is a new worktree whose history begins at `<commit>` of another worktree's `<branch>`, fetched once from `<remote>` (a push section of the profile) at CreateVolume, and kept in its identity (`[agentfs "start"]`). `<branch>` is a branch name such as `agentfs/<old volume>`, never a `refs/...` ref (a `diverged/*` ref is refused: "not a branch"), never the new volume's own branch; `<commit>` is a full id on it. Moving a volume to another node: [runbooks/moving.md](runbooks/moving.md). Not a static PV attribute |
-| `workloadMounts` | none | where pods mount the volume: comma-separated `PATH` or `PATH=DIR`, passed to every front as `--workload-mount` so worktree `gitdir:` paths map exactly (design §5, docs/csi.md §5) |
-| `fork` | `"false"` | `"true"` makes a fork class (design §11.5): a claim on it with a `dataSource` claim is a fork of that claim's volume, with the source's profile, made on the source's node (give the fork's pod affinity to its source's pods; elsewhere CreateVolume answers `FAILED_PRECONDITION`). A fork class must not set `profile`, `branch` or `startFrom`, its `onDelete` defaults to `delete`. Not a static PV attribute |
+| `workloadMounts` | none | where pods mount the volume: comma-separated `PATH` or `PATH=DIR`, passed to every front as `--workload-mount` so worktree `gitdir:` paths map exactly (see [recording](recording.md)) |
+| `fork` | `"false"` | `"true"` makes a fork class (see [forks](forks.md)): a claim on it with a `dataSource` claim is a fork of that claim's volume, with the source's profile, made on the source's node (give the fork's pod affinity to its source's pods; elsewhere CreateVolume answers `FAILED_PRECONDITION`). A fork class must not set `profile`, `branch` or `startFrom`, its `onDelete` defaults to `delete`. Not a static PV attribute |
 | `link` | `linked` | a fork class only (`INVALID_ARGUMENT` in any other): `linked` forks deliver their change back to the source when their claim is deleted; `unlinked` forks are independent, never finished, never push to the source's remotes (only to their `remotes`), and DeleteVolume applies `onDelete` once their own remotes hold the head, as for any worktree; with no remote of their own they are local-only and `onDelete: delete` removes them unpushed. Written into each fork's identity (`agentfs.fork.link`) at CreateVolume; changing the class moves no fork that exists. Not a static PV attribute |
 | `remotes` | none: local-only | a fork class with `link: unlinked` only (`INVALID_ARGUMENT` in any other): a profile name whose `<remotes>.config` holds the fork's own remotes ([`agentfs.fork.remotes`](#agentfs-fork)), written into each fork's identity at CreateVolume; the config must exist. Not a static PV attribute |
 
@@ -1099,7 +1143,7 @@ any other.
 | `--mount-dir DIR` | | `/run/agentfs-csi/mounts` | where fronts mount before the bind onto the kubelet's target |
 | `--profiles-dir DIR` | | `/etc/agentfs-csi/profiles` | the profiles |
 | `--agentfs-bin PATH` | | `/usr/local/bin/agentfs` | the `agentfs` binary the node plugin runs |
-| `--passthrough auto\|on\|off` | | `auto` | the fronts' FUSE passthrough, for files opened read-only (design §17.1) |
+| `--passthrough auto\|on\|off` | | `auto` | the fronts' FUSE passthrough, for files opened read-only (see [library/filesystem](library/filesystem.md)) |
 | `--front-threads N` | | `4` | FUSE threads per front |
 | `--stage-wait DURATION` | | `60s` | how long NodeStage waits for the history service before answering `UNAVAILABLE` |
 | `--publish-wait DURATION` | | `60s` | how long NodePublish waits for the front's mount |
@@ -1108,7 +1152,7 @@ any other.
 | `--history-wait DURATION` | | `30s` | the fronts' `--history-wait` |
 | `--backoff-max DURATION` | | `30s` | the longest delay between restarts of a crashed service or front |
 | `--pod NAME`, `--namespace NAME` | `AGENTFS_CSI_POD`, `AGENTFS_CSI_NAMESPACE` | empty | the plugin pod's name and namespace, passed to the history services (their own identity in telemetry) |
-| `--release-scan-interval DURATION` | `AGENTFS_CSI_RELEASE_SCAN_INTERVAL` | `30s` | how often the release scan runs `agentfs push` for every worktree no pod stages on this node, until a push exits 0 at its head, and `agentfs fork finish` for every fork whose deletion asked for it (design §14.2, §11.5); also the first delay after a failed push, doubling up to `--backoff-max` (at least this). It runs once at start and whenever DeleteVolume waits |
+| `--release-scan-interval DURATION` | `AGENTFS_CSI_RELEASE_SCAN_INTERVAL` | `30s` | how often the release scan runs `agentfs push` for every worktree no pod stages on this node, until a push exits 0 at its head, and `agentfs fork finish` for every fork whose deletion asked for it (see [library/kubernetes](library/kubernetes.md)); also the first delay after a failed push, doubling up to `--backoff-max` (at least this). It runs once at start and whenever DeleteVolume waits |
 
 The node plugin passes its `OTEL_*` variables on to every service and
 front; it removes inherited `AGENTFS_*` variables, so the per-volume and

@@ -4,7 +4,7 @@ A volume started from another worktree's branch (a move,
 [moving.md](moving.md)) watches that branch: at every push to its start
 remote it lists the start branch, and while the branch holds commits this
 volume has not taken in or accepted, it raises **`StartBranchMoved`**
-([design §11.3](../design.md#113-limits-and-rejected-pushes)). That happens when the
+([remotes](../remotes.md)). That happens when the
 old node comes back after the move and its release scan pushes the
 commits it had not pushed: they reach the old branch, never the new
 volume's. Nothing is lost or overwritten; the alarm says the two

@@ -1,8 +1,7 @@
 # Domain: Views
 
-**Layer:** System › **Domain: Views** › Feature.
-**Status:** draft 9, proposed, under [system.md](../system.md) revision 10 and [git-model.md](../git-model.md), which
-win where this page disagrees. The target, not today's code; sketches are Rust surfaces.
+**Proposed, not built.** This page proposes the Views domain (how each client sees and changes its tree), one part of the system around the git model ([the system](../system.md)). The git model ([git-model.md](../git-model.md)) wins wherever the two disagree. Rust sketches show surfaces only. The commit that lands the slice that builds this domain deletes this page and moves the behaviour into the library or operator docs.
+
 **What this page covers:** how each client's view serves file calls, what a client sees and when, and what Views asks
 of its tree's actor. Saves, locks, syncs and transactions themselves are git-model §6–§9.
 
@@ -10,12 +9,7 @@ of its tree's actor. Saves, locks, syncs and transactions themselves are git-mod
 
 A view is one client's filesystem: the mount point a program uses, served by a view host outside that program.
 
-**The owner's words this page serves** (system §0): R3 "a virtual filesystem overlay for each client (including
-main) that is backed by a _real_ filesystem source-of-truth"; R7 "Agentfs is the gatekeeper that exposes only what
-we want sandboxes to see"; R13 "a default usage … can operate per-file"; A1 main is a view like any fork; A5 "It
-depends on the config!"; A6 a pinned fork is an acceptable snapshot; A11 file watchers: "we can take the "no
-guarantee" path for now" (2026-11-02); close-to-open visibility, accepted: "Go" (2026-11-03, in reply to the
-recommendation). Everything else here is a design choice.
+The owner's guidance that applies here is in `OWNER-GUIDANCE.md` at the repository root. Everything else on this page is a design choice.
 
 | Views owns | Views is not |
 |---|---|
@@ -30,7 +24,7 @@ recommendation). Everything else here is a design choice.
 
 ## 2. What a client sees, and when
 
-**Close-to-open** (the owner accepted it, 2026-11-03): a change becomes visible to anyone else only once its file is
+**Close-to-open** (already true of the tree views; see [trees](../../trees.md)): a change becomes visible to anyone else only once its file is
 closed and saved, as in AFS. The close is FUSE `RELEASE` (the last reference, a shared mapping included), never
 `FLUSH` (git-model §3).
 
@@ -49,9 +43,9 @@ stops another tree's opens.
 
 | Setting | Read open | Write open | Name cache kept |
 |---|---|---|---|
-| `PerFile` (default, A5; R13's "per-file") | never waits; each file whole old or whole new | waits while a take holds p (git-model §6) | found names, missing names, listings, dropped by `TreeMoved` |
+| `PerFile` (default) | never waits; each file whole old or whole new | waits while a take holds p (git-model §6) | found names, missing names, listings, dropped by `TreeMoved` |
 | `WholeLanding` | also waits while a take holds p, so a take's files are not read half-applied | as `PerFile` | found names only |
-| `Snapshot` (A6) | never waits; the pinned snapshot never changes ([trees](trees.md) §3) | `EROFS` | everything, until `rebound` after `advance` |
+| `Snapshot` | never waits; the pinned snapshot never changes ([trees](trees.md) §3) | `EROFS` | everything, until `rebound` after `advance` |
 
 Attributes are never cached and file pages never outlive their handle, so content is always the real file's
 (design choice, today's rule).
@@ -222,7 +216,7 @@ resumes from the tree's head. A view never waits for another view.
 | Backstop lifetime for cached names | placeholder, set at the code-architect gate | bounds only a hung host's stale names; a listed timer (S5) |
 | Kernel passthrough | read-only opens | reads skip the host; writes stay visible to the view |
 | Stale mount point | `recover` (stack over it) | a host restart reuses its mount point |
-| File watchers | no guarantee (A11) | a guarantee needs a per-view mechanism FUSE may lack |
+| File watchers | no guarantee | a guarantee needs a per-view mechanism FUSE may lack |
 
 ## 9. Tests
 
@@ -254,7 +248,7 @@ All against a real mount, a real history service and real git.
    (git-model §18).
 4. **Locks are approximated:** forwarded to the working-tree file, they do not survive a take rewriting it, and do
    not hold a take back. NOT VERIFIED through FUSE.
-5. **Watchers may miss changes** (A11): a program must reload on agentfs's notice instead.
+5. **Watchers may miss changes** (accepted): a program must reload on agentfs's notice instead.
 
 ## New terms
 
@@ -273,15 +267,14 @@ mapping from FUSE lock owners; sharing one follower across views of one tree; wh
 path into the state area (a descriptor the service hands it over the session, or the session itself); the race
 between a take's release and a new write-open.
 
-## Reconcile with existing code (agentfs origin/main b5c0dc8, `docs/design.md`)
+## Where it meets the existing code
 
-- **The two-session daemon** (§2.4) becomes one view per client; the overlay's visibility gate carries over as V3.
+- **The two-session daemon** of the sandbox overlay becomes one view per client; the overlay's visibility gate carries over as V3.
 - **The tmp layer** goes: scratch names live in the tree's untracked area, never committed (git-model §3).
 - **Coherence by events** (`invalidate.rs`, never from a request thread) carries over as the follower, fed by `TreeMoved`.
-- **Today's journal** (`docs/design.md` §3.2–§3.3) carries over as the tree's journal, holding write calls instead of
+- **The existing journal** carries over as the tree's journal, holding write calls instead of
   frozen whole files; `fsync` and close make it durable, as `FLUSH` does today. **The sweep goes:** a save happens at
   `RELEASE`. Cost: the FUSE request path and node table are rewritten together.
 
-**NOT RUN:** FUSE lock forwarding, watchers across mounts and `RELEASE` after unmap were not tested.
+**Not verified:** FUSE lock forwarding, watchers across mounts and `RELEASE` after unmap were not tested.
 
-*History: drafts 1–7 are in git; draft 8 (2026-11-03) conforms to the git model and close-to-open; draft 9 (2026-11-04) records every write call in the journal before it returns, moves refusals ahead of `RELEASE`, and gives open handles objects.*

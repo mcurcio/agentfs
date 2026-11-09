@@ -2,8 +2,7 @@
 
 A fork publishes its change by pushing its history, then
 `refs/agentfs/<fork>/change` and `refs/agentfs/<fork>/finish`
-create-only, to its fork remote (design
-[§11.5](../design.md#115-forks)). Most failures (an unreachable remote,
+create-only, to its fork remote ([forks](../forks.md)). Most failures (an unreachable remote,
 bad credentials, a busy remote) are retried with backoff and need no
 runbook: fix the remote and the next attempt publishes. A few mean no
 retry can ever succeed. One function, `fork::finish::refused_reason`,
@@ -19,7 +18,7 @@ refuses it (`fork <fork> is unlinked`) and `fork status` has no state for
 it. It pushes only to its own remotes (`agentfs.fork.remotes`), never to
 the source's, and those pushes are an ordinary volume's
 ([stuck-pushes.md](stuck-pushes.md)); with none it is local-only and
-pushes nothing ([design §11.5](../design.md#115-forks), "The link").
+pushes nothing ([forks](../forks.md), "The link").
 
 ## How it shows
 
@@ -87,8 +86,7 @@ instead.
 
 **What happened.** One commit of the fork's history is larger than the
 fork remote's `agentfsMaxPushSize`, or one LFS object is larger than its
-`agentfsMaxLfsObjectSize` ([configuration](../configuration.md#push-size),
-design §11.3). A single commit is never split, so no retry can send it.
+`agentfsMaxLfsObjectSize` ([configuration](../configuration.md#push-size)). A single commit is never split, so no retry can send it.
 
 **Fix.** Raise the limit on the fork remote's section in the source's
 settings (under CSI, the profile's config), if the host takes pushes
@@ -122,7 +120,7 @@ settings files (under CSI, the profile's config).
 
 **What happened.** The fork's source is local-only, so the fork
 publishes into the source's own history, and the source refused what
-the fork brings (design [§11.5](../design.md#115-forks), "A local-only
+the fork brings ([forks](../forks.md), "A local-only
 source's forks"). agentfs treats a fork's output as untrusted, and wrote
 no ref. The message says which of three it was:
 

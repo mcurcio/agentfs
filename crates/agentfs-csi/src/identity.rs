@@ -1,4 +1,4 @@
-//! The CSI Identity service (design §14.2): the driver's name and version,
+//! The CSI Identity service: the driver's name and version,
 //! and its capabilities: the Controller service, served by every node
 //! plugin (F8 R8), and volume accessibility constraints, since a worktree
 //! lives on one node's disk ([`TOPOLOGY_KEY`]).

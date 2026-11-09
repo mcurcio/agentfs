@@ -1,4 +1,4 @@
-# The agentfs CSI driver (design §14.2, docs/csi.md, docs/helm.md).
+# The agentfs CSI driver (docs/csi.md, docs/helm.md).
 # Install into a namespace labelled for privileged pods (docs/helm.md).
 
 image:
@@ -59,7 +59,7 @@ basePath:
   # -- Where each node keeps its worktrees (`--base-path`): a hostPath
   # directory on the node's own disk, ideally a disk of its own, since a
   # full disk makes the kubelet evict every pod on the node. A network
-  # filesystem is refused (docs/csi.md §11).
+  # filesystem is refused (docs/csi.md).
   path: /var/lib/agentfs-csi/volumes
 
 node:
@@ -113,7 +113,7 @@ classAdmission:
   # -- Install the ValidatingAdmissionPolicy `agentfs-class`, which refuses
   # any StorageClass of the driver whose reclaim policy is not Delete, so
   # DeleteVolume always runs and the release decider always answers
-  # (docs/csi.md §5). Off: a class with Retain loses nothing, but its PVs
+  # (docs/csi.md). Off: a class with Retain loses nothing, but its PVs
   # stay Released for ever.
   enabled: true
 
@@ -180,5 +180,5 @@ server:
 # nothing ever delivered, never pushed to the source's remotes). An
 # unlinked class's `remotes: <profile>` names the profile whose config
 # holds the forks' own remotes; without it they are local-only and
-# deleting a claim loses its history (docs/csi.md §14).
+# deleting a claim loses its history (docs/csi.md).
 storageClasses: []

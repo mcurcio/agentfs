@@ -1,4 +1,4 @@
-//! OpenTelemetry instrumentation (design §13).
+//! OpenTelemetry instrumentation.
 //!
 //! The engine is written against the OpenTelemetry API only; the binary
 //! chooses the SDK and the exporters and hands the engine a [`Telemetry`]
@@ -50,7 +50,7 @@ use crate::record::Trigger;
 use crate::volume::StateDir;
 
 /// Why the sandbox overlay refused a change: the `reason` attribute of
-/// `agentfs.sandbox_overlay.refusals` (design §13; sandbox overlay slice
+/// `agentfs.sandbox_overlay.refusals` (sandbox overlay slice
 /// 4). Reads of hidden names are not counted: a hidden name answers like a
 /// missing one, and missing names are looked up all the time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,7 +89,7 @@ impl OverlayRefusal {
     }
 }
 
-/// Metric names (design §13).
+/// Metric names.
 pub mod names {
     pub const RECORD_DURATION: &str = "agentfs.record.duration";
     pub const RECORD_FAILURES: &str = "agentfs.record.failures";
@@ -122,11 +122,11 @@ pub mod names {
     pub const RECONCILE_FAILURES: &str = "agentfs.reconcile.failures";
     pub const NESTED_GITDIR_HEURISTIC: &str = "agentfs.nested.gitdir_heuristic";
     pub const FORK_PUBLISH_DURATION: &str = "agentfs.fork.publish.duration";
-    /// Recorded by the binary, which owns the exporters (design §13).
+    /// Recorded by the binary, which owns the exporters.
     pub const TELEMETRY_EXPORT_FAILURES: &str = "agentfs.telemetry.export_failures";
 }
 
-/// Span names (design §13).
+/// Span names.
 pub mod spans {
     pub const RECORD: &str = "agentfs.record";
     pub const COMMIT: &str = "agentfs.commit";
@@ -256,14 +256,13 @@ impl Telemetry {
             reconcile_failures: counter(
                 names::RECONCILE_FAILURES,
                 "{move}",
-                "Moved trees given up on after repeated failures to reconcile them (design \
-                 §3.1); each also raises ReconcileFailed",
+                "Moved trees given up on after repeated failures to reconcile them; each also raises ReconcileFailed",
             ),
             reconcile_records: counter(
                 names::RECONCILE_RECORDS,
                 "{record}",
                 "Records made by reconciling moved trees: files the rules decide differently \
-                 at the new path, or changed around the move (design §3.1)",
+                 at the new path, or changed around the move",
             ),
             push_failures: counter(
                 names::PUSH_FAILURES,
@@ -274,7 +273,7 @@ impl Telemetry {
                 names::PUSH_LIMITED,
                 "{push}",
                 "Pushes that sent only part of the backlog because it was larger than the \
-                 remote's agentfsMaxPushSize, by remote (design §11.3)",
+                 remote's agentfsMaxPushSize, by remote",
             ),
             rejected_paths: counter(
                 names::PRECHECK_REJECTED_PATHS,
@@ -285,7 +284,7 @@ impl Telemetry {
                 .f64_histogram(names::FRONT_ROUND_TRIP)
                 .with_unit("s")
                 .with_description(
-                    "Time a front waits for the history service to answer, by request (design §14)",
+                    "Time a front waits for the history service to answer, by request",
                 )
                 .with_boundaries(RECORD_DURATION_BOUNDARIES.to_vec())
                 .build(),
@@ -298,26 +297,26 @@ impl Telemetry {
                 names::HISTORY_SERVICE_SUPERSEDED,
                 "{write}",
                 "Front writes the history service skipped because a newer state of the path was \
-                 already journaled (design §14.1)",
+                 already journaled",
             ),
             resyncs: counter(
                 names::HISTORY_SERVICE_RESYNCS,
                 "{record}",
                 "Paths the history service recorded again as the backing tree has them, after a \
-                 front's change it could not order against another's (design §14.1)",
+                 front's change it could not order against another's",
             ),
             create_as_caller_fallbacks: counter(
                 names::FUSE_CREATE_AS_CALLER_FALLBACKS,
                 "{object}",
                 "Objects a root daemon created as itself and then gave to the caller, because \
-                 creating as the caller was refused or could not be set up (design §6)",
+                 creating as the caller was refused or could not be set up",
             ),
             racy_rechecks: counter(
                 names::FUSE_RACY_RECHECKS,
                 "{boundary}",
                 "Boundaries that would have recorded a file again only because its last record \
                  was racy, by outcome: skipped (its bytes were the frozen copy still last \
-                 journaled at its path) or recorded (design §3.1)",
+                 journaled at its path) or recorded",
             ),
             overlay_refusals: counter(
                 names::SANDBOX_OVERLAY_REFUSALS,
@@ -332,7 +331,7 @@ impl Telemetry {
                 .with_description(
                     "Seconds from a fork's finish commit to its fork remote holding the change \
                      and finish refs, by remote; recorded once, when the published mark is \
-                     written (design §11.5)",
+                     written",
                 )
                 .with_boundaries(FORK_PUBLISH_BOUNDARIES.to_vec())
                 .build(),
@@ -345,7 +344,7 @@ impl Telemetry {
             .with_unit("{target}")
             .with_description(
                 "Absolute gitdir: or .git symlink targets under no known view of the tree, found \
-                 by trying their suffixes (design §5); configure --workload-mount (CSI: the workloadMounts \
+                 by trying their suffixes; configure --workload-mount (CSI: the workloadMounts \
                  parameter) to map them exactly",
             )
             .with_callback(|observer| observer.observe(crate::nested::heuristic_matches(), &[]))
@@ -428,7 +427,7 @@ impl Telemetry {
             .meter
             .u64_observable_gauge(names::PUSH_DIVERGED)
             .with_unit("{remote}")
-            .with_description("1 while the remote branch has diverged (design §11.3)")
+            .with_description("1 while the remote branch has diverged")
             .with_callback(move |observer| {
                 for remote in snapshot.get(2) {
                     observer.observe(u64::from(remote.diverged), &[remote_attr(&remote.remote)]);
@@ -475,10 +474,7 @@ impl Telemetry {
             .meter
             .u64_observable_gauge(names::REMOTES_MODE)
             .with_unit("{volume}")
-            .with_description(
-                "1, with the volume's remotes mode: pushed, none_valid or local_only (design \
-                 §11.1)",
-            )
+            .with_description("1, with the volume's remotes mode: pushed, none_valid or local_only")
             .with_callback(move |observer| observer.observe(1, &[KeyValue::new("mode", mode)]))
             .build();
         let patch_state = state.patch_state();
@@ -486,7 +482,7 @@ impl Telemetry {
             .meter
             .u64_observable_gauge(names::PATCH_QUEUE_DEPTH)
             .with_unit("{patch}")
-            .with_description("Patches queued and not applied, as of the last mount (design §12)")
+            .with_description("Patches queued and not applied, as of the last mount")
             .with_callback(move |observer| {
                 let state = crate::patch::status::PatchState::load(&patch_state);
                 observer.observe(state.queue_depth, &[]);
@@ -497,7 +493,7 @@ impl Telemetry {
             .meter
             .u64_observable_gauge(names::PATCH_BLOCKED)
             .with_unit("{queue}")
-            .with_description("1 while the patch queue is blocked (design §12)")
+            .with_description("1 while the patch queue is blocked")
             .with_callback(move |observer| {
                 let state = crate::patch::status::PatchState::load(&patch_state);
                 observer.observe(u64::from(state.blocked.is_some()), &[]);
@@ -510,7 +506,7 @@ impl Telemetry {
             .with_unit("{patch}")
             .with_description(
                 "Patches set aside (held, waiting, awaiting or not judged) at the last run of the \
-                 patch queue (design §12)",
+                 patch queue",
             )
             .with_callback(move |observer| {
                 let state = crate::patch::status::PatchState::load(&patch_state);
@@ -560,7 +556,7 @@ impl Telemetry {
         }
     }
 
-    /// Records one answered request of a front (design §14): `request` is
+    /// Records one answered request of a front: `request` is
     /// `record`, `tracked` or `ping`.
     pub(crate) fn front_round_trip(&self, request: &'static str, elapsed: Duration) {
         if let Some(inner) = &self.inner {
@@ -580,15 +576,14 @@ impl Telemetry {
         }
     }
 
-    /// Counts one front write skipped as superseded (design §14.1).
+    /// Counts one front write skipped as superseded.
     pub(crate) fn superseded(&self) {
         if let Some(inner) = &self.inner {
             inner.superseded.add(1, &[]);
         }
     }
 
-    /// Counts one path recorded again as the backing tree has it (design
-    /// §14.1).
+    /// Counts one path recorded again as the backing tree has it.
     pub(crate) fn resynced(&self) {
         if let Some(inner) = &self.inner {
             inner.resyncs.add(1, &[]);
@@ -596,7 +591,7 @@ impl Telemetry {
     }
 
     /// Counts one object created as the daemon, then given to its caller,
-    /// because creating it as the caller failed (design §6).
+    /// because creating it as the caller failed.
     pub fn create_as_caller_fallback(&self) {
         if let Some(inner) = &self.inner {
             inner.create_as_caller_fallbacks.add(1, &[]);
@@ -613,15 +608,14 @@ impl Telemetry {
         }
     }
 
-    /// Counts a record made by reconciling a moved tree (design §3.1).
+    /// Counts a record made by reconciling a moved tree.
     pub fn reconcile_record(&self) {
         if let Some(inner) = &self.inner {
             inner.reconcile_records.add(1, &[]);
         }
     }
 
-    /// Counts one boundary that found a file unchanged but racy (design
-    /// §3.1): `skipped` if its bytes were proven recorded, else `recorded`.
+    /// Counts one boundary that found a file unchanged but racy: `skipped` if its bytes were proven recorded, else `recorded`.
     pub fn racy_recheck(&self, skipped: bool) {
         if let Some(inner) = &self.inner {
             let outcome = if skipped { "skipped" } else { "recorded" };
@@ -641,7 +635,7 @@ impl Telemetry {
             .meter
             .u64_observable_gauge(names::HISTORY_SERVICE_FRONTS)
             .with_unit("{front}")
-            .with_description("Fronts connected to this history service (design §14)")
+            .with_description("Fronts connected to this history service")
             .with_callback(move |observer| {
                 if let Some(fronts) = fronts.upgrade() {
                     observer.observe(fronts() as u64, &[]);
@@ -651,7 +645,7 @@ impl Telemetry {
     }
 
     /// Records one fork published to `remote`, `elapsed` after its finish
-    /// commit (design §11.5).
+    /// commit.
     pub(crate) fn fork_published(&self, remote: &str, elapsed: Duration) {
         if let Some(inner) = &self.inner {
             inner

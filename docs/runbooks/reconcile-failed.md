@@ -2,8 +2,7 @@
 
 A directory rename is journaled as one move and then *reconciled* on the
 commit thread: the destination is walked and anything that recording
-every file there would have decided differently is recorded (design
-[§3.1](../design.md#31-change-boundaries)). Reconciling kept failing,
+every file there would have decided differently is recorded ([recording](../recording.md)). Reconciling kept failing,
 so the move was committed as journaled. Nothing the workload wrote is
 lost from the backing tree; history may differ from it beneath the
 destination until each affected file changes again or is recorded by

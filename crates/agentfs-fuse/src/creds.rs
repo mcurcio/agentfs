@@ -1,4 +1,4 @@
-//! Creating as the caller (design §6).
+//! Creating as the caller.
 //!
 //! A daemon running as root creates each new object with the caller's
 //! filesystem identity, so the object is the caller's from the instant it
@@ -175,7 +175,7 @@ pub fn groups_of(caller: Caller, groups: Supplementary) -> Vec<u32> {
 /// pod's process, seen from a CSI node plugin without `hostPID`): its
 /// groups are unknown, said once on stderr. Creating as such a caller
 /// then succeeds only through its primary group, else falls back to the
-/// daemon (design §6, §14.1).
+/// daemon.
 pub fn caller_groups(pid: u32) -> Vec<u32> {
     if pid == 0 {
         static SAID: std::sync::Once = std::sync::Once::new();
@@ -185,7 +185,7 @@ pub fn caller_groups(pid: u32) -> Vec<u32> {
                  daemon), so its supplementary groups are unknown: a new object it may create \
                  only through one (a pod's fsGroup) is created as the daemon and then given to \
                  it, and another front's racing open of that name may fail with EACCES; run \
-                 the CSI node plugin with hostPID: true (design §6)"
+                 the CSI node plugin with hostPID: true"
             );
         });
         return Vec::new();

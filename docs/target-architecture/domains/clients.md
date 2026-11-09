@@ -1,8 +1,6 @@
 # Domain: Clients
 
-**Layer:** System › **Domain (Clients)** › Feature.
-**Status:** draft 7, proposed, under [system.md](../system.md) revision 10 and [git-model.md](../git-model.md). The
-target, not today's code; Rust sketches show surfaces only.
+**Proposed, not built.** This page proposes the Clients domain (who is attached to which tree, with what grant), one part of the system around the git model ([the system](../system.md)). The git model ([git-model.md](../git-model.md)) wins wherever the two disagree. Rust sketches show surfaces only. The commit that lands the slice that builds this domain deletes this page and moves the behaviour into the library or operator docs.
 
 ## 1. What Clients owns, its language, and what it is not
 
@@ -10,16 +8,8 @@ Clients answers three questions: who is attached to which tree, through what gra
 the only place a `ClientCap`, an `ActorCap` or a `Writer::Client` is born. A client is the git model's writer: its
 `ClientId` is the `Agentfs-Writer` trailer of every commit it saves (git-model §3).
 
-**The owner's words this domain rests on.** Everything else here is a design choice.
+The owner's guidance that applies here is in `OWNER-GUIDANCE.md` at the repository root. Everything else on this page is a design choice.
 
-| # | His words | Date | What it asks of Clients |
-|---|---|---|---|
-| R3 | "a virtual filesystem overlay for each client (including main) that is backed by a _real_ filesystem source-of-truth" | 2026-11-01 | one client per view, main included |
-| R5 | "Agentfs history shouod distinguish between the various containers so we can track direct edits on main vs the forks that sandboxes edit" | 2026-11-01 | each client is its own writer |
-| R7 | "Security boundary. Agentfs is the gatekeeper that exposes only what we want sandboxes to see" | 2026-10-30 | a grant never exceeds its launcher's authority |
-| A1, A2 | main is a view like any fork; a fork's client is its own view mount, made by whoever starts the container | answers | one `attach` for every kind of client |
-| A5, A6 | consistency: "It depends on the config!"; a pinned fork is an acceptable snapshot | 2026-11-02 | the grant holds the consistency setting and the snapshot choice |
-| R16 | "The various agentfs components should be within the same version family" | 2026-11-02 | a launcher of another family never reaches `attach` |
 
 | Term | Meaning here | Is not |
 |---|---|---|
@@ -124,7 +114,7 @@ deleted). Calls out: Trees' `facts(f)` for a `ForksItCreates` attach and `pin(of
 | # | Invariant | Enforced by | Strength |
 |---|---|---|---|
 | C1 | Only Clients mints `ClientCap` and `ActorCap`, so only Clients makes `Writer::Client` | private fields; the one constructor takes the composition root's `&Minter`; clippy bans `Minter::new` elsewhere | construction + build time |
-| C2 | A grant never exceeds its launcher: a `ForksItCreates` launcher reaches only forks it created, and no launcher grants a profile outside its bound (R7) | `attach` builds a private `Attenuated` only after both checks; `Binding` takes only an `Attenuated` | construction time |
+| C2 | A grant never exceeds its launcher: a `ForksItCreates` launcher reaches only forks it created, and no launcher grants a profile outside its bound | `attach` builds a private `Attenuated` only after both checks; `Binding` takes only an `Attenuated` | construction time |
 | C3 | A snapshot or read-only client has no `ClientCap` | `Grant::snapshot` is the only way to build `Sees::Snapshot` and sets `ReadOnly` | construction time |
 | C4 | A fork has at most one read-write client, for life | the `ForkWriterClaim` row is unique per fork, deleted only at `ForkDropped` | construction time (unique key) |
 | C5 | A session binds exactly one client; a client acts only through its live session | the session owns the `ClientCap`; a call names no client | construction time |
@@ -162,7 +152,7 @@ rest end (`Reconciled`). Open files' write calls survive it: each is in the tree
 
 | Policy | Current setting (design choice unless cited) |
 |---|---|
-| Consistency, per client | `PerFile` when the launcher names none (A5; R13's per-file default) |
+| Consistency, per client | `PerFile` when the launcher names none (the per-file default) |
 | Actor directory | authenticated id → actor, roles (`Operator`; more are rows), from deployment config |
 | Admission while draining | `attach` refused; `rebind`, `detach`, `advance` allowed |
 
@@ -170,7 +160,7 @@ rest end (`Reconciled`). Open files' write calls survive it: each is in the tree
 
 | Test | Rules out |
 |---|---|
-| A fork launcher asks for main, another launcher's fork, and a profile above its bound: refused each time, no row | a hostile in-pod launcher seeing or writing main (R7) |
+| A fork launcher asks for main, another launcher's fork, and a profile above its bound: refused each time, no row | a hostile in-pod launcher seeing or writing main |
 | A second read-write attach to a fork, before and after a service restart: `ForkTaken` | two writers on one fork's branch |
 | A view host's save names another client id: the commit's `Agentfs-Writer` is the session's own client | forged attribution |
 | Kill a fork's view host: `AttachmentEnded(SessionClosed)`, `LastDetached{F}`; main keeps writing | a dead client holding opens forever |
@@ -190,12 +180,11 @@ rest end (`Reconciled`). Open files' write calls survive it: each is in the tree
 The `store` layout for the two aggregates and the outbox; reserving room for an end; the outbox dedup key; how a
 `LaunchCap` reaches `rebind` over the socket; `Ordinal` allocation.
 
-## Reconcile with existing code (agentfs origin/main b5c0dc8)
+## Where it meets the existing code
 
 - **The attached mark** (`patch/attached.rs`) goes: attachment becomes `Client` rows with events.
 - **Front slots and their leases** (`history_service/fronts.rs`) become sessions. **Peer authentication** (`SO_PEERCRED`) stays as the id `actor` and launchers start from.
 - **Committer from pod flags** becomes the `ClientId` in each commit's `Agentfs-Writer` trailer.
 
-**NOT RUN:** no code was built or tested.
+**Not verified:** no code was built or tested.
 
-*History: drafts 1–6 are in git; draft 7 (2026-11-03) conforms to the git model.*

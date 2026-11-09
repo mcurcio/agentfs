@@ -1,4 +1,4 @@
-//! The patch queue for iac (design §12).
+//! The patch queue for iac.
 //!
 //! A producer outside the volume (iac, an operator, CI) submits a patch:
 //! a single commit whose parent is a commit of the volume's branch, pushed
@@ -35,8 +35,7 @@
 //!   `patch-notify` hook, the notify webhook), and while a daemon holds
 //!   the volume `agentfs patch apply` only judges
 //!   ([`queue::Queue::judge`]) and answers "lands at next mount" (bead
-//!   agentfs-mia.5, design §19.1 "Integrators decide when patches are
-//!   applied"); a start that may have a workload attached judges it the
+//!   agentfs-mia.5); a start that may have a workload attached judges it the
 //!   same way instead of landing it ([`attached`]).
 //!
 //! `agentfs serve-git` makes the state area's history repository the
@@ -67,7 +66,7 @@ use serde::{Deserialize, Serialize};
 
 pub use crate::history::{INBOX_TRAILER, inbox_from_message};
 
-/// The most paths one patch may change (design §12).
+/// The most paths one patch may change.
 pub const MAX_PATCH_PATHS: usize = 4096;
 
 /// Digits of an inbox number in a ref name.
@@ -146,7 +145,7 @@ pub fn seq_of_ref(prefix: &str, refname: &str) -> Option<u64> {
     refname.strip_prefix(prefix).and_then(parse_seq)
 }
 
-/// Why the queue stopped at a patch (design §12).
+/// Why the queue stopped at a patch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BlockReason {
@@ -252,7 +251,7 @@ impl fmt::Display for BlockReason {
     }
 }
 
-/// Where the queue stopped (design §12).
+/// Where the queue stopped.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Blocked {
     pub inbox: u64,

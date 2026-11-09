@@ -1,4 +1,4 @@
-//! End-to-end tests of telemetry export (design §13): the `agentfs`
+//! End-to-end tests of telemetry export: the `agentfs`
 //! binary against a fake OTLP/HTTP collector.
 
 use std::collections::BTreeSet;

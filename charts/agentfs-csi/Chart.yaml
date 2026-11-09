@@ -2,7 +2,7 @@ apiVersion: v2
 name: agentfs-csi
 description: >-
   The agentfs CSI driver: volumes whose every change is recorded in git
-  history the workload cannot see (design §14.2).
+  history the workload cannot see.
 type: application
 # The repository's version. CI publishes main as <version>-main.<run> and
 # a tag vX.Y.Z as X.Y.Z, with appVersion set to the commit (docs/helm.md).

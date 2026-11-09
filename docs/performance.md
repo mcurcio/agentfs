@@ -2,28 +2,24 @@
 
 What recording costs, measured. agentfs makes the call that ends a change
 (a `close` after a write, `unlink`, `rename`, ...) wait until the change
-is durable (design §3.2): the content is frozen into `pending/` and a
+is durable (see [recording](recording.md)): the content is frozen into `pending/` and a
 journal record is appended and `fsync`ed. Hashing, compression, commits
 and pushes come afterwards, off the workload's path. This page gives the
-cost of both parts, the benchmark that measures them (design §18 test
-13), and the performance budget (§19.2 item 1).
+cost of both parts, the benchmark that measures them, and the
+performance budget.
 
-Unless a section says otherwise, the numbers below are from the first
-CI run of the benchmark, on 2026-10-13 (commit `699bbb7`, run
-[38334925092](https://github.com/mcurcio/agentfs/actions/runs/38334925092)):
-GitHub's `ubuntu-24.04` runner, 4 vCPUs (AMD EPYC 7763), 16 GiB, kernel
-6.17, FUSE passthrough on (writes too, before 2026-10-30: see
+Unless a section says otherwise, the numbers below are from CI runs of
+the benchmark on GitHub's `ubuntu-24.04` runner, 4 vCPUs (AMD EPYC 7763),
+16 GiB, kernel 6.17, FUSE passthrough on for files opened read-only and,
+in these runs, also for files opened for writing (see
 [Writes through the daemon](#writes-through-the-daemon)), each filesystem a fresh 20 GiB loop device on
-the runner's disk, no remotes configured (so no pushes). They are one
-run on a shared machine; the next two runs, some on a different CPU,
-were up to about 1.7 times slower in `fsync`-bound results and up to four
-times faster in commit catch-up (see [Run to run](#run-to-run)). The
+the runner's disk, no remotes configured (so no pushes). They come
+from a shared machine; runs on a different CPU were up to about 1.7
+times slower in `fsync`-bound results and up to four times faster in
+commit catch-up (see [Run to run](#run-to-run)). The
 loop device puts every `fsync` through a second filesystem, so
 `fsync`-bound numbers are likely somewhat higher than on a dedicated
-disk. The workloads through a mount, and the summary's figures for
-them, are from two later runs, after the double record was removed
-([Workloads through a mount](#workloads-through-a-mount)).
-
+disk. 
 ## Summary
 
 - **A small file's change costs 1.3–1.9 ms in the engine and 1.8–3.3 ms
@@ -41,12 +37,11 @@ them, are from two later runs, after the double record was removed
   plain directory (whose times vary threefold between runners): about
   2.1–3.2 ms per file for a `git clone`, 1.8–2.9 ms per created file,
   0.8–1.7 ms per removed file.
-- **A file written and closed at once is recorded once** (since
-  2026-10-13; before, RELEASE recorded it a second time through the
-  racy-timestamp rule). RELEASE compares the file with the copy its close
-  froze instead. See [Known costs](#known-costs).
+- **A file written and closed at once is recorded once.** RELEASE
+  compares the file with the copy its close froze. See
+  [Known costs](#known-costs).
 - **A directory rename is one record** however many files it holds: 24
-  ms through a mount for 100,000 files (design §3.1).
+  ms through a mount for 100,000 files (see [recording](recording.md)).
 - **Excluded paths still pay FUSE**: about 0.5–0.7 ms per small file
   written into an excluded `node_modules/`, against 0.01–0.04 ms in a
   plain directory, and nothing is recorded.
@@ -94,12 +89,7 @@ filesystem, with the page cache dropped first. After each it waits until
 `agentfs status` shows no backlog ("catch-up") and checks the history
 against the backing tree.
 
-This table is from the two runs after the double record was removed
-(see [Known costs](#known-costs)):
-[38388265326](https://github.com/mcurcio/agentfs/actions/runs/38388265326)
-at `157416d` and
-[38394883510](https://github.com/mcurcio/agentfs/actions/runs/38394883510)
-at `f6223dc`, which added mvdir. Both XFS jobs ran on AMD EPYC 7763 and
+This table is from two runs. Both XFS jobs ran on AMD EPYC 7763 and
 both ext4 jobs on Intel (Xeon Platinum 8370C, then Xeon 6973P-C). Each
 cell is the median of 3 runs in a job, except close4k, create, mvdir
 and rm (1 run). Where the two jobs differ, the cell gives both:
@@ -116,10 +106,7 @@ and rm (1 run). Where the two jobs differ, the cell gives both:
 | bigclose, dirty: `close` of a 1 GiB file just written | 0.10 s | 2.63–2.65 s | 0.30–0.41 s | 5.73–8.75 s | 29 s; 24–29 s | 1 |
 
 *Records* is per run: one per change boundary (a close after a write, a
-file removed, a directory renamed). Before the change, the same
-workloads made about twice as many on the first three runs: 4,000 for
-close4k, 9,041–9,048 for clone, 199,923–200,008 for create and 2 (1–3)
-for the dirty 1 GiB close.
+file removed, a directory renamed).
 
 For comparison, copying the 1 GiB file and `fsync`ing the copy in the
 plain directory took 2.6–5.6 s (clean) and 5.1–10.5 s (dirty), the most
@@ -146,32 +133,27 @@ What the numbers mean:
 - **Bulk creation** outpaces the commit loop: creating 100,000 files took
   3–5 minutes and made about 100,000 records, and committing them took
   about 7.7 more minutes on the AMD runners (2.6–3.6 on the Intel ones),
-  during which `agentfs status` showed the backlog shrinking. Halving
-  the records did not halve that: on AMD it went from 474–510 s to
-  461–464 s. The catch-up is bound by the 1,100–1,450 commits, each
+  during which `agentfs status` showed the backlog shrinking. The catch-up is bound by the 1,100–1,450 commits, each
   writing the trees of a directory that grows to 100,000 entries, more
   than by the records in them. The journal holds the records durably
   meanwhile, and the workload was never slowed by it.
 - **A directory rename** is one record however many files are beneath
-  it (design §3.1): 23–24 ms through the mount for 100,000 files, where
-  recording each file at its new path made the rename wait for 100,000
-  records. Its commit moves the index entries and writes the trees
+  it (see [recording](recording.md)): 23–24 ms through the mount for 100,000 files,  where recording each file at its new path would make the rename wait
+  for 100,000 records. Its commit moves the index entries and writes the trees
   (3.4–7.9 s here), and the reconciliation that follows it walks the
   moved tree's metadata, which here records nothing.
 - **Removals** are cheaper than creations (nothing frozen), and each is
   one journaled `fsync`ed record: no RELEASE follows an `unlink`.
 - **A 1 GiB commit** is a loose object written by hashing and
-  zlib-compressing the frozen copy, 23–29 s. The dirty variant now makes
-  one record too: before the change its RELEASE froze the file again (a
-  second reflink on XFS, a second 1 GiB copy on ext4) and its catch-up
-  took 56 s, twice the fsynced variant's.
+  zlib-compressing the frozen copy, 23–29 s. The dirty variant makes
+  one record too, so its catch-up matches the fsynced variant's.
 
 ## Known costs
 
 ### Racy closes, and how they stay single records
 
 Change detection compares the inode's stamp (size, mtime, ctime, mode)
-with the one taken before the last freeze (design §3.1). File timestamps
+with the one taken before the last freeze (see [recording](recording.md)). File timestamps
 come from a coarse clock, so a write in the same clock tick as the
 freeze would not move the stamp. git's racy-timestamp rule covers that:
 when the recorded stamp is within twice the clock's resolution (at least
@@ -183,12 +165,10 @@ A program that writes a file and closes it right away (an editor's save,
 RELEASE that follows the last close a moment later is the only backstop
 for a write through a shared memory mapping in the same tick, which
 reaches the file without the daemon seeing it and leaves the stamp
-unchanged. Until 2026-10-13 RELEASE therefore recorded every such file a
-second time: about 200,000 records for 100,000 new files, a second
-freeze and journal `fsync` for each, and a 1 GiB file just written
-frozen, hashed and compressed twice (design §19.2 item 4).
-
-Now a racy record keeps its frozen copy open, and a boundary that would
+unchanged. A second record of every such file would double the work: about 200,000
+records for 100,000 new files, a second freeze and journal `fsync` for
+each, and a 1 GiB file just written frozen, hashed and compressed twice.
+So a racy record keeps its frozen copy open, and a boundary that would
 record only because of the racy rule compares the file with that copy.
 It records nothing when the bytes are equal, the file still has the one
 name the copy was recorded at, and the copy is still the last state
@@ -217,24 +197,23 @@ in the history at its new path.
 
 ### Writes through the daemon
 
-Since 2026-10-30 a file opened for writing never gets kernel passthrough
-(design §17.1, §19.1 "Writers never passthrough"): under passthrough a
-shared mapping did not hold the FUSE file open, so a write through it
-after the last close went unrecorded. Every `write` to such a file is now
-a FUSE round trip through the daemon, as under `--passthrough off`, and
-a reader opened while it is open is served by the daemon too. Reads of
-files opened read-only keep passthrough. The numbers on this page were
-measured before the change, with writes in passthrough. Not yet
-measured: the cost is expected to be small where the record dominates
-(a 4 KiB write is one round trip of tens of microseconds against a
-boundary of 1.8 ms or more), and largest for workloads that write much
-data without recording it, such as npm into an excluded path, and for
-the time spent writing a large file before its close. The benchmark
-after landing shows it ([Run to run](#run-to-run)).
+A file opened for writing never gets kernel passthrough (see
+[library/filesystem](library/filesystem.md)): under passthrough a shared
+mapping does not hold the FUSE file open, so a write through it after
+the last close would go unrecorded. Every `write` to such a file is a
+FUSE round trip through the daemon, as under `--passthrough off`, and a
+reader opened while it is open is served by the daemon too. Reads of
+files opened read-only keep passthrough. The numbers above were measured
+with writes in passthrough, so they understate the cost of writing. That
+cost is not measured. It is expected to be small where the record
+dominates (a 4 KiB write is one round trip of tens of microseconds
+against a boundary of 1.8 ms or more), and largest for workloads that
+write much data without recording it, such as npm into an excluded path,
+and for the time spent writing a large file before its close.
 
 ### Directory renames
 
-A directory rename is journaled as one move (design §3.1), so the
+A directory rename is journaled as one move (see [recording](recording.md)), so the
 `rename` waits for one record, not one per file beneath it. What it
 costs instead comes after the call has returned:
 
@@ -250,11 +229,11 @@ costs instead comes after the call has returned:
 
 ### A front's round trip to its history service
 
-With several pods on one volume (design §14.1), each pod's mount is a
+With several pods on one volume (see [library/core](library/core.md)), each pod's mount is a
 front that sends every boundary to the volume's history service over
 gRPC on a Unix socket, and returns once the service has made it durable.
-Measured in the `e2e-multipod` jobs of CI run 38819854746 (commit
-2526397, `ubuntu-24.04`, kernel 6.17.0-1022-azure, ext4), medians in
+Measured in the `e2e-multipod` jobs of CI (`ubuntu-24.04`, kernel
+6.17, ext4), medians in
 microseconds, passthrough `auto` / `off`:
 
 | Measurement | auto | off |
@@ -268,26 +247,77 @@ microseconds, passthrough `auto` / `off`:
 A front's single-thread record costs 1.33 and 1.32 times the
 single-process one (1.23 to 1.30 in reruns); with 8 threads the two are
 within 22 % (front 2516 and 2470 µs against 2083 and 2028 µs). The
-freeze and the journal's `fsync`, which both modes pay, dominate. The
-round trip varies with the runner from 49 to 148 µs, more between runs
-than between the designs tried; protocol 1 (JSON frames, before
-2026-10-15) had an 18 to 27 µs round trip and a 1.16 to 1.18 ratio. The
-full table is in design §14.1. CI fails when the single-thread ratio's
-median over several runs of the bench exceeds 1.6
-([`ci/round-trip-bench.sh`](../ci/round-trip-bench.sh), design §19.1).
+freeze and the journal's `fsync`, which both modes pay, dominate. The round trip varies with the runner from 49 to 148 µs. CI fails when
+the single-thread ratio's median over several runs of the bench exceeds
+1.6 ([`ci/round-trip-bench.sh`](../ci/round-trip-bench.sh)).
+
+## Tree views
+
+These figures are for the tree-view mode (`agentfs trees`, see
+[trees](trees.md)). They are observations, not budgets: no figure here is
+gated. They come from one run of each case, in a debug build, on one CI
+runner (ext4, git 2.47.3, Linux 7.0, `FOPEN_DIRECT_IO`). Two runs of one
+mode have differed by up to 2 times, so read a figure as one observation.
+
+| Measurement | Result |
+|---|---|
+| Journal call cost against plain FUSE | 1,000 `pwrite` calls of 8 bytes at offset 0 on one open descriptor. Plain FUSE (`bindfs -o direct_io`): median 27.0 µs, p99 53.1 µs. Recording mount: median 352.1 µs, p99 607.0 µs. Wall time around the syscall, including FUSE and the journal's `fsync` |
+| One hour of journal growth | 501,785 bytes over 3,600 s: 3,592 eight-byte `pwrite` calls (28,736 payload bytes), a pause of one second after each. Logical growth of `calls.wal` |
+| Line map, 10,000 one-line saves | `metadata.json` 195,687 bytes (19.6 a save). The snapshots are 961,003,746 bytes logical and 241,338,078 as git objects (10,000 distinct blobs). The commits are 3,615,564 bytes logical and 2,251,085 on disk. The repository is 245,688,644 bytes of files and 425,779,200 allocated, with 164 refs. The journal is 15,044,086 bytes after 10,001 saves (1,504 a save). The run took 2,560.9 s and started 390,047 git children (39 a save) |
+| Save and take, 1 MiB | Write and close 23.3 ms; actor save 272.9 ms; landing 337.3 ms, of which the sync back is 5.2 ms; both views and an empty queue after 1.27 s |
+| Save and take, 100 MiB | Write and close 31.9 s; actor save 25.6 s; landing 288.2 s, of which the sync back is 0.14 s; both views and an empty queue after 339.1 s |
+| Waits | One main log held open, five saves of other files in a fork, then a fork save of the log waiting: one wait of 740.9 s in all. The five independent saves became visible after 238 to 241 s. Five more opens of the held log took a median 138.8 s (p99 139.0 s). Both views converged 98.7 s after the release. A 100 MiB file was in the tree throughout |
+| Held log and compaction | A log held open while another file takes 24 saves of 8 MiB: the journal peaks at 66,149,414 bytes, drops to 745 bytes at each of 2 compactions, and ends at 49,611,545. The held file's one line is all a compaction keeps. The 24 saves took 115.5 s |
+| 1,000 saves | 95.7 s; git children a save stay flat at 39.0 between saves 100 and 1,000 |
+
+### Large files in the tree are slow
+
+Every save and take reads and rewrites the whole tree, so a large file
+taxes every later step of every file, not just its own.
+
+- A 100 MiB file takes 339.1 s to converge in both views. A 1 MiB file
+  takes 1.27 s, so 100 times the bytes cost 267 times the time.
+- Other files pay for it. Five saves of unrelated small files took 238 to
+  241 s each to become visible while the large file was queued, and each
+  new open of the held log took a median 138.8 s.
+- Where the time goes, over the whole run (seconds, number of runs):
+  `snapshot_read` 1,797.4 (97), `queue_plan` 1,280.6 (48, which encloses
+  some of the stages beside it), `objects` 288.6 (19, one rehash and sync
+  of the blob on each later save), `judge` 263.0 (14) and `checkout` 24.7
+  (38).
+- In earlier runs in a debug build under Docker on macOS, the `judge`
+  stage grew faster than linearly with the file's lines: 28 s at 32 MiB,
+  109 s at 64 MiB, 316 s at 100 MiB.
+
+Keep large files out of a tree-view volume. Three costs are not reduced
+yet: parsed snapshots are not memoised by commit, every save writes all
+files rather than only the changed ones, and the line referee's own cost
+is unmeasured separately.
+
+### Many saves slow each one
+
+Over 10,000 saves the per-save cost rose from tens of milliseconds to
+hundreds, because the stages grow with the line map, which is never
+pruned. Per-stage totals, in seconds (number of runs): `queue_plan`
+1,059.5 (10,001), `snapshot_read` 300.7 (20,003), `align` 281.8 (10,000),
+`objects` 458.7 (10,001), `checkout` 148.4 (20,003), `ref_copy` 160.1
+(20,004) and `journal_append` 191.1 (50,005, of which `fsync` is 176.7).
+Git children per save stay flat at 39, because each queue entry's owners
+are read once at open and the sync plan asks git once per commit, not
+once per line. About a third of the run is inside `queue_plan` but in none
+of its measured parts.
 
 ## Performance budget
 
-Design §19.2 item 1 is decided: the budget is
+The budget is
 [`ci/bench-budget.json`](../ci/bench-budget.json), checked by every run
 of the benchmark. It is **advisory**: a result over budget is a warning
 in the job and its summary, never a failure, because shared runners are
 noisy. Each limit is about 1.5 times the slowest of the first three runs
 (six jobs, on two CPU types; see [Run to run](#run-to-run)). Workloads
-are budgeted in absolute time, not as ratios. Since 2026-10-15 clone and
-npm run once per job instead of three times (design §19.1), so their
-budgets apply to one sample rather than a median of three: the limits
-are unchanged, and a single slow run can now warn.
+are budgeted in absolute time, not as ratios. Clone and npm run once per
+job, so their budgets apply to one sample rather than a median of three,
+and a single slow run can warn.
 
 | Budget | Limit | Measured (slowest to fastest of six jobs) |
 |---|---|---|
@@ -301,7 +331,7 @@ are unchanged, and a single slow run can now warn.
 | git clone of 4,524 files | 30 s | 12.5–18.9 s |
 | 30,000 small files into an excluded path | 30 s | 17.1–19.0 s |
 | 100,000 creates | 600 s | 230–384 s |
-| Catch-up after 100,000 creates (about 100,000 records) | 12 min | 2.6–7.7 min (2.0–8.1 min with the double record) |
+| Catch-up after 100,000 creates (about 100,000 records) | 12 min | 2.6–7.7 min |
 | Rename of the directory holding them | 0.1 s | 23–24 ms |
 | Catch-up after that rename | 15 s | 3.4–7.9 s |
 | `rm -rf` of 100,000 files | 270 s | 78–177 s |
@@ -310,27 +340,19 @@ are unchanged, and a single slow run can now warn.
 | ext4: close of a clean 1 GiB file | 7 s | 2.8–4.3 s |
 | ext4: close of a dirty 1 GiB file | 12 s | 4.9–8.1 s |
 
-The catch-up budget was set with the double record. Removing it took
-the catch-up on AMD runners from 453–510 s to 461–464 s, not to half:
-it is bound by the commits' tree writes more than by the records (see
-[Workloads through a mount](#workloads-through-a-mount)), so the limit
-stays. The two rename rows come from the two runs after the change
-(four jobs), not six. On the second of them the ext4 job's engine step
-with 8 threads had a p99 of 22.6 ms and warned, against 4.4–6.6 ms in
-the first six jobs, one of them on the same CPU (Xeon 6973P-C) and
-filesystem. The bench does not exercise the change there (it calls the
-engine, without RELEASE), so it is left as one outlier to watch.
+The catch-up is bound by the commits' tree writes more than by the
+records (see [Workloads through a mount](#workloads-through-a-mount)).
+The two rename rows come from four jobs, not six.
 
 ## Run to run
 
-Three runs on consecutive commits, each with an XFS and an ext4 job, so
-six jobs; `env.json` in each artifact names the CPU:
+Three runs, each with an XFS and an ext4 job, so six jobs; `env.json` in each artifact names the CPU:
 
-| Run | Commit | XFS job | ext4 job |
-|---|---|---|---|
-| [38334925092](https://github.com/mcurcio/agentfs/actions/runs/38334925092) | `699bbb7` | AMD EPYC 7763 | AMD EPYC 7763 |
-| [38337353781](https://github.com/mcurcio/agentfs/actions/runs/38337353781) | `b67c5c0` | Intel Xeon 6973P-C | AMD EPYC 7763 |
-| [38339428837](https://github.com/mcurcio/agentfs/actions/runs/38339428837) | `25f10d5` | AMD EPYC 7763 | Intel Xeon 6973P-C |
+| Run | XFS job | ext4 job |
+|---|---|---|
+| 1 | AMD EPYC 7763 | AMD EPYC 7763 |
+| 2 | Intel Xeon 6973P-C | AMD EPYC 7763 |
+| 3 | AMD EPYC 7763 | Intel Xeon 6973P-C |
 
 On the same CPU type and filesystem the results agreed within about
 20 %. Between the two CPU types they did not:
@@ -339,9 +361,8 @@ On the same CPU type and filesystem the results agreed within about
   closed a small file in 4.0 ms through FUSE (2.3–2.4 ms on AMD), took
   177 s for the `rm -rf` (121–132 s), 7.3–8.1 s for the dirty 1 GiB
   close (5.4 s) and 4.3 s for the clean one (2.9 s); its 16 MiB freeze
-  took 80 ms (44–46 ms). That run's close4k, at 4,010 µs, was just over
-  the first budget of 4,000 µs and warned, which led to the limits
-  above.
+  took 80 ms (44–46 ms). That run's close4k took 4,010 µs, which is why the budget
+  limits sit above the AMD results.
 - **The Intel runners committed much faster**: the catch-up after
   100,000 creates took 119–136 s there and 453–484 s on AMD, and a 1 GiB
   commit 23 s instead of 28 s.
@@ -366,8 +387,7 @@ on network storage they are higher, by the cost of an `fsync` per change.
 every push to main that changes more than documentation, and on demand
 (with `quick` for a smoke run of smaller workloads), on XFS created
 with `mkfs.xfs -m reflink=1` and on ext4. It runs after a change lands
-and does not hold it: a budget warning or a failed check is a follow-up
-(design §19.1, 2026-10-15). Each filesystem runs as two parallel jobs,
+and does not hold it: a budget warning or a failed check is a follow-up. Each filesystem runs as two parallel jobs,
 the shards of `ci/bench.sh` (`BENCH_SHARD`): `many` (create, mvdir and
 rm of 100,000 files, the longest part) and `rest` (everything else).
 Each job:
@@ -436,9 +456,7 @@ for one filesystem.
 - *Commit catch-up*: from the end of the workload until `agentfs status`
   shows an empty backlog.
 - *Records*: how far the committed journal sequence (`Agentfs-Seq` of the
-  branch head) moved: the records journaled during the workload (before
-  2026-10-13, including the RELEASE duplicates of
-  [Known costs](#known-costs)). A last record whose commit would change
+  branch head) moved: the records journaled during the workload. A last record whose commit would change
   nothing (such as a duplicate committed on its own) leaves no commit and does not move the sequence,
   so this can be a little lower than the records journaled.
 - *Commits*: commits added to the branch.

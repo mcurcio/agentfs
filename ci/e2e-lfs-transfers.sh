@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# End-to-end tests of LFS transfers (design §7), after ci/e2e-lfs.sh and
+# End-to-end tests of LFS transfers, after ci/e2e-lfs.sh and
 # against the same servers: git-lfs's lfs-test-server behind nginx, whose
 # LFS host (127.0.0.1:8081) takes fault rules from `lfs_faults` (ci/lib.sh)
 # to throttle or fail chosen requests:
@@ -166,7 +166,7 @@ assert_contains "$out" "sep: failed (unreachable, stage lfs)" "a 503 for one obj
 assert_eq "" "$(remote_ref "$REPO" refs/heads/agentfs/resume)" "the branch was not pushed"
 on_lfs_host "$FAILING" && fail "the failing object reached the server"
 # An upload stops starting objects at its first failure and lets those in
-# flight finish (design §7): which of the other four started before the
+# flight finish: which of the other four started before the
 # 503 depends on thread timing, so count them, then check the next push
 # sends exactly the objects still missing.
 ON_SERVER=()

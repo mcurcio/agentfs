@@ -3,6 +3,8 @@
 Spec, design or brief contradictions found while cutting or implementing. Newest last. Each entry:
 date, who, where, what, and what was done.
 
+Section numbers of `design.md` and `.handoff/` files cited below refer to documents that are deleted or not in the repository.
+
 ## 2026-10-17, F8 code architect (f8-interfaces)
 
 Against `.handoff/f8-design.md` (run 6 revision 2). Resolved in `.handoff/f8-slices.md`

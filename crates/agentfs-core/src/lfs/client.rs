@@ -1,5 +1,4 @@
-//! Moving LFS objects between the local cache and a remote's LFS endpoint
-//! (design §7).
+//! Moving LFS objects between the local cache and a remote's LFS endpoint.
 //!
 //! - [`HttpTransfer`]: the git-lfs batch API (`POST <endpoint>/objects/batch`)
 //!   with the `basic` transfer adapter only, over `ureq`: uploads (a `PUT`
@@ -753,7 +752,7 @@ impl HttpTransfer {
         }
     }
 
-    /// One download attempt (design §7): with `Range: bytes=<n>-` when
+    /// One download attempt: with `Range: bytes=<n>-` when
     /// `n` bytes are already in the partial. A `206` must start at `n`
     /// (only the start is checked: lfs-test-server reports the remaining
     /// length as the total); a `200` starts again from the first byte; a
@@ -1235,7 +1234,7 @@ pub enum PostError {
 
 /// One POST of `body` as `application/json` with `headers`, through
 /// [`agent`] (no redirects, never a proxy from the environment, as the LFS
-/// client, design §7), within `timeout`: the one HTTP POST of fork
+/// client), within `timeout`: the one HTTP POST of fork
 /// delivery's webhook ([`crate::fork::deliver`]) and the patch queue's
 /// notify webhook ([`crate::patch::notify`], bead agentfs-mia.5).
 pub fn post(

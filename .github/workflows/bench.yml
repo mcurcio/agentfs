@@ -1,6 +1,6 @@
 name: bench
 
-# The performance benchmark (design §18 test 13, docs/performance.md): the
+# The performance benchmark (docs/performance.md): the
 # synchronous record step, then workloads through real FUSE mounts on a
 # fresh XFS (reflink) and ext4 (copy) loop filesystem. Each filesystem
 # runs as two shards in parallel (ci/bench.sh BENCH_SHARD): `many` is
@@ -11,7 +11,7 @@ name: bench
 # ci/bench.sh do fail the job.
 #
 # This workflow runs after a change lands on main and does not hold it
-# (AGENTS.md, design §19.1): a budget warning or a failure here is a
+# (AGENTS.md): a budget warning or a failure here is a
 # follow-up.
 
 on:

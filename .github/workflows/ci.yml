@@ -264,7 +264,7 @@ jobs:
         env:
           AGENTFS_TEST_PASSTHROUGH: ${{ matrix.passthrough }}
           AGENTFS_TEST_UNPRIV_USER: runner
-      # README.md's quick start, as written, as root (design §18).
+      # README.md's quick start, as written, as root.
       - name: README quick start
         if: matrix.passthrough == 'auto'
         run: ci/readme-quickstart.sh
@@ -281,7 +281,7 @@ jobs:
         if: always()
         run: sudo sh -c 'grep agentfs /proc/self/mountinfo | cut -d" " -f5 | xargs -r -n1 umount -l' || true
 
-  # Crash injection (design §18 test 3): the failpoint harness, built with
+  # Crash injection: the failpoint harness, built with
   # the `failpoints` feature (never in release builds), including the
   # mount tests that need root and /dev/fuse.
   crash:
@@ -325,7 +325,7 @@ jobs:
           AGENTFS_TEST_PASSTHROUGH: ${{ matrix.passthrough }}
           AGENTFS_BIN: ${{ github.workspace }}/target/release/agentfs
       # Fails when a front's record costs over 1.6 times the
-      # single-process one at the median of several runs (design §19.1).
+      # single-process one at the median of several runs.
       - name: round-trip benchmark
         run: ci/round-trip-bench.sh
         env:

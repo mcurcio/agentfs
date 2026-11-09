@@ -1,5 +1,5 @@
 //! The inode table: FUSE node ids, the backing inodes behind them, and the
-//! names they are known by (design §2.1).
+//! names they are known by.
 //!
 //! Recording is per inode and attributed to the inode's *current* paths, so
 //! each node keeps its known links (parent node, name). A path is resolved
@@ -73,10 +73,10 @@ pub struct Node {
     /// mapping it made may write without the daemon seeing it, and without
     /// holding the FUSE file open, until the kernel forgets the node (the
     /// mapping pins its dentry): the node stays armed and swept, and is
-    /// recorded once more at FORGET (design §3.1, §17.1).
+    /// recorded once more at FORGET.
     pub mapping_may_write: bool,
-    /// The fsync-class group of the open handles, if they are in one
-    /// (design §8): such a node is recorded by group captures, never alone.
+    /// The fsync-class group of the open handles, if they are in one:
+    /// such a node is recorded by group captures, never alone.
     pub group: Option<Arc<Group>>,
     /// Links of other nodes that name this node as parent.
     children: usize,

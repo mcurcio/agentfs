@@ -1,4 +1,4 @@
-//! Target-model composition root (git-model §18).
+//! Target-model composition root (git-model.md).
 use agentfs_core::tree_actor::Volume;
 use agentfs_fuse::tree_view::{Binding, serve_with_metrics};
 use anyhow::{Context, Result, bail};

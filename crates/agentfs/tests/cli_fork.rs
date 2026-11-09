@@ -1,4 +1,4 @@
-//! End-to-end tests of `agentfs fork` (design §11.5, §17.1) against
+//! End-to-end tests of `agentfs fork` against
 //! `file://` bare remotes, no FUSE: init, record, fork create, record in
 //! the fork, fork finish, then the change submitted twice with
 //! `agentfs patch submit` (which drives the real `git`) and applied once;
@@ -965,7 +965,7 @@ fn a_remote_added_to_a_local_only_source_gets_its_forks() {
     );
 }
 
-/// Design §11.5 "Fork link": `fork create --link unlinked` makes an
+/// The fork link: `fork create --link unlinked` makes an
 /// independent fork. It pushes only to remotes of its own (`--remotes`),
 /// never to its source's (owner, 2026-10-17: "B. And if no remote is
 /// configured, the volume is lost, and that's a choice the user is

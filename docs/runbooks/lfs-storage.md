@@ -3,8 +3,7 @@
 Large files stored as Git LFS objects take space in three places: the
 volume's local object cache in the state area, partial downloads beside
 it, and every remote's LFS server. This runbook covers watching that
-space, freeing the local cache safely, and getting objects back. Design:
-[§7](../design.md#7-large-files-and-lfs-phase-2); settings:
+space, freeing the local cache safely, and getting objects back. How it works: [recording](../recording.md), [remotes](../remotes.md); settings:
 [Git LFS](../configuration.md#git-lfs).
 
 ## Symptoms

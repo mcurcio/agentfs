@@ -1,4 +1,4 @@
-//! A front of a history service (design §14): `mount --history-service`
+//! A front of a history service: `mount --history-service`
 //! and `record --history-service`.
 //!
 //! A front takes no state-area lock. It leases a pending slot
@@ -9,7 +9,7 @@
 //! repair file (`meta/fronts/slot-N.repairs`) for the next front in that
 //! slot. A front serves no control socket: restores and reverts go to
 //! the service, which writes the backing tree itself and calls each front
-//! on its listening connection (design §15): to settle what is dirty, to
+//! on its listening connection: to settle what is dirty, to
 //! say what is open for writing, and to drop its kernel's caches of what
 //! was written.
 
@@ -82,7 +82,7 @@ fn connect(
         instance: nanos ^ (u64::from(std::process::id()) << 32),
         pid: std::process::id(),
         version: env!("CARGO_PKG_VERSION").to_owned(),
-        // Where its workloads see the tree, as this process knows (design §5).
+        // Where its workloads see the tree, as this process knows.
         views: agentfs_core::nested::views(),
     };
     let client = HistoryClient::connect(
@@ -185,8 +185,7 @@ pub(crate) fn mount_front(
     if args.seal_mountpoint {
         crate::seal_mountpoint(&mountpoint)?;
     }
-    // Where its workloads see the tree, for this front and the service
-    // (design §5).
+    // Where its workloads see the tree, for this front and the service.
     agentfs_core::nested::add_views(crate::workload_views(&mountpoint, args));
     // Before mounting: a missing service exits without a mount.
     let front = connect(
@@ -209,7 +208,7 @@ pub(crate) fn mount_front(
         sweep_interval: settings.sweep_interval,
         repair_store: Some(state.front_repairs(slot)),
         stack_over: None,
-        // A finished fork is read-only (design §11.5): the kernel refuses
+        // A finished fork is read-only: the kernel refuses
         // its writes, whatever the binds of this mount say.
         read_only: matches!(
             agentfs_core::volume::refuse_finished(state),
@@ -224,7 +223,7 @@ pub(crate) fn mount_front(
     crate::add_mounted_views(&mountpoint);
     daemon.watch(mounted.ended(), Wake::Unmounted)?;
     daemon.watch(mounted.failed(), Wake::PassthroughFailed)?;
-    // The service calls the mount on this for restores (design §15).
+    // The service calls the mount on this for restores.
     let listener = front.listen(Arc::new(mounted.hooks()))?;
     let startup = mounted.startup_repairs();
     if startup.loaded > 0 {

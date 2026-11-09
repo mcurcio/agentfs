@@ -1,5 +1,4 @@
-//! Forked volumes against real state areas and bare remotes (design
-//! §11.5): create, finish, publish and status, no FUSE.
+//! Forked volumes against real state areas and bare remotes: create, finish, publish and status, no FUSE.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -340,7 +339,7 @@ fn create_reads_the_source_live_and_leaves_it_untouched() {
 
 /// A fork of a source with a change line records its tip
 /// (`agentfs.fork.baseChangeLine`), and the fork's first checkpoint
-/// continues that line (design §19.2 item 11); a source without one gives
+/// continues that line; a source without one gives
 /// a fork whose first checkpoint starts its own.
 #[test]
 fn a_forks_first_checkpoint_continues_its_sources_change_line() {
@@ -586,7 +585,7 @@ fn repair_line(path: &str) -> String {
     format!("{} {} {} {hex}\n", CALLER.uid, CALLER.gid, CALLER.pid)
 }
 
-/// Finish records what every repair queue left (design §11.5): the
+/// Finish records what every repair queue left: the
 /// single-process `meta/repairs`, a front slot's queue (CSI: no next front
 /// comes for a deleted fork), and a slot's temporary file a crash left,
 /// each entry as the pod that queued it; what it cannot record is counted.
@@ -766,7 +765,7 @@ fn publish_waits_for_an_unreachable_remote() {
         "{outcome:?}"
     );
     // A linked fork that cannot reach its source alarms, and its change
-    // reached nowhere else (design §11.5 "Fork link").
+    // reached nowhere else.
     assert!(
         seen.lock()
             .unwrap()
@@ -901,7 +900,7 @@ fn refused_reasons_are_decided_in_one_place() {
         assert_eq!(refused_reason(Met::CreateOnly(kind)), None, "{kind:?}");
     }
     // A branch push the remote refuses (a hook on the branch, a lock) is
-    // retried, as for any volume (§11.3).
+    // retried, as for any volume.
     assert_eq!(refused_reason(Met::Branch(Refused)), None);
     for (reason, text) in [
         (RefusedReason::AnotherWriter, "another_writer"),
@@ -1589,7 +1588,7 @@ fn a_fork_named_as_its_source_in_another_case_is_refused() {
 }
 
 /// A fork's base must be on the source's branch: one the source never
-/// had, or no longer has (its history rewritten, design §15), is refused
+/// had, or no longer has (its history rewritten), is refused
 /// and nothing is written, so a fork never brings history the source
 /// does not hold.
 #[test]
@@ -1751,7 +1750,7 @@ fn soon() -> Instant {
     Instant::now() + Duration::from_secs(5)
 }
 
-/// Design §11.5 "Fork link" (owner, 2026-10-17: "A fork can be created
+/// The fork link (owner, 2026-10-17: "A fork can be created
 /// with or without a remote link back to its parent. Configurable."; on
 /// where an unlinked fork pushes: "B. And if no remote is configured, the
 /// volume is lost, and that's a choice the user is allowed to make."): an

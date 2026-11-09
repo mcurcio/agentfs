@@ -27,7 +27,7 @@ Pass `args` as a JSON object, not a string. The run notifies you when it complet
 3. **Fresh, narrow agents.** Each agent has one role and one milestone. None carries the history of earlier milestones.
 4. **The repo is the memory.**
    - Milestones hand off through commit SHAs: each milestone's base is the previous one's head.
-   - Every milestone must keep `docs/design.md`, the configuration reference and the runbooks true.
+   - Every milestone must keep the library and human docs, the configuration reference and the runbooks true. The commit that lands a slice deletes its design page and moves the behaviour into them.
    - The next architect therefore reads current, compact truth instead of a transcript.
 5. **Structured handoffs.**
    - Every role returns JSON matching a schema. The plan includes files, tests, CI changes, docs changes, decisions and risks. The implementation report includes head, gates, CI result, deviations and problems. Each review finding has a severity, a failure scenario and a fix.
@@ -48,7 +48,7 @@ Pass `args` as a JSON object, not a string. The run notifies you when it complet
 
 ## Writing milestone briefs
 
-- **Cite the design sections**, and say exactly what "done" means: behaviour, tests (unit, integration, CI e2e) and docs.
+- **Name the design page** of the slice and the library or human pages it changes, and say exactly what "done" means: behaviour, tests (unit, integration, CI e2e) and docs.
 - **Give enough context** to start: the earlier review finding, the user's request (quoted), and known traps.
 - **Order by dependency.** Put features before the packaging that exposes them (local-only mode before Helm). Put docs overhauls last, so they describe the final state.
 - **Allow honest scope cuts.** If an item proves infeasible, the architect plans the closest alternative, documented as such. It must not fake coverage.

@@ -1,6 +1,6 @@
 # The node plugin: `agentfs-csi` under tini on every node, with
 # csi-provisioner (`--node-deployment`), node-driver-registrar and
-# livenessprobe (design §14.2, docs/csi.md "Architecture"). Each node
+# livenessprobe (docs/csi.md "Architecture"). Each node
 # provisions the worktrees on its own disk.
 {{- $kubelet := .Values.kubeletDir }}
 {{- $pluginDir := printf "%s/plugins/%s" $kubelet (include "agentfs-csi.driverName" .) }}
@@ -37,8 +37,7 @@ spec:
       priorityClassName: {{ . }}
       {{- end }}
       terminationGracePeriodSeconds: {{ .Values.node.terminationGracePeriodSeconds }}
-      # The workloads' processes must be visible to the fronts (design §6,
-      # docs/csi.md "Pod Security").
+      # The workloads' processes must be visible to the fronts (docs/csi.md "Pod Security").
       hostPID: true
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
@@ -90,7 +89,7 @@ spec:
             timeoutSeconds: 5
             failureThreshold: 5
           # FUSE mounts and Bidirectional propagation into the kubelet's
-          # directory need privileged (design §14.2 "Pod Security").
+          # directory need privileged.
           securityContext:
             privileged: true
             runAsUser: 0

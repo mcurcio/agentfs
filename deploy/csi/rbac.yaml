@@ -1,4 +1,4 @@
-# The driver's whole RBAC inventory (design §14.2, docs/csi.md
+# The driver's whole RBAC inventory (docs/csi.md
 # "Security"). No rule grants secrets, pods or snapshots: credentials are
 # a Secret mounted into the driver's own pods, never read through the API.
 #

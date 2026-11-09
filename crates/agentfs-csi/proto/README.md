@@ -11,7 +11,7 @@
 
 `build.rs` compiles it with `protox` (a pure-Rust protobuf compiler that
 bundles the well-known types, so no `protoc` is needed) and generates the
-tonic client and server with `tonic-prost-build` (design §17.3).
+tonic client and server with `tonic-prost-build`.
 
 To update: fetch the new tag's `csi.proto` here, update the tag, commit and
 sha256 above, and check that `csi-sanity` in CI uses a matching

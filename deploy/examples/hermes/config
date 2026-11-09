@@ -1,4 +1,4 @@
-# Hermes (design §16): the operator fragment, mounted from a ConfigMap and
+# Hermes: the operator fragment, mounted from a ConfigMap and
 # included with `agentfs init --include /etc/agentfs/config`.
 [agentfs]
 	# Nested repositories (a skill cloned with git) are not recorded.

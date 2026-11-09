@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# End-to-end test of the OTLP transports (design §13) against a real
+# End-to-end test of the OTLP transports against a real
 # OpenTelemetry Collector: metrics, a span and an alarm log arrive over
 # http/protobuf, http/json and gRPC, each from its own service name, with
 # OTEL_EXPORTER_OTLP_HEADERS sent along; with E2E_OTLP_TLS=1 (a binary

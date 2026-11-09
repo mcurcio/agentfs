@@ -1,4 +1,4 @@
-//! `agentfs push` against a running daemon (design §2.3, §11.2).
+//! `agentfs push` against a running daemon.
 //!
 //! `mount`, `run` and `serve-history` serve the control socket
 //! ([`crate::control`]); [`handler`] answers its requests:
@@ -35,7 +35,7 @@
 //! existed), and the command then pushes directly, taking the lock.
 //!
 //! `agentfs push --force-with-lease` never comes here: the operator's
-//! lease push (§15) is always direct, under the remote's push lock alone,
+//! lease push is always direct, under the remote's push lock alone,
 //! so it runs the same with or without a daemon and the control protocol
 //! carries no way to replace a branch.
 
@@ -148,8 +148,7 @@ fn serve_push(
 }
 
 /// Pushes again, at once, every remote whose attempt in `report` sent
-/// only part of its backlog because of its push size limit (design
-/// §11.3), until each is up to date, fails, or `timeout` (from now) runs
+/// only part of its backlog because of its push size limit, until each is up to date, fails, or `timeout` (from now) runs
 /// out. Each remote's steps are kept in its result, in order.
 fn follow_steps(
     service: &ServiceHandle,
@@ -212,7 +211,7 @@ fn remote_reply(result: &RemoteResult) -> RemoteReply {
         .map(|outcome| format!("{}: {}", result.name, describe(outcome)))
         .collect();
     let mut ok = result.outcome.is_success();
-    // Still limited: the timeout ran out between steps (design §11.3). The
+    // Still limited: the timeout ran out between steps. The
     // remote lacks commits, so this is not success; the push loop carries
     // on with the next step at once.
     if let agentfs_core::push::PushOutcome::Pushed {

@@ -1,4 +1,4 @@
-//! Git LFS (design §7): large content stored as LFS objects, with pointer
+//! Git LFS: large content stored as LFS objects, with pointer
 //! blobs in history that ordinary `git clone` plus `git lfs pull` turns
 //! back into content.
 //!
@@ -53,7 +53,7 @@ pub use endpoint::Direction;
 pub use pointer::{LfsOid, Pointer};
 pub use policy::{Store, StorePolicy};
 
-/// An LFS problem, classified like a push failure (design §11.3, §13): it
+/// An LFS problem, classified like a push failure: it
 /// fails the push attempt with stage `lfs`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LfsError {

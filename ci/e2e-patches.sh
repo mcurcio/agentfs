@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# End-to-end patch queue (design §12, §18 test 15) against a smart-HTTP
+# End-to-end patch queue against a smart-HTTP
 # remote with basic auth and a real FUSE mount, following
 # docs/runbooks/patch-queue.md:
 #

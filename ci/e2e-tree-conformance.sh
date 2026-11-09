@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Mounted subset of git-model §18. Needs Linux, git, python3 and /dev/fuse.
+# Mounted subset of the validation in git-model.md. Needs Linux, git, python3 and /dev/fuse.
 set -euo pipefail
 bin=${AGENTFS_BIN:-$PWD/target/debug/agentfs}
 work=$(mktemp -d)

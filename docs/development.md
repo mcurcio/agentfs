@@ -37,7 +37,7 @@ libfuse or pkg-config; running a mount needs `/dev/fuse` (and `fusermount3`
 from the `fuse3` package for a non-root daemon).
 
 Tests only: `cargo test --workspace --features agentfs/failpoints` adds
-the crash-injection failpoints (design §18 test 3, `AGENTFS_FAILPOINTS`
+the crash-injection failpoints (`AGENTFS_FAILPOINTS`
 in the [configuration reference](configuration.md)). Never ship such a
 build: its `--version` ends in `+failpoints`.
 
@@ -158,7 +158,7 @@ Every push runs [`.github/workflows/ci.yml`](../.github/workflows/ci.yml):
 - **e2e FUSE mount** ([`ci/fuse-tests.sh`](../ci/fuse-tests.sh)), with
   passthrough `auto`, `on` and `off`: real mounts as root running the `#[ignore]`d
   tests in [`crates/agentfs/tests/mount.rs`](../crates/agentfs/tests/mount.rs):
-  every operation of design §18 test 1 (editor saves, appends, truncate,
+  every operation of the no-gaps promise (editor saves, appends, truncate,
   directory renames, `rm -r`, hard links, `chmod +x`, symlinks, unlink and
   rename of open files, log rotation), `kill -9` right after a close, root
   and uid 10000 writers, invisibility of the state area, rules and nested
@@ -195,8 +195,7 @@ Every push runs [`.github/workflows/ci.yml`](../.github/workflows/ci.yml):
   mount and through a front ([`boundary-latency.py`](../ci/boundary-latency.py))
   and the socket round trip, into the job summary. The `fuse` job also
   runs `two_fronts_one_service` from `mount.rs`.
-- **e2e crash injection** ([`ci/crash-tests.sh`](../ci/crash-tests.sh),
-  design §18 test 3): a build with the `failpoints` feature (test builds
+- **e2e crash injection** ([`ci/crash-tests.sh`](../ci/crash-tests.sh)): a build with the `failpoints` feature (test builds
   only; `AGENTFS_FAILPOINTS` names where to kill or fail) runs
   [`crash_points.rs`](../crates/agentfs-core/tests/crash_points.rs), a
   workload of writes, a directory move, LFS content, commits and pushes to
@@ -322,7 +321,7 @@ Build the book locally with `mdbook build` (output in `target/book`) or
 `mdbook serve`.
 
 [`.github/workflows/bench.yml`](../.github/workflows/bench.yml) runs the
-benchmark ([`ci/bench.sh`](../ci/bench.sh), design §18 test 13) on every
+benchmark ([`ci/bench.sh`](../ci/bench.sh)) on every
 push to main that changes code, and on demand, once on a fresh XFS
 (reflink) and once on a fresh ext4 (copy) loop filesystem: the
 synchronous record step without FUSE
@@ -340,7 +339,7 @@ change lands and does not hold it;
 failures. See [docs/performance.md](performance.md).
 
 [`.github/workflows/power-loss.yml`](../.github/workflows/power-loss.yml)
-tests power loss and fsync ordering (design §3.3, §18 test 3) on every
+tests power loss and fsync ordering (see [guarantees](guarantees.md)) on every
 push to main that changes code, and on demand, once on ext4 and once on
 XFS: [`ci/power-loss.sh`](../ci/power-loss.sh) runs `agentfs record` and
 `agentfs push` on a filesystem over dm-log-writes, which logs every write,
@@ -370,3 +369,98 @@ kind, kubectl, nginx and fcgiwrap; their headers list the commands.
 `ci/bench.sh dir PATH` benchmarks the filesystem PATH is on with FUSE and
 passwordless sudo; `cargo bench -p agentfs-core --bench record_step`
 needs neither.
+
+## What each promise is tested by
+
+Each promise in [guarantees](guarantees.md) has a test. This table maps
+them to where they run. The CI jobs are described above.
+
+| Promise | Where it is tested |
+|---|---|
+| Every change boundary is recorded: editor saves, appends, `truncate`, directory moves, `rm -r`, hard links, mode changes, symlinks, unlink and rename of open files, log rotation | the `fuse` job, through real mounts (`crates/agentfs/tests/mount.rs`, as root, with passthrough `auto`, `on` and `off`) |
+| A change is recorded before the call returns: `kill -9` right after `close`, then remount | the `fuse` job; the engine matrix of the `crash` job |
+| Nothing is lost or duplicated at any step of record, commit, ref update and push | the `crash` job (`ci/crash-tests.sh`: the engine matrix, the process tests and the mount tests) with one oracle; power loss in the `power-loss` workflow |
+| Any user: root and uid 10000 write with normal permission semantics | the `fuse` job; the kind jobs, in a pod |
+| The history is invisible: no history, journal, state or credential is reachable through the mount | the `fuse` job; the kind jobs |
+| Rules: ignores apply only to new paths, a tracked file stays recorded, tracked rule files cannot turn recording off | the `fuse` job and the unit tests of `rules.rs` |
+| Nested repositories: a clone, a bare clone and `git init` at the root behave as documented, and nesting deletes nothing from history | the `fuse` job (`nothing_is_deleted_by_nesting`), through a mount and a front |
+| Remotes: interval pushes reach two remotes, and an unreachable remote, a refused push and a non-fast-forward each raise an alarm while the filesystem keeps working | `e2e-remotes` (smart HTTP and HTTPS), `e2e-ssh`, and `e2e-shared-remotes` (`ci/e2e-remote-failures.sh`) through a live mount |
+| Pre-commit checks: a path git's fsck or a remote limit would refuse is not recorded, and raises an alarm | the unit tests of `checks.rs` and the `fuse` job |
+| Shared repositories: two volumes push on their own refs without contending, a rival writer is detected as divergence, identities follow the templates | `ci/e2e-shared-remote.sh`, the unit tests of `push.rs`, `crates/agentfs/tests/cli_identity.rs` |
+| Recovery: a file and a whole commit are restored, and the restore is recorded | `ci/e2e-recovery.sh`, `crates/agentfs/tests/cli_restore.rs`, the `e2e-runbooks` job |
+| Telemetry: the metrics are exported and move as expected | `ci/e2e-telemetry.sh` against a real collector and `cli_telemetry.rs` without one. The export of these counters is not tested, though the behaviour each counts is: `agentfs.history_service.superseded` and `.resyncs`, `agentfs.fuse.create_as_caller_fallbacks` and `.racy_rechecks`, `agentfs.reconcile.records` and `.failures`, `agentfs.nested.gitdir_heuristic` |
+| Performance is recorded for a `git clone`, 30,000 small files into an excluded path, `rm -rf` of 100,000 files and closing a 1 GiB file on XFS and ext4 | the `bench` workflow ([performance.md](performance.md)) |
+| Databases: SQLite in WAL and DELETE mode restores every version and passes `PRAGMA integrity_check`; LFS content is readable through `git clone` plus `git lfs pull` | the `fuse` job, `ci/e2e-sqlite.sh`, the `e2e-lfs` jobs |
+| The patch queue: a conflicting patch is set aside and the rest go on, the volume mounts, and a crash and replay never applies a patch twice | the unit tests of `agentfs_core::patch`, `cli_patch.rs`, `ci/e2e-patches.sh` |
+| Several pods on one node: each pod's changes carry its own committer identity and history keeps every boundary | `ci/e2e-multipod.sh`, `history_service.rs`, `ci/e2e-csi.sh` on kind |
+| A `ReadWriteMany` claim is refused | `ci/e2e-csi.sh` and `crates/agentfs-csi/tests/grpc.rs` |
+| The state lock, its holder line and the mount-option check hold across two NFS clients of one export | `ci/e2e-nfs.sh` |
+| A volume continues on another node as a new volume started from its branch | the `f8` workflow (`ci/e2e-csi-move.sh`, two-worker kind cluster) |
+| Forks: a fork publishes one change create-only, a refused publish stays refused, a forked claim in use clones | `fork/tests.rs`, `cli_fork.rs`, `cli_fork_deliver.rs`, `ci/e2e-csi-forks.sh`, `ci/e2e-csi-fork-of-fork.sh` |
+
+Not tested: the CSI driver on hardened node images (Talos) and across node
+reboots; two nodes writing one volume, which is not supported; a power cut
+through a FUSE mount (power loss is tested through the CLI's `record`);
+and reordered writes within one flush epoch, because the replay is in
+write order.
+
+The `fuse` job also runs the README's from-source quick start as written,
+as root (`ci/readme-quickstart.sh`): its remote log after `kill %1; wait`
+must show the edited file, which only the final push at shutdown puts
+there. The `docs` workflow runs the README's Docker quick start as written
+against the published image. The README's Kubernetes quick starts are not
+run as written; the manifests and charts they use are tested by the
+`image` and `helm` workflows.
+
+## Tree-view tests
+
+Tests of tree views ([trees](trees.md)) use real repositories but local
+`tree_actor`, `tree_git` and replay tests are not FUSE or power-loss
+evidence. CI scripts judge the build:
+
+- `e2e-trees.sh` and `e2e-trees-ordering.sh` (workflow `ci`): recording,
+  objects, the anonymous first link, immediate reopen.
+- `e2e-tree-conformance.sh`: fixed model cases and byte calls against a
+  plain Linux file.
+- `phase1-replay` and `e2e-tree-replay.sh`: the model's in-scope scenarios
+  and seeds replayed on a fresh model, the library and real mounts,
+  comparing each tree and each collision's lost lines, with invariants
+  read from git
+  ([VERIFYING.md](../crates/agentfs-model/VERIFYING.md)).
+- `e2e-tree-pagecache.sh`: shared mappings in 21 cases, `trees-mmap`, 64
+  closes reopened.
+- `e2e-tree-restart.sh`, `e2e-tree-recording-faults.sh` and
+  `e2e-tree-enospc.sh`: view-host death, kills at each failpoint, state
+  exhaustion.
+- `power-loss-trees.sh`: dm-log-writes replay on ext4 and XFS, on the
+  upstream and a fork, each checkpoint also rebuilding the refs from the
+  journal alone.
+- `measure-trees.sh`: the measurements in [performance.md](performance.md#tree-views),
+  which are not budgets. A pushed commit message containing
+  `[phase1-measure]` runs them all, `[phase1-held]`, `[phase1-calls]` and
+  `[phase1-pilot]` one mode each, and `[phase1-seeds]` the library at
+  seeds 1 to 500.
+
+## Runners, images and runbooks
+
+- **Runners are pinned.** Every CI job runs on GitHub's runner image named
+  `ubuntu-24.04`, never `ubuntu-latest`, so the kernel, FUSE, kind and nginx
+  the tests rely on change only when the pin does.
+  `crates/agentfs-core/tests/docs_reference.rs` fails on any other runner.
+- **The image is published after the kind jobs pass.** The `image`
+  workflow publishes to `ghcr.io/mcurcio/agentfs` as the commit sha and
+  `latest`, only from main and only after both kind end-to-end jobs
+  pass with that image.
+- **Kind jobs run a real git server.** The example git server runs as a
+  pod, so pushes from pods reach a real remote.
+- **LFS is tested against a real server.** The `e2e-lfs` jobs run git-lfs's
+  `lfs-test-server` behind nginx with the real git-lfs client.
+- **NFS and moves.** `ci/e2e-nfs.sh` mounts one NFS export on two clients
+  to check the state lock, the mount-option check, silly-rename names and
+  a CSI volume refused on a second node plugin while staged on the first.
+  A move to another node is tested on a two-worker kind cluster.
+- **Runbooks never `git push` a branch.** A test
+  (`runbooks_push_only_the_namespace`) holds every `git push` in a runbook
+  to refs under `refs/agentfs/`. The one way a branch is replaced is
+  `agentfs push --force-with-lease`, by an operator
+  ([history-rewrite](runbooks/history-rewrite.md)).

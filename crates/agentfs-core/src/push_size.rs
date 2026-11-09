@@ -1,5 +1,4 @@
-//! Measuring a push before it is sent (design §11.3,
-//! `remote.<name>.agentfsMaxPushSize`).
+//! Measuring a push before it is sent (`remote.<name>.agentfsMaxPushSize`).
 //!
 //! A remote with a maximum push size has the git pack of every attempt
 //! measured before agentfs connects: libgit2's pack builder packs the
@@ -13,8 +12,8 @@
 //! never. A single commit over the limit cannot be stepped: the push fails
 //! as `too_large`.
 //!
-//! Only the git pack is measured: LFS objects go to their own servers
-//! (design §7). The pack libgit2 then sends can differ slightly from the
+//! Only the git pack is measured: LFS objects go to their own servers.
+//! The pack libgit2 then sends can differ slightly from the
 //! measured one, since libgit2 negotiates against every ref the remote
 //! advertises, not the branch alone.
 

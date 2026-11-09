@@ -1,6 +1,6 @@
 {{/*
-agentfs as a phase 1 native sidecar (design §17.1, docs/deployment.md),
-as helpers for a workload's own chart (docs/helm.md §4). Each takes the
+agentfs as a privileged native sidecar (docs/deployment.md),
+as helpers for a workload's own chart (docs/helm.md). Each takes the
 values map of this library (its alias's key):
 
   initContainers:          {{ include "agentfs-sidecar.initContainers" .Values.agentfs | nindent 8 }}
@@ -18,7 +18,7 @@ The pod must also stop slowly enough for the final commit
   /agentfs              an emptyDir shared by every container
   /agentfs/workspace    the FUSE mount: what the workload uses
   /agentfs-sandbox/overlay  with sandboxOverlay.enabled, the sandbox
-                        overlay (design §2.4): for a container that starts
+                        overlay: for a container that starts
                         other containers (sandboxOverlay.mountPath)
 */}}
 
@@ -159,7 +159,7 @@ Docker daemon), with sandboxOverlay.enabled: only the sandbox overlay's
 emptyDir, never the main mount's. It binds paths under
 <mountPath>/overlay into its sandboxes; a container runtime binds with
 private propagation by default, so sandboxes started before a sidecar
-recovery keep the dead mount (docs/deployment.md §12).
+recovery keep the dead mount (docs/deployment.md).
 */}}
 {{- define "agentfs-sidecar.sandboxOverlayMount" -}}
 - name: {{ .sandboxOverlay.volumeName }}
@@ -187,7 +187,7 @@ recovery keep the dead mount (docs/deployment.md §12).
 {{- end }}
 {{- end }}
 
-{{/* Rolls the pod when the settings or rules change: they are read at mount (design §4.1). */}}
+{{/* Rolls the pod when the settings or rules change: they are read at mount. */}}
 {{- define "agentfs-sidecar.podAnnotations" -}}
 checksum/agentfs-config: {{ include "agentfs-sidecar.configMap" . | sha256sum }}
 {{- end }}
@@ -228,8 +228,7 @@ stringData:
 
 {{/*
 The claim: backing/ and state/ as siblings on one filesystem, mounted once
-at /data (recording freezes files with reflinks, which fail across mounts;
-design §3.2).
+at /data (recording freezes files with reflinks, which fail across mounts).
 */}}
 {{- define "agentfs-sidecar.claim" -}}
 apiVersion: v1

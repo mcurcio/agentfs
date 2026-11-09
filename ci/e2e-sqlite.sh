@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# End-to-end SQLite in the fsync class (design §8) through a real FUSE
+# End-to-end SQLite in the fsync class through a real FUSE
 # mount, following docs/operator-guide.md ("Databases: the fsync class")
 # and docs/runbooks/recovery-and-undo.md ("Restoring a database"):
 #
@@ -108,7 +108,7 @@ mount_rows() { # path
 step "a volume with SQLite databases in the fsync class, mounted"
 af init --volume demo >/dev/null
 sgit config agentfs.commitWindow 200ms
-# The operator's file (design §4.3): every member of a database's group.
+# The operator's file: every member of a database's group.
 sudo tee "$STATE/git/info/attributes" >/dev/null <<ATTR
 *.db* agentfs.commit=fsync agentfs.group=sqlite agentfs.coalesce=${COALESCE}s
 ATTR

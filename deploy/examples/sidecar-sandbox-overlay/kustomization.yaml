@@ -1,4 +1,4 @@
-# deploy/sidecar with the sandbox overlay (docs/deployment.md §12): the
+# deploy/sidecar with the sandbox overlay (docs/deployment.md): the
 # component deploy/sidecar/sandbox-overlay applied to the sidecar base.
 # It lives outside deploy/sidecar because kustomize refuses a base that
 # contains the kustomization using it.

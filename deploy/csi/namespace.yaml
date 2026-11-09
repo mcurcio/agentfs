@@ -1,5 +1,4 @@
-# The driver's namespace: the only place agentfs runs privileged (design
-# §14.2, docs/csi.md "Security"). The node plugin needs privileged (FUSE,
+# The driver's namespace: the only place agentfs runs privileged (docs/csi.md "Security"). The node plugin needs privileged (FUSE,
 # Bidirectional mount propagation into the kubelet's directory); nothing
 # else may run here, so warn on anything beyond baseline.
 apiVersion: v1

@@ -3,8 +3,7 @@
 What to do when an agentfs CSI volume misbehaves: a crashed front or
 history service, a node plugin upgrade, a node reboot, a volume stuck
 staging, an undo in a live volume. The node plugin recovers crashes by itself; this runbook is for
-checking that it did and for the cases it cannot handle. Design:
-[§14.2](../design.md#142-csi-driver-built); operator guide:
+checking that it did and for the cases it cannot handle. Library: [kubernetes](../library/kubernetes.md); operator guide:
 [csi.md](../csi.md#8-recovery).
 
 Throughout, `$NODE_POD` is the node plugin pod on the node running the
@@ -40,14 +39,14 @@ front for <ns>/<pod> restarted in slot 3; its mount is stacked over the stale on
    and the volume mount has no `mountPropagation: HostToContainer`, the
    container still sees the dead mount: restart the container (`kubectl
    exec <pod> -- kill 1`, or delete the pod). Add `HostToContainer` to
-   the workload (csi.md §6).
+   the workload ([csi.md](../csi.md)).
 3. A front restarting in a loop (`restarting in 30s`) logs why in the
    lines prefixed `[front <ns>/<pod> …]` above it: a full disk, a broken
    profile, a service that refuses it (`refused this front: …`).
 
 Nothing is lost: a change whose call returned was journaled by the
-service (design §3.2); changes whose call failed are recorded with their
-final state by the new front's repairs (design §3.5).
+service ([guarantees](../guarantees.md)); changes whose call failed are recorded with their
+final state by the new front's repairs ([recording](../recording.md)).
 
 ## A crashed or crash-looping history service
 
@@ -104,7 +103,7 @@ Nothing to do in the common case: the records under
 `/var/lib/agentfs-csi/node` survive, the new plugin restarts the staged
 volumes' services, forgets the targets that no longer exist, and the
 kubelet stages and publishes the volumes again for the pods it restarts.
-Each service recovers its journal before it serves (design §3.3).
+Each service recovers its journal before it serves.
 
 Check that the plugin log has no `warning: an unreadable node record was
 skipped` lines; a record the plugin could not read is left in place and
@@ -124,7 +123,7 @@ It is usually:
 
 - **Journal recovery** of a large journal (`[service <pv>] recovering …`).
   Wait.
-- **Applying queued patches** (design §12), bounded by
+- **Applying queued patches** ([patches](../patches.md)), bounded by
   `agentfs.patchFetchTimeout`. Wait, or check the queue with
   [patch-queue.md](patch-queue.md).
 - **A service that exits** at start: the event then says
@@ -171,7 +170,7 @@ csi-provisioner's log says `DeleteVolume … Unavailable desc = volume <pv>: the
 fork is active` (or `finished`, or `refused`) `: it is deleted once it is
 published or abandoned`.
 
-This is the design working (design §11.5, [csi.md §14](../csi.md#14-forks)):
+This is intended ([forks](../forks.md), [csi.md §14](../csi.md#14-forks)):
 a linked fork (the default) is deleted only once its fork remote holds
 its change and finish refs. An unlinked fork (`link: unlinked` in its
 class) never answers this way: it is never finished, and its
@@ -242,8 +241,8 @@ says why.
 ## Undoing a change in a live volume
 
 Restores and reverts run through the volume's history service, with the
-pods still running (design §15,
-[recovery-and-undo.md](recovery-and-undo.md)), from the node plugin pod
+pods still running
+([recovery-and-undo.md](recovery-and-undo.md)), from the node plugin pod
 on the node that stages the volume:
 
 ```sh

@@ -1,4 +1,4 @@
-//! The synchronous step's cost (design §3.2, §18 test 13, §19.2 item 1),
+//! The synchronous step's cost,
 //! without FUSE: what a change boundary pays before its call returns.
 //!
 //! ```sh

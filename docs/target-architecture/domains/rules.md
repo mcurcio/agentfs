@@ -1,21 +1,11 @@
 # Domain: Rules
 
-**Layer:** System › **Domain (this page)** › Feature. Binding parents: [../system.md](../system.md) revision 10 and
-[../git-model.md](../git-model.md).
-**Status:** draft 5, proposed. The target, not today's code; sketches are Rust surfaces. "Profile" on this page always
-means a **view profile**; the CSI settings bundle keeps the bare word.
+**Proposed, not built.** This page proposes the Rules domain (path policy and view profiles), one part of the system around the git model ([the system](../system.md)). The git model ([git-model.md](../git-model.md)) wins wherever the two disagree. Rust sketches show surfaces only. The commit that lands the slice that builds this domain deletes this page and moves the behaviour into the library or operator docs.
+"Profile" on this page always means a **view profile**; the CSI settings bundle keeps the bare word.
 
-## 0. The owner's words this domain rests on
+## 0. Guidance this domain rests on
 
-| # | His words | Date | What it sets here |
-|---|---|---|---|
-| R7 | "Security boundary. Agentfs is the gatekeeper that exposes only what we want sandboxes to see" | 2026-10-30 | profiles decide what a view shows |
-| — | "the sandbox agent should only get write access to the agentfs overlay files"; "potentially should only be able to see the agentfs overlay files at all" | 2026-10-30 | the `Recordable` base (read as: "overlay files" are the names agentfs would record) |
-| R8 | a consumer's personal information never enters the agentfs repo | 2026-10-30 | this page names no consumer |
-| R9 | "Whole seems best, right? A partial application has unknown side effects" | 2026-10-16 | a database group is shown, hidden and recorded whole |
-| R16 | "The various agentfs components should be within the same version family (major for sure, maybe minor too, patch doesnt need to match)" | 2026-11-02 | a change to how rules are judged is a minor release (RU7) |
-
-Everything else is a design choice. Today's behaviour (origin/main b5c0dc8, design §2.4, §4, §5, §8) is evidence.
+The owner's guidance that applies here is in `OWNER-GUIDANCE.md` at the repository root. Everything else on this page is a design choice.
 
 ## 1. What Rules owns, and what it is not
 
@@ -117,7 +107,7 @@ home of the rule, including a tracked file arriving at its path, is git-model §
 | RU1 | Rules is pure and total: no I/O, no clock, no error after boot | depends on `model` and `contracts` only; methods return no `Result` | compile time |
 | RU2 | A rule-set error stops the service; it never degrades to "show" or "record everything" | `RuleSet::build` is the only constructor; no fallback | boot time |
 | RU3 | Visibility never depends on existence or on who wrote a name; a profile shows nothing its base hides | `visibility` takes no existence or writer argument; a profile holds only a base and hide patterns | compile + construction time |
-| RU4 | A database group is shown, hidden and recorded whole (R9) | `Group::members()` is computed, never supplied | construction time + test |
+| RU4 | A database group is shown, hidden and recorded whole | `Group::members()` is computed, never supplied | construction time + test |
 | RU5 | Ignore rules decide only for untracked paths; a tracked path stays recorded until removed | `skip` order: never-record, then `tracked` short-circuits ignore and containment | test |
 | RU6 | A path whose containment is unknown is judged as inside a repository (fail closed) | one exhaustive `match` | compile time |
 | RU7 | Every view host judges with the history service's rule set | a `Binding` carries `RuleSetVersion` (a digest of the sources and the family); another version reloads before serving | boot time per binding |
@@ -169,7 +159,6 @@ recorded. Names that are not `RelPath`s (a `.git` component, git's refused spell
 |---|---|---|---|
 | rule set, rule-set version | the immutable value of every operator rule, and its digest | RU2, RU7 | `Rules` (today's type) |
 | group kind | a database group's member and never-recorded suffixes | RU4 | `agentfs.group` |
-| base, hide patterns, scratch | a view profile's parts; a private name never committed | R7 | recordable names; the tmp layer |
+| base, hide patterns, scratch | a view profile's parts; a private name never committed | the rule that a view shows only what a client may see | recordable names; the tmp layer |
 | containment | inside a nested repository or not, as observed | RU6 | nested detection |
 
-*History: drafts 1–4 are in git; draft 5 (2026-11-03) drops the merge rule and record classes with the resolver chain and journal.*

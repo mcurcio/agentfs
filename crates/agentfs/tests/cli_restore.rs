@@ -1,5 +1,5 @@
 //! `agentfs restore` and `agentfs revert` with no mount running: direct
-//! mode, writing the backing tree (design §15, §18 test 11). The same
+//! mode, writing the backing tree. The same
 //! commands through a running mount are tested in `mount.rs`.
 
 use std::fs;

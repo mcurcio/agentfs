@@ -1,4 +1,4 @@
-//! A front's lease on a pending slot (design §2.2, §14).
+//! A front's lease on a pending slot.
 //!
 //! Fronts freeze into one shared `pending/`, each in a slot of its own
 //! ([`crate::pending::SLOT_SHIFT`]). A front leases its slot with an
@@ -53,8 +53,8 @@ impl FrontLease {
     /// does.
     ///
     /// A front restarted after a crash prefers its predecessor's slot, so
-    /// it drains that slot's repair queue (§3.5) under the same pod
-    /// identity (design §14.2).
+    /// it drains that slot's repair queue under the same pod
+    /// identity.
     pub fn acquire_preferring(
         state: &StateDir,
         description: &str,

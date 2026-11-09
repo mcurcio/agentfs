@@ -1,7 +1,7 @@
 //! The node plugin's supervisor against a fake launcher (processes that
 //! write their address, mount their source, crash on demand) and a fake
 //! mounter (an in-memory mount table): staging, publishing, recovery,
-//! teardown and reconcile (design §14.2).
+//! teardown and reconcile.
 
 use std::collections::HashMap;
 use std::fs;
@@ -728,7 +728,7 @@ async fn reconcile_rebuilds_services_and_fronts_from_the_records() {
     sup.shutdown().await;
 }
 
-/// Whether a service was told a workload is attached (design §12: it
+/// Whether a service was told a workload is attached (: it
 /// judges the patch queue and does not land it).
 fn told_attached(spec: &ProcessSpec) -> bool {
     spec.args.iter().any(|a| a == "--workload-attached")

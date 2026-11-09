@@ -1,6 +1,6 @@
 # The node plugin: `agentfs-csi` under tini on every node, with
 # csi-provisioner (`--node-deployment`), node-driver-registrar and
-# livenessprobe (design §14.2, docs/csi.md "Architecture"). Each node
+# livenessprobe (docs/csi.md "Architecture"). Each node
 # provisions the worktrees on its own disk: CreateVolume makes one under
 # the base path, NodeStage starts one `agentfs serve-history` per volume,
 # NodePublish one `agentfs mount --history-service` front per pod,
@@ -38,15 +38,14 @@ spec:
       # The workloads' processes must be visible to the fronts: FUSE reports
       # a caller outside the plugin's pid namespace as pid 0, whose
       # supplementary groups (a pod's fsGroup) are then unknown, and new
-      # files are created as root before being given to the pod (design §6,
-      # docs/csi.md "Pod Security").
+      # files are created as root before being given to the pod (docs/csi.md "Pod Security").
       hostPID: true
       tolerations:
         - operator: Exists
       containers:
         - name: agentfs-csi
           image: ghcr.io/mcurcio/agentfs
-          # tini reaps whatever the children leave behind (design §14.2); with
+          # tini reaps whatever the children leave behind; with
           # hostPID it is not PID 1, so it registers as a subreaper (-s).
           command: [tini, -s, --, agentfs-csi]
           args:
@@ -74,7 +73,7 @@ spec:
             timeoutSeconds: 5
             failureThreshold: 5
           # FUSE mounts and Bidirectional propagation into the kubelet's
-          # directory need privileged (design §14.2 "Pod Security").
+          # directory need privileged.
           securityContext:
             privileged: true
             runAsUser: 0

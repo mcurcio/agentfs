@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# End-to-end test of upstream Hermes (NousResearch/hermes-agent, design
-# §16, deployment.md §10) on an agentfs volume under Docker Compose:
+# End-to-end test of upstream Hermes (NousResearch/hermes-agent, design, deployment.md) on an agentfs volume under Docker Compose:
 # examples/docker/compose.yaml + compose.remote.yaml + ci/hermes/compose.yaml.
 # Hermes runs its published image as shipped, root start-up included, with
 # the mount at its data path; its docker terminal backend runs tool
@@ -122,7 +121,7 @@ hermes_check_exclusions
 step "4. a queued patch lands at restart and Hermes reads it"
 marker="Patched by agentfs CI $(date +%s%N)"
 hermes_queue_patch "$marker" 1
-# A pod restart (deployment.md §10): everything on the mount stops, then
+# A pod restart (deployment.md): everything on the mount stops, then
 # the recorder, which lands the queue at mount with nothing attached.
 dc stop hermes dind
 dc restart agentfs

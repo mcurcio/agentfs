@@ -1,40 +1,71 @@
 # Target architecture
 
-This set describes the **target** architecture of agentfs: the shape the code should move to. It is not a description of today's code. For how agentfs works today, read [Design](../design.md) and [Architecture](../architecture.md).
+This directory holds two kinds of page.
 
-**Start with [agentfs in git terms](git-model.md): it is the foundation for implementation.** It describes every tree, save, lock, landing, sync, collision and transaction as git branches, commits and refs, as the executable model in `crates/agentfs-model` runs them. It is the one source of truth for all of that; no other page here restates it.
+- **The baseline.** The git model, the rules ledger, the executable model and the demo. They are the proof and the
+  testbed for how trees, saves, landings and syncs behave. They stay.
+- **Open slices.** Designs for work that is not built. A design page lives only until its slice is built. The
+  commit that lands the slice deletes the page and moves the behaviour into the library or operator docs. Each page
+  opens with what it proposes.
 
-The rest of the set covers only what the git model does not: [the system](system.md) (the owner's requirements and where each is designed, the domains around the git model, their contracts and events, versions, deployment and crate layout) and one page per domain.
+How the built parts work is in [trees](../trees.md) and the library pages, not here.
 
-## Status
+## The baseline
 
-| Document | Status |
+| Page | What it holds |
 |---|---|
-| [agentfs in git terms](git-model.md) | proposed; the foundation for implementation; wins wherever another page disagrees |
-| [The rules ledger](rules-ledger.md) | the authority on which rules the owner approved; CI fails while any is `proposed` |
-| [The system](system.md) | revision 10, proposed (revision 3 approved by the owner on 2026-11-02) |
-| The eight domain pages | proposed |
+| [agentfs in git terms](git-model.md) | every tree, save, lock, landing, sync, collision and transaction as git branches, commits and refs. It is the one source of truth for that, and no other page restates it |
+| [The rules ledger](rules-ledger.md) | every rule in plain words, and whether the owner approved it. CI fails while any rule is `proposed` |
+| [MODEL.md](../../crates/agentfs-model/MODEL.md) | the rules, invariants and findings the executable model checks |
+| [VERIFYING.md](../../crates/agentfs-model/VERIFYING.md) | how a design change is verified on the model: what to run, seeds and replays, planted bugs, reading a failure, and the conformance replay on the real library and mounts |
+| [Walkthrough](demo/walkthrough.md) | the fork and upstream rules run on plain `git`, with `demo.sh` as the script CI runs |
 
-## Reading order
+## The open slices
 
-1. **[agentfs in git terms](git-model.md)**.
-2. **[The rules ledger](rules-ledger.md)**: every rule in plain words, and whether the owner approved it.
-3. **[The system](system.md)**: its §5 lists the owner's requirements the git model does not design yet.
-4. The domains:
+Pages for a whole domain or the system:
 
-| Domain | One line |
+| Slice | Page |
 |---|---|
-| [Rules](domains/rules.md) | pure path policy: recorded or not, database groups, what each view profile shows |
-| [Clients](domains/clients.md) | clients, writers, grants, sessions and attachment; every capability |
-| [Views](domains/views.md) | each client's filesystem: open files until close, what a client sees and when, consistency, caches |
-| [Trees](domains/trees.md) | where working trees live, confinement, space limits, the fork lifecycle, pinned snapshots |
-| [Replication](domains/replication.md) | remotes, credentials, pushes (the one pusher), settlement, divergence |
-| [Volume](domains/volume.md) | lifecycle, start point, release verdict, an upgrade's drain |
-| [Health](domains/health.md) | liveness of the history service and view hosts, judged from outside them |
-| [Telemetry](domains/telemetry.md) | metrics, traces and alarms that never block |
+| System composition and contracts: events, capabilities, versions, deployment compositions | [The system](system.md) |
+| Rules and view profiles: recorded or not, database groups, what each profile shows | [Rules](domains/rules.md) |
+| Clients, grants, sessions and attachment | [Clients](domains/clients.md) |
+| Views: one view per client, consistency settings, several view hosts | [Views](domains/views.md) |
+| Trees storage and lifecycle: fork end and drop, pinned snapshots, confinement | [Trees](domains/trees.md) |
+| Replication on the tree model: remotes, credentials, pushes, divergence | [Replication](domains/replication.md) |
+| Volume lifecycle, versions and the upgrade drain | [Volume](domains/volume.md) |
+| Health: liveness of the history service and view hosts | [Health](domains/health.md) |
+| The target telemetry domain: metrics, traces and alarms that never block | [Telemetry](domains/telemetry.md) |
+| Snapshot opens (parked) | [Snapshot opens](snapshot-opens.md) |
+
+Smaller slices, one page each:
+
+| Slice | Page |
+|---|---|
+| Cutting the tree actor into six modules | [Module cut](future/module-cut.md) |
+| Transactions | [Transactions](future/transactions.md) |
+| Nested forks on trees | [Nested forks](future/nested-forks.md) |
+| Directories, symlinks, non-UTF-8 names and more links in the tree views | [Beyond flat files](future/tree-views-beyond-flat-files.md) |
+| Telemetry export from the tree views | [Tree-view telemetry](future/tree-view-telemetry.md) |
+| Landing approvals and timing on trees | [Landing approvals](future/landing-approvals.md) |
+| Integrator patches, restore and revert on trees | [Integrator patches](future/integrator-patches.md) |
+| Files changed while open, database groups | [Open files and groups](future/files-open-groups.md) |
+| Large and binary files on trees | [Large and binary files](future/large-and-binary-files.md) |
+| Space limits and history truncation | [Space limits](future/space-limits.md) |
+| Where the line map lives; two renames to one path | [Line map and renames](future/line-map-and-renames.md) |
+| Refusing shared mappings | [Shared mappings](future/shared-mappings.md) |
+| Faster saves and landings with large files or many saves | [Save and take speed](future/save-and-take-speed.md) |
+| Landing patches while a workload runs | [Live landing](future/live-landing.md) |
+| Recovery tooling beyond restore and revert | [Recovery tooling](future/recovery-tooling.md) |
+| Sandbox overlay: shared locks, inode gaps, hosting on a front | [Overlay gaps](future/sandbox-overlay-gaps.md) |
+| Wider power-loss coverage | [Power-loss coverage](future/power-loss-coverage.md) |
+| Reloading OTLP TLS files | [OTLP TLS reload](future/otlp-tls-reload.md) |
+| Cloning a claim that is in use | [Clone in use](future/clone-in-use.md) |
+| Forge CI on hidden fork refs | [Forge CI](future/forge-ci-on-hidden-refs.md) |
 
 ## How to read a page
 
-- Requirements credited to the owner are quoted and dated; everything else is a design choice and says so.
-- Sketches are Rust and show surfaces only. Nothing here was compiled or run, except the git model's rules, which run as tests in `crates/agentfs-model`. How a change to them is verified: [Verifying the design](verifying.md).
-- The older Forks, Journal, Landing and History pages were removed on 2026-11-03: the git model replaces them. They are in git history.
+- Sketches are Rust and show surfaces only. Nothing on an open-slice page is compiled or run. The git model's
+  rules run as tests in `crates/agentfs-model`.
+- The owner's guidance that shaped these pages is in `OWNER-GUIDANCE.md` at the repository root. Everything else on
+  a page is a design choice and says so.
+- Where an open-slice page seems to disagree with [git-model.md](git-model.md), the git model wins and the page has a bug.

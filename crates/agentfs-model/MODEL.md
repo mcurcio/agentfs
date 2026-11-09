@@ -471,15 +471,14 @@ An open or rejected finding has a test marked `#[ignore = "coherence finding N: 
    rename that leaves the name free, each wakes it (`wake`). Revisable: option b was that the library locks files alone.
    `r9_a_landing_waits_for_an_open_file_that_took_a_name_it_touches`,
    `finding_46_a_landing_waits_for_an_open_file_that_took_a_name_it_touches`.
-47. **Resolved by the owner's "6 a" (2026-11-07): the same calls, other bytes (5 of 1,000: seeds 78, 164, 189, 428, 484 of the phase 1
-   generator).** Shrunk and split by mechanism:
+47. **Resolved by the owner's "6 a" (2026-11-07): the same calls, other bytes (5 of 1,000: seeds 78, 164, 189, 428, 484 of the tree-library generator).** Shrunk and split by mechanism:
    - Seed 484, the model was wrong (R10.3). Main edits a file and unlinks it, and a fork unlinks it or names it in a rename-over. The
      model's unlink lost to the edit inside the file main had also unlinked; the library's two deletes agreed. Fixed in the model.
      `finding_47_two_unlinks_agree_over_an_unseen_edit`, `finding_47_a_rename_over_agrees_with_an_unlink_over_an_unseen_edit`.
    - Seed 428 is finding 48.
    - Seeds 78, 164 and 189 are finding 49: neither side is wrong, the trace is.
 48. **Resolved by the owner (2026-11-08, "A"): a kept file shows the upstream's last edit (R11.5; seed 428 and 7 more traces at seeds 1
-   to 500 of the phase 1 generators).** Main edits `a` and unlinks it, and a fork's rename of `a` is undecided. Until the upstream decides,
+   to 500 of the tree-library generators).** Main edits `a` and unlinks it, and a fork's rename of `a` is undecided. Until the upstream decides,
    the fork keeps the file under its new name (R11.5), and the fork never touched its contents, so a sync brings the upstream's last edit
    (R3d): the model and the library both show it, byte for byte. The library's sync commit then holds a line neither of its git parents
    holds, since an upstream that ended the file stores no map of it. The replay's `one_writer` ("a merge originates nothing") now also
@@ -488,7 +487,7 @@ An open or rejected finding has a test marked `#[ignore = "coherence finding N: 
    (`one_writer_refuses_anything_wider`, in `crates/agentfs-conformance/src/invariants.rs`). Revisable: option B was the contents before
    that edit. `finding_48_a_kept_file_takes_the_upstreams_last_lines_and_keeps_its_own`, `one_writer_accepts_a_line_of_the_upstreams_last_version`.
 49. **Resolved by the owner (2026-11-08, "Without any other information, B sounds reasonable. Obviously atomic operations are more
-   reliable"): a take is one atomic step in the model (seeds 78, 164, 189 of the phase 1 generator).** The model's take was two steps, a
+   reliable"): a take is one atomic step in the model (seeds 78, 164, 189 of the tree-library generator).** The model's take was two steps, a
    hold and a finish, with calls between them, and a real take is one. The trace recorded a take after the calls made during its hold, and
    when one of those calls freed an earlier queue entry, a take at the recorded place picked that entry: the fresh model and the library
    agreed with each other and differed from the run that recorded the trace. Now `Step::Next` chooses its entry, locks its keys and writes
@@ -501,7 +500,7 @@ An open or rejected finding has a test marked `#[ignore = "coherence finding N: 
    `finding_49_a_take_is_one_step_so_its_trace_replays`.
 50. **Closed by the owner (2026-11-08, option A, general guidance: "shouldnt a fork receive all changes from its upstream? barring
    transactions and locks, a fork configured to sync should stay up to date"): a fork's prefix sync past its upstream's fast-forward (seed
-   401 of `full_lineage`, `adjacent_lines` and `commit_dates_decide_nothing` at seeds 1 to 500; a fork of a fork, so outside phase 1's
+   401 of `full_lineage`, `adjacent_lines` and `commit_dates_decide_nothing` at seeds 1 to 500; a fork of a fork, so outside the tree library's
    generators).** f2 is a fork of f1, made while f1's save x of `b` is undecided. The save m of `b` in f1's upstream wins against x, and
    f1, with no other commit, syncs by fast-forwarding to that landing, so f1's first parents are now its upstream's. f2 keeps `b` open, so
    its prefix sync of f1 (R9.3) delivers only an earlier commit, one with neither x nor the decision against x, and holds that decision
@@ -512,7 +511,7 @@ An open or rejected finding has a test marked `#[ignore = "coherence finding N: 
    commits); the random calls only now reach it, because the generator draws differently. Revisable: the alternative was to change the
    prefix sync's rule. `finding_50_a_prefix_sync_holds_back_a_decision_on_the_upstreams_line_until_the_close`,
    `finding_50_a_held_back_decision_is_excused_only_while_a_lock_holds_it`.
-51. **Fixed (2026-11-08): the library merged a sync that could fast-forward (R6.1; CI seed 37 of the phase 1 generator).** A fork's save
+51. **Fixed (2026-11-08; the owner answered "A" on 2026-11-09, at the cost that no ref reaches the fork's earlier sync merge any more): the library merged a sync that could fast-forward (R6.1; CI seed 37 of the tree-library generator).** A fork's save
    loses to its upstream's; the fork's sync can then fast-forward to its upstream's landing, which holds the fork's commit, with nothing of
    the fork waiting. The model did. The library merged, because its fork's line map still listed the lost version in its ancestry, so its
    snapshot differed from its upstream's in that alone. The fork's next save then landed as a merge rather than a fast-forward (R6.2), and a
@@ -708,7 +707,7 @@ It found the model NOT SOUND: one P0, seven P1s, six P2s, from eight planted bug
 - **`syncs_deliver`'s held-back excuse** covers any version taken in a held-back landing, a sibling's included, and
   since finding 50 any line whose decision a lock holds back, in any tree's landing the upstream's head holds;
   a leak through a sibling's landing is unproven.
-- **What phase 1 must validate on a real filesystem** (git-model.md §18): `RELEASE` ordering against a reopen,
+- **What the tree library must validate on a real filesystem** (git-model.md §18): `RELEASE` ordering against a reopen,
   journal durability under power loss and `ENOSPC`, the object table after a view-host restart, shared `mmap`,
   `O_TMPFILE`, stale offsets through the page cache, costs at scale, reftable under a crash, and how often real
   workloads keep a file open long enough to postpone a landing.

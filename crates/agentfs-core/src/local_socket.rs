@@ -1,5 +1,5 @@
 //! Unix sockets in the state area, shared by the control socket of a mount
-//! (design §15) and the history service (§14).
+//! and the history service.
 //!
 //! Both ends address a socket as `/proc/self/fd/<dir fd>/<name>`, so a long
 //! state-area path never hits the 108-byte `sun_path` limit. A private

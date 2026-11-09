@@ -1,4 +1,4 @@
-# Defaults of the agentfs sidecar helpers (docs/helm.md §4). A workload
+# Defaults of the agentfs sidecar helpers (docs/helm.md). A workload
 # chart depends on this library under an alias (`alias: agentfs`) and
 # sets these under that key; each helper takes
 # that values map, e.g. `include "agentfs-sidecar.initContainers"
@@ -16,7 +16,7 @@ image:
   pullPolicy: ""
 
 # -- The agentfs volume name (required); the history branch is
-# `agentfs/<volume>` (design §4.3).
+# `agentfs/<volume>`.
 volume: ""
 
 # -- Labels of the ConfigMap, Secret and claim the helpers render.
@@ -30,10 +30,9 @@ config:
   # Must not set agentfs.volume or agentfs.branch.
   settings: ""
   # -- Mounted over `<state>/git/info/exclude`: paths never recorded when
-  # new (design §4.1).
+  # new.
   exclude: ""
-  # -- Mounted over `<state>/git/info/attributes`: agentfs attributes
-  # (design §4.2).
+  # -- Mounted over `<state>/git/info/attributes`: agentfs attributes.
   attributes: ""
 
 credentials:
@@ -48,8 +47,7 @@ claim:
   # -- The claim holding the backing tree and the state area, mounted at
   # `/data` in the agentfs containers only.
   name: agentfs-data
-  # -- Its access modes. ReadWriteOncePod makes this pod the single writer
-  # (design §2.3).
+  # -- Its access modes. ReadWriteOncePod makes this pod the single writer.
   accessModes: [ReadWriteOncePod]
   # -- Its size.
   size: 10Gi
@@ -58,16 +56,15 @@ claim:
   storageClassName: ""
 
 # -- What the sidecar does on a stale mount after a crash: `recover`
-# mounts over it, `hold` waits for a pod restart (design §17.1).
+# mounts over it, `hold` waits for a pod restart.
 onStaleMount: recover
 
 # -- Seal the bare mount point (root's, mode 0000) so a non-root workload
-# cannot write where nothing records it (design §17.1).
+# cannot write where nothing records it.
 sealMountpoint: true
 
 sandboxOverlay:
-  # -- Also serve the sandbox overlay (design §2.4, docs/deployment.md
-  # §12): a second mount point of the volume, at `<mountPath>/overlay`,
+  # -- Also serve the sandbox overlay (docs/deployment.md): a second mount point of the volume, at `<mountPath>/overlay`,
   # that shows only the files the operator's rules would record. Give it
   # to a container that starts other containers, with
   # `agentfs-sidecar.sandboxOverlayMount`, never the main mount.

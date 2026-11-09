@@ -1,4 +1,4 @@
-//! The state-area lock from the command line (design §2.3): `mount`, `run`,
+//! The state-area lock from the command line: `mount`, `run`,
 //! `record`, `flush` and `push` refuse a state area another process holds,
 //! with exit status 75, unless `--wait-lock` lets them wait; `status` is
 //! read-only and reports the holder.

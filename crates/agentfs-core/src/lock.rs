@@ -1,4 +1,4 @@
-//! Exclusive use of a state area by one process (design §2.3).
+//! Exclusive use of a state area by one process.
 //!
 //! Every command that opens a volume for writing (`mount`, `run`, `record`,
 //! `flush`, `push`) takes [`StateLock`] first: an exclusive `flock` on
@@ -71,8 +71,7 @@ impl StateLock {
             source,
         };
         fs::create_dir_all(state.meta()).map_err(io_err)?;
-        // Only a lock the server enforces keeps another node out (design
-        // §14.2).
+        // Only a lock the server enforces keeps another node out.
         crate::shared_fs::require_safe_locks(&state.meta()).map_err(|source| {
             LockError::UnsafeFilesystem {
                 state: state.root().to_path_buf(),

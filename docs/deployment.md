@@ -1,15 +1,14 @@
 # Deploying agentfs on Kubernetes
 
-Phase 1 runs agentfs as a **privileged native sidecar** in the workload's
-own pod (design §17.1): the sidecar mounts the FUSE filesystem into an
+agentfs runs as a **privileged native sidecar** in the workload's
+own pod: the sidecar mounts the FUSE filesystem into an
 `emptyDir`, and the workload's containers use it like any directory. This
 guide covers the container image, the example manifests in
 [`deploy/sidecar`](../deploy/sidecar), why the pod is laid out the way it
 is, configuration, operations, what happens when the daemon crashes, the
-security cost of the privileged sidecar, and Hermes, the first consumer
-(design §16).
-
-Section numbers (§) refer to [design.md](design.md). Running a mount
+security cost of the privileged sidecar, and Hermes as upstream ships it.
+Section numbers (§) on this page are this page's own. What agentfs
+promises is in [guarantees](guarantees.md). Running a mount
 outside Kubernetes is in the [operator guide](operator-guide.md); every
 setting is in the [configuration reference](configuration.md).
 
@@ -37,11 +36,11 @@ without publishing. **Pin a commit tag or a digest** in production
   through `kubectl exec`, and `tini`, PID 1 of the CSI node plugin. Both
   base images are pinned by digest.
 - **The release of `git`:** the build fails unless Debian's `git` is the
-  release in `ci/git-release`, the one CI runs. In phase 1's trees an upgrade
+  release in `ci/git-release`, the one CI runs. In tree views ([trees](trees.md)) an upgrade
   changes how later saves align repeated lines, so a concurrent edit of a
   repeated line can land elsewhere or collide. Stored bytes and line
   identities do not change.
-- **Platform:** `linux/amd64` only for now.
+- **Platform:** `linux/amd64` only.
 - **Entrypoint:** `agentfs`; the default command is `--help`.
 - **User:** root, on purpose (`USER 0`). The sidecar must be root and
   privileged (§7 below), and libgit2's repository ownership check wants
@@ -113,7 +112,7 @@ volumes
 (`/data/backing`) and the state area (`/data/state`) are siblings on one
 filesystem, never two `subPath` mounts of the volume: recording freezes a
 file's content with a `FICLONE` reflink into `state/pending`, and reflinks
-fail with `EXDEV` across mounts (§3.2). Siblings also keep the state area
+fail with `EXDEV` across mounts. Siblings also keep the state area
 out of the backing tree, which `mount` checks. XFS (or btrfs) is
 recommended for the volume: a reflink costs the same whatever the file's
 size; on ext4 it is a copy.
@@ -168,7 +167,7 @@ journal recovery) would only interrupt it.
 **One writer.** `ReadWriteOncePod` lets only one pod in the cluster use
 the volume, and the Deployment's `Recreate` strategy stops the old pod
 before the new one starts, so a rollout never has two pods (and two
-daemons) on one state area (§2.3). The state-area lock is the last line
+daemons) on one state area. The state-area lock is the last line
 of defence. Most clusters need a CSI driver for `ReadWriteOncePod`.
 
 **Termination.** Native sidecars are stopped after the workload
@@ -183,7 +182,7 @@ filesystem mounted elsewhere, so the daemon waits its `--unmount-grace`
 (10 s) for the session to end, says so (`the filesystem was still
 mounted elsewhere`), and exits; the bind then fails with `ENOTCONN` until
 the kubelet removes it. The stop keeps the attached mark, which the next
-pod's start passes over because it was another pod's (design §12). `terminationGracePeriodSeconds: 60`
+pod's start passes over because it was another pod's ([patches](patches.md)). `terminationGracePeriodSeconds: 60`
 covers both with room to spare; keep it above `--unmount-grace` plus
 `--push-grace` plus a few seconds.
 
@@ -217,7 +216,7 @@ read ([Proxies](configuration.md#proxies)):
 
 **Rules.** The ConfigMap keys `exclude` and `attributes` are mounted
 read-only over `/data/state/git/info/exclude` and `info/attributes`, in
-the sidecar only (`subPath` mounts). Rules are read at mount time (§4.1).
+the sidecar only (`subPath` mounts). Rules are read at mount time ([recording](recording.md)).
 
 **Changing settings or rules** is a rollout: the kustomization's
 `configMapGenerator` puts a hash of the content in the ConfigMap's name,
@@ -234,7 +233,7 @@ and `agentfsKnownHosts` (or name an ssh-agent socket with
 `agentfsSshAgent` instead of a key)
 ([SSH remotes](configuration.md#ssh-remotes)); the commented example in
 `config/config` shows the keys.
-With Git LFS on (`agentfs.lfsThreshold`, design §7), an LFS server on
+With Git LFS on (`agentfs.lfsThreshold`, [remotes](remotes.md)), an LFS server on
 another host than the git remote takes its own credentials file from the
 same Secret (`remote.origin.agentfsLfsCredentials =
 /run/secrets/agentfs/origin-lfs`); the LFS endpoint derived from an
@@ -247,7 +246,7 @@ feature, which https LFS servers need. LFS objects are cached under
 **The downward API** fills `AGENTFS_POD`, `AGENTFS_POD_UID`,
 `AGENTFS_NAMESPACE` and `AGENTFS_NODE`: the commit trailers
 (`Agentfs-Pod: ...`), the committer identity and the telemetry resource
-(§9, §13).
+([recording](recording.md), [telemetry](telemetry.md)).
 
 **Telemetry.** Set `OTEL_EXPORTER_OTLP_ENDPOINT` to your collector (OTLP
 http/protobuf by default; `OTEL_EXPORTER_OTLP_PROTOCOL=grpc` with the
@@ -291,7 +290,7 @@ kubectl exec "$POD" -c agentfs -- agentfs revert <commit>
 
 `restore` and `revert` go to the running daemon over its control socket
 and write through the mount, so the workload sees the result at once
-(§15, [recovery runbook](runbooks/recovery-and-undo.md)).
+([recovery runbook](runbooks/recovery-and-undo.md)).
 
 - **Upgrading agentfs:** change the image tag; the rollout (Recreate)
   stops the old pod, whose sidecar makes its final commit, and the new
@@ -314,7 +313,7 @@ and write through the mount, so the workload sees the result at once
 ### Alerts
 
 [`deploy/alerts`](../deploy/alerts) has example alert rules for the
-metrics of design §13, each with a runbook link:
+metrics of [telemetry](telemetry.md), each with a runbook link:
 
 | File | What |
 |---|---|
@@ -445,7 +444,7 @@ Run `subPath` consumers as non-root, or with `capabilities: {drop:
 
 - Files opened for writing before a crash with kernel passthrough
   (`--passthrough auto` as root; only a writer sharing a reader's
-  backing file, design §17.1) keep writing to their backing file after the daemon
+  backing file) keep writing to their backing file after the daemon
   died, unrecorded, for as long as the workload holds them open; a
   recovered sidecar does not notice those changes until the file is
   changed again through the mount or the sweep sees it. With in-place
@@ -489,7 +488,7 @@ writable `/sys`. A compromised agentfs binary or image could take over
 the node. The namespace has to allow it (Pod Security Admission
 `privileged`), which also allows any other privileged pod there.
 
-**Why phase 1 needs it:**
+**Why it needs it:**
 
 - `mountPropagation: Bidirectional` is only allowed in privileged
   containers, and it is how a mount made in one container reaches the
@@ -514,22 +513,21 @@ the node. The namespace has to allow it (Pod Security Admission
 - a dedicated namespace for agentfs workloads, so `privileged` PSA does
   not widen what other teams can run.
 
-**Against the threat model (§1.1):** agentfs protects against an agent's
+**Against the threat model ([guarantees](guarantees.md)):** agentfs protects against an agent's
 mistakes, not a malicious agent. The privilege sits in the sidecar, not
 in the agent's containers: the agent gets an ordinary directory and no
 new privilege. The risk it adds is to the node, if agentfs itself is
 compromised, so treat its image like any privileged node component:
 pinned, scanned, updated.
 
-**The CSI driver moves the privilege out of workload pods** (design
-§14.2, [csi.md](csi.md#10-security)): its node plugin, in the driver's own
+**The CSI driver moves the privilege out of workload pods** ([csi.md](csi.md#10-security)): its node plugin, in the driver's own
 `agentfs-csi` namespace, is the only privileged container, and workload
 namespaces can enforce `restricted`. Settings and credentials move with
 it, into that namespace.
 
 ## 10. Hermes
 
-Hermes is the first consumer (§16): an agent whose definitions (skills,
+Hermes is an example consumer: an agent whose definitions (skills,
 persona, profiles) are worth recording, next to state that is not
 (secrets, databases, sessions, logs, checkpoints).
 
@@ -639,7 +637,7 @@ spec; from then on every change is recorded through the mount.
 
 ### Restarts and patches
 
-iac's patches to Hermes' files (the patch queue, §12) apply only at
+iac's patches to Hermes' files (the [patch queue](patches.md)) apply only at
 mount, which for Hermes means a pod restart: iac queues them with
 `agentfs patch submit` (or plain git) on the remote the sidecar pushes
 to, then restarts the pod (`kubectl delete pod`, or a rollout). The
@@ -650,8 +648,7 @@ alert on `agentfs.patch.blocked`. See
 
 **With Hermes' data path mounted through `subPath`**, the kubelet still
 holds the mount when the sidecar stops, through the subPath binds it made
-for Hermes and docker-in-docker, so the stop keeps the attached mark
-(design §12). The mark names the pod (`AGENTFS_POD_UID`), and the next
+for Hermes and docker-in-docker, so the stop keeps the attached mark. The mark names the pod (`AGENTFS_POD_UID`), and the next
 pod lands the queue over it: the old pod's binds cannot reach the new
 pod's `emptyDir`. A restart of the sidecar alone under running Hermes
 defers the queue (`PatchQueueDeferred`, reason `unclean_stop`), as it
@@ -736,7 +733,7 @@ fence's `HERMES_WRITE_SAFE_ROOT`.
   without `--history-service`). For several pods on one volume use the
   CSI driver ([csi.md](csi.md)), which runs a history service per volume
   and a front per pod, one node per volume at a time; multi-node access
-  modes are refused (design §19.1, 2026-10-15).
+  modes are refused.
 - A state area on NFS must be NFS 4.1 or later, without `nolock` and
   with `local_lock=none`: the state lock is the only guard against a
   second writer, and agentfs refuses other NFS mounts at start. Even
@@ -756,8 +753,8 @@ containers (for example a Docker daemon) can give them the sandbox
 overlay instead of the mount: a second mount point of the same volume
 that shows only the files the operator's rules would record, records
 what sandboxes change there, and keeps their other files in a private
-tmp layer ([design §2.4](design.md#24-the-sandbox-overlay); its limits
-are in [§1.1](design.md#11-threat-model)). The kustomize Component
+tmp layer ([operator guide](operator-guide.md#17-the-sandbox-overlay); its limits
+are in [guarantees](guarantees.md)). The kustomize Component
 [`deploy/sidecar/sandbox-overlay`](../deploy/sidecar/sandbox-overlay)
 adds it to the example sidecar
 ([`deploy/examples/sidecar-sandbox-overlay`](../deploy/examples/sidecar-sandbox-overlay)
@@ -811,8 +808,7 @@ volumes
   fresh mounts ([runbook](runbooks/sandbox-overlay.md#the-overlay-was-unmounted-from-outside-and-both-mounts-stopped)).
 - **Sidecar only.** The overlay is served by a single-process `agentfs
   mount`. It is not offered on CSI volumes or on fronts
-  (`--history-service`), which refuse it at start
-  ([design §19.2](design.md#192-open-questions) item 13).
+  (`--history-service`), which refuse it at start.
 
 Failure modes and their fixes:
 [runbooks/sandbox-overlay.md](runbooks/sandbox-overlay.md).

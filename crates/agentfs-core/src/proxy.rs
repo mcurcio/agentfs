@@ -1,4 +1,4 @@
-//! HTTP proxies for remote traffic (design §11.1), from git's own keys in
+//! HTTP proxies for remote traffic, from git's own keys in
 //! the state area's config: `http.proxy` for every remote and
 //! `remote.<name>.proxy`, which overrides it for one remote (an empty
 //! value means no proxy for that remote). Proxy environment variables

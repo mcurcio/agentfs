@@ -1,5 +1,4 @@
-//! Edges of `agentfs serve-git` and `agentfs patch apply` (design §12;
-//! beads agentfs-5sg, agentfs-g09): what hiding a ref does not hide, and
+//! Edges of `agentfs serve-git` and `agentfs patch apply` (beads agentfs-5sg, agentfs-g09): what hiding a ref does not hide, and
 //! the answer of a daemon from before the control socket's `apply` and
 //! `judge`.
 //!
@@ -338,8 +337,8 @@ fn serve_git_apply_falls_back_when_an_old_daemon_cannot_apply() {
 /// upload-pack serves any object a client names by id (git-config(1)
 /// `transfer.hideRefs`; gitnamespaces(7) SECURITY). v0's upload-pack
 /// refuses that one request, but v0 hides no objects either: a pusher
-/// can push a patch whose tree names a hidden object and fetch it back
-/// (design §19.1 "serve-git"). This pins what design §12 says hiding
+/// can push a patch whose tree names a hidden object and fetch it back.
+/// This pins what says hiding
 /// gives (bead agentfs-5sg).
 #[test]
 fn hidden_refs_hide_names_not_objects() {

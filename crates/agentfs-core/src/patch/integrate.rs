@@ -1,5 +1,4 @@
-//! Merging a patch branch onto the branch head (design §12, §19.2 item
-//! 11; bead agentfs-mia.4).
+//! Merging a patch branch onto the branch head (bead agentfs-mia.4).
 //!
 //! A patch is a branch: a line of single-parent commits whose oldest
 //! commit's parent is on the volume's branch (the head or an ancestor of
@@ -12,7 +11,7 @@
 //! record, one commit carrying `Agentfs-Patch: <tip>` and `Agentfs-Inbox`).
 //!
 //! The one implementation in this bead, [`GitMergeTree`], runs the `git`
-//! program (AGENTS.md principle 4, design §17.3):
+//! program (AGENTS.md principle 4):
 //! `git merge-tree --write-tree --merge-base=<base> <head> <tip>` in the
 //! state area's git directory, in the environment of [`git_cli::command`]
 //! (an empty one, the repository's own config only), `-c core.fsync=objects`, so
@@ -30,7 +29,7 @@
 //! `git merge-tree` run, so both honour the merge drivers the operator
 //! names in `$GIT_DIR/info/attributes` (`merge=<name>`, the built-in
 //! `union`, `text`, `binary`, or a `merge.<name>.driver` of the
-//! repository's config: libgit2 cannot run those, design §17.3). A driver
+//! repository's config: libgit2 cannot run those). A driver
 //! that cannot run makes the merge not judged
 //! ([`IntegrateError::DriverNotWorking`]), never a conflict: before the
 //! merge, a configured driver whose program is not an executable file
@@ -283,8 +282,7 @@ pub fn is_barrier(commit: &git2::Commit<'_>) -> bool {
     message_is_barrier(&String::from_utf8_lossy(commit.message_raw_bytes()))
 }
 
-/// Whether a patch tip's commit message makes it a barrier (design §12,
-/// bead agentfs-mia.2): it has more than one paragraph and the last one
+/// Whether a patch tip's commit message makes it a barrier (bead agentfs-mia.2): it has more than one paragraph and the last one
 /// has a line `Agentfs-Barrier: yes` (the key in any case, as git reads
 /// trailer keys).
 pub fn message_is_barrier(message: &str) -> bool {

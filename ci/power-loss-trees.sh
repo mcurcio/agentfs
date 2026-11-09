@@ -101,7 +101,7 @@ for n in range(1, 3):
         append(disk, f'{kind} {n}')
 # A write and a rename marked straight after they return, with no fsync or close
 # before the mark: only the journal's own fsync of the call can keep them
-# (phase-1.md, git-model §3). The last acknowledged rename of the run.
+# (git-model §3). The last acknowledged rename of the run.
 for n in range(1, 3):
     fd = os.open(f'{root}/x{n}', os.O_CREAT | os.O_WRONLY, 0o600)
     data = f'unsynced-{n}\n'.encode()

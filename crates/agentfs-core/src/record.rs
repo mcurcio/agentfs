@@ -1,7 +1,7 @@
-//! What the journal stores: one record per change boundary (design §3.1).
+//! What the journal stores: one record per change boundary.
 //!
 //! Records hold absolute state ("this path now has this content"), never
-//! deltas, so applying a record twice gives the same tree (design §3.3).
+//! deltas, so applying a record twice gives the same tree.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -30,11 +30,11 @@ pub enum Trigger {
     /// Recorded late, by the periodic sweep of files that stay open.
     Sweep,
     /// Recorded by an fsync-class group's trailing timer, at most one
-    /// `agentfs.coalesce` after its last change (design §8).
+    /// `agentfs.coalesce` after its last change.
     Interval,
-    /// An operator restore (design §15).
+    /// An operator restore.
     Restore,
-    /// A patch from the queue, applied at mount (design §12).
+    /// A patch from the queue, applied at mount.
     Patch,
 }
 
@@ -76,8 +76,8 @@ pub enum Change {
         path: RepoPath,
         pending: PendingId,
         executable: bool,
-        /// Where the content is stored, decided when it was recorded
-        /// (design §7). Absent from older journals, and from blob writes.
+        /// Where the content is stored, decided when it was recorded.
+        /// Absent from older journals, and from blob writes.
         #[serde(default, skip_serializing_if = "Store::is_blob")]
         store: Store,
     },
@@ -87,7 +87,7 @@ pub enum Change {
     Remove { path: RepoPath },
     /// Whatever is recorded at and beneath `from` is now at and beneath
     /// `to`, unchanged, and whatever was recorded at and beneath `to` is
-    /// gone: a directory rename, recorded in O(1) (design §3.1). The tree
+    /// gone: a directory rename, recorded in O(1). The tree
     /// under `to` is reconciled afterwards ([`crate::reconcile`]). Older
     /// agentfs versions cannot read it: `agentfs flush` before a
     /// downgrade.
@@ -120,7 +120,7 @@ impl Change {
     }
 }
 
-/// What an operator operation does (design §15).
+/// What an operator operation does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OperationKind {
@@ -128,7 +128,7 @@ pub enum OperationKind {
     Restore,
     /// A commit's changes undone.
     Revert,
-    /// A patch from the queue applied onto the branch (design §12).
+    /// A patch from the queue applied onto the branch.
     Patch,
 }
 
@@ -161,7 +161,7 @@ impl OperationKind {
 }
 
 /// A patch commit's author, kept as the git author of the commit that
-/// applies it (design §9, §12).
+/// applies it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PatchAuthor {
     pub name: String,
@@ -172,7 +172,7 @@ pub struct PatchAuthor {
     pub offset_min: i32,
 }
 
-/// An operator restore or revert that records belong to (design §15).
+/// An operator restore or revert that records belong to.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Operation {
     /// Tells one operation's records from the next one's.
@@ -185,7 +185,7 @@ pub struct Operation {
     /// The operator who asked for it: the author of its commit, unless
     /// `author` is set.
     pub caller: Caller,
-    /// A patch's inbox number (design §12): its commit carries
+    /// A patch's inbox number: its commit carries
     /// `Agentfs-Inbox`. Absent from older journals.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inbox: Option<u64>,
@@ -195,7 +195,7 @@ pub struct Operation {
     pub author: Option<PatchAuthor>,
 }
 
-/// The pod whose front recorded a change (design §9, §14): its committer
+/// The pod whose front recorded a change: its committer
 /// identity and pod trailers. Journaled with each record a history service
 /// receives from a front, so a replay after a crash commits with the same
 /// committer. Single-process mode journals none: the committer is the
@@ -253,11 +253,10 @@ pub struct Draft {
     pub operation: Option<Operation>,
     /// All or nothing: if any change is refused when committed, the whole
     /// record is dropped. Set for fsync-class groups, whose files are only
-    /// consistent together (design §8). Absent from older journals.
+    /// consistent together. Absent from older journals.
     #[serde(default, skip_serializing_if = "is_false")]
     pub atomic: bool,
-    /// The front that recorded it, set by the history service (design
-    /// §14); `None` in single-process mode, whose journals carry no field.
+    /// The front that recorded it, set by the history service; `None` in single-process mode, whose journals carry no field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin: Option<Origin>,
 }
@@ -280,7 +279,7 @@ impl Record {
     }
 }
 
-/// A saved repair queue's entry (design §3.5): a path the FUSE layer
+/// A saved repair queue's entry: a path the FUSE layer
 /// could not record, the caller that changed it, and the pod it is
 /// committed as (`None`: the loading process's own).
 pub type QueuedRepair = (Vec<u8>, Caller, Option<Origin>);

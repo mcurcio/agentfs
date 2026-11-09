@@ -1,4 +1,4 @@
-//! Authenticating to one remote (design §11.1), shared by the push
+//! Authenticating to one remote, shared by the push
 //! ([`crate::push`]) and the patch-queue fetch and push
 //! ([`crate::patch`]).
 //!
@@ -175,7 +175,7 @@ impl SshRemote {
             .unwrap_or_default()
     }
 
-    /// Whether the SSH server's host key is trusted (design §11.1): the
+    /// Whether the SSH server's host key is trusted: the
     /// host connected to must be the push URL's, and its raw key must be
     /// listed for that host and port in `agentfsKnownHosts`. The error says
     /// which file, name, key type and SHA256 fingerprint, and how to fix
@@ -237,7 +237,7 @@ impl SshRemote {
     }
 
     /// Whether the SSH server's host certificate is trusted at Unix time
-    /// `now` (design §11.1, [`KnownHosts::check_certificate`]): as for
+    /// `now` ([`KnownHosts::check_certificate`]): as for
     /// [`SshRemote::check_host_key`], the host connected to must be the
     /// push URL's. The error says which file, CA and certified key, and
     /// how to inspect the certificate.
@@ -349,7 +349,7 @@ impl RemoteAuth {
     /// Hands this remote's SSH side and `state` to the SSH transport for
     /// libgit2 calls made on this thread until the scope is dropped.
     /// Without it, or for a remote that is not an ssh remote, the transport
-    /// refuses every connection (design §11.1).
+    /// refuses every connection.
     pub(crate) fn ssh_scope(&self, state: &Arc<AuthState>) -> SshScope {
         #[cfg(feature = "ssh")]
         {
@@ -386,7 +386,7 @@ impl RemoteAuth {
         callbacks
     }
 
-    /// The credentials callback's decision (design §11.1): one username and
+    /// The credentials callback's decision: one username and
     /// password (token) per connection, from the remote's own file, for its
     /// own host only. SSH remotes never get one: their transport is
     /// agentfs's own.

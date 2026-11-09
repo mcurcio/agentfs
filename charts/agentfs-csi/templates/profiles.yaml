@@ -1,6 +1,6 @@
 # The profiles, one `<profile>.config` (with optional `.exclude` and
 # `.attributes`) each; a StorageClass picks one with `profile: <name>`
-# (docs/csi.md §4). The pods see edits through the
+# (docs/csi.md). The pods see edits through the
 # mounted ConfigMap without being restarted.
 {{- $data := dict }}
 {{- range $name, $profile := .Values.profiles }}

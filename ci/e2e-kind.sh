@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
-# End-to-end test of the phase 1 deployment (design §17.1,
-# docs/deployment.md) in a kind cluster: deploys ci/k8s (the CI overlay of
+# End-to-end test of the sidecar deployment (docs/deployment.md) in a kind cluster: deploys ci/k8s (the CI overlay of
 # deploy/sidecar) and checks, from real pods:
 #
-#   - root and uid 10000 write through the mount with normal permissions
-#     (design §18 test 4), the uid 10000 writer through a subPath mount of
+#   - root and uid 10000 write through the mount with normal permissions,
+#     the uid 10000 writer through a subPath mount of
 #     the FUSE root at a fixed path;
 #   - the operator rules from the ConfigMap apply, and nothing of the state
 #     area is visible to the writers (test 5);
@@ -15,7 +14,7 @@
 #     11);
 #   - deleting the pod makes the final commit and pushes it, and the new
 #     pod does not defer the patch queue although the subPath writer's
-#     bind held the old pod's mount as it stopped (design §12);
+#     bind held the old pod's mount as it stopped;
 #   - after `kill -9` of the daemon, writes fail with ENOTCONN, the kubelet
 #     restarts the sidecar (a write that races the recovery and succeeds
 #     must be recorded), which stacks a new mount over the stale one
@@ -205,9 +204,9 @@ echo "sidecar: $startup"
 assert_contains "$startup" "volume $VOLUME" "the sidecar mounted the volume"
 assert_contains "$(k logs "$POD" -c agentfs-init)" "initialised volume $VOLUME" "the init container created the state area"
 
-step "root and uid 10000 write with normal permissions (design §18 test 4)"
+step "root and uid 10000 write with normal permissions"
 # A shell's `>` is two records, the empty file and then its content, and a
-# busy machine puts the empty file in a commit of its own (design §3.1). Here
+# busy machine puts the empty file in a commit of its own. Here
 # it always does, so the restore below meets that history in every run.
 in_root "cd $WS && : > root.txt"
 wait_remote root.txt ""
@@ -222,7 +221,7 @@ fi
 assert_contains "$out" "Permission denied" "uid 10000 cannot write root's 0600 file"
 assert_eq user "$(in_root "cat $WS/u10000/user.txt")" "root reads uid 10000's file through the other mount"
 
-step "operator rules and invisibility (design §18 test 5)"
+step "operator rules and invisibility"
 in_root "cd $WS && mkdir -p scratch secrets && printf x > scratch/x.log && printf k > secrets/k"
 assert_eq "root.txt scratch secrets u10000" "$(in_root "ls -A $WS" | tr '\n' ' ' | sed 's/ $//')" "the writer sees only its files"
 assert_eq "workspace" "$(in_root 'ls -A /agentfs')" "nothing else in the shared emptyDir"
@@ -230,7 +229,7 @@ assert_eq "root.txt scratch secrets u10000" "$(in_user 'ls -A /workspace' | tr '
 if in_root 'test -e /data'; then fail "the writer can reach /data"; fi
 pass "the writers cannot reach /data"
 
-step "commits reach the remote with authors and trailers (design §18 test 8)"
+step "commits reach the remote with authors and trailers"
 wait_remote root.txt root
 wait_remote u10000/user.txt user
 assert_eq uid-0 "$(remote_author root.txt)" "root.txt authored by uid-0"
@@ -252,7 +251,7 @@ for path in scratch/x.log secrets/k; do
 done
 pass "excluded and -agentfs paths are not in history"
 
-step "restore through the sidecar's control socket (design §18 test 11)"
+step "restore through the sidecar's control socket"
 # The remote's head: wait_remote saw it hold root.txt, and nothing wrote that
 # file since. Not the commit that added the file, which may hold it empty.
 SOURCE=$(rgit rev-parse "$BRANCH")
@@ -281,7 +280,7 @@ assert_contains "$(remote_message final.txt)" "Agentfs-Pod: $OLD" "final.txt was
 assert_contains "$(k logs "$POD" -c agentfs-init)" "volume $VOLUME already initialised" "init accepted the existing state area"
 # The writer's subPath bind kept the old pod's mount until the kubelet tore
 # its volumes down, after the sidecar's stop; a new pod still runs the
-# patch queue (design §12 "Only with nothing attached").
+# patch queue.
 grep -E 'elsewhere|attached' "$LOGS/graceful.log" || true
 case "$(k logs "$POD" -c agentfs)" in
 *"patches: not applied at this start"*) fail "the new pod deferred the patch queue: $(k logs "$POD" -c agentfs | grep -m1 'patches: not applied')" ;;
@@ -330,7 +329,7 @@ wait_sidecar_restarted() { # previous-count
   pass "the kubelet restarted the sidecar and the pod is Ready, with no manual step"
 }
 
-step "the sidecar sealed the bare mount point (design §17.1)"
+step "the sidecar sealed the bare mount point"
 # A non-recursive bind of the emptyDir shows the directory under the FUSE
 # mount, whatever is mounted on it.
 POD_UID=$(k get pod "$POD" -o jsonpath='{.metadata.uid}')
@@ -342,7 +341,7 @@ docker exec "$NODE" umount /tmp/peek
 assert_eq "0 0" "$sealed" "the bare mount point is root's with mode 0000"
 assert_contains "$sealout" "Permission denied" "uid 10000 cannot write to the bare mount point"
 
-step "kill -9 the daemon: the restarted sidecar recovers in place (design §18 test 2)"
+step "kill -9 the daemon: the restarted sidecar recovers in place"
 in_root "printf before > $WS/before-crash.txt"
 wait_remote before-crash.txt before
 restarts=$(sidecar_restarts)

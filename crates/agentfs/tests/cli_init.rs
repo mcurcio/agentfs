@@ -1,4 +1,4 @@
-//! `agentfs init` from the command line (design §2.3, §4.3, §17.1): safe to
+//! `agentfs init` from the command line: safe to
 //! re-run for the same volume, refusing another volume or branch, setting
 //! `include.path` from `--include`, and creating `--root`.
 

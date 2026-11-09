@@ -1,4 +1,4 @@
-//! A small worker pool for LFS transfers (design §7): up to
+//! A small worker pool for LFS transfers: up to
 //! `lfs.concurrenttransfers` objects move at once, each on a scoped
 //! thread, so a transfer borrows its cache and client without `'static`
 //! bounds.
@@ -7,7 +7,7 @@
 //! with an error the caller says should stop the run (a server that
 //! cannot be reached, refused credentials), no new item is started; the
 //! items already in flight finish, so their progress counts (an uploaded
-//! object is not sent again, design §7), and the items never started come
+//! object is not sent again), and the items never started come
 //! back as `None`. Results are in input order.
 
 use std::sync::Mutex;
