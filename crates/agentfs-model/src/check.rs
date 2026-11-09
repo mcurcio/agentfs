@@ -9,8 +9,9 @@ use std::path::Path;
 use crate::content::{Content, Line, PATHS, State, is_root, writer_of};
 use crate::git::{git, try_git};
 use crate::world::{
-    By, Client, Collision, Decision, Direction, Entry, ForkId, Kind, Life, Step, Take, Target,
-    Tree, TxnEnd, TxnId, TxnOutcome, World, commit_parents, decisions_in, name_key, origin_in,
+    By, Client, Collision, Decision, Direction, Entry, ForkId, Kind, Landed, Life, Step, Take,
+    Target, Tree, TxnEnd, TxnId, TxnOutcome, World, commit_parents, decisions_in, name_key,
+    origin_in,
 };
 
 /// Every invariant that holds after any step.
@@ -948,13 +949,42 @@ fn taken_by(w: &World, upstream: Tree, entered: usize) -> BTreeSet<&str> {
 /// P2: a version `upstream` took only in takes a sync of its commit `up` holds
 /// back (the take's result commit is not in `up`, read from git).
 fn held_back(w: &World, upstream: Tree, up: &str, id: &str) -> bool {
+    taken_only_past(w, up, id, |l| l.tree == upstream)
+}
+
+/// Whether version `id` was taken in at least one of `in_scope`'s takes, and
+/// only in takes whose result commit is not in `up`.
+fn taken_only_past(w: &World, up: &str, id: &str, in_scope: impl Fn(&Landed) -> bool) -> bool {
     let mut takes = w
         .landings
         .iter()
-        .filter(|l| l.tree == upstream)
+        .filter(|l| in_scope(l))
         .filter(|l| w.edits(&l.base, &l.change).iter().any(|e| e.token == id))
         .peekable();
     takes.peek().is_some() && takes.all(|l| !w.is_ancestor(&l.result, up))
+}
+
+/// R9.3 with R9.9, whoever wrote the line (finding 50): the decision on
+/// version `id` is in the upstream's head, in a take of any tree (a
+/// fast-forward brings a tree further up's takes there), and not in the commit
+/// `up` this sync delivered; and what stopped the sync at `up` is a lock, the
+/// first commit it held back touching a file open in fork `t`
+/// ([`prefix_cut`]). The owner, 2026-11-08, option A: the rest arrives when the
+/// file closes.
+fn decision_held_back_by_lock(
+    w: &World,
+    t: Tree,
+    upstream: Tree,
+    up: &str,
+    result: &str,
+    id: &str,
+) -> bool {
+    let head = w.head(upstream);
+    let Some(ours) = commit_parents(w.repo(), result).into_iter().next() else {
+        return false;
+    };
+    taken_only_past(w, up, id, |l| w.is_ancestor(&l.result, &head))
+        && prefix_cut(w, t, &ours, &head, &w.write_open(t), Some(&up.to_string())).is_ok()
 }
 
 /// R10.6 at one sync: `x`, the upstream's version in `u` of a line the sync's
@@ -1073,7 +1103,12 @@ fn syncs_deliver(w: &mut World) -> Result<(), String> {
                 }
                 // excuse: R3d the fork keeps its own lines the upstream's queue has not decided
                 // excuse: R9.3 a prefix sync holds back the commits from the first to an open file
-                if theirs.is_none_or(|u| u.id != x.id) && decided(&x.id) && !held_back(&x.id) {
+                // excuse: R9.3 and with them any line whose decision a lock holds back, whoever wrote it
+                if theirs.is_none_or(|u| u.id != x.id)
+                    && decided(&x.id)
+                    && !held_back(&x.id)
+                    && !decision_held_back_by_lock(w, *t, upstream, up, result, &x.id)
+                {
                     return Err(format!(
                         "a sync of {up:.7} into {t:?} left {p}[{}] at {}, which {upstream:?} already took, not its {theirs:?}",
                         x.line, x.id

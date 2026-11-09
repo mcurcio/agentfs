@@ -3715,23 +3715,22 @@ fn r9_a_prefix_sync_holds_back_a_transaction_whole() {
     assert!(has(&w, t, "c", &gc));
 }
 
-/// Coherence finding 50 (seed 401 of the random runs at 500 seeds, 2026-11-08; the
-/// model before finding 49's fix fails the same calls the same way): f2 is a fork of
-/// f1, made while f1's save x of `b` is undecided. Main's save m of `b` wins against x,
-/// and f1, having no other commit, then syncs by fast-forwarding to main's landing, so
-/// f1's first parents are main's. f2 keeps `b` open, so its prefix sync (R9.3) delivers
-/// only main's save of `c`, a commit with neither x nor the decision against x, which
-/// it holds back (R9.9). f2 keeps x; `syncs_deliver` wants the upstream's version
-/// there, since x is f1's own line, not f2's.
+/// Finding 50 (seed 401 of the random runs at 500 seeds, 2026-11-08; closed by the
+/// owner's option A the same day): f2 is a fork of f1, made while f1's save x of `b` is
+/// undecided. f1's upstream's save m of `b` wins against x, and f1, having no other
+/// commit, then syncs by fast-forwarding to that landing, so f1's first parents are its
+/// upstream's. f2 keeps `b` open, so its prefix sync (R9.3) delivers only the upstream's
+/// save of `c`, and holds back m and the decision against x (R9.9): f2 keeps x, with `b`
+/// and its decision waiting. Once `b` closes f2 has received every line it was owed.
 #[test]
-#[ignore = "coherence finding 50: a nested fork's prefix sync past its upstream's fast-forward keeps the upstream's lost line, which syncs_deliver does not excuse"]
-fn finding_50_a_nested_prefix_sync_past_a_fast_forward_keeps_the_upstreams_lost_line() {
+fn finding_50_a_prefix_sync_holds_back_a_decision_on_the_upstreams_line_until_the_close() {
     let mut w = world();
     let f1 = w.create_fork(Tree::Main);
     let x = w.save(&Client::Fork(f1), "b", 0);
-    w.save(&m1(), "c", 0);
+    let c = w.save(&m1(), "c", 0);
     let m = w.save(&m1(), "b", 0);
     let f2 = w.create_fork(Tree::Fork(f1));
+    let t2 = Tree::Fork(f2);
     let held = w.open_write(&Client::Fork(f2), "b");
     next(&mut w, Tree::Main);
     assert!(has(&w, Tree::Main, "b", &m) && !has(&w, Tree::Main, "b", &x));
@@ -3739,9 +3738,47 @@ fn finding_50_a_nested_prefix_sync_past_a_fast_forward_keeps_the_upstreams_lost_
     assert_eq!(
         w.head(Tree::Fork(f1)),
         w.main_head,
-        "f1 fast-forwards to main"
+        "f1 fast-forwards to its upstream"
     );
-    take(&mut w, &Step::Next(Tree::Fork(f2)));
+    take(&mut w, &Step::Next(t2));
+    assert!(w.prefix_syncs > 0, "a prefix sync");
+    assert!(has(&w, t2, "c", &c), "f2 gets the unlocked c");
+    assert!(
+        has(&w, t2, "b", &x) && !has(&w, t2, "b", &m),
+        "b and its decision wait"
+    );
     w.close(held);
     drain(&mut w);
+    assert!(
+        has(&w, t2, "b", &m) && !has(&w, t2, "b", &x),
+        "the decision arrives when b closes"
+    );
+    for p in ["b", "c"] {
+        assert_eq!(
+            w.read(t2, p),
+            w.read(Tree::Fork(f1), p),
+            "f2 has every line of {p} it was owed"
+        );
+    }
+}
+
+/// Finding 50's excuse needs the lock: the same prefix sync, judged only after `b` has
+/// closed. No file holds it back any more, so `syncs_deliver` refuses f2's x, on the
+/// real commits of that sync.
+#[test]
+fn finding_50_a_held_back_decision_is_excused_only_while_a_lock_holds_it() {
+    let mut w = world();
+    let f1 = w.create_fork(Tree::Main);
+    let x = w.save(&Client::Fork(f1), "b", 0);
+    w.save(&m1(), "c", 0);
+    w.save(&m1(), "b", 0);
+    let f2 = w.create_fork(Tree::Fork(f1));
+    let held = w.open_write(&Client::Fork(f2), "b");
+    next(&mut w, Tree::Main);
+    next(&mut w, Tree::Fork(f1));
+    w.step(&Step::Next(Tree::Fork(f2)));
+    assert!(w.prefix_syncs > 0, "a prefix sync");
+    w.close(held);
+    let e = check(&mut w).expect_err("no lock holds that sync back now");
+    assert!(e.contains(&format!("at {x}, which")), "{e}");
 }
