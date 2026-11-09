@@ -51,6 +51,7 @@
 - [Overview](target-architecture/README.md)
   - [agentfs in git terms](target-architecture/git-model.md)
   - [The rules ledger](target-architecture/rules-ledger.md)
+  - [The fork and upstream rules in plain git](target-architecture/demo/walkthrough.md)
   - [Snapshot opens (parked)](target-architecture/snapshot-opens.md)
   - [Phase 1: implementation and validation](target-architecture/phase-1.md)
   - [Phase 1 handoff](target-architecture/phase-1-handoff.md)

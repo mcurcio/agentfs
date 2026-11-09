@@ -4,8 +4,9 @@ name: docs
 # request: the logo PNGs under docs/assets/ checked as fresh renders of
 # the SVGs beside them (ci/render-assets.sh); the mdBook of docs/
 # (book.toml, docs/SUMMARY.md) built, and deployed to GitHub Pages from
-# main (https://mcurcio.github.io/agentfs/); and the README's Docker
-# quick start run as written. Links and the configuration and
+# main (https://mcurcio.github.io/agentfs/); the plain-git demo of the
+# fork and upstream rules (docs/target-architecture/demo/); and the
+# README's Docker quick start run as written. Links and the configuration and
 # architecture references are checked against the code by the docs job
 # of ci.yml; the README's from-source quick start runs in its fuse job.
 
@@ -77,6 +78,30 @@ jobs:
       - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
         with:
           path: target/book
+
+  # The fork and upstream rules in plain git and coreutils: every scene's
+  # assertions, then every line of its output quoted in the walkthrough, so
+  # the page cannot drift from the script.
+  demo:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: run the demo
+        run: |
+          git --version
+          status=0
+          bash docs/target-architecture/demo/demo.sh >"$RUNNER_TEMP/demo.out" 2>&1 || status=$?
+          cat "$RUNNER_TEMP/demo.out"
+          [ "$status" = 0 ] || exit "$status"
+      - name: the walkthrough quotes its output
+        run: |
+          while IFS= read -r line; do
+            if ! grep -qxF -- "$line" docs/target-architecture/demo/walkthrough.md; then
+              echo "::error::walkthrough.md does not quote this line of demo output: $line"
+              exit 1
+            fi
+          done <"$RUNNER_TEMP/demo.out"
 
   # Pages from main only: the site is the book of main's newest commit.
   deploy:
