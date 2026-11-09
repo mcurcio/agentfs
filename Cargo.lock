@@ -72,9 +72,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "agentfs-align"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
+]
+
+[[package]]
+name = "agentfs-conformance"
+version = "0.0.0"
+dependencies = [
+ "agentfs-core",
+ "agentfs-model",
+ "libc",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "agentfs-core"
 version = "0.1.0"
 dependencies = [
+ "agentfs-align",
  "base64 0.23.1",
  "bstr",
  "crc32fast",
@@ -148,6 +167,13 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror",
+]
+
+[[package]]
+name = "agentfs-model"
+version = "0.0.0"
+dependencies = [
+ "agentfs-align",
 ]
 
 [[package]]
@@ -958,8 +984,6 @@ dependencies = [
 [[package]]
 name = "fuser"
 version = "0.18.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b82b6597d216503555ead6b358f341ef748869bf5c6fbae6a0cb9dd231baecfd"
 dependencies = [
  "bitflags",
  "libc",

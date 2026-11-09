@@ -12,6 +12,8 @@ page says *where*. Section references (§) are to design.md.
 | `agentfs-fuse` | library | The FUSE layer: a passthrough filesystem over the backing tree that calls the engine at every change boundary (§2.1, §3.1, §6) |
 | `agentfs` | binary | The `agentfs` command (§17.1): `init`, `mount`, `run`, `record`, `flush`, `push`, `status`, `probe`, `serve-history`, `restore`, `revert`, `patch`, `fork`; OpenTelemetry export |
 | `agentfs-csi` | library and binary | The CSI driver (§14.2): `agentfs-csi`, one per node beside csi-provisioner, which makes the node's worktrees and supervises `agentfs serve-history`, `agentfs mount` and the release scan's `agentfs flush` and `agentfs push` children |
+| `agentfs-align` | library | Git's histogram diff, called one way, for line identity (git-model §7). `agentfs-core` and `agentfs-model` both depend on it, so line identity does not depend on how `git` is called; one module, `lib.rs` |
+| `agentfs-conformance` | library and binary, tests only | The model's recorded calls against the real tree library and real mounts (git-model §18). Depends on `agentfs-core` and `agentfs-model`; nothing depends on it |
 
 The dependencies run one way: `agentfs-csi` → (`agentfs` as a child
 process) → `agentfs-fuse` → `agentfs-core`. `agentfs-csi` links
@@ -32,6 +34,16 @@ missing from these tables or a row names a module that no longer exists;
 | `lib.rs` | Crate root: the module list and the engine's overview |
 | `volume.rs` | Opens a state area: crash recovery, then the [`Recorder`](#the-synchronous-step) used at every boundary and the `Committer` that turns records into commits |
 | `record.rs` | What the journal stores: one record per change boundary, absolute state, never deltas (§3.1, §3.3) |
+| `tree_actor/mod.rs` | Phase 1 actor: recorded byte calls, the ordered step, recovery from the journal, line-map storage, queue takes, main and one sandbox; separate from the production recorder |
+| `tree_actor/journal.rs` | The actor's journal: salted checksummed frames, the commit point for calls and pointer steps, torn-tail and corruption rules, compaction (target git-model §3, §12) |
+| `tree_actor/pointers.rs` | Branches, queue entries, collision refs and object tables as the journal leaves them: pure, no I/O |
+| `tree_actor/pages.rs` | The kernel's one page cache per file: page fills, page writes and the size replies for shared mappings (ledger R1.4) |
+| `tree_actor/queue.rs` | P1 eligibility and P2 prefix selection for writer-locked queue entries |
+| `tree_actor/referee.rs` | Whole-save parent referee for line and namespace versions, with causal collision records |
+| `tree_actor/stages.rs` | Measurements only, never read by a decision: runs and time per actor stage, and the Git children the actor's path has started (counted at `git_cli::counted`, the one spawn site; target git-model §18) |
+| `tree_actor/sync.rs` | Sync snapshots preserving undecided child versions without deciding collisions |
+| `tree_reconcile.rs` | Histogram save alignment, line identities, whole-change reconciliation and undecided sync |
+| `tree_git.rs` | Git executable backend for durable objects, the rebuildable copy of the refs in files format, `config` and `HEAD`, snapshots and private caches; Git children retain the actor lease |
 | `journal.rs` | The durable change log: framed, checksummed records with group-commit `fsync` (§3.2, §3.3) |
 | `pending.rs` | Frozen copies in `pending/`: `FICLONE` reflink, else copy plus `fsync`; slot-numbered ids for fronts (§3.2 step 1) |
 | `claims.rs` | Per-path ordering: a record claims its paths from decision to tracked-set update (§3.2, §4) |
@@ -126,6 +138,7 @@ missing from these tables or a row names a module that no longer exists;
 
 | Module | Role |
 |---|---|
+| `tree_view.rs` | Main/sandbox FUSE views over one target-model actor: direct I/O, saved-reader snapshots, byte-call writes, and the kernel's page fills, page writes and invalidations for shared mappings (R1.4) |
 | `lib.rs` | Crate root and overview |
 | `ops.rs` | Every filesystem operation without the kernel, unit-tested against a real directory and state area |
 | `fuse.rs` | The kernel adapter: `fuser::Filesystem` over `Ops`, and kernel passthrough negotiation |
@@ -150,6 +163,7 @@ missing from these tables or a row names a module that no longer exists;
 
 | Module | Role |
 |---|---|
+| `trees_cmd.rs` | `trees init`, `fork` and `mount` composition root; separate state format |
 | `main.rs` | The CLI (`Cli`), command dispatch, `init`, `status`, `record`, `flush`, `push` (direct), `run` and `mount` |
 | `daemon.rs` | Signals and shutdown for `run` and `mount` |
 | `front.rs` | `mount --history-service`: a front of a history service (§14) |
@@ -168,6 +182,16 @@ missing from these tables or a row names a module that no longer exists;
 | `otel/tls.rs` | The `otlp-tls` feature: TLS to the collector (CA bundle or system store, client certificate) for the HTTP and gRPC exporters (§13) |
 | `doc_tables.rs` | Test only: a small markdown reader for the documentation tests |
 | `reference_tests.rs` | Test only: checks docs/configuration.md against the CLI's flags and variables |
+
+### `agentfs-conformance`
+
+| Module | Role |
+|---|---|
+| `lib.rs` | Crate root, one call per kind of replay, which traces fit a real mount |
+| `library.rs` | `Library`: the shared calls on `Volume`, seeded as the model's first commit |
+| `mounted.rs` | `Mounted`: the shared calls as real system calls on a mount of a failpoints build, each take through the take gate |
+| `invariants.rs` | What must hold in the real system, read from `git`, its own parse of `metadata.json` and `namespace.json` and its own byte oracle, never `tree_actor` |
+| `bin/phase1-replay.rs` | `phase1-replay model\|library\|mount DIR`: replays the traces, with floors, against `open-findings.txt` |
 
 ### `agentfs-csi`
 

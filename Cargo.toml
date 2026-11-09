@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
-members = ["crates/agentfs-core", "crates/agentfs-fuse", "crates/agentfs", "crates/agentfs-csi"]
+exclude = ["vendor/fuser"]
+members = ["crates/agentfs-align", "crates/agentfs-core", "crates/agentfs-fuse", "crates/agentfs", "crates/agentfs-csi", "crates/agentfs-model", "crates/agentfs-conformance"]
 
 [workspace.package]
 edition = "2024"
@@ -8,3 +9,6 @@ edition = "2024"
 rust-version = "1.89"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/mcurcio/agentfs"
+
+[patch.crates-io]
+fuser = { path = "vendor/fuser" }

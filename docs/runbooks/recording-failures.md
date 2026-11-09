@@ -27,6 +27,8 @@ kubectl exec "$POD" -c agentfs -- agentfs status
 | `alarm: repack failed: <error>` | stderr; log event `agentfs.repack_failed`; counter `agentfs.repack.failures`; alert `AgentfsRepackFailed` | [1](#1-the-state-area-is-full-or-unwritable) |
 | `<n> path(s) a previous mount could not record: <r> repaired from the backing tree, <s> still failing` | the sidecar's log at start | [4](#4-paths-a-mount-could-not-record-metarepairs) |
 | `<n> path(s) could not be recorded ...` | the sidecar's log at stop | [4](#4-paths-a-mount-could-not-record-metarepairs) |
+| `journal corruption at byte <offset>`, or `<ref> names lost object <oid>`, opening a phase 1 tree state area | `agentfs trees` | [5](#5-a-tree-state-area-that-refuses-to-open) |
+| `tree JournalTail: <n> bytes at <offset>` | a phase 1 tree actor's stderr at open | [5](#5-a-tree-state-area-that-refuses-to-open) |
 
 The `<error>` says what failed: `No space left on device` (`ENOSPC`),
 `Disk quota exceeded`, `Read-only file system` (`EROFS`), `Permission
@@ -161,6 +163,35 @@ anything. Its start shows the result:
   removed by creating and removing it through the mount. With the volume
   not mounted (the pod stopped), `agentfs --state /data/state --root
   /data/backing record <path>` records them directly.
+
+## 5. A tree state area that refuses to open
+
+This section is for phase 1's tree actor ([phase 1](../target-architecture/phase-1.md)),
+whose journal is `calls.wal` and whose refs are a copy of it. Recovery is manual:
+agentfs repairs neither case itself.
+
+- **`CorruptJournal(offset)`.** A frame is bad and a good frame follows it, so this is
+  not a torn write. `CorruptJournal(0)` also means the journal is missing or holds no
+  frame.
+- **`MissingObject`.** A pointer's commit, tree or blob is gone. The error names the
+  pointer and the object.
+
+Do this before anything else:
+
+```sh
+cp -a "$STATE" "$STATE.saved"
+git --git-dir="$STATE/history.git" for-each-ref > "$STATE.saved.refs"
+```
+
+Those refs are the last copy the actor made, and they show what the journal said.
+Truncating `calls.wal` at the offset loses every later record: those saves stop
+existing, and the same refs show what they were. Recovery rebuilds the refs from the
+journal on open, so a truncation overwrites any newer copy.
+
+A `tree JournalTail` line with a `calls.wal.torn` file means a last frame was dropped
+at open. This is the expected result of a cut mid-write, and the actor keeps going. It
+can also be bit rot in the very last frame, which looks the same: the log line and the
+file are the evidence. The file keeps the bytes of every tear, appended.
 
 ## Verify
 

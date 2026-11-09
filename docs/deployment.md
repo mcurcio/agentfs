@@ -36,6 +36,11 @@ without publishing. **Pin a commit tag or a digest** in production
   trust store), `git`, so the runbooks' `git log` and `git show` work
   through `kubectl exec`, and `tini`, PID 1 of the CSI node plugin. Both
   base images are pinned by digest.
+- **The release of `git`:** the build fails unless Debian's `git` is the
+  release in `ci/git-release`, the one CI runs. In phase 1's trees an upgrade
+  changes how later saves align repeated lines, so a concurrent edit of a
+  repeated line can land elsewhere or collide. Stored bytes and line
+  identities do not change.
 - **Platform:** `linux/amd64` only for now.
 - **Entrypoint:** `agentfs`; the default command is `--help`.
 - **User:** root, on purpose (`USER 0`). The sidecar must be root and

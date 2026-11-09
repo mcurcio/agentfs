@@ -43,6 +43,12 @@ and environment variable, [docs/architecture.md](docs/architecture.md)
 every module, and every relative link in the README and docs must resolve
 (`cargo test -p agentfs-core --test docs_reference`).
 
+A change to the target architecture's rules (`crates/agentfs-model`,
+[docs/target-architecture](docs/target-architecture/README.md)) is verified
+as [crates/agentfs-model/VERIFYING.md](crates/agentfs-model/VERIFYING.md)
+describes: the model first, more seeds and planted bugs locally, an
+adversarial review, and the docs updated with the model.
+
 Mounts, root, kind, Helm, sshd and the other end-to-end tests need Linux
 with `/dev/fuse` and usually root, so they run as scripts under `ci/` in
 GitHub Actions. Run what you can locally and let CI run the rest.
@@ -62,6 +68,11 @@ RUN apt-get update \
  && rustup component add rustfmt clippy
 EOF
 ```
+
+This image has the release of `git` that CI and the agentfs image run
+(`ci/git-release`; `ci/check-tree-git.sh` fails on another). Change that file
+when a base image brings a new release, and say so in the commit: later saves
+align repeated lines differently (MODEL.md, finding 42).
 
 Then run any cargo command against your checkout, with the build and the
 registry in named volumes so they survive between runs:

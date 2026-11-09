@@ -1,0 +1,11 @@
+[package]
+name = "agentfs-align"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Git's histogram diff, called one way, for agentfs's line identity"
+
+[dependencies]
+thiserror = "2.0.21"

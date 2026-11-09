@@ -25,6 +25,8 @@ WORKDIR /src
 # Dependencies first, against stub crates, so a source change does not
 # rebuild libgit2, OpenSSL bindings, russh, ring and OpenTelemetry.
 COPY Cargo.toml Cargo.lock ./
+COPY vendor/fuser vendor/fuser
+COPY crates/agentfs-align/Cargo.toml crates/agentfs-align/
 COPY crates/agentfs-fuse/Cargo.toml crates/agentfs-fuse/
 COPY crates/agentfs/Cargo.toml crates/agentfs/
 # The build scripts and the protos they compile (tonic, prost, protox) are
@@ -33,11 +35,14 @@ COPY crates/agentfs-core/Cargo.toml crates/agentfs-core/build.rs crates/agentfs-
 COPY crates/agentfs-core/proto crates/agentfs-core/proto
 COPY crates/agentfs-csi/Cargo.toml crates/agentfs-csi/build.rs crates/agentfs-csi/
 COPY crates/agentfs-csi/proto crates/agentfs-csi/proto
+# A workspace member the image does not build still needs its manifest.
+COPY crates/agentfs-model/Cargo.toml crates/agentfs-model/
+COPY crates/agentfs-conformance/Cargo.toml crates/agentfs-conformance/
 # Every target a manifest declares must exist, so the record_step bench
 # gets a stub too.
-RUN mkdir -p crates/agentfs-core/src crates/agentfs-core/benches crates/agentfs-fuse/src crates/agentfs/src crates/agentfs-csi/src \
+RUN mkdir -p crates/agentfs-align/src crates/agentfs-core/src crates/agentfs-core/benches crates/agentfs-fuse/src crates/agentfs/src crates/agentfs-csi/src crates/agentfs-model/src crates/agentfs-conformance/src \
  && echo "fn main() {}" > crates/agentfs-core/benches/record_step.rs \
- && touch crates/agentfs-core/src/lib.rs crates/agentfs-fuse/src/lib.rs crates/agentfs-csi/src/lib.rs \
+ && touch crates/agentfs-align/src/lib.rs crates/agentfs-core/src/lib.rs crates/agentfs-fuse/src/lib.rs crates/agentfs-csi/src/lib.rs crates/agentfs-model/src/lib.rs crates/agentfs-conformance/src/lib.rs \
  && echo 'fn main() { std::process::exit(1) }' > crates/agentfs/src/main.rs \
  && echo 'fn main() { std::process::exit(1) }' > crates/agentfs-csi/src/main.rs \
  && cargo build --release --locked -p agentfs -p agentfs-csi --features agentfs/https,agentfs/ssh,agentfs/otlp-tls
@@ -84,6 +89,10 @@ RUN apt-get update \
 COPY --from=build /usr/local/bin/agentfs /usr/local/bin/agentfs-csi /usr/local/bin/
 COPY --from=mergiraf /out/bin/mergiraf /usr/local/bin/
 COPY --from=mergiraf /out/doc/ /usr/share/doc/mergiraf/
+# Fails the build if Debian's git is not the release CI runs: line identity depends
+# on it (MODEL.md, finding 42). An upgrade changes ci/git-release in the same commit.
+COPY ci/git-release /usr/share/agentfs/git-release
+RUN test "$(git --version)" = "git version $(sed -n 1p /usr/share/agentfs/git-release)"
 # Fails the build if a shared library is missing, or a stub (which exits
 # 1) was shipped.
 RUN agentfs --version && agentfs probe --help >/dev/null \

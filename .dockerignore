@@ -3,3 +3,7 @@
 !Cargo.toml
 !Cargo.lock
 !crates/
+!vendor/
+vendor/*
+!vendor/fuser/
+!ci/git-release

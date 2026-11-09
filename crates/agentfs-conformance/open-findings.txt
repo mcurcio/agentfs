@@ -1,0 +1,2 @@
+# Traces that fail for an open finding (MODEL.md), which replay requires to keep
+# failing: `<finding> <trace file>`. Take a line off when its finding closes.
