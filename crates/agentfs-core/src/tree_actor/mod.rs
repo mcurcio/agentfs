@@ -913,6 +913,28 @@ impl Volume {
             .collect())
     }
 
+    /// `open(O_TRUNC)`: a write-open and its truncate to zero, recorded in that
+    /// order. When the truncate fails the kernel gets an error and sends no
+    /// RELEASE, so the open closes here, or it would hold its file's takes until a
+    /// restart (R9.10). A close that fails too stays pending, as any failed close
+    /// does.
+    pub fn write_open_truncating(
+        &mut self,
+        tree: &str,
+        path: &str,
+        writer: &str,
+        create: bool,
+    ) -> Result<u64> {
+        let handle = self.write_open(tree, path, writer, create)?;
+        if let Err(error) = self.truncate(handle, 0) {
+            if let Err(close) = self.close(handle) {
+                eprintln!("tree close after a failed truncate: {close}");
+            }
+            return Err(error);
+        }
+        Ok(handle)
+    }
+
     /// Open a private write buffer. Creation is itself a recorded namespace call.
     /// The returned number is persisted before it can be used and never repeats.
     pub fn write_open(

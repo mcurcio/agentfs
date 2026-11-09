@@ -1487,6 +1487,23 @@ fn a_failed_save_keeps_serving_and_saves_at_the_next_step() {
     assert_eq!(opens_saved(tmp.path(), h), 1);
 }
 
+/// R9.10: an `open(O_TRUNC)` that fails answers an error, so no RELEASE ever comes. It
+/// leaves no open behind to hold its file's takes.
+#[cfg(feature = "failpoints")]
+#[test]
+fn a_failed_truncate_at_open_leaves_no_open_behind() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut v = Volume::open(tmp.path()).unwrap();
+    put(&mut v, "main", "a", b"old");
+    let fork = v.fork().unwrap();
+    put(&mut v, &fork, "a", b"sandbox");
+    // The open's record is the first append, the truncate's the second.
+    let guard = agentfs_core::failpoints::configure("tree.wal_before_header=error@2").unwrap();
+    assert!(v.write_open_truncating("main", "a", "w", false).is_err());
+    drop(guard);
+    assert_eq!(v.take_next("main").unwrap(), Took::Taken);
+}
+
 #[cfg(feature = "failpoints")]
 #[test]
 fn a_failed_take_stays_queued_for_the_next_event() {

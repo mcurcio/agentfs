@@ -426,12 +426,12 @@ impl View {
             return Err(Errno::EACCES);
         }
         let entry = if write {
-            let handle = v
-                .write_open(&self.tree, path, &self.writer, create)
-                .map_err(errno)?;
-            if flags & libc::O_TRUNC != 0 {
-                v.truncate(handle, 0).map_err(errno)?;
+            let handle = if flags & libc::O_TRUNC != 0 {
+                v.write_open_truncating(&self.tree, path, &self.writer, create)
+            } else {
+                v.write_open(&self.tree, path, &self.writer, create)
             }
+            .map_err(errno)?;
             Open::Write {
                 handle,
                 append: flags & libc::O_APPEND != 0,
