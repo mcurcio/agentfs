@@ -197,8 +197,9 @@ requires it. The ledger check fails on an excuse with no rule, or one whose rule
   end a client through `end_checked` and crash through `crash_checked`, so the byte oracle and its object table
   see the same calls the model does;
   after a step a referee takes (a queue step, a transaction's commit) the oracle reads the trees again.
-- **An invariant** goes in `src/check.rs`, called from `check` (after any step), `step_checked` (what only the
-  step itself shows) or `check_converged` (once writes stop). Read the truth from git or from the harness's own
+- **An invariant** goes in `src/check.rs`, called from `Checked::check` (after any step), `Checked::step_checked`
+  (what only the step itself shows) or `Checked::converged` (once writes stop). Whatever it must remember between
+  checks goes in its `Checker`, never in `World`, which does not know it is checked. Read the truth from git or from the harness's own
   record, not from the model's bookkeeping it is meant to check: a check derived from the model's own record
   agrees with the model's bugs. Add it to MODEL.md's "What must always hold" table, then plant a bug it alone
   should catch.

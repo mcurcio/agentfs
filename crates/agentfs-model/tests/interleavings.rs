@@ -30,7 +30,7 @@
 //! panic too reports its seed and the event log. The generator is a
 //! SplitMix64 written here: fixed seeds replay exactly.
 
-use agentfs_model::check::{change_files, check, check_converged, step_checked};
+use agentfs_model::check::{Checked, change_files};
 use agentfs_model::content::{BLANK, Content, FILES, Layout, PATHS, UNBORN};
 use agentfs_model::git::{git, with_reversed_dates};
 use agentfs_model::program;
@@ -546,10 +546,10 @@ impl Oracle {
     }
 }
 
-/// One step ([`step_checked`]), asserting it took its queue's head and left
+/// One step ([`Checked::step_checked`]), asserting it took its queue's head and left
 /// the rest in order, or waits and left the queue as it was; and that only the
 /// tree a take wrote in changed bytes (the oracle reads them again after).
-fn take(w: &mut World, o: &mut Oracle, s: &Step, tally: &mut Tally) -> Result<(), String> {
+fn take(w: &mut Checked, o: &mut Oracle, s: &Step, tally: &mut Tally) -> Result<(), String> {
     w.note_step(s);
     let before = match s {
         Step::Next(t) => w.queue(*t),
@@ -584,7 +584,7 @@ fn take(w: &mut World, o: &mut Oracle, s: &Step, tally: &mut Tally) -> Result<()
         Step::Next(t) => agentfs_model::check::p1_first(w, *t),
         _ => None,
     };
-    let taken = step_checked(w, s)?;
+    let taken = w.step_checked(s)?;
     tally.steps += 1;
     let skip = match s {
         Step::Next(t) => Some(Target::Tree(*t)),
@@ -852,7 +852,7 @@ fn commit_checked(
 }
 
 fn drain(
-    w: &mut World,
+    w: &mut Checked,
     o: &mut Oracle,
     tally: &mut Tally,
     at: usize,
@@ -862,7 +862,7 @@ fn drain(
         close_all_checked(w, o, tally).map_err(|e| (at, e))?;
         checkg(w, o).map_err(|e| (at, e))?;
         let Some(s) = pending_of(w, g).into_iter().next() else {
-            return check_converged(w).map_err(|e| (at, e));
+            return w.converged().map_err(|e| (at, e));
         };
         take(w, o, &s, tally).map_err(|e| (at, e))?;
         checkg(w, o).map_err(|e| (at, e))?;
@@ -870,8 +870,8 @@ fn drain(
     Err((at, "the queues never drained".into()))
 }
 
-fn checkg(w: &mut World, o: &mut Oracle) -> Result<(), String> {
-    check(w)?;
+fn checkg(w: &mut Checked, o: &mut Oracle) -> Result<(), String> {
+    w.check()?;
     gitledger::observe(w)?;
     o.no_call_waits(w)?;
     o.check(w)
@@ -911,7 +911,7 @@ fn pending_of(w: &World, g: Generator) -> Vec<Step> {
 }
 
 /// A generator of one seed's client calls and steps.
-type Run = fn(&mut World, u64, &mut Tally) -> Result<(), (usize, String)>;
+type Run = fn(&mut Checked, u64, &mut Tally) -> Result<(), (usize, String)>;
 
 /// One seed: [`run`] under `catch_unwind`.
 fn run_seed(seed: u64, policies: Policies, tally: &mut Tally) -> Result<String, String> {
@@ -926,7 +926,7 @@ fn run_seed_of(
     policies: Policies,
     tally: &mut Tally,
 ) -> Result<String, String> {
-    let mut w = World::new(policies);
+    let mut w = Checked::new(policies);
     w.label_trace(format!("seed{seed}"));
     let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         generate(&mut w, seed, tally)
@@ -1427,18 +1427,18 @@ impl Calls {
     }
 }
 
-fn run(w: &mut World, seed: u64, tally: &mut Tally) -> Result<(), (usize, String)> {
+fn run(w: &mut Checked, seed: u64, tally: &mut Tally) -> Result<(), (usize, String)> {
     run_as(EVERYTHING, w, seed, tally)
 }
 
 /// [`run`], the calls phase 1 builds.
-fn run_phase1(w: &mut World, seed: u64, tally: &mut Tally) -> Result<(), (usize, String)> {
+fn run_phase1(w: &mut Checked, seed: u64, tally: &mut Tally) -> Result<(), (usize, String)> {
     run_as(PHASE_1, w, seed, tally)
 }
 
 fn run_as(
     g: Generator,
-    w: &mut World,
+    w: &mut Checked,
     seed: u64,
     tally: &mut Tally,
 ) -> Result<(), (usize, String)> {
@@ -1670,8 +1670,8 @@ fn run_as(
     }
     tally_run(w, tally);
     tally.fast_forwards += w.fast_forwards;
-    tally.inserts_met += w.inserts_met;
-    tally.unlinked_edits += w.unlinked_edits;
+    tally.inserts_met += w.met().inserts;
+    tally.unlinked_edits += w.met().unlinked_edits;
     tally.orphans += w.orphans.len();
     tally.prefix_syncs += w.prefix_syncs;
     if gitledger::takes() != w.landings.len() {
@@ -1713,18 +1713,18 @@ fn run_as(
 /// no queue step between the calls of a round. So a change meets many others
 /// queued behind it, which steps between the calls keep apart: this generator
 /// found findings 25 to 28. Every invariant holds after every call and step.
-fn rounds(w: &mut World, seed: u64, tally: &mut Tally) -> Result<(), (usize, String)> {
+fn rounds(w: &mut Checked, seed: u64, tally: &mut Tally) -> Result<(), (usize, String)> {
     rounds_as(EVERYTHING, w, seed, tally)
 }
 
 /// [`rounds`], the calls phase 1 builds.
-fn rounds_phase1(w: &mut World, seed: u64, tally: &mut Tally) -> Result<(), (usize, String)> {
+fn rounds_phase1(w: &mut Checked, seed: u64, tally: &mut Tally) -> Result<(), (usize, String)> {
     rounds_as(PHASE_1, w, seed, tally)
 }
 
 fn rounds_as(
     g: Generator,
-    w: &mut World,
+    w: &mut Checked,
     seed: u64,
     tally: &mut Tally,
 ) -> Result<(), (usize, String)> {

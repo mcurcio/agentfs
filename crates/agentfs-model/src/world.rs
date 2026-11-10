@@ -760,44 +760,13 @@ pub struct World {
     parents: RefCell<BTreeMap<String, Vec<String>>>,
     ancestry: RefCell<BTreeMap<(String, String), bool>>,
     over: RefCell<BTreeMap<String, Vec<String>>>,
-    /// `check`'s state: its last view of each tree and caches over
-    /// immutable git objects.
-    pub(crate) views: BTreeMap<Tree, BTreeMap<String, Content>>,
-    /// Every (tree, file, line identity, version) a tree has shown and
-    /// then replaced.
-    pub(crate) left: BTreeSet<(Tree, String, String, String)>,
-    pub(crate) checked_commits: BTreeSet<String>,
-    /// Each open a save names (`Agentfs-Open`), with that save: `check`'s.
-    pub(crate) opens_saved: BTreeMap<String, String>,
-    /// Each rename-over's unlink, read from its save's commit: the replaced
-    /// file's deleted name version, to the renamed file's identity and the
-    /// name version that same save gave it (`check`: one call, whole).
-    pub(crate) rename_overs: BTreeMap<String, (String, String)>,
-    /// Per head: the commits its history reaches.
-    pub(crate) reach: BTreeMap<String, BTreeSet<String>>,
-    pub(crate) grepped: (usize, BTreeSet<String>),
-    pub(crate) collisions_checked: usize,
-    pub(crate) landings_checked: usize,
     /// Main moved, or a collision was recorded, since Replication last
     /// pushed.
     replication_due: bool,
-    pub(crate) syncs_checked: usize,
-    pub(crate) ended_checked: usize,
-    /// `check`'s: per open transaction, its fork's head and the files it had
-    /// saved at the last check.
-    pub(crate) txn_files_seen: BTreeMap<TxnId, (String, BTreeSet<String>)>,
     pub(crate) ref_moves: u64,
-    pub(crate) refs_checked: Option<u64>,
-    /// Counted by `check` (rules 10 and 11 met in a take, so a run can show
-    /// it exercised them): a new line placed beside an upstream's concurrent
-    /// new line at its place, and a change that edited a file the upstream
-    /// had unlinked.
-    pub inserts_met: usize,
     /// Syncs that delivered only a prefix of the upstream's commits (P2),
     /// counted so a run can show it met them.
     pub prefix_syncs: usize,
-    pub unlinked_edits: usize,
-    pub(crate) placements_checked: usize,
     /// The calls made, as [`crate::calls`] records them, when recording.
     trace: Option<Vec<Recorded>>,
     /// Inside a call that records itself as one: nothing it does records.
@@ -864,25 +833,9 @@ impl World {
             parents: RefCell::new(BTreeMap::new()),
             ancestry: RefCell::new(BTreeMap::new()),
             over: RefCell::new(BTreeMap::new()),
-            views: BTreeMap::new(),
-            left: BTreeSet::new(),
-            checked_commits: BTreeSet::new(),
-            opens_saved: BTreeMap::new(),
-            rename_overs: BTreeMap::new(),
-            reach: BTreeMap::new(),
-            grepped: (0, BTreeSet::new()),
-            collisions_checked: 0,
-            landings_checked: 0,
             replication_due: false,
-            syncs_checked: 0,
-            ended_checked: 0,
-            txn_files_seen: BTreeMap::new(),
             ref_moves: 0,
-            refs_checked: None,
-            inserts_met: 0,
             prefix_syncs: 0,
-            unlinked_edits: 0,
-            placements_checked: 0,
             trace: std::env::var_os(TRACE_DIR).map(|_| Vec::new()),
             trace_mute: false,
             trace_label: None,

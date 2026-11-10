@@ -1,16 +1,20 @@
 //! The invariants (MODEL.md, "What must always hold"), read back from the
 //! repository and the trees after every step. Each returns the first
-//! violation found. Reads over git objects are cached in the [`World`]:
-//! commits, their ancestry and blobs never change.
+//! violation found. The checker's own state (its last view of each tree, how
+//! far it has read the world's records, caches over git objects, which never
+//! change) lives in a [`Checker`], owned with its world by [`Checked`]: the
+//! world does not know it is checked, and the checker reads the world and git
+//! but writes neither.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::{Deref, DerefMut};
 use std::path::Path;
 
 use crate::content::{Content, Line, PATHS, State, is_root, writer_of};
 use crate::git::{git, try_git};
 use crate::world::{
-    By, Client, Collision, Decision, Direction, Entry, ForkId, Kind, Landed, Life, Step, Take,
-    Target, Tree, TxnEnd, TxnId, TxnOutcome, World, commit_parents, decisions_in, name_key,
+    By, Client, Collision, Decision, Direction, Entry, ForkId, Kind, Landed, Life, Policies, Step,
+    Take, Target, Tree, TxnEnd, TxnId, TxnOutcome, World, commit_parents, decisions_in, name_key,
     origin_in,
 };
 
@@ -19,32 +23,131 @@ fn named<T>(check: &'static str, r: Result<T, String>) -> Result<T, String> {
     r.map_err(|e| format!("{check}: {e}"))
 }
 
-/// Every invariant that holds after any step.
-pub fn check(w: &mut World) -> Result<(), String> {
-    let now = views(w);
-    named("no_silent_loss", no_silent_loss(w, &now))?;
-    named("no_flicker", no_flicker(w, &now))?;
-    w.views = now;
-    named("locks", locks(w))?;
-    named("upstream_wins", upstream_wins(w))?;
-    named("changes_whole", changes_whole(w))?;
-    named("syncs_deliver", syncs_deliver(w))?;
-    named("transactions_end_as_told", transactions_end_as_told(w))?;
-    named("transactions_undisturbed", transactions_undisturbed(w))?;
-    let discards = w.grepped.0 != w.discarded.len();
-    if w.refs_checked != Some(w.ref_moves) || discards {
-        let all = w.all_commits();
-        named("one_writer", one_writer(w, &all))?;
-        named(
-            "discarded_leave_no_trace",
-            discarded_leave_no_trace(w, &all),
-        )?;
-        w.refs_checked = Some(w.ref_moves);
+/// A world and its checker, one per world, fixed at construction. It derefs
+/// to the [`World`], so a test drives the world through it; the checks run
+/// only through [`Checked::check`], [`Checked::step_checked`] and
+/// [`Checked::converged`].
+pub struct Checked {
+    world: World,
+    checker: Checker,
+}
+
+impl Checked {
+    pub fn new(policies: Policies) -> Self {
+        Self {
+            world: World::new(policies),
+            checker: Checker::default(),
+        }
     }
-    named("rename_overs_whole", rename_overs_whole(w))?;
-    named("full_lineage", full_lineage(w))?;
-    named("placed_and_unlinked", placed_and_unlinked(w))?;
-    Ok(())
+
+    /// Every invariant that holds after any step.
+    pub fn check(&mut self) -> Result<(), String> {
+        self.checker.check(&self.world)
+    }
+
+    /// One step, with what only the step itself shows ([`step_checked`]).
+    /// Returns the queue entries taken.
+    pub fn step_checked(&mut self, s: &Step) -> Result<usize, String> {
+        step_checked(&mut self.world, s)
+    }
+
+    /// Once writes stop and every queue has drained ([`check_converged`]).
+    pub fn converged(&self) -> Result<(), String> {
+        check_converged(&self.world)
+    }
+
+    /// What the checks counted, so a run can show it exercised them.
+    pub fn met(&self) -> Met {
+        self.checker.met
+    }
+}
+
+impl Deref for Checked {
+    type Target = World;
+    fn deref(&self) -> &World {
+        &self.world
+    }
+}
+
+impl DerefMut for Checked {
+    fn deref_mut(&mut self) -> &mut World {
+        &mut self.world
+    }
+}
+
+/// Counted by `check` (rules 10 and 11 met in a take): a new line placed
+/// beside an upstream's concurrent new line at its place, and a change that
+/// edited a file the upstream had unlinked.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Met {
+    pub inserts: usize,
+    pub unlinked_edits: usize,
+}
+
+/// The checks' own state: the last view of each tree, how far they have read
+/// the world's records, and caches over immutable git objects.
+#[derive(Default)]
+struct Checker {
+    views: Views,
+    /// Every (tree, file, line identity, version) a tree has shown and
+    /// then replaced.
+    left: BTreeSet<(Tree, String, String, String)>,
+    checked_commits: BTreeSet<String>,
+    /// Each open a save names (`Agentfs-Open`), with that save.
+    opens_saved: BTreeMap<String, String>,
+    /// Each rename-over's unlink, read from its save's commit: the replaced
+    /// file's deleted name version, to the renamed file's identity and the
+    /// name version that same save gave it (one call, whole).
+    rename_overs: BTreeMap<String, (String, String)>,
+    /// Per head: the commits its history reaches.
+    reach: BTreeMap<String, BTreeSet<String>>,
+    grepped: (usize, BTreeSet<String>),
+    read: Cursors,
+    /// Per open transaction, its fork's head and the files it had saved at
+    /// the last check.
+    txn_files_seen: BTreeMap<TxnId, (String, BTreeSet<String>)>,
+    refs_checked: Option<u64>,
+    met: Met,
+}
+
+/// How many of each of the world's records the checks have read.
+#[derive(Default)]
+struct Cursors {
+    collisions: usize,
+    landings: usize,
+    syncs: usize,
+    ended: usize,
+    placements: usize,
+}
+
+impl Checker {
+    /// Every invariant that holds after any step.
+    fn check(&mut self, w: &World) -> Result<(), String> {
+        let now = views(w);
+        named("no_silent_loss", self.no_silent_loss(w, &now))?;
+        named("no_flicker", self.no_flicker(w, &now))?;
+        self.views = now;
+        named("locks", locks(w))?;
+        named("upstream_wins", self.upstream_wins(w))?;
+        named("changes_whole", self.changes_whole(w))?;
+        named("syncs_deliver", self.syncs_deliver(w))?;
+        named("transactions_end_as_told", self.transactions_end_as_told(w))?;
+        named("transactions_undisturbed", self.transactions_undisturbed(w))?;
+        let discards = self.grepped.0 != w.discarded.len();
+        if self.refs_checked != Some(w.ref_moves) || discards {
+            let all = w.all_commits();
+            named("one_writer", self.one_writer(w, &all))?;
+            named(
+                "discarded_leave_no_trace",
+                self.discarded_leave_no_trace(w, &all),
+            )?;
+            self.refs_checked = Some(w.ref_moves);
+        }
+        named("rename_overs_whole", self.rename_overs_whole(w))?;
+        named("full_lineage", self.full_lineage(w))?;
+        named("placed_and_unlinked", self.placed_and_unlinked(w))?;
+        Ok(())
+    }
 }
 
 /// One step, with what only the step itself shows. A take (rule 9) is one
@@ -56,7 +159,7 @@ pub fn check(w: &mut World) -> Result<(), String> {
 /// client of that tree has open for writing, nor any file it did not lock; a
 /// sync records no collision (only an upstream's queue decides one) and
 /// carries the head its take read. Returns the queue entries taken.
-pub fn step_checked(w: &mut World, s: &Step) -> Result<usize, String> {
+fn step_checked(w: &mut World, s: &Step) -> Result<usize, String> {
     named("step_checked", step_rules(w, s))
 }
 
@@ -357,7 +460,7 @@ fn diff_files(w: &World, a: &str, b: &str) -> BTreeSet<String> {
 /// fork's untouched files equal main and touched files equal main or the
 /// fork's newer non-colliding edit": once the queues drain, a fork has no
 /// newer edit left.
-pub fn check_converged(w: &World) -> Result<(), String> {
+fn check_converged(w: &World) -> Result<(), String> {
     named("check_converged", drained(w))?;
     named("losers_pushed", losers_pushed(w))?;
     named("check_converged", trees_equal_main(w))
@@ -417,10 +520,13 @@ fn views(w: &World) -> Views {
 /// Each line whose version changed in a live tree since the last check:
 /// (tree, file, line identity, before, now). A line identity never leaves
 /// a tree: a delete is a version.
-fn moves<'a>(w: &'a World, now: &'a Views) -> Vec<(Tree, &'a str, &'a str, &'a Line, &'a Line)> {
+fn moves<'a>(
+    views: &'a Views,
+    now: &'a Views,
+) -> Vec<(Tree, &'a str, &'a str, &'a Line, &'a Line)> {
     let mut out = Vec::new();
     for (t, files) in now {
-        let Some(before) = w.views.get(t) else {
+        let Some(before) = views.get(t) else {
             continue;
         };
         for (p, c) in files {
@@ -562,96 +668,99 @@ fn delivered(w: &World, t: Tree, c: &Collision) -> bool {
         || w.is_ancestor(&c.result, &w.head(t))
 }
 
-/// Main never silently loses a change, nor does any tree, and no stale
-/// version reverts a newer one: (a) in every live tree a line moves from
-/// version a to b only if b was written over a, or both are deletes (they
-/// agree, R10.3), or b is a delete agreeing with one written over a
-/// ([`deleted_over`]), or a recorded collision in that tree or one upstream names a
-/// as lost; never if a was written over b (b is stale), unless a collision
-/// decided against a ([`decided_against`]); (b) every version that
-/// entered a tree (written there, carried in by a landing or a
-/// transaction, won or lost, or taken from the upstream by a sync) is still
-/// its line's version there, or one written over it is, or a delete is
-/// that agrees with it or with a delete written over it
-/// ([`deleted_over`]), or such a collision names it, or the tree's last sync
-/// hid its line under R10.6 ([`hidden_by_r10_6`]).
-fn no_silent_loss(w: &World, now: &Views) -> Result<(), String> {
-    for (t, p, l, a, b) in moves(w, now) {
-        // excuse: R10.3 two deletes of one line agree: the line stays deleted
-        if !a.live() && !b.live() {
-            continue;
-        }
-        // excuse: R3b a collision decided against a: the upstream's version may replace it
-        if w.lineage.descends(&a.id, &b.id) && !decided_against(w, t, p, l, &a.id) {
-            return Err(format!(
-                "stale revert in {t:?}:{p}[{l}]: {} became {}, which it was written over",
-                a.id, b.id
-            ));
-        }
-        // excuse: R3b a collision names a lost: it stays in history, named
-        // excuse: R10.3 b agrees with a delete written over a
-        if !w.lineage.descends(&b.id, &a.id)
-            && !flagged(w, t, p, l, &a.id)
-            && !(!b.live() && deleted_over(w, t, p, l, &a.id))
-        {
-            return Err(format!(
-                "silent loss in {t:?}:{p}[{l}]: {} became {}, which was not written over it, and no collision names it",
-                a.id, b.id
-            ));
-        }
-    }
-    for (t, e) in &w.entered {
-        let Some(files) = now.get(t) else {
-            continue;
-        };
-        let lost = flagged(w, *t, &e.path, &e.line, &e.token);
-        let Some(s) = files[&e.path].member(&e.line) else {
-            // A new line that lost never entered the tree's file.
-            // excuse: R3b a new line that lost never entered the tree's file
-            if lost {
+impl Checker {
+    /// Main never silently loses a change, nor does any tree, and no stale
+    /// version reverts a newer one: (a) in every live tree a line moves from
+    /// version a to b only if b was written over a, or both are deletes (they
+    /// agree, R10.3), or b is a delete agreeing with one written over a
+    /// ([`deleted_over`]), or a recorded collision in that tree or one upstream names a
+    /// as lost; never if a was written over b (b is stale), unless a collision
+    /// decided against a ([`decided_against`]); (b) every version that
+    /// entered a tree (written there, carried in by a landing or a
+    /// transaction, won or lost, or taken from the upstream by a sync) is still
+    /// its line's version there, or one written over it is, or a delete is
+    /// that agrees with it or with a delete written over it
+    /// ([`deleted_over`]), or such a collision names it, or the tree's last sync
+    /// hid its line under R10.6 ([`hidden_by_r10_6`]).
+    fn no_silent_loss(&self, w: &World, now: &Views) -> Result<(), String> {
+        for (t, p, l, a, b) in moves(&self.views, now) {
+            // excuse: R10.3 two deletes of one line agree: the line stays deleted
+            if !a.live() && !b.live() {
                 continue;
             }
-            // excuse: R10.6 the tree's last sync hid the upstream's unfinished last line in front of an undecided line
-            if hidden_by_r10_6(w, *t, &e.path, &e.line, &e.token) {
-                continue;
+            // excuse: R3b a collision decided against a: the upstream's version may replace it
+            if w.lineage.descends(&a.id, &b.id) && !decided_against(w, t, p, l, &a.id) {
+                return Err(format!(
+                    "stale revert in {t:?}:{p}[{l}]: {} became {}, which it was written over",
+                    a.id, b.id
+                ));
             }
-            return Err(format!("line {} of {} left {t:?}", e.line, e.path));
-        };
-        // excuse: R3b a collision names it lost
-        // excuse: R10.3 s agrees with a delete written over e (or e itself)
-        let deleted = !s.live() && deleted_over(w, *t, &e.path, &e.line, &e.token);
-        if !lost && !w.lineage.descends(&s.id, &e.token) && !deleted {
-            return Err(format!(
-                "{} entered {t:?}:{}[{}] and is gone ({} there), with no collision naming it",
-                e.token, e.path, e.line, s.id
-            ));
+            // excuse: R3b a collision names a lost: it stays in history, named
+            // excuse: R10.3 b agrees with a delete written over a
+            if !w.lineage.descends(&b.id, &a.id)
+                && !flagged(w, t, p, l, &a.id)
+                && !(!b.live() && deleted_over(w, t, p, l, &a.id))
+            {
+                return Err(format!(
+                    "silent loss in {t:?}:{p}[{l}]: {} became {}, which was not written over it, and no collision names it",
+                    a.id, b.id
+                ));
+            }
         }
+        for (t, e) in &w.entered {
+            let Some(files) = now.get(t) else {
+                continue;
+            };
+            let lost = flagged(w, *t, &e.path, &e.line, &e.token);
+            let Some(s) = files[&e.path].member(&e.line) else {
+                // A new line that lost never entered the tree's file.
+                // excuse: R3b a new line that lost never entered the tree's file
+                if lost {
+                    continue;
+                }
+                // excuse: R10.6 the tree's last sync hid the upstream's unfinished last line in front of an undecided line
+                if hidden_by_r10_6(w, *t, &e.path, &e.line, &e.token) {
+                    continue;
+                }
+                return Err(format!("line {} of {} left {t:?}", e.line, e.path));
+            };
+            // excuse: R3b a collision names it lost
+            // excuse: R10.3 s agrees with a delete written over e (or e itself)
+            let deleted = !s.live() && deleted_over(w, *t, &e.path, &e.line, &e.token);
+            if !lost && !w.lineage.descends(&s.id, &e.token) && !deleted {
+                return Err(format!(
+                    "{} entered {t:?}:{}[{}] and is gone ({} there), with no collision naming it",
+                    e.token, e.path, e.line, s.id
+                ));
+            }
+        }
+        Ok(())
     }
-    Ok(())
-}
 
-/// No flip-flop: a version, once replaced in a tree, never shows there
-/// again, unless a collision decided against the version replacing it now
-/// ([`decided_against`]: then it is that decision). So a fork's line
-/// changes at most once per collision (its own x, then the upstream's
-/// winning m, never x again).
-fn no_flicker(w: &mut World, now: &Views) -> Result<(), String> {
-    let mut left = Vec::new();
-    for (t, p, l, a, b) in moves(w, now) {
-        // excuse: R3a the upstream's queue decided against a: the line takes that decision
-        if w.left
-            .contains(&(t, p.to_string(), l.to_string(), b.id.clone()))
-            && !decided_against(w, t, p, l, &a.id)
-        {
-            return Err(format!(
-                "flicker in {t:?}:{p}[{l}]: {} shows again after it was replaced (now over {})",
-                b.id, a.id
-            ));
+    /// No flip-flop: a version, once replaced in a tree, never shows there
+    /// again, unless a collision decided against the version replacing it now
+    /// ([`decided_against`]: then it is that decision). So a fork's line
+    /// changes at most once per collision (its own x, then the upstream's
+    /// winning m, never x again).
+    fn no_flicker(&mut self, w: &World, now: &Views) -> Result<(), String> {
+        let mut left = Vec::new();
+        for (t, p, l, a, b) in moves(&self.views, now) {
+            // excuse: R3a the upstream's queue decided against a: the line takes that decision
+            if self
+                .left
+                .contains(&(t, p.to_string(), l.to_string(), b.id.clone()))
+                && !decided_against(w, t, p, l, &a.id)
+            {
+                return Err(format!(
+                    "flicker in {t:?}:{p}[{l}]: {} shows again after it was replaced (now over {})",
+                    b.id, a.id
+                ));
+            }
+            left.push((t, p.to_string(), l.to_string(), a.id.clone()));
         }
-        left.push((t, p.to_string(), l.to_string(), a.id.clone()));
+        self.left.extend(left);
+        Ok(())
     }
-    w.left.extend(left);
-    Ok(())
 }
 
 /// Whether some file of commit `at` holds version `token`.
@@ -659,153 +768,155 @@ fn holds(w: &World, at: &str, token: &str) -> bool {
     PATHS.iter().any(|p| w.file(at, p).holds(token))
 }
 
-/// The upstream's version wins every collision, decided only at the
-/// upstream's queue (a landing, or a transaction's commit into its fork:
-/// [`Direction`] has no other case, and `sync` records none), and only a
-/// real one: in each recorded collision the result holds none of the lost
-/// versions and keeps the tree's own version of every lost line, as the
-/// tree had it before, and holds each version named in `won`, as the tree
-/// did before; the lost versions are the losing change's; each
-/// lost and winning pair is concurrent (neither was written over the
-/// other; for a loss decided by a file rule, at least one pair; for a line
-/// lost only because its change lost whole, a real collision of that
-/// change: [`really_collided`]); the losing change stays reachable under
-/// the collision's ref; the result's parents are the tree's previous
-/// head and the losing change. Where it was decided is read from
-/// git, not the model's record: the result is the deciding tree's own
-/// landing or transaction commit, and the losing commit was written below
-/// that tree (a fork under it, or the transaction of that fork).
-fn upstream_wins(w: &mut World) -> Result<(), String> {
-    for c in &w.collisions[w.collisions_checked..] {
-        if !decided_at_the_upstreams_queue(w, c) {
-            return Err(format!(
-                "{c:?}: not decided at the upstream's queue (result {} in {}, loser from {})",
-                w.trailer(&c.result, "Agentfs-Cause"),
-                w.trailer(&c.result, "Agentfs-Tree"),
-                w.trailer(&c.loser, "Agentfs-Tree"),
-            ));
-        }
-        let (r, win, lose) = (
-            w.file(&c.result, &c.path),
-            w.file(&c.winner, &c.path),
-            w.file(&c.loser, &c.path),
-        );
-        let named = c.lines.len() == c.won.len()
-            && c.lines.len() == c.lost.len()
-            && c.won
+impl Checker {
+    /// The upstream's version wins every collision, decided only at the
+    /// upstream's queue (a landing, or a transaction's commit into its fork:
+    /// [`Direction`] has no other case, and `sync` records none), and only a
+    /// real one: in each recorded collision the result holds none of the lost
+    /// versions and keeps the tree's own version of every lost line, as the
+    /// tree had it before, and holds each version named in `won`, as the tree
+    /// did before; the lost versions are the losing change's; each
+    /// lost and winning pair is concurrent (neither was written over the
+    /// other; for a loss decided by a file rule, at least one pair; for a line
+    /// lost only because its change lost whole, a real collision of that
+    /// change: [`really_collided`]); the losing change stays reachable under
+    /// the collision's ref; the result's parents are the tree's previous
+    /// head and the losing change. Where it was decided is read from
+    /// git, not the model's record: the result is the deciding tree's own
+    /// landing or transaction commit, and the losing commit was written below
+    /// that tree (a fork under it, or the transaction of that fork).
+    fn upstream_wins(&mut self, w: &World) -> Result<(), String> {
+        for c in &w.collisions[self.read.collisions..] {
+            if !decided_at_the_upstreams_queue(w, c) {
+                return Err(format!(
+                    "{c:?}: not decided at the upstream's queue (result {} in {}, loser from {})",
+                    w.trailer(&c.result, "Agentfs-Cause"),
+                    w.trailer(&c.result, "Agentfs-Tree"),
+                    w.trailer(&c.loser, "Agentfs-Tree"),
+                ));
+            }
+            let (r, win, lose) = (
+                w.file(&c.result, &c.path),
+                w.file(&c.winner, &c.path),
+                w.file(&c.loser, &c.path),
+            );
+            let named = c.lines.len() == c.won.len()
+                && c.lines.len() == c.lost.len()
+                && c.won
+                    .iter()
+                    .all(|t| holds(w, &c.winner, t) && holds(w, &c.result, t));
+            let kept = c
+                .lines
                 .iter()
-                .all(|t| holds(w, &c.winner, t) && holds(w, &c.result, t));
-        let kept = c
-            .lines
-            .iter()
-            .zip(&c.lost)
-            .all(|(l, x)| !r.holds(x) && r.member(l) == win.member(l));
-        if !kept || !named || c.lines.is_empty() {
-            return Err(format!("{c:?}: the upstream's version did not win"));
+                .zip(&c.lost)
+                .all(|(l, x)| !r.holds(x) && r.member(l) == win.member(l));
+            if !kept || !named || c.lines.is_empty() {
+                return Err(format!("{c:?}: the upstream's version did not win"));
+            }
+            let mut pairs = c.lost.iter().zip(&c.won);
+            let real = match c.by {
+                By::Line => pairs.all(|(x, y)| concurrent(w, x, y)),
+                // excuse: R11 a loss by a file rule needs one concurrent pair, not all
+                By::File => pairs.any(|(x, y)| concurrent(w, x, y)),
+                // excuse: R3e a line lost with its change needs a real collision of that change
+                By::Whole => really_collided(w, c),
+            };
+            if !real {
+                return Err(format!(
+                    "{c:?}: not a collision: one version was written over the other"
+                ));
+            }
+            if let Some(t) = c.lost.iter().find(|t| !lose.holds(t)) {
+                return Err(format!("{c:?}: lost {t} is not in the incoming commit"));
+            }
+            let at = git(w.repo(), &["rev-parse", &c.reference]);
+            if at != c.loser {
+                return Err(format!("{c:?}: its ref names {at}"));
+            }
+            // Recorded in git, in its result commit, which names the tree the
+            // decision belongs to; the losing commit holds no decision of its own.
+            let tree = w.trailer(&c.result, "Agentfs-Tree");
+            if !decisions_in(w.repo(), &["-1", &c.result])
+                .iter()
+                .any(|(_, d)| *d == Decision::of(c) && d.tree == tree)
+            {
+                return Err(format!(
+                    "{c:?}: its result commit {:.7} in {tree} does not record it",
+                    c.result
+                ));
+            }
+            let parents = commit_parents(w.repo(), &c.result);
+            if parents != [c.winner.clone(), c.loser.clone()] {
+                return Err(format!("{c:?}: result's parents are {parents:?}"));
+            }
         }
-        let mut pairs = c.lost.iter().zip(&c.won);
-        let real = match c.by {
-            By::Line => pairs.all(|(x, y)| concurrent(w, x, y)),
-            // excuse: R11 a loss by a file rule needs one concurrent pair, not all
-            By::File => pairs.any(|(x, y)| concurrent(w, x, y)),
-            // excuse: R3e a line lost with its change needs a real collision of that change
-            By::Whole => really_collided(w, c),
-        };
-        if !real {
-            return Err(format!(
-                "{c:?}: not a collision: one version was written over the other"
-            ));
-        }
-        if let Some(t) = c.lost.iter().find(|t| !lose.holds(t)) {
-            return Err(format!("{c:?}: lost {t} is not in the incoming commit"));
-        }
-        let at = git(w.repo(), &["rev-parse", &c.reference]);
-        if at != c.loser {
-            return Err(format!("{c:?}: its ref names {at}"));
-        }
-        // Recorded in git, in its result commit, which names the tree the
-        // decision belongs to; the losing commit holds no decision of its own.
-        let tree = w.trailer(&c.result, "Agentfs-Tree");
-        if !decisions_in(w.repo(), &["-1", &c.result])
-            .iter()
-            .any(|(_, d)| *d == Decision::of(c) && d.tree == tree)
-        {
-            return Err(format!(
-                "{c:?}: its result commit {:.7} in {tree} does not record it",
-                c.result
-            ));
-        }
-        let parents = commit_parents(w.repo(), &c.result);
-        if parents != [c.winner.clone(), c.loser.clone()] {
-            return Err(format!("{c:?}: result's parents are {parents:?}"));
-        }
+        self.read.collisions = w.collisions.len();
+        Ok(())
     }
-    w.collisions_checked = w.collisions.len();
-    Ok(())
-}
 
-/// Rule 3e, read from git: no partial save or transaction ever reaches an
-/// upstream. The change a take judged (a save, a transaction's commit, a
-/// landing commit, or a transaction's branch at its commit) either lost,
-/// named by a collision of that take, or won, never both; the versions its
-/// own edit set (its diff from its base, read from git) are, for one that
-/// lost, none in the take's result (unless the tree held it before) and
-/// each named lost by that change's collisions (unless the tree before
-/// already held it, or a version written over it); for one that won,
-/// every one in the result, or a version written over it.
-fn changes_whole(w: &mut World) -> Result<(), String> {
-    for l in &w.landings[w.landings_checked..] {
-        let u = &l.change;
-        let lost = w
-            .collisions
-            .iter()
-            .any(|c| c.tree == l.tree && c.result == l.result && c.loser == *u);
-        if lost == l.won {
-            return Err(format!(
-                "{u:.7} into {:?}: judged lost {lost}, among the winners {}",
-                l.tree, !lost
-            ));
-        }
-        for e in w.edits(&l.base, u) {
-            let (r, b) = (w.file(&l.result, &e.path), w.file(&l.before, &e.path));
-            let ends = |v: &Line| w.lineage.descends(&v.id, &e.token);
-            if !lost {
-                if !r.member(&e.line).is_some_and(ends) {
+    /// Rule 3e, read from git: no partial save or transaction ever reaches an
+    /// upstream. The change a take judged (a save, a transaction's commit, a
+    /// landing commit, or a transaction's branch at its commit) either lost,
+    /// named by a collision of that take, or won, never both; the versions its
+    /// own edit set (its diff from its base, read from git) are, for one that
+    /// lost, none in the take's result (unless the tree held it before) and
+    /// each named lost by that change's collisions (unless the tree before
+    /// already held it, or a version written over it); for one that won,
+    /// every one in the result, or a version written over it.
+    fn changes_whole(&mut self, w: &World) -> Result<(), String> {
+        for l in &w.landings[self.read.landings..] {
+            let u = &l.change;
+            let lost = w
+                .collisions
+                .iter()
+                .any(|c| c.tree == l.tree && c.result == l.result && c.loser == *u);
+            if lost == l.won {
+                return Err(format!(
+                    "{u:.7} into {:?}: judged lost {lost}, among the winners {}",
+                    l.tree, !lost
+                ));
+            }
+            for e in w.edits(&l.base, u) {
+                let (r, b) = (w.file(&l.result, &e.path), w.file(&l.before, &e.path));
+                let ends = |v: &Line| w.lineage.descends(&v.id, &e.token);
+                if !lost {
+                    if !r.member(&e.line).is_some_and(ends) {
+                        return Err(format!(
+                            "{u:.7} won in {:?}, but its {} of {}[{}] is not in {:.7}: a partial change",
+                            l.tree, e.token, e.path, e.line, l.result
+                        ));
+                    }
+                    continue;
+                }
+                // excuse: R3e.2 a version the tree held before costs the change nothing
+                if r.holds(&e.token) && !b.holds(&e.token) {
                     return Err(format!(
-                        "{u:.7} won in {:?}, but its {} of {}[{}] is not in {:.7}: a partial change",
+                        "{u:.7} lost in {:?}, but its {} of {}[{}] reached {:.7}: a partial change",
                         l.tree, e.token, e.path, e.line, l.result
                     ));
                 }
-                continue;
-            }
-            // excuse: R3e.2 a version the tree held before costs the change nothing
-            if r.holds(&e.token) && !b.holds(&e.token) {
-                return Err(format!(
-                    "{u:.7} lost in {:?}, but its {} of {}[{}] reached {:.7}: a partial change",
-                    l.tree, e.token, e.path, e.line, l.result
-                ));
-            }
-            let named = w.collisions.iter().any(|c| {
-                c.tree == l.tree
-                    && c.result == l.result
-                    && c.loser == *u
-                    && c.path == e.path
-                    && c.lines
-                        .iter()
-                        .zip(&c.lost)
-                        .any(|(x, t)| *x == e.line && *t == e.token)
-            });
-            // excuse: R3e.2 the tree before held it, or a version written over it
-            if !named && !b.member(&e.line).is_some_and(ends) {
-                return Err(format!(
-                    "{u:.7} lost in {:?}, but no collision names its {} of {}[{}]",
-                    l.tree, e.token, e.path, e.line
-                ));
+                let named = w.collisions.iter().any(|c| {
+                    c.tree == l.tree
+                        && c.result == l.result
+                        && c.loser == *u
+                        && c.path == e.path
+                        && c.lines
+                            .iter()
+                            .zip(&c.lost)
+                            .any(|(x, t)| *x == e.line && *t == e.token)
+                });
+                // excuse: R3e.2 the tree before held it, or a version written over it
+                if !named && !b.member(&e.line).is_some_and(ends) {
+                    return Err(format!(
+                        "{u:.7} lost in {:?}, but no collision names its {} of {}[{}]",
+                        l.tree, e.token, e.path, e.line
+                    ));
+                }
             }
         }
+        self.read.landings = w.landings.len();
+        Ok(())
     }
-    w.landings_checked = w.landings.len();
-    Ok(())
 }
 
 /// Every losing change is replicated to the shared remote, eventually, and
@@ -1056,390 +1167,394 @@ fn hidden_by_r10_6(w: &World, t: Tree, path: &str, line: &str, token: &str) -> b
     })
 }
 
-/// Rule 3 per sync, as of the moment its take began: the fork now holds
-/// the upstream's version of every line, except where it holds its own
-/// version the upstream's queue had not decided then (that version had not
-/// entered the upstream), or had decided only in a take a prefix sync holds
-/// back (P2: the take's result commit is not in the upstream commit the
-/// sync delivered, read from git). A sync carries the upstream's decided
-/// state: a fork version the upstream already took is replaced by the
-/// upstream's version, whichever won. Two upstream's lines may be absent while
-/// the fork's own line is undecided, each only where the rule says: its
-/// unfinished last line in front of that line (R10.6), and a line behind that
-/// line when it is unfinished (R10.9), which the fork never held or holds
-/// only as its own delete (finding 43).
-fn syncs_deliver(w: &mut World) -> Result<(), String> {
-    for (t, up, result, entered) in &w.syncs[w.syncs_checked..] {
-        let Tree::Fork(f) = t else {
-            return Err("main synced".into());
-        };
-        let upstream = w.forks[f].upstream;
-        let took = taken_by(w, upstream, *entered);
-        let held_back = |id: &str| held_back(w, upstream, up, id);
-        let decided = |id: &str| is_root(id) || took.contains(id);
-        // Finding 11: the upstream gave file `p` a path that the fork's own
-        // undecided name of another file holds there, or (a chain) a file
-        // shown under its previous name by this same exception holds
-        // there; the fork keeps showing `p` under the name it had (the one
-        // exception). Grown from the undecided names, so no cycle of
-        // files excuses itself.
-        // excuse: R11.1 the fork shows a file under its previous name until decided
-        let mut kept: BTreeSet<&str> = PATHS
-            .iter()
-            .copied()
-            .filter(|q| {
-                let id = &w.file(result, q).name.id;
-                !decided(id) || held_back(id)
-            })
-            .collect();
-        loop {
-            let more: Vec<&str> = PATHS
+impl Checker {
+    /// Rule 3 per sync, as of the moment its take began: the fork now holds
+    /// the upstream's version of every line, except where it holds its own
+    /// version the upstream's queue had not decided then (that version had not
+    /// entered the upstream), or had decided only in a take a prefix sync holds
+    /// back (P2: the take's result commit is not in the upstream commit the
+    /// sync delivered, read from git). A sync carries the upstream's decided
+    /// state: a fork version the upstream already took is replaced by the
+    /// upstream's version, whichever won. Two upstream's lines may be absent while
+    /// the fork's own line is undecided, each only where the rule says: its
+    /// unfinished last line in front of that line (R10.6), and a line behind that
+    /// line when it is unfinished (R10.9), which the fork never held or holds
+    /// only as its own delete (finding 43).
+    fn syncs_deliver(&mut self, w: &World) -> Result<(), String> {
+        for (t, up, result, entered) in &w.syncs[self.read.syncs..] {
+            let Tree::Fork(f) = t else {
+                return Err("main synced".into());
+            };
+            let upstream = w.forks[f].upstream;
+            let took = taken_by(w, upstream, *entered);
+            let held_back = |id: &str| held_back(w, upstream, up, id);
+            let decided = |id: &str| is_root(id) || took.contains(id);
+            // Finding 11: the upstream gave file `p` a path that the fork's own
+            // undecided name of another file holds there, or (a chain) a file
+            // shown under its previous name by this same exception holds
+            // there; the fork keeps showing `p` under the name it had (the one
+            // exception). Grown from the undecided names, so no cycle of
+            // files excuses itself.
+            // excuse: R11.1 the fork shows a file under its previous name until decided
+            let mut kept: BTreeSet<&str> = PATHS
                 .iter()
                 .copied()
-                .filter(|p| !kept.contains(p))
-                .filter(|p| {
-                    w.file(up, p).path().is_some_and(|path| {
-                        kept.iter()
-                            .any(|q| q != p && w.file(result, q).path() == Some(path))
-                    })
+                .filter(|q| {
+                    let id = &w.file(result, q).name.id;
+                    !decided(id) || held_back(id)
                 })
                 .collect();
-            if more.is_empty() {
-                break;
-            }
-            kept.extend(more);
-        }
-        for p in PATHS {
-            let (u, r) = (w.file(up, p), w.file(result, p));
-            let clash = u.path().is_some_and(|path| {
-                PATHS
+            loop {
+                let more: Vec<&str> = PATHS
                     .iter()
-                    .any(|q| *q != p && kept.contains(q) && w.file(result, q).path() == Some(path))
-            });
-            for x in r.records() {
-                let theirs = u.member(&x.line);
-                // excuse: R11.1 the name line of a file shown under its previous name
-                if clash && x.line == u.name.line {
-                    continue;
+                    .copied()
+                    .filter(|p| !kept.contains(p))
+                    .filter(|p| {
+                        w.file(up, p).path().is_some_and(|path| {
+                            kept.iter()
+                                .any(|q| q != p && w.file(result, q).path() == Some(path))
+                        })
+                    })
+                    .collect();
+                if more.is_empty() {
+                    break;
                 }
-                // excuse: R3d the fork keeps its own lines the upstream's queue has not decided
-                // excuse: R9.3 a prefix sync holds back the commits from the first to an open file
-                // excuse: R9.3 and with them any line whose decision a lock holds back, whoever wrote it
-                if theirs.is_none_or(|u| u.id != x.id)
-                    && decided(&x.id)
-                    && !held_back(&x.id)
-                    && !decision_held_back_by_lock(w, *t, upstream, up, result, &x.id)
+                kept.extend(more);
+            }
+            for p in PATHS {
+                let (u, r) = (w.file(up, p), w.file(result, p));
+                let clash = u.path().is_some_and(|path| {
+                    PATHS.iter().any(|q| {
+                        *q != p && kept.contains(q) && w.file(result, q).path() == Some(path)
+                    })
+                });
+                for x in r.records() {
+                    let theirs = u.member(&x.line);
+                    // excuse: R11.1 the name line of a file shown under its previous name
+                    if clash && x.line == u.name.line {
+                        continue;
+                    }
+                    // excuse: R3d the fork keeps its own lines the upstream's queue has not decided
+                    // excuse: R9.3 a prefix sync holds back the commits from the first to an open file
+                    // excuse: R9.3 and with them any line whose decision a lock holds back, whoever wrote it
+                    if theirs.is_none_or(|u| u.id != x.id)
+                        && decided(&x.id)
+                        && !held_back(&x.id)
+                        && !decision_held_back_by_lock(w, *t, upstream, up, result, &x.id)
+                    {
+                        return Err(format!(
+                            "a sync of {up:.7} into {t:?} left {p}[{}] at {}, which {upstream:?} already took, not its {theirs:?}",
+                            x.line, x.id
+                        ));
+                    }
+                }
+                // The fork's lines still undecided, for what a sync may hide.
+                let own_writer = w.forks[f].writer.as_str();
+                let undecided = |o: &Line| !decided(&o.id) || held_back(&o.id);
+                let ours = commit_parents(w.repo(), result)
+                    .first()
+                    .map(|c| w.file(c, p));
+                let in_front = |x: &Line, o: &Line| {
+                    ours.as_ref().is_some_and(|m| in_front_of(&u, m, &r, x, o))
+                };
+                let hidden = |x: &Line| {
+                    // excuse: R10.6 the upstream's unfinished last line in front of an undecided line
+                    let before_own = r10_6_hides(&u, ours.as_ref(), &r, x, undecided);
+                    // excuse: R10.9 the upstream's lines after an undecided unfinished line, which the fork never held or holds only as its own delete
+                    let after_own = x.live()
+                        && ours.as_ref().is_some_and(|m| {
+                            m.member(&x.line)
+                                .is_none_or(|o| !o.live() && writer_of(&o.id) == own_writer)
+                        })
+                        && r.live()
+                            .filter(|o| undecided(o))
+                            .any(|o| ends_open(o) && !in_front(x, o));
+                    before_own || after_own
+                };
+                if let Some(x) = u
+                    .records()
+                    .find(|x| r.member(&x.line).is_none() && !hidden(x))
                 {
                     return Err(format!(
-                        "a sync of {up:.7} into {t:?} left {p}[{}] at {}, which {upstream:?} already took, not its {theirs:?}",
-                        x.line, x.id
+                        "a sync of {up:.7} into {t:?} dropped line {} of {p}",
+                        x.line
                     ));
                 }
             }
-            // The fork's lines still undecided, for what a sync may hide.
-            let own_writer = w.forks[f].writer.as_str();
-            let undecided = |o: &Line| !decided(&o.id) || held_back(&o.id);
-            let ours = commit_parents(w.repo(), result)
-                .first()
-                .map(|c| w.file(c, p));
-            let in_front =
-                |x: &Line, o: &Line| ours.as_ref().is_some_and(|m| in_front_of(&u, m, &r, x, o));
-            let hidden = |x: &Line| {
-                // excuse: R10.6 the upstream's unfinished last line in front of an undecided line
-                let before_own = r10_6_hides(&u, ours.as_ref(), &r, x, undecided);
-                // excuse: R10.9 the upstream's lines after an undecided unfinished line, which the fork never held or holds only as its own delete
-                let after_own = x.live()
-                    && ours.as_ref().is_some_and(|m| {
-                        m.member(&x.line)
-                            .is_none_or(|o| !o.live() && writer_of(&o.id) == own_writer)
-                    })
-                    && r.live()
-                        .filter(|o| undecided(o))
-                        .any(|o| ends_open(o) && !in_front(x, o));
-                before_own || after_own
+        }
+        self.read.syncs = w.syncs.len();
+        Ok(())
+    }
+
+    /// Rule 5, as the program was told, whole (rule 3e): a committed
+    /// transaction's every staged edit is in the fork's commit that carries it
+    /// (or overwritten by a later edit of its own), and no collision names
+    /// that commit; a transaction that lost has none of its staged versions in
+    /// that commit, a collision in the fork that really collided, and its
+    /// every staged edit named in the answer (by its last staged version of
+    /// that line), with a collision in the fork naming it and the version
+    /// named as kept in the commit; the answer names every line the commit's collisions lost. A
+    /// rolled-back one's every staged token is discarded
+    /// (`discarded_leave_no_trace` holds that); an empty one staged nothing.
+    fn transactions_end_as_told(&mut self, w: &World) -> Result<(), String> {
+        for e in &w.ended[self.read.ended..] {
+            let fork = Tree::Fork(e.fork);
+            // Whether the transaction created `s`'s file (a new file) and its
+            // last staged version of the file's name line ended it: then the
+            // file changed nothing anyone sees (an atomic save's new file), so
+            // none of its staged versions is in the commit (`World::edits`).
+            // excuse: R11.2 a file a transaction created and ended changed nothing anyone sees
+            let created_and_ended = |s: &crate::world::Edit| {
+                let names = || {
+                    e.staged
+                        .iter()
+                        .filter(|x| x.path == s.path && x.line == s.path)
+                };
+                crate::content::UNBORN.contains(&s.path.as_str())
+                    && names().any(|x| !x.gone)
+                    && names().next_back().is_some_and(|x| x.gone)
             };
-            if let Some(x) = u
-                .records()
-                .find(|x| r.member(&x.line).is_none() && !hidden(x))
-            {
+            let ok = match (&e.how, &e.result) {
+                (TxnEnd::Commit(TxnOutcome::Committed), Some(r)) => {
+                    let none_lost = !w.collisions.iter().any(|c| c.result == *r);
+                    let staged = e.staged.iter().filter(|s| !created_and_ended(s)).all(|s| {
+                        w.file(r, &s.path)
+                            .member(&s.line)
+                            .is_some_and(|v| w.lineage.descends(&v.id, &s.token))
+                            && w.entered.iter().any(|(t, x)| {
+                                *t == fork
+                                    && x.path == s.path
+                                    && x.line == s.line
+                                    && w.lineage.descends(&x.token, &s.token)
+                            })
+                    });
+                    none_lost && staged
+                }
+                (TxnEnd::Commit(TxnOutcome::Lost { lines }), Some(r)) => {
+                    let mine: Vec<&Collision> =
+                        w.collisions.iter().filter(|c| c.result == *r).collect();
+                    let real = mine
+                        .iter()
+                        .any(|c| c.by != By::Whole && really_collided(w, c));
+                    let told = lines.iter().all(|o| {
+                        lost_in(w, &[fork], &o.path, &o.line, &o.staged) && holds(w, r, &o.kept)
+                    });
+                    let all_told = mine.iter().map(|c| c.lost.len()).sum::<usize>() == lines.len();
+                    let none_applied = e.staged.iter().all(|s| !w.file(r, &s.path).holds(&s.token));
+                    let named = e.staged.iter().filter(|s| !created_and_ended(s)).all(|s| {
+                        lines.iter().any(|o| {
+                            o.path == s.path
+                                && o.line == s.line
+                                && w.lineage.descends(&o.staged, &s.token)
+                        })
+                    });
+                    real && told && all_told && none_applied && named
+                }
+                (TxnEnd::Commit(TxnOutcome::Empty), None) => e.staged.is_empty(),
+                (TxnEnd::Rollback, None) => e.staged.iter().all(|s| w.discarded.contains(&s.token)),
+                _ => false,
+            };
+            if !ok {
                 return Err(format!(
-                    "a sync of {up:.7} into {t:?} dropped line {} of {p}",
-                    x.line
+                    "t{} on f{} ended {:?} but its staged edits {:?} are not where that says",
+                    e.txn, e.fork, e.how, e.staged
                 ));
             }
         }
+        self.read.ended = w.ended.len();
+        Ok(())
     }
-    w.syncs_checked = w.syncs.len();
-    Ok(())
-}
 
-/// Rule 5, as the program was told, whole (rule 3e): a committed
-/// transaction's every staged edit is in the fork's commit that carries it
-/// (or overwritten by a later edit of its own), and no collision names
-/// that commit; a transaction that lost has none of its staged versions in
-/// that commit, a collision in the fork that really collided, and its
-/// every staged edit named in the answer (by its last staged version of
-/// that line), with a collision in the fork naming it and the version
-/// named as kept in the commit; the answer names every line the commit's collisions lost. A
-/// rolled-back one's every staged token is discarded
-/// (`discarded_leave_no_trace` holds that); an empty one staged nothing.
-fn transactions_end_as_told(w: &mut World) -> Result<(), String> {
-    for e in &w.ended[w.ended_checked..] {
-        let fork = Tree::Fork(e.fork);
-        // Whether the transaction created `s`'s file (a new file) and its
-        // last staged version of the file's name line ended it: then the
-        // file changed nothing anyone sees (an atomic save's new file), so
-        // none of its staged versions is in the commit (`World::edits`).
-        // excuse: R11.2 a file a transaction created and ended changed nothing anyone sees
-        let created_and_ended = |s: &crate::world::Edit| {
-            let names = || {
-                e.staged
-                    .iter()
-                    .filter(|x| x.path == s.path && x.line == s.path)
-            };
-            crate::content::UNBORN.contains(&s.path.as_str())
-                && names().any(|x| !x.gone)
-                && names().next_back().is_some_and(|x| x.gone)
-        };
-        let ok = match (&e.how, &e.result) {
-            (TxnEnd::Commit(TxnOutcome::Committed), Some(r)) => {
-                let none_lost = !w.collisions.iter().any(|c| c.result == *r);
-                let staged = e.staged.iter().filter(|s| !created_and_ended(s)).all(|s| {
-                    w.file(r, &s.path)
-                        .member(&s.line)
-                        .is_some_and(|v| w.lineage.descends(&v.id, &s.token))
-                        && w.entered.iter().any(|(t, x)| {
-                            *t == fork
-                                && x.path == s.path
-                                && x.line == s.line
-                                && w.lineage.descends(&x.token, &s.token)
-                        })
-                });
-                none_lost && staged
-            }
-            (TxnEnd::Commit(TxnOutcome::Lost { lines }), Some(r)) => {
-                let mine: Vec<&Collision> =
-                    w.collisions.iter().filter(|c| c.result == *r).collect();
-                let real = mine
-                    .iter()
-                    .any(|c| c.by != By::Whole && really_collided(w, c));
-                let told = lines.iter().all(|o| {
-                    lost_in(w, &[fork], &o.path, &o.line, &o.staged) && holds(w, r, &o.kept)
-                });
-                let all_told = mine.iter().map(|c| c.lost.len()).sum::<usize>() == lines.len();
-                let none_applied = e.staged.iter().all(|s| !w.file(r, &s.path).holds(&s.token));
-                let named = e.staged.iter().filter(|s| !created_and_ended(s)).all(|s| {
-                    lines.iter().any(|o| {
-                        o.path == s.path
-                            && o.line == s.line
-                            && w.lineage.descends(&o.staged, &s.token)
-                    })
-                });
-                real && told && all_told && none_applied && named
-            }
-            (TxnEnd::Commit(TxnOutcome::Empty), None) => e.staged.is_empty(),
-            (TxnEnd::Rollback, None) => e.staged.iter().all(|s| w.discarded.contains(&s.token)),
-            _ => false,
-        };
-        if !ok {
-            return Err(format!(
-                "t{} on f{} ended {:?} but its staged edits {:?} are not where that says",
-                e.txn, e.fork, e.how, e.staged
-            ));
-        }
-    }
-    w.ended_checked = w.ended.len();
-    Ok(())
-}
-
-/// R5.3, read from git: while a transaction is open, no save reaches its
-/// fork's tree on a file the transaction had saved at the last check. Other
-/// I/O on such a file is deferred. A sync or a landing is not I/O of a client:
-/// it moves the tree with a commit whose cause is not `Direct`, or one made
-/// in another tree.
-fn transactions_undisturbed(w: &mut World) -> Result<(), String> {
-    let mut seen = BTreeMap::new();
-    for f in w.forks.values().filter(|f| f.txn.is_some()) {
-        let txn = f.txn.as_ref().expect("open");
-        let (tree, head) = (World::name(Tree::Fork(f.id)), f.head.clone());
-        if let Some((at, files)) = w.txn_files_seen.get(&txn.id) {
-            let files: &BTreeSet<String> = files;
-            let mut c = head.clone();
-            while !w.is_ancestor(&c, at) {
-                let direct = w.trailer(&c, "Agentfs-Cause") == "Direct"
-                    && w.trailer(&c, "Agentfs-Tree") == tree;
-                if direct && let Some(p) = change_files(w, &c).intersection(files).next() {
-                    return Err(format!(
-                        "{c:.7} saved {p} in fork {} while transaction t{} had it open: R5.3 defers that",
-                        f.id, txn.id
-                    ));
+    /// R5.3, read from git: while a transaction is open, no save reaches its
+    /// fork's tree on a file the transaction had saved at the last check. Other
+    /// I/O on such a file is deferred. A sync or a landing is not I/O of a client:
+    /// it moves the tree with a commit whose cause is not `Direct`, or one made
+    /// in another tree.
+    fn transactions_undisturbed(&mut self, w: &World) -> Result<(), String> {
+        let mut seen = BTreeMap::new();
+        for f in w.forks.values().filter(|f| f.txn.is_some()) {
+            let txn = f.txn.as_ref().expect("open");
+            let (tree, head) = (World::name(Tree::Fork(f.id)), f.head.clone());
+            if let Some((at, files)) = self.txn_files_seen.get(&txn.id) {
+                let files: &BTreeSet<String> = files;
+                let mut c = head.clone();
+                while !w.is_ancestor(&c, at) {
+                    let direct = w.trailer(&c, "Agentfs-Cause") == "Direct"
+                        && w.trailer(&c, "Agentfs-Tree") == tree;
+                    if direct && let Some(p) = change_files(w, &c).intersection(files).next() {
+                        return Err(format!(
+                            "{c:.7} saved {p} in fork {} while transaction t{} had it open: R5.3 defers that",
+                            f.id, txn.id
+                        ));
+                    }
+                    c = git(w.repo(), &["rev-parse", &format!("{c}^1")]);
                 }
-                c = git(w.repo(), &["rev-parse", &format!("{c}^1")]);
             }
+            seen.insert(txn.id, (head, diff_files(w, &txn.start, &txn.head)));
         }
-        seen.insert(txn.id, (head, diff_files(w, &txn.start, &txn.head)));
+        self.txn_files_seen = seen;
+        Ok(())
     }
-    w.txn_files_seen = seen;
-    Ok(())
-}
 
-/// Rule 6: every commit names exactly one writer; a non-merge commit's
-/// change (the records its diff from its parent adds) is that writer's
-/// alone, and rule 8's `O_APPEND` in every save ([`appends_exact`]); a merge originates nothing: every
-/// record it adds over its first parent is in one of its parents, and it
-/// names the writer of its second parent (a landing or a transaction's
-/// commit), or `agentfs` if it is a sync. So every version traces through
-/// ancestry to the one non-merge commit that wrote it, which names its
-/// writer. Each commit is checked once: commits never change.
-fn one_writer(w: &mut World, all: &[String]) -> Result<(), String> {
-    let new: Vec<String> = all
-        .iter()
-        .filter(|c| !w.checked_commits.contains(*c))
-        .cloned()
-        .collect();
-    if new.is_empty() {
-        return Ok(());
-    }
-    let mut args = vec![
+    /// Rule 6: every commit names exactly one writer; a non-merge commit's
+    /// change (the records its diff from its parent adds) is that writer's
+    /// alone, and rule 8's `O_APPEND` in every save ([`appends_exact`]); a merge originates nothing: every
+    /// record it adds over its first parent is in one of its parents, and it
+    /// names the writer of its second parent (a landing or a transaction's
+    /// commit), or `agentfs` if it is a sync. So every version traces through
+    /// ancestry to the one non-merge commit that wrote it, which names its
+    /// writer. Each commit is checked once: commits never change.
+    fn one_writer(&mut self, w: &World, all: &[String]) -> Result<(), String> {
+        let new: Vec<String> = all
+            .iter()
+            .filter(|c| !self.checked_commits.contains(*c))
+            .cloned()
+            .collect();
+        if new.is_empty() {
+            return Ok(());
+        }
+        let mut args = vec![
         "log".to_string(),
         "--no-walk=unsorted".into(),
         "--diff-merges=first-parent".into(),
         "-p".into(),
         "--format=%x01%H%x1f%P%x1f%(trailers:key=Agentfs-Writer,valueonly,separator=%x1e)%x1f%(trailers:key=Agentfs-Cause,valueonly)%x1f%(trailers:key=Agentfs-Open,valueonly,separator=%x1e)%x02".into(),
     ];
-    args.extend(new.iter().cloned());
-    let args: Vec<&str> = args.iter().map(String::as_str).collect();
-    let log = git(w.repo(), &args);
-    for block in log.split('\x01').skip(1) {
-        let (header, diff) = block.split_once('\x02').unwrap_or((block, ""));
-        let fields: Vec<&str> = header.split('\x1f').collect();
-        let [commit, parents, writers, cause, opens] = fields[..] else {
-            return Err(format!("unparsable log header {header:?}"));
-        };
-        // git-model.md §3: a save from an open names that open, once; no
-        // open is saved twice (a crash's replay of the journal included).
-        let opens: Vec<&str> = opens
-            .split('\x1e')
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .collect();
-        if w.save_calls.contains_key(commit) != (opens.len() == 1) || opens.len() > 1 {
-            return Err(format!("{commit} names opens {opens:?}"));
-        }
-        for o in opens {
-            if let Some(c) = w.opens_saved.insert(o.to_string(), commit.to_string()) {
-                return Err(format!("open {o} saved twice: {c:.7} and {commit:.7}"));
-            }
-        }
-        let parents: Vec<&str> = parents.split_whitespace().collect();
-        let writers: Vec<&str> = writers.split('\x1e').filter(|s| !s.is_empty()).collect();
-        if writers.len() != 1 {
-            return Err(format!("{commit} names writers {writers:?}"));
-        }
-        if parents.len() > 1 {
-            let expect = match cause.trim() {
-                "Sync" => "agentfs".to_string(),
-                _ => w.writer_of_commit(parents[1]),
+        args.extend(new.iter().cloned());
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let log = git(w.repo(), &args);
+        for block in log.split('\x01').skip(1) {
+            let (header, diff) = block.split_once('\x02').unwrap_or((block, ""));
+            let fields: Vec<&str> = header.split('\x1f').collect();
+            let [commit, parents, writers, cause, opens] = fields[..] else {
+                return Err(format!("unparsable log header {header:?}"));
             };
-            if writers[0] != expect {
-                return Err(format!(
-                    "{commit} ({}) names {} but its second parent's writer is {expect}",
-                    cause.trim(),
-                    writers[0]
-                ));
+            // git-model.md §3: a save from an open names that open, once; no
+            // open is saved twice (a crash's replay of the journal included).
+            let opens: Vec<&str> = opens
+                .split('\x1e')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .collect();
+            if w.save_calls.contains_key(commit) != (opens.len() == 1) || opens.len() > 1 {
+                return Err(format!("{commit} names opens {opens:?}"));
             }
-        }
-        let added = added(diff);
-        for (_, rec) in &added {
-            if let State::Replaced(by) = &rec.state {
-                let v = w.file(commit, by).name.id;
-                w.rename_overs
-                    .entry(rec.id.clone())
-                    .or_insert((by.clone(), v));
+            for o in opens {
+                if let Some(c) = self.opens_saved.insert(o.to_string(), commit.to_string()) {
+                    return Err(format!("open {o} saved twice: {c:.7} and {commit:.7}"));
+                }
             }
-        }
-        if cause.trim() == "Direct" && parents.len() == 1 {
-            let paths: BTreeSet<&String> = added.iter().map(|(p, _)| p).collect();
-            for path in paths {
-                let (base, now) = (w.file(parents[0], path), w.file(commit, path));
-                save_aligned(&base, &now).map_err(|e| format!("{commit}: save of {path}: {e}"))?;
-                if let Some(calls) = w.save_calls.get(commit) {
-                    appends_exact(&base, &now, calls)
+            let parents: Vec<&str> = parents.split_whitespace().collect();
+            let writers: Vec<&str> = writers.split('\x1e').filter(|s| !s.is_empty()).collect();
+            if writers.len() != 1 {
+                return Err(format!("{commit} names writers {writers:?}"));
+            }
+            if parents.len() > 1 {
+                let expect = match cause.trim() {
+                    "Sync" => "agentfs".to_string(),
+                    _ => w.writer_of_commit(parents[1]),
+                };
+                if writers[0] != expect {
+                    return Err(format!(
+                        "{commit} ({}) names {} but its second parent's writer is {expect}",
+                        cause.trim(),
+                        writers[0]
+                    ));
+                }
+            }
+            let added = added(diff);
+            for (_, rec) in &added {
+                if let State::Replaced(by) = &rec.state {
+                    let v = w.file(commit, by).name.id;
+                    self.rename_overs
+                        .entry(rec.id.clone())
+                        .or_insert((by.clone(), v));
+                }
+            }
+            if cause.trim() == "Direct" && parents.len() == 1 {
+                let paths: BTreeSet<&String> = added.iter().map(|(p, _)| p).collect();
+                for path in paths {
+                    let (base, now) = (w.file(parents[0], path), w.file(commit, path));
+                    save_aligned(&base, &now)
                         .map_err(|e| format!("{commit}: save of {path}: {e}"))?;
+                    if let Some(calls) = w.save_calls.get(commit) {
+                        appends_exact(&base, &now, calls)
+                            .map_err(|e| format!("{commit}: save of {path}: {e}"))?;
+                    }
+                }
+            }
+            for (path, rec) in added {
+                // git's diff may show a record it kept, but whose neighbours
+                // moved, as removed and added: only a record no parent holds
+                // is new.
+                let first = w.file(parents.first().copied().unwrap_or(commit), &path);
+                if !parents.is_empty() && first.records().any(|l| *l == rec) {
+                    continue;
+                }
+                let bad = match parents.len() {
+                    0 => false,
+                    1 => writer_of(&rec.id) != writers[0],
+                    _ => !parents
+                        .iter()
+                        .any(|p| w.file(p, &path).records().any(|l| *l == rec)),
+                };
+                if bad {
+                    return Err(format!(
+                        "{commit} ({}, parents {}) names {} but adds {} in {path}",
+                        cause.trim(),
+                        parents.len(),
+                        writers[0],
+                        rec.id
+                    ));
                 }
             }
         }
-        for (path, rec) in added {
-            // git's diff may show a record it kept, but whose neighbours
-            // moved, as removed and added: only a record no parent holds
-            // is new.
-            let first = w.file(parents.first().copied().unwrap_or(commit), &path);
-            if !parents.is_empty() && first.records().any(|l| *l == rec) {
-                continue;
-            }
-            let bad = match parents.len() {
-                0 => false,
-                1 => writer_of(&rec.id) != writers[0],
-                _ => !parents
-                    .iter()
-                    .any(|p| w.file(p, &path).records().any(|l| *l == rec)),
-            };
-            if bad {
-                return Err(format!(
-                    "{commit} ({}, parents {}) names {} but adds {} in {path}",
-                    cause.trim(),
-                    parents.len(),
-                    writers[0],
-                    rec.id
-                ));
-            }
-        }
+        self.checked_commits.extend(new);
+        Ok(())
     }
-    w.checked_commits.extend(new);
-    Ok(())
-}
 
-/// Rule 11: a rename-over is one call, so it applies whole or not at all.
-/// In every live tree, a file unlinked by a rename-over has the renamed
-/// file at that save's name version or a later one: never the unlink
-/// without the rename. (The rename without the unlink would leave two
-/// files at one path, which the model refuses outright.) One exception, a
-/// cost: a fork that holds a name version of the renamed file other than
-/// its upstream's (it has not synced since the upstream's queue decided it), or
-/// a fork's version main has not taken (a sync kept it as undecided, in
-/// this fork or a tree above it that this fork synced from); main has no
-/// such exception. A delete of the renamed file that agrees with one written
-/// over the rename is not half a rename-over (R10.3, [`deleted_over`]).
-fn rename_overs_whole(w: &World) -> Result<(), String> {
-    for (t, files) in &w.views {
-        for (x, c) in files {
-            let Some((by, v)) = w.rename_overs.get(&c.name.id) else {
-                continue;
-            };
-            let n = &files[by].name;
-            // excuse: R10.3 a delete agreeing with one written over the rename is not half of it
-            if !n.live() && deleted_over(w, *t, by, by, v) {
-                continue;
-            }
-            // excuse: R3a a fork keeps its own undecided name version until the upstream decides
-            let undecided = match t {
-                Tree::Fork(f) => {
-                    w.file(&w.head(w.forks[f].upstream), by).name.id != n.id
-                        || (writer_of(&n.id).starts_with('c')
-                            && w.file(&w.main_head, by).name.id != n.id)
+    /// Rule 11: a rename-over is one call, so it applies whole or not at all.
+    /// In every live tree, a file unlinked by a rename-over has the renamed
+    /// file at that save's name version or a later one: never the unlink
+    /// without the rename. (The rename without the unlink would leave two
+    /// files at one path, which the model refuses outright.) One exception, a
+    /// cost: a fork that holds a name version of the renamed file other than
+    /// its upstream's (it has not synced since the upstream's queue decided it), or
+    /// a fork's version main has not taken (a sync kept it as undecided, in
+    /// this fork or a tree above it that this fork synced from); main has no
+    /// such exception. A delete of the renamed file that agrees with one written
+    /// over the rename is not half a rename-over (R10.3, [`deleted_over`]).
+    fn rename_overs_whole(&self, w: &World) -> Result<(), String> {
+        for (t, files) in &self.views {
+            for (x, c) in files {
+                let Some((by, v)) = self.rename_overs.get(&c.name.id) else {
+                    continue;
+                };
+                let n = &files[by].name;
+                // excuse: R10.3 a delete agreeing with one written over the rename is not half of it
+                if !n.live() && deleted_over(w, *t, by, by, v) {
+                    continue;
                 }
-                Tree::Main => false,
-            };
-            if !undecided && !w.lineage.descends(&n.id, v) {
-                return Err(format!(
-                    "{t:?}: {x} was unlinked by renaming {by} over it, but {by}'s name is {}, \
+                // excuse: R3a a fork keeps its own undecided name version until the upstream decides
+                let undecided = match t {
+                    Tree::Fork(f) => {
+                        w.file(&w.head(w.forks[f].upstream), by).name.id != n.id
+                            || (writer_of(&n.id).starts_with('c')
+                                && w.file(&w.main_head, by).name.id != n.id)
+                    }
+                    Tree::Main => false,
+                };
+                if !undecided && !w.lineage.descends(&n.id, v) {
+                    return Err(format!(
+                        "{t:?}: {x} was unlinked by renaming {by} over it, but {by}'s name is {}, \
                      not that rename's {v} or later",
-                    n.id
-                ));
+                        n.id
+                    ));
+                }
             }
         }
+        Ok(())
     }
-    Ok(())
 }
 
 /// Rule 10, read from the two blobs alone, not from the replay that wrote
@@ -1609,205 +1724,207 @@ fn added(diff: &str) -> Vec<(String, Line)> {
     out
 }
 
-/// A rolled-back transaction leaves no line in any tree, and no commit
-/// reachable from any ref. A program that read its staged lines and writes
-/// their bytes back after the rollback makes new lines, its own write
-/// (rule 8). Each commit is grepped once,
-/// until a new discard adds tokens.
-fn discarded_leave_no_trace(w: &mut World, all: &[String]) -> Result<(), String> {
-    if w.discarded.is_empty() {
-        return Ok(());
-    }
-    for t in w.live_trees() {
-        for p in PATHS {
-            let f = w.file(&w.head(t), p);
-            if let Some(l) = f.records().find(|l| w.discarded.contains(&l.id)) {
-                return Err(format!("discarded {} shows in {t:?}:{p}", l.id));
+impl Checker {
+    /// A rolled-back transaction leaves no line in any tree, and no commit
+    /// reachable from any ref. A program that read its staged lines and writes
+    /// their bytes back after the rollback makes new lines, its own write
+    /// (rule 8). Each commit is grepped once,
+    /// until a new discard adds tokens.
+    fn discarded_leave_no_trace(&mut self, w: &World, all: &[String]) -> Result<(), String> {
+        if w.discarded.is_empty() {
+            return Ok(());
+        }
+        for t in w.live_trees() {
+            for p in PATHS {
+                let f = w.file(&w.head(t), p);
+                if let Some(l) = f.records().find(|l| w.discarded.contains(&l.id)) {
+                    return Err(format!("discarded {} shows in {t:?}:{p}", l.id));
+                }
             }
         }
-    }
-    if w.grepped.0 != w.discarded.len() {
-        w.grepped = (w.discarded.len(), Default::default());
-    }
-    let new: Vec<String> = all
-        .iter()
-        .filter(|c| !w.grepped.1.contains(*c))
-        .cloned()
-        .collect();
-    if new.is_empty() {
-        return Ok(());
-    }
-    // Versions, by id: a later rewrite's new line may hold a discarded
-    // line's bytes, a new write by its program with its own id.
-    let mut args: Vec<String> = vec!["grep".into(), "-l".into(), "-E".into()];
-    for t in &w.discarded {
-        args.extend(["-e".into(), format!("^{}\t", t.replace('.', "\\."))]);
-    }
-    args.extend(new.iter().cloned());
-    let args: Vec<&str> = args.iter().map(String::as_str).collect();
-    let out = try_git(w.repo(), &args, None);
-    match out.code {
-        1 => {
-            w.grepped.1.extend(new);
-            Ok(())
+        if self.grepped.0 != w.discarded.len() {
+            self.grepped = (w.discarded.len(), Default::default());
         }
-        0 => Err(format!(
-            "discarded content reachable in history:\n{}",
-            out.stdout
-        )),
-        _ => Err(format!("git grep failed: {}", out.stderr)),
-    }
-}
-
-/// Rule 7: a tree's history reaches every change it took, won or lost. Read
-/// by ancestry alone (`git rev-list <head>`, never a `from..to` range, whose
-/// walk stops early by commit date).
-fn full_lineage(w: &mut World) -> Result<(), String> {
-    let repo = w.repo().to_path_buf();
-    let landed: Vec<(Tree, String)> = w
-        .landings
-        .iter()
-        .filter(|l| l.direction == Direction::Landing && w.alive(l.tree))
-        .map(|l| (l.tree, l.change.clone()))
-        .collect();
-    for (t, c) in &landed {
-        let head = w.head(*t);
-        let history = w
-            .reach
-            .entry(head.clone())
-            .or_insert_with(|| reach(&repo, &head));
-        if !history.contains(c) {
-            return Err(format!("{t:?}'s history lost landed {c}"));
+        let new: Vec<String> = all
+            .iter()
+            .filter(|c| !self.grepped.1.contains(*c))
+            .cloned()
+            .collect();
+        if new.is_empty() {
+            return Ok(());
+        }
+        // Versions, by id: a later rewrite's new line may hold a discarded
+        // line's bytes, a new write by its program with its own id.
+        let mut args: Vec<String> = vec!["grep".into(), "-l".into(), "-E".into()];
+        for t in &w.discarded {
+            args.extend(["-e".into(), format!("^{}\t", t.replace('.', "\\."))]);
+        }
+        args.extend(new.iter().cloned());
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let out = try_git(w.repo(), &args, None);
+        match out.code {
+            1 => {
+                self.grepped.1.extend(new);
+                Ok(())
+            }
+            0 => Err(format!(
+                "discarded content reachable in history:\n{}",
+                out.stdout
+            )),
+            _ => Err(format!("git grep failed: {}", out.stderr)),
         }
     }
-    Ok(())
-}
 
-/// Rules 10 and 11 in every take (a landing or a transaction's commit),
-/// read from git: the take's head before, its result, and each change's
-/// own file. Rule 10's placement: a new line a winning change added
-/// (an identity its base lacks) that the take placed is put after the
-/// nearest line before it in the change's file that the result holds,
-/// past only lines the change never saw (an upstream's concurrent new lines:
-/// of two inserts at one place the upstream's comes first), and no line the
-/// upstream added that the change never saw directly follows it. Rule 11: a
-/// change that edits a file the tree had unlinked before the take (and does
-/// not unlink it too, nor create it: an unborn file) loses, by a file rule. Counts each in the world, so
-/// a run can show it met them.
-fn placed_and_unlinked(w: &mut World) -> Result<(), String> {
-    let mut met = (0, 0);
-    for l in &w.landings[w.placements_checked..] {
-        let (u, base) = (&l.change, &l.base);
-        // R10.4, read from git: a landing leaves no line after the upstream's
-        // unfinished last line.
-        if l.direction == Direction::Landing {
+    /// Rule 7: a tree's history reaches every change it took, won or lost. Read
+    /// by ancestry alone (`git rev-list <head>`, never a `from..to` range, whose
+    /// walk stops early by commit date).
+    fn full_lineage(&mut self, w: &World) -> Result<(), String> {
+        let repo = w.repo().to_path_buf();
+        let landed: Vec<(Tree, String)> = w
+            .landings
+            .iter()
+            .filter(|l| l.direction == Direction::Landing && w.alive(l.tree))
+            .map(|l| (l.tree, l.change.clone()))
+            .collect();
+        for (t, c) in &landed {
+            let head = w.head(*t);
+            let history = self
+                .reach
+                .entry(head.clone())
+                .or_insert_with(|| reach(&repo, &head));
+            if !history.contains(c) {
+                return Err(format!("{t:?}'s history lost landed {c}"));
+            }
+        }
+        Ok(())
+    }
+
+    /// Rules 10 and 11 in every take (a landing or a transaction's commit),
+    /// read from git: the take's head before, its result, and each change's
+    /// own file. Rule 10's placement: a new line a winning change added
+    /// (an identity its base lacks) that the take placed is put after the
+    /// nearest line before it in the change's file that the result holds,
+    /// past only lines the change never saw (an upstream's concurrent new lines:
+    /// of two inserts at one place the upstream's comes first), and no line the
+    /// upstream added that the change never saw directly follows it. Rule 11: a
+    /// change that edits a file the tree had unlinked before the take (and does
+    /// not unlink it too, nor create it: an unborn file) loses, by a file rule. Counts each ([`Met`]), so
+    /// a run can show it met them.
+    fn placed_and_unlinked(&mut self, w: &World) -> Result<(), String> {
+        let mut met = (0, 0);
+        for l in &w.landings[self.read.placements..] {
+            let (u, base) = (&l.change, &l.base);
+            // R10.4, read from git: a landing leaves no line after the upstream's
+            // unfinished last line.
+            if l.direction == Direction::Landing {
+                for p in PATHS {
+                    let b = w.file(&l.before, p);
+                    let Some(q) = b
+                        .live()
+                        .last()
+                        .filter(|x| x.text().is_some_and(|t| !t.ends_with('\n')))
+                    else {
+                        continue;
+                    };
+                    if let Some(x) = w
+                        .file(&l.result, p)
+                        .live()
+                        .skip_while(|x| x.id != q.id)
+                        .nth(1)
+                    {
+                        return Err(format!(
+                            "{u:.7}'s line {} in {p} comes after the upstream's unfinished last line {}",
+                            x.id, q.id
+                        ));
+                    }
+                }
+            }
             for p in PATHS {
                 let b = w.file(&l.before, p);
-                let Some(q) = b
-                    .live()
-                    .last()
-                    .filter(|x| x.text().is_some_and(|t| !t.ends_with('\n')))
-                else {
+                let edits: Vec<_> = w
+                    .edits(base, u)
+                    .into_iter()
+                    .filter(|e| e.path == p)
+                    .collect();
+                if edits.is_empty() {
                     continue;
-                };
-                if let Some(x) = w
-                    .file(&l.result, p)
-                    .live()
-                    .skip_while(|x| x.id != q.id)
-                    .nth(1)
-                {
-                    return Err(format!(
-                        "{u:.7}'s line {} in {p} comes after the upstream's unfinished last line {}",
-                        x.id, q.id
-                    ));
                 }
-            }
-        }
-        for p in PATHS {
-            let b = w.file(&l.before, p);
-            let edits: Vec<_> = w
-                .edits(base, u)
-                .into_iter()
-                .filter(|e| e.path == p)
-                .collect();
-            if edits.is_empty() {
-                continue;
-            }
-            let unlinks = edits.iter().any(|e| e.line == b.name.line && e.gone);
-            // A create: its name version written over the tree's deleted
-            // one (read from the change's line map), which only a new
-            // file's create can be.
-            let name = w.file(u, p).name;
-            let creates = edits.iter().any(|e| e.line == b.name.line && !e.gone)
-                && name.over.as_deref() == Some(b.name.id.as_str());
-            let applies = edits.iter().any(|e| {
-                b.member(&e.line)
-                    .is_none_or(|v| v.id != e.token && !w.lineage.descends(&v.id, &e.token))
-            });
-            // excuse: R11 a change that unlinks the file too, or creates it, is no edit of an unlinked file
-            if !b.name.live() && !unlinks && !creates && applies {
-                met.1 += 1;
-                let lost = w.collisions.iter().any(|c| {
-                    c.tree == l.tree
-                        && c.result == l.result
-                        && c.loser == *u
-                        && c.path == p
-                        && c.by == By::File
+                let unlinks = edits.iter().any(|e| e.line == b.name.line && e.gone);
+                // A create: its name version written over the tree's deleted
+                // one (read from the change's line map), which only a new
+                // file's create can be.
+                let name = w.file(u, p).name;
+                let creates = edits.iter().any(|e| e.line == b.name.line && !e.gone)
+                    && name.over.as_deref() == Some(b.name.id.as_str());
+                let applies = edits.iter().any(|e| {
+                    b.member(&e.line)
+                        .is_none_or(|v| v.id != e.token && !w.lineage.descends(&v.id, &e.token))
                 });
-                if !lost {
-                    return Err(format!(
-                        "{u:.7} edits {p}, which {:?} had unlinked, and did not lose by a file rule",
-                        l.tree
-                    ));
+                // excuse: R11 a change that unlinks the file too, or creates it, is no edit of an unlinked file
+                if !b.name.live() && !unlinks && !creates && applies {
+                    met.1 += 1;
+                    let lost = w.collisions.iter().any(|c| {
+                        c.tree == l.tree
+                            && c.result == l.result
+                            && c.loser == *u
+                            && c.path == p
+                            && c.by == By::File
+                    });
+                    if !lost {
+                        return Err(format!(
+                            "{u:.7} edits {p}, which {:?} had unlinked, and did not lose by a file rule",
+                            l.tree
+                        ));
+                    }
                 }
-            }
-            if !l.won {
-                continue;
-            }
-            let (src, r, mine) = (w.file(u, p), w.file(&l.result, p), w.file(base, p));
-            let saw = |line: &str| src.lines.iter().any(|x| x.line == line);
-            for (k, n) in src.lines.iter().enumerate() {
-                if mine.member(&n.line).is_some() || b.member(&n.line).is_some() {
+                if !l.won {
                     continue;
                 }
-                let Some(i) = r.lines.iter().position(|x| x.line == n.line) else {
-                    continue;
-                };
-                let anchor = src.lines[..k]
-                    .iter()
-                    .rev()
-                    .find(|x| r.lines.iter().any(|y| y.line == x.line))
-                    .map(|x| x.line.as_str());
-                let mut j = i;
-                while j > 0 && !saw(&r.lines[j - 1].line) {
-                    j -= 1;
-                }
-                let prev = j.checked_sub(1).map(|j| r.lines[j].line.as_str());
-                if prev != anchor {
-                    return Err(format!(
-                        "{u:.7}'s new line {} in {p} is placed after {prev:?}, not after {anchor:?}",
-                        n.id
-                    ));
-                }
-                if let Some(x) = r.lines.get(i + 1)
-                    && b.member(&x.line).is_some()
-                    && !saw(&x.line)
-                {
-                    return Err(format!(
-                        "{u:.7}'s new line {} in {p} comes before the upstream's {} at its place",
-                        n.id, x.id
-                    ));
-                }
-                if j < i && r.lines[j..i].iter().any(|x| b.member(&x.line).is_some()) {
-                    met.0 += 1;
+                let (src, r, mine) = (w.file(u, p), w.file(&l.result, p), w.file(base, p));
+                let saw = |line: &str| src.lines.iter().any(|x| x.line == line);
+                for (k, n) in src.lines.iter().enumerate() {
+                    if mine.member(&n.line).is_some() || b.member(&n.line).is_some() {
+                        continue;
+                    }
+                    let Some(i) = r.lines.iter().position(|x| x.line == n.line) else {
+                        continue;
+                    };
+                    let anchor = src.lines[..k]
+                        .iter()
+                        .rev()
+                        .find(|x| r.lines.iter().any(|y| y.line == x.line))
+                        .map(|x| x.line.as_str());
+                    let mut j = i;
+                    while j > 0 && !saw(&r.lines[j - 1].line) {
+                        j -= 1;
+                    }
+                    let prev = j.checked_sub(1).map(|j| r.lines[j].line.as_str());
+                    if prev != anchor {
+                        return Err(format!(
+                            "{u:.7}'s new line {} in {p} is placed after {prev:?}, not after {anchor:?}",
+                            n.id
+                        ));
+                    }
+                    if let Some(x) = r.lines.get(i + 1)
+                        && b.member(&x.line).is_some()
+                        && !saw(&x.line)
+                    {
+                        return Err(format!(
+                            "{u:.7}'s new line {} in {p} comes before the upstream's {} at its place",
+                            n.id, x.id
+                        ));
+                    }
+                    if j < i && r.lines[j..i].iter().any(|x| b.member(&x.line).is_some()) {
+                        met.0 += 1;
+                    }
                 }
             }
         }
+        self.read.placements = w.landings.len();
+        self.met.inserts += met.0;
+        self.met.unlinked_edits += met.1;
+        Ok(())
     }
-    w.placements_checked = w.landings.len();
-    w.inserts_met += met.0;
-    w.unlinked_edits += met.1;
-    Ok(())
 }
 
 /// Every commit `head` reaches.
