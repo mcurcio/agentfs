@@ -150,10 +150,7 @@ impl Checker {
         named("transactions_end_as_told", self.transactions_end_as_told(w))?;
         named("transactions_undisturbed", self.transactions_undisturbed(w))?;
         let discards = self.grepped.0 != w.discarded.len();
-        let refs = git(
-            w.repo(),
-            &["for-each-ref", "--format=%(objectname) %(refname)"],
-        );
+        let refs = lineage::refs(w.repo());
         if self.refs_seen.as_ref() != Some(&refs) || discards {
             let all = w.all_commits();
             named("one_writer", self.one_writer(w, &all))?;
