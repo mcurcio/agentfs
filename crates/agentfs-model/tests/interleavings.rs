@@ -461,7 +461,7 @@ impl Oracle {
             let open = x.kind == Kind::Write && self.held.contains_key(&x.id);
             if !open && !deferred {
                 return Err(format!(
-                    "h{} ({:?} of {}) did not return: a call waits",
+                    "oracle_no_call_waits: h{} ({:?} of {}) did not return: a call waits",
                     x.id, x.kind, x.file
                 ));
             }
@@ -479,7 +479,7 @@ impl Oracle {
                 let got = w.file(&head, p).bytes();
                 if got.as_bytes() != &b[..] {
                     return Err(format!(
-                        "bytes: {t:?}:{p} holds {got:?}, the oracle {:?}",
+                        "oracle_bytes: {t:?}:{p} holds {got:?}, the oracle {:?}",
                         String::from_utf8_lossy(b)
                     ));
                 }
@@ -605,7 +605,7 @@ fn take(w: &mut World, o: &mut Oracle, s: &Step, tally: &mut Tally) -> Result<()
                     && change_files(w, commit).is_disjoint(&open_before)
                 {
                     return Err(format!(
-                        "{s:?}: entry {} waits, but none of its own change's files is open (open: {open_before:?})",
+                        "oracle_p1: {s:?}: entry {} waits, but none of its own change's files is open (open: {open_before:?})",
                         numbered[i].0
                     ));
                 }
@@ -613,10 +613,12 @@ fn take(w: &mut World, o: &mut Oracle, s: &Step, tally: &mut Tally) -> Result<()
             return if after == before && w.waits().contains_key(t) {
                 Ok(())
             } else {
-                Err(format!("{s:?} took nothing but does not wait"))
+                Err(format!("oracle_p1: {s:?} took nothing but does not wait"))
             };
         }
-        let i = first.ok_or(format!("{s:?} took {taken} entries, none free to go"))?;
+        let i = first.ok_or(format!(
+            "oracle_p1: {s:?} took {taken} entries, none free to go"
+        ))?;
         tally.overtakes += usize::from(i > 0);
         let rest: Vec<_> = before[..i]
             .iter()
@@ -625,7 +627,7 @@ fn take(w: &mut World, o: &mut Oracle, s: &Step, tally: &mut Tally) -> Result<()
             .collect();
         if taken != 1 || after != rest {
             return Err(format!(
-                "{s:?} took {taken} entries: not the first P1 lets go (entry {i}), or the rest out of order"
+                "oracle_p1: {s:?} took {taken} entries: not the first P1 lets go (entry {i}), or the rest out of order"
             ));
         }
     }
@@ -647,7 +649,7 @@ fn close_checked(
     if let Some(f) = o.close_defers(w, h) {
         w.close(h);
         if w.forks[&f].deferred.back() != Some(&h) {
-            return Err(format!("R5.3: close h{h} did not defer"));
+            return Err(format!("oracle_deferred: R5.3: close h{h} did not defer"));
         }
         o.deferred.entry(f).or_default().push(Deferred::Close(h));
         tally.deferred_closes += 1;
@@ -656,7 +658,7 @@ fn close_checked(
     let expect = o.closing(w, h);
     w.close(h);
     if expect.is_some() && head_of(w, t) != head {
-        return Err(format!("close h{h}: an orphan saved"));
+        return Err(format!("oracle_orphans: close h{h}: an orphan saved"));
     }
     dropped(w, n, expect.into_iter().collect())?;
     gitledger::observe(w)?;
@@ -672,7 +674,7 @@ fn dropped(w: &World, n: usize, expect: Vec<Dropped>) -> Result<(), String> {
         .collect();
     if got != expect {
         return Err(format!(
-            "orphans: the model raised {got:?}, the oracle expects {expect:?}"
+            "oracle_orphans: the model raised {got:?}, the oracle expects {expect:?}"
         ));
     }
     Ok(())
@@ -765,7 +767,7 @@ fn crash_checked(w: &mut World, o: &mut Oracle, during: Option<HandleId>) -> Res
     }
     dropped(w, n, expect)?;
     if let Some(h) = w.handles().find(|h| !h.deferred) {
-        return Err(format!("h{} outlived the crash", h.id));
+        return Err(format!("oracle_crash: h{} outlived the crash", h.id));
     }
     o.calls.retain(|h, _| w.handles().any(|x| x.id == *h));
     o.held.retain(|h, _| w.handles().any(|x| x.id == *h));
@@ -782,7 +784,7 @@ fn apply_deferred_checked(w: &mut World, o: &mut Oracle, f: ForkId) -> Result<()
     let own: Vec<HandleId> = list.iter().map(Deferred::id).collect();
     if model != own {
         return Err(format!(
-            "R5.3: f{f} deferred {model:?}, the harness made {own:?}"
+            "oracle_deferred: R5.3: f{f} deferred {model:?}, the harness made {own:?}"
         ));
     }
     let t = Target::Tree(Tree::Fork(f));
@@ -798,7 +800,7 @@ fn apply_deferred_checked(w: &mut World, o: &mut Oracle, f: ForkId) -> Result<()
             Deferred::Path(h, to) => Some((w.handle(*h).file.clone(), to.clone())),
         };
         if w.apply_deferred(f) != Some(d.id()) {
-            return Err(format!("R5.3: {d:?} did not apply next"));
+            return Err(format!("oracle_deferred: R5.3: {d:?} did not apply next"));
         }
         if let Some((file, to)) = run
             && w.file(&at, &file).name.live()
@@ -810,7 +812,9 @@ fn apply_deferred_checked(w: &mut World, o: &mut Oracle, f: ForkId) -> Result<()
             .map_err(|e| format!("deferred {d:?} after its transaction: {e}"))?;
     }
     if w.apply_deferred(f).is_some() {
-        return Err(format!("R5.3: f{f} deferred more than the harness made"));
+        return Err(format!(
+            "oracle_deferred: R5.3: f{f} deferred more than the harness made"
+        ));
     }
     gitledger::observe(w)
 }
@@ -867,7 +871,7 @@ fn drain(
         take(w, o, &s, tally).map_err(|e| (at, e))?;
         checkg(w, o).map_err(|e| (at, e))?;
     }
-    Err((at, "the queues never drained".into()))
+    Err((at, "oracle_drained: the queues never drained".into()))
 }
 
 fn checkg(w: &mut World, o: &mut Oracle) -> Result<(), String> {
@@ -919,7 +923,7 @@ fn run_seed(seed: u64, policies: Policies, tally: &mut Tally) -> Result<String, 
 }
 
 /// One seed of `generate` under `catch_unwind`. `Ok` carries the run's
-/// [`World::fingerprint`]; `Err` the seed, step, violation and log.
+/// canonical text (`agentfs_model::digest`); `Err` the seed, step, violation and log.
 fn run_seed_of(
     generate: Run,
     seed: u64,
@@ -932,7 +936,7 @@ fn run_seed_of(
         generate(&mut w, seed, tally)
     }));
     let (step, e) = match out {
-        Ok(Ok(())) => return Ok(w.fingerprint()),
+        Ok(Ok(())) => return Ok(agentfs_model::digest::canonical_text(&w)),
         Ok(Err(e)) => e,
         Err(panic) => {
             let msg = panic
@@ -2006,7 +2010,7 @@ fn random_interleavings_adjacent_lines() {
 
 /// Rule 2, "no clock is read anywhere", on the random runs: seeds 1..=8 run
 /// again with every commit dated before its parents decide exactly the same
-/// trees and collisions ([`World::fingerprint`]). An order taken from commit
+/// history (the digest's canonical text, `agentfs_model::digest`). An order taken from commit
 /// dates would differ.
 #[test]
 fn random_interleavings_commit_dates_decide_nothing() {

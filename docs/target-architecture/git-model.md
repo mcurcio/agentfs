@@ -819,7 +819,7 @@ policy of this revision included. Every check runs after every step, in every sc
 | Nested forks follow the same rules | all checks | `r4_nested_forks_follow_the_same_rules` |
 | Full lineage, read by ancestry alone: a tree's history reaches every change it took | `full_lineage` | `r7_every_fork_commit_lands_on_its_own_in_mains_history`, `r7_main_reaches_a_losing_commit_and_its_ref_keeps_it`, `random_interleavings_full_lineage` |
 | Trees converge when writes stop | `check_converged` | `convergence_when_writes_stop` |
-| No clock decides anything | fingerprint compare | `r2_no_clock_commit_dates_decide_nothing`, `random_interleavings_commit_dates_decide_nothing` |
+| No clock decides anything | canonical text compare (`digest.rs`) | `r2_no_clock_commit_dates_decide_nothing`, `random_interleavings_commit_dates_decide_nothing` |
 
 Ignored (open findings): `finding_43_a_sync_hides_a_line_the_fork_deleted_in_a_lost_save`, `finding_1_git_merge_base_on_crossing_merges`, `random_interleavings_git_merge_base`,
 `finding_6_git_hunks_on_neighbouring_lines`. Finding 3's tests went with the per-file setting (rule 3e).

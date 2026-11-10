@@ -719,9 +719,14 @@ fn upstream_wins(w: &mut World) -> Result<(), String> {
         if let Some(t) = c.lost.iter().find(|t| !lose.holds(t)) {
             return Err(format!("{c:?}: lost {t} is not in the incoming commit"));
         }
-        let at = git(w.repo(), &["rev-parse", &c.reference]);
-        if at != c.loser {
-            return Err(format!("{c:?}: its ref names {at}"));
+        // A missing ref is this check failing, not the harness: read it without panicking.
+        let at = try_git(
+            w.repo(),
+            &["rev-parse", "--verify", "-q", &c.reference],
+            None,
+        );
+        if at.stdout.trim() != c.loser {
+            return Err(format!("{c:?}: its ref names {:?}", at.stdout.trim()));
         }
         // Recorded in git, in its result commit, which names the tree the
         // decision belongs to; the losing commit holds no decision of its own.
