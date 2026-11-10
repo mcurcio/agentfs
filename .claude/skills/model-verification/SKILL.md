@@ -13,7 +13,7 @@ does not restate it.
 |---|---|
 | Before editing | "The procedure", "Adding a rule, a scenario or an invariant"; the rule must be `owner` or `approved` in `docs/target-architecture/rules-ledger.md` |
 | Fixing a review finding or a failing seed | "Fix passes": delete, or correct toward a ledger rule; anything else is a question for the owner |
-| Running anything | "Commands" (the container line, the `-e` seed variables) |
+| Running anything | "Commands", through `ci/model-docker.sh` (the skill model-runs) |
 | A test fails | "Reading a failure", "What the ignored tests are expected to show" |
 | Planting bugs | "Planting bugs (mutation probes)" |
 | Reviewing a pull request | "Reviewer checklist for a design pull request" |

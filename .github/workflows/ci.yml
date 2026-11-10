@@ -33,6 +33,8 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked --all-features -- -D warnings
       - name: linked C and crypto per feature set
         run: ci/check-deps.sh
+      - name: the model's safety net (corpus runner, digest compare, mount refusal, stall alarm)
+        run: python3 -m unittest discover -s crates/agentfs-model/planted -p 'test_*.py' -v
 
   # The documentation against the code: every config key, operator
   # attribute, flag and environment variable agentfs reads is in
