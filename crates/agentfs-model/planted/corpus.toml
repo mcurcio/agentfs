@@ -4,6 +4,14 @@
 # no change here, and an edit that really changes an anchor reports STALE until this file
 # is re-anchored in the same commit. `seeds` is 64 (CI's seeds and scenarios) or 500.
 # Keep `find` a single statement or arm where you can, so a nearby edit does not stale it.
+# Anchors match exactly, leading whitespace included: a move that changes indentation
+# makes them STALE.
+#
+# Not in the corpus, because no model behaviour can show them: finding 11's fix reverted
+# (two renames to one path) reaches only the model's "not modelled" guard in no_clash,
+# and P3 reintroduced (a write-open waiting behind a waiting take) has no form in a model
+# whose calls never wait; R9.2's scenarios and the random runs' oracle_no_call_waits
+# check that no call waits.
 
 [[bug]]
 id = "sync_decides_the_collision"
@@ -285,30 +293,6 @@ replace = '''
         }'''
 
 [[bug]]
-id = "p3_open_waits_behind_a_waiting_take"
-rule = "P3"
-seeds = 64
-find = '''
-        let file = self
-            .lookup(&self.target_head(target), p)
-            .unwrap_or_else(|| {
-                panic!("open_write of {p}: no such file ([`World::create`] makes one)")
-            });'''
-replace = '''
-        let file = self
-            .lookup(&self.target_head(target), p)
-            .unwrap_or_else(|| {
-                panic!("open_write of {p}: no such file ([`World::create`] makes one)")
-            });
-        if self
-            .waits
-            .get(&tree_of(target))
-            .is_some_and(|m| m.values().any(|x| x.files.contains(&file)))
-        {
-            panic!("P3: a new write-open waits behind a waiting take of {file}");
-        }'''
-
-[[bug]]
 id = "sync_delivers_past_an_open_file"
 rule = "P2"
 seeds = 64
@@ -331,15 +315,6 @@ replace = '''
                     deliver: None,
                     until: Some(now.difference(&before).cloned().collect()),
                 };'''
-
-[[bug]]
-id = "finding_11_reverted_two_renames_clash"
-rule = "R11"
-seeds = 64
-find = '''
-        self.keep_own_names(ours, up, &mut files);'''
-replace = '''
-'''
 
 [[bug]]
 id = "finding_25_reverted_rename_over_loses_by_its_name"
@@ -445,7 +420,7 @@ replace = '''
 [[bug]]
 id = "p46s_sync_name_keys_from_the_parent"
 rule = "R9.1"
-seeds = 500
+seeds = 64
 find = '''
             let after = tree.as_deref().unwrap_or(ours);'''
 replace = '''
@@ -454,7 +429,7 @@ replace = '''
 [[bug]]
 id = "p47_unlink_loses_to_a_line_of_a_file_unlinked_too"
 rule = "R10.3"
-seeds = 500
+seeds = 64
 find = '''
                 && verdicts[&key(u)] == Verdict::Apply
                 && cur.name.live()'''

@@ -891,6 +891,22 @@ impl World {
         }
     }
 
+    /// Transaction `id`'s name, as its commits' `Agentfs-Tree` gives it. With
+    /// [`World::name`] and [`World::branch`] the one place that names a tree.
+    pub(crate) fn txn_name(id: TxnId) -> String {
+        format!("txn/{id}")
+    }
+
+    /// The ref holding transaction `id`'s head.
+    pub(crate) fn txn_branch(id: TxnId) -> String {
+        format!("refs/heads/{}", Self::txn_name(id))
+    }
+
+    /// How many transactions began in this run (each has its own id, from 1).
+    pub fn txns_begun(&self) -> TxnId {
+        self.next_txn - 1
+    }
+
     /// What tree `t` shows at path `p`: the file named `p` there.
     pub fn read(&self, t: Tree, p: &str) -> Content {
         self.read_at(&self.head(t), p)
@@ -2266,9 +2282,9 @@ impl World {
         let t = self.tree_with(Some(at), &files);
         match target {
             Target::Txn(f, id) => {
-                let on = format!("txn/{id}");
+                let on = Self::txn_name(id);
                 let commit = self.commit_by(&[at], &t, writer, "Direct", &on, open);
-                self.update_ref(&[&format!("refs/heads/{on}"), &commit]);
+                self.update_ref(&[&Self::txn_branch(id), &commit]);
                 let txn = self.forks.get_mut(&f).expect("fork").txn.as_mut();
                 let txn = txn.expect("open");
                 txn.head = commit.clone();
@@ -2545,7 +2561,7 @@ impl World {
         let id = self.next_txn;
         self.next_txn += 1;
         let start = fork.head.clone();
-        self.update_ref(&[&format!("refs/heads/txn/{id}"), &start]);
+        self.update_ref(&[&Self::txn_branch(id), &start]);
         self.forks.get_mut(&f).expect("fork").txn = Some(Txn {
             id,
             start: start.clone(),
@@ -2792,7 +2808,7 @@ impl World {
             .txn
             .take()
             .ok_or(ModelError::NoTransaction)?;
-        self.update_ref(&["-d", &format!("refs/heads/txn/{}", txn.id)]);
+        self.update_ref(&["-d", &Self::txn_branch(txn.id)]);
         Ok(txn)
     }
 
@@ -3458,29 +3474,6 @@ impl World {
         self.queues.remove(&Tree::Fork(f));
         self.forks.get_mut(&f).expect("fork").life = Life::Dropped;
         self.note(format!("drop f{f}"));
-    }
-
-    /// What a run decided, without commit ids (they carry dates): each
-    /// branch's and collision ref's tree, and each collision's tree, side,
-    /// file, slots and tokens. The same calls give the same fingerprint
-    /// whatever the commits' dates (`r2_no_clock_commit_dates_decide_nothing`).
-    pub fn fingerprint(&self) -> String {
-        let mut s = git(
-            &self.repo,
-            &[
-                "for-each-ref",
-                "--format=%(refname) %(tree)",
-                "refs/heads",
-                "refs/collisions",
-            ],
-        );
-        for c in &self.collisions {
-            s.push_str(&format!(
-                "\n{:?} {:?} {} {:?} {:?} {:?} {:?}",
-                c.tree, c.direction, c.path, c.lines, c.lost, c.won, c.by
-            ));
-        }
-        s
     }
 
     // ── recording (crate::calls) ─────────────────────────────────────────

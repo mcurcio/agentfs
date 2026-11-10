@@ -148,7 +148,7 @@ fn r2_no_clock_commit_dates_decide_nothing() {
                 w.repo(),
                 &["for-each-ref", "--format=%(objectname) %(refname)"],
             ),
-            w.fingerprint(),
+            agentfs_model::digest::canonical_text(&w),
         )
     };
     let pinned = run();

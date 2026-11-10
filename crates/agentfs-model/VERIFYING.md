@@ -26,19 +26,17 @@ every invariant holds after every step of every run. A rule that exists only in 
 ## Commands
 
 All commands run from the repository root. Without a local Rust toolchain (on macOS, say), run them in the
-container from [CONTRIBUTING.md](../../CONTRIBUTING.md) ("A local Linux gate in a container"): the model
-needs only `git`, which the Rust image has. Pass the seed variables into the container with `-e`, or they
-are silently dropped. A whole command, 500 seeds in the container:
+container from [CONTRIBUTING.md](../../CONTRIBUTING.md) ("A local Linux gate in a container") through
+`ci/model-docker.sh`, never a hand-written `docker run` ("Refactoring without changing outcomes" below says
+why): the model needs only `git`, which the Rust image has. Seed variables go inside the command. A whole
+command, 500 seeds in the container:
 
 ```sh
-AGENTFS_MODEL_SEEDS=500 docker run --rm -v "$PWD":/src -v agentfs-target:/target \
-  -v agentfs-cargo:/usr/local/cargo/registry -e CARGO_TARGET_DIR=/target \
-  -e AGENTFS_MODEL_SEEDS -e AGENTFS_MODEL_SEED -w /src agentfs-dev \
-  cargo test --locked -p agentfs-model --test interleavings
+ci/model-docker.sh -- env AGENTFS_MODEL_SEEDS=500 cargo test --locked -p agentfs-model --test interleavings
 ```
 
-Keep the build output and the registry on a disk with room; a full workspace build is several GB. The
-commands below are what goes after `agentfs-dev` in that line:
+The wrapper keeps the build output and the registry in named Docker volumes, on Docker's own disk; a full
+workspace build is several GB. The commands below are what goes after `ci/model-docker.sh --` in that line:
 
 ```sh
 # The model: every scenario, and the random runs at seeds 1..64, rounds at 1..16 (what CI runs).
@@ -251,35 +249,62 @@ the pull request body reports them), prove it:
 
 - **The digest** (`src/digest.rs`, `baseline/digests.txt`, `ci/model-digest.sh`): one canonical text per run
   built only from git (every reachable commit numbered by a walk from the refs, with its git tree, parents by
-  number and whole message), hashed with `git hash-object`. Commit ids, dates and in-memory records are left
-  out; tree names become labels (`T0`, `T<fork id>`) through `World::name`, `World::branch` and the fork list
-  only, so a rename edits one call site. The golden holds for one git release (`ci/git-release`); the runner
-  refuses any other.
+  number and whole message, then the local refs and the shared remote's refs with their tips' numbers), hashed
+  with `git hash-object`. Commit ids, dates and in-memory records are left out; tree names become labels (`T0`,
+  `T<fork id>`, `X<transaction id>`) through the one place that names trees (`World::name`, `World::branch`,
+  `World::txn_name`, `World::txn_branch`), so a rename edits that place only. `canonical_text_is_pinned` pins the
+  text on a hand-built repository: a change to the format fails it, and is a deliberate re-record of the golden.
+  The golden holds for one git release (`ci/git-release`); the runner refuses any other.
 - **The planted-bug corpus** (`planted/corpus.toml`, `planted/run.py`, `planted/matrix.tsv`): each bug is an
-  exact find-and-replace matched exactly once across `src/**`. A verbatim move needs no change; an anchor the
-  refactor really changed reports STALE, which fails the run, and is re-anchored in the same commit.
+  exact find-and-replace matched exactly once across `src/**`, leading whitespace included. A verbatim move
+  needs no change; a move that changes indentation, or an edit of the anchor, reports STALE, which stops the
+  run before any bug runs, and is re-anchored in the same commit. A bug counts as caught only by a named check
+  (an invariant of `src/check.rs`, the random runs' `oracle_*` checks or the `ledger`) or by an explicit
+  assertion in a test file; a panic in the model or the harness never counts, in either test binary.
+
+Run every model job in a container through `ci/model-docker.sh`, never a hand-written `docker run` (the repo skill
+`model-runs` says how and why). The wrapper always passes `--init` (without it, orphaned git processes pile up as
+zombies until nothing can start, and the run hangs), `--pids-limit 4096` (a process leak then fails within seconds,
+exit 4, instead of freezing Docker), `TMPDIR=/tmp` and named volumes for the target, work and registry folders. On a
+Docker Desktop bind mount 8 seeds took 320 s against 24 s on the container's `/tmp`, so `run.py` and `collect` read
+`/proc/self/mountinfo` and refuse (exit 2) a `TMPDIR` or `--work` on a host file share. The wrapper is also the alarm:
+it kills the job and exits 3, naming the unit in flight, when no unit (a bug, a seed, the scenarios) finishes within
+twice the slowest unit in `planted/budget.json`, or `--stall SECONDS`.
 
 ```sh
-# In the container, from the repository root. Long: 500 seeds take 10 to 14 minutes on 8 cores.
-ci/model-digest.sh record             # after a change meant to change outcomes
-ci/model-digest.sh check              # fails on any different, missing or extra run, naming it
-# The same check in parts, for a time limit:
-ci/model-digest.sh collect DIR 0 2; ci/model-digest.sh collect DIR 1 2; ci/model-digest.sh compare DIR
-# A run's text, to diff against another: AGENTFS_MODEL_DIGEST_TEXT=1 with ci/model-digest.sh collect
-python3 crates/agentfs-model/planted/run.py --work DIR [--jobs 4] [--only a,b] [--write]
+# From the repository root; each line is one wrapped job.
+ci/model-docker.sh -- cargo test --locked -p agentfs-model          # the model's tests
+ci/model-docker.sh -- ci/model-digest.sh check        # fast: scenarios first, stops at the first difference
+ci/model-docker.sh -- ci/model-digest.sh check --all  # every run, every difference listed
+ci/model-docker.sh -- ci/model-digest.sh record       # after a change meant to change outcomes; times the budget
+# In parts, for a time limit: each shard into its own new directory, chained with &&.
+ci/model-docker.sh -- sh -c 'ci/model-digest.sh collect /work/d0 0 2 && ci/model-digest.sh collect /work/d1 1 2 && ci/model-digest.sh compare /work/d0 /work/d1'
+# Each run's text beside its digest, to diff two runs:
+ci/model-docker.sh -- env AGENTFS_MODEL_DIGEST_TEXT=1 ci/model-digest.sh collect /work/texts
+ci/model-docker.sh -- python3 crates/agentfs-model/planted/run.py --work /work/planted [--only a,b] [--full] [--write]
 ```
 
-`check` and `run.py` need the container's `git` (`ci/git-release`). Keep `TMPDIR` and `run.py`'s `--work` on a disk
-inside the container, never a bind mount: every run makes git repositories there, and on Docker Desktop 8 seeds took
-320 s with `TMPDIR` on a bind mount against 24 s on the container's `/tmp`. `/tmp` is the default for `TMPDIR`; for
-`--work` use a named volume (`-v agentfs-planted:/work`, `--work /work/planted`), which also survives a stopped run.
-Use `docker run --init` for both: without an init process, orphaned git processes pile up as zombies until nothing can
-start, and the run hangs. A test process that passes its limit (30 minutes) or a process that cannot start fails the
-run: `run.py` reports `TIMEOUT` or `HARNESS`, and the digest's `collect` counts that test as failed.
-A failing test does not stop `collect` or `check`: the failed run's digest is missing, the rest are compared, and the
-command fails. Every bug must be caught: a surviving mutant, a stale anchor or a build error fails the
-run; `matrix.tsv` records which check tripped first most often (or `assert` for a scenario assertion) and must
-reproduce. A change meant to change outcomes re-records the golden and matrix in the same commit, and says why.
+`ci/model-digest.sh` and `run.py` need the container's `git` (`ci/git-release`). A test process that passes its limit
+(30 minutes) or a process that cannot start fails the run: `run.py` reports `TIMEOUT` or `HARNESS`, and the digest's
+`collect` counts that test as failed. A failing test does not stop `collect` or `check --all`: the failed run's digest
+is missing, the rest are compared, and the command fails. `collect` refuses a directory that is not empty and writes a
+success marker only when every test passed; `compare` and `accept` need one marker per shard, so a missing digest is
+never filled by an old one. `run.py` keeps each result under a hash of its corpus entry, the mode and the model's
+sources and tests, so a changed model or bug always runs again.
+
+`run.py` runs in fast mode by default: each test in its own process, the scenarios first and then the random runs, in
+name order, stopping at the first test that catches the bug (a failure that is only a panic does not stop it).
+`--full` runs both test targets whole and records the check that tripped first most often. Every bug must be caught: a
+surviving mutant, a stale anchor or a build error fails the run; `matrix.tsv` records each bug's id, rule, seeds,
+status and catching check (`assert`: an explicit assertion in a test file, never a panic) and must reproduce.
+`planted/budget.json` holds measured seconds, as `ci/bench-budget.json` does for the benchmarks: the corpus pass and
+its slowest bug, the scenario digest and the whole digest. A corpus pass or a `check` over 1.5 times its budget fails;
+`run.py --write` and `ci/model-digest.sh record` measure them again, alone: the wrapper refuses a budget write while
+another `agentfs-dev` container runs (exit 5), or with `MODEL_BUDGET_CONTENDED=1` writes it with a note saying so. A change meant to change outcomes re-records the
+golden and matrix in the same commit, and says why.
+
+The safety net has tests of its own, plain Python and bash that CI runs in the lint job
+(`python3 -m unittest discover -s crates/agentfs-model/planted -p 'test_*.py'`), and `canonical_text_is_pinned`.
 
 ## Reading a failure
 
