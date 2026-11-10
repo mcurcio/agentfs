@@ -6,9 +6,13 @@
 //! world does not know it is checked, and the checker reads the world and git
 //! but writes neither.
 
+mod lineage;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::{Deref, DerefMut};
 use std::path::Path;
+
+use lineage::Lineage;
 
 use crate::content::{Content, Line, PATHS, State, is_root, writer_of};
 use crate::git::{git, try_git};
@@ -60,6 +64,13 @@ impl Checked {
     pub fn met(&self) -> Met {
         self.checker.met
     }
+
+    /// Whether version `newer` was written over `older` (or is it), by the
+    /// checker's own record, read from git first.
+    pub fn descends(&mut self, newer: &str, older: &str) -> bool {
+        self.checker.lineage.read_new(self.world.repo());
+        self.checker.lineage.descends(newer, older)
+    }
 }
 
 impl Deref for Checked {
@@ -106,7 +117,11 @@ struct Checker {
     /// Per open transaction, its fork's head and the files it had saved at
     /// the last check.
     txn_files_seen: BTreeMap<TxnId, (String, BTreeSet<String>)>,
-    refs_checked: Option<u64>,
+    /// What each version was written over, read from git.
+    lineage: Lineage,
+    /// Every ref and its commit at the last read of history: history is read
+    /// again only once a ref moved (or a new discard adds tokens).
+    refs_seen: Option<String>,
     met: Met,
 }
 
@@ -123,6 +138,7 @@ struct Cursors {
 impl Checker {
     /// Every invariant that holds after any step.
     fn check(&mut self, w: &World) -> Result<(), String> {
+        self.lineage.read_new(w.repo());
         let now = views(w);
         named("no_silent_loss", self.no_silent_loss(w, &now))?;
         named("no_flicker", self.no_flicker(w, &now))?;
@@ -134,14 +150,18 @@ impl Checker {
         named("transactions_end_as_told", self.transactions_end_as_told(w))?;
         named("transactions_undisturbed", self.transactions_undisturbed(w))?;
         let discards = self.grepped.0 != w.discarded.len();
-        if self.refs_checked != Some(w.ref_moves) || discards {
+        let refs = git(
+            w.repo(),
+            &["for-each-ref", "--format=%(objectname) %(refname)"],
+        );
+        if self.refs_seen.as_ref() != Some(&refs) || discards {
             let all = w.all_commits();
             named("one_writer", self.one_writer(w, &all))?;
             named(
                 "discarded_leave_no_trace",
                 self.discarded_leave_no_trace(w, &all),
             )?;
-            self.refs_checked = Some(w.ref_moves);
+            self.refs_seen = Some(refs);
         }
         named("rename_overs_whole", self.rename_overs_whole(w))?;
         named("full_lineage", self.full_lineage(w))?;
@@ -542,94 +562,99 @@ fn moves<'a>(
     out
 }
 
-/// A collision in `trees` names `token`, or a later version written over
-/// it, as lost on line `line` of file `path`.
-fn lost_in(w: &World, trees: &[Tree], path: &str, line: &str, token: &str) -> bool {
-    w.collisions
-        .iter()
-        .any(|c| trees.contains(&c.tree) && names_lost(w, c, path, line, token))
-}
-
-/// Collision `c` names `token`, or a later version written over it, as
-/// lost on line `line` of file `path`.
-fn names_lost(w: &World, c: &Collision, path: &str, line: &str, token: &str) -> bool {
-    c.path == path
-        && c.lines
+impl Checker {
+    /// A collision in `trees` names `token`, or a later version written over
+    /// it, as lost on line `line` of file `path`.
+    fn lost_in(&self, w: &World, trees: &[Tree], path: &str, line: &str, token: &str) -> bool {
+        w.collisions
             .iter()
-            .zip(&c.lost)
-            .any(|(l, x)| l == line && w.lineage.descends(x, token))
-}
+            .any(|c| trees.contains(&c.tree) && self.names_lost(c, path, line, token))
+    }
 
-/// [`lost_in`] `t` or a tree upstream of it, by a decision that has
-/// reached `t` ([`delivered`]): a loss decided upstream reaches `t` as a
-/// plain update, never before the commit that carries it.
-fn flagged(w: &World, t: Tree, path: &str, line: &str, token: &str) -> bool {
-    let trees = w.upstream(t);
-    w.collisions.iter().any(|c| {
-        trees.contains(&c.tree) && delivered(w, t, c) && names_lost(w, c, path, line, token)
-    })
-}
-
-/// R10.3: a delete of line `line` of `path` that was written over version
-/// `token` (or is it) entered `t` or a tree upstream of it, and no
-/// collision that reached `t` names it lost. Another delete of that line
-/// then agrees with it: `token`'s content is gone by that delete first.
-fn deleted_over(w: &World, t: Tree, path: &str, line: &str, token: &str) -> bool {
-    let trees = w.upstream(t);
-    w.entered.iter().any(|(u, d)| {
-        trees.contains(u)
-            && d.gone
-            && d.path == path
-            && d.line == line
-            && w.lineage.descends(&d.token, token)
-            && !flagged(w, t, path, line, &d.token)
-    })
-}
-
-/// Neither version was written over the other.
-fn concurrent(w: &World, a: &str, b: &str) -> bool {
-    !w.lineage.descends(a, b) && !w.lineage.descends(b, a)
-}
-
-/// The change collision `c` names really collided in that take: a
-/// same-line or file-rule record of it ([`By::Line`], [`By::File`]) has a
-/// lost version and a winner that are concurrent.
-fn really_collided(w: &World, c: &Collision) -> bool {
-    w.collisions.iter().any(|d| {
-        d.tree == c.tree
-            && d.result == c.result
-            && d.loser == c.loser
-            && d.by != By::Whole
-            && d.lost.iter().zip(&d.won).any(|(x, y)| concurrent(w, x, y))
-    })
-}
-
-/// [`flagged`], by a real decision: a collision in which the lost version
-/// and its winner really collided (neither was written over the other), or
-/// a version of a change that lost whole because another of its versions
-/// really collided (rule 3e, [`By::Whole`]). That decision may replace the
-/// lost version with any version, the one it was written over included (an
-/// unlink that lost to a line it never saw gives the file back; a line of a
-/// losing save goes back to the upstream's). A version lost by no real
-/// collision of its change is no such decision.
-fn decided_against(w: &World, t: Tree, path: &str, line: &str, token: &str) -> bool {
-    let trees = w.upstream(t);
-    w.collisions.iter().any(|c| {
-        trees.contains(&c.tree)
-            && delivered(w, t, c)
-            && c.path == path
+    /// Collision `c` names `token`, or a later version written over it, as
+    /// lost on line `line` of file `path`.
+    fn names_lost(&self, c: &Collision, path: &str, line: &str, token: &str) -> bool {
+        c.path == path
             && c.lines
                 .iter()
-                .zip(c.lost.iter().zip(&c.won))
-                .any(|(l, (x, won))| {
-                    l == line
-                        && w.lineage.descends(x, token)
-                        && match c.by {
-                            By::Whole => really_collided(w, c),
-                            By::Line | By::File => concurrent(w, x, won),
-                        }
-                })
-    })
+                .zip(&c.lost)
+                .any(|(l, x)| l == line && self.lineage.descends(x, token))
+    }
+
+    /// [`Self::lost_in`] `t` or a tree upstream of it, by a decision that has
+    /// reached `t` ([`delivered`]): a loss decided upstream reaches `t` as a
+    /// plain update, never before the commit that carries it.
+    fn flagged(&self, w: &World, t: Tree, path: &str, line: &str, token: &str) -> bool {
+        let trees = w.upstream(t);
+        w.collisions.iter().any(|c| {
+            trees.contains(&c.tree) && delivered(w, t, c) && self.names_lost(c, path, line, token)
+        })
+    }
+
+    /// R10.3: a delete of line `line` of `path` that was written over version
+    /// `token` (or is it) entered `t` or a tree upstream of it, and no
+    /// collision that reached `t` names it lost. Another delete of that line
+    /// then agrees with it: `token`'s content is gone by that delete first.
+    fn deleted_over(&self, w: &World, t: Tree, path: &str, line: &str, token: &str) -> bool {
+        let trees = w.upstream(t);
+        w.entered.iter().any(|(u, d)| {
+            trees.contains(u)
+                && d.gone
+                && d.path == path
+                && d.line == line
+                && self.lineage.descends(&d.token, token)
+                && !self.flagged(w, t, path, line, &d.token)
+        })
+    }
+
+    /// Neither version was written over the other.
+    fn concurrent(&self, a: &str, b: &str) -> bool {
+        !self.lineage.descends(a, b) && !self.lineage.descends(b, a)
+    }
+
+    /// The change collision `c` names really collided in that take: a
+    /// same-line or file-rule record of it ([`By::Line`], [`By::File`]) has a
+    /// lost version and a winner that are concurrent.
+    fn really_collided(&self, w: &World, c: &Collision) -> bool {
+        w.collisions.iter().any(|d| {
+            d.tree == c.tree
+                && d.result == c.result
+                && d.loser == c.loser
+                && d.by != By::Whole
+                && d.lost
+                    .iter()
+                    .zip(&d.won)
+                    .any(|(x, y)| self.concurrent(x, y))
+        })
+    }
+
+    /// [`Self::flagged`], by a real decision: a collision in which the lost version
+    /// and its winner really collided (neither was written over the other), or
+    /// a version of a change that lost whole because another of its versions
+    /// really collided (rule 3e, [`By::Whole`]). That decision may replace the
+    /// lost version with any version, the one it was written over included (an
+    /// unlink that lost to a line it never saw gives the file back; a line of a
+    /// losing save goes back to the upstream's). A version lost by no real
+    /// collision of its change is no such decision.
+    fn decided_against(&self, w: &World, t: Tree, path: &str, line: &str, token: &str) -> bool {
+        let trees = w.upstream(t);
+        w.collisions.iter().any(|c| {
+            trees.contains(&c.tree)
+                && delivered(w, t, c)
+                && c.path == path
+                && c.lines
+                    .iter()
+                    .zip(c.lost.iter().zip(&c.won))
+                    .any(|(l, (x, won))| {
+                        l == line
+                            && self.lineage.descends(x, token)
+                            && match c.by {
+                                By::Whole => self.really_collided(w, c),
+                                By::Line | By::File => self.concurrent(x, won),
+                            }
+                    })
+        })
+    }
 }
 
 /// Whether collision `c`, decided in `t` or a tree upstream of it, has
@@ -673,15 +698,15 @@ impl Checker {
     /// version reverts a newer one: (a) in every live tree a line moves from
     /// version a to b only if b was written over a, or both are deletes (they
     /// agree, R10.3), or b is a delete agreeing with one written over a
-    /// ([`deleted_over`]), or a recorded collision in that tree or one upstream names a
+    /// ([`Self::deleted_over`]), or a recorded collision in that tree or one upstream names a
     /// as lost; never if a was written over b (b is stale), unless a collision
-    /// decided against a ([`decided_against`]); (b) every version that
+    /// decided against a ([`Self::decided_against`]); (b) every version that
     /// entered a tree (written there, carried in by a landing or a
     /// transaction, won or lost, or taken from the upstream by a sync) is still
     /// its line's version there, or one written over it is, or a delete is
     /// that agrees with it or with a delete written over it
-    /// ([`deleted_over`]), or such a collision names it, or the tree's last sync
-    /// hid its line under R10.6 ([`hidden_by_r10_6`]).
+    /// ([`Self::deleted_over`]), or such a collision names it, or the tree's last sync
+    /// hid its line under R10.6 ([`Self::hidden_by_r10_6`]).
     fn no_silent_loss(&self, w: &World, now: &Views) -> Result<(), String> {
         for (t, p, l, a, b) in moves(&self.views, now) {
             // excuse: R10.3 two deletes of one line agree: the line stays deleted
@@ -689,7 +714,7 @@ impl Checker {
                 continue;
             }
             // excuse: R3b a collision decided against a: the upstream's version may replace it
-            if w.lineage.descends(&a.id, &b.id) && !decided_against(w, t, p, l, &a.id) {
+            if self.lineage.descends(&a.id, &b.id) && !self.decided_against(w, t, p, l, &a.id) {
                 return Err(format!(
                     "stale revert in {t:?}:{p}[{l}]: {} became {}, which it was written over",
                     a.id, b.id
@@ -697,9 +722,9 @@ impl Checker {
             }
             // excuse: R3b a collision names a lost: it stays in history, named
             // excuse: R10.3 b agrees with a delete written over a
-            if !w.lineage.descends(&b.id, &a.id)
-                && !flagged(w, t, p, l, &a.id)
-                && !(!b.live() && deleted_over(w, t, p, l, &a.id))
+            if !self.lineage.descends(&b.id, &a.id)
+                && !self.flagged(w, t, p, l, &a.id)
+                && !(!b.live() && self.deleted_over(w, t, p, l, &a.id))
             {
                 return Err(format!(
                     "silent loss in {t:?}:{p}[{l}]: {} became {}, which was not written over it, and no collision names it",
@@ -711,7 +736,7 @@ impl Checker {
             let Some(files) = now.get(t) else {
                 continue;
             };
-            let lost = flagged(w, *t, &e.path, &e.line, &e.token);
+            let lost = self.flagged(w, *t, &e.path, &e.line, &e.token);
             let Some(s) = files[&e.path].member(&e.line) else {
                 // A new line that lost never entered the tree's file.
                 // excuse: R3b a new line that lost never entered the tree's file
@@ -719,15 +744,15 @@ impl Checker {
                     continue;
                 }
                 // excuse: R10.6 the tree's last sync hid the upstream's unfinished last line in front of an undecided line
-                if hidden_by_r10_6(w, *t, &e.path, &e.line, &e.token) {
+                if self.hidden_by_r10_6(w, *t, &e.path, &e.line, &e.token) {
                     continue;
                 }
                 return Err(format!("line {} of {} left {t:?}", e.line, e.path));
             };
             // excuse: R3b a collision names it lost
             // excuse: R10.3 s agrees with a delete written over e (or e itself)
-            let deleted = !s.live() && deleted_over(w, *t, &e.path, &e.line, &e.token);
-            if !lost && !w.lineage.descends(&s.id, &e.token) && !deleted {
+            let deleted = !s.live() && self.deleted_over(w, *t, &e.path, &e.line, &e.token);
+            if !lost && !self.lineage.descends(&s.id, &e.token) && !deleted {
                 return Err(format!(
                     "{} entered {t:?}:{}[{}] and is gone ({} there), with no collision naming it",
                     e.token, e.path, e.line, s.id
@@ -739,7 +764,7 @@ impl Checker {
 
     /// No flip-flop: a version, once replaced in a tree, never shows there
     /// again, unless a collision decided against the version replacing it now
-    /// ([`decided_against`]: then it is that decision). So a fork's line
+    /// ([`Self::decided_against`]: then it is that decision). So a fork's line
     /// changes at most once per collision (its own x, then the upstream's
     /// winning m, never x again).
     fn no_flicker(&mut self, w: &World, now: &Views) -> Result<(), String> {
@@ -749,7 +774,7 @@ impl Checker {
             if self
                 .left
                 .contains(&(t, p.to_string(), l.to_string(), b.id.clone()))
-                && !decided_against(w, t, p, l, &a.id)
+                && !self.decided_against(w, t, p, l, &a.id)
             {
                 return Err(format!(
                     "flicker in {t:?}:{p}[{l}]: {} shows again after it was replaced (now over {})",
@@ -779,7 +804,7 @@ impl Checker {
     /// lost and winning pair is concurrent (neither was written over the
     /// other; for a loss decided by a file rule, at least one pair; for a line
     /// lost only because its change lost whole, a real collision of that
-    /// change: [`really_collided`]); the losing change stays reachable under
+    /// change: [`Self::really_collided`]); the losing change stays reachable under
     /// the collision's ref; the result's parents are the tree's previous
     /// head and the losing change. Where it was decided is read from
     /// git, not the model's record: the result is the deciding tree's own
@@ -815,11 +840,11 @@ impl Checker {
             }
             let mut pairs = c.lost.iter().zip(&c.won);
             let real = match c.by {
-                By::Line => pairs.all(|(x, y)| concurrent(w, x, y)),
+                By::Line => pairs.all(|(x, y)| self.concurrent(x, y)),
                 // excuse: R11 a loss by a file rule needs one concurrent pair, not all
-                By::File => pairs.any(|(x, y)| concurrent(w, x, y)),
+                By::File => pairs.any(|(x, y)| self.concurrent(x, y)),
                 // excuse: R3e a line lost with its change needs a real collision of that change
-                By::Whole => really_collided(w, c),
+                By::Whole => self.really_collided(w, c),
             };
             if !real {
                 return Err(format!(
@@ -878,7 +903,7 @@ impl Checker {
             }
             for e in w.edits(&l.base, u) {
                 let (r, b) = (w.file(&l.result, &e.path), w.file(&l.before, &e.path));
-                let ends = |v: &Line| w.lineage.descends(&v.id, &e.token);
+                let ends = |v: &Line| self.lineage.descends(&v.id, &e.token);
                 if !lost {
                     if !r.member(&e.line).is_some_and(ends) {
                         return Err(format!(
@@ -1136,38 +1161,38 @@ fn r10_6_hides(
             .any(|o| ours.is_some_and(|m| in_front_of(u, m, r, x, o)))
 }
 
-/// Line `line` of `path`, whose version `token` entered `t`, is out of `t`'s
-/// file because `t`'s last sync hid it under R10.6: that sync's result lacks it,
-/// and the upstream's version in the commit it delivered was written over `token`
-/// and is hidden by [`r10_6_hides`]. So the next sync, which delivers the
-/// upstream's decision, must bring the line back or fail here, and a line that
-/// left any other way (a save, a sync with no such reason, an upstream's version
-/// not written over `token`) fails. The owner, 2026-11-06, finding 35: "A is fine".
-fn hidden_by_r10_6(w: &World, t: Tree, path: &str, line: &str, token: &str) -> bool {
-    let Tree::Fork(f) = t else {
-        return false;
-    };
-    let Some((_, up, result, entered)) = w.syncs.iter().rev().find(|s| s.0 == t) else {
-        return false;
-    };
-    let (u, r) = (w.file(up, path), w.file(result, path));
-    let Some(x) = u.member(line) else {
-        return false;
-    };
-    if r.member(line).is_some() || !w.lineage.descends(&x.id, token) {
-        return false;
-    }
-    let upstream = w.forks[&f].upstream;
-    let took = taken_by(w, upstream, *entered);
-    let ours = commit_parents(w.repo(), result)
-        .first()
-        .map(|c| w.file(c, path));
-    r10_6_hides(&u, ours.as_ref(), &r, x, |o| {
-        !is_root(&o.id) && (!took.contains(o.id.as_str()) || held_back(w, upstream, up, &o.id))
-    })
-}
-
 impl Checker {
+    /// Line `line` of `path`, whose version `token` entered `t`, is out of `t`'s
+    /// file because `t`'s last sync hid it under R10.6: that sync's result lacks it,
+    /// and the upstream's version in the commit it delivered was written over `token`
+    /// and is hidden by [`r10_6_hides`]. So the next sync, which delivers the
+    /// upstream's decision, must bring the line back or fail here, and a line that
+    /// left any other way (a save, a sync with no such reason, an upstream's version
+    /// not written over `token`) fails. The owner, 2026-11-06, finding 35: "A is fine".
+    fn hidden_by_r10_6(&self, w: &World, t: Tree, path: &str, line: &str, token: &str) -> bool {
+        let Tree::Fork(f) = t else {
+            return false;
+        };
+        let Some((_, up, result, entered)) = w.syncs.iter().rev().find(|s| s.0 == t) else {
+            return false;
+        };
+        let (u, r) = (w.file(up, path), w.file(result, path));
+        let Some(x) = u.member(line) else {
+            return false;
+        };
+        if r.member(line).is_some() || !self.lineage.descends(&x.id, token) {
+            return false;
+        }
+        let upstream = w.forks[&f].upstream;
+        let took = taken_by(w, upstream, *entered);
+        let ours = commit_parents(w.repo(), result)
+            .first()
+            .map(|c| w.file(c, path));
+        r10_6_hides(&u, ours.as_ref(), &r, x, |o| {
+            !is_root(&o.id) && (!took.contains(o.id.as_str()) || held_back(w, upstream, up, &o.id))
+        })
+    }
+
     /// Rule 3 per sync, as of the moment its take began: the fork now holds
     /// the upstream's version of every line, except where it holds its own
     /// version the upstream's queue had not decided then (that version had not
@@ -1320,12 +1345,12 @@ impl Checker {
                     let staged = e.staged.iter().filter(|s| !created_and_ended(s)).all(|s| {
                         w.file(r, &s.path)
                             .member(&s.line)
-                            .is_some_and(|v| w.lineage.descends(&v.id, &s.token))
+                            .is_some_and(|v| self.lineage.descends(&v.id, &s.token))
                             && w.entered.iter().any(|(t, x)| {
                                 *t == fork
                                     && x.path == s.path
                                     && x.line == s.line
-                                    && w.lineage.descends(&x.token, &s.token)
+                                    && self.lineage.descends(&x.token, &s.token)
                             })
                     });
                     none_lost && staged
@@ -1335,9 +1360,10 @@ impl Checker {
                         w.collisions.iter().filter(|c| c.result == *r).collect();
                     let real = mine
                         .iter()
-                        .any(|c| c.by != By::Whole && really_collided(w, c));
+                        .any(|c| c.by != By::Whole && self.really_collided(w, c));
                     let told = lines.iter().all(|o| {
-                        lost_in(w, &[fork], &o.path, &o.line, &o.staged) && holds(w, r, &o.kept)
+                        self.lost_in(w, &[fork], &o.path, &o.line, &o.staged)
+                            && holds(w, r, &o.kept)
                     });
                     let all_told = mine.iter().map(|c| c.lost.len()).sum::<usize>() == lines.len();
                     let none_applied = e.staged.iter().all(|s| !w.file(r, &s.path).holds(&s.token));
@@ -1345,7 +1371,7 @@ impl Checker {
                         lines.iter().any(|o| {
                             o.path == s.path
                                 && o.line == s.line
-                                && w.lineage.descends(&o.staged, &s.token)
+                                && self.lineage.descends(&o.staged, &s.token)
                         })
                     });
                     real && told && all_told && none_applied && named
@@ -1523,7 +1549,7 @@ impl Checker {
     /// a fork's version main has not taken (a sync kept it as undecided, in
     /// this fork or a tree above it that this fork synced from); main has no
     /// such exception. A delete of the renamed file that agrees with one written
-    /// over the rename is not half a rename-over (R10.3, [`deleted_over`]).
+    /// over the rename is not half a rename-over (R10.3, [`Self::deleted_over`]).
     fn rename_overs_whole(&self, w: &World) -> Result<(), String> {
         for (t, files) in &self.views {
             for (x, c) in files {
@@ -1532,7 +1558,7 @@ impl Checker {
                 };
                 let n = &files[by].name;
                 // excuse: R10.3 a delete agreeing with one written over the rename is not half of it
-                if !n.live() && deleted_over(w, *t, by, by, v) {
+                if !n.live() && self.deleted_over(w, *t, by, by, v) {
                     continue;
                 }
                 // excuse: R3a a fork keeps its own undecided name version until the upstream decides
@@ -1544,7 +1570,7 @@ impl Checker {
                     }
                     Tree::Main => false,
                 };
-                if !undecided && !w.lineage.descends(&n.id, v) {
+                if !undecided && !self.lineage.descends(&n.id, v) {
                     return Err(format!(
                         "{t:?}: {x} was unlinked by renaming {by} over it, but {by}'s name is {}, \
                      not that rename's {v} or later",
@@ -1858,7 +1884,7 @@ impl Checker {
                     && name.over.as_deref() == Some(b.name.id.as_str());
                 let applies = edits.iter().any(|e| {
                     b.member(&e.line)
-                        .is_none_or(|v| v.id != e.token && !w.lineage.descends(&v.id, &e.token))
+                        .is_none_or(|v| v.id != e.token && !self.lineage.descends(&v.id, &e.token))
                 });
                 // excuse: R11 a change that unlinks the file too, or creates it, is no edit of an unlinked file
                 if !b.name.live() && !unlinks && !creates && applies {

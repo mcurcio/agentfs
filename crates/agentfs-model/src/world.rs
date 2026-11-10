@@ -30,7 +30,7 @@ use crate::calls::{
     CallError, Caller, Recorded, RecordedCall, Shown, ShownCollision, Took, TreeCalls, TreeId,
     gather_collisions, out_of_scope,
 };
-use crate::content::{Content, Layout, Line, Lineage, PATHS, State, UNBORN, split_lines};
+use crate::content::{Content, Layout, Line, PATHS, State, UNBORN, split_lines};
 use crate::git::{git, git_in, try_git};
 use crate::program;
 pub use crate::program::LineEdit;
@@ -729,7 +729,6 @@ pub struct World {
     waits: BTreeMap<Tree, BTreeMap<u64, Waiting>>,
     /// The files each landing commit's own changes touch, cached.
     touches: RefCell<BTreeMap<String, BTreeSet<String>>>,
-    pub lineage: Lineage,
     counters: BTreeMap<String, u32>,
     pub collisions: Vec<Collision>,
     /// Every token that entered a tree: written in it, carried into it by a
@@ -763,7 +762,6 @@ pub struct World {
     /// Main moved, or a collision was recorded, since Replication last
     /// pushed.
     replication_due: bool,
-    pub(crate) ref_moves: u64,
     /// Syncs that delivered only a prefix of the upstream's commits (P2),
     /// counted so a run can show it met them.
     pub prefix_syncs: usize,
@@ -816,7 +814,6 @@ impl World {
             last_take: None,
             waits: BTreeMap::new(),
             touches: RefCell::new(BTreeMap::new()),
-            lineage: Lineage::default(),
             counters: BTreeMap::new(),
             collisions: Vec::new(),
             entered: Vec::new(),
@@ -834,7 +831,6 @@ impl World {
             ancestry: RefCell::new(BTreeMap::new()),
             over: RefCell::new(BTreeMap::new()),
             replication_due: false,
-            ref_moves: 0,
             prefix_syncs: 0,
             trace: std::env::var_os(TRACE_DIR).map(|_| Vec::new()),
             trace_mute: false,
@@ -1151,13 +1147,11 @@ impl World {
         git_in(&self.repo, &args, msg)
     }
 
-    /// `git update-ref`, counted so `check` re-reads history only after a
-    /// ref moved.
+    /// `git update-ref`.
     fn update_ref(&mut self, args: &[&str]) {
         let mut v = vec!["update-ref"];
         v.extend(args);
         git(&self.repo, &v);
-        self.ref_moves += 1;
     }
 
     fn set_head(&mut self, t: Tree, c: &str) {
@@ -2135,7 +2129,6 @@ impl World {
                         None => self.token(writer, txn),
                     };
                     let line = line.unwrap_or_else(|| id.clone());
-                    self.lineage.wrote(&id, over.as_deref());
                     set.push(Edit {
                         path: p.to_string(),
                         line: line.clone(),
@@ -2345,7 +2338,6 @@ impl World {
         let mut set = Vec::new();
         let name = |w: &mut Self, c: &Content, state: State| {
             let id = w.token(&writer, txn);
-            w.lineage.wrote(&id, Some(&c.name.id));
             let e = Edit {
                 path: c.name.line.clone(),
                 line: c.name.line.clone(),
@@ -2476,7 +2468,6 @@ impl World {
         };
         let cur = self.file(&at, &f);
         let id = self.token(&writer, txn);
-        self.lineage.wrote(&id, Some(&cur.name.id));
         let mut n = cur.clone();
         n.name = Line {
             id: id.clone(),

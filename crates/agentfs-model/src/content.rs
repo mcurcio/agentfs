@@ -1,5 +1,5 @@
 //! File content as a sequence of lines, each line a version of a line
-//! identity, and the lineage of those versions.
+//! identity.
 //!
 //! A file is a byte buffer. A line is its bytes up to and including a
 //! newline, or the bytes after the last newline (a partial last line: the
@@ -29,7 +29,7 @@
 //! separator lines after each record, so git's line merge sees two records
 //! as two hunks; [`Layout::Adjacent`] puts them on consecutive lines.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 /// Lines each file starts with: six root lines, all holding [`BLANK`].
 pub const SLOTS: usize = 6;
@@ -335,36 +335,6 @@ pub fn writer_of(token: &str) -> &str {
     token.split('.').next().unwrap_or(token)
 }
 
-/// What each version was written over: the oracle for "nothing is silently
-/// lost" and "no stale line reverts a newer one", kept apart from git. A
-/// version `b` descends from `a` when `b` was written over `a`: `a` is the
-/// version `b`'s writer saw of that line, or one that version was written
-/// over, and so on. From what the writer could read (R3c.2), never from which
-/// commits its version merged: a sync that kept the fork's own line over
-/// the upstream's did not show the upstream's version to the fork's writer.
-#[derive(Default, Debug)]
-pub struct Lineage {
-    saw: BTreeMap<String, BTreeSet<String>>,
-}
-
-impl Lineage {
-    /// `token` was written over `base`, the version its writer saw (none:
-    /// a new line).
-    pub fn wrote(&mut self, token: &str, base: Option<&str>) {
-        let mut over = BTreeSet::new();
-        if let Some(base) = base {
-            over.insert(base.to_string());
-            over.extend(self.saw.get(base).into_iter().flatten().cloned());
-        }
-        self.saw.insert(token.to_string(), over);
-    }
-
-    /// Whether `newer` descends from `older` (or is it).
-    pub fn descends(&self, newer: &str, older: &str) -> bool {
-        newer == older || self.saw.get(newer).is_some_and(|s| s.contains(older))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -410,19 +380,6 @@ mod tests {
         assert_eq!(c.at(3), "b3");
         assert!(is_root("b3") && is_root("b") && !is_root("b6") && !is_root("c1.1"));
         assert_eq!(c.member("b").and_then(Line::text), Some("b"));
-    }
-
-    #[test]
-    fn lineage_follows_views() {
-        let mut l = Lineage::default();
-        l.wrote("m1.2", Some("a0"));
-        l.wrote("m1.3", Some("m1.2"));
-        l.wrote("c1.1", Some("a0"));
-        l.wrote("c1.2", None);
-        assert!(l.descends("m1.3", "a0") && l.descends("m1.3", "m1.2"));
-        assert!(!l.descends("m1.2", "m1.3"));
-        assert!(!l.descends("c1.1", "m1.2") && !l.descends("m1.2", "c1.1"));
-        assert!(!l.descends("c1.2", "a0"));
     }
 
     #[test]

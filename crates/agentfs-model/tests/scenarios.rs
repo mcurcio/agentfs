@@ -1186,7 +1186,7 @@ fn r8_a_stale_rewrite_overwrites_the_synced_line_and_history_keeps_it() {
         read.get(0).and_then(|l| l.text()),
         "o's bytes, back"
     );
-    assert!(r.starts_with("c1.") && w.lineage.descends(&r, &m));
+    assert!(r.starts_with("c1.") && w.descends(&r, &m));
     drain(&mut w);
     assert!(has(&w, Tree::Main, "a", &r) && !has(&w, Tree::Main, "a", &m));
     assert!(w.collisions.is_empty(), "no collision");
