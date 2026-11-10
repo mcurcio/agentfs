@@ -1,0 +1,484 @@
+# The planted-bug corpus (VERIFYING.md, "Planting bugs"; run by planted/run.py).
+# Each bug is one exact find-and-replace in a copy of crates/agentfs-model/src/**.
+# `find` must match exactly once across that tree: an edit that moves code verbatim needs
+# no change here, and an edit that really changes an anchor reports STALE until this file
+# is re-anchored in the same commit. `seeds` is 64 (CI's seeds and scenarios) or 500.
+# Keep `find` a single statement or arm where you can, so a nearby edit does not stale it.
+
+[[bug]]
+id = "sync_decides_the_collision"
+rule = "R3"
+seeds = 64
+find = '''
+                        && !self.is_ancestor(&self.origin_of(ours, &p, &r.id), up)'''
+replace = '''
+                        && false'''
+
+[[bug]]
+id = "fork_wins_a_collision"
+rule = "R3"
+seeds = 64
+find = '''
+        } else {
+            Verdict::Lose(p.id.clone())
+        }'''
+replace = '''
+        } else {
+            Verdict::Apply
+        }'''
+
+[[bug]]
+id = "deferred_flag_dropped"
+rule = "R5.3"
+seeds = 64
+find = '''
+        self.handles.get_mut(&h).expect("a call").deferred = true;'''
+replace = '''
+'''
+
+[[bug]]
+id = "client_death_keeps_its_locks"
+rule = "R9"
+seeds = 64
+find = '''
+        self.release(&[Client::Fork(f), Client::Outside(f)]);'''
+replace = '''
+'''
+
+[[bug]]
+id = "append_ignores_where_the_file_ends"
+rule = "R8"
+seeds = 64
+find = '''
+            for l in split_lines(rest) {
+                seq.push(Replayed::New {'''
+replace = '''
+            for l in split_lines(rest) {
+                seq.insert(0, Replayed::New {'''
+
+[[bug]]
+id = "loser_ref_not_kept"
+rule = "R4"
+seeds = 64
+find = '''
+                    self.update_ref(&[&r, &l.loser]);'''
+replace = '''
+'''
+
+[[bug]]
+id = "losing_save_applies_its_clean_lines"
+rule = "R3e"
+seeds = 64
+find = '''
+                    (Verdict::Apply, Some(d)) => (&mut whole, d.clone()),'''
+replace = '''
+                    (Verdict::Apply, Some(_)) if dir == Direction::Landing => {
+                        applied.push(i.version.clone());
+                        continue;
+                    }
+                    (Verdict::Apply, Some(d)) => (&mut whole, d.clone()),'''
+
+[[bug]]
+id = "losing_transaction_applies_its_clean_lines"
+rule = "R5"
+seeds = 64
+find = '''
+                    (Verdict::Apply, Some(d)) => (&mut whole, d.clone()),'''
+replace = '''
+                    (Verdict::Apply, Some(_)) if dir == Direction::Transaction => {
+                        applied.push(i.version.clone());
+                        continue;
+                    }
+                    (Verdict::Apply, Some(d)) => (&mut whole, d.clone()),'''
+
+[[bug]]
+id = "file_rule_loss_does_not_cost_the_change"
+rule = "R3e"
+seeds = 64
+find = '''
+            .flatten()
+            .find_map(|i| match &verdicts[&key(i)] {'''
+replace = '''
+            .flatten()
+            .filter(|i| !by_file.contains(i.path.as_str()))
+            .find_map(|i| match &verdicts[&key(i)] {'''
+
+[[bug]]
+id = "judge_skips_one_of_a_takes_changes"
+rule = "R3e"
+seeds = 64
+find = '''
+            &self.edit_of(&self.first_parent(c), c),
+            c,
+        )'''
+replace = '''
+            &{
+                let mut e = self.edit_of(&self.first_parent(c), c);
+                e.pop();
+                e
+            },
+            c,
+        )'''
+
+[[bug]]
+id = "landing_locks_only_what_it_writes"
+rule = "R9.1"
+seeds = 64
+find = '''
+        files.extend(self.touches_of(c));'''
+replace = '''
+        let _ = c;'''
+
+[[bug]]
+id = "append_on_a_partial_line_adds_a_line"
+rule = "R10"
+seeds = 64
+find = '''
+                && !rest.is_empty()'''
+replace = '''
+                && !rest.is_empty()
+                && false'''
+
+[[bug]]
+id = "line_follows_the_upstreams_unfinished_last_line"
+rule = "R10.4"
+seeds = 64
+find = '''
+                for l in after {
+                    verdicts.insert((p.to_string(), l.line.clone()), Verdict::Lose(q.id.clone()));
+                }'''
+replace = '''
+                let _ = after;'''
+
+[[bug]]
+id = "hole_is_not_nul"
+rule = "R8"
+seeds = 64
+find = '''
+                    b.resize(end, 0);'''
+replace = '''
+                    b.resize(end, b' ');'''
+
+[[bug]]
+id = "no_collision_record_in_the_result"
+rule = "R5.1"
+seeds = 64
+find = '''
+        msg.extend(decisions.iter().map(Decision::render));'''
+replace = '''
+        let _ = decisions;'''
+
+[[bug]]
+id = "collision_record_in_the_wrong_commit"
+rule = "R5.1"
+seeds = 64
+find = '''
+            self.record(t, Direction::Transaction, &m, &decisions, &ours, &c);'''
+replace = '''
+            self.record(t, Direction::Transaction, &m, &decisions, &ours, &ours);'''
+
+[[bug]]
+id = "incoming_insert_before_the_upstreams"
+rule = "R10.7"
+seeds = 64
+find = '''
+        while at < lines.len() && !in_src.contains(lines[at].line.as_str()) {
+            at += 1;
+        }'''
+replace = '''
+'''
+
+[[bug]]
+id = "edit_of_a_file_the_upstream_unlinked_applies"
+rule = "R11"
+seeds = 64
+find = '''
+            if !cur.name.live() && unlink.is_none() && !creates {'''
+replace = '''
+            if false && !cur.name.live() && unlink.is_none() && !creates {'''
+
+[[bug]]
+id = "entry_overtakes_a_waiting_entry_of_its_file"
+rule = "P1"
+seeds = 64
+find = '''
+            if sources.contains(&e.source()) || !mine.is_disjoint(&files) {'''
+replace = '''
+            if sources.contains(&e.source()) {'''
+
+[[bug]]
+id = "entry_overtakes_a_waiting_entry_of_its_fork"
+rule = "P1"
+seeds = 64
+find = '''
+            if sources.contains(&e.source()) || !mine.is_disjoint(&files) {'''
+replace = '''
+            if !mine.is_disjoint(&files) {'''
+
+[[bug]]
+id = "atomic_save_leaves_the_old_object"
+rule = "R11"
+seeds = 64
+find = '''
+                        self.inodes.remove(&(h.target, g.clone()));
+                        if let Some(o) = o {
+                            self.inodes.insert((h.target, g.clone()), o);
+                        }'''
+replace = '''
+'''
+
+[[bug]]
+id = "crash_saves_an_open_a_save_names"
+rule = "R12"
+seeds = 64
+find = '''
+        if self.saved(id) {'''
+replace = '''
+        if false && self.saved(id) {'''
+
+[[bug]]
+id = "crash_drops_the_journal"
+rule = "R12"
+seeds = 64
+find = '''
+        let tokens = self.save_handle(&h);
+        self.note(format!(
+            "crash: h{id} replayed from the journal: saved {tokens:?}"'''
+replace = '''
+        let tokens: Vec<String> = Vec::new();
+        let _ = &h;
+        self.note(format!(
+            "crash: h{id} replayed from the journal: saved {tokens:?}"'''
+
+[[bug]]
+id = "crash_relinks_a_dead_open"
+rule = "R12"
+seeds = 64
+find = '''
+        let h = self.handles.remove(&id).expect("an open to replay");'''
+replace = '''
+        let h = self.handles.remove(&id).expect("an open to replay");
+        self.inodes.insert((h.target, h.file.clone()), h.object);'''
+
+[[bug]]
+id = "waiting_take_records_only_open_files"
+rule = "R9"
+seeds = 64
+find = '''
+                    until: files.clone(),
+                    files,'''
+replace = '''
+                    until: files.clone(),
+                    files: open.clone(),'''
+
+[[bug]]
+id = "crash_drops_a_transactions_journal"
+rule = "R12"
+seeds = 64
+find = '''
+    fn restart_open_unshown(&mut self, id: HandleId) {'''
+replace = '''
+    fn restart_open_unshown(&mut self, id: HandleId) {
+        if matches!(self.handles[&id].target, Target::Txn(..)) {
+            self.handles.remove(&id);
+            return;
+        }'''
+
+[[bug]]
+id = "p3_open_waits_behind_a_waiting_take"
+rule = "P3"
+seeds = 64
+find = '''
+        let file = self
+            .lookup(&self.target_head(target), p)
+            .unwrap_or_else(|| {
+                panic!("open_write of {p}: no such file ([`World::create`] makes one)")
+            });'''
+replace = '''
+        let file = self
+            .lookup(&self.target_head(target), p)
+            .unwrap_or_else(|| {
+                panic!("open_write of {p}: no such file ([`World::create`] makes one)")
+            });
+        if self
+            .waits
+            .get(&tree_of(target))
+            .is_some_and(|m| m.values().any(|x| x.files.contains(&file)))
+        {
+            panic!("P3: a new write-open waits behind a waiting take of {file}");
+        }'''
+
+[[bug]]
+id = "sync_delivers_past_an_open_file"
+rule = "P2"
+seeds = 64
+find = '''
+        if open.is_empty() || chain.is_empty() {'''
+replace = '''
+        if true || open.is_empty() || chain.is_empty() {'''
+
+[[bug]]
+id = "sync_never_delivers_a_prefix"
+rule = "P2"
+seeds = 64
+find = '''
+                return Prefix {
+                    deliver,
+                    until: Some(now.difference(&before).cloned().collect()),
+                };'''
+replace = '''
+                return Prefix {
+                    deliver: None,
+                    until: Some(now.difference(&before).cloned().collect()),
+                };'''
+
+[[bug]]
+id = "finding_11_reverted_two_renames_clash"
+rule = "R11"
+seeds = 64
+find = '''
+        self.keep_own_names(ours, up, &mut files);'''
+replace = '''
+'''
+
+[[bug]]
+id = "finding_25_reverted_rename_over_loses_by_its_name"
+rule = "R11"
+seeds = 64
+find = '''
+                    .find(|(g, m)| g != f && m.text() == n.text() && !replaced.contains(g.as_str()))'''
+replace = '''
+                    .find(|(g, m)| g != f && m.text() == n.text())'''
+
+[[bug]]
+id = "finding_26_reverted_agreeing_delete_dropped"
+rule = "R10.3"
+seeds = 64
+find = '''
+        } else if !p.live() && !i.version.live() {
+            Verdict::Apply'''
+replace = '''
+        } else if !p.live() && !i.version.live() {
+            Verdict::Drop'''
+
+[[bug]]
+id = "transaction_close_saves_at_once"
+rule = "R5.3"
+seeds = 64
+find = '''
+        if self.defer(h) {
+            return;
+        }
+        let handle = self.handles.remove(&h).expect("an open file");'''
+replace = '''
+        let handle = self.handles.remove(&h).expect("an open file");'''
+
+[[bug]]
+id = "deferred_calls_applied_out_of_order"
+rule = "R5.3"
+seeds = 64
+find = '''
+        let id = fork.deferred.pop_front()?;'''
+replace = '''
+        let id = fork.deferred.pop_back()?;'''
+
+[[bug]]
+id = "rollback_drops_deferred_calls"
+rule = "R5.3"
+seeds = 64
+find = '''
+        self.rollback_only(f)?;
+        while self.apply_deferred(f).is_some() {}'''
+replace = '''
+        self.rollback_only(f)?;
+        self.forks.get_mut(&f).expect("fork").deferred.clear();'''
+
+[[bug]]
+id = "crash_drops_deferred_calls"
+rule = "R5.3"
+seeds = 64
+find = '''
+        self.waits.clear();
+        let replay = self'''
+replace = '''
+        self.waits.clear();
+        for f in self.forks.values_mut() {
+            f.deferred.clear();
+        }
+        self.handles.retain(|_, h| !h.deferred);
+        let replay = self'''
+
+[[bug]]
+id = "p43a_hide_after_any_own_line"
+rule = "R10.9"
+seeds = 64
+find = '''
+        .position(|l| own.contains(&l.line) && unfinished(l))
+    else {'''
+replace = '''
+        .position(|l| own.contains(&l.line))
+    else {'''
+
+[[bug]]
+id = "p43b_hide_after_an_own_delete"
+rule = "R10.9"
+seeds = 64
+find = '''
+        .position(|l| own.contains(&l.line) && unfinished(l))
+    else {'''
+replace = '''
+        .position(|l| own.contains(&l.line) && (unfinished(l) || !l.live()))
+    else {'''
+
+[[bug]]
+id = "p46m_a_take_locks_files_not_names"
+rule = "R9.1"
+seeds = 64
+find = '''
+        files.into_iter().chain(names).collect()
+    }'''
+replace = '''
+        let _ = names;
+        files.into_iter().collect()
+    }'''
+
+[[bug]]
+id = "p46s_sync_name_keys_from_the_parent"
+rule = "R9.1"
+seeds = 500
+find = '''
+            let after = tree.as_deref().unwrap_or(ours);'''
+replace = '''
+            let after = c;'''
+
+[[bug]]
+id = "p47_unlink_loses_to_a_line_of_a_file_unlinked_too"
+rule = "R10.3"
+seeds = 500
+find = '''
+                && verdicts[&key(u)] == Verdict::Apply
+                && cur.name.live()'''
+replace = '''
+                && verdicts[&key(u)] == Verdict::Apply'''
+
+[[bug]]
+id = "lineage_landing_drops_the_fork_commit"
+rule = "R7"
+seeds = 64
+find = '''
+        let new = self.commit_deciding(
+            &[&ours, tip],'''
+replace = '''
+        let new = self.commit_deciding(
+            &[&ours],'''
+
+[[bug]]
+id = "converge_move_queues_one_child_only"
+rule = "R1"
+seeds = 64
+find = '''
+        for c in self.children(t) {
+            self.next_seq += 1;'''
+replace = '''
+        for c in self.children(t).into_iter().take(1) {
+            self.next_seq += 1;'''

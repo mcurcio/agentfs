@@ -14,28 +14,36 @@ use crate::world::{
     origin_in,
 };
 
+/// `r`'s error named for `check`: planted/matrix.tsv records the first check tripped.
+fn named<T>(check: &'static str, r: Result<T, String>) -> Result<T, String> {
+    r.map_err(|e| format!("{check}: {e}"))
+}
+
 /// Every invariant that holds after any step.
 pub fn check(w: &mut World) -> Result<(), String> {
     let now = views(w);
-    no_silent_loss(w, &now)?;
-    no_flicker(w, &now)?;
+    named("no_silent_loss", no_silent_loss(w, &now))?;
+    named("no_flicker", no_flicker(w, &now))?;
     w.views = now;
-    locks(w)?;
-    upstream_wins(w)?;
-    changes_whole(w)?;
-    syncs_deliver(w)?;
-    transactions_end_as_told(w)?;
-    transactions_undisturbed(w)?;
+    named("locks", locks(w))?;
+    named("upstream_wins", upstream_wins(w))?;
+    named("changes_whole", changes_whole(w))?;
+    named("syncs_deliver", syncs_deliver(w))?;
+    named("transactions_end_as_told", transactions_end_as_told(w))?;
+    named("transactions_undisturbed", transactions_undisturbed(w))?;
     let discards = w.grepped.0 != w.discarded.len();
     if w.refs_checked != Some(w.ref_moves) || discards {
         let all = w.all_commits();
-        one_writer(w, &all)?;
-        discarded_leave_no_trace(w, &all)?;
+        named("one_writer", one_writer(w, &all))?;
+        named(
+            "discarded_leave_no_trace",
+            discarded_leave_no_trace(w, &all),
+        )?;
         w.refs_checked = Some(w.ref_moves);
     }
-    rename_overs_whole(w)?;
-    full_lineage(w)?;
-    placed_and_unlinked(w)?;
+    named("rename_overs_whole", rename_overs_whole(w))?;
+    named("full_lineage", full_lineage(w))?;
+    named("placed_and_unlinked", placed_and_unlinked(w))?;
     Ok(())
 }
 
@@ -49,6 +57,10 @@ pub fn check(w: &mut World) -> Result<(), String> {
 /// sync records no collision (only an upstream's queue decides one) and
 /// carries the head its take read. Returns the queue entries taken.
 pub fn step_checked(w: &mut World, s: &Step) -> Result<usize, String> {
+    named("step_checked", step_rules(w, s))
+}
+
+fn step_rules(w: &mut World, s: &Step) -> Result<usize, String> {
     let Step::Next(t) = s else {
         return Ok(w.step(s));
     };
@@ -346,6 +358,12 @@ fn diff_files(w: &World, a: &str, b: &str) -> BTreeSet<String> {
 /// fork's newer non-colliding edit": once the queues drain, a fork has no
 /// newer edit left.
 pub fn check_converged(w: &World) -> Result<(), String> {
+    named("check_converged", drained(w))?;
+    named("losers_pushed", losers_pushed(w))?;
+    named("check_converged", trees_equal_main(w))
+}
+
+fn drained(w: &World) -> Result<(), String> {
     if let Some(s) = w
         .pending()
         .iter()
@@ -359,7 +377,10 @@ pub fn check_converged(w: &World) -> Result<(), String> {
     if !w.waits().is_empty() {
         return Err(format!("a lock outlives the run: waits {:?}", w.waits()));
     }
-    losers_pushed(w)?;
+    Ok(())
+}
+
+fn trees_equal_main(w: &World) -> Result<(), String> {
     for t in w.live_trees() {
         for p in PATHS {
             let (mine, main) = (w.file(&w.head(t), p), w.file(&w.main_head, p));
