@@ -3,7 +3,7 @@
 //! A test marked `#[ignore = "coherence finding N: ..."]` asserts what the
 //! rules intend but do not deliver; run it with `--ignored`.
 
-use agentfs_model::check::{check, check_converged, step_checked};
+use agentfs_model::check::Checked;
 use agentfs_model::content::{BLANK, Content, Layout, Line, State};
 use agentfs_model::git::{git, with_reversed_dates};
 use agentfs_model::world::{
@@ -12,39 +12,39 @@ use agentfs_model::world::{
 };
 use std::collections::BTreeSet;
 
-fn world() -> World {
-    World::new(Policies::default())
+fn world() -> Checked {
+    Checked::new(Policies::default())
 }
 
 /// Every invariant, now.
-fn ok(w: &mut World) {
-    if let Err(e) = check(w) {
+fn ok(w: &mut Checked) {
+    if let Err(e) = w.check() {
         panic!("{e}\nlog:\n  {}", w.log.join("\n  "));
     }
 }
 
-/// One step ([`step_checked`]), then every invariant.
-fn take(w: &mut World, s: &Step) {
-    if let Err(e) = step_checked(w, s) {
+/// One step ([`Checked::step_checked`]), then every invariant.
+fn take(w: &mut Checked, s: &Step) {
+    if let Err(e) = w.step_checked(s) {
         panic!("{e}\nlog:\n  {}", w.log.join("\n  "));
     }
     ok(w);
 }
 
 /// One queued change taken whole (rule 9: one step), then every invariant.
-fn next(w: &mut World, t: Tree) {
+fn next(w: &mut Checked, t: Tree) {
     take(w, &Step::Next(t));
     assert!(w.waits().get(&t).is_none(), "{t:?}'s queue waits");
 }
 
 /// Every step until none is left, checking after each; then convergence.
-fn drain(w: &mut World) {
+fn drain(w: &mut Checked) {
     ok(w);
     while let Some(s) = w.pending().into_iter().next() {
         w.note_step(&s);
         take(w, &s);
     }
-    if let Err(e) = check_converged(w) {
+    if let Err(e) = w.converged() {
         panic!("{e}\nlog:\n  {}", w.log.join("\n  "));
     }
 }
@@ -385,8 +385,8 @@ fn finding_1_git_merge_base_on_crossing_merges() {
     crossing(MergeRule::GitMergeBase);
 }
 
-fn crossing(merge: MergeRule) -> (World, String) {
-    let mut w = World::new(Policies {
+fn crossing(merge: MergeRule) -> (Checked, String) {
+    let mut w = Checked::new(Policies {
         merge,
         ..Policies::default()
     });
@@ -741,8 +741,8 @@ fn finding_6_git_hunks_on_neighbouring_lines() {
     neighbours(MergeRule::GitMergeBase);
 }
 
-fn neighbours(merge: MergeRule) -> (World, [String; 2]) {
-    let mut w = World::new(Policies {
+fn neighbours(merge: MergeRule) -> (Checked, [String; 2]) {
+    let mut w = Checked::new(Policies {
         merge,
         layout: Layout::Adjacent,
     });
@@ -1122,7 +1122,7 @@ fn convergence_when_writes_stop() {
 /// The fork's program read `a` before main's m reached it by sync,
 /// then opens `a`, makes one write call and closes. Returns the world, the
 /// program's stale read, the synced m, and the fork.
-fn read_then_sync() -> (World, Content, String, u32) {
+fn read_then_sync() -> (Checked, Content, String, u32) {
     let mut w = world();
     let f = w.create_fork(Tree::Main);
     let o = w.save(&m1(), "a", 0);
@@ -1186,7 +1186,7 @@ fn r8_a_stale_rewrite_overwrites_the_synced_line_and_history_keeps_it() {
         read.get(0).and_then(|l| l.text()),
         "o's bytes, back"
     );
-    assert!(r.starts_with("c1.") && w.lineage.descends(&r, &m));
+    assert!(r.starts_with("c1.") && w.descends(&r, &m));
     drain(&mut w);
     assert!(has(&w, Tree::Main, "a", &r) && !has(&w, Tree::Main, "a", &m));
     assert!(w.collisions.is_empty(), "no collision");
@@ -1254,7 +1254,7 @@ fn calls(w: &mut World, c: &Client, p: &str, calls: &[Write]) {
 
 /// `a` holding `foo` with no final newline, saved by main: one line, the
 /// file's last six lines deleted. Returns that line's identity.
-fn foo_without_newline(w: &mut World) -> String {
+fn foo_without_newline(w: &mut Checked) -> String {
     calls(
         w,
         &m1(),
@@ -2402,7 +2402,7 @@ fn texts(lines: &[&str]) -> Content {
     c
 }
 
-fn ends_converged_without_collisions(w: &mut World) {
+fn ends_converged_without_collisions(w: &mut Checked) {
     drain(w);
     assert!(w.collisions.is_empty(), "{:?}", w.collisions);
 }
@@ -2483,7 +2483,7 @@ fn r10_a_delete_against_a_concurrent_edit_the_upstream_wins() {
 
 /// Lines 0 to 3 of `p` given distinct bytes by main, then every tree
 /// synced: their bytes, in order.
-fn distinct(w: &mut World, p: &str) -> Vec<String> {
+fn distinct(w: &mut Checked, p: &str) -> Vec<String> {
     let h = w.open_write(&m1(), p);
     let made: Vec<String> = (0..4).filter_map(|i| w.edit(h, LineEdit::At(i))).collect();
     w.close(h);
@@ -3779,7 +3779,7 @@ fn finding_50_a_held_back_decision_is_excused_only_while_a_lock_holds_it() {
     w.step(&Step::Next(Tree::Fork(f2)));
     assert!(w.prefix_syncs > 0, "a prefix sync");
     w.close(held);
-    let e = check(&mut w).expect_err("no lock holds that sync back now");
+    let e = w.check().expect_err("no lock holds that sync back now");
     assert!(e.contains(&format!("at {x}, which")), "{e}");
 }
 
@@ -3827,7 +3827,7 @@ fn finding_47_a_rename_over_agrees_with_an_unlink_over_an_unseen_edit() {
     next(&mut w, Tree::Main);
     assert!(w.last_take().is_some(), "main takes the fork's rename-over");
     assert!(w.collisions.is_empty(), "{:?}", w.collisions);
-    let paths = TreeCalls::paths(&w, TreeId::Main).unwrap();
+    let paths = TreeCalls::paths(&*w, TreeId::Main).unwrap();
     assert!(
         paths.contains(&"c".to_string()) && !paths.contains(&"b".to_string()),
         "{paths:?}"

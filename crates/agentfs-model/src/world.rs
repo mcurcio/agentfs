@@ -30,7 +30,7 @@ use crate::calls::{
     CallError, Caller, Recorded, RecordedCall, Shown, ShownCollision, Took, TreeCalls, TreeId,
     gather_collisions, out_of_scope,
 };
-use crate::content::{Content, Layout, Line, Lineage, PATHS, State, UNBORN, split_lines};
+use crate::content::{Content, Layout, Line, PATHS, State, UNBORN, split_lines};
 use crate::git::{git, git_in, try_git};
 use crate::program;
 pub use crate::program::LineEdit;
@@ -729,7 +729,6 @@ pub struct World {
     waits: BTreeMap<Tree, BTreeMap<u64, Waiting>>,
     /// The files each landing commit's own changes touch, cached.
     touches: RefCell<BTreeMap<String, BTreeSet<String>>>,
-    pub lineage: Lineage,
     counters: BTreeMap<String, u32>,
     pub collisions: Vec<Collision>,
     /// Every token that entered a tree: written in it, carried into it by a
@@ -760,44 +759,12 @@ pub struct World {
     parents: RefCell<BTreeMap<String, Vec<String>>>,
     ancestry: RefCell<BTreeMap<(String, String), bool>>,
     over: RefCell<BTreeMap<String, Vec<String>>>,
-    /// `check`'s state: its last view of each tree and caches over
-    /// immutable git objects.
-    pub(crate) views: BTreeMap<Tree, BTreeMap<String, Content>>,
-    /// Every (tree, file, line identity, version) a tree has shown and
-    /// then replaced.
-    pub(crate) left: BTreeSet<(Tree, String, String, String)>,
-    pub(crate) checked_commits: BTreeSet<String>,
-    /// Each open a save names (`Agentfs-Open`), with that save: `check`'s.
-    pub(crate) opens_saved: BTreeMap<String, String>,
-    /// Each rename-over's unlink, read from its save's commit: the replaced
-    /// file's deleted name version, to the renamed file's identity and the
-    /// name version that same save gave it (`check`: one call, whole).
-    pub(crate) rename_overs: BTreeMap<String, (String, String)>,
-    /// Per head: the commits its history reaches.
-    pub(crate) reach: BTreeMap<String, BTreeSet<String>>,
-    pub(crate) grepped: (usize, BTreeSet<String>),
-    pub(crate) collisions_checked: usize,
-    pub(crate) landings_checked: usize,
     /// Main moved, or a collision was recorded, since Replication last
     /// pushed.
     replication_due: bool,
-    pub(crate) syncs_checked: usize,
-    pub(crate) ended_checked: usize,
-    /// `check`'s: per open transaction, its fork's head and the files it had
-    /// saved at the last check.
-    pub(crate) txn_files_seen: BTreeMap<TxnId, (String, BTreeSet<String>)>,
-    pub(crate) ref_moves: u64,
-    pub(crate) refs_checked: Option<u64>,
-    /// Counted by `check` (rules 10 and 11 met in a take, so a run can show
-    /// it exercised them): a new line placed beside an upstream's concurrent
-    /// new line at its place, and a change that edited a file the upstream
-    /// had unlinked.
-    pub inserts_met: usize,
     /// Syncs that delivered only a prefix of the upstream's commits (P2),
     /// counted so a run can show it met them.
     pub prefix_syncs: usize,
-    pub unlinked_edits: usize,
-    pub(crate) placements_checked: usize,
     /// The calls made, as [`crate::calls`] records them, when recording.
     trace: Option<Vec<Recorded>>,
     /// Inside a call that records itself as one: nothing it does records.
@@ -847,7 +814,6 @@ impl World {
             last_take: None,
             waits: BTreeMap::new(),
             touches: RefCell::new(BTreeMap::new()),
-            lineage: Lineage::default(),
             counters: BTreeMap::new(),
             collisions: Vec::new(),
             entered: Vec::new(),
@@ -864,25 +830,8 @@ impl World {
             parents: RefCell::new(BTreeMap::new()),
             ancestry: RefCell::new(BTreeMap::new()),
             over: RefCell::new(BTreeMap::new()),
-            views: BTreeMap::new(),
-            left: BTreeSet::new(),
-            checked_commits: BTreeSet::new(),
-            opens_saved: BTreeMap::new(),
-            rename_overs: BTreeMap::new(),
-            reach: BTreeMap::new(),
-            grepped: (0, BTreeSet::new()),
-            collisions_checked: 0,
-            landings_checked: 0,
             replication_due: false,
-            syncs_checked: 0,
-            ended_checked: 0,
-            txn_files_seen: BTreeMap::new(),
-            ref_moves: 0,
-            refs_checked: None,
-            inserts_met: 0,
             prefix_syncs: 0,
-            unlinked_edits: 0,
-            placements_checked: 0,
             trace: std::env::var_os(TRACE_DIR).map(|_| Vec::new()),
             trace_mute: false,
             trace_label: None,
@@ -1214,13 +1163,11 @@ impl World {
         git_in(&self.repo, &args, msg)
     }
 
-    /// `git update-ref`, counted so `check` re-reads history only after a
-    /// ref moved.
+    /// `git update-ref`.
     fn update_ref(&mut self, args: &[&str]) {
         let mut v = vec!["update-ref"];
         v.extend(args);
         git(&self.repo, &v);
-        self.ref_moves += 1;
     }
 
     fn set_head(&mut self, t: Tree, c: &str) {
@@ -2198,7 +2145,6 @@ impl World {
                         None => self.token(writer, txn),
                     };
                     let line = line.unwrap_or_else(|| id.clone());
-                    self.lineage.wrote(&id, over.as_deref());
                     set.push(Edit {
                         path: p.to_string(),
                         line: line.clone(),
@@ -2408,7 +2354,6 @@ impl World {
         let mut set = Vec::new();
         let name = |w: &mut Self, c: &Content, state: State| {
             let id = w.token(&writer, txn);
-            w.lineage.wrote(&id, Some(&c.name.id));
             let e = Edit {
                 path: c.name.line.clone(),
                 line: c.name.line.clone(),
@@ -2539,7 +2484,6 @@ impl World {
         };
         let cur = self.file(&at, &f);
         let id = self.token(&writer, txn);
-        self.lineage.wrote(&id, Some(&cur.name.id));
         let mut n = cur.clone();
         n.name = Line {
             id: id.clone(),

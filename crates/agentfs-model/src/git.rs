@@ -64,6 +64,10 @@ pub fn try_git(dir: &Path, args: &[&str], input: Option<&str>) -> Output {
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
         .env_remove("GIT_INDEX_FILE")
+        // Every repository the model creates is SHA-1 with loose ref files:
+        // the checks read its object and ref folders directly.
+        .env_remove("GIT_DEFAULT_HASH")
+        .env_remove("GIT_DEFAULT_REF_FORMAT")
         .stdin(if input.is_some() {
             Stdio::piped()
         } else {
