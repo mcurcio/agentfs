@@ -80,7 +80,7 @@ seeds = 64
 find = '''
                     (Verdict::Apply, Some(d)) => (&mut whole, d.clone()),'''
 replace = '''
-                    (Verdict::Apply, Some(_)) if dir == Direction::Landing => {
+                    (Verdict::Apply, Some(_)) if lines.dir == crate::world::Direction::Landing => {
                         applied.push(i.version.clone());
                         continue;
                     }
@@ -93,7 +93,7 @@ seeds = 64
 find = '''
                     (Verdict::Apply, Some(d)) => (&mut whole, d.clone()),'''
 replace = '''
-                    (Verdict::Apply, Some(_)) if dir == Direction::Transaction => {
+                    (Verdict::Apply, Some(_)) if lines.dir == crate::world::Direction::Transaction => {
                         applied.push(i.version.clone());
                         continue;
                     }

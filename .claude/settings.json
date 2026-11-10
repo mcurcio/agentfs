@@ -1,0 +1,13 @@
+{
+  "extraKnownMarketplaces": {
+    "mcurcio-skills": {
+      "source": { "source": "github", "repo": "mcurcio/skills" },
+      "autoUpdate": true
+    }
+  },
+  "enabledPlugins": {
+    "rules@mcurcio-skills": true,
+    "workflow@mcurcio-skills": true,
+    "releases@mcurcio-skills": true
+  }
+}

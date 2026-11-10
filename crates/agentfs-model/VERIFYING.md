@@ -117,8 +117,8 @@ request says in its body that they were run and what they showed.
 
 ## The procedure
 
-1. **Encode the rule in the model first.** Change `src/world.rs` (and `src/content.rs` for what a file holds)
-   so the model does what the rule says. The rule must already be in the
+1. **Encode the rule in the model first.** Change `src/world.rs` (`src/referee/` for a line or name rule, `src/content.rs`
+   for what a file holds) so the model does what the rule says. The rule must already be in the
    [rules ledger](../../docs/target-architecture/rules-ledger.md) as `owner` or `approved`. A rule that is not
    there goes to the owner as a question first, with a recommendation, and is built only after he answers.
    Then add or change the rule's row in MODEL.md's table: the rule in plain words, its ledger ID, and the

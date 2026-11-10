@@ -154,12 +154,25 @@ fn r2_no_clock_commit_dates_decide_nothing() {
     let pinned = run();
     assert_eq!(pinned, run());
     assert_eq!(pinned.1, with_reversed_dates(run).1);
-    let src = concat!(
+    let mut src = concat!(
         include_str!("../src/world.rs"),
         include_str!("../src/check.rs"),
         include_str!("../src/content.rs"),
         include_str!("../src/git.rs")
-    );
+    )
+    .to_string();
+    // Every unit of the referee, read at test time, so a new one is scanned too.
+    let referee = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/referee");
+    let mut units: Vec<_> = std::fs::read_dir(&referee)
+        .expect("src/referee")
+        .map(|e| e.expect("an entry of src/referee").path())
+        .filter(|p| p.extension().is_some_and(|x| x == "rs"))
+        .collect();
+    units.sort();
+    assert!(units.len() > 1, "the referee's units: {units:?}");
+    for u in units {
+        src.push_str(&std::fs::read_to_string(&u).expect("a referee unit"));
+    }
     for clock in ["SystemTime", "Instant", "chrono", "UNIX_EPOCH"] {
         assert!(!src.contains(clock), "the model reads a clock: {clock}");
     }

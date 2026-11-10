@@ -46,4 +46,5 @@ pub mod content;
 pub mod digest;
 pub mod git;
 pub mod program;
+mod referee;
 pub mod world;

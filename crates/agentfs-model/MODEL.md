@@ -206,8 +206,8 @@ An open or rejected finding has a test marked `#[ignore = "coherence finding N: 
    keeping the fork's side of it withholds main's decided neighbouring line.
    `finding_6_git_hunks_on_neighbouring_lines`.
 7. **The merge an implementation needs is not a git merge strategy.** Findings 1 and 6: so the rule lives in
-   the model's own code (`World::resolve`, `World::adopt`), using git only to store commits and answer "who
-   wrote this line" and "does this history reach that commit". An implementation needs the same.
+   the model's own code (the referee, `src/referee/`: `land` and `sync`), using git only to store commits and
+   answer "who wrote this line" and "does this history reach that commit". An implementation needs the same.
 8. **Resolved: "saw" cannot be read from commit ancestry (R3c.2).** A sync that keeps a fork's undecided line x
    still makes main's commit (with m) a parent of the fork's next commit. Read by commit ancestry, the
    fork's next edit y over x looks "made on m", so y replaces main's winning m with no collision: a
@@ -230,7 +230,8 @@ An open or rejected finding has a test marked `#[ignore = "coherence finding N: 
    11), but a fork that synced first showed two files at one path, and the model stopped there. Rule (a
    choice, recommended in the overnight report of 2026-11-04 without objection): the fork keeps its own name
    until the upstream's queue decides it, and shows the upstream's file under the name it has in the fork
-   (`keep_own_names`); `syncs_deliver` allows exactly that name line to differ from the upstream's.
+   (`Referee::keep_own_names`, `src/referee/names.rs`); `syncs_deliver` allows exactly that name line to differ
+   from the upstream's.
    `r11_two_renames_to_one_path_keep_the_forks_name_until_decided` reproduces it (a rename and a rename-over);
    seeds 253 (every main random run) and 216 (the settings comparison) of 1 to 500, which stopped there, pass.
    Cost: until the decision the fork shows the upstream's file at its old path, and a file the fork never had

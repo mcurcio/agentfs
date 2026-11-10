@@ -364,8 +364,8 @@ of their day: "main" is the root, a "sandbox" is a fork, a "parent" is an upstre
   revisable: at a transaction's commit the transaction is the fork and the tree it began from is its
   upstream (R3f: every tree applies the same rules), so R10.8 applies there: an unfinished line the transaction would put
   in front of a line the upstream keeps collides, the upstream wins, the transaction loses whole and the program is told
-  (R3e, R5). Not built: world.rs's landing gate (`if dir == Direction::Landing` in `resolve`) switches R10.4 and R10.8
-  off at a transaction commit.
+  (R3e, R5). Not built: the model's landing gate (`if dir == Direction::Landing` in `joins`, `referee/placing.rs`)
+  switches R10.4 and R10.8 off at a transaction commit.
 - **R10.1** · approved · Of two inserts at one place, the upstream's comes first. Approved by the owner, 2026-11-05 (approval page); he asked whether this is only inserts: yes; two edits of one line are a collision the upstream wins (R3b). Tests: `r10_concurrent_inserts_at_one_place_keep_both_the_upstreams_first`
 - **R10.2** · rejected · A partial last line that a merge puts another line after reads as ending in a newline. Owner, 2026-11-05 (in chat, round 2): "collide": a line appended after the upstream's unfinished last line collides with it (R10.4). Gone when: `r10_a_line_after_a_partial_line_reads_terminated`
 - **R11** · approved · A file keeps its identity through renames (like an inode). Its name and existence are one

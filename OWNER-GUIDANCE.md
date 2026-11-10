@@ -15,6 +15,10 @@ on his answer.
 - **Guidance**, 2026-11-09. "We don't need to keep design docs focused on implementation plans. Docs should be purged and rewritten so as to focus on library/human docs. The only design docs that should persist are for future slices that haven't been implemented yet".
 - **Guidance**, 2026-11-09. Of the rules ledger, `docs/target-architecture/git-model.md`, the model's `MODEL.md` and `VERIFYING.md` and the walkthrough: "These stay as the baseline proof and testbed". Applies to: `docs/target-architecture/`.
 
+## Tooling
+
+- **Guidance**, 2026-11-10. On opting agentfs in to his shared skills marketplace (`rules` and `workflow`): "add this config to the current PR, and include semantic release". Applies to: `.claude/settings.json`.
+
 ## Terms
 
 - **Guidance**, 2026-11-08. "the terminology of sandbox/main/parent is nebulous. We should be discussing a pure model of parent/child or upstream/fork." Then: "Terminology: upstream/fork". Applies to: the model, the ledger and the target-architecture pages. [Main is the tree with no upstream.]
