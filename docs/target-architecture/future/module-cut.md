@@ -106,17 +106,40 @@ git's ref files. It does not yet re-derive the rest from git; a later step does,
 
 ## Steps
 
-Each step starts with an architect, who designs that step before anyone implements it. Guidance, owner, 2026-11-09:
-"I want each phase of the work to start with an architect".
+Built: the safety net (the golden digest, the planted-bug corpus and the guarded runner) and the checker's own state,
+`Checked` and `Checker` in `crates/agentfs-model/src/check.rs`. How to use the net is in the model's `VERIFYING.md`
+("Refactoring without changing outcomes") and the repo skill `.claude/skills/model-runs`.
+
+**The model gate.** It holds for every model step below unless the row says otherwise. Every run goes through
+`ci/model-docker.sh`, with no other model container running:
+
+- `ci/model-digest.sh check` matches all 2620 runs;
+- the corpus in fast mode reproduces `planted/matrix.tsv`;
+- both stay within `planted/budget.json`;
+- `run.py --anchors-only` reports no STALE;
+- the model, conformance and safety-net tests pass.
+
+Measured on step 1: digest 627 s, corpus 235 s. A matrix row or digest that changes is a finding to explain, never a
+re-record, except where a row says the digest is re-baselined on purpose.
+
+**How each step runs.** Each step is its own session and its own PR to `main`, in this order:
+
+1. **Architect.** It designs the step and probes its risky seams, before anyone implements it. Guidance, owner,
+   2026-11-09: "I want each phase of the work to start with an architect".
+2. **Implementer.** It builds the step in a few large slices, each green alone.
+3. **Review.** One adversarial review attacks what the gate cannot see.
+4. **Fix round.** One round of fixes, checked by the gate again.
+5. **CI.** The ci and image runs on the PR must be green.
+
+A change to the safety net itself runs its quick tier and a review before any full run.
 
 | # | Step | Gate |
 |---|---|---|
-| 0 | Safety baseline: a golden digest over every scenario and seeds 1 to 500 of each run's refs and commits, with tree names normalised and commit ids and dates left out, so a rename cannot change it and an outcome change must; the planted-bug corpus as anchored mutants that survive code moves, with a runner and a baseline matrix | Digest reproduces; every planted bug is caught |
-| 1 | Model: checker state out of `World` | Digest, scenarios, 500 seeds and the bug matrix unchanged |
-| 2 | Model: referee units out of `resolve`, `adopt` and `splice` | Same |
-| 3 | Model: queue and locks, and recording, split out; one tree identity with an optional upstream, keeping today's order (root first, forks ascending); `World` is the composition root; the replicate step keeps its place among the pending steps, because random runs draw from that list | Same. Names may change, outcomes may not |
+| 2 | Model: referee units out of `resolve`, `adopt` and `splice` | The model gate |
+| 3 | Model: queue and locks, and recording, split out. One tree identity with an optional upstream, keeping today's order (root first, forks ascending). `World` is the composition root. The replicate step keeps its place among the pending steps, because random runs draw from that list. The digest's tree labels come from `World::name`, `World::branch`, `World::txn_name` and `World::txn_branch`, so this step edits them, and `canonical_text_is_pinned` must stay unchanged | The model gate. Names may change, outcomes may not |
 | 4 | Recorder: an engine call sequence becomes a model trace, so a regression found on a mount replays in the model. Guidance, owner, 2026-11-07: "if new regressions are found in the implementation, then those regressions can be verified and fixed via the git model" | One known regression replays |
 | 5 | Engine: remove the duplicated ancestry check, name combining and R3e; a typed version; then split `tree_actor/mod.rs` | Conformance traces on every scenario and seed stay at 0 mismatched |
-| 6 | Model: R9.18, R10.5 and R10.11 (see [transactions](transactions.md)); the built-in `remote` and its replicate step leave `World` | The digest is re-baselined on purpose; finding 30's test is no longer ignored |
+| 6 | Model: R9.18, R10.5 and R10.11 (see [transactions](transactions.md)); the built-in `remote` and its replicate step leave `World`. `MODEL.md` says Replication is "due on every move of main and every collision", which is stricter than any check: a planted bug that dropped the flag at a collision changed no digest and tripped no check, because the next move of main pushes anyway. This step settles what a mirror's push timing must be | The digest is re-baselined on purpose; finding 30's test is no longer ignored |
+| later | Checker: re-derive from git what it still reads through `World` (the table under design rule 3) | The matrix changes on purpose, with every planted bug still caught |
 
 Not in this slice: the older engine (`volume.rs`, `push.rs`), and building mirrors on the tree model.
