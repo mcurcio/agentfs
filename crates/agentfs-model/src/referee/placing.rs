@@ -55,7 +55,8 @@ impl<L: Lineage + ?Sized> Referee<'_, L> {
 
 /// A sync's files: each changed file's kept versions placed over the upstream's
 /// file in the fork's order, its joins hidden; only the files that differ from
-/// the upstream's.
+/// the upstream's. Sync's names ([`Referee::keep_own_names`]) read these
+/// placed files, so they run after it.
 pub(super) fn kept(own: Vec<Own>) -> BTreeMap<String, Content> {
     let mut files = BTreeMap::new();
     for Own {

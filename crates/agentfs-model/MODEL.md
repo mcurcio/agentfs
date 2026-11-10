@@ -230,7 +230,8 @@ An open or rejected finding has a test marked `#[ignore = "coherence finding N: 
    11), but a fork that synced first showed two files at one path, and the model stopped there. Rule (a
    choice, recommended in the overnight report of 2026-11-04 without objection): the fork keeps its own name
    until the upstream's queue decides it, and shows the upstream's file under the name it has in the fork
-   (`Referee::keep_own_names`, `src/referee/names.rs`); `syncs_deliver` allows exactly that name line to differ from the upstream's.
+   (`Referee::keep_own_names`, `src/referee/names.rs`); `syncs_deliver` allows exactly that name line to differ
+   from the upstream's.
    `r11_two_renames_to_one_path_keep_the_forks_name_until_decided` reproduces it (a rename and a rename-over);
    seeds 253 (every main random run) and 216 (the settings comparison) of 1 to 500, which stopped there, pass.
    Cost: until the decision the fork shows the upstream's file at its old path, and a file the fork never had

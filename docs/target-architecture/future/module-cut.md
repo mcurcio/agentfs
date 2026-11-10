@@ -1,6 +1,6 @@
 # Cutting the tree engine into modules
 
-**Proposed, not built.** This page proposes one home per rule: six modules, with the tree actor only composing them,
+**Partly built: the model's referee units are built.** This page proposes one home per rule: six modules, with the tree actor only composing them,
 in both the model and the engine. The commit that lands this slice deletes this page and moves the behaviour into the
 library docs.
 
@@ -110,9 +110,9 @@ git's ref files. It does not yet re-derive the rest from git; a later step does,
 ## Steps
 
 Built: the safety net (the golden digest, the planted-bug corpus and the guarded runner) and the checker's own state,
-`Checked` and `Checker` in `crates/agentfs-model/src/check.rs`, and the model's referee in
-`crates/agentfs-model/src/referee/` (step 2): one file per unit, `land` and `sync` its only entry points, the world
-building the trees from their plans. How to use the net is in the model's `VERIFYING.md`
+`Checked` and `Checker` in `crates/agentfs-model/src/check.rs`. The model's referee is in
+`crates/agentfs-model/src/referee/`: one file per unit, with `land` and `sync` its only entry points. The world builds
+the trees from their plans. How to use the net is in the model's `VERIFYING.md`
 ("Refactoring without changing outcomes") and the repo skill `.claude/skills/model-runs`.
 
 **The model gate.** It holds for every model step below unless the row says otherwise. Every run goes through

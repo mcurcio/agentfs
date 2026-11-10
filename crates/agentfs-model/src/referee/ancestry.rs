@@ -6,8 +6,9 @@ use super::Referee;
 use crate::content::{Content, Line};
 
 /// Ancestry and commit reachability, over git in the model: every read the
-/// referee makes. Each answer is about immutable objects, so it is the same
-/// whenever it is asked.
+/// referee makes. Each answer is about immutable objects, and the world caches
+/// it. A version is written once, so the order of reads does not change an
+/// answer, though `origin_of` keeps the answer of the first asker.
 pub(crate) trait Lineage {
     /// File `p` (its identity) at a commit or tree.
     fn file(&self, at: &str, p: &str) -> Content;

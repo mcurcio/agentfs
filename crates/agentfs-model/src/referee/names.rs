@@ -15,7 +15,7 @@ impl<L: Lineage + ?Sized> Referee<'_, L> {
         let by_file = &mut lines.by_file;
         // A rename-over (one call: both name lines, in one save) needs no
         // rule of its own: if either half loses, the save loses whole
-        // (rule 3e, below). So the path its unlink half would have freed is
+        // (rule 3e, in `whole`). So the path its unlink half would have freed is
         // no claim against its rename half (finding 25): a file this change
         // itself replaces keeps its name only because the change lost, and
         // the rename loses with it (`By::Whole`), not to that name.
@@ -75,7 +75,8 @@ impl<L: Lineage + ?Sized> Referee<'_, L> {
     /// again: each file whose upstream's name clashes with a name the sync
     /// shows is shown under its fork's name, until no two clash; the fork's
     /// own tree has no clash, so this ends. `files`: the sync's changed
-    /// files, by identity, over `up`.
+    /// files, by identity, over `up`. It reads the placed files, so a sync
+    /// runs it after [`super::placing::kept`].
     pub(super) fn keep_own_names(
         &self,
         ours: &str,
