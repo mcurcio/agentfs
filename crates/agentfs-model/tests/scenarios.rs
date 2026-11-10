@@ -156,6 +156,7 @@ fn r2_no_clock_commit_dates_decide_nothing() {
     assert_eq!(pinned.1, with_reversed_dates(run).1);
     let src = concat!(
         include_str!("../src/world.rs"),
+        include_str!("../src/referee/mod.rs"),
         include_str!("../src/check.rs"),
         include_str!("../src/content.rs"),
         include_str!("../src/git.rs")
