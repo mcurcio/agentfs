@@ -201,8 +201,13 @@ fn connect(
     )
 }
 
+/// The deadline of every call in a test whose subject is not the
+/// deadline: far above any runner, so a slow runner cannot fail it. Only
+/// the tests of the deadline itself set a short one.
+const NO_DEADLINE: Duration = Duration::from_secs(600);
+
 fn front(env: &Env, name: &str) -> Front {
-    front_with_timeout(env, name, Duration::from_secs(10))
+    front_with_timeout(env, name, NO_DEADLINE)
 }
 
 fn front_with_timeout(env: &Env, name: &str, timeout: Duration) -> Front {
@@ -877,15 +882,7 @@ fn a_lost_reply_is_never_resent() {
     let seen = fake.seen.clone();
     let server = FakeServer::start(&env, fake);
     let sink = Arc::new(MemorySink::new());
-    let client = connect(
-        &env,
-        &lease,
-        pod("pod-a"),
-        "vol",
-        Duration::from_secs(5),
-        sink.clone(),
-    )
-    .unwrap();
+    let client = connect(&env, &lease, pod("pod-a"), "vol", NO_DEADLINE, sink.clone()).unwrap();
     let recorder = front_on(&env, client, sink);
     let result = close(&env, &recorder, "a", "1");
     assert_eq!(seen.record.load(Ordering::SeqCst), 1, "resent: {result:?}");
@@ -906,15 +903,7 @@ fn a_busy_service_fails_the_boundary_without_an_outage_alarm() {
     // the socket next is at its connection limit.
     let first = FakeServer::start(&env, Fake::new(&env, OnRecord::Answer));
     let sink = Arc::new(MemorySink::new());
-    let client = connect(
-        &env,
-        &lease,
-        pod("pod-a"),
-        "vol",
-        Duration::from_secs(5),
-        sink.clone(),
-    )
-    .unwrap();
+    let client = connect(&env, &lease, pod("pod-a"), "vol", NO_DEADLINE, sink.clone()).unwrap();
     let recorder = front_on(&env, client, sink.clone());
     drop(first);
     let _busy = FakeServer::start(
@@ -955,15 +944,7 @@ fn record_failure(code: tonic::Code) -> (ClientError, usize) {
     let lease = FrontLease::acquire(&env.state, "pod=a").unwrap();
     let _server = FakeServer::start(&env, Fake::new(&env, OnRecord::Fail(code)));
     let sink = Arc::new(MemorySink::new());
-    let client = connect(
-        &env,
-        &lease,
-        pod("pod-a"),
-        "vol",
-        Duration::from_secs(5),
-        sink.clone(),
-    )
-    .unwrap();
+    let client = connect(&env, &lease, pod("pod-a"), "vol", NO_DEADLINE, sink.clone()).unwrap();
     let recorder = front_on(&env, client, sink);
     match close(&env, &recorder, "a", "1").unwrap_err() {
         VolumeError::HistoryService(e) => (e, slot_copies(&env, 1)),
@@ -1003,7 +984,7 @@ fn ping_of_a_service_that_is_not_serving_is_unreachable() {
         &lease,
         pod("a"),
         "vol",
-        Duration::from_secs(5),
+        NO_DEADLINE,
         Arc::new(NullSink),
     )
     .unwrap();
@@ -1031,7 +1012,7 @@ fn a_service_of_another_protocol_is_refused() {
         &lease,
         pod("a"),
         "vol",
-        Duration::from_secs(5),
+        NO_DEADLINE,
         Arc::new(NullSink),
     ) {
         Err(ClientError::Refused { reason, .. }) => {
@@ -1056,7 +1037,7 @@ fn a_service_without_still_last_is_never_asked() {
         &lease,
         pod("a"),
         "vol",
-        Duration::from_secs(5),
+        NO_DEADLINE,
         Arc::new(NullSink),
     )
     .unwrap();
@@ -1138,7 +1119,7 @@ fn the_service_refuses_fronts_it_cannot_serve() {
         Err(e) => panic!("{e:?}"),
         Ok(_) => panic!("admitted"),
     };
-    let timeout = Duration::from_secs(5);
+    let timeout = NO_DEADLINE;
 
     let reason = refused(connect(
         &env,
@@ -1718,7 +1699,7 @@ fn ping_measures_a_round_trip() {
         &lease,
         pod("a"),
         "vol",
-        Duration::from_secs(5),
+        NO_DEADLINE,
         Arc::new(NullSink),
     )
     .unwrap();
@@ -1829,13 +1810,19 @@ fn a_restarted_service_does_not_fail_the_next_boundary() {
 fn a_record_over_4_mib_is_journaled() {
     use prost::Message as _;
 
-    const CHANGES: usize = 50_000;
+    // Few changes with long paths: the record's size, not the service's
+    // work per change, is the subject. Each path is about 3.6 KB, under
+    // Linux's PATH_MAX, in 250-byte names, under NAME_MAX.
+    const CHANGES: usize = 1_200;
     let env = env();
     let service = Service::start(&env);
     let a = front(&env, "pod-a");
-    let dir = env.tree.join("links");
-    std::fs::create_dir_all(&dir).unwrap();
-    let name = |n: usize| format!("links/{n:0>90}");
+    let dir = std::iter::once("links".to_owned())
+        .chain(std::iter::repeat_n("d".repeat(250), 14))
+        .collect::<Vec<_>>()
+        .join("/");
+    std::fs::create_dir_all(env.tree.join(&dir)).unwrap();
+    let name = |n: usize| format!("{dir}/{n:0>90}");
     for n in 0..CHANGES {
         std::os::unix::fs::symlink("target", env.tree.join(name(n))).unwrap();
     }
@@ -2045,7 +2032,7 @@ impl FrontHooks for Noting {
 
 fn listening_client(env: &Env, lease: &FrontLease, name: &str) -> Arc<HistoryClient> {
     let sink = Arc::new(MemorySink::new());
-    Arc::new(connect(env, lease, pod(name), "vol", Duration::from_secs(10), sink).unwrap())
+    Arc::new(connect(env, lease, pod(name), "vol", NO_DEADLINE, sink).unwrap())
 }
 
 fn path(p: &str) -> RepoPath {
