@@ -49,8 +49,9 @@ What this changes in the code:
 | journal | the commit point, recovery, compaction | records | a folded state | decides |
 | actor | composition only | everything, through ports | nothing of its own | holds rule logic |
 
-Inside the referee, private units run in a fixed order over one set of per-line verdicts: ancestry, undecided, verdicts,
-names (to a fixed point), placing, whole (land only). Land and sync run the same units.
+Inside the referee, private units each own a few rules. Land runs them in a fixed order over one set of per-line
+verdicts: undecided, verdicts, names (to a fixed point), placing, whole. Sync runs undecided, then placing, then names
+(to a fixed point over the placed files). Ancestry is the port: the other units ask it as they need an answer.
 
 | New term | Means |
 |---|---|
@@ -72,7 +73,9 @@ names (to a fixed point), placing, whole (land only). Land and sync run the same
 ## Design rules (design choices)
 
 1. **One owner per rule.** Where one clause of a rule lives elsewhere, the collaborator is named with that clause.
-2. **The referee is pure, and only land builds a `Decision`.** It takes snapshots and gives back plans.
+2. **The referee is pure, and only land builds a `Decision`.** It takes snapshots and gives back plans. In the model
+   it reads git lazily through a port of four reads (`Lineage`), and land gives back the lost versions; the world
+   adds the collision ref and builds the `Decision`.
 3. **The checker stays independent.** It keeps its own ancestry record, re-derives every claim from git, and shares
    neither this map nor this code.
 
@@ -107,7 +110,9 @@ git's ref files. It does not yet re-derive the rest from git; a later step does,
 ## Steps
 
 Built: the safety net (the golden digest, the planted-bug corpus and the guarded runner) and the checker's own state,
-`Checked` and `Checker` in `crates/agentfs-model/src/check.rs`. How to use the net is in the model's `VERIFYING.md`
+`Checked` and `Checker` in `crates/agentfs-model/src/check.rs`, and the model's referee in
+`crates/agentfs-model/src/referee/` (step 2): one file per unit, `land` and `sync` its only entry points, the world
+building the trees from their plans. How to use the net is in the model's `VERIFYING.md`
 ("Refactoring without changing outcomes") and the repo skill `.claude/skills/model-runs`.
 
 **The model gate.** It holds for every model step below unless the row says otherwise. Every run goes through
@@ -135,7 +140,7 @@ A change to the safety net itself runs its quick tier and a review before any fu
 
 | # | Step | Gate |
 |---|---|---|
-| 2 | Model: referee units out of `resolve`, `adopt` and `splice` | The model gate |
+| 2 | Built. Model: referee units out of `resolve`, `adopt` and `splice` | The model gate |
 | 3 | Model: queue and locks, and recording, split out. One tree identity with an optional upstream, keeping today's order (root first, forks ascending). `World` is the composition root. The replicate step keeps its place among the pending steps, because random runs draw from that list. The digest's tree labels come from `World::name`, `World::branch`, `World::txn_name` and `World::txn_branch`, so this step edits them, and `canonical_text_is_pinned` must stay unchanged | The model gate. Names may change, outcomes may not |
 | 4 | Recorder: an engine call sequence becomes a model trace, so a regression found on a mount replays in the model. Guidance, owner, 2026-11-07: "if new regressions are found in the implementation, then those regressions can be verified and fixed via the git model" | One known regression replays |
 | 5 | Engine: remove the duplicated ancestry check, name combining and R3e; a typed version; then split `tree_actor/mod.rs` | Conformance traces on every scenario and seed stay at 0 mismatched |

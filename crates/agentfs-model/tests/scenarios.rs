@@ -157,6 +157,12 @@ fn r2_no_clock_commit_dates_decide_nothing() {
     let src = concat!(
         include_str!("../src/world.rs"),
         include_str!("../src/referee/mod.rs"),
+        include_str!("../src/referee/ancestry.rs"),
+        include_str!("../src/referee/undecided.rs"),
+        include_str!("../src/referee/verdicts.rs"),
+        include_str!("../src/referee/names.rs"),
+        include_str!("../src/referee/placing.rs"),
+        include_str!("../src/referee/whole.rs"),
         include_str!("../src/check.rs"),
         include_str!("../src/content.rs"),
         include_str!("../src/git.rs")
