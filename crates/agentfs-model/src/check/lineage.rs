@@ -20,7 +20,7 @@ use crate::content::Content;
 struct Batch {
     child: Child,
     stdin: Option<ChildStdin>,
-    stdout: BufReader<ChildStdout>,
+    stdout: Option<BufReader<ChildStdout>>,
 }
 
 impl Batch {
@@ -35,11 +35,11 @@ impl Batch {
             .env_remove("GIT_INDEX_FILE")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
             .expect("git cat-file --batch runs");
         let stdin = child.stdin.take();
-        let stdout = BufReader::new(child.stdout.take().expect("stdout is piped"));
+        let stdout = child.stdout.take().map(BufReader::new);
         Self {
             child,
             stdin,
@@ -50,30 +50,51 @@ impl Batch {
     /// Object `id`'s type and bytes.
     fn read(&mut self, id: &str) -> (String, Vec<u8>) {
         let stdin = self.stdin.as_mut().expect("open");
-        writeln!(stdin, "{id}")
-            .and_then(|()| stdin.flush())
-            .expect("cat-file reads");
+        if let Err(e) = writeln!(stdin, "{id}").and_then(|()| stdin.flush()) {
+            self.fail(&format!("cat-file took no request for {id}: {e}"));
+        }
         let mut header = String::new();
-        self.stdout
-            .read_line(&mut header)
-            .expect("cat-file answers");
+        if let Err(e) = self.out().read_line(&mut header) {
+            self.fail(&format!("cat-file gave no answer for {id}: {e}"));
+        }
         let mut f = header.split_whitespace();
         let (_, kind, size) = (f.next(), f.next(), f.next());
-        let size: usize = size
-            .and_then(|n| n.parse().ok())
-            .unwrap_or_else(|| panic!("unparsable cat-file header {header:?}"));
+        let Some(size) = size.and_then(|n| n.parse::<usize>().ok()) else {
+            self.fail(&format!("unparsable cat-file header {header:?} for {id}"));
+        };
         let mut body = vec![0; size + 1];
-        self.stdout
-            .read_exact(&mut body)
-            .expect("cat-file's object");
+        if let Err(e) = self.out().read_exact(&mut body) {
+            self.fail(&format!("cat-file's object {id} is short: {e}"));
+        }
         body.truncate(size);
         (kind.unwrap_or_default().to_string(), body)
+    }
+
+    fn out(&mut self) -> &mut BufReader<ChildStdout> {
+        self.stdout.as_mut().expect("open")
+    }
+
+    /// Stops cat-file and panics with `what` and everything it wrote to
+    /// stderr.
+    fn fail(&mut self, what: &str) -> ! {
+        self.stdin.take();
+        self.stdout.take();
+        let mut stderr = String::new();
+        if let Some(mut e) = self.child.stderr.take() {
+            let _ = e.read_to_string(&mut stderr);
+        }
+        let _ = self.child.wait();
+        panic!("{what}; cat-file's stderr: {stderr:?}");
     }
 }
 
 impl Drop for Batch {
+    /// Closes both pipes first, so a cat-file blocked writing an answer no
+    /// one reads (a panic mid-read) ends instead of hanging the wait.
     fn drop(&mut self) {
-        drop(self.stdin.take());
+        self.stdin.take();
+        self.stdout.take();
+        self.child.stderr.take();
         let _ = self.child.wait();
     }
 }
@@ -98,6 +119,7 @@ pub(crate) struct Lineage {
 /// model writes only loose objects (plumbing never packs, and it never runs
 /// `gc`, `repack` or `fetch`).
 fn objects(repo: &Path) -> PathBuf {
+    formats(&repo.join(".git"));
     let dir = repo.join(".git/objects");
     let packs = std::fs::read_dir(dir.join("pack"))
         .map(|d| d.flatten().count())
@@ -108,6 +130,40 @@ fn objects(repo: &Path) -> PathBuf {
         dir.display()
     );
     dir
+}
+
+/// Checks that git directory `git` is in the formats the checker reads:
+/// SHA-1 object ids (40 hex digits) and loose ref files. Another object
+/// format would leave every object unread, and reftable keeps `refs/` a
+/// constant stub, so history would never be read again. The model's git
+/// runner pins both (`crate::git`); this refuses any repository that
+/// escaped it.
+fn formats(git: &Path) {
+    let config = std::fs::read_to_string(git.join("config")).unwrap_or_default();
+    for line in config.lines() {
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let (key, value) = (
+            key.trim().to_ascii_lowercase(),
+            value.trim().to_ascii_lowercase(),
+        );
+        assert!(
+            key != "objectformat" || value == "sha1",
+            "{} has object format {value}: the checker reads SHA-1 objects only",
+            git.display()
+        );
+        assert!(
+            key != "refstorage" || value == "files",
+            "{} has ref format {value}: the checker reads loose ref files only",
+            git.display()
+        );
+    }
+    assert!(
+        !git.join("reftable").exists(),
+        "{} has ref format reftable: the checker reads loose ref files only",
+        git.display()
+    );
 }
 
 impl Lineage {
@@ -207,6 +263,7 @@ impl Lineage {
 /// them: asserted): what `git for-each-ref` lists, without a process.
 pub(crate) fn refs(repo: &Path) -> String {
     let git = repo.join(".git");
+    formats(&git);
     assert!(
         !git.join("packed-refs").exists(),
         "{} has packed refs: the checker reads loose refs only",
@@ -285,6 +342,30 @@ mod tests {
     fn packed_refs_stop_the_ref_read() {
         let repo = bare_git_dir("packed-refs");
         std::fs::write(repo.join(".git/packed-refs"), "").expect("packed refs");
+        refs(&repo);
+    }
+
+    #[test]
+    #[should_panic(expected = "has object format sha256")]
+    fn another_object_format_stops_the_object_read() {
+        let repo = bare_git_dir("sha256");
+        std::fs::write(
+            repo.join(".git/config"),
+            "[core]\n\trepositoryformatversion = 1\n[extensions]\n\tobjectFormat = sha256\n",
+        )
+        .expect("a config");
+        Lineage::default().read_new(&repo);
+    }
+
+    #[test]
+    #[should_panic(expected = "has ref format reftable")]
+    fn another_ref_format_stops_the_ref_read() {
+        let repo = bare_git_dir("reftable");
+        std::fs::write(
+            repo.join(".git/config"),
+            "[core]\n\trepositoryformatversion = 1\n[extensions]\n\trefStorage = reftable\n",
+        )
+        .expect("a config");
         refs(&repo);
     }
 }
