@@ -1,4 +1,5 @@
 /target/
+__pycache__/
 *.swp
 .DS_Store
 /deploy/examples/helm-sidecar/charts/

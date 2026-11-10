@@ -1038,6 +1038,7 @@ fn print(files: &BTreeMap<String, Vec<u8>>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agentfs_model::calls::CallError;
 
     /// A bare repository whose commits the real `one_writer` reads.
     struct Repo {
@@ -1078,6 +1079,17 @@ mod tests {
         /// A commit with `parents`, `cause` and, for file 1, the line versions it
         /// holds; `None` for a tree that ended the file.
         fn commit(&self, parents: &[&str], cause: &str, lines: Option<&[&str]>) -> String {
+            self.commit_with(parents, cause, lines, "")
+        }
+
+        /// [`Repo::commit`] with `extra` trailers after its own.
+        fn commit_with(
+            &self,
+            parents: &[&str],
+            cause: &str,
+            lines: Option<&[&str]>,
+            extra: &str,
+        ) -> String {
             let (metadata, namespace) = match lines {
                 Some(lines) => {
                     let lines: Vec<String> = lines
@@ -1117,7 +1129,7 @@ mod tests {
             self.git(
                 &args,
                 format!(
-                    "{cause}\n\nAgentfs-Writer: agentfs\nAgentfs-Cause: {cause}\nAgentfs-Format: envelope-1\n"
+                    "{cause}\n\nAgentfs-Writer: agentfs\nAgentfs-Cause: {cause}\nAgentfs-Format: envelope-1\n{extra}"
                 )
                 .as_bytes(),
             )
@@ -1172,5 +1184,140 @@ mod tests {
             let error = check(&mut inv, &merge).unwrap_err();
             assert!(error.contains("one_writer"), "{error}");
         }
+    }
+
+    /// What [`Invariants::drained`] reads of the trees; the other calls never run here.
+    struct Shows(BTreeMap<TreeId, BTreeMap<String, Vec<u8>>>);
+
+    impl TreeCalls for Shows {
+        type Open = u64;
+        fn fork(&mut self) -> Result<usize, CallError> {
+            unreachable!("drained only reads")
+        }
+        fn open_write(&mut self, _: &Caller, _: &str) -> Result<u64, CallError> {
+            unreachable!("drained only reads")
+        }
+        fn open_trunc(&mut self, _: &Caller, _: &str) -> Result<u64, CallError> {
+            unreachable!("drained only reads")
+        }
+        fn create(&mut self, _: &Caller, _: &str) -> Result<u64, CallError> {
+            unreachable!("drained only reads")
+        }
+        fn pwrite(&mut self, _: u64, _: u64, _: &[u8]) -> Result<(), CallError> {
+            unreachable!("drained only reads")
+        }
+        fn append(&mut self, _: u64, _: &[u8]) -> Result<(), CallError> {
+            unreachable!("drained only reads")
+        }
+        fn truncate(&mut self, _: u64, _: u64) -> Result<(), CallError> {
+            unreachable!("drained only reads")
+        }
+        fn close(&mut self, _: u64) -> Result<(), CallError> {
+            unreachable!("drained only reads")
+        }
+        fn unlink(&mut self, _: &Caller, _: &str) -> Result<(), CallError> {
+            unreachable!("drained only reads")
+        }
+        fn rename(&mut self, _: &Caller, _: &str, _: &str) -> Result<(), CallError> {
+            unreachable!("drained only reads")
+        }
+        fn end_client(&mut self, _: &Caller) -> Result<(), CallError> {
+            unreachable!("drained only reads")
+        }
+        fn take_next(&mut self, _: TreeId) -> Result<Took, CallError> {
+            unreachable!("drained only reads")
+        }
+        fn crash(&mut self) -> Result<(), CallError> {
+            unreachable!("drained only reads")
+        }
+        fn read(&self, t: TreeId, path: &str) -> Result<Option<Vec<u8>>, CallError> {
+            Ok(self.0.get(&t).and_then(|f| f.get(path)).cloned())
+        }
+        fn paths(&self, t: TreeId) -> Result<Vec<String>, CallError> {
+            Ok(self
+                .0
+                .get(&t)
+                .map(|f| f.keys().cloned().collect())
+                .unwrap_or_default())
+        }
+    }
+
+    /// Main and fork 1 showing `main` and `fork` at path `a`.
+    fn shows(main: &[u8], fork: &[u8]) -> Shows {
+        let tree = |bytes: &[u8]| BTreeMap::from([("a".to_owned(), bytes.to_vec())]);
+        Shows(BTreeMap::from([
+            (TreeId::Main, tree(main)),
+            (TreeId::Fork(1), tree(fork)),
+        ]))
+    }
+
+    /// `Invariants` over a new repository with a fork 1 to check, and its main tip.
+    fn with_fork(repo: &Repo) -> (Invariants, String) {
+        let mut inv = repo.invariants();
+        inv.trees.insert(TreeId::Fork(1), OracleTree::default());
+        let tip = repo.git(&["rev-parse", "refs/heads/main"], b"");
+        (inv, tip)
+    }
+
+    /// R7: once the queues are empty every tree holds main's files.
+    #[test]
+    fn converged_fails_when_a_tree_differs_from_main() {
+        let repo = Repo::new();
+        let (mut inv, _) = with_fork(&repo);
+        assert_eq!(inv.drained(&shows(b"x\n", b"x\n")), Ok(()));
+        let error = inv.drained(&shows(b"x\n", b"y\n")).unwrap_err();
+        assert!(error.contains("converged:"), "{error}");
+    }
+
+    /// R7: once the queues are empty every save of every tree is in main's history.
+    #[test]
+    fn full_lineage_fails_when_a_save_is_not_in_mains_history() {
+        let repo = Repo::new();
+        let (mut inv, tip) = with_fork(&repo);
+        let on_main = repo.commit(&[&tip], "Direct", Some(&["m"]));
+        repo.git(&["update-ref", "refs/heads/main", &on_main], b"");
+        inv.commit(&on_main).unwrap();
+        assert_eq!(inv.drained(&shows(b"x\n", b"x\n")), Ok(()));
+        let stray = repo.commit(&[&tip], "Direct", Some(&["s"]));
+        inv.commit(&stray).unwrap();
+        let error = inv.drained(&shows(b"x\n", b"x\n")).unwrap_err();
+        assert!(error.contains("full_lineage:"), "{error}");
+    }
+
+    /// R3: the upstream's line wins, so the result of a lost landing never holds
+    /// the line that lost. Both the valid landing and the bad one are real commits.
+    #[test]
+    fn upstream_kept_fails_when_a_landing_keeps_the_lost_line() {
+        let repo = Repo::new();
+        let base = repo.commit(&[], "Root", Some(&["b"]));
+        let before = repo.commit(&[&base], "Direct", Some(&["u", "w"]));
+        let incoming = repo.commit(&[&base], "Direct", Some(&["f"]));
+        repo.git(
+            &[
+                "update-ref",
+                &format!("refs/collisions/main/{incoming}"),
+                &incoming,
+            ],
+            b"",
+        );
+        let trailers = concat!(
+            "Agentfs-Tree: main\n",
+            r#"Agentfs-Collisions: [{"lost":{"Line":{"file":1,"version":"f"}},"#,
+            r#""winner":{"Line":{"file":1,"version":"u"}},"kind":"Line"}]"#,
+            "\n"
+        );
+        let landing = |lines: &[&str]| {
+            repo.commit_with(&[&before, &incoming], "Landing", Some(lines), trailers)
+        };
+        let mut inv = repo.invariants();
+        let keeps_upstream = landing(&["u", "w"]);
+        let c = inv.commit(&keeps_upstream).unwrap();
+        assert_eq!(inv.landing(&keeps_upstream, &c), Ok(()));
+        // The winner is still there, so only the lost line tells: every line's bytes
+        // match, which the checks before it read.
+        let keeps_lost = landing(&["u", "f"]);
+        let c = inv.commit(&keeps_lost).unwrap();
+        let error = inv.landing(&keeps_lost, &c).unwrap_err();
+        assert!(error.contains("upstream_kept:"), "{error}");
     }
 }

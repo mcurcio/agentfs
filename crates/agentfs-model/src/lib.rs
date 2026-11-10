@@ -43,6 +43,7 @@
 pub mod calls;
 pub mod check;
 pub mod content;
+pub mod digest;
 pub mod git;
 pub mod program;
 pub mod world;

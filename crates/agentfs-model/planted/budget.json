@@ -1,0 +1,13 @@
+{
+  "corpus": {
+    "jobs": 4,
+    "pass_seconds": 224,
+    "slowest_bug": "crash_relinks_a_dead_open",
+    "slowest_bug_seconds": 129
+  },
+  "digest": {
+    "full_seconds": 643,
+    "scenarios_seconds": 5,
+    "slowest_seed_seconds": 28
+  }
+}

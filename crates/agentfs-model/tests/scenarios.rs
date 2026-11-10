@@ -148,7 +148,7 @@ fn r2_no_clock_commit_dates_decide_nothing() {
                 w.repo(),
                 &["for-each-ref", "--format=%(objectname) %(refname)"],
             ),
-            w.fingerprint(),
+            agentfs_model::digest::canonical_text(&w),
         )
     };
     let pinned = run();
@@ -3781,4 +3781,83 @@ fn finding_50_a_held_back_decision_is_excused_only_while_a_lock_holds_it() {
     w.close(held);
     let e = check(&mut w).expect_err("no lock holds that sync back now");
     assert!(e.contains(&format!("at {x}, which")), "{e}");
+}
+
+/// Main's save of a new line to `c` (at its third byte), as finding 47's seed made it.
+fn main_edits_c(w: &mut World) {
+    calls(
+        w,
+        &m1(),
+        "c",
+        &[Write::Pwrite {
+            offset: 2,
+            bytes: "m\n".into(),
+        }],
+    );
+}
+
+/// Finding 47, seed 484 (R10.3): the fork's unlink agrees with main's unlink of the same
+/// file, though main edited the file first and the fork never saw that edit. The landing
+/// takes, with no collision. The calls of the conformance replay's test of the same name.
+#[test]
+fn finding_47_two_unlinks_agree_over_an_unseen_edit() {
+    let mut w = world();
+    let f = w.create_fork(Tree::Main);
+    main_edits_c(&mut w);
+    w.unlink(&m1(), "c");
+    w.unlink(&Client::Fork(f), "c");
+    ok(&mut w);
+    next(&mut w, Tree::Main);
+    assert!(w.last_take().is_some(), "main takes the fork's unlink");
+    assert!(w.collisions.is_empty(), "{:?}", w.collisions);
+    drain(&mut w);
+}
+
+/// Finding 47, seed 484, as the seed had it: the fork's delete is half of a rename-over,
+/// which lands whole, so `b` takes the name `c` in main.
+#[test]
+fn finding_47_a_rename_over_agrees_with_an_unlink_over_an_unseen_edit() {
+    use agentfs_model::calls::{TreeCalls, TreeId};
+    let mut w = world();
+    let f = w.create_fork(Tree::Main);
+    main_edits_c(&mut w);
+    w.unlink(&m1(), "c");
+    w.rename(&Client::Fork(f), "b", "c");
+    ok(&mut w);
+    next(&mut w, Tree::Main);
+    assert!(w.last_take().is_some(), "main takes the fork's rename-over");
+    assert!(w.collisions.is_empty(), "{:?}", w.collisions);
+    let paths = TreeCalls::paths(&w, TreeId::Main).unwrap();
+    assert!(
+        paths.contains(&"c".to_string()) && !paths.contains(&"b".to_string()),
+        "{paths:?}"
+    );
+    drain(&mut w);
+}
+
+/// Finding 46, seed 124 (R9.1): a sync that changes no line or name of the fork's own view
+/// of a file locks no name of it. The fork replaced `d` with `a` by a rename-over,
+/// undecided, so main's edit of the old `d` keeps no name there, and the fork's open of
+/// the new `d` does not hold the sync back: it takes at once.
+#[test]
+fn finding_46_a_sync_of_a_file_the_fork_replaced_passes_the_name_it_took() {
+    let mut w = world();
+    let f = w.create_fork(Tree::Main);
+    let s = Client::Fork(f);
+    w.rename(&s, "a", "d");
+    calls(
+        &mut w,
+        &m1(),
+        "d",
+        &[Write::Pwrite {
+            offset: 2,
+            bytes: "m\n".into(),
+        }],
+    );
+    let held = w.open_write(&s, "d");
+    ok(&mut w);
+    next(&mut w, Tree::Fork(f));
+    assert!(w.last_take().is_some(), "the sync takes past the open d");
+    w.close(held);
+    drain(&mut w);
 }
