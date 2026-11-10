@@ -4040,9 +4040,10 @@ impl TreeCalls for World {
 /// Where `World::drop` writes a recorded world's trace.
 const TRACE_DIR: &str = "AGENTFS_MODEL_TRACE_DIR";
 
-/// `<thread name>[.<label>][.<n>].trace`: the n-th world of that name in this
-/// process counts from 1 past the first.
-fn trace_file(dir: &Path, label: Option<&str>) -> PathBuf {
+/// `<thread name>[.<label>][.<n>]`, a world's name for its trace and digest
+/// files: the n-th world of that name in this process counts from 1 past the
+/// first. A world takes one name, whichever of the two it writes.
+fn run_name(label: Option<&str>) -> String {
     static NAMES: Mutex<BTreeMap<String, u32>> = Mutex::new(BTreeMap::new());
     let thread = std::thread::current();
     let mut name = thread.name().unwrap_or("unnamed").replace("::", "-");
@@ -4058,21 +4059,25 @@ fn trace_file(dir: &Path, label: Option<&str>) -> PathBuf {
     if n > 1 {
         name = format!("{name}.{n}");
     }
-    dir.join(format!("{name}.trace"))
+    name
 }
 
 impl Drop for World {
     fn drop(&mut self) {
-        if let (Some(dir), Some(trace), false) = (
-            std::env::var_os(TRACE_DIR),
-            &self.trace,
-            std::thread::panicking(),
-        ) {
-            let file = trace_file(Path::new(&dir), self.trace_label.as_deref());
-            // A trace that cannot be written must fail the job, not a floor later.
-            std::fs::create_dir_all(&dir)
-                .and_then(|()| std::fs::write(&file, crate::calls::render(trace)))
-                .unwrap_or_else(|e| panic!("write {}: {e}", file.display()));
+        let trace_dir = std::env::var_os(TRACE_DIR).filter(|_| self.trace.is_some());
+        let digest_dir = std::env::var_os(crate::digest::DIGEST_DIR);
+        if !std::thread::panicking() && (trace_dir.is_some() || digest_dir.is_some()) {
+            let name = run_name(self.trace_label.as_deref());
+            if let (Some(dir), Some(trace)) = (trace_dir, &self.trace) {
+                let file = Path::new(&dir).join(format!("{name}.trace"));
+                // A trace that cannot be written must fail the job, not a floor later.
+                std::fs::create_dir_all(&dir)
+                    .and_then(|()| std::fs::write(&file, crate::calls::render(trace)))
+                    .unwrap_or_else(|e| panic!("write {}: {e}", file.display()));
+            }
+            if let Some(dir) = digest_dir {
+                crate::digest::write(self, Path::new(&dir), &name);
+            }
         }
         if std::env::var_os("AGENTFS_MODEL_KEEP").is_none() {
             let _ = std::fs::remove_dir_all(&self.root);
