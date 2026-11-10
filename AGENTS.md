@@ -2,6 +2,11 @@
 
 Guidance for coding agents working in this repository. Humans should start with [README.md](README.md).
 
+This project follows its maintainer's shared engineering rules: https://github.com/mcurcio/skills
+(`plugins/rules/skills/global/SKILL.md`, with the reasons in the `owner-*` skills beside it). Claude
+Code loads them through `.claude/settings.json`; other agents and people read them there. A rule here
+that quotes the maintainer overrides them for this project.
+
 agentfs is a FUSE filesystem. It records every change a workload makes into git history that the workload cannot see. It pushes that history to remotes and applies patches queued by iac. It ships as a sidecar and as a CSI driver.
 
 ## What agentfs is for
