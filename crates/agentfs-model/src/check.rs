@@ -49,10 +49,23 @@ impl Checked {
         self.checker.check(&self.world)
     }
 
-    /// One step, with what only the step itself shows ([`step_checked`]).
-    /// Returns the queue entries taken.
+    /// One step, with what only the step itself shows. A take (rule 9) is one
+    /// step (the owner, 2026-11-08, finding 49: "B"): it either waits, taking
+    /// nothing, or takes the first entry P1 lets go and writes it. A sync's take
+    /// reads the upstream's head as it is then (read here before the step, not
+    /// from the model's record). A landing locks every file its change touches,
+    /// read from git, a losing change's included (R9.1). A take writes no file a
+    /// client of that tree has open for writing, nor any file it did not lock; a
+    /// sync records no collision (only an upstream's queue decides one) and
+    /// carries the head its take read. Returns the queue entries taken. The
+    /// checks only read the world, before and after; the step alone changes it.
     pub fn step_checked(&mut self, s: &Step) -> Result<usize, String> {
-        step_checked(&mut self.world, s)
+        let before = named("step_checked", before_step(&self.world, s))?;
+        let taken = self.world.step(s);
+        match before {
+            Some(b) => named("step_checked", after_step(&self.world, b, taken)),
+            None => Ok(taken),
+        }
     }
 
     /// Once writes stop and every queue has drained ([`check_converged`]).
@@ -167,22 +180,26 @@ impl Checker {
     }
 }
 
-/// One step, with what only the step itself shows. A take (rule 9) is one
-/// step (the owner, 2026-11-08, finding 49: "B"): it either waits, taking
-/// nothing, or takes the first entry P1 lets go and writes it. A sync's take
-/// reads the upstream's head as it is then (read here before the step, not
-/// from the model's record). A landing locks every file its change touches,
-/// read from git, a losing change's included (R9.1). A take writes no file a
-/// client of that tree has open for writing, nor any file it did not lock; a
-/// sync records no collision (only an upstream's queue decides one) and
-/// carries the head its take read. Returns the queue entries taken.
-fn step_checked(w: &mut World, s: &Step) -> Result<usize, String> {
-    named("step_checked", step_rules(w, s))
+/// What [`Checked::step_checked`] reads before a queue step `t` (none for another
+/// step).
+struct Before {
+    t: Tree,
+    /// The upstream's head, if `t` is a fork.
+    up: Option<String>,
+    /// Whether the entry P1 lets go is a sync.
+    sync: bool,
+    /// That entry's number.
+    n: u64,
+    was: bool,
+    ours: String,
+    open: BTreeSet<String>,
+    collisions: usize,
+    syncs: usize,
 }
 
-fn step_rules(w: &mut World, s: &Step) -> Result<usize, String> {
+fn before_step(w: &World, s: &Step) -> Result<Option<Before>, String> {
     let Step::Next(t) = s else {
-        return Ok(w.step(s));
+        return Ok(None);
     };
     let up = match t {
         Tree::Fork(f) => Some(w.head(w.forks[f].upstream)),
@@ -200,8 +217,33 @@ fn step_rules(w: &mut World, s: &Step) -> Result<usize, String> {
     let ours = w.head(*t);
     let open = w.write_open(*t);
     let (collisions, syncs) = (w.collisions.len(), w.syncs.len());
-    let taken = w.step(s);
-    let up = up.filter(|_| q[i].1 == Entry::Sync);
+    Ok(Some(Before {
+        t: *t,
+        up,
+        sync: q[i].1 == Entry::Sync,
+        n,
+        was,
+        ours,
+        open,
+        collisions,
+        syncs,
+    }))
+}
+
+fn after_step(w: &World, b: Before, taken: usize) -> Result<usize, String> {
+    let Before {
+        t,
+        up,
+        sync,
+        n,
+        was,
+        ours,
+        open,
+        collisions,
+        syncs,
+    } = b;
+    let t = &t;
+    let up = up.filter(|_| sync);
     let waits = w.waits().get(t).is_some_and(|m| m.contains_key(&n)) && !was;
     let Some((_, take)) = w.last_take().filter(|(x, _)| x == t).cloned() else {
         // A landing, or a sync whose first commit would overwrite an open
