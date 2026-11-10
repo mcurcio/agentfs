@@ -76,6 +76,17 @@ names (to a fixed point), placing, whole (land only). Land and sync run the same
 3. **The checker stays independent.** It keeps its own ancestry record, re-derives every claim from git, and shares
    neither this map nor this code.
 
+After step 1 the checker owns its state, reads its version ancestry from git's blobs and notices a moved ref from
+git's ref files. It does not yet re-derive the rest from git; a later step does, and that step changes the matrix:
+
+| Not yet re-derived | Read through `World` | Read by |
+|---|---|---|
+| The model's records | `landings`, `syncs`, `entered`, `collisions`, `ended`, `discarded`, `save_calls`, `last_take` | most checks |
+| Each change's edits | `World::edits` | `changes_whole`, `placed_and_unlinked`, `taken_only_past` |
+| Each tree's head | `World::head`, `World::main_head` and the fork list, not git's refs | `views`, the queue step's checks, `prefix_cut`, `delivered`, `entry_files`, `trees_equal_main` and others |
+| A file at a commit, and ancestry | `World::file` and `World::is_ancestor`, over `World`'s caches of git objects | almost every check |
+| Queues, waits, opens and handles | `queue_numbered`, `waits`, `write_open`, `handles` | `locks`, `p1_first`, the queue step's checks |
+
 ## Patterns
 
 | Pattern | Where |

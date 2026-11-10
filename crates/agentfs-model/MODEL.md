@@ -146,8 +146,9 @@ nothing about what the model leaves out (below).
 | Full lineage, read by ancestry alone: a tree's history reaches every change it took, won or lost. Across the CI seeds, changes really lose whole with clean lines in them. | `full_lineage`, `interleavings.rs` `run_all` |
 | No clock is read: the same calls with every commit dated before its parents decide the same trees. | `r2_no_clock_commit_dates_decide_nothing`, `random_interleavings_commit_dates_decide_nothing` |
 
-The checks' record of who saw what (`Lineage`) is read from the version records in git's blobs, which the save's
-replay wrote, so on its own it cannot see a wrong alignment; `save_aligned`, `appends_exact` and the byte oracle are the checks that do not derive from the
+The checks' record of who saw what (`Lineage`) is read from the version records in git's blobs, which the model
+wrote (the save's replay, and the rename and unlink paths for a name version), so on its own it cannot see a wrong
+alignment; `save_aligned`, `appends_exact` and the byte oracle are the checks that do not derive from the
 replay. The random runs open files (a sixth with `O_TRUNC`) and make byte calls: `O_APPEND` writes, some of a
 partial line; raw `pwrite`s at any offset, some past the end (a hole); split writes (a line's bytes in two calls)
 and overlapping ones; `ftruncate`s shrinking and growing; and the byte calls a program makes for a line written in
