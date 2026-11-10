@@ -243,6 +243,43 @@ nothing catches is a finding: add the missing check, then confirm it now catches
 
 Planted bugs stay local. CI does not run them; record the results in the pull request body.
 
+## Refactoring without changing outcomes
+
+A refactor that moves code must not change what any run decides. Two baselines, both local (CI runs neither;
+the pull request body reports them), prove it:
+
+- **The digest** (`src/digest.rs`, `baseline/digests.txt`, `ci/model-digest.sh`): one canonical text per run
+  built only from git (every reachable commit numbered by a walk from the refs, with its git tree, parents by
+  number and whole message), hashed with `git hash-object`. Commit ids, dates and in-memory records are left
+  out; tree names become labels (`T0`, `T<fork id>`) through `World::name`, `World::branch` and the fork list
+  only, so a rename edits one call site. The golden holds for one git release (`ci/git-release`); the runner
+  refuses any other.
+- **The planted-bug corpus** (`planted/corpus.toml`, `planted/run.py`, `planted/matrix.tsv`): each bug is an
+  exact find-and-replace matched exactly once across `src/**`. A verbatim move needs no change; an anchor the
+  refactor really changed reports STALE, which fails the run, and is re-anchored in the same commit.
+
+```sh
+# In the container, from the repository root. Long: 500 seeds take 10 to 14 minutes on 8 cores.
+ci/model-digest.sh record             # after a change meant to change outcomes
+ci/model-digest.sh check              # fails on any different, missing or extra run, naming it
+# The same check in parts, for a time limit:
+ci/model-digest.sh collect DIR 0 2; ci/model-digest.sh collect DIR 1 2; ci/model-digest.sh compare DIR
+# A run's text, to diff against another: AGENTFS_MODEL_DIGEST_TEXT=1 with ci/model-digest.sh collect
+python3 crates/agentfs-model/planted/run.py --work DIR [--jobs 4] [--only a,b] [--write]
+```
+
+`check` and `run.py` need the container's `git` (`ci/git-release`). Keep `TMPDIR` and `run.py`'s `--work` on a disk
+inside the container, never a bind mount: every run makes git repositories there, and on Docker Desktop 8 seeds took
+320 s with `TMPDIR` on a bind mount against 24 s on the container's `/tmp`. `/tmp` is the default for `TMPDIR`; for
+`--work` use a named volume (`-v agentfs-planted:/work`, `--work /work/planted`), which also survives a stopped run.
+Use `docker run --init` for both: without an init process, orphaned git processes pile up as zombies until nothing can
+start, and the run hangs. A test process that passes its limit (30 minutes) or a process that cannot start fails the
+run: `run.py` reports `TIMEOUT` or `HARNESS`, and the digest's `collect` counts that test as failed.
+A failing test does not stop `collect` or `check`: the failed run's digest is missing, the rest are compared, and the
+command fails. Every bug must be caught: a surviving mutant, a stale anchor or a build error fails the
+run; `matrix.tsv` records which check tripped first most often (or `assert` for a scenario assertion) and must
+reproduce. A change meant to change outcomes re-records the golden and matrix in the same commit, and says why.
+
 ## Reading a failure
 
 Start from the printed seed and step log, replay the seed under the test that failed, and decide which of
