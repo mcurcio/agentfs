@@ -81,6 +81,19 @@ pub enum State {
     Replaced(String),
 }
 
+/// One line version a commit set.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Edit {
+    /// The file's identity.
+    pub path: String,
+    /// The line's identity.
+    pub line: String,
+    /// The version.
+    pub token: String,
+    /// The version is a delete (of a line, or an unlink).
+    pub gone: bool,
+}
+
 /// One version of a line.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Line {

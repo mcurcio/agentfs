@@ -76,7 +76,7 @@ flowchart TB
 | nested fork | a branch whose upstream is another fork's branch | `create_fork(f)` |
 | client, writer | the `Agentfs-Writer` trailer; git's author and committer are one fixed service identity | `Client`, `fork.writer` |
 | save | one commit on the tree's branch at close: the program's write calls applied to the head then (its first parent), naming one writer | `World::close` |
-| lock | a take holding the files it overwrites in a tree, or a write-open blocking one; in memory, not a ref | `World::holds`, `World::waits` |
+| lock | a take holding the files it overwrites in a tree, or a write-open blocking one; in memory, not a ref | `TakeRecord::files`, `World::waits` |
 | landing | a push of a fork's commit into its upstream's queue | `Entry::Landing` |
 | the upstream's queue | the one referee for that tree: a first-in, first-out list of incoming commits and syncs | `World::queue` |
 | queue take | the referee builds one commit on the upstream's branch and moves the ref | `World::step`, `land` |

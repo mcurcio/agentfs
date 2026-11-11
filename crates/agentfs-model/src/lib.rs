@@ -19,7 +19,7 @@
 //! still on their way to that queue. Every losing commit keeps a collision
 //! ref and a record in its take's result commit, which a separate
 //! Replication step pushes with main to a bare shared remote. A file is a
-//! byte buffer and a program's calls are POSIX byte calls ([`world::Write`]):
+//! byte buffer and a program's calls are POSIX byte calls ([`recording::Write`]):
 //! a save is those calls applied at close to its tree's head, line
 //! identity derived from the bytes then: an append is exact (finishing a
 //! partial last line, then new lines), every other byte write is aligned

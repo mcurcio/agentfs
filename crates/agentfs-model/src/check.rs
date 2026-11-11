@@ -14,14 +14,14 @@ use std::path::Path;
 
 use lineage::Lineage;
 
-use crate::calls::TreeId;
+use crate::calls::{Client, TreeId, TxnId};
 use crate::content::{Content, Line, PATHS, State, is_root, writer_of};
 use crate::git::{git, try_git};
 use crate::queue::{Entry, Take, name_key};
 use crate::recording::{Kind, Target};
 use crate::world::{
-    By, Client, Collision, Decision, Direction, Landed, Life, Policies, Step, TxnEnd, TxnId,
-    TxnOutcome, World, commit_parents, decisions_in, origin_in,
+    By, Collision, Decision, Direction, Landed, Life, Policies, Step, TxnEnd, TxnOutcome, World,
+    commit_parents, decisions_in, origin_in,
 };
 
 /// `r`'s error named for `check`: planted/matrix.tsv records the first check tripped.
@@ -298,7 +298,7 @@ fn after_step(w: &World, b: Before, taken: usize) -> Result<usize, String> {
     else {
         return Ok(taken);
     };
-    let to = &cut.up().to_string();
+    let to = cut.up();
     let Some(head) = up else {
         return Err(format!("{t:?}'s entry {n}, a landing, was taken as a sync"));
     };
@@ -340,7 +340,7 @@ fn prefix_cut(
     ours: &str,
     head: &str,
     open: &BTreeSet<String>,
-    to: Option<&String>,
+    to: Option<&str>,
 ) -> Result<(), String> {
     let mut chain = Vec::new();
     let mut c = head.to_string();
@@ -1181,7 +1181,7 @@ fn decision_held_back_by_lock(
         return false;
     };
     taken_only_past(w, up, id, |l| w.is_ancestor(&l.result, &head))
-        && prefix_cut(w, t, &ours, &head, &w.write_open(t), Some(&up.to_string())).is_ok()
+        && prefix_cut(w, t, &ours, &head, &w.write_open(t), Some(up)).is_ok()
 }
 
 /// R10.6 at one sync: `x`, the upstream's version in `u` of a line the sync's
@@ -1367,7 +1367,7 @@ impl Checker {
             // file changed nothing anyone sees (an atomic save's new file), so
             // none of its staged versions is in the commit (`World::edits`).
             // excuse: R11.2 a file a transaction created and ended changed nothing anyone sees
-            let created_and_ended = |s: &crate::world::Edit| {
+            let created_and_ended = |s: &crate::content::Edit| {
                 let names = || {
                     e.staged
                         .iter()
@@ -1744,7 +1744,7 @@ fn appends_exact(
 }
 
 /// The check's own account of byte calls on `bytes`: kept apart from the
-/// model's replay ([`crate::world::Write::apply_all`]).
+/// model's replay ([`crate::recording::Write::apply_all`]).
 fn bytes_after(bytes: &str, calls: &[crate::recording::Write]) -> String {
     use crate::recording::Write;
     let mut b: Vec<u8> = bytes.as_bytes().to_vec();

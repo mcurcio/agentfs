@@ -3,10 +3,10 @@
 //! only: no mount.
 use agentfs_conformance::{against_library, against_model};
 use agentfs_model::calls::{
-    Caller, Recorded, RecordedCall, Took, TreeCalls, TreeId, parse, render,
+    Caller, Client, Recorded, RecordedCall, Took, TreeCalls, TreeId, parse, render,
 };
 use agentfs_model::recording::Write;
-use agentfs_model::world::{Client, Policies, World};
+use agentfs_model::world::{Policies, World};
 
 fn world() -> World {
     World::recording(Policies::default())

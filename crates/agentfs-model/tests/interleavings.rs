@@ -30,15 +30,15 @@
 //! panic too reports its seed and the event log. The generator is a
 //! SplitMix64 written here: fixed seeds replay exactly.
 
-use agentfs_model::calls::TreeId;
+use agentfs_model::calls::{Client, HandleId, TreeId};
 use agentfs_model::check::{Checked, change_files};
 use agentfs_model::content::{BLANK, Content, FILES, Layout, PATHS, UNBORN};
 use agentfs_model::git::{git, with_reversed_dates};
 use agentfs_model::program;
 use agentfs_model::queue::{Entry, NAME_KEY, name_key};
-use agentfs_model::recording::{HandleId, Kind, Target, Write};
+use agentfs_model::recording::{Kind, Target, Write};
 use agentfs_model::world::{
-    By, Client, Direction, Life, LineEdit, MergeRule, Policies, Step, TxnEnd, TxnOutcome, World,
+    By, Direction, Life, LineEdit, MergeRule, Policies, Step, TxnEnd, TxnOutcome, World,
 };
 use std::collections::{BTreeMap, BTreeSet};
 

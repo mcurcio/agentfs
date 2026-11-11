@@ -7,11 +7,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::calls::TreeId;
-use crate::content::{Content, Line, PATHS, State, UNBORN, split_lines};
-use crate::world::{Client, Edit, TxnId};
-
-pub type HandleId = u32;
+use crate::calls::{Client, HandleId, TreeId, TxnId};
+use crate::content::{Content, Edit, Line, PATHS, State, UNBORN, split_lines};
 
 /// The port: a model file at a commit or tree. The world's git repository and its one
 /// object cache implement it; a test may use a map.

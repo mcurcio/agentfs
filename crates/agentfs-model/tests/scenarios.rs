@@ -3,14 +3,14 @@
 //! A test marked `#[ignore = "coherence finding N: ..."]` asserts what the
 //! rules intend but do not deliver; run it with `--ignored`.
 
-use agentfs_model::calls::TreeId;
+use agentfs_model::calls::{Client, TreeId};
 use agentfs_model::check::Checked;
 use agentfs_model::content::{BLANK, Content, Layout, Line, State};
 use agentfs_model::git::{git, with_reversed_dates};
 use agentfs_model::recording::{Target, Write};
 use agentfs_model::world::{
-    By, Client, Direction, Life, LineEdit, MergeRule, ModelError, Overwritten, Policies, Step,
-    TxnOutcome, World, decisions_in,
+    By, Direction, Life, LineEdit, MergeRule, ModelError, Overwritten, Policies, Step, TxnOutcome,
+    World, decisions_in,
 };
 use std::collections::BTreeSet;
 
@@ -159,24 +159,36 @@ fn r2_no_clock_commit_dates_decide_nothing() {
     let pinned = run();
     assert_eq!(pinned, run());
     assert_eq!(pinned.1, with_reversed_dates(run).1);
-    let mut src = concat!(
-        include_str!("../src/world.rs"),
-        include_str!("../src/check.rs"),
-        include_str!("../src/content.rs"),
-        include_str!("../src/git.rs")
-    )
-    .to_string();
-    // Every unit of the referee, read at test time, so a new one is scanned too.
-    let referee = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/referee");
-    let mut units: Vec<_> = std::fs::read_dir(&referee)
-        .expect("src/referee")
-        .map(|e| e.expect("an entry of src/referee").path())
-        .filter(|p| p.extension().is_some_and(|x| x == "rs"))
-        .collect();
+    // Every source file of the model, read at test time by walking `src`, so a new module
+    // or unit is scanned too.
+    let mut units = Vec::new();
+    let mut dirs = vec![std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src")];
+    while let Some(d) = dirs.pop() {
+        for e in std::fs::read_dir(&d).expect("a source directory") {
+            let p = e.expect("an entry of src").path();
+            if p.is_dir() {
+                dirs.push(p);
+            } else if p.extension().is_some_and(|x| x == "rs") {
+                units.push(p);
+            }
+        }
+    }
     units.sort();
-    assert!(units.len() > 1, "the referee's units: {units:?}");
+    for unit in [
+        "world.rs",
+        "recording.rs",
+        "queue.rs",
+        "referee/mod.rs",
+        "check/lineage.rs",
+    ] {
+        assert!(
+            units.iter().any(|u| u.ends_with(unit)),
+            "src/{unit} is scanned: {units:?}"
+        );
+    }
+    let mut src = String::new();
     for u in units {
-        src.push_str(&std::fs::read_to_string(&u).expect("a referee unit"));
+        src.push_str(&std::fs::read_to_string(&u).expect("a source file"));
     }
     for clock in ["SystemTime", "Instant", "chrono", "UNIX_EPOCH"] {
         assert!(!src.contains(clock), "the model reads a clock: {clock}");

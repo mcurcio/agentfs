@@ -133,7 +133,7 @@ id = "landing_locks_only_what_it_writes"
 rule = "R9.1"
 seeds = 64
 find = '''
-        files.extend(self.touches_of(c));'''
+        files.extend(self.port.touches_of(c));'''
 replace = '''
         let _ = c;'''
 

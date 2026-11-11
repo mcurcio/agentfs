@@ -1,20 +1,18 @@
 //! Queue and locks: each tree's landing queue (MODEL.md rule 2), the order it keeps per
 //! source (P1), the files a take locks and the opens it waits for (rule 9), the prefix a
 //! sync may deliver (P2, its [`Cut`]), and the order of calls deferred behind a transaction
-//! (R5.3). It reads the other modules through one port ([`Keys`]) and never reads line
-//! content. The module-cut page (`docs/target-architecture/future/module-cut.md`) draws its
+//! (R5.3). It reads the other modules through two ports, [`Keys`] (lock keys and lineage)
+//! and [`Plans`] (the referee's answers a take needs), and never reads line content. The module-cut page (`docs/target-architecture/future/module-cut.md`) draws its
 //! boundary.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use crate::calls::TreeId;
+use crate::calls::{HandleId, TreeId};
 use crate::content::Content;
-use crate::recording::HandleId;
 
-/// The port: what queue and locks reads of the other modules. The world implements it.
+/// The port of lock keys and lineage: what queue and locks reads of tree history and
+/// recording. P1's scan needs only this. The world implements it.
 pub(crate) trait Keys {
-    /// A landing's plan, built by the world from the referee's.
-    type Plan: Clone;
     /// Tree `t`'s head.
     fn head(&self, t: TreeId) -> String;
     /// The tree `t` syncs from and lands into; none for the root.
@@ -30,13 +28,20 @@ pub(crate) trait Keys {
     fn is_ancestor(&self, a: &str, b: &str) -> bool;
     /// Commit `c`'s first parent.
     fn first_parent(&self, c: &str) -> String;
-    /// The tree a sync of upstream commit `up` into a fork at `ours` makes; none if the
-    /// fork has `up`.
-    fn sync_tree(&self, ours: &str, up: &str) -> Option<String>;
     /// Lock keys delivering upstream commit `c` (its sync's tree `tree`) into a fork at
     /// `ours` writes, finding 38's changed line maps included: the world reads line
     /// content so queue and locks never does.
     fn delivery_keys(&self, ours: &str, c: &str, tree: Option<&str>) -> BTreeSet<String>;
+}
+
+/// The port of plans: the referee's answers a take needs, a landing's plan and its written
+/// keys (R9.1) and a sync's tree (the [`Cut`]'s). The world implements it.
+pub(crate) trait Plans {
+    /// A landing's plan, built by the world from the referee's.
+    type Plan: Clone;
+    /// The tree a sync of upstream commit `up` into a fork at `ours` makes; none if the
+    /// fork has `up`.
+    fn sync_tree(&self, ours: &str, up: &str) -> Option<String>;
     /// The plan of landing commit `c` on `ours`, and the keys it writes.
     fn plan(&self, ours: &str, c: &str) -> (Self::Plan, BTreeSet<String>);
 }
@@ -280,7 +285,7 @@ impl Queues {
 
     /// Rule 9: plan the first entry P1 lets go into `t` and the files it locks. Reads only;
     /// [`Queues::apply`] records the choice. Panics if no entry may go.
-    pub(crate) fn choose<K: Keys + ?Sized>(&self, t: TreeId, port: &K) -> Choice<K::Plan> {
+    pub(crate) fn choose<K: Keys + Plans + ?Sized>(&self, t: TreeId, port: &K) -> Choice<K::Plan> {
         Locks { q: self, port }.choose(t)
     }
 
@@ -349,57 +354,13 @@ impl Queues {
     }
 }
 
-/// The queues read with the port: the rules' bodies call `self.x(..)` for either.
-struct Locks<'a, K: Keys + ?Sized> {
+/// The queues read with the ports.
+struct Locks<'a, K: ?Sized> {
     q: &'a Queues,
     port: &'a K,
 }
 
 impl<K: Keys + ?Sized> Locks<'_, K> {
-    fn head(&self, t: TreeId) -> String {
-        self.port.head(t)
-    }
-
-    fn upstream_of(&self, t: TreeId) -> Option<TreeId> {
-        self.port.upstream_of(t)
-    }
-
-    fn write_open(&self, t: TreeId) -> BTreeSet<String> {
-        self.port.write_open(t)
-    }
-
-    fn touches_of(&self, c: &str) -> BTreeSet<String> {
-        self.port.touches_of(c)
-    }
-
-    fn changed_keys(&self, ours: &str, tree: &str) -> BTreeSet<String> {
-        self.port.changed_keys(ours, tree)
-    }
-
-    fn is_ancestor(&self, a: &str, b: &str) -> bool {
-        self.port.is_ancestor(a, b)
-    }
-
-    fn first_parent(&self, c: &str) -> String {
-        self.port.first_parent(c)
-    }
-
-    fn sync_tree(&self, ours: &str, up: &str) -> Option<String> {
-        self.port.sync_tree(ours, up)
-    }
-
-    fn delivery_keys(&self, ours: &str, c: &str, tree: Option<&str>) -> BTreeSet<String> {
-        self.port.delivery_keys(ours, c, tree)
-    }
-
-    fn plan(&self, ours: &str, c: &str) -> (K::Plan, BTreeSet<String>) {
-        self.port.plan(ours, c)
-    }
-
-    fn landing_pending(&self, upstream: TreeId, f: TreeId) -> bool {
-        self.q.landing_pending(upstream, f)
-    }
-
     /// Progress rule P1 (git-model.md §6): the first entry of `t`'s queue
     /// that may be taken now. An entry waits behind every
     /// earlier waiting entry it shares a file or a source with; so does
@@ -433,14 +394,18 @@ impl<K: Keys + ?Sized> Locks<'_, K> {
     /// The files queue entry `e` of `t` may touch, before it is planned.
     fn hint(&self, t: TreeId, e: &Entry) -> BTreeSet<String> {
         match e {
-            Entry::Landing { commit, .. } => self.touches_of(commit),
-            Entry::Sync => match self.upstream_of(t) {
-                Some(up) => self.changed_keys(&self.head(t), &self.head(up)),
+            Entry::Landing { commit, .. } => self.port.touches_of(commit),
+            Entry::Sync => match self.port.upstream_of(t) {
+                Some(up) => self
+                    .port
+                    .changed_keys(&self.port.head(t), &self.port.head(up)),
                 None => BTreeSet::new(),
             },
         }
     }
+}
 
+impl<K: Keys + Plans + ?Sized> Locks<'_, K> {
     /// Rule 9, a take's choice: plan the first entry P1 lets go
     /// ([`Locks::scan`]) into `t` and the files it locks there (a landing:
     /// every file its changes touch, [`Locks::touched`]). If a client of `t`
@@ -455,15 +420,14 @@ impl<K: Keys + ?Sized> Locks<'_, K> {
             panic!("{t:?}: no entry can be taken")
         };
         let (seq, head) = q[i].clone();
-        let ours = self.head(t);
+        let ours = self.port.head(t);
         let (take, files) = match head {
             Entry::Sync => {
-                let f = t;
-                let Some(upstream) = self.upstream_of(f) else {
+                let Some(upstream) = self.port.upstream_of(t) else {
                     unreachable!("the root has no upstream")
                 };
-                let whole = self.head(upstream);
-                let landing = self.landing_pending(upstream, f);
+                let whole = self.port.head(upstream);
+                let landing = self.q.landing_pending(upstream, t);
                 let p = self.prefix(t, &ours, &whole);
                 let Some((up, tree)) = p.deliver else {
                     // Its first commit would overwrite an open file: it
@@ -478,7 +442,7 @@ impl<K: Keys + ?Sized> Locks<'_, K> {
                 };
                 let files = tree
                     .as_ref()
-                    .map(|tr| self.changed_keys(&ours, tr))
+                    .map(|tr| self.port.changed_keys(&ours, tr))
                     .unwrap_or_default();
                 let cut = Cut { up, tree };
                 if let Some(until) = p.until {
@@ -511,12 +475,17 @@ impl<K: Keys + ?Sized> Locks<'_, K> {
                 )
             }
             Entry::Landing { from, commit } => {
-                let (plan, written) = self.plan(&ours, &commit);
+                let (plan, written) = self.port.plan(&ours, &commit);
                 let files = self.touched(&commit, written);
                 (Take::Landing { from, commit, plan }, files)
             }
         };
-        let open: BTreeSet<String> = self.write_open(t).intersection(&files).cloned().collect();
+        let open: BTreeSet<String> = self
+            .port
+            .write_open(t)
+            .intersection(&files)
+            .cloned()
+            .collect();
         if !open.is_empty() {
             // A landing whose files are open waits for them to close; a
             // sync never gets here (`prefix` delivers none of an open file).
@@ -544,7 +513,7 @@ impl<K: Keys + ?Sized> Locks<'_, K> {
     /// for an open writer of a file its change touches even when that change loses.
     fn touched(&self, c: &str, written: BTreeSet<String>) -> BTreeSet<String> {
         let mut files = written;
-        files.extend(self.touches_of(c));
+        files.extend(self.port.touches_of(c));
         files
     }
 
@@ -560,25 +529,25 @@ impl<K: Keys + ?Sized> Locks<'_, K> {
     /// 38; the owner, 2026-11-07, "3. B"), and holds back that one and every
     /// later one, the decisions they carry included, until those files close.
     fn prefix(&self, t: TreeId, ours: &str, whole: &str) -> Prefix {
-        let open = self.write_open(t);
+        let open = self.port.write_open(t);
         let mut chain = Vec::new();
         let mut c = whole.to_string();
-        while !self.is_ancestor(&c, ours) {
+        while !self.port.is_ancestor(&c, ours) {
             chain.push(c.clone());
-            c = self.first_parent(&c);
+            c = self.port.first_parent(&c);
         }
         chain.reverse();
         if open.is_empty() || chain.is_empty() {
             return Prefix {
-                deliver: Some((whole.to_string(), self.sync_tree(ours, whole))),
+                deliver: Some((whole.to_string(), self.port.sync_tree(ours, whole))),
                 until: None,
             };
         }
         let mut deliver = None;
         let mut before = BTreeSet::new();
         for c in &chain {
-            let tree = self.sync_tree(ours, c);
-            let mut now = self.delivery_keys(ours, c, tree.as_deref());
+            let tree = self.port.sync_tree(ours, c);
+            let mut now = self.port.delivery_keys(ours, c, tree.as_deref());
             now.extend(before.iter().cloned());
             if !now.is_disjoint(&open) {
                 // It waits until no file this commit adds to the sync's
@@ -627,8 +596,6 @@ mod tests {
     }
 
     impl Keys for Fake {
-        type Plan = ();
-
         fn head(&self, t: TreeId) -> String {
             self.heads[&t].clone()
         }
@@ -670,12 +637,16 @@ mod tests {
             self.parent[c].clone()
         }
 
-        fn sync_tree(&self, ours: &str, up: &str) -> Option<String> {
-            (!self.is_ancestor(up, ours)).then(|| up.to_string())
-        }
-
         fn delivery_keys(&self, _ours: &str, c: &str, _tree: Option<&str>) -> BTreeSet<String> {
             self.touches_of(c)
+        }
+    }
+
+    impl Plans for Fake {
+        type Plan = ();
+
+        fn sync_tree(&self, ours: &str, up: &str) -> Option<String> {
+            (!self.is_ancestor(up, ours)).then(|| up.to_string())
         }
 
         fn plan(&self, _ours: &str, c: &str) -> ((), BTreeSet<String>) {

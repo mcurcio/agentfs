@@ -27,20 +27,18 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::calls::{
-    CallError, Caller, Recorded, RecordedCall, Shown, ShownCollision, Took, TreeCalls, TreeId,
-    gather_collisions, out_of_scope,
+    CallError, Caller, Client, HandleId, Recorded, RecordedCall, Shown, ShownCollision, Took,
+    TreeCalls, TreeId, TxnId, gather_collisions, out_of_scope,
 };
-use crate::content::{Content, Layout, Line, PATHS, UNBORN};
+use crate::content::{Content, Edit, Layout, Line, PATHS, UNBORN};
 use crate::git::{git, git_in, try_git};
 use crate::program;
 pub use crate::program::LineEdit;
-use crate::queue::{self, Choice, Cut, Entry, Keys, Queues, Take, TakeRecord, Waiting, name_key};
-use crate::recording::{
-    self, Files, Handle, HandleId, Kind, Recording, Save, Saved, Target, Write,
+use crate::queue::{
+    self, Choice, Cut, Entry, Keys, Plans, Queues, Take, TakeRecord, Waiting, name_key,
 };
+use crate::recording::{self, Files, Handle, Kind, Recording, Save, Saved, Target, Write};
 use crate::referee::{self, Incoming, Lost};
-
-pub type TxnId = u32;
 
 /// The design choice under rules 2 and 3: how a sync builds the fork's
 /// new version.
@@ -74,18 +72,6 @@ impl Default for Policies {
             layout: Layout::Separated,
         }
     }
-}
-
-/// A program writing through a view: one of main's clients (by writer
-/// name), a fork's client, or another program in that fork. Only
-/// [`Client::Fork`] begins a transaction and writes in it; [`Client::Outside`]
-/// always writes in the fork's tree, and so meets a transaction's files
-/// (R5.3). Both name the fork's one writer (rule 6).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Client {
-    Main(String),
-    Fork(TreeId),
-    Outside(TreeId),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -250,19 +236,6 @@ pub enum Step {
     /// for), taken in any order with the queue steps, so the push is
     /// eventual and never part of a referee's step.
     Replicate,
-}
-
-/// One line version a commit set.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Edit {
-    /// The file's identity.
-    pub path: String,
-    /// The line's identity.
-    pub line: String,
-    /// The version.
-    pub token: String,
-    /// The version is a delete (of a line, or an unlink).
-    pub gone: bool,
 }
 
 /// One take of a change into a tree (a landing, or a transaction's commit
@@ -2698,8 +2671,6 @@ impl referee::Lineage for World {
 
 /// Queue and locks reads the world through this port.
 impl Keys for World {
-    type Plan = Merged;
-
     fn head(&self, t: TreeId) -> String {
         World::head(self, t)
     }
@@ -2728,12 +2699,16 @@ impl Keys for World {
         World::first_parent(self, c)
     }
 
-    fn sync_tree(&self, ours: &str, up: &str) -> Option<String> {
-        World::sync_tree(self, ours, up)
-    }
-
     fn delivery_keys(&self, ours: &str, c: &str, tree: Option<&str>) -> BTreeSet<String> {
         World::delivery_keys(self, ours, c, tree)
+    }
+}
+
+impl Plans for World {
+    type Plan = Merged;
+
+    fn sync_tree(&self, ours: &str, up: &str) -> Option<String> {
+        World::sync_tree(self, ours, up)
     }
 
     /// Rule 3e's plan of landing `c` on `ours` ([`World::judge`]) and the files it writes.

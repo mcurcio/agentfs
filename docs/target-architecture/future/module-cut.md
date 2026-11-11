@@ -66,7 +66,7 @@ verdicts: undecided, verdicts, names (to a fixed point), placing, whole. Sync ru
 | Rules | Owner | How it crosses |
 |---|---|---|
 | R9.3, R9.9, R3d | queue and locks owns the `Cut`; the referee owns what each commit touches | Queue and locks walks the upstream's commits one at a time and stops at the first that touches an open file. Sync accepts only a `Cut` |
-| R9, R9.1 lock keys | queue and locks | Tree history gives each commit's keys; land gives its written keys |
+| R9, R9.1 lock keys | queue and locks | Tree history gives each commit's keys; land gives its written keys. Deriving a key (`NAME_KEY` is queue and locks's) reads files and line maps, so in the model it stays with tree history in `World` (`changed_keys`, `touches_of`, `delivery_keys`) until tree history is cut |
 | R11.2 at a landing | referee: names | A rename-over's own unlink frees its path, even when the change loses whole |
 | R11.3 at a sync | referee gives it, recording takes it | The sync result lists files that came back; they get new objects, so old writers stay orphaned |
 | R6.1 | tree history | The landing-pending flag comes from the queue |
@@ -107,6 +107,14 @@ git's ref files. It does not yet re-derive the rest from git; a later step does,
 - The model and the engine share one decomposition, so a wrong grouping shows up in both. The checker shares none of it.
 - Rule work pauses while the split runs: about 6 to 8 days in all (estimate).
 - Each engine step needs the full tree-view CI run, about 2 to 3 hours.
+- Built model step 3 keeps these, each a later step's to remove:
+  - Queue and locks asks the referee through `Plans`: a take needs a landing's written keys and the tree its `Cut`
+    carries in the same step. An engine queue must be given both.
+  - Whether a call is deferred is two records: `Handle::deferred` in recording and the order in queue and locks,
+    kept in step only by `World::defer`. Deriving one from the other removes the corpus bug `deferred_flag_dropped`,
+    which plants a bug in the flag alone, and so changes the matrix.
+  - `Recording::replayed` is `remove` for a crash's replay, kept apart because the corpus bug
+    `crash_relinks_a_dead_open` edits the replay alone; folding it into `remove` would plant that bug at every close.
 
 ## Steps
 
@@ -116,7 +124,8 @@ Built: the safety net (the golden digest, the planted-bug corpus and the guarded
 the trees from their plans. Recording is `crates/agentfs-model/src/recording.rs`: opens, their byte calls, objects,
 orphans and each close's save, read through a `Files` port; the world commits the save. Queue and locks is
 `crates/agentfs-model/src/queue.rs`: the queues, P1's scan, the locks a take holds, the `Cut` a sync delivers to,
-and the order of deferred calls, read through a `Keys` port that the world implements. The world composes them;
+and the order of deferred calls, read through two ports the world implements: `Keys` (lock keys and lineage, all P1's
+scan reads) and `Plans` (a landing's plan and written keys, a sync's tree). The world composes them;
 it still holds tree history, transactions, the journal's replay, replication and the trace, which no step here
 cuts. How to use the net is in the model's `VERIFYING.md`
 ("Refactoring without changing outcomes") and the repo skill `.claude/skills/model-runs`.
