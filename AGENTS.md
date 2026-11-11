@@ -8,11 +8,9 @@ Code loads them through `.claude/settings.json`; other agents and people read th
 that quotes the maintainer overrides them for this project.
 
 A cloud session ignores the plugins a checked-in `.claude/settings.json` turns on, because it never
-shows the trust dialog. `.claude/install-plugins.sh` installs them. As a SessionStart hook it runs too
-late for the session it is in, so put it in the environment's setup script, which runs before Claude
-starts. Without that, the first session in a fresh container has no `workflow:*` agents, and the hook
-says so. Never test it with `claude plugin marketplace remove`: that also empties the project's
-`.claude/settings.json`.
+shows the trust dialog. The environment's setup script installs them before Claude starts, as the
+skills README says under "Cloud sessions". When it has not, `.claude/check-plugins.sh` (a
+SessionStart hook) says which are missing, and the `workflow:*` agents are absent from the session.
 
 agentfs is a FUSE filesystem. It records every change a workload makes into git history that the workload cannot see. It pushes that history to remotes and applies patches queued by iac. It ships as a sidecar and as a CSI driver.
 

@@ -17,8 +17,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/install-plugins.sh --hook",
-            "timeout": 300
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/check-plugins.sh",
+            "timeout": 30
           }
         ]
       }
