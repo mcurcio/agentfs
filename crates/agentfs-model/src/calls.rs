@@ -24,6 +24,24 @@ pub enum Caller {
     Fork(TreeId),
 }
 
+/// A program writing through a view: one of main's clients (by writer
+/// name), a fork's client, or another program in that fork. Only
+/// [`Client::Fork`] begins a transaction and writes in it; [`Client::Outside`]
+/// always writes in the fork's tree, and so meets a transaction's files
+/// (R5.3). Both name the fork's one writer (rule 6).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Client {
+    Main(String),
+    Fork(TreeId),
+    Outside(TreeId),
+}
+
+/// A transaction's number in its fork.
+pub type TxnId = u32;
+
+/// An open file's, or a deferred path call's, number.
+pub type HandleId = u32;
+
 /// A tree: its number. 0 is the root, the one tree with no upstream; each fork
 /// takes the next number from 1, in the order made, never reused. Ordered by
 /// number: the root first, forks ascending. Which tree a fork syncs from is the

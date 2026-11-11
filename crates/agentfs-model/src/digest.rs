@@ -19,8 +19,9 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use crate::calls::TreeId;
+use crate::calls::TxnId;
 use crate::git::{git, git_in, try_git};
-use crate::world::{COLLISION, TxnId, World};
+use crate::world::{COLLISION, World};
 
 /// Where `World::drop` writes each run's digest.
 pub const DIGEST_DIR: &str = "AGENTFS_MODEL_DIGEST_DIR";

@@ -10,7 +10,7 @@
 //! to nothing and writes the bytes it was given (often a stale read).
 
 use crate::content::{Content, split_lines};
-use crate::world::Write;
+use crate::recording::Write;
 
 /// What a program means to do to a file's lines. Positions count the lines
 /// the program reads ([`crate::world::World::view`]); a position past the

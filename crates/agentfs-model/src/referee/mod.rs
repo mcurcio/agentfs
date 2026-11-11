@@ -12,8 +12,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::content::{Content, Line};
-use crate::world::{By, Direction, Edit};
+use crate::content::{Content, Edit, Line};
+use crate::world::{By, Direction};
 
 mod ancestry;
 mod names;

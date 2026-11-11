@@ -117,9 +117,10 @@ request says in its body that they were run and what they showed.
 
 ## The procedure
 
-1. **Encode the rule in the model first.** Change `src/world.rs` (`src/referee/` for a line or name rule, `src/content.rs`
-   for what a file holds) so the model does what the rule says. The rule must already be in the
-   [rules ledger](../../docs/target-architecture/rules-ledger.md) as `owner` or `approved`. A rule that is not
+1. **Encode the rule in the model first.** Change `src/world.rs` (`src/referee/` for a line or name rule,
+   `src/recording.rs` for an open, a byte call, a path call or a save, `src/queue.rs` for a queue's order, a lock or
+   a deferred call, `src/content.rs` for what a file holds) so the model does what the rule says. The rule must
+   already be in the [rules ledger](../../docs/target-architecture/rules-ledger.md) as `owner` or `approved`. A rule that is not
    there goes to the owner as a question first, with a recommendation, and is built only after he answers.
    Then add or change the rule's row in MODEL.md's table: the rule in plain words, its ledger ID, and the
    scenario tests that show it. Never present a choice as an owner decision.
@@ -380,9 +381,9 @@ What a replay decides, each reported rather than hidden:
   finding 49: "Without any other information, B sounds reasonable. Obviously atomic operations are more reliable"): it
   chooses its entry, locks its keys and writes, with no call in between. So the trace is the order the calls ran in, a
   take is recorded once, after its write, and the trees are compared after every call. One ordering is left in
-  `world.rs`'s recording: a queue step that only marks a wait while another entry is free is not a call, since a real
-  take goes on to the free entry. No take is in progress at a crash. Until 2026-11-08 the model's take was two steps,
-  and a take recorded later than it began could pick another entry at its recorded place (finding 49).
+  `world.rs`'s trace (`record_take`): a queue step that only marks a wait while another entry is free is not a call,
+  since a real take goes on to the free entry. No take is in progress at a crash. Until 2026-11-08 the model's take
+  was two steps, and a take recorded later than it began could pick another entry at its recorded place (finding 49).
 - **Mounts.** `mountable` takes at most one fork, made before any client call, and no open that both appends and
   writes at an offset: Linux has no such descriptor. The take gate (`AGENTFS_TAKE_GATE`, a failpoints build) runs each
   take at the trace's point and answers by a fifo, and a synchronous request after `close(2)` proves its `RELEASE`
