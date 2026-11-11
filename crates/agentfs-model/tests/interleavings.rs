@@ -30,13 +30,14 @@
 //! panic too reports its seed and the event log. The generator is a
 //! SplitMix64 written here: fixed seeds replay exactly.
 
+use agentfs_model::calls::TreeId;
 use agentfs_model::check::{Checked, change_files};
 use agentfs_model::content::{BLANK, Content, FILES, Layout, PATHS, UNBORN};
 use agentfs_model::git::{git, with_reversed_dates};
 use agentfs_model::program;
 use agentfs_model::world::{
-    By, Client, Direction, Entry, ForkId, HandleId, Kind, Life, LineEdit, MergeRule, NAME_KEY,
-    Policies, Step, Target, Tree, TxnEnd, TxnOutcome, World, Write, name_key,
+    By, Client, Direction, Entry, HandleId, Kind, Life, LineEdit, MergeRule, NAME_KEY, Policies,
+    Step, Target, TxnEnd, TxnOutcome, World, Write, name_key,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -172,7 +173,7 @@ fn seeds() -> Vec<u64> {
     (1..=SEEDS).collect()
 }
 
-fn live_clients(w: &World) -> Vec<ForkId> {
+fn live_clients(w: &World) -> Vec<TreeId> {
     w.forks
         .values()
         .filter(|f| f.life == Life::Open)
@@ -186,7 +187,7 @@ fn txn_open(w: &World) -> bool {
         .any(|h| h.kind == Kind::Write && matches!(h.target, Target::Txn(..)))
 }
 
-fn in_txn(w: &World) -> Vec<ForkId> {
+fn in_txn(w: &World) -> Vec<TreeId> {
     w.forks
         .values()
         .filter(|f| f.txn.is_some())
@@ -209,7 +210,7 @@ struct Oracle {
     next_inode: u64,
     /// R5.3, the harness's own list: the calls each fork's open transaction
     /// has deferred, in the order they were made.
-    deferred: BTreeMap<ForkId, Vec<Deferred>>,
+    deferred: BTreeMap<TreeId, Vec<Deferred>>,
 }
 
 /// A call deferred behind a transaction: a close, or a path call (its handle,
@@ -357,12 +358,12 @@ impl Oracle {
         to: Option<&str>,
     ) -> Result<(), String> {
         let t = match c {
-            Client::Main(_) => Target::Tree(Tree::Main),
+            Client::Main(_) => Target::Tree(TreeId::ROOT),
             Client::Fork(f) => match &w.forks[f].txn {
                 Some(x) => Target::Txn(*f, x.id),
-                None => Target::Tree(Tree::Fork(*f)),
+                None => Target::Tree(*f),
             },
-            Client::Outside(f) => Target::Tree(Tree::Fork(*f)),
+            Client::Outside(f) => Target::Tree(*f),
         };
         let at = head_of(w, t).expect("live");
         let file = w.lookup(&at, p).expect("a file");
@@ -392,10 +393,11 @@ impl Oracle {
     /// one of `files` is a file of the fork's open transaction: one it has
     /// saved (read from git), has open for writing, or has deferred a call on.
     /// The fork, if so.
-    fn defers(&self, w: &World, t: Target, files: &[String]) -> Option<ForkId> {
-        let Target::Tree(Tree::Fork(f)) = t else {
+    fn defers(&self, w: &World, t: Target, files: &[String]) -> Option<TreeId> {
+        let Target::Tree(f) = t else {
             return None;
         };
+        w.upstream_of(f)?;
         let txn = w.forks[&f].txn.as_ref()?;
         let spec = [txn.start.as_str(), txn.head.as_str()];
         let saved = git(
@@ -418,15 +420,15 @@ impl Oracle {
     }
 
     /// R5.3: whether open `h`'s close defers, as the harness reads it.
-    fn close_defers(&self, w: &World, h: HandleId) -> Option<ForkId> {
+    fn close_defers(&self, w: &World, h: HandleId) -> Option<TreeId> {
         let file = self.named(w, h)?;
         self.defers(w, w.handle(h).target, &[file])
     }
 
     /// A commit left transaction open `h` open: it now holds in the fork
     /// the object its file `file` has there; with none, an orphan.
-    fn move_to_fork(&mut self, h: HandleId, f: ForkId, file: Option<String>) {
-        let t = Target::Tree(Tree::Fork(f));
+    fn move_to_fork(&mut self, h: HandleId, f: TreeId, file: Option<String>) {
+        let t = Target::Tree(f);
         let o = match file {
             Some(x) => match self.inodes.get(&(t, x.clone())) {
                 Some(o) => *o,
@@ -778,7 +780,7 @@ fn crash_checked(w: &mut World, o: &mut Oracle, during: Option<HandleId>) -> Res
 /// R5.3, once fork `f`'s transaction has ended: the model's deferred calls
 /// are the harness's, in order, and each applies now, the oracle following it
 /// by its own byte code on the head it finds.
-fn apply_deferred_checked(w: &mut World, o: &mut Oracle, f: ForkId) -> Result<(), String> {
+fn apply_deferred_checked(w: &mut World, o: &mut Oracle, f: TreeId) -> Result<(), String> {
     let list = o.deferred.remove(&f).unwrap_or_default();
     let model: Vec<HandleId> = w.forks[&f].deferred.iter().copied().collect();
     let own: Vec<HandleId> = list.iter().map(Deferred::id).collect();
@@ -787,10 +789,10 @@ fn apply_deferred_checked(w: &mut World, o: &mut Oracle, f: ForkId) -> Result<()
             "oracle_deferred: R5.3: f{f} deferred {model:?}, the harness made {own:?}"
         ));
     }
-    let t = Target::Tree(Tree::Fork(f));
+    let t = Target::Tree(f);
     for d in list {
         let n = w.orphans.len();
-        let at = w.head(Tree::Fork(f));
+        let at = w.head(f);
         let mut expect = Vec::new();
         let run = match &d {
             Deferred::Close(h) => {
@@ -819,7 +821,7 @@ fn apply_deferred_checked(w: &mut World, o: &mut Oracle, f: ForkId) -> Result<()
     gitledger::observe(w)
 }
 
-fn rollback_checked(w: &mut World, o: &mut Oracle, f: ForkId) -> Result<(), String> {
+fn rollback_checked(w: &mut World, o: &mut Oracle, f: TreeId) -> Result<(), String> {
     let n = w.orphans.len();
     w.rollback_only(f).expect("open");
     o.reload(w);
@@ -833,7 +835,7 @@ fn rollback_checked(w: &mut World, o: &mut Oracle, f: ForkId) -> Result<(), Stri
 fn commit_checked(
     w: &mut World,
     o: &mut Oracle,
-    f: ForkId,
+    f: TreeId,
     tally: &mut Tally,
 ) -> Result<(), String> {
     let txn = w.forks[&f].txn.as_ref().expect("open").id;
@@ -843,9 +845,10 @@ fn commit_checked(
         .filter(|(_, (u, _, _, _))| *u == Target::Txn(f, txn))
         .map(|(h, _)| (*h, o.named(w, *h)))
         .collect();
-    tally.commits_with_open += usize::from(w.handles().any(|h| {
-        !h.deferred && (h.target == Target::Txn(f, txn) || h.target == Target::Tree(Tree::Fork(f)))
-    }));
+    tally.commits_with_open +=
+        usize::from(w.handles().any(|h| {
+            !h.deferred && (h.target == Target::Txn(f, txn) || h.target == Target::Tree(f))
+        }));
     w.commit_txn_only(f).expect("open");
     gitledger::observe(w)?;
     o.reload(w);
@@ -955,7 +958,7 @@ fn run_seed_of(
 
 /// A waiting entry: its tree, the files it locks, and the (file, line
 /// identity) pairs in contention there.
-type Contention = (Tree, Vec<String>, Vec<(String, String)>);
+type Contention = (TreeId, Vec<String>, Vec<(String, String)>);
 
 /// The client calls of a run, with the harness's state across them.
 struct Calls {
@@ -1383,10 +1386,10 @@ impl Calls {
         let Some((t, held, contended)) = self.rng.pick(&waiting) else {
             return Ok(false);
         };
-        let c = match t {
-            Tree::Main => Client::Main(self.mains[self.rng.below(self.mains.len())].clone()),
-            Tree::Fork(f) if w.forks[&f].life == Life::Open => Client::Fork(f),
-            Tree::Fork(_) => return Ok(false),
+        let c = match w.upstream_of(t) {
+            None => Client::Main(self.mains[self.rng.below(self.mains.len())].clone()),
+            Some(_) if w.forks[&t].life == Life::Open => Client::Fork(t),
+            Some(_) => return Ok(false),
         };
         let file = match self.rng.pick(&held) {
             Some(x) if self.rng.below(4) != 0 => x,
@@ -1484,9 +1487,9 @@ fn run_as(
                     let upstream = match k.rng.pick(&forks) {
                         Some(f) if k.rng.below(3) == 0 && g.nested => {
                             tally.nested += 1;
-                            Tree::Fork(f)
+                            f
                         }
-                        _ => Tree::Main,
+                        _ => TreeId::ROOT,
                     };
                     w.create_fork(upstream);
                     k.o.reload(w);
@@ -1607,7 +1610,7 @@ fn run_as(
                 // An entry waits: a fork of that tree saves a file the
                 // entry does not lock, then a queue step there, so a later,
                 // unrelated entry goes ahead of the waiting one (P1).
-                let waiting: Vec<(Tree, Vec<String>)> = w
+                let waiting: Vec<(TreeId, Vec<String>)> = w
                     .waits()
                     .iter()
                     .map(|(t, m)| {
@@ -1626,7 +1629,7 @@ fn run_as(
                         .copied()
                         .filter(|f| !locked.iter().any(|l| l == f))
                         .collect();
-                    let kids: Vec<ForkId> = live_clients(w)
+                    let kids: Vec<TreeId> = live_clients(w)
                         .into_iter()
                         .filter(|f| w.forks[f].upstream == t && w.forks[f].txn.is_none())
                         .collect();
@@ -1747,8 +1750,8 @@ fn rounds_as(
                     let forks = live_clients(w);
                     if forks.len() < 4 {
                         let upstream = match k.rng.pick(&forks) {
-                            Some(f) if k.rng.below(3) == 0 && g.nested => Tree::Fork(f),
-                            _ => Tree::Main,
+                            Some(f) if k.rng.below(3) == 0 && g.nested => f,
+                            _ => TreeId::ROOT,
                         };
                         w.create_fork(upstream);
                         k.o.reload(w);

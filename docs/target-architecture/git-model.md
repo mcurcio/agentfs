@@ -73,7 +73,7 @@ flowchart TB
 | volume | one repository (one object store, many branches) | `World` |
 | tree (main, the tree with no upstream; a fork) | a branch, with its own working tree and index | `refs/heads/main`, `refs/heads/fork/<id>` |
 | fork's upstream | the branch's upstream, in the same repository (`branch.fork/3.remote = .`) | `Fork::upstream` |
-| nested fork | a branch whose upstream is another fork's branch | `create_fork(Tree::Fork(f))` |
+| nested fork | a branch whose upstream is another fork's branch | `create_fork(f)` |
 | client, writer | the `Agentfs-Writer` trailer; git's author and committer are one fixed service identity | `Client`, `fork.writer` |
 | save | one commit on the tree's branch at close: the program's write calls applied to the head then (its first parent), naming one writer | `World::close` |
 | lock | a take holding the files it overwrites in a tree, or a write-open blocking one; in memory, not a ref | `World::holds`, `World::waits` |

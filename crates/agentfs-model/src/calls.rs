@@ -21,14 +21,44 @@ use std::fmt;
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Caller {
     Main(String),
-    Fork(usize),
+    Fork(TreeId),
 }
 
-/// A tree.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub enum TreeId {
-    Main,
-    Fork(usize),
+/// A tree: its number. 0 is the root, the one tree with no upstream; each fork
+/// takes the next number from 1, in the order made, never reused. Ordered by
+/// number: the root first, forks ascending. Which tree a fork syncs from is the
+/// system's answer, not the identity's.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TreeId(u32);
+
+impl TreeId {
+    /// The root.
+    pub const ROOT: TreeId = TreeId(0);
+
+    /// The tree numbered `n` (0 is the root).
+    pub const fn new(n: u32) -> TreeId {
+        TreeId(n)
+    }
+
+    /// Its number; the digest labels it `T<number>`.
+    pub const fn number(self) -> u32 {
+        self.0
+    }
+}
+
+/// The bare number: every name built from a tree (`fork/<n>`, the writer
+/// `c<n>`) reads as it did when forks were numbers.
+impl fmt::Display for TreeId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// The digest's label, `T<number>`, so logs and digests read alike.
+impl fmt::Debug for TreeId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "T{}", self.0)
+    }
 }
 
 /// What a queue step did: it took an entry, every entry waits, or none is queued.
@@ -71,7 +101,7 @@ impl std::error::Error for CallError {}
 /// real library and a real mount (`crates/agentfs-conformance`).
 pub trait TreeCalls {
     type Open: Copy + Ord + std::fmt::Debug;
-    fn fork(&mut self) -> Result<usize, CallError>;
+    fn fork(&mut self) -> Result<TreeId, CallError>;
     fn open_write(&mut self, c: &Caller, path: &str) -> Result<Self::Open, CallError>;
     fn open_trunc(&mut self, c: &Caller, path: &str) -> Result<Self::Open, CallError>;
     fn create(&mut self, c: &Caller, path: &str) -> Result<Self::Open, CallError>;
@@ -93,7 +123,7 @@ pub trait TreeCalls {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RecordedCall {
     Fork {
-        id: usize,
+        id: TreeId,
     },
     OpenWrite {
         caller: Caller,
@@ -261,7 +291,7 @@ fn unhex(s: &str) -> Result<Vec<u8>, CallError> {
 fn caller(c: &Caller) -> String {
     match c {
         Caller::Main(n) => format!("m:{}", hex(n.as_bytes())),
-        Caller::Fork(f) => format!("f:{f}"),
+        Caller::Fork(f) => format!("f:{}", f.number()),
     }
 }
 
@@ -273,23 +303,35 @@ fn parse_caller(s: &str) -> Result<Caller, CallError> {
     }
     s.strip_prefix("f:")
         .ok_or_else(|| CallError::new(format!("bad caller {s:?}")))
-        .and_then(|f| number(f).map(|f| Caller::Fork(f as usize)))
+        .and_then(fork_id)
+        .map(Caller::Fork)
 }
 
 fn tree(t: TreeId) -> String {
-    match t {
-        TreeId::Main => "main".into(),
-        TreeId::Fork(f) => format!("f{f}"),
-    }
+    format!("t{}", t.number())
 }
 
 fn parse_tree(s: &str) -> Result<TreeId, CallError> {
-    if s == "main" {
-        return Ok(TreeId::Main);
-    }
-    s.strip_prefix('f')
+    s.strip_prefix('t')
         .ok_or_else(|| CallError::new(format!("bad tree {s:?}")))
-        .and_then(|f| number(f).map(|f| TreeId::Fork(f as usize)))
+        .and_then(tree_id)
+}
+
+/// A tree's number as the trace writes it; one past `u32` is an error, never a wrap.
+fn tree_id(s: &str) -> Result<TreeId, CallError> {
+    let n = number(s)?;
+    u32::try_from(n)
+        .map(TreeId::new)
+        .map_err(|_| CallError::new(format!("bad tree number {s:?}")))
+}
+
+/// A fork's number: a tree's, but never the root's.
+fn fork_id(s: &str) -> Result<TreeId, CallError> {
+    let t = tree_id(s)?;
+    if t == TreeId::ROOT {
+        return Err(CallError::new(format!("{s:?} names the root, not a fork")));
+    }
+    Ok(t)
 }
 
 fn number(s: &str) -> Result<u64, CallError> {
@@ -307,7 +349,7 @@ fn parse_path(s: &str) -> Result<String, CallError> {
 
 fn render_call(c: &RecordedCall) -> String {
     match c {
-        RecordedCall::Fork { id } => format!("fork {id}"),
+        RecordedCall::Fork { id } => format!("fork {}", id.number()),
         RecordedCall::OpenWrite { caller: c, path, h } => {
             format!("open {} {} {h}", caller(c), path_text(path))
         }
@@ -348,9 +390,7 @@ fn parse_call(s: &str) -> Result<RecordedCall, CallError> {
     let f: Vec<&str> = s.split(' ').collect();
     let bad = || CallError::new(format!("bad call {s:?}"));
     Ok(match f.as_slice() {
-        ["fork", id] => RecordedCall::Fork {
-            id: number(id)? as usize,
-        },
+        ["fork", id] => RecordedCall::Fork { id: fork_id(id)? },
         ["open", c, p, h] => RecordedCall::OpenWrite {
             caller: parse_caller(c)?,
             path: parse_path(p)?,
@@ -556,7 +596,7 @@ pub fn replay<T: TreeCalls>(
             RecordedCall::Fork { id } => {
                 let got = t.fork().map_err(|e| at(&e))?;
                 if got != *id {
-                    return Err(at(&format!("the system's fork is {got}")));
+                    return Err(at(&format!("the system's fork is {got:?}")));
                 }
             }
             RecordedCall::OpenWrite { caller, path, h } => {
@@ -633,20 +673,20 @@ mod tests {
         let shown = Shown {
             trees: BTreeMap::from([
                 (
-                    TreeId::Main,
+                    TreeId::ROOT,
                     BTreeMap::from([("a b".into(), b"-\n".to_vec())]),
                 ),
-                (TreeId::Fork(2), BTreeMap::from([("c".into(), Vec::new())])),
+                (TreeId::new(2), BTreeMap::from([("c".into(), Vec::new())])),
             ]),
             collisions: vec![ShownCollision {
-                tree: TreeId::Main,
+                tree: TreeId::ROOT,
                 path: "a".into(),
                 lost_bytes: vec![b"x\n".to_vec(), Vec::new()],
                 whole: true,
             }],
         };
         let calls = vec![
-            RecordedCall::Fork { id: 1 },
+            RecordedCall::Fork { id: TreeId::new(1) },
             RecordedCall::OpenTrunc {
                 caller: Caller::Main("m 1".into()),
                 path: "a".into(),
@@ -658,7 +698,7 @@ mod tests {
                 bytes: vec![0, 255, b'\n'],
             },
             RecordedCall::Take {
-                tree: TreeId::Fork(1),
+                tree: TreeId::new(1),
                 took: Took::Waiting,
             },
             RecordedCall::Crash,
@@ -673,7 +713,7 @@ mod tests {
             })
             .chain([Recorded {
                 call: RecordedCall::Take {
-                    tree: TreeId::Main,
+                    tree: TreeId::ROOT,
                     took: Took::Taken,
                 },
                 shown: None,
@@ -682,5 +722,18 @@ mod tests {
             .collect();
         assert_eq!(parse(&render(&trace)).unwrap(), trace);
         assert_eq!(scope_of(&trace), Scope::OutOfScope("drop"));
+    }
+
+    #[test]
+    fn a_tree_number_past_u32_or_a_root_fork_is_an_error() {
+        assert_eq!(parse_tree("t0").unwrap(), TreeId::ROOT);
+        assert!(
+            parse_tree("t4294967296").is_err(),
+            "it would wrap to the root"
+        );
+        assert!(parse_caller("f:0").is_err(), "the root is no fork");
+        assert!(parse_caller("f:4294967297").is_err());
+        assert_eq!(parse_caller("f:3").unwrap(), Caller::Fork(TreeId::new(3)));
+        assert!(parse_call("fork 0").is_err());
     }
 }

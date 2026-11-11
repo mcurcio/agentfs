@@ -36,16 +36,8 @@ use crate::program;
 pub use crate::program::LineEdit;
 use crate::referee::{self, Incoming, Lost};
 
-pub type ForkId = u32;
 pub type TxnId = u32;
 pub type HandleId = u32;
-
-/// A tree: main's, or a fork's.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum Tree {
-    Main,
-    Fork(ForkId),
-}
 
 /// The design choice under rules 2 and 3: how a sync builds the fork's
 /// new version.
@@ -89,8 +81,8 @@ impl Default for Policies {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Client {
     Main(String),
-    Fork(ForkId),
-    Outside(ForkId),
+    Fork(TreeId),
+    Outside(TreeId),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -113,8 +105,8 @@ pub struct Txn {
 }
 
 pub struct Fork {
-    pub id: ForkId,
-    pub upstream: Tree,
+    pub id: TreeId,
+    pub upstream: TreeId,
     /// Its one client's writer name.
     pub writer: String,
     pub life: Life,
@@ -130,7 +122,7 @@ pub struct Fork {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Entry {
     /// A child fork's commit, to land in this tree.
-    Landing { from: ForkId, commit: String },
+    Landing { from: TreeId, commit: String },
     /// The upstream moved: bring its current decided version into this fork
     /// (a sync carries the upstream's current version, never a stale one).
     Sync,
@@ -170,7 +162,7 @@ pub enum By {
 #[derive(Clone, Debug)]
 pub struct Collision {
     /// The tree that decided it: the upstream the incoming change landed in.
-    pub tree: Tree,
+    pub tree: TreeId,
     pub direction: Direction,
     /// The file (its identity) the lost versions are of.
     pub path: String,
@@ -199,7 +191,7 @@ pub struct Collision {
 /// answer of a commit that lost, or discarded).
 #[derive(Clone, Debug)]
 pub struct Ended {
-    pub fork: ForkId,
+    pub fork: TreeId,
     pub txn: TxnId,
     pub staged: Vec<Edit>,
     pub how: TxnEnd,
@@ -262,8 +254,8 @@ pub enum Step {
     /// overwrites and write them, with no call in between; or, if a client of
     /// that tree has one of them open for writing, record that it waits for
     /// those to close (rule 9).
-    Next(Tree),
-    Drop(ForkId),
+    Next(TreeId),
+    Drop(TreeId),
     /// Replication pushes to the shared remote: due once main moved or a
     /// collision was recorded since its last push (the events it waits
     /// for), taken in any order with the queue steps, so the push is
@@ -402,8 +394,8 @@ pub enum Kind {
 /// Where a write-open writes: its tree, or its client's open transaction.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Target {
-    Tree(Tree),
-    Txn(ForkId, TxnId),
+    Tree(TreeId),
+    Txn(TreeId, TxnId),
 }
 
 /// A file a client has open for writing (rule 8), or a path call deferred
@@ -479,7 +471,7 @@ pub enum Take {
     },
     /// A child's commit and the planned merge.
     Landing {
-        from: ForkId,
+        from: TreeId,
         commit: String,
         merged: Merged,
     },
@@ -516,7 +508,7 @@ pub enum Source {
     /// A sync: the tree's upstream.
     Upstream,
     /// A landing of a child fork's commit.
-    Child(ForkId),
+    Child(TreeId),
 }
 
 impl Entry {
@@ -541,7 +533,7 @@ struct Prefix {
 /// edit is read against, and whether it won.
 #[derive(Clone, Debug)]
 pub struct Landed {
-    pub tree: Tree,
+    pub tree: TreeId,
     pub direction: Direction,
     /// The tree's head before the take, and its commit after.
     pub before: String,
@@ -661,12 +653,12 @@ pub struct World {
     /// The shared remote (a bare repository): Replication pushes main and
     /// every collision ref there.
     remote: PathBuf,
-    pub main_head: String,
-    pub forks: BTreeMap<ForkId, Fork>,
-    next_fork: ForkId,
+    root_head: String,
+    pub forks: BTreeMap<TreeId, Fork>,
+    next_fork: u32,
     next_txn: TxnId,
     /// Each tree's queue: its entries, each numbered when queued.
-    queues: BTreeMap<Tree, VecDeque<(u64, Entry)>>,
+    queues: BTreeMap<TreeId, VecDeque<(u64, Entry)>>,
     next_seq: u64,
     handles: BTreeMap<HandleId, Handle>,
     next_handle: HandleId,
@@ -680,10 +672,10 @@ pub struct World {
     /// Every `OrphanDropped` event.
     pub orphans: Vec<Orphan>,
     /// The last queue step's take, if it took: for the checks.
-    last_take: Option<(Tree, TakeRecord)>,
+    last_take: Option<(TreeId, TakeRecord)>,
     /// Each tree's queue entries that wait for write-opens of their files
     /// to close (P1: several may wait, each for its own files).
-    waits: BTreeMap<Tree, BTreeMap<u64, Waiting>>,
+    waits: BTreeMap<TreeId, BTreeMap<u64, Waiting>>,
     /// The files each landing commit's own changes touch, cached.
     touches: RefCell<BTreeMap<String, BTreeSet<String>>>,
     counters: BTreeMap<String, u32>,
@@ -691,10 +683,10 @@ pub struct World {
     /// Every token that entered a tree: written in it, carried into it by a
     /// landing or a transaction (whether it won or lost there), or taken
     /// from the upstream by a sync.
-    pub entered: Vec<(Tree, Edit)>,
+    pub entered: Vec<(TreeId, Edit)>,
     /// Every sync that moved a fork: (the fork, the upstream's head it
     /// carried, the fork's head after, `entered.len()` when it began).
-    pub syncs: Vec<(Tree, String, String, usize)>,
+    pub syncs: Vec<(TreeId, String, String, usize)>,
     /// Every take of changes into a tree, a transaction's commit included.
     pub landings: Vec<Landed>,
     /// Landings that were fast-forwards.
@@ -756,7 +748,7 @@ impl World {
             root,
             repo,
             remote,
-            main_head: String::new(),
+            root_head: String::new(),
             forks: BTreeMap::new(),
             next_fork: 1,
             next_txn: 1,
@@ -799,7 +791,7 @@ impl World {
             .collect();
         let tree = w.tree_with(None, &files);
         let c = w.commit(&[], &tree, "agentfs", "Root", "main");
-        w.set_head(Tree::Main, &c);
+        w.set_head(TreeId::ROOT, &c);
         if !matches!(policies.merge, MergeRule::PerLine) || policies.layout != Layout::Separated {
             w.trace_call(out_of_scope("policy"));
         }
@@ -826,25 +818,31 @@ impl World {
 
     // ── reads ────────────────────────────────────────────────────────────
 
-    pub fn head(&self, t: Tree) -> String {
-        match t {
-            Tree::Main => self.main_head.clone(),
-            Tree::Fork(f) => self.forks[&f].head.clone(),
+    /// Tree `t`'s head. Panics on a tree never made.
+    pub fn head(&self, t: TreeId) -> String {
+        if t == TreeId::ROOT {
+            self.root_head.clone()
+        } else {
+            self.forks[&t].head.clone()
         }
+    }
+
+    /// The tree `t` syncs from and lands into; none for the root. Panics on a
+    /// tree never made.
+    pub fn upstream_of(&self, t: TreeId) -> Option<TreeId> {
+        (t != TreeId::ROOT).then(|| self.forks[&t].upstream)
     }
 
     /// The ref holding `t`'s head.
-    pub fn branch(t: Tree) -> String {
-        match t {
-            Tree::Main => "refs/heads/main".into(),
-            Tree::Fork(f) => format!("refs/heads/fork/{f}"),
-        }
+    pub fn branch(t: TreeId) -> String {
+        format!("refs/heads/{}", Self::name(t))
     }
 
-    pub(crate) fn name(t: Tree) -> String {
-        match t {
-            Tree::Main => "main".into(),
-            Tree::Fork(f) => format!("fork/{f}"),
+    pub(crate) fn name(t: TreeId) -> String {
+        if t == TreeId::ROOT {
+            "main".into()
+        } else {
+            format!("fork/{}", t.number())
         }
     }
 
@@ -865,7 +863,7 @@ impl World {
     }
 
     /// What tree `t` shows at path `p`: the file named `p` there.
-    pub fn read(&self, t: Tree, p: &str) -> Content {
+    pub fn read(&self, t: TreeId, p: &str) -> Content {
         self.read_at(&self.head(t), p)
     }
 
@@ -885,7 +883,7 @@ impl World {
     }
 
     /// The path file `f` has in tree `t`; none if unlinked there.
-    pub fn path_of(&self, t: Tree, f: &str) -> Option<String> {
+    pub fn path_of(&self, t: TreeId, f: &str) -> Option<String> {
         self.file(&self.head(t), f).path().map(str::to_string)
     }
 
@@ -920,11 +918,11 @@ impl World {
         c
     }
 
-    pub fn queue_len(&self, t: Tree) -> usize {
+    pub fn queue_len(&self, t: TreeId) -> usize {
         self.queues.get(&t).map_or(0, VecDeque::len)
     }
 
-    pub fn queue(&self, t: Tree) -> Vec<Entry> {
+    pub fn queue(&self, t: TreeId) -> Vec<Entry> {
         self.queues
             .get(&t)
             .map(|q| q.iter().map(|(_, e)| e.clone()).collect())
@@ -932,7 +930,7 @@ impl World {
     }
 
     /// The queue with each entry's number.
-    pub fn queue_numbered(&self, t: Tree) -> Vec<(u64, Entry)> {
+    pub fn queue_numbered(&self, t: TreeId) -> Vec<(u64, Entry)> {
         self.queues
             .get(&t)
             .map(|q| q.iter().cloned().collect())
@@ -950,18 +948,18 @@ impl World {
 
     /// The take the last queue step made, with its tree, if it took one: what
     /// it locked and wrote (rule 9). None after a step that only waited.
-    pub fn last_take(&self) -> Option<&(Tree, TakeRecord)> {
+    pub fn last_take(&self) -> Option<&(TreeId, TakeRecord)> {
         self.last_take.as_ref()
     }
 
     /// Each tree whose queue head waits, with the files it waits for.
-    pub fn waits(&self) -> &BTreeMap<Tree, BTreeMap<u64, Waiting>> {
+    pub fn waits(&self) -> &BTreeMap<TreeId, BTreeMap<u64, Waiting>> {
         &self.waits
     }
 
     /// The files tree `t`'s waiting entries wait for: those of their files
     /// open for writing there.
-    pub fn waiting_for(&self, t: Tree) -> BTreeSet<String> {
+    pub fn waiting_for(&self, t: TreeId) -> BTreeSet<String> {
         let open = self.write_open(t);
         self.waits
             .get(&t)
@@ -976,7 +974,7 @@ impl World {
     /// What a client of `t` has open for writing, and what its
     /// deferred calls (R5.3) will save: each file and the name it has now (R9.1,
     /// [`NAME_KEY`]). An open whose object no path names (an orphan) has no file open.
-    pub fn write_open(&self, t: Tree) -> BTreeSet<String> {
+    pub fn write_open(&self, t: TreeId) -> BTreeSet<String> {
         let at = self.head(t);
         self.handles
             .values()
@@ -1014,34 +1012,42 @@ impl World {
         self.next_object
     }
 
-    pub fn alive(&self, t: Tree) -> bool {
-        match t {
-            Tree::Main => true,
-            Tree::Fork(f) => self.forks[&f].life != Life::Dropped,
+    pub fn alive(&self, t: TreeId) -> bool {
+        match self.upstream_of(t) {
+            None => true,
+            Some(_) => self.forks[&t].life != Life::Dropped,
         }
     }
 
-    pub fn live_trees(&self) -> Vec<Tree> {
-        let mut v = vec![Tree::Main];
+    /// Every tree made in this run, dropped ones included: the root, then the
+    /// forks in the order made.
+    pub fn trees(&self) -> Vec<TreeId> {
+        std::iter::once(TreeId::ROOT)
+            .chain(self.forks.keys().copied())
+            .collect()
+    }
+
+    pub fn live_trees(&self) -> Vec<TreeId> {
+        let mut v = vec![TreeId::ROOT];
         v.extend(
             self.forks
                 .values()
                 .filter(|f| f.life != Life::Dropped)
-                .map(|f| Tree::Fork(f.id)),
+                .map(|f| f.id),
         );
         v
     }
 
     /// `t` and every tree upstream of it, up to main.
-    pub fn upstream(&self, t: Tree) -> Vec<Tree> {
+    pub fn upstream(&self, t: TreeId) -> Vec<TreeId> {
         let mut v = vec![t];
-        while let Some(Tree::Fork(f)) = v.last().copied() {
-            v.push(self.forks[&f].upstream);
+        while let Some(u) = v.last().and_then(|t| self.upstream_of(*t)) {
+            v.push(u);
         }
         v
     }
 
-    fn children(&self, t: Tree) -> Vec<ForkId> {
+    fn children(&self, t: TreeId) -> Vec<TreeId> {
         self.forks
             .values()
             .filter(|f| f.upstream == t && f.life != Life::Dropped)
@@ -1127,16 +1133,16 @@ impl World {
         git(&self.repo, &v);
     }
 
-    fn set_head(&mut self, t: Tree, c: &str) {
+    fn set_head(&mut self, t: TreeId, c: &str) {
         self.update_ref(&[&Self::branch(t), c]);
-        match t {
-            Tree::Main => {
+        match self.upstream_of(t) {
+            None => {
                 // Replication pushes main once it moved: the event its push
                 // waits for.
                 self.replication_due = true;
-                self.main_head = c.to_string();
+                self.root_head = c.to_string();
             }
-            Tree::Fork(f) => self.forks.get_mut(&f).expect("fork").head = c.to_string(),
+            Some(_) => self.forks.get_mut(&t).expect("fork").head = c.to_string(),
         }
     }
 
@@ -1355,7 +1361,7 @@ impl World {
     /// them: one decision per change that lost (rule 3a), kept reachable under
     /// one `refs/collisions/<n>`, with one record under that ref for each file
     /// and cause it lost by.
-    fn decide(&mut self, t: Tree, m: &Merged) -> Vec<Decision> {
+    fn decide(&mut self, t: TreeId, m: &Merged) -> Vec<Decision> {
         let mut refs: BTreeMap<&str, String> = BTreeMap::new();
         let mut out = Vec::new();
         for l in &m.collisions {
@@ -1391,7 +1397,7 @@ impl World {
     /// result commit.
     fn record(
         &mut self,
-        t: Tree,
+        t: TreeId,
         dir: Direction,
         m: &Merged,
         decisions: &[Decision],
@@ -1452,16 +1458,15 @@ impl World {
 
     /// `t`'s head moved: a fork's new commit queues for its upstream (`up`),
     /// and the new content queues for every child (rule 1: both ways).
-    fn moved(&mut self, t: Tree, up: bool) {
+    fn moved(&mut self, t: TreeId, up: bool) {
         let head = self.head(t);
-        if up && let Tree::Fork(f) = t {
-            let upstream = self.forks[&f].upstream;
+        if up && let Some(upstream) = self.upstream_of(t) {
             self.next_seq += 1;
             let n = self.next_seq;
             self.queues.entry(upstream).or_default().push_back((
                 n,
                 Entry::Landing {
-                    from: f,
+                    from: t,
                     commit: head.clone(),
                 },
             ));
@@ -1470,7 +1475,7 @@ impl World {
             self.next_seq += 1;
             let n = self.next_seq;
             self.queues
-                .entry(Tree::Fork(c))
+                .entry(c)
                 .or_default()
                 .push_back((n, Entry::Sync));
         }
@@ -1479,8 +1484,8 @@ impl World {
     // ── clients ──────────────────────────────────────────────────────────
 
     /// A launcher creates a fork over `upstream`, a branch at its head.
-    pub fn create_fork(&mut self, upstream: Tree) -> ForkId {
-        let id = self.next_fork;
+    pub fn create_fork(&mut self, upstream: TreeId) -> TreeId {
+        let id = TreeId::new(self.next_fork);
         self.next_fork += 1;
         let head = self.head(upstream);
         self.forks.insert(
@@ -1495,11 +1500,11 @@ impl World {
                 deferred: VecDeque::new(),
             },
         );
-        self.set_head(Tree::Fork(id), &head);
+        self.set_head(id, &head);
         self.note(format!("create f{id} over {upstream:?}"));
-        self.trace_call(match upstream {
-            Tree::Main => RecordedCall::Fork { id: id as usize },
-            Tree::Fork(_) => out_of_scope("nested-fork"),
+        self.trace_call(match self.upstream_of(upstream) {
+            None => RecordedCall::Fork { id },
+            Some(_) => out_of_scope("nested-fork"),
         });
         id
     }
@@ -1537,12 +1542,12 @@ impl World {
     /// Where a client's calls go: its open transaction, else its tree.
     fn target_of(&self, c: &Client) -> Target {
         match c {
-            Client::Main(_) => Target::Tree(Tree::Main),
+            Client::Main(_) => Target::Tree(TreeId::ROOT),
             Client::Fork(f) => match &self.forks[f].txn {
                 Some(t) => Target::Txn(*f, t.id),
-                None => Target::Tree(Tree::Fork(*f)),
+                None => Target::Tree(*f),
             },
-            Client::Outside(f) => Target::Tree(Tree::Fork(*f)),
+            Client::Outside(f) => Target::Tree(*f),
         }
     }
 
@@ -2187,7 +2192,7 @@ impl World {
     /// `until` files are all closed stops waiting; the next queue step on
     /// `t` takes it, or finds it must wait again (P1). Nothing waits behind
     /// it meanwhile (P3 is gone).
-    fn wake(&mut self, t: Tree) {
+    fn wake(&mut self, t: TreeId) {
         let open = self.write_open(t);
         if let Some(m) = self.waits.get_mut(&t) {
             let woken: Vec<u64> = m
@@ -2214,7 +2219,7 @@ impl World {
     /// file open before begin keeps writing to the fork (its target is
     /// fixed at open); only the client's opens after begin write in the
     /// transaction.
-    pub fn begin(&mut self, f: ForkId) -> Result<TxnId, ModelError> {
+    pub fn begin(&mut self, f: TreeId) -> Result<TxnId, ModelError> {
         self.trace_call(out_of_scope("transaction"));
         let fork = &self.forks[&f];
         if fork.life != Life::Open {
@@ -2241,7 +2246,7 @@ impl World {
     /// (its branch differs from its start in them), those it has open for
     /// writing, and those of the calls already deferred, so a file's calls
     /// keep their order.
-    fn txn_files(&self, f: ForkId) -> BTreeSet<String> {
+    fn txn_files(&self, f: TreeId) -> BTreeSet<String> {
         let fork = &self.forks[&f];
         let txn = fork.txn.as_ref().expect("open");
         let mut files = self.changed(&txn.start, &txn.head);
@@ -2272,10 +2277,10 @@ impl World {
     /// Nothing waits on a program.
     fn defer(&mut self, h: HandleId) -> bool {
         let handle = &self.handles[&h];
-        let Target::Tree(Tree::Fork(f)) = handle.target else {
+        let Target::Tree(f) = handle.target else {
             return false;
         };
-        if self.forks[&f].txn.is_none() {
+        if self.upstream_of(f).is_none() || self.forks[&f].txn.is_none() {
             return false;
         }
         let mine = self.txn_files(f);
@@ -2294,7 +2299,7 @@ impl World {
     /// R5.3: the next deferred call of fork `f` applies, its transaction
     /// having ended: a save as any later close saves, on the tree's head
     /// now, a path call as it would have run. None when none is left.
-    pub fn apply_deferred(&mut self, f: ForkId) -> Option<HandleId> {
+    pub fn apply_deferred(&mut self, f: TreeId) -> Option<HandleId> {
         let fork = self.forks.get_mut(&f).expect("fork");
         assert!(fork.txn.is_none(), "a deferred call during its transaction");
         let id = fork.deferred.pop_front()?;
@@ -2306,12 +2311,12 @@ impl World {
             self.note(format!("deferred h{id}: it runs"));
             self.run_path_call(&h);
         }
-        self.wake(Tree::Fork(f));
+        self.wake(f);
         Some(id)
     }
 
     /// Commit (MODEL.md rule 5), then the calls it deferred (R5.3).
-    pub fn commit_txn(&mut self, f: ForkId) -> Result<TxnOutcome, ModelError> {
+    pub fn commit_txn(&mut self, f: TreeId) -> Result<TxnOutcome, ModelError> {
         let outcome = self.commit_txn_only(f)?;
         while self.apply_deferred(f).is_some() {}
         Ok(outcome)
@@ -2328,7 +2333,7 @@ impl World {
     /// files open (the owner, 2026-11-05: R5.3): those files stay open, a
     /// transaction's opens now write in the fork, and each saves at its close
     /// as an ordinary later save.
-    pub fn commit_txn_only(&mut self, f: ForkId) -> Result<TxnOutcome, ModelError> {
+    pub fn commit_txn_only(&mut self, f: TreeId) -> Result<TxnOutcome, ModelError> {
         if self.forks[&f].txn.is_none() {
             return Err(ModelError::NoTransaction);
         }
@@ -2351,7 +2356,7 @@ impl World {
         let mut result = None;
         let outcome = if let Some((edit, m)) = planned {
             let writer = self.forks[&f].writer.clone();
-            let t = Tree::Fork(f);
+            let t = f;
             let decisions = self.decide(t, &m);
             let c = self.commit_deciding(
                 &[&ours, &txn.head],
@@ -2411,15 +2416,15 @@ impl World {
             how: TxnEnd::Commit(outcome.clone()),
             result,
         });
-        self.wake(Tree::Fork(f));
+        self.wake(f);
         Ok(outcome)
     }
 
     /// A transaction's open `h` after its commit: it stays open and writes in
     /// the fork, holding the object file `file` (its file in the transaction)
     /// has there; with no such file it is an orphan (R11.3).
-    fn move_to_fork(&mut self, h: HandleId, f: ForkId, file: Option<String>) {
-        let target = Target::Tree(Tree::Fork(f));
+    fn move_to_fork(&mut self, h: HandleId, f: TreeId, file: Option<String>) {
+        let target = Target::Tree(f);
         let object = match &file {
             Some(x) => self.inode(target, x),
             None => {
@@ -2436,14 +2441,14 @@ impl World {
     }
 
     /// Rollback (abandon), then the calls it deferred (R5.3).
-    pub fn rollback(&mut self, f: ForkId) -> Result<(), ModelError> {
+    pub fn rollback(&mut self, f: TreeId) -> Result<(), ModelError> {
         self.rollback_only(f)?;
         while self.apply_deferred(f).is_some() {}
         Ok(())
     }
 
     /// The rollback alone: drop the branch, and its files still open, unsaved.
-    pub fn rollback_only(&mut self, f: ForkId) -> Result<(), ModelError> {
+    pub fn rollback_only(&mut self, f: TreeId) -> Result<(), ModelError> {
         let txn = self.take_txn(f)?;
         self.handles
             .retain(|_, h| !matches!(h.target, Target::Txn(g, t) if g == f && t == txn.id));
@@ -2456,7 +2461,7 @@ impl World {
             how: TxnEnd::Rollback,
             result: None,
         });
-        self.wake(Tree::Fork(f));
+        self.wake(f);
         Ok(())
     }
 
@@ -2465,7 +2470,7 @@ impl World {
             .extend(txn.staged.iter().map(|e| e.token.clone()));
     }
 
-    fn take_txn(&mut self, f: ForkId) -> Result<Txn, ModelError> {
+    fn take_txn(&mut self, f: TreeId) -> Result<Txn, ModelError> {
         let txn = self
             .forks
             .get_mut(&f)
@@ -2481,18 +2486,18 @@ impl World {
     /// is dropped with its open files, and every lock it held is released
     /// ([`World::release`]). The fork's commits still land; it drops once
     /// that is done.
-    pub fn end_client(&mut self, f: ForkId) {
+    pub fn end_client(&mut self, f: TreeId) {
         let muted = std::mem::replace(&mut self.trace_mute, true);
         if self.forks[&f].txn.is_some() {
             let _ = self.rollback(f);
         }
         self.release(&[Client::Fork(f), Client::Outside(f)]);
         self.forks.get_mut(&f).expect("fork").life = Life::Ended;
-        self.wake(Tree::Fork(f));
+        self.wake(f);
         self.note(format!("end f{f}"));
         self.trace_mute = muted;
         self.trace_call(RecordedCall::EndClient {
-            caller: Caller::Fork(f as usize),
+            caller: Caller::Fork(f),
         });
     }
 
@@ -2503,7 +2508,7 @@ impl World {
         let muted = std::mem::replace(&mut self.trace_mute, true);
         self.release(&[Client::Main(writer.to_string())]);
         self.ended_main.insert(writer.to_string());
-        self.wake(Tree::Main);
+        self.wake(TreeId::ROOT);
         self.note(format!("end main client {writer}"));
         self.trace_mute = muted;
         self.trace_call(RecordedCall::EndClient {
@@ -2694,7 +2699,7 @@ impl World {
     /// landing's own changes (each against its first parent), a sync's
     /// every file its tree and the upstream's head differ in (all it may
     /// write).
-    fn scan(&self, t: Tree) -> Option<usize> {
+    fn scan(&self, t: TreeId) -> Option<usize> {
         let waiting = self.waits.get(&t);
         let mut files = BTreeSet::new();
         let mut sources = BTreeSet::new();
@@ -2716,14 +2721,12 @@ impl World {
     }
 
     /// The files queue entry `e` of `t` may touch, before it is planned.
-    fn hint(&self, t: Tree, e: &Entry) -> BTreeSet<String> {
+    fn hint(&self, t: TreeId, e: &Entry) -> BTreeSet<String> {
         match e {
             Entry::Landing { commit, .. } => self.touches_of(commit),
-            Entry::Sync => match t {
-                Tree::Fork(f) => {
-                    self.changed_keys(&self.head(t), &self.head(self.forks[&f].upstream))
-                }
-                Tree::Main => BTreeSet::new(),
+            Entry::Sync => match self.upstream_of(t) {
+                Some(up) => self.changed_keys(&self.head(t), &self.head(up)),
+                None => BTreeSet::new(),
             },
         }
     }
@@ -2749,7 +2752,7 @@ impl World {
     /// is granted (no call waits on a waiting take, the owner's decision of
     /// 2026-11-04). Else it leaves the queue, and [`World::step`] writes it
     /// at once. A prefix sync (P2) delivers its prefix and waits for the rest.
-    fn acquire(&mut self, t: Tree) -> Option<TakeRecord> {
+    fn acquire(&mut self, t: TreeId) -> Option<TakeRecord> {
         let q = self.queue_numbered(t);
         let Some(i) = self.scan(t) else {
             panic!("{t:?}: no entry can be taken")
@@ -2758,12 +2761,11 @@ impl World {
         let ours = self.head(t);
         let (take, files) = match head {
             Entry::Sync => {
-                let Tree::Fork(f) = t else {
-                    unreachable!("main has no upstream")
+                let Some(upstream) = self.upstream_of(t) else {
+                    unreachable!("the root has no upstream")
                 };
-                let upstream = self.forks[&f].upstream;
                 let whole = self.head(upstream);
-                let landing = self.landing_pending(self.forks[&f].upstream, f);
+                let landing = self.landing_pending(upstream, t);
                 let p = self.prefix(t, &ours, &whole);
                 let Some((up, tree)) = p.deliver else {
                     // Its first commit would overwrite an open file: it
@@ -2861,7 +2863,7 @@ impl World {
     /// planned on (nothing ran in between), writing only files it locked (the
     /// model stops loudly if not); then an entry waiting in `t` whose files
     /// closed meanwhile is woken (a prefix sync's rest).
-    fn finish(&mut self, t: Tree, take: &TakeRecord) {
+    fn finish(&mut self, t: TreeId, take: &TakeRecord) {
         let entered = self.entered.len();
         match &take.take {
             Take::Sync {
@@ -2937,7 +2939,7 @@ impl World {
     /// ([`World::judge`]): the upstream's line wins a collision, and the
     /// change that lost it applies nothing. `m`: the take planned on `x`'s
     /// current head.
-    fn land(&mut self, x: Tree, from: ForkId, tip: &str, m: Merged) {
+    fn land(&mut self, x: TreeId, from: TreeId, tip: &str, m: Merged) {
         let ours = self.head(x);
         let base = self.first_parent(tip);
         let incoming = self.edit_of(&base, tip);
@@ -2983,7 +2985,7 @@ impl World {
     }
 
     /// Records a take's change and whether it won, for `check`.
-    fn landed(&mut self, x: Tree, before: &str, result: &str, change: &str, won: bool) {
+    fn landed(&mut self, x: TreeId, before: &str, result: &str, change: &str, won: bool) {
         self.landings.push(Landed {
             tree: x,
             direction: Direction::Landing,
@@ -3006,7 +3008,7 @@ impl World {
     /// read the same because it keeps its own undecided line there (finding
     /// 38; the owner, 2026-11-07, "3. B"), and holds back that one and every
     /// later one, the decisions they carry included, until those files close.
-    fn prefix(&self, t: Tree, ours: &str, whole: &str) -> Prefix {
+    fn prefix(&self, t: TreeId, ours: &str, whole: &str) -> Prefix {
         let open = self.write_open(t);
         let mut chain = Vec::new();
         let mut c = whole.to_string();
@@ -3092,11 +3094,18 @@ impl World {
     /// `planned`: the tree planned on the fork's current head (none: it has
     /// `up`); `landing`: a fork commit was on its way to the upstream when the
     /// take began, so `up` may lack it.
-    fn sync(&mut self, x: Tree, up: &str, planned: Option<String>, landing: bool, entered: usize) {
-        let Tree::Fork(f) = x else {
-            unreachable!("main has no upstream")
+    fn sync(
+        &mut self,
+        x: TreeId,
+        up: &str,
+        planned: Option<String>,
+        landing: bool,
+        entered: usize,
+    ) {
+        let f = x;
+        let Some(upstream) = self.upstream_of(f) else {
+            unreachable!("the root has no upstream")
         };
-        let upstream = self.forks[&f].upstream;
         let ours = self.head(x);
         let Some(tree) = planned else {
             return;
@@ -3117,26 +3126,25 @@ impl World {
         self.moved(x, false);
     }
 
-    fn droppable(&self, f: ForkId) -> bool {
+    fn droppable(&self, f: TreeId) -> bool {
         let fork = &self.forks[&f];
-        let t = Tree::Fork(f);
         fork.life == Life::Ended
-            && self.children(t).is_empty()
-            && !self.waits.contains_key(&t)
+            && self.children(f).is_empty()
+            && !self.waits.contains_key(&f)
             && !self.landing_pending(fork.upstream, f)
     }
 
     /// Whether a commit of fork `f` waits in `upstream`'s queue.
-    fn landing_pending(&self, upstream: Tree, f: ForkId) -> bool {
+    fn landing_pending(&self, upstream: TreeId, f: TreeId) -> bool {
         self.queue(upstream)
             .iter()
             .any(|e| matches!(e, Entry::Landing { from, .. } if *from == f))
     }
 
-    fn drop_fork(&mut self, f: ForkId) {
+    fn drop_fork(&mut self, f: TreeId) {
         assert!(self.droppable(f), "drop f{f} when ready");
-        self.update_ref(&["-d", &Self::branch(Tree::Fork(f))]);
-        self.queues.remove(&Tree::Fork(f));
+        self.update_ref(&["-d", &Self::branch(f)]);
+        self.queues.remove(&f);
         self.forks.get_mut(&f).expect("fork").life = Life::Dropped;
         self.note(format!("drop f{f}"));
     }
@@ -3191,7 +3199,7 @@ impl World {
     /// another entry is free is not a call: it only marks a wait the real
     /// system finds again by itself, and a real `take_next` goes on to the
     /// free entry in one step.
-    fn record_take(&mut self, t: Tree) {
+    fn record_take(&mut self, t: TreeId) {
         let took = if self.last_take.is_some() {
             Took::Taken
         } else if self.scan(t).is_some() {
@@ -3199,9 +3207,8 @@ impl World {
         } else {
             Took::Waiting
         };
-        let id = tree_id(t);
         let moved = (took == Took::Taken).then(|| self.head_shape(t));
-        self.trace_call(RecordedCall::Take { tree: id, took });
+        self.trace_call(RecordedCall::Take { tree: t, took });
         if let (Some(head), false, Some(last)) = (
             moved,
             self.trace_mute,
@@ -3212,7 +3219,7 @@ impl World {
     }
 
     /// The `Agentfs-Cause` of tree `t`'s head and its number of parents.
-    fn head_shape(&self, t: Tree) -> (String, usize) {
+    fn head_shape(&self, t: TreeId) -> (String, usize) {
         let head = self.head(t);
         let body = git(&self.repo, &["log", "-1", "--format=%B", &head]);
         let cause = body
@@ -3260,10 +3267,10 @@ impl World {
     fn caller_of(&mut self, c: &Client) -> Caller {
         match c {
             Client::Main(n) => Caller::Main(n.clone()),
-            Client::Fork(f) => Caller::Fork(*f as usize),
+            Client::Fork(f) => Caller::Fork(*f),
             Client::Outside(f) => {
                 self.trace_call(out_of_scope("outside"));
-                Caller::Fork(*f as usize)
+                Caller::Fork(*f)
             }
         }
     }
@@ -3282,7 +3289,7 @@ impl World {
                         c.path().map(|p| (p.to_string(), c.bytes().into_bytes()))
                     })
                     .collect();
-                (tree_id(t), files)
+                (t, files)
             })
             .collect();
         let collisions = gather_collisions(self.collisions.iter().map(|c| {
@@ -3294,7 +3301,7 @@ impl World {
                 .unwrap_or_default()
                 .to_string();
             ShownCollision {
-                tree: tree_id(c.tree),
+                tree: c.tree,
                 path,
                 lost_bytes: c
                     .lost
@@ -3336,7 +3343,7 @@ pub fn name_key(c: &Content) -> Option<String> {
 }
 
 /// Rule 9: a take writes only files it holds.
-fn held(t: Tree, files: &BTreeSet<String>, holds: &BTreeSet<String>) {
+fn held(t: TreeId, files: &BTreeSet<String>, holds: &BTreeSet<String>) {
     assert!(
         files.is_subset(holds),
         "a take into {t:?} would write {files:?}, holding only {holds:?}"
@@ -3371,31 +3378,17 @@ pub(crate) fn commit_parents(repo: &Path, c: &str) -> Vec<String> {
         .collect()
 }
 
-fn tree_id(t: Tree) -> TreeId {
-    match t {
-        Tree::Main => TreeId::Main,
-        Tree::Fork(f) => TreeId::Fork(f as usize),
-    }
-}
-
-fn tree_of_id(t: TreeId) -> Tree {
-    match t {
-        TreeId::Main => Tree::Main,
-        TreeId::Fork(f) => Tree::Fork(f as ForkId),
-    }
-}
-
-fn tree_of(t: Target) -> Tree {
+fn tree_of(t: Target) -> TreeId {
     match t {
         Target::Tree(t) => t,
-        Target::Txn(f, _) => Tree::Fork(f),
+        Target::Txn(f, _) => f,
     }
 }
 
 fn client_of(c: &Caller) -> Client {
     match c {
         Caller::Main(n) => Client::Main(n.clone()),
-        Caller::Fork(f) => Client::Fork(*f as ForkId),
+        Caller::Fork(f) => Client::Fork(*f),
     }
 }
 
@@ -3420,8 +3413,8 @@ fn text(bytes: &[u8]) -> Result<String, CallError> {
 impl TreeCalls for World {
     type Open = HandleId;
 
-    fn fork(&mut self) -> Result<usize, CallError> {
-        Ok(self.create_fork(Tree::Main) as usize)
+    fn fork(&mut self) -> Result<TreeId, CallError> {
+        Ok(self.create_fork(TreeId::ROOT))
     }
 
     fn open_write(&mut self, c: &Caller, path: &str) -> Result<HandleId, CallError> {
@@ -3492,17 +3485,15 @@ impl TreeCalls for World {
     fn end_client(&mut self, c: &Caller) -> Result<(), CallError> {
         match c {
             Caller::Main(n) => self.end_main_client(n),
-            Caller::Fork(f) => World::end_client(self, *f as ForkId),
+            Caller::Fork(f) => World::end_client(self, *f),
         }
         Ok(())
     }
 
     fn take_next(&mut self, t: TreeId) -> Result<Took, CallError> {
-        let id = t;
-        let t = tree_of_id(t);
         if self.queue_len(t) == 0 {
             self.trace_call(RecordedCall::Take {
-                tree: id,
+                tree: t,
                 took: Took::Empty,
             });
             return Ok(Took::Empty);
@@ -3518,7 +3509,7 @@ impl TreeCalls for World {
         // The last step recorded its wait; none ran if a wait was already marked.
         if !stepped {
             self.trace_call(RecordedCall::Take {
-                tree: id,
+                tree: t,
                 took: Took::Waiting,
             });
         }
@@ -3531,14 +3522,14 @@ impl TreeCalls for World {
     }
 
     fn read(&self, t: TreeId, path: &str) -> Result<Option<Vec<u8>>, CallError> {
-        let head = self.head(tree_of_id(t));
+        let head = self.head(t);
         Ok(self
             .lookup(&head, path)
             .map(|f| self.file(&head, &f).bytes().into_bytes()))
     }
 
     fn paths(&self, t: TreeId) -> Result<Vec<String>, CallError> {
-        let head = self.head(tree_of_id(t));
+        let head = self.head(t);
         let mut paths: Vec<String> = PATHS
             .iter()
             .filter_map(|f| self.file(&head, f).path().map(str::to_string))
