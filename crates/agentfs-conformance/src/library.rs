@@ -69,11 +69,11 @@ impl Library {
     }
 
     fn tree(&self, t: TreeId) -> Result<&str, CallError> {
-        match t {
-            TreeId::Main => Ok("main"),
-            TreeId::Fork(f) => self
+        match t.number() {
+            0 => Ok("main"),
+            f => self
                 .forks
-                .get(f.wrapping_sub(1))
+                .get((f as usize).wrapping_sub(1))
                 .map(String::as_str)
                 .ok_or_else(|| CallError::new(format!("no fork {f}"))),
         }
@@ -83,7 +83,7 @@ impl Library {
     fn who(&self, c: &Caller) -> Result<(String, String), CallError> {
         Ok(match c {
             Caller::Main(n) => ("main".to_owned(), n.clone()),
-            Caller::Fork(f) => (self.tree(TreeId::Fork(*f))?.to_owned(), format!("c{f}")),
+            Caller::Fork(f) => (self.tree(*f)?.to_owned(), format!("c{f}")),
         })
     }
 
@@ -101,10 +101,10 @@ impl Library {
 impl TreeCalls for Library {
     type Open = u64;
 
-    fn fork(&mut self) -> Result<usize, CallError> {
+    fn fork(&mut self) -> Result<TreeId, CallError> {
         let name = self.v_mut()?.fork().map_err(fail)?;
         self.forks.push(name);
-        Ok(self.forks.len())
+        Ok(TreeId::new(self.forks.len() as u32))
     }
 
     fn open_write(&mut self, c: &Caller, path: &str) -> Result<u64, CallError> {

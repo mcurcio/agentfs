@@ -18,8 +18,9 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
+use crate::calls::TreeId;
 use crate::git::{git, git_in, try_git};
-use crate::world::{COLLISION, ForkId, Tree, TxnId, World};
+use crate::world::{COLLISION, TxnId, World};
 
 /// Where `World::drop` writes each run's digest.
 pub const DIGEST_DIR: &str = "AGENTFS_MODEL_DIGEST_DIR";
@@ -31,9 +32,8 @@ const TREE: &str = "Agentfs-Tree";
 
 /// The label of each tree's name and ref: the root, forks `forks` and
 /// transactions 1 to `txns`.
-fn labels_of(forks: impl IntoIterator<Item = ForkId>, txns: TxnId) -> BTreeMap<String, String> {
-    let trees = std::iter::once((Tree::Main, "T0".to_string()))
-        .chain(forks.into_iter().map(|f| (Tree::Fork(f), format!("T{f}"))));
+fn labels_of(trees: impl IntoIterator<Item = TreeId>, txns: TxnId) -> BTreeMap<String, String> {
+    let trees = trees.into_iter().map(|t| (t, format!("T{}", t.number())));
     let mut labels: BTreeMap<String, String> = trees
         .flat_map(|(t, label)| [(World::name(t), label.clone()), (World::branch(t), label)])
         .collect();
@@ -207,7 +207,7 @@ fn canonical(repo: &Path, remote: &Path, labels: &BTreeMap<String, String>) -> S
 
 /// The run as one canonical text (this module's doc comment).
 pub fn canonical_text(w: &World) -> String {
-    let labels = labels_of(w.forks.keys().copied(), w.txns_begun());
+    let labels = labels_of(w.trees(), w.txns_begun());
     canonical(w.repo(), w.remote(), &labels)
 }
 
@@ -277,8 +277,8 @@ mod tests {
         std::fs::create_dir_all(&remote).unwrap();
         git(&repo, &["init", "-q", "-b", "main"]);
         git(&remote, &["init", "-q", "--bare", "-b", "main"]);
-        let main = World::name(Tree::Main);
-        let (f1, f2) = (World::name(Tree::Fork(1)), World::name(Tree::Fork(2)));
+        let main = World::name(TreeId::ROOT);
+        let (f1, f2) = (World::name(TreeId::new(1)), World::name(TreeId::new(2)));
         let empty = git_in(&repo, &["mktree"], "");
         let blob = git_in(&repo, &["hash-object", "-w", "--stdin"], "x\n");
         let with_a = git_in(&repo, &["mktree"], &format!("100644 blob {blob}\ta\n"));
@@ -299,9 +299,9 @@ mod tests {
             &message("Direct", &World::txn_name(1), "Agentfs-Open: 7\n"),
         );
         for (r, c) in [
-            (World::branch(Tree::Main), &landing),
-            (World::branch(Tree::Fork(1)), &on_f1),
-            (World::branch(Tree::Fork(2)), &on_f2),
+            (World::branch(TreeId::ROOT), &landing),
+            (World::branch(TreeId::new(1)), &on_f1),
+            (World::branch(TreeId::new(2)), &on_f2),
             (World::txn_branch(1), &in_txn),
             ("refs/collisions/1".to_string(), &on_f2),
         ] {
@@ -318,7 +318,11 @@ mod tests {
                 "refs/collisions/*:refs/collisions/*",
             ],
         );
-        let text = canonical(&repo, &remote, &labels_of([1, 2], 1));
+        let text = canonical(
+            &repo,
+            &remote,
+            &labels_of([TreeId::ROOT, TreeId::new(1), TreeId::new(2)], 1),
+        );
         assert_eq!(text, PINNED, "the canonical text changed:\n{text}");
     }
 

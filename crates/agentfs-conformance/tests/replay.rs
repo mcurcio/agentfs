@@ -34,7 +34,7 @@ fn at(offset: usize, bytes: &str) -> Write {
 fn drain(w: &mut World) {
     loop {
         let mut took = false;
-        for t in [TreeId::Main, TreeId::Fork(1)] {
+        for t in [TreeId::ROOT, TreeId::new(1)] {
             if w.take_next(t).unwrap() == Took::Taken {
                 took = true;
             }
@@ -55,7 +55,7 @@ fn passes(w: &World) {
 #[test]
 fn a_collision_replays_the_same_on_the_library() {
     let mut w = world();
-    let f = w.create_fork(agentfs_model::world::Tree::Main);
+    let f = w.create_fork(TreeId::ROOT);
     save(&mut w, &m1(), "c", &[at(2, "m\n")]);
     save(&mut w, &Client::Fork(f), "c", &[at(2, "s\n")]);
     drain(&mut w);
@@ -76,12 +76,12 @@ fn a_changed_byte_in_the_trace_is_a_mismatch() {
         .unwrap();
     let file = shown
         .trees
-        .get_mut(&TreeId::Main)
+        .get_mut(&TreeId::ROOT)
         .and_then(|t| t.get_mut("c"))
         .unwrap();
     file[0] = b'!';
     let e = against_library(&trace).unwrap_err();
-    assert!(e.contains("Main:c"), "{e}");
+    assert!(e.contains("T0:c"), "{e}");
 }
 
 /// A crash right after a take, with another file open: the take is one step, so it
@@ -89,13 +89,13 @@ fn a_changed_byte_in_the_trace_is_a_mismatch() {
 #[test]
 fn a_crash_after_a_take_keeps_it_and_saves_the_open() {
     let mut w = world();
-    let f = w.create_fork(agentfs_model::world::Tree::Main);
+    let f = w.create_fork(TreeId::ROOT);
     save(&mut w, &Client::Fork(f), "c", &[at(2, "s\n")]);
     let open = w.open_write(&m1(), "a");
     w.write(open, at(0, "m\n"));
-    assert_eq!(w.take_next(TreeId::Main).unwrap(), Took::Taken);
+    assert_eq!(w.take_next(TreeId::ROOT).unwrap(), Took::Taken);
     World::crash(&mut w);
-    assert_eq!(w.queue_len(agentfs_model::world::Tree::Main), 0);
+    assert_eq!(w.queue_len(TreeId::ROOT), 0);
     drain(&mut w);
     assert!(w.trace().iter().any(|r| r.call == RecordedCall::Crash));
     passes(&w);
@@ -116,11 +116,11 @@ fn a_clients_end_saves_its_opens() {
 #[test]
 fn finding_36_a_save_that_changes_nothing_commits_nothing() {
     let mut w = world();
-    let f = w.create_fork(agentfs_model::world::Tree::Main);
+    let f = w.create_fork(TreeId::ROOT);
     let h = w.open_trunc(&Client::Fork(f), "c");
     w.write(h, at(0, "-\n-\n-\n-\n-\n-\n"));
     World::close(&mut w, h);
-    assert_eq!(w.take_next(TreeId::Main).unwrap(), Took::Empty);
+    assert_eq!(w.take_next(TreeId::ROOT).unwrap(), Took::Empty);
     passes(&w);
 }
 
@@ -130,7 +130,7 @@ fn finding_36_a_save_that_changes_nothing_commits_nothing() {
 #[test]
 fn finding_37_a_truncate_then_an_append_is_a_rewrite() {
     let mut w = world();
-    let f = w.create_fork(agentfs_model::world::Tree::Main);
+    let f = w.create_fork(TreeId::ROOT);
     let h = w.open_trunc(&m1(), "c");
     w.write(h, Write::Append("-\nyy".into()));
     World::close(&mut w, h);
@@ -143,7 +143,7 @@ fn finding_37_a_truncate_then_an_append_is_a_rewrite() {
     drain(&mut w);
     let shown = w.shown();
     assert_eq!(
-        shown.trees[&TreeId::Main]["c"].as_slice(),
+        shown.trees[&TreeId::ROOT]["c"].as_slice(),
         b"n\nyy",
         "the sandbox's edit of the kept line lands"
     );
@@ -157,7 +157,7 @@ fn finding_37_a_truncate_then_an_append_is_a_rewrite() {
 #[test]
 fn finding_40_an_append_mixed_with_an_offset_write_is_a_rewrite() {
     let mut w = world();
-    let f = w.create_fork(agentfs_model::world::Tree::Main);
+    let f = w.create_fork(TreeId::ROOT);
     let h = w.open_write(&m1(), "c");
     w.write(h, Write::Append("-\n".into()));
     w.write(h, at(0, "n\n"));
@@ -173,7 +173,7 @@ fn finding_40_an_append_mixed_with_an_offset_write_is_a_rewrite() {
 #[test]
 fn finding_41_an_offset_write_then_an_append_is_one_alignment() {
     let mut w = world();
-    let f = w.create_fork(agentfs_model::world::Tree::Main);
+    let f = w.create_fork(TreeId::ROOT);
     let s = Client::Fork(f);
     let h = w.open_write(&s, "c");
     w.write(h, at(4, "n8\n-\n-\n-\n"));
@@ -194,7 +194,7 @@ fn finding_41_an_offset_write_then_an_append_is_one_alignment() {
 #[test]
 fn finding_43_model_and_library_agree_on_a_hidden_line_the_sandbox_deleted() {
     let mut w = world();
-    let f = w.create_fork(agentfs_model::world::Tree::Main);
+    let f = w.create_fork(TreeId::ROOT);
     let s = Client::Fork(f);
     save(
         &mut w,
@@ -202,19 +202,19 @@ fn finding_43_model_and_library_agree_on_a_hidden_line_the_sandbox_deleted() {
         "c",
         &[Write::Truncate(0), at(0, "1\n2\n3\n4\n5\n6\n")],
     );
-    assert_eq!(w.take_next(TreeId::Fork(1)).unwrap(), Took::Taken);
+    assert_eq!(w.take_next(TreeId::new(1)).unwrap(), Took::Taken);
     save(&mut w, &m1(), "c", &[at(0, "M")]);
     save(&mut w, &s, "c", &[Write::Truncate(8), at(0, "S")]);
-    assert_eq!(w.take_next(TreeId::Main).unwrap(), Took::Taken);
+    assert_eq!(w.take_next(TreeId::ROOT).unwrap(), Took::Taken);
     save(&mut w, &s, "c", &[Write::Truncate(6), at(6, "yy")]);
-    assert_eq!(w.take_next(TreeId::Fork(1)).unwrap(), Took::Taken);
+    assert_eq!(w.take_next(TreeId::new(1)).unwrap(), Took::Taken);
     assert_eq!(
-        w.shown().trees[&TreeId::Fork(1)]["c"].as_slice(),
+        w.shown().trees[&TreeId::new(1)]["c"].as_slice(),
         b"M\n2\n3\nyy"
     );
     drain(&mut w);
     assert_eq!(
-        w.shown().trees[&TreeId::Fork(1)]["c"].as_slice(),
+        w.shown().trees[&TreeId::new(1)]["c"].as_slice(),
         b"M\n2\n3\n4\n5\n6\n"
     );
     passes(&w);
@@ -226,14 +226,14 @@ fn finding_43_model_and_library_agree_on_a_hidden_line_the_sandbox_deleted() {
 #[test]
 fn finding_38_a_sync_past_an_open_file_waits_for_any_line_map_change() {
     let mut w = world();
-    let f = w.create_fork(agentfs_model::world::Tree::Main);
+    let f = w.create_fork(TreeId::ROOT);
     let s = Client::Fork(f);
     save(&mut w, &s, "a", &[at(2, "s\n")]);
     let open = w.open_write(&s, "a");
     save(&mut w, &m1(), "a", &[at(2, "m\n")]);
-    assert_eq!(w.take_next(TreeId::Fork(1)).unwrap(), Took::Waiting);
+    assert_eq!(w.take_next(TreeId::new(1)).unwrap(), Took::Waiting);
     World::close(&mut w, open);
-    assert_eq!(w.take_next(TreeId::Fork(1)).unwrap(), Took::Taken);
+    assert_eq!(w.take_next(TreeId::new(1)).unwrap(), Took::Taken);
     passes(&w);
 }
 
@@ -243,7 +243,7 @@ fn finding_38_a_sync_past_an_open_file_waits_for_any_line_map_change() {
 #[test]
 fn finding_39_a_losing_atomic_save_keeps_two_files_apart() {
     let mut w = world();
-    let f = w.create_fork(agentfs_model::world::Tree::Main);
+    let f = w.create_fork(TreeId::ROOT);
     let s = Client::Fork(f);
     let h = World::create(&mut w, &s, "t").unwrap();
     w.write(h, Write::Append("n\n-\n-\n-\n-\n-\n".into()));
@@ -252,7 +252,7 @@ fn finding_39_a_losing_atomic_save_keeps_two_files_apart() {
     save(&mut w, &m1(), "c", &[at(0, "m\n")]);
     drain(&mut w);
     let shown = w.shown();
-    let sandbox = &shown.trees[&TreeId::Fork(1)];
+    let sandbox = &shown.trees[&TreeId::new(1)];
     assert_eq!(sandbox["c"].as_slice(), b"m\n-\n-\n-\n-\n-\n");
     assert_eq!(sandbox["t"].as_slice(), b"n\n-\n-\n-\n-\n-\n");
     passes(&w);
@@ -264,7 +264,7 @@ fn finding_39_a_losing_atomic_save_keeps_two_files_apart() {
 #[test]
 fn an_old_writer_stays_orphaned_when_the_unlink_loses() {
     let mut w = world();
-    let f = w.create_fork(agentfs_model::world::Tree::Main);
+    let f = w.create_fork(TreeId::ROOT);
     let s = Client::Fork(f);
     let old = w.open_write(&s, "c");
     w.write(old, at(0, "x\n"));
@@ -276,7 +276,7 @@ fn an_old_writer_stays_orphaned_when_the_unlink_loses() {
     assert_eq!(w.orphans.len(), 1, "the old writer saved nothing");
     let shown = w.shown();
     assert_eq!(
-        shown.trees[&TreeId::Fork(1)]["c"].as_slice(),
+        shown.trees[&TreeId::new(1)]["c"].as_slice(),
         b"m\n-\n-\n-\n-\n-\n"
     );
     passes(&w);
@@ -287,7 +287,7 @@ fn an_old_writer_stays_orphaned_when_the_unlink_loses() {
 #[test]
 fn an_old_writer_stays_orphaned_when_the_rename_over_loses() {
     let mut w = world();
-    let f = w.create_fork(agentfs_model::world::Tree::Main);
+    let f = w.create_fork(TreeId::ROOT);
     let s = Client::Fork(f);
     let old = w.open_write(&s, "c");
     w.write(old, at(0, "x\n"));
@@ -306,18 +306,18 @@ fn an_old_writer_stays_orphaned_when_the_rename_over_loses() {
 #[test]
 fn finding_44_a_kept_rename_of_a_file_the_parent_unlinked_keeps_its_lines() {
     let mut w = world();
-    let f = w.create_fork(agentfs_model::world::Tree::Main);
+    let f = w.create_fork(TreeId::ROOT);
     let s = Client::Fork(f);
-    let lines = w.shown().trees[&TreeId::Main]["a"].clone();
+    let lines = w.shown().trees[&TreeId::ROOT]["a"].clone();
     assert!(!lines.is_empty());
     World::rename(&mut w, &s, "a", "e");
     World::unlink(&mut w, &m1(), "a");
-    assert_eq!(w.take_next(TreeId::Fork(1)).unwrap(), Took::Taken);
-    assert_eq!(w.shown().trees[&TreeId::Fork(1)]["e"], lines);
+    assert_eq!(w.take_next(TreeId::new(1)).unwrap(), Took::Taken);
+    assert_eq!(w.shown().trees[&TreeId::new(1)]["e"], lines);
     let undecided = w.trace().len();
     drain(&mut w);
     assert!(w.trace().len() > undecided);
-    assert!(!w.shown().trees[&TreeId::Fork(1)].contains_key("e"));
+    assert!(!w.shown().trees[&TreeId::new(1)].contains_key("e"));
     passes(&w);
 }
 
@@ -330,14 +330,14 @@ fn finding_44_a_kept_rename_of_a_file_the_parent_unlinked_keeps_its_lines() {
 #[test]
 fn finding_48_a_kept_file_takes_the_upstreams_last_lines_and_keeps_its_own() {
     let mut w = world();
-    let f = w.create_fork(agentfs_model::world::Tree::Main);
+    let f = w.create_fork(TreeId::ROOT);
     let s = Client::Fork(f);
     save(&mut w, &s, "a", &[at(2, "s\n")]);
     World::rename(&mut w, &s, "a", "e");
     save(&mut w, &m1(), "a", &[at(4, "m\n")]);
     World::unlink(&mut w, &m1(), "a");
-    assert_eq!(w.take_next(TreeId::Fork(1)).unwrap(), Took::Taken);
-    let kept = &w.shown().trees[&TreeId::Fork(1)]["e"];
+    assert_eq!(w.take_next(TreeId::new(1)).unwrap(), Took::Taken);
+    let kept = &w.shown().trees[&TreeId::new(1)]["e"];
     assert!(kept.starts_with(b"-\ns\nm\n"), "{kept:?}");
     passes(&w);
 }
@@ -348,13 +348,13 @@ fn finding_48_a_kept_file_takes_the_upstreams_last_lines_and_keeps_its_own() {
 #[test]
 fn finding_45_a_landing_on_the_parents_head_is_a_fast_forward() {
     let mut w = world();
-    let f = w.create_fork(agentfs_model::world::Tree::Main);
+    let f = w.create_fork(TreeId::ROOT);
     let s = Client::Fork(f);
     save(&mut w, &s, "a", &[at(0, "s\n")]);
-    assert_eq!(w.take_next(TreeId::Main).unwrap(), Took::Taken);
+    assert_eq!(w.take_next(TreeId::ROOT).unwrap(), Took::Taken);
     let _held = w.open_write(&s, "a");
     save(&mut w, &m1(), "a", &[at(2, "m\n")]);
-    assert_eq!(w.take_next(TreeId::Fork(1)).unwrap(), Took::Waiting);
+    assert_eq!(w.take_next(TreeId::new(1)).unwrap(), Took::Waiting);
     passes(&w);
 }
 
@@ -364,14 +364,14 @@ fn finding_45_a_landing_on_the_parents_head_is_a_fast_forward() {
 #[test]
 fn finding_46_a_landing_waits_for_an_open_file_that_took_a_name_it_touches() {
     let mut w = world();
-    let f = w.create_fork(agentfs_model::world::Tree::Main);
+    let f = w.create_fork(TreeId::ROOT);
     let s = Client::Fork(f);
     let held = w.open_write(&m1(), "b");
     World::rename(&mut w, &m1(), "b", "a");
     World::unlink(&mut w, &s, "a");
-    assert_eq!(w.take_next(TreeId::Main).unwrap(), Took::Waiting);
+    assert_eq!(w.take_next(TreeId::ROOT).unwrap(), Took::Waiting);
     World::close(&mut w, held);
-    assert_eq!(w.take_next(TreeId::Main).unwrap(), Took::Taken);
+    assert_eq!(w.take_next(TreeId::ROOT).unwrap(), Took::Taken);
     passes(&w);
 }
 
@@ -380,12 +380,12 @@ fn finding_46_a_landing_waits_for_an_open_file_that_took_a_name_it_touches() {
 #[test]
 fn finding_47_two_unlinks_agree_over_an_unseen_edit() {
     let mut w = world();
-    let f = w.create_fork(agentfs_model::world::Tree::Main);
+    let f = w.create_fork(TreeId::ROOT);
     let s = Client::Fork(f);
     save(&mut w, &m1(), "c", &[at(2, "m\n")]);
     World::unlink(&mut w, &m1(), "c");
     World::unlink(&mut w, &s, "c");
-    assert_eq!(w.take_next(TreeId::Main).unwrap(), Took::Taken);
+    assert_eq!(w.take_next(TreeId::ROOT).unwrap(), Took::Taken);
     assert!(w.collisions.is_empty(), "{:?}", w.collisions);
     passes(&w);
 }
@@ -395,16 +395,16 @@ fn finding_47_two_unlinks_agree_over_an_unseen_edit() {
 #[test]
 fn finding_47_a_rename_over_agrees_with_an_unlink_over_an_unseen_edit() {
     let mut w = world();
-    let f = w.create_fork(agentfs_model::world::Tree::Main);
+    let f = w.create_fork(TreeId::ROOT);
     let s = Client::Fork(f);
     save(&mut w, &m1(), "c", &[at(2, "m\n")]);
     World::unlink(&mut w, &m1(), "c");
     World::rename(&mut w, &s, "b", "c");
-    assert_eq!(w.take_next(TreeId::Main).unwrap(), Took::Taken);
+    assert_eq!(w.take_next(TreeId::ROOT).unwrap(), Took::Taken);
     assert!(w.collisions.is_empty(), "{:?}", w.collisions);
     let shown = w.shown();
-    assert!(shown.trees[&TreeId::Main].contains_key("c"));
-    assert!(!shown.trees[&TreeId::Main].contains_key("b"));
+    assert!(shown.trees[&TreeId::ROOT].contains_key("c"));
+    assert!(!shown.trees[&TreeId::ROOT].contains_key("b"));
     passes(&w);
 }
 
@@ -415,12 +415,12 @@ fn finding_47_a_rename_over_agrees_with_an_unlink_over_an_unseen_edit() {
 #[test]
 fn finding_46_a_sync_of_a_file_the_sandbox_replaced_passes_the_name_it_took() {
     let mut w = world();
-    let f = w.create_fork(agentfs_model::world::Tree::Main);
+    let f = w.create_fork(TreeId::ROOT);
     let s = Client::Fork(f);
     World::rename(&mut w, &s, "a", "d");
     save(&mut w, &m1(), "d", &[at(2, "m\n")]);
     let _held = w.open_write(&s, "d");
-    assert_eq!(w.take_next(TreeId::Fork(1)).unwrap(), Took::Taken);
+    assert_eq!(w.take_next(TreeId::new(1)).unwrap(), Took::Taken);
     passes(&w);
 }
 
@@ -432,21 +432,21 @@ fn finding_46_a_sync_of_a_file_the_sandbox_replaced_passes_the_name_it_took() {
 #[test]
 fn finding_49_a_take_is_one_step_so_its_trace_replays() {
     let mut w = world();
-    let tree = agentfs_model::world::Tree::Main;
+    let tree = TreeId::ROOT;
     let (f, g) = (w.create_fork(tree), w.create_fork(tree));
     let held = w.open_write(&m1(), "d");
     save(&mut w, &Client::Fork(f), "d", &[at(2, "s\n")]);
     save(&mut w, &Client::Fork(g), "c", &[at(2, "t\n")]);
-    assert_eq!(w.take_next(TreeId::Main).unwrap(), Took::Taken);
+    assert_eq!(w.take_next(TreeId::ROOT).unwrap(), Took::Taken);
     assert_eq!(
-        &w.shown().trees[&TreeId::Main]["c"][..4],
+        &w.shown().trees[&TreeId::ROOT]["c"][..4],
         b"-\nt\n",
         "c's landing is written when its take returns"
     );
     World::close(&mut w, held);
     save(&mut w, &m1(), "a", &[at(2, "m\n")]);
-    assert_eq!(w.take_next(TreeId::Main).unwrap(), Took::Taken);
-    assert_eq!(&w.shown().trees[&TreeId::Main]["d"][..4], b"-\ns\n");
+    assert_eq!(w.take_next(TreeId::ROOT).unwrap(), Took::Taken);
+    assert_eq!(&w.shown().trees[&TreeId::ROOT]["d"][..4], b"-\ns\n");
     let takes: Vec<&RecordedCall> = w
         .trace()
         .iter()
@@ -464,17 +464,17 @@ fn finding_49_a_take_is_one_step_so_its_trace_replays() {
 #[test]
 fn finding_51_a_sync_that_cannot_show_the_upstreams_commit_merges() {
     let mut w = world();
-    let f = w.create_fork(agentfs_model::world::Tree::Main);
+    let f = w.create_fork(TreeId::ROOT);
     let s = Client::Fork(f);
     save(&mut w, &m1(), "a", &[at(4, "n2\n")]);
     World::rename(&mut w, &m1(), "d", "c");
     let held = w.open_write(&s, "d");
     save(&mut w, &m1(), "a", &[at(0, "n3\n")]);
     save(&mut w, &s, "d", &[at(0, "n4\n")]);
-    assert_eq!(w.take_next(TreeId::Main).unwrap(), Took::Taken);
+    assert_eq!(w.take_next(TreeId::ROOT).unwrap(), Took::Taken);
     w.write(held, at(0, "-\n-\n-\n-\n-\n-\n"));
     w.write(held, Write::Truncate(12));
-    assert_eq!(w.take_next(TreeId::Fork(1)).unwrap(), Took::Taken);
+    assert_eq!(w.take_next(TreeId::new(1)).unwrap(), Took::Taken);
     passes(&w);
 }
 
@@ -487,18 +487,18 @@ fn finding_51_a_sync_that_cannot_show_the_upstreams_commit_merges() {
 #[test]
 fn finding_51_a_sync_after_a_lost_save_fast_forwards() {
     let mut w = world();
-    let f = w.create_fork(agentfs_model::world::Tree::Main);
+    let f = w.create_fork(TreeId::ROOT);
     let s = Client::Fork(f);
     save(&mut w, &s, "c", &[at(2, "s\n")]);
     save(&mut w, &m1(), "c", &[at(2, "m\n")]);
-    assert_eq!(w.take_next(TreeId::Main).unwrap(), Took::Taken);
+    assert_eq!(w.take_next(TreeId::ROOT).unwrap(), Took::Taken);
     assert_eq!(w.collisions.len(), 1, "the fork's save lost");
-    assert_eq!(w.take_next(TreeId::Fork(1)).unwrap(), Took::Taken);
-    assert_eq!(w.head(agentfs_model::world::Tree::Fork(f)), w.main_head);
+    assert_eq!(w.take_next(TreeId::new(1)).unwrap(), Took::Taken);
+    assert_eq!(w.head(f), w.head(TreeId::ROOT));
     let _held = w.open_write(&s, "c");
     save(&mut w, &s, "a", &[at(2, "t\n")]);
-    assert_eq!(w.take_next(TreeId::Main).unwrap(), Took::Taken);
+    assert_eq!(w.take_next(TreeId::ROOT).unwrap(), Took::Taken);
     save(&mut w, &m1(), "c", &[at(4, "n\n")]);
-    assert_eq!(w.take_next(TreeId::Fork(1)).unwrap(), Took::Waiting);
+    assert_eq!(w.take_next(TreeId::new(1)).unwrap(), Took::Waiting);
     passes(&w);
 }

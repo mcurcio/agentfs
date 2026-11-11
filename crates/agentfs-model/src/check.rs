@@ -14,12 +14,12 @@ use std::path::Path;
 
 use lineage::Lineage;
 
+use crate::calls::TreeId;
 use crate::content::{Content, Line, PATHS, State, is_root, writer_of};
 use crate::git::{git, try_git};
 use crate::world::{
-    By, Client, Collision, Decision, Direction, Entry, ForkId, Kind, Landed, Life, Policies, Step,
-    Take, Target, Tree, TxnEnd, TxnId, TxnOutcome, World, commit_parents, decisions_in, name_key,
-    origin_in,
+    By, Client, Collision, Decision, Direction, Entry, Kind, Landed, Life, Policies, Step, Take,
+    Target, TxnEnd, TxnId, TxnOutcome, World, commit_parents, decisions_in, name_key, origin_in,
 };
 
 /// `r`'s error named for `check`: planted/matrix.tsv records the first check tripped.
@@ -115,7 +115,7 @@ struct Checker {
     views: Views,
     /// Every (tree, file, line identity, version) a tree has shown and
     /// then replaced.
-    left: BTreeSet<(Tree, String, String, String)>,
+    left: BTreeSet<(TreeId, String, String, String)>,
     checked_commits: BTreeSet<String>,
     /// Each open a save names (`Agentfs-Open`), with that save.
     opens_saved: BTreeMap<String, String>,
@@ -183,7 +183,7 @@ impl Checker {
 /// What [`Checked::step_checked`] reads before a queue step `t` (none for another
 /// step).
 struct Before {
-    t: Tree,
+    t: TreeId,
     /// The upstream's head, if `t` is a fork.
     up: Option<String>,
     /// Whether the entry P1 lets go is a sync.
@@ -201,10 +201,7 @@ fn before_step(w: &World, s: &Step) -> Result<Option<Before>, String> {
     let Step::Next(t) = s else {
         return Ok(None);
     };
-    let up = match t {
-        Tree::Fork(f) => Some(w.head(w.forks[f].upstream)),
-        Tree::Main => None,
-    };
+    let up = w.upstream_of(*t).map(|u| w.head(u));
     // P1, read before the step: the entry it must act on is the first one no
     // earlier waiting entry shares a file or a source with (the files read
     // from git, not from the model's plan).
@@ -336,7 +333,7 @@ fn after_step(w: &World, b: Before, taken: usize) -> Result<usize, String> {
 /// (`step_checked`), so no change to an open file is delivered.
 fn prefix_cut(
     w: &World,
-    t: Tree,
+    t: TreeId,
     ours: &str,
     head: &str,
     open: &BTreeSet<String>,
@@ -393,7 +390,7 @@ fn prefix_cut(
 /// is still open for writing there (the last close wakes it). No timer is
 /// modelled.
 fn locks(w: &World) -> Result<(), String> {
-    let queued = |t: Tree, n: u64| w.queue_numbered(t).iter().any(|(m, _)| *m == n);
+    let queued = |t: TreeId, n: u64| w.queue_numbered(t).iter().any(|(m, _)| *m == n);
     for h in w.handles() {
         let alive = match &h.client {
             Client::Main(n) => !w.ended_main.contains(n),
@@ -402,7 +399,7 @@ fn locks(w: &World) -> Result<(), String> {
         let held = match h.target {
             Target::Txn(f, n) => w.forks[&f].txn.as_ref().is_some_and(|x| x.id == n),
             // R5.3: a deferred call lives only behind its open transaction.
-            Target::Tree(Tree::Fork(f)) if h.deferred => {
+            Target::Tree(f) if h.deferred && w.upstream_of(f).is_some() => {
                 w.forks[&f].txn.is_some() && w.forks[&f].deferred.contains(&h.id)
             }
             Target::Tree(_) => h.kind == Kind::Write,
@@ -456,7 +453,7 @@ fn locks(w: &World) -> Result<(), String> {
 /// queue that no earlier waiting entry (or one waiting behind it) shares a
 /// file or a source with. Files are read from git ([`entry_files`]); a
 /// waiting entry's, the files it locks.
-pub fn p1_first(w: &World, t: Tree) -> Option<usize> {
+pub fn p1_first(w: &World, t: TreeId) -> Option<usize> {
     let waiting = w.waits().get(&t);
     let mut files: BTreeSet<String> = BTreeSet::new();
     let mut sources = BTreeSet::new();
@@ -480,14 +477,14 @@ pub fn p1_first(w: &World, t: Tree) -> Option<usize> {
 /// The files queue entry `e` of `t` may touch, read from git: a landing's
 /// commit's own changes ([`change_files`]), a sync's every file its tree
 /// and its upstream's head differ in.
-pub fn entry_files(w: &World, t: Tree, e: &Entry) -> BTreeSet<String> {
-    match (e, t) {
+pub fn entry_files(w: &World, t: TreeId, e: &Entry) -> BTreeSet<String> {
+    match (e, w.upstream_of(t)) {
         (Entry::Landing { commit, .. }, _) => change_files(w, commit),
-        (Entry::Sync, Tree::Fork(f)) => {
-            let (ours, up) = (w.head(t), w.head(w.forks[&f].upstream));
+        (Entry::Sync, Some(u)) => {
+            let (ours, up) = (w.head(t), w.head(u));
             lock_keys(w, &ours, &up)
         }
-        (Entry::Sync, Tree::Main) => BTreeSet::new(),
+        (Entry::Sync, None) => BTreeSet::new(),
     }
 }
 
@@ -545,7 +542,7 @@ fn drained(w: &World) -> Result<(), String> {
 fn trees_equal_main(w: &World) -> Result<(), String> {
     for t in w.live_trees() {
         for p in PATHS {
-            let (mine, main) = (w.file(&w.head(t), p), w.file(&w.main_head, p));
+            let (mine, main) = (w.file(&w.head(t), p), w.file(&w.head(TreeId::ROOT), p));
             if mine != main {
                 return Err(format!(
                     "{t:?}:{p} never converged: {mine:?} vs main's {main:?}"
@@ -556,7 +553,7 @@ fn trees_equal_main(w: &World) -> Result<(), String> {
     Ok(())
 }
 
-type Views = BTreeMap<Tree, BTreeMap<String, Content>>;
+type Views = BTreeMap<TreeId, BTreeMap<String, Content>>;
 
 /// What every live tree holds now, file by file (by identity), deleted
 /// versions and unlinked files included.
@@ -582,7 +579,7 @@ fn views(w: &World) -> Views {
 fn moves<'a>(
     views: &'a Views,
     now: &'a Views,
-) -> Vec<(Tree, &'a str, &'a str, &'a Line, &'a Line)> {
+) -> Vec<(TreeId, &'a str, &'a str, &'a Line, &'a Line)> {
     let mut out = Vec::new();
     for (t, files) in now {
         let Some(before) = views.get(t) else {
@@ -604,7 +601,7 @@ fn moves<'a>(
 impl Checker {
     /// A collision in `trees` names `token`, or a later version written over
     /// it, as lost on line `line` of file `path`.
-    fn lost_in(&self, w: &World, trees: &[Tree], path: &str, line: &str, token: &str) -> bool {
+    fn lost_in(&self, w: &World, trees: &[TreeId], path: &str, line: &str, token: &str) -> bool {
         w.collisions
             .iter()
             .any(|c| trees.contains(&c.tree) && self.names_lost(c, path, line, token))
@@ -623,7 +620,7 @@ impl Checker {
     /// [`Self::lost_in`] `t` or a tree upstream of it, by a decision that has
     /// reached `t` ([`delivered`]): a loss decided upstream reaches `t` as a
     /// plain update, never before the commit that carries it.
-    fn flagged(&self, w: &World, t: Tree, path: &str, line: &str, token: &str) -> bool {
+    fn flagged(&self, w: &World, t: TreeId, path: &str, line: &str, token: &str) -> bool {
         let trees = w.upstream(t);
         w.collisions.iter().any(|c| {
             trees.contains(&c.tree) && delivered(w, t, c) && self.names_lost(c, path, line, token)
@@ -634,7 +631,7 @@ impl Checker {
     /// `token` (or is it) entered `t` or a tree upstream of it, and no
     /// collision that reached `t` names it lost. Another delete of that line
     /// then agrees with it: `token`'s content is gone by that delete first.
-    fn deleted_over(&self, w: &World, t: Tree, path: &str, line: &str, token: &str) -> bool {
+    fn deleted_over(&self, w: &World, t: TreeId, path: &str, line: &str, token: &str) -> bool {
         let trees = w.upstream(t);
         w.entered.iter().any(|(u, d)| {
             trees.contains(u)
@@ -675,7 +672,7 @@ impl Checker {
     /// unlink that lost to a line it never saw gives the file back; a line of a
     /// losing save goes back to the upstream's). A version lost by no real
     /// collision of its change is no such decision.
-    fn decided_against(&self, w: &World, t: Tree, path: &str, line: &str, token: &str) -> bool {
+    fn decided_against(&self, w: &World, t: TreeId, path: &str, line: &str, token: &str) -> bool {
         let trees = w.upstream(t);
         w.collisions.iter().any(|c| {
             trees.contains(&c.tree)
@@ -708,7 +705,7 @@ impl Checker {
 /// prefix sync that holds back
 /// the upstream's landing that carried a line upstream has not delivered
 /// main's decision against that line, nor a held-back commit's own.
-fn delivered(w: &World, t: Tree, c: &Collision) -> bool {
+fn delivered(w: &World, t: TreeId, c: &Collision) -> bool {
     let Some(upstream) = w.upstream(t).get(1).copied() else {
         return true;
     };
@@ -1088,19 +1085,15 @@ fn decided_at_the_upstreams_queue(w: &World, c: &Collision) -> bool {
             cause == "Landing"
                 && from
                     .strip_prefix("fork/")
-                    .and_then(|f| f.parse::<ForkId>().ok())
-                    .is_some_and(|f| w.upstream(Tree::Fork(f))[1..].contains(&c.tree))
+                    .and_then(|f| f.parse::<u32>().ok())
+                    .is_some_and(|f| w.upstream(TreeId::new(f))[1..].contains(&c.tree))
         }
         Direction::Transaction => {
             cause.starts_with("Transaction ")
                 && from
                     .strip_prefix("txn/")
                     .and_then(|n| n.parse::<TxnId>().ok())
-                    .is_some_and(|n| {
-                        w.ended
-                            .iter()
-                            .any(|e| e.txn == n && Tree::Fork(e.fork) == c.tree)
-                    })
+                    .is_some_and(|n| w.ended.iter().any(|e| e.txn == n && e.fork == c.tree))
         }
     }
 }
@@ -1139,7 +1132,7 @@ fn ends_open(l: &Line) -> bool {
 }
 
 /// The versions `upstream` had taken within the first `entered` records.
-fn taken_by(w: &World, upstream: Tree, entered: usize) -> BTreeSet<&str> {
+fn taken_by(w: &World, upstream: TreeId, entered: usize) -> BTreeSet<&str> {
     w.entered[..entered]
         .iter()
         .filter(|(x, _)| *x == upstream)
@@ -1149,7 +1142,7 @@ fn taken_by(w: &World, upstream: Tree, entered: usize) -> BTreeSet<&str> {
 
 /// P2: a version `upstream` took only in takes a sync of its commit `up` holds
 /// back (the take's result commit is not in `up`, read from git).
-fn held_back(w: &World, upstream: Tree, up: &str, id: &str) -> bool {
+fn held_back(w: &World, upstream: TreeId, up: &str, id: &str) -> bool {
     taken_only_past(w, up, id, |l| l.tree == upstream)
 }
 
@@ -1174,8 +1167,8 @@ fn taken_only_past(w: &World, up: &str, id: &str, in_scope: impl Fn(&Landed) -> 
 /// file closes.
 fn decision_held_back_by_lock(
     w: &World,
-    t: Tree,
-    upstream: Tree,
+    t: TreeId,
+    upstream: TreeId,
     up: &str,
     result: &str,
     id: &str,
@@ -1213,8 +1206,8 @@ impl Checker {
     /// upstream's decision, must bring the line back or fail here, and a line that
     /// left any other way (a save, a sync with no such reason, an upstream's version
     /// not written over `token`) fails. The owner, 2026-11-06, finding 35: "A is fine".
-    fn hidden_by_r10_6(&self, w: &World, t: Tree, path: &str, line: &str, token: &str) -> bool {
-        let Tree::Fork(f) = t else {
+    fn hidden_by_r10_6(&self, w: &World, t: TreeId, path: &str, line: &str, token: &str) -> bool {
+        let Some(upstream) = w.upstream_of(t) else {
             return false;
         };
         let Some((_, up, result, entered)) = w.syncs.iter().rev().find(|s| s.0 == t) else {
@@ -1227,7 +1220,6 @@ impl Checker {
         if r.member(line).is_some() || !self.lineage.descends(&x.id, token) {
             return false;
         }
-        let upstream = w.forks[&f].upstream;
         let took = taken_by(w, upstream, *entered);
         let ours = commit_parents(w.repo(), result)
             .first()
@@ -1251,10 +1243,9 @@ impl Checker {
     /// only as its own delete (finding 43).
     fn syncs_deliver(&mut self, w: &World) -> Result<(), String> {
         for (t, up, result, entered) in &w.syncs[self.read.syncs..] {
-            let Tree::Fork(f) = t else {
+            let Some(upstream) = w.upstream_of(*t) else {
                 return Err("main synced".into());
             };
-            let upstream = w.forks[f].upstream;
             let took = taken_by(w, upstream, *entered);
             let held_back = |id: &str| held_back(w, upstream, up, id);
             let decided = |id: &str| is_root(id) || took.contains(id);
@@ -1318,7 +1309,7 @@ impl Checker {
                     }
                 }
                 // The fork's lines still undecided, for what a sync may hide.
-                let own_writer = w.forks[f].writer.as_str();
+                let own_writer = w.forks[t].writer.as_str();
                 let undecided = |o: &Line| !decided(&o.id) || held_back(&o.id);
                 let ours = commit_parents(w.repo(), result)
                     .first()
@@ -1367,7 +1358,7 @@ impl Checker {
     /// (`discarded_leave_no_trace` holds that); an empty one staged nothing.
     fn transactions_end_as_told(&mut self, w: &World) -> Result<(), String> {
         for e in &w.ended[self.read.ended..] {
-            let fork = Tree::Fork(e.fork);
+            let fork = e.fork;
             // Whether the transaction created `s`'s file (a new file) and its
             // last staged version of the file's name line ended it: then the
             // file changed nothing anyone sees (an atomic save's new file), so
@@ -1444,7 +1435,7 @@ impl Checker {
         let mut seen = BTreeMap::new();
         for f in w.forks.values().filter(|f| f.txn.is_some()) {
             let txn = f.txn.as_ref().expect("open");
-            let (tree, head) = (World::name(Tree::Fork(f.id)), f.head.clone());
+            let (tree, head) = (World::name(f.id), f.head.clone());
             if let Some((at, files)) = self.txn_files_seen.get(&txn.id) {
                 let files: &BTreeSet<String> = files;
                 let mut c = head.clone();
@@ -1606,13 +1597,13 @@ impl Checker {
                     continue;
                 }
                 // excuse: R3a a fork keeps its own undecided name version until the upstream decides
-                let undecided = match t {
-                    Tree::Fork(f) => {
-                        w.file(&w.head(w.forks[f].upstream), by).name.id != n.id
+                let undecided = match w.upstream_of(*t) {
+                    Some(u) => {
+                        w.file(&w.head(u), by).name.id != n.id
                             || (writer_of(&n.id).starts_with('c')
-                                && w.file(&w.main_head, by).name.id != n.id)
+                                && w.file(&w.head(TreeId::ROOT), by).name.id != n.id)
                     }
-                    Tree::Main => false,
+                    None => false,
                 };
                 if !undecided && !self.lineage.descends(&n.id, v) {
                     return Err(format!(
@@ -1850,7 +1841,7 @@ impl Checker {
     /// walk stops early by commit date).
     fn full_lineage(&mut self, w: &World) -> Result<(), String> {
         let repo = w.repo().to_path_buf();
-        let landed: Vec<(Tree, String)> = w
+        let landed: Vec<(TreeId, String)> = w
             .landings
             .iter()
             .filter(|l| l.direction == Direction::Landing && w.alive(l.tree))

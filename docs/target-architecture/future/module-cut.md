@@ -30,8 +30,9 @@ Every statement here is about one fork and its one upstream.
 
 What this changes in the code:
 
-- `Tree::Main` and `Tree::Fork` in the model become one tree identity with an optional upstream. The root is simply
-  the tree without one. No module asks whether a tree is "main".
+- The model has one tree identity, `calls::TreeId`: a number, the root 0 and each fork the next from 1. A tree's
+  upstream is the world's answer (`World::upstream_of`), and the root is simply the tree without one. No module asks
+  whether a tree is "main".
 - The referee takes one pair at a time: land is a fork into its upstream, sync is an upstream into a fork.
 - The model's built-in `remote` leaves `World` (step 6). Tree history publishes that a tree moved; mirrors subscribe.
   What a mirror may send back, pull requests included, belongs to the mirror's own design
@@ -86,7 +87,7 @@ git's ref files. It does not yet re-derive the rest from git; a later step does,
 |---|---|---|
 | The model's records | `landings`, `syncs`, `entered`, `collisions`, `ended`, `discarded`, `save_calls`, `last_take` | most checks |
 | Each change's edits | `World::edits` | `changes_whole`, `placed_and_unlinked`, `taken_only_past` |
-| Each tree's head | `World::head`, `World::main_head` and the fork list, not git's refs | `views`, the queue step's checks, `prefix_cut`, `delivered`, `entry_files`, `trees_equal_main` and others |
+| Each tree's head | `World::head` and the fork list, not git's refs | `views`, the queue step's checks, `prefix_cut`, `delivered`, `entry_files`, `trees_equal_main` and others |
 | A file at a commit, and ancestry | `World::file` and `World::is_ancestor`, over `World`'s caches of git objects | almost every check |
 | Queues, waits, opens and handles | `queue_numbered`, `waits`, `write_open`, `handles` | `locks`, `p1_first`, the queue step's checks |
 
@@ -141,7 +142,7 @@ A change to the safety net itself runs its quick tier and a review before any fu
 | # | Step | Gate |
 |---|---|---|
 | 2 | Built. Model: referee units out of `resolve`, `adopt` and `splice` | The model gate |
-| 3 | Model: queue and locks, and recording, split out. One tree identity with an optional upstream, keeping today's order (root first, forks ascending). `World` is the composition root. The replicate step keeps its place among the pending steps, because random runs draw from that list. The digest's tree labels come from `World::name`, `World::branch`, `World::txn_name` and `World::txn_branch`, so this step edits them, and `canonical_text_is_pinned` must stay unchanged | The model gate. Names may change, outcomes may not |
+| 3 | Model. Built: one tree identity, `calls::TreeId`, with its upstream from `World::upstream_of`, keeping today's order (root first, forks ascending); the digest's tree labels still come from `World::name`, `World::branch`, `World::txn_name` and `World::txn_branch`, and `canonical_text_is_pinned` is unchanged. Still to build: queue and locks, and recording, split out, with `World` the composition root. The replicate step keeps its place among the pending steps, because random runs draw from that list | The model gate. Names may change, outcomes may not |
 | 4 | Recorder: an engine call sequence becomes a model trace, so a regression found on a mount replays in the model. Guidance, owner, 2026-11-07: "if new regressions are found in the implementation, then those regressions can be verified and fixed via the git model" | One known regression replays |
 | 5 | Engine: remove the duplicated ancestry check, name combining and R3e; a typed version; then split `tree_actor/mod.rs` | Conformance traces on every scenario and seed stay at 0 mismatched |
 | 6 | Model: R9.18, R10.5 and R10.11 (see [transactions](transactions.md)); the built-in `remote` and its replicate step leave `World`. `MODEL.md` says Replication is "due on every move of main and every collision", which is stricter than any check: a planted bug that dropped the flag at a collision changed no digest and tripped no check, because the next move of main pushes anyway. This step settles what a mirror's push timing must be | The digest is re-baselined on purpose; finding 30's test is no longer ignored |

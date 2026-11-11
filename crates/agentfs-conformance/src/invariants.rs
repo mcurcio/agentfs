@@ -407,17 +407,17 @@ impl Invariants {
             collisions: Vec::new(),
             refs: String::new(),
         };
-        me.trees.insert(TreeId::Main, OracleTree::default());
-        me.reload(TreeId::Main)?;
+        me.trees.insert(TreeId::ROOT, OracleTree::default());
+        me.reload(TreeId::ROOT)?;
         Ok(me)
     }
 
     fn refname(&self, t: TreeId) -> Result<String, String> {
         match t {
-            TreeId::Main => Ok("refs/heads/main".into()),
-            TreeId::Fork(f) => self
+            TreeId::ROOT => Ok("refs/heads/main".into()),
+            f => self
                 .forks
-                .get(f.wrapping_sub(1))
+                .get((f.number() as usize).wrapping_sub(1))
                 .map(|n| format!("refs/heads/{n}"))
                 .ok_or_else(|| format!("no fork {f}")),
         }
@@ -526,8 +526,8 @@ impl Invariants {
 
     fn tree_of(c: &Caller) -> TreeId {
         match c {
-            Caller::Main(_) => TreeId::Main,
-            Caller::Fork(f) => TreeId::Fork(*f),
+            Caller::Main(_) => TreeId::ROOT,
+            Caller::Fork(f) => *f,
         }
     }
 
@@ -573,8 +573,8 @@ impl Invariants {
                         .unwrap_or(0)
                 });
                 self.forks = names;
-                let main = self.trees.get(&TreeId::Main).cloned().unwrap_or_default();
-                self.trees.insert(TreeId::Fork(*id), main);
+                let main = self.trees.get(&TreeId::ROOT).cloned().unwrap_or_default();
+                self.trees.insert(*id, main);
             }
             RecordedCall::OpenWrite { caller, path, h } => {
                 self.opened(caller, path, *h, Vec::new())?;
@@ -799,7 +799,7 @@ impl Invariants {
                     .forks
                     .iter()
                     .position(|f| *f == tree)
-                    .map_or(TreeId::Main, |i| TreeId::Fork(i + 1)),
+                    .map_or(TreeId::ROOT, |i| TreeId::new(i as u32 + 1)),
                 path,
                 lost_bytes,
                 whole: d.whole,
@@ -879,7 +879,7 @@ impl Invariants {
         if !queued.trim().is_empty() {
             return Ok(());
         }
-        let main_paths = t.paths(TreeId::Main).map_err(|e| e.to_string())?;
+        let main_paths = t.paths(TreeId::ROOT).map_err(|e| e.to_string())?;
         let ids: Vec<TreeId> = self.trees.keys().copied().collect();
         for id in ids {
             let paths = t.paths(id).map_err(|e| e.to_string())?;
@@ -891,7 +891,7 @@ impl Invariants {
             for p in &paths {
                 let (a, b) = (
                     t.read(id, p).map_err(|e| e.to_string())?,
-                    t.read(TreeId::Main, p).map_err(|e| e.to_string())?,
+                    t.read(TreeId::ROOT, p).map_err(|e| e.to_string())?,
                 );
                 if a != b {
                     return Err(format!("converged: {id:?}:{p} differs from main's"));
@@ -1191,7 +1191,7 @@ mod tests {
 
     impl TreeCalls for Shows {
         type Open = u64;
-        fn fork(&mut self) -> Result<usize, CallError> {
+        fn fork(&mut self) -> Result<TreeId, CallError> {
             unreachable!("drained only reads")
         }
         fn open_write(&mut self, _: &Caller, _: &str) -> Result<u64, CallError> {
@@ -1246,15 +1246,15 @@ mod tests {
     fn shows(main: &[u8], fork: &[u8]) -> Shows {
         let tree = |bytes: &[u8]| BTreeMap::from([("a".to_owned(), bytes.to_vec())]);
         Shows(BTreeMap::from([
-            (TreeId::Main, tree(main)),
-            (TreeId::Fork(1), tree(fork)),
+            (TreeId::ROOT, tree(main)),
+            (TreeId::new(1), tree(fork)),
         ]))
     }
 
     /// `Invariants` over a new repository with a fork 1 to check, and its main tip.
     fn with_fork(repo: &Repo) -> (Invariants, String) {
         let mut inv = repo.invariants();
-        inv.trees.insert(TreeId::Fork(1), OracleTree::default());
+        inv.trees.insert(TreeId::new(1), OracleTree::default());
         let tip = repo.git(&["rev-parse", "refs/heads/main"], b"");
         (inv, tip)
     }

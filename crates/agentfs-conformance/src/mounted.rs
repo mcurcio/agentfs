@@ -183,8 +183,8 @@ impl Mounted {
 
     fn root(&self, t: TreeId) -> &Path {
         match t {
-            TreeId::Main => &self.main,
-            TreeId::Fork(_) => &self.sandbox,
+            TreeId::ROOT => &self.main,
+            _ => &self.sandbox,
         }
     }
 
@@ -281,12 +281,12 @@ impl TreeCalls for Mounted {
     type Open = RawFd;
 
     /// `new` made the one fork `mountable` allows.
-    fn fork(&mut self) -> Result<usize, CallError> {
+    fn fork(&mut self) -> Result<TreeId, CallError> {
         if self.fork.is_none() || self.fork_used {
             return Err(CallError::new("not a mountable trace"));
         }
         self.fork_used = true;
-        Ok(1)
+        Ok(TreeId::new(1))
     }
 
     fn open_write(&mut self, c: &Caller, path: &str) -> Result<RawFd, CallError> {
@@ -369,8 +369,8 @@ impl TreeCalls for Mounted {
 
     fn take_next(&mut self, t: TreeId) -> Result<Took, CallError> {
         let tree = match t {
-            TreeId::Main => "main".to_owned(),
-            TreeId::Fork(_) => self
+            TreeId::ROOT => "main".to_owned(),
+            _ => self
                 .fork
                 .clone()
                 .ok_or_else(|| CallError::new("no sandbox"))?,

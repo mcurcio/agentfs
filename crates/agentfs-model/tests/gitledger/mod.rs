@@ -6,8 +6,9 @@
 //! from the branch moves it sees, so a change the model never judged is
 //! caught even when the model's world and its record agree.
 
+use agentfs_model::calls::TreeId;
 use agentfs_model::git::{git, try_git};
-use agentfs_model::world::{Direction, Step, Tree, World};
+use agentfs_model::world::{Direction, Step, World};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -21,7 +22,7 @@ struct Meta {
 
 #[derive(Clone, Debug, PartialEq)]
 enum Q {
-    Landing { from: u32, commit: String },
+    Landing { from: TreeId, commit: String },
     Sync,
 }
 
@@ -33,11 +34,11 @@ struct Ledger {
     heads: BTreeMap<String, String>,
     collisions: BTreeSet<String>,
     meta: BTreeMap<String, Meta>,
-    queues: BTreeMap<Tree, Vec<Q>>,
+    queues: BTreeMap<TreeId, Vec<Q>>,
     /// The queue entries (by index) each tree's takes have taken: P1 lets
     /// a landing go ahead of an earlier waiting entry.
-    done: BTreeMap<Tree, BTreeSet<usize>>,
-    at_next: BTreeMap<Tree, usize>,
+    done: BTreeMap<TreeId, BTreeSet<usize>>,
+    at_next: BTreeMap<TreeId, usize>,
     landings_seen: usize,
     takes: usize,
 }
@@ -53,18 +54,19 @@ pub fn enable(on: bool) {
     L.with(|l| *l.borrow_mut() = None);
 }
 
-fn name(t: Tree) -> String {
-    match t {
-        Tree::Main => "main".into(),
-        Tree::Fork(f) => format!("fork/{f}"),
+fn name(t: TreeId) -> String {
+    if t == TreeId::ROOT {
+        "main".into()
+    } else {
+        format!("fork/{t}")
     }
 }
 
-fn tree_of_name(s: &str) -> Option<Tree> {
+fn tree_of_name(s: &str) -> Option<TreeId> {
     if s == "main" {
-        return Some(Tree::Main);
+        return Some(TreeId::ROOT);
     }
-    s.strip_prefix("fork/")?.parse().ok().map(Tree::Fork)
+    s.strip_prefix("fork/")?.parse().ok().map(TreeId::new)
 }
 
 impl Ledger {
@@ -124,7 +126,7 @@ pub fn observe(w: &World) -> Result<(), String> {
                 repo: w.repo().to_path_buf(),
                 ..Default::default()
             };
-            l.heads.insert("main".into(), w.head(Tree::Main));
+            l.heads.insert("main".into(), w.head(TreeId::ROOT));
             l.seen = w.all_commits().into_iter().collect();
             *g = Some(l);
         }
@@ -181,7 +183,7 @@ pub fn observe(w: &World) -> Result<(), String> {
                 moves += 1;
                 let m = l.meta(&c);
                 let below = tree_of_name(&m.tree).is_some_and(|t| {
-                    t != x && matches!(t, Tree::Fork(_)) && w.upstream(t).contains(&x)
+                    t != x && w.upstream_of(t).is_some() && w.upstream(t).contains(&x)
                 });
                 if below {
                     ff = Some(c.clone());
@@ -196,16 +198,16 @@ pub fn observe(w: &World) -> Result<(), String> {
                     queued.push(c.clone());
                 }
             }
-            if let Tree::Fork(f) = x {
-                let upstream = w.forks[&f].upstream;
+            if let Some(upstream) = w.upstream_of(x) {
+                let f = x;
                 let q = l.queues.entry(upstream).or_default();
                 for c in &queued {
                     q.push(Q::Landing { from: f, commit: c.clone() });
                 }
             }
             for child in w.forks.values().filter(|k| k.upstream == x) {
-                if heads.contains_key(&name(Tree::Fork(child.id))) {
-                    let q = l.queues.entry(Tree::Fork(child.id)).or_default();
+                if heads.contains_key(&name(child.id)) {
+                    let q = l.queues.entry(child.id).or_default();
                     for _ in 0..moves {
                         q.push(Q::Sync);
                     }
