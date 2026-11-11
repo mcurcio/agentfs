@@ -18,6 +18,7 @@ on his answer.
 ## Tooling
 
 - **Guidance**, 2026-11-10. On opting agentfs in to his shared skills marketplace (`rules` and `workflow`): "add this config to the current PR, and include semantic release". Applies to: `.claude/settings.json`.
+- **Guidance**, 2026-11-11. On the identity agents commit with: "the env setup should set the agent to the GitHub bot-einstein user and email", then "The email should use the GitHub email for that user". Applies to: `AGENTS.md` (Git, Identity) and the cloud environment's git variables. [That email is `265368963+bot-einstein@users.noreply.github.com`.]
 
 ## Terms
 
