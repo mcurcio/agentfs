@@ -22,9 +22,16 @@ pub use library::Library;
 pub use mounted::Mounted;
 
 use agentfs_model::calls::{Recorded, RecordedCall, TreeCalls, gather_collisions, replay};
-use agentfs_model::world::{Policies, World};
+use agentfs_model::world::{MODEL_ROOT, Policies, TreeNames, World};
 use invariants::Invariants;
 use std::path::{Path, PathBuf};
+
+/// The root tree's name in agentfs-core, which takes no other today. The
+/// engine step that makes it configured
+/// (docs/target-architecture/future/root-branch-name.md) removes this:
+/// conformance then configures the engine with a name of its own, not `main`,
+/// and passes it.
+pub const ENGINE_ROOT: &str = "main";
 
 /// The trace against `t`, with the real system's invariants read from `repo`.
 fn against_real<T: TreeCalls>(trace: &[Recorded], t: &mut T, repo: &Path) -> Result<(), String> {
@@ -62,7 +69,7 @@ pub fn against_mount(trace: &[Recorded], bin: &Path) -> Result<(), String> {
 
 /// The same replay driving a fresh model shows its own trace (criterion 6).
 pub fn against_model(trace: &[Recorded]) -> Result<(), String> {
-    let mut world = World::new(Policies::default());
+    let mut world = World::new(Policies::default(), TreeNames::new(MODEL_ROOT));
     replay(trace, &mut world, &mut |w, r| {
         if let Some(shown) = &r.shown {
             let got = gather_collisions(w.shown().collisions);
@@ -77,7 +84,7 @@ pub fn against_model(trace: &[Recorded]) -> Result<(), String> {
     })
 }
 
-/// Whether a trace fits "main and one sandbox" on a real mount: at most one
+/// Whether a trace fits "the root and one sandbox" on a real mount: at most one
 /// fork, made before the first client call, and no open that both appends and
 /// writes at an offset. Linux has no such descriptor: `pwrite` on an `O_APPEND`
 /// file appends, and the view reads `O_APPEND` when the file opens.

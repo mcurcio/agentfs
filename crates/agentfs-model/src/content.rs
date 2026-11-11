@@ -18,7 +18,7 @@
 //! line, its name line: its identity is the file's identity (fixed at
 //! create, kept by a rename), its live versions hold the file's path, a
 //! deleted version marks the file unlinked. A file a create can make is in
-//! main's first commit as unborn ([`UNBORN`]): its name line deleted, no
+//! the root's first commit as unborn ([`UNBORN`]): its name line deleted, no
 //! lines.
 //!
 //! The model keeps each line's record (version, identity, the version it
@@ -33,11 +33,11 @@ use std::collections::BTreeSet;
 
 /// Lines each file starts with: six root lines, all holding [`BLANK`].
 pub const SLOTS: usize = 6;
-/// The files that exist from main's first commit: their identities, which
+/// The files that exist from the root's first commit: their identities, which
 /// are also their first paths.
 pub const FILES: [&str; 4] = ["a", "b", "c", "d"];
 /// The file identities a create can take, in this order, each once in the
-/// volume (rule 11: a file's identity is fixed at create). Main's first
+/// volume (rule 11: a file's identity is fixed at create). The root's first
 /// commit holds each as unborn: a deleted name version and no lines, so a
 /// create is a new version of the name line written over it, and every
 /// reader that walks the files sees an unborn file as an unlinked one.

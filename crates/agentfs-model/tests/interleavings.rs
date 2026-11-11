@@ -1,5 +1,5 @@
 //! Seeded random interleavings of client calls and queue steps across
-//! main, several forks (nested ones included) and transactions, with every
+//! the root, several forks (nested ones included) and transactions, with every
 //! invariant checked after each step (`agentfs_model::check`), and, once
 //! writes stop and the queues drain, convergence.
 //!
@@ -38,7 +38,8 @@ use agentfs_model::program;
 use agentfs_model::queue::{Entry, NAME_KEY, name_key};
 use agentfs_model::recording::{Kind, Target, Write};
 use agentfs_model::world::{
-    By, Direction, Life, LineEdit, MergeRule, Policies, Step, TxnEnd, TxnOutcome, World,
+    By, Direction, Life, LineEdit, MODEL_ROOT, MergeRule, Policies, Step, TreeNames, TxnEnd,
+    TxnOutcome, World,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -136,7 +137,7 @@ struct Tally {
     unlinks: usize,
     renames: usize,
     rename_overs: usize,
-    main_deaths: usize,
+    root_deaths: usize,
     /// Creates, atomic saves (a create renamed over a file), old writers
     /// left open on a file an atomic save may replace, and closes of an
     /// orphan that dropped calls.
@@ -243,7 +244,7 @@ fn new_file(c: &Content) -> bool {
 
 fn writer(w: &World, c: &Client) -> String {
     match c {
-        Client::Main(n) => n.clone(),
+        Client::Root(n) => n.clone(),
         Client::Fork(f) | Client::Outside(f) => w.forks[f].writer.clone(),
     }
 }
@@ -359,7 +360,7 @@ impl Oracle {
         to: Option<&str>,
     ) -> Result<(), String> {
         let t = match c {
-            Client::Main(_) => Target::Tree(TreeId::ROOT),
+            Client::Root(_) => Target::Tree(TreeId::ROOT),
             Client::Fork(f) => match &w.forks[f].txn {
                 Some(x) => Target::Txn(*f, x.id),
                 None => Target::Tree(*f),
@@ -720,7 +721,7 @@ fn end_checked(w: &mut World, o: &mut Oracle, c: &Client) -> Result<(), String> 
         expect.extend(o.closing(w, h));
     }
     match c {
-        Client::Main(n) => w.end_main_client(n),
+        Client::Root(n) => w.end_root_client(n),
         Client::Fork(f) | Client::Outside(f) => w.end_client(*f),
     }
     dropped(w, n, expect)?;
@@ -934,7 +935,7 @@ fn run_seed_of(
     policies: Policies,
     tally: &mut Tally,
 ) -> Result<String, String> {
-    let mut w = Checked::new(policies);
+    let mut w = Checked::new(policies, TreeNames::new(MODEL_ROOT));
     w.label_trace(format!("seed{seed}"));
     let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         generate(&mut w, seed, tally)
@@ -968,9 +969,9 @@ struct Calls {
     /// Each client's last read of each file (by identity), which a later
     /// whole-file rewrite writes back: often stale by then.
     reads: BTreeMap<(String, String), Content>,
-    /// Main's live clients: one may die (its end event) and a new one start.
-    mains: Vec<String>,
-    next_main: usize,
+    /// The root's live clients: one may die (its end event) and a new one start.
+    root_clients: Vec<String>,
+    next_root_client: usize,
     next_name: usize,
     /// A counter for new lines' bytes, so most new lines differ.
     next_text: usize,
@@ -984,8 +985,8 @@ impl Calls {
             rng: Rng(seed),
             o: Oracle::default(),
             reads: BTreeMap::new(),
-            mains: vec!["m1".into(), "m2".into()],
-            next_main: 3,
+            root_clients: vec!["m1".into(), "m2".into()],
+            next_root_client: 3,
             next_name: 1,
             next_text: 1,
             creates: 0,
@@ -1388,7 +1389,9 @@ impl Calls {
             return Ok(false);
         };
         let c = match w.upstream_of(t) {
-            None => Client::Main(self.mains[self.rng.below(self.mains.len())].clone()),
+            None => {
+                Client::Root(self.root_clients[self.rng.below(self.root_clients.len())].clone())
+            }
             Some(_) if w.forks[&t].life == Life::Open => Client::Fork(t),
             Some(_) => return Ok(false),
         };
@@ -1454,9 +1457,9 @@ fn run_as(
     gitledger::observe(w).map_err(|e| (0, e))?;
     let mut k = Calls::new(seed);
     k.o.reload(w);
-    // The line a fork wrote last (its file's identity and position). Main
+    // The line a fork wrote last (its file's identity and position). The root
     // and forks write it again half the time, so runs often build "a fork
-    // edits over its own undecided line while main writes it
+    // edits over its own undecided line while the root writes it
     // concurrently" (coherence finding 8).
     let mut focus: Option<(&str, usize)> = None;
     for step in 0..STEPS {
@@ -1464,7 +1467,7 @@ fn run_as(
             Some(x) if k.rng.below(2) == 0 => x,
             _ => (FILES[k.rng.below(FILES.len())], k.rng.below(HOT_SLOTS)),
         };
-        let mut clients: Vec<Client> = k.mains.iter().cloned().map(Client::Main).collect();
+        let mut clients: Vec<Client> = k.root_clients.iter().cloned().map(Client::Root).collect();
         clients.extend(live_clients(w).into_iter().map(Client::Fork));
         // Another program of a fork differs from its client only while a
         // transaction is open there.
@@ -1477,7 +1480,7 @@ fn run_as(
         let e = |e| (step, e);
         match k.rng.below(34) {
             0..=2 => {
-                let who = Client::Main(k.mains[k.rng.below(k.mains.len())].clone());
+                let who = Client::Root(k.root_clients[k.rng.below(k.root_clients.len())].clone());
                 if let Some(p) = w.client_path(&who, f) {
                     k.save(w, &who, &p, slot, tally).map_err(e)?;
                 }
@@ -1534,12 +1537,13 @@ fn run_as(
             }
             10 => {
                 if k.rng.below(4) == 0 {
-                    // One of main's clients dies; a new one starts.
-                    let i = k.rng.below(k.mains.len());
-                    end_checked(w, &mut k.o, &Client::Main(k.mains[i].clone())).map_err(e)?;
-                    tally.main_deaths += 1;
-                    k.mains[i] = format!("m{}", k.next_main);
-                    k.next_main += 1;
+                    // One of the root's clients dies; a new one starts.
+                    let i = k.rng.below(k.root_clients.len());
+                    end_checked(w, &mut k.o, &Client::Root(k.root_clients[i].clone()))
+                        .map_err(e)?;
+                    tally.root_deaths += 1;
+                    k.root_clients[i] = format!("m{}", k.next_root_client);
+                    k.next_root_client += 1;
                 } else if let Some(f) = k.rng.pick(&live_clients(w))
                     && k.rng.below(3) == 0
                 {
@@ -1656,7 +1660,7 @@ fn run_as(
         checkg(w, &mut k.o).map_err(e)?;
     }
     // Writes stop: every open file closes, every open transaction commits
-    // or rolls back; the queues drain; every fork equals main.
+    // or rolls back; the queues drain; every fork equals the root.
     close_all_checked(w, &mut k.o, tally).map_err(|e| (STEPS, e))?;
     for f in in_txn(w) {
         if k.rng.below(2) == 0 {
@@ -1714,7 +1718,7 @@ fn run_as(
     Ok(())
 }
 
-/// Rounds of client calls, each drained to convergence: saves by main and by
+/// Rounds of client calls, each drained to convergence: saves by the root and by
 /// forks (nested ones included), every kind of write call (line edits as bytes,
 /// raw `pwrite`s, partial appends, truncates, `O_TRUNC` opens, stale rewrites),
 /// unlinks, renames and rename-overs, and transactions begun and committed, with
@@ -1740,7 +1744,7 @@ fn rounds_as(
     gitledger::observe(w).map_err(|e| (0, e))?;
     let mut k = Calls::new(seed);
     k.o.reload(w);
-    let m1 = Client::Main("m1".into());
+    let m1 = Client::Root("m1".into());
     for round in 0..ROUNDS {
         for _ in 0..ROUND_CALLS {
             let (f, slot) = (FILES[k.rng.below(FILES.len())], k.rng.below(HOT_SLOTS));

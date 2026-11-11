@@ -87,7 +87,7 @@ git's ref files. It does not yet re-derive the rest from git; a later step does,
 |---|---|---|
 | The model's records | `landings`, `syncs`, `entered`, `collisions`, `ended`, `discarded`, `save_calls`, `last_take` | most checks |
 | Each change's edits | `World::edits` | `changes_whole`, `placed_and_unlinked`, `taken_only_past` |
-| Each tree's head | `World::head` and the fork list, not git's refs | `views`, the queue step's checks, `prefix_cut`, `delivered`, `entry_files`, `trees_equal_main` and others |
+| Each tree's head | `World::head` and the fork list, not git's refs | `views`, the queue step's checks, `prefix_cut`, `delivered`, `entry_files`, `trees_equal_root` and others |
 | A file at a commit, and ancestry | `World::file` and `World::is_ancestor`, over `World`'s caches of git objects | almost every check |
 | Queues, waits, opens and handles | `queue_numbered`, `waits`, `write_open`, `handles` | `locks`, `p1_first`, the queue step's checks |
 

@@ -20,8 +20,8 @@ use crate::git::{git, try_git};
 use crate::queue::{Entry, Take, name_key};
 use crate::recording::{Kind, Target};
 use crate::world::{
-    By, Collision, Decision, Direction, Landed, Life, Policies, Step, TxnEnd, TxnOutcome, World,
-    commit_parents, decisions_in, origin_in,
+    By, Collision, Decision, Direction, Landed, Life, Policies, Step, TreeNames, TxnEnd,
+    TxnOutcome, World, commit_parents, decisions_in, origin_in,
 };
 
 /// `r`'s error named for `check`: planted/matrix.tsv records the first check tripped.
@@ -39,9 +39,9 @@ pub struct Checked {
 }
 
 impl Checked {
-    pub fn new(policies: Policies) -> Self {
+    pub fn new(policies: Policies, names: TreeNames) -> Self {
         Self {
-            world: World::new(policies),
+            world: World::new(policies, names),
             checker: Checker::default(),
         }
     }
@@ -396,7 +396,7 @@ fn locks(w: &World) -> Result<(), String> {
     let queued = |t: TreeId, n: u64| w.queue_numbered(t).iter().any(|(m, _)| *m == n);
     for h in w.handles() {
         let alive = match &h.client {
-            Client::Main(n) => !w.ended_main().contains(n),
+            Client::Root(n) => !w.ended_root().contains(n),
             Client::Fork(f) | Client::Outside(f) => w.forks[f].life == Life::Open,
         };
         let held = match h.target {
@@ -515,14 +515,14 @@ fn diff_files(w: &World, a: &str, b: &str) -> BTreeSet<String> {
 }
 
 /// Once writes stop and every queue has drained: no step is left but
-/// drops, and every live fork's tree equals main's. Stronger than "each
-/// fork's untouched files equal main and touched files equal main or the
+/// drops, and every live fork's tree equals the root's. Stronger than "each
+/// fork's untouched files equal the root and touched files equal the root or the
 /// fork's newer non-colliding edit": once the queues drain, a fork has no
 /// newer edit left.
 fn check_converged(w: &World) -> Result<(), String> {
     named("check_converged", drained(w))?;
     named("losers_pushed", losers_pushed(w))?;
-    named("check_converged", trees_equal_main(w))
+    named("check_converged", trees_equal_root(w))
 }
 
 fn drained(w: &World) -> Result<(), String> {
@@ -542,13 +542,13 @@ fn drained(w: &World) -> Result<(), String> {
     Ok(())
 }
 
-fn trees_equal_main(w: &World) -> Result<(), String> {
+fn trees_equal_root(w: &World) -> Result<(), String> {
     for t in w.live_trees() {
         for p in PATHS {
-            let (mine, main) = (w.file(&w.head(t), p), w.file(&w.head(TreeId::ROOT), p));
-            if mine != main {
+            let (mine, root) = (w.file(&w.head(t), p), w.file(&w.head(TreeId::ROOT), p));
+            if mine != root {
                 return Err(format!(
-                    "{t:?}:{p} never converged: {mine:?} vs main's {main:?}"
+                    "{t:?}:{p} never converged: {mine:?} vs the root's {root:?}"
                 ));
             }
         }
@@ -707,7 +707,7 @@ impl Checker {
 /// fast-forwarded to) does, nor, for a result, `t`'s head. So a
 /// prefix sync that holds back
 /// the upstream's landing that carried a line upstream has not delivered
-/// main's decision against that line, nor a held-back commit's own.
+/// the root's decision against that line, nor a held-back commit's own.
 fn delivered(w: &World, t: TreeId, c: &Collision) -> bool {
     let Some(upstream) = w.upstream(t).get(1).copied() else {
         return true;
@@ -733,7 +733,7 @@ fn delivered(w: &World, t: TreeId, c: &Collision) -> bool {
 }
 
 impl Checker {
-    /// Main never silently loses a change, nor does any tree, and no stale
+    /// The root never silently loses a change, nor does any tree, and no stale
     /// version reverts a newer one: (a) in every live tree a line moves from
     /// version a to b only if b was written over a, or both are deletes (they
     /// agree, R10.3), or b is a delete agreeing with one written over a
@@ -907,7 +907,7 @@ impl Checker {
             let tree = w.trailer(&c.result, "Agentfs-Tree");
             if !decisions_in(w.repo(), &["-1", &c.result])
                 .iter()
-                .any(|(_, d)| *d == Decision::of(c) && d.tree == tree)
+                .any(|(_, d)| *d == Decision::of(c, w.names()) && d.tree == tree)
             {
                 return Err(format!(
                     "{c:?}: its result commit {:.7} in {tree} does not record it",
@@ -992,29 +992,26 @@ impl Checker {
 /// stays there attributable (owner, 2026-11-03: "yes, \"losing\" patches
 /// should still be part of the history. i want to know who changed what
 /// when"). Run once Replication has drained ([`check_converged`]). Read from
-/// the remote alone: the commits of its main's history hold exactly the
+/// the remote alone: the commits of the root's history there hold exactly the
 /// run's collision records, each in its result commit, which places the
-/// decision in main's order; each record's ref
+/// decision in the root's order; each record's ref
 /// names its losing commit; and each lost version is in its file there and was
 /// written by a commit naming that version's writer (who, what). The commit's date is kept as its
 /// audit "when" but never read to decide anything (rule 2), and not
 /// checked here.
 fn losers_pushed(w: &World) -> Result<(), String> {
     let remote = w.remote();
-    let exists = try_git(
-        remote,
-        &["rev-parse", "--verify", "-q", "refs/heads/main"],
-        None,
-    );
+    let root = w.names().branch(TreeId::ROOT);
+    let exists = try_git(remote, &["rev-parse", "--verify", "-q", &root], None);
     let records = if exists.code == 0 {
-        decisions_in(remote, &["refs/heads/main"])
+        decisions_in(remote, &[&root])
     } else {
         Vec::new()
     };
     let mut want: Vec<String> = w
         .collisions
         .iter()
-        .map(|c| format!("{} {:?}", c.result, Decision::of(c)))
+        .map(|c| format!("{} {:?}", c.result, Decision::of(c, w.names())))
         .collect();
     let mut got: Vec<String> = records
         .iter()
@@ -1024,7 +1021,7 @@ fn losers_pushed(w: &World) -> Result<(), String> {
     got.sort();
     if want != got {
         return Err(format!(
-            "the remote main's collision records {got:?} are not the run's collisions {want:?}"
+            "the remote root's collision records {got:?} are not the run's collisions {want:?}"
         ));
     }
     for (_, c) in &records {
@@ -1079,7 +1076,7 @@ fn losers_pushed(w: &World) -> Result<(), String> {
 /// the branch of a transaction of fork `c.tree`.
 fn decided_at_the_upstreams_queue(w: &World, c: &Collision) -> bool {
     let cause = w.trailer(&c.result, "Agentfs-Cause");
-    if w.trailer(&c.result, "Agentfs-Tree") != World::name(c.tree) {
+    if w.trailer(&c.result, "Agentfs-Tree") != w.names().name(c.tree) {
         return false;
     }
     let from = w.trailer(&c.loser, "Agentfs-Tree");
@@ -1247,7 +1244,7 @@ impl Checker {
     fn syncs_deliver(&mut self, w: &World) -> Result<(), String> {
         for (t, up, result, entered) in &w.syncs[self.read.syncs..] {
             let Some(upstream) = w.upstream_of(*t) else {
-                return Err("main synced".into());
+                return Err("the root synced".into());
             };
             let took = taken_by(w, upstream, *entered);
             let held_back = |id: &str| held_back(w, upstream, up, id);
@@ -1438,7 +1435,7 @@ impl Checker {
         let mut seen = BTreeMap::new();
         for f in w.forks.values().filter(|f| f.txn.is_some()) {
             let txn = f.txn.as_ref().expect("open");
-            let (tree, head) = (World::name(f.id), f.head.clone());
+            let (tree, head) = (w.names().name(f.id), f.head.clone());
             if let Some((at, files)) = self.txn_files_seen.get(&txn.id) {
                 let files: &BTreeSet<String> = files;
                 let mut c = head.clone();
@@ -1584,8 +1581,8 @@ impl Checker {
     /// files at one path, which the model refuses outright.) One exception, a
     /// cost: a fork that holds a name version of the renamed file other than
     /// its upstream's (it has not synced since the upstream's queue decided it), or
-    /// a fork's version main has not taken (a sync kept it as undecided, in
-    /// this fork or a tree above it that this fork synced from); main has no
+    /// a fork's version the root has not taken (a sync kept it as undecided, in
+    /// this fork or a tree above it that this fork synced from); the root has no
     /// such exception. A delete of the renamed file that agrees with one written
     /// over the rename is not half a rename-over (R10.3, [`Self::deleted_over`]).
     fn rename_overs_whole(&self, w: &World) -> Result<(), String> {

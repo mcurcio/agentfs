@@ -17,21 +17,21 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
-/// Who makes a call: one of main's programs, or a fork's.
+/// Who makes a call: one of the root's programs, or a fork's.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Caller {
-    Main(String),
+    Root(String),
     Fork(TreeId),
 }
 
-/// A program writing through a view: one of main's clients (by writer
+/// A program writing through a view: one of the root's clients (by writer
 /// name), a fork's client, or another program in that fork. Only
 /// [`Client::Fork`] begins a transaction and writes in it; [`Client::Outside`]
 /// always writes in the fork's tree, and so meets a transaction's files
 /// (R5.3). Both name the fork's one writer (rule 6).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Client {
-    Main(String),
+    Root(String),
     Fork(TreeId),
     Outside(TreeId),
 }
@@ -308,15 +308,15 @@ fn unhex(s: &str) -> Result<Vec<u8>, CallError> {
 
 fn caller(c: &Caller) -> String {
     match c {
-        Caller::Main(n) => format!("m:{}", hex(n.as_bytes())),
+        Caller::Root(n) => format!("r:{}", hex(n.as_bytes())),
         Caller::Fork(f) => format!("f:{}", f.number()),
     }
 }
 
 fn parse_caller(s: &str) -> Result<Caller, CallError> {
-    if let Some(n) = s.strip_prefix("m:") {
+    if let Some(n) = s.strip_prefix("r:") {
         return String::from_utf8(unhex(n)?)
-            .map(Caller::Main)
+            .map(Caller::Root)
             .map_err(|e| CallError::new(e.to_string()));
     }
     s.strip_prefix("f:")
@@ -706,7 +706,7 @@ mod tests {
         let calls = vec![
             RecordedCall::Fork { id: TreeId::new(1) },
             RecordedCall::OpenTrunc {
-                caller: Caller::Main("m 1".into()),
+                caller: Caller::Root("m 1".into()),
                 path: "a".into(),
                 h: 7,
             },

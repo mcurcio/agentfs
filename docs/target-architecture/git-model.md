@@ -303,7 +303,7 @@ simply comes after it (the owner, 2026-11-08, finding 49: "Without any other inf
 Obviously atomic operations are more reliable"; R9). Each wait ends on an event: the last close wakes a take,
 and a client's end event (exit or death, a client of any tree alike) closes its files, saving their write
 calls as the kernel's close would (a choice) (`r9_client_death_releases_its_locks`,
-`r9_a_main_clients_death_releases_its_locks`). A transaction's opens are on its frozen branch and never wait.
+`r9_a_now_dead_root_client_releases_its_locks`). A transaction's opens are on its frozen branch and never wait.
 *Choice:* a landing locks every file its changes touch, a losing change's files included, not only the files
 its plan writes (R9.1, `r9_a_landing_holds_the_files_of_its_losing_changes`). Cost: a take waits for a file's
 open writer even when its change to that file loses.
@@ -701,7 +701,7 @@ One history mode. The owner, 2026-11-05: "drop squashing". Every fork commit sta
 | The upstream's history | reaches every landed fork commit, a losing one included |
 | A losing change | a merge in the upstream's history, with the upstream's tree unchanged, named by its collision ref |
 
-(`r7_every_fork_commit_lands_on_its_own_in_mains_history`, `r7_main_reaches_a_losing_commit_and_its_ref_keeps_it`.)
+(`r7_every_fork_commit_lands_on_its_own_in_the_roots_history`, `r7_the_root_reaches_a_losing_commit_and_its_ref_keeps_it`.)
 
 ## 12. Crash recovery and convergence
 
@@ -808,7 +808,7 @@ policy of this revision included. Every check runs after every step, in every sc
 | A sync never delivers past the first change to an open file: it delivers an upstream commit, in order, overwrites no open file, and the first commit it holds back names an open file (P2, §6) | `step_checked` (`prefix_cut`) | `r9_a_sync_delivers_up_to_the_first_change_to_an_open_file`, `r9_a_prefix_sync_holds_back_a_transaction_whole`, every random run |
 | The upstream wins every collision, decided only at its queue, losing commit reachable, the decision in the take's result commit, which names its tree | `upstream_wins` | `r3_landing_collision_the_upstream_wins`, `r3_a_collision_is_recorded_once_at_the_upstreams_queue`, `r10_a_delete_against_a_concurrent_edit_the_upstream_wins`, `r10_a_move_is_a_delete_plus_an_insert` |
 | An edit over the upstream's current line replaces it (a save after a sync); before the sync, or over an undecided line, it collides | `upstream_wins` | `r3_fast_forward_when_the_base_is_current`, `r3_a_save_after_the_sync_wins_upstream_by_lineage`, `r3_a_save_before_the_sync_arrives_loses_to_the_upstream`, `r3_an_edit_over_the_decided_line_replaces_it`, `r3_an_edit_over_an_undecided_line_still_collides` |
-| No partial save or transaction ever reaches an upstream: each change a take judged lost or won, never both; one that lost has none of its versions in the result and every one named; one that won has every one in the result | `changes_whole`, `upstream_wins` | `r3_a_save_loses_whole_with_its_clean_lines`, `r3_a_change_whose_delete_agrees_lands_whole`, `r3_a_later_save_after_a_losing_one_is_judged_on_its_own`, `r3_a_transaction_loses_whole_and_is_told`, `r3_a_committed_transaction_loses_whole_at_main`, `r3_a_file_rule_loss_costs_the_whole_change`, `r4_nested_changes_land_whole_or_lose_whole_at_every_level`, `r10_a_move_is_a_delete_plus_an_insert`, every random run |
+| No partial save or transaction ever reaches an upstream: each change a take judged lost or won, never both; one that lost has none of its versions in the result and every one named; one that won has every one in the result | `changes_whole`, `upstream_wins` | `r3_a_save_loses_whole_with_its_clean_lines`, `r3_a_change_whose_delete_agrees_lands_whole`, `r3_a_later_save_after_a_losing_one_is_judged_on_its_own`, `r3_a_transaction_loses_whole_and_is_told`, `r3_a_committed_transaction_loses_whole_at_the_root`, `r3_a_file_rule_loss_costs_the_whole_change`, `r4_nested_changes_land_whole_or_lose_whole_at_every_level`, `r10_a_move_is_a_delete_plus_an_insert`, every random run |
 | Two changes never cost each other: neighbouring lines of two changes both apply | `upstream_wins`, `no_silent_loss` | `r3_neighbouring_lines_merge_per_line`, `random_interleavings_adjacent_lines` |
 | A sync records no collision and carries the upstream's head as it was then | `step_checked` | `r3_a_sync_carries_the_upstreams_current_version`, `r3_a_fork_never_flips_back_to_its_own_edit` |
 | Every sync delivers the decided version, keeping only undecided own lines | `syncs_deliver` | `r3_a_sync_keeps_the_undecided_saves` |
@@ -817,7 +817,7 @@ policy of this revision included. Every check runs after every step, in every sc
 | Every change traces to one writer | `one_writer` | `r6_a_sync_is_a_merge_with_the_upstream_second` |
 | Every losing change is replicated, eventually, and stays: once Replication drains, the commits of the remote main's history hold the run's collisions, each re-read on the shared remote alone, its writer and line | `losers_pushed` | `r3_a_save_before_the_sync_arrives_loses_to_the_upstream`, every collision |
 | Nested forks follow the same rules | all checks | `r4_nested_forks_follow_the_same_rules` |
-| Full lineage, read by ancestry alone: a tree's history reaches every change it took | `full_lineage` | `r7_every_fork_commit_lands_on_its_own_in_mains_history`, `r7_main_reaches_a_losing_commit_and_its_ref_keeps_it`, `random_interleavings_full_lineage` |
+| Full lineage, read by ancestry alone: a tree's history reaches every change it took | `full_lineage` | `r7_every_fork_commit_lands_on_its_own_in_the_roots_history`, `r7_the_root_reaches_a_losing_commit_and_its_ref_keeps_it`, `random_interleavings_full_lineage` |
 | Trees converge when writes stop | `check_converged` | `convergence_when_writes_stop` |
 | No clock decides anything | canonical text compare (`digest.rs`) | `r2_no_clock_commit_dates_decide_nothing`, `random_interleavings_commit_dates_decide_nothing` |
 

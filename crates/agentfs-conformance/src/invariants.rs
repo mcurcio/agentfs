@@ -4,6 +4,7 @@
 //! library's bookkeeping. `check::save_aligned` is shared with the model, over the
 //! model's `Content`.
 
+use crate::ENGINE_ROOT;
 use agentfs_model::calls::{
     Caller, Recorded, RecordedCall, Shown, ShownCollision, Took, TreeCalls, TreeId,
     gather_collisions,
@@ -414,7 +415,7 @@ impl Invariants {
 
     fn refname(&self, t: TreeId) -> Result<String, String> {
         match t {
-            TreeId::ROOT => Ok("refs/heads/main".into()),
+            TreeId::ROOT => Ok(format!("refs/heads/{ENGINE_ROOT}")),
             f => self
                 .forks
                 .get((f.number() as usize).wrapping_sub(1))
@@ -439,7 +440,7 @@ impl Invariants {
 
     /// Tree `t`'s object behind each file identity, from its table in git. A
     /// commit's own numbers are those of the tree that wrote it: a fast-forward
-    /// leaves a sandbox on main's commit, its objects still its own.
+    /// leaves a sandbox on the root's commit, its objects still its own.
     fn object_table(&self, t: TreeId) -> Result<BTreeMap<u64, u64>, String> {
         let tree = self.refname(t)?;
         let tree = tree.strip_prefix("refs/heads/").unwrap_or(&tree);
@@ -526,7 +527,7 @@ impl Invariants {
 
     fn tree_of(c: &Caller) -> TreeId {
         match c {
-            Caller::Main(_) => TreeId::ROOT,
+            Caller::Root(_) => TreeId::ROOT,
             Caller::Fork(f) => *f,
         }
     }
@@ -573,8 +574,8 @@ impl Invariants {
                         .unwrap_or(0)
                 });
                 self.forks = names;
-                let main = self.trees.get(&TreeId::ROOT).cloned().unwrap_or_default();
-                self.trees.insert(*id, main);
+                let root = self.trees.get(&TreeId::ROOT).cloned().unwrap_or_default();
+                self.trees.insert(*id, root);
             }
             RecordedCall::OpenWrite { caller, path, h } => {
                 self.opened(caller, path, *h, Vec::new())?;
@@ -870,8 +871,8 @@ impl Invariants {
         Ok(())
     }
 
-    /// Queues empty, every tree holds main's files, and every save of every tree is
-    /// in main's history (R7).
+    /// Queues empty, every tree holds the root's files, and every save of every tree
+    /// is in the root's history (R7).
     fn drained<T: TreeCalls>(&mut self, t: &T) -> Result<(), String> {
         let queued = self
             .git
@@ -879,13 +880,13 @@ impl Invariants {
         if !queued.trim().is_empty() {
             return Ok(());
         }
-        let main_paths = t.paths(TreeId::ROOT).map_err(|e| e.to_string())?;
+        let root_paths = t.paths(TreeId::ROOT).map_err(|e| e.to_string())?;
         let ids: Vec<TreeId> = self.trees.keys().copied().collect();
         for id in ids {
             let paths = t.paths(id).map_err(|e| e.to_string())?;
-            if paths != main_paths {
+            if paths != root_paths {
                 return Err(format!(
-                    "converged: {id:?} has {paths:?}, main {main_paths:?}"
+                    "converged: {id:?} has {paths:?}, the root {root_paths:?}"
                 ));
             }
             for p in &paths {
@@ -894,19 +895,21 @@ impl Invariants {
                     t.read(TreeId::ROOT, p).map_err(|e| e.to_string())?,
                 );
                 if a != b {
-                    return Err(format!("converged: {id:?}:{p} differs from main's"));
+                    return Err(format!("converged: {id:?}:{p} differs from the root's"));
                 }
             }
         }
         let reached: BTreeSet<String> = self
             .git
-            .run(&["rev-list", "refs/heads/main"])?
+            .run(&["rev-list", &format!("refs/heads/{ENGINE_ROOT}")])?
             .lines()
             .map(str::to_owned)
             .collect();
         for (oid, c) in &self.commits {
             if c.trailers("Agentfs-Cause") == ["Direct"] && !reached.contains(oid) {
-                return Err(format!("full_lineage: {oid:.7} is not in main's history"));
+                return Err(format!(
+                    "full_lineage: {oid:.7} is not in the root's history"
+                ));
             }
         }
         Ok(())
@@ -1137,7 +1140,10 @@ mod tests {
 
         fn invariants(&self) -> Invariants {
             let root = self.commit(&[], "Root", Some(&[]));
-            self.git(&["update-ref", "refs/heads/main", &root], b"");
+            self.git(
+                &["update-ref", &format!("refs/heads/{ENGINE_ROOT}"), &root],
+                b"",
+            );
             Invariants::new(self.dir.path()).unwrap()
         }
     }
@@ -1242,26 +1248,26 @@ mod tests {
         }
     }
 
-    /// Main and fork 1 showing `main` and `fork` at path `a`.
-    fn shows(main: &[u8], fork: &[u8]) -> Shows {
+    /// The root and fork 1 showing `root` and `fork` at path `a`.
+    fn shows(root: &[u8], fork: &[u8]) -> Shows {
         let tree = |bytes: &[u8]| BTreeMap::from([("a".to_owned(), bytes.to_vec())]);
         Shows(BTreeMap::from([
-            (TreeId::ROOT, tree(main)),
+            (TreeId::ROOT, tree(root)),
             (TreeId::new(1), tree(fork)),
         ]))
     }
 
-    /// `Invariants` over a new repository with a fork 1 to check, and its main tip.
+    /// `Invariants` over a new repository with a fork 1 to check, and its root's tip.
     fn with_fork(repo: &Repo) -> (Invariants, String) {
         let mut inv = repo.invariants();
         inv.trees.insert(TreeId::new(1), OracleTree::default());
-        let tip = repo.git(&["rev-parse", "refs/heads/main"], b"");
+        let tip = repo.git(&["rev-parse", &format!("refs/heads/{ENGINE_ROOT}")], b"");
         (inv, tip)
     }
 
-    /// R7: once the queues are empty every tree holds main's files.
+    /// R7: once the queues are empty every tree holds the root's files.
     #[test]
-    fn converged_fails_when_a_tree_differs_from_main() {
+    fn converged_fails_when_a_tree_differs_from_the_root() {
         let repo = Repo::new();
         let (mut inv, _) = with_fork(&repo);
         assert_eq!(inv.drained(&shows(b"x\n", b"x\n")), Ok(()));
@@ -1269,14 +1275,17 @@ mod tests {
         assert!(error.contains("converged:"), "{error}");
     }
 
-    /// R7: once the queues are empty every save of every tree is in main's history.
+    /// R7: once the queues are empty every save of every tree is in the root's history.
     #[test]
-    fn full_lineage_fails_when_a_save_is_not_in_mains_history() {
+    fn full_lineage_fails_when_a_save_is_not_in_the_roots_history() {
         let repo = Repo::new();
         let (mut inv, tip) = with_fork(&repo);
-        let on_main = repo.commit(&[&tip], "Direct", Some(&["m"]));
-        repo.git(&["update-ref", "refs/heads/main", &on_main], b"");
-        inv.commit(&on_main).unwrap();
+        let on_root = repo.commit(&[&tip], "Direct", Some(&["m"]));
+        repo.git(
+            &["update-ref", &format!("refs/heads/{ENGINE_ROOT}"), &on_root],
+            b"",
+        );
+        inv.commit(&on_root).unwrap();
         assert_eq!(inv.drained(&shows(b"x\n", b"x\n")), Ok(()));
         let stray = repo.commit(&[&tip], "Direct", Some(&["s"]));
         inv.commit(&stray).unwrap();
@@ -1295,19 +1304,18 @@ mod tests {
         repo.git(
             &[
                 "update-ref",
-                &format!("refs/collisions/main/{incoming}"),
+                &format!("refs/collisions/{ENGINE_ROOT}/{incoming}"),
                 &incoming,
             ],
             b"",
         );
-        let trailers = concat!(
-            "Agentfs-Tree: main\n",
+        let trailers = format!(
+            "Agentfs-Tree: {ENGINE_ROOT}\n{}{}\n",
             r#"Agentfs-Collisions: [{"lost":{"Line":{"file":1,"version":"f"}},"#,
             r#""winner":{"Line":{"file":1,"version":"u"}},"kind":"Line"}]"#,
-            "\n"
         );
         let landing = |lines: &[&str]| {
-            repo.commit_with(&[&before, &incoming], "Landing", Some(lines), trailers)
+            repo.commit_with(&[&before, &incoming], "Landing", Some(lines), &trailers)
         };
         let mut inv = repo.invariants();
         let keeps_upstream = landing(&["u", "w"]);

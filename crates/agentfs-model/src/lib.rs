@@ -8,7 +8,7 @@
 //! via native git operations." And, the same day: "I generally like the
 //! metaphor of a typical Linux filesystem. I want to try that out."
 //!
-//! [`world`] drives the real `git` program in a temporary repository: main
+//! [`world`] drives the real `git` program in a temporary repository: the root
 //! and each fork are branches, each save a commit naming one writer. A
 //! collision between a fork and its upstream is decided only at the upstream's
 //! landing queue, per line: a line written over the upstream's replaces it,
@@ -18,7 +18,7 @@
 //! the fork takes the upstream's decided version, keeping only its own lines
 //! still on their way to that queue. Every losing commit keeps a collision
 //! ref and a record in its take's result commit, which a separate
-//! Replication step pushes with main to a bare shared remote. A file is a
+//! Replication step pushes with the root to a bare shared remote. A file is a
 //! byte buffer and a program's calls are POSIX byte calls ([`recording::Write`]):
 //! a save is those calls applied at close to its tree's head, line
 //! identity derived from the bytes then: an append is exact (finishing a

@@ -1,12 +1,13 @@
 //! The shared calls on a real mount: `open(2)`, `pwrite(2)`, `ftruncate(2)`,
-//! `close(2)`, `rename(2)` and `unlink(2)` against one process serving main and
-//! at most one sandbox. Linux only, with `/dev/fuse` and `fusermount3`.
+//! `close(2)`, `rename(2)` and `unlink(2)` against one process serving the root
+//! and at most one sandbox. Linux only, with `/dev/fuse` and `fusermount3`.
 //!
 //! The process is a failpoints build with `AGENTFS_TAKE_GATE` set: it takes
 //! nothing by itself. Each take runs at the trace's point and answers on a fifo,
 //! so a take crosses FUSE at that point and needs no poll. Cost: this replay never
 //! exercises automatic takes (R1); the mounted P1 and P2 cases cover those.
 
+use crate::ENGINE_ROOT;
 use crate::library::{fail, seed};
 use agentfs_core::tree_actor::Volume;
 use agentfs_model::calls::{CallError, Caller, Took, TreeCalls, TreeId};
@@ -38,11 +39,11 @@ fn c_path(p: &Path) -> Result<CString, CallError> {
     CString::new(p.as_os_str().as_bytes()).map_err(|e| CallError::new(e.to_string()))
 }
 
-/// A mount of main and at most one sandbox, and the opens this harness holds.
+/// A mount of the root and at most one sandbox, and the opens this harness holds.
 pub struct Mounted {
     bin: PathBuf,
     state: PathBuf,
-    main: PathBuf,
+    root: PathBuf,
     sandbox: PathBuf,
     gate: PathBuf,
     fork: Option<String>,
@@ -65,13 +66,13 @@ impl Mounted {
         with_sandbox: bool,
         appends: Vec<bool>,
     ) -> Result<Self, CallError> {
-        let (state, main, sandbox, gate) = (
+        let (state, root, sandbox, gate) = (
             work.join("state"),
-            work.join("main"),
+            work.join("root"),
             work.join("sandbox"),
             work.join("gate"),
         );
-        for dir in [&main, &sandbox, &gate] {
+        for dir in [&root, &sandbox, &gate] {
             std::fs::create_dir_all(dir).map_err(|e| io_fail("mkdir", &e))?;
         }
         let fork = {
@@ -103,7 +104,7 @@ impl Mounted {
             bin: bin.to_owned(),
             log: work.join("mount.log"),
             state,
-            main,
+            root,
             sandbox,
             gate,
             fork,
@@ -124,7 +125,7 @@ impl Mounted {
     }
 
     fn mountpoints(&self) -> Vec<PathBuf> {
-        let mut points = vec![self.main.clone()];
+        let mut points = vec![self.root.clone()];
         if self.fork.is_some() {
             points.push(self.sandbox.clone());
         }
@@ -142,7 +143,7 @@ impl Mounted {
             .arg("--state")
             .arg(&self.state)
             .args(["trees", "mount"])
-            .arg(&self.main)
+            .arg(&self.root)
             .env("AGENTFS_TAKE_GATE", &self.gate)
             .stdin(Stdio::null())
             .stdout(log.try_clone().map_err(|e| io_fail("mount log", &e))?)
@@ -183,14 +184,14 @@ impl Mounted {
 
     fn root(&self, t: TreeId) -> &Path {
         match t {
-            TreeId::ROOT => &self.main,
+            TreeId::ROOT => &self.root,
             _ => &self.sandbox,
         }
     }
 
     fn at(&self, c: &Caller, path: &str) -> PathBuf {
         match c {
-            Caller::Main(_) => self.main.join(path),
+            Caller::Root(_) => self.root.join(path),
             Caller::Fork(_) => self.sandbox.join(path),
         }
     }
@@ -369,7 +370,7 @@ impl TreeCalls for Mounted {
 
     fn take_next(&mut self, t: TreeId) -> Result<Took, CallError> {
         let tree = match t {
-            TreeId::ROOT => "main".to_owned(),
+            TreeId::ROOT => ENGINE_ROOT.to_owned(),
             _ => self
                 .fork
                 .clone()
