@@ -353,9 +353,9 @@ id = "deferred_calls_applied_out_of_order"
 rule = "R5.3"
 seeds = 64
 find = '''
-        let id = fork.deferred.pop_front()?;'''
+        self.deferred.get_mut(&f)?.pop_front()'''
 replace = '''
-        let id = fork.deferred.pop_back()?;'''
+        self.deferred.get_mut(&f)?.pop_back()'''
 
 [[bug]]
 id = "rollback_drops_deferred_calls"
@@ -366,19 +366,19 @@ find = '''
         while self.apply_deferred(f).is_some() {}'''
 replace = '''
         self.rollback_only(f)?;
-        self.forks.get_mut(&f).expect("fork").deferred.clear();'''
+        while self.queues.next_deferred(f).is_some() {}'''
 
 [[bug]]
 id = "crash_drops_deferred_calls"
 rule = "R5.3"
 seeds = 64
 find = '''
-        self.waits.clear();
+        self.queues.clear_waits();
         let replay = self'''
 replace = '''
-        self.waits.clear();
-        for f in self.forks.values_mut() {
-            for h in f.deferred.drain(..) {
+        self.queues.clear_waits();
+        for f in self.forks.keys() {
+            while let Some(h) = self.queues.next_deferred(*f) {
                 self.recording.remove(h);
             }
         }
@@ -423,9 +423,9 @@ id = "p46s_sync_name_keys_from_the_parent"
 rule = "R9.1"
 seeds = 64
 find = '''
-            let after = tree.as_deref().unwrap_or(ours);'''
+        let after = tree.unwrap_or(ours);'''
 replace = '''
-            let after = c;'''
+        let after = c;'''
 
 [[bug]]
 id = "p47_unlink_loses_to_a_line_of_a_file_unlinked_too"
@@ -453,8 +453,8 @@ id = "converge_move_queues_one_child_only"
 rule = "R1"
 seeds = 64
 find = '''
-        for c in self.children(t) {
+        for &c in children {
             self.next_seq += 1;'''
 replace = '''
-        for c in self.children(t).into_iter().take(1) {
+        for &c in children.iter().take(1) {
             self.next_seq += 1;'''

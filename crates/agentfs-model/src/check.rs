@@ -17,10 +17,11 @@ use lineage::Lineage;
 use crate::calls::TreeId;
 use crate::content::{Content, Line, PATHS, State, is_root, writer_of};
 use crate::git::{git, try_git};
+use crate::queue::{Entry, Take, name_key};
 use crate::recording::{Kind, Target};
 use crate::world::{
-    By, Client, Collision, Decision, Direction, Entry, Landed, Life, Policies, Step, Take, TxnEnd,
-    TxnId, TxnOutcome, World, commit_parents, decisions_in, name_key, origin_in,
+    By, Client, Collision, Decision, Direction, Landed, Life, Policies, Step, TxnEnd, TxnId,
+    TxnOutcome, World, commit_parents, decisions_in, origin_in,
 };
 
 /// `r`'s error named for `check`: planted/matrix.tsv records the first check tripped.
@@ -292,11 +293,12 @@ fn after_step(w: &World, b: Before, taken: usize) -> Result<usize, String> {
         ));
     }
     let Take::Sync {
-        up: to, head: read, ..
+        cut, head: read, ..
     } = &take.take
     else {
         return Ok(taken);
     };
+    let to = &cut.up().to_string();
     let Some(head) = up else {
         return Err(format!("{t:?}'s entry {n}, a landing, was taken as a sync"));
     };
@@ -401,7 +403,7 @@ fn locks(w: &World) -> Result<(), String> {
             Target::Txn(f, n) => w.forks[&f].txn.as_ref().is_some_and(|x| x.id == n),
             // R5.3: a deferred call lives only behind its open transaction.
             Target::Tree(f) if h.deferred && w.upstream_of(f).is_some() => {
-                w.forks[&f].txn.is_some() && w.forks[&f].deferred.contains(&h.id)
+                w.forks[&f].txn.is_some() && w.deferred(f).contains(&h.id)
             }
             Target::Tree(_) => h.kind == Kind::Write,
         };

@@ -2038,12 +2038,12 @@ fn r5_io_on_a_transactions_files_is_deferred_past_its_commit() {
     w.close(reopened);
     ok(&mut w);
     assert_eq!(w.head(t), start, "none of it moved the fork");
-    assert_eq!(w.forks[&f].deferred.len(), 4);
+    assert_eq!(w.deferred(f).len(), 4);
     assert!(w.path_of(t, "b").is_some() && w.path_of(t, "d").as_deref() == Some("d"));
 
     assert_eq!(w.commit_txn(f), Ok(TxnOutcome::Committed));
     ok(&mut w);
-    assert!(w.forks[&f].deferred.is_empty());
+    assert!(w.deferred(f).is_empty());
     assert!(w.handles().next().is_none());
     let result = w.ended.last().unwrap().result.clone().unwrap();
     assert!(has(&w, f, "a", &staged) || w.file(&result, "a").holds(&staged));
@@ -2073,7 +2073,7 @@ fn r5_a_path_call_after_a_take_defers() {
     w.save(&m1(), "b", 1);
     take(&mut w, &Step::Next(t));
     w.unlink(&other, "b");
-    let h = *w.forks[&f].deferred.back().expect("it defers");
+    let h = *w.deferred(f).last().expect("it defers");
     assert!(w.handle(h).deferred);
     assert!(w.path_of(t, "b").is_some());
     assert_eq!(w.commit_txn(f), Ok(TxnOutcome::Committed));
@@ -2155,7 +2155,7 @@ fn r5_a_crash_keeps_what_a_transaction_deferred() {
     w.crash();
     ok(&mut w);
     assert_eq!(w.head(t), start, "still behind the transaction");
-    assert_eq!(w.forks[&f].deferred.len(), 3);
+    assert_eq!(w.deferred(f).len(), 3);
     assert!(w.handles().all(|h| h.deferred));
     assert_eq!(w.commit_txn(f), Ok(TxnOutcome::Committed));
     ok(&mut w);

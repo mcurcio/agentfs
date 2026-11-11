@@ -4,16 +4,16 @@
 //! | Rule (MODEL.md) | Here |
 //! |---|---|
 //! | 1. Like a Linux filesystem | a close ([`World::close`]) is never refused; its save is a commit on the writer's tree at once, its first parent the tree's head at that moment |
-//! | 2. One landing queue per tree | [`World::queue_len`]: a FIFO of [`Entry`]s per tree; a [`Step::Next`] takes its head, or records that it waits (rule 9) |
+//! | 2. One landing queue per tree | [`World::queue_len`]: a FIFO of [`Entry`](crate::queue::Entry)s per tree (`queue`); a [`Step::Next`] takes its head, or records that it waits (rule 9) |
 //! | 3. The upstream's queue decides | `land` (a fork's commit into its upstream) is the only place a collision with the upstream is decided, through `judge` and the referee's land (`referee`, called by `resolve`): per line, a line written over the upstream's replaces it, a stale one is dropped, and of two concurrent lines the upstream's wins; then each change (a save, a transaction's commit) is judged whole: one lost line and none of it applies (rule 3e). `sync` decides nothing: it takes the upstream's version and keeps only the fork's lines the upstream's queue has not taken yet (the referee's sync, called by `adopt`) |
 //! | 4. Nothing waits behind a collision | there is no held state: a collision is recorded as a [`Collision`] and in git (a trailer of the take's result commit, [`COLLISION`]), the fork's losing commit kept under `refs/collisions/<n>`, which Replication later pushes to the shared remote with main ([`Step::Replicate`], due on every move of main and every collision), and the queue moves on |
-//! | 5. Transactions | [`World::begin`]: a branch `txn/<n>` frozen at the fork's head; [`World::commit_txn`] lands it in the fork like a child's commit, whole or not at all (the fork is its upstream, so the fork's lines win), and answers whether it lost, with every staged line that did not apply; [`World::rollback`] drops it. While one is open, other I/O on its files in the fork is accepted and applies in order after it ends ([`Fork::deferred`], R5.3) |
+//! | 5. Transactions | [`World::begin`]: a branch `txn/<n>` frozen at the fork's head; [`World::commit_txn`] lands it in the fork like a child's commit, whole or not at all (the fork is its upstream, so the fork's lines win), and answers whether it lost, with every staged line that did not apply; [`World::rollback`] drops it. While one is open, other I/O on its files in the fork is accepted and applies in order after it ends ([`World::deferred`], kept by `queue`, R5.3) |
 //! | 6. Attribution | every commit names one writer in an `Agentfs-Writer` trailer; a sync is a merge with the upstream's commit as second parent |
 //! | 7. Full lineage | a landing is a merge with the fork's commit as second parent (or a fast-forward), so a tree's history reaches every change it took, the losers included; each fork commit lands on its own |
 //! | 8. A save records the write calls | [`World::write`] keeps each byte call ([`Write`](crate::recording::Write): an `O_APPEND` write, `pwrite`, `ftruncate`; [`World::open_trunc`] for `O_TRUNC`) on the open file; [`World::close`] applies them to the tree's head then: an append's bytes go after the file's last byte, finishing a partial last line (a version of it) and then making new lines; other calls leave bytes the save aligns with the head's lines (rule 10). [`World::edit`] makes a test's line edit as a program's byte calls (`program`) |
 //! | 9. A take locks the files it overwrites | [`World::open_write`]; a [`Step::Next`] whose sync or landing would overwrite a file open for writing in that tree waits ([`World::waits`]) until the close; else it takes its entry, locks its files and writes them in that one step ([`World::last_take`]), so no call runs while a take holds a file (the owner, 2026-11-08, finding 49: "B"); a client's death ([`World::end_client`], [`World::end_main_client`]) closes its files |
 //! | 10. Line identity | a save derives identities from the bytes at close: it aligns them with the head's lines once, by git's histogram diff (`align`), and records the result: each new line an identity, each changed line a new version written over the version it replaced; the referee and a sync then compare versions of one identity, never bytes or positions (the referee: `referee/placing.rs` places them); a line a landing would put after the upstream's unfinished last line collides with it (R10.4), and so does an unfinished line a landing would put in front of a line the upstream keeps (R10.8); until the upstream decides, a sync hides the upstream's unfinished last line in front of an undecided line (R10.6) and the upstream's lines after an undecided unfinished line (R10.9) |
-//! | 9, progress (git-model.md §6) | P1: a [`Step::Next`] takes the first entry no earlier waiting entry shares a file or a source with (`scan`), so several may wait ([`World::waits`]); no call ever waits on a waiting entry (P3 is gone, the owner's decision of 2026-11-04): a new open of a file a waiting entry waits for is granted; P2, the prefix sync: a sync delivers the upstream's commits in order up to the first whose delivery would overwrite a file open for writing in the fork, and waits for the rest (`prefix`) |
+//! | 9, progress (git-model.md §6) | P1: a [`Step::Next`] takes the first entry no earlier waiting entry shares a file or a source with (`queue`'s scan), so several may wait ([`World::waits`]); no call ever waits on a waiting entry (P3 is gone, the owner's decision of 2026-11-04): a new open of a file a waiting entry waits for is granted; P2, the prefix sync: a sync delivers the upstream's commits in order up to the first whose delivery would overwrite a file open for writing in the fork, and waits for the rest (`queue`'s prefix, its `Cut`) |
 //! | 11. Deletes and renames | a file's name line: [`World::rename`] writes a new version, [`World::unlink`] a deleted one; the referee's land applies the per-line rule to it and couples a file's existence with its content. [`World::create`] makes a file (an unborn identity); an open holds an object ([`Handle::object`](crate::recording::Handle::object)), so a close saves to the file its object is named by ([`World::named`]) or, for an orphan, nothing ([`Orphan`](crate::recording::Orphan), kept by `recording`); a rename-over from a new file is an atomic save, a rewrite of the replaced file |
 //! | 12. The journal (git-model.md §3) | an open's calls are its journal; [`World::crash`] saves each open from it once (the `Agentfs-Open` trailer, [`World::saved`]); a take is one step, so none is in progress at a crash |
 //!
@@ -21,7 +21,7 @@
 //! from the queues and from git history.
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -34,6 +34,7 @@ use crate::content::{Content, Layout, Line, PATHS, UNBORN};
 use crate::git::{git, git_in, try_git};
 use crate::program;
 pub use crate::program::LineEdit;
+use crate::queue::{self, Choice, Cut, Entry, Keys, Queues, Take, TakeRecord, Waiting, name_key};
 use crate::recording::{
     self, Files, Handle, HandleId, Kind, Recording, Save, Saved, Target, Write,
 };
@@ -114,20 +115,6 @@ pub struct Fork {
     pub life: Life,
     pub head: String,
     pub txn: Option<Txn>,
-    /// R5.3: the calls on an open transaction's files, in the order they
-    /// were made. Each returned at once; each applies, in this order, after
-    /// the commit or rollback ([`World::apply_deferred`]).
-    pub deferred: VecDeque<HandleId>,
-}
-
-/// A queued change into a tree (rule 2).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Entry {
-    /// A child fork's commit, to land in this tree.
-    Landing { from: TreeId, commit: String },
-    /// The upstream moved: bring its current decided version into this fork
-    /// (a sync carries the upstream's current version, never a stale one).
-    Sync,
 }
 
 /// Where a collision was decided: always an upstream's queue.
@@ -278,78 +265,6 @@ pub struct Edit {
     pub gone: bool,
 }
 
-/// What a tree's take writes (rule 9).
-#[derive(Clone, Debug)]
-pub enum Take {
-    /// The upstream's commit it delivers, the tree it makes, and whether
-    /// a commit of the fork was then on its way to the upstream.
-    Sync {
-        up: String,
-        tree: Option<String>,
-        landing: bool,
-        /// The upstream's head the take read: `up` is it, or under P2 the
-        /// last of its first parents the take may deliver.
-        head: String,
-    },
-    /// A child's commit and the planned merge.
-    Landing {
-        from: TreeId,
-        commit: String,
-        merged: Merged,
-    },
-}
-
-/// Rule 9: what one take locked in its tree and wrote there, in one step.
-#[derive(Clone, Debug)]
-pub struct TakeRecord {
-    /// The files and names it locked.
-    pub files: BTreeSet<String>,
-    pub take: Take,
-    /// The number of the queue entry it took (none: a prefix sync, whose
-    /// entry stays queued for the rest).
-    pub seq: Option<u64>,
-}
-
-/// Progress rule P1: a queue entry that waits for write-opens of its files
-/// to close (rule 9). Entries behind it go ahead unless they share a file
-/// or a source with it (git-model.md §6). No call waits behind it.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Waiting {
-    /// The files its take locks (a sync: every file it may write).
-    pub files: BTreeSet<String>,
-    /// The files whose writers it waits for: it is woken once none is open
-    /// for writing. A landing's are all its `files`; a sync's, the files
-    /// the first commit it holds back adds to its write (P2, the prefix
-    /// sync).
-    pub until: BTreeSet<String>,
-}
-
-/// Where a queue entry comes from: its order is kept per source (P1).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Source {
-    /// A sync: the tree's upstream.
-    Upstream,
-    /// A landing of a child fork's commit.
-    Child(TreeId),
-}
-
-impl Entry {
-    pub fn source(&self) -> Source {
-        match self {
-            Entry::Landing { from, .. } => Source::Child(*from),
-            Entry::Sync => Source::Upstream,
-        }
-    }
-}
-
-/// What a prefix sync (P2) delivers now: the upstream's commit it goes up
-/// to, the tree it makes (none: the fork has it) and the commits it holds
-/// back; and the open files whose close it waits for to deliver the rest.
-struct Prefix {
-    deliver: Option<(String, Option<String>)>,
-    until: Option<BTreeSet<String>>,
-}
-
 /// One take of a change into a tree (a landing, or a transaction's commit
 /// into its fork), as `check` reads it: the change with the base its own
 /// edit is read against, and whether it won.
@@ -479,16 +394,12 @@ pub struct World {
     pub forks: BTreeMap<TreeId, Fork>,
     next_fork: u32,
     next_txn: TxnId,
-    /// Each tree's queue: its entries, each numbered when queued.
-    queues: BTreeMap<TreeId, VecDeque<(u64, Entry)>>,
-    next_seq: u64,
+    /// Each tree's queue, its waiting entries and its deferred calls (rules 2 and 9, R5.3).
+    queues: Queues,
     /// Opens, their objects and calls, and what their saves recorded (rules 8, 10, 11).
     recording: Recording,
     /// The last queue step's take, if it took: for the checks.
-    last_take: Option<(TreeId, TakeRecord)>,
-    /// Each tree's queue entries that wait for write-opens of their files
-    /// to close (P1: several may wait, each for its own files).
-    waits: BTreeMap<TreeId, BTreeMap<u64, Waiting>>,
+    last_take: Option<(TreeId, TakeRecord<Merged>)>,
     /// The files each landing commit's own changes touch, cached.
     touches: RefCell<BTreeMap<String, BTreeSet<String>>>,
     pub collisions: Vec<Collision>,
@@ -583,11 +494,9 @@ impl World {
             forks: BTreeMap::new(),
             next_fork: 1,
             next_txn: 1,
-            queues: BTreeMap::new(),
-            next_seq: 0,
+            queues: Queues::default(),
             recording: Recording::new(),
             last_take: None,
-            waits: BTreeMap::new(),
             touches: RefCell::new(BTreeMap::new()),
             collisions: Vec::new(),
             entered: Vec::new(),
@@ -732,22 +641,16 @@ impl World {
     }
 
     pub fn queue_len(&self, t: TreeId) -> usize {
-        self.queues.get(&t).map_or(0, VecDeque::len)
+        self.queues.len(t)
     }
 
     pub fn queue(&self, t: TreeId) -> Vec<Entry> {
-        self.queues
-            .get(&t)
-            .map(|q| q.iter().map(|(_, e)| e.clone()).collect())
-            .unwrap_or_default()
+        self.queues.entries(t)
     }
 
     /// The queue with each entry's number.
     pub fn queue_numbered(&self, t: TreeId) -> Vec<(u64, Entry)> {
-        self.queues
-            .get(&t)
-            .map(|q| q.iter().cloned().collect())
-            .unwrap_or_default()
+        self.queues.numbered(t)
     }
 
     /// Every open file, and every deferred path call (R5.3).
@@ -779,32 +682,29 @@ impl World {
 
     /// The take the last queue step made, with its tree, if it took one: what
     /// it locked and wrote (rule 9). None after a step that only waited.
-    pub fn last_take(&self) -> Option<&(TreeId, TakeRecord)> {
+    pub fn last_take(&self) -> Option<&(TreeId, TakeRecord<Merged>)> {
         self.last_take.as_ref()
     }
 
     /// Each tree whose queue head waits, with the files it waits for.
     pub fn waits(&self) -> &BTreeMap<TreeId, BTreeMap<u64, Waiting>> {
-        &self.waits
+        self.queues.waits()
     }
 
     /// The files tree `t`'s waiting entries wait for: those of their files
     /// open for writing there.
     pub fn waiting_for(&self, t: TreeId) -> BTreeSet<String> {
-        let open = self.write_open(t);
-        self.waits
-            .get(&t)
-            .into_iter()
-            .flat_map(|m| m.values())
-            .flat_map(|x| x.until.iter())
-            .filter(|p| open.contains(*p) && !p.starts_with(NAME_KEY))
-            .cloned()
-            .collect()
+        self.queues.waiting_for(t, &self.write_open(t))
+    }
+
+    /// R5.3: the calls deferred behind fork `f`'s transaction, in the order made.
+    pub fn deferred(&self, f: TreeId) -> Vec<HandleId> {
+        self.queues.deferred(f).collect()
     }
 
     /// What a client of `t` has open for writing, and what its
     /// deferred calls (R5.3) will save: each file and the name it has now (R9.1,
-    /// [`NAME_KEY`]). An open whose object no path names (an orphan) has no file open.
+    /// [`queue::NAME_KEY`]). An open whose object no path names (an orphan) has no file open.
     pub fn write_open(&self, t: TreeId) -> BTreeSet<String> {
         let at = self.head(t);
         self.recording
@@ -1259,26 +1159,9 @@ impl World {
     /// and the new content queues for every child (rule 1: both ways).
     fn moved(&mut self, t: TreeId, up: bool) {
         let head = self.head(t);
-        if up && let Some(upstream) = self.upstream_of(t) {
-            let f = t;
-            self.next_seq += 1;
-            let n = self.next_seq;
-            self.queues.entry(upstream).or_default().push_back((
-                n,
-                Entry::Landing {
-                    from: f,
-                    commit: head.clone(),
-                },
-            ));
-        }
-        for c in self.children(t) {
-            self.next_seq += 1;
-            let n = self.next_seq;
-            self.queues
-                .entry(c)
-                .or_default()
-                .push_back((n, Entry::Sync));
-        }
+        let children = self.children(t);
+        self.queues
+            .moved(t, &head, self.upstream_of(t), &children, up);
     }
 
     // ── clients ──────────────────────────────────────────────────────────
@@ -1297,7 +1180,6 @@ impl World {
                 life: Life::Open,
                 head: head.clone(),
                 txn: None,
-                deferred: VecDeque::new(),
             },
         );
         self.set_head(id, &head);
@@ -1651,21 +1533,8 @@ impl World {
     /// it meanwhile (P3 is gone).
     fn wake(&mut self, t: TreeId) {
         let open = self.write_open(t);
-        if let Some(m) = self.waits.get_mut(&t) {
-            let woken: Vec<u64> = m
-                .iter()
-                .filter(|(_, x)| x.until.is_disjoint(&open))
-                .map(|(n, _)| *n)
-                .collect();
-            for n in &woken {
-                m.remove(n);
-            }
-            if m.is_empty() {
-                self.waits.remove(&t);
-            }
-            for n in woken {
-                self.note(format!("wake {t:?}'s entry {n}"));
-            }
+        for n in self.queues.wake(t, &open) {
+            self.note(format!("wake {t:?}'s entry {n}"));
         }
     }
 
@@ -1713,8 +1582,8 @@ impl World {
                 .filter(|h| h.target == Target::Txn(f, txn.id))
                 .filter_map(|h| self.named(h)),
         );
-        for h in &fork.deferred {
-            files.extend(self.deferred_files(self.recording.handle(*h)));
+        for h in self.queues.deferred(f) {
+            files.extend(self.deferred_files(self.recording.handle(h)));
         }
         files
     }
@@ -1730,7 +1599,7 @@ impl World {
 
     /// R5.3 (the owner, 2026-11-05: "deferred, obviously"): call `h`, a close
     /// or a path call in a fork's tree, acts on a file of the fork's open
-    /// transaction: it returns at once and goes on [`Fork::deferred`], true.
+    /// transaction: it returns at once and goes on its fork's deferred list ([`World::deferred`]), true.
     /// Nothing waits on a program.
     fn defer(&mut self, h: HandleId) -> bool {
         let handle = self.recording.handle(h);
@@ -1749,7 +1618,7 @@ impl World {
             handle.kind, handle.file
         ));
         self.recording.set_deferred(h);
-        self.forks.get_mut(&f).expect("fork").deferred.push_back(h);
+        self.queues.defer(f, h);
         true
     }
 
@@ -1757,9 +1626,11 @@ impl World {
     /// having ended: a save as any later close saves, on the tree's head
     /// now, a path call as it would have run. None when none is left.
     pub fn apply_deferred(&mut self, f: TreeId) -> Option<HandleId> {
-        let fork = self.forks.get_mut(&f).expect("fork");
-        assert!(fork.txn.is_none(), "a deferred call during its transaction");
-        let id = fork.deferred.pop_front()?;
+        assert!(
+            self.forks[&f].txn.is_none(),
+            "a deferred call during its transaction"
+        );
+        let id = self.queues.next_deferred(f)?;
         let h = self.recording.remove(id).expect("a deferred call");
         if h.kind == Kind::Write {
             let tokens = self.save_handle(&h);
@@ -1993,7 +1864,7 @@ impl World {
     /// order.
     pub fn crash_down(&mut self) -> Vec<HandleId> {
         self.note("crash: every agentfs process dies; restart replays the journal".into());
-        self.waits.clear();
+        self.queues.clear_waits();
         let replay = self
             .recording
             .handles()
@@ -2066,9 +1937,10 @@ impl World {
     pub fn pending(&self) -> Vec<Step> {
         let mut out: Vec<Step> = self
             .queues
-            .iter()
-            .filter(|(t, q)| !q.is_empty() && self.alive(**t) && self.scan(**t).is_some())
-            .map(|(t, _)| Step::Next(*t))
+            .queued_trees()
+            .into_iter()
+            .filter(|t| self.alive(*t) && self.queues.scan(*t, self).is_some())
+            .map(Step::Next)
             .collect();
         out.extend(
             self.forks
@@ -2090,15 +1962,23 @@ impl World {
         match s {
             Step::Next(t) => {
                 self.last_take = None;
-                let taken = match self.acquire(*t) {
-                    Some(take) => {
-                        let taken = usize::from(take.seq.is_some());
-                        self.finish(*t, &take);
-                        self.last_take = Some((*t, take));
-                        taken
+                let choice = self.queues.choose(*t, self);
+                self.note_choice(*t, &choice);
+                self.queues.apply(*t, &choice);
+                let take = match choice {
+                    Choice::Wait { .. } => None,
+                    Choice::Prefix { take, .. } => {
+                        self.prefix_syncs += 1;
+                        Some(take)
                     }
-                    None => 0,
+                    Choice::Take { take, .. } => Some(take),
                 };
+                let mut taken = 0;
+                if let Some(take) = take {
+                    taken = usize::from(take.seq.is_some());
+                    self.finish(*t, &take);
+                    self.last_take = Some((*t, take));
+                }
                 self.record_take(*t);
                 taken
             }
@@ -2126,45 +2006,30 @@ impl World {
         panic!("the queues never drained");
     }
 
-    /// Progress rule P1 (git-model.md §6): the first entry of `t`'s queue
-    /// that may be taken now. An entry waits behind every
-    /// earlier waiting entry it shares a file or a source with; so does
-    /// every entry behind one that waits behind, so one source's entries
-    /// keep their order and no two entries sharing a file pass each other.
-    /// Which files an entry not yet planned touches is read from git: a
-    /// landing's own changes (each against its first parent), a sync's
-    /// every file its tree and the upstream's head differ in (all it may
-    /// write).
-    fn scan(&self, t: TreeId) -> Option<usize> {
-        let waiting = self.waits.get(&t);
-        let mut files = BTreeSet::new();
-        let mut sources = BTreeSet::new();
-        for (i, (n, e)) in self.queues.get(&t).into_iter().flatten().enumerate() {
-            if let Some(x) = waiting.and_then(|m| m.get(n)) {
-                files.extend(x.files.iter().cloned());
-                sources.insert(e.source());
-                continue;
+    /// Logs a take's choice in tree `t`.
+    fn note_choice(&mut self, t: TreeId, choice: &Choice<Merged>) {
+        let s = match choice {
+            Choice::Wait { seq, waiting } => {
+                format!("{t:?}'s entry {seq} waits for {:?} to close", waiting.until)
             }
-            let mine = self.hint(t, e);
-            if sources.contains(&e.source()) || !mine.is_disjoint(&files) {
-                files.extend(mine);
-                sources.insert(e.source());
-                continue;
+            Choice::Prefix { seq, waiting, take } => {
+                let Take::Sync { cut, head, .. } = &take.take else {
+                    unreachable!("only a sync delivers a prefix")
+                };
+                format!(
+                    "{t:?}'s entry {seq} delivers {:.7} of {head:.7}, holds {:?}, and waits for {:?} to close for the rest",
+                    cut.up(),
+                    take.files,
+                    waiting.until
+                )
             }
-            return Some(i);
-        }
-        None
-    }
-
-    /// The files queue entry `e` of `t` may touch, before it is planned.
-    fn hint(&self, t: TreeId, e: &Entry) -> BTreeSet<String> {
-        match e {
-            Entry::Landing { commit, .. } => self.touches_of(commit),
-            Entry::Sync => match self.upstream_of(t) {
-                Some(up) => self.changed_keys(&self.head(t), &self.head(up)),
-                None => BTreeSet::new(),
-            },
-        }
+            Choice::Take { take, .. } => format!(
+                "{t:?} takes entry {}, locking {:?}",
+                take.seq.unwrap_or_default(),
+                take.files
+            ),
+        };
+        self.note(s);
     }
 
     /// The files a fork commit's own changes touch (each change against its
@@ -2180,159 +2045,27 @@ impl World {
         files
     }
 
-    /// Rule 9, a take's choice: plan the first entry P1 lets go
-    /// ([`World::scan`]) into `t` and the files it locks there (a landing:
-    /// every file its changes touch, [`World::touched`]). If a client of `t`
-    /// has one of them open for writing, the entry waits for those to close
-    /// (`waits`) and nothing is taken (None); a new open of one of its files
-    /// is granted (no call waits on a waiting take, the owner's decision of
-    /// 2026-11-04). Else it leaves the queue, and [`World::step`] writes it
-    /// at once. A prefix sync (P2) delivers its prefix and waits for the rest.
-    fn acquire(&mut self, t: TreeId) -> Option<TakeRecord> {
-        let q = self.queue_numbered(t);
-        let Some(i) = self.scan(t) else {
-            panic!("{t:?}: no entry can be taken")
-        };
-        let (seq, head) = q[i].clone();
-        let ours = self.head(t);
-        let (take, files) = match head {
-            Entry::Sync => {
-                let f = t;
-                let Some(upstream) = self.upstream_of(f) else {
-                    unreachable!("the root has no upstream")
-                };
-                let whole = self.head(upstream);
-                let landing = self.landing_pending(self.forks[&f].upstream, f);
-                let p = self.prefix(t, &ours, &whole);
-                let Some((up, tree)) = p.deliver else {
-                    // Its first commit would overwrite an open file: it
-                    // waits for those to close, taking nothing.
-                    let until = p.until.expect("a sync with nothing to deliver waits");
-                    self.note(format!(
-                        "{t:?}'s entry {seq} (a sync) waits for {until:?} to close"
-                    ));
-                    let mut files = self.hint(t, &Entry::Sync);
-                    files.extend(until.iter().cloned());
-                    self.waits
-                        .entry(t)
-                        .or_default()
-                        .insert(seq, Waiting { files, until });
-                    return None;
-                };
-                let files = tree
-                    .as_ref()
-                    .map(|tr| self.changed_keys(&ours, tr))
-                    .unwrap_or_default();
-                if let Some(until) = p.until {
-                    // P2: it delivers the prefix now; the entry stays queued
-                    // and waits for the rest.
-                    self.prefix_syncs += 1;
-                    self.note(format!(
-                        "{t:?}'s entry {seq} delivers {up:.7} of {whole:.7}, holds {files:?}, and waits for {until:?} to close for the rest"
-                    ));
-                    let mut all = self.hint(t, &Entry::Sync);
-                    all.extend(until.iter().cloned());
-                    all.extend(files.iter().cloned());
-                    self.waits
-                        .entry(t)
-                        .or_default()
-                        .insert(seq, Waiting { files: all, until });
-                    return Some(TakeRecord {
-                        files,
-                        take: Take::Sync {
-                            up,
-                            tree,
-                            landing,
-                            head: whole,
-                        },
-                        seq: None,
-                    });
-                }
-                (
-                    Take::Sync {
-                        up,
-                        tree,
-                        landing,
-                        head: whole,
-                    },
-                    files,
-                )
-            }
-            Entry::Landing { from, commit } => {
-                let merged = self.judge(&ours, &commit);
-                let files = self.touched(&commit, &merged);
-                (
-                    Take::Landing {
-                        from,
-                        commit,
-                        merged,
-                    },
-                    files,
-                )
-            }
-        };
-        let open: BTreeSet<String> = self.write_open(t).intersection(&files).cloned().collect();
-        if !open.is_empty() {
-            // A landing whose files are open waits for them to close; a
-            // sync never gets here (`prefix` delivers none of an open file).
-            self.note(format!("{t:?}'s entry {seq} waits for {open:?} to close"));
-            self.waits.entry(t).or_default().insert(
-                seq,
-                Waiting {
-                    until: files.clone(),
-                    files,
-                },
-            );
-            return None;
-        }
-        let mut qd = self.queues.remove(&t).unwrap_or_default();
-        qd.remove(i);
-        self.queues.insert(t, qd);
-        self.note(format!("{t:?} takes entry {seq}, locking {files:?}"));
-        Some(TakeRecord {
-            files,
-            take,
-            seq: Some(seq),
-        })
-    }
-
     /// Rule 9, the same step's write: the planned change, on the head it was
     /// planned on (nothing ran in between), writing only files it locked (the
     /// model stops loudly if not); then an entry waiting in `t` whose files
     /// closed meanwhile is woken (a prefix sync's rest).
-    fn finish(&mut self, t: TreeId, take: &TakeRecord) {
+    fn finish(&mut self, t: TreeId, take: &TakeRecord<Merged>) {
         let entered = self.entered.len();
         match &take.take {
-            Take::Sync {
-                up, tree, landing, ..
-            } => {
-                let files = tree
-                    .as_ref()
+            Take::Sync { cut, landing, .. } => {
+                let files = cut
+                    .tree()
                     .map(|tr| self.changed(&self.head(t), tr))
                     .unwrap_or_default();
-                held(t, &files, &take.files);
-                self.sync(t, up, tree.clone(), *landing, entered);
+                queue::held(t, &files, &take.files);
+                self.sync(t, cut, *landing, entered);
             }
-            Take::Landing {
-                from,
-                commit,
-                merged,
-            } => {
-                held(t, &merged.files, &take.files);
-                self.land(t, *from, commit, merged.clone());
+            Take::Landing { from, commit, plan } => {
+                queue::held(t, &plan.files, &take.files);
+                self.land(t, *from, commit, plan.clone());
             }
         }
         self.wake(t);
-    }
-
-    /// Rule 9, the files a landing locks: every file its change touches (read
-    /// from git, against its first parent), whether the plan says it wins or
-    /// loses, and every file the plan writes (R9.1). So a landing waits for an
-    /// open writer of a file its change touches even when that change loses.
-    fn touched(&self, c: &str, m: &Merged) -> BTreeSet<String> {
-        let mut files = m.files.clone();
-        files.extend(self.touches_of(c));
-        files
     }
 
     /// The files tree `tree` changes from commit `ours`.
@@ -2434,60 +2167,6 @@ impl World {
         });
     }
 
-    /// Progress rule P2, the prefix sync (the owner, 2026-11-04: "agreed",
-    /// on "a sync delivers the parent's changes in order up to the first
-    /// change that touches a file the sandbox has open for writing"): the
-    /// upstream's commits fork `t` (at `ours`) lacks are `whole`'s first
-    /// parents back to the first the fork has, each one change as the
-    /// upstream took it (a save, a transaction's commit, a landing). It delivers them
-    /// in order up to, not including, the first that changes the line map of
-    /// a file open for writing in `t`, even where the fork's file would
-    /// read the same because it keeps its own undecided line there (finding
-    /// 38; the owner, 2026-11-07, "3. B"), and holds back that one and every
-    /// later one, the decisions they carry included, until those files close.
-    fn prefix(&self, t: TreeId, ours: &str, whole: &str) -> Prefix {
-        let open = self.write_open(t);
-        let mut chain = Vec::new();
-        let mut c = whole.to_string();
-        while !self.is_ancestor(&c, ours) {
-            chain.push(c.clone());
-            c = self.first_parent(&c);
-        }
-        chain.reverse();
-        if open.is_empty() || chain.is_empty() {
-            return Prefix {
-                deliver: Some((whole.to_string(), self.sync_tree(ours, whole))),
-                until: None,
-            };
-        }
-        let mut deliver = None;
-        let mut before = BTreeSet::new();
-        for c in &chain {
-            let tree = self.sync_tree(ours, c);
-            let mut now: BTreeSet<String> = tree
-                .as_ref()
-                .map(|tr| self.changed_keys(ours, tr))
-                .unwrap_or_default();
-            let after = tree.as_deref().unwrap_or(ours);
-            now.extend(self.keys_of(self.new_lines_of(ours, c), ours, after));
-            now.extend(before.iter().cloned());
-            if !now.is_disjoint(&open) {
-                // It waits until no file this commit adds to the sync's
-                // write is open (its own change's files, as for a landing).
-                return Prefix {
-                    deliver,
-                    until: Some(now.difference(&before).cloned().collect()),
-                };
-            }
-            deliver = Some((c.clone(), tree));
-            before = now;
-        }
-        Prefix {
-            deliver,
-            until: None,
-        }
-    }
-
     /// The files in which the upstream's commit `c` wrote a line version the
     /// fork at `ours` has never had, so its line map changes at this sync
     /// even if the fork's file goes on reading the same (finding 38).
@@ -2502,6 +2181,19 @@ impl World {
                 })
             })
             .collect()
+    }
+
+    /// The lock keys delivering the upstream's commit `c` into a fork at
+    /// `ours` writes, `tree` the sync's tree (none: the fork has `c`): the
+    /// files that tree changes, and those whose line map `c` changes there
+    /// (finding 38), each with its names (R9.1).
+    fn delivery_keys(&self, ours: &str, c: &str, tree: Option<&str>) -> BTreeSet<String> {
+        let mut now: BTreeSet<String> = tree
+            .map(|tr| self.changed_keys(ours, tr))
+            .unwrap_or_default();
+        let after = tree.unwrap_or(ours);
+        now.extend(self.keys_of(self.new_lines_of(ours, c), ours, after));
+        now
     }
 
     /// The tree a sync of the upstream's `up` into fork `x` (at `ours`)
@@ -2531,14 +2223,8 @@ impl World {
     /// `planned`: the tree planned on the fork's current head (none: it has
     /// `up`); `landing`: a fork commit was on its way to the upstream when the
     /// take began, so `up` may lack it.
-    fn sync(
-        &mut self,
-        x: TreeId,
-        up: &str,
-        planned: Option<String>,
-        landing: bool,
-        entered: usize,
-    ) {
+    fn sync(&mut self, x: TreeId, cut: &Cut, landing: bool, entered: usize) {
+        let (up, planned) = (cut.up(), cut.tree().map(str::to_string));
         let f = x;
         let Some(upstream) = self.upstream_of(f) else {
             unreachable!("the root has no upstream")
@@ -2550,7 +2236,7 @@ impl World {
         for e in self.edits(&ours, &tree) {
             self.entered.push((x, e));
         }
-        let waiting = landing || self.landing_pending(upstream, f);
+        let waiting = landing || self.queues.landing_pending(upstream, f);
         let new = if tree == self.tree_of(up) && !waiting {
             self.note(format!("synced {up:.7} into f{f}: fast-forward"));
             up.to_string()
@@ -2567,21 +2253,14 @@ impl World {
         let fork = &self.forks[&f];
         fork.life == Life::Ended
             && self.children(f).is_empty()
-            && !self.waits.contains_key(&f)
-            && !self.landing_pending(fork.upstream, f)
-    }
-
-    /// Whether a commit of fork `f` waits in `upstream`'s queue.
-    fn landing_pending(&self, upstream: TreeId, f: TreeId) -> bool {
-        self.queue(upstream)
-            .iter()
-            .any(|e| matches!(e, Entry::Landing { from, .. } if *from == f))
+            && !self.queues.waits().contains_key(&f)
+            && !self.queues.landing_pending(fork.upstream, f)
     }
 
     fn drop_fork(&mut self, f: TreeId) {
         assert!(self.droppable(f), "drop f{f} when ready");
         self.update_ref(&["-d", &Self::branch(f)]);
-        self.queues.remove(&f);
+        self.queues.forget(f);
         self.forks.get_mut(&f).expect("fork").life = Life::Dropped;
         self.note(format!("drop f{f}"));
     }
@@ -2639,7 +2318,7 @@ impl World {
     fn record_take(&mut self, t: TreeId) {
         let took = if self.last_take.is_some() {
             Took::Taken
-        } else if self.scan(t).is_some() {
+        } else if self.queues.scan(t, self).is_some() {
             return;
         } else {
             Took::Waiting
@@ -2760,22 +2439,6 @@ impl World {
             .map(str::to_string)
             .collect()
     }
-}
-
-/// A lock key of a name, not a file (R9.1): two files can compete for one name.
-pub const NAME_KEY: &str = "name:";
-
-/// The lock key of the name file `c` shows, if it has one.
-pub fn name_key(c: &Content) -> Option<String> {
-    c.path().map(|p| format!("{NAME_KEY}{p}"))
-}
-
-/// Rule 9: a take writes only files it holds.
-fn held(t: TreeId, files: &BTreeSet<String>, holds: &BTreeSet<String>) {
-    assert!(
-        files.is_subset(holds),
-        "a take into {t:?} would write {files:?}, holding only {holds:?}"
-    );
 }
 
 /// The commit that wrote version `id`, reached from commit `at`, which
@@ -2927,7 +2590,7 @@ impl TreeCalls for World {
             return Ok(Took::Empty);
         }
         let mut stepped = false;
-        while self.scan(t).is_some() {
+        while self.queues.scan(t, self).is_some() {
             stepped = true;
             self.step(&Step::Next(t));
             if self.last_take.is_some() {
@@ -3030,5 +2693,53 @@ impl referee::Lineage for World {
 
     fn written_over(&self, origin: &str, p: &str, v: &Line) -> Vec<String> {
         World::written_over(self, origin, p, v)
+    }
+}
+
+/// Queue and locks reads the world through this port.
+impl Keys for World {
+    type Plan = Merged;
+
+    fn head(&self, t: TreeId) -> String {
+        World::head(self, t)
+    }
+
+    fn upstream_of(&self, t: TreeId) -> Option<TreeId> {
+        World::upstream_of(self, t)
+    }
+
+    fn write_open(&self, t: TreeId) -> BTreeSet<String> {
+        World::write_open(self, t)
+    }
+
+    fn touches_of(&self, c: &str) -> BTreeSet<String> {
+        World::touches_of(self, c)
+    }
+
+    fn changed_keys(&self, ours: &str, tree: &str) -> BTreeSet<String> {
+        World::changed_keys(self, ours, tree)
+    }
+
+    fn is_ancestor(&self, a: &str, b: &str) -> bool {
+        World::is_ancestor(self, a, b)
+    }
+
+    fn first_parent(&self, c: &str) -> String {
+        World::first_parent(self, c)
+    }
+
+    fn sync_tree(&self, ours: &str, up: &str) -> Option<String> {
+        World::sync_tree(self, ours, up)
+    }
+
+    fn delivery_keys(&self, ours: &str, c: &str, tree: Option<&str>) -> BTreeSet<String> {
+        World::delivery_keys(self, ours, c, tree)
+    }
+
+    /// Rule 3e's plan of landing `c` on `ours` ([`World::judge`]) and the files it writes.
+    fn plan(&self, ours: &str, c: &str) -> (Merged, BTreeSet<String>) {
+        let m = self.judge(ours, c);
+        let files = m.files.clone();
+        (m, files)
     }
 }

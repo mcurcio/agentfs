@@ -35,10 +35,10 @@ use agentfs_model::check::{Checked, change_files};
 use agentfs_model::content::{BLANK, Content, FILES, Layout, PATHS, UNBORN};
 use agentfs_model::git::{git, with_reversed_dates};
 use agentfs_model::program;
+use agentfs_model::queue::{Entry, NAME_KEY, name_key};
 use agentfs_model::recording::{HandleId, Kind, Target, Write};
 use agentfs_model::world::{
-    By, Client, Direction, Entry, Life, LineEdit, MergeRule, NAME_KEY, Policies, Step, TxnEnd,
-    TxnOutcome, World, name_key,
+    By, Client, Direction, Life, LineEdit, MergeRule, Policies, Step, TxnEnd, TxnOutcome, World,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -377,7 +377,7 @@ impl Oracle {
         }
         match defers {
             Some(f) => {
-                let id = *w.forks[&f].deferred.back().ok_or_else(|| {
+                let id = *w.deferred(f).last().ok_or_else(|| {
                     format!("R5.3: a path call on {files:?} ran during its transaction")
                 })?;
                 self.deferred
@@ -651,7 +651,7 @@ fn close_checked(
     // nothing yet.
     if let Some(f) = o.close_defers(w, h) {
         w.close(h);
-        if w.forks[&f].deferred.back() != Some(&h) {
+        if w.deferred(f).last() != Some(&h) {
             return Err(format!("oracle_deferred: R5.3: close h{h} did not defer"));
         }
         o.deferred.entry(f).or_default().push(Deferred::Close(h));
@@ -783,7 +783,7 @@ fn crash_checked(w: &mut World, o: &mut Oracle, during: Option<HandleId>) -> Res
 /// by its own byte code on the head it finds.
 fn apply_deferred_checked(w: &mut World, o: &mut Oracle, f: TreeId) -> Result<(), String> {
     let list = o.deferred.remove(&f).unwrap_or_default();
-    let model: Vec<HandleId> = w.forks[&f].deferred.iter().copied().collect();
+    let model: Vec<HandleId> = w.deferred(f);
     let own: Vec<HandleId> = list.iter().map(Deferred::id).collect();
     if model != own {
         return Err(format!(
@@ -1204,7 +1204,7 @@ impl Calls {
         unlink: bool,
         tally: &mut Tally,
     ) -> Result<(), String> {
-        let deferred = |w: &World| w.forks.values().map(|x| x.deferred.len()).sum::<usize>();
+        let deferred = |w: &World| w.forks.keys().map(|f| w.deferred(*f).len()).sum::<usize>();
         let before = deferred(w);
         let out = self.path_call_as(w, c, f, p, unlink, tally);
         tally.deferred_path_calls += deferred(w) - before;

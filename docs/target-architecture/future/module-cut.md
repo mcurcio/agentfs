@@ -1,6 +1,6 @@
 # Cutting the tree engine into modules
 
-**Partly built: the model's referee units are built.** This page proposes one home per rule: six modules, with the tree actor only composing them,
+**Partly built: in the model, the referee units, recording, and queue and locks are built.** This page proposes one home per rule: six modules, with the tree actor only composing them,
 in both the model and the engine. The commit that lands this slice deletes this page and moves the behaviour into the
 library docs.
 
@@ -113,7 +113,12 @@ git's ref files. It does not yet re-derive the rest from git; a later step does,
 Built: the safety net (the golden digest, the planted-bug corpus and the guarded runner) and the checker's own state,
 `Checked` and `Checker` in `crates/agentfs-model/src/check.rs`. The model's referee is in
 `crates/agentfs-model/src/referee/`: one file per unit, with `land` and `sync` its only entry points. The world builds
-the trees from their plans. How to use the net is in the model's `VERIFYING.md`
+the trees from their plans. Recording is `crates/agentfs-model/src/recording.rs`: opens, their byte calls, objects,
+orphans and each close's save, read through a `Files` port; the world commits the save. Queue and locks is
+`crates/agentfs-model/src/queue.rs`: the queues, P1's scan, the locks a take holds, the `Cut` a sync delivers to,
+and the order of deferred calls, read through a `Keys` port that the world implements. The world composes them;
+it still holds tree history, transactions, the journal's replay, replication and the trace, which no step here
+cuts. How to use the net is in the model's `VERIFYING.md`
 ("Refactoring without changing outcomes") and the repo skill `.claude/skills/model-runs`.
 
 **The model gate.** It holds for every model step below unless the row says otherwise. Every run goes through
@@ -142,7 +147,7 @@ A change to the safety net itself runs its quick tier and a review before any fu
 | # | Step | Gate |
 |---|---|---|
 | 2 | Built. Model: referee units out of `resolve`, `adopt` and `splice` | The model gate |
-| 3 | Model. Built: one tree identity, `calls::TreeId`, with its upstream from `World::upstream_of`, keeping today's order (root first, forks ascending); the digest's tree labels still come from `World::name`, `World::branch`, `World::txn_name` and `World::txn_branch`, and `canonical_text_is_pinned` is unchanged. Still to build: queue and locks, and recording, split out, with `World` the composition root. The replicate step keeps its place among the pending steps, because random runs draw from that list | The model gate. Names may change, outcomes may not |
+| 3 | Built. Model: one tree identity, `calls::TreeId`, with its upstream from `World::upstream_of`, keeping today's order (root first, forks ascending); the digest's tree labels still come from `World::name`, `World::branch`, `World::txn_name` and `World::txn_branch`, and `canonical_text_is_pinned` is unchanged. Recording, and queue and locks, split out, with `World` composing them. The replicate step keeps its place among the pending steps, because random runs draw from that list | The model gate. Names may change, outcomes may not |
 | 4 | Recorder: an engine call sequence becomes a model trace, so a regression found on a mount replays in the model. Guidance, owner, 2026-11-07: "if new regressions are found in the implementation, then those regressions can be verified and fixed via the git model" | One known regression replays |
 | 5 | Engine: remove the duplicated ancestry check, name combining and R3e; a typed version; then split `tree_actor/mod.rs` | Conformance traces on every scenario and seed stay at 0 mismatched |
 | 6 | Model: R9.18, R10.5 and R10.11 (see [transactions](transactions.md)); the built-in `remote` and its replicate step leave `World`. `MODEL.md` says Replication is "due on every move of main and every collision", which is stricter than any check: a planted bug that dropped the flag at a collision changed no digest and tripped no check, because the next move of main pushes anyway. This step settles what a mirror's push timing must be | The digest is re-baselined on purpose; finding 30's test is no longer ignored |
