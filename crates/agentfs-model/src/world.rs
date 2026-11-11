@@ -1461,13 +1461,12 @@ impl World {
     fn moved(&mut self, t: TreeId, up: bool) {
         let head = self.head(t);
         if up && let Some(upstream) = self.upstream_of(t) {
-            let f = t;
             self.next_seq += 1;
             let n = self.next_seq;
             self.queues.entry(upstream).or_default().push_back((
                 n,
                 Entry::Landing {
-                    from: f,
+                    from: t,
                     commit: head.clone(),
                 },
             ));
@@ -2762,12 +2761,11 @@ impl World {
         let ours = self.head(t);
         let (take, files) = match head {
             Entry::Sync => {
-                let f = t;
-                let Some(upstream) = self.upstream_of(f) else {
+                let Some(upstream) = self.upstream_of(t) else {
                     unreachable!("the root has no upstream")
                 };
                 let whole = self.head(upstream);
-                let landing = self.landing_pending(self.forks[&f].upstream, f);
+                let landing = self.landing_pending(upstream, t);
                 let p = self.prefix(t, &ours, &whole);
                 let Some((up, tree)) = p.deliver else {
                     // Its first commit would overwrite an open file: it
