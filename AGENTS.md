@@ -7,6 +7,11 @@ This project follows its maintainer's shared engineering rules: https://github.c
 Code loads them through `.claude/settings.json`; other agents and people read them there. A rule here
 that quotes the maintainer overrides them for this project.
 
+A cloud session ignores the plugins a checked-in `.claude/settings.json` turns on, because it never
+shows the trust dialog. The environment's setup script installs them before Claude starts, as the
+skills README says under "Cloud sessions". When it has not, `.claude/check-plugins.sh` (a
+SessionStart hook) says which are missing, and the `workflow:*` agents are absent from the session.
+
 agentfs is a FUSE filesystem. It records every change a workload makes into git history that the workload cannot see. It pushes that history to remotes and applies patches queued by iac. It ships as a sidecar and as a CSI driver.
 
 ## What agentfs is for

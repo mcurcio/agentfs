@@ -9,5 +9,19 @@
     "rules@mcurcio-skills": true,
     "workflow@mcurcio-skills": true,
     "releases@mcurcio-skills": true
+  },
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/check-plugins.sh",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
   }
 }
