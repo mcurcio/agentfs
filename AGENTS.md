@@ -147,7 +147,7 @@ Rules:
 
 ## Git
 
-- **Identity:** `bot-einstein <bot+github@mcurcio.com>`. Don't change it.
+- **Identity:** `bot-einstein <265368963+bot-einstein@users.noreply.github.com>`, the account's GitHub no-reply email. Cloud sessions get it from the environment's `GIT_AUTHOR_*` and `GIT_COMMITTER_*` variables. Don't change it.
 - **Commit messages:** an imperative subject of at most 72 characters and a short body, ending with the attribution trailer your harness specifies (currently `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`).
 - **Pushing:** work goes straight to `main`, which is the owner's chosen practice for this repo. Run `git pull --ff-only origin main` before pushing. Never force-push.
 - **Docs travel with the code:**
