@@ -103,7 +103,7 @@ refusal), `Clock` (probes and deadlines only), `Publish`.
 | Scenario | What Health does | What it never does |
 |---|---|---|
 | A take waits on a file a client holds open | nothing: the waiting write-opens are parked; the take is the service's work in hand only if the service reports it unparked | judge a long lock wait as a hang |
-| A view host hangs (`SIGSTOP`) | `Unresponsive` after threshold × interval + deadline; its launcher restarts it in place (a fork's on a new fork) | judge main's host by it |
+| A view host hangs (`SIGSTOP`) | `Unresponsive` after threshold × interval + deadline; its launcher restarts it in place (a fork's on a new fork) | judge the root's host by it |
 | A view host or the service exits | `Gone` at once from its exit | wait for probes to fail first |
 | Health's own host crashes | every watch is lost; nothing else changes; the launcher re-watches | persist or replay verdicts |
 | Disk full | nothing: a service answering with `NoSpace` still finishes calls | call a full disk a liveness fault |
@@ -119,7 +119,7 @@ refusal), `Clock` (probes and deadlines only), `Publish`.
 
 | Test | Rules out |
 |---|---|
-| `SIGSTOP` a fork's view host: `Unresponsive`; main's host stays `Live` | a hung host nobody notices |
+| `SIGSTOP` a fork's view host: `Unresponsive`; the root's host stays `Live` | a hung host nobody notices |
 | `SIGKILL` a view host: `Gone` before one probe interval | `Gone` judged from missed probes (H2) |
 | A failpoint holds the service's dispatcher while its socket accepts: `Unresponsive` | a status green while the capability is dead |
 | A take waits an hour on an open file: every component stays `Live` | a lock wait read as a hang |

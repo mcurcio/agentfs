@@ -75,7 +75,7 @@ pub struct RelPath(/* private */);   // beneath the root and git-fsck clean; onl
 pub struct TreeName(/* private */);  // a confined name that may fail fsck (a nested `.git`): only views show it
 
 pub enum TreeRef {
-    Main,                            // refs/heads/main
+    Root,                            // refs/heads/<root>
     Fork(ForkId),                    // refs/heads/fork/<id>; its branch tracks its upstream tree's branch (git-model §2)
 }
 pub enum Served {                    // what a view serves
@@ -115,15 +115,15 @@ capabilities bound to it.
 
 | Capability | Minted by | Held by | It can never |
 |---|---|---|---|
-| `LaunchCap { launcher, may: Main \| ForksItCreates, view_profiles }` | the composition root, from deployment config | a launcher | (fork launcher) attach to main or a fork it did not create, widen a view profile, create, stage or unstage the volume |
+| `LaunchCap { launcher, may: Root \| ForksItCreates, view_profiles }` | the composition root, from deployment config | a launcher | (fork launcher) attach to the root or a fork it did not create, widen a view profile, create, stage or unstage the volume |
 | `ClientCap` | `Clients::attach`, `rebind` (read-write grants only) | the client's session, in the history service | save into another tree or as another writer |
 | `PinCap` | the composition root | Clients | (anyone else) pin a snapshot |
-| `StartCap` | the composition root | Volume (lent to Replication's `fetch_start`) | (anyone else) set where main's line starts |
+| `StartCap` | the composition root | Volume (lent to Replication's `fetch_start`) | (anyone else) set where the root's line starts |
 | `ActorCap { actor, roles }` | `Clients::actor`, from an identity the edge authenticated | operators; roles are data | act as another actor |
 
 **The view host's calls name no client and no tree.** A write-open, a path call, a save at close and a transaction
 call arrive over a session, whose edge supplies the client, its tree and its `ClientCap`, and refuses writes from a
-session with none: a fork never writes main. A session opens only within one `Family`; the rpc edge refuses
+session with none: a fork never writes the root. A session opens only within one `Family`; the rpc edge refuses
 another (`OtherFamily(Version)`) before any domain is called.
 
 ### 2.3 Events
@@ -172,7 +172,7 @@ The git model's invariants are git-model §15. These are the rest; all are desig
 | Upgrade | Path |
 |---|---|
 | Patch | replace a component in place; a view host's restart ends its clients' open files (no live hand-over: design choice) |
-| Minor or major | **drain, then upgrade:** an operator's `drain_for_upgrade`; every client detaches (its open files saved at its end), every queue drains, pushes settle, every fork drops; `Released`; the new release stages on main's branch alone ([volume](domains/volume.md)) |
+| Minor or major | **drain, then upgrade:** an operator's `drain_for_upgrade`; every client detaches (its open files saved at its end), every queue drains, pushes settle, every fork drops; `Released`; the new release stages on the root's branch alone ([volume](domains/volume.md)) |
 
 Releases come from semantic-release on merge: a format or rpc change is at least a minor, a
 history break a major. Cost: every `feat` is a minor, so every feature release is a full drain.
@@ -196,7 +196,7 @@ Each mode composes the same domains; none reads a mode flag.
 
 | Composition | History service | View hosts | Health | Who launches clients |
 |---|---|---|---|---|
-| **Sidecar** (`mount`, `run`) | a child process of the sidecar's supervisor | main and each fork view, as child processes | the supervisor; the platform's probe judges it | the sidecar |
+| **Sidecar** (`mount`, `run`) | a child process of the sidecar's supervisor | the root and each fork view, as child processes | the supervisor; the platform's probe judges it | the sidecar |
 | **History service with view hosts** | `serve-history` | one process per host, many views each | the supervising launcher | each host's launcher |
 | **CSI** | started at stage, runs through Draining | one per publish, plus in-pod launchers' views | the node plugin, told by the in-pod launcher's `watch` | publish and unpublish; the in-pod launcher (`ForksItCreates` only) |
 | **CLI** (`fork`, `status`; `status` opens read-only, lock-free) | lock held: a short-lived service; busy: a control-socket client | none | none | none |
@@ -230,11 +230,11 @@ unbound port, or a volume or peer of another family, is refused (S8); zero remot
    rest of this page rests on the git model's rules, which the executable model checks, and on no mounted test
    (see [the index](README.md)).
 
-**Tracer bullet** (design choice). A sidecar runs main's view and one fork view: (1) the fork closes p; main's
-queue takes it and main's view shows it once caught up; (2) main closes s; the fork's queue syncs it and the
-fork's view shows it; (3) a main client holds p open while the fork's p lands: the take waits, then writes;
-(4) killing the fork's view host mid-write leaves main untouched, and the fork's answered write calls are
-saved from the journal; (5) while main holds p open, the fork's change to q lands without waiting. The git side of each step is git-model's; this bullet
+**Tracer bullet** (design choice). A sidecar runs the root's view and one fork view: (1) the fork closes p; the root's
+queue takes it and the root's view shows it once caught up; (2) the root closes s; the fork's queue syncs it and the
+fork's view shows it; (3) a root client holds p open while the fork's p lands: the take waits, then writes;
+(4) killing the fork's view host mid-write leaves the root untouched, and the fork's answered write calls are
+saved from the journal; (5) while the root holds p open, the fork's change to q lands without waiting. The git side of each step is git-model's; this bullet
 proves the views, sessions and events around it.
 
 **Prior art.** AFS close-to-open consistency · NFS `COMMIT` and write-ahead logging (the journal) · fair
@@ -246,7 +246,7 @@ object capabilities · the transactional outbox · Kubernetes liveness probes ·
 | Term | Definition | Why needed | Could be |
 |---|---|---|---|
 | view host; session | the process serving views, never inside a client; its connection for one client (capabilities stay in the service) | who hosts a view, and what it may hold; §2.2 | the `mount` process |
-| tree | main (the tree with no upstream) or one fork: a branch with its working tree (git-model §2) | one name for main and every fork | backing tree |
+| tree | the root (the tree with no upstream) or one fork: a branch with its working tree (git-model §2) | one name for the root and every fork | backing tree |
 | `TreeMoved` | the actor's notice that a tree's branch and working tree moved | views drop caches; pushes start | the existing feed's `Recorded` |
 | version, family | a component's semantic version; its major and minor | versions that may talk (§4) | release |
 | grant, view profile | what a client may do and see, as data | what a client may reach | role |

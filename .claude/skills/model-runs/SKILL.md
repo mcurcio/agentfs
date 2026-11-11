@@ -32,6 +32,22 @@ a particular one. Copy logs out of `/work` before you finish: the volume is not 
 - `ci/model-digest.sh check` is fast: scenarios first, stopping at their first difference before any seed runs.
   `check --all` runs everything and lists every difference.
 
+## Which tier a change needs
+
+`VERIFYING.md` ("Refactoring without changing outcomes") holds the deciding test; read the diff against it, not your
+sense of the change's risk. The owner judged the whole gate too heavy for a rename (2026-11-11, guidance: "That gate
+process seems too heavy for this").
+
+- **Light**, for docs, comments, renames at every site, imports, formatting, tree names given through
+  `world::TreeNames`, and digest keys renamed with identical values. One job at a time through the wrapper:
+  `run.py --anchors-only --work /work/anchors` (silent, rc 0), `ci/model-digest.sh check` (the scenario digests
+  match; a budget-only line is fine), `cargo test --locked -p agentfs-model`, `cargo test --locked -p
+  agentfs-conformance`, the safety-net tests, and `run.py --work /work/planted --only <ids>` for each bug whose anchor
+  moved (each still caught). Then `cargo fmt --all --check` and clippy.
+- **Full**, for any other change to the model's `src/**` or `tests/**` (a condition, a branch, a moved function), to
+  the digest's text or the harness, or to a digest value or matrix row: `check --all` and the whole corpus in place of
+  `check` and `--only`.
+
 ## The budget
 
 `crates/agentfs-model/planted/budget.json` holds measured seconds, like `ci/bench-budget.json`: the corpus pass and its

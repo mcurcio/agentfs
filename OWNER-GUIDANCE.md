@@ -21,7 +21,8 @@ on his answer.
 
 ## Terms
 
-- **Guidance**, 2026-11-08. "the terminology of sandbox/main/parent is nebulous. We should be discussing a pure model of parent/child or upstream/fork." Then: "Terminology: upstream/fork". Applies to: the model, the ledger and the target-architecture pages. [Main is the tree with no upstream.]
+- **Guidance**, 2026-11-08. "the terminology of sandbox/main/parent is nebulous. We should be discussing a pure model of parent/child or upstream/fork." Then: "Terminology: upstream/fork". Applies to: the model, the ledger and the target-architecture pages. [The root is the tree with no upstream; the examples of the time called it main.]
+- **Guidance**, 2026-11-11. "refs/heads/main should not be special or hardcoded. Consumers will configure the name of the root branch. If that work is already planned, we can keep to the plan." [It was not planned; the plan is `docs/target-architecture/future/root-branch-name.md`. The model and conformance already take the root's name as a value.] Applies to: the model, agentfs-core, agentfs-fuse, the CLI and `docs/target-architecture/future/root-branch-name.md`.
 
 ## Trees, forks and what they receive
 
@@ -51,6 +52,11 @@ on his answer.
 - **Guidance**, 2026-11-06. On state formats from earlier work: "drop support. we are pre-production and there is no need to worry about "supporting" old concepts".
 - **Guidance**, 2026-11-08. On how to cut the tree actor into modules, he picked option "B" [six modules: recording, queue and locks, referee, transactions, tree history and journal, with the tree actor only composing them]. To start when the module is next opened. Applies to: `docs/target-architecture/future/module-cut.md`.
 - **Guidance**, 2026-11-09. On the revised module cut: "I generally approve. I want each phase of the work to start with an architect". Applies to: every step of `docs/target-architecture/future/module-cut.md`.
+- **Guidance**, 2026-11-11. On splitting the module cut's step 3 into pull requests: "2 PRs is fine". On a third, for removing the remaining "main" from the model: "New pr is fine". Applies to: `docs/target-architecture/future/module-cut.md`, step 3.
+- **Guidance**, 2026-11-11. On step 4's recorder, offered a harness boundary (A) or an engine hook (B): "B sounds more correct, if we are trying to design real observability into the system. ... we probably need A+B eventually, written in such a way that we have one observability engine that can receive data from the disparate components." Then: "I agree with the approach of “design for both, build the A solution first”." Asked: "If agentfs-core is emitting OTEL data, can we use that as the [...] mechanism to receive the necessary data?" [Answered yes: the engine source arrives later as OpenTelemetry events into the same recorder.] Applies to: `docs/target-architecture/future/module-cut.md`, step 4 and the engine-source row.
+- **Guidance**, 2026-11-11. Asked whether the five scenario tests named for "main" may be renamed, with their keys in `crates/agentfs-model/baseline/digests.txt` and byte-identical values: "Yes". Applies to: `crates/agentfs-model/baseline/digests.txt`.
+- **Guidance**, 2026-11-11. "Make sure the plan docs are updated and consistent and there are no gaps in the process". Applies to: `docs/target-architecture/` and the model's `MODEL.md` and `VERIFYING.md`.
+- **Guidance**, 2026-11-11. On running the whole model gate for a rename: "That gate process seems too heavy for this. Isn't the big gate about validating the merge framework? That should be run only when some part of the core engine changes". [The whole gate checks the model's rules; conformance and CI judge engine changes.] Asked whether a light tier serves renames, docs and changes that move no rule logic, with the whole gate kept for a change to rule logic or to any digest value or matrix row: "Yes". Applies to: `crates/agentfs-model/VERIFYING.md` and `.claude/skills/model-runs/SKILL.md`.
 
 ## History and versions
 

@@ -584,3 +584,23 @@ Not blocking; the suite is built and green. Findings about the brief and the doc
    (`session_abandoned`), which the log reported as "files were still open". It also
    pointed at Hermes as §9 (it is §10). The log now says "the filesystem was still mounted
    elsewhere" when the unmount was not busy.
+
+## 2026-11-11, module cut step 3c implementer (the root's name)
+
+1. **The 3c design's edit of `future/sandbox-overlay-gaps.md` was wrong.** It said "the main
+   mount" becomes "the root's mount". That page is about the older engine's sandbox overlay,
+   where the "main mount" is the volume's mount point, not a tree. It now says "the mount
+   point".
+2. **The ledger harness (`tests/gitledger`) keeps its own fork naming.** The design said the
+   ledger stores a `TreeNames` and names trees through it. The ledger re-derives everything
+   from git on purpose, so it now takes only the root's name from the world
+   (`w.names().name(TreeId::ROOT)`) and keeps its own `fork/<n>` mapping.
+3. **AGENTS.md says a new docs page goes in both `docs/README.md` and `docs/SUMMARY.md`**,
+   but `docs/README.md` lists no future-design page individually (it links the overview), and
+   `docs_reference` checks only SUMMARY. The new `future/root-branch-name.md` is in SUMMARY
+   and the target-architecture overview only, as every other future page is.
+4. **Step 4's design (unbuilt, outside the repo) predates 3c.** Before it is frozen: the
+   root caller is `Caller::Root(n)` and the trace prefix `r:`; its engine-side naming takes
+   the root's name from `agentfs_conformance::ENGINE_ROOT`, not a literal; its conformance
+   `TreeNames` type should be renamed (for example `EngineNames`) apart from the model's
+   `world::TreeNames`; and its D4 ("no trace change beyond step 3") no longer holds.

@@ -5,7 +5,7 @@
 ## What stands until then
 
 - **Locks are not shared between the two mounts.** Each kernel keeps its own POSIX and BSD locks, so a lock taken
-  through the main mount is not seen through the overlay.
+  through the mount point is not seen through the overlay.
 - **Shown entries' inode numbers skip one per hidden entry.** This tells a sandbox how many hidden entries a
   directory holds, not their names. Not tested.
 - **The overlay is served only by a single-process `mount`**, so not on CSI volumes, where every pod's mount is a front.

@@ -16,12 +16,12 @@ The owner's guidance that applies here is in `OWNER-GUIDANCE.md` at the reposito
 | **volume** | one repository and its trees, on one node (S7) |
 | **staged** | in use on this node: the history service runs and admits attachments |
 | **draining** | told to stop: no new attachments; existing work finishes. `Stop` (a launcher's) or `Upgrade` (an operator's) |
-| **upgrade drain** | a drain that also waits until every fork has dropped, so the next family finds only main's branch |
+| **upgrade drain** | a drain that also waits until every fork has dropped, so the next family finds only the root's branch |
 | **released** | nothing promised would be lost if the service stopped now |
 | **release verdict** | `Wait(blockers)` or `Release(disposition)`, from a pure judgement of asked facts |
-| **start point** | where main's history begins: empty, or a commit on another volume's line on a remote; fixed at create |
+| **start point** | where the root's history begins: empty, or a commit on another volume's line on a remote; fixed at create |
 | **start line** | the remote line the start point was taken from, which can keep moving (a late push from an old node) |
-| **accept** | an operator's statement that main need not take in the start line's commits up to a tip |
+| **accept** | an operator's statement that the root need not take in the start line's commits up to a tip |
 
 **Not this domain:** attachment (Clients), branches, queues and history (git-model), remotes (Replication), which
 forks are left (Trees), liveness (Health), the kernel lock and the family check (`store`), alarms (Telemetry).
@@ -42,7 +42,7 @@ stateDiagram-v2
 ```mermaid
 stateDiagram-v2
   [*] --> InStep: created from a start point (an empty start has no machine)
-  InStep --> Moved: PushSettled from the start remote, and main reaches neither the line's tip nor an accepted tip covering it
+  InStep --> Moved: PushSettled from the start remote, and the root reaches neither the line's tip nor an accepted tip covering it
   Moved --> InStep: accept_start(tip) covers it
   Moved --> Moved: the line moved again
 ```
@@ -51,8 +51,8 @@ stateDiagram-v2
 
 ```rust
 pub trait Volume {
-    fn create(&mut self, spec: VolumeSpec, by: &LaunchCap) -> Result<(), VolumeError>;   // may: Main
-    fn stage(&mut self, by: &LaunchCap) -> Result<VolumeState, VolumeError>;             // may: Main
+    fn create(&mut self, spec: VolumeSpec, by: &LaunchCap) -> Result<(), VolumeError>;   // may: Root
+    fn stage(&mut self, by: &LaunchCap) -> Result<VolumeState, VolumeError>;             // may: Root
     fn unstage(&mut self, by: &LaunchCap) -> Result<VolumeState, VolumeError>;           // Staged → Draining(Stop)
     fn drain_for_upgrade(&mut self, by: &ActorCap) -> Result<VolumeState, VolumeError>;  // Operator
     fn accept_start(&mut self, tip: CommitId, by: &ActorCap) -> Result<(), VolumeError>; // Operator
@@ -60,7 +60,7 @@ pub trait Volume {
     fn release_verdict(&self) -> ReleaseVerdict;   // asks every judge now; never stored
 }
 pub enum VolumeError { NotPermitted, NotStaged, StartDiverged, NoStartPoint, StartUnreachable, FormatsOf(Family), NotDurable(IoKind) }
-pub struct VolumeSpec { name: VolumeName, start: StartPoint, on_release: OnRelease }
+pub struct VolumeSpec { name: VolumeName, root: BranchName, start: StartPoint, on_release: OnRelease }  // root: the root branch's name (future/root-branch-name.md)
 pub enum StartPoint { Empty, Line { remote: RemoteName, line: LineName, at: CommitId } }
 pub enum OnRelease { Keep, Remove }
 pub enum ReleaseVerdict {
@@ -85,19 +85,19 @@ pub enum StartLine { Empty, InStep { pinned: CommitId }, Moved { pinned: CommitI
 | `StartLineChanged` | the judgement changes | Telemetry |
 
 Consumed (re-judged while Draining): `AttachmentEnded`, `LastDetached`, `TreeMoved`, `ForkDropped`, `PushSettled`.
-Asked: Clients `attached_any`, the git model's queue depths, Trees `live`, Replication `settlement(main's head)`,
+Asked: Clients `attached_any`, the git model's queue depths, Trees `live`, Replication `settlement(the root's head)`,
 `line_tip`, `fetch_start` (once, at create, lending its `StartCap`).
 
 ## 4. Invariants
 
 | # | Invariant | Enforced by | Strength |
 |---|---|---|---|
-| VO1 | `Released` only when no client is attached, every queue is empty, `settlement` of main's head is `Held` or `NoRemotes`, and for an upgrade drain no fork is left | `release` takes a `Cleared`; only the pure `decide` builds one | construction time |
+| VO1 | `Released` only when no client is attached, every queue is empty, `settlement` of the root's head is `Held` or `NoRemotes`, and for an upgrade drain no fork is left | `release` takes a `Cleared`; only the pure `decide` builds one | construction time |
 | VO2 | `Removable` only when `on_release` is `Remove`, the drain is `Stop`, and `settlement` is `Held` or `NoRemotes` | the same `decide`, exhaustively tested | construction time + test |
 | VO3 | A transition and its event are one unit | repository write and outbox row commit together | construction time |
 | VO4 | The verdict reads only facts asked at judgement time; nothing is polled | no clock port; clippy bans timers in the crate | compile + build time |
 | VO5 | The start point never changes after create; acceptances only move forward along the start line | no setter; `accept_start` checks the tip (`StartDiverged`) | construction time |
-| VO6 | A fork launcher cannot create, drain or stage the volume | `LaunchCap` with `may: Main`; `drain_for_upgrade` needs the Operator role | construction time |
+| VO6 | A fork launcher cannot create, drain or stage the volume | `LaunchCap` with `may: Root`; `drain_for_upgrade` needs the Operator role | construction time |
 | VO7 | A release stages another family's volume only after that family's upgrade drain released it (S8) | `store` reports the family at open; `stage` answers `FormatsOf` | boot time |
 
 Ports: `VolumeRepository`, `StartRepository` (append-only acceptance rows), `Outbox`, `UnitOfWork` (`store`, audited).
@@ -117,7 +117,7 @@ Ports: `VolumeRepository`, `StartRepository` (append-only acceptance rows), `Out
 **Draining to release.** `unstage` writes `Draining(Stop)` and `VolumeDraining`: Clients refuses attaches and
 Replication skips spacing. Each client's detach closes its open files as saves (git-model §6); each queue drains its
 entries; each `TreeMoved` and `PushSettled` re-judges; with no blocker, `Released` and `VolumeReleased`, and the
-service exits. **An upgrade** adds one blocker: every fork must drop (Trees), so the new family stages on main's
+service exits. **An upgrade** adds one blocker: every fork must drop (Trees), so the new family stages on the root's
 branch, its history, the start record and the settings alone.
 
 ## 7. Tests
@@ -133,7 +133,7 @@ branch, its history, the start record and the settings alone.
 
 ## 8. Costs
 
-1. **A draining service keeps running** until every remote holds main; behind an unreachable remote, until an
+1. **A draining service keeps running** until every remote holds the root; behind an unreachable remote, until an
    operator acts.
 2. **A file held open blocks release:** its take waits, so its queue never empties until its client ends.
 3. **Acceptances stay on the volume:** a row, not today's pushed ref, so another node cannot see it.

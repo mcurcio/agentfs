@@ -38,14 +38,14 @@ Everything else here is a **design choice** and says so, or is what the model do
 
 ## 1. The picture
 
-One git repository per volume holds every tree. Main (the tree with no upstream) and each fork are branches; a fork's branch tracks its
-upstream's branch. Replication, the remote's one pusher, carries main's line and every collision ref to the
+One git repository per volume holds every tree. The root (the tree with no upstream) and each fork are branches; a fork's branch tracks its
+upstream's branch. Replication, the remote's one pusher, carries the root's line and every collision ref to the
 shared remote.
 
 ```mermaid
 flowchart TB
   subgraph R["the volume's history repository: one object store"]
-    M["refs/heads/main"]
+    M["refs/heads/(the root's name)"]
     F1["refs/heads/fork/1: fork A"]
     F2["refs/heads/fork/2: fork B"]
     F3["refs/heads/fork/3: fork C, inside A"]
@@ -57,9 +57,9 @@ flowchart TB
   F2 -- "upstream" --> M
   F3 -- "upstream" --> F1
   T7 -- "frozen at begin, lands in" --> F2
-  M -- "Replication pushes main, collisions" --> O[("shared remote: origin")]
+  M -- "Replication pushes the root, collisions" --> O[("shared remote: origin")]
   subgraph V["views (FUSE): one per client"]
-    VM["main's clients"] --> WM["main's working tree"]
+    VM["the root's clients"] --> WM["the root's working tree"]
     VA["fork A"] --> WA["A's working tree"]
   end
   WM -. "checked out from" .-> M
@@ -71,7 +71,7 @@ flowchart TB
 | agentfs term | git term | In the model |
 |---|---|---|
 | volume | one repository (one object store, many branches) | `World` |
-| tree (main, the tree with no upstream; a fork) | a branch, with its own working tree and index | `refs/heads/main`, `refs/heads/fork/<id>` |
+| tree (the root, the tree with no upstream, its branch's name configured: [root branch name](future/root-branch-name.md); a fork) | a branch, with its own working tree and index | `refs/heads/<root>`, `refs/heads/fork/<id>` |
 | fork's upstream | the branch's upstream, in the same repository (`branch.fork/3.remote = .`) | `Fork::upstream` |
 | nested fork | a branch whose upstream is another fork's branch | `create_fork(f)` |
 | client, writer | the `Agentfs-Writer` trailer; git's author and committer are one fixed service identity | `Client`, `fork.writer` |
@@ -193,7 +193,7 @@ Direct by c3
 
 Agentfs-Writer: c3            # exactly one writer: a client, or `agentfs` for a sync and the Root commit
 Agentfs-Cause: Direct         # Direct (a save) | Landing | Sync | Transaction t7 | Root
-Agentfs-Tree: fork/3          # main | fork/<id> | txn/<id>: the branch it was made on
+Agentfs-Tree: fork/3          # <root> | fork/<id> | txn/<id>: the branch it was made on
 ```
 
 A take that decides a collision (R5.1, R9.9) records it in its own result commit, a landing or transaction commit, with
@@ -208,8 +208,8 @@ Landing by c3
 
 Agentfs-Writer: c3
 Agentfs-Cause: Landing
-Agentfs-Tree: main
-Agentfs-Collision: main a Line <losing commit> refs/collisions/1 a1 c3.2 m1.1
+Agentfs-Tree: <root>
+Agentfs-Collision: <root> a Line <losing commit> refs/collisions/1 a1 c3.2 m1.1
 ```
 
 A merge originates nothing: each line it adds comes from a non-first parent, and it names its second parent's
@@ -225,7 +225,7 @@ Ref names are a design choice; the model uses the first six (with `refs/collisio
 
 | Ref | Holds | Kept locally | Pushed to the shared remote (design choice) |
 |---|---|---|---|
-| `refs/heads/main` | main's decided line | always | yes, as today's `refs/heads/agentfs/<volume>` |
+| `refs/heads/<root>` | the root's decided line | always | yes, as today's `refs/heads/agentfs/<volume>` |
 | `refs/heads/fork/<id>` | a fork's line, syncs included | until the fork drops | only where Replication pushes fork lines (A4); its losing commits go regardless, as collision refs |
 | `refs/heads/txn/<id>` | an open transaction | until commit or rollback | never |
 | `refs/collisions/<loser>` | one per losing change, named by its losing commit (the model numbers them, one per losing change, with a record for each file and cause it lost by) | past the fork's drop | yes, by Replication, under `refs/agentfs/<volume>/collisions/` ("i want to know who changed what when", 2026-11-03) |
@@ -233,9 +233,9 @@ Ref names are a design choice; the model uses the first six (with `refs/collisio
 | `refs/txn-start/<id>` | the commit a transaction began at (the model holds it in memory, `Txn::start`) | until commit or rollback | never |
 
 Replication adds the release major to pushed names (replication.md). It is the only pusher: the collision refs
-join its refspec, and a move of main or a recorded collision makes a push due (design
+join its refspec, and a move of the root or a recorded collision makes a push due (design
 choice; the model's `Step::Replicate`, taken in any order with the queue steps). The model first made only a
-collision an event, so a run without one never pushed main (MODEL.md finding 16). No queue step waits on
+collision an event, so a run without one never pushed the root (MODEL.md finding 16). No queue step waits on
 the network.
 
 ## 5. The queue: one referee per tree
@@ -321,7 +321,7 @@ Its ref transaction moves the branch and creates a landing entry at the upstream
 sequenceDiagram
   participant P as program in fork A
   participant A as fork/1's actor
-  participant QM as main's queue
+  participant QM as the root's queue
   participant QC as fork/3's queue
   P->>A: close a.txt (line 2 now x)
   A->>A: commit on fork/1's head h: the program's file, Writer c1, Cause Direct
@@ -549,17 +549,17 @@ it is a merge: first parent the upstream's head, second the fork commit, named f
 
 ```mermaid
 sequenceDiagram
-  participant QM as main's queue
-  participant M as main branch
+  participant QM as the root's queue
+  participant M as the root branch
   participant A as fork/1
   QM->>QM: take Landing(fork/1, c)
-  alt c's first parent is main's head
-    QM->>M: move main to c (fast-forward)
-  else main moved since
+  alt c's first parent is the root's head
+    QM->>M: move the root to c (fast-forward)
+  else the root moved since
     QM->>QM: per line: every line of c replaces or applies, so c wins whole
-    QM->>M: merge, parents main and c, Writer c1, Cause Landing
+    QM->>M: merge, parents the root and c, Writer c1, Cause Landing
   end
-  M->>A: Sync queued (main moved)
+  M->>A: Sync queued (the root moved)
 ```
 
 **Collision.** The upstream's line wins (owner, 2026-11-03), and the change that lost it loses whole. The landing makes a
@@ -571,15 +571,15 @@ again (`no_flicker`); a clean line y of x's save goes back to the upstream's ver
 ```mermaid
 sequenceDiagram
   participant A as fork/1 (shows x)
-  participant QM as main's queue
-  participant M as main (has m, concurrent)
+  participant QM as the root's queue
+  participant M as the root (has m, concurrent)
   QM->>QM: take Landing(fork/1, x's commit)
-  QM->>QM: line 2: m and x concurrent, main wins
+  QM->>QM: line 2: m and x concurrent, the root wins
   QM->>QM: line 4: y clean, but its save lost: y loses with it
-  QM->>M: commit, main's tree unchanged, parents main and x's commit
+  QM->>M: commit, the root's tree unchanged, parents the root and x's commit
   QM->>QM: same ref transaction: refs/collisions/x's commit, and the result commit's trailers: lost x for m, y with its save
   M->>A: Sync queued
-  A->>A: sync: x's commit decided by main, take m and main's line 4
+  A->>A: sync: x's commit decided by the root, take m and the root's line 4
 ```
 
 ## 8. Sync: fetch, then fast-forward to the decided state
@@ -591,18 +591,18 @@ its history does not reach the commit. Those are lines still on their way to the
 ```mermaid
 sequenceDiagram
   participant QA as fork/1's queue
-  participant M as main
+  participant M as the root
   participant A as fork/1
   QA->>QA: take Sync
-  QA->>M: read main's head now (fetch)
-  alt A's head already reaches main's head
+  QA->>M: read the root's head now (fetch)
+  alt A's head already reaches the root's head
     QA->>A: nothing to do
-  else main's head reaches A's head, or A has undecided lines
-    QA->>QA: main's tree, with A's lines that main has not decided kept (none in the first case)
-    alt that is main's tree and nothing of A waits in main's queue
-      QA->>A: fast-forward fork/1 to main's head
+  else the root's head reaches A's head, or A has undecided lines
+    QA->>QA: the root's tree, with A's lines that the root has not decided kept (none in the first case)
+    alt that is the root's tree and nothing of A waits in the root's queue
+      QA->>A: fast-forward fork/1 to the root's head
     else
-      QA->>A: merge, parents A and main, Writer agentfs, Cause Sync
+      QA->>A: merge, parents A and the root, Writer agentfs, Cause Sync
     end
   end
 ```
@@ -650,7 +650,7 @@ sequenceDiagram
   participant P as program
   participant T as txn/7
   participant B as fork/2's actor
-  participant QM as main's queue
+  participant QM as the root's queue
   P->>T: begin: branch at B's head
   P->>T: saves, each a commit on txn/7
   Note over B: syncs keep landing in B, T stays frozen
@@ -676,13 +676,13 @@ change lands in, and every tree below learns it by sync.
 sequenceDiagram
   participant C as fork/3 (inside A)
   participant QA as fork/1's queue
-  participant QM as main's queue
+  participant QM as the root's queue
   C->>QA: Landing(fork/3, g)
   QA->>QA: decide against fork/1, which wins its concurrent lines
   QA->>QA: Landing commit on fork/1, Writer c3
   QA->>QM: Landing(fork/1, that commit)
-  QM->>QM: decide against main, main wins, the loser is fork/1's commit
-  QM-->>QA: Sync (main moved)
+  QM->>QM: decide against the root, the root wins, the loser is fork/1's commit
+  QM-->>QA: Sync (the root moved)
   QA-->>C: Sync (fork/1 moved)
 ```
 
@@ -815,7 +815,7 @@ policy of this revision included. Every check runs after every step, in every sc
 | Nothing else waits; each take is its queue's first entry or records a wait, the rest stay in order | `take` (interleavings.rs) | `random_interleavings_full_lineage`, `random_interleavings_adjacent_lines` (the scenarios' own `take` checks no order) |
 | A transaction ends as the program was told, whole; a rollback leaves nothing | `transactions_end_as_told`, `discarded_leave_no_trace` | `r5_transaction_commits_clean`, `r3_a_transaction_loses_whole_and_is_told`, `r5_sync_before_or_after_the_commit_ends_the_same`, `r5_a_committed_transaction_then_lands_like_any_change`, `r5_transaction_rollback_and_client_death_leave_nothing` |
 | Every change traces to one writer | `one_writer` | `r6_a_sync_is_a_merge_with_the_upstream_second` |
-| Every losing change is replicated, eventually, and stays: once Replication drains, the commits of the remote main's history hold the run's collisions, each re-read on the shared remote alone, its writer and line | `losers_pushed` | `r3_a_save_before_the_sync_arrives_loses_to_the_upstream`, every collision |
+| Every losing change is replicated, eventually, and stays: once Replication drains, the commits of the remote root's history hold the run's collisions, each re-read on the shared remote alone, its writer and line | `losers_pushed` | `r3_a_save_before_the_sync_arrives_loses_to_the_upstream`, every collision |
 | Nested forks follow the same rules | all checks | `r4_nested_forks_follow_the_same_rules` |
 | Full lineage, read by ancestry alone: a tree's history reaches every change it took | `full_lineage` | `r7_every_fork_commit_lands_on_its_own_in_the_roots_history`, `r7_the_root_reaches_a_losing_commit_and_its_ref_keeps_it`, `random_interleavings_full_lineage` |
 | Trees converge when writes stop | `check_converged` | `convergence_when_writes_stop` |
@@ -922,11 +922,11 @@ The goal is a real implementation of the proposed design, so that end-to-end tes
 
 | In scope | Answers | Exit criterion (pass or fail) |
 |---|---|---|
-| A FUSE mount of main and one fork on one real repository: a tree actor and a queue each | the model on real calls | the model's scenarios, driven as real file calls (VERIFYING.md's conformance plan), pass. Built as a replay of each scenario's recorded calls, so it compares what each tree shows and the lost lines of each collision: no mapping call, a client call waiting on a take assumed by replay order, a crash only between calls, no injected `ENOSPC` (VERIFYING.md has the table). Evidence and counts: the [tree views page](../trees.md#how-it-is-verified), first row |
+| A FUSE mount of the root and one fork on one real repository: a tree actor and a queue each | the model on real calls | the model's scenarios, driven as real file calls (VERIFYING.md's conformance plan), pass. Built as a replay of each scenario's recorded calls, so it compares what each tree shows and the lost lines of each collision: no mapping call, a client call waiting on a take assumed by replay order, a crash only between calls, no injected `ENOSPC` (VERIFYING.md has the table). Evidence and counts: the [tree views page](../trees.md#how-it-is-verified), first row |
 | The journal (§3) | review point 1 | a kill of the one process that hosts the view and the tree actors (there is no separate history service) after each journal step: every write call that returned is in the next save, and none is saved twice; under power loss (dm-log-writes, as the power-loss workflow): every call before a returned `fsync` or close survives; a full state area fails the write call with `ENOSPC`; a close followed at once by an open, in the same process and in another, reads the new content (`RELEASE` is a background request: it goes to `/dev/fuse` in order, before `close` returns, while fewer than `max_background` requests are outstanding and no readahead of that handle is in flight, and a synchronous `OPEN` skips that queue. The view sets `max_background` as high as the kernel's `max_user_bgreq` allows. Read from fs/fuse at v6.8 and v6.14 and tested on CI's kernel (7.0) with 64 closes over a busy view, `ci/trees-close-open.py`. Limits: thousands outstanding, or a readahead of that handle in flight, can still let an open pass) |
 | Byte-level calls (modelled since 2026-11-04: §6, MODEL.md rules 8 and 10) | review point 2, on a real mount | random `pwrite` at any offset, partial lines, split writes, a missing final newline (appending `bar` to a file holding `foo`), overlapping writes, `ftruncate` shrinking and growing, `O_APPEND`; the bytes are the independent oracle: each saved file equals what the same calls leave on a plain Linux filesystem, and its line map passes `save_aligned` |
 | Objects (§7) | review point 3 | an atomic save (write `n`, `rename(n, a)`) while another process holds `a` open for writing and keeps writing: the new `a` never changes; `O_TMPFILE` with `linkat`; an unlink while open; a rename of an open file; a view-host restart with handles open (the object table rebuilt from the journal, §3; plain FUSE ends the connection with its server): an old handle's later writes fail, the file holds what returned before the kill, and a file replaced through the new mount stays unchanged; two writers at stale offsets through the page cache; shared `mmap` writeback |
-| Progress (§6) | review point 4 | a main process holds a log open for the whole run while a fork lands a stream of changes to other files: each lands without waiting for the log; a change to the log waits, new writers of the log are never made to wait, and the change lands once no writer has the log open; real programs that wait on each other while one holds a file a take waits for (a shell pipeline, a parent process waiting for a child that appends to its log) never hang (finding 24, the reason P3 was dropped); a prefix sync into a fork holding a file open delivers the upstream's commits before the first that touches it, and the rest at the close |
+| Progress (§6) | review point 4 | a root process holds a log open for the whole run while a fork lands a stream of changes to other files: each lands without waiting for the log; a change to the log waits, new writers of the log are never made to wait, and the change lands once no writer has the log open; real programs that wait on each other while one holds a file a take waits for (a shell pipeline, a parent process waiting for a child that appends to its log) never hang (finding 24, the reason P3 was dropped); a prefix sync into a fork holding a file open delivers the upstream's commits before the first that touches it, and the rest at the close |
 | Measurements, recorded, not gated | review point 5 | per-call cost of the journal against plain FUSE (median, 99th percentile); journal size for a file written for an hour; line-map size per 10,000 saves; save and take time for 1 MiB and 100 MiB files |
 
 Out of scope: nested forks, transactions, Rules and view profiles, replication,
