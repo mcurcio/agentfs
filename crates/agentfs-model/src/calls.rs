@@ -303,7 +303,8 @@ fn parse_caller(s: &str) -> Result<Caller, CallError> {
     }
     s.strip_prefix("f:")
         .ok_or_else(|| CallError::new(format!("bad caller {s:?}")))
-        .and_then(|f| number(f).map(|f| Caller::Fork(TreeId::new(f as u32))))
+        .and_then(fork_id)
+        .map(Caller::Fork)
 }
 
 fn tree(t: TreeId) -> String {
@@ -313,7 +314,24 @@ fn tree(t: TreeId) -> String {
 fn parse_tree(s: &str) -> Result<TreeId, CallError> {
     s.strip_prefix('t')
         .ok_or_else(|| CallError::new(format!("bad tree {s:?}")))
-        .and_then(|f| number(f).map(|f| TreeId::new(f as u32)))
+        .and_then(tree_id)
+}
+
+/// A tree's number as the trace writes it; one past `u32` is an error, never a wrap.
+fn tree_id(s: &str) -> Result<TreeId, CallError> {
+    let n = number(s)?;
+    u32::try_from(n)
+        .map(TreeId::new)
+        .map_err(|_| CallError::new(format!("bad tree number {s:?}")))
+}
+
+/// A fork's number: a tree's, but never the root's.
+fn fork_id(s: &str) -> Result<TreeId, CallError> {
+    let t = tree_id(s)?;
+    if t == TreeId::ROOT {
+        return Err(CallError::new(format!("{s:?} names the root, not a fork")));
+    }
+    Ok(t)
 }
 
 fn number(s: &str) -> Result<u64, CallError> {
@@ -372,9 +390,7 @@ fn parse_call(s: &str) -> Result<RecordedCall, CallError> {
     let f: Vec<&str> = s.split(' ').collect();
     let bad = || CallError::new(format!("bad call {s:?}"));
     Ok(match f.as_slice() {
-        ["fork", id] => RecordedCall::Fork {
-            id: TreeId::new(number(id)? as u32),
-        },
+        ["fork", id] => RecordedCall::Fork { id: fork_id(id)? },
         ["open", c, p, h] => RecordedCall::OpenWrite {
             caller: parse_caller(c)?,
             path: parse_path(p)?,
@@ -706,5 +722,18 @@ mod tests {
             .collect();
         assert_eq!(parse(&render(&trace)).unwrap(), trace);
         assert_eq!(scope_of(&trace), Scope::OutOfScope("drop"));
+    }
+
+    #[test]
+    fn a_tree_number_past_u32_or_a_root_fork_is_an_error() {
+        assert_eq!(parse_tree("t0").unwrap(), TreeId::ROOT);
+        assert!(
+            parse_tree("t4294967296").is_err(),
+            "it would wrap to the root"
+        );
+        assert!(parse_caller("f:0").is_err(), "the root is no fork");
+        assert!(parse_caller("f:4294967297").is_err());
+        assert_eq!(parse_caller("f:3").unwrap(), Caller::Fork(TreeId::new(3)));
+        assert!(parse_call("fork 0").is_err());
     }
 }
