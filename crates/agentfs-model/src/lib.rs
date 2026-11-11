@@ -46,5 +46,6 @@ pub mod content;
 pub mod digest;
 pub mod git;
 pub mod program;
+pub mod recording;
 mod referee;
 pub mod world;

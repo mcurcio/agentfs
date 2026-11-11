@@ -35,9 +35,10 @@ use agentfs_model::check::{Checked, change_files};
 use agentfs_model::content::{BLANK, Content, FILES, Layout, PATHS, UNBORN};
 use agentfs_model::git::{git, with_reversed_dates};
 use agentfs_model::program;
+use agentfs_model::recording::{HandleId, Kind, Target, Write};
 use agentfs_model::world::{
-    By, Client, Direction, Entry, HandleId, Kind, Life, LineEdit, MergeRule, NAME_KEY, Policies,
-    Step, Target, TxnEnd, TxnOutcome, World, Write, name_key,
+    By, Client, Direction, Entry, Life, LineEdit, MergeRule, NAME_KEY, Policies, Step, TxnEnd,
+    TxnOutcome, World, name_key,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -645,7 +646,7 @@ fn close_checked(
     tally: &mut Tally,
 ) -> Result<(), String> {
     let t = w.handle(h).target;
-    let (n, head) = (w.orphans.len(), head_of(w, t));
+    let (n, head) = (w.orphans().len(), head_of(w, t));
     // R5.3: a close of an open transaction's file returns at once and saves
     // nothing yet.
     if let Some(f) = o.close_defers(w, h) {
@@ -670,7 +671,7 @@ fn close_checked(
 /// The model raised exactly the `OrphanDropped` events the oracle expects
 /// since event `n` (git-model.md §7: an orphan's calls are dropped, named).
 fn dropped(w: &World, n: usize, expect: Vec<Dropped>) -> Result<(), String> {
-    let got: Vec<Dropped> = w.orphans[n..]
+    let got: Vec<Dropped> = w.orphans()[n..]
         .iter()
         .map(|e| (e.handle, e.writer.clone(), e.path.clone(), e.bytes))
         .collect();
@@ -713,7 +714,7 @@ fn end_checked(w: &mut World, o: &mut Oracle, c: &Client) -> Result<(), String> 
         .filter(|h| of_it(&h.client) && h.kind == Kind::Write)
         .map(|h| h.id)
         .collect();
-    let n = w.orphans.len();
+    let n = w.orphans().len();
     let mut expect = Vec::new();
     for h in mine {
         expect.extend(o.closing(w, h));
@@ -738,7 +739,7 @@ fn end_checked(w: &mut World, o: &mut Oracle, c: &Client) -> Result<(), String> 
 /// call a transaction deferred stays behind it, and a close that would defer
 /// defers (R5.3). A take is one step, so none is in progress.
 fn crash_checked(w: &mut World, o: &mut Oracle, during: Option<HandleId>) -> Result<(), String> {
-    let n = w.orphans.len();
+    let n = w.orphans().len();
     let mut expect = Vec::new();
     let mut during = during;
     let mut first = None;
@@ -791,7 +792,7 @@ fn apply_deferred_checked(w: &mut World, o: &mut Oracle, f: TreeId) -> Result<()
     }
     let t = Target::Tree(f);
     for d in list {
-        let n = w.orphans.len();
+        let n = w.orphans().len();
         let at = w.head(f);
         let mut expect = Vec::new();
         let run = match &d {
@@ -822,7 +823,7 @@ fn apply_deferred_checked(w: &mut World, o: &mut Oracle, f: TreeId) -> Result<()
 }
 
 fn rollback_checked(w: &mut World, o: &mut Oracle, f: TreeId) -> Result<(), String> {
-    let n = w.orphans.len();
+    let n = w.orphans().len();
     w.rollback_only(f).expect("open");
     o.reload(w);
     dropped(w, n, Vec::new())?;
@@ -1679,7 +1680,7 @@ fn run_as(
     tally.fast_forwards += w.fast_forwards;
     tally.inserts_met += w.met().inserts;
     tally.unlinked_edits += w.met().unlinked_edits;
-    tally.orphans += w.orphans.len();
+    tally.orphans += w.orphans().len();
     tally.prefix_syncs += w.prefix_syncs;
     if gitledger::takes() != w.landings.len() {
         return Err((

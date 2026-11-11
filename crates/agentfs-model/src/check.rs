@@ -17,9 +17,10 @@ use lineage::Lineage;
 use crate::calls::TreeId;
 use crate::content::{Content, Line, PATHS, State, is_root, writer_of};
 use crate::git::{git, try_git};
+use crate::recording::{Kind, Target};
 use crate::world::{
-    By, Client, Collision, Decision, Direction, Entry, Kind, Landed, Life, Policies, Step, Take,
-    Target, TxnEnd, TxnId, TxnOutcome, World, commit_parents, decisions_in, name_key, origin_in,
+    By, Client, Collision, Decision, Direction, Entry, Landed, Life, Policies, Step, Take, TxnEnd,
+    TxnId, TxnOutcome, World, commit_parents, decisions_in, name_key, origin_in,
 };
 
 /// `r`'s error named for `check`: planted/matrix.tsv records the first check tripped.
@@ -393,7 +394,7 @@ fn locks(w: &World) -> Result<(), String> {
     let queued = |t: TreeId, n: u64| w.queue_numbered(t).iter().any(|(m, _)| *m == n);
     for h in w.handles() {
         let alive = match &h.client {
-            Client::Main(n) => !w.ended_main.contains(n),
+            Client::Main(n) => !w.ended_main().contains(n),
             Client::Fork(f) | Client::Outside(f) => w.forks[f].life == Life::Open,
         };
         let held = match h.target {
@@ -1497,7 +1498,7 @@ impl Checker {
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .collect();
-            if w.save_calls.contains_key(commit) != (opens.len() == 1) || opens.len() > 1 {
+            if w.save_calls().contains_key(commit) != (opens.len() == 1) || opens.len() > 1 {
                 return Err(format!("{commit} names opens {opens:?}"));
             }
             for o in opens {
@@ -1538,7 +1539,7 @@ impl Checker {
                     let (base, now) = (w.file(parents[0], path), w.file(commit, path));
                     save_aligned(&base, &now)
                         .map_err(|e| format!("{commit}: save of {path}: {e}"))?;
-                    if let Some(calls) = w.save_calls.get(commit) {
+                    if let Some(calls) = w.save_calls().get(commit) {
                         appends_exact(&base, &now, calls)
                             .map_err(|e| format!("{commit}: save of {path}: {e}"))?;
                     }
@@ -1675,9 +1676,9 @@ pub fn save_aligned(base: &Content, now: &Content) -> Result<(), String> {
 fn appends_exact(
     base: &Content,
     now: &Content,
-    calls: &[crate::world::Write],
+    calls: &[crate::recording::Write],
 ) -> Result<(), String> {
-    use crate::world::Write;
+    use crate::recording::Write;
     let k = calls
         .iter()
         .rposition(|c| !matches!(c, Write::Append(_)))
@@ -1742,8 +1743,8 @@ fn appends_exact(
 
 /// The check's own account of byte calls on `bytes`: kept apart from the
 /// model's replay ([`crate::world::Write::apply_all`]).
-fn bytes_after(bytes: &str, calls: &[crate::world::Write]) -> String {
-    use crate::world::Write;
+fn bytes_after(bytes: &str, calls: &[crate::recording::Write]) -> String {
+    use crate::recording::Write;
     let mut b: Vec<u8> = bytes.as_bytes().to_vec();
     for c in calls {
         match c {

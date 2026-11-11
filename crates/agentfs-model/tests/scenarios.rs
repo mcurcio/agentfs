@@ -7,9 +7,10 @@ use agentfs_model::calls::TreeId;
 use agentfs_model::check::Checked;
 use agentfs_model::content::{BLANK, Content, Layout, Line, State};
 use agentfs_model::git::{git, with_reversed_dates};
+use agentfs_model::recording::{Target, Write};
 use agentfs_model::world::{
     By, Client, Direction, Life, LineEdit, MergeRule, ModelError, Overwritten, Policies, Step,
-    Target, TxnOutcome, World, Write, decisions_in,
+    TxnOutcome, World, decisions_in,
 };
 use std::collections::BTreeSet;
 
@@ -1568,7 +1569,7 @@ fn r11_an_old_writer_stays_orphaned_when_the_change_that_ended_its_file_loses() 
         assert_eq!(bytes(&w, f, "c"), "m\n-\n-\n-\n-\n-\n");
         w.close(old);
         drain(&mut w);
-        assert_eq!(w.orphans.len(), 1, "the old writer saved nothing");
+        assert_eq!(w.orphans().len(), 1, "the old writer saved nothing");
         assert_eq!(bytes(&w, f, "c"), "m\n-\n-\n-\n-\n-\n");
     }
 }
@@ -2003,10 +2004,10 @@ fn r5_an_open_of_a_file_only_a_lost_transaction_made_saves_nothing() {
     assert!(has(&w, t, "a", &m));
     assert!(matches!(w.commit_txn(f), Ok(TxnOutcome::Lost { .. })));
     ok(&mut w);
-    let n = w.orphans.len();
+    let n = w.orphans().len();
     let head = w.head(t);
     w.close(new);
-    assert_eq!(w.orphans.len(), n + 1, "its write is dropped, and named");
+    assert_eq!(w.orphans().len(), n + 1, "its write is dropped, and named");
     assert_eq!(w.head(t), head);
     drain(&mut w);
 }
@@ -2949,7 +2950,7 @@ fn r11_an_old_writer_after_an_atomic_save_saves_nothing() {
             "its writes never reached the replacement"
         );
         let _ = new;
-        let e = w.orphans.last().expect("an OrphanDropped event");
+        let e = w.orphans().last().expect("an OrphanDropped event");
         assert_eq!((e.handle, e.path.as_str(), e.bytes), (h, "a", 6),);
         assert_eq!(
             e.writer,
@@ -2988,7 +2989,7 @@ fn r11_an_open_on_the_new_file_follows_it_through_the_atomic_save() {
     ok(&mut w);
     let a = w.read(TreeId::ROOT, "a");
     assert_eq!((a.name.line.as_str(), a.bytes().as_str()), ("a", "x\ny\n"),);
-    assert!(w.orphans.is_empty());
+    assert!(w.orphans().is_empty());
     drain(&mut w);
 }
 

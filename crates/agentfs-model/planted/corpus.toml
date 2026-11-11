@@ -287,8 +287,8 @@ find = '''
     fn restart_open_unshown(&mut self, id: HandleId) {'''
 replace = '''
     fn restart_open_unshown(&mut self, id: HandleId) {
-        if matches!(self.handles[&id].target, Target::Txn(..)) {
-            self.handles.remove(&id);
+        if matches!(self.recording.handle(id).target, Target::Txn(..)) {
+            self.recording.remove(id);
             return;
         }'''
 
@@ -344,9 +344,9 @@ find = '''
         if self.defer(h) {
             return;
         }
-        let handle = self.handles.remove(&h).expect("an open file");'''
+        let handle = self.recording.remove(h).expect("an open file");'''
 replace = '''
-        let handle = self.handles.remove(&h).expect("an open file");'''
+        let handle = self.recording.remove(h).expect("an open file");'''
 
 [[bug]]
 id = "deferred_calls_applied_out_of_order"
@@ -378,9 +378,10 @@ find = '''
 replace = '''
         self.waits.clear();
         for f in self.forks.values_mut() {
-            f.deferred.clear();
+            for h in f.deferred.drain(..) {
+                self.recording.remove(h);
+            }
         }
-        self.handles.retain(|_, h| !h.deferred);
         let replay = self'''
 
 [[bug]]

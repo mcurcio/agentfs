@@ -5,7 +5,8 @@
 //! This runs only the named cases, not the model's random or verification suites.
 use agentfs_model::calls::TreeId;
 use agentfs_model::git::git;
-use agentfs_model::world::{Client, Policies, Step, World, Write};
+use agentfs_model::recording::Write;
+use agentfs_model::world::{Client, Policies, Step, World};
 use std::fmt::Write as _;
 
 fn hex(bytes: &[u8]) -> String {

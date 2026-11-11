@@ -5,7 +5,8 @@ use agentfs_conformance::{against_library, against_model};
 use agentfs_model::calls::{
     Caller, Recorded, RecordedCall, Took, TreeCalls, TreeId, parse, render,
 };
-use agentfs_model::world::{Client, Policies, World, Write};
+use agentfs_model::recording::Write;
+use agentfs_model::world::{Client, Policies, World};
 
 fn world() -> World {
     World::recording(Policies::default())
@@ -273,7 +274,7 @@ fn an_old_writer_stays_orphaned_when_the_unlink_loses() {
     drain(&mut w);
     World::close(&mut w, old);
     drain(&mut w);
-    assert_eq!(w.orphans.len(), 1, "the old writer saved nothing");
+    assert_eq!(w.orphans().len(), 1, "the old writer saved nothing");
     let shown = w.shown();
     assert_eq!(
         shown.trees[&TreeId::new(1)]["c"].as_slice(),
@@ -296,7 +297,7 @@ fn an_old_writer_stays_orphaned_when_the_rename_over_loses() {
     drain(&mut w);
     World::close(&mut w, old);
     drain(&mut w);
-    assert_eq!(w.orphans.len(), 1, "the old writer saved nothing");
+    assert_eq!(w.orphans().len(), 1, "the old writer saved nothing");
     passes(&w);
 }
 
