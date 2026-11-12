@@ -564,23 +564,31 @@ fn take(w: &mut Checked, o: &mut Oracle, s: &Step, tally: &mut Tally) -> Result<
         Step::Next(t) => w.queue_numbered(*t),
         _ => Vec::new(),
     };
-    // The files open for writing in the tree, by the harness's own object
-    // table, when the step comes.
+    // The files open for writing in the tree and in its open transaction
+    // (R9.18), by the harness's own object table, each with its name read in
+    // its own target, when the step comes.
+    let r: &World = w;
     let open_before: BTreeSet<String> = match s {
-        Step::Next(t) => w
+        Step::Next(t) => r
             .handles()
-            .filter(|h| h.target == Target::Tree(*t))
+            .filter(|h| matches!(h.target, Target::Tree(u) | Target::Txn(u, _) if u == *t))
             .flat_map(|h| {
-                let mut files: Vec<String> = o.named(w, h.id).into_iter().collect();
+                let at = r.target_head(h.target);
+                let mut files: Vec<String> = o.named(r, h.id).into_iter().collect();
                 if h.kind != Kind::Write {
                     files.extend(h.files());
                 }
                 files
+                    .into_iter()
+                    .flat_map(move |f| [name_key(&r.file(&at, &f)), Some(f)])
             })
-            .flat_map(|f| [name_key(&w.file(&w.head(*t), &f)), Some(f)])
             .flatten()
             .collect(),
         _ => BTreeSet::new(),
+    };
+    let head_before = match s {
+        Step::Next(t) => Some(w.head(*t)),
+        _ => None,
     };
     gitledger::note_next(w, s)?;
     // P1: the entry a queue step acts on is the first one no earlier
@@ -591,6 +599,22 @@ fn take(w: &mut Checked, o: &mut Oracle, s: &Step, tally: &mut Tally) -> Result<
     };
     let taken = w.step_checked(s)?;
     tally.steps += 1;
+    // Rule 9 and R9.18, by the harness's own reading of the opens: a take
+    // writes no file open for writing in its tree or in that tree's open
+    // transaction (read from git, not from the model's locks).
+    if let (Step::Next(t), Some(before)) = (s, &head_before)
+        && *before != w.head(*t)
+    {
+        let wrote = git(
+            w.repo(),
+            &["diff-tree", "-r", "--name-only", before, &w.head(*t)],
+        );
+        if let Some(p) = wrote.lines().find(|p| open_before.contains(*p)) {
+            return Err(format!(
+                "oracle_locks: {s:?} wrote {p}, which is open for writing in {t:?} or its transaction"
+            ));
+        }
+    }
     let skip = match s {
         Step::Next(t) => Some(Target::Tree(*t)),
         _ => None,

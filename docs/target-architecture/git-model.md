@@ -627,7 +627,9 @@ that creates a transaction is not defined. Transactions are not built (§18) unt
 Begin creates `txn/<n>` and `refs/txn-start/<n>` at the fork's head: snapshot isolation. The program's saves
 commit there and it reads its own edits; the fork keeps syncing. One per fork; a tree with no upstream has none. A file
 open before begin keeps writing to the fork (its target is fixed at open), so a long-lived open file blocks no
-transaction; the client's opens after begin write in the transaction. Errors: begin with one open (`InTransaction`),
+transaction; the client's opens after begin write in the transaction. A file open inside the transaction holds back
+every take into the fork, its syncs and its own forks' landings, until it closes, as an open on the fork does (§6;
+ledger R9.18, the owner's pick of 2026-11-12). Errors: begin with one open (`InTransaction`),
 commit or rollback with none (`NoTransaction`), after the client ended (`Ended`).
 
 **Other I/O on its files is deferred** (ledger R5.3; the owner, 2026-11-05: "deferred, obviously. thats what i mean by
@@ -826,6 +828,7 @@ policy of this revision included. Every check runs after every step, in every sc
 | Every losing change is replicated, eventually, and stays: once the mirror's push drains, the commits of the mirror's root history hold the run's collisions, each re-read on the mirror alone, its writer and line | `losers_pushed` | `r3_a_save_before_the_sync_arrives_loses_to_the_upstream`, every collision |
 | The mirror's push is pending whenever the mirror lacks the root's tip or a collision ref, a fork's included (§4) | `mirror_current` | every collision, `r4_nested_forks_follow_the_same_rules` |
 | No tree and no open transaction shows a joined line: only a file's last live line may lack its newline (§7, §9) | `no_joined_lines` | `r10_a_transactions_line_after_the_forks_unfinished_line_loses_whole`, `r10_a_transactions_unfinished_line_before_a_kept_line_loses_whole` |
+| A take writes no file open in its tree or in that tree's open transaction, by the harness's reading of the opens (§6, §9) | `oracle_locks` | `r9_a_file_open_in_a_transaction_holds_back_the_forks_sync`, `r9_a_file_open_in_a_transaction_holds_back_a_landing_into_its_fork` |
 | Nested forks follow the same rules | all checks | `r4_nested_forks_follow_the_same_rules` |
 | Full lineage, read by ancestry alone: a tree's history reaches every change it took | `full_lineage` | `r7_every_fork_commit_lands_on_its_own_in_the_roots_history`, `r7_the_root_reaches_a_losing_commit_and_its_ref_keeps_it`, `random_interleavings_full_lineage` |
 | Trees converge when writes stop | `check_converged` | `convergence_when_writes_stop` |

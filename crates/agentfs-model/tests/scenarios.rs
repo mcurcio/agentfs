@@ -1881,6 +1881,60 @@ fn r9_a_sync_waits_for_an_open_writer_then_applies() {
     drain(&mut w);
 }
 
+/// R9.18 (the owner, 2026-11-08: "Yes. “Waiting longer” is a feature of locks and
+/// transactions, not a bug"): a file open inside a transaction holds back the
+/// fork's sync of it until it closes, as an open on the fork does (R9.3).
+#[test]
+fn r9_a_file_open_in_a_transaction_holds_back_the_forks_sync() {
+    let mut w = world();
+    let f = w.create_fork(TreeId::ROOT);
+    w.begin(f).unwrap();
+    let h = w.open_write(&Client::Fork(f), "a");
+    assert!(
+        matches!(w.handle(h).target, Target::Txn(..)),
+        "in the transaction"
+    );
+    let m = w.save(&m1(), "a", 0);
+    take(&mut w, &Step::Next(f));
+    assert_eq!(w.waiting_for(f), BTreeSet::from(["a".to_string()]));
+    assert!(!w.pending().contains(&Step::Next(f)));
+    assert!(!has(&w, f, "a", &m), "not written");
+    let x = w.edit(h, LineEdit::At(1)).unwrap();
+    w.close(h);
+    ok(&mut w);
+    assert!(w.waits().is_empty(), "the close woke it");
+    next(&mut w, f);
+    assert!(has(&w, f, "a", &m), "the sync took the root's line");
+    assert_eq!(w.commit_txn(f), Ok(TxnOutcome::Committed));
+    let a = w.read(f, "a");
+    assert_eq!((a.at(0), a.at(1)), (m.as_str(), x.as_str()));
+    drain(&mut w);
+}
+
+/// R9.18 for every take (the owner, 2026-11-12, picking "A file open inside a
+/// transaction holds back every take into its fork until it closes"): a
+/// landing from the fork's own fork waits for the file open inside the
+/// fork's transaction, as R9.1's landing waits for an open on the fork.
+#[test]
+fn r9_a_file_open_in_a_transaction_holds_back_a_landing_into_its_fork() {
+    let mut w = world();
+    let f = w.create_fork(TreeId::ROOT);
+    let g = w.create_fork(f);
+    w.begin(f).unwrap();
+    let h = w.open_write(&Client::Fork(f), "a");
+    let y = w.save(&Client::Fork(g), "a", 2);
+    take(&mut w, &Step::Next(f));
+    assert_eq!(w.waiting_for(f), BTreeSet::from(["a".to_string()]));
+    assert!(!has(&w, f, "a", &y), "not written");
+    w.close(h);
+    ok(&mut w);
+    assert!(w.waits().is_empty(), "the close woke it");
+    next(&mut w, f);
+    assert!(has(&w, f, "a", &y), "the landing took g's line");
+    assert_eq!(w.commit_txn(f), Ok(TxnOutcome::Empty));
+    drain(&mut w);
+}
+
 /// Rule 9, the same rule for a landing into a tree (a choice): the root's
 /// queue waits while one of the root's clients has the file open for writing.
 #[test]

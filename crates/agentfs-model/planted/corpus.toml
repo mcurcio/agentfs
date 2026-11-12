@@ -464,3 +464,12 @@ find = '''
 replace = '''
         for &c in children.iter().take(1) {
             self.next_seq += 1;'''
+
+[[bug]]
+id = "transaction_open_holds_nothing"
+rule = "R9.18"
+seeds = 64
+find = '''
+            targets.push(Target::Txn(t, txn.id));'''
+replace = '''
+            let _ = txn;'''

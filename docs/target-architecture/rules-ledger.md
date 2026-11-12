@@ -287,12 +287,16 @@ of their day: "main" is the root, a "sandbox" is a fork, a "parent" is an upstre
   his 3, option (b) of finding 38: the model changes, not the library. Revisable: option (a) was to count only a change to
   what the file shows. Cost: a fork holding a file open waits longer for later commits.
   Tests: `r9_a_sync_delivers_up_to_the_first_change_to_an_open_file`, `finding_38_a_sync_past_an_open_file_waits_for_any_line_map_change`
-- **R9.18** · owner · A file open inside a transaction on a fork holds back that fork's syncs from its upstream until it
-  closes, as a file open on the fork does under R9.3. Asked, 2026-11-08, whether a file held open inside a transaction
-  should hold back syncs as an open on the fork does under R9.3, the owner answered: "Yes. “Waiting longer” is a feature
-  of locks and transactions, not a bug". Revisable: it is his answer, not a rule. Cost: a transaction that keeps a file
-  open delays the fork's syncs for as long. Not built: the model counts only opens on the tree (`write_open` filters
-  `Target::Tree`).
+- **R9.18** · owner · A file open inside a transaction on a fork holds back every take into that fork, its syncs from
+  its upstream and its own forks' landings, until it closes, as a file open on the fork does under R9.3 and R9.1. Asked,
+  2026-11-08, whether a file held open inside a transaction should hold back syncs as an open on the fork does under
+  R9.3, the owner answered: "Yes. “Waiting longer” is a feature of locks and transactions, not a bug". Asked, 2026-11-12,
+  whether it holds back every take into its fork or only syncs, he picked "every take" (the option, worded by the agent:
+  "A file open inside a transaction holds back every take into its fork until it closes"). Revisable: it is his answer,
+  not a rule. Cost: a transaction that keeps a file open delays the fork's syncs, and its own forks' landings, for as
+  long.
+  Tests: `r9_a_file_open_in_a_transaction_holds_back_the_forks_sync`,
+  `r9_a_file_open_in_a_transaction_holds_back_a_landing_into_its_fork`
 - **R9.4** · approved · A sync or landing waits for all its files at once, never holding one while it waits for
   another. Approved by the owner, 2026-11-05 (approval page); he asked whether a fast writer can starve a landing (open, with R9.8). 
 - **R9.5** · approved · A waiting entry waits only for its own files, and for earlier entries that share a file

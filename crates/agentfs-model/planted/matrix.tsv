@@ -39,5 +39,6 @@ sync_decides_the_collision	R3	64	caught	no_silent_loss
 sync_delivers_past_an_open_file	P2	64	caught	assert
 sync_never_delivers_a_prefix	P2	64	caught	assert
 transaction_close_saves_at_once	R5.3	64	caught	assert
+transaction_open_holds_nothing	R9.18	64	caught	assert
 unfinished_line_lands_before_a_kept_line	R10.8	64	caught	no_joined_lines
 waiting_take_records_only_open_files	R9	64	caught	locks

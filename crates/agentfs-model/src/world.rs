@@ -11,7 +11,7 @@
 //! | 6. Attribution | every commit names one writer in an `Agentfs-Writer` trailer; a sync is a merge with the upstream's commit as second parent |
 //! | 7. Full lineage | a landing is a merge with the fork's commit as second parent (or a fast-forward), so a tree's history reaches every change it took, the losers included; each fork commit lands on its own |
 //! | 8. A save records the write calls | [`World::write`] keeps each byte call ([`Write`](crate::recording::Write): an `O_APPEND` write, `pwrite`, `ftruncate`; [`World::open_trunc`] for `O_TRUNC`) on the open file; [`World::close`] applies them to the tree's head then: an append's bytes go after the file's last byte, finishing a partial last line (a version of it) and then making new lines; other calls leave bytes the save aligns with the head's lines (rule 10). [`World::edit`] makes a test's line edit as a program's byte calls (`program`) |
-//! | 9. A take locks the files it overwrites | [`World::open_write`]; a [`TreeStep::Next`] whose sync or landing would overwrite a file open for writing in that tree waits ([`World::waits`]) until the close; else it takes its entry, locks its files and writes them in that one step ([`World::last_take`]), so no call runs while a take holds a file (the owner, 2026-11-08, finding 49: "B"); a client's death ([`World::end_client`], [`World::end_root_client`]) closes its files |
+//! | 9. A take locks the files it overwrites | [`World::open_write`]; a [`TreeStep::Next`] whose sync or landing would overwrite a file open for writing in that tree waits ([`World::waits`]) until the close; else it takes its entry, locks its files and writes them in that one step ([`World::last_take`]), so no call runs while a take holds a file (the owner, 2026-11-08, finding 49: "B"); a client's death ([`World::end_client`], [`World::end_root_client`]) closes its files; a file open inside a fork's transaction counts as open in the fork for every take into it (R9.18) |
 //! | 10. Line identity | a save derives identities from the bytes at close: it aligns them with the head's lines once, by git's histogram diff (`align`), and records the result: each new line an identity, each changed line a new version written over the version it replaced; the referee and a sync then compare versions of one identity, never bytes or positions (the referee: `referee/placing.rs` places them); a line a take (a landing, or a transaction's commit into its fork: the referee is given no direction) would put after the upstream's unfinished last line collides with it (R10.4, R10.5), and so does an unfinished line a take would put in front of a line the upstream keeps (R10.8, R10.11); until the upstream decides, a sync hides the upstream's unfinished last line in front of an undecided line (R10.6) and the upstream's lines after an undecided unfinished line (R10.9) |
 //! | 9, progress (git-model.md §6) | P1: a [`TreeStep::Next`] takes the first entry no earlier waiting entry shares a file or a source with (`queue`'s scan), so several may wait ([`World::waits`]); no call ever waits on a waiting entry (P3 is gone, the owner's decision of 2026-11-04): a new open of a file a waiting entry waits for is granted; P2, the prefix sync: a sync delivers the upstream's commits in order up to the first whose delivery would overwrite a file open for writing in the fork, and waits for the rest (`queue`'s prefix, its `Cut`) |
 //! | 11. Deletes and renames | a file's name line: [`World::rename`] writes a new version, [`World::unlink`] a deleted one; the referee's land applies the per-line rule to it and couples a file's existence with its content. [`World::create`] makes a file (an unborn identity); an open holds an object ([`Handle::object`](crate::recording::Handle::object)), so a close saves to the file its object is named by ([`World::named`]) or, for an orphan, nothing ([`Orphan`](crate::recording::Orphan), kept by `recording`); a rename-over from a new file is an atomic save, a rewrite of the replaced file |
@@ -735,15 +735,26 @@ impl World {
         self.queues.deferred(f).collect()
     }
 
-    /// What a client of `t` has open for writing, and what its
-    /// deferred calls (R5.3) will save: each file and the name it has now (R9.1,
-    /// [`queue::NAME_KEY`]). An open whose object no path names (an orphan) has no file open.
+    /// What a client of `t` has open for writing, in `t` or in `t`'s open
+    /// transaction (R9.18: a file open inside a transaction holds back every take
+    /// into its fork until it closes), and what its deferred calls (R5.3) will
+    /// save: each file and the name it has now (R9.1, [`queue::NAME_KEY`]), each
+    /// read in its own target, at that target's head. An open whose object no path
+    /// names (an orphan) has no file open.
     pub fn write_open(&self, t: TreeId) -> BTreeSet<String> {
-        let at = self.head(t);
-        self.recording
-            .open_files(t, &at, &self.objects)
+        let mut targets = vec![Target::Tree(t)];
+        if let Some(txn) = self.forks.get(&t).and_then(|f| f.txn.as_ref()) {
+            targets.push(Target::Txn(t, txn.id));
+        }
+        targets
             .into_iter()
-            .flat_map(|f| [name_key(&self.file(&at, &f)), Some(f)])
+            .flat_map(|target| {
+                let at = self.target_head(target);
+                self.recording
+                    .open_files(target, &at, &self.objects)
+                    .into_iter()
+                    .flat_map(move |f| [name_key(&self.file(&at, &f)), Some(f)])
+            })
             .flatten()
             .collect()
     }
@@ -1369,9 +1380,9 @@ impl World {
         let target = handle.target;
         let tokens = self.save_handle(&handle);
         self.note(format!("close h{h}: saved {tokens:?}"));
-        if let Target::Tree(t) = target {
-            self.wake(t);
-        }
+        // A close in a fork's transaction wakes the fork's takes too (R9.18).
+        let (Target::Tree(t) | Target::Txn(t, _)) = target;
+        self.wake(t);
         self.trace_call(RecordedCall::Close { h: u64::from(h) });
     }
 
@@ -1502,10 +1513,10 @@ impl World {
         self.commit_save(save);
         // An open of a file this call unlinked or replaced holds an object
         // no path names now, so no file of it is open: a take waiting for
-        // that close is woken.
-        if let Target::Tree(t) = h.target {
-            self.wake(t);
-        }
+        // that close is woken, in the tree or, for a transaction's call, its
+        // fork (R9.18).
+        let (Target::Tree(t) | Target::Txn(t, _)) = h.target;
+        self.wake(t);
         let caller = self.caller_of(&h.client);
         self.trace_call(match &h.kind {
             Kind::Rename { to, .. } => RecordedCall::Rename {
