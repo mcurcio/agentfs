@@ -453,6 +453,10 @@ phase1-replay library "$T" --min-scenarios 0 --min-seeds 0 --only NAME --record 
 phase1-replay model "$OUT" --min-scenarios 0 --min-seeds 0 --only NAME
 ```
 
+The phase 1 jobs record their replays this way: each mount's recording replays on a fresh model at the mount's
+floors (`ci/e2e-tree-replay.sh`), and the seed shards keep the library's recordings beside the traces
+(`ci/replay-seeds.sh`). Both are in the jobs' artifacts, so a mismatch arrives as an engine trace to replay.
+
 A fixed regression is kept as a fixture in `crates/agentfs-conformance/tests/regressions/`, with a test in
 `tests/regressions.rs` that asserts two things: the model fails the fixture at its call, and today's library makes
 the fixture's calls as recorded up to that call and differs there. The first proves the model catches the
