@@ -1,5 +1,6 @@
 //! The shared calls on the real library: `Volume`, in this process.
 
+use crate::ENGINE_ROOT;
 use agentfs_core::tree_actor::{self, Error, Volume};
 use agentfs_model::calls::{CallError, Caller, Took, TreeCalls, TreeId};
 use std::collections::BTreeMap;
@@ -15,10 +16,10 @@ const SEED_BYTES: &[u8] = b"-\n-\n-\n-\n-\n-\n";
 pub fn seed(volume: &mut Volume) -> Result<(), Error> {
     for path in SEEDED {
         let new = format!("{path}.new");
-        let h = volume.write_open("main", &new, "agentfs-seed", true)?;
+        let h = volume.write_open(ENGINE_ROOT, &new, "agentfs-seed", true)?;
         volume.write(h, 0, SEED_BYTES, false)?;
         volume.close(h)?;
-        volume.rename("main", &new, path, "agentfs-seed")?;
+        volume.rename(ENGINE_ROOT, &new, path, "agentfs-seed")?;
     }
     Ok(())
 }
@@ -70,7 +71,7 @@ impl Library {
 
     fn tree(&self, t: TreeId) -> Result<&str, CallError> {
         match t.number() {
-            0 => Ok("main"),
+            0 => Ok(ENGINE_ROOT),
             f => self
                 .forks
                 .get((f as usize).wrapping_sub(1))
@@ -82,7 +83,7 @@ impl Library {
     /// The tree and writer label of a caller, owned: calls take `&mut self`.
     fn who(&self, c: &Caller) -> Result<(String, String), CallError> {
         Ok(match c {
-            Caller::Main(n) => ("main".to_owned(), n.clone()),
+            Caller::Root(n) => (ENGINE_ROOT.to_owned(), n.clone()),
             Caller::Fork(f) => (self.tree(*f)?.to_owned(), format!("c{f}")),
         })
     }

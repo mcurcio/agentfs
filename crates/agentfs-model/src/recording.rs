@@ -257,9 +257,9 @@ pub(crate) struct Recording {
     /// commit: `check` reads rule 8's `O_APPEND` from them and the blobs,
     /// not from the replay.
     save_calls: BTreeMap<String, Vec<Write>>,
-    /// Main's clients that ended (rule 9: their end event released their
+    /// The root's clients that ended (rule 9: their end event released their
     /// locks).
-    ended_main: BTreeSet<String>,
+    ended_root: BTreeSet<String>,
 }
 
 impl Recording {
@@ -273,13 +273,13 @@ impl Recording {
             counters: BTreeMap::new(),
             orphans: Vec::new(),
             save_calls: BTreeMap::new(),
-            ended_main: BTreeSet::new(),
+            ended_root: BTreeSet::new(),
         }
     }
 
     /// A new open (or a path call, rule 11) of `file` at `target`, holding its object there.
     /// No take is ever in progress between calls (a take is one step), so none waits. Panics
-    /// for a main client that ended.
+    /// for a root client that ended.
     pub(crate) fn open(
         &mut self,
         c: &Client,
@@ -289,7 +289,7 @@ impl Recording {
         kind: Kind,
     ) -> HandleId {
         assert!(
-            !matches!(c, Client::Main(n) if self.ended_main.contains(n)),
+            !matches!(c, Client::Root(n) if self.ended_root.contains(n)),
             "a call by {c:?}, which ended"
         );
         let id = self.next_handle;
@@ -678,9 +678,9 @@ impl Recording {
         self.save_calls.insert(commit, calls);
     }
 
-    /// One of main's clients ended: it opens nothing after.
-    pub(crate) fn end_main_client(&mut self, writer: &str) {
-        self.ended_main.insert(writer.to_string());
+    /// One of the root's clients ended: it opens nothing after.
+    pub(crate) fn end_root_client(&mut self, writer: &str) {
+        self.ended_root.insert(writer.to_string());
     }
 
     /// Every `OrphanDropped` event.
@@ -692,8 +692,8 @@ impl Recording {
         &self.save_calls
     }
 
-    pub(crate) fn ended_main(&self) -> &BTreeSet<String> {
-        &self.ended_main
+    pub(crate) fn ended_root(&self) -> &BTreeSet<String> {
+        &self.ended_root
     }
 
     /// File `p`'s lines `cur` with byte calls replayed on them (rules 8 and
@@ -874,7 +874,7 @@ mod tests {
     const ROOT: Target = Target::Tree(TreeId::ROOT);
 
     fn client() -> Client {
-        Client::Main("m".into())
+        Client::Root("m".into())
     }
 
     fn line(id: &str, text: &str) -> Line {

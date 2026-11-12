@@ -1,6 +1,6 @@
 # Cutting the tree engine into modules
 
-**Partly built: in the model, the referee units, recording, and queue and locks are built.** This page proposes one home per rule: six modules, with the tree actor only composing them,
+**Partly built: in the model, the referee units, the tree identity, recording, queue and locks, and the root's name as a value are built.** This page proposes one home per rule: six modules, with the tree actor only composing them,
 in both the model and the engine. The commit that lands this slice deletes this page and moves the behaviour into the
 library docs.
 
@@ -23,7 +23,7 @@ Every statement here is about one fork and its one upstream.
 
 | Term | Means | Source |
 |---|---|---|
-| root | The native tree with no upstream. It holds the canonical history | Guidance, owner, 2026-11-08: "I like the idea of agentfs having a native root to its tree which holds the canonical history, and then having a different model for mirror repos" |
+| root | The native tree with no upstream. It holds the canonical history. Its branch's name is configured, never fixed ([root branch name](root-branch-name.md)) | Guidance, owner, 2026-11-08: "I like the idea of agentfs having a native root to its tree which holds the canonical history, and then having a different model for mirror repos" |
 | upstream | The one tree a fork syncs from and lands into. It is itself a tree, and may be a fork of another | Guidance, owner, 2026-11-08: "from the perspective of f2, f1 is its upstream. remember, there is no "main" in this new model of upstreams and forks" |
 | fork | A tree with exactly one upstream | Same |
 | mirror | A remote copy, such as GitHub. It is not an upstream and is not part of the tree | Guidance, owner, 2026-11-08: "GitHub is something closer to a peer than an upstream" |
@@ -31,8 +31,8 @@ Every statement here is about one fork and its one upstream.
 What this changes in the code:
 
 - The model has one tree identity, `calls::TreeId`: a number, the root 0 and each fork the next from 1. A tree's
-  upstream is the world's answer (`World::upstream_of`), and the root is simply the tree without one. No module asks
-  whether a tree is "main".
+  upstream is the world's answer (`World::upstream_of`), and the root is simply the tree without one. No module
+  compares a tree's name to find the root: its name is configured (`world::TreeNames`).
 - The referee takes one pair at a time: land is a fork into its upstream, sync is an upstream into a fork.
 - The model's built-in `remote` leaves `World` (step 6). Tree history publishes that a tree moved; mirrors subscribe.
   What a mirror may send back, pull requests included, belongs to the mirror's own design
@@ -87,7 +87,7 @@ git's ref files. It does not yet re-derive the rest from git; a later step does,
 |---|---|---|
 | The model's records | `landings`, `syncs`, `entered`, `collisions`, `ended`, `discarded`, `save_calls`, `last_take` | most checks |
 | Each change's edits | `World::edits` | `changes_whole`, `placed_and_unlinked`, `taken_only_past` |
-| Each tree's head | `World::head` and the fork list, not git's refs | `views`, the queue step's checks, `prefix_cut`, `delivered`, `entry_files`, `trees_equal_main` and others |
+| Each tree's head | `World::head` and the fork list, not git's refs | `views`, the queue step's checks, `prefix_cut`, `delivered`, `entry_files`, `trees_equal_root` and others |
 | A file at a commit, and ancestry | `World::file` and `World::is_ancestor`, over `World`'s caches of git objects | almost every check |
 | Queues, waits, opens and handles | `queue_numbered`, `waits`, `write_open`, `handles` | `locks`, `p1_first`, the queue step's checks |
 
@@ -125,7 +125,9 @@ the trees from their plans. Recording is `crates/agentfs-model/src/recording.rs`
 orphans and each close's save, read through a `Files` port; the world commits the save. Queue and locks is
 `crates/agentfs-model/src/queue.rs`: the queues, P1's scan, the locks a take holds, the `Cut` a sync delivers to,
 and the order of deferred calls, read through two ports the world implements: `Keys` (lock keys and lineage, all P1's
-scan reads) and `Plans` (a landing's plan and written keys, a sync's tree). The world composes them;
+scan reads) and `Plans` (a landing's plan and written keys, a sync's tree). Every tree's git name comes from one
+value, `world::TreeNames`, which the world is given: the model's runs name the root `MODEL_ROOT` (`root`), and
+conformance names it as the engine does (`ENGINE_ROOT`). The world composes them;
 it still holds tree history, transactions, the journal's replay, replication and the trace, which no step here
 cuts. How to use the net is in the model's `VERIFYING.md`
 ("Refactoring without changing outcomes") and the repo skill `.claude/skills/model-runs`.
@@ -139,10 +141,12 @@ cuts. How to use the net is in the model's `VERIFYING.md`
 - `run.py --anchors-only` reports no STALE;
 - the model, conformance and safety-net tests pass.
 
-Measured on step 1: digest 627 s, corpus 235 s. A matrix row or digest that changes is a finding to explain, never a
+A step whose diff meets the light tier's test in `VERIFYING.md` ("Refactoring without changing outcomes") runs that
+tier instead (guidance, owner, 2026-11-11). Measured on step 1: digest 627 s, corpus 235 s. A matrix row or digest that changes is a finding to explain, never a
 re-record, except where a row says the digest is re-baselined on purpose.
 
-**How each step runs.** Each step is its own session and its own PR to `main`, in this order:
+**How each step runs.** Each step is its own session and its own PR to the repository's `main` branch, in this
+order. Step 3 is three PRs, 3a to 3c (guidance, owner, 2026-11-11: "2 PRs is fine"; then "New pr is fine"):
 
 1. **Architect.** It designs the step and probes its risky seams, before anyone implements it. Guidance, owner,
    2026-11-09: "I want each phase of the work to start with an architect".
@@ -156,10 +160,15 @@ A change to the safety net itself runs its quick tier and a review before any fu
 | # | Step | Gate |
 |---|---|---|
 | 2 | Built. Model: referee units out of `resolve`, `adopt` and `splice` | The model gate |
-| 3 | Built. Model: one tree identity, `calls::TreeId`, with its upstream from `World::upstream_of`, keeping today's order (root first, forks ascending); the digest's tree labels still come from `World::name`, `World::branch`, `World::txn_name` and `World::txn_branch`, and `canonical_text_is_pinned` is unchanged. Recording, and queue and locks, split out, with `World` composing them. The replicate step keeps its place among the pending steps, because random runs draw from that list | The model gate. Names may change, outcomes may not |
-| 4 | Recorder: an engine call sequence becomes a model trace, so a regression found on a mount replays in the model. Guidance, owner, 2026-11-07: "if new regressions are found in the implementation, then those regressions can be verified and fixed via the git model" | One known regression replays |
+| 3a | Built. Model: one tree identity, `calls::TreeId`, with its upstream from `World::upstream_of`, keeping today's order (root first, forks ascending); the digest's tree labels come from the one place that names trees (now `world::TreeNames`), and `canonical_text_is_pinned` is unchanged | The model gate. Names may change, outcomes may not |
+| 3b | Built. Model: recording, and queue and locks, split out, with `World` composing them. The replicate step keeps its place among the pending steps, because random runs draw from that list | The model gate |
+| 3c | Built. Model and conformance: no tree is named "main". `Caller::Root` and `Client::Root`, the trace's root caller `r:<hex>`, the root's name a value (`world::TreeNames`, given to `World::new`; `MODEL_ROOT` is `root`), and conformance's one engine name, `ENGINE_ROOT`. Five scenario tests renamed, with their digest keys and byte-identical values (guidance, owner, 2026-11-11, asked whether they may be renamed with identical values: "Yes"). Writer labels (`m1`, ...) stay: they are data the digest pins. `digest`'s unit tests run one run under four root names and get one text, and check the names `TreeNames::new` refuses | The light tier of the model gate (`VERIFYING.md`, "Refactoring without changing outcomes"), by the owner's exception for this step (guidance, 2026-11-11: "That gate process seems too heavy for this"). By the tier's own test its diff needs the full gate (a new type, changed signatures, a computed ref in `check.rs`), so the seeds' digests (`check --all`) and the whole corpus are not shown for it. Plus one `phase-1.yml` dispatch, the only CI that runs the oracle and the new `r:` traces |
+| 4 | Recorder: an engine call sequence becomes a model trace, so a regression found on a mount replays in the model. Guidance, owner, 2026-11-07: "if new regressions are found in the implementation, then those regressions can be verified and fixed via the git model". Designed for two sources feeding one recorder; this step builds the first, A: the harness records at `TreeCalls` (agentfs-model's `calls::record`, and conformance's library and mount harnesses), in the trace format with the root caller `r:`. Guidance, owner, 2026-11-11: "I agree with the approach of “design for both, build the A solution first”." So the recorder is a sink both sources can feed: it takes each call with its result as it happens, failed calls included, and drives no system itself; the harness (A) feeds it, and B feeds the same entry later. Step 4's architect designs it from this row; a draft made before 3c is not in the repo and is superseded where it differs: the root caller is `Caller::Root(writer)` and the trace's root prefix `r:` (a trace with the old `m:` fails to parse, and none is stored); the engine's root name comes from `agentfs_conformance::ENGINE_ROOT`, not a literal; conformance's engine-naming type takes a name apart from the model's `world::TreeNames` (for example `EngineNames`), since engine forks are `fork/<event>`. The root caller names a writer and a fork caller a tree, because the root has many writers and a fork one. The regression it must replay was introduced in `6049b1b` and fixed in `e9ab747` | One known regression replays |
+| later (engine source) | Recorder source B: agentfs-core's OpenTelemetry events feed the same recorder through an adapter in agentfs-conformance (a lossless, unsampled, in-process listener; content hashes, not bytes; event names defined once in agentfs-core's telemetry and [telemetry](../../telemetry.md)). Guidance, owner, 2026-11-11: "we probably need A+B eventually, written in such a way that we have one observability engine that can receive data from the disparate components". Depends on [tree-view telemetry](tree-view-telemetry.md), whose export never blocks a save and so may drop data: this source needs its own lossless listener in the process, beside that export, and squaring the two is this step's first design question. Not yet numbered: it is ordered after step 4 and before any use of it | A regression found on a mount replays from the engine's own events, with no harness |
 | 5 | Engine: remove the duplicated ancestry check, name combining and R3e; a typed version; then split `tree_actor/mod.rs` | Conformance traces on every scenario and seed stay at 0 mismatched |
-| 6 | Model: R9.18, R10.5 and R10.11 (see [transactions](transactions.md)); the built-in `remote` and its replicate step leave `World`. `MODEL.md` says Replication is "due on every move of main and every collision", which is stricter than any check: a planted bug that dropped the flag at a collision changed no digest and tripped no check, because the next move of main pushes anyway. This step settles what a mirror's push timing must be | The digest is re-baselined on purpose; finding 30's test is no longer ignored |
+| 5b | Engine: the root branch's name is configured, not `main` ([root branch name](root-branch-name.md)); `ENGINE_ROOT` is deleted. Its architect may pull it before step 5 | That page's gate |
+| 6 | Model: R9.18, R10.5 and R10.11 (see [transactions](transactions.md)); the built-in `remote` and its replicate step leave `World`. `MODEL.md` says Replication is "due on every move of the root and every collision", which is stricter than any check: a planted bug that dropped the flag at a collision changed no digest and tripped no check, because the next move of the root pushes anyway. This step settles what a mirror's push timing must be | The digest is re-baselined on purpose; finding 30's test is no longer ignored |
 | later | Checker: re-derive from git what it still reads through `World` (the table under design rule 3) | The matrix changes on purpose, with every planted bug still caught |
 
-Not in this slice: the older engine (`volume.rs`, `push.rs`), and building mirrors on the tree model.
+Not in this slice: the older engine (`volume.rs`, `push.rs`), and building mirrors on the tree model. Configuring the
+root branch's name is its own slice, [root branch name](root-branch-name.md), ordered here as step 5b.

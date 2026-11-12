@@ -9,7 +9,7 @@ foundation the implementation follows); this page does not restate them.
 
 ## What the model is for
 
-`crates/agentfs-model` runs the target design on the real `git` program: main and each fork are branches,
+`crates/agentfs-model` runs the target design on the real `git` program: the root and each fork are branches,
 every save is a commit, and the rules decide what each tree shows. It is tests only and depends on no other
 agentfs crate. A design rule counts as designed when the model encodes it, its scenario tests show it, and
 every invariant holds after every step of every run. A rule that exists only in prose is not yet designed.
@@ -252,8 +252,8 @@ the pull request body reports them), prove it:
   built only from git (every reachable commit numbered by a walk from the refs, with its git tree, parents by
   number and whole message, then the local refs and the shared remote's refs with their tips' numbers), hashed
   with `git hash-object`. Commit ids, dates and in-memory records are left out; tree names become labels (`T<tree number>`,
-  the root `T0`, and `X<transaction id>`) through the one place that names trees (`World::name`, `World::branch`,
-  `World::txn_name`, `World::txn_branch`), so a rename edits that place only. `canonical_text_is_pinned` pins the
+  the root `T0`, and `X<transaction id>`) through the one place that names trees (`world::TreeNames`, which the
+  world is given), so a rename edits that place only, and the root's name changes no digest. `canonical_text_is_pinned` pins the
   text on a hand-built repository: a change to the format fails it, and is a deliberate re-record of the golden.
   The golden holds for one git release (`ci/git-release`); the runner refuses any other.
 - **The planted-bug corpus** (`planted/corpus.toml`, `planted/run.py`, `planted/matrix.tsv`): each bug is an
@@ -262,6 +262,23 @@ the pull request body reports them), prove it:
   run before any bug runs, and is re-anchored in the same commit. A bug counts as caught only by a named check
   (an invariant of `src/check.rs`, the random runs' `oracle_*` checks or the `ledger`) or by an explicit
   assertion in a test file; a panic in the model or the harness never counts, in either test binary.
+
+Which gate a change needs is decided by what its diff touches, not by judgement. The owner, 2026-11-11: "That gate
+process seems too heavy for this. Isn't the big gate about validating the merge framework?"; asked whether a light
+tier serves renames, docs and changes that move no rule logic: "Yes" (guidance).
+
+- **The light tier**, when every change is one of these: a doc or Markdown file; a comment; an identifier, test name
+  or message text renamed at every site; an import or formatting; a unit test added in a `#[cfg(test)]` module of
+  `src/**` (neither the digest nor the corpus runs those); a digest key renamed with its value byte for byte the same
+  (show the value column before and after). It runs, through `ci/model-docker.sh`, one job at a
+  time: `planted/run.py --anchors-only` (silent), `ci/model-digest.sh check` (the scenario digests match), the
+  model's tests (scenarios and seeds 1..64), conformance's tests, the safety-net tests, and `planted/run.py --only`
+  the bugs whose anchors moved (each still caught); then `cargo fmt` and `cargo clippy`.
+- **The full gate**, for anything else that touches `crates/agentfs-model/src/**` or its `tests/**`: a changed
+  condition, branch, statement, call or loop; code moved between functions or files; a change to `src/digest.rs`'s
+  text, to `ci/model-digest.sh` or `planted/run.py`; a digest value, a `planted/matrix.tsv` row or a
+  `planted/corpus.toml` find or replace changed for any reason but re-anchoring a renamed token. It is the light
+  tier with `ci/model-digest.sh check --all` (all runs) and the whole corpus in place of `check` and `--only`.
 
 Run every model job in a container through `ci/model-docker.sh`, never a hand-written `docker run` (the repo skill
 `model-runs` says how and why). The wrapper always passes `--init` (without it, orphaned git processes pile up as

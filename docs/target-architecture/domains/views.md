@@ -171,7 +171,7 @@ pub struct ViewCaughtUp { view: ViewId, tree: TreeRef, to: CommitId }
 
 ## 6. Flows
 
-**A write and its save** (main and forks alike).
+**A write and its save** (the root and forks alike).
 
 ```mermaid
 sequenceDiagram

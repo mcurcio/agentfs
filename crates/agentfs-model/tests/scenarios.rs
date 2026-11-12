@@ -9,13 +9,13 @@ use agentfs_model::content::{BLANK, Content, Layout, Line, State};
 use agentfs_model::git::{git, with_reversed_dates};
 use agentfs_model::recording::{Target, Write};
 use agentfs_model::world::{
-    By, Direction, Life, LineEdit, MergeRule, ModelError, Overwritten, Policies, Step, TxnOutcome,
-    World, decisions_in,
+    By, Direction, Life, LineEdit, MODEL_ROOT, MergeRule, ModelError, Overwritten, Policies, Step,
+    TreeNames, TxnOutcome, World, decisions_in,
 };
 use std::collections::BTreeSet;
 
 fn world() -> Checked {
-    Checked::new(Policies::default())
+    Checked::new(Policies::default(), TreeNames::new(MODEL_ROOT))
 }
 
 /// Every invariant, now.
@@ -52,7 +52,7 @@ fn drain(w: &mut Checked) {
 }
 
 fn m1() -> Client {
-    Client::Main("m1".into())
+    Client::Root("m1".into())
 }
 
 fn has(w: &World, t: TreeId, p: &str, token: &str) -> bool {
@@ -63,8 +63,8 @@ fn show(w: &World, rev: &str, format: &str) -> String {
     git(w.repo(), &["log", "-1", &format!("--format={format}"), rev])
 }
 
-/// The writers of main's first-parent commits, newest first.
-fn main_writers(w: &World) -> Vec<String> {
+/// The writers of the root's first-parent commits, newest first.
+fn root_writers(w: &World) -> Vec<String> {
     git(
         w.repo(),
         &[
@@ -104,7 +104,7 @@ fn r1_writes_never_wait_and_forks_sync_both_ways() {
 
 // ── rule 2: one landing queue per tree; no clock ────────────────────────
 
-/// Rule 2: main's queue fixes the order its children's commits land in,
+/// Rule 2: the root's queue fixes the order its children's commits land in,
 /// whatever order the scheduler visits the forks.
 #[test]
 fn r2_one_queue_fixes_the_landing_order() {
@@ -122,7 +122,7 @@ fn r2_one_queue_fixes_the_landing_order() {
     for _ in 0..3 {
         next(&mut w, TreeId::ROOT);
     }
-    assert_eq!(main_writers(&w)[..3], ["c1", "c2", "c1"]);
+    assert_eq!(root_writers(&w)[..3], ["c1", "c2", "c1"]);
     drain(&mut w);
 }
 
@@ -197,7 +197,7 @@ fn r2_no_clock_commit_dates_decide_nothing() {
 
 // ── rule 3: the upstream's queue decides; the upstream's version wins ─────
 
-/// Rule 3: an edit whose base is main's current version replaces it: main's
+/// Rule 3: an edit whose base is the root's current version replaces it: the root's
 /// head becomes the fork's commit.
 #[test]
 fn r3_fast_forward_when_the_base_is_current() {
@@ -212,13 +212,13 @@ fn r3_fast_forward_when_the_base_is_current() {
     drain(&mut w);
 }
 
-/// Rule 3, a fork's landing into main, the one place their collision is
-/// decided: main's concurrent same-line line wins ("i think the updated
+/// Rule 3, a fork's landing into the root, the one place their collision is
+/// decided: the root's concurrent same-line line wins ("i think the updated
 /// main should win in a conflict"). The collision names the fork's lost
-/// line and main's line that won; the fork's losing commit stays
-/// reachable under the collision's ref. The sync main queued into the fork
+/// line and the root's line that won; the fork's losing commit stays
+/// reachable under the collision's ref. The sync the root queued into the fork
 /// when it wrote its line is processed after the landing: it carries
-/// main's decided version, so the fork takes m.
+/// the root's decided version, so the fork takes m.
 #[test]
 fn r3_landing_collision_the_upstream_wins() {
     let mut w = world();
@@ -253,10 +253,10 @@ fn r3_landing_collision_the_upstream_wins() {
     assert_eq!(w.collisions.len(), 1, "recorded once");
 }
 
-/// Rule 3, no flip-flop (coherence finding 4, resolved): main's sync
+/// Rule 3, no flip-flop (coherence finding 4, resolved): the root's sync
 /// reaches the fork before the fork's own concurrent edit lands. The
-/// sync decides nothing, so the fork keeps its x; main's queue then
-/// decides, main's m wins, and the fork takes m. Its line changes once,
+/// sync decides nothing, so the fork keeps its x; the root's queue then
+/// decides, the root's m wins, and the fork takes m. Its line changes once,
 /// x then m, never x, m, x (the `no_flicker` invariant checks this in every
 /// run).
 #[test]
@@ -265,7 +265,7 @@ fn r3_a_fork_never_flips_back_to_its_own_edit() {
     let f = w.create_fork(TreeId::ROOT);
     let x = w.save(&Client::Fork(f), "a", 0);
     let m = w.save(&m1(), "a", 0);
-    next(&mut w, f); // main's sync, before x lands
+    next(&mut w, f); // the root's sync, before x lands
     assert!(has(&w, f, "a", &x), "the fork decided");
     assert!(w.collisions.is_empty(), "a sync records nothing");
     let head = w.head(f);
@@ -273,7 +273,7 @@ fn r3_a_fork_never_flips_back_to_its_own_edit() {
         show(&w, &head, "%(trailers:key=Agentfs-Cause,valueonly)"),
         "Sync"
     );
-    next(&mut w, TreeId::ROOT); // main's queue decides
+    next(&mut w, TreeId::ROOT); // the root's queue decides
     assert!(has(&w, TreeId::ROOT, "a", &m) && !has(&w, TreeId::ROOT, "a", &x));
     drain(&mut w);
     assert!(has(&w, f, "a", &m));
@@ -286,8 +286,8 @@ fn r3_a_fork_never_flips_back_to_its_own_edit() {
 }
 
 /// Rule 3, an edit on a line the upstream has not decided: the fork
-/// writes y over its own x while main's concurrent m waits for x's
-/// landing. y never saw m, so it collides with m too, and main's m wins
+/// writes y over its own x while the root's concurrent m waits for x's
+/// landing. y never saw m, so it collides with m too, and the root's m wins
 /// again. The sync between them showed the fork nothing of m: what a
 /// fork wrote over is read per line, not from which commits its version
 /// merged.
@@ -306,8 +306,8 @@ fn r3_an_edit_over_an_undecided_line_still_collides() {
 }
 
 /// Rule 3, an edit made on the upstream's current version replaces it: the
-/// fork's x loses to main's m and the fork takes m; it then writes
-/// y over m, and y replaces m in main without a collision.
+/// fork's x loses to the root's m and the fork takes m; it then writes
+/// y over m, and y replaces m in the root without a collision.
 #[test]
 fn r3_an_edit_over_the_decided_line_replaces_it() {
     let (w, y) = crossing(MergeRule::PerLine);
@@ -319,10 +319,10 @@ fn r3_an_edit_over_the_decided_line_replaces_it() {
 /// saves after the sync has landed, then arguably the sandbox was the last
 /// writer and its change should take effect"). A save's first parent is
 /// the tree's head when it is made, so whatever the tree held then counts
-/// as seen. The fork has its own unlanded line b, so main's m arrives
-/// as a sync commit (a `Sync` merge naming `agentfs`, main's commit
+/// as seen. The fork has its own unlanded line b, so the root's m arrives
+/// as a sync commit (a `Sync` merge naming `agentfs`, the root's commit
 /// second); the fork's y on m's line is written over m and replaces it
-/// in main by lineage, with no collision.
+/// in the root by lineage, with no collision.
 #[test]
 fn r3_a_save_after_the_sync_wins_upstream_by_lineage() {
     let mut w = world();
@@ -347,11 +347,11 @@ fn r3_a_save_after_the_sync_wins_upstream_by_lineage() {
     assert!(w.collisions.is_empty(), "written over m, no collision");
 }
 
-/// Rule 3b, a save before the sync arrives: main writes m first, but the
-/// fork saves x on the same line while main's sync still waits in the
+/// Rule 3b, a save before the sync arrives: the root writes m first, but the
+/// fork saves x on the same line while the root's sync still waits in the
 /// fork's queue. x's first parent is the head the fork held, without
 /// m, so x and m are concurrent whatever order they were written in, and
-/// main's m wins at main's queue. The fork shows x, then m, never x
+/// the root's m wins at the root's queue. The fork shows x, then m, never x
 /// again; Replication, a step of its own, then pushes x to the shared
 /// remote, naming its writer.
 #[test]
@@ -359,7 +359,7 @@ fn r3_a_save_before_the_sync_arrives_loses_to_the_upstream() {
     let mut w = world();
     let f = w.create_fork(TreeId::ROOT);
     let m = w.save(&m1(), "a", 0);
-    assert_eq!(w.queue_len(f), 1, "main's sync waits");
+    assert_eq!(w.queue_len(f), 1, "the root's sync waits");
     let x = w.save(&Client::Fork(f), "a", 0);
     let xc = w.head(f);
     ok(&mut w);
@@ -381,7 +381,7 @@ fn r3_a_save_before_the_sync_arrives_loses_to_the_upstream() {
 }
 
 /// Rule 3, "a sync carries the parent's current version, never a stale
-/// change": main writes m1 then m2 over it, queueing two syncs. The first
+/// change": the root writes m1 then m2 over it, queueing two syncs. The first
 /// sync brings m2 directly; the fork never shows m1.
 #[test]
 fn r3_a_sync_carries_the_upstreams_current_version() {
@@ -402,10 +402,10 @@ fn r3_a_sync_carries_the_upstreams_current_version() {
 /// Coherence finding 1: the same calls as
 /// [`r3_an_edit_over_the_decided_line_replaces_it`] with git's own
 /// three-way merge for the sync, a conflicting hunk keeping the fork's
-/// side. After x lands and loses, the fork and main have crossed (each
+/// side. After x lands and loses, the fork and the root have crossed (each
 /// merged the other), so git finds two merge bases, merges them leaving
 /// conflict markers in the base, and sees x against m as a conflict: the
-/// fork keeps x, which main already decided against.
+/// fork keeps x, which the root already decided against.
 #[test]
 #[ignore = "coherence finding 1: git's own merge base of crossing syncs and landings keeps a fork line the upstream already decided against"]
 fn finding_1_git_merge_base_on_crossing_merges() {
@@ -413,20 +413,23 @@ fn finding_1_git_merge_base_on_crossing_merges() {
 }
 
 fn crossing(merge: MergeRule) -> (Checked, String) {
-    let mut w = Checked::new(Policies {
-        merge,
-        ..Policies::default()
-    });
+    let mut w = Checked::new(
+        Policies {
+            merge,
+            ..Policies::default()
+        },
+        TreeNames::new(MODEL_ROOT),
+    );
     let f = w.create_fork(TreeId::ROOT);
     let x = w.save(&Client::Fork(f), "a", 0);
     let m = w.save(&m1(), "a", 0);
     next(&mut w, f); // sync: x is not decided, so F keeps it
-    next(&mut w, TreeId::ROOT); // landing: main's m wins; crossed
+    next(&mut w, TreeId::ROOT); // landing: the root's m wins; crossed
     assert!(has(&w, f, "a", &x) && has(&w, TreeId::ROOT, "a", &m));
-    next(&mut w, f); // main's decided version
+    next(&mut w, f); // the root's decided version
     assert!(
         has(&w, f, "a", &m),
-        "{merge:?}: the fork takes main's decision"
+        "{merge:?}: the fork takes the root's decision"
     );
     let y = w.save(&Client::Fork(f), "a", 0); // written over m
     drain(&mut w);
@@ -458,12 +461,12 @@ fn decided(w: &World) -> Vec<Decision> {
 
 /// Rule 3e (owner, 2026-11-03: "The whole file, right? That was the
 /// “traditional Linux fs” model we had discussed"): one save writes lines 0
-/// and 2 of a; main concurrently writes line 0 and, cleanly, line 1. At
-/// main's queue the save's line 0 collides and main wins, so the whole
+/// and 2 of a; the root concurrently writes line 0 and, cleanly, line 1. At
+/// the root's queue the save's line 0 collides and the root wins, so the whole
 /// save loses: its clean line 2 does not land either. Both are named, the
-/// clean one as lost with its change (`By::Whole`), for main's winning
+/// clean one as lost with its change (`By::Whole`), for the root's winning
 /// line; the save is kept under its collision ref and pushed. The fork
-/// then takes main's file, line 2 included, once.
+/// then takes the root's file, line 2 included, once.
 #[test]
 fn r3_a_save_loses_whole_with_its_clean_lines() {
     let mut w = world();
@@ -512,9 +515,9 @@ fn r3_a_save_loses_whole_with_its_clean_lines() {
 
 /// Rule 3e, "later saves are judged whole on their own": after the save
 /// that lost (lines 0 and 2), the fork saves line 2 again, over its own
-/// lost line (which was written over main's), and then b. Neither later
-/// save collides with anything of main's, so both land whole, the first
-/// replacing main's line 2 by lineage.
+/// lost line (which was written over the root's), and then b. Neither later
+/// save collides with anything of the root's, so both land whole, the first
+/// replacing the root's line 2 by lineage.
 #[test]
 fn r3_a_later_save_after_a_losing_one_is_judged_on_its_own() {
     let mut w = world();
@@ -536,12 +539,12 @@ fn r3_a_later_save_after_a_losing_one_is_judged_on_its_own() {
 }
 
 /// Rule 3e for a transaction (owner, 2026-11-03: "some commits represent a
-/// transaction"): it stages lines of a and b; main's line on a's staged
+/// transaction"): it stages lines of a and b; the root's line on a's staged
 /// line syncs into the fork first. At its commit the fork's line wins
 /// a, so the whole transaction loses: b's staged line does not apply
 /// either, the answer names both (b's for the line that decided), the
 /// collision ref keeps the transaction's branch, and nothing of it reaches
-/// the fork or main.
+/// the fork or the root.
 #[test]
 fn r3_a_transaction_loses_whole_and_is_told() {
     let mut w = world();
@@ -599,14 +602,14 @@ fn r3_a_transaction_loses_whole_and_is_told() {
     assert_eq!(w.collisions.len(), 2, "decided once, in the fork");
 }
 
-/// Rule 3e, a committed transaction at main's queue (the case of coherence
+/// Rule 3e, a committed transaction at the root's queue (the case of coherence
 /// finding 3, now the owner's rule): it committed cleanly in the fork,
-/// with lines 0 and 2 of a; main concurrently changed line 0 and, cleanly,
-/// line 1. Main wins line 0, so the transaction's commit loses whole at
-/// main: line 2 stays main's, and the fork takes main's file, its line 2
-/// going back to main's, decided by that collision.
+/// with lines 0 and 2 of a; the root concurrently changed line 0 and, cleanly,
+/// line 1. The root wins line 0, so the transaction's commit loses whole at
+/// the root: line 2 stays the root's, and the fork takes the root's file, its line 2
+/// going back to the root's, decided by that collision.
 #[test]
-fn r3_a_committed_transaction_loses_whole_at_main() {
+fn r3_a_committed_transaction_loses_whole_at_the_root() {
     let mut w = world();
     let f = w.create_fork(TreeId::ROOT);
     w.begin(f).unwrap();
@@ -646,11 +649,11 @@ fn r3_a_committed_transaction_loses_whole_at_main() {
 }
 
 /// Rule 3e for a loss by a file rule (rule 11) inside a change of several
-/// files: the transaction edits a and b, and main unlinks a; whether the
+/// files: the transaction edits a and b, and the root unlinks a; whether the
 /// sync brings the unlink into the fork before the commit (the commit
-/// loses there, and is told) or main's queue meets it after (the committed
+/// loses there, and is told) or the root's queue meets it after (the committed
 /// transaction loses there), b's clean line never lands. The same with a
-/// rename-over in the transaction (c over a, while main edits a): its
+/// rename-over in the transaction (c over a, while the root edits a): its
 /// unlink of a loses, so the whole transaction does, b included.
 #[test]
 fn r3_a_file_rule_loss_costs_the_whole_change() {
@@ -675,7 +678,7 @@ fn r3_a_file_rule_loss_costs_the_whole_change() {
         drain(&mut w);
         for t in [TreeId::ROOT, f] {
             assert!(!has(&w, t, "b", &sb), "{t:?}: a partial change");
-            assert_eq!(w.path_of(t, "a"), None, "{t:?}: main's unlink");
+            assert_eq!(w.path_of(t, "a"), None, "{t:?}: the root's unlink");
         }
         let lost: BTreeSet<&str> = w.collisions.iter().map(|c| c.path.as_str()).collect();
         assert!(lost.contains("b"), "b's clean line is named lost");
@@ -696,13 +699,13 @@ fn r3_a_file_rule_loss_costs_the_whole_change() {
     drain(&mut w);
     for t in [TreeId::ROOT, f] {
         assert!(!has(&w, t, "b", &sb), "{t:?}: a partial change");
-        assert!(has(&w, t, "a", &m), "{t:?}: main's edit keeps a");
+        assert!(has(&w, t, "a", &m), "{t:?}: the root's edit keeps a");
         assert_eq!(w.path_of(t, "c").as_deref(), Some("c"), "{t:?}");
     }
 }
 
 /// Rule 3e: only a lost line costs a change. One save deletes line 1 of a
-/// and writes line 3; main deletes line 1 too. The two deletes agree (no
+/// and writes line 3; the root deletes line 1 too. The two deletes agree (no
 /// collision), so nothing of the save lost and it lands whole: its line 3
 /// applies.
 #[test]
@@ -724,9 +727,9 @@ fn r3_a_change_whose_delete_agrees_lands_whole() {
 }
 
 /// Rule 3d with whole saves, in the sync direction: two fork saves (line
-/// 0, then line 2); main changes line 0 and, cleanly, line 1. The sync
-/// takes main's line 1 and keeps the fork's lines 0 and 2, which main's
-/// queue has not decided yet. Then main's line 0 wins against the first
+/// 0, then line 2); the root changes line 0 and, cleanly, line 1. The sync
+/// takes the root's line 1 and keeps the fork's lines 0 and 2, which the root's
+/// queue has not decided yet. Then the root's line 0 wins against the first
 /// save, and the second, its own change, lands.
 #[test]
 fn r3_a_sync_keeps_the_undecided_saves() {
@@ -738,13 +741,13 @@ fn r3_a_sync_keeps_the_undecided_saves() {
     let k = w.save(&m1(), "a", 1);
     next(&mut w, f);
     assert!(has(&w, f, "a", &x) && has(&w, f, "a", &y));
-    assert!(has(&w, f, "a", &k), "main's clean line");
+    assert!(has(&w, f, "a", &k), "the root's clean line");
     drain(&mut w);
     assert_eq!(ids(&w, TreeId::ROOT, "a")[..3], [m, k, y]);
 }
 
 /// Rule 3, per line, on neighbouring lines (one git hunk): the fork's
-/// line 1 and main's line 0 both stay, in both trees.
+/// line 1 and the root's line 0 both stay, in both trees.
 #[test]
 fn r3_neighbouring_lines_merge_per_line() {
     let (w, [k, m]) = neighbours(MergeRule::PerLine);
@@ -756,7 +759,7 @@ fn r3_neighbouring_lines_merge_per_line() {
 /// Coherence finding 6: the same calls with git's own merge for the sync,
 /// a conflicting hunk keeping the fork's side (`-X ours`). Neighbouring
 /// changes form one git hunk, so the sync keeps the fork's whole hunk
-/// and withholds main's line 0, which main had decided. "Per hunk" in
+/// and withholds the root's line 0, which the root had decided. "Per hunk" in
 /// git's sense withholds a decided line; the model's rule is per line.
 #[test]
 #[ignore = "coherence finding 6: git's hunk on neighbouring lines withholds the upstream's decided line"]
@@ -765,22 +768,25 @@ fn finding_6_git_hunks_on_neighbouring_lines() {
 }
 
 fn neighbours(merge: MergeRule) -> (Checked, [String; 2]) {
-    let mut w = Checked::new(Policies {
-        merge,
-        layout: Layout::Adjacent,
-    });
+    let mut w = Checked::new(
+        Policies {
+            merge,
+            layout: Layout::Adjacent,
+        },
+        TreeNames::new(MODEL_ROOT),
+    );
     let f = w.create_fork(TreeId::ROOT);
     let k = w.save(&Client::Fork(f), "a", 1);
     let m = w.save(&m1(), "a", 0);
-    next(&mut w, f); // main's sync: m beside k
+    next(&mut w, f); // the root's sync: m beside k
     assert!(has(&w, f, "a", &k) && has(&w, f, "a", &m));
     drain(&mut w);
     (w, [k, m])
 }
 
 /// Rule 3, decided once, at the upstream's queue: nested G's g lands in its
-/// upstream F, where F's line m (main's, synced in) wins. F's next landing
-/// into main carries nothing of g, so main records nothing; G takes m from
+/// upstream F, where F's line m (the root's, synced in) wins. F's next landing
+/// into the root carries nothing of g, so the root records nothing; G takes m from
 /// F. Sibling H holds m throughout.
 #[test]
 fn r3_a_collision_is_recorded_once_at_the_upstreams_queue() {
@@ -824,10 +830,10 @@ fn r4_nothing_waits_behind_a_collision() {
     drain(&mut w);
 }
 
-/// Rule 4, nested forks: G over F over main, the same rules with F as
+/// Rule 4, nested forks: G over F over the root, the same rules with F as
 /// G's upstream. G's landing loses in F to F's own concurrent line; G's
-/// later line lands in F, then loses in main to main's concurrent line;
-/// a clean change of G's reaches main named for G. Everything converges.
+/// later line lands in F, then loses in the root to the root's concurrent line;
+/// a clean change of G's reaches the root named for G. Everything converges.
 #[test]
 fn r4_nested_forks_follow_the_same_rules() {
     let mut w = world();
@@ -868,7 +874,7 @@ fn r4_nested_forks_follow_the_same_rules() {
             &w.head(TreeId::ROOT),
         ],
     );
-    let c_commit = c_commit.lines().last().expect("a main commit adds G's c");
+    let c_commit = c_commit.lines().last().expect("a root commit adds G's c");
     assert_eq!(w.writer_of_commit(c_commit), "c2");
     w.end_client(g);
     w.end_client(f);
@@ -880,7 +886,7 @@ fn r4_nested_forks_follow_the_same_rules() {
 
 /// Rule 5, a clean commit: the program reads its own staged edits on a
 /// frozen snapshot while the fork keeps receiving syncs; the commit lands
-/// in main as ONE commit named for the client.
+/// in the root as ONE commit named for the client.
 #[test]
 fn r5_transaction_commits_clean() {
     let mut w = world();
@@ -899,22 +905,22 @@ fn r5_transaction_commits_clean() {
         !w.client_reads(&c, "c").contains(&m),
         "the snapshot is frozen"
     );
-    let before = main_writers(&w).len();
+    let before = root_writers(&w).len();
     assert_eq!(w.commit_txn(f), Ok(TxnOutcome::Committed));
     assert!(w.client_reads(&c, "c").contains(&m));
     drain(&mut w);
     assert!(has(&w, TreeId::ROOT, "a", &sa) && has(&w, TreeId::ROOT, "b", &sb));
-    assert_eq!(main_writers(&w).len(), before + 1, "one commit");
-    assert_eq!(main_writers(&w)[0], "c1");
+    assert_eq!(root_writers(&w).len(), before + 1, "one commit");
+    assert_eq!(root_writers(&w)[0], "c1");
 }
 
 /// Rule 5, no race: the same calls as
 /// [`r3_a_transaction_loses_whole_and_is_told`] and as
-/// [`r5_a_committed_transaction_then_lands_like_any_change`], where main's
+/// [`r5_a_committed_transaction_then_lands_like_any_change`], where the root's
 /// sync arrives after the commit, end with the same trees. Whether the
-/// sync comes before or after the commit decides nothing: main's line
+/// sync comes before or after the commit decides nothing: the root's line
 /// wins either way, and the transaction loses whole, at the fork's
-/// commit or at main's queue.
+/// commit or at the root's queue.
 #[test]
 fn r5_sync_before_or_after_the_commit_ends_the_same() {
     let run = |sync_first: bool| {
@@ -959,10 +965,10 @@ fn r5_transaction_rollback_and_client_death_leave_nothing() {
 }
 
 /// Rule 5 then rule 3: a committed transaction lands like any change. A
-/// sync of main's concurrent line, queued before the commit and processed
-/// after, decides nothing: the fork keeps the whole transaction. Main's
-/// queue then decides: main's line wins line a, so the transaction loses
-/// whole (rule 3e), its line b too, and the fork takes main's lines,
+/// sync of the root's concurrent line, queued before the commit and processed
+/// after, decides nothing: the fork keeps the whole transaction. The root's
+/// queue then decides: the root's line wins line a, so the transaction loses
+/// whole (rule 3e), its line b too, and the fork takes the root's lines,
 /// once.
 #[test]
 fn r5_a_committed_transaction_then_lands_like_any_change() {
@@ -993,11 +999,11 @@ fn r6_a_sync_is_a_merge_with_the_upstream_second() {
     let f = w.create_fork(TreeId::ROOT);
     w.save(&Client::Fork(f), "a", 0);
     w.save(&m1(), "b", 0);
-    let main = w.head(TreeId::ROOT);
+    let root = w.head(TreeId::ROOT);
     next(&mut w, f);
     let head = w.head(f);
     let parents = show(&w, &head, "%P");
-    assert_eq!(parents.split(' ').nth(1), Some(main.as_str()));
+    assert_eq!(parents.split(' ').nth(1), Some(root.as_str()));
     assert_eq!(
         show(&w, &head, "%(trailers:key=Agentfs-Cause,valueonly)"),
         "Sync"
@@ -1007,11 +1013,11 @@ fn r6_a_sync_is_a_merge_with_the_upstream_second() {
 
 // ── rule 7: full lineage ────────────────────────────────────────────────
 
-/// Rule 7: main's history reaches the fork's commits, the losing one
+/// Rule 7: the root's history reaches the fork's commits, the losing one
 /// included, and the fork's losing version stays reachable under the
 /// collision's ref after the fork is dropped.
 #[test]
-fn r7_main_reaches_a_losing_commit_and_its_ref_keeps_it() {
+fn r7_the_root_reaches_a_losing_commit_and_its_ref_keeps_it() {
     let mut w = world();
     let f = w.create_fork(TreeId::ROOT);
     let x = w.save(&Client::Fork(f), "a", 0);
@@ -1031,10 +1037,10 @@ fn r7_main_reaches_a_losing_commit_and_its_ref_keeps_it() {
 }
 
 /// Rule 7 (the owner, 2026-11-05: "drop squashing"): each commit of a
-/// fork, a transaction's included, lands on its own and is in main's
+/// fork, a transaction's included, lands on its own and is in the root's
 /// history; every fork commit stays stored.
 #[test]
-fn r7_every_fork_commit_lands_on_its_own_in_mains_history() {
+fn r7_every_fork_commit_lands_on_its_own_in_the_roots_history() {
     let mut w = world();
     let f = w.create_fork(TreeId::ROOT);
     let c = Client::Fork(f);
@@ -1052,24 +1058,24 @@ fn r7_every_fork_commit_lands_on_its_own_in_mains_history() {
     w.save(&c, "a", 1);
     commits.push(w.head(f));
     assert_eq!(w.queue_len(TreeId::ROOT), 5);
-    let before = main_writers(&w).len();
+    let before = root_writers(&w).len();
     next(&mut w, TreeId::ROOT);
     assert_eq!(w.queue_len(TreeId::ROOT), 4, "one commit, one take");
-    assert_eq!(main_writers(&w).len(), before + 1);
+    assert_eq!(root_writers(&w).len(), before + 1);
     let landed = ["a", "b", "c"].map(|p| w.read(TreeId::ROOT, p).at(0) != format!("{p}0"));
     assert_eq!(landed, [true, false, false]);
     drain(&mut w);
-    assert_eq!(main_writers(&w).len(), before + 5);
+    assert_eq!(root_writers(&w).len(), before + 5);
     for s in &commits {
         assert!(w.is_ancestor(s, &w.head(TreeId::ROOT)));
     }
 }
 
-/// Rule 3e at every level: G over F over main. G's save of lines 0 and 2
+/// Rule 3e at every level: G over F over the root. G's save of lines 0 and 2
 /// of a loses whole in F, to F's own concurrent line 0, its line 2 too.
 /// G's next save of lines 0 and 2 of b wins in F and travels up in F's
-/// landing commit, which loses whole at main to main's concurrent line 0
-/// of b: b's line 2 reaches main from neither.
+/// landing commit, which loses whole at the root to the root's concurrent line 0
+/// of b: b's line 2 reaches the root from neither.
 #[test]
 fn r4_nested_changes_land_whole_or_lose_whole_at_every_level() {
     let mut w = world();
@@ -1117,7 +1123,7 @@ fn r4_nested_changes_land_whole_or_lose_whole_at_every_level() {
 
 // ── convergence ─────────────────────────────────────────────────────────
 
-/// When writes stop and the queues drain, every fork equals main
+/// When writes stop and the queues drain, every fork equals the root
 /// (`check_converged`), here with siblings, a nested fork and collisions
 /// in both directions.
 #[test]
@@ -1141,7 +1147,7 @@ fn convergence_when_writes_stop() {
 
 // ── rule 8: a save records the write calls ──────────────────────────────
 
-/// The fork's program read `a` before main's m reached it by sync,
+/// The fork's program read `a` before the root's m reached it by sync,
 /// then opens `a`, makes one write call and closes. Returns the world, the
 /// program's stale read, the synced m, and the fork.
 fn read_then_sync() -> (Checked, Content, String, TreeId) {
@@ -1159,7 +1165,7 @@ fn read_then_sync() -> (Checked, Content, String, TreeId) {
 
 /// Rule 8, an append after the sync: it adds a line at the file's end as
 /// it is now, so the line the sync brought stays, in the fork and, once
-/// landed, in main.
+/// landed, in the root.
 #[test]
 fn r8_an_append_after_the_sync_keeps_the_synced_line() {
     let (mut w, _, m, f) = read_then_sync();
@@ -1192,8 +1198,8 @@ fn r8_an_offset_write_elsewhere_keeps_the_synced_line() {
 /// Rule 8, a stale truncate and rewrite: the program writes back the whole
 /// file it read before the sync. That really puts o's bytes back over m,
 /// recorded as the program's write: a new line by the fork's writer
-/// (`git blame` names it), written over m, so it replaces m in main too
-/// with no collision. m stays in main's history.
+/// (`git blame` names it), written over m, so it replaces m in the root too
+/// with no collision. m stays in the root's history.
 #[test]
 fn r8_a_stale_rewrite_overwrites_the_synced_line_and_history_keeps_it() {
     let (mut w, read, m, f) = read_then_sync();
@@ -1234,7 +1240,7 @@ fn r8_a_stale_rewrite_overwrites_the_synced_line_and_history_keeps_it() {
     assert!(w.file(&m_commit, "a").contains(&m));
 }
 
-/// Rule 8, `O_APPEND`: two of main's clients append to one file at once.
+/// Rule 8, `O_APPEND`: two of the root's clients append to one file at once.
 /// Each append goes after the file's end as it is at its close, so neither
 /// writes over the other's line, whichever closes first; and a check
 /// rejects an append that lands on a written slot (`one_writer`).
@@ -1243,7 +1249,7 @@ fn r8_concurrent_appends_never_overwrite_each_other() {
     for m2_first in [true, false] {
         let mut w = world();
         let o = w.save(&m1(), "a", 0);
-        let m2 = Client::Main("m2".into());
+        let m2 = Client::Root("m2".into());
         let (a, b) = (w.open_write(&m1(), "a"), w.open_write(&m2, "a"));
         let xa = w.edit(a, LineEdit::Append).unwrap();
         let xb = w.edit(b, LineEdit::Append).unwrap();
@@ -1277,7 +1283,7 @@ fn calls(w: &mut World, c: &Client, p: &str, calls: &[Write]) {
     w.close(h);
 }
 
-/// `a` holding `foo` with no final newline, saved by main: one line, the
+/// `a` holding `foo` with no final newline, saved by the root: one line, the
 /// file's last six lines deleted. Returns that line's identity.
 fn foo_without_newline(w: &mut Checked) -> String {
     calls(
@@ -1348,9 +1354,9 @@ fn r8_concurrent_appends_onto_a_partial_last_line_collide() {
     assert_eq!((c.by, c.lines), (By::Line, vec![foo]));
 }
 
-/// R10.4 (the owner, 2026-11-05: "collide"): main appends "}" with no final
+/// R10.4 (the owner, 2026-11-05: "collide"): the root appends "}" with no final
 /// newline while the fork appends a line. The fork's line, which would
-/// come after main's unfinished last line, collides with it and main wins, at
+/// come after the root's unfinished last line, collides with it and the root wins, at
 /// every level of nesting. agentfs adds no newline: the file ends in "}", and
 /// the fork's save stays in history, kept by its collision ref.
 #[test]
@@ -1395,7 +1401,7 @@ fn r10_a_line_after_the_upstreams_unfinished_line_collides() {
     }
 }
 
-/// R8.1, not R10.4: an append made after the sync brought main's unfinished
+/// R8.1, not R10.4: an append made after the sync brought the root's unfinished
 /// last line finishes that line, written over it, and lands with no collision.
 #[test]
 fn r10_an_append_over_the_synced_unfinished_line_finishes_it() {
@@ -1463,12 +1469,12 @@ fn r10_a_sync_hides_the_upstreams_lines_after_an_undecided_unfinished_line() {
     w.close(cut);
     let loser = w.head(f);
     calls(&mut w, &m1(), "c", &[Write::Append("m7\n".into())]);
-    let main = bytes(&w, TreeId::ROOT, "c");
+    let root = bytes(&w, TreeId::ROOT, "c");
     next(&mut w, f);
     assert_eq!(bytes(&w, f, "c"), "y");
     drain(&mut w);
-    assert_eq!(bytes(&w, TreeId::ROOT, "c"), main);
-    assert_eq!(bytes(&w, f, "c"), main);
+    assert_eq!(bytes(&w, TreeId::ROOT, "c"), root);
+    assert_eq!(bytes(&w, f, "c"), root);
     let lost = w
         .collisions
         .iter()
@@ -1477,7 +1483,7 @@ fn r10_a_sync_hides_the_upstreams_lines_after_an_undecided_unfinished_line() {
     assert!(w.is_ancestor(&lost.loser, &w.head(TreeId::ROOT)));
 }
 
-/// Finding 35, answered by the owner, 2026-11-06, "A is fine": main cuts a line the
+/// Finding 35, answered by the owner, 2026-11-06, "A is fine": the root cuts a line the
 /// fork already holds to an unfinished last line, in front of the fork's
 /// undecided line. R10.6 covers it: the line leaves the fork's file until the
 /// upstream decides, then the upstream's version arrives.
@@ -1656,7 +1662,7 @@ fn finding_43_a_sync_hides_a_line_the_fork_deleted_in_a_lost_save() {
 }
 
 /// R9.1, finding 46 (the owner, 2026-11-07, "5 a sounds correct, right?"): a landing also
-/// locks the names its change touches. A fork's unlink of `a` waits while main's open of
+/// locks the names its change touches. A fork's unlink of `a` waits while the root's open of
 /// another file holds that name, though its own change does not write that file; the close
 /// ends the wait (an event), all its keys are then free at once, and the take goes.
 #[test]
@@ -1777,7 +1783,7 @@ fn r8_truncates_holes_and_an_empty_o_trunc() {
 
 // ── rule 9: a take locks the files it overwrites ────────────────────────
 
-/// Rule 9: main's sync waits while the fork's program has `a` open for
+/// Rule 9: the root's sync waits while the fork's program has `a` open for
 /// writing: its queue head records the wait and its step is not offered.
 /// The close (an event) wakes it, and it applies over the saved file. A
 /// sync of a file nobody has open does not wait.
@@ -1805,8 +1811,8 @@ fn r9_a_sync_waits_for_an_open_writer_then_applies() {
     drain(&mut w);
 }
 
-/// Rule 9, the same rule for a landing into a tree (a choice): main's
-/// queue waits while one of main's clients has the file open for writing.
+/// Rule 9, the same rule for a landing into a tree (a choice): the root's
+/// queue waits while one of the root's clients has the file open for writing.
 #[test]
 fn r9_a_landing_waits_for_the_upstreams_open_writer() {
     let mut w = world();
@@ -1825,8 +1831,8 @@ fn r9_a_landing_waits_for_the_upstreams_open_writer() {
 
 /// Rule 9 (R9.1): a landing locks every file its changes touch, a losing
 /// change's included, not only what its plan writes. Here the fork's unlink
-/// of `a` loses (main's unseen line), so the plan writes nothing; the landing
-/// still waits while main's program has `a` open for writing, and its take,
+/// of `a` loses (the root's unseen line), so the plan writes nothing; the landing
+/// still waits while the root's program has `a` open for writing, and its take,
 /// one step, goes once that open closes.
 #[test]
 fn r9_a_landing_holds_the_files_of_its_losing_changes() {
@@ -1903,12 +1909,12 @@ fn r9_client_death_releases_its_locks() {
     assert!(has(&w, TreeId::ROOT, "b", &n));
 }
 
-/// Rule 9, one of main's clients dies (its end event) holding `a` open
-/// for writing while main's queue waits for it: its write calls are saved
+/// Rule 9, one of the root's clients dies (its end event) holding `a` open
+/// for writing while the root's queue waits for it: its write calls are saved
 /// as the kernel's close on exit would, which wakes the queue; and no lock
 /// of it outlives it (`locks`).
 #[test]
-fn r9_a_main_clients_death_releases_its_locks() {
+fn r9_a_now_dead_root_client_releases_its_locks() {
     let mut w = world();
     let f = w.create_fork(TreeId::ROOT);
     let x = w.save(&Client::Fork(f), "b", 0);
@@ -1921,11 +1927,11 @@ fn r9_a_main_clients_death_releases_its_locks() {
     let z = w.save(&Client::Fork(f), "a", 2);
     take(&mut w, &Step::Next(TreeId::ROOT));
     assert!(w.waits().contains_key(&TreeId::ROOT));
-    let m2 = Client::Main("m2".into());
+    let m2 = Client::Root("m2".into());
     let other = w.open_write(&m2, "d");
-    w.end_main_client("m1");
+    w.end_root_client("m1");
     ok(&mut w);
-    assert!(w.waits().is_empty(), "the death woke main's queue");
+    assert!(w.waits().is_empty(), "the death woke the root's queue");
     assert!(has(&w, TreeId::ROOT, "a", &y), "its write calls were saved");
     assert!(
         w.handles().any(|h| h.id == other),
@@ -2205,12 +2211,12 @@ fn r5_a_deferred_save_holds_back_a_sync_of_its_file() {
     drain(&mut w);
     assert!(
         w.collisions.iter().any(|c| c.tree == TreeId::ROOT),
-        "written without reading main's line, the save collides with it"
+        "written without reading the root's line, the save collides with it"
     );
     assert!(has(&w, TreeId::ROOT, "a", &m), "and the upstream wins");
 }
 
-/// R10.3 (finding 31): main renames d over c and then unlinks d, while a fork
+/// R10.3 (finding 31): the root renames d over c and then unlinks d, while a fork
 /// unlinks d. The two deletes agree, so the fork's applies, and d's name is
 /// then a version not written over the rename-over's, which is not half a
 /// rename-over.
@@ -2237,7 +2243,7 @@ fn r10_an_agreeing_delete_of_a_rename_overs_file_agrees() {
 /// R5.1 and R9.9, read from git: a take's decision lives in its own result
 /// commit (its tree named), with no notes ref; the losing commit, which cannot
 /// be edited, holds none and keeps its collision ref; and the record reaches
-/// the shared remote with main's history, a transaction's and a nested
+/// the shared remote with the root's history, a transaction's and a nested
 /// fork's included.
 #[test]
 fn r5_a_decision_is_in_its_result_commit_with_its_tree() {
@@ -2257,7 +2263,7 @@ fn r5_a_decision_is_in_its_result_commit_with_its_tree() {
     let refs = git(w.repo(), &["for-each-ref", "--format=%(refname)"]);
     assert!(!refs.contains("refs/notes"), "no notes ref: {refs}");
     for x in &w.collisions {
-        let d = agentfs_model::world::Decision::of(x);
+        let d = agentfs_model::world::Decision::of(x, w.names());
         for repo in [w.repo(), w.remote()] {
             let on = decisions_in(repo, &["-1", &x.result]);
             assert!(on.iter().any(|(_, n)| *n == d), "the result holds it");
@@ -2279,7 +2285,7 @@ fn r5_a_decision_is_in_its_result_commit_with_its_tree() {
 
 /// R10.8 (finding 32): a save that makes a line unfinished (no final newline)
 /// would land in front of a line the upstream keeps. A first save cuts the file to
-/// one unfinished line; main edits a line it deleted, so that save loses whole;
+/// one unfinished line; the root edits a line it deleted, so that save loses whole;
 /// the fork's next save, written over its own first line, would put the
 /// upstream's next line on one line of bytes nobody wrote, so it loses whole too.
 #[test]
@@ -2297,7 +2303,7 @@ fn r10_an_unfinished_line_before_a_kept_line_loses_whole() {
     );
     w.close(cut);
     w.save(&m1(), "c", 1);
-    let main = bytes(&w, TreeId::ROOT, "c");
+    let root = bytes(&w, TreeId::ROOT, "c");
     let edit = w.open_write(&c, "c");
     w.write(
         edit,
@@ -2311,7 +2317,7 @@ fn r10_an_unfinished_line_before_a_kept_line_loses_whole() {
     next(&mut w, TreeId::ROOT);
     next(&mut w, TreeId::ROOT);
     let read = w.read(TreeId::ROOT, "c");
-    assert_eq!(read.bytes(), main, "main reads as before");
+    assert_eq!(read.bytes(), root, "the root reads as before");
     assert_eq!(
         read.bytes().lines().count(),
         read.live().count(),
@@ -2330,10 +2336,10 @@ fn r10_an_unfinished_line_before_a_kept_line_loses_whole() {
     );
     assert_eq!(git(w.repo(), &["rev-parse", &lost.reference]), second);
     drain(&mut w);
-    assert_eq!(bytes(&w, f, "c"), main, "the fork converges");
+    assert_eq!(bytes(&w, f, "c"), root, "the fork converges");
 }
 
-/// R10.7: an edited line keeps its place. When main appends after the line a
+/// R10.7: an edited line keeps its place. When the root appends after the line a
 /// fork edits, the file reads the edit, then the append.
 #[test]
 fn r10_an_edited_line_keeps_its_place_before_an_append() {
@@ -2434,8 +2440,8 @@ fn ends_converged_without_collisions(w: &mut Checked) {
 }
 
 /// Rule 10: an insert shifts the lines after it without changing their
-/// identity. The fork inserts a line at the top while main writes line
-/// 2; then main inserts at the top while the fork writes line 2. Each
+/// identity. The fork inserts a line at the top while the root writes line
+/// 2; then the root inserts at the top while the fork writes line 2. Each
 /// edit lands on the line its writer meant, now one further down, with no
 /// collision.
 #[test]
@@ -2478,7 +2484,7 @@ fn r10_concurrent_inserts_at_one_place_keep_both_the_upstreams_first() {
 /// is a version of the line, so the per-line rule decides. The lines hold
 /// distinct bytes (among identical ones the diff picks which one went:
 /// `r10_repeated_identical_lines_align_by_the_diff`). The fork deletes
-/// line 1 while main writes it: main's line stays. Main deletes line 1
+/// line 1 while the root writes it: the root's line stays. The root deletes line 1
 /// while the fork writes it: the line stays deleted. Both delete it:
 /// they agree, no collision.
 #[test]
@@ -2507,7 +2513,7 @@ fn r10_a_delete_against_a_concurrent_edit_the_upstream_wins() {
     assert_eq!(ids(&w, TreeId::ROOT, "c")[..2], [t[0].as_str(), &t[2]]);
 }
 
-/// Lines 0 to 3 of `p` given distinct bytes by main, then every tree
+/// Lines 0 to 3 of `p` given distinct bytes by the root, then every tree
 /// synced: their bytes, in order.
 fn distinct(w: &mut Checked, p: &str) -> Vec<String> {
     let h = w.open_write(&m1(), p);
@@ -2520,11 +2526,11 @@ fn distinct(w: &mut Checked, p: &str) -> Vec<String> {
 /// Rule 10, a move: the save sees only bytes, so its one alignment reads a
 /// moved line as a delete plus a new line holding the same bytes. With no
 /// concurrent edit of that line it lands as the program wrote it. Against
-/// main's concurrent edit of the moved line, the delete loses to main's
-/// edit, so the whole save loses (rule 3e), its new line too: main's edit
+/// the root's concurrent edit of the moved line, the delete loses to the root's
+/// edit, so the whole save loses (rule 3e), its new line too: the root's edit
 /// shows at the old place only, and the delete's collision and the new
-/// line's (`By::Whole`) name the save. Main's move against the
-/// fork's edit of that line: main's delete wins, the fork's edit
+/// line's (`By::Whole`) name the save. The root's move against the
+/// fork's edit of that line: the root's delete wins, the fork's edit
 /// loses.
 #[test]
 fn r10_a_move_is_a_delete_plus_an_insert() {
@@ -2545,7 +2551,7 @@ fn r10_a_move_is_a_delete_plus_an_insert() {
     assert_eq!(
         w.read(TreeId::ROOT, "b").texts()[..5],
         [m.as_str(), &t[1], &t[2], &t[3], BLANK],
-        "main's edit, and not the old bytes"
+        "the root's edit, and not the old bytes"
     );
     let n = w.collisions.len();
     let (del, new) = (&w.collisions[n - 2], &w.collisions[n - 1]);
@@ -2574,15 +2580,15 @@ fn r10_a_move_is_a_delete_plus_an_insert() {
 }
 
 /// Rule 10, repeated lines. Six blank lines, and the fork inserts a
-/// blank line at the top while main writes line 1. In bytes the new line
+/// blank line at the top while the root writes line 1. In bytes the new line
 /// could be any of seven blank lines; git's diff takes the last (it trims
-/// the common prefix first), so main's edit stays on line 1, not line 2,
+/// the common prefix first), so the root's edit stays on line 1, not line 2,
 /// as the fork's program would read it (a cost: git-model.md §16). No
-/// line is lost or doubled, and no collision. Then braces: main writes
+/// line is lost or doubled, and no collision. Then braces: the root writes
 /// `{ x } { y }`; the fork's program rewrites the whole file with a
-/// third block between, while main edits `y`. The diff anchors on the
+/// third block between, while the root edits `y`. The diff anchors on the
 /// lines that occur once, so the rewrite's new braces are new lines and
-/// main's edit stays on `y`'s line, no collision.
+/// the root's edit stays on `y`'s line, no collision.
 #[test]
 fn r10_repeated_identical_lines_align_by_the_diff() {
     let mut w = world();
@@ -2613,9 +2619,9 @@ fn r10_repeated_identical_lines_align_by_the_diff() {
 // ── rule 11: deletes and renames ────────────────────────────────────────
 
 /// Rule 11, an unlink against a concurrent edit, in each direction. The
-/// fork unlinks `a` while main writes a line of it: the unlink never
-/// saw that line, so it loses whole and `a` stays, with main's line. Main
-/// unlinks `b` while the fork writes a line of it: main's unlink wins,
+/// fork unlinks `a` while the root writes a line of it: the unlink never
+/// saw that line, so it loses whole and `a` stays, with the root's line. The root
+/// unlinks `b` while the fork writes a line of it: the root's unlink wins,
 /// the fork's line loses. Both are recorded collisions.
 #[test]
 fn r11_an_unlink_against_a_concurrent_edit_the_upstream_wins() {
@@ -2641,7 +2647,7 @@ fn r11_an_unlink_against_a_concurrent_edit_the_upstream_wins() {
     assert!(c.by == By::File && c.lost == [x.clone()], "{c:?}");
 }
 
-/// Rule 11, an unlink after the sync: the fork saw main's line, so its
+/// Rule 11, an unlink after the sync: the fork saw the root's line, so its
 /// unlink wins upstream by lineage, with no collision.
 #[test]
 fn r11_an_unlink_after_the_sync_wins() {
@@ -2686,7 +2692,7 @@ fn r11_concurrent_renames_the_upstream_wins() {
     }
     w.rename(&Client::Fork(f), "b", "h");
     w.rename(&m1(), "c", "h");
-    // Main's queue decides before the fork syncs: a sync first would
+    // The root's queue decides before the fork syncs: a sync first would
     // show the fork two files named h (not modelled: MODEL.md).
     next(&mut w, TreeId::ROOT);
     drain(&mut w);
@@ -2700,10 +2706,10 @@ fn r11_concurrent_renames_the_upstream_wins() {
 
 /// Finding 11, two renames to one path before the upstream decides (a
 /// choice, recommended without objection): the fork renames `b` to `h`
-/// and main renames `c` to `h`, and the fork syncs first. It keeps its
-/// own name until main's queue decides, and shows main's file under its
-/// previous name, `c`: never two files at one path. Then main's queue
-/// decides (main wins) and the sync shows main's names. Also with
+/// and the root renames `c` to `h`, and the fork syncs first. It keeps its
+/// own name until the root's queue decides, and shows the root's file under its
+/// previous name, `c`: never two files at one path. Then the root's queue
+/// decides (the root wins) and the sync shows the root's names. Also with
 /// rename-overs: both rename a file over `d`.
 #[test]
 fn r11_two_renames_to_one_path_keep_the_forks_name_until_decided() {
@@ -2717,7 +2723,7 @@ fn r11_two_renames_to_one_path_keep_the_forks_name_until_decided() {
     assert_eq!(
         w.path_of(t, "c").as_deref(),
         Some("c"),
-        "main's file under its previous name"
+        "the root's file under its previous name"
     );
     drain(&mut w);
     for t in [TreeId::ROOT, t] {
@@ -2737,9 +2743,9 @@ fn r11_two_renames_to_one_path_keep_the_forks_name_until_decided() {
 
 /// Rule 11, a rename-over (`rename(2)` onto an existing file, the atomic
 /// save idiom) is one call: it applies or loses whole. The fork renames
-/// `a` over `b` while main writes a line of `b`: the unlink of `b` never
+/// `a` over `b` while the root writes a line of `b`: the unlink of `b` never
 /// saw it, so the whole rename-over loses: `a` keeps its name, `b` keeps
-/// main's line. Without the concurrent edit it applies. Main's rename-over
+/// the root's line. Without the concurrent edit it applies. The root's rename-over
 /// takes a fork edit of the renamed file with it, and the replaced
 /// file's edit loses.
 #[test]
@@ -2776,7 +2782,7 @@ fn r11_a_rename_over_applies_or_loses_whole() {
 }
 
 /// Rule 11, a rename-over's other half: the fork renames `a` over `b`
-/// while main renames `a` to `g`. The fork's rename loses to main's
+/// while the root renames `a` to `g`. The fork's rename loses to the root's
 /// name, so its unlink of `b` loses with it (one call): `b` keeps its path
 /// and its lines, and `a` is at `g`, in both trees.
 #[test]
@@ -2834,7 +2840,7 @@ fn r11_an_unlink_or_rename_of_a_held_file_runs_after_the_take() {
 #[test]
 fn r11_an_open_file_follows_a_rename_and_an_unlinked_one_saves_nothing() {
     let mut w = world();
-    let m2 = Client::Main("m2".into());
+    let m2 = Client::Root("m2".into());
     let h = w.open_write(&m1(), "a");
     let x = w.edit(h, LineEdit::At(0)).unwrap();
     w.rename(&m2, "a", "e");
@@ -2913,18 +2919,21 @@ fn r11_an_atomic_save_keeps_the_files_identity_and_merges_per_line() {
     assert_eq!(w.lookup(&w.head(f), "a.tmp"), None, "the new file ended");
     assert!(!w.file(&w.head(f), "g").name.live());
     drain(&mut w);
-    let main = w.read(TreeId::ROOT, "a");
-    assert_eq!(main.texts()[0], "x", "the atomic save landed");
-    assert!(main.contains(&m), "and main's edit of another line stayed");
+    let root = w.read(TreeId::ROOT, "a");
+    assert_eq!(root.texts()[0], "x", "the atomic save landed");
+    assert!(
+        root.contains(&m),
+        "and the root's edit of another line stayed"
+    );
     assert!(w.collisions.is_empty(), "{:?}", w.collisions);
-    assert_eq!(w.read(f, "a"), main);
+    assert_eq!(w.read(f, "a"), root);
 }
 
 /// Rule 11 with git-model.md §7's objects: an old writer of the file an
 /// editor replaces by an atomic save keeps its object; its writes never
 /// reach the replacement, its close saves nothing and an `OrphanDropped`
 /// event names its calls. A take of the file no longer waits for that
-/// writer's close, since no path names the old object. In main (two
+/// writer's close, since no path names the old object. In the root (two
 /// clients) and in a fork (one program with both opens).
 #[test]
 fn r11_an_old_writer_after_an_atomic_save_saves_nothing() {
@@ -2934,7 +2943,7 @@ fn r11_an_old_writer_after_an_atomic_save_saves_nothing() {
         let (t, old, editor) = if in_fork {
             (f, Client::Fork(f), Client::Fork(f))
         } else {
-            (TreeId::ROOT, Client::Main("m2".into()), m1())
+            (TreeId::ROOT, Client::Root("m2".into()), m1())
         };
         let h = w.open_write(&old, "a");
         w.write(h, Write::Append("old\n".into()));
@@ -3078,10 +3087,10 @@ fn r12_a_crash_during_a_close_saves_the_open_once() {
 
 /// The calls of finding 26: a nested
 /// fork f3 deletes line 3 of `a`; its upstream f2 deletes line 3 too and
-/// edits line 0, which main edits concurrently, so f2's save loses whole at
-/// main. Then f2 takes f3's save: its delete agrees with f2's, so it
+/// edits line 0, which the root edits concurrently, so f2's save loses whole at
+/// the root. Then f2 takes f3's save: its delete agrees with f2's, so it
 /// applies there, an ordinary version of f3's change (the owner,
-/// 2026-11-05, rejecting R3e.3). Returns main's and f3's lines once drained.
+/// 2026-11-05, rejecting R3e.3). Returns the root's and f3's lines once drained.
 fn nested_agreeing_delete() -> (Vec<String>, Vec<String>) {
     let mut w = world();
     let d = w.open_write(&m1(), "a");
@@ -3103,7 +3112,7 @@ fn nested_agreeing_delete() -> (Vec<String>, Vec<String>) {
     next(&mut w, TreeId::ROOT);
     assert!(
         w.collisions.iter().any(|c| c.by == By::Whole),
-        "f2's save lost whole at main"
+        "f2's save lost whole at the root"
     );
     next(&mut w, f2);
     assert_eq!(
@@ -3111,8 +3120,8 @@ fn nested_agreeing_delete() -> (Vec<String>, Vec<String>) {
         Some(mine.clone()),
         "f3's delete applied in f2"
     );
-    // f2 syncs main (its own delete lost there) before f3 syncs: f2 keeps
-    // f3's delete, which main's queue has not decided yet (rule 3d).
+    // f2 syncs the root (its own delete lost there) before f3 syncs: f2 keeps
+    // f3's delete, which the root's queue has not decided yet (rule 3d).
     while w.pending().contains(&Step::Next(f2)) {
         next(&mut w, f2);
     }
@@ -3123,7 +3132,7 @@ fn nested_agreeing_delete() -> (Vec<String>, Vec<String>) {
     assert_eq!(
         version(&w, TreeId::ROOT),
         Some(mine),
-        "f3's delete carried upward and applied in main"
+        "f3's delete carried upward and applied in the root"
     );
     (w.read(TreeId::ROOT, "a").texts(), w.read(f3, "a").texts())
 }
@@ -3132,19 +3141,19 @@ fn nested_agreeing_delete() -> (Vec<String>, Vec<String>) {
 /// 2026-11-05: "(a) agree -- why would it be dropped?"): a nested
 /// fork's delete that agrees with its upstream's applies there as part of
 /// the change that won, is carried upward with the upstream's landing, and is
-/// judged again in main, where it was written over main's line: it applies,
+/// judged again in the root, where it was written over the root's line: it applies,
 /// though the upstream's own delete lost there. Finding 26's calls.
 #[test]
 fn r3_a_nested_forks_agreeing_delete_is_carried_upward() {
-    let (main, f3) = nested_agreeing_delete();
-    assert_eq!(main.len(), 5, "line 3 deleted in main");
-    assert_eq!(f3, main, "and in the nested fork");
+    let (root, f3) = nested_agreeing_delete();
+    assert_eq!(root.len(), 5, "line 3 deleted in the root");
+    assert_eq!(f3, root, "and in the nested fork");
 }
 
-/// R10.3, finding 28 (2026-11-05, found removing R3e.3): main edits line 1, then deletes it; the
+/// R10.3, finding 28 (2026-11-05, found removing R3e.3): the root edits line 1, then deletes it; the
 /// fork deletes line 1 concurrently. The two deletes agree: both are
-/// recorded, no collision is reported, and the line stays deleted. Main's
-/// edit is not lost: main's own delete replaced it first. The checks
+/// recorded, no collision is reported, and the line stays deleted. The root's
+/// edit is not lost: the root's own delete replaced it first. The checks
 /// called it a loss until the owner's rule R10.3.
 #[test]
 fn r10_two_deletes_of_one_line_agree_over_an_unseen_edit() {
@@ -3164,9 +3173,9 @@ fn r10_two_deletes_of_one_line_agree_over_an_unseen_edit() {
     }
 }
 
-/// R10.3, finding 28: a fork's edit of line 1 loses to main's delete, and
+/// R10.3, finding 28: a fork's edit of line 1 loses to the root's delete, and
 /// a later save deletes line 1 over that edit. That delete agrees with
-/// main's: it applies, the line stays deleted, and only the edit is named
+/// the root's: it applies, the line stays deleted, and only the edit is named
 /// lost.
 #[test]
 fn r10_a_later_delete_agrees_with_the_winning_delete() {
@@ -3194,7 +3203,7 @@ fn r10_a_later_delete_agrees_with_the_winning_delete() {
 
 /// Finding 25: a fork
 /// renames `a` to `e` (save 1), then renames `c` over `e` (save 2, one call:
-/// `c` named `e`, `a` replaced). Main edited `a` meanwhile, unseen by save 2,
+/// `c` named `e`, `a` replaced). The root edited `a` meanwhile, unseen by save 2,
 /// so save 2's unlink of `a` loses to that line (the file rule) and save 2
 /// loses whole: its rename of `c` lost with its change (`By::Whole`), not to
 /// the name `a` keeps only because the change lost.
@@ -3223,8 +3232,8 @@ fn r11_a_losing_rename_over_loses_its_rename_with_its_change() {
 /// a line the fork's own save deletes too. At commit the two deletes
 /// agree, so the transaction's delete applies in the fork, part of the
 /// change that won (`Committed`). The fork's save then loses whole at
-/// main (another of its lines collided); the transaction's commit, judged
-/// on its own (rule 4), carries its delete upward, and it applies in main.
+/// the root (another of its lines collided); the transaction's commit, judged
+/// on its own (rule 4), carries its delete upward, and it applies in the root.
 /// When the transaction's change loses instead (another of its lines
 /// collided with the fork's), its agreeing delete loses with it and the
 /// answer names it.
@@ -3296,17 +3305,17 @@ fn r3_a_transactions_agreeing_delete_is_part_of_its_change() {
 
 // ── rule 9, progress (git-model.md §6: P1 and P2; P3 deleted) ───────────
 
-/// Rule 9 with P1: a main writer holding a file open for long holds back
+/// Rule 9 with P1: a root writer holding a file open for long holds back
 /// only the landings that touch that file. An unrelated fork's change
 /// goes ahead of the waiting one; a later change of the waiting one's own
 /// fork does not (each fork's order is kept), even of another file,
 /// nor does another fork's change of the held file.
 #[test]
-fn r9_a_long_lived_main_writer_holds_back_only_its_own_file() {
+fn r9_a_long_lived_root_writer_holds_back_only_its_own_file() {
     let mut w = world();
     let (f, g) = (w.create_fork(TreeId::ROOT), w.create_fork(TreeId::ROOT));
     let k = w.create_fork(TreeId::ROOT);
-    let m2 = Client::Main("m2".into());
+    let m2 = Client::Root("m2".into());
     let log = w.open_write(&m2, "a");
     w.write(log, Write::Append("log\n".into()));
     let x = w.save(&Client::Fork(f), "a", 0);
@@ -3351,7 +3360,7 @@ fn r9_a_long_lived_main_writer_holds_back_only_its_own_file() {
 fn r9_new_writers_postpone_a_waiting_take() {
     let mut w = world();
     let f = w.create_fork(TreeId::ROOT);
-    let m2 = Client::Main("m2".into());
+    let m2 = Client::Root("m2".into());
     let first = w.open_write(&m1(), "a");
     let x = w.save(&Client::Fork(f), "a", 0);
     take(&mut w, &Step::Next(TreeId::ROOT));
@@ -3367,7 +3376,7 @@ fn r9_new_writers_postpone_a_waiting_take() {
         w.waits().contains_key(&TreeId::ROOT),
         "the second writer still has it open: the take still waits"
     );
-    let third = w.open_write(&Client::Main("m3".into()), "a");
+    let third = w.open_write(&Client::Root("m3".into()), "a");
     assert!(w.handles().any(|h| h.id == third));
     w.close(second);
     ok(&mut w);
@@ -3415,7 +3424,7 @@ fn r9_a_writer_holding_a_waited_file_is_not_made_to_wait() {
         w.handles().any(|h| h.id == b),
         "m1 holds a: not made to wait"
     );
-    let other = w.open_write(&Client::Main("m2".into()), "b");
+    let other = w.open_write(&Client::Root("m2".into()), "b");
     assert!(
         w.handles().any(|h| h.id == other),
         "another client's open of b is granted too"
@@ -3434,7 +3443,7 @@ fn r9_a_writer_holding_a_waited_file_is_not_made_to_wait() {
 /// Rule 12 inside a transaction: an open in the transaction is in the
 /// journal like any other, so a crash saves its calls into the
 /// transaction's branch (a ref, which survives); the commit then carries
-/// them into the fork and on to main.
+/// them into the fork and on to the root.
 #[test]
 fn r12_a_crash_saves_an_open_inside_a_transaction() {
     let mut w = world();
@@ -3462,14 +3471,14 @@ fn r12_a_crash_saves_an_open_inside_a_transaction() {
 
 /// Rule 9 with P1 (the review of 2026-11-04, P1-c): a long-held file holds
 /// back only the saves that touch it. A fork saves `a`, then `b`, while a
-/// main client holds `b` open; the save of `a` lands at once, and the save of
+/// root client holds `b` open; the save of `a` lands at once, and the save of
 /// `b` waits on its own. And in the other order, a first save that waits
 /// waits alone.
 #[test]
 fn r9_a_held_file_holds_back_only_its_saves() {
     let mut w = world();
     let f = w.create_fork(TreeId::ROOT);
-    let m2 = Client::Main("m2".into());
+    let m2 = Client::Root("m2".into());
     let held = w.open_write(&m2, "b");
     let x = w.save(&Client::Fork(f), "a", 0);
     let y = w.save(&Client::Fork(f), "b", 0);
@@ -3494,12 +3503,12 @@ fn r9_a_held_file_holds_back_only_its_saves() {
     // open of `b` is granted.
     let mut w = world();
     let f = w.create_fork(TreeId::ROOT);
-    let held = w.open_write(&Client::Main("m2".into()), "a");
+    let held = w.open_write(&Client::Root("m2".into()), "a");
     w.save(&Client::Fork(f), "a", 0);
     w.save(&Client::Fork(f), "b", 0);
     take(&mut w, &Step::Next(TreeId::ROOT));
     assert!(w.waits().contains_key(&TreeId::ROOT));
-    let other = w.open_write(&Client::Main("m3".into()), "b");
+    let other = w.open_write(&Client::Root("m3".into()), "b");
     assert!(
         w.handles().any(|h| h.id == other),
         "the waiting save of a does not lock b"
@@ -3529,7 +3538,7 @@ fn r9_cooperating_programs_never_deadlock() {
         w.waits().contains_key(&TreeId::ROOT),
         "the landing waits for m1"
     );
-    let child = w.open_write(&Client::Main("m2".into()), "a");
+    let child = w.open_write(&Client::Root("m2".into()), "a");
     assert!(
         w.handles().any(|h| h.id == child),
         "m2's open is granted: nothing waits on m1's close but the take"
@@ -3547,7 +3556,7 @@ fn r9_cooperating_programs_never_deadlock() {
 /// Progress rule P2, the prefix sync (the owner, 2026-11-04: "agreed"): a
 /// sync delivers the upstream's commits in order up to the first that would
 /// overwrite a file the fork has open for writing, and holds back that
-/// one and every later one until the file closes. Main saves `b`, then
+/// one and every later one until the file closes. The root saves `b`, then
 /// `a`, then `c` while the fork has `a` open: the sync delivers `b`
 /// only (not `c`, which comes after the change to `a`), then waits; the
 /// close delivers the rest.
@@ -3590,11 +3599,11 @@ fn r9_a_sync_delivers_up_to_the_first_change_to_an_open_file() {
 }
 
 /// Finding 11's rule on a chain (review of 2026-11-04): the fork renames
-/// `b` to `h`; main renames `c` to `h`, then `d` to `c`. The sync keeps the
-/// fork's `h`, shows main's c-file under its previous name `c`, and so
-/// main's d-file, now named `c` in main, under its previous name `d`:
-/// never two files at one path. Main's queue then decides and the fork
-/// shows main's names.
+/// `b` to `h`; the root renames `c` to `h`, then `d` to `c`. The sync keeps the
+/// fork's `h`, shows the root's c-file under its previous name `c`, and so
+/// the root's d-file, now named `c` in the root, under its previous name `d`:
+/// never two files at one path. The root's queue then decides and the fork
+/// shows the root's names.
 #[test]
 fn r11_a_chain_of_renames_to_one_path_keeps_every_previous_name() {
     let mut w = world();
@@ -3608,7 +3617,7 @@ fn r11_a_chain_of_renames_to_one_path_keeps_every_previous_name() {
     assert_eq!(
         names(&w, t),
         (Some("h".into()), Some("c".into()), Some("d".into())),
-        "its own name, main's files under their previous names"
+        "its own name, the root's files under their previous names"
     );
     drain(&mut w);
     for t in [TreeId::ROOT, t] {
@@ -3622,10 +3631,10 @@ fn r11_a_chain_of_renames_to_one_path_keeps_every_previous_name() {
 
 /// P2, causal order (review of 2026-11-04, P0-1): a prefix sync delivers no
 /// upstream decision before the commit that carries it. G is a fork in
-/// P and keeps `b` open; G's x and main's m both write over line 0 of `a`.
-/// P saves `c`, then `b`, then takes G's x; main takes P's three commits
+/// P and keeps `b` open; G's x and the root's m both write over line 0 of `a`.
+/// P saves `c`, then `b`, then takes G's x; the root takes P's three commits
 /// and x loses to m. G's sync of P delivers only `c` (P's `b` is open in G)
-/// and holds back the landing that carried x up, so main's decision
+/// and holds back the landing that carried x up, so the root's decision
 /// against x is not delivered yet: G keeps x, never the version both were
 /// written over. Then `b` closes and G shows m.
 #[test]
@@ -3697,12 +3706,12 @@ fn r9_a_prefix_sync_holds_back_a_transaction_whole() {
     let mut w = world();
     let (f, g) = (w.create_fork(TreeId::ROOT), w.create_fork(TreeId::ROOT));
     let t = f;
-    // f's own save of a lands in main; f opens a again.
+    // f's own save of a lands in the root; f opens a again.
     let own = w.save(&Client::Fork(f), "a", 0);
     next(&mut w, TreeId::ROOT);
     let h = w.open_write(&Client::Fork(f), "a");
     let mb = w.save(&m1(), "b", 0);
-    // g's transaction writes c and a, and lands in main whole.
+    // g's transaction writes c and a, and lands in the root whole.
     w.begin(g).unwrap();
     let mut staged = Vec::new();
     for p in ["c", "a"] {
@@ -3716,7 +3725,7 @@ fn r9_a_prefix_sync_holds_back_a_transaction_whole() {
         next(&mut w, TreeId::ROOT);
     }
     assert!(has(&w, TreeId::ROOT, "c", &gc));
-    // f's queue: syncs of main's landing of f's own save, of b, and of g's
+    // f's queue: syncs of the root's landing of f's own save, of b, and of g's
     // transaction. The first two deliver; the transaction waits whole.
     while w.pending().contains(&Step::Next(t)) {
         take(&mut w, &Step::Next(t));
@@ -3800,8 +3809,8 @@ fn finding_50_a_held_back_decision_is_excused_only_while_a_lock_holds_it() {
     assert!(e.contains(&format!("at {x}, which")), "{e}");
 }
 
-/// Main's save of a new line to `c` (at its third byte), as finding 47's seed made it.
-fn main_edits_c(w: &mut World) {
+/// The root's save of a new line to `c` (at its third byte), as finding 47's seed made it.
+fn root_edits_c(w: &mut World) {
     calls(
         w,
         &m1(),
@@ -3813,36 +3822,39 @@ fn main_edits_c(w: &mut World) {
     );
 }
 
-/// Finding 47, seed 484 (R10.3): the fork's unlink agrees with main's unlink of the same
-/// file, though main edited the file first and the fork never saw that edit. The landing
+/// Finding 47, seed 484 (R10.3): the fork's unlink agrees with the root's unlink of the same
+/// file, though the root edited the file first and the fork never saw that edit. The landing
 /// takes, with no collision. The calls of the conformance replay's test of the same name.
 #[test]
 fn finding_47_two_unlinks_agree_over_an_unseen_edit() {
     let mut w = world();
     let f = w.create_fork(TreeId::ROOT);
-    main_edits_c(&mut w);
+    root_edits_c(&mut w);
     w.unlink(&m1(), "c");
     w.unlink(&Client::Fork(f), "c");
     ok(&mut w);
     next(&mut w, TreeId::ROOT);
-    assert!(w.last_take().is_some(), "main takes the fork's unlink");
+    assert!(w.last_take().is_some(), "the root takes the fork's unlink");
     assert!(w.collisions.is_empty(), "{:?}", w.collisions);
     drain(&mut w);
 }
 
 /// Finding 47, seed 484, as the seed had it: the fork's delete is half of a rename-over,
-/// which lands whole, so `b` takes the name `c` in main.
+/// which lands whole, so `b` takes the name `c` in the root.
 #[test]
 fn finding_47_a_rename_over_agrees_with_an_unlink_over_an_unseen_edit() {
     use agentfs_model::calls::{TreeCalls, TreeId};
     let mut w = world();
     let f = w.create_fork(TreeId::ROOT);
-    main_edits_c(&mut w);
+    root_edits_c(&mut w);
     w.unlink(&m1(), "c");
     w.rename(&Client::Fork(f), "b", "c");
     ok(&mut w);
     next(&mut w, TreeId::ROOT);
-    assert!(w.last_take().is_some(), "main takes the fork's rename-over");
+    assert!(
+        w.last_take().is_some(),
+        "the root takes the fork's rename-over"
+    );
     assert!(w.collisions.is_empty(), "{:?}", w.collisions);
     let paths = TreeCalls::paths(&*w, TreeId::ROOT).unwrap();
     assert!(
@@ -3854,7 +3866,7 @@ fn finding_47_a_rename_over_agrees_with_an_unlink_over_an_unseen_edit() {
 
 /// Finding 46, seed 124 (R9.1): a sync that changes no line or name of the fork's own view
 /// of a file locks no name of it. The fork replaced `d` with `a` by a rename-over,
-/// undecided, so main's edit of the old `d` keeps no name there, and the fork's open of
+/// undecided, so the root's edit of the old `d` keeps no name there, and the fork's open of
 /// the new `d` does not hold the sync back: it takes at once.
 #[test]
 fn finding_46_a_sync_of_a_file_the_fork_replaced_passes_the_name_it_took() {

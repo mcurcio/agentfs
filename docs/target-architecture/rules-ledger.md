@@ -32,7 +32,8 @@ question first ([VERIFYING.md](../../crates/agentfs-model/VERIFYING.md) §"Fix p
 `proposed` and then built.
 
 A *fork* is a tree made from another tree, its *upstream*; a fork inside a fork has that fork as its upstream. A
-tree with no upstream is the root (the examples call it main, `refs/heads/main`). A *sync* brings the upstream's version
+tree with no upstream is the root; its branch is `refs/heads/<root>`, a name the volume is configured with
+([root branch name](future/root-branch-name.md)). A *sync* brings the upstream's version
 into a fork. A *landing* brings a fork's save into its upstream. Two lines *collide* when each was written
 without seeing the other. MODEL.md's rules table holds the full wording; this page is the authority on status.
 
@@ -184,7 +185,7 @@ of their day: "main" is the root, a "sandbox" is a fork, a "parent" is an upstre
   "drop squashing"). Transaction commits stay as they are. Every fork
   commit stays stored. Source: "one setting per volume" (2026-11-02); "the sandbox commits could be squashed to
   one changeset (if they are the naive simple commits) ... leave the transaction commits as they are"; "every
-  sandbox commit stays stored ... that makes sense" (2026-11-03). Tests: `r7_every_fork_commit_lands_on_its_own_in_mains_history`
+  sandbox commit stays stored ... that makes sense" (2026-11-03). Tests: `r7_every_fork_commit_lands_on_its_own_in_the_roots_history`
 - **R7.1** · rejected · Squashing happens after judging: each save is judged on its own, only the winners are
   squashed, and a loser stays its own commit. Approved by the owner, 2026-11-05 (approval page); his note: "if my squashing optimization idea causes too many issues, we can drop it entirely. it is mostly veneer to cut down on noise in the git history.". Owner, 2026-11-05 (in chat, round 2): "drop squashing". Gone when: `Squashed`
 - **R7.2** · rejected · The history setting never changes an outcome: the same calls decide the same trees and
@@ -295,7 +296,7 @@ of their day: "main" is the root, a "sandbox" is a fork, a "parent" is an upstre
 - **R9.4** · approved · A sync or landing waits for all its files at once, never holding one while it waits for
   another. Approved by the owner, 2026-11-05 (approval page); he asked whether a fast writer can starve a landing (open, with R9.8). 
 - **R9.5** · approved · A waiting entry waits only for its own files, and for earlier entries that share a file
-  or a source with it (P1). Owner, 2026-11-05 (in chat, round 2): "i think approve". Tests: `r9_a_long_lived_main_writer_holds_back_only_its_own_file`
+  or a source with it (P1). Owner, 2026-11-05 (in chat, round 2): "i think approve". Tests: `r9_a_long_lived_root_writer_holds_back_only_its_own_file`
 - **R9.6** · approved · A client's death closes its open files and saves them, as Linux's close on exit does.
   Approved by the owner, 2026-11-05 (approval page). Tests: `r9_client_death_releases_its_locks`
 - **R9.7** · approved · `unlink` and `rename` of a locked file wait like a write-open.

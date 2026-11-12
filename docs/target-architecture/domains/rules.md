@@ -23,7 +23,7 @@ Rules is a **policy decision point**: other domains enforce, Rules only answers,
 program cannot steer its own recording. Not chosen: tree rules, which let a rule-file edit change another tree's
 recording once it lands or syncs.
 
-**Design choice: a view profile is a base plus operator hide patterns, narrowing only.** `Everything` (main) or
+**Design choice: a view profile is a base plus operator hide patterns, narrowing only.** `Everything` (the root) or
 `Recordable` (forks), plus patterns that hide more; a profile never shows what its base hides (RU3).
 
 ## 2. The public contract

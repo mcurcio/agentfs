@@ -584,3 +584,39 @@ Not blocking; the suite is built and green. Findings about the brief and the doc
    (`session_abandoned`), which the log reported as "files were still open". It also
    pointed at Hermes as §9 (it is §10). The log now says "the filesystem was still mounted
    elsewhere" when the unmount was not busy.
+
+## 2026-11-11, module cut step 3c implementer (the root's name)
+
+1. **The 3c design's edit of `future/sandbox-overlay-gaps.md` was wrong.** It said "the main
+   mount" becomes "the root's mount". That page is about the older engine's sandbox overlay,
+   where the "main mount" is the volume's mount point, not a tree. It now says "the mount
+   point".
+2. **The ledger harness (`tests/gitledger`) keeps its own fork naming.** The design said the
+   ledger stores a `TreeNames` and names trees through it. The ledger re-derives everything
+   from git on purpose, so it now takes only the root's name from the world
+   (`w.names().name(TreeId::ROOT)`) and keeps its own `fork/<n>` mapping.
+3. **AGENTS.md says a new docs page goes in both `docs/README.md` and `docs/SUMMARY.md`**,
+   but `docs/README.md` lists no future-design page individually (it links the overview), and
+   `docs_reference` checks only SUMMARY. The new `future/root-branch-name.md` is in SUMMARY
+   and the target-architecture overview only, as every other future page is.
+4. **Step 4's design (unbuilt, outside the repo) predates 3c.** Before it is frozen: the
+   root caller is `Caller::Root(n)` and the trace prefix `r:`; its engine-side naming takes
+   the root's name from `agentfs_conformance::ENGINE_ROOT`, not a literal; its conformance
+   `TreeNames` type should be renamed (for example `EngineNames`) apart from the model's
+   `world::TreeNames`; and its D4 ("no trace change beyond step 3") no longer holds.
+
+## 2026-11-11, module cut step 3c fix round
+
+1. **Item 4 above is applied**: module-cut.md's step 4 row now carries each correction, and
+   says step 4's architect designs from that row, not from the earlier draft.
+2. **Item 3 above stands.** AGENTS.md's "a new page goes in both" disagrees with how future
+   pages are indexed; AGENTS.md is the maintainer's to change, so this round leaves it.
+3. **root-branch-name.md overstated two things.** It counted "about 29 places outside tests"
+   in `tree_actor/mod.rs` (there are 16 lines; `fork/deliver.rs` and agentfs-fuse's
+   `tree_view.rs` name `main` only in tests), and it proposed reusing `agentfs.branch` as
+   settled, though that key is the older engine's, with its own default. Both corrected; the
+   key is now an open question.
+4. **3c's light tier was an owner exception, not the tier's test.** The tier's list had a
+   clause ("a tree's name or ref, given only through `world::TreeNames`") that blessed the
+   change introducing `TreeNames`. It is removed; module-cut.md's 3c row says the full gate's
+   test applied and what the light run does not show.

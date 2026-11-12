@@ -6,14 +6,14 @@ use agentfs_model::calls::{
     Caller, Client, Recorded, RecordedCall, Took, TreeCalls, TreeId, parse, render,
 };
 use agentfs_model::recording::Write;
-use agentfs_model::world::{Policies, World};
+use agentfs_model::world::{MODEL_ROOT, Policies, TreeNames, World};
 
 fn world() -> World {
-    World::recording(Policies::default())
+    World::recording(Policies::default(), TreeNames::new(MODEL_ROOT))
 }
 
 fn m1() -> Client {
-    Client::Main("m1".into())
+    Client::Root("m1".into())
 }
 
 fn save(w: &mut World, c: &Client, p: &str, calls: &[Write]) {
@@ -64,7 +64,7 @@ fn a_collision_replays_the_same_on_the_library() {
     passes(&w);
 }
 
-/// The compare can fail: one byte of what the trace says main shows, changed.
+/// The compare can fail: one byte of what the trace says the root shows, changed.
 #[test]
 fn a_changed_byte_in_the_trace_is_a_mismatch() {
     let mut w = world();
@@ -108,7 +108,7 @@ fn a_clients_end_saves_its_opens() {
     let mut w = world();
     let h = w.open_write(&m1(), "c");
     w.write(h, at(0, "m\n"));
-    TreeCalls::end_client(&mut w, &Caller::Main("m1".into())).unwrap();
+    TreeCalls::end_client(&mut w, &Caller::Root("m1".into())).unwrap();
     passes(&w);
 }
 
@@ -185,7 +185,10 @@ fn finding_41_an_offset_write_then_an_append_is_one_alignment() {
     World::close(&mut w, h);
     save(&mut w, &m1(), "c", &[at(0, "m\n")]);
     drain(&mut w);
-    assert!(!w.collisions.is_empty(), "the sandbox's saves lose to main");
+    assert!(
+        !w.collisions.is_empty(),
+        "the sandbox's saves lose to the root"
+    );
     passes(&w);
 }
 
@@ -238,7 +241,7 @@ fn finding_38_a_sync_past_an_open_file_waits_for_any_line_map_change() {
     passes(&w);
 }
 
-/// Finding 39: an atomic save in a sandbox loses to main's edit of the file it
+/// Finding 39: an atomic save in a sandbox loses to the root's edit of the file it
 /// replaced. The new file comes back, so each identity needs its own object: the view's
 /// bytes match the commit's only if `t` and `c` are two objects.
 #[test]
@@ -259,7 +262,7 @@ fn finding_39_a_losing_atomic_save_keeps_two_files_apart() {
     passes(&w);
 }
 
-/// R11.3, the same mechanism as finding 39: a sandbox's unlink loses to main's edit, so
+/// R11.3, the same mechanism as finding 39: a sandbox's unlink loses to the root's edit, so
 /// the file comes back. A writer that held the unlinked file open still reaches no
 /// file: the file that came back is a new object.
 #[test]
@@ -301,7 +304,7 @@ fn an_old_writer_stays_orphaned_when_the_rename_over_loses() {
     passes(&w);
 }
 
-/// Finding 44 (the owner, 2026-11-07, his 3, option a): main unlinks a file a sandbox has
+/// Finding 44 (the owner, 2026-11-07, his 3, option a): the root unlinks a file a sandbox has
 /// renamed, and the rename is undecided, so the sandbox keeps the file under its name, and
 /// its lines until the parent decides. Then the rename loses, and the file goes.
 #[test]
@@ -343,9 +346,9 @@ fn finding_48_a_kept_file_takes_the_upstreams_last_lines_and_keeps_its_own() {
     passes(&w);
 }
 
-/// Finding 45 (the owner, 2026-11-07, his 4, option a): a sandbox's save landing on main's
+/// Finding 45 (the owner, 2026-11-07, his 4, option a): a sandbox's save landing on the root's
 /// current head is a fast-forward, in the library too. So there is nothing to deliver before
-/// main's next commit, which waits for an open file.
+/// the root's next commit, which waits for an open file.
 #[test]
 fn finding_45_a_landing_on_the_parents_head_is_a_fast_forward() {
     let mut w = world();
@@ -360,7 +363,7 @@ fn finding_45_a_landing_on_the_parents_head_is_a_fast_forward() {
 }
 
 /// Finding 46 (the owner, 2026-11-07, his 5, option a; R9.1): a landing locks the names its
-/// change touches too. A landing's unlink of `a` waits while main's open of another file
+/// change touches too. A landing's unlink of `a` waits while the root's open of another file
 /// holds the name `a`, the close ends the wait, and the take goes.
 #[test]
 fn finding_46_a_landing_waits_for_an_open_file_that_took_a_name_it_touches() {
@@ -376,8 +379,8 @@ fn finding_46_a_landing_waits_for_an_open_file_that_took_a_name_it_touches() {
     passes(&w);
 }
 
-/// Finding 47, seed 484: a sandbox's unlink agrees with main's unlink of the same file,
-/// though main edited the file first and the sandbox never saw that edit (R10.3).
+/// Finding 47, seed 484: a sandbox's unlink agrees with the root's unlink of the same file,
+/// though the root edited the file first and the sandbox never saw that edit (R10.3).
 #[test]
 fn finding_47_two_unlinks_agree_over_an_unseen_edit() {
     let mut w = world();
@@ -411,7 +414,7 @@ fn finding_47_a_rename_over_agrees_with_an_unlink_over_an_unseen_edit() {
 
 /// Finding 46, seed 124: a sync that changes no line or name of the sandbox's own view of a
 /// file locks no name of it. The sandbox replaced `d` with `a` by a rename-over, undecided,
-/// so main's edit of its old `d` keeps no name there, and the sandbox's open of the new `d`
+/// so the root's edit of its old `d` keeps no name there, and the sandbox's open of the new `d`
 /// does not hold the sync back.
 #[test]
 fn finding_46_a_sync_of_a_file_the_sandbox_replaced_passes_the_name_it_took() {
@@ -426,9 +429,9 @@ fn finding_46_a_sync_of_a_file_the_sandbox_replaced_passes_the_name_it_took() {
 }
 
 /// Finding 49 (seeds 78, 164 and 189; the owner, 2026-11-08, "B"): a take is one atomic
-/// step in the model too. Main takes `c`'s landing while `d`'s waits for an open file: the
+/// step in the model too. The root takes `c`'s landing while `d`'s waits for an open file: the
 /// take has written `c` when `take_next` returns, before the close that frees `d`'s landing
-/// and main's next save. The trace is the order the calls ran in, so a fresh model and the
+/// and the root's next save. The trace is the order the calls ran in, so a fresh model and the
 /// library take the same entries at the same calls.
 #[test]
 fn finding_49_a_take_is_one_step_so_its_trace_replays() {
@@ -480,7 +483,7 @@ fn finding_51_a_sync_that_cannot_show_the_upstreams_commit_merges() {
 }
 
 /// Finding 51 (CI seed 37 of the phase 1 generator, 2026-11-08; R6.1, R6.2): a fork's save
-/// loses to main's, and the fork's sync can then fast-forward to main's landing, since that
+/// loses to the root's, and the fork's sync can then fast-forward to the root's landing, since that
 /// landing holds the fork's commit and nothing of the fork waits. The library merged instead,
 /// because its fork still listed the lost version in its line map's ancestry, so the fork's
 /// next save landed as a merge too, and a later sync had one more commit to deliver past an

@@ -71,6 +71,7 @@
   - [Telemetry](target-architecture/domains/telemetry.md)
   - [Snapshot opens (parked)](target-architecture/snapshot-opens.md)
   - [Module cut](target-architecture/future/module-cut.md)
+  - [Root branch name](target-architecture/future/root-branch-name.md)
   - [Transactions](target-architecture/future/transactions.md)
   - [Nested forks](target-architecture/future/nested-forks.md)
   - [Beyond flat files](target-architecture/future/tree-views-beyond-flat-files.md)

@@ -97,7 +97,7 @@ def seed(name, data):
 def concurrent(name, base, parent, child, result, losing=False):
     """Model's parent/child concurrent saves, blocked at parent's writer."""
     model = json.loads(subprocess.check_output([ORACLE, name]))
-    assert bytes.fromhex(model["main"]) == result
+    assert bytes.fromhex(model["root"]) == result
     assert bytes.fromhex(model["child"]) == result
     assert bool(model["collisions"]) == losing
     seed(name, base)
@@ -248,9 +248,9 @@ def flow():
 
 def standard_cases():
     cases = [
-        ("loss", b"a0\na1\na2\n", b"main\na1\na2\n", b"child\na1\nclean\n", b"main\na1\na2\n", True),
-        ("neighbors", b"a0\na1\na2\n", b"main\na1\na2\n", b"a0\nchild\na2\n", b"main\nchild\na2\n", False),
-        ("inserts", b"a0\na1\n", b"a0\nmain\na1\n", b"a0\nchild\na1\n", b"a0\nmain\nchild\na1\n", False),
+        ("loss", b"a0\na1\na2\n", b"root\na1\na2\n", b"child\na1\nclean\n", b"root\na1\na2\n", True),
+        ("neighbors", b"a0\na1\na2\n", b"root\na1\na2\n", b"a0\nchild\na2\n", b"root\nchild\na2\n", False),
+        ("inserts", b"a0\na1\n", b"a0\nroot\na1\n", b"a0\nchild\na1\n", b"a0\nroot\nchild\na1\n", False),
         ("unfinished", b"base\n", b"base\n}", b"base\nchild\n", b"base\n}", True),
         ("edited-place", b"a0\na1\n", b"a0\na1\nparent\n", b"a0\nchild\n", b"a0\nchild\nparent\n", False),
     ]
@@ -316,7 +316,7 @@ def progress_p1():
         wait_ref("main", "pipeline", b"pipeline")
         assert_aligned(direct_commit("main", "pipeline", b"pipeline"), "pipeline")
     converged("later", b"later\n")
-    expected = bytes.fromhex(json.loads(subprocess.check_output([ORACLE, "p1-append"]))["main"])
+    expected = bytes.fromhex(json.loads(subprocess.check_output([ORACLE, "p1-append"]))["root"])
     converged("log", expected)
 
 
@@ -419,9 +419,9 @@ def finding_32():
         status = subprocess.run(["git", "--git-dir=" + str(REPO), "merge-base",
                                  "--is-ancestor", save_commit, commit]).returncode
         assert status == 0, ("losing save left history", save_commit, commit, status)
-    assert model["main"] == model["parent"], ("the model's main took a losing save", model)
-    assert bytes_at(commit, "finding32") == bytes.fromhex(model["main"]), (
-        "finding 32 bytes differ from model", bytes_at(commit, "finding32"), model["main"])
+    assert model["root"] == model["parent"], ("the model's root took a losing save", model)
+    assert bytes_at(commit, "finding32") == bytes.fromhex(model["root"]), (
+        "finding 32 bytes differ from model", bytes_at(commit, "finding32"), model["root"])
     message = git("show", "-s", "--format=%B", commit).decode().splitlines()
     assert "Agentfs-Format: envelope-1" in message
     lines = json.loads(git("show", f"{commit}:metadata.json"))["finding32"][2]["lines"]

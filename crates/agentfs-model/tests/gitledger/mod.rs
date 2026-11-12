@@ -29,6 +29,9 @@ enum Q {
 #[derive(Default)]
 struct Ledger {
     repo: PathBuf,
+    /// The root's name, as the world was configured with it: the one name
+    /// the ledger does not derive itself.
+    root: String,
     refs: String,
     seen: BTreeSet<String>,
     heads: BTreeMap<String, String>,
@@ -54,16 +57,16 @@ pub fn enable(on: bool) {
     L.with(|l| *l.borrow_mut() = None);
 }
 
-fn name(t: TreeId) -> String {
+fn name(root: &str, t: TreeId) -> String {
     if t == TreeId::ROOT {
-        "main".into()
+        root.to_string()
     } else {
         format!("fork/{t}")
     }
 }
 
-fn tree_of_name(s: &str) -> Option<TreeId> {
-    if s == "main" {
+fn tree_of_name(root: &str, s: &str) -> Option<TreeId> {
+    if s == root {
         return Some(TreeId::ROOT);
     }
     s.strip_prefix("fork/")?.parse().ok().map(TreeId::new)
@@ -124,13 +127,15 @@ pub fn observe(w: &World) -> Result<(), String> {
         if g.as_ref().is_none_or(|l| l.repo != w.repo()) {
             let mut l = Ledger {
                 repo: w.repo().to_path_buf(),
+                root: w.names().name(TreeId::ROOT),
                 ..Default::default()
             };
-            l.heads.insert("main".into(), w.head(TreeId::ROOT));
+            l.heads.insert(l.root.clone(), w.head(TreeId::ROOT));
             l.seen = w.all_commits().into_iter().collect();
             *g = Some(l);
         }
         let l = g.as_mut().expect("ledger");
+        let root = l.root.clone();
         let refs = git(&l.repo, &["for-each-ref", "--format=%(objectname) %(refname)"]);
         if refs == l.refs {
             return Ok(());
@@ -141,7 +146,7 @@ pub fn observe(w: &World) -> Result<(), String> {
         for line in refs.lines() {
             let (oid, r) = line.split_once(' ').expect("ref line");
             if let Some(b) = r.strip_prefix("refs/heads/") {
-                if b == "main" || b.starts_with("fork/") {
+                if b == root || b.starts_with("fork/") {
                     heads.insert(b.to_string(), oid.to_string());
                 }
             } else if r.starts_with("refs/collisions/") {
@@ -159,7 +164,7 @@ pub fn observe(w: &World) -> Result<(), String> {
         let mut moved = Vec::new();
         for (b, h) in &heads {
             if l.heads.get(b) != Some(h) {
-                moved.push((tree_of_name(b).expect("branch"), l.heads.get(b).cloned(), h.clone()));
+                moved.push((tree_of_name(&root, b).expect("branch"), l.heads.get(b).cloned(), h.clone()));
             }
         }
         if moved.len() > 1 {
@@ -182,7 +187,7 @@ pub fn observe(w: &World) -> Result<(), String> {
             if old.as_deref() != Some(c.as_str()) && old.is_some() {
                 moves += 1;
                 let m = l.meta(&c);
-                let below = tree_of_name(&m.tree).is_some_and(|t| {
+                let below = tree_of_name(&root, &m.tree).is_some_and(|t| {
                     t != x && w.upstream_of(t).is_some() && w.upstream(t).contains(&x)
                 });
                 if below {
@@ -192,7 +197,7 @@ pub fn observe(w: &World) -> Result<(), String> {
             }
             for c in &chain {
                 let m = l.meta(c);
-                if m.tree == name(x)
+                if m.tree == name(&root, x)
                     && (m.cause == "Direct" || m.cause == "Landing" || m.cause.starts_with("Transaction "))
                 {
                     queued.push(c.clone());
@@ -206,7 +211,7 @@ pub fn observe(w: &World) -> Result<(), String> {
                 }
             }
             for child in w.forks.values().filter(|k| k.upstream == x) {
-                if heads.contains_key(&name(child.id)) {
+                if heads.contains_key(&name(&root, child.id)) {
                     let q = l.queues.entry(child.id).or_default();
                     for _ in 0..moves {
                         q.push(Q::Sync);
@@ -220,7 +225,7 @@ pub fn observe(w: &World) -> Result<(), String> {
             }
             for c in &chain {
                 let m = l.meta(c);
-                if m.tree != name(x) {
+                if m.tree != name(&root, x) {
                     continue;
                 }
                 if m.cause == "Landing" {

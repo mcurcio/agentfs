@@ -10,8 +10,8 @@
 //! so no commit id is in the text. Every tree name, as a ref or as a message's
 //! `Agentfs-Tree` or `Agentfs-Collision` field, becomes a label: `T0` the root,
 //! `T<fork id>` a fork, `X<id>` a transaction. The names come from the one place
-//! that names trees ([`World::name`], [`World::branch`], [`World::txn_name`],
-//! [`World::txn_branch`]), so renaming a tree changes no digest. The loser in
+//! that names trees ([`TreeNames`]), so renaming a tree, the root included,
+//! changes no digest. The loser in
 //! `Agentfs-Collision` becomes its number. New trailers are in by default.
 //! Collision refs stay verbatim.
 
@@ -21,7 +21,7 @@ use std::path::Path;
 use crate::calls::TreeId;
 use crate::calls::TxnId;
 use crate::git::{git, git_in, try_git};
-use crate::world::{COLLISION, World};
+use crate::world::{COLLISION, TreeNames, World};
 
 /// Where `World::drop` writes each run's digest.
 pub const DIGEST_DIR: &str = "AGENTFS_MODEL_DIGEST_DIR";
@@ -31,17 +31,21 @@ const DIGEST_TEXT: &str = "AGENTFS_MODEL_DIGEST_TEXT";
 
 const TREE: &str = "Agentfs-Tree";
 
-/// The label of each tree's name and ref: the root, forks `forks` and
-/// transactions 1 to `txns`.
-fn labels_of(trees: impl IntoIterator<Item = TreeId>, txns: TxnId) -> BTreeMap<String, String> {
+/// The label of each tree's name and ref, as `names` names them: the root,
+/// forks `forks` and transactions 1 to `txns`.
+fn labels_of(
+    names: &TreeNames,
+    trees: impl IntoIterator<Item = TreeId>,
+    txns: TxnId,
+) -> BTreeMap<String, String> {
     let trees = trees.into_iter().map(|t| (t, format!("T{}", t.number())));
     let mut labels: BTreeMap<String, String> = trees
-        .flat_map(|(t, label)| [(World::name(t), label.clone()), (World::branch(t), label)])
+        .flat_map(|(t, label)| [(names.name(t), label.clone()), (names.branch(t), label)])
         .collect();
     for id in 1..=txns {
         let label = format!("X{id}");
-        labels.insert(World::txn_name(id), label.clone());
-        labels.insert(World::txn_branch(id), label);
+        labels.insert(TreeNames::txn_name(id), label.clone());
+        labels.insert(TreeNames::txn_branch(id), label);
     }
     labels
 }
@@ -208,7 +212,7 @@ fn canonical(repo: &Path, remote: &Path, labels: &BTreeMap<String, String>) -> S
 
 /// The run as one canonical text (this module's doc comment).
 pub fn canonical_text(w: &World) -> String {
-    let labels = labels_of(w.trees(), w.txns_begun());
+    let labels = labels_of(w.names(), w.trees(), w.txns_begun());
     canonical(w.repo(), w.remote(), &labels)
 }
 
@@ -237,6 +241,7 @@ pub(crate) fn write(w: &World, dir: &Path, name: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::world::MODEL_ROOT;
     use std::path::PathBuf;
 
     /// A temporary directory, removed when dropped.
@@ -276,14 +281,15 @@ mod tests {
         let (repo, remote) = (dir.0.join("repo"), dir.0.join("origin.git"));
         std::fs::create_dir_all(&repo).unwrap();
         std::fs::create_dir_all(&remote).unwrap();
-        git(&repo, &["init", "-q", "-b", "main"]);
-        git(&remote, &["init", "-q", "--bare", "-b", "main"]);
-        let main = World::name(TreeId::ROOT);
-        let (f1, f2) = (World::name(TreeId::new(1)), World::name(TreeId::new(2)));
+        let names = TreeNames::new(MODEL_ROOT);
+        let root_name = names.name(TreeId::ROOT);
+        git(&repo, &["init", "-q", "-b", &root_name]);
+        git(&remote, &["init", "-q", "--bare", "-b", &root_name]);
+        let (f1, f2) = (names.name(TreeId::new(1)), names.name(TreeId::new(2)));
         let empty = git_in(&repo, &["mktree"], "");
         let blob = git_in(&repo, &["hash-object", "-w", "--stdin"], "x\n");
         let with_a = git_in(&repo, &["mktree"], &format!("100644 blob {blob}\ta\n"));
-        let root = commit(&repo, &[], &empty, &message("Root", &main, ""));
+        let root = commit(&repo, &[], &empty, &message("Root", &root_name, ""));
         let on_f1 = commit(&repo, &[&root], &empty, &message("Direct", &f1, ""));
         let on_f2 = commit(&repo, &[&root], &with_a, &message("Direct", &f2, ""));
         let lost = format!("{COLLISION}: {f2} a Line {on_f2} refs/collisions/1 a c2.1 m1.1\n");
@@ -291,19 +297,19 @@ mod tests {
             &repo,
             &[&root, &on_f2],
             &empty,
-            &message("Landing", &main, &lost),
+            &message("Landing", &root_name, &lost),
         );
         let in_txn = commit(
             &repo,
             &[&on_f1],
             &with_a,
-            &message("Direct", &World::txn_name(1), "Agentfs-Open: 7\n"),
+            &message("Direct", &TreeNames::txn_name(1), "Agentfs-Open: 7\n"),
         );
         for (r, c) in [
-            (World::branch(TreeId::ROOT), &landing),
-            (World::branch(TreeId::new(1)), &on_f1),
-            (World::branch(TreeId::new(2)), &on_f2),
-            (World::txn_branch(1), &in_txn),
+            (names.branch(TreeId::ROOT), &landing),
+            (names.branch(TreeId::new(1)), &on_f1),
+            (names.branch(TreeId::new(2)), &on_f2),
+            (TreeNames::txn_branch(1), &in_txn),
             ("refs/collisions/1".to_string(), &on_f2),
         ] {
             git(&repo, &["update-ref", &r, c]);
@@ -315,14 +321,14 @@ mod tests {
                 "push",
                 "-q",
                 &to,
-                &format!("{root}:refs/heads/main"),
+                &format!("{root}:{}", names.branch(TreeId::ROOT)),
                 "refs/collisions/*:refs/collisions/*",
             ],
         );
         let text = canonical(
             &repo,
             &remote,
-            &labels_of([TreeId::ROOT, TreeId::new(1), TreeId::new(2)], 1),
+            &labels_of(&names, [TreeId::ROOT, TreeId::new(1), TreeId::new(2)], 1),
         );
         assert_eq!(text, PINNED, "the canonical text changed:\n{text}");
     }
@@ -368,4 +374,55 @@ R refs/collisions/1 1
 P T0 0
 P refs/collisions/1 1
 ";
+
+    /// The canonical text of one run under root name `root`: a fork's
+    /// committed transaction loses at the root (a collision), and the root and
+    /// the collision ref are replicated to the remote.
+    fn text_of_a_run_under(root: &str) -> String {
+        use crate::calls::Client;
+        use crate::world::Policies;
+        let mut w = World::new(Policies::default(), TreeNames::new(root));
+        let f = w.create_fork(TreeId::ROOT);
+        w.begin(f).expect("a transaction");
+        w.save(&Client::Fork(f), "a", 0);
+        w.save(&Client::Fork(f), "a", 2);
+        w.commit_txn(f).expect("the transaction commits");
+        let m1 = Client::Root("m1".into());
+        w.save(&m1, "a", 0);
+        w.save(&m1, "a", 1);
+        while let Some(s) = w.pending().into_iter().next() {
+            w.step(&s);
+        }
+        canonical_text(&w)
+    }
+
+    /// The root's name reaches no digest: the same run under other names,
+    /// one of them nested and one the engine's, gives the same text.
+    #[test]
+    fn the_roots_name_changes_no_digest() {
+        let text = text_of_a_run_under(MODEL_ROOT);
+        for needed in [COLLISION, "\nAgentfs-Tree: X1\n", "\nP T0 "] {
+            assert!(text.contains(needed), "no {needed:?} in:\n{text}");
+        }
+        assert!(!text.contains(MODEL_ROOT), "the root's name is in:\n{text}");
+        for root in ["main", "trunk", "team/main"] {
+            assert_eq!(text_of_a_run_under(root), text, "under {root:?}");
+        }
+    }
+
+    /// A root name that would collide with a fork's or a transaction's is
+    /// refused; any other git accepts is taken.
+    #[test]
+    fn tree_names_refuses_a_fork_or_transaction_name() {
+        for bad in ["", "fork", "txn", "fork/1", "txn/1"] {
+            let made = std::panic::catch_unwind(|| TreeNames::new(bad));
+            assert!(made.is_err(), "{bad:?} was accepted");
+        }
+        for good in ["root", "main", "forks", "team/fork"] {
+            assert_eq!(
+                TreeNames::new(good).branch(TreeId::ROOT),
+                format!("refs/heads/{good}")
+            );
+        }
+    }
 }

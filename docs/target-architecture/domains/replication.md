@@ -3,7 +3,7 @@
 **Proposed, not built.** This page proposes the Replication domain (remotes, credentials, pushes and divergence), one part of the system around the git model ([the system](../system.md)). The git model ([git-model.md](../git-model.md)) wins wherever the two disagree. Rust sketches show surfaces only. The commit that lands the slice that builds this domain deletes this page and moves the behaviour into the library or operator docs.
 
 **What the git model already fixes** (git-model §4): Replication is the shared remote's only pusher; its refspec
-carries main's branch and every collision ref; a recorded collision makes a
+carries the root's branch and every collision ref; a recorded collision makes a
 push due; no queue step waits on the network. This page covers the rest: remotes, credentials, attempts, divergence
 and settlement.
 
@@ -23,7 +23,7 @@ The owner's guidance that applies here is in `OWNER-GUIDANCE.md` at the reposito
 | **endpoint** | a URL with its origin and the credential bound to that origin |
 | **credential reference** | where a secret lives, never its bytes |
 | **divergence save** | the local tip pushed under a new name in this volume's namespace when someone else moved its ref |
-| **settlement** | the answer to "does every remote carrying main hold it through this commit?" |
+| **settlement** | the answer to "does every remote carrying the root hold it through this commit?" |
 | **spacing** | the operator's minimum time between two attempts on one remote |
 
 **Not this domain:** commits, branches and collision refs (git-model); release and an upgrade's drain
@@ -44,7 +44,7 @@ stateDiagram-v2
 ```
 
 Divergence is per replica: one ref's divergence never stops another ref or remote. A collision ref is create-only
-(git-model §4), so it never diverges; only main's branch, and a carried fork's, can.
+(git-model §4), so it never diverges; only the root's branch, and a carried fork's, can.
 
 ## 3. Public contract
 
@@ -54,7 +54,7 @@ pub trait Replication {
     fn replace_diverged(&mut self, r: &RemoteName, at: TreeRef, lease: Lease, by: &ActorCap)
         -> Result<PushOutcome, PushError>;                                   // Operator role, audited
     fn fetch_start(&mut self, at: &StartPoint, by: &StartCap) -> Result<CommitId, FetchError>; // Volume's create
-    fn settlement(&self, through: CommitId) -> Settlement;                  // main's branch through this commit
+    fn settlement(&self, through: CommitId) -> Settlement;                  // the root's branch through this commit
     fn line_tip(&self, r: &RemoteName, line: &LineName) -> Result<Option<CommitId>, PushError>; // Volume's start line
     fn status(&self) -> Vec<RemoteStatus>;                                  // no secret, no credential path
 }
@@ -77,7 +77,7 @@ pub enum PushError {
 pub enum FetchError { Unreachable(IoKind), CredentialRefused, UntrustedHost, UnknownRemote, NoSuchRef, OtherMajor(Version) }
 pub enum Settlement {
     NoRemotes,                                  // nothing will be pushed (a volume with no remote is the user's choice)
-    Held,                                       // every remote carrying main holds `through`
+    Held,                                       // every remote carrying the root holds `through`
     Pending { remotes: Vec<RemoteName> },
     Failing { remotes: Vec<(RemoteName, PushError)> },
 }
@@ -101,8 +101,8 @@ pub enum Auth {
     SshAgent { socket: CredentialRef, known_hosts: CredentialRef },
 }
 pub enum Carries {
-    Main,                // main's branch, collision refs (git-model §4)
-    MainAndForks,        // also each fork's branch, kept on the remote after the fork drops
+    Root,                // the root's branch, collision refs (git-model §4)
+    RootAndForks,        // also each fork's branch, kept on the remote after the fork drops
 }
 ```
 
@@ -128,7 +128,7 @@ Called by operators (`push`, `replace_diverged`, `status`) and Volume (`settleme
 
 ## 5. Flows and scenarios
 
-**A move reaches each remote.** On `TreeMoved(main)`, each remote's attempt becomes due; once spacing is met it lists
+**A move reaches each remote.** On `TreeMoved(root)`, each remote's attempt becomes due; once spacing is met it lists
 this volume's refs, checks each carried ref is an ancestor of the local tip, uploads LFS objects, then updates every
 ref with its expected old value (collision refs: create only). It saves the claim (audited) and publishes
 `PushSettled`. **Someone else moved a ref:** the tip is saved under a divergence name in this volume's namespace
@@ -138,7 +138,7 @@ with a lease touches the remote ref.
 | Scenario | Replication's behaviour |
 |---|---|
 | A collision | the take's `TreeMoved` names it; its ref goes in the next attempt, create-only |
-| 1,000 forks | `Main`: one replica set per remote, whatever the fork count; `MainAndForks`: one more per live fork |
+| 1,000 forks | `Root`: one replica set per remote, whatever the fork count; `RootAndForks`: one more per live fork |
 | A slow, dead or refusing remote | `Unreachable` at an I/O deadline, then `Backoff`; other remotes settle on their own |
 | Crash mid-attempt | each remote is `Due` at restart; the next listing shows what it holds, so a push that landed is `UpToDate`, never a false divergence |
 | Upgrade | a minor continues the same refs; **a major pushes under its own refs** (design choice), so another major's history is never diverged, forced or deleted |
@@ -147,7 +147,7 @@ with a lease touches the remote ref.
 |---|---|
 | Remote set | empty (local-only); the deployment config is the one source of truth, watched, none stored |
 | Spacing; retry cap | 1 minute; 15 minutes (placeholders) |
-| Refs carried | `Main` (main's branch, collision refs); `MainAndForks` opt-in, a fork's branch kept on the remote after its drop. A fork's losing commits go either way |
+| Refs carried | `Root` (the root's branch, collision refs); `RootAndForks` opt-in, a fork's branch kept on the remote after its drop. A fork's losing commits go either way |
 | I/O deadlines | connect 30 s, stalled transfer 5 min (as today) |
 
 ## 6. Tests
@@ -157,7 +157,7 @@ with a lease touches the remote ref.
 | Zero remotes: saves, takes and release all work; status says local-only; no alarm | a missing remote treated as an error |
 | The server redirects to another host; an LFS endpoint on another origin | a secret sent to the wrong host |
 | A credential file under a tree or mount; a view lists everything it can | a fork reading a credential |
-| Another writer moves main's ref; kill the service between Pending and Confirmed | a forced push; one divergence under many names |
+| Another writer moves the root's ref; kill the service between Pending and Confirmed | a forced push; one divergence under many names |
 | One remote blackholed, one live: save and take rates unchanged | a dead remote stalling the volume |
 | A run with collisions, then drain: every collision is re-read on the remote alone, writer and line | a losing change lost (RP8) |
 | A remote holding a previous major's refs receives a new major's pushes | old history overwritten |

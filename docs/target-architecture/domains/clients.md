@@ -13,7 +13,7 @@ The owner's guidance that applies here is in `OWNER-GUIDANCE.md` at the reposito
 
 | Term | Meaning here | Is not |
 |---|---|---|
-| **client** | one view's user: main's or a fork's container, attached to one tree | a process, a uid, a pod |
+| **client** | one view's user: the root's or a fork's container, attached to one tree | a process, a uid, a pod |
 | **launcher** | whoever starts a container and attaches its client; holds a `LaunchCap` | a client |
 | **grant** | what a client may do (`Access`), see (`ViewProfileId`), how it sees (`Sees`), and the owner its view presents | a role |
 | **binding** | what `attach` returns; it holds no capability | a mount |
@@ -160,10 +160,10 @@ rest end (`Reconciled`). Open files' write calls survive it: each is in the tree
 
 | Test | Rules out |
 |---|---|
-| A fork launcher asks for main, another launcher's fork, and a profile above its bound: refused each time, no row | a hostile in-pod launcher seeing or writing main |
+| A fork launcher asks for the root, another launcher's fork, and a profile above its bound: refused each time, no row | a hostile in-pod launcher seeing or writing the root |
 | A second read-write attach to a fork, before and after a service restart: `ForkTaken` | two writers on one fork's branch |
 | A view host's save names another client id: the commit's `Agentfs-Writer` is the session's own client | forged attribution |
-| Kill a fork's view host: `AttachmentEnded(SessionClosed)`, `LastDetached{F}`; main keeps writing | a dead client holding opens forever |
+| Kill a fork's view host: `AttachmentEnded(SessionClosed)`, `LastDetached{F}`; the root keeps writing | a dead client holding opens forever |
 | Kill the service with three attachments; rebind two; reconcile: two `Bound`, one `Reconciled`, `LastDetached` once | ending clients by guess |
 | Compile-fail: build `ClientCap`, `ActorCap`, `Writer::Client` or a writable snapshot `Grant` in another crate | forging authority in code |
 
@@ -173,7 +173,7 @@ rest end (`Reconciled`). Open files' write calls survive it: each is in the tree
    new fork; the old fork ends, and what it saved still lands.
 2. **A launcher that never returns** leaves its clients attached, so the volume never releases until an operator
    calls `end`.
-3. **Labels are the launcher's word:** the launcher and fork in the `ClientId` keep a fork from passing as main.
+3. **Labels are the launcher's word:** the launcher and fork in the `ClientId` keep a fork from passing as the root.
 
 ## For the code architects (parked)
 

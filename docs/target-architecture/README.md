@@ -42,6 +42,7 @@ Smaller slices, one page each:
 | Slice | Page |
 |---|---|
 | Cutting the tree actor into six modules | [Module cut](future/module-cut.md) |
+| Configuring the root branch's name instead of `main` | [Root branch name](future/root-branch-name.md) |
 | Transactions | [Transactions](future/transactions.md) |
 | Nested forks on trees | [Nested forks](future/nested-forks.md) |
 | Directories, symlinks, non-UTF-8 names and more links in the tree views | [Beyond flat files](future/tree-views-beyond-flat-files.md) |
