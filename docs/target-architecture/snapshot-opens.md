@@ -18,7 +18,8 @@ passed every check of that model.
 2. File "foo" with no newline; two opens; append "bar\n", close; append "baz\n", close. The result is "foobaz\n"
    and "bar" is gone. Linux gives "foobar\nbaz\n". An edit has to keep the shape of its calls.
 3. The root opens a; a fork's delete lands; the root writes and closes. The writes vanish with no collision and no
-   record. R9.14 says "the parent deleted", and the root has no upstream. This needs an owner decision.
+   record. R9.14 judges "an edit of a file the upstream deleted", and the root has no upstream. This needs an owner
+   decision.
 
 What held up: the commit shape (an edit commit whose first parent is the opened version, then a merge), the "seen"
 check, and no wait loop in any traced sequence.

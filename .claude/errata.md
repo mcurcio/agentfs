@@ -604,3 +604,19 @@ Not blocking; the suite is built and green. Findings about the brief and the doc
    the root's name from `agentfs_conformance::ENGINE_ROOT`, not a literal; its conformance
    `TreeNames` type should be renamed (for example `EngineNames`) apart from the model's
    `world::TreeNames`; and its D4 ("no trace change beyond step 3") no longer holds.
+
+## 2026-11-11, module cut step 3c fix round
+
+1. **Item 4 above is applied**: module-cut.md's step 4 row now carries each correction, and
+   says step 4's architect designs from that row, not from the earlier draft.
+2. **Item 3 above stands.** AGENTS.md's "a new page goes in both" disagrees with how future
+   pages are indexed; AGENTS.md is the maintainer's to change, so this round leaves it.
+3. **root-branch-name.md overstated two things.** It counted "about 29 places outside tests"
+   in `tree_actor/mod.rs` (there are 16 lines; `fork/deliver.rs` and agentfs-fuse's
+   `tree_view.rs` name `main` only in tests), and it proposed reusing `agentfs.branch` as
+   settled, though that key is the older engine's, with its own default. Both corrected; the
+   key is now an open question.
+4. **3c's light tier was an owner exception, not the tier's test.** The tier's list had a
+   clause ("a tree's name or ref, given only through `world::TreeNames`") that blessed the
+   change introducing `TreeNames`. It is removed; module-cut.md's 3c row says the full gate's
+   test applied and what the light run does not show.

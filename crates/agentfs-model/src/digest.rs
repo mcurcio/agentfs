@@ -374,4 +374,55 @@ R refs/collisions/1 1
 P T0 0
 P refs/collisions/1 1
 ";
+
+    /// The canonical text of one run under root name `root`: a fork's
+    /// committed transaction loses at the root (a collision), and the root and
+    /// the collision ref are replicated to the remote.
+    fn text_of_a_run_under(root: &str) -> String {
+        use crate::calls::Client;
+        use crate::world::Policies;
+        let mut w = World::new(Policies::default(), TreeNames::new(root));
+        let f = w.create_fork(TreeId::ROOT);
+        w.begin(f).expect("a transaction");
+        w.save(&Client::Fork(f), "a", 0);
+        w.save(&Client::Fork(f), "a", 2);
+        w.commit_txn(f).expect("the transaction commits");
+        let m1 = Client::Root("m1".into());
+        w.save(&m1, "a", 0);
+        w.save(&m1, "a", 1);
+        while let Some(s) = w.pending().into_iter().next() {
+            w.step(&s);
+        }
+        canonical_text(&w)
+    }
+
+    /// The root's name reaches no digest: the same run under other names,
+    /// one of them nested and one the engine's, gives the same text.
+    #[test]
+    fn the_roots_name_changes_no_digest() {
+        let text = text_of_a_run_under(MODEL_ROOT);
+        for needed in [COLLISION, "\nAgentfs-Tree: X1\n", "\nP T0 "] {
+            assert!(text.contains(needed), "no {needed:?} in:\n{text}");
+        }
+        assert!(!text.contains(MODEL_ROOT), "the root's name is in:\n{text}");
+        for root in ["main", "trunk", "team/main"] {
+            assert_eq!(text_of_a_run_under(root), text, "under {root:?}");
+        }
+    }
+
+    /// A root name that would collide with a fork's or a transaction's is
+    /// refused; any other git accepts is taken.
+    #[test]
+    fn tree_names_refuses_a_fork_or_transaction_name() {
+        for bad in ["", "fork", "txn", "fork/1", "txn/1"] {
+            let made = std::panic::catch_unwind(|| TreeNames::new(bad));
+            assert!(made.is_err(), "{bad:?} was accepted");
+        }
+        for good in ["root", "main", "forks", "team/fork"] {
+            assert_eq!(
+                TreeNames::new(good).branch(TreeId::ROOT),
+                format!("refs/heads/{good}")
+            );
+        }
+    }
 }

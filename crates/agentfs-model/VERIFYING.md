@@ -268,9 +268,9 @@ process seems too heavy for this. Isn't the big gate about validating the merge 
 tier serves renames, docs and changes that move no rule logic: "Yes" (guidance).
 
 - **The light tier**, when every change is one of these: a doc or Markdown file; a comment; an identifier, test name
-  or message text renamed at every site; an import or formatting; a tree's name or ref, given only through
-  `world::TreeNames` and the values passed to it (the digest labels them); a digest key renamed with its value byte
-  for byte the same (show the value column before and after). It runs, through `ci/model-docker.sh`, one job at a
+  or message text renamed at every site; an import or formatting; a unit test added in a `#[cfg(test)]` module of
+  `src/**` (neither the digest nor the corpus runs those); a digest key renamed with its value byte for byte the same
+  (show the value column before and after). It runs, through `ci/model-docker.sh`, one job at a
   time: `planted/run.py --anchors-only` (silent), `ci/model-digest.sh check` (the scenario digests match), the
   model's tests (scenarios and seeds 1..64), conformance's tests, the safety-net tests, and `planted/run.py --only`
   the bugs whose anchors moved (each still caught); then `cargo fmt` and `cargo clippy`.

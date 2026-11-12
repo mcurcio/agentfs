@@ -38,8 +38,8 @@ a particular one. Copy logs out of `/work` before you finish: the volume is not 
 sense of the change's risk. The owner judged the whole gate too heavy for a rename (2026-11-11, guidance: "That gate
 process seems too heavy for this").
 
-- **Light**, for docs, comments, renames at every site, imports, formatting, tree names given through
-  `world::TreeNames`, and digest keys renamed with identical values. One job at a time through the wrapper:
+- **Light**, for docs, comments, renames at every site, imports, formatting, unit tests added in `src/**`'s
+  `#[cfg(test)]` modules, and digest keys renamed with identical values. One job at a time through the wrapper:
   `run.py --anchors-only --work /work/anchors` (silent, rc 0), `ci/model-digest.sh check` (the scenario digests
   match; a budget-only line is fine), `cargo test --locked -p agentfs-model`, `cargo test --locked -p
   agentfs-conformance`, the safety-net tests, and `run.py --work /work/planted --only <ids>` for each bug whose anchor

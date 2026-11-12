@@ -358,7 +358,8 @@ pub fn decisions_in(repo: &Path, rev: &[&str]) -> Vec<(String, Decision)> {
 
 /// The root's name in the model's own runs: scenarios, random runs, the
 /// oracle and the digest's pinned text. Any name [`TreeNames::new`] accepts
-/// gives the same outcomes and digests, since the digest labels the root `T0`.
+/// gives the same outcomes and digests, since the digest labels the root `T0`
+/// (`the_roots_name_changes_no_digest` in `digest`'s tests runs one run under four names).
 /// The engine's name is conformance's (`agentfs_conformance::ENGINE_ROOT`).
 pub const MODEL_ROOT: &str = "root";
 
