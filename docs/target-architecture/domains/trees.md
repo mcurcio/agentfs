@@ -47,9 +47,9 @@ fork's lifecycle, a CSI fork claim's included ([one engine](../future/one-engine
 approval"). A launcher may pass an idempotency key to `create`: the CSI driver passes the claim's volume handle. A
 second `create` under a key Trees already holds returns that fork, so a repeated CreateVolume makes no second fork,
 and `end_keyed` ends it for any launcher that presents the key, so a restarted controller needs no map of its
-own. A fork's settings (whether its landings need approval) are passed to `create` and kept with its row; Trees
-is the one place that refuses a fork whose settings need approval while [landing
-approvals](../future/landing-approvals.md) is not built.
+own. A fork's settings (whether its landings need approval) are passed to `create` and kept with its row. Approval
+is opt-in: a fork with no approval setting lands automatically. Trees is the one place that refuses a fork whose
+settings need approval while [landing approvals](../future/landing-approvals.md) is not built.
 
 ## 3. Pinned snapshots
 

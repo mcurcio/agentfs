@@ -28,6 +28,7 @@ page's; "speed" is [save and take speed](save-and-take-speed.md).
 
 | End goal | Delivered by |
 |---|---|
+| A baseline build verified with a target application | [the baseline](#the-baseline), the plan's first acceptance point: M1 to M7, with M6 |
 | One engine | M1 (volumes and their lifecycle), M7 and M8 (the launchers move), M9 (the recording engine is deleted) |
 | Nobody runs `trees init` by hand | M1 (`ensure` takes a `VolumeSpec` value; the trial CLI builds it from `init`'s flags), M7 and M8 (each launcher calls `ensure`; `agentfs trees` folds into `init` and `mount`) |
 | One volume that root and non-root processes both use (the problem ArtifactFS stalled on) | M1 (other users reach the tree mount; today it admits only its owner); M2 (modes and owners decide what each may do) |
@@ -43,11 +44,11 @@ page's; "speed" is [save and take speed](save-and-take-speed.md).
 | Keep operating (principle 5) | M4 (retry, divergence saved), M5 (alarms, liveness, restart in place, each of today's alerts and runbooks ported or dropped) |
 | Any remote, or none (principle 6) | module cut 6 (the mirror leaves the model's world); M1 (zero remotes is a valid volume); M4 |
 | History is the product (principle 7) | 5b (identity); M1 (where); M4 (never forced; a divergence is saved); M7 and M8 (old state areas archived, never deleted) |
-| Recovery is manual but supported (principle 8); merging is an extra (principle 9) | M6 (restore, revert; patches at mount only, and `serve-git` as a patch source); M6 lands before M9 |
+| Recovery is manual but supported (principle 8); merging is an extra (principle 9) | M6 (restore, revert; patches at mount only, and `serve-git` as a patch source); M6 lands before the baseline |
 | Three layers; OpenTelemetry for everything observable (principle 10) | each milestone's library page; M5 (telemetry, and the recorder's engine source) |
-| The model stays the baseline proof | module cut 6 and 7 |
+| The model stays the baseline proof | module cut 6 and 7; from M1, the tree engine's core tests on every PR ([CI tiers](#ci-tiers)) |
 | Old state formats are not supported | 5b (tree format 3); M7 and M8 (a recording state area is refused at boot) |
-| Extras that ship today: LFS; forks of forks; several pods on one CSI volume; moving a volume between nodes; the fork overlay of example 12; `fork deliver`; unlinked forks | Open: [question 1](#open-questions-for-the-owner) asks which M9 drops and which get a step before M9 |
+| Extras that ship today (LFS, forks of forks, several pods on one volume, moving a volume, the fork overlay, `fork deliver`, unlinked forks and the rest) | Deferred: each is recorded with its home in [deferred extras](#deferred-extras), dropped at M9 until its slice lands |
 
 ## The shape
 
@@ -55,7 +56,7 @@ The launchers compose the domains of [the system](../system.md). None of them is
 launcher composes (Volume, Clients, Views, Trees), and the rest arrive where they are needed (Rules in M3,
 Replication in M4, Health and Telemetry in M5). The recording engine's own concepts (frozen copies and `pending/`,
 the front, history service v2, forked volumes, checkpoints, the fsync class, the overlay's tmp layer) leave, and each
-returns only as a slice of its own.
+returns only as a slice of its own ([deferred extras](#deferred-extras)).
 
 **One volume lifecycle for every launcher.** The sidecar, Docker, the CLI and CSI each build a `VolumeSpec` from
 configuration and call the same idempotent `ensure`, then `stage` ([Volume](../domains/volume.md)). Release is judged
@@ -108,10 +109,13 @@ node names reach every remote, as they do today.
 
 Whether a fork's change needs an approval before it lands in its source is a setting of that fork, as
 [landing approvals](landing-approvals.md) has it; a fork configured to need approval cannot be created until that
-slice is built. Every other fork lands in its source as the tree views do today. Trees holds each fork's settings
-and is the one place that refuses ([Trees](../domains/trees.md)); a launcher only passes them on. M8's architect
-picks the CSI class's key for the setting. The default when the setting is absent, and what today's fork classes
-become, are [question 2](#open-questions-for-the-owner).
+slice is built. Landing is automated by default: a fork with no approval setting lands in its source as it saves,
+as the tree views do today, and approval is opt-in per fork. Trees holds each fork's settings and is the one place
+that refuses ([Trees](../domains/trees.md)); a launcher only passes them on. M8's architect picks the CSI class's
+key for the setting. Today's CSI fork classes have no such key, so on the tree views their forks land automatically
+unless a class is configured to need approval; the receiver's acceptance rule of today (`agentfs.patchAccept`) no
+longer gates them. A class with `link: unlinked` makes an unlinked fork, which is
+[deferred](#deferred-extras): M8 refuses such a claim, with a clear error, until its slice lands.
 
 A CSI fork claim's fork has one lifecycle owner, Trees: CreateVolume creates it with the claim's handle as an
 idempotency key, so a repeated CreateVolume finds the same fork, and DeleteVolume ends it by that key. The launcher
@@ -124,18 +128,21 @@ claim" becomes a fork claim). Each milestone's gate decides the new spellings.
 ## Milestones
 
 Each is its own PR series from `main`, gated by an architect, an implementer, one review, one fix round, and green
-ci and image runs, plus what its row says. A "full run" of `phase-1.yml` includes the 500-seed shards; a "short run"
-does not. Only a milestone that changes save or land logic needs the full run.
+ci and image runs, plus what its row says. A "short run" of `phase-1.yml` is its core tests, without the 500-seed
+shards; from M1 it runs on every PR and push to `main` ([CI tiers](#ci-tiers)). A "full run" adds the shards, on a
+manual trigger. Only a milestone that changes save or land logic needs the full run.
 
 **M1. Volumes and their lifecycle.** The four domains a launcher composes are built: Volume (`ensure`, `stage`,
 `unstage`, the drain and the release verdict), Clients (attach and detach), Views (view hosts) and Trees (the fork
 lifecycle: create with settings and an idempotency key, end, drop). `ensure` takes a `VolumeSpec` value; the trial
 `trees` CLI builds it from the same flags `agentfs init` takes, so no new configuration format appears. A volume
-gets its UUID at create; zero remotes is a valid volume. Other users reach the tree mount, as they reach the
+gets its UUID at create; zero remotes is a valid volume; its start point is empty (a start from another
+volume's branch is [deferred](#deferred-extras)). Other users reach the tree mount, as they reach the
 recording mount today; the tracer's workload runs as an unprivileged user. Tree-view commits gain the "where"
 trailers, written through module cut step 5's one message function. A release build on a many-file workload, in
 the shape of the recording engine's end-to-end budgets (`ci/bench-budget.json`: many files created, a large file
-closed, a clone), gives the first release figures and sets tree-view budgets. A tracer CI job starts (below). Its
+closed, a clone), gives the first release figures and sets tree-view budgets. A tracer CI job starts (below), and
+`phase-1.yml` gains its PR and `main` triggers ([CI tiers](#ci-tiers)). Its
 gate cuts M1 into PR series, and decides where the spec and the settings are stored and audited, the trailer keys,
 how a launcher passes its pod context, and the budgets. Gate: a full run per PR series; the tracer.
 
@@ -180,8 +187,9 @@ the engine's own events.
 
 **M6. Patches, restore and revert on trees.** iac's patches applied at mount, `serve-git` as a patch source, and
 `restore` and `revert` on trees ([integrator patches](integrator-patches.md)). It needs M4's remotes and nothing
-later: it may land before or after M7 and M8, and lands before M9, which deletes the recording engine's patch queue.
-Its gate names its commands, so that no command serves both engines. Gate: a full run.
+later: it may land before or after M7, and lands before the baseline, whose every Hermes job lands a queued patch.
+Its gate names its commands, among them the producer's `patch submit`, so that no command serves both engines.
+Gate: a full run.
 
 **M7. The `agentfs` binary moves.** The sidecar, the Docker examples and the CLI share one launcher, the binary's
 `init` and `mount`, so they move together. `agentfs trees` folds into `init` and `mount` and goes. The CSI driver
@@ -200,29 +208,66 @@ launcher whose configuration names a patch source (`agentfs.patchRemote` or any 
 and keeps the filesystem working (principle 5), logs the gap at every boot, and raises a standing alarm while it
 runs: patches are never silently not applied. M7 adds the migration runbook (below). Gate: the tracer's
 release-build many-file step within M1's tree budgets, run in CI before the merge (`bench.yml` runs only after
-landing and never fails, so it cannot hold the move); a miss holds the move.
+landing and never fails, so it cannot hold the move); a miss holds the move. M7 also rewrites the migration Job of
+[deployment](../../deployment.md#10-hermes) (today `record` and `push`) to copy the files in through the mount.
+
+### The baseline
+
+The plan's first acceptance point: a baseline build, verified integrated with a target application, before anything
+else is moved or deleted. The applications are the ones agentfs already tests end to end: the generic sidecar
+example (`deploy/sidecar`) and upstream Hermes ([deployment](../../deployment.md#10-hermes)), each on the tree
+engine. The baseline builds nothing of its own. It is reached when M6 and M7 have both landed and its gate passes;
+a failure is fixed in the milestone that owns the gap, before M8 starts.
+
+What those applications need, and the milestone that gives it:
+
+| Need | Milestone |
+|---|---|
+| A volume created, or recovered, from the launcher's configuration | M1 (`ensure`), M7 (the sidecar and Docker launchers call it) |
+| The mount at the application's data path, used by root, by other users and by a docker-in-docker tools container | M1 (other users reach the mount), M2 (directories, symlinks, modes and owners) |
+| Rule files: what is recorded, and untracked paths (secrets, databases, sessions, logs) never in history | M3 |
+| Every change pushed to a remote | M4 |
+| Health and alarms, and a sidecar-only restart onto a new mount | M5's first series |
+| iac's patches landing at the next start | M6 |
+| The start-up speed the probes allow | M1's budgets; speed, if M1's figures miss them |
+
+Only these come before it. M5's recorder series, M8, M9 and every [deferred extra](#deferred-extras) come after,
+or never block it.
+
+Gate: these CI jobs green with the launchers on the tree engine: image's `e2e (kind cluster)` (`ci/e2e-kind.sh`,
+the generic sidecar), hermes' `e2e (Hermes on kind, sidecar)` and `e2e (Hermes on kind, fence)`
+(`ci/e2e-hermes-kind.sh`), and docker's `e2e (docker compose, upstream Hermes)` (`ci/e2e-hermes.sh`). Each lands a
+queued patch, records a tool container's edit and keeps secrets and databases out of history. Hermes' third job,
+`e2e (Hermes on kind, csi)`, runs on the CSI driver and moves at M8.
 
 **M8. The CSI driver moves.** CreateVolume calls `ensure`; publish attaches a view host; DeleteVolume asks Volume's
-release verdict, or for a fork claim ends its fork by key. A fork claim makes an in-volume fork, owned by Trees under the claim's handle (above); a fork whose
-settings need approval is refused by Trees until landing approvals is built. Its architect writes the missing
-CSI-on-trees page, which also carries several pods on one volume and moving a volume between nodes, as question 1's
-answer places them. Existing recording-format volumes move by the runbook below; a recording-format volume is never
-staged, and its DeleteVolume keeps its directory, with an alarm naming it. Gate: as M7.
+release verdict, or for a fork claim ends its fork by key. A fork claim makes an in-volume fork, owned by Trees
+under the claim's handle (above); it lands automatically unless its class needs approval, and a fork whose settings
+need approval is refused by Trees until landing approvals is built. Its architect writes the missing CSI-on-trees
+page for one pod per volume; several pods on one volume, moving a volume between nodes and the other CSI extras are
+[deferred](#deferred-extras), and M8 refuses a claim that asks for one (a second pod's publish, `startFrom`,
+`link: unlinked`) with a clear error. Existing recording-format volumes move by the runbook below; a
+recording-format volume is never staged, and its DeleteVolume keeps its directory, with an alarm naming it. Gate:
+as M7, and hermes' `csi` job green on the tree engine.
 
 **M9. The recording engine is deleted.** Its domain logic and the passthrough FUSE layer go, with its patch queue and
-`serve-git` (rebuilt on trees by M6), its CSI entry points and one-shot commands, and its LFS and the other extras
-as question 1's answer says. Adapters the tree engine uses stay where M4 and M5 re-homed them. Recording-only docs,
-runbooks and alert rules go, as M5's list says. This page goes. Gate: ci and image.
+`serve-git` (rebuilt on trees by M6), its CSI entry points and one-shot commands, and every
+[deferred extra](#deferred-extras) it still serves. Adapters the tree engine uses stay where M4 and M5 re-homed
+them. Recording-only docs, runbooks, alert rules and CI jobs go, as M5's list and the deferred table say. This page
+goes; its deferred table moves to [the target architecture's index](../README.md) first. Gate: ci and image.
 
 ## Order
 
 ```text
- 6 → 5b → 5.1 → 5.2 → 5.3 ─┬─▶ M1 ─┬─▶ speed → M2 → M3 → M4 → M5 → M7 → M8 ─┬─▶ M9
-                           └─▶ 7 ──┘                       │    │             │
+ 6 → 5b → 5.1 → 5.2 → 5.3 ─┬─▶ M1 ─┬─▶ speed → M2 → M3 → M4 → M5 → M7 ─┬─▶ BASELINE → M8 → M9 → deferred extras
+                           └─▶ 7 ──┘                       │    │        │
                                                            │    └─▶ M5's recorder series (off the path)
-                                                           └─▶ M6 ────────────┘
-                                                   (M6: any time after M4, before M9)
+                                                           └─▶ M6 ───────┘
+                                              (M6: any time after M4, before the baseline)
 ```
+
+The order serves the baseline first: every milestone before it is one a target application needs, and nothing
+after it is.
 
 - Step 7 (the model's checker reads git) and M1 run side by side; they touch disjoint crates. M2 adds model rules,
   which the checker then judges, so it waits for both.
@@ -236,14 +281,56 @@ runbooks and alert rules go, as M5's list says. This page goes. Gate: ci and ima
 - **Goals may lapse during the move.** agentfs is before its 1.0 release, so a launcher moves without waiting for
   every goal its users rely on. M6 is off M7's path: from M7 until M6 lands, a moved launcher applies no iac patches
   at mount, never silently (M7's alarm), and has no `restore` or `revert`, and example 3 of
-  [supported configurations](../../supported-configurations.md) is marked "not built". M6 must land before M9, which
-  deletes the recording engine's patch queue. The extras in the goals table are marked "not built" from the move
-  until question 1's answer gives each its step, or its removal.
+  [supported configurations](../../supported-configurations.md) is marked "not built". M6 must land before the
+  baseline, whose Hermes jobs land a patch. Each [deferred extra](#deferred-extras) is marked "not built" in
+  supported configurations from its launcher's move (M7 or M8) until its slice lands.
 - **Links to deleted pages.** The commit that deletes a plan page repoints every link to it: step 7's commit,
   which deletes the module cut, rewrites the references to its steps here and in
   [root branch name](root-branch-name.md) as the built behaviour's library pages; M4's commit, which deletes root
   branch name, does the same for its links here, in the domain pages and in the baseline pages; M9's, which deletes
   this page, for every link to it. The docs workflow's link check fails otherwise.
+
+## Deferred extras
+
+Every capability the recording engine ships that no milestone above rebuilds. None is needed for
+[the baseline](#the-baseline). Each goes dark when its launcher moves (M7 for the binary and the Docker examples,
+M8 for the CSI driver), is marked "not built" in [supported configurations](../../supported-configurations.md) from
+then, and is deleted with the recording engine at M9. Each returns as a slice of its own, from its home below; M9's
+commit moves this table to [the target architecture's index](../README.md), so no row is lost with this page.
+
+| Capability | What it is | Who uses it today | Home | Until then |
+|---|---|---|---|---|
+| Git LFS | content over a threshold stored as LFS objects, uploaded beside each push | example 11; ci's `e2e-lfs` and `e2e-lfs-ssh` | [Large and binary files](large-and-binary-files.md) | dropped at M9 until its slice lands |
+| Forks of forks | a fork of a linked fork, whose change rolls up through its parent | example 6; f8's `e2e-csi-fork-of-fork` | [Nested forks](nested-forks.md) | dropped at M9 until its slice lands |
+| Several pods on one volume | one history service per CSI volume, one front per pod | example 4; ci's `e2e-multipod` | [The system](../system.md) (the "history service with view hosts" composition), [Views](../domains/views.md) | dropped at M9 until its slice lands; M8 refuses a second pod |
+| Moving a volume between nodes | a new volume on another node, started from the old one's branch, by the moving runbook | example 10; f8's `e2e-csi-move` | [Volume](../domains/volume.md) (the start point) | dropped at M9 until its slice lands |
+| `startFrom` and `start accept` | a CSI start class: a volume whose history begins at another volume's commit; `StartBranchMoved` while that branch moves | example 10; f8's `e2e-csi-move` | [Volume](../domains/volume.md) (`StartPoint::Line`, the start record) | dropped at M9 until its slice lands; M1 builds only the empty start, and M8 refuses a start class |
+| The fork overlay | `mount --sandbox-overlay`: a second mount that shows a fork's workload only recordable files and keeps the rest in a private tmp layer | example 12; `crates/agentfs/tests/mount.rs`, the sidecar chart's overlay values | [The system](../system.md) (the overlay becomes a fork), [Overlay gaps](sandbox-overlay-gaps.md) | dropped at M9 until its slice lands |
+| `fork deliver` | a finished fork's change handed to a receiver as an inbox patch, a branch, a command or a webhook | example 8; `crates/agentfs/tests/cli_fork_deliver.rs` | [Fork delivery](fork-delivery.md) | dropped at M9 until its slice lands |
+| Unlinked forks | a fork that never delivers to its source and pushes only to its own remotes | example 5's `link: unlinked` class; `crates/agentfs/tests/cli_fork.rs`, `crates/agentfs-csi/tests/grpc.rs` | [Fork delivery](fork-delivery.md) | dropped at M9 until its slice lands; M8 refuses an unlinked class |
+| Recording without a mount | `agentfs run` (the commit and push loops with no mount), `record` and `flush` (named paths of the backing tree) | the Hermes migration Job; ci's `e2e-remotes`, `e2e-ssh`, `e2e-telemetry`; alerts' `ci/e2e-alerts.sh` | [Recording without a mount](recording-without-a-mount.md) | dropped at M9 until its slice lands; M7 rewrites the migration Job and repoints the scripts |
+| Checkpoint and the change line | an integrator cuts one commit per change intent on `refs/agentfs/<volume>/change-line`; a remote may get only that line | `crates/agentfs/tests/cli_checkpoint.rs` | [Checkpoints and patch notices](integrator-hooks.md) | dropped at M9 until its slice lands |
+| Patch notices | the `patch-notify` hook and the `agentfs.patchNotifyUrl` webhook, sent when the queue's verdicts change | ci's `e2e-patches` | [Checkpoints and patch notices](integrator-hooks.md) | dropped at M9 until its slice lands |
+| Database groups | `agentfs.commit=fsync` and `agentfs.group`: a database and its journal recorded whole at `fsync` | ci's `fuse` job (`ci/e2e-sqlite.sh`) | [Open files and groups](files-open-groups.md) | dropped at M9 until its slice lands |
+| State areas on NFS | a CLI or sidecar state area on an NFS 4.1 export, its lock reaching other clients | ci's `e2e-nfs` | [State on NFS](state-on-nfs.md) | dropped at M9 until its slice lands |
+| Hidden fork history | `agentfs.forkRefs = hidden`: a fork's history outside `refs/heads/`; whether a forge runs CI on it is not verified | supported configurations, "Remote topology" | [Forge CI on hidden refs](forge-ci-on-hidden-refs.md) | dropped at M9 until its slice lands |
+| A fork of a claim in use | a fork claim whose source a pod is writing; Kubernetes may one day refuse such a clone | image's `e2e-csi-forks` | [Clone in use](clone-in-use.md) | not dropped: M8's fork claims are clones too, so the page stays and applies to them |
+
+Each row's CI job or test goes with the recording engine at M9 and returns with its slice.
+
+## CI tiers
+
+From M1, `phase-1.yml` runs in two tiers:
+
+- **Core, on every PR and every push to `main`:** mounted conformance, power loss (ext4 and XFS), journal and state
+  exhaustion, the two-writer page cache and the measurement harness. About 20 min wall and 41 runner-min a run
+  (run 43146523186, without the shards).
+- **Randomized, on a manual trigger:** the 500-seed replay shards, about 73 min wall and about 300 runner-min with
+  the core jobs. They still run in CI, only when someone asks: a dispatch, or `[phase1-seeds]` in the pushed commit
+  message. A milestone that changes save or land logic asks for them before it merges (its "full run").
+
+Today `phase-1.yml` runs only on a push to `docs/target-architecture` and on a dispatch, so the tree engine's tests
+never run on PRs or `main`. M1 adds the PR and `main` triggers and keeps the shards behind the manual trigger.
 
 ## Existing recording volumes
 
@@ -303,8 +390,9 @@ database groups, nested forks, transactions, upgrades.
 
 - Nine milestones and the speed slice after the module cut, touching every crate, doc, chart and workflow. M1 is
   the largest: it builds four domains before any launcher moves.
-- Goals and extras go dark for a while: iac's patches (alarmed), `restore` and `revert` from M7 until M6; the extras
-  from a launcher's move until question 1's answer gives each its step.
+- Goals and extras go dark for a while: iac's patches (alarmed), `restore` and `revert` from M7 until M6; each
+  [deferred extra](#deferred-extras) from its launcher's move until its own slice lands, which no milestone here
+  schedules. A user who needs one stays on a release before its launcher's move until then.
 - Existing volumes' history does not continue inside new ones. Whether a published name that a recording volume
   used diverges, fails loudly or meets nothing depends on M4's prefix.
 - A volume re-created at a location whose state was lost (an `emptyDir`, a deleted Docker volume) gets a new UUID.
@@ -314,6 +402,7 @@ database groups, nested forks, transactions, upgrades.
 - The history format changes at 5b (the root's identity) and again at M1 (the "where" trailers).
 - M7 repoints or deletes about two dozen `ci/` scripts and renames the CSI driver's two recording entry points.
 - Two pages to write: file metadata (M2) and CSI on trees (M8). M2's new model rules run the costliest gate.
+- The baseline's gate adds no job: it is four existing jobs, run against the tree engine.
 - **CI.** Wall time and runner time differ, because jobs run side by side. Measured on run 43146523186: a full
   `phase-1.yml` run takes about 73 min wall and about 300 runner-min; without the 500-seed shards, about 20 min wall
   and about 41 runner-min. A full model gate takes about 41 min on a 4-CPU container, outside CI. Measured on the
@@ -322,33 +411,14 @@ database groups, nested forks, transactions, upgrades.
   code), about 4.9 h wall and 20 h runner time, and four full model gates (step 6 three, 5b one; about 2.7 h);
   step 7 adds one or two model gates beside M1. From M1 to M8: full runs where save or land logic changes (expected:
   M1's series, speed, M2, M3, M6) and short runs elsewhere (M4, M5, M7, M8), M2's model gate, the tracer job (not
-  yet measured) and both engines' jobs in ci until M9. Today a dispatch always runs the seed shards; M1 adds a way
-  to dispatch without them. The counts are estimates.
+  yet measured) and both engines' jobs in ci until M9. From M1 the core tier ([CI tiers](#ci-tiers)) adds about
+  20 min wall, side by side with ci, and about 41 runner-min to every PR push and every push to `main`; the
+  randomized shards cost only when triggered. The counts are estimates.
 - Not planned: a converter, an engine flag, mirror-back (pull requests from a forge into the root).
 
-## Open questions for the owner
+## Prior art
 
-Each is asked labelled "general guidance" or "absolute requirement". A later commit folds the answers in.
-
-1. **Shipped extras at M9** (absolute requirement). Background: today these ship on the recording engine, and M9
-   deletes it. The tree views have none of them, and each has a design page or none: LFS
-   ([large and binary files](large-and-binary-files.md)), forks of forks ([nested forks](nested-forks.md)), several
-   pods on one CSI volume and moving a volume between nodes (M8's CSI-on-trees page), the fork overlay of example 12
-   (`--sandbox-overlay`; [the system](../system.md) has it become a fork), `fork deliver` (a fork's change delivered
-   as an inbox patch, a branch, a command or a webhook, example 8) and unlinked forks (forks that never deliver).
-   Question: for each, does M9 wait for a step that rebuilds it on the tree views, or may M9 drop it?
-2. **The approval default and today's fork classes** (general guidance). Background: approval is a setting of each
-   fork. Today a CSI fork class makes a linked fork, which delivers its change on finish for the receiver's
-   acceptance rule (`agentfs.patchAccept`, default `cleanMerge`), or an unlinked fork, which never delivers. On the
-   tree views a fork lands as it saves, unless its setting needs approval, and such a fork cannot be created until
-   landing approvals is built. Question: when a fork's setting is absent, does it need approval (refused until then)
-   or not (it lands as it saves)? And what does each of today's classes become?
-3. **Tree-engine CI on every PR** (general guidance). Background: `phase-1.yml` runs today only on a push to
-   `docs/target-architecture` and on a dispatch, so the tree engine's conformance and power-loss jobs never run on
-   PRs or on `main`. Without the seed shards a run costs about 20 min wall and 41 runner-min. Question: from M1,
-   does it run on every PR and every push to `main`?
-
-**Prior art.** Strangler fig (Fowler) and parallel change (Sato) for moving one launcher at a time; branch by
+Strangler fig (Fowler) and parallel change (Sato) for moving one launcher at a time; branch by
 abstraction rejected, because it keeps a dual path; tracer bullet (Hunt, Thomas); idempotent create (CSI
 `CreateVolume`, `git init`); git's `include.path`; entity identity apart from its attributes (Evans, *Domain-Driven
 Design*; Kubernetes' `uid` beside `name`); an idempotency key on a create request (CSI's volume name).

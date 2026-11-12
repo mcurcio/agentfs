@@ -92,3 +92,7 @@
   - [OTLP TLS reload](target-architecture/future/otlp-tls-reload.md)
   - [Clone in use](target-architecture/future/clone-in-use.md)
   - [Forge CI on hidden refs](target-architecture/future/forge-ci-on-hidden-refs.md)
+  - [Fork delivery](target-architecture/future/fork-delivery.md)
+  - [Checkpoints and patch notices](target-architecture/future/integrator-hooks.md)
+  - [Recording without a mount](target-architecture/future/recording-without-a-mount.md)
+  - [State on NFS](target-architecture/future/state-on-nfs.md)
