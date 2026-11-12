@@ -28,6 +28,7 @@ lineage_landing_drops_the_fork_commit	R7	64	caught	upstream_wins
 loser_ref_not_kept	R4	64	caught	upstream_wins
 losing_save_applies_its_clean_lines	R3e	64	caught	changes_whole
 losing_transaction_applies_its_clean_lines	R5	64	caught	changes_whole
+mirror_ignores_a_forks_collision	R4	64	caught	mirror_current
 no_collision_record_in_the_result	R5.1	64	caught	upstream_wins
 p43a_hide_after_any_own_line	R10.9	64	caught	syncs_deliver
 p43b_hide_after_an_own_delete	R10.9	64	caught	syncs_deliver

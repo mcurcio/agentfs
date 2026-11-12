@@ -8,8 +8,9 @@ use agentfs_model::check::Checked;
 use agentfs_model::content::{BLANK, Content, Layout, Line, State};
 use agentfs_model::git::{git, with_reversed_dates};
 use agentfs_model::recording::{Target, Write};
+use agentfs_model::service::Step;
 use agentfs_model::world::{
-    By, Direction, Life, LineEdit, MODEL_ROOT, MergeRule, ModelError, Overwritten, Policies, Step,
+    By, Direction, Life, LineEdit, MODEL_ROOT, MergeRule, ModelError, Overwritten, Policies,
     TreeNames, TxnOutcome, World, decisions_in,
 };
 use std::collections::BTreeSet;
@@ -373,11 +374,14 @@ fn r3_a_save_before_the_sync_arrives_loses_to_the_upstream() {
         .collect();
     assert_eq!(lost, [(TreeId::ROOT, vec![x.clone()], vec![m.clone()])],);
     assert!(
-        !w.pending().contains(&Step::Replicate),
-        "drained, Replication included"
+        !w.pending().contains(&Step::Push),
+        "drained, the mirror's push included"
     );
-    let pushed = git(w.remote(), &["rev-parse", &w.collisions[0].reference]);
-    assert_eq!(pushed, xc, "the loser is on the shared remote");
+    let pushed = git(
+        w.mirror().repo(),
+        &["rev-parse", &w.collisions[0].reference],
+    );
+    assert_eq!(pushed, xc, "the loser is on the mirror");
 }
 
 /// Rule 3, "a sync carries the parent's current version, never a stale
@@ -506,7 +510,7 @@ fn r3_a_save_loses_whole_with_its_clean_lines() {
     );
     for c in &w.collisions {
         assert_eq!(
-            git(w.remote(), &["rev-parse", &c.reference]),
+            git(w.mirror().repo(), &["rev-parse", &c.reference]),
             save,
             "pushed"
         );
@@ -2264,7 +2268,7 @@ fn r5_a_decision_is_in_its_result_commit_with_its_tree() {
     assert!(!refs.contains("refs/notes"), "no notes ref: {refs}");
     for x in &w.collisions {
         let d = agentfs_model::world::Decision::of(x, w.names());
-        for repo in [w.repo(), w.remote()] {
+        for repo in [w.repo(), w.mirror().repo()] {
             let on = decisions_in(repo, &["-1", &x.result]);
             assert!(on.iter().any(|(_, n)| *n == d), "the result holds it");
             assert!(decisions_in(repo, &["-1", &x.loser]).is_empty());
@@ -3856,7 +3860,7 @@ fn finding_47_a_rename_over_agrees_with_an_unlink_over_an_unseen_edit() {
         "the root takes the fork's rename-over"
     );
     assert!(w.collisions.is_empty(), "{:?}", w.collisions);
-    let paths = TreeCalls::paths(&*w, TreeId::ROOT).unwrap();
+    let paths = TreeCalls::paths(&**w, TreeId::ROOT).unwrap();
     assert!(
         paths.contains(&"c".to_string()) && !paths.contains(&"b".to_string()),
         "{paths:?}"

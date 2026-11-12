@@ -17,8 +17,10 @@
 //! whole. A sync decides nothing:
 //! the fork takes the upstream's decided version, keeping only its own lines
 //! still on their way to that queue. Every losing commit keeps a collision
-//! ref and a record in its take's result commit, which a separate
-//! Replication step pushes with the root to a bare shared remote. A file is a
+//! ref and a record in its take's result commit; tree history publishes each
+//! move of a head ([`world::TreeMoved`]), and a [`mirror::Mirror`] that reads
+//! them pushes the root and those refs to a bare repository in its own step,
+//! composed with the trees by the [`service::HistoryService`]. A file is a
 //! byte buffer and a program's calls are POSIX byte calls ([`recording::Write`]):
 //! a save is those calls applied at close to its tree's head, line
 //! identity derived from the bytes then: an append is exact (finishing a
@@ -45,8 +47,10 @@ pub mod check;
 pub mod content;
 pub mod digest;
 pub mod git;
+pub mod mirror;
 pub mod program;
 pub mod queue;
 pub mod recording;
 mod referee;
+pub mod service;
 pub mod world;

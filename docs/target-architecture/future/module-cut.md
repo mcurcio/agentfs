@@ -34,7 +34,8 @@ What this changes in the code:
   upstream is the world's answer (`World::upstream_of`), and the root is simply the tree without one. No module
   compares a tree's name to find the root: its name is configured (`world::TreeNames`).
 - The referee takes one pair at a time: land is a fork into its upstream, sync is an upstream into a fork.
-- The model's built-in `remote` leaves `World` (step 6). Tree history publishes that a tree moved; mirrors subscribe.
+- The model's mirror is outside `World`: tree history publishes that a tree moved (`world::TreeMoved`), and a mirror
+  (`mirror::Mirror`) reads those moves; the model's history service (`service::HistoryService`) composes the two.
   What a mirror may send back, pull requests included, belongs to the mirror's own design
   ([Replication](../domains/replication.md)).
 
@@ -90,6 +91,9 @@ git's ref files. It does not yet re-derive the rest from git; a later step does,
 | Each tree's head | `World::head` and the fork list, not git's refs | `views`, the queue step's checks, `prefix_cut`, `delivered`, `entry_files`, `trees_equal_root` and others |
 | A file at a commit, and ancestry | `World::file` and `World::is_ancestor`, over `World`'s caches of git objects | almost every check |
 | Queues, waits, opens and handles | `queue_numbered`, `waits`, `write_open`, `handles` | `locks`, `p1_first`, the queue step's checks |
+| Pending steps | `World::tree_steps`, `HistoryService::pending` | `drained`, the queue step's check, `mirror_current` |
+
+The mirror is read from git: `losers_pushed` and `mirror_current` read its repository, not `Mirror`'s record.
 
 ## Patterns
 
@@ -128,8 +132,8 @@ and the order of deferred calls, read through two ports the world implements: `K
 scan reads) and `Plans` (a landing's plan and written keys, a sync's tree). Every tree's git name comes from one
 value, `world::TreeNames`, which the world is given: the model's runs name the root `MODEL_ROOT` (`root`), and
 conformance names it as the engine does (`ENGINE_ROOT`). The world composes them;
-it still holds tree history, transactions, the journal's replay, replication and the trace, which no step here
-cuts. How to use the net is in the model's `VERIFYING.md`
+it still holds tree history, transactions, the journal's replay and the trace, which no step here cuts. The mirror
+is `crates/agentfs-model/src/mirror.rs`, composed with the world by `service.rs`. How to use the net is in the model's `VERIFYING.md`
 ("Refactoring without changing outcomes") and the repo skill `.claude/skills/model-runs`.
 
 **The model gate.** It holds for every model step below unless the row says otherwise. Every run goes through

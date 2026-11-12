@@ -4,23 +4,23 @@
 //! | Rule (MODEL.md) | Here |
 //! |---|---|
 //! | 1. Like a Linux filesystem | a close ([`World::close`]) is never refused; its save is a commit on the writer's tree at once, its first parent the tree's head at that moment |
-//! | 2. One landing queue per tree | [`World::queue_len`]: a FIFO of [`Entry`](crate::queue::Entry)s per tree (`queue`); a [`Step::Next`] takes its head, or records that it waits (rule 9) |
+//! | 2. One landing queue per tree | [`World::queue_len`]: a FIFO of [`Entry`](crate::queue::Entry)s per tree (`queue`); a [`TreeStep::Next`] takes its head, or records that it waits (rule 9) |
 //! | 3. The upstream's queue decides | `land` (a fork's commit into its upstream) is the only place a collision with the upstream is decided, through `judge` and the referee's land (`referee`, called by `resolve`): per line, a line written over the upstream's replaces it, a stale one is dropped, and of two concurrent lines the upstream's wins; then each change (a save, a transaction's commit) is judged whole: one lost line and none of it applies (rule 3e). `sync` decides nothing: it takes the upstream's version and keeps only the fork's lines the upstream's queue has not taken yet (the referee's sync, called by `adopt`) |
-//! | 4. Nothing waits behind a collision | there is no held state: a collision is recorded as a [`Collision`] and in git (a trailer of the take's result commit, [`COLLISION`]), the fork's losing commit kept under `refs/collisions/<n>`, which Replication later pushes to the shared remote with the root ([`Step::Replicate`], due on every move of the root and every collision), and the queue moves on |
+//! | 4. Nothing waits behind a collision | there is no held state: a collision is recorded as a [`Collision`] and in git (a trailer of the take's result commit, [`COLLISION`]), the fork's losing commit kept under `refs/collisions/<n>`, which a mirror later pushes with the root ([`crate::service::Step::Push`], due once a [`TreeMoved`] moved the root or named a collision ref), and the queue moves on |
 //! | 5. Transactions | [`World::begin`]: a branch `txn/<n>` frozen at the fork's head; [`World::commit_txn`] lands it in the fork like a child's commit, whole or not at all (the fork is its upstream, so the fork's lines win), and answers whether it lost, with every staged line that did not apply; [`World::rollback`] drops it. While one is open, other I/O on its files in the fork is accepted and applies in order after it ends ([`World::deferred`], kept by `queue`, R5.3) |
 //! | 6. Attribution | every commit names one writer in an `Agentfs-Writer` trailer; a sync is a merge with the upstream's commit as second parent |
 //! | 7. Full lineage | a landing is a merge with the fork's commit as second parent (or a fast-forward), so a tree's history reaches every change it took, the losers included; each fork commit lands on its own |
 //! | 8. A save records the write calls | [`World::write`] keeps each byte call ([`Write`](crate::recording::Write): an `O_APPEND` write, `pwrite`, `ftruncate`; [`World::open_trunc`] for `O_TRUNC`) on the open file; [`World::close`] applies them to the tree's head then: an append's bytes go after the file's last byte, finishing a partial last line (a version of it) and then making new lines; other calls leave bytes the save aligns with the head's lines (rule 10). [`World::edit`] makes a test's line edit as a program's byte calls (`program`) |
-//! | 9. A take locks the files it overwrites | [`World::open_write`]; a [`Step::Next`] whose sync or landing would overwrite a file open for writing in that tree waits ([`World::waits`]) until the close; else it takes its entry, locks its files and writes them in that one step ([`World::last_take`]), so no call runs while a take holds a file (the owner, 2026-11-08, finding 49: "B"); a client's death ([`World::end_client`], [`World::end_root_client`]) closes its files |
+//! | 9. A take locks the files it overwrites | [`World::open_write`]; a [`TreeStep::Next`] whose sync or landing would overwrite a file open for writing in that tree waits ([`World::waits`]) until the close; else it takes its entry, locks its files and writes them in that one step ([`World::last_take`]), so no call runs while a take holds a file (the owner, 2026-11-08, finding 49: "B"); a client's death ([`World::end_client`], [`World::end_root_client`]) closes its files |
 //! | 10. Line identity | a save derives identities from the bytes at close: it aligns them with the head's lines once, by git's histogram diff (`align`), and records the result: each new line an identity, each changed line a new version written over the version it replaced; the referee and a sync then compare versions of one identity, never bytes or positions (the referee: `referee/placing.rs` places them); a line a landing would put after the upstream's unfinished last line collides with it (R10.4), and so does an unfinished line a landing would put in front of a line the upstream keeps (R10.8); until the upstream decides, a sync hides the upstream's unfinished last line in front of an undecided line (R10.6) and the upstream's lines after an undecided unfinished line (R10.9) |
-//! | 9, progress (git-model.md §6) | P1: a [`Step::Next`] takes the first entry no earlier waiting entry shares a file or a source with (`queue`'s scan), so several may wait ([`World::waits`]); no call ever waits on a waiting entry (P3 is gone, the owner's decision of 2026-11-04): a new open of a file a waiting entry waits for is granted; P2, the prefix sync: a sync delivers the upstream's commits in order up to the first whose delivery would overwrite a file open for writing in the fork, and waits for the rest (`queue`'s prefix, its `Cut`) |
+//! | 9, progress (git-model.md §6) | P1: a [`TreeStep::Next`] takes the first entry no earlier waiting entry shares a file or a source with (`queue`'s scan), so several may wait ([`World::waits`]); no call ever waits on a waiting entry (P3 is gone, the owner's decision of 2026-11-04): a new open of a file a waiting entry waits for is granted; P2, the prefix sync: a sync delivers the upstream's commits in order up to the first whose delivery would overwrite a file open for writing in the fork, and waits for the rest (`queue`'s prefix, its `Cut`) |
 //! | 11. Deletes and renames | a file's name line: [`World::rename`] writes a new version, [`World::unlink`] a deleted one; the referee's land applies the per-line rule to it and couples a file's existence with its content. [`World::create`] makes a file (an unborn identity); an open holds an object ([`Handle::object`](crate::recording::Handle::object)), so a close saves to the file its object is named by ([`World::named`]) or, for an orphan, nothing ([`Orphan`](crate::recording::Orphan), kept by `recording`); a rename-over from a new file is an atomic save, a rewrite of the replaced file |
 //! | 12. The journal (git-model.md §3) | an open's calls are its journal; [`World::crash`] saves each open from it once (the `Agentfs-Open` trailer, [`World::saved`]); a take is one step, so none is in progress at a crash |
 //!
 //! No clock: commits carry a fixed date (`git.rs`) and order comes only
 //! from the queues and from git history.
 
-use std::cell::RefCell;
+use std::cell::{OnceCell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -220,10 +220,11 @@ pub enum ModelError {
     Ended,
 }
 
-/// A step the scheduler can take: each completes at once (a [`Step::Next`]
-/// may record that its head waits).
+/// A step of the trees the scheduler can take: each completes at once (a
+/// [`TreeStep::Next`] may record that its head waits). The mirror's push is the
+/// history service's ([`crate::service::Step`]).
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Step {
+pub enum TreeStep {
     /// A take, one atomic step (the owner, 2026-11-08, finding 49: "B"):
     /// choose the first entry of a tree's queue P1 lets go, lock the files it
     /// overwrites and write them, with no call in between; or, if a client of
@@ -231,11 +232,18 @@ pub enum Step {
     /// those to close (rule 9).
     Next(TreeId),
     Drop(TreeId),
-    /// Replication pushes to the shared remote: due once the root moved or a
-    /// collision was recorded since its last push (the events it waits
-    /// for), taken in any order with the queue steps, so the push is
-    /// eventual and never part of a referee's step.
-    Replicate,
+}
+
+/// Tree history's notice that a tree's head moved (system.md's `TreeMoved`,
+/// less `paths`): what a mirror reads to know it is due ([`World::moves`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TreeMoved {
+    pub tree: TreeId,
+    /// The head before; none for a tree's first head.
+    pub from: Option<String>,
+    pub to: String,
+    /// The refs (`refs/collisions/<n>`) the take that moved it recorded, in order.
+    pub collisions: Vec<String>,
 }
 
 /// One take of a change into a tree (a landing, or a transaction's commit
@@ -374,7 +382,9 @@ pub struct TreeNames {
 impl TreeNames {
     /// Names the root `root`. Panics if `root` is empty, is `fork` or `txn`,
     /// or starts `fork/` or `txn/`: it would collide with a fork's or a
-    /// transaction's name. Git checks the rest when the world runs `git init -b`.
+    /// transaction's name. Panics too on a name git's branch rule refuses
+    /// (`git check-ref-format --branch`), `HEAD` among them: `git init -b HEAD`
+    /// succeeds, and the first commit then fails.
     pub fn new(root: &str) -> Self {
         assert!(
             !root.is_empty()
@@ -382,6 +392,16 @@ impl TreeNames {
                 && !root.starts_with("fork/")
                 && !root.starts_with("txn/"),
             "{root:?} cannot name the root: it is empty or a fork's or a transaction's name"
+        );
+        let branch = try_git(
+            &std::env::temp_dir(),
+            &["check-ref-format", "--branch", root],
+            None,
+        );
+        assert!(
+            branch.code == 0,
+            "{root:?} cannot name the root: git's branch rule refuses it: {}",
+            branch.stderr.trim_end()
         );
         Self {
             root: root.to_string(),
@@ -419,9 +439,6 @@ pub struct World {
     names: TreeNames,
     root: PathBuf,
     repo: PathBuf,
-    /// The shared remote (a bare repository): Replication pushes the root and
-    /// every collision ref there.
-    remote: PathBuf,
     root_head: String,
     pub forks: BTreeMap<TreeId, Fork>,
     next_fork: u32,
@@ -457,9 +474,8 @@ pub struct World {
     parents: RefCell<BTreeMap<String, Vec<String>>>,
     ancestry: RefCell<BTreeMap<(String, String), bool>>,
     over: RefCell<BTreeMap<String, Vec<String>>>,
-    /// The root moved, or a collision was recorded, since Replication last
-    /// pushed.
-    replication_due: bool,
+    /// Every move of a head, oldest first: what tree history publishes.
+    moves: Vec<TreeMoved>,
     /// Syncs that delivered only a prefix of the upstream's commits (P2),
     /// counted so a run can show it met them.
     pub prefix_syncs: usize,
@@ -469,6 +485,9 @@ pub struct World {
     trace_mute: bool,
     /// What tells this world's trace file from another's (a seed).
     trace_label: Option<String>,
+    /// This world's name for its trace and digest files, taken at the first
+    /// ask ([`World::run_name`]).
+    run_name: OnceCell<String>,
 }
 
 /// The trailer naming the open a save came from (git-model.md §3).
@@ -508,12 +527,9 @@ impl World {
         ));
         let _ = std::fs::remove_dir_all(&root);
         let repo = root.join("repo");
-        let remote = root.join("origin.git");
         std::fs::create_dir_all(&repo).expect("create the repository");
-        std::fs::create_dir_all(&remote).expect("create the remote");
         let root_name = names.name(TreeId::ROOT);
         git(&repo, &["init", "-q", "-b", &root_name]);
-        git(&remote, &["init", "-q", "--bare", "-b", &root_name]);
         let objects = GitFiles {
             repo: repo.clone(),
             objects: RefCell::new(BTreeMap::new()),
@@ -523,7 +539,6 @@ impl World {
             names,
             root,
             repo,
-            remote,
             root_head: String::new(),
             forks: BTreeMap::new(),
             next_fork: 1,
@@ -545,11 +560,12 @@ impl World {
             parents: RefCell::new(BTreeMap::new()),
             ancestry: RefCell::new(BTreeMap::new()),
             over: RefCell::new(BTreeMap::new()),
-            replication_due: false,
+            moves: Vec::new(),
             prefix_syncs: 0,
             trace: std::env::var_os(TRACE_DIR).map(|_| Vec::new()),
             trace_mute: false,
             trace_label: None,
+            run_name: OnceCell::new(),
         };
         let files = PATHS
             .iter()
@@ -557,7 +573,7 @@ impl World {
             .collect();
         let tree = w.tree_with(None, &files);
         let c = w.commit(&[], &tree, "agentfs", "Root", &root_name);
-        w.set_head(TreeId::ROOT, &c);
+        w.set_head(TreeId::ROOT, &c, Vec::new());
         if !matches!(policies.merge, MergeRule::PerLine) || policies.layout != Layout::Separated {
             w.trace_call(out_of_scope("policy"));
         }
@@ -568,17 +584,19 @@ impl World {
         &self.repo
     }
 
-    /// The shared remote's bare repository.
-    pub fn remote(&self) -> &Path {
-        &self.remote
+    /// Every move of a head, oldest first, the root's first included:
+    /// append-only, so a reader keeps how far it has read.
+    pub fn moves(&self) -> &[TreeMoved] {
+        &self.moves
     }
 
     fn note(&mut self, s: String) {
         self.log.push(s);
     }
 
-    /// Logs a scheduler's choice, so a failing seed's log replays it.
-    pub fn note_step(&mut self, s: &Step) {
+    /// Logs a scheduler's choice (a tree step or the history service's), so a
+    /// failing seed's log replays it.
+    pub fn note_step(&mut self, s: &dyn std::fmt::Debug) {
         self.note(format!("step {s:?}"));
     }
 
@@ -859,17 +877,22 @@ impl World {
         git(&self.repo, &v);
     }
 
-    fn set_head(&mut self, t: TreeId, c: &str) {
+    /// Moves tree `t`'s head to `c`, the one place a head moves, and publishes
+    /// the move with the collision refs the take that moved it recorded
+    /// ([`World::record`]'s, passed by value so none is dropped).
+    fn set_head(&mut self, t: TreeId, c: &str, collisions: Vec<String>) {
         self.update_ref(&[&self.names.branch(t), c]);
-        match self.upstream_of(t) {
-            None => {
-                // Replication pushes the root once it moved: the event its push
-                // waits for.
-                self.replication_due = true;
-                self.root_head = c.to_string();
-            }
-            Some(_) => self.forks.get_mut(&t).expect("fork").head = c.to_string(),
-        }
+        let head = match self.upstream_of(t) {
+            None => &mut self.root_head,
+            Some(_) => &mut self.forks.get_mut(&t).expect("fork").head,
+        };
+        let from = std::mem::replace(head, c.to_string());
+        self.moves.push(TreeMoved {
+            tree: t,
+            from: (!from.is_empty()).then_some(from),
+            to: c.to_string(),
+            collisions,
+        });
     }
 
     fn tree_of(&self, c: &str) -> String {
@@ -1108,7 +1131,9 @@ impl World {
     }
 
     /// Records a take's collisions in tree `t`, its decisions being in its
-    /// result commit.
+    /// result commit, and returns the collision refs it recorded, in order, for
+    /// the move of `t`'s head ([`World::set_head`]).
+    #[must_use]
     fn record(
         &mut self,
         t: TreeId,
@@ -1117,7 +1142,8 @@ impl World {
         decisions: &[Decision],
         winner: &str,
         result: &str,
-    ) {
+    ) -> Vec<String> {
+        let mut refs: Vec<String> = Vec::new();
         for (l, d) in m.collisions.iter().zip(decisions) {
             let Lost {
                 path,
@@ -1143,32 +1169,11 @@ impl World {
                 result: result.to_string(),
                 reference: d.reference.clone(),
             });
-            self.replication_due = true;
+            if !refs.contains(&d.reference) {
+                refs.push(d.reference.clone());
+            }
         }
-    }
-
-    /// Replication's push ([`Step::Replicate`]): the root, whose history holds
-    /// every take's decisions, and every collision ref to the shared remote in one
-    /// atomic push (owner,
-    /// 2026-11-03: "yes, \"losing\" patches should still be part of the
-    /// history. i want to know who changed what when"). Replication is the
-    /// remote's one pusher; no referee step pushes. Never forced: the root only
-    /// moves forward, and collision refs never move.
-    fn replicate(&mut self) {
-        self.replication_due = false;
-        let remote = self.remote.to_string_lossy().into_owned();
-        let root = self.names.branch(TreeId::ROOT);
-        git(
-            &self.repo,
-            &[
-                "push",
-                "-q",
-                "--atomic",
-                &remote,
-                &format!("{root}:{root}"),
-                "refs/collisions/*:refs/collisions/*",
-            ],
-        );
+        refs
     }
 
     /// `t`'s head moved: a fork's new commit queues for its upstream (`up`),
@@ -1194,11 +1199,12 @@ impl World {
                 upstream,
                 writer: format!("c{id}"),
                 life: Life::Open,
-                head: head.clone(),
+                // Its first head is set, and published, just below.
+                head: String::new(),
                 txn: None,
             },
         );
-        self.set_head(id, &head);
+        self.set_head(id, &head, Vec::new());
         self.note(format!("create f{id} over {upstream:?}"));
         self.trace_call(match self.upstream_of(upstream) {
             None => RecordedCall::Fork { id },
@@ -1434,7 +1440,7 @@ impl World {
             }
             Target::Tree(tree) => {
                 let c = self.commit_by(&[at], &t, writer, "Direct", &self.names.name(tree), open);
-                self.set_head(tree, &c);
+                self.set_head(tree, &c, Vec::new());
                 self.entered.extend(set.into_iter().map(|e| (tree, e)));
                 self.moved(tree, true);
                 c
@@ -1710,7 +1716,7 @@ impl World {
                 &self.names.name(t),
                 &decisions,
             );
-            self.record(t, Direction::Transaction, &m, &decisions, &ours, &c);
+            let refs = self.record(t, Direction::Transaction, &m, &decisions, &ours, &c);
             self.landings.push(Landed {
                 tree: t,
                 direction: Direction::Transaction,
@@ -1720,7 +1726,7 @@ impl World {
                 base: txn.start.clone(),
                 won: m.collisions.is_empty(),
             });
-            self.set_head(t, &c);
+            self.set_head(t, &c, refs);
             for e in edit {
                 self.entered.push((t, e.edit()));
             }
@@ -1948,35 +1954,32 @@ impl World {
 
     // ── steps ────────────────────────────────────────────────────────────
 
-    /// Every step that can act now: a take in each live tree whose queue
+    /// Every tree step that can act now: a take in each live tree whose queue
     /// has an entry P1 lets go, and each fork ready to drop.
-    pub fn pending(&self) -> Vec<Step> {
-        let mut out: Vec<Step> = self
+    pub fn tree_steps(&self) -> Vec<TreeStep> {
+        let mut out: Vec<TreeStep> = self
             .queues
             .queued_trees()
             .into_iter()
             .filter(|t| self.alive(*t) && self.queues.scan(*t, self).is_some())
-            .map(Step::Next)
+            .map(TreeStep::Next)
             .collect();
         out.extend(
             self.forks
                 .keys()
                 .filter(|f| self.droppable(**f))
-                .map(|f| Step::Drop(*f)),
+                .map(|f| TreeStep::Drop(*f)),
         );
-        if self.replication_due {
-            out.push(Step::Replicate);
-        }
         out
     }
 
     /// Takes one step and returns how many queue entries it took: a
-    /// [`Step::Next`] takes the first its queue lets go and writes it, or
+    /// [`TreeStep::Next`] takes the first its queue lets go and writes it, or
     /// none when it waits (a prefix sync writes and leaves its entry
     /// queued). Nothing is held by a collision.
-    pub fn step(&mut self, s: &Step) -> usize {
+    pub fn take_step(&mut self, s: &TreeStep) -> usize {
         match s {
-            Step::Next(t) => {
+            TreeStep::Next(t) => {
                 self.last_take = None;
                 let choice = self.queues.choose(*t, self);
                 self.note_choice(*t, &choice);
@@ -1998,26 +2001,23 @@ impl World {
                 self.record_take(*t);
                 taken
             }
-            Step::Drop(f) => {
+            TreeStep::Drop(f) => {
                 self.trace_call(out_of_scope("drop"));
                 self.drop_fork(*f);
-                0
-            }
-            Step::Replicate => {
-                self.replicate();
                 0
             }
         }
     }
 
-    /// Takes steps until none is left.
-    pub fn settle(&mut self) {
+    /// Takes tree steps until none is left. It never pushes: a mirror is the
+    /// history service's ([`crate::service::HistoryService::settle`]).
+    pub fn settle_trees(&mut self) {
         for _ in 0..100_000 {
-            let Some(s) = self.pending().into_iter().next() else {
+            let Some(s) = self.tree_steps().into_iter().next() else {
                 return;
             };
             self.note_step(&s);
-            self.step(&s);
+            self.take_step(&s);
         }
         panic!("the queues never drained");
     }
@@ -2144,7 +2144,7 @@ impl World {
                 won && m.tree == self.tree_of(tip),
                 "a fast-forward is a plain replacement"
             );
-            self.set_head(x, tip);
+            self.set_head(x, tip, Vec::new());
             self.fast_forwards += 1;
             self.landed(x, &ours, tip, tip, won);
             self.note(format!(
@@ -2163,10 +2163,10 @@ impl World {
             &self.names.name(x),
             &decisions,
         );
-        self.record(x, Direction::Landing, &m, &decisions, &ours, &new);
+        let refs = self.record(x, Direction::Landing, &m, &decisions, &ours, &new);
         self.landed(x, &ours, &new, tip, won);
         self.note(format!("landed f{from}'s {tip:.7} into {x:?}"));
-        self.set_head(x, &new);
+        self.set_head(x, &new, refs);
         self.moved(x, true);
     }
 
@@ -2260,7 +2260,7 @@ impl World {
             self.note(format!("synced {up:.7} into f{f}"));
             self.commit(&[&ours, up], &tree, "agentfs", "Sync", &self.names.name(x))
         };
-        self.set_head(x, &new);
+        self.set_head(x, &new, Vec::new());
         self.syncs.push((x, up.to_string(), new, entered));
         self.moved(x, false);
     }
@@ -2298,6 +2298,17 @@ impl World {
     /// Names this world's trace file apart from others of its test.
     pub fn label_trace(&mut self, label: String) {
         self.trace_label = Some(label);
+    }
+
+    /// The run's name for its trace and digest files,
+    /// `<thread name>[.<label>][.<n>]`: the n-th run of that name in this
+    /// process counts from 1 past the first. Taken at the first ask and kept,
+    /// so a run's two writers share one name; each asks only at drop, after
+    /// [`World::label_trace`].
+    pub fn run_name(&self) -> String {
+        self.run_name
+            .get_or_init(|| run_name(self.trace_label.as_deref()))
+            .clone()
     }
 
     fn trace_call(&mut self, call: RecordedCall) {
@@ -2609,7 +2620,7 @@ impl TreeCalls for World {
         let mut stepped = false;
         while self.queues.scan(t, self).is_some() {
             stepped = true;
-            self.step(&Step::Next(t));
+            self.take_step(&TreeStep::Next(t));
             if self.last_take.is_some() {
                 return Ok(Took::Taken);
             }
@@ -2664,9 +2675,7 @@ impl History<World> for ModelHistory {
 /// Where `World::drop` writes a recorded world's trace.
 const TRACE_DIR: &str = "AGENTFS_MODEL_TRACE_DIR";
 
-/// `<thread name>[.<label>][.<n>]`, a world's name for its trace and digest
-/// files: the n-th world of that name in this process counts from 1 past the
-/// first. A world takes one name, whichever of the two it writes.
+/// [`World::run_name`]'s name, counted.
 fn run_name(label: Option<&str>) -> String {
     static NAMES: Mutex<BTreeMap<String, u32>> = Mutex::new(BTreeMap::new());
     let thread = std::thread::current();
@@ -2686,22 +2695,19 @@ fn run_name(label: Option<&str>) -> String {
     name
 }
 
+/// Writes the trace (the digest is the history service's, which sees the
+/// mirror), then removes the world's directory.
 impl Drop for World {
     fn drop(&mut self) {
         let trace_dir = std::env::var_os(TRACE_DIR).filter(|_| self.trace.is_some());
-        let digest_dir = std::env::var_os(crate::digest::DIGEST_DIR);
-        if !std::thread::panicking() && (trace_dir.is_some() || digest_dir.is_some()) {
-            let name = run_name(self.trace_label.as_deref());
-            if let (Some(dir), Some(trace)) = (trace_dir, &self.trace) {
-                let file = Path::new(&dir).join(format!("{name}.trace"));
-                // A trace that cannot be written must fail the job, not a floor later.
-                std::fs::create_dir_all(&dir)
-                    .and_then(|()| std::fs::write(&file, crate::calls::render(trace)))
-                    .unwrap_or_else(|e| panic!("write {}: {e}", file.display()));
-            }
-            if let Some(dir) = digest_dir {
-                crate::digest::write(self, Path::new(&dir), &name);
-            }
+        if !std::thread::panicking()
+            && let (Some(dir), Some(trace)) = (trace_dir, &self.trace)
+        {
+            let file = Path::new(&dir).join(format!("{}.trace", self.run_name()));
+            // A trace that cannot be written must fail the job, not a floor later.
+            std::fs::create_dir_all(&dir)
+                .and_then(|()| std::fs::write(&file, crate::calls::render(trace)))
+                .unwrap_or_else(|e| panic!("write {}: {e}", file.display()));
         }
         if std::env::var_os("AGENTFS_MODEL_KEEP").is_none() {
             let _ = std::fs::remove_dir_all(&self.root);

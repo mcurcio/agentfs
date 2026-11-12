@@ -250,7 +250,7 @@ the pull request body reports them), prove it:
 
 - **The digest** (`src/digest.rs`, `baseline/digests.txt`, `ci/model-digest.sh`): one canonical text per run
   built only from git (every reachable commit numbered by a walk from the refs, with its git tree, parents by
-  number and whole message, then the local refs and the shared remote's refs with their tips' numbers), hashed
+  number and whole message, then the local refs and the mirror's refs with their tips' numbers), hashed
   with `git hash-object`. Commit ids, dates and in-memory records are left out; tree names become labels (`T<tree number>`,
   the root `T0`, and `X<transaction id>`) through the one place that names trees (`world::TreeNames`, which the
   world is given), so a rename edits that place only, and the root's name changes no digest. `canonical_text_is_pinned` pins the

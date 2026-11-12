@@ -4,7 +4,7 @@
 //! The text holds every commit reachable from `refs/heads` and
 //! `refs/collisions`, numbered by a depth-first walk from those refs in label
 //! order: its git tree, its parents by number and its whole message. Then each
-//! of those refs, and each the shared remote holds, with the number of its tip.
+//! of those refs, and each the mirror holds, with the number of its tip.
 //! A commit id depends on the commit's date, and under
 //! [`crate::git::with_reversed_dates`] on how many git processes ran before it,
 //! so no commit id is in the text. Every tree name, as a ref or as a message's
@@ -21,9 +21,10 @@ use std::path::Path;
 use crate::calls::TreeId;
 use crate::calls::TxnId;
 use crate::git::{git, git_in, try_git};
-use crate::world::{COLLISION, TreeNames, World};
+use crate::service::HistoryService;
+use crate::world::{COLLISION, TreeNames};
 
-/// Where `World::drop` writes each run's digest.
+/// Where `HistoryService::drop` writes each run's digest.
 pub const DIGEST_DIR: &str = "AGENTFS_MODEL_DIGEST_DIR";
 
 /// Set, it writes each run's canonical text beside its digest, to diff.
@@ -171,7 +172,7 @@ fn canonical_line(
     line.to_string()
 }
 
-/// The canonical text of `repo` and its shared `remote`, tree names replaced by
+/// The canonical text of `repo` and its mirror `remote`, tree names replaced by
 /// `labels`.
 fn canonical(repo: &Path, remote: &Path, labels: &BTreeMap<String, String>) -> String {
     let commits = commits(repo);
@@ -211,21 +212,21 @@ fn canonical(repo: &Path, remote: &Path, labels: &BTreeMap<String, String>) -> S
 }
 
 /// The run as one canonical text (this module's doc comment).
-pub fn canonical_text(w: &World) -> String {
-    let labels = labels_of(w.names(), w.trees(), w.txns_begun());
-    canonical(w.repo(), w.remote(), &labels)
+pub fn canonical_text(s: &HistoryService) -> String {
+    let labels = labels_of(s.names(), s.trees(), s.txns_begun());
+    canonical(s.repo(), s.mirror().repo(), &labels)
 }
 
 /// The sha of [`canonical_text`], as `git hash-object` gives it.
-pub fn digest(w: &World) -> String {
-    git_in(w.repo(), &["hash-object", "--stdin"], &canonical_text(w))
+pub fn digest(s: &HistoryService) -> String {
+    git_in(s.repo(), &["hash-object", "--stdin"], &canonical_text(s))
 }
 
 /// Writes `<name>.digest` to `dir`, and `<name>.text` when [`DIGEST_TEXT`] is
 /// set. A digest that cannot be written must fail the job.
-pub(crate) fn write(w: &World, dir: &Path, name: &str) {
-    let text = canonical_text(w);
-    let sha = git_in(w.repo(), &["hash-object", "--stdin"], &text);
+pub(crate) fn write(s: &HistoryService, dir: &Path, name: &str) {
+    let text = canonical_text(s);
+    let sha = git_in(s.repo(), &["hash-object", "--stdin"], &text);
     let write = |ext: &str, body: &str| {
         let file = dir.join(format!("{name}.{ext}"));
         std::fs::create_dir_all(dir)
@@ -377,11 +378,11 @@ P refs/collisions/1 1
 
     /// The canonical text of one run under root name `root`: a fork's
     /// committed transaction loses at the root (a collision), and the root and
-    /// the collision ref are replicated to the remote.
+    /// the collision ref are pushed to the mirror.
     fn text_of_a_run_under(root: &str) -> String {
         use crate::calls::Client;
         use crate::world::Policies;
-        let mut w = World::new(Policies::default(), TreeNames::new(root));
+        let mut w = HistoryService::new(Policies::default(), TreeNames::new(root));
         let f = w.create_fork(TreeId::ROOT);
         w.begin(f).expect("a transaction");
         w.save(&Client::Fork(f), "a", 0);
@@ -410,11 +411,12 @@ P refs/collisions/1 1
         }
     }
 
-    /// A root name that would collide with a fork's or a transaction's is
-    /// refused; any other git accepts is taken.
+    /// A root name that would collide with a fork's or a transaction's, or that
+    /// git's branch rule refuses (`HEAD`, which `git init -b` takes and the first
+    /// commit then fails on), is refused; any other git accepts is taken.
     #[test]
     fn tree_names_refuses_a_fork_or_transaction_name() {
-        for bad in ["", "fork", "txn", "fork/1", "txn/1"] {
+        for bad in ["", "fork", "txn", "fork/1", "txn/1", "HEAD", "-x", "a..b"] {
             let made = std::panic::catch_unwind(|| TreeNames::new(bad));
             assert!(made.is_err(), "{bad:?} was accepted");
         }

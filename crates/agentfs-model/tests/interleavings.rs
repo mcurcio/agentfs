@@ -37,9 +37,10 @@ use agentfs_model::git::{git, with_reversed_dates};
 use agentfs_model::program;
 use agentfs_model::queue::{Entry, NAME_KEY, name_key};
 use agentfs_model::recording::{Kind, Target, Write};
+use agentfs_model::service::{HistoryService, Step};
 use agentfs_model::world::{
-    By, Direction, Life, LineEdit, MODEL_ROOT, MergeRule, Policies, Step, TreeNames, TxnEnd,
-    TxnOutcome, World,
+    By, Direction, Life, LineEdit, MODEL_ROOT, MergeRule, Policies, TreeNames, TxnEnd, TxnOutcome,
+    World,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -557,7 +558,7 @@ fn take(w: &mut Checked, o: &mut Oracle, s: &Step, tally: &mut Tally) -> Result<
     w.note_step(s);
     let before = match s {
         Step::Next(t) => w.queue(*t),
-        Step::Drop(_) | Step::Replicate => Vec::new(),
+        Step::Drop(_) | Step::Push => Vec::new(),
     };
     let numbered = match s {
         Step::Next(t) => w.queue_numbered(*t),
@@ -911,7 +912,7 @@ const PHASE_1: Generator = Generator {
 };
 
 /// The steps `g` may take now.
-fn pending_of(w: &World, g: Generator) -> Vec<Step> {
+fn pending_of(w: &HistoryService, g: Generator) -> Vec<Step> {
     let mut steps = w.pending();
     if !g.drops {
         steps.retain(|s| !matches!(s, Step::Drop(_)));

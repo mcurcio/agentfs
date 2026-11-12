@@ -74,6 +74,15 @@ replace = '''
 '''
 
 [[bug]]
+id = "mirror_ignores_a_forks_collision"
+rule = "R4"
+seeds = 64
+find = '''
+            .any(|m| m.tree == TreeId::ROOT || !m.collisions.is_empty())'''
+replace = '''
+            .any(|m| m.tree == TreeId::ROOT)'''
+
+[[bug]]
 id = "losing_save_applies_its_clean_lines"
 rule = "R3e"
 seeds = 64
@@ -181,9 +190,9 @@ id = "collision_record_in_the_wrong_commit"
 rule = "R5.1"
 seeds = 64
 find = '''
-            self.record(t, Direction::Transaction, &m, &decisions, &ours, &c);'''
+            let refs = self.record(t, Direction::Transaction, &m, &decisions, &ours, &c);'''
 replace = '''
-            self.record(t, Direction::Transaction, &m, &decisions, &ours, &ours);'''
+            let refs = self.record(t, Direction::Transaction, &m, &decisions, &ours, &ours);'''
 
 [[bug]]
 id = "incoming_insert_before_the_upstreams"

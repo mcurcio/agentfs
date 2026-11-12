@@ -2,9 +2,9 @@
 //! repository and the trees after every step. Each returns the first
 //! violation found. The checker's own state (its last view of each tree, how
 //! far it has read the world's records, caches over git objects, which never
-//! change) lives in a [`Checker`], owned with its world by [`Checked`]: the
-//! world does not know it is checked, and the checker reads the world and git
-//! but writes neither.
+//! change) lives in a [`Checker`], owned with its history service by
+//! [`Checked`]: the world does not know it is checked, and the checker reads
+//! the world, the mirror and git but writes none of them.
 
 mod lineage;
 
@@ -17,10 +17,12 @@ use lineage::Lineage;
 use crate::calls::{Client, TreeId, TxnId};
 use crate::content::{Content, Line, PATHS, State, is_root, writer_of};
 use crate::git::{git, try_git};
+use crate::mirror::Mirror;
 use crate::queue::{Entry, Take, name_key};
 use crate::recording::{Kind, Target};
+use crate::service::{HistoryService, Step};
 use crate::world::{
-    By, Collision, Decision, Direction, Landed, Life, Policies, Step, TreeNames, TxnEnd,
+    By, Collision, Decision, Direction, Landed, Life, Policies, TreeNames, TreeStep, TxnEnd,
     TxnOutcome, World, commit_parents, decisions_in, origin_in,
 };
 
@@ -29,26 +31,28 @@ fn named<T>(check: &'static str, r: Result<T, String>) -> Result<T, String> {
     r.map_err(|e| format!("{check}: {e}"))
 }
 
-/// A world and its checker, one per world, fixed at construction. It derefs
-/// to the [`World`], so a test drives the world through it; the checks run
-/// only through [`Checked::check`], [`Checked::step_checked`] and
+/// A history service and its checker, one per service, fixed at
+/// construction. It derefs to the [`HistoryService`] (and on to its
+/// [`World`]), so a test drives the system through it; the checks run only
+/// through [`Checked::check`], [`Checked::step_checked`] and
 /// [`Checked::converged`].
 pub struct Checked {
-    world: World,
+    service: HistoryService,
     checker: Checker,
 }
 
 impl Checked {
     pub fn new(policies: Policies, names: TreeNames) -> Self {
         Self {
-            world: World::new(policies, names),
+            service: HistoryService::new(policies, names),
             checker: Checker::default(),
         }
     }
 
     /// Every invariant that holds after any step.
     pub fn check(&mut self) -> Result<(), String> {
-        self.checker.check(&self.world)
+        self.checker.check(&self.service)?;
+        named("mirror_current", mirror_current(&self.service))
     }
 
     /// One step, with what only the step itself shows. A take (rule 9) is one
@@ -61,18 +65,27 @@ impl Checked {
     /// sync records no collision (only an upstream's queue decides one) and
     /// carries the head its take read. Returns the queue entries taken. The
     /// checks only read the world, before and after; the step alone changes it.
+    /// After the mirror's push, the mirror lacks nothing of the local root and
+    /// collision refs (read from git, both sides).
     pub fn step_checked(&mut self, s: &Step) -> Result<usize, String> {
-        let before = named("step_checked", before_step(&self.world, s))?;
-        let taken = self.world.step(s);
+        let before = named("step_checked", before_step(&self.service, s))?;
+        let taken = self.service.step(s);
+        if *s == Step::Push
+            && let Some(r) = lagging(&self.service)
+        {
+            return Err(format!(
+                "step_checked: after the push, the mirror lacks {r}"
+            ));
+        }
         match before {
-            Some(b) => named("step_checked", after_step(&self.world, b, taken)),
+            Some(b) => named("step_checked", after_step(&self.service, b, taken)),
             None => Ok(taken),
         }
     }
 
     /// Once writes stop and every queue has drained ([`check_converged`]).
     pub fn converged(&self) -> Result<(), String> {
-        check_converged(&self.world)
+        check_converged(&self.service)
     }
 
     /// What the checks counted, so a run can show it exercised them.
@@ -83,21 +96,21 @@ impl Checked {
     /// Whether version `newer` was written over `older` (or is it), by the
     /// checker's own record, read from git first.
     pub fn descends(&mut self, newer: &str, older: &str) -> bool {
-        self.checker.lineage.read_new(self.world.repo());
+        self.checker.lineage.read_new(self.service.repo());
         self.checker.lineage.descends(newer, older)
     }
 }
 
 impl Deref for Checked {
-    type Target = World;
-    fn deref(&self) -> &World {
-        &self.world
+    type Target = HistoryService;
+    fn deref(&self) -> &HistoryService {
+        &self.service
     }
 }
 
 impl DerefMut for Checked {
-    fn deref_mut(&mut self) -> &mut World {
-        &mut self.world
+    fn deref_mut(&mut self) -> &mut HistoryService {
+        &mut self.service
     }
 }
 
@@ -445,7 +458,7 @@ fn locks(w: &World) -> Result<(), String> {
             }
         }
         // P1: an entry no waiting one shares a file or a source with goes.
-        if p1_first(w, *t).is_some() && !w.pending().contains(&Step::Next(*t)) {
+        if p1_first(w, *t).is_some() && !w.tree_steps().contains(&TreeStep::Next(*t)) {
             return Err(format!("{t:?}: an entry free to go is not offered"));
         }
     }
@@ -519,17 +532,17 @@ fn diff_files(w: &World, a: &str, b: &str) -> BTreeSet<String> {
 /// fork's untouched files equal the root and touched files equal the root or the
 /// fork's newer non-colliding edit": once the queues drain, a fork has no
 /// newer edit left.
-fn check_converged(w: &World) -> Result<(), String> {
-    named("check_converged", drained(w))?;
-    named("losers_pushed", losers_pushed(w))?;
-    named("check_converged", trees_equal_root(w))
+fn check_converged(s: &HistoryService) -> Result<(), String> {
+    named("check_converged", drained(s))?;
+    named("losers_pushed", losers_pushed(s, s.mirror()))?;
+    named("check_converged", trees_equal_root(s))
 }
 
-fn drained(w: &World) -> Result<(), String> {
+fn drained(w: &HistoryService) -> Result<(), String> {
     if let Some(s) = w
         .pending()
         .iter()
-        .find(|s| matches!(s, Step::Next(_) | Step::Replicate))
+        .find(|s| matches!(s, Step::Next(_) | Step::Push))
     {
         return Err(format!("not drained: {s:?} still pending"));
     }
@@ -988,19 +1001,19 @@ impl Checker {
     }
 }
 
-/// Every losing change is replicated to the shared remote, eventually, and
+/// Every losing change is pushed to the mirror, eventually, and
 /// stays there attributable (owner, 2026-11-03: "yes, \"losing\" patches
 /// should still be part of the history. i want to know who changed what
-/// when"). Run once Replication has drained ([`check_converged`]). Read from
-/// the remote alone: the commits of the root's history there hold exactly the
+/// when"). Run once the mirror's push has drained ([`check_converged`]). Read
+/// from the mirror alone: the commits of the root's history there hold exactly the
 /// run's collision records, each in its result commit, which places the
 /// decision in the root's order; each record's ref
 /// names its losing commit; and each lost version is in its file there and was
 /// written by a commit naming that version's writer (who, what). The commit's date is kept as its
 /// audit "when" but never read to decide anything (rule 2), and not
 /// checked here.
-fn losers_pushed(w: &World) -> Result<(), String> {
-    let remote = w.remote();
+fn losers_pushed(w: &World, m: &Mirror) -> Result<(), String> {
+    let remote = m.repo();
     let root = w.names().branch(TreeId::ROOT);
     let exists = try_git(remote, &["rev-parse", "--verify", "-q", &root], None);
     let records = if exists.code == 0 {
@@ -1066,6 +1079,49 @@ fn losers_pushed(w: &World) -> Result<(), String> {
                 ));
             }
         }
+    }
+    Ok(())
+}
+
+/// The root's branch and every collision ref, each with its commit, as
+/// `for-each-ref` reads them in `repo`.
+fn pushed_refs(repo: &Path, root: &str) -> BTreeMap<String, String> {
+    git(
+        repo,
+        &[
+            "for-each-ref",
+            "--format=%(refname) %(objectname)",
+            root,
+            "refs/collisions",
+        ],
+    )
+    .lines()
+    .filter_map(|l| l.split_once(' '))
+    .map(|(r, c)| (r.to_string(), c.to_string()))
+    .collect()
+}
+
+/// The first of the local root's tip and collision refs the mirror lacks (or
+/// holds at another commit), read from git on both sides.
+fn lagging(s: &HistoryService) -> Option<String> {
+    let root = s.names().branch(TreeId::ROOT);
+    let local = pushed_refs(s.repo(), &root);
+    let mirrored = pushed_refs(s.mirror().repo(), &root);
+    local
+        .into_iter()
+        .find(|(r, c)| mirrored.get(r) != Some(c))
+        .map(|(r, c)| format!("{r} at {c}"))
+}
+
+/// Push timing (git-model.md §4): whenever the mirror lacks the local root's
+/// tip or a collision ref, a fork's included before it ever lands, the
+/// service lists [`Step::Push`]. Truth from git, both sides: it judges the
+/// service's claim, it does not ask the mirror whether it is due.
+fn mirror_current(s: &HistoryService) -> Result<(), String> {
+    if let Some(r) = lagging(s)
+        && !s.pending().contains(&Step::Push)
+    {
+        return Err(format!("the mirror lacks {r}, and no push is pending"));
     }
     Ok(())
 }

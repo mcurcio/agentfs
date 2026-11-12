@@ -8,7 +8,8 @@
 
 use agentfs_model::calls::TreeId;
 use agentfs_model::git::{git, try_git};
-use agentfs_model::world::{Direction, Step, World};
+use agentfs_model::service::Step;
+use agentfs_model::world::{Direction, World};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;

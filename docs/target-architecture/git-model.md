@@ -234,7 +234,11 @@ Ref names are a design choice; the model uses the first six (with `refs/collisio
 
 Replication adds the release major to pushed names (replication.md). It is the only pusher: the collision refs
 join its refspec, and a move of the root or a recorded collision makes a push due (design
-choice; the model's `Step::Replicate`, taken in any order with the queue steps). The model first made only a
+choice). In the model a mirror (`mirror::Mirror`) sits outside the trees: tree history publishes each move of a head
+(`world::TreeMoved`, with the collision refs its take recorded), the mirror is due once a move it has not read moved the
+root or names a collision ref, and its push is the history service's `Step::Push`, taken in any order with the queue
+steps (`service::HistoryService`). A fork's collision ref reaches the mirror even if that fork never lands
+(`mirror_current`). The model first made only a
 collision an event, so a run without one never pushed the root (MODEL.md finding 16). No queue step waits on
 the network.
 
@@ -789,7 +793,7 @@ git configuration; one actor per tree is the actor model's single owner of mutab
 These checks hold **for the modelled executions**: the scenarios and the seeds run. That is evidence about the
 model's rules, not a proof, and it covers nothing the model leaves out (§16), the journal, objects and progress
 policy of this revision included. Every check runs after every step, in every scenario and random run (seeds 1 to 64 in CI), except
-`check_converged` and `losers_pushed`, which run once the queues and Replication drain.
+`check_converged` and `losers_pushed`, which run once the queues and the mirror's push drain.
 
 | Invariant | Check | Tests |
 |---|---|---|
@@ -815,7 +819,8 @@ policy of this revision included. Every check runs after every step, in every sc
 | Nothing else waits; each take is its queue's first entry or records a wait, the rest stay in order | `take` (interleavings.rs) | `random_interleavings_full_lineage`, `random_interleavings_adjacent_lines` (the scenarios' own `take` checks no order) |
 | A transaction ends as the program was told, whole; a rollback leaves nothing | `transactions_end_as_told`, `discarded_leave_no_trace` | `r5_transaction_commits_clean`, `r3_a_transaction_loses_whole_and_is_told`, `r5_sync_before_or_after_the_commit_ends_the_same`, `r5_a_committed_transaction_then_lands_like_any_change`, `r5_transaction_rollback_and_client_death_leave_nothing` |
 | Every change traces to one writer | `one_writer` | `r6_a_sync_is_a_merge_with_the_upstream_second` |
-| Every losing change is replicated, eventually, and stays: once Replication drains, the commits of the remote root's history hold the run's collisions, each re-read on the shared remote alone, its writer and line | `losers_pushed` | `r3_a_save_before_the_sync_arrives_loses_to_the_upstream`, every collision |
+| Every losing change is replicated, eventually, and stays: once the mirror's push drains, the commits of the mirror's root history hold the run's collisions, each re-read on the mirror alone, its writer and line | `losers_pushed` | `r3_a_save_before_the_sync_arrives_loses_to_the_upstream`, every collision |
+| The mirror's push is pending whenever the mirror lacks the root's tip or a collision ref, a fork's included (§4) | `mirror_current` | every collision, `r4_nested_forks_follow_the_same_rules` |
 | Nested forks follow the same rules | all checks | `r4_nested_forks_follow_the_same_rules` |
 | Full lineage, read by ancestry alone: a tree's history reaches every change it took | `full_lineage` | `r7_every_fork_commit_lands_on_its_own_in_the_roots_history`, `r7_the_root_reaches_a_losing_commit_and_its_ref_keeps_it`, `random_interleavings_full_lineage` |
 | Trees converge when writes stop | `check_converged` | `convergence_when_writes_stop` |
