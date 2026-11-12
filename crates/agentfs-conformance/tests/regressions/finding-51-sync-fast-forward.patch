@@ -1,0 +1,31 @@
+Removes the fix of finding-51-sync-fast-forward.trace: the shows-the-same guard
+on a sync's fast-forward (introduced without it in 6049b1b, fixed in e9ab747).
+Base: 7474470 (agentfs-core unchanged since). git: the release in ci/git-release.
+Re-record (crates/agentfs-model/VERIFYING.md, "A regression found on the engine")
+in a scratch worktree with this applied. Give it fresh volumes, since --record
+refuses a non-empty OUT: export MODEL_TARGET_VOLUME=mt-fixture MODEL_WORK_VOLUME=mw-fixture
+  ci/model-docker.sh -- sh -c 'AGENTFS_MODEL_TRACE_DIR=/work/t cargo test --locked \
+    -p agentfs-conformance --test replay \
+    finding_51_a_sync_that_cannot_show_the_upstreams_commit_merges'
+    # exits 101: the copy fails the scenario at call 15, which is the point
+  ci/model-docker.sh -- cargo run --locked -p agentfs-conformance --bin phase1-replay -- \
+    library /work/t --min-scenarios 0 --min-seeds 0 \
+    --only finding_51_a_sync_that --record /work/out
+    # exits 1: MISMATCH at call 15, as expected; the recording is still written
+  ci/model-docker.sh -- sh -c 'cp /work/out/finding_51_a_sync_that*.trace \
+    crates/agentfs-conformance/tests/regressions/finding-51-sync-fast-forward.trace'
+    # /work is a Docker volume, so the copy runs in the container
+Verified 2026-11-12: these commands reproduce the committed trace byte for byte (cmp).
+`git apply` skips these lines.
+
+--- a/crates/agentfs-core/src/tree_actor/mod.rs
++++ b/crates/agentfs-core/src/tree_actor/mod.rs
+@@ -1656,7 +1656,7 @@
+             // for the upstream and the sync shows what the upstream's commit shows (the
+             // model's `World::sync`). The fork then takes that commit's line maps and names,
+             // so a version the upstream decided against stays in history only (finding 51).
+-            let head = if Self::shows_the_same(&parent, &snapshot) && !self.pending_from(tree)? {
++            let head = if !self.pending_from(tree)? {
+                 for (id, file) in &mut snapshot.files {
+                     if let Some(theirs) = parent.files.get(id) {
+                         file.lines = theirs.lines.clone();

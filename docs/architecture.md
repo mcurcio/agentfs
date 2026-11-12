@@ -189,11 +189,13 @@ missing from these tables or a row names a module that no longer exists;
 
 | Module | Role |
 |---|---|
-| `lib.rs` | Crate root, one call per kind of replay, which traces fit a real mount |
+| `lib.rs` | Crate root, one call per kind of replay, each recording what the system did into a sink; the root's engine name (`ENGINE_ROOT`, read once); which traces fit a real mount |
+| `engine_names.rs` | `EngineNames`: the engine's name of each tree of a trace, the root by its given name, fork n by the n-th fork made |
+| `git_history.rs` | Its own parse of the engine's commits (`git cat-file`, `metadata.json`, `namespace.json`), and `EngineHistory`: the collisions and heads a replay compares, read from git |
 | `library.rs` | `Library`: the shared calls on `Volume`, seeded as the model's first commit |
 | `mounted.rs` | `Mounted`: the shared calls as real system calls on a mount of a failpoints build, each take through the take gate |
 | `invariants.rs` | What must hold in the real system, read from `git`, its own parse of `metadata.json` and `namespace.json` and its own byte oracle, never `tree_actor` |
-| `bin/phase1-replay.rs` | `phase1-replay model\|library\|mount DIR`: replays the traces, with floors, against `open-findings.txt` |
+| `bin/phase1-replay.rs` | `phase1-replay model\|library\|mount DIR [--record OUT]`: replays the traces, with floors, against `open-findings.txt`; `--record` writes what the system did with each |
 
 ### `agentfs-csi`
 

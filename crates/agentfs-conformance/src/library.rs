@@ -1,6 +1,6 @@
 //! The shared calls on the real library: `Volume`, in this process.
 
-use crate::ENGINE_ROOT;
+use crate::engine_names::EngineNames;
 use agentfs_core::tree_actor::{self, Error, Volume};
 use agentfs_model::calls::{CallError, Caller, Took, TreeCalls, TreeId};
 use std::collections::BTreeMap;
@@ -10,16 +10,16 @@ use std::path::{Path, PathBuf};
 pub const SEEDED: [&str; 4] = ["a", "b", "c", "d"];
 const SEED_BYTES: &[u8] = b"-\n-\n-\n-\n-\n-\n";
 
-/// Makes the model's first commit in a new volume. Each file is created under
-/// another name and renamed, because a file just created is what an atomic save
-/// renames (the model's a to d never are: `fresh`, git-model.md §7).
-pub fn seed(volume: &mut Volume) -> Result<(), Error> {
+/// Makes the model's first commit in a new volume, in its root `root`. Each file
+/// is created under another name and renamed, because a file just created is what
+/// an atomic save renames (the model's a to d never are: `fresh`, git-model.md §7).
+pub fn seed(volume: &mut Volume, root: &str) -> Result<(), Error> {
     for path in SEEDED {
         let new = format!("{path}.new");
-        let h = volume.write_open(ENGINE_ROOT, &new, "agentfs-seed", true)?;
+        let h = volume.write_open(root, &new, "agentfs-seed", true)?;
         volume.write(h, 0, SEED_BYTES, false)?;
         volume.close(h)?;
-        volume.rename(ENGINE_ROOT, &new, path, "agentfs-seed")?;
+        volume.rename(root, &new, path, "agentfs-seed")?;
     }
     Ok(())
 }
@@ -35,19 +35,19 @@ pub(crate) fn fail(e: Error) -> CallError {
 pub struct Library {
     volume: Option<Volume>,
     dir: PathBuf,
-    forks: Vec<String>,
+    names: EngineNames,
     owners: BTreeMap<u64, Caller>,
 }
 
 impl Library {
-    /// A new volume at `dir`, seeded.
-    pub fn new(dir: &Path) -> Result<Self, CallError> {
+    /// A new volume at `dir`, seeded, its trees named by `names`.
+    pub fn new(dir: &Path, names: EngineNames) -> Result<Self, CallError> {
         let mut volume = Volume::open(dir).map_err(fail)?;
-        seed(&mut volume).map_err(fail)?;
+        seed(&mut volume, names.name(TreeId::ROOT)?).map_err(fail)?;
         Ok(Self {
             volume: Some(volume),
             dir: dir.to_owned(),
-            forks: Vec::new(),
+            names,
             owners: BTreeMap::new(),
         })
     }
@@ -69,22 +69,11 @@ impl Library {
             .ok_or_else(|| CallError::new("the volume is down"))
     }
 
-    fn tree(&self, t: TreeId) -> Result<&str, CallError> {
-        match t.number() {
-            0 => Ok(ENGINE_ROOT),
-            f => self
-                .forks
-                .get((f as usize).wrapping_sub(1))
-                .map(String::as_str)
-                .ok_or_else(|| CallError::new(format!("no fork {f}"))),
-        }
-    }
-
     /// The tree and writer label of a caller, owned: calls take `&mut self`.
     fn who(&self, c: &Caller) -> Result<(String, String), CallError> {
         Ok(match c {
-            Caller::Root(n) => (ENGINE_ROOT.to_owned(), n.clone()),
-            Caller::Fork(f) => (self.tree(*f)?.to_owned(), format!("c{f}")),
+            Caller::Root(n) => (self.names.name(TreeId::ROOT)?.to_owned(), n.clone()),
+            Caller::Fork(f) => (self.names.name(*f)?.to_owned(), format!("c{f}")),
         })
     }
 
@@ -104,8 +93,7 @@ impl TreeCalls for Library {
 
     fn fork(&mut self) -> Result<TreeId, CallError> {
         let name = self.v_mut()?.fork().map_err(fail)?;
-        self.forks.push(name);
-        Ok(TreeId::new(self.forks.len() as u32))
+        self.names.forked(name)
     }
 
     fn open_write(&mut self, c: &Caller, path: &str) -> Result<u64, CallError> {
@@ -168,7 +156,7 @@ impl TreeCalls for Library {
     }
 
     fn take_next(&mut self, t: TreeId) -> Result<Took, CallError> {
-        let tree = self.tree(t)?.to_owned();
+        let tree = self.names.name(t)?.to_owned();
         Ok(match self.v_mut()?.take_next(&tree).map_err(fail)? {
             tree_actor::Took::Taken => Took::Taken,
             tree_actor::Took::Waiting => Took::Waiting,
@@ -185,7 +173,7 @@ impl TreeCalls for Library {
     }
 
     fn read(&self, t: TreeId, path: &str) -> Result<Option<Vec<u8>>, CallError> {
-        match self.v()?.read(self.tree(t)?, path) {
+        match self.v()?.read(self.names.name(t)?, path) {
             Ok(b) => Ok(Some(b.to_vec())),
             Err(Error::NotFound) => Ok(None),
             Err(e) => Err(fail(e)),
@@ -195,7 +183,7 @@ impl TreeCalls for Library {
     fn paths(&self, t: TreeId) -> Result<Vec<String>, CallError> {
         let mut paths: Vec<String> = self
             .v()?
-            .files(self.tree(t)?)
+            .files(self.names.name(t)?)
             .map_err(fail)?
             .into_iter()
             .map(|(p, _, _)| p)

@@ -378,7 +378,19 @@ them unchanged and records each call plus what each tree showed (`src/calls.rs`)
 real library and real mounts (`crates/agentfs-conformance`); the real run must show the same, and passes invariants
 of its own.** Those read `git`, the crate's own parse of `metadata.json` and `namespace.json` and its own byte
 oracle, never the library's bookkeeping. Assertions reach the real system only through that equality, so only for
-what a trace's `Shown` exposes: each tree's files, and the lost lines of each collision.
+what a trace's `Shown` exposes: each tree's files, and the lost lines of each collision, and for a take that took,
+its tree's head (`Agentfs-Cause` and the number of parents).
+
+The replay (`calls::replay`) is also the recorder's first source: it gives each call, with what the system answered
+and then showed, to a sink (`calls::Sink`; `calls::Recorder` keeps them as a trace), stopping after the first call
+that differs from the trace. A failed call is kept, written ` !<errno>` after the call (` !-` without one), and a
+replay of it must fail with the same errno. So what the library or a mount did is a trace the model replays (below,
+"A regression found on the engine"). Every hand scenario of `crates/agentfs-conformance/tests/replay.rs` checks that
+the model's and the library's recordings equal the trace they replayed. To make each record whole, the replay reads
+every tree made so far and the collisions after every call, not only the trees the trace lists: a read that fails
+fails that call, and a replay costs a read of every tree per call. A call the trace cannot make (an open number it
+never opened) is an error, not a record, since no system answered it. The only failed calls shown so far are the
+unit tests' scripted ones: no test yet records a library or mount failure and replays it in the model.
 
 ```sh
 # Record (the same run CI makes), then replay. Without Linux and /dev/fuse, mounts stay NOT RUN.
@@ -411,7 +423,7 @@ What a replay decides, each reported rather than hidden:
 | R1.4 mappings | no mmap call | page-cache job |
 | R9, R9.7: a client call waiting on a take | none in the model, whose take is one step; the replay order stands for it, and only `Waiting` of takes is compared | mounted P1/P2 cases, finite, no seeds |
 | R12 mid-step or with unsynced loss | crash between calls only | recording-faults, power-loss jobs |
-| ENOSPC, EIO | no injected failure; `errno` compared only library against mount | enospc job |
+| ENOSPC, EIO | no injected failure; a failed call's `errno` is compared and recorded | enospc job |
 | Trace with two forks | library only (§18 asks one fork) | - |
 | Automatic takes (R1) | a mount takes only through the gate | mounted P1/P2 cases |
 | R1.3 an open's own read, R1.1 another reader | no calls: the replay makes neither read, so nothing compares them | byte and page-cache jobs |
@@ -432,3 +444,49 @@ its small reproduction is an ignored test in `crates/agentfs-conformance/tests/r
 
 The model and the library share the alignment's call (`agentfs_align`): one environment and one program lookup, so a replay runs one
 release of `git` on both sides. Identities depend on the release, so `ci/git-release` pins one for the image and for CI, and `ci/check-tree-git.sh` fails on another (R10.10).
+
+## A regression found on the engine
+
+A mismatch on the library or a mount is first a question: which side is wrong? Its recording answers it in the model.
+The recording is the engine's own record of the calls, through the first that differs, with what the engine showed.
+
+```sh
+# Record: what the library (or a mount) did with each trace, into an empty OUT.
+phase1-replay library "$T" --min-scenarios 0 --min-seeds 0 --only NAME --record "$OUT"
+# Replay it in the model: it fails at the call where the engine left the rules.
+phase1-replay model "$OUT" --min-scenarios 0 --min-seeds 0 --only NAME
+```
+
+The phase 1 jobs record their replays this way. `ci/e2e-tree-replay.sh` replays each mount's recording on a fresh
+model at the mount's floors, whether or not the mounts passed, and exits with the mounts' status, or else the
+model's. A mount that differs in what the trees show then fails in the model at that call too, with the model's
+answer in the log; one that broke only an engine invariant passes there. When every mount passes, each recording
+equals its trace, and the step repeats the model's own replay. The seed shards keep the library's recordings beside
+the traces (`ci/replay-seeds.sh`), for replay by hand. Both are in the jobs' artifacts, so a mismatch arrives as an
+engine trace to replay.
+
+A fixed regression is kept as a fixture in `crates/agentfs-conformance/tests/regressions/`, with a test in
+`tests/regressions.rs` that asserts two things. The model fails the fixture at its call, agreeing with every record
+before it, and shows there what the regression lost. Today's library makes the fixture's calls as recorded up to that
+call, and there makes the model's own record. The first proves the model catches the regression; the second proves
+the fix holds and the fixture is not stale. Beside each fixture, a `.patch` removes its fix; its header names the
+base it applies to and the commands that recorded the fixture.
+
+- **Record a fixture** once, on a scratch copy of the engine with the fix removed (`git worktree add`; its own cargo
+  target or `MODEL_TARGET_VOLUME`, since every copy mounts at `/src`): write the model's trace of the scenario that
+  found it (`AGENTFS_MODEL_TRACE_DIR=$T cargo test --locked -p agentfs-conformance --test replay NAME`), confirm the
+  copy fails that test, then `cargo run --locked -p agentfs-conformance --bin phase1-replay -- library "$T" ... --only
+  NAME --record "$OUT"` (it exits 1 at the regression's call and still writes the recording; `$OUT` must be empty) and
+  copy `$OUT/NAME.trace` into `tests/regressions/`. Through `ci/model-docker.sh`, run a command with a leading variable
+  under `sh -c`, and the copy too, since `/work` is a Docker volume; the finding-51 `.patch` header has the exact lines. Commit the trace and, as `<fixture>.patch`, the diff that removed the fix, its header naming
+  the base commit and the commands. Record with the release of git in `ci/git-release`, through
+  `ci/model-docker.sh`: line identities depend on it, so the tests may fail on another release.
+- **Re-record** when an unrelated engine change makes the second test fail before the fixture's call: apply the
+  `.patch` to a scratch copy of today's engine (rebase it if it no longer applies, and update its header), and run its
+  header's commands, in the same commit, with the regression still failing at its call.
+- **Retire** the fixture and its test with the ledger change, if an approved rule change makes the model agree with
+  the recording at that call.
+
+The fixture of finding 51 is the library without the shows-the-same guard of a sync's fast-forward (introduced in
+`6049b1b`, fixed in `e9ab747`), on `finding_51_a_sync_that_cannot_show_the_upstreams_commit_merges`: the model
+fails it at call 15, the fork's sync, where the engine's fork lost its saved line.

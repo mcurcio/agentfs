@@ -7,7 +7,7 @@
 //! so a take crosses FUSE at that point and needs no poll. Cost: this replay never
 //! exercises automatic takes (R1); the mounted P1 and P2 cases cover those.
 
-use crate::ENGINE_ROOT;
+use crate::engine_names::EngineNames;
 use crate::library::{fail, seed};
 use agentfs_core::tree_actor::Volume;
 use agentfs_model::calls::{CallError, Caller, Took, TreeCalls, TreeId};
@@ -46,7 +46,8 @@ pub struct Mounted {
     root: PathBuf,
     sandbox: PathBuf,
     gate: PathBuf,
-    fork: Option<String>,
+    /// The root's name, and the sandbox's fork when there is one.
+    names: EngineNames,
     fork_used: bool,
     child: Option<Child>,
     go: File,
@@ -58,11 +59,13 @@ pub struct Mounted {
 
 impl Mounted {
     /// Seeds a volume under `work`, forks if the trace does (`mountable` puts that
-    /// fork before any client call) and mounts it. `appends`: for each open the
-    /// trace makes, in order, whether it appends ([`crate::opens_that_append`]).
+    /// fork before any client call) and mounts it, its trees named by `names`.
+    /// `appends`: for each open the trace makes, in order, whether it appends
+    /// ([`crate::opens_that_append`]).
     pub fn new(
         bin: &Path,
         work: &Path,
+        mut names: EngineNames,
         with_sandbox: bool,
         appends: Vec<bool>,
     ) -> Result<Self, CallError> {
@@ -75,15 +78,13 @@ impl Mounted {
         for dir in [&root, &sandbox, &gate] {
             std::fs::create_dir_all(dir).map_err(|e| io_fail("mkdir", &e))?;
         }
-        let fork = {
+        {
             let mut volume = Volume::open(&state).map_err(fail)?;
-            seed(&mut volume).map_err(fail)?;
+            seed(&mut volume, names.name(TreeId::ROOT)?).map_err(fail)?;
             if with_sandbox {
-                Some(volume.fork().map_err(fail)?)
-            } else {
-                None
+                names.forked(volume.fork().map_err(fail)?)?;
             }
-        };
+        }
         for fifo in ["go", "took"] {
             let path = c_path(&gate.join(fifo))?;
             // SAFETY: `path` is a valid C string for the call's duration.
@@ -107,7 +108,7 @@ impl Mounted {
             root,
             sandbox,
             gate,
-            fork,
+            names,
             fork_used: false,
             child: None,
             go,
@@ -126,7 +127,7 @@ impl Mounted {
 
     fn mountpoints(&self) -> Vec<PathBuf> {
         let mut points = vec![self.root.clone()];
-        if self.fork.is_some() {
+        if self.sandbox_fork().is_some() {
             points.push(self.sandbox.clone());
         }
         points
@@ -148,7 +149,7 @@ impl Mounted {
             .stdin(Stdio::null())
             .stdout(log.try_clone().map_err(|e| io_fail("mount log", &e))?)
             .stderr(log);
-        if let Some(fork) = &self.fork {
+        if let Some(fork) = self.sandbox_fork() {
             command
                 .arg("--sandbox")
                 .arg(&self.sandbox)
@@ -180,6 +181,11 @@ impl Mounted {
     /// What the mount process printed.
     pub fn log_text(&self) -> String {
         std::fs::read_to_string(&self.log).unwrap_or_default()
+    }
+
+    /// The sandbox's fork, the one `mountable` allows, if `new` made it.
+    fn sandbox_fork(&self) -> Option<&str> {
+        self.names.name(TreeId::new(1)).ok()
     }
 
     fn root(&self, t: TreeId) -> &Path {
@@ -283,7 +289,7 @@ impl TreeCalls for Mounted {
 
     /// `new` made the one fork `mountable` allows.
     fn fork(&mut self) -> Result<TreeId, CallError> {
-        if self.fork.is_none() || self.fork_used {
+        if self.sandbox_fork().is_none() || self.fork_used {
             return Err(CallError::new("not a mountable trace"));
         }
         self.fork_used = true;
@@ -369,13 +375,7 @@ impl TreeCalls for Mounted {
     }
 
     fn take_next(&mut self, t: TreeId) -> Result<Took, CallError> {
-        let tree = match t {
-            TreeId::ROOT => ENGINE_ROOT.to_owned(),
-            _ => self
-                .fork
-                .clone()
-                .ok_or_else(|| CallError::new("no sandbox"))?,
-        };
+        let tree = self.names.name(t)?.to_owned();
         writeln!(self.go, "{tree}").map_err(|e| io_fail("ask the gate", &e))?;
         let mut answer = String::new();
         self.took

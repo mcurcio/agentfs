@@ -3,7 +3,7 @@
 //! only: no mount.
 use agentfs_conformance::{against_library, against_model};
 use agentfs_model::calls::{
-    Caller, Client, Recorded, RecordedCall, Took, TreeCalls, TreeId, parse, render,
+    Caller, Client, Recorded, RecordedCall, Recorder, Took, TreeCalls, TreeId, parse, render,
 };
 use agentfs_model::recording::Write;
 use agentfs_model::world::{MODEL_ROOT, Policies, TreeNames, World};
@@ -46,10 +46,20 @@ fn drain(w: &mut World) {
     }
 }
 
+/// The trace replays on a fresh model and on the library, and what each recorded is
+/// the trace itself: the recorder loses nothing a trace holds.
 fn passes(w: &World) {
     let trace = parse(&render(w.trace())).unwrap();
-    against_model(&trace).unwrap();
-    against_library(&trace).unwrap();
+    let mut on_model = Recorder::default();
+    against_model(&trace, &mut on_model).unwrap();
+    assert_eq!(on_model.trace(), trace.as_slice(), "the model's recording");
+    let mut on_library = Recorder::default();
+    against_library(&trace, &mut on_library).unwrap();
+    assert_eq!(
+        on_library.trace(),
+        trace.as_slice(),
+        "the library's recording"
+    );
 }
 
 /// R3b and R3e: a collision through the real library, its record compared.
@@ -81,7 +91,7 @@ fn a_changed_byte_in_the_trace_is_a_mismatch() {
         .and_then(|t| t.get_mut("c"))
         .unwrap();
     file[0] = b'!';
-    let e = against_library(&trace).unwrap_err();
+    let e = against_library(&trace, &mut Recorder::default()).unwrap_err();
     assert!(e.contains("T0:c"), "{e}");
 }
 

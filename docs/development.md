@@ -424,8 +424,11 @@ evidence. CI scripts judge the build:
   plain Linux file.
 - `phase1-replay` and `e2e-tree-replay.sh`: the model's in-scope scenarios
   and seeds replayed on a fresh model, the library and real mounts,
-  comparing each tree and each collision's lost lines, with invariants
-  read from git
+  comparing each tree, each collision's lost lines and each take's head,
+  with invariants read from git. `--record` writes what the system did with
+  each trace, a trace the model replays: each mount's recording replays on a
+  fresh model, and a recorded regression is a fixture in
+  `crates/agentfs-conformance/tests/regressions`
   ([VERIFYING.md](../crates/agentfs-model/VERIFYING.md)).
 - `e2e-tree-pagecache.sh`: shared mappings in 21 cases, `trees-mmap`, 64
   closes reopened.

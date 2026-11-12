@@ -58,7 +58,7 @@ jobs:
         run: target/debug/phase1-replay library "$RUNNER_TEMP/traces" --min-scenarios 74 --min-seeds 94
       - run: cargo build --locked -p agentfs --features failpoints
       - name: replay on mounts
-        run: ci/e2e-tree-replay.sh "$RUNNER_TEMP/traces" 71 16
+        run: ci/e2e-tree-replay.sh "$RUNNER_TEMP/traces" 71 16 "$RUNNER_TEMP/recorded"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         if: always()
         with:
@@ -67,6 +67,7 @@ jobs:
             ${{ runner.temp }}/conformance.json
             ${{ runner.temp }}/conformance.log
             ${{ runner.temp }}/traces/*.trace
+            ${{ runner.temp }}/recorded/*.trace
 
   # `[phase1-seeds]` in the pushed commit message, or a manual run: the library's
   # replay of the phase 1 generators at seeds 1 to 500. Four jobs of about an hour's

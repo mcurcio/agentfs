@@ -6,6 +6,11 @@
 //! tree showed after it ([`Recorded`]). [`replay`] makes the same calls of any
 //! [`TreeCalls`], and that system must show the same.
 //!
+//! [`replay`] is also a source for the recorder: it gives each call, with what the
+//! system answered and showed, to a [`Sink`], and [`Recorder`] keeps them as a
+//! trace. So what the real system did is a trace the model replays (VERIFYING.md,
+//! "A regression found on the engine"). A failed call is kept with its errno.
+//!
 //! A take is one atomic step in the model, as in the real system (the owner,
 //! 2026-11-08, finding 49: "B"): [`TreeCalls::take_next`] chooses its entry,
 //! locks its files and writes them, and no call runs in between. So the trace
@@ -200,14 +205,84 @@ pub enum RecordedCall {
     OutOfScope(&'static str),
 }
 
-/// One recorded call with what the trees showed after it. `head`, for a take that
-/// took an entry: the moved tree's head's `Agentfs-Cause` and its number of parents,
-/// so a replay also compares the commit graph, a merge against a fast-forward (R6.1).
+/// A call the system failed, as a trace keeps it: the errno a program reads, or
+/// none. The message is the system's own and is not kept. Rendered after the call
+/// as ` !<errno>`, or ` !-` without one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Failed {
+    pub errno: Option<i32>,
+}
+
+impl From<&CallError> for Failed {
+    fn from(e: &CallError) -> Failed {
+        Failed { errno: e.errno }
+    }
+}
+
+impl fmt::Display for Failed {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.errno {
+            Some(n) => write!(f, "errno {n}"),
+            None => f.write_str("no errno"),
+        }
+    }
+}
+
+/// One recorded call with what the trees showed after it. `failed`: the call
+/// failed; a failed open holds no open, so a later call on its `h` is a mismatch.
+/// `head`, for a take that took an entry: the moved tree's head's `Agentfs-Cause`
+/// and its number of parents, so a replay also compares the commit graph, a merge
+/// against a fast-forward (R6.1).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Recorded {
     pub call: RecordedCall,
+    pub failed: Option<Failed>,
     pub shown: Option<Shown>,
     pub head: Option<(String, usize)>,
+}
+
+/// The recorder's port: the one entry every source feeds, each call as it
+/// returns, a failed call included, with what the system showed after it. A
+/// sink keeps what it is given; it never calls a system and never judges.
+/// Today's source is the harness ([`replay`]); the engine's own events feed the
+/// same entry later (`docs/target-architecture/future/module-cut.md`).
+pub trait Sink {
+    fn record(&mut self, r: Recorded);
+}
+
+/// The recorder: the one sink. Keeps each record in the order it arrived;
+/// [`render`] writes it as a trace.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Recorder {
+    trace: Vec<Recorded>,
+}
+
+impl Recorder {
+    /// The records so far, in order.
+    pub fn trace(&self) -> &[Recorded] {
+        &self.trace
+    }
+
+    pub fn into_trace(self) -> Vec<Recorded> {
+        self.trace
+    }
+}
+
+impl Sink for Recorder {
+    fn record(&mut self, r: Recorded) {
+        self.trace.push(r);
+    }
+}
+
+/// What a system's history tells that its trees do not, read by a source after
+/// each call. `system` is given so the model answers from itself; a real
+/// system's history reads git and ignores it.
+pub trait History<T: ?Sized> {
+    /// Every collision so far, as [`gather_collisions`] gives them.
+    fn collisions(&mut self, system: &T) -> Result<Vec<ShownCollision>, CallError>;
+    /// Tree `t`'s head: its `Agentfs-Cause` trailer and its number of parents
+    /// (R6.1, R6.2).
+    fn head(&mut self, system: &T, t: TreeId) -> Result<(String, usize), CallError>;
 }
 
 /// What the trees show: each tree's files by path, and every collision so far.
@@ -527,13 +602,20 @@ fn parse_shown(s: &str) -> Result<Shown, CallError> {
     Ok(shown)
 }
 
-/// One line per call, hex bytes, no serde: `<call>`, then ` ^<cause>:<parents>` when
-/// the call moved a tree's head, then ` |` and, when the call has one, what the
-/// trees showed.
+/// One line per call, hex bytes, no serde: `<call>`, then ` !<errno>` (` !-`
+/// without one) when the call failed, then ` ^<cause>:<parents>` when the call
+/// moved a tree's head, then ` |` and, when the call has one, what the trees
+/// showed.
 pub fn render(trace: &[Recorded]) -> String {
     let mut out = String::new();
     for r in trace {
         out.push_str(&render_call(&r.call));
+        if let Some(f) = &r.failed {
+            match f.errno {
+                Some(n) => out.push_str(&format!(" !{n}")),
+                None => out.push_str(" !-"),
+            }
+        }
         if let Some((cause, parents)) = &r.head {
             out.push_str(&format!(" ^{cause}:{parents}"));
         }
@@ -563,8 +645,19 @@ pub fn parse(text: &str) -> Result<Vec<Recorded>, CallError> {
                 }
                 None => (call, None),
             };
+            let (call, failed) = match call.split_once(" !") {
+                Some((c, "-")) => (c, Some(Failed { errno: None })),
+                Some((c, n)) => {
+                    let errno = n
+                        .parse()
+                        .map_err(|_| CallError::new(format!("bad errno {n:?}")))?;
+                    (c, Some(Failed { errno: Some(errno) }))
+                }
+                None => (call, None),
+            };
             Ok(Recorded {
                 call: parse_call(call)?,
+                failed,
                 shown,
                 head,
             })
@@ -572,112 +665,227 @@ pub fn parse(text: &str) -> Result<Vec<Recorded>, CallError> {
         .collect()
 }
 
-fn compare_trees<T: TreeCalls>(t: &T, shown: &Shown) -> Result<(), String> {
-    for (id, files) in &shown.trees {
-        let paths = t.paths(*id).map_err(|e| e.to_string())?;
-        let want: Vec<&String> = files.keys().collect();
-        if paths.iter().collect::<Vec<_>>() != want {
-            return Err(format!("{id:?} shows paths {paths:?}, the trace {want:?}"));
+/// Every tree in `trees`, by path, as `t` shows it.
+fn read_trees<T: TreeCalls>(
+    t: &T,
+    trees: &[TreeId],
+) -> Result<BTreeMap<TreeId, BTreeMap<String, Vec<u8>>>, CallError> {
+    let mut out = BTreeMap::new();
+    for id in trees {
+        let mut files = BTreeMap::new();
+        for p in t.paths(*id)? {
+            if let Some(bytes) = t.read(*id, &p)? {
+                files.insert(p, bytes);
+            }
+        }
+        out.insert(*id, files);
+    }
+    Ok(out)
+}
+
+/// The first tree the trace lists that `got` shows otherwise.
+fn compare_trees(got: &Shown, want: &Shown) -> Result<(), String> {
+    for (id, files) in &want.trees {
+        let Some(shows) = got.trees.get(id) else {
+            return Err(format!("{id:?} is no tree the system made"));
+        };
+        let (paths, want_paths): (Vec<&String>, Vec<&String>) =
+            (shows.keys().collect(), files.keys().collect());
+        if paths != want_paths {
+            return Err(format!(
+                "{id:?} shows paths {paths:?}, the trace {want_paths:?}"
+            ));
         }
         for (p, want) in files {
-            let got = t.read(*id, p).map_err(|e| e.to_string())?;
-            if got.as_deref() != Some(want.as_slice()) {
+            let got = shows.get(p);
+            if got != Some(want) {
                 return Err(format!(
                     "{id:?}:{p} shows {:?}, the trace {:?}",
-                    got.as_deref().map(String::from_utf8_lossy),
+                    got.map(|b| String::from_utf8_lossy(b)),
                     String::from_utf8_lossy(want)
                 ));
             }
         }
     }
+    if got.collisions != want.collisions {
+        return Err(format!(
+            "collisions: the system recorded {:?}, the trace {:?}",
+            got.collisions, want.collisions
+        ));
+    }
     Ok(())
 }
 
-/// Makes the trace's calls of `t`. A failed call, a different [`Took`] or
-/// different trees is an `Err` naming the call. `each` runs after every call,
-/// for what the trait does not expose (the collisions, the invariants).
-pub fn replay<T: TreeCalls>(
-    trace: &[Recorded],
+/// Makes one call of `t`: the call as the system answered it (a fork's number, a
+/// take's [`Took`]) and its result. An `Err` is no call the system answered.
+fn make_call<T: TreeCalls>(
+    want: &RecordedCall,
     t: &mut T,
+    opens: &mut BTreeMap<u64, Option<T::Open>>,
+    trees: &mut Vec<TreeId>,
+) -> Result<(RecordedCall, Result<(), CallError>), String> {
+    let open = |opens: &BTreeMap<u64, Option<T::Open>>, h: u64| {
+        opens.get(&h).copied().ok_or_else(|| format!("no open {h}"))
+    };
+    let opened = |opens: &mut BTreeMap<u64, Option<T::Open>>, h: u64, o| match o {
+        Ok(o) => {
+            opens.insert(h, Some(o));
+            Ok(())
+        }
+        Err(e) => {
+            opens.remove(&h);
+            Err(e)
+        }
+    };
+    let result = match want {
+        RecordedCall::Fork { .. } => {
+            return Ok(match t.fork() {
+                Ok(id) => {
+                    trees.push(id);
+                    (RecordedCall::Fork { id }, Ok(()))
+                }
+                Err(e) => (want.clone(), Err(e)),
+            });
+        }
+        RecordedCall::OpenWrite { caller, path, h } => {
+            opened(opens, *h, t.open_write(caller, path))
+        }
+        RecordedCall::OpenTrunc { caller, path, h } => {
+            opened(opens, *h, t.open_trunc(caller, path))
+        }
+        RecordedCall::Create { caller, path, h } => opened(opens, *h, t.create(caller, path)),
+        RecordedCall::OpenGone { h } => {
+            opens.insert(*h, None);
+            Ok(())
+        }
+        RecordedCall::Pwrite { h, offset, bytes } => match open(opens, *h)? {
+            Some(o) => t.pwrite(o, *offset, bytes),
+            None => Ok(()),
+        },
+        RecordedCall::Append { h, bytes } => match open(opens, *h)? {
+            Some(o) => t.append(o, bytes),
+            None => Ok(()),
+        },
+        RecordedCall::Truncate { h, size } => match open(opens, *h)? {
+            Some(o) => t.truncate(o, *size),
+            None => Ok(()),
+        },
+        RecordedCall::Close { h } => {
+            let closed = match open(opens, *h)? {
+                Some(o) => t.close(o),
+                None => Ok(()),
+            };
+            opens.remove(h);
+            closed
+        }
+        RecordedCall::Unlink { caller, path } => t.unlink(caller, path),
+        RecordedCall::Rename { caller, from, to } => t.rename(caller, from, to),
+        RecordedCall::EndClient { caller } => t.end_client(caller),
+        RecordedCall::Take { tree, .. } => {
+            return Ok(match t.take_next(*tree) {
+                Ok(took) => (RecordedCall::Take { tree: *tree, took }, Ok(())),
+                Err(e) => (want.clone(), Err(e)),
+            });
+        }
+        RecordedCall::Crash => {
+            let crashed = t.crash();
+            opens.clear();
+            crashed
+        }
+        RecordedCall::OutOfScope(why) => return Err(format!("out of scope: {why}")),
+    };
+    Ok((want.clone(), result))
+}
+
+/// How the system's record differs from the trace's, before what it showed.
+fn compare_call(got: &Recorded, want: &Recorded, error: Option<&CallError>) -> Result<(), String> {
+    match (&want.failed, error) {
+        (None, Some(e)) => return Err(e.to_string()),
+        (Some(f), None) => return Err(format!("the system did it, the trace failed ({f})")),
+        (Some(f), Some(e)) if *f != Failed::from(e) => {
+            return Err(format!("{e}, the trace failed ({f})"));
+        }
+        _ => {}
+    }
+    match (&got.call, &want.call) {
+        (RecordedCall::Fork { id }, RecordedCall::Fork { id: want }) if id != want => {
+            Err(format!("the system's fork is {id:?}"))
+        }
+        (RecordedCall::Take { took, .. }, RecordedCall::Take { took: want, .. })
+            if took != want =>
+        {
+            Err(format!("the system answered {took:?}"))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Source A, the harness: makes the trace's calls of `system` and gives `sink`
+/// each one with what the system returned and then showed: every tree made so
+/// far by path, `history`'s collisions, and for a take that took, the tree's
+/// head. A fork's `id` and a take's `took` are the system's answers; open
+/// numbers `h` are the trace's.
+///
+/// Stops at the first record that differs from the trace's, after giving it to
+/// `sink`: failed or not and the errno, a take's `took`, a fork's number, a
+/// listed tree's paths or bytes, the collisions (both only when the trace's
+/// record has a shown part), the head (when the trace has one). Then `each`
+/// runs, for the real system's own invariants. Errors name the call, "call {i}
+/// ({call}): {difference}". `OpenGone` makes no call; `OutOfScope` is an error,
+/// and so is a call the trace cannot make (an open number it never opened): the
+/// sink gets neither, since no system answered.
+///
+/// After every call it reads every tree made so far and the collisions, whether
+/// or not the trace lists them, so the record is whole: a read that fails fails
+/// the call, and each call costs a read of every tree.
+pub fn replay<T: TreeCalls, H: History<T>, S: Sink + ?Sized>(
+    trace: &[Recorded],
+    system: &mut T,
+    history: &mut H,
+    sink: &mut S,
     each: &mut dyn FnMut(&T, &Recorded) -> Result<(), String>,
 ) -> Result<(), String> {
     let mut opens: BTreeMap<u64, Option<T::Open>> = BTreeMap::new();
-    for (i, r) in trace.iter().enumerate() {
-        let at = |e: &dyn fmt::Display| format!("call {i} ({}): {e}", render_call(&r.call));
-        let open = |opens: &BTreeMap<u64, Option<T::Open>>, h: u64| {
-            opens
-                .get(&h)
-                .copied()
-                .ok_or_else(|| at(&format!("no open {h}")))
+    let mut trees = vec![TreeId::ROOT];
+    for (i, want) in trace.iter().enumerate() {
+        let at = |e: &dyn fmt::Display| format!("call {i} ({}): {e}", render_call(&want.call));
+        let (call, result) =
+            make_call(&want.call, system, &mut opens, &mut trees).map_err(|e| at(&e))?;
+        let shown = read_trees(system, &trees).and_then(|trees| {
+            Ok(Shown {
+                trees,
+                collisions: history.collisions(system)?,
+            })
+        });
+        let head = match call {
+            RecordedCall::Take {
+                tree,
+                took: Took::Taken,
+            } => history.head(system, tree).map(Some),
+            _ => Ok(None),
         };
-        match &r.call {
-            RecordedCall::Fork { id } => {
-                let got = t.fork().map_err(|e| at(&e))?;
-                if got != *id {
-                    return Err(at(&format!("the system's fork is {got:?}")));
-                }
-            }
-            RecordedCall::OpenWrite { caller, path, h } => {
-                let o = t.open_write(caller, path).map_err(|e| at(&e))?;
-                opens.insert(*h, Some(o));
-            }
-            RecordedCall::OpenTrunc { caller, path, h } => {
-                let o = t.open_trunc(caller, path).map_err(|e| at(&e))?;
-                opens.insert(*h, Some(o));
-            }
-            RecordedCall::Create { caller, path, h } => {
-                let o = t.create(caller, path).map_err(|e| at(&e))?;
-                opens.insert(*h, Some(o));
-            }
-            RecordedCall::OpenGone { h } => {
-                opens.insert(*h, None);
-            }
-            RecordedCall::Pwrite { h, offset, bytes } => {
-                if let Some(o) = open(&opens, *h)? {
-                    t.pwrite(o, *offset, bytes).map_err(|e| at(&e))?;
-                }
-            }
-            RecordedCall::Append { h, bytes } => {
-                if let Some(o) = open(&opens, *h)? {
-                    t.append(o, bytes).map_err(|e| at(&e))?;
-                }
-            }
-            RecordedCall::Truncate { h, size } => {
-                if let Some(o) = open(&opens, *h)? {
-                    t.truncate(o, *size).map_err(|e| at(&e))?;
-                }
-            }
-            RecordedCall::Close { h } => {
-                if let Some(o) = open(&opens, *h)? {
-                    t.close(o).map_err(|e| at(&e))?;
-                }
-                opens.remove(h);
-            }
-            RecordedCall::Unlink { caller, path } => {
-                t.unlink(caller, path).map_err(|e| at(&e))?;
-            }
-            RecordedCall::Rename { caller, from, to } => {
-                t.rename(caller, from, to).map_err(|e| at(&e))?;
-            }
-            RecordedCall::EndClient { caller } => {
-                t.end_client(caller).map_err(|e| at(&e))?;
-            }
-            RecordedCall::Take { tree, took } => {
-                let got = t.take_next(*tree).map_err(|e| at(&e))?;
-                if got != *took {
-                    return Err(at(&format!("the system answered {got:?}")));
-                }
-            }
-            RecordedCall::Crash => {
-                t.crash().map_err(|e| at(&e))?;
-                opens.clear();
-            }
-            RecordedCall::OutOfScope(why) => return Err(at(&format!("out of scope: {why}"))),
+        let got = Recorded {
+            call,
+            failed: result.as_ref().err().map(Failed::from),
+            shown: shown.as_ref().ok().cloned(),
+            head: head.as_ref().ok().cloned().flatten(),
+        };
+        sink.record(got.clone());
+        compare_call(&got, want, result.as_ref().err()).map_err(|e| at(&e))?;
+        let shown = shown.map_err(|e| at(&e))?;
+        if let Some(want) = &want.shown {
+            compare_trees(&shown, want).map_err(|e| at(&e))?;
         }
-        if let Some(shown) = &r.shown {
-            compare_trees(t, shown).map_err(|e| at(&e))?;
+        let head = head.map_err(|e| at(&e))?;
+        if let (Some(want), RecordedCall::Take { tree, .. }) = (&want.head, &got.call)
+            && head.as_ref() != Some(want)
+        {
+            let head = head.map_or_else(|| "none".to_owned(), |h| format!("{h:?}"));
+            return Err(at(&format!(
+                "history_shape: {tree:?}'s head is {head}, the trace {want:?}"
+            )));
         }
-        each(t, r).map_err(|e| at(&e))?;
+        each(system, want).map_err(|e| at(&e))?;
     }
     Ok(())
 }
@@ -726,18 +934,40 @@ mod tests {
             .into_iter()
             .map(|call| Recorded {
                 call,
+                failed: None,
                 shown: Some(shown.clone()),
                 head: None,
             })
-            .chain([Recorded {
-                call: RecordedCall::Take {
-                    tree: TreeId::ROOT,
-                    took: Took::Taken,
+            .chain([
+                Recorded {
+                    call: RecordedCall::Take {
+                        tree: TreeId::ROOT,
+                        took: Took::Taken,
+                    },
+                    failed: None,
+                    shown: None,
+                    head: Some(("Sync".into(), 2)),
                 },
-                shown: None,
-                head: Some(("Sync".into(), 2)),
-            }])
+                Recorded {
+                    call: RecordedCall::Unlink {
+                        caller: Caller::Fork(TreeId::new(1)),
+                        path: "a".into(),
+                    },
+                    failed: Some(Failed { errno: Some(2) }),
+                    shown: Some(shown.clone()),
+                    head: None,
+                },
+                Recorded {
+                    call: RecordedCall::Crash,
+                    failed: Some(Failed { errno: None }),
+                    shown: None,
+                    head: None,
+                },
+            ])
             .collect();
+        let text = render(&trace);
+        assert!(text.contains(" !2 |"), "{text}");
+        assert!(text.contains("crash !-\n"), "{text}");
         assert_eq!(parse(&render(&trace)).unwrap(), trace);
         assert_eq!(scope_of(&trace), Scope::OutOfScope("drop"));
     }
@@ -753,5 +983,203 @@ mod tests {
         assert!(parse_caller("f:4294967297").is_err());
         assert_eq!(parse_caller("f:3").unwrap(), Caller::Fork(TreeId::new(3)));
         assert!(parse_call("fork 0").is_err());
+    }
+
+    /// A system the replay's tests script: the root shows `a`, an open of any
+    /// other path fails with `ENOENT`, and takes answer in turn from `takes`.
+    struct Scripted {
+        forks: u32,
+        takes: Vec<Took>,
+        opens: u64,
+    }
+
+    fn scripted(takes: &[Took]) -> Scripted {
+        Scripted {
+            forks: 0,
+            takes: takes.iter().rev().copied().collect(),
+            opens: 0,
+        }
+    }
+
+    const ENOENT: i32 = 2;
+
+    impl TreeCalls for Scripted {
+        type Open = u64;
+        fn fork(&mut self) -> Result<TreeId, CallError> {
+            self.forks += 1;
+            Ok(TreeId::new(self.forks))
+        }
+        fn open_write(&mut self, _: &Caller, path: &str) -> Result<u64, CallError> {
+            if path != "a" {
+                return Err(CallError {
+                    errno: Some(ENOENT),
+                    message: format!("open of {path}"),
+                });
+            }
+            self.opens += 1;
+            Ok(self.opens)
+        }
+        fn open_trunc(&mut self, c: &Caller, path: &str) -> Result<u64, CallError> {
+            self.open_write(c, path)
+        }
+        fn create(&mut self, c: &Caller, path: &str) -> Result<u64, CallError> {
+            self.open_write(c, path)
+        }
+        fn pwrite(&mut self, _: u64, _: u64, _: &[u8]) -> Result<(), CallError> {
+            Ok(())
+        }
+        fn append(&mut self, _: u64, _: &[u8]) -> Result<(), CallError> {
+            Ok(())
+        }
+        fn truncate(&mut self, _: u64, _: u64) -> Result<(), CallError> {
+            Ok(())
+        }
+        fn close(&mut self, _: u64) -> Result<(), CallError> {
+            Ok(())
+        }
+        fn unlink(&mut self, _: &Caller, _: &str) -> Result<(), CallError> {
+            Ok(())
+        }
+        fn rename(&mut self, _: &Caller, _: &str, _: &str) -> Result<(), CallError> {
+            Ok(())
+        }
+        fn end_client(&mut self, _: &Caller) -> Result<(), CallError> {
+            Ok(())
+        }
+        fn take_next(&mut self, _: TreeId) -> Result<Took, CallError> {
+            Ok(self.takes.pop().unwrap_or(Took::Empty))
+        }
+        fn crash(&mut self) -> Result<(), CallError> {
+            Ok(())
+        }
+        fn read(&self, _: TreeId, path: &str) -> Result<Option<Vec<u8>>, CallError> {
+            Ok((path == "a").then(|| b"-\n".to_vec()))
+        }
+        fn paths(&self, _: TreeId) -> Result<Vec<String>, CallError> {
+            Ok(vec!["a".into()])
+        }
+    }
+
+    /// No collisions; every head a sync's merge.
+    struct Merges;
+
+    impl History<Scripted> for Merges {
+        fn collisions(&mut self, _: &Scripted) -> Result<Vec<ShownCollision>, CallError> {
+            Ok(Vec::new())
+        }
+        fn head(&mut self, _: &Scripted, _: TreeId) -> Result<(String, usize), CallError> {
+            Ok(("Sync".into(), 2))
+        }
+    }
+
+    fn call(call: RecordedCall) -> Recorded {
+        Recorded {
+            call,
+            failed: None,
+            shown: None,
+            head: None,
+        }
+    }
+
+    fn take(tree: TreeId, took: Took) -> RecordedCall {
+        RecordedCall::Take { tree, took }
+    }
+
+    fn open(path: &str, h: u64) -> RecordedCall {
+        RecordedCall::OpenWrite {
+            caller: Caller::Root("w".into()),
+            path: path.into(),
+            h,
+        }
+    }
+
+    fn enoent(r: Recorded) -> Recorded {
+        Recorded {
+            failed: Some(Failed {
+                errno: Some(ENOENT),
+            }),
+            ..r
+        }
+    }
+
+    fn run(trace: &[Recorded], takes: &[Took]) -> (Result<(), String>, Vec<Recorded>) {
+        let mut sink = Recorder::default();
+        let result = replay(
+            trace,
+            &mut scripted(takes),
+            &mut Merges,
+            &mut sink,
+            &mut |_, _| Ok(()),
+        );
+        (result, sink.into_trace())
+    }
+
+    /// The sink gets every call with the system's answers and what it showed: the
+    /// fork's number, a failed call, a head only for a take that took.
+    #[test]
+    fn the_sink_gets_each_call_as_the_system_answered_it() {
+        let t1 = TreeId::new(1);
+        let trace = [
+            call(RecordedCall::Fork { id: t1 }),
+            enoent(call(open("gone", 1))),
+            call(take(t1, Took::Taken)),
+            call(take(TreeId::ROOT, Took::Waiting)),
+        ];
+        let (result, got) = run(&trace, &[Took::Taken, Took::Waiting]);
+        assert_eq!(result, Ok(()));
+        let files = BTreeMap::from([("a".to_owned(), b"-\n".to_vec())]);
+        let shown = Shown {
+            trees: BTreeMap::from([(TreeId::ROOT, files.clone()), (t1, files)]),
+            collisions: Vec::new(),
+        };
+        let want: Vec<Recorded> = trace
+            .iter()
+            .map(|r| Recorded {
+                shown: Some(shown.clone()),
+                head: (r.call == take(t1, Took::Taken)).then(|| ("Sync".into(), 2)),
+                ..r.clone()
+            })
+            .collect();
+        assert_eq!(got, want);
+    }
+
+    /// The replay stops at the first difference, after the sink has it.
+    #[test]
+    fn the_replay_stops_after_the_first_difference() {
+        let trace = [
+            call(take(TreeId::ROOT, Took::Waiting)),
+            call(take(TreeId::ROOT, Took::Empty)),
+        ];
+        let (result, got) = run(&trace, &[Took::Taken, Took::Empty]);
+        assert_eq!(
+            result,
+            Err("call 0 (take t0 waiting): the system answered Taken".into())
+        );
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].call, take(TreeId::ROOT, Took::Taken));
+        assert_eq!(got[0].head, Some(("Sync".into(), 2)));
+    }
+
+    /// A failed call passes only with the trace's errno, and a later call on a
+    /// failed open is a mismatch.
+    #[test]
+    fn a_failed_call_must_fail_with_the_traces_errno() {
+        let other = Recorded {
+            failed: Some(Failed { errno: Some(13) }),
+            ..call(open("gone", 1))
+        };
+        let (result, _) = run(&[other], &[]);
+        assert!(result.unwrap_err().contains("the trace failed (errno 13)"));
+        let (result, _) = run(&[call(open("gone", 1))], &[]);
+        assert!(result.unwrap_err().contains("(errno 2)"));
+        let (result, got) = run(&[enoent(call(open("a", 1)))], &[]);
+        assert!(result.unwrap_err().contains("the system did it"));
+        assert_eq!(got[0].failed, None);
+        let after = [
+            enoent(call(open("gone", 1))),
+            call(RecordedCall::Close { h: 1 }),
+        ];
+        let (result, _) = run(&after, &[]);
+        assert_eq!(result, Err("call 1 (close 1): no open 1".into()));
     }
 }
