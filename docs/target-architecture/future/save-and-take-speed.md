@@ -15,5 +15,6 @@ files took 238 to 241 s to become visible while the large file was queued ([perf
 - Writing only the files that changed.
 - Lowering the line referee's own cost on large files.
 
-Each is a change to the tree library with a measurement before and after. None adds a performance budget until a
-release build on CI gives figures to set one from.
+Each is a change to the tree library with a measurement before and after. Milestone M1 of
+[one engine](one-engine.md) takes the first release-build figures on a many-file workload and sets the tree-view
+budgets; this slice comes before M2 when those figures miss them.

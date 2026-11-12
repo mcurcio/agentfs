@@ -106,9 +106,10 @@ git's ref files. It does not yet re-derive the rest from git; step 7 does, and c
   rules set the number of edge cases.
 - The model and the engine share one decomposition, so a wrong grouping shows up in both. The checker shares none of it.
 - Rule work pauses while the split runs: about 6 to 8 days in all (estimate).
-- Each engine step needs one `phase-1.yml` dispatch, the full tree-view CI run: 73 min measured (run 43146523186).
-  A full model gate takes about 41 min on a 4-CPU container. [One engine](one-engine.md), "Costs", totals the
-  dispatches and gates before and after this cut.
+- Each engine step needs one `phase-1.yml` dispatch, the full tree-view CI run with its 500-seed shards: about
+  73 min wall and about 300 runner-min (run 43146523186). A full model gate takes about 41 min on a 4-CPU
+  container, outside CI. [One engine](one-engine.md), "Costs", totals the dispatches and gates before and after
+  this cut.
 - Built model step 3 keeps these, each a later step's to remove:
   - Queue and locks asks the referee through `Plans`: a take needs a landing's written keys and the tree its `Cut`
     carries in the same step. An engine queue must be given both.

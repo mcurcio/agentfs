@@ -5,8 +5,8 @@
 ## What stands until then
 
 Every landing is accepted when its queue takes it. Nothing waits for approval, and nothing waits for a quiet moment.
-A fork configured to need approval cannot be created until this slice is built: creating one fails with a clear
-error ([one engine](one-engine.md), "Forks and landing approval").
+A fork configured to need approval cannot be created until this slice is built: Trees refuses to create one, with a
+clear error ([one engine](one-engine.md), "Forks and landing approval").
 
 ## What it proposes
 

@@ -28,18 +28,28 @@ so far.
 
 ```mermaid
 stateDiagram-v2
-  [*] --> Open: create(upstream) by a launcher: branch at the upstream's head, working tree, space reserved
-  Open --> Ended: LastDetached of its tree, or its launcher's end
+  [*] --> Open: create(upstream, key, settings) by a launcher: branch at the upstream's head, working tree, space reserved
+  Open --> Ended: LastDetached of its tree, or its launcher's end (a keyed fork: end_keyed only)
   Ended --> Dropped: no live child, and none of its entries waits in its upstream's queue
   Dropped --> [*]: ForkDropped: branch and working tree deleted (git-model §12); space released
 ```
 
 | Rule (design choices) | Why |
 |---|---|
-| A fork ends at its last client's leaving | one writer for life ([clients](clients.md) C4): it is never written again, and a deleted pod's launcher may never call `end` |
+| A fork ends at its last client's leaving, unless it was created under a key | one writer for life ([clients](clients.md) C4): it is never written again, and a deleted pod's launcher may never call `end` |
+| A fork created under a key ends only at `end` by that key | a CSI fork claim outlives its pods; CSI's DeleteVolume, which Kubernetes retries until it succeeds, ends it |
 | An ended fork drops only once its upstream's queue has taken every entry it put there | every save reaches the referee, so a losing one is kept as a collision ref (git-model §4) before the branch goes |
 | A fork with a live child does not drop | the child's upstream is its branch |
 | After the drop | the root still reaches the fork's landed commits (full lineage); every losing commit stays under its collision ref (git-model §4, §11) |
+
+**Keyed forks and fork settings (a domain change proposed for the owner's review).** Trees is the one owner of a
+fork's lifecycle, a CSI fork claim's included ([one engine](../future/one-engine.md), "Forks and landing
+approval"). A launcher may pass an idempotency key to `create`: the CSI driver passes the claim's volume handle. A
+second `create` under a key Trees already holds returns that fork, so a repeated CreateVolume makes no second fork,
+and `end_keyed` ends it for any launcher that presents the key, so a restarted controller needs no map of its
+own. A fork's settings (whether its landings need approval) are passed to `create` and kept with its row; Trees
+is the one place that refuses a fork whose settings need approval while [landing
+approvals](../future/landing-approvals.md) is not built.
 
 ## 3. Pinned snapshots
 
@@ -71,7 +81,9 @@ clone of its upstream's working tree, or an overlay over it (a "fork layer"), on
 
 ```rust
 pub trait Trees {
-    fn create(&mut self, upstream: TreeRef, by: &LaunchCap) -> Result<ForkId, TreeError>; // branch, working tree, quota
+    fn create(&mut self, upstream: TreeRef, key: Option<ForkKey>, settings: ForkSettings, by: &LaunchCap)
+        -> Result<ForkId, TreeError>;                                                     // branch, working tree, quota; idempotent per key
+    fn end_keyed(&mut self, key: &ForkKey, by: &LaunchCap) -> Result<(), TreeError>;  // any launcher presenting the key
     fn pin(&mut self, of: TreeRef, by: &PinCap) -> Result<SnapshotId, TreeError>;      // ends at its LastDetached
     fn end(&mut self, f: ForkId, by: &LaunchCap) -> Result<(), TreeError>;             // only its creating launcher
     fn facts(&self, f: ForkId) -> Option<ForkFacts>;                                   // upstream, created by, ended
@@ -84,6 +96,8 @@ pub enum TreeError {
     SpaceLimit,         // the fork budget cannot reserve the limit
     QuotaUnavailable,   // no per-tree quota support: editable forks refused (T4)
     Ended,
+    KeyUnknown,
+    ApprovalNotBuilt,   // the fork's settings need landing approvals, which is not built
     EscapesRoot,
     Io(IoKind),
 }

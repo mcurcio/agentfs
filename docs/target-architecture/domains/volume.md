@@ -14,8 +14,9 @@ The owner's guidance that applies here is in `OWNER-GUIDANCE.md` at the reposito
 | Term | Meaning here |
 |---|---|
 | **volume** | one repository and its trees, on one node (S7) |
-| **volume id** | a UUID assigned when the volume is created and never changed; history and published refs carry it ([one engine](../future/one-engine.md)) |
-| **spec** | what a launcher asks for, built from its configuration: the volume's name, its start point and what happens on release |
+| **volume id** | a UUID assigned when the volume is created and never changed; history carries it, and whether published refs carry it is M4's prefix question ([one engine](../future/one-engine.md)) |
+| **spec** | what a launcher asks for, built from its configuration: the volume's name and its start point |
+| **location** | where the volume's state is found: the sidecar's or Docker's state path, or the CSI volume's handle |
 | **staged** | in use on this node: the history service runs and admits attachments |
 | **draining** | told to stop: no new attachments; existing work finishes. `Stop` (a launcher's) or `Upgrade` (an operator's) |
 | **upgrade drain** | a drain that also waits until every fork has dropped, so the next family finds only the root's branch |
@@ -53,10 +54,10 @@ stateDiagram-v2
 
 ```rust
 pub trait Volume {
-    /// Idempotent: every launcher calls it at every start. No state: create, with a new `VolumeId`. Same name and
-    /// start: recover, taking `on_release` from this spec. Another name or start: `SpecMismatch`, before any write.
-    fn ensure(&mut self, spec: VolumeSpec, by: &LaunchCap) -> Result<VolumeState, VolumeError>; // may: Root
-    fn id(&self) -> VolumeId;                                                             // assigned at create
+    /// Idempotent: every launcher calls it at every start, on the state at the volume's location. No state there:
+    /// create, with a new `VolumeId`. Same name and start: recover. Another name or start: `SpecMismatch`, before
+    /// any write.
+    fn ensure(&mut self, spec: VolumeSpec, by: &LaunchCap) -> Result<Ensured, VolumeError>;     // may: Root
     fn stage(&mut self, by: &LaunchCap) -> Result<VolumeState, VolumeError>;             // may: Root
     fn unstage(&mut self, by: &LaunchCap) -> Result<VolumeState, VolumeError>;           // Staged → Draining(Stop)
     fn drain_for_upgrade(&mut self, by: &ActorCap) -> Result<VolumeState, VolumeError>;  // Operator
@@ -66,10 +67,11 @@ pub trait Volume {
 }
 pub enum VolumeError { NotPermitted, NotStaged, StartDiverged, NoStartPoint, StartUnreachable, FormatsOf(Family), NotDurable(IoKind),
                        SpecMismatch(SpecField) }   // SpecField: Name | Start
-pub struct VolumeSpec { name: VolumeName, start: StartPoint, on_release: OnRelease }
+pub struct VolumeSpec { name: VolumeName, start: StartPoint }
 pub struct VolumeId(Uuid);   // not in the spec: assigned by `ensure` at create
+pub struct Ensured { pub id: VolumeId, pub state: VolumeState }   // the id exists only once `ensure` has run
 pub enum StartPoint { Empty, Line { remote: RemoteName, line: LineName, at: CommitId } }
-pub enum OnRelease { Keep, Remove }
+pub enum OnRelease { Keep, Remove }   // an operator setting, read at boot; not in the spec
 pub enum ReleaseVerdict {
     Wait(NonEmpty<Blocker>),
     Release(Disposition),         // Keep | Removable
@@ -103,7 +105,7 @@ Asked: Clients `attached_any`, the git model's queue depths, Trees `live`, Repli
 | VO2 | `Removable` only when `on_release` is `Remove`, the drain is `Stop`, and `settlement` is `Held` or `NoRemotes` | the same `decide`, exhaustively tested | construction time + test |
 | VO3 | A transition and its event are one unit | repository write and outbox row commit together | construction time |
 | VO4 | The verdict reads only facts asked at judgement time; nothing is polled | no clock port; clippy bans timers in the crate | compile + build time |
-| VO5 | The name, the id and the start point never change after create; acceptances only move forward along the start line | no setter; a repeated `ensure` with another name or start answers `SpecMismatch`; `accept_start` checks the tip (`StartDiverged`) | construction time |
+| VO5 | The id and the start point never change after create, and the name does not change until M4's prefix decision says it may; acceptances only move forward along the start line | no setter; a repeated `ensure` at the same location with another name or start answers `SpecMismatch`; `accept_start` checks the tip (`StartDiverged`) | construction time |
 | VO6 | A fork launcher cannot `ensure`, drain or stage the volume | `LaunchCap` with `may: Root`; `drain_for_upgrade` needs the Operator role | construction time |
 | VO7 | A release stages another family's volume only after that family's upgrade drain released it (S8) | `store` reports the family at open; `stage` answers `FormatsOf` | boot time |
 
@@ -113,7 +115,7 @@ Ports: `VolumeRepository`, `StartRepository` (append-only acceptance rows), `Out
 
 | Policy | Current setting (design choice unless cited) |
 |---|---|
-| On release, per volume | `Keep` (today's `onDelete` default); a setting, so the latest `ensure`'s value wins |
+| On release, per volume | `Keep` (today's `onDelete` default); an operator setting in the git-config include with the others (CSI writes it from the class's `onDelete`), read by Volume at boot, never in the spec |
 | Start point, per volume | `Empty`; fixed at create |
 | Zero remotes with `Remove` | `Removable`, from the owner's guidance on a volume with no remote. Cost: a deployment that forgot its remotes loses the volume on delete |
 | A `stage` during a `Stop` drain | cancels the drain. Cost: a volume whose pods come and go may rarely reach `Released` |
@@ -125,11 +127,12 @@ Ports: `VolumeRepository`, `StartRepository` (append-only acceptance rows), `Out
 container, the Docker example and the CLI through the `agentfs` binary, and CSI's CreateVolume. The first call
 creates the volume and its id; later calls recover it. Operator settings (rules, remotes, the root's published name)
 are not in the spec: iac places them as a git-config include and each owner reads its own at boot, so an iac edit is
-never a mismatch. The root's published name is Replication's setting ([root branch name](../future/root-branch-name.md)).
-The volume id is not in the spec: `ensure` assigns it, so a launcher needs no state before the volume exists. The
-volume's name is fixed because it is the launcher's key to the volume (the configured name, the CSI volume's handle):
-another name is another volume, and a fixed name is what lets a repeated `ensure` recover rather than create twice.
-History keys on the id, so a later rename would rewrite nothing ([one engine](../future/one-engine.md)).
+never a mismatch; `on_release` is one of them. The root's published name is Replication's setting
+([root branch name](../future/root-branch-name.md)). The volume id is not in the spec: `ensure` assigns it and
+returns it, so a launcher needs no state before the volume exists. `ensure` finds the state by the volume's
+location, not its name. The name is a label and a guard: another name at the same location is refused, as
+`agentfs init` refuses it today. Whether it may later change is M4's prefix question; history keys on the id, so a
+rename would rewrite nothing ([one engine](../future/one-engine.md)).
 
 **Draining to release.** `unstage` writes `Draining(Stop)` and `VolumeDraining`: Clients refuses attaches and
 Replication skips spacing. Each client's detach closes its open files as saves (git-model §6); each queue drains its

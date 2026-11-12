@@ -51,18 +51,24 @@ Each is asked labelled "general guidance" or "absolute requirement".
 2. **No name set.** Refuse to publish, or publish under a default, and which default.
 3. **A rename.** What happens to the ref under the old name on each remote: left as it is, or deleted.
 4. **The prefix.** Its form: the volume's name, its UUID, or both. The [git model](../git-model.md)'s
-   `refs/agentfs/<volume>/` (its ref table, collision refs) stands for this prefix; M4 settles its form.
+   `refs/agentfs/<volume>/` (its ref table, collision refs) stands for this prefix; M4 settles its form. The answer
+   also decides whether a volume's name may change: under a name prefix a rename moves the volume's published refs,
+   under a UUID prefix it moves nothing.
 
 ## Costs
 
 - A rename leaves the old ref on remotes unless the answer to question 3 deletes it, and deleting a ref on a remote
   is a step towards rewriting what others read.
-- Publishing under the same name a recording volume used, on the same remote, diverges on the first push
-  ([one engine](one-engine.md), "Existing recording volumes"): loud, never lost.
+- What publishing under the same name a recording volume used, on the same remote, meets on the first push depends
+  on question 4 ([one engine](one-engine.md), "Existing recording volumes"): a divergence, a refused push, or
+  nothing at all.
+- Under a UUID prefix, a volume re-created after its state was lost gets a new UUID and publishes a parallel history
+  beside the old one, with no alarm.
 
 ## Gate
 
-- M4's gate: one `phase-1.yml` dispatch (73 min measured, [module cut](module-cut.md), "Costs"), and ci and image.
+- M4's gate: a `phase-1.yml` run without the seed shards (about 20 min wall, [one engine](one-engine.md), "Costs"),
+  and ci and image.
 - `docs_reference` passes with the key's row in [configuration](../../configuration.md).
 - The tracer publishes under a configured name, then under a changed one.
 - [Trees](../../trees.md), [remotes](../../remotes.md) and [configuration](../../configuration.md) are rewritten, and
