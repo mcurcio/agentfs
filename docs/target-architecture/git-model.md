@@ -71,7 +71,7 @@ flowchart TB
 | agentfs term | git term | In the model |
 |---|---|---|
 | volume | one repository (one object store, many branches) | `World` |
-| tree (the root, the tree with no upstream, its branch's name configured: [root branch name](future/root-branch-name.md); a fork) | a branch, with its own working tree and index | `refs/heads/<root>`, `refs/heads/fork/<id>` |
+| tree (the root, the tree with no upstream, the name it is published under configured: [root branch name](future/root-branch-name.md); a fork) | a branch, with its own working tree and index | `refs/heads/<root>`, `refs/heads/fork/<id>` |
 | fork's upstream | the branch's upstream, in the same repository (`branch.fork/3.remote = .`) | `Fork::upstream` |
 | nested fork | a branch whose upstream is another fork's branch | `create_fork(f)` |
 | client, writer | the `Agentfs-Writer` trailer; git's author and committer are one fixed service identity | `Client`, `fork.writer` |
@@ -225,7 +225,7 @@ Ref names are a design choice; the model uses the first six (with `refs/collisio
 
 | Ref | Holds | Kept locally | Pushed to the shared remote (design choice) |
 |---|---|---|---|
-| `refs/heads/<root>` | the root's decided line | always | yes, as today's `refs/heads/agentfs/<volume>` |
+| `refs/heads/<root>` | the root's decided line | always | yes, under its published name, in the volume's own prefix ([root branch name](future/root-branch-name.md)) |
 | `refs/heads/fork/<id>` | a fork's line, syncs included | until the fork drops | only where Replication pushes fork lines (A4); its losing commits go regardless, as collision refs |
 | `refs/heads/txn/<id>` | an open transaction | until commit or rollback | never |
 | `refs/collisions/<loser>` | one per losing change, named by its losing commit (the model numbers them, one per losing change, with a record for each file and cause it lost by) | past the fork's drop | yes, by Replication, under `refs/agentfs/<volume>/collisions/` ("i want to know who changed what when", 2026-11-03) |

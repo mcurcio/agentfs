@@ -14,6 +14,8 @@ The owner's guidance that applies here is in `OWNER-GUIDANCE.md` at the reposito
 | Term | Meaning here |
 |---|---|
 | **volume** | one repository and its trees, on one node (S7) |
+| **volume id** | a UUID assigned when the volume is created and never changed; history and published refs carry it ([one engine](../future/one-engine.md)) |
+| **spec** | what a launcher asks for, built from its configuration: the volume's name, its start point and what happens on release |
 | **staged** | in use on this node: the history service runs and admits attachments |
 | **draining** | told to stop: no new attachments; existing work finishes. `Stop` (a launcher's) or `Upgrade` (an operator's) |
 | **upgrade drain** | a drain that also waits until every fork has dropped, so the next family finds only the root's branch |
@@ -30,7 +32,7 @@ forks are left (Trees), liveness (Health), the kernel lock and the family check 
 
 ```mermaid
 stateDiagram-v2
-  [*] --> Staged: create, then stage (service boots holding the lock)
+  [*] --> Staged: ensure creates it, then stage (service boots holding the lock)
   Staged --> Draining: unstage (Stop) or drain_for_upgrade (Upgrade); VolumeDraining
   Draining --> Draining: a consumed event, verdict Wait
   Draining --> Staged: stage, during a Stop drain only
@@ -51,7 +53,10 @@ stateDiagram-v2
 
 ```rust
 pub trait Volume {
-    fn create(&mut self, spec: VolumeSpec, by: &LaunchCap) -> Result<(), VolumeError>;   // may: Root
+    /// Idempotent: every launcher calls it at every start. No state: create, with a new `VolumeId`. Same name and
+    /// start: recover, taking `on_release` from this spec. Another name or start: `SpecMismatch`, before any write.
+    fn ensure(&mut self, spec: VolumeSpec, by: &LaunchCap) -> Result<VolumeState, VolumeError>; // may: Root
+    fn id(&self) -> VolumeId;                                                             // assigned at create
     fn stage(&mut self, by: &LaunchCap) -> Result<VolumeState, VolumeError>;             // may: Root
     fn unstage(&mut self, by: &LaunchCap) -> Result<VolumeState, VolumeError>;           // Staged → Draining(Stop)
     fn drain_for_upgrade(&mut self, by: &ActorCap) -> Result<VolumeState, VolumeError>;  // Operator
@@ -59,8 +64,10 @@ pub trait Volume {
     fn start_line(&self) -> StartLine;
     fn release_verdict(&self) -> ReleaseVerdict;   // asks every judge now; never stored
 }
-pub enum VolumeError { NotPermitted, NotStaged, StartDiverged, NoStartPoint, StartUnreachable, FormatsOf(Family), NotDurable(IoKind) }
-pub struct VolumeSpec { name: VolumeName, root: BranchName, start: StartPoint, on_release: OnRelease }  // root: the root branch's name (future/root-branch-name.md)
+pub enum VolumeError { NotPermitted, NotStaged, StartDiverged, NoStartPoint, StartUnreachable, FormatsOf(Family), NotDurable(IoKind),
+                       SpecMismatch(SpecField) }   // SpecField: Name | Start
+pub struct VolumeSpec { name: VolumeName, start: StartPoint, on_release: OnRelease }
+pub struct VolumeId(Uuid);   // not in the spec: assigned by `ensure` at create
 pub enum StartPoint { Empty, Line { remote: RemoteName, line: LineName, at: CommitId } }
 pub enum OnRelease { Keep, Remove }
 pub enum ReleaseVerdict {
@@ -96,7 +103,7 @@ Asked: Clients `attached_any`, the git model's queue depths, Trees `live`, Repli
 | VO2 | `Removable` only when `on_release` is `Remove`, the drain is `Stop`, and `settlement` is `Held` or `NoRemotes` | the same `decide`, exhaustively tested | construction time + test |
 | VO3 | A transition and its event are one unit | repository write and outbox row commit together | construction time |
 | VO4 | The verdict reads only facts asked at judgement time; nothing is polled | no clock port; clippy bans timers in the crate | compile + build time |
-| VO5 | The start point never changes after create; acceptances only move forward along the start line | no setter; `accept_start` checks the tip (`StartDiverged`) | construction time |
+| VO5 | The name, the id and the start point never change after create; acceptances only move forward along the start line | no setter; a repeated `ensure` with another name or start answers `SpecMismatch`; `accept_start` checks the tip (`StartDiverged`) | construction time |
 | VO6 | A fork launcher cannot create, drain or stage the volume | `LaunchCap` with `may: Root`; `drain_for_upgrade` needs the Operator role | construction time |
 | VO7 | A release stages another family's volume only after that family's upgrade drain released it (S8) | `store` reports the family at open; `stage` answers `FormatsOf` | boot time |
 
@@ -106,13 +113,19 @@ Ports: `VolumeRepository`, `StartRepository` (append-only acceptance rows), `Out
 
 | Policy | Current setting (design choice unless cited) |
 |---|---|
-| On release, per volume | `Keep` (today's `onDelete` default) |
+| On release, per volume | `Keep` (today's `onDelete` default); a setting, so the latest `ensure`'s value wins |
 | Start point, per volume | `Empty`; fixed at create |
 | Zero remotes with `Remove` | `Removable`, from the owner's guidance on a volume with no remote. Cost: a deployment that forgot its remotes loses the volume on delete |
 | A `stage` during a `Stop` drain | cancels the drain. Cost: a volume whose pods come and go may rarely reach `Released` |
 | A `stage` during an `Upgrade` drain | answers `Draining(Upgrade)`: the launcher waits for the new family |
 
 ## 6. Flows
+
+**Ensure.** Each launcher calls `ensure` at every start with the spec its configuration gives: the sidecar's init
+container, the Docker example and the CLI through the `agentfs` binary, and CSI's CreateVolume. The first call
+creates the volume and its id; later calls recover it. Operator settings (rules, remotes, the root's published name)
+are not in the spec: iac places them as a git-config include and each owner reads its own at boot, so an iac edit is
+never a mismatch. The root's published name is Replication's setting ([root branch name](../future/root-branch-name.md)).
 
 **Draining to release.** `unstage` writes `Draining(Stop)` and `VolumeDraining`: Clients refuses attaches and
 Replication skips spacing. Each client's detach closes its open files as saves (git-model §6); each queue drains its
@@ -147,6 +160,7 @@ on-disk shape of settings kept across upgrades.
 
 - **The pure release decider** keeps its shape; its facts are asked of their owners.
 - **The release scan** (30 s) and **NodeUnstage's push grace** (5 s) go: the service runs through Draining.
+- **`agentfs init`** is already idempotent, with a refusal for another volume ([configuration](../../configuration.md)); `ensure` is that contract for every launcher, and CSI requires it of CreateVolume.
 - **`startFrom`, `agentfs.start.*`** become the `StartRecord`; **`accepted/<tip>` refs** become acceptance rows; **`onDelete`** becomes `on_release`.
 - **Upgrades:** the family check and upgrade drain are new.
 

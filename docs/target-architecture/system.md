@@ -40,7 +40,7 @@ flowchart TB
   LA -->|attach, detach, reconcile, advance| CL
   LA -->|create, end a fork| TR
   LA -->|open, rebound a view| V
-  LA -->|create, stage, unstage| VO
+  LA -->|ensure, stage, unstage| VO
   OP -->|push, replace diverged, drain, accept start| RP & VO
   V -->|write-open, path calls, save at close, transactions: over its session| G
   V -->|reads the tree's working tree| TR

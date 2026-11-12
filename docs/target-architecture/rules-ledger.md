@@ -32,7 +32,7 @@ question first ([VERIFYING.md](../../crates/agentfs-model/VERIFYING.md) §"Fix p
 `proposed` and then built.
 
 A *fork* is a tree made from another tree, its *upstream*; a fork inside a fork has that fork as its upstream. A
-tree with no upstream is the root; its branch is `refs/heads/<root>`, a name the volume is configured with
+tree with no upstream is the root; its branch is `refs/heads/<root>`, and the name it is published under is configured
 ([root branch name](future/root-branch-name.md)). A *sync* brings the upstream's version
 into a fork. A *landing* brings a fork's save into its upstream. Two lines *collide* when each was written
 without seeing the other. MODEL.md's rules table holds the full wording; this page is the authority on status.
