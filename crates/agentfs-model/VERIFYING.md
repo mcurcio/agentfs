@@ -474,9 +474,11 @@ base it applies to and the commands that recorded the fixture.
 
 - **Record a fixture** once, on a scratch copy of the engine with the fix removed (`git worktree add`; its own cargo
   target or `MODEL_TARGET_VOLUME`, since every copy mounts at `/src`): write the model's trace of the scenario that
-  found it (`AGENTFS_MODEL_TRACE_DIR=$T cargo test -p agentfs-conformance --test replay NAME`), confirm the copy fails
-  that test, then `phase1-replay library "$T" ... --only NAME --record "$OUT"` and copy `$OUT/NAME.trace` into
-  `tests/regressions/`. Commit the trace and, as `<fixture>.patch`, the diff that removed the fix, its header naming
+  found it (`AGENTFS_MODEL_TRACE_DIR=$T cargo test --locked -p agentfs-conformance --test replay NAME`), confirm the
+  copy fails that test, then `cargo run --locked -p agentfs-conformance --bin phase1-replay -- library "$T" ... --only
+  NAME --record "$OUT"` (it exits 1 at the regression's call and still writes the recording; `$OUT` must be empty) and
+  copy `$OUT/NAME.trace` into `tests/regressions/`. Through `ci/model-docker.sh`, run a command with a leading variable
+  under `sh -c`, and the copy too, since `/work` is a Docker volume; the finding-51 `.patch` header has the exact lines. Commit the trace and, as `<fixture>.patch`, the diff that removed the fix, its header naming
   the base commit and the commands. Record with the release of git in `ci/git-release`, through
   `ci/model-docker.sh`: line identities depend on it, so the tests may fail on another release.
 - **Re-record** when an unrelated engine change makes the second test fail before the fixture's call: apply the
