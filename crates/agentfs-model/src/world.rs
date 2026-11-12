@@ -12,7 +12,7 @@
 //! | 7. Full lineage | a landing is a merge with the fork's commit as second parent (or a fast-forward), so a tree's history reaches every change it took, the losers included; each fork commit lands on its own |
 //! | 8. A save records the write calls | [`World::write`] keeps each byte call ([`Write`](crate::recording::Write): an `O_APPEND` write, `pwrite`, `ftruncate`; [`World::open_trunc`] for `O_TRUNC`) on the open file; [`World::close`] applies them to the tree's head then: an append's bytes go after the file's last byte, finishing a partial last line (a version of it) and then making new lines; other calls leave bytes the save aligns with the head's lines (rule 10). [`World::edit`] makes a test's line edit as a program's byte calls (`program`) |
 //! | 9. A take locks the files it overwrites | [`World::open_write`]; a [`TreeStep::Next`] whose sync or landing would overwrite a file open for writing in that tree waits ([`World::waits`]) until the close; else it takes its entry, locks its files and writes them in that one step ([`World::last_take`]), so no call runs while a take holds a file (the owner, 2026-11-08, finding 49: "B"); a client's death ([`World::end_client`], [`World::end_root_client`]) closes its files |
-//! | 10. Line identity | a save derives identities from the bytes at close: it aligns them with the head's lines once, by git's histogram diff (`align`), and records the result: each new line an identity, each changed line a new version written over the version it replaced; the referee and a sync then compare versions of one identity, never bytes or positions (the referee: `referee/placing.rs` places them); a line a landing would put after the upstream's unfinished last line collides with it (R10.4), and so does an unfinished line a landing would put in front of a line the upstream keeps (R10.8); until the upstream decides, a sync hides the upstream's unfinished last line in front of an undecided line (R10.6) and the upstream's lines after an undecided unfinished line (R10.9) |
+//! | 10. Line identity | a save derives identities from the bytes at close: it aligns them with the head's lines once, by git's histogram diff (`align`), and records the result: each new line an identity, each changed line a new version written over the version it replaced; the referee and a sync then compare versions of one identity, never bytes or positions (the referee: `referee/placing.rs` places them); a line a take (a landing, or a transaction's commit into its fork: the referee is given no direction) would put after the upstream's unfinished last line collides with it (R10.4, R10.5), and so does an unfinished line a take would put in front of a line the upstream keeps (R10.8, R10.11); until the upstream decides, a sync hides the upstream's unfinished last line in front of an undecided line (R10.6) and the upstream's lines after an undecided unfinished line (R10.9) |
 //! | 9, progress (git-model.md §6) | P1: a [`TreeStep::Next`] takes the first entry no earlier waiting entry shares a file or a source with (`queue`'s scan), so several may wait ([`World::waits`]); no call ever waits on a waiting entry (P3 is gone, the owner's decision of 2026-11-04): a new open of a file a waiting entry waits for is granted; P2, the prefix sync: a sync delivers the upstream's commits in order up to the first whose delivery would overwrite a file open for writing in the fork, and waits for the rest (`queue`'s prefix, its `Cut`) |
 //! | 11. Deletes and renames | a file's name line: [`World::rename`] writes a new version, [`World::unlink`] a deleted one; the referee's land applies the per-line rule to it and couples a file's existence with its content. [`World::create`] makes a file (an unborn identity); an open holds an object ([`Handle::object`](crate::recording::Handle::object)), so a close saves to the file its object is named by ([`World::named`]) or, for an orphan, nothing ([`Orphan`](crate::recording::Orphan), kept by `recording`); a rename-over from a new file is an atomic save, a rewrite of the replaced file |
 //! | 12. The journal (git-model.md §3) | an open's calls are its journal; [`World::crash`] saves each open from it once (the `Agentfs-Open` trailer, [`World::saved`]); a take is one step, so none is in progress at a crash |
@@ -1013,8 +1013,8 @@ impl World {
     /// Rules 3, 10 and 11 at the upstream's queue: the referee's plan
     /// ([`referee::land`]) for one change into the upstream's head `ours`, its
     /// tree built here.
-    fn resolve(&self, dir: Direction, ours: &str, incoming: &[Incoming], tip: &str) -> Merged {
-        let referee::Plan { files, collisions } = referee::land(self, dir, ours, incoming, tip);
+    fn resolve(&self, ours: &str, incoming: &[Incoming], tip: &str) -> Merged {
+        let referee::Plan { files, collisions } = referee::land(self, ours, incoming, tip);
         let tree = if files.is_empty() {
             self.tree_of(ours)
         } else {
@@ -1693,7 +1693,7 @@ impl World {
         let (id, start, head) = (txn.id, txn.start.clone(), txn.head.clone());
         let planned = (head != start).then(|| {
             let edit = self.edit_of(&start, &head);
-            let m = self.resolve(Direction::Transaction, &ours, &edit, &head);
+            let m = self.resolve(&ours, &edit, &head);
             (edit, m)
         });
         let stay_open: Vec<(HandleId, Option<String>)> = self
@@ -2111,12 +2111,7 @@ impl World {
     /// Rule 3e, one take of commit `c` into the tree at `ours`: the change
     /// judged whole ([`World::resolve`]).
     fn judge(&self, ours: &str, c: &str) -> Merged {
-        self.resolve(
-            Direction::Landing,
-            ours,
-            &self.edit_of(&self.first_parent(c), c),
-            c,
-        )
+        self.resolve(ours, &self.edit_of(&self.first_parent(c), c), c)
     }
 
     /// Rule 3, a fork's change into its upstream `x`, the one place a

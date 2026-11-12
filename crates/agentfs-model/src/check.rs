@@ -191,6 +191,7 @@ impl Checker {
         named("rename_overs_whole", self.rename_overs_whole(w))?;
         named("full_lineage", self.full_lineage(w))?;
         named("placed_and_unlinked", self.placed_and_unlinked(w))?;
+        named("no_joined_lines", no_joined_lines(w))?;
         Ok(())
     }
 }
@@ -1083,6 +1084,42 @@ fn losers_pushed(w: &World, m: &Mirror) -> Result<(), String> {
     Ok(())
 }
 
+/// No tree and no open transaction shows a joined line (R10.4, R10.5, R10.6,
+/// R10.8, R10.9, R10.11): in each file at each head, read from git, only the last
+/// live line may lack its `\n`. A save's bytes split into lines can end
+/// unfinished only at the end, so a line with no `\n` before another is two
+/// writers' lines read as one, bytes nobody wrote.
+fn no_joined_lines(w: &World) -> Result<(), String> {
+    let txns = w.forks.values().filter_map(|f| {
+        f.txn
+            .as_ref()
+            .map(|x| (format!("txn {}", x.id), x.head.clone()))
+    });
+    let trees = w
+        .live_trees()
+        .into_iter()
+        .map(|t| (format!("{t:?}"), w.head(t)));
+    for (on, head) in trees.chain(txns) {
+        for p in PATHS {
+            let file = w.file(&head, p);
+            let mut live = file.live().peekable();
+            while let Some(l) = live.next() {
+                if l.text().is_some_and(|t| !t.ends_with('\n'))
+                    && let Some(next) = live.peek()
+                {
+                    return Err(format!(
+                        "{on} shows {p}'s unfinished line {} joined to {}: {:?}",
+                        l.id,
+                        next.id,
+                        file.bytes()
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// The root's branch and every collision ref, each with its commit, as
 /// `for-each-ref` reads them in `repo`.
 fn pushed_refs(repo: &Path, root: &str) -> BTreeMap<String, String> {
@@ -1931,29 +1968,28 @@ impl Checker {
         let mut met = (0, 0);
         for l in &w.landings[self.read.placements..] {
             let (u, base) = (&l.change, &l.base);
-            // R10.4, read from git: a landing leaves no line after the upstream's
-            // unfinished last line.
-            if l.direction == Direction::Landing {
-                for p in PATHS {
-                    let b = w.file(&l.before, p);
-                    let Some(q) = b
-                        .live()
-                        .last()
-                        .filter(|x| x.text().is_some_and(|t| !t.ends_with('\n')))
-                    else {
-                        continue;
-                    };
-                    if let Some(x) = w
-                        .file(&l.result, p)
-                        .live()
-                        .skip_while(|x| x.id != q.id)
-                        .nth(1)
-                    {
-                        return Err(format!(
-                            "{u:.7}'s line {} in {p} comes after the upstream's unfinished last line {}",
-                            x.id, q.id
-                        ));
-                    }
+            // R10.4 and R10.5, read from git: a take (a landing, or a
+            // transaction's commit into its fork) leaves no line after the
+            // upstream's unfinished last line.
+            for p in PATHS {
+                let b = w.file(&l.before, p);
+                let Some(q) = b
+                    .live()
+                    .last()
+                    .filter(|x| x.text().is_some_and(|t| !t.ends_with('\n')))
+                else {
+                    continue;
+                };
+                if let Some(x) = w
+                    .file(&l.result, p)
+                    .live()
+                    .skip_while(|x| x.id != q.id)
+                    .nth(1)
+                {
+                    return Err(format!(
+                        "{u:.7}'s line {} in {p} comes after the upstream's unfinished last line {}",
+                        x.id, q.id
+                    ));
                 }
             }
             for p in PATHS {

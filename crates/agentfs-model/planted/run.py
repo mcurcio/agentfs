@@ -61,7 +61,7 @@ CHECKS = (
     "no_silent_loss no_flicker locks upstream_wins changes_whole syncs_deliver "
     "transactions_end_as_told transactions_undisturbed one_writer discarded_leave_no_trace "
     "rename_overs_whole full_lineage placed_and_unlinked step_checked check_converged "
-    "losers_pushed mirror_current oracle_no_call_waits oracle_bytes oracle_p1 oracle_deferred "
+    "losers_pushed mirror_current no_joined_lines oracle_no_call_waits oracle_bytes oracle_p1 oracle_deferred "
     "oracle_orphans oracle_crash oracle_drained ledger"
 ).split()
 CHECK_RE = re.compile(r"(?:^|[\s:\"])(" + "|".join(CHECKS) + r"): ")

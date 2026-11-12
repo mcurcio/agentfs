@@ -325,8 +325,8 @@ of their day: "main" is the root, a "sandbox" is a fork, a "parent" is an upstre
   collides: the upstream wins and the save loses whole, retained in history. No tree shows bytes nobody wrote, and line
   order does not change (R10.7) (finding 32). Owner, 2026-11-06, accepting that recommendation: "we can take those
   recommendations for now, and i might change my mind later".
-  The same at a transaction's commit, with the transaction as the fork (R10.11, not built).
-  Tests: `r10_an_unfinished_line_before_a_kept_line_loses_whole`, `r10_an_unfinished_save_after_the_upstreams_last_line_lands`,
+  The same at a transaction's commit, with the transaction as the fork (R10.11).
+  Tests: `r10_an_unfinished_line_before_a_kept_line_loses_whole`, `r10_a_transactions_unfinished_line_before_a_kept_line_loses_whole`, `r10_an_unfinished_save_after_the_upstreams_last_line_lands`,
   `a_save_with_an_unfinished_line_before_a_kept_line_loses_whole`
 - **R10.10** · owner · One release of `git` aligns saves everywhere agentfs is built and tested: the image and CI run the
   release in `ci/git-release`, and each fails if it has another. An upgrade is a known change: it changes how later saves
@@ -360,13 +360,19 @@ of their day: "main" is the root, a "sandbox" is a fork, a "parent" is an upstre
 - **R10.5** · owner · The same inside a transaction: a line the transaction appended after the fork's unfinished
   last line collides at commit, the fork's line wins, and the program is told (R5). Owner, 2026-11-05: "A" (finding 30).
   R10.8 applies at that commit too (R10.11).
-- **R10.11** · owner · A transaction's commit follows the normal merge rules for its files that are not open. The owner,
-  2026-11-08: "If the file is not open, then it follows the normal merge rules". The agent's reading, not his words, and
-  revisable: at a transaction's commit the transaction is the fork and the tree it began from is its
-  upstream (R3f: every tree applies the same rules), so R10.8 applies there: an unfinished line the transaction would put
-  in front of a line the upstream keeps collides, the upstream wins, the transaction loses whole and the program is told
-  (R3e, R5). Not built: the model's landing gate (`if dir == Direction::Landing` in `joins`, `referee/placing.rs`)
-  switches R10.4 and R10.8 off at a transaction commit.
+  Tests: `r10_a_transactions_line_after_the_forks_unfinished_line_loses_whole`
+- **R10.11** · owner · A transaction's commit is a landing of the transaction into its fork, under every landing rule,
+  R10.8 included, for every file, open or not: the transaction is the fork and the tree it began from is its upstream
+  (R3f: every tree applies the same rules). An unfinished line the transaction would put in front of a line the fork
+  keeps collides, the fork wins, the transaction loses whole and the program is told (R3e, R5). The owner, 2026-11-08:
+  "If the file is not open, then it follows the normal merge rules". Asked, 2026-11-12, whether a transaction's commit
+  lands into its fork under every landing rule, R10.8 included, for every file, open or not, the owner answered: "A". His
+  model of a transaction, the same day: "when a transaction is open, the "save" operation isnt creating git commits;
+  instead the changes are being accumulated and only get committed when the transaction itself closes/commits".
+  Revisable: it is his answer, not a rule. Cost: some commits that would commit with R10.4 and R10.8 switched off lose
+  whole. The model's referee is given no direction, so it cannot tell a landing from a transaction's commit.
+  Tests: `r10_a_transactions_unfinished_line_before_a_kept_line_loses_whole`,
+  `r10_a_transactions_line_after_the_forks_unfinished_line_loses_whole`
 - **R10.1** · approved · Of two inserts at one place, the upstream's comes first. Approved by the owner, 2026-11-05 (approval page); he asked whether this is only inserts: yes; two edits of one line are a collision the upstream wins (R3b). Tests: `r10_concurrent_inserts_at_one_place_keep_both_the_upstreams_first`
 - **R10.2** · rejected · A partial last line that a merge puts another line after reads as ending in a newline. Owner, 2026-11-05 (in chat, round 2): "collide": a line appended after the upstream's unfinished last line collides with it (R10.4). Gone when: `r10_a_line_after_a_partial_line_reads_terminated`
 - **R11** · approved · A file keeps its identity through renames (like an inode). Its name and existence are one

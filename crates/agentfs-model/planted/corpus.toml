@@ -83,30 +83,16 @@ replace = '''
             .any(|m| m.tree == TreeId::ROOT)'''
 
 [[bug]]
-id = "losing_save_applies_its_clean_lines"
+id = "losing_change_applies_its_clean_lines"
 rule = "R3e"
 seeds = 64
 find = '''
                     (Verdict::Apply, Some(d)) => (&mut whole, d.clone()),'''
 replace = '''
-                    (Verdict::Apply, Some(_)) if lines.dir == crate::world::Direction::Landing => {
+                    (Verdict::Apply, Some(_)) => {
                         applied.push(i.version.clone());
                         continue;
-                    }
-                    (Verdict::Apply, Some(d)) => (&mut whole, d.clone()),'''
-
-[[bug]]
-id = "losing_transaction_applies_its_clean_lines"
-rule = "R5"
-seeds = 64
-find = '''
-                    (Verdict::Apply, Some(d)) => (&mut whole, d.clone()),'''
-replace = '''
-                    (Verdict::Apply, Some(_)) if lines.dir == crate::world::Direction::Transaction => {
-                        applied.push(i.version.clone());
-                        continue;
-                    }
-                    (Verdict::Apply, Some(d)) => (&mut whole, d.clone()),'''
+                    }'''
 
 [[bug]]
 id = "file_rule_loss_does_not_cost_the_change"
@@ -125,10 +111,10 @@ id = "judge_skips_one_of_a_takes_changes"
 rule = "R3e"
 seeds = 64
 find = '''
-            &self.edit_of(&self.first_parent(c), c),
-            c,
-        )'''
+        self.resolve(ours, &self.edit_of(&self.first_parent(c), c), c)'''
 replace = '''
+        self.resolve(
+            ours,
             &{
                 let mut e = self.edit_of(&self.first_parent(c), c);
                 e.pop();
@@ -161,11 +147,22 @@ id = "line_follows_the_upstreams_unfinished_last_line"
 rule = "R10.4"
 seeds = 64
 find = '''
-                for l in after {
-                    verdicts.insert((p.to_string(), l.line.clone()), Verdict::Lose(q.id.clone()));
-                }'''
+            for l in after {
+                verdicts.insert((p.to_string(), l.line.clone()), Verdict::Lose(q.id.clone()));
+            }'''
 replace = '''
-                let _ = after;'''
+            let _ = after;'''
+
+[[bug]]
+id = "unfinished_line_lands_before_a_kept_line"
+rule = "R10.8"
+seeds = 64
+find = '''
+            if let Some((line, next)) = unfinished_before_kept(&placed, &applied) {
+                verdicts.insert((p.to_string(), line), Verdict::Lose(next));
+            }'''
+replace = '''
+            let _ = (&placed, unfinished_before_kept);'''
 
 [[bug]]
 id = "hole_is_not_nul"

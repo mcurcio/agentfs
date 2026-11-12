@@ -470,9 +470,10 @@ nothing after it lands (R10.8, MODEL.md finding 32; `r10_an_unfinished_line_befo
 
 A sync decides nothing, so until the upstream decides the fork hides, rather than joins: the upstream's unfinished
 last line in front of a fork's undecided line (R10.6, finding 29), and the upstream's lines behind a fork's
-undecided unfinished line (R10.9, finding 33). Each arrives with the decision (§8). One case stays open
-(MODEL.md finding 30): a transaction's line after its own fork's unfinished one makes one line of bytes from two
-line identities.
+undecided unfinished line (R10.9, finding 33). Each arrives with the decision (§8). A transaction's commit is a take
+like a landing (§9): a line it appended after its fork's unfinished last line collides with it and the fork's line
+wins (R10.5, MODEL.md finding 30), and so does an unfinished line it would put in front of a line the fork keeps (R10.8
+at a commit, R10.11). No tree or transaction shows two lines as one (`no_joined_lines`).
 
 | What the bytes show | Recorded as | Against the upstream's concurrent edit of that line | Tests |
 |---|---|---|---|
@@ -641,7 +642,10 @@ the call behind a surviving transaction).
 
 **Commit** lands the branch in the fork as a child lands in its upstream, whole or not at all (rule 3e, the owner):
 the fork's concurrent line (one a sync brought in since begin) wins, and then none of the transaction applies; no
-collision refuses it. A transaction that lost still writes its merge commit, with the fork's tree, so history
+collision refuses it. Every landing rule applies at the commit, for every file, open or not (R10.11; the owner,
+2026-11-12: "A"): the referee is given the pair, the transaction as the fork and the fork as its upstream, and no
+direction, so a line after the fork's unfinished last line (R10.5) and an unfinished line in front of a line the fork
+keeps (R10.8) lose as at a landing. A transaction that lost still writes its merge commit, with the fork's tree, so history
 shows the decision (a choice); its collision ref keeps the transaction's branch. Nothing refuses a commit: it goes
 ahead while programs hold files open, those files stay open, and their writes (a transaction's opens now write in the
 fork) save at close as ordinary later saves (`r5_a_commit_goes_ahead_with_the_programs_own_files_open`). The answer says
@@ -821,6 +825,7 @@ policy of this revision included. Every check runs after every step, in every sc
 | Every change traces to one writer | `one_writer` | `r6_a_sync_is_a_merge_with_the_upstream_second` |
 | Every losing change is replicated, eventually, and stays: once the mirror's push drains, the commits of the mirror's root history hold the run's collisions, each re-read on the mirror alone, its writer and line | `losers_pushed` | `r3_a_save_before_the_sync_arrives_loses_to_the_upstream`, every collision |
 | The mirror's push is pending whenever the mirror lacks the root's tip or a collision ref, a fork's included (§4) | `mirror_current` | every collision, `r4_nested_forks_follow_the_same_rules` |
+| No tree and no open transaction shows a joined line: only a file's last live line may lack its newline (§7, §9) | `no_joined_lines` | `r10_a_transactions_line_after_the_forks_unfinished_line_loses_whole`, `r10_a_transactions_unfinished_line_before_a_kept_line_loses_whole` |
 | Nested forks follow the same rules | all checks | `r4_nested_forks_follow_the_same_rules` |
 | Full lineage, read by ancestry alone: a tree's history reaches every change it took | `full_lineage` | `r7_every_fork_commit_lands_on_its_own_in_the_roots_history`, `r7_the_root_reaches_a_losing_commit_and_its_ref_keeps_it`, `random_interleavings_full_lineage` |
 | Trees converge when writes stop | `check_converged` | `convergence_when_writes_stop` |

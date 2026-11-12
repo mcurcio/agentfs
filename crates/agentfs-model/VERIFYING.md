@@ -101,7 +101,6 @@ the expected failure.
 | `finding_1_git_merge_base_on_crossing_merges` | 1 | a sync leaves a line "which T0 already took" |
 | `random_interleavings_git_merge_base` | 1 | 15 of 64 seeds since the one-step take of finding 49, whose generator draws differently (2026-11-08, none a harness panic); 38 since the name locks of finding 46 (2026-11-07; 40 before them), 2 of them (seeds 32 and 46) a "harness panic: a model file in git": a sync that leaves a line "which T0 already took" or drops a line (with the calls of programs outside a transaction, 2026-11-05; 34 with no P3 and the prefix sync; 35 after the fix pass of the review of 2026-11-04, whose generator changes move the random calls; with creates, crashes and the progress rules 36; with the byte calls alone 32; before them 39 of 64, 2 of them a "harness panic: a model file in git", when git's merge leaves one line identity twice) |
 | `finding_6_git_hunks_on_neighbouring_lines` | 6 | a sync leaves a line "which T0 already took" |
-| `finding_30_a_transactions_line_after_the_forks_unfinished_line` | 30 | two lines read as one, `}n9` |
 
 Findings 36 to 49 pass in `crates/agentfs-conformance/tests/replay.rs` since the owner's answers (48 and 49 on 2026-11-08). These
 were the results at seeds 1..64 on 2026-11-05, unchanged on 2026-11-06; a change that moves a count says so in

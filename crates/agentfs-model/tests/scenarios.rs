@@ -1700,28 +1700,94 @@ fn r9_a_landing_waits_for_an_open_file_that_took_a_name_it_touches() {
     drain(&mut w);
 }
 
-/// Coherence finding 30: a transaction's line after its fork's own
-/// unfinished last line. R10.4 is about an upstream and a fork; no rule says
-/// what happens inside one tree.
+/// R10.5 (finding 30, the owner, 2026-11-05: "A"): a line a transaction
+/// appended after its fork's unfinished last line collides at the commit, as
+/// R10.4 does at a landing. The fork's line wins, the transaction loses whole
+/// and is told, naming its line; no tree shows the two lines as one.
 #[test]
-#[ignore = "coherence finding 30: a transaction commit puts its line after the fork's unfinished last line, and two lines read as one"]
-fn finding_30_a_transactions_line_after_the_forks_unfinished_line() {
+fn r10_a_transactions_line_after_the_forks_unfinished_line_loses_whole() {
     let mut w = world();
     let f = w.create_fork(TreeId::ROOT);
     let c = Client::Fork(f);
     w.begin(f).unwrap();
     calls(&mut w, &c, "b", &[Write::Append("n9\n".into())]);
+    let staged = w.file(&w.forks[&f].txn.as_ref().expect("open").head, "b");
+    let n9 = staged.last().to_string();
+    let n9_line = staged.live().last().expect("n9").line.clone();
     // The fork's own unfinished line arrives after begin, by a sync.
     calls(&mut w, &m1(), "b", &[Write::Append("}".into())]);
     next(&mut w, f);
-    assert_eq!(w.commit_txn(f), Ok(TxnOutcome::Committed));
-    let b = w.read(f, "b");
+    let brace = w.read(f, "b").last().to_string();
+    assert_eq!(&bytes(&w, f, "b")[12..], "}");
     assert_eq!(
-        b.bytes().lines().count(),
-        b.live().count(),
-        "{:?}: only a file's last line can lack a newline",
-        b.bytes()
+        w.commit_txn(f),
+        Ok(TxnOutcome::Lost {
+            lines: vec![Overwritten {
+                path: "b".into(),
+                line: n9_line,
+                staged: n9.clone(),
+                kept: brace,
+            }],
+        })
     );
+    ok(&mut w);
+    assert_eq!(&bytes(&w, f, "b")[12..], "}", "the fork keeps its `}}`");
+    assert!(!has(&w, f, "b", &n9), "none of the transaction applies");
+    drain(&mut w);
+    for t in [TreeId::ROOT, f] {
+        assert_eq!(&bytes(&w, t, "b")[12..], "}", "{t:?}");
+    }
+}
+
+/// R10.11 (the owner, 2026-11-12: "A"): a transaction's commit follows every
+/// landing rule, R10.8 included. The transaction rewrites its file's last line
+/// with no newline; a sync then brings the fork a line after it. At the commit
+/// the unfinished line would stand in front of a line the fork keeps: it
+/// collides, the fork's line wins and the transaction loses whole and is told.
+#[test]
+fn r10_a_transactions_unfinished_line_before_a_kept_line_loses_whole() {
+    let mut w = world();
+    let f = w.create_fork(TreeId::ROOT);
+    let c = Client::Fork(f);
+    w.begin(f).unwrap();
+    calls(
+        &mut w,
+        &c,
+        "c",
+        &[
+            Write::Pwrite {
+                offset: 10,
+                bytes: "y".into(),
+            },
+            Write::Truncate(11),
+        ],
+    );
+    let staged = w.file(&w.forks[&f].txn.as_ref().expect("open").head, "c");
+    assert_eq!(staged.bytes(), "-\n-\n-\n-\n-\ny");
+    let y = staged.last().to_string();
+    let y_line = staged.live().last().expect("y").line.clone();
+    calls(&mut w, &m1(), "c", &[Write::Append("z\n".into())]);
+    next(&mut w, f);
+    let z = w.read(f, "c").last().to_string();
+    let fork = bytes(&w, f, "c");
+    assert_eq!(fork, "-\n-\n-\n-\n-\n-\nz\n");
+    assert_eq!(
+        w.commit_txn(f),
+        Ok(TxnOutcome::Lost {
+            lines: vec![Overwritten {
+                path: "c".into(),
+                line: y_line,
+                staged: y.clone(),
+                kept: z,
+            }],
+        })
+    );
+    ok(&mut w);
+    assert_eq!(bytes(&w, f, "c"), fork, "the fork keeps its file");
+    drain(&mut w);
+    for t in [TreeId::ROOT, f] {
+        assert_eq!(bytes(&w, t, "c"), fork, "{t:?}");
+    }
 }
 
 /// Rule 8 and 10, a line written in two calls, and two calls over one

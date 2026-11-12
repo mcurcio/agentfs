@@ -1,53 +1,51 @@
 //! The referee's placing: where applied and kept versions go ([`splice`], R10.1,
 //! R10.7), and the joins no tree may show (an unfinished line with a live line
-//! after it): at a landing they lose (R10.4, R10.8), at a sync they are hidden
-//! until the upstream decides (R10.6, R10.9).
+//! after it): at a take (a landing, or a transaction's commit) they lose (R10.4,
+//! R10.5, R10.8, R10.11), at a sync they are hidden until the upstream decides
+//! (R10.6, R10.9).
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::{Lineage, Lines, Own, Referee, Verdict, key};
 use crate::content::{Content, Line};
-use crate::world::Direction;
 
 impl<L: Lineage + ?Sized> Referee<'_, L> {
-    /// At a landing, a line placed after the upstream's unfinished last line
-    /// collides with it (R10.4), and so does an applied unfinished line the
-    /// upstream would keep a line after (R10.8): the next line wins.
+    /// At every take (a landing, or a transaction's commit into its fork), a
+    /// line placed after the upstream's unfinished last line collides with it
+    /// (R10.4, R10.5), and so does an applied unfinished line the upstream would
+    /// keep a line after (R10.8, R10.11): the next line wins.
     pub(super) fn joins(&self, ours: &str, tip: &str, lines: &mut Lines<'_>) {
-        let dir = lines.dir;
         let by_path = &lines.by_path;
         let verdicts = &mut lines.verdicts;
-        if dir == Direction::Landing {
-            for (p, ins) in by_path {
-                let cur = self.file(ours, p);
-                let Some(q) = cur
-                    .live()
-                    .last()
-                    .filter(|l| l.text().is_some_and(|t| !t.ends_with('\n')))
-                else {
-                    continue;
-                };
-                let applied: Vec<Line> = ins
-                    .iter()
-                    .filter(|i| verdicts[&key(i)] == Verdict::Apply)
-                    .map(|i| i.version.clone())
-                    .collect();
-                let placed = splice(&cur, &applied, &self.file(tip, p));
-                let after = placed.live().skip_while(|l| l.id != q.id).skip(1);
-                for l in after {
-                    verdicts.insert((p.to_string(), l.line.clone()), Verdict::Lose(q.id.clone()));
-                }
+        for (p, ins) in by_path {
+            let cur = self.file(ours, p);
+            let Some(q) = cur
+                .live()
+                .last()
+                .filter(|l| l.text().is_some_and(|t| !t.ends_with('\n')))
+            else {
+                continue;
+            };
+            let applied: Vec<Line> = ins
+                .iter()
+                .filter(|i| verdicts[&key(i)] == Verdict::Apply)
+                .map(|i| i.version.clone())
+                .collect();
+            let placed = splice(&cur, &applied, &self.file(tip, p));
+            let after = placed.live().skip_while(|l| l.id != q.id).skip(1);
+            for l in after {
+                verdicts.insert((p.to_string(), l.line.clone()), Verdict::Lose(q.id.clone()));
             }
-            for (p, ins) in by_path {
-                let applied: Vec<Line> = ins
-                    .iter()
-                    .filter(|i| verdicts[&key(i)] == Verdict::Apply)
-                    .map(|i| i.version.clone())
-                    .collect();
-                let placed = splice(&self.file(ours, p), &applied, &self.file(tip, p));
-                if let Some((line, next)) = unfinished_before_kept(&placed, &applied) {
-                    verdicts.insert((p.to_string(), line), Verdict::Lose(next));
-                }
+        }
+        for (p, ins) in by_path {
+            let applied: Vec<Line> = ins
+                .iter()
+                .filter(|i| verdicts[&key(i)] == Verdict::Apply)
+                .map(|i| i.version.clone())
+                .collect();
+            let placed = splice(&self.file(ours, p), &applied, &self.file(tip, p));
+            if let Some((line, next)) = unfinished_before_kept(&placed, &applied) {
+                verdicts.insert((p.to_string(), line), Verdict::Lose(next));
             }
         }
     }
