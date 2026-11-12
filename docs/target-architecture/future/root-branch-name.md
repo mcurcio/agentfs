@@ -30,8 +30,8 @@ of `AGENTS.md`) without their roots meeting.
 
 The tree engine names the root `main` (`refs/heads/main`, `Agentfs-Tree: main`) and publishes nothing.
 [Trees](../../trees.md) and [configuration](../../configuration.md) describe it as it is. Module cut step 5b replaces
-`main` with the identity `root` everywhere in the engine; until M4 there is no published name, because nothing
-publishes.
+`main` with the identity `root` everywhere in the engine, and deletes conformance's `ENGINE_ROOT`, the engine's root
+name it passes today; until M4 there is no published name, because nothing publishes.
 
 ## Proposal (design choices, for M4's architect)
 
@@ -50,7 +50,8 @@ Each is asked labelled "general guidance" or "absolute requirement".
    own `remote.<name>.push` is the idiom, but today's pusher sends explicit `<oid>:<ref>` refspecs on purpose.
 2. **No name set.** Refuse to publish, or publish under a default, and which default.
 3. **A rename.** What happens to the ref under the old name on each remote: left as it is, or deleted.
-4. **The prefix.** Its form: the volume's name, its UUID, or both.
+4. **The prefix.** Its form: the volume's name, its UUID, or both. The [git model](../git-model.md)'s
+   `refs/agentfs/<volume>/` (its ref table, collision refs) stands for this prefix; M4 settles its form.
 
 ## Costs
 

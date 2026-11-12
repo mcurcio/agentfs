@@ -28,7 +28,7 @@ page's.
 | End goal | Delivered by |
 |---|---|
 | One engine | M1 (volumes from configuration), M7 and M8 (the launchers move), M9 (the recording engine is deleted) |
-| Nobody runs `trees init` by hand | M1 (`ensure` from configuration), M7 (`agentfs trees` folds into `init` and `mount`) |
+| Nobody runs `trees init` by hand | M1 (`ensure` from a configuration file, on the trial CLI), M7 and M8 (each launcher calls `ensure`; `agentfs trees` folds into `init` and `mount`) |
 | History knows the root by identity; no hardcoded `main` | module cut 5b |
 | Consumers configure the name the root is published under, and may change it | [Root branch name](root-branch-name.md), built in M4 (the publisher and its key) |
 | The trailer records meaningful information | 5b (which tree, by identity); M1 (where: the volume and the pod) |
@@ -40,10 +40,12 @@ page's.
 | Keep operating (principle 5) | M4 (retry, divergence saved), M5 (alarms, liveness, restart in place) |
 | Any remote, or none (principle 6) | module cut 6 (the mirror leaves the model's world); M1 (zero remotes is a valid volume); M4 |
 | History is the product (principle 7) | 5b (identity); M1 (where); M4 (never forced; a divergence is saved) |
-| Recovery is manual but supported (principle 8); merging is an extra (principle 9) | M6 (restore, revert; patches at mount only) |
+| Recovery is manual but supported (principle 8); merging is an extra (principle 9) | M6 (restore, revert; patches at mount only, and `serve-git` as a patch source); M6 lands before M9 |
 | Three layers; OpenTelemetry for everything observable (principle 10) | each milestone's library page; M5 (telemetry, and the recorder's engine source) |
 | The model stays the baseline proof | module cut 6 and 7 |
 | Old state formats are not supported | 5b (tree format 3); M7 and M8 (a recording state area is refused at boot) |
+| Extras that ship today: several pods on one CSI volume, moving a volume between nodes | M8: its CSI-on-trees page carries both, and its gate decides whether M8 builds them or they follow it as slices that page names |
+| Extras that ship today: LFS; forks of forks | [Large and binary files](large-and-binary-files.md); [nested forks](nested-forks.md). Each its own slice, after the launcher it needs has moved |
 
 ## The shape
 
@@ -57,7 +59,7 @@ only by Volume. Operator files (rules, remotes, the published name) stay out of 
 git-config include, and each owner reads its own at boot, so an iac edit is never a spec mismatch.
 
 ```rust
-pub struct VolumeSpec { name: VolumeName, start: StartPoint, on_release: OnRelease }
+pub struct VolumeSpec { name: VolumeName, start: StartPoint, on_release: OnRelease }   // no id: `ensure` assigns it
 
 pub trait Volume {
     /// Idempotent. No state: create, with a new volume id. Same name and start: recover, taking `on_release`
@@ -75,6 +77,16 @@ pub trait Volume {
 | volume | a UUID assigned at create | its `VolumeName`, from the launcher's configuration |
 | tree | `root`, or `fork/<n>`, a short number within its volume (5b) | the root's published name, the publisher's setting (M4), changeable at any boot |
 
+The UUID is not in `VolumeSpec`: `ensure` assigns it at create and stores it beside the spec. A launcher that had to
+carry it would need state of its own before the volume exists, and a first boot could only mismatch.
+
+The volume's name stays fixed, unlike the root's published name, because it is the launcher's key to the volume, not
+a label on it: `ensure` finds a volume's state by its name (the sidecar's and Docker's configured name, the CSI
+volume's handle), so another name is another volume, and a fixed name is what lets a repeated `ensure` recover
+instead of creating twice. History does not depend on it: the trailer records the name a commit was made under
+beside the UUID, which identifies the volume. Renaming a volume is not planned; because history keys on the UUID, a
+later slice could add it without rewriting history.
+
 Each volume publishes its refs under a prefix of its own (M4), so several volumes share one repository without their
 `root` and `fork/<n>` refs meeting.
 
@@ -86,10 +98,10 @@ node names reach every remote, as they do today.
 
 ## Forks and landing approval
 
-Whether a fork's change needs an approval before it lands in its source is a setting of that fork. A fork configured
-to need approval cannot be created until [landing approvals](landing-approvals.md) is built; creating one fails with
-a clear error meanwhile. Every other fork lands in its source as the tree views do today. On the CSI driver the
-setting belongs to the fork's class; M8's architect picks its key.
+Whether a fork's change needs an approval before it lands in its source is a setting of that fork, as
+[landing approvals](landing-approvals.md) has it; a fork configured to need approval cannot be created until that
+slice is built. Every other fork lands in its source as the tree views do today. M8's architect picks the CSI
+class's key for the setting.
 
 The user-facing word for these is "fork". M7 renames "sandbox" in the binary (the trial CLI's `--sandbox`) and M8 in
 the CSI driver, its chart and [supported configurations](../../supported-configurations.md) (example 5's "sandbox
@@ -100,8 +112,9 @@ claim" becomes a fork claim). Each milestone's gate decides the new spellings.
 Each is its own PR series from `main`, gated by an architect, an implementer, one review, one fix round, and green
 ci and image runs, plus what its row says.
 
-**M1. Volumes from configuration.** Every launcher gets `ensure(VolumeSpec)`; a volume gets its UUID at create; zero
-remotes is a valid volume. Tree-view commits gain the "where" trailers, written through module cut step 5's one
+**M1. Volumes from configuration.** Volume gains `ensure(VolumeSpec)`, and the trial `trees` CLI builds the spec
+from a configuration file and calls it; the launchers call it when they move (M7, M8). A volume gets its UUID at
+create; zero remotes is a valid volume. Tree-view commits gain the "where" trailers, written through module cut step 5's one
 message function. A tracer CI job starts (below). Its gate decides where the spec is stored and audited, the trailer
 keys, and how a launcher passes its pod context. Gate: one `phase-1.yml` dispatch; the tracer.
 
@@ -119,7 +132,8 @@ publisher, each volume's refs under its own prefix, and history a mirror's reade
 ([line map and renames](line-map-and-renames.md)). The SSH and HTTP transports, credentials and the fast-forward
 claim are reused, re-homed under Replication, and recorded in architecture.md's "Technology choices". Its gate
 decides the published name's key, what a rename does to the old remote ref, and the prefix's form
-([root branch name](root-branch-name.md), which M4 deletes). Gate: one dispatch.
+([root branch name](root-branch-name.md), which M4 deletes; git-model's `refs/agentfs/<volume>/` stands for that
+prefix until then). Gate: one dispatch.
 
 **M5. Keep operating.** Telemetry, alarms, liveness and restart in place
 ([tree-view telemetry](tree-view-telemetry.md), [health](../domains/health.md)), and the recorder's engine source:
@@ -128,9 +142,10 @@ agentfs-conformance, with content hashes, not bytes. The export never blocks a s
 recorder needs a lossless, unsampled, in-process listener beside it. Squaring the two is M5's first design question.
 Gate: one dispatch; a regression found on a mount replays in the model from the engine's own events.
 
-**M6. Patches, restore and revert on trees.** iac's patches applied at mount, and `restore` and `revert` on trees
-([integrator patches](integrator-patches.md)). It needs M4's remotes and nothing later: it may land before or after
-M7 and M8. Gate: one dispatch.
+**M6. Patches, restore and revert on trees.** iac's patches applied at mount, `serve-git` as a patch source, and
+`restore` and `revert` on trees ([integrator patches](integrator-patches.md)). It needs M4's remotes and nothing
+later: it may land before or after M7 and M8, and lands before M9, which deletes the recording engine's patch queue.
+Gate: one dispatch.
 
 **M7. The `agentfs` binary moves.** The sidecar, the Docker examples and the CLI share one launcher, the binary's
 `init` and `mount`, so they move together. `agentfs trees` folds into `init` and `mount` and goes. Between M7 and M9
@@ -140,18 +155,20 @@ and pulls [save and take speed](save-and-take-speed.md) in front of it.
 
 **M8. The CSI driver moves.** CreateVolume calls `ensure`; publish attaches a view host; DeleteVolume asks Volume's
 release verdict. A fork claim makes an in-volume fork; a fork class configured to need approval is refused until
-landing approvals is built. Its architect writes the missing CSI-on-trees page. Gate: as M7.
+landing approvals is built. Its architect writes the missing CSI-on-trees page, which also carries several pods on
+one volume and moving a volume between nodes. Gate: as M7.
 
-**M9. The recording engine is deleted.** Its domain logic and the passthrough FUSE layer go; LFS and `serve-git` go,
-each extra's slice bringing back what it needs from history. Adapters the tree engine uses stay where M4 and M5
+**M9. The recording engine is deleted.** Its domain logic and the passthrough FUSE layer go, with its patch queue and
+`serve-git` (rebuilt on trees by M6) and its LFS (rebuilt by [large and binary files](large-and-binary-files.md)). Adapters the tree engine uses stay where M4 and M5
 re-homed them. Recording-only docs, runbooks and alert rules go. This page goes. Gate: ci and image.
 
 ## Order
 
 ```text
- 6 → 5b → 5.1 → 5.2 → 5.3 ─┬─▶ M1 ─┬─▶ M2 → M3 → M4 → M5 → M7 → M8 → M9
-                           └─▶ 7 ──┘              │
-                                                  └─▶ M6 (any time after M4)
+ 6 → 5b → 5.1 → 5.2 → 5.3 ─┬─▶ M1 ─┬─▶ M2 → M3 → M4 → M5 → M7 → M8 ─┬─▶ M9
+                           └─▶ 7 ──┘              │                    │
+                                                  └─▶ M6 ──────────────┘
+                                          (M6: any time after M4, before M9)
 ```
 
 - Step 7 (the model's checker reads git) and M1 run side by side; they touch disjoint crates. M2 adds model rules,
@@ -160,8 +177,14 @@ re-homed them. Recording-only docs, runbooks and alert rules go. This page goes.
 - **Goals may lapse during the move.** agentfs is before its 1.0 release, so a launcher moves without waiting for
   every goal its users rely on. M6 is off M7's path: from M7 until M6 lands, a moved launcher applies no iac patches
   at mount and has no `restore` or `revert`, and example 3 of [supported configurations](../../supported-configurations.md)
-  is marked "not built". Extras (several pods on one CSI volume, moving a volume, LFS, nested forks) are marked "not
-  built" from the move until their own slices.
+  is marked "not built". M6 must land before M9, which deletes the recording engine's patch queue. Extras (several
+  pods on one CSI volume, moving a volume, LFS, nested forks) are marked "not built" from the move until the step the
+  goals table names for each.
+- **Links to deleted pages.** The commit that deletes a plan page repoints every link to it: step 7's commit,
+  which deletes the module cut, rewrites the references to its steps here and in
+  [root branch name](root-branch-name.md) as the built behaviour's library pages; M4's commit, which deletes root
+  branch name, does the same for its links here, in the domain pages and in the baseline pages; M9's, which deletes
+  this page, for every link to it. The docs workflow's link check fails otherwise.
 
 ## Existing recording volumes
 
@@ -169,8 +192,8 @@ A recording state area is refused at boot by the format check (`FormatsOf`, [the
 converter. To move one, create a volume from configuration and copy the files in through its mount, as
 [deployment](../../deployment.md)'s migration Job does. The old history stays on its remotes under
 `refs/heads/agentfs/<volume>`. If the new root is published under that same name on that remote, its first push is
-not a fast-forward: Replication saves it as a divergence and raises an alarm, never overwrites. The upgrading runbook
-says to pick another name.
+not a fast-forward: Replication saves it as a divergence and raises an alarm, never overwrites. M7 adds to the
+upgrading runbook ([upgrading the sidecar](../../runbooks/upgrading-the-sidecar.md)) the advice to pick another name.
 
 ## Tracer
 
@@ -200,7 +223,7 @@ upgrades.
 
 - Nine milestones after the module cut, touching every crate, doc, chart and workflow.
 - Goals and extras go dark for a while: iac's patches, `restore` and `revert` from M7 until M6; several pods, moving,
-  LFS and nested forks from a launcher's move until their slices.
+  LFS and nested forks from a launcher's move until the step the goals table names for each.
 - Existing volumes' history does not continue inside new ones; a reused published name diverges, loudly.
 - The history format changes at 5b (the root's identity) and again at M1 (the "where" trailers).
 - Two pages to write: file metadata (M2) and CSI on trees (M8). M2's new model rules run the costliest gate.

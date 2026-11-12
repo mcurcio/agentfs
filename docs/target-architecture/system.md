@@ -115,7 +115,7 @@ capabilities bound to it.
 
 | Capability | Minted by | Held by | It can never |
 |---|---|---|---|
-| `LaunchCap { launcher, may: Root \| ForksItCreates, view_profiles }` | the composition root, from deployment config | a launcher | (fork launcher) attach to the root or a fork it did not create, widen a view profile, create, stage or unstage the volume |
+| `LaunchCap { launcher, may: Root \| ForksItCreates, view_profiles }` | the composition root, from deployment config | a launcher | (fork launcher) attach to the root or a fork it did not create, widen a view profile, `ensure`, stage or unstage the volume |
 | `ClientCap` | `Clients::attach`, `rebind` (read-write grants only) | the client's session, in the history service | save into another tree or as another writer |
 | `PinCap` | the composition root | Clients | (anyone else) pin a snapshot |
 | `StartCap` | the composition root | Volume (lent to Replication's `fetch_start`) | (anyone else) set where the root's line starts |

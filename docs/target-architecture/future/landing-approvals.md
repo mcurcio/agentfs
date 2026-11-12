@@ -5,12 +5,17 @@
 ## What stands until then
 
 Every landing is accepted when its queue takes it. Nothing waits for approval, and nothing waits for a quiet moment.
+A fork configured to need approval cannot be created until this slice is built: creating one fails with a clear
+error ([one engine](one-engine.md), "Forks and landing approval").
 
 ## What it proposes
 
 - **Approval.** A landing may wait for an acceptance rule, as the existing patch queue does with `cleanMerge`,
   `approval` and `command`. The rule is configurable with a sensible default, because a clean merge is not always an
   acceptable merge.
+- **Approval is a setting of each fork.** Whether a fork's changes need approval before they land in its source is
+  part of that fork's configuration, not the volume's. Forks that do not need it land as soon as their queue takes
+  them. On the CSI driver the setting belongs to the fork's class.
 - **Timing.** A fork's saves land continuously. An integrator's patches wait until a chosen moment (for example,
   until the workload detaches), and the integrator can ask to apply them now.
 

@@ -104,7 +104,7 @@ Asked: Clients `attached_any`, the git model's queue depths, Trees `live`, Repli
 | VO3 | A transition and its event are one unit | repository write and outbox row commit together | construction time |
 | VO4 | The verdict reads only facts asked at judgement time; nothing is polled | no clock port; clippy bans timers in the crate | compile + build time |
 | VO5 | The name, the id and the start point never change after create; acceptances only move forward along the start line | no setter; a repeated `ensure` with another name or start answers `SpecMismatch`; `accept_start` checks the tip (`StartDiverged`) | construction time |
-| VO6 | A fork launcher cannot create, drain or stage the volume | `LaunchCap` with `may: Root`; `drain_for_upgrade` needs the Operator role | construction time |
+| VO6 | A fork launcher cannot `ensure`, drain or stage the volume | `LaunchCap` with `may: Root`; `drain_for_upgrade` needs the Operator role | construction time |
 | VO7 | A release stages another family's volume only after that family's upgrade drain released it (S8) | `store` reports the family at open; `stage` answers `FormatsOf` | boot time |
 
 Ports: `VolumeRepository`, `StartRepository` (append-only acceptance rows), `Outbox`, `UnitOfWork` (`store`, audited).
@@ -126,6 +126,10 @@ container, the Docker example and the CLI through the `agentfs` binary, and CSI'
 creates the volume and its id; later calls recover it. Operator settings (rules, remotes, the root's published name)
 are not in the spec: iac places them as a git-config include and each owner reads its own at boot, so an iac edit is
 never a mismatch. The root's published name is Replication's setting ([root branch name](../future/root-branch-name.md)).
+The volume id is not in the spec: `ensure` assigns it, so a launcher needs no state before the volume exists. The
+volume's name is fixed because it is the launcher's key to the volume (the configured name, the CSI volume's handle):
+another name is another volume, and a fixed name is what lets a repeated `ensure` recover rather than create twice.
+History keys on the id, so a later rename would rewrite nothing ([one engine](../future/one-engine.md)).
 
 **Draining to release.** `unstage` writes `Draining(Stop)` and `VolumeDraining`: Clients refuses attaches and
 Replication skips spacing. Each client's detach closes its open files as saves (git-model §6); each queue drains its
