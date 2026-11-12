@@ -27,8 +27,8 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::calls::{
-    CallError, Caller, Client, HandleId, Recorded, RecordedCall, Shown, ShownCollision, Took,
-    TreeCalls, TreeId, TxnId, gather_collisions, out_of_scope,
+    CallError, Caller, Client, HandleId, History, Recorded, RecordedCall, Shown, ShownCollision,
+    Took, TreeCalls, TreeId, TxnId, gather_collisions, out_of_scope,
 };
 use crate::content::{Content, Edit, Layout, Line, PATHS, UNBORN};
 use crate::git::{git, git_in, try_git};
@@ -2310,6 +2310,7 @@ impl World {
         if let Some(trace) = &mut self.trace {
             trace.push(Recorded {
                 call,
+                failed: None,
                 shown,
                 head: None,
             });
@@ -2643,6 +2644,20 @@ impl TreeCalls for World {
             .collect();
         paths.sort();
         Ok(paths)
+    }
+}
+
+/// The model's own history, for [`crate::calls::replay`] driving a world: its
+/// collisions as [`World::shown`] gives them, and a tree's head read from its git.
+pub struct ModelHistory;
+
+impl History<World> for ModelHistory {
+    fn collisions(&mut self, w: &World) -> Result<Vec<ShownCollision>, CallError> {
+        Ok(w.shown().collisions)
+    }
+
+    fn head(&mut self, w: &World, t: TreeId) -> Result<(String, usize), CallError> {
+        Ok(w.head_shape(t))
     }
 }
 

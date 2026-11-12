@@ -1,13 +1,17 @@
 //! Replays the model's traces: `phase1-replay model|library|mount DIR
-//! --min-scenarios N --min-seeds N [--only NAME]`. `DIR` holds the `*.trace` files
-//! the model wrote (`AGENTFS_MODEL_TRACE_DIR`). Fewer in-scope traces than a floor
+//! --min-scenarios N --min-seeds N [--only NAME] [--record OUT]`. `DIR` holds the
+//! `*.trace` files the model wrote (`AGENTFS_MODEL_TRACE_DIR`), or a recording of
+//! the engine. `--record OUT` writes what the system did with each trace, through
+//! its first differing call, to `OUT/<name>`: a trace to replay on another system
+//! (VERIFYING.md, "A regression found on the engine"). It refuses an `OUT` that is
+//! not empty. Fewer in-scope traces than a floor
 //! fail: a scenario that left the scope is a drop of coverage, not a pass. Every
 //! mismatch is a finding: this prints each trace's first and exits 1, unless
 //! `open-findings.txt` names that trace with its finding (VERIFYING.md, "What the
 //! ignored tests are expected to show"), which then must still fail.
 
 use agentfs_conformance::{against_library, against_model, against_mount, mountable};
-use agentfs_model::calls::{Recorded, Scope, parse, scope_of};
+use agentfs_model::calls::{Recorded, Recorder, Scope, parse, render, scope_of};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -26,11 +30,12 @@ struct Args {
     min_scenarios: usize,
     min_seeds: usize,
     only: Option<String>,
+    record: Option<PathBuf>,
 }
 
 fn args() -> Result<Args, String> {
     let mut it = std::env::args().skip(1);
-    let usage = "usage: phase1-replay model|library|mount DIR --min-scenarios N --min-seeds N [--only NAME]";
+    let usage = "usage: phase1-replay model|library|mount DIR --min-scenarios N --min-seeds N [--only NAME] [--record OUT]";
     let mode = match it.next().as_deref() {
         Some("model") => Mode::Model,
         Some("library") => Mode::Library,
@@ -38,7 +43,7 @@ fn args() -> Result<Args, String> {
         _ => return Err(usage.into()),
     };
     let dir = PathBuf::from(it.next().ok_or(usage)?);
-    let (mut min_scenarios, mut min_seeds, mut only) = (None, None, None);
+    let (mut min_scenarios, mut min_seeds, mut only, mut record) = (None, None, None, None);
     while let Some(flag) = it.next() {
         let value = it.next().ok_or(usage)?;
         let number = || value.parse::<usize>().map_err(|_| usage.to_owned());
@@ -46,6 +51,7 @@ fn args() -> Result<Args, String> {
             "--min-scenarios" => min_scenarios = Some(number()?),
             "--min-seeds" => min_seeds = Some(number()?),
             "--only" => only = Some(value),
+            "--record" => record = Some(PathBuf::from(value)),
             _ => return Err(usage.into()),
         }
     }
@@ -55,7 +61,18 @@ fn args() -> Result<Args, String> {
         min_scenarios: min_scenarios.ok_or(usage)?,
         min_seeds: min_seeds.ok_or(usage)?,
         only,
+        record,
     })
+}
+
+/// `out`, made if missing; an error if it holds anything.
+fn empty_dir(out: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(out).map_err(|e| format!("{}: {e}", out.display()))?;
+    let mut entries = std::fs::read_dir(out).map_err(|e| format!("{}: {e}", out.display()))?;
+    if entries.next().is_some() {
+        return Err(format!("{}: not empty", out.display()));
+    }
+    Ok(())
 }
 
 /// The traces that fail for an open finding: trace name to finding.
@@ -83,6 +100,10 @@ fn main() -> ExitCode {
     let bin = std::env::var_os("AGENTFS_BIN").map(PathBuf::from);
     if args.mode == Mode::Mount && bin.is_none() {
         eprintln!("mount needs AGENTFS_BIN: a failpoints build of agentfs");
+        return ExitCode::from(2);
+    }
+    if let Some(Err(e)) = args.record.as_deref().map(empty_dir) {
+        eprintln!("--record {e}");
         return ExitCode::from(2);
     }
     let mut names: Vec<String> = match std::fs::read_dir(&args.dir) {
@@ -144,13 +165,23 @@ fn main() -> ExitCode {
                     let Some((name, trace)) = item else {
                         return;
                     };
-                    let result = match args.mode {
-                        Mode::Model => against_model(trace),
-                        Mode::Library => against_library(trace),
-                        Mode::Mount => {
-                            against_mount(trace, bin.as_deref().unwrap_or(Path::new("")))
-                        }
+                    let mut recorder = Recorder::default();
+                    let mut result = match args.mode {
+                        Mode::Model => against_model(trace, &mut recorder),
+                        Mode::Library => against_library(trace, &mut recorder),
+                        Mode::Mount => against_mount(
+                            trace,
+                            bin.as_deref().unwrap_or(Path::new("")),
+                            &mut recorder,
+                        ),
                     };
+                    if let Some(out) = &args.record {
+                        let file = out.join(name);
+                        if let Err(e) = std::fs::write(&file, render(recorder.trace())) {
+                            let e = format!("write {}: {e}", file.display());
+                            result = result.and(Err(e));
+                        }
+                    }
                     match result {
                         Ok(()) => {
                             let mut p = passed.lock().unwrap_or_else(|e| e.into_inner());

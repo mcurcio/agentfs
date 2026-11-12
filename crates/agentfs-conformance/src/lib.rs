@@ -5,7 +5,9 @@
 //! what each tree showed (`agentfs_model::calls`). [`Library`] and [`Mounted`]
 //! make the same calls of the real library and of a real mount. The real run
 //! must show the same, and passes invariants of its own, read from git
-//! ([`invariants`]).
+//! ([`invariants`]). The replay records what each system did into a sink
+//! (`agentfs_model::calls::Recorder`), so a run recorded on the engine is a
+//! trace the model replays (VERIFYING.md, "A regression found on the engine").
 //!
 //! The replay does not prove what no call of it makes: shared mappings (the
 //! page-cache job), a client call waiting on a take, which a one-step take never
@@ -14,15 +16,19 @@
 //! (the recording-faults and power-loss jobs), `ENOSPC` and `EIO` (the enospc
 //! job).
 
+pub mod engine_names;
+pub mod git_history;
 pub mod invariants;
 pub mod library;
 pub mod mounted;
 
+pub use engine_names::EngineNames;
+pub use git_history::EngineHistory;
 pub use library::Library;
 pub use mounted::Mounted;
 
-use agentfs_model::calls::{Recorded, RecordedCall, TreeCalls, gather_collisions, replay};
-use agentfs_model::world::{MODEL_ROOT, Policies, TreeNames, World};
+use agentfs_model::calls::{Recorded, RecordedCall, Sink, TreeCalls, replay};
+use agentfs_model::world::{MODEL_ROOT, ModelHistory, Policies, TreeNames, World};
 use invariants::Invariants;
 use std::path::{Path, PathBuf};
 
@@ -30,36 +36,57 @@ use std::path::{Path, PathBuf};
 /// engine step that makes it configured
 /// (docs/target-architecture/future/root-branch-name.md) removes this:
 /// conformance then configures the engine with a name of its own, not `main`,
-/// and passes it.
+/// and passes it. Read only by `engine_names`.
 pub const ENGINE_ROOT: &str = "main";
 
-/// The trace against `t`, with the real system's invariants read from `repo`.
-fn against_real<T: TreeCalls>(trace: &[Recorded], t: &mut T, repo: &Path) -> Result<(), String> {
-    let mut invariants = Invariants::new(repo)?;
-    replay(trace, t, &mut |t, r| invariants.after(t, r))
+/// How the engine names a trace's trees: the one place [`ENGINE_ROOT`] is read.
+pub(crate) fn engine_names() -> EngineNames {
+    EngineNames::new(ENGINE_ROOT)
 }
 
-/// The trace against a new real library.
-pub fn against_library(trace: &[Recorded]) -> Result<(), String> {
+/// The trace against `t`, recorded into `sink`, with its history and the real
+/// system's invariants read from `repo`.
+fn against_real<T: TreeCalls>(
+    trace: &[Recorded],
+    t: &mut T,
+    repo: &Path,
+    sink: &mut dyn Sink,
+) -> Result<(), String> {
+    let mut history = EngineHistory::new(repo, engine_names())?;
+    let mut invariants = Invariants::new(repo, engine_names())?;
+    replay(trace, t, &mut history, sink, &mut |t, r| {
+        invariants.after(t, r)
+    })
+}
+
+/// The trace against a new real library; `sink` gets what the library did.
+pub fn against_library(trace: &[Recorded], sink: &mut dyn Sink) -> Result<(), String> {
     let dir = tempfile::tempdir().map_err(|e| e.to_string())?;
     // A mismatch to read: `PHASE1_REPLAY_KEEP=DIR` leaves the state there.
     let state = std::env::var_os("PHASE1_REPLAY_KEEP")
         .map_or_else(|| dir.path().join("state"), PathBuf::from);
-    let mut library = Library::new(&state).map_err(|e| e.to_string())?;
+    let mut library = Library::new(&state, engine_names()).map_err(|e| e.to_string())?;
     let repo = library.repo();
-    against_real(trace, &mut library, &repo)
+    against_real(trace, &mut library, &repo, sink)
 }
 
-/// The trace against a new real mount, `bin` a failpoints build of agentfs.
-pub fn against_mount(trace: &[Recorded], bin: &Path) -> Result<(), String> {
+/// The trace against a new real mount, `bin` a failpoints build of agentfs;
+/// `sink` gets what the mount did.
+pub fn against_mount(trace: &[Recorded], bin: &Path, sink: &mut dyn Sink) -> Result<(), String> {
     let dir = tempfile::tempdir().map_err(|e| e.to_string())?;
     let with_sandbox = trace
         .iter()
         .any(|r| matches!(r.call, RecordedCall::Fork { .. }));
-    let mut mounted = Mounted::new(bin, dir.path(), with_sandbox, opens_that_append(trace))
-        .map_err(|e| e.to_string())?;
+    let mut mounted = Mounted::new(
+        bin,
+        dir.path(),
+        engine_names(),
+        with_sandbox,
+        opens_that_append(trace),
+    )
+    .map_err(|e| e.to_string())?;
     let repo = mounted.repo();
-    let result = against_real(trace, &mut mounted, &repo);
+    let result = against_real(trace, &mut mounted, &repo, sink);
     let log = mounted.log_text();
     let finished = mounted.finish().map_err(|e| e.to_string());
     result
@@ -67,19 +94,12 @@ pub fn against_mount(trace: &[Recorded], bin: &Path) -> Result<(), String> {
         .map_err(|e| format!("{e}\nmount log:\n{log}"))
 }
 
-/// The same replay driving a fresh model shows its own trace (criterion 6).
-pub fn against_model(trace: &[Recorded]) -> Result<(), String> {
+/// The same replay driving a fresh model shows its own trace (criterion 6): its
+/// trees, collisions and heads. `sink` gets what the model did, so a trace
+/// recorded on the engine replays here.
+pub fn against_model(trace: &[Recorded], sink: &mut dyn Sink) -> Result<(), String> {
     let mut world = World::new(Policies::default(), TreeNames::new(MODEL_ROOT));
-    replay(trace, &mut world, &mut |w, r| {
-        if let Some(shown) = &r.shown {
-            let got = gather_collisions(w.shown().collisions);
-            if got != shown.collisions {
-                return Err(format!(
-                    "collisions {got:?}, the trace {:?}",
-                    shown.collisions
-                ));
-            }
-        }
+    replay(trace, &mut world, &mut ModelHistory, sink, &mut |_, _| {
         Ok(())
     })
 }
