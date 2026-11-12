@@ -386,7 +386,11 @@ and then showed, to a sink (`calls::Sink`; `calls::Recorder` keeps them as a tra
 that differs from the trace. A failed call is kept, written ` !<errno>` after the call (` !-` without one), and a
 replay of it must fail with the same errno. So what the library or a mount did is a trace the model replays (below,
 "A regression found on the engine"). Every hand scenario of `crates/agentfs-conformance/tests/replay.rs` checks that
-the model's and the library's recordings equal the trace they replayed.
+the model's and the library's recordings equal the trace they replayed. To make each record whole, the replay reads
+every tree made so far and the collisions after every call, not only the trees the trace lists: a read that fails
+fails that call, and a replay costs a read of every tree per call. A call the trace cannot make (an open number it
+never opened) is an error, not a record, since no system answered it. The only failed calls shown so far are the
+unit tests' scripted ones: no test yet records a library or mount failure and replays it in the model.
 
 ```sh
 # Record (the same run CI makes), then replay. Without Linux and /dev/fuse, mounts stay NOT RUN.
@@ -453,23 +457,31 @@ phase1-replay library "$T" --min-scenarios 0 --min-seeds 0 --only NAME --record 
 phase1-replay model "$OUT" --min-scenarios 0 --min-seeds 0 --only NAME
 ```
 
-The phase 1 jobs record their replays this way: each mount's recording replays on a fresh model at the mount's
-floors (`ci/e2e-tree-replay.sh`), and the seed shards keep the library's recordings beside the traces
-(`ci/replay-seeds.sh`). Both are in the jobs' artifacts, so a mismatch arrives as an engine trace to replay.
+The phase 1 jobs record their replays this way. `ci/e2e-tree-replay.sh` replays each mount's recording on a fresh
+model at the mount's floors, whether or not the mounts passed, and exits with the mounts' status, or else the
+model's. A mount that differs in what the trees show then fails in the model at that call too, with the model's
+answer in the log; one that broke only an engine invariant passes there. When every mount passes, each recording
+equals its trace, and the step repeats the model's own replay. The seed shards keep the library's recordings beside
+the traces (`ci/replay-seeds.sh`), for replay by hand. Both are in the jobs' artifacts, so a mismatch arrives as an
+engine trace to replay.
 
 A fixed regression is kept as a fixture in `crates/agentfs-conformance/tests/regressions/`, with a test in
-`tests/regressions.rs` that asserts two things: the model fails the fixture at its call, and today's library makes
-the fixture's calls as recorded up to that call and differs there. The first proves the model catches the
-regression; the second proves the fix holds and the fixture is not stale.
+`tests/regressions.rs` that asserts two things. The model fails the fixture at its call, agreeing with every record
+before it, and shows there what the regression lost. Today's library makes the fixture's calls as recorded up to that
+call, and there makes the model's own record. The first proves the model catches the regression; the second proves
+the fix holds and the fixture is not stale. Beside each fixture, a `.patch` removes its fix; its header names the
+base it applies to and the commands that recorded the fixture.
 
 - **Record a fixture** once, on a scratch copy of the engine with the fix removed (`git worktree add`; its own cargo
   target or `MODEL_TARGET_VOLUME`, since every copy mounts at `/src`): write the model's trace of the scenario that
   found it (`AGENTFS_MODEL_TRACE_DIR=$T cargo test -p agentfs-conformance --test replay NAME`), confirm the copy fails
   that test, then `phase1-replay library "$T" ... --only NAME --record "$OUT"` and copy `$OUT/NAME.trace` into
-  `tests/regressions/`. Only the trace is committed. Record with the release of git in `ci/git-release`, through
-  `ci/model-docker.sh`: line identities depend on it.
-- **Re-record** when an unrelated engine change makes the second test fail before the fixture's call: the same
-  procedure, in the same commit, with the regression still failing at its call.
+  `tests/regressions/`. Commit the trace and, as `<fixture>.patch`, the diff that removed the fix, its header naming
+  the base commit and the commands. Record with the release of git in `ci/git-release`, through
+  `ci/model-docker.sh`: line identities depend on it, so the tests may fail on another release.
+- **Re-record** when an unrelated engine change makes the second test fail before the fixture's call: apply the
+  `.patch` to a scratch copy of today's engine (rebase it if it no longer applies, and update its header), and run its
+  header's commands, in the same commit, with the regression still failing at its call.
 - **Retire** the fixture and its test with the ledger change, if an approved rule change makes the model agree with
   the recording at that call.
 

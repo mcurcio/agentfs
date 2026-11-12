@@ -93,7 +93,7 @@ impl TreeCalls for Library {
 
     fn fork(&mut self) -> Result<TreeId, CallError> {
         let name = self.v_mut()?.fork().map_err(fail)?;
-        Ok(self.names.forked(name))
+        self.names.forked(name)
     }
 
     fn open_write(&mut self, c: &Caller, path: &str) -> Result<u64, CallError> {

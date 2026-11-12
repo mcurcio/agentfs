@@ -226,12 +226,16 @@ impl Invariants {
     fn note_call(&mut self, r: &Recorded) -> Result<(), String> {
         match &r.call {
             RecordedCall::Fork { id } => {
-                let listed = self.git.run(&[
-                    "for-each-ref",
-                    "--format=%(refname:lstrip=2)",
-                    "refs/heads/fork/",
-                ])?;
+                let listed = self.git.run(&EngineNames::LIST_FORKS)?;
                 self.names.read_forks(&listed).map_err(|e| e.to_string())?;
+                // The system's names, made in order, agree with these, read from
+                // git, only if git holds exactly the forks the trace made.
+                if self.names.forks() != id.number() as usize {
+                    return Err(format!(
+                        "fork_names: git lists {} forks after the trace's fork {id}",
+                        self.names.forks()
+                    ));
+                }
                 let root = self.trees.get(&TreeId::ROOT).cloned().unwrap_or_default();
                 self.trees.insert(*id, root);
             }

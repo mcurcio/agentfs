@@ -828,10 +828,16 @@ fn compare_call(got: &Recorded, want: &Recorded, error: Option<&CallError>) -> R
 ///
 /// Stops at the first record that differs from the trace's, after giving it to
 /// `sink`: failed or not and the errno, a take's `took`, a fork's number, a
-/// listed tree's paths or bytes, the collisions (when the trace shows any trees),
-/// the head (when the trace has one). Then `each` runs, for the real system's own
-/// invariants. Errors name the call, "call {i} ({call}): {difference}". `OpenGone`
-/// makes no call; `OutOfScope` is an error.
+/// listed tree's paths or bytes, the collisions (both only when the trace's
+/// record has a shown part), the head (when the trace has one). Then `each`
+/// runs, for the real system's own invariants. Errors name the call, "call {i}
+/// ({call}): {difference}". `OpenGone` makes no call; `OutOfScope` is an error,
+/// and so is a call the trace cannot make (an open number it never opened): the
+/// sink gets neither, since no system answered.
+///
+/// After every call it reads every tree made so far and the collisions, whether
+/// or not the trace lists them, so the record is whole: a read that fails fails
+/// the call, and each call costs a read of every tree.
 pub fn replay<T: TreeCalls, H: History<T>, S: Sink + ?Sized>(
     trace: &[Recorded],
     system: &mut T,

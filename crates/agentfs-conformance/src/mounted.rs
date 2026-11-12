@@ -82,7 +82,7 @@ impl Mounted {
             let mut volume = Volume::open(&state).map_err(fail)?;
             seed(&mut volume, names.name(TreeId::ROOT)?).map_err(fail)?;
             if with_sandbox {
-                names.forked(volume.fork().map_err(fail)?);
+                names.forked(volume.fork().map_err(fail)?)?;
             }
         }
         for fifo in ["go", "took"] {

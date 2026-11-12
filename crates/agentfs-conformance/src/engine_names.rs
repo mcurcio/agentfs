@@ -1,9 +1,17 @@
 //! How the engine names a trace's trees (VERIFYING.md, "The model as the
 //! conformance suite"). The root goes by the name it is given (today
 //! [`crate::ENGINE_ROOT`], through `engine_names`); fork n by the name the engine
-//! gave the n-th fork made, `fork/<event>`, never reused. The one map from a
+//! gave the n-th fork made, `fork/<event>`, never reused. The one type that maps a
 //! [`TreeId`] to an engine name in this crate, apart from the model's own
 //! `world::TreeNames`: the engine numbers its forks by event, the model by order.
+//!
+//! A replay holds three of them: the system's ([`crate::Library`] or
+//! [`crate::Mounted`]), filled as it makes forks ([`EngineNames::forked`]), and
+//! [`crate::EngineHistory`]'s and [`crate::invariants::Invariants`]'s, filled from
+//! git ([`EngineNames::read_forks`]). They agree because `forked` refuses a fork
+//! whose event is not past the last fork's, so the order made is the order of
+//! events, and `Invariants` checks after each fork that git lists exactly the
+//! forks the trace made.
 
 use agentfs_model::calls::{CallError, TreeId};
 
@@ -14,7 +22,27 @@ pub struct EngineNames {
     forks: Vec<String>,
 }
 
+/// The event number of fork `name`, `fork/<event>`.
+fn event_of(name: &str) -> Result<u64, CallError> {
+    name.strip_prefix("fork/")
+        .and_then(|n| n.parse::<u64>().ok())
+        .ok_or_else(|| CallError::new(format!("{name:?} is no fork's name")))
+}
+
 impl EngineNames {
+    /// The `git` arguments that list every fork, one name a line, for
+    /// [`Self::read_forks`].
+    pub const LIST_FORKS: [&str; 3] = [
+        "for-each-ref",
+        "--format=%(refname:lstrip=2)",
+        "refs/heads/fork/",
+    ];
+
+    /// How many forks are made.
+    pub fn forks(&self) -> usize {
+        self.forks.len()
+    }
+
     /// The root named `root`, and no fork yet.
     pub fn new(root: &str) -> EngineNames {
         EngineNames {
@@ -23,24 +51,29 @@ impl EngineNames {
         }
     }
 
-    /// The engine just made fork `name`, the next in order: its tree.
-    pub fn forked(&mut self, name: String) -> TreeId {
+    /// The engine just made fork `name`, the next in order: its tree. An error
+    /// for a name that is no fork's, or whose event is not past the last fork's,
+    /// since then the order made would not be the order [`Self::read_forks`] reads.
+    pub fn forked(&mut self, name: String) -> Result<TreeId, CallError> {
+        let event = event_of(&name)?;
+        if let Some(last) = self.forks.last()
+            && event_of(last)? >= event
+        {
+            return Err(CallError::new(format!(
+                "fork {name:?} made after {last:?}: events out of order"
+            )));
+        }
         self.forks.push(name);
-        TreeId::new(self.forks.len() as u32)
+        Ok(TreeId::new(self.forks.len() as u32))
     }
 
-    /// Every fork made, from `git for-each-ref --format=%(refname:lstrip=2)
-    /// refs/heads/fork/`, in the order of their event numbers.
+    /// Every fork made, from [`Self::LIST_FORKS`]'s output, in the order of
+    /// their event numbers.
     pub fn read_forks(&mut self, listed: &str) -> Result<(), CallError> {
         let mut forks = listed
             .lines()
-            .map(|name| {
-                name.strip_prefix("fork/")
-                    .and_then(|n| n.parse::<u64>().ok())
-                    .map(|event| (event, name.to_owned()))
-                    .ok_or_else(|| CallError::new(format!("{name:?} is no fork's name")))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+            .map(|name| Ok((event_of(name)?, name.to_owned())))
+            .collect::<Result<Vec<_>, CallError>>()?;
         forks.sort();
         self.forks = forks.into_iter().map(|(_, name)| name).collect();
         Ok(())
@@ -91,7 +124,10 @@ mod tests {
             assert_eq!(names.tree(names.name(t).unwrap()), Some(t));
         }
         assert_eq!(names.tree("fork/11"), None);
-        assert_eq!(names.forked("fork/12".into()), TreeId::new(3));
+        assert_eq!(names.forks(), 2);
+        assert!(names.forked("fork/10".into()).is_err(), "not past fork/10");
+        assert!(names.forked("main".into()).is_err());
+        assert_eq!(names.forked("fork/12".into()).unwrap(), TreeId::new(3));
         assert!(names.read_forks("main\n").is_err());
     }
 }

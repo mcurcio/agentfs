@@ -370,11 +370,7 @@ impl EngineHistory {
         if refs == self.refs {
             return Ok(());
         }
-        let forks = self.git.run(&[
-            "for-each-ref",
-            "--format=%(refname:lstrip=2)",
-            "refs/heads/fork/",
-        ])?;
+        let forks = self.git.run(&EngineNames::LIST_FORKS)?;
         self.names.read_forks(&forks).map_err(|e| e.to_string())?;
         for oid in self.git.run(&["rev-list", "--all"])?.lines() {
             if self.seen.insert(oid.to_owned())

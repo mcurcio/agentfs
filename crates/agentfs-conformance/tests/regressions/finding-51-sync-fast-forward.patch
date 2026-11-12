@@ -1,0 +1,24 @@
+Removes the fix of finding-51-sync-fast-forward.trace: the shows-the-same guard
+on a sync's fast-forward (introduced without it in 6049b1b, fixed in e9ab747).
+Base: 7474470 (agentfs-core unchanged since). git: the release in ci/git-release.
+Re-record (crates/agentfs-model/VERIFYING.md, "A regression found on the engine"),
+in a scratch worktree with this applied, through ci/model-docker.sh:
+  AGENTFS_MODEL_TRACE_DIR=/work/t cargo test -p agentfs-conformance --test replay \
+    finding_51_a_sync_that_cannot_show_the_upstreams_commit_merges  # fails here
+  cargo run -p agentfs-conformance --bin phase1-replay -- library /work/t \
+    --min-scenarios 0 --min-seeds 0 --only finding_51_a_sync_that --record /work/out
+  cp /work/out/finding_51_a_sync_that*.trace \
+    crates/agentfs-conformance/tests/regressions/finding-51-sync-fast-forward.trace
+`git apply` skips these lines.
+
+--- a/crates/agentfs-core/src/tree_actor/mod.rs
++++ b/crates/agentfs-core/src/tree_actor/mod.rs
+@@ -1656,7 +1656,7 @@
+             // for the upstream and the sync shows what the upstream's commit shows (the
+             // model's `World::sync`). The fork then takes that commit's line maps and names,
+             // so a version the upstream decided against stays in history only (finding 51).
+-            let head = if Self::shows_the_same(&parent, &snapshot) && !self.pending_from(tree)? {
++            let head = if !self.pending_from(tree)? {
+                 for (id, file) in &mut snapshot.files {
+                     if let Some(theirs) = parent.files.get(id) {
+                         file.lines = theirs.lines.clone();
