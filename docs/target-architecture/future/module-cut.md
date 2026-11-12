@@ -150,7 +150,7 @@ re-record, except where a row says the digest is re-baselined on purpose.
 
 **How each step runs.** Each step is its own session and its own PR to the repository's `main` branch, in this
 order. Step 3 is three PRs, 3a to 3c (guidance, owner, 2026-11-11: "2 PRs is fine"; then "New pr is fine"), and step 5
-is three, 5.1 to 5.3. Step 7 runs beside milestone M1 of [one engine](one-engine.md):
+is three, 5.1 to 5.3. Step 7 runs after the baseline of [one engine](one-engine.md), beside its M8:
 
 1. **Architect.** It designs the step and probes its risky seams, before anyone implements it. Guidance, owner,
    2026-11-09: "I want each phase of the work to start with an architect".
@@ -176,4 +176,4 @@ A change to the safety net itself runs its quick tier and a review before any fu
 | 7 | Model: the checker re-derives from git what it still reads through `World` (the table under design rule 3). The last step of this cut: its commit deletes this page and repoints the links to it ([one engine](one-engine.md)) | The full model gate; the matrix changes on purpose, with every planted bug still caught |
 
 Not in this slice: the older engine (`volume.rs`, `push.rs`), mirrors on the tree model and the root's published
-name. Each is a milestone of [one engine](one-engine.md), which starts after step 5 (M1 beside step 7).
+name. Each is a milestone of [one engine](one-engine.md), which starts after step 5; step 7 runs after its baseline.

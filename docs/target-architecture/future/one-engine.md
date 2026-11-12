@@ -259,18 +259,21 @@ goes; its deferred table moves to [the target architecture's index](../README.md
 ## Order
 
 ```text
- 6 → 5b → 5.1 → 5.2 → 5.3 ─┬─▶ M1 ─┬─▶ speed → M2 → M3 → M4 → M5 → M7 ─┬─▶ BASELINE → M8 → M9 → deferred extras
-                           └─▶ 7 ──┘                       │    │        │
-                                                           │    └─▶ M5's recorder series (off the path)
-                                                           └─▶ M6 ───────┘
-                                              (M6: any time after M4, before the baseline)
+ 6 → 5b → 5.1 → 5.2 → 5.3 → M1 → speed → M2 → M3 → M4 → M5 → M7 ─┬─▶ BASELINE ─┬─▶ M8 → M9 → deferred extras
+                                                        │    │        │             └─▶ 7 (the model's checker)
+                                                        │    └─▶ M5's recorder series (off the path)
+                                                        └─▶ M6 ───────┘
+                                           (M6: any time after M4, before the baseline)
 ```
 
 The order serves the baseline first: every milestone before it is one a target application needs, and nothing
 after it is.
 
-- Step 7 (the model's checker reads git) and M1 run side by side; they touch disjoint crates. M2 adds model rules,
-  which the checker then judges, so it waits for both.
+- Step 6 is built before the plan's first milestone: its first slice moves the mirror out of `World`, which M4's
+  publisher is checked against, and its transaction rules ride along because they were already in flight.
+- Step 5b precedes M1 because M1's "where" trailers and M4's publisher both name trees by identity, which 5b gives.
+- Step 7 (the model's checker reads git) is not on the baseline's path: the checker judges M2's new model rules as it
+  is today, reading some facts through `World`. It runs after the baseline, beside M8.
 - Step 5 precedes M1 because M2, M3, M4 and M6 each extend a module step 5 makes.
 - Each serial edge has a reason. Speed precedes M2 because M2 to M4 extend the path it rewrites. M2 precedes M3
   because rules classify directories and symlinks, which M2 adds. M3 precedes M4 because a mirror publishes what
@@ -409,7 +412,7 @@ database groups, nested forks, transactions, upgrades.
   2026-11-12 pushes: ci 9 to 13 min and image 5 to 10 min wall, side by side; with helm, f8 and docs, about 25 to
   30 runner-min per pushed commit. Before M1: four full runs (6, 5b, 5.1, 5.3; each moves or changes save and land
   code), about 4.9 h wall and 20 h runner time, and four full model gates (step 6 three, 5b one; about 2.7 h);
-  step 7 adds one or two model gates beside M1. From M1 to M8: full runs where save or land logic changes (expected:
+  step 7 adds one or two model gates after the baseline. From M1 to M8: full runs where save or land logic changes (expected:
   M1's series, speed, M2, M3, M6) and short runs elsewhere (M4, M5, M7, M8), M2's model gate, the tracer job (not
   yet measured) and both engines' jobs in ci until M9. From M1 the core tier ([CI tiers](#ci-tiers)) adds about
   20 min wall, side by side with ci, and about 41 runner-min to every PR push and every push to `main`; the
