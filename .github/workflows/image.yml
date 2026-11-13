@@ -174,24 +174,39 @@ jobs:
       - run: ci/e2e-mergiraf.sh
 
   # The tree views' tracer (ci/e2e-trees-tracer.sh): `trees init` and `trees
-  # mount` in the built image, a uid 10000 workload in another container.
+  # mount` in the built image, a uid 10000 workload in another container,
+  # and the release figures of its step 4, with the state area on a fresh
+  # loop filesystem of each type (docs/performance.md, "Tree views, release
+  # build"). A figure over ci/trees-budget.json is a warning only.
   trees-tracer:
-    name: e2e (tree views tracer in the image)
+    name: e2e (tree views tracer in the image, ${{ matrix.fs }})
     needs: build
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        fs: [ext4, xfs]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: agentfs-image
           path: ${{ runner.temp }}
-      - name: FUSE and the image
+      - name: FUSE, xfsprogs and the image
         run: |
           sudo modprobe fuse
           ls -l /dev/fuse
+          command -v mkfs.xfs || { sudo apt-get update && sudo apt-get install -y xfsprogs; }
           docker load -i "$RUNNER_TEMP/agentfs-image.tar"
-      - run: ci/e2e-trees-tracer.sh
+      - run: ci/e2e-trees-tracer.sh --figures ${{ matrix.fs }}
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: trees-figures-${{ matrix.fs }}
+          path: ${{ runner.temp }}/trees-figures-${{ matrix.fs }}.json
+          retention-days: 90
+          if-no-files-found: warn
       - name: diagnose
         if: failure()
         run: ci/e2e-trees-tracer.sh diagnose

@@ -1,0 +1,20 @@
+{
+  "comment": "The recording engine's budgets (ci/bench-budget.json, docs/performance.md), as the bar ci/trees-figures.py compares the tree views' release figures with. Advisory: a figure over its budget is a warning, never a failure. `metric` names the report field compared, `max` its limit (one number, or one per filesystem), `text` the budget as the report states it. close_64m takes the recording engine's close of a dirty 1 GiB file on each filesystem, since the workload closes without an fsync.",
+  "budgets": {
+    "close_4k": {
+      "metric": "p50_ms",
+      "max": 3.5,
+      "text": "p50 3.5 ms (record close 4k)"
+    },
+    "create_1000": {
+      "metric": "extrapolated_100000_s",
+      "max": 600,
+      "text": "600 s for 100,000 (create)"
+    },
+    "close_64m": {
+      "metric": "extrapolated_1g_s",
+      "max": {"ext4": 12, "xfs": 8},
+      "text": "7-12 s for 1 GiB (bigclose)"
+    }
+  }
+}
