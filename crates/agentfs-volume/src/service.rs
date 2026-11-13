@@ -9,35 +9,33 @@ use agentfs_contracts::volume::{
     Ensured, ReleaseVerdict, Volume, VolumeError, VolumeSpec, VolumeState,
 };
 
-/// One volume's Volume domain. `C` and `Q` are asked at judgement time; the
-/// composition root re-judges by [`VolumeService::rejudge`] on each consumed
-/// event (`AttachmentEnded`, `LastDetached`, a take).
+/// One volume's Volume domain. Its state area `A` is also its row store and
+/// its queue facts: the volume's one tree actor, which the state area opens at
+/// `stage`, holds all three (before it, the row reads `None` and no queue holds
+/// anything). `C` and `A`'s queues are asked at judgement time; the composition
+/// root re-judges by [`VolumeService::rejudge`] on each consumed event
+/// (`AttachmentEnded`, `LastDetached`, a take). Built before `ensure`, so `C` is
+/// a handle the root fills once Clients is restored at `stage`.
 #[expect(
     dead_code,
     reason = "slices S1 and S6 build the bodies that read these"
 )]
-pub struct VolumeService<A, S, C, Q, E> {
+pub struct VolumeService<A, C, E> {
     area: A,
-    store: S,
     clients: C,
-    queues: Q,
     events: E,
 }
 
-impl<A, S, C, Q, E> VolumeService<A, S, C, Q, E>
+impl<A, C, E> VolumeService<A, C, E>
 where
-    A: StateArea,
-    S: VolumeStore,
+    A: StateArea + VolumeStore + QueueFacts,
     C: AttachedLookup,
-    Q: QueueFacts,
     E: EventSink,
 {
-    pub fn new(area: A, store: S, clients: C, queues: Q, events: E) -> Self {
+    pub fn new(area: A, clients: C, events: E) -> Self {
         Self {
             area,
-            store,
             clients,
-            queues,
             events,
         }
     }
@@ -53,12 +51,10 @@ where
     }
 }
 
-impl<A, S, C, Q, E> Volume for VolumeService<A, S, C, Q, E>
+impl<A, C, E> Volume for VolumeService<A, C, E>
 where
-    A: StateArea,
-    S: VolumeStore,
+    A: StateArea + VolumeStore + QueueFacts,
     C: AttachedLookup,
-    Q: QueueFacts,
     E: EventSink,
 {
     fn ensure(
