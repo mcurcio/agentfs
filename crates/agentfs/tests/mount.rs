@@ -9,7 +9,8 @@
 //! `fuse` CI job runs them through `ci/fuse-tests.sh`:
 //!
 //! ```sh
-//! sudo AGENTFS_TEST_PASSTHROUGH=auto target/debug/deps/mount-<hash> --ignored --test-threads=1
+//! cargo test -p agentfs --test mount --no-run
+//! sudo AGENTFS_TEST_PASSTHROUGH=auto <the executable cargo printed> --ignored --test-threads=1
 //! ```
 //!
 //! - `AGENTFS_TEST_PASSTHROUGH` (`auto`, `on`, `off`) is passed to every

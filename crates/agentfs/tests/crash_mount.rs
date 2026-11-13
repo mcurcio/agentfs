@@ -12,7 +12,7 @@
 //!
 //! ```sh
 //! cargo test -p agentfs --features failpoints --test crash_mount --no-run
-//! sudo target/debug/deps/crash_mount-<hash> --ignored --test-threads=1
+//! sudo <the executable cargo printed> --ignored --test-threads=1
 //! ```
 
 #![cfg(feature = "failpoints")]
