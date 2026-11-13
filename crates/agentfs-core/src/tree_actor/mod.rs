@@ -15,7 +15,6 @@ mod pointers;
 pub mod queue;
 mod referee;
 pub mod stages;
-mod sync;
 mod tree;
 mod tree_id;
 
@@ -38,17 +37,13 @@ use journal::{
 };
 use pointers::Pointers;
 use stages::{Stages, Timer, Which};
-use tree::{EventNumber, LineVersion, Lines, Versions};
+use tree::{EventNumber, Lines, Versions};
 pub use tree_id::{NotATree, TreeId};
 
 const FORMAT: &str = "agentfs-trees-3\n";
 const JOURNAL: &str = "calls.wal";
 const INITIALIZING: &str = "initializing";
 type Result<T> = std::result::Result<T, Error>;
-type Undecided = (
-    BTreeSet<LineVersion>,
-    BTreeSet<(MergeFileIdentity, EventNumber)>,
-);
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -84,6 +79,13 @@ pub enum Error {
     MissingObject { name: String, oid: Oid },
     #[error("pointer {name} is not at the value a step expected")]
     PointerMoved { name: String },
+}
+
+impl From<referee::Broken> for Error {
+    /// A broken ancestry is damaged history.
+    fn from(_: referee::Broken) -> Self {
+        Self::Format
+    }
 }
 
 impl Error {
@@ -263,19 +265,11 @@ impl Tree {
                 return Err(Error::Format);
             }
             let history = snapshot.names.get(&id).ok_or(Error::Format)?;
-            let path = history
-                .versions
-                .get(&history.head)
-                .and_then(|version| version.path.clone())
-                .ok_or(Error::Format)?;
-            if history
-                .versions
-                .get(&history.head)
-                .is_some_and(|version| version.over.is_none())
-            {
+            let path = history.path()?.ok_or(Error::Format)?;
+            if history.head_version()?.over.is_none() {
                 self.fresh_names.insert(file.object);
             }
-            self.names.insert(path, file.object);
+            self.names.insert(path.to_owned(), file.object);
             self.bytes.insert(file.object, Arc::new(file.lines.bytes()));
             self.lines.insert(file.object, Arc::new(file.lines));
             self.identities.insert(file.object, id);
@@ -300,7 +294,7 @@ struct NameHistory {
     versions: BTreeMap<EventNumber, NameVersion>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct NameVersion {
     path: Option<String>,
     over: Option<EventNumber>,
@@ -340,6 +334,32 @@ impl NameHistory {
         );
         self.head = event;
     }
+
+    /// The head's version: [`Error::Format`] if it is not on record.
+    fn head_version(&self) -> Result<&NameVersion> {
+        self.versions.get(&self.head).ok_or(Error::Format)
+    }
+
+    /// The head's path: None once the file is ended.
+    fn path(&self) -> Result<Option<&str>> {
+        Ok(self.head_version()?.path.as_deref())
+    }
+
+    /// Both histories' versions, keeping `self.head`; [`Error::Format`] where they record one
+    /// version differently.
+    fn combine(&self, other: &NameHistory) -> Result<NameHistory> {
+        let mut combined = self.clone();
+        for (event, version) in &other.versions {
+            match combined.versions.get(event) {
+                Some(existing) if existing != version => return Err(Error::Format),
+                Some(_) => {}
+                None => {
+                    combined.versions.insert(*event, version.clone());
+                }
+            }
+        }
+        Ok(combined)
+    }
 }
 
 struct Handle {
@@ -349,6 +369,28 @@ struct Handle {
     bytes: Vec<u8>,
     /// This open's calls, each with its journal number.
     calls: Vec<(u64, Call)>,
+}
+
+/// The actor's [`referee::Landed`]: whether a save's commit is in `upstream`'s history. That
+/// never changes, and every line one save wrote has that save's commit: ask Git once per commit,
+/// not once per line (an 8 MiB file is 8,000 lines).
+struct LandedInto<'a> {
+    repo: &'a TreeGit,
+    owners: &'a BTreeMap<EventNumber, Oid>,
+    upstream: Oid,
+    reached: BTreeMap<Oid, bool>,
+}
+
+impl referee::Landed for LandedInto<'_> {
+    fn landed(&mut self, save: EventNumber) -> Result<bool> {
+        let owner = *self.owners.get(&save).ok_or(Error::Format)?;
+        if let Some(known) = self.reached.get(&owner) {
+            return Ok(*known);
+        }
+        let answer = self.repo.is_ancestor(owner, self.upstream)?;
+        self.reached.insert(owner, answer);
+        Ok(answer)
+    }
 }
 
 struct SyncPlan {
@@ -1344,11 +1386,7 @@ impl Volume {
         let mut metadata = BTreeMap::new();
         for (id, file) in &snapshot.files {
             let history = snapshot.names.get(id).ok_or(Error::Format)?;
-            let path = history
-                .versions
-                .get(&history.head)
-                .and_then(|version| version.path.as_ref())
-                .ok_or(Error::Format)?;
+            let path = history.path()?.ok_or(Error::Format)?;
             let bytes = file.lines.bytes();
             files.push(TreeEntry {
                 name: path.as_bytes().to_vec(),
@@ -1436,39 +1474,6 @@ impl Volume {
             })
     }
 
-    fn changed_keys(before: &referee::Snapshot, after: &referee::Snapshot) -> BTreeSet<queue::Key> {
-        let ids: BTreeSet<_> = before
-            .names
-            .keys()
-            .chain(after.names.keys())
-            .chain(before.files.keys())
-            .chain(after.files.keys())
-            .copied()
-            .collect();
-        let mut keys = BTreeSet::new();
-        for id in ids {
-            let old = before.names.get(&id);
-            let new = after.names.get(&id);
-            if old.map(|h| h.head) == new.map(|h| h.head)
-                && before.files.get(&id).map(|file| &file.lines)
-                    == after.files.get(&id).map(|file| &file.lines)
-            {
-                continue;
-            }
-            keys.insert(queue::Key::File(id.0));
-            for history in [old, new].into_iter().flatten() {
-                if let Some(path) = history
-                    .versions
-                    .get(&history.head)
-                    .and_then(|v| v.path.as_ref())
-                {
-                    keys.insert(queue::Key::Name(path.clone()));
-                }
-            }
-        }
-        keys
-    }
-
     fn open_keys(&self, tree: TreeId) -> BTreeSet<queue::Key> {
         let mut keys = BTreeSet::new();
         if let Some(t) = self.trees.get(&tree) {
@@ -1509,43 +1514,7 @@ impl Volume {
         Ok(())
     }
 
-    fn undecided(&self, fork: &referee::Snapshot, upstream: Oid) -> Result<Undecided> {
-        let owners = &self.owners;
-        // Whether a commit is in `upstream`'s history never changes, and every
-        // line one save wrote has that save's commit: ask Git once per commit,
-        // not once per line (an 8 MiB file is 8,000 lines).
-        let mut reached: BTreeMap<Oid, bool> = BTreeMap::new();
-        let mut landed = |owner: Oid| -> Result<bool> {
-            if let Some(known) = reached.get(&owner) {
-                return Ok(*known);
-            }
-            let answer = self.repo.is_ancestor(owner, upstream)?;
-            reached.insert(owner, answer);
-            Ok(answer)
-        };
-        let mut lines = BTreeSet::new();
-        let mut names = BTreeSet::new();
-        for file in fork.files.values() {
-            for line in &file.lines.lines {
-                let owner = owners.get(&line.version.event()).ok_or(Error::Format)?;
-                if !landed(*owner)? {
-                    lines.insert(line.version);
-                }
-            }
-        }
-        for (id, history) in &fork.names {
-            let owner = owners.get(&history.head).ok_or(Error::Format)?;
-            if !landed(*owner)? {
-                names.insert((*id, history.head));
-            }
-        }
-        Ok((lines, names))
-    }
-
-    fn prior_decisions(
-        &self,
-        mut head: Oid,
-    ) -> Result<BTreeMap<referee::Version, referee::Version>> {
+    fn prior_decisions(&self, mut head: Oid) -> Result<referee::PriorDecisions> {
         let _timer = Timer::start(Which::PriorDecisions);
         let mut result = BTreeMap::new();
         loop {
@@ -1588,14 +1557,14 @@ impl Volume {
         let prior = self.prior_decisions(current)?;
         let decision = {
             let _timer = Timer::start(Which::Judge);
-            referee::judge(&mine, &base, &theirs, &prior)?
+            referee::land(&mine, &base, &theirs, &prior)?
         };
         let head = if base_commit == current {
             // Made on the parent's current version: every line replaces the
             // parent's, so nothing collides, and the save itself is the head.
             // The journal's record of this step moves the pointer (finding 45).
             if !decision.collisions.is_empty()
-                || !Self::changed_keys(&decision.snapshot, &theirs).is_empty()
+                || !referee::touches(&decision.snapshot, &theirs).is_empty()
             {
                 return Err(Error::Format);
             }
@@ -1683,13 +1652,21 @@ impl Volume {
         let mut remaining = false;
         for oid in todo {
             let parent = self.snapshot_at(oid)?;
-            let (lines, names) = self.undecided(&fork_snapshot, oid)?;
-            let last_lines = self.last_lines(&parent, oid, &names)?;
+            let undecided = referee::undecided(
+                &fork_snapshot,
+                &mut LandedInto {
+                    repo: &self.repo,
+                    owners: &self.owners,
+                    upstream: oid,
+                    reached: BTreeMap::new(),
+                },
+            )?;
+            let last_lines = self.last_lines(&parent, oid, &undecided)?;
             let next = {
                 let _timer = Timer::start(Which::SyncMerge);
-                sync::sync(&parent, &fork_snapshot, &lines, &names, &last_lines)?
+                referee::sync(&parent, &fork_snapshot, &undecided, &last_lines)?
             };
-            let changes = Self::changed_keys(&current, &next);
+            let changes = referee::touches(&current, &next);
             if !changes.is_disjoint(open) {
                 remaining = true;
                 if target.is_none() {
@@ -1716,14 +1693,9 @@ impl Volume {
         &self,
         parent: &referee::Snapshot,
         at: Oid,
-        names: &BTreeSet<(MergeFileIdentity, EventNumber)>,
+        undecided: &referee::Undecided,
     ) -> Result<BTreeMap<MergeFileIdentity, Lines>> {
-        let mut wanted = BTreeSet::new();
-        for (id, _) in names {
-            if sync::ended(parent, *id)? {
-                wanted.insert(*id);
-            }
-        }
+        let mut wanted = referee::ended_files(parent, undecided)?;
         let mut lines = BTreeMap::new();
         let mut cursor = at;
         while !wanted.is_empty() {
@@ -1882,7 +1854,7 @@ impl Volume {
                 let commit = self.repo.read_commit(*oid)?;
                 let base = *commit.parents.first().ok_or(Error::Format)?;
                 let source = tree_trailer(&commit.message)?.ok_or(Error::Format)?;
-                let keys = Self::changed_keys(&self.snapshot_at(base)?, &self.snapshot_at(*oid)?);
+                let keys = referee::touches(&self.snapshot_at(base)?, &self.snapshot_at(*oid)?);
                 plans.push(queue::Plan {
                     source,
                     files: keys,

@@ -42,12 +42,17 @@ missing from these tables or a row names a module that no longer exists;
 | `tree_actor/oracle.rs` | Tests only, until the module cut's step 5.1 ends: the old referee, sync and line rules, compared with the new on seeded trees |
 | `tree_actor/pages.rs` | The kernel's one page cache per file: page fills, page writes and the size replies for shared mappings (rules ledger, R1.4) |
 | `tree_actor/queue.rs` | Eligibility and prefix selection for writer-locked queue entries |
-| `tree_actor/referee.rs` | Whole-save parent referee for line and namespace versions, with causal collision records |
+| `tree_actor/referee/mod.rs` | The referee: every line and name rule of a fork and its upstream, pure. `land` composes verdicts, names, placing and whole into a decision; `sync` keeps a fork's undecided versions; `touches` gives a step's lock keys |
+| `tree_actor/referee/ancestry.rs` | The one ancestry walk (`descends`) over names and lines alike, and the one union of line ancestries |
+| `tree_actor/referee/names.rs` | Names: a landing's name onto a path a live upstream file holds (R11.2), and a sync's names with the fork's undecided ones kept |
+| `tree_actor/referee/placing.rs` | Where versions go in a file's lines: a landing's applying lines and its joins (R10.4, R10.8), a sync's undecided lines (R10.6, R10.9) |
+| `tree_actor/referee/undecided.rs` | A fork's undecided versions, through the referee's one question to history (`Landed`) |
+| `tree_actor/referee/verdicts.rs` | Rule 3 for one change, for names and lines alike: each changed version's verdict and its loss so far |
+| `tree_actor/referee/whole.rs` | R3e: a change lands whole or not at all; the collisions in their order |
 | `tree_actor/stages.rs` | Measurements only, never read by a decision: runs and time per actor stage, and the Git children the actor's path has started (counted at `git_cli::counted`, the one spawn site; target git-model §18) |
 | `tree_actor/tree.rs` | A tree's shared types: the event number a step is given, and the line versions (`<event>:<index>`, ordered as their text) and line maps it writes |
 | `tree_actor/tree_id.rs` | A tree's identity, `root` or `fork/<n>`: the text history, refs and checkouts name a tree by, parsed once where the journal is read |
-| `tree_actor/sync.rs` | Sync snapshots preserving undecided child versions without deciding collisions |
-| `tree_reconcile.rs` | Histogram save alignment, line identities, whole-change reconciliation and undecided sync |
+| `tree_reconcile.rs` | The line-map library: histogram alignment and line identities, generic over the caller's version |
 | `tree_git.rs` | Git executable backend for durable objects, the rebuildable copy of the refs in files format, `config` and `HEAD`, snapshots and private caches; Git children retain the actor lease |
 | `journal.rs` | The durable change log: framed, checksummed records with group-commit `fsync` |
 | `pending.rs` | Frozen copies in `pending/`: `FICLONE` reflink, else copy plus `fsync`; slot-numbered ids for fronts |

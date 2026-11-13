@@ -187,8 +187,16 @@ fn production(path: &Path) -> String {
 fn one_spawn_site() {
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut files = vec![src.join("tree_git.rs"), src.join("tree_reconcile.rs")];
-    for entry in std::fs::read_dir(src.join("tree_actor")).unwrap() {
-        files.push(entry.unwrap().path());
+    let mut dirs = vec![src.join("tree_actor")];
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                dirs.push(path);
+            } else {
+                files.push(path);
+            }
+        }
     }
     for file in files {
         let source = production(&file);

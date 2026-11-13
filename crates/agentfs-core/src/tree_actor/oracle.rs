@@ -891,9 +891,9 @@ mod old {
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::referee::{self, Collision, CollisionKind, File, Snapshot, Version};
+use super::referee::{self, Collision, CollisionKind, File, Snapshot, Undecided, Version};
 use super::tree::{EventNumber, LineVersion, Lines, Versions};
-use super::{MergeFileIdentity, NameHistory, sync};
+use super::{MergeFileIdentity, NameHistory};
 use crate::tree_reconcile::Line;
 
 /// A seeded generator (SplitMix64): the same seed gives the same case.
@@ -1170,6 +1170,13 @@ fn case(seed: u64) -> Case {
     let root = root.snapshot;
     let mut upstream = Side::new(root.clone());
     let mut incoming = Side::new(root.clone());
+    // One case in four, the upstream already holds the change's first operation (R3e.2): those
+    // versions are decided, so not the fork's undecided ones.
+    if rng.chance(1, 4) && incoming.operate(&mut rng, &mut clock) {
+        incoming.events.clear();
+        upstream = incoming.clone();
+        upstream.renamed_over = false;
+    }
     // The two sides' events interleave, as a volume's do.
     let (mut up, mut inc) = (rng.below(4), rng.below(4));
     while up + inc > 0 {
@@ -1259,6 +1266,7 @@ struct Seen {
     joins: u32,
     syncs_differ: u32,
     fallbacks: u32,
+    held: u32,
 }
 
 impl Seen {
@@ -1309,9 +1317,32 @@ impl Seen {
                 }
             });
         self.fallbacks += u32::from(fallback);
+        let held_line = case.incoming.files.iter().any(|(id, file)| {
+            let seen: BTreeSet<_> = case
+                .base
+                .files
+                .get(id)
+                .map(|b| b.lines.lines.iter().map(|l| l.version).collect())
+                .unwrap_or_default();
+            file.lines.lines.iter().any(|line| {
+                !seen.contains(&line.version)
+                    && case.upstream.files.get(id).is_some_and(|theirs| {
+                        theirs.lines.lines.iter().any(|l| l.version == line.version)
+                    })
+            })
+        });
+        let held_name = case.incoming.names.iter().any(|(id, name)| {
+            case.base.names.get(id).is_none_or(|b| b.head != name.head)
+                && case
+                    .upstream
+                    .names
+                    .get(id)
+                    .is_some_and(|u| u.head == name.head)
+        });
+        self.held += u32::from(held_line || held_name);
     }
 
-    fn floors(&self) -> [(&'static str, u32); 10] {
+    fn floors(&self) -> [(&'static str, u32); 11] {
         [
             ("decisions with collisions", self.collided),
             ("decisions without collisions", self.clean),
@@ -1323,6 +1354,7 @@ impl Seen {
             ("joins", self.joins),
             ("syncs unlike both inputs", self.syncs_differ),
             ("name fallbacks", self.fallbacks),
+            ("versions the upstream already holds", self.held),
         ]
     }
 }
@@ -1337,8 +1369,8 @@ fn land_and_sync_equal_the_oracle() {
         let case = case(seed);
         let old = old::referee::judge(&case.upstream, &case.base, &case.incoming, &case.prior)
             .unwrap_or_else(|e| panic!("seed {seed}: old judge: {e}"));
-        let new = referee::judge(&case.upstream, &case.base, &case.incoming, &case.prior)
-            .unwrap_or_else(|e| panic!("seed {seed}: judge: {e}"));
+        let new = referee::land(&case.upstream, &case.base, &case.incoming, &case.prior)
+            .unwrap_or_else(|e| panic!("seed {seed}: land: {e}"));
         assert_eq!(
             fingerprint(&new.snapshot),
             fingerprint(&old.snapshot),
@@ -1357,14 +1389,12 @@ fn land_and_sync_equal_the_oracle() {
             &case.last_lines,
         )
         .unwrap_or_else(|e| panic!("seed {seed}: old sync: {e}"));
-        let new_sync = sync::sync(
-            &case.upstream,
-            &case.incoming,
-            &case.undecided_lines,
-            &case.undecided_names,
-            &case.last_lines,
-        )
-        .unwrap_or_else(|e| panic!("seed {seed}: sync: {e}"));
+        let undecided = Undecided {
+            lines: case.undecided_lines.clone(),
+            names: case.undecided_names.clone(),
+        };
+        let new_sync = referee::sync(&case.upstream, &case.incoming, &undecided, &case.last_lines)
+            .unwrap_or_else(|e| panic!("seed {seed}: sync: {e}"));
         assert_eq!(
             fingerprint(&new_sync),
             fingerprint(&old_sync),

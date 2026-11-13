@@ -430,7 +430,7 @@ An open or rejected finding has a test marked `#[ignore = "coherence finding N: 
    `c`, so `c`'s identity takes `t`'s object there, and `t`'s identity ends. That save loses to the root's edit of `c`, and `t`
    comes back with its object number from the root: two identities on one object, so `c` read `t`'s bytes while the commit held
    the root's. Now a file that comes back to a tree that ended it takes a new object, numbered by the event that ended it, which
-   numbers nothing else (`sync.rs`), as the model mints a new one. Looking for other paths found one more with the same cause,
+   numbers nothing else (`referee/placing.rs`), as the model mints a new one. Looking for other paths found one more with the same cause,
    a break of R11.3 rather than of the view: a fork's unlink or rename-over that lost brought its file back on its old object,
    so a writer that held the unlinked file reached it again (`an_old_writer_stays_orphaned_when_the_unlink_loses`,
    `an_old_writer_stays_orphaned_when_the_rename_over_loses`, fixed by the same line). No other path gives a view its own bytes:
