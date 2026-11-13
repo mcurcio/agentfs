@@ -15,10 +15,16 @@ is. The libraries behind it, and why each was chosen, are under
 | `agentfs` | binary | The `agentfs` command (every subcommand is listed in [configuration](configuration.md#commands)); OpenTelemetry export |
 | `agentfs-csi` | library and binary | The CSI driver: `agentfs-csi`, one per node beside csi-provisioner, which makes the node's worktrees and supervises `agentfs serve-history`, `agentfs mount` and the release scan's `agentfs flush` and `agentfs push` children |
 | `agentfs-align` | library | Git's histogram diff, called one way, for line identity (git-model §7). `agentfs-core` and `agentfs-model` both depend on it, so line identity does not depend on how `git` is called; one module, `lib.rs` |
+| `agentfs-contracts` | library | The shared kernel of the domains around the git model ([the system](target-architecture/system.md)): values (the tree and volume identities, names, the pod context), capabilities and their minter, each domain's trait, errors and events, and the ports adapters implement. No I/O; depends on no other agentfs crate |
+| `agentfs-volume` | library | The Volume domain, pure over its ports: `ensure`, the lifecycle and the release verdict |
+| `agentfs-clients` | library | The Clients domain, pure over its ports: attachments, grants and each fork's one writer |
+| `agentfs-trees` | library | The Trees domain, pure over its ports: each fork's lifecycle |
 | `agentfs-conformance` | library and binary, tests only | The model's recorded calls against the real tree library and real mounts (git-model §18). Depends on `agentfs-core` and `agentfs-model`; nothing depends on it |
 
 The dependencies run one way: `agentfs-csi` → (`agentfs` as a child
-process) → `agentfs-fuse` → `agentfs-core`. `agentfs-csi` links
+process) → `agentfs-fuse` → `agentfs-core` → `agentfs-contracts`. The
+domain crates (`agentfs-volume`, `agentfs-clients`, `agentfs-trees`) depend
+on `agentfs-contracts` alone, and on no other domain. `agentfs-csi` links
 `agentfs-core` only to create state areas and read their status; it never
 records.
 
@@ -28,6 +34,45 @@ Every module of every crate, one line each. A test
 (`crates/agentfs-core/tests/docs_reference.rs`) fails when a module is
 missing from these tables or a row names a module that no longer exists;
 `tests.rs` files are not listed.
+
+### `agentfs-contracts`
+
+| Module | Role |
+|---|---|
+| `lib.rs` | Crate root: the module list and the shared kernel's overview |
+| `audit.rs` | Principals and the audit stamps every row carries (`Audited<T>`), written by the store adapter |
+| `caps.rs` | Capabilities (`LaunchCap`, `ClientCap`) and the one `Minter` a composition root makes |
+| `clients.rs` | The Clients domain's contract: client ids, grants, bindings, errors, events and the `Clients` trait |
+| `name.rs` | Validated names and labels (volume, pod field, writer, client, launcher, fork key) and the one safe-name rule |
+| `pod.rs` | The pod context a writer ran in, and a writer with it (`WriterAt`), as commits name them |
+| `ports.rs` | The ports adapters implement: the state area, each domain's rows as journal steps, queue facts, sessions and the event sink |
+| `tree.rs` | A tree's identity, `root` or `fork/<n>`, and a fork's number: the text history, refs and checkouts name a tree by |
+| `trees.rs` | The Trees domain's contract: fork settings, facts, phases, errors, events and the `Trees` trait |
+| `views.rs` | The Views domain's contract: mount points, mount options, errors and the `Views` trait |
+| `volume.rs` | The Volume domain's contract: identity, spec, lifecycle, the release verdict's facts and blockers, errors, events and the `Volume` trait |
+
+### `agentfs-volume`
+
+| Module | Role |
+|---|---|
+| `lib.rs` | Crate root: the Volume domain's overview |
+| `ensure.rs` | `ensure`'s one decision from what the state area holds |
+| `release.rs` | The release verdict, pure: every blocker, and the `Cleared` proof only `decide` builds |
+| `service.rs` | The Volume domain over its ports: ensure, stage, unstage and the Stop drain |
+
+### `agentfs-clients`
+
+| Module | Role |
+|---|---|
+| `lib.rs` | Crate root: the Clients domain's overview |
+| `service.rs` | The Clients domain over its ports: attach, detach, reconcile and the per-tree index rebuilt from rows |
+
+### `agentfs-trees`
+
+| Module | Role |
+|---|---|
+| `lib.rs` | Crate root: the Trees domain's overview |
+| `service.rs` | The Trees domain over its ports: fork create, end, end by key, the drop and the reaction to a tree's last detach |
 
 ### `agentfs-core`
 
@@ -58,7 +103,6 @@ missing from these tables or a row names a module that no longer exists;
 | `tree_actor/referee/whole.rs` | R3e: a change lands whole or not at all; the collisions in their order |
 | `tree_actor/stages.rs` | Measurements only, never read by a decision: runs and time per actor stage, and the Git children the actor's path has started (counted at `git_cli::counted`, the one spawn site; target git-model §18) |
 | `tree_actor/tree.rs` | A tree's shared types: the event number a step is given, the line versions (`<event>:<index>`, ordered as their text) and line maps it writes, and a tree's saved state (`Tree`), its files' identities and name histories |
-| `tree_actor/tree_id.rs` | A tree's identity, `root` or `fork/<n>`: the text history, refs and checkouts name a tree by, parsed once where the journal is read |
 | `tree_reconcile.rs` | The line-map library: histogram alignment and line identities, generic over the caller's version |
 | `tree_git.rs` | Git executable backend for durable objects, the rebuildable copy of the refs in files format, `config` and `HEAD`, snapshots and private caches; Git children retain the actor lease. It knows no ref layout and no trailer |
 | `journal.rs` | The durable change log: framed, checksummed records with group-commit `fsync` |
@@ -387,6 +431,7 @@ program where git does the job better.
 | Container image | `debian:trixie-slim` with `fuse3`, `libssl3t64`, `ca-certificates`, `git`, `tini` and `mergiraf`; both build and base images pinned by digest. Ships `agentfs` and `agentfs-csi` | Not distroless: the daemon runs `git repack`, and operators follow the runbooks with `git` through `kubectl exec`. `tini` is a subreaper, since the node plugin shares the host's pid namespace. It runs as root. `linux/amd64` only |
 | Front and CSI gRPC | `tonic` and `prost`, on `tokio`. The front's client is `hyper`'s HTTP/2 over the Unix socket | A request `hyper` hands back unsent is known never to have left, which tonic's `channel` would hide. No TLS: the sockets are node-local. `ci/check-deps.sh` checks the default build links no ring or rustls |
 | gRPC codegen | `protox` and `tonic-prost-build` in `build.rs` | A pure-Rust protobuf compiler: no `protoc` on build hosts or in the image |
+| Volume ids | the `uuid` crate (version 4, random) | The standard Rust implementation of RFC 9562: parsing and the hyphenated text in `agentfs-contracts`, generation (its `v4` feature, the OS's random source) only in the state-area adapter that creates a volume |
 | CSI spec | `csi.proto` v1.13.0, vendored in `crates/agentfs-csi/proto` | Pinned by copy; updating it is a deliberate change |
 | CSI sidecars | csi-provisioner (`--node-deployment`, in the node plugin pod), csi-node-driver-registrar and livenessprobe from `registry.k8s.io/sig-storage` | Pinned by digest in `deploy/csi/kustomization.yaml` |
 

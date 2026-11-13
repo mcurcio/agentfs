@@ -15,7 +15,6 @@ mod recording;
 mod referee;
 pub mod stages;
 mod tree;
-mod tree_id;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
@@ -30,6 +29,7 @@ use serde::Serialize;
 
 use crate::file_lock::{FileLock, Mode};
 use crate::tree_git::{RefUpdate, TreeGit};
+pub use agentfs_contracts::{NotATree, TreeId};
 use history::message::{self, Message};
 use history::upstreams::Upstreams;
 use history::{SyncStep, check_objects, refs, remove_stale_locks};
@@ -40,7 +40,6 @@ use pointers::Pointers;
 use recording::{Handle, pages};
 use stages::{Stages, Timer, Which};
 use tree::{EventNumber, Tree};
-pub use tree_id::{NotATree, TreeId};
 
 const FORMAT: &str = "agentfs-trees-3\n";
 const JOURNAL: &str = "calls.wal";

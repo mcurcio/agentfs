@@ -1,0 +1,11 @@
+[package]
+name = "agentfs-clients"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The clients domain of agentfs: pure, over the ports in agentfs-contracts"
+
+[dependencies]
+agentfs-contracts = { version = "0.1.0", path = "../agentfs-contracts" }

@@ -6,16 +6,30 @@
 use std::fmt;
 use std::str::FromStr;
 
+use serde::{Deserialize, Serialize};
+
 /// A tree's identity in its volume. Its text (`root`, `fork/<n>`) is what history
 /// records (`Agentfs-Tree`) and what every internal ref and checkout is named by;
 /// never a published branch name (docs/trees.md).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
 pub enum TreeId {
     /// The tree with no upstream. Sorts before every fork.
     Root,
     /// A tree with one upstream, made at journal event `n` (never reused). Forks
     /// sort by `n`.
     Fork(u64),
+}
+
+/// A fork's number in its volume: the journal event that made it, never reused.
+/// `TreeId::Fork(n)` and `ForkId(n)` name the same fork.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct ForkId(pub u64);
+
+impl From<ForkId> for TreeId {
+    fn from(fork: ForkId) -> Self {
+        Self::Fork(fork.0)
+    }
 }
 
 /// Text that names no tree.
@@ -27,6 +41,14 @@ impl TreeId {
     /// Whether this is the root, the tree with no upstream.
     pub fn is_root(self) -> bool {
         self == Self::Root
+    }
+
+    /// The fork this tree is; `None` for the root.
+    pub fn fork(self) -> Option<ForkId> {
+        match self {
+            Self::Root => None,
+            Self::Fork(n) => Some(ForkId(n)),
+        }
     }
 }
 
@@ -56,6 +78,20 @@ impl FromStr for TreeId {
             .and_then(|n| n.parse().ok())
             .map(Self::Fork)
             .ok_or_else(|| NotATree(text.to_owned()))
+    }
+}
+
+impl TryFrom<String> for TreeId {
+    type Error = NotATree;
+
+    fn try_from(text: String) -> Result<Self, NotATree> {
+        text.parse()
+    }
+}
+
+impl From<TreeId> for String {
+    fn from(tree: TreeId) -> Self {
+        tree.to_string()
     }
 }
 

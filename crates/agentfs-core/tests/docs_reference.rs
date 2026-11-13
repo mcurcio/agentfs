@@ -159,6 +159,10 @@ fn every_module_is_in_the_architecture_map() {
     ));
     let mut problems = Vec::new();
     for krate in [
+        "agentfs-contracts",
+        "agentfs-volume",
+        "agentfs-clients",
+        "agentfs-trees",
         "agentfs-core",
         "agentfs-fuse",
         "agentfs",
@@ -174,7 +178,7 @@ fn every_module_is_in_the_architecture_map() {
         };
         let documented = key_cells(section);
         let actual = modules(krate);
-        assert!(actual.len() > 3, "no modules found for {krate}");
+        assert!(!actual.is_empty(), "no modules found for {krate}");
         for module in actual.difference(&documented) {
             problems.push(format!("{krate}: add a row for `{module}`"));
         }

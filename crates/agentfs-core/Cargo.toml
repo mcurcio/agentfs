@@ -9,6 +9,9 @@ description = "Recording, journal and history engine for agentfs"
 
 [dependencies]
 agentfs-align = { version = "0.1.0", path = "../agentfs-align" }
+# The shared kernel: values (the tree identity among them), capabilities and the
+# ports agentfs-core's adapters implement.
+agentfs-contracts = { version = "0.1.0", path = "../agentfs-contracts" }
 # known_hosts key blobs and hashed host names, and OpenSSH private key
 # headers.
 base64 = "0.23.1"
