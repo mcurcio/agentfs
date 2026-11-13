@@ -41,8 +41,9 @@ Smaller slices, one page each:
 
 | Slice | Page |
 |---|---|
+| Moving every launcher onto the tree views and deleting the recording engine: milestones M1 to M9, the baseline, the deferred extras | [One engine](future/one-engine.md) |
 | Cutting the tree actor into six modules | [Module cut](future/module-cut.md) |
-| Configuring the root branch's name instead of `main` | [Root branch name](future/root-branch-name.md) |
+| The name the root is published under, apart from its identity | [Root branch name](future/root-branch-name.md) |
 | Transactions | [Transactions](future/transactions.md) |
 | Nested forks on trees | [Nested forks](future/nested-forks.md) |
 | Directories, symlinks, non-UTF-8 names and more links in the tree views | [Beyond flat files](future/tree-views-beyond-flat-files.md) |
@@ -62,6 +63,10 @@ Smaller slices, one page each:
 | Reloading OTLP TLS files | [OTLP TLS reload](future/otlp-tls-reload.md) |
 | Cloning a claim that is in use | [Clone in use](future/clone-in-use.md) |
 | Forge CI on hidden fork refs | [Forge CI](future/forge-ci-on-hidden-refs.md) |
+| Handing a fork's change to a receiver; forks that never land | [Fork delivery](future/fork-delivery.md) |
+| The integrator's checkpoint and the patch queue's notices | [Checkpoints and patch notices](future/integrator-hooks.md) |
+| Recording, committing and pushing with no mount | [Recording without a mount](future/recording-without-a-mount.md) |
+| A state area on NFS | [State on NFS](future/state-on-nfs.md) |
 
 ## How to read a page
 

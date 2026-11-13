@@ -85,6 +85,8 @@ that point to it.
 [Overview](target-architecture/README.md). The designs of slices that are not
 built are under `target-architecture/`; the baseline pages are listed above. When
 a slice is built, its page is deleted and the behaviour is in the pages above.
+The plan from today's two engines to one is
+[One engine](target-architecture/future/one-engine.md).
 
 ## The project
 
