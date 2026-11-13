@@ -18,8 +18,10 @@ enum Command {
     Fork,
     /// Recover and mount the root, optionally also a sandbox. Unmount all views to exit.
     Mount {
-        /// An existing empty directory, outside the state area.
-        root: PathBuf,
+        /// Mount the root here: an existing empty directory, outside the
+        /// state area. Not named `root`: that id is the global `--root`.
+        #[arg(value_name = "ROOT")]
+        mountpoint: PathBuf,
         /// Mount a sandbox in this existing empty directory too.
         #[arg(long)]
         sandbox: Option<PathBuf>,
@@ -44,7 +46,7 @@ pub fn run(state: &Path, args: Args) -> Result<()> {
         Command::Init => println!("{} {}", TreeId::Root, volume.head(TreeId::Root)?),
         Command::Fork => println!("{}", volume.fork()?),
         Command::Mount {
-            root,
+            mountpoint: root,
             sandbox,
             fork,
             writer,
@@ -78,4 +80,37 @@ pub fn run(state: &Path, args: Args) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Command;
+    use clap::Parser;
+
+    /// The mount point never lands in the global `--root` (an arg id clash
+    /// does exactly that, and `trees` then refuses to run).
+    #[test]
+    fn mount_point_is_not_the_global_root() {
+        let cli = crate::Cli::try_parse_from([
+            "agentfs",
+            "--state",
+            "s",
+            "trees",
+            "mount",
+            "m",
+            "--sandbox",
+            "x",
+            "--fork",
+            "fork/1",
+        ])
+        .expect("parses");
+        assert!(cli.root.is_none(), "positional leaked into --root");
+        let crate::Command::Trees(args) = cli.command else {
+            panic!("not trees");
+        };
+        let Command::Mount { mountpoint, .. } = args.command else {
+            panic!("not mount");
+        };
+        assert_eq!(mountpoint, std::path::PathBuf::from("m"));
+    }
 }

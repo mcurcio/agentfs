@@ -2140,3 +2140,36 @@ fn current_uid() -> u32 {
 fn current_gid() -> u32 {
     std::fs::metadata("/proc/self").map_or(0, |m| std::os::unix::fs::MetadataExt::gid(&m))
 }
+
+#[cfg(test)]
+mod cli_tests {
+    use super::Cli;
+    use clap::CommandFactory;
+
+    /// Clap stores a value by arg id, so a subcommand arg sharing an id with
+    /// a global arg sends its value to the global one. No id may be shared.
+    #[test]
+    fn no_subcommand_arg_shares_a_global_id() {
+        fn walk(cmd: &clap::Command, path: &str, globals: &[String], clashes: &mut Vec<String>) {
+            for sub in cmd.get_subcommands() {
+                let path = format!("{path} {}", sub.get_name());
+                for arg in sub.get_arguments().filter(|a| !a.is_global_set()) {
+                    if globals.iter().any(|g| g == arg.get_id().as_str()) {
+                        clashes.push(format!("{path}: {}", arg.get_id()));
+                    }
+                }
+                walk(sub, &path, globals, clashes);
+            }
+        }
+        let cli = Cli::command();
+        let globals: Vec<String> = cli
+            .get_arguments()
+            .filter(|a| a.is_global_set())
+            .map(|a| a.get_id().to_string())
+            .collect();
+        assert!(globals.contains(&"root".to_string()));
+        let mut clashes = Vec::new();
+        walk(&cli, "agentfs", &globals, &mut clashes);
+        assert!(clashes.is_empty(), "args sharing a global id: {clashes:?}");
+    }
+}
