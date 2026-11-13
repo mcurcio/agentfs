@@ -5,13 +5,13 @@ atomic_save_leaves_the_old_object	R11	64	caught	assert
 client_death_keeps_its_locks	R9	64	caught	locks
 collision_record_in_the_wrong_commit	R5.1	64	caught	upstream_wins
 converge_move_queues_one_child_only	R1	64	caught	step_checked
-crash_drops_a_transactions_journal	R12	64	caught	assert
 crash_drops_deferred_calls	R5.3	64	caught	assert
 crash_drops_the_journal	R12	64	caught	assert
+crash_keeps_an_open_transaction	R5.3	64	caught	oracle_crash
 crash_relinks_a_dead_open	R12	64	caught	oracle_orphans
 crash_saves_an_open_a_save_names	R12	64	caught	one_writer
 deferred_calls_applied_out_of_order	R5.3	64	caught	assert
-deferred_flag_dropped	R5.3	64	caught	locks
+deferred_flag_dropped	R5.3	64	caught	assert
 edit_of_a_file_the_upstream_unlinked_applies	R11	64	caught	placed_and_unlinked
 entry_overtakes_a_waiting_entry_of_its_file	P1	64	caught	assert
 entry_overtakes_a_waiting_entry_of_its_fork	P1	64	caught	assert
@@ -40,6 +40,10 @@ sync_delivers_past_an_open_file	P2	64	caught	assert
 sync_never_delivers_a_prefix	P2	64	caught	assert
 transaction_close_saves_at_once	R5.3	64	caught	assert
 transaction_close_wakes_nothing	R9.18	64	caught	locks
+transaction_commit_always_merges	R6.2	64	caught	transactions_end_as_told
+transaction_commit_keeps_the_raw_index	R5.5	64	caught	one_writer
 transaction_open_holds_nothing	R9.18	64	caught	assert
+transaction_save_commits	R5.5	64	caught	one_writer
+transaction_that_changes_nothing_commits	R5.5	64	caught	assert
 unfinished_line_lands_before_a_kept_line	R10.8	64	caught	no_joined_lines
 waiting_take_records_only_open_files	R9	64	caught	locks

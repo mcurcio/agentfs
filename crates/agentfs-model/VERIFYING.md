@@ -225,11 +225,13 @@ A planted bug is one deliberate mistake in a copy of the model. It shows which t
    leaves the replaced file's old object at its path; a crash whose replay saves an open a save already names, or
    drops the journal. From the review of 2026-11-04: a crash replay that re-links each open to its file identity
    (a dead handle saved into the file that replaced it); a waiting take that records only its files open now; a
-   crash that drops a transaction's journaled calls. From the owner's decisions of 2026-11-04: P3 reintroduced (a
+   crash that keeps an open transaction (R5.3's pick: it rolls back). From the owner's decisions of 2026-11-04: P3 reintroduced (a
    new write-open waits behind a waiting take); a sync that delivers the upstream's head whatever is open (past an open
    file); a sync that never delivers a prefix (it waits whole); and
    each fix of findings 11, 25 and 26 reverted. From R5.3: a close of a transaction's file that saves at once; deferred
-   calls applied out of order; a rollback that drops them; a crash that drops them.
+   calls applied out of order; a rollback that drops them; a crash that drops them. From R5.5: a staged save that
+   commits on the transaction's branch; a transaction's commit that keeps the index's raw records (not one save over
+   begin); one that merges though its fork is still at begin (R6.2); one that commits when it changes nothing.
 3. Run `cargo test --locked -p agentfs-model --no-fail-fast` in the copy (and 500 seeds for a bug the
    scenarios miss), with a separate target directory per copy: in the container, mount the copy as `/src`
    and a volume of its own as `/target` (`-v agentfs-target-m1:/target`).

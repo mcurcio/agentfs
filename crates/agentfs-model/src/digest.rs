@@ -402,7 +402,7 @@ P refs/collisions/1 1
     #[test]
     fn the_roots_name_changes_no_digest() {
         let text = text_of_a_run_under(MODEL_ROOT);
-        for needed in [COLLISION, "\nAgentfs-Tree: X1\n", "\nP T0 "] {
+        for needed in [COLLISION, "\nAgentfs-Cause: Transaction t1\n", "\nP T0 "] {
             assert!(text.contains(needed), "no {needed:?} in:\n{text}");
         }
         assert!(!text.contains(MODEL_ROOT), "the root's name is in:\n{text}");

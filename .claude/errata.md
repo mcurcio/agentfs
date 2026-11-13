@@ -650,3 +650,27 @@ Not blocking; the suite is built and green. Findings about the brief and the doc
 8. **No corpus bug can isolate R10.5**: the referee takes no direction, so a transaction's
    commit and a landing are one code path; `line_follows_the_upstreams_unfinished_last_line`
    switches R10.4 off for both.
+
+## 2026-11-13, Part B: a transaction recorded as one commit
+
+1. **git-model §9 always merged a transaction's commit**, against R6.2 under R10.11 (a landing on the current head is
+   a fast-forward). The model now fast-forwards the fork to T when the fork is still at begin, and the check
+   `transactions_end_as_told` fails a merge made at begin.
+2. **git-model §4 and §9 named `refs/txn-start/<n>`**, which the model never wrote. Gone: `txn/<n>` itself now holds
+   begin and never moves.
+3. **MODEL.md rule 12 replayed a transaction's open "into the transaction's branch"**, and the model kept a
+   transaction alive across a crash, against R5.3's recorded pick ("the crash rolls the transaction back and applies
+   the call", 2026-11-05) and A13. The design for this part recommended keeping survival (its Q2); the review showed
+   that anchors on the code against the ledger. A crash now rolls back every open transaction and applies its deferred
+   calls; `r12_a_crash_saves_an_open_inside_a_transaction` and `r5_a_crash_keeps_what_a_transaction_deferred` became
+   `r12_a_crash_rolls_back_an_open_transaction` and `r5_a_crash_rolls_back_and_applies_what_it_deferred`, and the
+   corpus bug `crash_drops_a_transactions_journal` (now the correct behaviour) became `crash_keeps_an_open_transaction`.
+4. **The design's `Agentfs-Tree: txn/<n>` on T broke the independent landing ledger** (`tests/gitledger/mod.rs`) and
+   `upstream_wins` once T is fast-forwarded into the fork and lands upstream. T names its fork; `upstream_wins` reads a
+   transaction's loser by its `Agentfs-Cause`, and the ledger reads a one-parent `Transaction` commit as a fast-forward
+   take.
+5. **The design's "reachable commit naming `txn/<n>`" crash marker was redundant**: the ref's absence already says the
+   transaction ended, and a crash now rolls back whatever still has its ref.
+6. **`transactions_frozen`'s first cut required begin to stay an ancestor of the fork's head.** A sync may fast-forward
+   past the fork's own sync merge (R6.1, 2026-11-09), so begin can leave the fork's history (seeds 20, 54, 61). The
+   clause is gone; the ref's value is the check.

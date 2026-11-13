@@ -11,7 +11,7 @@ use agentfs_model::recording::{Target, Write};
 use agentfs_model::service::Step;
 use agentfs_model::world::{
     By, Direction, Life, LineEdit, MODEL_ROOT, MergeRule, ModelError, Overwritten, Policies,
-    TreeNames, TxnOutcome, World, decisions_in,
+    TreeNames, TxnEnd, TxnOutcome, World, decisions_in,
 };
 use std::collections::BTreeSet;
 
@@ -557,7 +557,6 @@ fn r3_a_transaction_loses_whole_and_is_told() {
     w.begin(f).unwrap();
     let s = w.save(&c, "a", 0);
     let s2 = w.save(&c, "b", 0);
-    let staged = w.forks[&f].txn.as_ref().expect("open").head.clone();
     let m = w.save(&m1(), "a", 0);
     drain(&mut w);
     assert_eq!(
@@ -580,6 +579,8 @@ fn r3_a_transaction_loses_whole_and_is_told() {
         })
     );
     ok(&mut w);
+    // The transaction's one commit, the merge's second parent, lost.
+    let staged = git(w.repo(), &["rev-parse", &format!("{}^2", w.head(f))]);
     assert_eq!(
         decided(&w),
         [
@@ -916,6 +917,114 @@ fn r5_transaction_commits_clean() {
     assert!(has(&w, TreeId::ROOT, "a", &sa) && has(&w, TreeId::ROOT, "b", &sb));
     assert_eq!(root_writers(&w).len(), before + 1, "one commit");
     assert_eq!(root_writers(&w)[0], "c1");
+}
+
+/// R5.5 (the owner, 2026-11-13: "a transaction should be recorded as one
+/// commit"): saves in a transaction make no commit; `txn/<n>` stays at begin.
+/// The commit is one commit T on begin, naming each open it staged a save
+/// of; with the fork still at begin it is a fast-forward (R6.2), so the
+/// fork's history gains exactly T.
+#[test]
+fn r5_a_transaction_is_recorded_as_one_commit() {
+    let mut w = world();
+    let f = w.create_fork(TreeId::ROOT);
+    let c = Client::Fork(f);
+    let begin = w.head(f);
+    w.begin(f).unwrap();
+    let branch = TreeNames::txn_branch(1);
+    let all = w.all_commits().len();
+    let (ha, hb) = (w.open_write(&c, "a"), w.open_write(&c, "b"));
+    let sa = w.edit(ha, LineEdit::At(0)).unwrap();
+    let sb = w.edit(hb, LineEdit::At(0)).unwrap();
+    w.close(ha);
+    w.close(hb);
+    ok(&mut w);
+    assert_eq!(w.all_commits().len(), all, "a staged save makes no commit");
+    assert_eq!(git(w.repo(), &["rev-parse", &branch]), begin);
+    assert!(w.client_reads(&c, "a").contains(&sa));
+    assert_eq!(w.commit_txn(f), Ok(TxnOutcome::Committed));
+    ok(&mut w);
+    let t = w.head(f);
+    assert_eq!(
+        git(w.repo(), &["rev-list", &format!("{begin}..{t}")]),
+        t,
+        "one commit"
+    );
+    assert_eq!(show(&w, &t, "%P"), begin);
+    assert_eq!(
+        show(&w, &t, "%(trailers:key=Agentfs-Cause,valueonly)"),
+        "Transaction t1"
+    );
+    assert_eq!(
+        show(&w, &t, "%(trailers:key=Agentfs-Tree,valueonly)"),
+        "fork/1"
+    );
+    assert_eq!(
+        show(
+            &w,
+            &t,
+            "%(trailers:key=Agentfs-Open,valueonly,separator=%x2c)"
+        ),
+        format!("{ha},{hb}")
+    );
+    assert!(has(&w, f, "a", &sa) && has(&w, f, "b", &sb));
+    assert!(
+        git(w.repo(), &["for-each-ref", &branch]).is_empty(),
+        "its branch is gone"
+    );
+    drain(&mut w);
+    assert!(has(&w, TreeId::ROOT, "a", &sa) && has(&w, TreeId::ROOT, "b", &sb));
+}
+
+/// R5.5: a line staged twice is one version in T, written over begin's: the
+/// version staged between is in no commit. A line staged and written back
+/// keeps begin's version.
+#[test]
+fn r5_a_line_staged_twice_is_one_version_over_begin() {
+    let mut w = world();
+    let f = w.create_fork(TreeId::ROOT);
+    let c = Client::Fork(f);
+    w.begin(f).unwrap();
+    w.save(&c, "a", 0);
+    let last = w.save(&c, "a", 0);
+    w.save(&c, "a", 1);
+    let h = w.open_write(&c, "a");
+    w.edit_text(h, LineEdit::At(1), BLANK);
+    w.close(h);
+    let staged = w.save(&c, "a", 2);
+    assert_eq!(w.commit_txn(f), Ok(TxnOutcome::Committed));
+    ok(&mut w);
+    let a = w.file(&w.head(f), "a");
+    let root = Content::root("a");
+    assert_eq!(a.lines[0].id, last);
+    assert_eq!(
+        a.lines[0].over.as_deref(),
+        Some("a0"),
+        "written over begin's"
+    );
+    assert_eq!(a.lines[1], root.lines[1], "written back: begin's version");
+    assert_eq!(a.lines[2].id, staged);
+    assert_eq!(a.lines[2].over.as_deref(), Some("a2"));
+    drain(&mut w);
+}
+
+/// R5.5, net nothing: a transaction whose staged saves are all written back
+/// changes nothing over begin, so it makes no commit and is told `Empty`.
+#[test]
+fn r5_a_transaction_that_changes_nothing_makes_no_commit() {
+    let mut w = world();
+    let f = w.create_fork(TreeId::ROOT);
+    let c = Client::Fork(f);
+    let begin = w.head(f);
+    w.begin(f).unwrap();
+    w.save(&c, "a", 0);
+    let h = w.open_write(&c, "a");
+    w.edit_text(h, LineEdit::At(0), BLANK);
+    w.close(h);
+    assert_eq!(w.commit_txn(f), Ok(TxnOutcome::Empty));
+    ok(&mut w);
+    assert_eq!(w.head(f), begin);
+    drain(&mut w);
 }
 
 /// Rule 5, no race: the same calls as
@@ -1711,7 +1820,7 @@ fn r10_a_transactions_line_after_the_forks_unfinished_line_loses_whole() {
     let c = Client::Fork(f);
     w.begin(f).unwrap();
     calls(&mut w, &c, "b", &[Write::Append("n9\n".into())]);
-    let staged = w.file(&w.forks[&f].txn.as_ref().expect("open").head, "b");
+    let staged = w.file(&w.forks[&f].txn.as_ref().expect("open").index, "b");
     let n9 = staged.last().to_string();
     let n9_line = staged.live().last().expect("n9").line.clone();
     // The fork's own unfinished line arrives after begin, by a sync.
@@ -1762,7 +1871,7 @@ fn r10_a_transactions_unfinished_line_before_a_kept_line_loses_whole() {
             Write::Truncate(11),
         ],
     );
-    let staged = w.file(&w.forks[&f].txn.as_ref().expect("open").head, "c");
+    let staged = w.file(&w.forks[&f].txn.as_ref().expect("open").index, "c");
     assert_eq!(staged.bytes(), "-\n-\n-\n-\n-\ny");
     let y = staged.last().to_string();
     let y_line = staged.live().last().expect("y").line.clone();
@@ -2276,11 +2385,13 @@ fn r5_a_clients_death_applies_what_its_transaction_deferred() {
     assert!(has(&w, TreeId::ROOT, "a", &x) && has(&w, TreeId::ROOT, "a", &y));
 }
 
-/// R5.3 with rule 12: a crash keeps a deferred call in the journal behind
-/// its transaction, which survives; an open of its file defers at the
-/// restart's replay. Each applies once, after the commit.
+/// R5.3 with rule 12 (the owner, 2026-11-05: "the crash rolls the
+/// transaction back and applies the call"): a crash rolls the open
+/// transaction back, leaving nothing of it, then applies the calls it
+/// deferred, in order; an open of its file is replayed from the journal into
+/// the fork, as its close would have saved it.
 #[test]
-fn r5_a_crash_keeps_what_a_transaction_deferred() {
+fn r5_a_crash_rolls_back_and_applies_what_it_deferred() {
     let mut w = world();
     let f = w.create_fork(TreeId::ROOT);
     let t = f;
@@ -2293,21 +2404,20 @@ fn r5_a_crash_keeps_what_a_transaction_deferred() {
     w.close(closed);
     w.unlink(&other, "b");
     let y = w.edit(open, LineEdit::Append).unwrap();
-    let start = w.head(t);
+    assert_eq!(w.deferred(f).len(), 2);
     w.crash();
     ok(&mut w);
-    assert_eq!(w.head(t), start, "still behind the transaction");
-    assert_eq!(w.deferred(f).len(), 3);
-    assert!(w.handles().all(|h| h.deferred));
-    assert_eq!(w.commit_txn(f), Ok(TxnOutcome::Committed));
-    ok(&mut w);
+    assert!(w.forks[&f].txn.is_none(), "the crash rolled it back");
+    assert_eq!(w.ended.last().unwrap().how, TxnEnd::Rollback);
+    assert!(w.deferred(f).is_empty() && w.handles().next().is_none());
     let a = w.file(&w.head(t), "a");
-    assert!(a.holds(&x) && a.holds(&y) && a.holds(&staged));
-    let result = w.ended.last().unwrap().result.clone().unwrap();
-    assert!(w.file(&result, "b").holds(&staged_b));
-    assert_eq!(w.path_of(t, "b"), None);
+    assert!(a.holds(&x) && a.holds(&y) && !a.holds(&staged));
+    assert!(!w.file(&w.head(t), "b").holds(&staged_b));
+    assert_eq!(w.path_of(t, "b"), None, "the deferred unlink applied");
+    assert_eq!(w.commit_txn(f), Err(ModelError::NoTransaction));
     drain(&mut w);
     assert!(has(&w, TreeId::ROOT, "a", &x) && has(&w, TreeId::ROOT, "a", &y));
+    assert!(!has(&w, TreeId::ROOT, "a", &staged));
 }
 
 /// R5.3 with R3c.2 and rule 9: a deferred save has not happened, so its file
@@ -3564,33 +3674,25 @@ fn r9_a_writer_holding_a_waited_file_is_not_made_to_wait() {
     assert_eq!(w.read(TreeId::ROOT, "a"), w.read(f, "a"));
 }
 
-/// Rule 12 inside a transaction: an open in the transaction is in the
-/// journal like any other, so a crash saves its calls into the
-/// transaction's branch (a ref, which survives); the commit then carries
-/// them into the fork and on to the root.
+/// Rule 12 inside a transaction (R5: "a failure is an implicit rollback"):
+/// a crash rolls the open transaction back, so an open in it ends unsaved,
+/// as at a rollback; nothing of it reaches any tree or any commit.
 #[test]
-fn r12_a_crash_saves_an_open_inside_a_transaction() {
+fn r12_a_crash_rolls_back_an_open_transaction() {
     let mut w = world();
     let f = w.create_fork(TreeId::ROOT);
+    let start = w.head(f);
     w.begin(f).unwrap();
     let h = w.open_write(&Client::Fork(f), "a");
     w.write(h, Write::Append("txn\n".into()));
     w.crash();
     ok(&mut w);
-    assert!(w.saved(h), "the replay saved the open");
+    assert!(!w.saved(h), "the open is not saved");
     assert_eq!(w.handles().count(), 0);
-    assert!(
-        !w.read(f, "a").bytes().ends_with("txn\n"),
-        "the transaction's save stays in its branch until commit"
-    );
-    assert_eq!(w.commit_txn(f), Ok(TxnOutcome::Committed));
-    ok(&mut w);
-    assert!(
-        w.read(f, "a").bytes().ends_with("txn\n"),
-        "the commit carries the replayed call"
-    );
+    assert_eq!(w.head(f), start);
+    assert_eq!(w.commit_txn(f), Err(ModelError::NoTransaction));
     drain(&mut w);
-    assert!(w.read(TreeId::ROOT, "a").bytes().ends_with("txn\n"));
+    assert!(!w.read(TreeId::ROOT, "a").bytes().ends_with("txn\n"));
 }
 
 /// Rule 9 with P1 (the review of 2026-11-04, P1-c): a long-held file holds

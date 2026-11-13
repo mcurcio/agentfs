@@ -187,9 +187,9 @@ id = "collision_record_in_the_wrong_commit"
 rule = "R5.1"
 seeds = 64
 find = '''
-            let refs = self.record(t, Direction::Transaction, &m, &decisions, &ours, &c);'''
+                let refs = self.record(f, Direction::Transaction, &m, &decisions, &ours, &c);'''
 replace = '''
-            let refs = self.record(t, Direction::Transaction, &m, &decisions, &ours, &ours);'''
+                let refs = self.record(f, Direction::Transaction, &m, &decisions, &ours, &ours);'''
 
 [[bug]]
 id = "incoming_insert_before_the_upstreams"
@@ -286,17 +286,15 @@ replace = '''
                     files: open.clone(),'''
 
 [[bug]]
-id = "crash_drops_a_transactions_journal"
-rule = "R12"
+id = "crash_keeps_an_open_transaction"
+rule = "R5.3"
 seeds = 64
 find = '''
-    fn restart_open_unshown(&mut self, id: HandleId) {'''
-replace = '''
-    fn restart_open_unshown(&mut self, id: HandleId) {
-        if matches!(self.recording.handle(id).target, Target::Txn(..)) {
-            self.recording.remove(id);
-            return;
+        for f in open {
+            self.rollback_only(f).expect("open");
         }'''
+replace = '''
+        let _ = open;'''
 
 [[bug]]
 id = "sync_delivers_past_an_open_file"
@@ -379,16 +377,15 @@ id = "crash_drops_deferred_calls"
 rule = "R5.3"
 seeds = 64
 find = '''
-        self.queues.clear_waits();
-        let replay = self'''
+        for f in forks {
+            while self.apply_deferred(f).is_some() {}
+        }'''
 replace = '''
-        self.queues.clear_waits();
-        for f in self.forks.keys() {
-            while let Some(h) = self.queues.next_deferred(*f) {
+        for f in forks {
+            while let Some(h) = self.queues.next_deferred(f) {
                 self.recording.remove(h);
             }
-        }
-        let replay = self'''
+        }'''
 
 [[bug]]
 id = "p43a_hide_after_any_own_line"
@@ -486,3 +483,41 @@ replace = '''
         if let Target::Tree(t) = target {
             self.wake(t);
         }'''
+
+[[bug]]
+id = "transaction_save_commits"
+rule = "R5.5"
+seeds = 64
+find = '''
+                txn.index = t.clone();'''
+replace = '''
+                txn.index = t.clone();
+                let c = git_in(&self.repo, &["commit-tree", &t, "-m", "Direct\n\nAgentfs-Writer: x\nAgentfs-Cause: Direct\nAgentfs-Tree: txn/0\n"], "");
+                git(&self.repo, &["update-ref", &TreeNames::txn_branch(id), &c]);'''
+
+[[bug]]
+id = "transaction_commit_keeps_the_raw_index"
+rule = "R5.5"
+seeds = 64
+find = '''
+                let t = content::one_save(&b, &self.file(&index, &p));'''
+replace = '''
+                let t = self.file(&index, &p);'''
+
+[[bug]]
+id = "transaction_commit_always_merges"
+rule = "R6.2"
+seeds = 64
+find = '''
+            let (c, lines) = if ours == start {'''
+replace = '''
+            let (c, lines) = if false && ours == start {'''
+
+[[bug]]
+id = "transaction_that_changes_nothing_commits"
+rule = "R5.5"
+seeds = 64
+find = '''
+                (t != b).then_some((p, t))'''
+replace = '''
+                Some((p, t))'''

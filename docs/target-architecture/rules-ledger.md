@@ -132,8 +132,8 @@ of their day: "main" is the root, a "sandbox" is a fork, a "parent" is an upstre
 
 ## 3. Transactions
 
-- **R5** · owner · Opt-in. Begin opens a new branch frozen at the fork's version. The program sees its own
-  edits while the fork keeps syncing. Rollback, abandon or the client dying drops the branch. Commit lands it
+- **R5** · owner · Opt-in. Begin opens a new branch frozen at the fork's version. The program's saves stage in the
+  transaction's index (R5.5) and it sees its own edits while the fork keeps syncing. Rollback, abandon or the client dying drops the branch. Commit lands it
   in the fork whole or not at all, and tells the program. Source: "Frozen snapshot was my intention, yes.
   That's why I said “new branch” earlier." (2026-11-02); "It’s a transaction, so a failure is an implicit
   rollback." (2026-11-02). Tests: `r5_transaction_commits_clean`, `r5_transaction_rollback_and_client_death_leave_nothing`,
@@ -151,8 +151,19 @@ of their day: "main" is the root, a "sandbox" is a fork, a "parent" is an upstre
   Deferred: other writes to those files are accepted and applied in order after the transaction completes. Owner, 2026-11-05: "deferred, obviously. thats what i mean by "lock" -- its about ordering the operations so that agentfs has a change to mutate the filesystem without a client fighting it".
   Its files, owner, 2026-11-05: "The changes that it adds to the transaction." A deferred call and a sync: the sync
   waits until the transaction ends (owner picked this, 2026-11-05, cost stated). A deferred call at a crash: the crash
-  rolls the transaction back and applies the call (owner picked this, 2026-11-05). The model does not match these
-  yet: it counts files open for writing and keeps a deferred call behind a surviving transaction.
+  rolls the transaction back and applies the call (owner picked this, 2026-11-05); the model does so for every open
+  transaction at a crash. The model does not match the rest yet: it counts files open for writing, and a sync does
+  not wait for the transaction. Tests: `r5_a_crash_rolls_back_and_applies_what_it_deferred`
+- **R5.5** · owner · A transaction is recorded as one commit. Its saves make no commit: they stage in its index, and its
+  commit makes one commit of everything staged, on the commit it began at, which then lands in the fork as any change
+  lands (R10.11): a fast-forward if the fork has not moved (R6.2). Owner, 2026-11-13, asked as general guidance whether
+  saves inside a transaction are commits on `txn/<n>` or staged: "a transaction should be recorded as one commit";
+  2026-11-12: "the "save" operation isnt creating git commits; instead the changes are being accumulated and only get
+  committed when the transaction itself closes/commits". Revisable: guidance, not a rule. The commit's form is the
+  model's choice, not his words: one save over begin (a line's last staged version written over begin's, begin's
+  version where written back), one `Agentfs-Open` per open it staged a save of, and no commit, told `Empty`, when it
+  changes nothing over begin (git-model, Questions for the owner). Tests: `r5_a_transaction_is_recorded_as_one_commit`,
+  `r5_a_line_staged_twice_is_one_version_over_begin`, `r5_a_transaction_that_changes_nothing_makes_no_commit`
 - **R5.4** · owner · A transaction has no owner program. Owner, 2026-11-05: "There is no “who” in a transaction —
   transactions stage file changes"; "A transaction is an agentfs concept, not a property of the local/shared fs."
   Not built: the model still binds a transaction to a client and adds `Client::Outside`, which no rule supports.
@@ -373,10 +384,9 @@ of their day: "main" is the root, a "sandbox" is a fork, a "parent" is an upstre
   lands into its fork under every landing rule, R10.8 included, for every file, open or not, the owner answered: "A". His
   model of a transaction, the same day: "when a transaction is open, the "save" operation isnt creating git commits;
   instead the changes are being accumulated and only get committed when the transaction itself closes/commits".
-  That model differs from the model's and git-model.md's, where each save inside a transaction is a commit on its
-  `txn/<n>` branch and the transaction's commit lands them as one change into its fork: what a fork receives is the
-  same, the history inside the transaction is not. Asked about that difference, the owner answered, 2026-11-13: "a
-  transaction should be recorded as one commit". Revisable: it is his answer, not a rule. Cost: some commits that would commit with R10.4 and R10.8 switched off lose whole. The
+  Asked whether saves inside a transaction are commits on `txn/<n>` or staged, the owner answered, 2026-11-13: "a
+  transaction should be recorded as one commit" (R5.5): the commit lands that one commit, T, into the fork, a
+  fast-forward when the fork has not moved. Cost: some commits that would commit with R10.4 and R10.8 switched off lose whole. The
   model's referee is given no direction, so it cannot tell a landing from a transaction's commit.
   Tests: `r10_a_transactions_unfinished_line_before_a_kept_line_loses_whole`,
   `r10_a_transactions_line_after_the_forks_unfinished_line_loses_whole`
@@ -415,6 +425,8 @@ of their day: "main" is the root, a "sandbox" is a fork, a "parent" is an upstre
 
 - **R12** · approved · Every write call is in its tree's journal before it returns. After a crash, each open
   file is saved from the journal as its close would have saved it, exactly once, before any tree is served again.
+  An open inside a transaction is not: the crash rolls its transaction back first (R5, R5.3), so it ends unsaved
+  (`r12_a_crash_rolls_back_an_open_transaction`).
   Approved by the owner, 2026-11-05 (approval page). A compaction keeps that fold: only the page writes memory still
   holds stay in the journal, so a recovery close never lays a closed open's page write over later saves
   (`a_compaction_keeps_a_closed_opens_page_write_out_of_recovery`, a unit test in `tree_actor/mod.rs`). Tests: `r12_a_crash_saves_every_open_from_the_journal`, `r12_a_crash_during_a_close_saves_the_open_once`, and on the real journal `a_step_killed_before_its_record_saves_at_restart`, `a_step_killed_after_its_record_is_not_saved_again`, `a_failed_save_keeps_serving_and_saves_at_the_next_step`

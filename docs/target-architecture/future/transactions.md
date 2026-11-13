@@ -4,9 +4,11 @@
 
 ## What it proposes
 
-A transaction is a frozen branch that snapshots the fork's head at begin. The program's saves commit there, and it
-reads its own edits. Commit lands the branch in the fork as a child lands in its upstream, whole or not at all.
-Rollback deletes the branch and leaves no trace in any tree or history. The model and its rules are
+A transaction is a frozen branch that snapshots the fork's head at begin, with its own index. The program's saves
+stage in the index, with no commit, and it reads its own edits there. Commit records the transaction as one commit on
+begin and lands it in the fork as a child's change lands in its upstream, whole or not at all: a fast-forward if the
+fork has not moved (ledger R5.5). Rollback, or a crash, deletes the branch and the index and leaves no trace in any
+tree or history. The model and its rules are
 [git-model §9](../git-model.md#9-transactions-a-frozen-branch).
 
 ## What stands until then

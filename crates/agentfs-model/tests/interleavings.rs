@@ -273,7 +273,7 @@ fn head_of(w: &World, t: Target) -> Option<String> {
             .txn
             .as_ref()
             .filter(|x| x.id == n)
-            .map(|x| x.head.clone()),
+            .map(|x| x.index.clone()),
     }
 }
 
@@ -402,10 +402,12 @@ impl Oracle {
         };
         w.upstream_of(f)?;
         let txn = w.forks[&f].txn.as_ref()?;
-        let spec = [txn.start.as_str(), txn.head.as_str()];
+        // Begin read from its ref; the index is the tree whose bytes
+        // `check_but` holds to the oracle's at every step.
+        let begin = git(w.repo(), &["rev-parse", &TreeNames::txn_branch(txn.id)]);
         let saved = git(
             w.repo(),
-            &["diff-tree", "-r", "--name-only", spec[0], spec[1]],
+            &["diff-tree", "-r", "--name-only", &begin, &txn.index],
         );
         let mut mine: BTreeSet<String> = saved.lines().map(str::to_string).collect();
         for (h, (u, _, _, _)) in &self.held {
@@ -757,13 +759,16 @@ fn end_checked(w: &mut World, o: &mut Oracle, c: &Client) -> Result<(), String> 
 }
 
 /// A crash of every agentfs process (git-model.md §3), during open
-/// `during`'s close if one is given: the oracle saves every open's
-/// calls as its close would (`during` first, then the rest in the model's
-/// order, by handle), so every write call that returned survives; an
-/// orphan's event comes once per close the journal replays (twice for an
-/// orphan whose close the crash interrupted: events are at least once). A
-/// call a transaction deferred stays behind it, and a close that would defer
-/// defers (R5.3). A take is one step, so none is in progress.
+/// `during`'s close if one is given. The crash rolls back every open
+/// transaction (R5: "a failure is an implicit rollback"; R5.3, the owner's
+/// pick: it then applies the calls it deferred): its opens end unsaved, and
+/// its deferred calls apply in order, the oracle following each. Then the
+/// oracle saves every open's calls as its close would (`during` first, then
+/// the rest in the model's order, by handle), so every write call that
+/// returned outside a transaction survives; an orphan's event comes once per
+/// close the journal replays (twice for an orphan whose close the crash
+/// interrupted: events are at least once). A take is one step, so none is in
+/// progress.
 fn crash_checked(w: &mut World, o: &mut Oracle, during: Option<HandleId>) -> Result<(), String> {
     let n = w.orphans().len();
     let mut expect = Vec::new();
@@ -781,13 +786,29 @@ fn crash_checked(w: &mut World, o: &mut Oracle, during: Option<HandleId>) -> Res
         w.close_keeping_journal(h);
         gitledger::observe(w)?;
     }
-    for h in w.crash_down() {
+    let open: Vec<TreeId> = in_txn(w);
+    let replay = w.crash_down();
+    if let Some(f) = open.iter().find(|f| w.forks[f].txn.is_some()) {
+        return Err(format!(
+            "oracle_crash: f{f}'s transaction outlived the crash"
+        ));
+    }
+    dropped(w, n, expect)?;
+    o.reload(w);
+    let mut forks: Vec<TreeId> = o.deferred.keys().copied().collect();
+    forks.extend(open);
+    forks.sort();
+    forks.dedup();
+    for f in forks {
+        apply_deferred_checked(w, o, f)?;
+    }
+    let n = w.orphans().len();
+    let mut expect = Vec::new();
+    for h in replay {
         if Some(h) == during {
             // Its close saved nothing git records, so the replay drops it
             // again, in handle order.
             expect.extend(first.clone());
-        } else if let Some(f) = o.close_defers(w, h) {
-            o.deferred.entry(f).or_default().push(Deferred::Close(h));
         } else {
             expect.extend(o.closing(w, h));
         }
@@ -795,7 +816,7 @@ fn crash_checked(w: &mut World, o: &mut Oracle, during: Option<HandleId>) -> Res
         gitledger::observe(w)?;
     }
     dropped(w, n, expect)?;
-    if let Some(h) = w.handles().find(|h| !h.deferred) {
+    if let Some(h) = w.handles().next() {
         return Err(format!("oracle_crash: h{} outlived the crash", h.id));
     }
     o.calls.retain(|h, _| w.handles().any(|x| x.id == *h));
@@ -876,13 +897,89 @@ fn commit_checked(
         usize::from(w.handles().any(|h| {
             !h.deferred && (h.target == Target::Txn(f, txn) || h.target == Target::Tree(f))
         }));
-    w.commit_txn_only(f).expect("open");
+    // Rule 5's legs, from git and the harness's own bytes: begin from the
+    // transaction's ref, what the program staged from the oracle.
+    let begin = git(w.repo(), &["rev-parse", &TreeNames::txn_branch(txn)]);
+    let before = w.head(f);
+    let mine = o
+        .files
+        .get(&Target::Txn(f, txn))
+        .cloned()
+        .unwrap_or_default();
+    let outcome = w.commit_txn_only(f).expect("open");
     gitledger::observe(w)?;
+    txn_committed(w, f, txn, &begin, &before, &mine, &outcome)?;
     o.reload(w);
     for (h, file) in stay {
         o.move_to_fork(h, f, file);
     }
     apply_deferred_checked(w, o, f)
+}
+
+/// `oracle_txn_commit`, rule 5 read from git against the harness's own
+/// bytes: a transaction is recorded as one commit T (the owner, 2026-11-13),
+/// the fork's head (a fast-forward) or its merge's second parent, whose one
+/// parent is begin, as `txn/<n>` held it until the commit; T holds, in every
+/// file it names, the bytes the program staged (the oracle's). An empty
+/// commit made none: the fork's head did not move, and what the program
+/// staged is begin's bytes.
+fn txn_committed(
+    w: &World,
+    f: TreeId,
+    txn: u32,
+    begin: &str,
+    before: &str,
+    mine: &BTreeMap<String, Vec<u8>>,
+    outcome: &TxnOutcome,
+) -> Result<(), String> {
+    let head = w.head(f);
+    let t = if *outcome == TxnOutcome::Empty {
+        if head != before {
+            return Err(format!(
+                "oracle_txn_commit: t{txn} was empty, but f{f} moved"
+            ));
+        }
+        begin.to_string()
+    } else {
+        let parents = |c: &str| -> Vec<String> {
+            git(w.repo(), &["log", "-1", "--format=%P", c])
+                .split_whitespace()
+                .map(str::to_string)
+                .collect()
+        };
+        let p = parents(&head);
+        let t = if p.len() == 1 {
+            head.clone()
+        } else {
+            p[1].clone()
+        };
+        let cause = git(
+            w.repo(),
+            &[
+                "log",
+                "-1",
+                "--format=%(trailers:key=Agentfs-Cause,valueonly)",
+                &t,
+            ],
+        );
+        if cause != format!("Transaction t{txn}") || parents(&t) != [begin.to_string()] {
+            return Err(format!(
+                "oracle_txn_commit: t{txn}'s commit {t:.7} ({cause}) is not one commit on its begin {begin:.7}"
+            ));
+        }
+        t
+    };
+    for (p, b) in mine {
+        let file = w.file(&t, p);
+        if file.name.live() && file.bytes().as_bytes() != &b[..] {
+            return Err(format!(
+                "oracle_txn_commit: t{txn}'s commit {t:.7} holds {p} as {:?}, the program staged {:?}",
+                file.bytes(),
+                String::from_utf8_lossy(b)
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn drain(
