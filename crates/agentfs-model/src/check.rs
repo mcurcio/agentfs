@@ -1153,14 +1153,16 @@ fn lagging(s: &HistoryService) -> Option<String> {
 /// Push timing (git-model.md §4): whenever the mirror lacks the local root's
 /// tip or a collision ref, a fork's included before it ever lands, the
 /// service lists [`Step::Push`]. Truth from git, both sides: it judges the
-/// service's claim, it does not ask the mirror whether it is due.
+/// service's claim, it does not ask the mirror whether it is due. A listed
+/// push makes any lag allowed, so git is read only when none is listed.
 fn mirror_current(s: &HistoryService) -> Result<(), String> {
-    if let Some(r) = lagging(s)
-        && !s.pending().contains(&Step::Push)
-    {
-        return Err(format!("the mirror lacks {r}, and no push is pending"));
+    if s.push_due() {
+        return Ok(());
     }
-    Ok(())
+    match lagging(s) {
+        Some(r) => Err(format!("the mirror lacks {r}, and no push is pending")),
+        None => Ok(()),
+    }
 }
 
 /// The collision's result is a `Landing` (or the transaction's) commit made

@@ -382,9 +382,7 @@ pub struct TreeNames {
 impl TreeNames {
     /// Names the root `root`. Panics if `root` is empty, is `fork` or `txn`,
     /// or starts `fork/` or `txn/`: it would collide with a fork's or a
-    /// transaction's name. Panics too on a name git's branch rule refuses
-    /// (`git check-ref-format --branch`), `HEAD` among them: `git init -b HEAD`
-    /// succeeds, and the first commit then fails.
+    /// transaction's name. Git checks the rest when the world runs `git init -b`.
     pub fn new(root: &str) -> Self {
         assert!(
             !root.is_empty()
@@ -392,16 +390,6 @@ impl TreeNames {
                 && !root.starts_with("fork/")
                 && !root.starts_with("txn/"),
             "{root:?} cannot name the root: it is empty or a fork's or a transaction's name"
-        );
-        let branch = try_git(
-            &std::env::temp_dir(),
-            &["check-ref-format", "--branch", root],
-            None,
-        );
-        assert!(
-            branch.code == 0,
-            "{root:?} cannot name the root: git's branch rule refuses it: {}",
-            branch.stderr.trim_end()
         );
         Self {
             root: root.to_string(),
@@ -2301,17 +2289,23 @@ impl World {
         self.trace.as_deref().unwrap_or_default()
     }
 
-    /// Names this world's trace file apart from others of its test.
+    /// Names this world's trace file apart from others of its test. Panics
+    /// once the run's name is taken ([`World::run_name`]): the label would
+    /// otherwise be silently ignored.
     pub fn label_trace(&mut self, label: String) {
+        assert!(
+            self.run_name.get().is_none(),
+            "label_trace({label:?}) after the run's name was taken"
+        );
         self.trace_label = Some(label);
     }
 
     /// The run's name for its trace and digest files,
     /// `<thread name>[.<label>][.<n>]`: the n-th run of that name in this
     /// process counts from 1 past the first. Taken at the first ask and kept,
-    /// so a run's two writers share one name; each asks only at drop, after
-    /// [`World::label_trace`].
-    pub fn run_name(&self) -> String {
+    /// so a run's two writers share one name; each asks only at drop, and
+    /// [`World::label_trace`] refuses to run after it.
+    pub(crate) fn run_name(&self) -> String {
         self.run_name
             .get_or_init(|| run_name(self.trace_label.as_deref()))
             .clone()

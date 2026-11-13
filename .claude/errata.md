@@ -620,3 +620,33 @@ Not blocking; the suite is built and green. Findings about the brief and the doc
    clause ("a tree's name or ref, given only through `world::TreeNames`") that blessed the
    change introducing `TreeNames`. It is removed; module-cut.md's 3c row says the full gate's
    test applied and what the light run does not show.
+
+## 2026-11-13, module cut step 6 (implementer and fix round)
+
+1. **`planted/run.py` hard-coded the check names it counts.** The design left run.py out of every
+   slice, so a new check was classed `assert` until listed (it bit S1's `mirror_current`). Class
+   fix in the fix round: run.py reads the names from the code (`named("...")` in `src/check.rs`,
+   messages starting `oracle_<name>: ` or `ledger: ` in the tests).
+2. **R9.18 needs a wake the design did not list.** A close or path call inside a transaction
+   must wake the fork's waiting takes; without it a take held by that open waits forever and
+   `locks` fires. Built in S3; corpus bug `transaction_close_wakes_nothing` plants its absence.
+3. **S1 could not keep "anchors clean".** Passing collision refs from `record` to `set_head`
+   changed the anchor of `collision_record_in_the_wrong_commit`, re-anchored in S1;
+   `judge_skips_one_of_a_takes_changes` was re-anchored after `cargo fmt`.
+4. **S2's bound, "the first differing commit is a Transaction commit", cannot be read in
+   canonical-text order**: the walk can print later, unrelated commits before the
+   transaction's. S2 used "the only changed commit with unchanged parents"; S3 used step-log
+   diffs between the two builds.
+5. **Row 6's "as the engine's `RootName` does" named nothing on main** (step 5b brings and then
+   removes it). The fix round applies the design round's erratum: the `HEAD` refusal in
+   `TreeNames::new`, its test cases and the row-6 clause are gone.
+6. **The moved count of `random_interleavings_git_merge_base` (ignored, finding 1) went from 15
+   to 16 of 64 seeds**: seed 17 is a harness panic ("a model file in git") under that rejected
+   policy, only after S3. VERIFYING.md is updated.
+7. **The fix brief's "tag R9.18 and R10.11 `approved`, as R10.5" rests on a misreading**: R10.5
+   is tagged `owner` on main and here, as is R11.5, though both rest on a letter answer to
+   agent-worded options. R9.18 and R10.11 are now `approved`; R10.5 and R11.5 are left for a
+   ledger-wide tag pass.
+8. **No corpus bug can isolate R10.5**: the referee takes no direction, so a transaction's
+   commit and a landing are one code path; `line_follows_the_upstreams_unfinished_last_line`
+   switches R10.4 off for both.

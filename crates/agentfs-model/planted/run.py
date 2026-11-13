@@ -55,15 +55,18 @@ MATRIX = MODEL / "planted/matrix.tsv"
 BUDGET = MODEL / "planted/budget.json"
 # A pass may take this many times its budgeted seconds.
 SLACK = 1.5
-# The names a failure can carry: check.rs's invariants, the random runs' oracle
-# (tests/interleavings.rs) and the ledger (tests/gitledger).
-CHECKS = (
-    "no_silent_loss no_flicker locks upstream_wins changes_whole syncs_deliver "
-    "transactions_end_as_told transactions_undisturbed one_writer discarded_leave_no_trace "
-    "rename_overs_whole full_lineage placed_and_unlinked step_checked check_converged "
-    "losers_pushed mirror_current no_joined_lines oracle_no_call_waits oracle_bytes "
-    "oracle_p1 oracle_deferred oracle_orphans oracle_crash oracle_drained oracle_locks ledger"
-).split()
+# The names a failure can carry, read from the code so a new check is never
+# missed: check.rs's invariants (each reported through `named("...")`), and the
+# random runs' oracle and the ledger (tests/interleavings.rs, tests/gitledger),
+# whose messages start `oracle_<name>: ` or `ledger: `.
+CHECKS = sorted(
+    set(re.findall(r'named\(\s*"(\w+)"', (SRC / "check.rs").read_text()))
+    | {
+        name
+        for test in [MODEL / "tests/interleavings.rs", *(MODEL / "tests/gitledger").glob("*.rs")]
+        for name in re.findall(r'"(oracle_\w+|ledger): ', test.read_text())
+    }
+)
 CHECK_RE = re.compile(r"(?:^|[\s:\"])(" + "|".join(CHECKS) + r"): ")
 # Where a failing test panicked.
 PANIC_AT = re.compile(r"panicked at (\S+?):\d+:\d+:")

@@ -259,8 +259,9 @@ the pull request body reports them), prove it:
   exact find-and-replace matched exactly once across `src/**`, leading whitespace included. A verbatim move
   needs no change; a move that changes indentation, or an edit of the anchor, reports STALE, which stops the
   run before any bug runs, and is re-anchored in the same commit. A bug counts as caught only by a named check
-  (an invariant of `src/check.rs`, the random runs' `oracle_*` checks or the `ledger`) or by an explicit
-  assertion in a test file; a panic in the model or the harness never counts, in either test binary.
+  (an invariant of `src/check.rs`, the random runs' `oracle_*` checks or the `ledger`, whose names `run.py` reads
+  from the code: `named("...")` in `src/check.rs`, a message starting `oracle_<name>: ` or `ledger: ` in the tests)
+  or by an explicit assertion in a test file; a panic in the model or the harness never counts, in either test binary.
 
 Which gate a change needs is decided by what its diff touches, not by judgement. The owner, 2026-11-11: "That gate
 process seems too heavy for this. Isn't the big gate about validating the merge framework?"; asked whether a light
@@ -319,6 +320,11 @@ its slowest bug, the scenario digest and the whole digest. A corpus pass or a `c
 `run.py --write` and `ci/model-digest.sh record` measure them again, alone: the wrapper refuses a budget write while
 another `agentfs-dev` container runs (exit 5), or with `MODEL_BUDGET_CONTENDED=1` writes it with a note saying so. A change meant to change outcomes re-records the
 golden and matrix in the same commit, and says why.
+
+The mirror's check, `mirror_current`, runs after every step and reads both sides from git (`git for-each-ref`) only
+when no push is listed. Measured on one machine about 3x slower than the budget's, `check --all` took 2054 s against
+1964 s before the mirror left `World` (about 5% more; reading git after every step cost about 35%). `planted/budget.json`
+was not re-measured for it: whether the budget changes is the owner's call.
 
 The safety net has tests of its own, plain Python and bash that CI runs in the lint job
 (`python3 -m unittest discover -s crates/agentfs-model/planted -p 'test_*.py'`), and `canonical_text_is_pinned`.

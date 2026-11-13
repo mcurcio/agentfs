@@ -287,7 +287,7 @@ of their day: "main" is the root, a "sandbox" is a fork, a "parent" is an upstre
   his 3, option (b) of finding 38: the model changes, not the library. Revisable: option (a) was to count only a change to
   what the file shows. Cost: a fork holding a file open waits longer for later commits.
   Tests: `r9_a_sync_delivers_up_to_the_first_change_to_an_open_file`, `finding_38_a_sync_past_an_open_file_waits_for_any_line_map_change`
-- **R9.18** · owner · A file open inside a transaction on a fork holds back every take into that fork, its syncs from
+- **R9.18** · approved · A file open inside a transaction on a fork holds back every take into that fork, its syncs from
   its upstream and its own forks' landings, until it closes, as a file open on the fork does under R9.3 and R9.1. Asked,
   2026-11-08, whether a file held open inside a transaction should hold back syncs as an open on the fork does under
   R9.3, the owner answered: "Yes. “Waiting longer” is a feature of locks and transactions, not a bug". Asked, 2026-11-12,
@@ -365,7 +365,7 @@ of their day: "main" is the root, a "sandbox" is a fork, a "parent" is an upstre
   last line collides at commit, the fork's line wins, and the program is told (R5). Owner, 2026-11-05: "A" (finding 30).
   R10.8 applies at that commit too (R10.11).
   Tests: `r10_a_transactions_line_after_the_forks_unfinished_line_loses_whole`
-- **R10.11** · owner · A transaction's commit is a landing of the transaction into its fork, under every landing rule,
+- **R10.11** · approved · A transaction's commit is a landing of the transaction into its fork, under every landing rule,
   R10.8 included, for every file, open or not: the transaction is the fork and the tree it began from is its upstream
   (R3f: every tree applies the same rules). An unfinished line the transaction would put in front of a line the fork
   keeps collides, the fork wins, the transaction loses whole and the program is told (R3e, R5). The owner, 2026-11-08:
@@ -373,8 +373,11 @@ of their day: "main" is the root, a "sandbox" is a fork, a "parent" is an upstre
   lands into its fork under every landing rule, R10.8 included, for every file, open or not, the owner answered: "A". His
   model of a transaction, the same day: "when a transaction is open, the "save" operation isnt creating git commits;
   instead the changes are being accumulated and only get committed when the transaction itself closes/commits".
-  Revisable: it is his answer, not a rule. Cost: some commits that would commit with R10.4 and R10.8 switched off lose
-  whole. The model's referee is given no direction, so it cannot tell a landing from a transaction's commit.
+  That model differs from the model's and git-model.md's, where each save inside a transaction is a commit on its
+  `txn/<n>` branch and the transaction's commit lands them as one change into its fork: what a fork receives is the
+  same, the history inside the transaction is not. That difference is an open question for the owner. Revisable: it
+  is his answer, not a rule. Cost: some commits that would commit with R10.4 and R10.8 switched off lose whole. The
+  model's referee is given no direction, so it cannot tell a landing from a transaction's commit.
   Tests: `r10_a_transactions_unfinished_line_before_a_kept_line_loses_whole`,
   `r10_a_transactions_line_after_the_forks_unfinished_line_loses_whole`
 - **R10.1** · approved · Of two inserts at one place, the upstream's comes first. Approved by the owner, 2026-11-05 (approval page); he asked whether this is only inserts: yes; two edits of one line are a collision the upstream wins (R3b). Tests: `r10_concurrent_inserts_at_one_place_keep_both_the_upstreams_first`

@@ -64,10 +64,15 @@ impl HistoryService {
             .into_iter()
             .map(Step::from)
             .collect();
-        if self.mirror.due(self.world.moves()) {
+        if self.push_due() {
             out.push(Step::Push);
         }
         out
+    }
+
+    /// Whether [`HistoryService::pending`] lists the mirror's push.
+    pub fn push_due(&self) -> bool {
+        self.mirror.due(self.world.moves())
     }
 
     /// Takes one step and returns how many queue entries it took (none for a

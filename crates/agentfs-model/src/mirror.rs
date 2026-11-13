@@ -54,9 +54,16 @@ impl Mirror {
         &self.repo
     }
 
+    /// The moves it has not read. A history shorter than what it has read
+    /// (another history put in its place) is all unread, not a slice panic:
+    /// the next push offers every ref again, never forced.
+    fn unread<'m>(&self, moves: &'m [TreeMoved]) -> &'m [TreeMoved] {
+        moves.get(self.read..).unwrap_or(moves)
+    }
+
     /// A move it has not read moved the root or names a collision ref.
     pub fn due(&self, moves: &[TreeMoved]) -> bool {
-        moves[self.read..]
+        self.unread(moves)
             .iter()
             .any(|m| m.tree == TreeId::ROOT || !m.collisions.is_empty())
     }
@@ -74,7 +81,7 @@ impl Mirror {
             .map(str::to_string)
             .collect();
         args.push(format!("{0}:{0}", self.root));
-        for m in &moves[self.read..] {
+        for m in self.unread(moves) {
             args.extend(m.collisions.iter().map(|r| format!("{r}:{r}")));
         }
         let args: Vec<&str> = args.iter().map(String::as_str).collect();

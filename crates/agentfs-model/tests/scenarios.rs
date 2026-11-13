@@ -353,8 +353,8 @@ fn r3_a_save_after_the_sync_wins_upstream_by_lineage() {
 /// fork's queue. x's first parent is the head the fork held, without
 /// m, so x and m are concurrent whatever order they were written in, and
 /// the root's m wins at the root's queue. The fork shows x, then m, never x
-/// again; Replication, a step of its own, then pushes x to the shared
-/// remote, naming its writer.
+/// again; the mirror's push, a step of its own, then carries x to the
+/// mirror, naming its writer.
 #[test]
 fn r3_a_save_before_the_sync_arrives_loses_to_the_upstream() {
     let mut w = world();
@@ -2367,8 +2367,8 @@ fn r10_an_agreeing_delete_of_a_rename_overs_file_agrees() {
 /// R5.1 and R9.9, read from git: a take's decision lives in its own result
 /// commit (its tree named), with no notes ref; the losing commit, which cannot
 /// be edited, holds none and keeps its collision ref; and the record reaches
-/// the shared remote with the root's history, a transaction's and a nested
-/// fork's included.
+/// the mirror with the root's history, a transaction's and a nested fork's
+/// included.
 #[test]
 fn r5_a_decision_is_in_its_result_commit_with_its_tree() {
     let mut w = world();

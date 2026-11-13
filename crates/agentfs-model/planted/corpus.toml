@@ -473,3 +473,16 @@ find = '''
             targets.push(Target::Txn(t, txn.id));'''
 replace = '''
             let _ = txn;'''
+
+[[bug]]
+id = "transaction_close_wakes_nothing"
+rule = "R9.18"
+seeds = 64
+find = '''
+        // A close in a fork's transaction wakes the fork's takes too (R9.18).
+        let (Target::Tree(t) | Target::Txn(t, _)) = target;
+        self.wake(t);'''
+replace = '''
+        if let Target::Tree(t) = target {
+            self.wake(t);
+        }'''
