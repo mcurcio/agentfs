@@ -1308,7 +1308,7 @@ fn a_step_killed_before_its_record_saves_at_restart() {
     ] {
         let state = tmp.path().join(spec);
         let open = run_killed_worker("step_worker", &state, spec);
-        let v = new_actor(&state);
+        let v = reopen(&state);
         assert_eq!(v.read(ROOT, "a").unwrap(), b"returned", "{spec}");
         let head = v.head(ROOT).unwrap();
         assert_eq!(opens_saved(&state, open), 1, "{spec}");
@@ -1331,7 +1331,7 @@ fn a_step_killed_after_its_record_is_not_saved_again() {
     ] {
         let state = tmp.path().join(spec);
         let open = run_killed_worker("step_worker", &state, spec);
-        let v = new_actor(&state);
+        let v = reopen(&state);
         assert_eq!(v.read(ROOT, "a").unwrap(), b"returned", "{spec}");
         assert_eq!(opens_saved(&state, open), 1, "{spec}");
         assert_eq!(
@@ -1366,7 +1366,7 @@ fn a_fast_forward_killed_at_any_step_lands_once() {
     ] {
         let state = tmp.path().join(spec);
         run_killed_worker("fast_forward_worker", &state, spec);
-        let mut v = new_actor(&state);
+        let mut v = reopen(&state);
         while v.progress().unwrap() {}
         let fork = v.trees().into_iter().find(|tree| !tree.is_root()).unwrap();
         assert_eq!(v.read(ROOT, "a").unwrap(), b"sandbox", "{spec}");
@@ -1413,7 +1413,7 @@ fn a_kill_at_either_compact_failpoint_loses_nothing() {
     ] {
         let state = tmp.path().join(spec);
         let log = run_killed_worker("compact_worker", &state, spec);
-        let v = new_actor(&state);
+        let v = reopen(&state);
         assert_eq!(v.read(ROOT, "log").unwrap(), b"returned\n", "{spec}");
         assert_eq!(v.read(ROOT, "big").unwrap(), FILLED, "{spec}");
         assert_eq!(opens_saved(&state, log), 1, "{spec}");
@@ -1464,7 +1464,7 @@ fn a_failure_before_the_rename_is_retried_at_the_next_step() {
 fn a_cut_first_init_starts_over() {
     let tmp = tempfile::tempdir().unwrap();
     let guard = agentfs_core::failpoints::configure("tree.init_before_format=error").unwrap();
-    assert!(TreeActor::open(tmp.path(), &PodContext::default()).is_err());
+    assert!(TreeActor::create(tmp.path(), &trees::identity(), &PodContext::default()).is_err());
     drop(guard);
     assert!(tmp.path().join("initializing").exists());
     assert!(tmp.path().join("history.git").exists());

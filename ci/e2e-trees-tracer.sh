@@ -11,7 +11,7 @@
 #    `--volume u` at the same state area exits 1 with every file's bytes
 #    unchanged.
 # 2. The workload writes a.txt. Right after its close returns, the root's head
-#    holds it, with `Agentfs-Volume: t`, the volume's id and the pod trailers
+#    holds it (under `files/`, as every envelope commit does), with `Agentfs-Volume: t`, the volume's id and the pod trailers
 #    the mount was given.
 # 3. agentfs is killed with SIGKILL while the workload writes, the stale mount
 #    is lazily unmounted and agentfs mounts again: every write the workload saw
@@ -112,7 +112,7 @@ mount_view
 # The close's release reaches agentfs after close(2) returns; the view takes
 # requests in order, so the read that follows sees the release done.
 workload -- 'printf hello > /agentfs/root/a.txt && cat /agentfs/root/a.txt >/dev/null'
-assert_eq hello "$(in_history show root:a.txt)" 'the root holds a.txt once its close returned'
+assert_eq hello "$(in_history show root:files/a.txt)" 'the root holds a.txt once its close returned'
 message=$(in_history log -1 --format=%B root)
 assert_contains "$message" 'Agentfs-Volume: t' 'the save names its volume'
 assert_contains "$message" "Agentfs-Volume-Id: $id" 'and its id'
@@ -136,13 +136,13 @@ answered=$(wc -l <"$RECEIPTS/answered")
 mount_view
 missing=$(docker run --rm -i -v "$DATA:/data" --entrypoint sh "$IMAGE" -c '
   while read -r n; do
-    [ "$(git --git-dir /data/state/history.git show "root:f$n" 2>/dev/null)" = "$n" ] || echo "f$n"
+    [ "$(git --git-dir /data/state/history.git show "root:files/f$n" 2>/dev/null)" = "$n" ] || echo "f$n"
   done' <"$RECEIPTS/answered")
 assert_eq '' "$missing" "all $answered answered writes are in history"
 unnamed=$(in_history log --format='%H%n%(trailers:key=Agentfs-Pod,valueonly)%n--' root |
   awk '/^--$/ { if (!pod) print sha; sha = ""; pod = 0; next } !sha { sha = $0; next } $0 == "pod-t" { pod = 1 }')
 assert_eq '' "$unnamed" 'every commit on the root carries its pod trailers'
 workload -- 'printf again > /agentfs/root/after.txt && cat /agentfs/root/after.txt >/dev/null'
-assert_eq again "$(in_history show root:after.txt)" 'a restarted workload writes through the new mount'
+assert_eq again "$(in_history show root:files/after.txt)" 'a restarted workload writes through the new mount'
 has_trailers "$(in_history log -1 --format=%B root)" 'its save'
 pass 'tree views tracer'
