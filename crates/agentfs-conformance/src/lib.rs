@@ -28,7 +28,7 @@ pub use library::Library;
 pub use mounted::Mounted;
 
 use agentfs_model::calls::{Recorded, RecordedCall, Sink, TreeCalls, replay};
-use agentfs_model::world::{MODEL_ROOT, ModelHistory, Policies, TreeNames, World};
+use agentfs_model::world::{ModelHistory, Policies, TreeNames, World};
 use invariants::Invariants;
 use std::path::{Path, PathBuf};
 
@@ -86,7 +86,7 @@ pub fn against_mount(trace: &[Recorded], bin: &Path, sink: &mut dyn Sink) -> Res
 /// trees, collisions and heads. `sink` gets what the model did, so a trace
 /// recorded on the engine replays here.
 pub fn against_model(trace: &[Recorded], sink: &mut dyn Sink) -> Result<(), String> {
-    let mut world = World::new(Policies::default(), TreeNames::new(MODEL_ROOT));
+    let mut world = World::new(Policies::default(), TreeNames::new());
     replay(trace, &mut world, &mut ModelHistory, sink, &mut |_, _| {
         Ok(())
     })

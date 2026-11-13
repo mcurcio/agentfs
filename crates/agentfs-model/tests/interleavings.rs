@@ -39,8 +39,7 @@ use agentfs_model::queue::{Entry, NAME_KEY, name_key};
 use agentfs_model::recording::{Kind, Target, Write};
 use agentfs_model::service::{HistoryService, Step};
 use agentfs_model::world::{
-    By, Direction, Life, LineEdit, MODEL_ROOT, MergeRule, Policies, TreeNames, TxnEnd, TxnOutcome,
-    World,
+    By, Direction, Life, LineEdit, MergeRule, Policies, TreeNames, TxnEnd, TxnOutcome, World,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -1057,7 +1056,7 @@ fn run_seed_of(
     policies: Policies,
     tally: &mut Tally,
 ) -> Result<String, String> {
-    let mut w = Checked::new(policies, TreeNames::new(MODEL_ROOT));
+    let mut w = Checked::new(policies, TreeNames::new());
     w.label_trace(format!("seed{seed}"));
     let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         generate(&mut w, seed, tally)

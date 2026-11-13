@@ -392,42 +392,28 @@ pub fn decisions_in(repo: &Path, rev: &[&str]) -> Vec<(String, Decision)> {
     out
 }
 
-/// The root's name in the model's own runs: scenarios, random runs, the
-/// oracle and the digest's pinned text. Any name [`TreeNames::new`] accepts
-/// gives the same outcomes and digests, since the digest labels the root `T0`
-/// (`the_roots_name_changes_no_digest` in `digest`'s tests runs one run under four names).
-/// The engine's name is conformance's (`agentfs_conformance::ENGINE_ROOT`).
+/// The root's name in git, the model's one text for it: `root`, the
+/// identity the engine also names it by (`TreeId`'s text in `agentfs-core`).
+/// No name is configured: the name the root is published under is the
+/// publisher's, outside the model. The digest labels the root `T0`.
 pub const MODEL_ROOT: &str = "root";
 
-/// How the model names its trees in git: the root by the name it is given,
+/// How the model names its trees in git: the root `root` ([`MODEL_ROOT`]),
 /// fork `n` as `fork/<n>`, transaction `n` as `txn/<n>`, each under
 /// `refs/heads/`. The one place that names a tree.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TreeNames {
-    root: String,
-}
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TreeNames;
 
 impl TreeNames {
-    /// Names the root `root`. Panics if `root` is empty, is `fork` or `txn`,
-    /// or starts `fork/` or `txn/`: it would collide with a fork's or a
-    /// transaction's name. Git checks the rest when the world runs `git init -b`.
-    pub fn new(root: &str) -> Self {
-        assert!(
-            !root.is_empty()
-                && !["fork", "txn"].contains(&root)
-                && !root.starts_with("fork/")
-                && !root.starts_with("txn/"),
-            "{root:?} cannot name the root: it is empty or a fork's or a transaction's name"
-        );
-        Self {
-            root: root.to_string(),
-        }
+    /// The model's names; nothing is configured.
+    pub fn new() -> Self {
+        Self
     }
 
     /// Tree `t`'s name, as its commits' `Agentfs-Tree` gives it.
     pub fn name(&self, t: TreeId) -> String {
         if t == TreeId::ROOT {
-            self.root.clone()
+            MODEL_ROOT.to_string()
         } else {
             format!("fork/{}", t.number())
         }

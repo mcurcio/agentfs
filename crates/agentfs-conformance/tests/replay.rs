@@ -6,10 +6,10 @@ use agentfs_model::calls::{
     Caller, Client, Recorded, RecordedCall, Recorder, Took, TreeCalls, TreeId, parse, render,
 };
 use agentfs_model::recording::Write;
-use agentfs_model::world::{MODEL_ROOT, Policies, TreeNames, World};
+use agentfs_model::world::{Policies, TreeNames, World};
 
 fn world() -> World {
-    World::recording(Policies::default(), TreeNames::new(MODEL_ROOT))
+    World::recording(Policies::default(), TreeNames::new())
 }
 
 fn m1() -> Client {

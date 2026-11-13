@@ -1,8 +1,7 @@
 # The landing model, in plain words
 
-This crate runs the owner's landing rules on the real `git` program. The root (the tree with no upstream; its branch's name is
-configured, `world::TreeNames`, which refuses `fork`, `txn` and names under them, where forks and transactions live)
-and each fork are git branches. Every save is a commit that names its one writer. A file is a byte buffer and a program's
+This crate runs the owner's landing rules on the real `git` program. The root (the tree with no upstream, branch
+`refs/heads/root`; forks are `fork/<n>`, transactions `txn/<id>`) and each fork are git branches. Every save is a commit that names its one writer. A file is a byte buffer and a program's
 calls are byte calls, as POSIX gives them (rule 8). Each line of a file gets an identity when a save first
 records it, derived from the bytes at close, and keeps it through later edits around it (rule 10); a file's
 name and existence are one more line (rule 11). Tests in

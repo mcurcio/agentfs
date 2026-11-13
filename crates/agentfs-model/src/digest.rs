@@ -10,8 +10,8 @@
 //! so no commit id is in the text. Every tree name, as a ref or as a message's
 //! `Agentfs-Tree` or `Agentfs-Collision` field, becomes a label: `T0` the root,
 //! `T<fork id>` a fork, `X<id>` a transaction. The names come from the one place
-//! that names trees ([`TreeNames`]), so renaming a tree, the root included,
-//! changes no digest. The loser in
+//! that names trees ([`TreeNames`]), so a change to a tree's name changes no
+//! digest. The loser in
 //! `Agentfs-Collision` becomes its number. New trailers are in by default.
 //! Collision refs stay verbatim.
 
@@ -242,7 +242,6 @@ pub(crate) fn write(s: &HistoryService, dir: &Path, name: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::world::MODEL_ROOT;
     use std::path::PathBuf;
 
     /// A temporary directory, removed when dropped.
@@ -282,7 +281,7 @@ mod tests {
         let (repo, remote) = (dir.0.join("repo"), dir.0.join("origin.git"));
         std::fs::create_dir_all(&repo).unwrap();
         std::fs::create_dir_all(&remote).unwrap();
-        let names = TreeNames::new(MODEL_ROOT);
+        let names = TreeNames::new();
         let root_name = names.name(TreeId::ROOT);
         git(&repo, &["init", "-q", "-b", &root_name]);
         git(&remote, &["init", "-q", "--bare", "-b", &root_name]);
@@ -375,55 +374,4 @@ R refs/collisions/1 1
 P T0 0
 P refs/collisions/1 1
 ";
-
-    /// The canonical text of one run under root name `root`: a fork's
-    /// committed transaction loses at the root (a collision), and the root and
-    /// the collision ref are pushed to the mirror.
-    fn text_of_a_run_under(root: &str) -> String {
-        use crate::calls::Client;
-        use crate::world::Policies;
-        let mut w = HistoryService::new(Policies::default(), TreeNames::new(root));
-        let f = w.create_fork(TreeId::ROOT);
-        w.begin(f).expect("a transaction");
-        w.save(&Client::Fork(f), "a", 0);
-        w.save(&Client::Fork(f), "a", 2);
-        w.commit_txn(f).expect("the transaction commits");
-        let m1 = Client::Root("m1".into());
-        w.save(&m1, "a", 0);
-        w.save(&m1, "a", 1);
-        while let Some(s) = w.pending().into_iter().next() {
-            w.step(&s);
-        }
-        canonical_text(&w)
-    }
-
-    /// The root's name reaches no digest: the same run under other names,
-    /// one of them nested and one the engine's, gives the same text.
-    #[test]
-    fn the_roots_name_changes_no_digest() {
-        let text = text_of_a_run_under(MODEL_ROOT);
-        for needed in [COLLISION, "\nAgentfs-Cause: Transaction t1\n", "\nP T0 "] {
-            assert!(text.contains(needed), "no {needed:?} in:\n{text}");
-        }
-        assert!(!text.contains(MODEL_ROOT), "the root's name is in:\n{text}");
-        for root in ["main", "trunk", "team/main"] {
-            assert_eq!(text_of_a_run_under(root), text, "under {root:?}");
-        }
-    }
-
-    /// A root name that would collide with a fork's or a transaction's is
-    /// refused; any other git accepts is taken.
-    #[test]
-    fn tree_names_refuses_a_fork_or_transaction_name() {
-        for bad in ["", "fork", "txn", "fork/1", "txn/1"] {
-            let made = std::panic::catch_unwind(|| TreeNames::new(bad));
-            assert!(made.is_err(), "{bad:?} was accepted");
-        }
-        for good in ["root", "main", "forks", "team/fork"] {
-            assert_eq!(
-                TreeNames::new(good).branch(TreeId::ROOT),
-                format!("refs/heads/{good}")
-            );
-        }
-    }
 }

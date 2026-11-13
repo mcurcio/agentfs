@@ -10,13 +10,13 @@ use agentfs_model::git::{git, with_reversed_dates};
 use agentfs_model::recording::{Target, Write};
 use agentfs_model::service::Step;
 use agentfs_model::world::{
-    By, Direction, Life, LineEdit, MODEL_ROOT, MergeRule, ModelError, Overwritten, Policies,
-    TreeNames, TxnEnd, TxnOutcome, World, decisions_in,
+    By, Direction, Life, LineEdit, MergeRule, ModelError, Overwritten, Policies, TreeNames, TxnEnd,
+    TxnOutcome, World, decisions_in,
 };
 use std::collections::BTreeSet;
 
 fn world() -> Checked {
-    Checked::new(Policies::default(), TreeNames::new(MODEL_ROOT))
+    Checked::new(Policies::default(), TreeNames::new())
 }
 
 /// Every invariant, now.
@@ -422,7 +422,7 @@ fn crossing(merge: MergeRule) -> (Checked, String) {
             merge,
             ..Policies::default()
         },
-        TreeNames::new(MODEL_ROOT),
+        TreeNames::new(),
     );
     let f = w.create_fork(TreeId::ROOT);
     let x = w.save(&Client::Fork(f), "a", 0);
@@ -778,7 +778,7 @@ fn neighbours(merge: MergeRule) -> (Checked, [String; 2]) {
             merge,
             layout: Layout::Adjacent,
         },
-        TreeNames::new(MODEL_ROOT),
+        TreeNames::new(),
     );
     let f = w.create_fork(TreeId::ROOT);
     let k = w.save(&Client::Fork(f), "a", 1);
