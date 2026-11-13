@@ -5,10 +5,10 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use agentfs_core::tree_actor::Volume;
+use agentfs_core::tree_actor::{TreeId, Volume};
 
 const PAGE: u64 = 4096;
-const TREE: &str = "main";
+const TREE: TreeId = TreeId::Root;
 const PATH: &str = "shared";
 const SEED: &[u8] = b"abcdefgh";
 
@@ -180,14 +180,14 @@ fn tree_with_seed(seed: &[u8]) -> (tempfile::TempDir, Kernel) {
     (tmp, kernel)
 }
 
-/// How many commits on main name this open.
+/// How many commits on the root name this open.
 fn saves_of(root: &Path, open: u64) -> usize {
     let out = std::process::Command::new("git")
         .arg("--git-dir")
         .arg(root.join("history.git"))
         .args([
             "log",
-            "main",
+            &TREE.to_string(),
             "--format=%(trailers:key=Agentfs-Open,valueonly)",
         ])
         .output()
@@ -529,7 +529,7 @@ fn a_take_names_the_files_it_changed_and_a_save_does_not() {
     v.close(h).unwrap();
     assert_eq!(v.drain_changed(), [], "a save is no take");
     while v.progress().unwrap() {}
-    assert_eq!(v.read(&fork, PATH).unwrap(), b"WXcdefgh");
-    assert_eq!(v.drain_changed(), [(fork.clone(), object)]);
+    assert_eq!(v.read(fork, PATH).unwrap(), b"WXcdefgh");
+    assert_eq!(v.drain_changed(), [(fork, object)]);
     assert_eq!(v.drain_changed(), [], "drained");
 }

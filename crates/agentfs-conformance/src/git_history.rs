@@ -562,9 +562,9 @@ pub(crate) mod tests {
             r#""winner":{"Line":{"file":1,"version":"u"}},"kind":"Line"}]"#,
         );
         let landing = repo.commit_with(&[&before, &incoming], "Landing", Some(&["u"]), &trailers);
-        repo.git(&["update-ref", "refs/heads/r", &landing], b"");
+        repo.git(&["update-ref", "refs/heads/root", &landing], b"");
         repo.git(&["update-ref", "refs/heads/fork/3", &incoming], b"");
-        let mut history = EngineHistory::new(repo.path(), EngineNames::new("r")).unwrap();
+        let mut history = EngineHistory::new(repo.path(), EngineNames::new()).unwrap();
         let fork = TreeId::new(1);
         assert_eq!(
             History::<()>::collisions(&mut history, &()).unwrap(),

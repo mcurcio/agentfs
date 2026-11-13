@@ -50,7 +50,7 @@ fn classify(stderr: &[u8]) -> Error {
 
 // The repository's whole configuration; nothing else writes it.
 const CONFIG: &str = "[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n\tbare = true\n\tfsync = objects,derived-metadata\n\tfsyncMethod = fsync\n";
-const HEAD: &str = "ref: refs/heads/main\n";
+const HEAD: &str = "ref: refs/heads/root\n";
 
 /// A single tree entry. Names are raw Unix filename bytes.
 #[derive(Clone, Debug, PartialEq, Eq)]

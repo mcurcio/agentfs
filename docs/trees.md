@@ -16,7 +16,12 @@ what they do today, and where they stop.
 
 - A **tree** is a branch of one bare git repository.
 - A **fork** is a tree made from another tree, its **upstream**. A fork of a fork
-  has that fork as its upstream. A tree with no upstream is the root (`main`).
+  has that fork as its upstream. A tree with no upstream is the root.
+- A tree's **identity** is `root` or `fork/<n>`, where `n` is the journal event that
+  made the fork; it is never reused. The tree's branch (`refs/heads/root`,
+  `refs/heads/fork/<n>`), its queue, its checkout and the `Agentfs-Tree` trailer of
+  every commit made in it name it by its identity, never by a branch name it is
+  published under. Forks are taken in order of `n`, after the root.
 - A **sync** brings the upstream's version into a fork. A **landing** brings a
   fork's save into its upstream. Two lines **collide** when each was written
   without seeing the other; the upstream's version wins and the loser's lines are
@@ -31,10 +36,10 @@ release in CI.
 
 ```sh
 cargo build --locked -p agentfs
-mkdir -p /tmp/agentfs-trees/main /tmp/agentfs-trees/fork
+mkdir -p /tmp/agentfs-trees/root /tmp/agentfs-trees/fork
 target/debug/agentfs --state /tmp/agentfs-trees/state trees init
 target/debug/agentfs --state /tmp/agentfs-trees/state trees mount \
-  /tmp/agentfs-trees/main --sandbox /tmp/agentfs-trees/fork
+  /tmp/agentfs-trees/root --sandbox /tmp/agentfs-trees/fork
 ```
 
 Use ordinary file calls in either view. The command prints the fork's `fork/N`
@@ -43,12 +48,12 @@ views with `fusermount3 -u PATH`; unmounting every view ends the process.
 
 | Command or flag | Meaning |
 |---|---|
-| `trees init` | Initialize or recover the state area; prints `main <head>` |
-| `trees fork` | Create a fork of main at its saved head; prints its name |
-| `trees mount MAIN` | Recover and mount main on an existing empty directory |
+| `trees init` | Initialize or recover the state area; prints `root <head>` |
+| `trees fork` | Create a fork of the root at its saved head; prints its identity, `fork/N` |
+| `trees mount ROOT` | Recover and mount the root on an existing empty directory |
 | `--sandbox DIR` | Also mount a fork in DIR (a new one, or `--fork`) |
-| `--fork fork/N` | Reuse this fork (needs `--sandbox`) |
-| `--writer LABEL`, `--sandbox-writer LABEL` | Main's and the fork's writer label (default `main-client`, `sandbox-client`). A label is trusted, not an authenticated identity |
+| `--fork fork/N` | Reuse this fork (needs `--sandbox`); `root` is refused |
+| `--writer LABEL`, `--sandbox-writer LABEL` | The root's and the fork's writer label (default `root-client`, `sandbox-client`). A label is trusted, not an authenticated identity |
 | `--metrics-output FILE` | Write counters, the journal's length and each stage's runs, time and git children every 100 ms and at unmount |
 
 Mount points must be empty, separate and outside the state area. Metrics never take
@@ -106,8 +111,10 @@ A step writes its objects, checks and appends its record, then installs and copi
   actor. A failed copy after the record is logged and the call succeeds.
 - Recovery reads the journal, rebuilds the refs and trees, closes abandoned opens
   through the ordinary step and compacts. It refuses a missing journal, a missing
-  `format` file or a lost object at a pointer's tip, and deletes nothing outside a
-  first init's own marker.
+  `format` file, a lost object at a pointer's tip, and a journal that names a tree
+  by anything but its identity, has no root, gives the root an upstream or gives a
+  fork an upstream that is no tree. It deletes nothing outside a first init's own
+  marker.
 - Compaction keeps the journal at most `max(64 MiB, twice the last compacted
   length)` plus the live calls, and keeps only the page writes memory holds. A held
   file pins only its own calls. Frames are at most 96 MiB. The constants are not

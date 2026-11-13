@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use agentfs_core::tree_actor::{Error, Saved, Volume};
+use agentfs_core::tree_actor::{Error, Saved, TreeId, Volume};
 use fuser::*;
 
 const TTL: Duration = Duration::ZERO;
@@ -21,7 +21,7 @@ type Result<T> = std::result::Result<T, Errno>;
 
 /// Views in one process share one locked volume actor.
 pub struct Binding {
-    pub tree: String,
+    pub tree: TreeId,
     pub writer: String,
     pub mountpoint: PathBuf,
 }
@@ -57,7 +57,7 @@ pub fn serve_with_metrics(
                 "trees mounts must be empty directories, separate from state and each other",
             ));
         }
-        volume.head(&binding.tree).map_err(io::Error::other)?;
+        volume.head(binding.tree).map_err(io::Error::other)?;
         if binding.writer.is_empty()
             || binding.writer.chars().any(char::is_control)
             || binding.writer.len() > 256
@@ -94,9 +94,9 @@ pub fn serve_with_metrics(
     let actor = Arc::new(Mutex::new(volume));
     let signal = Arc::new(ProgressSignal::default());
     let mut sessions = Vec::new();
-    let mut notifiers: Vec<(String, Notifier)> = Vec::new();
+    let mut notifiers: Vec<(TreeId, Notifier)> = Vec::new();
     for (binding, at) in bindings.into_iter().zip(points) {
-        let tree = binding.tree.clone();
+        let tree = binding.tree;
         let view = View {
             actor: actor.clone(),
             signal: Arc::clone(&signal),
@@ -218,14 +218,17 @@ pub fn serve_with_metrics(
 fn run_take_gate(
     mut gate: agentfs_core::failpoints::TakeGate,
     actor: &Mutex<Volume>,
-    notifiers: &[(String, Notifier)],
+    notifiers: &[(TreeId, Notifier)],
 ) -> io::Result<()> {
     while let Some(tree) = gate.next_tree()? {
         let (took, changed) = {
             let mut volume = actor
                 .lock()
                 .map_err(|_| io::Error::other("tree actor poisoned"))?;
-            let took = volume.take_next(&tree);
+            let took = tree
+                .parse::<TreeId>()
+                .map_err(|e| e.to_string())
+                .and_then(|tree| volume.take_next(tree).map_err(|e| e.to_string()));
             (took, volume.drain_changed())
         };
         invalidate_changed(notifiers, &changed);
@@ -243,7 +246,7 @@ fn run_take_gate(
 /// Drops the kernel's pages of files a take changed. A file holds no dirty page
 /// then, because takes wait for write-opens. A failure leaves old pages in
 /// mappings and stops nothing: fills read the new bytes once they go.
-fn invalidate_changed(notifiers: &[(String, Notifier)], changed: &[(String, u64)]) {
+fn invalidate_changed(notifiers: &[(TreeId, Notifier)], changed: &[(TreeId, u64)]) {
     for (tree, object) in changed {
         for (_, notifier) in notifiers.iter().filter(|(name, _)| name == tree) {
             if let Err(e) = notifier.inval_inode(INodeNo(object + 2), 0, 0) {
@@ -256,7 +259,7 @@ fn invalidate_changed(notifiers: &[(String, Notifier)], changed: &[(String, u64)
 struct View {
     actor: Arc<Mutex<Volume>>,
     signal: Arc<ProgressSignal>,
-    tree: String,
+    tree: TreeId,
     writer: String,
     handles: Mutex<Handles>,
 }
@@ -346,7 +349,7 @@ impl View {
         self.handles.lock().map_err(|_| Errno::EIO)
     }
     fn path(&self, v: &Volume, ino: INodeNo) -> Result<String> {
-        v.files(&self.tree)
+        v.files(self.tree)
             .map_err(errno)?
             .into_iter()
             .find(|(_, o, _)| *o + 2 == ino.0)
@@ -359,7 +362,7 @@ impl View {
         let open_size = ino
             .0
             .checked_sub(2)
-            .and_then(|object| v.inode_size(&self.tree, object));
+            .and_then(|object| v.inode_size(self.tree, object));
         let size = if ino.0 == 1 {
             0
         } else if let Some(size) = open_size {
@@ -370,7 +373,7 @@ impl View {
                 Open::Read(bytes) => bytes.len(),
                 Open::Write { handle, .. } => v.read_open(*handle).map_err(errno)?.len(),
             }
-        } else if v.is_anonymous(&self.tree, ino.0 - 2).map_err(errno)? {
+        } else if v.is_anonymous(self.tree, ino.0 - 2).map_err(errno)? {
             let handles = self.handles()?;
             let handle = handles
                 .entries
@@ -386,9 +389,7 @@ impl View {
                 .ok_or(Errno::ENOENT)?;
             v.read_open(handle).map_err(errno)?.len()
         } else {
-            v.read(&self.tree, &self.path(v, ino)?)
-                .map_err(errno)?
-                .len()
+            v.read(self.tree, &self.path(v, ino)?).map_err(errno)?.len()
         };
         let dir = ino.0 == 1;
         Ok(FileAttr {
@@ -407,7 +408,7 @@ impl View {
             perm: if dir { 0o700 } else { 0o600 },
             nlink: if dir {
                 2
-            } else if v.is_anonymous(&self.tree, ino.0 - 2).map_err(errno)? {
+            } else if v.is_anonymous(self.tree, ino.0 - 2).map_err(errno)? {
                 0
             } else {
                 1
@@ -427,9 +428,9 @@ impl View {
         }
         let entry = if write {
             let handle = if flags & libc::O_TRUNC != 0 {
-                v.write_open_truncating(&self.tree, path, &self.writer, create)
+                v.write_open_truncating(self.tree, path, &self.writer, create)
             } else {
-                v.write_open(&self.tree, path, &self.writer, create)
+                v.write_open(self.tree, path, &self.writer, create)
             }
             .map_err(errno)?;
             Open::Write {
@@ -440,11 +441,11 @@ impl View {
         } else {
             if create {
                 let h = v
-                    .write_open(&self.tree, path, &self.writer, true)
+                    .write_open(self.tree, path, &self.writer, true)
                     .map_err(errno)?;
                 v.close(h).map_err(errno)?;
             }
-            Open::Read(v.read(&self.tree, path).map_err(errno)?.to_vec())
+            Open::Read(v.read(self.tree, path).map_err(errno)?.to_vec())
         };
         let fh = handles.next;
         handles.next += 1;
@@ -491,7 +492,7 @@ impl Filesystem for View {
             let name = name.to_str().ok_or(Errno::EINVAL)?;
             let v = self.actor()?;
             let (_, object, _) = v
-                .files(&self.tree)
+                .files(self.tree)
                 .map_err(errno)?
                 .into_iter()
                 .find(|(p, _, _)| p == name)
@@ -536,12 +537,12 @@ impl Filesystem for View {
             }
             let path = name.to_str().ok_or(Errno::EINVAL)?;
             let mut v = self.actor()?;
-            if flags & libc::O_EXCL != 0 && v.read(&self.tree, path).is_ok() {
+            if flags & libc::O_EXCL != 0 && v.read(self.tree, path).is_ok() {
                 return Err(Errno::EEXIST);
             }
             let fh = self.open_file(&mut v, path, flags, true)?;
             let object = v
-                .files(&self.tree)
+                .files(self.tree)
                 .map_err(errno)?
                 .into_iter()
                 .find(|(p, _, _)| p == path)
@@ -577,7 +578,7 @@ impl Filesystem for View {
                 return Err(Errno::ENOTDIR);
             }
             let mut v = self.actor()?;
-            let handle = v.anonymous_open(&self.tree, &self.writer).map_err(errno)?;
+            let handle = v.anonymous_open(self.tree, &self.writer).map_err(errno)?;
             let object = v.open_object(handle).map_err(errno)?;
             let mut handles = self.handles()?;
             let fh = handles.next;
@@ -623,7 +624,7 @@ impl Filesystem for View {
             // waits for, so it does not wake the queue worker.
             if owner.is_none() {
                 let object = ino.0.checked_sub(2).ok_or(Errno::EBADF)?;
-                match v.volume.page_fill(&self.tree, object, offset, size) {
+                match v.volume.page_fill(self.tree, object, offset, size) {
                     Err(Error::NotFound) => {}
                     filled => return filled.map_err(errno),
                 }
@@ -718,7 +719,7 @@ impl Filesystem for View {
                 } else {
                     let path = self.path(&v, ino)?;
                     let h = v
-                        .write_open(&self.tree, &path, &self.writer, false)
+                        .write_open(self.tree, &path, &self.writer, false)
                         .map_err(errno)?;
                     let result = v.truncate(h, size).map_err(errno);
                     v.close(h).map_err(errno)?;
@@ -784,11 +785,11 @@ impl Filesystem for View {
             let object = ino.0.checked_sub(2).ok_or(Errno::ENOENT)?;
             let mut v = self.actor()?;
             // Existing named-object hard links retain fuser's default EPERM.
-            if !v.is_anonymous(&self.tree, object).map_err(errno)? {
+            if !v.is_anonymous(self.tree, object).map_err(errno)? {
                 return Err(Errno::EPERM);
             }
             v.first_link(
-                &self.tree,
+                self.tree,
                 object,
                 name.to_str().ok_or(Errno::EINVAL)?,
                 &self.writer,
@@ -807,11 +808,7 @@ impl Filesystem for View {
                 return Err(Errno::ENOTDIR);
             }
             self.actor()?
-                .unlink(
-                    &self.tree,
-                    name.to_str().ok_or(Errno::EINVAL)?,
-                    &self.writer,
-                )
+                .unlink(self.tree, name.to_str().ok_or(Errno::EINVAL)?, &self.writer)
                 .map_err(errno)
         })();
         match result {
@@ -838,7 +835,7 @@ impl Filesystem for View {
             }
             self.actor()?
                 .rename(
-                    &self.tree,
+                    self.tree,
                     name.to_str().ok_or(Errno::EINVAL)?,
                     newname.to_str().ok_or(Errno::EINVAL)?,
                     &self.writer,
@@ -868,7 +865,7 @@ impl Filesystem for View {
                 (INodeNo(1), FileType::Directory, "..".to_owned()),
             ];
             entries.extend(
-                v.files(&self.tree)
+                v.files(self.tree)
                     .map_err(errno)?
                     .into_iter()
                     .map(|(p, o, _)| (INodeNo(o + 2), FileType::RegularFile, p)),
@@ -906,12 +903,12 @@ mod tests {
             std::fs::create_dir_all(&invalid).unwrap();
             let bindings = vec![
                 Binding {
-                    tree: "main".into(),
-                    writer: "main".into(),
+                    tree: TreeId::Root,
+                    writer: "root-client".into(),
                     mountpoint: outside,
                 },
                 Binding {
-                    tree: "main".into(),
+                    tree: TreeId::Root,
                     writer: "other".into(),
                     mountpoint: invalid,
                 },
@@ -929,7 +926,7 @@ mod tests {
         let view = View {
             actor: Arc::new(Mutex::new(Volume::open(tmp.path()).unwrap())),
             signal: Arc::new(ProgressSignal::default()),
-            tree: "main".into(),
+            tree: TreeId::Root,
             writer: "client".into(),
             handles: Mutex::new(Handles {
                 next: 2,
@@ -937,7 +934,7 @@ mod tests {
             }),
         };
         let mut volume = view.actor().unwrap();
-        let handle = volume.anonymous_open("main", "client").unwrap();
+        let handle = volume.anonymous_open(TreeId::Root, "client").unwrap();
         let ino = INodeNo(volume.open_object(handle).unwrap() + 2);
         volume.write(handle, 0, b"private", false).unwrap();
         view.handles().unwrap().entries.insert(
@@ -959,7 +956,7 @@ mod tests {
         let view = View {
             actor: Arc::new(Mutex::new(Volume::open(tmp.path()).unwrap())),
             signal: Arc::new(ProgressSignal::default()),
-            tree: "main".into(),
+            tree: TreeId::Root,
             writer: "client".into(),
             handles: Mutex::new(Handles {
                 next: 1,
@@ -967,17 +964,17 @@ mod tests {
             }),
         };
         let mut volume = view.actor().unwrap();
-        let h = volume.write_open("main", "a", "seed", true).unwrap();
+        let h = volume.write_open(TreeId::Root, "a", "seed", true).unwrap();
         volume.write(h, 0, b"old", false).unwrap();
         volume.close(h).unwrap();
         let reader = view
             .open_file(&mut volume, "a", libc::O_RDONLY, false)
             .unwrap();
-        let h = volume.write_open("main", "a", "next", false).unwrap();
+        let h = volume.write_open(TreeId::Root, "a", "next", false).unwrap();
         volume.truncate(h, 0).unwrap();
         volume.write(h, 0, b"new", false).unwrap();
         volume.close(h).unwrap();
-        assert_eq!(volume.read("main", "a").unwrap(), b"new");
+        assert_eq!(volume.read(TreeId::Root, "a").unwrap(), b"new");
         match &view.handles().unwrap().entries[&reader] {
             Open::Read(bytes) => assert_eq!(bytes, b"old"),
             _ => panic!("read-only open acquired a writer"),
@@ -986,6 +983,6 @@ mod tests {
             view.open_file(&mut volume, "a", libc::O_RDONLY | libc::O_TRUNC, false),
             Err(Errno::EACCES)
         );
-        assert_eq!(volume.read("main", "a").unwrap(), b"new");
+        assert_eq!(volume.read(TreeId::Root, "a").unwrap(), b"new");
     }
 }

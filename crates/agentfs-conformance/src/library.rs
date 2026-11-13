@@ -1,7 +1,7 @@
 //! The shared calls on the real library: `Volume`, in this process.
 
 use crate::engine_names::EngineNames;
-use agentfs_core::tree_actor::{self, Error, Volume};
+use agentfs_core::tree_actor::{self, Error, TreeId as EngineTree, Volume};
 use agentfs_model::calls::{CallError, Caller, Took, TreeCalls, TreeId};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -13,7 +13,7 @@ const SEED_BYTES: &[u8] = b"-\n-\n-\n-\n-\n-\n";
 /// Makes the model's first commit in a new volume, in its root `root`. Each file
 /// is created under another name and renamed, because a file just created is what
 /// an atomic save renames (the model's a to d never are: `fresh`, git-model.md §7).
-pub fn seed(volume: &mut Volume, root: &str) -> Result<(), Error> {
+pub fn seed(volume: &mut Volume, root: EngineTree) -> Result<(), Error> {
     for path in SEEDED {
         let new = format!("{path}.new");
         let h = volume.write_open(root, &new, "agentfs-seed", true)?;
@@ -70,10 +70,10 @@ impl Library {
     }
 
     /// The tree and writer label of a caller, owned: calls take `&mut self`.
-    fn who(&self, c: &Caller) -> Result<(String, String), CallError> {
+    fn who(&self, c: &Caller) -> Result<(EngineTree, String), CallError> {
         Ok(match c {
-            Caller::Root(n) => (self.names.name(TreeId::ROOT)?.to_owned(), n.clone()),
-            Caller::Fork(f) => (self.names.name(*f)?.to_owned(), format!("c{f}")),
+            Caller::Root(n) => (self.names.name(TreeId::ROOT)?, n.clone()),
+            Caller::Fork(f) => (self.names.name(*f)?, format!("c{f}")),
         })
     }
 
@@ -81,7 +81,7 @@ impl Library {
         let (tree, writer) = self.who(c)?;
         let h = self
             .v_mut()?
-            .write_open(&tree, path, &writer, create)
+            .write_open(tree, path, &writer, create)
             .map_err(fail)?;
         self.owners.insert(h, c.clone());
         Ok(h)
@@ -109,7 +109,7 @@ impl TreeCalls for Library {
     /// `O_CREAT | O_EXCL`, as the view makes it.
     fn create(&mut self, c: &Caller, path: &str) -> Result<u64, CallError> {
         let (tree, _) = self.who(c)?;
-        if self.v()?.read(&tree, path).is_ok() {
+        if self.v()?.read(tree, path).is_ok() {
             return Err(fail(Error::Exists));
         }
         self.open(c, path, true)
@@ -134,12 +134,12 @@ impl TreeCalls for Library {
 
     fn unlink(&mut self, c: &Caller, path: &str) -> Result<(), CallError> {
         let (tree, writer) = self.who(c)?;
-        self.v_mut()?.unlink(&tree, path, &writer).map_err(fail)
+        self.v_mut()?.unlink(tree, path, &writer).map_err(fail)
     }
 
     fn rename(&mut self, c: &Caller, from: &str, to: &str) -> Result<(), CallError> {
         let (tree, writer) = self.who(c)?;
-        self.v_mut()?.rename(&tree, from, to, &writer).map_err(fail)
+        self.v_mut()?.rename(tree, from, to, &writer).map_err(fail)
     }
 
     fn end_client(&mut self, c: &Caller) -> Result<(), CallError> {
@@ -156,8 +156,8 @@ impl TreeCalls for Library {
     }
 
     fn take_next(&mut self, t: TreeId) -> Result<Took, CallError> {
-        let tree = self.names.name(t)?.to_owned();
-        Ok(match self.v_mut()?.take_next(&tree).map_err(fail)? {
+        let tree = self.names.name(t)?;
+        Ok(match self.v_mut()?.take_next(tree).map_err(fail)? {
             tree_actor::Took::Taken => Took::Taken,
             tree_actor::Took::Waiting => Took::Waiting,
             tree_actor::Took::Empty => Took::Empty,

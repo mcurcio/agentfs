@@ -14,6 +14,7 @@ pub mod queue;
 mod referee;
 pub mod stages;
 mod sync;
+mod tree_id;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
@@ -35,8 +36,9 @@ use journal::{
 };
 use pointers::Pointers;
 use stages::{Stages, Timer, Which};
+pub use tree_id::{NotATree, TreeId};
 
-const FORMAT: &str = "agentfs-trees-2\n";
+const FORMAT: &str = "agentfs-trees-3\n";
 const JOURNAL: &str = "calls.wal";
 const INITIALIZING: &str = "initializing";
 type Result<T> = std::result::Result<T, Error>;
@@ -110,8 +112,35 @@ fn now_ns() -> u64 {
         .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
 }
 
-fn branch(tree: &str) -> String {
+fn branch(tree: TreeId) -> String {
     format!("refs/heads/{tree}")
+}
+
+fn queue(tree: TreeId) -> String {
+    format!("refs/queue/{tree}/")
+}
+
+/// A tree string the journal stores, parsed once, at the fold: one that names no
+/// tree is [`Error::Format`].
+fn parse_tree(text: &str) -> Result<TreeId> {
+    text.parse().map_err(|_| Error::Format)
+}
+
+/// The tree a commit's `Agentfs-Tree` trailer names, if it has one.
+fn tree_trailer(message: &[u8]) -> Result<Option<TreeId>> {
+    std::str::from_utf8(message)
+        .ok()
+        .and_then(|m| m.lines().find_map(|l| l.strip_prefix("Agentfs-Tree: ")))
+        .map(parse_tree)
+        .transpose()
+}
+
+/// The upstream map as Git's config writes it: each fork's text and its upstream's.
+fn upstream_config(upstreams: &BTreeMap<TreeId, TreeId>) -> BTreeMap<String, String> {
+    upstreams
+        .iter()
+        .map(|(fork, upstream)| (fork.to_string(), upstream.to_string()))
+        .collect()
 }
 
 /// Calls name byte positions, never lines. Append finds EOF at save time.
@@ -303,7 +332,7 @@ impl NameHistory {
 }
 
 struct Handle {
-    tree: String,
+    tree: TreeId,
     writer: String,
     object: u64,
     bytes: Vec<u8>,
@@ -371,10 +400,43 @@ pub struct Metrics {
     pub journal_bytes: u64,
 }
 
+/// A live write-open: a journal [`OpenRecord`] with its tree parsed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LiveOpen {
+    handle: u64,
+    tree: TreeId,
+    writer: String,
+    object: u64,
+    /// Never linked: its object has no name and no saved state.
+    anonymous: bool,
+}
+
+impl LiveOpen {
+    fn parse(record: &OpenRecord) -> Result<Self> {
+        Ok(Self {
+            handle: record.handle,
+            tree: parse_tree(&record.tree)?,
+            writer: record.writer.clone(),
+            object: record.object,
+            anonymous: record.anonymous,
+        })
+    }
+
+    fn record(&self) -> OpenRecord {
+        OpenRecord {
+            handle: self.handle,
+            tree: self.tree.to_string(),
+            writer: self.writer.clone(),
+            object: self.object,
+            anonymous: self.anonymous,
+        }
+    }
+}
+
 /// A live open and its calls, as the journal leaves them.
 #[derive(Debug, PartialEq, Eq)]
 struct FoldedOpen {
-    open: OpenRecord,
+    open: LiveOpen,
     calls: Vec<(u64, Call)>,
 }
 
@@ -382,17 +444,27 @@ struct FoldedOpen {
 #[derive(Debug, PartialEq, Eq)]
 struct Folded {
     pointers: Pointers,
-    upstreams: BTreeMap<String, String>,
+    /// Each fork's upstream. The root has none.
+    upstreams: BTreeMap<TreeId, TreeId>,
     next_seq: u64,
     opens: BTreeMap<u64, FoldedOpen>,
     /// A file's page writes while a write-open of it lives.
-    page_writes: BTreeMap<(String, u64), Vec<(u64, pages::Run)>>,
+    page_writes: BTreeMap<(TreeId, u64), Vec<(u64, pages::Run)>>,
     /// The last step that closed a write-open of a file, while one lives.
-    saved_through: BTreeMap<(String, u64), u64>,
+    saved_through: BTreeMap<(TreeId, u64), u64>,
 }
 
 impl Folded {
-    fn add_open(&mut self, open: OpenRecord) {
+    fn add_upstream(&mut self, fork: &str, upstream: &str) -> Result<()> {
+        let fork = parse_tree(fork)?;
+        if fork.is_root() {
+            return Err(Error::Format);
+        }
+        self.upstreams.insert(fork, parse_tree(upstream)?);
+        Ok(())
+    }
+
+    fn add_open(&mut self, open: LiveOpen) {
         self.opens.insert(
             open.handle,
             FoldedOpen {
@@ -437,9 +509,9 @@ fn runs_from_frame(heads: &[RunHead], tail: &[u8]) -> Result<Vec<pages::Run>> {
     }
 }
 
-/// Adds a journal's frames up. Pure. Frames that disagree with each other
-/// cannot come from a good journal: [`Error::Format`], or
-/// [`Error::PointerMoved`] for a pointer.
+/// Adds a journal's frames up. Pure. Frames that disagree with each other, or
+/// a tree string that is no [`TreeId`], cannot come from a good journal:
+/// [`Error::Format`], or [`Error::PointerMoved`] for a pointer.
 fn fold(frames: &[Frame]) -> Result<Folded> {
     let mut frames = frames.iter();
     let Some((
@@ -466,17 +538,20 @@ fn fold(frames: &[Frame]) -> Result<Folded> {
                 .map(|(name, hex)| Ok((name.clone(), parse_oid(hex)?)))
                 .collect::<Result<_>>()?,
         ),
-        upstreams: upstreams.clone(),
+        upstreams: BTreeMap::new(),
         next_seq: *next_seq,
         opens: BTreeMap::new(),
         page_writes: BTreeMap::new(),
         saved_through: page_saved
             .iter()
-            .map(|(tree, object, seq)| ((tree.clone(), *object), *seq))
-            .collect(),
+            .map(|(tree, object, seq)| Ok(((parse_tree(tree)?, *object), *seq)))
+            .collect::<Result<_>>()?,
     };
+    for (fork, upstream) in upstreams {
+        folded.add_upstream(fork, upstream)?;
+    }
     for open in opens {
-        folded.add_open(open.clone());
+        folded.add_open(LiveOpen::parse(open)?);
     }
     for (record, tail) in frames {
         let seq = record.seq;
@@ -488,16 +563,16 @@ fn fold(frames: &[Frame]) -> Result<Folded> {
                 writer,
                 object,
                 ..
-            } => folded.add_open(OpenRecord {
+            } => folded.add_open(LiveOpen {
                 handle: seq,
-                tree: tree.clone(),
+                tree: parse_tree(tree)?,
                 writer: writer.clone(),
                 object: *object,
                 anonymous: false,
             }),
-            Entry::AnonymousOpen { tree, writer } => folded.add_open(OpenRecord {
+            Entry::AnonymousOpen { tree, writer } => folded.add_open(LiveOpen {
                 handle: seq,
-                tree: tree.clone(),
+                tree: parse_tree(tree)?,
                 writer: writer.clone(),
                 object: seq,
                 anonymous: true,
@@ -510,7 +585,7 @@ fn fold(frames: &[Frame]) -> Result<Folded> {
                 .push((seq, Call::from_frame(call, tail)?)),
             Entry::PageWrite { tree, object, runs } => folded
                 .page_writes
-                .entry((tree.clone(), *object))
+                .entry((parse_tree(tree)?, *object))
                 .or_default()
                 .extend(runs_from_frame(runs, tail)?.into_iter().map(|r| (seq, r))),
             Entry::Step {
@@ -528,10 +603,10 @@ fn fold(frames: &[Frame]) -> Result<Folded> {
                 folded.pointers.check(&changes)?;
                 folded.pointers.apply(&changes);
                 if let Some((name, parent)) = fork {
-                    folded.upstreams.insert(name.clone(), parent.clone());
+                    folded.add_upstream(name, parent)?;
                 }
                 if let Some(open) = opened {
-                    folded.add_open(open.clone());
+                    folded.add_open(LiveOpen::parse(open)?);
                 }
                 if let Some(object) = linked {
                     folded
@@ -542,18 +617,16 @@ fn fold(frames: &[Frame]) -> Result<Folded> {
                 }
                 if let Some(handle) = closes {
                     let open = folded.opens.remove(handle).ok_or(Error::Format)?.open;
-                    folded
-                        .saved_through
-                        .insert((open.tree.clone(), open.object), seq);
+                    folded.saved_through.insert((open.tree, open.object), seq);
                 }
             }
         }
     }
     // Page state lives from a file's write-open to the close of its last one.
-    let live: BTreeSet<(String, u64)> = folded
+    let live: BTreeSet<(TreeId, u64)> = folded
         .opens
         .values()
-        .map(|o| (o.open.tree.clone(), o.open.object))
+        .map(|o| (o.open.tree, o.open.object))
         .collect();
     folded.page_writes.retain(|key, _| live.contains(key));
     folded.saved_through.retain(|key, _| live.contains(key));
@@ -563,23 +636,24 @@ fn fold(frames: &[Frame]) -> Result<Folded> {
 /// A step built on a copy of its tree and not yet on record.
 struct Draft {
     by: String,
-    tree: String,
+    tree: TreeId,
     built: Tree,
     changes: Vec<RefUpdate>,
     closes: Option<u64>,
-    opened: Option<OpenRecord>,
+    opened: Option<LiveOpen>,
     linked: Option<u64>,
-    fork: Option<(String, String)>,
+    /// A fork this step makes, and its upstream.
+    fork: Option<(TreeId, TreeId)>,
     saved: Saved,
     enqueued: u64,
     taken: u64,
 }
 
 impl Draft {
-    fn new(by: &str, tree: &str, built: Tree) -> Self {
+    fn new(by: &str, tree: TreeId, built: Tree) -> Self {
         Self {
             by: by.to_owned(),
-            tree: tree.to_owned(),
+            tree,
             built,
             changes: Vec::new(),
             closes: None,
@@ -597,9 +671,11 @@ impl Draft {
         Entry::Step {
             by: self.by.clone(),
             closes: self.closes,
-            opened: self.opened.clone(),
+            opened: self.opened.as_ref().map(LiveOpen::record),
             linked: self.linked,
-            fork: self.fork.clone(),
+            fork: self
+                .fork
+                .map(|(fork, upstream)| (fork.to_string(), upstream.to_string())),
             pointers: self
                 .changes
                 .iter()
@@ -621,8 +697,9 @@ pub struct Volume {
     journal: Journal,
     /// Runtime pointer reads come from here, never from Git's copy.
     pointers: Pointers,
-    upstreams: BTreeMap<String, String>,
-    trees: BTreeMap<String, Tree>,
+    /// Each fork's upstream. The root has none.
+    upstreams: BTreeMap<TreeId, TreeId>,
+    trees: BTreeMap<TreeId, Tree>,
     handles: BTreeMap<u64, Handle>,
     /// Closes that could not save, in arrival order. Their handles count as
     /// open until a later step in their tree saves them, or a restart does.
@@ -633,13 +710,13 @@ pub struct Volume {
     stopped: bool,
     /// A copy failed: the next step rebuilds refs whole and redoes checkouts.
     copies_stale: bool,
-    stale_checkouts: BTreeSet<String>,
+    stale_checkouts: BTreeSet<TreeId>,
     compact_threshold: u64,
     metrics: Metrics,
     waiting_since: BTreeMap<String, Instant>,
-    pages: BTreeMap<(String, u64), pages::ObjectPages>,
+    pages: BTreeMap<(TreeId, u64), pages::ObjectPages>,
     /// Objects takes changed since the view last asked (`drain_changed`).
-    changed: Vec<(String, u64)>,
+    changed: Vec<(TreeId, u64)>,
     _lock: Arc<FileLock>,
 }
 
@@ -672,7 +749,10 @@ fn prepare_state_area(root: &Path, lock: &Arc<FileLock>) -> Result<()> {
     let head = repo.write_commit(
         tree,
         &[],
-        "Root\n\nAgentfs-Writer: agentfs\nAgentfs-Cause: Root\nAgentfs-Tree: main\nAgentfs-Event: 0\n",
+        &format!(
+            "Root\n\nAgentfs-Writer: agentfs\nAgentfs-Cause: Root\nAgentfs-Tree: {}\nAgentfs-Event: 0\n",
+            TreeId::Root
+        ),
     )?;
     Journal::create(
         &root.join(JOURNAL),
@@ -681,7 +761,9 @@ fn prepare_state_area(root: &Path, lock: &Arc<FileLock>) -> Result<()> {
             at_ns: now_ns(),
             entry: Entry::Checkpoint {
                 next_seq: 1,
-                pointers: [(branch("main"), head.to_string())].into_iter().collect(),
+                pointers: [(branch(TreeId::Root), head.to_string())]
+                    .into_iter()
+                    .collect(),
                 upstreams: BTreeMap::new(),
                 opens: Vec::new(),
                 page_saved: Vec::new(),
@@ -724,8 +806,10 @@ impl Volume {
     ///
     /// # Errors
     ///
-    /// [`Error::Format`] for a state area that is not this format,
-    /// [`Error::CorruptJournal`] and [`Error::MissingObject`] when the journal
+    /// [`Error::Format`] for a state area that is not this format (an older
+    /// format included), or whose journal names a tree that is no [`TreeId`],
+    /// has no root, gives the root an upstream or a fork an upstream that is no
+    /// tree; [`Error::CorruptJournal`] and [`Error::MissingObject`] when the journal
     /// or a pointer's objects are damaged (docs/runbooks/recording-failures.md),
     /// and any failure of a recovery close.
     pub fn open(root: &Path) -> Result<Self> {
@@ -757,7 +841,7 @@ impl Volume {
         let repo = TreeGit::open_with_lease(&history, Arc::clone(&lock))?;
         // Before any git command: an empty config silently loses core.fsync,
         // and an empty HEAD is "not a git repository".
-        repo.write_config(&folded.upstreams)?;
+        repo.write_config(&upstream_config(&folded.upstreams))?;
         check_objects(&repo, &folded.pointers)?;
         repo.rebuild_refs(&folded.pointers.creates())?;
         crate::failpoints::hit("tree.after_ref_rebuild")?;
@@ -792,7 +876,7 @@ impl Volume {
             volume.handles.insert(
                 handle,
                 Handle {
-                    tree: open.tree.clone(),
+                    tree: open.tree,
                     writer: open.writer,
                     object: open.object,
                     // Nothing reads it: this handle closes before serving.
@@ -800,23 +884,23 @@ impl Volume {
                     calls,
                 },
             );
-            volume.pages_opened(&open.tree, open.object);
+            volume.pages_opened(open.tree, open.object);
         }
         let mut page_writes = folded.page_writes;
         let saved = folded.saved_through;
-        let page_files: BTreeSet<(String, u64)> =
+        let page_files: BTreeSet<(TreeId, u64)> =
             page_writes.keys().chain(saved.keys()).cloned().collect();
         for key in page_files {
             let writes = page_writes.remove(&key).unwrap_or_default();
             let saved_through = saved.get(&key).copied().unwrap_or(0);
-            volume.pages_restore(&key.0, key.1, writes, saved_through);
+            volume.pages_restore(key.0, key.1, writes, saved_through);
         }
         let abandoned: Vec<_> = volume.handles.keys().copied().collect();
         for handle in abandoned {
             volume.close(handle)?;
         }
-        for name in volume.tree_names() {
-            volume.checkout(&name)?;
+        for tree in volume.trees() {
+            volume.checkout(tree)?;
         }
         volume.metrics.queued = volume.pointers.under("refs/queue/").len() as u64;
         match volume.compact() {
@@ -828,27 +912,36 @@ impl Volume {
         Ok(volume)
     }
 
+    /// Every branch is a tree's, the root among them, and every fork's upstream
+    /// is a tree: else [`Error::Format`].
     fn build_trees(&mut self) -> Result<()> {
         for (reference, head) in self.pointers.under("refs/heads/") {
-            let name = reference
-                .strip_prefix("refs/heads/")
-                .ok_or(Error::Format)?
-                .to_owned();
+            let id = parse_tree(reference.strip_prefix("refs/heads/").ok_or(Error::Format)?)?;
             let mut snapshot = self.snapshot_at(head)?;
-            self.restore_object_table(&name, &mut snapshot)?;
+            self.restore_object_table(id, &mut snapshot)?;
             let mut tree = Tree::default();
             tree.install(snapshot)?;
-            self.trees.insert(name, tree);
+            self.trees.insert(id, tree);
         }
-        if self.trees.contains_key("main") {
+        if self.trees.contains_key(&TreeId::Root)
+            && self
+                .upstreams
+                .values()
+                .all(|upstream| self.trees.contains_key(upstream))
+        {
             Ok(())
         } else {
             Err(Error::Format)
         }
     }
 
-    pub fn tree_names(&self) -> Vec<String> {
-        self.trees.keys().cloned().collect()
+    /// Every tree: the root first, then the forks by number.
+    pub fn trees(&self) -> Vec<TreeId> {
+        self.trees.keys().copied().collect()
+    }
+
+    fn upstream_of(&self, tree: TreeId) -> Option<TreeId> {
+        self.upstreams.get(&tree).copied()
     }
 
     /// Snapshot measurements without exposing them through a workload view.
@@ -869,41 +962,43 @@ impl Volume {
         self.stopped
     }
 
-    pub fn head(&self, tree: &str) -> Result<Oid> {
+    pub fn head(&self, tree: TreeId) -> Result<Oid> {
         self.tree(tree)?;
         self.pointers.get(&branch(tree)).ok_or(Error::NotFound)
     }
 
     /// Fork IDs are numeric and never reused. Forking a fork is not exposed yet.
-    pub fn fork(&mut self) -> Result<String> {
-        let (seq, _) = self.step("main", |v, seq| {
-            let name = format!("fork/{seq}");
-            let at = v.head("main")?;
-            let mut tree = v.tree("main")?.clone();
+    /// A fork of the root, at the root's saved head.
+    pub fn fork(&mut self) -> Result<TreeId> {
+        let upstream = TreeId::Root;
+        let (seq, _) = self.step(upstream, |v, seq| {
+            let fork = TreeId::Fork(seq);
+            let at = v.head(upstream)?;
+            let mut tree = v.tree(upstream)?.clone();
             for object in std::mem::take(&mut tree.anonymous) {
                 tree.drop_object(object);
             }
-            let mut draft = Draft::new("agentfs", &name, tree);
+            let mut draft = Draft::new("agentfs", fork, tree);
             draft.changes.push(RefUpdate {
-                refname: branch(&name),
+                refname: branch(fork),
                 new: Some(at),
                 expected_old: None,
             });
-            draft.fork = Some((name, "main".to_owned()));
+            draft.fork = Some((fork, upstream));
             Ok(draft)
         })?;
-        Ok(format!("fork/{seq}"))
+        Ok(TreeId::Fork(seq))
     }
 
     /// Saved bytes; an independent reader never sees an unfinished save.
-    pub fn read(&self, tree: &str, path: &str) -> Result<&[u8]> {
+    pub fn read(&self, tree: TreeId, path: &str) -> Result<&[u8]> {
         let tree = self.tree(tree)?;
         let object = tree.names.get(path).ok_or(Error::NotFound)?;
         Ok(tree.bytes.get(object).ok_or(Error::NotFound)?)
     }
 
     /// Stable object IDs for a view's inode table (not merge identities).
-    pub fn files(&self, tree: &str) -> Result<Vec<(String, u64, usize)>> {
+    pub fn files(&self, tree: TreeId) -> Result<Vec<(String, u64, usize)>> {
         let tree = self.tree(tree)?;
         Ok(tree
             .names
@@ -919,7 +1014,7 @@ impl Volume {
     /// does.
     pub fn write_open_truncating(
         &mut self,
-        tree: &str,
+        tree: TreeId,
         path: &str,
         writer: &str,
         create: bool,
@@ -938,7 +1033,7 @@ impl Volume {
     /// The returned number is persisted before it can be used and never repeats.
     pub fn write_open(
         &mut self,
-        tree: &str,
+        tree: TreeId,
         path: &str,
         writer: &str,
         create: bool,
@@ -955,7 +1050,7 @@ impl Volume {
         };
         let handle = self.journal_record(
             Entry::Open {
-                tree: tree.to_owned(),
+                tree: tree.to_string(),
                 path: path.to_owned(),
                 writer: writer.to_owned(),
                 object,
@@ -966,7 +1061,7 @@ impl Volume {
         self.handles.insert(
             handle,
             Handle {
-                tree: tree.to_owned(),
+                tree,
                 writer: writer.to_owned(),
                 object,
                 bytes,
@@ -978,24 +1073,24 @@ impl Volume {
     }
 
     /// Create an unnamed open object. Its writes are journaled as usual.
-    pub fn anonymous_open(&mut self, tree: &str, writer: &str) -> Result<u64> {
+    pub fn anonymous_open(&mut self, tree: TreeId, writer: &str) -> Result<u64> {
         writer_label(writer)?;
         self.tree(tree)?;
         let handle = self.journal_record(
             Entry::AnonymousOpen {
-                tree: tree.to_owned(),
+                tree: tree.to_string(),
                 writer: writer.to_owned(),
             },
             &[],
         )?;
         self.trees
-            .get_mut(tree)
+            .get_mut(&tree)
             .ok_or(Error::NotFound)?
             .add_anonymous(handle);
         self.handles.insert(
             handle,
             Handle {
-                tree: tree.to_owned(),
+                tree,
                 writer: writer.to_owned(),
                 object: handle,
                 bytes: Vec::new(),
@@ -1007,7 +1102,13 @@ impl Volume {
     }
 
     /// Link an anonymous object for the first time, preserving its identity.
-    pub fn first_link(&mut self, tree: &str, object: u64, path: &str, writer: &str) -> Result<()> {
+    pub fn first_link(
+        &mut self,
+        tree: TreeId,
+        object: u64,
+        path: &str,
+        writer: &str,
+    ) -> Result<()> {
         name(path)?;
         writer_label(writer)?;
         let t = self.tree(tree)?;
@@ -1033,7 +1134,7 @@ impl Volume {
     }
 
     /// Whether this object has never had a name in this tree.
-    pub fn is_anonymous(&self, tree: &str, object: u64) -> Result<bool> {
+    pub fn is_anonymous(&self, tree: TreeId, object: u64) -> Result<bool> {
         Ok(self.tree(tree)?.anonymous.contains(&object))
     }
 
@@ -1067,7 +1168,7 @@ impl Volume {
         // Check both the writer's view and replay on the head before journaling.
         let mut bytes = h.bytes.clone();
         call.apply(&mut bytes)?;
-        let mut replay = self.tree(&h.tree)?.bytes[&h.object].to_vec();
+        let mut replay = self.tree(h.tree)?.bytes[&h.object].to_vec();
         for c in h.calls.iter().map(|(_, c)| c).chain(std::iter::once(&call)) {
             c.apply(&mut replay)?;
         }
@@ -1076,14 +1177,14 @@ impl Volume {
         let h = self.handles.get_mut(&handle).ok_or(Error::NotFound)?;
         h.bytes = bytes;
         h.calls.push((seq, call.clone()));
-        let (tree, object) = (h.tree.clone(), h.object);
-        self.pages_note_call(&tree, object, &call);
+        let (tree, object) = (h.tree, h.object);
+        self.pages_note_call(tree, object, &call);
         Ok(())
     }
 
     /// The journal call for a page write: only `pages` calls it (ledger R1.4).
     /// Returns its journal number.
-    fn record_page_write(&mut self, tree: &str, object: u64, runs: &[pages::Run]) -> Result<u64> {
+    fn record_page_write(&mut self, tree: TreeId, object: u64, runs: &[pages::Run]) -> Result<u64> {
         let heads = runs
             .iter()
             .map(|run| RunHead {
@@ -1097,7 +1198,7 @@ impl Volume {
         });
         self.journal_record(
             Entry::PageWrite {
-                tree: tree.to_owned(),
+                tree: tree.to_string(),
                 object,
                 runs: heads,
             },
@@ -1121,19 +1222,14 @@ impl Volume {
         if self.stopped {
             return Err(Error::Stopped);
         }
-        let tree = self
-            .handles
-            .get(&handle)
-            .ok_or(Error::NotFound)?
-            .tree
-            .clone();
+        let tree = self.handles.get(&handle).ok_or(Error::NotFound)?.tree;
         if !self.pending_closes.contains(&handle) {
             self.pending_closes.push(handle);
         }
-        self.run_pending_closes(&tree, Some(handle))
+        self.run_pending_closes(tree, Some(handle))
     }
 
-    pub fn rename(&mut self, tree: &str, from: &str, to: &str, writer: &str) -> Result<()> {
+    pub fn rename(&mut self, tree: TreeId, from: &str, to: &str, writer: &str) -> Result<()> {
         name(from)?;
         name(to)?;
         writer_label(writer)?;
@@ -1146,7 +1242,7 @@ impl Volume {
         Ok(())
     }
 
-    pub fn unlink(&mut self, tree: &str, path: &str, writer: &str) -> Result<()> {
+    pub fn unlink(&mut self, tree: TreeId, path: &str, writer: &str) -> Result<()> {
         name(path)?;
         writer_label(writer)?;
         if !self.tree(tree)?.names.contains_key(path) {
@@ -1164,11 +1260,11 @@ impl Volume {
         Ok(())
     }
 
-    fn tree(&self, tree: &str) -> Result<&Tree> {
+    fn tree(&self, tree: TreeId) -> Result<&Tree> {
         if self.stopped {
             return Err(Error::Stopped);
         }
-        self.trees.get(tree).ok_or(Error::NotFound)
+        self.trees.get(&tree).ok_or(Error::NotFound)
     }
 
     fn snapshot_of(tree: &Tree) -> referee::Snapshot {
@@ -1277,7 +1373,7 @@ impl Volume {
 
     fn object_table_update(
         &self,
-        tree: &str,
+        tree: TreeId,
         snapshot: &referee::Snapshot,
         updates: &mut Vec<RefUpdate>,
     ) -> Result<()> {
@@ -1298,7 +1394,7 @@ impl Volume {
         Ok(())
     }
 
-    fn restore_object_table(&self, tree: &str, snapshot: &mut referee::Snapshot) -> Result<()> {
+    fn restore_object_table(&self, tree: TreeId, snapshot: &mut referee::Snapshot) -> Result<()> {
         if let Some(oid) = self.pointers.get(&format!("refs/agentfs/objects/{tree}")) {
             let table: ObjectTable = serde_json::from_slice(&self.repo.read_blob(oid)?)?;
             for (id, file) in &mut snapshot.files {
@@ -1359,9 +1455,9 @@ impl Volume {
         keys
     }
 
-    fn open_keys(&self, tree: &str) -> BTreeSet<queue::Key> {
+    fn open_keys(&self, tree: TreeId) -> BTreeSet<queue::Key> {
         let mut keys = BTreeSet::new();
-        if let Some(t) = self.trees.get(tree) {
+        if let Some(t) = self.trees.get(&tree) {
             for handle in self.handles.values().filter(|h| h.tree == tree) {
                 if !t.names.values().any(|object| *object == handle.object) {
                     continue;
@@ -1386,7 +1482,8 @@ impl Volume {
     fn rebuild_owners(&mut self) -> Result<()> {
         let _timer = Timer::start(Which::EventOwners);
         let mut tips: Vec<Oid> = Vec::new();
-        for prefix in ["refs/heads/", "refs/queue/main/", "refs/collisions/"] {
+        // Landings queue as commits in the root's queue; syncs are blobs.
+        for prefix in ["refs/heads/", &queue(TreeId::Root), "refs/collisions/"] {
             tips.extend(self.pointers.under(prefix).into_iter().map(|(_, oid)| oid));
         }
         self.owners = self.repo.direct_events(&tips)?.into_iter().collect();
@@ -1458,7 +1555,13 @@ impl Volume {
         Ok(result)
     }
 
-    fn build_landing(&self, tree: &str, reference: &str, incoming: Oid, seq: u64) -> Result<Draft> {
+    fn build_landing(
+        &self,
+        tree: TreeId,
+        reference: &str,
+        incoming: Oid,
+        seq: u64,
+    ) -> Result<Draft> {
         let current = self.head(tree)?;
         let t = self.tree(tree)?;
         let incoming_commit = self.repo.read_commit(incoming)?;
@@ -1530,7 +1633,7 @@ impl Volume {
         Ok(draft)
     }
 
-    fn take_landing(&mut self, tree: &str, reference: &str, incoming: Oid) -> Result<()> {
+    fn take_landing(&mut self, tree: TreeId, reference: &str, incoming: Oid) -> Result<()> {
         let started = Instant::now();
         self.pages_take(tree, |v, seq| {
             v.build_landing(tree, reference, incoming, seq)
@@ -1544,12 +1647,13 @@ impl Volume {
         Ok(())
     }
 
-    fn plan_sync(&self, tree: &str, open: &BTreeSet<queue::Key>) -> Result<SyncPlan> {
+    fn plan_sync(&self, tree: TreeId, open: &BTreeSet<queue::Key>) -> Result<SyncPlan> {
         let fork = self.tree(tree)?;
         let fork_head = self.head(tree)?;
         let fork_snapshot = Self::snapshot_of(fork);
         let mut todo = Vec::new();
-        let mut cursor = self.head("main")?;
+        let upstream = self.upstream_of(tree).ok_or(Error::Format)?;
+        let mut cursor = self.head(upstream)?;
         while !self.repo.is_ancestor(cursor, fork_head)? {
             todo.push(cursor);
             let commit = self.repo.read_commit(cursor)?;
@@ -1625,13 +1729,14 @@ impl Volume {
         Ok(lines)
     }
 
-    fn pending_from(&self, tree: &str) -> Result<bool> {
-        for (_, oid) in self.pointers.under("refs/queue/main/") {
+    /// Whether a landing of `tree` waits in its upstream's queue.
+    fn pending_from(&self, tree: TreeId) -> Result<bool> {
+        let Some(upstream) = self.upstream_of(tree) else {
+            return Ok(false);
+        };
+        for (_, oid) in self.pointers.under(&queue(upstream)) {
             let commit = self.repo.read_commit(oid)?;
-            if std::str::from_utf8(&commit.message).is_ok_and(|m| {
-                m.lines()
-                    .any(|line| line == format!("Agentfs-Tree: {tree}"))
-            }) {
+            if tree_trailer(&commit.message)? == Some(tree) {
                 return Ok(true);
             }
         }
@@ -1640,7 +1745,7 @@ impl Volume {
 
     fn build_sync(
         &self,
-        tree: &str,
+        tree: TreeId,
         reference: &str,
         value: Oid,
         plan: SyncPlan,
@@ -1694,7 +1799,13 @@ impl Volume {
         Ok(draft)
     }
 
-    fn take_sync(&mut self, tree: &str, reference: &str, value: Oid, plan: SyncPlan) -> Result<()> {
+    fn take_sync(
+        &mut self,
+        tree: TreeId,
+        reference: &str,
+        value: Oid,
+        plan: SyncPlan,
+    ) -> Result<()> {
         let started = Instant::now();
         self.pages_take(tree, |v, seq| {
             v.build_sync(tree, reference, value, plan, seq)
@@ -1725,10 +1836,9 @@ impl Volume {
     }
 
     fn progress_one(&mut self) -> Result<bool> {
-        let mut trees = self.tree_names();
-        trees.sort_by_key(|name| name != "main");
-        for tree in trees {
-            if self.take_next(&tree)? == Took::Taken {
+        // The root first, then the forks by number: `TreeId`'s order.
+        for tree in self.trees() {
+            if self.take_next(tree)? == Took::Taken {
                 return Ok(true);
             }
         }
@@ -1737,35 +1847,27 @@ impl Volume {
 
     /// One queue step in `tree`: its first entry P1 lets go is taken whole, in
     /// this one call. Failures are not swallowed, unlike [`Volume::progress`].
-    pub fn take_next(&mut self, tree: &str) -> Result<Took> {
+    pub fn take_next(&mut self, tree: TreeId) -> Result<Took> {
         if self.stopped {
             return Err(Error::Stopped);
         }
         self.tree(tree)?;
-        if self
-            .pointers
-            .under(&format!("refs/queue/{tree}/"))
-            .is_empty()
-        {
+        if self.pointers.under(&queue(tree)).is_empty() {
             return Ok(Took::Empty);
         }
         // A take is a step: pending closes save first, and its plan reads
         // the tree they leave.
         self.run_pending_closes(tree, None)?;
-        let entries = self.pointers.under(&format!("refs/queue/{tree}/"));
+        let entries = self.pointers.under(&queue(tree));
         let open = self.open_keys(tree);
         let mut plans = Vec::new();
         let mut actions = Vec::new();
         let planning = Timer::start(Which::QueuePlan);
         for (_, oid) in &entries {
-            if tree == "main" {
+            if tree.is_root() {
                 let commit = self.repo.read_commit(*oid)?;
                 let base = *commit.parents.first().ok_or(Error::Format)?;
-                let source = std::str::from_utf8(&commit.message)
-                    .ok()
-                    .and_then(|m| m.lines().find_map(|l| l.strip_prefix("Agentfs-Tree: ")))
-                    .ok_or(Error::Format)?
-                    .to_owned();
+                let source = tree_trailer(&commit.message)?.ok_or(Error::Format)?;
                 let keys = Self::changed_keys(&self.snapshot_at(base)?, &self.snapshot_at(*oid)?);
                 plans.push(queue::Plan {
                     source,
@@ -1775,7 +1877,7 @@ impl Volume {
             } else {
                 let sync = self.plan_sync(tree, &open)?;
                 plans.push(queue::Plan {
-                    source: "main".into(),
+                    source: self.upstream_of(tree).ok_or(Error::Format)?,
                     files: sync.keys.clone(),
                 });
                 actions.push(QueueAction::Sync(*oid, sync));
@@ -1827,7 +1929,7 @@ impl Volume {
     }
 
     /// Saves this tree's pending closes, then runs the step `build` makes.
-    fn step<F>(&mut self, tree: &str, build: F) -> Result<(u64, Saved)>
+    fn step<F>(&mut self, tree: TreeId, build: F) -> Result<(u64, Saved)>
     where
         F: FnOnce(&Self, u64) -> Result<Draft>,
     {
@@ -1836,7 +1938,7 @@ impl Volume {
     }
 
     /// Saves this tree's pending closes in arrival order, answering for `wanted`.
-    fn run_pending_closes(&mut self, tree: &str, wanted: Option<u64>) -> Result<Saved> {
+    fn run_pending_closes(&mut self, tree: TreeId, wanted: Option<u64>) -> Result<Saved> {
         let due: Vec<u64> = self
             .pending_closes
             .iter()
@@ -1884,7 +1986,7 @@ impl Volume {
         let saved = draft.saved;
         let is_fork = draft.fork.is_some();
         let changes = draft.changes.clone();
-        let tree = draft.tree.clone();
+        let tree = draft.tree;
         self.install(draft, seq);
         if let Saved::Commit(head) = saved {
             self.owners.insert(seq, head);
@@ -1895,7 +1997,7 @@ impl Volume {
             self.metrics.save_nanos = self.metrics.save_nanos.saturating_add(nanos);
             self.metrics.max_save_nanos = self.metrics.max_save_nanos.max(nanos);
         }
-        if let Err(e) = self.copy_out(&tree, is_fork, &changes) {
+        if let Err(e) = self.copy_out(tree, is_fork, &changes) {
             self.copies_stale = true;
             eprintln!("tree CopyStale: {e}");
         }
@@ -1931,14 +2033,14 @@ impl Volume {
             self.handles.insert(
                 open.handle,
                 Handle {
-                    tree: open.tree.clone(),
+                    tree: open.tree,
                     writer: open.writer,
                     object: open.object,
                     bytes,
                     calls: Vec::new(),
                 },
             );
-            self.pages_opened(&open.tree, open.object);
+            self.pages_opened(open.tree, open.object);
         }
         self.trees.insert(tree, built);
         self.pointers.apply(&changes);
@@ -1948,25 +2050,25 @@ impl Volume {
             .saturating_sub(taken)
             .saturating_add(enqueued);
         if let Some(closed) = closed {
-            self.pages_saved(&closed.tree, closed.object, seq);
+            self.pages_saved(closed.tree, closed.object, seq);
         }
     }
 
     /// Stage 7: Git's refs and the checkouts, both copies of what is on record.
-    fn copy_out(&mut self, tree: &str, is_fork: bool, changes: &[RefUpdate]) -> Result<()> {
+    fn copy_out(&mut self, tree: TreeId, is_fork: bool, changes: &[RefUpdate]) -> Result<()> {
         // Named first, so that a failure anywhere below redoes this checkout.
         if changes.iter().any(|change| change.refname == branch(tree)) {
-            self.stale_checkouts.insert(tree.to_owned());
+            self.stale_checkouts.insert(tree);
         }
         crate::failpoints::hit("tree.after_commit_point")?;
         {
             let _timer = Timer::start(Which::RefCopy);
             if self.copies_stale {
-                self.repo.write_config(&self.upstreams)?;
+                self.repo.write_config(&upstream_config(&self.upstreams))?;
                 self.repo.rebuild_refs(&self.pointers.creates())?;
             } else if !changes.is_empty() {
                 if is_fork {
-                    self.repo.write_config(&self.upstreams)?;
+                    self.repo.write_config(&upstream_config(&self.upstreams))?;
                 }
                 self.repo.ref_transaction(changes)?;
             }
@@ -1976,7 +2078,7 @@ impl Volume {
             crate::failpoints::hit("tree.before_checkout")?;
             for name in &self.stale_checkouts {
                 let _timer = Timer::start(Which::Checkout);
-                self.checkout(name)?;
+                self.checkout(*name)?;
             }
             self.stale_checkouts.clear();
             crate::failpoints::hit("tree.after_checkout")?;
@@ -1996,7 +2098,7 @@ impl Volume {
             .iter()
             .map(|(handle, h)| OpenRecord {
                 handle: *handle,
-                tree: h.tree.clone(),
+                tree: h.tree.to_string(),
                 writer: h.writer.clone(),
                 object: h.object,
                 anonymous: self
@@ -2011,7 +2113,7 @@ impl Volume {
             entry: Entry::Checkpoint {
                 next_seq: self.next,
                 pointers: self.pointers.to_hex(),
-                upstreams: self.upstreams.clone(),
+                upstreams: upstream_config(&self.upstreams),
                 opens,
                 page_saved: self.pages_saved_through(),
             },
@@ -2021,9 +2123,9 @@ impl Volume {
             .journal
             .retained(|record| match &record.entry {
                 Entry::Call { handle, .. } => handles.contains_key(handle),
-                Entry::PageWrite { tree, object, .. } => {
-                    pages::holds(pages, tree, *object, record.seq)
-                }
+                Entry::PageWrite { tree, object, .. } => tree
+                    .parse()
+                    .is_ok_and(|tree| pages::holds(pages, tree, *object, record.seq)),
                 _ => false,
             })
             .map_err(CompactError::Before)?;
@@ -2046,7 +2148,7 @@ impl Volume {
         }
     }
 
-    fn build_create(&self, tree: &str, path: &str, writer: &str, seq: u64) -> Result<Draft> {
+    fn build_create(&self, tree: TreeId, path: &str, writer: &str, seq: u64) -> Result<Draft> {
         let mut t = self.tree(tree)?.clone();
         t.names.insert(path.to_owned(), seq);
         t.bytes.insert(seq, Arc::default());
@@ -2058,9 +2160,9 @@ impl Volume {
         );
         t.fresh_names.insert(seq);
         let mut draft = self.build_save(tree, t, writer, "Create", seq, None)?;
-        draft.opened = Some(OpenRecord {
+        draft.opened = Some(LiveOpen {
             handle: seq,
-            tree: tree.to_owned(),
+            tree,
             writer: writer.to_owned(),
             object: seq,
             anonymous: false,
@@ -2071,12 +2173,12 @@ impl Volume {
     fn build_close(&self, handle: u64, seq: u64) -> Result<Draft> {
         let h = self.handles.get(&handle).ok_or(Error::NotFound)?;
         let calls = self.pages_calls_for_close(h);
-        let mut t = self.tree(&h.tree)?.clone();
+        let mut t = self.tree(h.tree)?.clone();
         let mut draft = if t.anonymous.remove(&h.object) {
             t.drop_object(h.object);
-            Draft::new(&h.writer, &h.tree, t)
+            Draft::new(&h.writer, h.tree, t)
         } else if !t.names.values().any(|o| *o == h.object) {
-            let mut draft = Draft::new(&h.writer, &h.tree, t);
+            let mut draft = Draft::new(&h.writer, h.tree, t);
             draft.saved = Saved::OrphanDropped;
             draft
         } else if let Some(bytes) = changed_bytes(&t.bytes[&h.object], &calls)? {
@@ -2101,9 +2203,9 @@ impl Volume {
             };
             t.lines.insert(h.object, Arc::new(lines));
             t.bytes.insert(h.object, Arc::new(bytes));
-            self.build_save(&h.tree, t, &h.writer, "Direct", seq, Some(handle))?
+            self.build_save(h.tree, t, &h.writer, "Direct", seq, Some(handle))?
         } else {
-            Draft::new(&h.writer, &h.tree, t)
+            Draft::new(&h.writer, h.tree, t)
         };
         draft.closes = Some(handle);
         Ok(draft)
@@ -2111,7 +2213,7 @@ impl Volume {
 
     fn build_rename(
         &self,
-        tree: &str,
+        tree: TreeId,
         from: &str,
         to: &str,
         writer: &str,
@@ -2159,7 +2261,7 @@ impl Volume {
     /// Writes `t`'s commit and the pointer changes that publish it.
     fn build_save(
         &self,
-        name: &str,
+        tree: TreeId,
         t: Tree,
         writer: &str,
         cause: &str,
@@ -2183,23 +2285,23 @@ impl Volume {
         }
         let blob = self.repo.write_blob(&serde_json::to_vec(&metadata)?)?;
         let namespace = self.repo.write_blob(&serde_json::to_vec(&t.namespace)?)?;
-        let tree = self.envelope(files, blob, namespace)?;
+        let content = self.envelope(files, blob, namespace)?;
         let mut message = format!(
-            "{cause} by {writer}\n\nAgentfs-Writer: {writer}\nAgentfs-Cause: Direct\nAgentfs-Tree: {name}\nAgentfs-Event: {seq}\nAgentfs-Format: envelope-1\n"
+            "{cause} by {writer}\n\nAgentfs-Writer: {writer}\nAgentfs-Cause: Direct\nAgentfs-Tree: {tree}\nAgentfs-Event: {seq}\nAgentfs-Format: envelope-1\n"
         );
         if let Some(open) = open {
             message.push_str(&format!("Agentfs-Open: {open}\n"));
         }
-        let current = self.head(name)?;
-        let head = self.repo.write_commit(tree, &[current], &message)?;
+        let current = self.head(tree)?;
+        let head = self.repo.write_commit(content, &[current], &message)?;
         let mut changes = vec![RefUpdate {
-            refname: branch(name),
+            refname: branch(tree),
             new: Some(head),
             expected_old: Some(current),
         }];
-        self.object_table_update(name, &Self::snapshot_of(&t), &mut changes)?;
-        let enqueued = self.enqueue_moves(name, head, seq, &mut changes)?;
-        let mut draft = Draft::new(writer, name, t);
+        self.object_table_update(tree, &Self::snapshot_of(&t), &mut changes)?;
+        let enqueued = self.enqueue_moves(tree, head, seq, &mut changes)?;
+        let mut draft = Draft::new(writer, tree, t);
         draft.changes = changes;
         draft.enqueued = enqueued;
         draft.saved = Saved::Commit(head);
@@ -2207,27 +2309,32 @@ impl Volume {
     }
 
     // One entry per destination, numbered by the step that causes it: order
-    // across restart, independent of commit dates.
+    // across restart, independent of commit dates. A tree's head moves to its
+    // upstream as a landing and to each tree it is the upstream of as a sync.
     fn enqueue_moves(
         &self,
-        tree: &str,
+        tree: TreeId,
         head: Oid,
         seq: u64,
         changes: &mut Vec<RefUpdate>,
     ) -> Result<u64> {
-        let destinations: Vec<(String, Oid)> = if tree == "main" {
+        let mut destinations: Vec<(TreeId, Oid)> = Vec::new();
+        if let Some(upstream) = self.upstream_of(tree) {
+            destinations.push((upstream, head));
+        }
+        let downstream: Vec<TreeId> = self
+            .upstreams
+            .iter()
+            .filter(|(_, upstream)| **upstream == tree)
+            .map(|(fork, _)| *fork)
+            .collect();
+        if !downstream.is_empty() {
             let sync = self.repo.write_blob(b"sync")?;
-            self.trees
-                .keys()
-                .filter(|name| name.as_str() != "main")
-                .map(|name| (name.clone(), sync))
-                .collect()
-        } else {
-            vec![("main".to_owned(), head)]
-        };
+            destinations.extend(downstream.into_iter().map(|fork| (fork, sync)));
+        }
         for (destination, oid) in &destinations {
             changes.push(RefUpdate {
-                refname: format!("refs/queue/{destination}/{seq:020}"),
+                refname: format!("{}{seq:020}", queue(*destination)),
                 new: Some(*oid),
                 expected_old: None,
             });
@@ -2235,15 +2342,15 @@ impl Volume {
         Ok(destinations.len() as u64)
     }
 
-    fn checkout(&self, name: &str) -> Result<()> {
-        let dir = self.root.join("trees").join(name);
+    fn checkout(&self, tree: TreeId) -> Result<()> {
+        let dir = self.root.join("trees").join(tree.to_string());
         fs::create_dir_all(&dir)?;
         // Rebuild from the branch, never from intermediate in-memory state.
-        let commit = self.repo.read_commit(self.head(name)?)?;
+        let commit = self.repo.read_commit(self.head(tree)?)?;
         // The trailer tells the Root commit even if a workload used our names.
         let has_envelope = std::str::from_utf8(&commit.message)
             .is_ok_and(|m| m.lines().any(|l| l == "Agentfs-Format: envelope-1"));
-        let tree = if has_envelope {
+        let files = if has_envelope {
             self.repo
                 .list_tree(commit.tree)?
                 .into_iter()
@@ -2253,7 +2360,7 @@ impl Volume {
         } else {
             commit.tree
         };
-        self.repo.checkout_tree(tree, &dir)?;
+        self.repo.checkout_tree(files, &dir)?;
         Ok(())
     }
 }
@@ -2315,6 +2422,8 @@ fn writer_label(writer: &str) -> Result<()> {
 mod tests {
     use super::*;
 
+    const ROOT: TreeId = TreeId::Root;
+
     fn frames_of(root: &Path) -> Vec<Frame> {
         Journal::open(&root.join(JOURNAL)).unwrap().1
     }
@@ -2326,21 +2435,21 @@ mod tests {
         // Both kinds of live open with calls and page writes, closed opens with
         // both, a fork and a queue entry.
         let fork = v.fork().unwrap();
-        let held = v.write_open("main", "held", "w", true).unwrap();
+        let held = v.write_open(ROOT, "held", "w", true).unwrap();
         v.write(held, 0, b"held-1", false).unwrap();
-        let shared = v.write_open("main", "shared", "w", true).unwrap();
+        let shared = v.write_open(ROOT, "shared", "w", true).unwrap();
         v.write(shared, 0, b"shared", false).unwrap();
         let object = v.open_object(shared).unwrap();
-        let other = v.write_open("main", "shared", "w", false).unwrap();
+        let other = v.write_open(ROOT, "shared", "w", false).unwrap();
         v.page_writeback(other, 1, b"WXYZ").unwrap();
         v.close(other).unwrap();
-        let anonymous = v.anonymous_open("main", "w").unwrap();
+        let anonymous = v.anonymous_open(ROOT, "w").unwrap();
         v.write(anonymous, 0, b"unnamed", false).unwrap();
-        let closed = v.write_open("main", "closed", "w", true).unwrap();
+        let closed = v.write_open(ROOT, "closed", "w", true).unwrap();
         v.write(closed, 0, b"closed", false).unwrap();
         let closed_object = v.open_object(closed).unwrap();
         v.record_page_write(
-            "main",
+            ROOT,
             closed_object,
             &[pages::Run {
                 offset: 0,
@@ -2349,28 +2458,17 @@ mod tests {
         )
         .unwrap();
         v.close(closed).unwrap();
-        v.write_open(&fork, "sandbox", "w", true).unwrap();
+        v.write_open(fork, "sandbox", "w", true).unwrap();
 
         let mut whole = frames_of(tmp.path());
         let folded = fold(&whole).unwrap();
         assert_eq!(folded.opens.len(), 4);
         assert_eq!(folded.opens[&held].calls.len(), 1);
         assert!(folded.opens[&anonymous].open.anonymous);
-        assert_eq!(folded.upstreams[&fork], "main");
-        assert_eq!(
-            folded.page_writes[&("main".to_owned(), object)][0].1.bytes,
-            b"WXYZ"
-        );
-        assert!(
-            folded
-                .saved_through
-                .contains_key(&("main".to_owned(), object))
-        );
-        assert!(
-            !folded
-                .page_writes
-                .contains_key(&("main".to_owned(), closed_object))
-        );
+        assert_eq!(folded.upstreams[&fork], ROOT);
+        assert_eq!(folded.page_writes[&(ROOT, object)][0].1.bytes, b"WXYZ");
+        assert!(folded.saved_through.contains_key(&(ROOT, object)));
+        assert!(!folded.page_writes.contains_key(&(ROOT, closed_object)));
         assert_eq!(folded.next_seq, v.next);
         assert_eq!(folded.pointers, v.pointers);
 
@@ -2382,9 +2480,9 @@ mod tests {
         // What follows lands on either start and adds up the same.
         v.write(held, 0, b"held-2", false).unwrap();
         v.write(shared, 0, b"!", true).unwrap();
-        let again = v.write_open("main", "again", "w", true).unwrap();
+        let again = v.write_open(ROOT, "again", "w", true).unwrap();
         v.close(shared).unwrap();
-        v.first_link("main", anonymous, "named", "w").unwrap();
+        v.first_link(ROOT, anonymous, "named", "w").unwrap();
         v.close(again).unwrap();
         while v.progress().unwrap() {}
         let now = frames_of(tmp.path());
@@ -2404,18 +2502,104 @@ mod tests {
     fn a_compaction_keeps_a_closed_opens_page_write_out_of_recovery() {
         let tmp = tempfile::tempdir().unwrap();
         let mut v = Volume::open(tmp.path()).unwrap();
-        let first = v.write_open("main", "f", "w", true).unwrap();
+        let first = v.write_open(ROOT, "f", "w", true).unwrap();
         v.page_writeback(first, 0, b"XXXX").unwrap();
         v.close(first).unwrap();
-        let second = v.write_open("main", "f", "w", false).unwrap();
+        let second = v.write_open(ROOT, "f", "w", false).unwrap();
         v.write(second, 0, b"YYYY", false).unwrap();
         v.close(second).unwrap();
         // Held open across the compaction, as a long-lived log is.
-        let _held = v.write_open("main", "f", "w", false).unwrap();
+        let _held = v.write_open(ROOT, "f", "w", false).unwrap();
         v.compact().unwrap();
         drop(v);
         let v = Volume::open(tmp.path()).unwrap();
-        assert_eq!(v.read("main", "f").unwrap(), b"YYYY");
+        assert_eq!(v.read(ROOT, "f").unwrap(), b"YYYY");
+    }
+
+    /// An edit of a checkpoint's pointers and upstreams.
+    type CheckpointEdit = fn(&mut BTreeMap<String, String>, &mut BTreeMap<String, String>);
+
+    /// A volume with fork 1 compacted to its checkpoint alone; reopened with
+    /// `edit` applied to that checkpoint's pointers and upstreams.
+    fn reopen_with(edit: CheckpointEdit) -> Result<Volume> {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut v = Volume::open(tmp.path()).unwrap();
+        v.fork().unwrap();
+        v.compact().unwrap();
+        drop(v);
+        let mut frames = frames_of(tmp.path());
+        assert_eq!(
+            frames.len(),
+            1,
+            "a compacted volume with no open is its checkpoint"
+        );
+        let (mut first, _) = frames.remove(0);
+        let Entry::Checkpoint {
+            pointers,
+            upstreams,
+            ..
+        } = &mut first.entry
+        else {
+            panic!("the first frame is a checkpoint");
+        };
+        edit(pointers, upstreams);
+        fs::remove_file(tmp.path().join(JOURNAL)).unwrap();
+        Journal::create(&tmp.path().join(JOURNAL), &first).unwrap();
+        Volume::open(tmp.path())
+    }
+
+    #[test]
+    fn recovery_refuses_a_journal_that_names_no_tree_as_one() {
+        reopen_with(|_, _| {}).unwrap();
+        let cases: [(&str, CheckpointEdit); 5] = [
+            ("a branch that is no tree", |pointers, _| {
+                let root = pointers["refs/heads/root"].clone();
+                pointers.insert("refs/heads/main".into(), root);
+            }),
+            ("no root", |pointers, _| {
+                pointers.remove("refs/heads/root");
+            }),
+            ("an upstream of the root", |_, upstreams| {
+                upstreams.insert("root".into(), "fork/1".into());
+            }),
+            ("a fork's upstream that is no tree", |_, upstreams| {
+                upstreams.insert("fork/1".into(), "fork/999".into());
+            }),
+            ("an upstream map naming no tree", |_, upstreams| {
+                upstreams.insert("main".into(), "root".into());
+            }),
+        ];
+        for (case, edit) in cases {
+            assert!(
+                matches!(reopen_with(edit), Err(Error::Format)),
+                "{case}: not refused as Format"
+            );
+        }
+    }
+
+    #[test]
+    fn a_format_2_state_area_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        drop(Volume::open(tmp.path()).unwrap());
+        fs::write(tmp.path().join("format"), "agentfs-trees-2\n").unwrap();
+        assert!(matches!(Volume::open(tmp.path()), Err(Error::Format)));
+    }
+
+    /// A fork's landing in the root's queue is what `pending_from` sees, until
+    /// the root takes it.
+    #[test]
+    fn pending_from_holds_while_a_forks_landing_is_queued() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut v = Volume::open(tmp.path()).unwrap();
+        let fork = v.fork().unwrap();
+        assert!(!v.pending_from(fork).unwrap());
+        assert!(!v.pending_from(ROOT).unwrap(), "the root lands nowhere");
+        let h = v.write_open(fork, "f", "w", true).unwrap();
+        v.write(h, 0, b"x\n", false).unwrap();
+        v.close(h).unwrap();
+        assert!(v.pending_from(fork).unwrap());
+        while v.take_next(ROOT).unwrap() == Took::Taken {}
+        assert!(!v.pending_from(fork).unwrap());
     }
 
     #[test]

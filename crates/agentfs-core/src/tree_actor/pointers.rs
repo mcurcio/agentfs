@@ -101,39 +101,39 @@ mod tests {
     #[test]
     fn a_change_applies_only_over_the_value_it_names() {
         let mut pointers = Pointers::default();
-        let create = [change("refs/heads/main", Some(oid(1)), None)];
+        let create = [change("refs/heads/root", Some(oid(1)), None)];
         pointers.check(&create).unwrap();
         pointers.apply(&create);
-        assert_eq!(pointers.get("refs/heads/main"), Some(oid(1)));
+        assert_eq!(pointers.get("refs/heads/root"), Some(oid(1)));
         assert!(matches!(
             pointers.check(&create),
-            Err(Error::PointerMoved { name }) if name == "refs/heads/main"
+            Err(Error::PointerMoved { name }) if name == "refs/heads/root"
         ));
-        let delete = [change("refs/heads/main", None, Some(oid(1)))];
+        let delete = [change("refs/heads/root", None, Some(oid(1)))];
         pointers.check(&delete).unwrap();
         pointers.apply(&delete);
-        assert_eq!(pointers.get("refs/heads/main"), None);
+        assert_eq!(pointers.get("refs/heads/root"), None);
     }
 
     #[test]
     fn under_stops_at_the_prefix_and_keeps_queue_order() {
         let mut pointers = Pointers::default();
         pointers.apply(&[
-            change("refs/queue/main/00000000000000000012", Some(oid(2)), None),
-            change("refs/queue/main/00000000000000000003", Some(oid(1)), None),
-            change("refs/queue/mainline/1", Some(oid(3)), None),
-            change("refs/heads/main", Some(oid(4)), None),
+            change("refs/queue/root/00000000000000000012", Some(oid(2)), None),
+            change("refs/queue/root/00000000000000000003", Some(oid(1)), None),
+            change("refs/queue/rootline/1", Some(oid(3)), None),
+            change("refs/heads/root", Some(oid(4)), None),
         ]);
         let names: Vec<_> = pointers
-            .under("refs/queue/main/")
+            .under("refs/queue/root/")
             .into_iter()
             .map(|(name, _)| name)
             .collect();
         assert_eq!(
             names,
             [
-                "refs/queue/main/00000000000000000003",
-                "refs/queue/main/00000000000000000012"
+                "refs/queue/root/00000000000000000003",
+                "refs/queue/root/00000000000000000012"
             ]
         );
         assert_eq!(pointers.creates().len(), 4);

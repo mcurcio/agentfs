@@ -36,13 +36,14 @@ missing from these tables or a row names a module that no longer exists;
 | `lib.rs` | Crate root: the module list and the engine's overview |
 | `volume.rs` | Opens a state area: crash recovery, then the [`Recorder`](#the-synchronous-step) used at every boundary and the `Committer` that turns records into commits |
 | `record.rs` | What the journal stores: one record per change boundary, absolute state, never deltas |
-| `tree_actor/mod.rs` | The tree actor: recorded byte calls, the ordered step, recovery from the journal, line-map storage, queue takes, main and one sandbox; separate from the production recorder |
+| `tree_actor/mod.rs` | The tree actor: recorded byte calls, the ordered step, recovery from the journal, line-map storage, queue takes, the root and one sandbox; separate from the production recorder |
 | `tree_actor/journal.rs` | The actor's journal: salted checksummed frames, the commit point for calls and pointer steps, torn-tail and corruption rules, compaction (target git-model §3) |
 | `tree_actor/pointers.rs` | Branches, queue entries, collision refs and object tables as the journal leaves them: pure, no I/O |
 | `tree_actor/pages.rs` | The kernel's one page cache per file: page fills, page writes and the size replies for shared mappings (rules ledger, R1.4) |
 | `tree_actor/queue.rs` | Eligibility and prefix selection for writer-locked queue entries |
 | `tree_actor/referee.rs` | Whole-save parent referee for line and namespace versions, with causal collision records |
 | `tree_actor/stages.rs` | Measurements only, never read by a decision: runs and time per actor stage, and the Git children the actor's path has started (counted at `git_cli::counted`, the one spawn site; target git-model §18) |
+| `tree_actor/tree_id.rs` | A tree's identity, `root` or `fork/<n>`: the text history, refs and checkouts name a tree by, parsed once where the journal is read |
 | `tree_actor/sync.rs` | Sync snapshots preserving undecided child versions without deciding collisions |
 | `tree_reconcile.rs` | Histogram save alignment, line identities, whole-change reconciliation and undecided sync |
 | `tree_git.rs` | Git executable backend for durable objects, the rebuildable copy of the refs in files format, `config` and `HEAD`, snapshots and private caches; Git children retain the actor lease |
@@ -189,8 +190,8 @@ missing from these tables or a row names a module that no longer exists;
 
 | Module | Role |
 |---|---|
-| `lib.rs` | Crate root, one call per kind of replay, each recording what the system did into a sink; the root's engine name (`ENGINE_ROOT`, read once); which traces fit a real mount |
-| `engine_names.rs` | `EngineNames`: the engine's name of each tree of a trace, the root by its given name, fork n by the n-th fork made |
+| `lib.rs` | Crate root, one call per kind of replay, each recording what the system did into a sink; which traces fit a real mount |
+| `engine_names.rs` | `EngineNames`: the engine's `TreeId` of each tree of a trace, the root as `root`, fork n as the n-th fork made |
 | `git_history.rs` | Its own parse of the engine's commits (`git cat-file`, `metadata.json`, `namespace.json`), and `EngineHistory`: the collisions and heads a replay compares, read from git |
 | `library.rs` | `Library`: the shared calls on `Volume`, seeded as the model's first commit |
 | `mounted.rs` | `Mounted`: the shared calls as real system calls on a mount of a failpoints build, each take through the take gate |

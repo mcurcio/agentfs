@@ -2,6 +2,8 @@
 
 use std::collections::BTreeSet;
 
+use super::TreeId;
+
 /// A file identity or a namespace slot involved in a change. Namespace slots
 /// are included because distinct files may compete for the same name.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -15,8 +17,9 @@ pub enum Key {
 /// Files and source of a queue entry, in arrival order.
 #[derive(Clone, Debug)]
 pub struct Plan {
-    /// The upstream tree or child that originated the entry.
-    pub source: String,
+    /// The tree whose head the entry moves here: the upstream for a sync, a
+    /// fork for a landing.
+    pub source: TreeId,
     /// Identities and namespace slots the entry can read or change.
     pub files: BTreeSet<Key>,
 }
@@ -34,7 +37,7 @@ pub fn eligible(plans: &[Plan], open: &BTreeSet<Key>) -> Option<usize> {
             return Some(index);
         }
         waiting_files.extend(plan.files.iter().cloned());
-        waiting_sources.insert(plan.source.clone());
+        waiting_sources.insert(plan.source);
     }
     None
 }
@@ -53,9 +56,9 @@ pub fn prefix(changes: &[BTreeSet<Key>], open: &BTreeSet<Key>) -> usize {
 mod tests {
     use super::*;
 
-    fn plan(source: &str, files: &[u64]) -> Plan {
+    fn plan(source: u64, files: &[u64]) -> Plan {
         Plan {
-            source: source.into(),
+            source: TreeId::Fork(source),
             files: files.iter().copied().map(Key::File).collect(),
         }
     }
@@ -63,10 +66,10 @@ mod tests {
     #[test]
     fn waiting_dependencies_are_transitive_but_unrelated_source_goes_ahead() {
         let plans = [
-            plan("a", &[1]),
-            plan("b", &[1, 2]),
-            plan("c", &[2]),
-            plan("d", &[3]),
+            plan(1, &[1]),
+            plan(2, &[1, 2]),
+            plan(3, &[2]),
+            plan(4, &[3]),
         ];
         let open = [Key::File(1)].into_iter().collect();
         assert_eq!(eligible(&plans, &open), Some(3));
@@ -75,7 +78,7 @@ mod tests {
 
     #[test]
     fn same_source_cannot_overtake_even_for_another_file() {
-        let plans = [plan("a", &[1]), plan("a", &[2]), plan("b", &[2])];
+        let plans = [plan(1, &[1]), plan(1, &[2]), plan(2, &[2])];
         let open = [Key::File(1)].into_iter().collect();
         assert_eq!(eligible(&plans, &open), None);
     }

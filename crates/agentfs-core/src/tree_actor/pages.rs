@@ -28,7 +28,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-use super::{Call, Draft, Error, Handle, Result, Saved, Volume};
+use super::{Call, Draft, Error, Handle, Result, Saved, TreeId, Volume};
 
 /// The bases' unit. Every kernel page size is a multiple of it, so a base map at
 /// this size is exact whatever the kernel's own page size is.
@@ -204,12 +204,12 @@ impl Volume {
     /// [`Error::NotFound`] when `tree` holds no such object.
     pub fn page_fill(
         &mut self,
-        tree: &str,
+        tree: TreeId,
         object: u64,
         offset: u64,
         size: u32,
     ) -> Result<Vec<u8>> {
-        let key = (tree.to_owned(), object);
+        let key = (tree, object);
         if !self.pages.contains_key(&key) {
             let saved = self.tree(tree)?.bytes.get(&object).ok_or(Error::NotFound)?;
             return Ok(slice_at(saved, offset, size).to_vec());
@@ -241,7 +241,7 @@ impl Volume {
     /// trusted. A failure changes nothing here.
     pub fn page_writeback(&mut self, handle: u64, offset: u64, bytes: &[u8]) -> Result<()> {
         let h = self.handles.get(&handle).ok_or(Error::NotFound)?;
-        let key = (h.tree.clone(), h.object);
+        let key = (h.tree, h.object);
         let end = offset
             .checked_add(bytes.len() as u64)
             .filter(|end| usize::try_from(*end).is_ok())
@@ -277,7 +277,7 @@ impl Volume {
         let seq = if runs.is_empty() {
             None
         } else {
-            Some(self.record_page_write(&key.0, key.1, &runs)?)
+            Some(self.record_page_write(key.0, key.1, &runs)?)
         };
         // On record, so memory follows. Nothing below can fail.
         for handle in self
@@ -308,51 +308,45 @@ impl Volume {
     /// per inode and drops cached pages past any smaller size it is told
     /// (`fuse_change_attributes`). `None` with no write-open; the view then
     /// answers as it does for any other file.
-    pub fn inode_size(&self, tree: &str, object: u64) -> Option<u64> {
-        self.pages
-            .get(&(tree.to_owned(), object))
-            .map(|state| state.len)
+    pub fn inode_size(&self, tree: TreeId, object: u64) -> Option<u64> {
+        self.pages.get(&(tree, object)).map(|state| state.len)
     }
 
     /// The objects queue takes changed since the last call. The view drops the
     /// kernel's pages of each with the actor unlocked, because invalidation can
     /// wait on a page fill. Takes wait only for write-opens, so a read-only
     /// mapping would otherwise keep old pages and refault new ones.
-    pub fn drain_changed(&mut self) -> Vec<(String, u64)> {
+    pub fn drain_changed(&mut self) -> Vec<(TreeId, u64)> {
         std::mem::take(&mut self.changed)
     }
 
     /// A queue take: [`Volume::step`] plus a note of the files it changed.
-    pub(super) fn pages_take<F>(&mut self, tree: &str, build: F) -> Result<(u64, Saved)>
+    pub(super) fn pages_take<F>(&mut self, tree: TreeId, build: F) -> Result<(u64, Saved)>
     where
         F: FnOnce(&Self, u64) -> Result<Draft>,
     {
         let before = self.tree(tree)?.bytes.clone();
         let result = self.step(tree, build)?;
-        if let Some(after) = self.trees.get(tree) {
+        if let Some(after) = self.trees.get(&tree) {
             let changed = after.bytes.iter().filter(|(object, bytes)| {
                 before
                     .get(object)
                     .is_some_and(|old| !Arc::ptr_eq(old, bytes) && old != *bytes)
             });
             self.changed
-                .extend(changed.map(|(object, _)| (tree.to_owned(), *object)));
+                .extend(changed.map(|(object, _)| (tree, *object)));
         }
         Ok(result)
     }
 
     /// Builds the image if it has none: saved bytes plus every live open's calls
     /// and the file's page writes, by the one close rule.
-    fn pages_build_image(&mut self, key: &(String, u64)) -> Result<()> {
+    fn pages_build_image(&mut self, key: &(TreeId, u64)) -> Result<()> {
         let state = self.pages.get(key).ok_or(Error::NotFound)?;
         if state.image.is_some() {
             return Ok(());
         }
-        let saved = self
-            .tree(&key.0)?
-            .bytes
-            .get(&key.1)
-            .ok_or(Error::NotFound)?;
+        let saved = self.tree(key.0)?.bytes.get(&key.1).ok_or(Error::NotFound)?;
         let mut own: Vec<(u64, Call)> = self
             .handles
             .values()
@@ -373,12 +367,12 @@ impl Volume {
     /// Hook: a write-open of `object` in `tree` is on record. Recovery calls it
     /// too. No I/O. A later open's view starts with the file's unsaved page
     /// writes (R1.3).
-    pub(super) fn pages_opened(&mut self, tree: &str, object: u64) {
-        let key = (tree.to_owned(), object);
+    pub(super) fn pages_opened(&mut self, tree: TreeId, object: u64) {
+        let key = (tree, object);
         let Some(state) = self.pages.get(&key) else {
             let len = self
                 .trees
-                .get(tree)
+                .get(&tree)
                 .and_then(|t| t.bytes.get(&object))
                 .map_or(0, |bytes| bytes.len() as u64);
             self.pages.insert(
@@ -407,8 +401,8 @@ impl Volume {
     }
 
     /// Hook: a descriptor call on `object` is in the journal. No I/O.
-    pub(super) fn pages_note_call(&mut self, tree: &str, object: u64, call: &Call) {
-        if let Some(state) = self.pages.get_mut(&(tree.to_owned(), object)) {
+    pub(super) fn pages_note_call(&mut self, tree: TreeId, object: u64, call: &Call) {
+        if let Some(state) = self.pages.get_mut(&(tree, object)) {
             state.len = len_after(state.len, call);
             if let Some(image) = &mut state.image
                 && call.apply(image).is_err()
@@ -427,7 +421,7 @@ impl Volume {
             .get(&closing.tree)
             .and_then(|t| t.bytes.get(&closing.object))
             .map_or(0, |bytes| bytes.len() as u64);
-        match self.pages.get(&(closing.tree.clone(), closing.object)) {
+        match self.pages.get(&(closing.tree, closing.object)) {
             Some(state) => calls_for_close(
                 saved_len,
                 &closing.calls,
@@ -442,8 +436,8 @@ impl Volume {
     /// past its commit point and installed. Drops the image, so the next fill
     /// rebuilds it over the saved bytes, or the whole state with the last
     /// write-open. No I/O.
-    pub(super) fn pages_saved(&mut self, tree: &str, object: u64, seq: u64) {
-        let key = (tree.to_owned(), object);
+    pub(super) fn pages_saved(&mut self, tree: TreeId, object: u64, seq: u64) {
+        let key = (tree, object);
         if self
             .handles
             .values()
@@ -464,7 +458,7 @@ impl Volume {
         self.pages
             .iter()
             .filter(|(_, state)| state.saved_through > 0)
-            .map(|((tree, object), state)| (tree.clone(), *object, state.saved_through))
+            .map(|((tree, object), state)| (tree.to_string(), *object, state.saved_through))
             .collect()
     }
 
@@ -472,12 +466,12 @@ impl Volume {
     /// file with a live write-open, before its closes run. No I/O.
     pub(super) fn pages_restore(
         &mut self,
-        tree: &str,
+        tree: TreeId,
         object: u64,
         writes: Vec<(u64, Run)>,
         saved_through: u64,
     ) {
-        let state = self.pages.entry((tree.to_owned(), object)).or_default();
+        let state = self.pages.entry((tree, object)).or_default();
         state.writes = writes;
         state.saved_through = saved_through;
     }
@@ -486,12 +480,12 @@ impl Volume {
 /// Whether memory holds the page write numbered `seq` of `object` in `tree`: what
 /// a compaction keeps. `writes` is in journal order.
 pub(super) fn holds(
-    pages: &BTreeMap<(String, u64), ObjectPages>,
-    tree: &str,
+    pages: &BTreeMap<(TreeId, u64), ObjectPages>,
+    tree: TreeId,
     object: u64,
     seq: u64,
 ) -> bool {
-    pages.get(&(tree.to_owned(), object)).is_some_and(|state| {
+    pages.get(&(tree, object)).is_some_and(|state| {
         state
             .writes
             .binary_search_by_key(&seq, |(number, _)| *number)

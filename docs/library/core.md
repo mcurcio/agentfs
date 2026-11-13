@@ -36,7 +36,7 @@ recorded; [guarantees](../guarantees.md) says what the engine promises.
 | Release decision for a worktree | `release` | `decide`, `Release` |
 | Several mounts, one writer | `history_service` | `HistoryServer`, `HistoryClient`, `FrontLease` |
 | Large files | `lfs` | `ObjectCache`, `Store`, `fetch`, `prune` |
-| Git-backed tree views | `tree_actor` | `Volume` |
+| Git-backed tree views | `tree_actor` | `Volume`, `TreeId` (a tree's identity, `root` or `fork/<n>`) |
 
 ## The state area
 

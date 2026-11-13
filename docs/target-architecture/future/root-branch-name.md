@@ -28,10 +28,9 @@ of `AGENTS.md`) without their roots meeting.
 
 ## What stands until then
 
-The tree engine names the root `main` (`refs/heads/main`, `Agentfs-Tree: main`) and publishes nothing.
-[Trees](../../trees.md) and [configuration](../../configuration.md) describe it as it is. Module cut step 5b replaces
-`main` with the identity `root` everywhere in the engine, and deletes conformance's `ENGINE_ROOT`, the engine's root
-name it passes today; until M4 there is no published name, because nothing publishes.
+The tree engine names the root by its identity, `root` (`refs/heads/root`, `Agentfs-Tree: root`), and publishes
+nothing. [Trees](../../trees.md) and [configuration](../../configuration.md) describe it as it is. Until M4 there is no
+published name, because nothing publishes.
 
 ## Proposal (design choices, for M4's architect)
 

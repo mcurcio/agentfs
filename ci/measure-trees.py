@@ -376,7 +376,7 @@ def line_map_storage(root, state, count, metrics, timeout, report, name, sample_
     with open(root / 'line-map-measure', 'wb'):
         pass
     baseline = await_save_count(metrics, initial['saves'] + 1, timeout)
-    before_head = git(repo, 'rev-parse', 'refs/heads/main').strip()
+    before_head = git(repo, 'rev-parse', 'refs/heads/root').strip()
     before = disk_usage(repo)
     # Git's files format: the refs are a copy under refs/ (git-model §3).
     before_refs = disk_usage(repo / 'refs')
@@ -410,7 +410,7 @@ def line_map_storage(root, state, count, metrics, timeout, report, name, sample_
     # the last save's copy has landed.
     deadline = time.monotonic() + timeout
     while True:
-        after_head = git(repo, 'rev-parse', 'refs/heads/main').strip()
+        after_head = git(repo, 'rev-parse', 'refs/heads/root').strip()
         commits = git(repo, 'rev-list', after_head, '^' + before_head).splitlines()
         if len(commits) >= count or time.monotonic() > deadline:
             break

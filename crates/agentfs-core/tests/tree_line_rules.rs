@@ -1,12 +1,14 @@
 //! Line rules R10.8, R10.6 and R10.9 through the real `Volume`: its saves, its
 //! queue and its Git history. Target git-model §7.
-use agentfs_core::tree_actor::Volume;
+use agentfs_core::tree_actor::{TreeId, Volume};
+
+const ROOT: TreeId = TreeId::Root;
 use agentfs_core::tree_git::TreeGit;
 
 const BASE: &[u8] = b"-\n-\n-\n-\n-\n-\n";
 const PARENT: &[u8] = b"-\nm1.1\n-\n-\n-\n-\n";
 
-fn put(v: &mut Volume, tree: &str, path: &str, bytes: &[u8]) {
+fn put(v: &mut Volume, tree: TreeId, path: &str, bytes: &[u8]) {
     let h = v.write_open(tree, path, "test-writer", true).unwrap();
     v.truncate(h, 0).unwrap();
     v.write(h, 0, bytes, false).unwrap();
@@ -38,42 +40,42 @@ fn live_lines(repo: &TreeGit, head: git2::Oid, path: &str) -> Vec<Vec<u8>> {
 }
 
 fn lost(repo: &TreeGit, save: git2::Oid) -> bool {
-    repo.list_refs("refs/collisions/main/")
+    repo.list_refs("refs/collisions/root/")
         .unwrap()
         .iter()
         .any(|(_, oid)| *oid == save)
 }
 
-/// Finding 32's exact calls (R10.8): the first save loses to main's edit of a
-/// line it deleted, the second to the line main keeps after it. Nothing of
-/// either reaches main, both stay in history, and no line joins another.
+/// Finding 32's exact calls (R10.8): the first save loses to the root's edit of a
+/// line it deleted, the second to the line the root keeps after it. Nothing of
+/// either reaches the root, both stay in history, and no line joins another.
 #[test]
 fn a_save_with_an_unfinished_line_before_a_kept_line_loses_whole() {
     let tmp = tempfile::tempdir().unwrap();
     let mut v = Volume::open(tmp.path()).unwrap();
-    put(&mut v, "main", "c", BASE);
+    put(&mut v, ROOT, "c", BASE);
     drain(&mut v);
     let fork = v.fork().unwrap();
-    put(&mut v, &fork, "c", b"y");
-    let first = v.head(&fork).unwrap();
-    let edit = v.write_open(&fork, "c", "editor", false).unwrap();
-    put(&mut v, "main", "c", PARENT);
+    put(&mut v, fork, "c", b"y");
+    let first = v.head(fork).unwrap();
+    let edit = v.write_open(fork, "c", "editor", false).unwrap();
+    put(&mut v, ROOT, "c", PARENT);
     v.write(edit, 0, b"n6", false).unwrap();
     v.close(edit).unwrap();
-    let second = v.head(&fork).unwrap();
+    let second = v.head(fork).unwrap();
     assert_ne!(first, second);
-    assert_eq!(v.read(&fork, "c").unwrap(), b"n6");
+    assert_eq!(v.read(fork, "c").unwrap(), b"n6");
     drain(&mut v);
 
-    assert_eq!(v.read("main", "c").unwrap(), PARENT);
-    assert_eq!(v.read(&fork, "c").unwrap(), PARENT);
+    assert_eq!(v.read(ROOT, "c").unwrap(), PARENT);
+    assert_eq!(v.read(fork, "c").unwrap(), PARENT);
     let repo = TreeGit::open(tmp.path().join("history.git")).unwrap();
     assert!(lost(&repo, first), "the first save keeps its collision ref");
     assert!(
         lost(&repo, second),
         "the second save keeps its collision ref"
     );
-    let head = v.head("main").unwrap();
+    let head = v.head(ROOT).unwrap();
     assert!(repo.is_ancestor(first, head).unwrap());
     assert!(repo.is_ancestor(second, head).unwrap());
     let live = live_lines(&repo, head, "c");
@@ -87,60 +89,60 @@ fn a_save_with_an_unfinished_line_before_a_kept_line_loses_whole() {
 fn an_unfinished_save_past_the_parents_lines_lands() {
     let tmp = tempfile::tempdir().unwrap();
     let mut v = Volume::open(tmp.path()).unwrap();
-    put(&mut v, "main", "a", b"base\n");
+    put(&mut v, ROOT, "a", b"base\n");
     drain(&mut v);
     let fork = v.fork().unwrap();
-    put(&mut v, &fork, "a", b"base\nchild");
-    put(&mut v, "main", "a", b"base\nparent\n");
+    put(&mut v, fork, "a", b"base\nchild");
+    put(&mut v, ROOT, "a", b"base\nparent\n");
     drain(&mut v);
-    assert_eq!(v.read("main", "a").unwrap(), b"base\nparent\nchild");
-    assert_eq!(v.read(&fork, "a").unwrap(), b"base\nparent\nchild");
+    assert_eq!(v.read(ROOT, "a").unwrap(), b"base\nparent\nchild");
+    assert_eq!(v.read(fork, "a").unwrap(), b"base\nparent\nchild");
     let repo = TreeGit::open(tmp.path().join("history.git")).unwrap();
-    assert!(repo.list_refs("refs/collisions/main/").unwrap().is_empty());
+    assert!(repo.list_refs("refs/collisions/root/").unwrap().is_empty());
 }
 
-/// R10.6: while main's queue holds the sandbox's line back, the sandbox shows
-/// that line alone, not main's unfinished line in front of it; then main's.
+/// R10.6: while the root's queue holds the sandbox's line back, the sandbox shows
+/// that line alone, not the root's unfinished line in front of it; then the root's.
 #[test]
 fn a_sync_hides_the_parents_unfinished_line_until_decided() {
     let tmp = tempfile::tempdir().unwrap();
     let mut v = Volume::open(tmp.path()).unwrap();
-    put(&mut v, "main", "a", b"base\n");
+    put(&mut v, ROOT, "a", b"base\n");
     drain(&mut v);
     let fork = v.fork().unwrap();
-    let held = v.write_open("main", "a", "holder", false).unwrap();
-    put(&mut v, &fork, "a", b"base\nchild\n");
-    put(&mut v, "main", "a", b"base\n}");
+    let held = v.write_open(ROOT, "a", "holder", false).unwrap();
+    put(&mut v, fork, "a", b"base\nchild\n");
+    put(&mut v, ROOT, "a", b"base\n}");
     drain(&mut v);
-    assert_eq!(v.read(&fork, "a").unwrap(), b"base\nchild\n");
+    assert_eq!(v.read(fork, "a").unwrap(), b"base\nchild\n");
     v.close(held).unwrap();
     drain(&mut v);
-    assert_eq!(v.read("main", "a").unwrap(), b"base\n}");
-    assert_eq!(v.read(&fork, "a").unwrap(), b"base\n}");
+    assert_eq!(v.read(ROOT, "a").unwrap(), b"base\n}");
+    assert_eq!(v.read(fork, "a").unwrap(), b"base\n}");
 }
 
-/// R10.9 (finding 33): while main's queue holds back the sandbox's unfinished
-/// line, the sandbox shows it and hides main's later line, so `y` then `m7\n`
+/// R10.9 (finding 33): while the root's queue holds back the sandbox's unfinished
+/// line, the sandbox shows it and hides the root's later line, so `y` then `m7\n`
 /// never reads `ym7\n`. Nothing is lost: the save stays in history, the sandbox
-/// then shows main's version.
+/// then shows the root's version.
 #[test]
 fn a_sync_hides_the_parents_later_lines_behind_an_undecided_unfinished_line() {
     let tmp = tempfile::tempdir().unwrap();
     let mut v = Volume::open(tmp.path()).unwrap();
-    put(&mut v, "main", "a", b"a\nb\n");
+    put(&mut v, ROOT, "a", b"a\nb\n");
     drain(&mut v);
     let fork = v.fork().unwrap();
-    let held = v.write_open("main", "a", "holder", false).unwrap();
-    put(&mut v, &fork, "a", b"y");
-    let save = v.head(&fork).unwrap();
-    put(&mut v, "main", "a", b"a\nb\nm7\n");
+    let held = v.write_open(ROOT, "a", "holder", false).unwrap();
+    put(&mut v, fork, "a", b"y");
+    let save = v.head(fork).unwrap();
+    put(&mut v, ROOT, "a", b"a\nb\nm7\n");
     drain(&mut v);
-    assert_eq!(v.read(&fork, "a").unwrap(), b"y");
+    assert_eq!(v.read(fork, "a").unwrap(), b"y");
     v.close(held).unwrap();
     drain(&mut v);
-    assert_eq!(v.read("main", "a").unwrap(), b"a\nb\nm7\n");
-    assert_eq!(v.read(&fork, "a").unwrap(), b"a\nb\nm7\n");
+    assert_eq!(v.read(ROOT, "a").unwrap(), b"a\nb\nm7\n");
+    assert_eq!(v.read(fork, "a").unwrap(), b"a\nb\nm7\n");
     let repo = TreeGit::open(tmp.path().join("history.git")).unwrap();
     assert!(lost(&repo, save));
-    assert!(repo.is_ancestor(save, v.head("main").unwrap()).unwrap());
+    assert!(repo.is_ancestor(save, v.head(ROOT).unwrap()).unwrap());
 }

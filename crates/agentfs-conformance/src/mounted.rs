@@ -9,7 +9,7 @@
 
 use crate::engine_names::EngineNames;
 use crate::library::{fail, seed};
-use agentfs_core::tree_actor::Volume;
+use agentfs_core::tree_actor::{TreeId as EngineTree, Volume};
 use agentfs_model::calls::{CallError, Caller, Took, TreeCalls, TreeId};
 use std::collections::{BTreeMap, VecDeque};
 use std::ffi::CString;
@@ -153,7 +153,7 @@ impl Mounted {
             command
                 .arg("--sandbox")
                 .arg(&self.sandbox)
-                .args(["--fork", fork]);
+                .args(["--fork", &fork.to_string()]);
         }
         self.child = Some(command.spawn().map_err(|e| io_fail("spawn", &e))?);
         let started = Instant::now();
@@ -184,7 +184,7 @@ impl Mounted {
     }
 
     /// The sandbox's fork, the one `mountable` allows, if `new` made it.
-    fn sandbox_fork(&self) -> Option<&str> {
+    fn sandbox_fork(&self) -> Option<EngineTree> {
         self.names.name(TreeId::new(1)).ok()
     }
 
@@ -375,7 +375,7 @@ impl TreeCalls for Mounted {
     }
 
     fn take_next(&mut self, t: TreeId) -> Result<Took, CallError> {
-        let tree = self.names.name(t)?.to_owned();
+        let tree = self.names.name(t)?;
         writeln!(self.go, "{tree}").map_err(|e| io_fail("ask the gate", &e))?;
         let mut answer = String::new();
         self.took

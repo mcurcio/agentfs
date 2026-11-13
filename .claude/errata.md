@@ -689,3 +689,21 @@ Not blocking; the suite is built and green. Findings about the brief and the doc
 4. **"Recorded as one commit" vs. T plus a landing merge**: when the fork moved since begin, the fork gains T and the
    merge `[fork, T]`. R5.5 and git-model's Questions for the owner now say so, as the model's choice for the owner to
    confirm.
+
+## 2026-11-13, step 5b S1 (engine names every tree by its identity)
+
+1. **The design says 5b "does not touch root-branch-name.md"**, but that page's "What stands until then" said the
+   engine names the root `main` and that 5b would replace it: false once S1 lands. S1 rewrites that one paragraph in
+   the present tense (`root`, `refs/heads/root`, `Agentfs-Tree: root`); the page's proposal and M4's ownership are
+   unchanged.
+2. **The design says S1 "changes no step of the save path"**: not quite. `enqueue_moves`, now written from the
+   upstream map, writes a sync's marker blob only when the tree has forks; the old root branch wrote it on every
+   root save, read by nothing when no fork existed. A root save with no fork runs 15 git children, not 16
+   (`tree_stages.rs` `CHILDREN_PER_SAVE`). Recording is unchanged: the same commit, refs and journal record.
+3. **The design's grep gate covers only the engine files.** `world.rs:399` (the model, S2's file) still names
+   `agentfs_conformance::ENGINE_ROOT`, which S1 deletes; S2 rewrites that comment with `TreeNames`.
+4. **The finding-51 regression patch said "agentfs-core unchanged since 7474470"**, false after S1. Its hunk now
+   applies at line 1761 (`git apply --check` clean); the recorded trace was not re-recorded (it holds model calls,
+   not engine names).
+5. **The design's §8 table has `rebuild_owners` read "TreeId::Root's queue"**; kept as written (landings queue only in
+   the root's queue while forks fork only the root). A fork of a fork would need every upstream's queue there.

@@ -85,16 +85,16 @@ PY
   fusermount3 -uz "$work/main"; fusermount3 -uz "$work/sandbox"
   "$bin" --state "$work/state" trees init
   gitdir=$work/state/history.git
-  [ "$(tree_git_file "$gitdir" main baseline)" = baseline ]
+  [ "$(tree_git_file "$gitdir" root baseline)" = baseline ]
   if grep -q "^write " "$work/receipt"; then
     count=$(awk '/^write / {print $2}' "$work/receipt")
-    [ "$(tree_git_file "$gitdir" main candidate)" = "$(printf candidate | head -c "$count")" ]
+    [ "$(tree_git_file "$gitdir" root candidate)" = "$(printf candidate | head -c "$count")" ]
   fi
   git --git-dir="$gitdir" fsck --full --strict --no-progress
   tree_git_no_duplicate_opens "$gitdir"
-  head=$(git --git-dir="$gitdir" rev-parse main)
+  head=$(git --git-dir="$gitdir" rev-parse root)
   "$bin" --state "$work/state" trees init
-  [ "$(git --git-dir="$gitdir" rev-parse main)" = "$head" ]
+  [ "$(git --git-dir="$gitdir" rev-parse root)" = "$head" ]
   printf 'PASS\t%s\t%s\n' "$point" "$(tail -n 1 "$work/receipt")" | tee -a "$work/results.tsv"
 done
 # The failpoints a mounted process cannot reach: each opening of the state area
@@ -114,7 +114,7 @@ for point in tree.after_ref_rebuild tree.compact_before_rename tree.compact_afte
   grep -F "agentfs failpoint $point triggered (kill)" "$work/open.log" >/dev/null
   "$bin" --state "$work/state" trees init
   gitdir=$work/state/history.git
-  [ "$(tree_git_file "$gitdir" main kept)" = saved ]
+  [ "$(tree_git_file "$gitdir" root kept)" = saved ]
   git --git-dir="$gitdir" fsck --full --strict --no-progress
   tree_git_no_duplicate_opens "$gitdir"
   printf 'PASS\t%s\t-\n' "$point" | tee -a "$work/results.tsv"
@@ -159,7 +159,7 @@ kill "$client"; wait "$client" 2>/dev/null || true
 fusermount3 -uz "$work/main"; fusermount3 -uz "$work/sandbox"
 "$bin" --state "$work/state" trees init
 gitdir=$work/state/history.git
-[ "$(tree_git_file "$gitdir" main old)" = replacement ]
+[ "$(tree_git_file "$gitdir" root old)" = replacement ]
 git --git-dir="$gitdir" rev-list --all > "$work/orphan-commits"
 while read -r commit; do
   prefix=
@@ -172,8 +172,8 @@ while read -r commit; do
   fi
 done < "$work/orphan-commits"
 tree_git_no_duplicate_opens "$gitdir"
-head=$(git --git-dir="$gitdir" rev-parse main)
+head=$(git --git-dir="$gitdir" rev-parse root)
 "$bin" --state "$work/state" trees init
-[ "$(git --git-dir="$gitdir" rev-parse main)" = "$head" ]
+[ "$(git --git-dir="$gitdir" rev-parse root)" = "$head" ]
 git --git-dir="$gitdir" fsck --full --strict --no-progress
 printf 'PASS\treplaced-open-object\twrite fsync\n' | tee -a "$work/results.tsv"

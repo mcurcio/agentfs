@@ -36,13 +36,13 @@ if ! "$AGENTFS_BIN" --state "$m/state" trees init >"$m/recovery.log" 2>&1; then
 fi
 gitdir=$m/state/history.git
 git --git-dir="$gitdir" fsck --full --strict --no-progress > /dev/null 2>&1 || fail 'git fsck'
-# A returned write's bytes: f<n> on main, s<n> on the fork's branch. The sandbox
+# A returned write's bytes: f<n> on the root, s<n> on the fork's branch. The sandbox
 # files ride through the fork's own pointers, in the same journal.
 check_write() {
   local kind=$1 n=$2 want got
   if [ "$kind" = W ]; then
     want=$(printf 'acknowledged-%s\n' "$n" | sha256sum | cut -d' ' -f1)
-    got=$(tree_git_file "$gitdir" main "f$n" | sha256sum | cut -d' ' -f1) || fail "missing acknowledged write $n"
+    got=$(tree_git_file "$gitdir" root "f$n" | sha256sum | cut -d' ' -f1) || fail "missing acknowledged write $n"
   else
     want=$(printf 'sandbox-%s\n' "$n" | sha256sum | cut -d' ' -f1)
     got=$(tree_git_file "$gitdir" "refs/heads/$FORK" "s$n" | sha256sum | cut -d' ' -f1) || fail "missing sandbox write $n"
@@ -53,16 +53,16 @@ check_write() {
 check_unsynced() {
   local n=$1 want got
   want=$(printf 'unsynced-%s\n' "$n" | sha256sum | cut -d' ' -f1)
-  got=$(tree_git_file "$gitdir" main "x$n" | sha256sum | cut -d' ' -f1) || fail "missing unsynced write $n"
+  got=$(tree_git_file "$gitdir" root "x$n" | sha256sum | cut -d' ' -f1) || fail "missing unsynced write $n"
   [ "$got" = "$want" ] || fail "wrong bytes for unsynced write $n"
 }
 # A rename marked as soon as it returned: the new name, with the old one gone.
 check_rename() {
   local want got
   want=$(printf 'renamed\n' | sha256sum | cut -d' ' -f1)
-  got=$(tree_git_file "$gitdir" main r | sha256sum | cut -d' ' -f1) || fail "missing renamed file"
+  got=$(tree_git_file "$gitdir" root r | sha256sum | cut -d' ' -f1) || fail "missing renamed file"
   [ "$got" = "$want" ] || fail "wrong bytes for renamed file"
-  ! tree_git_file "$gitdir" main y >/dev/null 2>&1 || fail "old name of the rename still present"
+  ! tree_git_file "$gitdir" root y >/dev/null 2>&1 || fail "old name of the rename still present"
 }
 while read -r kind n; do
   case "$kind" in

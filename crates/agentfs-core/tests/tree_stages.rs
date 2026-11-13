@@ -4,14 +4,16 @@
 use std::path::Path;
 use std::sync::Mutex;
 
-use agentfs_core::tree_actor::Volume;
 use agentfs_core::tree_actor::stages::Stages;
+use agentfs_core::tree_actor::{TreeId, Volume};
 
 /// The counters are process-wide: one test reads them at a time.
 static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
 
 fn put(v: &mut Volume, path: &str, bytes: &[u8]) {
-    let h = v.write_open("main", path, "test-writer", true).unwrap();
+    let h = v
+        .write_open(TreeId::Root, path, "test-writer", true)
+        .unwrap();
     v.truncate(h, 0).unwrap();
     v.write(h, 0, bytes, false).unwrap();
     v.close(h).unwrap();
@@ -48,14 +50,14 @@ fn count(stages: &Stages, before: &Stages) -> Vec<(&'static str, u64)> {
     ]
 }
 
-/// One save of one file on main, step by step. Each save runs the Git programs
+/// One save of one file on the root, step by step. Each save runs the Git programs
 /// below, in this many children: hash-object for the file, its tree, the line
-/// map, the name history, the envelope tree, the commit, the object table and
-/// the queue's marker blob (8); `git diff` aligning the lines (1);
-/// `check-ref-format` for the branch and the object table, then `update-ref`
-/// (3); `cat-file` of the commit, `ls-tree` of its envelope, `ls-tree` of the
-/// files and `cat-file` of the one file (4).
-const CHILDREN_PER_SAVE: u64 = 16;
+/// map, the name history, the envelope tree, the commit and the object table
+/// (7; a sync's marker blob only when the tree has forks, and here it has none);
+/// `git diff` aligning the lines (1); `check-ref-format` for the branch and the
+/// object table, then `update-ref` (3); `cat-file` of the commit, `ls-tree` of
+/// its envelope, `ls-tree` of the files and `cat-file` of the one file (4).
+const CHILDREN_PER_SAVE: u64 = 15;
 
 #[test]
 fn stages_add_up() {
@@ -95,7 +97,7 @@ fn stages_add_up() {
     assert!(after.stages.objects.max_nanos > 0);
 }
 
-/// A save on main and the sync that carries it to a sandbox must cost the same
+/// A save on the root and the sync that carries it to a sandbox must cost the same
 /// Git children whether the history holds ten saves or ninety (the pilot found
 /// each sync walking the whole history, one child per commit).
 #[test]

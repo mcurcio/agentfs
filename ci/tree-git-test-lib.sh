@@ -11,6 +11,6 @@ tree_git_file() {
 
 tree_git_no_duplicate_opens() {
   local duplicates
-  duplicates=$(git --git-dir="$1" log main --format='%(trailers:key=Agentfs-Open,valueonly)' | sed '/^$/d' | sort | uniq -d) || return 1
+  duplicates=$(git --git-dir="$1" log root --format='%(trailers:key=Agentfs-Open,valueonly)' | sed '/^$/d' | sort | uniq -d) || return 1
   [ -z "$duplicates" ] || { echo "duplicate Agentfs-Open: $duplicates" >&2; return 1; }
 }

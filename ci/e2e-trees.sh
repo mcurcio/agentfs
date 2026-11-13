@@ -159,10 +159,10 @@ client=
 fusermount3 -uz "$work/main"
 fusermount3 -uz "$work/sandbox"
 "$bin" --state "$work/state" trees init
-head=$(git --git-dir="$work/state/history.git" rev-parse main)
-test "$(tree_git_file "$work/state/history.git" main crash)" = acknowledged-before-kill
+head=$(git --git-dir="$work/state/history.git" rev-parse root)
+test "$(tree_git_file "$work/state/history.git" root crash)" = acknowledged-before-kill
 "$bin" --state "$work/state" trees init
-test "$(git --git-dir="$work/state/history.git" rev-parse main)" = "$head"
+test "$(git --git-dir="$work/state/history.git" rev-parse root)" = "$head"
 start
 test "$(cat "$work/main/crash")" = acknowledged-before-kill
 test "$(cat "$work/main/isolation")" = sandbox

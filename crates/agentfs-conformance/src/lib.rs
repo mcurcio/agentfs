@@ -32,18 +32,6 @@ use agentfs_model::world::{MODEL_ROOT, ModelHistory, Policies, TreeNames, World}
 use invariants::Invariants;
 use std::path::{Path, PathBuf};
 
-/// The root tree's name in agentfs-core, which takes no other today. The
-/// engine step that makes it configured
-/// (docs/target-architecture/future/root-branch-name.md) removes this:
-/// conformance then configures the engine with a name of its own, not `main`,
-/// and passes it. Read only by `engine_names`.
-pub const ENGINE_ROOT: &str = "main";
-
-/// How the engine names a trace's trees: the one place [`ENGINE_ROOT`] is read.
-pub(crate) fn engine_names() -> EngineNames {
-    EngineNames::new(ENGINE_ROOT)
-}
-
 /// The trace against `t`, recorded into `sink`, with its history and the real
 /// system's invariants read from `repo`.
 fn against_real<T: TreeCalls>(
@@ -52,8 +40,8 @@ fn against_real<T: TreeCalls>(
     repo: &Path,
     sink: &mut dyn Sink,
 ) -> Result<(), String> {
-    let mut history = EngineHistory::new(repo, engine_names())?;
-    let mut invariants = Invariants::new(repo, engine_names())?;
+    let mut history = EngineHistory::new(repo, EngineNames::new())?;
+    let mut invariants = Invariants::new(repo, EngineNames::new())?;
     replay(trace, t, &mut history, sink, &mut |t, r| {
         invariants.after(t, r)
     })
@@ -65,7 +53,7 @@ pub fn against_library(trace: &[Recorded], sink: &mut dyn Sink) -> Result<(), St
     // A mismatch to read: `PHASE1_REPLAY_KEEP=DIR` leaves the state there.
     let state = std::env::var_os("PHASE1_REPLAY_KEEP")
         .map_or_else(|| dir.path().join("state"), PathBuf::from);
-    let mut library = Library::new(&state, engine_names()).map_err(|e| e.to_string())?;
+    let mut library = Library::new(&state, EngineNames::new()).map_err(|e| e.to_string())?;
     let repo = library.repo();
     against_real(trace, &mut library, &repo, sink)
 }
@@ -80,7 +68,7 @@ pub fn against_mount(trace: &[Recorded], bin: &Path, sink: &mut dyn Sink) -> Res
     let mut mounted = Mounted::new(
         bin,
         dir.path(),
-        engine_names(),
+        EngineNames::new(),
         with_sandbox,
         opens_that_append(trace),
     )

@@ -660,21 +660,21 @@ fn print(files: &BTreeMap<String, Vec<u8>>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine_names;
+    use crate::EngineNames;
     use crate::git_history::tests::Repo;
     use agentfs_model::calls::CallError;
 
     /// The root's engine name.
     fn root() -> String {
-        engine_names().name(TreeId::ROOT).unwrap().to_owned()
+        EngineNames::new().name(TreeId::ROOT).unwrap().to_string()
     }
 
     /// [`Invariants`] over `repo` with a root commit on the root's branch.
     fn invariants(repo: &Repo) -> Invariants {
         let root = repo.commit(&[], "Root", Some(&[]));
-        let branch = engine_names().branch(TreeId::ROOT).unwrap();
+        let branch = EngineNames::new().branch(TreeId::ROOT).unwrap();
         repo.git(&["update-ref", &branch, &root], b"");
-        Invariants::new(repo.path(), engine_names()).unwrap()
+        Invariants::new(repo.path(), EngineNames::new()).unwrap()
     }
     /// The real `one_writer` on `merge`.
     fn check(inv: &mut Invariants, merge: &str) -> Result<(), String> {

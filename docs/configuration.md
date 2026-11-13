@@ -911,8 +911,8 @@ templates' variables, the commit trailers and the telemetry resource:
 | Flag | Environment | Default | Commands |
 |---|---|---|---|
 | `--sandbox DIR` | | no sandbox mount | `trees mount`: also mount an isolated sandbox |
-| `--fork fork/N` | | create a new fork | `trees mount`: reuse this existing sandbox; requires `--sandbox` |
-| `--writer LABEL` | | `main-client` | `trees mount`: trusted main writer label |
+| `--fork fork/N` | | create a new fork | `trees mount`: reuse this existing sandbox (not `root`); requires `--sandbox` |
+| `--writer LABEL` | | `root-client` | `trees mount`: trusted root writer label |
 | `--sandbox-writer LABEL` | | `sandbox-client` | `trees mount`: trusted sandbox writer label |
 | `--metrics-output FILE` | | no metrics file | `trees mount`: replace a JSON snapshot of process-local save, take and wait counters, the journal's length, and runs, time and Git children by actor stage (`stages`, process-wide: see `tree_actor/stages.rs`) every 100 ms and at unmount; the existing parent directory must be outside state and views; collection errors are reported after unmount |
 

@@ -173,7 +173,7 @@ fn write_config_replaces_a_damaged_config_and_head_before_any_git_command() {
     std::fs::write(path.join("config"), b"").unwrap();
     std::fs::write(path.join("HEAD"), b"").unwrap();
     let repo = TreeGit::open(&path).unwrap();
-    let upstreams = [("fork/7".to_owned(), "main".to_owned())]
+    let upstreams = [("fork/7".to_owned(), "root".to_owned())]
         .into_iter()
         .collect();
     repo.write_config(&upstreams).unwrap();
@@ -186,15 +186,15 @@ fn write_config_replaces_a_damaged_config_and_head_before_any_git_command() {
     assert_eq!(get("core.fsyncMethod"), "fsync\n");
     assert_eq!(get("core.bare"), "true\n");
     assert_eq!(get("branch.fork/7.remote"), ".\n");
-    assert_eq!(get("branch.fork/7.merge"), "refs/heads/main\n");
+    assert_eq!(get("branch.fork/7.merge"), "refs/heads/root\n");
     assert_eq!(
         std::fs::read(path.join("HEAD")).unwrap(),
-        b"ref: refs/heads/main\n"
+        b"ref: refs/heads/root\n"
     );
     assert!(git(&path, &["rev-parse", "--git-dir"]).status.success());
     // Files format, so libgit2 can open what the actor's copy leaves.
     let tip = commit(&repo);
-    repo.rebuild_refs(&[update("refs/heads/main", Some(tip), None)])
+    repo.rebuild_refs(&[update("refs/heads/root", Some(tip), None)])
         .unwrap();
     assert_eq!(
         git2::Repository::open_bare(&path)
@@ -215,24 +215,24 @@ fn rebuild_refs_replaces_everything_with_what_it_is_given() {
     let tip = commit(&repo);
     let blob = repo.write_blob(b"table").unwrap();
     repo.ref_transaction(&[
-        update("refs/heads/main", Some(tip), None),
+        update("refs/heads/root", Some(tip), None),
         update("refs/heads/gone", Some(tip), None),
-        update("refs/queue/main/1", Some(tip), None),
+        update("refs/queue/root/1", Some(tip), None),
     ])
     .unwrap();
     assert!(git(&path, &["pack-refs", "--all"]).status.success());
     std::fs::write(path.join("refs/heads/garbage"), b"not a ref\n").unwrap();
-    std::fs::write(path.join("refs/heads/main.lock"), b"stale").unwrap();
+    std::fs::write(path.join("refs/heads/root.lock"), b"stale").unwrap();
     repo.rebuild_refs(&[
-        update("refs/heads/main", Some(tip), None),
-        update("refs/agentfs/objects/main", Some(blob), None),
+        update("refs/heads/root", Some(tip), None),
+        update("refs/agentfs/objects/root", Some(blob), None),
     ])
     .unwrap();
     assert_eq!(
         repo.list_refs("refs/").unwrap(),
         vec![
-            ("refs/agentfs/objects/main".to_owned(), blob),
-            ("refs/heads/main".to_owned(), tip),
+            ("refs/agentfs/objects/root".to_owned(), blob),
+            ("refs/heads/root".to_owned(), tip),
         ]
     );
     assert!(!path.join("packed-refs").exists());

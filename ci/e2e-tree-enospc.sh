@@ -90,12 +90,12 @@ if [ "$status" != 0 ]; then echo "mount exited $status after a full state area" 
 grep -Fq 'tree SaveFailed' "$work/mount.log" || { cat "$work/mount.log" >&2; exit 1; }
 "$bin" --state "$work/volume/state" trees init
 gitdir=$work/volume/state/history.git
-[ "$(tree_git_file "$gitdir" main file)" = acknowledged ]
+[ "$(tree_git_file "$gitdir" root file)" = acknowledged ]
 git --git-dir="$gitdir" fsck --full --strict --no-progress
 tree_git_no_duplicate_opens "$gitdir"
-head=$(git --git-dir="$gitdir" rev-parse main)
+head=$(git --git-dir="$gitdir" rev-parse root)
 "$bin" --state "$work/volume/state" trees init
-[ "$(git --git-dir="$gitdir" rev-parse main)" = "$head" ]
+[ "$(git --git-dir="$gitdir" rev-parse root)" = "$head" ]
 printf 'PASS\tenospc\twrite fsync\n' | tee "$work/results.tsv"
 # Run a rename held at `point` while the real filesystem fills, then release it.
 # Filling must finish before the stalled rename is released. Main only: with no
@@ -152,12 +152,12 @@ PY
   wait "$pid"; pid=
   "$bin" --state "$work/volume/state" trees init
   gitdir=$work/volume/state/history.git
-  [ "$(tree_git_file "$gitdir" main "$3")" = git-acknowledged ]
+  [ "$(tree_git_file "$gitdir" root "$3")" = git-acknowledged ]
   git --git-dir="$gitdir" fsck --full --strict --no-progress
   tree_git_no_duplicate_opens "$gitdir"
-  head=$(git --git-dir="$gitdir" rev-parse main)
+  head=$(git --git-dir="$gitdir" rev-parse root)
   "$bin" --state "$work/volume/state" trees init
-  [ "$(git --git-dir="$gitdir" rev-parse main)" = "$head" ]
+  [ "$(git --git-dir="$gitdir" rev-parse root)" = "$head" ]
 }
 # Objects cannot be written: nothing is recorded, ENOSPC, the name stays.
 rename_while_full tree.before_objects ENOSPC source

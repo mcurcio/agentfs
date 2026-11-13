@@ -646,11 +646,12 @@ replacement for `mount`.
 
 ```sh
 agentfs --state STATE trees init
-agentfs --state STATE trees mount MAIN --sandbox SANDBOX
+agentfs --state STATE trees mount ROOT --sandbox SANDBOX
 ```
 
-`trees mount` recovers and mounts the main view, and with `--sandbox` also a
-sandbox branch (`fork/N`) of it. `--fork fork/N` reuses a sandbox, and `trees
+`trees mount` recovers and mounts the root's view, and with `--sandbox` also a
+sandbox fork (`fork/N`) of it. Each `Binding` names its tree by
+`agentfs_core::tree_actor::TreeId`. `--fork fork/N` reuses a sandbox, and `trees
 fork` makes one and prints its name. `--writer` and `--sandbox-writer` set
 each view's trusted writer label, and `--metrics-output FILE` writes counters
 every 100 ms and at unmount. Mount points must be empty, separate and outside
