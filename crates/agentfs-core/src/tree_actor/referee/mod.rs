@@ -182,7 +182,7 @@ pub(super) fn touches(before: &Snapshot, after: &Snapshot) -> BTreeSet<queue::Ke
         {
             continue;
         }
-        keys.insert(queue::Key::File(id.0));
+        keys.insert(queue::Key::File(id));
         for history in [old, new].into_iter().flatten() {
             // A history with no head version names no path.
             if let Ok(Some(path)) = history.path() {

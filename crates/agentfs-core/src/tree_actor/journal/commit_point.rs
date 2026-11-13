@@ -4,7 +4,7 @@
 use super::{CompactError, Entry, OpenRecord, Record};
 use crate::tree_actor::recording::pages;
 use crate::tree_actor::stages::{Timer, Which};
-use crate::tree_actor::{Error, Result, Volume, now_ns, upstream_config};
+use crate::tree_actor::{Error, Result, Volume, now_ns};
 
 /// When a journal this long after its last compaction compacts again.
 /// Constants, not a setting: restart memory is at most this plus live calls.
@@ -63,7 +63,7 @@ impl Volume {
             entry: Entry::Checkpoint {
                 next_seq: self.next,
                 pointers: self.pointers.to_hex(),
-                upstreams: upstream_config(&self.upstreams),
+                upstreams: self.upstreams.to_text(),
                 opens,
                 page_saved: self.pages_saved_through(),
             },

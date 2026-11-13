@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use git2::Oid;
 
 use super::{Entry, Frame, OpenRecord, PointerChange, Record, RunHead};
+use crate::tree_actor::history::upstreams::Upstreams;
 use crate::tree_actor::pointers::Pointers;
 use crate::tree_actor::recording::{Call, pages};
 use crate::tree_actor::{Error, Result, TreeId};
@@ -61,7 +62,7 @@ pub(in crate::tree_actor) struct FoldedOpen {
 pub(in crate::tree_actor) struct Folded {
     pub(in crate::tree_actor) pointers: Pointers,
     /// Each fork's upstream. The root has none.
-    pub(in crate::tree_actor) upstreams: BTreeMap<TreeId, TreeId>,
+    pub(in crate::tree_actor) upstreams: Upstreams,
     pub(in crate::tree_actor) next_seq: u64,
     pub(in crate::tree_actor) opens: BTreeMap<u64, FoldedOpen>,
     /// A file's page writes while a write-open of it lives.
@@ -72,11 +73,10 @@ pub(in crate::tree_actor) struct Folded {
 
 impl Folded {
     pub(in crate::tree_actor) fn add_upstream(&mut self, fork: &str, upstream: &str) -> Result<()> {
-        let fork = parse_tree(fork)?;
-        if fork.is_root() {
+        let TreeId::Fork(fork) = parse_tree(fork)? else {
             return Err(Error::Format);
-        }
-        self.upstreams.insert(fork, parse_tree(upstream)?);
+        };
+        self.upstreams.add(fork, parse_tree(upstream)?);
         Ok(())
     }
 
@@ -157,7 +157,7 @@ pub(in crate::tree_actor) fn fold(frames: &[Frame]) -> Result<Folded> {
                 .map(|(name, hex)| Ok((name.clone(), parse_oid(hex)?)))
                 .collect::<Result<_>>()?,
         ),
-        upstreams: BTreeMap::new(),
+        upstreams: Upstreams::default(),
         next_seq: *next_seq,
         opens: BTreeMap::new(),
         page_writes: BTreeMap::new(),

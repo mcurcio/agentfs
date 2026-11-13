@@ -10,7 +10,7 @@
 mod history;
 mod journal;
 mod pointers;
-pub mod queue;
+mod queue;
 mod recording;
 mod referee;
 pub mod stages;
@@ -31,9 +31,8 @@ use serde::Serialize;
 use crate::file_lock::{FileLock, Mode};
 use crate::tree_git::{RefUpdate, TreeGit};
 use history::message::{self, Message};
-use history::{
-    SyncPlan, check_objects, refs, remove_stale_locks, upstream_config, upstream_merges,
-};
+use history::upstreams::Upstreams;
+use history::{SyncStep, check_objects, refs, remove_stale_locks};
 use journal::{
     CompactError, Entry, FoldedOpen, Journal, LiveOpen, PointerChange, Record, compact_at, fold,
 };
@@ -119,7 +118,7 @@ fn now_ns() -> u64 {
 
 enum QueueAction {
     Landing(Oid),
-    Sync(Oid, SyncPlan),
+    Sync(Oid, queue::Cut<SyncStep>),
 }
 
 /// What [`Volume::take_next`] did: took one entry, found every entry waiting, or
@@ -174,8 +173,8 @@ struct Draft {
     closes: Option<u64>,
     opened: Option<LiveOpen>,
     linked: Option<u64>,
-    /// A fork this step makes, and its upstream.
-    fork: Option<(TreeId, TreeId)>,
+    /// A fork this step makes, by number, and its upstream.
+    fork: Option<(u64, TreeId)>,
     saved: Saved,
     enqueued: u64,
     taken: u64,
@@ -207,7 +206,7 @@ impl Draft {
             linked: self.linked,
             fork: self
                 .fork
-                .map(|(fork, upstream)| (fork.to_string(), upstream.to_string())),
+                .map(|(fork, upstream)| (TreeId::Fork(fork).to_string(), upstream.to_string())),
             pointers: self
                 .changes
                 .iter()
@@ -230,7 +229,7 @@ pub struct Volume {
     /// Runtime pointer reads come from here, never from Git's copy.
     pointers: Pointers,
     /// Each fork's upstream. The root has none.
-    upstreams: BTreeMap<TreeId, TreeId>,
+    upstreams: Upstreams,
     trees: BTreeMap<TreeId, Tree>,
     handles: BTreeMap<u64, Handle>,
     /// Closes that could not save, in arrival order. Their handles count as
@@ -348,7 +347,7 @@ impl Volume {
         let repo = TreeGit::open_with_lease(&history, Arc::clone(&lock))?;
         // Before any git command: an empty config silently loses core.fsync,
         // and an empty HEAD is "not a git repository".
-        repo.write_config(&refs::head(), &upstream_merges(&folded.upstreams))?;
+        repo.write_config(&refs::head(), &folded.upstreams.merges())?;
         check_objects(&repo, &folded.pointers)?;
         repo.rebuild_refs(&folded.pointers.creates())?;
         crate::failpoints::hit("tree.after_ref_rebuild")?;
@@ -431,15 +430,11 @@ impl Volume {
             tree.install(snapshot)?;
             self.trees.insert(id, tree);
         }
-        if self.trees.contains_key(&TreeId::Root)
-            && self.upstreams.iter().all(|(fork, upstream)| {
-                !fork.is_root() && upstream.is_root() && self.trees.contains_key(fork)
-            })
-        {
-            Ok(())
-        } else {
-            Err(Error::Format)
+        if !self.trees.contains_key(&TreeId::Root) {
+            return Err(Error::Format);
         }
+        self.upstreams
+            .check_recovered(|fork| self.trees.contains_key(&fork))
     }
 
     /// Every tree: the root first, then the forks by number.
@@ -448,7 +443,7 @@ impl Volume {
     }
 
     fn upstream_of(&self, tree: TreeId) -> Option<TreeId> {
-        self.upstreams.get(&tree).copied()
+        self.upstreams.upstream_of(tree)
     }
 
     /// Snapshot measurements without exposing them through a workload view.
@@ -493,7 +488,7 @@ impl Volume {
                 new: Some(at),
                 expected_old: None,
             });
-            draft.fork = Some((fork, upstream));
+            draft.fork = Some((event.get(), upstream));
             Ok(draft)
         })?;
         Ok(TreeId::Fork(event.get()))
@@ -525,11 +520,11 @@ impl Volume {
         tree: TreeId,
         reference: &str,
         value: Oid,
-        plan: SyncPlan,
+        cut: queue::Cut<SyncStep>,
     ) -> Result<()> {
         let started = Instant::now();
         self.pages_take(tree, |v, event| {
-            v.build_sync(tree, reference, value, plan, event)
+            v.build_sync(tree, reference, value, cut, event)
         })?;
         let nanos = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
         self.metrics.takes = self.metrics.takes.saturating_add(1);
@@ -580,7 +575,16 @@ impl Volume {
         // the tree they leave.
         self.run_pending_closes(tree, None)?;
         let entries = self.pointers.under(&refs::queue(tree));
-        let open = self.open_keys(tree);
+        let open = match self.trees.get(&tree) {
+            Some(t) => queue::held(
+                t,
+                self.handles
+                    .values()
+                    .filter(|h| h.tree == tree)
+                    .map(|h| h.object),
+            ),
+            None => BTreeSet::new(),
+        };
         let mut plans = Vec::new();
         let mut actions = Vec::new();
         let planning = Timer::start(Which::QueuePlan);
@@ -599,7 +603,7 @@ impl Volume {
                 let sync = self.plan_sync(tree, &open)?;
                 plans.push(queue::Plan {
                     source: self.upstream_of(tree).ok_or(Error::Format)?,
-                    files: sync.keys.clone(),
+                    files: sync.keys().clone(),
                 });
                 actions.push(QueueAction::Sync(*oid, sync));
             }
@@ -622,7 +626,7 @@ impl Volume {
             }
             match actions.swap_remove(index) {
                 QueueAction::Landing(oid) => self.take_landing(tree, reference, oid)?,
-                QueueAction::Sync(oid, plan) => self.take_sync(tree, reference, oid, plan)?,
+                QueueAction::Sync(oid, cut) => self.take_sync(tree, reference, oid, cut)?,
             }
             return Ok(Took::Taken);
         }
@@ -701,8 +705,8 @@ impl Volume {
             taken,
             ..
         } = draft;
-        if let Some((name, parent)) = fork {
-            self.upstreams.insert(name, parent);
+        if let Some((fork, upstream)) = fork {
+            self.upstreams.add(fork, upstream);
         }
         let closed = closes.and_then(|handle| {
             self.pending_closes.retain(|pending| *pending != handle);
@@ -751,12 +755,12 @@ impl Volume {
             let _timer = Timer::start(Which::RefCopy);
             if self.copies_stale {
                 self.repo
-                    .write_config(&refs::head(), &upstream_merges(&self.upstreams))?;
+                    .write_config(&refs::head(), &self.upstreams.merges())?;
                 self.repo.rebuild_refs(&self.pointers.creates())?;
             } else if !changes.is_empty() {
                 if is_fork {
                     self.repo
-                        .write_config(&refs::head(), &upstream_merges(&self.upstreams))?;
+                        .write_config(&refs::head(), &self.upstreams.merges())?;
                 }
                 self.repo.ref_transaction(changes)?;
             }
@@ -824,7 +828,7 @@ mod tests {
         assert_eq!(folded.opens.len(), 4);
         assert_eq!(folded.opens[&held].calls.len(), 1);
         assert!(folded.opens[&anonymous].open.anonymous);
-        assert_eq!(folded.upstreams[&fork], ROOT);
+        assert_eq!(folded.upstreams.upstream_of(fork), Some(ROOT));
         assert_eq!(folded.page_writes[&(ROOT, object)][0].1.bytes, b"WXYZ");
         assert!(folded.saved_through.contains_key(&(ROOT, object)));
         assert!(!folded.page_writes.contains_key(&(ROOT, closed_object)));

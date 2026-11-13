@@ -4,6 +4,7 @@
 pub(super) mod message;
 pub(super) mod refs;
 mod take;
+pub(super) mod upstreams;
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -19,27 +20,7 @@ use super::tree::{EventNumber, Lines, MergeFileIdentity, Tree};
 use super::{Draft, Error, Result, Saved, TreeId, Volume, referee};
 use crate::tree_git::{RefUpdate, TreeEntry, TreeGit};
 use message::{Action, Message};
-pub(super) use take::SyncPlan;
-
-/// The upstream map as Git's config writes it: each fork's text and its upstream's.
-pub(in crate::tree_actor) fn upstream_config(
-    upstreams: &BTreeMap<TreeId, TreeId>,
-) -> BTreeMap<String, String> {
-    upstreams
-        .iter()
-        .map(|(fork, upstream)| (fork.to_string(), upstream.to_string()))
-        .collect()
-}
-
-/// The upstream map as Git's config merges it: each fork's text and its upstream's branch.
-pub(in crate::tree_actor) fn upstream_merges(
-    upstreams: &BTreeMap<TreeId, TreeId>,
-) -> BTreeMap<String, String> {
-    upstreams
-        .iter()
-        .map(|(fork, upstream)| (fork.to_string(), refs::branch(*upstream)))
-        .collect()
-}
+pub(super) use take::SyncStep;
 
 #[derive(Serialize, Deserialize)]
 pub(in crate::tree_actor) struct ObjectTable {
@@ -291,12 +272,7 @@ impl Volume {
         if let Some(upstream) = self.upstream_of(tree) {
             destinations.push((upstream, head));
         }
-        let downstream: Vec<TreeId> = self
-            .upstreams
-            .iter()
-            .filter(|(_, upstream)| **upstream == tree)
-            .map(|(fork, _)| *fork)
-            .collect();
+        let downstream: Vec<TreeId> = self.upstreams.forks_of(tree).collect();
         if !downstream.is_empty() {
             let sync = self.repo.write_blob(b"sync")?;
             destinations.extend(downstream.into_iter().map(|fork| (fork, sync)));

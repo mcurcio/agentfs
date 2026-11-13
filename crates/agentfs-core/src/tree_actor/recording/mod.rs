@@ -3,14 +3,13 @@
 
 pub(super) mod pages;
 
-use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use super::history::message::Action;
 use super::journal::{CallHead, Entry, LiveOpen, RunHead};
 use super::stages::{Timer, Which};
 use super::tree::{EventNumber, MergeFileIdentity, NameHistory, Versions};
-use super::{Draft, Error, Result, Saved, TreeId, Volume, queue};
+use super::{Draft, Error, Result, Saved, TreeId, Volume};
 use crate::paths::RepoPath;
 
 /// Calls name byte positions, never lines. Append finds EOF at save time.
@@ -370,26 +369,6 @@ impl Volume {
             v.build_save(tree, t, writer, Action::Unlink, event, None)
         })?;
         Ok(())
-    }
-
-    pub(in crate::tree_actor) fn open_keys(&self, tree: TreeId) -> BTreeSet<queue::Key> {
-        let mut keys = BTreeSet::new();
-        if let Some(t) = self.trees.get(&tree) {
-            for handle in self.handles.values().filter(|h| h.tree == tree) {
-                if !t.names.values().any(|object| *object == handle.object) {
-                    continue;
-                }
-                if let Some(id) = t.identities.get(&handle.object) {
-                    keys.insert(queue::Key::File(id.0));
-                }
-                for (path, object) in &t.names {
-                    if *object == handle.object {
-                        keys.insert(queue::Key::Name(path.clone()));
-                    }
-                }
-            }
-        }
-        keys
     }
 
     /// Saves this tree's pending closes in arrival order, answering for `wanted`.

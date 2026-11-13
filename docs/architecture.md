@@ -41,13 +41,14 @@ missing from these tables or a row names a module that no longer exists;
 | `tree_actor/history/message.rs` | Every message a tree-view commit carries, its one home: each message's bytes (Root, direct saves, landings, syncs) and the readers of its trailers (target git-model §5) |
 | `tree_actor/history/refs.rs` | The ref layout of a tree volume's history, its one home: branches, queues and their entries, collision refs, object tables, and the tips that reach every save (target git-model §4) |
 | `tree_actor/history/take.rs` | Queue takes as history: a landing judged by the referee into its upstream, and a fork's prefix sync planned and built from its upstream's commits |
+| `tree_actor/history/upstreams.rs` | Each fork's upstream, the shape of a volume's trees: added when a fork is made, checked at recovery, and written as the journal's checkpoint and Git's config |
 | `tree_actor/journal/mod.rs` | The actor's journal: salted checksummed frames, the commit point for calls and pointer steps, torn-tail and corruption rules, compaction (target git-model §3) |
 | `tree_actor/journal/commit_point.rs` | The actor's appends to the journal and when it compacts, with the checkpoint a compaction writes |
 | `tree_actor/journal/fold.rs` | What a journal's frames add up to, pure: pointers, upstreams, live opens with their calls, and page writes (target git-model §12) |
 | `tree_actor/pointers.rs` | Branches, queue entries, collision refs and object tables as the journal leaves them: pure, no I/O |
 | `tree_actor/recording/mod.rs` | Recording: a tree's file calls (open, read, write, truncate), each journalled before it returns, and the steps that save them: create, close, rename, unlink |
 | `tree_actor/recording/pages.rs` | The kernel's one page cache per file: page fills, page writes and the size replies for shared mappings (rules ledger, R1.4) |
-| `tree_actor/queue.rs` | Eligibility and prefix selection for writer-locked queue entries |
+| `tree_actor/queue.rs` | Queue and locks: P1 eligibility, held keys and the `Cut` of a prefix sync |
 | `tree_actor/referee/mod.rs` | The referee: every line and name rule of a fork and its upstream, pure. `land` composes verdicts, names, placing and whole into a decision; `sync` keeps a fork's undecided versions; `touches` gives a step's lock keys |
 | `tree_actor/referee/ancestry.rs` | The one ancestry walk (`descends`) over names and lines alike, and the one union of line ancestries |
 | `tree_actor/referee/names.rs` | Names: a landing's name onto a path a live upstream file holds (R11.2), and a sync's names with the fork's undecided ones kept |

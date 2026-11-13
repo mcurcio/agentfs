@@ -34,11 +34,10 @@ impl referee::Landed for LandedInto<'_> {
     }
 }
 
-pub(in crate::tree_actor) struct SyncPlan {
-    pub(in crate::tree_actor) target: Option<Oid>,
+/// One upstream commit a sync can take, and the fork's snapshot after it.
+pub(in crate::tree_actor) struct SyncStep {
+    pub(in crate::tree_actor) commit: Oid,
     pub(in crate::tree_actor) snapshot: referee::Snapshot,
-    pub(in crate::tree_actor) remaining: bool,
-    pub(in crate::tree_actor) keys: BTreeSet<queue::Key>,
 }
 
 impl Volume {
@@ -157,11 +156,13 @@ impl Volume {
         Ok(draft)
     }
 
+    /// [`queue::cut`] over the upstream commits the fork lacks, oldest first: each is synced
+    /// and diffed against the last taken (or the fork's own snapshot) with `referee::touches`.
     pub(in crate::tree_actor) fn plan_sync(
         &self,
         tree: TreeId,
         open: &BTreeSet<queue::Key>,
-    ) -> Result<SyncPlan> {
+    ) -> Result<queue::Cut<SyncStep>> {
         let fork = self.tree(tree)?;
         let fork_head = self.head(tree)?;
         let fork_snapshot = Self::snapshot_of(fork);
@@ -177,11 +178,7 @@ impl Volume {
             cursor = *parent;
         }
         todo.reverse();
-        let mut current = fork_snapshot.clone();
-        let mut target = None;
-        let mut keys = BTreeSet::new();
-        let mut remaining = false;
-        for oid in todo {
+        queue::cut(todo, open, |last: Option<&SyncStep>, oid| {
             let parent = self.snapshot_at(oid)?;
             let undecided = referee::undecided(
                 &fork_snapshot,
@@ -197,23 +194,15 @@ impl Volume {
                 let _timer = Timer::start(Which::SyncMerge);
                 referee::sync(&parent, &fork_snapshot, &undecided, &last_lines)?
             };
-            let changes = referee::touches(&current, &next);
-            if !changes.is_disjoint(open) {
-                remaining = true;
-                if target.is_none() {
-                    keys = changes;
-                }
-                break;
-            }
-            keys.extend(changes);
-            current = next;
-            target = Some(oid);
-        }
-        Ok(SyncPlan {
-            target,
-            snapshot: current,
-            remaining,
-            keys,
+            let current = last.map_or(&fork_snapshot, |step| &step.snapshot);
+            let keys = referee::touches(current, &next);
+            Ok((
+                SyncStep {
+                    commit: oid,
+                    snapshot: next,
+                },
+                keys,
+            ))
         })
     }
 
@@ -265,15 +254,19 @@ impl Volume {
         tree: TreeId,
         reference: &str,
         value: Oid,
-        plan: SyncPlan,
+        cut: queue::Cut<SyncStep>,
         event: EventNumber,
     ) -> Result<Draft> {
         let current = self.head(tree)?;
         let mut built = self.tree(tree)?.clone();
         let mut changes = Vec::new();
-        if let Some(target) = plan.target {
+        let taken = !cut.remaining();
+        if let Some(SyncStep {
+            commit: target,
+            mut snapshot,
+        }) = cut.into_taken()
+        {
             let parent = self.snapshot_at(target)?;
-            let mut snapshot = plan.snapshot;
             // R6.1: a sync that can fast-forward does. It can when nothing of the fork waits
             // for the upstream and the sync shows what the upstream's commit shows (the
             // model's `World::sync`). The fork then takes that commit's line maps and names,
@@ -300,7 +293,6 @@ impl Volume {
             self.object_table_update(tree, &snapshot, &mut changes)?;
             built.install(snapshot)?;
         }
-        let taken = !plan.remaining;
         if taken {
             changes.push(RefUpdate {
                 refname: reference.into(),
