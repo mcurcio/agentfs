@@ -15,8 +15,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 
 use super::queue;
-use super::tree::{EventNumber, LineVersion, Lines};
-use super::{Error, MergeFileIdentity, NameHistory, Result};
+use super::tree::{EventNumber, LineVersion, Lines, MergeFileIdentity, NameHistory};
+use super::{Error, Result};
 pub(super) use ancestry::Broken;
 pub(super) use undecided::{Landed, Undecided, ended_files, undecided};
 

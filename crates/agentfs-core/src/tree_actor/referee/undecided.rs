@@ -4,8 +4,8 @@
 use std::collections::BTreeSet;
 
 use super::Snapshot;
-use crate::tree_actor::tree::{EventNumber, LineVersion};
-use crate::tree_actor::{MergeFileIdentity, Result};
+use crate::tree_actor::Result;
+use crate::tree_actor::tree::{EventNumber, LineVersion, MergeFileIdentity};
 
 /// History's one answer the referee needs: whether the save numbered `save` is in the upstream's
 /// history.

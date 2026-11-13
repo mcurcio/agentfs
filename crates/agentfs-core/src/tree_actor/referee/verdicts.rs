@@ -5,8 +5,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use super::ancestry::{self, Broken, Graph, descends};
 use super::{CollisionKind, File, PriorDecisions, Snapshot, Verdict, Version};
-use crate::tree_actor::tree::{LineVersion, Lines};
-use crate::tree_actor::{Error, MergeFileIdentity, NameHistory, Result};
+use crate::tree_actor::tree::{LineVersion, Lines, MergeFileIdentity, NameHistory};
+use crate::tree_actor::{Error, Result};
 use crate::tree_reconcile::Line;
 
 /// A version as rule 3 reads it: which one, and whether it is live (a line's bytes, a file's

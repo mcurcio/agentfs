@@ -46,8 +46,7 @@ mod tests {
     use super::super::Version;
     use super::super::verdicts::Order;
     use super::*;
-    use crate::tree_actor::MergeFileIdentity;
-    use crate::tree_actor::tree::{EventNumber, LineVersion};
+    use crate::tree_actor::tree::{EventNumber, LineVersion, MergeFileIdentity};
 
     fn line(file: u64, version: &str) -> Version {
         Version::Line {

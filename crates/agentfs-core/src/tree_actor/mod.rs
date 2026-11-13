@@ -35,7 +35,7 @@ use journal::{
 };
 use pointers::Pointers;
 use stages::{Stages, Timer, Which};
-use tree::{EventNumber, Lines, Versions};
+use tree::{EventNumber, Lines, MergeFileIdentity, NameHistory, Tree, Versions};
 pub use tree_id::{NotATree, TreeId};
 
 const FORMAT: &str = "agentfs-trees-3\n";
@@ -218,145 +218,6 @@ impl Call {
             CallHead::Append { len } => Ok(Self::Append(whole(*len)?)),
             CallHead::Truncate(size) => whole(0).map(|_| Self::Truncate(*size)),
         }
-    }
-}
-
-/// The saved state of one tree. A step builds on a copy and installs it after
-/// its commit point, so file bytes and line maps sit behind `Arc`.
-#[derive(Clone, Default)]
-struct Tree {
-    names: BTreeMap<String, u64>,
-    anonymous: BTreeSet<u64>,
-    bytes: BTreeMap<u64, Arc<Vec<u8>>>,
-    lines: BTreeMap<u64, Arc<Lines>>,
-    identities: BTreeMap<u64, MergeFileIdentity>,
-    namespace: BTreeMap<MergeFileIdentity, NameHistory>,
-    fresh_names: BTreeSet<u64>,
-}
-
-impl Tree {
-    /// Adds an object that has no name and no saved state.
-    fn add_anonymous(&mut self, object: u64) {
-        self.anonymous.insert(object);
-        self.bytes.insert(object, Arc::default());
-        self.lines.insert(object, Arc::default());
-        self.identities.insert(object, MergeFileIdentity(object));
-        self.fresh_names.insert(object);
-    }
-
-    fn drop_object(&mut self, object: u64) {
-        self.bytes.remove(&object);
-        self.lines.remove(&object);
-        self.identities.remove(&object);
-        self.fresh_names.remove(&object);
-    }
-
-    /// Replaces the names and files with `snapshot`'s. Two files on one object
-    /// would read each other's bytes, so a view could differ from its commit: a
-    /// step that would do it fails before its record (finding 39).
-    fn install(&mut self, snapshot: referee::Snapshot) -> Result<()> {
-        self.names.clear();
-        self.fresh_names.clear();
-        let mut objects = BTreeSet::new();
-        for (id, file) in snapshot.files {
-            if !objects.insert(file.object) {
-                return Err(Error::Format);
-            }
-            let history = snapshot.names.get(&id).ok_or(Error::Format)?;
-            let path = history.path()?.ok_or(Error::Format)?;
-            if history.head_version()?.over.is_none() {
-                self.fresh_names.insert(file.object);
-            }
-            self.names.insert(path.to_owned(), file.object);
-            self.bytes.insert(file.object, Arc::new(file.lines.bytes()));
-            self.lines.insert(file.object, Arc::new(file.lines));
-            self.identities.insert(file.object, id);
-        }
-        self.namespace = snapshot.names;
-        Ok(())
-    }
-}
-
-// Merge identity follows an atomic replacement; the object number follows an
-// open handle. Keep the types distinct even though both are allocated from
-// the same durable event sequence.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(transparent)]
-struct MergeFileIdentity(u64);
-
-/// A file's name versions, including deletion, travel in the same commit as
-/// its content. Each history is keyed by event number, which is volume-wide.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct NameHistory {
-    head: EventNumber,
-    versions: BTreeMap<EventNumber, NameVersion>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-struct NameVersion {
-    path: Option<String>,
-    over: Option<EventNumber>,
-    replaced_by: Option<MergeFileIdentity>,
-}
-
-impl NameHistory {
-    fn created(event: EventNumber, path: String) -> Self {
-        Self {
-            head: event,
-            versions: [(
-                event,
-                NameVersion {
-                    path: Some(path),
-                    over: None,
-                    replaced_by: None,
-                },
-            )]
-            .into_iter()
-            .collect(),
-        }
-    }
-
-    fn advance(
-        &mut self,
-        event: EventNumber,
-        path: Option<String>,
-        replaced_by: Option<MergeFileIdentity>,
-    ) {
-        self.versions.insert(
-            event,
-            NameVersion {
-                path,
-                over: Some(self.head),
-                replaced_by,
-            },
-        );
-        self.head = event;
-    }
-
-    /// The head's version: [`Error::Format`] if it is not on record.
-    fn head_version(&self) -> Result<&NameVersion> {
-        self.versions.get(&self.head).ok_or(Error::Format)
-    }
-
-    /// The head's path: None once the file is ended.
-    fn path(&self) -> Result<Option<&str>> {
-        Ok(self.head_version()?.path.as_deref())
-    }
-
-    /// Both histories' versions, keeping `self.head`; [`Error::Format`] where they record one
-    /// version differently.
-    fn combine(&self, other: &NameHistory) -> Result<NameHistory> {
-        let mut combined = self.clone();
-        for (event, version) in &other.versions {
-            match combined.versions.get(event) {
-                Some(existing) if existing != version => return Err(Error::Format),
-                Some(_) => {}
-                None => {
-                    combined.versions.insert(*event, version.clone());
-                }
-            }
-        }
-        Ok(combined)
     }
 }
 
@@ -1319,26 +1180,6 @@ impl Volume {
             return Err(Error::Stopped);
         }
         self.trees.get(&tree).ok_or(Error::NotFound)
-    }
-
-    fn snapshot_of(tree: &Tree) -> referee::Snapshot {
-        let files = tree
-            .names
-            .values()
-            .map(|object| {
-                (
-                    tree.identities[object],
-                    referee::File {
-                        object: *object,
-                        lines: (*tree.lines[object]).clone(),
-                    },
-                )
-            })
-            .collect();
-        referee::Snapshot {
-            files,
-            names: tree.namespace.clone(),
-        }
     }
 
     fn snapshot_at(&self, head: Oid) -> Result<referee::Snapshot> {

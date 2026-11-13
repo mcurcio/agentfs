@@ -5,8 +5,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::{File, Snapshot, Verdict, ancestry};
-use crate::tree_actor::tree::{LineVersion, Lines};
-use crate::tree_actor::{Error, MergeFileIdentity, Result};
+use crate::tree_actor::tree::{LineVersion, Lines, MergeFileIdentity};
+use crate::tree_actor::{Error, Result};
 use crate::tree_reconcile::Line;
 
 /// One file's lines placed, and the joins that lose: each as the losing version and the
@@ -214,8 +214,7 @@ pub(super) fn sync_files(
 mod tests {
     use super::super::{CollisionKind, Version, land};
     use super::*;
-    use crate::tree_actor::NameHistory;
-    use crate::tree_actor::tree::{EventNumber, Versions};
+    use crate::tree_actor::tree::{EventNumber, NameHistory, Versions};
 
     const FILE: MergeFileIdentity = MergeFileIdentity(100);
 

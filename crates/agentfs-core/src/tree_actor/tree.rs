@@ -2,12 +2,14 @@
 //! (docs/target-architecture/git-model.md §5, §7, §12).
 
 use std::cmp::Ordering;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::str::FromStr;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-use super::Error;
+use super::{Error, Result, Volume, referee};
 use crate::tree_reconcile::LineMap;
 
 /// A step's journal number. It numbers the step's name versions and line versions, and the object,
@@ -119,7 +121,7 @@ fn canonical(text: &str) -> Option<u64> {
 impl FromStr for LineVersion {
     type Err = Error;
 
-    fn from_str(text: &str) -> Result<Self, Error> {
+    fn from_str(text: &str) -> std::result::Result<Self, Error> {
         let (event, index) = text.split_once(':').ok_or(Error::Format)?;
         let event = canonical(event).ok_or(Error::Format)?;
         let index = canonical(index)
@@ -141,7 +143,7 @@ impl From<LineVersion> for String {
 impl TryFrom<String> for LineVersion {
     type Error = Error;
 
-    fn try_from(text: String) -> Result<Self, Error> {
+    fn try_from(text: String) -> std::result::Result<Self, Error> {
         text.parse()
     }
 }
@@ -169,11 +171,171 @@ impl Versions {
 /// A file's line map as the engine stores it.
 pub(super) type Lines = LineMap<LineVersion>;
 
+/// The saved state of one tree. A step builds on a copy and installs it after
+/// its commit point, so file bytes and line maps sit behind `Arc`.
+#[derive(Clone, Default)]
+pub(super) struct Tree {
+    pub(super) names: BTreeMap<String, u64>,
+    pub(super) anonymous: BTreeSet<u64>,
+    pub(super) bytes: BTreeMap<u64, Arc<Vec<u8>>>,
+    pub(super) lines: BTreeMap<u64, Arc<Lines>>,
+    pub(super) identities: BTreeMap<u64, MergeFileIdentity>,
+    pub(super) namespace: BTreeMap<MergeFileIdentity, NameHistory>,
+    pub(super) fresh_names: BTreeSet<u64>,
+}
+
+impl Tree {
+    /// Adds an object that has no name and no saved state.
+    pub(super) fn add_anonymous(&mut self, object: u64) {
+        self.anonymous.insert(object);
+        self.bytes.insert(object, Arc::default());
+        self.lines.insert(object, Arc::default());
+        self.identities.insert(object, MergeFileIdentity(object));
+        self.fresh_names.insert(object);
+    }
+
+    pub(super) fn drop_object(&mut self, object: u64) {
+        self.bytes.remove(&object);
+        self.lines.remove(&object);
+        self.identities.remove(&object);
+        self.fresh_names.remove(&object);
+    }
+
+    /// Replaces the names and files with `snapshot`'s. Two files on one object
+    /// would read each other's bytes, so a view could differ from its commit: a
+    /// step that would do it fails before its record (finding 39).
+    pub(super) fn install(&mut self, snapshot: referee::Snapshot) -> Result<()> {
+        self.names.clear();
+        self.fresh_names.clear();
+        let mut objects = BTreeSet::new();
+        for (id, file) in snapshot.files {
+            if !objects.insert(file.object) {
+                return Err(Error::Format);
+            }
+            let history = snapshot.names.get(&id).ok_or(Error::Format)?;
+            let path = history.path()?.ok_or(Error::Format)?;
+            if history.head_version()?.over.is_none() {
+                self.fresh_names.insert(file.object);
+            }
+            self.names.insert(path.to_owned(), file.object);
+            self.bytes.insert(file.object, Arc::new(file.lines.bytes()));
+            self.lines.insert(file.object, Arc::new(file.lines));
+            self.identities.insert(file.object, id);
+        }
+        self.namespace = snapshot.names;
+        Ok(())
+    }
+}
+
+// Merge identity follows an atomic replacement; the object number follows an
+// open handle. Keep the types distinct even though both are allocated from
+// the same durable event sequence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub(super) struct MergeFileIdentity(pub(super) u64);
+
+/// A file's name versions, including deletion, travel in the same commit as
+/// its content. Each history is keyed by event number, which is volume-wide.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(super) struct NameHistory {
+    pub(super) head: EventNumber,
+    pub(super) versions: BTreeMap<EventNumber, NameVersion>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) struct NameVersion {
+    pub(super) path: Option<String>,
+    pub(super) over: Option<EventNumber>,
+    pub(super) replaced_by: Option<MergeFileIdentity>,
+}
+
+impl NameHistory {
+    pub(super) fn created(event: EventNumber, path: String) -> Self {
+        Self {
+            head: event,
+            versions: [(
+                event,
+                NameVersion {
+                    path: Some(path),
+                    over: None,
+                    replaced_by: None,
+                },
+            )]
+            .into_iter()
+            .collect(),
+        }
+    }
+
+    pub(super) fn advance(
+        &mut self,
+        event: EventNumber,
+        path: Option<String>,
+        replaced_by: Option<MergeFileIdentity>,
+    ) {
+        self.versions.insert(
+            event,
+            NameVersion {
+                path,
+                over: Some(self.head),
+                replaced_by,
+            },
+        );
+        self.head = event;
+    }
+
+    /// The head's version: [`Error::Format`] if it is not on record.
+    pub(super) fn head_version(&self) -> Result<&NameVersion> {
+        self.versions.get(&self.head).ok_or(Error::Format)
+    }
+
+    /// The head's path: None once the file is ended.
+    pub(super) fn path(&self) -> Result<Option<&str>> {
+        Ok(self.head_version()?.path.as_deref())
+    }
+
+    /// Both histories' versions, keeping `self.head`; [`Error::Format`] where they record one
+    /// version differently.
+    pub(super) fn combine(&self, other: &NameHistory) -> Result<NameHistory> {
+        let mut combined = self.clone();
+        for (event, version) in &other.versions {
+            match combined.versions.get(event) {
+                Some(existing) if existing != version => return Err(Error::Format),
+                Some(_) => {}
+                None => {
+                    combined.versions.insert(*event, version.clone());
+                }
+            }
+        }
+        Ok(combined)
+    }
+}
+
+impl Volume {
+    pub(super) fn snapshot_of(tree: &Tree) -> referee::Snapshot {
+        let files = tree
+            .names
+            .values()
+            .map(|object| {
+                (
+                    tree.identities[object],
+                    referee::File {
+                        object: *object,
+                        lines: (*tree.lines[object]).clone(),
+                    },
+                )
+            })
+            .collect();
+        referee::Snapshot {
+            files,
+            names: tree.namespace.clone(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::tree_actor::referee::{Collision, CollisionKind, Version};
-    use crate::tree_actor::{MergeFileIdentity, NameHistory};
     use crate::tree_reconcile::Line;
 
     fn v(text: &str) -> LineVersion {

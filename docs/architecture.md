@@ -49,7 +49,7 @@ missing from these tables or a row names a module that no longer exists;
 | `tree_actor/referee/verdicts.rs` | Rule 3 for one change, for names and lines alike: each changed version's verdict and its loss so far |
 | `tree_actor/referee/whole.rs` | R3e: a change lands whole or not at all; the collisions in their order |
 | `tree_actor/stages.rs` | Measurements only, never read by a decision: runs and time per actor stage, and the Git children the actor's path has started (counted at `git_cli::counted`, the one spawn site; target git-model §18) |
-| `tree_actor/tree.rs` | A tree's shared types: the event number a step is given, and the line versions (`<event>:<index>`, ordered as their text) and line maps it writes |
+| `tree_actor/tree.rs` | A tree's shared types: the event number a step is given, the line versions (`<event>:<index>`, ordered as their text) and line maps it writes, and a tree's saved state (`Tree`), its files' identities and name histories |
 | `tree_actor/tree_id.rs` | A tree's identity, `root` or `fork/<n>`: the text history, refs and checkouts name a tree by, parsed once where the journal is read |
 | `tree_reconcile.rs` | The line-map library: histogram alignment and line identities, generic over the caller's version |
 | `tree_git.rs` | Git executable backend for durable objects, the rebuildable copy of the refs in files format, `config` and `HEAD`, snapshots and private caches; Git children retain the actor lease |

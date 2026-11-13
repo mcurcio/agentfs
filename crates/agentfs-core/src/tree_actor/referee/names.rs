@@ -6,8 +6,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use super::verdicts::Candidate;
 use super::{CollisionKind, Snapshot, Version};
-use crate::tree_actor::tree::EventNumber;
-use crate::tree_actor::{Error, MergeFileIdentity, NameHistory, Result};
+use crate::tree_actor::tree::{EventNumber, MergeFileIdentity, NameHistory};
+use crate::tree_actor::{Error, Result};
 
 /// R11.2 at a landing: an applied name onto a path a live upstream file holds loses to that
 /// file's name, unless this change ended that file by a rename-over onto this name (its own

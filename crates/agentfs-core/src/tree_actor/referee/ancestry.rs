@@ -3,8 +3,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::tree_actor::tree::{EventNumber, LineVersion};
-use crate::tree_actor::{Error, NameHistory, Result};
+use crate::tree_actor::tree::{EventNumber, LineVersion, NameHistory};
+use crate::tree_actor::{Error, Result};
 
 /// Versions, each written over at most one other.
 pub(in crate::tree_actor) trait Graph {
