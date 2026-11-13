@@ -31,7 +31,8 @@ use crate::file_lock::{FileLock, Mode};
 use crate::paths::RepoPath;
 use crate::tree_git::{RefUpdate, TreeEntry, TreeGit};
 use journal::{
-    CallHead, CompactError, Entry, Frame, Journal, OpenRecord, PointerChange, Record, RunHead,
+    CallHead, CompactError, Entry, FoldedOpen, Journal, LiveOpen, PointerChange, Record, RunHead,
+    compact_at, fold, parse_tree,
 };
 use pointers::Pointers;
 use stages::{Stages, Timer, Which};
@@ -106,12 +107,6 @@ impl Error {
     }
 }
 
-/// When a journal this long after its last compaction compacts again.
-/// Constants, not a setting: restart memory is at most this plus live calls.
-fn compact_at(len_after_last: u64) -> u64 {
-    (64_u64 << 20).max(len_after_last.saturating_mul(2))
-}
-
 fn now_ns() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -124,12 +119,6 @@ fn branch(tree: TreeId) -> String {
 
 fn queue(tree: TreeId) -> String {
     format!("refs/queue/{tree}/")
-}
-
-/// A tree string the journal stores, parsed once, at the fold: one that names no
-/// tree is [`Error::Format`].
-fn parse_tree(text: &str) -> Result<TreeId> {
-    text.parse().map_err(|_| Error::Format)
 }
 
 /// The tree a commit's `Agentfs-Tree` trailer names, if it has one.
@@ -310,239 +299,6 @@ pub struct Metrics {
     pub stages: Stages,
     /// The journal file's length now: what a held open file keeps from compaction.
     pub journal_bytes: u64,
-}
-
-/// A live write-open: a journal [`OpenRecord`] with its tree parsed.
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct LiveOpen {
-    handle: u64,
-    tree: TreeId,
-    writer: String,
-    object: u64,
-    /// Never linked: its object has no name and no saved state.
-    anonymous: bool,
-}
-
-impl LiveOpen {
-    fn parse(record: &OpenRecord) -> Result<Self> {
-        Ok(Self {
-            handle: record.handle,
-            tree: parse_tree(&record.tree)?,
-            writer: record.writer.clone(),
-            object: record.object,
-            anonymous: record.anonymous,
-        })
-    }
-
-    fn record(&self) -> OpenRecord {
-        OpenRecord {
-            handle: self.handle,
-            tree: self.tree.to_string(),
-            writer: self.writer.clone(),
-            object: self.object,
-            anonymous: self.anonymous,
-        }
-    }
-}
-
-/// A live open and its calls, as the journal leaves them.
-#[derive(Debug, PartialEq, Eq)]
-struct FoldedOpen {
-    open: LiveOpen,
-    calls: Vec<(u64, Call)>,
-}
-
-/// What a journal's frames add up to (git-model §12).
-#[derive(Debug, PartialEq, Eq)]
-struct Folded {
-    pointers: Pointers,
-    /// Each fork's upstream. The root has none.
-    upstreams: BTreeMap<TreeId, TreeId>,
-    next_seq: u64,
-    opens: BTreeMap<u64, FoldedOpen>,
-    /// A file's page writes while a write-open of it lives.
-    page_writes: BTreeMap<(TreeId, u64), Vec<(u64, pages::Run)>>,
-    /// The last step that closed a write-open of a file, while one lives.
-    saved_through: BTreeMap<(TreeId, u64), u64>,
-}
-
-impl Folded {
-    fn add_upstream(&mut self, fork: &str, upstream: &str) -> Result<()> {
-        let fork = parse_tree(fork)?;
-        if fork.is_root() {
-            return Err(Error::Format);
-        }
-        self.upstreams.insert(fork, parse_tree(upstream)?);
-        Ok(())
-    }
-
-    fn add_open(&mut self, open: LiveOpen) {
-        self.opens.insert(
-            open.handle,
-            FoldedOpen {
-                open,
-                calls: Vec::new(),
-            },
-        );
-    }
-}
-
-fn parse_oid(hex: &str) -> Result<Oid> {
-    Oid::from_str(hex).map_err(|_| Error::Format)
-}
-
-fn parse_change(change: &PointerChange) -> Result<RefUpdate> {
-    Ok(RefUpdate {
-        refname: change.name.clone(),
-        new: change.new.as_deref().map(parse_oid).transpose()?,
-        expected_old: change.old.as_deref().map(parse_oid).transpose()?,
-    })
-}
-
-fn runs_from_frame(heads: &[RunHead], tail: &[u8]) -> Result<Vec<pages::Run>> {
-    let mut rest = tail;
-    let mut runs = Vec::with_capacity(heads.len());
-    for head in heads {
-        let len = usize::try_from(head.len).map_err(|_| Error::Format)?;
-        if rest.len() < len {
-            return Err(Error::Format);
-        }
-        let (bytes, after) = rest.split_at(len);
-        runs.push(pages::Run {
-            offset: head.offset,
-            bytes: bytes.to_vec(),
-        });
-        rest = after;
-    }
-    if rest.is_empty() {
-        Ok(runs)
-    } else {
-        Err(Error::Format)
-    }
-}
-
-/// Adds a journal's frames up. Pure. Frames that disagree with each other, or
-/// a tree string that is no [`TreeId`], cannot come from a good journal:
-/// [`Error::Format`], or [`Error::PointerMoved`] for a pointer.
-fn fold(frames: &[Frame]) -> Result<Folded> {
-    let mut frames = frames.iter();
-    let Some((
-        Record {
-            entry:
-                Entry::Checkpoint {
-                    next_seq,
-                    pointers,
-                    upstreams,
-                    opens,
-                    page_saved,
-                },
-            ..
-        },
-        _,
-    )) = frames.next()
-    else {
-        return Err(Error::Format);
-    };
-    let mut folded = Folded {
-        pointers: Pointers::new(
-            pointers
-                .iter()
-                .map(|(name, hex)| Ok((name.clone(), parse_oid(hex)?)))
-                .collect::<Result<_>>()?,
-        ),
-        upstreams: BTreeMap::new(),
-        next_seq: *next_seq,
-        opens: BTreeMap::new(),
-        page_writes: BTreeMap::new(),
-        saved_through: page_saved
-            .iter()
-            .map(|(tree, object, seq)| Ok(((parse_tree(tree)?, *object), *seq)))
-            .collect::<Result<_>>()?,
-    };
-    for (fork, upstream) in upstreams {
-        folded.add_upstream(fork, upstream)?;
-    }
-    for open in opens {
-        folded.add_open(LiveOpen::parse(open)?);
-    }
-    for (record, tail) in frames {
-        let seq = record.seq;
-        folded.next_seq = folded.next_seq.max(seq.saturating_add(1));
-        match &record.entry {
-            Entry::Checkpoint { .. } => return Err(Error::Format),
-            Entry::Open {
-                tree,
-                writer,
-                object,
-                ..
-            } => folded.add_open(LiveOpen {
-                handle: seq,
-                tree: parse_tree(tree)?,
-                writer: writer.clone(),
-                object: *object,
-                anonymous: false,
-            }),
-            Entry::AnonymousOpen { tree, writer } => folded.add_open(LiveOpen {
-                handle: seq,
-                tree: parse_tree(tree)?,
-                writer: writer.clone(),
-                object: seq,
-                anonymous: true,
-            }),
-            Entry::Call { handle, call } => folded
-                .opens
-                .get_mut(handle)
-                .ok_or(Error::Format)?
-                .calls
-                .push((seq, Call::from_frame(call, tail)?)),
-            Entry::PageWrite { tree, object, runs } => folded
-                .page_writes
-                .entry((parse_tree(tree)?, *object))
-                .or_default()
-                .extend(runs_from_frame(runs, tail)?.into_iter().map(|r| (seq, r))),
-            Entry::Step {
-                closes,
-                opened,
-                linked,
-                fork,
-                pointers,
-                ..
-            } => {
-                let changes = pointers
-                    .iter()
-                    .map(parse_change)
-                    .collect::<Result<Vec<_>>>()?;
-                folded.pointers.check(&changes)?;
-                folded.pointers.apply(&changes);
-                if let Some((name, parent)) = fork {
-                    folded.add_upstream(name, parent)?;
-                }
-                if let Some(open) = opened {
-                    folded.add_open(LiveOpen::parse(open)?);
-                }
-                if let Some(object) = linked {
-                    folded
-                        .opens
-                        .values_mut()
-                        .filter(|o| o.open.object == *object)
-                        .for_each(|o| o.open.anonymous = false);
-                }
-                if let Some(handle) = closes {
-                    let open = folded.opens.remove(handle).ok_or(Error::Format)?.open;
-                    folded.saved_through.insert((open.tree, open.object), seq);
-                }
-            }
-        }
-    }
-    // Page state lives from a file's write-open to the close of its last one.
-    let live: BTreeSet<(TreeId, u64)> = folded
-        .opens
-        .values()
-        .map(|o| (o.open.tree, o.open.object))
-        .collect();
-    folded.page_writes.retain(|key, _| live.contains(key));
-    folded.saved_through.retain(|key, _| live.contains(key));
-    Ok(folded)
 }
 
 /// A step built on a copy of its tree and not yet on record.
@@ -1733,26 +1489,6 @@ impl Volume {
         Ok(Took::Waiting)
     }
 
-    /// Appends one record that moves no pointer, or the step `run_step` built.
-    /// Only a file that can no longer be trusted stops the actor.
-    fn journal_record(&mut self, entry: Entry, tail: &[u8]) -> Result<u64> {
-        if self.stopped {
-            return Err(Error::Stopped);
-        }
-        let seq = self.next;
-        let record = Record {
-            seq,
-            at_ns: now_ns(),
-            entry,
-        };
-        if let Err(e) = self.journal.append(&record, tail) {
-            self.stopped = self.journal.unknown();
-            return Err(e);
-        }
-        self.next += 1;
-        Ok(seq)
-    }
-
     /// Saves this tree's pending closes, then runs the step `build` makes.
     fn step<F>(&mut self, tree: TreeId, build: F) -> Result<(EventNumber, Saved)>
     where
@@ -1910,79 +1646,6 @@ impl Volume {
         }
         self.copies_stale = false;
         Ok(())
-    }
-
-    /// A fuzzy checkpoint (ARIES): the pointers, the live opens, and unchanged
-    /// the live opens' calls and the page writes memory still holds. A file held
-    /// open pins only its own calls, never other files' saves, and a closed
-    /// generation's page write stays out of the fold (R12).
-    fn compact(&mut self) -> std::result::Result<(), CompactError> {
-        let _timer = Timer::start(Which::Compaction);
-        let opens = self
-            .handles
-            .iter()
-            .map(|(handle, h)| OpenRecord {
-                handle: *handle,
-                tree: h.tree.to_string(),
-                writer: h.writer.clone(),
-                object: h.object,
-                anonymous: self
-                    .trees
-                    .get(&h.tree)
-                    .is_some_and(|t| t.anonymous.contains(&h.object)),
-            })
-            .collect();
-        let checkpoint = Record {
-            seq: 0,
-            at_ns: now_ns(),
-            entry: Entry::Checkpoint {
-                next_seq: self.next,
-                pointers: self.pointers.to_hex(),
-                upstreams: upstream_config(&self.upstreams),
-                opens,
-                page_saved: self.pages_saved_through(),
-            },
-        };
-        let (handles, pages) = (&self.handles, &self.pages);
-        // The fold parsed every page write's tree; one that names none stops the
-        // compaction with the journal untouched, never a page write dropped.
-        let unparsed = std::cell::Cell::new(false);
-        let retained = self
-            .journal
-            .retained(|record| match &record.entry {
-                Entry::Call { handle, .. } => handles.contains_key(handle),
-                Entry::PageWrite { tree, object, .. } => match tree.parse() {
-                    Ok(tree) => pages::holds(pages, tree, *object, record.seq),
-                    Err(_) => {
-                        unparsed.set(true);
-                        true
-                    }
-                },
-                _ => false,
-            })
-            .map_err(CompactError::Before)?;
-        if unparsed.get() {
-            return Err(CompactError::Before(std::io::Error::other(
-                "a journalled page write names no tree",
-            )));
-        }
-        self.journal.compact(&checkpoint, &retained)
-    }
-
-    fn compact_if_due(&mut self) {
-        if self.journal.len() < self.compact_threshold {
-            return;
-        }
-        match self.compact() {
-            Ok(()) => self.compact_threshold = compact_at(self.journal.len()),
-            // Untouched: the next step retries.
-            Err(e @ CompactError::Before(_)) => eprintln!("tree CompactionFailed: {e}"),
-            // The open file may not be the named one.
-            Err(e @ CompactError::After(_)) => {
-                eprintln!("tree CompactionFailed: {e}");
-                self.stopped = true;
-            }
-        }
     }
 
     fn build_create(
@@ -2258,6 +1921,7 @@ fn writer_label(writer: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use super::journal::Frame;
     use super::*;
 
     const ROOT: TreeId = TreeId::Root;

@@ -37,7 +37,9 @@ missing from these tables or a row names a module that no longer exists;
 | `volume.rs` | Opens a state area: crash recovery, then the [`Recorder`](#the-synchronous-step) used at every boundary and the `Committer` that turns records into commits |
 | `record.rs` | What the journal stores: one record per change boundary, absolute state, never deltas |
 | `tree_actor/mod.rs` | The tree actor: recorded byte calls, the ordered step, recovery from the journal, line-map storage, queue takes, the root and one sandbox; separate from the production recorder |
-| `tree_actor/journal.rs` | The actor's journal: salted checksummed frames, the commit point for calls and pointer steps, torn-tail and corruption rules, compaction (target git-model §3) |
+| `tree_actor/journal/mod.rs` | The actor's journal: salted checksummed frames, the commit point for calls and pointer steps, torn-tail and corruption rules, compaction (target git-model §3) |
+| `tree_actor/journal/commit_point.rs` | The actor's appends to the journal and when it compacts, with the checkpoint a compaction writes |
+| `tree_actor/journal/fold.rs` | What a journal's frames add up to, pure: pointers, upstreams, live opens with their calls, and page writes (target git-model §12) |
 | `tree_actor/pointers.rs` | Branches, queue entries, collision refs and object tables as the journal leaves them: pure, no I/O |
 | `tree_actor/pages.rs` | The kernel's one page cache per file: page fills, page writes and the size replies for shared mappings (rules ledger, R1.4) |
 | `tree_actor/queue.rs` | Eligibility and prefix selection for writer-locked queue entries |

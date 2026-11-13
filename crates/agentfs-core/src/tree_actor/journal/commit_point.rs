@@ -1,0 +1,111 @@
+//! The journal's commit point: appending a step's record, and compacting the journal behind it
+//! (target git-model §3).
+
+use super::{CompactError, Entry, OpenRecord, Record};
+use crate::tree_actor::stages::{Timer, Which};
+use crate::tree_actor::{Error, Result, Volume, now_ns, pages, upstream_config};
+
+/// When a journal this long after its last compaction compacts again.
+/// Constants, not a setting: restart memory is at most this plus live calls.
+pub(in crate::tree_actor) fn compact_at(len_after_last: u64) -> u64 {
+    (64_u64 << 20).max(len_after_last.saturating_mul(2))
+}
+
+impl Volume {
+    /// Appends one record that moves no pointer, or the step `run_step` built.
+    /// Only a file that can no longer be trusted stops the actor.
+    pub(in crate::tree_actor) fn journal_record(
+        &mut self,
+        entry: Entry,
+        tail: &[u8],
+    ) -> Result<u64> {
+        if self.stopped {
+            return Err(Error::Stopped);
+        }
+        let seq = self.next;
+        let record = Record {
+            seq,
+            at_ns: now_ns(),
+            entry,
+        };
+        if let Err(e) = self.journal.append(&record, tail) {
+            self.stopped = self.journal.unknown();
+            return Err(e);
+        }
+        self.next += 1;
+        Ok(seq)
+    }
+
+    /// A fuzzy checkpoint (ARIES): the pointers, the live opens, and unchanged
+    /// the live opens' calls and the page writes memory still holds. A file held
+    /// open pins only its own calls, never other files' saves, and a closed
+    /// generation's page write stays out of the fold (R12).
+    pub(in crate::tree_actor) fn compact(&mut self) -> std::result::Result<(), CompactError> {
+        let _timer = Timer::start(Which::Compaction);
+        let opens = self
+            .handles
+            .iter()
+            .map(|(handle, h)| OpenRecord {
+                handle: *handle,
+                tree: h.tree.to_string(),
+                writer: h.writer.clone(),
+                object: h.object,
+                anonymous: self
+                    .trees
+                    .get(&h.tree)
+                    .is_some_and(|t| t.anonymous.contains(&h.object)),
+            })
+            .collect();
+        let checkpoint = Record {
+            seq: 0,
+            at_ns: now_ns(),
+            entry: Entry::Checkpoint {
+                next_seq: self.next,
+                pointers: self.pointers.to_hex(),
+                upstreams: upstream_config(&self.upstreams),
+                opens,
+                page_saved: self.pages_saved_through(),
+            },
+        };
+        let (handles, pages) = (&self.handles, &self.pages);
+        // The fold parsed every page write's tree; one that names none stops the
+        // compaction with the journal untouched, never a page write dropped.
+        let unparsed = std::cell::Cell::new(false);
+        let retained = self
+            .journal
+            .retained(|record| match &record.entry {
+                Entry::Call { handle, .. } => handles.contains_key(handle),
+                Entry::PageWrite { tree, object, .. } => match tree.parse() {
+                    Ok(tree) => pages::holds(pages, tree, *object, record.seq),
+                    Err(_) => {
+                        unparsed.set(true);
+                        true
+                    }
+                },
+                _ => false,
+            })
+            .map_err(CompactError::Before)?;
+        if unparsed.get() {
+            return Err(CompactError::Before(std::io::Error::other(
+                "a journalled page write names no tree",
+            )));
+        }
+        self.journal.compact(&checkpoint, &retained)
+    }
+
+    pub(in crate::tree_actor) fn compact_if_due(&mut self) {
+        if self.journal.len() < self.compact_threshold {
+            return;
+        }
+        match self.compact() {
+            Ok(()) => self.compact_threshold = compact_at(self.journal.len()),
+            // Untouched: the next step retries.
+            Err(e @ CompactError::Before(_)) => eprintln!("tree CompactionFailed: {e}"),
+            // The open file may not be the named one.
+            Err(e @ CompactError::After(_)) => {
+                eprintln!("tree CompactionFailed: {e}");
+                self.stopped = true;
+            }
+        }
+    }
+}

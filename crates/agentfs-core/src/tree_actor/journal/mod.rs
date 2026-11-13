@@ -14,6 +14,9 @@
 //! valid frame is a torn tail; with one it is corruption, which an operator
 //! decides about (docs/runbooks/recording-failures.md).
 
+mod commit_point;
+mod fold;
+
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -24,6 +27,8 @@ use serde::{Deserialize, Serialize};
 
 use super::stages::{Timer, Which};
 use super::{Error, Result};
+pub(super) use commit_point::compact_at;
+pub(super) use fold::{FoldedOpen, LiveOpen, fold, parse_tree};
 
 const MAGIC: &[u8; 4] = b"AFJ2";
 const HEADER: usize = 24;
