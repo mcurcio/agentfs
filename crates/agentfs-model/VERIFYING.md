@@ -46,11 +46,11 @@ runs only when asked for.
 |---|---|---|
 | The model's tests, `cargo test --locked -p agentfs-model` | 73 s | 228 s (`AGENTFS_MODEL_SWEEP=1`) |
 | The digest, `ci/model-digest.sh check` | 66 s (the scenarios, then eleven seeds) | `check --all`: about 2054 s |
-| The library's replay of the recorded traces | 143 s (77 scenario and 15 seed traces) | 834 s in CI (74 and 94) |
+| The library's replay of the recorded traces, in CI | 140 s (77 scenario and 25 seed traces) | 834 s (74 and 94) |
 | The planted corpus, `run.py` | 518 s, 48 of 48 caught | 590 s (`--sweep`) |
-| CI's `phase-1` conformance job | every pull request and push | a manual run, about 80 minutes with the shards |
+| CI's `phase-1` conformance job | 448 s, on every pull request and push | 1400 s, and about 80 minutes with the shards, on a manual run |
 
-Times are one 4-core container on 2026-11-13, except the CI row. The model is bound by its `git` processes: a
+Times are one 4-core container on 2026-11-13, except the CI rows. The model is bound by its `git` processes: a
 release build ran a seed no faster (20.7 s against 21.3 s for eight seeds), and a library replay on tmpfs, with no
 fsync cost, took 21 s against 23 s. Fewer runs is what made it fast.
 
@@ -449,8 +449,8 @@ unit tests' scripted ones: no test yet records a library or mount failure and re
 ```sh
 # Record (the same run CI makes on a push), then replay. Without Linux and /dev/fuse, mounts stay NOT RUN.
 AGENTFS_MODEL_TRACE_DIR=$T cargo test --locked -p agentfs-model --test scenarios --test interleavings
-cargo run --locked -p agentfs-conformance --bin phase1-replay -- model   "$T" --min-scenarios 74 --min-seeds 15
-cargo run --locked -p agentfs-conformance --bin phase1-replay -- library "$T" --min-scenarios 74 --min-seeds 15
+cargo run --locked -p agentfs-conformance --bin phase1-replay -- model   "$T" --min-scenarios 74 --min-seeds 25
+cargo run --locked -p agentfs-conformance --bin phase1-replay -- library "$T" --min-scenarios 74 --min-seeds 25
 # The full sweep, as a manual run of phase-1.yml records it: AGENTFS_MODEL_SWEEP=1 on the record, floors 74 and 94.
 # One trace, its state kept to read with git:
 PHASE1_REPLAY_KEEP=/tmp/k phase1-replay library "$T" --min-scenarios 0 --min-seeds 0 --only NAME
@@ -483,11 +483,11 @@ What a replay decides, each reported rather than hidden:
 | Automatic takes (R1) | a mount takes only through the gate | mounted P1/P2 cases |
 | R1.3 an open's own read, R1.1 another reader | no calls: the replay makes neither read, so nothing compares them | byte and page-cache jobs |
 
-At the regression seeds the in-scope traces are 77 from scenarios and 15 from seeds (9 and 6 of the tree-library
-generators; none of the ordinary ones stays in scope), and 5 of those seeds are mountable (3 and 2). At the full sweep they
+At the regression seeds the in-scope traces are 77 from scenarios and 25 from seeds (9 and 6 of the tree-library
+generators, and 10 of the ordinary ones that happened to stay in scope), and 14 of those seeds are mountable. At the full sweep they
 were 74 and 94 (64 and 16 of the tree-library generators, and 14 of the ordinary ones), 16 of them mountable. The rest are
 excluded by the reasons above, and the replay prints the count of each. The floors in `.github/workflows/phase-1.yml` are
-what passes: on a push 74 and 15 on the library and 71 and 5 on mounts; on a manual run, the full sweep, 74 and 94 and
+what passes: on a push 74 and 25 on the library and 71 and 14 on mounts; on a manual run, the full sweep, 74 and 94 and
 71 and 16. Library and model replay every in-scope trace. `[phase1-seeds]` in a pushed commit message, or a manual run,
 replays the tree-library generators at seeds 1 to 500 on the library, in four shards (`ci/replay-seeds.sh`): too slow for
 every push, and fast enough for a job. `[phase1-measure]` runs every measurement mode, and `[phase1-held]`, `[phase1-calls]` or

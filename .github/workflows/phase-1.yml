@@ -30,12 +30,11 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: ${{ github.event_name == 'workflow_dispatch' && 120 || 30 }}
     # The floors are what passes: on every push the regression seeds' in-scope traces
-    # (9 and 6 of the tree-library generators; 3 and 2 of them mountable), on a manual
-    # run the full sweep's.
+    # (25, 14 of them mountable), on a manual run the full sweep's.
     env:
       SWEEP: ${{ github.event_name == 'workflow_dispatch' && '1' || '' }}
-      MIN_SEEDS: ${{ github.event_name == 'workflow_dispatch' && '94' || '15' }}
-      MIN_MOUNTED_SEEDS: ${{ github.event_name == 'workflow_dispatch' && '16' || '5' }}
+      MIN_SEEDS: ${{ github.event_name == 'workflow_dispatch' && '94' || '25' }}
+      MIN_MOUNTED_SEEDS: ${{ github.event_name == 'workflow_dispatch' && '16' || '14' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: rustup toolchain install # the release rust-toolchain.toml pins

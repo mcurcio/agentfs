@@ -37,7 +37,7 @@ the model's rules or its generator, once, at the end, never per slice or per pus
 | `cargo test --locked -p agentfs-model` | 73 s | `AGENTFS_MODEL_SWEEP=1`: 228 s |
 | `ci/model-digest.sh check` | 66 s: scenarios first, stopping at their first difference, then 11 seeds | `check --all`: 500 seeds, about 2054 s |
 | `planted/run.py --work DIR` | 518 s, 48 of 48 caught | `--sweep`: 590 s |
-| `phase-1.yml` | every pull request and push | a manual run (`gh workflow run phase-1.yml`): about 80 min |
+| `phase-1.yml` | every pull request and push: conformance 448 s (1400 s before) | a manual run (`gh workflow run phase-1.yml`): about 80 min |
 
 - `run.py` stops at the first test that catches the bug, each test in its own process, scenarios first. Running the
   scenarios in one process instead was slower (890 s against 518 s): the corpus is CPU-bound, and stopping early saves
