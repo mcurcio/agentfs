@@ -5,7 +5,6 @@ use std::collections::BTreeMap;
 
 use git2::Oid;
 
-use crate::tree_actor::journal::parse_tree;
 use crate::tree_actor::pointers::Pointers;
 use crate::tree_actor::tree::EventNumber;
 use crate::tree_actor::{Error, Result, TreeId};
@@ -34,7 +33,7 @@ pub(in crate::tree_actor) fn branches(pointers: &Pointers) -> Result<BTreeMap<Tr
         .under(BRANCHES)
         .into_iter()
         .map(|(name, head)| {
-            let tree = parse_tree(name.strip_prefix(BRANCHES).ok_or(Error::Format)?)?;
+            let tree = name.strip_prefix(BRANCHES).ok_or(Error::Format)?.parse()?;
             Ok((tree, head))
         })
         .collect()

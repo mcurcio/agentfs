@@ -433,7 +433,7 @@ impl Volume {
         let mut draft = if t.anonymous.remove(&h.object) {
             t.drop_object(h.object);
             Draft::new(&h.writer, h.tree, t)
-        } else if !t.names.values().any(|o| *o == h.object) {
+        } else if !t.is_named(h.object) {
             let mut draft = Draft::new(&h.writer, h.tree, t);
             draft.saved = Saved::OrphanDropped;
             draft

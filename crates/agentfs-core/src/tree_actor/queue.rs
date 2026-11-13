@@ -52,17 +52,13 @@ pub(in crate::tree_actor) fn held(
 ) -> BTreeSet<Key> {
     let mut keys = BTreeSet::new();
     for object in open_objects {
-        if !tree.names.values().any(|named| *named == object) {
+        if !tree.is_named(object) {
             continue;
         }
         if let Some(id) = tree.identities.get(&object) {
             keys.insert(Key::File(*id));
         }
-        for (path, named) in &tree.names {
-            if *named == object {
-                keys.insert(Key::Name(path.clone()));
-            }
-        }
+        keys.extend(tree.paths_of(object).map(|path| Key::Name(path.to_owned())));
     }
     keys
 }

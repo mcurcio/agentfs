@@ -28,7 +28,7 @@ use serde::{Deserialize, Serialize};
 use super::stages::{Timer, Which};
 use super::{Error, Result};
 pub(super) use commit_point::compact_at;
-pub(super) use fold::{FoldedOpen, LiveOpen, fold, parse_tree};
+pub(super) use fold::{FoldedOpen, LiveOpen, fold};
 
 const MAGIC: &[u8; 4] = b"AFJ2";
 const HEADER: usize = 24;

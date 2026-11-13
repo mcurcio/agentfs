@@ -741,3 +741,29 @@ Not blocking; the suite is built and green. Findings about the brief and the doc
    on the host's git 2.43.0 (`fatal: bad object` for a missing tip given to `rev-list --missing=print`) and passes 5/5
    as root in `agentfs-dev` with git 2.47.3 (`ci/git-release`). `TreeGit::missing_objects` therefore depends on a git
    newer than 2.43; not fixed in 5b.
+
+## 2026-11-13, module cut steps 5.1-5.3 fix round (verification and review of b975dec)
+
+1. **The 5.1 page's probes R2 and R6 name only the differential test, which 5.1.4 deletes.** Verification at b975dec
+   planted both (`verdict` answers Apply where the upstream holds the same version; `displace` frees a path for any
+   unlink) and both survived every remaining test and a local library replay (0 mismatched); the oracle at 3ac3bae
+   fails R2 at seed 20. Two rules had lost their only guard. Unit tests now close them:
+   `verdicts::the_upstream_holding_the_same_version_drops_it`,
+   `referee::tests::only_a_rename_over_onto_the_name_frees_its_path`, and
+   `tree::combine_keeps_its_head_and_refuses_a_version_recorded_twice_differently` (N1). The rule for later cuts:
+   before an oracle or differential test is deleted, each rule it alone guards gets its own unit test.
+2. **Departures from the 5.1 and 5.3 pages, behaviour-neutral, not logged when built:**
+   - `placing::place` takes `(upstream, incoming, verdicts)`: the page's `base` parameter is unused and was dropped.
+   - `queue::Cut::taken()` is not built: no caller reads the cut's taken step without consuming it (`into_taken`).
+   - `LandedInto` and its fields were `pub(in crate::tree_actor)`, wider than the page's private struct; it is built
+     only in `history/take.rs`, and is now private there as the page has it.
+   - Corrupt line ancestry (missing ancestor, cycle, conflict) reads `Error::Format` where it read
+     `Error::Reconcile(InvalidMap(..))`; both answer EIO. Stated on the page as a cost; recorded here as built.
+   - `refs::branches` parses every `refs/heads/` name before any snapshot is read, where the old loop interleaved
+     them: on a corrupt volume the first error reported can differ (both `Format`).
+3. **`parse_tree` (5.2's move table puts it in `journal/fold.rs`) made `history/refs.rs` and `history/message.rs`
+   import from `journal/`, while `journal/fold.rs` imports `history::upstreams`: a module cycle.** It is gone;
+   `impl From<NotATree> for Error` (`Format`) beside `TreeId` lets every reader write `text.parse::<TreeId>()?`.
+   `Upstreams` stays in `history/upstreams.rs` as the 5.3 page places it, so `journal` still reads `history` one way.
+4. **Commit 3d4a439 (the `ci_pipes_never_end_in_an_early_exit` test and the `ci/*.sh` pipefail edits) sits in the
+   5.1-5.3 range but belongs to none of the steps.** It changes no engine code; the PR description should list it.

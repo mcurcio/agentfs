@@ -11,12 +11,6 @@ use crate::tree_actor::recording::{Call, pages};
 use crate::tree_actor::{Error, Result, TreeId};
 use crate::tree_git::RefUpdate;
 
-/// A tree string the journal stores, parsed once, at the fold: one that names no
-/// tree is [`Error::Format`].
-pub(in crate::tree_actor) fn parse_tree(text: &str) -> Result<TreeId> {
-    text.parse().map_err(|_| Error::Format)
-}
-
 /// A live write-open: a journal [`OpenRecord`] with its tree parsed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(in crate::tree_actor) struct LiveOpen {
@@ -32,7 +26,7 @@ impl LiveOpen {
     pub(in crate::tree_actor) fn parse(record: &OpenRecord) -> Result<Self> {
         Ok(Self {
             handle: record.handle,
-            tree: parse_tree(&record.tree)?,
+            tree: record.tree.parse::<TreeId>()?,
             writer: record.writer.clone(),
             object: record.object,
             anonymous: record.anonymous,
@@ -73,10 +67,10 @@ pub(in crate::tree_actor) struct Folded {
 
 impl Folded {
     pub(in crate::tree_actor) fn add_upstream(&mut self, fork: &str, upstream: &str) -> Result<()> {
-        let TreeId::Fork(fork) = parse_tree(fork)? else {
+        let TreeId::Fork(fork) = fork.parse::<TreeId>()? else {
             return Err(Error::Format);
         };
-        self.upstreams.add(fork, parse_tree(upstream)?);
+        self.upstreams.add(fork, upstream.parse::<TreeId>()?);
         Ok(())
     }
 
@@ -163,7 +157,7 @@ pub(in crate::tree_actor) fn fold(frames: &[Frame]) -> Result<Folded> {
         page_writes: BTreeMap::new(),
         saved_through: page_saved
             .iter()
-            .map(|(tree, object, seq)| Ok(((parse_tree(tree)?, *object), *seq)))
+            .map(|(tree, object, seq)| Ok(((tree.parse::<TreeId>()?, *object), *seq)))
             .collect::<Result<_>>()?,
     };
     for (fork, upstream) in upstreams {
@@ -184,14 +178,14 @@ pub(in crate::tree_actor) fn fold(frames: &[Frame]) -> Result<Folded> {
                 ..
             } => folded.add_open(LiveOpen {
                 handle: seq,
-                tree: parse_tree(tree)?,
+                tree: tree.parse::<TreeId>()?,
                 writer: writer.clone(),
                 object: *object,
                 anonymous: false,
             }),
             Entry::AnonymousOpen { tree, writer } => folded.add_open(LiveOpen {
                 handle: seq,
-                tree: parse_tree(tree)?,
+                tree: tree.parse::<TreeId>()?,
                 writer: writer.clone(),
                 object: seq,
                 anonymous: true,
@@ -204,7 +198,7 @@ pub(in crate::tree_actor) fn fold(frames: &[Frame]) -> Result<Folded> {
                 .push((seq, Call::from_frame(call, tail)?)),
             Entry::PageWrite { tree, object, runs } => folded
                 .page_writes
-                .entry((parse_tree(tree)?, *object))
+                .entry((tree.parse::<TreeId>()?, *object))
                 .or_default()
                 .extend(runs_from_frame(runs, tail)?.into_iter().map(|r| (seq, r))),
             Entry::Step {

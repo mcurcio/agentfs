@@ -83,6 +83,13 @@ pub enum Error {
     PointerMoved { name: String },
 }
 
+impl From<NotATree> for Error {
+    /// Stored text that names no tree (a journal record, a ref, a trailer) is damaged state.
+    fn from(_: NotATree) -> Self {
+        Self::Format
+    }
+}
+
 impl From<referee::Broken> for Error {
     /// A broken ancestry is damaged history.
     fn from(_: referee::Broken) -> Self {

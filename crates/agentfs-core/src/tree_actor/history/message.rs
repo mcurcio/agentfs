@@ -2,14 +2,17 @@
 //! (docs/target-architecture/git-model.md §5). A trailer common to every message is one edit in
 //! [`Message::render`]'s shared part.
 
-use crate::tree_actor::journal::parse_tree;
 use crate::tree_actor::tree::EventNumber;
 use crate::tree_actor::{Result, TreeId, referee};
 
+const WRITER: &str = "Agentfs-Writer: ";
+const CAUSE: &str = "Agentfs-Cause: ";
 const TREE: &str = "Agentfs-Tree: ";
 const EVENT: &str = "Agentfs-Event: ";
+const OPEN: &str = "Agentfs-Open: ";
 const COLLISIONS: &str = "Agentfs-Collisions: ";
-const DIRECT: &str = "Agentfs-Cause: Direct";
+/// The cause a direct save's commit carries, written by `render` and read by `direct_event`.
+const DIRECT: &str = "Direct";
 const ENVELOPE: &str = "Agentfs-Format: envelope-1";
 
 /// A direct save's subject word: the call that saved.
@@ -77,7 +80,7 @@ impl Message<'_> {
             } => (
                 format!("{} by {writer}", action.word()),
                 *writer,
-                "Direct",
+                DIRECT,
                 *tree,
                 Some(*event),
             ),
@@ -93,7 +96,7 @@ impl Message<'_> {
             }
         };
         let mut message = format!(
-            "{subject}\n\nAgentfs-Writer: {writer}\nAgentfs-Cause: {cause}\n{TREE}{tree}\n{EVENT}{}\n",
+            "{subject}\n\n{WRITER}{writer}\n{CAUSE}{cause}\n{TREE}{tree}\n{EVENT}{}\n",
             event.map_or(0, EventNumber::get)
         );
         if event.is_some() {
@@ -103,7 +106,7 @@ impl Message<'_> {
         match self {
             Self::Direct {
                 open: Some(open), ..
-            } => message.push_str(&format!("Agentfs-Open: {open}\n")),
+            } => message.push_str(&format!("{OPEN}{open}\n")),
             Self::Landing { collisions, .. } if !collisions.is_empty() => message.push_str(
                 &format!("{COLLISIONS}{}\n", serde_json::to_string(collisions)?),
             ),
@@ -125,7 +128,7 @@ fn lines(message: &[u8]) -> Option<std::str::Lines<'_>> {
 pub(in crate::tree_actor) fn tree_of(message: &[u8]) -> Result<Option<TreeId>> {
     lines(message)
         .and_then(|mut lines| lines.find_map(|l| l.strip_prefix(TREE)))
-        .map(parse_tree)
+        .map(|text| Ok(text.parse()?))
         .transpose()
 }
 
@@ -133,7 +136,10 @@ pub(in crate::tree_actor) fn tree_of(message: &[u8]) -> Result<Option<TreeId>> {
 /// other, or when that event is no number.
 pub(in crate::tree_actor) fn direct_event(message: &[u8]) -> Option<EventNumber> {
     let mut all = lines(message)?;
-    if !all.clone().any(|line| line == DIRECT) {
+    if !all
+        .clone()
+        .any(|line| line.strip_prefix(CAUSE) == Some(DIRECT))
+    {
         return None;
     }
     all.find_map(|line| line.strip_prefix(EVENT))

@@ -30,12 +30,9 @@ pub(super) fn displace(
             }
             let freed = match incoming.names.get(other) {
                 Some(name) => {
-                    name.path()?.is_none()
+                    name.is_ended()?
                         && name.head_version()?.replaced_by == Some(*id)
-                        && base
-                            .names
-                            .get(other)
-                            .is_none_or(|old| old.head != name.head)
+                        && name.moved_since(base.names.get(other))
                 }
                 None => false,
             };

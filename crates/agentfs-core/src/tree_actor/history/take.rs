@@ -15,11 +15,11 @@ use crate::tree_git::{RefUpdate, TreeGit};
 /// The actor's [`referee::Landed`]: whether a save's commit is in `upstream`'s history. That
 /// never changes, and every line one save wrote has that save's commit: ask Git once per commit,
 /// not once per line (an 8 MiB file is 8,000 lines).
-pub(in crate::tree_actor) struct LandedInto<'a> {
-    pub(in crate::tree_actor) repo: &'a TreeGit,
-    pub(in crate::tree_actor) owners: &'a BTreeMap<EventNumber, Oid>,
-    pub(in crate::tree_actor) upstream: Oid,
-    pub(in crate::tree_actor) reached: BTreeMap<Oid, bool>,
+struct LandedInto<'a> {
+    repo: &'a TreeGit,
+    owners: &'a BTreeMap<EventNumber, Oid>,
+    upstream: Oid,
+    reached: BTreeMap<Oid, bool>,
 }
 
 impl referee::Landed for LandedInto<'_> {

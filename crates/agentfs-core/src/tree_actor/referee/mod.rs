@@ -1,5 +1,5 @@
 //! The referee: every line and name rule of one pair of trees, a fork and its upstream
-//! (docs/target-architecture/git-model.md §7, §8; docs/target-architecture/future/module-cut.md).
+//! (docs/target-architecture/git-model.md §7, §8).
 //! Pure: it reads history only through [`Landed`], writes nothing, and gives back plans: `land` a
 //! [`Decision`], `sync` a fork's snapshot. The actor owns queue order and durability.
 
@@ -95,7 +95,7 @@ pub(super) fn land(
     names::displace(upstream, base, incoming, &applied_names, &mut candidates)?;
     let mut applied = upstream.clone();
     for (id, name) in applied_names {
-        if name.path()?.is_none() {
+        if name.is_ended()? {
             applied.files.remove(&id);
         } else if let std::collections::btree_map::Entry::Vacant(entry) = applied.files.entry(id) {
             // A live name for an identity the upstream lacks makes an empty file. Only lines of
@@ -154,7 +154,7 @@ pub(super) fn sync(
     let names = names::sync_names(upstream, fork, &undecided.names)?;
     let mut files = BTreeMap::new();
     for (id, name) in &names {
-        if name.path()?.is_some() {
+        if !name.is_ended()? {
             files.insert(*id, placed.remove(id).ok_or(Error::Format)?);
         }
     }
@@ -410,6 +410,42 @@ mod tests {
                 .iter()
                 .any(|c| c.kind == CollisionKind::Whole)
         );
+    }
+
+    // R11.2: only a rename-over onto the new name frees the path a live upstream file holds; the
+    // same change's plain unlink of that file does not, and the new name loses whole.
+    #[test]
+    fn only_a_rename_over_onto_the_name_frees_its_path() {
+        let base = base();
+        let mut plain = base.clone();
+        unlink(&mut plain, 2, 11, None);
+        rename(&mut plain, 1, "b", 11);
+        let decision = judge(&base, &base, &plain, &BTreeMap::new()).unwrap();
+        assert!(
+            decision
+                .collisions
+                .iter()
+                .any(|c| c.kind == CollisionKind::Name)
+        );
+        assert_eq!(
+            path(&decision.snapshot.names[&MergeFileIdentity(1)]).unwrap(),
+            Some("a")
+        );
+        assert_eq!(
+            path(&decision.snapshot.names[&MergeFileIdentity(2)]).unwrap(),
+            Some("b")
+        );
+
+        let mut over = base.clone();
+        unlink(&mut over, 2, 11, Some(1));
+        rename(&mut over, 1, "b", 11);
+        let decision = judge(&base, &base, &over, &BTreeMap::new()).unwrap();
+        assert!(decision.collisions.is_empty());
+        assert_eq!(
+            path(&decision.snapshot.names[&MergeFileIdentity(1)]).unwrap(),
+            Some("b")
+        );
+        assert!(!decision.snapshot.files.contains_key(&MergeFileIdentity(2)));
     }
 
     // R10.3, finding 31: an agreeing delete of a file a rename-over named.

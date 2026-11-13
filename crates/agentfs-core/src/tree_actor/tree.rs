@@ -194,6 +194,20 @@ impl Tree {
         self.fresh_names.insert(object);
     }
 
+    /// The paths naming `object`, in path order.
+    pub(super) fn paths_of(&self, object: u64) -> impl Iterator<Item = &str> {
+        self.names
+            .iter()
+            .filter(move |(_, named)| **named == object)
+            .map(|(path, _)| path.as_str())
+    }
+
+    /// Whether any name reaches `object`. One no name reaches is an orphan: its close saves
+    /// nothing and its opens hold no keys.
+    pub(super) fn is_named(&self, object: u64) -> bool {
+        self.paths_of(object).next().is_some()
+    }
+
     pub(super) fn drop_object(&mut self, object: u64) {
         self.bytes.remove(&object);
         self.lines.remove(&object);
@@ -291,6 +305,17 @@ impl NameHistory {
     /// The head's path: None once the file is ended.
     pub(super) fn path(&self) -> Result<Option<&str>> {
         Ok(self.head_version()?.path.as_deref())
+    }
+
+    /// Whether the head ends the file: an unlink or a rename-over.
+    pub(super) fn is_ended(&self) -> Result<bool> {
+        Ok(self.path()?.is_none())
+    }
+
+    /// Whether this history's head is not `base`'s: the change it belongs to moved the name.
+    /// A file `base` has no history of moved.
+    pub(super) fn moved_since(&self, base: Option<&NameHistory>) -> bool {
+        base.is_none_or(|old| old.head != self.head)
     }
 
     /// Both histories' versions, keeping `self.head`; [`Error::Format`] where they record one
@@ -435,5 +460,39 @@ mod tests {
             format!("{:020}", EventNumber::new(7)),
             "00000000000000000007"
         );
+    }
+
+    #[test]
+    fn combine_keeps_its_head_and_refuses_a_version_recorded_twice_differently() {
+        let mut ours = NameHistory::created(EventNumber::new(1), "a".into());
+        let mut theirs = ours.clone();
+        ours.advance(EventNumber::new(5), Some("b".into()), None);
+        theirs.advance(EventNumber::new(6), Some("c".into()), None);
+        let combined = ours.combine(&theirs).unwrap();
+        assert_eq!(combined.head, EventNumber::new(5));
+        assert_eq!(
+            combined
+                .versions
+                .keys()
+                .map(|e| e.get())
+                .collect::<Vec<_>>(),
+            [1, 5, 6]
+        );
+
+        let mut other = NameHistory::created(EventNumber::new(1), "a".into());
+        other.advance(EventNumber::new(5), Some("elsewhere".into()), None);
+        assert!(matches!(ours.combine(&other), Err(Error::Format)));
+    }
+
+    #[test]
+    fn a_name_is_ended_by_a_head_with_no_path_and_moved_by_a_new_head() {
+        let created = NameHistory::created(EventNumber::new(1), "a".into());
+        assert!(!created.is_ended().unwrap());
+        assert!(created.moved_since(None));
+        assert!(!created.moved_since(Some(&created)));
+        let mut unlinked = created.clone();
+        unlinked.advance(EventNumber::new(2), None, None);
+        assert!(unlinked.is_ended().unwrap());
+        assert!(unlinked.moved_since(Some(&created)));
     }
 }

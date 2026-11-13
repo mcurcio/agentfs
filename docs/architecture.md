@@ -36,7 +36,7 @@ missing from these tables or a row names a module that no longer exists;
 | `lib.rs` | Crate root: the module list and the engine's overview |
 | `volume.rs` | Opens a state area: crash recovery, then the [`Recorder`](#the-synchronous-step) used at every boundary and the `Committer` that turns records into commits |
 | `record.rs` | What the journal stores: one record per change boundary, absolute state, never deltas |
-| `tree_actor/mod.rs` | The tree actor: composition only. A step is one unit of work: built, recorded in the journal, installed, copied out; opening and recovery; queue takes |
+| `tree_actor/mod.rs` | The tree actor: the actor, recovery and queue orchestration. A step is one unit of work: built, recorded in the journal, installed, copied out; opening and recovery; queue takes and their plans |
 | `tree_actor/history/mod.rs` | Tree history: snapshots read from and written to commits (`metadata.json`, `namespace.json`), object tables, the owners of direct saves, direct saves, queue entries and private checkouts |
 | `tree_actor/history/message.rs` | Every message a tree-view commit carries, its one home: each message's bytes (Root, direct saves, landings, syncs) and the readers of its trailers (target git-model §5) |
 | `tree_actor/history/refs.rs` | The ref layout of a tree volume's history, its one home: branches, queues and their entries, collision refs, object tables, and the tips that reach every save (target git-model §4) |

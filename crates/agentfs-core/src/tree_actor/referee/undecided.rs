@@ -52,7 +52,7 @@ pub(in crate::tree_actor) fn ended_files(
     for (id, _) in &undecided.names {
         let gone = !upstream.files.contains_key(id)
             && match upstream.names.get(id) {
-                Some(name) => name.path()?.is_none(),
+                Some(name) => name.is_ended()?,
                 None => false,
             };
         if gone {

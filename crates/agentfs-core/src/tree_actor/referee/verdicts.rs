@@ -76,7 +76,7 @@ pub(super) struct Verdicts {
 fn held_name(name: &NameHistory) -> Result<Held<crate::tree_actor::tree::EventNumber>> {
     Ok(Held {
         version: name.head,
-        live: name.path()?.is_some(),
+        live: !name.is_ended()?,
     })
 }
 
@@ -131,7 +131,7 @@ fn ended_by(
     prior: &PriorDecisions,
 ) -> Result<Option<Version>> {
     if let Some(name) = upstream.names.get(&id) {
-        return Ok(name.path()?.is_none().then_some(Version::Name {
+        return Ok(name.is_ended()?.then_some(Version::Name {
             file: id,
             version: name.head,
         }));
@@ -170,7 +170,7 @@ pub(super) fn verdicts(
         let Some(name) = incoming.names.get(id) else {
             continue;
         };
-        if base.names.get(id).is_some_and(|old| old.head == name.head) {
+        if !name.moved_since(base.names.get(id)) {
             continue;
         }
         let theirs = upstream.names.get(id);
@@ -190,7 +190,7 @@ pub(super) fn verdicts(
                 CollisionKind::Name,
             )),
         };
-        if name.path()?.is_none()
+        if name.is_ended()?
             && loss.is_none()
             && let Some(line) = unseen_upstream_line(base.files.get(id), upstream.files.get(id))?
         {
@@ -339,6 +339,23 @@ mod tests {
             judge(&deleted_p.lines[0], &deleted_c.lines[0], &graph),
             Verdict::Apply
         );
+    }
+
+    // R3e.2: the upstream already holds this very version (a line, a name).
+    #[test]
+    fn the_upstream_holding_the_same_version_drops_it() {
+        let root = save(&Lines::default(), b"one\n", 1);
+        let line = &root.lines[0];
+        assert_eq!(judge(line, line, &root.ancestors), Verdict::Drop);
+        let deleted = save(&root, b"", 2);
+        let line = deleted.lines.iter().find(|l| l.bytes.is_none()).unwrap();
+        assert_eq!(judge(line, line, &deleted.ancestors), Verdict::Drop);
+
+        let mut name = NameHistory::created(EventNumber::new(1), "a".into());
+        name.advance(EventNumber::new(2), None, None);
+        let held = held_name(&name).unwrap();
+        assert!(!held.live);
+        assert_eq!(verdict(&name, Some(held), held).unwrap(), Verdict::Drop);
     }
 
     #[test]
