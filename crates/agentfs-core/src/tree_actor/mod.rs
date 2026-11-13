@@ -912,8 +912,10 @@ impl Volume {
         Ok(volume)
     }
 
-    /// Every branch is a tree's, the root among them, and every fork's upstream
-    /// is a tree: else [`Error::Format`].
+    /// Every branch is a tree's, the root among them, and every entry of the
+    /// upstream map is a fork with a branch whose upstream is the root (forks are
+    /// made only of the root, and only the root's queue holds landings): else
+    /// [`Error::Format`].
     fn build_trees(&mut self) -> Result<()> {
         for (reference, head) in self.pointers.under("refs/heads/") {
             let id = parse_tree(reference.strip_prefix("refs/heads/").ok_or(Error::Format)?)?;
@@ -924,10 +926,9 @@ impl Volume {
             self.trees.insert(id, tree);
         }
         if self.trees.contains_key(&TreeId::Root)
-            && self
-                .upstreams
-                .values()
-                .all(|upstream| self.trees.contains_key(upstream))
+            && self.upstreams.iter().all(|(fork, upstream)| {
+                !fork.is_root() && upstream.is_root() && self.trees.contains_key(fork)
+            })
         {
             Ok(())
         } else {
@@ -2119,16 +2120,28 @@ impl Volume {
             },
         };
         let (handles, pages) = (&self.handles, &self.pages);
+        // The fold parsed every page write's tree; one that names none stops the
+        // compaction with the journal untouched, never a page write dropped.
+        let unparsed = std::cell::Cell::new(false);
         let retained = self
             .journal
             .retained(|record| match &record.entry {
                 Entry::Call { handle, .. } => handles.contains_key(handle),
-                Entry::PageWrite { tree, object, .. } => tree
-                    .parse()
-                    .is_ok_and(|tree| pages::holds(pages, tree, *object, record.seq)),
+                Entry::PageWrite { tree, object, .. } => match tree.parse() {
+                    Ok(tree) => pages::holds(pages, tree, *object, record.seq),
+                    Err(_) => {
+                        unparsed.set(true);
+                        true
+                    }
+                },
                 _ => false,
             })
             .map_err(CompactError::Before)?;
+        if unparsed.get() {
+            return Err(CompactError::Before(std::io::Error::other(
+                "a journalled page write names no tree",
+            )));
+        }
         self.journal.compact(&checkpoint, &retained)
     }
 
@@ -2551,7 +2564,7 @@ mod tests {
     #[test]
     fn recovery_refuses_a_journal_that_names_no_tree_as_one() {
         reopen_with(|_, _| {}).unwrap();
-        let cases: [(&str, CheckpointEdit); 5] = [
+        let cases: [(&str, CheckpointEdit); 7] = [
             ("a branch that is no tree", |pointers, _| {
                 let root = pointers["refs/heads/root"].clone();
                 pointers.insert("refs/heads/main".into(), root);
@@ -2567,6 +2580,12 @@ mod tests {
             }),
             ("an upstream map naming no tree", |_, upstreams| {
                 upstreams.insert("main".into(), "root".into());
+            }),
+            ("an upstream map's fork with no branch", |_, upstreams| {
+                upstreams.insert("fork/5".into(), "root".into());
+            }),
+            ("a fork whose upstream is not the root", |_, upstreams| {
+                upstreams.insert("fork/1".into(), "fork/1".into());
             }),
         ];
         for (case, edit) in cases {
@@ -2585,19 +2604,24 @@ mod tests {
         assert!(matches!(Volume::open(tmp.path()), Err(Error::Format)));
     }
 
-    /// A fork's landing in the root's queue is what `pending_from` sees, until
-    /// the root takes it.
+    /// A fork's landing in the root's queue is what `pending_from` sees, for
+    /// that fork alone, until the root takes it.
     #[test]
     fn pending_from_holds_while_a_forks_landing_is_queued() {
         let tmp = tempfile::tempdir().unwrap();
         let mut v = Volume::open(tmp.path()).unwrap();
         let fork = v.fork().unwrap();
+        let other = v.fork().unwrap();
         assert!(!v.pending_from(fork).unwrap());
         assert!(!v.pending_from(ROOT).unwrap(), "the root lands nowhere");
         let h = v.write_open(fork, "f", "w", true).unwrap();
         v.write(h, 0, b"x\n", false).unwrap();
         v.close(h).unwrap();
         assert!(v.pending_from(fork).unwrap());
+        assert!(
+            !v.pending_from(other).unwrap(),
+            "another fork's landing is not this fork's"
+        );
         while v.take_next(ROOT).unwrap() == Took::Taken {}
         assert!(!v.pending_from(fork).unwrap());
     }

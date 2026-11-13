@@ -112,8 +112,9 @@ A step writes its objects, checks and appends its record, then installs and copi
 - Recovery reads the journal, rebuilds the refs and trees, closes abandoned opens
   through the ordinary step and compacts. It refuses a missing journal, a missing
   `format` file, a lost object at a pointer's tip, and a journal that names a tree
-  by anything but its identity, has no root, gives the root an upstream or gives a
-  fork an upstream that is no tree. It deletes nothing outside a first init's own
+  by anything but its identity, has no root, gives the root an upstream, gives an
+  upstream to a fork with no branch, or gives a fork an upstream other than the root
+  (forks are made only of the root). It deletes nothing outside a first init's own
   marker.
 - Compaction keeps the journal at most `max(64 MiB, twice the last compacted
   length)` plus the live calls, and keeps only the page writes memory holds. A held

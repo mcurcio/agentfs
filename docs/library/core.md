@@ -648,10 +648,14 @@ whose saves are ordered by one actor. It is not the recorder above and does
 not share its state format. It holds an exclusive lease on its state area
 (`Volume::open(root)` fails with `Error::Busy` if another process holds it).
 Its recorded calls are `write_open`, `write`, `truncate`, `sync`, `close`,
-`rename` and `unlink`. `fork()` makes a sandbox branch, `read` and `files`
-read saved bytes, and `take_next` and `progress` move queued changes between
-a tree and its upstream. A close that leaves the bytes as they were commits
-nothing. `Error::errno()` maps each error to the errno a file call answers
+`rename` and `unlink`. Every call names its tree by a `TreeId`: `root`, the
+tree with no upstream, or `fork/<n>`, made at journal event `n`. `trees()`
+lists them, the root first and then the forks by number; `TreeId` parses from
+and prints as that text. `fork()` makes a fork of the root and returns its
+`TreeId`, `read` and `files` read saved bytes, and `take_next` and `progress`
+move queued changes between a tree and its upstream. `drain_changed` returns
+the objects queue takes changed, each with its `TreeId`. A close that leaves
+the bytes as they were commits nothing. `Error::errno()` maps each error to the errno a file call answers
 with. The behaviour, the state format and the current limits (flat files
 only) are in [trees](../trees.md); the FUSE adapter is in the [filesystem
 layer](filesystem.md#tree-views).

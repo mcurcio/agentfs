@@ -721,3 +721,23 @@ Not blocking; the suite is built and green. Findings about the brief and the doc
 3. **The design's "nothing else on them changes" misses git-model §1's diagram**, whose node read
    `refs/heads/(the root's name)`: now `refs/heads/root`, the same edit as the table. system.md:78 (`Root, //
    refs/heads/<root>`) is a design page outside §4's list and is left for its own step.
+
+## 2026-11-13, step 5b fix round (S2, review findings)
+
+1. **S2 had not landed when S1 and S3 were reported done.** Built here: `TreeNames::new()` takes no root (a unit
+   struct; `name(TreeId::ROOT)` is `MODEL_ROOT`), the reserved-name assert, `the_roots_name_changes_no_digest` and
+   `tree_names_refuses_a_fork_or_transaction_name` are gone, and the callers drop the argument. MODEL.md, VERIFYING.md
+   and module-cut.md (rows 3c, 4, 5b and the module text) now say the root is `root`.
+2. **The design's §9 says "a plain `pending_from` test" proves the queue prefix.** With one fork it could not tell
+   `tree_trailer(..) == Some(tree)` from `.is_some()` (a mutant survived). The test now holds a second fork and checks
+   `pending_from(other) == false` while the first fork's landing waits; the mutant fails it.
+3. **S1 generalised `enqueue_moves` through the upstream map while `take_next` and `rebuild_owners` read only the
+   root's queue as landings** (two deciders). Forks are made only of the root, so recovery now refuses (`Format`) an
+   upstream map entry whose upstream is not the root, or whose fork has no branch (the reviewer's unbounded-queue
+   case). Forking a fork needs both readers widened with it.
+4. **Compaction dropped a page write whose tree did not parse** (`is_ok_and`). It now fails before the rename, the
+   journal untouched, as every `CompactError::Before` does.
+5. **`tree_git::missing_objects_names_what_is_lost_of_a_tip_and_not_its_parents` is not a root-user failure.** It fails
+   on the host's git 2.43.0 (`fatal: bad object` for a missing tip given to `rev-list --missing=print`) and passes 5/5
+   as root in `agentfs-dev` with git 2.47.3 (`ci/git-release`). `TreeGit::missing_objects` therefore depends on a git
+   newer than 2.43; not fixed in 5b.
