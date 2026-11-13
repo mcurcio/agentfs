@@ -28,8 +28,9 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-use super::tree::EventNumber;
-use super::{Call, Draft, Error, Handle, Result, Saved, TreeId, Volume};
+use super::{Call, Handle};
+use crate::tree_actor::tree::EventNumber;
+use crate::tree_actor::{Draft, Error, Result, Saved, TreeId, Volume};
 
 /// The bases' unit. Every kernel page size is a multiple of it, so a base map at
 /// this size is exact whatever the kernel's own page size is.
@@ -37,7 +38,7 @@ const PAGE: u64 = 4096;
 
 /// One contiguous run of bytes a page write changed, in file offsets.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(super) struct Run {
+pub(in crate::tree_actor) struct Run {
     pub offset: u64,
     pub bytes: Vec<u8>,
 }
@@ -61,7 +62,7 @@ impl Run {
 /// The per-file state of a file with a write-open. It lives from the first
 /// write-open to the close of the last one.
 #[derive(Default)]
-pub(super) struct ObjectPages {
+pub(in crate::tree_actor) struct ObjectPages {
     /// Arrival-order length, kept from the first write-open by arithmetic.
     len: u64,
     /// Cache: built at the first fill or page write, dropped at each save.
@@ -77,7 +78,7 @@ pub(super) struct ObjectPages {
 /// The runs of `page`, which starts at file offset `at`, that differ from
 /// `base`. Bytes past the end of `base` compare with zero, which is what the
 /// kernel fills a page's tail with. Pure; adjacent changed bytes make one run.
-pub(super) fn changed_runs(base: &[u8], page: &[u8], at: u64) -> Vec<Run> {
+pub(in crate::tree_actor) fn changed_runs(base: &[u8], page: &[u8], at: u64) -> Vec<Run> {
     let mut runs: Vec<Run> = Vec::new();
     for (index, byte) in page.iter().enumerate() {
         if *byte == base.get(index).copied().unwrap_or(0) {
@@ -146,7 +147,7 @@ fn over_touched(run: &Run, touched: &[(u64, u64)]) -> Vec<Run> {
 /// earlier calls touched. A store that an earlier close saved stays where later
 /// saves left it, unless this open's replay would overwrite it (R1.4, R9.16's
 /// note: a later mapped write stands against a later close). Pure.
-pub(super) fn calls_for_close(
+pub(in crate::tree_actor) fn calls_for_close(
     saved_len: u64,
     own: &[(u64, Call)],
     writes: &[(u64, Run)],
@@ -322,7 +323,11 @@ impl Volume {
     }
 
     /// A queue take: [`Volume::step`] plus a note of the files it changed.
-    pub(super) fn pages_take<F>(&mut self, tree: TreeId, build: F) -> Result<(EventNumber, Saved)>
+    pub(in crate::tree_actor) fn pages_take<F>(
+        &mut self,
+        tree: TreeId,
+        build: F,
+    ) -> Result<(EventNumber, Saved)>
     where
         F: FnOnce(&Self, EventNumber) -> Result<Draft>,
     {
@@ -368,7 +373,7 @@ impl Volume {
     /// Hook: a write-open of `object` in `tree` is on record. Recovery calls it
     /// too. No I/O. A later open's view starts with the file's unsaved page
     /// writes (R1.3).
-    pub(super) fn pages_opened(&mut self, tree: TreeId, object: u64) {
+    pub(in crate::tree_actor) fn pages_opened(&mut self, tree: TreeId, object: u64) {
         let key = (tree, object);
         let Some(state) = self.pages.get(&key) else {
             let len = self
@@ -402,7 +407,12 @@ impl Volume {
     }
 
     /// Hook: a descriptor call on `object` is in the journal. No I/O.
-    pub(super) fn pages_note_call(&mut self, tree: TreeId, object: u64, call: &Call) {
+    pub(in crate::tree_actor) fn pages_note_call(
+        &mut self,
+        tree: TreeId,
+        object: u64,
+        call: &Call,
+    ) {
         if let Some(state) = self.pages.get_mut(&(tree, object)) {
             state.len = len_after(state.len, call);
             if let Some(image) = &mut state.image
@@ -416,7 +426,7 @@ impl Volume {
     /// Hook: `closing` is about to save, on a copy of its tree: this cannot
     /// change anything, because the save may still fail. Returns the calls its
     /// save applies to the saved bytes, by journal number.
-    pub(super) fn pages_calls_for_close(&self, closing: &Handle) -> Vec<Call> {
+    pub(in crate::tree_actor) fn pages_calls_for_close(&self, closing: &Handle) -> Vec<Call> {
         let saved_len = self
             .trees
             .get(&closing.tree)
@@ -437,7 +447,7 @@ impl Volume {
     /// past its commit point and installed. Drops the image, so the next fill
     /// rebuilds it over the saved bytes, or the whole state with the last
     /// write-open. No I/O.
-    pub(super) fn pages_saved(&mut self, tree: TreeId, object: u64, seq: u64) {
+    pub(in crate::tree_actor) fn pages_saved(&mut self, tree: TreeId, object: u64, seq: u64) {
         let key = (tree, object);
         if self
             .handles
@@ -455,7 +465,7 @@ impl Volume {
 
     /// The files with a live write-open whose earlier close moved `saved_through`,
     /// for a checkpoint. This is the only home of that number while serving.
-    pub(super) fn pages_saved_through(&self) -> Vec<(String, u64, u64)> {
+    pub(in crate::tree_actor) fn pages_saved_through(&self) -> Vec<(String, u64, u64)> {
         self.pages
             .iter()
             .filter(|(_, state)| state.saved_through > 0)
@@ -465,7 +475,7 @@ impl Volume {
 
     /// Hook: recovery found these page writes and this `saved_through` for a
     /// file with a live write-open, before its closes run. No I/O.
-    pub(super) fn pages_restore(
+    pub(in crate::tree_actor) fn pages_restore(
         &mut self,
         tree: TreeId,
         object: u64,
@@ -480,7 +490,7 @@ impl Volume {
 
 /// Whether memory holds the page write numbered `seq` of `object` in `tree`: what
 /// a compaction keeps. `writes` is in journal order.
-pub(super) fn holds(
+pub(in crate::tree_actor) fn holds(
     pages: &BTreeMap<(TreeId, u64), ObjectPages>,
     tree: TreeId,
     object: u64,

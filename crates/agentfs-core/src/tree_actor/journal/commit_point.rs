@@ -2,8 +2,9 @@
 //! (target git-model §3).
 
 use super::{CompactError, Entry, OpenRecord, Record};
+use crate::tree_actor::recording::pages;
 use crate::tree_actor::stages::{Timer, Which};
-use crate::tree_actor::{Error, Result, Volume, now_ns, pages, upstream_config};
+use crate::tree_actor::{Error, Result, Volume, now_ns, upstream_config};
 
 /// When a journal this long after its last compaction compacts again.
 /// Constants, not a setting: restart memory is at most this plus live calls.

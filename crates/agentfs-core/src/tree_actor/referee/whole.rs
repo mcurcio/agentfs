@@ -109,7 +109,7 @@ mod tests {
         let mut applied = Snapshot::default();
         applied.names.insert(
             MergeFileIdentity(1),
-            crate::tree_actor::NameHistory::created(EventNumber::new(1), "a".into()),
+            crate::tree_actor::tree::NameHistory::created(EventNumber::new(1), "a".into()),
         );
         let decision = whole(
             &Snapshot::default(),

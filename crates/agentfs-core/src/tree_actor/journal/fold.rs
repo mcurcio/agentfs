@@ -6,7 +6,8 @@ use git2::Oid;
 
 use super::{Entry, Frame, OpenRecord, PointerChange, Record, RunHead};
 use crate::tree_actor::pointers::Pointers;
-use crate::tree_actor::{Call, Error, Result, TreeId, pages};
+use crate::tree_actor::recording::{Call, pages};
+use crate::tree_actor::{Error, Result, TreeId};
 use crate::tree_git::RefUpdate;
 
 /// A tree string the journal stores, parsed once, at the fold: one that names no

@@ -41,7 +41,8 @@ missing from these tables or a row names a module that no longer exists;
 | `tree_actor/journal/commit_point.rs` | The actor's appends to the journal and when it compacts, with the checkpoint a compaction writes |
 | `tree_actor/journal/fold.rs` | What a journal's frames add up to, pure: pointers, upstreams, live opens with their calls, and page writes (target git-model §12) |
 | `tree_actor/pointers.rs` | Branches, queue entries, collision refs and object tables as the journal leaves them: pure, no I/O |
-| `tree_actor/pages.rs` | The kernel's one page cache per file: page fills, page writes and the size replies for shared mappings (rules ledger, R1.4) |
+| `tree_actor/recording/mod.rs` | Recording: a tree's file calls (open, read, write, truncate), each journalled before it returns, and the steps that save them: create, close, rename, unlink |
+| `tree_actor/recording/pages.rs` | The kernel's one page cache per file: page fills, page writes and the size replies for shared mappings (rules ledger, R1.4) |
 | `tree_actor/queue.rs` | Eligibility and prefix selection for writer-locked queue entries |
 | `tree_actor/referee/mod.rs` | The referee: every line and name rule of a fork and its upstream, pure. `land` composes verdicts, names, placing and whole into a decision; `sync` keeps a fork's undecided versions; `touches` gives a step's lock keys |
 | `tree_actor/referee/ancestry.rs` | The one ancestry walk (`descends`) over names and lines alike, and the one union of line ancestries |
