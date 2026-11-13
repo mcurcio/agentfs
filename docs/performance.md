@@ -339,6 +339,33 @@ warning and never fails the job.
   at 1, 2 and 5 times each power of ten), not a total scaled to 100,000.
 - The report is the job's artifact `trees-figures-<fs>`.
 
+Figures from one run (`image` run 43528919742, commit c22a820, GitHub
+`ubuntu-24.04` runners). Every workload missed its bar on both
+filesystems:
+
+| Workload | ext4 | XFS |
+|---|---|---|
+| `close_4k`, 200 saves in a tree of about 23 files | p50 125.9 ms, p99 149.1 ms | p50 106.7 ms, p99 123.3 ms |
+| `create`, created by the 300 s deadline | 248 | 271 |
+| `close_64m` | 28.4 s | 28.7 s |
+
+The cost of one create grows with the files in the tree (the median save
+in each window, ms):
+
+| Files in the tree | ext4 | XFS |
+|---|---|---|
+| about 25 | 255 | 218 |
+| about 44 | 360 | 306 |
+| about 74 | 524 | 437 |
+| about 124 | 842 | 702 |
+| about 224 | 1,400 | 1,186 |
+| 272 (ext4), 294 (XFS) | 1,957 | 1,769 |
+
+Every save rewrites the whole tree ([Large files in the tree are
+slow](#large-files-in-the-tree-are-slow)), so a save costs 6 to 7 ms more
+for each file already in the tree, and creating many files costs about the
+square of their count.
+
 ## Performance budget
 
 The budget is
