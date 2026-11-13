@@ -1,6 +1,7 @@
 Removes the fix of finding-51-sync-fast-forward.trace: the shows-the-same guard
 on a sync's fast-forward (introduced without it in 6049b1b, fixed in e9ab747).
-Base: 7474470; applies at an offset once trees are named by identity (`TreeId`).
+Base: 7474470; the fix now lives in tree_actor/history/take.rs (module cut 5.2), where
+this hunk applies.
 git: the release in ci/git-release.
 Re-record (crates/agentfs-model/VERIFYING.md, "A regression found on the engine")
 in a scratch worktree with this applied. Give it fresh volumes, since --record
@@ -19,9 +20,9 @@ refuses a non-empty OUT: export MODEL_TARGET_VOLUME=mt-fixture MODEL_WORK_VOLUME
 Verified 2026-11-12: these commands reproduce the committed trace byte for byte (cmp).
 `git apply` skips these lines.
 
---- a/crates/agentfs-core/src/tree_actor/mod.rs
-+++ b/crates/agentfs-core/src/tree_actor/mod.rs
-@@ -1761,7 +1761,7 @@
+--- a/crates/agentfs-core/src/tree_actor/history/take.rs
++++ b/crates/agentfs-core/src/tree_actor/history/take.rs
+@@ -288,7 +288,7 @@
              // for the upstream and the sync shows what the upstream's commit shows (the
              // model's `World::sync`). The fork then takes that commit's line maps and names,
              // so a version the upstream decided against stays in history only (finding 51).

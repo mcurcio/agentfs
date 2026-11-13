@@ -36,7 +36,9 @@ missing from these tables or a row names a module that no longer exists;
 | `lib.rs` | Crate root: the module list and the engine's overview |
 | `volume.rs` | Opens a state area: crash recovery, then the [`Recorder`](#the-synchronous-step) used at every boundary and the `Committer` that turns records into commits |
 | `record.rs` | What the journal stores: one record per change boundary, absolute state, never deltas |
-| `tree_actor/mod.rs` | The tree actor: recorded byte calls, the ordered step, recovery from the journal, line-map storage, queue takes, the root and one sandbox; separate from the production recorder |
+| `tree_actor/mod.rs` | The tree actor: composition only. A step is one unit of work: built, recorded in the journal, installed, copied out; opening and recovery; queue takes |
+| `tree_actor/history/mod.rs` | Tree history: snapshots read from and written to commits (`metadata.json`, `namespace.json`), object tables, the owners of direct saves, direct saves, queue entries and private checkouts |
+| `tree_actor/history/take.rs` | Queue takes as history: a landing judged by the referee into its upstream, and a fork's prefix sync planned and built from its upstream's commits |
 | `tree_actor/journal/mod.rs` | The actor's journal: salted checksummed frames, the commit point for calls and pointer steps, torn-tail and corruption rules, compaction (target git-model §3) |
 | `tree_actor/journal/commit_point.rs` | The actor's appends to the journal and when it compacts, with the checkpoint a compaction writes |
 | `tree_actor/journal/fold.rs` | What a journal's frames add up to, pure: pointers, upstreams, live opens with their calls, and page writes (target git-model §12) |
