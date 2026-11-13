@@ -767,3 +767,26 @@ Not blocking; the suite is built and green. Findings about the brief and the doc
    `Upstreams` stays in `history/upstreams.rs` as the 5.3 page places it, so `journal` still reads `history` one way.
 4. **Commit 3d4a439 (the `ci_pipes_never_end_in_an_early_exit` test and the `ci/*.sh` pipefail edits) sits in the
    5.1-5.3 range but belongs to none of the steps.** It changes no engine code; the PR description should list it.
+
+## 2026-11-13, M1 S2 (release figures): the §8 workloads do not finish in the tracer job
+
+1. **The design's §8 says the flat workloads are "scaled to finish in the tracer job"; on the release image they do
+   not.** Image run 43500960004 (commit 6d092da, both legs cancelled at the job's 45-minute limit): `close_4k` took
+   15-18 s and reported p50 75.3 ms, p99 91.4 ms on ext4 and p50 88.6 ms, p99 107.2 ms on XFS (the recording
+   engine's budget is p50 3.5 ms). `create_1000` then ran for 44 minutes on each filesystem without finishing; a
+   local debug build had created 482 of the 1,000 files after about 19 minutes. Every save rewrites the whole tree
+   (performance.md, "Large files in the tree are slow"), so a save's cost grows with the files in the tree and the
+   1,000 creates cost about the square of the count. `close_64m` never ran.
+2. **The S2 page's linear extrapolations follow from the same wrong premise.** `extrapolated_100000_s` scales
+   `create_1000` linearly, but the per-save cost grows with the tree, so a linear figure understates 100,000
+   creates by orders of magnitude.
+3. **What a re-cut has to choose (the frozen schema fixes `count: 1000`):** a smaller create count, or a deadline
+   with the count reached in the report; how to extrapolate a cost that grows with the tree (or no extrapolation);
+   and whether `close_64m` gets its own deadline. The commit was reverted on the branch (it held the image run red);
+   the work is on `wip/m1-s2` (6d092da). The local mutation probe passed: a 50 ms sleep in `run_step` moved a debug
+   build's `close_4k` p50 from 47.6 ms to 99.3 ms and flipped `warn` against a 70 ms bar, so the timed window holds
+   the save.
+4. **The guarantee string `committed before close returns` is not literally what the view does.** The view saves a
+   file on FUSE `release`, which the kernel sends after `close(2)` returns; the save is committed before the view
+   answers any later request (one session thread, requests in order), which is what the tracer's step 2 and
+   `trees-figures.py`'s timed stat rely on. The report's frozen string should say that, or the design should.
