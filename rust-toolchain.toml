@@ -1,0 +1,8 @@
+# The one pin of the Rust toolchain: rustup reads it for cargo here, CI's workflows install
+# it (`rustup toolchain install`), and a test checks that the Dockerfile's Rust image, which
+# the development image builds from too (`ci/dev-image.sh`), is this release
+# (docs/development.md, "The Rust toolchain").
+[toolchain]
+channel = "1.100.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

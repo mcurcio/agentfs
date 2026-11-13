@@ -160,7 +160,7 @@ Rules:
 ## The no-root toolchain
 
 Some agent containers have no root and no C compiler. Earlier sessions used:
-- **Rust:** stable via rustup.
+- **Rust:** rustup, which installs the release `rust-toolchain.toml` pins on first use ([development](docs/development.md#the-rust-toolchain)).
 - **C compiler:** Zig as the C compiler, through wrappers in `~/.local/bin`: `cc`, `c++`, `ar`, `ranlib`, and `gcc` as a symlink to `cc`. `cc` drops `--target` flags and runs `zig cc -target x86_64-linux-gnu.2.28 -fno-sanitize=undefined`, because libgit2's sha1dc trips UBSan.
 - **gh:** the static binary.
 - **Debian packages without root:**

@@ -10,10 +10,11 @@
 #
 #   docker build -t agentfs .
 #
-# Base images are pinned by digest; update both together with the Rust
-# toolchain (README "Building").
+# Base images are pinned by digest. The Rust image is the release
+# rust-toolchain.toml pins, which a test checks; change them together
+# (docs/development.md, "The Rust toolchain").
 
-ARG RUST_IMAGE=rust:1.99-trixie@sha256:6ff07edce8775d0f64be7aba9197229407301bddf2054d62c27b541a6238a181
+ARG RUST_IMAGE=rust:1.100-trixie@sha256:e19840879045c951c905d0eaa9887f3439c62000e429963371b376bac8d38c31
 ARG RUNTIME_IMAGE=debian:trixie-slim@sha256:a29215f6a35e51e22adffa17f89e9d2ef06214e64a2bad10d765c46aea49f11f
 
 FROM ${RUST_IMAGE} AS build

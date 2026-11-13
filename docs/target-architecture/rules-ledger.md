@@ -375,8 +375,8 @@ of their day: "main" is the root, a "sandbox" is a fork, a "parent" is an upstre
   instead the changes are being accumulated and only get committed when the transaction itself closes/commits".
   That model differs from the model's and git-model.md's, where each save inside a transaction is a commit on its
   `txn/<n>` branch and the transaction's commit lands them as one change into its fork: what a fork receives is the
-  same, the history inside the transaction is not. That difference is an open question for the owner. Revisable: it
-  is his answer, not a rule. Cost: some commits that would commit with R10.4 and R10.8 switched off lose whole. The
+  same, the history inside the transaction is not. Asked about that difference, the owner answered, 2026-11-13: "a
+  transaction should be recorded as one commit". Revisable: it is his answer, not a rule. Cost: some commits that would commit with R10.4 and R10.8 switched off lose whole. The
   model's referee is given no direction, so it cannot tell a landing from a transaction's commit.
   Tests: `r10_a_transactions_unfinished_line_before_a_kept_line_loses_whole`,
   `r10_a_transactions_line_after_the_forks_unfinished_line_loses_whole`

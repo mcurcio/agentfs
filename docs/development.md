@@ -10,6 +10,22 @@ cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
+### The Rust toolchain
+
+`rust-toolchain.toml` at the root pins one Rust release, with rustfmt and
+clippy. rustup reads it for every cargo command in the checkout and installs
+that release on first use. CI's workflows install it with
+`rustup toolchain install`, so a new stable release cannot change a build
+until the pin moves. The [Dockerfile](../Dockerfile)'s Rust image is the
+same release, pinned by digest, and `ci/dev-image.sh` builds the development
+image from it. A test (`rust_toolchain_is_pinned_once`) fails when a
+workflow names its own toolchain or the Dockerfile's image is another
+release. To move the pin, change the file and the Dockerfile's
+`RUST_IMAGE` (tag and digest) together, fix what the new release's lints
+find, and rebuild the development image.
+
+### What the build needs
+
 libgit2 is built from source, so a C compiler is needed. Local, `file://`
 and plain `http://` remotes work in the default build. Two features add
 transports: `https` links OpenSSL (`libssl-dev` and `pkg-config` on Debian

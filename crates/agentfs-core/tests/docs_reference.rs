@@ -405,6 +405,59 @@ fn workflows_pin_runners() {
     assert!(problems.is_empty(), "{}", problems.join("\n"));
 }
 
+/// `rust-toolchain.toml` is the one pin of the Rust release: no workflow names
+/// its own toolchain, and the Dockerfile's Rust image, which the development
+/// image builds from too, is that release (docs/development.md, "The Rust
+/// toolchain").
+#[test]
+fn rust_toolchain_is_pinned_once() {
+    let root = workspace();
+    let pin = std::fs::read_to_string(root.join("rust-toolchain.toml")).unwrap();
+    let channel = pin
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("channel = "))
+        .expect("rust-toolchain.toml has a channel")
+        .trim_matches('"')
+        .to_string();
+    assert!(
+        channel.split('.').count() == 3 && channel.split('.').all(|p| p.parse::<u32>().is_ok()),
+        "rust-toolchain.toml pins a release, not {channel:?}"
+    );
+    let mut problems = Vec::new();
+    for entry in std::fs::read_dir(root.join(".github/workflows")).unwrap() {
+        let path = entry.unwrap().path();
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        let text = std::fs::read_to_string(&path).unwrap();
+        for (n, line) in text.lines().enumerate() {
+            let line = line.trim();
+            if line.contains("rust-toolchain@")
+                || line.starts_with("toolchain:")
+                || line.contains("RUSTUP_TOOLCHAIN")
+                || (line.contains("rustup") && line.contains("default"))
+            {
+                problems.push(format!("{name}:{}: {line}", n + 1));
+            }
+        }
+    }
+    let dockerfile = std::fs::read_to_string(root.join("Dockerfile")).unwrap();
+    let image = dockerfile
+        .lines()
+        .find_map(|l| l.strip_prefix("ARG RUST_IMAGE="))
+        .expect("the Dockerfile has ARG RUST_IMAGE");
+    // The official image's tag names the release without its patch when it is .0.
+    let release = channel.strip_suffix(".0").unwrap_or(&channel);
+    if !image.starts_with(&format!("rust:{release}-")) || !image.contains("@sha256:") {
+        problems.push(format!(
+            "Dockerfile: RUST_IMAGE={image} is not rust:{release}-... pinned by digest"
+        ));
+    }
+    assert!(
+        problems.is_empty(),
+        "rust-toolchain.toml pins {channel}; name it nowhere else:\n{}",
+        problems.join("\n")
+    );
+}
+
 /// Every file under `dir`, recursively.
 fn files_under(dir: &Path, out: &mut Vec<PathBuf>) {
     for entry in std::fs::read_dir(dir).unwrap() {
