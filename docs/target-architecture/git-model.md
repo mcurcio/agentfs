@@ -50,7 +50,7 @@ shared remote.
 ```mermaid
 flowchart TB
   subgraph R["the volume's history repository: one object store"]
-    M["refs/heads/(the root's name)"]
+    M["refs/heads/root"]
     F1["refs/heads/fork/1: fork A"]
     F2["refs/heads/fork/2: fork B"]
     F3["refs/heads/fork/3: fork C, inside A"]
@@ -76,7 +76,7 @@ flowchart TB
 | agentfs term | git term | In the model |
 |---|---|---|
 | volume | one repository (one object store, many branches) | `World` |
-| tree (the root, the tree with no upstream, the name it is published under configured: [root branch name](future/root-branch-name.md); a fork) | a branch, with its own working tree and index | `refs/heads/<root>`, `refs/heads/fork/<id>` |
+| tree (the root, the tree with no upstream; a fork) | a branch, with its own working tree and index | `refs/heads/root`, `refs/heads/fork/<id>` |
 | fork's upstream | the branch's upstream, in the same repository (`branch.fork/3.remote = .`) | `Fork::upstream` |
 | nested fork | a branch whose upstream is another fork's branch | `create_fork(f)` |
 | client, writer | the `Agentfs-Writer` trailer; git's author and committer are one fixed service identity | `Client`, `fork.writer` |
@@ -198,7 +198,7 @@ Direct by c3
 
 Agentfs-Writer: c3            # exactly one writer: a client, or `agentfs` for a sync and the Root commit
 Agentfs-Cause: Direct         # Direct (a save) | Landing | Sync | Transaction t7 | Root
-Agentfs-Tree: fork/3          # <root> | fork/<id>: the tree it was made for (a transaction's commit names its fork)
+Agentfs-Tree: fork/3          # root | fork/<id>: the tree it was made for, by identity, never a published name (a transaction's commit names its fork)
 ```
 
 A take that decides a collision (R5.1, R9.9) records it in its own result commit, a landing or transaction commit, with
@@ -213,8 +213,8 @@ Landing by c3
 
 Agentfs-Writer: c3
 Agentfs-Cause: Landing
-Agentfs-Tree: <root>
-Agentfs-Collision: <root> a Line <losing commit> refs/collisions/1 a1 c3.2 m1.1
+Agentfs-Tree: root
+Agentfs-Collision: root a Line <losing commit> refs/collisions/1 a1 c3.2 m1.1
 ```
 
 A merge originates nothing: each line it adds comes from a non-first parent, and it names its second parent's
@@ -230,7 +230,7 @@ Ref names are a design choice; the model uses the first five (with `refs/collisi
 
 | Ref | Holds | Kept locally | Pushed to the shared remote (design choice) |
 |---|---|---|---|
-| `refs/heads/<root>` | the root's decided line | always | yes, under its published name, in the volume's own prefix ([root branch name](future/root-branch-name.md)) |
+| `refs/heads/root` | the root's decided line | always | yes, under its published name, in the volume's own prefix ([root branch name](future/root-branch-name.md)) |
 | `refs/heads/fork/<id>` | a fork's line, syncs included | until the fork drops | only where Replication pushes fork lines (A4); its losing commits go regardless, as collision refs |
 | `refs/heads/txn/<id>` | an open transaction: the commit it began at, never moved (its saves stage in its index) | until commit or rollback | never |
 | `refs/collisions/<loser>` | one per losing change, named by its losing commit (the model numbers them, one per losing change, with a record for each file and cause it lost by) | past the fork's drop | yes, by Replication, under `refs/agentfs/<volume>/collisions/` ("i want to know who changed what when", 2026-11-03) |

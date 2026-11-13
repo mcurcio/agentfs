@@ -707,3 +707,17 @@ Not blocking; the suite is built and green. Findings about the brief and the doc
    not engine names).
 5. **The design's §8 table has `rebuild_owners` read "TreeId::Root's queue"**; kept as written (landings queue only in
    the root's queue while forks fork only the root). A fork of a fork would need every upstream's queue there.
+
+## 2026-11-13, step 5b S3 (baseline pages)
+
+1. **The brief says S1 and S2 are landed; S2 is not** (branch head eeec466: `world::TreeNames::new(root: &str)` still
+   takes and checks a configured name, and `world.rs` still cites the deleted `ENGINE_ROOT`). S3 lands only the edits
+   that hold after S1: git-model.md and rules-ledger.md. MODEL.md:3–4 ("branch `refs/heads/root`") and module-cut.md
+   (row 5b "Built"; "it is `root`, as in the engine") describe S2's result and wait for S2's commit.
+2. **The design's §4 edits predate the plan PR's rewording** of git-model.md (the tree row, the refs table) and
+   rules-ledger.md:35–36, which already say "the name it is published under is configured". The branch wins: only
+   `<root>` becomes `root`; the root-branch-name links in the refs table and the ledger stay. git-model's `Agentfs-Tree`
+   comment keeps the branch's "(a transaction's commit names its fork)" (0f63eb6) and drops the design's `txn/<id>`.
+3. **The design's "nothing else on them changes" misses git-model §1's diagram**, whose node read
+   `refs/heads/(the root's name)`: now `refs/heads/root`, the same edit as the table. system.md:78 (`Root, //
+   refs/heads/<root>`) is a design page outside §4's list and is left for its own step.
