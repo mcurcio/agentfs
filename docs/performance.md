@@ -307,6 +307,38 @@ are read once at open and the sync plan asks git once per commit, not
 once per line. About a third of the run is inside `queue_plan` but in none
 of its measured parts.
 
+## Tree views, release build
+
+The `image` workflow runs three flat workloads through a tree view of the
+built image, on its release build, with the state area on a fresh loop
+filesystem: once on ext4 and once on XFS (`ci/e2e-trees-tracer.sh
+--figures`, driving `ci/trees-figures.py`). Each figure is held to the
+recording engine's budget in `ci/trees-budget.json`. A missed bar prints a
+warning and never fails the job.
+
+| Workload | What it does | Deadline | Bar |
+|---|---|---|---|
+| `close_4k` | Rewrites and closes a 4 KiB file 200 times | 60 s | p50 3.5 ms, finished |
+| `create` | Creates one-line files in the root, up to 50,000 | 300 s | 50,000 created: the engine's 100,000 in 600 s, over half the time |
+| `close_64m` | Writes a 64 MiB file in 1 MiB blocks and closes it | 120 s | The engine's close of a dirty 1 GiB file (12 s on ext4, 8 s on XFS), unscaled |
+
+- **Each save is timed to its commit.** Every timed save ends with a
+  `stat` of the file. The view saves a file on the kernel's release, which
+  reaches agentfs just after `close(2)` returns, and it answers requests
+  one at a time and in order. So the `stat` returns only once the save is
+  committed: the guarantee each figure carries is "committed before the
+  view answers any later request".
+- **Each workload has its own deadline.** A workload reports what it
+  reached by its deadline: the saves made, or the bytes written. A save the
+  deadline catches gets 30 s more. A view still stuck after that has its
+  FUSE connection aborted, and the workloads after it are reported as not
+  run.
+- **Nothing is extrapolated.** A save's cost grows with the files in the
+  tree, so `create` reports the cost of a save against the tree's size
+  (`cost_by_tree_size`: the median and the largest save in windows ending
+  at 1, 2 and 5 times each power of ten), not a total scaled to 100,000.
+- The report is the job's artifact `trees-figures-<fs>`.
+
 ## Performance budget
 
 The budget is

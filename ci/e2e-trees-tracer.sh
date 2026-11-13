@@ -4,8 +4,11 @@
 # workload in a second container as 10000:10000 that reaches the mount by
 # propagation, as the Docker example does (docs/docker.md).
 #
-#   ci/e2e-trees-tracer.sh            the steps below
-#   ci/e2e-trees-tracer.sh diagnose   the agentfs container's log and history
+#   ci/e2e-trees-tracer.sh                 steps 1 to 3 below
+#   ci/e2e-trees-tracer.sh --figures FS    steps 1 to 4, with the state area
+#                                          on a fresh loop filesystem, FS
+#                                          ext4 or xfs (sudo)
+#   ci/e2e-trees-tracer.sh diagnose        the agentfs container's log and history
 #
 # 1. `trees init --volume t` twice gives one id, `created` then `found`;
 #    `--volume u` at the same state area exits 1 with every file's bytes
@@ -17,6 +20,11 @@
 #    is lazily unmounted and agentfs mounts again: every write the workload saw
 #    answered is in history, with its pod trailers, and a restarted workload
 #    writes through the new mount.
+# 4. (--figures) The flat workloads of ci/trees-figures.py through the mount,
+#    on the image's release build, each against its own deadline: the report
+#    is $RUNNER_TEMP/trees-figures-FS.json (docs/performance.md, "Tree views,
+#    release build"), a missed bar in ci/trees-budget.json is a warning, and
+#    the root's history holds the last save each workload saw answered.
 #
 # Needs the agentfs image as $AGENTFS_IMAGE (default agentfs:ci), the fuse
 # module loaded, a shared mount under $RUNNER_TEMP (as / is on systemd
@@ -34,6 +42,16 @@ VIEW=$MOUNT_DIR/root
 POD=(-e AGENTFS_NAMESPACE=ns-t -e AGENTFS_POD=pod-t -e AGENTFS_POD_UID=uid-t -e AGENTFS_NODE=node-t)
 TRAILERS=("Agentfs-Namespace: ns-t" "Agentfs-Pod: pod-t" "Agentfs-Pod-Uid: uid-t" "Agentfs-Node: node-t")
 
+FS=
+if [ "${1:-}" = --figures ]; then
+  FS=${2:?--figures needs ext4 or xfs}
+  case $FS in ext4|xfs) ;; *) fail "--figures takes ext4 or xfs, not $FS" ;; esac
+  # The state area on a fresh loop filesystem of that type, bound into the
+  # agentfs container in place of the docker volume.
+  LOOP_IMG=${RUNNER_TEMP:-/tmp}/agentfs-trees-tracer-$FS.img
+  DATA=${RUNNER_TEMP:-/tmp}/agentfs-trees-tracer-fs
+fi
+
 if [ "${1:-}" = diagnose ]; then
   docker logs "$NAME" 2>&1 | tail -n 100 || true
   docker run --rm -v "$DATA:/data" --entrypoint git "$IMAGE" \
@@ -45,14 +63,31 @@ fi
 cleanup() {
   docker rm -f "$NAME" >/dev/null 2>&1 || true
   sudo umount -l "$VIEW" 2>/dev/null || true
-  docker volume rm "$DATA" >/dev/null 2>&1 || true
+  if [ -n "$FS" ]; then
+    sudo umount "$DATA" 2>/dev/null || sudo umount -l "$DATA" 2>/dev/null || true
+    sudo rm -f "$LOOP_IMG"
+  else
+    docker volume rm "$DATA" >/dev/null 2>&1 || true
+  fi
 }
 trap cleanup EXIT
 cleanup
 mkdir -p "$VIEW" "$RECEIPTS"
 rm -f "$RECEIPTS"/*
 chmod 0777 "$RECEIPTS"
-docker volume create "$DATA" >/dev/null
+if [ -n "$FS" ]; then
+  sudo truncate -s 4G "$LOOP_IMG"
+  if [ "$FS" = xfs ]; then
+    sudo mkfs.xfs -q -f -m reflink=1 "$LOOP_IMG"
+  else
+    sudo mkfs.ext4 -q -F -E lazy_itable_init=0,lazy_journal_init=0 "$LOOP_IMG"
+  fi
+  mkdir -p "$DATA"
+  sudo mount -o loop "$LOOP_IMG" "$DATA"
+  assert_eq "$FS" "$(findmnt -no FSTYPE -T "$DATA")" "the state area is on $FS"
+else
+  docker volume create "$DATA" >/dev/null
+fi
 
 # agentfs on the state volume, with the pod context every step carries.
 in_state() { # program args...
@@ -145,4 +180,39 @@ assert_eq '' "$unnamed" 'every commit on the root carries its pod trailers'
 workload -- 'printf again > /agentfs/root/after.txt && cat /agentfs/root/after.txt >/dev/null'
 assert_eq again "$(in_history show root:files/after.txt)" 'a restarted workload writes through the new mount'
 has_trailers "$(in_history log -1 --format=%B root)" 'its save'
+
+if [ -n "$FS" ]; then
+  step "4. figures: the flat workloads on the release build, on $FS"
+  report=${RUNNER_TEMP:-/tmp}/trees-figures-$FS.json
+  # As root, which the view lets through (docs/trees.md), so the runner's
+  # files need no other owner, and so a stuck view's connection can be
+  # aborted; the stat after each save is the timed end.
+  sudo python3 "$(dirname "$0")/trees-figures.py" --view "$VIEW" --filesystem "$FS" \
+    --image "$(docker image inspect --format '{{.Id}}' "$IMAGE")" \
+    --budget "$(dirname "$0")/trees-budget.json" --output "$report"
+  cat "$report"
+  figure() { # workload field
+    python3 -c 'import json, sys
+w = {w["name"]: w for w in json.load(open(sys.argv[1]))["workloads"]}[sys.argv[2]]
+print(json.dumps(w.get(sys.argv[3], 0)))' "$report" "$1" "$2"
+  }
+  assert_eq "close_4k create close_64m" \
+    "$(python3 -c 'import json, sys; print(*(w["name"] for w in json.load(open(sys.argv[1]))["workloads"]))' "$report")" \
+    'the report lists every workload'
+  # A save each workload saw answered is in history; a save the deadline
+  # caught may have landed after it, so history may hold one more.
+  n=$(figure close_4k count)
+  if [ "$n" -gt 0 ]; then
+    held=$(in_history show root:files/fig-close4k | sed -n 1p)
+    [ "$held" -ge "$n" ] || fail "history holds 4 KiB save $held, the workload saw $n answered"
+    pass "4 KiB save $n is in history"
+  fi
+  n=$(figure create count)
+  if [ "$n" -gt 0 ]; then
+    assert_eq "$n" "$(in_history show "root:files/fig-create-$n")" "create $n is in history"
+  fi
+  if [ "$(figure close_64m finished)" = true ]; then
+    assert_eq 67108864 "$(in_history cat-file -s root:files/fig-64m)" 'the 64 MiB save is in history'
+  fi
+fi
 pass 'tree views tracer'

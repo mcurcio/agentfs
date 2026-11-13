@@ -1,0 +1,24 @@
+{
+  "comment": "The bars ci/trees-figures.py holds the tree views' release figures to: the recording engine's budgets (ci/bench-budget.json, docs/performance.md). Advisory: a missed bar is a warning, never a failure. Every workload has its own `deadline_s` and reports what it reached by then; nothing is extrapolated. A workload misses its bar when it does not finish by its deadline, or when its `metric` is over `max` (one number, or one per filesystem). `create` runs for half the engine's 600 s and is held to half its 100,000 creates, the engine's rate of 6 ms a create. `close_64m` is held, unscaled, to the engine's close of a dirty 1 GiB file. `grace_s` is how long a save the deadline caught may run on before the view's connection is aborted.",
+  "grace_s": 30,
+  "budgets": {
+    "close_4k": {
+      "deadline_s": 60,
+      "count": 200,
+      "metric": "p50_ms",
+      "max": 3.5,
+      "text": "p50 3.5 ms (record close 4k)"
+    },
+    "create": {
+      "deadline_s": 300,
+      "count": 50000,
+      "text": "50,000 creates in 300 s (create: 100,000 in 600 s)"
+    },
+    "close_64m": {
+      "deadline_s": 120,
+      "metric": "total_s",
+      "max": {"ext4": 12, "xfs": 8},
+      "text": "within the engine's close of a dirty 1 GiB file, 12 s on ext4 and 8 s on XFS (bigclose)"
+    }
+  }
+}

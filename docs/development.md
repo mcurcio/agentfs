@@ -454,6 +454,11 @@ evidence. CI scripts judge the build:
 - `power-loss-trees.sh`: dm-log-writes replay on ext4 and XFS, on the
   upstream and a fork, each checkpoint also rebuilding the refs from the
   journal alone.
+- `e2e-trees-tracer.sh --figures FS` (workflow `image`, on ext4 and XFS):
+  the release figures in
+  [performance.md](performance.md#tree-views-release-build), each workload
+  against its own deadline in `ci/trees-budget.json`, reporting what it
+  reached. A missed bar is a warning, never a failure.
 - `measure-trees.sh`: the measurements in [performance.md](performance.md#tree-views),
   which are not budgets. A pushed commit message containing
   `[phase1-measure]` runs them all, `[phase1-held]`, `[phase1-calls]` and
