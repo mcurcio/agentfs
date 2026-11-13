@@ -8,8 +8,6 @@
 //! journal at every open and after any failed copy. Nothing decides from a copy.
 
 mod journal;
-#[cfg(test)]
-mod oracle;
 mod pages;
 mod pointers;
 pub mod queue;

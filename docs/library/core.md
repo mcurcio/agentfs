@@ -37,6 +37,7 @@ recorded; [guarantees](../guarantees.md) says what the engine promises.
 | Several mounts, one writer | `history_service` | `HistoryServer`, `HistoryClient`, `FrontLease` |
 | Large files | `lfs` | `ObjectCache`, `Store`, `fetch`, `prune` |
 | Git-backed tree views | `tree_actor` | `Volume`, `TreeId` (a tree's identity, `root` or `fork/<n>`) |
+| Line identity across saves | `tree_reconcile` | `LineMap`, `Line`, `LineMap::align` (git's histogram diff), `LineMap::append`: the line-map library, generic over the caller's version (`Id`) |
 
 ## The state area
 
