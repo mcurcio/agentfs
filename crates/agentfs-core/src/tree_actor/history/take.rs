@@ -5,7 +5,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use git2::Oid;
 
-use super::{branch, tree_trailer};
+use super::message::{self, Message};
+use super::refs;
 use crate::tree_actor::stages::{Timer, Which};
 use crate::tree_actor::tree::{EventNumber, Lines, MergeFileIdentity};
 use crate::tree_actor::{Draft, Error, Result, TreeId, Volume, queue, referee};
@@ -70,16 +71,8 @@ impl Volume {
         let mut result = BTreeMap::new();
         loop {
             let commit = self.repo.read_commit(head)?;
-            if let Ok(message) = std::str::from_utf8(&commit.message) {
-                for json in message
-                    .lines()
-                    .filter_map(|line| line.strip_prefix("Agentfs-Collisions: "))
-                {
-                    let collisions: Vec<referee::Collision> = serde_json::from_str(json)?;
-                    for collision in collisions {
-                        result.entry(collision.lost).or_insert(collision.winner);
-                    }
-                }
+            for collision in message::collisions(&commit.message)? {
+                result.entry(collision.lost).or_insert(collision.winner);
             }
             match commit.parents.first() {
                 Some(parent) => head = *parent,
@@ -122,21 +115,18 @@ impl Volume {
             incoming
         } else {
             let content = self.snapshot_tree(&decision.snapshot)?;
-            let mut message = format!(
-                "Landing\n\nAgentfs-Writer: agentfs\nAgentfs-Cause: Landing\nAgentfs-Tree: {tree}\nAgentfs-Event: {event}\nAgentfs-Format: envelope-1\n"
-            );
-            if !decision.collisions.is_empty() {
-                message.push_str(&format!(
-                    "Agentfs-Collisions: {}\n",
-                    serde_json::to_string(&decision.collisions)?
-                ));
+            let message = Message::Landing {
+                tree,
+                event,
+                collisions: &decision.collisions,
             }
+            .render()?;
             self.repo
                 .write_commit(content, &[current, incoming], &message)?
         };
         let mut changes = vec![
             RefUpdate {
-                refname: branch(tree),
+                refname: refs::branch(tree),
                 new: Some(head),
                 expected_old: Some(current),
             },
@@ -147,7 +137,7 @@ impl Volume {
             },
         ];
         if !decision.collisions.is_empty() {
-            let name = format!("refs/collisions/{tree}/{incoming}");
+            let name = refs::collision(tree, incoming);
             if self.pointers.get(&name).is_none() {
                 changes.push(RefUpdate {
                     refname: name,
@@ -261,9 +251,9 @@ impl Volume {
         let Some(upstream) = self.upstream_of(tree) else {
             return Ok(false);
         };
-        for (_, oid) in self.pointers.under(&queue(upstream)) {
+        for (_, oid) in self.pointers.under(&refs::queue(upstream)) {
             let commit = self.repo.read_commit(oid)?;
-            if tree_trailer(&commit.message)? == Some(tree) {
+            if message::tree_of(&commit.message)? == Some(tree) {
                 return Ok(true);
             }
         }
@@ -298,14 +288,12 @@ impl Volume {
                 target
             } else {
                 let content = self.snapshot_tree(&snapshot)?;
-                let message = format!(
-                    "Sync\n\nAgentfs-Writer: agentfs\nAgentfs-Cause: Sync\nAgentfs-Tree: {tree}\nAgentfs-Event: {event}\nAgentfs-Format: envelope-1\n"
-                );
+                let message = Message::Sync { tree, event }.render()?;
                 self.repo
                     .write_commit(content, &[current, target], &message)?
             };
             changes.push(RefUpdate {
-                refname: branch(tree),
+                refname: refs::branch(tree),
                 new: Some(head),
                 expected_old: Some(current),
             });

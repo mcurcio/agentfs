@@ -50,7 +50,6 @@ fn classify(stderr: &[u8]) -> Error {
 
 // The repository's whole configuration; nothing else writes it.
 const CONFIG: &str = "[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n\tbare = true\n\tfsync = objects,derived-metadata\n\tfsyncMethod = fsync\n";
-const HEAD: &str = "ref: refs/heads/root\n";
 
 /// A single tree entry. Names are raw Unix filename bytes.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -126,17 +125,18 @@ impl TreeGit {
     /// Replaces `config` and `HEAD`, each atomically (temporary file, fsync,
     /// rename, directory fsync). Runs no git, and leaves what git needs to call
     /// this a repository, `refs/` included: a cut rebuild can leave none.
-    /// `upstreams` maps a fork's name to its parent's.
-    pub fn write_config(&self, upstreams: &BTreeMap<String, String>) -> Result<()> {
+    /// `head` is HEAD's full ref; `merges` maps each branch section's name to
+    /// the full ref it merges.
+    pub fn write_config(&self, head: &str, merges: &BTreeMap<String, String>) -> Result<()> {
         let mut config = CONFIG.to_owned();
-        for (fork, parent) in upstreams {
-            let section = fork.replace('\\', "\\\\").replace('"', "\\\"");
+        for (branch, merge) in merges {
+            let section = branch.replace('\\', "\\\\").replace('"', "\\\"");
             config.push_str(&format!(
-                "[branch \"{section}\"]\n\tremote = .\n\tmerge = refs/heads/{parent}\n"
+                "[branch \"{section}\"]\n\tremote = .\n\tmerge = {merge}\n"
             ));
         }
         replace_file(&self.path, "config", config.as_bytes())?;
-        replace_file(&self.path, "HEAD", HEAD.as_bytes())?;
+        replace_file(&self.path, "HEAD", format!("ref: {head}\n").as_bytes())?;
         std::fs::create_dir_all(self.path.join("refs"))?;
         Ok(())
     }
@@ -181,9 +181,9 @@ impl TreeGit {
             .collect()
     }
 
-    /// The event number and commit of every `Agentfs-Cause: Direct` commit
-    /// reachable from `tips`, in one Git child, not one per commit.
-    pub fn direct_events(&self, tips: &[Oid]) -> Result<Vec<(u64, Oid)>> {
+    /// Each commit reachable from `tips` with its raw message, in one Git
+    /// child, not one per commit.
+    pub fn commit_messages(&self, tips: &[Oid]) -> Result<Vec<(Oid, Vec<u8>)>> {
         if tips.is_empty() {
             return Ok(Vec::new());
         }
@@ -196,25 +196,15 @@ impl TreeGit {
             Some(input.as_bytes()),
             true,
         )?;
-        let mut events = Vec::new();
+        let mut commits = Vec::new();
         for record in out.stdout.split(|b| *b == 1).filter(|r| !r.is_empty()) {
             let (oid, message) = match record.iter().position(|b| *b == b'\n') {
                 Some(end) => (&record[..end], &record[end + 1..]),
                 None => (record, &[][..]),
             };
-            let Ok(message) = std::str::from_utf8(message) else {
-                continue;
-            };
-            if message.lines().any(|line| line == "Agentfs-Cause: Direct")
-                && let Some(seq) = message
-                    .lines()
-                    .find_map(|line| line.strip_prefix("Agentfs-Event: "))
-                    .and_then(|s| s.parse::<u64>().ok())
-            {
-                events.push((seq, parse_oid(oid)?));
-            }
+            commits.push((parse_oid(oid)?, message.to_vec()));
         }
-        Ok(events)
+        Ok(commits)
     }
 
     fn command(&self, bare: bool) -> Command {

@@ -1,6 +1,8 @@
 //! Tree history: snapshots read from and written to commits, a tree's object table, direct saves,
 //! queue entries and checkouts (target git-model §4, §5).
 
+pub(super) mod message;
+pub(super) mod refs;
 mod take;
 
 use std::collections::BTreeMap;
@@ -11,30 +13,13 @@ use std::path::Path;
 use git2::Oid;
 use serde::{Deserialize, Serialize};
 
-use super::journal::parse_tree;
 use super::pointers::Pointers;
 use super::stages::{Timer, Which};
 use super::tree::{EventNumber, Lines, MergeFileIdentity, Tree};
 use super::{Draft, Error, Result, Saved, TreeId, Volume, referee};
 use crate::tree_git::{RefUpdate, TreeEntry, TreeGit};
+use message::{Action, Message};
 pub(super) use take::SyncPlan;
-
-pub(in crate::tree_actor) fn branch(tree: TreeId) -> String {
-    format!("refs/heads/{tree}")
-}
-
-pub(in crate::tree_actor) fn queue(tree: TreeId) -> String {
-    format!("refs/queue/{tree}/")
-}
-
-/// The tree a commit's `Agentfs-Tree` trailer names, if it has one.
-pub(in crate::tree_actor) fn tree_trailer(message: &[u8]) -> Result<Option<TreeId>> {
-    std::str::from_utf8(message)
-        .ok()
-        .and_then(|m| m.lines().find_map(|l| l.strip_prefix("Agentfs-Tree: ")))
-        .map(parse_tree)
-        .transpose()
-}
 
 /// The upstream map as Git's config writes it: each fork's text and its upstream's.
 pub(in crate::tree_actor) fn upstream_config(
@@ -43,6 +28,16 @@ pub(in crate::tree_actor) fn upstream_config(
     upstreams
         .iter()
         .map(|(fork, upstream)| (fork.to_string(), upstream.to_string()))
+        .collect()
+}
+
+/// The upstream map as Git's config merges it: each fork's text and its upstream's branch.
+pub(in crate::tree_actor) fn upstream_merges(
+    upstreams: &BTreeMap<TreeId, TreeId>,
+) -> BTreeMap<String, String> {
+    upstreams
+        .iter()
+        .map(|(fork, upstream)| (fork.to_string(), refs::branch(*upstream)))
         .collect()
 }
 
@@ -58,13 +53,13 @@ pub(in crate::tree_actor) fn check_objects(repo: &TreeGit, pointers: &Pointers) 
     let Some(first) = missing.first() else {
         return Ok(());
     };
-    for (name, tip) in pointers.under("refs/") {
+    for (name, tip) in pointers.under(refs::ALL) {
         if let Some(oid) = repo.missing_objects(&[tip])?.first() {
             return Err(Error::MissingObject { name, oid: *oid });
         }
     }
     Err(Error::MissingObject {
-        name: "refs/".to_owned(),
+        name: refs::ALL.to_owned(),
         oid: *first,
     })
 }
@@ -101,12 +96,7 @@ impl Volume {
     pub(in crate::tree_actor) fn snapshot_at(&self, head: Oid) -> Result<referee::Snapshot> {
         let _timer = Timer::start(Which::SnapshotRead);
         let commit = self.repo.read_commit(head)?;
-        let is_envelope = std::str::from_utf8(&commit.message).is_ok_and(|message| {
-            message
-                .lines()
-                .any(|line| line == "Agentfs-Format: envelope-1")
-        });
-        if !is_envelope {
+        if !message::is_envelope(&commit.message) {
             // The Root commit alone has no envelope, and an empty tree.
             if self.repo.list_tree(commit.tree)?.is_empty() {
                 return Ok(referee::Snapshot {
@@ -189,7 +179,7 @@ impl Volume {
         snapshot: &referee::Snapshot,
         updates: &mut Vec<RefUpdate>,
     ) -> Result<()> {
-        let name = format!("refs/agentfs/objects/{tree}");
+        let name = refs::object_table(tree);
         let files: BTreeMap<MergeFileIdentity, u64> = snapshot
             .files
             .iter()
@@ -211,7 +201,7 @@ impl Volume {
         tree: TreeId,
         snapshot: &mut referee::Snapshot,
     ) -> Result<()> {
-        if let Some(oid) = self.pointers.get(&format!("refs/agentfs/objects/{tree}")) {
+        if let Some(oid) = self.pointers.get(&refs::object_table(tree)) {
             let table: ObjectTable = serde_json::from_slice(&self.repo.read_blob(oid)?)?;
             for (id, file) in &mut snapshot.files {
                 file.object = *table.files.get(id).ok_or(Error::Format)?;
@@ -226,16 +216,11 @@ impl Volume {
     /// folded as saves land and is empty-then-rebuilt here at every open.
     pub(in crate::tree_actor) fn rebuild_owners(&mut self) -> Result<()> {
         let _timer = Timer::start(Which::EventOwners);
-        let mut tips: Vec<Oid> = Vec::new();
-        // Landings queue as commits in the root's queue; syncs are blobs.
-        for prefix in ["refs/heads/", &queue(TreeId::Root), "refs/collisions/"] {
-            tips.extend(self.pointers.under(prefix).into_iter().map(|(_, oid)| oid));
-        }
         self.owners = self
             .repo
-            .direct_events(&tips)?
+            .commit_messages(&refs::owner_tips(&self.pointers))?
             .into_iter()
-            .map(|(event, oid)| (EventNumber::new(event), oid))
+            .filter_map(|(oid, message)| Some((message::direct_event(&message)?, oid)))
             .collect();
         Ok(())
     }
@@ -246,7 +231,7 @@ impl Volume {
         tree: TreeId,
         t: Tree,
         writer: &str,
-        cause: &str,
+        action: Action,
         event: EventNumber,
         open: Option<u64>,
     ) -> Result<Draft> {
@@ -268,16 +253,18 @@ impl Volume {
         let blob = self.repo.write_blob(&serde_json::to_vec(&metadata)?)?;
         let namespace = self.repo.write_blob(&serde_json::to_vec(&t.namespace)?)?;
         let content = self.envelope(files, blob, namespace)?;
-        let mut message = format!(
-            "{cause} by {writer}\n\nAgentfs-Writer: {writer}\nAgentfs-Cause: Direct\nAgentfs-Tree: {tree}\nAgentfs-Event: {event}\nAgentfs-Format: envelope-1\n"
-        );
-        if let Some(open) = open {
-            message.push_str(&format!("Agentfs-Open: {open}\n"));
+        let message = Message::Direct {
+            action,
+            writer,
+            tree,
+            event,
+            open,
         }
+        .render()?;
         let current = self.head(tree)?;
         let head = self.repo.write_commit(content, &[current], &message)?;
         let mut changes = vec![RefUpdate {
-            refname: branch(tree),
+            refname: refs::branch(tree),
             new: Some(head),
             expected_old: Some(current),
         }];
@@ -316,7 +303,7 @@ impl Volume {
         }
         for (destination, oid) in &destinations {
             changes.push(RefUpdate {
-                refname: format!("{}{event:020}", queue(*destination)),
+                refname: refs::queue_entry(*destination, event),
                 new: Some(*oid),
                 expected_old: None,
             });
@@ -330,9 +317,7 @@ impl Volume {
         // Rebuild from the branch, never from intermediate in-memory state.
         let commit = self.repo.read_commit(self.head(tree)?)?;
         // The trailer tells the Root commit even if a workload used our names.
-        let has_envelope = std::str::from_utf8(&commit.message)
-            .is_ok_and(|m| m.lines().any(|l| l == "Agentfs-Format: envelope-1"));
-        let files = if has_envelope {
+        let files = if message::is_envelope(&commit.message) {
             self.repo
                 .list_tree(commit.tree)?
                 .into_iter()

@@ -6,6 +6,7 @@ pub(super) mod pages;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
+use super::history::message::Action;
 use super::journal::{CallHead, Entry, LiveOpen, RunHead};
 use super::stages::{Timer, Which};
 use super::tree::{EventNumber, MergeFileIdentity, NameHistory, Versions};
@@ -230,7 +231,7 @@ impl Volume {
                 NameHistory::created(event, path.to_owned()),
             );
             t.names.insert(path.to_owned(), object);
-            let mut draft = v.build_save(tree, t, writer, "Create", event, None)?;
+            let mut draft = v.build_save(tree, t, writer, Action::Create, event, None)?;
             draft.linked = Some(object);
             Ok(draft)
         })?;
@@ -366,7 +367,7 @@ impl Volume {
                 .get_mut(&t.identities[&object])
                 .ok_or(Error::Format)?
                 .advance(event, None, None);
-            v.build_save(tree, t, writer, "Unlink", event, None)
+            v.build_save(tree, t, writer, Action::Unlink, event, None)
         })?;
         Ok(())
     }
@@ -431,7 +432,7 @@ impl Volume {
             NameHistory::created(event, path.to_owned()),
         );
         t.fresh_names.insert(object);
-        let mut draft = self.build_save(tree, t, writer, "Create", event, None)?;
+        let mut draft = self.build_save(tree, t, writer, Action::Create, event, None)?;
         draft.opened = Some(LiveOpen {
             handle: event.get(),
             tree,
@@ -476,7 +477,7 @@ impl Volume {
             };
             t.lines.insert(h.object, Arc::new(lines));
             t.bytes.insert(h.object, Arc::new(bytes));
-            self.build_save(h.tree, t, &h.writer, "Direct", event, Some(handle))?
+            self.build_save(h.tree, t, &h.writer, Action::Direct, event, Some(handle))?
         } else {
             Draft::new(&h.writer, h.tree, t)
         };
@@ -525,7 +526,7 @@ impl Volume {
             t.fresh_names.remove(&object);
         }
         t.names.insert(to.to_owned(), object);
-        self.build_save(tree, t, writer, "Rename", event, None)
+        self.build_save(tree, t, writer, Action::Rename, event, None)
     }
 }
 

@@ -173,10 +173,10 @@ fn write_config_replaces_a_damaged_config_and_head_before_any_git_command() {
     std::fs::write(path.join("config"), b"").unwrap();
     std::fs::write(path.join("HEAD"), b"").unwrap();
     let repo = TreeGit::open(&path).unwrap();
-    let upstreams = [("fork/7".to_owned(), "root".to_owned())]
+    let merges = [("fork/7".to_owned(), "refs/heads/root".to_owned())]
         .into_iter()
         .collect();
-    repo.write_config(&upstreams).unwrap();
+    repo.write_config("refs/heads/root", &merges).unwrap();
     let get = |key: &str| {
         let out = git(&path, &["config", "--get", key]);
         assert!(out.status.success(), "{key}");
@@ -211,7 +211,8 @@ fn rebuild_refs_replaces_everything_with_what_it_is_given() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("repo.git");
     let repo = TreeGit::init(&path).unwrap();
-    repo.write_config(&Default::default()).unwrap();
+    repo.write_config("refs/heads/root", &Default::default())
+        .unwrap();
     let tip = commit(&repo);
     let blob = repo.write_blob(b"table").unwrap();
     repo.ref_transaction(&[
@@ -245,7 +246,8 @@ fn missing_objects_names_what_is_lost_of_a_tip_and_not_its_parents() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("repo.git");
     let repo = TreeGit::init(&path).unwrap();
-    repo.write_config(&Default::default()).unwrap();
+    repo.write_config("refs/heads/root", &Default::default())
+        .unwrap();
     let old_blob = repo.write_blob(b"parent's").unwrap();
     let old_tree = repo
         .write_tree(&[TreeEntry {

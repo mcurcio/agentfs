@@ -30,12 +30,12 @@ use serde::Serialize;
 
 use crate::file_lock::{FileLock, Mode};
 use crate::tree_git::{RefUpdate, TreeGit};
+use history::message::{self, Message};
 use history::{
-    SyncPlan, branch, check_objects, queue, remove_stale_locks, tree_trailer, upstream_config,
+    SyncPlan, check_objects, refs, remove_stale_locks, upstream_config, upstream_merges,
 };
 use journal::{
     CompactError, Entry, FoldedOpen, Journal, LiveOpen, PointerChange, Record, compact_at, fold,
-    parse_tree,
 };
 use pointers::Pointers;
 use recording::{Handle, pages};
@@ -276,16 +276,9 @@ fn prepare_state_area(root: &Path, lock: &Arc<FileLock>) -> Result<()> {
     File::open(&marker)?.sync_all()?;
     File::open(root)?.sync_all()?;
     let repo = TreeGit::init_with_lease(root.join("history.git"), Arc::clone(lock))?;
-    repo.write_config(&BTreeMap::new())?;
+    repo.write_config(&refs::head(), &BTreeMap::new())?;
     let tree = repo.write_tree(&[])?;
-    let head = repo.write_commit(
-        tree,
-        &[],
-        &format!(
-            "Root\n\nAgentfs-Writer: agentfs\nAgentfs-Cause: Root\nAgentfs-Tree: {}\nAgentfs-Event: 0\n",
-            TreeId::Root
-        ),
-    )?;
+    let head = repo.write_commit(tree, &[], &Message::Root.render()?)?;
     Journal::create(
         &root.join(JOURNAL),
         &Record {
@@ -293,7 +286,7 @@ fn prepare_state_area(root: &Path, lock: &Arc<FileLock>) -> Result<()> {
             at_ns: now_ns(),
             entry: Entry::Checkpoint {
                 next_seq: 1,
-                pointers: [(branch(TreeId::Root), head.to_string())]
+                pointers: [(refs::branch(TreeId::Root), head.to_string())]
                     .into_iter()
                     .collect(),
                 upstreams: BTreeMap::new(),
@@ -355,7 +348,7 @@ impl Volume {
         let repo = TreeGit::open_with_lease(&history, Arc::clone(&lock))?;
         // Before any git command: an empty config silently loses core.fsync,
         // and an empty HEAD is "not a git repository".
-        repo.write_config(&upstream_config(&folded.upstreams))?;
+        repo.write_config(&refs::head(), &upstream_merges(&folded.upstreams))?;
         check_objects(&repo, &folded.pointers)?;
         repo.rebuild_refs(&folded.pointers.creates())?;
         crate::failpoints::hit("tree.after_ref_rebuild")?;
@@ -416,7 +409,7 @@ impl Volume {
         for tree in volume.trees() {
             volume.checkout(tree)?;
         }
-        volume.metrics.queued = volume.pointers.under("refs/queue/").len() as u64;
+        volume.metrics.queued = volume.pointers.under(refs::QUEUES).len() as u64;
         match volume.compact() {
             Ok(()) => {}
             Err(e @ CompactError::Before(_)) => eprintln!("tree CompactionFailed: {e}"),
@@ -431,8 +424,7 @@ impl Volume {
     /// made only of the root, and only the root's queue holds landings): else
     /// [`Error::Format`].
     fn build_trees(&mut self) -> Result<()> {
-        for (reference, head) in self.pointers.under("refs/heads/") {
-            let id = parse_tree(reference.strip_prefix("refs/heads/").ok_or(Error::Format)?)?;
+        for (id, head) in refs::branches(&self.pointers)? {
             let mut snapshot = self.snapshot_at(head)?;
             self.restore_object_table(id, &mut snapshot)?;
             let mut tree = Tree::default();
@@ -479,7 +471,9 @@ impl Volume {
 
     pub fn head(&self, tree: TreeId) -> Result<Oid> {
         self.tree(tree)?;
-        self.pointers.get(&branch(tree)).ok_or(Error::NotFound)
+        self.pointers
+            .get(&refs::branch(tree))
+            .ok_or(Error::NotFound)
     }
 
     /// Fork IDs are numeric and never reused. Forking a fork is not exposed yet.
@@ -495,7 +489,7 @@ impl Volume {
             }
             let mut draft = Draft::new("agentfs", fork, tree);
             draft.changes.push(RefUpdate {
-                refname: branch(fork),
+                refname: refs::branch(fork),
                 new: Some(at),
                 expected_old: None,
             });
@@ -579,13 +573,13 @@ impl Volume {
             return Err(Error::Stopped);
         }
         self.tree(tree)?;
-        if self.pointers.under(&queue(tree)).is_empty() {
+        if self.pointers.under(&refs::queue(tree)).is_empty() {
             return Ok(Took::Empty);
         }
         // A take is a step: pending closes save first, and its plan reads
         // the tree they leave.
         self.run_pending_closes(tree, None)?;
-        let entries = self.pointers.under(&queue(tree));
+        let entries = self.pointers.under(&refs::queue(tree));
         let open = self.open_keys(tree);
         let mut plans = Vec::new();
         let mut actions = Vec::new();
@@ -594,7 +588,7 @@ impl Volume {
             if tree.is_root() {
                 let commit = self.repo.read_commit(*oid)?;
                 let base = *commit.parents.first().ok_or(Error::Format)?;
-                let source = tree_trailer(&commit.message)?.ok_or(Error::Format)?;
+                let source = message::tree_of(&commit.message)?.ok_or(Error::Format)?;
                 let keys = referee::touches(&self.snapshot_at(base)?, &self.snapshot_at(*oid)?);
                 plans.push(queue::Plan {
                     source,
@@ -746,18 +740,23 @@ impl Volume {
     /// Stage 7: Git's refs and the checkouts, both copies of what is on record.
     fn copy_out(&mut self, tree: TreeId, is_fork: bool, changes: &[RefUpdate]) -> Result<()> {
         // Named first, so that a failure anywhere below redoes this checkout.
-        if changes.iter().any(|change| change.refname == branch(tree)) {
+        if changes
+            .iter()
+            .any(|change| change.refname == refs::branch(tree))
+        {
             self.stale_checkouts.insert(tree);
         }
         crate::failpoints::hit("tree.after_commit_point")?;
         {
             let _timer = Timer::start(Which::RefCopy);
             if self.copies_stale {
-                self.repo.write_config(&upstream_config(&self.upstreams))?;
+                self.repo
+                    .write_config(&refs::head(), &upstream_merges(&self.upstreams))?;
                 self.repo.rebuild_refs(&self.pointers.creates())?;
             } else if !changes.is_empty() {
                 if is_fork {
-                    self.repo.write_config(&upstream_config(&self.upstreams))?;
+                    self.repo
+                        .write_config(&refs::head(), &upstream_merges(&self.upstreams))?;
                 }
                 self.repo.ref_transaction(changes)?;
             }

@@ -38,6 +38,8 @@ missing from these tables or a row names a module that no longer exists;
 | `record.rs` | What the journal stores: one record per change boundary, absolute state, never deltas |
 | `tree_actor/mod.rs` | The tree actor: composition only. A step is one unit of work: built, recorded in the journal, installed, copied out; opening and recovery; queue takes |
 | `tree_actor/history/mod.rs` | Tree history: snapshots read from and written to commits (`metadata.json`, `namespace.json`), object tables, the owners of direct saves, direct saves, queue entries and private checkouts |
+| `tree_actor/history/message.rs` | Every message a tree-view commit carries, its one home: each message's bytes (Root, direct saves, landings, syncs) and the readers of its trailers (target git-model §5) |
+| `tree_actor/history/refs.rs` | The ref layout of a tree volume's history, its one home: branches, queues and their entries, collision refs, object tables, and the tips that reach every save (target git-model §4) |
 | `tree_actor/history/take.rs` | Queue takes as history: a landing judged by the referee into its upstream, and a fork's prefix sync planned and built from its upstream's commits |
 | `tree_actor/journal/mod.rs` | The actor's journal: salted checksummed frames, the commit point for calls and pointer steps, torn-tail and corruption rules, compaction (target git-model §3) |
 | `tree_actor/journal/commit_point.rs` | The actor's appends to the journal and when it compacts, with the checkpoint a compaction writes |
@@ -57,7 +59,7 @@ missing from these tables or a row names a module that no longer exists;
 | `tree_actor/tree.rs` | A tree's shared types: the event number a step is given, the line versions (`<event>:<index>`, ordered as their text) and line maps it writes, and a tree's saved state (`Tree`), its files' identities and name histories |
 | `tree_actor/tree_id.rs` | A tree's identity, `root` or `fork/<n>`: the text history, refs and checkouts name a tree by, parsed once where the journal is read |
 | `tree_reconcile.rs` | The line-map library: histogram alignment and line identities, generic over the caller's version |
-| `tree_git.rs` | Git executable backend for durable objects, the rebuildable copy of the refs in files format, `config` and `HEAD`, snapshots and private caches; Git children retain the actor lease |
+| `tree_git.rs` | Git executable backend for durable objects, the rebuildable copy of the refs in files format, `config` and `HEAD`, snapshots and private caches; Git children retain the actor lease. It knows no ref layout and no trailer |
 | `journal.rs` | The durable change log: framed, checksummed records with group-commit `fsync` |
 | `pending.rs` | Frozen copies in `pending/`: `FICLONE` reflink, else copy plus `fsync`; slot-numbered ids for fronts |
 | `claims.rs` | Per-path ordering: a record claims its paths from decision to tracked-set update |
