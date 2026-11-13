@@ -217,7 +217,7 @@ before=$(wc -l <"$GIT_SERVER_LFS_RANGE_LOG")
 agentfs restore huge.bin "$SOURCE"
 cmp "$TREE/huge.bin" "$VOL/huge.orig" && pass "the restore completed with the right content"
 ranged=$(tail -n +"$((before + 1))" "$GIT_SERVER_LFS_RANGE_LOG" | grep "objects/$HUGE" || true)
-held_now=$(grep -o '"bytes=[0-9]*-"' <<<"$ranged" | head -n1 | tr -dc 0-9)
+held_now=$(grep -o '"bytes=[0-9]*-"' <<<"$ranged" | sed -n 1p | tr -dc 0-9)
 [ -n "$held_now" ] && [ "$held_now" -ge "$held" ] || fail "no Range request resumed the download: $ranged"
 assert_contains "$ranged" " 206 \"bytes=$held_now-\"" "lfs-test-server answered the Range with 206"
 assert_eq "$HUGE" "$(sha256sum "$STATE/lfs/objects/${HUGE:0:2}/${HUGE:2:2}/$HUGE" | cut -d' ' -f1)" "the cached object's hash"

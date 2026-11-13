@@ -71,7 +71,7 @@ ka() { kubectl -n "$APPS" "$@"; }
 
 gateway() {
   docker network inspect kind -f '{{range .IPAM.Config}}{{.Gateway}} {{end}}' |
-    tr ' ' '\n' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -n1
+    tr ' ' '\n' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | sed -n 1p
 }
 
 diagnose() {
@@ -139,7 +139,7 @@ remote_message() { rgit log -1 --format=%B "$BRANCH" -- "$1"; }
 plugin_pod() {
   kd get pod -l "$PLUGIN_LABEL" -o go-template \
     --template '{{range .items}}{{if not .metadata.deletionTimestamp}}{{.metadata.name}}{{"\n"}}{{end}}{{end}}' |
-    head -n1
+    sed -n 1p
 }
 in_plugin() { kd exec "$(plugin_pod)" -c agentfs-csi -- "$@"; }
 plugin_log() { kd logs "$(plugin_pod)" -c agentfs-csi; }
@@ -245,7 +245,7 @@ kd wait --for=condition=Ready pod -l "$PLUGIN_LABEL" --timeout=300s >/dev/null |
   fail "the node plugin never became Ready"
 pass "the node plugin is Ready"
 deadline=$((SECONDS + 120))
-until kubectl get csinode "$NODE_NAME" -o jsonpath='{.spec.drivers[*].name}' | grep -qw "$DRIVER"; do
+until kubectl get csinode "$NODE_NAME" -o jsonpath='{.spec.drivers[*].name}' | grep -w "$DRIVER" >/dev/null; do
   [ $SECONDS -lt $deadline ] || fail "the CSINode of $NODE_NAME never listed $DRIVER"
   sleep 1
 done
@@ -404,7 +404,7 @@ pass "40 racing creates from each pod all succeeded"
 assert_eq "x x" "$(in_pod writer-b 'cat /data/race/f39' | xargs)" "both pods appended to f39"
 assert_eq 10000 "$(in_pod writer-a 'stat -c %g /data/race/f0 /data/race/f39 | sort -u')" \
   "the racing files carry the fsGroup"
-if plugin_log | grep -q "process id is 0"; then
+if plugin_log | grep "process id is 0" >/dev/null; then
   fail "a front could not see a pod's process (hostPID): $(plugin_log | grep 'process id is 0')"
 fi
 pass "every front saw its callers' groups"

@@ -88,7 +88,8 @@ PY
   [ "$(tree_git_file "$gitdir" root baseline)" = baseline ]
   if grep -q "^write " "$work/receipt"; then
     count=$(awk '/^write / {print $2}' "$work/receipt")
-    [ "$(tree_git_file "$gitdir" root candidate)" = "$(printf candidate | head -c "$count")" ]
+    written=candidate
+    [ "$(tree_git_file "$gitdir" root candidate)" = "${written:0:count}" ]
   fi
   git --git-dir="$gitdir" fsck --full --strict --no-progress
   tree_git_no_duplicate_opens "$gitdir"
@@ -163,7 +164,7 @@ gitdir=$work/state/history.git
 git --git-dir="$gitdir" rev-list --all > "$work/orphan-commits"
 while read -r commit; do
   prefix=
-  if git --git-dir="$gitdir" show -s --format=%B "$commit" | grep -Fxq 'Agentfs-Format: envelope-1'; then prefix=:files; fi
+  if git --git-dir="$gitdir" show -s --format=%B "$commit" | grep -Fx 'Agentfs-Format: envelope-1' >/dev/null; then prefix=:files; fi
   if git --git-dir="$gitdir" grep -F 'ORPHAN-BAD' "$commit$prefix" >/dev/null; then
     echo "orphan bytes entered history at $commit" >&2; exit 1
   else

@@ -150,13 +150,13 @@ for v in a b; do
   status=$(vagentfs "$v" status)
   n=$(grep -c '^remote:' <<<"$status")
   assert_eq 2 "$n" "vol-$v has two remotes"
-  if grep '^remote:' <<<"$status" | grep -v ' 0 consecutive failure(s)' | grep -q .; then
+  if grep '^remote:' <<<"$status" | grep -v ' 0 consecutive failure(s)' | grep . >/dev/null; then
     fail "vol-$v has a failing remote: $status"
   fi
   case $status in *"last error"* | *diverged*) fail "vol-$v reports an error: $status" ;; esac
   pass "vol-$v: no push failed"
   if grep -q "alarm: push to" "$LOGS/vol-$v.log"; then
-    fail "vol-$v raised a push alarm: $(grep "alarm: push to" "$LOGS/vol-$v.log" | head -n 3)"
+    fail "vol-$v raised a push alarm: $(grep "alarm: push to" "$LOGS/vol-$v.log" | sed -n 1,3p)"
   fi
   pass "vol-$v: no push alarm"
 done

@@ -224,7 +224,7 @@ if [ "${E2E_HTTPS:-}" = 1 ]; then
   volume_config remote.tls.lfsurl "$LFS_HTTPS_BASE/acme/tls"
   out=$(agentfs push --remote tls 2>&1)
   assert_contains "$out" "tls: pushed" "pushed with LFS over https"
-  find "$LFS_SERVER_DIR/tls/content" -type f | grep -q . || fail "nothing on the https LFS server"
+  find "$LFS_SERVER_DIR/tls/content" -type f | grep . >/dev/null || fail "nothing on the https LFS server"
   pass "objects are on the https LFS server"
   BAD_REPO=$VOL/badtls.git
   git init -q --bare "$BAD_REPO"
@@ -253,7 +253,7 @@ rm -rf "$STATE/lfs/objects" "$FILE_REPO/lfs"
 before=$(log_lines)
 agentfs restore "$TARGET" "$SOURCE"
 cmp "$TREE/$TARGET" "$VOL/original" && pass "restored after the cache was lost"
-log_since "$before" | grep -q '"GET /git/same/objects/' || fail "not downloaded from a server: $(log_since "$before")"
+log_since "$before" | grep '"GET /git/same/objects/' >/dev/null || fail "not downloaded from a server: $(log_since "$before")"
 pass "the object was downloaded from the same-host LFS server"
 
 step "all LFS checks passed"

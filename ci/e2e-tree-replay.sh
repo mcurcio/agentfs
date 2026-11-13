@@ -18,7 +18,7 @@ min_seeds=${3:?a floor of seed traces}
 recorded=${4:-}
 replay=${PHASE1_REPLAY:-$PWD/target/debug/phase1-replay}
 export AGENTFS_BIN=${AGENTFS_BIN:-$PWD/target/debug/agentfs}
-"$AGENTFS_BIN" --version | grep -q failpoints || {
+"$AGENTFS_BIN" --version | grep failpoints >/dev/null || {
     echo "$AGENTFS_BIN is not a failpoints build" >&2
     exit 2
 }

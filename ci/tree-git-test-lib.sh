@@ -2,7 +2,7 @@
 # Read published tree contents by the commit's format marker, including legacy roots.
 tree_git_file() {
   local gitdir=$1 commit=$2 path=$3 prefix=
-  if git --git-dir="$gitdir" show -s --format=%B "$commit" | grep -Fxq 'Agentfs-Format: envelope-1'; then
+  if git --git-dir="$gitdir" show -s --format=%B "$commit" | grep -Fx 'Agentfs-Format: envelope-1' >/dev/null; then
     prefix=files/
     git --git-dir="$gitdir" cat-file -e "$commit:metadata.json" || return 1
   fi

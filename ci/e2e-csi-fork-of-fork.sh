@@ -46,7 +46,7 @@ ka() { kubectl -n "$APPS" "$@"; }
 
 gateway() {
   docker network inspect kind -f '{{range .IPAM.Config}}{{.Gateway}} {{end}}' |
-    tr ' ' '\n' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -n1
+    tr ' ' '\n' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | sed -n 1p
 }
 
 diagnose() {
@@ -90,7 +90,7 @@ fgit() { git --git-dir "$FORKS_REMOTE" "$@"; }
 plugin_pod() {
   kd get pod -l "$PLUGIN_LABEL" -o go-template \
     --template '{{range .items}}{{if not .metadata.deletionTimestamp}}{{.metadata.name}}{{"\n"}}{{end}}{{end}}' |
-    head -n1
+    sed -n 1p
 }
 plugin_ready() {
   kd wait --for=condition=Ready pod -l "$PLUGIN_LABEL" --timeout=300s >/dev/null ||
@@ -269,7 +269,7 @@ assert_eq "from the grandchild" "$(in_pod child 'cat /data/g.txt')" \
   "the child's queue landed the grandchild's change at its next mount"
 until_ok 120 "the child's applied ref for patch 1 reaches the fork remote" \
   ref_exists "$FORKS_REMOTE" "refs/agentfs/$CHILD/applied/0000000001"
-ka get pod writer -o jsonpath='{.status.phase}' | grep -q Running || fail "the source's pod stopped"
+ka get pod writer -o jsonpath='{.status.phase}' | grep Running >/dev/null || fail "the source's pod stopped"
 pass "the source stayed in use throughout"
 
 step "e2e-csi-fork-of-fork passed"

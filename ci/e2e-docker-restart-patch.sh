@@ -75,7 +75,7 @@ hold_open() { # tag
   docker exec -d "$WL" sh -c "cd $WS && exec 3<$TARGET && exec sleep $1"
   local pid="" deadline=$((SECONDS + 30))
   until [ -n "$pid" ]; do
-    pid=$(in_wl "for p in /proc/[0-9]*; do [ \"\$(tr '\\0' ' ' <\$p/cmdline 2>/dev/null)\" = 'sleep $1 ' ] && echo \${p#/proc/}; done; true" | head -n1)
+    pid=$(in_wl "for p in /proc/[0-9]*; do [ \"\$(tr '\\0' ' ' <\$p/cmdline 2>/dev/null)\" = 'sleep $1 ' ] && echo \${p#/proc/}; done; true" | sed -n 1p)
     [ -n "$pid" ] || { [ $SECONDS -lt $deadline ] || fail "the holder never started"; sleep 0.5; }
   done
   echo "$pid"
@@ -102,7 +102,7 @@ variant() { # name how before patched tag
   out=$(queue_patch "$patched" "$name: under a live workload" 2>&1)
   echo "$out"
   assert_contains "$out" "queued patch" "$name: the patch is queued"
-  n=$(printf '%s\n' "$out" | sed -n 's/^queued patch \([0-9]*\) .*/\1/p' | head -n1)
+  n=$(printf '%s\n' "$out" | sed -n 's/^queued patch \([0-9]*\) .*/\1/p' | sed -n 1p)
   code=0
   out=$(in_agentfs agentfs patch apply --no-fetch 2>&1) || code=$?
   echo "$out"
@@ -142,7 +142,7 @@ variant() { # name how before patched tag
   if [ "$seen" = "$patched" ]; then
     VERDICTS+=("$name: BUG: patch $n landed under the running workload ($WS/$TARGET '$before' -> '$patched')")
     printf '\033[31mBUG:\033[0m %s\n' "${VERDICTS[-1]}"
-  elif [ "$seen" = "$before" ] && in_agentfs agentfs status 2>&1 | grep -qE '^patches: .*[1-9][0-9]* queued'; then
+  elif [ "$seen" = "$before" ] && in_agentfs agentfs status 2>&1 | grep -E '^patches: .*[1-9][0-9]* queued' >/dev/null; then
     pass "$name: patch $n did not land under the running workload; still queued"
   else
     VERDICTS+=("$name: UNEXPECTED: the workload reads '$seen' (before '$before', patch '$patched')")

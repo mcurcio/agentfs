@@ -6,7 +6,8 @@
 //! - the same for the operator attributes ([`rules::OPERATOR_ATTRIBUTES`]);
 //! - every relative link and `#anchor` in README.md and docs/ resolves;
 //! - every CI job runs on the pinned runner, `ubuntu-24.04`;
-//! - every script under ci/ is executable;
+//! - every script under ci/ is executable, and no pipe in one ends in a
+//!   reader that exits early (pipefail turns its SIGPIPE into a failure);
 //! - every page under docs/ is in the book's docs/SUMMARY.md;
 //! - every `git push` in a runbook writes only refs literally under
 //!   `refs/agentfs/` and never forces (F8 S2).
@@ -492,6 +493,120 @@ fn ci_scripts_are_executable() {
         "not executable (git update-index --chmod=+x):\n{}",
         offenders.join("\n")
     );
+}
+
+/// The pipe stages in one line of shell that stop reading their input
+/// early: `head`, and `grep` with `-q`, `-m`, `-l` or `-L` (or a long
+/// form). Under `set -o pipefail` the producer then dies of SIGPIPE (141)
+/// whenever it is still writing, and the pipeline fails though the reader
+/// matched (ci run 43420737106, ci/e2e-mergiraf.sh).
+fn early_exit_readers(line: &str) -> Vec<String> {
+    let bytes = line.as_bytes();
+    let mut found = Vec::new();
+    for (i, &b) in bytes.iter().enumerate() {
+        let lone_pipe =
+            b == b'|' && bytes.get(i + 1) != Some(&b'|') && (i == 0 || bytes[i - 1] != b'|');
+        if !lone_pipe {
+            continue;
+        }
+        let stage: String = line[i + 1..]
+            .chars()
+            .take_while(|c| !matches!(c, '|' | ';' | '&' | ')'))
+            .collect();
+        let mut words = stage.split_whitespace();
+        let early = match words.next() {
+            Some("head") => true,
+            Some("grep") => words.any(|w| {
+                matches!(
+                    w,
+                    "--quiet" | "--silent" | "--files-with-matches" | "--files-without-match"
+                ) || w.starts_with("--max-count")
+                    || (w.starts_with('-')
+                        && !w.starts_with("--")
+                        && w[1..].chars().all(|c| c.is_ascii_alphanumeric())
+                        && w[1..].contains(['q', 'm', 'l', 'L']))
+            }),
+            _ => false,
+        };
+        if early {
+            found.push(format!("|{}", stage.trim_end()));
+        }
+    }
+    found
+}
+
+/// The CI scripts run under `set -o pipefail`, so no pipe in them feeds a
+/// reader that exits early: `grep P >/dev/null` replaces `grep -q P`, and
+/// `sed -n 1p` replaces `head -n1`, as both read all their input.
+#[test]
+fn ci_pipes_never_end_in_an_early_exit() {
+    let mut files = Vec::new();
+    files_under(&workspace().join("ci"), &mut files);
+    let mut offenders = Vec::new();
+    let mut scripts = 0;
+    for path in files {
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let bash = path.extension().is_some_and(|e| e == "sh")
+            || text.starts_with("#!/usr/bin/env bash")
+            || text.starts_with("#!/bin/bash");
+        if !bash {
+            continue;
+        }
+        scripts += 1;
+        // One logical line: a line ending in `|` or `\` goes on.
+        let mut logical = String::new();
+        let mut first = 0;
+        for (n, line) in text.lines().enumerate() {
+            if logical.is_empty() {
+                first = n + 1;
+            }
+            let trimmed = line.trim_end();
+            logical.push_str(trimmed.strip_suffix('\\').unwrap_or(trimmed));
+            logical.push(' ');
+            if trimmed.ends_with('|') || trimmed.ends_with('\\') {
+                continue;
+            }
+            if !logical.trim_start().starts_with('#') {
+                for stage in early_exit_readers(&logical) {
+                    offenders.push(format!("{}:{first}: {stage}", path.display()));
+                }
+            }
+            logical.clear();
+        }
+    }
+    assert!(scripts > 10, "no ci scripts found");
+    assert!(
+        offenders.is_empty(),
+        "a pipe into a reader that exits early fails under pipefail when the \
+         producer gets SIGPIPE; use `grep P >/dev/null` for `grep -q P` and \
+         `sed -n 1p` for `head -n1`:\n{}",
+        offenders.join("\n")
+    );
+}
+
+#[test]
+fn early_exit_readers_are_found() {
+    for bad in [
+        "git log | grep -qx \"a b\" || fail",
+        "x |\n grep -Fxq y",
+        "a | grep -m1 y",
+        "a | grep --quiet y",
+        "a | head -n1",
+        "sh -c \"a | grep -Eq '^b'\"",
+    ] {
+        assert!(!early_exit_readers(bad).is_empty(), "{bad}");
+    }
+    for good in [
+        "git log | grep -x y >/dev/null || fail",
+        "a || grep -q y file",
+        "grep -q y file",
+        "a | sed -n 1p",
+        "a | grep -v y | grep -E y >/dev/null",
+    ] {
+        assert!(early_exit_readers(good).is_empty(), "{good}");
+    }
 }
 
 /// `ci/publish-image.sh` against a stand-in `docker` whose first `fails`

@@ -188,7 +188,7 @@ assert_eq "c" "$(cat "$MNT/c.txt")" "patch 5 stays applied"
 inbox_empty() { [ -z "$(remote_inbox)" ]; }
 wait_for 30 inbox_empty || fail "the remote inbox never emptied: $(remote_inbox)"
 wait_pushed
-status_clear() { remote_status | grep -q '"queue": \[\]'; }
+status_clear() { remote_status | grep '"queue": \[\]' >/dev/null; }
 wait_for 30 status_clear || fail "status still queues a patch: $(remote_status)"
 pass "status queues nothing"
 for n in 1 2 3 4 5; do

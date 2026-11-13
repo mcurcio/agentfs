@@ -66,7 +66,7 @@ k() { kubectl -n "$NS" "$@"; }
 
 gateway() {
   docker network inspect kind -f '{{range .IPAM.Config}}{{.Gateway}} {{end}}' |
-    tr ' ' '\n' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -n1
+    tr ' ' '\n' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | sed -n 1p
 }
 
 diagnose() {
@@ -109,7 +109,7 @@ rgit() { git --git-dir "$REMOTE" "$@"; }
 current_pod() {
   k get pod -l "$APP" -o go-template \
     --template '{{range .items}}{{if not .metadata.deletionTimestamp}}{{.metadata.name}}{{"\n"}}{{end}}{{end}}' |
-    head -n1
+    sed -n 1p
 }
 
 wait_ready() { # -> POD
@@ -283,7 +283,7 @@ assert_contains "$(k logs "$POD" -c agentfs-init)" "volume $VOLUME already initi
 # patch queue.
 grep -E 'elsewhere|attached' "$LOGS/graceful.log" || true
 case "$(k logs "$POD" -c agentfs)" in
-*"patches: not applied at this start"*) fail "the new pod deferred the patch queue: $(k logs "$POD" -c agentfs | grep -m1 'patches: not applied')" ;;
+*"patches: not applied at this start"*) fail "the new pod deferred the patch queue: $(k logs "$POD" -c agentfs | grep 'patches: not applied' | sed -n 1p)" ;;
 esac
 pass "the new pod did not defer the patch queue"
 
