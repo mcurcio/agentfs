@@ -9,7 +9,7 @@
 
 use crate::engine_names::EngineNames;
 use crate::library::{fail, seed};
-use agentfs_core::tree_actor::{TreeId as EngineTree, Volume};
+use agentfs_core::tree_actor::TreeId as EngineTree;
 use agentfs_model::calls::{CallError, Caller, Took, TreeCalls, TreeId};
 use std::collections::{BTreeMap, VecDeque};
 use std::ffi::CString;
@@ -79,7 +79,7 @@ impl Mounted {
             std::fs::create_dir_all(dir).map_err(|e| io_fail("mkdir", &e))?;
         }
         {
-            let mut volume = Volume::open(&state).map_err(fail)?;
+            let mut volume = crate::library::create(&state).map_err(fail)?;
             seed(&mut volume, names.name(TreeId::ROOT)?).map_err(fail)?;
             if with_sandbox {
                 names.forked(volume.fork().map_err(fail)?)?;

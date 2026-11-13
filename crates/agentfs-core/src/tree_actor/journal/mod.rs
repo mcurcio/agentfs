@@ -9,6 +9,10 @@
 //! tail   = the raw bytes of the record's calls or runs, in order
 //! ```
 //!
+//! Each write-open and step names its writer with the pod context it ran in
+//! (`WriterAt`), so a recovery close commits as the writer that opened.
+//! Format 4's `format` file gates the records' shape: the frame magic stays.
+//!
 //! The salt is random per journal and kept through compaction, so a workload's
 //! bytes inside a tail cannot pass as a frame. An invalid frame with no later
 //! valid frame is a torn tail; with one it is corruption, which an operator
@@ -23,6 +27,7 @@ use std::io::{self, Read, Write};
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
+use agentfs_contracts::pod::WriterAt;
 use serde::{Deserialize, Serialize};
 
 use super::stages::{Timer, Which};
@@ -59,12 +64,12 @@ pub(super) enum Entry {
     Open {
         tree: String,
         path: String,
-        writer: String,
+        by: WriterAt,
         object: u64,
     },
     AnonymousOpen {
         tree: String,
-        writer: String,
+        by: WriterAt,
     },
     Call {
         handle: u64,
@@ -78,9 +83,10 @@ pub(super) enum Entry {
     },
     /// Every pointer change one step makes, and what else it decides.
     Step {
-        by: String,
+        by: WriterAt,
         closes: Option<u64>,
-        opened: Option<OpenRecord>,
+        /// Boxed: the step is the largest record, and most steps open nothing.
+        opened: Option<Box<OpenRecord>>,
         linked: Option<u64>,
         fork: Option<(String, String)>,
         pointers: Vec<PointerChange>,
@@ -92,7 +98,7 @@ pub(super) enum Entry {
 pub(super) struct OpenRecord {
     pub handle: u64,
     pub tree: String,
-    pub writer: String,
+    pub by: WriterAt,
     pub object: u64,
     /// Never linked: its object has no name and no saved state.
     pub anonymous: bool,

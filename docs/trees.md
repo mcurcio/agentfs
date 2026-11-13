@@ -37,7 +37,7 @@ release in CI.
 ```sh
 cargo build --locked -p agentfs
 mkdir -p /tmp/agentfs-trees/root /tmp/agentfs-trees/fork
-target/debug/agentfs --state /tmp/agentfs-trees/state trees init
+target/debug/agentfs --state /tmp/agentfs-trees/state trees init --volume trial
 target/debug/agentfs --state /tmp/agentfs-trees/state trees mount \
   /tmp/agentfs-trees/root --sandbox /tmp/agentfs-trees/fork
 ```
@@ -48,16 +48,54 @@ views with `fusermount3 -u PATH`; unmounting every view ends the process.
 
 | Command or flag | Meaning |
 |---|---|
-| `trees init` | Initialize or recover the state area; prints `root <head>` |
+| `trees init --volume NAME` | Create the volume, or find it under the same name, then recover it; prints `<name> <id> created` or `found`. Another name or another format exits 1 with nothing written |
 | `trees fork` | Create a fork of the root at its saved head; prints its identity, `fork/N` |
-| `trees mount ROOT` | Recover and mount the root on an existing empty directory |
+| `trees mount ROOT` | Recover and mount the root on an existing empty directory. It never creates a volume: run `trees init` first |
+| `--volume NAME` (`trees mount`) | Refuse, before anything is written, a volume with another name |
+| `--owner UID:GID` | Every file's owner in the views (default: the mounting process's user and group) |
+| `--no-allow-other` | Only the mounting user reaches the views. By default other users do (FUSE `allow_other`, which needs `user_allow_other` in `/etc/fuse.conf` when the mounting user is not root) |
+| `--namespace`, `--pod`, `--pod-uid`, `--node` | Where the views run: the pod context of their commits (below) |
 | `--sandbox DIR` | Also mount a fork in DIR (a new one, or `--fork`) |
 | `--fork fork/N` | Reuse this fork (needs `--sandbox`); `root` is refused |
 | `--writer LABEL`, `--sandbox-writer LABEL` | The root's and the fork's writer label (default `root-client`, `sandbox-client`). A label is trusted, not an authenticated identity |
 | `--metrics-output FILE` | Write counters, the journal's length and each stage's runs, time and git children every 100 ms and at unmount |
 
 Mount points must be empty, separate and outside the state area. Metrics never take
-part in ordering.
+part in ordering. Every flag is in [configuration](configuration.md#flags-and-environment).
+
+## Volume identity and trailers
+
+`trees init --volume NAME` gives a new volume a random id (RFC 9562 version 4) and
+writes it with the name to the state area's `volume` file, before the repository and
+`format`. Every start reads `format` and `volume` before it writes anything. The id
+never changes; the name is a label and a guard.
+
+Every commit names its volume, its writer and where the writer ran, in this order:
+
+```text
+<subject>
+
+Agentfs-Writer: <writer>
+Agentfs-Cause: <Root | Direct | Landing | Sync>
+Agentfs-Tree: <root | fork/<n>>
+Agentfs-Event: <step number, 0 for the Root>
+Agentfs-Volume: <volume name>
+Agentfs-Volume-Id: <id>
+Agentfs-Namespace: <namespace>     each pod field only when given
+Agentfs-Pod: <pod>
+Agentfs-Pod-Uid: <pod uid>
+Agentfs-Node: <node>
+Agentfs-Format: envelope-1         every commit but the Root
+Agentfs-Open: <n>                  a save that closed an open
+Agentfs-Collisions: <json>         a landing that decided any
+```
+
+A save carries its writer and the pod context of the mount it came through. The
+journal keeps both with each write-open, so a save recovery makes after a crash
+names the writer that opened the file and where it ran, not the restarted process.
+A landing merge's subject is `Landing by <writer>`, and its writer and pod trailers
+are those of the save it lands. A sync, a fork step and the Root commit are
+`agentfs`'s, with the pod context of the process that serves the volume.
 
 ## What a tree does
 
@@ -89,7 +127,10 @@ part in ordering.
 
 ## The library
 
-`agentfs_core::tree_actor::Volume` holds an exclusive state-area lease. `write_open`,
+`agentfs_core::tree_actor::TreeActor` holds an exclusive state-area lease.
+`TreeActor::create` makes a volume, `TreeActor::open` recovers one and never creates,
+and `tree_actor::inspect` reads what a state area holds without the lease. Each
+recorded call names its writer as a `WriterAt` (the writer and its pod context). `write_open`,
 `write`, `truncate`, `sync` and `close` are the recorded calls. Upstream and fork
 share one bare repository. A commit stores the files under `files/`, line maps in
 `metadata.json` and name versions in `namespace.json` (`Agentfs-Format:
@@ -124,9 +165,11 @@ A step writes its objects, checks and appends its record, then installs and copi
   higher number means corruption and refuses to open; none means a torn tail, saved
   to `calls.wal.torn`. Bit rot in the very last frame reads as a tear and drops
   that record; the log line and that file are the evidence.
-- The state area is `history.git`, `calls.wal`, `actor.lock`, `format` and rebuilt
-  private checkout caches, which the workload never sees. **Earlier state formats do
-  not open.**
+- The state area is `volume`, `history.git`, `calls.wal`, `actor.lock`, `format`
+  and rebuilt private checkout caches, which the workload never sees. A create writes
+  an `initializing` marker first and removes it last; the next `trees init` starts a
+  cut-short create over. **Earlier state formats (format 3 included) do not open**,
+  and are never converted.
 
 ## The view
 

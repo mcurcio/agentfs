@@ -319,6 +319,7 @@ impl Invariants {
             }
             let c = self.commit(oid)?;
             one_writer(oid, &c, self)?;
+            landing_names_its_writer(oid, &c, self)?;
             self.no_duplicate_opens(oid, &c)?;
             self.save_aligned(oid, &c)?;
             self.landing(oid, &c)?;
@@ -578,6 +579,37 @@ impl Invariants {
     }
 }
 
+/// The writer trailers a landing merge copies from the commit it lands.
+const WRITER_TRAILERS: [&str; 5] = [
+    "Agentfs-Writer",
+    "Agentfs-Namespace",
+    "Agentfs-Pod",
+    "Agentfs-Pod-Uid",
+    "Agentfs-Node",
+];
+
+/// git-model §3: a landing merge names the writer whose save it lands. Its writer and
+/// pod trailers are its second parent's, each one alike.
+fn landing_names_its_writer(oid: &str, c: &Commit, inv: &mut Invariants) -> Result<(), String> {
+    if c.trailers("Agentfs-Cause") != ["Landing"] {
+        return Ok(());
+    }
+    let [_, landed] = c.parents.as_slice() else {
+        return Err(format!("landing_names_its_writer: {oid:.7} is no merge"));
+    };
+    let landed = inv.commit(landed)?;
+    for key in WRITER_TRAILERS {
+        if c.trailers(key) != landed.trailers(key) {
+            return Err(format!(
+                "landing_names_its_writer: {oid:.7} has {key} {:?}, the landed commit {:?}",
+                c.trailers(key),
+                landed.trailers(key)
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// R6: every commit names one writer, and a merge originates nothing: it holds only
 /// lines one of its parents holds. One exception: a sync (R11.5, the owner's "A" of
 /// 2026-11-08, finding 48) may hold a line of the upstream's last version of a file the
@@ -717,6 +749,34 @@ mod tests {
         for merge in [stale, held, not_a_sync, nowhere] {
             let error = check(&mut inv, &merge).unwrap_err();
             assert!(error.contains("one_writer"), "{error}");
+        }
+    }
+
+    /// A landing names the writer and pod of the commit it lands, never its own.
+    #[test]
+    fn a_landing_names_the_writer_it_lands() {
+        let repo = Repo::new();
+        let root = repo.commit(&[], "Root", Some(&["b"]));
+        let before = repo.commit(&[&root], "Direct", Some(&["u"]));
+        let pod = "Agentfs-Pod: p-1\nAgentfs-Node: n1\n";
+        let incoming = repo.commit_with(&[&root], "Direct", Some(&["f"]), pod);
+        let named = repo.commit_with(&[&before, &incoming], "Landing", Some(&["u", "f"]), pod);
+        let unnamed = repo.commit(&[&before, &incoming], "Landing", Some(&["u", "f"]));
+        let other_pod = repo.commit_with(
+            &[&before, &incoming],
+            "Landing",
+            Some(&["u", "f"]),
+            "Agentfs-Pod: p-2\nAgentfs-Node: n1\n",
+        );
+        let mut inv = invariants(&repo);
+        let mut judge = |oid: &str| {
+            let c = inv.commit(oid).unwrap();
+            landing_names_its_writer(oid, &c, &mut inv)
+        };
+        assert_eq!(judge(&named), Ok(()));
+        for wrong in [unnamed, other_pod] {
+            let error = judge(&wrong).unwrap_err();
+            assert!(error.contains("Agentfs-Pod"), "{error}");
         }
     }
 

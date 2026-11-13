@@ -17,7 +17,7 @@ cleanup() {
   rm -rf "$work"
 }
 trap cleanup EXIT
-"$AGENTFS_BIN" --state "$work/state" trees init
+"$AGENTFS_BIN" --state "$work/state" trees init --volume t
 strace -f -y -qq -e trace=fsync,pwrite64 -o "$work/trace" \
   "$AGENTFS_BIN" --state "$work/state" trees mount "$work/main" --sandbox "$work/sandbox" >"$work/mount.log" 2>&1 & pid=$!
 for _ in $(seq 1 200); do

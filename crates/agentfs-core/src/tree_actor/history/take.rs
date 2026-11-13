@@ -9,7 +9,7 @@ use super::message::{self, Message};
 use super::refs;
 use crate::tree_actor::stages::{Timer, Which};
 use crate::tree_actor::tree::{EventNumber, Lines, MergeFileIdentity};
-use crate::tree_actor::{Draft, Error, Result, TreeId, Volume, queue, referee};
+use crate::tree_actor::{Draft, Error, Result, TreeActor, TreeId, queue, referee};
 use crate::tree_git::{RefUpdate, TreeGit};
 
 /// The actor's [`referee::Landed`]: whether a save's commit is in `upstream`'s history. That
@@ -40,7 +40,7 @@ pub(in crate::tree_actor) struct SyncStep {
     pub(in crate::tree_actor) snapshot: referee::Snapshot,
 }
 
-impl Volume {
+impl TreeActor {
     /// Whether two snapshots show the same: the same files, each with the same line
     /// versions in the same order, and the same name versions. The versions each line
     /// version was written over may differ.
@@ -114,12 +114,15 @@ impl Volume {
             incoming
         } else {
             let content = self.snapshot_tree(&decision.snapshot)?;
+            // The merge names the writer whose save it lands (git-model §3).
+            let landed = message::writer_at(&incoming_commit.message)?.ok_or(Error::Format)?;
             let message = Message::Landing {
+                landed: &landed,
                 tree,
                 event,
                 collisions: &decision.collisions,
             }
-            .render()?;
+            .render(&self.identity)?;
             self.repo
                 .write_commit(content, &[current, incoming], &message)?
         };
@@ -149,7 +152,7 @@ impl Volume {
         let enqueued = self.enqueue_moves(tree, head, event, &mut changes)?;
         let mut built = t.clone();
         built.install(decision.snapshot)?;
-        let mut draft = Draft::new("agentfs", tree, built);
+        let mut draft = Draft::new(&self.agentfs(), tree, built);
         draft.changes = changes;
         draft.enqueued = enqueued;
         draft.taken = 1;
@@ -281,7 +284,12 @@ impl Volume {
                 target
             } else {
                 let content = self.snapshot_tree(&snapshot)?;
-                let message = Message::Sync { tree, event }.render()?;
+                let message = Message::Sync {
+                    service: &self.service,
+                    tree,
+                    event,
+                }
+                .render(&self.identity)?;
                 self.repo
                     .write_commit(content, &[current, target], &message)?
             };
@@ -300,7 +308,7 @@ impl Volume {
                 expected_old: Some(value),
             });
         }
-        let mut draft = Draft::new("agentfs", tree, built);
+        let mut draft = Draft::new(&self.agentfs(), tree, built);
         draft.changes = changes;
         draft.taken = u64::from(taken);
         Ok(draft)

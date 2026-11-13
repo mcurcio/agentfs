@@ -11,6 +11,6 @@ cleanup() {
 }
 trap cleanup EXIT
 mkdir "$work/main"
-"$bin" --state "$work/state" trees init
+"$bin" --state "$work/state" trees init --volume t
 python3 ci/trees-restart.py "$bin" "$work/state" "$work/main"
 git --git-dir="$work/state/history.git" fsck --strict

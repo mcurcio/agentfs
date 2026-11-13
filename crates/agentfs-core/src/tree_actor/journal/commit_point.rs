@@ -4,7 +4,7 @@
 use super::{CompactError, Entry, OpenRecord, Record};
 use crate::tree_actor::recording::pages;
 use crate::tree_actor::stages::{Timer, Which};
-use crate::tree_actor::{Error, Result, Volume, now_ns};
+use crate::tree_actor::{Error, Result, TreeActor, now_ns};
 
 /// When a journal this long after its last compaction compacts again.
 /// Constants, not a setting: restart memory is at most this plus live calls.
@@ -12,7 +12,7 @@ pub(in crate::tree_actor) fn compact_at(len_after_last: u64) -> u64 {
     (64_u64 << 20).max(len_after_last.saturating_mul(2))
 }
 
-impl Volume {
+impl TreeActor {
     /// Appends one record that moves no pointer, or the step `run_step` built.
     /// Only a file that can no longer be trusted stops the actor.
     pub(in crate::tree_actor) fn journal_record(
@@ -49,7 +49,7 @@ impl Volume {
             .map(|(handle, h)| OpenRecord {
                 handle: *handle,
                 tree: h.tree.to_string(),
-                writer: h.writer.clone(),
+                by: h.by.clone(),
                 object: h.object,
                 anonymous: self
                     .trees

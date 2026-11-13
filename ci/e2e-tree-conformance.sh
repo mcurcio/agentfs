@@ -16,7 +16,7 @@ cleanup() {
 }
 trap cleanup EXIT
 mkdir "$work/main" "$work/sandbox"
-"$bin" --state "$work/state" trees init
+"$bin" --state "$work/state" trees init --volume t
 fork=$("$bin" --state "$work/state" trees fork)
 "$bin" --state "$work/state" trees mount "$work/main" --sandbox "$work/sandbox" --fork "$fork" --metrics-output "$work/metrics" >"$work/mount.log" 2>&1 &
 pid=$!

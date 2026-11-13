@@ -1,21 +1,27 @@
-//! Line rules R10.8, R10.6 and R10.9 through the real `Volume`: its saves, its
+//! Line rules R10.8, R10.6 and R10.9 through the real `TreeActor`: its saves, its
 //! queue and its Git history. Target git-model §7.
-use agentfs_core::tree_actor::{TreeId, Volume};
+use agentfs_core::tree_actor::{TreeActor, TreeId};
+use trees::{new_actor, writer};
 
 const ROOT: TreeId = TreeId::Root;
 use agentfs_core::tree_git::TreeGit;
 
+#[path = "support/trees.rs"]
+mod trees;
+
 const BASE: &[u8] = b"-\n-\n-\n-\n-\n-\n";
 const PARENT: &[u8] = b"-\nm1.1\n-\n-\n-\n-\n";
 
-fn put(v: &mut Volume, tree: TreeId, path: &str, bytes: &[u8]) {
-    let h = v.write_open(tree, path, "test-writer", true).unwrap();
+fn put(v: &mut TreeActor, tree: TreeId, path: &str, bytes: &[u8]) {
+    let h = v
+        .write_open(tree, path, &writer("test-writer"), true)
+        .unwrap();
     v.truncate(h, 0).unwrap();
     v.write(h, 0, bytes, false).unwrap();
     v.close(h).unwrap();
 }
 
-fn drain(v: &mut Volume) {
+fn drain(v: &mut TreeActor) {
     while v.progress().unwrap() {}
 }
 
@@ -52,13 +58,13 @@ fn lost(repo: &TreeGit, save: git2::Oid) -> bool {
 #[test]
 fn a_save_with_an_unfinished_line_before_a_kept_line_loses_whole() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut v = Volume::open(tmp.path()).unwrap();
+    let mut v = new_actor(tmp.path());
     put(&mut v, ROOT, "c", BASE);
     drain(&mut v);
     let fork = v.fork().unwrap();
     put(&mut v, fork, "c", b"y");
     let first = v.head(fork).unwrap();
-    let edit = v.write_open(fork, "c", "editor", false).unwrap();
+    let edit = v.write_open(fork, "c", &writer("editor"), false).unwrap();
     put(&mut v, ROOT, "c", PARENT);
     v.write(edit, 0, b"n6", false).unwrap();
     v.close(edit).unwrap();
@@ -88,7 +94,7 @@ fn a_save_with_an_unfinished_line_before_a_kept_line_loses_whole() {
 #[test]
 fn an_unfinished_save_past_the_parents_lines_lands() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut v = Volume::open(tmp.path()).unwrap();
+    let mut v = new_actor(tmp.path());
     put(&mut v, ROOT, "a", b"base\n");
     drain(&mut v);
     let fork = v.fork().unwrap();
@@ -106,11 +112,11 @@ fn an_unfinished_save_past_the_parents_lines_lands() {
 #[test]
 fn a_sync_hides_the_parents_unfinished_line_until_decided() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut v = Volume::open(tmp.path()).unwrap();
+    let mut v = new_actor(tmp.path());
     put(&mut v, ROOT, "a", b"base\n");
     drain(&mut v);
     let fork = v.fork().unwrap();
-    let held = v.write_open(ROOT, "a", "holder", false).unwrap();
+    let held = v.write_open(ROOT, "a", &writer("holder"), false).unwrap();
     put(&mut v, fork, "a", b"base\nchild\n");
     put(&mut v, ROOT, "a", b"base\n}");
     drain(&mut v);
@@ -128,11 +134,11 @@ fn a_sync_hides_the_parents_unfinished_line_until_decided() {
 #[test]
 fn a_sync_hides_the_parents_later_lines_behind_an_undecided_unfinished_line() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut v = Volume::open(tmp.path()).unwrap();
+    let mut v = new_actor(tmp.path());
     put(&mut v, ROOT, "a", b"a\nb\n");
     drain(&mut v);
     let fork = v.fork().unwrap();
-    let held = v.write_open(ROOT, "a", "holder", false).unwrap();
+    let held = v.write_open(ROOT, "a", &writer("holder"), false).unwrap();
     put(&mut v, fork, "a", b"y");
     let save = v.head(fork).unwrap();
     put(&mut v, ROOT, "a", b"a\nb\nm7\n");

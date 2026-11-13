@@ -43,9 +43,11 @@ dependencies = [
 name = "agentfs"
 version = "0.1.0"
 dependencies = [
+ "agentfs-contracts",
  "agentfs-core",
  "agentfs-csi",
  "agentfs-fuse",
+ "agentfs-volume",
  "anyhow",
  "clap",
  "git2",
@@ -89,11 +91,13 @@ dependencies = [
 name = "agentfs-conformance"
 version = "0.0.0"
 dependencies = [
+ "agentfs-contracts",
  "agentfs-core",
  "agentfs-model",
  "libc",
  "serde_json",
  "tempfile",
+ "uuid",
 ]
 
 [[package]]
@@ -101,6 +105,7 @@ name = "agentfs-contracts"
 version = "0.1.0"
 dependencies = [
  "serde",
+ "serde_json",
  "thiserror",
  "uuid",
 ]
@@ -111,6 +116,7 @@ version = "0.1.0"
 dependencies = [
  "agentfs-align",
  "agentfs-contracts",
+ "agentfs-volume",
  "base64 0.23.1",
  "bstr",
  "crc32fast",
@@ -144,6 +150,7 @@ dependencies = [
  "tonic-prost-build",
  "tower",
  "ureq",
+ "uuid",
 ]
 
 [[package]]
@@ -176,6 +183,7 @@ dependencies = [
 name = "agentfs-fuse"
 version = "0.1.0"
 dependencies = [
+ "agentfs-contracts",
  "agentfs-core",
  "fuser",
  "git2",
@@ -184,6 +192,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror",
+ "uuid",
 ]
 
 [[package]]
@@ -205,6 +214,7 @@ name = "agentfs-volume"
 version = "0.1.0"
 dependencies = [
  "agentfs-contracts",
+ "uuid",
 ]
 
 [[package]]
@@ -3907,6 +3917,7 @@ version = "1.29.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bed99139f7dac9b5cfe5f17be4d66dc7079a34dee1d74bcc77217119240e267c"
 dependencies = [
+ "getrandom 0.4.3",
  "js-sys",
  "serde_core",
  "wasm-bindgen",

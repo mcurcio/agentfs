@@ -201,6 +201,10 @@ Agentfs-Cause: Direct         # Direct (a save) | Landing | Sync | Transaction t
 Agentfs-Tree: fork/3          # root | fork/<id>: the tree it was made for, by identity, never a published name (a transaction's commit names its fork)
 ```
 
+The engine's commits carry these three and more: the event, the volume's name and id, and the pod context the writer
+ran in (`Agentfs-Event`, `Agentfs-Volume`, `Agentfs-Volume-Id`, `Agentfs-Namespace`, `Agentfs-Pod`, `Agentfs-Pod-Uid`,
+`Agentfs-Node`; their order is in docs/trees.md), and a landing's writer and pod trailers are its second parent's.
+
 A take that decides a collision (R5.1, R9.9) records it in its own result commit, a landing or transaction commit, with
 one more trailer per record: its tree, file, cause, losing change, collision ref, lines, lost and won versions. So a
 commit says which tree it belongs to and what it decided there, and a decision reaches a fork only with its commit:

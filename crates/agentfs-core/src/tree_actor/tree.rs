@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-use super::{Error, Result, Volume, referee};
+use super::{Error, Result, TreeActor, referee};
 use crate::tree_reconcile::LineMap;
 
 /// A step's journal number. It numbers the step's name versions and line versions, and the object,
@@ -335,7 +335,7 @@ impl NameHistory {
     }
 }
 
-impl Volume {
+impl TreeActor {
     pub(super) fn snapshot_of(tree: &Tree) -> referee::Snapshot {
         let files = tree
             .names

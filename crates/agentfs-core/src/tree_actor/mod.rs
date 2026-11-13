@@ -24,6 +24,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use agentfs_contracts::name::WriterLabel;
+use agentfs_contracts::pod::{PodContext, WriterAt};
+use agentfs_contracts::ports::Found;
+use agentfs_contracts::volume::VolumeIdentity;
 use git2::Oid;
 use serde::Serialize;
 
@@ -41,9 +45,13 @@ use recording::{Handle, pages};
 use stages::{Stages, Timer, Which};
 use tree::{EventNumber, Tree};
 
-const FORMAT: &str = "agentfs-trees-3\n";
+const FORMAT: &str = "agentfs-trees-4\n";
+/// The volume identity file: [`VolumeIdentity`] as JSON, written once by
+/// [`TreeActor::create`], read before any write at every open.
+const IDENTITY: &str = "volume";
 const JOURNAL: &str = "calls.wal";
 const INITIALIZING: &str = "initializing";
+const LOCK: &str = "actor.lock";
 type Result<T> = std::result::Result<T, Error>;
 
 #[derive(Debug, thiserror::Error)]
@@ -64,8 +72,8 @@ pub enum Error {
     Format,
     #[error("tree supports flat, git-safe UTF-8 names only")]
     Name,
-    #[error("writer must be a nonempty single-line label")]
-    Writer,
+    #[error("no tree volume here: create it with `agentfs trees init --volume NAME`")]
+    NotCreated,
     #[error("no such tree, file or handle")]
     NotFound,
     #[error("file already exists")]
@@ -102,7 +110,7 @@ impl Error {
         match self {
             Self::NotFound => libc::ENOENT,
             Self::Exists => libc::EEXIST,
-            Self::Name | Self::Writer => libc::EINVAL,
+            Self::Name => libc::EINVAL,
             Self::TooLarge => libc::EFBIG,
             Self::Busy => libc::EBUSY,
             Self::TreeGit(crate::tree_git::Error::NoSpace(_)) => libc::ENOSPC,
@@ -127,7 +135,7 @@ enum QueueAction {
     Sync(Oid, queue::Cut<SyncStep>),
 }
 
-/// What [`Volume::take_next`] did: took one entry, found every entry waiting, or
+/// What [`TreeActor::take_next`] did: took one entry, found every entry waiting, or
 /// found none queued. Apart from the model's (`agentfs_model::calls::Took`):
 /// neither crate depends on the other.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -172,7 +180,7 @@ pub struct Metrics {
 
 /// A step built on a copy of its tree and not yet on record.
 struct Draft {
-    by: String,
+    by: WriterAt,
     tree: TreeId,
     built: Tree,
     changes: Vec<RefUpdate>,
@@ -187,9 +195,9 @@ struct Draft {
 }
 
 impl Draft {
-    fn new(by: &str, tree: TreeId, built: Tree) -> Self {
+    fn new(by: &WriterAt, tree: TreeId, built: Tree) -> Self {
         Self {
-            by: by.to_owned(),
+            by: by.clone(),
             tree,
             built,
             changes: Vec::new(),
@@ -208,7 +216,7 @@ impl Draft {
         Entry::Step {
             by: self.by.clone(),
             closes: self.closes,
-            opened: self.opened.as_ref().map(LiveOpen::record),
+            opened: self.opened.as_ref().map(|open| Box::new(open.record())),
             linked: self.linked,
             fork: self
                 .fork
@@ -228,8 +236,13 @@ impl Draft {
 
 /// A single synchronous actor. Sharing requires a mutex; a second process
 /// cannot open this volume. No method exposes its state area to workloads.
-pub struct Volume {
+pub struct TreeActor {
     root: PathBuf,
+    /// The volume identity file's content: every commit's `Agentfs-Volume` and
+    /// `Agentfs-Volume-Id`.
+    identity: VolumeIdentity,
+    /// The history service's pod context, carried by its own commits (Root, Sync).
+    service: PodContext,
     repo: TreeGit,
     journal: Journal,
     /// Runtime pointer reads come from here, never from Git's copy.
@@ -257,74 +270,98 @@ pub struct Volume {
     _lock: Arc<FileLock>,
 }
 
-// Only a first init deletes, and only under its own marker: a cut one holds
-// nothing a call returned for. Any other state area with no `format` or no
-// journal is refused by the caller, with nothing removed.
-fn prepare_state_area(root: &Path, lock: &Arc<FileLock>) -> Result<()> {
-    let marker = root.join(INITIALIZING);
-    if marker.exists() {
-        for dir in ["history.git", "trees"] {
-            if root.join(dir).exists() {
-                fs::remove_dir_all(root.join(dir))?;
-            }
-        }
-        for file in [JOURNAL, "format"] {
-            match fs::remove_file(root.join(file)) {
-                Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e.into()),
-                _ => {}
-            }
-        }
-    } else if fs::read_dir(root)?.any(|e| e.map_or(true, |e| e.file_name() != "actor.lock")) {
-        return Ok(());
+/// What a state area holds: reads `format` and `volume` only, takes no lock,
+/// writes nothing. An absent or empty directory (its lock file at most), or one
+/// a cut-short create left under its `initializing` marker, holds `Nothing`.
+///
+/// # Errors
+///
+/// A directory or file that could not be read.
+pub fn inspect(root: &Path) -> io::Result<Found> {
+    let entries = match fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Found::Nothing),
+        Err(e) => return Err(e),
+    };
+    let mut names = Vec::new();
+    for entry in entries {
+        names.push(entry?.file_name());
     }
-    fs::write(&marker, b"")?;
-    File::open(&marker)?.sync_all()?;
-    File::open(root)?.sync_all()?;
-    let repo = TreeGit::init_with_lease(root.join("history.git"), Arc::clone(lock))?;
-    repo.write_config(&refs::head(), &BTreeMap::new())?;
-    let tree = repo.write_tree(&[])?;
-    let head = repo.write_commit(tree, &[], &Message::Root.render()?)?;
-    Journal::create(
-        &root.join(JOURNAL),
-        &Record {
-            seq: 0,
-            at_ns: now_ns(),
-            entry: Entry::Checkpoint {
-                next_seq: 1,
-                pointers: [(refs::branch(TreeId::Root), head.to_string())]
-                    .into_iter()
-                    .collect(),
-                upstreams: BTreeMap::new(),
-                opens: Vec::new(),
-                page_saved: Vec::new(),
-            },
-        },
-    )?;
-    crate::failpoints::hit("tree.init_before_format")?;
-    let temporary = root.join("format.tmp");
-    fs::write(&temporary, FORMAT)?;
+    if names.iter().all(|name| name == LOCK) || names.iter().any(|name| name == INITIALIZING) {
+        return Ok(Found::Nothing);
+    }
+    match fs::read(root.join("format")) {
+        Ok(format) if format == FORMAT.as_bytes() => {}
+        Ok(_) => return Ok(Found::Other),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Found::Other),
+        Err(e) => return Err(e),
+    }
+    match fs::read(root.join(IDENTITY)) {
+        Ok(bytes) => Ok(serde_json::from_slice(&bytes).map_or(Found::Other, Found::Volume)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Found::Other),
+        Err(e) => Err(e),
+    }
+}
+
+/// The identity of the volume at `root`: [`Error::NotCreated`] where there is
+/// none, [`Error::Format`] for another format.
+fn found_volume(root: &Path) -> Result<VolumeIdentity> {
+    match inspect(root)? {
+        Found::Nothing => Err(Error::NotCreated),
+        Found::Other => Err(Error::Format),
+        Found::Volume(identity) => Ok(identity),
+    }
+}
+
+/// The state area's exclusive lock: [`Error::Busy`] while another holds it.
+fn lock_area(root: &Path) -> Result<Arc<FileLock>> {
+    Ok(Arc::new(
+        FileLock::try_take(&root.join(LOCK), Mode::Exclusive)?.ok_or(Error::Busy)?,
+    ))
+}
+
+fn sync_dir(root: &Path) -> io::Result<()> {
+    File::open(root)?.sync_all()
+}
+
+/// Writes `bytes` to `name` whole: a temporary file, fsynced, renamed into place.
+fn write_durably(root: &Path, name: &str, bytes: &[u8]) -> io::Result<()> {
+    let temporary = root.join(format!("{name}.tmp"));
+    fs::write(&temporary, bytes)?;
     File::open(&temporary)?.sync_all()?;
-    fs::rename(&temporary, root.join("format"))?;
-    File::open(root)?.sync_all()?;
-    fs::remove_file(&marker)?;
-    File::open(root)?.sync_all()?;
+    fs::rename(&temporary, root.join(name))?;
+    sync_dir(root)
+}
+
+// Only a create deletes, and only under its own marker: a cut one holds
+// nothing a call returned for.
+fn clear_cut_create(root: &Path) -> io::Result<()> {
+    for dir in ["history.git", "trees"] {
+        if root.join(dir).exists() {
+            fs::remove_dir_all(root.join(dir))?;
+        }
+    }
+    for file in [JOURNAL, "format", "format.tmp", IDENTITY, "volume.tmp"] {
+        match fs::remove_file(root.join(file)) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+            _ => {}
+        }
+    }
     Ok(())
 }
 
-impl Volume {
-    /// Initialize an empty directory or recover a tree volume before serving.
-    /// Recovery closes every abandoned write-open exactly once. It takes no
-    /// queue entries: the view's worker or a caller runs [`Volume::progress`].
+impl TreeActor {
+    /// Creates a volume in an absent or empty directory (or one a cut-short
+    /// create left under its marker): the marker, `volume`, the repository and
+    /// its Root commit (writer `agentfs`, `service`'s pod context), the journal,
+    /// then `format`; each fsynced, the directory too. Then serves it, as
+    /// [`TreeActor::open`] does.
     ///
     /// # Errors
     ///
-    /// [`Error::Format`] for a state area that is not this format (an older
-    /// format included), or whose journal names a tree that is no [`TreeId`],
-    /// has no root, gives the root an upstream or a fork an upstream that is no
-    /// tree; [`Error::CorruptJournal`] and [`Error::MissingObject`] when the journal
-    /// or a pointer's objects are damaged (docs/runbooks/recording-failures.md),
-    /// and any failure of a recovery close.
-    pub fn open(root: &Path) -> Result<Self> {
+    /// [`Error::Exists`] for any other directory, [`Error::Busy`] while another
+    /// holds the state area, and any failed write.
+    pub fn create(root: &Path, identity: &VolumeIdentity, service: &PodContext) -> Result<Self> {
         crate::history::init_libgit2();
         if !root.exists() {
             fs::DirBuilder::new()
@@ -333,18 +370,97 @@ impl Volume {
                 .create(root)?;
         }
         let root = root.canonicalize()?;
-        let lock = Arc::new(
-            FileLock::try_take(&root.join("actor.lock"), Mode::Exclusive)?.ok_or(Error::Busy)?,
-        );
-        // Never grant another user access to a newly initialized state area.
-        fs::set_permissions(&root, fs::Permissions::from_mode(0o700))?;
-        prepare_state_area(&root, &lock)?;
-        match fs::read_to_string(root.join("format")) {
-            Ok(format) if format == FORMAT => {}
-            Ok(_) => return Err(Error::Format),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Err(Error::Format),
-            Err(e) => return Err(e.into()),
+        let lock = lock_area(&root)?;
+        if inspect(&root)? != Found::Nothing {
+            return Err(Error::Exists);
         }
+        // Never grant another user access to a new state area.
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700))?;
+        let marker = root.join(INITIALIZING);
+        if marker.exists() {
+            clear_cut_create(&root)?;
+        }
+        fs::write(&marker, b"")?;
+        File::open(&marker)?.sync_all()?;
+        sync_dir(&root)?;
+        let mut text = serde_json::to_string(identity)?;
+        text.push('\n');
+        write_durably(&root, IDENTITY, text.as_bytes())?;
+        let repo = TreeGit::init_with_lease(root.join("history.git"), Arc::clone(&lock))?;
+        repo.write_config(&refs::head(), &BTreeMap::new())?;
+        let tree = repo.write_tree(&[])?;
+        let head = repo.write_commit(tree, &[], &Message::Root { service }.render(identity)?)?;
+        Journal::create(
+            &root.join(JOURNAL),
+            &Record {
+                seq: 0,
+                at_ns: now_ns(),
+                entry: Entry::Checkpoint {
+                    next_seq: 1,
+                    pointers: [(refs::branch(TreeId::Root), head.to_string())]
+                        .into_iter()
+                        .collect(),
+                    upstreams: BTreeMap::new(),
+                    opens: Vec::new(),
+                    page_saved: Vec::new(),
+                },
+            },
+        )?;
+        drop(repo);
+        crate::failpoints::hit("tree.init_before_format")?;
+        write_durably(&root, "format", FORMAT.as_bytes())?;
+        fs::remove_file(&marker)?;
+        sync_dir(&root)?;
+        Self::serve(root, lock, identity.clone(), service.clone())
+    }
+
+    /// Recovers a volume and serves it. Reads `format` and `volume` before any
+    /// write. Recovery closes every abandoned write-open exactly once, as its
+    /// own writer with its journaled pod context; `service` is carried by the
+    /// Sync commits this run writes. It takes no queue entries: the view's
+    /// worker or a caller runs [`TreeActor::progress`].
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotCreated`] where no volume was created; [`Error::Format`] for
+    /// a state area that is not this format (an older format included), or
+    /// whose journal names a tree that is no [`TreeId`], has no root, gives the
+    /// root an upstream or a fork an upstream that is no tree;
+    /// [`Error::CorruptJournal`] and [`Error::MissingObject`] when the journal
+    /// or a pointer's objects are damaged (docs/runbooks/recording-failures.md),
+    /// and any failure of a recovery close.
+    pub fn open(root: &Path, service: &PodContext) -> Result<Self> {
+        found_volume(root)?;
+        crate::history::init_libgit2();
+        let root = root.canonicalize()?;
+        let lock = lock_area(&root)?;
+        // Again under the lock: a create may have been cut short since.
+        let identity = found_volume(&root)?;
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700))?;
+        Self::serve(root, lock, identity, service.clone())
+    }
+
+    /// The volume identity file's content.
+    pub fn identity(&self) -> &VolumeIdentity {
+        &self.identity
+    }
+
+    /// `agentfs`, with the history service's pod context: the writer of a fork
+    /// step, a sync and the Root commit.
+    fn agentfs(&self) -> WriterAt {
+        WriterAt {
+            writer: WriterLabel::agentfs(),
+            at: self.service.clone(),
+        }
+    }
+
+    /// Recovers the locked state area of a volume of this format.
+    fn serve(
+        root: PathBuf,
+        lock: Arc<FileLock>,
+        identity: VolumeIdentity,
+        service: PodContext,
+    ) -> Result<Self> {
         let (journal, frames) = Journal::open(&root.join(JOURNAL))?;
         let folded = fold(&frames)?;
         drop(frames);
@@ -359,6 +475,8 @@ impl Volume {
         crate::failpoints::hit("tree.after_ref_rebuild")?;
         let mut volume = Self {
             root,
+            identity,
+            service,
             repo,
             journal,
             pointers: folded.pointers,
@@ -389,7 +507,7 @@ impl Volume {
                 handle,
                 Handle {
                     tree: open.tree,
-                    writer: open.writer,
+                    by: open.by,
                     object: open.object,
                     // Nothing reads it: this handle closes before serving.
                     bytes: Vec::new(),
@@ -488,7 +606,7 @@ impl Volume {
             for object in std::mem::take(&mut tree.anonymous) {
                 tree.drop_object(object);
             }
-            let mut draft = Draft::new("agentfs", fork, tree);
+            let mut draft = Draft::new(&v.agentfs(), fork, tree);
             draft.changes.push(RefUpdate {
                 refname: refs::branch(fork),
                 new: Some(at),
@@ -568,7 +686,7 @@ impl Volume {
     }
 
     /// One queue step in `tree`: its first entry P1 lets go is taken whole, in
-    /// this one call. Failures are not swallowed, unlike [`Volume::progress`].
+    /// this one call. Failures are not swallowed, unlike [`TreeActor::progress`].
     pub fn take_next(&mut self, tree: TreeId) -> Result<Took> {
         if self.stopped {
             return Err(Error::Stopped);
@@ -727,7 +845,7 @@ impl Volume {
                 open.handle,
                 Handle {
                     tree: open.tree,
-                    writer: open.writer,
+                    by: open.by,
                     object: open.object,
                     bytes,
                     calls: Vec::new(),
@@ -786,9 +904,44 @@ impl Volume {
     }
 }
 
+/// The unit tests' volumes: one line each, as `tests/support/trees.rs` gives the
+/// integration tests.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::path::Path;
+
+    use agentfs_contracts::name::{VolumeName, WriterLabel};
+    use agentfs_contracts::pod::{PodContext, WriterAt};
+    use agentfs_contracts::volume::{VolumeId, VolumeIdentity};
+
+    use super::TreeActor;
+
+    /// A new volume `test` with a fixed id, served with an empty pod context.
+    pub(crate) fn new_actor(dir: &Path) -> TreeActor {
+        let identity = VolumeIdentity {
+            name: VolumeName::parse("test").expect("a safe name"),
+            id: VolumeId(uuid::Uuid::from_u128(1)),
+        };
+        TreeActor::create(dir, &identity, &PodContext::default()).expect("creates")
+    }
+
+    pub(crate) fn reopen(dir: &Path) -> TreeActor {
+        TreeActor::open(dir, &PodContext::default()).expect("reopens")
+    }
+
+    /// `label` with an empty pod context.
+    pub(crate) fn writer(label: &str) -> WriterAt {
+        WriterAt {
+            writer: WriterLabel::parse(label).expect("a writer"),
+            at: PodContext::default(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::journal::Frame;
+    use super::test_support::{new_actor, reopen, writer};
     use super::*;
 
     const ROOT: TreeId = TreeId::Root;
@@ -800,21 +953,22 @@ mod tests {
     #[test]
     fn compaction_keeps_the_fold() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut v = Volume::open(tmp.path()).unwrap();
+        let mut v = new_actor(tmp.path());
+        let w = writer("w");
         // Both kinds of live open with calls and page writes, closed opens with
         // both, a fork and a queue entry.
         let fork = v.fork().unwrap();
-        let held = v.write_open(ROOT, "held", "w", true).unwrap();
+        let held = v.write_open(ROOT, "held", &w, true).unwrap();
         v.write(held, 0, b"held-1", false).unwrap();
-        let shared = v.write_open(ROOT, "shared", "w", true).unwrap();
+        let shared = v.write_open(ROOT, "shared", &w, true).unwrap();
         v.write(shared, 0, b"shared", false).unwrap();
         let object = v.open_object(shared).unwrap();
-        let other = v.write_open(ROOT, "shared", "w", false).unwrap();
+        let other = v.write_open(ROOT, "shared", &w, false).unwrap();
         v.page_writeback(other, 1, b"WXYZ").unwrap();
         v.close(other).unwrap();
-        let anonymous = v.anonymous_open(ROOT, "w").unwrap();
+        let anonymous = v.anonymous_open(ROOT, &w).unwrap();
         v.write(anonymous, 0, b"unnamed", false).unwrap();
-        let closed = v.write_open(ROOT, "closed", "w", true).unwrap();
+        let closed = v.write_open(ROOT, "closed", &w, true).unwrap();
         v.write(closed, 0, b"closed", false).unwrap();
         let closed_object = v.open_object(closed).unwrap();
         v.record_page_write(
@@ -827,7 +981,7 @@ mod tests {
         )
         .unwrap();
         v.close(closed).unwrap();
-        v.write_open(fork, "sandbox", "w", true).unwrap();
+        v.write_open(fork, "sandbox", &w, true).unwrap();
 
         let mut whole = frames_of(tmp.path());
         let folded = fold(&whole).unwrap();
@@ -849,9 +1003,9 @@ mod tests {
         // What follows lands on either start and adds up the same.
         v.write(held, 0, b"held-2", false).unwrap();
         v.write(shared, 0, b"!", true).unwrap();
-        let again = v.write_open(ROOT, "again", "w", true).unwrap();
+        let again = v.write_open(ROOT, "again", &w, true).unwrap();
         v.close(shared).unwrap();
-        v.first_link(ROOT, anonymous, "named", "w").unwrap();
+        v.first_link(ROOT, anonymous, "named", &w).unwrap();
         v.close(again).unwrap();
         while v.progress().unwrap() {}
         let now = frames_of(tmp.path());
@@ -870,18 +1024,19 @@ mod tests {
     #[test]
     fn a_compaction_keeps_a_closed_opens_page_write_out_of_recovery() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut v = Volume::open(tmp.path()).unwrap();
-        let first = v.write_open(ROOT, "f", "w", true).unwrap();
+        let mut v = new_actor(tmp.path());
+        let w = writer("w");
+        let first = v.write_open(ROOT, "f", &w, true).unwrap();
         v.page_writeback(first, 0, b"XXXX").unwrap();
         v.close(first).unwrap();
-        let second = v.write_open(ROOT, "f", "w", false).unwrap();
+        let second = v.write_open(ROOT, "f", &w, false).unwrap();
         v.write(second, 0, b"YYYY", false).unwrap();
         v.close(second).unwrap();
         // Held open across the compaction, as a long-lived log is.
-        let _held = v.write_open(ROOT, "f", "w", false).unwrap();
+        let _held = v.write_open(ROOT, "f", &w, false).unwrap();
         v.compact().unwrap();
         drop(v);
-        let v = Volume::open(tmp.path()).unwrap();
+        let v = reopen(tmp.path());
         assert_eq!(v.read(ROOT, "f").unwrap(), b"YYYY");
     }
 
@@ -890,9 +1045,9 @@ mod tests {
 
     /// A volume with fork 1 compacted to its checkpoint alone; reopened with
     /// `edit` applied to that checkpoint's pointers and upstreams.
-    fn reopen_with(edit: CheckpointEdit) -> Result<Volume> {
+    fn reopen_with(edit: CheckpointEdit) -> Result<TreeActor> {
         let tmp = tempfile::tempdir().unwrap();
-        let mut v = Volume::open(tmp.path()).unwrap();
+        let mut v = new_actor(tmp.path());
         v.fork().unwrap();
         v.compact().unwrap();
         drop(v);
@@ -914,7 +1069,7 @@ mod tests {
         edit(pointers, upstreams);
         fs::remove_file(tmp.path().join(JOURNAL)).unwrap();
         Journal::create(&tmp.path().join(JOURNAL), &first).unwrap();
-        Volume::open(tmp.path())
+        TreeActor::open(tmp.path(), &PodContext::default())
     }
 
     #[test]
@@ -953,11 +1108,16 @@ mod tests {
     }
 
     #[test]
-    fn a_format_2_state_area_is_refused() {
-        let tmp = tempfile::tempdir().unwrap();
-        drop(Volume::open(tmp.path()).unwrap());
-        fs::write(tmp.path().join("format"), "agentfs-trees-2\n").unwrap();
-        assert!(matches!(Volume::open(tmp.path()), Err(Error::Format)));
+    fn an_older_format_is_refused() {
+        for older in ["agentfs-trees-2\n", "agentfs-trees-3\n"] {
+            let tmp = tempfile::tempdir().unwrap();
+            drop(new_actor(tmp.path()));
+            fs::write(tmp.path().join("format"), older).unwrap();
+            assert!(matches!(
+                TreeActor::open(tmp.path(), &PodContext::default()),
+                Err(Error::Format)
+            ));
+        }
     }
 
     /// A fork's landing in the root's queue is what `pending_from` sees, for
@@ -965,12 +1125,13 @@ mod tests {
     #[test]
     fn pending_from_holds_while_a_forks_landing_is_queued() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut v = Volume::open(tmp.path()).unwrap();
+        let mut v = new_actor(tmp.path());
+        let w = writer("w");
         let fork = v.fork().unwrap();
         let other = v.fork().unwrap();
         assert!(!v.pending_from(fork).unwrap());
         assert!(!v.pending_from(ROOT).unwrap(), "the root lands nowhere");
-        let h = v.write_open(fork, "f", "w", true).unwrap();
+        let h = v.write_open(fork, "f", &w, true).unwrap();
         v.write(h, 0, b"x\n", false).unwrap();
         v.close(h).unwrap();
         assert!(v.pending_from(fork).unwrap());

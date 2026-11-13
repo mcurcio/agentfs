@@ -9,3 +9,7 @@ description = "The volume domain of agentfs: pure, over the ports in agentfs-con
 
 [dependencies]
 agentfs-contracts = { version = "0.1.0", path = "../agentfs-contracts" }
+
+[dev-dependencies]
+# Fixed volume ids in the tests.
+uuid = { version = "1", default-features = false, features = ["std"] }

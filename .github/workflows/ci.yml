@@ -447,6 +447,8 @@ jobs:
         with:
           key: trees
       - run: sudo apt-get update && sudo apt-get install -y fuse3
+      # The tree views mount with FUSE allow_other by default.
+      - run: echo user_allow_other | sudo tee -a /etc/fuse.conf
       - uses: ./.github/actions/pinned-git
       - run: cargo build --locked -p agentfs
       - run: ci/e2e-trees.sh

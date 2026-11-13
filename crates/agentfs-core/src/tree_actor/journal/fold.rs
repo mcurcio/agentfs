@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use agentfs_contracts::pod::WriterAt;
 use git2::Oid;
 
 use super::{Entry, Frame, OpenRecord, PointerChange, Record, RunHead};
@@ -16,7 +17,7 @@ use crate::tree_git::RefUpdate;
 pub(in crate::tree_actor) struct LiveOpen {
     pub(in crate::tree_actor) handle: u64,
     pub(in crate::tree_actor) tree: TreeId,
-    pub(in crate::tree_actor) writer: String,
+    pub(in crate::tree_actor) by: WriterAt,
     pub(in crate::tree_actor) object: u64,
     /// Never linked: its object has no name and no saved state.
     pub(in crate::tree_actor) anonymous: bool,
@@ -27,7 +28,7 @@ impl LiveOpen {
         Ok(Self {
             handle: record.handle,
             tree: record.tree.parse::<TreeId>()?,
-            writer: record.writer.clone(),
+            by: record.by.clone(),
             object: record.object,
             anonymous: record.anonymous,
         })
@@ -37,7 +38,7 @@ impl LiveOpen {
         OpenRecord {
             handle: self.handle,
             tree: self.tree.to_string(),
-            writer: self.writer.clone(),
+            by: self.by.clone(),
             object: self.object,
             anonymous: self.anonymous,
         }
@@ -172,21 +173,18 @@ pub(in crate::tree_actor) fn fold(frames: &[Frame]) -> Result<Folded> {
         match &record.entry {
             Entry::Checkpoint { .. } => return Err(Error::Format),
             Entry::Open {
-                tree,
-                writer,
-                object,
-                ..
+                tree, by, object, ..
             } => folded.add_open(LiveOpen {
                 handle: seq,
                 tree: tree.parse::<TreeId>()?,
-                writer: writer.clone(),
+                by: by.clone(),
                 object: *object,
                 anonymous: false,
             }),
-            Entry::AnonymousOpen { tree, writer } => folded.add_open(LiveOpen {
+            Entry::AnonymousOpen { tree, by } => folded.add_open(LiveOpen {
                 handle: seq,
                 tree: tree.parse::<TreeId>()?,
-                writer: writer.clone(),
+                by: by.clone(),
                 object: seq,
                 anonymous: true,
             }),

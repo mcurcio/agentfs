@@ -11,13 +11,14 @@ use std::fs;
 use std::io;
 use std::path::Path;
 
+use agentfs_contracts::pod::WriterAt;
 use git2::Oid;
 use serde::{Deserialize, Serialize};
 
 use super::pointers::Pointers;
 use super::stages::{Timer, Which};
 use super::tree::{EventNumber, Lines, MergeFileIdentity, Tree};
-use super::{Draft, Error, Result, Saved, TreeId, Volume, referee};
+use super::{Draft, Error, Result, Saved, TreeActor, TreeId, referee};
 use crate::tree_git::{RefUpdate, TreeEntry, TreeGit};
 use message::{Action, Message};
 pub(super) use take::SyncStep;
@@ -73,7 +74,7 @@ pub(in crate::tree_actor) fn remove_stale_locks(gitdir: &Path) -> io::Result<()>
     Ok(())
 }
 
-impl Volume {
+impl TreeActor {
     pub(in crate::tree_actor) fn snapshot_at(&self, head: Oid) -> Result<referee::Snapshot> {
         let _timer = Timer::start(Which::SnapshotRead);
         let commit = self.repo.read_commit(head)?;
@@ -211,7 +212,7 @@ impl Volume {
         &self,
         tree: TreeId,
         t: Tree,
-        writer: &str,
+        by: &WriterAt,
         action: Action,
         event: EventNumber,
         open: Option<u64>,
@@ -236,12 +237,12 @@ impl Volume {
         let content = self.envelope(files, blob, namespace)?;
         let message = Message::Direct {
             action,
-            writer,
+            by,
             tree,
             event,
             open,
         }
-        .render()?;
+        .render(&self.identity)?;
         let current = self.head(tree)?;
         let head = self.repo.write_commit(content, &[current], &message)?;
         let mut changes = vec![RefUpdate {
@@ -251,7 +252,7 @@ impl Volume {
         }];
         self.object_table_update(tree, &Self::snapshot_of(&t), &mut changes)?;
         let enqueued = self.enqueue_moves(tree, head, event, &mut changes)?;
-        let mut draft = Draft::new(writer, tree, t);
+        let mut draft = Draft::new(by, tree, t);
         draft.changes = changes;
         draft.enqueued = enqueued;
         draft.saved = Saved::Commit(head);

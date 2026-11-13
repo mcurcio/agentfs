@@ -905,11 +905,15 @@ templates' variables, the commit trailers and the telemetry resource:
 | Flag | Environment | Default | Commands |
 |---|---|---|---|
 | `--namespace NAME`, `--pod NAME`, `--pod-uid UID`, `--node NAME`, `--replica NAME` | `AGENTFS_NAMESPACE`, `AGENTFS_POD`, `AGENTFS_POD_UID`, `AGENTFS_NODE`, `AGENTFS_REPLICA` | empty; `--pod-uid` defaults to the replica, and `--replica` (the committer's `{replica}`) to the pod name, else the host name. `mount` also records a given `--pod-uid` in `meta/attached.json` when the mount point is in that pod's own volume, so a different pod's start lands the patch queue over a mark the old pod's stop left (see [patches](patches.md)) | `mount`, `run`, `record`, `flush`, `push`, `checkpoint`, `serve-history`, `serve-git` (passed to its hooks and `patch apply` as the variables), `restore`, `revert`, `patch apply`, `fork finish`, `status` (accepted and ignored) |
+| `--namespace NAME`, `--pod NAME`, `--pod-uid UID`, `--node NAME` | `AGENTFS_NAMESPACE`, `AGENTFS_POD`, `AGENTFS_POD_UID`, `AGENTFS_NODE` | empty: absent from the commits. Each is 1 to 253 bytes of printable ASCII with no whitespace | `trees init`, `trees fork`, `trees mount`: the pod context of a tree volume's commits, as `Agentfs-Namespace`, `Agentfs-Pod`, `Agentfs-Pod-Uid` and `Agentfs-Node` ([trees](trees.md#volume-identity-and-trailers)). `trees mount`'s are its views' writers' and its own syncs'; `trees init`'s are the Root commit's |
 
-**Tree view flags** (`agentfs trees mount`; see [trees](trees.md)):
+**Tree view flags** (`agentfs trees`; see [trees](trees.md)):
 
 | Flag | Environment | Default | Commands |
 |---|---|---|---|
+| `--volume NAME` | `AGENTFS_VOLUME` | none: required by `trees init` | `trees init`: the volume's name, kept in its identity file. A new state area gets a new id; the same name finds it and writes nothing; another name, or another format (the trial's format 3 included), exits 1 with nothing written. Prints `<name> <id> created\|found`, then recovers the volume. Exit 75 while another process holds it. `trees mount`: optional, a guard: another name exits 1 before anything is written |
+| `--owner UID:GID` | `AGENTFS_OWNER` | this process's effective user and group | `trees mount`: every file's and directory's owner in the views |
+| `--no-allow-other` | | FUSE `allow_other` on | `trees mount`: only the mounting user reaches the views. With `allow_other`, a mount by a user other than root needs `user_allow_other` in `/etc/fuse.conf` |
 | `--sandbox DIR` | | no sandbox mount | `trees mount`: also mount an isolated sandbox |
 | `--fork fork/N` | | create a new fork | `trees mount`: reuse this existing sandbox (not `root`); requires `--sandbox` |
 | `--writer LABEL` | | `root-client` | `trees mount`: trusted root writer label |
@@ -1037,8 +1041,9 @@ equivalents above; a flag given on the command line wins.
 | `AGENTFS_STATE` | `--state` | all commands |
 | `AGENTFS_ROOT` | `--root` | all commands |
 | `AGENTFS_WAIT_LOCK` | `--wait-lock` | all commands |
-| `AGENTFS_NAMESPACE`, `AGENTFS_POD`, `AGENTFS_POD_UID`, `AGENTFS_NODE`, `AGENTFS_REPLICA` | `--namespace`, `--pod`, `--pod-uid`, `--node`, `--replica` | the commands with pod flags |
-| `AGENTFS_VOLUME` | `--volume` | `init`, `patch submit`, `patch approve` |
+| `AGENTFS_NAMESPACE`, `AGENTFS_POD`, `AGENTFS_POD_UID`, `AGENTFS_NODE`, `AGENTFS_REPLICA` | `--namespace`, `--pod`, `--pod-uid`, `--node`, `--replica` | the commands with pod flags, the `trees` commands among them (not `--replica`) |
+| `AGENTFS_VOLUME` | `--volume` | `init`, `patch submit`, `patch approve`, `trees init`, `trees mount` |
+| `AGENTFS_OWNER` | `--owner` | `trees mount` |
 | `AGENTFS_PASSTHROUGH` | `--passthrough` | `mount` |
 | `AGENTFS_THREADS` | `--threads` | `mount` |
 | `AGENTFS_ON_STALE_MOUNT` | `--on-stale-mount` | `mount` |

@@ -20,8 +20,32 @@ pub struct NameError {
 /// A volume name, a client label and a launcher id follow it, and so does
 /// `agentfs_core::config::validate_name` (it calls this).
 pub fn is_safe_name(value: &str) -> bool {
-    let _ = value;
-    todo!("S1: move the rule from agentfs_core::config::validate_name")
+    let bytes = value.as_bytes();
+    bytes.first().is_some_and(u8::is_ascii_alphanumeric)
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+        && !value.contains("..")
+        && !value.ends_with(".lock")
+        && !value.ends_with('.')
+}
+
+/// `Ok` when `holds`; else a [`NameError`] naming `what` and `rule`.
+fn check(
+    holds: bool,
+    what: &'static str,
+    value: &str,
+    rule: &'static str,
+) -> Result<(), NameError> {
+    if holds {
+        Ok(())
+    } else {
+        Err(NameError {
+            what,
+            value: value.to_owned(),
+            rule,
+        })
+    }
 }
 
 /// A volume's name: a label and a guard, never its identity (the
@@ -35,8 +59,14 @@ impl VolumeName {
     ///
     /// [`NameError`] (`what`: `volume`) for text that breaks the rule.
     pub fn parse(text: &str) -> Result<Self, NameError> {
-        let _ = text;
-        todo!("S1")
+        check(
+            is_safe_name(text) && text.len() <= 253,
+            "volume",
+            text,
+            "a safe name of at most 253 bytes: an ASCII letter or digit, then letters, digits, \
+             '.', '_' or '-'; no '..', no trailing '.' or '.lock'",
+        )?;
+        Ok(Self(text.to_owned()))
     }
 
     pub fn as_str(&self) -> &str {
@@ -55,8 +85,13 @@ impl Label {
     ///
     /// [`NameError`] (`what`: `pod context field`).
     pub fn parse(text: &str) -> Result<Self, NameError> {
-        let _ = text;
-        todo!("S1")
+        check(
+            (1..=253).contains(&text.len()) && text.bytes().all(|b| b.is_ascii_graphic()),
+            "pod context field",
+            text,
+            "1 to 253 bytes of printable ASCII with no whitespace",
+        )?;
+        Ok(Self(text.to_owned()))
     }
 
     pub fn as_str(&self) -> &str {
@@ -79,13 +114,18 @@ impl WriterLabel {
     ///
     /// [`NameError`] (`what`: `writer`).
     pub fn parse(text: &str) -> Result<Self, NameError> {
-        let _ = text;
-        todo!("S1")
+        check(
+            (1..=256).contains(&text.len()) && !text.chars().any(char::is_control),
+            "writer",
+            text,
+            "1 to 256 bytes with no control character",
+        )?;
+        Ok(Self(text.to_owned()))
     }
 
     /// `agentfs`.
     pub fn agentfs() -> Self {
-        todo!("S1")
+        Self(Self::AGENTFS.to_owned())
     }
 
     pub fn as_str(&self) -> &str {
@@ -124,8 +164,14 @@ impl LauncherId {
     ///
     /// [`NameError`] (`what`: `launcher`).
     pub fn parse(text: &str) -> Result<Self, NameError> {
-        let _ = text;
-        todo!("S1")
+        check(
+            is_safe_name(text) && text.len() <= 64,
+            "launcher",
+            text,
+            "a safe name of at most 64 bytes: an ASCII letter or digit, then letters, digits, \
+             '.', '_' or '-'; no '..', no trailing '.' or '.lock'",
+        )?;
+        Ok(Self(text.to_owned()))
     }
 
     pub fn as_str(&self) -> &str {
@@ -185,3 +231,48 @@ text_conversions!(
     LauncherId,
     ForkKey
 );
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn safe_names_follow_the_rule() {
+        for good in ["a", "t", "vol-1", "a.b_c", "9x"] {
+            assert!(is_safe_name(good), "{good}");
+        }
+        for bad in ["", "-a", ".a", "a..b", "a.", "a.lock", "a/b", "a b", "é"] {
+            assert!(!is_safe_name(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn each_parse_keeps_its_bounds() {
+        assert!(VolumeName::parse(&"a".repeat(253)).is_ok());
+        assert_eq!(
+            VolumeName::parse(&"a".repeat(254)).unwrap_err().what,
+            "volume"
+        );
+        assert!(VolumeName::parse("a..b").is_err());
+        assert!(LauncherId::parse(&"c".repeat(64)).is_ok());
+        assert!(LauncherId::parse(&"c".repeat(65)).is_err());
+        assert!(Label::parse("ns-1").is_ok());
+        assert!(Label::parse("").is_err());
+        assert!(Label::parse("a b").is_err());
+        assert!(Label::parse(&"x".repeat(254)).is_err());
+        assert!(WriterLabel::parse("w x").is_ok());
+        assert!(WriterLabel::parse("").is_err());
+        assert!(WriterLabel::parse("a\nb").is_err());
+        assert!(WriterLabel::parse(&"w".repeat(257)).is_err());
+        assert_eq!(WriterLabel::agentfs().as_str(), WriterLabel::AGENTFS);
+    }
+
+    #[test]
+    fn text_round_trips_through_serde() {
+        let name = VolumeName::parse("t").unwrap();
+        let json = serde_json::to_string(&name).unwrap();
+        assert_eq!(json, "\"t\"");
+        assert_eq!(serde_json::from_str::<VolumeName>(&json).unwrap(), name);
+        assert!(serde_json::from_str::<VolumeName>("\"a..b\"").is_err());
+    }
+}

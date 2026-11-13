@@ -29,7 +29,7 @@ off = open(sys.argv[2]).read().splitlines()
 assert on == off[:len(on)], (on, off)
 if os.environ.get('CHECK_FINAL') == '1': assert on == off, (on, off)
 PY
-if ! "$AGENTFS_BIN" --state "$m/state" trees init >"$m/recovery.log" 2>&1; then
+if ! "$AGENTFS_BIN" --state "$m/state" trees init --volume t >"$m/recovery.log" 2>&1; then
   install -m 0644 "$m/recovery.log" "$RECOVERY_LOG_DIR/recovery-$point.log" || true
   cat "$m/recovery.log" >&2 || true
   fail 'tree recovery'
@@ -107,10 +107,10 @@ PYMARK
 fi
 tree_git_no_duplicate_opens "$gitdir" || fail "duplicate Agentfs-Open"
 heads=$(git --git-dir="$gitdir" for-each-ref --format='%(refname) %(objectname)' refs/heads)
-"$AGENTFS_BIN" --state "$m/state" trees init >/dev/null 2>&1 || fail 'second recovery'
+"$AGENTFS_BIN" --state "$m/state" trees init --volume t >/dev/null 2>&1 || fail 'second recovery'
 [ "$(git --git-dir="$gitdir" for-each-ref --format='%(refname) %(objectname)' refs/heads)" = "$heads" ] || fail 'second recovery changed heads'
 # The refs are a copy: without them, the journal alone brings back the same heads.
 rm -rf "$gitdir/refs" "$gitdir/packed-refs"
-"$AGENTFS_BIN" --state "$m/state" trees init >/dev/null 2>&1 || fail 'recovery without refs'
+"$AGENTFS_BIN" --state "$m/state" trees init --volume t >/dev/null 2>&1 || fail 'recovery without refs'
 [ "$(git --git-dir="$gitdir" for-each-ref --format='%(refname) %(objectname)' refs/heads)" = "$heads" ] || fail 'refs differ after removing them'
 printf 'PASS\t%s\t%s\tlast receipt %s\n' "$FS" "$point" "$(tail -n 1 "$m/receipts")" >> "$RESULTS"

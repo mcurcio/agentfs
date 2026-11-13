@@ -645,13 +645,15 @@ and it mounts flat regular files only. Use it to try the model; it is not a
 replacement for `mount`.
 
 ```sh
-agentfs --state STATE trees init
+agentfs --state STATE trees init --volume NAME
 agentfs --state STATE trees mount ROOT --sandbox SANDBOX
 ```
 
 `trees mount` recovers and mounts the root's view, and with `--sandbox` also a
-sandbox fork (`fork/N`) of it. Each `Binding` names its tree by
-`agentfs_core::tree_actor::TreeId`. `--fork fork/N` reuses a sandbox, and `trees
+sandbox fork (`fork/N`) of it; it never creates a volume. Each `Binding` names
+its tree by `agentfs_core::tree_actor::TreeId`, the writer its saves carry (a
+`WriterAt`) and the owner every file is presented as (`--owner`). The views
+mount with FUSE `allow_other` unless `--no-allow-other` (`MountOptions`). `--fork fork/N` reuses a sandbox, and `trees
 fork` makes one and prints its name. `--writer` and `--sandbox-writer` set
 each view's trusted writer label, and `--metrics-output FILE` writes counters
 every 100 ms and at unmount. Mount points must be empty, separate and outside

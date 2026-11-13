@@ -30,7 +30,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{Call, Handle};
 use crate::tree_actor::tree::EventNumber;
-use crate::tree_actor::{Draft, Error, Result, Saved, TreeId, Volume};
+use crate::tree_actor::{Draft, Error, Result, Saved, TreeActor, TreeId};
 
 /// The bases' unit. Every kernel page size is a multiple of it, so a base map at
 /// this size is exact whatever the kernel's own page size is.
@@ -195,7 +195,7 @@ pub(in crate::tree_actor) fn calls_for_close(
     }
 }
 
-impl Volume {
+impl TreeActor {
     /// The bytes for a page fill of `object` in `tree`: up to `size` bytes from
     /// `offset`, short at the end. While the file has a write-open they come
     /// from its image and are recorded as the base of each page they cover; with
@@ -239,7 +239,7 @@ impl Volume {
     /// # Errors
     ///
     /// [`Error::NotFound`] for an unknown handle; a journal failure as from
-    /// [`Volume::write`], which also stops the actor when the journal cannot be
+    /// [`TreeActor::write`], which also stops the actor when the journal cannot be
     /// trusted. A failure changes nothing here.
     pub fn page_writeback(&mut self, handle: u64, offset: u64, bytes: &[u8]) -> Result<()> {
         let h = self.handles.get(&handle).ok_or(Error::NotFound)?;
@@ -322,7 +322,7 @@ impl Volume {
         std::mem::take(&mut self.changed)
     }
 
-    /// A queue take: [`Volume::step`] plus a note of the files it changed.
+    /// A queue take: [`TreeActor::step`] plus a note of the files it changed.
     pub(in crate::tree_actor) fn pages_take<F>(
         &mut self,
         tree: TreeId,

@@ -18,7 +18,7 @@ cleanup() {
 }
 trap cleanup EXIT
 mkdir "$work/main" "$work/sandbox"
-"$bin" --state "$work/state" trees init
+"$bin" --state "$work/state" trees init --volume t
 fork=$("$bin" --state "$work/state" trees fork)
 start() {
     "$bin" --state "$work/state" trees mount "$work/main" \
@@ -158,10 +158,10 @@ wait "$client" 2>/dev/null || true
 client=
 fusermount3 -uz "$work/main"
 fusermount3 -uz "$work/sandbox"
-"$bin" --state "$work/state" trees init
+"$bin" --state "$work/state" trees init --volume t
 head=$(git --git-dir="$work/state/history.git" rev-parse root)
 test "$(tree_git_file "$work/state/history.git" root crash)" = acknowledged-before-kill
-"$bin" --state "$work/state" trees init
+"$bin" --state "$work/state" trees init --volume t
 test "$(git --git-dir="$work/state/history.git" rev-parse root)" = "$head"
 start
 test "$(cat "$work/main/crash")" = acknowledged-before-kill

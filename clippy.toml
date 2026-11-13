@@ -30,4 +30,8 @@ disallowed-methods = [
     { path = "rustix::net::listen", reason = "listen through agentfs_core::listening_socket::Listener", allow-invalid = true },
     { path = "libc::listen", reason = "listen through agentfs_core::listening_socket::Listener", allow-invalid = true },
     { path = "nix::sys::socket::listen", reason = "listen through agentfs_core::listening_socket::Listener", allow-invalid = true },
+
+    # Capabilities are minted only in a composition root: the `agentfs`
+    # binary's `main`, and each test that plays one.
+    { path = "agentfs_contracts::caps::Minter::new", reason = "capabilities are minted only in the composition root" },
 ]

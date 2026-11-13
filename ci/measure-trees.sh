@@ -33,7 +33,7 @@ for cmd in mountpoint fusermount3 findmnt git python3; do
     if ! command -v "$cmd" >/dev/null; then notrun "missing $cmd"; exit 0; fi
 done
 if [ ! -c /dev/fuse ] || [ ! -x "$bin" ]; then notrun 'missing /dev/fuse or executable agentfs binary'; exit 0; fi
-if ! "$bin" --state "$work/state" trees init >"$work/init.log" 2>&1; then notrun 'tree init failed; see CI log'; cat "$work/init.log" >&2; exit 1; fi
+if ! "$bin" --state "$work/state" trees init --volume t >"$work/init.log" 2>&1; then notrun 'tree init failed; see CI log'; cat "$work/init.log" >&2; exit 1; fi
 # The mount's log sits beside the report, so a run that is cut still has it.
 mount_log="$out.mount.log"
 "$bin" --state "$work/state" trees mount "$work/main" --sandbox "$work/sandbox" --metrics-output "$work/metrics.json" >"$mount_log" 2>&1 &

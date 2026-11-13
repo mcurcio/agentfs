@@ -81,9 +81,10 @@ missing from these tables or a row names a module that no longer exists;
 | `lib.rs` | Crate root: the module list and the engine's overview |
 | `volume.rs` | Opens a state area: crash recovery, then the [`Recorder`](#the-synchronous-step) used at every boundary and the `Committer` that turns records into commits |
 | `record.rs` | What the journal stores: one record per change boundary, absolute state, never deltas |
-| `tree_actor/mod.rs` | The tree actor: the actor, recovery and queue orchestration. A step is one unit of work: built, recorded in the journal, installed, copied out; opening and recovery; queue takes and their plans |
+| `state_area.rs` | The `StateArea` port over the tree actor: inspect without the lock, create a volume with a new id, open and keep the recovered actor |
+| `tree_actor/mod.rs` | The tree actor: the actor, recovery and queue orchestration. A step is one unit of work: built, recorded in the journal, installed, copied out; creating a volume (its identity file, then `format` last), inspecting and opening a state area, recovery; queue takes and their plans |
 | `tree_actor/history/mod.rs` | Tree history: snapshots read from and written to commits (`metadata.json`, `namespace.json`), object tables, the owners of direct saves, direct saves, queue entries and private checkouts |
-| `tree_actor/history/message.rs` | Every message a tree-view commit carries, its one home: each message's bytes (Root, direct saves, landings, syncs) and the readers of its trailers (target git-model §5) |
+| `tree_actor/history/message.rs` | Every message a tree-view commit carries, its one home: each message's bytes (Root, direct saves, landings, syncs) with the volume and pod trailers, and the readers of its trailers, the landed writer's among them (target git-model §5) |
 | `tree_actor/history/refs.rs` | The ref layout of a tree volume's history, its one home: branches, queues and their entries, collision refs, object tables, and the tips that reach every save (target git-model §4) |
 | `tree_actor/history/take.rs` | Queue takes as history: a landing judged by the referee into its upstream, and a fork's prefix sync planned and built from its upstream's commits |
 | `tree_actor/history/upstreams.rs` | Each fork's upstream, the shape of a volume's trees: added when a fork is made, checked at recovery, and written as the journal's checkpoint and Git's config |
@@ -224,7 +225,8 @@ missing from these tables or a row names a module that no longer exists;
 
 | Module | Role |
 |---|---|
-| `trees_cmd.rs` | `trees init`, `fork` and `mount` composition root; separate state format |
+| `trees_cmd.rs` | `trees init` (`ensure` through the Volume domain), `fork` and `mount` composition root; separate state format |
+| `pod_args.rs` | The pod flags (`--namespace`, `--pod`, `--pod-uid`, `--node`) one clap group shares between the recording engine's commands and `trees` |
 | `main.rs` | The CLI (`Cli`), command dispatch, `init`, `status`, `record`, `flush`, `push` (direct), `run` and `mount` |
 | `daemon.rs` | Signals and shutdown for `run` and `mount` |
 | `front.rs` | `mount --history-service`: a front of a history service |

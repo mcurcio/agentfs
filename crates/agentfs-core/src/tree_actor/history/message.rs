@@ -1,14 +1,24 @@
 //! Every message a tree-view commit carries, written and read here only
-//! (docs/target-architecture/git-model.md §5). A trailer common to every message is one edit in
-//! [`Message::render`]'s shared part.
+//! (docs/target-architecture/git-model.md §3 and §5, docs/trees.md). A trailer common to every
+//! message is one edit in [`Message::render`]'s shared part.
+
+use agentfs_contracts::name::{Label, WriterLabel};
+use agentfs_contracts::pod::{PodContext, WriterAt};
+use agentfs_contracts::volume::VolumeIdentity;
 
 use crate::tree_actor::tree::EventNumber;
-use crate::tree_actor::{Result, TreeId, referee};
+use crate::tree_actor::{Error, Result, TreeId, referee};
 
 const WRITER: &str = "Agentfs-Writer: ";
 const CAUSE: &str = "Agentfs-Cause: ";
 const TREE: &str = "Agentfs-Tree: ";
 const EVENT: &str = "Agentfs-Event: ";
+const VOLUME: &str = "Agentfs-Volume: ";
+const VOLUME_ID: &str = "Agentfs-Volume-Id: ";
+const NAMESPACE: &str = "Agentfs-Namespace: ";
+const POD: &str = "Agentfs-Pod: ";
+const POD_UID: &str = "Agentfs-Pod-Uid: ";
+const NODE: &str = "Agentfs-Node: ";
 const OPEN: &str = "Agentfs-Open: ";
 const COLLISIONS: &str = "Agentfs-Collisions: ";
 /// The cause a direct save's commit carries, written by `render` and read by `direct_event`.
@@ -38,67 +48,114 @@ impl Action {
 
 /// One tree-view commit's message.
 pub(in crate::tree_actor) enum Message<'a> {
-    /// Tree `root`, event 0, and no `Agentfs-Format`: its absence marks the Root commit.
-    Root,
+    /// Writer `agentfs` with the history service's pod context, tree `root`, event 0, and no
+    /// `Agentfs-Format`: its absence marks the Root commit.
+    Root { service: &'a PodContext },
     /// "{action} by {writer}"; `Agentfs-Cause: Direct`; `Agentfs-Open` when the save closed an
     /// open.
     Direct {
         action: Action,
-        writer: &'a str,
+        by: &'a WriterAt,
         tree: TreeId,
         event: EventNumber,
         open: Option<u64>,
     },
-    /// `Agentfs-Collisions` when any.
+    /// "Landing by {writer}": `landed` is the queued commit's writer and pod context, read by
+    /// [`writer_at`] (git-model §3). `Agentfs-Collisions` when any.
     Landing {
+        landed: &'a WriterAt,
         tree: TreeId,
         event: EventNumber,
         collisions: &'a [referee::Collision],
     },
+    /// Writer `agentfs` with the history service's pod context.
     Sync {
+        service: &'a PodContext,
         tree: TreeId,
         event: EventNumber,
     },
 }
 
+/// Each pod trailer's key and its field, in trailer order.
+fn pod_fields(at: &PodContext) -> [(&'static str, Option<&Label>); 4] {
+    [
+        (NAMESPACE, at.namespace.as_ref()),
+        (POD, at.pod.as_ref()),
+        (POD_UID, at.pod_uid.as_ref()),
+        (NODE, at.node.as_ref()),
+    ]
+}
+
 impl Message<'_> {
-    /// The message's bytes: subject, blank line, Writer, Cause, Tree, Event, Format, then Open
-    /// or Collisions, each line ending in '\n'.
+    /// The message's bytes: subject, blank line, Writer, Cause, Tree, Event, Volume, Volume-Id,
+    /// each present pod field, Format, then Open or Collisions, each line ending in '\n'.
     ///
     /// # Errors
     ///
     /// The collisions' JSON only.
-    pub(in crate::tree_actor) fn render(&self) -> Result<String> {
-        let (subject, writer, cause, tree, event) = match self {
-            Self::Root => ("Root".to_owned(), "agentfs", "Root", TreeId::Root, None),
+    pub(in crate::tree_actor) fn render(&self, volume: &VolumeIdentity) -> Result<String> {
+        let agentfs = WriterLabel::agentfs();
+        let (subject, writer, at, cause, tree, event) = match self {
+            Self::Root { service } => (
+                "Root".to_owned(),
+                &agentfs,
+                *service,
+                "Root",
+                TreeId::Root,
+                None,
+            ),
             Self::Direct {
                 action,
-                writer,
+                by,
                 tree,
                 event,
                 ..
             } => (
-                format!("{} by {writer}", action.word()),
-                *writer,
+                format!("{} by {}", action.word(), by.writer),
+                &by.writer,
+                &by.at,
                 DIRECT,
                 *tree,
                 Some(*event),
             ),
-            Self::Landing { tree, event, .. } => (
-                "Landing".to_owned(),
-                "agentfs",
+            Self::Landing {
+                landed,
+                tree,
+                event,
+                ..
+            } => (
+                format!("Landing by {}", landed.writer),
+                &landed.writer,
+                &landed.at,
                 "Landing",
                 *tree,
                 Some(*event),
             ),
-            Self::Sync { tree, event } => {
-                ("Sync".to_owned(), "agentfs", "Sync", *tree, Some(*event))
-            }
+            Self::Sync {
+                service,
+                tree,
+                event,
+            } => (
+                "Sync".to_owned(),
+                &agentfs,
+                *service,
+                "Sync",
+                *tree,
+                Some(*event),
+            ),
         };
         let mut message = format!(
-            "{subject}\n\n{WRITER}{writer}\n{CAUSE}{cause}\n{TREE}{tree}\n{EVENT}{}\n",
-            event.map_or(0, EventNumber::get)
+            "{subject}\n\n{WRITER}{writer}\n{CAUSE}{cause}\n{TREE}{tree}\n{EVENT}{}\n\
+             {VOLUME}{}\n{VOLUME_ID}{}\n",
+            event.map_or(0, EventNumber::get),
+            volume.name,
+            volume.id.0.hyphenated(),
         );
+        for (key, value) in pod_fields(at) {
+            if let Some(value) = value {
+                message.push_str(&format!("{key}{value}\n"));
+            }
+        }
         if event.is_some() {
             message.push_str(ENVELOPE);
             message.push('\n');
@@ -130,6 +187,36 @@ pub(in crate::tree_actor) fn tree_of(message: &[u8]) -> Result<Option<TreeId>> {
         .and_then(|mut lines| lines.find_map(|l| l.strip_prefix(TREE)))
         .map(|text| Ok(text.parse()?))
         .transpose()
+}
+
+/// The first `Agentfs-Writer` and the first of each pod trailer: `None` if no writer trailer or
+/// the message is not UTF-8.
+///
+/// # Errors
+///
+/// [`Error::Format`] for a writer or pod value that does not parse.
+pub(in crate::tree_actor) fn writer_at(message: &[u8]) -> Result<Option<WriterAt>> {
+    let Some(all) = lines(message) else {
+        return Ok(None);
+    };
+    let first = |key: &str| all.clone().find_map(|line| line.strip_prefix(key));
+    let Some(writer) = first(WRITER) else {
+        return Ok(None);
+    };
+    let label = |key: &str| {
+        first(key)
+            .map(|text| Label::parse(text).map_err(|_| Error::Format))
+            .transpose()
+    };
+    Ok(Some(WriterAt {
+        writer: WriterLabel::parse(writer).map_err(|_| Error::Format)?,
+        at: PodContext {
+            namespace: label(NAMESPACE)?,
+            pod: label(POD)?,
+            pod_uid: label(POD_UID)?,
+            node: label(NODE)?,
+        },
+    }))
 }
 
 /// The event of an `Agentfs-Cause: Direct` commit (its first `Agentfs-Event`); None for any
@@ -171,12 +258,51 @@ pub(in crate::tree_actor) fn is_envelope(message: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use agentfs_contracts::name::VolumeName;
+    use agentfs_contracts::volume::VolumeId;
+
     use super::*;
-    use crate::tree_actor::Error;
     use crate::tree_actor::referee::{Collision, CollisionKind, Version};
     use crate::tree_actor::tree::MergeFileIdentity;
 
-    const ROOT_TEXT: &str = "Root\n\nAgentfs-Writer: agentfs\nAgentfs-Cause: Root\nAgentfs-Tree: root\nAgentfs-Event: 0\n";
+    const VOLUME_TEXT: &str =
+        "Agentfs-Volume: t\nAgentfs-Volume-Id: 00000000-0000-0000-0000-00000000002a\n";
+    const POD_TEXT: &str =
+        "Agentfs-Namespace: ns\nAgentfs-Pod: p-1\nAgentfs-Pod-Uid: u-1\nAgentfs-Node: n1\n";
+
+    fn volume() -> VolumeIdentity {
+        VolumeIdentity {
+            name: VolumeName::parse("t").unwrap(),
+            id: VolumeId(uuid::Uuid::from_u128(42)),
+        }
+    }
+
+    fn pod() -> PodContext {
+        let label = |text| Some(Label::parse(text).unwrap());
+        PodContext {
+            namespace: label("ns"),
+            pod: label("p-1"),
+            pod_uid: label("u-1"),
+            node: label("n1"),
+        }
+    }
+
+    fn by(writer: &str, at: PodContext) -> WriterAt {
+        WriterAt {
+            writer: WriterLabel::parse(writer).unwrap(),
+            at,
+        }
+    }
+
+    fn root_text() -> String {
+        format!(
+            "Root\n\nAgentfs-Writer: agentfs\nAgentfs-Cause: Root\nAgentfs-Tree: root\nAgentfs-Event: 0\n{VOLUME_TEXT}"
+        )
+    }
+
+    fn render(message: &Message<'_>) -> String {
+        message.render(&volume()).unwrap()
+    }
 
     fn collision() -> Collision {
         Collision {
@@ -193,27 +319,54 @@ mod tests {
     }
 
     fn direct(open: Option<u64>) -> String {
-        Message::Direct {
+        render(&Message::Direct {
             action: Action::Rename,
-            writer: "w x",
+            by: &by("w x", PodContext::default()),
             tree: TreeId::Fork(7),
             event: EventNumber::new(42),
             open,
-        }
-        .render()
-        .unwrap()
+        })
     }
 
     #[test]
     fn each_message_renders_its_literal_bytes() {
-        assert_eq!(Message::Root.render().unwrap(), ROOT_TEXT);
+        assert_eq!(
+            render(&Message::Root {
+                service: &PodContext::default()
+            }),
+            root_text()
+        );
+        assert_eq!(
+            render(&Message::Root { service: &pod() }),
+            format!("{}{POD_TEXT}", root_text())
+        );
         assert_eq!(
             direct(None),
-            "Rename by w x\n\nAgentfs-Writer: w x\nAgentfs-Cause: Direct\nAgentfs-Tree: fork/7\nAgentfs-Event: 42\nAgentfs-Format: envelope-1\n"
+            format!(
+                "Rename by w x\n\nAgentfs-Writer: w x\nAgentfs-Cause: Direct\nAgentfs-Tree: fork/7\nAgentfs-Event: 42\n{VOLUME_TEXT}Agentfs-Format: envelope-1\n"
+            )
         );
         assert_eq!(
             direct(Some(5)),
-            "Rename by w x\n\nAgentfs-Writer: w x\nAgentfs-Cause: Direct\nAgentfs-Tree: fork/7\nAgentfs-Event: 42\nAgentfs-Format: envelope-1\nAgentfs-Open: 5\n"
+            format!(
+                "Rename by w x\n\nAgentfs-Writer: w x\nAgentfs-Cause: Direct\nAgentfs-Tree: fork/7\nAgentfs-Event: 42\n{VOLUME_TEXT}Agentfs-Format: envelope-1\nAgentfs-Open: 5\n"
+            )
+        );
+        let partial = PodContext {
+            pod: Some(Label::parse("p-1").unwrap()),
+            ..PodContext::default()
+        };
+        assert_eq!(
+            render(&Message::Direct {
+                action: Action::Direct,
+                by: &by("w", partial),
+                tree: TreeId::Root,
+                event: EventNumber::new(3),
+                open: Some(2),
+            }),
+            format!(
+                "Direct by w\n\nAgentfs-Writer: w\nAgentfs-Cause: Direct\nAgentfs-Tree: root\nAgentfs-Event: 3\n{VOLUME_TEXT}Agentfs-Pod: p-1\nAgentfs-Format: envelope-1\nAgentfs-Open: 2\n"
+            )
         );
         for (action, word) in [
             (Action::Create, "Create"),
@@ -221,48 +374,92 @@ mod tests {
             (Action::Unlink, "Unlink"),
             (Action::Direct, "Direct"),
         ] {
-            let text = Message::Direct {
+            let text = render(&Message::Direct {
                 action,
-                writer: "w",
+                by: &by("w", PodContext::default()),
                 tree: TreeId::Root,
                 event: EventNumber::new(1),
                 open: None,
-            }
-            .render()
-            .unwrap();
+            });
             assert!(text.starts_with(&format!("{word} by w\n\n")), "{text}");
         }
-        let landing = |collisions: &[Collision]| {
-            Message::Landing {
+        let landing = |at: PodContext, collisions: &[Collision]| {
+            render(&Message::Landing {
+                landed: &by("c3", at),
                 tree: TreeId::Root,
                 event: EventNumber::new(8),
                 collisions,
-            }
-            .render()
-            .unwrap()
+            })
         };
         assert_eq!(
-            landing(&[]),
-            "Landing\n\nAgentfs-Writer: agentfs\nAgentfs-Cause: Landing\nAgentfs-Tree: root\nAgentfs-Event: 8\nAgentfs-Format: envelope-1\n"
+            landing(PodContext::default(), &[]),
+            format!(
+                "Landing by c3\n\nAgentfs-Writer: c3\nAgentfs-Cause: Landing\nAgentfs-Tree: root\nAgentfs-Event: 8\n{VOLUME_TEXT}Agentfs-Format: envelope-1\n"
+            )
         );
         assert_eq!(
-            landing(&[collision()]),
-            "Landing\n\nAgentfs-Writer: agentfs\nAgentfs-Cause: Landing\nAgentfs-Tree: root\nAgentfs-Event: 8\nAgentfs-Format: envelope-1\nAgentfs-Collisions: [{\"lost\":{\"Name\":{\"file\":3,\"version\":9}},\"winner\":{\"Line\":{\"file\":3,\"version\":\"10:2\"}},\"kind\":\"Line\"}]\n"
+            landing(pod(), &[collision()]),
+            format!(
+                "Landing by c3\n\nAgentfs-Writer: c3\nAgentfs-Cause: Landing\nAgentfs-Tree: root\nAgentfs-Event: 8\n{VOLUME_TEXT}{POD_TEXT}Agentfs-Format: envelope-1\nAgentfs-Collisions: [{{\"lost\":{{\"Name\":{{\"file\":3,\"version\":9}}}},\"winner\":{{\"Line\":{{\"file\":3,\"version\":\"10:2\"}}}},\"kind\":\"Line\"}}]\n"
+            )
         );
+        for (service, pods) in [(PodContext::default(), ""), (pod(), POD_TEXT)] {
+            assert_eq!(
+                render(&Message::Sync {
+                    service: &service,
+                    tree: TreeId::Fork(70),
+                    event: EventNumber::new(11),
+                }),
+                format!(
+                    "Sync\n\nAgentfs-Writer: agentfs\nAgentfs-Cause: Sync\nAgentfs-Tree: fork/70\nAgentfs-Event: 11\n{VOLUME_TEXT}{pods}Agentfs-Format: envelope-1\n"
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn writer_at_reads_back_what_render_writes() {
+        let partial = PodContext {
+            node: Some(Label::parse("n1").unwrap()),
+            ..PodContext::default()
+        };
+        for at in [PodContext::default(), pod(), partial] {
+            let writer = by("w x", at);
+            let text = render(&Message::Direct {
+                action: Action::Direct,
+                by: &writer,
+                tree: TreeId::Fork(1),
+                event: EventNumber::new(2),
+                open: None,
+            });
+            assert_eq!(writer_at(text.as_bytes()).unwrap(), Some(writer.clone()));
+            let landed = render(&Message::Landing {
+                landed: &writer,
+                tree: TreeId::Root,
+                event: EventNumber::new(3),
+                collisions: &[],
+            });
+            assert_eq!(writer_at(landed.as_bytes()).unwrap(), Some(writer));
+        }
         assert_eq!(
-            Message::Sync {
-                tree: TreeId::Fork(70),
-                event: EventNumber::new(11),
-            }
-            .render()
-            .unwrap(),
-            "Sync\n\nAgentfs-Writer: agentfs\nAgentfs-Cause: Sync\nAgentfs-Tree: fork/70\nAgentfs-Event: 11\nAgentfs-Format: envelope-1\n"
+            writer_at(render(&Message::Root { service: &pod() }).as_bytes()).unwrap(),
+            Some(by("agentfs", pod()))
         );
+        assert_eq!(writer_at(b"no trailer\n").unwrap(), None);
+        assert_eq!(writer_at(b"\xff\nAgentfs-Writer: w\n").unwrap(), None);
+        assert!(matches!(
+            writer_at(b"x\n\nAgentfs-Writer: w\nAgentfs-Pod: a b\n"),
+            Err(Error::Format)
+        ));
+        assert!(matches!(
+            writer_at(format!("x\n\nAgentfs-Writer: {}\n", "w".repeat(257)).as_bytes()),
+            Err(Error::Format)
+        ));
     }
 
     #[test]
     fn tree_of_reads_the_first_tree_trailer() {
-        assert_eq!(tree_of(ROOT_TEXT.as_bytes()).unwrap(), Some(TreeId::Root));
+        assert_eq!(tree_of(root_text().as_bytes()).unwrap(), Some(TreeId::Root));
         assert_eq!(
             tree_of(direct(None).as_bytes()).unwrap(),
             Some(TreeId::Fork(7))
@@ -285,21 +482,19 @@ mod tests {
             direct_event(direct(Some(5)).as_bytes()),
             Some(EventNumber::new(42))
         );
-        assert_eq!(direct_event(ROOT_TEXT.as_bytes()), None);
-        let landing = Message::Landing {
+        assert_eq!(direct_event(root_text().as_bytes()), None);
+        let landing = render(&Message::Landing {
+            landed: &by("w", PodContext::default()),
             tree: TreeId::Root,
             event: EventNumber::new(8),
             collisions: &[],
-        }
-        .render()
-        .unwrap();
+        });
         assert_eq!(direct_event(landing.as_bytes()), None);
-        let sync = Message::Sync {
+        let sync = render(&Message::Sync {
+            service: &PodContext::default(),
             tree: TreeId::Fork(7),
             event: EventNumber::new(8),
-        }
-        .render()
-        .unwrap();
+        });
         assert_eq!(direct_event(sync.as_bytes()), None);
         assert_eq!(
             direct_event(b"Agentfs-Cause: Direct\nAgentfs-Event: 3\nAgentfs-Event: 4\n"),
@@ -317,13 +512,12 @@ mod tests {
 
     #[test]
     fn collisions_reads_every_collisions_line_in_order() {
-        let one = Message::Landing {
+        let one = render(&Message::Landing {
+            landed: &by("w", PodContext::default()),
             tree: TreeId::Root,
             event: EventNumber::new(8),
             collisions: &[collision()],
-        }
-        .render()
-        .unwrap();
+        });
         assert_eq!(collisions(one.as_bytes()).unwrap(), [collision()]);
         let mut second = collision();
         second.kind = CollisionKind::Whole;
@@ -343,7 +537,7 @@ mod tests {
 
     #[test]
     fn every_message_but_the_roots_is_an_envelope() {
-        assert!(!is_envelope(ROOT_TEXT.as_bytes()));
+        assert!(!is_envelope(root_text().as_bytes()));
         assert!(is_envelope(direct(None).as_bytes()));
         assert!(!is_envelope(b"\xff\nAgentfs-Format: envelope-1\n"));
         assert!(!is_envelope(b"x\n\nAgentfs-Format: envelope-1 \n"));

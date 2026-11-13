@@ -13,31 +13,42 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use agentfs_core::tree_actor::{Error, Saved, TreeId, Volume};
+use agentfs_contracts::clients::FileOwner;
+use agentfs_contracts::pod::WriterAt;
+use agentfs_contracts::views::MountOptions;
+use agentfs_core::tree_actor::{Error, Saved, TreeActor, TreeId};
 use fuser::*;
 
 const TTL: Duration = Duration::ZERO;
 type Result<T> = std::result::Result<T, Errno>;
 
-/// Views in one process share one locked volume actor.
+/// Views in one process share one locked volume actor. Each view writes as
+/// `by`, and presents every file as `owner`'s.
 pub struct Binding {
     pub tree: TreeId,
-    pub writer: String,
+    pub by: WriterAt,
+    pub owner: FileOwner,
     pub mountpoint: PathBuf,
 }
 
 /// Mount until every view is unmounted. All mountpoints must be empty,
 /// outside the private state and separate from one another.
-pub fn serve(state: &Path, volume: Volume, bindings: Vec<Binding>) -> io::Result<()> {
-    serve_with_metrics(state, volume, bindings, None)
+pub fn serve(
+    state: &Path,
+    actor: TreeActor,
+    bindings: Vec<Binding>,
+    options: MountOptions,
+) -> io::Result<()> {
+    serve_with_metrics(state, actor, bindings, options, None)
 }
 
 /// Serve views with optional process-local measurement snapshots. The output
 /// belongs outside the state area and views; no measurement affects decisions.
 pub fn serve_with_metrics(
     state: &Path,
-    volume: Volume,
+    volume: TreeActor,
     bindings: Vec<Binding>,
+    options: MountOptions,
     metrics_output: Option<&Path>,
 ) -> io::Result<()> {
     let state = state.canonicalize()?;
@@ -58,15 +69,6 @@ pub fn serve_with_metrics(
             ));
         }
         volume.head(binding.tree).map_err(io::Error::other)?;
-        if binding.writer.is_empty()
-            || binding.writer.chars().any(char::is_control)
-            || binding.writer.len() > 256
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "invalid tree writer",
-            ));
-        }
         points.push(at);
     }
     let metrics_output = metrics_output
@@ -101,23 +103,14 @@ pub fn serve_with_metrics(
             actor: actor.clone(),
             signal: Arc::clone(&signal),
             tree: binding.tree,
-            writer: binding.writer,
+            by: binding.by,
+            owner: binding.owner,
             handles: Mutex::new(Handles {
                 next: 1,
                 entries: BTreeMap::new(),
             }),
         };
-        let mut config = Config::default();
-        config.mount_options = vec![
-            MountOption::FSName("agentfs-trees".into()),
-            MountOption::DefaultPermissions,
-            MountOption::NoDev,
-            MountOption::NoSuid,
-            MountOption::RW,
-        ];
-        config.acl = SessionACL::Owner;
-        config.n_threads = Some(1);
-        let session = fuser::spawn_mount(view, at, &config)?;
+        let session = fuser::spawn_mount(view, at, &session_config(&options))?;
         notifiers.push((tree, session.notifier()));
         sessions.push(session);
     }
@@ -217,7 +210,7 @@ pub fn serve_with_metrics(
 #[cfg(feature = "failpoints")]
 fn run_take_gate(
     mut gate: agentfs_core::failpoints::TakeGate,
-    actor: &Mutex<Volume>,
+    actor: &Mutex<TreeActor>,
     notifiers: &[(TreeId, Notifier)],
 ) -> io::Result<()> {
     while let Some(tree) = gate.next_tree()? {
@@ -256,11 +249,34 @@ fn invalidate_changed(notifiers: &[(TreeId, Notifier)], changed: &[(TreeId, u64)
     }
 }
 
+/// The fuser config for one view: FUSE `allow_other` (`SessionACL::All`) when
+/// `options.allow_other`, else the mounting user alone; permission checks by
+/// the kernel, no devices, no set-user-ID.
+fn session_config(options: &MountOptions) -> Config {
+    let mut config = Config::default();
+    config.mount_options = vec![
+        MountOption::FSName("agentfs-trees".into()),
+        MountOption::DefaultPermissions,
+        MountOption::NoDev,
+        MountOption::NoSuid,
+        MountOption::RW,
+    ];
+    config.acl = if options.allow_other {
+        SessionACL::All
+    } else {
+        SessionACL::Owner
+    };
+    config.n_threads = Some(1);
+    config
+}
+
 struct View {
-    actor: Arc<Mutex<Volume>>,
+    actor: Arc<Mutex<TreeActor>>,
     signal: Arc<ProgressSignal>,
     tree: TreeId,
-    writer: String,
+    by: WriterAt,
+    /// Every file's and directory's owner, until file metadata is recorded.
+    owner: FileOwner,
     handles: Mutex<Handles>,
 }
 
@@ -287,20 +303,20 @@ impl Default for ProgressSignal {
 }
 
 struct ActorGuard<'a> {
-    volume: MutexGuard<'a, Volume>,
+    volume: MutexGuard<'a, TreeActor>,
     signal: &'a ProgressSignal,
     modified: bool,
 }
 
 impl Deref for ActorGuard<'_> {
-    type Target = Volume;
-    fn deref(&self) -> &Volume {
+    type Target = TreeActor;
+    fn deref(&self) -> &TreeActor {
         &self.volume
     }
 }
 
 impl DerefMut for ActorGuard<'_> {
-    fn deref_mut(&mut self) -> &mut Volume {
+    fn deref_mut(&mut self) -> &mut TreeActor {
         self.modified = true;
         &mut self.volume
     }
@@ -348,7 +364,7 @@ impl View {
     fn handles(&self) -> Result<MutexGuard<'_, Handles>> {
         self.handles.lock().map_err(|_| Errno::EIO)
     }
-    fn path(&self, v: &Volume, ino: INodeNo) -> Result<String> {
+    fn path(&self, v: &TreeActor, ino: INodeNo) -> Result<String> {
         v.files(self.tree)
             .map_err(errno)?
             .into_iter()
@@ -356,7 +372,7 @@ impl View {
             .map(|(p, _, _)| p)
             .ok_or(Errno::ENOENT)
     }
-    fn attr(&self, v: &Volume, ino: INodeNo, fh: Option<FileHandle>) -> Result<FileAttr> {
+    fn attr(&self, v: &TreeActor, ino: INodeNo, fh: Option<FileHandle>) -> Result<FileAttr> {
         // First: the kernel keeps one size per inode, and an unlinked mapped
         // file's fstat has no path.
         let open_size = ino
@@ -413,14 +429,14 @@ impl View {
             } else {
                 1
             },
-            uid: rustix::process::geteuid().as_raw(),
-            gid: rustix::process::getegid().as_raw(),
+            uid: self.owner.uid,
+            gid: self.owner.gid,
             rdev: 0,
             blksize: 4096,
             flags: 0,
         })
     }
-    fn open_file(&self, v: &mut Volume, path: &str, flags: i32, create: bool) -> Result<u64> {
+    fn open_file(&self, v: &mut TreeActor, path: &str, flags: i32, create: bool) -> Result<u64> {
         let mut handles = self.handles()?;
         let write = flags & libc::O_ACCMODE != libc::O_RDONLY;
         if flags & libc::O_TRUNC != 0 && !write {
@@ -428,9 +444,9 @@ impl View {
         }
         let entry = if write {
             let handle = if flags & libc::O_TRUNC != 0 {
-                v.write_open_truncating(self.tree, path, &self.writer, create)
+                v.write_open_truncating(self.tree, path, &self.by, create)
             } else {
-                v.write_open(self.tree, path, &self.writer, create)
+                v.write_open(self.tree, path, &self.by, create)
             }
             .map_err(errno)?;
             Open::Write {
@@ -441,7 +457,7 @@ impl View {
         } else {
             if create {
                 let h = v
-                    .write_open(self.tree, path, &self.writer, true)
+                    .write_open(self.tree, path, &self.by, true)
                     .map_err(errno)?;
                 v.close(h).map_err(errno)?;
             }
@@ -578,7 +594,7 @@ impl Filesystem for View {
                 return Err(Errno::ENOTDIR);
             }
             let mut v = self.actor()?;
-            let handle = v.anonymous_open(self.tree, &self.writer).map_err(errno)?;
+            let handle = v.anonymous_open(self.tree, &self.by).map_err(errno)?;
             let object = v.open_object(handle).map_err(errno)?;
             let mut handles = self.handles()?;
             let fh = handles.next;
@@ -719,7 +735,7 @@ impl Filesystem for View {
                 } else {
                     let path = self.path(&v, ino)?;
                     let h = v
-                        .write_open(self.tree, &path, &self.writer, false)
+                        .write_open(self.tree, &path, &self.by, false)
                         .map_err(errno)?;
                     let result = v.truncate(h, size).map_err(errno);
                     v.close(h).map_err(errno)?;
@@ -792,7 +808,7 @@ impl Filesystem for View {
                 self.tree,
                 object,
                 name.to_str().ok_or(Errno::EINVAL)?,
-                &self.writer,
+                &self.by,
             )
             .map_err(errno)?;
             self.attr(&v, ino, None)
@@ -808,7 +824,7 @@ impl Filesystem for View {
                 return Err(Errno::ENOTDIR);
             }
             self.actor()?
-                .unlink(self.tree, name.to_str().ok_or(Errno::EINVAL)?, &self.writer)
+                .unlink(self.tree, name.to_str().ok_or(Errno::EINVAL)?, &self.by)
                 .map_err(errno)
         })();
         match result {
@@ -838,7 +854,7 @@ impl Filesystem for View {
                     self.tree,
                     name.to_str().ok_or(Errno::EINVAL)?,
                     newname.to_str().ok_or(Errno::EINVAL)?,
-                    &self.writer,
+                    &self.by,
                 )
                 .map_err(errno)
         })();
@@ -890,13 +906,49 @@ impl Filesystem for View {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agentfs_contracts::name::{VolumeName, WriterLabel};
+    use agentfs_contracts::pod::PodContext;
+    use agentfs_contracts::volume::{VolumeId, VolumeIdentity};
+
+    fn new_actor(dir: &Path) -> TreeActor {
+        let identity = VolumeIdentity {
+            name: VolumeName::parse("test").unwrap(),
+            id: VolumeId(uuid::Uuid::from_u128(1)),
+        };
+        TreeActor::create(dir, &identity, &PodContext::default()).unwrap()
+    }
+
+    fn writer(label: &str) -> WriterAt {
+        WriterAt {
+            writer: WriterLabel::parse(label).unwrap(),
+            at: PodContext::default(),
+        }
+    }
+
+    const OWNER: FileOwner = FileOwner {
+        uid: 10000,
+        gid: 10001,
+    };
+
+    #[test]
+    fn session_config_allows_other_by_default() {
+        let config = session_config(&MountOptions { allow_other: true });
+        assert_eq!(config.acl, SessionACL::All);
+        assert!(
+            config
+                .mount_options
+                .contains(&MountOption::DefaultPermissions)
+        );
+        let config = session_config(&MountOptions { allow_other: false });
+        assert_eq!(config.acl, SessionACL::Owner);
+    }
 
     #[test]
     fn all_bindings_are_checked_before_any_mount_can_expose_state() {
         for invalid in ["state", "state/inside", "."] {
             let tmp = tempfile::tempdir().unwrap();
             let state = tmp.path().join("state");
-            let volume = Volume::open(&state).unwrap();
+            let volume = new_actor(&state);
             let outside = tmp.path().join("valid");
             std::fs::create_dir(&outside).unwrap();
             let invalid = tmp.path().join(invalid);
@@ -904,17 +956,21 @@ mod tests {
             let bindings = vec![
                 Binding {
                     tree: TreeId::Root,
-                    writer: "root-client".into(),
+                    by: writer("root-client"),
+                    owner: OWNER,
                     mountpoint: outside,
                 },
                 Binding {
                     tree: TreeId::Root,
-                    writer: "other".into(),
+                    by: writer("other"),
+                    owner: OWNER,
                     mountpoint: invalid,
                 },
             ];
             assert_eq!(
-                serve(&state, volume, bindings).unwrap_err().kind(),
+                serve(&state, volume, bindings, MountOptions { allow_other: true })
+                    .unwrap_err()
+                    .kind(),
                 io::ErrorKind::InvalidInput
             );
         }
@@ -924,17 +980,20 @@ mod tests {
     fn anonymous_inode_attributes_are_available_without_a_file_handle() {
         let tmp = tempfile::tempdir().unwrap();
         let view = View {
-            actor: Arc::new(Mutex::new(Volume::open(tmp.path()).unwrap())),
+            actor: Arc::new(Mutex::new(new_actor(tmp.path()))),
             signal: Arc::new(ProgressSignal::default()),
             tree: TreeId::Root,
-            writer: "client".into(),
+            by: writer("client"),
+            owner: OWNER,
             handles: Mutex::new(Handles {
                 next: 2,
                 entries: BTreeMap::new(),
             }),
         };
         let mut volume = view.actor().unwrap();
-        let handle = volume.anonymous_open(TreeId::Root, "client").unwrap();
+        let handle = volume
+            .anonymous_open(TreeId::Root, &writer("client"))
+            .unwrap();
         let ino = INodeNo(volume.open_object(handle).unwrap() + 2);
         volume.write(handle, 0, b"private", false).unwrap();
         view.handles().unwrap().entries.insert(
@@ -948,29 +1007,35 @@ mod tests {
         let attr = view.attr(&volume, ino, None).unwrap();
         assert_eq!(attr.size, 7);
         assert_eq!(attr.nlink, 0);
+        assert_eq!((attr.uid, attr.gid), (OWNER.uid, OWNER.gid));
     }
 
     #[test]
     fn a_readers_snapshot_survives_a_later_save_and_readonly_truncation_is_refused() {
         let tmp = tempfile::tempdir().unwrap();
         let view = View {
-            actor: Arc::new(Mutex::new(Volume::open(tmp.path()).unwrap())),
+            actor: Arc::new(Mutex::new(new_actor(tmp.path()))),
             signal: Arc::new(ProgressSignal::default()),
             tree: TreeId::Root,
-            writer: "client".into(),
+            by: writer("client"),
+            owner: OWNER,
             handles: Mutex::new(Handles {
                 next: 1,
                 entries: BTreeMap::new(),
             }),
         };
         let mut volume = view.actor().unwrap();
-        let h = volume.write_open(TreeId::Root, "a", "seed", true).unwrap();
+        let h = volume
+            .write_open(TreeId::Root, "a", &writer("seed"), true)
+            .unwrap();
         volume.write(h, 0, b"old", false).unwrap();
         volume.close(h).unwrap();
         let reader = view
             .open_file(&mut volume, "a", libc::O_RDONLY, false)
             .unwrap();
-        let h = volume.write_open(TreeId::Root, "a", "next", false).unwrap();
+        let h = volume
+            .write_open(TreeId::Root, "a", &writer("next"), false)
+            .unwrap();
         volume.truncate(h, 0).unwrap();
         volume.write(h, 0, b"new", false).unwrap();
         volume.close(h).unwrap();

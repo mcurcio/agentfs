@@ -1,7 +1,10 @@
-//! The shared calls on the real library: `Volume`, in this process.
+//! The shared calls on the real library: `TreeActor`, in this process.
 
 use crate::engine_names::EngineNames;
-use agentfs_core::tree_actor::{self, Error, TreeId as EngineTree, Volume};
+use agentfs_contracts::name::{VolumeName, WriterLabel};
+use agentfs_contracts::pod::{PodContext, WriterAt};
+use agentfs_contracts::volume::{VolumeId, VolumeIdentity};
+use agentfs_core::tree_actor::{self, Error, TreeActor, TreeId as EngineTree};
 use agentfs_model::calls::{CallError, Caller, Took, TreeCalls, TreeId};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -13,15 +16,38 @@ const SEED_BYTES: &[u8] = b"-\n-\n-\n-\n-\n-\n";
 /// Makes the model's first commit in a new volume, in its root `root`. Each file
 /// is created under another name and renamed, because a file just created is what
 /// an atomic save renames (the model's a to d never are: `fresh`, git-model.md §7).
-pub fn seed(volume: &mut Volume, root: EngineTree) -> Result<(), Error> {
+pub fn seed(volume: &mut TreeActor, root: EngineTree) -> Result<(), Error> {
+    let by = writer("agentfs-seed")?;
     for path in SEEDED {
         let new = format!("{path}.new");
-        let h = volume.write_open(root, &new, "agentfs-seed", true)?;
+        let h = volume.write_open(root, &new, &by, true)?;
         volume.write(h, 0, SEED_BYTES, false)?;
         volume.close(h)?;
-        volume.rename(root, &new, path, "agentfs-seed")?;
+        volume.rename(root, &new, path, &by)?;
     }
     Ok(())
+}
+
+/// A replay's volume: `conformance`, with a fixed id. Its commits carry no pod
+/// context: the model has none.
+pub fn identity() -> VolumeIdentity {
+    VolumeIdentity {
+        name: VolumeName::parse("conformance").expect("a safe name"),
+        id: VolumeId(uuid::Uuid::from_u128(1)),
+    }
+}
+
+/// A new volume at `dir`, served with no pod context.
+pub fn create(dir: &Path) -> Result<TreeActor, Error> {
+    TreeActor::create(dir, &identity(), &PodContext::default())
+}
+
+/// `label` as a writer with no pod context: the model's labels (`c3`) as they are.
+pub(crate) fn writer(label: &str) -> Result<WriterAt, Error> {
+    Ok(WriterAt {
+        writer: WriterLabel::parse(label).map_err(|_| Error::Name)?,
+        at: PodContext::default(),
+    })
 }
 
 pub(crate) fn fail(e: Error) -> CallError {
@@ -31,9 +57,9 @@ pub(crate) fn fail(e: Error) -> CallError {
     }
 }
 
-/// `Volume` and its state directory.
+/// `TreeActor` and its state directory.
 pub struct Library {
-    volume: Option<Volume>,
+    volume: Option<TreeActor>,
     dir: PathBuf,
     names: EngineNames,
     owners: BTreeMap<u64, Caller>,
@@ -42,7 +68,7 @@ pub struct Library {
 impl Library {
     /// A new volume at `dir`, seeded, its trees named by `names`.
     pub fn new(dir: &Path, names: EngineNames) -> Result<Self, CallError> {
-        let mut volume = Volume::open(dir).map_err(fail)?;
+        let mut volume = create(dir).map_err(fail)?;
         seed(&mut volume, names.name(TreeId::ROOT)?).map_err(fail)?;
         Ok(Self {
             volume: Some(volume),
@@ -57,24 +83,25 @@ impl Library {
         self.dir.join("history.git")
     }
 
-    fn v(&self) -> Result<&Volume, CallError> {
+    fn v(&self) -> Result<&TreeActor, CallError> {
         self.volume
             .as_ref()
             .ok_or_else(|| CallError::new("the volume is down"))
     }
 
-    fn v_mut(&mut self) -> Result<&mut Volume, CallError> {
+    fn v_mut(&mut self) -> Result<&mut TreeActor, CallError> {
         self.volume
             .as_mut()
             .ok_or_else(|| CallError::new("the volume is down"))
     }
 
     /// The tree and writer label of a caller, owned: calls take `&mut self`.
-    fn who(&self, c: &Caller) -> Result<(EngineTree, String), CallError> {
-        Ok(match c {
+    fn who(&self, c: &Caller) -> Result<(EngineTree, WriterAt), CallError> {
+        let (tree, label) = match c {
             Caller::Root(n) => (self.names.name(TreeId::ROOT)?, n.clone()),
             Caller::Fork(f) => (self.names.name(*f)?, format!("c{f}")),
-        })
+        };
+        Ok((tree, writer(&label).map_err(fail)?))
     }
 
     fn open(&mut self, c: &Caller, path: &str, create: bool) -> Result<u64, CallError> {
@@ -168,7 +195,7 @@ impl TreeCalls for Library {
     fn crash(&mut self) -> Result<(), CallError> {
         self.volume = None;
         self.owners.clear();
-        self.volume = Some(Volume::open(&self.dir).map_err(fail)?);
+        self.volume = Some(TreeActor::open(&self.dir, &PodContext::default()).map_err(fail)?);
         Ok(())
     }
 

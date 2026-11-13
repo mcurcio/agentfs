@@ -55,7 +55,7 @@ case "$fs" in ext4) mkfs.ext4 -q -F "/dev/mapper/$lw" ;; xfs) mkfs.xfs -q -f "/d
 dmsetup message "$lw" 0 mark mkfs
 mount "/dev/mapper/$lw" "$work/mnt" || notrun "cannot mount $fs test filesystem"
 export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null
-"$AGENTFS_BIN" --state "$work/mnt/state" trees init
+"$AGENTFS_BIN" --state "$work/mnt/state" trees init --volume t
 "$AGENTFS_BIN" --state "$work/mnt/state" trees mount "$work/main" --sandbox "$work/sandbox" >"$work/mount.log" 2>&1 & pid=$!
 for _ in $(seq 1 200); do
   if mountpoint -q "$work/main" && mountpoint -q "$work/sandbox"; then break; fi

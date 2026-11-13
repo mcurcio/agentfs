@@ -1,18 +1,22 @@
 //! The actor's stage measurements (git-model §18, ledger R2): what a save does
-//! is counted by stage and by Git child, through a real `Volume` on real Git.
+//! is counted by stage and by Git child, through a real `TreeActor` on real Git.
 //! Measurements are never read by a decision; these tests read them.
 use std::path::Path;
 use std::sync::Mutex;
 
 use agentfs_core::tree_actor::stages::Stages;
-use agentfs_core::tree_actor::{TreeId, Volume};
+use agentfs_core::tree_actor::{TreeActor, TreeId};
+use trees::{new_actor, reopen, writer};
+
+#[path = "support/trees.rs"]
+mod trees;
 
 /// The counters are process-wide: one test reads them at a time.
 static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
 
-fn put(v: &mut Volume, path: &str, bytes: &[u8]) {
+fn put(v: &mut TreeActor, path: &str, bytes: &[u8]) {
     let h = v
-        .write_open(TreeId::Root, path, "test-writer", true)
+        .write_open(TreeId::Root, path, &writer("test-writer"), true)
         .unwrap();
     v.truncate(h, 0).unwrap();
     v.write(h, 0, bytes, false).unwrap();
@@ -63,7 +67,7 @@ const CHILDREN_PER_SAVE: u64 = 15;
 fn stages_add_up() {
     let _one = ONE_AT_A_TIME.lock().unwrap();
     let tmp = tempfile::tempdir().unwrap();
-    let mut v = Volume::open(&tmp.path().join("state")).unwrap();
+    let mut v = new_actor(&tmp.path().join("state"));
     put(&mut v, "a", b"seed\n");
     let before = v.metrics();
     const SAVES: u64 = 5;
@@ -105,9 +109,9 @@ fn a_sync_costs_the_same_children_at_any_history_length() {
     let _one = ONE_AT_A_TIME.lock().unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let state = tmp.path().join("state");
-    let mut v = Volume::open(&state).unwrap();
+    let mut v = new_actor(&state);
     v.fork().unwrap();
-    let cycle = |v: &mut Volume, i: u64| {
+    let cycle = |v: &mut TreeActor, i: u64| {
         let before = Stages::current().git_children;
         put(v, "a", format!("line {i}\n").as_bytes());
         while v.progress().unwrap() {}
@@ -132,7 +136,7 @@ fn a_sync_costs_the_same_children_at_any_history_length() {
     );
     // A reopened actor rebuilds what the syncs look up, from history.
     drop(v);
-    let mut v = Volume::open(&state).unwrap();
+    let mut v = reopen(&state);
     let syncs = v.metrics().syncs;
     put(&mut v, "a", b"after reopen\n");
     while v.progress().unwrap() {}
@@ -148,7 +152,7 @@ fn a_sync_costs_the_same_children_for_any_number_of_lines() {
     // A volume of its own for each size, so each save meets the same tree.
     let children = |lines: usize| {
         let tmp = tempfile::tempdir().unwrap();
-        let mut v = Volume::open(&tmp.path().join("state")).unwrap();
+        let mut v = new_actor(&tmp.path().join("state"));
         v.fork().unwrap();
         let bytes: Vec<u8> = (0..lines)
             .flat_map(|i| format!("line {i}\n").into_bytes())

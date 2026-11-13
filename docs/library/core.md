@@ -36,7 +36,7 @@ recorded; [guarantees](../guarantees.md) says what the engine promises.
 | Release decision for a worktree | `release` | `decide`, `Release` |
 | Several mounts, one writer | `history_service` | `HistoryServer`, `HistoryClient`, `FrontLease` |
 | Large files | `lfs` | `ObjectCache`, `Store`, `fetch`, `prune` |
-| Git-backed tree views | `tree_actor` | `Volume`, `TreeId` (a tree's identity, `root` or `fork/<n>`) |
+| Git-backed tree views | `tree_actor`, `state_area` | `TreeActor`, `TreeId` (a tree's identity, `root` or `fork/<n>`), `inspect`, `TreeStateArea` (the Volume domain's `StateArea` port) |
 | Line identity across saves | `tree_reconcile` | `LineMap`, `Line`, `LineMap::align` (git's histogram diff), `LineMap::append`: the line-map library, generic over the caller's version (`Id`) |
 
 ## The state area
@@ -644,12 +644,20 @@ in the tree. See [recording](../recording.md) and [remotes](../remotes.md).
 
 ## Git-backed tree views
 
-`tree_actor::Volume` is a separate, smaller library: a git-backed volume
+`tree_actor::TreeActor` is a separate, smaller library: a git-backed volume
 whose saves are ordered by one actor. It is not the recorder above and does
-not share its state format. It holds an exclusive lease on its state area
-(`Volume::open(root)` fails with `Error::Busy` if another process holds it).
-Its recorded calls are `write_open`, `write`, `truncate`, `sync`, `close`,
-`rename` and `unlink`. Every call names its tree by a `TreeId`: `root`, the
+not share its state format. `TreeActor::create(root, identity, service)` makes a
+volume with its identity (`agentfs_contracts::volume::VolumeIdentity`: a name
+and an id); `TreeActor::open(root, service)` recovers one and never creates
+(`Error::NotCreated`, `Error::Format` for another format). `service` is the pod
+context of the process that serves it, which its own commits carry. It holds
+an exclusive lease on its state area (`Error::Busy` if another process holds
+it); `tree_actor::inspect(root)` reads what a state area holds without it, and
+`state_area::TreeStateArea` offers both to the Volume domain as its
+`StateArea` port. Its recorded calls are `write_open`, `write`, `truncate`,
+`sync`, `close`, `rename` and `unlink`; each write-open and namespace call
+names its writer as an `agentfs_contracts::pod::WriterAt`, the writer and its
+pod context, which the commit carries ([trees](../trees.md#volume-identity-and-trailers)). Every call names its tree by a `TreeId`: `root`, the
 tree with no upstream, or `fork/<n>`, made at journal event `n`. `trees()`
 lists them, the root first and then the forks by number; `TreeId` parses from
 and prints as that text. `fork()` makes a fork of the root and returns its

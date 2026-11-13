@@ -5,11 +5,13 @@ pub(super) mod pages;
 
 use std::sync::Arc;
 
+use agentfs_contracts::pod::WriterAt;
+
 use super::history::message::Action;
 use super::journal::{CallHead, Entry, LiveOpen, RunHead};
 use super::stages::{Timer, Which};
 use super::tree::{EventNumber, MergeFileIdentity, NameHistory, Versions};
-use super::{Draft, Error, Result, Saved, TreeId, Volume};
+use super::{Draft, Error, Result, Saved, TreeActor, TreeId};
 use crate::paths::RepoPath;
 
 /// Calls name byte positions, never lines. Append finds EOF at save time.
@@ -86,14 +88,14 @@ impl Call {
 
 pub(in crate::tree_actor) struct Handle {
     pub(in crate::tree_actor) tree: TreeId,
-    pub(in crate::tree_actor) writer: String,
+    pub(in crate::tree_actor) by: WriterAt,
     pub(in crate::tree_actor) object: u64,
     pub(in crate::tree_actor) bytes: Vec<u8>,
     /// This open's calls, each with its journal number.
     pub(in crate::tree_actor) calls: Vec<(u64, Call)>,
 }
 
-impl Volume {
+impl TreeActor {
     /// Saved bytes; an independent reader never sees an unfinished save.
     pub fn read(&self, tree: TreeId, path: &str) -> Result<&[u8]> {
         let tree = self.tree(tree)?;
@@ -120,10 +122,10 @@ impl Volume {
         &mut self,
         tree: TreeId,
         path: &str,
-        writer: &str,
+        by: &WriterAt,
         create: bool,
     ) -> Result<u64> {
-        let handle = self.write_open(tree, path, writer, create)?;
+        let handle = self.write_open(tree, path, by, create)?;
         if let Err(error) = self.truncate(handle, 0) {
             if let Err(close) = self.close(handle) {
                 eprintln!("tree close after a failed truncate: {close}");
@@ -139,24 +141,23 @@ impl Volume {
         &mut self,
         tree: TreeId,
         path: &str,
-        writer: &str,
+        by: &WriterAt,
         create: bool,
     ) -> Result<u64> {
         name(path)?;
-        writer_label(writer)?;
         let Some(object) = self.tree(tree)?.names.get(path).copied() else {
             if !create {
                 return Err(Error::NotFound);
             }
             return self
-                .step(tree, |v, event| v.build_create(tree, path, writer, event))
+                .step(tree, |v, event| v.build_create(tree, path, by, event))
                 .map(|(event, _)| event.get());
         };
         let handle = self.journal_record(
             Entry::Open {
                 tree: tree.to_string(),
                 path: path.to_owned(),
-                writer: writer.to_owned(),
+                by: by.clone(),
                 object,
             },
             &[],
@@ -166,7 +167,7 @@ impl Volume {
             handle,
             Handle {
                 tree,
-                writer: writer.to_owned(),
+                by: by.clone(),
                 object,
                 bytes,
                 calls: Vec::new(),
@@ -177,13 +178,12 @@ impl Volume {
     }
 
     /// Create an unnamed open object. Its writes are journaled as usual.
-    pub fn anonymous_open(&mut self, tree: TreeId, writer: &str) -> Result<u64> {
-        writer_label(writer)?;
+    pub fn anonymous_open(&mut self, tree: TreeId, by: &WriterAt) -> Result<u64> {
         self.tree(tree)?;
         let handle = self.journal_record(
             Entry::AnonymousOpen {
                 tree: tree.to_string(),
-                writer: writer.to_owned(),
+                by: by.clone(),
             },
             &[],
         )?;
@@ -195,7 +195,7 @@ impl Volume {
             handle,
             Handle {
                 tree,
-                writer: writer.to_owned(),
+                by: by.clone(),
                 object: handle,
                 bytes: Vec::new(),
                 calls: Vec::new(),
@@ -211,10 +211,9 @@ impl Volume {
         tree: TreeId,
         object: u64,
         path: &str,
-        writer: &str,
+        by: &WriterAt,
     ) -> Result<()> {
         name(path)?;
-        writer_label(writer)?;
         let t = self.tree(tree)?;
         if t.names.contains_key(path) {
             return Err(Error::Exists);
@@ -230,7 +229,7 @@ impl Volume {
                 NameHistory::created(event, path.to_owned()),
             );
             t.names.insert(path.to_owned(), object);
-            let mut draft = v.build_save(tree, t, writer, Action::Create, event, None)?;
+            let mut draft = v.build_save(tree, t, by, Action::Create, event, None)?;
             draft.linked = Some(object);
             Ok(draft)
         })?;
@@ -338,24 +337,20 @@ impl Volume {
         self.run_pending_closes(tree, Some(handle))
     }
 
-    pub fn rename(&mut self, tree: TreeId, from: &str, to: &str, writer: &str) -> Result<()> {
+    pub fn rename(&mut self, tree: TreeId, from: &str, to: &str, by: &WriterAt) -> Result<()> {
         name(from)?;
         name(to)?;
-        writer_label(writer)?;
         if !self.tree(tree)?.names.contains_key(from) {
             return Err(Error::NotFound);
         }
         if from != to {
-            self.step(tree, |v, event| {
-                v.build_rename(tree, from, to, writer, event)
-            })?;
+            self.step(tree, |v, event| v.build_rename(tree, from, to, by, event))?;
         }
         Ok(())
     }
 
-    pub fn unlink(&mut self, tree: TreeId, path: &str, writer: &str) -> Result<()> {
+    pub fn unlink(&mut self, tree: TreeId, path: &str, by: &WriterAt) -> Result<()> {
         name(path)?;
-        writer_label(writer)?;
         if !self.tree(tree)?.names.contains_key(path) {
             return Err(Error::NotFound);
         }
@@ -366,7 +361,7 @@ impl Volume {
                 .get_mut(&t.identities[&object])
                 .ok_or(Error::Format)?
                 .advance(event, None, None);
-            v.build_save(tree, t, writer, Action::Unlink, event, None)
+            v.build_save(tree, t, by, Action::Unlink, event, None)
         })?;
         Ok(())
     }
@@ -397,7 +392,7 @@ impl Volume {
         &self,
         tree: TreeId,
         path: &str,
-        writer: &str,
+        by: &WriterAt,
         event: EventNumber,
     ) -> Result<Draft> {
         let object = event.object();
@@ -411,11 +406,11 @@ impl Volume {
             NameHistory::created(event, path.to_owned()),
         );
         t.fresh_names.insert(object);
-        let mut draft = self.build_save(tree, t, writer, Action::Create, event, None)?;
+        let mut draft = self.build_save(tree, t, by, Action::Create, event, None)?;
         draft.opened = Some(LiveOpen {
             handle: event.get(),
             tree,
-            writer: writer.to_owned(),
+            by: by.clone(),
             object,
             anonymous: false,
         });
@@ -432,9 +427,9 @@ impl Volume {
         let mut t = self.tree(h.tree)?.clone();
         let mut draft = if t.anonymous.remove(&h.object) {
             t.drop_object(h.object);
-            Draft::new(&h.writer, h.tree, t)
+            Draft::new(&h.by, h.tree, t)
         } else if !t.is_named(h.object) {
-            let mut draft = Draft::new(&h.writer, h.tree, t);
+            let mut draft = Draft::new(&h.by, h.tree, t);
             draft.saved = Saved::OrphanDropped;
             draft
         } else if let Some(bytes) = changed_bytes(&t.bytes[&h.object], &calls)? {
@@ -456,9 +451,9 @@ impl Volume {
             };
             t.lines.insert(h.object, Arc::new(lines));
             t.bytes.insert(h.object, Arc::new(bytes));
-            self.build_save(h.tree, t, &h.writer, Action::Direct, event, Some(handle))?
+            self.build_save(h.tree, t, &h.by, Action::Direct, event, Some(handle))?
         } else {
-            Draft::new(&h.writer, h.tree, t)
+            Draft::new(&h.by, h.tree, t)
         };
         draft.closes = Some(handle);
         Ok(draft)
@@ -469,7 +464,7 @@ impl Volume {
         tree: TreeId,
         from: &str,
         to: &str,
-        writer: &str,
+        by: &WriterAt,
         event: EventNumber,
     ) -> Result<Draft> {
         let mut t = self.tree(tree)?.clone();
@@ -505,7 +500,7 @@ impl Volume {
             t.fresh_names.remove(&object);
         }
         t.names.insert(to.to_owned(), object);
-        self.build_save(tree, t, writer, Action::Rename, event, None)
+        self.build_save(tree, t, by, Action::Rename, event, None)
     }
 }
 
@@ -526,13 +521,6 @@ pub(in crate::tree_actor) fn name(path: &str) -> Result<()> {
     RepoPath::new(path).map_err(|_| Error::Name)?;
     if path.contains('/') {
         return Err(Error::Name);
-    }
-    Ok(())
-}
-
-pub(in crate::tree_actor) fn writer_label(writer: &str) -> Result<()> {
-    if writer.is_empty() || writer.len() > 256 || writer.chars().any(char::is_control) {
-        return Err(Error::Writer);
     }
     Ok(())
 }

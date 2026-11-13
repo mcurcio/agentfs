@@ -61,6 +61,15 @@ design was reviewed on 2026-10-12.
   and Compose examples, Helm charts for the CSI driver and the sidecar
   (published to `oci://ghcr.io/mcurcio/charts`), and example Prometheus
   alert rules with runbooks.
+- **Tree views identify their volume and writers** ([trees](docs/trees.md)):
+  tree state format 4; a state area of format 3 is refused, never converted.
+  `agentfs trees init --volume NAME` (required) gives a volume a random id,
+  finds it again under the same name with nothing written, and refuses
+  another name. Every commit carries `Agentfs-Event`, `Agentfs-Volume`,
+  `Agentfs-Volume-Id` and the writer's pod context (`--namespace`, `--pod`,
+  `--pod-uid`, `--node`); a landing merge names the writer it lands. `trees
+  mount` never creates a volume, mounts with FUSE `allow_other` unless
+  `--no-allow-other`, and presents its files as `--owner UID:GID`.
 - **Testing**: end-to-end CI against real FUSE mounts, git servers over
   HTTP, HTTPS and SSH, LFS servers, an OpenTelemetry collector, NFS, kind
   clusters and csi-sanity; crash injection and power-loss replay on XFS
