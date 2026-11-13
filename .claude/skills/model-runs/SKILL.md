@@ -25,12 +25,27 @@ older than it: two mutant probes once reported the same 170 differing digests be
 binary. Volumes can be renamed for a run (`MODEL_WORK_VOLUME`, `MODEL_TARGET_VOLUME`, `MODEL_CARGO_VOLUME`) when someone watches
 a particular one. Copy logs out of `/work` before you finish: the volume is not on the host.
 
-## Fast and full
+## The regression tier and the full sweep
 
-- `run.py` is fast by default: each test in its own process, scenarios first, stopping at the first test that catches
-  the bug. `--full` runs both test targets whole (the old behaviour, for counting every catcher).
-- `ci/model-digest.sh check` is fast: scenarios first, stopping at their first difference before any seed runs.
-  `check --all` runs everything and lists every difference.
+The owner, 2026-11-13: "a test suite should run in seconds to minutes, not hours". Every command below runs the
+regression tier by default: the scenarios plus the random runs at the measured cover of seeds in
+`crates/agentfs-model/tests/regression-seeds.txt` (`VERIFYING.md`, "Tiers"). Run the full sweep only for a change to
+the model's rules or its generator, once, at the end, never per slice or per push.
+
+| Command | Regression tier (default) | Full sweep |
+|---|---|---|
+| `cargo test --locked -p agentfs-model` | 73 s | `AGENTFS_MODEL_SWEEP=1`: 228 s |
+| `ci/model-digest.sh check` | 66 s: scenarios first, stopping at their first difference, then 11 seeds | `check --all`: 500 seeds, about 2054 s |
+| `planted/run.py --work DIR` | 518 s, 48 of 48 caught | `--sweep`: 590 s |
+| `phase-1.yml` | every pull request and push | a manual run (`gh workflow run phase-1.yml`): about 80 min |
+
+- `run.py` stops at the first test that catches the bug, each test in its own process, scenarios first. Running the
+  scenarios in one process instead was slower (890 s against 518 s): the corpus is CPU-bound, and stopping early saves
+  more than process starts cost. `--full` runs both test targets whole, for counting every catcher.
+- The model is bound by its `git` processes, not by the debug build (a release build ran no faster).
+- A change to the generator moves the cover: `ci/model-docker.sh -- python3 ci/regression-seeds.py --work /work/cover
+  --must 24` (about 3 minutes) prints the two lines for `regression-seeds.txt`; then run the corpus. A tally floor that
+  fails on the regression seeds says the same.
 
 ## Which tier a change needs
 
@@ -40,13 +55,13 @@ process seems too heavy for this").
 
 - **Light**, for docs, comments, renames at every site, imports, formatting, unit tests added in `src/**`'s
   `#[cfg(test)]` modules, and digest keys renamed with identical values. One job at a time through the wrapper:
-  `run.py --anchors-only --work /work/anchors` (silent, rc 0), `ci/model-digest.sh check` (the scenario digests
-  match; a budget-only line is fine), `cargo test --locked -p agentfs-model`, `cargo test --locked -p
+  `run.py --anchors-only --work /work/anchors` (silent, rc 0), `ci/model-digest.sh check` (the scenarios' and the
+  regression seeds' digests match; a budget-only line is fine), `cargo test --locked -p agentfs-model`, `cargo test --locked -p
   agentfs-conformance`, the safety-net tests, and `run.py --work /work/planted --only <ids>` for each bug whose anchor
   moved (each still caught). Then `cargo fmt --all --check` and clippy.
 - **Full**, for any other change to the model's `src/**` or `tests/**` (a condition, a branch, a moved function), to
-  the digest's text or the harness, or to a digest value or matrix row: `check --all` and the whole corpus in place of
-  `check` and `--only`.
+  the digest's text or the harness, or to a digest value or matrix row: the whole corpus in place of `--only`, and
+  `check --all` (the full sweep) once at the end in place of `check`.
 
 ## The budget
 

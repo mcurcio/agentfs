@@ -14,18 +14,23 @@ HARNESS; each fails the run.
 Fast mode (the default) runs each test in its own process, the scenarios first, then the
 random runs, in name order, and stops at the first test that catches the bug. `--full`
 runs every test of both targets once and records the check that tripped first most often.
+The random runs take the regression seeds (tests/regression-seeds.txt) by default: the
+fast tier, which must catch every bug (VERIFYING.md, "Tiers"). `--sweep` runs the full
+sweep instead (AGENTFS_MODEL_SWEEP=1, or AGENTFS_MODEL_SEEDS for a bug whose `seeds` is
+not 64), to count what the sweep catches.
 
 Run it through ci/model-docker.sh, never a hand-written `docker run` (VERIFYING.md):
 
     ci/model-docker.sh -- python3 crates/agentfs-model/planted/run.py --work /work/planted \\
-        [--jobs N] [--only a,b] [--full] [--write]
+        [--jobs N] [--only a,b] [--full] [--sweep] [--write]
 
 DIR (--work) holds each bug's result, copy, target and TMPDIR. A result is kept under a
 hash of its corpus entry and of the model's sources and tests, so a stopped run goes on
 where it left off and a changed model or bug runs again. Without --write the results must
 equal planted/matrix.tsv and the pass must take at most 1.5 times its time in
-planted/budget.json; --write records both. DIR and TMPDIR must not be on a host file share
-(mounts.py refuses one, exit 2). Each bug prints `unit-start: ID` and `unit-done: ID ...`,
+planted/budget.json (its `corpus` key for the default, `corpus_sweep` and `corpus_full`
+for the others; a missing key checks no time); --write records both. DIR and TMPDIR must
+not be on a host file share (mounts.py refuses one, exit 2). Each bug prints `unit-start: ID` and `unit-done: ID ...`,
 which ci/model-docker.sh's stall alarm reads.
 """
 
@@ -178,7 +183,7 @@ def classify(code, output):
 def run_limited(cmd, cwd, env, deadline):
     """(exit status or None past the deadline, output) of one process group."""
     inherited = {k: v for k, v in os.environ.items()
-                 if k not in ("AGENTFS_MODEL_SEED", "AGENTFS_MODEL_SEEDS")}
+                 if k not in ("AGENTFS_MODEL_SEED", "AGENTFS_MODEL_SEEDS", "AGENTFS_MODEL_SWEEP")}
     proc = subprocess.Popen(
         cmd, cwd=cwd, env={**inherited, **env}, stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT, text=True, errors="replace", start_new_session=True,
@@ -225,7 +230,7 @@ def full(dst, env, deadline):
     return status, hits, out
 
 
-def run_bug(work, bug, model, mode):
+def run_bug(work, bug, model, mode, sweep=False):
     result = result_path(work, bug, model, mode)
     if result.exists():
         return result.read_text()
@@ -238,9 +243,11 @@ def run_bug(work, bug, model, mode):
     target = work / "target" / bug["id"]
     (work / "tmp").mkdir(exist_ok=True)
     env = {"CARGO_TARGET_DIR": str(target), "TMPDIR": str(work / "tmp")}
-    if bug["seeds"] != 64:
-        env["AGENTFS_MODEL_SEEDS"] = str(bug["seeds"])
-    status, hits, log = (fast if mode == "fast" else full)(dst, env, start + BUG_SECONDS)
+    if sweep:
+        env["AGENTFS_MODEL_SWEEP"] = "1"
+        if bug["seeds"] != 64:
+            env["AGENTFS_MODEL_SEEDS"] = str(bug["seeds"])
+    status, hits, log = (fast if mode.startswith("fast") else full)(dst, env, start + BUG_SECONDS)
     (work / f"{bug['id']}.log").write_text(log)
     shutil.rmtree(dst, ignore_errors=True)
     shutil.rmtree(target, ignore_errors=True)
@@ -269,6 +276,7 @@ def main(argv=None):
     ap.add_argument("--jobs", type=int, default=4)
     ap.add_argument("--only", default="")
     ap.add_argument("--full", action="store_true")
+    ap.add_argument("--sweep", action="store_true")
     ap.add_argument("--write", action="store_true")
     ap.add_argument("--anchors-only", action="store_true")
     ap.add_argument("--corpus", type=pathlib.Path, default=CORPUS)
@@ -292,11 +300,11 @@ def main(argv=None):
     if refused:
         print(refused, file=sys.stderr)
         return 2
-    mode = "full" if args.full else "fast"
+    mode = ("full" if args.full else "fast") + ("-sweep" if args.sweep else "")
     model = model_hash()
     start = time.monotonic()
     with concurrent.futures.ThreadPoolExecutor(args.jobs) as pool:
-        lines = list(pool.map(lambda b: run_bug(work, b, model, mode), bugs))
+        lines = list(pool.map(lambda b: run_bug(work, b, model, mode, args.sweep), bugs))
     elapsed = round(time.monotonic() - start)
     header = "id\trule\tseeds\tstatus\tcheck\n"
     body = header + "".join(sorted(lines))
@@ -314,7 +322,7 @@ def main(argv=None):
     if only:
         print(f"{len(bugs)} bugs caught ({work / 'matrix.tsv'}); --only runs are not checked against the matrix")
         return 0
-    key = "corpus" if mode == "fast" else "corpus_full"
+    key = {"fast": "corpus", "fast-sweep": "corpus_sweep"}.get(mode, "corpus_full")
     budget = load_budget()
     if args.write:
         times = {b["id"]: int((work / f"{b['id']}.seconds").read_text())

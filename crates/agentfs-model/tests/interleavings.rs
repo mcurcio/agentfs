@@ -24,9 +24,11 @@
 //! referee did not take (a queue step, a transaction's commit), which only
 //! the tree it took may change.
 //!
-//! The seeds are every seed in `1..=SEEDS`, never a set picked because it
-//! passes. `AGENTFS_MODEL_SEED=<n>` runs one seed; `AGENTFS_MODEL_SEEDS=<n>`
-//! runs seeds 1..=n. Each seed runs under `catch_unwind`, so a harness
+//! By default each run takes the regression seeds of `regression-seeds.txt`:
+//! a set chosen by cover, never because it passes (VERIFYING.md, "Tiers").
+//! `AGENTFS_MODEL_SWEEP=1` runs the full sweep, every seed in `1..=SEEDS`
+//! (rounds `1..=ROUNDS_SEEDS`); `AGENTFS_MODEL_SEED=<n>` runs one seed;
+//! `AGENTFS_MODEL_SEEDS=<n>` runs seeds 1..=n. Each seed runs under `catch_unwind`, so a harness
 //! panic too reports its seed and the event log. The generator is a
 //! SplitMix64 written here: fixed seeds replay exactly.
 
@@ -45,7 +47,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 mod gitledger;
 
-/// CI runs seeds 1..=SEEDS.
+/// The full sweep's seeds, 1..=SEEDS (`AGENTFS_MODEL_SWEEP=1`).
 const SEEDS: u64 = 64;
 const STEPS: usize = 80;
 /// Positions the random clients write at: the first three lines, so edits
@@ -164,7 +166,26 @@ struct Tally {
     git_takes_total: usize,
 }
 
-fn seeds() -> Vec<u64> {
+/// The regression seeds of `kind` (`random` or `rounds`) in `regression-seeds.txt`.
+fn regression_seeds(kind: &str) -> Vec<u64> {
+    include_str!("regression-seeds.txt")
+        .lines()
+        .filter(|l| !l.starts_with('#'))
+        .filter_map(|l| l.strip_prefix(kind)?.strip_prefix(' '))
+        .flat_map(|l| l.split_whitespace())
+        .map(|s| s.parse().expect("regression-seeds.txt holds seed numbers"))
+        .collect()
+}
+
+/// Whether `var` is set and not empty: CI sets `AGENTFS_MODEL_SWEEP` empty on a push.
+fn set(var: &str) -> bool {
+    std::env::var_os(var).is_some_and(|v| !v.is_empty())
+}
+
+/// The seeds a run takes: one (`AGENTFS_MODEL_SEED`), 1..=n
+/// (`AGENTFS_MODEL_SEEDS`), the sweep's 1..=`sweep` (`AGENTFS_MODEL_SWEEP`), or
+/// else the regression seeds of `kind`.
+fn seeds_of(kind: &str, sweep: u64) -> Vec<u64> {
     if let Ok(s) = std::env::var("AGENTFS_MODEL_SEED") {
         return vec![s.parse().expect("AGENTFS_MODEL_SEED is a number")];
     }
@@ -172,7 +193,29 @@ fn seeds() -> Vec<u64> {
         let n: u64 = n.parse().expect("AGENTFS_MODEL_SEEDS is a number");
         return (1..=n).collect();
     }
-    (1..=SEEDS).collect()
+    if set("AGENTFS_MODEL_SWEEP") {
+        return (1..=sweep).collect();
+    }
+    let seeds = regression_seeds(kind);
+    assert!(!seeds.is_empty(), "no {kind} line in regression-seeds.txt");
+    seeds
+}
+
+fn seeds() -> Vec<u64> {
+    seeds_of("random", SEEDS)
+}
+
+/// Whether a run's tally floors apply: on the regression seeds, which were
+/// chosen to meet them, and on a sweep of at least `sweep` seeds; never on one
+/// seed or a shorter sweep, where one seed alone may meet none.
+fn floors_apply(sweep: u64) -> bool {
+    if set("AGENTFS_MODEL_SEED") {
+        return false;
+    }
+    match std::env::var("AGENTFS_MODEL_SEEDS") {
+        Ok(n) => n.parse::<u64>().is_ok_and(|n| n >= sweep),
+        Err(_) => true,
+    }
 }
 
 fn live_clients(w: &World) -> Vec<TreeId> {
@@ -1986,10 +2029,10 @@ fn run_all(policies: Policies) {
         seeds().len(),
         failures.join("\n\n")
     );
-    // Across the CI seeds (or more) the rules really met: changes lost
-    // whole with clean lines in them (rule 3e), and rules 10 and 11 (below).
-    // One seed alone may have none.
-    if seeds().len() as u64 >= SEEDS {
+    // Across the regression seeds or the sweep the rules really met: changes
+    // lost whole with clean lines in them (rule 3e), and rules 10 and 11
+    // (below). One seed alone may have none.
+    if floors_apply(SEEDS) {
         assert!(
             tally.changes_lost > 0 && tally.clean_lines_lost > 0,
             "no change lost whole with a clean line in {} seeds",
@@ -2045,22 +2088,20 @@ fn random_interleavings_full_lineage() {
     run_all(Policies::default());
 }
 
-/// CI runs [`random_interleavings_rounds`] at seeds 1..=ROUNDS_SEEDS: each seed
-/// drains four times, so 64 seeds would be the slowest test by far.
-/// `AGENTFS_MODEL_SEEDS` and `AGENTFS_MODEL_SEED` apply as to every random run.
+/// The sweep runs [`random_interleavings_rounds`] at seeds 1..=ROUNDS_SEEDS: each
+/// seed drains four times, so 64 seeds would be the slowest test by far. By
+/// default it takes the `rounds` regression seeds; `AGENTFS_MODEL_SEEDS` and
+/// `AGENTFS_MODEL_SEED` apply as to every random run.
 const ROUNDS_SEEDS: u64 = 16;
+
+fn round_seeds() -> Vec<u64> {
+    seeds_of("rounds", ROUNDS_SEEDS)
+}
 
 /// [`rounds`]: many calls with no queue step between them, every invariant.
 #[test]
 fn random_interleavings_rounds() {
-    let explicit = ["AGENTFS_MODEL_SEED", "AGENTFS_MODEL_SEEDS"]
-        .iter()
-        .any(|v| std::env::var(v).is_ok());
-    let seeds = if explicit {
-        seeds()
-    } else {
-        (1..=ROUNDS_SEEDS).collect()
-    };
+    let seeds = round_seeds();
     let mut tally = Tally::default();
     let failures: Vec<String> = seeds
         .iter()
@@ -2074,7 +2115,7 @@ fn random_interleavings_rounds() {
         seeds.len(),
         failures.join("\n\n")
     );
-    if seeds.len() as u64 >= ROUNDS_SEEDS {
+    if floors_apply(ROUNDS_SEEDS) {
         assert!(
             tally.changes_lost > 0 && tally.clean_lines_lost > 0,
             "rounds: no change lost whole with a clean line in {} seeds",
@@ -2083,8 +2124,9 @@ fn random_interleavings_rounds() {
     }
 }
 
-/// One [`Run`] over the seeds, every invariant on, no tally floor: the floors
-/// of [`run_all`] count transactions, which these runs do not make.
+/// One [`Run`] over the seeds, every invariant on, with its own floor
+/// `at_least` where [`floors_apply`] at 8 seeds: the floors of [`run_all`]
+/// count transactions, which these runs do not make.
 fn run_scoped(generate: Run, seeds: &[u64], at_least: impl Fn(&Tally) -> bool) {
     let mut tally = Tally::default();
     let failures: Vec<String> = seeds
@@ -2100,7 +2142,7 @@ fn run_scoped(generate: Run, seeds: &[u64], at_least: impl Fn(&Tally) -> bool) {
         failures.join("\n\n")
     );
     assert!(
-        seeds.len() < 8 || at_least(&tally),
+        !floors_apply(8) || at_least(&tally),
         "the phase 1 runs met too little: {tally:?}"
     );
 }
@@ -2116,15 +2158,7 @@ fn random_interleavings_phase1_scope() {
 /// [`rounds`], for the same replay.
 #[test]
 fn random_interleavings_rounds_phase1_scope() {
-    let explicit = ["AGENTFS_MODEL_SEED", "AGENTFS_MODEL_SEEDS"]
-        .iter()
-        .any(|v| std::env::var(v).is_ok());
-    let seeds = if explicit {
-        seeds()
-    } else {
-        (1..=ROUNDS_SEEDS).collect()
-    };
-    run_scoped(rounds_phase1, &seeds, |t| t.changes_lost > 0);
+    run_scoped(rounds_phase1, &round_seeds(), |t| t.changes_lost > 0);
 }
 
 /// The per-line rule does not depend on slots being separate git hunks:
@@ -2137,14 +2171,14 @@ fn random_interleavings_adjacent_lines() {
     });
 }
 
-/// Rule 2, "no clock is read anywhere", on the random runs: seeds 1..=8 run
-/// again with every commit dated before its parents decide exactly the same
+/// Rule 2, "no clock is read anywhere", on the random runs: the first 8 of
+/// the run's seeds run again with every commit dated before its parents decide exactly the same
 /// history (the digest's canonical text, `agentfs_model::digest`). An order taken from commit
 /// dates would differ.
 #[test]
 fn random_interleavings_commit_dates_decide_nothing() {
     let policies = Policies::default();
-    for seed in seeds().into_iter().take(8) {
+    let one = |seed: u64| {
         let mut tally = Tally::default();
         let pinned = run_seed(seed, policies, &mut tally);
         // Each run must pass on its own first: a failure names commit
@@ -2154,7 +2188,29 @@ fn random_interleavings_commit_dates_decide_nothing() {
         let reversed = with_reversed_dates(|| run_seed(seed, policies, &mut tally))
             .unwrap_or_else(|e| panic!("seed {seed}, dates reversed: {e}"));
         assert_eq!(pinned, reversed, "seed {seed}");
-    }
+    };
+    // Each seed on its own thread, named as the test's so its runs keep their
+    // names (`World::run_name`); the reversed dates are per thread.
+    let one = &one;
+    let name = std::thread::current().name().map(str::to_owned);
+    std::thread::scope(|s| {
+        let runs: Vec<_> = seeds()
+            .into_iter()
+            .take(8)
+            .map(|seed| {
+                let mut b = std::thread::Builder::new();
+                if let Some(n) = &name {
+                    b = b.name(n.clone());
+                }
+                b.spawn_scoped(s, move || one(seed)).expect("a thread")
+            })
+            .collect();
+        for run in runs {
+            if let Err(panic) = run.join() {
+                std::panic::resume_unwind(panic);
+            }
+        }
+    });
 }
 
 /// Coherence finding 1: git's own merge base cannot tell a fork line the

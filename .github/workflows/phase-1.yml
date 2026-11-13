@@ -12,6 +12,9 @@ on:
       - '.github/actions/**'
   pull_request:
     paths: *paths
+  # A manual run is the full sweep (VERIFYING.md, "Tiers"): the conformance job records
+  # seeds 1..64 (rounds 1..16) instead of the regression seeds, and the library replays
+  # the phase 1 generators at seeds 1 to 500 in four shards.
   workflow_dispatch:
 
 permissions:
@@ -25,7 +28,14 @@ jobs:
   conformance:
     name: phase 1 mounted conformance
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    timeout-minutes: ${{ github.event_name == 'workflow_dispatch' && 120 || 30 }}
+    # The floors are what passes: on every push the regression seeds' in-scope traces
+    # (9 and 6 of the tree-library generators; 3 and 2 of them mountable), on a manual
+    # run the full sweep's.
+    env:
+      SWEEP: ${{ github.event_name == 'workflow_dispatch' && '1' || '' }}
+      MIN_SEEDS: ${{ github.event_name == 'workflow_dispatch' && '94' || '15' }}
+      MIN_MOUNTED_SEEDS: ${{ github.event_name == 'workflow_dispatch' && '16' || '5' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: rustup toolchain install # the release rust-toolchain.toml pins
@@ -53,14 +63,15 @@ jobs:
         run: cargo test --locked -p agentfs-model --test scenarios --test interleavings
         env:
           AGENTFS_MODEL_TRACE_DIR: ${{ runner.temp }}/traces
+          AGENTFS_MODEL_SWEEP: ${{ env.SWEEP }}
       - run: cargo build --locked -p agentfs-conformance --bin phase1-replay
       - name: replay on a fresh model
-        run: target/debug/phase1-replay model "$RUNNER_TEMP/traces" --min-scenarios 74 --min-seeds 94
+        run: target/debug/phase1-replay model "$RUNNER_TEMP/traces" --min-scenarios 74 --min-seeds "$MIN_SEEDS"
       - name: replay on the library
-        run: target/debug/phase1-replay library "$RUNNER_TEMP/traces" --min-scenarios 74 --min-seeds 94
+        run: target/debug/phase1-replay library "$RUNNER_TEMP/traces" --min-scenarios 74 --min-seeds "$MIN_SEEDS"
       - run: cargo build --locked -p agentfs --features failpoints
       - name: replay on mounts
-        run: ci/e2e-tree-replay.sh "$RUNNER_TEMP/traces" 71 16 "$RUNNER_TEMP/recorded"
+        run: ci/e2e-tree-replay.sh "$RUNNER_TEMP/traces" 71 "$MIN_MOUNTED_SEEDS" "$RUNNER_TEMP/recorded"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         if: always()
         with:

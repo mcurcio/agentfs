@@ -18,10 +18,52 @@ every invariant holds after every step of every run. A rule that exists only in 
 
 | You changed | Run |
 |---|---|
-| A rule, a check or the model's code | the crate's tests at the CI seeds, then 500 seeds, then the ignored findings |
+| A rule, a check or the model's code | the crate's tests (the regression tier), then the full sweep at 500 seeds, then the ignored findings |
 | A rule you believe the checks already cover | the same, plus at least one planted bug the change should be caught by |
 | `MODEL.md` or `git-model.md` only | the mdBook build and the docs reference test |
 | Anything, before pushing | fmt, clippy and the model's tests; CI runs the rest of the workspace |
+
+## Tiers
+
+The owner, 2026-11-13: "stop running the full seed test suite every single time. thats insane. start building a more
+useful set of regression tests that can quickly validate correctness. a test suite should run in seconds to minutes,
+not hours." So every `cargo test`, every push's CI and every slice run the **regression tier**; the **full sweep**
+runs only when asked for.
+
+- **The regression tier** is every scenario (each past finding's regression test among them), and the random runs at
+  the regression seeds of [`tests/regression-seeds.txt`](tests/regression-seeds.txt): nine seeds of the random runs and
+  six of the rounds. They are chosen by set cover (`ci/regression-seeds.py`), never because they pass: together they
+  reach every behaviour counter of the run's tally that any seed of the sweep reaches (so every tally floor holds on
+  them), the mountable phase 1 seeds among them reach every counter the sweep's mountable seeds reach (so real mounts
+  replay seeds too), and they keep the seed that catches the planted corpus's one bug no scenario catches. On this
+  tier the planted corpus is caught whole, 48 of 48, and `matrix.tsv` reproduces.
+- **The full sweep** is the random runs at seeds 1..64 (rounds 1..16): `AGENTFS_MODEL_SWEEP=1`, or
+  `AGENTFS_MODEL_SEEDS=N` for 1..N, or `ci/model-digest.sh check --all` (500 seeds), or `run.py --sweep`, or a
+  manual run of `phase-1.yml` (the conformance job records the sweep, and the library replays the phase 1
+  generators at seeds 1 to 500 in four shards).
+
+| Tier | Regression | Full sweep |
+|---|---|---|
+| The model's tests, `cargo test --locked -p agentfs-model` | 73 s | 228 s (`AGENTFS_MODEL_SWEEP=1`) |
+| The digest, `ci/model-digest.sh check` | 66 s (the scenarios, then eleven seeds) | `check --all`: about 2054 s |
+| The library's replay of the recorded traces | 143 s (77 scenario and 15 seed traces) | 834 s in CI (74 and 94) |
+| The planted corpus, `run.py` | 518 s, 48 of 48 caught | 590 s (`--sweep`) |
+| CI's `phase-1` conformance job | every pull request and push | a manual run, about 80 minutes with the shards |
+
+Times are one 4-core container on 2026-11-13, except the CI row. The model is bound by its `git` processes: a
+release build ran a seed no faster (20.7 s against 21.3 s for eight seeds), and a library replay on tmpfs, with no
+fsync cost, took 21 s against 23 s. Fewer runs is what made it fast.
+
+When the generator changes (a new call, a new draw), every seed draws differently and the cover moves. Measure it
+again and put its two lines in `tests/regression-seeds.txt`, then run the corpus on the new set:
+
+```sh
+ci/model-docker.sh -- python3 ci/regression-seeds.py --work /work/cover --must 24   # about 3 minutes
+ci/model-docker.sh -- python3 crates/agentfs-model/planted/run.py --work /work/planted
+```
+
+`--must` keeps the seeds the corpus needs: for a bug no scenario catches, the seeds its `run.py --sweep` log shows
+failing. A floor that fails on the regression seeds after a generator change says the same: the cover moved.
 
 ## Commands
 
@@ -39,8 +81,11 @@ The wrapper keeps the build output and the registry in named Docker volumes, on 
 workspace build is several GB. The commands below are what goes after `ci/model-docker.sh --` in that line:
 
 ```sh
-# The model: every scenario, and the random runs at seeds 1..64, rounds at 1..16 (what CI runs).
+# The model: every scenario, and the random runs at the regression seeds (what CI runs).
 cargo test --locked -p agentfs-model
+
+# The full sweep: the random runs at seeds 1..64, rounds at 1..16.
+AGENTFS_MODEL_SWEEP=1 cargo test --locked -p agentfs-model --test interleavings
 
 # One rule's scenarios (they are named r<N>_... after the rule they show).
 cargo test --locked -p agentfs-model --test scenarios r9_
@@ -86,7 +131,8 @@ docker run --rm -v "$PWD":/src -w /src agentfs-dev sh -c '
 The output goes to `target/book`. CI checks the tarball's sha256 (`.github/workflows/docs.yml`); this
 local build does not.
 
-The random seeds are every seed in `1..=n`, never a set picked because it passes. Every failure prints its
+A sweep's seeds are every seed in `1..=n`, and the regression seeds a measured cover, never a set picked because it
+passes. Every failure prints its
 seed, the step, the broken invariant, a `replay: AGENTFS_MODEL_SEED=<n>` line and the step log. A replay
 runs that one seed under every random-run test, so name the test that failed, as above.
 
@@ -99,7 +145,7 @@ the expected failure.
 | Test | Finding | Fails with |
 |---|---|---|
 | `finding_1_git_merge_base_on_crossing_merges` | 1 | a sync leaves a line "which T0 already took" |
-| `random_interleavings_git_merge_base` | 1 | 16 of 64 seeds since R9.18 (2026-11-12: a file open inside a transaction holds back every take into its fork), one of them (seed 17) a "harness panic: a model file in git"; 15 of 64 seeds since the one-step take of finding 49, whose generator draws differently (2026-11-08, none a harness panic); 38 since the name locks of finding 46 (2026-11-07; 40 before them), 2 of them (seeds 32 and 46) a "harness panic: a model file in git": a sync that leaves a line "which T0 already took" or drops a line (with the calls of programs outside a transaction, 2026-11-05; 34 with no P3 and the prefix sync; 35 after the fix pass of the review of 2026-11-04, whose generator changes move the random calls; with creates, crashes and the progress rules 36; with the byte calls alone 32; before them 39 of 64, 2 of them a "harness panic: a model file in git", when git's merge leaves one line identity twice) |
+| `random_interleavings_git_merge_base` | 1 | at the sweep (`AGENTFS_MODEL_SWEEP=1`), 16 of 64 seeds since R9.18 (2026-11-12: a file open inside a transaction holds back every take into its fork), one of them (seed 17) a "harness panic: a model file in git"; 15 of 64 seeds since the one-step take of finding 49, whose generator draws differently (2026-11-08, none a harness panic); 38 since the name locks of finding 46 (2026-11-07; 40 before them), 2 of them (seeds 32 and 46) a "harness panic: a model file in git": a sync that leaves a line "which T0 already took" or drops a line (with the calls of programs outside a transaction, 2026-11-05; 34 with no P3 and the prefix sync; 35 after the fix pass of the review of 2026-11-04, whose generator changes move the random calls; with creates, crashes and the progress rules 36; with the byte calls alone 32; before them 39 of 64, 2 of them a "harness panic: a model file in git", when git's merge leaves one line identity twice) |
 | `finding_6_git_hunks_on_neighbouring_lines` | 6 | a sync leaves a line "which T0 already took" |
 
 Findings 36 to 49 pass in `crates/agentfs-conformance/tests/replay.rs` since the owner's answers (48 and 49 on 2026-11-08). These
@@ -110,7 +156,7 @@ with squashing; finding 28's are `r10_two_deletes_of_one_line_agree_over_an_unse
 `r10_a_later_delete_agrees_with_the_winning_delete`). Finding 3's two tests went with the per-file setting when the owner chose whole changes (rule 3e); finding
 24's test passes since the owner deleted P3 (2026-11-04), as `r9_cooperating_programs_never_deadlock`.
 
-CI runs `cargo test --workspace` (so the scenarios, seeds 1..64 and rounds at 1..16), fmt, clippy with `-D warnings`, and the
+CI runs `cargo test --workspace` (so the scenarios and the regression seeds), fmt, clippy with `-D warnings`, and the
 mdBook build. It does not run 500 seeds, the ignored tests or planted bugs: those stay local, and a design pull
 request says in its body that they were run and what they showed.
 
@@ -273,8 +319,8 @@ tier serves renames, docs and changes that move no rule logic: "Yes" (guidance).
   or message text renamed at every site; an import or formatting; a unit test added in a `#[cfg(test)]` module of
   `src/**` (neither the digest nor the corpus runs those); a digest key renamed with its value byte for byte the same
   (show the value column before and after). It runs, through `ci/model-docker.sh`, one job at a
-  time: `planted/run.py --anchors-only` (silent), `ci/model-digest.sh check` (the scenario digests match), the
-  model's tests (scenarios and seeds 1..64), conformance's tests, the safety-net tests, and `planted/run.py --only`
+  time: `planted/run.py --anchors-only` (silent), `ci/model-digest.sh check` (the scenarios' and the regression seeds'
+  digests match), the model's tests (scenarios and the regression seeds), conformance's tests, the safety-net tests, and `planted/run.py --only`
   the bugs whose anchors moved (each still caught); then `cargo fmt` and `cargo clippy`.
 - **The full gate**, for anything else that touches `crates/agentfs-model/src/**` or its `tests/**`: a changed
   condition, branch, statement, call or loop; code moved between functions or files; a change to `src/digest.rs`'s
@@ -294,14 +340,14 @@ twice the slowest unit in `planted/budget.json`, or `--stall SECONDS`.
 ```sh
 # From the repository root; each line is one wrapped job.
 ci/model-docker.sh -- cargo test --locked -p agentfs-model          # the model's tests
-ci/model-docker.sh -- ci/model-digest.sh check        # fast: scenarios first, stops at the first difference
+ci/model-docker.sh -- ci/model-digest.sh check        # fast: scenarios first, stops at the first difference, then the regression seeds
 ci/model-docker.sh -- ci/model-digest.sh check --all  # every run, every difference listed
 ci/model-docker.sh -- ci/model-digest.sh record       # after a change meant to change outcomes; times the budget
 # In parts, for a time limit: each shard into its own new directory, chained with &&.
 ci/model-docker.sh -- sh -c 'ci/model-digest.sh collect /work/d0 0 2 && ci/model-digest.sh collect /work/d1 1 2 && ci/model-digest.sh compare /work/d0 /work/d1'
 # Each run's text beside its digest, to diff two runs:
 ci/model-docker.sh -- env AGENTFS_MODEL_DIGEST_TEXT=1 ci/model-digest.sh collect /work/texts
-ci/model-docker.sh -- python3 crates/agentfs-model/planted/run.py --work /work/planted [--only a,b] [--full] [--write]
+ci/model-docker.sh -- python3 crates/agentfs-model/planted/run.py --work /work/planted [--only a,b] [--full] [--sweep] [--write]
 ```
 
 `ci/model-digest.sh` and `run.py` need the container's `git` (`ci/git-release`). A test process that passes its limit
@@ -312,8 +358,9 @@ success marker only when every test passed; `compare` and `accept` need one mark
 never filled by an old one. `run.py` keeps each result under a hash of its corpus entry, the mode and the model's
 sources and tests, so a changed model or bug always runs again.
 
-`run.py` runs in fast mode by default: each test in its own process, the scenarios first and then the random runs, in
-name order, stopping at the first test that catches the bug (a failure that is only a panic does not stop it).
+`run.py` runs in fast mode by default: each test in its own process, the scenarios first and then the random runs at
+the regression seeds, in name order, stopping at the first test that catches the bug (a failure that is only a panic
+does not stop it). `--sweep` runs the random runs at the full sweep instead.
 `--full` runs both test targets whole and records the check that tripped first most often. Every bug must be caught: a
 surviving mutant, a stale anchor or a build error fails the run; `matrix.tsv` records each bug's id, rule, seeds,
 status and catching check (`assert`: an explicit assertion in a test file, never a panic) and must reproduce.
@@ -400,10 +447,11 @@ never opened) is an error, not a record, since no system answered it. The only f
 unit tests' scripted ones: no test yet records a library or mount failure and replays it in the model.
 
 ```sh
-# Record (the same run CI makes), then replay. Without Linux and /dev/fuse, mounts stay NOT RUN.
+# Record (the same run CI makes on a push), then replay. Without Linux and /dev/fuse, mounts stay NOT RUN.
 AGENTFS_MODEL_TRACE_DIR=$T cargo test --locked -p agentfs-model --test scenarios --test interleavings
-cargo run --locked -p agentfs-conformance --bin phase1-replay -- model   "$T" --min-scenarios 74 --min-seeds 94
-cargo run --locked -p agentfs-conformance --bin phase1-replay -- library "$T" --min-scenarios 74 --min-seeds 94
+cargo run --locked -p agentfs-conformance --bin phase1-replay -- model   "$T" --min-scenarios 74 --min-seeds 15
+cargo run --locked -p agentfs-conformance --bin phase1-replay -- library "$T" --min-scenarios 74 --min-seeds 15
+# The full sweep, as a manual run of phase-1.yml records it: AGENTFS_MODEL_SWEEP=1 on the record, floors 74 and 94.
 # One trace, its state kept to read with git:
 PHASE1_REPLAY_KEEP=/tmp/k phase1-replay library "$T" --min-scenarios 0 --min-seeds 0 --only NAME
 ```
@@ -435,13 +483,14 @@ What a replay decides, each reported rather than hidden:
 | Automatic takes (R1) | a mount takes only through the gate | mounted P1/P2 cases |
 | R1.3 an open's own read, R1.1 another reader | no calls: the replay makes neither read, so nothing compares them | byte and page-cache jobs |
 
-The in-scope traces at CI's seeds are 74 from scenarios and 94 from seeds (64 and 16 of the tree-library generators, and 14 of
-the ordinary ones that happened to stay in scope). The rest are excluded by the reasons above, and the replay prints the
-count of each. The floors
-in `.github/workflows/phase-1.yml` are what passes: 74 and 94 on the library, and 71 and 16 on mounts, where 81 in-scope traces are
-not mountable. Library and model replay every in-scope trace. `[phase1-seeds]` in a pushed commit message, or a manual run, replays
-the tree-library generators at seeds 1 to 500 on the library, in four shards (`ci/replay-seeds.sh`): too slow for every push, and fast
-enough for a job. `[phase1-measure]` runs every measurement mode, and `[phase1-held]`, `[phase1-calls]` or
+At the regression seeds the in-scope traces are 77 from scenarios and 15 from seeds (9 and 6 of the tree-library
+generators; none of the ordinary ones stays in scope), and 5 of those seeds are mountable (3 and 2). At the full sweep they
+were 74 and 94 (64 and 16 of the tree-library generators, and 14 of the ordinary ones), 16 of them mountable. The rest are
+excluded by the reasons above, and the replay prints the count of each. The floors in `.github/workflows/phase-1.yml` are
+what passes: on a push 74 and 15 on the library and 71 and 5 on mounts; on a manual run, the full sweep, 74 and 94 and
+71 and 16. Library and model replay every in-scope trace. `[phase1-seeds]` in a pushed commit message, or a manual run,
+replays the tree-library generators at seeds 1 to 500 on the library, in four shards (`ci/replay-seeds.sh`): too slow for
+every push, and fast enough for a job. `[phase1-measure]` runs every measurement mode, and `[phase1-held]`, `[phase1-calls]` or
 `[phase1-pilot]` one; the [tree views page](../../docs/trees.md#how-it-is-verified) has each exit row's run.
 
 A mismatch is a finding (MODEL.md), never a change to either side without a ledger rule. Its traces

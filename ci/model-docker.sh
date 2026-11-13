@@ -42,7 +42,8 @@ if [ -z "$stall" ]; then
 b = json.load(open(sys.argv[1]))
 args = sys.argv[2:]
 if any(a.endswith("run.py") for a in args):
-    units = [b.get("corpus_full" if "--full" in args else "corpus", {}).get("slowest_bug_seconds", 0)]
+    key = "corpus_full" if "--full" in args else "corpus_sweep" if "--sweep" in args else "corpus"
+    units = [b.get(key, {}).get("slowest_bug_seconds", 0)]
 elif any(a.endswith("model-digest.sh") for a in args):
     d = b.get("digest", {})
     units = [d.get("scenarios_seconds", 0), d.get("slowest_seed_seconds", 0)]
