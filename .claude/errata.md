@@ -674,3 +674,18 @@ Not blocking; the suite is built and green. Findings about the brief and the doc
 6. **`transactions_frozen`'s first cut required begin to stay an ancestor of the fork's head.** A sync may fast-forward
    past the fork's own sync merge (R6.1, 2026-11-09), so begin can leave the fork's history (seeds 20, 54, 61). The
    clause is gone; the ref's value is the check.
+
+## 2026-11-13, Part B fix round (review and verification of 0f63eb6)
+
+1. **git-model §9 gave T's `Agentfs-Open` trailers a replay purpose ("so a crash's replay never saves those opens
+   again")**, against §3, which says the trailer is for the audit and decides nothing (the journal's closing record
+   does). §9 now says "for the audit". The model's `saved` still reads the trailer, its simplification of §3.
+2. **The design's check row "T names each staged open" was not built**: `one_writer` skips a transaction's commit.
+   `transactions_end_as_told` now compares T's `Agentfs-Open` trailers with the opens its staged saves name, in order
+   (a probe dropping T's opens fails 23 scenarios there).
+3. **The crash rollback of every open transaction was presented as the owner's pick.** His pick (R5.3, 2026-11-05)
+   covered a transaction with a deferred call; extending it to every transaction is the model's choice, now labelled
+   so in §9, R5.3, R12 and git-model's Questions for the owner, with its principle-1 cost.
+4. **"Recorded as one commit" vs. T plus a landing merge**: when the fork moved since begin, the fork gains T and the
+   merge `[fork, T]`. R5.5 and git-model's Questions for the owner now say so, as the model's choice for the owner to
+   confirm.

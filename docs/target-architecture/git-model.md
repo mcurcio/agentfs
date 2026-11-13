@@ -653,14 +653,19 @@ happened.
 implicit rollback"; R5.3, his pick of 2026-11-05: "the crash rolls the transaction back and applies the call"): its index
 and its opens are dropped, unsaved, as at a rollback, and then the calls it deferred apply, in order, before the
 restart replays the opens left (§3; `r12_a_crash_rolls_back_an_open_transaction`,
-`r5_a_crash_rolls_back_and_applies_what_it_deferred`). So the index is never needed after a crash: it lives in the state
+`r5_a_crash_rolls_back_and_applies_what_it_deferred`). Rolling back every open transaction, not only one with a
+deferred call, is the model's choice, revisable, the owner to confirm (Questions for the owner). Principle 1 holds as
+R12 states it: every write call inside a transaction is in the journal before it returns, and its save is staged; what
+history records of it is decided at the end, once in T, or never if the transaction rolls back. The cost: a staged
+save whose close returned is lost at a crash, as at a rollback, and leaves no trace in git. So the index is never needed after a crash: it lives in the state
 area as a cache of nothing durable, and git's garbage collection may drop the unreachable blobs it names once the
 transaction has ended. A transaction is open exactly while its ref `txn/<n>` exists.
 
 **Commit** records the transaction as one commit, T: one parent, the commit `txn/<n>` holds (begin's); its tree the
 index as one save over begin's (`content::one_save`); `Agentfs-Writer` the fork's writer, `Agentfs-Cause: Transaction
 t<n>`, `Agentfs-Tree` the fork (T is the fork's change, staged in its index); and one `Agentfs-Open` per open it staged a
-save of, in order, so a crash's replay never saves those opens again (§3). One save over begin means: a line begin holds
+save of, in order, for the audit, as every save names its open (§3; the journal's records, not the trailer, decide a
+replay). One save over begin means: a line begin holds
 keeps begin's version if its last staged version holds the same bytes and state (a line written back), else that last
 version, written over begin's; the versions staged between are in no commit. A line begin lacks that is live at the end
 is a new line, its identity its last version's id; one gone at the end is not in T. A file the transaction created and
@@ -683,7 +688,8 @@ files open, those files stay open, and their writes (a transaction's opens now w
 ordinary later saves (`r5_a_commit_goes_ahead_with_the_programs_own_files_open`). An open's target needs no record of
 its own: an open of a transaction whose ref is gone writes in the fork. The answer says `Committed`, or `Lost` with
 every line of T and the fork's line that won or decided it (`r3_a_transaction_loses_whole_and_is_told`), or `Empty`. One
-ref transaction moves the fork and deletes `txn/<n>`; before it the transaction is open (a crash rolls it back, and T,
+ref transaction moves the fork and deletes `txn/<n>` (the model makes both updates in one step, which nothing can
+interleave; it deletes the ref first); before it the transaction is open (a crash rolls it back, and T,
 unreachable, is garbage), after it the transaction has ended. The fork's new head lands upstream like any fork commit
 (`r5_a_transaction_is_recorded_as_one_commit`, `r5_a_line_staged_twice_is_one_version_over_begin`,
 `r5_a_transaction_that_changes_nothing_makes_no_commit`).
@@ -851,7 +857,7 @@ policy of this revision included. Every check runs after every step, in every sc
 | An append writes over no line but a partial last line it finishes: read from the save's blobs and its program's calls, each line starting in the appended bytes is new, after every line of the upstream, and a finished line is the upstream's last, one version on | `appends_exact` (in `one_writer`) | `r8_concurrent_appends_never_overwrite_each_other`, every random run |
 | No take writes a file open for writing in that tree or one it did not lock; a take is one step, so no call runs while it holds a file; no lock outlives its holder (any tree's client, a transaction, a tree); every wait ends on an event | `step_checked`, `locks`, `check_converged` | `r9_*`, `r11_an_unlink_or_rename_of_a_held_file_runs_after_the_take`, `r5_open_files_and_transactions`, every random run (clients of every tree die in them) |
 | While a transaction is open, no save reaches its fork on a file it has staged; each deferred call applies in order once it ends, a crash's rollback included (§9) | `transactions_undisturbed`, `locks`, `interleavings.rs` `Oracle::defers` | `r5_io_on_a_transactions_files_is_deferred_past_its_commit`, `r5_a_rollback_applies_what_it_deferred`, `r5_a_clients_death_applies_what_its_transaction_deferred`, `r5_a_crash_rolls_back_and_applies_what_it_deferred`, every random run |
-| A transaction makes no commit before its commit: `txn/<n>` stays at begin, no commit names its branch, each staged save meets every save's rules; its commit is one commit T on begin, holding the bytes the program staged (§9) | `transactions_frozen`, `one_writer`, `transactions_end_as_told`, `interleavings.rs` `oracle_txn_commit` | `r5_a_transaction_is_recorded_as_one_commit`, `r5_a_line_staged_twice_is_one_version_over_begin`, `r5_a_transaction_that_changes_nothing_makes_no_commit`, every random run |
+| A transaction makes no commit before its commit: `txn/<n>` stays at begin, no commit names its branch, each staged save meets every save's rules; its commit is one commit T on begin, naming each open it staged a save of and holding the bytes the program staged (§9) | `transactions_frozen`, `one_writer`, `transactions_end_as_told`, `interleavings.rs` `oracle_txn_commit` | `r5_a_transaction_is_recorded_as_one_commit`, `r5_a_line_staged_twice_is_one_version_over_begin`, `r5_a_transaction_that_changes_nothing_makes_no_commit`, every random run |
 | No program's open, `unlink` or `rename(2)` ever waits on a waiting landing, only on a take writing its file (no P3, §6) | `Oracle::no_wait_on_waiting` (interleavings.rs, the harness's own record), `locks` | `r9_cooperating_programs_never_deadlock`, `r9_new_writers_postpone_a_waiting_take`, every random run |
 | A sync never delivers past the first change to an open file: it delivers an upstream commit, in order, overwrites no open file, and the first commit it holds back names an open file (P2, §6) | `step_checked` (`prefix_cut`) | `r9_a_sync_delivers_up_to_the_first_change_to_an_open_file`, `r9_a_prefix_sync_holds_back_a_transaction_whole`, every random run |
 | The upstream wins every collision, decided only at its queue, losing commit reachable, the decision in the take's result commit, which names its tree | `upstream_wins` | `r3_landing_collision_the_upstream_wins`, `r3_a_collision_is_recorded_once_at_the_upstreams_queue`, `r10_a_delete_against_a_concurrent_edit_the_upstream_wins`, `r10_a_move_is_a_delete_plus_an_insert` |
@@ -1042,6 +1048,15 @@ Open on 2026-11-05. Each names its context; none blocks the validation unless no
   commit and is told `Empty` (§9), as it is when it staged nothing. Recording it as an empty commit T instead would show,
   in history, that a transaction ran and changed nothing; the model's choice saves a commit with no change, as a plain
   save that changes nothing makes none (R8.2).
+- **A crash rolls back every open transaction** (general guidance). The owner picked a rollback at a crash for a
+  transaction with a deferred call (R5.3, 2026-11-05), and A13 says "a failure is an implicit rollback"; the model
+  rolls back every open transaction (§9), so a staged save whose close returned is lost with no trace in git. The
+  other shape keeps the transaction across a crash: its index rebuilt from the journal and each open replayed into it,
+  so nothing staged is lost, at the cost of a durable index.
+- **A transaction's one commit and the fork's history** (general guidance). "Recorded as one commit" holds for T: the
+  fork gains exactly T when it is still at begin. When the fork has moved since begin, it gains T and the landing's
+  merge `[fork, T]` (§9, R10.11), as a fork's commit landing upstream does. Squashing them into one commit would hide
+  the referee's decision (R5.1).
 - **Programs sharing one tree, during a transaction.** R5.3 conflicts with R1: a program that knows nothing of transactions
   closes a file with a deferred call, reopens it and reads the old bytes.
 - **Fork and upstream.** The model's `OrphanDropped` stretches R11.3 for a file created in a transaction that lost.

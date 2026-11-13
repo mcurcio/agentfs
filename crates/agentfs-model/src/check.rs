@@ -1490,6 +1490,25 @@ impl Checker {
                         e.txn
                     ));
                 }
+                // T names each open it staged a save of, in order (rule 5).
+                let staged_opens: Vec<String> = w
+                    .staged
+                    .iter()
+                    .filter(|s| s.txn == e.txn)
+                    .filter_map(|s| s.open.map(|h| h.to_string()))
+                    .collect();
+                let named_opens = w.trailer(&t, crate::world::OPEN);
+                let named_opens: Vec<&str> = named_opens
+                    .lines()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                if named_opens != staged_opens {
+                    return Err(format!(
+                        "t{}'s commit {t:.7} names opens {named_opens:?}, but it staged saves of {staged_opens:?}",
+                        e.txn
+                    ));
+                }
                 let edits = w.edits(&base[0], &t);
                 if let Some(x) = edits.iter().find(|x| !mine(&x.token)) {
                     return Err(format!(
