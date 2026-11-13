@@ -43,6 +43,7 @@ missing from these tables or a row names a module that no longer exists;
 | `tree_actor/queue.rs` | Eligibility and prefix selection for writer-locked queue entries |
 | `tree_actor/referee.rs` | Whole-save parent referee for line and namespace versions, with causal collision records |
 | `tree_actor/stages.rs` | Measurements only, never read by a decision: runs and time per actor stage, and the Git children the actor's path has started (counted at `git_cli::counted`, the one spawn site; target git-model §18) |
+| `tree_actor/tree.rs` | A tree's shared types: the event number a step is given, and the line versions (`<event>:<index>`, ordered as their text) and line maps it writes |
 | `tree_actor/tree_id.rs` | A tree's identity, `root` or `fork/<n>`: the text history, refs and checkouts name a tree by, parsed once where the journal is read |
 | `tree_actor/sync.rs` | Sync snapshots preserving undecided child versions without deciding collisions |
 | `tree_reconcile.rs` | Histogram save alignment, line identities, whole-change reconciliation and undecided sync |

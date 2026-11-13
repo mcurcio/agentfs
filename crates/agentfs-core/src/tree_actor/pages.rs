@@ -28,6 +28,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
+use super::tree::EventNumber;
 use super::{Call, Draft, Error, Handle, Result, Saved, TreeId, Volume};
 
 /// The bases' unit. Every kernel page size is a multiple of it, so a base map at
@@ -321,9 +322,9 @@ impl Volume {
     }
 
     /// A queue take: [`Volume::step`] plus a note of the files it changed.
-    pub(super) fn pages_take<F>(&mut self, tree: TreeId, build: F) -> Result<(u64, Saved)>
+    pub(super) fn pages_take<F>(&mut self, tree: TreeId, build: F) -> Result<(EventNumber, Saved)>
     where
-        F: FnOnce(&Self, u64) -> Result<Draft>,
+        F: FnOnce(&Self, EventNumber) -> Result<Draft>,
     {
         let before = self.tree(tree)?.bytes.clone();
         let result = self.step(tree, build)?;

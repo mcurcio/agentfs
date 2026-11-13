@@ -3,9 +3,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::tree_reconcile::{self, LineMap};
+use crate::tree_reconcile;
 
 use super::referee::{File, Snapshot};
+use super::tree::{EventNumber, LineVersion, Lines};
 use super::{Error, MergeFileIdentity, NameHistory, Result};
 
 fn path(history: &NameHistory) -> Result<Option<&str>> {
@@ -52,9 +53,9 @@ pub(super) fn ended(parent: &Snapshot, id: MergeFileIdentity) -> Result<bool> {
 pub(super) fn sync(
     parent: &Snapshot,
     fork: &Snapshot,
-    undecided_lines: &BTreeSet<String>,
-    undecided_names: &BTreeSet<(MergeFileIdentity, u64)>,
-    last_lines: &BTreeMap<MergeFileIdentity, LineMap>,
+    undecided_lines: &BTreeSet<LineVersion>,
+    undecided_names: &BTreeSet<(MergeFileIdentity, EventNumber)>,
+    last_lines: &BTreeMap<MergeFileIdentity, Lines>,
 ) -> Result<Snapshot> {
     let mut names = BTreeMap::new();
     let ids: BTreeSet<_> = parent
@@ -128,13 +129,16 @@ pub(super) fn sync(
             // old writer reaches no file (R11.3), and after an atomic save that
             // object is now the replaced file's (finding 39).
             (Some(p), None) => File {
-                object: fork.names.get(&id).map_or(p.object, |ended| ended.head),
-                lines: tree_reconcile::sync(&p.lines, &LineMap::default(), undecided_lines)?,
+                object: fork
+                    .names
+                    .get(&id)
+                    .map_or(p.object, |ended| ended.head.object()),
+                lines: tree_reconcile::sync(&p.lines, &Lines::default(), undecided_lines)?,
             },
             (None, Some(f)) => File {
                 object: f.object,
                 lines: tree_reconcile::sync(
-                    last_lines.get(&id).unwrap_or(&LineMap::default()),
+                    last_lines.get(&id).unwrap_or(&Lines::default()),
                     &f.lines,
                     undecided_lines,
                 )?,
@@ -151,24 +155,39 @@ mod tests {
     use super::*;
     use crate::tree_reconcile::Line;
 
+    /// A line version for each name the cases use.
+    fn v(name: &str) -> LineVersion {
+        let event = [
+            "line1", "line2", "line3", "base", "parent", "fork", "insert", "later", "own", "one",
+            "two", "three",
+        ]
+        .iter()
+        .position(|known| *known == name)
+        .expect("a known name");
+        format!("{}:1", event + 1).parse().unwrap()
+    }
+
     fn file(id: u64, path: &str, version: &str, bytes: &[u8]) -> Snapshot {
         let identity = MergeFileIdentity(id);
         let line = Line {
-            identity: format!("line{id}"),
-            version: version.into(),
+            identity: v(&format!("line{id}")),
+            version: v(version),
             bytes: Some(bytes.into()),
         };
         Snapshot {
-            names: [(identity, NameHistory::created(id, path.into()))]
-                .into_iter()
-                .collect(),
+            names: [(
+                identity,
+                NameHistory::created(EventNumber::new(id), path.into()),
+            )]
+            .into_iter()
+            .collect(),
             files: [(
                 identity,
                 File {
                     object: id,
-                    lines: LineMap {
+                    lines: Lines {
                         lines: vec![line],
-                        ancestors: [(version.into(), None)].into_iter().collect(),
+                        ancestors: [(v(version), None)].into_iter().collect(),
                     },
                 },
             )]
@@ -187,7 +206,7 @@ mod tests {
             .unwrap()
             .lines
             .lines[0]
-            .version = "parent".into();
+            .version = v("parent");
         parent
             .files
             .get_mut(&MergeFileIdentity(1))
@@ -201,13 +220,13 @@ mod tests {
             .unwrap()
             .lines
             .ancestors
-            .insert("parent".into(), Some("base".into()));
+            .insert(v("parent"), Some(v("base")));
         fork.files
             .get_mut(&MergeFileIdentity(1))
             .unwrap()
             .lines
             .lines[0]
-            .version = "fork".into();
+            .version = v("fork");
         fork.files
             .get_mut(&MergeFileIdentity(1))
             .unwrap()
@@ -219,11 +238,11 @@ mod tests {
             .unwrap()
             .lines
             .ancestors
-            .insert("fork".into(), Some("base".into()));
+            .insert(v("fork"), Some(v("base")));
         let kept = sync(
             &parent,
             &fork,
-            &["fork".into()].into_iter().collect(),
+            &[v("fork")].into_iter().collect(),
             &BTreeSet::new(),
             &BTreeMap::new(),
         )
@@ -253,8 +272,8 @@ mod tests {
             .lines
             .lines
             .push(Line {
-                identity: "insert".into(),
-                version: "insert".into(),
+                identity: v("insert"),
+                version: v("insert"),
                 bytes: Some(b"own\n".to_vec()),
             });
         fork.files
@@ -262,11 +281,11 @@ mod tests {
             .unwrap()
             .lines
             .ancestors
-            .insert("insert".into(), None);
+            .insert(v("insert"), None);
         let result = sync(
             &parent,
             &fork,
-            &["insert".into()].into_iter().collect(),
+            &[v("insert")].into_iter().collect(),
             &BTreeSet::new(),
             &BTreeMap::new(),
         )
@@ -295,20 +314,20 @@ mod tests {
         let mut fork = parent.clone();
         let lines = &mut parent.files.get_mut(&key).unwrap().lines;
         lines.lines.push(Line {
-            identity: "later".into(),
-            version: "later".into(),
+            identity: v("later"),
+            version: v("later"),
             bytes: Some(b"later\n".to_vec()),
         });
-        lines.ancestors.insert("later".into(), None);
+        lines.ancestors.insert(v("later"), None);
         let lines = &mut fork.files.get_mut(&key).unwrap().lines;
-        lines.lines[0].version = "own".into();
+        lines.lines[0].version = v("own");
         lines.lines[0].bytes = Some(b"own".to_vec());
-        lines.ancestors.insert("own".into(), Some("base".into()));
+        lines.ancestors.insert(v("own"), Some(v("base")));
         // Without the hide the sync would read `ownlater\n`.
         let kept = sync(
             &parent,
             &fork,
-            &["own".into()].into_iter().collect(),
+            &[v("own")].into_iter().collect(),
             &BTreeSet::new(),
             &BTreeMap::new(),
         )
@@ -336,21 +355,24 @@ mod tests {
             fork.files.extend(snapshot.files);
         }
         let mut parent = fork.clone();
-        fork.names
-            .get_mut(&MergeFileIdentity(1))
-            .unwrap()
-            .advance(11, Some("target".into()), None);
+        fork.names.get_mut(&MergeFileIdentity(1)).unwrap().advance(
+            EventNumber::new(11),
+            Some("target".into()),
+            None,
+        );
         parent
             .names
             .get_mut(&MergeFileIdentity(2))
             .unwrap()
-            .advance(12, Some("target".into()), None);
+            .advance(EventNumber::new(12), Some("target".into()), None);
         parent
             .names
             .get_mut(&MergeFileIdentity(3))
             .unwrap()
-            .advance(13, Some("b".into()), None);
-        let pending = [(MergeFileIdentity(1), 11)].into_iter().collect();
+            .advance(EventNumber::new(13), Some("b".into()), None);
+        let pending = [(MergeFileIdentity(1), EventNumber::new(11))]
+            .into_iter()
+            .collect();
         let result = sync(&parent, &fork, &BTreeSet::new(), &pending, &BTreeMap::new()).unwrap();
         assert_eq!(
             path(&result.names[&MergeFileIdentity(1)]).unwrap(),

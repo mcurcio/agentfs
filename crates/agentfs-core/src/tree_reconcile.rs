@@ -1,31 +1,47 @@
-//! Byte-preserving line maps for tree landing (target architecture §7).
+//! Byte-preserving line maps for tree landing (target architecture §7), generic
+//! over the caller's version.
 //!
 //! The caller supplies volume-unique version IDs. Metadata must be persisted
 //! with the corresponding content and all ancestors retained; a line's
 //! identity is independent of a filesystem object's identity.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::io;
 
 pub use agentfs_align::Hunk;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-/// An opaque, volume-unique line or version identifier.
-pub type Id = String;
+/// A caller's version identifier: volume-unique, written once. A line's identity
+/// is its first version.
+pub trait Id: Clone + Ord + fmt::Debug + fmt::Display + Serialize + DeserializeOwned {}
+
+impl<T: Clone + Ord + fmt::Debug + fmt::Display + Serialize + DeserializeOwned> Id for T {}
 
 /// One current version of a line. A deleted line retains its identity.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Line {
-    pub identity: Id,
-    pub version: Id,
+pub struct Line<V = String> {
+    pub identity: V,
+    pub version: V,
     pub bytes: Option<Vec<u8>>,
 }
 
 /// Stored line sequence and the versions each version was written over.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LineMap {
-    pub lines: Vec<Line>,
-    pub ancestors: BTreeMap<Id, Option<Id>>,
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(bound(serialize = "V: Serialize", deserialize = "V: DeserializeOwned + Ord"))]
+pub struct LineMap<V = String> {
+    pub lines: Vec<Line<V>>,
+    pub ancestors: BTreeMap<V, Option<V>>,
+}
+
+impl<V> Default for LineMap<V> {
+    fn default() -> Self {
+        Self {
+            lines: Vec::new(),
+            ancestors: BTreeMap::new(),
+        }
+    }
 }
 
 /// Failure to produce or interpret the histogram alignment.
@@ -38,7 +54,7 @@ pub enum Error {
     #[error("invalid histogram output")]
     InvalidDiff,
     #[error("duplicate identifier: {0}")]
-    DuplicateId(Id),
+    DuplicateId(String),
     #[error("invalid line map: {0}")]
     InvalidMap(&'static str),
 }
@@ -50,7 +66,7 @@ fn split(bytes: &[u8]) -> Vec<&[u8]> {
         .collect()
 }
 
-impl LineMap {
+impl<V: Id> LineMap<V> {
     /// Render exactly the bytes stored in live records, without adding delimiters.
     pub fn bytes(&self) -> Vec<u8> {
         self.lines
@@ -109,7 +125,7 @@ impl LineMap {
     }
 
     /// Apply append-only calls without realigning existing lines.
-    pub fn append(&self, suffix: &[u8], mut next_id: impl FnMut() -> Id) -> Result<Self, Error> {
+    pub fn append(&self, suffix: &[u8], mut next_id: impl FnMut() -> V) -> Result<Self, Error> {
         let mut result = self.clone();
         let mut rest = suffix;
         if let Some(line) = result
@@ -129,7 +145,7 @@ impl LineMap {
                 .map_or(rest.len(), |n| n + 1);
             let id = next_id();
             if result.ancestors.contains_key(&id) {
-                return Err(Error::DuplicateId(id));
+                return Err(Error::DuplicateId(id.to_string()));
             }
             result
                 .ancestors
@@ -143,7 +159,7 @@ impl LineMap {
         for bytes in split(rest) {
             let id = next_id();
             if result.ancestors.contains_key(&id) {
-                return Err(Error::DuplicateId(id));
+                return Err(Error::DuplicateId(id.to_string()));
             }
             result.ancestors.insert(id.clone(), None);
             result.lines.push(Line {
@@ -159,7 +175,7 @@ impl LineMap {
     /// fresh ID each time across the volume. `self` is the same-tree head at
     /// close: R9 holds upstream takes while a writer is open, and R9.16 orders
     /// competing closes in the same tree.
-    pub fn align(&self, image: &[u8], mut next_id: impl FnMut() -> Id) -> Result<Self, Error> {
+    pub fn align(&self, image: &[u8], mut next_id: impl FnMut() -> V) -> Result<Self, Error> {
         let old_image = self.bytes();
         self.validate(&old_image)?;
         let old = split(&old_image);
@@ -177,18 +193,18 @@ impl LineMap {
             ));
         }
         let mut result = self.clone();
-        let mut replacement: Vec<Option<Line>> =
+        let mut replacement: Vec<Option<Line<V>>> =
             live.iter().map(|i| Some(self.lines[*i].clone())).collect();
-        let mut before: Vec<Vec<Line>> = vec![Vec::new(); old.len() + 1];
-        let mut fresh = || -> Result<Id, Error> {
+        let mut before: Vec<Vec<Line<V>>> = vec![Vec::new(); old.len() + 1];
+        let mut fresh = || -> Result<V, Error> {
             let id = next_id();
             if result.ancestors.contains_key(&id) {
-                return Err(Error::DuplicateId(id));
+                return Err(Error::DuplicateId(id.to_string()));
             }
             Ok(id)
         };
         // Build new records separately so every generated ID is checked.
-        let mut additions: Vec<(Id, Option<Id>)> = Vec::new();
+        let mut additions: Vec<(V, Option<V>)> = Vec::new();
         let mut allocated = BTreeSet::new();
         for h in hunks {
             let (mut os, mut ns, mut on, mut nn) =
@@ -212,7 +228,7 @@ impl LineMap {
                 let prior = &self.lines[live[os + j]];
                 let id = fresh()?;
                 if !allocated.insert(id.clone()) {
-                    return Err(Error::DuplicateId(id));
+                    return Err(Error::DuplicateId(id.to_string()));
                 }
                 additions.push((id.clone(), Some(prior.version.clone())));
                 replacement[os + j] = Some(Line {
@@ -224,7 +240,7 @@ impl LineMap {
             for bytes in &new[ns + on.min(nn)..ns + nn] {
                 let id = fresh()?;
                 if !allocated.insert(id.clone()) {
-                    return Err(Error::DuplicateId(id));
+                    return Err(Error::DuplicateId(id.to_string()));
                 }
                 additions.push((id.clone(), None));
                 before[os + on].push(Line {
@@ -267,32 +283,32 @@ pub fn histogram(old: &[u8], new: &[u8]) -> Result<Vec<Hunk>, Error> {
 /// The parent's decision for one incoming version. The caller supplies the
 /// version graph, including ancestry obtained from the writer's read view.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Verdict {
+pub enum Verdict<V = String> {
     /// The version can be applied (including agreeing deletes).
     Apply,
     /// The parent has this version or a later version.
     Drop,
     /// Concurrent versions: the parent wins.
-    Lose { winner: Id },
+    Lose { winner: V },
 }
 
 /// Compare versions of one identity. `parent` is absent for a new line.
 /// Both input maps' ancestry must have been combined before calling this.
-pub fn verdict(
-    parent: Option<&Line>,
-    incoming: &Line,
-    ancestry: &BTreeMap<Id, Option<Id>>,
-) -> Result<Verdict, Error> {
+pub fn verdict<V: Id>(
+    parent: Option<&Line<V>>,
+    incoming: &Line<V>,
+    ancestry: &BTreeMap<V, Option<V>>,
+) -> Result<Verdict<V>, Error> {
     let Some(parent) = parent else {
         return Ok(Verdict::Apply);
     };
     if parent.identity != incoming.identity {
         return Err(Error::InvalidMap("different line identities"));
     }
-    fn descends(
-        start: &str,
-        wanted: &str,
-        graph: &BTreeMap<Id, Option<Id>>,
+    fn descends<V: Id>(
+        start: &V,
+        wanted: &V,
+        graph: &BTreeMap<V, Option<V>>,
     ) -> Result<bool, Error> {
         let mut next = Some(start);
         let mut seen = BTreeSet::new();
@@ -306,7 +322,7 @@ pub fn verdict(
             next = graph
                 .get(id)
                 .ok_or(Error::InvalidMap("missing ancestor"))?
-                .as_deref();
+                .as_ref();
         }
         Ok(false)
     }
@@ -338,22 +354,22 @@ pub enum CollisionKind {
 
 /// A lost version and the parent version that decided against it.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Collision {
-    pub identity: Id,
-    pub lost: Id,
-    pub winner: Id,
+pub struct Collision<V = String> {
+    pub identity: V,
+    pub lost: V,
+    pub winner: V,
     pub kind: CollisionKind,
 }
 
 /// The result of one whole save. A losing save leaves `content` exactly the
 /// parent's map; the caller keeps the incoming commit reachable in history.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Landing {
-    pub content: LineMap,
-    pub collisions: Vec<Collision>,
+pub struct Landing<V = String> {
+    pub content: LineMap<V>,
+    pub collisions: Vec<Collision<V>>,
 }
 
-fn combined_graph(a: &LineMap, b: &LineMap) -> Result<BTreeMap<Id, Option<Id>>, Error> {
+fn combined_graph<V: Id>(a: &LineMap<V>, b: &LineMap<V>) -> Result<BTreeMap<V, Option<V>>, Error> {
     let mut graph = a.ancestors.clone();
     for (version, over) in &b.ancestors {
         if graph.get(version).is_some_and(|existing| existing != over) {
@@ -364,11 +380,11 @@ fn combined_graph(a: &LineMap, b: &LineMap) -> Result<BTreeMap<Id, Option<Id>>, 
     Ok(graph)
 }
 
-fn unfinished(line: &Line) -> bool {
+fn unfinished<V>(line: &Line<V>) -> bool {
     line.bytes.as_ref().is_some_and(|b| !b.ends_with(b"\n"))
 }
 
-fn parents_unfinished_tail(parent: &LineMap) -> Option<&Line> {
+fn parents_unfinished_tail<V>(parent: &LineMap<V>) -> Option<&Line<V>> {
     parent
         .lines
         .iter()
@@ -379,7 +395,7 @@ fn parents_unfinished_tail(parent: &LineMap) -> Option<&Line> {
 
 // R10.8: the first selected unfinished line with a live line after it, as its
 // identity and the next live line's version.
-fn unfinished_before_kept(placed: &[Line], selected: &BTreeSet<Id>) -> Option<(Id, Id)> {
+fn unfinished_before_kept<V: Id>(placed: &[Line<V>], selected: &BTreeSet<V>) -> Option<(V, V)> {
     let mut live = placed.iter().filter(|line| line.bytes.is_some()).peekable();
     while let Some(line) = live.next() {
         if unfinished(line)
@@ -394,9 +410,9 @@ fn unfinished_before_kept(placed: &[Line], selected: &BTreeSet<Id>) -> Option<(I
 
 // Replace existing identities in place; insert new identities after their
 // nearest predecessor in the source, past parent-only inserts at that point.
-fn place(parent: &[Line], source: &[Line], selected: &BTreeSet<Id>) -> Vec<Line> {
+fn place<V: Id>(parent: &[Line<V>], source: &[Line<V>], selected: &BTreeSet<V>) -> Vec<Line<V>> {
     let mut result = parent.to_vec();
-    let source_ids: BTreeSet<&str> = source.iter().map(|l| l.identity.as_str()).collect();
+    let source_ids: BTreeSet<&V> = source.iter().map(|l| &l.identity).collect();
     for (index, line) in source.iter().enumerate() {
         if !selected.contains(&line.identity) {
             continue;
@@ -410,7 +426,7 @@ fn place(parent: &[Line], source: &[Line], selected: &BTreeSet<Id>) -> Vec<Line>
             .rev()
             .find_map(|p| result.iter().position(|r| r.identity == p.identity));
         let mut pos = anchor.map_or(0, |p| p + 1);
-        while pos < result.len() && !source_ids.contains(result[pos].identity.as_str()) {
+        while pos < result.len() && !source_ids.contains(&result[pos].identity) {
             pos += 1;
         }
         result.insert(pos, line.clone());
@@ -427,31 +443,31 @@ fn place(parent: &[Line], source: &[Line], selected: &BTreeSet<Id>) -> Vec<Line>
 /// commit, and commit the result with both histories as parents. An incoming
 /// unfinished line placed in front of a line the parent keeps loses to that
 /// line (R10.8), so no result holds bytes neither writer wrote.
-pub fn land_save(parent: &LineMap, base: &LineMap, incoming: &LineMap) -> Result<Landing, Error> {
+pub fn land_save<V: Id>(
+    parent: &LineMap<V>,
+    base: &LineMap<V>,
+    incoming: &LineMap<V>,
+) -> Result<Landing<V>, Error> {
     let graph = combined_graph(parent, incoming)?;
-    let base_versions: BTreeMap<&str, &str> = base
+    let base_versions: BTreeMap<&V, &V> = base
         .lines
         .iter()
-        .map(|l| (l.identity.as_str(), l.version.as_str()))
+        .map(|l| (&l.identity, &l.version))
         .collect();
-    let current: BTreeMap<&str, &Line> = parent
+    let current: BTreeMap<&V, &Line<V>> = parent.lines.iter().map(|l| (&l.identity, l)).collect();
+    let changed: Vec<&Line<V>> = incoming
         .lines
         .iter()
-        .map(|l| (l.identity.as_str(), l))
-        .collect();
-    let changed: Vec<&Line> = incoming
-        .lines
-        .iter()
-        .filter(|line| base_versions.get(line.identity.as_str()) != Some(&line.version.as_str()))
+        .filter(|line| base_versions.get(&line.identity) != Some(&&line.version))
         .collect();
     let mut decisions = BTreeMap::new();
     for line in &changed {
         decisions.insert(
             line.identity.clone(),
-            verdict(current.get(line.identity.as_str()).copied(), line, &graph)?,
+            verdict(current.get(&line.identity).copied(), line, &graph)?,
         );
     }
-    let selected: BTreeSet<Id> = decisions
+    let selected: BTreeSet<V> = decisions
         .iter()
         .filter_map(|(id, verdict)| (*verdict == Verdict::Apply).then_some(id.clone()))
         .collect();
@@ -476,7 +492,7 @@ pub fn land_save(parent: &LineMap, base: &LineMap, incoming: &LineMap) -> Result
         }
     }
     // R10.8: judged on what would still apply after R10.4.
-    let applying: BTreeSet<Id> = selected
+    let applying: BTreeSet<V> = selected
         .iter()
         .filter(|id| decisions[*id] == Verdict::Apply)
         .cloned()
@@ -528,13 +544,13 @@ pub fn land_save(parent: &LineMap, base: &LineMap, incoming: &LineMap) -> Result
 /// decision. `undecided` contains version IDs, determined by commit ancestry;
 /// this function makes no collision decision. The actor must only sync a file
 /// when its writer-lock protocol permits it.
-pub fn sync(
-    parent: &LineMap,
-    sandbox: &LineMap,
-    undecided: &BTreeSet<Id>,
-) -> Result<LineMap, Error> {
+pub fn sync<V: Id>(
+    parent: &LineMap<V>,
+    sandbox: &LineMap<V>,
+    undecided: &BTreeSet<V>,
+) -> Result<LineMap<V>, Error> {
     let graph = combined_graph(parent, sandbox)?;
-    let selected: BTreeSet<Id> = sandbox
+    let selected: BTreeSet<V> = sandbox
         .lines
         .iter()
         .filter(|line| undecided.contains(&line.version))

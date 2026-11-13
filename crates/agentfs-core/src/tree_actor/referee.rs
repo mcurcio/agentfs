@@ -3,8 +3,9 @@
 //! Inputs are snapshots at the parent's current head, the incoming save's
 //! first parent, and the save. The actor owns queue ordering and durability.
 
+use super::tree::{EventNumber, LineVersion, Lines};
 use super::{Error, MergeFileIdentity, NameHistory, NameVersion, Result};
-use crate::tree_reconcile::{self, LineMap, Verdict};
+use crate::tree_reconcile::{self, Verdict};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -17,18 +18,18 @@ pub(super) struct Snapshot {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct File {
     pub object: u64,
-    pub lines: LineMap,
+    pub lines: Lines,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(super) enum Version {
     Name {
         file: MergeFileIdentity,
-        version: u64,
+        version: EventNumber,
     },
     Line {
         file: MergeFileIdentity,
-        version: String,
+        version: LineVersion,
     },
 }
 
@@ -64,7 +65,11 @@ fn path(history: &NameHistory) -> Result<Option<&str>> {
     Ok(head(history)?.path.as_deref())
 }
 
-fn name_descends(history: &NameHistory, mut current: u64, ancestor: u64) -> Result<bool> {
+fn name_descends(
+    history: &NameHistory,
+    mut current: EventNumber,
+    ancestor: EventNumber,
+) -> Result<bool> {
     let mut seen = BTreeSet::new();
     loop {
         if current == ancestor {
@@ -100,7 +105,7 @@ fn combine_names(a: &NameHistory, b: &NameHistory) -> Result<NameHistory> {
 fn name_verdict(
     parent: Option<&NameHistory>,
     incoming: &NameHistory,
-) -> Result<(Verdict, NameHistory)> {
+) -> Result<(Verdict<EventNumber>, NameHistory)> {
     let Some(parent) = parent else {
         return Ok((Verdict::Apply, incoming.clone()));
     };
@@ -119,13 +124,17 @@ fn name_verdict(
     }
     Ok((
         Verdict::Lose {
-            winner: parent.head.to_string(),
+            winner: parent.head,
         },
         combined,
     ))
 }
 
-fn line_descends<'a>(map: &'a LineMap, mut current: &'a str, ancestor: &str) -> Result<bool> {
+fn line_descends<'a>(
+    map: &'a Lines,
+    mut current: &'a LineVersion,
+    ancestor: &LineVersion,
+) -> Result<bool> {
     let mut seen = BTreeSet::new();
     loop {
         if current == ancestor {
@@ -143,7 +152,7 @@ fn line_descends<'a>(map: &'a LineMap, mut current: &'a str, ancestor: &str) -> 
 
 // An unlink can remove only versions its writer could have seen on its first
 // parent. A line in that snapshot may itself descend from the parent's line.
-fn unseen_parent_line(base: Option<&File>, parent: Option<&File>) -> Result<Option<String>> {
+fn unseen_parent_line(base: Option<&File>, parent: Option<&File>) -> Result<Option<LineVersion>> {
     let Some(parent) = parent else {
         return Ok(None);
     };
@@ -153,14 +162,14 @@ fn unseen_parent_line(base: Option<&File>, parent: Option<&File>) -> Result<Opti
             .lines
             .iter()
             .find(|line| line.bytes.is_some())
-            .map(|line| line.version.clone()));
+            .map(|line| line.version));
     };
     let mut graph = base.lines.clone();
     for (version, over) in &parent.lines.ancestors {
         if graph.ancestors.get(version).is_some_and(|old| old != over) {
             return Err(Error::Format);
         }
-        graph.ancestors.insert(version.clone(), over.clone());
+        graph.ancestors.insert(*version, *over);
     }
     let previous: BTreeMap<_, _> = base.lines.lines.iter().map(|l| (&l.identity, l)).collect();
     for line in parent
@@ -171,7 +180,7 @@ fn unseen_parent_line(base: Option<&File>, parent: Option<&File>) -> Result<Opti
     {
         match previous.get(&line.identity) {
             Some(old) if line_descends(&graph, &old.version, &line.version)? => {}
-            _ => return Ok(Some(line.version.clone())),
+            _ => return Ok(Some(line.version)),
         }
     }
     Ok(None)
@@ -247,7 +256,7 @@ pub(super) fn judge(
                 let object = incoming.files.get(id).ok_or(Error::Format)?.object;
                 entry.insert(File {
                     object,
-                    lines: LineMap::default(),
+                    lines: Lines::default(),
                 });
             }
         }
@@ -341,7 +350,7 @@ pub(super) fn judge(
                     candidates.push((
                         Version::Line {
                             file: *id,
-                            version: line.version.clone(),
+                            version: line.version,
                         },
                         Some((winner.clone(), CollisionKind::Name)),
                     ));
@@ -349,7 +358,7 @@ pub(super) fn judge(
             }
             continue;
         }
-        let empty = LineMap::default();
+        let empty = Lines::default();
         let parent_map = original.map_or(&empty, |f| &f.lines);
         let base_map = old_file.map_or(&empty, |f| &f.lines);
         let landing = tree_reconcile::land_save(parent_map, base_map, &new_file.lines)?;
@@ -371,7 +380,7 @@ pub(super) fn judge(
                 tree_reconcile::CollisionKind::Line => Some((
                     Version::Line {
                         file: *id,
-                        version: c.winner.clone(),
+                        version: c.winner,
                     },
                     CollisionKind::Line,
                 )),
@@ -384,7 +393,7 @@ pub(super) fn judge(
                 candidates.push((
                     Version::Line {
                         file: *id,
-                        version: line.version.clone(),
+                        version: line.version,
                     },
                     loss,
                 ));
@@ -431,45 +440,39 @@ pub(super) fn judge(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tree_actor::tree::Versions;
 
     fn file(snapshot: &mut Snapshot, id: u64, path: &str, bytes: &[u8]) {
         let key = MergeFileIdentity(id);
-        let mut n = 0;
-        let lines = LineMap::default()
-            .align(bytes, || {
-                n += 1;
-                format!("{id}:{n}")
-            })
-            .unwrap();
+        let mut versions = Versions::of(EventNumber::new(id));
+        let lines = Lines::default().align(bytes, || versions.next()).unwrap();
         snapshot
             .names
-            .insert(key, NameHistory::created(id, path.into()));
+            .insert(key, NameHistory::created(EventNumber::new(id), path.into()));
         snapshot.files.insert(key, File { object: id, lines });
     }
     fn edit(snapshot: &mut Snapshot, id: u64, bytes: &[u8], seq: u64) {
-        let mut n = 0;
+        let mut versions = Versions::of(EventNumber::new(seq));
         let file = snapshot.files.get_mut(&MergeFileIdentity(id)).unwrap();
-        file.lines = file
-            .lines
-            .align(bytes, || {
-                n += 1;
-                format!("{seq}:{n}")
-            })
-            .unwrap();
+        file.lines = file.lines.align(bytes, || versions.next()).unwrap();
     }
     fn rename(snapshot: &mut Snapshot, id: u64, path: &str, seq: u64) {
         snapshot
             .names
             .get_mut(&MergeFileIdentity(id))
             .unwrap()
-            .advance(seq, Some(path.into()), None);
+            .advance(EventNumber::new(seq), Some(path.into()), None);
     }
     fn unlink(snapshot: &mut Snapshot, id: u64, seq: u64, replaced_by: Option<u64>) {
         snapshot
             .names
             .get_mut(&MergeFileIdentity(id))
             .unwrap()
-            .advance(seq, None, replaced_by.map(MergeFileIdentity));
+            .advance(
+                EventNumber::new(seq),
+                None,
+                replaced_by.map(MergeFileIdentity),
+            );
         snapshot.files.remove(&MergeFileIdentity(id));
     }
     fn base() -> Snapshot {
@@ -567,11 +570,11 @@ mod tests {
         edit(&mut child, 3, b"later\n", 11);
         let lost = Version::Name {
             file: MergeFileIdentity(3),
-            version: 3,
+            version: EventNumber::new(3),
         };
         let winner = Version::Name {
             file: MergeFileIdentity(2),
-            version: 2,
+            version: EventNumber::new(2),
         };
         let prior = [(lost, winner.clone())].into_iter().collect();
         let decision = judge(&parent, &base, &child, &prior).unwrap();
@@ -591,11 +594,11 @@ mod tests {
         rename(&mut child, 3, "available", 11);
         let lost = Version::Name {
             file: MergeFileIdentity(3),
-            version: 3,
+            version: EventNumber::new(3),
         };
         let winner = Version::Name {
             file: MergeFileIdentity(2),
-            version: 10,
+            version: EventNumber::new(10),
         };
         let prior = [(lost, winner)].into_iter().collect();
         let decision = judge(&parent, &base, &child, &prior).unwrap();
@@ -653,7 +656,7 @@ mod tests {
         assert!(decision.collisions.is_empty());
         let name = &decision.snapshot.names[&MergeFileIdentity(1)];
         assert_eq!(path(name).unwrap(), None);
-        assert_eq!(name.head, 12);
+        assert_eq!(name.head, EventNumber::new(12));
         assert!(!decision.snapshot.files.contains_key(&MergeFileIdentity(1)));
     }
 

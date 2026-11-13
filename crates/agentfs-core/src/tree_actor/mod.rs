@@ -14,6 +14,7 @@ pub mod queue;
 mod referee;
 pub mod stages;
 mod sync;
+mod tree;
 mod tree_id;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -30,19 +31,22 @@ use serde::{Deserialize, Serialize};
 use crate::file_lock::{FileLock, Mode};
 use crate::paths::RepoPath;
 use crate::tree_git::{RefUpdate, TreeEntry, TreeGit};
-use crate::tree_reconcile::LineMap;
 use journal::{
     CallHead, CompactError, Entry, Frame, Journal, OpenRecord, PointerChange, Record, RunHead,
 };
 use pointers::Pointers;
 use stages::{Stages, Timer, Which};
+use tree::{EventNumber, LineVersion, Lines, Versions};
 pub use tree_id::{NotATree, TreeId};
 
 const FORMAT: &str = "agentfs-trees-3\n";
 const JOURNAL: &str = "calls.wal";
 const INITIALIZING: &str = "initializing";
 type Result<T> = std::result::Result<T, Error>;
-type Undecided = (BTreeSet<String>, BTreeSet<(MergeFileIdentity, u64)>);
+type Undecided = (
+    BTreeSet<LineVersion>,
+    BTreeSet<(MergeFileIdentity, EventNumber)>,
+);
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -222,7 +226,7 @@ struct Tree {
     names: BTreeMap<String, u64>,
     anonymous: BTreeSet<u64>,
     bytes: BTreeMap<u64, Arc<Vec<u8>>>,
-    lines: BTreeMap<u64, Arc<LineMap>>,
+    lines: BTreeMap<u64, Arc<Lines>>,
     identities: BTreeMap<u64, MergeFileIdentity>,
     namespace: BTreeMap<MergeFileIdentity, NameHistory>,
     fresh_names: BTreeSet<u64>,
@@ -290,23 +294,23 @@ struct MergeFileIdentity(u64);
 /// its content. Each history is keyed by event number, which is volume-wide.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct NameHistory {
-    head: u64,
-    versions: BTreeMap<u64, NameVersion>,
+    head: EventNumber,
+    versions: BTreeMap<EventNumber, NameVersion>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct NameVersion {
     path: Option<String>,
-    over: Option<u64>,
+    over: Option<EventNumber>,
     replaced_by: Option<MergeFileIdentity>,
 }
 
 impl NameHistory {
-    fn created(seq: u64, path: String) -> Self {
+    fn created(event: EventNumber, path: String) -> Self {
         Self {
-            head: seq,
+            head: event,
             versions: [(
-                seq,
+                event,
                 NameVersion {
                     path: Some(path),
                     over: None,
@@ -318,16 +322,21 @@ impl NameHistory {
         }
     }
 
-    fn advance(&mut self, seq: u64, path: Option<String>, replaced_by: Option<MergeFileIdentity>) {
+    fn advance(
+        &mut self,
+        event: EventNumber,
+        path: Option<String>,
+        replaced_by: Option<MergeFileIdentity>,
+    ) {
         self.versions.insert(
-            seq,
+            event,
             NameVersion {
                 path,
                 over: Some(self.head),
                 replaced_by,
             },
         );
-        self.head = seq;
+        self.head = event;
     }
 }
 
@@ -705,7 +714,7 @@ pub struct Volume {
     /// open until a later step in their tree saves them, or a restart does.
     pending_closes: Vec<u64>,
     /// Each direct save's commit, by event number (see `rebuild_owners`).
-    owners: BTreeMap<u64, Oid>,
+    owners: BTreeMap<EventNumber, Oid>,
     next: u64,
     stopped: bool,
     /// A copy failed: the next step rebuilds refs whole and redoes checkouts.
@@ -972,8 +981,8 @@ impl Volume {
     /// A fork of the root, at the root's saved head.
     pub fn fork(&mut self) -> Result<TreeId> {
         let upstream = TreeId::Root;
-        let (seq, _) = self.step(upstream, |v, seq| {
-            let fork = TreeId::Fork(seq);
+        let (event, _) = self.step(upstream, |v, event| {
+            let fork = TreeId::Fork(event.get());
             let at = v.head(upstream)?;
             let mut tree = v.tree(upstream)?.clone();
             for object in std::mem::take(&mut tree.anonymous) {
@@ -988,7 +997,7 @@ impl Volume {
             draft.fork = Some((fork, upstream));
             Ok(draft)
         })?;
-        Ok(TreeId::Fork(seq))
+        Ok(TreeId::Fork(event.get()))
     }
 
     /// Saved bytes; an independent reader never sees an unfinished save.
@@ -1046,8 +1055,8 @@ impl Volume {
                 return Err(Error::NotFound);
             }
             return self
-                .step(tree, |v, seq| v.build_create(tree, path, writer, seq))
-                .map(|(seq, _)| seq);
+                .step(tree, |v, event| v.build_create(tree, path, writer, event))
+                .map(|(event, _)| event.get());
         };
         let handle = self.journal_record(
             Entry::Open {
@@ -1119,15 +1128,15 @@ impl Volume {
         if !t.anonymous.contains(&object) {
             return Err(Error::NotFound);
         }
-        self.step(tree, |v, seq| {
+        self.step(tree, |v, event| {
             let mut t = v.tree(tree)?.clone();
             t.anonymous.remove(&object);
             t.namespace.insert(
                 t.identities[&object],
-                NameHistory::created(seq, path.to_owned()),
+                NameHistory::created(event, path.to_owned()),
             );
             t.names.insert(path.to_owned(), object);
-            let mut draft = v.build_save(tree, t, writer, "Create", seq, None)?;
+            let mut draft = v.build_save(tree, t, writer, "Create", event, None)?;
             draft.linked = Some(object);
             Ok(draft)
         })?;
@@ -1238,7 +1247,9 @@ impl Volume {
             return Err(Error::NotFound);
         }
         if from != to {
-            self.step(tree, |v, seq| v.build_rename(tree, from, to, writer, seq))?;
+            self.step(tree, |v, event| {
+                v.build_rename(tree, from, to, writer, event)
+            })?;
         }
         Ok(())
     }
@@ -1249,14 +1260,14 @@ impl Volume {
         if !self.tree(tree)?.names.contains_key(path) {
             return Err(Error::NotFound);
         }
-        self.step(tree, |v, seq| {
+        self.step(tree, |v, event| {
             let mut t = v.tree(tree)?.clone();
             let object = t.names.remove(path).ok_or(Error::NotFound)?;
             t.namespace
                 .get_mut(&t.identities[&object])
                 .ok_or(Error::Format)?
-                .advance(seq, None, None);
-            v.build_save(tree, t, writer, "Unlink", seq, None)
+                .advance(event, None, None);
+            v.build_save(tree, t, writer, "Unlink", event, None)
         })?;
         Ok(())
     }
@@ -1315,7 +1326,7 @@ impl Volume {
             .iter()
             .find(|e| e.name == b"namespace.json")
             .ok_or(Error::Format)?;
-        let by_path: BTreeMap<String, (u64, MergeFileIdentity, LineMap)> =
+        let by_path: BTreeMap<String, (u64, MergeFileIdentity, Lines)> =
             serde_json::from_slice(&self.repo.read_blob(metadata.oid)?)?;
         let names = serde_json::from_slice(&self.repo.read_blob(namespace.oid)?)?;
         let files = by_path
@@ -1487,7 +1498,12 @@ impl Volume {
         for prefix in ["refs/heads/", &queue(TreeId::Root), "refs/collisions/"] {
             tips.extend(self.pointers.under(prefix).into_iter().map(|(_, oid)| oid));
         }
-        self.owners = self.repo.direct_events(&tips)?.into_iter().collect();
+        self.owners = self
+            .repo
+            .direct_events(&tips)?
+            .into_iter()
+            .map(|(event, oid)| (EventNumber::new(event), oid))
+            .collect();
         Ok(())
     }
 
@@ -1509,14 +1525,9 @@ impl Volume {
         let mut names = BTreeSet::new();
         for file in fork.files.values() {
             for line in &file.lines.lines {
-                let seq = line
-                    .version
-                    .split_once(':')
-                    .and_then(|(s, _)| s.parse::<u64>().ok())
-                    .ok_or(Error::Format)?;
-                let owner = owners.get(&seq).ok_or(Error::Format)?;
+                let owner = owners.get(&line.version.event()).ok_or(Error::Format)?;
                 if !landed(*owner)? {
-                    lines.insert(line.version.clone());
+                    lines.insert(line.version);
                 }
             }
         }
@@ -1561,7 +1572,7 @@ impl Volume {
         tree: TreeId,
         reference: &str,
         incoming: Oid,
-        seq: u64,
+        event: EventNumber,
     ) -> Result<Draft> {
         let current = self.head(tree)?;
         let t = self.tree(tree)?;
@@ -1590,7 +1601,7 @@ impl Volume {
         } else {
             let content = self.snapshot_tree(&decision.snapshot)?;
             let mut message = format!(
-                "Landing\n\nAgentfs-Writer: agentfs\nAgentfs-Cause: Landing\nAgentfs-Tree: {tree}\nAgentfs-Event: {seq}\nAgentfs-Format: envelope-1\n"
+                "Landing\n\nAgentfs-Writer: agentfs\nAgentfs-Cause: Landing\nAgentfs-Tree: {tree}\nAgentfs-Event: {event}\nAgentfs-Format: envelope-1\n"
             );
             if !decision.collisions.is_empty() {
                 message.push_str(&format!(
@@ -1624,7 +1635,7 @@ impl Volume {
             }
         }
         self.object_table_update(tree, &decision.snapshot, &mut changes)?;
-        let enqueued = self.enqueue_moves(tree, head, seq, &mut changes)?;
+        let enqueued = self.enqueue_moves(tree, head, event, &mut changes)?;
         let mut built = t.clone();
         built.install(decision.snapshot)?;
         let mut draft = Draft::new("agentfs", tree, built);
@@ -1636,8 +1647,8 @@ impl Volume {
 
     fn take_landing(&mut self, tree: TreeId, reference: &str, incoming: Oid) -> Result<()> {
         let started = Instant::now();
-        self.pages_take(tree, |v, seq| {
-            v.build_landing(tree, reference, incoming, seq)
+        self.pages_take(tree, |v, event| {
+            v.build_landing(tree, reference, incoming, event)
         })?;
         let nanos = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
         self.metrics.takes = self.metrics.takes.saturating_add(1);
@@ -1703,8 +1714,8 @@ impl Volume {
         &self,
         parent: &referee::Snapshot,
         at: Oid,
-        names: &BTreeSet<(MergeFileIdentity, u64)>,
-    ) -> Result<BTreeMap<MergeFileIdentity, LineMap>> {
+        names: &BTreeSet<(MergeFileIdentity, EventNumber)>,
+    ) -> Result<BTreeMap<MergeFileIdentity, Lines>> {
         let mut wanted = BTreeSet::new();
         for (id, _) in names {
             if sync::ended(parent, *id)? {
@@ -1750,7 +1761,7 @@ impl Volume {
         reference: &str,
         value: Oid,
         plan: SyncPlan,
-        seq: u64,
+        event: EventNumber,
     ) -> Result<Draft> {
         let current = self.head(tree)?;
         let mut built = self.tree(tree)?.clone();
@@ -1773,7 +1784,7 @@ impl Volume {
             } else {
                 let content = self.snapshot_tree(&snapshot)?;
                 let message = format!(
-                    "Sync\n\nAgentfs-Writer: agentfs\nAgentfs-Cause: Sync\nAgentfs-Tree: {tree}\nAgentfs-Event: {seq}\nAgentfs-Format: envelope-1\n"
+                    "Sync\n\nAgentfs-Writer: agentfs\nAgentfs-Cause: Sync\nAgentfs-Tree: {tree}\nAgentfs-Event: {event}\nAgentfs-Format: envelope-1\n"
                 );
                 self.repo
                     .write_commit(content, &[current, target], &message)?
@@ -1808,8 +1819,8 @@ impl Volume {
         plan: SyncPlan,
     ) -> Result<()> {
         let started = Instant::now();
-        self.pages_take(tree, |v, seq| {
-            v.build_sync(tree, reference, value, plan, seq)
+        self.pages_take(tree, |v, event| {
+            v.build_sync(tree, reference, value, plan, event)
         })?;
         let nanos = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
         self.metrics.takes = self.metrics.takes.saturating_add(1);
@@ -1930,9 +1941,9 @@ impl Volume {
     }
 
     /// Saves this tree's pending closes, then runs the step `build` makes.
-    fn step<F>(&mut self, tree: TreeId, build: F) -> Result<(u64, Saved)>
+    fn step<F>(&mut self, tree: TreeId, build: F) -> Result<(EventNumber, Saved)>
     where
-        F: FnOnce(&Self, u64) -> Result<Draft>,
+        F: FnOnce(&Self, EventNumber) -> Result<Draft>,
     {
         self.run_pending_closes(tree, None)?;
         self.run_step(build)
@@ -1948,7 +1959,7 @@ impl Volume {
             .collect();
         let mut outcome = Saved::Unchanged;
         for handle in due {
-            let (_, saved) = self.run_step(|v, seq| v.build_close(handle, seq))?;
+            let (_, saved) = self.run_step(|v, event| v.build_close(handle, event))?;
             if wanted == Some(handle) {
                 outcome = saved;
             }
@@ -1960,18 +1971,18 @@ impl Volume {
     /// changes nothing and returns its errno. After the record, the commit
     /// point, the step has happened: a failed copy is logged and the call
     /// succeeds (AGENTS principle 5).
-    fn run_step<F>(&mut self, build: F) -> Result<(u64, Saved)>
+    fn run_step<F>(&mut self, build: F) -> Result<(EventNumber, Saved)>
     where
-        F: FnOnce(&Self, u64) -> Result<Draft>,
+        F: FnOnce(&Self, EventNumber) -> Result<Draft>,
     {
         if self.stopped {
             return Err(Error::Stopped);
         }
         let started = Instant::now();
-        let seq = self.next;
+        let event = EventNumber::new(self.next);
         let recorded = (|| -> Result<Draft> {
             crate::failpoints::hit("tree.before_objects")?;
-            let draft = build(self, seq)?;
+            let draft = build(self, event)?;
             crate::failpoints::hit("tree.after_objects_durable")?;
             self.pointers.check(&draft.changes)?;
             self.journal_record(draft.entry(), &[])?;
@@ -1988,9 +1999,9 @@ impl Volume {
         let is_fork = draft.fork.is_some();
         let changes = draft.changes.clone();
         let tree = draft.tree;
-        self.install(draft, seq);
+        self.install(draft, event);
         if let Saved::Commit(head) = saved {
-            self.owners.insert(seq, head);
+            self.owners.insert(event, head);
         }
         if matches!(saved, Saved::Commit(_)) {
             let nanos = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
@@ -2003,11 +2014,11 @@ impl Volume {
             eprintln!("tree CopyStale: {e}");
         }
         self.compact_if_due();
-        Ok((seq, saved))
+        Ok((event, saved))
     }
 
     /// Stage 6: the step is on record, so memory follows. Cannot fail.
-    fn install(&mut self, draft: Draft, seq: u64) {
+    fn install(&mut self, draft: Draft, event: EventNumber) {
         let Draft {
             tree,
             built,
@@ -2051,7 +2062,7 @@ impl Volume {
             .saturating_sub(taken)
             .saturating_add(enqueued);
         if let Some(closed) = closed {
-            self.pages_saved(closed.tree, closed.object, seq);
+            self.pages_saved(closed.tree, closed.object, event.get());
         }
     }
 
@@ -2161,29 +2172,36 @@ impl Volume {
         }
     }
 
-    fn build_create(&self, tree: TreeId, path: &str, writer: &str, seq: u64) -> Result<Draft> {
+    fn build_create(
+        &self,
+        tree: TreeId,
+        path: &str,
+        writer: &str,
+        event: EventNumber,
+    ) -> Result<Draft> {
+        let object = event.object();
         let mut t = self.tree(tree)?.clone();
-        t.names.insert(path.to_owned(), seq);
-        t.bytes.insert(seq, Arc::default());
-        t.lines.insert(seq, Arc::default());
-        t.identities.insert(seq, MergeFileIdentity(seq));
+        t.names.insert(path.to_owned(), object);
+        t.bytes.insert(object, Arc::default());
+        t.lines.insert(object, Arc::default());
+        t.identities.insert(object, MergeFileIdentity(object));
         t.namespace.insert(
-            MergeFileIdentity(seq),
-            NameHistory::created(seq, path.to_owned()),
+            MergeFileIdentity(object),
+            NameHistory::created(event, path.to_owned()),
         );
-        t.fresh_names.insert(seq);
-        let mut draft = self.build_save(tree, t, writer, "Create", seq, None)?;
+        t.fresh_names.insert(object);
+        let mut draft = self.build_save(tree, t, writer, "Create", event, None)?;
         draft.opened = Some(LiveOpen {
-            handle: seq,
+            handle: event.get(),
             tree,
             writer: writer.to_owned(),
-            object: seq,
+            object,
             anonymous: false,
         });
         Ok(draft)
     }
 
-    fn build_close(&self, handle: u64, seq: u64) -> Result<Draft> {
+    fn build_close(&self, handle: u64, event: EventNumber) -> Result<Draft> {
         let h = self.handles.get(&handle).ok_or(Error::NotFound)?;
         let calls = self.pages_calls_for_close(h);
         let mut t = self.tree(h.tree)?.clone();
@@ -2195,11 +2213,8 @@ impl Volume {
             draft.saved = Saved::OrphanDropped;
             draft
         } else if let Some(bytes) = changed_bytes(&t.bytes[&h.object], &calls)? {
-            let mut index = 0_u64;
-            let mut next_id = || {
-                index += 1;
-                format!("{seq}:{index}")
-            };
+            let mut versions = Versions::of(event);
+            let mut next_id = || versions.next();
             let lines = if calls.iter().all(|call| matches!(call, Call::Append(_))) {
                 let suffix: Vec<u8> = calls
                     .iter()
@@ -2216,7 +2231,7 @@ impl Volume {
             };
             t.lines.insert(h.object, Arc::new(lines));
             t.bytes.insert(h.object, Arc::new(bytes));
-            self.build_save(h.tree, t, &h.writer, "Direct", seq, Some(handle))?
+            self.build_save(h.tree, t, &h.writer, "Direct", event, Some(handle))?
         } else {
             Draft::new(&h.writer, h.tree, t)
         };
@@ -2230,7 +2245,7 @@ impl Volume {
         from: &str,
         to: &str,
         writer: &str,
-        seq: u64,
+        event: EventNumber,
     ) -> Result<Draft> {
         let mut t = self.tree(tree)?.clone();
         let object = t.names.remove(from).ok_or(Error::NotFound)?;
@@ -2241,12 +2256,9 @@ impl Volume {
             t.namespace
                 .get_mut(&source_id)
                 .ok_or(Error::Format)?
-                .advance(seq, None, None);
-            let mut index = 0_u64;
-            let lines = t.lines[&replaced].align(&t.bytes[&object], || {
-                index += 1;
-                format!("{seq}:{index}")
-            })?;
+                .advance(event, None, None);
+            let mut versions = Versions::of(event);
+            let lines = t.lines[&replaced].align(&t.bytes[&object], || versions.next())?;
             t.lines.insert(object, Arc::new(lines));
             t.identities.insert(object, t.identities[&replaced]);
             if !t.fresh_names.contains(&replaced) {
@@ -2259,16 +2271,16 @@ impl Volume {
                 t.namespace
                     .get_mut(&replaced_id)
                     .ok_or(Error::Format)?
-                    .advance(seq, None, Some(source_id));
+                    .advance(event, None, Some(source_id));
             }
             t.namespace
                 .get_mut(&source_id)
                 .ok_or(Error::Format)?
-                .advance(seq, Some(to.to_owned()), None);
+                .advance(event, Some(to.to_owned()), None);
             t.fresh_names.remove(&object);
         }
         t.names.insert(to.to_owned(), object);
-        self.build_save(tree, t, writer, "Rename", seq, None)
+        self.build_save(tree, t, writer, "Rename", event, None)
     }
 
     /// Writes `t`'s commit and the pointer changes that publish it.
@@ -2278,7 +2290,7 @@ impl Volume {
         t: Tree,
         writer: &str,
         cause: &str,
-        seq: u64,
+        event: EventNumber,
         open: Option<u64>,
     ) -> Result<Draft> {
         let _timer = Timer::start(Which::Objects);
@@ -2300,7 +2312,7 @@ impl Volume {
         let namespace = self.repo.write_blob(&serde_json::to_vec(&t.namespace)?)?;
         let content = self.envelope(files, blob, namespace)?;
         let mut message = format!(
-            "{cause} by {writer}\n\nAgentfs-Writer: {writer}\nAgentfs-Cause: Direct\nAgentfs-Tree: {tree}\nAgentfs-Event: {seq}\nAgentfs-Format: envelope-1\n"
+            "{cause} by {writer}\n\nAgentfs-Writer: {writer}\nAgentfs-Cause: Direct\nAgentfs-Tree: {tree}\nAgentfs-Event: {event}\nAgentfs-Format: envelope-1\n"
         );
         if let Some(open) = open {
             message.push_str(&format!("Agentfs-Open: {open}\n"));
@@ -2313,7 +2325,7 @@ impl Volume {
             expected_old: Some(current),
         }];
         self.object_table_update(tree, &Self::snapshot_of(&t), &mut changes)?;
-        let enqueued = self.enqueue_moves(tree, head, seq, &mut changes)?;
+        let enqueued = self.enqueue_moves(tree, head, event, &mut changes)?;
         let mut draft = Draft::new(writer, tree, t);
         draft.changes = changes;
         draft.enqueued = enqueued;
@@ -2328,7 +2340,7 @@ impl Volume {
         &self,
         tree: TreeId,
         head: Oid,
-        seq: u64,
+        event: EventNumber,
         changes: &mut Vec<RefUpdate>,
     ) -> Result<u64> {
         let mut destinations: Vec<(TreeId, Oid)> = Vec::new();
@@ -2347,7 +2359,7 @@ impl Volume {
         }
         for (destination, oid) in &destinations {
             changes.push(RefUpdate {
-                refname: format!("{}{seq:020}", queue(*destination)),
+                refname: format!("{}{event:020}", queue(*destination)),
                 new: Some(*oid),
                 expected_old: None,
             });
