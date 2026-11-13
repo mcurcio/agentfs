@@ -2,14 +2,16 @@ name: phase-1
 
 on:
   push:
-    branches: [docs/target-architecture]
-    paths:
+    branches: [main, docs/target-architecture]
+    paths: &paths
       - 'crates/**'
       - 'ci/**'
       - 'vendor/**'
       - 'Cargo.*'
       - '.github/workflows/phase-1.yml'
       - '.github/actions/**'
+  pull_request:
+    paths: *paths
   workflow_dispatch:
 
 permissions:
@@ -31,6 +33,8 @@ jobs:
         with:
           key: phase-1-conformance
       - run: sudo apt-get update && sudo apt-get install -y fuse3 git python3 util-linux curl gcc zlib1g-dev
+      # The tree views mount with FUSE allow_other by default.
+      - run: echo user_allow_other | sudo tee -a /etc/fuse.conf
       - uses: ./.github/actions/pinned-git
       - run: cargo test --manifest-path vendor/fuser/Cargo.toml --lib raw_tmpfile_request_dispatches_and_returns_create_reply
       - run: cargo build --locked -p agentfs -p agentfs-model --bin agentfs --bin phase1-oracle
@@ -105,6 +109,8 @@ jobs:
         with:
           key: phase-1-page-cache
       - run: sudo apt-get update && sudo apt-get install -y fuse3 git python3
+      # The tree views mount with FUSE allow_other by default.
+      - run: echo user_allow_other | sudo tee -a /etc/fuse.conf
       - uses: ./.github/actions/pinned-git
       - run: cargo build --locked -p agentfs
       - run: |
@@ -137,6 +143,8 @@ jobs:
         with:
           key: phase-1-faults
       - run: sudo apt-get update && sudo apt-get install -y fuse3 git python3 util-linux curl gcc zlib1g-dev
+      # The tree views mount with FUSE allow_other by default.
+      - run: echo user_allow_other | sudo tee -a /etc/fuse.conf
       - uses: ./.github/actions/pinned-git
       - run: cargo build --locked -p agentfs --features failpoints
       - name: kill at recording boundaries
@@ -217,6 +225,8 @@ jobs:
         with:
           key: phase-1-measure
       - run: sudo apt-get update && sudo apt-get install -y fuse3 git python3 util-linux curl gcc zlib1g-dev
+      # The tree views mount with FUSE allow_other by default.
+      - run: echo user_allow_other | sudo tee -a /etc/fuse.conf
       - uses: ./.github/actions/pinned-git
       - run: cargo test --locked -p agentfs-core --test tree_stages
       - run: cargo build --locked -p agentfs
