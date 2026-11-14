@@ -449,6 +449,25 @@ writes, `.claude/handoff`'s `mem.py`; a local observation, not CI):
 | 256 MiB | 9.7 s | 15 MiB | 146 MiB (mapped pack pages) | 769 MiB |
 | 1 GiB | 39.9 s | 17 MiB | 66 MiB | 3,073 MiB |
 
+On CI (`image` run 43600260345, commit c187fe3, one observation each):
+
+| Workload | ext4 | XFS |
+|---|---|---|
+| `history_1g`, the 1 GiB save's `drain_s` | 40.7 s | 40.6 s |
+| `memory_1g`, the view's peak over its memory before | 36.2 MiB | 36.3 MiB |
+| `close_1g`, close and `stat` (total with the writes) | 2.45 s (3.08 s) | 2.39 s (2.86 s) |
+| `write_1g` (ratio) | 0.82 | 0.82 |
+| `close_4k`, p50 (p99) | 1.50 ms (3.05 ms) | 1.41 ms (3.68 ms) |
+| `create`, 50,000 created in | 84.3 s | 88.0 s |
+| `close_64m` | 0.11 s | 0.10 s |
+
+All meet their bars. The view's own memory before the 1 GiB workload was
+about 1 GiB, held for the 50,000 files the `create` workload left (their
+maps and descriptors), which is not this figure. `close_4k` and `create`
+moved from the earlier run's 0.68 and 0.58 ms and 52 and 53 s; the same code
+gave 0.66 ms and 47 s on one runner and 1.25 ms and 76 s on another (runs
+43595126271 and 43595132223), so they are within the runners' spread.
+
 The 256 MiB row predates bounding `git cat-file`'s pack window; with it the
 1 GiB save's children peak at 66 MiB. Before, the same container's 256 MiB
 save took 13.8 s with the children at 752 MiB.
