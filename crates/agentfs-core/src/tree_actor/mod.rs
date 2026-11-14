@@ -7,6 +7,7 @@
 //! refs and the private checkouts are copies made after it, rebuilt from the
 //! journal at every open and after any failed copy. Nothing decides from a copy.
 
+mod call_path;
 mod history;
 mod journal;
 mod pointers;
@@ -34,9 +35,12 @@ use serde::Serialize;
 use crate::file_lock::{FileLock, Mode};
 use crate::tree_git::{RefUpdate, TreeGit};
 pub use agentfs_contracts::{NotATree, TreeId};
+pub use call_path::{Progress, Recording};
+pub use history::built::{BuildError, BuiltSnapshot, Health, History, Lag, TreeLag, WaitError};
 use history::message::{self, Message};
 use history::upstreams::Upstreams;
 use history::{SyncStep, check_objects, refs, remove_stale_locks};
+pub use journal::durable::{Durability, DurableError, RecordNo};
 use journal::{
     CompactError, Entry, FoldedOpen, Journal, LiveOpen, PointerChange, Record, compact_at, fold,
 };

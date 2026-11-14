@@ -19,6 +19,7 @@
 //! decides about (docs/runbooks/recording-failures.md).
 
 mod commit_point;
+pub(super) mod durable;
 mod fold;
 
 use std::collections::BTreeMap;

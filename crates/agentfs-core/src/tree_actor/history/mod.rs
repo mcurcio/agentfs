@@ -1,6 +1,7 @@
 //! Tree history: snapshots read from and written to commits, a tree's object table, direct saves,
 //! queue entries and checkouts (target git-model §4, §5).
 
+pub(super) mod built;
 pub(super) mod message;
 pub(super) mod refs;
 mod take;
