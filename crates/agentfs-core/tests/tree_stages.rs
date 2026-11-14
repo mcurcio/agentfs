@@ -66,10 +66,16 @@ fn count(stages: &Stages, before: &Stages) -> Vec<(&'static str, u64)> {
 /// call path runs none.
 const CHILDREN_PER_SAVE: u64 = 2;
 
-/// The objects one save feeds `git fast-import`: the changed file's blob, the
-/// object table and the commit. Its trees, line map and name history are
-/// fast-import's and inline; an unchanged file's blob is already known.
-const OBJECTS_PER_SAVE: u64 = 3;
+/// The objects one save feeds `git fast-import` by mark: the changed file's
+/// blob and the commit. Its line map and name history are inline, its trees
+/// fast-import's; an unchanged file's blob is already known.
+const OBJECTS_PER_SAVE: u64 = 2;
+
+/// The objects one save of a file stores, counted in the pack: the file's
+/// blob and line map, the seven folders on their two paths (the commit's own
+/// tree, `files/`, `files/<aa>/`, `files/<aa>/<bb>/` and the same under
+/// `lines/`) and the commit. Its name history is unchanged.
+const STORED_PER_SAVE: u64 = 10;
 
 /// Saves of an existing file, each built in its own batch: what the builder
 /// does for each, stage by stage.
@@ -206,31 +212,204 @@ fn a_call_is_not_fsynced_and_flush_fsyncs_once() {
     assert_eq!(after.journal_append.count - before.journal_append.count, 10);
 }
 
-/// A save's cost grows with its change, not the tree: one changed file in a
-/// tree of forty feeds the builder the objects it would in a tree of one, and
-/// starts the same Git children.
+/// Objects in the store's packs, as `git count-objects` counts them.
+fn packed(state: &Path) -> u64 {
+    let out = std::process::Command::new("git")
+        .arg("--git-dir")
+        .arg(state.join("history.git"))
+        .args(["count-objects", "-v"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    String::from_utf8(out.stdout)
+        .unwrap()
+        .lines()
+        .find_map(|l| l.strip_prefix("in-pack: "))
+        .unwrap()
+        .parse()
+        .unwrap()
+}
+
+/// A volume whose root holds `files` files, `f0` to `f<files - 1>`, then `a`,
+/// all built. The creates are recorded back to back and built in batches.
+fn filled(state: &Path, files: usize) -> TreeActor {
+    let mut v = new_actor(state);
+    for i in 0..files {
+        put(&mut v, &format!("f{i}"), format!("file {i}\n").as_bytes());
+    }
+    put(&mut v, "a", b"seed\n");
+    v.settle().unwrap();
+    v
+}
+
+/// A save's cost grows with its change, not the tree (Q1-A, hashed
+/// sub-folders): one changed file in a tree of 100 files and in one of
+/// 10,000 stores the same objects, feeds the builder the same, and starts the
+/// same Git children.
 #[test]
-fn a_save_stores_the_same_objects_at_any_tree_size() {
+fn a_save_stores_the_same_objects_at_100_and_10000_files() {
     let _one = ONE_AT_A_TIME.lock().unwrap();
     let cost = |files: usize| {
         let tmp = tempfile::tempdir().unwrap();
-        let mut v = new_actor(&tmp.path().join("state"));
-        for i in 0..files {
-            put(&mut v, &format!("f{i}"), format!("file {i}\n").as_bytes());
-        }
-        put(&mut v, "a", b"seed\n");
-        v.settle().unwrap();
-        let before = v.metrics().stages;
+        let state = tmp.path().join("state");
+        let mut v = filled(&state, files);
+        let (before, stored) = (v.metrics().stages, packed(&state));
         put(&mut v, "a", b"changed\n");
         v.settle().unwrap();
         let after = v.metrics().stages;
         (
+            packed(&state) - stored,
             after.object_writes - before.object_writes,
             after.git_children - before.git_children,
         )
     };
-    assert_eq!(cost(0), (OBJECTS_PER_SAVE, CHILDREN_PER_SAVE));
-    assert_eq!(cost(40), (OBJECTS_PER_SAVE, CHILDREN_PER_SAVE));
+    let expect = (STORED_PER_SAVE, OBJECTS_PER_SAVE, CHILDREN_PER_SAVE);
+    assert_eq!(cost(100), expect, "at 100 files");
+    assert_eq!(cost(10_000), expect, "at 10,000 files");
+}
+
+/// A file's first bytes are all new lines: the builder aligns them with no
+/// `git diff` child, so a create's save starts only `git fast-import`.
+#[test]
+fn an_empty_files_first_alignment_runs_no_child() {
+    let _one = ONE_AT_A_TIME.lock().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let mut v = new_actor(&tmp.path().join("state"));
+    v.settle().unwrap();
+    for (i, bytes) in [&b"one line\n"[..], b"a\nb\nno newline", b"\n\n", b"x"]
+        .into_iter()
+        .enumerate()
+    {
+        // The create is built first, so the save's batch is its own.
+        let h = v
+            .write_open(
+                TreeId::Root,
+                &format!("new{i}"),
+                &writer("test-writer"),
+                true,
+            )
+            .unwrap();
+        v.settle().unwrap();
+        let before = v.metrics().stages;
+        v.write(h, 0, bytes, false).unwrap();
+        v.close(h).unwrap();
+        v.settle().unwrap();
+        let after = v.metrics().stages;
+        assert_eq!(after.align.count - before.align.count, 1, "aligned once");
+        assert_eq!(
+            after.git_children - before.git_children,
+            1,
+            "only fast-import ran for {bytes:?}"
+        );
+        assert_eq!(v.read(TreeId::Root, &format!("new{i}")).unwrap(), bytes);
+    }
+}
+
+/// `git hash-object --stdin` of `name`: the id the layout's folders come from.
+fn hash_object(name: &str) -> String {
+    use std::io::Write;
+    let mut child = std::process::Command::new("git")
+        .args(["hash-object", "--stdin"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(name.as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success());
+    String::from_utf8(out.stdout).unwrap().trim().to_owned()
+}
+
+/// The paths of every blob under `top` in the root's head, from `git ls-tree`.
+fn listed(state: &Path, top: &str) -> Vec<String> {
+    let out = std::process::Command::new("git")
+        .arg("--git-dir")
+        .arg(state.join("history.git"))
+        .args(["ls-tree", "-r", "-z", "--name-only", "refs/heads/root", top])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    String::from_utf8(out.stdout)
+        .unwrap()
+        .split_terminator('\0')
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Each file's bytes and line map sit at `<aa>/<bb>/<name>` and its name
+/// history at `<cc>/<dd>/<id>`, the folders hex digits 1-2 and 3-4 of `git
+/// hash-object --stdin` of the name or the identity in decimal.
+#[test]
+fn fanout_matches_git_hash_object() {
+    let _one = ONE_AT_A_TIME.lock().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let state = tmp.path().join("state");
+    let mut v = new_actor(&state);
+    let names = [
+        "a",
+        "b.txt",
+        "with space",
+        "ünï",
+        "metadata.json",
+        ".hidden",
+    ];
+    for name in names {
+        put(&mut v, name, b"x\n");
+    }
+    v.settle().unwrap();
+    let fanned = |name: &str| {
+        let hex = hash_object(name);
+        format!("{}/{}/{name}", &hex[..2], &hex[2..4])
+    };
+    let mut files: Vec<String> = names
+        .iter()
+        .map(|n| format!("files/{}", fanned(n)))
+        .collect();
+    let mut lines: Vec<String> = names
+        .iter()
+        .map(|n| format!("lines/{}", fanned(n)))
+        .collect();
+    files.sort();
+    lines.sort();
+    assert_eq!(listed(&state, "files/"), files);
+    assert_eq!(listed(&state, "lines/"), lines);
+    let ids: Vec<String> = v
+        .files(TreeId::Root)
+        .unwrap()
+        .into_iter()
+        .map(|(_, object, _)| object.to_string())
+        .collect();
+    let mut histories: Vec<String> = ids
+        .iter()
+        .map(|id| format!("names/{}", fanned(id)))
+        .collect();
+    histories.sort();
+    assert_eq!(listed(&state, "names/"), histories);
+}
+
+/// A file's path depends on its name alone: the same at 10 files and at
+/// 10,000 (two fixed levels of 256, never a fan-out that grows).
+#[test]
+fn a_files_path_never_changes_when_siblings_are_added() {
+    let _one = ONE_AT_A_TIME.lock().unwrap();
+    let path = |files: usize| {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path().join("state");
+        let _v = filled(&state, files);
+        listed(&state, "files/")
+            .into_iter()
+            .find(|p| p.ends_with("/a"))
+            .unwrap()
+    };
+    let hex = hash_object("a");
+    let expect = format!("files/{}/{}/a", &hex[..2], &hex[2..4]);
+    assert_eq!(path(10), expect);
+    assert_eq!(path(10_000), expect);
 }
 
 /// A save on the root and the sync that carries it to a sandbox must cost the same

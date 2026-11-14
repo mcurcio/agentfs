@@ -1,7 +1,7 @@
 //! What must hold in the real system, whatever the model said (git-model.md
-//! §15, §18). Read from `git`, the crate's own parse of each commit's
-//! `metadata.json` and `namespace.json` ([`crate::git_history`]), and a byte
-//! oracle of its own: never the
+//! §15, §18). Read from `git`, the crate's own reader of each commit's line
+//! maps and name histories ([`crate::git_history`]), and a byte oracle of its
+//! own: never the
 //! library's bookkeeping. `check::save_aligned` is shared with the model, over the
 //! model's `Content`. What a replay compares (each tree's files, the collisions, a
 //! take's head) is the replay's, not this file's (`agentfs_model::calls::replay`,
@@ -11,7 +11,6 @@ use crate::engine_names::EngineNames;
 use crate::git_history::{Commit, Git, Version, content, decisions, descends};
 use agentfs_model::calls::{Caller, Recorded, RecordedCall, Took, TreeCalls, TreeId};
 use agentfs_model::check::save_aligned;
-use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
@@ -20,9 +19,11 @@ use std::path::Path;
 struct OracleTree {
     names: BTreeMap<String, u64>,
     bytes: BTreeMap<u64, Vec<u8>>,
-    /// The real object number behind each of this oracle's objects: bound only so
-    /// an open follows its file through a reload.
-    bound: BTreeMap<u64, u64>,
+    /// Each path's file identity at the tree's head after the last call: how
+    /// an open follows its file through a take, by Linux's rules and the
+    /// engine's (git-model §7): a file that stays keeps its object, and one a
+    /// take brings is on an object no open holds.
+    identities: BTreeMap<String, u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -103,78 +104,40 @@ impl Invariants {
         Ok(c)
     }
 
-    /// Tree `t`'s object behind each file identity, from its table in git. A
-    /// commit's own numbers are those of the tree that wrote it: a fast-forward
-    /// leaves a sandbox on the root's commit, its objects still its own.
-    fn object_table(&self, t: TreeId) -> Result<BTreeMap<u64, u64>, String> {
-        let tree = self.names.name(t).map_err(|e| e.to_string())?;
-        let oid = self.git.run(&[
-            "for-each-ref",
-            "--format=%(objectname)",
-            &format!("refs/agentfs/objects/{tree}"),
-        ])?;
-        if oid.trim().is_empty() {
-            return Ok(BTreeMap::new());
-        }
-        let blob = self.git.run(&["cat-file", "blob", oid.trim()])?;
-        let table: Value = serde_json::from_str(&blob).map_err(|e| e.to_string())?;
-        table["files"]
-            .as_object()
-            .ok_or("the object table is not a map")?
-            .iter()
-            .map(|(id, object)| {
-                Ok((
-                    id.parse().map_err(|_| "bad file identity")?,
-                    object.as_u64().ok_or("bad object")?,
-                ))
-            })
-            .collect()
-    }
-
     /// The oracle takes tree `t` from git: only a take changes a tree by rules
-    /// this oracle does not know.
+    /// this oracle does not know. A file whose identity the tree held keeps
+    /// this oracle's object; any other gets a new one.
     fn reload(&mut self, t: TreeId) -> Result<(), String> {
         let head = self.head(t)?;
-        let table = self.object_table(t)?;
-        let mut held = BTreeSet::new();
-        for map in head.maps.values() {
-            let real = table.get(&map.identity).copied().unwrap_or(map.object);
-            if !held.insert(real) {
-                return Err(format!(
-                    "one_object_one_file: {t:?}'s object {real} holds two files"
-                ));
-            }
-        }
-        let mut objects: BTreeMap<u64, u64> = BTreeMap::new();
         let tree = self.trees.entry(t).or_default();
-        for (own, real) in &tree.bound {
-            objects.insert(*real, *own);
-        }
+        let held: BTreeMap<u64, u64> = tree
+            .names
+            .iter()
+            .filter_map(|(path, own)| Some((*tree.identities.get(path)?, *own)))
+            .collect();
         tree.names.clear();
         for map in head.maps.values() {
-            let real = table.get(&map.identity).copied().unwrap_or(map.object);
-            let own = *objects.entry(real).or_insert_with(|| {
-                self.next_object += 1;
-                self.next_object
-            });
+            let own = match held.get(&map.identity) {
+                Some(own) => *own,
+                None => {
+                    self.next_object += 1;
+                    self.next_object
+                }
+            };
             tree.names.insert(map.path.clone(), own);
             tree.bytes
                 .insert(own, head.files.get(&map.path).cloned().unwrap_or_default());
-            tree.bound.insert(own, real);
         }
+        tree.identities = Self::identities(&head);
         Ok(())
     }
 
-    /// Bind a file this oracle just made to its real object number.
-    fn bind(&mut self, t: TreeId, path: &str, own: u64) -> Result<(), String> {
-        let head = self.head(t)?;
-        let table = self.object_table(t)?;
-        let tree = self.trees.entry(t).or_default();
-        if let Some(map) = head.maps.values().find(|m| m.path == path) {
-            let real = table.get(&map.identity).copied().unwrap_or(map.object);
-            tree.bound.insert(own, real);
-        }
-        Ok(())
+    /// Each path's file identity in `head`.
+    fn identities(head: &Commit) -> BTreeMap<String, u64> {
+        head.maps
+            .values()
+            .map(|map| (map.path.clone(), map.identity))
+            .collect()
     }
 
     fn close_in_oracle(&mut self, h: u64) -> Result<(), String> {
@@ -252,7 +215,6 @@ impl Invariants {
                 let t = self.trees.entry(tree).or_default();
                 t.names.insert(path.clone(), own);
                 t.bytes.insert(own, Vec::new());
-                self.bind(tree, path, own)?;
                 self.opened(caller, path, *h, Vec::new())?;
             }
             RecordedCall::OpenGone { .. } => {}
@@ -571,6 +533,9 @@ impl Invariants {
             let head = self.head(id)?;
             Self::lines_whole(id, &head)?;
             self.bytes_match(t, id, &head)?;
+            if let Some(tree) = self.trees.get_mut(&id) {
+                tree.identities = Self::identities(&head);
+            }
         }
         if matches!(r.call, RecordedCall::Take { .. } | RecordedCall::Crash) {
             self.drained(t)?;

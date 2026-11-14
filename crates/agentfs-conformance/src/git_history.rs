@@ -1,8 +1,10 @@
 //! The engine's history as a replay reads it, from its bare repository (VERIFYING.md,
 //! "The model as the conformance suite"): one long-lived `git cat-file`, this
-//! crate's own parse of each commit's `metadata.json` and `namespace.json`, and
+//! crate's own reader of each commit's layout (docs/trees.md, "What a commit
+//! holds": `files/`, `lines/` and `names/` under two hashed folders), and
 //! [`EngineHistory`], the collisions and heads a replay compares. Never the
-//! library's bookkeeping (`tree_actor`).
+//! library's bookkeeping (`tree_actor`): the folders are hashed here with `git
+//! hash-object`, not the library's code.
 
 use crate::engine_names::EngineNames;
 use agentfs_model::calls::{CallError, History, ShownCollision, TreeId, gather_collisions};
@@ -17,7 +19,6 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 #[derive(Clone, Debug)]
 pub(crate) struct FileMap {
     pub(crate) path: String,
-    pub(crate) object: u64,
     pub(crate) identity: u64,
     pub(crate) lines: Vec<(String, String, Option<Vec<u8>>)>,
     pub(crate) ancestors: BTreeMap<String, Option<String>>,
@@ -134,6 +135,8 @@ pub(crate) struct Git {
     child: Child,
     input: ChildStdin,
     output: BufReader<ChildStdout>,
+    /// Each name's two hashed folders, once asked of `git hash-object`.
+    folders: BTreeMap<String, String>,
 }
 
 impl Git {
@@ -153,6 +156,7 @@ impl Git {
             child,
             input,
             output,
+            folders: BTreeMap::new(),
         })
     }
 
@@ -210,34 +214,84 @@ impl Git {
         })
     }
 
+    /// `<aa>/<bb>`: hex digits 1-2 and 3-4 of `git hash-object --stdin` of
+    /// `name`, the folders the layout keeps it in.
+    fn folders(&mut self, name: &str) -> Result<String, String> {
+        if let Some(folders) = self.folders.get(name) {
+            return Ok(folders.clone());
+        }
+        let mut child = Command::new("git")
+            .args(["hash-object", "--stdin"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .map_err(|e| e.to_string())?;
+        child
+            .stdin
+            .take()
+            .ok_or("no stdin")?
+            .write_all(name.as_bytes())
+            .map_err(|e| e.to_string())?;
+        let out = child.wait_with_output().map_err(|e| e.to_string())?;
+        let hex = String::from_utf8(out.stdout).map_err(|e| e.to_string())?;
+        if !out.status.success() || hex.len() < 4 {
+            return Err(format!("git hash-object of {name:?}: {hex:?}"));
+        }
+        let folders = format!("{}/{}", &hex[..2], &hex[2..4]);
+        self.folders.insert(name.to_owned(), folders.clone());
+        Ok(folders)
+    }
+
+    /// Every blob under `top/` of commit `oid`: its name and object. A blob
+    /// outside the folders its name hashes to is a layout the engine never
+    /// writes.
+    fn leaves(&mut self, oid: &str, top: &str) -> Result<Vec<(String, String)>, String> {
+        let listing = self.run(&[
+            "ls-tree",
+            "-r",
+            "-z",
+            "--full-tree",
+            oid,
+            &format!("{top}/"),
+        ])?;
+        let mut leaves = Vec::new();
+        for record in listing.split_terminator('\0') {
+            let (meta, path) = record.split_once('\t').ok_or_else(|| record.to_owned())?;
+            let blob = meta.rsplit(' ').next().ok_or_else(|| record.to_owned())?;
+            let mut parts = path.splitn(4, '/');
+            let (Some(_), Some(aa), Some(bb), Some(name)) =
+                (parts.next(), parts.next(), parts.next(), parts.next())
+            else {
+                return Err(format!("{oid:.7}: {path} is not {top}/<aa>/<bb>/<name>"));
+            };
+            if self.folders(name)? != format!("{aa}/{bb}") {
+                return Err(format!("{oid:.7}: {path} is not in its name's folders"));
+            }
+            leaves.push((name.to_owned(), blob.to_owned()));
+        }
+        Ok(leaves)
+    }
+
     pub(crate) fn commit(&mut self, oid: &str) -> Result<Commit, String> {
         let header = self.header(oid)?;
-        let mut files = BTreeMap::new();
-        for line in self
-            .run(&["ls-tree", "-r", "--full-tree", oid, "files/"])?
-            .lines()
-        {
-            let (meta, path) = line.split_once('\t').ok_or_else(|| line.to_owned())?;
-            let blob = meta.rsplit(' ').next().ok_or_else(|| line.to_owned())?;
-            let name = path.strip_prefix("files/").unwrap_or(path).to_owned();
-            files.insert(name, self.object(blob)?);
+        // The root commit has no envelope and its files are at the top.
+        if header.trailers("Agentfs-Format").is_empty() {
+            let mut files = BTreeMap::new();
+            for line in self.run(&["ls-tree", "-r", "--full-tree", oid])?.lines() {
+                let (meta, path) = line.split_once('\t').ok_or_else(|| line.to_owned())?;
+                let blob = meta.rsplit(' ').next().ok_or_else(|| line.to_owned())?;
+                files.insert(path.to_owned(), self.object(blob)?);
+            }
+            return Ok(Commit { files, ..header });
         }
-        let mut commit = Commit { files, ..header };
-        // The root commit has no envelope.
-        if commit.trailers("Agentfs-Format").is_empty() {
-            return Ok(commit);
+        let mut commit = header;
+        for (name, blob) in self.leaves(oid, "files")? {
+            let bytes = self.object(&blob)?;
+            commit.files.insert(name, bytes);
         }
-        let metadata: Value =
-            serde_json::from_slice(&self.object(&format!("{oid}:metadata.json"))?)
-                .map_err(|e| e.to_string())?;
-        for (path, entry) in metadata.as_object().ok_or("metadata is not a map")? {
-            let map = parse_map(path, entry).map_err(|e| format!("{oid} {path}: {e}"))?;
-            commit.maps.insert(map.identity, map);
-        }
-        let namespace: Value =
-            serde_json::from_slice(&self.object(&format!("{oid}:namespace.json"))?)
-                .map_err(|e| e.to_string())?;
-        for (file, history) in namespace.as_object().ok_or("namespace is not a map")? {
+        for (file, blob) in self.leaves(oid, "names")? {
+            let history: Value =
+                serde_json::from_slice(&self.object(&blob)?).map_err(|e| e.to_string())?;
             let file: u64 = file.parse().map_err(|_| "bad file identity")?;
             let head = history["head"].as_u64().ok_or("bad name head")?;
             let mut versions = BTreeMap::new();
@@ -252,6 +306,18 @@ impl Git {
             }
             commit.names.insert(file, (head, versions));
         }
+        for (path, blob) in self.leaves(oid, "lines")? {
+            let entry: Value =
+                serde_json::from_slice(&self.object(&blob)?).map_err(|e| e.to_string())?;
+            let map = parse_map(&path, &entry).map_err(|e| format!("{oid} {path}: {e}"))?;
+            if commit.name_path(map.identity) != Some(path.as_str()) {
+                return Err(format!(
+                    "{oid:.7}: lines of {path} name file {}, whose name is elsewhere",
+                    map.identity
+                ));
+            }
+            commit.maps.insert(map.identity, map);
+        }
         Ok(commit)
     }
 }
@@ -263,10 +329,10 @@ impl Drop for Git {
     }
 }
 
+/// A `lines/` entry: `[identity, line map]`.
 pub(crate) fn parse_map(path: &str, entry: &Value) -> Result<FileMap, String> {
-    let object = entry[0].as_u64().ok_or("bad object")?;
-    let identity = entry[1].as_u64().ok_or("bad identity")?;
-    let map = &entry[2];
+    let identity = entry[0].as_u64().ok_or("bad identity")?;
+    let map = &entry[1];
     let mut lines = Vec::new();
     for l in map["lines"].as_array().ok_or("bad lines")? {
         let bytes = match &l["bytes"] {
@@ -294,7 +360,6 @@ pub(crate) fn parse_map(path: &str, entry: &Value) -> Result<FileMap, String> {
     }
     Ok(FileMap {
         path: path.to_owned(),
-        object,
         identity,
         lines,
         ancestors,
@@ -502,7 +567,9 @@ pub(crate) mod tests {
             lines: Option<&[&str]>,
             extra: &str,
         ) -> String {
-            let (metadata, namespace) = match lines {
+            // File 1 at `a` (`git hash-object` gives 2e65...), its name history
+            // at `1` (56a6...).
+            let (map, history) = match lines {
                 Some(lines) => {
                     let lines: Vec<String> = lines
                         .iter()
@@ -511,28 +578,35 @@ pub(crate) mod tests {
                         })
                         .collect();
                     (
-                        format!(
-                            r#"{{"a":[1,1,{{"lines":[{}],"ancestors":{{}}}}]}}"#,
+                        Some(format!(
+                            r#"[1,{{"lines":[{}],"ancestors":{{}}}}]"#,
                             lines.join(",")
-                        ),
-                        r#"{"1":{"head":1,"versions":{"1":{"path":"a","over":null}}}}"#.to_owned(),
+                        )),
+                        r#"{"head":1,"versions":{"1":{"path":"a","over":null}}}"#.to_owned(),
                     )
                 }
                 None => (
-                    "{}".to_owned(),
-                    r#"{"1":{"head":2,"versions":{"2":{"path":null,"over":1}}}}"#.to_owned(),
+                    None,
+                    r#"{"head":2,"versions":{"2":{"path":null,"over":1}}}"#.to_owned(),
                 ),
             };
             let blob = |text: &str| self.git(&["hash-object", "-w", "--stdin"], text.as_bytes());
-            let tree = self.git(
-                &["mktree"],
+            let folder = |name: &str, entry: &str| {
+                self.git(&["mktree"], format!("{entry}\t{name}\n").as_bytes())
+            };
+            let hashed = |top: &str, aa: &str, bb: &str, leaf: &str, text: &str| {
+                let leaf = folder(leaf, &format!("100644 blob {}", blob(text)));
+                let bb = folder(bb, &format!("040000 tree {leaf}"));
                 format!(
-                    "100644 blob {}\tmetadata.json\n100644 blob {}\tnamespace.json\n",
-                    blob(&metadata),
-                    blob(&namespace)
+                    "040000 tree {}\t{top}\n",
+                    folder(aa, &format!("040000 tree {bb}"))
                 )
-                .as_bytes(),
-            );
+            };
+            let mut listing = hashed("names", "56", "a6", "1", &history);
+            if let Some(map) = &map {
+                listing.push_str(&hashed("lines", "2e", "65", "a", map));
+            }
+            let tree = self.git(&["mktree"], listing.as_bytes());
             let mut args = vec!["commit-tree", tree.as_str()];
             for parent in parents {
                 args.extend(["-p", parent]);

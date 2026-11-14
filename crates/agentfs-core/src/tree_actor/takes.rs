@@ -87,7 +87,12 @@ pub(in crate::tree_actor) fn decide(
         return Ok(None);
     }
     let open = &inputs.held;
-    let mine = history::tree_snapshot(snapshot.repo(), snapshot.pointers(), tree)?;
+    let mine = history::tree_snapshot(
+        snapshot.repo(),
+        snapshot.pointers(),
+        snapshot.objects(tree),
+        tree,
+    )?;
     let mut plans = Vec::new();
     let mut cuts = Vec::new();
     let planning = Timer::start(Which::QueuePlan);
@@ -378,7 +383,6 @@ impl TreeActor {
         let event = EventNumber::new(seq);
         let landing = tree.is_root();
         let mut pointers = Vec::new();
-        let moved = !matches!(take.head, TakeHead::Stay);
         match &take.head {
             TakeHead::FastForward { to } => {
                 pointers.push(self.change(refs::branch(tree), Some(Target::Oid(to.clone()))));
@@ -400,12 +404,6 @@ impl TreeActor {
             if self.pointers.get(&name).is_none() {
                 pointers.push(self.change(name, Some(Target::Oid(incoming.to_string()))));
             }
-        }
-        if moved {
-            pointers.push(self.change(
-                refs::object_table(tree),
-                Some(Target::Step(RecordNo::new(seq))),
-            ));
         }
         let mut enqueued = 0;
         if landing {

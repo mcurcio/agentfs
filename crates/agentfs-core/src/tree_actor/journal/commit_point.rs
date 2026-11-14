@@ -85,6 +85,11 @@ impl TreeActor {
                 upstreams: self.upstreams.to_text(),
                 opens,
                 page_saved: self.pages_saved_through(),
+                objects: snapshot
+                    .all_objects()
+                    .into_iter()
+                    .map(|(tree, objects)| (tree.to_string(), objects))
+                    .collect(),
             },
         };
         let (handles, pages) = (&self.handles, &self.pages);

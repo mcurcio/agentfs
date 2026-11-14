@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use agentfs_core::tree_actor::{TreeActor, TreeId};
-use trees::{new_actor, reopen, writer};
+use trees::{checkout, new_actor, reopen, writer};
 
 #[path = "support/trees.rs"]
 mod trees;
@@ -558,14 +558,14 @@ fn a_mapped_write_after_a_close_survives_the_build() {
     assert_eq!(k.saved(), b"12cdefgh");
     k.v.settle().unwrap();
     assert_eq!(
-        std::fs::read(tmp.path().join("trees/root").join(PATH)).unwrap(),
+        std::fs::read(checkout(tmp.path(), "root", PATH)).unwrap(),
         b"12cdefgh",
         "the build applied the piece the close saved"
     );
     k.close(b);
     k.v.settle().unwrap();
     assert_eq!(
-        std::fs::read(tmp.path().join("trees/root").join(PATH)).unwrap(),
+        std::fs::read(checkout(tmp.path(), "root", PATH)).unwrap(),
         b"12cdefgh"
     );
 }

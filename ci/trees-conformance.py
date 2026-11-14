@@ -16,6 +16,9 @@ import tempfile
 import time
 import traceback
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from tree_git_read import fanned  # noqa: E402
+
 MAIN, FORK, REPO = map(Path, sys.argv[1:4])
 ROOT_REF = "refs/heads/root"
 FORK_REF = "refs/heads/" + sys.argv[4]
@@ -47,7 +50,7 @@ def until(description, predicate):
 def bytes_at(ref, name):
     commit = git("rev-parse", f"{ref}^{{commit}}").strip().decode()
     message = git("show", "-s", "--format=%B", commit).decode()
-    path = f"files/{name}" if "Agentfs-Format: envelope-1" in message.splitlines() else name
+    path = f"files/{fanned(name)}" if "Agentfs-Format: envelope-1" in message.splitlines() else name
     return git("show", f"{commit}:{path}")
 
 
@@ -206,13 +209,13 @@ def assert_aligned(commit, name):
             probe = subprocess.run(["git", "--git-dir=" + str(REPO), "cat-file", "-e", f"{rev}:{name}"], stderr=subprocess.DEVNULL)
             assert probe.returncode != 0, (rev, name, "legacy file has no map")
             return {"lines": [], "ancestors": {}}, b""
-        metadata = json.loads(git("show", f"{rev}:metadata.json"))
-        if name not in metadata:
+        has_map = subprocess.run(["git", "--git-dir=" + str(REPO), "cat-file", "-e", f"{rev}:lines/{fanned(name)}"], stderr=subprocess.DEVNULL)
+        if has_map.returncode != 0:
             assert creation_allowed
-            probe = subprocess.run(["git", "--git-dir=" + str(REPO), "cat-file", "-e", f"{rev}:files/{name}"], stderr=subprocess.DEVNULL)
-            assert probe.returncode != 0, (rev, name, "file missing metadata")
+            probe = subprocess.run(["git", "--git-dir=" + str(REPO), "cat-file", "-e", f"{rev}:files/{fanned(name)}"], stderr=subprocess.DEVNULL)
+            assert probe.returncode != 0, (rev, name, "file missing its line map")
             return {"lines": [], "ancestors": {}}, b""
-        line_map = metadata[name][2]
+        line_map = json.loads(git("show", f"{rev}:lines/{fanned(name)}"))[1]
         lines = line_map["lines"]
         ids = [line["identity"] for line in lines]
         versions = [line["version"] for line in lines]
@@ -425,7 +428,7 @@ def finding_32():
         "finding 32 bytes differ from model", bytes_at(commit, "finding32"), model["root"])
     message = git("show", "-s", "--format=%B", commit).decode().splitlines()
     assert "Agentfs-Format: envelope-1" in message
-    lines = json.loads(git("show", f"{commit}:metadata.json"))["finding32"][2]["lines"]
+    lines = json.loads(git("show", f"{commit}:lines/{fanned('finding32')}"))[1]["lines"]
     live = [bytes(line["bytes"]) for line in lines if line["bytes"] is not None]
     assert all(line.endswith(b"\n") for line in live[:-1]), (
         "finding 32: an unfinished line precedes another line", live, bytes_at(commit, "finding32"))

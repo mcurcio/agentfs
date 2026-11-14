@@ -13,7 +13,7 @@ use git2::Oid;
 
 use super::super::TreeId;
 use super::super::journal::durable::RecordNo;
-use super::refs;
+use super::{Objects, refs};
 use crate::tree_actor::pointers::Pointers;
 use crate::tree_actor::tree::EventNumber;
 use crate::tree_git::TreeGit;
@@ -130,6 +130,8 @@ pub(in crate::tree_actor) struct State {
     pub(in crate::tree_actor) pointers: Arc<Pointers>,
     /// Each direct save's commit, by its step: what a sync asks of a save.
     pub(in crate::tree_actor) owners: Arc<BTreeMap<EventNumber, Oid>>,
+    /// Each tree's object numbers as built.
+    pub(in crate::tree_actor) objects: Arc<BuiltObjects>,
     pub(in crate::tree_actor) failed: Option<BuildError>,
     /// The request count the failed batch started at: a wait asked after it
     /// waits for the retry.
@@ -163,7 +165,11 @@ pub struct BuiltSnapshot {
     at: RecordNo,
     pointers: Arc<Pointers>,
     owners: Arc<BTreeMap<EventNumber, Oid>>,
+    objects: Arc<BuiltObjects>,
 }
+
+/// Every tree's object numbers at one built point.
+pub(in crate::tree_actor) type BuiltObjects = BTreeMap<TreeId, Arc<Objects>>;
 
 impl BuiltSnapshot {
     /// The built point this snapshot is at.
@@ -197,6 +203,20 @@ impl BuiltSnapshot {
         &self.owners
     }
 
+    /// `tree`'s object numbers as built; none for a tree not built.
+    pub(in crate::tree_actor) fn objects(&self, tree: TreeId) -> &Objects {
+        static NONE: Objects = Objects::new();
+        self.objects.get(&tree).map_or(&NONE, |o| o)
+    }
+
+    /// Every tree's object numbers as built.
+    pub(in crate::tree_actor) fn all_objects(&self) -> BTreeMap<TreeId, Objects> {
+        self.objects
+            .iter()
+            .map(|(tree, objects)| (*tree, (**objects).clone()))
+            .collect()
+    }
+
     /// `tree`'s queue as built: each entry's ref and commit, in queue order.
     pub(in crate::tree_actor) fn queue(&self, tree: TreeId) -> Vec<(String, Oid)> {
         self.pointers.under(&refs::queue(tree))
@@ -217,6 +237,7 @@ impl History {
         built: RecordNo,
         pointers: Pointers,
         owners: BTreeMap<EventNumber, Oid>,
+        objects: BuiltObjects,
     ) -> Self {
         Self {
             inner: Arc::new(Inner {
@@ -225,6 +246,7 @@ impl History {
                     built,
                     pointers: Arc::new(pointers),
                     owners: Arc::new(owners),
+                    objects: Arc::new(objects),
                     failed: None,
                     failed_at: 0,
                     wanted: built,
@@ -318,6 +340,7 @@ impl History {
         through: RecordNo,
         pointers: Pointers,
         owners: BTreeMap<EventNumber, Oid>,
+        objects: Arc<BuiltObjects>,
         elapsed: Duration,
     ) {
         let mut state = self.state();
@@ -325,6 +348,7 @@ impl History {
         state.built = state.built.max(through);
         state.pointers = Arc::new(pointers);
         state.owners = Arc::new(owners);
+        state.objects = objects;
         state.failed = None;
         while state
             .unbuilt
@@ -460,6 +484,7 @@ impl History {
             at: state.built,
             pointers: Arc::clone(&state.pointers),
             owners: Arc::clone(&state.owners),
+            objects: Arc::clone(&state.objects),
         }
     }
 

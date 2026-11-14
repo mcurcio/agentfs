@@ -159,16 +159,38 @@ serves, and dropping the last `Recording` makes every record durable and builds 
 built: call it before reading Git. `TreeActor::head` settles first. Each recorded call names
 its writer as a `WriterAt` (the writer and its pod context). `write_open`, `write`,
 `truncate` and `close` are the recorded calls. Upstream and fork
-share one bare repository. A commit stores the files under `files/`, line maps in
-`metadata.json` and name versions in `namespace.json` (`Agentfs-Format:
-envelope-1`). Merge identity is separate from an open object's identity. See
-[library/core.md](library/core.md).
+share one bare repository. Merge identity is separate from an open object's
+identity. See [library/core.md](library/core.md).
+
+## What a commit holds
+
+Each commit (`Agentfs-Format: envelope-1`) keeps three entries per file, in two
+levels of hashed folders:
+
+```text
+files/<aa>/<bb>/<name>   the file's bytes
+lines/<aa>/<bb>/<name>   JSON [identity, line map]
+names/<cc>/<dd>/<id>     JSON name history of one file identity, ended files included
+```
+
+`aa` and `bb` are hex digits 1-2 and 3-4 of `git hash-object --stdin` of the
+name's bytes; `cc` and `dd` the same of the identity in decimal. The folders are
+fixed (256 by 256), so a file's path never changes when files come or go, and a
+commit that changes one file rewrites only the folders on its three paths: the
+builder's cost per save is the same at 100 files and at 100,000. `git log --
+files/2e/65/a` is the history of a file named `a` (`printf a | git hash-object
+--stdin` starts `2e65`). Each tree's private checkout (`trees/<tree>/` in the
+state area) mirrors `files/`: `trees/root/2e/65/a`.
+
+Object numbers (which file an open handle writes to) are not in history. They are
+the journal's: a checkpoint holds each tree's objects as of its built point, and
+the steps after it move them.
 
 ## The journal
 
 Every step (a create, a link, a close that saves, a rename, an unlink, a fork, a
 take) is one record in `calls.wal`: the change itself and the pointer changes its
-build publishes (branch moves, queue entries, collision refs, object tables), each
+build publishes (branch moves, queue entries, collision refs), each
 value an oid or "what step `n`'s build gives". It is appended as a call is and made
 durable as a call is. That record is the commit point. The actor decides the step,
 appends it and applies it to the saved state the views serve; it runs no git.

@@ -20,22 +20,26 @@ use agentfs_contracts::pod::{PodContext, WriterAt};
 use agentfs_contracts::volume::VolumeIdentity;
 use git2::Oid;
 
+use super::built::BuiltObjects;
 use super::built::{BuildError, History};
 use super::built_log::{BuiltEntry, BuiltLog, BuiltValue};
 use super::feed::{CommitSpec, Feed, Parent};
 use super::format::{self, BlobRef};
 use super::message::{self, Action, Message};
 use super::upstreams::Upstreams;
-use super::{checkout, object_table, refs};
+use super::{Objects, checkout, objects_of, refs};
 use crate::tree_actor::journal::durable::{Durability, RecordNo};
 use crate::tree_actor::journal::{
     Change, Entry, Frame, Record, SaveOutcome, TakeHead, TakeRecord, Target, frame_at,
     runs_from_frame, salt_of,
 };
 use crate::tree_actor::pointers::Pointers;
+use crate::tree_actor::queue::Key;
 use crate::tree_actor::recording::{Call, changed_bytes, pages};
 use crate::tree_actor::stages::{Timer, Which};
-use crate::tree_actor::tree::{EventNumber, FileBytes, NameHistory, Tree, Versions};
+use crate::tree_actor::tree::{
+    EventNumber, FileBytes, MergeFileIdentity, NameHistory, Tree, Versions,
+};
 use crate::tree_actor::{Error, Result, TreeId, referee};
 use crate::tree_git::{RefUpdate, TreeGit};
 
@@ -141,8 +145,10 @@ pub(in crate::tree_actor) struct BuildState {
     /// Each step's head, for a later record naming it (`Target::Step`).
     heads: BTreeMap<RecordNo, Parent>,
     /// Trees whose head's tree is not known to match the built tree (after a
-    /// fast-forward, or at start): the next commit lists the whole tree.
+    /// fast-forward): the next commit lists the whole tree.
     whole: BTreeSet<TreeId>,
+    /// Each tree's object numbers as built, as History publishes them.
+    objects: BTreeMap<TreeId, Arc<Objects>>,
 }
 
 /// One batch's packer and what it fed.
@@ -157,6 +163,8 @@ struct Batch<'a> {
     /// The last commit each `refs/build/<tree>` got.
     scratch: BTreeMap<TreeId, u64>,
     forked: bool,
+    /// Trees whose names or objects a step moved.
+    moved: BTreeSet<TreeId>,
 }
 
 impl Batch<'_> {
@@ -227,6 +235,10 @@ impl BuildState {
         heads: BTreeMap<RecordNo, Oid>,
     ) -> Result<Self> {
         let mut trees = trees;
+        let objects = trees
+            .iter()
+            .map(|(id, tree)| Ok((*id, Arc::new(objects_of(&tree.shape)?))))
+            .collect::<Result<_>>()?;
         for folded in opens.values() {
             if folded.open.anonymous {
                 trees
@@ -235,7 +247,6 @@ impl BuildState {
                     .add_anonymous(folded.open.object);
             }
         }
-        let whole = trees.keys().copied().collect();
         Ok(Self {
             trees,
             pointers: Pointers::new(
@@ -267,7 +278,8 @@ impl BuildState {
                 .into_iter()
                 .map(|(step, oid)| (step, Parent::Built(oid)))
                 .collect(),
-            whole,
+            whole: BTreeSet::new(),
+            objects,
         })
     }
 
@@ -334,27 +346,32 @@ impl BuildState {
         self.pages.entry((tree, object)).or_default();
     }
 
-    /// A direct save's commit of `after` over the tree's head.
-    fn commit_direct(
+    /// A commit of the tree as it now is over `parents`: the edits of the
+    /// paths and identities in `changed`, or the whole tree after a move the
+    /// built tree is not known to match.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the commit's parts, passed through"
+    )]
+    fn commit(
         &mut self,
         tree: TreeId,
-        after: &Tree,
+        parents: &[Parent],
+        changed: &BTreeSet<Key>,
         message: &str,
         at_ns: u64,
         batch: &mut Batch<'_>,
     ) -> Result<Parent> {
-        let parent = self.head(tree)?;
-        let before = if self.whole.remove(&tree) {
-            None
-        } else {
-            Some(self.tree(tree)?)
-        };
-        let edits = format::edits(before, after, |bytes| batch.blob(bytes))?;
+        let whole = self.whole.remove(&tree);
+        let after = self.trees.get(&tree).ok_or(Error::Format)?;
+        let edits = format::edits(after, (!whole).then_some(changed), |bytes| {
+            batch.blob(bytes)
+        })?;
         let mark = batch
             .feed()?
             .commit(&CommitSpec {
                 tree,
-                parents: &[parent],
+                parents,
                 at_ns,
                 message,
                 edits: &edits,
@@ -364,6 +381,25 @@ impl BuildState {
         Ok(Parent::Mark(mark))
     }
 
+    /// A direct step's commit over the tree's head.
+    fn commit_direct(
+        &mut self,
+        tree: TreeId,
+        changed: &BTreeSet<Key>,
+        message: &str,
+        at_ns: u64,
+        batch: &mut Batch<'_>,
+    ) -> Result<Parent> {
+        let parent = self.head(tree)?;
+        self.commit(tree, &[parent], changed, message, at_ns, batch)
+    }
+
+    fn tree_mut(&mut self, tree: TreeId) -> Result<&mut Tree> {
+        self.trees.get_mut(&tree).ok_or(Error::Format)
+    }
+
+    /// One step, applied to the built trees in place: a failed batch drops
+    /// the copy it built on.
     #[allow(
         clippy::too_many_lines,
         reason = "one arm per kind of step, as the record has"
@@ -392,37 +428,34 @@ impl BuildState {
         // The commit this step makes or moves its tree's head to.
         let mut head: Option<Parent> = None;
         let mut owner = false;
-        let mut target_tree: Option<TreeId> = None;
         match change {
             Change::Create { tree, path } => {
                 let id = tree.parse::<TreeId>()?;
-                let mut t = self.tree(id)?.clone();
-                t.shape.apply(change, event)?;
+                let t = self.tree_mut(id)?;
+                let keys = t.shape.apply(change, event)?;
                 let object = event.object();
                 t.bytes.insert(object, Arc::default());
                 t.lines.insert(object, Arc::default());
-                let identity = t.identities[&object];
+                let identity = *t.identities.get(&object).ok_or(Error::Format)?;
                 t.namespace
                     .insert(identity, NameHistory::created(event, path.clone()));
                 let message = direct(Action::Create, id, None)?;
-                head = Some(self.commit_direct(id, &t, &message, record.at_ns, batch)?);
-                self.trees.insert(id, t);
+                head = Some(self.commit_direct(id, &keys, &message, record.at_ns, batch)?);
                 self.opened(seq, id, object);
                 owner = true;
-                target_tree = Some(id);
+                batch.moved.insert(id);
             }
             Change::Link { tree, object, path } => {
                 let id = tree.parse::<TreeId>()?;
-                let mut t = self.tree(id)?.clone();
-                t.shape.apply(change, event)?;
+                let t = self.tree_mut(id)?;
+                let keys = t.shape.apply(change, event)?;
                 let identity = *t.identities.get(object).ok_or_else(|| disagrees(seq))?;
                 t.namespace
                     .insert(identity, NameHistory::created(event, path.clone()));
                 let message = direct(Action::Create, id, None)?;
-                head = Some(self.commit_direct(id, &t, &message, record.at_ns, batch)?);
-                self.trees.insert(id, t);
+                head = Some(self.commit_direct(id, &keys, &message, record.at_ns, batch)?);
                 owner = true;
-                target_tree = Some(id);
+                batch.moved.insert(id);
             }
             Change::Save {
                 tree,
@@ -435,8 +468,8 @@ impl BuildState {
                 if open.tree != id {
                     return Err(disagrees(seq));
                 }
-                let mut t = self.tree(id)?.clone();
-                t.shape.save(open.object, *outcome);
+                let t = self.trees.get_mut(&id).ok_or(Error::Format)?;
+                let keys = t.shape.save(open.object, *outcome);
                 match outcome {
                     SaveOutcome::AnonymousDropped => {
                         t.bytes.remove(&open.object);
@@ -483,7 +516,8 @@ impl BuildState {
                         t.lines.insert(open.object, Arc::new(lines));
                         t.bytes.insert(open.object, Arc::new(bytes.into()));
                         let message = direct(Action::Direct, id, Some(*handle))?;
-                        head = Some(self.commit_direct(id, &t, &message, record.at_ns, batch)?);
+                        head =
+                            Some(self.commit_direct(id, &keys, &message, record.at_ns, batch)?);
                         owner = true;
                     }
                 }
@@ -494,12 +528,10 @@ impl BuildState {
                 {
                     self.pages.remove(&(id, open.object));
                 }
-                self.trees.insert(id, t);
-                target_tree = Some(id);
             }
             Change::Rename { tree, from, to } => {
                 let id = tree.parse::<TreeId>()?;
-                let mut t = self.tree(id)?.clone();
+                let t = self.tree_mut(id)?;
                 let object = *t.names.get(from).ok_or_else(|| disagrees(seq))?;
                 let source = *t.identities.get(&object).ok_or_else(|| disagrees(seq))?;
                 match t.names.get(to).copied() {
@@ -532,28 +564,26 @@ impl BuildState {
                         );
                     }
                 }
-                t.shape.apply(change, event)?;
+                let keys = t.shape.apply(change, event)?;
                 let message = direct(Action::Rename, id, None)?;
-                head = Some(self.commit_direct(id, &t, &message, record.at_ns, batch)?);
-                self.trees.insert(id, t);
+                head = Some(self.commit_direct(id, &keys, &message, record.at_ns, batch)?);
                 owner = true;
-                target_tree = Some(id);
+                batch.moved.insert(id);
             }
             Change::Unlink { tree, path } => {
                 let id = tree.parse::<TreeId>()?;
-                let mut t = self.tree(id)?.clone();
+                let t = self.tree_mut(id)?;
                 let object = *t.names.get(path).ok_or_else(|| disagrees(seq))?;
                 let identity = *t.identities.get(&object).ok_or(Error::Format)?;
                 t.namespace
                     .get_mut(&identity)
                     .ok_or(Error::Format)?
                     .advance(event, None, None);
-                t.shape.apply(change, event)?;
+                let keys = t.shape.apply(change, event)?;
                 let message = direct(Action::Unlink, id, None)?;
-                head = Some(self.commit_direct(id, &t, &message, record.at_ns, batch)?);
-                self.trees.insert(id, t);
+                head = Some(self.commit_direct(id, &keys, &message, record.at_ns, batch)?);
                 owner = true;
-                target_tree = Some(id);
+                batch.moved.insert(id);
             }
             Change::Fork { upstream } => {
                 let upstream = upstream.parse::<TreeId>()?;
@@ -569,11 +599,12 @@ impl BuildState {
                 }
                 head = Some(self.head(upstream)?);
                 batch.forked = true;
+                batch.moved.insert(fork);
             }
             Change::Take { tree, take } => {
                 let id = tree.parse::<TreeId>()?;
                 head = self.take(id, seq, take, change, ctx, record.at_ns, batch)?;
-                target_tree = Some(id);
+                batch.moved.insert(id);
             }
         }
         if let Some(head) = head {
@@ -589,13 +620,7 @@ impl BuildState {
                     Oid::from_str(hex).map_err(|_| Error::Format)?,
                 )),
                 Some(Target::Step(step)) if *step == record.seq => {
-                    let value = match target_tree {
-                        Some(tree) if pointer.name == refs::object_table(tree) => {
-                            let blob = object_table(self.tree(tree)?)?;
-                            Parent::Mark(batch.feed()?.blob(&blob).map_err(build_error)?)
-                        }
-                        _ => head.ok_or_else(|| disagrees(seq))?,
-                    };
+                    let value = head.ok_or_else(|| disagrees(seq))?;
                     batch.values.push((*step, pointer.name.clone(), value));
                     Some(value)
                 }
@@ -648,7 +673,29 @@ impl BuildState {
         if *shape.names != *t.shape.names || shape.fresh_names != t.shape.fresh_names {
             return Err(disagrees(seq));
         }
+        // What the commit rewrites: each identity the take changed, and the
+        // paths it had and has.
+        let identities: BTreeSet<MergeFileIdentity> = take
+            .files
+            .iter()
+            .map(|(id, _)| *id)
+            .chain(take.names.iter().map(|(id, _)| *id))
+            .collect();
+        let mut changed = BTreeSet::new();
+        for tree in [current, &t] {
+            for (path, object) in tree.names.iter() {
+                if tree
+                    .identities
+                    .get(object)
+                    .is_some_and(|i| identities.contains(i))
+                {
+                    changed.insert(Key::Name(path.clone()));
+                }
+            }
+        }
+        changed.extend(identities.into_iter().map(Key::File));
         let parent = self.head(id)?;
+        self.trees.insert(id, t);
         let head = match &take.head {
             TakeHead::Stay => None,
             TakeHead::FastForward { to } => {
@@ -666,10 +713,10 @@ impl BuildState {
                     collisions: &take.collisions,
                 }
                 .render(ctx.identity)?;
-                Some(self.commit_whole(
+                Some(self.commit(
                     id,
-                    &t,
                     &[parent, Parent::Built(incoming)],
+                    &changed,
                     &message,
                     at_ns,
                     batch,
@@ -683,44 +730,17 @@ impl BuildState {
                     event,
                 }
                 .render(ctx.identity)?;
-                Some(self.commit_whole(
+                Some(self.commit(
                     id,
-                    &t,
                     &[parent, Parent::Built(target)],
+                    &changed,
                     &message,
                     at_ns,
                     batch,
                 )?)
             }
         };
-        self.trees.insert(id, t);
         Ok(head)
-    }
-
-    /// A merge's commit: the whole tree over its first parent's.
-    fn commit_whole(
-        &mut self,
-        tree: TreeId,
-        after: &Tree,
-        parents: &[Parent],
-        message: &str,
-        at_ns: u64,
-        batch: &mut Batch<'_>,
-    ) -> Result<Parent> {
-        self.whole.remove(&tree);
-        let edits = format::edits(None, after, |bytes| batch.blob(bytes))?;
-        let mark = batch
-            .feed()?
-            .commit(&CommitSpec {
-                tree,
-                parents,
-                at_ns,
-                message,
-                edits: &edits,
-            })
-            .map_err(build_error)?;
-        batch.scratch.insert(tree, mark);
-        Ok(Parent::Mark(mark))
     }
 
     /// Every mark replaced by its object, once the batch's pack is installed.
@@ -863,6 +883,7 @@ impl Builder {
             values: Vec::new(),
             scratch: BTreeMap::new(),
             forked: false,
+            moved: BTreeSet::new(),
         };
         for (record, tail) in &frames {
             next.apply(record, tail, &ctx, &mut batch)
@@ -876,6 +897,12 @@ impl Builder {
             None => BTreeMap::new(),
         };
         next.resolve(&marks).map_err(to_build_error)?;
+        for tree in &batch.moved {
+            let objects = objects_of(&next.tree(*tree).map_err(to_build_error)?.shape)
+                .map_err(to_build_error)?;
+            next.objects.insert(*tree, Arc::new(objects));
+        }
+        let objects: Arc<BuiltObjects> = Arc::new(next.objects.clone());
         for (bytes, mark) in batch.blobs.values() {
             if let Some(oid) = marks.get(mark) {
                 bytes.set_blob(*oid);
@@ -914,7 +941,7 @@ impl Builder {
             eprintln!("tree CopyStale: {e}");
         }
         self.history
-            .built_event(through, built, owners, started.elapsed());
+            .built_event(through, built, owners, objects, started.elapsed());
         Ok(())
     }
 

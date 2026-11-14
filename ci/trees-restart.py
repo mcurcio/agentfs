@@ -16,7 +16,7 @@ import sys
 import tempfile
 import time
 
-from tree_git_read import read
+from tree_git_read import fanned, read
 
 DEAD = (errno.ENOTCONN, errno.ECONNABORTED)
 SIZE = mmap.PAGESIZE
@@ -66,7 +66,7 @@ def linux_bytes():
 
 def saves_of(state, name):
     out = subprocess.check_output(["git", "--git-dir", str(state / "history.git"), "log",
-                                   "root", "--format=%s", "--", f"files/{name}"])
+                                   "root", "--format=%s", "--", f"files/{fanned(name)}"])
     return out.decode().splitlines()
 
 

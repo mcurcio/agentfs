@@ -430,7 +430,7 @@ Review provenance before behaviour. For every finding, name the ledger rule that
 validate this model. The scenario bodies assert on the model's internals, so they are not ported. **The model runs
 them unchanged and records each call plus what each tree showed (`src/calls.rs`); the same calls replay against the
 real library and real mounts (`crates/agentfs-conformance`); the real run must show the same, and passes invariants
-of its own.** Those read `git`, the crate's own parse of `metadata.json` and `namespace.json` and its own byte
+of its own.** Those read `git`, the crate's own reader of each commit's line maps and name histories and its own byte
 oracle, never the library's bookkeeping. Assertions reach the real system only through that equality, so only for
 what a trace's `Shown` exposes: each tree's files, and the lost lines of each collision, and for a take that took,
 its tree's head (`Agentfs-Cause` and the number of parents).

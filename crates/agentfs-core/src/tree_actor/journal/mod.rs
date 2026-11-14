@@ -46,7 +46,7 @@ pub(super) use commit_point::compact_at;
 use durable::{Durability, RecordNo};
 #[cfg(test)]
 pub(super) use fold::Folded;
-pub(super) use fold::{FoldedOpen, fold, runs_from_frame};
+pub(super) use fold::{FoldedOpen, fold, objects_through, runs_from_frame};
 
 const MAGIC: &[u8; 4] = b"AFJ3";
 const HEADER: usize = 44;
@@ -98,10 +98,13 @@ pub(super) enum Entry {
     /// The first frame only: what every record before `next` adds up to.
     /// `built` is the redo start, at most the built log's point: every pointer
     /// value is an oid as of it. `page_saved`: tree, object, saved_through.
+    /// `objects`: each tree's object of each named file, by identity, as of
+    /// `built`; the steps after it move them (git-model §3).
     Checkpoint {
         next: RecordNo,
         built: RecordNo,
         pointers: BTreeMap<String, String>,
+        objects: BTreeMap<String, BTreeMap<u64, u64>>,
         upstreams: BTreeMap<String, String>,
         opens: Vec<OpenRecord>,
         page_saved: Vec<(String, u64, u64)>,
@@ -714,6 +717,7 @@ mod tests {
                 upstreams: BTreeMap::new(),
                 opens: Vec::new(),
                 page_saved: Vec::new(),
+                objects: BTreeMap::new(),
             },
         }
     }

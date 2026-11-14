@@ -1,5 +1,5 @@
 //! Tree history: the builder that makes commits behind the call path, History that owns the
-//! store, snapshots read from commits, object tables and checkouts (target git-model §4, §5, §12;
+//! store, snapshots read from commits, and checkouts (target git-model §4, §5, §12;
 //! docs/trees.md, "History trails the files").
 
 pub(super) mod builder;
@@ -20,18 +20,31 @@ use std::path::Path;
 use std::sync::Arc;
 
 use git2::Oid;
-use serde::{Deserialize, Serialize};
 
 use super::pointers::Pointers;
 use super::stages::{Timer, Which};
-use super::tree::{EventNumber, MergeFileIdentity, Tree};
+use super::tree::{EventNumber, Shape, Tree};
 use super::{Error, Result, TreeId, referee};
 use crate::file_lock::FileLock;
 use crate::tree_git::TreeGit;
 
-#[derive(Serialize, Deserialize)]
-pub(in crate::tree_actor) struct ObjectTable {
-    pub(in crate::tree_actor) files: BTreeMap<MergeFileIdentity, u64>,
+/// One tree's object numbers: each named file's object, by its identity's
+/// number. The journal's, never history's (git-model §3): a checkpoint holds
+/// them as of its built point, and the steps after it move them.
+pub(in crate::tree_actor) type Objects = BTreeMap<u64, u64>;
+
+/// The object each named file of `shape` is on, by identity.
+pub(in crate::tree_actor) fn objects_of(shape: &Shape) -> Result<Objects> {
+    shape
+        .names
+        .values()
+        .map(|object| {
+            Ok((
+                shape.identities.get(object).ok_or(Error::Format)?.0,
+                *object,
+            ))
+        })
+        .collect()
 }
 
 // What is lost of any pointer's commit, tree and blobs refuses to serve. The
@@ -92,41 +105,19 @@ pub(in crate::tree_actor) fn open_store(git_dir: &Path, lease: Arc<FileLock>) ->
     Ok(TreeGit::open_with_lease(git_dir, lease)?)
 }
 
-/// A tree's object table as a blob: each named file's object, by identity.
-pub(in crate::tree_actor) fn object_table(tree: &Tree) -> Result<Vec<u8>> {
-    let files: BTreeMap<MergeFileIdentity, u64> = tree
-        .names
-        .values()
-        .map(|object| Ok((*tree.identities.get(object).ok_or(Error::Format)?, *object)))
-        .collect::<Result<_>>()?;
-    Ok(serde_json::to_vec(&ObjectTable { files })?)
-}
-
-/// Gives a snapshot's files the objects `tree`'s object table names.
-pub(in crate::tree_actor) fn restore_object_table(
-    repo: &TreeGit,
-    pointers: &Pointers,
-    tree: TreeId,
-    snapshot: &mut referee::Snapshot,
-) -> Result<()> {
-    if let Some(oid) = pointers.get(&refs::object_table(tree)) {
-        let table: ObjectTable = serde_json::from_slice(&repo.read_blob(oid)?)?;
-        for (id, file) in &mut snapshot.files {
-            file.object = *table.files.get(id).ok_or(Error::Format)?;
-        }
-    }
-    Ok(())
-}
-
-/// `tree`'s snapshot as built: its head's, with its object table's objects.
+/// `tree`'s snapshot as built: its head's, each file on the object
+/// `objects` gives it. A named file `objects` lacks is [`Error::Format`].
 pub(in crate::tree_actor) fn tree_snapshot(
     repo: &TreeGit,
     pointers: &Pointers,
+    objects: &Objects,
     tree: TreeId,
 ) -> Result<referee::Snapshot> {
     let head = pointers.get(&refs::branch(tree)).ok_or(Error::NotFound)?;
-    let mut snapshot = format::read_snapshot(repo, head)?;
-    restore_object_table(repo, pointers, tree, &mut snapshot)?;
+    let snapshot = format::read_snapshot(repo, head, objects)?;
+    if snapshot.files.keys().any(|id| !objects.contains_key(&id.0)) {
+        return Err(Error::Format);
+    }
     Ok(snapshot)
 }
 
@@ -134,11 +125,14 @@ pub(in crate::tree_actor) fn tree_snapshot(
 pub(in crate::tree_actor) fn read_trees(
     repo: &TreeGit,
     pointers: &Pointers,
+    objects: &BTreeMap<TreeId, Objects>,
 ) -> Result<BTreeMap<TreeId, Tree>> {
     let mut trees = BTreeMap::new();
+    let none = Objects::new();
     for id in refs::branches(pointers)?.into_keys() {
         let mut tree = Tree::default();
-        tree.install(tree_snapshot(repo, pointers, id)?)?;
+        let objects = objects.get(&id).unwrap_or(&none);
+        tree.install(tree_snapshot(repo, pointers, objects, id)?)?;
         trees.insert(id, tree);
     }
     if !trees.contains_key(&TreeId::Root) {

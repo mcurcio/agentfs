@@ -861,3 +861,42 @@ Not blocking; the suite is built and green. Findings about the brief and the doc
    drive `TreeActor` directly; `TreeActor::take_next` runs the same three parts with no lock to release);
    `the_gate_holds_only_its_tree` is the lag gate's unit test, not the page's view-level test of a tree's write and
    RELEASE passing a held create.
+
+## 2026-11-14, speed B4 (hashed sub-folders): the owned files, the builder's per-step clone, objects of other trees
+
+1. **The owned-files list is short.** Moving object numbers into the checkpoint needs `journal/mod.rs` (the
+   `Entry::Checkpoint` field lives there, not in `fold.rs`), `journal/commit_point.rs` (compaction writes it),
+   `history/built.rs` (`BuiltSnapshot::objects`, since takes and the actor's open read objects as built),
+   `history/take.rs`, `takes.rs` and `tree_actor/mod.rs` (the object table pointer, start-up, the format bump to
+   `agentfs-trees-7`). Tests outside the list read the layout (`tree_actor.rs`, `tree_line_rules.rs`,
+   `tree_pages.rs`, `support/trees.rs`), so do the conformance oracle (`invariants.rs`) and seven `ci/` scripts.
+   B3 was not running, so nothing collided.
+2. **The page's builder cost assumed what B2b did not do.** B2b's builder cloned the whole built tree for every
+   step (names, bytes, line maps, name histories: O(files) per step), which alone would miss the creates bar. Built:
+   steps apply in place on the batch's copy (`builder.rs`, more than "calls format only"); the per-batch copy and
+   the per-batch object map stay O(files) per batch.
+3. **`edits` takes keys, not `before`.** The frozen `edits(before, after, changed: &BTreeSet<u64>, blobs)` needs the
+   tree before the step beside the tree after, which is the clone of 2. Built: `edits(after, changed:
+   Option<&BTreeSet<queue::Key>>, blob)`, the keys each transition already returns (`Shape::apply`, `Shape::save`;
+   a take's from its record), `None` for the whole tree (after a fast-forward only; no longer at start).
+4. **`read_snapshot` of another tree's commit has no objects to read.** A landing gives a file new to the upstream
+   the incoming file's object, and a sync a file new to the fork the upstream's; both came from the commit. Built:
+   the writer tree's objects as built, else the identity's own number (the object its create made). It differs from
+   the old reading only when the writer's tree moved that file's object after the commit.
+5. **Start-up needs objects at the built log's point, past the checkpoint's.** Built: `fold::objects_through` reads
+   the trees at the checkpoint's pointers and replays each step's own transition to the built point: a second whole
+   snapshot read when the built point is past the checkpoint. Reopen of 600 files (100 past the checkpoint), debug:
+   0.46 to 0.48 s (B2b: 2.6 s); of 10,000 (100 past): 5.9 s, over the 5 s hypothesis, spent reading one blob per
+   file and name history, up to three times (checkpoint, built point, the actor's open).
+6. **The conformance oracle lost the real object numbers.** Nothing in git names them now. Built: the oracle follows
+   a file across a take by its identity (one that stays keeps the oracle's object, one a take brings gets a new
+   one); `one_object_one_file`, read from the object table ref, is gone (the engine's `Tree::install` still refuses
+   two files on one object).
+7. **Acceptance naming.** `an_empty_files_first_alignment_runs_no_child` is two tests: the no-child count in
+   `tree_stages.rs`, and `an_empty_old_image_aligns_as_git_does` (hunks equal git's on nine inputs) in
+   `tree_reconcile.rs`. Objects per 1-file save, counted in the pack: 10 (blob, line map, seven folders, commit), not
+   hypothesis 6's six; fed by mark: 2. `checkout_path` is not added: it has no consumer before B3.
+8. **Cost not on the page: a snapshot read is one blob read per file.** Takes read whole snapshots (a sync plans
+   over each upstream commit the fork lacks, a landing reads base and incoming): where one `metadata.json` read was
+   one blob, it is now a blob per file and per name history. Not measured at size; the take tests are small. A
+   reader that reads only a commit's changed folders is the follow-up if takes on large trees prove slow.

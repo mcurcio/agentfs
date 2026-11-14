@@ -12,6 +12,14 @@ design was reviewed on 2026-10-12.
 
 ### Added
 
+- **Tree views: a save costs its change, not the tree.** A commit keeps each
+  file's bytes, line map and name history under two levels of hashed folders
+  (`files/<aa>/<bb>/<name>`, `lines/...`, `names/<cc>/<dd>/<id>`), and the builder
+  rewrites only the changed files' folders. `metadata.json`, `namespace.json` and
+  the object table refs (`refs/agentfs/objects/<tree>`) are gone: object numbers
+  live in the journal's checkpoint. A new file's first save runs no `git diff`.
+  Checkouts mirror `files/`. The state format is now `agentfs-trees-7`; older tree
+  state areas do not open (docs/trees.md, "What a commit holds").
 - **Tree views: history is built behind the calls.** A step's journal record is the
   change itself; the call path runs no git. A builder thread makes the commits with
   `git fast-import` behind it, and Git's refs, commits and checkouts show only what

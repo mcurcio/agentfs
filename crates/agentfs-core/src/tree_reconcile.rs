@@ -272,7 +272,23 @@ impl<V: Id> LineMap<V> {
 }
 
 /// Git's text-mode histogram diff, through the one call the model shares.
+/// Against an empty old image every new line is an insert, the one hunk
+/// `git diff` gives (`@@ -0,0 +1,n @@`): answered with no child, so a new
+/// file's first save starts no `git diff`.
 pub fn histogram(old: &[u8], new: &[u8]) -> Result<Vec<Hunk>, Error> {
+    if old.is_empty() {
+        let count = split(new).len();
+        return Ok(if count == 0 {
+            Vec::new()
+        } else {
+            vec![Hunk {
+                old_start: 0,
+                old_count: 0,
+                new_start: 0,
+                new_count: count,
+            }]
+        });
+    }
     agentfs_align::histogram_with(old, new, crate::git_cli::counted).map_err(|e| match e {
         agentfs_align::Error::Io(e) => Error::Io(e),
         agentfs_align::Error::Git(message) => Error::Git(message),

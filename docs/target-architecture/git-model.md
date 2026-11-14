@@ -163,8 +163,8 @@ that step moves: the commit point (§12). The open's records leave the journal a
   object (§7) its tree and the file identity whose path names it, or none, is journaled too: an open's first record
   names its object, and every call that moves an object (a create, `rename(2)`, `unlink`, a rename-over, the atomic
   save) records the move in the same durable record as the call itself (the `unlink`/`rename(2)` row above). At
-  restart the table is rebuilt from the journal on top of the last committed trees, never from file identities or
-  paths. An open whose object the rebuilt table names by no path is an orphan: its replay saves nothing and raises
+  restart the table is rebuilt from the journal, never from file identities or paths: a checkpoint holds each
+  tree's objects as of its built point, and the steps after it move them (no history commit or ref holds them). An open whose object the rebuilt table names by no path is an orphan: its replay saves nothing and raises
   `OrphanDropped`, as its close would have. Rebuilt by identity instead, a dead handle's calls would be saved into
   the file that replaced it, the failure §7 exists to prevent (the review planted exactly that bug; the model's
   byte oracle and object table catch it). The model's crash keeps its object table, which this rule rebuilds
@@ -242,6 +242,12 @@ Ref names are a design choice; the model uses the first five (with `refs/collisi
 | `refs/heads/txn/<id>` | an open transaction: the commit it began at, never moved (its saves stage in its index) | until commit or rollback | never |
 | `refs/collisions/<loser>` | one per losing change, named by its losing commit (the model numbers them, one per losing change, with a record for each file and cause it lost by) | past the fork's drop | yes, by Replication, under `refs/agentfs/<volume>/collisions/` ("i want to know who changed what when", 2026-11-03) |
 | `refs/queue/<tree>/<n>` | one queue entry (§5) | until taken | never |
+
+A commit's tree (a design choice, the owner's pick Q1-A of 2026-11-14, hashed sub-folders) keeps each file at
+`files/<aa>/<bb>/<name>`, its line map at `lines/<aa>/<bb>/<name>` and each file identity's name history at
+`names/<cc>/<dd>/<id>`, the folders hex digits 1-2 and 3-4 of `git hash-object` of the name (or the identity in
+decimal): fixed, so a file's path never moves, and a commit rewrites only its changed files' folders
+([trees](../trees.md#what-a-commit-holds)). No ref holds object numbers; they are the journal's (§3).
 
 Replication adds the release major to pushed names (replication.md). It is the only pusher: the collision refs
 join its refspec, and a move of the root or a recorded collision makes a push due (design
@@ -778,7 +784,7 @@ not; the rest is a design choice.
 
 **One step, one journal record** (a recommendation the owner accepted, revisable; [OWNER-GUIDANCE.md](../../OWNER-GUIDANCE.md)). Each step
 appends one journal record: the change itself, and every pointer its build moves (the branch, queue entries, collision
-refs, the object table), each value an oid or "what step `n`'s build gives". That record is the commit point. The
+refs), each value an oid or "what step `n`'s build gives". That record is the commit point. The
 commits are built behind it by a builder (the owner, 2026-11-13: "only the diff/patch needs to be syncrhonosly
 collected and queued, while the git history persistence could be an asynchronous trailing process"). Git's refs are a
 copy of the built pointers, in the files format, and nothing decides from the copy. Reftable's one atomic swap is no
@@ -806,14 +812,14 @@ copy after the built-log entry is logged, and the next batch rebuilds the refs w
 
 | Step | Its one journal record | On restart |
 |---|---|---|
-| save | the close's calls by reference and its outcome; the branch, the landing entry at the upstream, a sync entry at each child, the object table; names the open it closes | build what is not built; the move and its entries are one record, or neither happened |
-| queue take | the decision (head move, changed files and names, collisions); the branch, the entry deleted, the entries the move causes, the collision ref, the object table | the entry is still there only if the take has no record: take it again; collision refs are named by the losing commit, so a rerun makes the same names |
+| save | the close's calls by reference and its outcome; the branch, the landing entry at the upstream, a sync entry at each child; names the open it closes | build what is not built; the move and its entries are one record, or neither happened |
+| queue take | the decision (head move, changed files and names, collisions); the branch, the entry deleted, the entries the move causes, the collision ref | the entry is still there only if the take has no record: take it again; collision refs are named by the losing commit, so a rerun makes the same names |
 | transaction begin, commit, rollback | not built | every `txn/*` branch is deleted, its index dropped and its deferred calls applied: a crash rolls back every open transaction (A13; R5.3's pick, §9). A commit's ref transaction either happened (the branch is gone, the transaction ended) or did not (rolled back) |
 | fork create | the branch and its upstream | `config` is rewritten from the journal before any git command; a dropped fork is not built |
 | journal | each call appended before it returns, durable once a flush covers it (§3) | every frame is read, durable or not; a hole a later frame's mark shows was durable refuses to serve, any other bad tail is saved aside and discarded. Before any view serves the tree, each open with no record closing it is saved as its close would be, exactly once, and every record is flushed |
 | refs, `config`, `HEAD` | a copy of the records | `config` and `HEAD` are rewritten, then `refs/` and `packed-refs` are removed and every pointer is created in one `update-ref --stdin`, on every open, so this path always runs. A live `git` reader may see a step half copied |
 | locks | none: held in memory by the actor | none survive: open files ended with their clients and are saved from the journal (row above); an unfinished take has no record, so its entry is still there and is taken again. In the model a take is one step, so none is unfinished at a crash |
-| object table | a blob per tree, named by the step's record | rebuilt on each branch's snapshot, never by file identity; an open whose object no path names is replayed as an orphan (saves nothing, `OrphanDropped`) |
+| object table | each tree's object per file identity, in the checkpoint as of its built point; the steps after it move them | rebuilt from the checkpoint and the steps' own transitions, never by file identity; an open whose object no path names is replayed as an orphan (saves nothing, `OrphanDropped`) |
 | objects | none: durable before a record names them | every pointer's commit, tree and blobs are checked (`rev-list --objects --no-walk --missing=print`): anything lost refuses to serve. Unreferenced objects: git's garbage collection |
 
 ## 13. Where the virtual filesystem sits

@@ -10,7 +10,7 @@ use std::os::unix::fs::FileExt;
 use agentfs_contracts::name::WriterLabel;
 use agentfs_contracts::pod::PodContext;
 use agentfs_core::tree_actor::{Error, Saved, Took, TreeActor, TreeId};
-use trees::{new_actor, reopen, reopen_after_kill, writer};
+use trees::{checkout, fanned, new_actor, reopen, reopen_after_kill, writer};
 
 const ROOT: TreeId = TreeId::Root;
 use agentfs_core::tree_git::TreeGit;
@@ -29,6 +29,34 @@ fn entry(repo: &TreeGit, tree: git2::Oid, name: &str) -> git2::Oid {
         .find(|e| e.name == name.as_bytes())
         .unwrap()
         .oid
+}
+
+/// The blob at `path`, '/'-separated, in a commit's tree.
+fn at_path(repo: &TreeGit, commit: git2::Oid, path: &str) -> Vec<u8> {
+    let mut oid = repo.read_commit(commit).unwrap().tree;
+    for part in path.split('/') {
+        oid = entry(repo, oid, part);
+    }
+    repo.read_blob(oid).unwrap()
+}
+
+/// A file's line map in a commit, with its identity: `lines/<aa>/<bb>/<name>`.
+fn line_map(
+    repo: &TreeGit,
+    commit: git2::Oid,
+    name: &str,
+) -> (u64, agentfs_core::tree_reconcile::LineMap) {
+    serde_json::from_slice(&at_path(repo, commit, &format!("lines/{}", fanned(name)))).unwrap()
+}
+
+/// A file identity's name history in a commit: `names/<cc>/<dd>/<id>`.
+fn name_history(repo: &TreeGit, commit: git2::Oid, id: u64) -> serde_json::Value {
+    serde_json::from_slice(&at_path(
+        repo,
+        commit,
+        &format!("names/{}", fanned(&id.to_string())),
+    ))
+    .unwrap()
 }
 
 /// Each frame of a journal: where it starts and how long it is. Frozen format.
@@ -137,7 +165,7 @@ fn byte_calls_match_a_plain_linux_file_and_publish_only_at_release() {
             .contains(&format!("Agentfs-Open: {h}\n"))
     );
     assert_eq!(
-        fs::read(tmp.path().join("state/trees/root/a")).unwrap(),
+        fs::read(checkout(&tmp.path().join("state"), "root", "a")).unwrap(),
         v.read(ROOT, "a").unwrap()
     );
 }
@@ -218,11 +246,11 @@ fn restart_closes_abandoned_opens_once_and_repairs_the_checkout() {
     assert!(next > h);
     v.close(next).unwrap();
     drop(v);
-    fs::write(tmp.path().join("trees/root/a"), b"damaged-cache").unwrap();
+    fs::write(checkout(tmp.path(), "root", "a"), b"damaged-cache").unwrap();
     let v = reopen(tmp.path());
     assert_eq!(v.head(ROOT).unwrap(), saved);
     assert_eq!(
-        fs::read(tmp.path().join("trees/root/a")).unwrap(),
+        fs::read(checkout(tmp.path(), "root", "a")).unwrap(),
         b"acknowledged"
     );
 }
@@ -246,7 +274,7 @@ fn fork_saves_land_and_parent_changes_sync_across_restart() {
     assert_eq!(v.head(fork).unwrap(), fork_head);
     assert_eq!(v.read(fork, "a").unwrap(), b"parent");
     assert_eq!(
-        fs::read(tmp.path().join("trees").join(fork.to_string()).join("a")).unwrap(),
+        fs::read(checkout(tmp.path(), &fork.to_string(), "a")).unwrap(),
         b"parent"
     );
 }
@@ -616,7 +644,7 @@ fn save_and_checkout_failures_keep_calls_and_recover_without_duplicate_commits()
     assert_eq!(v.head(ROOT).unwrap(), committed);
     assert_eq!(v.read(ROOT, "a").unwrap(), b"basejournaledonce");
     assert_eq!(
-        fs::read(tmp.path().join("trees/root/a")).unwrap(),
+        fs::read(checkout(tmp.path(), "root", "a")).unwrap(),
         b"basejournaledonce"
     );
     assert_eq!(opens_saved(tmp.path(), h), 1);
@@ -662,38 +690,28 @@ fn saved_line_map_and_bytes_share_a_commit_without_a_reserved_name() {
     volume.write(handle, 0, b" tail\nnext\n", true).unwrap();
     volume.close(handle).unwrap();
     let repo = repo(tmp.path());
-    let root = repo.read_commit(volume.head(ROOT).unwrap()).unwrap().tree;
-    let files = entry(&repo, root, "files");
-    let blob = repo
-        .read_blob(entry(&repo, files, "metadata.json"))
-        .unwrap();
+    let head = volume.head(ROOT).unwrap();
+    let blob = at_path(&repo, head, &format!("files/{}", fanned("metadata.json")));
     assert_eq!(blob, b"first\npartial tail\nnext\n");
-    let metadata = repo.read_blob(entry(&repo, root, "metadata.json")).unwrap();
-    let maps: std::collections::BTreeMap<
-        String,
-        (u64, u64, agentfs_core::tree_reconcile::LineMap),
-    > = serde_json::from_slice(&metadata).unwrap();
-    maps["metadata.json"].2.validate(&blob).unwrap();
+    line_map(&repo, head, "metadata.json")
+        .1
+        .validate(&blob)
+        .unwrap();
     assert_eq!(
-        fs::read(tmp.path().join("trees/root/metadata.json")).unwrap(),
+        fs::read(checkout(tmp.path(), "root", "metadata.json")).unwrap(),
         blob
     );
 }
 
 #[test]
 fn atomic_replacement_keeps_merge_identity_but_changes_object_across_recovery() {
+    // The object, from the actor; the identity and line map, from history.
     fn metadata(
+        volume: &TreeActor,
         root: &std::path::Path,
-        head: git2::Oid,
     ) -> (u64, u64, agentfs_core::tree_reconcile::LineMap) {
-        let repo = repo(root);
-        let tree = repo.read_commit(head).unwrap().tree;
-        let blob = repo.read_blob(entry(&repo, tree, "metadata.json")).unwrap();
-        let mut maps: std::collections::BTreeMap<
-            String,
-            (u64, u64, agentfs_core::tree_reconcile::LineMap),
-        > = serde_json::from_slice(&blob).unwrap();
-        maps.remove("target").unwrap()
+        let (id, lines) = line_map(&repo(root), volume.head(ROOT).unwrap(), "target");
+        (volume.object_at(ROOT, "target").unwrap(), id, lines)
     }
     let tmp = tempfile::tempdir().unwrap();
     let mut volume = new_actor(tmp.path());
@@ -701,12 +719,12 @@ fn atomic_replacement_keeps_merge_identity_but_changes_object_across_recovery() 
     let old = volume
         .write_open(ROOT, "target", &writer("old"), false)
         .unwrap();
-    let before = metadata(tmp.path(), volume.head(ROOT).unwrap());
+    let before = metadata(&volume, tmp.path());
     put(&mut volume, ROOT, "temp", b"first\nchanged\n");
     volume
         .rename(ROOT, "temp", "target", &writer("editor"))
         .unwrap();
-    let after = metadata(tmp.path(), volume.head(ROOT).unwrap());
+    let after = metadata(&volume, tmp.path());
     assert_ne!(before.0, after.0);
     assert_eq!(before.1, after.1);
     assert_eq!(before.2.lines[0].identity, after.2.lines[0].identity);
@@ -717,7 +735,7 @@ fn atomic_replacement_keeps_merge_identity_but_changes_object_across_recovery() 
     drop(volume);
     let volume = reopen(tmp.path());
     assert_eq!(volume.read(ROOT, "target").unwrap(), b"first\nchanged\n");
-    assert_eq!(metadata(tmp.path(), volume.head(ROOT).unwrap()), after);
+    assert_eq!(metadata(&volume, tmp.path()), after);
 }
 
 #[test]
@@ -802,15 +820,12 @@ fn name_history_keeps_rename_and_unlink_versions_in_the_commit() {
     let tmp = tempfile::tempdir().unwrap();
     let mut volume = new_actor(tmp.path());
     put(&mut volume, ROOT, "a", b"content\n");
+    let created = volume.head(ROOT).unwrap();
     volume.rename(ROOT, "a", "b", &writer("writer")).unwrap();
     volume.unlink(ROOT, "b", &writer("writer")).unwrap();
     let repo = repo(tmp.path());
-    let root = repo.read_commit(volume.head(ROOT).unwrap()).unwrap().tree;
-    let data = repo
-        .read_blob(entry(&repo, root, "namespace.json"))
-        .unwrap();
-    let histories: serde_json::Value = serde_json::from_slice(&data).unwrap();
-    let history = histories.as_object().unwrap().values().next().unwrap();
+    let id = line_map(&repo, created, "a").0;
+    let history = name_history(&repo, volume.head(ROOT).unwrap(), id);
     let versions = history["versions"].as_object().unwrap();
     assert_eq!(versions.len(), 3);
     let paths: Vec<_> = versions.values().map(|v| &v["path"]).collect();
@@ -820,12 +835,7 @@ fn name_history_keeps_rename_and_unlink_versions_in_the_commit() {
     drop(volume);
     let volume = reopen(tmp.path());
     assert!(matches!(volume.read(ROOT, "b"), Err(Error::NotFound)));
-    let root = repo.read_commit(volume.head(ROOT).unwrap()).unwrap().tree;
-    assert_eq!(
-        repo.read_blob(entry(&repo, root, "namespace.json"))
-            .unwrap(),
-        data
-    );
+    assert_eq!(name_history(&repo, volume.head(ROOT).unwrap(), id), history);
 }
 
 // The journal is the commit point; Git's refs are a copy (git-model §12).
@@ -949,8 +959,14 @@ fn a_ref_copy_failure_is_not_a_call_failure() {
     );
     assert!(copy.is_ancestor(recorded, v.head(ROOT).unwrap()).unwrap());
     assert!(!lock.exists());
-    assert_eq!(fs::read(tmp.path().join("trees/root/a")).unwrap(), b"base!");
-    assert_eq!(fs::read(tmp.path().join("trees/root/b")).unwrap(), b"next");
+    assert_eq!(
+        fs::read(checkout(tmp.path(), "root", "a")).unwrap(),
+        b"base!"
+    );
+    assert_eq!(
+        fs::read(checkout(tmp.path(), "root", "b")).unwrap(),
+        b"next"
+    );
 }
 
 #[test]
@@ -1371,7 +1387,7 @@ fn a_step_killed_after_its_record_is_not_saved_again() {
             "{spec}"
         );
         assert_eq!(
-            fs::read(state.join("trees/root/a")).unwrap(),
+            fs::read(checkout(&state, "root", "a")).unwrap(),
             b"returned",
             "{spec}"
         );
@@ -1563,8 +1579,9 @@ fn a_fast_forward_takes_the_upstreams_line_maps() {
     assert_eq!(v.head(fork).unwrap(), v.head(ROOT).unwrap());
     put(&mut v, fork, "c", b"t\n");
     let map = |commit: String| -> serde_json::Value {
-        let out = git(tmp.path(), &["show", &format!("{commit}:metadata.json")]);
-        serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap()["c"][2].clone()
+        let path = format!("lines/{}", fanned("c"));
+        let out = git(tmp.path(), &["show", &format!("{commit}:{path}")]);
+        serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap()[1].clone()
     };
     let lost_lines: Vec<String> = map(lost.to_string())["lines"]
         .as_array()
@@ -1596,18 +1613,28 @@ fn a_fast_forward_takes_the_upstreams_names() {
     assert_eq!(v.head(fork).unwrap(), v.head(ROOT).unwrap());
     // The fork's next commit writes out the names it holds now.
     put(&mut v, fork, "d", b"y\n");
-    let names = |reference: &str| -> serde_json::Value {
+    // Every name history each head holds, by identity.
+    let names = |reference: &str| -> std::collections::BTreeMap<String, serde_json::Value> {
         let out = git(
             tmp.path(),
-            &["show", &format!("{reference}:namespace.json")],
+            &["ls-tree", "-r", "--name-only", reference, "names/"],
         );
-        serde_json::from_slice(&out.stdout).unwrap()
+        String::from_utf8(out.stdout)
+            .unwrap()
+            .lines()
+            .map(|path| {
+                let blob = git(tmp.path(), &["show", &format!("{reference}:{path}")]);
+                let id = path.rsplit('/').next().unwrap().to_owned();
+                (id, serde_json::from_slice(&blob.stdout).unwrap())
+            })
+            .collect()
     };
     let (forked, upstream) = (
         names(&format!("refs/heads/{fork}")),
         names("refs/heads/root"),
     );
-    for (id, history) in upstream.as_object().unwrap() {
+    assert!(!upstream.is_empty());
+    for (id, history) in &upstream {
         assert_eq!(forked[id]["versions"], history["versions"], "file {id}");
     }
 }
@@ -1798,9 +1825,7 @@ fn history_names_trees_by_identity_only() {
 
     let identity = |name: &str| name.parse::<TreeId>().is_ok();
     for (name, _) in all_refs(tmp.path()) {
-        let tree = ["refs/heads/", "refs/agentfs/objects/"]
-            .iter()
-            .find_map(|prefix| name.strip_prefix(prefix));
+        let tree = name.strip_prefix("refs/heads/");
         assert!(tree.is_some_and(identity), "{name}");
     }
     let head = fs::read_to_string(tmp.path().join("history.git/HEAD")).unwrap();
@@ -1820,13 +1845,7 @@ fn history_names_trees_by_identity_only() {
         .collect();
     checkouts.sort();
     assert_eq!(checkouts, ["fork", "root"]);
-    assert!(
-        tmp.path()
-            .join("trees")
-            .join(fork.to_string())
-            .join("a")
-            .is_file()
-    );
+    assert!(checkout(tmp.path(), &fork.to_string(), "a").is_file());
     let trailers = String::from_utf8(
         git(
             tmp.path(),

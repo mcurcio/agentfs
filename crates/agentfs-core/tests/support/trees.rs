@@ -52,3 +52,18 @@ pub fn writer(label: &str) -> WriterAt {
         at: PodContext::default(),
     }
 }
+
+/// Where a file named `name` sits under `files/`, `lines/` and a checkout:
+/// `<aa>/<bb>/<name>`, `aa` and `bb` the first four hex digits of the name's
+/// blob id, as `git hash-object --stdin` gives it (docs/trees.md).
+pub fn fanned(name: &str) -> String {
+    let hex = git2::Oid::hash_object(git2::ObjectType::Blob, name.as_bytes())
+        .expect("hashes")
+        .to_string();
+    format!("{}/{}/{name}", &hex[..2], &hex[2..4])
+}
+
+/// Tree `tree`'s checkout of `name` in the state area `dir`.
+pub fn checkout(dir: &Path, tree: &str, name: &str) -> std::path::PathBuf {
+    dir.join("trees").join(tree).join(fanned(name))
+}
