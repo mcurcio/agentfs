@@ -1351,7 +1351,18 @@ fn a_step_killed_after_its_record_is_not_saved_again() {
     ] {
         let state = tmp.path().join(spec);
         let open = run_killed_worker("step_worker", &state, spec);
+        // Refs are copies of the built log's values, made after its fsync:
+        // killed before the copy, they still name the create's commit.
+        let on_disk = repo(&state).head("refs/heads/root").unwrap().unwrap();
         let v = reopen(&state);
+        let head = v.head(ROOT).unwrap();
+        let copied = spec.starts_with("tree.build_after_ref_copy");
+        let expected = if copied {
+            head
+        } else {
+            repo(&state).read_commit(head).unwrap().parents[0]
+        };
+        assert_eq!(on_disk, expected, "{spec}: refs name only built commits");
         assert_eq!(v.read(ROOT, "a").unwrap(), b"returned", "{spec}");
         assert_eq!(opens_saved(&state, open), 1, "{spec}");
         assert_eq!(
