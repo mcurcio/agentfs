@@ -34,7 +34,7 @@ drain_queue() {
   done
   echo 'queue did not drain' >&2; return 1
 }
-points=(tree.wal_before_header tree.wal_after_payload tree.wal_before_fsync tree.wal_after_fsync tree.before_objects tree.after_objects_durable tree.after_commit_point tree.after_ref_copy tree.before_checkout tree.after_checkout)
+points=(tree.wal_before_header tree.wal_after_payload tree.wal_before_fsync tree.wal_after_fsync tree.before_step tree.build_before_batch tree.build_after_pack tree.build_after_built_log tree.build_after_ref_copy)
 for point in "${points[@]}"; do
   rm -rf "$work/state" "$work/main" "$work/sandbox"
   mkdir "$work/main" "$work/sandbox"

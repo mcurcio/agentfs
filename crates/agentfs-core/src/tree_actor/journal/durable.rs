@@ -86,6 +86,8 @@ struct State {
     leading: bool,
     /// The errno of a failed fsync: nothing is durable past the mark again.
     failed: Option<i32>,
+    /// Bumped at each compaction: a reader of the file reopens it.
+    generation: u64,
 }
 
 /// Every deferred wait queued since the thread last looked is answered by one
@@ -132,6 +134,7 @@ impl Durability {
                     mark: mark.min(appended),
                     leading: false,
                     failed: None,
+                    generation: 0,
                 }),
                 ended: Condvar::new(),
                 queue: Mutex::new(sender),
@@ -149,6 +152,12 @@ impl Durability {
     /// The highest record every finished fsync covers: the durable mark.
     pub fn mark(&self) -> RecordNo {
         self.state().mark
+    }
+
+    /// The journal file's generation: it changes when a compaction replaces
+    /// the file.
+    pub(in crate::tree_actor) fn generation(&self) -> u64 {
+        self.state().generation
     }
 
     /// The highest record appended so far (in the kernel, maybe not on disk).
@@ -245,6 +254,7 @@ impl Durability {
     pub(in crate::tree_actor) fn replace_file(&self, file: Arc<File>, last: RecordNo) {
         let mut state = self.state();
         state.file = file;
+        state.generation += 1;
         state.appended = state.appended.max(last);
         state.mark = state.mark.max(last);
         drop(state);

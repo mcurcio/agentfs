@@ -215,6 +215,7 @@ impl Mounted {
             return Err(last_error("open"));
         }
         self.opens.insert(fd, c.clone());
+        self.settle()?;
         Ok(fd)
     }
 
@@ -234,7 +235,23 @@ impl Mounted {
         if unsafe { libc::close(fd) } != 0 {
             return Err(last_error("close"));
         }
-        self.released()
+        self.released()?;
+        self.settle()
+    }
+
+    /// Asks the gate to wait until history is built through every record so
+    /// far: the invariants read git after each call, and the builder makes
+    /// history behind the call path.
+    fn settle(&mut self) -> Result<(), CallError> {
+        writeln!(self.go, "settle").map_err(|e| io_fail("ask the gate", &e))?;
+        let mut answer = String::new();
+        self.took
+            .read_line(&mut answer)
+            .map_err(|e| io_fail("read the gate", &e))?;
+        match answer.trim_end() {
+            "settled" => Ok(()),
+            other => Err(CallError::new(format!("the gate answered {other:?}"))),
+        }
     }
 
     fn unmount(&self, lazy: bool) -> Result<(), CallError> {
@@ -354,11 +371,13 @@ impl TreeCalls for Mounted {
     }
 
     fn unlink(&mut self, c: &Caller, path: &str) -> Result<(), CallError> {
-        std::fs::remove_file(self.at(c, path)).map_err(|e| io_fail("unlink", &e))
+        std::fs::remove_file(self.at(c, path)).map_err(|e| io_fail("unlink", &e))?;
+        self.settle()
     }
 
     fn rename(&mut self, c: &Caller, from: &str, to: &str) -> Result<(), CallError> {
-        std::fs::rename(self.at(c, from), self.at(c, to)).map_err(|e| io_fail("rename", &e))
+        std::fs::rename(self.at(c, from), self.at(c, to)).map_err(|e| io_fail("rename", &e))?;
+        self.settle()
     }
 
     fn end_client(&mut self, c: &Caller) -> Result<(), CallError> {
@@ -381,12 +400,14 @@ impl TreeCalls for Mounted {
         self.took
             .read_line(&mut answer)
             .map_err(|e| io_fail("read the gate", &e))?;
-        match answer.trim_end() {
-            "taken" => Ok(Took::Taken),
-            "waiting" => Ok(Took::Waiting),
-            "empty" => Ok(Took::Empty),
-            other => Err(CallError::new(format!("the gate answered {other:?}"))),
-        }
+        let took = match answer.trim_end() {
+            "taken" => Took::Taken,
+            "waiting" => Took::Waiting,
+            "empty" => Took::Empty,
+            other => return Err(CallError::new(format!("the gate answered {other:?}"))),
+        };
+        self.settle()?;
+        Ok(took)
     }
 
     /// `SIGKILL`, wait on the pid, drop what the harness holds, `fusermount3 -uz`,

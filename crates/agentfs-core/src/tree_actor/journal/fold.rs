@@ -5,12 +5,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use agentfs_contracts::pod::WriterAt;
 use git2::Oid;
 
-use super::{Entry, Frame, OpenRecord, PointerChange, Record, RunHead};
+use super::durable::RecordNo;
+use super::{Change, Entry, Frame, OpenRecord, Record, RunHead, Target};
 use crate::tree_actor::history::upstreams::Upstreams;
 use crate::tree_actor::pointers::Pointers;
 use crate::tree_actor::recording::{Call, pages};
 use crate::tree_actor::{Error, Result, TreeId};
-use crate::tree_git::RefUpdate;
 
 /// A live write-open: a journal [`OpenRecord`] with its tree parsed.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -33,16 +33,6 @@ impl LiveOpen {
             anonymous: record.anonymous,
         })
     }
-
-    pub(in crate::tree_actor) fn record(&self) -> OpenRecord {
-        OpenRecord {
-            handle: self.handle,
-            tree: self.tree.to_string(),
-            by: self.by.clone(),
-            object: self.object,
-            anonymous: self.anonymous,
-        }
-    }
 }
 
 /// A live open and its calls, as the journal leaves them.
@@ -55,7 +45,11 @@ pub(in crate::tree_actor) struct FoldedOpen {
 /// What a journal's frames add up to (git-model §12).
 #[derive(Debug, PartialEq, Eq)]
 pub(in crate::tree_actor) struct Folded {
-    pub(in crate::tree_actor) pointers: Pointers,
+    /// The pointers as the records name them: oids from the checkpoint, and
+    /// the steps after it as [`Target`]s.
+    pub(in crate::tree_actor) pointers: Pointers<Target>,
+    /// The checkpoint's redo start: its pointers' oids are as of this record.
+    pub(in crate::tree_actor) built: RecordNo,
     /// Each fork's upstream. The root has none.
     pub(in crate::tree_actor) upstreams: Upstreams,
     pub(in crate::tree_actor) next_seq: u64,
@@ -75,6 +69,39 @@ impl Folded {
         Ok(())
     }
 
+    /// One step's part of the fold: its pointers, the open a create makes, the
+    /// fork it makes, the open a close ends.
+    pub(in crate::tree_actor) fn add_step(
+        &mut self,
+        seq: u64,
+        by: &WriterAt,
+        change: &Change,
+    ) -> Result<()> {
+        match change {
+            Change::Create { tree, .. } => self.add_open(LiveOpen {
+                handle: seq,
+                tree: tree.parse::<TreeId>()?,
+                by: by.clone(),
+                object: seq,
+                anonymous: false,
+            }),
+            Change::Link { object, .. } => self
+                .opens
+                .values_mut()
+                .filter(|o| o.open.object == *object)
+                .for_each(|o| o.open.anonymous = false),
+            Change::Save { handle, .. } => {
+                let open = self.opens.remove(handle).ok_or(Error::Format)?.open;
+                self.saved_through.insert((open.tree, open.object), seq);
+            }
+            Change::Fork { upstream } => {
+                self.upstreams.add(seq, upstream.parse::<TreeId>()?);
+            }
+            Change::Rename { .. } | Change::Unlink { .. } | Change::Take { .. } => {}
+        }
+        Ok(())
+    }
+
     pub(in crate::tree_actor) fn add_open(&mut self, open: LiveOpen) {
         self.opens.insert(
             open.handle,
@@ -88,14 +115,6 @@ impl Folded {
 
 pub(in crate::tree_actor) fn parse_oid(hex: &str) -> Result<Oid> {
     Oid::from_str(hex).map_err(|_| Error::Format)
-}
-
-pub(in crate::tree_actor) fn parse_change(change: &PointerChange) -> Result<RefUpdate> {
-    Ok(RefUpdate {
-        refname: change.name.clone(),
-        new: change.new.as_deref().map(parse_oid).transpose()?,
-        expected_old: change.old.as_deref().map(parse_oid).transpose()?,
-    })
 }
 
 pub(in crate::tree_actor) fn runs_from_frame(
@@ -132,7 +151,8 @@ pub(in crate::tree_actor) fn fold(frames: &[Frame]) -> Result<Folded> {
         Record {
             entry:
                 Entry::Checkpoint {
-                    next_seq,
+                    next,
+                    built,
                     pointers,
                     upstreams,
                     opens,
@@ -149,11 +169,15 @@ pub(in crate::tree_actor) fn fold(frames: &[Frame]) -> Result<Folded> {
         pointers: Pointers::new(
             pointers
                 .iter()
-                .map(|(name, hex)| Ok((name.clone(), parse_oid(hex)?)))
+                .map(|(name, hex)| {
+                    parse_oid(hex)?;
+                    Ok((name.clone(), Target::Oid(hex.clone())))
+                })
                 .collect::<Result<_>>()?,
         ),
+        built: *built,
         upstreams: Upstreams::default(),
-        next_seq: *next_seq,
+        next_seq: next.get(),
         opens: BTreeMap::new(),
         page_writes: BTreeMap::new(),
         saved_through: page_saved
@@ -200,36 +224,13 @@ pub(in crate::tree_actor) fn fold(frames: &[Frame]) -> Result<Folded> {
                 .or_default()
                 .extend(runs_from_frame(runs, tail)?.into_iter().map(|r| (seq, r))),
             Entry::Step {
-                closes,
-                opened,
-                linked,
-                fork,
+                by,
+                change,
                 pointers,
-                ..
             } => {
-                let changes = pointers
-                    .iter()
-                    .map(parse_change)
-                    .collect::<Result<Vec<_>>>()?;
-                folded.pointers.check(&changes)?;
-                folded.pointers.apply(&changes);
-                if let Some((name, parent)) = fork {
-                    folded.add_upstream(name, parent)?;
-                }
-                if let Some(open) = opened {
-                    folded.add_open(LiveOpen::parse(open)?);
-                }
-                if let Some(object) = linked {
-                    folded
-                        .opens
-                        .values_mut()
-                        .filter(|o| o.open.object == *object)
-                        .for_each(|o| o.open.anonymous = false);
-                }
-                if let Some(handle) = closes {
-                    let open = folded.opens.remove(handle).ok_or(Error::Format)?.open;
-                    folded.saved_through.insert((open.tree, open.object), seq);
-                }
+                folded.pointers.check_targets(pointers)?;
+                folded.pointers.apply_targets(pointers);
+                folded.add_step(seq, by, change)?;
             }
         }
     }

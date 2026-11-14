@@ -28,6 +28,7 @@ kubectl exec "$POD" -c agentfs -- agentfs status
 | `<n> path(s) could not be recorded ...` | the sidecar's log at stop | [4](#4-paths-a-mount-could-not-record-metarepairs) |
 | `journal corruption at byte <offset>`, or `<ref> names lost object <oid>`, opening a tree state area | `agentfs trees` | [5](#5-a-tree-state-area-that-refuses-to-open) |
 | `tree JournalTail: <n> bytes at <offset>` | a tree actor's stderr at open | [5](#5-a-tree-state-area-that-refuses-to-open) |
+| `tree HistoryBuildFailed: <error>`, or a tree view's metrics with `history.health` `failed` or an `oldest_unbuilt_ns` that keeps growing | a tree actor's stderr; `--metrics-output` | [6](#6-a-tree-volumes-history-is-not-built) |
 
 The `<error>` says what failed: `No space left on device` (`ENOSPC`),
 `Disk quota exceeded`, `Read-only file system` (`EROFS`), `Permission
@@ -197,6 +198,34 @@ the file are the evidence. The file keeps the bytes of every tear, appended.
 A `tree JournalFsyncFailed` line means a flush of `calls.wal` failed and the actor
 stopped: every later call answers `EIO`. Fix the disk or space problem, then restart;
 recovery reads every frame still in the file.
+
+## 6. A tree volume's history is not built
+
+A tree view records every call in its journal before the call returns, and a
+builder thread makes the commits behind it ([trees](../trees.md#history-trails-the-files)).
+When a batch fails, recording goes on and nothing reachable changes: the batch is
+retried at the next step or wait. Takes, `settle` and anything reading history wait
+until it builds or answer the failure.
+
+- **`no space`, `errno <n>`.** The state area is full or failing: free space or fix
+  the disk ([1](#1-the-state-area-is-full-or-unwritable)). The next step retries. A
+  builder that never recovers leaves every journal record in `calls.wal`, so the
+  state area fills and the workload's calls fail with `ENOSPC`.
+- **`git fast-import failed: <first line>`.** The packer exited or was killed. Its
+  first stderr line says why; the next step retries with a new child.
+- **`disagrees with step <n>`.** The builder's replay of step `n` does not give what
+  the actor recorded (a length, a checksum, or a name). Every retry fails the same
+  way. Preserve the state area (`cp -a "$STATE" "$STATE.saved"`) and report it with
+  `calls.wal` and `built.log`: it is a bug, and no history is built past step `n`
+  until a release fixes it.
+- **A wedged builder**: `oldest_unbuilt_ns` grows while `health` stays `current`.
+  Waiters wait without a timeout. Find the `git fast-import` child of the agentfs
+  process (`pgrep -P <pid> -a git`) and kill it: the batch fails, waiters get the
+  error, and the next step retries.
+
+What `fast-import` left behind is cleared at the next open: `objects/pack/tmp_*`,
+`.keep` files, an index without its pack, and `refs/build/*`. An unreferenced pack
+from a batch whose built-log entry was never written stays; nothing names it.
 
 ## Verify
 

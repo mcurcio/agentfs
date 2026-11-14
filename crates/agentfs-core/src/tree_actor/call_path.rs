@@ -4,8 +4,6 @@
 //! durability waits and lag-gate waits run outside it (docs/trees.md,
 //! "Recording and durability").
 //!
-//! Slice B2b (history, gate, takes) builds the bodies still `todo!`; their
-//! signatures are frozen on its page.
 
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -33,14 +31,16 @@ pub enum Progress {
     Empty,
 }
 
-/// One tree volume, served: the actor, its journal's durability, and (B2b)
+/// One tree volume, served: the actor, its journal's durability, and
 /// History with the builder behind it. Shared as `Arc<Recording>`. Dropping
-/// the last one makes every record durable and builds every step appended
-/// (B2b), so a clean shutdown leaves history built through its last record.
+/// the last one makes every record durable and builds every step appended,
+/// so a clean shutdown leaves history built through its last record.
 pub struct Recording {
     actor: Mutex<TreeActor>,
     /// The actor's journal's group commit, reached without its lock.
     durability: Arc<Durability>,
+    /// The one owner of the Git store, reached without the actor's lock.
+    history: History,
 }
 
 impl Drop for Recording {
@@ -53,9 +53,11 @@ impl Drop for Recording {
 impl Recording {
     fn serve(actor: TreeActor) -> Arc<Self> {
         let durability = Arc::clone(actor.durability());
+        let history = actor.history().clone();
         Arc::new(Self {
             actor: Mutex::new(actor),
             durability,
+            history,
         })
     }
 
@@ -147,14 +149,14 @@ impl Recording {
     /// `truncate(2)`): returns at once while the tree's lag is under the
     /// limit or the builder has failed, else on the built event that brings
     /// it under. Never called with the actor locked; never before a write
-    /// call or a RELEASE.
+    /// call or a RELEASE. No limit holds yet: it admits at once.
     ///
     /// # Errors
     ///
     /// [`Error::Stopped`] at shutdown.
     pub fn admit(&self, tree: TreeId) -> Result<(), Error> {
         let _ = tree;
-        todo!("B2b")
+        Ok(())
     }
 
     /// [`Recording::admit`] without blocking the caller: `then` runs at once on
@@ -162,43 +164,48 @@ impl Recording {
     /// failed event that admits it. The call it wraps is concurrent with every
     /// later request, as an unreturned syscall is.
     pub fn admit_then(&self, tree: TreeId, then: Then) {
-        let _ = (tree, then);
-        todo!("B2b")
+        then(self.admit(tree));
     }
 
     /// History, the one owner of the Git store.
     pub fn history(&self) -> &History {
-        todo!("B2b")
+        &self.history
     }
 
-    /// At most one take: decided off the actor on the built snapshot, then
-    /// landed under the lock if nothing it read changed. A refused or failed
-    /// take stays queued for the next event.
+    /// At most one take, decided on history built through every record
+    /// appended before it, and landed under the lock. A failed take stays
+    /// queued for the next event.
     ///
     /// # Errors
     ///
     /// [`Error::Stopped`] when the actor stopped.
     pub fn progress(&self) -> Result<Progress, Error> {
-        todo!("B2b")
+        let mut actor = self.actor()?;
+        if actor.pointers.under(super::refs::QUEUES).is_empty() {
+            return Ok(Progress::Empty);
+        }
+        Ok(if actor.progress()? {
+            Progress::Landed
+        } else {
+            Progress::Waiting
+        })
     }
 
     /// One take in `tree`, as [`Recording::progress`] takes one: the
-    /// conformance replay's `take_next`, after [`Recording::settle`].
+    /// conformance replay's `take_next`.
     ///
     /// # Errors
     ///
     /// [`Error::Stopped`] when the actor stopped; a failed decision or land.
     pub fn take_next(&self, tree: TreeId) -> Result<Took, Error> {
-        let _ = tree;
-        todo!("B2b")
+        self.actor()?.take_next(tree)
     }
 
     /// Blocks until something a take may wait for has happened since `seen`
-    /// (a built event, a last close, a queue entry): returns the new epoch.
-    /// Event-driven; no timer.
+    /// (a built or failed event): returns the new epoch. Event-driven; no
+    /// timer.
     pub fn wait_for_work(&self, seen: u64) -> u64 {
-        let _ = seen;
-        todo!("B2b")
+        self.history.wait_epoch(seen)
     }
 
     /// Waits until every record appended so far is built: what a test, the
@@ -208,7 +215,7 @@ impl Recording {
     ///
     /// As [`History::wait_built`], as an [`Error`].
     pub fn settle(&self) -> Result<RecordNo, Error> {
-        todo!("B2b")
+        Ok(self.history.wait_built(self.durability.appended())?)
     }
 }
 

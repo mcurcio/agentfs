@@ -40,10 +40,13 @@ use agentfs_contracts::pod::WriterAt;
 use serde::{Deserialize, Serialize};
 
 use super::stages::{Timer, Which};
-use super::{Error, Result};
+use super::tree::{MergeFileIdentity, NameHistory};
+use super::{Error, Result, referee};
 pub(super) use commit_point::compact_at;
 use durable::{Durability, RecordNo};
-pub(super) use fold::{FoldedOpen, LiveOpen, fold};
+#[cfg(test)]
+pub(super) use fold::Folded;
+pub(super) use fold::{FoldedOpen, fold, runs_from_frame};
 
 const MAGIC: &[u8; 4] = b"AFJ3";
 const HEADER: usize = 44;
@@ -92,9 +95,12 @@ impl Record {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) enum Entry {
-    /// The first frame only. `page_saved`: tree, object, saved_through.
+    /// The first frame only: what every record before `next` adds up to.
+    /// `built` is the redo start, at most the built log's point: every pointer
+    /// value is an oid as of it. `page_saved`: tree, object, saved_through.
     Checkpoint {
-        next_seq: u64,
+        next: RecordNo,
+        built: RecordNo,
         pointers: BTreeMap<String, String>,
         upstreams: BTreeMap<String, String>,
         opens: Vec<OpenRecord>,
@@ -121,16 +127,103 @@ pub(super) enum Entry {
         object: u64,
         runs: Vec<RunHead>,
     },
-    /// Every pointer change one step makes, and what else it decides.
+    /// A step: the change itself, the commit point of it, and the pointer
+    /// changes its build publishes. The builder makes its commits later.
     Step {
         by: WriterAt,
-        closes: Option<u64>,
-        /// Boxed: the step is the largest record, and most steps open nothing.
-        opened: Option<Box<OpenRecord>>,
-        linked: Option<u64>,
-        fork: Option<(String, String)>,
+        change: Change,
         pointers: Vec<PointerChange>,
     },
+}
+
+/// What one step changes (git-model §12). The builder replays it on the
+/// built trees with the transitions the actor applied (`Shape::apply`,
+/// `close_calls`, `Call::apply`) and decides nothing.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) enum Change {
+    /// A create; it opens handle = this record. Object = this record's number.
+    Create {
+        tree: String,
+        path: String,
+    },
+    /// An anonymous object's first name.
+    Link {
+        tree: String,
+        object: u64,
+        path: String,
+    },
+    /// A write-open's close: its own calls (every `Call` record of `handle`)
+    /// with these page-write pieces, and the outcome the actor decided.
+    Save {
+        tree: String,
+        handle: u64,
+        pages: Vec<PagePiece>,
+        outcome: SaveOutcome,
+    },
+    Rename {
+        tree: String,
+        from: String,
+        to: String,
+    },
+    Unlink {
+        tree: String,
+        path: String,
+    },
+    /// A fork of `upstream`; fork id = this record's number.
+    Fork {
+        upstream: String,
+    },
+    /// A queue take, decided on the built snapshot.
+    Take {
+        tree: String,
+        take: TakeRecord,
+    },
+}
+
+/// A page write's run that a close applies, by reference (the open's own
+/// calls are implied: all its `Call` records).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) struct PagePiece {
+    pub record: RecordNo,
+    pub offset: u64,
+    pub len: u64,
+}
+
+/// What a close saved: the result's length and checksum, which the builder
+/// checks its replay against.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) enum SaveOutcome {
+    Saved { len: u64, crc32: u32 },
+    Unchanged,
+    OrphanDropped,
+    AnonymousDropped,
+}
+
+/// A take as decided: how the head moves, and the files and names it leaves
+/// that differ from the tree before it (bytes inside the line maps).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) struct TakeRecord {
+    pub entry: String,
+    pub whole: bool,
+    /// Audit: the built point the decision read.
+    pub decided_at: RecordNo,
+    pub head: TakeHead,
+    pub files: Vec<(MergeFileIdentity, Option<referee::File>)>,
+    pub names: Vec<(MergeFileIdentity, Option<NameHistory>)>,
+    pub collisions: Vec<referee::Collision>,
+}
+
+/// How a take moves its tree's head.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) enum TakeHead {
+    /// To an existing commit.
+    FastForward { to: String },
+    /// A landing merge of the queued commit.
+    Landing { incoming: String },
+    /// A sync merge of the upstream's commit.
+    Sync { target: String },
+    /// No head move: only the queue entry goes.
+    Stay,
 }
 
 /// A live write-open, in a checkpoint or the step that created it.
@@ -157,12 +250,22 @@ pub(super) struct RunHead {
     pub len: u64,
 }
 
-/// Hex object ids. `None` is absent.
+/// A pointer's value in a record: an oid, or the value step `n`'s build gives
+/// this pointer (its commit, or its object table), resolved by the builder and
+/// kept in the built log.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(super) enum Target {
+    Oid(String),
+    Step(RecordNo),
+}
+
+/// One pointer change. `None` is absent.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct PointerChange {
     pub name: String,
-    pub new: Option<String>,
-    pub old: Option<String>,
+    pub new: Option<Target>,
+    pub old: Option<Target>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -291,6 +394,52 @@ fn durable_past(bytes: &[u8], salt: u32, last: RecordNo) -> bool {
         .any(|(header, _, _)| header.mark > last)
 }
 
+/// The frame at byte `at` of a journal file, with its length, when it checks
+/// and numbers at most `through`: `None` at the end, at a frame past
+/// `through`, or at one not whole (an append the reader raced). The builder's
+/// read; it never parses past what it was asked for.
+pub(super) fn frame_at(
+    file: &File,
+    at: u64,
+    salt: u32,
+    through: RecordNo,
+) -> io::Result<Option<(Frame, u64)>> {
+    let mut header = [0; HEADER];
+    match file.read_exact_at(&mut header, at) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(e) => return Err(e),
+    }
+    let Some(header) = read_header(&header, salt) else {
+        return Ok(None);
+    };
+    if header.record > through {
+        return Ok(None);
+    }
+    let mut body = vec![0; header.head + header.tail];
+    match file.read_exact_at(&mut body, at + HEADER as u64) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(e) => return Err(e),
+    }
+    let (head, tail) = body.split_at(header.head);
+    if crc_body(head, tail) != header.crc {
+        return Ok(None);
+    }
+    let record = Record::parse(header.record, head)?;
+    Ok(Some((
+        (record, tail.to_vec()),
+        (HEADER + header.head + header.tail) as u64,
+    )))
+}
+
+/// A journal file's salt: its first frame's.
+pub(super) fn salt_of(file: &File) -> io::Result<u32> {
+    let mut first = [0; 8];
+    file.read_exact_at(&mut first, 0)?;
+    Ok(u32_at(&first, 4))
+}
+
 fn sync_parent(path: &Path) -> io::Result<()> {
     let parent = path
         .parent()
@@ -313,7 +462,7 @@ fn temporary(path: &Path) -> PathBuf {
 /// The last record a checkpoint covers: every record before its `next_seq`.
 fn covered_by(checkpoint: &Record) -> RecordNo {
     match &checkpoint.entry {
-        Entry::Checkpoint { next_seq, .. } => RecordNo::new(next_seq.saturating_sub(1)),
+        Entry::Checkpoint { next, .. } => RecordNo::new(next.get().saturating_sub(1)),
         _ => checkpoint.seq,
     }
 }
@@ -554,12 +703,13 @@ impl Journal {
 mod tests {
     use super::*;
 
-    fn checkpoint(next_seq: u64) -> Record {
+    fn checkpoint(next: u64) -> Record {
         Record {
             seq: RecordNo::ZERO,
             at_ns: 1,
             entry: Entry::Checkpoint {
-                next_seq,
+                next: RecordNo::new(next),
+                built: RecordNo::new(next.saturating_sub(1)),
                 pointers: BTreeMap::new(),
                 upstreams: BTreeMap::new(),
                 opens: Vec::new(),

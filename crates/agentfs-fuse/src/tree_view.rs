@@ -217,6 +217,14 @@ fn run_take_gate(
     notifiers: &[(TreeId, Notifier)],
 ) -> io::Result<()> {
     while let Some(tree) = gate.next_tree()? {
+        if tree == "settle" {
+            let answer = match actor.settle() {
+                Ok(_) => "settled".to_owned(),
+                Err(e) => format!("error {e}"),
+            };
+            gate.answer(&answer)?;
+            continue;
+        }
         let (took, changed) = {
             let mut volume = actor.actor().map_err(io::Error::other)?;
             let took = tree

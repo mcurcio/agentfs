@@ -281,6 +281,31 @@ impl TreeGit {
         run_command(cmd, input)
     }
 
+    /// Starts `git fast-import` on this repository, its stdin piped and its
+    /// marks exported to `marks` at the end: the tree builder's packer. It
+    /// always writes a pack (`fastimport.unpackLimit=0`), never loose objects.
+    pub fn fast_import(&self, marks: &Path) -> Result<std::process::Child> {
+        let mut cmd = self.command(true);
+        cmd.args(["-c", "fastimport.unpackLimit=0", "fast-import"])
+            .args(["--quiet", "--done", "--force"])
+            .arg(format!("--export-marks={}", marks.display()))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        Ok(crate::git_cli::counted(&mut cmd)?)
+    }
+
+    /// Makes objects stored by another writer since this handle last looked
+    /// (a pack `git fast-import` installed) readable here.
+    pub fn refresh(&self) -> Result<()> {
+        self.with_repo(|repo| Ok(repo.odb()?.refresh()?))
+    }
+
+    /// The repository's directory.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
     /// Return a reference's value, or None when it does not exist.
     pub fn head(&self, name: &str) -> Result<Option<Oid>> {
         self.run(&["check-ref-format", name], None, true)?;
@@ -777,6 +802,7 @@ mod classify_tests {
 }
 
 #[cfg(all(test, target_os = "linux"))]
+#[allow(clippy::disallowed_methods, reason = "a test makes a store of its own")]
 mod tests {
     use super::*;
     use crate::file_lock::Mode;

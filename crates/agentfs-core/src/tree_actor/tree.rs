@@ -12,7 +12,8 @@ use git2::Oid;
 
 use serde::{Deserialize, Serialize};
 
-use super::{Error, Result, TreeActor, referee};
+use super::journal::{Change, SaveOutcome, TakeRecord};
+use super::{Error, Result, queue, referee};
 use crate::tree_reconcile::LineMap;
 
 /// A step's journal number. It numbers the step's name versions and line versions, and the object,
@@ -174,9 +175,9 @@ impl Versions {
 /// A file's line map as the engine stores it.
 pub(super) type Lines = LineMap<LineVersion>;
 
-/// A file's saved bytes and, once stored, their blob. New bytes are a new
+/// A file's saved bytes and, once built, their blob. New bytes are a new
 /// value, so a blob found once holds for as long as the bytes are shared: a
-/// save stores only the blobs of the files it changed.
+/// build stores only the blobs of the files it changed.
 #[derive(Debug, Default)]
 pub(super) struct FileBytes {
     bytes: Vec<u8>,
@@ -184,15 +185,15 @@ pub(super) struct FileBytes {
 }
 
 impl FileBytes {
-    /// The bytes' blob, stored by `store` the first time it is asked for.
-    pub(super) fn blob(&self, store: impl FnOnce(&[u8]) -> Result<Oid>) -> Result<Oid> {
-        if let Some(oid) = self.blob.get() {
-            return Ok(*oid);
-        }
-        let oid = store(&self.bytes)?;
+    /// The bytes' blob, once one is known to be stored.
+    pub(super) fn known_blob(&self) -> Option<Oid> {
+        self.blob.get().copied()
+    }
+
+    /// Notes the bytes' stored blob.
+    pub(super) fn set_blob(&self, oid: Oid) {
         // Content-addressed: whoever set it first set the same id.
         let _ = self.blob.set(oid);
-        Ok(oid)
     }
 }
 
@@ -271,25 +272,21 @@ impl Deref for Names {
     }
 }
 
-/// The saved state of one tree. A step builds on a copy and installs it after
-/// its commit point, so file bytes and line maps sit behind `Arc`.
-#[derive(Clone, Default)]
-pub(super) struct Tree {
+/// The names-level state of one tree, which both projections of the journal
+/// keep: the actor's saved state and the builder's trees. [`Shape::apply`] is
+/// its one transition.
+#[derive(Clone, Debug, Default)]
+pub(super) struct Shape {
     pub(super) names: Names,
     pub(super) anonymous: BTreeSet<u64>,
-    pub(super) bytes: BTreeMap<u64, Arc<FileBytes>>,
-    pub(super) lines: BTreeMap<u64, Arc<Lines>>,
     pub(super) identities: BTreeMap<u64, MergeFileIdentity>,
-    pub(super) namespace: BTreeMap<MergeFileIdentity, NameHistory>,
     pub(super) fresh_names: BTreeSet<u64>,
 }
 
-impl Tree {
-    /// Adds an object that has no name and no saved state.
+impl Shape {
+    /// Adds an object that has no name.
     pub(super) fn add_anonymous(&mut self, object: u64) {
         self.anonymous.insert(object);
-        self.bytes.insert(object, Arc::default());
-        self.lines.insert(object, Arc::default());
         self.identities.insert(object, MergeFileIdentity(object));
         self.fresh_names.insert(object);
     }
@@ -305,19 +302,230 @@ impl Tree {
         self.paths_of(object).next().is_some()
     }
 
+    /// The keys a change to `object` touches: its identity and every path naming it.
+    fn keys_of(&self, object: u64, keys: &mut BTreeSet<queue::Key>) {
+        if let Some(id) = self.identities.get(&object) {
+            keys.insert(queue::Key::File(*id));
+        }
+        keys.extend(
+            self.paths_of(object)
+                .map(|p| queue::Key::Name(p.to_owned())),
+        );
+    }
+
+    /// The one transition of names, objects and identities for a step of this
+    /// tree, which the actor runs at the call and the builder at the build;
+    /// the keys it touched. A fork's step is the caller's (it copies another
+    /// tree), and a save's is [`Shape::save`].
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotFound`] for a name or object the tree lacks, and
+    /// [`Error::Format`] for a take that would put two files on one object.
+    pub(super) fn apply(
+        &mut self,
+        change: &Change,
+        step: EventNumber,
+    ) -> Result<BTreeSet<queue::Key>> {
+        let mut keys = BTreeSet::new();
+        match change {
+            Change::Create { path, .. } => {
+                let object = step.object();
+                self.names.insert(path.clone(), object);
+                self.identities.insert(object, MergeFileIdentity(object));
+                self.fresh_names.insert(object);
+                self.keys_of(object, &mut keys);
+            }
+            Change::Link { object, path, .. } => {
+                if !self.anonymous.remove(object) {
+                    return Err(Error::NotFound);
+                }
+                self.names.insert(path.clone(), *object);
+                self.keys_of(*object, &mut keys);
+            }
+            Change::Rename { from, to, .. } => {
+                let object = self.names.get(from).copied().ok_or(Error::NotFound)?;
+                self.keys_of(object, &mut keys);
+                let replaced = self.names.get(to).copied();
+                if let Some(replaced) = replaced {
+                    self.keys_of(replaced, &mut keys);
+                }
+                self.names.remove(from);
+                match replaced {
+                    Some(replaced) if self.fresh_names.contains(&object) => {
+                        let id = *self.identities.get(&replaced).ok_or(Error::Format)?;
+                        self.identities.insert(object, id);
+                        if !self.fresh_names.contains(&replaced) {
+                            self.fresh_names.remove(&object);
+                        }
+                    }
+                    _ => {
+                        self.fresh_names.remove(&object);
+                    }
+                }
+                self.names.insert(to.clone(), object);
+                keys.insert(queue::Key::Name(to.clone()));
+            }
+            Change::Unlink { path, .. } => {
+                let object = self.names.get(path).copied().ok_or(Error::NotFound)?;
+                self.keys_of(object, &mut keys);
+                self.names.remove(path);
+            }
+            Change::Take { take, .. } => self.take(take, &mut keys)?,
+            Change::Save { .. } | Change::Fork { .. } => {}
+        }
+        Ok(keys)
+    }
+
+    /// A close's part: an anonymous object's close drops it; any other
+    /// changes no name. The keys a saved file's change touches.
+    pub(super) fn save(&mut self, object: u64, outcome: SaveOutcome) -> BTreeSet<queue::Key> {
+        let mut keys = BTreeSet::new();
+        match outcome {
+            SaveOutcome::AnonymousDropped => self.drop_object(object),
+            SaveOutcome::Saved { .. } => self.keys_of(object, &mut keys),
+            SaveOutcome::Unchanged | SaveOutcome::OrphanDropped => {}
+        }
+        keys
+    }
+
     pub(super) fn drop_object(&mut self, object: u64) {
-        self.bytes.remove(&object);
-        self.lines.remove(&object);
+        self.anonymous.remove(&object);
         self.identities.remove(&object);
         self.fresh_names.remove(&object);
+    }
+
+    /// A take: the files and names it changed laid over this tree's, as
+    /// installing its whole snapshot would leave them.
+    fn take(&mut self, take: &TakeRecord, keys: &mut BTreeSet<queue::Key>) -> Result<()> {
+        // Each named file: its object, path and whether its name is fresh.
+        let mut files: BTreeMap<MergeFileIdentity, (u64, String, bool)> = BTreeMap::new();
+        for (path, object) in self.names.iter() {
+            let id = *self.identities.get(object).ok_or(Error::Format)?;
+            files
+                .entry(id)
+                .or_insert_with(|| (*object, path.clone(), self.fresh_names.contains(object)));
+        }
+        for (id, file) in &take.files {
+            keys.insert(queue::Key::File(*id));
+            if let Some((_, path, _)) = files.get(id) {
+                keys.insert(queue::Key::Name(path.clone()));
+            }
+            match file {
+                Some(file) => match files.get_mut(id) {
+                    Some(entry) => entry.0 = file.object,
+                    None => {
+                        files.insert(*id, (file.object, String::new(), false));
+                    }
+                },
+                None => {
+                    files.remove(id);
+                }
+            }
+        }
+        for (id, history) in &take.names {
+            keys.insert(queue::Key::File(*id));
+            let Some(entry) = files.get_mut(id) else {
+                continue;
+            };
+            let history = history.as_ref().ok_or(Error::Format)?;
+            keys.insert(queue::Key::Name(entry.1.clone()));
+            entry.1 = history.path()?.ok_or(Error::Format)?.to_owned();
+            entry.2 = history.head_version()?.over.is_none();
+        }
+        self.names.clear();
+        self.fresh_names.clear();
+        let mut objects = BTreeSet::new();
+        for (id, (object, path, fresh)) in files {
+            if !objects.insert(object) || path.is_empty() {
+                return Err(Error::Format);
+            }
+            keys.insert(queue::Key::Name(path.clone()));
+            self.names.insert(path, object);
+            self.identities.insert(object, id);
+            if fresh {
+                self.fresh_names.insert(object);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The actor's saved state of one tree: its shape and each object's saved
+/// bytes. No line map and no name history: those are the builder's.
+#[derive(Clone, Default)]
+pub(super) struct SavedTree {
+    pub(super) shape: Shape,
+    pub(super) bytes: BTreeMap<u64, Arc<FileBytes>>,
+}
+
+impl Deref for SavedTree {
+    type Target = Shape;
+
+    fn deref(&self) -> &Shape {
+        &self.shape
+    }
+}
+
+impl SavedTree {
+    /// The saved state a built tree shows.
+    pub(super) fn of(tree: &Tree) -> Self {
+        Self {
+            shape: tree.shape.clone(),
+            bytes: tree.bytes.clone(),
+        }
+    }
+
+    pub(super) fn add_anonymous(&mut self, object: u64) {
+        self.shape.add_anonymous(object);
+        self.bytes.insert(object, Arc::default());
+    }
+
+    pub(super) fn drop_object(&mut self, object: u64) {
+        self.shape.drop_object(object);
+        self.bytes.remove(&object);
+    }
+}
+
+/// The builder's state of one tree: its shape, bytes, line maps and name
+/// histories. A step builds on a copy and installs it after its commit is
+/// built, so file bytes and line maps sit behind `Arc`.
+#[derive(Clone, Default)]
+pub(super) struct Tree {
+    pub(super) shape: Shape,
+    pub(super) bytes: BTreeMap<u64, Arc<FileBytes>>,
+    pub(super) lines: BTreeMap<u64, Arc<Lines>>,
+    pub(super) namespace: BTreeMap<MergeFileIdentity, NameHistory>,
+}
+
+impl Deref for Tree {
+    type Target = Shape;
+
+    fn deref(&self) -> &Shape {
+        &self.shape
+    }
+}
+
+impl Tree {
+    /// Adds an object that has no name and no saved state.
+    pub(super) fn add_anonymous(&mut self, object: u64) {
+        self.shape.add_anonymous(object);
+        self.bytes.insert(object, Arc::default());
+        self.lines.insert(object, Arc::default());
+    }
+
+    pub(super) fn drop_object(&mut self, object: u64) {
+        self.shape.drop_object(object);
+        self.bytes.remove(&object);
+        self.lines.remove(&object);
     }
 
     /// Replaces the names and files with `snapshot`'s. Two files on one object
     /// would read each other's bytes, so a view could differ from its commit: a
     /// step that would do it fails before its record (finding 39).
     pub(super) fn install(&mut self, snapshot: referee::Snapshot) -> Result<()> {
-        self.names.clear();
-        self.fresh_names.clear();
+        self.shape.names.clear();
+        self.shape.fresh_names.clear();
         let mut objects = BTreeSet::new();
         for (id, file) in snapshot.files {
             if !objects.insert(file.object) {
@@ -326,16 +534,38 @@ impl Tree {
             let history = snapshot.names.get(&id).ok_or(Error::Format)?;
             let path = history.path()?.ok_or(Error::Format)?;
             if history.head_version()?.over.is_none() {
-                self.fresh_names.insert(file.object);
+                self.shape.fresh_names.insert(file.object);
             }
-            self.names.insert(path.to_owned(), file.object);
+            self.shape.names.insert(path.to_owned(), file.object);
             self.bytes
                 .insert(file.object, Arc::new(file.lines.bytes().into()));
             self.lines.insert(file.object, Arc::new(file.lines));
-            self.identities.insert(file.object, id);
+            self.shape.identities.insert(file.object, id);
         }
         self.namespace = snapshot.names;
         Ok(())
+    }
+
+    /// The tree as the referee reads it: each named file's object and lines,
+    /// and every name history.
+    pub(super) fn snapshot(&self) -> referee::Snapshot {
+        let files = self
+            .names
+            .values()
+            .map(|object| {
+                (
+                    self.identities[object],
+                    referee::File {
+                        object: *object,
+                        lines: (*self.lines[object]).clone(),
+                    },
+                )
+            })
+            .collect();
+        referee::Snapshot {
+            files,
+            names: self.namespace.clone(),
+        }
     }
 }
 
@@ -348,7 +578,7 @@ pub(super) struct MergeFileIdentity(pub(super) u64);
 
 /// A file's name versions, including deletion, travel in the same commit as
 /// its content. Each history is keyed by event number, which is volume-wide.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct NameHistory {
     pub(super) head: EventNumber,
     pub(super) versions: BTreeMap<EventNumber, NameVersion>,
@@ -430,28 +660,6 @@ impl NameHistory {
             }
         }
         Ok(combined)
-    }
-}
-
-impl TreeActor {
-    pub(super) fn snapshot_of(tree: &Tree) -> referee::Snapshot {
-        let files = tree
-            .names
-            .values()
-            .map(|object| {
-                (
-                    tree.identities[object],
-                    referee::File {
-                        object: *object,
-                        lines: (*tree.lines[object]).clone(),
-                    },
-                )
-            })
-            .collect();
-        referee::Snapshot {
-            files,
-            names: tree.namespace.clone(),
-        }
     }
 }
 

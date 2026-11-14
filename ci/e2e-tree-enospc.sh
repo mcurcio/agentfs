@@ -144,7 +144,8 @@ with open(sys.argv[1], 'wb', buffering=0) as f:
     except OSError as e:
         assert e.errno == errno.ENOSPC, e
 PY
-  kill -0 "$client" || { echo 'rename returned before filesystem was filled' >&2; exit 1; }
+  # A call waits at a call-path point; the builder's points are behind the call.
+  [ "${4:-held}" != held ] || kill -0 "$client" || { echo 'rename returned before filesystem was filled' >&2; exit 1; }
   if ! wait "$client"; then cat "$work/rename.log" >&2; exit 1; fi
   rm "$work/volume/filler"
   fusermount3 -u "$work/main"
@@ -159,12 +160,12 @@ PY
   "$bin" --state "$work/volume/state" trees init --volume t
   [ "$(git --git-dir="$gitdir" rev-parse root)" = "$head" ]
 }
-# Objects cannot be written: nothing is recorded, ENOSPC, the name stays.
-rename_while_full tree.before_objects ENOSPC source
+# The step's record cannot be written: nothing is recorded, ENOSPC, the name stays.
+rename_while_full tree.before_step ENOSPC source
 printf 'PASS\tenospc-before-commit-point\trename ENOSPC; source\n' | tee -a "$work/results.tsv"
-# The record stands and only the copies fail: the call succeeded.
-rename_while_full tree.after_commit_point NONE destination
-grep -Fq 'tree CopyStale' "$work/tree.after_commit_point.log" || { cat "$work/tree.after_commit_point.log" >&2; exit 1; }
+# The record stands and only the builder's copies fail: the call succeeded.
+rename_while_full tree.build_after_built_log NONE destination behind
+grep -Fq 'tree CopyStale' "$work/tree.build_after_built_log.log" || { cat "$work/tree.build_after_built_log.log" >&2; exit 1; }
 printf 'PASS\tenospc-after-commit-point\trename 0; destination\n' | tee -a "$work/results.tsv"
 # Only a failed fsync stops the actor: the file can no longer be trusted. A
 # write appends with no fsync, so the client's fsync is the one that fails.

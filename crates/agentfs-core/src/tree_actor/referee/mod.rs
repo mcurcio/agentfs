@@ -26,7 +26,7 @@ pub(super) struct Snapshot {
     pub names: BTreeMap<MergeFileIdentity, NameHistory>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct File {
     pub object: u64,
     pub lines: Lines,
