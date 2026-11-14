@@ -17,8 +17,15 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
 /// Every file commit, newest first: `rev-list` over every ref but the row
 /// chains under `refs/agentfs/`, which hold event commits (docs/trees.md,
-/// "Rows and event commits").
-pub const FILE_COMMITS: [&str; 3] = ["rev-list", "--exclude=refs/agentfs/*", "--all"];
+/// "Rows and event commits"), and the builder's scratch ref of a batch's
+/// event commits, `refs/build/rows`, there while a batch is in flight (a
+/// mount's attach is built while the harness reads).
+pub const FILE_COMMITS: [&str; 4] = [
+    "rev-list",
+    "--exclude=refs/agentfs/*",
+    "--exclude=refs/build/rows",
+    "--all",
+];
 
 /// A line version in a commit: the file's identity, the line's, the bytes.
 #[derive(Clone, Debug)]
