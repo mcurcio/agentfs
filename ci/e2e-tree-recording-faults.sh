@@ -34,7 +34,7 @@ drain_queue() {
   done
   echo 'queue did not drain' >&2; return 1
 }
-points=(tree.wal_before_header tree.wal_after_header tree.wal_after_payload tree.wal_before_fsync tree.wal_after_fsync tree.before_objects tree.after_objects_durable tree.after_commit_point tree.after_ref_copy tree.before_checkout tree.after_checkout)
+points=(tree.wal_before_header tree.wal_after_payload tree.wal_before_fsync tree.wal_after_fsync tree.before_objects tree.after_objects_durable tree.after_commit_point tree.after_ref_copy tree.before_checkout tree.after_checkout)
 for point in "${points[@]}"; do
   rm -rf "$work/state" "$work/main" "$work/sandbox"
   mkdir "$work/main" "$work/sandbox"
@@ -59,7 +59,10 @@ PY
   fusermount3 -u "$work/main"; fusermount3 -u "$work/sandbox"
   wait "$pid"; pid=
   case "$point" in
-    tree.wal_*) spec="$point=kill@2" ;; # The open is the first record.
+    # A write appends with no fsync: the client's fsync is the first. The open
+    # is the first record appended, the write the second.
+    tree.wal_*fsync) spec="$point=kill" ;;
+    tree.wal_*) spec="$point=kill@2" ;;
     *) spec="$point=kill" ;;
   esac
   start "$spec"

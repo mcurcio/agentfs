@@ -139,8 +139,9 @@ him to accept losing a call that returned, which the previous draft did (views.m
 |---|---|---|---|
 | `write`, `pwrite`, an `O_APPEND` write, `ftruncate` | appended to the tree's journal; the open file's copy changes only after (record first) | `ENOSPC` (the state area is full) or `EIO`; the open file is unchanged | the death of any agentfs process at once; power loss once the next row has returned |
 | a page a shared mapping writes back (`FUSE_WRITE_CACHE`) | only the bytes differing from what that page was last filled with or written back as, in one record naming the file, never the handle the kernel used; nothing if no byte changed. Then every write-open's copy follows. The next close of any write-open saves it: whole above the last step that closed a write-open of the file, and below that, for an open with an earlier call, only over bytes that open's own earlier calls touched, so a later mapped write stands against a later close (R9.16) and a third save is not reverted | `ENOSPC` or `EIO`, which the kernel keeps as the mapping's error; nothing changes | as the row above. A store not written back is in the kernel's page only: the death of the view host loses it, which Linux would keep (a cost of R1.4) |
-| `fsync`, `fdatasync`, `msync(MS_SYNC)`, each write on an `O_SYNC` or `O_DSYNC` open, and every `close` (FUSE `FLUSH`) of a handle whose records are not yet durable | the open's records made durable; one flush covers every record queued meanwhile (group commit, as today's journal) | `EIO` from that call; the records stay and the next one tries again | power loss |
-| `unlink`, `rename(2)`, path `truncate(2)` | journaled durably, then run (as today's namespace records) | the call's own error; nothing changed | power loss |
+| `fsync`, `fdatasync`, `msync(MS_SYNC)`, each write on an `O_SYNC` or `O_DSYNC` open, and every `close` (FUSE `FLUSH`) of a handle whose records are not yet durable | the open's records made durable; one flush covers every record queued meanwhile (group commit), and runs outside the actor's lock | the flush's error from that call; a failed flush stops the actor (§12) | power loss |
+| `fsync` of the view's directory (FSYNCDIR), or of a read-only descriptor | every record so far made durable, in the same group commit | as the row above | power loss, for every call before it |
+| `unlink`, `rename(2)`, path `truncate(2)` | appended to the journal, as a write is, then run | the call's own error; nothing changed | the death of any agentfs process at once; power loss once a flush covering it has returned (the two rows above) |
 | `RELEASE` (the last reference) | nothing to wait for: the actor saves from the journal (§6) | nothing can fail on recording, since every call is already recorded; the kernel ignores `RELEASE`'s answer anyway | — |
 
 Publication is the save, at `RELEASE`, as before: the actor builds the commit from the open's journaled calls and
@@ -182,8 +183,9 @@ that step moves: the commit point (§12). The open's records leave the journal a
 
 The journal is in the state area beside the repository, never under a tree or a mount (V4). The tree library has one
 journal per actor, holding every tree's records, because a step can move two trees' queues at once. Frames are checksummed
-and salted; a bad frame with no good one after it is a torn tail, saved aside, and one with a good one after it refuses
-to serve (`docs/runbooks/recording-failures.md`). How a view host appends without a path into the state area is
+and salted, and each carries the durable mark (the last record a finished flush covered when it was written). A bad
+frame that a later good frame's mark shows was durable refuses to serve (`docs/runbooks/recording-failures.md`); any
+other bad frame starts a torn tail, saved aside. How a view host appends without a path into the state area is
 parked (views.md).
 
 Compaction replaces the file with one checkpoint (every pointer, the fork upstreams, the live opens, the next number)
@@ -768,7 +770,7 @@ open saved once from the journal; a take is one step, so none is in progress); t
 not; the rest is a design choice.
 
 **One step, one journal record** (a recommendation the owner accepted, revisable; [OWNER-GUIDANCE.md](../../OWNER-GUIDANCE.md)). Each step
-writes its objects durably, then appends one synced journal record with every pointer it moves: the branch, queue
+writes its objects durably, then appends one journal record with every pointer it moves: the branch, queue
 entries, collision refs, the object table. That record is the commit point. Git's refs are then a copy, in the files
 format, and nothing decides from the copy: runtime reads come from the journal's pointers. Reftable's one atomic swap
 is no longer needed, and git's reftable writer could not survive a cut anyway (`reftable/writer.c` writes a table's
@@ -779,7 +781,7 @@ The order of a step:
 1. Build on a copy of the tree. Only objects the step changed are written, in process through libgit2, each fsynced
    with its fan-out directory; `objects/` is fsynced once, after the last, before the record names them.
 2. Check the pointers it moves against their current values.
-3. Append the record and fsync it: **the commit point**.
+3. Append the record, with no flush: **the commit point**. It survives power loss once a flush covers it (§3).
 4. Install the copy and apply the pointers.
 5. The copies: a fork's `config`, the refs, the private checkout.
 
@@ -796,7 +798,7 @@ step rebuilds the refs whole and redoes that checkout.
 | queue take | the branch, the entry deleted, the entries the move causes, the collision ref, the object table | the entry is still there only if the take has no record: take it again; collision refs are named by the losing commit, so a rerun makes the same names |
 | transaction begin, commit, rollback | not built | every `txn/*` branch is deleted, its index dropped and its deferred calls applied: a crash rolls back every open transaction (A13; R5.3's pick, §9). A commit's ref transaction either happened (the branch is gone, the transaction ended) or did not (rolled back) |
 | fork create | the branch and its upstream | `config` is rewritten from the journal before any git command; a dropped fork is not built |
-| journal | each call appended and synced before it returns (§3) | before any view serves the tree, each open with no record closing it is saved as its close would be, exactly once. A torn last frame is saved aside and discarded |
+| journal | each call appended before it returns, durable once a flush covers it (§3) | every frame is read, durable or not; a hole a later frame's mark shows was durable refuses to serve, any other bad tail is saved aside and discarded. Before any view serves the tree, each open with no record closing it is saved as its close would be, exactly once, and every record is flushed |
 | refs, `config`, `HEAD` | a copy of the records | `config` and `HEAD` are rewritten, then `refs/` and `packed-refs` are removed and every pointer is created in one `update-ref --stdin`, on every open, so this path always runs. A live `git` reader may see a step half copied |
 | locks | none: held in memory by the actor | none survive: open files ended with their clients and are saved from the journal (row above); an unfinished take has no record, so its entry is still there and is taken again. In the model a take is one step, so none is unfinished at a crash |
 | object table | a blob per tree, named by the step's record | rebuilt on each branch's snapshot, never by file identity; an open whose object no path names is replayed as an orphan (saves nothing, `OrphanDropped`) |

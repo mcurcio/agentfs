@@ -1,11 +1,11 @@
 //! The state area as the Volume domain reaches it (docs/trees.md, "Volume
 //! identity"): the [`StateArea`] port over the tree actor. `inspect` reads
 //! `format` and the identity file only; `create` makes a volume with a new id;
-//! `open` recovers the tree actor and keeps it for the other adapters.
+//! `open` recovers the tree actor and keeps it, served, for the other adapters.
 
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use agentfs_contracts::audit::{Audited, Principal};
 use agentfs_contracts::name::VolumeName;
@@ -16,25 +16,25 @@ use agentfs_contracts::volume::{
     EnsureOutcome, IoKind, VolumeError, VolumeEvent, VolumeId, VolumeIdentity, VolumeState,
 };
 
-use crate::tree_actor::{self, TreeActor};
+use crate::tree_actor::{self, Recording};
 
 /// A volume's state area at one path.
 pub struct TreeStateArea {
     root: PathBuf,
-    actor: Option<Arc<Mutex<TreeActor>>>,
+    recording: Option<Arc<Recording>>,
 }
 
 impl TreeStateArea {
     pub fn at(root: &Path) -> Self {
         Self {
             root: root.to_owned(),
-            actor: None,
+            recording: None,
         }
     }
 
-    /// The actor `open` recovered; `None` before.
-    pub fn actor(&self) -> Option<Arc<Mutex<TreeActor>>> {
-        self.actor.clone()
+    /// The volume `open` recovered, served; `None` before.
+    pub fn recording(&self) -> Option<Arc<Recording>> {
+        self.recording.clone()
     }
 }
 
@@ -65,7 +65,7 @@ impl StateArea for TreeStateArea {
         tree_actor::inspect(&self.root).map_err(|e| VolumeError::NotDurable(io_kind(&e)))
     }
 
-    /// [`TreeActor::create`] takes the state area's lock and inspects again
+    /// [`Recording::create`] takes the state area's lock and inspects again
     /// under it; a volume there by now (another launcher raced) is answered
     /// `Found`, with nothing written.
     fn create(
@@ -77,9 +77,10 @@ impl StateArea for TreeStateArea {
             name: name.clone(),
             id: VolumeId(uuid::Uuid::new_v4()),
         };
-        match TreeActor::create(&self.root, &identity, at) {
-            Ok(actor) => {
-                drop(actor);
+        match Recording::create(&self.root, &identity, at) {
+            Ok(recording) => {
+                // Every record durable before the call returns.
+                drop(recording);
                 Ok((identity, EnsureOutcome::Created))
             }
             Err(tree_actor::Error::Exists) => match self.inspect()? {
@@ -93,9 +94,13 @@ impl StateArea for TreeStateArea {
     }
 
     fn open(&mut self, at: &PodContext) -> Result<VolumeIdentity, VolumeError> {
-        let actor = TreeActor::open(&self.root, at).map_err(|e| volume_error(&e))?;
-        let identity = actor.identity().clone();
-        self.actor = Some(Arc::new(Mutex::new(actor)));
+        let recording = Recording::open(&self.root, at).map_err(|e| volume_error(&e))?;
+        let identity = recording
+            .actor()
+            .map_err(|e| volume_error(&e))?
+            .identity()
+            .clone();
+        self.recording = Some(recording);
         Ok(identity)
     }
 }

@@ -1,11 +1,13 @@
 //! The tree actor (git-model §3, §6, §7, §12 and §18; `docs/trees.md`).
 //!
 //! One exclusively locked actor owns a repository, private checkouts and a
-//! journal. Every call is fsynced before acknowledgement (deliberately stronger
-//! and slower than the target's group commit). A step's pointer changes are one
-//! journal record, the commit point: objects are durable before it, and Git's
-//! refs and the private checkouts are copies made after it, rebuilt from the
-//! journal at every open and after any failed copy. Nothing decides from a copy.
+//! journal. Every call is appended to the journal before it returns, with no
+//! fsync; a FLUSH, an fsync or an FSYNCDIR makes the records durable by group
+//! commit, outside the actor's lock ([`Recording`], [`Durability`]). A step's
+//! pointer changes are one journal record, the commit point: objects are
+//! durable before it, and Git's refs and the private checkouts are copies made
+//! after it, rebuilt from the journal at every open and after any failed copy.
+//! Nothing decides from a copy.
 
 mod call_path;
 mod history;
@@ -49,7 +51,7 @@ use recording::{Handle, pages};
 use stages::{Stages, Timer, Which};
 use tree::{EventNumber, Tree};
 
-const FORMAT: &str = "agentfs-trees-4\n";
+const FORMAT: &str = "agentfs-trees-5\n";
 /// The volume identity file: [`VolumeIdentity`] as JSON, written once by
 /// [`TreeActor::create`], read before any write at every open.
 const IDENTITY: &str = "volume";
@@ -92,6 +94,8 @@ pub enum Error {
     MissingObject { name: String, oid: Oid },
     #[error("pointer {name} is not at the value a step expected")]
     PointerMoved { name: String },
+    #[error(transparent)]
+    Durable(#[from] DurableError),
 }
 
 impl From<NotATree> for Error {
@@ -117,6 +121,7 @@ impl Error {
             Self::Name => libc::EINVAL,
             Self::TooLarge => libc::EFBIG,
             Self::Busy => libc::EBUSY,
+            Self::Durable(e) => e.errno(),
             Self::TreeGit(crate::tree_git::Error::NoSpace(_)) => libc::ENOSPC,
             Self::Io(e)
             | Self::TreeGit(crate::tree_git::Error::Io(e))
@@ -401,7 +406,7 @@ impl TreeActor {
         Journal::create(
             &root.join(JOURNAL),
             &Record {
-                seq: 0,
+                seq: RecordNo::ZERO,
                 at_ns: now_ns(),
                 entry: Entry::Checkpoint {
                     next_seq: 1,
@@ -594,9 +599,29 @@ impl TreeActor {
         metrics
     }
 
-    /// A failed actor must not keep answering reads from stale state.
+    /// A failed actor must not keep answering reads from stale state: it
+    /// stopped, its journal file is unknown, or a journal fsync failed.
     pub fn is_stopped(&self) -> bool {
-        self.stopped
+        self.stopped || self.journal.unknown() || self.journal.durability().has_failed()
+    }
+
+    /// The journal's group commit: what [`Recording`] waits on, outside the
+    /// actor's lock. Waiting on it with the actor locked holds every call.
+    pub fn durability(&self) -> &Arc<Durability> {
+        self.journal.durability()
+    }
+
+    /// The last record a FLUSH of `open` must cover: its open record, its
+    /// calls, its object's page writes.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotFound`] for no such open.
+    pub fn durable_through(&self, open: u64) -> Result<RecordNo> {
+        let h = self.handles.get(&open).ok_or(Error::NotFound)?;
+        let calls = h.calls.last().map_or(open, |(seq, _)| *seq);
+        let pages = self.pages_last_write(h.tree, h.object).unwrap_or(open);
+        Ok(RecordNo::new(open.max(calls).max(pages)))
     }
 
     pub fn head(&self, tree: TreeId) -> Result<Oid> {
@@ -630,7 +655,7 @@ impl TreeActor {
     }
 
     fn tree(&self, tree: TreeId) -> Result<&Tree> {
-        if self.stopped {
+        if self.is_stopped() {
             return Err(Error::Stopped);
         }
         self.trees.get(&tree).ok_or(Error::NotFound)
@@ -674,11 +699,11 @@ impl TreeActor {
     /// mutex between calls, so opens do not wait behind a waiting entry. A take
     /// that fails stays queued for the next event and this answers `Ok(false)`.
     pub fn progress(&mut self) -> Result<bool> {
-        if self.stopped {
+        if self.is_stopped() {
             return Err(Error::Stopped);
         }
         match self.progress_one() {
-            Err(e) if !self.stopped => {
+            Err(e) if !self.is_stopped() => {
                 eprintln!("tree SaveFailed: {e}");
                 Ok(false)
             }
@@ -699,7 +724,7 @@ impl TreeActor {
     /// One queue step in `tree`: its first entry P1 lets go is taken whole, in
     /// this one call. Failures are not swallowed, unlike [`TreeActor::progress`].
     pub fn take_next(&mut self, tree: TreeId) -> Result<Took> {
-        if self.stopped {
+        if self.is_stopped() {
             return Err(Error::Stopped);
         }
         self.tree(tree)?;
@@ -785,7 +810,7 @@ impl TreeActor {
     where
         F: FnOnce(&Self, EventNumber) -> Result<Draft>,
     {
-        if self.stopped {
+        if self.is_stopped() {
             return Err(Error::Stopped);
         }
         let started = Instant::now();
@@ -1125,7 +1150,11 @@ mod tests {
 
     #[test]
     fn an_older_format_is_refused() {
-        for older in ["agentfs-trees-2\n", "agentfs-trees-3\n"] {
+        for older in [
+            "agentfs-trees-2\n",
+            "agentfs-trees-3\n",
+            "agentfs-trees-4\n",
+        ] {
             let tmp = tempfile::tempdir().unwrap();
             drop(new_actor(tmp.path()));
             fs::write(tmp.path().join("format"), older).unwrap();

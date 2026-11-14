@@ -123,15 +123,39 @@ are those of the save it lands. A sync, a fork step and the Root commit are
   saves can align repeated lines differently. Stored bytes and identities do not
   change.
 
-`fsync` flushes the journal and the final release publishes the file.
+`fsync` and close make the file's calls durable; the final release publishes the
+file.
+
+## Recording and durability
+
+Every file call is in the journal before it returns: one frame, written with one
+`write(2)` and no fsync. A call that returned survives a crash or kill of agentfs,
+because its frame is in the kernel. It survives a power cut once one of these has
+returned:
+
+- `close(2)` of a descriptor that wrote (FUSE `FLUSH`), or `fsync(2)` of it;
+- each `write(2)` of a descriptor opened `O_SYNC` or `O_DSYNC`;
+- `fsync(2)` of the view's directory (FSYNCDIR), or of a read-only descriptor:
+  every record so far, creates, renames and unlinks included.
+
+A power cut loses the calls, renames and unlinks made since the last of these.
+Waits share fsyncs (group commit): one fsync answers every wait whose records were
+written before it began. The fsync runs off the view's request thread and outside
+the actor's lock, so a waiting close holds no other call. A failed fsync stops the
+actor: its waiters get its error and every later call `EIO` (see
+[Recovery](#recovery)).
 
 ## The library
 
 `agentfs_core::tree_actor::TreeActor` holds an exclusive state-area lease.
 `TreeActor::create` makes a volume, `TreeActor::open` recovers one and never creates,
-and `tree_actor::inspect` reads what a state area holds without the lease. Each
-recorded call names its writer as a `WriterAt` (the writer and its pod context). `write_open`,
-`write`, `truncate`, `sync` and `close` are the recorded calls. Upstream and fork
+and `tree_actor::inspect` reads what a state area holds without the lease.
+`tree_actor::Recording` serves a volume: the actor behind its one lock, with
+`durable`, `durable_all` and their deferred forms waiting for durability outside it.
+`Recording::open` makes every recovered record durable before it serves, and
+dropping the last `Recording` makes every record durable. Each recorded call names
+its writer as a `WriterAt` (the writer and its pod context). `write_open`, `write`,
+`truncate` and `close` are the recorded calls. Upstream and fork
 share one bare repository. A commit stores the files under `files/`, line maps in
 `metadata.json` and name versions in `namespace.json` (`Agentfs-Format:
 envelope-1`). Merge identity is separate from an open object's identity. See
@@ -140,7 +164,8 @@ envelope-1`). Merge identity is separate from an open object's identity. See
 ## The journal
 
 Every step's pointer changes (branch moves, queue entries, collision refs, object
-tables) are one fsynced record in `calls.wal`. That record is the commit point. Git's
+tables) are one record in `calls.wal`, appended as a call is and made durable as a
+call is. That record is the commit point. Git's
 refs are a copy in the files format, rebuilt on every open, and nothing decides from
 them. A `git` command run during a step may see the copy half written; each queue
 entry is a loose ref file.
@@ -161,14 +186,17 @@ A step writes its objects, checks and appends its record, then installs and copi
   length)` plus the live calls, and keeps only the page writes memory holds. A held
   file pins only its own calls. Frames are at most 96 MiB. The constants are not
   settings.
-- At the first invalid frame, a later valid frame with this journal's salt and a
-  higher number means corruption and refuses to open; none means a torn tail, saved
-  to `calls.wal.torn`. Bit rot in the very last frame reads as a tear and drops
-  that record; the log line and that file are the evidence.
+- Every frame carries the durable mark: the last record a finished fsync covered
+  when the frame was written. At the first invalid frame, a later valid frame with
+  this journal's salt whose mark passes the last valid record means a durable record
+  was lost: corruption, and the journal refuses to open. Otherwise the hole is a
+  torn tail of records no fsync had covered, saved to `calls.wal.torn` and cut off.
+  Bit rot in the very last frame, or in records not yet durable, reads as a tear
+  and drops those records; the log line and that file are the evidence.
 - The state area is `volume`, `history.git`, `calls.wal`, `actor.lock`, `format`
   and rebuilt private checkout caches, which the workload never sees. A create writes
   an `initializing` marker first and removes it last; the next `trees init` starts a
-  cut-short create over. **Earlier state formats (format 3 included) do not open**,
+  cut-short create over. **Earlier state formats (format 4 included) do not open**,
   and are never converted.
 
 ## The view
@@ -177,7 +205,8 @@ The FUSE adapter (`agentfs_fuse::tree_view`) uses zero entry and attribute TTLs 
 direct I/O, and negotiates neither passthrough nor the writeback cache. A read with
 no lock owner is a page fill and a write with `FUSE_WRITE_CACHE` is a page write.
 `max_background` is as high as the kernel allows, to keep a release ahead of a later
-open. The queue worker takes one entry at a time, releasing the actor between takes,
+open. One thread answers requests in order; a `FLUSH`, `FSYNC`, FSYNCDIR or `O_SYNC`
+write is answered from the journal's waiter thread once its records are durable. The queue worker takes one entry at a time, releasing the actor between takes,
 and drops the kernel's pages of files a take changed. A file open for writing
 holds back that fork's syncs from its upstream until it closes; no alarm is raised
 for a waiting open. See [library/filesystem.md](library/filesystem.md).

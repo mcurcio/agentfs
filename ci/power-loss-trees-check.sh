@@ -49,14 +49,15 @@ check_write() {
   fi
   [ "$got" = "$want" ] || fail "wrong bytes for $kind write $n"
 }
-# A write marked as soon as it returned: its bytes, saved at recovery (R12).
+# A write with no fsync, marked once its close returned: its bytes (git-model §3, R12).
 check_unsynced() {
   local n=$1 want got
   want=$(printf 'unsynced-%s\n' "$n" | sha256sum | cut -d' ' -f1)
   got=$(tree_git_file "$gitdir" root "x$n" | sha256sum | cut -d' ' -f1) || fail "missing unsynced write $n"
   [ "$got" = "$want" ] || fail "wrong bytes for unsynced write $n"
 }
-# A rename marked as soon as it returned: the new name, with the old one gone.
+# A rename marked once an fsync of the view's directory returned: the new name,
+# with the old one gone.
 check_rename() {
   local want got
   want=$(printf 'renamed\n' | sha256sum | cut -d' ' -f1)

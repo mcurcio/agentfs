@@ -1,5 +1,6 @@
-//! Recording: a tree's file calls, each journalled before it returns, and the steps that save
-//! them: create, close, rename and unlink (docs/recording.md; target git-model §7).
+//! Recording: a tree's file calls, each journalled (in the kernel, no fsync) before it returns,
+//! and the steps that save them: create, close, rename and unlink (docs/recording.md; target
+//! git-model §7).
 
 pub(super) mod pages;
 
@@ -385,20 +386,12 @@ impl TreeActor {
         )
     }
 
-    /// fsync/FLUSH records durability, not publication. Every call is already durable.
-    pub fn sync(&self) -> Result<()> {
-        if self.stopped {
-            return Err(Error::Stopped);
-        }
-        self.journal.sync()
-    }
-
     /// RELEASE publishes calls against this tree's head, never the stale open
     /// base. A failed save changes nothing and answers its errno: the close
     /// stays pending, its handle still counting as open, and saves first at the
     /// next step in its tree and at restart.
     pub fn close(&mut self, handle: u64) -> Result<Saved> {
-        if self.stopped {
+        if self.is_stopped() {
             return Err(Error::Stopped);
         }
         let tree = self.handles.get(&handle).ok_or(Error::NotFound)?.tree;

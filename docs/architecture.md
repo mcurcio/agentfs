@@ -81,21 +81,21 @@ missing from these tables or a row names a module that no longer exists;
 | `lib.rs` | Crate root: the module list and the engine's overview |
 | `volume.rs` | Opens a state area: crash recovery, then the [`Recorder`](#the-synchronous-step) used at every boundary and the `Committer` that turns records into commits |
 | `record.rs` | What the journal stores: one record per change boundary, absolute state, never deltas |
-| `state_area.rs` | The `StateArea` port over the tree actor: inspect without the lock, create a volume with a new id, open and keep the recovered actor |
+| `state_area.rs` | The `StateArea` port over the tree actor: inspect without the lock, create a volume with a new id, open and keep the recovered volume, served (`Recording`) |
 | `tree_actor/mod.rs` | The tree actor: the actor, recovery and queue orchestration. A step is one unit of work: built, recorded in the journal, installed, copied out; creating a volume (its identity file, then `format` last), inspecting and opening a state area, recovery; queue takes and their plans |
 | `tree_actor/history/mod.rs` | Tree history: snapshots read from and written to commits (`metadata.json`, `namespace.json`), object tables, the owners of direct saves, direct saves, queue entries and private checkouts |
-| `tree_actor/call_path.rs` | The call path as a view host, the CLI and the conformance replay reach it (`Recording`): the actor behind its one lock, with durability waits and lag-gate waits outside it. Its bodies are not built yet |
+| `tree_actor/call_path.rs` | The call path as a view host, the CLI and the conformance replay reach it (`Recording`): the actor behind its one lock, with durability waits outside it, blocking or deferred to a callback; dropping it makes every record durable. Its history, lag-gate and take bodies are not built yet |
 | `tree_actor/history/built.rs` | History as built, the one owner of a tree volume's Git store: the built point, built snapshots, built and failed events, each tree's lag. Its bodies are not built yet |
 | `tree_actor/history/message.rs` | Every message a tree-view commit carries, its one home: each message's bytes (Root, direct saves, landings, syncs) with the volume and pod trailers, and the readers of its trailers, the landed writer's among them (target git-model §5) |
 | `tree_actor/history/refs.rs` | The ref layout of a tree volume's history, its one home: branches, queues and their entries, collision refs, object tables, and the tips that reach every save (target git-model §4) |
 | `tree_actor/history/take.rs` | Queue takes as history: a landing judged by the referee into its upstream, and a fork's prefix sync planned and built from its upstream's commits |
 | `tree_actor/history/upstreams.rs` | Each fork's upstream, the shape of a volume's trees: added when a fork is made, checked at recovery, and written as the journal's checkpoint and Git's config |
-| `tree_actor/journal/mod.rs` | The actor's journal: salted checksummed frames, the commit point for calls and pointer steps, torn-tail and corruption rules, compaction (target git-model §3) |
+| `tree_actor/journal/mod.rs` | The actor's journal: salted checksummed frames, each appended with one write and no fsync and carrying the durable mark, the commit point for calls and pointer steps, torn-tail and corruption rules, compaction (target git-model §3) |
 | `tree_actor/journal/commit_point.rs` | The actor's appends to the journal and when it compacts, with the checkpoint a compaction writes |
-| `tree_actor/journal/durable.rs` | The journal's one numbering (`RecordNo`) and its durable mark: one fsync leader whose fsync covers every record appended before it began (group commit). Its bodies are not built yet |
+| `tree_actor/journal/durable.rs` | The journal's one numbering (`RecordNo`) and its durable mark: one fsync leader whose fsync covers every record appended before it began (group commit), and a waiter thread that answers deferred waits |
 | `tree_actor/journal/fold.rs` | What a journal's frames add up to, pure: pointers, upstreams, live opens with their calls, and page writes (target git-model §12) |
 | `tree_actor/pointers.rs` | Branches, queue entries, collision refs and object tables as the journal leaves them: pure, no I/O |
-| `tree_actor/recording/mod.rs` | Recording: a tree's file calls (open, read, write, truncate), each journalled before it returns, and the steps that save them: create, close, rename, unlink |
+| `tree_actor/recording/mod.rs` | Recording: a tree's file calls (open, read, write, truncate), each journalled (no fsync) before it returns, and the steps that save them: create, close, rename, unlink |
 | `tree_actor/recording/pages.rs` | The kernel's one page cache per file: page fills, page writes and the size replies for shared mappings (rules ledger, R1.4) |
 | `tree_actor/queue.rs` | Queue and locks: P1 eligibility, held keys and the `Cut` of a prefix sync |
 | `tree_actor/referee/mod.rs` | The referee: every line and name rule of a fork and its upstream, pure. `land` composes verdicts, names, placing and whole into a decision; `sync` keeps a fork's undecided versions; `touches` gives a step's lock keys |
@@ -203,7 +203,7 @@ missing from these tables or a row names a module that no longer exists;
 
 | Module | Role |
 |---|---|
-| `tree_view.rs` | Main/sandbox FUSE views over one target-model actor: direct I/O, saved-reader snapshots, byte-call writes, and the kernel's page fills, page writes and invalidations for shared mappings (rules ledger, R1.4) |
+| `tree_view.rs` | Main/sandbox FUSE views over one target-model actor: direct I/O, saved-reader snapshots, byte-call writes, FLUSH, FSYNC, FSYNCDIR and `O_SYNC` writes answered once durable, and the kernel's page fills, page writes and invalidations for shared mappings (rules ledger, R1.4) |
 | `lib.rs` | Crate root and overview |
 | `ops.rs` | Every filesystem operation without the kernel, unit-tested against a real directory and state area |
 | `fuse.rs` | The kernel adapter: `fuser::Filesystem` over `Ops`, and kernel passthrough negotiation |

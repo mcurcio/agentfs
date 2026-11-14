@@ -35,7 +35,7 @@ fn frames(journal: &[u8]) -> Vec<(usize, usize)> {
         let field = |offset: usize| {
             u32::from_le_bytes(journal[at + offset..at + offset + 4].try_into().unwrap()) as usize
         };
-        let length = 24 + field(8) + field(12);
+        let length = 44 + field(28) + field(32);
         result.push((at, length));
         at += length;
     }
@@ -116,7 +116,8 @@ fn byte_calls_match_a_plain_linux_file_and_publish_only_at_release() {
             v.read_open(h).unwrap(),
             fs::read(tmp.path().join("plain")).unwrap()
         );
-        v.sync().unwrap();
+        // FLUSH and fsync make records durable; they publish nothing.
+        v.durability().make_all_durable().unwrap();
         assert_eq!(v.read(ROOT, "a").unwrap(), b"foo");
     }
     v.close(h).unwrap();
@@ -417,6 +418,9 @@ fn incomplete_tail_is_discarded_but_a_bad_frame_with_a_later_one_is_not() {
     let tmp = tempfile::tempdir().unwrap();
     let mut v = new_actor(tmp.path());
     put(&mut v, ROOT, "a", b"saved");
+    // Durable, then a later frame: its mark says the bad one was on disk.
+    v.durability().make_all_durable().unwrap();
+    put(&mut v, ROOT, "b", b"later");
     drop(v);
     let path = tmp.path().join("calls.wal");
     let valid = fs::read(&path).unwrap();
@@ -970,6 +974,8 @@ fn a_bad_frame_before_a_good_one_is_corruption() {
     let mut v = new_actor(tmp.path());
     let h = v.write_open(ROOT, "a", &writer("writer"), true).unwrap();
     v.write(h, 0, b"one", false).unwrap();
+    // Durable before the next frame is written: that frame's mark says so.
+    v.durability().make_all_durable().unwrap();
     v.write(h, 3, b"two", false).unwrap();
     drop(v);
     let path = tmp.path().join("calls.wal");
@@ -995,10 +1001,13 @@ fn a_bad_frame_before_a_good_one_is_corruption() {
 fn a_frame_in_a_workloads_bytes_is_not_a_frame() {
     // A whole valid frame of some other journal, with a high number.
     fn forged(salt: u32) -> Vec<u8> {
-        let head =
-            br#"{"seq":999999,"at_ns":0,"entry":{"AnonymousOpen":{"tree":ROOT,"writer":"w"}}}"#;
-        let mut frame = b"AFJ2".to_vec();
+        let head = br#"{"at_ns":0,"entry":{"AnonymousOpen":{"tree":ROOT,"writer":"w"}}}"#;
+        let mut frame = b"AFJ3".to_vec();
         frame.extend_from_slice(&salt.to_le_bytes());
+        frame.extend_from_slice(&999_999_u64.to_le_bytes());
+        // A mark past every record: were it this journal's, a hole would be corruption.
+        frame.extend_from_slice(&999_999_u64.to_le_bytes());
+        frame.extend_from_slice(&0_u32.to_le_bytes());
         frame.extend_from_slice(&(head.len() as u32).to_le_bytes());
         frame.extend_from_slice(&0_u32.to_le_bytes());
         frame.extend_from_slice(&crc32fast::hash(head).to_le_bytes());
@@ -1622,7 +1631,7 @@ fn a_failed_write_changes_nothing_and_keeps_serving() {
     v.write(h, 0, b"one", false).unwrap();
     let path = tmp.path().join("calls.wal");
     let journal = fs::read(&path).unwrap();
-    for point in ["tree.wal_after_header", "tree.wal_after_payload"] {
+    for point in ["tree.wal_before_header", "tree.wal_after_payload"] {
         let guard = agentfs_core::failpoints::configure(&format!("{point}=error")).unwrap();
         assert!(v.write(h, 3, b"lost", false).is_err(), "{point}");
         drop(guard);
@@ -1642,10 +1651,15 @@ fn a_failed_fsync_stops_the_actor() {
     let mut v = new_actor(tmp.path());
     let h = v.write_open(ROOT, "a", &writer("writer"), true).unwrap();
     v.write(h, 0, b"one", false).unwrap();
+    v.write(h, 3, b"unknown", false).unwrap();
     let guard = agentfs_core::failpoints::configure("tree.wal_before_fsync=error").unwrap();
-    assert!(v.write(h, 3, b"unknown", false).is_err());
+    assert!(v.durability().make_all_durable().is_err());
     drop(guard);
     assert!(v.is_stopped());
+    assert!(matches!(
+        v.write(h, 10, b"more", false),
+        Err(Error::Stopped)
+    ));
     assert!(matches!(v.read(ROOT, "a"), Err(Error::Stopped)));
     drop(v);
     let v = reopen(tmp.path());

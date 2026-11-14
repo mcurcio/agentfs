@@ -36,6 +36,8 @@
 
 #[path = "support/crash_oracle.rs"]
 mod crash_oracle;
+#[path = "support/trees.rs"]
+mod trees;
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -737,4 +739,54 @@ fn kill_or_fail_at_every_engine_point() {
         failures.join("\n\n")
     );
     eprintln!("{total} crash cases passed");
+}
+
+/// A tree view's write is appended to the journal, with no fsync, before it
+/// returns: in the kernel, it outlives a kill of agentfs. The child is killed
+/// as the write's frame is written (its second append, after the create);
+/// the next open, on the same kernel, saves it as the write's close would.
+#[test]
+fn a_kill_after_a_write_returned_keeps_it() {
+    use agentfs_contracts::pod::PodContext;
+    use agentfs_core::tree_actor::{Recording, TreeActor, TreeId};
+
+    if let Some(dir) = std::env::var_os("TREE_CRASH_CHILD") {
+        let rec =
+            Recording::create(Path::new(&dir), &trees::identity(), &PodContext::default()).unwrap();
+        let mut v = rec.actor().unwrap();
+        let h = v
+            .write_open(TreeId::Root, "a", &trees::writer("w"), true)
+            .unwrap();
+        v.write(h, 0, b"kept", false).unwrap();
+        unreachable!("the failpoint kills the child at the write");
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("state");
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "a_kill_after_a_write_returned_keeps_it",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env("TREE_CRASH_CHILD", &dir)
+        .env(
+            agentfs_core::failpoints::ENV_VAR,
+            "tree.wal_after_payload=kill@2",
+        )
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.signal(),
+        Some(libc_sigkill()),
+        "the child was not killed: {stderr}"
+    );
+    assert!(stderr.contains("agentfs failpoint tree.wal_after_payload triggered (kill)"));
+    let v = TreeActor::open(&dir, &PodContext::default()).unwrap();
+    assert_eq!(v.read(TreeId::Root, "a").unwrap(), b"kept");
 }

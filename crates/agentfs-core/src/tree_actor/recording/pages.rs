@@ -305,6 +305,14 @@ impl TreeActor {
         Ok(())
     }
 
+    /// The last page write journalled for `object` while the file has a
+    /// write-open: what a FLUSH of any of its opens must make durable.
+    pub(in crate::tree_actor) fn pages_last_write(&self, tree: TreeId, object: u64) -> Option<u64> {
+        self.pages
+            .get(&(tree, object))
+            .and_then(|state| state.writes.last().map(|(seq, _)| *seq))
+    }
+
     /// The size every reply must give the kernel for `object` while the file has
     /// a write-open: the arrival-order length, because the kernel keeps one size
     /// per inode and drops cached pages past any smaller size it is told

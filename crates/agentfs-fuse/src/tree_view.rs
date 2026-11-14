@@ -16,7 +16,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use agentfs_contracts::clients::FileOwner;
 use agentfs_contracts::pod::WriterAt;
 use agentfs_contracts::views::MountOptions;
-use agentfs_core::tree_actor::{Error, Saved, TreeActor, TreeId};
+use agentfs_core::tree_actor::{Error, Recording, Saved, TreeActor, TreeId};
 use fuser::*;
 
 const TTL: Duration = Duration::ZERO;
@@ -38,18 +38,18 @@ pub struct Binding {
 /// outside the private state and separate from one another.
 pub fn serve(
     state: &Path,
-    actor: TreeActor,
+    recording: Arc<Recording>,
     bindings: Vec<Binding>,
     options: MountOptions,
 ) -> io::Result<()> {
-    serve_with_metrics(state, actor, bindings, options, None)
+    serve_with_metrics(state, recording, bindings, options, None)
 }
 
 /// Serve views with optional process-local measurement snapshots. The output
 /// belongs outside the state area and views; no measurement affects decisions.
 pub fn serve_with_metrics(
     state: &Path,
-    volume: TreeActor,
+    actor: Arc<Recording>,
     bindings: Vec<Binding>,
     options: MountOptions,
     metrics_output: Option<&Path>,
@@ -71,7 +71,11 @@ pub fn serve_with_metrics(
                 "trees mounts must be empty directories, separate from state and each other",
             ));
         }
-        volume.head(binding.tree).map_err(io::Error::other)?;
+        actor
+            .actor()
+            .map_err(io::Error::other)?
+            .head(binding.tree)
+            .map_err(io::Error::other)?;
         points.push(at);
     }
     let metrics_output = metrics_output
@@ -96,7 +100,6 @@ pub fn serve_with_metrics(
             Ok(path)
         })
         .transpose()?;
-    let actor = Arc::new(Mutex::new(volume));
     let signal = Arc::new(ProgressSignal::default());
     let mut sessions = Vec::new();
     let mut notifiers: Vec<(TreeId, Notifier)> = Vec::new();
@@ -143,9 +146,7 @@ pub fn serve_with_metrics(
             }
             loop {
                 let (progressed, changed) = {
-                    let mut volume = progress_actor
-                        .lock()
-                        .map_err(|_| io::Error::other("tree actor poisoned"))?;
+                    let mut volume = progress_actor.actor().map_err(io::Error::other)?;
                     let progressed = volume.progress().map_err(io::Error::other)?;
                     (progressed, volume.drain_changed())
                 };
@@ -166,10 +167,7 @@ pub fn serve_with_metrics(
         std::thread::spawn(move || -> io::Result<()> {
             loop {
                 let last = stop.load(Ordering::Acquire);
-                let metrics = actor
-                    .lock()
-                    .map_err(|_| io::Error::other("tree actor poisoned"))?
-                    .metrics();
+                let metrics = actor.actor().map_err(io::Error::other)?.metrics();
                 let bytes = serde_json::to_vec(&metrics)?;
                 let temporary =
                     output.with_extension(format!("metrics-{}.tmp", std::process::id()));
@@ -205,6 +203,8 @@ pub fn serve_with_metrics(
     result?;
     progress_result?;
     metrics_result?;
+    // A failed journal fsync stops the actor off this thread: serving ends with it.
+    drop(actor.actor().map_err(io::Error::other)?);
     Ok(())
 }
 
@@ -213,14 +213,12 @@ pub fn serve_with_metrics(
 #[cfg(feature = "failpoints")]
 fn run_take_gate(
     mut gate: agentfs_core::failpoints::TakeGate,
-    actor: &Mutex<TreeActor>,
+    actor: &Recording,
     notifiers: &[(TreeId, Notifier)],
 ) -> io::Result<()> {
     while let Some(tree) = gate.next_tree()? {
         let (took, changed) = {
-            let mut volume = actor
-                .lock()
-                .map_err(|_| io::Error::other("tree actor poisoned"))?;
+            let mut volume = actor.actor().map_err(io::Error::other)?;
             let took = tree
                 .parse::<TreeId>()
                 .map_err(|e| e.to_string())
@@ -274,7 +272,7 @@ fn session_config(options: &MountOptions) -> Config {
 }
 
 struct View {
-    actor: Arc<Mutex<TreeActor>>,
+    actor: Arc<Recording>,
     signal: Arc<ProgressSignal>,
     tree: TreeId,
     by: WriterAt,
@@ -345,19 +343,40 @@ enum Open {
         handle: u64,
         append: bool,
         readable: bool,
+        /// `O_SYNC` or `O_DSYNC`: each write is durable before it is answered.
+        sync: bool,
     },
+}
+
+/// A write-open's actor handle; `None` for a read-only open.
+fn open_handle(open: &Open) -> Option<u64> {
+    match open {
+        Open::Write { handle, .. } => Some(*handle),
+        Open::Read(_) => None,
+    }
 }
 
 fn errno(error: Error) -> Errno {
     Errno::from_i32(error.errno())
 }
 
+/// Whether an open's writes must each be durable before they are answered.
+fn sync_flags(flags: i32) -> bool {
+    flags & (libc::O_SYNC | libc::O_DSYNC) != 0
+}
+
+/// A FLUSH, FSYNC or FSYNCDIR answered once its records are durable, from
+/// whichever thread the durability wait ends on.
+fn answer_empty(reply: ReplyEmpty) -> agentfs_core::tree_actor::Then {
+    Box::new(move |result| match result {
+        Ok(()) => reply.ok(),
+        Err(e) => reply.error(errno(e)),
+    })
+}
+
 impl View {
     fn actor(&self) -> Result<ActorGuard<'_>> {
-        let v = self.actor.lock().map_err(|_| Errno::EIO)?;
-        if v.is_stopped() {
-            return Err(Errno::EIO);
-        }
+        let v = self.actor.actor().map_err(|_| Errno::EIO)?;
         Ok(ActorGuard {
             volume: v,
             signal: &self.signal,
@@ -454,6 +473,7 @@ impl View {
                 handle,
                 append: flags & libc::O_APPEND != 0,
                 readable: flags & libc::O_ACCMODE == libc::O_RDWR,
+                sync: sync_flags(flags),
             }
         } else {
             if create {
@@ -595,6 +615,7 @@ impl Filesystem for View {
                     handle,
                     append: flags & libc::O_APPEND != 0,
                     readable: flags & libc::O_ACCMODE == libc::O_RDWR,
+                    sync: sync_flags(flags),
                 },
             );
             drop(handles);
@@ -667,23 +688,39 @@ impl Filesystem for View {
         _owner: Option<LockOwner>,
         reply: ReplyWrite,
     ) {
+        // The guards drop before a durability wait is queued.
         let result = (|| {
             let mut v = self.actor()?;
             let handles = self.handles()?;
             match handles.entries.get(&fh.0).ok_or(Errno::EBADF)? {
-                Open::Write { handle, .. }
+                Open::Write { handle, sync, .. }
                     if write_flags.contains(WriteFlags::FUSE_WRITE_CACHE) =>
                 {
-                    v.page_writeback(*handle, offset, data).map_err(errno)
+                    v.page_writeback(*handle, offset, data).map_err(errno)?;
+                    Ok(sync.then_some(*handle))
                 }
-                Open::Write { handle, append, .. } => {
-                    v.write(*handle, offset, data, *append).map_err(errno)
+                Open::Write {
+                    handle,
+                    append,
+                    sync,
+                    ..
+                } => {
+                    v.write(*handle, offset, data, *append).map_err(errno)?;
+                    Ok(sync.then_some(*handle))
                 }
                 _ => Err(Errno::EBADF),
             }
         })();
+        let written = data.len() as u32;
         match result {
-            Ok(()) => reply.written(data.len() as u32),
+            Ok(None) => reply.written(written),
+            Ok(Some(handle)) => self.actor.durable_then(
+                handle,
+                Box::new(move |result| match result {
+                    Ok(()) => reply.written(written),
+                    Err(e) => reply.error(errno(e)),
+                }),
+            ),
             Err(e) => reply.error(e),
         }
     }
@@ -739,28 +776,63 @@ impl Filesystem for View {
             Err(e) => reply.error(e),
         }
     }
+    /// close(2): the open's records made durable before close returns. The
+    /// fsync runs off this thread; the reply comes when it ends.
     fn flush(
         &self,
         _req: &Request,
         _ino: INodeNo,
-        _fh: FileHandle,
+        fh: FileHandle,
         _owner: LockOwner,
         reply: ReplyEmpty,
     ) {
-        match self.actor().and_then(|v| v.sync().map_err(errno)) {
-            Ok(()) => reply.ok(),
-            Err(e) => reply.error(e),
+        let handle = match self
+            .handles()
+            .map(|h| h.entries.get(&fh.0).map(open_handle))
+        {
+            Ok(Some(handle)) => handle,
+            Ok(None) => return reply.error(Errno::EBADF),
+            Err(e) => return reply.error(e),
+        };
+        match handle {
+            Some(handle) => self.actor.durable_then(handle, answer_empty(reply)),
+            None => reply.ok(),
         }
     }
+    /// A write-open's records made durable; a read-only descriptor's fsync
+    /// makes every record durable, as FSYNCDIR does.
     fn fsync(
         &self,
-        req: &Request,
-        ino: INodeNo,
+        _req: &Request,
+        _ino: INodeNo,
         fh: FileHandle,
         _datasync: bool,
         reply: ReplyEmpty,
     ) {
-        self.flush(req, ino, fh, LockOwner(0), reply);
+        let handle = match self
+            .handles()
+            .map(|h| h.entries.get(&fh.0).map(open_handle))
+        {
+            Ok(Some(handle)) => handle,
+            Ok(None) => return reply.error(Errno::EBADF),
+            Err(e) => return reply.error(e),
+        };
+        match handle {
+            Some(handle) => self.actor.durable_then(handle, answer_empty(reply)),
+            None => self.actor.durable_all_then(answer_empty(reply)),
+        }
+    }
+    /// The directory's names: every record durable (renames, unlinks and
+    /// creates included).
+    fn fsyncdir(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        _fh: FileHandle,
+        _datasync: bool,
+        reply: ReplyEmpty,
+    ) {
+        self.actor.durable_all_then(answer_empty(reply));
     }
     fn release(
         &self,
@@ -903,12 +975,12 @@ mod tests {
     use agentfs_contracts::pod::PodContext;
     use agentfs_contracts::volume::{VolumeId, VolumeIdentity};
 
-    fn new_actor(dir: &Path) -> TreeActor {
+    fn new_actor(dir: &Path) -> Arc<Recording> {
         let identity = VolumeIdentity {
             name: VolumeName::parse("test").unwrap(),
             id: VolumeId(uuid::Uuid::from_u128(1)),
         };
-        TreeActor::create(dir, &identity, &PodContext::default()).unwrap()
+        Recording::create(dir, &identity, &PodContext::default()).unwrap()
     }
 
     fn writer(label: &str) -> WriterAt {
@@ -973,7 +1045,7 @@ mod tests {
     fn anonymous_inode_attributes_are_available_without_a_file_handle() {
         let tmp = tempfile::tempdir().unwrap();
         let view = View {
-            actor: Arc::new(Mutex::new(new_actor(tmp.path()))),
+            actor: new_actor(tmp.path()),
             signal: Arc::new(ProgressSignal::default()),
             tree: TreeId::Root,
             by: writer("client"),
@@ -995,6 +1067,7 @@ mod tests {
                 handle,
                 append: false,
                 readable: true,
+                sync: false,
             },
         );
         let attr = view.attr(&volume, ino, None).unwrap();
@@ -1007,7 +1080,7 @@ mod tests {
     fn a_readers_snapshot_survives_a_later_save_and_readonly_truncation_is_refused() {
         let tmp = tempfile::tempdir().unwrap();
         let view = View {
-            actor: Arc::new(Mutex::new(new_actor(tmp.path()))),
+            actor: new_actor(tmp.path()),
             signal: Arc::new(ProgressSignal::default()),
             tree: TreeId::Root,
             by: writer("client"),

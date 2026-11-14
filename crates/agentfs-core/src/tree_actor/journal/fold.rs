@@ -168,7 +168,7 @@ pub(in crate::tree_actor) fn fold(frames: &[Frame]) -> Result<Folded> {
         folded.add_open(LiveOpen::parse(open)?);
     }
     for (record, tail) in frames {
-        let seq = record.seq;
+        let seq = record.seq.get();
         folded.next_seq = folded.next_seq.max(seq.saturating_add(1));
         match &record.entry {
             Entry::Checkpoint { .. } => return Err(Error::Format),

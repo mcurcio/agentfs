@@ -259,4 +259,8 @@ that node.
 
 ## Tree views
 
-The [tree views](trees.md) have their own limits, which that page lists.
+The [tree views](trees.md) have their own limits, which that page lists. A tree
+view records every call in its journal before the call returns, so a returned call
+survives a crash of agentfs. It survives a power cut once the file's `close(2)` or
+`fsync(2)`, an `O_SYNC` write, or an `fsync(2)` of the view's directory has
+returned ([trees.md](trees.md#recording-and-durability)).

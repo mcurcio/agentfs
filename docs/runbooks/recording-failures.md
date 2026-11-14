@@ -169,9 +169,10 @@ This section is for the tree actor ([trees](../trees.md)),
 whose journal is `calls.wal` and whose refs are a copy of it. Recovery is manual:
 agentfs repairs neither case itself.
 
-- **`CorruptJournal(offset)`.** A frame is bad and a good frame follows it, so this is
-  not a torn write. `CorruptJournal(0)` also means the journal is missing or holds no
-  frame.
+- **`CorruptJournal(offset)`.** A frame is bad and a later good frame's durable mark
+  says a record at or after the bad one had been flushed to disk, so this is not a torn
+  write: the disk lost data it had acknowledged. `CorruptJournal(0)` also means the
+  journal is missing or holds no frame.
 - **`MissingObject`.** A pointer's commit, tree or blob is gone. The error names the
   pointer and the object.
 
@@ -187,10 +188,15 @@ Truncating `calls.wal` at the offset loses every later record: those saves stop
 existing, and the same refs show what they were. Recovery rebuilds the refs from the
 journal on open, so a truncation overwrites any newer copy.
 
-A `tree JournalTail` line with a `calls.wal.torn` file means a last frame was dropped
-at open. This is the expected result of a cut mid-write, and the actor keeps going. It
-can also be bit rot in the very last frame, which looks the same: the log line and the
-file are the evidence. The file keeps the bytes of every tear, appended.
+A `tree JournalTail` line with a `calls.wal.torn` file means frames no flush had
+covered were dropped at open: calls made since the last `close`, `fsync` or FSYNCDIR
+before a power cut. This is the expected result of a cut, and the actor keeps going. It
+can also be bit rot in records not yet flushed, which looks the same: the log line and
+the file are the evidence. The file keeps the bytes of every tear, appended.
+
+A `tree JournalFsyncFailed` line means a flush of `calls.wal` failed and the actor
+stopped: every later call answers `EIO`. Fix the disk or space problem, then restart;
+recovery reads every frame still in the file.
 
 ## Verify
 

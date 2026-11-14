@@ -166,19 +166,26 @@ printf 'PASS\tenospc-before-commit-point\trename ENOSPC; source\n' | tee -a "$wo
 rename_while_full tree.after_commit_point NONE destination
 grep -Fq 'tree CopyStale' "$work/tree.after_commit_point.log" || { cat "$work/tree.after_commit_point.log" >&2; exit 1; }
 printf 'PASS\tenospc-after-commit-point\trename 0; destination\n' | tee -a "$work/results.tsv"
-# Only a failed fsync stops the actor: the file can no longer be trusted.
+# Only a failed fsync stops the actor: the file can no longer be trusted. A
+# write appends with no fsync, so the client's fsync is the one that fails.
 rm -rf "$work/volume/state"
 "$bin" --state "$work/volume/state" trees init --volume t
 AGENTFS_FAILPOINTS='tree.wal_before_fsync=error' "$bin" --state "$work/volume/state" trees mount "$work/main" >"$work/fsync-mount.log" 2>&1 & pid=$!
 wait_mounted "$work/main"
-python3 - "$work/main/after-fsync" <<'PY'
+python3 - "$work/main/synced" "$work/main/after-fsync" <<'PY'
 import errno, os, sys
-try:
-    os.close(os.open(sys.argv[1], os.O_CREAT | os.O_WRONLY, 0o600))
-except OSError as e:
-    assert e.errno == errno.EIO, e
-else:
-    raise AssertionError('create succeeded after a failed fsync')
+def expect_eio(what, call):
+    try:
+        call()
+    except OSError as e:
+        assert e.errno == errno.EIO, (what, e)
+    else:
+        raise AssertionError(f'{what} succeeded after a failed fsync')
+fd = os.open(sys.argv[1], os.O_CREAT | os.O_WRONLY, 0o600)
+assert os.write(fd, b'x') == 1
+expect_eio('fsync', lambda: os.fsync(fd))
+expect_eio('close', lambda: os.close(fd))
+expect_eio('create', lambda: os.close(os.open(sys.argv[2], os.O_CREAT | os.O_WRONLY, 0o600)))
 PY
 fusermount3 -u "$work/main"
 expect_stopped "$work/fsync-mount.log"

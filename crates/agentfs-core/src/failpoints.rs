@@ -39,7 +39,6 @@ pub const POINTS: &[&str] = &[
     "tree.init_before_format",
     "tree.after_ref_rebuild",
     "tree.wal_before_header",
-    "tree.wal_after_header",
     "tree.wal_after_payload",
     "tree.wal_before_fsync",
     "tree.wal_after_fsync",

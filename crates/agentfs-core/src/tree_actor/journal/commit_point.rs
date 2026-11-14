@@ -1,6 +1,7 @@
 //! The journal's commit point: appending a step's record, and compacting the journal behind it
 //! (target git-model §3).
 
+use super::durable::RecordNo;
 use super::{CompactError, Entry, OpenRecord, Record};
 use crate::tree_actor::recording::pages;
 use crate::tree_actor::stages::{Timer, Which};
@@ -13,19 +14,21 @@ pub(in crate::tree_actor) fn compact_at(len_after_last: u64) -> u64 {
 }
 
 impl TreeActor {
-    /// Appends one record that moves no pointer, or the step `run_step` built.
-    /// Only a file that can no longer be trusted stops the actor.
+    /// Appends one record that moves no pointer, or the step `run_step` built,
+    /// with no fsync: the journal's [`Durability`](super::durable::Durability)
+    /// makes it durable when a caller asks. Only a file that can no longer be
+    /// trusted stops the actor.
     pub(in crate::tree_actor) fn journal_record(
         &mut self,
         entry: Entry,
         tail: &[u8],
     ) -> Result<u64> {
-        if self.stopped {
+        if self.is_stopped() {
             return Err(Error::Stopped);
         }
         let seq = self.next;
         let record = Record {
-            seq,
+            seq: RecordNo::new(seq),
             at_ns: now_ns(),
             entry,
         };
@@ -58,7 +61,7 @@ impl TreeActor {
             })
             .collect();
         let checkpoint = Record {
-            seq: 0,
+            seq: RecordNo::ZERO,
             at_ns: now_ns(),
             entry: Entry::Checkpoint {
                 next_seq: self.next,
@@ -77,7 +80,7 @@ impl TreeActor {
             .retained(|record| match &record.entry {
                 Entry::Call { handle, .. } => handles.contains_key(handle),
                 Entry::PageWrite { tree, object, .. } => match tree.parse() {
-                    Ok(tree) => pages::holds(pages, tree, *object, record.seq),
+                    Ok(tree) => pages::holds(pages, tree, *object, record.seq.get()),
                     Err(_) => {
                         unparsed.set(true);
                         true

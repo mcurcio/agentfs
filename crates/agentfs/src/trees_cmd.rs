@@ -4,6 +4,7 @@
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
 
 use agentfs_contracts::caps::{LaunchCap, LaunchScope, Minter};
 use agentfs_contracts::clients::{AttachedLookup, ClientSet, FileOwner};
@@ -13,7 +14,7 @@ use agentfs_contracts::ports::{Event, EventSink, Found, StateArea};
 use agentfs_contracts::views::MountOptions;
 use agentfs_contracts::volume::{EnsureOutcome, StartPoint, Volume, VolumeError, VolumeSpec};
 use agentfs_core::state_area::TreeStateArea;
-use agentfs_core::tree_actor::{self, TreeActor, TreeId};
+use agentfs_core::tree_actor::{self, Recording, TreeId};
 use agentfs_fuse::tree_view::{Binding, serve_with_metrics};
 use agentfs_volume::VolumeService;
 use anyhow::{Context, Result, bail};
@@ -125,8 +126,11 @@ pub fn run(state: &Path, args: Args, minter: &Minter) -> Result<ExitCode> {
     match args.command {
         Command::Init { volume, pod } => init(state, &volume, &context(&pod)?, minter),
         Command::Fork { pod } => {
-            let mut actor = open(state, &context(&pod)?)?;
-            println!("{}", actor.fork()?);
+            let recording = open(state, &context(&pod)?)?;
+            let fork = recording.actor()?.fork()?;
+            // Durable before the id is printed: dropping the volume fsyncs.
+            drop(recording);
+            println!("{fork}");
             Ok(ExitCode::SUCCESS)
         }
         Command::Mount {
@@ -163,7 +167,7 @@ pub fn run(state: &Path, args: Args, minter: &Minter) -> Result<ExitCode> {
                     at: at.clone(),
                 })
             };
-            let mut actor = open(state, &at)?;
+            let recording = open(state, &at)?;
             let mut bindings = vec![Binding {
                 tree: TreeId::Root,
                 by: by(&writer)?,
@@ -175,10 +179,10 @@ pub fn run(state: &Path, args: Args, minter: &Minter) -> Result<ExitCode> {
                     if fork.is_root() {
                         bail!("--fork must name an existing fork/N, not the root");
                     }
-                    actor.head(fork)?;
+                    recording.actor()?.head(fork)?;
                     fork
                 } else {
-                    actor.fork()?
+                    recording.actor()?.fork()?
                 };
                 eprintln!("sandbox tree: {tree}");
                 bindings.push(Binding {
@@ -191,16 +195,22 @@ pub fn run(state: &Path, args: Args, minter: &Minter) -> Result<ExitCode> {
             let options = MountOptions {
                 allow_other: !no_allow_other,
             };
-            serve_with_metrics(state, actor, bindings, options, metrics_output.as_deref())
-                .context("serving tree views")?;
+            serve_with_metrics(
+                state,
+                recording,
+                bindings,
+                options,
+                metrics_output.as_deref(),
+            )
+            .context("serving tree views")?;
             Ok(ExitCode::SUCCESS)
         }
     }
 }
 
 /// Recovers the volume; never creates one.
-fn open(state: &Path, at: &PodContext) -> Result<TreeActor> {
-    TreeActor::open(state, at).context("opening tree state")
+fn open(state: &Path, at: &PodContext) -> Result<Arc<Recording>> {
+    Recording::open(state, at).context("opening tree state")
 }
 
 /// `ensure` as the volume's own launcher, then recovery of what it found or

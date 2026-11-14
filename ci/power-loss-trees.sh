@@ -99,19 +99,22 @@ for n in range(1, 3):
     os.close(fd); mark('SC', n)
     for kind in ('SW', 'SF', 'SC'):
         append(disk, f'{kind} {n}')
-# A write and a rename marked straight after they return, with no fsync or close
-# before the mark: only the journal's own fsync of the call can keep them
-# (git-model §3). The last acknowledged rename of the run.
+# A write with no fsync, marked once close(2) returned: the close's FLUSH makes
+# the open's calls durable (git-model §3). A rename, marked once an fsync of
+# the view's directory returned: FSYNCDIR makes every record durable. The last
+# acknowledged rename of the run.
 for n in range(1, 3):
     fd = os.open(f'{root}/x{n}', os.O_CREAT | os.O_WRONLY, 0o600)
     data = f'unsynced-{n}\n'.encode()
     assert os.write(fd, data) == len(data)
-    mark('XW', n); append(disk, f'XW {n}')
     os.close(fd)
+    mark('XW', n); append(disk, f'XW {n}')
 fd = os.open(f'{root}/y', os.O_CREAT | os.O_WRONLY, 0o600)
 assert os.write(fd, b'renamed\n') == 8
 os.fsync(fd); os.close(fd)
 os.rename(f'{root}/y', f'{root}/r')
+viewfd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+os.fsync(viewfd); os.close(viewfd)
 mark('RN', 1); append(disk, 'RN 1')
 PYWORK
 fusermount3 -u "$work/main"; fusermount3 -u "$work/sandbox"

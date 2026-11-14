@@ -4,9 +4,10 @@
 use std::path::Path;
 use std::sync::Mutex;
 
+use agentfs_contracts::pod::PodContext;
 use agentfs_core::tree_actor::stages::Stages;
-use agentfs_core::tree_actor::{TreeActor, TreeId};
-use trees::{new_actor, reopen, writer};
+use agentfs_core::tree_actor::{Recording, TreeActor, TreeId};
+use trees::{identity, new_actor, reopen, writer};
 
 #[path = "support/trees.rs"]
 mod trees;
@@ -86,7 +87,8 @@ fn stages_add_up() {
     let expect = [
         // the open, the truncate, the write, and the close as a pointer step.
         ("journal_append", 4 * SAVES),
-        ("journal_fsync", 4 * SAVES),
+        // A call is appended with no fsync; only a FLUSH, fsync or FSYNCDIR syncs.
+        ("journal_fsync", 0),
         ("compaction", 0),
         ("align", SAVES),
         ("objects", SAVES),
@@ -108,8 +110,43 @@ fn stages_add_up() {
     assert_eq!(after.saves - before.saves, SAVES);
     assert!(after.journal_bytes > before.journal_bytes);
     // Durations are only measured, never exact: each ran and none ran backwards.
-    assert!(after.stages.journal_fsync.nanos > before.stages.journal_fsync.nanos);
+    assert!(after.stages.journal_append.nanos > before.stages.journal_append.nanos);
     assert!(after.stages.objects.max_nanos > 0);
+}
+
+/// Calls are appended with no fsync, and a FLUSH makes all of an open's
+/// records durable with one: close_4k's path (open, truncate, write, FLUSH,
+/// RELEASE) does one journal fsync where it did four.
+#[test]
+fn a_call_is_not_fsynced_and_flush_fsyncs_once() {
+    let _one = ONE_AT_A_TIME.lock().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let rec = Recording::create(
+        &tmp.path().join("state"),
+        &identity(),
+        &PodContext::default(),
+    )
+    .unwrap();
+    let w = writer("test-writer");
+    let before = Stages::current();
+    let h = {
+        let mut v = rec.actor().unwrap();
+        let h = v.write_open(TreeId::Root, "a", &w, true).unwrap();
+        v.truncate(h, 0).unwrap();
+        for i in 0..8_u64 {
+            v.write(h, i * 512, &[b'x'; 512], false).unwrap();
+        }
+        h
+    };
+    let written = Stages::current();
+    assert_eq!(written.journal_fsync.count, before.journal_fsync.count);
+    rec.durable(h).unwrap();
+    // Covered already: a second FLUSH finds nothing to sync.
+    rec.durable(h).unwrap();
+    rec.actor().unwrap().close(h).unwrap();
+    let after = Stages::current();
+    assert_eq!(after.journal_fsync.count - before.journal_fsync.count, 1);
+    assert_eq!(after.journal_append.count - before.journal_append.count, 11);
 }
 
 /// A save's cost grows with its change, not the tree: one changed file in a

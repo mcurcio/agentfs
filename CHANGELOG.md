@@ -12,6 +12,11 @@ design was reviewed on 2026-10-12.
 
 ### Added
 
+- **Tree views: a call is journalled without an fsync.** A write, create, rename
+  or unlink is in the journal before it returns and survives a crash of agentfs;
+  close, fsync, an `O_SYNC` write or an fsync of the view's directory make it
+  power-cut safe, with waits sharing one fsync. The journal's frame format is now
+  `AFJ3` and the state format `agentfs-trees-5`; older tree state areas do not open.
 - **Recording.** A FUSE filesystem (`agentfs mount`) that durably records
   every change boundary (a close after a change, a rename, a delete, a
   link) before the call returns, through a journal with group commit and

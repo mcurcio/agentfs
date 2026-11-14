@@ -3,20 +3,27 @@
 //!
 //! ```text
 //! frame  = header head tail
-//! header = "AFJ2" | u32le salt | u32le head_len | u32le tail_len
-//!          | u32le crc32(head + tail) | u32le crc32(first 20 header bytes)
-//! head   = JSON of Record
+//! header = "AFJ3" | u32le salt | u64le record | u64le mark | u32le flags
+//!          | u32le head_len | u32le tail_len | u32le crc32(head + tail)
+//!          | u32le crc32(first 40 header bytes)                    (44 bytes)
+//! head   = JSON of the record's time and entry
 //! tail   = the raw bytes of the record's calls or runs, in order
+//! mark   = the durable mark when the frame was appended
+//! flags  = 0
 //! ```
 //!
-//! Each write-open and step names its writer with the pod context it ran in
-//! (`WriterAt`), so a recovery close commits as the writer that opened.
-//! Format 4's `format` file gates the records' shape: the frame magic stays.
+//! A frame is appended with one `write`, and no fsync: a record is in the
+//! kernel when the call returns, and durable once a FLUSH, an fsync or an
+//! FSYNCDIR has made it so ([`durable`]). The header is the record number's
+//! one home. Each write-open and step names its writer with the pod context it
+//! ran in (`WriterAt`), so a recovery close commits as the writer that opened.
 //!
 //! The salt is random per journal and kept through compaction, so a workload's
-//! bytes inside a tail cannot pass as a frame. An invalid frame with no later
-//! valid frame is a torn tail; with one it is corruption, which an operator
-//! decides about (docs/runbooks/recording-failures.md).
+//! bytes inside a tail cannot pass as a frame. At an invalid frame after the
+//! last valid record `r`, a later valid frame whose mark passes `r` shows that
+//! a record in the hole was durable: that is corruption, which an operator
+//! decides about (docs/runbooks/recording-failures.md). Otherwise the hole is
+//! a torn tail, records no fsync had covered: it is saved aside and cut off.
 
 mod commit_point;
 pub(super) mod durable;
@@ -27,6 +34,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use agentfs_contracts::pod::WriterAt;
 use serde::{Deserialize, Serialize};
@@ -34,21 +42,52 @@ use serde::{Deserialize, Serialize};
 use super::stages::{Timer, Which};
 use super::{Error, Result};
 pub(super) use commit_point::compact_at;
+use durable::{Durability, RecordNo};
 pub(super) use fold::{FoldedOpen, LiveOpen, fold};
 
-const MAGIC: &[u8; 4] = b"AFJ2";
-const HEADER: usize = 24;
+const MAGIC: &[u8; 4] = b"AFJ3";
+const HEADER: usize = 44;
+/// The header bytes its own checksum covers.
+const HEADER_SUMMED: usize = 40;
 pub(super) const MAX_FRAME: usize = 96 << 20;
 
 /// One frame as a record and its tail bytes.
 pub(super) type Frame = (Record, Vec<u8>);
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// One record: its number is read from and written to the frame's header.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct Record {
-    pub seq: u64,
+    pub seq: RecordNo,
     /// Audit only: no rule reads it (ledger R2).
     pub at_ns: u64,
     pub entry: Entry,
+}
+
+/// A record's head as the frame stores it: everything but its number.
+#[derive(Serialize)]
+struct HeadOut<'a> {
+    at_ns: u64,
+    entry: &'a Entry,
+}
+
+#[derive(Deserialize)]
+struct HeadIn {
+    at_ns: u64,
+    entry: Entry,
+}
+
+impl Record {
+    fn head(&self) -> serde_json::Result<Vec<u8>> {
+        serde_json::to_vec(&HeadOut {
+            at_ns: self.at_ns,
+            entry: &self.entry,
+        })
+    }
+
+    fn parse(seq: RecordNo, head: &[u8]) -> serde_json::Result<Self> {
+        let HeadIn { at_ns, entry } = serde_json::from_slice(head)?;
+        Ok(Self { seq, at_ns, entry })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -138,11 +177,12 @@ pub(super) enum CompactError {
 }
 
 pub(super) struct Journal {
-    file: File,
+    file: Arc<File>,
     path: PathBuf,
     length: u64,
     salt: u32,
     unknown: bool,
+    durability: Arc<Durability>,
 }
 
 fn crc_body(head: &[u8], tail: &[u8]) -> u32 {
@@ -158,53 +198,88 @@ fn u32_at(bytes: &[u8], at: usize) -> u32 {
     u32::from_le_bytes(value)
 }
 
-/// `None` when the frame would exceed [`MAX_FRAME`].
-fn header(salt: u32, head: &[u8], tail: &[u8]) -> Option<[u8; HEADER]> {
+fn u64_at(bytes: &[u8], at: usize) -> u64 {
+    let mut value = [0; 8];
+    value.copy_from_slice(&bytes[at..at + 8]);
+    u64::from_le_bytes(value)
+}
+
+/// What a valid header says.
+#[derive(Clone, Copy)]
+struct Header {
+    record: RecordNo,
+    mark: RecordNo,
+    head: usize,
+    tail: usize,
+    crc: u32,
+}
+
+/// One frame's bytes in one buffer: header, head, tail. `None` when the frame
+/// would exceed [`MAX_FRAME`].
+fn frame_bytes(
+    salt: u32,
+    record: RecordNo,
+    mark: RecordNo,
+    head: &[u8],
+    tail: &[u8],
+) -> Option<Vec<u8>> {
     if head.len().checked_add(tail.len())? > MAX_FRAME {
         return None;
     }
-    let mut bytes = [0; HEADER];
-    bytes[..4].copy_from_slice(MAGIC);
-    bytes[4..8].copy_from_slice(&salt.to_le_bytes());
-    bytes[8..12].copy_from_slice(&u32::try_from(head.len()).ok()?.to_le_bytes());
-    bytes[12..16].copy_from_slice(&u32::try_from(tail.len()).ok()?.to_le_bytes());
-    bytes[16..20].copy_from_slice(&crc_body(head, tail).to_le_bytes());
-    let header_crc = crc32fast::hash(&bytes[..20]);
-    bytes[20..24].copy_from_slice(&header_crc.to_le_bytes());
+    let mut bytes = Vec::with_capacity(HEADER + head.len() + tail.len());
+    bytes.extend_from_slice(MAGIC);
+    bytes.extend_from_slice(&salt.to_le_bytes());
+    bytes.extend_from_slice(&record.get().to_le_bytes());
+    bytes.extend_from_slice(&mark.get().to_le_bytes());
+    bytes.extend_from_slice(&0_u32.to_le_bytes());
+    bytes.extend_from_slice(&u32::try_from(head.len()).ok()?.to_le_bytes());
+    bytes.extend_from_slice(&u32::try_from(tail.len()).ok()?.to_le_bytes());
+    bytes.extend_from_slice(&crc_body(head, tail).to_le_bytes());
+    let header_crc = crc32fast::hash(&bytes[..HEADER_SUMMED]);
+    bytes.extend_from_slice(&header_crc.to_le_bytes());
+    bytes.extend_from_slice(head);
+    bytes.extend_from_slice(tail);
     Some(bytes)
 }
 
-/// The lengths in a header whose magic, salt and checksum are right.
-fn header_lengths(bytes: &[u8], salt: u32) -> Option<(usize, usize, u32)> {
+/// A header whose magic, salt and checksum are right.
+fn read_header(bytes: &[u8], salt: u32) -> Option<Header> {
     if bytes.len() < HEADER
         || &bytes[..4] != MAGIC
         || u32_at(bytes, 4) != salt
-        || u32_at(bytes, 20) != crc32fast::hash(&bytes[..20])
+        || u32_at(bytes, HEADER_SUMMED) != crc32fast::hash(&bytes[..HEADER_SUMMED])
     {
         return None;
     }
-    let head = u32_at(bytes, 8) as usize;
-    let tail = u32_at(bytes, 12) as usize;
+    let head = u32_at(bytes, 28) as usize;
+    let tail = u32_at(bytes, 32) as usize;
     if head.checked_add(tail)? > MAX_FRAME {
         return None;
     }
-    Some((head, tail, u32_at(bytes, 16)))
+    Some(Header {
+        record: RecordNo::new(u64_at(bytes, 8)),
+        mark: RecordNo::new(u64_at(bytes, 16)),
+        head,
+        tail,
+        crc: u32_at(bytes, 36),
+    })
 }
 
-/// A whole valid frame at the start of `bytes`: its head, tail and length.
-fn read_frame(bytes: &[u8], salt: u32) -> Option<(&[u8], &[u8], usize)> {
-    let (head_len, tail_len, crc) = header_lengths(bytes, salt)?;
-    let length = HEADER + head_len + tail_len;
+/// A whole valid frame at the start of `bytes`: its header, head and tail.
+fn read_frame(bytes: &[u8], salt: u32) -> Option<(Header, &[u8], &[u8])> {
+    let header = read_header(bytes, salt)?;
+    let length = HEADER + header.head + header.tail;
     if bytes.len() < length {
         return None;
     }
-    let head = &bytes[HEADER..HEADER + head_len];
-    let tail = &bytes[HEADER + head_len..length];
-    (crc_body(head, tail) == crc).then_some((head, tail, length))
+    let head = &bytes[HEADER..HEADER + header.head];
+    let tail = &bytes[HEADER + header.head..length];
+    (crc_body(head, tail) == header.crc).then_some((header, head, tail))
 }
 
-/// Whether a later valid frame of this journal follows `seq`.
-fn later_frame(bytes: &[u8], salt: u32, seq: u64) -> bool {
+/// Whether a later valid frame of this journal says a record past `last` was
+/// durable when it was written: then a hole after `last` lost durable records.
+fn durable_past(bytes: &[u8], salt: u32, last: RecordNo) -> bool {
     let mut pattern = [0; 8];
     pattern[..4].copy_from_slice(MAGIC);
     pattern[4..].copy_from_slice(&salt.to_le_bytes());
@@ -213,8 +288,7 @@ fn later_frame(bytes: &[u8], salt: u32, seq: u64) -> bool {
         .enumerate()
         .filter(|(_, window)| *window == pattern)
         .filter_map(|(at, _)| read_frame(&bytes[at..], salt))
-        .filter_map(|(head, _, _)| serde_json::from_slice::<Record>(head).ok())
-        .any(|record| record.seq > seq)
+        .any(|(header, _, _)| header.mark > last)
 }
 
 fn sync_parent(path: &Path) -> io::Result<()> {
@@ -236,7 +310,16 @@ fn temporary(path: &Path) -> PathBuf {
     PathBuf::from(name)
 }
 
+/// The last record a checkpoint covers: every record before its `next_seq`.
+fn covered_by(checkpoint: &Record) -> RecordNo {
+    match &checkpoint.entry {
+        Entry::Checkpoint { next_seq, .. } => RecordNo::new(next_seq.saturating_sub(1)),
+        _ => checkpoint.seq,
+    }
+}
+
 /// Writes one checkpoint and `retained` to the temporary name and syncs them.
+/// The file is synced whole, so every frame carries the mark of what it covers.
 fn write_temporary(
     path: &Path,
     salt: u32,
@@ -250,15 +333,14 @@ fn write_temporary(
         .write(true)
         .mode(0o600)
         .open(&temp)?;
+    let mark = covered_by(checkpoint);
     for (record, tail) in std::iter::once((checkpoint, &[][..]))
         .chain(retained.iter().map(|(r, t)| (r, t.as_slice())))
     {
-        let head = serde_json::to_vec(record)?;
-        let bytes =
-            header(salt, &head, tail).ok_or_else(|| io::Error::from_raw_os_error(libc::EFBIG))?;
+        let head = record.head()?;
+        let bytes = frame_bytes(salt, record.seq, mark, &head, tail)
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::EFBIG))?;
         file.write_all(&bytes)?;
-        file.write_all(&head)?;
-        file.write_all(tail)?;
     }
     file.sync_all()?;
     Ok(temp)
@@ -273,14 +355,17 @@ impl Journal {
         Ok(())
     }
 
-    /// The journal and its frames. At a torn tail: saves its bytes to
+    /// The journal and every valid frame, durable or not (a killed agentfs
+    /// leaves its appends in the kernel). At a torn tail: saves its bytes to
     /// `calls.wal.torn`, logs `tree JournalTail: <n> bytes at <offset>`,
-    /// truncates and syncs.
+    /// truncates and syncs. The durable mark starts at the highest mark a frame
+    /// carries; the caller makes the rest durable before serving.
     ///
     /// # Errors
     ///
     /// [`Error::CorruptJournal`] for a missing or frameless file (offset 0), or
-    /// at an invalid frame with a later valid one. Nothing is changed then.
+    /// at an invalid frame that a later valid frame's mark shows held a durable
+    /// record. Nothing is changed then.
     pub fn open(path: &Path) -> Result<(Self, Vec<Frame>)> {
         let bytes = match fs::read(path) {
             Ok(bytes) => bytes,
@@ -295,25 +380,34 @@ impl Journal {
         let salt = u32_at(&bytes, 4);
         let mut frames: Vec<Frame> = Vec::new();
         let mut offset = 0;
-        let mut last = 0;
+        // The last frame's number, and the last record the valid frames hold.
+        let mut last = RecordNo::ZERO;
+        let mut covered = RecordNo::ZERO;
+        let mut mark = RecordNo::ZERO;
         let mut torn = false;
         while offset < bytes.len() {
-            let Some((head, tail, length)) = read_frame(&bytes[offset..], salt) else {
-                if offset == 0 || later_frame(&bytes[offset + 1..], salt, last) {
+            let Some((header, head, tail)) = read_frame(&bytes[offset..], salt) else {
+                if offset == 0 || durable_past(&bytes[offset + 1..], salt, covered) {
                     return Err(Error::CorruptJournal(offset));
                 }
                 torn = true;
                 break;
             };
-            let record: Record =
-                serde_json::from_slice(head).map_err(|_| Error::CorruptJournal(offset))?;
+            let record =
+                Record::parse(header.record, head).map_err(|_| Error::CorruptJournal(offset))?;
             let is_checkpoint = matches!(record.entry, Entry::Checkpoint { .. });
             if is_checkpoint != (offset == 0) || (offset != 0 && record.seq <= last) {
                 return Err(Error::CorruptJournal(offset));
             }
             last = record.seq;
+            covered = covered.max(if is_checkpoint {
+                covered_by(&record)
+            } else {
+                record.seq
+            });
+            mark = mark.max(header.mark);
             frames.push((record, tail.to_vec()));
-            offset += length;
+            offset += HEADER + header.head + header.tail;
         }
         let file = OpenOptions::new().read(true).write(true).open(path)?;
         if torn {
@@ -332,6 +426,8 @@ impl Journal {
             file.set_len(offset as u64)?;
             file.sync_all()?;
         }
+        let file = Arc::new(file);
+        let durability = Durability::new(Arc::clone(&file), covered, mark);
         Ok((
             Self {
                 file,
@@ -339,57 +435,42 @@ impl Journal {
                 length: offset as u64,
                 salt,
                 unknown: false,
+                durability,
             },
             frames,
         ))
     }
 
-    /// Appends one frame and syncs it: when this returns Ok the record stands.
+    /// Appends one frame: one buffer, one `write`, no fsync. When this returns
+    /// Ok the record is in the kernel and stands against a crash of agentfs;
+    /// [`Durability`] makes it stand against a power cut.
     ///
     /// # Errors
     ///
     /// A failed write whose rollback worked: the error, file as before. A
-    /// failed sync or rollback: the error, and [`Journal::unknown`] turns true.
+    /// failed rollback: the error, and [`Journal::unknown`] turns true.
     pub fn append(&mut self, record: &Record, tail: &[u8]) -> Result<()> {
         if self.unknown {
             return Err(Error::Stopped);
         }
         let _timer = Timer::start(Which::JournalAppend);
-        let head = serde_json::to_vec(record)?;
-        let bytes = header(self.salt, &head, tail).ok_or(Error::TooLarge)?;
+        let head = record.head()?;
+        let bytes = frame_bytes(self.salt, record.seq, self.durability.mark(), &head, tail)
+            .ok_or(Error::TooLarge)?;
         let at = self.length;
         let written = (|| -> io::Result<()> {
             crate::failpoints::hit("tree.wal_before_header")?;
             self.file.write_all_at(&bytes, at)?;
-            crate::failpoints::hit("tree.wal_after_header")?;
-            self.file.write_all_at(&head, at + HEADER as u64)?;
-            self.file
-                .write_all_at(tail, at + (HEADER + head.len()) as u64)?;
             crate::failpoints::hit("tree.wal_after_payload")
         })();
         if let Err(e) = written {
-            if self
-                .file
-                .set_len(at)
-                .and_then(|()| self.file.sync_all())
-                .is_err()
-            {
+            if self.file.set_len(at).is_err() {
                 self.unknown = true;
             }
             return Err(e.into());
         }
-        let synced = (|| -> io::Result<()> {
-            crate::failpoints::hit("tree.wal_before_fsync")?;
-            let _timer = Timer::start(Which::JournalFsync);
-            self.file.sync_all()?;
-            crate::failpoints::hit("tree.wal_after_fsync")
-        })();
-        if let Err(e) = synced {
-            // After a failed fsync the page cache says nothing about the disk.
-            self.unknown = true;
-            return Err(e.into());
-        }
-        self.length = at + (HEADER + head.len() + tail.len()) as u64;
+        self.length = at + bytes.len() as u64;
+        self.durability.appended_to(record.seq);
         Ok(())
     }
 
@@ -398,11 +479,9 @@ impl Journal {
         self.unknown
     }
 
-    pub fn sync(&self) -> Result<()> {
-        if self.unknown {
-            return Err(Error::Stopped);
-        }
-        Ok(self.file.sync_all()?)
+    /// The journal's group commit: the only way its records become durable.
+    pub fn durability(&self) -> &Arc<Durability> {
+        &self.durability
     }
 
     /// The frames after the first that `keep` accepts, read back unchanged, so
@@ -414,28 +493,29 @@ impl Journal {
         while at < self.length {
             let mut bytes = [0; HEADER];
             self.file.read_exact_at(&mut bytes, at)?;
-            let (head_len, tail_len, crc) = header_lengths(&bytes, self.salt)
+            let header = read_header(&bytes, self.salt)
                 .ok_or_else(|| io::Error::other("invalid frame in an open journal"))?;
-            let mut head = vec![0; head_len];
+            let mut head = vec![0; header.head];
             self.file.read_exact_at(&mut head, at + HEADER as u64)?;
-            let record: Record = serde_json::from_slice(&head)?;
+            let record = Record::parse(header.record, &head)?;
             if !first && keep(&record) {
-                let mut tail = vec![0; tail_len];
+                let mut tail = vec![0; header.tail];
                 self.file
-                    .read_exact_at(&mut tail, at + (HEADER + head_len) as u64)?;
+                    .read_exact_at(&mut tail, at + (HEADER + header.head) as u64)?;
                 // Rewriting computes a new checksum: never launder a bad frame.
-                if crc_body(&head, &tail) != crc {
+                if crc_body(&head, &tail) != header.crc {
                     return Err(io::Error::other("invalid frame in an open journal"));
                 }
                 kept.push((record, tail));
             }
             first = false;
-            at += (HEADER + head_len + tail_len) as u64;
+            at += (HEADER + header.head + header.tail) as u64;
         }
         Ok(kept)
     }
 
     /// Replaces the journal with `checkpoint` then `retained`, keeping the salt.
+    /// The new file is synced whole: the durable mark rises to what it covers.
     ///
     /// # Errors
     ///
@@ -455,8 +535,10 @@ impl Journal {
         (|| -> io::Result<()> {
             sync_parent(&self.path)?;
             crate::failpoints::hit("tree.compact_after_rename")?;
-            let file = OpenOptions::new().read(true).write(true).open(&self.path)?;
+            let file = Arc::new(OpenOptions::new().read(true).write(true).open(&self.path)?);
             self.length = file.metadata()?.len();
+            self.durability
+                .replace_file(Arc::clone(&file), covered_by(checkpoint));
             self.file = file;
             Ok(())
         })()
@@ -474,7 +556,7 @@ mod tests {
 
     fn checkpoint(next_seq: u64) -> Record {
         Record {
-            seq: 0,
+            seq: RecordNo::ZERO,
             at_ns: 1,
             entry: Entry::Checkpoint {
                 next_seq,
@@ -489,7 +571,7 @@ mod tests {
     fn call(seq: u64, bytes: &[u8]) -> (Record, Vec<u8>) {
         (
             Record {
-                seq,
+                seq: RecordNo::new(seq),
                 at_ns: 2,
                 entry: Entry::Call {
                     handle: 1,
@@ -520,7 +602,9 @@ mod tests {
         journal.append(&second.0, &second.1).unwrap();
         assert_eq!(journal.len(), fs::metadata(&path).unwrap().len());
         let salt = journal.salt;
-        let kept = journal.retained(|record| record.seq == 2).unwrap();
+        let kept = journal
+            .retained(|record| record.seq == RecordNo::new(2))
+            .unwrap();
         assert_eq!(kept, vec![second.clone()]);
         journal.compact(&checkpoint(3), &kept).unwrap();
         assert_eq!(journal.len(), fs::metadata(&path).unwrap().len());
@@ -577,7 +661,7 @@ mod tests {
         let length = journal.len();
         drop(journal);
         let mut file = OpenOptions::new().append(true).open(&path).unwrap();
-        file.write_all(b"AFJ2 torn").unwrap();
+        file.write_all(b"AFJ3 torn").unwrap();
         drop(file);
         let (journal, frames) = Journal::open(&path).unwrap();
         assert_eq!(frames.len(), 2);
@@ -585,7 +669,63 @@ mod tests {
         assert_eq!(fs::metadata(&path).unwrap().len(), length);
         assert_eq!(
             fs::read(dir.path().join("calls.wal.torn")).unwrap(),
-            b"AFJ2 torn"
+            b"AFJ3 torn"
+        );
+    }
+
+    /// Three calls; the second's tail damaged on disk. `durable` makes the
+    /// first two durable before the third is appended, so its mark covers them.
+    fn damaged_middle(durable: bool) -> (tempfile::TempDir, PathBuf, u64) {
+        let (dir, path, mut journal) = journal();
+        let first = call(1, b"one");
+        journal.append(&first.0, &first.1).unwrap();
+        let hole = journal.len();
+        let second = call(2, b"two");
+        journal.append(&second.0, &second.1).unwrap();
+        if durable {
+            journal.durability().make_durable(RecordNo::new(2)).unwrap();
+        }
+        let third = call(3, b"three");
+        journal.append(&third.0, &third.1).unwrap();
+        drop(journal);
+        let mut bytes = fs::read(&path).unwrap();
+        // The first byte of the second frame's head: its body checksum fails.
+        bytes[usize::try_from(hole).unwrap() + HEADER] ^= 0xff;
+        fs::write(&path, bytes).unwrap();
+        (dir, path, hole)
+    }
+
+    #[test]
+    fn a_hole_a_later_mark_covers_is_corruption() {
+        let (_dir, path, hole) = damaged_middle(true);
+        let before = fs::read(&path).unwrap();
+        match Journal::open(&path) {
+            Err(Error::CorruptJournal(at)) => assert_eq!(at as u64, hole),
+            other => panic!("expected corruption, got {:?}", other.map(|(_, f)| f.len())),
+        }
+        assert_eq!(fs::read(&path).unwrap(), before, "nothing changed");
+    }
+
+    #[test]
+    fn a_hole_no_later_mark_covers_is_a_torn_tail() {
+        let (dir, path, hole) = damaged_middle(false);
+        let (journal, frames) = Journal::open(&path).unwrap();
+        assert_eq!(frames.len(), 2, "the checkpoint and the first call");
+        assert_eq!(journal.len(), hole);
+        assert_eq!(fs::metadata(&path).unwrap().len(), hole);
+        assert!(dir.path().join("calls.wal.torn").exists());
+    }
+
+    #[test]
+    fn a_call_is_appended_without_an_fsync() {
+        let (_dir, _path, mut journal) = journal();
+        let first = call(1, b"one");
+        journal.append(&first.0, &first.1).unwrap();
+        assert_eq!(journal.durability().appended(), RecordNo::new(1));
+        assert_eq!(journal.durability().mark(), RecordNo::ZERO);
+        assert_eq!(
+            journal.durability().make_all_durable(),
+            Ok(RecordNo::new(1))
         );
     }
 }
