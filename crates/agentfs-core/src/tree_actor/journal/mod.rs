@@ -52,6 +52,7 @@ use std::sync::Arc;
 use agentfs_contracts::pod::WriterAt;
 use serde::{Deserialize, Serialize};
 
+use super::recording::{Call, FileMap};
 use super::stages::{self, Timer, Which};
 use super::tree::{MergeFileIdentity, NameHistory};
 use super::{Error, Result, referee};
@@ -59,7 +60,7 @@ pub(super) use commit_point::compact_at;
 use durable::{Durability, RecordNo};
 #[cfg(test)]
 pub(super) use fold::{Folded, LiveOpen};
-pub(super) use fold::{FoldedOpen, fold, objects_through, runs_from_frame};
+pub(super) use fold::{FoldedOpen, Replay, fold, runs_from_frame};
 use segment::{FramePos, SEGMENT_BYTES, Segment};
 
 const MAGIC: &[u8; 4] = b"AFJ3";
@@ -263,6 +264,30 @@ impl TakeRecord {
             .filter_map(|(_, file)| file.as_ref())
             .flat_map(|file| file.lines.bytes())
             .collect()
+    }
+
+    /// Each file it leaves as its object's saved map at step `seq`, reading
+    /// the record's tail at `tail`: what the actor, its replay and the
+    /// builder all install.
+    pub fn maps(&self, tail: &FramePos, seq: RecordNo) -> Result<Vec<(u64, FileMap)>> {
+        let spans = self.spans();
+        let mut maps = Vec::new();
+        for (identity, file) in &self.files {
+            let (Some(file), Some((at, len))) = (file, spans.get(identity)) else {
+                continue;
+            };
+            let mut map = FileMap::empty();
+            map.apply(
+                &Call::Write {
+                    offset: 0,
+                    len: *len,
+                },
+                &tail.at(*at),
+            )?;
+            map.saved_at(seq);
+            maps.push((file.object, map));
+        }
+        Ok(maps)
     }
 
     /// Where each file it leaves starts in [`TakeRecord::tail`], and its length.

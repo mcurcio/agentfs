@@ -370,11 +370,13 @@ fn a_recovery_close_keeps_a_store_whose_handle_closed() {
     k.close(b);
     drop(k);
     let v = reopen(tmp.path());
+    v.settle().unwrap();
     assert_eq!(v.read(TREE, PATH).unwrap(), b"12YZefgh", "Linux's bytes");
     assert_eq!(saves_of(tmp.path(), a), 1);
     assert_eq!(saves_of(tmp.path(), b), 1);
     drop(v);
     let v = reopen(tmp.path());
+    v.settle().unwrap();
     assert_eq!(saves_of(tmp.path(), a), 1, "exactly once");
     assert_eq!(v.read(TREE, PATH).unwrap(), b"12YZefgh");
 }
@@ -393,6 +395,7 @@ fn a_recovery_close_does_not_reapply_a_saved_store() {
     k.close(d);
     drop(k);
     let v = reopen(tmp.path());
+    v.settle().unwrap();
     assert_eq!(v.read(TREE, PATH).unwrap(), b"WXcdefgQ");
     assert_eq!(saves_of(tmp.path(), a), 1, "exactly once");
 }
@@ -409,6 +412,7 @@ fn a_recovery_close_saves_a_flushed_store_no_close_saved() {
     k.store(6, b"!!");
     drop(k);
     let v = reopen(tmp.path());
+    v.settle().unwrap();
     assert_eq!(v.read(TREE, PATH).unwrap(), b"ab12efgh");
     assert_eq!(saves_of(tmp.path(), a), 1, "exactly once");
 }

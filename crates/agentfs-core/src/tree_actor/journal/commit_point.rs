@@ -3,7 +3,7 @@
 
 use super::durable::RecordNo;
 use super::segment::FramePos;
-use super::{CompactError, Entry, OpenRecord, Record};
+use super::{CompactError, Entry, OpenRecord, PointerChange, Record, Target};
 use crate::tree_actor::recording::pages;
 use crate::tree_actor::stages::{Timer, Which};
 use crate::tree_actor::{Error, Result, TreeActor, now_ns};
@@ -27,11 +27,7 @@ impl TreeActor {
         if self.is_stopped() {
             return Err(Error::Stopped);
         }
-        // Saved maps the builder has checked out let go of their frames first.
-        self.rebase_built();
-        // A compaction due since history trailed runs at the first call after
-        // it caught up, before that call's record.
-        self.compact_if_due();
+        self.before_record();
         if self.is_stopped() {
             return Err(Error::Stopped);
         }
@@ -50,6 +46,36 @@ impl TreeActor {
         };
         self.next += 1;
         Ok((seq, pos))
+    }
+
+    /// What runs before any record: saved maps the builder has checked out
+    /// let go of their frames, and a compaction due since history trailed
+    /// runs at the first call after it caught up.
+    pub(in crate::tree_actor) fn before_record(&mut self) {
+        self.rebase_built();
+        self.compact_if_due();
+    }
+
+    /// Names each step value `changes` read before the last compaction as
+    /// the oid it was built as: no record after a checkpoint names a step
+    /// the checkpoint covers (restart builds from the checkpoint and knows
+    /// no such step). [`Error::Format`] for one the compaction did not hold.
+    pub(in crate::tree_actor) fn resolve_compacted(
+        &self,
+        changes: &mut [PointerChange],
+    ) -> Result<()> {
+        let (through, built) = &self.compacted;
+        for change in changes.iter_mut() {
+            for target in [&mut change.new, &mut change.old].into_iter().flatten() {
+                if let Target::Step(step) = target
+                    && *step <= *through
+                {
+                    let oid = built.get(step).ok_or(Error::Format)?;
+                    *target = Target::Oid(oid.clone());
+                }
+            }
+        }
+        Ok(())
     }
 
     /// A fuzzy checkpoint (ARIES): the pointers and the live opens, written
@@ -105,6 +131,15 @@ impl TreeActor {
         self.journal.checkpoint(&checkpoint)?;
         self.history.checkpointed(last);
         // The records name built values only: no step past the checkpoint yet.
+        let built: std::collections::BTreeMap<RecordNo, String> = self
+            .pointers
+            .iter()
+            .filter_map(|(name, target)| match target {
+                Target::Step(step) => Some((*step, snapshot.pointers().get(name)?.to_string())),
+                Target::Oid(_) => None,
+            })
+            .collect();
+        self.compacted = (last, built);
         self.pointers = snapshot.pointers().to_targets();
         let (handles, pages) = (&self.handles, &self.pages);
         let live = |record: &Record| match &record.entry {

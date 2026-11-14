@@ -213,7 +213,9 @@ A tree view records every call in its journal before the call returns, and a
 builder thread makes the commits behind it ([trees](../trees.md#history-trails-the-files)).
 When a batch fails, recording goes on and nothing reachable changes: the batch is
 retried at the next step or wait. Takes, `settle` and anything reading history wait
-until it builds or answer the failure.
+until it builds or answer the failure. A volume whose builder fails still opens and
+serves: a restart never waits for history, so a failing build shows as this alarm,
+never as a volume that will not mount.
 
 - **`no space`, `errno <n>`.** The state area is full or failing: free space or fix
   the disk ([1](#1-the-state-area-is-full-or-unwritable)). The next step retries. A

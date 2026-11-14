@@ -430,7 +430,9 @@ impl TreeCalls for Mounted {
             unsafe { libc::close(fd) };
         }
         self.unmount(true)?;
-        self.mount()
+        self.mount()?;
+        // Open never waits for history; the invariants read it after each call.
+        self.settle()
     }
 
     fn read(&self, t: TreeId, path: &str) -> Result<Option<Vec<u8>>, CallError> {

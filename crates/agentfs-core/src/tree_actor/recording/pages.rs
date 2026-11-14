@@ -27,6 +27,7 @@
 use std::collections::BTreeMap;
 
 use super::{Call, FileMap, Handle};
+use crate::tree_actor::journal::PagePiece;
 use crate::tree_actor::journal::durable::RecordNo;
 use crate::tree_actor::journal::segment::FramePos;
 use crate::tree_actor::{Error, Result, TreeActor, TreeId};
@@ -232,6 +233,28 @@ pub(in crate::tree_actor) fn calls_for_close(
     saved_through: u64,
 ) -> Vec<(Call, FramePos)> {
     close_calls(own, &close_pieces(saved_len, own, writes, saved_through))
+}
+
+/// The calls a recorded save applies: the open's own calls merged with its
+/// page-write pieces, each resolved in the file's page writes. The builder
+/// and recovery's replay both run it, then [`FileMap::apply`]; `None` when a
+/// piece names no run of its record.
+pub(in crate::tree_actor) fn recorded_close_calls(
+    own: &[(u64, Call, FramePos)],
+    writes: &[(u64, Run)],
+    pieces: &[PagePiece],
+) -> Option<Vec<(Call, FramePos)>> {
+    let mut resolved = Vec::with_capacity(pieces.len());
+    for piece in pieces {
+        let record = piece.record.get();
+        let runs: Vec<Run> = writes
+            .iter()
+            .filter(|(n, _)| *n == record)
+            .map(|(_, run)| run.clone())
+            .collect();
+        resolved.push((record, resolve_piece(&runs, piece.offset, piece.len)?));
+    }
+    Some(close_calls(own, &resolved))
 }
 
 /// A piece of a page write, from its runs: the part of the run that holds

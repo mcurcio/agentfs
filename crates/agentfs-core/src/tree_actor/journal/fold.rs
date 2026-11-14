@@ -9,12 +9,12 @@ use git2::Oid;
 
 use super::durable::RecordNo;
 use super::segment::FramePos;
-use super::{Change, Entry, Frame, OpenRecord, Record, RunHead, Tail, Target};
+use super::{Change, Entry, Frame, OpenRecord, Record, RunHead, SaveOutcome, Tail, Target};
+use crate::tree_actor::history::Objects;
 use crate::tree_actor::history::upstreams::Upstreams;
-use crate::tree_actor::history::{Objects, objects_of};
 use crate::tree_actor::pointers::Pointers;
-use crate::tree_actor::recording::{Call, pages};
-use crate::tree_actor::tree::{EventNumber, Shape};
+use crate::tree_actor::recording::{Call, FileMap, pages};
+use crate::tree_actor::tree::{EventNumber, SavedTree};
 use crate::tree_actor::{Error, Result, TreeId};
 
 /// A live write-open: a journal [`OpenRecord`] with its tree parsed.
@@ -121,88 +121,193 @@ impl Folded {
     }
 }
 
-/// Each tree's object numbers after the steps of `frames`, which follow the
-/// checkpoint folded in `checkpoint`; `shapes` are the trees' shapes at its
-/// built point. Each step's own transition ([`Shape::apply`], [`Shape::save`],
-/// a fork's copy), the one the actor ran at the call: object numbers are the
-/// journal's, never history's.
-///
-/// # Errors
-///
-/// [`Error::Format`] for a step naming a tree or open the journal lacks; a
-/// transition's own failure.
-pub(in crate::tree_actor) fn objects_through(
-    mut shapes: BTreeMap<TreeId, Shape>,
-    checkpoint: &Folded,
-    frames: &[Frame],
-) -> Result<BTreeMap<TreeId, Objects>> {
-    let mut opens: BTreeMap<u64, (TreeId, u64)> = BTreeMap::new();
-    for (handle, folded) in &checkpoint.opens {
-        let open = &folded.open;
-        if open.anonymous {
-            shapes
-                .get_mut(&open.tree)
-                .ok_or(Error::Format)?
-                .add_anonymous(open.object);
+/// A write-open a replay follows: its tree, object and calls.
+type ReplayOpen = (TreeId, u64, Vec<(u64, Call, FramePos)>);
+
+/// The actor's saved trees replayed over records: each step's own
+/// transition ([`Shape::apply`], [`Shape::save`], a fork's copy) and each
+/// save's calls ([`pages::recorded_close_calls`], [`FileMap::apply`]), the
+/// ones the actor ran at the call. What a start serves from, never waiting
+/// for history, and how it numbers objects at the built point: object numbers
+/// are the journal's, never history's.
+pub(in crate::tree_actor) struct Replay {
+    pub(in crate::tree_actor) trees: BTreeMap<TreeId, SavedTree>,
+    opens: BTreeMap<u64, ReplayOpen>,
+    pages: BTreeMap<(TreeId, u64), Vec<(u64, pages::Run)>>,
+    /// False: shapes only, each save's map left as it was.
+    maps: bool,
+}
+
+impl Replay {
+    /// From `trees` as of a point where `opens` were live with these calls
+    /// and `page_writes` held: each anonymous open's object added.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Format`] for an open of a tree `trees` lacks.
+    pub(in crate::tree_actor) fn new(
+        mut trees: BTreeMap<TreeId, SavedTree>,
+        opens: &BTreeMap<u64, FoldedOpen>,
+        page_writes: BTreeMap<(TreeId, u64), Vec<(u64, pages::Run)>>,
+    ) -> Result<Self> {
+        let mut live = BTreeMap::new();
+        for (handle, folded) in opens {
+            let open = &folded.open;
+            if open.anonymous {
+                trees
+                    .get_mut(&open.tree)
+                    .ok_or(Error::Format)?
+                    .add_anonymous(open.object);
+            }
+            live.insert(*handle, (open.tree, open.object, folded.calls.clone()));
         }
-        opens.insert(*handle, (open.tree, open.object));
+        Ok(Self {
+            trees,
+            opens: live,
+            pages: page_writes,
+            maps: true,
+        })
     }
-    for (record, _) in frames {
+
+    /// [`Replay::new`] of shapes only: what object numbers need.
+    ///
+    /// # Errors
+    ///
+    /// As [`Replay::new`].
+    pub(in crate::tree_actor) fn shapes(
+        trees: BTreeMap<TreeId, SavedTree>,
+        opens: &BTreeMap<u64, FoldedOpen>,
+    ) -> Result<Self> {
+        let mut replay = Self::new(trees, opens, BTreeMap::new())?;
+        replay.maps = false;
+        Ok(replay)
+    }
+
+    fn tree(&mut self, tree: &str) -> Result<(TreeId, &mut SavedTree)> {
+        let id = tree.parse::<TreeId>()?;
+        Ok((id, self.trees.get_mut(&id).ok_or(Error::Format)?))
+    }
+
+    fn opened(&mut self, handle: u64, tree: TreeId, object: u64) {
+        self.opens.insert(handle, (tree, object, Vec::new()));
+        self.pages.entry((tree, object)).or_default();
+    }
+
+    /// One record.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Format`] for a record naming a tree, open or run the replay
+    /// lacks; a transition's own failure.
+    pub(in crate::tree_actor) fn apply(&mut self, record: &Record, tail: &Tail) -> Result<()> {
         let seq = record.seq.get();
         match &record.entry {
+            Entry::Checkpoint { .. } => return Err(Error::Format),
             Entry::Open { tree, object, .. } => {
-                opens.insert(seq, (tree.parse()?, *object));
+                let tree = tree.parse::<TreeId>()?;
+                self.opened(seq, tree, *object);
             }
             Entry::AnonymousOpen { tree, .. } => {
-                let tree = tree.parse::<TreeId>()?;
-                shapes
-                    .get_mut(&tree)
-                    .ok_or(Error::Format)?
-                    .add_anonymous(seq);
-                opens.insert(seq, (tree, seq));
+                let (id, t) = self.tree(tree)?;
+                t.add_anonymous(seq);
+                self.opened(seq, id, seq);
             }
-            Entry::Step { change, .. } => match change {
-                Change::Fork { upstream } => {
-                    let mut shape = shapes
-                        .get(&upstream.parse::<TreeId>()?)
-                        .ok_or(Error::Format)?
-                        .clone();
-                    for object in std::mem::take(&mut shape.anonymous) {
-                        shape.drop_object(object);
-                    }
-                    shapes.insert(TreeId::Fork(seq), shape);
-                }
-                Change::Save {
-                    handle, outcome, ..
-                } => {
-                    let (tree, object) = opens.remove(handle).ok_or(Error::Format)?;
-                    shapes
-                        .get_mut(&tree)
-                        .ok_or(Error::Format)?
-                        .save(object, *outcome);
-                }
-                Change::Create { tree, .. }
-                | Change::Link { tree, .. }
-                | Change::Rename { tree, .. }
-                | Change::Unlink { tree, .. }
-                | Change::Take { tree, .. } => {
-                    let tree = tree.parse::<TreeId>()?;
-                    shapes
-                        .get_mut(&tree)
-                        .ok_or(Error::Format)?
-                        .apply(change, EventNumber::new(seq))?;
-                    if matches!(change, Change::Create { .. }) {
-                        opens.insert(seq, (tree, seq));
-                    }
-                }
-            },
-            Entry::Checkpoint { .. } | Entry::Call { .. } | Entry::PageWrite { .. } => {}
+            Entry::Call { handle, call } => {
+                call.check_tail(tail.len)?;
+                self.opens.get_mut(handle).ok_or(Error::Format)?.2.push((
+                    seq,
+                    call.clone(),
+                    tail.pos.clone(),
+                ));
+            }
+            Entry::PageWrite { tree, object, runs } => self
+                .pages
+                .entry((tree.parse::<TreeId>()?, *object))
+                .or_default()
+                .extend(runs_from_frame(runs, tail)?.into_iter().map(|r| (seq, r))),
+            Entry::Step { change, .. } => self.step(seq, change, tail)?,
         }
+        Ok(())
     }
-    shapes
-        .iter()
-        .map(|(tree, shape)| Ok((*tree, objects_of(shape)?)))
-        .collect()
+
+    fn step(&mut self, seq: u64, change: &Change, tail: &Tail) -> Result<()> {
+        let event = EventNumber::new(seq);
+        match change {
+            Change::Create { tree, .. } => {
+                let (id, t) = self.tree(tree)?;
+                t.shape.apply(change, event)?;
+                let mut empty = FileMap::empty();
+                empty.saved_at(RecordNo::new(seq));
+                t.bytes.insert(event.object(), empty);
+                self.opened(seq, id, event.object());
+            }
+            Change::Link { tree, .. }
+            | Change::Rename { tree, .. }
+            | Change::Unlink { tree, .. } => {
+                self.tree(tree)?.1.shape.apply(change, event)?;
+            }
+            Change::Save {
+                tree,
+                handle,
+                pages: pieces,
+                outcome,
+            } => {
+                let (id, object, calls) = self.opens.remove(handle).ok_or(Error::Format)?;
+                let writes = self.pages.get(&(id, object));
+                let saved = match outcome {
+                    SaveOutcome::Saved { .. } if self.maps => {
+                        let calls = pages::recorded_close_calls(
+                            &calls,
+                            writes.map_or(&[][..], Vec::as_slice),
+                            pieces,
+                        )
+                        .ok_or(Error::Format)?;
+                        let t = self.trees.get(&id).ok_or(Error::Format)?;
+                        let mut map = t.bytes.get(&object).ok_or(Error::Format)?.clone();
+                        for (call, pos) in &calls {
+                            map.apply(call, pos)?;
+                        }
+                        map.saved_at(RecordNo::new(seq));
+                        Some(map)
+                    }
+                    _ => None,
+                };
+                let (_, t) = self.tree(tree)?;
+                t.shape.save(object, *outcome);
+                if matches!(outcome, SaveOutcome::AnonymousDropped) {
+                    t.drop_object(object);
+                }
+                if let Some(map) = saved {
+                    t.bytes.insert(object, map);
+                }
+                if !self.opens.values().any(|o| o.0 == id && o.1 == object) {
+                    self.pages.remove(&(id, object));
+                }
+            }
+            Change::Fork { upstream } => {
+                let mut fork = self
+                    .trees
+                    .get(&upstream.parse::<TreeId>()?)
+                    .ok_or(Error::Format)?
+                    .clone();
+                for object in fork.shape.anonymous.clone() {
+                    fork.drop_object(object);
+                }
+                self.trees.insert(TreeId::Fork(seq), fork);
+            }
+            Change::Take { tree, take } => {
+                let maps = self.maps;
+                let (_, t) = self.tree(tree)?;
+                t.shape.apply(change, event)?;
+                if maps {
+                    for (object, map) in take.maps(&tail.pos, RecordNo::new(seq))? {
+                        t.bytes.insert(object, map);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 pub(in crate::tree_actor) fn parse_oid(hex: &str) -> Result<Oid> {

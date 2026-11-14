@@ -529,19 +529,12 @@ impl BuildState {
                         pieces: digest,
                     } => {
                         let writes = self.pages.get(&(id, open.object));
-                        let mut resolved = Vec::with_capacity(pieces.len());
-                        for piece in pieces {
-                            let runs: Vec<pages::Run> = writes
-                                .into_iter()
-                                .flatten()
-                                .filter(|(n, _)| *n == piece.record.get())
-                                .map(|(_, run)| run.clone())
-                                .collect();
-                            let run = pages::resolve_piece(&runs, piece.offset, piece.len)
-                                .ok_or_else(|| disagrees(seq))?;
-                            resolved.push((piece.record.get(), run));
-                        }
-                        let calls = pages::close_calls(&open.calls, &resolved);
+                        let calls = pages::recorded_close_calls(
+                            &open.calls,
+                            writes.map_or(&[][..], Vec::as_slice),
+                            pieces,
+                        )
+                        .ok_or_else(|| disagrees(seq))?;
                         let mut map =
                             (**t.bytes.get(&open.object).ok_or_else(|| disagrees(seq))?).clone();
                         for (call, pos) in &calls {
@@ -724,20 +717,15 @@ impl BuildState {
         let mut t = current.clone();
         // A file the take leaves reads its bytes from the record's tail; every
         // other file keeps its map.
-        let spans = take.spans();
+        let mut maps: BTreeMap<u64, FileMap> = take
+            .maps(&tail.pos, RecordNo::new(seq))?
+            .into_iter()
+            .collect();
         let mut taken = Vec::new();
-        t.install(snapshot, |identity, object, _| match spans.get(&identity) {
-            Some((at, len)) => {
-                let mut map = FileMap::empty();
-                map.apply(
-                    &Call::Write {
-                        offset: 0,
-                        len: *len,
-                    },
-                    &tail.pos.at(*at),
-                )?;
+        t.install(snapshot, |_, object, _| match maps.remove(&object) {
+            Some(map) => {
                 taken.push(object);
-                Ok(saved_map(map, seq))
+                Ok(Arc::new(map.into()))
             }
             None => current
                 .bytes

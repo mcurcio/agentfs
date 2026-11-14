@@ -178,8 +178,9 @@ clone it.
 and `tree_actor::inspect` reads what a state area holds without the lease.
 `tree_actor::Recording` serves a volume: the actor behind its one lock, with
 `durable`, `durable_all` and their deferred forms waiting for durability outside it.
-`Recording::open` makes every recovered record durable and builds it before it
-serves, and dropping the last `Recording` makes every record durable and builds it.
+`Recording::open` makes every recovered record durable and serves at once, from the
+journal: it never waits for history. Dropping the last `Recording` makes every record
+durable and builds it.
 `Recording::history` is the one owner of the Git store (`History`: the built point,
 `wait_built`, built snapshots, lag), and `settle` waits until every record so far is
 built: call it before reading Git. `TreeActor::head` settles first. Each recorded call names
@@ -227,9 +228,15 @@ appends it and applies it to the saved state the views serve; it runs no git.
   covers any record in it.
 - A failed step keeps serving and saves at the next step in its tree. Only a failed
   journal `fsync` or rollback stops the actor.
-- Recovery reads the journal, builds history through its last record (see
-  [History trails the files](#history-trails-the-files)), reads the saved state
-  from it, closes abandoned opens through the ordinary step and compacts. It refuses
+- Recovery reads the journal and serves from it without waiting for history: the
+  saved state is the trees as built (read from Git and the private checkouts)
+  with every later record replayed on them by the transitions the actor ran at
+  the call. It then closes abandoned opens through the ordinary step; the builder
+  catches up behind, as at any time (see
+  [History trails the files](#history-trails-the-files)), and a failed build
+  raises its alarm without refusing the open. A journal built through its last
+  record compacts at once; otherwise compaction runs at the first call after the
+  builder catches up. It refuses
   a missing journal, a missing `format` file, a lost object at a pointer's tip, and
   a journal that names a tree by anything but its identity, has no root, gives the
   root an upstream, gives an upstream to a fork with no branch, or gives a fork an
@@ -290,7 +297,12 @@ the private checkouts copied, the checked-out files' maps rebased onto them
   after the built-log entry is logged (`tree CopyStale`) and redone whole at the next
   batch.
 - Dropping the volume builds every record appended, so a clean shutdown leaves
-  history built through its last record. Recovery builds what a kill left unbuilt.
+  history built through its last record. After a kill the builder builds what
+  was left unbuilt, behind the reopened views.
+- No record after a checkpoint names a step the checkpoint covers: a step whose
+  pointers were read before a compaction names those values as the oids they
+  were built as, so a restart, which builds from the checkpoint, builds every
+  later record as an uninterrupted run would.
 - `--metrics-output` reports `history`: the built point, the last record appended,
   the oldest unbuilt step's age, the worst tree's lag and the builder's health.
 - **The lag gate.** Each tree's lag is the builder's estimated time for its unbuilt

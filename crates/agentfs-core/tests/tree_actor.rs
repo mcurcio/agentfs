@@ -981,6 +981,7 @@ fn a_bad_final_frame_is_a_torn_tail() {
     let (offset, length) = *frames(&journal).last().unwrap();
     fs::write(&path, &journal).unwrap();
     let v = reopen(tmp.path());
+    v.settle().unwrap();
     // The last record is dropped; every one before it stands, closed once.
     assert_eq!(v.read(ROOT, "a").unwrap(), b"returned");
     assert_eq!(opens_saved(tmp.path(), h), 1);
@@ -1205,6 +1206,7 @@ fn a_log_held_open_does_not_pin_other_saves() {
     v.write(log, 0, b"after\n", true).unwrap();
     drop(v);
     let v = reopen(tmp.path());
+    v.settle().unwrap();
     assert_eq!(v.read(ROOT, "log").unwrap(), b"before\nafter\n");
     assert_eq!(v.read(ROOT, "big").unwrap(), FILLED);
     assert_eq!(opens_saved(tmp.path(), log), 1);
@@ -1579,10 +1581,109 @@ fn a_kill_at_either_compact_failpoint_loses_nothing() {
         let state = tmp.path().join(spec);
         let log = run_killed_worker("compact_worker", &state, spec);
         let v = reopen(&state);
+        v.settle().unwrap();
         assert_eq!(v.read(ROOT, "log").unwrap(), b"returned\n", "{spec}");
         assert_eq!(v.read(ROOT, "big").unwrap(), FILLED, "{spec}");
         assert_eq!(opens_saved(&state, log), 1, "{spec}");
     }
+}
+
+/// Restart equals an uninterrupted run: a fork recorded as the first step
+/// after a compaction names the upstream's head as an oid, never a step the
+/// checkpoint covers, so a kill before its batch's built-log entry leaves a
+/// journal the next start builds.
+#[cfg(feature = "failpoints")]
+#[test]
+fn a_fork_right_after_a_compaction_reopens_after_a_kill() {
+    let tmp = tempfile::tempdir().unwrap();
+    // The create's batch, the close's, then the fork's.
+    let spec = "tree.build_after_pack=kill@3";
+    let state = tmp.path().join("state");
+    run_killed_worker("fork_after_compaction_worker", &state, spec);
+    let v = reopen(&state);
+    v.settle().unwrap();
+    let fork = v.trees().into_iter().find(|tree| !tree.is_root()).unwrap();
+    assert_eq!(v.read(fork, "big").unwrap(), FILLED);
+    assert_eq!(v.head(fork).unwrap(), v.head(ROOT).unwrap());
+}
+
+#[cfg(feature = "failpoints")]
+#[test]
+fn fork_after_compaction_worker() {
+    let Some(root) = std::env::var_os("AGENTFS_TREE_STEP_WORKER") else {
+        return;
+    };
+    let mut v = new_actor(std::path::Path::new(&root));
+    let h = v.write_open(ROOT, "big", &writer("filler"), true).unwrap();
+    v.settle().unwrap();
+    let chunk = vec![b'x'; 33 << 20];
+    for _ in 0..2 {
+        v.write(h, 0, &chunk, true).unwrap();
+    }
+    v.truncate(h, FILLED.len() as u64).unwrap();
+    v.close(h).unwrap();
+    v.settle().unwrap();
+    println!("OPEN {h}");
+    std::io::stdout().flush().unwrap();
+    // The first record after history caught up: it compacts, then records.
+    v.fork().unwrap();
+    v.settle().unwrap();
+    unreachable!("the failpoint kills this process");
+}
+
+/// Opening a volume never waits for history: with every batch failing, open
+/// serves the saves the builder never built, and recording goes on; the
+/// alarm is the builder's, and a retry builds them all.
+#[cfg(feature = "failpoints")]
+#[test]
+fn open_serves_from_the_journal_while_every_build_fails() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut v = new_actor(tmp.path());
+    put(&mut v, ROOT, "a", b"built");
+    v.settle().unwrap();
+    let held = agentfs_core::failpoints::configure("tree.build_before_batch=error@*").unwrap();
+    put(&mut v, ROOT, "a", b"unbuilt");
+    drop(v);
+    let mut v = reopen(tmp.path());
+    assert_eq!(v.read(ROOT, "a").unwrap(), b"unbuilt");
+    put(&mut v, ROOT, "b", b"recorded");
+    assert_eq!(v.read(ROOT, "b").unwrap(), b"recorded");
+    assert!(v.settle().is_err(), "the builder failed");
+    assert_eq!(v.metrics().history.health, "failed");
+    drop(held);
+    put(&mut v, ROOT, "c", b"retried");
+    v.settle().unwrap();
+    assert_eq!(
+        fs::read(checkout(tmp.path(), "root", "a")).unwrap(),
+        b"unbuilt"
+    );
+    assert_eq!(
+        fs::read(checkout(tmp.path(), "root", "b")).unwrap(),
+        b"recorded"
+    );
+}
+
+/// Restart equals an uninterrupted run: an anonymous file linked while held
+/// open, killed before the link was built, reopens with its bytes.
+#[cfg(feature = "failpoints")]
+#[test]
+fn a_file_linked_while_held_open_reopens_before_its_link_is_built() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut v = new_actor(tmp.path());
+    let held = agentfs_core::failpoints::configure("tree.build_before_batch=error@*").unwrap();
+    let h = v.anonymous_open(ROOT, &writer("w")).unwrap();
+    v.write(h, 0, b"linked", false).unwrap();
+    let object = v.open_object(h).unwrap();
+    v.first_link(ROOT, object, "a", &writer("w")).unwrap();
+    drop(v);
+    drop(held);
+    let v = reopen(tmp.path());
+    assert_eq!(v.read(ROOT, "a").unwrap(), b"linked");
+    v.settle().unwrap();
+    assert_eq!(
+        fs::read(checkout(tmp.path(), "root", "a")).unwrap(),
+        b"linked"
+    );
 }
 
 #[cfg(feature = "failpoints")]
@@ -1673,6 +1774,7 @@ fn a_failed_save_keeps_serving_and_saves_at_the_next_step() {
     drop(guard);
     drop(v);
     let v = reopen(tmp.path());
+    v.settle().unwrap();
     assert_eq!(v.read(ROOT, "a").unwrap(), b"base+returned+again");
     assert_eq!(opens_saved(tmp.path(), h), 1);
 }
@@ -1894,6 +1996,7 @@ fn recovery_enqueues_once_after_failure_before_the_commit_point() {
     assert_eq!(repo.list_refs("refs/queue/root/").unwrap(), before);
     drop(volume);
     let mut volume = reopen(tmp.path());
+    volume.settle().unwrap();
     assert_eq!(volume.read(fork, "a").unwrap(), b"saved");
     let queued = repo.list_refs("refs/queue/root/").unwrap();
     let saved = queued.last().unwrap().1;
@@ -2046,6 +2149,7 @@ fn a_recovered_open_commits_with_its_writers_pod_context() {
     v.write(h, 0, b"abandoned\n", false).unwrap();
     drop(v);
     let v = TreeActor::open(tmp.path(), &pod("b")).unwrap();
+    v.settle().unwrap();
     assert_eq!(v.read(ROOT, "a").unwrap(), b"abandoned\n");
     let last = last_message(tmp.path(), ROOT);
     assert!(last.starts_with("Direct by w\n"), "{last}");

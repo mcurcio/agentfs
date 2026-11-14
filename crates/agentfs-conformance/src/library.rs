@@ -211,7 +211,10 @@ impl TreeCalls for Library {
     fn crash(&mut self) -> Result<(), CallError> {
         self.volume = None;
         self.owners.clear();
-        self.volume = Some(TreeActor::open(&self.dir, &PodContext::default()).map_err(fail)?);
+        let volume = TreeActor::open(&self.dir, &PodContext::default()).map_err(fail)?;
+        // Open never waits for history; the invariants read it after each call.
+        volume.settle().map_err(fail)?;
+        self.volume = Some(volume);
         Ok(())
     }
 
