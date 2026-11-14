@@ -78,3 +78,7 @@ bd.db
 
 # Interactions log (runtime, not versioned)
 interactions.jsonl
+
+# Added by bd (missing required patterns)
+*.gate.lock*
+dolt-server-config.yaml
