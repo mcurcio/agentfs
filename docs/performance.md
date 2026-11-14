@@ -463,8 +463,7 @@ On CI (`image` run 43600260345, commit c187fe3, one observation each):
 
 All meet their bars. The view's own memory before the 1 GiB workload was
 about 1 GiB, held for the 50,000 files the `create` workload left (about
-20 KiB a file in the actor's and the builder's trees), which is not this
-figure.
+20 KiB a file, see `memory_create` below), which is not this figure.
 
 Then file maps without descriptors, compaction that waits only for steps,
 and one gate thread per volume (`image` run 43608163463, commit d7666ef, one
@@ -502,6 +501,22 @@ Compare a figure across runs only on the same CPU.
 The 256 MiB row predates bounding `git cat-file`'s pack window; with it the
 1 GiB save's children peak at 66 MiB. Before, the same container's 256 MiB
 save took 13.8 s with the children at 752 MiB.
+
+The view's memory per file is held by `memory_create`: its resident memory
+once the `create` workload's history is built, over its memory before, per
+file created, at most 2 KiB. About 20 KiB a file came from libgit2: the
+builder packs each batch with `git fast-import`, and one handle kept open
+held a cache of delta bases (up to 16 MiB) for every pack it had read. The
+handle is now let go after each batch. Small maps (a file's name versions,
+its byte pieces, the paths of each object) are vectors, not B-tree maps,
+whose node costs hundreds of bytes for the one entry most files have. On one
+4-CPU container (ext4, release build, one-line files created one after
+another, each step's history built before reading; a local observation, not
+CI), the resident memory grows by about 3.4 to 3.8 KiB a file between 5,000
+and 20,000 files: about 400 MiB for a 100,000-file tree. Two things hold most
+of what is left: each builder batch applies to a copy of the builder's trees
+(about 0.7 KiB a file while it runs), and each path is held about four times
+in each of the actor's and the builder's trees.
 
 ## Performance budget
 

@@ -326,9 +326,19 @@ impl TreeGit {
     }
 
     /// Makes objects stored by another writer since this handle last looked
-    /// (a pack `git fast-import` installed) readable here.
+    /// (a pack `git fast-import` installed) readable here, by letting go of
+    /// libgit2's handle: the next use opens a fresh one. libgit2 keeps a cache
+    /// of delta bases for each pack it has read (up to 16 MiB a pack) and maps
+    /// of its files for the handle's life, and every batch the builder packs
+    /// adds a pack, so a handle kept open grows with the history it has read.
     pub fn refresh(&self) -> Result<()> {
-        self.with_repo(|repo| Ok(repo.odb()?.refresh()?))
+        let mut slot = self
+            .store
+            .repo
+            .lock()
+            .map_err(|_| Error::Git("the repository's lock is poisoned".into()))?;
+        *slot = None;
+        Ok(())
     }
 
     /// The repository's directory.

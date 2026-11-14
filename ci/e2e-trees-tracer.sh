@@ -211,7 +211,7 @@ if [ -n "$FS" ]; then
 w = {w["name"]: w for w in json.load(open(sys.argv[1]))["workloads"]}[sys.argv[2]]
 print(json.dumps(w.get(sys.argv[3], 0)))' "$report" "$1" "$2"
   }
-  assert_eq "close_4k create close_64m close_1g write_1g history_1g memory_1g" \
+  assert_eq "close_4k create memory_create close_64m close_1g write_1g history_1g memory_1g" \
     "$(python3 -c 'import json, sys; print(*(w["name"] for w in json.load(open(sys.argv[1]))["workloads"]))' "$report")" \
     'the report lists every workload'
   # A save each workload saw answered is in history once the built point reached

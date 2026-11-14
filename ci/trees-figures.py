@@ -39,6 +39,10 @@ commit, not only the close.
                memory before the 1 GiB workload, through its save and its
                build, in MiB: the kernel's high-water mark, reset first
                (/proc/PID/clear_refs, 5) and read once (needs --view-pid)
+    memory_create the view process's resident memory after the `create`
+               workload's history is built, over its resident memory before
+               the workload, per file created, in KiB: what the view holds for
+               each file of a tree (needs --view-pid and --metrics)
 
 Each workload runs on a worker thread. One the deadline catches inside a
 save gets `grace_s` more to come back; one still blocked then is stuck in
@@ -453,6 +457,7 @@ def main():
             continue
         run = Run(time.monotonic() + budget["deadline_s"])
         baseline = reset_peak(args.view_pid) if args.view_pid and name == "close_1g" else None
+        resident = proc_kib(args.view_pid, "VmRSS") if args.view_pid and name == "create" else None
 
         def worker(work=work, run=run, target=budget.get("count")):
             try:
@@ -476,6 +481,16 @@ def main():
         if args.metrics and not stopped:
             figure["drain_s"] = drain(args.metrics, args.drain_cap)
         found = [(name, budget, figure)]
+        if name == "create":
+            # memory_create: read once its history is built, so the builder's
+            # trees are in it.
+            after = proc_kib(args.view_pid, "VmRSS") if resident is not None else None
+            count = figure.get("count", 0)
+            measured = after is not None and figure.get("drain_s") is not None and count > 0
+            found.append(("memory_create", budgets["memory_create"],
+                          {"finished": figure["finished"] and measured,
+                           "kib_per_file": round((after - resident) / count, 2) if measured else None,
+                           "rss_mib": None if after is None else round(after / 1024, 1)}))
         if name == "close_1g":
             # write_1g: the same run's writes, held to its own bar.
             derived = budgets["write_1g"]

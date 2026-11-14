@@ -7,7 +7,7 @@
 //! at the same offset. The actor's saved state, an open's view and the
 //! builder's replay run the one [`FileMap::apply`].
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::fs::File;
 use std::io::{self, Read};
 use std::ops::Range;
@@ -169,7 +169,10 @@ pub(in crate::tree_actor) struct Piece {
 #[derive(Clone, Debug)]
 pub struct FileMap {
     len: u64,
-    pieces: Arc<BTreeMap<u64, Piece>>,
+    /// By start offset, in order: a vector, because most maps hold one
+    /// piece and a map's node costs hundreds of bytes for it. A write in the
+    /// middle moves the pieces after it once.
+    pieces: Arc<Vec<(u64, Piece)>>,
     /// The step whose save the map is, while it holds nothing unsaved: what
     /// [`FileMap::rebase`] compares with a base's built point.
     step: Option<RecordNo>,
@@ -208,15 +211,15 @@ impl FileMap {
     /// The first `len` bytes of `base`, as saved at its built point.
     pub(in crate::tree_actor) fn of_base(base: Arc<BaseFile>, len: u64) -> Self {
         let step = Some(base.step);
-        let mut pieces = BTreeMap::new();
+        let mut pieces = Vec::new();
         if len > 0 {
-            pieces.insert(
+            pieces.push((
                 0,
                 Piece {
                     len,
                     source: Source::Base { file: base, at: 0 },
                 },
-            );
+            ));
         }
         Self {
             len,
@@ -282,24 +285,21 @@ impl FileMap {
         if start > self.len {
             let gap = start - self.len;
             let end = self.len;
-            Arc::make_mut(&mut self.pieces).insert(
+            Arc::make_mut(&mut self.pieces).push((
                 end,
                 Piece {
                     len: gap,
                     source: Source::Zero,
                 },
-            );
+            ));
             self.len = start;
         }
         let end = start + len;
         let pieces = Arc::make_mut(&mut self.pieces);
         split(pieces, start);
         split(pieces, end);
-        let covered: Vec<u64> = pieces.range(start..end).map(|(at, _)| *at).collect();
-        for key in covered {
-            pieces.remove(&key);
-        }
-        pieces.insert(start, Piece { len, source });
+        let (from, to) = (first_at(pieces, start), first_at(pieces, end));
+        pieces.splice(from..to, [(start, Piece { len, source })]);
         self.len = self.len.max(end);
     }
 
@@ -307,23 +307,20 @@ impl FileMap {
         if size >= self.len {
             if size > self.len {
                 let end = self.len;
-                Arc::make_mut(&mut self.pieces).insert(
+                Arc::make_mut(&mut self.pieces).push((
                     end,
                     Piece {
                         len: size - end,
                         source: Source::Zero,
                     },
-                );
+                ));
                 self.len = size;
             }
             return;
         }
         let pieces = Arc::make_mut(&mut self.pieces);
         split(pieces, size);
-        let cut: Vec<u64> = pieces.range(size..).map(|(at, _)| *at).collect();
-        for key in cut {
-            pieces.remove(&key);
-        }
+        pieces.truncate(first_at(pieces, size));
         self.len = size;
     }
 
@@ -334,12 +331,9 @@ impl FileMap {
             return Ok(0);
         }
         let end = self.len.min(offset.saturating_add(buf.len() as u64));
-        let first = self
-            .pieces
-            .range(..=offset)
-            .next_back()
-            .map_or(offset, |(at, _)| *at);
-        for (start, piece) in self.pieces.range(first..end) {
+        // The piece holding `offset`, then each one starting before `end`.
+        let first = first_at(&self.pieces, offset.saturating_add(1)).saturating_sub(1);
+        for (start, piece) in self.pieces[first..].iter().take_while(|(at, _)| *at < end) {
             let from = (*start).max(offset);
             let to = (start + piece.len).min(end);
             if from >= to {
@@ -429,15 +423,15 @@ impl FileMap {
     /// Whether some piece reads a journal frame: the map pins a segment.
     pub(in crate::tree_actor) fn on_frames(&self) -> bool {
         self.pieces
-            .values()
-            .any(|piece| matches!(piece.source, Source::Frame { .. }))
+            .iter()
+            .any(|(_, piece)| matches!(piece.source, Source::Frame { .. }))
     }
 
     /// Whether every piece reads from `base` (or is empty): nothing pins a
     /// journal segment.
     #[cfg(test)]
     pub(in crate::tree_actor) fn is_on(&self, base: &Arc<BaseFile>) -> bool {
-        self.pieces.values().all(|piece| match &piece.source {
+        self.pieces.iter().all(|(_, piece)| match &piece.source {
             Source::Base { file, .. } => Arc::ptr_eq(file, base),
             Source::Zero => true,
             Source::Frame { .. } => false,
@@ -482,11 +476,18 @@ impl FileMap {
     }
 }
 
+/// The index of the first piece starting at or after `at`.
+fn first_at(pieces: &[(u64, Piece)], at: u64) -> usize {
+    pieces.partition_point(|(start, _)| *start < at)
+}
+
 /// `pieces` with a piece boundary at `at`.
-fn split(pieces: &mut BTreeMap<u64, Piece>, at: u64) {
-    let Some((start, piece)) = pieces.range_mut(..at).next_back() else {
+fn split(pieces: &mut Vec<(u64, Piece)>, at: u64) {
+    let index = first_at(pieces, at);
+    let Some((start, piece)) = index.checked_sub(1).and_then(|i| pieces.get_mut(i)) else {
         return;
     };
+    let start = *start;
     let end = start + piece.len;
     if end <= at {
         return;
@@ -496,7 +497,7 @@ fn split(pieces: &mut BTreeMap<u64, Piece>, at: u64) {
         source: piece.source.advanced(at - start),
     };
     piece.len = at - start;
-    pieces.insert(at, right);
+    pieces.insert(index, (at, right));
 }
 
 /// FNV-1a, 64 bits: a digest stable across builds and releases, which a

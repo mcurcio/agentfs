@@ -257,7 +257,9 @@ impl Deref for FileBytes {
 #[derive(Clone, Debug, Default)]
 pub(super) struct Names {
     by_path: BTreeMap<String, u64>,
-    by_object: BTreeMap<u64, BTreeSet<String>>,
+    /// One entry per (object, path), not a set per object: a set's node costs
+    /// hundreds of bytes for the one path most objects have.
+    by_object: BTreeSet<(u64, String)>,
 }
 
 impl Names {
@@ -266,7 +268,7 @@ impl Names {
         if let Some(replaced) = replaced {
             self.unindex(replaced, &path);
         }
-        self.by_object.entry(object).or_default().insert(path);
+        self.by_object.insert((object, path));
         replaced
     }
 
@@ -284,19 +286,13 @@ impl Names {
     /// The paths naming `object`, in path order.
     pub(super) fn of(&self, object: u64) -> impl Iterator<Item = &str> {
         self.by_object
-            .get(&object)
-            .into_iter()
-            .flatten()
-            .map(String::as_str)
+            .range((object, String::new())..)
+            .take_while(move |(o, _)| *o == object)
+            .map(|(_, path)| path.as_str())
     }
 
     fn unindex(&mut self, object: u64, path: &str) {
-        if let Some(paths) = self.by_object.get_mut(&object) {
-            paths.remove(path);
-            if paths.is_empty() {
-                self.by_object.remove(&object);
-            }
-        }
+        self.by_object.remove(&(object, path.to_owned()));
     }
 }
 
@@ -632,7 +628,55 @@ pub(super) struct MergeFileIdentity(pub(super) u64);
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct NameHistory {
     pub(super) head: EventNumber,
-    pub(super) versions: BTreeMap<EventNumber, NameVersion>,
+    pub(super) versions: NameVersions,
+}
+
+/// A name history's versions by event number, in order: a vector, because
+/// most files have one version and a map's node costs hundreds of bytes for
+/// it. Stored as the map it stands for, so the commit's bytes are the same.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(super) struct NameVersions(Vec<(EventNumber, NameVersion)>);
+
+impl NameVersions {
+    pub(super) fn get(&self, event: &EventNumber) -> Option<&NameVersion> {
+        let at = self.0.binary_search_by_key(event, |(e, _)| *e).ok()?;
+        Some(&self.0[at].1)
+    }
+
+    /// Records `version` at `event`, replacing the one there.
+    pub(super) fn insert(&mut self, event: EventNumber, version: NameVersion) {
+        match self.0.binary_search_by_key(&event, |(e, _)| *e) {
+            Ok(at) => self.0[at].1 = version,
+            Err(at) => self.0.insert(at, (event, version)),
+        }
+    }
+
+    pub(super) fn iter(&self) -> impl Iterator<Item = (&EventNumber, &NameVersion)> {
+        self.0.iter().map(|(e, v)| (e, v))
+    }
+
+    #[cfg(test)]
+    pub(super) fn keys(&self) -> impl Iterator<Item = &EventNumber> {
+        self.0.iter().map(|(e, _)| e)
+    }
+}
+
+impl Serialize for NameVersions {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        serializer.collect_map(self.iter())
+    }
+}
+
+impl<'de> Deserialize<'de> for NameVersions {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        let map = BTreeMap::<EventNumber, NameVersion>::deserialize(deserializer)?;
+        Ok(Self(map.into_iter().collect()))
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -646,16 +690,14 @@ impl NameHistory {
     pub(super) fn created(event: EventNumber, path: String) -> Self {
         Self {
             head: event,
-            versions: [(
+            versions: NameVersions(vec![(
                 event,
                 NameVersion {
                     path: Some(path),
                     over: None,
                     replaced_by: None,
                 },
-            )]
-            .into_iter()
-            .collect(),
+            )]),
         }
     }
 
@@ -701,7 +743,7 @@ impl NameHistory {
     /// version differently.
     pub(super) fn combine(&self, other: &NameHistory) -> Result<NameHistory> {
         let mut combined = self.clone();
-        for (event, version) in &other.versions {
+        for (event, version) in other.versions.iter() {
             match combined.versions.get(event) {
                 Some(existing) if existing != version => return Err(Error::Format),
                 Some(_) => {}
@@ -717,6 +759,37 @@ impl NameHistory {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn names_index_each_object_by_its_paths() {
+        let mut names = Names::default();
+        names.insert("b".into(), 2);
+        names.insert("a".into(), 2);
+        names.insert("c".into(), 3);
+        assert_eq!(names.of(2).collect::<Vec<_>>(), ["a", "b"]);
+        // Renaming over a name moves it to the new object.
+        assert_eq!(names.insert("a".into(), 3), Some(2));
+        assert_eq!(names.of(2).collect::<Vec<_>>(), ["b"]);
+        assert_eq!(names.of(3).collect::<Vec<_>>(), ["a", "c"]);
+        assert_eq!(names.remove("b"), Some(2));
+        assert_eq!(names.of(2).count(), 0);
+        assert_eq!(names.of(1).count(), 0);
+    }
+
+    #[test]
+    fn name_versions_keep_event_order() {
+        let mut name = NameHistory::created(EventNumber::new(5), "a".into());
+        name.advance(EventNumber::new(9), Some("b".into()), None);
+        let mut older = NameHistory::created(EventNumber::new(5), "a".into());
+        older.advance(EventNumber::new(7), None, None);
+        let both = name.combine(&older).unwrap();
+        assert_eq!(
+            both.versions.keys().map(|e| e.get()).collect::<Vec<_>>(),
+            [5, 7, 9]
+        );
+        let stored = serde_json::to_string(&both).unwrap();
+        assert_eq!(serde_json::from_str::<NameHistory>(&stored).unwrap(), both);
+    }
     use crate::tree_actor::referee::{Collision, CollisionKind, Version};
     use crate::tree_reconcile::Line;
 
