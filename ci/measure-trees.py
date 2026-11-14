@@ -417,8 +417,10 @@ def line_map_storage(root, state, count, metrics, timeout, report, name, sample_
         time.sleep(0.05)
     if len(commits) != count:
         raise RuntimeError('expected %d save commits, found %d' % (count, len(commits)))
-    # Metadata is an envelope blob containing line maps and object/file IDs.
-    expressions = ''.join(c + ':metadata.json\n' for c in commits)
+    # The file's line map: lines/<aa>/<bb>/<name>, [identity, line map] (docs/trees.md).
+    name = 'line-map-measure'
+    digest = hashlib.sha1(b'blob %d\0' % len(name) + name.encode()).hexdigest()
+    expressions = ''.join('%s:lines/%s/%s/%s\n' % (c, digest[:2], digest[2:4], name) for c in commits)
     records = git(repo, 'cat-file', '--batch-check=%(objectname) %(objecttype) %(objectsize) %(objectsize:disk)',
                   input_data=expressions).splitlines()
     if len(records) != count:
@@ -441,7 +443,7 @@ def line_map_storage(root, state, count, metrics, timeout, report, name, sample_
         raise RuntimeError('invalid commit object records')
     return {'status': 'MEASURED', 'save_count': count, 'elapsed_ns': elapsed,
             'pattern': 'seed an empty file before the window; truncate and write one distinct 9-byte line, close after each save',
-            'metadata_definition': 'metadata.json envelope blobs include line maps and object/file IDs; namespace.json is separate',
+            'metadata_definition': 'the file\'s lines/<aa>/<bb>/<name> blob: its identity and line map; name histories are separate',
             'metadata_snapshot_logical_bytes_sum': sum(sizes), 'final_metadata_logical_bytes': sizes[0],
             'unique_metadata_blob_count': len(objects),
             'unique_metadata_logical_bytes': sum(v[0] for v in objects.values()),
