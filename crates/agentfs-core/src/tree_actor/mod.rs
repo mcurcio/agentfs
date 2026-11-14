@@ -35,7 +35,7 @@ use serde::Serialize;
 use crate::file_lock::{FileLock, Mode};
 use crate::tree_git::{RefUpdate, TreeGit};
 pub use agentfs_contracts::{NotATree, TreeId};
-pub use call_path::{Progress, Recording};
+pub use call_path::{Progress, Recording, Then};
 pub use history::built::{BuildError, BuiltSnapshot, Health, History, Lag, TreeLag, WaitError};
 use history::message::{self, Message};
 use history::upstreams::Upstreams;

@@ -15,7 +15,12 @@ use agentfs_contracts::volume::VolumeIdentity;
 
 use super::history::built::History;
 use super::journal::durable::RecordNo;
-use super::{Error, TreeActor, TreeId};
+use super::{Error, Took, TreeActor, TreeId};
+
+/// What runs when a deferred call may go on: given the durability or gate
+/// outcome, it sends the FUSE reply. Runs on the journal's waiter thread or
+/// the gate's, never with the actor locked.
+pub type Then = Box<dyn FnOnce(Result<(), Error>) + Send + 'static>;
 
 /// What [`Recording::progress`] did.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -29,7 +34,9 @@ pub enum Progress {
 }
 
 /// One tree volume, served: the actor, its journal's durability, and (B2b)
-/// History with the builder behind it. Shared as `Arc<Recording>`.
+/// History with the builder behind it. Shared as `Arc<Recording>`. Dropping
+/// the last one makes every record durable and builds every step appended
+/// (B2b), so a clean shutdown leaves history built through its last record.
 pub struct Recording {
     _private: (),
 }
@@ -83,6 +90,20 @@ impl Recording {
         todo!("B2a")
     }
 
+    /// [`Recording::durable`] without blocking the caller (a view's one FUSE
+    /// thread): `then` runs once the records are durable or the fsync failed.
+    /// Every call one fsync covers is answered by that fsync (group commit).
+    pub fn durable_then(&self, open: u64, then: Then) {
+        let _ = (open, then);
+        todo!("B2a")
+    }
+
+    /// [`Recording::durable_all`] without blocking the caller.
+    pub fn durable_all_then(&self, then: Then) {
+        let _ = then;
+        todo!("B2a")
+    }
+
     /// FSYNCDIR and a read-only descriptor's fsync: every record appended so far.
     ///
     /// # Errors
@@ -107,6 +128,15 @@ impl Recording {
         todo!("B2b")
     }
 
+    /// [`Recording::admit`] without blocking the caller: `then` runs at once on
+    /// this thread when admitted, else on the gate's thread at the built or
+    /// failed event that admits it. The call it wraps is concurrent with every
+    /// later request, as an unreturned syscall is.
+    pub fn admit_then(&self, tree: TreeId, then: Then) {
+        let _ = (tree, then);
+        todo!("B2b")
+    }
+
     /// History, the one owner of the Git store.
     pub fn history(&self) -> &History {
         todo!("B2b")
@@ -120,6 +150,17 @@ impl Recording {
     ///
     /// [`Error::Stopped`] when the actor stopped.
     pub fn progress(&self) -> Result<Progress, Error> {
+        todo!("B2b")
+    }
+
+    /// One take in `tree`, as [`Recording::progress`] takes one: the
+    /// conformance replay's `take_next`, after [`Recording::settle`].
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Stopped`] when the actor stopped; a failed decision or land.
+    pub fn take_next(&self, tree: TreeId) -> Result<Took, Error> {
+        let _ = tree;
         todo!("B2b")
     }
 
