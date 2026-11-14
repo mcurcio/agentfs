@@ -12,8 +12,9 @@ use std::fs::File;
 use std::io::{self, Read};
 use std::ops::Range;
 use std::os::unix::fs::FileExt;
-use std::path::Path;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use git2::Oid;
 
@@ -23,24 +24,93 @@ use crate::tree_actor::journal::segment::FramePos;
 use crate::tree_actor::stages;
 use crate::tree_actor::{Error, Result};
 
-/// The checkout's file as built: an open descriptor, so a later checkout,
-/// which writes a new file and renames it over this one, leaves it readable.
+/// The checkout's file as built: a hard link to it in the state area's
+/// `bases/`, so a later checkout, which writes a new file and renames it over
+/// this one, leaves it readable. It holds no descriptor: reads open the link
+/// through a bounded cache ([`OPEN_BASES`]), so a tree of any size needs no
+/// more descriptors than that. The link goes when the last map lets go.
 pub(in crate::tree_actor) struct BaseFile {
-    file: File,
+    link: PathBuf,
+    id: u64,
     step: RecordNo,
     blob: Option<Oid>,
 }
 
+/// The most base files open at once, process-wide: the descriptors file maps
+/// hold, whatever the trees' sizes.
+const OPEN_BASES: usize = 256;
+
+/// The open base files, most recently read last.
+static OPEN: Mutex<Vec<(u64, Arc<File>)>> = Mutex::new(Vec::new());
+
+/// Base files' link names, unique in this process.
+static NEXT_BASE: AtomicU64 = AtomicU64::new(0);
+
 impl BaseFile {
     /// The file at `path`, as built through `step`, holding blob `blob` when
-    /// the builder knows it.
-    pub fn open(path: &Path, step: RecordNo, blob: Option<Oid>) -> io::Result<Arc<Self>> {
+    /// the builder knows it: linked as `bases/<n>` (`bases` is the state
+    /// area's directory of links).
+    pub fn open(
+        bases: &Path,
+        path: &Path,
+        step: RecordNo,
+        blob: Option<Oid>,
+    ) -> io::Result<Arc<Self>> {
+        let id = NEXT_BASE.fetch_add(1, Ordering::Relaxed);
+        let link = bases.join(id.to_string());
+        std::fs::hard_link(path, &link)?;
         Ok(Arc::new(Self {
-            file: File::open(path)?,
+            link,
+            id,
             step,
             blob,
         }))
     }
+
+    /// Reads `buf.len()` bytes at `at`, opening the link when the cache does
+    /// not hold it (and letting the least recently read one go).
+    fn read_exact_at(&self, buf: &mut [u8], at: u64) -> io::Result<()> {
+        let file = {
+            let mut open = OPEN.lock().unwrap_or_else(PoisonError::into_inner);
+            match open.iter().position(|(id, _)| *id == self.id) {
+                Some(index) => {
+                    let entry = open.remove(index);
+                    let file = Arc::clone(&entry.1);
+                    open.push(entry);
+                    file
+                }
+                None => {
+                    let file = Arc::new(File::open(&self.link)?);
+                    if open.len() >= OPEN_BASES {
+                        open.remove(0);
+                    }
+                    open.push((self.id, Arc::clone(&file)));
+                    file
+                }
+            }
+        };
+        file.read_exact_at(buf, at)
+    }
+}
+
+impl Drop for BaseFile {
+    fn drop(&mut self) {
+        OPEN.lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|(id, _)| *id != self.id);
+        // A failure leaves a link the next start clears.
+        let _ = std::fs::remove_file(&self.link);
+    }
+}
+
+/// The state area's directory of base links, emptied: what a start does
+/// before any map reads a checkout. Links of an earlier run name nothing.
+pub(in crate::tree_actor) fn clear_bases(bases: &Path) -> io::Result<()> {
+    match std::fs::remove_dir_all(bases) {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+        _ => {}
+    }
+    std::fs::create_dir(bases)
 }
 
 impl std::fmt::Debug for BaseFile {
@@ -80,7 +150,7 @@ impl Source {
                 buf.fill(0);
                 Ok(())
             }
-            Self::Base { file, at } => file.file.read_exact_at(buf, *at),
+            Self::Base { file, at } => file.read_exact_at(buf, *at),
             Self::Frame { pos, at } => pos.read(*at, buf),
         }
     }
@@ -594,10 +664,10 @@ mod tests {
             .unwrap();
         let mut open = map.clone();
         map.saved_at(RecordNo::new(5));
-        let late = BaseFile::open(&path, RecordNo::new(4), None).unwrap();
+        let late = BaseFile::open(dir.path(), &path, RecordNo::new(4), None).unwrap();
         map.rebase(Arc::clone(&late));
         assert!(!map.is_on(&late), "a base built before the save");
-        let base = BaseFile::open(&path, RecordNo::new(5), None).unwrap();
+        let base = BaseFile::open(dir.path(), &path, RecordNo::new(5), None).unwrap();
         map.rebase(Arc::clone(&base));
         assert!(map.is_on(&base));
         assert_eq!(map.step(), Some(RecordNo::new(5)));
@@ -625,7 +695,7 @@ mod tests {
             .unwrap();
         framed.saved_at(RecordNo::new(3));
         let mut based = framed.clone();
-        based.rebase(BaseFile::open(&path, RecordNo::new(3), None).unwrap());
+        based.rebase(BaseFile::open(dir.path(), &path, RecordNo::new(3), None).unwrap());
         let write = frames.add(b"ab");
         let call = Call::Write { offset: 4, len: 2 };
         framed.apply(&call, &write).unwrap();

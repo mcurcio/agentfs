@@ -90,22 +90,24 @@ impl TreeActor {
 
     /// A fuzzy checkpoint (ARIES): the pointers and the live opens, written
     /// as the first frame of a new segment, then every older segment dropped
-    /// whose records are built and which holds no live open's call or held
-    /// page write. A file held open pins only its own frames, never other
-    /// files' saves: they are copied forward once the dead bytes they pin
-    /// exceed their own. A closed generation's page write stays out of the
-    /// fold (R12). Only with history built through every record: the
-    /// checkpoint's pointers are the built ones, and its redo start is its
-    /// last record.
+    /// whose records the builder has read and which holds no live open's call
+    /// or held page write. A file held open pins only its own frames, never
+    /// other files' saves: they are copied forward once the dead bytes they
+    /// pin exceed their own. A closed generation's page write stays out of
+    /// the fold (R12). Only with every step built: the checkpoint's pointers
+    /// are the built ones, and its redo start is its last record. Records
+    /// after the last step (calls, opens, page writes) build nothing the
+    /// checkpoint does not hold, so a file under constant writes never holds
+    /// compaction back.
     pub(in crate::tree_actor) fn compact(&mut self) -> std::result::Result<(), CompactError> {
         let _timer = Timer::start(Which::Compaction);
-        let snapshot = self.history.snapshot();
-        let last = RecordNo::new(self.next.saturating_sub(1));
-        if snapshot.at() < last {
+        if !self.history.steps_built() {
             return Err(CompactError::Before(std::io::Error::other(
-                "history is not built through the journal",
+                "history is not built through the journal's last step",
             )));
         }
+        let snapshot = self.history.snapshot();
+        let last = RecordNo::new(self.next.saturating_sub(1));
         let opens = self
             .handles
             .iter()
@@ -160,22 +162,37 @@ impl TreeActor {
             }),
             _ => false,
         };
+        // The builder reads the records after its built point from the
+        // linked segments: those stay until it has.
         let stats = self
             .journal
-            .drop_behind(last, &live)
+            .drop_behind(snapshot.at(), &live)
             .map_err(|e| CompactError::After(std::io::Error::other(e.to_string())))?;
         self.metrics.journal_dropped = self.metrics.journal_dropped.saturating_add(stats.segments);
         Ok(())
     }
 
     pub(in crate::tree_actor) fn compact_if_due(&mut self) {
-        if self.journal.len() < self.compact_threshold {
+        let length = self.journal.len();
+        if length < self.compact_threshold {
             return;
         }
         // A checkpoint's pointers are the built ones: due, it waits for the
-        // first call after the builder has caught up. The call path never
-        // waits on the builder, so the journal grows while history trails.
-        if self.history.built_through() < self.durability().appended() {
+        // first record after the builder has built every step and read past
+        // the oldest segment (else it could drop nothing). Calls after the
+        // builder's last batch never hold it back: they are live, and only
+        // the segment they share with dead records waits for the next step.
+        // The call path never waits on the builder; once the journal is twice
+        // its due length with steps unbuilt, the lag gate holds new work until
+        // the builder catches up.
+        let steps_built = self.history.steps_built();
+        self.history
+            .compaction_overdue(!steps_built && length >= self.compact_threshold.saturating_mul(2));
+        let read_past = self
+            .journal
+            .oldest_through()
+            .is_none_or(|oldest| self.history.built_through() >= oldest);
+        if !(steps_built && read_past) {
             return;
         }
         match self.compact() {

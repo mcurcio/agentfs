@@ -158,13 +158,15 @@ touched. A view reads a map with the actor unlocked: the lock is held only to
 clone it.
 
 - After a batch is built and checked out, the builder reads each changed file
-  from its checkout (an open descriptor) instead of the frames, and the actor
-  takes that map at its next call where it saved the same step. A checkout
-  writes each file to a temporary name and renames it over the old one, so a
-  reader that opened the old version keeps reading it.
-- Each such file holds one open descriptor per tree. The view raises the soft
-  limit on open files to the hard limit at start; a host whose hard limit is
-  below the files it serves gets `EMFILE`.
+  from its checkout instead of the frames, through a hard link in the state
+  area's `bases/` (cleared at each start), and the actor takes that map at its
+  next call where it saved the same step. A checkout writes each file to a
+  temporary name and renames it over the old one, so a reader that opened the
+  old version keeps reading it through its link; the link goes when the last
+  map lets go of it.
+- A map holds no descriptor: reads open the link through a cache of at most
+  256 open files per process, so a volume of any number of files opens and
+  reads under the default open-files limit.
 - A take's merged files are in chunk records of at most 16 MiB just before
   its step, written from the files whose lines it keeps (a version's bytes are
   the same in every file that holds it), and their maps read them there; a
@@ -246,16 +248,20 @@ appends it and applies it to the saved state the views serve; it runs no git.
   its own. A new segment's directory entry is fsynced before the durable mark
   covers any record in it.
 - A failed step keeps serving and saves at the next step in its tree. Only a failed
-  journal `fsync` or rollback stops the actor.
+  journal `fsync` (a leader's or a compaction's) or rollback stops the actor; a
+  failed fsync is never retried, since the page cache then says nothing about the
+  disk.
 - Recovery reads the journal and serves from it without waiting for history: the
   saved state is the trees as built (read from Git and the private checkouts)
   with every later record replayed on them by the transitions the actor ran at
   the call. It then closes abandoned opens through the ordinary step; the builder
   catches up behind, as at any time (see
   [History trails the files](#history-trails-the-files)), and a failed build
-  raises its alarm without refusing the open. A journal built through its last
-  record compacts at once; otherwise compaction runs at the first call after the
-  builder catches up. It refuses
+  raises its alarm without refusing the open. The recovered records are made
+  durable before anything is served (the directory first), and the steps past the
+  built point count in the lag gate as they did at their call. A journal whose
+  steps are all built compacts at once; otherwise compaction runs at the first
+  call after the builder catches up. It refuses
   a missing journal, a missing `format` file, a lost object at a pointer's tip, and
   a journal that names a tree by anything but its identity, has no root, gives the
   root an upstream, gives an upstream to a fork with no branch, or gives a fork an
@@ -263,17 +269,24 @@ appends it and applies it to the saved state the views serve; it runs no git.
   nothing outside a first init's own marker.
 - Compaction runs when the segments pass `max(64 MiB, twice the last compacted
   length)`: it writes a checkpoint at the start of a new segment, then drops
-  (unlinks) every older segment whose records are all built and which holds no
-  live open's call and no page write memory holds. A held file pins only its own
+  (unlinks) every older segment whose records the builder has read and which
+  holds no live open's call and no page write memory holds. A held file pins only its own
   frames: they are copied forward (marked `carried`, their record numbers kept)
   once the dead bytes they pin exceed their own, so the segments stay under about
   twice the live opens' bytes plus a segment. A reader holding a dropped segment
   keeps reading it; its space returns when the last lets go. Frames are at most
-  96 MiB; a take's bytes are in records of at most 16 MiB. The constants are not settings. A checkpoint's pointers are the built
-  ones, so a compaction that is due waits for the first call after the builder
-  has built every record; while history trails, the journal grows. A compaction
+  96 MiB; a take's bytes are in records of at most 16 MiB. The constants are not
+  settings. A checkpoint's pointers are the built ones, so a compaction that is
+  due waits for the first call after the builder has built every step and read
+  past the oldest segment; calls after the last step (a file under constant
+  writes) never hold it back, since the checkpoint holds them, and only the
+  segment they share with dead records waits for the next step. While steps
+  trail, the journal grows; once it is twice its due length, the lag gate holds
+  every tree's new work until the builder has built every step. A compaction
   that fails before its checkpoint changes nothing and is retried at the next
-  call; one that fails while dropping leaves those segments for the next.
+  call; one that fails while dropping leaves those segments for the next. Its
+  fsyncs (every segment the checkpoint covers, the directory, the frames it
+  copies forward) stop the actor when they fail, as a leader's do.
 - Recovery folds the last checkpoint, the live opens' calls and the held page
   writes it names from the segments before it (kept or carried, each once), and
   every frame after it.
@@ -282,11 +295,13 @@ appends it and applies it to the saved state the views serve; it runs no git.
   this journal's salt whose mark passes the last valid record means a durable record
   was lost: corruption, and the journal refuses to open. Otherwise the hole is a
   torn tail of records no fsync had covered, saved to `journal/torn` and cut off,
-  with every later segment.
-  Bit rot in the very last frame, or in records not yet durable, reads as a tear
-  and drops those records; the log line and that file are the evidence.
+  with every later segment. A journal whose valid records end before the built
+  log's point is corruption too: the builder made those records durable before it
+  built them.
+  Bit rot in the very last frame, or in records not yet durable or built, reads as
+  a tear and drops those records; the log line and that file are the evidence.
 - The state area is `volume`, `history.git`, `journal/`, `built.log`, `align/`,
-  `actor.lock`, `format` and rebuilt private checkout caches, which the workload
+  `bases/`, `actor.lock`, `format` and rebuilt private checkout caches, which the workload
   never sees. A create writes an `initializing` marker first and removes it last;
   the next `trees init` starts a cut-short create over. **Earlier state formats
   (format 8 included) do not open**, and are never converted.
@@ -326,13 +341,14 @@ the private checkouts copied, the checked-out files' maps rebased onto them
   the oldest unbuilt step's age, the worst tree's lag and the builder's health.
 - **The lag gate.** Each tree's lag is the builder's estimated time for its unbuilt
   steps: the larger of their count at a cost per step and the bytes they write
-  (the changed file and the tree's listings) at a cost per byte, each measured on
-  the last batch as if it bore the whole batch. While a commit writes the tree's
-  whole listings, a step costs more as the tree grows, and the byte estimate
-  follows that growth. Over 120 s, a call that starts new work in that tree (a
-  create, a write-open, `O_TMPFILE`, a link, a rename, an unlink, a path truncate)
-  waits for the built event that brings the lag under; other trees, writes,
-  flushes and closes do not wait, and the view answers other requests meanwhile.
+  (the bytes a save or take leaves, plus a constant for the commit and its three
+  hashed folder levels, which do not grow with the tree) at a cost per byte, each
+  measured on the last batch as if it bore the whole batch. Over 120 s, a call
+  that starts new work in that tree (a create, a write-open, `O_TMPFILE`, a link,
+  a rename, an unlink, a path truncate) waits for the built event that brings the
+  lag under; other trees, writes, flushes and closes do not wait, and the view
+  answers other requests meanwhile. One gate thread per volume answers every
+  waiting call at the built or failed event that admits it.
   The kernel holds a directory's lock while a create, link, rename or unlink in it
   waits, so a lookup or listing of that directory waits with it. A failed builder
   holds nothing back. Over 30 s,

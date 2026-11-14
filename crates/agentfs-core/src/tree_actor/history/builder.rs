@@ -114,10 +114,12 @@ impl JournalReader {
         }
     }
 
-    /// Frames after the cursor through `through` (at most the durable mark),
-    /// stopping after `max_steps` steps, and where they end. The cursor moves
-    /// only at [`JournalReader::advance`].
+    /// Frames after the cursor through `through`, never past the durable
+    /// mark, stopping after `max_steps` steps, and where they end. The cursor
+    /// moves only at [`JournalReader::advance`].
     pub fn read(&mut self, through: RecordNo, max_steps: usize) -> Result<(Vec<Frame>, ReadAt)> {
+        // A record past the mark may yet be torn: nothing is built from it.
+        let through = through.min(self.durability.mark());
         let mut frames = Vec::new();
         let mut steps = 0;
         let (start, start_offset) = (Arc::clone(&self.segment), self.offset);
@@ -1087,6 +1089,7 @@ impl Builder {
                     continue;
                 }
                 let base = match BaseFile::open(
+                    &self.root.join(super::BASES),
                     &super::checkout_path(&self.root, *tree, &path),
                     through,
                     bytes.known_blob(),

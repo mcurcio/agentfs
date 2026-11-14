@@ -14,6 +14,7 @@ use git2::Oid;
 use super::super::TreeId;
 use super::super::journal::durable::RecordNo;
 use super::{Objects, refs};
+use crate::tree_actor::call_path::Then;
 use crate::tree_actor::pointers::Pointers;
 use crate::tree_actor::recording::FileMap;
 use crate::tree_actor::tree::EventNumber;
@@ -159,6 +160,9 @@ pub(in crate::tree_actor) struct State {
     /// Built files' maps the actor has not taken yet, in the order built:
     /// each save, create and take, and each map rebased onto its checkout.
     pub(in crate::tree_actor) maps: Vec<(TreeId, u64, FileMap)>,
+    /// Gated calls waiting for their tree's lag to fall, in arrival order:
+    /// the one gate thread answers them ([`History::serve_gate`]).
+    gated: Vec<(TreeId, Then)>,
 }
 
 /// The built state at one built point: heads, refs and the commits behind
@@ -263,6 +267,7 @@ impl History {
                     checkpointed: RecordNo::ZERO,
                     gate: super::lag::LagGate::default(),
                     maps: Vec::new(),
+                    gated: Vec::new(),
                 }),
                 changed: Condvar::new(),
             }),
@@ -337,6 +342,21 @@ impl History {
         drop(state);
         self.notify();
         None
+    }
+
+    /// Whether every step appended is built: what a compaction waits for.
+    pub(in crate::tree_actor) fn steps_built(&self) -> bool {
+        self.state().unbuilt.is_empty()
+    }
+
+    /// A compaction due long enough that the lag gate holds every tree's new
+    /// work until the builder has built every step (or `false`: no longer).
+    pub(in crate::tree_actor) fn compaction_overdue(&self, overdue: bool) {
+        let mut state = self.state();
+        if state.gate.compaction_overdue(overdue) {
+            drop(state);
+            self.notify();
+        }
     }
 
     /// A batch is built and its built-log entry durable: the built point moves.
@@ -452,7 +472,63 @@ impl History {
         }
     }
 
+    /// [`History::admit`] without blocking the caller: `then` runs at once on
+    /// this thread when admitted (or at shutdown), else on the gate thread at
+    /// the built or failed event that admits it. One thread answers every
+    /// waiting call ([`History::serve_gate`]).
+    pub(in crate::tree_actor) fn admit_then(&self, tree: TreeId, then: Then) {
+        let mut state = self.state();
+        if state.gate.admits(tree) {
+            drop(state);
+            then(Ok(()));
+        } else if state.stopped || state.stopping {
+            drop(state);
+            then(Err(WaitError::Stopped.into()));
+        } else {
+            state.gated.push((tree, then));
+            drop(state);
+            self.notify();
+        }
+    }
+
+    /// The gate thread: answers each waiting call once its tree is admitted,
+    /// on the event that admits it; at shutdown answers the rest with
+    /// [`WaitError::Stopped`] and returns once the builder has stopped.
+    pub(in crate::tree_actor) fn serve_gate(&self) {
+        let mut state = self.state();
+        loop {
+            let shutting = state.stopped || state.stopping;
+            let (ready, waiting): (Vec<_>, Vec<_>) = std::mem::take(&mut state.gated)
+                .into_iter()
+                .partition(|(tree, _)| shutting || state.gate.admits(*tree));
+            state.gated = waiting;
+            if !ready.is_empty() {
+                drop(state);
+                for (_, then) in ready {
+                    then(if shutting {
+                        Err(WaitError::Stopped.into())
+                    } else {
+                        Ok(())
+                    });
+                }
+                state = self.state();
+                continue;
+            }
+            if state.stopped {
+                return;
+            }
+            state = self.wait(state);
+        }
+    }
+
+    /// The lag gate with these levels: a test's limit, so a call waits.
+    #[cfg(all(test, feature = "failpoints"))]
+    pub(in crate::tree_actor) fn set_lag_limits(&self, alarm: Duration, limit: Duration) {
+        self.state().gate = super::lag::LagGate::with_limits(alarm, limit);
+    }
+
     /// Whether `tree`'s new work may start now, without waiting.
+    #[cfg(all(test, feature = "failpoints"))]
     pub(in crate::tree_actor) fn admits(&self, tree: TreeId) -> bool {
         self.state().gate.admits(tree)
     }

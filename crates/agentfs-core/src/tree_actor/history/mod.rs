@@ -162,6 +162,10 @@ pub(in crate::tree_actor) fn owners(
 
 /// Where `tree`'s checkout holds the file named `name`: its `files/` path
 /// under `trees/<tree>/` (`format::file_path`).
+/// The state area's directory of links to checked-out files as built
+/// (`recording::file_map::BaseFile`).
+pub(in crate::tree_actor) const BASES: &str = "bases";
+
 pub(in crate::tree_actor) fn checkout_path(root: &Path, tree: TreeId, name: &str) -> PathBuf {
     let (aa, bb) = format::fanout(name);
     root.join("trees")

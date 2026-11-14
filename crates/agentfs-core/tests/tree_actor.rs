@@ -1004,14 +1004,38 @@ fn a_ref_copy_failure_is_not_a_call_failure() {
     );
 }
 
+/// The built log as of now, to put back after a clean shutdown built the
+/// records after it: the state a kill leaves before the builder read them, so
+/// those records can be torn (a built record never is: the builder made it
+/// durable first).
+struct BuiltSoFar {
+    path: std::path::PathBuf,
+    bytes: Vec<u8>,
+}
+
+fn built_so_far(v: &TreeActor, state: &std::path::Path) -> BuiltSoFar {
+    v.settle().unwrap();
+    let path = state.join("built.log");
+    let bytes = fs::read(&path).unwrap();
+    BuiltSoFar { path, bytes }
+}
+
+impl BuiltSoFar {
+    fn restore(self) {
+        fs::write(&self.path, &self.bytes).unwrap();
+    }
+}
+
 #[test]
 fn a_bad_final_frame_is_a_torn_tail() {
     let tmp = tempfile::tempdir().unwrap();
     let mut v = new_actor(tmp.path());
     let h = v.write_open(ROOT, "a", &writer("writer"), true).unwrap();
     v.write(h, 0, b"returned", false).unwrap();
+    let built = built_so_far(&v, tmp.path());
     v.write(h, 8, b"-torn", false).unwrap();
     drop(v);
+    built.restore();
     let path = trees::current_segment(tmp.path());
     let mut journal = fs::read(&path).unwrap();
     let last = journal.len() - 1;
@@ -1083,11 +1107,13 @@ fn a_frame_in_a_workloads_bytes_is_not_a_frame() {
     let salt = u32::from_le_bytes(fs::read(&path).unwrap()[4..8].try_into().unwrap());
     let h = v.write_open(ROOT, "a", &writer("writer"), true).unwrap();
     v.write(h, 0, b"returned", false).unwrap();
+    let built = built_so_far(&v, tmp.path());
     let mut bytes = b"workload ".to_vec();
     bytes.extend_from_slice(&forged(salt ^ 1));
     bytes.extend_from_slice(b" bytes");
     v.write(h, 8, &bytes, false).unwrap();
     drop(v);
+    built.restore();
     // Whole, the frame reads as what it is: the workload's bytes.
     let saved = {
         let copy = tempfile::tempdir().unwrap();
@@ -1354,7 +1380,12 @@ fn a_record_in_a_segment_whose_entry_is_not_fsynced_is_never_marked_durable() {
     assert!(v.durability().mark().get() < first);
     assert!(v.is_stopped());
     drop(v);
+    // The reopen finds the segment whose entry no fsync covered: its first
+    // fsync syncs the directory before the mark covers any record.
+    let counted = agentfs_core::failpoints::configure("").unwrap();
     let v = reopen(tmp.path());
+    assert!(agentfs_core::failpoints::hits("tree.segment_after_create") >= 1);
+    drop(counted);
     assert_eq!(v.read(ROOT, "big").unwrap().len(), 66 << 20);
 }
 
@@ -1524,6 +1555,15 @@ fn a_step_killed_after_its_record_is_not_saved_again() {
         // Refs are copies of the built log's values, made after its fsync:
         // killed before the copy, they still name the create's commit.
         let on_disk = repo(&state).head("refs/heads/root").unwrap().unwrap();
+        // Read before the reopen rebuilds anything: a ref on disk names a
+        // commit the built log holds (the install order), never one only the
+        // store has.
+        let built_log =
+            String::from_utf8_lossy(&fs::read(state.join("built.log")).unwrap()).into_owned();
+        assert!(
+            built_log.contains(&on_disk.to_string()),
+            "{spec}: the ref on disk names {on_disk}, which the built log lacks"
+        );
         let v = reopen(&state);
         let head = v.head(ROOT).unwrap();
         let copied = spec.starts_with("tree.build_after_ref_copy");
@@ -1778,7 +1818,7 @@ fn a_failure_before_the_checkpoint_is_retried_at_the_next_step() {
     let tmp = tempfile::tempdir().unwrap();
     let mut v = new_actor(tmp.path());
     let guard =
-        agentfs_core::failpoints::configure("tree.compact_before_checkpoint=error").unwrap();
+        agentfs_core::failpoints::configure("tree.compact_before_checkpoint=error@*").unwrap();
     fill_journal(&mut v, "big");
     drop(guard);
     assert!(!v.is_stopped());
@@ -1787,6 +1827,33 @@ fn a_failure_before_the_checkpoint_is_retried_at_the_next_step() {
     put(&mut v, ROOT, "a", b"next");
     assert!(trees::journal_len(tmp.path()) < 1 << 20);
     assert_eq!(v.read(ROOT, "a").unwrap(), b"next");
+}
+
+/// A compaction's fsync that fails is sticky, as a leader's is: the page
+/// cache says nothing about the disk any more, so the actor stops and a
+/// later fsync never reports what the failed one lost as durable.
+#[cfg(feature = "failpoints")]
+#[test]
+fn a_failed_compaction_fsync_stops_the_actor() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut v = new_actor(tmp.path());
+    let guard = agentfs_core::failpoints::configure("tree.compact_before_fsync=error").unwrap();
+    // Its last open is the first record after history caught up: it
+    // compacts, the fsync fails, and the open is refused.
+    fill_journal(&mut v, "big");
+    assert_eq!(
+        agentfs_core::failpoints::hits("tree.compact_before_fsync"),
+        1
+    );
+    drop(guard);
+    assert!(v.is_stopped());
+    assert!(
+        v.write_open(ROOT, "a", &writer("w"), true).is_err(),
+        "sticky"
+    );
+    drop(v);
+    let v = reopen(tmp.path());
+    assert_eq!(v.read(ROOT, "big").unwrap(), FILLED);
 }
 
 #[cfg(feature = "failpoints")]
@@ -2281,4 +2348,58 @@ fn a_landing_names_its_landed_writer() {
         assert!(sync.contains("Agentfs-Writer: agentfs\n"), "{sync}");
         assert!(sync.contains("Agentfs-Pod: pod-svc\n"), "{sync}");
     }
+}
+
+/// Files in the descriptor test: more than its limit allows open at once.
+const MANY_FILES: usize = 700;
+/// The descriptor limit the worker reopens under (soft and hard).
+const FEW_DESCRIPTORS: u64 = 512;
+
+/// A volume of more files than the process may hold descriptors opens and
+/// reads every file: a file's map holds no descriptor of its own (one per
+/// file per tree would fail the open with `EMFILE`).
+#[test]
+fn a_volume_of_more_files_than_descriptors_opens_and_reads() {
+    let tmp = tempfile::tempdir().unwrap();
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "descriptors_worker", "--nocapture"])
+        .env("AGENTFS_TREE_DESCRIPTORS_WORKER", tmp.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("READ ALL"),
+        "{output:?}"
+    );
+}
+
+#[test]
+fn descriptors_worker() {
+    let Some(root) = std::env::var_os("AGENTFS_TREE_DESCRIPTORS_WORKER") else {
+        return;
+    };
+    let root = std::path::Path::new(&root);
+    let mut v = new_actor(root);
+    for n in 0..MANY_FILES {
+        put(&mut v, ROOT, &format!("f{n}"), format!("{n}\n").as_bytes());
+    }
+    v.settle().unwrap();
+    drop(v);
+    let limit = libc::rlimit {
+        rlim_cur: FEW_DESCRIPTORS,
+        rlim_max: FEW_DESCRIPTORS,
+    };
+    // SAFETY: setrlimit reads only `limit`.
+    assert_eq!(
+        unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raw const limit) },
+        0
+    );
+    let v = reopen(root);
+    for n in 0..MANY_FILES {
+        assert_eq!(
+            v.read(ROOT, &format!("f{n}")).unwrap(),
+            format!("{n}\n").as_bytes()
+        );
+    }
+    println!("READ ALL");
 }

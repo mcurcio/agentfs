@@ -28,6 +28,9 @@ pub(in crate::tree_actor) struct LagGate {
     limit: Duration,
     alarm: Duration,
     failed: bool,
+    /// The journal's compaction is overdue: every tree's new work waits
+    /// until no step is unbuilt.
+    overdue: bool,
     /// The last health logged, so each entry into a state logs once.
     logged: Health,
 }
@@ -48,8 +51,15 @@ impl LagGate {
             limit,
             alarm,
             failed: false,
+            overdue: false,
             logged: Health::Current,
         }
+    }
+
+    /// Sets whether the journal's compaction is overdue; true when that
+    /// changed.
+    pub(in crate::tree_actor) fn compaction_overdue(&mut self, overdue: bool) -> bool {
+        std::mem::replace(&mut self.overdue, overdue) != overdue
     }
 
     /// The actor appended `step` in `tree`, which adds about `bytes` for the
@@ -108,10 +118,11 @@ impl LagGate {
         Duration::from_nanos(nanos)
     }
 
-    /// Whether `tree`'s new work may start now: its lag is under the limit,
-    /// or the builder has failed (a failed builder holds nothing back).
+    /// Whether `tree`'s new work may start now: its lag is under the limit
+    /// and no overdue compaction waits for the builder, or the builder has
+    /// failed (a failed builder holds nothing back).
     pub(in crate::tree_actor) fn admits(&self, tree: TreeId) -> bool {
-        self.failed || self.lag(tree) <= self.limit
+        self.failed || (self.lag(tree) <= self.limit && !(self.overdue && !self.unbuilt.is_empty()))
     }
 
     /// Every tree's lag, worst first.
@@ -203,6 +214,21 @@ mod tests {
         gate.built(step(5), Duration::from_millis(5));
         assert!(gate.admits(A));
         assert!(gate.trees().is_empty());
+    }
+
+    #[test]
+    fn an_overdue_compaction_holds_every_tree_until_steps_are_built() {
+        let mut gate = LagGate::default();
+        gate.appended(A, step(1), 0);
+        assert!(gate.admits(A) && gate.admits(B));
+        assert!(gate.compaction_overdue(true));
+        assert!(!gate.admits(A) && !gate.admits(B), "the journal is shared");
+        gate.built(step(1), Duration::from_millis(1));
+        assert!(gate.admits(A) && gate.admits(B), "every step is built");
+        gate.appended(B, step(2), 0);
+        assert!(!gate.admits(A));
+        assert!(gate.compaction_overdue(false));
+        assert!(gate.admits(A));
     }
 
     #[test]

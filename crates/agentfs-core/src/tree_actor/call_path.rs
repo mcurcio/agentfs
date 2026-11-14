@@ -42,12 +42,28 @@ pub struct Recording {
     durability: Arc<Durability>,
     /// The one owner of the Git store, reached without the actor's lock.
     history: History,
+    /// The gate thread, joined at drop: it holds the store (and the state
+    /// area's lease) until the builder has stopped.
+    gate: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Drop for Recording {
     fn drop(&mut self) {
         // A failure is logged where the fsync failed; the next open recovers.
         let _ = self.durability.make_all_durable();
+        // Build every record appended, then stop the builder and the gate
+        // thread, so the lease is free once the drop returns. A drop on the
+        // gate thread itself (its last reply held the last handle) leaves it
+        // to end on its own.
+        self.actor
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .shut_down();
+        if let Some(gate) = self.gate.take()
+            && gate.thread().id() != std::thread::current().id()
+        {
+            let _ = gate.join();
+        }
     }
 }
 
@@ -59,14 +75,26 @@ impl Lands for &Recording {
 }
 
 impl Recording {
-    fn serve(actor: TreeActor) -> Arc<Self> {
+    /// Serves `actor`, with the volume's gate thread: one thread answers
+    /// every gated call that waits ([`Recording::admit_then`]) and ends once
+    /// the builder has stopped.
+    fn serve(actor: TreeActor) -> Result<Arc<Self>, Error> {
         let durability = Arc::clone(actor.durability());
         let history = actor.history().clone();
-        Arc::new(Self {
+        let gate = history.clone();
+        let owner = crate::failpoints::owner();
+        let gate = std::thread::Builder::new()
+            .name("tree-gate".into())
+            .spawn(move || {
+                crate::failpoints::adopt(owner);
+                gate.serve_gate();
+            })?;
+        Ok(Arc::new(Self {
             actor: Mutex::new(actor),
             durability,
             history,
-        })
+            gate: Some(gate),
+        }))
     }
 
     /// Creates a volume as [`TreeActor::create`] does, then serves it.
@@ -79,19 +107,16 @@ impl Recording {
         identity: &VolumeIdentity,
         service: &PodContext,
     ) -> Result<Arc<Self>, Error> {
-        Ok(Self::serve(TreeActor::create(root, identity, service)?))
+        Self::serve(TreeActor::create(root, identity, service)?)
     }
 
-    /// Recovers a volume as [`TreeActor::open`] does, makes every recovered
-    /// record durable, then serves it.
+    /// Recovers a volume as [`TreeActor::open`] does, then serves it.
     ///
     /// # Errors
     ///
-    /// As [`TreeActor::open`], and a failed fsync of the recovered journal.
+    /// As [`TreeActor::open`].
     pub fn open(root: &Path, service: &PodContext) -> Result<Arc<Self>, Error> {
-        let actor = TreeActor::open(root, service)?;
-        actor.durability().make_all_durable()?;
-        Ok(Self::serve(actor))
+        Self::serve(TreeActor::open(root, service)?)
     }
 
     /// The actor, locked, for work that decides, appends and applies. The
@@ -167,31 +192,11 @@ impl Recording {
     }
 
     /// [`Recording::admit`] without blocking the caller: `then` runs at once on
-    /// this thread when admitted, else on a gate thread at the built or failed
-    /// event that admits it. The call it wraps is concurrent with every later
-    /// request, as an unreturned syscall is.
+    /// this thread when admitted, else on the volume's one gate thread at the
+    /// built or failed event that admits it. The call it wraps is concurrent
+    /// with every later request, as an unreturned syscall is.
     pub fn admit_then(&self, tree: TreeId, then: Then) {
-        if self.history.admits(tree) {
-            then(Ok(()));
-            return;
-        }
-        let history = self.history.clone();
-        let slot = Arc::new(Mutex::new(Some(then)));
-        let waiting = Arc::clone(&slot);
-        let spawned = std::thread::Builder::new()
-            .name("tree-gate".into())
-            .spawn(move || {
-                let admitted = history.admit(tree).map_err(Error::from);
-                if let Some(then) = waiting.lock().ok().and_then(|mut t| t.take()) {
-                    then(admitted);
-                }
-            });
-        if let Err(e) = spawned {
-            // No gate thread: answer here rather than drop the reply.
-            if let Some(then) = slot.lock().ok().and_then(|mut t| t.take()) {
-                then(Err(Error::Io(e)));
-            }
-        }
+        self.history.admit_then(tree, then);
     }
 
     /// History, the one owner of the Git store.
@@ -290,7 +295,7 @@ mod tests {
     #[test]
     fn a_flush_waits_without_the_actor_lock() {
         let tmp = tempfile::tempdir().unwrap();
-        let rec = Recording::serve(new_actor(tmp.path()));
+        let rec = Recording::serve(new_actor(tmp.path())).unwrap();
         let h = rec
             .actor()
             .unwrap()
@@ -323,7 +328,7 @@ mod tests {
     #[test]
     fn a_flush_covers_its_open_and_a_deferred_one_answers() {
         let tmp = tempfile::tempdir().unwrap();
-        let rec = Recording::serve(new_actor(tmp.path()));
+        let rec = Recording::serve(new_actor(tmp.path())).unwrap();
         let h = rec
             .actor()
             .unwrap()
@@ -347,7 +352,7 @@ mod tests {
     #[test]
     fn a_save_is_visible_before_it_is_built() {
         let tmp = tempfile::tempdir().unwrap();
-        let rec = Recording::serve(new_actor(tmp.path()));
+        let rec = Recording::serve(new_actor(tmp.path())).unwrap();
         rec.settle().unwrap();
         let before = rec.history().snapshot();
         // Hold the builder in the fsync it makes before each batch.
@@ -388,10 +393,75 @@ mod tests {
         );
     }
 
+    /// A failed batch releases every waiter on its event: a gated create
+    /// held over the lag limit goes on (a failed builder holds nothing back),
+    /// a wait for the built point gets the failure, recording goes on, and a
+    /// retry builds.
+    #[cfg(feature = "failpoints")]
+    #[test]
+    fn a_failed_builder_releases_the_gate_and_recording_goes_on() {
+        use std::time::Duration;
+        // A bound on a hang, never a coordination: each answer comes on an event.
+        const HANG: Duration = Duration::from_secs(60);
+        let tmp = tempfile::tempdir().unwrap();
+        let rec = Recording::serve(new_actor(tmp.path())).unwrap();
+        rec.settle().unwrap();
+        rec.history.set_lag_limits(Duration::ZERO, Duration::ZERO);
+        let failing = crate::failpoints::configure("tree.build_after_pack=error@*").unwrap();
+        // Hold the builder in the fsync it makes before its batch.
+        let (entered, inside) = sync_channel::<()>(0);
+        let (release, released) = mpsc::channel::<()>();
+        let released = Mutex::new(released);
+        rec.durability.hold_fsync_with(move || {
+            let _ = entered.send(());
+            let _ = released.lock().map(|r| r.recv());
+        });
+        let h = rec
+            .actor()
+            .unwrap()
+            .write_open(TreeId::Root, "a", &writer("w"), true)
+            .unwrap();
+        inside.recv().unwrap();
+        // The create is unbuilt and the limit is zero: a gated call waits.
+        assert!(!rec.history.admits(TreeId::Root));
+        let (admitted, admission) = mpsc::channel();
+        rec.admit_then(
+            TreeId::Root,
+            Box::new(move |r| admitted.send(r.is_ok()).unwrap()),
+        );
+        assert!(admission.try_recv().is_err(), "held by the gate");
+        let through = rec.durability.appended();
+        let (waited, wait) = mpsc::channel();
+        let history = rec.history.clone();
+        let asked = history.state().requests;
+        std::thread::spawn(move || waited.send(history.wait_built(through)).unwrap());
+        // The waiter asks under History's lock and waits in the same hold.
+        while rec.history.state().requests == asked {
+            std::thread::yield_now();
+        }
+        release.send(()).unwrap();
+        drop((release, inside));
+        assert_eq!(admission.recv_timeout(HANG), Ok(true), "the gate let go");
+        assert!(matches!(
+            wait.recv_timeout(HANG),
+            Ok(Err(super::super::history::built::WaitError::Failed(_)))
+        ));
+        // Recording goes on while the builder fails.
+        rec.actor().unwrap().write(h, 0, b"saved", false).unwrap();
+        rec.actor().unwrap().close(h).unwrap();
+        assert_eq!(
+            rec.actor().unwrap().read(TreeId::Root, "a").unwrap(),
+            b"saved"
+        );
+        drop(failing);
+        let built = rec.settle().unwrap();
+        assert_eq!(built, rec.durability.appended(), "a retry built it all");
+    }
+
     #[test]
     fn the_builder_never_reads_past_the_mark() {
         let tmp = tempfile::tempdir().unwrap();
-        let rec = Recording::serve(new_actor(tmp.path()));
+        let rec = Recording::serve(new_actor(tmp.path())).unwrap();
         for name in ["a", "b", "c"] {
             let h = rec
                 .actor()
@@ -411,7 +481,7 @@ mod tests {
     #[test]
     fn drop_builds_everything() {
         let tmp = tempfile::tempdir().unwrap();
-        let rec = Recording::serve(new_actor(tmp.path()));
+        let rec = Recording::serve(new_actor(tmp.path())).unwrap();
         for n in 0..20 {
             let h = rec
                 .actor()
@@ -421,11 +491,27 @@ mod tests {
             rec.actor().unwrap().write(h, 0, b"x", false).unwrap();
             rec.actor().unwrap().close(h).unwrap();
         }
+        // Calls after the last step: no step asks the builder for them.
+        rec.settle().unwrap();
+        let h = rec
+            .actor()
+            .unwrap()
+            .write_open(TreeId::Root, "f0", &writer("w"), false)
+            .unwrap();
+        rec.actor().unwrap().write(h, 0, b"y", false).unwrap();
         let last = rec.durability.appended();
-        assert!(rec.history().built_through() <= last);
+        assert!(rec.history().built_through() < last);
         drop(rec);
+        // Read before the reopen, which would build what the drop did not.
+        let (_, entries) =
+            super::super::history::built_log::BuiltLog::open(&tmp.path().join("built.log"))
+                .unwrap();
+        assert_eq!(
+            super::super::history::built_log::built_through(&entries),
+            last,
+            "the drop built through the last record"
+        );
         let v = super::super::test_support::reopen(tmp.path());
         assert_eq!(v.history().built_through(), last);
-        assert_eq!(v.durability().appended(), last);
     }
 }

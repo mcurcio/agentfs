@@ -144,7 +144,9 @@ impl Durability {
                 state: Mutex::new(State {
                     segments,
                     dir: Arc::new(dir),
-                    dir_unsynced: false,
+                    // A segment found at open may be one whose entry no fsync
+                    // of the directory covered yet: the first leader syncs it.
+                    dir_unsynced: true,
                     appended,
                     mark: mark.min(appended),
                     leading: false,
@@ -226,9 +228,7 @@ impl Durability {
                 Ok(state.mark)
             }
             Err(e) => {
-                let errno = e.raw_os_error().unwrap_or(libc::EIO);
-                eprintln!("tree JournalFsyncFailed: {e}");
-                state.failed = Some(errno);
+                let errno = Self::record_failure(&mut state, &e);
                 state.dir_unsynced |= dir.is_some();
                 Err(DurableError::Io(errno))
             }
@@ -254,7 +254,7 @@ impl Durability {
                 dir.sync_all()?;
             }
             for segment in files {
-                segment.file().sync_data()?;
+                segment.sync()?;
             }
         }
         crate::failpoints::hit("tree.wal_after_fsync")
@@ -318,6 +318,21 @@ impl Durability {
             drop(queue);
             then(self.make_durable(through).map(|_| ()).map_err(Error::from));
         }
+    }
+
+    /// A failed fsync, sticky: nothing past the mark is durable again.
+    fn record_failure(state: &mut State, e: &io::Error) -> i32 {
+        let errno = e.raw_os_error().unwrap_or(libc::EIO);
+        eprintln!("tree JournalFsyncFailed: {e}");
+        state.failed.get_or_insert(errno);
+        errno
+    }
+
+    /// An fsync of the journal outside a leader's (compaction's) failed: as a
+    /// leader's failure, every waiter gets the errno and the actor stops.
+    pub(in crate::tree_actor) fn fsync_failed(&self, e: &io::Error) {
+        Self::record_failure(&mut self.state(), e);
+        self.ended.notify_all();
     }
 
     /// An fsync of this journal failed: the actor stops.
@@ -449,7 +464,9 @@ mod tests {
     #[test]
     fn a_new_segment_is_fsynced_through_its_directory_first() {
         let (dir, d) = durability(1);
+        assert!(d.state().dir_unsynced, "a journal found at open");
         assert_eq!(d.make_all_durable(), Ok(RecordNo::new(1)));
+        assert!(!d.state().dir_unsynced);
         d.add_segment(Segment::create(dir.path(), RecordNo::new(2)).unwrap());
         assert!(d.state().dir_unsynced);
         d.appended_to(RecordNo::new(2));

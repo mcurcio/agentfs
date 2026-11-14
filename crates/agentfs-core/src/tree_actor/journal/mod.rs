@@ -225,6 +225,38 @@ pub(super) enum Change {
     },
 }
 
+/// What one step adds to a commit besides its files' bytes: a commit, its
+/// tree's three hashed folder levels down each changed path, and a line map
+/// (docs/trees.md, "What a commit holds"). Hashed sub-folders hold at most
+/// 256 entries a level, so this does not grow with the tree.
+const STEP_LISTINGS: u64 = 3 * 256 * 40;
+
+impl Change {
+    /// The tree a step's build works in, and about how many bytes it writes:
+    /// the bytes a save or take leaves and the listings each step writes
+    /// (the lag gate's estimate; the builder's measured rate corrects it).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Format`] for a tree that is no [`super::TreeId`].
+    pub fn build_cost(&self) -> Result<(super::TreeId, u64)> {
+        let (tree, bytes) = match self {
+            Self::Create { tree, .. }
+            | Self::Link { tree, .. }
+            | Self::Rename { tree, .. }
+            | Self::Unlink { tree, .. } => (tree, 0),
+            Self::Take { tree, take } => (tree, take.lens.iter().sum()),
+            Self::Save { tree, outcome, .. } => match outcome {
+                SaveOutcome::Saved { len, .. } => (tree, *len),
+                _ => (tree, 0),
+            },
+            Self::Fork { upstream } => (upstream, 0),
+        };
+        let tree = tree.parse().map_err(|_| Error::Format)?;
+        Ok((tree, bytes.saturating_add(STEP_LISTINGS)))
+    }
+}
+
 /// A page write's run that a close applies, by reference (the open's own
 /// calls are implied: all its `Call` records).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -708,10 +740,12 @@ impl Journal {
     /// # Errors
     ///
     /// [`Error::CorruptJournal`] for a missing, empty or checkpointless
-    /// journal (offset 0), or at an invalid frame that a later valid frame's
+    /// journal (offset 0); at an invalid frame that a later valid frame's
     /// mark shows held a durable record (its offset over the segments in
-    /// order). Nothing is changed then.
-    pub fn open(dir: &Path) -> Result<(Self, Vec<Frame>)> {
+    /// order); and where the valid records end before `built`, the built
+    /// log's point (records the builder made durable before it built them).
+    /// Nothing is changed then.
+    pub fn open(dir: &Path, built: RecordNo) -> Result<(Self, Vec<Frame>)> {
         let listed = match segment::list(dir) {
             Ok(listed) => listed,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Err(Error::CorruptJournal(0)),
@@ -782,6 +816,12 @@ impl Journal {
                 break;
             }
             global += bytes.len();
+        }
+        if built > covered {
+            let at = hole
+                .as_ref()
+                .map_or(global, |(_, offset, _)| global + offset);
+            return Err(Error::CorruptJournal(at));
         }
         if let Some((index, offset, mut rest)) = hole {
             for (_, path) in &listed[index + 1..] {
@@ -963,14 +1003,21 @@ impl Journal {
         let (segment, at) = self.current().clone();
         let written = (|| -> io::Result<()> {
             crate::failpoints::hit("tree.compact_before_checkpoint")?;
-            segment.file().write_all_at(&bytes, at)?;
-            // Every segment, so every record the checkpoint covers is on disk
-            // (a restart's frames may be only in the kernel); then the mark rises.
-            for (each, _) in &self.segments {
-                each.file().sync_data()?;
-            }
-            sync_dir(&self.dir)
+            segment.file().write_all_at(&bytes, at)
         })();
+        // Every segment, so every record the checkpoint covers is on disk (a
+        // restart's frames may be only in the kernel); then the mark rises. A
+        // failed fsync stops the journal, as a leader's does.
+        let written = written.and_then(|()| {
+            let synced = (|| -> io::Result<()> {
+                for (each, _) in &self.segments {
+                    crate::failpoints::hit("tree.compact_before_fsync")?;
+                    each.sync()?;
+                }
+                sync_dir(&self.dir)
+            })();
+            synced.inspect_err(|e| self.durability.fsync_failed(e))
+        });
         if let Err(e) = written {
             if rolled {
                 self.segments.pop();
@@ -1059,9 +1106,13 @@ impl Journal {
                     stats.carried_bytes += header.frame_len();
                     stages::copied(header.tail as u64);
                 }
-                current.file().sync_data()?;
                 let last = self.segments.len() - 1;
                 self.segments[last].1 = end;
+                // The copies stand before their originals go; a failed fsync
+                // stops the journal, as a leader's does.
+                current
+                    .sync()
+                    .inspect_err(|e| self.durability.fsync_failed(e))?;
             }
             fs::remove_file(segment.path())?;
             self.durability.remove_segment(segment.first());
@@ -1069,12 +1120,24 @@ impl Journal {
             stats.segments += 1;
         }
         self.carried += stats.carried_bytes;
+        if stats.segments > 0 {
+            // Only space rides on it: a dropped segment that comes back after
+            // a power cut holds records the checkpoint covers.
+            sync_dir(&self.dir).inspect_err(|e| self.durability.fsync_failed(e))?;
+        }
         Ok(stats)
     }
 
     /// Every linked segment's bytes: what compaction is due by.
     pub fn len(&self) -> u64 {
         self.segments.iter().map(|(_, length)| length).sum()
+    }
+
+    /// The last record the oldest segment can hold when a later one exists:
+    /// once history is built through it, a compaction can drop it.
+    pub fn oldest_through(&self) -> Option<RecordNo> {
+        let next = self.segments.get(1)?.0.first();
+        Some(RecordNo::new(next.get().saturating_sub(1)))
     }
 
     /// Bytes compaction has copied forward since open.
@@ -1134,7 +1197,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("journal");
         Journal::create(&dir, &checkpoint(1)).unwrap();
-        let (journal, frames) = Journal::open(&dir).unwrap();
+        let (journal, frames) = Journal::open(&dir, RecordNo::ZERO).unwrap();
         assert_eq!(frames.len(), 1);
         (tmp, dir, journal)
     }
@@ -1187,7 +1250,7 @@ mod tests {
         let third = call(3, 8, b"three");
         journal.append(&third.0, &third.1).unwrap();
         drop(journal);
-        let (journal, frames) = Journal::open(&dir).unwrap();
+        let (journal, frames) = Journal::open(&dir, RecordNo::ZERO).unwrap();
         assert_eq!(journal.salt, salt);
         assert!(matches!(frames[0].0.entry, Entry::Checkpoint { .. }));
         assert_eq!(
@@ -1211,7 +1274,7 @@ mod tests {
         assert_eq!(stats, DropStats::default());
         assert_eq!(journal.segment_firsts().len(), 2);
         drop(journal);
-        let (_, frames) = Journal::open(&dir).unwrap();
+        let (_, frames) = Journal::open(&dir, RecordNo::ZERO).unwrap();
         assert_eq!(tails(&frames[1..]), vec![(2, big.1)]);
     }
 
@@ -1241,7 +1304,7 @@ mod tests {
             Ok(RecordNo::new(70))
         );
         drop(journal);
-        let (_, frames) = Journal::open(&dir).unwrap();
+        let (_, frames) = Journal::open(&dir, RecordNo::ZERO).unwrap();
         assert_eq!(frames.len(), 71);
     }
 
@@ -1270,7 +1333,7 @@ mod tests {
         let next = call(193, 8, &block);
         journal.append(&next.0, &next.1).unwrap();
         drop(journal);
-        let (_, frames) = Journal::open(&dir).unwrap();
+        let (_, frames) = Journal::open(&dir, RecordNo::ZERO).unwrap();
         assert_eq!(frames.len(), 1 + live_frames + 1);
     }
 
@@ -1293,14 +1356,26 @@ mod tests {
     fn a_missing_empty_or_frameless_journal_is_corruption_at_zero() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("journal");
-        assert!(matches!(Journal::open(&dir), Err(Error::CorruptJournal(0))));
+        assert!(matches!(
+            Journal::open(&dir, RecordNo::ZERO),
+            Err(Error::CorruptJournal(0))
+        ));
         fs::create_dir(&dir).unwrap();
-        assert!(matches!(Journal::open(&dir), Err(Error::CorruptJournal(0))));
+        assert!(matches!(
+            Journal::open(&dir, RecordNo::ZERO),
+            Err(Error::CorruptJournal(0))
+        ));
         let path = dir.join(segment::name_of(RecordNo::new(1)));
         fs::write(&path, b"").unwrap();
-        assert!(matches!(Journal::open(&dir), Err(Error::CorruptJournal(0))));
+        assert!(matches!(
+            Journal::open(&dir, RecordNo::ZERO),
+            Err(Error::CorruptJournal(0))
+        ));
         fs::write(&path, vec![7; 100]).unwrap();
-        assert!(matches!(Journal::open(&dir), Err(Error::CorruptJournal(0))));
+        assert!(matches!(
+            Journal::open(&dir, RecordNo::ZERO),
+            Err(Error::CorruptJournal(0))
+        ));
         assert_eq!(fs::read(&path).unwrap(), vec![7; 100]);
     }
 
@@ -1315,7 +1390,7 @@ mod tests {
         let mut file = OpenOptions::new().append(true).open(&path).unwrap();
         file.write_all(b"AFJ3 torn").unwrap();
         drop(file);
-        let (journal, frames) = Journal::open(&dir).unwrap();
+        let (journal, frames) = Journal::open(&dir, RecordNo::ZERO).unwrap();
         assert_eq!(frames.len(), 2);
         assert_eq!(journal.len(), length);
         assert_eq!(fs::metadata(&path).unwrap().len(), length);
@@ -1350,7 +1425,7 @@ mod tests {
         let (_tmp, dir, hole) = damaged_middle(true);
         let path = only_segment(&dir);
         let before = fs::read(&path).unwrap();
-        match Journal::open(&dir) {
+        match Journal::open(&dir, RecordNo::ZERO) {
             Err(Error::CorruptJournal(at)) => assert_eq!(at as u64, hole),
             other => panic!("expected corruption, got {:?}", other.map(|(_, f)| f.len())),
         }
@@ -1360,11 +1435,29 @@ mod tests {
     #[test]
     fn a_hole_no_later_mark_covers_is_a_torn_tail() {
         let (_tmp, dir, hole) = damaged_middle(false);
-        let (journal, frames) = Journal::open(&dir).unwrap();
+        let (journal, frames) = Journal::open(&dir, RecordNo::ZERO).unwrap();
         assert_eq!(frames.len(), 2, "the checkpoint and the first call");
         assert_eq!(journal.len(), hole);
         assert_eq!(fs::metadata(only_segment(&dir)).unwrap().len(), hole);
         assert!(dir.join("torn").exists());
+    }
+
+    /// A hole no later mark covers, but the built log is past it: the builder
+    /// made those records durable before it built them, so they were lost to
+    /// the disk, not torn. Cutting them would move refs back.
+    #[test]
+    fn a_hole_the_built_log_passes_is_corruption() {
+        let (_tmp, dir, hole) = damaged_middle(false);
+        let path = only_segment(&dir);
+        let before = fs::read(&path).unwrap();
+        match Journal::open(&dir, RecordNo::new(2)) {
+            Err(Error::CorruptJournal(at)) => assert_eq!(at as u64, hole),
+            other => panic!("expected corruption, got {:?}", other.map(|(_, f)| f.len())),
+        }
+        assert_eq!(fs::read(&path).unwrap(), before, "nothing changed");
+        assert!(!dir.join("torn").exists());
+        // Built only through the first: the hole is a torn tail.
+        assert!(Journal::open(&dir, RecordNo::new(1)).is_ok());
     }
 
     #[test]
@@ -1387,9 +1480,124 @@ mod tests {
             .unwrap()
             .set_len(length - 10)
             .unwrap();
-        let (_, frames) = Journal::open(&dir).unwrap();
+        let (_, frames) = Journal::open(&dir, RecordNo::ZERO).unwrap();
         assert!(frames.len() < 66);
         assert_eq!(segment::list(&dir).unwrap().len(), 1);
+    }
+
+    /// A checkpoint fsyncs every segment before the mark rises to what it
+    /// covers: a restart's frames may be only in the kernel, and no leader's
+    /// fsync covers them after.
+    #[test]
+    fn a_checkpoint_fsyncs_every_segment_it_covers() {
+        let (_tmp, dir, mut journal) = journal();
+        let block = vec![5; 1 << 20];
+        for seq in 1..=66 {
+            let (record, tail) = call(seq, 1, &block);
+            journal.append(&record, &tail).unwrap();
+        }
+        assert_eq!(segment::list(&dir).unwrap().len(), 2);
+        assert_eq!(journal.durability().mark(), RecordNo::ZERO);
+        let before = segment::SYNCS.with(std::cell::Cell::get);
+        journal.checkpoint(&checkpoint(67)).unwrap();
+        let synced = segment::SYNCS.with(std::cell::Cell::get) - before;
+        assert_eq!(synced, 3, "both segments and the checkpoint's");
+        assert_eq!(journal.durability().mark(), RecordNo::new(66));
+    }
+
+    /// The builder's reader never reads past the durable mark: a frame in the
+    /// kernel but not yet fsynced may still be torn.
+    #[test]
+    fn the_builder_never_reads_past_the_mark() {
+        use crate::tree_actor::history::builder::JournalReader;
+        let (_tmp, _dir, mut journal) = journal();
+        for seq in 1..=2 {
+            let (record, tail) = call(seq, 1, b"durable");
+            journal.append(&record, &tail).unwrap();
+        }
+        journal.durability().make_all_durable().unwrap();
+        let (record, tail) = call(3, 1, b"unsynced");
+        journal.append(&record, &tail).unwrap();
+        assert_eq!(journal.durability().mark(), RecordNo::new(2));
+        let mut reader = JournalReader::open(
+            Arc::clone(journal.durability()),
+            journal.salt(),
+            RecordNo::ZERO,
+        )
+        .unwrap();
+        let (frames, _) = reader
+            .read(journal.durability().appended(), usize::MAX)
+            .unwrap();
+        let read: Vec<u64> = frames.iter().map(|(r, _)| r.seq.get()).collect();
+        assert_eq!(read, vec![1, 2], "the unsynced frame waits for its fsync");
+    }
+
+    /// A replay that disagrees with its record stops building with the alarm
+    /// (`Disagrees`), and recording goes on: the save's record claims pieces
+    /// the builder's replay of its calls does not reach.
+    #[cfg(feature = "failpoints")]
+    #[test]
+    fn a_replay_that_disagrees_with_its_record_stops_the_builder() {
+        use crate::tree_actor::history::built::{BuildError, WaitError};
+        use crate::tree_actor::test_support::{new_actor, reopen, writer};
+        use crate::tree_actor::{Saved, TreeId};
+        let tmp = tempfile::tempdir().unwrap();
+        let unbuilt = crate::failpoints::configure("tree.build_before_batch=error@*").unwrap();
+        let mut v = new_actor(tmp.path());
+        let h = v.write_open(TreeId::Root, "a", &writer("w"), true).unwrap();
+        v.write(h, 0, b"bytes", false).unwrap();
+        let Saved::Commit(step) = v.close(h).unwrap() else {
+            panic!("the close saves");
+        };
+        v.durability().make_all_durable().unwrap();
+        drop(v);
+        drop(unbuilt);
+        // The step's record, its digest changed in place: the same length.
+        let dir = tmp.path().join("journal");
+        let path = only_segment(&dir);
+        let mut bytes = fs::read(&path).unwrap();
+        let salt = u32_at(&bytes, 4);
+        let mut at = 0;
+        loop {
+            let (header, head, _) = read_frame(&bytes[at..], salt).unwrap();
+            if header.record == step {
+                let text = String::from_utf8(head.to_vec()).unwrap();
+                let digits = text.split("\"pieces\":").nth(1).unwrap();
+                let end = digits.find(|c: char| !c.is_ascii_digit()).unwrap();
+                let place = text.len() - digits.len() + end - 1;
+                let mut head = head.to_vec();
+                head[place] = if head[place] == b'1' { b'2' } else { b'1' };
+                let tail =
+                    bytes[at + HEADER + head.len()..at + header.frame_len() as usize].to_vec();
+                let fixed = header_bytes(
+                    salt,
+                    header.record,
+                    header.mark,
+                    header.flags,
+                    head.len() as u32,
+                    tail.len() as u32,
+                    crc_body(&head, &tail),
+                );
+                bytes[at..at + HEADER].copy_from_slice(&fixed);
+                bytes[at + HEADER..at + HEADER + head.len()].copy_from_slice(&head);
+                break;
+            }
+            at += header.frame_len() as usize;
+        }
+        fs::write(&path, &bytes).unwrap();
+        let mut v = reopen(tmp.path());
+        // Served from the journal; history stops at the step with the alarm.
+        assert_eq!(v.read(TreeId::Root, "a").unwrap(), b"bytes");
+        match v.settle() {
+            Err(Error::History(WaitError::Failed(BuildError::Disagrees(at)))) => {
+                assert_eq!(at, step);
+            }
+            other => panic!("expected Disagrees, got {other:?}"),
+        }
+        let h = v.write_open(TreeId::Root, "b", &writer("w"), true).unwrap();
+        v.write(h, 0, b"recorded", false).unwrap();
+        v.close(h).unwrap();
+        assert_eq!(v.read(TreeId::Root, "b").unwrap(), b"recorded");
     }
 
     #[test]

@@ -174,8 +174,12 @@ agentfs repairs neither case itself.
 - **`CorruptJournal(offset)`.** A frame is bad and a later good frame's durable mark
   says a record at or after the bad one had been flushed to disk, so this is not a torn
   write: the disk lost data it had acknowledged. The offset counts the bytes of the
-  segments in name order. `CorruptJournal(0)` also means the journal is missing,
-  holds no frame or holds no checkpoint.
+  segments in name order. It also means the valid records end before the point
+  `built.log` names: the builder made those records durable before it built them,
+  so the disk lost them (the offset is where the records end). Truncating
+  `built.log` instead would move refs back past saves the views served.
+  `CorruptJournal(0)` also means the journal is missing, holds no frame or holds
+  no checkpoint.
 - **`MissingObject`.** A pointer's commit, tree or blob is gone. The error names the
   pointer and the object.
 

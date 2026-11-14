@@ -94,11 +94,25 @@ impl Segment {
         &self.file
     }
 
+    /// `fdatasync`: its records and its length on disk. Every fsync of a
+    /// segment goes through here.
+    pub fn sync(&self) -> io::Result<()> {
+        #[cfg(test)]
+        SYNCS.with(|n| n.set(n.get() + 1));
+        self.file.sync_data()
+    }
+
     /// Fills `buf` from byte `at`. A segment never shrinks under a reader of
     /// what was appended, so a short read is damage.
     pub fn read_exact_at(&self, buf: &mut [u8], at: u64) -> io::Result<()> {
         self.file.read_exact_at(buf, at)
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// This thread's segment fsyncs, for tests.
+    pub(in crate::tree_actor) static SYNCS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// Where one frame's tail starts: a record's bytes, read from its segment.
