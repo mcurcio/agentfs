@@ -217,8 +217,7 @@ the private checkouts copied, and waiters woken.
 
 - A save is visible to every view at its release, before it is built. Git's refs,
   commits and checkouts show only what is built.
-- Takes are decided on history built through every record before them; a take waits
-  for the builder first.
+- Takes are decided on built history, off the actor's lock (below, "Takes").
 - A commit is dated by its step's record, in `+0000`. A replay after a crash may
   make other objects for steps nothing had seen built.
 - A failed batch (`tree HistoryBuildFailed: <e>`) changes nothing reachable and is
@@ -245,6 +244,28 @@ the private checkouts copied, and waiters woken.
   holds nothing back. Over 30 s,
   `tree HistoryLagging` is logged once; over the limit, `tree HistoryStalled`.
   The levels are constants, not settings.
+
+## Takes
+
+A tree's queue entries are taken one at a time per volume, by the view's worker or
+by `take_next`. Each take runs in three parts:
+
+1. Under the actor's lock: pending closes in the tree save first, then the take
+   reads its inputs: the keys the tree's write-opens hold, the last step that moved
+   the tree's head (and its upstream's, for a fork), and the last record appended.
+2. With the lock released: it waits for history built through that record, then
+   plans and judges the first entry P1 lets go on that built snapshot. Calls go on
+   meanwhile.
+3. Under the lock: it lands as a take step, or is refused when a step after the
+   decision touched a key it read (`FilesChanged`), a write-open holds a key it
+   writes (`Held`), a fast-forward's head or a sync's upstream head moved
+   (`HeadMoved`), or its entry is gone (`EntryGone`). A refused take is logged
+   (`tree TakeRefused`) and decided again at once, on the history that refused it.
+
+A landed take read nothing that changed after its decision, so it decides what a take
+made in one step at its land would. The worker wakes on built and failed events,
+never a timer. A take whose files change faster than the builder's lag plus its
+decision waits until they stop.
 
 ## The view
 

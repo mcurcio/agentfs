@@ -359,6 +359,21 @@ fifteen, and stores only the blobs of the files it changed.
 After, `close_64m` meets its bar on ext4 and misses it on XFS; `close_4k`
 and `create` miss theirs on both.
 
+Then the call path stopped running git: a save is a journal record, and the
+builder makes its commits behind it (`image` run 43567446691, commit
+2271669, one observation each):
+
+| Workload | ext4 | XFS |
+|---|---|---|
+| `close_4k`, p50 | 1.03 ms | 0.46 ms |
+| `close_4k`, `drain_s` | 0.50 s | 0.20 s |
+| `create`, created by the 300 s deadline | 7,529 | 7,743 |
+| `close_64m` | 0.51 s | 0.20 s |
+
+`close_4k` and `close_64m` meet their bars on both filesystems. `create`
+misses its bar: the lag gate holds creates to the builder's pace, and the
+builder still writes each commit's whole listings, as below.
+
 The cost of one create against the files in the tree (the median save in
 each window, ms):
 
@@ -372,10 +387,12 @@ each window, ms):
 | about 2,025 | | 45 | | 52 |
 | about 4,550 to 4,650 | | 85 | | 85 |
 
-A save still writes the whole files tree, the line map (`metadata.json`)
-and the name history (`namespace.json`) of its tree ([Large files in the
-tree are slow](#large-files-in-the-tree-are-slow)), so it costs about
-14 µs more for each file already in the tree, where it cost 6 to 7 ms.
+Each commit still writes the whole files tree, the line map
+(`metadata.json`) and the name history (`namespace.json`) of its tree
+([Large files in the tree are slow](#large-files-in-the-tree-are-slow)), so
+it costs about 14 µs more for each file already in the tree, where it cost
+6 to 7 ms. The figures above in this table were taken while the save made
+its commit; the builder now pays this cost behind the call path.
 
 ## Performance budget
 

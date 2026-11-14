@@ -18,6 +18,10 @@ design was reviewed on 2026-10-12.
   is built (`Recording::settle` waits for it). A failed build is retried and never
   fails a call. The state format is now `agentfs-trees-6`, with a `built.log`;
   older tree state areas do not open.
+- **Tree views: takes are decided off the actor.** A queue take is decided on
+  built history with the actor unlocked, so calls go on while it judges, and lands
+  only if nothing it read changed since; otherwise it is decided again
+  (docs/trees.md, "Takes").
 - **Tree views: a call is journalled without an fsync.** A write, create, rename
   or unlink is in the journal before it returns and survives a crash of agentfs;
   close, fsync, an `O_SYNC` write or an fsync of the view's directory make it

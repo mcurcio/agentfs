@@ -822,3 +822,38 @@ Not blocking; the suite is built and green. Findings about the brief and the doc
 3. **The WIP does not build all of §4.** Takes still settle and decide on the actor under its lock (no `takes.rs`,
    no `Decision`/`land`/`Refused`), and most of the acceptance table's tests and mutation probes 2, 4, 6 and 7 do not
    exist. The brief's "fallback split" for B2b is not in speed-pages.md or speed-design.md.
+
+## 2026-11-14, speed B2b rest (takes off the actor, §4's tests and probes)
+
+1. **§4's land rule misses that a sync reads its upstream's head.** A sync decided before an upstream save syncs to
+   the older commit; an atomic take at the land would sync to the newer one (and the second sync entry would then
+   stay), so the two histories differ. Built: `TakeInputs::upstream` and `Decision::upstream_at` (the upstream's last
+   head-moving step), and `land` refuses `HeadMoved` for a sync whose upstream's head moved, as for a fast-forward
+   whose own head moved. A re-cut should list both fields.
+2. **`head_at` cannot name the head the decision saw.** A snapshot knows oids, not the step that set them. Built:
+   `TakeInputs::through` (the last record when the inputs were read); the decision waits for history built through
+   it, `head_at` is the inputs' head step, and `land` compares the actor's current head step with it, which refuses
+   whenever the head moved after the inputs (conservatively, also for a move before the snapshot).
+3. **Pruning `touched` at built events loses a refusal.** A key touched after a decision's built point but before the
+   next built event is pruned before the decision lands. Built: `touched` holds keys only while the tree's queue holds
+   an entry (a decision reads a queue as built, so an earlier step precedes it), and is pruned at each land to steps
+   after the built point; takes are one at a time, so no decision is in flight then.
+4. **A close that changes nothing lets a held key go without touching it.** `Shape::save` gives no keys for
+   `Unchanged`, so an entry that a held key blocked would stay passed over. Built: every close touches its object's
+   keys, whatever its outcome.
+5. **`decide` returns no waiting entries**, which the wait metrics need (`ci/trees-conformance.py` reads `waits`).
+   Built: `take_one` counts the built queue's entries before the decided one (or all) as waiting.
+6. **The restart hypothesis is killed, and 10,000 files cannot be built in a test before B4.** Open settles, so its
+   time is building the tail past the checkpoint at whole-listings cost: debug, 0.19 s for 501 files with 1 step past
+   the checkpoint, 2.6 s for 600 with 100, 8.8 s for 2,100 with 100 (hypothesis: under 5 s for 10,000). The worker
+   that builds 2,000 files took about 85 s (one commit's listings per step). `restart_replays_from_the_checkpoint`
+   uses 500 + 100 files; re-measure after B4.
+7. **No failpoint can hold the builder** (actions are kill, error, panic, sleep). `a_save_is_visible_before_it_is_built`
+   holds it in the journal fsync it makes before each batch (`Durability::hold_fsync_with`), an event.
+8. **Probe 1 survived the named crash test**: a rebuild after the kill makes the same commits, so refs naming them
+   early is invisible after reopen. `a_step_killed_after_its_record_is_not_saved_again` now reads the refs on disk
+   before the reopen.
+9. **Not built from §4:** `TreeActor::{create, open}` stay public (the integration tests and the conformance library
+   drive `TreeActor` directly; `TreeActor::take_next` runs the same three parts with no lock to release);
+   `the_gate_holds_only_its_tree` is the lag gate's unit test, not the page's view-level test of a tree's write and
+   RELEASE passing a held create.

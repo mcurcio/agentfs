@@ -191,7 +191,8 @@ parked (views.md).
 Compaction replaces the file with one checkpoint (every pointer, the fork upstreams, the live opens, the next number)
 and then, unchanged, the calls and page writes of files with a live write-open: a file held open pins only its own
 calls, never other files' saves. It is due at a step once the file reaches `max(64 MiB, twice its length after the last
-compaction)`, and always runs at the end of a recovery.
+compaction)`, and always runs at the end of a recovery. A checkpoint's pointers are built values, so compaction
+waits for the first step after the builder has caught up, and the checkpoint's redo start is the built point (§12).
 
 Every commit carries three trailers. The model's exact format (the `#` comments are not part of it):
 
@@ -311,10 +312,15 @@ sync arrived while the file was open) is not modelled.
 **Locks** (owner, 2026-11-03; for a landing into a tree too, a *choice*; the names its files have on either side of the change too, R9.1). A take into a tree lists the files
 it will overwrite there, waits until no client of that tree has one open for writing, then holds them all
 while it writes; a write-open of a held file waits until it finishes. All at once, so it never holds one
-file while waiting for another (no deadlock). A take is one atomic step, in the model as in the library: it
+file while waiting for another (no deadlock). A take is one atomic step in the model: it
 chooses its entry, locks its files and writes them, with no call in between, so a call that would wait for it
 simply comes after it (the owner, 2026-11-08, finding 49: "Without any other information, B sounds reasonable.
-Obviously atomic operations are more reliable"; R9). Each wait ends on an event: the last close wakes a take,
+Obviously atomic operations are more reliable"; R9). The library has the same effect without holding the actor
+while it decides: a take is decided on a built snapshot (§12) with the actor unlocked, then landed under its lock
+only if no step after the decision touched a key it read (its plan's keys, and the held keys that cut its sync or
+blocked an earlier entry), no write-open holds a key it writes, and neither a fast-forward's head nor a sync's
+upstream head moved. Otherwise it is refused and decided again at the next built event. A landed decision read
+nothing that changed, so it is the take an atomic step at its land would make. Each wait ends on an event: the last close wakes a take,
 and a client's end event (exit or death, a client of any tree alike) closes its files, saving their write
 calls as the kernel's close would (a choice) (`r9_client_death_releases_its_locks`,
 `r9_a_now_dead_root_client_releases_its_locks`). A transaction's opens write in its index and never wait.
@@ -788,7 +794,7 @@ The order of a step, on the call path:
 Then the builder, for a batch of durable records: it replays each step on the built trees with the same transitions,
 aligns the lines, feeds the commits to `git fast-import`, fsyncs the pack, then fsyncs the batch's entry in the built
 log (the built point). Only then are a fork's `config`, the refs and the private checkouts copied. Nothing reads Git
-past the built point; takes are decided on history built through every record before them.
+past the built point; takes are decided on built snapshots and landed only if what they read is unchanged (§6).
 
 A failure in 1 to 3 changes nothing: the call returns its errno and the actor keeps serving (§3). A close stays pending,
 its handle still counting as open, and saves first at the next step in its tree and at restart. A take stays queued for
