@@ -56,7 +56,8 @@ dmsetup message "$lw" 0 mark mkfs
 mount "/dev/mapper/$lw" "$work/mnt" || notrun "cannot mount $fs test filesystem"
 export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null
 "$AGENTFS_BIN" --state "$work/mnt/state" trees init --volume t
-"$AGENTFS_BIN" --state "$work/mnt/state" trees mount "$work/main" --sandbox "$work/sandbox" >"$work/mount.log" 2>&1 & pid=$!
+"$AGENTFS_BIN" --state "$work/mnt/state" trees mount "$work/main" --sandbox "$work/sandbox" \
+  --metrics-output "$work/metrics.json" >"$work/mount.log" 2>&1 & pid=$!
 for _ in $(seq 1 200); do
   if mountpoint -q "$work/main" && mountpoint -q "$work/sandbox"; then break; fi
   kill -0 "$pid"; sleep .1
@@ -65,9 +66,9 @@ mountpoint -q "$work/main"; mountpoint -q "$work/sandbox"
 # A dm-log-writes mark follows each returned fsync/close before any receipt
 # is written to this device. Off-device receipts associate marks with calls.
 # Only after both marks do we fsync on-device receipts for the sweep oracle.
-python3 - "$work/main" "$work/sandbox" "$work/mnt/receipts" "$work/external-receipts" "$lw" "$work/marks" <<'PYWORK'
-import os, subprocess, sys
-root, sandbox, disk, external, device, marks = sys.argv[1:]
+python3 - "$work/main" "$work/sandbox" "$work/mnt/receipts" "$work/external-receipts" "$lw" "$work/marks" "$work/metrics.json" "$(dirname "$0")/trees-figures.py" <<'PYWORK'
+import importlib.util, json, os, subprocess, sys, time
+root, sandbox, disk, external, device, marks, metrics, figures = sys.argv[1:]
 def append(name, value):
     with open(name, 'a') as f:
         f.write(value + '\n'); f.flush(); os.fsync(f.fileno())
@@ -116,6 +117,42 @@ os.rename(f'{root}/y', f'{root}/r')
 viewfd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
 os.fsync(viewfd); os.close(viewfd)
 mark('RN', 1); append(disk, 'RN 1')
+# A file held open across a segment rollover, a compaction and a carry-forward
+# (docs/trees.md, "Recording and durability"): h's first 4 MiB sit in the first
+# segment; 70 MiB of another file roll the journal past it; once history is
+# built, the next call compacts, drops the old segments and carries h's frames
+# forward. h's close, marked once it returned, holds every byte.
+spec = importlib.util.spec_from_file_location('figures', figures)
+module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+renames = module.Renames(metrics)
+def metric():
+    try:
+        with open(metrics) as f: return json.load(f)
+    except (OSError, ValueError): return None
+def until(test, what):
+    # The view rewrites the file at each built event: wait on its renames.
+    limit = time.monotonic() + 600
+    while not test(metric() or {}):
+        if not renames.wait(limit): sys.exit(f'{what}: not reached; metrics {metric()}')
+MIB = 1 << 20
+held = os.open(f'{root}/h', os.O_CREAT | os.O_WRONLY, 0o600)
+for i in range(4):
+    assert os.write(held, bytes([0x41 + i]) * MIB) == MIB
+big = os.open(f'{root}/big', os.O_CREAT | os.O_WRONLY, 0o600)
+for i in range(70):
+    assert os.write(big, i.to_bytes(4, 'little') * (MIB // 4)) == MIB
+os.close(big)
+floor = (metric() or {}).get('seq', 0) + 2
+until(lambda m: m.get('seq', 0) >= floor, 'a metrics file after the big save')
+target = metric()['history']['appended']
+until(lambda m: m['history']['built_through'] >= target, 'history built through the big save')
+poke = os.open(f'{root}/poke', os.O_CREAT | os.O_WRONLY, 0o600); os.close(poke)
+until(lambda m: m.get('journal_carried_bytes', 0) > 0 and m.get('journal_dropped', 0) > 0,
+      "a compaction carrying h's frames")
+assert os.write(held, b'held\n') == 5
+os.fsync(held); os.close(held)
+mark('HC', 1); append(disk, 'HC 1')
+renames.close()
 PYWORK
 fusermount3 -u "$work/main"; fusermount3 -u "$work/sandbox"
 wait "$pid"; pid=
@@ -134,7 +171,7 @@ import sys
 actual = open(sys.argv[1]).read().splitlines()
 expected = [f'ack-{kind.lower()}-{n} {kind} {n}' for n in range(1, 9) for kind in ('F', 'C')]
 expected += [f'ack-{kind.lower()}-{n} {kind} {n}' for n in range(1, 3) for kind in ('SF', 'SC')]
-expected += [f'ack-xw-{n} XW {n}' for n in range(1, 3)] + ['ack-rn-1 RN 1']
+expected += [f'ack-xw-{n} XW {n}' for n in range(1, 3)] + ['ack-rn-1 RN 1', 'ack-hc-1 HC 1']
 assert actual == expected, (actual, expected)
 PYMARKS
 # Locate each mark and scan the pinned replay tool's flagged entries once.
@@ -143,7 +180,7 @@ while read -r mark kind n; do
   [[ "$entry" =~ ^[0-9]+@[0-9]+$ ]] || { printf 'FAIL\t%s\t%s\tinvalid replay entry\n' "$fs" "$mark" >> "$results"; exit 1; }
   printf '%s\t%s\t%s\t%s\n' "$mark" "$kind" "$n" "$entry" >> "$work/mark-entries.tsv"
 done < "$work/marks"
-"$REPLAY_LOG" --log "$log" --find -vv --end-mark ack-rn-1 > "$work/entry-flags.log"
+"$REPLAY_LOG" --log "$log" --find -vv --end-mark ack-hc-1 > "$work/entry-flags.log"
 python3 - "$work/mark-entries.tsv" "$work/entry-flags.log" "$work/durable-entries.tsv" <<'PYDURABLE' || { printf 'FAIL\t%s\tmarks\tdurable entry mapping failed\n' "$fs" >> "$results"; exit 1; }
 import bisect, re, sys
 marks, flags_file, result = sys.argv[1:]
