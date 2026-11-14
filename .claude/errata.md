@@ -805,3 +805,20 @@ Not blocking; the suite is built and green. Findings about the brief and the doc
    checkout first, which is B2b's bead, not B3's.
 3. **What resumes it:** land B2b (and B4, by the page's order), then dispatch B3 unchanged. No re-cut of B3's page is
    needed. Nothing of B3 was written.
+
+## 2026-11-14, speed B2b (the trailing builder): the lag formula, the page's missing parts, the gate's cost
+
+1. **The lag formula cannot be measured as written.** §4 gives lag = steps x ns_per_step + bytes x ns_per_byte,
+   "both measured on the last batch". One batch's time cannot be split between two rates. The WIP fixed
+   ns_per_byte at 10 ns and measured ns_per_step as the remainder; while a commit writes the tree's whole listings
+   (until B4), a step's cost grows with the tree, the early small-tree batches set a low step rate, and the view
+   admitted about 8,000 creates in 10 s that took the builder over 300 s (the tracer's create figure held past its
+   deadline plus grace, connection aborted, image run 43560396695; reproduced locally). Built instead: each rate
+   measured as if it bore the whole batch, lag = the larger of the two estimates (`history/lag.rs`). The estimate
+   errs high, which only holds a call until the next built event. A re-cut should state the formula.
+2. **"A waiting call holds no other request" (finding 2, docs) is not what the kernel does.** The VFS holds a
+   directory's lock while a create, link, rename or unlink in it is outstanding, so a lookup or listing of that
+   directory waits behind a gated create. docs/trees.md now says so.
+3. **The WIP does not build all of §4.** Takes still settle and decide on the actor under its lock (no `takes.rs`,
+   no `Decision`/`land`/`Refused`), and most of the acceptance table's tests and mutation probes 2, 4, 6 and 7 do not
+   exist. The brief's "fallback split" for B2b is not in speed-pages.md or speed-design.md.

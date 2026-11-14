@@ -62,8 +62,11 @@ impl LagGate {
         self.log();
     }
 
-    /// A batch through `through` is built in `elapsed`: its steps' measured
-    /// rate replaces the last.
+    /// A batch through `through` is built in `elapsed`. Each rate is measured
+    /// as if it bore the whole batch: its time over its steps, and over the
+    /// bytes they added. One batch cannot split its time between the two, and
+    /// [`LagGate::lag`] takes the larger estimate, so a cost that grows with
+    /// the tree (its listings) is never read as a fixed cost per step.
     pub(in crate::tree_actor) fn built(&mut self, through: RecordNo, elapsed: Duration) {
         let (mut steps, mut bytes) = (0_u64, 0_u64);
         for queue in self.unbuilt.values_mut() {
@@ -76,9 +79,11 @@ impl LagGate {
         }
         self.unbuilt.retain(|_, queue| !queue.is_empty());
         let elapsed = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
-        let per_bytes = bytes.saturating_mul(self.ns_per_byte);
-        if let Some(per_step) = elapsed.saturating_sub(per_bytes).checked_div(steps) {
+        if let Some(per_step) = elapsed.checked_div(steps) {
             self.ns_per_step = per_step.max(1);
+        }
+        if let Some(per_byte) = elapsed.checked_div(bytes) {
+            self.ns_per_byte = per_byte.max(1);
         }
         self.failed = false;
         self.log();
@@ -90,7 +95,8 @@ impl LagGate {
         self.logged = Health::Current;
     }
 
-    /// `tree`'s lag: its unbuilt steps' estimated build time.
+    /// `tree`'s lag: its unbuilt steps' estimated build time, the larger of
+    /// their count at the step rate and their bytes at the byte rate.
     pub(in crate::tree_actor) fn lag(&self, tree: TreeId) -> Duration {
         let Some(queue) = self.unbuilt.get(&tree) else {
             return Duration::ZERO;
@@ -98,7 +104,7 @@ impl LagGate {
         let bytes: u64 = queue.iter().map(|(_, bytes)| *bytes).sum();
         let nanos = (queue.len() as u64)
             .saturating_mul(self.ns_per_step)
-            .saturating_add(bytes.saturating_mul(self.ns_per_byte));
+            .max(bytes.saturating_mul(self.ns_per_byte));
         Duration::from_nanos(nanos)
     }
 
@@ -205,8 +211,25 @@ mod tests {
         gate.appended(A, step(1), 1_000_000);
         assert_eq!(
             gate.lag(A),
-            Duration::from_nanos(INITIAL_NS_PER_STEP + 1_000_000 * INITIAL_NS_PER_BYTE)
+            Duration::from_nanos(INITIAL_NS_PER_STEP.max(1_000_000 * INITIAL_NS_PER_BYTE))
         );
         assert_eq!(gate.trees()[0].steps, 1);
+    }
+
+    /// The builder's cost per step grows with the tree's listings until the
+    /// commit layout costs only its change. A batch of small-tree steps sets
+    /// the byte rate; a step in a tree ten times as large is estimated at ten
+    /// times the cost, not at the small tree's cost per step.
+    #[test]
+    fn a_cost_that_grows_with_the_tree_is_estimated_by_its_bytes() {
+        let mut gate = LagGate::with_limits(Duration::from_secs(30), Duration::from_secs(120));
+        for n in 1..=100 {
+            gate.appended(A, step(n), 1_000);
+        }
+        gate.built(step(100), Duration::from_millis(100));
+        for n in 101..=200 {
+            gate.appended(A, step(n), 10_000);
+        }
+        assert_eq!(gate.lag(A), Duration::from_millis(1_000));
     }
 }

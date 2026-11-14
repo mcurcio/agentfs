@@ -323,12 +323,16 @@ warning and never fails the job.
 | `create` | Creates one-line files in the root, up to 50,000 | 300 s | 50,000 created: the engine's 100,000 in 600 s, over half the time |
 | `close_64m` | Writes a 64 MiB file in 1 MiB blocks and closes it | 120 s | The engine's close of a dirty 1 GiB file (12 s on ext4, 8 s on XFS), unscaled |
 
-- **Each save is timed to its commit.** Every timed save ends with a
+- **Each save is timed to its record.** Every timed save ends with a
   `stat` of the file. The view saves a file on the kernel's release, which
   reaches agentfs just after `close(2)` returns, and it answers requests
   one at a time and in order. So the `stat` returns only once the save is
-  committed: the guarantee each figure carries is "committed before the
-  view answers any later request".
+  recorded: the guarantee each figure carries is "saved before the view
+  answers any later request; history built later". The builder makes the
+  commits behind it, and each workload reports `drain_s`, the time from its
+  last save to the built point reaching it (from `--metrics-output`). While
+  the lag gate holds the root's creates (docs/trees.md), `create` runs at
+  the builder's pace.
 - **Each workload has its own deadline.** A workload reports what it
   reached by its deadline: the saves made, or the bytes written. A save the
   deadline catches gets 30 s more. A view still stuck after that has its

@@ -232,12 +232,17 @@ the private checkouts copied, and waiters woken.
 - `--metrics-output` reports `history`: the built point, the last record appended,
   the oldest unbuilt step's age, the worst tree's lag and the builder's health.
 - **The lag gate.** Each tree's lag is the builder's estimated time for its unbuilt
-  steps: a fixed cost per step and a cost per byte it writes (the changed file and
-  the tree's listings), both measured on its last batch. Over 120 s, a call that
-  starts new work in that tree (a create, a write-open, `O_TMPFILE`, a link, a
-  rename, an unlink, a path truncate) waits for the built event that brings the lag
-  under; other trees, writes, flushes and closes do not wait, and a waiting call
-  holds no other request. A failed builder holds nothing back. Over 30 s,
+  steps: the larger of their count at a cost per step and the bytes they write
+  (the changed file and the tree's listings) at a cost per byte, each measured on
+  the last batch as if it bore the whole batch. While a commit writes the tree's
+  whole listings, a step costs more as the tree grows, and the byte estimate
+  follows that growth. Over 120 s, a call that starts new work in that tree (a
+  create, a write-open, `O_TMPFILE`, a link, a rename, an unlink, a path truncate)
+  waits for the built event that brings the lag under; other trees, writes,
+  flushes and closes do not wait, and the view answers other requests meanwhile.
+  The kernel holds a directory's lock while a create, link, rename or unlink in it
+  waits, so a lookup or listing of that directory waits with it. A failed builder
+  holds nothing back. Over 30 s,
   `tree HistoryLagging` is logged once; over the limit, `tree HistoryStalled`.
   The levels are constants, not settings.
 
