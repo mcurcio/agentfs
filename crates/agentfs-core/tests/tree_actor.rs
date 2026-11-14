@@ -1982,10 +1982,15 @@ fn a_failed_write_changes_nothing_and_keeps_serving() {
 fn a_failed_fsync_stops_the_actor() {
     let tmp = tempfile::tempdir().unwrap();
     let mut v = new_actor(tmp.path());
+    // The builder makes its batch durable first; held (its batches fail
+    // before that), it leaves the records for this fsync.
+    let guard = agentfs_core::failpoints::configure(
+        "tree.build_before_batch=error@*;tree.wal_before_fsync=error",
+    )
+    .unwrap();
     let h = v.write_open(ROOT, "a", &writer("writer"), true).unwrap();
     v.write(h, 0, b"one", false).unwrap();
     v.write(h, 3, b"unknown", false).unwrap();
-    let guard = agentfs_core::failpoints::configure("tree.wal_before_fsync=error").unwrap();
     assert!(v.durability().make_all_durable().is_err());
     drop(guard);
     assert!(v.is_stopped());
