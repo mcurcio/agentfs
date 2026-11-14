@@ -109,7 +109,12 @@ impl Feed {
         let pack_dir = repo.path().join("objects").join("pack");
         fs::create_dir_all(&pack_dir).map_err(BuildError::from)?;
         let before = entries(&pack_dir)?;
+        // A batch cut short (a kill, a power cut) leaves its marks and git's
+        // lock of them: neither names anything.
         let _ = fs::remove_file(marks);
+        let mut lock = marks.as_os_str().to_owned();
+        lock.push(".lock");
+        let _ = fs::remove_file(PathBuf::from(lock));
         let mut child = repo.fast_import(marks).map_err(packer)?;
         let stdin = child.stdin.take().map(BufWriter::new);
         Ok(Self {

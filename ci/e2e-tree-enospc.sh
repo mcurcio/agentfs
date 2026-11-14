@@ -70,16 +70,18 @@ else:
 try: os.close(fd)
 except OSError: pass
 PY
-# A full state area fails the call and stops nothing: the view still answers.
+# A full state area stops nothing: the view still answers. A create is one small
+# journal frame, which may still fit the journal's last page: then it is recorded
+# and only the builder behind it fails (no space for its pack); else it fails ENOSPC.
 python3 - "$work/main" <<'PY'
 import errno, os, sys
 try:
     os.close(os.open(sys.argv[1] + '/while-full', os.O_CREAT | os.O_WRONLY, 0o600))
 except OSError as e:
     assert e.errno == errno.ENOSPC, e
+    assert os.listdir(sys.argv[1]) == ['file'], os.listdir(sys.argv[1])
 else:
-    raise AssertionError('create succeeded while the state filesystem was full')
-assert os.listdir(sys.argv[1]) == ['file'], os.listdir(sys.argv[1])
+    assert sorted(os.listdir(sys.argv[1])) == ['file', 'while-full'], os.listdir(sys.argv[1])
 PY
 rm "$work/volume/filler"
 fusermount3 -u "$work/main"; fusermount3 -u "$work/sandbox"
@@ -87,7 +89,7 @@ status=0
 wait "$pid" || status=$?
 pid=
 if [ "$status" != 0 ]; then echo "mount exited $status after a full state area" >&2; cat "$work/mount.log" >&2; exit 1; fi
-grep -Fq 'tree SaveFailed' "$work/mount.log" || { cat "$work/mount.log" >&2; exit 1; }
+grep -Eq 'tree (SaveFailed|HistoryBuildFailed)' "$work/mount.log" || { cat "$work/mount.log" >&2; exit 1; }
 "$bin" --state "$work/volume/state" trees init --volume t
 gitdir=$work/volume/state/history.git
 [ "$(tree_git_file "$gitdir" root file)" = acknowledged ]

@@ -791,7 +791,7 @@ impl Builder {
         let mut seen = 0;
         while self.history.next_work(&mut seen).is_some() {
             if let Err(e) = self.batch() {
-                self.history.failed_event(e);
+                self.history.failed_event(e, seen);
             }
         }
     }

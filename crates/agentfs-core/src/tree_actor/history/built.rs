@@ -131,6 +131,9 @@ pub(in crate::tree_actor) struct State {
     /// Each direct save's commit, by its step: what a sync asks of a save.
     pub(in crate::tree_actor) owners: Arc<BTreeMap<EventNumber, Oid>>,
     pub(in crate::tree_actor) failed: Option<BuildError>,
+    /// The request count the failed batch started at: a wait asked after it
+    /// waits for the retry.
+    pub(in crate::tree_actor) failed_at: u64,
     /// The highest record the builder is asked to build through.
     pub(in crate::tree_actor) wanted: RecordNo,
     /// Bumped at each request: a failed builder retries at the next one.
@@ -216,6 +219,7 @@ impl History {
                     pointers: Arc::new(pointers),
                     owners: Arc::new(owners),
                     failed: None,
+                    failed_at: 0,
                     wanted: built,
                     requests: 0,
                     epoch: 0,
@@ -323,9 +327,11 @@ impl History {
         self.notify();
     }
 
-    /// A batch failed: waiters past the built point get it.
-    pub(in crate::tree_actor) fn failed_event(&self, error: BuildError) {
+    /// A batch that started at request count `at` failed: waiters that asked
+    /// at or before it get the error.
+    pub(in crate::tree_actor) fn failed_event(&self, error: BuildError, at: u64) {
         let mut state = self.state();
+        state.failed_at = at;
         if state.failed.as_ref() != Some(&error) {
             eprintln!("tree HistoryBuildFailed: {error}");
         }
@@ -385,13 +391,13 @@ impl History {
         }
         state.wanted = state.wanted.max(through);
         state.requests += 1;
-        let asked = state.epoch;
+        let asked = state.requests;
         self.notify();
         loop {
             if state.built >= through {
                 return Ok(state.built);
             }
-            if state.epoch > asked
+            if state.failed_at >= asked
                 && let Some(error) = &state.failed
             {
                 return Err(WaitError::Failed(error.clone()));
