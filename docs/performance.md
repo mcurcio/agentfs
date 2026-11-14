@@ -272,8 +272,10 @@ mode have differed by up to 2 times, so read a figure as one observation.
 
 ### Large files in the tree are slow
 
-Every save and take reads and rewrites the whole tree, so a large file
-taxes every later step of every file, not just its own.
+Every take reads and rewrites the whole tree, and every save writes its
+tree's whole line map, so a large file taxes every later step of every
+file, not just its own. The figures below were measured while every save
+also stored every file again.
 
 - A 100 MiB file takes 339.1 s to converge in both views. A 1 MiB file
   takes 1.27 s, so 100 times the bytes cost 267 times the time.
@@ -289,10 +291,9 @@ taxes every later step of every file, not just its own.
   stage grew faster than linearly with the file's lines: 28 s at 32 MiB,
   109 s at 64 MiB, 316 s at 100 MiB.
 
-Keep large files out of a tree-view volume. Three costs are not reduced
-yet: parsed snapshots are not memoised by commit, every save writes all
-files rather than only the changed ones, and the line referee's own cost
-is unmeasured separately.
+Keep large files out of a tree-view volume. Two costs are not reduced
+yet: parsed snapshots are not memoised by commit, and the line referee's
+own cost is unmeasured separately.
 
 ### Many saves slow each one
 
@@ -339,32 +340,38 @@ warning and never fails the job.
   at 1, 2 and 5 times each power of ten), not a total scaled to 100,000.
 - The report is the job's artifact `trees-figures-<fs>`.
 
-Figures from one run (`image` run 43528919742, commit c22a820, GitHub
-`ubuntu-24.04` runners). Every workload missed its bar on both
-filesystems:
+Figures from two runs on GitHub `ubuntu-24.04` runners, each one
+observation: before a save moved in process (`image` run 43528919742,
+commit c22a820), and after (`image` run 43534355542, commit 5771ad6). A
+save now runs one Git child, the line alignment's `git diff`, where it ran
+fifteen, and stores only the blobs of the files it changed.
 
-| Workload | ext4 | XFS |
-|---|---|---|
-| `close_4k`, 200 saves in a tree of about 23 files | p50 125.9 ms, p99 149.1 ms | p50 106.7 ms, p99 123.3 ms |
-| `create`, created by the 300 s deadline | 248 | 271 |
-| `close_64m` | 28.4 s | 28.7 s |
+| Workload | ext4 before | ext4 after | XFS before | XFS after |
+|---|---|---|---|---|
+| `close_4k`, 200 saves in a tree of 23 to 30 files | p50 125.9 ms, p99 149.1 ms | p50 12.7 ms, p99 37.0 ms | p50 106.7 ms, p99 123.3 ms | p50 15.1 ms, p99 21.6 ms |
+| `create`, created by the 300 s deadline | 248 | 4,620 | 271 | 4,526 |
+| `close_64m` | 28.4 s | 8.0 s | 28.7 s | 10.3 s |
 
-The cost of one create grows with the files in the tree (the median save
-in each window, ms):
+After, `close_64m` meets its bar on ext4 and misses it on XFS; `close_4k`
+and `create` miss theirs on both.
 
-| Files in the tree | ext4 | XFS |
-|---|---|---|
-| about 25 | 255 | 218 |
-| about 44 | 360 | 306 |
-| about 74 | 524 | 437 |
-| about 124 | 842 | 702 |
-| about 224 | 1,400 | 1,186 |
-| 272 (ext4), 294 (XFS) | 1,957 | 1,769 |
+The cost of one create against the files in the tree (the median save in
+each window, ms):
 
-Every save rewrites the whole tree ([Large files in the tree are
-slow](#large-files-in-the-tree-are-slow)), so a save costs 6 to 7 ms more
-for each file already in the tree, and creating many files costs about the
-square of their count.
+| Files in the tree | ext4 before | ext4 after | XFS before | XFS after |
+|---|---|---|---|---|
+| about 25 to 45 | 255 to 360 | 19 | 218 to 306 | 23 to 25 |
+| about 75 to 125 | 524 to 842 | 20 | 437 to 702 | 25 to 28 |
+| about 225 | 1,400 | 21 | 1,186 | 23 |
+| about 525 | | 26 | | 27 |
+| about 1,025 | | 31 | | 36 |
+| about 2,025 | | 45 | | 52 |
+| about 4,550 to 4,650 | | 85 | | 85 |
+
+A save still writes the whole files tree, the line map (`metadata.json`)
+and the name history (`namespace.json`) of its tree ([Large files in the
+tree are slow](#large-files-in-the-tree-are-slow)), so it costs about
+14 µs more for each file already in the tree, where it cost 6 to 7 ms.
 
 ## Performance budget
 
