@@ -1088,3 +1088,19 @@ Errata state, after this fix (each speed-epic entry the handoff listed as open):
    - Pack count: the builder adds a pack per batch and nothing repacks, so every lookup scans more packs. Files:
      `history/builder.rs`, `tree_git.rs`. Done: pack count logarithmic in batches (geometric repack), with the
      tracer's history checks green.
+
+## 2026-11-14, M1 S4-S6 re-cut (code architect): where the old pages broke on the engine
+
+Re-cut pages: `.claude/handoff/m1-s4-recut.md`, `m1-s5-recut.md`, `m1-s6-recut.md`; they override `m1-pages.md`'s S4-S6.
+1. **C4 without `rebind` stops phase 1.** The old S4 ends every restored client at boot and keeps a fork's writer claim
+   for life, so the mounted conformance replay's crash (kill, remount the same fork, write), `ci/e2e-trees.sh` and
+   `ci/e2e-tree-recording-faults.sh` would get `ForkTaken`. Re-cut: S4 builds clients.md's `rebind` (with M1's pod
+   context); the boot order is rebind or attach, then `reconcile(live)`. A clean unmount still spends the claim.
+2. **The old S5's after-take hook cannot reach the services.** It runs on the view's worker thread; the services hold
+   `Rc` (S3's `DomainEvents`). Re-cut: `ViewHost` notifies `HostEvent` through a `Send + Sync` callback into the
+   composition root's channel; SIGTERM joins that channel in S6.
+3. **Opening a view waited for history.** `serve_with_metrics` calls `head()`, which settles; a failed builder would
+   refuse the mount (principle 5). Re-cut: `ViewHost::open` checks the actor's saved trees.
+4. **`ClientStore::end`'s doc promises reserved room** that no page builds; `ClientError` and `TreeError` have no
+   variant for a stopped actor. Re-cut: the doc names `Stopped`, `NotDurable`; both errors gain `Stopped` with one
+   `From<StoreError>` each.

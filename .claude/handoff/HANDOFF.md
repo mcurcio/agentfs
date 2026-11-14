@@ -9,7 +9,7 @@ agentfs is moving to one engine, the tree views (`crates/agentfs-core/src/tree_a
 1. `OWNER-GUIDANCE.md` (dated, verbatim; all answers through 2026-11-13 are recorded there).
 2. `owner-notes.md` here (the same words, with the questions as asked).
 3. `speed-brief.md` (bar, evidence, owner direction), then `speed-pages.md` (frozen slice pages B2a, B2b, B4, B3), `speed-design.md` (v4 module design) and `speed-interfaces.md`.
-4. `m1-design.md` (rev. 2, with its "Gate outcome" section), `m1-pages.md` (S1–S6 pages; S3's page must be re-cut after B2b, because S3's row commits move into the builder), `m1-impl-brief.md` (rails).
+4. `m1-design.md` (rev. 2, with its "Gate outcome" section), `m1-pages.md` (S1–S6 pages; S3–S6 are overridden by `m1-s3-recut.md`, `m1-s4-recut.md`, `m1-s5-recut.md`, `m1-s6-recut.md`, re-cut on the speed epic), `m1-impl-brief.md` (rails).
 The code and the library/human docs win over all of these where they disagree; report the disagreement.
 
 ## State
