@@ -8,7 +8,7 @@ cleanup() {
     status=$?
     mountpoint -q "$work/main" && fusermount3 -uz "$work/main" || true
     mountpoint -q "$work/sandbox" && fusermount3 -uz "$work/sandbox" || true
-    [ -z "$pid" ] || kill "$pid" 2>/dev/null || true
+    [ -z "$pid" ] || { kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; }
     if [ "$status" != 0 ]; then cat "$work/mount.log" 2>/dev/null || true; fi
     rm -rf "$work"
 }

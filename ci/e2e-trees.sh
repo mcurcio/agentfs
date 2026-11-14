@@ -12,7 +12,7 @@ cleanup() {
         mountpoint -q "$mount" && fusermount3 -uz "$mount" || true
     done
     [ -z "$client" ] || kill "$client" 2>/dev/null || true
-    [ -z "$pid" ] || kill "$pid" 2>/dev/null || true
+    [ -z "$pid" ] || { kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; }
     if [ "$status" != 0 ]; then cat "$work"/*.log 2>/dev/null || true; fi
     rm -rf "$work"
 }

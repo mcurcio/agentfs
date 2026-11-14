@@ -9,7 +9,7 @@ cleanup() {
     for mount in "$work/main" "$work/sandbox"; do
         mountpoint -q "$mount" && fusermount3 -uz "$mount" || true
     done
-    [ -z "$pid" ] || kill "$pid" 2>/dev/null || true
+    [ -z "$pid" ] || { kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; }
     [ -z "$pid" ] || wait "$pid" 2>/dev/null || true
     if [ "$status" != 0 ]; then cat "$work/mount.log" >&2 || true; fi
     rm -rf "$work"
