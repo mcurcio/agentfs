@@ -825,11 +825,15 @@ Not blocking; the suite is built and green. Findings about the brief and the doc
 
 ## 2026-11-14, speed B2b rest (takes off the actor, §4's tests and probes)
 
-1. **§4's land rule misses that a sync reads its upstream's head.** A sync decided before an upstream save syncs to
-   the older commit; an atomic take at the land would sync to the newer one (and the second sync entry would then
-   stay), so the two histories differ. Built: `TakeInputs::upstream` and `Decision::upstream_at` (the upstream's last
-   head-moving step), and `land` refuses `HeadMoved` for a sync whose upstream's head moved, as for a fast-forward
-   whose own head moved. A re-cut should list both fields.
+1. **A sync reads its upstream's head, which §4's land rule does not check; checking it starves syncs.** A sync
+   decided before an upstream save lands at the older upstream commit, which is not what an atomic take at the land
+   would do. A first build refused it (`HeadMoved`); on CI (phase-1 "two-writer page cache", run 43572654936) a busy
+   root refused every sync, the fork's queue grew to 70 entries, and draining them (each take planned a sync per
+   entry, with git children) outran the test's 30 s. Built instead: a landed sync equals an atomic sync taken at its
+   decision (it reads nothing of its own tree that changed after it, the fork's head has not moved for a
+   fast-forward, and the upstream's later saves queue later entries), and a fork's entries are planned once per take
+   (each is the same sync marker; P1 takes the first or none). The page's claim "equals an atomic take at the land"
+   holds for its own tree only. `TakeInputs` carries the fork's `upstream`.
 2. **`head_at` cannot name the head the decision saw.** A snapshot knows oids, not the step that set them. Built:
    `TakeInputs::through` (the last record when the inputs were read); the decision waits for history built through
    it, `head_at` is the inputs' head step, and `land` compares the actor's current head step with it, which refuses

@@ -31,8 +31,8 @@ pub(in crate::tree_actor) struct TakeInputs {
     pub held: BTreeSet<Key>,
     /// The last step that moved the tree's head when the inputs were read.
     pub head_step: RecordNo,
-    /// A fork's upstream and the last step that moved its head: a sync reads it.
-    pub upstream: Option<(TreeId, RecordNo)>,
+    /// A fork's upstream, which its entries sync from.
+    pub upstream: Option<TreeId>,
     /// Every record appended when the inputs were read: the decision waits
     /// for history built through it, so it sees every step its inputs saw.
     pub through: RecordNo,
@@ -47,8 +47,6 @@ pub(in crate::tree_actor) struct Decision {
     pub decided_at: RecordNo,
     /// The tree's head step the decision saw ([`TakeInputs::head_step`]).
     pub head_at: RecordNo,
-    /// The upstream's head step a sync read.
-    pub upstream_at: Option<(TreeId, RecordNo)>,
     /// Touched keys, plus held keys that cut its sync or blocked an earlier entry.
     pub reads: BTreeSet<Key>,
     /// Its plan's keys (a losing change's files included, R9.1).
@@ -65,7 +63,7 @@ pub(in crate::tree_actor) enum Refused {
     FilesChanged,
     /// A write-open holds a key it writes.
     Held,
-    /// A fast-forward's head, or a sync's upstream head, moved after the decision.
+    /// A fast-forward's head moved after the decision.
     HeadMoved,
     /// Its queue entry is no longer queued.
     EntryGone,
@@ -93,13 +91,20 @@ pub(in crate::tree_actor) fn decide(
     let mut plans = Vec::new();
     let mut cuts = Vec::new();
     let planning = Timer::start(Which::QueuePlan);
-    for (_, oid) in &entries {
+    // A fork's entries are sync markers, each planned alike from the
+    // upstream's commits the fork lacks: P1 takes the first or none.
+    let planned = if inputs.upstream.is_some() {
+        &entries[..1]
+    } else {
+        &entries[..]
+    };
+    for (_, oid) in planned {
         match inputs.upstream {
             None => {
                 plans.push(plan::plan_landing(snapshot, *oid)?);
                 cuts.push(None);
             }
-            Some((upstream, _)) => {
+            Some(upstream) => {
                 let cut = plan::plan_sync(snapshot, tree, upstream, &mine, open)?;
                 plans.push(queue::Plan {
                     source: upstream,
@@ -121,7 +126,7 @@ pub(in crate::tree_actor) fn decide(
         .collect();
     let (entry, incoming) = entries[index].clone();
     let decided = match (cuts.swap_remove(index), inputs.upstream) {
-        (Some(cut), Some((upstream, _))) => {
+        (Some(cut), Some(upstream)) => {
             reads.extend(cut.held().iter().cloned());
             plan::decide_sync(snapshot, tree, upstream, cut)?
         }
@@ -147,7 +152,6 @@ pub(in crate::tree_actor) fn decide(
         entry: entry.clone(),
         decided_at: snapshot.at(),
         head_at: inputs.head_step,
-        upstream_at: inputs.upstream,
         reads,
         writes,
         take: TakeRecord {
@@ -244,7 +248,7 @@ impl TreeActor {
     }
 
     /// What a decision on `tree` reads from the actor: the keys its
-    /// write-opens hold, its head step and its upstream's, and the last record.
+    /// write-opens hold, its head step, its upstream, and the last record.
     ///
     /// # Errors
     ///
@@ -262,7 +266,7 @@ impl TreeActor {
             tree,
             held,
             head_step: self.head_step(tree),
-            upstream: self.upstream_of(tree).map(|u| (u, self.head_step(u))),
+            upstream: self.upstream_of(tree),
             through: self.durability().appended(),
         })
     }
@@ -297,7 +301,9 @@ impl TreeActor {
 
     /// Appends the take if no step after `decided_at` touched a key of
     /// `reads`, no write-open holds a key of `writes`, the entry is still
-    /// queued, and (a fast-forward) the head or (a sync) the upstream's head
+    /// queued, and (a fast-forward) the head has not moved. A sync whose
+    /// upstream moved since its decision lands as the take at its decision
+    /// would: the upstream's later saves queue later entries.
     /// has not moved; enqueues its moves under this record's number.
     ///
     /// # Errors
@@ -339,11 +345,6 @@ impl TreeActor {
         }
         let fast_forward = matches!(decision.take.head, TakeHead::FastForward { .. });
         if fast_forward && self.head_step(tree) != decision.head_at {
-            return Some(Refused::HeadMoved);
-        }
-        if let Some((upstream, at)) = decision.upstream_at
-            && self.head_step(upstream) != at
-        {
             return Some(Refused::HeadMoved);
         }
         None
@@ -589,7 +590,7 @@ mod tests {
     }
 
     #[test]
-    fn a_sync_after_its_upstream_moved_is_refused() {
+    fn a_sync_decided_before_an_upstream_save_lands_and_the_save_follows() {
         let tmp = tempfile::tempdir().unwrap();
         let mut v = new_actor(tmp.path());
         put(&mut v, ROOT, "a", b"one\n");
@@ -598,7 +599,9 @@ mod tests {
         assert!(v.queued(fork));
         let decision = decided(&v, fork);
         put(&mut v, ROOT, "b", b"new\n");
-        assert_eq!(v.land(decision).unwrap(), Err(Refused::HeadMoved));
+        assert!(v.land(decision).unwrap().is_ok());
+        assert_eq!(v.read(fork, "a").unwrap(), b"two\n");
+        assert!(v.read(fork, "b").is_err(), "synced as decided");
         while v.take_next(fork).unwrap() == Took::Taken {}
         assert_eq!(v.read(fork, "b").unwrap(), b"new\n");
     }

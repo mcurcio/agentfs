@@ -318,9 +318,10 @@ simply comes after it (the owner, 2026-11-08, finding 49: "Without any other inf
 Obviously atomic operations are more reliable"; R9). The library has the same effect without holding the actor
 while it decides: a take is decided on a built snapshot (§12) with the actor unlocked, then landed under its lock
 only if no step after the decision touched a key it read (its plan's keys, and the held keys that cut its sync or
-blocked an earlier entry), no write-open holds a key it writes, and neither a fast-forward's head nor a sync's
-upstream head moved. Otherwise it is refused and decided again at the next built event. A landed decision read
-nothing that changed, so it is the take an atomic step at its land would make. Each wait ends on an event: the last close wakes a take,
+blocked an earlier entry), no write-open holds a key it writes, and a fast-forward's head has not moved. Otherwise
+it is refused and decided again. A landed decision read nothing of its own tree that changed, so it is the take an
+atomic step would make at its land; a sync reads its upstream's head as of its decision, as an atomic sync taken
+then would, and the upstream's later saves queue later entries. Each wait ends on an event: the last close wakes a take,
 and a client's end event (exit or death, a client of any tree alike) closes its files, saving their write
 calls as the kernel's close would (a choice) (`r9_client_death_releases_its_locks`,
 `r9_a_now_dead_root_client_releases_its_locks`). A transaction's opens write in its index and never wait.
