@@ -181,7 +181,8 @@ rename_while_full tree.build_after_built_log NONE destination behind
 grep -Fq 'tree CopyStale' "$work/tree.build_after_built_log.log" || { cat "$work/tree.build_after_built_log.log" >&2; exit 1; }
 printf 'PASS\tenospc-after-commit-point\trename 0; destination\n' | tee -a "$work/results.tsv"
 # Only a failed fsync stops the actor: the file can no longer be trusted. A
-# write appends with no fsync, so the client's fsync is the one that fails.
+# write appends with no fsync; the first journal fsync fails, the client's own or
+# the builder's behind the create, and every call after it answers EIO.
 rm -rf "$work/volume/state"
 "$bin" --state "$work/volume/state" trees init --volume t
 AGENTFS_FAILPOINTS='tree.wal_before_fsync=error' "$bin" --state "$work/volume/state" trees mount "$work/main" >"$work/fsync-mount.log" 2>&1 & pid=$!
@@ -195,10 +196,18 @@ def expect_eio(what, call):
         assert e.errno == errno.EIO, (what, e)
     else:
         raise AssertionError(f'{what} succeeded after a failed fsync')
-fd = os.open(sys.argv[1], os.O_CREAT | os.O_WRONLY, 0o600)
-assert os.write(fd, b'x') == 1
-expect_eio('fsync', lambda: os.fsync(fd))
-expect_eio('close', lambda: os.close(fd))
+fd = None
+try:
+    fd = os.open(sys.argv[1], os.O_CREAT | os.O_WRONLY, 0o600)
+    assert os.write(fd, b'x') == 1
+    os.fsync(fd)
+except OSError as e:
+    assert e.errno == errno.EIO, e
+else:
+    raise AssertionError('no call failed after the journal fsync failed')
+if fd is not None:
+    try: os.close(fd)
+    except OSError as e: assert e.errno == errno.EIO, e
 expect_eio('create', lambda: os.close(os.open(sys.argv[2], os.O_CREAT | os.O_WRONLY, 0o600)))
 PY
 fusermount3 -u "$work/main"
