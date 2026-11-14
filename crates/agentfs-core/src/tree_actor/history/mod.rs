@@ -7,6 +7,7 @@ pub(super) mod built;
 pub(super) mod built_log;
 pub(super) mod feed;
 pub(super) mod format;
+pub(super) mod lag;
 pub(super) mod message;
 pub(super) mod refs;
 pub(super) mod take;

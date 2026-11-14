@@ -148,6 +148,8 @@ pub(in crate::tree_actor) struct State {
     pub(in crate::tree_actor) stopping: bool,
     /// The builder has exited.
     pub(in crate::tree_actor) stopped: bool,
+    /// Each tree's lag and the builder's rates.
+    pub(in crate::tree_actor) gate: super::lag::LagGate,
     /// The journal's last checkpoint's redo start: built-log entries at or
     /// before it name nothing a restart reads.
     pub(in crate::tree_actor) checkpointed: RecordNo,
@@ -228,6 +230,7 @@ impl History {
                     stopping: false,
                     stopped: false,
                     checkpointed: RecordNo::ZERO,
+                    gate: super::lag::LagGate::default(),
                 }),
                 changed: Condvar::new(),
             }),
@@ -265,9 +268,11 @@ impl History {
         state.checkpointed = state.checkpointed.max(built);
     }
 
-    /// The actor appended step `step`: the builder's event.
-    pub(in crate::tree_actor) fn appended_step(&self, step: RecordNo) {
+    /// The actor appended step `step` in `tree`, adding about `bytes` for the
+    /// builder to write: the builder's event, and the gate's count.
+    pub(in crate::tree_actor) fn appended_step(&self, step: RecordNo, tree: TreeId, bytes: u64) {
         let mut state = self.state();
+        state.gate.appended(tree, step, bytes);
         let now = Instant::now();
         state.oldest_unbuilt.get_or_insert(now);
         state.unbuilt.push_back((step, now));
@@ -308,8 +313,10 @@ impl History {
         through: RecordNo,
         pointers: Pointers,
         owners: BTreeMap<EventNumber, Oid>,
+        elapsed: Duration,
     ) {
         let mut state = self.state();
+        state.gate.built(through, elapsed);
         state.built = state.built.max(through);
         state.pointers = Arc::new(pointers);
         state.owners = Arc::new(owners);
@@ -332,6 +339,7 @@ impl History {
     pub(in crate::tree_actor) fn failed_event(&self, error: BuildError, at: u64) {
         let mut state = self.state();
         state.failed_at = at;
+        state.gate.failed();
         if state.failed.as_ref() != Some(&error) {
             eprintln!("tree HistoryBuildFailed: {error}");
         }
@@ -370,6 +378,30 @@ impl History {
             state = self.wait(state);
         }
         state.epoch
+    }
+
+    /// The lag gate: returns once `tree`'s lag is under the limit or the
+    /// builder has failed, on a built or failed event (never a timer).
+    ///
+    /// # Errors
+    ///
+    /// [`WaitError::Stopped`] at shutdown.
+    pub(in crate::tree_actor) fn admit(&self, tree: TreeId) -> Result<(), WaitError> {
+        let mut state = self.state();
+        loop {
+            if state.gate.admits(tree) {
+                return Ok(());
+            }
+            if state.stopped || state.stopping {
+                return Err(WaitError::Stopped);
+            }
+            state = self.wait(state);
+        }
+    }
+
+    /// Whether `tree`'s new work may start now, without waiting.
+    pub(in crate::tree_actor) fn admits(&self, tree: TreeId) -> bool {
+        self.state().gate.admits(tree)
     }
 
     /// The last step whose commits are in the store and in a durable
@@ -424,11 +456,11 @@ impl History {
     pub fn lag(&self) -> Lag {
         let state = self.state();
         Lag {
-            trees: Vec::new(),
+            trees: state.gate.trees(),
             oldest_unbuilt: state.oldest_unbuilt.map(|at| at.elapsed()),
             health: match &state.failed {
                 Some(error) => Health::Failed(error.clone()),
-                None => Health::Current,
+                None => state.gate.health(),
             },
         }
     }

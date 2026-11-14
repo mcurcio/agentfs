@@ -149,22 +149,41 @@ impl Recording {
     /// `truncate(2)`): returns at once while the tree's lag is under the
     /// limit or the builder has failed, else on the built event that brings
     /// it under. Never called with the actor locked; never before a write
-    /// call or a RELEASE. No limit holds yet: it admits at once.
+    /// call or a RELEASE.
     ///
     /// # Errors
     ///
     /// [`Error::Stopped`] at shutdown.
     pub fn admit(&self, tree: TreeId) -> Result<(), Error> {
-        let _ = tree;
-        Ok(())
+        Ok(self.history.admit(tree)?)
     }
 
     /// [`Recording::admit`] without blocking the caller: `then` runs at once on
-    /// this thread when admitted, else on the gate's thread at the built or
-    /// failed event that admits it. The call it wraps is concurrent with every
-    /// later request, as an unreturned syscall is.
+    /// this thread when admitted, else on a gate thread at the built or failed
+    /// event that admits it. The call it wraps is concurrent with every later
+    /// request, as an unreturned syscall is.
     pub fn admit_then(&self, tree: TreeId, then: Then) {
-        then(self.admit(tree));
+        if self.history.admits(tree) {
+            then(Ok(()));
+            return;
+        }
+        let history = self.history.clone();
+        let slot = Arc::new(Mutex::new(Some(then)));
+        let waiting = Arc::clone(&slot);
+        let spawned = std::thread::Builder::new()
+            .name("tree-gate".into())
+            .spawn(move || {
+                let admitted = history.admit(tree).map_err(Error::from);
+                if let Some(then) = waiting.lock().ok().and_then(|mut t| t.take()) {
+                    then(admitted);
+                }
+            });
+        if let Err(e) = spawned {
+            // No gate thread: answer here rather than drop the reply.
+            if let Some(then) = slot.lock().ok().and_then(|mut t| t.take()) {
+                then(Err(Error::Io(e)));
+            }
+        }
     }
 
     /// History, the one owner of the Git store.

@@ -177,7 +177,9 @@ pub struct HistoryMetrics {
     pub appended: u64,
     /// The age of the oldest step not yet built, in nanoseconds.
     pub oldest_unbuilt_ns: u64,
-    /// `current` or `failed`.
+    /// The worst tree's lag (the lag gate's estimate), in milliseconds.
+    pub lag_ms_max: u64,
+    /// `current`, `lagging`, `stalled` or `failed`.
     pub health: String,
 }
 
@@ -654,6 +656,10 @@ impl TreeActor {
             oldest_unbuilt_ns: lag
                 .oldest_unbuilt
                 .map_or(0, |age| u64::try_from(age.as_nanos()).unwrap_or(u64::MAX)),
+            lag_ms_max: lag
+                .trees
+                .first()
+                .map_or(0, |worst| (worst.seconds * 1000.0) as u64),
             health: match lag.health {
                 Health::Failed(_) => "failed",
                 Health::Current => "current",
@@ -1053,6 +1059,7 @@ impl TreeActor {
         if self.is_stopped() {
             return Err(Error::Stopped);
         }
+        let (tree, bytes) = self.build_cost(&change);
         let recorded = (|| -> Result<u64> {
             crate::failpoints::hit("tree.before_step")?;
             self.pointers.check_targets(&pointers)?;
@@ -1073,8 +1080,31 @@ impl TreeActor {
             }
         };
         self.pointers.apply_targets(&pointers);
-        self.history.appended_step(RecordNo::new(seq));
+        self.history.appended_step(RecordNo::new(seq), tree, bytes);
         Ok(seq)
+    }
+
+    /// The tree a step's build works in, and about how many bytes it writes:
+    /// the file a save changed and the tree's listings (the lag gate's
+    /// estimate; the builder's measured rate corrects it).
+    fn build_cost(&self, change: &Change) -> (TreeId, u64) {
+        /// About what one file adds to a commit's listings and metadata.
+        const LISTED: u64 = 64;
+        let (tree, file) = match change {
+            Change::Create { tree, .. }
+            | Change::Link { tree, .. }
+            | Change::Rename { tree, .. }
+            | Change::Unlink { tree, .. }
+            | Change::Take { tree, .. } => (tree, 0),
+            Change::Save { tree, outcome, .. } => match outcome {
+                journal::SaveOutcome::Saved { len, .. } => (tree, *len),
+                _ => (tree, 0),
+            },
+            Change::Fork { upstream } => (upstream, 0),
+        };
+        let tree: TreeId = tree.parse().unwrap_or(TreeId::Root);
+        let listed = self.trees.get(&tree).map_or(0, |t| t.names.len() as u64);
+        (tree, file.saturating_add(listed.saturating_mul(LISTED)))
     }
 
     /// After a step is applied: a compaction when one is due.

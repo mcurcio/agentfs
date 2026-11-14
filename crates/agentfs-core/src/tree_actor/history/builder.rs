@@ -800,6 +800,7 @@ impl Builder {
     /// installed, or nothing reachable changed.
     fn batch(&mut self) -> std::result::Result<(), BuildError> {
         crate::failpoints::hit("tree.build_before_batch")?;
+        let started = std::time::Instant::now();
         let checkpointed = self.history.state().checkpointed;
         if self
             .log
@@ -884,7 +885,8 @@ impl Builder {
             self.stale = true;
             eprintln!("tree CopyStale: {e}");
         }
-        self.history.built_event(through, built, owners);
+        self.history
+            .built_event(through, built, owners, started.elapsed());
         Ok(())
     }
 

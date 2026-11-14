@@ -229,9 +229,16 @@ the private checkouts copied, and waiters woken.
 - Dropping the volume builds every record appended, so a clean shutdown leaves
   history built through its last record. Recovery builds what a kill left unbuilt.
 - `--metrics-output` reports `history`: the built point, the last record appended,
-  the oldest unbuilt step's age and the builder's health.
-- No limit holds new work back while history trails (the lag gate admits at once),
-  and nothing alarms on a long lag but the oldest-unbuilt age.
+  the oldest unbuilt step's age, the worst tree's lag and the builder's health.
+- **The lag gate.** Each tree's lag is the builder's estimated time for its unbuilt
+  steps: a fixed cost per step and a cost per byte it writes (the changed file and
+  the tree's listings), both measured on its last batch. Over 120 s, a call that
+  starts new work in that tree (a create, a write-open, `O_TMPFILE`, a link, a
+  rename, an unlink, a path truncate) waits for the built event that brings the lag
+  under; other trees, writes, flushes and closes do not wait, and a waiting call
+  holds no other request. A failed builder holds nothing back. Over 30 s,
+  `tree HistoryLagging` is logged once; over the limit, `tree HistoryStalled`.
+  The levels are constants, not settings.
 
 ## The view
 
@@ -286,9 +293,10 @@ What the tree views do not support:
 - **Close-to-open** rests on kernel 7.0 and the sources of v6.8, v6.14 and v7.0: 64
   closes over a busy view, from the same process and another. A readahead in flight
   on the handle was not exercised.
-- **The object-directory syncs** cannot be judged by prefix replay on ext4 and XFS
-  (the journal's fsync carries the earlier rename). `ci/trees-object-dir-syncs.sh`
-  proves only the order of system calls, not a crash.
+- **The pack syncs** cannot be judged by prefix replay on ext4 and XFS (a later
+  fsync carries the pack's directory entry). `ci/trees-object-dir-syncs.sh` proves
+  only the order of system calls (pack files and `objects/pack`, then the built-log
+  entry), not a crash.
 - **Replays are not a proof.** The model's scenarios and seeded random interleavings
   are replayed on the model, the library and real mounts. They show no `mmap` call
   and no client call waiting on a take, and do not cover every interleaving.

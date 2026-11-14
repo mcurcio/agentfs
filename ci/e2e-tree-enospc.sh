@@ -127,7 +127,8 @@ try:
     os.rename(source, destination)
 except OSError as e:
     got = e.errno
-assert got == getattr(errno, want, 0), f'rename answered {got}, wanted {want}'
+assert got == getattr(errno, want, 0) or (want == 'ANY' and got in (0, errno.ENOSPC)), \
+    f'rename answered {got}, wanted {want}'
 PY
   for _ in $(seq 1 200); do
     if grep -Fq "agentfs failpoint $point triggered (sleep(30000))" "$log"; then break; fi
@@ -155,16 +156,21 @@ PY
   wait "$pid"; pid=
   "$bin" --state "$work/volume/state" trees init --volume t
   gitdir=$work/volume/state/history.git
-  [ "$(tree_git_file "$gitdir" root "$3")" = git-acknowledged ]
+  if [ "$3" = either ]; then
+    [ "$(tree_git_file "$gitdir" root source 2>/dev/null || tree_git_file "$gitdir" root destination)" = git-acknowledged ]
+  else
+    [ "$(tree_git_file "$gitdir" root "$3")" = git-acknowledged ]
+  fi
   git --git-dir="$gitdir" fsck --full --strict --no-progress
   tree_git_no_duplicate_opens "$gitdir"
   head=$(git --git-dir="$gitdir" rev-parse root)
   "$bin" --state "$work/volume/state" trees init --volume t
   [ "$(git --git-dir="$gitdir" rev-parse root)" = "$head" ]
 }
-# The step's record cannot be written: nothing is recorded, ENOSPC, the name stays.
-rename_while_full tree.before_step ENOSPC source
-printf 'PASS\tenospc-before-commit-point\trename ENOSPC; source\n' | tee -a "$work/results.tsv"
+# A full state area at the step: its record is one small frame, which may still fit
+# the journal's last page (recorded, the destination) or not (ENOSPC, the source).
+rename_while_full tree.before_step ANY either
+printf 'PASS\tenospc-before-commit-point\trename 0 or ENOSPC; one name holds it\n' | tee -a "$work/results.tsv"
 # The record stands and only the builder's copies fail: the call succeeded.
 rename_while_full tree.build_after_built_log NONE destination behind
 grep -Fq 'tree CopyStale' "$work/tree.build_after_built_log.log" || { cat "$work/tree.build_after_built_log.log" >&2; exit 1; }
