@@ -50,7 +50,7 @@ mkdir -p "$LOGS"
 
 gateway() {
   docker network inspect kind -f '{{range .IPAM.Config}}{{.Gateway}} {{end}}' |
-    tr ' ' '\n' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -n1
+    tr ' ' '\n' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | sed -n 1p
 }
 render() { kubectl kustomize --load-restrictor LoadRestrictionsNone "$1"; }
 apply_dir() { render "$1" | kubectl apply -f -; }
@@ -92,7 +92,7 @@ kd() { kubectl -n "$DNS" "$@"; }
 plugin_pod() {
   kd get pod -l "$PLUGIN_LABEL" -o go-template \
     --template '{{range .items}}{{if not .metadata.deletionTimestamp}}{{.metadata.name}}{{"\n"}}{{end}}{{end}}' |
-    head -n1
+    sed -n 1p
 }
 in_plugin() { kd exec "$(plugin_pod)" -c agentfs-csi -- "$@"; }
 
@@ -195,7 +195,7 @@ EOF
 current_pod() { # label
   k get pod -l "$1" -o go-template \
     --template '{{range .items}}{{if not .metadata.deletionTimestamp}}{{.metadata.name}}{{"\n"}}{{end}}{{end}}' |
-    head -n1
+    sed -n 1p
 }
 # Waits for a pod of <label> (default: the one under test) to be Ready;
 # sets POD.

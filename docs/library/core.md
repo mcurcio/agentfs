@@ -36,7 +36,9 @@ recorded; [guarantees](../guarantees.md) says what the engine promises.
 | Release decision for a worktree | `release` | `decide`, `Release` |
 | Several mounts, one writer | `history_service` | `HistoryServer`, `HistoryClient`, `FrontLease` |
 | Large files | `lfs` | `ObjectCache`, `Store`, `fetch`, `prune` |
-| Git-backed tree views | `tree_actor` | `Volume` |
+| Git-backed tree views | `tree_actor`, `state_area` | `TreeActor`, `TreeId` (a tree's identity, `root` or `fork/<n>`), `inspect`, `TreeStateArea` (the Volume domain's `StateArea` port) |
+| The domains' rows over a tree volume | `store`, `tree_actor` | `TreeStore` (the `ForkStore`, `ClientStore` and `QueueFacts` ports), `Chain`, `RowDomain`, `RowWrite`, `RowEvent` |
+| Line identity across saves | `tree_reconcile` | `LineMap` (runs of lines, never bytes), `LineMap::align` (git's histogram diff over two `Image`s, read a line at a time), `LineMap::append`, `LineMap::expand` (line by line, for the landing rules), `pieces` (where a merged file's lines are in its sources): the line-map library, generic over the caller's numbered version (`Id`) |
 
 ## The state area
 
@@ -643,18 +645,102 @@ in the tree. See [recording](../recording.md) and [remotes](../remotes.md).
 
 ## Git-backed tree views
 
-`tree_actor::Volume` is a separate, smaller library: a git-backed volume
+`tree_actor::TreeActor` is a separate, smaller library: a git-backed volume
 whose saves are ordered by one actor. It is not the recorder above and does
-not share its state format. It holds an exclusive lease on its state area
-(`Volume::open(root)` fails with `Error::Busy` if another process holds it).
-Its recorded calls are `write_open`, `write`, `truncate`, `sync`, `close`,
-`rename` and `unlink`. `fork()` makes a sandbox branch, `read` and `files`
-read saved bytes, and `take_next` and `progress` move queued changes between
-a tree and its upstream. A close that leaves the bytes as they were commits
-nothing. `Error::errno()` maps each error to the errno a file call answers
+not share its state format. `TreeActor::create(root, identity, service)` makes a
+volume with its identity (`agentfs_contracts::volume::VolumeIdentity`: a name
+and an id); `TreeActor::open(root, service)` recovers one and never creates
+(`Error::NotCreated`, `Error::Format` for another format). `service` is the pod
+context of the process that serves it, which its own commits carry. It holds
+an exclusive lease on its state area (`Error::Busy` if another process holds
+it); `tree_actor::inspect(root)` reads what a state area holds without it, and
+`state_area::TreeStateArea` offers both to the Volume domain as its
+`StateArea` port. Its recorded calls are `write_open`, `write`, `truncate`,
+`sync`, `close`, `rename` and `unlink`; each write-open and namespace call
+names its writer as an `agentfs_contracts::pod::WriterAt`, the writer and its
+pod context, which the commit carries ([trees](../trees.md#volume-identity-and-trailers)). Every call names its tree by a `TreeId`: `root`, the
+tree with no upstream, or `fork/<n>`, made at journal event `n`. `trees()`
+lists them, the root first and then the forks by number; `TreeId` parses from
+and prints as that text. A fork is made with its row, through the store
+adapter below; `read` reads a saved file whole into memory and `files` lists them;
+`file_map` gives a saved file as a `FileMap` (its pieces in the journal and the
+checkout as built, never bytes in memory), which a reader reads with
+`FileMap::read` or `reader` with the actor unlocked and keeps across later
+saves, and `read_open` gives a write-open's; `take_next` and `progress`
+move queued changes between a tree and its upstream. `drain_changed` returns
+the objects queue takes changed, each with its `TreeId`. A close that leaves
+the bytes as they were commits nothing. `Error::errno()` maps each error to the errno a file call answers
 with. The behaviour, the state format and the current limits (flat files
 only) are in [trees](../trees.md); the FUSE adapter is in the [filesystem
 layer](filesystem.md#tree-views).
+
+### Sessions
+
+`session::Sessions::new(recording)` holds the history service's sessions of a
+served volume and is Clients' `SessionBinder`: `open()` gives a new
+`SessionId`, unique per run; Clients binds a client's authority to it (a
+`ClientCap` for a read-write client, its tree for a read-only one). A view
+reaches its tree only through `sessions.session(id)`, a `TreeSession`, whose
+`lock()` takes the actor's lock and reads the binding under it. The
+`SessionGuard` it gives has `TreeActor`'s file calls with the tree and writer
+left out: a write answers `Error::ReadOnly` (`EROFS`) without a writer, and a
+handle call answers `NotFound` unless the open is this tree's and this
+writer's. `admit_then`, `durable_then` and `durable_all_then` run unlocked.
+`unbind` removes the binding and, under the same lock,
+`TreeActor::close_writer` closes every open of the client's writer as a save,
+in handle order; then it makes them durable. A failure is logged and an
+unsaved close stays pending. Lock order: the actor, then the bindings.
+
+### Rows and domain events
+
+The domains (`agentfs-volume`, `agentfs-clients`, `agentfs-trees`) keep their
+records as rows on the volume's one tree actor, through the ports in
+`agentfs_contracts::ports`. `store::TreeStore::new(recording)` implements
+them over a served volume (`Arc<Recording>`): Trees' `ForkStore` (`load`,
+`create`, `end`, `drop_fork`), Clients' `ClientStore` and `QueueFacts`. Each write is one journal step, the same commit
+point as a save: a fork's branch and its row are one record, or a row step
+holds rows alone. The store makes it durable (one group-commit fsync, outside
+the actor's lock) before it returns. Each row is the domain's value with its
+audit stamps (`agentfs_contracts::audit::Audited`): the store sets `created`
+at a row's first write and keeps it, and sets `changed` at every write.
+
+The actor knows no domain. A row names its chain (`tree_actor::Chain`:
+`Volume`, `Trees(fork)` or `Clients(tree)`) and its event (`RowEvent`: a kind
+such as `ForkCreated`, a detail, the principal as `Agentfs-By` text, and its
+pod context). `TreeActor::row(chain)` and `rows(domain)` read the rows from
+the actor's saved state, never Git, so they answer while history lags or the
+builder fails. `TreeActor::fork_with`, `record_rows` and `drop_fork` run the
+steps; only the store calls them (a clippy rule). `drop_fork(fork, rows)` is one
+step that deletes the fork's branch and its queue's entries with its rows, and
+forgets the tree at once; it answers `Busy` (the store's `Refused`) while its
+upstream's queue holds an entry it queued, a file is open in it, or a fork names
+it, so a drop never needs history. `service_at()` is the pod context of an
+`agentfs` event no caller gives one for. The queue facts are the journal's too:
+`queued()`, `pending_from(fork)` (an entry `fork` queued in its upstream's
+queue) and `has_child(fork)` never wait for history. A stopped actor's
+`QueueFacts` answer empty and `false`; the next write fails `Stopped`.
+
+Clients' `ClientStore` (`load`, `attach`, `rebind`, `end`) keeps one row per
+tree on `Chain::Clients(tree)`: its attached clients (`ClientRow`: the id, the
+grant and the pod context) and a fork's writer claim, each entry stamped. An
+attach's step number is the client's ordinal. One `end` step removes every
+ended client with its `AttachmentEnded`, then writes `LastDetached` for each
+tree left empty. `release_claim` removes a dropped fork's writer claim with
+`ClaimReleased` (nothing to release writes nothing).
+
+`TreesService` (`agentfs-trees`) answers a second keyed `create` with its open
+fork, ends forks (`end`, `end_keyed`, and `on_last_detached` for an unkeyed
+fork), and `settle` drops each ended fork its queue facts let go;
+`ClientsService::on_fork_dropped` releases the claim. The composition root
+dispatches the events between them ([trees](../trees.md#forks-keys-end-and-the-drop)).
+
+`StoreError` from a tree actor failure: `Stopped` and an unknown fsync
+outcome are `Stopped` (the reopen decides whether the step survived); a failed
+append is `NotDurable` (nothing recorded); damaged state is `Damaged`; a step
+the actor refused (no such upstream) is `Refused`. A domain publishes its
+event to its `EventSink` once the store returns; the composition root's queue
+hands each on in order. Each event is on record as a commit on its chain
+([trees](../trees.md#rows-and-event-commits)).
 
 ## Errors
 

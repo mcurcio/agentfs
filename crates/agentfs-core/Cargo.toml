@@ -9,6 +9,9 @@ description = "Recording, journal and history engine for agentfs"
 
 [dependencies]
 agentfs-align = { version = "0.1.0", path = "../agentfs-align" }
+# The shared kernel: values (the tree identity among them), capabilities and the
+# ports agentfs-core's adapters implement.
+agentfs-contracts = { version = "0.1.0", path = "../agentfs-contracts" }
 # known_hosts key blobs and hashed host names, and OpenSSH private key
 # headers.
 base64 = "0.23.1"
@@ -38,6 +41,8 @@ sha2 = "0.11"
 # TLS unless the `https` feature adds native-tls (OpenSSL, as libgit2 uses).
 ureq = { version = "3.4", default-features = false }
 thiserror = "2.0.21"
+# A new volume's id (RFC 9562 version 4), made in state_area.rs only.
+uuid = { version = "1", default-features = false, features = ["std", "v4"] }
 # The SSH transport (`ssh` feature): russh with ring, the
 # runtime that drives one connection.
 russh = { version = "0.64", default-features = false, features = ["ring", "rsa"], optional = true }
@@ -60,6 +65,12 @@ protox = "0.10.0"
 tonic-prost-build = { version = "0.14.6", default-features = false }
 
 [dev-dependencies]
+# The Volume domain over the real state area (tests/state_area.rs).
+agentfs-volume = { version = "0.1.0", path = "../agentfs-volume" }
+# The Trees domain over the store adapter (tests/tree_store.rs).
+agentfs-trees = { version = "0.1.0", path = "../agentfs-trees" }
+# The Clients domain over the store adapter and sessions (tests/tree_clients.rs).
+agentfs-clients = { version = "0.1.0", path = "../agentfs-clients" }
 # In-memory exporters for the telemetry tests.
 opentelemetry_sdk = { version = "0.33.1", default-features = false, features = ["testing"] }
 tempfile = "3.27.0"

@@ -262,7 +262,7 @@ mode have differed by up to 2 times, so read a figure as one observation.
 | Measurement | Result |
 |---|---|
 | Journal call cost against plain FUSE | 1,000 `pwrite` calls of 8 bytes at offset 0 on one open descriptor. Plain FUSE (`bindfs -o direct_io`): median 27.0 µs, p99 53.1 µs. Recording mount: median 352.1 µs, p99 607.0 µs. Wall time around the syscall, including FUSE and the journal's `fsync` |
-| One hour of journal growth | 501,785 bytes over 3,600 s: 3,592 eight-byte `pwrite` calls (28,736 payload bytes), a pause of one second after each. Logical growth of `calls.wal` |
+| One hour of journal growth | 501,785 bytes over 3,600 s: 3,592 eight-byte `pwrite` calls (28,736 payload bytes), a pause of one second after each. Logical growth of the journal |
 | Line map, 10,000 one-line saves | `metadata.json` 195,687 bytes (19.6 a save). The snapshots are 961,003,746 bytes logical and 241,338,078 as git objects (10,000 distinct blobs). The commits are 3,615,564 bytes logical and 2,251,085 on disk. The repository is 245,688,644 bytes of files and 425,779,200 allocated, with 164 refs. The journal is 15,044,086 bytes after 10,001 saves (1,504 a save). The run took 2,560.9 s and started 390,047 git children (39 a save) |
 | Save and take, 1 MiB | Write and close 23.3 ms; actor save 272.9 ms; landing 337.3 ms, of which the sync back is 5.2 ms; both views and an empty queue after 1.27 s |
 | Save and take, 100 MiB | Write and close 31.9 s; actor save 25.6 s; landing 288.2 s, of which the sync back is 0.14 s; both views and an empty queue after 339.1 s |
@@ -270,17 +270,20 @@ mode have differed by up to 2 times, so read a figure as one observation.
 | Held log and compaction | A log held open while another file takes 24 saves of 8 MiB: the journal peaks at 66,149,414 bytes, drops to 745 bytes at each of 2 compactions, and ends at 49,611,545. The held file's one line is all a compaction keeps. The 24 saves took 115.5 s |
 | 1,000 saves | 95.7 s; git children a save stay flat at 39.0 between saves 100 and 1,000 |
 
-### Large files in the tree are slow
+### Large files in the tree
 
-Every save and take reads and rewrites the whole tree, so a large file
-taxes every later step of every file, not just its own.
+These figures were measured before file maps and line maps without bytes,
+while every save stored every file again and a line map held every byte;
+they are kept as the history of the problem. A save now costs its own file
+(see [Tree views, release build](#tree-views-release-build)); a take still
+expands its files' line maps line by line and reads the files it merges.
 
-- A 100 MiB file takes 339.1 s to converge in both views. A 1 MiB file
-  takes 1.27 s, so 100 times the bytes cost 267 times the time.
-- Other files pay for it. Five saves of unrelated small files took 238 to
+- A 100 MiB file took 339.1 s to converge in both views. A 1 MiB file
+  took 1.27 s, so 100 times the bytes cost 267 times the time.
+- Other files paid for it. Five saves of unrelated small files took 238 to
   241 s each to become visible while the large file was queued, and each
   new open of the held log took a median 138.8 s.
-- Where the time goes, over the whole run (seconds, number of runs):
+- Where the time went, over the whole run (seconds, number of runs):
   `snapshot_read` 1,797.4 (97), `queue_plan` 1,280.6 (48, which encloses
   some of the stages beside it), `objects` 288.6 (19, one rehash and sync
   of the blob on each later save), `judge` 263.0 (14) and `checkout` 24.7
@@ -288,11 +291,6 @@ taxes every later step of every file, not just its own.
 - In earlier runs in a debug build under Docker on macOS, the `judge`
   stage grew faster than linearly with the file's lines: 28 s at 32 MiB,
   109 s at 64 MiB, 316 s at 100 MiB.
-
-Keep large files out of a tree-view volume. Three costs are not reduced
-yet: parsed snapshots are not memoised by commit, every save writes all
-files rather than only the changed ones, and the line referee's own cost
-is unmeasured separately.
 
 ### Many saves slow each one
 
@@ -306,6 +304,219 @@ Git children per save stay flat at 39, because each queue entry's owners
 are read once at open and the sync plan asks git once per commit, not
 once per line. About a third of the run is inside `queue_plan` but in none
 of its measured parts.
+
+## Tree views, release build
+
+The `image` workflow runs four flat workloads through a tree view of the
+built image, on its release build, with the state area on a fresh loop
+filesystem: once on ext4 and once on XFS (`ci/e2e-trees-tracer.sh
+--figures`, driving `ci/trees-figures.py`). Each figure is held to the
+recording engine's budget in `ci/trees-budget.json`. A missed bar prints a
+warning and never fails the job.
+
+| Workload | What it does | Deadline | Bar |
+|---|---|---|---|
+| `close_4k` | Rewrites and closes a 4 KiB file 200 times | 60 s | p50 3.5 ms, finished |
+| `create` | Creates one-line files in the root, up to 50,000 | 300 s | 50,000 created: the engine's 100,000 in 600 s, over half the time |
+| `close_64m` | Writes a 64 MiB file in 1 MiB blocks and closes it | 120 s | The engine's close of a dirty 1 GiB file (12 s on ext4, 8 s on XFS), unscaled |
+| `close_1g` | Writes a 1 GiB file in 1 MiB blocks; times the close and `stat` alone | 300 s | The engine's close of a dirty 1 GiB file: 12 s on ext4, 8 s on XFS |
+| `write_1g` | The same run's last 64 writes, against 32 files of 1 MiB written in one write each | 300 s | Median within 1.5 times a 1 MiB file's write |
+
+`close_1g` also reports its total.
+
+- **Each save is timed to its record.** Every timed save ends with a
+  `stat` of the file. The view saves a file on the kernel's release, which
+  reaches agentfs just after `close(2)` returns, and it answers requests
+  one at a time and in order. So the `stat` returns only once the save is
+  recorded: the guarantee each figure carries is "saved before the view
+  answers any later request; history built later". The builder makes the
+  commits behind it, and each workload reports `drain_s`, the time from its
+  last save to the built point reaching it (from `--metrics-output`, read at
+  each rename of the file into place, its `seq` showing a snapshot taken
+  after the workload ended). While
+  the lag gate holds the root's creates (docs/trees.md), `create` runs at
+  the builder's pace.
+- **Each workload has its own deadline.** A workload reports what it
+  reached by its deadline: the saves made, or the bytes written. A save the
+  deadline catches gets 30 s more. A view still stuck after that has its
+  FUSE connection aborted, and the workloads after it are reported as not
+  run.
+- **Nothing is extrapolated.** A save's cost grows with the files in the
+  tree, so `create` reports the cost of a save against the tree's size
+  (`cost_by_tree_size`: the median and the largest save in windows ending
+  at 1, 2 and 5 times each power of ten), not a total scaled to 100,000.
+- The report is the job's artifact `trees-figures-<fs>`.
+
+Figures from two runs on GitHub `ubuntu-24.04` runners, each one
+observation: before a save moved in process (`image` run 43528919742,
+commit c22a820), and after (`image` run 43534355542, commit 5771ad6). A
+save now runs one Git child, the line alignment's `git diff`, where it ran
+fifteen, and stores only the blobs of the files it changed.
+
+| Workload | ext4 before | ext4 after | XFS before | XFS after |
+|---|---|---|---|---|
+| `close_4k`, 200 saves in a tree of 23 to 30 files | p50 125.9 ms, p99 149.1 ms | p50 12.7 ms, p99 37.0 ms | p50 106.7 ms, p99 123.3 ms | p50 15.1 ms, p99 21.6 ms |
+| `create`, created by the 300 s deadline | 248 | 4,620 | 271 | 4,526 |
+| `close_64m` | 28.4 s | 8.0 s | 28.7 s | 10.3 s |
+
+After, `close_64m` meets its bar on ext4 and misses it on XFS; `close_4k`
+and `create` miss theirs on both.
+
+Then the call path stopped running git: a save is a journal record, and the
+builder makes its commits behind it (`image` run 43567446691, commit
+2271669, one observation each):
+
+| Workload | ext4 | XFS |
+|---|---|---|
+| `close_4k`, p50 | 1.03 ms | 0.46 ms |
+| `close_4k`, `drain_s` | 0.50 s | 0.20 s |
+| `create`, created by the 300 s deadline | 7,529 | 7,743 |
+| `close_64m` | 0.51 s | 0.20 s |
+
+`close_4k` and `close_64m` meet their bars on both filesystems. `create`
+misses its bar: the lag gate holds creates to the builder's pace, and the
+builder still writes each commit's whole listings, as below.
+
+The cost of one create against the files in the tree (the median save in
+each window, ms):
+
+| Files in the tree | ext4 before | ext4 after | XFS before | XFS after |
+|---|---|---|---|---|
+| about 25 to 45 | 255 to 360 | 19 | 218 to 306 | 23 to 25 |
+| about 75 to 125 | 524 to 842 | 20 | 437 to 702 | 25 to 28 |
+| about 225 | 1,400 | 21 | 1,186 | 23 |
+| about 525 | | 26 | | 27 |
+| about 1,025 | | 31 | | 36 |
+| about 2,025 | | 45 | | 52 |
+| about 4,550 to 4,650 | | 85 | | 85 |
+
+Each commit then wrote the whole files tree, the line map
+(`metadata.json`) and the name history (`namespace.json`) of its tree, so
+it cost about 14 µs more for each file already in the tree, where it cost
+6 to 7 ms. The figures above in this table were taken while the save made
+its commit.
+
+Then a commit came to hold each file under two levels of hashed folders and
+to rewrite only the changed files' folders (docs/trees.md, "What a commit
+holds"), and a new file's first save stopped running `git diff` (`image` run
+43580482406, commit c2bf696, one observation each):
+
+| Workload | ext4 | XFS |
+|---|---|---|
+| `close_4k`, p50 (p99) | 1.48 ms (2.68 ms) | 1.31 ms (3.98 ms) |
+| `create`, created by the 300 s deadline | 50,000 in 85.8 s | 50,000 in 79.4 s |
+| `create`, `drain_s` | 124.0 s | 112.2 s |
+| `close_64m` | 0.28 s | 0.26 s |
+
+All three meet their bars on both filesystems. The builder takes about
+4.2 ms a create on ext4 and 3.8 ms on XFS (the run and its drain over
+50,000), flat in the tree's size: the median save stays near 1 ms from 1 to
+50,000 files. `close_4k`'s p50 is above the previous run's (0.95 ms and
+0.45 ms on those runners, commit 3b1ed68); on one machine, the two release
+builds measured the same (0.58 to 0.69 ms against 0.68 to 0.70 ms, 200 saves
+in a tree of 250 files), so the difference is the runners'.
+
+Then file maps and journal segments: no file's bytes are held in memory, a
+write costs its own bytes, and a close compares only what the open touched
+(docs/trees.md, "File maps"; `image` run 43587792812, commit f24ed4e, one
+observation each):
+
+| Workload | ext4 | XFS |
+|---|---|---|
+| `close_4k`, p50 (p99) | 1.42 ms (137.9 ms) | 0.91 ms (2.32 ms) |
+| `create`, created by the 300 s deadline | 50,000 in 97.7 s | 50,000 in 70.4 s |
+| `create`, `drain_s` | 126.3 s | 118.3 s |
+| `close_64m` | 0.40 s | 0.47 s |
+| `close_1g`, close and `stat` (total with the writes) | 5.44 s (5.85 s) | 5.75 s (6.05 s) |
+| `write_1g`, last 64 writes against a 1 MiB file's (ratio) | 0.40 ms against 0.59 ms (0.67) | 0.29 ms against 0.40 ms (0.72) |
+
+`close_1g` is the fsync of the journal's gigabyte. That run did not measure the 1 GiB save's history: it had
+not finished building within the 180 s the script waits on XFS, and the
+builder then held a saved file whole (about 6 GB for a 1 GiB save).
+
+Then line maps without bytes (docs/trees.md, "What a commit holds"): a
+save's map is runs of lines, its alignment reads both versions a line at a
+time, and git streams blobs over 8 MiB. Two more figures hold the 1 GiB save's
+build: `history_1g` (its `drain_s`, at most 60 s, the engine's own 1 GiB commit
+of 23 to 29 s with margin) and `memory_1g` (the view process's peak memory
+through the save and its build, at most 256 MiB over its memory before). On
+one 4-CPU container (ext4, release build, a random file written in 1 MiB
+writes, `.claude/handoff`'s `mem.py`; a local observation, not CI):
+
+| File | `drain_s` | agentfs peak memory | git children's peak | state area |
+|---|---|---|---|---|
+| 64 MiB | 2.6 s | 15 MiB | 8 MiB | 193 MiB |
+| 256 MiB | 9.7 s | 15 MiB | 146 MiB (mapped pack pages) | 769 MiB |
+| 1 GiB | 39.9 s | 17 MiB | 66 MiB | 3,073 MiB |
+
+On CI (`image` run 43600260345, commit c187fe3, one observation each):
+
+| Workload | ext4 | XFS |
+|---|---|---|
+| `history_1g`, the 1 GiB save's `drain_s` | 40.7 s | 40.6 s |
+| `memory_1g`, the view's peak over its memory before | 36.2 MiB | 36.3 MiB |
+| `close_1g`, close and `stat` (total with the writes) | 2.45 s (3.08 s) | 2.39 s (2.86 s) |
+| `write_1g` (ratio) | 0.82 | 0.82 |
+| `close_4k`, p50 (p99) | 1.50 ms (3.05 ms) | 1.41 ms (3.68 ms) |
+| `create`, 50,000 created in | 84.3 s | 88.0 s |
+| `close_64m` | 0.11 s | 0.10 s |
+
+All meet their bars. The view's own memory before the 1 GiB workload was
+about 1 GiB, held for the 50,000 files the `create` workload left (about
+20 KiB a file, see `memory_create` below), which is not this figure.
+
+Then file maps without descriptors, compaction that waits only for steps,
+and one gate thread per volume (`image` run 43608163463, commit d7666ef, one
+observation each):
+
+| Workload | ext4 | XFS |
+|---|---|---|
+| `close_4k`, p50 (p99) | 1.23 ms (2.55 ms) | 0.74 ms (1.98 ms) |
+| `create`, 50,000 created in | 43.5 s | 18.8 s |
+| `create`, `drain_s` | 116.8 s | 110.7 s |
+| `close_64m` | 0.39 s | 0.11 s |
+| `close_1g`, close and `stat` (total with the writes) | 5.43 s (5.87 s) | 3.47 s (3.84 s) |
+| `history_1g` | 31.5 s | 32.5 s |
+| `memory_1g` | 35.8 MiB | 36.2 MiB |
+
+`close_4k`'s p50 has ranged from 0.46 to 1.50 ms across runs since the call
+path stopped running git, with no change to the call path between several of
+them: the same code gave 0.66 ms and 1.25 ms on two runners (runs
+43595126271 and 43595132223), and 1.23 ms and 0.74 ms on the two jobs of
+this run. Its p99 of 137.9 ms in one run (commit f24ed4e) did not recur in
+the runs since (1.6 to 4.0 ms). The report names each runner's CPU (`host`),
+and one commit's four jobs (f7149c4, `image` runs 43610666059 and
+43610532396) show the spread is the runner's CPU, not the code or the
+filesystem:
+
+| Runner CPU (4 CPUs each) | Filesystem | `close_4k` p50 (p99) | 50,000 creates in |
+|---|---|---|---|
+| Intel Xeon 6975P-C | XFS | 0.66 ms (1.78 ms) | 16.1 s |
+| Intel Xeon 6975P-C | ext4 | 0.74 ms (1.57 ms) | 17.8 s |
+| Intel Xeon Platinum 8370C | XFS | 1.14 ms (2.51 ms) | 41.4 s |
+| Intel Xeon Platinum 8573C | ext4 | 1.90 ms (2.68 ms) | 65.8 s |
+
+Compare a figure across runs only on the same CPU.
+
+The 256 MiB row predates bounding `git cat-file`'s pack window; with it the
+1 GiB save's children peak at 66 MiB. Before, the same container's 256 MiB
+save took 13.8 s with the children at 752 MiB.
+
+The view's memory per file is held by `memory_create`: its resident memory
+once the `create` workload's history is built, over its memory before, per
+file created, at most 2 KiB. About 20 KiB a file came from libgit2: the
+builder packs each batch with `git fast-import`, and one handle kept open
+held a cache of delta bases (up to 16 MiB) for every pack it had read. The
+handle is now let go after each batch. Small maps (a file's name versions,
+its byte pieces, the paths of each object) are vectors, not B-tree maps,
+whose node costs hundreds of bytes for the one entry most files have. On one
+4-CPU container (ext4, release build, one-line files created one after
+another, each step's history built before reading; a local observation, not
+CI), the resident memory grows by about 3.4 to 3.8 KiB a file between 5,000
+and 20,000 files: about 400 MiB for a 100,000-file tree. Two things hold most
+of what is left: each builder batch applies to a copy of the builder's trees
+(about 0.7 KiB a file while it runs), and each path is held about four times
+in each of the actor's and the builder's trees.
 
 ## Performance budget
 

@@ -54,10 +54,13 @@ pub mod repack;
 pub mod restore;
 pub mod rules;
 pub mod service;
+pub mod session;
 pub mod shared_fs;
 #[cfg(feature = "ssh")]
 pub(crate) mod ssh_transport;
 pub mod stamps;
+pub mod state_area;
+pub mod store;
 pub mod telemetry;
 pub mod tracked;
 pub mod tree_actor;

@@ -16,7 +16,12 @@ what they do today, and where they stop.
 
 - A **tree** is a branch of one bare git repository.
 - A **fork** is a tree made from another tree, its **upstream**. A fork of a fork
-  has that fork as its upstream. A tree with no upstream is the root (`main`).
+  has that fork as its upstream. A tree with no upstream is the root.
+- A tree's **identity** is `root` or `fork/<n>`, where `n` is the journal event that
+  made the fork; it is never reused. The tree's branch (`refs/heads/root`,
+  `refs/heads/fork/<n>`), its queue, its checkout and the `Agentfs-Tree` trailer of
+  every commit made in it name it by its identity, never by a branch name it is
+  published under. Forks are taken in order of `n`, after the root.
 - A **sync** brings the upstream's version into a fork. A **landing** brings a
   fork's save into its upstream. Two lines **collide** when each was written
   without seeing the other; the upstream's version wins and the loser's lines are
@@ -31,28 +36,189 @@ release in CI.
 
 ```sh
 cargo build --locked -p agentfs
-mkdir -p /tmp/agentfs-trees/main /tmp/agentfs-trees/fork
-target/debug/agentfs --state /tmp/agentfs-trees/state trees init
+mkdir -p /tmp/agentfs-trees/root /tmp/agentfs-trees/fork
+target/debug/agentfs --state /tmp/agentfs-trees/state trees init --volume trial
 target/debug/agentfs --state /tmp/agentfs-trees/state trees mount \
-  /tmp/agentfs-trees/main --sandbox /tmp/agentfs-trees/fork
+  /tmp/agentfs-trees/root --fork-mount /tmp/agentfs-trees/fork --fork-key trial
 ```
 
-Use ordinary file calls in either view. The command prints the fork's `fork/N`
-name. Reuse it with `--fork fork/N`, or make one with `trees fork`. Unmount both
-views with `fusermount3 -u PATH`; unmounting every view ends the process.
+Use ordinary file calls in either view. The command prints `fork tree: fork/N` on
+stderr. Without `--fork-key` every mount makes a new fork, which ends when its view
+is unmounted; under a key, every mount finds the same fork until `trees end
+--fork-key` ends it ([forks](#forks-keys-end-and-the-drop)). Unmount both views
+with `fusermount3 -u PATH`; unmounting every view ends the process.
 
 | Command or flag | Meaning |
 |---|---|
-| `trees init` | Initialize or recover the state area; prints `main <head>` |
-| `trees fork` | Create a fork of main at its saved head; prints its name |
-| `trees mount MAIN` | Recover and mount main on an existing empty directory |
-| `--sandbox DIR` | Also mount a fork in DIR (a new one, or `--fork`) |
-| `--fork fork/N` | Reuse this fork (needs `--sandbox`) |
-| `--writer LABEL`, `--sandbox-writer LABEL` | Main's and the fork's writer label (default `main-client`, `sandbox-client`). A label is trusted, not an authenticated identity |
-| `--metrics-output FILE` | Write counters, the journal's length and each stage's runs, time and git children every 100 ms and at unmount |
+| `trees init --volume NAME` | Create the volume, or find it under the same name, then recover it; prints `<name> <id> created` or `found`. Another name or another format exits 1 with nothing written |
+| `trees mount ROOT` | Recover and mount the root on an existing empty directory. It never creates a volume: run `trees init` first |
+| `--volume NAME` (`trees mount`) | Refuse, before anything is written, a volume with another name |
+| `--owner UID:GID` | Every file's owner in the views (default: the mounting process's user and group) |
+| `--no-allow-other` | Only the mounting user reaches the views. By default other users do (FUSE `allow_other`, which needs `user_allow_other` in `/etc/fuse.conf` when the mounting user is not root) |
+| `--namespace`, `--pod`, `--pod-uid`, `--node` | Where the views run: the pod context of their commits (below) |
+| `--fork-mount DIR` | Also mount a fork of the root in DIR: a new one, or with `--fork-key` the open one under that key (made the first time) |
+| `--fork-key KEY` | The fork's key (needs `--fork-mount`): 1 to 128 bytes of printable ASCII with no whitespace. A key whose fork has ended exits 1 |
+| `--writer LABEL`, `--fork-writer LABEL` | The root's and the fork's client label (default `root-client`, `fork-client`): a safe name of at most 64 bytes. A label is the launcher's word, not an authenticated identity |
+| `--read-only`, `--fork-read-only` | Mount the root, or the fork, read-only: its client cannot write, and every write answers `EROFS`. `--fork-read-only` takes the default fork label |
+| `trees end --fork-key KEY` | End the fork under the key; it drops once nothing holds it. Exits 75 while a mount holds the volume, 1 for an unknown key |
+| `--metrics-output FILE` | Write counters, the journal's length, each stage's runs, time and git children, and the objects stored, at each built or failed event, at least every 100 ms, and at unmount; each file carries `seq`, one more each time |
 
 Mount points must be empty, separate and outside the state area. Metrics never take
-part in ordering.
+part in ordering. Every flag is in [configuration](configuration.md#flags-and-environment).
+
+## Volume identity and trailers
+
+`trees init --volume NAME` gives a new volume a random id (RFC 9562 version 4) and
+writes it with the name to the state area's `volume` file, before the repository and
+`format`. Every start reads `format` and `volume` before it writes anything. The id
+never changes; the name is a label and a guard.
+
+Every commit names its volume, its writer and where the writer ran, in this order:
+
+```text
+<subject>
+
+Agentfs-Writer: <writer>
+Agentfs-Cause: <Root | Direct | Landing | Sync>
+Agentfs-Tree: <root | fork/<n>>
+Agentfs-Event: <step number, 0 for the Root>
+Agentfs-Volume: <volume name>
+Agentfs-Volume-Id: <id>
+Agentfs-Namespace: <namespace>     each pod field only when given
+Agentfs-Pod: <pod>
+Agentfs-Pod-Uid: <pod uid>
+Agentfs-Node: <node>
+Agentfs-Format: envelope-1         every commit but the Root
+Agentfs-Open: <n>                  a save that closed an open
+Agentfs-Collisions: <json>         a landing that decided any
+```
+
+A save's writer is its client (below), `<label>#<n>@<launcher>/<tree>`, for example
+`root-client#5@cli/root`. A save carries its writer and the pod context of the
+mount it came through. The
+journal keeps both with each write-open, so a save recovery makes after a crash
+names the writer that opened the file and where it ran, not the restarted process.
+A landing merge's subject is `Landing by <writer>`, and its writer and pod trailers
+are those of the save it lands. A sync, a fork step and the Root commit are
+`agentfs`'s, with the pod context of the process that serves the volume.
+
+## Clients
+
+Each view is one **client** of its tree, attached by its launcher (the trial CLI,
+`cli`) before the view mounts. A client is named by its label, its number, its
+launcher and its tree: `<label>#<n>@<launcher>/<tree>`. Its number is the journal
+step of its attach, unique in the volume and never reused. The name is every save's
+writer, so a commit needs no lookup to say who made it; the label and launcher hold
+no `#`, `@` or `/`, so the name parses back.
+
+- **Sessions.** A view reaches its tree only through its client's session. A
+  read-write client's session writes as the client; a read-only client's writes
+  nothing (`EROFS`), and its view is mounted read-only. A session reaches only its
+  own client's open files.
+- **One writer per fork, for life.** A fork's first read-write client claims it. The
+  claim stays after the client ends, so a second read-write client is refused, while
+  the first is attached and after it ends. `trees mount` then exits 1: "this fork
+  has had its writer; mount it with --fork-read-only or use a new fork". The
+  root has no claim. The claim is released when the fork is dropped
+  (`ClaimReleased`).
+- **Ends.** When a view is unmounted, its client is detached. Its open files close
+  as saves first, in handle order, durable before the detach returns; a write after
+  that answers `EROFS`. The end is one step with `AttachmentEnded`, then
+  `LastDetached` when its tree has no client left.
+- **Restart.** A killed `trees mount` leaves its clients attached. The next mount
+  rebinds the one of the same launcher, tree, label and access (the latest when
+  several are): the same client and writer, with the new mount's pod context
+  (`Rebound`), so a fork's writer comes back after a kill. Then it ends every other
+  client of its launcher (`AttachmentEnded`, reason `Reconciled`). A clean unmount
+  ends the client, so a fork's writer does not come back after one.
+- **Never waits for history.** Attach, rebind and end are durable before they
+  return, never wait at the lag gate or for history, and answer while the builder
+  fails.
+
+A failed end changes nothing: no room is reserved for it, and the next mount's
+reconcile ends what it left.
+
+## Rows and event commits
+
+The volume's own events (a fork created, ended and dropped, clients attached,
+rebound and ended, and in a later slice the volume's lifecycle) are on record
+like file changes: each is a commit in the volume's repository, on a chain of commits beside
+the tree it concerns.
+
+| Chain | Holds |
+|---|---|
+| `refs/agentfs/trees/fork/<n>` | fork `n`'s row (`ForkCreated`, `ForkEnded`, `ForkDropped`); kept after the fork is dropped |
+| `refs/agentfs/clients/<tree>` | the clients attached to a tree and a fork's writer claim (`Attached`, `Rebound`, `AttachmentEnded`, `LastDetached`, `ClaimReleased`) |
+| `refs/agentfs/volume` | the volume's lifecycle |
+
+Each event commit's tree is one file, `row.json`: the row's value after the event
+with its audit stamps (`created` set at the row's first write and kept, `changed` at
+every write, each a time and who). Its parent is the chain's previous event (none
+for the first). Its message is the event:
+
+```text
+<Kind> <detail>
+
+Agentfs-Kind: <Kind>
+Agentfs-By: <client <id> | launcher <id> | agentfs>
+Agentfs-Tree: <root | fork/<n>>    on a tree's chain only
+Agentfs-Event: <step number>
+Agentfs-Volume: <volume name>
+Agentfs-Volume-Id: <id>
+Agentfs-Namespace: <namespace>     each pod field only when given
+Agentfs-Pod: <pod>
+Agentfs-Pod-Uid: <pod uid>
+Agentfs-Node: <node>
+Agentfs-Format: row-1
+```
+
+An event commit has no `Agentfs-Writer` or `Agentfs-Cause`, so nothing that reads
+file commits takes it for a save. `git log refs/agentfs/trees/fork/3` is fork 3's
+life; `git show refs/agentfs/trees/fork/3:row.json` is its row now.
+
+- **One record.** A fork's create is one journal record: its branch and its row,
+  committed together or not at all, made durable (one group-commit fsync, outside
+  the actor's lock) before a mount's new fork returns. Its event
+  commit is built behind, with the step's batch, as a save's commit is.
+- **Read from the journal.** Rows are read from the actor's saved state, never Git:
+  they answer while the builder lags or fails, and a row step never waits at the lag
+  gate. A restart reads each built chain's `row.json`, then replays the later
+  records.
+- **Local for now.** The row chains are kept in the volume's repository; pushing
+  them to remotes comes with replication.
+
+## Forks: keys, end and the drop
+
+A fork is open, then ended, then dropped. Its row on `refs/agentfs/trees/fork/<n>`
+says which, and every move is one journal step with its event commit, durable
+before the call returns.
+
+- **Keys.** A launcher may create a fork under a key (`--fork-key`). A second create
+  under the key returns the open fork and writes nothing; once that fork has ended,
+  the key answers "ended" and makes no new fork.
+- **End.** A fork created without a key ends when its last client detaches (the
+  view is unmounted), by `agentfs`, or when its creating launcher (or the volume's
+  own) ends it. A keyed fork ends only by its key (`trees end --fork-key`), for any
+  launcher that presents it: a fork claim outlives the pods that mount it. An ended
+  fork is never written again.
+- **Drop.** An ended fork drops once its upstream's queue holds nothing it put
+  there (every save has reached the referee), no file is open in it and no fork
+  names it as upstream. The drop is one step with `ForkDropped`: the fork's branch
+  and every entry of its own queue go, and the builder deletes its refs and then
+  its checkout. Its row chain and the collision refs of its losing saves stay; its
+  landed saves stay reachable from the root's landing merges. Its sync merges carry
+  no edits of its own and become unreachable (`git fsck` lists them as dangling).
+- **When.** The drop is judged at boot, after each landing a view host takes, and at
+  each end; each judgement asks the journal, never history, so a failing builder
+  holds no drop back. A drop that meets an open file waits for the next judgement.
+- **Restart.** A drop on record is a drop after a crash: the restart forgets the
+  fork, deletes a checkout a crash left, and builds what was not built. A take of a
+  dropped fork finds nothing to take; one decided before the drop is refused when
+  it would land.
+
+The journal records a drop as `Change::Drop { fork }`: its pointer changes delete
+the branch and the queue entries, and the actor, the restart's replay and the
+builder each forget the tree.
 
 ## What a tree does
 
@@ -80,53 +246,282 @@ part in ordering.
   saves can align repeated lines differently. Stored bytes and identities do not
   change.
 
-`fsync` flushes the journal and the final release publishes the file.
+`fsync` and close make the file's calls durable; the final release publishes the
+file.
+
+## Recording and durability
+
+Every file call is in the journal before it returns: one frame, written with one
+`write(2)` and no fsync. A call that returned survives a crash or kill of agentfs,
+because its frame is in the kernel. It survives a power cut once one of these has
+returned:
+
+- `close(2)` of a descriptor that wrote (FUSE `FLUSH`), or `fsync(2)` of it;
+- each `write(2)` of a descriptor opened `O_SYNC` or `O_DSYNC`;
+- `fsync(2)` of the view's directory (FSYNCDIR), or of a read-only descriptor:
+  every record so far, creates, renames and unlinks included.
+
+A power cut loses the calls, renames and unlinks made since the last of these.
+Waits share fsyncs (group commit): one fsync answers every wait whose records were
+written before it began. The fsync runs off the view's request thread and outside
+the actor's lock, so a waiting close holds no other call. A failed fsync stops the
+actor: its waiters get its error and every later call `EIO` (see
+[Recovery](#recovery)).
+
+## File maps
+
+No file's bytes are held in memory, by the views or by the builder. A file is a map: pieces of journal frames
+and of the private checkout's file as built, by file offset. A write adds one
+piece that points at its frame, so it costs its own bytes at any file size: a
+4 KiB write into a 1 GiB file copies 4 KiB, into its frame. An open starts from
+the saved map, shared until it writes (copy on write). A close applies the
+open's calls to the saved map with the same function the builder replays, and
+tells a close that changes nothing by comparing only the bytes the open's calls
+touched. A view reads a map with the actor unlocked: the lock is held only to
+clone it.
+
+- After a batch is built and checked out, the builder reads each changed file
+  from its checkout instead of the frames, through a hard link in the state
+  area's `bases/` (cleared at each start), and the actor takes that map at its
+  next call where it saved the same step. A checkout writes each file to a
+  temporary name and renames it over the old one, so a reader that opened the
+  old version keeps reading it through its link; the link goes when the last
+  map lets go of it.
+- A map holds no descriptor: reads open the link through a cache of at most
+  256 open files per process, so a volume of any number of files opens and
+  reads under the default open-files limit.
+- A take's merged files are in chunk records of at most 16 MiB just before
+  its step, written from the files whose lines it keeps (a version's bytes are
+  the same in every file that holds it), and their maps read them there; a
+  take of a file of any size records.
+- The builder aligns a save reading both versions of the file a line at a
+  time, with a sampled index of where lines start. A new file and an append
+  run no `git diff`; any other save writes both versions to `align/` in the
+  state area for one `git diff` and removes them. `git diff` itself reads both
+  files whole, so an edit of a file near the host's memory needs that memory
+  in the `git` child. Blobs over 8 MiB stream through `git fast-import` and
+  `git cat-file` (`core.bigFileThreshold`), which never hold them whole.
+- The save record holds the result's length and a digest of its pieces: the
+  close's own pieces with their places, and the bytes it kept as runs. The
+  builder's replay must reach the same digest (`Disagrees`).
 
 ## The library
 
-`agentfs_core::tree_actor::Volume` holds an exclusive state-area lease. `write_open`,
-`write`, `truncate`, `sync` and `close` are the recorded calls. Upstream and fork
-share one bare repository. A commit stores the files under `files/`, line maps in
-`metadata.json` and name versions in `namespace.json` (`Agentfs-Format:
-envelope-1`). Merge identity is separate from an open object's identity. See
-[library/core.md](library/core.md).
+`agentfs_core::tree_actor::TreeActor` holds an exclusive state-area lease.
+`TreeActor::create` makes a volume, `TreeActor::open` recovers one and never creates,
+and `tree_actor::inspect` reads what a state area holds without the lease.
+`tree_actor::Recording` serves a volume: the actor behind its one lock, with
+`durable`, `durable_all` and their deferred forms waiting for durability outside it.
+`Recording::open` makes every recovered record durable and serves at once, from the
+journal: it never waits for history. Dropping the last `Recording` makes every record
+durable and builds it.
+`Recording::history` is the one owner of the Git store (`History`: the built point,
+`wait_built`, built snapshots, lag), and `settle` waits until every record so far is
+built: call it before reading Git. `TreeActor::head` settles first. Each recorded call names
+its writer as a `WriterAt` (the writer and its pod context). `write_open`, `write`,
+`truncate` and `close` are the recorded calls. A view reaches them through
+`agentfs_core::session`: a `TreeSession` locks the actor with its client's tree and
+writer, and `Sessions` is the binder Clients binds each client's authority to. Upstream and fork
+share one bare repository. Merge identity is separate from an open object's
+identity. See [library/core.md](library/core.md).
+
+## What a commit holds
+
+Each commit (`Agentfs-Format: envelope-1`) keeps three entries per file, in two
+levels of hashed folders:
+
+```text
+files/<aa>/<bb>/<name>   the file's bytes
+lines/<aa>/<bb>/<name>   JSON [identity, line map]: the file's lines as runs, never their bytes
+names/<cc>/<dd>/<id>     JSON name history of one file identity, ended files included
+```
+
+`aa` and `bb` are hex digits 1-2 and 3-4 of `git hash-object --stdin` of the
+name's bytes; `cc` and `dd` the same of the identity in decimal. The folders are
+fixed (256 by 256), so a file's path never changes when files come or go, and a
+commit that changes one file rewrites only the folders on its three paths: the
+builder's cost per save is the same at 100 files and at 100,000. `git log --
+files/2e/65/a` is the history of a file named `a` (`printf a | git hash-object
+--stdin` starts `2e65`). Each tree's private checkout (`trees/<tree>/` in the
+state area) mirrors `files/`: `trees/root/2e/65/a`.
+
+A line map is `{"lines": [runs], "ancestors": [runs]}`. A line run is
+`{"identity": "e:i", "version": "e:j", "count": n}`: `n` lines whose
+identities and versions number on (`e:i`, `e:i+1`, ...), with `"dead": true`
+for deleted lines and `"open": len` when its last line has no newline (that
+line's length in bytes). The live lines divide the file's bytes in order,
+each at its newline. An ancestor run `{"version": "e:j", "count": n, "over":
+"d:k"}` says each of `n` versions was written over the one numbered alike
+from `d:k`; without `over` they are new lines. A new file is one run of each
+at any size, so a map costs its saves' edits, not its file's bytes.
+
+Object numbers (which file an open handle writes to) are not in history. They are
+the journal's: a checkpoint holds each tree's objects as of its built point, and
+the steps after it move them.
 
 ## The journal
 
-Every step's pointer changes (branch moves, queue entries, collision refs, object
-tables) are one fsynced record in `calls.wal`. That record is the commit point. Git's
-refs are a copy in the files format, rebuilt on every open, and nothing decides from
-them. A `git` command run during a step may see the copy half written; each queue
-entry is a loose ref file.
+Every step (a create, a link, a close that saves, a rename, an unlink, a fork, a
+take, rows alone) is one record in the journal: the change itself, the rows it
+writes ([Rows and event commits](#rows-and-event-commits)), and the pointer changes
+its build publishes (branch moves, queue entries, collision refs, row chains), each
+value an oid or "what step `n`'s build gives" (on a row chain, step `n`'s last
+event commit on it). It is appended as a call is and made
+durable as a call is. That record is the commit point. The actor decides the step,
+appends it and applies it to the saved state the views serve; it runs no git.
 
-A step writes its objects, checks and appends its record, then installs and copies.
+- The journal is a directory of segments, `journal/<first record>.seg`, each
+  about 64 MiB; a frame never spans two, and a frame over 64 MiB has a segment of
+  its own. A new segment's directory entry is fsynced before the durable mark
+  covers any record in it.
+- A failed step keeps serving and saves at the next step in its tree. Only a failed
+  journal `fsync` (a leader's or a compaction's) or rollback stops the actor; a
+  failed fsync is never retried, since the page cache then says nothing about the
+  disk.
+- Recovery reads the journal and serves from it without waiting for history: the
+  saved state is the trees as built (read from Git and the private checkouts)
+  with every later record replayed on them by the transitions the actor ran at
+  the call. It then closes abandoned opens through the ordinary step; the builder
+  catches up behind, as at any time (see
+  [History trails the files](#history-trails-the-files)), and a failed build
+  raises its alarm without refusing the open. The recovered records are made
+  durable before anything is served (the directory first), and the steps past the
+  built point count in the lag gate as they did at their call. A journal whose
+  steps are all built compacts at once; otherwise compaction runs at the first
+  call after the builder catches up. It refuses
+  a missing journal, a missing `format` file, a lost object at a pointer's tip, and
+  a journal that names a tree by anything but its identity, has no root, gives the
+  root an upstream, gives an upstream to a fork with no branch, or gives a fork an
+  upstream other than the root (forks are made only of the root). It deletes
+  nothing outside a first init's own marker.
+- Compaction runs when the segments pass `max(64 MiB, twice the last compacted
+  length)`: it writes a checkpoint at the start of a new segment, then drops
+  (unlinks) every older segment whose records the builder has read and which
+  holds no live open's call and no page write memory holds. A held file pins only its own
+  frames: they are copied forward (marked `carried`, their record numbers kept)
+  once the dead bytes they pin exceed their own, so the segments stay under about
+  twice the live opens' bytes plus a segment. A frame is named by its record
+  and an offset into it, wherever it is carried, so a save's digest does not
+  change when it moves. The journal records where each carried frame went; the
+  actor moves its live opens, page writes and saved maps there as it compacts,
+  and the builder moves its own before its next batch, so the dropped segment's
+  space returns then. A reader holding a dropped segment (a view's open file)
+  keeps reading it; its space returns when the last lets go. Frames are at most
+  96 MiB; a take's bytes are in records of at most 16 MiB. The constants are not
+  settings. A checkpoint's pointers are the built ones, so a compaction that is
+  due waits for the first call after the builder has built every step and read
+  past the oldest segment; calls after the last step (a file under constant
+  writes) never hold it back, since the checkpoint holds them, and only the
+  segment they share with dead records waits for the next step. While steps
+  trail, the journal grows; once it is twice its due length, the lag gate holds
+  every tree's new work until the builder has built every step. A compaction
+  that fails before its checkpoint changes nothing and is retried at the next
+  call; one that fails while dropping leaves those segments for the next. Its
+  fsyncs (every segment the checkpoint covers, the directory, the frames it
+  copies forward) stop the actor when they fail, as a leader's do.
+- Recovery folds the last checkpoint, the live opens' calls and the held page
+  writes it names from the segments before it (kept or carried, each once), and
+  every frame after it.
+- Every frame carries the durable mark: the last record a finished fsync covered
+  when the frame was written. At the first invalid frame, a later valid frame with
+  this journal's salt whose mark passes the last valid record means a durable record
+  was lost: corruption, and the journal refuses to open. Otherwise the hole is a
+  torn tail of records no fsync had covered, saved to `journal/torn` and cut off,
+  with every later segment. A journal whose valid records end before the built
+  log's point is corruption too: the builder made those records durable before it
+  built them.
+  Bit rot in the very last frame, or in records not yet durable or built, reads as
+  a tear and drops those records; the log line and that file are the evidence.
+- The state area is `volume`, `history.git`, `journal/`, `built.log`, `align/`,
+  `bases/`, `actor.lock`, `format` and rebuilt private checkout caches, which the workload
+  never sees. A create writes an `initializing` marker first and removes it last;
+  the next `trees init` starts a cut-short create over. **Earlier state formats
+  (format 8 included) do not open**, and are never converted.
 
-- A failed save keeps serving and saves at the next step in its tree. Only a failed
-  journal `fsync` or rollback, or a compaction failing after its rename, stops the
-  actor. A failed copy after the record is logged and the call succeeds.
-- Recovery reads the journal, rebuilds the refs and trees, closes abandoned opens
-  through the ordinary step and compacts. It refuses a missing journal, a missing
-  `format` file or a lost object at a pointer's tip, and deletes nothing outside a
-  first init's own marker.
-- Compaction keeps the journal at most `max(64 MiB, twice the last compacted
-  length)` plus the live calls, and keeps only the page writes memory holds. A held
-  file pins only its own calls. Frames are at most 96 MiB. The constants are not
-  settings.
-- At the first invalid frame, a later valid frame with this journal's salt and a
-  higher number means corruption and refuses to open; none means a torn tail, saved
-  to `calls.wal.torn`. Bit rot in the very last frame reads as a tear and drops
-  that record; the log line and that file are the evidence.
-- The state area is `history.git`, `calls.wal`, `actor.lock`, `format` and rebuilt
-  private checkout caches, which the workload never sees. **Earlier state formats do
-  not open.**
+## History trails the files
+
+A builder thread makes each step's commits behind the call path, in batches of at
+most 256 steps, so a long backlog ends in a built event every batch. For a batch it
+makes every record through the last one appended durable (one fsync of the
+journal), reads them, replays each step on the trees as built (the same transitions
+the actor ran, then the line alignment), and feeds the commits to one
+`git fast-import`, each changed file's blob streamed from its map. It installs the batch in this order: the pack, then its index;
+the new pack files and `objects/pack` fsynced; the batch's entry in `built.log`
+fsynced. That entry moves the built point. Only then are Git's refs, `config` and
+the private checkouts copied, the checked-out files' maps rebased onto them
+([File maps](#file-maps)), and waiters woken.
+
+- A save is visible to every view at its release, before it is built. Git's refs,
+  commits and checkouts show only what is built.
+- Takes are decided on built history, off the actor's lock (below, "Takes").
+- A commit is dated by its step's record, in `+0000`. A replay after a crash may
+  make other objects for steps nothing had seen built.
+- A failed batch (`tree HistoryBuildFailed: <e>`) changes nothing reachable and is
+  retried at the next step or wait; recording goes on. A batch whose replay
+  disagrees with its record (`Disagrees`) fails the same way at every retry: see
+  [runbooks/recording-failures.md](runbooks/recording-failures.md). A failed copy
+  after the built-log entry is logged (`tree CopyStale`) and redone whole at the next
+  batch.
+- Dropping the volume builds every record appended, so a clean shutdown leaves
+  history built through its last record. After a kill the builder builds what
+  was left unbuilt, behind the reopened views.
+- No record after a checkpoint names a step the checkpoint covers: a step whose
+  pointers were read before a compaction names those values as the oids they
+  were built as, so a restart, which builds from the checkpoint, builds every
+  later record as an uninterrupted run would.
+- `--metrics-output` reports `history`: the built point, the last record appended,
+  the oldest unbuilt step's age, the worst tree's lag and the builder's health.
+- **The lag gate.** Each tree's lag is the builder's estimated time for its unbuilt
+  steps: the larger of their count at a cost per step and the bytes they write
+  (the bytes a save or take leaves, plus a constant for the commit and its three
+  hashed folder levels, which do not grow with the tree) at a cost per byte, each
+  measured on the last batch as if it bore the whole batch. Over 120 s, a call
+  that starts new work in that tree (a create, a write-open, `O_TMPFILE`, a link,
+  a rename, an unlink, a path truncate) waits for the built event that brings the
+  lag under; other trees, writes, flushes and closes do not wait, and the view
+  answers other requests meanwhile. One gate thread per volume answers every
+  waiting call at the built or failed event that admits it.
+  The kernel holds a directory's lock while a create, link, rename or unlink in it
+  waits, so a lookup or listing of that directory waits with it. A failed builder
+  holds nothing back. Over 30 s,
+  `tree HistoryLagging` is logged once; over the limit, `tree HistoryStalled`.
+  The levels are constants, not settings.
+
+## Takes
+
+A tree's queue entries are taken one at a time per volume, by the view's worker or
+by `take_next`. Each take runs in three parts:
+
+1. Under the actor's lock: pending closes in the tree save first, then the take
+   reads its inputs: the keys the tree's write-opens hold, the last step that moved
+   the tree's head, and the last record appended.
+2. With the lock released: it waits for history built through that record, then
+   plans and judges the first entry P1 lets go on that built snapshot. Calls go on
+   meanwhile.
+3. Under the lock: it lands as a take step, or is refused when a step after the
+   decision touched a key it read (`FilesChanged`), a write-open holds a key it
+   writes (`Held`), a fast-forward's head moved (`HeadMoved`), or its entry is
+   gone (`EntryGone`). A refused take is logged (`tree TakeRefused`) and decided
+   again at once, on the history that refused it.
+
+A landed take read nothing of its tree that changed after its decision, so it decides
+what a take made in one step at its land would. A sync reads its upstream's head as
+of its decision, as a sync taken then would; the upstream's later saves queue later
+entries. A fork's entries are planned once per take: each is a sync marker, and P1
+takes the first or none. The worker wakes on built and failed events,
+never a timer. A take whose files change faster than the builder's lag plus its
+decision waits until they stop.
 
 ## The view
 
-The FUSE adapter (`agentfs_fuse::tree_view`) uses zero entry and attribute TTLs and
+The view host (`agentfs_fuse::tree_view::ViewHost`) mounts each view on its
+client's session, never waiting for history: the tree must be among the actor's
+saved trees. The FUSE adapter uses zero entry and attribute TTLs and
 direct I/O, and negotiates neither passthrough nor the writeback cache. A read with
 no lock owner is a page fill and a write with `FUSE_WRITE_CACHE` is a page write.
 `max_background` is as high as the kernel allows, to keep a release ahead of a later
-open. The queue worker takes one entry at a time, releasing the actor between takes,
+open. One thread answers requests in order; a `FLUSH`, `FSYNC`, FSYNCDIR or `O_SYNC`
+write is answered from the journal's waiter thread once its records are durable. The queue worker takes one entry at a time, releasing the actor between takes,
 and drops the kernel's pages of files a take changed. A file open for writing
 holds back that fork's syncs from its upstream until it closes; no alarm is raised
 for a waiting open. See [library/filesystem.md](library/filesystem.md).
@@ -148,18 +543,21 @@ What the tree views do not support:
   replication, CSI, several view hosts, upgrades and snapshot opens** are not
   built. The designs for them are in [target-architecture](target-architecture/README.md).
 - **Telemetry export** is not wired. `--metrics-output` is the only measurement.
-- **Large files are slow.** Every save and take reads and rewrites the whole tree, so
-  a large file taxes every later step of every file. In one debug-build run on CI, a
-  100 MiB file took 31.9 s to write and close and 339 s until both views converged
-  (a 1 MiB file: 1.27 s), and five saves of unrelated small files took 238 to 241 s
-  each to appear while it was queued. The line map is never pruned, so per-save cost
-  grows with history: 10,000 one-line saves took 2,561 s in one run. See
-  [performance.md](performance.md). These are observations from single runs, not
-  budgets.
-- **A call can wait.** A client call on a mount waits behind a take that has begun.
-  A file held open can hold other files' decisions back for minutes in the
-  measurements above. Only the mounted cases and the held-log measurement cover the
-  wait; the model replays do not.
+- **Large files.** A save costs its own file: the builder's memory does not
+  grow with the file (17 MiB for a 1 GiB save in one local run, its history
+  built in about 40 s; see [performance.md](performance.md)). Still: the
+  state area needs about three times a large file while history builds (its
+  journal segments, its blob, its checkout); an edit that is not an append
+  runs `git diff`, which holds both versions; a take expands its files' line
+  maps line by line and reads the files it merges, through `git cat-file` for
+  any over 8 MiB; and a line map keeps every deleted line, so maps of files
+  edited often grow with their edits.
+- **A call can wait.** A call that starts new work in a tree waits while that
+  tree's lag is over the limit, or while an overdue compaction waits for the
+  builder (see [History trails the files](#history-trails-the-files)); every call
+  waits while a take lands under the actor's lock. A take waits for its entry's
+  write-opens to close, so a file held open holds the takes that write it. The
+  model replays do not cover the waits; the mounted cases do.
 - **Shared mappings have a gap.** A write through an `mmap` is saved as a page. A
   mapped store that writes the bytes its page last held records nothing, so a
   descriptor write made meanwhile stands where Linux would keep the store: with a
@@ -171,9 +569,10 @@ What the tree views do not support:
 - **Close-to-open** rests on kernel 7.0 and the sources of v6.8, v6.14 and v7.0: 64
   closes over a busy view, from the same process and another. A readahead in flight
   on the handle was not exercised.
-- **The object-directory syncs** cannot be judged by prefix replay on ext4 and XFS
-  (the journal's fsync carries the earlier rename). `ci/trees-object-dir-syncs.sh`
-  proves only the order of system calls, not a crash.
+- **The pack syncs** cannot be judged by prefix replay on ext4 and XFS (a later
+  fsync carries the pack's directory entry). `ci/trees-object-dir-syncs.sh` proves
+  only the order of system calls (pack files and `objects/pack`, then the built-log
+  entry), not a crash.
 - **Replays are not a proof.** The model's scenarios and seeded random interleavings
   are replayed on the model, the library and real mounts. They show no `mmap` call
   and no client call waiting on a take, and do not cover every interleaving.

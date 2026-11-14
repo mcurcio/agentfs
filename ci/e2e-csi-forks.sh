@@ -52,7 +52,7 @@ ka() { kubectl -n "$APPS" "$@"; }
 
 gateway() {
   docker network inspect kind -f '{{range .IPAM.Config}}{{.Gateway}} {{end}}' |
-    tr ' ' '\n' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -n1
+    tr ' ' '\n' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | sed -n 1p
 }
 
 diagnose() {
@@ -98,7 +98,7 @@ W=$(mktemp -d "${RUNNER_TEMP:-/tmp}/e2e-forks.XXXXXX")
 plugin_pod() {
   kd get pod -l "$PLUGIN_LABEL" -o go-template \
     --template '{{range .items}}{{if not .metadata.deletionTimestamp}}{{.metadata.name}}{{"\n"}}{{end}}{{end}}' |
-    head -n1
+    sed -n 1p
 }
 plugin_ready() {
   kd wait --for=condition=Ready pod -l "$PLUGIN_LABEL" --timeout=300s >/dev/null ||
@@ -269,7 +269,7 @@ assert_eq "$(fgit rev-parse "refs/agentfs/$FORK/finish")" "$(fgit rev-parse "$FO
   "the finish commit is the fork branch's head"
 until_ok 600 "the fork's PV is gone once published" pv_gone "$FORK_PV"
 until_ok 60 "the fork's volume directory is removed" node_path_gone "$BASE/$FORK_PV"
-ka get pod writer -o jsonpath='{.status.phase}' | grep -q Running || fail "the source's pod stopped"
+ka get pod writer -o jsonpath='{.status.phase}' | grep Running >/dev/null || fail "the source's pod stopped"
 pass "the source stayed in use throughout"
 
 step "(5) a fork whose remote refuses its refs is refused"

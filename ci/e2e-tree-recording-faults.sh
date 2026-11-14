@@ -15,32 +15,49 @@ cleanup() {
   for m in "$work/main" "$work/sandbox"; do fusermount3 -uz "$m" 2>/dev/null || true; done
 }
 trap cleanup EXIT
+# `start SPEC` mounts the root and the keyed fork's sandbox (made at the first
+# mount), whose writer it attaches; `start SPEC root` the root alone. The fork's
+# one writer is spent at a clean unmount, so a remount after one leaves the
+# sandbox out. Keyed, the fork stays open: no end or drop moves a count.
 start() {
-  local spec=$1
-  AGENTFS_FAILPOINTS="$spec" "$bin" --state "$work/state" trees mount "$work/main" --sandbox "$work/sandbox" --fork "$fork" >"$work/mount.log" 2>&1 & pid=$!
+  local spec=$1 views=("$work/main")
+  local args=("$work/main")
+  if [ "${2:-}" != root ]; then
+    views+=("$work/sandbox")
+    args+=(--fork-mount "$work/sandbox" --fork-key faults)
+  fi
+  AGENTFS_FAILPOINTS="$spec" "$bin" --state "$work/state" trees mount "${args[@]}" >"$work/mount.log" 2>&1 & pid=$!
   for _ in $(seq 1 200); do
-    if mountpoint -q "$work/main" && mountpoint -q "$work/sandbox"; then return; fi
+    local up=1 view
+    for view in "${views[@]}"; do mountpoint -q "$view" || up=; done
+    [ -z "$up" ] || return 0
     kill -0 "$pid" || { cat "$work/mount.log" >&2; return 1; }
     sleep .1
   done
   echo 'mount startup timed out' >&2; return 1
 }
 # Takes run on the view's worker. Let them finish before the kill, so the failpoint
-# meets the client's call rather than a leftover take.
+# meets the client's call rather than a leftover take. Git's refs trail the journal
+# (docs/trees.md, "History trails the files"): an empty queue in git means drained
+# only once the sandbox's head holds the last save's sync, which took its entry.
 drain_queue() {
+  local gitdir=$work/state/history.git
   for _ in $(seq 1 300); do
-    [ -n "$(git --git-dir="$work/state/history.git" for-each-ref refs/queue)" ] || return 0
+    if tree_git_file "$gitdir" "refs/heads/$fork" "$1" >/dev/null 2>&1 &&
+       [ -z "$(git --git-dir="$gitdir" for-each-ref refs/queue)" ]; then
+      return 0
+    fi
     sleep .1
   done
   echo 'queue did not drain' >&2; return 1
 }
-points=(tree.wal_before_header tree.wal_after_header tree.wal_after_payload tree.wal_before_fsync tree.wal_after_fsync tree.before_objects tree.after_objects_durable tree.after_commit_point tree.after_ref_copy tree.before_checkout tree.after_checkout)
+points=(tree.wal_before_header tree.wal_after_payload tree.wal_before_fsync tree.wal_after_fsync tree.before_step tree.build_before_batch tree.build_after_pack tree.build_after_built_log tree.build_after_ref_copy)
 for point in "${points[@]}"; do
   rm -rf "$work/state" "$work/main" "$work/sandbox"
   mkdir "$work/main" "$work/sandbox"
-  "$bin" --state "$work/state" trees init
-  fork=$("$bin" --state "$work/state" trees fork)
+  "$bin" --state "$work/state" trees init --volume t
   start ''
+  fork=$(sed -n 's/^fork tree: //p' "$work/mount.log")
   # Establish an independently observed acknowledged write before the kill.
   : > "$work/baseline.receipt"
   python3 - "$work/main/baseline" "$work/baseline.receipt" <<'PY'
@@ -55,14 +72,24 @@ os.fsync(fd); receipt('fsync')
 os.close(fd); receipt('close')
 PY
   : > "$work/main/candidate"
-  drain_queue
+  drain_queue candidate
   fusermount3 -u "$work/main"; fusermount3 -u "$work/sandbox"
   wait "$pid"; pid=
+  # The mount records one step of its own first, the root client's attach: one
+  # record, one fsync, one step and one builder batch, each a point's first hit.
+  # Its client's call meets the next.
   case "$point" in
-    tree.wal_*) spec="$point=kill@2" ;; # The open is the first record.
-    *) spec="$point=kill" ;;
+    # A write appends with no fsync: the client's fsync is the next. The open
+    # is the next record appended, the write the one after.
+    tree.wal_*fsync) spec="$point=kill@2" ;;
+    tree.wal_*) spec="$point=kill@3" ;;
+    *) spec="$point=kill@2" ;;
   esac
-  start "$spec"
+  before=$(tree_git_root_clients "$work/state/history.git")
+  start "$spec" root
+  # The attach's batch built before the client's first record: else the two could
+  # share one batch, and a builder point's second hit would come later or never.
+  tree_git_wait_root_attached "$work/state/history.git" "$before"
   : > "$work/receipt"
   python3 - "$work/main/candidate" "$work/receipt" <<'PY' >"$work/client.log" 2>&1 & client=$!
 import os, sys
@@ -82,39 +109,40 @@ PY
   wait "$pid" 2>/dev/null || true; pid=
   wait "$client" 2>/dev/null || true
   grep -F "agentfs failpoint $point triggered (kill)" "$work/mount.log" >/dev/null || { cat "$work/mount.log" >&2; exit 1; }
-  fusermount3 -uz "$work/main"; fusermount3 -uz "$work/sandbox"
-  "$bin" --state "$work/state" trees init
+  fusermount3 -uz "$work/main"
+  "$bin" --state "$work/state" trees init --volume t
   gitdir=$work/state/history.git
-  [ "$(tree_git_file "$gitdir" main baseline)" = baseline ]
+  [ "$(tree_git_file "$gitdir" root baseline)" = baseline ]
   if grep -q "^write " "$work/receipt"; then
     count=$(awk '/^write / {print $2}' "$work/receipt")
-    [ "$(tree_git_file "$gitdir" main candidate)" = "$(printf candidate | head -c "$count")" ]
+    written=candidate
+    [ "$(tree_git_file "$gitdir" root candidate)" = "${written:0:count}" ]
   fi
   git --git-dir="$gitdir" fsck --full --strict --no-progress
   tree_git_no_duplicate_opens "$gitdir"
-  head=$(git --git-dir="$gitdir" rev-parse main)
-  "$bin" --state "$work/state" trees init
-  [ "$(git --git-dir="$gitdir" rev-parse main)" = "$head" ]
+  head=$(git --git-dir="$gitdir" rev-parse root)
+  "$bin" --state "$work/state" trees init --volume t
+  [ "$(git --git-dir="$gitdir" rev-parse root)" = "$head" ]
   printf 'PASS\t%s\t%s\n' "$point" "$(tail -n 1 "$work/receipt")" | tee -a "$work/results.tsv"
 done
 # The failpoints a mounted process cannot reach: each opening of the state area
 # passes them. Killed there, the next open still finds every returned write.
-for point in tree.after_ref_rebuild tree.compact_before_rename tree.compact_after_rename; do
+for point in tree.after_ref_rebuild tree.compact_before_checkpoint tree.compact_before_drop; do
   rm -rf "$work/state" "$work/main" "$work/sandbox"
   mkdir "$work/main" "$work/sandbox"
-  "$bin" --state "$work/state" trees init
-  fork=$("$bin" --state "$work/state" trees fork)
+  "$bin" --state "$work/state" trees init --volume t
   start ''
+  fork=$(sed -n 's/^fork tree: //p' "$work/mount.log")
   printf saved > "$work/main/kept"
   fusermount3 -u "$work/main"; fusermount3 -u "$work/sandbox"
   wait "$pid"; pid=
   status=0
-  AGENTFS_FAILPOINTS="$point=kill" "$bin" --state "$work/state" trees init >"$work/open.log" 2>&1 || status=$?
+  AGENTFS_FAILPOINTS="$point=kill" "$bin" --state "$work/state" trees init --volume t >"$work/open.log" 2>&1 || status=$?
   [ "$status" = 137 ] || { echo "$point did not kill: $status" >&2; cat "$work/open.log" >&2; exit 1; }
   grep -F "agentfs failpoint $point triggered (kill)" "$work/open.log" >/dev/null
-  "$bin" --state "$work/state" trees init
+  "$bin" --state "$work/state" trees init --volume t
   gitdir=$work/state/history.git
-  [ "$(tree_git_file "$gitdir" main kept)" = saved ]
+  [ "$(tree_git_file "$gitdir" root kept)" = saved ]
   git --git-dir="$gitdir" fsck --full --strict --no-progress
   tree_git_no_duplicate_opens "$gitdir"
   printf 'PASS\t%s\t-\n' "$point" | tee -a "$work/results.tsv"
@@ -122,10 +150,10 @@ done
 # A first init killed before its `format` starts over.
 rm -rf "$work/state"
 status=0
-AGENTFS_FAILPOINTS=tree.init_before_format=kill "$bin" --state "$work/state" trees init >"$work/open.log" 2>&1 || status=$?
+AGENTFS_FAILPOINTS=tree.init_before_format=kill "$bin" --state "$work/state" trees init --volume t >"$work/open.log" 2>&1 || status=$?
 [ "$status" = 137 ] || { echo "tree.init_before_format did not kill: $status" >&2; cat "$work/open.log" >&2; exit 1; }
 [ -e "$work/state/initializing" ]
-"$bin" --state "$work/state" trees init
+"$bin" --state "$work/state" trees init --volume t
 [ ! -e "$work/state/initializing" ]
 git --git-dir="$work/state/history.git" fsck --full --strict --no-progress
 printf 'PASS\ttree.init_before_format\t-\n' | tee -a "$work/results.tsv"
@@ -133,9 +161,9 @@ printf 'PASS\ttree.init_before_format\t-\n' | tee -a "$work/results.tsv"
 # never be replayed onto the new object at that pathname.
 rm -rf "$work/state" "$work/main" "$work/sandbox"
 mkdir "$work/main" "$work/sandbox"
-"$bin" --state "$work/state" trees init
-fork=$("$bin" --state "$work/state" trees fork)
+"$bin" --state "$work/state" trees init --volume t
 start ''
+fork=$(sed -n 's/^fork tree: //p' "$work/mount.log")
 python3 - "$work/main" "$work/orphan-receipt" <<'PY' >"$work/orphan-client.log" 2>&1 & client=$!
 import os, sys, time
 root, receipt = sys.argv[1:]
@@ -157,13 +185,13 @@ done
 kill -KILL "$pid"; wait "$pid" 2>/dev/null || true; pid=
 kill "$client"; wait "$client" 2>/dev/null || true
 fusermount3 -uz "$work/main"; fusermount3 -uz "$work/sandbox"
-"$bin" --state "$work/state" trees init
+"$bin" --state "$work/state" trees init --volume t
 gitdir=$work/state/history.git
-[ "$(tree_git_file "$gitdir" main old)" = replacement ]
+[ "$(tree_git_file "$gitdir" root old)" = replacement ]
 git --git-dir="$gitdir" rev-list --all > "$work/orphan-commits"
 while read -r commit; do
   prefix=
-  if git --git-dir="$gitdir" show -s --format=%B "$commit" | grep -Fxq 'Agentfs-Format: envelope-1'; then prefix=:files; fi
+  if git --git-dir="$gitdir" show -s --format=%B "$commit" | grep -Fx 'Agentfs-Format: envelope-1' >/dev/null; then prefix=:files; fi
   if git --git-dir="$gitdir" grep -F 'ORPHAN-BAD' "$commit$prefix" >/dev/null; then
     echo "orphan bytes entered history at $commit" >&2; exit 1
   else
@@ -172,8 +200,8 @@ while read -r commit; do
   fi
 done < "$work/orphan-commits"
 tree_git_no_duplicate_opens "$gitdir"
-head=$(git --git-dir="$gitdir" rev-parse main)
-"$bin" --state "$work/state" trees init
-[ "$(git --git-dir="$gitdir" rev-parse main)" = "$head" ]
+head=$(git --git-dir="$gitdir" rev-parse root)
+"$bin" --state "$work/state" trees init --volume t
+[ "$(git --git-dir="$gitdir" rev-parse root)" = "$head" ]
 git --git-dir="$gitdir" fsck --full --strict --no-progress
 printf 'PASS\treplaced-open-object\twrite fsync\n' | tee -a "$work/results.tsv"

@@ -23,7 +23,7 @@ new_volume transports
 EXPORTS=0
 
 arrived() { # service-name needle: one export from service-name carries needle
-  grep -F "\"$1\"" "$OTEL_OUT" | grep -qF "$2"
+  grep -F "\"$1\"" "$OTEL_OUT" | grep -F "$2" >/dev/null
 }
 
 record_with() { # service-name env-assignments...: records one file and a refused path

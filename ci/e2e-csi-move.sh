@@ -93,7 +93,7 @@ esac
 plugin_on() { # node
   kd get pod -l "$PLUGIN_LABEL" --field-selector "spec.nodeName=$1" -o go-template \
     --template '{{range .items}}{{if not .metadata.deletionTimestamp}}{{.metadata.name}}{{"\n"}}{{end}}{{end}}' |
-    head -n1
+    sed -n 1p
 }
 on() { # node command...
   local node=$1
@@ -136,7 +136,7 @@ push_failures_at_least() { # node pv n
 delete_unavailable() { # node pv
   local said
   said=$(provisioner_log "$1")
-  grep "$2" <<<"$said" | grep -q "Unavailable.*remote origin could not be listed"
+  grep "$2" <<<"$said" | grep "Unavailable.*remote origin could not be listed" >/dev/null
 }
 log_has() { # node text
   local said
@@ -420,7 +420,7 @@ fi
 echo "$out"
 assert_contains "$out" "diverged" "the CLI volume's push is diverged"
 assert_eq "$G" "$(sgit rev-parse "$BRANCH1")" "agentfs/V1 is unchanged"
-DIVERGED=$(sgit for-each-ref --format='%(refname)' "refs/agentfs/$V1/diverged/" | head -n1)
+DIVERGED=$(sgit for-each-ref --format='%(refname)' "refs/agentfs/$V1/diverged/" | sed -n 1p)
 [ -n "$DIVERGED" ] || fail "no refs/agentfs/$V1/diverged/* ref was saved"
 pass "the CLI volume's head is saved as $DIVERGED"
 

@@ -879,8 +879,8 @@ section. A subcommand with its own subcommands lists them after it.
 - `start`: for a volume started from another worktree's branch
   ([moving](runbooks/moving.md)), with `accept`, which accepts a tip of
   the start branch and clears the start-branch alarm. It takes no lock.
-- `trees`: tree views ([trees](trees.md)), with `init`, `fork` and
-  `mount`.
+- `trees`: tree views ([trees](trees.md)), with `init`, `mount` and
+  `end`.
 
 Commands that write the state area take its lock and exit 75 while
 another process holds it ([operator guide](operator-guide.md#9-the-state-area-lock)).
@@ -905,16 +905,22 @@ templates' variables, the commit trailers and the telemetry resource:
 | Flag | Environment | Default | Commands |
 |---|---|---|---|
 | `--namespace NAME`, `--pod NAME`, `--pod-uid UID`, `--node NAME`, `--replica NAME` | `AGENTFS_NAMESPACE`, `AGENTFS_POD`, `AGENTFS_POD_UID`, `AGENTFS_NODE`, `AGENTFS_REPLICA` | empty; `--pod-uid` defaults to the replica, and `--replica` (the committer's `{replica}`) to the pod name, else the host name. `mount` also records a given `--pod-uid` in `meta/attached.json` when the mount point is in that pod's own volume, so a different pod's start lands the patch queue over a mark the old pod's stop left (see [patches](patches.md)) | `mount`, `run`, `record`, `flush`, `push`, `checkpoint`, `serve-history`, `serve-git` (passed to its hooks and `patch apply` as the variables), `restore`, `revert`, `patch apply`, `fork finish`, `status` (accepted and ignored) |
+| `--namespace NAME`, `--pod NAME`, `--pod-uid UID`, `--node NAME` | `AGENTFS_NAMESPACE`, `AGENTFS_POD`, `AGENTFS_POD_UID`, `AGENTFS_NODE` | empty: absent from the commits. Each is 1 to 253 bytes of printable ASCII with no whitespace | `trees init`, `trees mount`, `trees end`: the pod context of a tree volume's commits, as `Agentfs-Namespace`, `Agentfs-Pod`, `Agentfs-Pod-Uid` and `Agentfs-Node` ([trees](trees.md#volume-identity-and-trailers)). `trees mount`'s are its views' writers' and its own syncs'; `trees init`'s are the Root commit's |
 
-**Tree view flags** (`agentfs trees mount`; see [trees](trees.md)):
+**Tree view flags** (`agentfs trees`; see [trees](trees.md)):
 
 | Flag | Environment | Default | Commands |
 |---|---|---|---|
-| `--sandbox DIR` | | no sandbox mount | `trees mount`: also mount an isolated sandbox |
-| `--fork fork/N` | | create a new fork | `trees mount`: reuse this existing sandbox; requires `--sandbox` |
-| `--writer LABEL` | | `main-client` | `trees mount`: trusted main writer label |
-| `--sandbox-writer LABEL` | | `sandbox-client` | `trees mount`: trusted sandbox writer label |
-| `--metrics-output FILE` | | no metrics file | `trees mount`: replace a JSON snapshot of process-local save, take and wait counters, the journal's length, and runs, time and Git children by actor stage (`stages`, process-wide: see `tree_actor/stages.rs`) every 100 ms and at unmount; the existing parent directory must be outside state and views; collection errors are reported after unmount |
+| `--volume NAME` | `AGENTFS_VOLUME` | none: required by `trees init` | `trees init`: the volume's name, kept in its identity file. A new state area gets a new id; the same name finds it and writes nothing; another name, or another format (the trial's format 3 included), exits 1 with nothing written. Prints `<name> <id> created\|found`, then recovers the volume. Exit 75 while another process holds it. `trees mount`: optional, a guard: another name exits 1 before anything is written |
+| `--owner UID:GID` | `AGENTFS_OWNER` | this process's effective user and group | `trees mount`: every file's and directory's owner in the views |
+| `--no-allow-other` | | FUSE `allow_other` on | `trees mount`: only the mounting user reaches the views. With `allow_other`, a mount by a user other than root needs `user_allow_other` in `/etc/fuse.conf` |
+| `--fork-mount DIR` | | no fork mount | `trees mount`: also mount a fork of the root: a new one, ended when its last client detaches, or with `--fork-key` the open fork under that key (made the first time). Prints `fork tree: fork/N` on stderr |
+| `--fork-key KEY` | | an unkeyed fork | `trees mount`: the fork's key, 1 to 128 bytes of printable ASCII with no whitespace; requires `--fork-mount`. A key whose fork has ended exits 1. `trees end`: required, the key whose fork ends; the fork drops once nothing holds it. Exit 75 while a mount holds the volume, 1 for an unknown key ([trees](trees.md#forks-keys-end-and-the-drop)) |
+| `--writer LABEL` | | `root-client` | `trees mount`: the root's client label, a safe name of at most 64 bytes; with the client's number, launcher and tree (`<label>#<n>@cli/root`) it is every save's writer. After a kill, the next mount rebinds the client of this label ([trees](trees.md#clients)) |
+| `--fork-writer LABEL` | | `fork-client` | `trees mount`: the fork's client label, as `--writer`; requires `--fork-mount` |
+| `--read-only` | | read-write | `trees mount`: the root's client is read-only; its view is mounted read-only and every write answers `EROFS` |
+| `--fork-read-only` | | read-write | `trees mount`: the fork's client is read-only, with the default label; requires `--fork-mount`, excludes `--fork-writer`. How a keyed fork whose writer has gone (a clean unmount ends it) is mounted again: a fork has one writer for life, and a second read-write mount exits 1 |
+| `--metrics-output FILE` | | no metrics file | `trees mount`: replace a JSON snapshot of process-local save, take and wait counters, the journal's length, and runs, time and Git children by actor stage, with the objects handed to Git's store and the fsyncs of its `objects/` directory (`stages`, process-wide: see `tree_actor/stages.rs`) at each history built or failed event, at least every 100 ms, and at unmount, each file numbered by `seq` (one more each time) and renamed into place; the existing parent directory must be outside state and views; collection errors are reported after unmount |
 
 The `trees` commands accept global `--state` and its environment equivalent. They refuse
 `--root` and nonzero `--wait-lock`; they fail immediately when the actor is busy.
@@ -1037,8 +1043,9 @@ equivalents above; a flag given on the command line wins.
 | `AGENTFS_STATE` | `--state` | all commands |
 | `AGENTFS_ROOT` | `--root` | all commands |
 | `AGENTFS_WAIT_LOCK` | `--wait-lock` | all commands |
-| `AGENTFS_NAMESPACE`, `AGENTFS_POD`, `AGENTFS_POD_UID`, `AGENTFS_NODE`, `AGENTFS_REPLICA` | `--namespace`, `--pod`, `--pod-uid`, `--node`, `--replica` | the commands with pod flags |
-| `AGENTFS_VOLUME` | `--volume` | `init`, `patch submit`, `patch approve` |
+| `AGENTFS_NAMESPACE`, `AGENTFS_POD`, `AGENTFS_POD_UID`, `AGENTFS_NODE`, `AGENTFS_REPLICA` | `--namespace`, `--pod`, `--pod-uid`, `--node`, `--replica` | the commands with pod flags, the `trees` commands among them (not `--replica`) |
+| `AGENTFS_VOLUME` | `--volume` | `init`, `patch submit`, `patch approve`, `trees init`, `trees mount` |
+| `AGENTFS_OWNER` | `--owner` | `trees mount` |
 | `AGENTFS_PASSTHROUGH` | `--passthrough` | `mount` |
 | `AGENTFS_THREADS` | `--threads` | `mount` |
 | `AGENTFS_ON_STALE_MOUNT` | `--on-stale-mount` | `mount` |

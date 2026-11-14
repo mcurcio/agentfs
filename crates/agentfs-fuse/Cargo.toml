@@ -8,6 +8,7 @@ repository.workspace = true
 description = "The agentfs FUSE layer: a recording passthrough filesystem over a backing tree"
 
 [dependencies]
+agentfs-contracts = { version = "0.1.0", path = "../agentfs-contracts" }
 agentfs-core = { version = "0.1.0", path = "../agentfs-core" }
 # Default features only: pure Rust (mount(2) as root, fusermount3
 # otherwise), no libfuse or pkg-config needed to build.
@@ -20,6 +21,8 @@ thiserror = "2.0.21"
 [dev-dependencies]
 git2 = { version = "0.21.0", default-features = false }
 tempfile = "3.27.0"
+# A fixed volume id in the tree view's tests.
+uuid = { version = "1", default-features = false, features = ["std"] }
 
 [features]
 # Test builds only: agentfs-core's failpoints, and the FUSE layer's own.

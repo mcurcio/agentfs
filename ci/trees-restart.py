@@ -16,7 +16,7 @@ import sys
 import tempfile
 import time
 
-from tree_git_read import read
+from tree_git_read import fanned, read
 
 DEAD = (errno.ENOTCONN, errno.ECONNABORTED)
 SIZE = mmap.PAGESIZE
@@ -66,7 +66,7 @@ def linux_bytes():
 
 def saves_of(state, name):
     out = subprocess.check_output(["git", "--git-dir", str(state / "history.git"), "log",
-                                   "main", "--format=%s", "--", f"files/{name}"])
+                                   "root", "--format=%s", "--", f"files/{fanned(name)}"])
     return out.decode().splitlines()
 
 
@@ -105,7 +105,7 @@ def main():
     host = mount(binary, state, root, log)
 
     check("the file holds what returned before the kill", held.read_bytes(), expected)
-    check("main history holds the same", read(state / "history.git", "main", "held"), expected)
+    check("root history holds the same", read(state / "history.git", "root", "held", expected), expected)
     check("one save besides the create", len(saves_of(state, "held")), 2)
     check("a file replaced before the kill stays the replacement",
           replaced.read_bytes(), b"replacement before the kill")
@@ -114,8 +114,8 @@ def main():
     os.rename(root / "held.new", held)
     write_fails("the old handle's write after the replacement", fd)
     check("the replacement is unchanged", held.read_bytes(), b"replacement")
-    check("main history holds the replacement",
-          read(state / "history.git", "main", "held"), b"replacement")
+    check("root history holds the replacement",
+          read(state / "history.git", "root", "held", b"replacement"), b"replacement")
 
     view.close()
     for stale in (fd, old):

@@ -32,7 +32,7 @@ question first ([VERIFYING.md](../../crates/agentfs-model/VERIFYING.md) §"Fix p
 `proposed` and then built.
 
 A *fork* is a tree made from another tree, its *upstream*; a fork inside a fork has that fork as its upstream. A
-tree with no upstream is the root; its branch is `refs/heads/<root>`, a name the volume is configured with
+tree with no upstream is the root; its branch is `refs/heads/root`, and the name it is published under is configured
 ([root branch name](future/root-branch-name.md)). A *sync* brings the upstream's version
 into a fork. A *landing* brings a fork's save into its upstream. Two lines *collide* when each was written
 without seeing the other. MODEL.md's rules table holds the full wording; this page is the authority on status.
@@ -132,8 +132,8 @@ of their day: "main" is the root, a "sandbox" is a fork, a "parent" is an upstre
 
 ## 3. Transactions
 
-- **R5** · owner · Opt-in. Begin opens a new branch frozen at the fork's version. The program sees its own
-  edits while the fork keeps syncing. Rollback, abandon or the client dying drops the branch. Commit lands it
+- **R5** · owner · Opt-in. Begin opens a new branch frozen at the fork's version. The program's saves stage in the
+  transaction's index (R5.5) and it sees its own edits while the fork keeps syncing. Rollback, abandon or the client dying drops the branch. Commit lands it
   in the fork whole or not at all, and tells the program. Source: "Frozen snapshot was my intention, yes.
   That's why I said “new branch” earlier." (2026-11-02); "It’s a transaction, so a failure is an implicit
   rollback." (2026-11-02). Tests: `r5_transaction_commits_clean`, `r5_transaction_rollback_and_client_death_leave_nothing`,
@@ -151,13 +151,28 @@ of their day: "main" is the root, a "sandbox" is a fork, a "parent" is an upstre
   Deferred: other writes to those files are accepted and applied in order after the transaction completes. Owner, 2026-11-05: "deferred, obviously. thats what i mean by "lock" -- its about ordering the operations so that agentfs has a change to mutate the filesystem without a client fighting it".
   Its files, owner, 2026-11-05: "The changes that it adds to the transaction." A deferred call and a sync: the sync
   waits until the transaction ends (owner picked this, 2026-11-05, cost stated). A deferred call at a crash: the crash
-  rolls the transaction back and applies the call (owner picked this, 2026-11-05). The model does not match these
-  yet: it counts files open for writing and keeps a deferred call behind a surviving transaction.
+  rolls the transaction back and applies the call (owner picked this, 2026-11-05). The model rolls back every open
+  transaction at a crash, deferred call or not: its choice, revisable, the owner to confirm (git-model, Questions for
+  the owner). Cost: a staged save whose close returned is lost at a crash and leaves no trace in git; every call was
+  still journaled before it returned (R12). The model does not match the rest yet: it counts files open for writing, and a sync does
+  not wait for the transaction. Tests: `r5_a_crash_rolls_back_and_applies_what_it_deferred`
 - **R5.4** · owner · A transaction has no owner program. Owner, 2026-11-05: "There is no “who” in a transaction —
   transactions stage file changes"; "A transaction is an agentfs concept, not a property of the local/shared fs."
   Not built: the model still binds a transaction to a client and adds `Client::Outside`, which no rule supports.
   The API of the integration that creates one is not defined (his question, 2026-11-05: "I hat is the API of an
   integration that can create transactions?").
+- **R5.5** · owner · A transaction is recorded as one commit. Its saves make no commit: they stage in its index, and its
+  commit makes one commit of its own, T, of everything staged, on the commit it began at, which then lands in the fork
+  as any change lands (R10.11): a fast-forward if the fork has not moved (R6.2), so the fork gains T alone; else the
+  fork also gains the landing's merge `[fork, T]` (the model's choice, the owner to confirm: git-model, Questions for
+  the owner). Owner, 2026-11-13, asked as general guidance whether
+  saves inside a transaction are commits on `txn/<n>` or staged: "a transaction should be recorded as one commit";
+  2026-11-12: "the "save" operation isnt creating git commits; instead the changes are being accumulated and only get
+  committed when the transaction itself closes/commits". Revisable: guidance, not a rule. The commit's form is the
+  model's choice, not his words: one save over begin (a line's last staged version written over begin's, begin's
+  version where written back), one `Agentfs-Open` per open it staged a save of, and no commit, told `Empty`, when it
+  changes nothing over begin (git-model, Questions for the owner). Tests: `r5_a_transaction_is_recorded_as_one_commit`,
+  `r5_a_line_staged_twice_is_one_version_over_begin`, `r5_a_transaction_that_changes_nothing_makes_no_commit`
 
 ## 4. Who wrote what
 
@@ -287,12 +302,16 @@ of their day: "main" is the root, a "sandbox" is a fork, a "parent" is an upstre
   his 3, option (b) of finding 38: the model changes, not the library. Revisable: option (a) was to count only a change to
   what the file shows. Cost: a fork holding a file open waits longer for later commits.
   Tests: `r9_a_sync_delivers_up_to_the_first_change_to_an_open_file`, `finding_38_a_sync_past_an_open_file_waits_for_any_line_map_change`
-- **R9.18** · owner · A file open inside a transaction on a fork holds back that fork's syncs from its upstream until it
-  closes, as a file open on the fork does under R9.3. Asked, 2026-11-08, whether a file held open inside a transaction
-  should hold back syncs as an open on the fork does under R9.3, the owner answered: "Yes. “Waiting longer” is a feature
-  of locks and transactions, not a bug". Revisable: it is his answer, not a rule. Cost: a transaction that keeps a file
-  open delays the fork's syncs for as long. Not built: the model counts only opens on the tree (`write_open` filters
-  `Target::Tree`).
+- **R9.18** · approved · A file open inside a transaction on a fork holds back every take into that fork, its syncs from
+  its upstream and its own forks' landings, until it closes, as a file open on the fork does under R9.3 and R9.1. Asked,
+  2026-11-08, whether a file held open inside a transaction should hold back syncs as an open on the fork does under
+  R9.3, the owner answered: "Yes. “Waiting longer” is a feature of locks and transactions, not a bug". Asked, 2026-11-12,
+  whether it holds back every take into its fork or only syncs, he picked "every take" (the option, worded by the agent:
+  "A file open inside a transaction holds back every take into its fork until it closes"). Revisable: it is his answer,
+  not a rule. Cost: a transaction that keeps a file open delays the fork's syncs, and its own forks' landings, for as
+  long.
+  Tests: `r9_a_file_open_in_a_transaction_holds_back_the_forks_sync`,
+  `r9_a_file_open_in_a_transaction_holds_back_a_landing_into_its_fork`
 - **R9.4** · approved · A sync or landing waits for all its files at once, never holding one while it waits for
   another. Approved by the owner, 2026-11-05 (approval page); he asked whether a fast writer can starve a landing (open, with R9.8). 
 - **R9.5** · approved · A waiting entry waits only for its own files, and for earlier entries that share a file
@@ -325,8 +344,8 @@ of their day: "main" is the root, a "sandbox" is a fork, a "parent" is an upstre
   collides: the upstream wins and the save loses whole, retained in history. No tree shows bytes nobody wrote, and line
   order does not change (R10.7) (finding 32). Owner, 2026-11-06, accepting that recommendation: "we can take those
   recommendations for now, and i might change my mind later".
-  The same at a transaction's commit, with the transaction as the fork (R10.11, not built).
-  Tests: `r10_an_unfinished_line_before_a_kept_line_loses_whole`, `r10_an_unfinished_save_after_the_upstreams_last_line_lands`,
+  The same at a transaction's commit, with the transaction as the fork (R10.11).
+  Tests: `r10_an_unfinished_line_before_a_kept_line_loses_whole`, `r10_a_transactions_unfinished_line_before_a_kept_line_loses_whole`, `r10_an_unfinished_save_after_the_upstreams_last_line_lands`,
   `a_save_with_an_unfinished_line_before_a_kept_line_loses_whole`
 - **R10.10** · owner · One release of `git` aligns saves everywhere agentfs is built and tested: the image and CI run the
   release in `ci/git-release`, and each fails if it has another. An upgrade is a known change: it changes how later saves
@@ -360,13 +379,21 @@ of their day: "main" is the root, a "sandbox" is a fork, a "parent" is an upstre
 - **R10.5** · owner · The same inside a transaction: a line the transaction appended after the fork's unfinished
   last line collides at commit, the fork's line wins, and the program is told (R5). Owner, 2026-11-05: "A" (finding 30).
   R10.8 applies at that commit too (R10.11).
-- **R10.11** · owner · A transaction's commit follows the normal merge rules for its files that are not open. The owner,
-  2026-11-08: "If the file is not open, then it follows the normal merge rules". The agent's reading, not his words, and
-  revisable: at a transaction's commit the transaction is the fork and the tree it began from is its
-  upstream (R3f: every tree applies the same rules), so R10.8 applies there: an unfinished line the transaction would put
-  in front of a line the upstream keeps collides, the upstream wins, the transaction loses whole and the program is told
-  (R3e, R5). Not built: the model's landing gate (`if dir == Direction::Landing` in `joins`, `referee/placing.rs`)
-  switches R10.4 and R10.8 off at a transaction commit.
+  Tests: `r10_a_transactions_line_after_the_forks_unfinished_line_loses_whole`
+- **R10.11** · approved · A transaction's commit is a landing of the transaction into its fork, under every landing rule,
+  R10.8 included, for every file, open or not: the transaction is the fork and the tree it began from is its upstream
+  (R3f: every tree applies the same rules). An unfinished line the transaction would put in front of a line the fork
+  keeps collides, the fork wins, the transaction loses whole and the program is told (R3e, R5). The owner, 2026-11-08:
+  "If the file is not open, then it follows the normal merge rules". Asked, 2026-11-12, whether a transaction's commit
+  lands into its fork under every landing rule, R10.8 included, for every file, open or not, the owner answered: "A". His
+  model of a transaction, the same day: "when a transaction is open, the "save" operation isnt creating git commits;
+  instead the changes are being accumulated and only get committed when the transaction itself closes/commits".
+  Asked whether saves inside a transaction are commits on `txn/<n>` or staged, the owner answered, 2026-11-13: "a
+  transaction should be recorded as one commit" (R5.5): the commit lands that one commit, T, into the fork, a
+  fast-forward when the fork has not moved. Cost: some commits that would commit with R10.4 and R10.8 switched off lose whole. The
+  model's referee is given no direction, so it cannot tell a landing from a transaction's commit.
+  Tests: `r10_a_transactions_unfinished_line_before_a_kept_line_loses_whole`,
+  `r10_a_transactions_line_after_the_forks_unfinished_line_loses_whole`
 - **R10.1** · approved · Of two inserts at one place, the upstream's comes first. Approved by the owner, 2026-11-05 (approval page); he asked whether this is only inserts: yes; two edits of one line are a collision the upstream wins (R3b). Tests: `r10_concurrent_inserts_at_one_place_keep_both_the_upstreams_first`
 - **R10.2** · rejected · A partial last line that a merge puts another line after reads as ending in a newline. Owner, 2026-11-05 (in chat, round 2): "collide": a line appended after the upstream's unfinished last line collides with it (R10.4). Gone when: `r10_a_line_after_a_partial_line_reads_terminated`
 - **R11** · approved · A file keeps its identity through renames (like an inode). Its name and existence are one
@@ -402,6 +429,9 @@ of their day: "main" is the root, a "sandbox" is a fork, a "parent" is an upstre
 
 - **R12** · approved · Every write call is in its tree's journal before it returns. After a crash, each open
   file is saved from the journal as its close would have saved it, exactly once, before any tree is served again.
+  An open inside a transaction is not: the crash rolls its transaction back first, so it ends unsaved
+  (`r12_a_crash_rolls_back_an_open_transaction`). That exception is the model's choice, not part of the approval:
+  it extends R5.3's pick to every open transaction, revisable, the owner to confirm (R5.3).
   Approved by the owner, 2026-11-05 (approval page). A compaction keeps that fold: only the page writes memory still
   holds stay in the journal, so a recovery close never lays a closed open's page write over later saves
   (`a_compaction_keeps_a_closed_opens_page_write_out_of_recovery`, a unit test in `tree_actor/mod.rs`). Tests: `r12_a_crash_saves_every_open_from_the_journal`, `r12_a_crash_during_a_close_saves_the_open_once`, and on the real journal `a_step_killed_before_its_record_saves_at_restart`, `a_step_killed_after_its_record_is_not_saved_again`, `a_failed_save_keeps_serving_and_saves_at_the_next_step`

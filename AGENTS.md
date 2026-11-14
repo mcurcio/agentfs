@@ -27,7 +27,7 @@ agentfs is a FUSE filesystem. It records every change a workload makes into git 
 
 These are the owner's priorities. When a choice is unclear, decide by them. Each links to the page that applies it.
 
-1. **Recording is the baseline; everything else is an extra.** A change that reached the filesystem must be recorded before the call returns, or fail loudly ([guarantees](docs/guarantees.md), [recording](docs/recording.md)). Never trade recording for a feature, a speedup or convenience.
+1. **Recording is the baseline; everything else is an extra.** A change that reached the filesystem must be recorded before the call returns, or fail loudly ([guarantees](docs/guarantees.md), [recording](docs/recording.md)). A tree view records it in its journal before the call returns, and makes it power-cut safe at close, fsync or FSYNCDIR (the owner, 2026-11-13, in [OWNER-GUIDANCE.md](OWNER-GUIDANCE.md); [trees](docs/trees.md#recording-and-durability)). Never trade recording for a feature, a speedup or convenience.
 2. **Invisible and untouchable by the workload.** No history, journal, state or credential is reachable through the mount, and nothing in the tree can turn recording off ([guarantees](docs/guarantees.md#threat-model), [recording](docs/recording.md#which-paths-are-recorded)). The threat is an agent's mistakes, not malice, so don't over-engineer against an adversary.
 3. **Git idioms, not invented configuration.** Use `.gitignore`, `.gitattributes`, `.lfsconfig`, `$GIT_DIR/info/*` and git-config syntax. Operator policy lives in the git directory, which iac sets. Rule files in the tree only classify untracked paths ([recording](docs/recording.md#where-rules-come-from)).
 4. **The right technology for the job.** The owner, 2026-10-28: "i never said "no native libraries". lets choose the right technology for the job". Today agentfs uses libgit2 through git2-rs and its own LFS, HTTP and SSH clients, and runs the `git` program where git does the job better, for example `git repack`. Record each choice and its reason under "Technology choices" in [architecture](docs/architecture.md#technology-choices).
@@ -84,6 +84,8 @@ When you learn something durable, write it to its home in the same commit. Never
 
 | Path | What |
 |---|---|
+| `crates/agentfs-contracts` | The shared kernel of the domains around the git model: values, capabilities, each domain's trait and events, and the ports adapters implement. No I/O |
+| `crates/agentfs-volume`, `crates/agentfs-clients`, `crates/agentfs-trees` | The Volume, Clients and Trees domains, each pure over the ports in `agentfs-contracts` |
 | `crates/agentfs-core` | Engine: journal, pending, history, push, credentials, lfs, patch, history_service, telemetry |
 | `crates/agentfs-fuse` | FUSE operations, kernel-independent `Ops` plus a thin fuser adapter |
 | `crates/agentfs` | CLI binary (`mount`, `run`, `serve-history`, `record`, `push`, `restore`, `revert`, `patch`, ...) |
@@ -128,13 +130,14 @@ GitHub Actions runners can, so put such tests in a script under `ci/` and a job 
 | Workflow | Runs on | Typical duration | Covers |
 |---|---|---|---|
 | `ci.yml` | every push and PR | ~5 min | lint, docs checks, unit/integration tests, FUSE mounts, crash injection, remotes (http/https/ssh), LFS, telemetry, multipod, NFS (CLI state areas on one export with two clients; agentfs-csi refusing an NFS base path), patches, runbooks, csi-sanity |
-| `image.yml` | every push and PR | ~5–9 min | container image, kind sidecar e2e, CSI on one kind node (no multi-node job); publishes to GHCR on main |
+| `image.yml` | every push and PR | ~10–12 min | container image, kind sidecar e2e, CSI on one kind node (no multi-node job), the tree views' tracer and release figures on ext4 and XFS (a warning when a figure misses its bar, about fifteen minutes); publishes to GHCR on main |
 | `alerts.yml` | pushes and PRs touching `deploy/alerts`, its `ci/` scripts or the telemetry code | ~4 min | promtool checks and unit tests of the example alert rules, the generated `PrometheusRule`, the rules against the binary's metrics in a real Prometheus |
 | `docker.yml` | pushes and PRs touching the image, `examples/docker`, `ci/hermes` or `deploy/examples/hermes` | ~5–8 min | the Docker examples (`docker run`, compose, compose with a git server remote) via `ci/e2e-docker.sh`, one job each; upstream Hermes' published image on the compose example, with its tool containers on docker-in-docker and a scripted model server, via `ci/e2e-hermes.sh` (a ~2.5 min job; deployment.md §10) |
 | `helm.yml` | every push and PR | ~3–4 min | Helm charts: helm lint, ct lint, READMEs current with helm-docs, charts equal to `deploy/`; `ct install` of the CSI chart on kind and `ci/e2e-csi.sh` against it; publishes charts to `oci://ghcr.io/mcurcio/charts` on main and `v*` tags (docs/helm.md) |
 | `docs.yml` | every push and PR | ~2–3 min | logo PNGs in `docs/assets/` match fresh renders of their SVGs (`ci/render-assets.sh`); the mdBook of `docs/` (`book.toml`, `docs/SUMMARY.md`; an mdbook warning fails it), deployed to GitHub Pages from main; the README's Docker quick start as written, against the published image |
 | `hermes.yml` | pushes and PRs touching the image, `ci/hermes`, `ci/k8s`, `ci/k8s-csi/driver`, `deploy/examples/hermes`, `deploy/sidecar`, `deploy/csi` or `docs/deployment.md` | ~5–6 min | upstream Hermes on kind via `ci/e2e-hermes-kind.sh`, one job each: the sidecar pod of deployment.md §10 (the migration Job as written, a sidecar-only restart), its read-only fence alternative, Hermes on a CSI volume |
 | `f8.yml` | every push and PR | ~5–6 min | F8 end to end on kind, each job on its own runner: a volume moved between two workers by the moving runbook, with the example git server as a pod (`ci/e2e-csi-move.sh`); the chart's own git server, `server.enabled` (`ci/e2e-chart-server.sh`) |
+| `phase-1.yml` | pushes and PRs touching `crates/`, `ci/`, `vendor/` or `Cargo.*`; the full sweep on a manual run only | ~8 min; manual ~80 min | the tree engine's phase 1: the model's calls at its regression seeds replayed on a fresh model, the library and real mounts, power loss, page cache, exhaustion. A manual run (`gh workflow run phase-1.yml`) is the full sweep: seeds 1..64 and the library at seeds 1 to 500 in four shards (`crates/agentfs-model/VERIFYING.md`, "Tiers") |
 | `power-loss.yml` | pushes to main (not docs-only), after landing | ~7 min | dm-log-writes replay on XFS and ext4 |
 | `bench.yml` | pushes to main (not docs-only), after landing | ~15–18 min | benchmarks on XFS and ext4, each in two parallel shards, against `ci/bench-budget.json` |
 
@@ -142,6 +145,7 @@ Rules:
 - Pin third-party actions by full commit SHA (`gh api repos/OWNER/REPO/commits/TAG --jq .sha`).
 - Pin runners to `ubuntu-24.04`, never the floating `-latest` label. A test (`workflows_pin_runners`) enforces this.
 - A change is done when the **ci** and **image** runs for your final pushed SHA are green. Wait for both: `gh run list -R mcurcio/agentfs --commit <sha>`, then `gh run watch <id> -R mcurcio/agentfs --exit-status`. Don't report success while either is still in progress.
+- Run the regression tier, never the full sweep, for a push or a slice: `cargo test` runs it, and so does `phase-1.yml` on a pull request. The full sweep (`AGENTFS_MODEL_SWEEP=1`, `ci/model-digest.sh check --all`, a manual `phase-1.yml`) is for a change to the model's rules or generator, run once at the end. The owner, 2026-11-13: "a test suite should run in seconds to minutes, not hours".
 - **bench** and **power-loss** run after the change lands on main and are checked afterwards (decided 2026-10-15). A bench budget warning or a power-loss failure is a follow-up to fix, not a reason to hold the change; report it.
 - Read failures with `gh run view <id> --log-failed`. A test that fails only sometimes is a broken test: find the mechanism, then fix the test or the product bug it exposes. Never rerun it as the fix, and never keep a list of tolerated flakes. The owner, 2026-10-18: "“Known flake” is not an acceptable category. Broken tests must be fixed".
 
@@ -160,7 +164,7 @@ Rules:
 ## The no-root toolchain
 
 Some agent containers have no root and no C compiler. Earlier sessions used:
-- **Rust:** stable via rustup.
+- **Rust:** rustup, which installs the release `rust-toolchain.toml` pins on first use ([development](docs/development.md#the-rust-toolchain)).
 - **C compiler:** Zig as the C compiler, through wrappers in `~/.local/bin`: `cc`, `c++`, `ar`, `ranlib`, and `gcc` as a symlink to `cc`. `cc` drops `--target` flags and runs `zig cc -target x86_64-linux-gnu.2.28 -fno-sanitize=undefined`, because libgit2's sha1dc trips UBSan.
 - **gh:** the static binary.
 - **Debian packages without root:**

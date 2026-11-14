@@ -9,11 +9,15 @@
 //! verdicts ([`Lines`]): undecided, verdicts, names (to a fixed point), placing
 //! (its joins), whole. A sync runs undecided, then placing, then names. The
 //! ancestry questions are asked through the port as the units need them.
+//!
+//! Land takes no direction: a transaction's commit into its fork and a fork's
+//! landing into its upstream are one pair, the change and the tree it lands in,
+//! under every landing rule (R3f, R10.11), so the referee cannot tell them apart.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::content::{Content, Edit, Line};
-use crate::world::{By, Direction};
+use crate::world::By;
 
 mod ancestry;
 mod names;
@@ -33,7 +37,6 @@ struct Referee<'a, L: Lineage + ?Sized> {
 /// One take's per-line verdicts (land): the change's versions by file, a verdict
 /// per (file, line identity), and the files that lost by a file rule.
 struct Lines<'i> {
-    dir: Direction,
     by_path: BTreeMap<&'i str, Vec<&'i Incoming>>,
     verdicts: BTreeMap<(String, String), Verdict>,
     by_file: BTreeSet<String>,
@@ -51,16 +54,16 @@ fn key(i: &Incoming) -> (String, String) {
 }
 
 /// Rules 3, 10 and 11 at the upstream's queue: one change (`incoming`, from
-/// commit `tip`) into the upstream's head `ours`.
+/// commit `tip`) into the upstream's head `ours`, a fork's landing and a
+/// transaction's commit alike.
 pub(crate) fn land<L: Lineage + ?Sized>(
     git: &L,
-    dir: Direction,
     ours: &str,
     incoming: &[Incoming],
     tip: &str,
 ) -> Plan {
     let r = Referee { git };
-    let mut lines = Lines::undecided(dir, incoming);
+    let mut lines = Lines::undecided(incoming);
     r.verdicts(ours, tip, &mut lines);
     r.names(ours, incoming, &mut lines);
     r.joins(ours, tip, &mut lines);

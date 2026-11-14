@@ -1,215 +1,349 @@
-//! Flat-file view of the target actor (git-model.md).
-//! Direct I/O and zero TTLs; no passthrough or writeback-cache negotiation.
-//! Shared mappings go through the kernel's page cache all the same, so a read
-//! with no lock owner is a page fill and a write with `FUSE_WRITE_CACHE` a page
-//! write; `agentfs_core::tree_actor`'s `pages` module holds their rules (R1.4).
+//! The view host (docs/library/filesystem.md, "The view host"): each view is
+//! a flat-file FUSE mount of one tree, reached only through its client's
+//! session (`agentfs_core::session`), so its calls name no tree and no
+//! writer. Direct I/O and zero TTLs; no passthrough or writeback-cache
+//! negotiation. Shared mappings go through the kernel's page cache all the
+//! same, so a read with no lock owner is a page fill and a write with
+//! `FUSE_WRITE_CACHE` a page write; `agentfs_core::tree_actor`'s `pages`
+//! module holds their rules (R1.4).
 
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::io;
-use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use agentfs_core::tree_actor::{Error, Saved, Volume};
+use agentfs_contracts::clients::{Access, Binding, FileOwner};
+use agentfs_contracts::views::{MountOptions, MountPoint, ViewError, ViewId, Views};
+use agentfs_core::session::{SessionGuard, Sessions, TreeSession};
+use agentfs_core::tree_actor::{Error, FileMap, Progress, Recording, Saved, TreeId};
 use fuser::*;
 
 const TTL: Duration = Duration::ZERO;
+/// Files listed per READDIR at most: more than a reply's buffer holds, and the
+/// kernel asks again from where a reply stopped.
+const READDIR_BATCH: usize = 1024;
 type Result<T> = std::result::Result<T, Errno>;
 
-/// Views in one process share one locked volume actor.
-pub struct Binding {
-    pub tree: String,
-    pub writer: String,
-    pub mountpoint: PathBuf,
+/// What the view host tells its owner, from its own threads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostEvent {
+    /// The view's mount is gone (unmounted, by `close` or from outside) and
+    /// its session joined: every file it had open is released.
+    ViewEnded(ViewId),
+    /// A take landed and the kernel's pages of the files it changed were
+    /// dropped.
+    Landed,
 }
 
-/// Mount until every view is unmounted. All mountpoints must be empty,
-/// outside the private state and separate from one another.
-pub fn serve(state: &Path, volume: Volume, bindings: Vec<Binding>) -> io::Result<()> {
-    serve_with_metrics(state, volume, bindings, None)
+/// Where each open view is mounted, and its kernel channel.
+struct Mounted {
+    at: PathBuf,
+    tree: TreeId,
+    notifier: Notifier,
+    /// `close` has asked the kernel to unmount it.
+    closing: bool,
 }
 
-/// Serve views with optional process-local measurement snapshots. The output
-/// belongs outside the state area and views; no measurement affects decisions.
-pub fn serve_with_metrics(
-    state: &Path,
-    volume: Volume,
-    bindings: Vec<Binding>,
-    metrics_output: Option<&Path>,
-) -> io::Result<()> {
-    let state = state.canonicalize()?;
-    let mut points: Vec<PathBuf> = Vec::new();
-    for binding in &bindings {
-        let at = binding.mountpoint.canonicalize()?;
-        if !at.is_dir()
-            || std::fs::read_dir(&at)?.next().is_some()
-            || at.starts_with(&state)
-            || state.starts_with(&at)
-            || points
-                .iter()
-                .any(|p| at.starts_with(p) || p.starts_with(&at))
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "trees mounts must be empty directories, separate from state and each other",
-            ));
-        }
-        volume.head(&binding.tree).map_err(io::Error::other)?;
-        if binding.writer.is_empty()
-            || binding.writer.chars().any(char::is_control)
-            || binding.writer.len() > 256
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "invalid tree writer",
-            ));
-        }
-        points.push(at);
-    }
-    let metrics_output = metrics_output
-        .map(|path| {
-            let filename = path.file_name().ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "metrics output needs a filename",
-                )
-            })?;
-            let parent = path
-                .parent()
-                .filter(|p| !p.as_os_str().is_empty())
-                .unwrap_or(Path::new("."));
-            let path = parent.canonicalize()?.join(filename);
-            if path.starts_with(&state) || points.iter().any(|at| path.starts_with(at)) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "metrics output must be outside state and views",
-                ));
-            }
-            Ok(path)
+type OpenViews = Arc<Mutex<BTreeMap<ViewId, Mounted>>>;
+
+fn open_views(views: &OpenViews) -> MutexGuard<'_, BTreeMap<ViewId, Mounted>> {
+    views.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Every open view's tree and channel, read out of the lock: invalidation can
+/// wait on a page fill.
+fn notifiers(views: &OpenViews) -> Vec<(TreeId, Notifier)> {
+    open_views(views)
+        .values()
+        .map(|view| (view.tree, view.notifier.clone()))
+        .collect()
+}
+
+/// The views of one served volume, and its take and metrics workers.
+pub struct ViewHost {
+    sessions: Sessions,
+    /// The state area, canonical: no view may be inside it or hold it.
+    state: PathBuf,
+    metrics_output: Option<PathBuf>,
+    notify: Arc<dyn Fn(HostEvent) + Send + Sync>,
+    views: OpenViews,
+    next: u64,
+    stop: Arc<AtomicBool>,
+    takes: JoinHandle<io::Result<()>>,
+    metrics: Option<JoinHandle<io::Result<()>>>,
+    /// Each view's thread: it joins the view's session, then `ViewEnded`.
+    joins: Vec<JoinHandle<()>>,
+}
+
+impl ViewHost {
+    /// Starts the take worker (takes one at a time, each decided off the
+    /// actor's lock, woken by built and failed events: never a timer) and,
+    /// with `metrics_output`, the metrics worker. `notify` runs on the host's
+    /// threads. The output belongs outside the state area and every view; no
+    /// measurement affects a decision.
+    ///
+    /// # Errors
+    ///
+    /// `InvalidInput` for a metrics output with no filename or inside the
+    /// state area; a failed thread spawn.
+    pub fn new(
+        sessions: Sessions,
+        state: &Path,
+        metrics_output: Option<&Path>,
+        notify: Arc<dyn Fn(HostEvent) + Send + Sync>,
+    ) -> io::Result<Self> {
+        let state = state.canonicalize()?;
+        let metrics_output = metrics_output
+            .map(|path| {
+                let filename = path.file_name().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "metrics output needs a filename",
+                    )
+                })?;
+                let parent = path
+                    .parent()
+                    .filter(|p| !p.as_os_str().is_empty())
+                    .unwrap_or(Path::new("."));
+                let path = parent.canonicalize()?.join(filename);
+                if path.starts_with(&state) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "metrics output must be outside state and views",
+                    ));
+                }
+                Ok(path)
+            })
+            .transpose()?;
+        let views = OpenViews::default();
+        let stop = Arc::new(AtomicBool::new(false));
+        let takes = {
+            let recording = Arc::clone(sessions.recording());
+            let (views, stop, notify) =
+                (Arc::clone(&views), Arc::clone(&stop), Arc::clone(&notify));
+            std::thread::Builder::new()
+                .name("tree-takes".into())
+                .spawn(move || take_worker(&recording, &views, &stop, &*notify))?
+        };
+        let metrics = metrics_output
+            .clone()
+            .map(|output| {
+                let recording = Arc::clone(sessions.recording());
+                let stop = Arc::clone(&stop);
+                std::thread::Builder::new()
+                    .name("tree-metrics".into())
+                    .spawn(move || metrics_worker(&recording, &output, &stop))
+            })
+            .transpose()?;
+        Ok(Self {
+            sessions,
+            state,
+            metrics_output,
+            notify,
+            views,
+            next: 1,
+            stop,
+            takes,
+            metrics,
+            joins: Vec::new(),
         })
-        .transpose()?;
-    let actor = Arc::new(Mutex::new(volume));
-    let signal = Arc::new(ProgressSignal::default());
-    let mut sessions = Vec::new();
-    let mut notifiers: Vec<(String, Notifier)> = Vec::new();
-    for (binding, at) in bindings.into_iter().zip(points) {
-        let tree = binding.tree.clone();
+    }
+
+    /// After every view ended: stops and joins the workers. Serving ends with
+    /// an error when the actor stopped (a failed journal fsync stops it off
+    /// any view's thread).
+    ///
+    /// # Errors
+    ///
+    /// A worker's error or panic; the actor's [`Error::Stopped`].
+    pub fn wait(self) -> io::Result<()> {
+        self.stop.store(true, Ordering::Release);
+        self.sessions.recording().wake_workers();
+        let takes = self
+            .takes
+            .join()
+            .map_err(|_| io::Error::other("queue worker panicked"))?;
+        let metrics = self
+            .metrics
+            .map(|worker| {
+                worker
+                    .join()
+                    .map_err(|_| io::Error::other("metrics worker panicked"))?
+            })
+            .transpose();
+        for join in self.joins {
+            join.join()
+                .map_err(|_| io::Error::other("a view's thread panicked"))?;
+        }
+        takes?;
+        metrics?;
+        drop(
+            self.sessions
+                .recording()
+                .actor()
+                .map_err(io::Error::other)?,
+        );
+        Ok(())
+    }
+
+    /// The mount point checks: an existing empty directory, outside the
+    /// state area, every open view and the metrics output, holding none of
+    /// them.
+    fn mount_point(&self, at: &MountPoint) -> Option<PathBuf> {
+        let at = at.0.canonicalize().ok()?;
+        let empty = std::fs::read_dir(&at).ok()?.next().is_none();
+        let apart = |other: &Path| !at.starts_with(other) && !other.starts_with(&at);
+        let separate = open_views(&self.views).values().all(|view| apart(&view.at));
+        let metrics_apart = self
+            .metrics_output
+            .as_ref()
+            .is_none_or(|output| !output.starts_with(&at));
+        (at.is_dir() && empty && apart(&self.state) && separate && metrics_apart).then_some(at)
+    }
+}
+
+impl Views for ViewHost {
+    /// Mounts `binding`'s session's tree at `at`, every file presented as its
+    /// grant's `acts_as`, read-only for a read-only grant. Never waits for
+    /// history: the tree must be among the actor's saved trees.
+    fn open(
+        &mut self,
+        at: MountPoint,
+        binding: Binding,
+        options: MountOptions,
+    ) -> std::result::Result<ViewId, ViewError> {
+        let session = self
+            .sessions
+            .session(binding.session)
+            .ok_or(ViewError::UnknownSession)?;
+        let at = self
+            .mount_point(&at)
+            .ok_or(ViewError::MountFailed(libc::EINVAL))?;
+        let saved = self
+            .sessions
+            .recording()
+            .actor()
+            .map_err(|e| ViewError::MountFailed(e.errno()))?
+            .trees()
+            .contains(&session.tree());
+        if !saved {
+            return Err(ViewError::MountFailed(libc::ENOENT));
+        }
+        let tree = session.tree();
+        let read_only = binding.grant.access() == Access::ReadOnly;
         let view = View {
-            actor: actor.clone(),
-            signal: Arc::clone(&signal),
-            tree: binding.tree,
-            writer: binding.writer,
-            handles: Mutex::new(Handles {
+            session,
+            owner: binding.grant.acts_as(),
+            handles: Arc::new(Mutex::new(Handles {
                 next: 1,
                 entries: BTreeMap::new(),
-            }),
+            })),
         };
-        let mut config = Config::default();
-        config.mount_options = vec![
-            MountOption::FSName("agentfs-trees".into()),
-            MountOption::DefaultPermissions,
-            MountOption::NoDev,
-            MountOption::NoSuid,
-            MountOption::RW,
-        ];
-        config.acl = SessionACL::Owner;
-        config.n_threads = Some(1);
-        let session = fuser::spawn_mount(view, at, &config)?;
-        notifiers.push((tree, session.notifier()));
-        sessions.push(session);
+        let mounted = fuser::spawn_mount(view, &at, &session_config(&options, read_only))
+            .map_err(|e| ViewError::MountFailed(e.raw_os_error().unwrap_or(libc::EIO)))?;
+        let id = ViewId(self.next);
+        self.next += 1;
+        open_views(&self.views).insert(
+            id,
+            Mounted {
+                at,
+                tree,
+                notifier: mounted.notifier(),
+                closing: false,
+            },
+        );
+        let (views, notify) = (Arc::clone(&self.views), Arc::clone(&self.notify));
+        let join = std::thread::Builder::new()
+            .name("tree-view".into())
+            .spawn(move || {
+                if let Err(e) = mounted.join() {
+                    eprintln!("tree ViewFailed: tree={tree}: {e}");
+                }
+                open_views(&views).remove(&id);
+                notify(HostEvent::ViewEnded(id));
+            })
+            .map_err(|e| ViewError::MountFailed(e.raw_os_error().unwrap_or(libc::EIO)))?;
+        self.joins.push(join);
+        Ok(id)
     }
-    let progress_actor = Arc::clone(&actor);
-    let progress_signal = Arc::clone(&signal);
-    let progress_worker = std::thread::spawn(move || -> io::Result<()> {
-        #[cfg(feature = "failpoints")]
-        if let Some(gate) = agentfs_core::failpoints::take_gate() {
-            return run_take_gate(gate, &progress_actor, &notifiers);
+
+    /// A lazy unmount (`fusermount3 -uz`): the mount leaves the namespace at
+    /// once and its files close as the kernel releases them. Idempotent.
+    fn close(&mut self, view: ViewId) {
+        let at = match open_views(&self.views).get_mut(&view) {
+            Some(mounted) if !mounted.closing => {
+                mounted.closing = true;
+                mounted.at.clone()
+            }
+            _ => return,
+        };
+        match std::process::Command::new("fusermount3")
+            .arg("-uz")
+            .arg(&at)
+            .status()
+        {
+            Ok(status) if status.success() => {}
+            Ok(status) => eprintln!("tree UnmountFailed: {}: {status}", at.display()),
+            Err(e) => eprintln!("tree UnmountFailed: {}: {e}", at.display()),
         }
-        loop {
-            {
-                let mut state = progress_signal
-                    .state
-                    .lock()
-                    .map_err(|_| io::Error::other("queue signal poisoned"))?;
-                while !state.pending && !state.stopped {
-                    state = progress_signal
-                        .changed
-                        .wait(state)
-                        .map_err(|_| io::Error::other("queue signal poisoned"))?;
-                }
-                if state.stopped {
-                    return Ok(());
-                }
-                state.pending = false;
-            }
-            loop {
-                let (progressed, changed) = {
-                    let mut volume = progress_actor
-                        .lock()
-                        .map_err(|_| io::Error::other("tree actor poisoned"))?;
-                    let progressed = volume.progress().map_err(io::Error::other)?;
-                    (progressed, volume.drain_changed())
-                };
-                // With the actor unlocked: invalidation can wait on a page fill.
-                invalidate_changed(&notifiers, &changed);
-                if !progressed {
-                    break;
-                }
-                // Release the actor between takes so new client opens can run.
-                std::thread::yield_now();
-            }
-        }
-    });
-    let stop = Arc::new(AtomicBool::new(false));
-    let metrics_worker = metrics_output.map(|output| {
-        let actor = Arc::clone(&actor);
-        let stop = Arc::clone(&stop);
-        std::thread::spawn(move || -> io::Result<()> {
-            loop {
-                let last = stop.load(Ordering::Acquire);
-                let metrics = actor
-                    .lock()
-                    .map_err(|_| io::Error::other("tree actor poisoned"))?
-                    .metrics();
-                let bytes = serde_json::to_vec(&metrics)?;
-                let temporary =
-                    output.with_extension(format!("metrics-{}.tmp", std::process::id()));
-                std::fs::write(&temporary, bytes)?;
-                std::fs::rename(&temporary, &output)?;
-                if last {
-                    return Ok(());
-                }
-                std::thread::sleep(Duration::from_millis(100));
-            }
-        })
-    });
-    let result = sessions.into_iter().try_for_each(|session| session.join());
-    {
-        let mut state = signal
-            .state
-            .lock()
-            .map_err(|_| io::Error::other("queue signal poisoned"))?;
-        state.stopped = true;
-        signal.changed.notify_one();
     }
-    stop.store(true, Ordering::Release);
-    let progress_result = progress_worker
-        .join()
-        .map_err(|_| io::Error::other("queue worker panicked"))?;
-    let metrics_result = metrics_worker
-        .map(|worker| {
-            worker
-                .join()
-                .map_err(|_| io::Error::other("metrics worker panicked"))?
-        })
-        .transpose();
-    result?;
-    progress_result?;
-    metrics_result?;
-    Ok(())
+}
+
+/// The take worker: takes one at a time, each decided off the actor's lock;
+/// after each landed take, the kernel's pages of what it changed dropped,
+/// then `Landed`. Woken by built and failed events (docs/trees.md, "Takes"),
+/// never a timer.
+fn take_worker(
+    recording: &Recording,
+    views: &OpenViews,
+    stop: &AtomicBool,
+    notify: &(dyn Fn(HostEvent) + Send + Sync),
+) -> io::Result<()> {
+    #[cfg(feature = "failpoints")]
+    if let Some(gate) = agentfs_core::failpoints::take_gate() {
+        return run_take_gate(gate, recording, views);
+    }
+    let mut epoch = 0;
+    loop {
+        if stop.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        while recording.progress().map_err(io::Error::other)? == Progress::Landed {
+            let changed = recording.drain_changed().map_err(io::Error::other)?;
+            // With the actor unlocked: invalidation can wait on a page fill.
+            invalidate_changed(&notifiers(views), &changed);
+            notify(HostEvent::Landed);
+        }
+        epoch = recording.wait_for_work(epoch);
+    }
+}
+
+/// Each file carries `seq`, one more than the last: a reader that saw `n`
+/// knows a file numbered `n + 2` was read after it.
+fn metrics_worker(recording: &Recording, output: &Path, stop: &AtomicBool) -> io::Result<()> {
+    let (mut seq, mut epoch) = (0_u64, 0);
+    loop {
+        let last = stop.load(Ordering::Acquire);
+        seq += 1;
+        let metrics = recording.actor().map_err(io::Error::other)?.metrics();
+        let mut written = serde_json::to_value(&metrics)?;
+        if let Some(fields) = written.as_object_mut() {
+            fields.insert("seq".into(), seq.into());
+        }
+        let bytes = serde_json::to_vec(&written)?;
+        let temporary = output.with_extension(format!("metrics-{}.tmp", std::process::id()));
+        std::fs::write(&temporary, bytes)?;
+        std::fs::rename(&temporary, output)?;
+        if last {
+            return Ok(());
+        }
+        // At each built or failed event, and every 100 ms between.
+        epoch = recording.wait_for_event_or(epoch, Duration::from_millis(100));
+    }
 }
 
 /// A test's takes in place of the worker's: one at each line (failpoints'
@@ -217,18 +351,24 @@ pub fn serve_with_metrics(
 #[cfg(feature = "failpoints")]
 fn run_take_gate(
     mut gate: agentfs_core::failpoints::TakeGate,
-    actor: &Mutex<Volume>,
-    notifiers: &[(String, Notifier)],
+    actor: &Recording,
+    views: &OpenViews,
 ) -> io::Result<()> {
     while let Some(tree) = gate.next_tree()? {
-        let (took, changed) = {
-            let mut volume = actor
-                .lock()
-                .map_err(|_| io::Error::other("tree actor poisoned"))?;
-            let took = volume.take_next(&tree);
-            (took, volume.drain_changed())
-        };
-        invalidate_changed(notifiers, &changed);
+        if tree == "settle" {
+            let answer = match actor.settle() {
+                Ok(_) => "settled".to_owned(),
+                Err(e) => format!("error {e}"),
+            };
+            gate.answer(&answer)?;
+            continue;
+        }
+        let took = tree
+            .parse::<TreeId>()
+            .map_err(|e| e.to_string())
+            .and_then(|tree| actor.take_next(tree).map_err(|e| e.to_string()));
+        let changed = actor.drain_changed().map_err(io::Error::other)?;
+        invalidate_changed(&notifiers(views), &changed);
         let answer = match took {
             Ok(agentfs_core::tree_actor::Took::Taken) => "taken".to_owned(),
             Ok(agentfs_core::tree_actor::Took::Waiting) => "waiting".to_owned(),
@@ -243,7 +383,7 @@ fn run_take_gate(
 /// Drops the kernel's pages of files a take changed. A file holds no dirty page
 /// then, because takes wait for write-opens. A failure leaves old pages in
 /// mappings and stops nothing: fills read the new bytes once they go.
-fn invalidate_changed(notifiers: &[(String, Notifier)], changed: &[(String, u64)]) {
+fn invalidate_changed(notifiers: &[(TreeId, Notifier)], changed: &[(TreeId, u64)]) {
     for (tree, object) in changed {
         for (_, notifier) in notifiers.iter().filter(|(name, _)| name == tree) {
             if let Err(e) = notifier.inval_inode(INodeNo(object + 2), 0, 0) {
@@ -253,124 +393,118 @@ fn invalidate_changed(notifiers: &[(String, Notifier)], changed: &[(String, u64)
     }
 }
 
+/// The fuser config for one view: FUSE `allow_other` (`SessionACL::All`) when
+/// `options.allow_other`, else the mounting user alone; permission checks by
+/// the kernel, no devices, no set-user-ID; read-only for a read-only client.
+fn session_config(options: &MountOptions, read_only: bool) -> Config {
+    let mut config = Config::default();
+    config.mount_options = vec![
+        MountOption::FSName("agentfs-trees".into()),
+        MountOption::DefaultPermissions,
+        MountOption::NoDev,
+        MountOption::NoSuid,
+        if read_only {
+            MountOption::RO
+        } else {
+            MountOption::RW
+        },
+    ];
+    config.acl = if options.allow_other {
+        SessionACL::All
+    } else {
+        SessionACL::Owner
+    };
+    config.n_threads = Some(1);
+    config
+}
+
+#[derive(Clone)]
 struct View {
-    actor: Arc<Mutex<Volume>>,
-    signal: Arc<ProgressSignal>,
-    tree: String,
-    writer: String,
-    handles: Mutex<Handles>,
+    session: TreeSession,
+    /// Every file's and directory's owner, until file metadata is recorded.
+    owner: FileOwner,
+    handles: Arc<Mutex<Handles>>,
 }
 
-struct ProgressState {
-    pending: bool,
-    stopped: bool,
-}
-
-struct ProgressSignal {
-    state: Mutex<ProgressState>,
-    changed: Condvar,
-}
-
-impl Default for ProgressSignal {
-    fn default() -> Self {
-        Self {
-            state: Mutex::new(ProgressState {
-                pending: true,
-                stopped: false,
-            }),
-            changed: Condvar::new(),
-        }
-    }
-}
-
-struct ActorGuard<'a> {
-    volume: MutexGuard<'a, Volume>,
-    signal: &'a ProgressSignal,
-    modified: bool,
-}
-
-impl Deref for ActorGuard<'_> {
-    type Target = Volume;
-    fn deref(&self) -> &Volume {
-        &self.volume
-    }
-}
-
-impl DerefMut for ActorGuard<'_> {
-    fn deref_mut(&mut self) -> &mut Volume {
-        self.modified = true;
-        &mut self.volume
-    }
-}
-
-impl Drop for ActorGuard<'_> {
-    fn drop(&mut self) {
-        if self.modified
-            && let Ok(mut state) = self.signal.state.lock()
-        {
-            state.pending = true;
-            self.signal.changed.notify_one();
-        }
-    }
-}
 struct Handles {
     next: u64,
     entries: BTreeMap<u64, Open>,
 }
 enum Open {
-    Read(Vec<u8>),
+    /// A read-only open's snapshot: the saved file's map at open, read with
+    /// the actor unlocked.
+    Read(FileMap),
     Write {
         handle: u64,
         append: bool,
         readable: bool,
+        /// `O_SYNC` or `O_DSYNC`: each write is durable before it is answered.
+        sync: bool,
     },
+}
+
+/// A write-open's actor handle; `None` for a read-only open.
+fn open_handle(open: &Open) -> Option<u64> {
+    match open {
+        Open::Write { handle, .. } => Some(*handle),
+        Open::Read(_) => None,
+    }
 }
 
 fn errno(error: Error) -> Errno {
     Errno::from_i32(error.errno())
 }
 
+/// Whether an open's writes must each be durable before they are answered.
+fn sync_flags(flags: i32) -> bool {
+    flags & (libc::O_SYNC | libc::O_DSYNC) != 0
+}
+
+/// A FLUSH, FSYNC or FSYNCDIR answered once its records are durable, from
+/// whichever thread the durability wait ends on.
+fn answer_empty(reply: ReplyEmpty) -> agentfs_core::tree_actor::Then {
+    Box::new(move |result| match result {
+        Ok(()) => reply.ok(),
+        Err(e) => reply.error(errno(e)),
+    })
+}
+
 impl View {
-    fn actor(&self) -> Result<ActorGuard<'_>> {
-        let v = self.actor.lock().map_err(|_| Errno::EIO)?;
-        if v.is_stopped() {
-            return Err(Errno::EIO);
-        }
-        Ok(ActorGuard {
-            volume: v,
-            signal: &self.signal,
-            modified: false,
-        })
+    /// Runs `call` once the lag gate admits new work in this view's tree: at
+    /// once on this thread, else on a gate thread, so a held tree holds no
+    /// other request (docs/trees.md, "History trails the files").
+    fn gated(&self, call: impl FnOnce(&View, Result<()>) + Send + 'static) {
+        let view = self.clone();
+        self.session.admit_then(Box::new(move |admitted| {
+            call(&view, admitted.map_err(errno));
+        }));
+    }
+
+    fn actor(&self) -> Result<SessionGuard<'_>> {
+        self.session.lock().map_err(|_| Errno::EIO)
     }
     fn handles(&self) -> Result<MutexGuard<'_, Handles>> {
         self.handles.lock().map_err(|_| Errno::EIO)
     }
-    fn path(&self, v: &Volume, ino: INodeNo) -> Result<String> {
-        v.files(&self.tree)
-            .map_err(errno)?
-            .into_iter()
-            .find(|(_, o, _)| *o + 2 == ino.0)
-            .map(|(p, _, _)| p)
-            .ok_or(Errno::ENOENT)
+    fn path(&self, v: &SessionGuard<'_>, ino: INodeNo) -> Result<String> {
+        let object = ino.0.checked_sub(2).ok_or(Errno::ENOENT)?;
+        v.path_of(object).map(str::to_owned).map_err(errno)
     }
-    fn attr(&self, v: &Volume, ino: INodeNo, fh: Option<FileHandle>) -> Result<FileAttr> {
+    fn attr(&self, v: &SessionGuard<'_>, ino: INodeNo, fh: Option<FileHandle>) -> Result<FileAttr> {
         // First: the kernel keeps one size per inode, and an unlinked mapped
         // file's fstat has no path.
-        let open_size = ino
-            .0
-            .checked_sub(2)
-            .and_then(|object| v.inode_size(&self.tree, object));
-        let size = if ino.0 == 1 {
+        let open_size = ino.0.checked_sub(2).and_then(|object| v.inode_size(object));
+        let size: u64 = if ino.0 == 1 {
             0
         } else if let Some(size) = open_size {
-            size as usize
+            size
         } else if let Some(fh) = fh {
             let handles = self.handles()?;
             match handles.entries.get(&fh.0).ok_or(Errno::EBADF)? {
                 Open::Read(bytes) => bytes.len(),
                 Open::Write { handle, .. } => v.read_open(*handle).map_err(errno)?.len(),
             }
-        } else if v.is_anonymous(&self.tree, ino.0 - 2).map_err(errno)? {
+        } else if v.is_anonymous(ino.0 - 2).map_err(errno)? {
             let handles = self.handles()?;
             let handle = handles
                 .entries
@@ -386,15 +520,13 @@ impl View {
                 .ok_or(Errno::ENOENT)?;
             v.read_open(handle).map_err(errno)?.len()
         } else {
-            v.read(&self.tree, &self.path(v, ino)?)
-                .map_err(errno)?
-                .len()
+            v.file_len(&self.path(v, ino)?).map_err(errno)?
         };
         let dir = ino.0 == 1;
         Ok(FileAttr {
             ino,
-            size: size as u64,
-            blocks: (size as u64).div_ceil(512),
+            size,
+            blocks: size.div_ceil(512),
             atime: UNIX_EPOCH,
             mtime: UNIX_EPOCH,
             ctime: UNIX_EPOCH,
@@ -407,19 +539,25 @@ impl View {
             perm: if dir { 0o700 } else { 0o600 },
             nlink: if dir {
                 2
-            } else if v.is_anonymous(&self.tree, ino.0 - 2).map_err(errno)? {
+            } else if v.is_anonymous(ino.0 - 2).map_err(errno)? {
                 0
             } else {
                 1
             },
-            uid: rustix::process::geteuid().as_raw(),
-            gid: rustix::process::getegid().as_raw(),
+            uid: self.owner.uid,
+            gid: self.owner.gid,
             rdev: 0,
             blksize: 4096,
             flags: 0,
         })
     }
-    fn open_file(&self, v: &mut Volume, path: &str, flags: i32, create: bool) -> Result<u64> {
+    fn open_file(
+        &self,
+        v: &mut SessionGuard<'_>,
+        path: &str,
+        flags: i32,
+        create: bool,
+    ) -> Result<u64> {
         let mut handles = self.handles()?;
         let write = flags & libc::O_ACCMODE != libc::O_RDONLY;
         if flags & libc::O_TRUNC != 0 && !write {
@@ -427,24 +565,23 @@ impl View {
         }
         let entry = if write {
             let handle = if flags & libc::O_TRUNC != 0 {
-                v.write_open_truncating(&self.tree, path, &self.writer, create)
+                v.write_open_truncating(path, create)
             } else {
-                v.write_open(&self.tree, path, &self.writer, create)
+                v.write_open(path, create)
             }
             .map_err(errno)?;
             Open::Write {
                 handle,
                 append: flags & libc::O_APPEND != 0,
                 readable: flags & libc::O_ACCMODE == libc::O_RDWR,
+                sync: sync_flags(flags),
             }
         } else {
             if create {
-                let h = v
-                    .write_open(&self.tree, path, &self.writer, true)
-                    .map_err(errno)?;
+                let h = v.write_open(path, true).map_err(errno)?;
                 v.close(h).map_err(errno)?;
             }
-            Open::Read(v.read(&self.tree, path).map_err(errno)?.to_vec())
+            Open::Read(v.file_map(path).map_err(errno)?)
         };
         let fh = handles.next;
         handles.next += 1;
@@ -457,7 +594,10 @@ impl View {
         if let Open::Write { handle, .. } = entry
             && v.close(handle).map_err(errno)? == Saved::OrphanDropped
         {
-            eprintln!("tree OrphanDropped: tree={} open={handle}", self.tree);
+            eprintln!(
+                "tree OrphanDropped: tree={} open={handle}",
+                self.session.tree()
+            );
         }
         Ok(())
     }
@@ -490,12 +630,7 @@ impl Filesystem for View {
             }
             let name = name.to_str().ok_or(Errno::EINVAL)?;
             let v = self.actor()?;
-            let (_, object, _) = v
-                .files(&self.tree)
-                .map_err(errno)?
-                .into_iter()
-                .find(|(p, _, _)| p == name)
-                .ok_or(Errno::ENOENT)?;
+            let object = v.object_at(name).map_err(errno)?;
             self.attr(&v, INodeNo(object + 2), None)
         })();
         match result {
@@ -510,14 +645,22 @@ impl Filesystem for View {
         }
     }
     fn open(&self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
-        let result = (|| {
-            let mut v = self.actor()?;
-            let path = self.path(&v, ino)?;
-            self.open_file(&mut v, &path, flags.0, false)
-        })();
-        match result {
-            Ok(fh) => reply.opened(FileHandle(fh), FopenFlags::FOPEN_DIRECT_IO),
-            Err(e) => reply.error(e),
+        let open = move |view: &View, admitted: Result<()>| {
+            let result = admitted.and_then(|()| {
+                let mut v = view.actor()?;
+                let path = view.path(&v, ino)?;
+                view.open_file(&mut v, &path, flags.0, false)
+            });
+            match result {
+                Ok(fh) => reply.opened(FileHandle(fh), FopenFlags::FOPEN_DIRECT_IO),
+                Err(e) => reply.error(e),
+            }
+        };
+        // A write-open starts new work, so the lag gate stands before it.
+        if flags.0 & libc::O_ACCMODE == libc::O_RDONLY {
+            open(self, Ok(()));
+        } else {
+            self.gated(open);
         }
     }
     fn create(
@@ -530,38 +673,37 @@ impl Filesystem for View {
         flags: i32,
         reply: ReplyCreate,
     ) {
-        let result = (|| {
-            if parent.0 != 1 {
-                return Err(Errno::ENOTDIR);
+        let name = name.to_owned();
+        self.gated(move |view, admitted| {
+            let result = admitted.and_then(|()| {
+                (|| {
+                    if parent.0 != 1 {
+                        return Err(Errno::ENOTDIR);
+                    }
+                    let path = name.to_str().ok_or(Errno::EINVAL)?;
+                    let mut v = view.actor()?;
+                    if flags & libc::O_EXCL != 0 && v.read(path).is_ok() {
+                        return Err(Errno::EEXIST);
+                    }
+                    let fh = view.open_file(&mut v, path, flags, true)?;
+                    let object = v.object_at(path).map_err(errno)?;
+                    Ok((
+                        fh,
+                        view.attr(&v, INodeNo(object + 2), Some(FileHandle(fh)))?,
+                    ))
+                })()
+            });
+            match result {
+                Ok((fh, attr)) => reply.created(
+                    &TTL,
+                    &attr,
+                    Generation(0),
+                    FileHandle(fh),
+                    FopenFlags::FOPEN_DIRECT_IO,
+                ),
+                Err(e) => reply.error(e),
             }
-            let path = name.to_str().ok_or(Errno::EINVAL)?;
-            let mut v = self.actor()?;
-            if flags & libc::O_EXCL != 0 && v.read(&self.tree, path).is_ok() {
-                return Err(Errno::EEXIST);
-            }
-            let fh = self.open_file(&mut v, path, flags, true)?;
-            let object = v
-                .files(&self.tree)
-                .map_err(errno)?
-                .into_iter()
-                .find(|(p, _, _)| p == path)
-                .ok_or(Errno::ENOENT)?
-                .1;
-            Ok((
-                fh,
-                self.attr(&v, INodeNo(object + 2), Some(FileHandle(fh)))?,
-            ))
-        })();
-        match result {
-            Ok((fh, attr)) => reply.created(
-                &TTL,
-                &attr,
-                Generation(0),
-                FileHandle(fh),
-                FopenFlags::FOPEN_DIRECT_IO,
-            ),
-            Err(e) => reply.error(e),
-        }
+        });
     }
     fn tmpfile(
         &self,
@@ -572,38 +714,43 @@ impl Filesystem for View {
         flags: i32,
         reply: ReplyCreate,
     ) {
-        let result = (|| {
-            if parent.0 != 1 {
-                return Err(Errno::ENOTDIR);
+        self.gated(move |view, admitted| {
+            let result = admitted.and_then(|()| {
+                (|| {
+                    if parent.0 != 1 {
+                        return Err(Errno::ENOTDIR);
+                    }
+                    let mut v = view.actor()?;
+                    let handle = v.anonymous_open().map_err(errno)?;
+                    let object = v.open_object(handle).map_err(errno)?;
+                    let mut handles = view.handles()?;
+                    let fh = handles.next;
+                    handles.next += 1;
+                    handles.entries.insert(
+                        fh,
+                        Open::Write {
+                            handle,
+                            append: flags & libc::O_APPEND != 0,
+                            readable: flags & libc::O_ACCMODE == libc::O_RDWR,
+                            sync: sync_flags(flags),
+                        },
+                    );
+                    drop(handles);
+                    let ino = INodeNo(object + 2);
+                    Ok((fh, view.attr(&v, ino, Some(FileHandle(fh)))?))
+                })()
+            });
+            match result {
+                Ok((fh, attr)) => reply.created(
+                    &TTL,
+                    &attr,
+                    Generation(0),
+                    FileHandle(fh),
+                    FopenFlags::FOPEN_DIRECT_IO,
+                ),
+                Err(e) => reply.error(e),
             }
-            let mut v = self.actor()?;
-            let handle = v.anonymous_open(&self.tree, &self.writer).map_err(errno)?;
-            let object = v.open_object(handle).map_err(errno)?;
-            let mut handles = self.handles()?;
-            let fh = handles.next;
-            handles.next += 1;
-            handles.entries.insert(
-                fh,
-                Open::Write {
-                    handle,
-                    append: flags & libc::O_APPEND != 0,
-                    readable: flags & libc::O_ACCMODE == libc::O_RDWR,
-                },
-            );
-            drop(handles);
-            let ino = INodeNo(object + 2);
-            Ok((fh, self.attr(&v, ino, Some(FileHandle(fh)))?))
-        })();
-        match result {
-            Ok((fh, attr)) => reply.created(
-                &TTL,
-                &attr,
-                Generation(0),
-                FileHandle(fh),
-                FopenFlags::FOPEN_DIRECT_IO,
-            ),
-            Err(e) => reply.error(e),
-        }
+        });
     }
     fn read(
         &self,
@@ -617,31 +764,37 @@ impl Filesystem for View {
         reply: ReplyData,
     ) {
         let result = (|| {
-            let mut v = self.actor()?;
-            // A descriptor read on direct I/O always names a lock owner; a page
-            // fill never does. Through `v.volume`: a fill changes nothing a take
-            // waits for, so it does not wake the queue worker.
-            if owner.is_none() {
-                let object = ino.0.checked_sub(2).ok_or(Errno::EBADF)?;
-                match v.volume.page_fill(&self.tree, object, offset, size) {
-                    Err(Error::NotFound) => {}
-                    filled => return filled.map_err(errno),
+            // The map is cloned under the locks and read after them: a read
+            // holds no other request (docs/trees.md, "File maps").
+            let map = {
+                let mut v = self.actor()?;
+                // A descriptor read on direct I/O always names a lock owner; a page
+                // fill never does.
+                if owner.is_none() {
+                    let object = ino.0.checked_sub(2).ok_or(Errno::EBADF)?;
+                    match v.page_fill(object, offset, size) {
+                        Err(Error::NotFound) => {}
+                        filled => return filled.map_err(errno),
+                    }
                 }
-            }
-            let handles = self.handles()?;
-            let bytes = match handles.entries.get(&fh.0).ok_or(Errno::EBADF)? {
-                Open::Read(bytes) => bytes.as_slice(),
-                Open::Write {
-                    handle,
-                    readable: true,
-                    ..
-                } => v.read_open(*handle).map_err(errno)?,
-                _ => return Err(Errno::EBADF),
+                let handles = self.handles()?;
+                match handles.entries.get(&fh.0).ok_or(Errno::EBADF)? {
+                    Open::Read(map) => map.clone(),
+                    Open::Write {
+                        handle,
+                        readable: true,
+                        ..
+                    } => v.read_open(*handle).map_err(errno)?.clone(),
+                    _ => return Err(Errno::EBADF),
+                }
             };
-            let start = usize::try_from(offset)
-                .unwrap_or(usize::MAX)
-                .min(bytes.len());
-            Ok(bytes[start..start.saturating_add(size as usize).min(bytes.len())].to_vec())
+            let wanted = u64::from(size).min(map.len().saturating_sub(offset));
+            let mut bytes = vec![0; usize::try_from(wanted).map_err(|_| Errno::EFBIG)?];
+            let read = map
+                .read(offset, &mut bytes)
+                .map_err(|e| Errno::from_i32(e.raw_os_error().unwrap_or(libc::EIO)))?;
+            bytes.truncate(read);
+            Ok(bytes)
         })();
         match result {
             Ok(bytes) => reply.data(&bytes),
@@ -660,23 +813,39 @@ impl Filesystem for View {
         _owner: Option<LockOwner>,
         reply: ReplyWrite,
     ) {
+        // The guards drop before a durability wait is queued.
         let result = (|| {
             let mut v = self.actor()?;
             let handles = self.handles()?;
             match handles.entries.get(&fh.0).ok_or(Errno::EBADF)? {
-                Open::Write { handle, .. }
+                Open::Write { handle, sync, .. }
                     if write_flags.contains(WriteFlags::FUSE_WRITE_CACHE) =>
                 {
-                    v.page_writeback(*handle, offset, data).map_err(errno)
+                    v.page_writeback(*handle, offset, data).map_err(errno)?;
+                    Ok(sync.then_some(*handle))
                 }
-                Open::Write { handle, append, .. } => {
-                    v.write(*handle, offset, data, *append).map_err(errno)
+                Open::Write {
+                    handle,
+                    append,
+                    sync,
+                    ..
+                } => {
+                    v.write(*handle, offset, data, *append).map_err(errno)?;
+                    Ok(sync.then_some(*handle))
                 }
                 _ => Err(Errno::EBADF),
             }
         })();
+        let written = data.len() as u32;
         match result {
-            Ok(()) => reply.written(data.len() as u32),
+            Ok(None) => reply.written(written),
+            Ok(Some(handle)) => self.session.durable_then(
+                handle,
+                Box::new(move |result| match result {
+                    Ok(()) => reply.written(written),
+                    Err(e) => reply.error(errno(e)),
+                }),
+            ),
             Err(e) => reply.error(e),
         }
     }
@@ -698,62 +867,107 @@ impl Filesystem for View {
         _flags: Option<BsdFileFlags>,
         reply: ReplyAttr,
     ) {
-        let result = (|| {
-            if mode.is_some()
-                || uid.is_some()
-                || gid.is_some()
-                || atime.is_some()
-                || mtime.is_some()
-            {
-                return Err(Errno::EOPNOTSUPP);
-            }
-            let mut v = self.actor()?;
-            if let Some(size) = size {
-                if let Some(fh) = fh {
-                    let handles = self.handles()?;
-                    match handles.entries.get(&fh.0).ok_or(Errno::EBADF)? {
-                        Open::Write { handle, .. } => v.truncate(*handle, size).map_err(errno)?,
-                        _ => return Err(Errno::EBADF),
+        let setattr = move |view: &View, admitted: Result<()>| {
+            let result = admitted.and_then(|()| {
+                (|| {
+                    if mode.is_some()
+                        || uid.is_some()
+                        || gid.is_some()
+                        || atime.is_some()
+                        || mtime.is_some()
+                    {
+                        return Err(Errno::EOPNOTSUPP);
                     }
-                } else {
-                    let path = self.path(&v, ino)?;
-                    let h = v
-                        .write_open(&self.tree, &path, &self.writer, false)
-                        .map_err(errno)?;
-                    let result = v.truncate(h, size).map_err(errno);
-                    v.close(h).map_err(errno)?;
-                    result?;
-                }
+                    let mut v = view.actor()?;
+                    if let Some(size) = size {
+                        if let Some(fh) = fh {
+                            let handles = view.handles()?;
+                            match handles.entries.get(&fh.0).ok_or(Errno::EBADF)? {
+                                Open::Write { handle, .. } => {
+                                    v.truncate(*handle, size).map_err(errno)?
+                                }
+                                _ => return Err(Errno::EBADF),
+                            }
+                        } else {
+                            let path = view.path(&v, ino)?;
+                            let h = v.write_open(&path, false).map_err(errno)?;
+                            let result = v.truncate(h, size).map_err(errno);
+                            v.close(h).map_err(errno)?;
+                            result?;
+                        }
+                    }
+                    view.attr(&v, ino, fh)
+                })()
+            });
+            match result {
+                Ok(attr) => reply.attr(&TTL, &attr),
+                Err(e) => reply.error(e),
             }
-            self.attr(&v, ino, fh)
-        })();
-        match result {
-            Ok(attr) => reply.attr(&TTL, &attr),
-            Err(e) => reply.error(e),
+        };
+        // A path truncate is a write-open, a truncate and a close: new work.
+        if size.is_some() && fh.is_none() {
+            self.gated(setattr);
+        } else {
+            setattr(self, Ok(()));
         }
     }
+    /// close(2): the open's records made durable before close returns. The
+    /// fsync runs off this thread; the reply comes when it ends.
     fn flush(
         &self,
         _req: &Request,
         _ino: INodeNo,
-        _fh: FileHandle,
+        fh: FileHandle,
         _owner: LockOwner,
         reply: ReplyEmpty,
     ) {
-        match self.actor().and_then(|v| v.sync().map_err(errno)) {
-            Ok(()) => reply.ok(),
-            Err(e) => reply.error(e),
+        let handle = match self
+            .handles()
+            .map(|h| h.entries.get(&fh.0).map(open_handle))
+        {
+            Ok(Some(handle)) => handle,
+            Ok(None) => return reply.error(Errno::EBADF),
+            Err(e) => return reply.error(e),
+        };
+        match handle {
+            Some(handle) => self.session.durable_then(handle, answer_empty(reply)),
+            None => reply.ok(),
         }
     }
+    /// A write-open's records made durable; a read-only descriptor's fsync
+    /// makes every record durable, as FSYNCDIR does.
     fn fsync(
         &self,
-        req: &Request,
-        ino: INodeNo,
+        _req: &Request,
+        _ino: INodeNo,
         fh: FileHandle,
         _datasync: bool,
         reply: ReplyEmpty,
     ) {
-        self.flush(req, ino, fh, LockOwner(0), reply);
+        let handle = match self
+            .handles()
+            .map(|h| h.entries.get(&fh.0).map(open_handle))
+        {
+            Ok(Some(handle)) => handle,
+            Ok(None) => return reply.error(Errno::EBADF),
+            Err(e) => return reply.error(e),
+        };
+        match handle {
+            Some(handle) => self.session.durable_then(handle, answer_empty(reply)),
+            None => self.session.durable_all_then(answer_empty(reply)),
+        }
+    }
+    /// The directory's names: every record durable (renames, unlinks and
+    /// creates included).
+    fn fsyncdir(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        _fh: FileHandle,
+        _datasync: bool,
+        reply: ReplyEmpty,
+    ) {
+        self.session.durable_all_then(answer_empty(reply));
     }
     fn release(
         &self,
@@ -770,54 +984,55 @@ impl Filesystem for View {
             Err(e) => {
                 eprintln!(
                     "tree SaveFailed: tree={} errno={e:?}; preserve state and restart",
-                    self.tree
+                    self.session.tree()
                 );
                 reply.error(e);
             }
         }
     }
     fn link(&self, _req: &Request, ino: INodeNo, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
-        let result = (|| {
-            if parent.0 != 1 {
-                return Err(Errno::ENOTDIR);
+        let name = name.to_owned();
+        self.gated(move |view, admitted| {
+            let result = admitted.and_then(|()| {
+                (|| {
+                    if parent.0 != 1 {
+                        return Err(Errno::ENOTDIR);
+                    }
+                    let object = ino.0.checked_sub(2).ok_or(Errno::ENOENT)?;
+                    let mut v = view.actor()?;
+                    // Existing named-object hard links retain fuser's default EPERM.
+                    if !v.is_anonymous(object).map_err(errno)? {
+                        return Err(Errno::EPERM);
+                    }
+                    v.first_link(object, name.to_str().ok_or(Errno::EINVAL)?)
+                        .map_err(errno)?;
+                    view.attr(&v, ino, None)
+                })()
+            });
+            match result {
+                Ok(attr) => reply.entry(&TTL, &attr, Generation(0)),
+                Err(e) => reply.error(e),
             }
-            let object = ino.0.checked_sub(2).ok_or(Errno::ENOENT)?;
-            let mut v = self.actor()?;
-            // Existing named-object hard links retain fuser's default EPERM.
-            if !v.is_anonymous(&self.tree, object).map_err(errno)? {
-                return Err(Errno::EPERM);
-            }
-            v.first_link(
-                &self.tree,
-                object,
-                name.to_str().ok_or(Errno::EINVAL)?,
-                &self.writer,
-            )
-            .map_err(errno)?;
-            self.attr(&v, ino, None)
-        })();
-        match result {
-            Ok(attr) => reply.entry(&TTL, &attr, Generation(0)),
-            Err(e) => reply.error(e),
-        }
+        });
     }
     fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
-        let result = (|| {
-            if parent.0 != 1 {
-                return Err(Errno::ENOTDIR);
+        let name = name.to_owned();
+        self.gated(move |view, admitted| {
+            let result = admitted.and_then(|()| {
+                (|| {
+                    if parent.0 != 1 {
+                        return Err(Errno::ENOTDIR);
+                    }
+                    view.actor()?
+                        .unlink(name.to_str().ok_or(Errno::EINVAL)?)
+                        .map_err(errno)
+                })()
+            });
+            match result {
+                Ok(()) => reply.ok(),
+                Err(e) => reply.error(e),
             }
-            self.actor()?
-                .unlink(
-                    &self.tree,
-                    name.to_str().ok_or(Errno::EINVAL)?,
-                    &self.writer,
-                )
-                .map_err(errno)
-        })();
-        match result {
-            Ok(()) => reply.ok(),
-            Err(e) => reply.error(e),
-        }
+        });
     }
     fn rename(
         &self,
@@ -829,26 +1044,29 @@ impl Filesystem for View {
         flags: RenameFlags,
         reply: ReplyEmpty,
     ) {
-        let result = (|| {
-            if parent.0 != 1 || newparent.0 != 1 {
-                return Err(Errno::ENOTDIR);
+        let (name, newname) = (name.to_owned(), newname.to_owned());
+        self.gated(move |view, admitted| {
+            let result = admitted.and_then(|()| {
+                (|| {
+                    if parent.0 != 1 || newparent.0 != 1 {
+                        return Err(Errno::ENOTDIR);
+                    }
+                    if !flags.is_empty() {
+                        return Err(Errno::EOPNOTSUPP);
+                    }
+                    view.actor()?
+                        .rename(
+                            name.to_str().ok_or(Errno::EINVAL)?,
+                            newname.to_str().ok_or(Errno::EINVAL)?,
+                        )
+                        .map_err(errno)
+                })()
+            });
+            match result {
+                Ok(()) => reply.ok(),
+                Err(e) => reply.error(e),
             }
-            if !flags.is_empty() {
-                return Err(Errno::EOPNOTSUPP);
-            }
-            self.actor()?
-                .rename(
-                    &self.tree,
-                    name.to_str().ok_or(Errno::EINVAL)?,
-                    newname.to_str().ok_or(Errno::EINVAL)?,
-                    &self.writer,
-                )
-                .map_err(errno)
-        })();
-        match result {
-            Ok(()) => reply.ok(),
-            Err(e) => reply.error(e),
-        }
+        });
     }
     fn readdir(
         &self,
@@ -863,23 +1081,26 @@ impl Filesystem for View {
                 return Err(Errno::ENOTDIR);
             }
             let v = self.actor()?;
-            let mut entries = vec![
-                (INodeNo(1), FileType::Directory, ".".to_owned()),
-                (INodeNo(1), FileType::Directory, "..".to_owned()),
-            ];
+            // `.` and `..` are entries 0 and 1, the files 2 on: an offset is
+            // the number of entries already read.
+            let skip = usize::try_from(offset).map_err(|_| Errno::EINVAL)?;
+            let mut entries: Vec<(INodeNo, FileType, String)> = [".", ".."]
+                .into_iter()
+                .skip(skip)
+                .map(|name| (INodeNo(1), FileType::Directory, name.to_owned()))
+                .collect();
             entries.extend(
-                v.files(&self.tree)
+                v.files_from(skip.saturating_sub(2), READDIR_BATCH)
                     .map_err(errno)?
                     .into_iter()
-                    .map(|(p, o, _)| (INodeNo(o + 2), FileType::RegularFile, p)),
+                    .map(|(p, o)| (INodeNo(o + 2), FileType::RegularFile, p)),
             );
-            Ok(entries)
+            Ok((skip, entries))
         })();
         match result {
-            Ok(entries) => {
-                for (i, (ino, kind, name)) in entries.into_iter().enumerate().skip(offset as usize)
-                {
-                    if reply.add(ino, (i + 1) as u64, kind, name) {
+            Ok((skip, entries)) => {
+                for (i, (ino, kind, name)) in entries.into_iter().enumerate() {
+                    if reply.add(ino, (skip + i + 1) as u64, kind, name) {
                         break;
                     }
                 }
@@ -893,51 +1114,139 @@ impl Filesystem for View {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agentfs_contracts::caps::{ClientCap, Minter};
+    use agentfs_contracts::clients::{ClientId, Consistency, Grant, Ordinal, SessionId};
+    use agentfs_contracts::name::{ClientLabel, LauncherId, VolumeName};
+    use agentfs_contracts::pod::{PodContext, WriterAt};
+    use agentfs_contracts::ports::{SessionAuthority, SessionBinder};
+    use agentfs_contracts::volume::{VolumeId, VolumeIdentity};
+
+    fn new_actor(dir: &Path) -> Arc<Recording> {
+        let identity = VolumeIdentity {
+            name: VolumeName::parse("test").unwrap(),
+            id: VolumeId(uuid::Uuid::from_u128(1)),
+        };
+        Recording::create(dir, &identity, &PodContext::default()).unwrap()
+    }
+
+    const OWNER: FileOwner = FileOwner {
+        uid: 10000,
+        gid: 10001,
+    };
+
+    /// A session bound to write the root as client `label`.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "a test is its own composition root"
+    )]
+    fn writing(sessions: &mut Sessions, label: &str) -> TreeSession {
+        let client = ClientId {
+            launcher: LauncherId::parse("cli").unwrap(),
+            tree: TreeId::Root,
+            label: ClientLabel::parse(label).unwrap(),
+            n: Ordinal(1),
+        };
+        let writes_as = WriterAt {
+            writer: client.writer(),
+            at: PodContext::default(),
+        };
+        let id = sessions.open();
+        let cap = ClientCap::mint(&Minter::new(), client, TreeId::Root, writes_as);
+        sessions.bind(id, SessionAuthority::Write(cap));
+        sessions.session(id).unwrap()
+    }
+
+    fn view(session: TreeSession) -> View {
+        View {
+            session,
+            owner: OWNER,
+            handles: Arc::new(Mutex::new(Handles {
+                next: 1,
+                entries: BTreeMap::new(),
+            })),
+        }
+    }
+
+    fn host(sessions: &Sessions, state: &Path) -> ViewHost {
+        ViewHost::new(sessions.clone(), state, None, Arc::new(|_| {})).unwrap()
+    }
+
+    fn binding(session: SessionId, tree: TreeId) -> Binding {
+        Binding {
+            client: ClientId {
+                launcher: LauncherId::parse("cli").unwrap(),
+                tree,
+                label: ClientLabel::parse("c").unwrap(),
+                n: Ordinal(1),
+            },
+            session,
+            grant: Grant::live_read_only(tree, Consistency::PerFile, OWNER),
+        }
+    }
 
     #[test]
-    fn all_bindings_are_checked_before_any_mount_can_expose_state() {
-        for invalid in ["state", "state/inside", "."] {
-            let tmp = tempfile::tempdir().unwrap();
-            let state = tmp.path().join("state");
-            let volume = Volume::open(&state).unwrap();
-            let outside = tmp.path().join("valid");
-            std::fs::create_dir(&outside).unwrap();
+    fn session_config_allows_other_by_default() {
+        let config = session_config(&MountOptions { allow_other: true }, false);
+        assert_eq!(config.acl, SessionACL::All);
+        assert!(
+            config
+                .mount_options
+                .contains(&MountOption::DefaultPermissions)
+        );
+        assert!(config.mount_options.contains(&MountOption::RW));
+        let config = session_config(&MountOptions { allow_other: false }, true);
+        assert_eq!(config.acl, SessionACL::Owner);
+        assert!(config.mount_options.contains(&MountOption::RO));
+    }
+
+    /// A view is refused before any mount: an unbound session, a mount point
+    /// that would expose the state area, and a tree the actor has not saved.
+    #[test]
+    fn every_view_is_checked_before_its_mount_can_expose_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path().join("state");
+        let mut sessions = Sessions::new(new_actor(&state));
+        let mut host = host(&sessions, &state);
+        let options = MountOptions { allow_other: true };
+        let outside = tmp.path().join("valid");
+        std::fs::create_dir(&outside).unwrap();
+        let unbound = sessions.open();
+        assert_eq!(
+            host.open(
+                MountPoint(outside.clone()),
+                binding(unbound, TreeId::Root),
+                options
+            ),
+            Err(ViewError::UnknownSession)
+        );
+        let root = sessions.open();
+        sessions.bind(root, SessionAuthority::Read(TreeId::Root));
+        for invalid in ["state", "state/inside", ".", "missing"] {
             let invalid = tmp.path().join(invalid);
-            std::fs::create_dir_all(&invalid).unwrap();
-            let bindings = vec![
-                Binding {
-                    tree: "main".into(),
-                    writer: "main".into(),
-                    mountpoint: outside,
-                },
-                Binding {
-                    tree: "main".into(),
-                    writer: "other".into(),
-                    mountpoint: invalid,
-                },
-            ];
+            if !invalid.ends_with("missing") {
+                std::fs::create_dir_all(&invalid).unwrap();
+            }
             assert_eq!(
-                serve(&state, volume, bindings).unwrap_err().kind(),
-                io::ErrorKind::InvalidInput
+                host.open(MountPoint(invalid), binding(root, TreeId::Root), options),
+                Err(ViewError::MountFailed(libc::EINVAL))
             );
         }
+        let fork = sessions.open();
+        sessions.bind(fork, SessionAuthority::Read(TreeId::Fork(9)));
+        assert_eq!(
+            host.open(MountPoint(outside), binding(fork, TreeId::Fork(9)), options),
+            Err(ViewError::MountFailed(libc::ENOENT))
+        );
+        host.wait().unwrap();
     }
 
     #[test]
     fn anonymous_inode_attributes_are_available_without_a_file_handle() {
         let tmp = tempfile::tempdir().unwrap();
-        let view = View {
-            actor: Arc::new(Mutex::new(Volume::open(tmp.path()).unwrap())),
-            signal: Arc::new(ProgressSignal::default()),
-            tree: "main".into(),
-            writer: "client".into(),
-            handles: Mutex::new(Handles {
-                next: 2,
-                entries: BTreeMap::new(),
-            }),
-        };
+        let mut sessions = Sessions::new(new_actor(tmp.path()));
+        let view = view(writing(&mut sessions, "client"));
         let mut volume = view.actor().unwrap();
-        let handle = volume.anonymous_open("main", "client").unwrap();
+        let handle = volume.anonymous_open().unwrap();
         let ino = INodeNo(volume.open_object(handle).unwrap() + 2);
         volume.write(handle, 0, b"private", false).unwrap();
         view.handles().unwrap().entries.insert(
@@ -946,46 +1255,59 @@ mod tests {
                 handle,
                 append: false,
                 readable: true,
+                sync: false,
             },
         );
         let attr = view.attr(&volume, ino, None).unwrap();
         assert_eq!(attr.size, 7);
         assert_eq!(attr.nlink, 0);
+        assert_eq!((attr.uid, attr.gid), (OWNER.uid, OWNER.gid));
     }
 
     #[test]
     fn a_readers_snapshot_survives_a_later_save_and_readonly_truncation_is_refused() {
         let tmp = tempfile::tempdir().unwrap();
-        let view = View {
-            actor: Arc::new(Mutex::new(Volume::open(tmp.path()).unwrap())),
-            signal: Arc::new(ProgressSignal::default()),
-            tree: "main".into(),
-            writer: "client".into(),
-            handles: Mutex::new(Handles {
-                next: 1,
-                entries: BTreeMap::new(),
-            }),
-        };
+        let mut sessions = Sessions::new(new_actor(tmp.path()));
+        let view = view(writing(&mut sessions, "client"));
         let mut volume = view.actor().unwrap();
-        let h = volume.write_open("main", "a", "seed", true).unwrap();
+        let h = volume.write_open("a", true).unwrap();
         volume.write(h, 0, b"old", false).unwrap();
         volume.close(h).unwrap();
         let reader = view
             .open_file(&mut volume, "a", libc::O_RDONLY, false)
             .unwrap();
-        let h = volume.write_open("main", "a", "next", false).unwrap();
+        let h = volume.write_open("a", false).unwrap();
         volume.truncate(h, 0).unwrap();
         volume.write(h, 0, b"new", false).unwrap();
         volume.close(h).unwrap();
-        assert_eq!(volume.read("main", "a").unwrap(), b"new");
+        assert_eq!(volume.read("a").unwrap(), b"new");
         match &view.handles().unwrap().entries[&reader] {
-            Open::Read(bytes) => assert_eq!(bytes, b"old"),
+            Open::Read(map) => assert_eq!(map.to_vec().unwrap(), b"old"),
             _ => panic!("read-only open acquired a writer"),
         }
         assert_eq!(
             view.open_file(&mut volume, "a", libc::O_RDONLY | libc::O_TRUNC, false),
             Err(Errno::EACCES)
         );
-        assert_eq!(volume.read("main", "a").unwrap(), b"new");
+        assert_eq!(volume.read("a").unwrap(), b"new");
+    }
+
+    /// A read-only client's view answers `EROFS` to every write, whatever the
+    /// kernel lets through.
+    #[test]
+    fn a_read_only_view_refuses_writes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut sessions = Sessions::new(new_actor(tmp.path()));
+        let id = sessions.open();
+        sessions.bind(id, SessionAuthority::Read(TreeId::Root));
+        let view = view(sessions.session(id).unwrap());
+        let mut volume = view.actor().unwrap();
+        for flags in [libc::O_WRONLY, libc::O_RDWR, libc::O_RDONLY] {
+            assert_eq!(
+                view.open_file(&mut volume, "a", flags, true),
+                Err(Errno::EROFS)
+            );
+        }
+        assert_eq!(volume.anonymous_open().map_err(errno), Err(Errno::EROFS));
     }
 }

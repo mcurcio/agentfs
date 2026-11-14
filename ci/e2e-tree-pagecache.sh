@@ -23,9 +23,8 @@ wait_mounted() {
   mountpoint -q "$1"
 }
 mkdir "$work/main" "$work/sandbox"
-"$bin" --state "$work/state" trees init
-fork=$("$bin" --state "$work/state" trees fork)
-"$bin" --state "$work/state" trees mount "$work/main" --sandbox "$work/sandbox" --fork "$fork" >"$work/mount.log" 2>&1 & pid=$!
+"$bin" --state "$work/state" trees init --volume t
+"$bin" --state "$work/state" trees mount "$work/main" --fork-mount "$work/sandbox" >"$work/mount.log" 2>&1 & pid=$!
 wait_mounted "$work/main"
 wait_mounted "$work/sandbox"
 result=0
@@ -37,7 +36,7 @@ wait "$pid"; pid=
 git --git-dir="$work/state/history.git" fsck --strict
 
 # A sandbox's takes would hold the actor too: this runs against the saves alone.
-"$bin" --state "$work/close-open" trees init
+"$bin" --state "$work/close-open" trees init --volume t
 "$bin" --state "$work/close-open" trees mount "$work/main" >>"$work/mount.log" 2>&1 & pid=$!
 wait_mounted "$work/main"
 python3 ci/trees-close-open.py "$work/main" || result=$?

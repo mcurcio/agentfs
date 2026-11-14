@@ -57,18 +57,21 @@ mod control;
 mod daemon;
 #[cfg(test)]
 mod doc_tables;
+mod domain_events;
 mod fork_cmd;
 mod front;
 mod hold;
 mod lfs_cmd;
 mod otel;
 mod patch_cmd;
+mod pod_args;
 mod push_now;
 mod recovery;
 #[cfg(test)]
 mod reference_tests;
 mod serve_git;
 mod serve_history;
+mod shared;
 mod start_cmd;
 mod trees_cmd;
 
@@ -379,14 +382,8 @@ fn parse_grace(value: &str) -> Result<Duration, String> {
 /// API.
 #[derive(Args, Default)]
 struct Pod {
-    #[arg(long, env = "AGENTFS_NAMESPACE", default_value = "")]
-    namespace: String,
-    #[arg(long, env = "AGENTFS_POD", default_value = "")]
-    pod: String,
-    #[arg(long, env = "AGENTFS_POD_UID", default_value = "")]
-    pod_uid: String,
-    #[arg(long, env = "AGENTFS_NODE", default_value = "")]
-    node: String,
+    #[command(flatten)]
+    args: pod_args::PodArgs,
     /// Committer identity's `{replica}` (default: the pod name, else the
     /// host name).
     #[arg(long, env = "AGENTFS_REPLICA")]
@@ -399,18 +396,18 @@ impl Pod {
             .replica
             .clone()
             .filter(|r| !r.is_empty())
-            .or_else(|| (!self.pod.is_empty()).then(|| self.pod.clone()))
+            .or_else(|| (!self.args.pod.is_empty()).then(|| self.args.pod.clone()))
             .unwrap_or_else(hostname);
         Context {
             volume: volume.to_owned(),
-            namespace: self.namespace.clone(),
-            pod: self.pod.clone(),
-            pod_uid: if self.pod_uid.is_empty() {
+            namespace: self.args.namespace.clone(),
+            pod: self.args.pod.clone(),
+            pod_uid: if self.args.pod_uid.is_empty() {
                 replica.clone()
             } else {
-                self.pod_uid.clone()
+                self.args.pod_uid.clone()
             },
-            node: self.node.clone(),
+            node: self.args.node.clone(),
             replica,
         }
     }
@@ -450,7 +447,13 @@ fn real_main() -> Result<ExitCode> {
             if cli.root.is_some() || !cli.wait_lock.is_zero() {
                 bail!("trees uses --state only; --root and --wait-lock are not supported");
             }
-            trees_cmd::run(&cli.state, args)?;
+            // The composition root: the one place capabilities are minted.
+            #[allow(
+                clippy::disallowed_methods,
+                reason = "the composition root mints capabilities"
+            )]
+            let minter = agentfs_contracts::caps::Minter::new();
+            return trees_cmd::run(&cli.state, args, minter);
         }
         Command::Init {
             volume,
@@ -1709,7 +1712,7 @@ fn mount(
     // and no stale mount is below this one; otherwise it is judged and
     // waits. A blocked queue is an alarm; the volume mounts anyway, and so
     // it does when the queue cannot run at all.
-    let scope = PodScope::of(&args.pod.pod_uid, &mountpoint);
+    let scope = PodScope::of(&args.pod.args.pod_uid, &mountpoint);
     let deferred = if any_stacked {
         Some(Deferred::StaleMount)
     } else {
@@ -2139,4 +2142,37 @@ fn current_uid() -> u32 {
 
 fn current_gid() -> u32 {
     std::fs::metadata("/proc/self").map_or(0, |m| std::os::unix::fs::MetadataExt::gid(&m))
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::Cli;
+    use clap::CommandFactory;
+
+    /// Clap stores a value by arg id, so a subcommand arg sharing an id with
+    /// a global arg sends its value to the global one. No id may be shared.
+    #[test]
+    fn no_subcommand_arg_shares_a_global_id() {
+        fn walk(cmd: &clap::Command, path: &str, globals: &[String], clashes: &mut Vec<String>) {
+            for sub in cmd.get_subcommands() {
+                let path = format!("{path} {}", sub.get_name());
+                for arg in sub.get_arguments().filter(|a| !a.is_global_set()) {
+                    if globals.iter().any(|g| g == arg.get_id().as_str()) {
+                        clashes.push(format!("{path}: {}", arg.get_id()));
+                    }
+                }
+                walk(sub, &path, globals, clashes);
+            }
+        }
+        let cli = Cli::command();
+        let globals: Vec<String> = cli
+            .get_arguments()
+            .filter(|a| a.is_global_set())
+            .map(|a| a.get_id().to_string())
+            .collect();
+        assert!(globals.contains(&"root".to_string()));
+        let mut clashes = Vec::new();
+        walk(&cli, "agentfs", &globals, &mut clashes);
+        assert!(clashes.is_empty(), "args sharing a global id: {clashes:?}");
+    }
 }

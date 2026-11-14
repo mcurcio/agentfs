@@ -204,7 +204,7 @@ remote_status() { # name
 }
 expect_failure() { # remote kind
   wait_for 60 sh -c "sudo env AGENTFS_POD=pod-0 '$AGENTFS_BIN' --state '$STATE' status |
-    grep '^remote:    $1 ' | grep -q 'last error ($2)'" ||
+    grep '^remote:    $1 ' | grep 'last error ($2)' >/dev/null" ||
     fail "$1 never reported $2: $(remote_status "$1")"
   pass "status: $1 failed ($2)"
   grep -q "alarm: push to $1 failed ($2)" "$LOG" || fail "no alarm for $1 ($2)"
@@ -216,7 +216,7 @@ expect_failure badauth auth
 expect_failure untrusted untrusted_host
 expect_failure diverged non_fast_forward
 wait_for 30 sh -c "sudo env AGENTFS_POD=pod-0 '$AGENTFS_BIN' --state '$STATE' status |
-  grep '^remote:    diverged ' | grep -q 'diverged: head saved as'" ||
+  grep '^remote:    diverged ' | grep 'diverged: head saved as' >/dev/null" ||
   fail "the diverged head was never saved: $(remote_status diverged)"
 pass "status: the diverged head is saved"
 grep -q "alarm: diverged diverged: remote branch is at" "$LOG" || fail "no divergence alarm"

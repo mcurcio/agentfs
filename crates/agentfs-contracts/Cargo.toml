@@ -1,0 +1,21 @@
+[package]
+name = "agentfs-contracts"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The shared kernel of agentfs's domains: values, capabilities, traits, events and ports, with no I/O"
+
+[dependencies]
+# Rows and journal records carry these values as JSON (the store adapter in
+# agentfs-core); derives only.
+serde = { version = "1.0.229", features = ["derive"] }
+thiserror = "2.0.21"
+# The volume id (RFC 9562). Parsing and text only: the state-area adapter in
+# agentfs-core makes a new one with the `v4` feature.
+uuid = { version = "1", default-features = false, features = ["std", "serde"] }
+
+[dev-dependencies]
+# The text round trips of the names' serde forms.
+serde_json = "1.0.154"

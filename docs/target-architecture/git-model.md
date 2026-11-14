@@ -15,6 +15,9 @@ why a custom protocol on git primitives (§14), and the validation plan (§18). 
 the commit that adds MODEL.md rule 12, the journal's crash replay (§3), creates, objects and the atomic save (§7)
 and progress rule P1 (§6) are **modelled** (MODEL.md rules 9, 11 and 12, findings 19 to 22). After the owner's
 decisions of 2026-11-04 (§6), P3 is deleted and P2 is the prefix sync, both modelled.
+**Revision of 2026-11-13** (the owner: "a transaction should be recorded as one commit"): a transaction's saves stage in
+its index and its commit makes one commit, T, which lands in the fork as any change lands (§9); a crash rolls an open
+transaction back (§9, §12), as A13 and R5.3's pick say. `refs/txn-start/<id>` is gone (§4).
 
 ## 0. What the owner asked for
 
@@ -23,6 +26,8 @@ decisions of 2026-11-04 (§6), P3 is deleted and P2 is the prefix sync, both mod
 | 2026-11-03 | "if its coherent then i want a technical doc describing the system in git parlance, from the perspective of working trees, indexes, remotes, branches, etc. That will serve as the foundation of the code to follow" |
 | 2026-11-02 | "Since the model is effectively “just git” with some overlaid lock/merging rules, I propose a set of functional tests (recorded, runnable in the repo test suite) that mimic the agentfs model via native git operations."; "I generally like the metaphor of a typical Linux filesystem. I want to try that out." |
 | 2026-11-02 | Agreeing that every collision between a fork and its upstream is decided in one place, the upstream's landing queue: "ok, that tracks" |
+| 2026-11-12 | "the "save" operation isnt creating git commits; instead the changes are being accumulated and only get committed when the transaction itself closes/commits" |
+| 2026-11-13 | Asked as general guidance whether saves inside a transaction are commits on `txn/<n>` or staged: "a transaction should be recorded as one commit" |
 | 2026-11-03 | "i think i would assume main wins. because if sandbox forked from main and then main moved forward, the sandbox is working from an out-of-date copy. so even though its history can be preserved for posterity, i think the updated main should win in a conflict." (replaces "the incoming change wins", 2026-11-02) |
 | 2026-11-02 | On transactions: "Frozen snapshot was my intention, yes. That's why I said “new branch” earlier."; "If “landing” is essentially a continuous “checkout” into the working directory, then a transaction starting effectively creates a new index —maybe even an implicit branch in the local history — and adding files to the transactions only adds them to the staging index." |
 | 2026-11-03 | "the sandbox commits could be squashed to one changeset (if they are the naive simple commits) and merged into upstream as one unit. if its a smarter integration that is creating transactions, it might be best to leave the transaction commits as they are"; "every sandbox commit stays stored ... that makes sense, because thats basically the design we want" |
@@ -45,11 +50,11 @@ shared remote.
 ```mermaid
 flowchart TB
   subgraph R["the volume's history repository: one object store"]
-    M["refs/heads/(the root's name)"]
+    M["refs/heads/root"]
     F1["refs/heads/fork/1: fork A"]
     F2["refs/heads/fork/2: fork B"]
     F3["refs/heads/fork/3: fork C, inside A"]
-    T7["refs/heads/txn/7: B's open transaction"]
+    T7["refs/heads/txn/7: B's open transaction, at its begin"]
     Q["refs/queue/tree/n: each tree's queue entries"]
     X["refs/collisions/commit: every losing commit"]
   end
@@ -71,7 +76,7 @@ flowchart TB
 | agentfs term | git term | In the model |
 |---|---|---|
 | volume | one repository (one object store, many branches) | `World` |
-| tree (the root, the tree with no upstream, its branch's name configured: [root branch name](future/root-branch-name.md); a fork) | a branch, with its own working tree and index | `refs/heads/<root>`, `refs/heads/fork/<id>` |
+| tree (the root, the tree with no upstream; a fork) | a branch, with its own working tree and index | `refs/heads/root`, `refs/heads/fork/<id>` |
 | fork's upstream | the branch's upstream, in the same repository (`branch.fork/3.remote = .`) | `Fork::upstream` |
 | nested fork | a branch whose upstream is another fork's branch | `create_fork(f)` |
 | client, writer | the `Agentfs-Writer` trailer; git's author and committer are one fixed service identity | `Client`, `fork.writer` |
@@ -91,9 +96,9 @@ flowchart TB
 | decided | the upstream's lineage reaches the commit that wrote the version | `is_ancestor` |
 | "saw" a line | the version on the writer's first parent, and every version that one was written over | `written_over` |
 | losing version | a commit kept under its own ref | `refs/collisions/<n>` |
-| transaction | a short-lived branch frozen at begin, with its own index | `refs/heads/txn/<n>` |
-| transaction commit | a landing of that branch into its fork | `World::commit_txn` |
-| rollback | branch delete | `World::rollback` |
+| transaction | a short-lived branch frozen at begin, which never moves, and its own index, where its saves stage (no commit) | `refs/heads/txn/<n>`, `Txn::index` |
+| transaction commit | one commit T of everything staged, on begin, then a landing of T into its fork (a fast-forward, or a merge) | `World::commit_txn` |
+| rollback | branch delete; the index dropped; no commit was made | `World::rollback` |
 | full lineage | every landing is a fast-forward or a merge, so a tree's history reaches every change it took | `World::is_ancestor` |
 | view | a FUSE mount serving one tree's working tree, filtered by the rules | not modelled |
 
@@ -104,13 +109,13 @@ tree. This section is a design choice.
 
 | Piece | What it is | Rule |
 |---|---|---|
-| branch | the tree's head: the only source of truth for the tree | moved by a save, a queue take (a landing into it or a sync), a transaction commit; created when the fork is made, deleted when it drops |
+| branch | the tree's head: the only source of truth for the tree | moved by a save, a queue take (a landing into it or a sync), a transaction's commit; created when the fork is made, deleted when it drops |
 | upstream | the upstream tree's branch | fixed when the fork is made |
 | index | one per tree: a cache of the branch's tree, never a source | reset to the new head in the same step that moves the branch |
 | working tree | the saved tracked files the view serves: a full checkout of the branch (`git worktree add`) | follows every move in the same step: `git read-tree -m -u <old> <new>` rewrites only files that differ (the owner's "continuous checkout") |
 | untracked area | the tree's files the rules skip and its scratch names (rules.md): a directory beside the working tree, never inside it, which the view overlays on it | never committed, so no save, sync or landing carries it, and `read-tree -u` never meets it (it refuses to overwrite an untracked path). A tracked file that arrives at a path the untracked area holds wins the path in the view; the untracked file stays, hidden, and shows again if the tracked one goes (a choice) |
 | open file | a program's write calls since its write-open: each in the tree's journal before the call returns (below), with a copy in the view for the writer's own reads | becomes a save at close; no sync or landing writes it while open (§6). Private until close (close-to-open, as AFS), the owner's decision ("Go", 2026-11-03, accepting that recommendation): other readers see only saved content. The model has no reads through an open file; in the target the writer reads its own unsaved writes back through its open file, as on Linux (a choice, views.md §2). A shared mapping behaves as on Linux (R1.4): the kernel keeps one size and one set of pages per file, so all of a file's mappings share pages, a page fill reads the saved bytes plus every open's calls and page writes in arrival order, `stat` reports the writers' size to everyone while the file has a write-open, a writable descriptor also reads the file's page writes, and `sendfile` reads what a mapping reads. `read` and `pread` on a read-only descriptor keep saved bytes (R1.1). A take drops the kernel's pages of each file it changed (`FUSE_NOTIFY_INVAL_INODE`, with the actor unlocked). The close is FUSE `RELEASE` (the last reference to the open file, a shared mapping included), never `FLUSH`, which comes on every close of a duplicated descriptor. An `O_TRUNC` open is a truncate at open: one that writes nothing saves an empty file |
-| transaction | branch `txn/<n>`, its own index (`GIT_INDEX_FILE`) and its own directory checked out from it | no `git worktree`, so no HEAD and no HEAD reflog points at it |
+| transaction | branch `txn/<n>` at begin, never moved; its own index (`GIT_INDEX_FILE`), where each save stages (no commit), and its own directory checked out from it | no `git worktree`, so no HEAD and no HEAD reflog points at it. The index is a cache a crash drops: a crash rolls the transaction back (§9) |
 
 The working tree holds only saved tracked content, so moving it never loses a program's unsaved bytes or an
 untracked file. The older "fork's layer over its parent" (trees.md) becomes a storage optimisation that must serve
@@ -134,8 +139,9 @@ him to accept losing a call that returned, which the previous draft did (views.m
 |---|---|---|---|
 | `write`, `pwrite`, an `O_APPEND` write, `ftruncate` | appended to the tree's journal; the open file's copy changes only after (record first) | `ENOSPC` (the state area is full) or `EIO`; the open file is unchanged | the death of any agentfs process at once; power loss once the next row has returned |
 | a page a shared mapping writes back (`FUSE_WRITE_CACHE`) | only the bytes differing from what that page was last filled with or written back as, in one record naming the file, never the handle the kernel used; nothing if no byte changed. Then every write-open's copy follows. The next close of any write-open saves it: whole above the last step that closed a write-open of the file, and below that, for an open with an earlier call, only over bytes that open's own earlier calls touched, so a later mapped write stands against a later close (R9.16) and a third save is not reverted | `ENOSPC` or `EIO`, which the kernel keeps as the mapping's error; nothing changes | as the row above. A store not written back is in the kernel's page only: the death of the view host loses it, which Linux would keep (a cost of R1.4) |
-| `fsync`, `fdatasync`, `msync(MS_SYNC)`, each write on an `O_SYNC` or `O_DSYNC` open, and every `close` (FUSE `FLUSH`) of a handle whose records are not yet durable | the open's records made durable; one flush covers every record queued meanwhile (group commit, as today's journal) | `EIO` from that call; the records stay and the next one tries again | power loss |
-| `unlink`, `rename(2)`, path `truncate(2)` | journaled durably, then run (as today's namespace records) | the call's own error; nothing changed | power loss |
+| `fsync`, `fdatasync`, `msync(MS_SYNC)`, each write on an `O_SYNC` or `O_DSYNC` open, and every `close` (FUSE `FLUSH`) of a handle whose records are not yet durable | the open's records made durable; one flush covers every record queued meanwhile (group commit), and runs outside the actor's lock | the flush's error from that call; a failed flush stops the actor (§12) | power loss |
+| `fsync` of the view's directory (FSYNCDIR), or of a read-only descriptor | every record so far made durable, in the same group commit | as the row above | power loss, for every call before it |
+| `unlink`, `rename(2)`, path `truncate(2)` | appended to the journal, as a write is, then run | the call's own error; nothing changed | the death of any agentfs process at once; power loss once a flush covering it has returned (the two rows above) |
 | `RELEASE` (the last reference) | nothing to wait for: the actor saves from the journal (§6) | nothing can fail on recording, since every call is already recorded; the kernel ignores `RELEASE`'s answer anyway | — |
 
 Publication is the save, at `RELEASE`, as before: the actor builds the commit from the open's journaled calls and
@@ -157,8 +163,8 @@ that step moves: the commit point (§12). The open's records leave the journal a
   object (§7) its tree and the file identity whose path names it, or none, is journaled too: an open's first record
   names its object, and every call that moves an object (a create, `rename(2)`, `unlink`, a rename-over, the atomic
   save) records the move in the same durable record as the call itself (the `unlink`/`rename(2)` row above). At
-  restart the table is rebuilt from the journal on top of the last committed trees, never from file identities or
-  paths. An open whose object the rebuilt table names by no path is an orphan: its replay saves nothing and raises
+  restart the table is rebuilt from the journal, never from file identities or paths: a checkpoint holds each
+  tree's objects as of its built point, and the steps after it move them (no history commit or ref holds them). An open whose object the rebuilt table names by no path is an orphan: its replay saves nothing and raises
   `OrphanDropped`, as its close would have. Rebuilt by identity instead, a dead handle's calls would be saved into
   the file that replaced it, the failure §7 exists to prevent (the review planted exactly that bug; the model's
   byte oracle and object table catch it). The model's crash keeps its object table, which this rule rebuilds
@@ -177,14 +183,18 @@ that step moves: the commit point (§12). The open's records leave the journal a
 
 The journal is in the state area beside the repository, never under a tree or a mount (V4). The tree library has one
 journal per actor, holding every tree's records, because a step can move two trees' queues at once. Frames are checksummed
-and salted; a bad frame with no good one after it is a torn tail, saved aside, and one with a good one after it refuses
-to serve (`docs/runbooks/recording-failures.md`). How a view host appends without a path into the state area is
+and salted, and each carries the durable mark (the last record a finished flush covered when it was written). A bad
+frame that a later good frame's mark shows was durable refuses to serve (`docs/runbooks/recording-failures.md`); any
+other bad frame starts a torn tail, saved aside. How a view host appends without a path into the state area is
 parked (views.md).
 
-Compaction replaces the file with one checkpoint (every pointer, the fork upstreams, the live opens, the next number)
-and then, unchanged, the calls and page writes of files with a live write-open: a file held open pins only its own
-calls, never other files' saves. It is due at a step once the file reaches `max(64 MiB, twice its length after the last
-compaction)`, and always runs at the end of a recovery.
+Compaction writes one checkpoint (every pointer, the fork upstreams, the live opens, the next number) at the start of
+a new segment and drops the segments before it that the builder has read, keeping the calls and page writes of files
+with a live write-open: a file held open pins only its own calls, never other files' saves. It is due once the
+segments reach `max(64 MiB, twice their length after the last compaction)`, and runs at open when every step is
+built. A checkpoint's pointers are built values, so compaction waits for the first record after the builder has built
+every step; calls after the last step never hold it back, since the checkpoint holds them. Its redo start is its last
+record (§12).
 
 Every commit carries three trailers. The model's exact format (the `#` comments are not part of it):
 
@@ -193,8 +203,12 @@ Direct by c3
 
 Agentfs-Writer: c3            # exactly one writer: a client, or `agentfs` for a sync and the Root commit
 Agentfs-Cause: Direct         # Direct (a save) | Landing | Sync | Transaction t7 | Root
-Agentfs-Tree: fork/3          # <root> | fork/<id> | txn/<id>: the branch it was made on
+Agentfs-Tree: fork/3          # root | fork/<id>: the tree it was made for, by identity, never a published name (a transaction's commit names its fork)
 ```
+
+The engine's commits carry these three and more: the event, the volume's name and id, and the pod context the writer
+ran in (`Agentfs-Event`, `Agentfs-Volume`, `Agentfs-Volume-Id`, `Agentfs-Namespace`, `Agentfs-Pod`, `Agentfs-Pod-Uid`,
+`Agentfs-Node`; their order is in docs/trees.md), and a landing's writer and pod trailers are its second parent's.
 
 A take that decides a collision (R5.1, R9.9) records it in its own result commit, a landing or transaction commit, with
 one more trailer per record: its tree, file, cause, losing change, collision ref, lines, lost and won versions. So a
@@ -208,8 +222,8 @@ Landing by c3
 
 Agentfs-Writer: c3
 Agentfs-Cause: Landing
-Agentfs-Tree: <root>
-Agentfs-Collision: <root> a Line <losing commit> refs/collisions/1 a1 c3.2 m1.1
+Agentfs-Tree: root
+Agentfs-Collision: root a Line <losing commit> refs/collisions/1 a1 c3.2 m1.1
 ```
 
 A merge originates nothing: each line it adds comes from a non-first parent, and it names its second parent's
@@ -221,20 +235,30 @@ The "when" of who changed what when is the commit's committer date, kept as its 
 
 ## 4. Refs: what lives where
 
-Ref names are a design choice; the model uses the first six (with `refs/collisions/<n>`, from a counter).
+Ref names are a design choice; the model uses the first five (with `refs/collisions/<n>`, from a counter).
 
 | Ref | Holds | Kept locally | Pushed to the shared remote (design choice) |
 |---|---|---|---|
-| `refs/heads/<root>` | the root's decided line | always | yes, as today's `refs/heads/agentfs/<volume>` |
+| `refs/heads/root` | the root's decided line | always | yes, under its published name, in the volume's own prefix ([root branch name](future/root-branch-name.md)) |
 | `refs/heads/fork/<id>` | a fork's line, syncs included | until the fork drops | only where Replication pushes fork lines (A4); its losing commits go regardless, as collision refs |
-| `refs/heads/txn/<id>` | an open transaction | until commit or rollback | never |
+| `refs/heads/txn/<id>` | an open transaction: the commit it began at, never moved (its saves stage in its index) | until commit or rollback | never |
 | `refs/collisions/<loser>` | one per losing change, named by its losing commit (the model numbers them, one per losing change, with a record for each file and cause it lost by) | past the fork's drop | yes, by Replication, under `refs/agentfs/<volume>/collisions/` ("i want to know who changed what when", 2026-11-03) |
 | `refs/queue/<tree>/<n>` | one queue entry (§5) | until taken | never |
-| `refs/txn-start/<id>` | the commit a transaction began at (the model holds it in memory, `Txn::start`) | until commit or rollback | never |
+| `refs/agentfs/trees/fork/<n>`, `refs/agentfs/clients/<tree>`, `refs/agentfs/volume` | the volume's rows: one chain of event commits per row, beside the tree it concerns, each commit's tree one `row.json` and its message the event ([trees](../trees.md#rows-and-event-commits)) | always, a fork's past its drop | yes, by Replication, from M4 (design choice) |
+
+A commit's tree (a design choice, the owner's pick Q1-A of 2026-11-14, hashed sub-folders) keeps each file at
+`files/<aa>/<bb>/<name>`, its line map (runs of line identities and versions, never bytes) at `lines/<aa>/<bb>/<name>` and each file identity's name history at
+`names/<cc>/<dd>/<id>`, the folders hex digits 1-2 and 3-4 of `git hash-object` of the name (or the identity in
+decimal): fixed, so a file's path never moves, and a commit rewrites only its changed files' folders
+([trees](../trees.md#what-a-commit-holds)). No ref holds object numbers; they are the journal's (§3).
 
 Replication adds the release major to pushed names (replication.md). It is the only pusher: the collision refs
 join its refspec, and a move of the root or a recorded collision makes a push due (design
-choice; the model's `Step::Replicate`, taken in any order with the queue steps). The model first made only a
+choice). In the model a mirror (`mirror::Mirror`) sits outside the trees: tree history publishes each move of a head
+(`world::TreeMoved`, with the collision refs its take recorded), the mirror is due once a move it has not read moved the
+root or names a collision ref, and its push is the history service's `Step::Push`, taken in any order with the queue
+steps (`service::HistoryService`). A fork's collision ref reaches the mirror even if that fork never lands
+(`mirror_current`). The model first made only a
 collision an event, so a run without one never pushed the root (MODEL.md finding 16). No queue step waits on
 the network.
 
@@ -297,13 +321,19 @@ sync arrived while the file was open) is not modelled.
 **Locks** (owner, 2026-11-03; for a landing into a tree too, a *choice*; the names its files have on either side of the change too, R9.1). A take into a tree lists the files
 it will overwrite there, waits until no client of that tree has one open for writing, then holds them all
 while it writes; a write-open of a held file waits until it finishes. All at once, so it never holds one
-file while waiting for another (no deadlock). A take is one atomic step, in the model as in the library: it
+file while waiting for another (no deadlock). A take is one atomic step in the model: it
 chooses its entry, locks its files and writes them, with no call in between, so a call that would wait for it
 simply comes after it (the owner, 2026-11-08, finding 49: "Without any other information, B sounds reasonable.
-Obviously atomic operations are more reliable"; R9). Each wait ends on an event: the last close wakes a take,
+Obviously atomic operations are more reliable"; R9). The library has the same effect without holding the actor
+while it decides: a take is decided on a built snapshot (§12) with the actor unlocked, then landed under its lock
+only if no step after the decision touched a key it read (its plan's keys, and the held keys that cut its sync or
+blocked an earlier entry), no write-open holds a key it writes, and a fast-forward's head has not moved. Otherwise
+it is refused and decided again. A landed decision read nothing of its own tree that changed, so it is the take an
+atomic step would make at its land; a sync reads its upstream's head as of its decision, as an atomic sync taken
+then would, and the upstream's later saves queue later entries. Each wait ends on an event: the last close wakes a take,
 and a client's end event (exit or death, a client of any tree alike) closes its files, saving their write
 calls as the kernel's close would (a choice) (`r9_client_death_releases_its_locks`,
-`r9_a_now_dead_root_client_releases_its_locks`). A transaction's opens are on its frozen branch and never wait.
+`r9_a_now_dead_root_client_releases_its_locks`). A transaction's opens write in its index and never wait.
 *Choice:* a landing locks every file its changes touch, a losing change's files included, not only the files
 its plan writes (R9.1, `r9_a_landing_holds_the_files_of_its_losing_changes`). Cost: a take waits for a file's
 open writer even when its change to that file loses.
@@ -466,9 +496,10 @@ nothing after it lands (R10.8, MODEL.md finding 32; `r10_an_unfinished_line_befo
 
 A sync decides nothing, so until the upstream decides the fork hides, rather than joins: the upstream's unfinished
 last line in front of a fork's undecided line (R10.6, finding 29), and the upstream's lines behind a fork's
-undecided unfinished line (R10.9, finding 33). Each arrives with the decision (§8). One case stays open
-(MODEL.md finding 30): a transaction's line after its own fork's unfinished one makes one line of bytes from two
-line identities.
+undecided unfinished line (R10.9, finding 33). Each arrives with the decision (§8). A transaction's commit is a take
+like a landing (§9): a line it appended after its fork's unfinished last line collides with it and the fork's line
+wins (R10.5, MODEL.md finding 30), and so does an unfinished line it would put in front of a line the fork keeps (R10.8
+at a commit, R10.11). No tree or transaction shows two lines as one (`no_joined_lines`).
 
 | What the bytes show | Recorded as | Against the upstream's concurrent edit of that line | Tests |
 |---|---|---|---|
@@ -619,10 +650,16 @@ transaction is an agentfs concept, not a property of the local/shared fs." (ledg
 model, which binds a transaction to a client and adds `Client::Outside`: no rule supports that. The API of the integration
 that creates a transaction is not defined. Transactions are not built (§18) until that API is designed.
 
-Begin creates `txn/<n>` and `refs/txn-start/<n>` at the fork's head: snapshot isolation. The program's saves
-commit there and it reads its own edits; the fork keeps syncing. One per fork; a tree with no upstream has none. A file
+Begin creates `txn/<n>` at the fork's head, and an index on its tree: snapshot isolation. The branch never moves
+until the transaction ends. The program's saves stage in the index (the owner, 2026-11-13: "a transaction should be
+recorded as one commit"; 2026-11-12: "the changes are being accumulated and only get committed when the transaction
+itself closes/commits"): no commit is made before the commit. Each staged save writes its records raw, exactly as a
+save on a head writes them (§7), and it meets every rule a save meets (`transactions_frozen`). The program reads its own
+edits from the index; the fork keeps syncing. One per fork; a tree with no upstream has none. A file
 open before begin keeps writing to the fork (its target is fixed at open), so a long-lived open file blocks no
-transaction; the client's opens after begin write in the transaction. Errors: begin with one open (`InTransaction`),
+transaction; the client's opens after begin write in the transaction. A file open inside the transaction holds back
+every take into the fork, its syncs and its own forks' landings, until it closes, as an open on the fork does (§6;
+ledger R9.18, the owner's pick of 2026-11-12). Errors: begin with one open (`InTransaction`),
 commit or rollback with none (`NoTransaction`), after the client ended (`Ended`).
 
 **Other I/O on its files is deferred** (ledger R5.3; the owner, 2026-11-05: "deferred, obviously. thats what i mean by
@@ -632,40 +669,78 @@ of a file with a change added to the transaction (the owner: "The changes that i
 also counts files open for writing) is accepted, journaled and returns at once; nothing waits on a program.
 It applies in the order made after the commit or rollback, a client's death included, a save as any later close on the
 head then. The file counts as open until then (§6), so a sync or landing never writes it under a save that has not
-happened. A crash rolls the transaction back and then applies the call (the owner's pick, 2026-11-05; the model still keeps
-the call behind a surviving transaction).
+happened.
 
-**Commit** lands the branch in the fork as a child lands in its upstream, whole or not at all (rule 3e, the owner):
-the fork's concurrent line (one a sync brought in since begin) wins, and then none of the transaction applies; no
-collision refuses it. A transaction that lost still writes its merge commit, with the fork's tree, so history
-shows the decision (a choice); its collision ref keeps the transaction's branch. Nothing refuses a commit: it goes
-ahead while programs hold files open, those files stay open, and their writes (a transaction's opens now write in the
-fork) save at close as ordinary later saves (`r5_a_commit_goes_ahead_with_the_programs_own_files_open`). The answer says
-`Committed`, or `Lost` with every staged line and the fork's line that won or decided it
-(`r3_a_transaction_loses_whole_and_is_told`); no saves commits nothing (`Empty`). One ref transaction moves the fork and deletes both refs (the model
-deletes the branch first: a crash between would lose the commit). The result lands upstream like any fork commit.
+**A crash rolls back every open transaction** (A13, the owner, 2026-11-02: "It's a transaction, so a failure is an
+implicit rollback"; R5.3, his pick of 2026-11-05: "the crash rolls the transaction back and applies the call"): its index
+and its opens are dropped, unsaved, as at a rollback, and then the calls it deferred apply, in order, before the
+restart replays the opens left (§3; `r12_a_crash_rolls_back_an_open_transaction`,
+`r5_a_crash_rolls_back_and_applies_what_it_deferred`). Rolling back every open transaction, not only one with a
+deferred call, is the model's choice, revisable, the owner to confirm (Questions for the owner). Principle 1 holds as
+R12 states it: every write call inside a transaction is in the journal before it returns, and its save is staged; what
+history records of it is decided at the end, once in T, or never if the transaction rolls back. The cost: a staged
+save whose close returned is lost at a crash, as at a rollback, and leaves no trace in git. So the index is never needed after a crash: it lives in the state
+area as a cache of nothing durable, and git's garbage collection may drop the unreachable blobs it names once the
+transaction has ended. A transaction is open exactly while its ref `txn/<n>` exists.
+
+**Commit** records the transaction as one commit, T: one parent, the commit `txn/<n>` holds (begin's); its tree the
+index as one save over begin's (`content::one_save`); `Agentfs-Writer` the fork's writer, `Agentfs-Cause: Transaction
+t<n>`, `Agentfs-Tree` the fork (T is the fork's change, staged in its index); and one `Agentfs-Open` per open it staged a
+save of, in order, for the audit, as every save names its open (§3; the journal's records, not the trailer, decide a
+replay). One save over begin means: a line begin holds
+keeps begin's version if its last staged version holds the same bytes and state (a line written back), else that last
+version, written over begin's; the versions staged between are in no commit. A line begin lacks that is live at the end
+is a new line, its identity its last version's id; one gone at the end is not in T. A file the transaction created and
+ended is as begin has it; one it created is new in T at its last path, whatever renames it staged. A moved line is a
+delete and a new line, as each save already aligned it. So T passes `save_aligned` against begin, as every save does,
+and holds the bytes the program staged (`oracle_txn_commit`). If T would change nothing over begin (nothing staged, or
+everything written back), no commit is made and the answer is `Empty`.
+
+T then lands in the fork as a child's change lands in its upstream, under every landing rule (R10.11; the owner,
+2026-11-12: "A"): a fast-forward when the fork is still at begin (R6.2), so the fork's history gains exactly T; else
+the referee is given the pair, T as the fork's change and the fork as its upstream, and no direction, and judges T
+whole (rule 3e, the owner): the fork's concurrent line (one a sync brought in since begin) wins, and then none of the
+transaction applies; a line after the fork's unfinished last line (R10.5) and an unfinished line in front of a line the
+fork keeps (R10.8) lose as at a landing. The result is a merge `[fork, T]`, named for the client, `Transaction t<n>`.
+A transaction that lost still writes that merge, with the fork's tree, so history shows the decision (R5.1); its
+collision ref keeps T. `Direction::Transaction` only labels where a collision was decided, for the checks; the referee
+never reads it. The commit is a program's call, not a queue entry: it takes no lock and waits for none (R5.2 is
+rejected), and no take runs inside it (a take is one step). Nothing refuses a commit: it goes ahead while programs hold
+files open, those files stay open, and their writes (a transaction's opens now write in the fork) save at close as
+ordinary later saves (`r5_a_commit_goes_ahead_with_the_programs_own_files_open`). An open's target needs no record of
+its own: an open of a transaction whose ref is gone writes in the fork. The answer says `Committed`, or `Lost` with
+every line of T and the fork's line that won or decided it (`r3_a_transaction_loses_whole_and_is_told`), or `Empty`. One
+ref transaction moves the fork and deletes `txn/<n>` (the model makes both updates in one step, which nothing can
+interleave; it deletes the ref first); before it the transaction is open (a crash rolls it back, and T,
+unreachable, is garbage), after it the transaction has ended. The fork's new head lands upstream like any fork commit
+(`r5_a_transaction_is_recorded_as_one_commit`, `r5_a_line_staged_twice_is_one_version_over_begin`,
+`r5_a_transaction_that_changes_nothing_makes_no_commit`).
 
 ```mermaid
 sequenceDiagram
   participant P as program
-  participant T as txn/7
+  participant I as txn/7's index
   participant B as fork/2's actor
   participant QM as the root's queue
-  P->>T: begin: branch at B's head
-  P->>T: saves, each a commit on txn/7
-  Note over B: syncs keep landing in B, T stays frozen
+  P->>B: begin: refs/heads/txn/7 at B's head (B0), an index on its tree
+  P->>I: saves, each staged in the index (no commit)
+  Note over B: syncs keep landing in B; txn/7 stays at B0
   P->>B: commit
-  B->>B: per line, B's head as upstream: B's concurrent lines win, and then the whole transaction loses
-  B->>B: merge, parents B and txn/7, Writer c2, Cause Transaction t7 (B's tree if it lost)
-  B->>B: one ref transaction: move fork/2, delete txn/7 and its start (a collision ref keeps a loser)
-  B-->>P: Committed, or Lost with every staged line
+  B->>B: T: parent B0, tree the index as one save over B0, Writer c2, Cause Transaction t7, Tree fork/2
+  alt B's head is still B0
+    B->>B: fast-forward fork/2 to T
+  else B moved
+    B->>B: per line, B's head as upstream: B's concurrent lines win, and then the whole transaction loses
+    B->>B: merge, parents B and T, Writer c2, Cause Transaction t7 (B's tree if it lost)
+  end
+  B->>B: one ref transaction: move fork/2, delete txn/7 (a collision ref keeps a losing T)
+  B-->>P: Committed, Lost with every line of T, or Empty
   B->>B: the calls deferred behind it, in order, each an ordinary save or path call
-  B->>QM: Landing(fork/2, the transaction's commit)
+  B->>QM: Landing(fork/2, its new head)
 ```
 
-**Rollback**, abandon or the client dying deletes the branch and its start ref, then applies the deferred calls. No HEAD ever points at `txn/<n>`
-and deleting a branch deletes its reflog, so no ref reaches its commits and nothing of it shows in any tree or
-history (`discarded_leave_no_trace`); git's garbage collection removes them. The fork is unchanged.
+**Rollback**, abandon or the client dying deletes the branch and drops the index, then applies the deferred calls. No
+commit was made, so nothing of it shows in any tree or history (`discarded_leave_no_trace`). The fork is unchanged.
 
 ## 10. Nested forks
 
@@ -711,38 +786,45 @@ open saved once from the journal; a take is one step, so none is in progress); t
 not; the rest is a design choice.
 
 **One step, one journal record** (a recommendation the owner accepted, revisable; [OWNER-GUIDANCE.md](../../OWNER-GUIDANCE.md)). Each step
-writes its objects durably, then appends one synced journal record with every pointer it moves: the branch, queue
-entries, collision refs, the object table. That record is the commit point. Git's refs are then a copy, in the files
-format, and nothing decides from the copy: runtime reads come from the journal's pointers. Reftable's one atomic swap
-is no longer needed, and git's reftable writer could not survive a cut anyway (`reftable/writer.c` writes a table's
-footer after its last sync).
+appends one journal record: the change itself, and every pointer its build moves (the branch, queue entries, collision
+refs), each value an oid or "what step `n`'s build gives". That record is the commit point. The
+commits are built behind it by a builder (the owner, 2026-11-13: "only the diff/patch needs to be syncrhonosly
+collected and queued, while the git history persistence could be an asynchronous trailing process"). Git's refs are a
+copy of the built pointers, in the files format, and nothing decides from the copy. Reftable's one atomic swap is no
+longer needed, and git's reftable writer could not survive a cut anyway (`reftable/writer.c` writes a table's footer
+after its last sync).
 
-The order of a step:
+The order of a step, on the call path:
 
-1. Build on a copy of the tree. Objects are fsynced, with their directories, as they are written. Trees go through
-   `git hash-object`: `git mktree` reads no configuration, so `core.fsync` never reaches it.
+1. Decide it on the saved state: the outcome of a close (its length and checksum), the names it moves.
 2. Check the pointers it moves against their current values.
-3. Append the record and fsync it: **the commit point**.
-4. Install the copy and apply the pointers.
-5. The copies: a fork's `config`, the refs, the private checkout.
+3. Append the record, with no flush: **the commit point**. It survives power loss once a flush covers it (§3).
+4. Apply it to the saved state the views serve.
+
+Then the builder, for a batch of durable records: it replays each step on the built trees with the same transitions,
+aligns the lines, feeds the commits to `git fast-import`, fsyncs the pack, then fsyncs the batch's entry in the built
+log (the built point). Only then are a fork's `config`, the refs and the private checkouts copied. Nothing reads Git
+past the built point; takes are decided on built snapshots and landed only if what they read is unchanged (§6).
 
 A failure in 1 to 3 changes nothing: the call returns its errno and the actor keeps serving (§3). A close stays pending,
 its handle still counting as open, and saves first at the next step in its tree and at restart. A take stays queued for
-the next event. Only a failed `fsync` or rollback of the journal stops the actor: the file cannot be trusted then.
+the next event. Only a failed `fsync` (a flush's or a compaction's) or rollback of the journal stops the actor: the file
+cannot be trusted then.
 
-A failure in 4 and 5 is not a recording failure (AGENTS principle 5): the call succeeded. It is logged, and the next
-step rebuilds the refs whole and redoes that checkout.
+A failed batch is not a recording failure (AGENTS principle 5): nothing reachable changed, and it is retried. A failed
+copy after the built-log entry is logged, and the next batch rebuilds the refs whole and redoes the checkouts.
 
 | Step | Its one journal record | On restart |
 |---|---|---|
-| save | the branch, the landing entry at the upstream, a sync entry at each child, the object table; names the open it closes | nothing to do: the move and its entries are one record, or neither happened |
-| queue take | the branch, the entry deleted, the entries the move causes, the collision ref, the object table | the entry is still there only if the take has no record: take it again; collision refs are named by the losing commit, so a rerun makes the same names |
-| transaction begin, commit, rollback | not built | a `txn/*` branch whose client has ended is deleted: an implicit rollback (A13); a client waiting to rebind after a history-service restart has not ended, and its transaction is restored at rebind (clients.md) |
-| fork create | the branch and its upstream | `config` is rewritten from the journal before any git command; a dropped fork is not built |
-| journal | each call appended and synced before it returns (§3) | before any view serves the tree, each open with no record closing it is saved as its close would be, exactly once. A torn last frame is saved aside and discarded |
+| save | the close's calls by reference and its outcome; the branch, the landing entry at the upstream, a sync entry at each child; names the open it closes | build what is not built; the move and its entries are one record, or neither happened |
+| queue take | the decision (head move, changed files and names, collisions); the branch, the entry deleted, the entries the move causes, the collision ref | the entry is still there only if the take has no record: take it again; collision refs are named by the losing commit, so a rerun makes the same names |
+| transaction begin, commit, rollback | not built | every `txn/*` branch is deleted, its index dropped and its deferred calls applied: a crash rolls back every open transaction (A13; R5.3's pick, §9). A commit's ref transaction either happened (the branch is gone, the transaction ended) or did not (rolled back) |
+| fork create | the branch and its upstream, and the fork's row (its event commit on `refs/agentfs/trees/fork/<n>`) | `config` is rewritten from the journal before any git command; a dropped fork is not built; the branch and the row are one record, or neither happened |
+| rows alone | each row's chain and its event commit | each chain's row is read from its built tip's `row.json`, then the records after the built point replayed; the event commits not built are built |
+| journal | each call appended before it returns, durable once a flush covers it (§3) | every frame is read, durable or not; a hole a later frame's mark shows was durable, or valid records that end before the built log's point, refuse to serve; any other bad tail is saved aside and discarded. Before any view serves the tree, each open with no record closing it is saved as its close would be, exactly once, and every record is flushed |
 | refs, `config`, `HEAD` | a copy of the records | `config` and `HEAD` are rewritten, then `refs/` and `packed-refs` are removed and every pointer is created in one `update-ref --stdin`, on every open, so this path always runs. A live `git` reader may see a step half copied |
 | locks | none: held in memory by the actor | none survive: open files ended with their clients and are saved from the journal (row above); an unfinished take has no record, so its entry is still there and is taken again. In the model a take is one step, so none is unfinished at a crash |
-| object table | a blob per tree, named by the step's record | rebuilt on each branch's snapshot, never by file identity; an open whose object no path names is replayed as an orphan (saves nothing, `OrphanDropped`) |
+| object table | each tree's object per file identity, in the checkpoint as of its built point; the steps after it move them | rebuilt from the checkpoint and the steps' own transitions, never by file identity; an open whose object no path names is replayed as an orphan (saves nothing, `OrphanDropped`) |
 | objects | none: durable before a record names them | every pointer's commit, tree and blobs are checked (`rev-list --objects --no-walk --missing=print`): anything lost refuses to serve. Unreferenced objects: git's garbage collection |
 
 ## 13. Where the virtual filesystem sits
@@ -789,7 +871,7 @@ git configuration; one actor per tree is the actor model's single owner of mutab
 These checks hold **for the modelled executions**: the scenarios and the seeds run. That is evidence about the
 model's rules, not a proof, and it covers nothing the model leaves out (§16), the journal, objects and progress
 policy of this revision included. Every check runs after every step, in every scenario and random run (seeds 1 to 64 in CI), except
-`check_converged` and `losers_pushed`, which run once the queues and Replication drain.
+`check_converged` and `losers_pushed`, which run once the queues and the mirror's push drain.
 
 | Invariant | Check | Tests |
 |---|---|---|
@@ -803,7 +885,8 @@ policy of this revision included. Every check runs after every step, in every sc
 | A save is its write calls on the head at close: appends and offset writes keep the lines they did not write | every check | `r8_an_append_after_the_sync_keeps_the_synced_line`, `r8_an_offset_write_elsewhere_keeps_the_synced_line`, `r8_a_stale_rewrite_*` |
 | An append writes over no line but a partial last line it finishes: read from the save's blobs and its program's calls, each line starting in the appended bytes is new, after every line of the upstream, and a finished line is the upstream's last, one version on | `appends_exact` (in `one_writer`) | `r8_concurrent_appends_never_overwrite_each_other`, every random run |
 | No take writes a file open for writing in that tree or one it did not lock; a take is one step, so no call runs while it holds a file; no lock outlives its holder (any tree's client, a transaction, a tree); every wait ends on an event | `step_checked`, `locks`, `check_converged` | `r9_*`, `r11_an_unlink_or_rename_of_a_held_file_runs_after_the_take`, `r5_open_files_and_transactions`, every random run (clients of every tree die in them) |
-| While a transaction is open, no save reaches its fork on a file it has saved; each deferred call applies in order once it ends (§9) | `transactions_undisturbed`, `locks`, `interleavings.rs` `Oracle::defers` | `r5_io_on_a_transactions_files_is_deferred_past_its_commit`, `r5_a_rollback_applies_what_it_deferred`, `r5_a_clients_death_applies_what_its_transaction_deferred`, `r5_a_crash_keeps_what_a_transaction_deferred`, every random run |
+| While a transaction is open, no save reaches its fork on a file it has staged; each deferred call applies in order once it ends, a crash's rollback included (§9) | `transactions_undisturbed`, `locks`, `interleavings.rs` `Oracle::defers` | `r5_io_on_a_transactions_files_is_deferred_past_its_commit`, `r5_a_rollback_applies_what_it_deferred`, `r5_a_clients_death_applies_what_its_transaction_deferred`, `r5_a_crash_rolls_back_and_applies_what_it_deferred`, every random run |
+| A transaction makes no commit before its commit: `txn/<n>` stays at begin, no commit names its branch, each staged save meets every save's rules; its commit is one commit T on begin, naming each open it staged a save of and holding the bytes the program staged (§9) | `transactions_frozen`, `one_writer`, `transactions_end_as_told`, `interleavings.rs` `oracle_txn_commit` | `r5_a_transaction_is_recorded_as_one_commit`, `r5_a_line_staged_twice_is_one_version_over_begin`, `r5_a_transaction_that_changes_nothing_makes_no_commit`, every random run |
 | No program's open, `unlink` or `rename(2)` ever waits on a waiting landing, only on a take writing its file (no P3, §6) | `Oracle::no_wait_on_waiting` (interleavings.rs, the harness's own record), `locks` | `r9_cooperating_programs_never_deadlock`, `r9_new_writers_postpone_a_waiting_take`, every random run |
 | A sync never delivers past the first change to an open file: it delivers an upstream commit, in order, overwrites no open file, and the first commit it holds back names an open file (P2, §6) | `step_checked` (`prefix_cut`) | `r9_a_sync_delivers_up_to_the_first_change_to_an_open_file`, `r9_a_prefix_sync_holds_back_a_transaction_whole`, every random run |
 | The upstream wins every collision, decided only at its queue, losing commit reachable, the decision in the take's result commit, which names its tree | `upstream_wins` | `r3_landing_collision_the_upstream_wins`, `r3_a_collision_is_recorded_once_at_the_upstreams_queue`, `r10_a_delete_against_a_concurrent_edit_the_upstream_wins`, `r10_a_move_is_a_delete_plus_an_insert` |
@@ -813,9 +896,12 @@ policy of this revision included. Every check runs after every step, in every sc
 | A sync records no collision and carries the upstream's head as it was then | `step_checked` | `r3_a_sync_carries_the_upstreams_current_version`, `r3_a_fork_never_flips_back_to_its_own_edit` |
 | Every sync delivers the decided version, keeping only undecided own lines | `syncs_deliver` | `r3_a_sync_keeps_the_undecided_saves` |
 | Nothing else waits; each take is its queue's first entry or records a wait, the rest stay in order | `take` (interleavings.rs) | `random_interleavings_full_lineage`, `random_interleavings_adjacent_lines` (the scenarios' own `take` checks no order) |
-| A transaction ends as the program was told, whole; a rollback leaves nothing | `transactions_end_as_told`, `discarded_leave_no_trace` | `r5_transaction_commits_clean`, `r3_a_transaction_loses_whole_and_is_told`, `r5_sync_before_or_after_the_commit_ends_the_same`, `r5_a_committed_transaction_then_lands_like_any_change`, `r5_transaction_rollback_and_client_death_leave_nothing` |
+| A transaction ends as the program was told, whole, judged on T read from git; an empty one made no commit; a rollback, a crash's included, leaves nothing | `transactions_end_as_told`, `discarded_leave_no_trace` | `r5_transaction_commits_clean`, `r12_a_crash_rolls_back_an_open_transaction`, `r3_a_transaction_loses_whole_and_is_told`, `r5_sync_before_or_after_the_commit_ends_the_same`, `r5_a_committed_transaction_then_lands_like_any_change`, `r5_transaction_rollback_and_client_death_leave_nothing` |
 | Every change traces to one writer | `one_writer` | `r6_a_sync_is_a_merge_with_the_upstream_second` |
-| Every losing change is replicated, eventually, and stays: once Replication drains, the commits of the remote root's history hold the run's collisions, each re-read on the shared remote alone, its writer and line | `losers_pushed` | `r3_a_save_before_the_sync_arrives_loses_to_the_upstream`, every collision |
+| Every losing change is replicated, eventually, and stays: once the mirror's push drains, the commits of the mirror's root history hold the run's collisions, each re-read on the mirror alone, its writer and line | `losers_pushed` | `r3_a_save_before_the_sync_arrives_loses_to_the_upstream`, every collision |
+| The mirror's push is pending whenever the mirror lacks the root's tip or a collision ref, a fork's included (§4) | `mirror_current` | every collision, `r4_nested_forks_follow_the_same_rules` |
+| No tree and no open transaction's index shows a joined line: only a file's last live line may lack its newline (§7, §9) | `no_joined_lines` | `r10_a_transactions_line_after_the_forks_unfinished_line_loses_whole`, `r10_a_transactions_unfinished_line_before_a_kept_line_loses_whole` |
+| A take writes no file open in its tree or in that tree's open transaction, by the harness's reading of the opens (§6, §9) | `oracle_locks` | `r9_a_file_open_in_a_transaction_holds_back_the_forks_sync`, `r9_a_file_open_in_a_transaction_holds_back_a_landing_into_its_fork` |
 | Nested forks follow the same rules | all checks | `r4_nested_forks_follow_the_same_rules` |
 | Full lineage, read by ancestry alone: a tree's history reaches every change it took | `full_lineage` | `r7_every_fork_commit_lands_on_its_own_in_the_roots_history`, `r7_the_root_reaches_a_losing_commit_and_its_ref_keeps_it`, `random_interleavings_full_lineage` |
 | Trees converge when writes stop | `check_converged` | `convergence_when_writes_stop` |
@@ -893,6 +979,11 @@ power loss, failed save or view-host restart.
 - While a transaction is open, other programs' saves, unlinks and renames of its files do not show (§9), so a program's
   next read misses its own close; a file with a deferred call holds back a sync or landing of it until the transaction
   ends.
+- A transaction's history shows only its net change, in one commit T: the saves inside it, and the versions staged
+  and then written over, are in no commit (§9). Between a close and the commit a staged save lives only in the state
+  area (the journal and the index), not in any ref; a crash rolls it back with the transaction.
+- A transaction whose staged saves change nothing over begin makes no commit and is told `Empty`, a reading of the
+  owner's "one commit" for the case of nothing (a choice, to confirm with the owner).
 - A transaction's answer covers its commit into its own fork. A transaction committed there can still lose whole
   at the upstream's queue later: a recorded collision, not part of the answer.
 - The referee and the actor are our own code; no git merge strategy carries them.
@@ -957,6 +1048,9 @@ The Rust model stays the testbed; the script only demonstrates. His current choi
 | untracked area | where a tree's skipped and scratch files live, beside its working tree (§3) | `read-tree -u` refuses to overwrite untracked files | git's untracked files |
 | journal | a tree's write-ahead log of write calls and path calls, in the state area (§3) | a call is recorded before it returns, though it is saved at close | today's journal ([recording](../recording.md)) |
 | object; orphan | what an open handle holds (the inode); an object no path names (§7) | writes through an old handle must never reach the file that replaced it | inode |
+| staged save | a save in an open transaction: written into the transaction's index, raw, as a save on a head, with no commit (§9) | the owner: saves in a transaction are not commits | git's `git add` into an index; R5.4's "stage" |
+| T, a transaction's one commit | the one commit of everything a transaction staged: parent its begin, its tree the index as one save over begin's (§9) | names what lands in the fork and what a loss keeps | transaction commit |
+| one save over begin (`one_save`) | how the index becomes T's tree: each line's last staged version written over begin's, or begin's version where written back; new lines re-keyed to their last version (§9) | T must pass the check every save passes | squash |
 | source (of a queue entry) | the child fork a landing came from; for a sync's changes, their writer (§6) | P1 and P2 keep each source's order | — |
 | held-back part | the upstream's commits a prefix sync does not deliver yet: the first that touches a file open in the fork, and every later one (§6, P2) | a held file holds back a sync only from its first change on | a waiting take |
 
@@ -979,6 +1073,19 @@ Open on 2026-11-05. Each names its context; none blocks the validation unless no
   lifetime only. If staging is a separate directory, the owner's reason for deferring ("a client trying to write the
   transaction while also writing the the file") no longer applies, and deferring might shrink to the moment of commit. That
   would reopen R5.3, so it is his decision.
+- **A transaction that changes nothing** (general guidance, 2026-11-13). Its staged saves all written back, it makes no
+  commit and is told `Empty` (§9), as it is when it staged nothing. Recording it as an empty commit T instead would show,
+  in history, that a transaction ran and changed nothing; the model's choice saves a commit with no change, as a plain
+  save that changes nothing makes none (R8.2).
+- **A crash rolls back every open transaction** (general guidance). The owner picked a rollback at a crash for a
+  transaction with a deferred call (R5.3, 2026-11-05), and A13 says "a failure is an implicit rollback"; the model
+  rolls back every open transaction (§9), so a staged save whose close returned is lost with no trace in git. The
+  other shape keeps the transaction across a crash: its index rebuilt from the journal and each open replayed into it,
+  so nothing staged is lost, at the cost of a durable index.
+- **A transaction's one commit and the fork's history** (general guidance). "Recorded as one commit" holds for T: the
+  fork gains exactly T when it is still at begin. When the fork has moved since begin, it gains T and the landing's
+  merge `[fork, T]` (§9, R10.11), as a fork's commit landing upstream does. Squashing them into one commit would hide
+  the referee's decision (R5.1).
 - **Programs sharing one tree, during a transaction.** R5.3 conflicts with R1: a program that knows nothing of transactions
   closes a file with a deferred call, reopens it and reads the old bytes.
 - **Fork and upstream.** The model's `OrphanDropped` stretches R11.3 for a file created in a transaction that lost.

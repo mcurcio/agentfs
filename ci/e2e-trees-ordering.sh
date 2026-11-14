@@ -8,14 +8,14 @@ cleanup() {
     status=$?
     mountpoint -q "$work/main" && fusermount3 -uz "$work/main" || true
     mountpoint -q "$work/sandbox" && fusermount3 -uz "$work/sandbox" || true
-    [ -z "$pid" ] || kill "$pid" 2>/dev/null || true
+    [ -z "$pid" ] || { kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; }
     if [ "$status" != 0 ]; then cat "$work/mount.log" 2>/dev/null || true; fi
     rm -rf "$work"
 }
 trap cleanup EXIT
 mkdir "$work/main" "$work/sandbox"
-"$bin" --state "$work/state" trees init
-"$bin" --state "$work/state" trees mount "$work/main" --sandbox "$work/sandbox" >"$work/mount.log" 2>&1 &
+"$bin" --state "$work/state" trees init --volume t
+"$bin" --state "$work/state" trees mount "$work/main" --fork-mount "$work/sandbox" >"$work/mount.log" 2>&1 &
 pid=$!
 for _ in $(seq 1 200); do
     if mountpoint -q "$work/main" && mountpoint -q "$work/sandbox"; then break; fi

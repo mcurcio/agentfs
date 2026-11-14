@@ -2,14 +2,19 @@ name: phase-1
 
 on:
   push:
-    branches: [docs/target-architecture]
-    paths:
+    branches: [main, docs/target-architecture]
+    paths: &paths
       - 'crates/**'
       - 'ci/**'
       - 'vendor/**'
       - 'Cargo.*'
       - '.github/workflows/phase-1.yml'
       - '.github/actions/**'
+  pull_request:
+    paths: *paths
+  # A manual run is the full sweep (VERIFYING.md, "Tiers"): the conformance job records
+  # seeds 1..64 (rounds 1..16) instead of the regression seeds, and the library replays
+  # the phase 1 generators at seeds 1 to 500 in four shards.
   workflow_dispatch:
 
 permissions:
@@ -23,16 +28,22 @@ jobs:
   conformance:
     name: phase 1 mounted conformance
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    timeout-minutes: ${{ github.event_name == 'workflow_dispatch' && 120 || 30 }}
+    # The floors are what passes: on every push the regression seeds' in-scope traces
+    # (25, 14 of them mountable), on a manual run the full sweep's.
+    env:
+      SWEEP: ${{ github.event_name == 'workflow_dispatch' && '1' || '' }}
+      MIN_SEEDS: ${{ github.event_name == 'workflow_dispatch' && '94' || '25' }}
+      MIN_MOUNTED_SEEDS: ${{ github.event_name == 'workflow_dispatch' && '16' || '14' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
-        with:
-          toolchain: stable
+      - run: rustup toolchain install # the release rust-toolchain.toml pins
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: phase-1-conformance
       - run: sudo apt-get update && sudo apt-get install -y fuse3 git python3 util-linux curl gcc zlib1g-dev
+      # The tree views mount with FUSE allow_other by default.
+      - run: echo user_allow_other | sudo tee -a /etc/fuse.conf
       - uses: ./.github/actions/pinned-git
       - run: cargo test --manifest-path vendor/fuser/Cargo.toml --lib raw_tmpfile_request_dispatches_and_returns_create_reply
       - run: cargo build --locked -p agentfs -p agentfs-model --bin agentfs --bin phase1-oracle
@@ -51,14 +62,15 @@ jobs:
         run: cargo test --locked -p agentfs-model --test scenarios --test interleavings
         env:
           AGENTFS_MODEL_TRACE_DIR: ${{ runner.temp }}/traces
+          AGENTFS_MODEL_SWEEP: ${{ env.SWEEP }}
       - run: cargo build --locked -p agentfs-conformance --bin phase1-replay
       - name: replay on a fresh model
-        run: target/debug/phase1-replay model "$RUNNER_TEMP/traces" --min-scenarios 74 --min-seeds 94
+        run: target/debug/phase1-replay model "$RUNNER_TEMP/traces" --min-scenarios 74 --min-seeds "$MIN_SEEDS"
       - name: replay on the library
-        run: target/debug/phase1-replay library "$RUNNER_TEMP/traces" --min-scenarios 74 --min-seeds 94
+        run: target/debug/phase1-replay library "$RUNNER_TEMP/traces" --min-scenarios 74 --min-seeds "$MIN_SEEDS"
       - run: cargo build --locked -p agentfs --features failpoints
       - name: replay on mounts
-        run: ci/e2e-tree-replay.sh "$RUNNER_TEMP/traces" 71 16 "$RUNNER_TEMP/recorded"
+        run: ci/e2e-tree-replay.sh "$RUNNER_TEMP/traces" 71 "$MIN_MOUNTED_SEEDS" "$RUNNER_TEMP/recorded"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         if: always()
         with:
@@ -83,9 +95,7 @@ jobs:
         shard: [0, 1, 2, 3]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
-        with:
-          toolchain: stable
+      - run: rustup toolchain install # the release rust-toolchain.toml pins
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: phase-1-replay-seeds
@@ -104,13 +114,13 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
-        with:
-          toolchain: stable
+      - run: rustup toolchain install # the release rust-toolchain.toml pins
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: phase-1-page-cache
       - run: sudo apt-get update && sudo apt-get install -y fuse3 git python3
+      # The tree views mount with FUSE allow_other by default.
+      - run: echo user_allow_other | sudo tee -a /etc/fuse.conf
       - uses: ./.github/actions/pinned-git
       - run: cargo build --locked -p agentfs
       - run: |
@@ -138,13 +148,13 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
-        with:
-          toolchain: stable
+      - run: rustup toolchain install # the release rust-toolchain.toml pins
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: phase-1-faults
       - run: sudo apt-get update && sudo apt-get install -y fuse3 git python3 util-linux curl gcc zlib1g-dev
+      # The tree views mount with FUSE allow_other by default.
+      - run: echo user_allow_other | sudo tee -a /etc/fuse.conf
       - uses: ./.github/actions/pinned-git
       - run: cargo build --locked -p agentfs --features failpoints
       - name: kill at recording boundaries
@@ -179,9 +189,7 @@ jobs:
         fs: [ext4, xfs]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
-        with:
-          toolchain: stable
+      - run: rustup toolchain install # the release rust-toolchain.toml pins
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: phase-1-power-loss
@@ -202,7 +210,7 @@ jobs:
         env:
           AGENTFS_BIN: ${{ github.workspace }}/target/debug/agentfs
           POWER_LOSS_DIR: ${{ runner.temp }}/tree-power-loss
-      - name: object directories sync before the record
+      - name: pack files sync before their built-log entry
         if: matrix.fs == 'ext4'
         run: sudo env PATH="$PATH" AGENTFS_BIN="$AGENTFS_BIN" TMPDIR="$RUNNER_TEMP" ci/trees-object-dir-syncs.sh
         env:
@@ -222,13 +230,13 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
-        with:
-          toolchain: stable
+      - run: rustup toolchain install # the release rust-toolchain.toml pins
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: phase-1-measure
       - run: sudo apt-get update && sudo apt-get install -y fuse3 git python3 util-linux curl gcc zlib1g-dev
+      # The tree views mount with FUSE allow_other by default.
+      - run: echo user_allow_other | sudo tee -a /etc/fuse.conf
       - uses: ./.github/actions/pinned-git
       - run: cargo test --locked -p agentfs-core --test tree_stages
       - run: cargo build --locked -p agentfs
@@ -281,9 +289,7 @@ jobs:
         mode: ${{ fromJSON(needs.measure-plan.outputs.modes) }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
-        with:
-          toolchain: stable
+      - run: rustup toolchain install # the release rust-toolchain.toml pins
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: phase-1-measure

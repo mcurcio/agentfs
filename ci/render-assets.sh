@@ -56,7 +56,7 @@ done
 # Every SVG in docs/assets/ has a row above, so none is left unrendered.
 for src in docs/assets/*.svg; do
   name=$(basename "$src")
-  printf '%s\n' "${ASSETS[@]}" | grep -q "^$name " || {
+  printf '%s\n' "${ASSETS[@]}" | grep "^$name " >/dev/null || {
     echo "$src has no entry in ci/render-assets.sh" >&2
     failed=1
   }

@@ -249,10 +249,10 @@ fn git_config(volume: &str, branch_ref: &str, hooks: &Path) -> Vec<String> {
 /// where this process does.
 fn child_env(pod: &Pod) -> Vec<(String, String)> {
     let mut env: Vec<(String, String)> = [
-        ("AGENTFS_NAMESPACE", &pod.namespace),
-        ("AGENTFS_POD", &pod.pod),
-        ("AGENTFS_POD_UID", &pod.pod_uid),
-        ("AGENTFS_NODE", &pod.node),
+        ("AGENTFS_NAMESPACE", &pod.args.namespace),
+        ("AGENTFS_POD", &pod.args.pod),
+        ("AGENTFS_POD_UID", &pod.args.pod_uid),
+        ("AGENTFS_NODE", &pod.args.node),
     ]
     .into_iter()
     .map(|(k, v)| (k.to_owned(), v.clone()))

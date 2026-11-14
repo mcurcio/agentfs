@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# The fan-out directory and `objects/` are fsynced before a step's journal record
-# names the object (`docs/trees.md`). A prefix replay on ext4 or XFS cannot judge
-# this ordering: the record's own fsync carries the rename's directory entry too. So
-# this reads the system calls of one save on a real mount, under strace. As root, for
-# strace to follow fusermount3.
+# The builder fsyncs a batch's pack files and `objects/pack` before the batch's
+# built-log entry is written and fsynced, and only that entry makes the batch's
+# objects reachable (`docs/trees.md`, "History trails the files"). A prefix replay on
+# ext4 or XFS cannot judge this ordering: a later fsync carries the pack's directory
+# entry too. So this reads the system calls of one save on a real mount, under
+# strace. As root, for strace to follow fusermount3.
 #   sudo env AGENTFS_BIN=/path/to/agentfs ci/trees-object-dir-syncs.sh
 set -euo pipefail
 : "${AGENTFS_BIN:?}"
@@ -17,9 +18,9 @@ cleanup() {
   rm -rf "$work"
 }
 trap cleanup EXIT
-"$AGENTFS_BIN" --state "$work/state" trees init
-strace -f -y -qq -e trace=fsync,pwrite64 -o "$work/trace" \
-  "$AGENTFS_BIN" --state "$work/state" trees mount "$work/main" --sandbox "$work/sandbox" >"$work/mount.log" 2>&1 & pid=$!
+"$AGENTFS_BIN" --state "$work/state" trees init --volume t
+strace -f -y -qq -e trace=fsync,fdatasync,pwrite64 -o "$work/trace" \
+  "$AGENTFS_BIN" --state "$work/state" trees mount "$work/main" --fork-mount "$work/sandbox" >"$work/mount.log" 2>&1 & pid=$!
 for _ in $(seq 1 200); do
   if mountpoint -q "$work/main" && mountpoint -q "$work/sandbox"; then break; fi
   kill -0 "$pid"; sleep .1
@@ -36,23 +37,20 @@ wait "$pid"; pid=
 python3 - "$work/trace" "$work/state" <<'PY'
 import re, sys
 trace, state = sys.argv[1:]
-objects = re.escape(f'{state}/history.git/objects')
-fanout = re.compile(rf'^\d+ +fsync\(\d+<{objects}/[0-9a-f]{{2}}>')
-parent = re.compile(rf'^\d+ +fsync\(\d+<{objects}>')
-journal = re.compile(rf'^\d+ +pwrite64\(\d+<{re.escape(state)}/calls\.wal>')
-lines = open(trace).read().splitlines()
-kinds = []
-for line in lines:
-    if fanout.match(line):
-        kinds.append('fanout')
-    elif parent.match(line):
-        kinds.append('parent')
-    elif journal.match(line):
-        kinds.append('journal')
-assert kinds, 'no matching calls: is strace tracing the mount?'
-# Some commit's object directory syncs, in order, with no journal write between
-# them, and the journal's record of that step after them.
-sequence = ''.join({'fanout': 'f', 'parent': 'p', 'journal': 'j'}[k] for k in kinds)
-assert re.search('f+p+j', sequence), f'no fan-out then objects fsync before a journal write: {sequence}'
-print(f'ok: {sequence.count("f")} fan-out, {sequence.count("p")} objects fsyncs, ordered before their journal record')
+packs = re.escape(f'{state}/history.git/objects/pack')
+pack_file = re.compile(rf'^\d+ +fsync\(\d+<{packs}/pack-[0-9a-f]+\.(pack|idx|rev)>')
+pack_dir = re.compile(rf'^\d+ +fsync\(\d+<{packs}>')
+log_write = re.compile(rf'^\d+ +pwrite64\(\d+<{re.escape(state)}/built\.log>')
+log_sync = re.compile(rf'^\d+ +fdatasync\(\d+<{re.escape(state)}/built\.log>')
+sequence = ''
+for line in open(trace).read().splitlines():
+    for letter, pattern in (('k', pack_file), ('d', pack_dir), ('w', log_write), ('s', log_sync)):
+        if pattern.match(line):
+            sequence += letter
+assert sequence, 'no matching calls: is strace tracing the mount?'
+# Some batch's pack files then their directory fsynced, with nothing of the built
+# log between them, then its entry written and fsynced.
+assert re.search('k+d+ws', sequence), f'no pack fsyncs then a built-log entry: {sequence}'
+print(f'ok: {sequence.count("k")} pack files and {sequence.count("d")} pack directory fsyncs, '
+      f'each batch before its built-log entry ({sequence.count("s")})')
 PY

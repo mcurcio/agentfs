@@ -40,7 +40,7 @@ flowchart TB
   LA -->|attach, detach, reconcile, advance| CL
   LA -->|create, end a fork| TR
   LA -->|open, rebound a view| V
-  LA -->|create, stage, unstage| VO
+  LA -->|ensure, stage, unstage| VO
   OP -->|push, replace diverged, drain, accept start| RP & VO
   V -->|write-open, path calls, save at close, transactions: over its session| G
   V -->|reads the tree's working tree| TR
@@ -115,7 +115,7 @@ capabilities bound to it.
 
 | Capability | Minted by | Held by | It can never |
 |---|---|---|---|
-| `LaunchCap { launcher, may: Root \| ForksItCreates, view_profiles }` | the composition root, from deployment config | a launcher | (fork launcher) attach to the root or a fork it did not create, widen a view profile, create, stage or unstage the volume |
+| `LaunchCap { launcher, may: Root \| ForksItCreates, view_profiles }` | the composition root, from deployment config | a launcher | (fork launcher) attach to the root or a fork it did not create, widen a view profile, `ensure`, stage or unstage the volume |
 | `ClientCap` | `Clients::attach`, `rebind` (read-write grants only) | the client's session, in the history service | save into another tree or as another writer |
 | `PinCap` | the composition root | Clients | (anyone else) pin a snapshot |
 | `StartCap` | the composition root | Volume (lent to Replication's `fetch_start`) | (anyone else) set where the root's line starts |

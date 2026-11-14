@@ -97,7 +97,7 @@ stop_mount() {
 # the same commit; empty if it is not there yet.
 head_rows() { # path
   sudo python3 "$CHECK" "$STATE/git" "$BRANCH" "$1" --min 0 2>/dev/null |
-    head -n 1 | cut -d' ' -f2
+    sed -n 1p | cut -d' ' -f2
 }
 
 # Rows a workload sees in the database at <path> through the mount.
@@ -129,7 +129,7 @@ pass "the writer holds the database open with a WAL"
 # At most one interval late: coalesce after the last write, then the
 # commit window; allow slack for a loaded runner.
 LIMIT=$((COALESCE + 6))
-wait_for "$LIMIT" sh -c "[ \"\$(sudo python3 '$CHECK' '$STATE/git' $BRANCH wal/app.db --min 0 2>/dev/null | head -n 1 | cut -d' ' -f2)\" = '$WANT' ]" ||
+wait_for "$LIMIT" sh -c "[ \"\$(sudo python3 '$CHECK' '$STATE/git' $BRANCH wal/app.db --min 0 2>/dev/null | sed -n 1p | cut -d' ' -f2)\" = '$WANT' ]" ||
   fail "the history did not reach $WANT rows within ${LIMIT}s (has '$(head_rows wal/app.db)')"
 pass "the history caught up in $((SECONDS - DONE_AT))s (limit ${LIMIT}s), writer still open"
 wait "$WAL_PID" || fail "the WAL writer failed: $(cat "$W/wal.out")"
@@ -140,7 +140,7 @@ as_agent "python3 '$W/sqlite-writer.py' delete/app.db --mode delete --txs $TXS -
   >"$W/delete.out" 2>&1 || fail "the DELETE writer failed: $(cat "$W/delete.out")"
 ELAPSED=$((SECONDS - STARTED + 1))
 WANT_DELETE=$(sed -n 's/^done //p' "$W/delete.out")
-wait_for 20 sh -c "[ \"\$(sudo python3 '$CHECK' '$STATE/git' $BRANCH delete/app.db --min 0 2>/dev/null | head -n 1 | cut -d' ' -f2)\" = '$WANT_DELETE' ]" ||
+wait_for 20 sh -c "[ \"\$(sudo python3 '$CHECK' '$STATE/git' $BRANCH delete/app.db --min 0 2>/dev/null | sed -n 1p | cut -d' ' -f2)\" = '$WANT_DELETE' ]" ||
   fail "the history never reached $WANT_DELETE rows (has '$(head_rows delete/app.db)')"
 pass "the closed database is recorded whole"
 
@@ -162,7 +162,7 @@ sudo python3 "$CHECK" "$STATE/git" "$BRANCH" delete/app.db --rows "$ROWS" --min 
 # its -journal if one was captured.
 read -r OLD_D OLD_D_ROWS OLD_D_MEMBERS < <(
   { grep -- '-journal)' "$W/live-versions" || true; cat "$W/live-versions"; } |
-    awk -v want="$WANT_DELETE" '$2 > 0 && $2 < want' | head -n 1
+    awk -v want="$WANT_DELETE" '$2 > 0 && $2 < want' | sed -n 1p
 ) || true
 [ -n "$OLD_D" ] || fail "no older version of delete/app.db: $(cat "$W/live-versions")"
 # No --root: the running mount serves it over its control socket.
@@ -202,7 +202,7 @@ pass "no -shm in the head"
 
 step "restore an older version directly (runbook: restoring a database)"
 # An intermediate version: the newest with some rows but not all.
-read -r OLD OLD_ROWS _ < <(awk -v want="$WANT" '$2 > 0 && $2 < want' "$W/versions-wal" | head -n 1) || true
+read -r OLD OLD_ROWS _ < <(awk -v want="$WANT" '$2 > 0 && $2 < want' "$W/versions-wal" | sed -n 1p) || true
 [ -n "$OLD" ] && [ "$OLD_ROWS" -lt "$WANT" ] || fail "no older version to restore"
 # The database alone is named: its group comes with it.
 OUT=$(af --root "$BACKING" restore wal/app.db "$OLD")

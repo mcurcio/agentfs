@@ -153,7 +153,7 @@ hermes_check_skill() { # scenario
 # <id>."), checked to be one on docker-in-docker, not Hermes.
 tool_container() { # note
   local tool
-  tool=$(printf '%s\n' "$1" | sed -n 's/^Written in tool container \(.*\)\.$/\1/p' | head -n1)
+  tool=$(printf '%s\n' "$1" | sed -n 's/^Written in tool container \(.*\)\.$/\1/p' | sed -n 1p)
   [ -n "$tool" ] || fail "the tool container's note names no container: $1"
   [ "$tool" != "$(hermes_exec hostname)" ] || fail "the note was written in the Hermes container"
   assert_contains "$(dind_exec docker ps --no-trunc --format '{{.ID}} {{.Image}}')" "$tool" \

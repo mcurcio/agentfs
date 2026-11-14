@@ -4,23 +4,23 @@
 //! | Rule (MODEL.md) | Here |
 //! |---|---|
 //! | 1. Like a Linux filesystem | a close ([`World::close`]) is never refused; its save is a commit on the writer's tree at once, its first parent the tree's head at that moment |
-//! | 2. One landing queue per tree | [`World::queue_len`]: a FIFO of [`Entry`](crate::queue::Entry)s per tree (`queue`); a [`Step::Next`] takes its head, or records that it waits (rule 9) |
+//! | 2. One landing queue per tree | [`World::queue_len`]: a FIFO of [`Entry`](crate::queue::Entry)s per tree (`queue`); a [`TreeStep::Next`] takes its head, or records that it waits (rule 9) |
 //! | 3. The upstream's queue decides | `land` (a fork's commit into its upstream) is the only place a collision with the upstream is decided, through `judge` and the referee's land (`referee`, called by `resolve`): per line, a line written over the upstream's replaces it, a stale one is dropped, and of two concurrent lines the upstream's wins; then each change (a save, a transaction's commit) is judged whole: one lost line and none of it applies (rule 3e). `sync` decides nothing: it takes the upstream's version and keeps only the fork's lines the upstream's queue has not taken yet (the referee's sync, called by `adopt`) |
-//! | 4. Nothing waits behind a collision | there is no held state: a collision is recorded as a [`Collision`] and in git (a trailer of the take's result commit, [`COLLISION`]), the fork's losing commit kept under `refs/collisions/<n>`, which Replication later pushes to the shared remote with the root ([`Step::Replicate`], due on every move of the root and every collision), and the queue moves on |
-//! | 5. Transactions | [`World::begin`]: a branch `txn/<n>` frozen at the fork's head; [`World::commit_txn`] lands it in the fork like a child's commit, whole or not at all (the fork is its upstream, so the fork's lines win), and answers whether it lost, with every staged line that did not apply; [`World::rollback`] drops it. While one is open, other I/O on its files in the fork is accepted and applies in order after it ends ([`World::deferred`], kept by `queue`, R5.3) |
+//! | 4. Nothing waits behind a collision | there is no held state: a collision is recorded as a [`Collision`] and in git (a trailer of the take's result commit, [`COLLISION`]), the fork's losing commit kept under `refs/collisions/<n>`, which a mirror later pushes with the root ([`crate::service::Step::Push`], due once a [`TreeMoved`] moved the root or named a collision ref), and the queue moves on |
+//! | 5. Transactions | [`World::begin`]: a branch `txn/<n>` frozen at the fork's head, which never moves, and an index ([`Txn::index`]) where its saves stage, with no commit; [`World::commit_txn`] records it as one commit T on begin (the index as one save over begin's, [`content::one_save`]) and lands T in the fork like a child's commit, a fast-forward if the fork is still at begin, else whole or not at all (the fork is its upstream, so the fork's lines win), and answers whether it lost, with every line of T that did not apply; [`World::rollback`] drops it, and so does a crash ([`World::crash`]). While one is open, other I/O on its files in the fork is accepted and applies in order after it ends ([`World::deferred`], kept by `queue`, R5.3) |
 //! | 6. Attribution | every commit names one writer in an `Agentfs-Writer` trailer; a sync is a merge with the upstream's commit as second parent |
 //! | 7. Full lineage | a landing is a merge with the fork's commit as second parent (or a fast-forward), so a tree's history reaches every change it took, the losers included; each fork commit lands on its own |
 //! | 8. A save records the write calls | [`World::write`] keeps each byte call ([`Write`](crate::recording::Write): an `O_APPEND` write, `pwrite`, `ftruncate`; [`World::open_trunc`] for `O_TRUNC`) on the open file; [`World::close`] applies them to the tree's head then: an append's bytes go after the file's last byte, finishing a partial last line (a version of it) and then making new lines; other calls leave bytes the save aligns with the head's lines (rule 10). [`World::edit`] makes a test's line edit as a program's byte calls (`program`) |
-//! | 9. A take locks the files it overwrites | [`World::open_write`]; a [`Step::Next`] whose sync or landing would overwrite a file open for writing in that tree waits ([`World::waits`]) until the close; else it takes its entry, locks its files and writes them in that one step ([`World::last_take`]), so no call runs while a take holds a file (the owner, 2026-11-08, finding 49: "B"); a client's death ([`World::end_client`], [`World::end_root_client`]) closes its files |
-//! | 10. Line identity | a save derives identities from the bytes at close: it aligns them with the head's lines once, by git's histogram diff (`align`), and records the result: each new line an identity, each changed line a new version written over the version it replaced; the referee and a sync then compare versions of one identity, never bytes or positions (the referee: `referee/placing.rs` places them); a line a landing would put after the upstream's unfinished last line collides with it (R10.4), and so does an unfinished line a landing would put in front of a line the upstream keeps (R10.8); until the upstream decides, a sync hides the upstream's unfinished last line in front of an undecided line (R10.6) and the upstream's lines after an undecided unfinished line (R10.9) |
-//! | 9, progress (git-model.md §6) | P1: a [`Step::Next`] takes the first entry no earlier waiting entry shares a file or a source with (`queue`'s scan), so several may wait ([`World::waits`]); no call ever waits on a waiting entry (P3 is gone, the owner's decision of 2026-11-04): a new open of a file a waiting entry waits for is granted; P2, the prefix sync: a sync delivers the upstream's commits in order up to the first whose delivery would overwrite a file open for writing in the fork, and waits for the rest (`queue`'s prefix, its `Cut`) |
+//! | 9. A take locks the files it overwrites | [`World::open_write`]; a [`TreeStep::Next`] whose sync or landing would overwrite a file open for writing in that tree waits ([`World::waits`]) until the close; else it takes its entry, locks its files and writes them in that one step ([`World::last_take`]), so no call runs while a take holds a file (the owner, 2026-11-08, finding 49: "B"); a client's death ([`World::end_client`], [`World::end_root_client`]) closes its files; a file open inside a fork's transaction counts as open in the fork for every take into it (R9.18) |
+//! | 10. Line identity | a save derives identities from the bytes at close: it aligns them with the head's lines once, by git's histogram diff (`align`), and records the result: each new line an identity, each changed line a new version written over the version it replaced; the referee and a sync then compare versions of one identity, never bytes or positions (the referee: `referee/placing.rs` places them); a line a take (a landing, or a transaction's commit into its fork: the referee is given no direction) would put after the upstream's unfinished last line collides with it (R10.4, R10.5), and so does an unfinished line a take would put in front of a line the upstream keeps (R10.8, R10.11); until the upstream decides, a sync hides the upstream's unfinished last line in front of an undecided line (R10.6) and the upstream's lines after an undecided unfinished line (R10.9) |
+//! | 9, progress (git-model.md §6) | P1: a [`TreeStep::Next`] takes the first entry no earlier waiting entry shares a file or a source with (`queue`'s scan), so several may wait ([`World::waits`]); no call ever waits on a waiting entry (P3 is gone, the owner's decision of 2026-11-04): a new open of a file a waiting entry waits for is granted; P2, the prefix sync: a sync delivers the upstream's commits in order up to the first whose delivery would overwrite a file open for writing in the fork, and waits for the rest (`queue`'s prefix, its `Cut`) |
 //! | 11. Deletes and renames | a file's name line: [`World::rename`] writes a new version, [`World::unlink`] a deleted one; the referee's land applies the per-line rule to it and couples a file's existence with its content. [`World::create`] makes a file (an unborn identity); an open holds an object ([`Handle::object`](crate::recording::Handle::object)), so a close saves to the file its object is named by ([`World::named`]) or, for an orphan, nothing ([`Orphan`](crate::recording::Orphan), kept by `recording`); a rename-over from a new file is an atomic save, a rewrite of the replaced file |
 //! | 12. The journal (git-model.md §3) | an open's calls are its journal; [`World::crash`] saves each open from it once (the `Agentfs-Open` trailer, [`World::saved`]); a take is one step, so none is in progress at a crash |
 //!
 //! No clock: commits carry a fixed date (`git.rs`) and order comes only
 //! from the queues and from git history.
 
-use std::cell::RefCell;
+use std::cell::{OnceCell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -30,7 +30,7 @@ use crate::calls::{
     CallError, Caller, Client, HandleId, History, Recorded, RecordedCall, Shown, ShownCollision,
     Took, TreeCalls, TreeId, TxnId, gather_collisions, out_of_scope,
 };
-use crate::content::{Content, Edit, Layout, Line, PATHS, UNBORN};
+use crate::content::{self, Content, Edit, Layout, Line, PATHS, UNBORN};
 use crate::git::{git, git_in, try_git};
 use crate::program;
 pub use crate::program::LineEdit;
@@ -83,14 +83,37 @@ pub enum Life {
     Dropped,
 }
 
-/// Rule 5: an open transaction, a branch frozen at the fork's head.
+/// Rule 5: an open transaction: a branch `txn/<n>` frozen at the fork's
+/// head at begin, which never moves, and its index, where its saves stage.
+/// No commit is made before its commit (MODEL.md rule 5).
 #[derive(Clone, Debug)]
 pub struct Txn {
     pub id: TxnId,
+    /// The fork's head at begin: the commit `txn/<n>` holds until the
+    /// transaction ends.
     pub start: String,
-    pub head: String,
-    /// What it staged, in order.
+    /// The index: a git tree id (in no commit, on no ref), begin's tree
+    /// with every staged save applied, its records raw, as a save on it
+    /// writes them. What the program reads and the next save applies to.
+    pub index: String,
+    /// Every version it staged, in order, superseded ones included.
     pub staged: Vec<Edit>,
+    /// The opens it staged a save of, in order: its commit names each
+    /// (`Agentfs-Open`).
+    pub opens: Vec<HandleId>,
+}
+
+/// One save staged in a transaction's index (rule 5): the index before and
+/// after it, and the open and byte calls it saved, as the program made
+/// them. `check` holds every staged save to the rules every save meets
+/// (rule 10's alignment, rule 8's `O_APPEND`), read from the two trees.
+#[derive(Clone, Debug)]
+pub struct Staged {
+    pub txn: TxnId,
+    pub before: String,
+    pub after: String,
+    pub open: Option<HandleId>,
+    pub calls: Option<Vec<Write>>,
 }
 
 pub struct Fork {
@@ -161,13 +184,17 @@ pub struct Collision {
     pub reference: String,
 }
 
-/// How a transaction ended (rule 5), with what it staged: `check` holds
-/// every staged edit to its end (in the fork at commit, all named in the
-/// answer of a commit that lost, or discarded).
+/// How a transaction ended (rule 5), with what it staged: `check` judges
+/// its one commit, read from git (every version of it in the fork at
+/// commit, or all named in the answer of a commit that lost), and holds a
+/// rollback's every staged version discarded.
 #[derive(Clone, Debug)]
 pub struct Ended {
     pub fork: TreeId,
     pub txn: TxnId,
+    /// Begin's commit and the index at the end (git objects).
+    pub start: String,
+    pub index: String,
     pub staged: Vec<Edit>,
     pub how: TxnEnd,
     /// The fork's commit that carries it, when committed.
@@ -196,7 +223,8 @@ pub enum TxnOutcome {
     /// did not, with the fork's version that won it, or for a line that
     /// did not collide itself the one that decided the loss.
     Lost { lines: Vec<Overwritten> },
-    /// It staged nothing.
+    /// It staged nothing, or what it staged changes nothing over begin
+    /// (every line written back, every file it created ended): no commit.
     Empty,
 }
 
@@ -220,10 +248,11 @@ pub enum ModelError {
     Ended,
 }
 
-/// A step the scheduler can take: each completes at once (a [`Step::Next`]
-/// may record that its head waits).
+/// A step of the trees the scheduler can take: each completes at once (a
+/// [`TreeStep::Next`] may record that its head waits). The mirror's push is the
+/// history service's ([`crate::service::Step`]).
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Step {
+pub enum TreeStep {
     /// A take, one atomic step (the owner, 2026-11-08, finding 49: "B"):
     /// choose the first entry of a tree's queue P1 lets go, lock the files it
     /// overwrites and write them, with no call in between; or, if a client of
@@ -231,11 +260,18 @@ pub enum Step {
     /// those to close (rule 9).
     Next(TreeId),
     Drop(TreeId),
-    /// Replication pushes to the shared remote: due once the root moved or a
-    /// collision was recorded since its last push (the events it waits
-    /// for), taken in any order with the queue steps, so the push is
-    /// eventual and never part of a referee's step.
-    Replicate,
+}
+
+/// Tree history's notice that a tree's head moved (system.md's `TreeMoved`,
+/// less `paths`): what a mirror reads to know it is due ([`World::moves`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TreeMoved {
+    pub tree: TreeId,
+    /// The head before; none for a tree's first head.
+    pub from: Option<String>,
+    pub to: String,
+    /// The refs (`refs/collisions/<n>`) the take that moved it recorded, in order.
+    pub collisions: Vec<String>,
 }
 
 /// One take of a change into a tree (a landing, or a transaction's commit
@@ -356,42 +392,28 @@ pub fn decisions_in(repo: &Path, rev: &[&str]) -> Vec<(String, Decision)> {
     out
 }
 
-/// The root's name in the model's own runs: scenarios, random runs, the
-/// oracle and the digest's pinned text. Any name [`TreeNames::new`] accepts
-/// gives the same outcomes and digests, since the digest labels the root `T0`
-/// (`the_roots_name_changes_no_digest` in `digest`'s tests runs one run under four names).
-/// The engine's name is conformance's (`agentfs_conformance::ENGINE_ROOT`).
+/// The root's name in git, the model's one text for it: `root`, the
+/// identity the engine also names it by (`TreeId`'s text in `agentfs-core`).
+/// No name is configured: the name the root is published under is the
+/// publisher's, outside the model. The digest labels the root `T0`.
 pub const MODEL_ROOT: &str = "root";
 
-/// How the model names its trees in git: the root by the name it is given,
+/// How the model names its trees in git: the root `root` ([`MODEL_ROOT`]),
 /// fork `n` as `fork/<n>`, transaction `n` as `txn/<n>`, each under
 /// `refs/heads/`. The one place that names a tree.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TreeNames {
-    root: String,
-}
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TreeNames;
 
 impl TreeNames {
-    /// Names the root `root`. Panics if `root` is empty, is `fork` or `txn`,
-    /// or starts `fork/` or `txn/`: it would collide with a fork's or a
-    /// transaction's name. Git checks the rest when the world runs `git init -b`.
-    pub fn new(root: &str) -> Self {
-        assert!(
-            !root.is_empty()
-                && !["fork", "txn"].contains(&root)
-                && !root.starts_with("fork/")
-                && !root.starts_with("txn/"),
-            "{root:?} cannot name the root: it is empty or a fork's or a transaction's name"
-        );
-        Self {
-            root: root.to_string(),
-        }
+    /// The model's names; nothing is configured.
+    pub fn new() -> Self {
+        Self
     }
 
     /// Tree `t`'s name, as its commits' `Agentfs-Tree` gives it.
     pub fn name(&self, t: TreeId) -> String {
         if t == TreeId::ROOT {
-            self.root.clone()
+            MODEL_ROOT.to_string()
         } else {
             format!("fork/{}", t.number())
         }
@@ -402,7 +424,8 @@ impl TreeNames {
         format!("refs/heads/{}", self.name(t))
     }
 
-    /// Transaction `id`'s name, as its commits' `Agentfs-Tree` gives it.
+    /// Transaction `id`'s branch name (no commit names it: its one commit
+    /// names its fork).
     pub fn txn_name(id: TxnId) -> String {
         format!("txn/{id}")
     }
@@ -419,9 +442,6 @@ pub struct World {
     names: TreeNames,
     root: PathBuf,
     repo: PathBuf,
-    /// The shared remote (a bare repository): Replication pushes the root and
-    /// every collision ref there.
-    remote: PathBuf,
     root_head: String,
     pub forks: BTreeMap<TreeId, Fork>,
     next_fork: u32,
@@ -448,6 +468,8 @@ pub struct World {
     pub fast_forwards: usize,
     /// Tokens of rolled-back transactions.
     pub discarded: BTreeSet<String>,
+    /// Every save staged in a transaction's index, in order.
+    pub staged: Vec<Staged>,
     pub ended: Vec<Ended>,
     pub log: Vec<String>,
     /// The repository's files, through the one object cache.
@@ -457,9 +479,8 @@ pub struct World {
     parents: RefCell<BTreeMap<String, Vec<String>>>,
     ancestry: RefCell<BTreeMap<(String, String), bool>>,
     over: RefCell<BTreeMap<String, Vec<String>>>,
-    /// The root moved, or a collision was recorded, since Replication last
-    /// pushed.
-    replication_due: bool,
+    /// Every move of a head, oldest first: what tree history publishes.
+    moves: Vec<TreeMoved>,
     /// Syncs that delivered only a prefix of the upstream's commits (P2),
     /// counted so a run can show it met them.
     pub prefix_syncs: usize,
@@ -469,6 +490,9 @@ pub struct World {
     trace_mute: bool,
     /// What tells this world's trace file from another's (a seed).
     trace_label: Option<String>,
+    /// This world's name for its trace and digest files, taken at the first
+    /// ask ([`World::run_name`]).
+    run_name: OnceCell<String>,
 }
 
 /// The trailer naming the open a save came from (git-model.md §3).
@@ -508,12 +532,9 @@ impl World {
         ));
         let _ = std::fs::remove_dir_all(&root);
         let repo = root.join("repo");
-        let remote = root.join("origin.git");
         std::fs::create_dir_all(&repo).expect("create the repository");
-        std::fs::create_dir_all(&remote).expect("create the remote");
         let root_name = names.name(TreeId::ROOT);
         git(&repo, &["init", "-q", "-b", &root_name]);
-        git(&remote, &["init", "-q", "--bare", "-b", &root_name]);
         let objects = GitFiles {
             repo: repo.clone(),
             objects: RefCell::new(BTreeMap::new()),
@@ -523,7 +544,6 @@ impl World {
             names,
             root,
             repo,
-            remote,
             root_head: String::new(),
             forks: BTreeMap::new(),
             next_fork: 1,
@@ -538,6 +558,7 @@ impl World {
             landings: Vec::new(),
             fast_forwards: 0,
             discarded: BTreeSet::new(),
+            staged: Vec::new(),
             ended: Vec::new(),
             log: Vec::new(),
             objects,
@@ -545,11 +566,12 @@ impl World {
             parents: RefCell::new(BTreeMap::new()),
             ancestry: RefCell::new(BTreeMap::new()),
             over: RefCell::new(BTreeMap::new()),
-            replication_due: false,
+            moves: Vec::new(),
             prefix_syncs: 0,
             trace: std::env::var_os(TRACE_DIR).map(|_| Vec::new()),
             trace_mute: false,
             trace_label: None,
+            run_name: OnceCell::new(),
         };
         let files = PATHS
             .iter()
@@ -557,7 +579,7 @@ impl World {
             .collect();
         let tree = w.tree_with(None, &files);
         let c = w.commit(&[], &tree, "agentfs", "Root", &root_name);
-        w.set_head(TreeId::ROOT, &c);
+        w.set_head(TreeId::ROOT, &c, Vec::new());
         if !matches!(policies.merge, MergeRule::PerLine) || policies.layout != Layout::Separated {
             w.trace_call(out_of_scope("policy"));
         }
@@ -568,17 +590,19 @@ impl World {
         &self.repo
     }
 
-    /// The shared remote's bare repository.
-    pub fn remote(&self) -> &Path {
-        &self.remote
+    /// Every move of a head, oldest first, the root's first included:
+    /// append-only, so a reader keeps how far it has read.
+    pub fn moves(&self) -> &[TreeMoved] {
+        &self.moves
     }
 
     fn note(&mut self, s: String) {
         self.log.push(s);
     }
 
-    /// Logs a scheduler's choice, so a failing seed's log replays it.
-    pub fn note_step(&mut self, s: &Step) {
+    /// Logs a scheduler's choice (a tree step or the history service's), so a
+    /// failing seed's log replays it.
+    pub fn note_step(&mut self, s: &dyn std::fmt::Debug) {
         self.note(format!("step {s:?}"));
     }
 
@@ -717,15 +741,26 @@ impl World {
         self.queues.deferred(f).collect()
     }
 
-    /// What a client of `t` has open for writing, and what its
-    /// deferred calls (R5.3) will save: each file and the name it has now (R9.1,
-    /// [`queue::NAME_KEY`]). An open whose object no path names (an orphan) has no file open.
+    /// What a client of `t` has open for writing, in `t` or in `t`'s open
+    /// transaction (R9.18: a file open inside a transaction holds back every take
+    /// into its fork until it closes), and what its deferred calls (R5.3) will
+    /// save: each file and the name it has now (R9.1, [`queue::NAME_KEY`]), each
+    /// read in its own target, at that target's head. An open whose object no path
+    /// names (an orphan) has no file open.
     pub fn write_open(&self, t: TreeId) -> BTreeSet<String> {
-        let at = self.head(t);
-        self.recording
-            .open_files(t, &at, &self.objects)
+        let mut targets = vec![Target::Tree(t)];
+        if let Some(txn) = self.forks.get(&t).and_then(|f| f.txn.as_ref()) {
+            targets.push(Target::Txn(t, txn.id));
+        }
+        targets
             .into_iter()
-            .flat_map(|f| [name_key(&self.file(&at, &f)), Some(f)])
+            .flat_map(|target| {
+                let at = self.target_head(target);
+                self.recording
+                    .open_files(target, &at, &self.objects)
+                    .into_iter()
+                    .flat_map(move |f| [name_key(&self.file(&at, &f)), Some(f)])
+            })
             .flatten()
             .collect()
     }
@@ -806,7 +841,7 @@ impl World {
     }
 
     fn commit(&self, parents: &[&str], tree: &str, writer: &str, cause: &str, on: &str) -> String {
-        self.commit_by(parents, tree, writer, cause, on, None)
+        self.commit_by(parents, tree, writer, cause, on, &[])
     }
 
     /// [`World::commit`]; a save from an open names it in one more trailer,
@@ -819,10 +854,10 @@ impl World {
         writer: &str,
         cause: &str,
         on: &str,
-        open: Option<HandleId>,
+        opens: &[HandleId],
     ) -> String {
         let mut msg = message(&format!("{cause} by {writer}"), writer, cause, on);
-        if let Some(h) = open {
+        for h in opens {
             msg.push_str(&format!("{OPEN}: {h}\n"));
         }
         self.commit_message(parents, tree, &msg)
@@ -859,17 +894,22 @@ impl World {
         git(&self.repo, &v);
     }
 
-    fn set_head(&mut self, t: TreeId, c: &str) {
+    /// Moves tree `t`'s head to `c`, the one place a head moves, and publishes
+    /// the move with the collision refs the take that moved it recorded
+    /// ([`World::record`]'s, passed by value so none is dropped).
+    fn set_head(&mut self, t: TreeId, c: &str, collisions: Vec<String>) {
         self.update_ref(&[&self.names.branch(t), c]);
-        match self.upstream_of(t) {
-            None => {
-                // Replication pushes the root once it moved: the event its push
-                // waits for.
-                self.replication_due = true;
-                self.root_head = c.to_string();
-            }
-            Some(_) => self.forks.get_mut(&t).expect("fork").head = c.to_string(),
-        }
+        let head = match self.upstream_of(t) {
+            None => &mut self.root_head,
+            Some(_) => &mut self.forks.get_mut(&t).expect("fork").head,
+        };
+        let from = std::mem::replace(head, c.to_string());
+        self.moves.push(TreeMoved {
+            tree: t,
+            from: (!from.is_empty()).then_some(from),
+            to: c.to_string(),
+            collisions,
+        });
     }
 
     fn tree_of(&self, c: &str) -> String {
@@ -990,8 +1030,8 @@ impl World {
     /// Rules 3, 10 and 11 at the upstream's queue: the referee's plan
     /// ([`referee::land`]) for one change into the upstream's head `ours`, its
     /// tree built here.
-    fn resolve(&self, dir: Direction, ours: &str, incoming: &[Incoming], tip: &str) -> Merged {
-        let referee::Plan { files, collisions } = referee::land(self, dir, ours, incoming, tip);
+    fn resolve(&self, ours: &str, incoming: &[Incoming], tip: &str) -> Merged {
+        let referee::Plan { files, collisions } = referee::land(self, ours, incoming, tip);
         let tree = if files.is_empty() {
             self.tree_of(ours)
         } else {
@@ -1108,7 +1148,9 @@ impl World {
     }
 
     /// Records a take's collisions in tree `t`, its decisions being in its
-    /// result commit.
+    /// result commit, and returns the collision refs it recorded, in order, for
+    /// the move of `t`'s head ([`World::set_head`]).
+    #[must_use]
     fn record(
         &mut self,
         t: TreeId,
@@ -1117,7 +1159,8 @@ impl World {
         decisions: &[Decision],
         winner: &str,
         result: &str,
-    ) {
+    ) -> Vec<String> {
+        let mut refs: Vec<String> = Vec::new();
         for (l, d) in m.collisions.iter().zip(decisions) {
             let Lost {
                 path,
@@ -1143,32 +1186,11 @@ impl World {
                 result: result.to_string(),
                 reference: d.reference.clone(),
             });
-            self.replication_due = true;
+            if !refs.contains(&d.reference) {
+                refs.push(d.reference.clone());
+            }
         }
-    }
-
-    /// Replication's push ([`Step::Replicate`]): the root, whose history holds
-    /// every take's decisions, and every collision ref to the shared remote in one
-    /// atomic push (owner,
-    /// 2026-11-03: "yes, \"losing\" patches should still be part of the
-    /// history. i want to know who changed what when"). Replication is the
-    /// remote's one pusher; no referee step pushes. Never forced: the root only
-    /// moves forward, and collision refs never move.
-    fn replicate(&mut self) {
-        self.replication_due = false;
-        let remote = self.remote.to_string_lossy().into_owned();
-        let root = self.names.branch(TreeId::ROOT);
-        git(
-            &self.repo,
-            &[
-                "push",
-                "-q",
-                "--atomic",
-                &remote,
-                &format!("{root}:{root}"),
-                "refs/collisions/*:refs/collisions/*",
-            ],
-        );
+        refs
     }
 
     /// `t`'s head moved: a fork's new commit queues for its upstream (`up`),
@@ -1194,11 +1216,12 @@ impl World {
                 upstream,
                 writer: format!("c{id}"),
                 life: Life::Open,
-                head: head.clone(),
+                // Its first head is set, and published, just below.
+                head: String::new(),
                 txn: None,
             },
         );
-        self.set_head(id, &head);
+        self.set_head(id, &head, Vec::new());
         self.note(format!("create f{id} over {upstream:?}"));
         self.trace_call(match self.upstream_of(upstream) {
             None => RecordedCall::Fork { id },
@@ -1245,7 +1268,7 @@ impl World {
     pub fn target_head(&self, t: Target) -> String {
         match t {
             Target::Tree(t) => self.head(t),
-            Target::Txn(f, _) => self.forks[&f].txn.as_ref().expect("open").head.clone(),
+            Target::Txn(f, _) => self.forks[&f].txn.as_ref().expect("open").index.clone(),
         }
     }
 
@@ -1363,9 +1386,9 @@ impl World {
         let target = handle.target;
         let tokens = self.save_handle(&handle);
         self.note(format!("close h{h}: saved {tokens:?}"));
-        if let Target::Tree(t) = target {
-            self.wake(t);
-        }
+        // A close in a fork's transaction wakes the fork's takes too (R9.18).
+        let (Target::Tree(t) | Target::Txn(t, _)) = target;
+        self.wake(t);
         self.trace_call(RecordedCall::Close { h: u64::from(h) });
     }
 
@@ -1400,17 +1423,24 @@ impl World {
             Saved::NoChange => Vec::new(),
             Saved::Save(save) => {
                 let tokens = save.set.iter().map(|e| e.token.clone()).collect();
-                let c = self.commit_save(save);
-                self.recording.record_calls(c, handle.calls().to_vec());
+                let calls = handle.calls().to_vec();
+                match self.commit_save(save) {
+                    Some(c) => self.recording.record_calls(c, calls),
+                    None => {
+                        self.staged.last_mut().expect("staged").calls = Some(calls);
+                    }
+                }
                 tokens
             }
         }
     }
 
     /// A save's commit: on the target tree, first parent its head `at`,
-    /// moving its branch and queueing the move both ways (rule 1); or on
-    /// the open transaction's branch, staged.
-    fn commit_save(&mut self, save: Save) -> String {
+    /// moving its branch and queueing the move both ways (rule 1). In an
+    /// open transaction no commit: the save stages in its index (rule 5),
+    /// whose new tree it returns none for; the transaction's commit makes
+    /// the one commit.
+    fn commit_save(&mut self, save: Save) -> Option<String> {
         let Save {
             target,
             writer,
@@ -1423,21 +1453,33 @@ impl World {
         let t = self.tree_with(Some(at), &files);
         match target {
             Target::Txn(f, id) => {
-                let on = TreeNames::txn_name(id);
-                let commit = self.commit_by(&[at], &t, writer, "Direct", &on, open);
-                self.update_ref(&[&TreeNames::txn_branch(id), &commit]);
                 let txn = self.forks.get_mut(&f).expect("fork").txn.as_mut();
                 let txn = txn.expect("open");
-                txn.head = commit.clone();
+                txn.index = t.clone();
                 txn.staged.extend(set);
-                commit
+                txn.opens.extend(open);
+                self.staged.push(Staged {
+                    txn: id,
+                    before: at.to_string(),
+                    after: t,
+                    open,
+                    calls: None,
+                });
+                None
             }
             Target::Tree(tree) => {
-                let c = self.commit_by(&[at], &t, writer, "Direct", &self.names.name(tree), open);
-                self.set_head(tree, &c);
+                let c = self.commit_by(
+                    &[at],
+                    &t,
+                    writer,
+                    "Direct",
+                    &self.names.name(tree),
+                    open.as_slice(),
+                );
+                self.set_head(tree, &c, Vec::new());
                 self.entered.extend(set.into_iter().map(|e| (tree, e)));
                 self.moved(tree, true);
-                c
+                Some(c)
             }
         }
     }
@@ -1496,10 +1538,10 @@ impl World {
         self.commit_save(save);
         // An open of a file this call unlinked or replaced holds an object
         // no path names now, so no file of it is open: a take waiting for
-        // that close is woken.
-        if let Target::Tree(t) = h.target {
-            self.wake(t);
-        }
+        // that close is woken, in the tree or, for a transaction's call, its
+        // fork (R9.18).
+        let (Target::Tree(t) | Target::Txn(t, _)) = h.target;
+        self.wake(t);
         let caller = self.caller_of(&h.client);
         self.trace_call(match &h.kind {
             Kind::Rename { to, .. } => RecordedCall::Rename {
@@ -1556,8 +1598,9 @@ impl World {
 
     // ── transactions (rule 5) ────────────────────────────────────────────
 
-    /// Begin: a branch frozen at the fork's head. The fork keeps receiving
-    /// syncs; the program reads its own staged edits on the snapshot. A
+    /// Begin: a branch frozen at the fork's head, and an index on its tree.
+    /// The fork keeps receiving syncs; the program reads its own staged
+    /// edits in the index. A
     /// file open before begin keeps writing to the fork (its target is
     /// fixed at open); only the client's opens after begin write in the
     /// transaction.
@@ -1574,24 +1617,26 @@ impl World {
         self.next_txn += 1;
         let start = fork.head.clone();
         self.update_ref(&[&TreeNames::txn_branch(id), &start]);
+        let index = self.tree_of(&start);
         self.forks.get_mut(&f).expect("fork").txn = Some(Txn {
             id,
-            start: start.clone(),
-            head: start,
+            start,
+            index,
             staged: Vec::new(),
+            opens: Vec::new(),
         });
         self.note(format!("begin t{id} on f{f}"));
         Ok(id)
     }
 
-    /// The files open transaction `f` holds (R5.3): those it has saved
-    /// (its branch differs from its start in them), those it has open for
+    /// The files open transaction `f` holds (R5.3): those it has staged
+    /// (its index differs from begin's tree in them), those it has open for
     /// writing, and those of the calls already deferred, so a file's calls
     /// keep their order.
     fn txn_files(&self, f: TreeId) -> BTreeSet<String> {
         let fork = &self.forks[&f];
         let txn = fork.txn.as_ref().expect("open");
-        let mut files = self.changed(&txn.start, &txn.head);
+        let mut files = self.changed(&txn.start, &txn.index);
         files.extend(
             self.recording
                 .handles()
@@ -1666,30 +1711,50 @@ impl World {
         Ok(outcome)
     }
 
-    /// The commit alone: the transaction's branch lands in the fork's
-    /// current head as a child's change lands in its upstream, as one merge
-    /// commit named for the client, which then lands like any fork commit.
-    /// Never refused. The fork is the transaction's upstream, so a fork line
-    /// concurrent with a staged line (one a sync brought in since begin)
-    /// wins, and the transaction loses whole (rule 3e): none of its lines
-    /// apply, the merge keeps the fork's tree (so history shows the decision)
-    /// and the answer names every staged line. It goes ahead while programs hold
-    /// files open (the owner, 2026-11-05: R5.3): those files stay open, a
-    /// transaction's opens now write in the fork, and each saves at its close
-    /// as an ordinary later save.
+    /// The commit alone (MODEL.md rule 5). The transaction is recorded as
+    /// one commit, T (the owner, 2026-11-13: "a transaction should be
+    /// recorded as one commit"): its one parent begin's commit, its tree the
+    /// index as one save over begin's ([`content::one_save`]), named for the
+    /// fork's writer, `Agentfs-Cause: Transaction t<n>`, `Agentfs-Tree` the
+    /// fork (it is the fork's change, staged in its index), and one
+    /// `Agentfs-Open` per open it staged a save of. None
+    /// if that changes nothing over begin ([`TxnOutcome::Empty`]). T then
+    /// lands in the fork as a change lands in its upstream (R10.11): a
+    /// fast-forward if the fork is still at begin (R6.2), else judged whole
+    /// by the referee, given no direction, into one merge `[fork, T]` named
+    /// for the client, which then lands like any fork commit. The fork is
+    /// T's upstream, so a fork line concurrent with a staged line (one a sync
+    /// brought in since begin) wins, and the transaction loses whole (rule
+    /// 3e): none of its lines apply, the merge keeps the fork's tree (so
+    /// history shows the decision, R5.1), T stays reachable under the
+    /// collision's ref, and the answer names every line of T that lost.
+    ///
+    /// The commit is a program's call, not a queue entry: it takes no
+    /// lock and waits for none (R5.2 is rejected), and no take runs inside it
+    /// (a take is one step). It goes ahead while programs hold files open
+    /// (the owner, 2026-11-05: R5.3): those files stay open, and the
+    /// transaction's opens now write in the fork, each saving at its close
+    /// as an ordinary later save. The retarget needs no record of its own:
+    /// an open of a transaction whose ref `txn/<n>` is gone writes in the
+    /// fork, and the commit's ref update deletes that ref in the step that
+    /// moves the fork.
     pub fn commit_txn_only(&mut self, f: TreeId) -> Result<TxnOutcome, ModelError> {
         if self.forks[&f].txn.is_none() {
             return Err(ModelError::NoTransaction);
         }
         let fork = &self.forks[&f];
-        let ours = fork.head.clone();
+        let (ours, writer) = (fork.head.clone(), fork.writer.clone());
         let txn = fork.txn.as_ref().expect("open");
-        let (id, start, head) = (txn.id, txn.start.clone(), txn.head.clone());
-        let planned = (head != start).then(|| {
-            let edit = self.edit_of(&start, &head);
-            let m = self.resolve(Direction::Transaction, &ours, &edit, &head);
-            (edit, m)
-        });
+        let (id, start, index) = (txn.id, txn.start.clone(), txn.index.clone());
+        let files: BTreeMap<String, Content> = self
+            .changed(&start, &index)
+            .into_iter()
+            .filter_map(|p| {
+                let b = self.file(&start, &p);
+                let t = content::one_save(&b, &self.file(&index, &p));
+                (t != b).then_some((p, t))
+            })
+            .collect();
         let stay_open: Vec<(HandleId, Option<String>)> = self
             .recording
             .handles()
@@ -1698,64 +1763,81 @@ impl World {
             .collect();
         let txn = self.take_txn(f)?;
         let mut result = None;
-        let outcome = if let Some((edit, m)) = planned {
-            let writer = self.forks[&f].writer.clone();
-            let t = f;
-            let decisions = self.decide(t, &m);
-            let c = self.commit_deciding(
-                &[&ours, &txn.head],
-                &m.tree,
+        let outcome = if files.is_empty() {
+            TxnOutcome::Empty
+        } else {
+            let tree = self.tree_with(Some(&start), &files);
+            let t = self.commit_by(
+                &[&start],
+                &tree,
                 &writer,
-                &format!("Transaction t{}", txn.id),
-                &self.names.name(t),
-                &decisions,
+                &format!("Transaction t{id}"),
+                &self.names.name(f),
+                &txn.opens,
             );
-            self.record(t, Direction::Transaction, &m, &decisions, &ours, &c);
+            let edit = self.edit_of(&start, &t);
+            let (c, lines) = if ours == start {
+                // Made on the fork's current version: a fast-forward (R6.2).
+                self.set_head(f, &t, Vec::new());
+                (t.clone(), Vec::new())
+            } else {
+                let m = self.resolve(&ours, &edit, &t);
+                let decisions = self.decide(f, &m);
+                let c = self.commit_deciding(
+                    &[&ours, &t],
+                    &m.tree,
+                    &writer,
+                    &format!("Transaction t{id}"),
+                    &self.names.name(f),
+                    &decisions,
+                );
+                let refs = self.record(f, Direction::Transaction, &m, &decisions, &ours, &c);
+                self.set_head(f, &c, refs);
+                let lines: Vec<Overwritten> =
+                    m.collisions
+                        .iter()
+                        .flat_map(|l| {
+                            l.lines.iter().zip(l.lost.iter().zip(&l.won)).map(
+                                |(line, (lost, won))| Overwritten {
+                                    path: l.path.clone(),
+                                    line: line.clone(),
+                                    staged: lost.clone(),
+                                    kept: won.clone(),
+                                },
+                            )
+                        })
+                        .collect();
+                (c, lines)
+            };
             self.landings.push(Landed {
-                tree: t,
+                tree: f,
                 direction: Direction::Transaction,
                 before: ours.clone(),
                 result: c.clone(),
-                change: txn.head.clone(),
-                base: txn.start.clone(),
-                won: m.collisions.is_empty(),
+                change: t.clone(),
+                base: start.clone(),
+                won: lines.is_empty(),
             });
-            self.set_head(t, &c);
             for e in edit {
-                self.entered.push((t, e.edit()));
+                self.entered.push((f, e.edit()));
             }
-            self.moved(t, true);
+            self.moved(f, true);
             result = Some(c);
-            let lines: Vec<Overwritten> = m
-                .collisions
-                .iter()
-                .flat_map(|l| {
-                    l.lines
-                        .iter()
-                        .zip(l.lost.iter().zip(&l.won))
-                        .map(|(line, (lost, won))| Overwritten {
-                            path: l.path.clone(),
-                            line: line.clone(),
-                            staged: lost.clone(),
-                            kept: won.clone(),
-                        })
-                })
-                .collect();
             if lines.is_empty() {
                 TxnOutcome::Committed
             } else {
                 TxnOutcome::Lost { lines }
             }
-        } else {
-            TxnOutcome::Empty
         };
         for (h, file) in stay_open {
             self.recording.retarget(h, Target::Tree(f), file);
         }
-        self.note(format!("commit t{} on f{f}: {outcome:?}", txn.id));
+        self.note(format!("commit t{id} on f{f}: {outcome:?}"));
         self.ended.push(Ended {
             fork: f,
-            txn: txn.id,
+            txn: id,
+            start,
+            index,
             staged: txn.staged,
             how: TxnEnd::Commit(outcome.clone()),
             result,
@@ -1771,7 +1853,8 @@ impl World {
         Ok(())
     }
 
-    /// The rollback alone: drop the branch, and its files still open, unsaved.
+    /// The rollback alone: drop the branch and the index, and its files
+    /// still open, unsaved. No commit was made, so none is left.
     pub fn rollback_only(&mut self, f: TreeId) -> Result<(), ModelError> {
         let txn = self.take_txn(f)?;
         self.recording.drop_opens_of(Target::Txn(f, txn.id));
@@ -1780,6 +1863,8 @@ impl World {
         self.ended.push(Ended {
             fork: f,
             txn: txn.id,
+            start: txn.start,
+            index: txn.index,
             staged: txn.staged,
             how: TxnEnd::Rollback,
             result: None,
@@ -1857,30 +1942,47 @@ impl World {
     // ── crash and the journal (git-model.md §3) ──────────────────────────
 
     /// Every agentfs process dies at once (a view host, the history
-    /// service, the node). Each write call was in its tree's journal before
-    /// it returned (git-model.md §3; the model keeps an open's journaled
-    /// calls on its handle), so at restart, before any tree is served
-    /// again, each open is saved from the journal as its close would have
-    /// saved it, unless a save already names it (`Agentfs-Open`), and the
-    /// opens end: their descriptors died with the mount. An open no path
-    /// names raises its `OrphanDropped` event again (no save records it in
-    /// git: events are at least once). A call a transaction deferred did
-    /// return, so it stays in the journal behind that transaction, which
-    /// survives; an open whose close would defer defers (R5.3). A take is one
-    /// step (finding 49), so none is in progress; waits are dropped and found
-    /// again at the next take. Transactions survive: their branches are refs.
+    /// service, the node). A crash rolls back every open transaction (the
+    /// owner, 2026-11-02: "It's a transaction, so a failure is an implicit
+    /// rollback"; R5.3, picked 2026-11-05: "the crash rolls the transaction
+    /// back and applies the call"): its index and its opens are dropped, as
+    /// at a rollback, and then the calls it deferred apply, in order. Each
+    /// write call was in its tree's journal before it returned (git-model.md
+    /// §3; the model keeps an open's journaled calls on its handle), so at
+    /// restart, before any tree is served again, each open is saved from the
+    /// journal as its close would have saved it, unless a save already names
+    /// it (`Agentfs-Open`), and the opens end: their descriptors died with
+    /// the mount. An open no path names raises its `OrphanDropped` event
+    /// again (no save records it in git: events are at least once). A take
+    /// is one step (finding 49), so none is in progress; waits are dropped
+    /// and found again at the next take.
     pub fn crash(&mut self) {
-        for h in self.crash_down() {
+        let replay = self.crash_down();
+        let forks: Vec<TreeId> = self.forks.keys().copied().collect();
+        for f in forks {
+            while self.apply_deferred(f).is_some() {}
+        }
+        for h in replay {
             self.restart_open(h);
         }
     }
 
     /// [`World::crash`]'s first part: every process is down; waits are
-    /// dropped. Returns the opens the restart replays from the journal, in
-    /// order.
+    /// dropped; every open transaction is rolled back, its deferred calls
+    /// left for [`World::apply_deferred`]. Returns the opens the restart
+    /// replays from the journal, in order.
     pub fn crash_down(&mut self) -> Vec<HandleId> {
         self.note("crash: every agentfs process dies; restart replays the journal".into());
         self.queues.clear_waits();
+        let open: Vec<TreeId> = self
+            .forks
+            .values()
+            .filter(|f| f.txn.is_some())
+            .map(|f| f.id)
+            .collect();
+        for f in open {
+            self.rollback_only(f).expect("open");
+        }
         let replay = self
             .recording
             .handles()
@@ -1948,35 +2050,32 @@ impl World {
 
     // ── steps ────────────────────────────────────────────────────────────
 
-    /// Every step that can act now: a take in each live tree whose queue
+    /// Every tree step that can act now: a take in each live tree whose queue
     /// has an entry P1 lets go, and each fork ready to drop.
-    pub fn pending(&self) -> Vec<Step> {
-        let mut out: Vec<Step> = self
+    pub fn tree_steps(&self) -> Vec<TreeStep> {
+        let mut out: Vec<TreeStep> = self
             .queues
             .queued_trees()
             .into_iter()
             .filter(|t| self.alive(*t) && self.queues.scan(*t, self).is_some())
-            .map(Step::Next)
+            .map(TreeStep::Next)
             .collect();
         out.extend(
             self.forks
                 .keys()
                 .filter(|f| self.droppable(**f))
-                .map(|f| Step::Drop(*f)),
+                .map(|f| TreeStep::Drop(*f)),
         );
-        if self.replication_due {
-            out.push(Step::Replicate);
-        }
         out
     }
 
     /// Takes one step and returns how many queue entries it took: a
-    /// [`Step::Next`] takes the first its queue lets go and writes it, or
+    /// [`TreeStep::Next`] takes the first its queue lets go and writes it, or
     /// none when it waits (a prefix sync writes and leaves its entry
     /// queued). Nothing is held by a collision.
-    pub fn step(&mut self, s: &Step) -> usize {
+    pub fn take_step(&mut self, s: &TreeStep) -> usize {
         match s {
-            Step::Next(t) => {
+            TreeStep::Next(t) => {
                 self.last_take = None;
                 let choice = self.queues.choose(*t, self);
                 self.note_choice(*t, &choice);
@@ -1998,26 +2097,23 @@ impl World {
                 self.record_take(*t);
                 taken
             }
-            Step::Drop(f) => {
+            TreeStep::Drop(f) => {
                 self.trace_call(out_of_scope("drop"));
                 self.drop_fork(*f);
-                0
-            }
-            Step::Replicate => {
-                self.replicate();
                 0
             }
         }
     }
 
-    /// Takes steps until none is left.
-    pub fn settle(&mut self) {
+    /// Takes tree steps until none is left. It never pushes: a mirror is the
+    /// history service's ([`crate::service::HistoryService::settle`]).
+    pub fn settle_trees(&mut self) {
         for _ in 0..100_000 {
-            let Some(s) = self.pending().into_iter().next() else {
+            let Some(s) = self.tree_steps().into_iter().next() else {
                 return;
             };
             self.note_step(&s);
-            self.step(&s);
+            self.take_step(&s);
         }
         panic!("the queues never drained");
     }
@@ -2111,12 +2207,7 @@ impl World {
     /// Rule 3e, one take of commit `c` into the tree at `ours`: the change
     /// judged whole ([`World::resolve`]).
     fn judge(&self, ours: &str, c: &str) -> Merged {
-        self.resolve(
-            Direction::Landing,
-            ours,
-            &self.edit_of(&self.first_parent(c), c),
-            c,
-        )
+        self.resolve(ours, &self.edit_of(&self.first_parent(c), c), c)
     }
 
     /// Rule 3, a fork's change into its upstream `x`, the one place a
@@ -2144,7 +2235,7 @@ impl World {
                 won && m.tree == self.tree_of(tip),
                 "a fast-forward is a plain replacement"
             );
-            self.set_head(x, tip);
+            self.set_head(x, tip, Vec::new());
             self.fast_forwards += 1;
             self.landed(x, &ours, tip, tip, won);
             self.note(format!(
@@ -2163,10 +2254,10 @@ impl World {
             &self.names.name(x),
             &decisions,
         );
-        self.record(x, Direction::Landing, &m, &decisions, &ours, &new);
+        let refs = self.record(x, Direction::Landing, &m, &decisions, &ours, &new);
         self.landed(x, &ours, &new, tip, won);
         self.note(format!("landed f{from}'s {tip:.7} into {x:?}"));
-        self.set_head(x, &new);
+        self.set_head(x, &new, refs);
         self.moved(x, true);
     }
 
@@ -2260,7 +2351,7 @@ impl World {
             self.note(format!("synced {up:.7} into f{f}"));
             self.commit(&[&ours, up], &tree, "agentfs", "Sync", &self.names.name(x))
         };
-        self.set_head(x, &new);
+        self.set_head(x, &new, Vec::new());
         self.syncs.push((x, up.to_string(), new, entered));
         self.moved(x, false);
     }
@@ -2295,9 +2386,26 @@ impl World {
         self.trace.as_deref().unwrap_or_default()
     }
 
-    /// Names this world's trace file apart from others of its test.
+    /// Names this world's trace file apart from others of its test. Panics
+    /// once the run's name is taken ([`World::run_name`]): the label would
+    /// otherwise be silently ignored.
     pub fn label_trace(&mut self, label: String) {
+        assert!(
+            self.run_name.get().is_none(),
+            "label_trace({label:?}) after the run's name was taken"
+        );
         self.trace_label = Some(label);
+    }
+
+    /// The run's name for its trace and digest files,
+    /// `<thread name>[.<label>][.<n>]`: the n-th run of that name in this
+    /// process counts from 1 past the first. Taken at the first ask and kept,
+    /// so a run's two writers share one name; each asks only at drop, and
+    /// [`World::label_trace`] refuses to run after it.
+    pub(crate) fn run_name(&self) -> String {
+        self.run_name
+            .get_or_init(|| run_name(self.trace_label.as_deref()))
+            .clone()
     }
 
     fn trace_call(&mut self, call: RecordedCall) {
@@ -2609,7 +2717,7 @@ impl TreeCalls for World {
         let mut stepped = false;
         while self.queues.scan(t, self).is_some() {
             stepped = true;
-            self.step(&Step::Next(t));
+            self.take_step(&TreeStep::Next(t));
             if self.last_take.is_some() {
                 return Ok(Took::Taken);
             }
@@ -2664,9 +2772,7 @@ impl History<World> for ModelHistory {
 /// Where `World::drop` writes a recorded world's trace.
 const TRACE_DIR: &str = "AGENTFS_MODEL_TRACE_DIR";
 
-/// `<thread name>[.<label>][.<n>]`, a world's name for its trace and digest
-/// files: the n-th world of that name in this process counts from 1 past the
-/// first. A world takes one name, whichever of the two it writes.
+/// [`World::run_name`]'s name, counted.
 fn run_name(label: Option<&str>) -> String {
     static NAMES: Mutex<BTreeMap<String, u32>> = Mutex::new(BTreeMap::new());
     let thread = std::thread::current();
@@ -2686,22 +2792,19 @@ fn run_name(label: Option<&str>) -> String {
     name
 }
 
+/// Writes the trace (the digest is the history service's, which sees the
+/// mirror), then removes the world's directory.
 impl Drop for World {
     fn drop(&mut self) {
         let trace_dir = std::env::var_os(TRACE_DIR).filter(|_| self.trace.is_some());
-        let digest_dir = std::env::var_os(crate::digest::DIGEST_DIR);
-        if !std::thread::panicking() && (trace_dir.is_some() || digest_dir.is_some()) {
-            let name = run_name(self.trace_label.as_deref());
-            if let (Some(dir), Some(trace)) = (trace_dir, &self.trace) {
-                let file = Path::new(&dir).join(format!("{name}.trace"));
-                // A trace that cannot be written must fail the job, not a floor later.
-                std::fs::create_dir_all(&dir)
-                    .and_then(|()| std::fs::write(&file, crate::calls::render(trace)))
-                    .unwrap_or_else(|e| panic!("write {}: {e}", file.display()));
-            }
-            if let Some(dir) = digest_dir {
-                crate::digest::write(self, Path::new(&dir), &name);
-            }
+        if !std::thread::panicking()
+            && let (Some(dir), Some(trace)) = (trace_dir, &self.trace)
+        {
+            let file = Path::new(&dir).join(format!("{}.trace", self.run_name()));
+            // A trace that cannot be written must fail the job, not a floor later.
+            std::fs::create_dir_all(&dir)
+                .and_then(|()| std::fs::write(&file, crate::calls::render(trace)))
+                .unwrap_or_else(|e| panic!("write {}: {e}", file.display()));
         }
         if std::env::var_os("AGENTFS_MODEL_KEEP").is_none() {
             let _ = std::fs::remove_dir_all(&self.root);

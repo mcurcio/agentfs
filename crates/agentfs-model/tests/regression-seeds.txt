@@ -1,0 +1,16 @@
+# The regression seeds: the random runs' seeds that every `cargo test`, the digest's `check`
+# and the planted corpus run by default (VERIFYING.md, "Tiers"). The full sweep runs every
+# seed instead: AGENTFS_MODEL_SWEEP=1 (seeds 1..64, rounds 1..16) or AGENTFS_MODEL_SEEDS=N.
+#
+# Chosen by set cover, measured at seeds 1..64 (rounds 1..16) on 2026-11-13 by
+# `ci/regression-seeds.py --must 24`: every behaviour counter of the run's tally that any
+# seed of the sweep reached in random_interleavings_full_lineage, _adjacent_lines and
+# _phase1_scope (rounds: random_interleavings_rounds and _rounds_phase1_scope) is reached by
+# one of these, so the tally floors hold on them; the mountable phase 1 seeds among them
+# (3, 12 and 36; rounds 6 and 12) reach every counter the sweep's mountable seeds reach, so
+# real mounts replay seeds too; and seed 24 is kept for the planted corpus's one bug no
+# scenario catches (crash_relinks_a_dead_open, caught by oracle_orphans at seeds 24, 36 and
+# 40). A change to the generator moves what each seed draws: run the script again and the
+# corpus on this tier, never keep a list because it passes.
+random 1 3 9 12 24 32 36 45 63
+rounds 1 3 6 9 11 12

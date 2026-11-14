@@ -78,7 +78,7 @@ transaction is the named case.
 | Boundary | Base | Edit | The one rule |
 |---|---|---|---|
 | open to its tree (or transaction) | the commit it opened | edit commit | later close final; a synced line left for the upstream (R9.15, R9.16) |
-| transaction to fork | begin | `txn/<n>` | the fork's line wins, whole, and the program is told (R5, R3e) |
+| transaction to fork | begin | its one commit T (R5.5) | the fork's line wins, whole, and the program is told (R5, R3e) |
 | fork to upstream | last sync | its branch | the upstream wins, whole (R3a, R3b, R3e) |
 | upstream to fork | none | none | decides nothing |
 

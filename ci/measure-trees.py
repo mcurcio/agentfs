@@ -11,6 +11,10 @@ import statistics
 import subprocess
 import threading
 import time
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from tree_git_read import fanned  # noqa: E402
 
 
 class Report:
@@ -151,10 +155,15 @@ def calls(root, count):
             'elapsed_ns_including_close': time.monotonic_ns() - started, **distribution(samples)}
 
 
+def journal_size(journal):
+    """The journal's bytes: every segment in its directory."""
+    return sum(seg.stat().st_size for seg in journal.glob('*.seg'))
+
+
 def hour(root, wal, duration, interval):
     path = root / 'hour'
     fd = os.open(path, os.O_CREAT | os.O_TRUNC | os.O_WRONLY, 0o600)
-    start_size = wal.stat().st_size
+    start_size = journal_size(wal)
     started = time.monotonic_ns()
     deadline = started + int(duration * 1e9)
     count = 0
@@ -169,11 +178,11 @@ def hour(root, wal, duration, interval):
             if remaining > 0:
                 time.sleep(min(interval, remaining))
         elapsed = time.monotonic_ns() - started
-        end_size = wal.stat().st_size
+        end_size = journal_size(wal)
     finally:
         os.close(fd)
     return {'status': 'MEASURED' if duration >= 3600 and elapsed >= 3600 * 10**9 else 'SMOKE',
-            'definition': 'WAL logical file-size delta while one file stays write-open; excludes open and close records',
+            'definition': 'journal segments\' logical size delta while one file stays write-open; excludes open and close records',
             'write_pattern': 'pwrite 8-byte little-endian counter at offset 0; pause after each call',
             'pause_seconds': interval, 'write_count': count, 'bytes_written': count * 8,
             'elapsed_ns': elapsed, 'wal_start_bytes': start_size, 'wal_end_bytes': end_size,
@@ -376,7 +385,7 @@ def line_map_storage(root, state, count, metrics, timeout, report, name, sample_
     with open(root / 'line-map-measure', 'wb'):
         pass
     baseline = await_save_count(metrics, initial['saves'] + 1, timeout)
-    before_head = git(repo, 'rev-parse', 'refs/heads/main').strip()
+    before_head = git(repo, 'rev-parse', 'refs/heads/root').strip()
     before = disk_usage(repo)
     # Git's files format: the refs are a copy under refs/ (git-model §3).
     before_refs = disk_usage(repo / 'refs')
@@ -410,15 +419,16 @@ def line_map_storage(root, state, count, metrics, timeout, report, name, sample_
     # the last save's copy has landed.
     deadline = time.monotonic() + timeout
     while True:
-        after_head = git(repo, 'rev-parse', 'refs/heads/main').strip()
+        after_head = git(repo, 'rev-parse', 'refs/heads/root').strip()
         commits = git(repo, 'rev-list', after_head, '^' + before_head).splitlines()
         if len(commits) >= count or time.monotonic() > deadline:
             break
         time.sleep(0.05)
     if len(commits) != count:
         raise RuntimeError('expected %d save commits, found %d' % (count, len(commits)))
-    # Metadata is an envelope blob containing line maps and object/file IDs.
-    expressions = ''.join(c + ':metadata.json\n' for c in commits)
+    # The file's line map: lines/<aa>/<bb>/<name>, [identity, line map] (docs/trees.md).
+    name = 'line-map-measure'
+    expressions = ''.join('%s:lines/%s\n' % (c, fanned(name)) for c in commits)
     records = git(repo, 'cat-file', '--batch-check=%(objectname) %(objecttype) %(objectsize) %(objectsize:disk)',
                   input_data=expressions).splitlines()
     if len(records) != count:
@@ -441,7 +451,7 @@ def line_map_storage(root, state, count, metrics, timeout, report, name, sample_
         raise RuntimeError('invalid commit object records')
     return {'status': 'MEASURED', 'save_count': count, 'elapsed_ns': elapsed,
             'pattern': 'seed an empty file before the window; truncate and write one distinct 9-byte line, close after each save',
-            'metadata_definition': 'metadata.json envelope blobs include line maps and object/file IDs; namespace.json is separate',
+            'metadata_definition': 'the file\'s lines/<aa>/<bb>/<name> blob: its identity and line map; name histories are separate',
             'metadata_snapshot_logical_bytes_sum': sum(sizes), 'final_metadata_logical_bytes': sizes[0],
             'unique_metadata_blob_count': len(objects),
             'unique_metadata_logical_bytes': sum(v[0] for v in objects.values()),
@@ -587,7 +597,7 @@ def main():
             if a.mode in ('hour', 'smoke'):
                 with Ambient(report, a.metrics, 'ambient', pid=a.mount_pid):
                     report.measured('hour_journal_bytes', hour(
-                        Path(a.main), Path(a.state) / 'calls.wal',
+                        Path(a.main), Path(a.state) / 'journal',
                         3600 if a.mode == 'hour' else 2, a.interval))
             if a.landing and a.mode == 'calls':
                 with Ambient(report, a.metrics, 'ambient', pid=a.mount_pid):

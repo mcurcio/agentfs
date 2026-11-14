@@ -3,8 +3,10 @@
 **Proposed, not built.** This page proposes the Replication domain (remotes, credentials, pushes and divergence), one part of the system around the git model ([the system](../system.md)). The git model ([git-model.md](../git-model.md)) wins wherever the two disagree. Rust sketches show surfaces only. The commit that lands the slice that builds this domain deletes this page and moves the behaviour into the library or operator docs.
 
 **What the git model already fixes** (git-model §4): Replication is the shared remote's only pusher; its refspec
-carries the root's branch and every collision ref; a recorded collision makes a
-push due; no queue step waits on the network. This page covers the rest: remotes, credentials, attempts, divergence
+carries the root's branch and every collision ref; a move of the root or a recorded collision makes a
+push due; no queue step waits on the network. The model has one mirror of this kind, outside the trees: tree history
+publishes each move of a head with the collision refs its take recorded, and the mirror reads those moves to know it is
+due (`crates/agentfs-model/src/mirror.rs`). This page covers the rest: remotes, credentials, attempts, divergence
 and settlement.
 
 ## 1. What Replication owns, and what it is not

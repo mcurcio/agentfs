@@ -1,14 +1,18 @@
-//! Shared mappings (ledger R1.4, git-model §3) through the real `Volume`, its
+//! Shared mappings (ledger R1.4, git-model §3) through the real `TreeActor`, its
 //! journal and its Git history, driven by a double of the kernel's one page map
 //! and one size per file. The double holds this suite's beliefs about fs/fuse, so
 //! it proves the logic only; ci/trees-pagecache.py judges the kernel.
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use agentfs_core::tree_actor::Volume;
+use agentfs_core::tree_actor::{TreeActor, TreeId};
+use trees::{checkout, new_actor, reopen, rowless_fork, writer};
+
+#[path = "support/trees.rs"]
+mod trees;
 
 const PAGE: u64 = 4096;
-const TREE: &str = "main";
+const TREE: TreeId = TreeId::Root;
 const PATH: &str = "shared";
 const SEED: &[u8] = b"abcdefgh";
 
@@ -19,7 +23,7 @@ struct Cached {
 
 /// One file's page cache, as fs/fuse keeps it.
 struct Kernel {
-    v: Volume,
+    v: TreeActor,
     object: u64,
     pages: BTreeMap<u64, Cached>,
     size: u64,
@@ -31,8 +35,8 @@ struct Kernel {
 impl Kernel {
     /// A file holding `seed`, saved, with nothing open.
     fn new(root: &Path, seed: &[u8]) -> Self {
-        let mut v = Volume::open(root).unwrap();
-        let h = v.write_open(TREE, PATH, "seed", true).unwrap();
+        let mut v = new_actor(root);
+        let h = v.write_open(TREE, PATH, &writer("seed"), true).unwrap();
         v.write(h, 0, seed, false).unwrap();
         let object = v.open_object(h).unwrap();
         v.close(h).unwrap();
@@ -52,7 +56,9 @@ impl Kernel {
     /// `open(2)`: laundering and invalidation, then the OPEN.
     fn open(&mut self, writer: &str) -> u64 {
         self.invalidate();
-        self.v.write_open(TREE, PATH, writer, false).unwrap()
+        self.v
+            .write_open(TREE, PATH, &trees::writer(writer), false)
+            .unwrap()
     }
 
     /// `mmap(2)` of a direct-I/O handle: laundering and invalidation.
@@ -180,14 +186,14 @@ fn tree_with_seed(seed: &[u8]) -> (tempfile::TempDir, Kernel) {
     (tmp, kernel)
 }
 
-/// How many commits on main name this open.
+/// How many commits on the root name this open.
 fn saves_of(root: &Path, open: u64) -> usize {
     let out = std::process::Command::new("git")
         .arg("--git-dir")
         .arg(root.join("history.git"))
         .args([
             "log",
-            "main",
+            &TREE.to_string(),
             "--format=%(trailers:key=Agentfs-Open,valueonly)",
         ])
         .output()
@@ -363,12 +369,14 @@ fn a_recovery_close_keeps_a_store_whose_handle_closed() {
     k.store(0, b"12");
     k.close(b);
     drop(k);
-    let v = Volume::open(tmp.path()).unwrap();
+    let v = reopen(tmp.path());
+    v.settle().unwrap();
     assert_eq!(v.read(TREE, PATH).unwrap(), b"12YZefgh", "Linux's bytes");
     assert_eq!(saves_of(tmp.path(), a), 1);
     assert_eq!(saves_of(tmp.path(), b), 1);
     drop(v);
-    let v = Volume::open(tmp.path()).unwrap();
+    let v = reopen(tmp.path());
+    v.settle().unwrap();
     assert_eq!(saves_of(tmp.path(), a), 1, "exactly once");
     assert_eq!(v.read(TREE, PATH).unwrap(), b"12YZefgh");
 }
@@ -386,7 +394,8 @@ fn a_recovery_close_does_not_reapply_a_saved_store() {
     k.pwrite(d, 0, b"WX");
     k.close(d);
     drop(k);
-    let v = Volume::open(tmp.path()).unwrap();
+    let v = reopen(tmp.path());
+    v.settle().unwrap();
     assert_eq!(v.read(TREE, PATH).unwrap(), b"WXcdefgQ");
     assert_eq!(saves_of(tmp.path(), a), 1, "exactly once");
 }
@@ -402,7 +411,8 @@ fn a_recovery_close_saves_a_flushed_store_no_close_saved() {
     // Not flushed: the view host's death loses it, a stated cost of R1.4.
     k.store(6, b"!!");
     drop(k);
-    let v = Volume::open(tmp.path()).unwrap();
+    let v = reopen(tmp.path());
+    v.settle().unwrap();
     assert_eq!(v.read(TREE, PATH).unwrap(), b"ab12efgh");
     assert_eq!(saves_of(tmp.path(), a), 1, "exactly once");
 }
@@ -414,13 +424,12 @@ fn a_page_write_records_only_changed_bytes_and_a_clean_one_nothing() {
     let a = k.open("a");
     k.map(a);
     k.store(0, b"a"); // The same byte: dirty, and nothing changed.
-    let journal = tmp.path().join("calls.wal");
-    let before = std::fs::metadata(&journal).unwrap().len();
+    let before = trees::journal_len(tmp.path());
     k.flush();
-    assert_eq!(std::fs::metadata(&journal).unwrap().len(), before);
+    assert_eq!(trees::journal_len(tmp.path()), before);
     k.store(0, b"Z");
     k.flush();
-    assert!(std::fs::metadata(&journal).unwrap().len() > before);
+    assert!(trees::journal_len(tmp.path()) > before);
     k.close(a);
     assert_eq!(k.saved(), b"Zbcdefgh");
 }
@@ -452,9 +461,17 @@ fn a_writable_descriptor_reads_page_writes_and_a_read_only_one_keeps_its_snapsho
     k.map(a);
     k.store(0, b"12");
     k.flush();
-    assert_eq!(k.v.read_open(b).unwrap(), b"12cdefgh", "an open before it");
+    assert_eq!(
+        k.v.read_open(b).unwrap().to_vec().unwrap(),
+        b"12cdefgh",
+        "an open before it"
+    );
     let c = k.open("c");
-    assert_eq!(k.v.read_open(c).unwrap(), b"12cdefgh", "an open after it");
+    assert_eq!(
+        k.v.read_open(c).unwrap().to_vec().unwrap(),
+        b"12cdefgh",
+        "an open after it"
+    );
     assert_eq!(k.v.read(TREE, PATH).unwrap(), SEED, "a new read-only open");
 }
 
@@ -486,7 +503,7 @@ fn an_unlinked_file_answers_its_size_while_a_write_open_lives() {
     let (_tmp, mut k) = tree_with_seed(SEED);
     let a = k.open("a");
     k.pwrite(a, 8, b"XY");
-    k.v.unlink(TREE, PATH, "w").unwrap();
+    k.v.unlink(TREE, PATH, &writer("w")).unwrap();
     assert_eq!(k.v.inode_size(TREE, k.object), Some(10));
     k.v.close(a).unwrap();
     assert_eq!(k.v.inode_size(TREE, k.object), None);
@@ -512,24 +529,54 @@ fn a_fill_with_no_write_open_reads_saved_bytes_and_keeps_no_state() {
 #[test]
 fn a_take_names_the_files_it_changed_and_a_save_does_not() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut v = Volume::open(tmp.path()).unwrap();
-    let h = v.write_open(TREE, PATH, "seed", true).unwrap();
+    let mut v = new_actor(tmp.path());
+    let h = v.write_open(TREE, PATH, &writer("seed"), true).unwrap();
     v.write(h, 0, SEED, false).unwrap();
     let object = v.open_object(h).unwrap();
     v.close(h).unwrap();
-    let h = v.write_open(TREE, "other", "seed", true).unwrap();
+    let h = v.write_open(TREE, "other", &writer("seed"), true).unwrap();
     v.write(h, 0, b"other", false).unwrap();
     v.close(h).unwrap();
-    let fork = v.fork().unwrap();
+    let fork = rowless_fork(&mut v);
     while v.progress().unwrap() {}
     v.drain_changed();
 
-    let h = v.write_open(TREE, PATH, "w", false).unwrap();
+    let h = v.write_open(TREE, PATH, &writer("w"), false).unwrap();
     v.write(h, 0, b"WX", false).unwrap();
     v.close(h).unwrap();
     assert_eq!(v.drain_changed(), [], "a save is no take");
     while v.progress().unwrap() {}
-    assert_eq!(v.read(&fork, PATH).unwrap(), b"WXcdefgh");
-    assert_eq!(v.drain_changed(), [(fork.clone(), object)]);
+    assert_eq!(v.read(fork, PATH).unwrap(), b"WXcdefgh");
+    assert_eq!(v.drain_changed(), [(fork, object)]);
     assert_eq!(v.drain_changed(), [], "drained");
+}
+
+// The builder applies a close's page-write pieces from the journal, by the
+// close rule the actor used: a mapped store written back on one handle and
+// saved by another open's close is in the commit, and the build agrees with
+// the save's length and checksum (a builder without the pieces refuses it).
+#[test]
+fn a_mapped_write_after_a_close_survives_the_build() {
+    let (tmp, mut k) = tree_with_seed(SEED);
+    let (a, b) = (k.open("a"), k.open("b"));
+    k.close(a);
+    k.map(b);
+    k.store(0, b"12");
+    k.flush();
+    assert_eq!(k.saved(), SEED, "a page write is no save");
+    let c = k.open("c");
+    k.close(c);
+    assert_eq!(k.saved(), b"12cdefgh");
+    k.v.settle().unwrap();
+    assert_eq!(
+        std::fs::read(checkout(tmp.path(), "root", PATH)).unwrap(),
+        b"12cdefgh",
+        "the build applied the piece the close saved"
+    );
+    k.close(b);
+    k.v.settle().unwrap();
+    assert_eq!(
+        std::fs::read(checkout(tmp.path(), "root", PATH)).unwrap(),
+        b"12cdefgh"
+    );
 }

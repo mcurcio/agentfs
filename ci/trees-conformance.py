@@ -16,7 +16,11 @@ import tempfile
 import time
 import traceback
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from tree_git_read import fanned  # noqa: E402
+
 MAIN, FORK, REPO = map(Path, sys.argv[1:4])
+ROOT_REF = "refs/heads/root"
 FORK_REF = "refs/heads/" + sys.argv[4]
 METRICS = Path(sys.argv[5])
 ORACLE = sys.argv[6]
@@ -46,7 +50,7 @@ def until(description, predicate):
 def bytes_at(ref, name):
     commit = git("rev-parse", f"{ref}^{{commit}}").strip().decode()
     message = git("show", "-s", "--format=%B", commit).decode()
-    path = f"files/{name}" if "Agentfs-Format: envelope-1" in message.splitlines() else name
+    path = f"files/{fanned(name)}" if "Agentfs-Format: envelope-1" in message.splitlines() else name
     return git("show", f"{commit}:{path}")
 
 
@@ -83,14 +87,14 @@ def save(root, ref, name, data):
 
 
 def converged(name, expected):
-    for ref in ("main", FORK_REF):
+    for ref in (ROOT_REF, FORK_REF):
         wait_ref(ref, name, expected)
     assert (MAIN / name).read_bytes() == expected
     assert (FORK / name).read_bytes() == expected
 
 
 def seed(name, data):
-    save(MAIN, "main", name, data)
+    save(MAIN, ROOT_REF, name, data)
     converged(name, data)
 
 
@@ -111,18 +115,18 @@ def concurrent(name, base, parent, child, result, losing=False):
     converged(name, result)
     # Compare lineage with the model using commits read from the actual Git
     # graph. The parent save may already have been followed by a take.
-    parent_commit = direct_commit("main", name, parent)
+    parent_commit = direct_commit(ROOT_REF, name, parent)
     assert_aligned(parent_commit, name)
     for commit, key in ((parent_commit, "parent_reachable"), (child_commit, "child_reachable")):
         status = subprocess.run(["git", "--git-dir=" + str(REPO), "merge-base",
-                                 "--is-ancestor", commit, "main"]).returncode
+                                 "--is-ancestor", commit, ROOT_REF]).returncode
         assert status in (0, 1) and (status == 0) == model[key], (key, commit, status)
     if losing:
         refs = git("for-each-ref", "--format=%(refname)", "refs/collisions/").decode().splitlines()
         assert any(git("rev-parse", ref).strip().decode() == child_commit for ref in refs), (
             "losing save lacks collision ref", child_commit, refs)
         assert bytes_at(child_commit, name) == child
-        messages = git("log", "--format=%B", "main").decode()
+        messages = git("log", "--format=%B", ROOT_REF).decode()
         assert "Agentfs-Collisions:" in messages, "collision decision absent from history"
 
 
@@ -158,6 +162,38 @@ def histogram_hunks(old, new):
             hunks.append((old_start, old_count, new_start, new_count))
     assert (old == new) == (not hunks), (old, new, proc.stdout)
     return hunks
+
+
+def nth(version, n):
+    """The version n after `version` ("<event>:<index>") in its event's numbering."""
+    if n == 0:
+        return version
+    event, index = version.split(":")
+    return f"{event}:{int(index) + n}"
+
+
+def expand(line_map, image):
+    """A stored line map (runs, docs/trees.md "What a commit holds") line by
+    line, each live line's bytes read from its file: a line ends at a newline,
+    or after `open` bytes for a run's last line that has none."""
+    lines, rest = [], image
+    for run in line_map["lines"]:
+        for i in range(run["count"]):
+            data = None
+            if not run.get("dead"):
+                if "open" in run and i + 1 == run["count"]:
+                    size = run["open"]
+                else:
+                    size = rest.index(b"\n") + 1
+                data, rest = list(rest[:size]), rest[size:]
+            lines.append({"identity": nth(run["identity"], i),
+                          "version": nth(run["version"], i), "bytes": data})
+    assert rest == b"", "bytes past the map's live lines"
+    ancestors = {}
+    for run in line_map["ancestors"]:
+        for i in range(run["count"]):
+            ancestors[nth(run["version"], i)] = nth(run["over"], i) if run.get("over") else None
+    return {"lines": lines, "ancestors": ancestors}
 
 
 def check_histogram(before, after, old_image, new_image):
@@ -205,18 +241,18 @@ def assert_aligned(commit, name):
             probe = subprocess.run(["git", "--git-dir=" + str(REPO), "cat-file", "-e", f"{rev}:{name}"], stderr=subprocess.DEVNULL)
             assert probe.returncode != 0, (rev, name, "legacy file has no map")
             return {"lines": [], "ancestors": {}}, b""
-        metadata = json.loads(git("show", f"{rev}:metadata.json"))
-        if name not in metadata:
+        has_map = subprocess.run(["git", "--git-dir=" + str(REPO), "cat-file", "-e", f"{rev}:lines/{fanned(name)}"], stderr=subprocess.DEVNULL)
+        if has_map.returncode != 0:
             assert creation_allowed
-            probe = subprocess.run(["git", "--git-dir=" + str(REPO), "cat-file", "-e", f"{rev}:files/{name}"], stderr=subprocess.DEVNULL)
-            assert probe.returncode != 0, (rev, name, "file missing metadata")
+            probe = subprocess.run(["git", "--git-dir=" + str(REPO), "cat-file", "-e", f"{rev}:files/{fanned(name)}"], stderr=subprocess.DEVNULL)
+            assert probe.returncode != 0, (rev, name, "file missing its line map")
             return {"lines": [], "ancestors": {}}, b""
-        line_map = metadata[name][2]
+        image = bytes_at(rev, name)
+        line_map = expand(json.loads(git("show", f"{rev}:lines/{fanned(name)}"))[1], image)
         lines = line_map["lines"]
         ids = [line["identity"] for line in lines]
         versions = [line["version"] for line in lines]
         assert len(ids) == len(set(ids)) and len(versions) == len(set(versions))
-        image = bytes_at(rev, name)
         assert b"".join(bytes(line["bytes"]) for line in lines if line["bytes"] is not None) == image
         assert all(v in line_map["ancestors"] for v in versions)
         return line_map, image
@@ -240,7 +276,7 @@ def flow():
     seed("flow", b"initial\n")
     save(FORK, FORK_REF, "flow", b"sandbox\n")
     converged("flow", b"sandbox\n")
-    save(MAIN, "main", "flow", b"parent\n")
+    save(MAIN, ROOT_REF, "flow", b"parent\n")
     converged("flow", b"parent\n")
     save(FORK, FORK_REF, "flow", b"after-sync\n")
     converged("flow", b"after-sync\n")
@@ -275,8 +311,8 @@ def undecided():
     seed("undecided", b"base\n")
     with (MAIN / "undecided").open("r+b", buffering=0):
         save(FORK, FORK_REF, "undecided", b"base\nchild\n")
-        save(MAIN, "main", "undecided", b"base\n}")
-        parent_commit = git("rev-parse", "main").strip().decode()
+        save(MAIN, ROOT_REF, "undecided", b"base\n}")
+        parent_commit = git("rev-parse", ROOT_REF).strip().decode()
         def parent_reached_fork():
             return subprocess.run(["git", "--git-dir=" + str(REPO), "merge-base",
                                    "--is-ancestor", parent_commit, FORK_REF]).returncode == 0
@@ -302,19 +338,19 @@ def progress_p1():
         save(FORK, FORK_REF, "later", b"later\n")
         # The queued predecessor provides the observation barrier, while the
         # open writer prevents the take from completing.
-        assert bytes_at("main", "log") == b"base\n"
-        assert bytes_at("main", "later") == b"base\n"
+        assert bytes_at(ROOT_REF, "log") == b"base\n"
+        assert bytes_at(ROOT_REF, "later") == b"base\n"
         # Ordinary cooperating programs: the parent holds the waited file,
         # while a child appends; both must finish without a queue deadlock.
         subprocess.run([sys.executable, "-c",
                         "import sys; open(sys.argv[1], 'ab').write(b'child\\n')",
                         str(MAIN / "log")], check=True, timeout=TIMEOUT)
-        wait_ref("main", "log", b"base\nchild\n")
-        assert_aligned(direct_commit("main", "log", b"base\nchild\n"), "log")
+        wait_ref(ROOT_REF, "log", b"base\nchild\n")
+        assert_aligned(direct_commit(ROOT_REF, "log", b"base\nchild\n"), "log")
         subprocess.run(["sh", "-c", 'printf pipeline | cat > "$1"', "sh",
                         str(MAIN / "pipeline")], check=True, timeout=TIMEOUT)
-        wait_ref("main", "pipeline", b"pipeline")
-        assert_aligned(direct_commit("main", "pipeline", b"pipeline"), "pipeline")
+        wait_ref(ROOT_REF, "pipeline", b"pipeline")
+        assert_aligned(direct_commit(ROOT_REF, "pipeline", b"pipeline"), "pipeline")
     converged("later", b"later\n")
     expected = bytes.fromhex(json.loads(subprocess.check_output([ORACLE, "p1-append"]))["root"])
     converged("log", expected)
@@ -326,12 +362,12 @@ def progress_p2():
     for name in ("prefix", "held", "suffix"):
         seed(name, b"base\n")
     with (FORK / "held").open("r+b", buffering=0):
-        save(MAIN, "main", "prefix", b"prefix\n")
+        save(MAIN, ROOT_REF, "prefix", b"prefix\n")
         wait_ref(FORK_REF, "prefix", b"prefix\n")
         before = json.loads(METRICS.read_text())["waits"]
-        save(MAIN, "main", "held", b"held\n")
+        save(MAIN, ROOT_REF, "held", b"held\n")
         until("sync wait metric", lambda: json.loads(METRICS.read_text())["waits"] > before)
-        save(MAIN, "main", "suffix", b"suffix\n")
+        save(MAIN, ROOT_REF, "suffix", b"suffix\n")
         assert bytes_at(FORK_REF, "held") == b"base\n"
         assert bytes_at(FORK_REF, "suffix") == b"base\n"
     converged("held", b"held\n")
@@ -363,8 +399,8 @@ def byte_calls():
             with (MAIN / "byte-explicit").open(mode, buffering=0) as mounted:
                 operation(mounted.fileno())
             expected = os.pread(plain.fileno(), 256, 0)
-            wait_ref("main", "byte-explicit", expected)
-            assert_aligned(direct_commit("main", "byte-explicit", expected), "byte-explicit")
+            wait_ref(ROOT_REF, "byte-explicit", expected)
+            assert_aligned(direct_commit(ROOT_REF, "byte-explicit", expected), "byte-explicit")
             converged("byte-explicit", expected)
 
     # A fixed deterministic byte-call workload. The plain Linux file is the
@@ -385,10 +421,10 @@ def byte_calls():
                 assert os.pwrite(f.fileno(), payload, offset) == len(payload)
         expected = os.pread(oracle.fileno(), 256, 0)
         assert os.pread(f.fileno(), 256, 0) == expected
-    wait_ref("main", "bytes", expected)
+    wait_ref(ROOT_REF, "bytes", expected)
     converged("bytes", expected)
     # Inspect the actual direct save and its first parent, not actor state.
-    commits = git("rev-list", "--first-parent", "main").decode().splitlines()
+    commits = git("rev-list", "--first-parent", ROOT_REF).decode().splitlines()
     commit = next(c for c in commits if bytes_at(c, "bytes") == expected and
                   "Agentfs-Cause: Direct" in git("show", "-s", "--format=%B", c).decode())
     assert_aligned(commit, "bytes")
@@ -403,15 +439,15 @@ def finding_32():
         save(FORK, FORK_REF, "finding32", b"y")
         first = direct_commit(FORK_REF, "finding32", b"y")
         with (FORK / "finding32").open("r+b", buffering=0) as edit:
-            save(MAIN, "main", "finding32", bytes.fromhex(model["parent"]))
+            save(MAIN, ROOT_REF, "finding32", bytes.fromhex(model["parent"]))
             assert os.pwrite(edit.fileno(), b"n6", 0) == 2
         wait_ref(FORK_REF, "finding32", b"n6")
         assert_aligned(direct_commit(FORK_REF, "finding32", b"n6"), "finding32")
         second = direct_commit(FORK_REF, "finding32", b"n6")
     def queues_empty():
-        return not git("for-each-ref", "--format=%(refname)", "refs/queue/main/", "refs/queue/" + sys.argv[4] + "/").strip()
+        return not git("for-each-ref", "--format=%(refname)", "refs/queue/root/", "refs/queue/" + sys.argv[4] + "/").strip()
     until("finding 32 queue drain", queues_empty)
-    commit = git("rev-parse", "main").strip().decode()
+    commit = git("rev-parse", ROOT_REF).strip().decode()
     refs = git("for-each-ref", "--format=%(objectname)", "refs/collisions/").decode().splitlines()
     assert first in refs, ("first save did not lose whole", first, refs)
     assert second in refs, ("second save did not lose whole", second, refs)
@@ -424,7 +460,8 @@ def finding_32():
         "finding 32 bytes differ from model", bytes_at(commit, "finding32"), model["root"])
     message = git("show", "-s", "--format=%B", commit).decode().splitlines()
     assert "Agentfs-Format: envelope-1" in message
-    lines = json.loads(git("show", f"{commit}:metadata.json"))["finding32"][2]["lines"]
+    lines = expand(json.loads(git("show", f"{commit}:lines/{fanned('finding32')}"))[1],
+                   bytes_at(commit, "finding32"))["lines"]
     live = [bytes(line["bytes"]) for line in lines if line["bytes"] is not None]
     assert all(line.endswith(b"\n") for line in live[:-1]), (
         "finding 32: an unfinished line precedes another line", live, bytes_at(commit, "finding32"))
@@ -439,8 +476,8 @@ def finding_33():
     with (MAIN / "finding33").open("r+b", buffering=0):
         save(FORK, FORK_REF, "finding33", b"y")
         child = direct_commit(FORK_REF, "finding33", b"y")
-        save(MAIN, "main", "finding33", b"a\nb\nm7\n")
-        parent_commit = git("rev-parse", "main").strip().decode()
+        save(MAIN, ROOT_REF, "finding33", b"a\nb\nm7\n")
+        parent_commit = git("rev-parse", ROOT_REF).strip().decode()
         def parent_reached_fork():
             return subprocess.run(["git", "--git-dir=" + str(REPO), "merge-base",
                                    "--is-ancestor", parent_commit, FORK_REF]).returncode == 0

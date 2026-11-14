@@ -90,6 +90,6 @@ assert_eq "$(printf 'fn alpha() -> u32 { 10 }\nfn beta() -> u32 { 20 }')" "$(cat
   "both patches are in lib.rs"
 for n in 1 2; do
   git --git-dir "$STATE/git" log --format=%B refs/heads/agentfs/demo |
-    grep -qx "Agentfs-Inbox: $n" || fail "no commit applies patch $n"
+    grep -x "Agentfs-Inbox: $n" >/dev/null || fail "no commit applies patch $n"
 done
 pass "each patch is one commit on the branch"

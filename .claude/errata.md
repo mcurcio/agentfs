@@ -620,3 +620,570 @@ Not blocking; the suite is built and green. Findings about the brief and the doc
    clause ("a tree's name or ref, given only through `world::TreeNames`") that blessed the
    change introducing `TreeNames`. It is removed; module-cut.md's 3c row says the full gate's
    test applied and what the light run does not show.
+
+## 2026-11-13, module cut step 6 (implementer and fix round)
+
+1. **`planted/run.py` hard-coded the check names it counts.** The design left run.py out of every
+   slice, so a new check was classed `assert` until listed (it bit S1's `mirror_current`). Class
+   fix in the fix round: run.py reads the names from the code (`named("...")` in `src/check.rs`,
+   messages starting `oracle_<name>: ` or `ledger: ` in the tests).
+2. **R9.18 needs a wake the design did not list.** A close or path call inside a transaction
+   must wake the fork's waiting takes; without it a take held by that open waits forever and
+   `locks` fires. Built in S3; corpus bug `transaction_close_wakes_nothing` plants its absence.
+3. **S1 could not keep "anchors clean".** Passing collision refs from `record` to `set_head`
+   changed the anchor of `collision_record_in_the_wrong_commit`, re-anchored in S1;
+   `judge_skips_one_of_a_takes_changes` was re-anchored after `cargo fmt`.
+4. **S2's bound, "the first differing commit is a Transaction commit", cannot be read in
+   canonical-text order**: the walk can print later, unrelated commits before the
+   transaction's. S2 used "the only changed commit with unchanged parents"; S3 used step-log
+   diffs between the two builds.
+5. **Row 6's "as the engine's `RootName` does" named nothing on main** (step 5b brings and then
+   removes it). The fix round applies the design round's erratum: the `HEAD` refusal in
+   `TreeNames::new`, its test cases and the row-6 clause are gone.
+6. **The moved count of `random_interleavings_git_merge_base` (ignored, finding 1) went from 15
+   to 16 of 64 seeds**: seed 17 is a harness panic ("a model file in git") under that rejected
+   policy, only after S3. VERIFYING.md is updated.
+7. **The fix brief's "tag R9.18 and R10.11 `approved`, as R10.5" rests on a misreading**: R10.5
+   is tagged `owner` on main and here, as is R11.5, though both rest on a letter answer to
+   agent-worded options. R9.18 and R10.11 are now `approved`; R10.5 and R11.5 are left for a
+   ledger-wide tag pass.
+8. **No corpus bug can isolate R10.5**: the referee takes no direction, so a transaction's
+   commit and a landing are one code path; `line_follows_the_upstreams_unfinished_last_line`
+   switches R10.4 off for both.
+
+## 2026-11-13, Part B: a transaction recorded as one commit
+
+1. **git-model §9 always merged a transaction's commit**, against R6.2 under R10.11 (a landing on the current head is
+   a fast-forward). The model now fast-forwards the fork to T when the fork is still at begin, and the check
+   `transactions_end_as_told` fails a merge made at begin.
+2. **git-model §4 and §9 named `refs/txn-start/<n>`**, which the model never wrote. Gone: `txn/<n>` itself now holds
+   begin and never moves.
+3. **MODEL.md rule 12 replayed a transaction's open "into the transaction's branch"**, and the model kept a
+   transaction alive across a crash, against R5.3's recorded pick ("the crash rolls the transaction back and applies
+   the call", 2026-11-05) and A13. The design for this part recommended keeping survival (its Q2); the review showed
+   that anchors on the code against the ledger. A crash now rolls back every open transaction and applies its deferred
+   calls; `r12_a_crash_saves_an_open_inside_a_transaction` and `r5_a_crash_keeps_what_a_transaction_deferred` became
+   `r12_a_crash_rolls_back_an_open_transaction` and `r5_a_crash_rolls_back_and_applies_what_it_deferred`, and the
+   corpus bug `crash_drops_a_transactions_journal` (now the correct behaviour) became `crash_keeps_an_open_transaction`.
+4. **The design's `Agentfs-Tree: txn/<n>` on T broke the independent landing ledger** (`tests/gitledger/mod.rs`) and
+   `upstream_wins` once T is fast-forwarded into the fork and lands upstream. T names its fork; `upstream_wins` reads a
+   transaction's loser by its `Agentfs-Cause`, and the ledger reads a one-parent `Transaction` commit as a fast-forward
+   take.
+5. **The design's "reachable commit naming `txn/<n>`" crash marker was redundant**: the ref's absence already says the
+   transaction ended, and a crash now rolls back whatever still has its ref.
+6. **`transactions_frozen`'s first cut required begin to stay an ancestor of the fork's head.** A sync may fast-forward
+   past the fork's own sync merge (R6.1, 2026-11-09), so begin can leave the fork's history (seeds 20, 54, 61). The
+   clause is gone; the ref's value is the check.
+
+## 2026-11-13, Part B fix round (review and verification of 0f63eb6)
+
+1. **git-model §9 gave T's `Agentfs-Open` trailers a replay purpose ("so a crash's replay never saves those opens
+   again")**, against §3, which says the trailer is for the audit and decides nothing (the journal's closing record
+   does). §9 now says "for the audit". The model's `saved` still reads the trailer, its simplification of §3.
+2. **The design's check row "T names each staged open" was not built**: `one_writer` skips a transaction's commit.
+   `transactions_end_as_told` now compares T's `Agentfs-Open` trailers with the opens its staged saves name, in order
+   (a probe dropping T's opens fails 23 scenarios there).
+3. **The crash rollback of every open transaction was presented as the owner's pick.** His pick (R5.3, 2026-11-05)
+   covered a transaction with a deferred call; extending it to every transaction is the model's choice, now labelled
+   so in §9, R5.3, R12 and git-model's Questions for the owner, with its principle-1 cost.
+4. **"Recorded as one commit" vs. T plus a landing merge**: when the fork moved since begin, the fork gains T and the
+   merge `[fork, T]`. R5.5 and git-model's Questions for the owner now say so, as the model's choice for the owner to
+   confirm.
+
+## 2026-11-13, step 5b S1 (engine names every tree by its identity)
+
+1. **The design says 5b "does not touch root-branch-name.md"**, but that page's "What stands until then" said the
+   engine names the root `main` and that 5b would replace it: false once S1 lands. S1 rewrites that one paragraph in
+   the present tense (`root`, `refs/heads/root`, `Agentfs-Tree: root`); the page's proposal and M4's ownership are
+   unchanged.
+2. **The design says S1 "changes no step of the save path"**: not quite. `enqueue_moves`, now written from the
+   upstream map, writes a sync's marker blob only when the tree has forks; the old root branch wrote it on every
+   root save, read by nothing when no fork existed. A root save with no fork runs 15 git children, not 16
+   (`tree_stages.rs` `CHILDREN_PER_SAVE`). Recording is unchanged: the same commit, refs and journal record.
+3. **The design's grep gate covers only the engine files.** `world.rs:399` (the model, S2's file) still names
+   `agentfs_conformance::ENGINE_ROOT`, which S1 deletes; S2 rewrites that comment with `TreeNames`.
+4. **The finding-51 regression patch said "agentfs-core unchanged since 7474470"**, false after S1. Its hunk now
+   applies at line 1761 (`git apply --check` clean); the recorded trace was not re-recorded (it holds model calls,
+   not engine names).
+5. **The design's §8 table has `rebuild_owners` read "TreeId::Root's queue"**; kept as written (landings queue only in
+   the root's queue while forks fork only the root). A fork of a fork would need every upstream's queue there.
+
+## 2026-11-13, step 5b S3 (baseline pages)
+
+1. **The brief says S1 and S2 are landed; S2 is not** (branch head eeec466: `world::TreeNames::new(root: &str)` still
+   takes and checks a configured name, and `world.rs` still cites the deleted `ENGINE_ROOT`). S3 lands only the edits
+   that hold after S1: git-model.md and rules-ledger.md. MODEL.md:3–4 ("branch `refs/heads/root`") and module-cut.md
+   (row 5b "Built"; "it is `root`, as in the engine") describe S2's result and wait for S2's commit.
+2. **The design's §4 edits predate the plan PR's rewording** of git-model.md (the tree row, the refs table) and
+   rules-ledger.md:35–36, which already say "the name it is published under is configured". The branch wins: only
+   `<root>` becomes `root`; the root-branch-name links in the refs table and the ledger stay. git-model's `Agentfs-Tree`
+   comment keeps the branch's "(a transaction's commit names its fork)" (0f63eb6) and drops the design's `txn/<id>`.
+3. **The design's "nothing else on them changes" misses git-model §1's diagram**, whose node read
+   `refs/heads/(the root's name)`: now `refs/heads/root`, the same edit as the table. system.md:78 (`Root, //
+   refs/heads/<root>`) is a design page outside §4's list and is left for its own step.
+
+## 2026-11-13, step 5b fix round (S2, review findings)
+
+1. **S2 had not landed when S1 and S3 were reported done.** Built here: `TreeNames::new()` takes no root (a unit
+   struct; `name(TreeId::ROOT)` is `MODEL_ROOT`), the reserved-name assert, `the_roots_name_changes_no_digest` and
+   `tree_names_refuses_a_fork_or_transaction_name` are gone, and the callers drop the argument. MODEL.md, VERIFYING.md
+   and module-cut.md (rows 3c, 4, 5b and the module text) now say the root is `root`.
+2. **The design's §9 says "a plain `pending_from` test" proves the queue prefix.** With one fork it could not tell
+   `tree_trailer(..) == Some(tree)` from `.is_some()` (a mutant survived). The test now holds a second fork and checks
+   `pending_from(other) == false` while the first fork's landing waits; the mutant fails it.
+3. **S1 generalised `enqueue_moves` through the upstream map while `take_next` and `rebuild_owners` read only the
+   root's queue as landings** (two deciders). Forks are made only of the root, so recovery now refuses (`Format`) an
+   upstream map entry whose upstream is not the root, or whose fork has no branch (the reviewer's unbounded-queue
+   case). Forking a fork needs both readers widened with it.
+4. **Compaction dropped a page write whose tree did not parse** (`is_ok_and`). It now fails before the rename, the
+   journal untouched, as every `CompactError::Before` does.
+5. **`tree_git::missing_objects_names_what_is_lost_of_a_tip_and_not_its_parents` is not a root-user failure.** It fails
+   on the host's git 2.43.0 (`fatal: bad object` for a missing tip given to `rev-list --missing=print`) and passes 5/5
+   as root in `agentfs-dev` with git 2.47.3 (`ci/git-release`). `TreeGit::missing_objects` therefore depends on a git
+   newer than 2.43; not fixed in 5b.
+
+## 2026-11-13, module cut steps 5.1-5.3 fix round (verification and review of b975dec)
+
+1. **The 5.1 page's probes R2 and R6 name only the differential test, which 5.1.4 deletes.** Verification at b975dec
+   planted both (`verdict` answers Apply where the upstream holds the same version; `displace` frees a path for any
+   unlink) and both survived every remaining test and a local library replay (0 mismatched); the oracle at 3ac3bae
+   fails R2 at seed 20. Two rules had lost their only guard. Unit tests now close them:
+   `verdicts::the_upstream_holding_the_same_version_drops_it`,
+   `referee::tests::only_a_rename_over_onto_the_name_frees_its_path`, and
+   `tree::combine_keeps_its_head_and_refuses_a_version_recorded_twice_differently` (N1). The rule for later cuts:
+   before an oracle or differential test is deleted, each rule it alone guards gets its own unit test.
+2. **Departures from the 5.1 and 5.3 pages, behaviour-neutral, not logged when built:**
+   - `placing::place` takes `(upstream, incoming, verdicts)`: the page's `base` parameter is unused and was dropped.
+   - `queue::Cut::taken()` is not built: no caller reads the cut's taken step without consuming it (`into_taken`).
+   - `LandedInto` and its fields were `pub(in crate::tree_actor)`, wider than the page's private struct; it is built
+     only in `history/take.rs`, and is now private there as the page has it.
+   - Corrupt line ancestry (missing ancestor, cycle, conflict) reads `Error::Format` where it read
+     `Error::Reconcile(InvalidMap(..))`; both answer EIO. Stated on the page as a cost; recorded here as built.
+   - `refs::branches` parses every `refs/heads/` name before any snapshot is read, where the old loop interleaved
+     them: on a corrupt volume the first error reported can differ (both `Format`).
+3. **`parse_tree` (5.2's move table puts it in `journal/fold.rs`) made `history/refs.rs` and `history/message.rs`
+   import from `journal/`, while `journal/fold.rs` imports `history::upstreams`: a module cycle.** It is gone;
+   `impl From<NotATree> for Error` (`Format`) beside `TreeId` lets every reader write `text.parse::<TreeId>()?`.
+   `Upstreams` stays in `history/upstreams.rs` as the 5.3 page places it, so `journal` still reads `history` one way.
+4. **Commit 3d4a439 (the `ci_pipes_never_end_in_an_early_exit` test and the `ci/*.sh` pipefail edits) sits in the
+   5.1-5.3 range but belongs to none of the steps.** It changes no engine code; the PR description should list it.
+
+## 2026-11-13, M1 S2 (release figures): the §8 workloads do not finish in the tracer job
+
+1. **The design's §8 says the flat workloads are "scaled to finish in the tracer job"; on the release image they do
+   not.** Image run 43500960004 (commit 6d092da, both legs cancelled at the job's 45-minute limit): `close_4k` took
+   15-18 s and reported p50 75.3 ms, p99 91.4 ms on ext4 and p50 88.6 ms, p99 107.2 ms on XFS (the recording
+   engine's budget is p50 3.5 ms). `create_1000` then ran for 44 minutes on each filesystem without finishing; a
+   local debug build had created 482 of the 1,000 files after about 19 minutes. Every save rewrites the whole tree
+   (performance.md, "Large files in the tree are slow"), so a save's cost grows with the files in the tree and the
+   1,000 creates cost about the square of the count. `close_64m` never ran.
+2. **The S2 page's linear extrapolations follow from the same wrong premise.** `extrapolated_100000_s` scales
+   `create_1000` linearly, but the per-save cost grows with the tree, so a linear figure understates 100,000
+   creates by orders of magnitude.
+3. **What a re-cut has to choose (the frozen schema fixes `count: 1000`):** a smaller create count, or a deadline
+   with the count reached in the report; how to extrapolate a cost that grows with the tree (or no extrapolation);
+   and whether `close_64m` gets its own deadline. The commit was reverted on the branch (it held the image run red);
+   the work is on `wip/m1-s2` (6d092da). The local mutation probe passed: a 50 ms sleep in `run_step` moved a debug
+   build's `close_4k` p50 from 47.6 ms to 99.3 ms and flipped `warn` against a 70 ms bar, so the timed window holds
+   the save.
+4. **The guarantee string `committed before close returns` is not literally what the view does.** The view saves a
+   file on FUSE `release`, which the kernel sends after `close(2)` returns; the save is committed before the view
+   answers any later request (one session thread, requests in order), which is what the tracer's step 2 and
+   `trees-figures.py`'s timed stat rely on. The report's frozen string should say that, or the design should.
+
+## 2026-11-14, speed B3 (file maps and segments): dispatched before the slice it needs
+
+1. **B3 was dispatched, but B2b is not built.** The frozen pages (`speed-pages.md` §0) order the slices B2a, B2b,
+   B4, B3, and give B3 "Needs: B2b". On 6e4ce1e only B2a is landed: `History` (`tree_actor/history/built.rs`) and
+   `Recording`'s B2b methods (`call_path.rs`) are still `todo!("B2b")`, and `tree_actor/history/builder.rs` does not
+   exist.
+2. **B3's page cannot be built on B2a alone.** Its own files and interfaces rest on B2b's: `BaseFile` is "the
+   checkout's file as built" (B2b's private checkout and built point); `FileMap::rebase` runs "at a built event";
+   segments drop "once all its records are `<= built`"; the only change to `history/builder.rs` (a B2b file) is
+   streaming `FileMap::reader` into `Feed::blob_from` (a B2b type); the save record it changes,
+   `Saved { len, crc32 }`, is B2b's `SaveOutcome`. Building B3 now means building B2b's builder, built point and
+   checkout first, which is B2b's bead, not B3's.
+3. **What resumes it:** land B2b (and B4, by the page's order), then dispatch B3 unchanged. No re-cut of B3's page is
+   needed. Nothing of B3 was written.
+
+## 2026-11-14, speed B2b (the trailing builder): the lag formula, the page's missing parts, the gate's cost
+
+1. **The lag formula cannot be measured as written.** §4 gives lag = steps x ns_per_step + bytes x ns_per_byte,
+   "both measured on the last batch". One batch's time cannot be split between two rates. The WIP fixed
+   ns_per_byte at 10 ns and measured ns_per_step as the remainder; while a commit writes the tree's whole listings
+   (until B4), a step's cost grows with the tree, the early small-tree batches set a low step rate, and the view
+   admitted about 8,000 creates in 10 s that took the builder over 300 s (the tracer's create figure held past its
+   deadline plus grace, connection aborted, image run 43560396695; reproduced locally). Built instead: each rate
+   measured as if it bore the whole batch, lag = the larger of the two estimates (`history/lag.rs`). The estimate
+   errs high, which only holds a call until the next built event. A re-cut should state the formula.
+2. **"A waiting call holds no other request" (finding 2, docs) is not what the kernel does.** The VFS holds a
+   directory's lock while a create, link, rename or unlink in it is outstanding, so a lookup or listing of that
+   directory waits behind a gated create. docs/trees.md now says so.
+3. **The WIP does not build all of §4.** Takes still settle and decide on the actor under its lock (no `takes.rs`,
+   no `Decision`/`land`/`Refused`), and most of the acceptance table's tests and mutation probes 2, 4, 6 and 7 do not
+   exist. The brief's "fallback split" for B2b is not in speed-pages.md or speed-design.md.
+
+## 2026-11-14, speed B2b rest (takes off the actor, §4's tests and probes)
+
+1. **A sync reads its upstream's head, which §4's land rule does not check; checking it starves syncs.** A sync
+   decided before an upstream save lands at the older upstream commit, which is not what an atomic take at the land
+   would do. A first build refused it (`HeadMoved`); on CI (phase-1 "two-writer page cache", run 43572654936) a busy
+   root refused every sync, the fork's queue grew to 70 entries, and draining them (each take planned a sync per
+   entry, with git children) outran the test's 30 s. Built instead: a landed sync equals an atomic sync taken at its
+   decision (it reads nothing of its own tree that changed after it, the fork's head has not moved for a
+   fast-forward, and the upstream's later saves queue later entries), and a fork's entries are planned once per take
+   (each is the same sync marker; P1 takes the first or none). The page's claim "equals an atomic take at the land"
+   holds for its own tree only. `TakeInputs` carries the fork's `upstream`.
+2. **`head_at` cannot name the head the decision saw.** A snapshot knows oids, not the step that set them. Built:
+   `TakeInputs::through` (the last record when the inputs were read); the decision waits for history built through
+   it, `head_at` is the inputs' head step, and `land` compares the actor's current head step with it, which refuses
+   whenever the head moved after the inputs (conservatively, also for a move before the snapshot).
+3. **Pruning `touched` at built events loses a refusal.** A key touched after a decision's built point but before the
+   next built event is pruned before the decision lands. Built: `touched` holds keys only while the tree's queue holds
+   an entry (a decision reads a queue as built, so an earlier step precedes it), and is pruned at each land to steps
+   after the built point; takes are one at a time, so no decision is in flight then.
+4. **A close that changes nothing lets a held key go without touching it.** `Shape::save` gives no keys for
+   `Unchanged`, so an entry that a held key blocked would stay passed over. Built: every close touches its object's
+   keys, whatever its outcome.
+5. **`decide` returns no waiting entries**, which the wait metrics need (`ci/trees-conformance.py` reads `waits`).
+   Built: `take_one` counts the built queue's entries before the decided one (or all) as waiting.
+6. **The restart hypothesis is killed, and 10,000 files cannot be built in a test before B4.** Open settles, so its
+   time is building the tail past the checkpoint at whole-listings cost: debug, 0.19 s for 501 files with 1 step past
+   the checkpoint, 2.6 s for 600 with 100, 8.8 s for 2,100 with 100 (hypothesis: under 5 s for 10,000). The worker
+   that builds 2,000 files took about 85 s (one commit's listings per step). `restart_replays_from_the_checkpoint`
+   uses 500 + 100 files; re-measure after B4.
+7. **No failpoint can hold the builder** (actions are kill, error, panic, sleep). `a_save_is_visible_before_it_is_built`
+   holds it in the journal fsync it makes before each batch (`Durability::hold_fsync_with`), an event.
+8. **Probe 1 survived the named crash test**: a rebuild after the kill makes the same commits, so refs naming them
+   early is invisible after reopen. `a_step_killed_after_its_record_is_not_saved_again` now reads the refs on disk
+   before the reopen.
+9. **Not built from §4:** `TreeActor::{create, open}` stay public (the integration tests and the conformance library
+   drive `TreeActor` directly; `TreeActor::take_next` runs the same three parts with no lock to release);
+   `the_gate_holds_only_its_tree` is the lag gate's unit test, not the page's view-level test of a tree's write and
+   RELEASE passing a held create.
+
+## 2026-11-14, speed B4 (hashed sub-folders): the owned files, the builder's per-step clone, objects of other trees
+
+1. **The owned-files list is short.** Moving object numbers into the checkpoint needs `journal/mod.rs` (the
+   `Entry::Checkpoint` field lives there, not in `fold.rs`), `journal/commit_point.rs` (compaction writes it),
+   `history/built.rs` (`BuiltSnapshot::objects`, since takes and the actor's open read objects as built),
+   `history/take.rs`, `takes.rs` and `tree_actor/mod.rs` (the object table pointer, start-up, the format bump to
+   `agentfs-trees-7`). Tests outside the list read the layout (`tree_actor.rs`, `tree_line_rules.rs`,
+   `tree_pages.rs`, `support/trees.rs`), so do the conformance oracle (`invariants.rs`) and seven `ci/` scripts.
+   B3 was not running, so nothing collided.
+2. **The page's builder cost assumed what B2b did not do.** B2b's builder cloned the whole built tree for every
+   step (names, bytes, line maps, name histories: O(files) per step), which alone would miss the creates bar. Built:
+   steps apply in place on the batch's copy (`builder.rs`, more than "calls format only"); the per-batch copy and
+   the per-batch object map stay O(files) per batch.
+3. **`edits` takes keys, not `before`.** The frozen `edits(before, after, changed: &BTreeSet<u64>, blobs)` needs the
+   tree before the step beside the tree after, which is the clone of 2. Built: `edits(after, changed:
+   Option<&BTreeSet<queue::Key>>, blob)`, the keys each transition already returns (`Shape::apply`, `Shape::save`;
+   a take's from its record), `None` for the whole tree (after a fast-forward only; no longer at start).
+4. **`read_snapshot` of another tree's commit has no objects to read.** A landing gives a file new to the upstream
+   the incoming file's object, and a sync a file new to the fork the upstream's; both came from the commit. Built:
+   the writer tree's objects as built, else the identity's own number (the object its create made). It differs from
+   the old reading only when the writer's tree moved that file's object after the commit.
+5. **Start-up needs objects at the built log's point, past the checkpoint's.** Built: `fold::objects_through` reads
+   the trees at the checkpoint's pointers and replays each step's own transition to the built point: a second whole
+   snapshot read when the built point is past the checkpoint. Reopen of 600 files (100 past the checkpoint), debug:
+   0.46 to 0.48 s (B2b: 2.6 s); of 10,000 (100 past): 5.9 s, over the 5 s hypothesis, spent reading one blob per
+   file and name history, up to three times (checkpoint, built point, the actor's open).
+6. **The conformance oracle lost the real object numbers.** Nothing in git names them now. Built: the oracle follows
+   a file across a take by its identity (one that stays keeps the oracle's object, one a take brings gets a new
+   one); `one_object_one_file`, read from the object table ref, is gone (the engine's `Tree::install` still refuses
+   two files on one object).
+7. **Acceptance naming.** `an_empty_files_first_alignment_runs_no_child` is two tests: the no-child count in
+   `tree_stages.rs`, and `an_empty_old_image_aligns_as_git_does` (hunks equal git's on nine inputs) in
+   `tree_reconcile.rs`. Objects per 1-file save, counted in the pack: 10 (blob, line map, seven folders, commit), not
+   hypothesis 6's six; fed by mark: 2. `checkout_path` is not added: it has no consumer before B3.
+8. **Cost not on the page: a snapshot read is one blob read per file.** Takes read whole snapshots (a sync plans
+   over each upstream commit the fork lacks, a landing reads base and incoming): where one `metadata.json` read was
+   one blob, it is now a blob per file and per name history. Not measured at size; the take tests are small. A
+   reader that reads only a commit's changed folders is the follow-up if takes on large trees prove slow.
+
+## 2026-11-14, speed B3 (file maps and segments): where the page is short, and what was built instead
+
+1. **The owned-files list is short.** Beyond §6's list: `history/mod.rs` (`read_trees` takes each file's map
+   from a closure; `checkout_path`), `history/built.rs` (the maps the builder hands the actor), `history/feed.rs`
+   (`Feed::blob_from` did not exist), `tree.rs`'s `Tree::install` (a map per file from a closure), `takes.rs`
+   (a take's files), `tree_actor/mod.rs` (format `agentfs-trees-8`, serve from the builder's maps, the open-files
+   limit), `failpoints.rs` (new points), `ci/e2e-tree-recording-faults.sh` (renamed compaction points),
+   `.github/workflows/image.yml` (the tracer job's timeout, 20 to 25 min) and AGENTS.md's figure.
+2. **`Source` has no home for a take's merged bytes.** They are in the take record's head (JSON line maps), not
+   in a tail. Built: a take record's tail holds the bytes of each file it leaves (`TakeRecord::tail`, `spans`),
+   and the actor's and builder's maps read them there.
+3. **`rebase` cannot work per piece as written.** "Pieces from steps `<= base.step`": a piece does not know its
+   step, and a call's record is older than the close that saved it, so a record-numbered rule would read a later
+   save's bytes from an older base. Built: a map carries the step of the save it is (`None` once it holds unsaved
+   calls), and `rebase` replaces a whole saved map whose step is at or before the base's.
+4. **Who rebases, and when.** The page leaves it to "a built event". The actor cannot know which checkouts are
+   current (a failed copy leaves them stale) nor which files changed. Built: the builder, after each checkout,
+   opens a `BaseFile` per checked-out file that still reads frames and rebases its own map; every map it changed
+   or rebased goes to the actor through History (`publish_maps`, `take_maps`), which takes each at its next call
+   where its saved map is the same step. An open whose map is still that save takes it too. Recovery serves the
+   builder's maps, so a checkout a failed copy left stale is never read.
+5. **`Saved { len, pieces }` cannot be "a hash of the piece list".** The two sides rebase at different built
+   points, so their piece lists differ in what the save kept. Built: an FNV-1a digest of the length, each piece
+   from the close's own frames with its offset and place, and the kept bytes as one run per gap
+   (`FileMap::digest`). Cost: it checks the apply, not the kept bytes' content (the earlier saves were checked).
+6. **Recovery needs the checkpoint to name pre-checkpoint frames.** A checkpoint is no longer first in the file,
+   and carried or kept frames of a closed generation's page writes must stay out (R12). Built: the checkpoint
+   lists the held page writes (`page_writes`); a live open's calls are found by its handle. Found by probe 3:
+   carried frames could push the checkpoint's segment (named for the next record) past 64 MiB, and the next
+   record's roll then tried to create a segment of the same name (`EEXIST`); fixed, with a unit test.
+   "Compaction becomes: write a checkpoint frame, drop segments" also loses what the old rewrite gave: a
+   restart's frames may be only in the kernel, and the rewrite's fsync made them durable without a leader fsync
+   (`ci/e2e-tree-recording-faults.sh`'s `tree.wal_before_fsync` kill met the startup's instead). Built: the
+   checkpoint fsyncs every segment and the directory, then raises the mark to what it covers.
+7. **One descriptor per file.** `BaseFile { file }` holds one open descriptor per non-empty built file and
+   tree: 50,000 for the creates figure. Not on the page. Built: the volume raises the soft open-files limit to
+   the hard one at serve (as the Go runtime does); a failed open logs `tree BaseFile` and keeps the frames.
+   `BaseFile.blob` is an `Option`: at start the builder knows no blob (it does not hash checkouts).
+8. **`FileMap` is public.** The view (`agentfs-fuse`) reads through it with the actor unlocked, so it cannot be
+   crate-private as §6 has it. `read` now returns the bytes whole (`Vec<u8>`); `file_map` and `read_open` give
+   maps.
+9. **Probe 3's figures counter cannot fire.** A compaction waits for the builder to catch up, and calls do not
+   wake the builder, so none runs while the 1 GiB file is written. `close_1g` reports `carried_bytes` anyway; the
+   test's inverted case is the detector.
+10. **The space estimate is short.** "About 3 GiB for a 1 GiB close": the line map is JSON with a number per
+    byte, so a 1 GiB random file's pack is about twice the file. The tracer's loop filesystem is 8 GiB, not 6.
+11. **Smaller departures.** The segment-rollover crash test is in `tree_actor.rs` (`crash_points.rs` is the
+    recording engine's harness); it fails the leader at `tree.segment_after_create`, between a new segment and
+    its directory fsync. A compaction that fails dropping segments no longer stops the actor (nothing is
+    unknown); its failpoints are `tree.compact_before_checkpoint` and `tree.compact_before_drop`. `close_1g` times
+    the close and `stat` after the writes (the engine's dirty bigclose); `write_1g`'s "a 1 MiB file's writes" is
+    32 files of one 1 MiB write. Page writes' bases (kernel page snapshots) stay in memory; the image is a map.
+
+## 2026-11-14, speed fix 1 (fix-plan.md R1 to R3): where the plan is short, and what was built instead
+
+1. **R1 changes what `lines/` holds, not what history says.** A line map is now runs of lines (identity and
+   version numbering on, `dead`, `open` length for an unfinished last line) and runs of ancestors, never bytes
+   (docs/trees.md, "What a commit holds"). Bytes come from `files/`. The model's digests do not read the library's
+   layout and are unchanged; the conformance reader (`git_history.rs::parse_map`) and `ci/trees-conformance.py`
+   expand runs over the file's bytes. The state format is `agentfs-trees-9`. Lengths are not stored per line (a
+   line ends at its newline): a per-line form cannot meet "memory independent of file size" for a 1 GiB file of
+   short lines (millions of entries), so the established pattern is git blame's ranges of lines.
+2. **"Bounded independent of file size" holds for the builder process, not for every git child or a take.**
+   Measured (one container, release): agentfs 15 to 17 MiB at 64 MiB to 1 GiB; `git fast-import` and
+   `git cat-file` were made to stream (`core.bigFileThreshold=8m`, a 16 MiB pack window for `cat-file`), which
+   took the children from about 3x the file to 66 MiB. Still unbounded, and documented: an edit that is not an
+   append runs `git diff`, which reads both versions whole (git's xdiff), and a take expands its files' line maps
+   line by line (the referee works per line) and reads the files it merges. The bar names saves; takes and edits of
+   huge files would need a streaming diff and a run-level referee.
+3. **Take tails: chunk records, not a multi-frame tail.** A take's merged files are written from their sources
+   (`tree_reconcile::pieces`: a version's bytes are the same in every file that holds it) into `Entry::Bytes`
+   records of at most 16 MiB recorded just before the take step, with no compaction between (`append_record`);
+   `TakeRecord` gains `lens` and `chunks`. The take worker reads source blobs over 8 MiB through `git cat-file`
+   into an unlinked file of the state area.
+4. **R2: open compacts only when nothing is unbuilt.** A journal built through its last record compacts at open as
+   before; otherwise the threshold is 0 and compaction runs at the first record after the builder catches up. The
+   library's and the mounted replays' `crash` now settle after the reopen (they read git after every call).
+5. **R3b's class is gone with R2, not fixed in the builder.** Reopen failed because `serve` required a map the
+   builder had published for every named file; a linked anonymous file's map is empty and never published. Serving
+   from the journal's replay removes that requirement; the builder is unchanged there. The red test now fails only
+   if the replay's `Change::Link` arm is broken (probe run).
+6. **R3a, mechanism:** a compaction records each step value the pointers held and the oid it was built as; a step
+   whose pointers were read before it names those oids (`TreeActor::resolve_compacted`, run in `record_step`
+   after the compaction). `Pointers::check_targets` still tolerates step-versus-oid (left for Fix 2).
+7. **Validation tightened:** a line map's ancestry is acyclic because every version is over an earlier writer's
+   (checked by event number, not by walking chains). Every map the library writes satisfies it.
+8. **A `wip(trees):` commit (24ee3f5) is in the branch's history** (a checkpoint pushed to `wip/speed-fix1` before
+   the slice was green); it was not rewritten.
+
+## 2026-11-14, speed fix 2 (fix-plan.md "Fix 2"): what was built instead, residuals, and the errata's state
+
+1. **P2-2, built instead:** compaction waits for every *step* built and the builder past the oldest segment, not for
+   history built through every record. Records after the last step (calls, opens, page writes) are what the checkpoint
+   holds, so its redo start stays its last record; segments are dropped only up to the builder's built point (it reads
+   them). The segment that holds both dead records and calls after the builder's last batch waits for the next step
+   (bounded: one segment). Once the journal is twice its due length with steps unbuilt, the lag gate holds every
+   tree's new work until the builder catches up (an engineering choice, not the owner's). Steps replayed at open now
+   count in the gate (Fix 1's hand-over).
+2. **`check_targets` strict:** `compaction_keeps_the_fold`'s "lands on either start" premise was false after R3a:
+   records after a checkpoint name the values it covers as oids, so they fold only on top of it. The test now shows
+   the mixed fold is refused.
+3. **Coherence 3 (frame relocation owned by the journal), residual.** A live open's frames carried forward are still
+   read through the old segment's `Arc` until the open closes (the actor's `Handle.calls`, page runs, the builder's
+   opens), so a carried segment's space returns only then, and a statvfs test would fail today. Plan: `FramePos` names
+   (record, offset) with the save digest keyed by it (not by segment and byte), the journal keeps a relocation table
+   that `drop_behind` fills, and the actor and the builder (at its next batch, through History) rewrite their
+   positions from it; then a space test by statvfs. About half a day; it touches the digest, so the model-free
+   conformance replays are the check.
+4. **Coherence 5 (`TreeActor::{create, open, take_next}` crate-private), residual.** Open's durability is now one
+   path (`TreeActor::serve` makes recovered records durable), but the integration tests (about 1,000 call sites), the
+   conformance library and `tree_view` construct `TreeActor` directly. Plan: a test-support handle over `Recording`
+   that locks per call, the conformance `Library` on `Recording`, then `pub(crate)`; `TreeActor::take_next` and
+   `progress` go, `Recording::take_next` stays the one take path. B2b rest's item 9 stays with it.
+5. **P3-4 (power-loss-trees never crosses rollover or compaction), residual.** CI-only (`power-loss.yml` after
+   landing). Plan: a 70 MiB file in `ci/power-loss-trees.sh` before the marks, a mark kind for it in
+   `power-loss-trees-check.sh`; the 512 MiB data image holds it. This is also the true detector of probe A (an fsync
+   left out of the checkpoint); locally probe A is killed by a per-thread fsync count (`Segment::sync`).
+6. **P3-6, partly:** the builder drops heads the checkpoint covers; `owners` (each direct save's commit) still grows
+   with saves and is cloned and resolved whole each batch. Plan: share it as an `Arc` and resolve only the batch's
+   new entries.
+7. **New finding, not fixed:** the view holds about 1 GiB for the 50,000 files the `create` workload leaves (about
+   20 KiB a file across the actor's and the builder's trees; `memory_1g`'s `peak_mib` 1,106 at d7666ef). Not in the
+   plan; a memory-per-file figure is the first step.
+8. **Suspicions settled:** `whole` lost at restart is correct (the trees are read from the built heads, which match);
+   a hole in an early segment no longer reads every later segment into memory; a checkpoint's objects map passes the
+   96 MiB frame limit only at millions of files (the compaction then fails before its checkpoint every time: a
+   residual, not fixed).
+9. **Not run locally:** `ci/check-tree-git.sh` (needs the pinned git 2.47.3); the tracer and figures (docker and a
+   loop filesystem; the inotify wait was run against a simulated writer only).
+
+Errata state, after this fix (each speed-epic entry the handoff listed as open):
+- 2026-11-13 M1 S2: closed by B0 (c22a820, c828899): deadlines, no extrapolation, the guarantee string.
+- 2026-11-14 B3 dispatched before B2b: closed (B2b bb0d7b6..3b1ed68, B4 c2bf696, B3 f24ed4e landed in order).
+- 2026-11-14 B2b: closed; the lag formula and the kernel's directory lock are in docs/trees.md.
+- 2026-11-14 B2b rest: 1-8 closed (built, documented); 9 stays with item 4 above.
+- 2026-11-14 B4: 1-5 and 7 closed; 6 closed by this fix (`one_object_one_file` from the library's objects and a
+  mount's inodes); 8 (a snapshot read is one blob per file) stays: a follow-up if takes on large trees prove slow.
+- 2026-11-14 B3: 7 closed by d7666ef (no descriptor per file); 9 closed by this fix (`carried_bytes` dropped from the
+  figures); the rest closed (built, documented).
+- 2026-11-14 speed fix 1: 6 closed by this fix (`check_targets` strict); 8 stays (a pushed commit is never rewritten).
+
+## 2026-11-14, speed fix 3: what was found, what was built, the residuals as beads to cut
+
+1. **Patch e2e "never mounted" (run 43610665917).** The server's access log: the daemon's inbox fetch (`info/refs`,
+   upload-pack, the first request through fcgiwrap) answered 200 in 30.363 s, starting the instant its 401 was
+   answered; the mount waits `agentfs.patchFetchTimeout` (30 s by default) for that fetch, so it served 0.4 s after
+   the script's own 30 s wait. The server-side stall ended when the daemon was killed (its fetch thread still held
+   the connection), so git-http-backend or fcgiwrap waited on the client; not reproduced locally in 1,500 fetches
+   and 25 mounts under CPU load (git 2.43 locally, 2.56.1 on the runner). The script now waits 60 s and dumps the
+   daemon's threads, sockets and the server's git processes with kernel stacks on a fetch timeout or a missed mount.
+   Also seen, not fixed: after `patchFetchTimeout` the fetch thread keeps its connection up to libgit2's 300 s I/O
+   timeout, and fcgiwrap (one worker) serializes every later request behind it.
+2. **Memory per file.** About 20 KiB a file was libgit2: the one `Repository` handle `TreeGit` kept held a delta-base
+   cache (up to 16 MiB) for every pack it had read, and the builder adds a pack per batch. `refresh` (after each
+   batch) now drops the handle. Name versions, file-map pieces and each object's paths are vectors or one set, not
+   a B-tree map per file. Release, local: 3.4 to 3.8 KiB a file (VmRSS growth, 5,000 to 20,000 files). The rest:
+   the builder clones its whole state per batch (about 0.7 KiB a file, measured by taking instead of cloning), each
+   path held about four times in each projection. The `memory_create` bar is 2 KiB, so CI warns until those go.
+3. **Coherence 3** built as planned: `FramePos` is (record, offset) with the segment it reads; `Relocations` lives in
+   `Durability`; the actor moves its positions after `drop_behind`, the builder before each batch; the save digest
+   hashes (record, offset). A view's open file keeps its segment until it closes.
+4. **P3-4** built: `ci/power-loss-trees.sh` holds a file open across a 70 MiB rollover, a compaction and a carry,
+   mark `HC`. The workload ran locally against a view (carried 4 MiB, dropped 2 segments, history right); the
+   dm-log-writes replay was NOT RUN (CI-only, `power-loss.yml` after landing).
+5. **Beads to cut** (this agent may not create beads): each names its files and done condition.
+   - Coherence 5: `TreeActor::{create, open, take_next}` crate-private. Files: `crates/agentfs-core/src/tree_actor/mod.rs`,
+     a test-support handle over `Recording`, `crates/agentfs-core/tests/*.rs` (about 1,000 call sites),
+     `crates/agentfs-conformance` (its `Library` on `Recording`), `crates/agentfs-fuse/src/tree_view.rs`. Done: the
+     three are `pub(crate)`, `Recording::take_next` is the one take path, all tests green.
+   - Coherence 6: mounted replay never sees a lagging builder. Files: `crates/agentfs-conformance`,
+     `crates/agentfs-core/src/tree_actor/history/`. Done: a mounted replay where the builder trails the actor by
+     batches (a failpoint holding the builder), invariants read from git, green.
+   - Coherence 7: the builder's step duplicates tree transitions. Files: `history/builder.rs` (`BuildState::step`,
+     `apply`), `tree_actor/tree.rs` (`Shape::apply`), `tree_actor/mod.rs`. Done: one transition per change that both
+     projections run; conformance replays unchanged.
+   - Builder `owners` growth (P3-6): `owners` shared as an `Arc`, only each batch's new entries resolved. Files:
+     `history/builder.rs` (`built_owners`), `history/mod.rs`. Done: a batch's cost independent of earlier saves.
+   - Checkpoint size at millions of files: a checkpoint's objects map passes the 96 MiB frame limit, and compaction
+     then fails before its checkpoint every time. Files: `journal/commit_point.rs`, `journal/mod.rs`. Done: a
+     checkpoint of a tree with 2,000,000 objects is written and reopened.
+   - B4 8: a take on a large tree reads one blob per file. Files: `tree_actor/takes.rs`, `tree_git.rs`. Done: a take
+     figure on a 100,000-file tree in `ci/trees-figures.py` within its bar.
+   - Memory per file to 2 KiB: no per-batch clone of the builder's state (apply in place, or persistent maps), paths
+     shared. Files: `history/builder.rs`, `tree_actor/tree.rs`. Done: `memory_create` under 2 KiB on CI.
+   - Pack count: the builder adds a pack per batch and nothing repacks, so every lookup scans more packs. Files:
+     `history/builder.rs`, `tree_git.rs`. Done: pack count logarithmic in batches (geometric repack), with the
+     tracer's history checks green.
+
+## 2026-11-14, M1 S4-S6 re-cut (code architect): where the old pages broke on the engine
+
+Re-cut pages: `.claude/handoff/m1-s4-recut.md`, `m1-s5-recut.md`, `m1-s6-recut.md`; they override `m1-pages.md`'s S4-S6.
+1. **C4 without `rebind` stops phase 1.** The old S4 ends every restored client at boot and keeps a fork's writer claim
+   for life, so the mounted conformance replay's crash (kill, remount the same fork, write), `ci/e2e-trees.sh` and
+   `ci/e2e-tree-recording-faults.sh` would get `ForkTaken`. Re-cut: S4 builds clients.md's `rebind` (with M1's pod
+   context); the boot order is rebind or attach, then `reconcile(live)`. A clean unmount still spends the claim.
+2. **The old S5's after-take hook cannot reach the services.** It runs on the view's worker thread; the services hold
+   `Rc` (S3's `DomainEvents`). Re-cut: `ViewHost` notifies `HostEvent` through a `Send + Sync` callback into the
+   composition root's channel; SIGTERM joins that channel in S6.
+3. **Opening a view waited for history.** `serve_with_metrics` calls `head()`, which settles; a failed builder would
+   refuse the mount (principle 5). Re-cut: `ViewHost::open` checks the actor's saved trees.
+4. **`ClientStore::end`'s doc promises reserved room** that no page builds; `ClientError` and `TreeError` have no
+   variant for a stopped actor. Re-cut: the doc names `Stopped`, `NotDurable`; both errors gain `Stopped` with one
+   `From<StoreError>` each.
+
+## 2026-11-14, M1 S3 (store: volume events as commits beside their trees): where the page is short
+
+Page: `.claude/handoff/m1-s3-recut.md`. None blocks the slice; each is built as stated.
+1. **The probe "gate row steps → `a_failed_builder_stops_no_event`" cannot be killed by that test.** The lag gate
+   admits every call while the builder has failed (principle 5, `LagGate::admits`), so a store write that first
+   calls `Recording::admit` passes it (probe run: all seven `tree_store` tests green). Killing it needs a builder
+   that lags without failing and a gate limit of zero (`History::set_lag_limits` is crate-private), and then the
+   probe blocks rather than fails; no test was added for it. The other four probes are killed.
+2. **`Trees::create` carries no pod context**, but `ForkStore::create` takes `at`: `TreesService::create` passes an
+   empty `PodContext`, so `ForkCreated` has no pod trailers. The launcher's pod context needs a contract change
+   (a frozen interface: an erratum and a re-cut, not a local edit).
+3. **`TreeError` has no `Stopped`.** S3 maps `StoreError::Stopped` and `Damaged` to `TreeError::Io(Other(EIO))`,
+   `NotDurable(k)` to `Io(k)`, `Refused` to `UpstreamUnknown`; S5's page adds `Stopped` (`From<StoreError>`).
+4. **"`pending_from` ... set by `publish`" misses takes:** a landing's take enqueues syncs too. Each queue entry's
+   source is the step's tree, set in the one place every step is recorded (`TreeActor::record`), replayed after
+   the built point, and read at open from a built landing's `Agentfs-Tree` (a sync marker: its queue's upstream).
+5. **`fork_with(upstream)` with a fork upstream** would record a step recovery refuses (forks of forks are not
+   built; `Upstreams::check_recovered`). It answers `NotFound` before recording; Trees answers `NestedNotBuilt`
+   before that.
+6. **A row ref's `Step(n)` for an earlier step** is never written (`record` names a chain's own step only); the
+   builder answers `Disagrees` for one rather than resolving it.
+7. **Files outside the owned list, each a compile need:** `tree_actor/tree.rs` (`Shape::apply` arm for
+   `Change::Rows`), `tree_actor/call_path.rs` (`progress` uses the new `queued()`; the old `queued(tree)` is
+   `queue_holds`), `history/feed.rs` (`BuildRef`), and the `Cargo.toml` of `agentfs`, `agentfs-conformance` and
+   `agentfs-core` (dev) for `agentfs-trees`.
+8. **`an_event_is_durable_before_create_returns`** checks the journal's durable mark against the last record with
+   the builder failing before its own fsync: the process-wide `journal_fsync` count is shared by parallel tests.
+
+## 2026-11-14, M1 S4 (clients and views): where the re-cut page is short
+
+Page: `.claude/handoff/m1-s4-recut.md`. None blocks the slice; each is built as stated.
+1. **A mount's own steps move every failpoint count.** `trees mount` now records an attach (or rebind) per view
+   before it serves: a journal record, an fsync, a step and a builder batch each. The failpoint scripts counted from
+   the client's first call: `ci/e2e-tree-recording-faults.sh` (kill at the first hit) and `ci/e2e-tree-enospc.sh`
+   (`tree.before_step` and `tree.build_after_built_log` stalls, `tree.wal_before_fsync=error`) would fire in the
+   mount's attach. Neither is on the page's file list. Built: a remount after a clean unmount mounts the root alone
+   (one step, so exactly one builder batch), the counts move by one (`@2`, the wal records `@3`), and the script
+   waits until the attach's event commit is in Git before the client's call (`tree_git_wait_root_attached`, new in
+   `ci/tree-git-test-lib.sh`): otherwise the attach and the client's first record can share one batch, and a builder
+   point's second hit comes later or never. The faults script's remount leaves the sandbox out (its writer is spent).
+2. **`detach` and `reconcile` carry no pod context**, but `ClientStore::end` takes `at`: the service passes an empty
+   one, so `AttachmentEnded` and `LastDetached` have no pod trailers (as S3 item 2 for `ForkCreated`). `Attached`
+   and `Rebound` carry the client's.
+3. **The Clients row is `TreeClients` itself**, its entries (`Audited<ClientRow>`, the claim) each stamped by the one
+   helper (`store::stamp`); no outer `Audited` (the port's `load` answers `Vec<TreeClients>`).
+4. **The CLI cannot tell a restored client's access** from `attached` (ids only). Built: `ClientsService::resumable`
+   (inherent, not on the trait): the latest restored, unbound client of a launcher, tree, label and access.
+5. **`detach` after a restart of a client ended in an earlier run** answers `UnknownClient`: rows are hard-deleted at
+   an end, so only this run's ends are known (`ended`); within a run it is idempotent.
+6. **Read-only views mount read-only** (`MountOption::RO`) besides the session refusing writes (`EROFS` either way).
+7. **Files outside the owned list**, each a compile or test need: `crates/agentfs/Cargo.toml` (agentfs-clients),
+   `crates/agentfs-core/Cargo.toml` (dev: agentfs-clients), `crates/agentfs/src/domain_events.rs` (`next` is used
+   now: its `expect(dead_code)` went), `Cargo.lock`, and the three `ci/` files of item 1.
+8. **Not built here:** `Draining` (S6's `on_volume_draining`), `on_fork_dropped` and `release_claim` (S5).
+
+## 2026-11-14, M1 S5 (fork lifecycle): where the re-cut page is short
+
+Page: `.claude/handoff/m1-s5-recut.md`. None blocks the slice; each is built as stated.
+1. **The probe "skip `pending_from`" survives at either site alone.** The page puts the check in two places: Trees'
+   `settle` filter and the actor's `drop_fork` (`Busy`). Each masks the other, so no single-site mutation fails
+   `an_ended_fork_drops...`. Built: that test also calls `ForkStore::drop_fork` directly while the landing is queued
+   (expects `Refused`), which kills the actor-side probe; the Trees unit test `an_ended_fork_drops_once_nothing_holds_it`
+   now sets the pending landing and the child one at a time, which kills the settle-side probe.
+2. **`ForkEnded` and `ForkDropped` carry no pod trailers**: `Trees::end`, `end_keyed` and `settle` carry no pod
+   context, so the service passes an empty one (as S3 item 2). `ClaimReleased` carries `service_at()`, as the page says.
+3. **`release_claim` of a fork with no claim writes nothing** (a fork never written, or already released): the page
+   says "one step"; an empty step for nothing to release would only add a commit.
+4. **An unkeyed fork now ends and drops at its clean unmount**, which `ci/power-loss-trees-check.sh` (reads
+   `refs/heads/$FORK` at the final replay, after the unmount) and `ci/e2e-tree-recording-faults.sh` (step counts of the
+   next mount) cannot take. Both mount a keyed fork (`--fork-key power-loss`, `--fork-key faults`), which stays open:
+   the harnesses keep their meaning. The other scripts mount an unkeyed fork; `ci/e2e-trees.sh` gains the end, drop,
+   exit 75, ended key and unkeyed end checks.
+5. **`EntryGone` at the land of a decision on a dropped fork** is built (`TreeActor::land`) but not tested: it needs a
+   decision taken unlocked and a drop interleaved before its land, which no test can order without a hook.
+6. **Files outside the owned list**, each a compile or doc need: `tree_actor/tree.rs` (`Shape::apply` arm for
+   `Change::Drop`), `crates/agentfs/src/shared.rs` (an `expect` reason naming S5), `docs/library/{core,filesystem}.md`,
+   `docs/architecture.md`, `docs/target-architecture/future/one-engine.md` (the CLI's flag name).
+7. **`--fork-read-only` excludes `--fork-writer`** (the page's `|`): a read-only fork client takes the default label.
+   `trees end` restores Clients too, so its `ForkDropped` releases the claim at once.
+8. **No state format bump** for `Change::Drop`: a journal of format 10 without one reads as before; nothing is released.
+9. **Not built here:** the model's two `drop` traces stay excluded from the library and mounted replays (the replay's
+   mapping, not this page's).

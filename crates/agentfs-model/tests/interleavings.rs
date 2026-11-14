@@ -24,9 +24,11 @@
 //! referee did not take (a queue step, a transaction's commit), which only
 //! the tree it took may change.
 //!
-//! The seeds are every seed in `1..=SEEDS`, never a set picked because it
-//! passes. `AGENTFS_MODEL_SEED=<n>` runs one seed; `AGENTFS_MODEL_SEEDS=<n>`
-//! runs seeds 1..=n. Each seed runs under `catch_unwind`, so a harness
+//! By default each run takes the regression seeds of `regression-seeds.txt`:
+//! a set chosen by cover, never because it passes (VERIFYING.md, "Tiers").
+//! `AGENTFS_MODEL_SWEEP=1` runs the full sweep, every seed in `1..=SEEDS`
+//! (rounds `1..=ROUNDS_SEEDS`); `AGENTFS_MODEL_SEED=<n>` runs one seed;
+//! `AGENTFS_MODEL_SEEDS=<n>` runs seeds 1..=n. Each seed runs under `catch_unwind`, so a harness
 //! panic too reports its seed and the event log. The generator is a
 //! SplitMix64 written here: fixed seeds replay exactly.
 
@@ -37,15 +39,15 @@ use agentfs_model::git::{git, with_reversed_dates};
 use agentfs_model::program;
 use agentfs_model::queue::{Entry, NAME_KEY, name_key};
 use agentfs_model::recording::{Kind, Target, Write};
+use agentfs_model::service::{HistoryService, Step};
 use agentfs_model::world::{
-    By, Direction, Life, LineEdit, MODEL_ROOT, MergeRule, Policies, Step, TreeNames, TxnEnd,
-    TxnOutcome, World,
+    By, Direction, Life, LineEdit, MergeRule, Policies, TreeNames, TxnEnd, TxnOutcome, World,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
 mod gitledger;
 
-/// CI runs seeds 1..=SEEDS.
+/// The full sweep's seeds, 1..=SEEDS (`AGENTFS_MODEL_SWEEP=1`).
 const SEEDS: u64 = 64;
 const STEPS: usize = 80;
 /// Positions the random clients write at: the first three lines, so edits
@@ -164,7 +166,26 @@ struct Tally {
     git_takes_total: usize,
 }
 
-fn seeds() -> Vec<u64> {
+/// The regression seeds of `kind` (`random` or `rounds`) in `regression-seeds.txt`.
+fn regression_seeds(kind: &str) -> Vec<u64> {
+    include_str!("regression-seeds.txt")
+        .lines()
+        .filter(|l| !l.starts_with('#'))
+        .filter_map(|l| l.strip_prefix(kind)?.strip_prefix(' '))
+        .flat_map(|l| l.split_whitespace())
+        .map(|s| s.parse().expect("regression-seeds.txt holds seed numbers"))
+        .collect()
+}
+
+/// Whether `var` is set and not empty: CI sets `AGENTFS_MODEL_SWEEP` empty on a push.
+fn set(var: &str) -> bool {
+    std::env::var_os(var).is_some_and(|v| !v.is_empty())
+}
+
+/// The seeds a run takes: one (`AGENTFS_MODEL_SEED`), 1..=n
+/// (`AGENTFS_MODEL_SEEDS`), the sweep's 1..=`sweep` (`AGENTFS_MODEL_SWEEP`), or
+/// else the regression seeds of `kind`.
+fn seeds_of(kind: &str, sweep: u64) -> Vec<u64> {
     if let Ok(s) = std::env::var("AGENTFS_MODEL_SEED") {
         return vec![s.parse().expect("AGENTFS_MODEL_SEED is a number")];
     }
@@ -172,7 +193,29 @@ fn seeds() -> Vec<u64> {
         let n: u64 = n.parse().expect("AGENTFS_MODEL_SEEDS is a number");
         return (1..=n).collect();
     }
-    (1..=SEEDS).collect()
+    if set("AGENTFS_MODEL_SWEEP") {
+        return (1..=sweep).collect();
+    }
+    let seeds = regression_seeds(kind);
+    assert!(!seeds.is_empty(), "no {kind} line in regression-seeds.txt");
+    seeds
+}
+
+fn seeds() -> Vec<u64> {
+    seeds_of("random", SEEDS)
+}
+
+/// Whether a run's tally floors apply: on the regression seeds, which were
+/// chosen to meet them, and on a sweep of at least `sweep` seeds; never on one
+/// seed or a shorter sweep, where one seed alone may meet none.
+fn floors_apply(sweep: u64) -> bool {
+    if set("AGENTFS_MODEL_SEED") {
+        return false;
+    }
+    match std::env::var("AGENTFS_MODEL_SEEDS") {
+        Ok(n) => n.parse::<u64>().is_ok_and(|n| n >= sweep),
+        Err(_) => true,
+    }
 }
 
 fn live_clients(w: &World) -> Vec<TreeId> {
@@ -272,7 +315,7 @@ fn head_of(w: &World, t: Target) -> Option<String> {
             .txn
             .as_ref()
             .filter(|x| x.id == n)
-            .map(|x| x.head.clone()),
+            .map(|x| x.index.clone()),
     }
 }
 
@@ -401,10 +444,12 @@ impl Oracle {
         };
         w.upstream_of(f)?;
         let txn = w.forks[&f].txn.as_ref()?;
-        let spec = [txn.start.as_str(), txn.head.as_str()];
+        // Begin read from its ref; the index is the tree whose bytes
+        // `check_but` holds to the oracle's at every step.
+        let begin = git(w.repo(), &["rev-parse", &TreeNames::txn_branch(txn.id)]);
         let saved = git(
             w.repo(),
-            &["diff-tree", "-r", "--name-only", spec[0], spec[1]],
+            &["diff-tree", "-r", "--name-only", &begin, &txn.index],
         );
         let mut mine: BTreeSet<String> = saved.lines().map(str::to_string).collect();
         for (h, (u, _, _, _)) in &self.held {
@@ -557,29 +602,37 @@ fn take(w: &mut Checked, o: &mut Oracle, s: &Step, tally: &mut Tally) -> Result<
     w.note_step(s);
     let before = match s {
         Step::Next(t) => w.queue(*t),
-        Step::Drop(_) | Step::Replicate => Vec::new(),
+        Step::Drop(_) | Step::Push => Vec::new(),
     };
     let numbered = match s {
         Step::Next(t) => w.queue_numbered(*t),
         _ => Vec::new(),
     };
-    // The files open for writing in the tree, by the harness's own object
-    // table, when the step comes.
+    // The files open for writing in the tree and in its open transaction
+    // (R9.18), by the harness's own object table, each with its name read in
+    // its own target, when the step comes.
+    let r: &World = w;
     let open_before: BTreeSet<String> = match s {
-        Step::Next(t) => w
+        Step::Next(t) => r
             .handles()
-            .filter(|h| h.target == Target::Tree(*t))
+            .filter(|h| matches!(h.target, Target::Tree(u) | Target::Txn(u, _) if u == *t))
             .flat_map(|h| {
-                let mut files: Vec<String> = o.named(w, h.id).into_iter().collect();
+                let at = r.target_head(h.target);
+                let mut files: Vec<String> = o.named(r, h.id).into_iter().collect();
                 if h.kind != Kind::Write {
                     files.extend(h.files());
                 }
                 files
+                    .into_iter()
+                    .flat_map(move |f| [name_key(&r.file(&at, &f)), Some(f)])
             })
-            .flat_map(|f| [name_key(&w.file(&w.head(*t), &f)), Some(f)])
             .flatten()
             .collect(),
         _ => BTreeSet::new(),
+    };
+    let head_before = match s {
+        Step::Next(t) => Some(w.head(*t)),
+        _ => None,
     };
     gitledger::note_next(w, s)?;
     // P1: the entry a queue step acts on is the first one no earlier
@@ -590,6 +643,22 @@ fn take(w: &mut Checked, o: &mut Oracle, s: &Step, tally: &mut Tally) -> Result<
     };
     let taken = w.step_checked(s)?;
     tally.steps += 1;
+    // Rule 9 and R9.18, by the harness's own reading of the opens: a take
+    // writes no file open for writing in its tree or in that tree's open
+    // transaction (read from git, not from the model's locks).
+    if let (Step::Next(t), Some(before)) = (s, &head_before)
+        && *before != w.head(*t)
+    {
+        let wrote = git(
+            w.repo(),
+            &["diff-tree", "-r", "--name-only", before, &w.head(*t)],
+        );
+        if let Some(p) = wrote.lines().find(|p| open_before.contains(*p)) {
+            return Err(format!(
+                "oracle_locks: {s:?} wrote {p}, which is open for writing in {t:?} or its transaction"
+            ));
+        }
+    }
     let skip = match s {
         Step::Next(t) => Some(Target::Tree(*t)),
         _ => None,
@@ -732,13 +801,16 @@ fn end_checked(w: &mut World, o: &mut Oracle, c: &Client) -> Result<(), String> 
 }
 
 /// A crash of every agentfs process (git-model.md §3), during open
-/// `during`'s close if one is given: the oracle saves every open's
-/// calls as its close would (`during` first, then the rest in the model's
-/// order, by handle), so every write call that returned survives; an
-/// orphan's event comes once per close the journal replays (twice for an
-/// orphan whose close the crash interrupted: events are at least once). A
-/// call a transaction deferred stays behind it, and a close that would defer
-/// defers (R5.3). A take is one step, so none is in progress.
+/// `during`'s close if one is given. The crash rolls back every open
+/// transaction (R5: "a failure is an implicit rollback"; R5.3, the owner's
+/// pick: it then applies the calls it deferred): its opens end unsaved, and
+/// its deferred calls apply in order, the oracle following each. Then the
+/// oracle saves every open's calls as its close would (`during` first, then
+/// the rest in the model's order, by handle), so every write call that
+/// returned outside a transaction survives; an orphan's event comes once per
+/// close the journal replays (twice for an orphan whose close the crash
+/// interrupted: events are at least once). A take is one step, so none is in
+/// progress.
 fn crash_checked(w: &mut World, o: &mut Oracle, during: Option<HandleId>) -> Result<(), String> {
     let n = w.orphans().len();
     let mut expect = Vec::new();
@@ -756,13 +828,29 @@ fn crash_checked(w: &mut World, o: &mut Oracle, during: Option<HandleId>) -> Res
         w.close_keeping_journal(h);
         gitledger::observe(w)?;
     }
-    for h in w.crash_down() {
+    let open: Vec<TreeId> = in_txn(w);
+    let replay = w.crash_down();
+    if let Some(f) = open.iter().find(|f| w.forks[f].txn.is_some()) {
+        return Err(format!(
+            "oracle_crash: f{f}'s transaction outlived the crash"
+        ));
+    }
+    dropped(w, n, expect)?;
+    o.reload(w);
+    let mut forks: Vec<TreeId> = o.deferred.keys().copied().collect();
+    forks.extend(open);
+    forks.sort();
+    forks.dedup();
+    for f in forks {
+        apply_deferred_checked(w, o, f)?;
+    }
+    let n = w.orphans().len();
+    let mut expect = Vec::new();
+    for h in replay {
         if Some(h) == during {
             // Its close saved nothing git records, so the replay drops it
             // again, in handle order.
             expect.extend(first.clone());
-        } else if let Some(f) = o.close_defers(w, h) {
-            o.deferred.entry(f).or_default().push(Deferred::Close(h));
         } else {
             expect.extend(o.closing(w, h));
         }
@@ -770,7 +858,7 @@ fn crash_checked(w: &mut World, o: &mut Oracle, during: Option<HandleId>) -> Res
         gitledger::observe(w)?;
     }
     dropped(w, n, expect)?;
-    if let Some(h) = w.handles().find(|h| !h.deferred) {
+    if let Some(h) = w.handles().next() {
         return Err(format!("oracle_crash: h{} outlived the crash", h.id));
     }
     o.calls.retain(|h, _| w.handles().any(|x| x.id == *h));
@@ -851,13 +939,89 @@ fn commit_checked(
         usize::from(w.handles().any(|h| {
             !h.deferred && (h.target == Target::Txn(f, txn) || h.target == Target::Tree(f))
         }));
-    w.commit_txn_only(f).expect("open");
+    // Rule 5's legs, from git and the harness's own bytes: begin from the
+    // transaction's ref, what the program staged from the oracle.
+    let begin = git(w.repo(), &["rev-parse", &TreeNames::txn_branch(txn)]);
+    let before = w.head(f);
+    let mine = o
+        .files
+        .get(&Target::Txn(f, txn))
+        .cloned()
+        .unwrap_or_default();
+    let outcome = w.commit_txn_only(f).expect("open");
     gitledger::observe(w)?;
+    txn_committed(w, f, txn, &begin, &before, &mine, &outcome)?;
     o.reload(w);
     for (h, file) in stay {
         o.move_to_fork(h, f, file);
     }
     apply_deferred_checked(w, o, f)
+}
+
+/// `oracle_txn_commit`, rule 5 read from git against the harness's own
+/// bytes: a transaction is recorded as one commit T (the owner, 2026-11-13),
+/// the fork's head (a fast-forward) or its merge's second parent, whose one
+/// parent is begin, as `txn/<n>` held it until the commit; T holds, in every
+/// file it names, the bytes the program staged (the oracle's). An empty
+/// commit made none: the fork's head did not move, and what the program
+/// staged is begin's bytes.
+fn txn_committed(
+    w: &World,
+    f: TreeId,
+    txn: u32,
+    begin: &str,
+    before: &str,
+    mine: &BTreeMap<String, Vec<u8>>,
+    outcome: &TxnOutcome,
+) -> Result<(), String> {
+    let head = w.head(f);
+    let t = if *outcome == TxnOutcome::Empty {
+        if head != before {
+            return Err(format!(
+                "oracle_txn_commit: t{txn} was empty, but f{f} moved"
+            ));
+        }
+        begin.to_string()
+    } else {
+        let parents = |c: &str| -> Vec<String> {
+            git(w.repo(), &["log", "-1", "--format=%P", c])
+                .split_whitespace()
+                .map(str::to_string)
+                .collect()
+        };
+        let p = parents(&head);
+        let t = if p.len() == 1 {
+            head.clone()
+        } else {
+            p[1].clone()
+        };
+        let cause = git(
+            w.repo(),
+            &[
+                "log",
+                "-1",
+                "--format=%(trailers:key=Agentfs-Cause,valueonly)",
+                &t,
+            ],
+        );
+        if cause != format!("Transaction t{txn}") || parents(&t) != [begin.to_string()] {
+            return Err(format!(
+                "oracle_txn_commit: t{txn}'s commit {t:.7} ({cause}) is not one commit on its begin {begin:.7}"
+            ));
+        }
+        t
+    };
+    for (p, b) in mine {
+        let file = w.file(&t, p);
+        if file.name.live() && file.bytes().as_bytes() != &b[..] {
+            return Err(format!(
+                "oracle_txn_commit: t{txn}'s commit {t:.7} holds {p} as {:?}, the program staged {:?}",
+                file.bytes(),
+                String::from_utf8_lossy(b)
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn drain(
@@ -911,7 +1075,7 @@ const PHASE_1: Generator = Generator {
 };
 
 /// The steps `g` may take now.
-fn pending_of(w: &World, g: Generator) -> Vec<Step> {
+fn pending_of(w: &HistoryService, g: Generator) -> Vec<Step> {
     let mut steps = w.pending();
     if !g.drops {
         steps.retain(|s| !matches!(s, Step::Drop(_)));
@@ -935,7 +1099,7 @@ fn run_seed_of(
     policies: Policies,
     tally: &mut Tally,
 ) -> Result<String, String> {
-    let mut w = Checked::new(policies, TreeNames::new(MODEL_ROOT));
+    let mut w = Checked::new(policies, TreeNames::new());
     w.label_trace(format!("seed{seed}"));
     let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         generate(&mut w, seed, tally)
@@ -1865,10 +2029,10 @@ fn run_all(policies: Policies) {
         seeds().len(),
         failures.join("\n\n")
     );
-    // Across the CI seeds (or more) the rules really met: changes lost
-    // whole with clean lines in them (rule 3e), and rules 10 and 11 (below).
-    // One seed alone may have none.
-    if seeds().len() as u64 >= SEEDS {
+    // Across the regression seeds or the sweep the rules really met: changes
+    // lost whole with clean lines in them (rule 3e), and rules 10 and 11
+    // (below). One seed alone may have none.
+    if floors_apply(SEEDS) {
         assert!(
             tally.changes_lost > 0 && tally.clean_lines_lost > 0,
             "no change lost whole with a clean line in {} seeds",
@@ -1924,22 +2088,20 @@ fn random_interleavings_full_lineage() {
     run_all(Policies::default());
 }
 
-/// CI runs [`random_interleavings_rounds`] at seeds 1..=ROUNDS_SEEDS: each seed
-/// drains four times, so 64 seeds would be the slowest test by far.
-/// `AGENTFS_MODEL_SEEDS` and `AGENTFS_MODEL_SEED` apply as to every random run.
+/// The sweep runs [`random_interleavings_rounds`] at seeds 1..=ROUNDS_SEEDS: each
+/// seed drains four times, so 64 seeds would be the slowest test by far. By
+/// default it takes the `rounds` regression seeds; `AGENTFS_MODEL_SEEDS` and
+/// `AGENTFS_MODEL_SEED` apply as to every random run.
 const ROUNDS_SEEDS: u64 = 16;
+
+fn round_seeds() -> Vec<u64> {
+    seeds_of("rounds", ROUNDS_SEEDS)
+}
 
 /// [`rounds`]: many calls with no queue step between them, every invariant.
 #[test]
 fn random_interleavings_rounds() {
-    let explicit = ["AGENTFS_MODEL_SEED", "AGENTFS_MODEL_SEEDS"]
-        .iter()
-        .any(|v| std::env::var(v).is_ok());
-    let seeds = if explicit {
-        seeds()
-    } else {
-        (1..=ROUNDS_SEEDS).collect()
-    };
+    let seeds = round_seeds();
     let mut tally = Tally::default();
     let failures: Vec<String> = seeds
         .iter()
@@ -1953,7 +2115,7 @@ fn random_interleavings_rounds() {
         seeds.len(),
         failures.join("\n\n")
     );
-    if seeds.len() as u64 >= ROUNDS_SEEDS {
+    if floors_apply(ROUNDS_SEEDS) {
         assert!(
             tally.changes_lost > 0 && tally.clean_lines_lost > 0,
             "rounds: no change lost whole with a clean line in {} seeds",
@@ -1962,8 +2124,9 @@ fn random_interleavings_rounds() {
     }
 }
 
-/// One [`Run`] over the seeds, every invariant on, no tally floor: the floors
-/// of [`run_all`] count transactions, which these runs do not make.
+/// One [`Run`] over the seeds, every invariant on, with its own floor
+/// `at_least` where [`floors_apply`] at 8 seeds: the floors of [`run_all`]
+/// count transactions, which these runs do not make.
 fn run_scoped(generate: Run, seeds: &[u64], at_least: impl Fn(&Tally) -> bool) {
     let mut tally = Tally::default();
     let failures: Vec<String> = seeds
@@ -1979,7 +2142,7 @@ fn run_scoped(generate: Run, seeds: &[u64], at_least: impl Fn(&Tally) -> bool) {
         failures.join("\n\n")
     );
     assert!(
-        seeds.len() < 8 || at_least(&tally),
+        !floors_apply(8) || at_least(&tally),
         "the phase 1 runs met too little: {tally:?}"
     );
 }
@@ -1995,15 +2158,7 @@ fn random_interleavings_phase1_scope() {
 /// [`rounds`], for the same replay.
 #[test]
 fn random_interleavings_rounds_phase1_scope() {
-    let explicit = ["AGENTFS_MODEL_SEED", "AGENTFS_MODEL_SEEDS"]
-        .iter()
-        .any(|v| std::env::var(v).is_ok());
-    let seeds = if explicit {
-        seeds()
-    } else {
-        (1..=ROUNDS_SEEDS).collect()
-    };
-    run_scoped(rounds_phase1, &seeds, |t| t.changes_lost > 0);
+    run_scoped(rounds_phase1, &round_seeds(), |t| t.changes_lost > 0);
 }
 
 /// The per-line rule does not depend on slots being separate git hunks:
@@ -2016,14 +2171,14 @@ fn random_interleavings_adjacent_lines() {
     });
 }
 
-/// Rule 2, "no clock is read anywhere", on the random runs: seeds 1..=8 run
-/// again with every commit dated before its parents decide exactly the same
+/// Rule 2, "no clock is read anywhere", on the random runs: the first 8 of
+/// the run's seeds run again with every commit dated before its parents decide exactly the same
 /// history (the digest's canonical text, `agentfs_model::digest`). An order taken from commit
 /// dates would differ.
 #[test]
 fn random_interleavings_commit_dates_decide_nothing() {
     let policies = Policies::default();
-    for seed in seeds().into_iter().take(8) {
+    let one = |seed: u64| {
         let mut tally = Tally::default();
         let pinned = run_seed(seed, policies, &mut tally);
         // Each run must pass on its own first: a failure names commit
@@ -2033,7 +2188,29 @@ fn random_interleavings_commit_dates_decide_nothing() {
         let reversed = with_reversed_dates(|| run_seed(seed, policies, &mut tally))
             .unwrap_or_else(|e| panic!("seed {seed}, dates reversed: {e}"));
         assert_eq!(pinned, reversed, "seed {seed}");
-    }
+    };
+    // Each seed on its own thread, named as the test's so its runs keep their
+    // names (`World::run_name`); the reversed dates are per thread.
+    let one = &one;
+    let name = std::thread::current().name().map(str::to_owned);
+    std::thread::scope(|s| {
+        let runs: Vec<_> = seeds()
+            .into_iter()
+            .take(8)
+            .map(|seed| {
+                let mut b = std::thread::Builder::new();
+                if let Some(n) = &name {
+                    b = b.name(n.clone());
+                }
+                b.spawn_scoped(s, move || one(seed)).expect("a thread")
+            })
+            .collect();
+        for run in runs {
+            if let Err(panic) = run.join() {
+                std::panic::resume_unwind(panic);
+            }
+        }
+    });
 }
 
 /// Coherence finding 1: git's own merge base cannot tell a fork line the

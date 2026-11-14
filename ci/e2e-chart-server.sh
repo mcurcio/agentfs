@@ -252,7 +252,7 @@ if git ls-remote "$(url wrong-password)" >"$WORK/wrong.log" 2>&1; then
 fi
 pass "git ls-remote with a wrong password fails"
 until_ok 30 "the server logs the password mismatch (401)" \
-  sh -c "kubectl -n $DNS logs $SERVER-0 -c git-server | grep -q 'user \"agentfs\": password mismatch'"
+  sh -c "kubectl -n $DNS logs $SERVER-0 -c git-server | grep 'user \"agentfs\": password mismatch' >/dev/null"
 
 step "(e) the server pod is deleted and comes back with the repository"
 uid=$(kd get pod "$SERVER-0" -o jsonpath='{.metadata.uid}')

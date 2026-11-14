@@ -12,6 +12,90 @@ design was reviewed on 2026-10-12.
 
 ### Added
 
+- **Tree views: fork keys, end and drop.** `trees mount --fork-mount DIR` mounts
+  a new fork, which ends when its view is unmounted, or with `--fork-key KEY` the
+  open fork under that key: a second create under a key returns its fork and
+  writes nothing. `trees end --fork-key KEY` ends a keyed fork (exit 75 while a
+  mount holds the volume). An ended fork drops once its upstream's queue holds
+  nothing of it, no file is open in it and no fork names it: one journal step
+  (`Change::Drop`) with its `ForkDropped` row, after which its branch, queue
+  entries and checkout are gone while its row chain, collision refs and landed
+  saves stay; its writer claim is released (`ClaimReleased`). Ends and drops are
+  commits on the fork's chain (`ForkEnded`, `ForkDropped`), judged from the
+  journal at boot, after each landing and at each end, so a failing builder holds
+  none back (docs/trees.md, "Forks: keys, end and the drop"). `trees fork`,
+  `--sandbox`, `--fork`, `--sandbox-writer` and `--sandbox-read-only` are gone:
+  use `--fork-mount`, `--fork-key`, `--fork-writer` and `--fork-read-only`.
+- **Tree views: clients and sessions.** Each view of `trees mount` is a client of
+  its tree, attached through the Clients domain, and every save names it:
+  `Agentfs-Writer: <label>#<n>@<launcher>/<tree>` (`root-client#5@cli/root`), its
+  number the attach's journal step. A view reaches its tree only through its
+  client's session (`agentfs_core::session`): a read-only client's writes answer
+  `EROFS` (`--read-only`, `--fork-read-only`), and a session reaches only its
+  own open files. A fork has one writer for life: a second read-write mount of it,
+  live or after a clean unmount, exits 1. After a kill the next mount rebinds the
+  client (same id, the new pod context); a clean unmount detaches it, its open
+  files saved and durable first. Attach, rebind and end are commits on
+  `refs/agentfs/clients/<tree>` (`Attached`, `Rebound`, `AttachmentEnded`,
+  `LastDetached`), durable before they return, never waiting for history. The
+  view host is `agentfs_fuse::tree_view::ViewHost` (docs/trees.md, "Clients").
+  `--writer` and `--fork-writer` are now client labels: safe names of at most
+  64 bytes.
+- **Tree views: volume events on record as commits.** A fork's row is a commit
+  on its own chain, `refs/agentfs/trees/fork/<n>`, beside the fork: its tree is
+  `row.json` (the row with its audit stamps) and its message the event
+  (`ForkCreated`, with `Agentfs-Kind`, `Agentfs-By`, `Agentfs-Event` and the
+  volume and pod trailers, `Agentfs-Format: row-1`). The fork's branch and its row
+  are one journal record, durable before the call returns; the event commit is
+  built behind it. A mount's new fork is created through
+  the Trees domain on the new store adapter (`agentfs_core::store::TreeStore`).
+  Rows and queue facts are read from the journal, never Git, so they answer while
+  the builder lags or fails (docs/trees.md, "Rows and event commits"). The tree
+  state format is `agentfs-trees-10`; a state area of any other format is
+  refused, never converted.
+- **Tree views: a large file costs its save, not memory.** A line map holds each
+  line's identity and version as runs, never its bytes: bytes have one home, the
+  file. A save's alignment reads both versions a line at a time (a new file and an
+  append run no `git diff`), git streams blobs over 8 MiB, and a take's merged
+  files are written from their sources into chunk records of at most 16 MiB, so a
+  take of any size records. A 1 GiB save builds in about 40 s with the builder at
+  17 MiB (one local run); the figures add `history_1g` and `memory_1g`. Opening a
+  volume never waits for history: it serves the journal's records replayed on the
+  trees as built, and a failed build raises its alarm without refusing the open.
+  No record after a checkpoint names a step the checkpoint covers
+  (docs/trees.md, "What a commit holds", "File maps"). The tree state format is
+  `agentfs-trees-9`; a state area of any other format is refused, never
+  converted.
+- **Tree views: file maps and journal segments.** No file's bytes are held in
+  memory: a file is a map of journal frames and its checkout as built, so a write
+  costs its own bytes at any file size and a close compares only the bytes the
+  open touched. The journal is a directory of 64 MiB segments (`journal/`); a
+  compaction writes a checkpoint segment and drops the segments behind it, and a
+  file held open pins only its own frames. Checkouts write each file by rename, so
+  a reader keeps the version it opened. A save record carries a digest of the
+  file's pieces in place of a checksum. A map holds no descriptor: a checked-out
+  base is a hard link in `bases/`, read through a cache of 256 open files. The
+  figures add `close_1g` and `write_1g` (docs/trees.md, "File maps").
+- **Tree views: a save costs its change, not the tree.** A commit keeps each
+  file's bytes, line map and name history under two levels of hashed folders
+  (`files/<aa>/<bb>/<name>`, `lines/...`, `names/<cc>/<dd>/<id>`), and the builder
+  rewrites only the changed files' folders. `metadata.json`, `namespace.json` and
+  the object table refs (`refs/agentfs/objects/<tree>`) are gone: object numbers
+  live in the journal's checkpoint. A new file's first save runs no `git diff`.
+  Checkouts mirror `files/` (docs/trees.md, "What a commit holds").
+- **Tree views: history is built behind the calls.** A step's journal record is the
+  change itself; the call path runs no git. A builder thread makes the commits with
+  `git fast-import` behind it, and Git's refs, commits and checkouts show only what
+  is built (`Recording::settle` waits for it), recorded in `built.log`. A failed
+  build is retried and never fails a call.
+- **Tree views: takes are decided off the actor.** A queue take is decided on
+  built history with the actor unlocked, so calls go on while it judges, and lands
+  only if nothing it read changed since; otherwise it is decided again
+  (docs/trees.md, "Takes").
+- **Tree views: a call is journalled without an fsync.** A write, create, rename
+  or unlink is in the journal before it returns and survives a crash of agentfs;
+  close, fsync, an `O_SYNC` write or an fsync of the view's directory make it
+  power-cut safe, with waits sharing one fsync. The journal's frames are `AFJ3`.
 - **Recording.** A FUSE filesystem (`agentfs mount`) that durably records
   every change boundary (a close after a change, a rename, a delete, a
   link) before the call returns, through a journal with group commit and
@@ -61,6 +145,14 @@ design was reviewed on 2026-10-12.
   and Compose examples, Helm charts for the CSI driver and the sidecar
   (published to `oci://ghcr.io/mcurcio/charts`), and example Prometheus
   alert rules with runbooks.
+- **Tree views identify their volume and writers** ([trees](docs/trees.md)):
+  `agentfs trees init --volume NAME` (required) gives a volume a random id,
+  finds it again under the same name with nothing written, and refuses
+  another name. Every commit carries `Agentfs-Event`, `Agentfs-Volume`,
+  `Agentfs-Volume-Id` and the writer's pod context (`--namespace`, `--pod`,
+  `--pod-uid`, `--node`); a landing merge names the writer it lands. `trees
+  mount` never creates a volume, mounts with FUSE `allow_other` unless
+  `--no-allow-other`, and presents its files as `--owner UID:GID`.
 - **Testing**: end-to-end CI against real FUSE mounts, git servers over
   HTTP, HTTPS and SSH, LFS servers, an OpenTelemetry collector, NFS, kind
   clusters and csi-sanity; crash injection and power-loss replay on XFS

@@ -312,7 +312,7 @@ if in_shard rest; then
   check_history
   sgit cat-file -e "refs/heads/agentfs/clone:clone/Makefile" ||
     fail "the clone's working tree is not in the history"
-  if sgit ls-tree -r --name-only "refs/heads/agentfs/clone" -- "clone/.git" | grep -q .; then
+  if sgit ls-tree -r --name-only "refs/heads/agentfs/clone" -- "clone/.git" | grep . >/dev/null; then
     fail "the clone's git directory is in the history"
   fi
   pass "the working tree is recorded, its git directory is not"
@@ -345,7 +345,7 @@ if in_shard rest; then
   pass "npm: the excluded files were not journaled ($made records with the marker)"
   n=$(sudo find "$BACKING/npm/node_modules" -type f | wc -l)
   assert_eq "$NPM_FILES" "$n" "npm: every file reached the backing tree"
-  if sgit ls-tree -r --name-only refs/heads/agentfs/npm | grep -q node_modules; then
+  if sgit ls-tree -r --name-only refs/heads/agentfs/npm | grep node_modules >/dev/null; then
     fail "node_modules/ is in the history"
   fi
   pass "nothing under node_modules/ was recorded"

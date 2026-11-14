@@ -321,7 +321,7 @@ wait "$BURST_B" || fail "pod-b's burst failed"
 TREE=$(sudo cat "$BACKING/burst.txt")
 # commitWindow is 200ms: wait until every record of the burst that reached
 # the service is committed, then check once.
-wait_for 30 sh -c "sudo '$AGENTFS_BIN' --state '$STATE' status | grep -Eq '^backlog: +0 record'" ||
+wait_for 30 sh -c "sudo '$AGENTFS_BIN' --state '$STATE' status | grep -E '^backlog: +0 record' >/dev/null" ||
   fail "the backlog never drained: $(sudo "$AGENTFS_BIN" --state "$STATE" status 2>&1)"
 # Freeze stamps order the racing records: HEAD ends on the
 # tree's last state, with no later boundary to fix it.

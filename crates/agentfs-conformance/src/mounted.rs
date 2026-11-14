@@ -9,7 +9,7 @@
 
 use crate::engine_names::EngineNames;
 use crate::library::{fail, seed};
-use agentfs_core::tree_actor::Volume;
+use agentfs_core::tree_actor::TreeId as EngineTree;
 use agentfs_model::calls::{CallError, Caller, Took, TreeCalls, TreeId};
 use std::collections::{BTreeMap, VecDeque};
 use std::ffi::CString;
@@ -37,6 +37,46 @@ fn last_error(what: &str) -> CallError {
 
 fn c_path(p: &Path) -> Result<CString, CallError> {
     CString::new(p.as_os_str().as_bytes()).map_err(|e| CallError::new(e.to_string()))
+}
+
+/// Discards the events: this harness consumes none.
+struct NoConsumers;
+
+impl agentfs_contracts::ports::EventSink for NoConsumers {
+    fn publish(&mut self, _: agentfs_contracts::ports::Event) {}
+}
+
+/// The sandbox fork's key: `mount` finds the fork under it at every mount,
+/// the remount after a crash included.
+const FORK_KEY: &str = "conformance";
+
+/// The sandbox's fork, made as the trial CLI makes one: through the Trees
+/// domain on the store adapter, under [`FORK_KEY`], so the fork's row is on
+/// its chain and the mount finds it.
+fn sandbox_fork(
+    recording: &std::sync::Arc<agentfs_core::tree_actor::Recording>,
+) -> Result<EngineTree, CallError> {
+    use agentfs_contracts::caps::{LaunchCap, LaunchScope, Minter};
+    use agentfs_contracts::name::{ForkKey, LauncherId};
+    use agentfs_contracts::trees::{ForkSettings, Landing, Trees};
+    let store = agentfs_core::store::TreeStore::new(std::sync::Arc::clone(recording));
+    let mut trees = agentfs_trees::TreesService::restore(store.clone(), store, NoConsumers)
+        .map_err(|e| CallError::new(e.to_string()))?;
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the harness is its own composition root"
+    )]
+    let minter = Minter::new();
+    let launcher = LauncherId::parse("conformance").map_err(|e| CallError::new(e.to_string()))?;
+    let cap = LaunchCap::mint(&minter, launcher, LaunchScope::Root);
+    let settings = ForkSettings {
+        landing: Landing::Automatic,
+    };
+    let key = ForkKey::parse(FORK_KEY).map_err(|e| CallError::new(e.to_string()))?;
+    let fork = trees
+        .create(EngineTree::Root, Some(key), settings, &cap)
+        .map_err(|e| CallError::new(e.to_string()))?;
+    Ok(fork.into())
 }
 
 /// A mount of the root and at most one sandbox, and the opens this harness holds.
@@ -79,11 +119,21 @@ impl Mounted {
             std::fs::create_dir_all(dir).map_err(|e| io_fail("mkdir", &e))?;
         }
         {
-            let mut volume = Volume::open(&state).map_err(fail)?;
-            seed(&mut volume, names.name(TreeId::ROOT)?).map_err(fail)?;
+            let recording = agentfs_core::tree_actor::Recording::create(
+                &state,
+                &crate::library::identity(),
+                &agentfs_contracts::pod::PodContext::default(),
+            )
+            .map_err(fail)?;
+            seed(
+                &mut *recording.actor().map_err(fail)?,
+                names.name(TreeId::ROOT)?,
+            )
+            .map_err(fail)?;
             if with_sandbox {
-                names.forked(volume.fork().map_err(fail)?)?;
+                names.forked(sandbox_fork(&recording)?)?;
             }
+            // Every record durable and built, and the lease free, at the drop.
         }
         for fifo in ["go", "took"] {
             let path = c_path(&gate.join(fifo))?;
@@ -149,11 +199,11 @@ impl Mounted {
             .stdin(Stdio::null())
             .stdout(log.try_clone().map_err(|e| io_fail("mount log", &e))?)
             .stderr(log);
-        if let Some(fork) = self.sandbox_fork() {
+        if self.sandbox_fork().is_some() {
             command
-                .arg("--sandbox")
+                .arg("--fork-mount")
                 .arg(&self.sandbox)
-                .args(["--fork", fork]);
+                .args(["--fork-key", FORK_KEY]);
         }
         self.child = Some(command.spawn().map_err(|e| io_fail("spawn", &e))?);
         let started = Instant::now();
@@ -184,7 +234,7 @@ impl Mounted {
     }
 
     /// The sandbox's fork, the one `mountable` allows, if `new` made it.
-    fn sandbox_fork(&self) -> Option<&str> {
+    fn sandbox_fork(&self) -> Option<EngineTree> {
         self.names.name(TreeId::new(1)).ok()
     }
 
@@ -215,6 +265,7 @@ impl Mounted {
             return Err(last_error("open"));
         }
         self.opens.insert(fd, c.clone());
+        self.settle()?;
         Ok(fd)
     }
 
@@ -234,7 +285,23 @@ impl Mounted {
         if unsafe { libc::close(fd) } != 0 {
             return Err(last_error("close"));
         }
-        self.released()
+        self.released()?;
+        self.settle()
+    }
+
+    /// Asks the gate to wait until history is built through every record so
+    /// far: the invariants read git after each call, and the builder makes
+    /// history behind the call path.
+    fn settle(&mut self) -> Result<(), CallError> {
+        writeln!(self.go, "settle").map_err(|e| io_fail("ask the gate", &e))?;
+        let mut answer = String::new();
+        self.took
+            .read_line(&mut answer)
+            .map_err(|e| io_fail("read the gate", &e))?;
+        match answer.trim_end() {
+            "settled" => Ok(()),
+            other => Err(CallError::new(format!("the gate answered {other:?}"))),
+        }
     }
 
     fn unmount(&self, lazy: bool) -> Result<(), CallError> {
@@ -354,11 +421,13 @@ impl TreeCalls for Mounted {
     }
 
     fn unlink(&mut self, c: &Caller, path: &str) -> Result<(), CallError> {
-        std::fs::remove_file(self.at(c, path)).map_err(|e| io_fail("unlink", &e))
+        std::fs::remove_file(self.at(c, path)).map_err(|e| io_fail("unlink", &e))?;
+        self.settle()
     }
 
     fn rename(&mut self, c: &Caller, from: &str, to: &str) -> Result<(), CallError> {
-        std::fs::rename(self.at(c, from), self.at(c, to)).map_err(|e| io_fail("rename", &e))
+        std::fs::rename(self.at(c, from), self.at(c, to)).map_err(|e| io_fail("rename", &e))?;
+        self.settle()
     }
 
     fn end_client(&mut self, c: &Caller) -> Result<(), CallError> {
@@ -375,18 +444,20 @@ impl TreeCalls for Mounted {
     }
 
     fn take_next(&mut self, t: TreeId) -> Result<Took, CallError> {
-        let tree = self.names.name(t)?.to_owned();
+        let tree = self.names.name(t)?;
         writeln!(self.go, "{tree}").map_err(|e| io_fail("ask the gate", &e))?;
         let mut answer = String::new();
         self.took
             .read_line(&mut answer)
             .map_err(|e| io_fail("read the gate", &e))?;
-        match answer.trim_end() {
-            "taken" => Ok(Took::Taken),
-            "waiting" => Ok(Took::Waiting),
-            "empty" => Ok(Took::Empty),
-            other => Err(CallError::new(format!("the gate answered {other:?}"))),
-        }
+        let took = match answer.trim_end() {
+            "taken" => Took::Taken,
+            "waiting" => Took::Waiting,
+            "empty" => Took::Empty,
+            other => return Err(CallError::new(format!("the gate answered {other:?}"))),
+        };
+        self.settle()?;
+        Ok(took)
     }
 
     /// `SIGKILL`, wait on the pid, drop what the harness holds, `fusermount3 -uz`,
@@ -395,6 +466,11 @@ impl TreeCalls for Mounted {
         if let Some(mut child) = self.child.take() {
             child.kill().map_err(|e| io_fail("kill", &e))?;
             child.wait().map_err(|e| io_fail("wait", &e))?;
+            // Its tree Git children share its lease and die of their
+            // parent-death signal after it: taking the lease, blocking, is
+            // the event that every holder is gone.
+            agentfs_core::tree_actor::wait_for_lease(&self.state)
+                .map_err(|e| io_fail("lease", &e))?;
         }
         for (fd, _) in std::mem::take(&mut self.opens) {
             // SAFETY: an open this harness holds; its connection is gone, so the
@@ -402,7 +478,9 @@ impl TreeCalls for Mounted {
             unsafe { libc::close(fd) };
         }
         self.unmount(true)?;
-        self.mount()
+        self.mount()?;
+        // Open never waits for history; the invariants read it after each call.
+        self.settle()
     }
 
     fn read(&self, t: TreeId, path: &str) -> Result<Option<Vec<u8>>, CallError> {
@@ -421,5 +499,19 @@ impl TreeCalls for Mounted {
         }
         paths.sort();
         Ok(paths)
+    }
+}
+
+impl crate::Objects for Mounted {
+    /// Each file's inode: the view numbers a file's object `object + 2`.
+    fn objects(&self, t: TreeId) -> Result<Vec<(String, u64)>, CallError> {
+        use std::os::unix::fs::MetadataExt;
+        let mut objects = Vec::new();
+        for path in self.paths(t)? {
+            let meta = std::fs::symlink_metadata(self.root(t).join(&path))
+                .map_err(|e| io_fail("stat", &e))?;
+            objects.push((path, meta.ino()));
+        }
+        Ok(objects)
     }
 }

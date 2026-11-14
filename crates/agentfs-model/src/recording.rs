@@ -389,13 +389,19 @@ impl Recording {
             .map(|((_, f), _)| f.clone())
     }
 
-    /// The files clients writing in tree `t` (at `at`, its head) have open, and the files
-    /// their deferred calls (R5.3) will save: identities, not lock keys. An open whose
-    /// object no path names (an orphan) has no file open.
-    pub(crate) fn open_files(&self, t: TreeId, at: &str, git: &impl Files) -> BTreeSet<String> {
+    /// The files clients writing in `target` (a tree, or a fork's transaction; at `at`,
+    /// its head) have open, and the files their deferred calls (R5.3) will save:
+    /// identities, not lock keys. An open whose object no path names (an orphan) has no
+    /// file open.
+    pub(crate) fn open_files(
+        &self,
+        target: Target,
+        at: &str,
+        git: &impl Files,
+    ) -> BTreeSet<String> {
         self.handles
             .values()
-            .filter(|h| h.target == Target::Tree(t))
+            .filter(|h| h.target == target)
             .flat_map(|h| {
                 let mut files: Vec<String> = self.named(h, at, git).into_iter().collect();
                 if h.kind != Kind::Write {

@@ -29,46 +29,56 @@ off = open(sys.argv[2]).read().splitlines()
 assert on == off[:len(on)], (on, off)
 if os.environ.get('CHECK_FINAL') == '1': assert on == off, (on, off)
 PY
-if ! "$AGENTFS_BIN" --state "$m/state" trees init >"$m/recovery.log" 2>&1; then
+if ! "$AGENTFS_BIN" --state "$m/state" trees init --volume t >"$m/recovery.log" 2>&1; then
   install -m 0644 "$m/recovery.log" "$RECOVERY_LOG_DIR/recovery-$point.log" || true
   cat "$m/recovery.log" >&2 || true
   fail 'tree recovery'
 fi
 gitdir=$m/state/history.git
 git --git-dir="$gitdir" fsck --full --strict --no-progress > /dev/null 2>&1 || fail 'git fsck'
-# A returned write's bytes: f<n> on main, s<n> on the fork's branch. The sandbox
+# A returned write's bytes: f<n> on the root, s<n> on the fork's branch. The sandbox
 # files ride through the fork's own pointers, in the same journal.
 check_write() {
   local kind=$1 n=$2 want got
   if [ "$kind" = W ]; then
     want=$(printf 'acknowledged-%s\n' "$n" | sha256sum | cut -d' ' -f1)
-    got=$(tree_git_file "$gitdir" main "f$n" | sha256sum | cut -d' ' -f1) || fail "missing acknowledged write $n"
+    got=$(tree_git_file "$gitdir" root "f$n" | sha256sum | cut -d' ' -f1) || fail "missing acknowledged write $n"
   else
     want=$(printf 'sandbox-%s\n' "$n" | sha256sum | cut -d' ' -f1)
     got=$(tree_git_file "$gitdir" "refs/heads/$FORK" "s$n" | sha256sum | cut -d' ' -f1) || fail "missing sandbox write $n"
   fi
   [ "$got" = "$want" ] || fail "wrong bytes for $kind write $n"
 }
-# A write marked as soon as it returned: its bytes, saved at recovery (R12).
+# A write with no fsync, marked once its close returned: its bytes (git-model §3, R12).
 check_unsynced() {
   local n=$1 want got
   want=$(printf 'unsynced-%s\n' "$n" | sha256sum | cut -d' ' -f1)
-  got=$(tree_git_file "$gitdir" main "x$n" | sha256sum | cut -d' ' -f1) || fail "missing unsynced write $n"
+  got=$(tree_git_file "$gitdir" root "x$n" | sha256sum | cut -d' ' -f1) || fail "missing unsynced write $n"
   [ "$got" = "$want" ] || fail "wrong bytes for unsynced write $n"
 }
-# A rename marked as soon as it returned: the new name, with the old one gone.
+# A rename marked once an fsync of the view's directory returned: the new name,
+# with the old one gone.
 check_rename() {
   local want got
   want=$(printf 'renamed\n' | sha256sum | cut -d' ' -f1)
-  got=$(tree_git_file "$gitdir" main r | sha256sum | cut -d' ' -f1) || fail "missing renamed file"
+  got=$(tree_git_file "$gitdir" root r | sha256sum | cut -d' ' -f1) || fail "missing renamed file"
   [ "$got" = "$want" ] || fail "wrong bytes for renamed file"
-  ! tree_git_file "$gitdir" main y >/dev/null 2>&1 || fail "old name of the rename still present"
+  ! tree_git_file "$gitdir" root y >/dev/null 2>&1 || fail "old name of the rename still present"
+}
+# The file held open across a rollover, a compaction and a carry-forward,
+# marked once its close returned: 1 MiB each of A to D, then a line.
+check_held() {
+  local want got
+  want=$(python3 -c 'import hashlib, sys; sys.stdout.write(hashlib.sha256(b"".join(bytes([0x41 + i]) * (1 << 20) for i in range(4)) + b"held\n").hexdigest())')
+  got=$(tree_git_file "$gitdir" root h | sha256sum | cut -d' ' -f1) || fail "missing held file"
+  [ "$got" = "$want" ] || fail "wrong bytes for the held file"
 }
 while read -r kind n; do
   case "$kind" in
     W|SW) check_write "$kind" "$n" ;;
     XW) check_unsynced "$n" ;;
     RN) check_rename ;;
+    HC) check_held ;;
   esac
 done < "$m/receipts"
 if [ -n "${CHECK_MARK:-}" ]; then
@@ -78,9 +88,9 @@ if [ -n "${CHECK_MARK:-}" ]; then
 import sys
 lines = open(sys.argv[1]).read().splitlines()
 kind, n = sys.argv[2], int(sys.argv[3])
-assert kind in ('F', 'C', 'SF', 'SC', 'XW', 'RN') and n > 0
+assert kind in ('F', 'C', 'SF', 'SC', 'XW', 'RN', 'HC') and n > 0
 main = n if kind in ('F', 'C') else 8
-forked = n if kind in ('SF', 'SC') else (2 if kind in ('XW', 'RN') else 0)
+forked = n if kind in ('SF', 'SC') else (2 if kind in ('XW', 'RN', 'HC') else 0)
 prefix = ['S']
 for i in range(1, main + 1):
     prefix.extend([f'W {i}', f'F {i}'])
@@ -88,9 +98,10 @@ for i in range(1, main + 1):
 for i in range(1, forked + 1):
     prefix.extend([f'SW {i}', f'SF {i}'])
     if i < forked or kind != 'SF': prefix.append(f'SC {i}')
-if kind in ('XW', 'RN'):
+if kind in ('XW', 'RN', 'HC'):
     prefix.extend(f'XW {i}' for i in range(1, (n if kind == 'XW' else 2) + 1))
-if kind == 'RN': prefix.append('RN 1')
+if kind in ('RN', 'HC'): prefix.append('RN 1')
+if kind == 'HC': prefix.append('HC 1')
 assert lines[:len(prefix)] == prefix, (lines, prefix)
 PYMARK
   case "$CHECK_MARK_KIND" in
@@ -103,14 +114,15 @@ PYMARK
   case "$CHECK_MARK_KIND" in
     XW) for n in $(seq 1 "$CHECK_MARK_N"); do check_unsynced "$n"; done ;;
     RN) for n in 1 2; do check_unsynced "$n"; done; check_rename ;;
+    HC) for n in 1 2; do check_unsynced "$n"; done; check_rename; check_held ;;
   esac
 fi
 tree_git_no_duplicate_opens "$gitdir" || fail "duplicate Agentfs-Open"
 heads=$(git --git-dir="$gitdir" for-each-ref --format='%(refname) %(objectname)' refs/heads)
-"$AGENTFS_BIN" --state "$m/state" trees init >/dev/null 2>&1 || fail 'second recovery'
+"$AGENTFS_BIN" --state "$m/state" trees init --volume t >/dev/null 2>&1 || fail 'second recovery'
 [ "$(git --git-dir="$gitdir" for-each-ref --format='%(refname) %(objectname)' refs/heads)" = "$heads" ] || fail 'second recovery changed heads'
 # The refs are a copy: without them, the journal alone brings back the same heads.
 rm -rf "$gitdir/refs" "$gitdir/packed-refs"
-"$AGENTFS_BIN" --state "$m/state" trees init >/dev/null 2>&1 || fail 'recovery without refs'
+"$AGENTFS_BIN" --state "$m/state" trees init --volume t >/dev/null 2>&1 || fail 'recovery without refs'
 [ "$(git --git-dir="$gitdir" for-each-ref --format='%(refname) %(objectname)' refs/heads)" = "$heads" ] || fail 'refs differ after removing them'
 printf 'PASS\t%s\t%s\tlast receipt %s\n' "$FS" "$point" "$(tail -n 1 "$m/receipts")" >> "$RESULTS"
