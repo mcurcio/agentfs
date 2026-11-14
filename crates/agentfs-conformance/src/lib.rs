@@ -72,14 +72,14 @@ pub fn against_library(trace: &[Recorded], sink: &mut dyn Sink) -> Result<(), St
 /// `sink` gets what the mount did.
 pub fn against_mount(trace: &[Recorded], bin: &Path, sink: &mut dyn Sink) -> Result<(), String> {
     let dir = tempfile::tempdir().map_err(|e| e.to_string())?;
-    let with_sandbox = trace
+    let with_fork = trace
         .iter()
         .any(|r| matches!(r.call, RecordedCall::Fork { .. }));
     let mut mounted = Mounted::new(
         bin,
         dir.path(),
         EngineNames::new(),
-        with_sandbox,
+        with_fork,
         opens_that_append(trace),
     )
     .map_err(|e| e.to_string())?;
@@ -102,7 +102,7 @@ pub fn against_model(trace: &[Recorded], sink: &mut dyn Sink) -> Result<(), Stri
     })
 }
 
-/// Whether a trace fits "the root and one sandbox" on a real mount: at most one
+/// Whether a trace fits "the root and one fork" on a real mount: at most one
 /// fork, made before the first client call, and no open that both appends and
 /// writes at an offset. Linux has no such descriptor: `pwrite` on an `O_APPEND`
 /// file appends, and the view reads `O_APPEND` when the file opens.

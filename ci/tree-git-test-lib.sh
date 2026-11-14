@@ -43,3 +43,33 @@ tree_git_wait_root_attached() {
   done
   echo 'the mount did not attach its root client' >&2; return 1
 }
+
+# tree_wait_exit PID [SECONDS]: waits for PID, a child of this shell, to exit
+# and returns its status. A process that never exits (a drain that never
+# releases) is a failure, not a hang: past the bound (default 120 s) it is
+# killed with SIGKILL, said on stderr, and this returns 124. The wait is on
+# the exit itself; the bound only ends a hang.
+tree_wait_exit() {
+  local pid=$1 bound=${2:-120} timer done= status=0
+  # Gone already (reaped, or never this shell's): its status, if any, at once.
+  kill -0 "$pid" 2>/dev/null || { wait "$pid" 2>/dev/null; return; }
+  sleep "$bound" &
+  timer=$!
+  wait -n -p done "$pid" "$timer" || status=$?
+  if [ "$done" = "$timer" ]; then
+    echo "process $pid did not exit within ${bound}s: killed with SIGKILL" >&2
+    kill -KILL "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    return 124
+  fi
+  kill "$timer" 2>/dev/null || true
+  wait "$timer" 2>/dev/null || true
+  return "$status"
+}
+
+# tree_stop PID: SIGTERM, then tree_wait_exit with a short bound: a cleanup
+# trap never hangs on a mount whose drain does not finish.
+tree_stop() {
+  kill "$1" 2>/dev/null || true
+  tree_wait_exit "$1" 30 2>/dev/null || true
+}

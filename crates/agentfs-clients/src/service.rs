@@ -127,8 +127,27 @@ where
     ///
     /// The store's write.
     pub fn on_fork_dropped(&mut self, fork: ForkId) -> Result<(), StoreError> {
-        self.store.release_claim(fork, &Principal::Agentfs)?;
+        self.store.release_claim(fork)?;
         self.claims.remove(&fork);
+        Ok(())
+    }
+
+    /// Releases the claim of every fork Trees reports dropped: what a lost
+    /// `ForkDropped` (a crash or a failed release after the drop) left.
+    fn release_dropped_claims(&mut self) -> Result<(), StoreError> {
+        let dropped: Vec<ForkId> = self
+            .claims
+            .keys()
+            .copied()
+            .filter(|fork| {
+                self.forks
+                    .facts(*fork)
+                    .is_some_and(|facts| facts.phase == ForkPhase::Dropped)
+            })
+            .collect();
+        for fork in dropped {
+            self.on_fork_dropped(fork)?;
+        }
         Ok(())
     }
 
@@ -207,6 +226,7 @@ where
         &mut self,
         ended: &[(ClientId, AttachmentEndReason)],
         by: &LaunchCap,
+        at: &PodContext,
     ) -> Result<(), StoreError> {
         if ended.is_empty() {
             return Ok(());
@@ -229,12 +249,11 @@ where
             .filter(|(_, clients)| clients.keys().any(|c| gone.contains(c)))
             .map(|(tree, _)| *tree)
             .collect();
-        // `Detach` and `reconcile` carry no pod context: the events have none.
         self.store.end(
             ended,
             &emptied,
             &Principal::Launcher(by.launcher().clone()),
-            &PodContext::default(),
+            at,
         )?;
         for (client, why) in ended {
             if let Some(clients) = self.index.get_mut(&client.tree) {
@@ -353,7 +372,12 @@ where
         self.bind(client, session).ok_or(ClientError::UnknownClient)
     }
 
-    fn detach(&mut self, client: &ClientId, by: &LaunchCap) -> Result<(), ClientError> {
+    fn detach(
+        &mut self,
+        client: &ClientId,
+        by: &LaunchCap,
+        at: &PodContext,
+    ) -> Result<(), ClientError> {
         if self.attachment(client).is_none() {
             return if self.ended.contains(client) {
                 Ok(())
@@ -364,21 +388,25 @@ where
         if client.launcher != *by.launcher() {
             return Err(ClientError::NotItsLauncher);
         }
-        self.end(&[(client.clone(), AttachmentEndReason::Detached)], by)?;
+        self.end(&[(client.clone(), AttachmentEndReason::Detached)], by, at)?;
         Ok(())
     }
 
-    fn reconcile(&mut self, live: &ClientSet, by: &LaunchCap) -> Vec<ClientId> {
+    fn reconcile(
+        &mut self,
+        live: &ClientSet,
+        by: &LaunchCap,
+        at: &PodContext,
+    ) -> Result<Vec<ClientId>, ClientError> {
         let ended: Vec<(ClientId, AttachmentEndReason)> = self
             .attached_any()
             .into_iter()
             .filter(|c| c.launcher == *by.launcher() && !live.contains(c))
             .map(|c| (c, AttachmentEndReason::Reconciled))
             .collect();
-        match self.end(&ended, by) {
-            Ok(()) => ended.into_iter().map(|(c, _)| c).collect(),
-            Err(_) => Vec::new(),
-        }
+        self.end(&ended, by, at)?;
+        self.release_dropped_claims()?;
+        Ok(ended.into_iter().map(|(c, _)| c).collect())
     }
 
     fn attached(&self, tree: TreeId) -> ClientSet {
@@ -399,11 +427,14 @@ mod tests {
 
     use super::*;
 
-    /// Rows in memory, numbered as the actor numbers them: by step.
+    /// Rows in memory, numbered as the actor numbers them: by step. Each
+    /// end's `at` is kept; `fail_ends` fails every end, changing nothing.
     #[derive(Default)]
     struct Store {
         rows: BTreeMap<TreeId, TreeClients>,
         step: u64,
+        ends_at: Vec<PodContext>,
+        fail_ends: bool,
     }
 
     fn audited<T>(value: T) -> Audited<T> {
@@ -468,9 +499,15 @@ mod tests {
             ended: &[(ClientId, AttachmentEndReason)],
             _: &[TreeId],
             _: &Principal,
-            _: &PodContext,
+            at: &PodContext,
         ) -> Result<(), StoreError> {
+            if self.fail_ends {
+                return Err(StoreError::NotDurable(
+                    agentfs_contracts::volume::IoKind::NoSpace,
+                ));
+            }
             self.step += 1;
+            self.ends_at.push(at.clone());
             for (client, _) in ended {
                 if let Some(row) = self.rows.get_mut(&client.tree) {
                     row.attached.retain(|a| a.value.id != *client);
@@ -479,10 +516,11 @@ mod tests {
             Ok(())
         }
 
-        fn release_claim(&mut self, fork: ForkId, _: &Principal) -> Result<(), StoreError> {
-            self.step += 1;
-            if let Some(row) = self.rows.get_mut(&fork.into()) {
-                row.writer_claim = None;
+        fn release_claim(&mut self, fork: ForkId) -> Result<(), StoreError> {
+            if let Some(row) = self.rows.get_mut(&fork.into())
+                && row.writer_claim.take().is_some()
+            {
+                self.step += 1;
             }
             Ok(())
         }
@@ -500,7 +538,8 @@ mod tests {
         }
     }
 
-    /// Fork 1 by `cli`, fork 2 by `other`, both open; fork 3 ended.
+    /// Fork 1 by `cli`, fork 2 by `other`, both open; fork 3 ended; fork 4
+    /// dropped.
     struct Forks;
 
     impl ForkLookup for Forks {
@@ -509,6 +548,7 @@ mod tests {
                 1 => ("cli", ForkPhase::Open),
                 2 => ("other", ForkPhase::Open),
                 3 => ("cli", ForkPhase::Ended),
+                4 => ("cli", ForkPhase::Dropped),
                 _ => return None,
             };
             Some(ForkFacts {
@@ -642,13 +682,23 @@ mod tests {
             Err(ClientError::ForkTaken)
         );
         assert_eq!(
-            clients.detach(&writer, &cap("other", LaunchScope::Root)),
+            clients.detach(
+                &writer,
+                &cap("other", LaunchScope::Root),
+                &PodContext::default()
+            ),
             Err(ClientError::NotItsLauncher)
         );
         clients.events.0.clear();
-        clients.detach(&writer, &root).unwrap();
-        clients.detach(&reader, &root).unwrap();
-        clients.detach(&reader, &root).unwrap();
+        clients
+            .detach(&writer, &root, &PodContext::default())
+            .unwrap();
+        clients
+            .detach(&reader, &root, &PodContext::default())
+            .unwrap();
+        clients
+            .detach(&reader, &root, &PodContext::default())
+            .unwrap();
         assert_eq!(
             clients.events.0,
             [
@@ -711,8 +761,12 @@ mod tests {
             "and its restart"
         );
         assert_eq!(
-            clients.reconcile(&ClientSet::from([kept.clone()]), &root),
-            []
+            clients.reconcile(
+                &ClientSet::from([kept.clone()]),
+                &root,
+                &PodContext::default()
+            ),
+            Ok(vec![])
         );
         assert_eq!(clients.attached_any(), ClientSet::from([kept]));
     }
@@ -724,7 +778,9 @@ mod tests {
         let mut clients = service();
         let root = cap("cli", LaunchScope::Root);
         let writer = attach(&mut clients, write(TreeId::Fork(1)), &root).unwrap();
-        clients.detach(&writer, &root).unwrap();
+        clients
+            .detach(&writer, &root, &PodContext::default())
+            .unwrap();
         assert_eq!(
             attach(&mut clients, write(TreeId::Fork(1)), &root),
             Err(ClientError::ForkTaken)
@@ -743,6 +799,83 @@ mod tests {
         assert!(restored.claims.is_empty());
     }
 
+    /// The boot's reconcile releases the claim of a fork Trees reports
+    /// dropped: a crash after the drop step and before `ClaimReleased`
+    /// leaves the claim on the row, and the next boot releases it; an open
+    /// fork's claim stays.
+    #[test]
+    fn reconcile_releases_a_dropped_forks_claim() {
+        let mut clients = service();
+        let root = cap("cli", LaunchScope::Root);
+        let writer = attach(&mut clients, write(TreeId::Fork(1)), &root).unwrap();
+        clients
+            .detach(&writer, &root, &PodContext::default())
+            .unwrap();
+        // Fork 4 dropped with its claim left on the row.
+        let claim = ClientId {
+            tree: TreeId::Fork(4),
+            ..writer
+        };
+        clients.store.rows.insert(
+            TreeId::Fork(4),
+            TreeClients {
+                tree: TreeId::Fork(4),
+                attached: Vec::new(),
+                writer_claim: Some(audited(claim)),
+            },
+        );
+        let mut clients = ClientsService::restore(
+            clients.store,
+            Sessions::default(),
+            Forks,
+            Events::default(),
+            minter(),
+        )
+        .unwrap();
+        assert_eq!(clients.claims.len(), 2);
+        assert_eq!(
+            clients.reconcile(&ClientSet::new(), &root, &PodContext::default()),
+            Ok(vec![])
+        );
+        assert_eq!(
+            clients.claims.keys().copied().collect::<Vec<_>>(),
+            [ForkId(1)]
+        );
+        assert!(clients.store.rows[&TreeId::Fork(4)].writer_claim.is_none());
+        assert!(clients.store.rows[&TreeId::Fork(1)].writer_claim.is_some());
+    }
+
+    /// An end carries the launcher's pod context; a reconcile whose end
+    /// cannot be recorded answers the store's failure (the caller raises the
+    /// alarm) and ends none.
+    #[test]
+    fn ends_carry_the_launchers_pod_and_a_failed_reconcile_says_so() {
+        let mut clients = service();
+        let root = cap("cli", LaunchScope::Root);
+        let pod = PodContext {
+            pod: Some(agentfs_contracts::name::Label::parse("p-3").unwrap()),
+            ..PodContext::default()
+        };
+        let one = attach(&mut clients, write(TreeId::Root), &root).unwrap();
+        let two = attach(&mut clients, read(TreeId::Root), &root).unwrap();
+        clients.detach(&one, &root, &pod).unwrap();
+        assert_eq!(clients.store.ends_at, std::slice::from_ref(&pod));
+        clients.store.fail_ends = true;
+        assert_eq!(
+            clients.reconcile(&ClientSet::new(), &root, &pod),
+            Err(ClientError::NotDurable(
+                agentfs_contracts::volume::IoKind::NoSpace
+            ))
+        );
+        assert_eq!(clients.attached_any(), ClientSet::from([two.clone()]));
+        clients.store.fail_ends = false;
+        assert_eq!(
+            clients.reconcile(&ClientSet::new(), &root, &pod),
+            Ok(vec![two])
+        );
+        assert_eq!(clients.store.ends_at, [pod.clone(), pod]);
+    }
+
     /// While the volume drains no client attaches, nothing written; detach
     /// still ends one; staged again, attach is accepted.
     #[test]
@@ -757,7 +890,9 @@ mod tests {
             Err(ClientError::Draining)
         );
         assert_eq!(clients.store.step, step, "no row written");
-        clients.detach(&kept, &root).unwrap();
+        clients
+            .detach(&kept, &root, &PodContext::default())
+            .unwrap();
         assert!(clients.attached_any().is_empty());
         clients.on_volume_staged();
         attach(&mut clients, write(TreeId::Root), &root).unwrap();

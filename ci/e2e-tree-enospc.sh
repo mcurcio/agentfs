@@ -8,17 +8,17 @@ mkdir -p "$base"
 work=$(mktemp -d "$base/agentfs-tree-enospc.XXXXXX")
 work=$(realpath "$work")
 printf "artifacts: %s\n" "$work"
-mkdir -p "$work/volume" "$work/main" "$work/sandbox"
+mkdir -p "$work/volume" "$work/main" "$work/fork"
 pid=
 cleanup() {
-  [ -z "$pid" ] || { kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; }
-  for m in "$work/main" "$work/sandbox"; do fusermount3 -uz "$m" 2>/dev/null || true; done
+  [ -z "$pid" ] || tree_stop "$pid"
+  for m in "$work/main" "$work/fork"; do fusermount3 -uz "$m" 2>/dev/null || true; done
   mountpoint -q "$work/volume" && sudo umount "$work/volume" || true
 }
 trap cleanup EXIT
 expect_stopped() {
   local log=$1 status=0
-  wait "$pid" || status=$?
+  tree_wait_exit "$pid" || status=$?
   pid=
   if [ "$status" -ne 1 ] || ! grep -Fq 'actor stopped after a recording/save failure; reopen to recover' "$log"; then
     echo "expected actor fail-stop exit 1; got $status" >&2
@@ -38,8 +38,8 @@ wait_mounted() {
 }
 sudo mount -t tmpfs -o size=32m,mode=0777 tmpfs "$work/volume"
 "$bin" --state "$work/volume/state" trees init --volume t
-"$bin" --state "$work/volume/state" trees mount "$work/main" --fork-mount "$work/sandbox" >"$work/mount.log" 2>&1 & pid=$!
-wait_mounted "$work/main" "$work/sandbox"
+"$bin" --state "$work/volume/state" trees mount "$work/main" --fork-mount "$work/fork" >"$work/mount.log" 2>&1 & pid=$!
+wait_mounted "$work/main" "$work/fork"
 python3 - "$work/main" "$work/volume/filler" "$work/receipt" <<'PY'
 import errno, os, sys
 root, filler, receipt = sys.argv[1:]
@@ -84,9 +84,9 @@ else:
     assert sorted(os.listdir(sys.argv[1])) == ['file', 'while-full'], os.listdir(sys.argv[1])
 PY
 rm "$work/volume/filler"
-fusermount3 -u "$work/main"; fusermount3 -u "$work/sandbox"
+fusermount3 -u "$work/main"; fusermount3 -u "$work/fork"
 status=0
-wait "$pid" || status=$?
+tree_wait_exit "$pid" || status=$?
 pid=
 if [ "$status" != 0 ]; then echo "mount exited $status after a full state area" >&2; cat "$work/mount.log" >&2; exit 1; fi
 grep -Eq 'tree (SaveFailed|HistoryBuildFailed)' "$work/mount.log" || { cat "$work/mount.log" >&2; exit 1; }
@@ -101,7 +101,7 @@ head=$(git --git-dir="$gitdir" rev-parse root)
 printf 'PASS\tenospc\twrite fsync\n' | tee "$work/results.tsv"
 # Run a rename held at `point` while the real filesystem fills, then release it.
 # Filling must finish before the stalled rename is released. Main only: with no
-# sandbox no queue entry can take the failpoint before the rename does.
+# fork, no queue entry can take the failpoint before the rename does.
 rename_while_full() {
   local point=$1 log=$work/$1.log client
   rm -rf "$work/volume/state"
@@ -124,7 +124,7 @@ PY
     kill -0 "$pid"; sleep .1
   done
   tree_git_file "$work/volume/state/history.git" root source >/dev/null
-  kill -KILL "$pid"; wait "$pid" 2>/dev/null || true; pid=
+  kill -KILL "$pid"; tree_wait_exit "$pid" 2>/dev/null || true; pid=
   fusermount3 -uz "$work/main"
   flock "$work/volume/state/actor.lock" true
   # The mount's own step comes first (its root client's rebind: one step, one
@@ -173,7 +173,7 @@ PY
   rm "$work/volume/filler"
   fusermount3 -u "$work/main"
   # Neither failure stops the actor.
-  wait "$pid"; pid=
+  tree_wait_exit "$pid"; pid=
   "$bin" --state "$work/volume/state" trees init --volume t
   gitdir=$work/volume/state/history.git
   if [ "$3" = either ]; then

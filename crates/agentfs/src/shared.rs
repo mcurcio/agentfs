@@ -9,7 +9,7 @@ use std::rc::Rc;
 
 use agentfs_clients::ClientsService;
 use agentfs_contracts::clients::{AttachedLookup, ClientSet};
-use agentfs_contracts::ports::{ClientStore, EventSink, ForkStore, QueueFacts, SessionBinder};
+use agentfs_contracts::ports::{ClientStore, EventSink, ForkStore, SessionBinder};
 use agentfs_contracts::tree::ForkId;
 use agentfs_contracts::trees::{ForkFacts, ForkLookup};
 use agentfs_trees::TreesService;
@@ -45,10 +45,9 @@ impl<T> Shared<T> {
 }
 
 /// Clients' one question to Trees.
-impl<S, Q, E> ForkLookup for Shared<TreesService<S, Q, E>>
+impl<S, E> ForkLookup for Shared<TreesService<S, E>>
 where
     S: ForkStore,
-    Q: QueueFacts,
     E: EventSink,
 {
     fn facts(&self, fork: ForkId) -> Option<ForkFacts> {

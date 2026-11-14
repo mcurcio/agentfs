@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::caps::LaunchCap;
 use crate::name::{ForkKey, LauncherId};
+use crate::pod::PodContext;
 use crate::ports::StoreError;
 use crate::tree::{ForkId, TreeId};
 
@@ -69,13 +70,15 @@ pub enum TreeError {
 }
 
 impl From<StoreError> for TreeError {
-    /// A write that changed nothing for want of room or I/O is `Io`; every
-    /// other store failure leaves the volume unable to record. `create` reads
-    /// `Refused` as `UpstreamUnknown` before this.
+    /// A write that changed nothing for want of room or I/O is `Io`; a row
+    /// the store does not hold is `ForkUnknown` (`create` reads `Refused` as
+    /// `UpstreamUnknown` before this); a stopped or damaged store leaves the
+    /// volume unable to record.
     fn from(error: StoreError) -> Self {
         match error {
             StoreError::NotDurable(kind) => Self::Io(kind),
-            StoreError::Stopped | StoreError::Damaged(_) | StoreError::Refused(_) => Self::Stopped,
+            StoreError::Refused(_) => Self::ForkUnknown,
+            StoreError::Stopped | StoreError::Damaged(_) => Self::Stopped,
         }
     }
 }
@@ -96,8 +99,9 @@ pub trait ForkLookup {
 /// The Trees domain (docs/trees.md, "Forks: keys, end and the drop").
 pub trait Trees: ForkLookup {
     /// One step: the fork's branch at its upstream's saved head and its row
-    /// (`ForkCreated`). A second create under a key Trees holds for an open fork
-    /// returns that fork and writes nothing.
+    /// (`ForkCreated`, carrying `at`, the launcher's pod context). A second
+    /// create under a key Trees holds for an open fork returns that fork and
+    /// writes nothing.
     ///
     /// # Errors
     ///
@@ -109,23 +113,31 @@ pub trait Trees: ForkLookup {
         key: Option<ForkKey>,
         settings: ForkSettings,
         by: &LaunchCap,
+        at: &PodContext,
     ) -> Result<ForkId, TreeError>;
 
-    /// Ends an unkeyed fork; only its creating launcher or the volume's own.
-    /// Idempotent. The fork drops once nothing holds it (`ForkDropped`).
+    /// Ends an unkeyed fork (`ForkEnded`, carrying `at`); only its creating
+    /// launcher or the volume's own. Idempotent. The fork drops once nothing
+    /// holds it (`ForkDropped`).
     ///
     /// # Errors
     ///
     /// `ForkUnknown`, `NotPermitted` (another's fork, or a keyed one), `Io`,
     /// `Stopped`.
-    fn end(&mut self, fork: ForkId, by: &LaunchCap) -> Result<(), TreeError>;
+    fn end(&mut self, fork: ForkId, by: &LaunchCap, at: &PodContext) -> Result<(), TreeError>;
 
-    /// Ends a keyed fork, for any launcher presenting the key. Idempotent.
+    /// Ends a keyed fork (`ForkEnded`, carrying `at`), for any launcher
+    /// presenting the key. Idempotent.
     ///
     /// # Errors
     ///
     /// `KeyUnknown`, `Io`, `Stopped`.
-    fn end_keyed(&mut self, key: &ForkKey, by: &LaunchCap) -> Result<(), TreeError>;
+    fn end_keyed(
+        &mut self,
+        key: &ForkKey,
+        by: &LaunchCap,
+        at: &PodContext,
+    ) -> Result<(), TreeError>;
 
     /// Every fork not yet dropped.
     fn live(&self) -> Vec<ForkId>;

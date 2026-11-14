@@ -1,6 +1,6 @@
 //! The shared calls on a real mount: `open(2)`, `pwrite(2)`, `ftruncate(2)`,
 //! `close(2)`, `rename(2)` and `unlink(2)` against one process serving the root
-//! and at most one sandbox. Linux only, with `/dev/fuse` and `fusermount3`.
+//! and at most one fork. Linux only, with `/dev/fuse` and `fusermount3`.
 //!
 //! The process is a failpoints build with `AGENTFS_TAKE_GATE` set: it takes
 //! nothing by itself. Each take runs at the trace's point and answers on a fifo,
@@ -46,21 +46,21 @@ impl agentfs_contracts::ports::EventSink for NoConsumers {
     fn publish(&mut self, _: agentfs_contracts::ports::Event) {}
 }
 
-/// The sandbox fork's key: `mount` finds the fork under it at every mount,
+/// The fork view's key: `mount` finds the fork under it at every mount,
 /// the remount after a crash included.
 const FORK_KEY: &str = "conformance";
 
-/// The sandbox's fork, made as the trial CLI makes one: through the Trees
+/// The fork view's fork, made as the trial CLI makes one: through the Trees
 /// domain on the store adapter, under [`FORK_KEY`], so the fork's row is on
 /// its chain and the mount finds it.
-fn sandbox_fork(
+fn keyed_fork(
     recording: &std::sync::Arc<agentfs_core::tree_actor::Recording>,
 ) -> Result<EngineTree, CallError> {
     use agentfs_contracts::caps::{LaunchCap, LaunchScope, Minter};
     use agentfs_contracts::name::{ForkKey, LauncherId};
     use agentfs_contracts::trees::{ForkSettings, Landing, Trees};
     let store = agentfs_core::store::TreeStore::new(std::sync::Arc::clone(recording));
-    let mut trees = agentfs_trees::TreesService::restore(store.clone(), store, NoConsumers)
+    let mut trees = agentfs_trees::TreesService::restore(store, NoConsumers)
         .map_err(|e| CallError::new(e.to_string()))?;
     #[allow(
         clippy::disallowed_methods,
@@ -74,19 +74,25 @@ fn sandbox_fork(
     };
     let key = ForkKey::parse(FORK_KEY).map_err(|e| CallError::new(e.to_string()))?;
     let fork = trees
-        .create(EngineTree::Root, Some(key), settings, &cap)
+        .create(
+            EngineTree::Root,
+            Some(key),
+            settings,
+            &cap,
+            &agentfs_contracts::pod::PodContext::default(),
+        )
         .map_err(|e| CallError::new(e.to_string()))?;
     Ok(fork.into())
 }
 
-/// A mount of the root and at most one sandbox, and the opens this harness holds.
+/// A mount of the root and at most one fork, and the opens this harness holds.
 pub struct Mounted {
     bin: PathBuf,
     state: PathBuf,
     root: PathBuf,
-    sandbox: PathBuf,
+    fork_view: PathBuf,
     gate: PathBuf,
-    /// The root's name, and the sandbox's fork when there is one.
+    /// The root's name, and the fork view's fork when there is one.
     names: EngineNames,
     fork_used: bool,
     child: Option<Child>,
@@ -106,16 +112,16 @@ impl Mounted {
         bin: &Path,
         work: &Path,
         mut names: EngineNames,
-        with_sandbox: bool,
+        with_fork: bool,
         appends: Vec<bool>,
     ) -> Result<Self, CallError> {
-        let (state, root, sandbox, gate) = (
+        let (state, root, fork_view, gate) = (
             work.join("state"),
             work.join("root"),
-            work.join("sandbox"),
+            work.join("fork"),
             work.join("gate"),
         );
-        for dir in [&root, &sandbox, &gate] {
+        for dir in [&root, &fork_view, &gate] {
             std::fs::create_dir_all(dir).map_err(|e| io_fail("mkdir", &e))?;
         }
         {
@@ -130,8 +136,8 @@ impl Mounted {
                 names.name(TreeId::ROOT)?,
             )
             .map_err(fail)?;
-            if with_sandbox {
-                names.forked(sandbox_fork(&recording)?)?;
+            if with_fork {
+                names.forked(keyed_fork(&recording)?)?;
             }
             // Every record durable and built, and the lease free, at the drop.
         }
@@ -156,7 +162,7 @@ impl Mounted {
             log: work.join("mount.log"),
             state,
             root,
-            sandbox,
+            fork_view,
             gate,
             names,
             fork_used: false,
@@ -177,8 +183,8 @@ impl Mounted {
 
     fn mountpoints(&self) -> Vec<PathBuf> {
         let mut points = vec![self.root.clone()];
-        if self.sandbox_fork().is_some() {
-            points.push(self.sandbox.clone());
+        if self.fork_tree().is_some() {
+            points.push(self.fork_view.clone());
         }
         points
     }
@@ -199,10 +205,10 @@ impl Mounted {
             .stdin(Stdio::null())
             .stdout(log.try_clone().map_err(|e| io_fail("mount log", &e))?)
             .stderr(log);
-        if self.sandbox_fork().is_some() {
+        if self.fork_tree().is_some() {
             command
                 .arg("--fork-mount")
-                .arg(&self.sandbox)
+                .arg(&self.fork_view)
                 .args(["--fork-key", FORK_KEY]);
         }
         self.child = Some(command.spawn().map_err(|e| io_fail("spawn", &e))?);
@@ -233,22 +239,22 @@ impl Mounted {
         std::fs::read_to_string(&self.log).unwrap_or_default()
     }
 
-    /// The sandbox's fork, the one `mountable` allows, if `new` made it.
-    fn sandbox_fork(&self) -> Option<EngineTree> {
+    /// The fork view's fork, the one `mountable` allows, if `new` made it.
+    fn fork_tree(&self) -> Option<EngineTree> {
         self.names.name(TreeId::new(1)).ok()
     }
 
     fn root(&self, t: TreeId) -> &Path {
         match t {
             TreeId::ROOT => &self.root,
-            _ => &self.sandbox,
+            _ => &self.fork_view,
         }
     }
 
     fn at(&self, c: &Caller, path: &str) -> PathBuf {
         match c {
             Caller::Root(_) => self.root.join(path),
-            Caller::Fork(_) => self.sandbox.join(path),
+            Caller::Fork(_) => self.fork_view.join(path),
         }
     }
 
@@ -356,7 +362,7 @@ impl TreeCalls for Mounted {
 
     /// `new` made the one fork `mountable` allows.
     fn fork(&mut self) -> Result<TreeId, CallError> {
-        if self.sandbox_fork().is_none() || self.fork_used {
+        if self.fork_tree().is_none() || self.fork_used {
             return Err(CallError::new("not a mountable trace"));
         }
         self.fork_used = true;

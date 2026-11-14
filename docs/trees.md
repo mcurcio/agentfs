@@ -101,8 +101,11 @@ mount it came through. The
 journal keeps both with each write-open, so a save recovery makes after a crash
 names the writer that opened the file and where it ran, not the restarted process.
 A landing merge's subject is `Landing by <writer>`, and its writer and pod trailers
-are those of the save it lands. A sync, a fork step and the Root commit are
-`agentfs`'s, with the pod context of the process that serves the volume.
+are those of the save it lands. A sync, the Root commit and every event `agentfs`
+causes (a drop, a claim's release, an end or a release the domains judge) are
+`agentfs`'s, with the pod context of the process that serves the volume; an event a
+launcher's call causes (a fork's create or end, an attach, a detach) carries the
+launcher's.
 
 ## Clients
 
@@ -198,9 +201,9 @@ before the call returns.
 - **Keys.** A launcher may create a fork under a key (`--fork-key`). A second create
   under the key returns the open fork and writes nothing; once that fork has ended,
   the key answers "ended" and makes no new fork.
-- **End.** A fork created without a key ends when its last client detaches (the
-  view is unmounted), by `agentfs`, or when its creating launcher (or the volume's
-  own) ends it. A keyed fork ends only by its key (`trees end --fork-key`), for any
+- **End.** A fork created without a key ends, by `agentfs`, once no client is
+  attached to it (its view is unmounted, or a crash left it with none), or when its
+  creating launcher (or the volume's own) ends it. A keyed fork ends only by its key (`trees end --fork-key`), for any
   launcher that presents it: a fork claim outlives the pods that mount it. An ended
   fork is never written again.
 - **Drop.** An ended fork drops once its upstream's queue holds nothing it put
@@ -210,9 +213,14 @@ before the call returns.
   its checkout. Its row chain and the collision refs of its losing saves stay; its
   landed saves stay reachable from the root's landing merges. Its sync merges carry
   no edits of its own and become unreachable (`git fsck` lists them as dangling).
-- **When.** The drop is judged at boot, after each landing a view host takes, and at
-  each end; each judgement asks the journal, never history, so a failing builder
-  holds no drop back. A drop that meets an open file waits for the next judgement.
+- **When.** The end of an unattached unkeyed fork and the drop are judged at boot
+  (after the clients are reconciled), after each landing a view host takes, at each
+  last detach and at each end; each judgement asks the facts now (Clients for who is
+  attached, the journal for what holds a fork, never history), so an end or a drop a
+  crash or a failed step left undone is judged again, and a failing builder holds no
+  drop back. A drop that meets an open file waits for the next judgement. The boot's
+  reconcile also releases the writer claim of a fork that dropped before its claim
+  was released.
 - **Restart.** A drop on record is a drop after a crash: the restart forgets the
   fork, deletes a checkout a crash left, and builds what was not built. A take of a
   dropped fork finds nothing to take; one decided before the drop is refused when
@@ -240,7 +248,10 @@ row and counts as released.
   `VolumeDraining Stop`. From then no client attaches. The mount detaches each
   client, whose open files close as saves first (a file a process still holds open
   is saved as it stands, and a write after that answers `EROFS`), then unmounts each
-  view lazily (`fusermount3 -uz`). Every signal is an event on the mount's one
+  view lazily (`fusermount3 -uz`), and reconciles: every other client of its
+  launcher left in the index (one a failed end at boot kept) ends too, so the
+  release is judged from Clients alone. A reconcile that cannot record says
+  `tree ReconcileFailed` on stderr. Every signal is an event on the mount's one
   channel; nothing polls.
 - **Release.** Each client's end and each landing a take makes re-judge the
   release. It waits while the volume is staged, while any client is attached, and

@@ -278,7 +278,10 @@ fails ([6](#6-a-tree-volumes-history-is-not-built)).
 volume is released. It waits while:
 
 - **a client is attached.** A view whose file a process still holds open ends
-  when that file closes. Close it, or stop the process that holds it.
+  when that file closes. Close it, or stop the process that holds it. A
+  `tree ReconcileFailed` line means a client's end could not be recorded (the
+  state area's disk): the drain asks again at the stop, and the next mount's
+  reconcile ends it. Fix the disk, or let the grace period end the process.
 - **a queue holds an entry.** An entry is taken only once history is built
   behind it, so a failing builder holds the release: the volume stays
   `Draining`, recording goes on, and the builder's alarm says why
@@ -291,8 +294,8 @@ An exit of 1 after a recording failure means the tree actor stopped
 
 Log lines that change nothing: `tree UnstageFailed` (the volume stays staged;
 the next stop asks again), `tree DetachFailed: client=<id>` (the next mount's
-reconcile ends that client), `tree SettleFailed` (a drop waits for the next
-judgement) and `tree EventFailed`.
+reconcile ends that client), `tree SettleFailed` (a fork's end or drop waits for
+the next judgement, at the latest the next mount's) and `tree EventFailed`.
 
 ## Verify
 

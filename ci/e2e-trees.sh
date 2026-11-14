@@ -8,26 +8,26 @@ pid=
 client=
 cleanup() {
     status=$?
-    for mount in "$work/main" "$work/sandbox"; do
+    for mount in "$work/main" "$work/fork"; do
         mountpoint -q "$mount" && fusermount3 -uz "$mount" || true
     done
     [ -z "$client" ] || kill "$client" 2>/dev/null || true
-    [ -z "$pid" ] || { kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; }
+    [ -z "$pid" ] || tree_stop "$pid"
     if [ "$status" != 0 ]; then cat "$work"/*.log 2>/dev/null || true; fi
     rm -rf "$work"
 }
 trap cleanup EXIT
-mkdir "$work/main" "$work/sandbox"
+mkdir "$work/main" "$work/fork"
 "$bin" --state "$work/state" trees init --volume t
-# The sandbox is one keyed fork: the first mount makes it, every later mount
+# The fork view is one keyed fork: the first mount makes it, every later mount
 # under the key finds it.
 key=e2e
 start() {
     "$bin" --state "$work/state" trees mount "$work/main" \
-        --fork-mount "$work/sandbox" --fork-key "$key" "$@" >>"$work/mount.log" 2>&1 &
+        --fork-mount "$work/fork" --fork-key "$key" "$@" >>"$work/mount.log" 2>&1 &
     pid=$!
     for _ in $(seq 1 200); do
-        if mountpoint -q "$work/main" && mountpoint -q "$work/sandbox"; then return; fi
+        if mountpoint -q "$work/main" && mountpoint -q "$work/fork"; then return; fi
         kill -0 "$pid"
         sleep 0.1
     done
@@ -35,7 +35,7 @@ start() {
     return 1
 }
 start
-python3 - "$work/main" "$work/sandbox" <<'PY'
+python3 - "$work/main" "$work/fork" <<'PY'
 import errno
 import os
 from pathlib import Path
@@ -43,7 +43,7 @@ import sys
 import tempfile
 import time
 
-main, sandbox = map(Path, sys.argv[1:])
+main, fork_view = map(Path, sys.argv[1:])
 
 def saved(path, expected):
     assert path.read_bytes() == expected, (path, expected)
@@ -60,7 +60,7 @@ def delivered(path, expected):
         time.sleep(0.01)
     raise AssertionError((path, expected, path.read_bytes()))
 
-for label, root in (("main-", main), ("sandbox-", sandbox)):
+for label, root in (("main-", main), ("fork-", fork_view)):
     p = root / (label + "a")
     with p.open("w+b", buffering=0) as writer:
         writer.write(b"foo")
@@ -123,10 +123,10 @@ for label, root in (("main-", main), ("sandbox-", sandbox)):
 
 (main / "isolation").write_bytes(b"parent")
 saved(main / "isolation", b"parent")
-delivered(sandbox / "isolation", b"parent")
-(sandbox / "isolation").write_bytes(b"sandbox")
-saved(sandbox / "isolation", b"sandbox")
-delivered(main / "isolation", b"sandbox")
+delivered(fork_view / "isolation", b"parent")
+(fork_view / "isolation").write_bytes(b"fork")
+saved(fork_view / "isolation", b"fork")
+delivered(main / "isolation", b"fork")
 PY
 mmap_status=0
 python3 ci/trees-mmap.py "$work/main" "$work/state/history.git" || mmap_status=$?
@@ -153,13 +153,13 @@ for _ in $(seq 1 200); do
 done
 test -f "$work/ack"
 kill -KILL "$pid"
-wait "$pid" 2>/dev/null || true
+tree_wait_exit "$pid" 2>/dev/null || true
 pid=
 kill "$client"
 wait "$client" 2>/dev/null || true
 client=
 fusermount3 -uz "$work/main"
-fusermount3 -uz "$work/sandbox"
+fusermount3 -uz "$work/fork"
 "$bin" --state "$work/state" trees init --volume t
 head=$(git --git-dir="$work/state/history.git" rev-parse root)
 test "$(tree_git_file "$work/state/history.git" root crash)" = acknowledged-before-kill
@@ -167,15 +167,15 @@ test "$(tree_git_file "$work/state/history.git" root crash)" = acknowledged-befo
 test "$(git --git-dir="$work/state/history.git" rev-parse root)" = "$head"
 start
 test "$(cat "$work/main/crash")" = acknowledged-before-kill
-test "$(cat "$work/main/isolation")" = sandbox
-test "$(cat "$work/sandbox/isolation")" = sandbox
+test "$(cat "$work/main/isolation")" = fork
+test "$(cat "$work/fork/isolation")" = fork
 # The kill left the fork's writer attached: the restart rebinds it (same
-# client), so the sandbox writes as before.
-printf after-restart > "$work/sandbox/restarted"
-test "$(cat "$work/sandbox/restarted")" = after-restart
+# client), so the fork writes as before.
+printf after-restart > "$work/fork/restarted"
+test "$(cat "$work/fork/restarted")" = after-restart
 fusermount3 -u "$work/main"
-fusermount3 -u "$work/sandbox"
-wait "$pid"
+fusermount3 -u "$work/fork"
+tree_wait_exit "$pid"
 pid=
 # Both roots replace and unlink an open object. Check the actual RELEASE
 # outcomes after unmounting, and verify no orphan bytes entered history.
@@ -187,17 +187,17 @@ fi
 # A clean unmount ended the fork's writer, and a fork has one writer for life:
 # mounting it to write again exits 1, mounting nothing.
 status=0
-"$bin" --state "$work/state" trees mount "$work/main" --fork-mount "$work/sandbox" --fork-key "$key" \
+"$bin" --state "$work/state" trees mount "$work/main" --fork-mount "$work/fork" --fork-key "$key" \
     >"$work/taken.log" 2>&1 || status=$?
 test "$status" -eq 1
 grep -F 'this fork has had its writer; mount it with --fork-read-only' "$work/taken.log" >/dev/null
 ! mountpoint -q "$work/main"
-! mountpoint -q "$work/sandbox"
+! mountpoint -q "$work/fork"
 # Read-only it mounts: reads answer, writes are refused.
 start --fork-read-only
-test "$(cat "$work/sandbox/restarted")" = after-restart
-if printf refused 2>/dev/null > "$work/sandbox/refused"; then
-    echo "a read-only sandbox took a write" >&2
+test "$(cat "$work/fork/restarted")" = after-restart
+if printf refused 2>/dev/null > "$work/fork/refused"; then
+    echo "a read-only fork took a write" >&2
     exit 1
 fi
 # The fork's last save has landed in the root: nothing of it stays queued.
@@ -218,8 +218,8 @@ status=0
 "$bin" --state "$work/state" trees end --fork-key "$key" 2>"$work/busy.log" || status=$?
 test "$status" -eq 75
 fusermount3 -u "$work/main"
-fusermount3 -u "$work/sandbox"
-wait "$pid"
+fusermount3 -u "$work/fork"
+tree_wait_exit "$pid"
 pid=
 # Ended with nothing queued and no file open, the keyed fork drops at once:
 # its branch, queue and checkout go; its row chain stays, ending ForkDropped.
@@ -233,26 +233,26 @@ test ! -e "$work/state/trees/$fork"
 test "$(git --git-dir="$git_dir" log -1 --format=%s "refs/agentfs/trees/$fork")" = "ForkDropped $fork"
 # Its key has ended: mounting under it exits 1, mounting nothing.
 status=0
-"$bin" --state "$work/state" trees mount "$work/main" --fork-mount "$work/sandbox" --fork-key "$key" \
+"$bin" --state "$work/state" trees mount "$work/main" --fork-mount "$work/fork" --fork-key "$key" \
     >"$work/ended.log" 2>&1 || status=$?
 test "$status" -eq 1
 grep -F 'the fork under this --fork-key has ended' "$work/ended.log" >/dev/null
 ! mountpoint -q "$work/main"
 # A fork mounted with no key is new, and ends when its last client detaches.
 : >"$work/unkeyed.log"
-"$bin" --state "$work/state" trees mount "$work/main" --fork-mount "$work/sandbox" \
+"$bin" --state "$work/state" trees mount "$work/main" --fork-mount "$work/fork" \
     >>"$work/unkeyed.log" 2>&1 &
 pid=$!
 for _ in $(seq 1 200); do
-    if mountpoint -q "$work/main" && mountpoint -q "$work/sandbox"; then break; fi
+    if mountpoint -q "$work/main" && mountpoint -q "$work/fork"; then break; fi
     kill -0 "$pid"
     sleep 0.1
 done
 unkeyed=$(sed -n 's/^fork tree: //p' "$work/unkeyed.log")
 test -n "$unkeyed" && test "$unkeyed" != "$fork"
-fusermount3 -u "$work/sandbox"
+fusermount3 -u "$work/fork"
 fusermount3 -u "$work/main"
-wait "$pid"
+tree_wait_exit "$pid"
 pid=
 git --git-dir="$git_dir" log --format=%s "refs/agentfs/trees/$unkeyed" | grep -Fx "ForkEnded $unkeyed" >/dev/null
 # sigterm_with_a_file_open_saves_and_releases: SIGTERM drains the volume. The
@@ -307,7 +307,7 @@ git --git-dir="$git_dir" log --format='%(trailers:key=Agentfs-Kind,valueonly)' r
 kill "$client"
 wait "$client" 2>/dev/null || true
 client=
-wait "$pid"
+tree_wait_exit "$pid"
 pid=
 ! mountpoint -q "$work/main"
 git --git-dir="$work/state/history.git" fsck --strict

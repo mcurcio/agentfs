@@ -47,6 +47,12 @@ use crate::shared::Shared;
 /// Exit status when another process holds the state area (`EX_TEMPFAIL`).
 const EXIT_BUSY: u8 = 75;
 
+/// Says another process holds the state area, and answers its exit status.
+fn busy() -> ExitCode {
+    eprintln!("error: {}", VolumeError::Busy);
+    ExitCode::from(EXIT_BUSY)
+}
+
 /// What `mount` says when a fork's one writer has gone (C4).
 const FORK_TAKEN: &str =
     "this fork has had its writer; mount it with --fork-read-only or use a new fork";
@@ -253,7 +259,7 @@ pub fn run(state: &Path, args: Args, minter: Minter) -> Result<ExitCode> {
     }
 }
 
-type Forks = TreesService<TreeStore, TreeStore, DomainEvents>;
+type Forks = TreesService<TreeStore, DomainEvents>;
 type ClientsOf = ClientsService<TreeStore, Sessions, Shared<Forks>, DomainEvents>;
 /// Clients as Volume asks it: empty until restored after `stage`.
 type ClientsSlot = Shared<Option<ClientsOf>>;
@@ -277,6 +283,8 @@ struct Domains {
     sessions: Sessions,
     events: DomainEvents,
     cap: LaunchCap,
+    /// The launcher's pod context: every event its calls cause carries it.
+    at: PodContext,
     /// `VolumeDraining` consumed: the loop has its clients to detach and
     /// views to close.
     draining: bool,
@@ -290,14 +298,14 @@ impl Domains {
     /// asks.
     fn restore(
         recording: Arc<Recording>,
-        minter: Minter,
+        (minter, at): (Minter, PodContext),
         events: DomainEvents,
         clients: ClientsSlot,
         volume: Option<VolumeOf>,
     ) -> Result<Self> {
         let store = TreeStore::new(Arc::clone(&recording));
         let trees = Shared::new(
-            TreesService::restore(store.clone(), store.clone(), events.clone())
+            TreesService::restore(store.clone(), events.clone())
                 .context("reading the forks' rows")?,
         );
         let cap = root_cap(&minter)?;
@@ -318,6 +326,7 @@ impl Domains {
             sessions,
             events,
             cap,
+            at,
             draining: false,
             released: false,
         })
@@ -333,8 +342,9 @@ impl Domains {
     }
 
     /// The one dispatcher: each domain event, in order, to its consumers,
-    /// after the call that caused it returns. `LastDetached` ends an unkeyed
-    /// fork; `ForkDropped` releases its writer claim; `VolumeDraining` stops
+    /// after the call that caused it returns. `LastDetached` settles Trees
+    /// (an unkeyed fork no client is attached to ends); `ForkDropped`
+    /// releases its writer claim; `VolumeDraining` stops
     /// attaches and hands the loop its clients to detach, `VolumeStaged`
     /// allows them again; each end re-judges the release, and
     /// `VolumeReleased` ends the loop. A consumer's failure is logged: the
@@ -342,11 +352,8 @@ impl Domains {
     fn dispatch(&mut self) {
         while let Some(event) = self.events.next() {
             let handled = match event {
-                Event::Clients(ClientEvent::LastDetached { tree }) => {
-                    let ended = self.trees.get_mut().on_last_detached(tree);
-                    ended
-                        .map_err(|e| e.to_string())
-                        .and_then(|()| self.rejudge())
+                Event::Clients(ClientEvent::LastDetached { .. }) => {
+                    self.settle_trees().and_then(|()| self.rejudge())
                 }
                 Event::Clients(ClientEvent::AttachmentEnded { .. }) => self.rejudge(),
                 Event::Trees(TreesEvent::ForkDropped(fork)) => {
@@ -398,11 +405,29 @@ impl Domains {
         self.sessions.recording().actor().is_err()
     }
 
-    /// Drops every ended fork nothing holds, then re-judges the release: at
-    /// boot and after each landing.
+    /// Trees' settle, asking Clients who is attached.
+    fn settle_trees(&mut self) -> Result<(), String> {
+        let clients = self.clients();
+        let settled = self.trees.get_mut().settle(&*clients);
+        settled.map(drop).map_err(|e| e.to_string())
+    }
+
+    /// Clients' re-judgement: this launcher's clients not in `live` end, and
+    /// dropped forks' claims are released. A failure raises the alarm; the
+    /// next reconcile (the drain's, or the next boot's) asks again.
+    fn reconcile(&mut self, live: &ClientSet) {
+        let reconciled = self.clients().reconcile(live, &self.cap, &self.at);
+        if let Err(e) = reconciled {
+            eprintln!("tree ReconcileFailed: {e}");
+        }
+        self.dispatch();
+    }
+
+    /// Ends every unkeyed fork no client is attached to and drops every
+    /// ended fork nothing holds, then re-judges the release: at boot and
+    /// after each landing.
     fn settle(&mut self) {
-        let settled = self.trees.get_mut().settle();
-        if let Err(e) = settled {
+        if let Err(e) = self.settle_trees() {
             eprintln!("tree SettleFailed: {e}");
         }
         self.dispatch();
@@ -421,7 +446,7 @@ impl Domains {
         let fork = self
             .trees
             .get_mut()
-            .create(TreeId::Root, key, settings, &self.cap);
+            .create(TreeId::Root, key, settings, &self.cap, &self.at);
         self.dispatch();
         Ok(fork?.into())
     }
@@ -430,7 +455,7 @@ impl Domains {
     /// next boot's reconcile ends it).
     fn detach_all(&mut self, ids: &[ClientId]) {
         for client in ids {
-            let detached = self.clients().detach(client, &self.cap);
+            let detached = self.clients().detach(client, &self.cap, &self.at);
             if let Err(e) = detached {
                 eprintln!("tree DetachFailed: client={client}: {e}");
             }
@@ -489,10 +514,7 @@ impl Mount {
             VolumeService::new(TreeStateArea::at(state), clients.clone(), events.clone());
         match volume.stage(&self.at, &root_cap(&minter)?) {
             Ok(_) => {}
-            Err(VolumeError::Busy) => {
-                eprintln!("error: {}", VolumeError::Busy);
-                return Ok(ExitCode::from(EXIT_BUSY));
-            }
+            Err(VolumeError::Busy) => return Ok(busy()),
             Err(e) => bail!("opening tree state: {e}"),
         }
         let (sender, triggers) = mpsc::channel();
@@ -501,7 +523,13 @@ impl Mount {
             .area()
             .recording()
             .context("opening tree state: the staged volume is not served")?;
-        let mut domains = Domains::restore(recording, minter, events, clients, Some(volume))?;
+        let mut domains = Domains::restore(
+            recording,
+            (minter, self.at.clone()),
+            events,
+            clients,
+            Some(volume),
+        )?;
         let mut specs = vec![root];
         if let Some(ForkView { mut spec, key }) = fork {
             spec.tree = match domains.fork(key) {
@@ -561,8 +589,7 @@ impl Mount {
             }
         }
         let live: ClientSet = bound.iter().map(|(_, b)| b.client.clone()).collect();
-        domains.clients().reconcile(&live, &domains.cap);
-        domains.dispatch();
+        domains.reconcile(&live);
         domains.settle();
         let notify = Arc::new(move |event: HostEvent| {
             // The receiver goes only once the loop has ended.
@@ -612,6 +639,9 @@ impl Mount {
                 domains.draining = false;
                 let ids: Vec<ClientId> = views.values().cloned().collect();
                 domains.detach_all(&ids);
+                // Every client of this launcher ends, not only the views':
+                // the release is judged from the Clients index alone.
+                domains.reconcile(&ClientSet::new());
                 for view in views.keys() {
                     host.close(*view);
                 }
@@ -651,20 +681,17 @@ impl Mount {
 fn end(state: &Path, key: &ForkKey, at: &PodContext, minter: Minter) -> Result<ExitCode> {
     let recording = match Recording::open(state, at) {
         Ok(recording) => recording,
-        Err(tree_actor::Error::Busy) => {
-            eprintln!("error: {}", VolumeError::Busy);
-            return Ok(ExitCode::from(EXIT_BUSY));
-        }
+        Err(tree_actor::Error::Busy) => return Ok(busy()),
         Err(e) => return Err(e).context("opening tree state"),
     };
     let mut domains = Domains::restore(
         recording,
-        minter,
+        (minter, at.clone()),
         DomainEvents::default(),
         ClientsSlot::new(None),
         None,
     )?;
-    let ended = domains.trees.get_mut().end_keyed(key, &domains.cap);
+    let ended = domains.trees.get_mut().end_keyed(key, &domains.cap, at);
     domains.dispatch();
     match ended {
         Ok(()) => Ok(ExitCode::SUCCESS),
@@ -688,10 +715,7 @@ fn init(state: &Path, name: &str, at: &PodContext, minter: &Minter) -> Result<Ex
         VolumeService::new(TreeStateArea::at(state), NoClients, DomainEvents::default());
     let ensured = match volume.ensure(spec.clone(), at, &cap) {
         Ok(ensured) => ensured,
-        Err(VolumeError::Busy) => {
-            eprintln!("error: {}", VolumeError::Busy);
-            return Ok(ExitCode::from(EXIT_BUSY));
-        }
+        Err(VolumeError::Busy) => return Ok(busy()),
         Err(refused) => {
             eprintln!("error: {refused}");
             return Ok(ExitCode::FAILURE);
@@ -699,10 +723,7 @@ fn init(state: &Path, name: &str, at: &PodContext, minter: &Minter) -> Result<Ex
     };
     match TreeStateArea::at(state).open(at) {
         Ok(_) => {}
-        Err(VolumeError::Busy) => {
-            eprintln!("error: {}", VolumeError::Busy);
-            return Ok(ExitCode::from(EXIT_BUSY));
-        }
+        Err(VolumeError::Busy) => return Ok(busy()),
         Err(e) => bail!("recovering the volume: {e}"),
     }
     let outcome = match ensured.outcome {

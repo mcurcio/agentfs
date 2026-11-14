@@ -212,11 +212,13 @@ pub enum ClientError {
 
 impl From<StoreError> for ClientError {
     /// A write that changed nothing for want of room or I/O is `NotDurable`;
-    /// every other store failure leaves the volume unable to record.
+    /// a row the store does not hold is `UnknownClient`; a stopped or damaged
+    /// store leaves the volume unable to record.
     fn from(error: StoreError) -> Self {
         match error {
             StoreError::NotDurable(kind) => Self::NotDurable(kind),
-            StoreError::Stopped | StoreError::Damaged(_) | StoreError::Refused(_) => Self::Stopped,
+            StoreError::Refused(_) => Self::UnknownClient,
+            StoreError::Stopped | StoreError::Damaged(_) => Self::Stopped,
         }
     }
 }
@@ -276,18 +278,38 @@ pub trait Clients: AttachedLookup {
         by: &LaunchCap,
     ) -> Result<Binding, ClientError>;
 
-    /// Idempotent: a client already ended answers `Ok`.
+    /// One step: the client's end (`AttachmentEnded`, carrying `at`, the
+    /// launcher's pod context). Idempotent within a run: a client this run
+    /// ended answers `Ok`. Rows are removed at an end, so after a restart a
+    /// client ended in an earlier run is unknown.
     ///
     /// # Errors
     ///
-    /// `UnknownClient` for one never attached; `NotItsLauncher`; `Stopped`,
-    /// `NotDurable` when its end could not be recorded.
-    fn detach(&mut self, client: &ClientId, by: &LaunchCap) -> Result<(), ClientError>;
+    /// `UnknownClient` for one never attached, or ended in an earlier run;
+    /// `NotItsLauncher`; `Stopped`, `NotDurable` when its end could not be
+    /// recorded.
+    fn detach(
+        &mut self,
+        client: &ClientId,
+        by: &LaunchCap,
+        at: &PodContext,
+    ) -> Result<(), ClientError>;
 
-    /// Ends this launcher's attachments not in `live`; answers the ended ones.
-    /// An end that could not be recorded ends none: the answer is empty and
-    /// the next boot's reconcile ends them.
-    fn reconcile(&mut self, live: &ClientSet, by: &LaunchCap) -> Vec<ClientId>;
+    /// The boot's re-judgement, and the drain's: ends this launcher's
+    /// attachments not in `live` (their events carry `at`) and releases the
+    /// writer claim of every fork Trees reports dropped. Answers the ended
+    /// clients.
+    ///
+    /// # Errors
+    ///
+    /// `Stopped`, `NotDurable`: an end that could not be recorded ends none,
+    /// and the next reconcile ends them.
+    fn reconcile(
+        &mut self,
+        live: &ClientSet,
+        by: &LaunchCap,
+        at: &PodContext,
+    ) -> Result<Vec<ClientId>, ClientError>;
 
     fn attached(&self, tree: TreeId) -> ClientSet;
 }
@@ -301,11 +323,11 @@ mod tests {
         let id = ClientId {
             launcher: LauncherId::parse("cli").unwrap(),
             tree: TreeId::Fork(70),
-            label: ClientLabel::parse("sandbox-client").unwrap(),
+            label: ClientLabel::parse("fork-client").unwrap(),
             n: Ordinal(5),
         };
         let text = id.to_string();
-        assert_eq!(text, "sandbox-client#5@cli/fork/70");
+        assert_eq!(text, "fork-client#5@cli/fork/70");
         assert_eq!(text.parse::<ClientId>().unwrap(), id);
         assert_eq!(id.writer().as_str(), text);
         let json = serde_json::to_string(&id).unwrap();
@@ -336,12 +358,12 @@ mod tests {
             ClientError::from(StoreError::NotDurable(IoKind::NoSpace)),
             ClientError::NotDurable(IoKind::NoSpace)
         );
-        for stopped in [
-            StoreError::Stopped,
-            StoreError::Damaged("x".into()),
-            StoreError::Refused("x".into()),
-        ] {
+        for stopped in [StoreError::Stopped, StoreError::Damaged("x".into())] {
             assert_eq!(ClientError::from(stopped), ClientError::Stopped);
         }
+        assert_eq!(
+            ClientError::from(StoreError::Refused("x".into())),
+            ClientError::UnknownClient
+        );
     }
 }

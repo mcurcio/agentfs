@@ -102,7 +102,7 @@ flowchart TB
 | `agentfs-trees` | upstream, optional key, `ForkSettings` | `ForkId`, `ForkEnded`, `ForkDropped` | moves a branch itself (asks the git model) |
 | views (agentfs-fuse) | a `Binding`, a mount point, mount options | a mounted view; `ViewCaughtUp` | names a client or tree in a call to the actor |
 | store (agentfs-core) | each domain's rows | rows in the unit's journal step, audit stamps, outbox | lets a domain see another's rows |
-| `tree_actor` | sessions' calls with a pod context per write-open; Trees' branch requests; a unit's row changes | commits with every trailer, `TreeMoved` | knows volumes, clients or pods beyond the pod context it is handed |
+| `tree_actor` | sessions' calls with a pod context per write-open; Trees' branch requests; a unit's row changes | commits with every trailer, `TreeMoved` | knows what a row means (it names the chains, `Chain::{Volume, Trees, Clients}`, and checks their ref form; the store owns their content) or pods beyond the pod context it is handed |
 
 Smaller choices, recommended as shown: the service and view hosts share one process in M1 (in-process
 `TreeSession` handles); `tree_actor::Volume` becomes `TreeActor`, freeing "Volume" for the domain.
@@ -247,7 +247,7 @@ pub trait Clients {
         s: SessionId,
         by: &LaunchCap,
     ) -> Result<Binding, ClientError>;
-    fn detach(&mut self, c: ClientId, by: &LaunchCap) -> Result<(), ClientError>; // idempotent
+    fn detach(&mut self, c: ClientId, by: &LaunchCap) -> Result<(), ClientError>; // idempotent within a run (rows are removed at an end)
     fn reconcile(&mut self, live: ClientSet, by: &LaunchCap) -> Vec<ClientId>;    // ends this launcher's others
     fn attached(&self, t: TreeRef) -> ClientSet;
     fn attached_any(&self) -> ClientSet;
@@ -384,7 +384,9 @@ views → S5 fork lifecycle → S6 volume lifecycle. S2 needs only S1; S4 to S6 
 that owner's table of the sections each owner reads, where a section of an unbuilt owner gets the plan's standing
 alarm (one-engine.md M7) and the filesystem keeps working; agentfs's own copy of the settings' content (rev. 1's Q2,
 option B); line starts and `accept_start`; the upgrade drain and family check; pinned snapshots; `rebind`, `advance`,
-operator `end`; the socket between view hosts and the service; fork quotas; a settings digest event (M5).
+operator `end`; the socket between view hosts and the service; fork quotas; a settings digest event (M5);
+`ViewCaughtUp` (not built: the view host's `HostEvent::Landed` stands in for it as the lifecycle trigger until the
+take worker moves into agentfs-core, the M1 residual "take worker to core" in `.claude/errata.md`, which publishes it).
 
 **Findings for the plan (`future/one-engine.md`), reported, not changed here.**
 - F1. "PR series" contradicts G10: read "slices on the one PR", and a full run per slice that changes the journal, a
@@ -430,4 +432,4 @@ Footer: rev. 1, 2026-11-13, first draft; rev. 2, 2026-11-13, after the adversari
 ## Gate outcome (2026-11-13)
 
 Q1 is withdrawn: the owner said the October repository rule belonged to another project's database design and does not apply. The real question asked instead (general guidance): should volume events (clients attached and detached, forks created and ended, lifecycle moves) be on record like file changes? The owner: "On record is ideal. And hopefully, attached close to the git data for which it relates."
-Decision that follows (the design's, revisable): volume events are commits in the volume's own repository, on refs beside the trees they concern (option A's shape), so they travel to remotes with the history and an auditor reads them with git. No database, no ORM. S3 builds this; the journal stays the one commit point the engine decides from, and each event's commit is written from it before the call that caused it returns.
+Decision that follows (the design's, revisable): volume events are commits in the volume's own repository, on refs beside the trees they concern (option A's shape), so they travel to remotes with the history and an auditor reads them with git. No database, no ORM. S3 builds this; the journal stays the one commit point the engine decides from: each event's journal record is durable before the call that caused it returns, and its event commit trails, built from the record with the step's batch (corrected 2026-11-14, M1 end review; errata "M1 end review fix round").

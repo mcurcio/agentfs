@@ -47,7 +47,7 @@ impl EventSink for Events {
     }
 }
 
-type Forks = TreesService<TreeStore, TreeStore, Events>;
+type Forks = TreesService<TreeStore, Events>;
 type Service = ClientsService<TreeStore, Sessions, Forks, Events>;
 
 /// One run of a volume: its actor, sessions and Clients.
@@ -69,7 +69,7 @@ fn reopen(dir: &Path) -> Arc<Recording> {
 fn run(recording: &Arc<Recording>) -> Run {
     let store = TreeStore::new(Arc::clone(recording));
     let events = Events::default();
-    let forks = TreesService::restore(store.clone(), store.clone(), events.clone()).unwrap();
+    let forks = TreesService::restore(store.clone(), events.clone()).unwrap();
     let sessions = Sessions::new(Arc::clone(recording));
     let clients = ClientsService::restore(
         store,
@@ -96,11 +96,14 @@ fn cap() -> LaunchCap {
 
 fn fork(recording: &Arc<Recording>) -> TreeId {
     let store = TreeStore::new(Arc::clone(recording));
-    let mut trees = TreesService::restore(store.clone(), store, Events::default()).unwrap();
+    let mut trees = TreesService::restore(store, Events::default()).unwrap();
     let settings = ForkSettings {
         landing: Landing::Automatic,
     };
-    trees.create(ROOT, None, settings, &cap()).unwrap().into()
+    trees
+        .create(ROOT, None, settings, &cap(), &PodContext::default())
+        .unwrap()
+        .into()
 }
 
 fn pod(name: &str) -> PodContext {
@@ -173,7 +176,9 @@ fn a_second_writer_on_a_fork_is_fork_taken() {
         Err(ClientError::ForkTaken),
         "live"
     );
-    one.clients.detach(&writer.client, &cap()).unwrap();
+    one.clients
+        .detach(&writer.client, &cap(), &PodContext::default())
+        .unwrap();
     assert_eq!(
         one.attach(fork, "w", Access::ReadWrite),
         Err(ClientError::ForkTaken),
@@ -286,7 +291,10 @@ fn three_clients_killed_all_end_at_boot() {
         ClientSet::from([a.clone(), b.clone(), c.clone()])
     );
     let appended = recording.actor().unwrap().durability().appended();
-    let mut ended = two.clients.reconcile(&ClientSet::new(), &cap());
+    let mut ended = two
+        .clients
+        .reconcile(&ClientSet::new(), &cap(), &PodContext::default())
+        .unwrap();
     ended.sort();
     let mut expected = vec![a.clone(), b.clone(), c.clone()];
     expected.sort();
@@ -308,7 +316,12 @@ fn three_clients_killed_all_end_at_boot() {
     expected.push(Event::Clients(ClientEvent::LastDetached { tree: fork }));
     assert_eq!(events, expected);
     assert!(two.clients.attached_any().is_empty());
-    assert!(two.clients.reconcile(&ClientSet::new(), &cap()).is_empty());
+    assert!(
+        two.clients
+            .reconcile(&ClientSet::new(), &cap(), &PodContext::default())
+            .unwrap()
+            .is_empty()
+    );
     assert_eq!(two.events.0.borrow().len(), 5, "nothing more ended");
 }
 
@@ -427,7 +440,9 @@ fn a_detached_clients_open_file_is_saved() {
         handle
     };
     assert_eq!(recording.actor().unwrap().read(ROOT, "open").unwrap(), b"");
-    one.clients.detach(&binding.client, &cap()).unwrap();
+    one.clients
+        .detach(&binding.client, &cap(), &PodContext::default())
+        .unwrap();
     {
         let actor = recording.actor().unwrap();
         assert_eq!(actor.read(ROOT, "open").unwrap(), b"unsaved\n");
@@ -477,7 +492,9 @@ fn clients_go_on_while_the_builder_fails() {
         .rebind(&writer.client, pod("p-2"), two.sessions.open(), &cap())
         .unwrap();
     save(&two.session(&rebound), "f", b"while failing\n").unwrap();
-    two.clients.detach(&writer.client, &cap()).unwrap();
+    two.clients
+        .detach(&writer.client, &cap(), &PodContext::default())
+        .unwrap();
     assert!(!git(tmp.path(), &["for-each-ref"]).contains("refs/agentfs/clients/"));
     drop(held);
     recording.settle().unwrap();

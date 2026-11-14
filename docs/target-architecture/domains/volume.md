@@ -1,6 +1,6 @@
 # Domain: Volume (the unbuilt parts)
 
-**Proposed, not built.** The Volume domain's `ensure`, its lifecycle (`stage`, `unstage`, the Stop drain) and the
+**Partly built; this page proposes the rest.** The Volume domain's `ensure`, its lifecycle (`stage`, `unstage`, the Stop drain) and the
 release verdict over attached clients and queues are built and described in
 [docs/trees.md](../../trees.md#volume-lifecycle) and the [library](../../library/core.md#rows-and-domain-events),
 with the built parts of VO1 to VO6 in its [domain invariants](../../library/core.md#domain-invariants). This

@@ -25,8 +25,8 @@ pub enum StoreError {
     /// A row or ref the journal names is damaged (operator recovery).
     #[error("damaged state: {0}")]
     Damaged(String),
-    /// A branch step the git model refused (a fork drop while its queue holds
-    /// its entries): a domain bug, never a workload's.
+    /// A step the git model refused, nothing written: a fork drop while
+    /// anything holds the fork, or a row that is not there.
     #[error("refused by the tree actor: {0}")]
     Refused(String),
 }
@@ -82,10 +82,13 @@ pub trait VolumeStore {
     ///
     /// # Errors
     ///
-    /// `Stopped`, `Damaged`.
+    /// `Stopped` (for a volume not served, too: never `None` for a row nobody
+    /// read), `Damaged`.
     fn load(&self) -> Result<Option<Audited<VolumeState>>, StoreError>;
 
-    /// One step: the row's new state and the event commit that moved it.
+    /// One step: the row's new state and the event commit that moved it. `at`
+    /// is the caller's pod context; `None` for an event `by` agentfs, which
+    /// carries the history service's.
     ///
     /// # Errors
     ///
@@ -95,20 +98,19 @@ pub trait VolumeStore {
         state: VolumeState,
         event: &VolumeEvent,
         by: &Principal,
-        at: &PodContext,
+        at: Option<&PodContext>,
     ) -> Result<(), StoreError>;
 }
 
 /// Facts of the git model's queues, asked at judgement time.
 pub trait QueueFacts {
     /// Every tree whose queue holds an entry.
-    fn queued(&self) -> Vec<TreeId>;
-
-    /// Whether `fork`'s upstream's queue still holds an entry `fork` put there.
-    fn pending_from(&self, fork: ForkId) -> bool;
-
-    /// Whether any fork names `fork` as its upstream.
-    fn has_child(&self, fork: ForkId) -> bool;
+    ///
+    /// # Errors
+    ///
+    /// `Stopped` for a volume not served (before its stage, or after a
+    /// recording failure): never an empty answer for facts nobody read.
+    fn queued(&self) -> Result<Vec<TreeId>, StoreError>;
 }
 
 /// Trees' rows: `refs/agentfs/trees/<fork>`, one chain per fork, kept after
@@ -136,27 +138,31 @@ pub trait ForkStore {
         at: &PodContext,
     ) -> Result<Audited<ForkFacts>, StoreError>;
 
-    /// One step: the row's phase to `Ended`, with `ForkEnded`.
+    /// One step: the row's phase to `Ended`, with `ForkEnded`. `at` is the
+    /// launcher's pod context; `None` for an end `by` agentfs, which carries
+    /// the history service's.
     ///
     /// # Errors
     ///
     /// `Stopped`, `NotDurable`.
-    fn end(&mut self, fork: ForkId, by: &Principal, at: &PodContext) -> Result<(), StoreError>;
-
-    /// One step: the fork's branch, object table and queue entries removed, its
-    /// working tree deleted after the step, its row to `Dropped` with
-    /// `ForkDropped`. Its collision refs stay.
-    ///
-    /// # Errors
-    ///
-    /// `Refused` while its upstream's queue holds an entry of it, a write-open
-    /// is live in it, or a fork names it as upstream; `Stopped`, `NotDurable`.
-    fn drop_fork(
+    fn end(
         &mut self,
         fork: ForkId,
         by: &Principal,
-        at: &PodContext,
+        at: Option<&PodContext>,
     ) -> Result<(), StoreError>;
+
+    /// One step, by agentfs with the history service's pod context: the fork's
+    /// branch, object table and queue entries removed, its working tree deleted
+    /// after the step, its row to `Dropped` with `ForkDropped`. Its collision
+    /// refs stay. The one judge of whether a fork may drop.
+    ///
+    /// # Errors
+    ///
+    /// `Refused` while anything holds it: its upstream's queue holds an entry
+    /// of it, a write-open is live in it, or a fork names it as upstream;
+    /// `Stopped`, `NotDurable`.
+    fn drop_fork(&mut self, fork: ForkId) -> Result<(), StoreError>;
 }
 
 /// A client being attached, before its ordinal exists.
@@ -238,12 +244,14 @@ pub trait ClientStore {
         at: &PodContext,
     ) -> Result<(), StoreError>;
 
-    /// One step: the fork's writer claim removed (at `ForkDropped`).
+    /// One step, by agentfs with the history service's pod context: the
+    /// fork's writer claim removed (at `ForkDropped`, or the boot's
+    /// re-judgement of a dropped fork). A fork with no claim writes nothing.
     ///
     /// # Errors
     ///
     /// `Stopped`, `NotDurable`.
-    fn release_claim(&mut self, fork: ForkId, by: &Principal) -> Result<(), StoreError>;
+    fn release_claim(&mut self, fork: ForkId) -> Result<(), StoreError>;
 }
 
 /// What a session may do: write as a client, or read one tree.

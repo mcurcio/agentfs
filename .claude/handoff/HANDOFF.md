@@ -22,9 +22,15 @@ The code and the library/human docs win over all of these where they disagree; r
   the library describe M1; the domains' invariants (C1..C7, VO1..VO6) are in docs/library/core.md, "Domain
   invariants", and code comments cite them there; clients.md trimmed to its unbuilt parts; one-engine.md marks M1
   built; recording-failures runbook section 7. Per-slice deviations are in `.claude/errata.md`.
+- M1 end review done (verifier, durability, coherence lenses) and its one fix round landed: the contract re-cut (pod
+  context on launcher calls, agentfs events stamped by the store, `QueueFacts::queued` alone and fallible, one drop
+  judge, `VolumeError::Stopped`), level-triggered recovery (Trees' `settle(clients)` ends unattached unkeyed forks;
+  `reconcile` releases dropped forks' claims and runs at the drain), bounded waits in the tree e2e scripts. Errata:
+  "M1 end review fix round"; four residuals under "M1 residuals" (coordinator to a library, `stage` judges the name,
+  failpoints armed by event, take worker to core), each to become a bead.
 
 ## Next, in order
-1. End review of M1 (one review, then one fix round; CI is the gate).
+1. Confirm CI (ci, image, phase-1) green on the fix round's SHA; cut beads for the four "M1 residuals".
 2. One full phase-1 dispatch on the final SHA (`gh workflow run phase-1.yml`), read its result.
 3. Then the plan in `docs/target-architecture/future/one-engine.md`: M2 -> M3 -> M4 -> M5 -> M7 (with M6) -> baseline.
 4. `docs/target-architecture/future/save-and-take-speed.md` still reads "Proposed, not built" with pre-speed figures;
@@ -39,6 +45,6 @@ The code and the library/human docs win over all of these where they disagree; r
 - Commit trailers per AGENTS.md "Git"; no model IDs in commits or docs.
 
 ## Not done or not run
-- The M1 end review; the full phase-1 sweep on the final SHA; the residuals above.
+- The full phase-1 sweep on the final SHA; the speed residuals and the four M1 residuals above.
 - The PR #39 description is stale (it describes step 6); rewrite it when the speed epic lands.
 - A rule change for the owner's skills repo (scoping the repository rule to projects that use a database) sits unpushed in the previous machine's local clone and is lost with it; it needs the owner's go to redo.

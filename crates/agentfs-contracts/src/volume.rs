@@ -152,6 +152,24 @@ pub enum VolumeError {
     Busy,
     #[error("the volume's state could not be made durable: {0:?}")]
     NotDurable(IoKind),
+    /// The tree actor stopped after a recording failure, or its state is
+    /// damaged, or the volume is not served: nothing more is recorded until it
+    /// is reopened.
+    #[error("the volume has stopped; reopen it")]
+    Stopped,
+}
+
+impl From<crate::ports::StoreError> for VolumeError {
+    /// A write that changed nothing for want of room or I/O is `NotDurable`;
+    /// every other store failure leaves the volume unable to record (the
+    /// lifecycle row is never refused).
+    fn from(error: crate::ports::StoreError) -> Self {
+        use crate::ports::StoreError;
+        match error {
+            StoreError::NotDurable(kind) => Self::NotDurable(kind),
+            StoreError::Stopped | StoreError::Damaged(_) | StoreError::Refused(_) => Self::Stopped,
+        }
+    }
 }
 
 /// Published by Volume, each once its row is durable.
@@ -199,4 +217,27 @@ pub trait Volume {
 
     /// Asks every judge now; never stored.
     fn release_verdict(&self) -> ReleaseVerdict;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ports::StoreError;
+
+    /// A store that cannot record is `Stopped`, as for Clients and Trees;
+    /// a write that changed nothing keeps its kind.
+    #[test]
+    fn each_store_failure_has_its_volume_word() {
+        assert_eq!(
+            VolumeError::from(StoreError::NotDurable(IoKind::NoSpace)),
+            VolumeError::NotDurable(IoKind::NoSpace)
+        );
+        for stopped in [
+            StoreError::Stopped,
+            StoreError::Damaged("x".into()),
+            StoreError::Refused("x".into()),
+        ] {
+            assert_eq!(VolumeError::from(stopped), VolumeError::Stopped);
+        }
+    }
 }

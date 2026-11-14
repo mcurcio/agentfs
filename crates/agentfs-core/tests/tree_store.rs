@@ -14,8 +14,8 @@ use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
 
-use agentfs_contracts::audit::Principal;
 use agentfs_contracts::caps::{LaunchCap, LaunchScope, Minter};
+use agentfs_contracts::clients::{AttachedLookup, ClientSet};
 use agentfs_contracts::name::LauncherId;
 use agentfs_contracts::pod::PodContext;
 use agentfs_contracts::ports::{Event, EventSink, ForkStore, QueueFacts, StoreError};
@@ -42,7 +42,22 @@ impl EventSink for Events {
     }
 }
 
-type Service = TreesService<TreeStore, TreeStore, Events>;
+type Service = TreesService<TreeStore, Events>;
+
+/// Clients with nobody attached: what Trees' settle asks when a test has no
+/// Clients.
+struct Nobody;
+
+impl AttachedLookup for Nobody {
+    fn attached_any(&self) -> ClientSet {
+        ClientSet::new()
+    }
+}
+
+/// A launcher's pod context.
+fn at() -> PodContext {
+    PodContext::default()
+}
 
 fn serve(dir: &Path) -> Arc<Recording> {
     Recording::create(dir, &identity(), &PodContext::default()).expect("creates")
@@ -58,7 +73,7 @@ fn service(recording: &Arc<Recording>) -> Service {
 
 fn service_with(recording: &Arc<Recording>, events: Events) -> Service {
     let store = TreeStore::new(Arc::clone(recording));
-    TreesService::restore(store.clone(), store, events).expect("restores")
+    TreesService::restore(store, events).expect("restores")
 }
 
 fn cap() -> LaunchCap {
@@ -74,7 +89,9 @@ const SETTINGS: ForkSettings = ForkSettings {
 };
 
 fn create(trees: &mut Service) -> ForkId {
-    trees.create(ROOT, None, SETTINGS, &cap()).expect("creates")
+    trees
+        .create(ROOT, None, SETTINGS, &cap(), &at())
+        .expect("creates")
 }
 
 fn chain(fork: ForkId) -> String {
@@ -300,8 +317,9 @@ fn queue_facts_come_from_the_journal() {
     let recording = serve(tmp.path());
     let fork = create(&mut service(&recording));
     let store = TreeStore::new(Arc::clone(&recording));
-    assert!(!store.pending_from(fork));
-    assert!(store.queued().is_empty());
+    let pending = |recording: &Arc<Recording>| recording.actor().unwrap().pending_from(fork.into());
+    assert!(!pending(&recording));
+    assert!(store.queued().unwrap().is_empty());
     {
         let mut actor = recording.actor().unwrap();
         let h = actor
@@ -310,20 +328,20 @@ fn queue_facts_come_from_the_journal() {
         actor.write(h, 0, b"landing\n", false).unwrap();
         actor.close(h).unwrap();
     }
-    assert!(store.pending_from(fork), "pending, nothing built");
-    assert_eq!(store.queued(), [ROOT]);
-    assert!(!store.has_child(fork));
+    assert!(pending(&recording), "pending, nothing built");
+    assert_eq!(store.queued().unwrap(), [ROOT]);
+    assert!(!recording.actor().unwrap().has_child(fork.into()));
     drop(held);
     recording.settle().unwrap();
     drop(store);
     drop(recording);
     let recording = reopen(tmp.path());
     let store = TreeStore::new(Arc::clone(&recording));
-    assert!(store.pending_from(fork), "pending, read from history");
+    assert!(pending(&recording), "pending, read from history");
     while recording.take_next(ROOT).unwrap() == agentfs_core::tree_actor::Took::Taken {}
-    assert!(!store.pending_from(fork), "taken");
+    assert!(!pending(&recording), "taken");
     // The landing queued a sync in the fork; the root's queue is empty.
-    assert_eq!(store.queued(), [TreeId::from(fork)]);
+    assert_eq!(store.queued().unwrap(), [TreeId::from(fork)]);
 }
 
 // Slice S5: keys, end and the drop.
@@ -361,11 +379,11 @@ fn a_second_create_under_a_key_returns_its_fork() {
     let recording = serve(tmp.path());
     let mut trees = service(&recording);
     let fork = trees
-        .create(ROOT, Some(key("pvc-1")), SETTINGS, &cap())
+        .create(ROOT, Some(key("pvc-1")), SETTINGS, &cap(), &at())
         .unwrap();
     let appended = recording.actor().unwrap().durability().appended();
     assert_eq!(
-        trees.create(ROOT, Some(key("pvc-1")), SETTINGS, &cap()),
+        trees.create(ROOT, Some(key("pvc-1")), SETTINGS, &cap(), &at()),
         Ok(fork)
     );
     assert_eq!(
@@ -378,7 +396,7 @@ fn a_second_create_under_a_key_returns_its_fork() {
     let recording = reopen(tmp.path());
     let mut trees = service(&recording);
     assert_eq!(
-        trees.create(ROOT, Some(key("pvc-1")), SETTINGS, &cap()),
+        trees.create(ROOT, Some(key("pvc-1")), SETTINGS, &cap(), &at()),
         Ok(fork)
     );
     assert_eq!(trees.live(), [fork]);
@@ -402,18 +420,13 @@ fn an_ended_fork_drops_only_after_its_landing_is_taken() {
     put(&recording, ROOT, "a", b"parent\n");
     put(&recording, tree, "a", b"child\n");
     let losing = recording.actor().unwrap().head(tree).unwrap().to_string();
-    trees.end(fork, &cap()).unwrap();
+    trees.end(fork, &cap(), &at()).unwrap();
     assert_eq!(phase(&trees, fork), ForkPhase::Ended);
-    assert_eq!(trees.settle(), Ok(vec![]), "its landing is queued");
+    assert_eq!(trees.settle(&Nobody), Ok(vec![]), "its landing is queued");
     // The actor refuses the drop itself, whatever its caller asked first.
     let mut store = TreeStore::new(Arc::clone(&recording));
     assert!(matches!(
-        ForkStore::drop_fork(
-            &mut store,
-            fork,
-            &Principal::Agentfs,
-            &PodContext::default()
-        ),
+        ForkStore::drop_fork(&mut store, fork),
         Err(StoreError::Refused(_))
     ));
     assert_eq!(recording.actor().unwrap().trees(), [ROOT, tree]);
@@ -425,7 +438,7 @@ fn an_ended_fork_drops_only_after_its_landing_is_taken() {
         "the landing queued a sync in the fork"
     );
     assert!(git(dir, &["for-each-ref", "refs/collisions/root/"]).contains(&losing));
-    assert_eq!(trees.settle(), Ok(vec![fork]));
+    assert_eq!(trees.settle(&Nobody), Ok(vec![fork]));
     assert_eq!(phase(&trees, fork), ForkPhase::Dropped);
     assert!(trees.live().is_empty());
     assert_eq!(recording.actor().unwrap().trees(), [ROOT]);
@@ -474,16 +487,16 @@ fn a_drop_waits_for_its_open_file() {
         .unwrap()
         .write_open(fork.into(), "a", &writer("w"), false)
         .unwrap();
-    trees.end(fork, &cap()).unwrap();
+    trees.end(fork, &cap(), &at()).unwrap();
     assert_eq!(phase(&trees, fork), ForkPhase::Ended);
-    assert_eq!(trees.settle(), Ok(vec![]), "an open file holds it");
+    assert_eq!(trees.settle(&Nobody), Ok(vec![]), "an open file holds it");
     assert_eq!(
         recording.actor().unwrap().trees(),
         [ROOT, TreeId::from(fork)]
     );
     recording.actor().unwrap().close(held).unwrap();
     while recording.take_next(ROOT).unwrap() == agentfs_core::tree_actor::Took::Taken {}
-    assert_eq!(trees.settle(), Ok(vec![fork]));
+    assert_eq!(trees.settle(&Nobody), Ok(vec![fork]));
     assert_eq!(recording.actor().unwrap().trees(), [ROOT]);
 }
 
@@ -497,7 +510,7 @@ fn drop_worker() {
     let recording = serve(Path::new(&dir));
     let mut trees = service(&recording);
     let fork = create(&mut trees);
-    trees.end(fork, &cap()).unwrap();
+    trees.end(fork, &cap(), &at()).unwrap();
     recording.settle().unwrap();
     unreachable!("the failpoint kills this process");
 }
@@ -519,7 +532,11 @@ fn a_drop_and_its_row_are_one_record() {
     let mut trees = service(&recording);
     assert_eq!(phase(&trees, fork), ForkPhase::Ended);
     assert_eq!(recording.actor().unwrap().trees(), [ROOT, tree]);
-    assert_eq!(trees.settle(), Ok(vec![fork]), "the boot's settle drops it");
+    assert_eq!(
+        trees.settle(&Nobody),
+        Ok(vec![fork]),
+        "the boot's settle drops it"
+    );
     drop((trees, recording));
 
     let after = tmp.path().join("after");
@@ -551,7 +568,7 @@ fn a_dropped_fork_recovers_dropped() {
     let fork = create(&mut trees);
     let tree = TreeId::from(fork);
     put(&recording, ROOT, "before-drop", b"1\n");
-    trees.end(fork, &cap()).unwrap();
+    trees.end(fork, &cap(), &at()).unwrap();
     assert_eq!(phase(&trees, fork), ForkPhase::Dropped);
     assert_eq!(recording.actor().unwrap().trees(), [ROOT]);
     put(&recording, ROOT, "after-drop", b"2\n");
@@ -587,16 +604,22 @@ fn a_take_of_a_dropped_fork_is_empty() {
     assert!(
         TreeStore::new(Arc::clone(&recording))
             .queued()
+            .unwrap()
             .contains(&fork.into()),
         "a sync is queued in the fork"
     );
-    trees.end(fork, &cap()).unwrap();
+    trees.end(fork, &cap(), &at()).unwrap();
     assert_eq!(phase(&trees, fork), ForkPhase::Dropped);
     assert_eq!(
         recording.take_next(fork.into()).unwrap(),
         agentfs_core::tree_actor::Took::Empty
     );
-    assert!(TreeStore::new(Arc::clone(&recording)).queued().is_empty());
+    assert!(
+        TreeStore::new(Arc::clone(&recording))
+            .queued()
+            .unwrap()
+            .is_empty()
+    );
 }
 
 /// Trees shared by the test, as the composition root shares it: Clients
@@ -621,7 +644,7 @@ type ClientsOf = agentfs_clients::ClientsService<
 fn domains(recording: &Arc<Recording>, events: &Events) -> (SharedTrees, ClientsOf) {
     let store = TreeStore::new(Arc::clone(recording));
     let trees = SharedTrees(std::rc::Rc::new(std::cell::RefCell::new(
-        TreesService::restore(store.clone(), store.clone(), events.clone()).unwrap(),
+        TreesService::restore(store.clone(), events.clone()).unwrap(),
     )));
     let clients = agentfs_clients::ClientsService::restore(
         store,
@@ -634,8 +657,8 @@ fn domains(recording: &Arc<Recording>, events: &Events) -> (SharedTrees, Clients
     (trees, clients)
 }
 
-/// The composition root's dispatcher: `LastDetached` to Trees, `ForkDropped`
-/// to Clients, until the queue is empty.
+/// The composition root's dispatcher: `LastDetached` settles Trees,
+/// `ForkDropped` to Clients, until the queue is empty.
 fn dispatch(events: &Events, trees: &SharedTrees, clients: &mut ClientsOf) {
     use agentfs_contracts::clients::ClientEvent;
     use agentfs_contracts::trees::TreesEvent;
@@ -644,8 +667,8 @@ fn dispatch(events: &Events, trees: &SharedTrees, clients: &mut ClientsOf) {
         let event = events.0.borrow()[handled].clone();
         handled += 1;
         match event {
-            Event::Clients(ClientEvent::LastDetached { tree }) => {
-                trees.0.borrow_mut().on_last_detached(tree).unwrap();
+            Event::Clients(ClientEvent::LastDetached { .. }) => {
+                trees.0.borrow_mut().settle(&*clients).unwrap();
             }
             Event::Trees(TreesEvent::ForkDropped(fork)) => clients.on_fork_dropped(fork).unwrap(),
             _ => {}
@@ -673,7 +696,7 @@ fn write_and_leave(
         )
         .unwrap();
     dispatch(events, trees, clients);
-    clients.detach(&binding.client, &cap()).unwrap();
+    clients.detach(&binding.client, &cap(), &at()).unwrap();
     dispatch(events, trees, clients);
 }
 
@@ -689,12 +712,12 @@ fn last_detached_ends_an_unkeyed_fork_not_a_keyed_one() {
     let unkeyed = trees
         .0
         .borrow_mut()
-        .create(ROOT, None, SETTINGS, &cap())
+        .create(ROOT, None, SETTINGS, &cap(), &at())
         .unwrap();
     let keyed = trees
         .0
         .borrow_mut()
-        .create(ROOT, Some(key("k")), SETTINGS, &cap())
+        .create(ROOT, Some(key("k")), SETTINGS, &cap(), &at())
         .unwrap();
     write_and_leave(&events, &trees, &mut clients, &sessions, unkeyed.into());
     write_and_leave(&events, &trees, &mut clients, &sessions, keyed.into());
@@ -705,7 +728,11 @@ fn last_detached_ends_an_unkeyed_fork_not_a_keyed_one() {
         recording.actor().unwrap().trees(),
         [ROOT, TreeId::from(keyed)]
     );
-    trees.0.borrow_mut().end_keyed(&key("k"), &cap()).unwrap();
+    trees
+        .0
+        .borrow_mut()
+        .end_keyed(&key("k"), &cap(), &at())
+        .unwrap();
     assert_eq!(phase(&trees.0.borrow(), keyed), ForkPhase::Dropped);
 }
 
@@ -722,7 +749,7 @@ fn a_dropped_forks_claim_is_released() {
     let fork = trees
         .0
         .borrow_mut()
-        .create(ROOT, None, SETTINGS, &cap())
+        .create(ROOT, None, SETTINGS, &cap(), &at())
         .unwrap();
     let tree = TreeId::from(fork);
     let claim = |recording: &Arc<Recording>| {
@@ -750,7 +777,7 @@ fn a_dropped_forks_claim_is_released() {
     assert!(claim(&recording).is_some());
     {
         use agentfs_contracts::clients::Clients;
-        clients.detach(&binding.client, &cap()).unwrap();
+        clients.detach(&binding.client, &cap(), &at()).unwrap();
     }
     assert!(claim(&recording).is_some(), "kept after its client ends");
     dispatch(&events, &trees, &mut clients);
@@ -764,4 +791,216 @@ fn a_dropped_forks_claim_is_released() {
     );
     let body = git(dir, &["log", "-1", "--format=%B", &clients_chain]);
     assert!(body.contains("Agentfs-By: agentfs"), "{body}");
+}
+
+/// Trees and Clients restored as a boot restores them, reconciled with
+/// nothing live and settled, dispatching what follows.
+fn boot(recording: &Arc<Recording>, events: &Events) -> (SharedTrees, ClientsOf) {
+    use agentfs_contracts::clients::Clients;
+    let (trees, mut clients) = domains(recording, events);
+    clients.reconcile(&ClientSet::new(), &cap(), &at()).unwrap();
+    dispatch(events, &trees, &mut clients);
+    trees.0.borrow_mut().settle(&clients).unwrap();
+    dispatch(events, &trees, &mut clients);
+    (trees, clients)
+}
+
+/// Recovery converges when an event is lost: an unkeyed fork whose
+/// `LastDetached` never reached Trees (the process gone after the Clients
+/// step and before `ForkEnded`), and one whose first attach never came (gone
+/// after the create), each end at the next boot's settle and drop.
+#[test]
+fn a_lost_last_detached_ends_the_fork_at_the_next_boot() {
+    use agentfs_contracts::clients::{Clients, Consistency, FileOwner, Grant};
+    let tmp = tempfile::tempdir().unwrap();
+    let recording = serve(tmp.path());
+    let events = Events::default();
+    let (trees, mut clients) = domains(&recording, &events);
+    let sessions = agentfs_core::session::Sessions::new(Arc::clone(&recording));
+    let detached = trees
+        .0
+        .borrow_mut()
+        .create(ROOT, None, SETTINGS, &cap(), &at())
+        .unwrap();
+    let binding = clients
+        .attach(
+            Grant::live_read_write(
+                detached.into(),
+                Consistency::PerFile,
+                FileOwner { uid: 1, gid: 1 },
+            ),
+            agentfs_contracts::name::ClientLabel::parse("c").unwrap(),
+            PodContext::default(),
+            sessions.open(),
+            &cap(),
+        )
+        .unwrap();
+    // The Clients step is durable; its events are never delivered.
+    clients.detach(&binding.client, &cap(), &at()).unwrap();
+    let never_attached = trees
+        .0
+        .borrow_mut()
+        .create(ROOT, None, SETTINGS, &cap(), &at())
+        .unwrap();
+    assert_eq!(phase(&trees.0.borrow(), detached), ForkPhase::Open);
+    drop((trees, clients, sessions));
+    drop(recording);
+    let recording = reopen(tmp.path());
+    let events = Events::default();
+    let (trees, _clients) = boot(&recording, &events);
+    for fork in [detached, never_attached] {
+        assert_eq!(
+            phase(&trees.0.borrow(), fork),
+            ForkPhase::Dropped,
+            "{fork:?}"
+        );
+    }
+    assert_eq!(recording.actor().unwrap().trees(), [ROOT]);
+}
+
+/// Recovery converges for the writer claim: a fork dropped whose
+/// `ForkDropped` never reached Clients (the process gone after the drop and
+/// before `ClaimReleased`) has its claim released by the next boot's
+/// reconcile, by agentfs.
+#[test]
+fn a_lost_fork_dropped_releases_the_claim_at_the_next_boot() {
+    use agentfs_contracts::clients::{Clients, Consistency, FileOwner, Grant};
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let recording = serve(dir);
+    let events = Events::default();
+    let (trees, mut clients) = domains(&recording, &events);
+    let sessions = agentfs_core::session::Sessions::new(Arc::clone(&recording));
+    let fork = trees
+        .0
+        .borrow_mut()
+        .create(ROOT, None, SETTINGS, &cap(), &at())
+        .unwrap();
+    let binding = clients
+        .attach(
+            Grant::live_read_write(
+                fork.into(),
+                Consistency::PerFile,
+                FileOwner { uid: 1, gid: 1 },
+            ),
+            agentfs_contracts::name::ClientLabel::parse("c").unwrap(),
+            PodContext::default(),
+            sessions.open(),
+            &cap(),
+        )
+        .unwrap();
+    clients.detach(&binding.client, &cap(), &at()).unwrap();
+    // The end and the drop are durable; `ForkDropped` is never delivered.
+    trees.0.borrow_mut().settle(&clients).unwrap();
+    assert_eq!(phase(&trees.0.borrow(), fork), ForkPhase::Dropped);
+    let clients_chain = format!("refs/agentfs/clients/{}", TreeId::from(fork));
+    drop((trees, clients, sessions));
+    drop(recording);
+    let recording = reopen(dir);
+    recording.settle().unwrap();
+    assert_ne!(
+        subjects(dir, &clients_chain)[0],
+        format!("ClaimReleased {}", binding.client),
+        "the claim is still on the row"
+    );
+    let events = Events::default();
+    let _domains = boot(&recording, &events);
+    recording.settle().unwrap();
+    assert_eq!(
+        subjects(dir, &clients_chain)[0],
+        format!("ClaimReleased {}", binding.client)
+    );
+}
+
+/// The pod context's one rule: a launcher's step carries the launcher's pod
+/// (`ForkCreated`, its `ForkEnded`, `AttachmentEnded`); agentfs's steps carry
+/// the history service's (`ForkDropped`, `ClaimReleased`, an end by settle).
+#[test]
+fn each_event_carries_its_callers_pod_and_agentfs_the_services() {
+    use agentfs_contracts::clients::{Clients, Consistency, FileOwner, Grant};
+    let pod = |name: &str| PodContext {
+        pod: Some(agentfs_contracts::name::Label::parse(name).unwrap()),
+        ..PodContext::default()
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let recording = Recording::create(dir, &identity(), &pod("service")).unwrap();
+    let events = Events::default();
+    let (trees, mut clients) = domains(&recording, &events);
+    let sessions = agentfs_core::session::Sessions::new(Arc::clone(&recording));
+    let ended = trees
+        .0
+        .borrow_mut()
+        .create(ROOT, None, SETTINGS, &cap(), &pod("launcher"))
+        .unwrap();
+    trees
+        .0
+        .borrow_mut()
+        .end(ended, &cap(), &pod("launcher"))
+        .unwrap();
+    let settled = trees
+        .0
+        .borrow_mut()
+        .create(ROOT, None, SETTINGS, &cap(), &pod("launcher"))
+        .unwrap();
+    let binding = clients
+        .attach(
+            Grant::live_read_write(
+                settled.into(),
+                Consistency::PerFile,
+                FileOwner { uid: 1, gid: 1 },
+            ),
+            agentfs_contracts::name::ClientLabel::parse("c").unwrap(),
+            pod("launcher"),
+            sessions.open(),
+            &cap(),
+        )
+        .unwrap();
+    clients
+        .detach(&binding.client, &cap(), &pod("launcher"))
+        .unwrap();
+    dispatch(&events, &trees, &mut clients);
+    assert_eq!(phase(&trees.0.borrow(), settled), ForkPhase::Dropped);
+    recording.settle().unwrap();
+    let pod_of = |chain: &str, kind: &str| {
+        let log = git(dir, &["log", "--format=%s%n%b%x00", chain]);
+        let commit = log
+            .split('\0')
+            .find(|c| c.trim_start().starts_with(kind))
+            .unwrap_or_else(|| panic!("no {kind} on {chain}: {log}"))
+            .to_owned();
+        commit
+            .lines()
+            .find_map(|l| l.strip_prefix("Agentfs-Pod: "))
+            .map(str::to_owned)
+    };
+    let launcher = Some("launcher".to_owned());
+    let service = Some("service".to_owned());
+    assert_eq!(pod_of(&chain(ended), "ForkCreated"), launcher);
+    assert_eq!(pod_of(&chain(ended), "ForkEnded"), launcher);
+    assert_eq!(pod_of(&chain(ended), "ForkDropped"), service);
+    assert_eq!(pod_of(&chain(settled), "ForkEnded"), service);
+    let clients_chain = format!("refs/agentfs/clients/{}", TreeId::from(settled));
+    assert_eq!(pod_of(&clients_chain, "AttachmentEnded"), launcher);
+    assert_eq!(pod_of(&clients_chain, "LastDetached"), launcher);
+    assert_eq!(pod_of(&clients_chain, "ClaimReleased"), service);
+}
+
+/// `release_claim` of a fork with no claim (never written, or released
+/// already) records nothing: reconcile may ask it of every dropped fork.
+#[test]
+fn releasing_no_claim_records_nothing() {
+    use agentfs_contracts::ports::ClientStore;
+    let tmp = tempfile::tempdir().unwrap();
+    let recording = serve(tmp.path());
+    let fork = create(&mut service(&recording));
+    let appended = recording.actor().unwrap().durability().appended();
+    let mut store = TreeStore::new(Arc::clone(&recording));
+    ClientStore::release_claim(&mut store, fork).unwrap();
+    ClientStore::release_claim(&mut store, ForkId(99)).unwrap();
+    assert_eq!(
+        recording.actor().unwrap().durability().appended(),
+        appended,
+        "nothing recorded"
+    );
 }

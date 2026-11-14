@@ -12,6 +12,16 @@ design was reviewed on 2026-10-12.
 
 ### Added
 
+- **Tree views: recovery converges after a lost event.** An unkeyed fork with no
+  client attached ends at the next judgement (boot, a last detach, a landing),
+  so a crash between a client's end and the fork's end, or between a fork's
+  create and its first attach, no longer leaves the fork open for good; the
+  boot's reconcile releases the writer claim of a fork that dropped before its
+  claim was released. The Stop drain ends every client of its launcher, and a
+  reconcile that cannot record says `tree ReconcileFailed`. Every event a
+  launcher's call causes carries the launcher's pod trailers, and every event by
+  `agentfs` the serving process's. The tree e2e scripts bound each wait on a
+  mount (a drain that never releases fails within two minutes).
 - **Tree views: the volume's lifecycle.** `trees mount` stages the volume
   (`VolumeStaged` on `refs/agentfs/volume`) before it serves. SIGTERM, SIGINT or
   unmounting every view drains it (`VolumeDraining Stop`): no client attaches,

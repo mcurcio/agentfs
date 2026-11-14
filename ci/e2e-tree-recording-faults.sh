@@ -11,20 +11,20 @@ printf "artifacts: %s\n" "$work"
 printf 'status\tpoint\tlast_receipt\n' > "$work/results.tsv"
 pid=
 cleanup() {
-  [ -z "$pid" ] || { kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; }
-  for m in "$work/main" "$work/sandbox"; do fusermount3 -uz "$m" 2>/dev/null || true; done
+  [ -z "$pid" ] || tree_stop "$pid"
+  for m in "$work/main" "$work/fork"; do fusermount3 -uz "$m" 2>/dev/null || true; done
 }
 trap cleanup EXIT
-# `start SPEC` mounts the root and the keyed fork's sandbox (made at the first
+# `start SPEC` mounts the root and the keyed fork's view (made at the first
 # mount), whose writer it attaches; `start SPEC root` the root alone. The fork's
 # one writer is spent at a clean unmount, so a remount after one leaves the
-# sandbox out. Keyed, the fork stays open: no end or drop moves a count.
+# fork out. Keyed, the fork stays open: no end or drop moves a count.
 start() {
   local spec=$1 views=("$work/main")
   local args=("$work/main")
   if [ "${2:-}" != root ]; then
-    views+=("$work/sandbox")
-    args+=(--fork-mount "$work/sandbox" --fork-key faults)
+    views+=("$work/fork")
+    args+=(--fork-mount "$work/fork" --fork-key faults)
   fi
   AGENTFS_FAILPOINTS="$spec" "$bin" --state "$work/state" trees mount "${args[@]}" >"$work/mount.log" 2>&1 & pid=$!
   for _ in $(seq 1 200); do
@@ -39,7 +39,7 @@ start() {
 # Takes run on the view's worker. Let them finish before the kill, so the failpoint
 # meets the client's call rather than a leftover take. Git's refs trail the journal
 # (docs/trees.md, "History trails the files"): an empty queue in git means drained
-# only once the sandbox's head holds the last save's sync, which took its entry.
+# only once the fork's head holds the last save's sync, which took its entry.
 drain_queue() {
   local gitdir=$work/state/history.git
   for _ in $(seq 1 300); do
@@ -59,14 +59,14 @@ leave_root_attached() {
   before=$(tree_git_root_clients "$work/state/history.git")
   start '' root
   tree_git_wait_root_attached "$work/state/history.git" "$before"
-  kill -KILL "$pid"; wait "$pid" 2>/dev/null || true; pid=
+  kill -KILL "$pid"; tree_wait_exit "$pid" 2>/dev/null || true; pid=
   fusermount3 -uz "$work/main"
   flock "$work/state/actor.lock" true
 }
 points=(tree.wal_before_header tree.wal_after_payload tree.wal_before_fsync tree.wal_after_fsync tree.before_step tree.build_before_batch tree.build_after_pack tree.build_after_built_log tree.build_after_ref_copy)
 for point in "${points[@]}"; do
-  rm -rf "$work/state" "$work/main" "$work/sandbox"
-  mkdir "$work/main" "$work/sandbox"
+  rm -rf "$work/state" "$work/main" "$work/fork"
+  mkdir "$work/main" "$work/fork"
   "$bin" --state "$work/state" trees init --volume t
   start ''
   fork=$(sed -n 's/^fork tree: //p' "$work/mount.log")
@@ -85,8 +85,8 @@ os.close(fd); receipt('close')
 PY
   : > "$work/main/candidate"
   drain_queue candidate
-  fusermount3 -u "$work/main"; fusermount3 -u "$work/sandbox"
-  wait "$pid"; pid=
+  fusermount3 -u "$work/main"; fusermount3 -u "$work/fork"
+  tree_wait_exit "$pid"; pid=
   # A clean exit released the volume: a mount now stages it, one step, before
   # its client's attach, the two in one builder batch or two. A killed mount
   # leaves it staged with its root client attached instead.
@@ -122,7 +122,7 @@ PY
   # Wait for the requested failpoint, and require evidence that it fired.
   for _ in $(seq 1 300); do kill -0 "$pid" 2>/dev/null || break; sleep .1; done
   if kill -0 "$pid" 2>/dev/null; then echo "$point did not fire" >&2; exit 1; fi
-  wait "$pid" 2>/dev/null || true; pid=
+  tree_wait_exit "$pid" 2>/dev/null || true; pid=
   wait "$client" 2>/dev/null || true
   grep -F "agentfs failpoint $point triggered (kill)" "$work/mount.log" >/dev/null || { cat "$work/mount.log" >&2; exit 1; }
   fusermount3 -uz "$work/main"
@@ -144,14 +144,14 @@ done
 # The failpoints a mounted process cannot reach: each opening of the state area
 # passes them. Killed there, the next open still finds every returned write.
 for point in tree.after_ref_rebuild tree.compact_before_checkpoint tree.compact_before_drop; do
-  rm -rf "$work/state" "$work/main" "$work/sandbox"
-  mkdir "$work/main" "$work/sandbox"
+  rm -rf "$work/state" "$work/main" "$work/fork"
+  mkdir "$work/main" "$work/fork"
   "$bin" --state "$work/state" trees init --volume t
   start ''
   fork=$(sed -n 's/^fork tree: //p' "$work/mount.log")
   printf saved > "$work/main/kept"
-  fusermount3 -u "$work/main"; fusermount3 -u "$work/sandbox"
-  wait "$pid"; pid=
+  fusermount3 -u "$work/main"; fusermount3 -u "$work/fork"
+  tree_wait_exit "$pid"; pid=
   status=0
   AGENTFS_FAILPOINTS="$point=kill" "$bin" --state "$work/state" trees init --volume t >"$work/open.log" 2>&1 || status=$?
   [ "$status" = 137 ] || { echo "$point did not kill: $status" >&2; cat "$work/open.log" >&2; exit 1; }
@@ -175,8 +175,8 @@ git --git-dir="$work/state/history.git" fsck --full --strict --no-progress
 printf 'PASS\ttree.init_before_format\t-\n' | tee -a "$work/results.tsv"
 # Crash with a replaced object still held open: its acknowledged writes must
 # never be replayed onto the new object at that pathname.
-rm -rf "$work/state" "$work/main" "$work/sandbox"
-mkdir "$work/main" "$work/sandbox"
+rm -rf "$work/state" "$work/main" "$work/fork"
+mkdir "$work/main" "$work/fork"
 "$bin" --state "$work/state" trees init --volume t
 start ''
 fork=$(sed -n 's/^fork tree: //p' "$work/mount.log")
@@ -198,9 +198,9 @@ for _ in $(seq 1 200); do
   kill -0 "$client"; sleep .1
 done
 [ -f "$work/orphan-receipt" ]
-kill -KILL "$pid"; wait "$pid" 2>/dev/null || true; pid=
+kill -KILL "$pid"; tree_wait_exit "$pid" 2>/dev/null || true; pid=
 kill "$client"; wait "$client" 2>/dev/null || true
-fusermount3 -uz "$work/main"; fusermount3 -uz "$work/sandbox"
+fusermount3 -uz "$work/main"; fusermount3 -uz "$work/fork"
 "$bin" --state "$work/state" trees init --volume t
 gitdir=$work/state/history.git
 [ "$(tree_git_file "$gitdir" root old)" = replacement ]

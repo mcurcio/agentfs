@@ -7,7 +7,9 @@
 //!
 //! The audit stamps' one home: a row's first write sets `created` and
 //! `changed` to now and its principal; every later write keeps `created`
-//! from the chain's current row and sets `changed`.
+//! from the chain's current row and sets `changed`. The pod context's one
+//! rule: an event carries its caller's; an event by agentfs carries the
+//! history service's (`TreeActor::service_at`).
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -76,12 +78,13 @@ impl TreeStore {
         value: T,
         event: (&'static str, String),
         by: &Principal,
-        at: &PodContext,
+        at: Option<&PodContext>,
     ) -> Result<Audited<T>, StoreError> {
         self.write(|actor, now| {
             let previous = actor.row(chain);
             let audited = stamped(previous.as_deref(), value, by, now)?;
-            let write = row_write(chain, &audited, event, by, at)?;
+            let at = event_at(actor, at);
+            let write = row_write(chain, &audited, event, by, &at)?;
             #[expect(clippy::disallowed_methods, reason = "the store's own row step")]
             actor.record_rows(|_| Ok(vec![write]))?;
             Ok(audited)
@@ -90,6 +93,11 @@ impl TreeStore {
 
     /// Every row of `domain`, parsed.
     fn load<T: DeserializeOwned>(&self, domain: RowDomain) -> Result<Vec<Audited<T>>, StoreError> {
+        self.load_rows(domain)
+    }
+
+    /// Every row of `domain`, parsed as the row type itself (no outer stamps).
+    fn load_rows<T: DeserializeOwned>(&self, domain: RowDomain) -> Result<Vec<T>, StoreError> {
         let rows = self
             .recording
             .actor()
@@ -102,14 +110,12 @@ impl TreeStore {
             })
             .collect()
     }
+}
 
-    /// A question of the actor; a stopped actor answers `none`.
-    fn ask<R>(&self, none: R, question: impl FnOnce(&TreeActor) -> R) -> R {
-        match self.recording.actor() {
-            Ok(actor) => question(&actor),
-            Err(_) => none,
-        }
-    }
+/// The pod context an event carries: its caller's, or for an event by
+/// agentfs (`None`), the history service's.
+fn event_at(actor: &TreeActor, at: Option<&PodContext>) -> PodContext {
+    at.unwrap_or_else(|| actor.service_at()).clone()
 }
 
 fn now() -> UnixNanos {
@@ -218,8 +224,9 @@ fn row_write<T: Serialize>(
     })
 }
 
-fn io_kind(errno: i32) -> IoKind {
-    match errno {
+/// The one home of a tree actor failure's kind, for every adapter's word.
+pub(crate) fn io_kind(error: &tree_actor::Error) -> IoKind {
+    match error.errno() {
         libc::ENOSPC => IoKind::NoSpace,
         errno => IoKind::Other(errno),
     }
@@ -237,7 +244,7 @@ fn store_error(error: &tree_actor::Error) -> StoreError {
         }
         E::NotFound | E::Busy | E::PointerMoved { .. } => StoreError::Refused(error.to_string()),
         // Nothing recorded.
-        other => StoreError::NotDurable(io_kind(other.errno())),
+        other => StoreError::NotDurable(io_kind(other)),
     }
 }
 
@@ -284,9 +291,15 @@ impl ForkStore for TreeStore {
         })
     }
 
-    fn end(&mut self, fork: ForkId, by: &Principal, at: &PodContext) -> Result<(), StoreError> {
+    fn end(
+        &mut self,
+        fork: ForkId,
+        by: &Principal,
+        at: Option<&PodContext>,
+    ) -> Result<(), StoreError> {
         self.write(|actor, now| {
-            let write = fork_phase(actor, fork, ForkPhase::Ended, FORK_ENDED, (by, at, now))?;
+            let at = event_at(actor, at);
+            let write = fork_phase(actor, fork, ForkPhase::Ended, FORK_ENDED, (by, &at, now))?;
             #[expect(clippy::disallowed_methods, reason = "the store's own row step")]
             actor.record_rows(|_| Ok(vec![write]))?;
             Ok(())
@@ -294,16 +307,19 @@ impl ForkStore for TreeStore {
     }
 
     /// The branch, its queue and the row's `Dropped` are one step
-    /// (`TreeActor::drop_fork`): the actor refuses it, `Busy`, while anything
-    /// holds the fork.
-    fn drop_fork(
-        &mut self,
-        fork: ForkId,
-        by: &Principal,
-        at: &PodContext,
-    ) -> Result<(), StoreError> {
+    /// (`TreeActor::drop_fork`): the actor, the one judge, refuses it,
+    /// `Busy`, while anything holds the fork.
+    fn drop_fork(&mut self, fork: ForkId) -> Result<(), StoreError> {
         self.write(|actor, now| {
-            let write = fork_phase(actor, fork, ForkPhase::Dropped, FORK_DROPPED, (by, at, now))?;
+            let at = event_at(actor, None);
+            let by = &Principal::Agentfs;
+            let write = fork_phase(
+                actor,
+                fork,
+                ForkPhase::Dropped,
+                FORK_DROPPED,
+                (by, &at, now),
+            )?;
             #[expect(clippy::disallowed_methods, reason = "the store's own drop step")]
             actor.drop_fork(fork.into(), |_| Ok(vec![write]))
         })
@@ -314,17 +330,7 @@ impl ForkStore for TreeStore {
 /// a fork's writer claim, each entry stamped. One step per call.
 impl ClientStore for TreeStore {
     fn load(&self) -> Result<Vec<TreeClients>, StoreError> {
-        let rows = self
-            .recording
-            .actor()
-            .map_err(|e| store_error(&e))?
-            .rows(RowDomain::Clients);
-        rows.iter()
-            .map(|(chain, row)| {
-                serde_json::from_str(row)
-                    .map_err(|e| StoreError::Damaged(format!("{chain:?}'s row: {e}")))
-            })
-            .collect()
+        self.load_rows(RowDomain::Clients)
     }
 
     fn attach(
@@ -456,21 +462,21 @@ impl ClientStore for TreeStore {
     }
 
     /// Writes nothing for a fork with no claim (never written, or released
-    /// already): idempotent, as a boot's re-judgement needs. Its event carries
+    /// already): idempotent, as Clients' reconcile needs. By agentfs, with
     /// the history service's pod context.
-    fn release_claim(&mut self, fork: ForkId, by: &Principal) -> Result<(), StoreError> {
+    fn release_claim(&mut self, fork: ForkId) -> Result<(), StoreError> {
         let tree = TreeId::from(fork);
         self.write(|actor, _| {
             let mut row = clients_row(actor, tree)?;
             let Some(claim) = row.writer_claim.take() else {
                 return Ok(());
             };
-            let at = actor.service_at().clone();
+            let at = event_at(actor, None);
             let write = row_write(
                 Chain::Clients(tree),
                 &row,
                 (CLAIM_RELEASED, claim.value.to_string()),
-                by,
+                &Principal::Agentfs,
                 &at,
             )?;
             #[expect(clippy::disallowed_methods, reason = "the store's own row step")]
@@ -492,7 +498,7 @@ impl VolumeStore for TreeStore {
         state: VolumeState,
         event: &VolumeEvent,
         by: &Principal,
-        at: &PodContext,
+        at: Option<&PodContext>,
     ) -> Result<(), StoreError> {
         let event = match event {
             VolumeEvent::VolumeStaged => (VOLUME_STAGED, String::new()),
@@ -507,19 +513,14 @@ impl VolumeStore for TreeStore {
 }
 
 /// The actor's queue facts, from the journal's pointers: never a wait for
-/// history. A stopped actor answers empty and `false`; what follows fails
-/// `Stopped`.
+/// history. A stopped actor answers `Stopped`, never an empty queue.
 impl QueueFacts for TreeStore {
-    fn queued(&self) -> Vec<TreeId> {
-        self.ask(Vec::new(), TreeActor::queued)
-    }
-
-    fn pending_from(&self, fork: ForkId) -> bool {
-        self.ask(false, |actor| actor.pending_from(fork.into()))
-    }
-
-    fn has_child(&self, fork: ForkId) -> bool {
-        self.ask(false, |actor| actor.has_child(fork.into()))
+    fn queued(&self) -> Result<Vec<TreeId>, StoreError> {
+        Ok(self
+            .recording
+            .actor()
+            .map_err(|e| store_error(&e))?
+            .queued())
     }
 }
 
@@ -555,7 +556,7 @@ mod tests {
                 "staged".to_owned(),
                 ("VolumeStaged", String::new()),
                 &launcher("first"),
-                &at,
+                Some(&at),
             )
             .unwrap();
         let second = store
@@ -564,7 +565,7 @@ mod tests {
                 "draining".to_owned(),
                 ("VolumeDraining", String::new()),
                 &launcher("second"),
-                &at,
+                Some(&at),
             )
             .unwrap();
         assert_eq!(second.created, first.created);

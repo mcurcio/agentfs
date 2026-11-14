@@ -704,21 +704,24 @@ the actor's lock) before it returns. Each row is the domain's value with its
 audit stamps (`agentfs_contracts::audit::Audited`): the store sets `created`
 at a row's first write and keeps it, and sets `changed` at every write.
 
-The actor knows no domain. A row names its chain (`tree_actor::Chain`:
-`Volume`, `Trees(fork)` or `Clients(tree)`) and its event (`RowEvent`: a kind
-such as `ForkCreated`, a detail, the principal as `Agentfs-By` text, and its
-pod context). `TreeActor::row(chain)` and `rows(domain)` read the rows from
+The actor names the chains but not their meaning: a row names its chain
+(`tree_actor::Chain`: `Volume`, `Trees(fork)` or `Clients(tree)`), whose ref
+form the actor checks, and its event (`RowEvent`: a kind such as
+`ForkCreated`, a detail, the principal as `Agentfs-By` text, and its pod
+context); what a row holds is the store's. `TreeActor::row(chain)` and
+`rows(domain)` read the rows from
 the actor's saved state, never Git, so they answer while history lags or the
 builder fails. `TreeActor::fork_with`, `record_rows` and `drop_fork` run the
 steps; only the store calls them (a clippy rule). `drop_fork(fork, rows)` is one
 step that deletes the fork's branch and its queue's entries with its rows, and
 forgets the tree at once; it answers `Busy` (the store's `Refused`) while its
 upstream's queue holds an entry it queued, a file is open in it, or a fork names
-it, so a drop never needs history. `service_at()` is the pod context of an
-`agentfs` event no caller gives one for. The queue facts are the journal's too:
-`queued()`, `pending_from(fork)` (an entry `fork` queued in its upstream's
-queue) and `has_child(fork)` never wait for history. A stopped actor's
-`QueueFacts` answer empty and `false`; the next write fails `Stopped`.
+it, so a drop never needs history. It is the one judge of whether a fork may
+drop. An event carries its caller's pod context; an event by `agentfs` (a drop,
+a claim's release, an end or a release the domains judge) carries
+`service_at()`, the history service's, filled in by the store. The queue facts
+are the journal's too: `queued()` never waits for history, and a stopped actor
+answers `Stopped`, never an empty queue.
 
 Clients' `ClientStore` (`load`, `attach`, `rebind`, `end`) keeps one row per
 tree on `Chain::Clients(tree)`: its attached clients (`ClientRow`: the id, the
@@ -729,9 +732,15 @@ tree left empty. `release_claim` removes a dropped fork's writer claim with
 `ClaimReleased` (nothing to release writes nothing).
 
 `TreesService` (`agentfs-trees`) answers a second keyed `create` with its open
-fork, ends forks (`end`, `end_keyed`, and `on_last_detached` for an unkeyed
-fork), and `settle` drops each ended fork its queue facts let go;
-`ClientsService::on_fork_dropped` releases the claim. The composition root
+fork and ends forks (`end`, `end_keyed`). `settle(clients)` is its one
+judgement from facts asked now: every open unkeyed fork no client is attached
+to (asked of Clients' `attached_any`) ends, and every ended fork the store lets
+go drops. It runs at boot after Clients' `reconcile`, at each `LastDetached`
+and after each take, so an end a crash or a failed step left undone is judged
+again. `ClientsService::on_fork_dropped` releases the claim, and `reconcile`
+(at boot and at the drain) also releases the claim of every fork Trees reports
+dropped. `detach` is idempotent within a run: rows are removed at an end, so a
+client ended in an earlier run answers `UnknownClient`. The composition root
 dispatches the events between them ([trees](../trees.md#forks-keys-end-and-the-drop)).
 
 Volume's `VolumeStore` (`load`, `record`) keeps the lifecycle row on
@@ -739,17 +748,24 @@ Volume's `VolumeStore` (`load`, `record`) keeps the lifecycle row on
 `VolumeDraining` (detail `Stop`) or `VolumeReleased` (detail `Keep`).
 `TreeStateArea` is Volume's `StateArea`, `VolumeStore` and `QueueFacts` in one:
 `open` recovers the volume and makes a `TreeStore` over it, to which the other
-two delegate; before `open` the row reads `None`, a write fails `Stopped` and no
-queue holds anything. `VolumeService` (`agentfs-volume`) stages the volume
+two delegate; before `open` the row, a write and the queues answer `Stopped`:
+never a default nobody read. `VolumeService` (`agentfs-volume`) stages the volume
 (`stage` opens the state area), unstages it, and on each `rejudge` while it
 drains records the release once no client is attached and no queue holds an
 entry; `ClientsService::on_volume_draining` and `on_volume_staged` refuse and
-allow attaches meanwhile ([trees](../trees.md#volume-lifecycle)).
+allow attaches meanwhile ([trees](../trees.md#volume-lifecycle)). Its
+`release_verdict` judges a row or a queue it cannot read as `Staged`: never a
+release on facts nobody read.
 
 `StoreError` from a tree actor failure: `Stopped` and an unknown fsync
 outcome are `Stopped` (the reopen decides whether the step survived); a failed
 append is `NotDurable` (nothing recorded); damaged state is `Damaged`; a step
-the actor refused (no such upstream) is `Refused`. A domain publishes its
+the actor refused (a drop while anything holds the fork, a row or upstream
+that is not there) is `Refused`. Each domain's error has one `From<StoreError>`:
+`Stopped` for a stopped or damaged store, its own word for a refusal
+(`ClientError::UnknownClient`, `TreeError::ForkUnknown`), and `NotDurable` or
+`Io` for a write that changed nothing. One function maps a tree actor failure
+to its `IoKind` for every adapter (`store::io_kind`). A domain publishes its
 event to its `EventSink` once the store returns; the composition root's queue
 hands each on in order. Each event is on record as a commit on its chain
 ([trees](../trees.md#rows-and-event-commits)).

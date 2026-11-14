@@ -6,7 +6,6 @@
 //! the [`TreeStore`] it makes over that actor (docs/trees.md, "Volume
 //! lifecycle").
 
-use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -14,12 +13,12 @@ use agentfs_contracts::audit::{Audited, Principal};
 use agentfs_contracts::name::VolumeName;
 use agentfs_contracts::pod::PodContext;
 use agentfs_contracts::ports::{Found, QueueFacts, StateArea, StoreError, VolumeStore};
-use agentfs_contracts::tree::{ForkId, TreeId};
+use agentfs_contracts::tree::TreeId;
 use agentfs_contracts::volume::{
-    EnsureOutcome, IoKind, VolumeError, VolumeEvent, VolumeId, VolumeIdentity, VolumeState,
+    EnsureOutcome, VolumeError, VolumeEvent, VolumeId, VolumeIdentity, VolumeState,
 };
 
-use crate::store::TreeStore;
+use crate::store::{TreeStore, io_kind};
 use crate::tree_actor::{self, Recording};
 
 /// A volume's state area at one path.
@@ -49,31 +48,21 @@ impl TreeStateArea {
     }
 }
 
-fn io_kind(error: &io::Error) -> IoKind {
-    match error.raw_os_error() {
-        Some(libc::ENOSPC) => IoKind::NoSpace,
-        Some(errno) => IoKind::Other(errno),
-        None => IoKind::Other(libc::EIO),
-    }
-}
-
-/// The Volume domain's word for a tree actor's failure.
+/// The Volume domain's word for a tree actor's failure; its kind from the
+/// one mapping (`store::io_kind`).
 fn volume_error(error: &tree_actor::Error) -> VolumeError {
     match error {
         tree_actor::Error::Busy => VolumeError::Busy,
         tree_actor::Error::NotCreated => VolumeError::NotCreated,
         tree_actor::Error::Format => VolumeError::OtherFormat,
-        tree_actor::Error::Io(e) => VolumeError::NotDurable(io_kind(e)),
-        other => VolumeError::NotDurable(match other.errno() {
-            libc::ENOSPC => IoKind::NoSpace,
-            errno => IoKind::Other(errno),
-        }),
+        other => VolumeError::NotDurable(io_kind(other)),
     }
 }
 
 impl StateArea for TreeStateArea {
     fn inspect(&self) -> Result<Found, VolumeError> {
-        tree_actor::inspect(&self.root).map_err(|e| VolumeError::NotDurable(io_kind(&e)))
+        tree_actor::inspect(&self.root)
+            .map_err(|e| VolumeError::NotDurable(io_kind(&tree_actor::Error::Io(e))))
     }
 
     /// [`Recording::create`] takes the state area's lock and inspects again
@@ -117,10 +106,11 @@ impl StateArea for TreeStateArea {
     }
 }
 
-/// The volume's row, on the store `open` made: none before it, and no write.
+/// The volume's row, on the store `open` made: before it, `Stopped` (no row
+/// was read), and no write.
 impl VolumeStore for TreeStateArea {
     fn load(&self) -> Result<Option<Audited<VolumeState>>, StoreError> {
-        self.store().map_or(Ok(None), VolumeStore::load)
+        self.store().ok_or(StoreError::Stopped)?.load()
     }
 
     fn record(
@@ -128,7 +118,7 @@ impl VolumeStore for TreeStateArea {
         state: VolumeState,
         event: &VolumeEvent,
         by: &Principal,
-        at: &PodContext,
+        at: Option<&PodContext>,
     ) -> Result<(), StoreError> {
         match self.served.as_mut() {
             Some((_, store)) => store.record(state, event, by, at),
@@ -137,17 +127,10 @@ impl VolumeStore for TreeStateArea {
     }
 }
 
-/// The queues, on the store `open` made: before it, none holds anything.
+/// The queues, on the store `open` made: before it, `Stopped` (no queue was
+/// read).
 impl QueueFacts for TreeStateArea {
-    fn queued(&self) -> Vec<TreeId> {
-        self.store().map_or_else(Vec::new, QueueFacts::queued)
-    }
-
-    fn pending_from(&self, fork: ForkId) -> bool {
-        self.store().is_some_and(|store| store.pending_from(fork))
-    }
-
-    fn has_child(&self, fork: ForkId) -> bool {
-        self.store().is_some_and(|store| store.has_child(fork))
+    fn queued(&self) -> Result<Vec<TreeId>, StoreError> {
+        self.store().ok_or(StoreError::Stopped)?.queued()
     }
 }

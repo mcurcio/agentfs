@@ -1,27 +1,28 @@
 #!/usr/bin/env bash
 # Strict close-to-open experiments for git-model §3 and §18. Linux CI only.
 set -euo pipefail
+. "$(dirname "$0")/tree-git-test-lib.sh"
 bin=${AGENTFS_BIN:-$PWD/target/debug/agentfs}
 work=$(mktemp -d)
 pid=
 cleanup() {
     status=$?
     mountpoint -q "$work/main" && fusermount3 -uz "$work/main" || true
-    mountpoint -q "$work/sandbox" && fusermount3 -uz "$work/sandbox" || true
-    [ -z "$pid" ] || { kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; }
+    mountpoint -q "$work/fork" && fusermount3 -uz "$work/fork" || true
+    [ -z "$pid" ] || tree_stop "$pid"
     if [ "$status" != 0 ]; then cat "$work/mount.log" 2>/dev/null || true; fi
     rm -rf "$work"
 }
 trap cleanup EXIT
-mkdir "$work/main" "$work/sandbox"
+mkdir "$work/main" "$work/fork"
 "$bin" --state "$work/state" trees init --volume t
-"$bin" --state "$work/state" trees mount "$work/main" --fork-mount "$work/sandbox" >"$work/mount.log" 2>&1 &
+"$bin" --state "$work/state" trees mount "$work/main" --fork-mount "$work/fork" >"$work/mount.log" 2>&1 &
 pid=$!
 for _ in $(seq 1 200); do
-    if mountpoint -q "$work/main" && mountpoint -q "$work/sandbox"; then break; fi
+    if mountpoint -q "$work/main" && mountpoint -q "$work/fork"; then break; fi
     kill -0 "$pid"
     sleep 0.1
 done
 mountpoint -q "$work/main"
-mountpoint -q "$work/sandbox"
+mountpoint -q "$work/fork"
 python3 ci/trees-ordering.py "$work/main"

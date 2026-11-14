@@ -1219,3 +1219,75 @@ Page: `.claude/handoff/m1-s6-recut.md`. None blocks the slice; each is built as 
 8. **Docs: the domain pages are trimmed only in part.** `volume.md` keeps only its unbuilt parts; `clients.md`,
    `views.md` and `system.md` say at the top what is built and where, but their built sketches are not yet removed
    (deferred to the docs step at M1's end).
+
+## 2026-11-14, M1 end review fix round: the contract re-cut and where the spec was short
+
+Review findings: verifier F1-F2, durability F1-F5, coherence F1-F14. Applied at the class level; each fixed finding has
+a test that a mutation probe of its fix turns red.
+1. **The spec's boot re-judgement missed Trees' end of an unattached fork** (durability F1). `m1-pages.md` says "at
+   boot each consumer re-judges from asked facts", but an unkeyed fork ended only on a live `LastDetached`. Built:
+   `TreesService::settle(clients: &impl AttachedLookup)` is level-triggered for both moves (an open unkeyed fork no
+   client is attached to ends, by `agentfs`; then every ended fork the store lets go drops); `on_last_detached` is
+   gone and the root settles at `LastDetached`. Clients is passed per call, not held, so Trees never asks an
+   unrestored Clients slot (whose answer would be "nobody attached"). A fork must be attached in the run that creates
+   it before the next settle: true of `trees mount` (create, attach, then reconcile and settle), by ordering only.
+2. **The writer claim's release had no re-judgement** (durability F2): `Clients::reconcile` now also releases the claim
+   of every fork Trees reports `Dropped` (store.rs's "as a boot's re-judgement needs" is now true).
+3. **Contract re-cut (coherence F1, F7, F8; durability F3, F5; closes S3 item 2, S4 items 2 and 5, S5 items 1 and 2,
+   S6 item 5, and applies S6 item 8).** `Trees::create`, `end`, `end_keyed` and `Clients::detach`, `reconcile` carry
+   the launcher's `PodContext`; `reconcile` answers `Result` (the root logs `tree ReconcileFailed`). One home for an
+   agentfs event's pod context: the store fills in `service_at()` (ports take `at: Option<&PodContext>`, `None` by
+   agentfs; `drop_fork(fork)` and `release_claim(fork)` take no principal, always agentfs). `QueueFacts` is
+   `queued() -> Result<_, StoreError>` alone: `pending_from` and `has_child` are gone from the port, and the actor's
+   `drop_fork` is the one judge of a drop (Trees reads `Refused` as "not yet"). `VolumeStore::load` and `queued`
+   answer `Stopped` before `open`; `release_verdict` judges an unreadable row or queue `Staged`. `VolumeError::Stopped`
+   with `From<StoreError>`; `StoreError::Refused` maps to `ClientError::UnknownClient` and `TreeError::ForkUnknown`;
+   one `store::io_kind` for every adapter. `Clients::detach`'s doc says "idempotent within a run".
+4. **The Gate outcome sentence was stale** (durability F4): "each event's commit is written from it before the call
+   that caused it returns". As built, the journal record is durable before return and the event commit trails with the
+   step's batch. Corrected in `m1-design.md`'s Gate outcome.
+5. **`ViewCaughtUp` had no owner** (coherence F12): recorded as deferred in `m1-design.md` §10 and system.md §2.3; the
+   view host's `HostEvent::Landed` stands in for it until the take worker moves into agentfs-core (residual 4 below).
+6. **"The actor knows no domain" was false** (coherence F10): the actor names the chains (`Chain::{Volume, Trees,
+   Clients}`) but not their content; library/core.md and m1-design's module table now say so. Making chains opaque
+   to the actor was not chosen: refs.rs validates their ref forms, and an opaque key would move that check to each
+   store.
+7. **Volume's `unstage` still carries no pod context**: it records with `stage`'s (the launcher's, the same process
+   in every composition built); a contract change to `Volume::unstage` was not needed for any finding.
+8. **`trees end` does not reconcile**: reconciling there would end a killed mount's restored client, which the next
+   mount rebinds (C4). It settles through `end_keyed` as before.
+
+## 2026-11-14, M1 residuals (end review findings larger than the fix round)
+
+Each is to become a bead; none is open as one yet.
+1. **A library-level volume coordinator** (coherence F3, with F6 and the suspicions "`Domains::stopped()` reads a lock
+   acquisition", "`AttachedLookup` on an unrestored Clients slot answers nobody"). Files: a new module in agentfs-core
+   (or a small crate) owning the boot order (stage, restore, rebind-or-attach, reconcile, settle), the event routing,
+   the drain loop on one event channel and one shutdown path; `crates/agentfs/src/trees_cmd.rs` and agentfs-csi parse
+   flags and call it; `crates/agentfs-core/tests/tree_store.rs` drives the module instead of its own `dispatch`,
+   `domains` and `SharedTrees`; Clients owns the rebind-or-attach choice. Done when the binary holds no lifecycle
+   decision, every exit after `stage` runs the drain or a release (F6: the e2e's "remount to write: exit 1" ends
+   `Released`, not `Staged`), "stopped" is a fact the actor answers, and the core tests reach the real dispatcher.
+2. **`stage` judges the volume name; the root never names `tree_actor`** (coherence F4, and the suspicion "`trees end`
+   writes rows to a released volume without staging"). Files: `agentfs-contracts/src/volume.rs` (`stage` takes the
+   expected `VolumeName`), `agentfs-volume/src/{service,ensure}.rs` (one rule with `decide_ensure`),
+   `crates/agentfs/src/trees_cmd.rs` (`--volume` guard, `trees end` and `init`'s recovery through `VolumeService`).
+   Done when `trees_cmd.rs` imports nothing from `agentfs_core::tree_actor` and `trees end` stages and releases.
+3. **The recording-fault harness counts the mount's own steps** (coherence F11). Files: `crates/agentfs-core/src/
+   failpoints.rs` (arm a failpoint scope from an event, for example once the mount reports serving, or keyed by the
+   client's call), `ci/e2e-tree-recording-faults.sh`, `ci/e2e-tree-enospc.sh`, `ci/tree-git-test-lib.sh`
+   (`tree_git_wait_root_attached` goes). Done when no script kills a mount on purpose to fix a count and a new
+   mount-time step moves no count.
+4. **The take worker and its landed event move into agentfs-core** (coherence F9, F12). Files:
+   `crates/agentfs-fuse/src/tree_view.rs` (`take_worker`, `HostEvent::Landed`), the history service side of
+   agentfs-core (the worker, publishing `TreeMoved` to the coordinator's channel), residual 1's coordinator. Done when
+   a process with no view host (`trees end`, a CSI node) drops a fork whose landing was queued and releases a volume,
+   and `ViewHost` only subscribes to invalidate pages.
+5. **Smaller suspicions, each checked and not fixed here:** `Clients::rebind` checks neither `draining` nor the fork's
+   phase (unreachable today: rebind runs only at boot, before a drain, and an ended key refuses before it);
+   `ClientsService::end` unbinds each session before the store step, so a failed step leaves the client indexed with
+   no session; a dirty mmap page written back after `unbind` gets `EROFS` and is lost without `msync`; `VolumeReleased`
+   ignores a pending close after a failed `close_writer` (safe under `Keep`, wrong under a future `Delete`); rows
+   are visible in the actor before `durable_all` (safe by threading, not structure); `remove_stale_checkouts` refuses
+   an open on an unremovable checkout (principle 5 at boot); `ViewHost::wait` after the release is bounded only by
+   Kubernetes' grace period.

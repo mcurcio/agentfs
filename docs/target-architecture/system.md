@@ -73,33 +73,20 @@ Telemetry receives every event and is left off the picture.
 
 ### 2.1 Shared kernel (`model`: values only, no I/O)
 
+Built in `agentfs-contracts`, and not repeated here: `TreeId` (`Root` or `Fork(ForkId)`), `ClientId` (launcher,
+tree, label and ordinal, which names its writer alone), `Principal` (`Client`, `Launcher` or `Agentfs`), `Stamp` and
+`Audited<T>` (stamped by the store), the names and the pod context ([library](../library/core.md#rows-and-domain-events)).
+What follows goes beyond them.
+
 ```rust
 pub struct RelPath(/* private */);   // beneath the root and git-fsck clean; only RelPath::parse builds one
 pub struct TreeName(/* private */);  // a confined name that may fail fsck (a nested `.git`): only views show it
 
-pub enum TreeRef {
-    Root,                            // refs/heads/<root>
-    Fork(ForkId),                    // refs/heads/fork/<id>; its branch tracks its upstream tree's branch (git-model §2)
-}
 pub enum Served {                    // what a view serves
-    Tree(TreeRef),
+    Tree(TreeId),
     Snapshot(SnapshotId),            // a pinned, read-only checkout of one commit (trees §3)
 }
-
-pub enum Writer {                    // the Agentfs-Writer trailer (git-model §3): exactly one per commit
-    Client(ClientId),                // built only through Clients' minter
-    Agentfs,                         // a sync commit and the root commit
-}
-pub struct ClientId {                // names its writer alone, so a commit needs no lookup
-    launcher: LauncherId,
-    tree: TreeRef,
-    label: ClientLabel,
-    n: Ordinal,                      // unique per volume, never reused
-}
-
-pub enum Principal { Client(ClientId), Actor(ActorId), Launcher(LauncherId), Agentfs }
-pub struct Stamp { at: Time, by: Principal }
-pub struct Audited<T> { value: T, created: Stamp, changed: Stamp } // stamped by the repository layer
+// Principal gains Actor(ActorId), an operator (§2.2's ActorCap).
 
 pub enum Component {                 // what Health judges; a restart is a new incarnation
     HistoryService { volume: VolumeId, run: Incarnation },
@@ -131,18 +118,21 @@ another (`OtherFamily(Version)`) before any domain is called.
 
 ### 2.3 Events
 
-Delivery hands every event to its consumers and to `Telemetry::emit` in one step. A producer stages an event in the
-unit of work of the change it reports (a transactional outbox).
+Built: a domain publishes its event once its step is durable, and the composition root's in-process queue hands each
+to its consumers after the call that caused it returns. Delivery is not durable: at boot every consumer judges again
+from facts it asks (Trees' settle, Clients' reconcile, Volume's re-judgement), so a crash between a step and its
+delivery loses no reaction ([library](../library/core.md#rows-and-domain-events)). The built events (`Attached`,
+`Rebound`, `AttachmentEnded`, `LastDetached`, `ClaimReleased`, `ForkCreated`, `ForkEnded`, `ForkDropped`,
+`VolumeStaged`, `VolumeDraining`, `VolumeReleased`) and their consumers are in [docs/trees.md](../trees.md). Not
+built: handing each event to `Telemetry::emit`; Replication consuming `ForkEnded` and `ForkDropped` (a carried remote
+line) and `VolumeDraining` (pushes skip their spacing); CSI consuming `VolumeReleased`; and the events below.
 
 | Event | Producer | Consumers | Ends which wait |
 |---|---|---|---|
-| `Attached` / `AttachmentEnded{client, why}` / `LastDetached{tree}` (in that order, one unit) | Clients | the tree's actor, Trees, Volume | an ended client's open files close as saves and its waiting opens drop (git-model §6); its open transaction rolls back (§9); a fork's or pin's end; release |
 | `TreeMoved{tree, from, to, paths, collisions}` (design choice: the git model's actor publishes it once the branch, index and working tree have moved) | the tree's actor | Views of that tree; Replication; Volume | a view's cache; a push; release |
 | `TakeWaiting{tree, files}` / `TakeReleased{tree}` (design choice: a take waiting for open files, git-model §6) | the tree's actor | Telemetry only | none: the operator sees which file holds which changes back |
 | `OrphanDropped{tree, path, writer, bytes}` (design choice: calls on an object no path names at close, git-model §7) | the tree's actor | Telemetry only | none |
-| `ViewCaughtUp{view, tree, to}` | Views | anyone who must see a move in that view | "visible in view V" |
-| `ForkEnded{fork}` / `ForkDropped{fork}` | Trees | Clients, Replication, Volume | the writer claim, a carried remote line, an upgrade's release |
-| `VolumeDraining` / `VolumeStaged` / `VolumeReleased{disposition}` | Volume | Clients, Replication / the same / the composition root, CSI | attachments refused; pushes skip spacing / reopen / the service exits |
+| `ViewCaughtUp{view, tree, to}` (until built, the view host's `HostEvent::Landed` triggers the settle and the re-judgement) | Views | anyone who must see a move in that view | "visible in view V" |
 | `StartLineChanged{state}` | Volume | Telemetry | the start-line alarm |
 | `PushSettled{remote, outcome}` | Replication | Volume | release |
 | `ServiceReady{volume}` | the history service, once every domain restored and every judge re-published its state | view hosts, launchers | blocked file calls; a launcher's rebind |
