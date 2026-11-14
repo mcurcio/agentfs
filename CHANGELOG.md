@@ -12,6 +12,16 @@ design was reviewed on 2026-10-12.
 
 ### Added
 
+- **Tree views: file maps and journal segments.** No file's bytes are held in
+  memory: a file is a map of journal frames and its checkout as built, so a write
+  costs its own bytes at any file size and a close compares only the bytes the
+  open touched. The journal is a directory of 64 MiB segments (`journal/`); a
+  compaction writes a checkpoint segment and drops the segments behind it, and a
+  file held open pins only its own frames. Checkouts write each file by rename, so
+  a reader keeps the version it opened. A save record carries a digest of the
+  file's pieces in place of a checksum. The figures add `close_1g` and
+  `write_1g`. The state format is now `agentfs-trees-8`; older tree state areas
+  do not open (docs/trees.md, "File maps").
 - **Tree views: a save costs its change, not the tree.** A commit keeps each
   file's bytes, line map and name history under two levels of hashed folders
   (`files/<aa>/<bb>/<name>`, `lines/...`, `names/<cc>/<dd>/<id>`), and the builder

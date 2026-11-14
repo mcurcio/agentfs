@@ -145,6 +145,32 @@ the actor's lock, so a waiting close holds no other call. A failed fsync stops t
 actor: its waiters get its error and every later call `EIO` (see
 [Recovery](#recovery)).
 
+## File maps
+
+No file's bytes are held in memory. A file is a map: pieces of journal frames
+and of the private checkout's file as built, by file offset. A write adds one
+piece that points at its frame, so it costs its own bytes at any file size: a
+4 KiB write into a 1 GiB file copies 4 KiB, into its frame. An open starts from
+the saved map, shared until it writes (copy on write). A close applies the
+open's calls to the saved map with the same function the builder replays, and
+tells a close that changes nothing by comparing only the bytes the open's calls
+touched. A view reads a map with the actor unlocked: the lock is held only to
+clone it.
+
+- After a batch is built and checked out, the builder reads each changed file
+  from its checkout (an open descriptor) instead of the frames, and the actor
+  takes that map at its next call where it saved the same step. A checkout
+  writes each file to a temporary name and renames it over the old one, so a
+  reader that opened the old version keeps reading it.
+- Each such file holds one open descriptor per tree. The view raises the soft
+  limit on open files to the hard limit at start; a host whose hard limit is
+  below the files it serves gets `EMFILE`.
+- A take's merged files are in its record's tail, and their maps read them
+  there.
+- The save record holds the result's length and a digest of its pieces: the
+  close's own pieces with their places, and the bytes it kept as runs. The
+  builder's replay must reach the same digest (`Disagrees`).
+
 ## The library
 
 `agentfs_core::tree_actor::TreeActor` holds an exclusive state-area lease.
@@ -189,15 +215,18 @@ the steps after it move them.
 ## The journal
 
 Every step (a create, a link, a close that saves, a rename, an unlink, a fork, a
-take) is one record in `calls.wal`: the change itself and the pointer changes its
+take) is one record in the journal: the change itself and the pointer changes its
 build publishes (branch moves, queue entries, collision refs), each
 value an oid or "what step `n`'s build gives". It is appended as a call is and made
 durable as a call is. That record is the commit point. The actor decides the step,
 appends it and applies it to the saved state the views serve; it runs no git.
 
+- The journal is a directory of segments, `journal/<first record>.seg`, each
+  about 64 MiB; a frame never spans two, and a frame over 64 MiB has a segment of
+  its own. A new segment's directory entry is fsynced before the durable mark
+  covers any record in it.
 - A failed step keeps serving and saves at the next step in its tree. Only a failed
-  journal `fsync` or rollback, or a compaction failing after its rename, stops the
-  actor.
+  journal `fsync` or rollback stops the actor.
 - Recovery reads the journal, builds history through its last record (see
   [History trails the files](#history-trails-the-files)), reads the saved state
   from it, closes abandoned opens through the ordinary step and compacts. It refuses
@@ -206,24 +235,35 @@ appends it and applies it to the saved state the views serve; it runs no git.
   root an upstream, gives an upstream to a fork with no branch, or gives a fork an
   upstream other than the root (forks are made only of the root). It deletes
   nothing outside a first init's own marker.
-- Compaction keeps the journal at most `max(64 MiB, twice the last compacted
-  length)` plus the live calls, and keeps only the page writes memory holds. A held
-  file pins only its own calls. Frames are at most 96 MiB. The constants are not
-  settings. A checkpoint's pointers are the built ones, so a compaction that is due
-  waits for the first call after the builder has built every record; while history
-  trails, the journal grows.
+- Compaction runs when the segments pass `max(64 MiB, twice the last compacted
+  length)`: it writes a checkpoint at the start of a new segment, then drops
+  (unlinks) every older segment whose records are all built and which holds no
+  live open's call and no page write memory holds. A held file pins only its own
+  frames: they are copied forward (marked `carried`, their record numbers kept)
+  once the dead bytes they pin exceed their own, so the segments stay under about
+  twice the live opens' bytes plus a segment. A reader holding a dropped segment
+  keeps reading it; its space returns when the last lets go. Frames are at most
+  96 MiB. The constants are not settings. A checkpoint's pointers are the built
+  ones, so a compaction that is due waits for the first call after the builder
+  has built every record; while history trails, the journal grows. A compaction
+  that fails before its checkpoint changes nothing and is retried at the next
+  call; one that fails while dropping leaves those segments for the next.
+- Recovery folds the last checkpoint, the live opens' calls and the held page
+  writes it names from the segments before it (kept or carried, each once), and
+  every frame after it.
 - Every frame carries the durable mark: the last record a finished fsync covered
   when the frame was written. At the first invalid frame, a later valid frame with
   this journal's salt whose mark passes the last valid record means a durable record
   was lost: corruption, and the journal refuses to open. Otherwise the hole is a
-  torn tail of records no fsync had covered, saved to `calls.wal.torn` and cut off.
+  torn tail of records no fsync had covered, saved to `journal/torn` and cut off,
+  with every later segment.
   Bit rot in the very last frame, or in records not yet durable, reads as a tear
   and drops those records; the log line and that file are the evidence.
-- The state area is `volume`, `history.git`, `calls.wal`, `built.log`,
+- The state area is `volume`, `history.git`, `journal/`, `built.log`,
   `actor.lock`, `format` and rebuilt private checkout caches, which the workload
   never sees. A create writes an `initializing` marker first and removes it last;
   the next `trees init` starts a cut-short create over. **Earlier state formats
-  (format 5 included) do not open**, and are never converted.
+  (format 7 included) do not open**, and are never converted.
 
 ## History trails the files
 
@@ -232,10 +272,11 @@ most 256 steps, so a long backlog ends in a built event every batch. For a batch
 makes every record through the last one appended durable (one fsync of the
 journal), reads them, replays each step on the trees as built (the same transitions
 the actor ran, then the line alignment), and feeds the commits to one
-`git fast-import`. It installs the batch in this order: the pack, then its index;
+`git fast-import`, each changed file's blob streamed from its map. It installs the batch in this order: the pack, then its index;
 the new pack files and `objects/pack` fsynced; the batch's entry in `built.log`
 fsynced. That entry moves the built point. Only then are Git's refs, `config` and
-the private checkouts copied, and waiters woken.
+the private checkouts copied, the checked-out files' maps rebased onto them
+([File maps](#file-maps)), and waiters woken.
 
 - A save is visible to every view at its release, before it is built. Git's refs,
   commits and checkouts show only what is built.
@@ -321,9 +362,12 @@ What the tree views do not support:
   replication, CSI, several view hosts, upgrades and snapshot opens** are not
   built. The designs for them are in [target-architecture](target-architecture/README.md).
 - **Telemetry export** is not wired. `--metrics-output` is the only measurement.
-- **Large files are slow.** The builder writes each commit's metadata whole and
-  replays a save on the whole file, so a large file taxes its builds; takes read
-  whole trees. In one debug-build run on CI, a
+- **Large files are slow to build.** The call path costs a write's own bytes,
+  but the builder reads a saved file whole to align its lines, and its line map
+  holds every byte and is written as JSON, so a large file taxes its builds and
+  the state area: a 1 GiB save needs about 4 GiB while history builds (its
+  journal segments, a pack of the blob and its line map, the checkout). Takes read
+  whole trees. In one debug-build run on CI, before file maps, a
   100 MiB file took 31.9 s to write and close and 339 s until both views converged
   (a 1 MiB file: 1.27 s), and five saves of unrelated small files took 238 to 241 s
   each to appear while it was queued. The line map is never pruned, so per-save cost

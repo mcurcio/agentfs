@@ -144,7 +144,10 @@ fn bytes_copied_per_write_is_its_own() {
     let before = Stages::current().bytes_copied;
     v.write(h, 512 << 20, &[2; 4096], false).unwrap();
     let copied = Stages::current().bytes_copied - before;
-    assert_eq!(copied, 4096, "a 4 KiB write into a 1 GiB file copied {copied} bytes");
+    assert_eq!(
+        copied, 4096,
+        "a 4 KiB write into a 1 GiB file copied {copied} bytes"
+    );
     assert_eq!(v.read_open(h).unwrap().len(), 1 << 30);
 }
 
@@ -168,7 +171,10 @@ fn unchanged_compares_only_the_opens_runs() {
     let before = Stages::current().bytes_compared;
     assert_eq!(v.close(h).unwrap(), Saved::Unchanged);
     let compared = Stages::current().bytes_compared - before;
-    assert_eq!(compared, 4096, "the open's runs are 4096 bytes; {compared} compared");
+    assert_eq!(
+        compared, 4096,
+        "the open's runs are 4096 bytes; {compared} compared"
+    );
 }
 
 /// The call path runs no Git and writes no object: with the builder held, a

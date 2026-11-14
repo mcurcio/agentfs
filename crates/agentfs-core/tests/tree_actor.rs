@@ -1248,7 +1248,11 @@ fn a_held_open_pins_only_its_own_bytes() {
     // third segment, the two before it kept.
     let poke = v.write_open(ROOT, "small", &writer("w"), false).unwrap();
     v.close(poke).unwrap();
-    assert_eq!(v.metrics().journal_carried_bytes, 0, "a live open's frames moved");
+    assert_eq!(
+        v.metrics().journal_carried_bytes,
+        0,
+        "a live open's frames moved"
+    );
     assert_eq!(trees::segments(tmp.path()).len(), 3);
     assert!(trees::journal_len(tmp.path()) > 70 << 20);
     drop(v);

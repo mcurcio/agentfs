@@ -313,6 +313,26 @@ fn sync_dir(root: &Path) -> io::Result<()> {
     File::open(root)?.sync_all()
 }
 
+/// Raises the soft limit on open files to the hard one, as the Go runtime
+/// does at start: each built file's map holds its checkout open
+/// (`recording::file_map::BaseFile`), one descriptor per non-empty file and
+/// tree. A refusal leaves the limit as it was.
+fn raise_open_files() {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit and setrlimit read and write only `limit`.
+    unsafe {
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut limit) == 0
+            && limit.rlim_cur < limit.rlim_max
+        {
+            limit.rlim_cur = limit.rlim_max;
+            let _ = libc::setrlimit(libc::RLIMIT_NOFILE, &raw const limit);
+        }
+    }
+}
+
 /// Writes `bytes` to `name` whole: a temporary file, fsynced, renamed into place.
 fn write_durably(root: &Path, name: &str, bytes: &[u8]) -> io::Result<()> {
     let temporary = root.join(format!("{name}.tmp"));
@@ -603,6 +623,7 @@ impl TreeActor {
         identity: VolumeIdentity,
         service: PodContext,
     ) -> Result<Self> {
+        raise_open_files();
         let (journal, frames) = Journal::open(&root.join(JOURNAL))?;
         let folded = fold(&frames)?;
         let (history, builder, built) = Self::start_history(

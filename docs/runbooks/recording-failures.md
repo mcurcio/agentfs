@@ -167,13 +167,15 @@ anything. Its start shows the result:
 ## 5. A tree state area that refuses to open
 
 This section is for the tree actor ([trees](../trees.md)),
-whose journal is `calls.wal` and whose refs are a copy of it. Recovery is manual:
+whose journal is the segment files in `journal/` and whose refs are a copy of it.
+Recovery is manual:
 agentfs repairs neither case itself.
 
 - **`CorruptJournal(offset)`.** A frame is bad and a later good frame's durable mark
   says a record at or after the bad one had been flushed to disk, so this is not a torn
-  write: the disk lost data it had acknowledged. `CorruptJournal(0)` also means the
-  journal is missing or holds no frame.
+  write: the disk lost data it had acknowledged. The offset counts the bytes of the
+  segments in name order. `CorruptJournal(0)` also means the journal is missing,
+  holds no frame or holds no checkpoint.
 - **`MissingObject`.** A pointer's commit, tree or blob is gone. The error names the
   pointer and the object.
 
@@ -185,19 +187,25 @@ git --git-dir="$STATE/history.git" for-each-ref > "$STATE.saved.refs"
 ```
 
 Those refs are the last copy the actor made, and they show what the journal said.
-Truncating `calls.wal` at the offset loses every later record: those saves stop
-existing, and the same refs show what they were. Recovery rebuilds the refs from the
+Truncating the segment that holds the offset there, and removing every later
+segment, loses every later record: those saves stop existing, and the same refs
+show what they were. Recovery rebuilds the refs from the
 journal on open, so a truncation overwrites any newer copy.
 
-A `tree JournalTail` line with a `calls.wal.torn` file means frames no flush had
+A `tree JournalTail` line with a `journal/torn` file means frames no flush had
 covered were dropped at open: calls made since the last `close`, `fsync` or FSYNCDIR
 before a power cut. This is the expected result of a cut, and the actor keeps going. It
 can also be bit rot in records not yet flushed, which looks the same: the log line and
 the file are the evidence. The file keeps the bytes of every tear, appended.
 
-A `tree JournalFsyncFailed` line means a flush of `calls.wal` failed and the actor
-stopped: every later call answers `EIO`. Fix the disk or space problem, then restart;
-recovery reads every frame still in the file.
+A `tree JournalFsyncFailed` line means a flush of the journal (a segment, or the
+directory after a new segment) failed and the actor stopped: every later call
+answers `EIO`. Fix the disk or space problem, then restart; recovery reads every
+frame still in the segments.
+
+A `tree BaseFile` line means the builder could not open a checked-out file to read
+a map from (often `Too many open files`): the file keeps its journal frames, which
+then keep their segments' space. Raise the process's hard limit on open files.
 
 ## 6. A tree volume's history is not built
 
@@ -209,14 +217,14 @@ until it builds or answer the failure.
 
 - **`no space`, `errno <n>`.** The state area is full or failing: free space or fix
   the disk ([1](#1-the-state-area-is-full-or-unwritable)). The next step retries. A
-  builder that never recovers leaves every journal record in `calls.wal`, so the
+  builder that never recovers leaves every journal record in `journal/`, so the
   state area fills and the workload's calls fail with `ENOSPC`.
 - **`git fast-import failed: <first line>`.** The packer exited or was killed. Its
   first stderr line says why; the next step retries with a new child.
 - **`disagrees with step <n>`.** The builder's replay of step `n` does not give what
-  the actor recorded (a length, a checksum, or a name). Every retry fails the same
-  way. Preserve the state area (`cp -a "$STATE" "$STATE.saved"`) and report it with
-  `calls.wal` and `built.log`: it is a bug, and no history is built past step `n`
+  the actor recorded (a length, a digest of the file's pieces, or a name). Every
+  retry fails the same way. Preserve the state area (`cp -a "$STATE" "$STATE.saved"`)
+  and report it with `journal/` and `built.log`: it is a bug, and no history is built past step `n`
   until a release fixes it.
 - **A wedged builder**: `oldest_unbuilt_ns` grows while `health` stays `current`.
   Waiters wait without a timeout. Find the `git fast-import` child of the agentfs

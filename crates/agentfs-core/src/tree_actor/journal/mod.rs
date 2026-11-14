@@ -805,9 +805,7 @@ impl Journal {
     /// takes the frame however long it grows: the name is taken.
     fn roll(&mut self, first: RecordNo, bytes: u64) -> io::Result<bool> {
         let (segment, length) = self.current();
-        if *length == 0
-            || length.saturating_add(bytes) <= SEGMENT_BYTES
-            || segment.first() >= first
+        if *length == 0 || length.saturating_add(bytes) <= SEGMENT_BYTES || segment.first() >= first
         {
             return Ok(false);
         }
