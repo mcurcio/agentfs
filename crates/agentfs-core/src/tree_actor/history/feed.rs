@@ -141,11 +141,21 @@ impl Feed {
     }
 
     /// A blob of `bytes`: its mark.
+    #[cfg(test)]
     pub fn blob(&mut self, bytes: &[u8]) -> Result<u64, BuildError> {
+        self.blob_from(bytes.len() as u64, bytes)
+    }
+
+    /// A blob of the `len` bytes `reader` gives, streamed: its mark. A file
+    /// map's bytes go to fast-import without being held in memory.
+    pub fn blob_from(&mut self, len: u64, mut reader: impl Read) -> Result<u64, BuildError> {
         let mark = self.mark();
         let out = self.out()?;
-        write!(out, "blob\nmark :{mark}\ndata {}\n", bytes.len()).map_err(packer)?;
-        out.write_all(bytes).map_err(packer)?;
+        write!(out, "blob\nmark :{mark}\ndata {len}\n").map_err(packer)?;
+        let copied = std::io::copy(&mut (&mut reader).take(len), out).map_err(packer)?;
+        if copied != len {
+            return Err(packer("a file map ended before its length"));
+        }
         out.write_all(b"\n").map_err(packer)?;
         Ok(mark)
     }

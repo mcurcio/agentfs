@@ -8,7 +8,8 @@ use agentfs_contracts::pod::WriterAt;
 use git2::Oid;
 
 use super::durable::RecordNo;
-use super::{Change, Entry, Frame, OpenRecord, Record, RunHead, Target};
+use super::segment::FramePos;
+use super::{Change, Entry, Frame, OpenRecord, Record, RunHead, Tail, Target};
 use crate::tree_actor::history::upstreams::Upstreams;
 use crate::tree_actor::history::{Objects, objects_of};
 use crate::tree_actor::pointers::Pointers;
@@ -39,11 +40,12 @@ impl LiveOpen {
     }
 }
 
-/// A live open and its calls, as the journal leaves them.
+/// A live open and its calls, as the journal leaves them: each call with
+/// its number and where its bytes are.
 #[derive(Debug, PartialEq, Eq)]
 pub(in crate::tree_actor) struct FoldedOpen {
     pub(in crate::tree_actor) open: LiveOpen,
-    pub(in crate::tree_actor) calls: Vec<(u64, Call)>,
+    pub(in crate::tree_actor) calls: Vec<(u64, Call, FramePos)>,
 }
 
 /// What a journal's frames add up to (git-model §12).
@@ -207,25 +209,23 @@ pub(in crate::tree_actor) fn parse_oid(hex: &str) -> Result<Oid> {
     Oid::from_str(hex).map_err(|_| Error::Format)
 }
 
+/// A page write's runs, each where its bytes are in the frame's tail.
 pub(in crate::tree_actor) fn runs_from_frame(
     heads: &[RunHead],
-    tail: &[u8],
+    tail: &Tail,
 ) -> Result<Vec<pages::Run>> {
-    let mut rest = tail;
+    let mut at = 0_u64;
     let mut runs = Vec::with_capacity(heads.len());
     for head in heads {
-        let len = usize::try_from(head.len).map_err(|_| Error::Format)?;
-        if rest.len() < len {
-            return Err(Error::Format);
-        }
-        let (bytes, after) = rest.split_at(len);
+        head.offset.checked_add(head.len).ok_or(Error::Format)?;
         runs.push(pages::Run {
             offset: head.offset,
-            bytes: bytes.to_vec(),
+            len: head.len,
+            at: tail.pos.at(at),
         });
-        rest = after;
+        at = at.checked_add(head.len).ok_or(Error::Format)?;
     }
-    if rest.is_empty() {
+    if at == tail.len {
         Ok(runs)
     } else {
         Err(Error::Format)
@@ -248,6 +248,7 @@ pub(in crate::tree_actor) fn fold(frames: &[Frame]) -> Result<Folded> {
                     opens,
                     page_saved,
                     objects,
+                    ..
                 },
             ..
         },
@@ -307,12 +308,15 @@ pub(in crate::tree_actor) fn fold(frames: &[Frame]) -> Result<Folded> {
                 object: seq,
                 anonymous: true,
             }),
-            Entry::Call { handle, call } => folded
-                .opens
-                .get_mut(handle)
-                .ok_or(Error::Format)?
-                .calls
-                .push((seq, Call::from_frame(call, tail)?)),
+            Entry::Call { handle, call } => {
+                call.check_tail(tail.len)?;
+                folded
+                    .opens
+                    .get_mut(handle)
+                    .ok_or(Error::Format)?
+                    .calls
+                    .push((seq, call.clone(), tail.pos.clone()));
+            }
             Entry::PageWrite { tree, object, runs } => folded
                 .page_writes
                 .entry((tree.parse::<TreeId>()?, *object))

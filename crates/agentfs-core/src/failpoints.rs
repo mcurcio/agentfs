@@ -41,10 +41,11 @@ pub const POINTS: &[&str] = &[
     "tree.wal_before_header",
     "tree.wal_after_payload",
     "tree.wal_before_fsync",
+    "tree.segment_after_create",
     "tree.wal_after_fsync",
     "tree.before_step",
-    "tree.compact_before_rename",
-    "tree.compact_after_rename",
+    "tree.compact_before_checkpoint",
+    "tree.compact_before_drop",
     // The tree builder, behind the call path (docs/trees.md).
     "tree.build_before_batch",
     "tree.build_after_pack",

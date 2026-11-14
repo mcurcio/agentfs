@@ -109,7 +109,7 @@ PY
 done
 # The failpoints a mounted process cannot reach: each opening of the state area
 # passes them. Killed there, the next open still finds every returned write.
-for point in tree.after_ref_rebuild tree.compact_before_rename tree.compact_after_rename; do
+for point in tree.after_ref_rebuild tree.compact_before_checkpoint tree.compact_before_drop; do
   rm -rf "$work/state" "$work/main" "$work/sandbox"
   mkdir "$work/main" "$work/sandbox"
   "$bin" --state "$work/state" trees init --volume t

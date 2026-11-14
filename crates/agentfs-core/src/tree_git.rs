@@ -599,36 +599,40 @@ impl TreeGit {
     /// Make a private cache directory the exact tree, without Git filters.
     /// With `previous`, the tree the directory holds now, only entries that
     /// differ are rewritten (git-model §3); without it the directory is
-    /// replaced whole.
+    /// replaced whole. Each file is written to a temporary name beside the
+    /// tree's top and renamed into place, so a reader holding the file it
+    /// replaces keeps reading the old bytes (docs/trees.md, "File maps").
     pub fn checkout_tree(&self, tree: Oid, dest: &Path, previous: Option<Oid>) -> Result<()> {
+        let scratch = dest.join(CHECKOUT_SCRATCH);
         if let Some(previous) = previous {
-            return self.checkout_changes(previous, tree, dest);
+            return self.checkout_changes(previous, tree, dest, &scratch);
         }
         if dest.exists() {
             std::fs::remove_dir_all(dest)?;
         }
         std::fs::create_dir_all(dest)?;
-        self.checkout_entries(tree, dest)
+        self.checkout_entries(tree, dest, &scratch)
     }
-    fn checkout_entries(&self, tree: Oid, dest: &Path) -> Result<()> {
+    fn checkout_entries(&self, tree: Oid, dest: &Path, scratch: &Path) -> Result<()> {
         for entry in self.list_tree(tree)? {
-            self.checkout_entry(&entry, dest)?;
+            self.checkout_entry(&entry, dest, scratch)?;
         }
         Ok(())
     }
-    fn checkout_entry(&self, entry: &TreeEntry, dest: &Path) -> Result<()> {
+    fn checkout_entry(&self, entry: &TreeEntry, dest: &Path, scratch: &Path) -> Result<()> {
         let path = dest.join(entry_name(&entry.name)?);
         match entry.mode {
             0o40000 => {
                 std::fs::create_dir(&path)?;
-                self.checkout_entries(entry.oid, &path)?;
+                self.checkout_entries(entry.oid, &path, scratch)?;
             }
             0o100644 | 0o100755 => {
-                std::fs::write(&path, self.read_blob(entry.oid)?)?;
+                std::fs::write(scratch, self.read_blob(entry.oid)?)?;
                 std::fs::set_permissions(
-                    &path,
+                    scratch,
                     std::fs::Permissions::from_mode(entry.mode & 0o777),
                 )?;
+                std::fs::rename(scratch, &path)?;
             }
             0o120000 => symlink(OsString::from_vec(self.read_blob(entry.oid)?), path)?,
             _ => return Err(Error::Invalid("unsupported checkout mode".into())),
@@ -636,7 +640,8 @@ impl TreeGit {
         Ok(())
     }
     /// `dest` holds `old`; leaves it holding `new`, touching only what differs.
-    fn checkout_changes(&self, old: Oid, new: Oid, dest: &Path) -> Result<()> {
+    /// A file replaced by a file is renamed over, never removed first.
+    fn checkout_changes(&self, old: Oid, new: Oid, dest: &Path, scratch: &Path) -> Result<()> {
         if old == new {
             return Ok(());
         }
@@ -652,27 +657,39 @@ impl TreeGit {
                 && now.mode == 0o40000
                 && was.mode == 0o40000
             {
-                self.checkout_changes(was.oid, now.oid, &dest.join(entry_name(name)?))?;
+                self.checkout_changes(was.oid, now.oid, &dest.join(entry_name(name)?), scratch)?;
                 continue;
             }
             let path = dest.join(entry_name(name)?);
+            let file = |mode: u32| mode == 0o100644 || mode == 0o100755;
+            if let Some(now) = now
+                && file(now.mode)
+                && file(was.mode)
+            {
+                self.checkout_entry(now, dest, scratch)?;
+                continue;
+            }
             if was.mode == 0o40000 {
                 std::fs::remove_dir_all(&path)?;
             } else {
                 std::fs::remove_file(&path)?;
             }
             if let Some(now) = now {
-                self.checkout_entry(now, dest)?;
+                self.checkout_entry(now, dest, scratch)?;
             }
         }
         for (name, now) in &new {
             if !old.contains_key(name) {
-                self.checkout_entry(now, dest)?;
+                self.checkout_entry(now, dest, scratch)?;
             }
         }
         Ok(())
     }
 }
+
+/// The temporary name a checkout writes each file to before its rename: in
+/// the tree's top folder, where only two-hex-digit folders live.
+const CHECKOUT_SCRATCH: &str = ".agentfs-checkout";
 
 /// A tree entry's name as a path component; `.` and `..` never leave `dest`.
 fn entry_name(name: &[u8]) -> Result<OsString> {

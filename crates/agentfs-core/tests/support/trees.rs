@@ -67,3 +67,32 @@ pub fn fanned(name: &str) -> String {
 pub fn checkout(dir: &Path, tree: &str, name: &str) -> std::path::PathBuf {
     dir.join("trees").join(tree).join(fanned(name))
 }
+
+/// The journal's segment files in the state area `dir`, in order.
+pub fn segments(dir: &Path) -> Vec<std::path::PathBuf> {
+    let mut found: Vec<std::path::PathBuf> = std::fs::read_dir(dir.join("journal"))
+        .expect("reads the journal")
+        .map(|entry| entry.expect("an entry").path())
+        .filter(|path| path.extension().is_some_and(|e| e == "seg"))
+        .collect();
+    found.sort();
+    found
+}
+
+/// The segment the journal appends to: its last.
+pub fn current_segment(dir: &Path) -> std::path::PathBuf {
+    segments(dir).pop().expect("a segment")
+}
+
+/// Every segment's bytes.
+pub fn journal_len(dir: &Path) -> u64 {
+    segments(dir)
+        .iter()
+        .map(|path| std::fs::metadata(path).expect("a segment").len())
+        .sum()
+}
+
+/// Where a torn tail is saved.
+pub fn torn(dir: &Path) -> std::path::PathBuf {
+    dir.join("journal").join("torn")
+}

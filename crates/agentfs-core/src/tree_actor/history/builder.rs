@@ -12,7 +12,7 @@
 //! with its record (`Disagrees`) stops building with the alarm.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::fs::File;
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -29,13 +29,15 @@ use super::message::{self, Action, Message};
 use super::upstreams::Upstreams;
 use super::{Objects, checkout, objects_of, refs};
 use crate::tree_actor::journal::durable::{Durability, RecordNo};
+use crate::tree_actor::journal::segment::{FramePos, Segment};
 use crate::tree_actor::journal::{
-    Change, Entry, Frame, Record, SaveOutcome, TakeHead, TakeRecord, Target, frame_at,
-    runs_from_frame, salt_of,
+    At, Change, Entry, Frame, Record, SaveOutcome, Tail, TakeHead, TakeRecord, Target, frame_at,
+    runs_from_frame,
 };
 use crate::tree_actor::pointers::Pointers;
 use crate::tree_actor::queue::Key;
-use crate::tree_actor::recording::{Call, changed_bytes, pages};
+use crate::tree_actor::recording::file_map::BaseFile;
+use crate::tree_actor::recording::{Call, FileMap, own_keys, pages};
 use crate::tree_actor::stages::{Timer, Which};
 use crate::tree_actor::tree::{
     EventNumber, FileBytes, MergeFileIdentity, NameHistory, Tree, Versions,
@@ -47,78 +49,104 @@ use crate::tree_git::{RefUpdate, TreeGit};
 /// so a long backlog is built in slices that each end in one.
 const MAX_BATCH_STEPS: usize = 256;
 
-/// The builder's own reader of the journal file: frames after its cursor,
-/// through the durable mark. It reopens the file after a compaction replaced
-/// it, skipping to the cursor.
+/// Where a reader stands: a segment and a byte in it.
+type ReadAt = (Arc<Segment>, u64);
+
+/// The builder's own reader of the journal: frames after its cursor, through
+/// the durable mark, along the segments in order. A segment it holds stays
+/// readable after compaction drops it; carried frames and checkpoints number
+/// at or below the cursor and are passed over.
 pub(in crate::tree_actor) struct JournalReader {
-    path: PathBuf,
-    file: File,
+    durability: Arc<Durability>,
     salt: u32,
+    segment: Arc<Segment>,
     offset: u64,
     cursor: RecordNo,
-    generation: u64,
 }
 
 impl JournalReader {
-    /// A reader of the journal at `path` whose cursor is `cursor`: the next
-    /// read starts after it.
-    pub fn open(path: &Path, cursor: RecordNo, generation: u64) -> Result<Self> {
+    /// A reader of the journal whose cursor is `cursor`: the next read starts
+    /// after it.
+    pub fn open(durability: Arc<Durability>, salt: u32, cursor: RecordNo) -> Result<Self> {
+        let segment = durability
+            .segments()
+            .first()
+            .cloned()
+            .ok_or(Error::CorruptJournal(0))?;
         let mut reader = Self {
-            path: path.to_owned(),
-            file: File::open(path)?,
-            salt: 0,
+            durability,
+            salt,
+            segment,
             offset: 0,
             cursor,
-            generation,
         };
-        reader.reopen(generation)?;
+        // Past every frame at or below the cursor.
+        loop {
+            match frame_at(&reader.segment, reader.offset, salt, cursor)? {
+                At::Frame(_, len) => reader.offset += len,
+                At::Later => break,
+                At::End => {
+                    if !reader.next_segment() {
+                        break;
+                    }
+                }
+            }
+        }
         Ok(reader)
     }
 
-    fn reopen(&mut self, generation: u64) -> Result<()> {
-        self.file = File::open(&self.path)?;
-        self.salt = salt_of(&self.file)?;
-        self.offset = 0;
-        self.generation = generation;
-        while let Some(((record, _), len)) =
-            frame_at(&self.file, self.offset, self.salt, self.cursor)?
+    /// Moves to the segment after the one read, if the journal has one.
+    fn next_segment(&mut self) -> bool {
+        let first = self.segment.first();
+        match self
+            .durability
+            .segments()
+            .into_iter()
+            .find(|s| s.first() > first)
         {
-            let _ = record;
-            self.offset += len;
+            Some(next) => {
+                self.segment = next;
+                self.offset = 0;
+                true
+            }
+            None => false,
         }
-        Ok(())
     }
 
     /// Frames after the cursor through `through` (at most the durable mark),
     /// stopping after `max_steps` steps, and where they end. The cursor moves
     /// only at [`JournalReader::advance`].
-    pub fn read(
-        &mut self,
-        through: RecordNo,
-        generation: u64,
-        max_steps: usize,
-    ) -> Result<(Vec<Frame>, u64)> {
-        if generation != self.generation {
-            self.reopen(generation)?;
-        }
+    pub fn read(&mut self, through: RecordNo, max_steps: usize) -> Result<(Vec<Frame>, ReadAt)> {
         let mut frames = Vec::new();
         let mut steps = 0;
-        let mut at = self.offset;
-        while steps < max_steps
-            && let Some((frame, len)) = frame_at(&self.file, at, self.salt, through)?
-        {
-            at += len;
-            if frame.0.seq > self.cursor {
-                steps += usize::from(matches!(frame.0.entry, Entry::Step { .. }));
-                frames.push(frame);
+        let (start, start_offset) = (Arc::clone(&self.segment), self.offset);
+        while steps < max_steps {
+            match frame_at(&self.segment, self.offset, self.salt, through)? {
+                At::Frame(frame, len) => {
+                    self.offset += len;
+                    if frame.0.seq > self.cursor {
+                        steps += usize::from(matches!(frame.0.entry, Entry::Step { .. }));
+                        frames.push(*frame);
+                    }
+                }
+                At::Later => break,
+                At::End => {
+                    if !self.next_segment() {
+                        break;
+                    }
+                }
             }
         }
-        Ok((frames, at))
+        let end = (Arc::clone(&self.segment), self.offset);
+        // Nothing moves until the batch is built.
+        self.segment = start;
+        self.offset = start_offset;
+        Ok((frames, end))
     }
 
-    /// The batch read up to `offset`, through `through`, is built.
-    pub fn advance(&mut self, offset: u64, through: RecordNo) {
-        self.offset = offset;
+    /// The batch read up to `end`, through `through`, is built.
+    pub fn advance(&mut self, end: ReadAt, through: RecordNo) {
+        (self.segment, self.offset) = end;
         self.cursor = self.cursor.max(through);
     }
 }
@@ -128,7 +156,7 @@ impl JournalReader {
 struct BuildOpen {
     tree: TreeId,
     object: u64,
-    calls: Vec<(u64, Call)>,
+    calls: Vec<(u64, Call, FramePos)>,
 }
 
 /// What the builder has built: the trees with line maps and name histories,
@@ -151,6 +179,13 @@ pub(in crate::tree_actor) struct BuildState {
     objects: BTreeMap<TreeId, Arc<Objects>>,
 }
 
+/// A map for a file the builder's state just took: a save, a create, a take.
+fn saved_map(map: FileMap, step: u64) -> Arc<FileBytes> {
+    let mut map = map;
+    map.saved_at(RecordNo::new(step));
+    Arc::new(map.into())
+}
+
 /// One batch's packer and what it fed.
 struct Batch<'a> {
     repo: &'a TreeGit,
@@ -165,6 +200,8 @@ struct Batch<'a> {
     forked: bool,
     /// Trees whose names or objects a step moved.
     moved: BTreeSet<TreeId>,
+    /// Files whose map a step replaced: History hands the new maps to the actor.
+    files: BTreeSet<(TreeId, u64)>,
 }
 
 impl Batch<'_> {
@@ -185,7 +222,10 @@ impl Batch<'_> {
         if let Some((_, mark)) = self.blobs.get(&key) {
             return Ok(BlobRef::Mark(*mark));
         }
-        let mark = self.feed()?.blob(bytes).map_err(build_error)?;
+        let mark = self
+            .feed()?
+            .blob_from(bytes.len(), bytes.reader())
+            .map_err(build_error)?;
         self.blobs.insert(key, (Arc::clone(bytes), mark));
         Ok(BlobRef::Mark(mark))
     }
@@ -295,7 +335,7 @@ impl BuildState {
     fn apply(
         &mut self,
         record: &Record,
-        tail: &[u8],
+        tail: &Tail,
         ctx: &Context<'_>,
         batch: &mut Batch<'_>,
     ) -> Result<()> {
@@ -314,12 +354,14 @@ impl BuildState {
                     .add_anonymous(seq);
                 self.opened(seq, tree, seq);
             }
-            Entry::Call { handle, call } => self
-                .opens
-                .get_mut(handle)
-                .ok_or(Error::Format)?
-                .calls
-                .push((seq, Call::from_frame(call, tail)?)),
+            Entry::Call { handle, call } => {
+                call.check_tail(tail.len)?;
+                self.opens
+                    .get_mut(handle)
+                    .ok_or(Error::Format)?
+                    .calls
+                    .push((seq, call.clone(), tail.pos.clone()));
+            }
             Entry::PageWrite { tree, object, runs } => self
                 .pages
                 .entry((tree.parse::<TreeId>()?, *object))
@@ -329,7 +371,7 @@ impl BuildState {
                 by,
                 change,
                 pointers,
-            } => self.step(record, by, change, pointers, ctx, batch)?,
+            } => self.step(record, tail, by, change, pointers, ctx, batch)?,
         }
         Ok(())
     }
@@ -404,9 +446,14 @@ impl BuildState {
         clippy::too_many_lines,
         reason = "one arm per kind of step, as the record has"
     )]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the record's parts, passed through"
+    )]
     fn step(
         &mut self,
         record: &Record,
+        tail: &Tail,
         by: &WriterAt,
         change: &Change,
         changes: &[crate::tree_actor::journal::PointerChange],
@@ -434,8 +481,9 @@ impl BuildState {
                 let t = self.tree_mut(id)?;
                 let keys = t.shape.apply(change, event)?;
                 let object = event.object();
-                t.bytes.insert(object, Arc::default());
+                t.bytes.insert(object, saved_map(FileMap::empty(), seq));
                 t.lines.insert(object, Arc::default());
+                batch.files.insert((id, object));
                 let identity = *t.identities.get(&object).ok_or(Error::Format)?;
                 t.namespace
                     .insert(identity, NameHistory::created(event, path.clone()));
@@ -476,7 +524,10 @@ impl BuildState {
                         t.lines.remove(&open.object);
                     }
                     SaveOutcome::Unchanged | SaveOutcome::OrphanDropped => {}
-                    SaveOutcome::Saved { len, crc32 } => {
+                    SaveOutcome::Saved {
+                        len,
+                        pieces: digest,
+                    } => {
                         let writes = self.pages.get(&(id, open.object));
                         let mut resolved = Vec::with_capacity(pieces.len());
                         for piece in pieces {
@@ -491,30 +542,34 @@ impl BuildState {
                             resolved.push((piece.record.get(), run));
                         }
                         let calls = pages::close_calls(&open.calls, &resolved);
-                        let saved = t.bytes.get(&open.object).ok_or_else(|| disagrees(seq))?;
-                        let bytes = changed_bytes(saved, &calls)?.ok_or_else(|| disagrees(seq))?;
-                        if bytes.len() as u64 != *len || crc32fast::hash(&bytes) != *crc32 {
+                        let mut map =
+                            (**t.bytes.get(&open.object).ok_or_else(|| disagrees(seq))?).clone();
+                        for (call, pos) in &calls {
+                            map.apply(call, pos)?;
+                        }
+                        if map.len() != *len || map.digest(&own_keys(&calls)) != *digest {
                             return Err(disagrees(seq));
                         }
                         let mut versions = Versions::of(event);
                         let mut next_id = || versions.next();
                         let old = t.lines.get(&open.object).ok_or_else(|| disagrees(seq))?;
-                        let lines = if calls.iter().all(|call| matches!(call, Call::Append(_))) {
-                            let suffix: Vec<u8> = calls
-                                .iter()
-                                .flat_map(|call| match call {
-                                    Call::Append(bytes) => bytes.as_slice(),
-                                    _ => &[],
-                                })
-                                .copied()
-                                .collect();
+                        let lines = if calls
+                            .iter()
+                            .all(|(call, _)| matches!(call, Call::Append { .. }))
+                        {
+                            let mut suffix = Vec::new();
+                            for (call, pos) in &calls {
+                                suffix.extend_from_slice(&pos.bytes(0, call.carried())?);
+                            }
                             old.append(&suffix, &mut next_id)?
                         } else {
+                            let bytes = map.to_vec()?;
                             let _timer = Timer::start(Which::Align);
                             old.align(&bytes, &mut next_id)?
                         };
                         t.lines.insert(open.object, Arc::new(lines));
-                        t.bytes.insert(open.object, Arc::new(bytes.into()));
+                        t.bytes.insert(open.object, saved_map(map, seq));
+                        batch.files.insert((id, open.object));
                         let message = direct(Action::Direct, id, Some(*handle))?;
                         head =
                             Some(self.commit_direct(id, &keys, &message, record.at_ns, batch)?);
@@ -541,7 +596,7 @@ impl BuildState {
                             .ok_or(Error::Format)?
                             .advance(event, None, None);
                         let mut versions = Versions::of(event);
-                        let bytes = Arc::clone(t.bytes.get(&object).ok_or(Error::Format)?);
+                        let bytes = t.bytes.get(&object).ok_or(Error::Format)?.to_vec()?;
                         let lines = t
                             .lines
                             .get(&replaced)
@@ -603,7 +658,7 @@ impl BuildState {
             }
             Change::Take { tree, take } => {
                 let id = tree.parse::<TreeId>()?;
-                head = self.take(id, seq, take, change, ctx, record.at_ns, batch)?;
+                head = self.take(id, seq, take, tail, change, ctx, record.at_ns, batch)?;
                 batch.moved.insert(id);
             }
         }
@@ -645,6 +700,7 @@ impl BuildState {
         id: TreeId,
         seq: u64,
         take: &TakeRecord,
+        tail: &Tail,
         change: &Change,
         ctx: &Context<'_>,
         at_ns: u64,
@@ -666,7 +722,32 @@ impl BuildState {
             };
         }
         let mut t = current.clone();
-        t.install(snapshot)?;
+        // A file the take leaves reads its bytes from the record's tail; every
+        // other file keeps its map.
+        let spans = take.spans();
+        let mut taken = Vec::new();
+        t.install(snapshot, |identity, object, _| match spans.get(&identity) {
+            Some((at, len)) => {
+                let mut map = FileMap::empty();
+                map.apply(
+                    &Call::Write {
+                        offset: 0,
+                        len: *len,
+                    },
+                    &tail.pos.at(*at),
+                )?;
+                taken.push(object);
+                Ok(saved_map(map, seq))
+            }
+            None => current
+                .bytes
+                .get(&object)
+                .cloned()
+                .ok_or_else(|| disagrees(seq)),
+        })?;
+        batch
+            .files
+            .extend(taken.into_iter().map(|object| (id, object)));
         // The actor ran the shape's own transition: the two must agree.
         let mut shape = current.shape.clone();
         shape.apply(change, event)?;
@@ -848,10 +929,9 @@ impl Builder {
         self.durability
             .make_durable(through)
             .map_err(|e| BuildError::Io(e.errno()))?;
-        let generation = self.durability.generation();
         let (frames, offset) = self
             .reader
-            .read(through, generation, MAX_BATCH_STEPS)
+            .read(through, MAX_BATCH_STEPS)
             .map_err(to_build_error)?;
         // A batch cut at its step limit is built through its last record; the
         // next batch follows at once, so built events (and the gate) keep coming.
@@ -884,6 +964,7 @@ impl Builder {
             scratch: BTreeMap::new(),
             forked: false,
             moved: BTreeSet::new(),
+            files: BTreeSet::new(),
         };
         for (record, tail) in &frames {
             next.apply(record, tail, &ctx, &mut batch)
@@ -935,18 +1016,85 @@ impl Builder {
             .filter_map(|(tree, mark)| Some((*tree, *marks.get(mark)?)))
             .collect();
         let forked = batch.forked;
+        let files = std::mem::take(&mut batch.files);
         self.state = next;
-        if let Err(e) = self.copy(&built, &scratch, forked) {
-            self.stale = true;
-            eprintln!("tree CopyStale: {e}");
-        }
+        let checked_out = match self.copy(&built, &scratch, forked) {
+            Ok(trees) => trees,
+            Err(e) => {
+                self.stale = true;
+                eprintln!("tree CopyStale: {e}");
+                Vec::new()
+            }
+        };
+        let maps = self.rebase(through, &checked_out, files);
+        self.history.publish_maps(maps);
         self.history
             .built_event(through, built, owners, objects, started.elapsed());
         Ok(())
     }
 
+    /// The files of each tree checked out through `through` read from the
+    /// checkout as built, letting go of their frames; returns those maps and
+    /// every map in `files`, for the actor to take where it saved the same
+    /// step. A file that cannot be opened keeps its frames.
+    fn rebase(
+        &mut self,
+        through: RecordNo,
+        checked_out: &[TreeId],
+        files: BTreeSet<(TreeId, u64)>,
+    ) -> Vec<(TreeId, u64, FileMap)> {
+        let mut changed = files;
+        for tree in checked_out {
+            let Some(t) = self.state.trees.get_mut(tree) else {
+                continue;
+            };
+            let named: Vec<(String, u64)> = t
+                .names
+                .iter()
+                .map(|(path, object)| (path.clone(), *object))
+                .collect();
+            for (path, object) in named {
+                let Some(bytes) = t.bytes.get(&object) else {
+                    continue;
+                };
+                if !bytes.on_frames() {
+                    continue;
+                }
+                let base = match BaseFile::open(
+                    &super::checkout_path(&self.root, *tree, &path),
+                    through,
+                    bytes.known_blob(),
+                ) {
+                    Ok(base) => base,
+                    Err(e) => {
+                        eprintln!("tree BaseFile: {tree} {path}: {e}");
+                        continue;
+                    }
+                };
+                let mut map = (**bytes).clone();
+                map.rebase(base);
+                let rebased = Arc::new(bytes.with_map(map));
+                t.bytes.insert(object, rebased);
+                changed.insert((*tree, object));
+            }
+        }
+        changed
+            .into_iter()
+            .filter_map(|(tree, object)| {
+                let map = self.state.trees.get(&tree)?.bytes.get(&object)?;
+                Some((tree, object, (**map).clone()))
+            })
+            .collect()
+    }
+
     /// Git's refs, `config` and the checkouts: copies of the built state.
-    fn copy(&mut self, built: &Pointers, scratch: &[(TreeId, Oid)], forked: bool) -> Result<()> {
+    /// Returns the trees whose checkout it rewrote.
+    fn copy(
+        &mut self,
+        built: &Pointers,
+        scratch: &[(TreeId, Oid)],
+        forked: bool,
+    ) -> Result<Vec<TreeId>> {
         // The batch is built: from here a failure leaves only stale copies.
         crate::failpoints::hit("tree.build_after_built_log")?;
         let repo = self.history.repo().clone();
@@ -972,6 +1120,7 @@ impl Builder {
         }
         let old = std::mem::replace(&mut self.copied, built.clone());
         crate::failpoints::hit("tree.build_after_ref_copy")?;
+        let mut rewritten = Vec::new();
         for (tree, head) in refs::branches(built)? {
             if !self.stale && old.get(&refs::branch(tree)) == Some(head) {
                 continue;
@@ -979,9 +1128,10 @@ impl Builder {
             let previous = self.checked_out.remove(&tree);
             let files = checkout(&repo, &self.root, tree, head, previous)?;
             self.checked_out.insert(tree, files);
+            rewritten.push(tree);
         }
         self.stale = false;
-        Ok(())
+        Ok(rewritten)
     }
 }
 

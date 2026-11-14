@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """The tree views' release figures (docs/performance.md, "Tree views, release build").
 
-Runs three flat workloads through a mounted tree view, each against its own
+Runs four flat workloads through a mounted tree view, each against its own
 deadline, compares each figure with its bar in ci/trees-budget.json, and
 writes the report as JSON. A figure that misses its bar sets `warn` and
 prints a `::warning::` line; nothing here fails on a figure. A workload that
@@ -26,6 +26,14 @@ commit, not only the close.
     close_64m  one 64 MiB file written in 1 MiB blocks (random bytes, varied
                per MiB, as the benchmark's bigclose), closed and statted: total
                seconds, or the bytes written by the deadline
+    close_1g   one 1 GiB file written the same way, then closed and statted:
+               the seconds of the close and stat alone (the benchmark's dirty
+               bigclose), the total, the bytes the journal copied forward
+               meanwhile (`carried_bytes`, from --metrics), or the bytes
+               written by the deadline. Before it, 32 files of 1 MiB written
+               in one write each: `write_1g` is the median of the big file's
+               last 64 writes over the median of those (a write costs its own
+               bytes at any file size)
 
 Each workload runs on a worker thread. One the deadline catches inside a
 save gets `grace_s` more to come back; one still blocked then is stuck in
@@ -45,6 +53,9 @@ import time
 
 MIB = 1 << 20
 BIG_BYTES = 64 * MIB
+HUGE_BYTES = 1024 * MIB
+SMALL_FILES = 32
+LAST_WRITES = 64
 GUARANTEE = ("saved before the view answers any later request; "
              "history built later (drain_s: from the workload's end to the built point reaching it)")
 FUSECTL = "/sys/fs/fuse/connections"
@@ -157,6 +168,70 @@ def close_64m(view, run, _target):
     run.finished = run.done(start)
 
 
+def metrics_of(path):
+    """The view's metrics file, or None."""
+    if not path:
+        return None
+    try:
+        with open(path) as file:
+            return json.load(file)
+    except (OSError, ValueError):
+        return None
+
+
+def close_1g(view, run, _target, metrics=None):
+    block = bytearray(os.urandom(MIB))
+    run.extra.update(bytes_written=0)
+    small = []
+    for n in range(SMALL_FILES):
+        if not run.open():
+            return
+        block[:8] = n.to_bytes(8, "little")
+        fd = os.open(os.path.join(view, f"fig-1m-{n}"), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+        try:
+            start = time.monotonic()
+            written = os.write(fd, block)
+            small.append(time.monotonic() - start)
+            assert written == MIB, "one write of 1 MiB"
+        finally:
+            os.close(fd)
+    before = metrics_of(metrics)
+    path = os.path.join(view, "fig-1g")
+    writes = []
+    start = time.monotonic()
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+    closing = None
+    try:
+        for n in range(HUGE_BYTES // MIB):
+            if not run.open():
+                return
+            block[:8] = n.to_bytes(8, "little")
+            chunk = memoryview(block)
+            began = time.monotonic()
+            while chunk:
+                chunk = chunk[os.write(fd, chunk):]
+            writes.append(time.monotonic() - began)
+            run.extra["bytes_written"] += MIB
+        closing = time.monotonic()
+    finally:
+        os.close(fd)
+    os.stat(path)
+    end = time.monotonic()
+    if end > run.deadline:
+        return
+    run.samples.append(end - closing)
+    run.extra["total_s"] = round(end - start, 3)
+    last = statistics.median(writes[-LAST_WRITES:])
+    first = statistics.median(small)
+    run.extra["write_1g"] = {"p50_last_ms": ms(last), "p50_1m_ms": ms(first),
+                             "ratio": round(last / first, 3) if first else None}
+    after = metrics_of(metrics)
+    if before is not None and after is not None:
+        run.extra["carried_bytes"] = (after.get("journal_carried_bytes", 0)
+                                      - before.get("journal_carried_bytes", 0))
+    run.finished = True
+
+
 def by_tree_size(samples, start_files):
     """The cost of a save against the files in the tree, in windows of saves
     ending at 1, 2 and 5 times each power of ten, and the last save."""
@@ -190,6 +265,10 @@ def figures(name, run, budget):
         figure.update(target=budget["count"], count=len(samples),
                       total_s=round(sum(samples), 3),
                       cost_by_tree_size=by_tree_size(samples, run.extra["tree_files_at_start"]))
+    elif name == "close_1g":
+        figure.update(bytes=HUGE_BYTES)
+        if samples:
+            figure.update(close_s=round(samples[0], 3))
     else:
         figure.update(bytes=BIG_BYTES)
         if samples:
@@ -208,7 +287,8 @@ def missed(figure, budget, filesystem):
         return False
     value = budget["max"]
     limit = value[filesystem] if isinstance(value, dict) else value
-    return figure[budget["metric"]] > limit
+    found = figure.get(budget["metric"])
+    return found is None or found > limit
 
 
 def history(metrics):
@@ -255,7 +335,8 @@ def abort_connection(dev):
         return False
 
 
-WORKLOADS = [("close_4k", close_4k), ("create", create), ("close_64m", close_64m)]
+WORKLOADS = [("close_4k", close_4k), ("create", create), ("close_64m", close_64m),
+             ("close_1g", close_1g)]
 
 
 def main():
@@ -294,7 +375,10 @@ def main():
 
         def worker(work=work, run=run, target=budget.get("count")):
             try:
-                work(args.view, run, target)
+                if work is close_1g:
+                    work(args.view, run, target, args.metrics)
+                else:
+                    work(args.view, run, target)
             except OSError as error:
                 run.error = str(error)
 
@@ -310,13 +394,20 @@ def main():
             figure = figures(name, run, budget)
         if args.metrics and not stopped:
             figure["drain_s"] = drain(args.metrics, args.drain_cap)
-        warn = missed(figure, budget, args.filesystem)
-        workloads.append({**entry, **figure, "warn": warn})
-        print(f"{name} on {args.filesystem}: {json.dumps(figure)}", flush=True)
-        if warn:
-            print(f"::warning title=tree views, {args.filesystem}::{name} misses its bar, "
-                  f"{budget['text']}: {json.dumps({k: v for k, v in figure.items() if k != 'cost_by_tree_size'})}",
-                  flush=True)
+        found = [(name, budget, figure)]
+        if name == "close_1g":
+            # write_1g: the same run's writes, held to its own bar.
+            derived = budgets["write_1g"]
+            found.append(("write_1g", derived,
+                          {"finished": figure["finished"], **figure.get("write_1g", {})}))
+        for shown, held, value in found:
+            warn = missed(value, held, args.filesystem)
+            workloads.append({**entry, "name": shown, "budget": held["text"], **value, "warn": warn})
+            print(f"{shown} on {args.filesystem}: {json.dumps(value)}", flush=True)
+            if warn:
+                print(f"::warning title=tree views, {args.filesystem}::{shown} misses its bar, "
+                      f"{held['text']}: {json.dumps({k: v for k, v in value.items() if k != 'cost_by_tree_size'})}",
+                      flush=True)
 
     report = {"build": args.build, "filesystem": args.filesystem, "image": args.image,
               "connection_aborted": aborted, "workloads": workloads}

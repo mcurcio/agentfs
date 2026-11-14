@@ -178,13 +178,13 @@ jobs:
   # and the release figures of its step 4, with the state area on a fresh
   # loop filesystem of each type (docs/performance.md, "Tree views, release
   # build"). Each workload has its own deadline (ci/trees-budget.json), so
-  # step 4 ends in about ten minutes whatever the figures; a missed bar is a
-  # warning only.
+  # step 4 ends in about fifteen minutes whatever the figures; a missed bar
+  # is a warning only.
   trees-tracer:
     name: e2e (tree views tracer in the image, ${{ matrix.fs }})
     needs: build
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:

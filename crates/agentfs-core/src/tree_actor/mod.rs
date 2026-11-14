@@ -46,20 +46,24 @@ use history::message::Message;
 use history::upstreams::Upstreams;
 use history::{check_objects, clean_packs, read_trees, refs, remove_stale_locks, sync_marker};
 pub use journal::durable::{Durability, DurableError, RecordNo};
+use journal::segment::FramePos;
 use journal::{
-    Change, CompactError, Entry, FoldedOpen, Journal, PointerChange, Record, Target, compact_at,
-    fold, objects_through,
+    Change, Entry, FoldedOpen, Journal, PointerChange, Record, Target, compact_at, fold,
+    objects_through,
 };
 use pointers::Pointers;
+pub use recording::FileMap;
+pub use recording::file_map::FileMapReader;
 use recording::{Handle, pages};
 use stages::Stages;
 use tree::{EventNumber, SavedTree};
 
-const FORMAT: &str = "agentfs-trees-7\n";
+const FORMAT: &str = "agentfs-trees-8\n";
 /// The volume identity file: [`VolumeIdentity`] as JSON, written once by
 /// [`TreeActor::create`], read before any write at every open.
 const IDENTITY: &str = "volume";
-const JOURNAL: &str = "calls.wal";
+/// The journal's directory of segments (`journal`).
+const JOURNAL: &str = "journal";
 /// The builder's built log (`history::built_log`).
 const BUILT_LOG: &str = "built.log";
 const INITIALIZING: &str = "initializing";
@@ -206,8 +210,13 @@ pub struct Metrics {
     pub queued: u64,
     /// Time and Git children by stage, process-wide (see [`stages`]).
     pub stages: Stages,
-    /// The journal file's length now: what a held open file keeps from compaction.
+    /// The journal's segments' bytes now: what a held open file keeps from compaction.
     pub journal_bytes: u64,
+    /// Segments compaction has dropped since open.
+    pub journal_dropped: u64,
+    /// Bytes compaction has copied forward since open: a live open's frames
+    /// that pinned more dead bytes than their own.
+    pub journal_carried_bytes: u64,
     /// History as built behind the call path.
     pub history: HistoryMetrics,
 }
@@ -304,6 +313,26 @@ fn sync_dir(root: &Path) -> io::Result<()> {
     File::open(root)?.sync_all()
 }
 
+/// Raises the soft limit on open files to the hard one, as the Go runtime
+/// does at start: each built file's map holds its checkout open
+/// (`recording::file_map::BaseFile`), one descriptor per non-empty file and
+/// tree. A refusal leaves the limit as it was.
+fn raise_open_files() {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit and setrlimit read and write only `limit`.
+    unsafe {
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut limit) == 0
+            && limit.rlim_cur < limit.rlim_max
+        {
+            limit.rlim_cur = limit.rlim_max;
+            let _ = libc::setrlimit(libc::RLIMIT_NOFILE, &raw const limit);
+        }
+    }
+}
+
 /// Writes `bytes` to `name` whole: a temporary file, fsynced, renamed into place.
 fn write_durably(root: &Path, name: &str, bytes: &[u8]) -> io::Result<()> {
     let temporary = root.join(format!("{name}.tmp"));
@@ -316,19 +345,12 @@ fn write_durably(root: &Path, name: &str, bytes: &[u8]) -> io::Result<()> {
 // Only a create deletes, and only under its own marker: a cut one holds
 // nothing a call returned for.
 fn clear_cut_create(root: &Path) -> io::Result<()> {
-    for dir in ["history.git", "trees"] {
+    for dir in ["history.git", "trees", JOURNAL] {
         if root.join(dir).exists() {
             fs::remove_dir_all(root.join(dir))?;
         }
     }
-    for file in [
-        JOURNAL,
-        BUILT_LOG,
-        "format",
-        "format.tmp",
-        IDENTITY,
-        "volume.tmp",
-    ] {
+    for file in [BUILT_LOG, "format", "format.tmp", IDENTITY, "volume.tmp"] {
         match fs::remove_file(root.join(file)) {
             Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
             _ => {}
@@ -416,6 +438,7 @@ impl TreeActor {
                     upstreams: BTreeMap::new(),
                     opens: Vec::new(),
                     page_saved: Vec::new(),
+                    page_writes: Vec::new(),
                     objects: BTreeMap::new(),
                 },
             },
@@ -473,12 +496,17 @@ impl TreeActor {
     /// Starts History and the builder at the built point the built log and the
     /// journal's checkpoint name, with every copy (refs, `config`, checkouts)
     /// rebuilt from it.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "what a start reads, passed through"
+    )]
     fn start_history(
         root: &Path,
         lock: &Arc<FileLock>,
         frames: &[journal::Frame],
         folded_built: RecordNo,
         durability: &Arc<Durability>,
+        salt: u32,
         identity: &VolumeIdentity,
         service: &PodContext,
     ) -> Result<(History, JoinHandle<()>, RecordNo)> {
@@ -504,20 +532,41 @@ impl TreeActor {
         let objects = if built > folded_built {
             let checkpoint = fold(&frames[..1])?;
             let at_checkpoint = resolve_pointers(&checkpoint.pointers, &values)?;
-            let shapes = read_trees(&repo, &at_checkpoint, &checkpoint.objects)?
-                .into_iter()
-                .map(|(tree, t)| (tree, t.shape))
-                .collect();
+            let shapes = read_trees(&repo, &at_checkpoint, &checkpoint.objects, |_, _, _| {
+                Ok(Arc::default())
+            })?
+            .into_iter()
+            .map(|(tree, t)| (tree, t.shape))
+            .collect();
             objects_through(shapes, &checkpoint, &frames[1..upto])?
         } else {
             at_built.objects.clone()
         };
-        let trees = read_trees(&repo, &pointers, &objects)?;
+        let checked_out = copy_all(&repo, root, &pointers, &at_built.upstreams)?;
+        // Each file reads from its checkout as built: a map of no frame.
+        let trees = read_trees(&repo, &pointers, &objects, |tree, _, path| {
+            let at = history::checkout_path(root, tree, path);
+            let len = fs::metadata(&at)?.len();
+            if len == 0 {
+                let mut map = FileMap::empty();
+                map.saved_at(built);
+                return Ok(Arc::new(map.into()));
+            }
+            let base = recording::file_map::BaseFile::open(&at, built, None)?;
+            Ok(Arc::new(FileMap::of_base(base, len).into()))
+        })?;
         at_built
             .upstreams
             .check_recovered(|fork| trees.contains_key(&fork))?;
         let owners = history::owners(&repo, &pointers)?;
-        let checked_out = copy_all(&repo, root, &pointers, &at_built.upstreams)?;
+        let maps: Vec<(TreeId, u64, FileMap)> = trees
+            .iter()
+            .flat_map(|(tree, t)| {
+                t.bytes
+                    .iter()
+                    .map(|(object, bytes)| (*tree, *object, (**bytes).clone()))
+            })
+            .collect();
         let heads = values
             .iter()
             .filter(|((_, name), _)| {
@@ -540,9 +589,10 @@ impl TreeActor {
             .collect();
         let history = History::new(repo, built, pointers.clone(), owners, objects);
         history.checkpointed(folded_built);
+        history.publish_maps(maps);
         let builder = Builder {
             state,
-            reader: JournalReader::open(&root.join(JOURNAL), built, durability.generation())?,
+            reader: JournalReader::open(Arc::clone(durability), salt, built)?,
             history: history.clone(),
             durability: Arc::clone(durability),
             built_log,
@@ -573,6 +623,7 @@ impl TreeActor {
         identity: VolumeIdentity,
         service: PodContext,
     ) -> Result<Self> {
+        raise_open_files();
         let (journal, frames) = Journal::open(&root.join(JOURNAL))?;
         let folded = fold(&frames)?;
         let (history, builder, built) = Self::start_history(
@@ -581,6 +632,7 @@ impl TreeActor {
             &frames,
             folded.built,
             journal.durability(),
+            journal.salt(),
             &identity,
             &service,
         )?;
@@ -608,7 +660,8 @@ impl TreeActor {
             touched: BTreeMap::new(),
             _lock: lock,
         };
-        // The saved state is history built through the journal's last record.
+        // The saved state is history built through the journal's last record:
+        // each file's map as the builder built it, the last published.
         volume.settle()?;
         let snapshot = volume.history.snapshot();
         volume.pointers = snapshot.pointers().to_targets();
@@ -616,10 +669,21 @@ impl TreeActor {
             snapshot.repo(),
             snapshot.pointers(),
             &snapshot.all_objects(),
+            |_, _, _| Ok(Arc::default()),
         )?
         .iter()
         .map(|(id, tree)| (*id, SavedTree::of(tree)))
         .collect();
+        let mut built_maps: BTreeMap<(TreeId, u64), FileMap> = BTreeMap::new();
+        for (tree, object, map) in volume.history.take_maps() {
+            built_maps.insert((tree, object), map);
+        }
+        for (id, tree) in &mut volume.trees {
+            for object in tree.shape.names.values() {
+                let map = built_maps.remove(&(*id, *object)).ok_or(Error::Format)?;
+                tree.bytes.insert(*object, map);
+            }
+        }
         for (handle, FoldedOpen { open, calls }) in folded.opens {
             let tree = volume.trees.get_mut(&open.tree).ok_or(Error::Format)?;
             if open.anonymous {
@@ -632,7 +696,7 @@ impl TreeActor {
                     by: open.by,
                     object: open.object,
                     // Nothing reads it: this handle closes before serving.
-                    bytes: Vec::new(),
+                    bytes: FileMap::empty(),
                     calls,
                     replayed: None,
                 },
@@ -654,10 +718,8 @@ impl TreeActor {
         }
         volume.metrics.queued = volume.pointers.under(refs::QUEUES).len() as u64;
         volume.settle()?;
-        match volume.compact() {
-            Ok(()) => {}
-            Err(e @ CompactError::Before(_)) => eprintln!("tree CompactionFailed: {e}"),
-            Err(CompactError::After(e)) => return Err(e.into()),
+        if let Err(e) = volume.compact() {
+            eprintln!("tree CompactionFailed: {e}");
         }
         volume.compact_threshold = compact_at(volume.journal.len());
         Ok(volume)
@@ -677,6 +739,7 @@ impl TreeActor {
         let mut metrics = self.metrics.clone();
         metrics.stages = Stages::current();
         metrics.journal_bytes = self.journal.len();
+        metrics.journal_carried_bytes = self.journal.carried();
         for since in self.waiting_since.values() {
             let nanos = u64::try_from(since.elapsed().as_nanos()).unwrap_or(u64::MAX);
             metrics.wait_nanos = metrics.wait_nanos.saturating_add(nanos);
@@ -739,7 +802,7 @@ impl TreeActor {
     /// [`Error::NotFound`] for no such open.
     pub fn durable_through(&self, open: u64) -> Result<RecordNo> {
         let h = self.handles.get(&open).ok_or(Error::NotFound)?;
-        let calls = h.calls.last().map_or(open, |(seq, _)| *seq);
+        let calls = h.calls.last().map_or(open, |(seq, _, _)| *seq);
         let pages = self.pages_last_write(h.tree, h.object).unwrap_or(open);
         Ok(RecordNo::new(open.max(calls).max(pages)))
     }
@@ -779,6 +842,7 @@ impl TreeActor {
                 upstream: upstream.to_string(),
             },
             pointers,
+            &[],
         )?;
         self.upstreams.add(seq, upstream);
         let mut tree = self.tree(upstream)?.clone();
@@ -901,20 +965,22 @@ impl TreeActor {
         pointers
     }
 
-    /// Appends one step: its record is the change's commit point. A failure
-    /// changes nothing and returns its errno. Then the builder is told; the
-    /// caller applies the change, which cannot fail, and calls `after_step`.
+    /// Appends one step, with `tail` (a take's files): its record is the
+    /// change's commit point. A failure changes nothing and returns its errno.
+    /// Then the builder is told; the caller applies the change, which cannot
+    /// fail, and calls `after_step`.
     fn record_step(
         &mut self,
         by: WriterAt,
         change: Change,
         pointers: Vec<PointerChange>,
-    ) -> Result<u64> {
+        tail: &[u8],
+    ) -> Result<(u64, FramePos)> {
         if self.is_stopped() {
             return Err(Error::Stopped);
         }
         let (tree, bytes) = self.build_cost(&change);
-        let recorded = (|| -> Result<u64> {
+        let recorded = (|| -> Result<(u64, FramePos)> {
             crate::failpoints::hit("tree.before_step")?;
             self.pointers.check_targets(&pointers)?;
             self.journal_record(
@@ -923,11 +989,11 @@ impl TreeActor {
                     change,
                     pointers: pointers.clone(),
                 },
-                &[],
+                tail,
             )
         })();
-        let seq = match recorded {
-            Ok(seq) => seq,
+        let (seq, pos) = match recorded {
+            Ok(recorded) => recorded,
             Err(e) => {
                 eprintln!("tree SaveFailed: {e}");
                 return Err(e);
@@ -940,7 +1006,35 @@ impl TreeActor {
             }
         }
         self.history.appended_step(RecordNo::new(seq), tree, bytes);
-        Ok(seq)
+        Ok((seq, pos))
+    }
+
+    /// Takes each map the builder built that is the same save as the actor's
+    /// (the same step): a map rebased onto its checkout lets go of the
+    /// journal segments it read. An open with no call of its own since that
+    /// save takes it too.
+    fn rebase_built(&mut self) {
+        for (tree, object, map) in self.history.take_maps() {
+            let Some(saved) = self
+                .trees
+                .get_mut(&tree)
+                .and_then(|t| t.bytes.get_mut(&object))
+            else {
+                continue;
+            };
+            if map.step().is_none() || saved.step() != map.step() || saved.len() != map.len() {
+                continue;
+            }
+            *saved = map.clone();
+            for handle in self.handles.values_mut() {
+                if handle.tree == tree
+                    && handle.object == object
+                    && handle.bytes.step() == map.step()
+                {
+                    handle.bytes = map.clone();
+                }
+            }
+        }
     }
 
     /// The tree a step's build works in, and about how many bytes it writes:
@@ -1033,10 +1127,40 @@ mod tests {
     /// Two folds that add up to the same, but for how their records name
     /// pointer values (a step's, or the oid it was built as): the same names.
     fn same_fold(a: &journal::Folded, b: &journal::Folded) {
-        assert_eq!(a.opens, b.opens);
+        // Carried frames sit elsewhere: compare what they hold.
+        type Opens = Vec<(u64, journal::LiveOpen, Vec<(u64, recording::Call, Vec<u8>)>)>;
+        let opens = |f: &journal::Folded| -> Opens {
+            f.opens
+                .iter()
+                .map(|(handle, o)| {
+                    let calls = o
+                        .calls
+                        .iter()
+                        .map(|(seq, call, pos)| {
+                            (*seq, call.clone(), pos.bytes(0, call.carried()).unwrap())
+                        })
+                        .collect();
+                    (*handle, o.open.clone(), calls)
+                })
+                .collect()
+        };
+        type Writes = Vec<((TreeId, u64), Vec<(u64, u64, Vec<u8>)>)>;
+        let writes = |f: &journal::Folded| -> Writes {
+            f.page_writes
+                .iter()
+                .map(|(key, runs)| {
+                    let runs = runs
+                        .iter()
+                        .map(|(seq, run)| (*seq, run.offset, run.at.bytes(0, run.len).unwrap()))
+                        .collect();
+                    (*key, runs)
+                })
+                .collect()
+        };
+        assert_eq!(opens(a), opens(b));
         assert_eq!(a.upstreams, b.upstreams);
         assert_eq!(a.next_seq, b.next_seq);
-        assert_eq!(a.page_writes, b.page_writes);
+        assert_eq!(writes(a), writes(b));
         assert_eq!(a.saved_through, b.saved_through);
         let names = |f: &journal::Folded| -> Vec<String> {
             f.pointers.iter().map(|(n, _)| n.clone()).collect()
@@ -1068,7 +1192,7 @@ mod tests {
         v.record_page_write(
             ROOT,
             closed_object,
-            &[pages::Run {
+            &[pages::Changed {
                 offset: 0,
                 bytes: b"gone".to_vec(),
             }],
@@ -1083,7 +1207,8 @@ mod tests {
         assert_eq!(folded.opens[&held].calls.len(), 1);
         assert!(folded.opens[&anonymous].open.anonymous);
         assert_eq!(folded.upstreams.upstream_of(fork), Some(ROOT));
-        assert_eq!(folded.page_writes[&(ROOT, object)][0].1.bytes, b"WXYZ");
+        let run = &folded.page_writes[&(ROOT, object)][0].1;
+        assert_eq!(run.at.bytes(0, run.len).unwrap(), b"WXYZ");
         assert!(folded.saved_through.contains_key(&(ROOT, object)));
         assert!(!folded.page_writes.contains_key(&(ROOT, closed_object)));
         assert_eq!(folded.next_seq, v.next);
@@ -1164,7 +1289,7 @@ mod tests {
             panic!("the first frame is a checkpoint");
         };
         edit(pointers, upstreams);
-        fs::remove_file(tmp.path().join(JOURNAL)).unwrap();
+        fs::remove_dir_all(tmp.path().join(JOURNAL)).unwrap();
         Journal::create(&tmp.path().join(JOURNAL), &first).unwrap();
         TreeActor::open(tmp.path(), &PodContext::default())
     }
@@ -1211,6 +1336,7 @@ mod tests {
             "agentfs-trees-3\n",
             "agentfs-trees-4\n",
             "agentfs-trees-5\n",
+            "agentfs-trees-7\n",
         ] {
             let tmp = tempfile::tempdir().unwrap();
             drop(new_actor(tmp.path()));

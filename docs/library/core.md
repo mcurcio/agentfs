@@ -661,7 +661,11 @@ pod context, which the commit carries ([trees](../trees.md#volume-identity-and-t
 tree with no upstream, or `fork/<n>`, made at journal event `n`. `trees()`
 lists them, the root first and then the forks by number; `TreeId` parses from
 and prints as that text. `fork()` makes a fork of the root and returns its
-`TreeId`, `read` and `files` read saved bytes, and `take_next` and `progress`
+`TreeId`, `read` reads a saved file whole into memory and `files` lists them;
+`file_map` gives a saved file as a `FileMap` (its pieces in the journal and the
+checkout as built, never bytes in memory), which a reader reads with
+`FileMap::read` or `reader` with the actor unlocked and keeps across later
+saves, and `read_open` gives a write-open's; `take_next` and `progress`
 move queued changes between a tree and its upstream. `drain_changed` returns
 the objects queue takes changed, each with its `TreeId`. A close that leaves
 the bytes as they were commits nothing. `Error::errno()` maps each error to the errno a file call answers

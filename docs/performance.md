@@ -262,7 +262,7 @@ mode have differed by up to 2 times, so read a figure as one observation.
 | Measurement | Result |
 |---|---|
 | Journal call cost against plain FUSE | 1,000 `pwrite` calls of 8 bytes at offset 0 on one open descriptor. Plain FUSE (`bindfs -o direct_io`): median 27.0 µs, p99 53.1 µs. Recording mount: median 352.1 µs, p99 607.0 µs. Wall time around the syscall, including FUSE and the journal's `fsync` |
-| One hour of journal growth | 501,785 bytes over 3,600 s: 3,592 eight-byte `pwrite` calls (28,736 payload bytes), a pause of one second after each. Logical growth of `calls.wal` |
+| One hour of journal growth | 501,785 bytes over 3,600 s: 3,592 eight-byte `pwrite` calls (28,736 payload bytes), a pause of one second after each. Logical growth of the journal |
 | Line map, 10,000 one-line saves | `metadata.json` 195,687 bytes (19.6 a save). The snapshots are 961,003,746 bytes logical and 241,338,078 as git objects (10,000 distinct blobs). The commits are 3,615,564 bytes logical and 2,251,085 on disk. The repository is 245,688,644 bytes of files and 425,779,200 allocated, with 164 refs. The journal is 15,044,086 bytes after 10,001 saves (1,504 a save). The run took 2,560.9 s and started 390,047 git children (39 a save) |
 | Save and take, 1 MiB | Write and close 23.3 ms; actor save 272.9 ms; landing 337.3 ms, of which the sync back is 5.2 ms; both views and an empty queue after 1.27 s |
 | Save and take, 100 MiB | Write and close 31.9 s; actor save 25.6 s; landing 288.2 s, of which the sync back is 0.14 s; both views and an empty queue after 339.1 s |
@@ -310,7 +310,7 @@ of its measured parts.
 
 ## Tree views, release build
 
-The `image` workflow runs three flat workloads through a tree view of the
+The `image` workflow runs four flat workloads through a tree view of the
 built image, on its release build, with the state area on a fresh loop
 filesystem: once on ext4 and once on XFS (`ci/e2e-trees-tracer.sh
 --figures`, driving `ci/trees-figures.py`). Each figure is held to the
@@ -322,6 +322,11 @@ warning and never fails the job.
 | `close_4k` | Rewrites and closes a 4 KiB file 200 times | 60 s | p50 3.5 ms, finished |
 | `create` | Creates one-line files in the root, up to 50,000 | 300 s | 50,000 created: the engine's 100,000 in 600 s, over half the time |
 | `close_64m` | Writes a 64 MiB file in 1 MiB blocks and closes it | 120 s | The engine's close of a dirty 1 GiB file (12 s on ext4, 8 s on XFS), unscaled |
+| `close_1g` | Writes a 1 GiB file in 1 MiB blocks; times the close and `stat` alone | 300 s | The engine's close of a dirty 1 GiB file: 12 s on ext4, 8 s on XFS |
+| `write_1g` | The same run's last 64 writes, against 32 files of 1 MiB written in one write each | 300 s | Median within 1.5 times a 1 MiB file's write |
+
+`close_1g` also reports its total, and `carried_bytes`: what compaction copied
+forward from the close's start to its end (read from `--metrics-output`).
 
 - **Each save is timed to its record.** Every timed save ends with a
   `stat` of the file. The view saves a file on the kernel's release, which

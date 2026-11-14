@@ -21,39 +21,65 @@
 //! Read-only descriptors keep their snapshot (R1.1). Writable descriptors read
 //! their own calls plus the file's page writes (R1.3): the kernel cannot say
 //! whose store a page holds. Nothing here is durable except the [`Run`]s in the
-//! journal's page-write records; bases and image die with the kernel's pages.
+//! journal's page-write records, which the image and the views read from
+//! their frames; bases die with the kernel's pages.
 
 use std::collections::BTreeMap;
 
-use serde::{Deserialize, Serialize};
-
-use super::{Call, Handle};
+use super::{Call, FileMap, Handle};
+use crate::tree_actor::journal::durable::RecordNo;
+use crate::tree_actor::journal::segment::FramePos;
 use crate::tree_actor::{Error, Result, TreeActor, TreeId};
 
 /// The bases' unit. Every kernel page size is a multiple of it, so a base map at
 /// this size is exact whatever the kernel's own page size is.
 const PAGE: u64 = 4096;
 
-/// One contiguous run of bytes a page write changed, in file offsets.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(in crate::tree_actor) struct Run {
+/// A run of bytes a page write changed, before it is recorded.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(in crate::tree_actor) struct Changed {
     pub offset: u64,
     pub bytes: Vec<u8>,
 }
 
-impl Run {
+impl Changed {
     fn end(&self) -> u64 {
         self.offset.saturating_add(self.bytes.len() as u64)
     }
+}
 
-    /// Lays the run over `target`. `page_writeback` has checked the offsets.
-    fn overlay(&self, target: &mut Vec<u8>) {
-        let start = self.offset as usize;
-        let end = start + self.bytes.len();
-        if target.len() < end {
-            target.resize(end, 0);
+/// One contiguous run of bytes a page write changed, in file offsets, and
+/// where its bytes are in the page write's frame.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(in crate::tree_actor) struct Run {
+    pub offset: u64,
+    pub len: u64,
+    pub at: FramePos,
+}
+
+impl Run {
+    fn end(&self) -> u64 {
+        self.offset.saturating_add(self.len)
+    }
+
+    /// The run's part `start..end` (file offsets inside it).
+    fn part(&self, start: u64, end: u64) -> Self {
+        Self {
+            offset: start,
+            len: end - start,
+            at: self.at.at(start - self.offset),
         }
-        target[start..end].copy_from_slice(&self.bytes);
+    }
+
+    /// The run as the write it is.
+    fn call(&self) -> (Call, FramePos) {
+        (
+            Call::Write {
+                offset: self.offset,
+                len: self.len,
+            },
+            self.at.clone(),
+        )
     }
 }
 
@@ -64,7 +90,7 @@ pub(in crate::tree_actor) struct ObjectPages {
     /// Arrival-order length, kept from the first write-open by arithmetic.
     len: u64,
     /// Cache: built at the first fill or page write, dropped at each save.
-    image: Option<Vec<u8>>,
+    image: Option<FileMap>,
     /// Page number to the bytes last filled or written back. Memory only.
     bases: BTreeMap<u64, Vec<u8>>,
     /// The file's page writes with journal numbers, until the state drops.
@@ -76,8 +102,8 @@ pub(in crate::tree_actor) struct ObjectPages {
 /// The runs of `page`, which starts at file offset `at`, that differ from
 /// `base`. Bytes past the end of `base` compare with zero, which is what the
 /// kernel fills a page's tail with. Pure; adjacent changed bytes make one run.
-pub(in crate::tree_actor) fn changed_runs(base: &[u8], page: &[u8], at: u64) -> Vec<Run> {
-    let mut runs: Vec<Run> = Vec::new();
+pub(in crate::tree_actor) fn changed_runs(base: &[u8], page: &[u8], at: u64) -> Vec<Changed> {
+    let mut runs: Vec<Changed> = Vec::new();
     for (index, byte) in page.iter().enumerate() {
         if *byte == base.get(index).copied().unwrap_or(0) {
             continue;
@@ -85,7 +111,7 @@ pub(in crate::tree_actor) fn changed_runs(base: &[u8], page: &[u8], at: u64) -> 
         let offset = at + index as u64;
         match runs.last_mut() {
             Some(run) if run.end() == offset => run.bytes.push(*byte),
-            _ => runs.push(Run {
+            _ => runs.push(Changed {
                 offset,
                 bytes: vec![*byte],
             }),
@@ -96,43 +122,23 @@ pub(in crate::tree_actor) fn changed_runs(base: &[u8], page: &[u8], at: u64) -> 
 
 /// The length after `call`, by arithmetic.
 fn len_after(len: u64, call: &Call) -> u64 {
-    match call {
-        Call::Write { bytes, .. } if bytes.is_empty() => len,
-        Call::Write { offset, bytes } => len.max(offset.saturating_add(bytes.len() as u64)),
-        Call::Append(bytes) => len.saturating_add(bytes.len() as u64),
-        Call::Truncate(size) => *size,
-    }
-}
-
-/// The range `call` touches over a file `len` bytes long: an append's at
-/// replay, a truncate's from its size up.
-fn touched_by(len: u64, call: &Call) -> Option<(u64, u64)> {
-    match call {
-        Call::Write { bytes, .. } if bytes.is_empty() => None,
-        Call::Write { offset, bytes } => Some((*offset, offset.saturating_add(bytes.len() as u64))),
-        Call::Append(bytes) => Some((len, len.saturating_add(bytes.len() as u64))),
-        Call::Truncate(size) => Some((*size, u64::MAX)),
-    }
+    call.len_after(len).unwrap_or(u64::MAX)
 }
 
 /// The parts of `run` inside `touched`, in file order.
-fn over_touched(run: &Run, touched: &[(u64, u64)]) -> Vec<Run> {
+fn over_touched(run: &Run, touched: &[std::ops::Range<u64>]) -> Vec<Run> {
     let mut ranges = touched.to_vec();
-    ranges.sort_unstable();
+    ranges.sort_unstable_by_key(|r| (r.start, r.end));
     let mut pieces: Vec<Run> = Vec::new();
     let mut from = run.offset;
-    for (start, end) in ranges {
-        let (start, end) = (start.max(from), end.min(run.end()));
+    for range in ranges {
+        let (start, end) = (range.start.max(from), range.end.min(run.end()));
         if start >= end {
             continue;
         }
-        let bytes = &run.bytes[(start - run.offset) as usize..(end - run.offset) as usize];
         match pieces.last_mut() {
-            Some(piece) if piece.end() == start => piece.bytes.extend_from_slice(bytes),
-            _ => pieces.push(Run {
-                offset: start,
-                bytes: bytes.to_vec(),
-            }),
+            Some(piece) if piece.end() == start => piece.len += end - start,
+            _ => pieces.push(run.part(start, end)),
         }
         from = end;
     }
@@ -147,11 +153,11 @@ fn over_touched(run: &Run, touched: &[(u64, u64)]) -> Vec<Run> {
 /// R9.16's note: a later mapped write stands against a later close). Pure.
 pub(in crate::tree_actor) fn close_pieces(
     saved_len: u64,
-    own: &[(u64, Call)],
+    own: &[(u64, Call, FramePos)],
     writes: &[(u64, Run)],
     saved_through: u64,
 ) -> Vec<(u64, Run)> {
-    let first_call = own.first().map(|(seq, _)| *seq);
+    let first_call = own.first().map(|(seq, _, _)| *seq);
     let mut chosen = Vec::new();
     let mut len = saved_len;
     let mut touched = Vec::new();
@@ -162,13 +168,13 @@ pub(in crate::tree_actor) fn close_pieces(
             (None, None) => return chosen,
             (Some(_), None) => true,
             (None, Some(_)) => false,
-            (Some((call, _)), Some((write, _))) => call < write,
+            (Some((call, _, _)), Some((write, _))) => call < write,
         };
         if call_first {
-            let Some((_, call)) = own.next() else {
+            let Some((_, call, _)) = own.next() else {
                 return chosen;
             };
-            touched.extend(touched_by(len, call));
+            touched.extend(call.touched(len));
             len = len_after(len, call);
             continue;
         }
@@ -189,10 +195,14 @@ pub(in crate::tree_actor) fn close_pieces(
     }
 }
 
-/// The calls a close applies, in journal order: the open's own calls merged
-/// with the page-write pieces [`close_pieces`] chose. The actor and the
-/// builder both run this, then [`Call::apply`]. Pure.
-pub(in crate::tree_actor) fn close_calls(own: &[(u64, Call)], pieces: &[(u64, Run)]) -> Vec<Call> {
+/// The calls a close applies, in journal order, each with where its bytes
+/// are: the open's own calls merged with the page-write pieces
+/// [`close_pieces`] chose. The actor and the builder both run this, then
+/// [`FileMap::apply`]. Pure.
+pub(in crate::tree_actor) fn close_calls(
+    own: &[(u64, Call, FramePos)],
+    pieces: &[(u64, Run)],
+) -> Vec<(Call, FramePos)> {
     let mut calls = Vec::with_capacity(own.len() + pieces.len());
     let mut own = own.iter().peekable();
     let mut pieces = pieces.iter().peekable();
@@ -201,17 +211,14 @@ pub(in crate::tree_actor) fn close_calls(own: &[(u64, Call)], pieces: &[(u64, Ru
             (None, None) => return calls,
             (Some(_), None) => true,
             (None, Some(_)) => false,
-            (Some((call, _)), Some((write, _))) => call < write,
+            (Some((call, _, _)), Some((write, _))) => call < write,
         };
         if call_first {
-            if let Some((_, call)) = own.next() {
-                calls.push(call.clone());
+            if let Some((_, call, pos)) = own.next() {
+                calls.push((call.clone(), pos.clone()));
             }
         } else if let Some((_, piece)) = pieces.next() {
-            calls.push(Call::Write {
-                offset: piece.offset,
-                bytes: piece.bytes.clone(),
-            });
+            calls.push(piece.call());
         }
     }
 }
@@ -220,23 +227,19 @@ pub(in crate::tree_actor) fn close_calls(own: &[(u64, Call)], pieces: &[(u64, Ru
 /// over [`close_pieces`]. The same function live and at recovery.
 pub(in crate::tree_actor) fn calls_for_close(
     saved_len: u64,
-    own: &[(u64, Call)],
+    own: &[(u64, Call, FramePos)],
     writes: &[(u64, Run)],
     saved_through: u64,
-) -> Vec<Call> {
+) -> Vec<(Call, FramePos)> {
     close_calls(own, &close_pieces(saved_len, own, writes, saved_through))
 }
 
-/// A piece's bytes, from its page write's runs: the run that holds the
-/// range. `None` when no run does (the record is not that write).
+/// A piece of a page write, from its runs: the part of the run that holds
+/// the range. `None` when no run does (the record is not that write).
 pub(in crate::tree_actor) fn resolve_piece(runs: &[Run], offset: u64, len: u64) -> Option<Run> {
     let end = offset.checked_add(len)?;
-    runs.iter().find_map(|run| {
-        (run.offset <= offset && end <= run.end()).then(|| Run {
-            offset,
-            bytes: run.bytes[(offset - run.offset) as usize..(end - run.offset) as usize].to_vec(),
-        })
-    })
+    runs.iter()
+        .find_map(|run| (run.offset <= offset && end <= run.end()).then(|| run.part(offset, end)))
 }
 
 impl TreeActor {
@@ -258,18 +261,16 @@ impl TreeActor {
         let key = (tree, object);
         if !self.pages.contains_key(&key) {
             let saved = self.tree(tree)?.bytes.get(&object).ok_or(Error::NotFound)?;
-            return Ok(slice_at(saved, offset, size).to_vec());
+            return read_at(saved, offset, size as u64);
         }
         self.pages_build_image(&key)?;
         let state = self.pages.get_mut(&key).ok_or(Error::NotFound)?;
-        let image = state.image.as_deref().ok_or(Error::NotFound)?;
-        let bytes = slice_at(image, offset, size).to_vec();
+        let image = state.image.as_ref().ok_or(Error::NotFound)?;
+        let bytes = read_at(image, offset, size as u64)?;
         if !bytes.is_empty() {
             let last = (offset + bytes.len() as u64 - 1) / PAGE;
             for page in offset / PAGE..=last {
-                state
-                    .bases
-                    .insert(page, slice_at(image, page * PAGE, PAGE as u32).to_vec());
+                state.bases.insert(page, read_at(image, page * PAGE, PAGE)?);
             }
         }
         Ok(bytes)
@@ -290,12 +291,12 @@ impl TreeActor {
         let key = (h.tree, h.object);
         let end = offset
             .checked_add(bytes.len() as u64)
-            .filter(|end| usize::try_from(*end).is_ok())
+            .filter(|end| i64::try_from(*end).is_ok())
             .ok_or(Error::TooLarge)?;
         self.pages_build_image(&key)?;
         let state = self.pages.get(&key).ok_or(Error::NotFound)?;
-        let image = state.image.as_deref().ok_or(Error::NotFound)?;
-        let mut runs = Vec::new();
+        let image = state.image.as_ref().ok_or(Error::NotFound)?;
+        let mut changed = Vec::new();
         let mut bases = Vec::new();
         let mut at = offset;
         while at < end {
@@ -303,12 +304,11 @@ impl TreeActor {
             let within = (at - page * PAGE) as usize;
             let stop = end.min((page + 1) * PAGE);
             let chunk = &bytes[(at - offset) as usize..(stop - offset) as usize];
-            let mut base = state
-                .bases
-                .get(&page)
-                .cloned()
-                .unwrap_or_else(|| slice_at(image, page * PAGE, PAGE as u32).to_vec());
-            runs.extend(changed_runs(
+            let mut base = match state.bases.get(&page) {
+                Some(base) => base.clone(),
+                None => read_at(image, page * PAGE, PAGE)?,
+            };
+            changed.extend(changed_runs(
                 base.get(within..).unwrap_or_default(),
                 chunk,
                 at,
@@ -320,28 +320,43 @@ impl TreeActor {
             bases.push((page, base));
             at = stop;
         }
-        let seq = if runs.is_empty() {
+        let recorded = if changed.is_empty() {
             None
         } else {
-            Some(self.record_page_write(key.0, key.1, &runs)?)
+            Some(self.record_page_write(key.0, key.1, &changed)?)
         };
-        // On record, so memory follows. Nothing below can fail.
+        let mut runs = Vec::with_capacity(changed.len());
+        if let Some((_, pos)) = &recorded {
+            let mut tail = 0;
+            for run in &changed {
+                runs.push(Run {
+                    offset: run.offset,
+                    len: run.bytes.len() as u64,
+                    at: pos.at(tail),
+                });
+                tail += run.bytes.len() as u64;
+            }
+        }
+        // On record, so memory follows. Nothing below can fail: each run was
+        // checked against `i64` above.
         for handle in self
             .handles
             .values_mut()
             .filter(|h| h.tree == key.0 && h.object == key.1)
         {
             for run in &runs {
-                run.overlay(&mut handle.bytes);
+                let (call, pos) = run.call();
+                let _ = handle.bytes.apply(&call, &pos);
             }
         }
         let state = self.pages.get_mut(&key).ok_or(Error::NotFound)?;
         state.bases.extend(bases);
-        if let Some(seq) = seq {
+        if let Some((seq, _)) = recorded {
             for run in runs {
                 state.len = state.len.max(run.end());
                 if let Some(image) = &mut state.image {
-                    run.overlay(image);
+                    let (call, pos) = run.call();
+                    let _ = image.apply(&call, &pos);
                 }
                 state.writes.push((seq, run));
             }
@@ -374,24 +389,24 @@ impl TreeActor {
         std::mem::take(&mut self.changed)
     }
 
-    /// Builds the image if it has none: saved bytes plus every live open's calls
-    /// and the file's page writes, by the one close rule.
+    /// Builds the image if it has none: the saved map plus every live open's
+    /// calls and the file's page writes, by the one close rule.
     fn pages_build_image(&mut self, key: &(TreeId, u64)) -> Result<()> {
         let state = self.pages.get(key).ok_or(Error::NotFound)?;
         if state.image.is_some() {
             return Ok(());
         }
         let saved = self.tree(key.0)?.bytes.get(&key.1).ok_or(Error::NotFound)?;
-        let mut own: Vec<(u64, Call)> = self
+        let mut own: Vec<(u64, Call, FramePos)> = self
             .handles
             .values()
             .filter(|h| h.tree == key.0 && h.object == key.1)
             .flat_map(|h| h.calls.iter().cloned())
             .collect();
-        own.sort_by_key(|(seq, _)| *seq);
-        let mut image = saved.to_vec();
-        for call in calls_for_close(saved.len() as u64, &own, &state.writes, state.saved_through) {
-            call.apply(&mut image)?;
+        own.sort_by_key(|(seq, _, _)| *seq);
+        let mut image = saved.clone();
+        for (call, pos) in calls_for_close(saved.len(), &own, &state.writes, state.saved_through) {
+            image.apply(&call, &pos)?;
         }
         if let Some(state) = self.pages.get_mut(key) {
             state.image = Some(image);
@@ -409,7 +424,7 @@ impl TreeActor {
                 .trees
                 .get(&tree)
                 .and_then(|t| t.bytes.get(&object))
-                .map_or(0, |bytes| bytes.len() as u64);
+                .map_or(0, FileMap::len);
             self.pages.insert(
                 key,
                 ObjectPages {
@@ -430,22 +445,25 @@ impl TreeActor {
                 .iter()
                 .filter(|(seq, _)| *seq > state.saved_through)
             {
-                run.overlay(&mut newest.bytes);
+                let (call, pos) = run.call();
+                let _ = newest.bytes.apply(&call, &pos);
             }
         }
     }
 
-    /// Hook: a descriptor call on `object` is in the journal. No I/O.
+    /// Hook: a descriptor call on `object` is in the journal, its bytes at
+    /// `pos`. No I/O.
     pub(in crate::tree_actor) fn pages_note_call(
         &mut self,
         tree: TreeId,
         object: u64,
         call: &Call,
+        pos: &FramePos,
     ) {
         if let Some(state) = self.pages.get_mut(&(tree, object)) {
             state.len = len_after(state.len, call);
             if let Some(image) = &mut state.image
-                && call.apply(image).is_err()
+                && image.apply(call, pos).is_err()
             {
                 state.image = None;
             }
@@ -460,7 +478,7 @@ impl TreeActor {
             .trees
             .get(&closing.tree)
             .and_then(|t| t.bytes.get(&closing.object))
-            .map_or(0, |bytes| bytes.len() as u64);
+            .map_or(0, FileMap::len);
         match self.pages.get(&(closing.tree, closing.object)) {
             Some(state) => close_pieces(
                 saved_len,
@@ -502,6 +520,19 @@ impl TreeActor {
             .collect()
     }
 
+    /// Every page write memory holds, in record order: what a checkpoint
+    /// names for recovery to read from the segments before it.
+    pub(in crate::tree_actor) fn pages_held(&self) -> Vec<RecordNo> {
+        let mut held: Vec<RecordNo> = self
+            .pages
+            .values()
+            .flat_map(|state| state.writes.iter().map(|(seq, _)| RecordNo::new(*seq)))
+            .collect();
+        held.sort_unstable();
+        held.dedup();
+        held
+    }
+
     /// Hook: recovery found these page writes and this `saved_through` for a
     /// file with a live write-open, before its closes run. No I/O.
     pub(in crate::tree_actor) fn pages_restore(
@@ -533,39 +564,82 @@ pub(in crate::tree_actor) fn holds(
     })
 }
 
-/// Up to `size` bytes of `bytes` from `offset`, short at the end.
-fn slice_at(bytes: &[u8], offset: u64, size: u32) -> &[u8] {
-    let start = usize::try_from(offset)
-        .unwrap_or(usize::MAX)
-        .min(bytes.len());
-    let end = start.saturating_add(size as usize).min(bytes.len());
-    &bytes[start..end]
+/// Up to `size` bytes of `map` from `offset`, short at the end.
+fn read_at(map: &FileMap, offset: u64, size: u64) -> Result<Vec<u8>> {
+    let size = size.min(map.len().saturating_sub(offset));
+    let mut bytes = vec![0; usize::try_from(size).map_err(|_| Error::TooLarge)?];
+    let read = map.read(offset, &mut bytes)?;
+    bytes.truncate(read);
+    Ok(bytes)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tree_actor::journal::segment::Scratch;
 
-    fn run(offset: u64, bytes: &[u8]) -> Run {
-        Run {
-            offset,
-            bytes: bytes.to_vec(),
+    struct T {
+        frames: Scratch,
+    }
+
+    impl T {
+        fn new() -> Self {
+            Self {
+                frames: Scratch::new(),
+            }
+        }
+
+        fn run(&mut self, offset: u64, bytes: &[u8]) -> Run {
+            Run {
+                offset,
+                len: bytes.len() as u64,
+                at: self.frames.add(bytes),
+            }
+        }
+
+        fn write(&mut self, seq: u64, offset: u64, bytes: &[u8]) -> (u64, Call, FramePos) {
+            (
+                seq,
+                Call::Write {
+                    offset,
+                    len: bytes.len() as u64,
+                },
+                self.frames.add(bytes),
+            )
+        }
+
+        fn append(&mut self, seq: u64, bytes: &[u8]) -> (u64, Call, FramePos) {
+            (
+                seq,
+                Call::Append {
+                    len: bytes.len() as u64,
+                },
+                self.frames.add(bytes),
+            )
+        }
+
+        fn truncate(&mut self, seq: u64, size: u64) -> (u64, Call, FramePos) {
+            (seq, Call::Truncate(size), self.frames.add(b""))
+        }
+
+        fn map(&mut self, bytes: &[u8]) -> FileMap {
+            let mut map = FileMap::empty();
+            map.apply(
+                &Call::Append {
+                    len: bytes.len() as u64,
+                },
+                &self.frames.add(bytes),
+            )
+            .unwrap();
+            map
         }
     }
 
-    fn write(offset: u64, bytes: &[u8]) -> Call {
-        Call::Write {
-            offset,
-            bytes: bytes.to_vec(),
+    fn replay(mut map: FileMap, calls: &[(Call, FramePos)]) -> Vec<u8> {
+        for (call, pos) in calls {
+            map.apply(call, pos).unwrap();
         }
-    }
-
-    fn replay(seed: &[u8], calls: &[Call]) -> Vec<u8> {
-        let mut bytes = seed.to_vec();
-        for call in calls {
-            call.apply(&mut bytes).unwrap();
-        }
-        bytes
+        map.to_vec().unwrap()
     }
 
     #[test]
@@ -591,7 +665,13 @@ mod tests {
             (b"abcdefgh", b"abX", 0, &[(2, b"X")]),
         ];
         for (base, page, at, expected) in cases {
-            let expected: Vec<Run> = expected.iter().map(|(o, b)| run(*o, b)).collect();
+            let expected: Vec<Changed> = expected
+                .iter()
+                .map(|(o, b)| Changed {
+                    offset: *o,
+                    bytes: b.to_vec(),
+                })
+                .collect();
             assert_eq!(changed_runs(base, page, *at), expected, "{page:?}");
         }
     }
@@ -599,10 +679,11 @@ mod tests {
     #[test]
     fn calls_for_close_table() {
         const SEED: &[u8] = b"abcdefgh";
+        let mut t = T::new();
         // (saved, own, writes, saved_through, resulting bytes, why)
         type Case<'a> = (
             &'a [u8],
-            Vec<(u64, Call)>,
+            Vec<(u64, Call, FramePos)>,
             Vec<(u64, Run)>,
             u64,
             &'a [u8],
@@ -612,7 +693,7 @@ mod tests {
             (SEED, vec![], vec![], 0, SEED, "nothing"),
             (
                 SEED,
-                vec![(1, write(0, b"WX"))],
+                vec![t.write(1, 0, b"WX")],
                 vec![],
                 0,
                 b"WXcdefgh",
@@ -621,87 +702,87 @@ mod tests {
             (
                 SEED,
                 vec![],
-                vec![(1, run(2, b"12"))],
+                vec![(1, t.run(2, b"12"))],
                 0,
                 b"ab12efgh",
                 "a page write not saved yet, whatever handle closes",
             ),
             (
                 SEED,
-                vec![(1, write(0, b"WXYZ")), (3, write(2, b"!"))],
-                vec![(2, run(2, b"12"))],
+                vec![t.write(1, 0, b"WXYZ"), t.write(3, 2, b"!")],
+                vec![(2, t.run(2, b"12"))],
                 0,
                 b"WX!2efgh",
                 "merged by journal number",
             ),
             (
                 b"ab12efgh",
-                vec![(1, Call::Truncate(1))],
-                vec![(2, run(0, b"Q"))],
+                vec![t.truncate(1, 1)],
+                vec![(2, t.run(0, b"Q"))],
                 3,
                 b"a",
                 "a saved store under a truncate's size stays out",
             ),
             (
                 b"12cdefgh",
-                vec![(1, write(0, b"WXYZ"))],
-                vec![(2, run(0, b"12"))],
+                vec![t.write(1, 0, b"WXYZ")],
+                vec![(2, t.run(0, b"12"))],
                 3,
                 b"12YZefgh",
                 "third clause: a saved store over bytes this open wrote",
             ),
             (
                 b"WXcdefgh",
-                vec![(1, write(7, b"Q"))],
-                vec![(2, run(0, b"12"))],
+                vec![t.write(1, 7, b"Q")],
+                vec![(2, t.run(0, b"12"))],
                 4,
                 b"WXcdefgQ",
                 "third clause: a saved store touching none of this open's bytes",
             ),
             (
                 b"12cdefgh",
-                vec![(5, write(0, b"WXYZ"))],
-                vec![(2, run(0, b"12"))],
+                vec![t.write(5, 0, b"WXYZ")],
+                vec![(2, t.run(0, b"12"))],
                 3,
                 b"WXYZefgh",
                 "a saved store older than this open's first call stays older",
             ),
             (
                 b"abcd12",
-                vec![(1, Call::Append(b"XY".to_vec()))],
-                vec![(2, run(4, b"12"))],
+                vec![t.append(1, b"XY")],
+                vec![(2, t.run(4, b"12"))],
                 3,
                 b"abcd12XY",
                 "an append's range is its place at replay, past the saved store",
             ),
             (
                 b"abcd",
-                vec![(1, Call::Append(b"XY".to_vec()))],
-                vec![(2, run(4, b"12"))],
+                vec![t.append(1, b"XY")],
+                vec![(2, t.run(4, b"12"))],
                 3,
                 b"abcd12",
                 "a saved store over the bytes an append wrote at replay",
             ),
             (
                 b"abcd",
-                vec![(1, Call::Append(b"XY".to_vec()))],
-                vec![(2, run(4, b"12"))],
+                vec![t.append(1, b"XY")],
+                vec![(2, t.run(4, b"12"))],
                 0,
                 b"abcd12",
                 "above saved_through the store is whole, after the append",
             ),
             (
                 b"abcdef",
-                vec![(1, Call::Truncate(2))],
-                vec![(2, run(3, b"99"))],
+                vec![t.truncate(1, 2)],
+                vec![(2, t.run(3, b"99"))],
                 3,
                 b"ab\0\x39\x39",
                 "a truncate touches from its size up, so a saved store above it returns",
             ),
             (
                 b"abcdef",
-                vec![(1, write(1, b"XX")), (4, write(5, b"YY"))],
-                vec![(2, run(0, b"12345678")), (6, run(6, b"Z"))],
+                vec![t.write(1, 1, b"XX"), t.write(4, 5, b"YY")],
+                vec![(2, t.run(0, b"12345678")), (6, t.run(6, b"Z"))],
                 3,
                 b"a23deYZ",
                 "several pieces and a later whole write",
@@ -709,33 +790,40 @@ mod tests {
         ];
         for (saved, own, writes, saved_through, expected, why) in cases {
             let calls = calls_for_close(saved.len() as u64, &own, &writes, saved_through);
-            assert_eq!(replay(saved, &calls), expected, "{why}");
+            let map = t.map(saved);
+            assert_eq!(replay(map, &calls), expected, "{why}");
         }
     }
 
     #[test]
     fn over_touched_keeps_only_the_overlap_once() {
-        let store = run(4, b"abcdef");
-        let touched = [(0, 5), (4, 6), (8, u64::MAX)];
-        assert_eq!(
-            over_touched(&store, &touched),
-            vec![run(4, b"ab"), run(8, b"ef")]
-        );
-        assert!(over_touched(&store, &[(0, 4), (10, 12)]).is_empty());
+        let mut t = T::new();
+        let store = t.run(4, b"abcdef");
+        let touched = [0..5, 4..6, 8..u64::MAX];
+        let pieces = over_touched(&store, &touched);
+        let read: Vec<(u64, Vec<u8>)> = pieces
+            .iter()
+            .map(|p| (p.offset, p.at.bytes(0, p.len).unwrap()))
+            .collect();
+        assert_eq!(read, vec![(4, b"ab".to_vec()), (8, b"ef".to_vec())]);
+        assert!(over_touched(&store, &[0..4, 10..12]).is_empty());
     }
 
     #[test]
-    fn slices_are_short_at_the_end() {
-        assert_eq!(slice_at(b"abc", 1, 9), b"bc");
-        assert_eq!(slice_at(b"abc", 3, 9), b"");
-        assert_eq!(slice_at(b"abc", u64::MAX, 9), b"");
+    fn reads_are_short_at_the_end() {
+        let mut t = T::new();
+        let map = t.map(b"abc");
+        assert_eq!(read_at(&map, 1, 9).unwrap(), b"bc");
+        assert_eq!(read_at(&map, 3, 9).unwrap(), b"");
+        assert_eq!(read_at(&map, u64::MAX, 9).unwrap(), b"");
     }
 
     #[test]
     fn lengths_go_by_arithmetic() {
-        assert_eq!(len_after(8, &write(100, b"")), 8);
-        assert_eq!(len_after(8, &write(6, b"abcd")), 10);
-        assert_eq!(len_after(8, &Call::Append(b"abcd".to_vec())), 12);
+        let write = |offset, len| Call::Write { offset, len };
+        assert_eq!(len_after(8, &write(100, 0)), 8);
+        assert_eq!(len_after(8, &write(6, 4)), 10);
+        assert_eq!(len_after(8, &Call::Append { len: 4 }), 12);
         assert_eq!(len_after(8, &Call::Truncate(2)), 2);
     }
 }

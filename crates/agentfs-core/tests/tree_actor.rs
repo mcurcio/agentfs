@@ -145,7 +145,7 @@ fn byte_calls_match_a_plain_linux_file_and_publish_only_at_release() {
             }
         }
         assert_eq!(
-            v.read_open(h).unwrap(),
+            v.read_open(h).unwrap().to_vec().unwrap(),
             fs::read(tmp.path().join("plain")).unwrap()
         );
         // FLUSH and fsync make records durable; they publish nothing.
@@ -426,7 +426,7 @@ fn rename_after_rejected_create_keeps_rejected_content_out_of_parent() {
 fn single_actor_and_invalid_names_fail_before_recording() {
     let tmp = tempfile::tempdir().unwrap();
     let mut v = new_actor(tmp.path());
-    let journal = fs::metadata(tmp.path().join("calls.wal")).unwrap().len();
+    let journal = trees::journal_len(tmp.path());
     assert!(matches!(
         TreeActor::open(tmp.path(), &PodContext::default()),
         Err(Error::Busy)
@@ -439,10 +439,7 @@ fn single_actor_and_invalid_names_fail_before_recording() {
     }
     // A writer that would forge a trailer is no writer: refused before any call.
     assert!(WriterLabel::parse("w\nAgentfs-Writer: fake").is_err());
-    assert_eq!(
-        fs::metadata(tmp.path().join("calls.wal")).unwrap().len(),
-        journal
-    );
+    assert_eq!(trees::journal_len(tmp.path()), journal);
 }
 
 #[test]
@@ -454,7 +451,7 @@ fn incomplete_tail_is_discarded_but_a_bad_frame_with_a_later_one_is_not() {
     v.durability().make_all_durable().unwrap();
     put(&mut v, ROOT, "b", b"later");
     drop(v);
-    let path = tmp.path().join("calls.wal");
+    let path = trees::current_segment(tmp.path());
     let valid = fs::read(&path).unwrap();
     let mut corrupt_header = valid.clone();
     corrupt_header[frames(&valid)[1].0 + 8] ^= 0x80;
@@ -473,7 +470,7 @@ fn incomplete_tail_is_discarded_but_a_bad_frame_with_a_later_one_is_not() {
     let v = reopen(tmp.path());
     assert_eq!(v.read(ROOT, "a").unwrap(), b"saved");
     drop(v);
-    assert_eq!(fs::read(tmp.path().join("calls.wal.torn")).unwrap(), b"AFJ");
+    assert_eq!(fs::read(trees::torn(tmp.path())).unwrap(), b"AFJ");
 }
 
 #[test]
@@ -977,7 +974,7 @@ fn a_bad_final_frame_is_a_torn_tail() {
     v.write(h, 0, b"returned", false).unwrap();
     v.write(h, 8, b"-torn", false).unwrap();
     drop(v);
-    let path = tmp.path().join("calls.wal");
+    let path = trees::current_segment(tmp.path());
     let mut journal = fs::read(&path).unwrap();
     let last = journal.len() - 1;
     journal[last] ^= 1;
@@ -988,7 +985,7 @@ fn a_bad_final_frame_is_a_torn_tail() {
     assert_eq!(v.read(ROOT, "a").unwrap(), b"returned");
     assert_eq!(opens_saved(tmp.path(), h), 1);
     assert_eq!(
-        fs::read(tmp.path().join("calls.wal.torn")).unwrap(),
+        fs::read(trees::torn(tmp.path())).unwrap(),
         journal[offset..offset + length]
     );
 }
@@ -1003,7 +1000,7 @@ fn a_bad_frame_before_a_good_one_is_corruption() {
     v.durability().make_all_durable().unwrap();
     v.write(h, 3, b"two", false).unwrap();
     drop(v);
-    let path = tmp.path().join("calls.wal");
+    let path = trees::current_segment(tmp.path());
     let journal = fs::read(&path).unwrap();
     let all = frames(&journal);
     let (offset, length) = all[all.len() - 2];
@@ -1043,7 +1040,7 @@ fn a_frame_in_a_workloads_bytes_is_not_a_frame() {
     }
     let tmp = tempfile::tempdir().unwrap();
     let mut v = new_actor(tmp.path());
-    let path = tmp.path().join("calls.wal");
+    let path = trees::current_segment(tmp.path());
     let salt = u32::from_le_bytes(fs::read(&path).unwrap()[4..8].try_into().unwrap());
     let h = v.write_open(ROOT, "a", &writer("writer"), true).unwrap();
     v.write(h, 0, b"returned", false).unwrap();
@@ -1104,12 +1101,17 @@ fn a_missing_journal_refuses_and_keeps_history() {
     put(&mut v, ROOT, "a", b"history");
     let head = v.head(ROOT).unwrap();
     drop(v);
-    fs::remove_file(tmp.path().join("calls.wal")).unwrap();
+    fs::remove_dir_all(tmp.path().join("journal")).unwrap();
     assert!(matches!(
         TreeActor::open(tmp.path(), &PodContext::default()),
         Err(Error::CorruptJournal(0))
     ));
-    fs::write(tmp.path().join("calls.wal"), b"").unwrap();
+    fs::create_dir(tmp.path().join("journal")).unwrap();
+    fs::write(
+        tmp.path().join("journal").join("00000000000000000001.seg"),
+        b"",
+    )
+    .unwrap();
     assert!(matches!(
         TreeActor::open(tmp.path(), &PodContext::default()),
         Err(Error::CorruptJournal(0))
@@ -1149,11 +1151,15 @@ fn open_numbers_never_repeat_across_compaction() {
     drop(v);
     // Every open compacts; the journal then holds only a checkpoint.
     drop(reopen(tmp.path()));
-    // Nothing but the checkpoint can say what the next number is now.
-    assert_eq!(
-        frames(&fs::read(tmp.path().join("calls.wal")).unwrap()).len(),
-        1
-    );
+    // Nothing but checkpoints can say what the next number is now.
+    assert_eq!(trees::segments(tmp.path()).len(), 1);
+    let journal = fs::read(trees::current_segment(tmp.path())).unwrap();
+    for (at, length) in frames(&journal) {
+        assert!(
+            String::from_utf8_lossy(&journal[at + 44..at + length]).contains("Checkpoint"),
+            "a frame past the checkpoints"
+        );
+    }
     let mut v = reopen(tmp.path());
     let second = v.write_open(ROOT, "a", &writer("writer"), false).unwrap();
     assert!(second > first);
@@ -1180,7 +1186,7 @@ fn fill_journal(v: &mut TreeActor, path: &str) {
     v.truncate(h, FILLED.len() as u64).unwrap();
     v.close(h).unwrap();
     v.settle().unwrap();
-    // A compaction failing after its rename stops the actor: this open fails.
+    // An open is the first call after the builder caught up: it compacts.
     if let Ok(h) = v.write_open(ROOT, path, &writer("filler"), false) {
         v.close(h).unwrap();
     }
@@ -1194,7 +1200,7 @@ fn a_log_held_open_does_not_pin_other_saves() {
     v.write(log, 0, b"before\n", true).unwrap();
     fill_journal(&mut v, "big");
     // The step compacted: the other file's calls are gone, the log's stayed.
-    let length = fs::metadata(tmp.path().join("calls.wal")).unwrap().len();
+    let length = trees::journal_len(tmp.path());
     assert!(length < 1 << 20, "journal holds {length} bytes");
     v.write(log, 0, b"after\n", true).unwrap();
     drop(v);
@@ -1202,6 +1208,114 @@ fn a_log_held_open_does_not_pin_other_saves() {
     assert_eq!(v.read(ROOT, "log").unwrap(), b"before\nafter\n");
     assert_eq!(v.read(ROOT, "big").unwrap(), FILLED);
     assert_eq!(opens_saved(tmp.path(), log), 1);
+}
+
+/// A file held open pins only its own frames: after 200 MiB of other files'
+/// saves and a build, the segments on disk stay under twice its own bytes
+/// plus a segment. Inverted: an open whose own bytes outweigh the dead ones
+/// beside them keeps its segments where they are, and nothing is copied.
+#[test]
+fn a_held_open_pins_only_its_own_bytes() {
+    const SEGMENT: u64 = 64 << 20;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut v = new_actor(tmp.path());
+    let held = v.write_open(ROOT, "held", &writer("w"), true).unwrap();
+    let own: u64 = 4 << 20;
+    for _ in 0..4 {
+        v.write(held, 0, &[7; 1 << 20], true).unwrap();
+    }
+    for n in 0..3 {
+        fill_journal(&mut v, &format!("other-{n}"));
+    }
+    let on_disk = trees::journal_len(tmp.path());
+    assert!(
+        on_disk < 2 * (own + SEGMENT),
+        "{on_disk} bytes of segments for a held open of {own}"
+    );
+    v.write(held, 0, b"!", true).unwrap();
+    v.close(held).unwrap();
+    assert_eq!(v.read(ROOT, "held").unwrap().len() as u64, own + 1);
+
+    let tmp = tempfile::tempdir().unwrap();
+    let mut v = new_actor(tmp.path());
+    let held = v.write_open(ROOT, "held", &writer("w"), true).unwrap();
+    for _ in 0..70 {
+        v.write(held, 0, &[7; 1 << 20], true).unwrap();
+    }
+    put(&mut v, ROOT, "small", b"dead bytes beside a live open");
+    v.settle().unwrap();
+    // The first call after the builder caught up compacts: a checkpoint in a
+    // third segment, the two before it kept.
+    let poke = v.write_open(ROOT, "small", &writer("w"), false).unwrap();
+    v.close(poke).unwrap();
+    assert_eq!(
+        v.metrics().journal_carried_bytes,
+        0,
+        "a live open's frames moved"
+    );
+    assert_eq!(trees::segments(tmp.path()).len(), 3);
+    assert!(trees::journal_len(tmp.path()) > 70 << 20);
+    drop(v);
+    let v = reopen(tmp.path());
+    assert_eq!(v.read(ROOT, "held").unwrap().len(), 70 << 20);
+}
+
+/// A reader that opened a file read from its checkout as built keeps reading
+/// those bytes after a later save is built: the checkout writes a new file
+/// and renames it over the old, whose descriptor the reader holds.
+#[test]
+fn a_reader_of_a_rebased_file_reads_the_old_version() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut v = new_actor(tmp.path());
+    put(&mut v, ROOT, "a", b"opened\n");
+    v.settle().unwrap();
+    // The next call takes the builder's map, read from the checkout.
+    put(&mut v, ROOT, "b", b"poke\n");
+    let reader = v.file_map(ROOT, "a").unwrap();
+    put(&mut v, ROOT, "a", b"rewritten\n");
+    v.settle().unwrap();
+    put(&mut v, ROOT, "b", b"poke again\n");
+    v.settle().unwrap();
+    assert_eq!(
+        fs::read(trees::checkout(tmp.path(), "root", "a")).unwrap(),
+        b"rewritten\n"
+    );
+    assert_eq!(reader.to_vec().unwrap(), b"opened\n");
+    assert_eq!(v.read(ROOT, "a").unwrap(), b"rewritten\n");
+}
+
+/// A new segment's directory entry is fsynced before the mark covers any
+/// record in it: failing there, the mark stays below the segment's first
+/// record, and a reopen still finds every record (a kill keeps the kernel's).
+#[cfg(feature = "failpoints")]
+#[test]
+fn a_record_in_a_segment_whose_entry_is_not_fsynced_is_never_marked_durable() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut v = new_actor(tmp.path());
+    let h = v.write_open(ROOT, "big", &writer("w"), true).unwrap();
+    let chunk = vec![b'x'; 33 << 20];
+    v.write(h, 0, &chunk, true).unwrap();
+    v.durability().make_all_durable().unwrap();
+    assert_eq!(trees::segments(tmp.path()).len(), 1);
+    // A frame past the first segment's size starts the next one.
+    v.write(h, 0, &chunk, true).unwrap();
+    let segments = trees::segments(tmp.path());
+    assert_eq!(segments.len(), 2);
+    let first: u64 = segments[1]
+        .file_stem()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let guard = agentfs_core::failpoints::configure("tree.segment_after_create=error").unwrap();
+    assert!(v.durability().make_all_durable().is_err());
+    drop(guard);
+    assert!(v.durability().mark().get() < first);
+    assert!(v.is_stopped());
+    drop(v);
+    let v = reopen(tmp.path());
+    assert_eq!(v.read(ROOT, "big").unwrap().len(), 66 << 20);
 }
 
 // Run a worker test in a child process with this failpoint spec, and wait for
@@ -1459,8 +1573,8 @@ fn a_kill_at_either_compact_failpoint_loses_nothing() {
     let tmp = tempfile::tempdir().unwrap();
     // The compaction at open is the first hit; the one at the step, the second.
     for spec in [
-        "tree.compact_before_rename=kill@2",
-        "tree.compact_after_rename=kill@2",
+        "tree.compact_before_checkpoint=kill@2",
+        "tree.compact_before_drop=kill@2",
     ] {
         let state = tmp.path().join(spec);
         let log = run_killed_worker("compact_worker", &state, spec);
@@ -1473,41 +1587,41 @@ fn a_kill_at_either_compact_failpoint_loses_nothing() {
 
 #[cfg(feature = "failpoints")]
 #[test]
-fn a_failure_after_the_rename_stops_the_actor() {
+fn a_failure_before_the_drop_keeps_serving_and_the_next_compaction_drops() {
     let tmp = tempfile::tempdir().unwrap();
     let mut v = new_actor(tmp.path());
     put(&mut v, ROOT, "a", b"before");
-    let guard = agentfs_core::failpoints::configure("tree.compact_after_rename=error").unwrap();
+    let guard = agentfs_core::failpoints::configure("tree.compact_before_drop=error").unwrap();
     fill_journal(&mut v, "big");
     drop(guard);
-    // The step itself stands: its record is in the old file and the new one.
-    assert!(v.is_stopped());
-    assert!(matches!(v.read(ROOT, "a"), Err(Error::Stopped)));
-    assert!(matches!(
-        v.write_open(ROOT, "a", &writer("writer"), false),
-        Err(Error::Stopped)
-    ));
-    assert!(matches!(v.progress(), Err(Error::Stopped)));
+    // The checkpoint stands; the old segments wait for the next compaction.
+    assert!(!v.is_stopped());
+    assert_eq!(v.read(ROOT, "a").unwrap(), b"before");
+    assert!(trees::journal_len(tmp.path()) > 64 << 20);
     drop(v);
-    let v = reopen(tmp.path());
+    let mut v = reopen(tmp.path());
     assert_eq!(v.read(ROOT, "a").unwrap(), b"before");
     assert_eq!(v.read(ROOT, "big").unwrap(), FILLED);
+    // Open compacts: the old segments go.
+    assert!(trees::journal_len(tmp.path()) < 1 << 20);
+    put(&mut v, ROOT, "a", b"after");
+    assert_eq!(v.read(ROOT, "a").unwrap(), b"after");
 }
 
 #[cfg(feature = "failpoints")]
 #[test]
-fn a_failure_before_the_rename_is_retried_at_the_next_step() {
+fn a_failure_before_the_checkpoint_is_retried_at_the_next_step() {
     let tmp = tempfile::tempdir().unwrap();
     let mut v = new_actor(tmp.path());
-    let guard = agentfs_core::failpoints::configure("tree.compact_before_rename=error").unwrap();
+    let guard =
+        agentfs_core::failpoints::configure("tree.compact_before_checkpoint=error").unwrap();
     fill_journal(&mut v, "big");
     drop(guard);
     assert!(!v.is_stopped());
-    let path = tmp.path().join("calls.wal");
-    assert!(fs::metadata(&path).unwrap().len() > 64 << 20);
+    assert!(trees::journal_len(tmp.path()) > 64 << 20);
     v.settle().unwrap();
     put(&mut v, ROOT, "a", b"next");
-    assert!(fs::metadata(&path).unwrap().len() < 1 << 20);
+    assert!(trees::journal_len(tmp.path()) < 1 << 20);
     assert_eq!(v.read(ROOT, "a").unwrap(), b"next");
 }
 
@@ -1683,14 +1797,14 @@ fn a_failed_write_changes_nothing_and_keeps_serving() {
     let mut v = new_actor(tmp.path());
     let h = v.write_open(ROOT, "a", &writer("writer"), true).unwrap();
     v.write(h, 0, b"one", false).unwrap();
-    let path = tmp.path().join("calls.wal");
+    let path = trees::current_segment(tmp.path());
     let journal = fs::read(&path).unwrap();
     for point in ["tree.wal_before_header", "tree.wal_after_payload"] {
         let guard = agentfs_core::failpoints::configure(&format!("{point}=error")).unwrap();
         assert!(v.write(h, 3, b"lost", false).is_err(), "{point}");
         drop(guard);
         assert!(!v.is_stopped(), "{point}");
-        assert_eq!(v.read_open(h).unwrap(), b"one", "{point}");
+        assert_eq!(v.read_open(h).unwrap().to_vec().unwrap(), b"one", "{point}");
         assert_eq!(fs::read(&path).unwrap(), journal, "{point}");
     }
     v.write(h, 3, b"two", false).unwrap();

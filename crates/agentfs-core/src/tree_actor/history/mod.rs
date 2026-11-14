@@ -16,14 +16,14 @@ pub(super) mod upstreams;
 use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use git2::Oid;
 
 use super::pointers::Pointers;
 use super::stages::{Timer, Which};
-use super::tree::{EventNumber, Shape, Tree};
+use super::tree::{EventNumber, FileBytes, Shape, Tree};
 use super::{Error, Result, TreeId, referee};
 use crate::file_lock::FileLock;
 use crate::tree_git::TreeGit;
@@ -121,18 +121,23 @@ pub(in crate::tree_actor) fn tree_snapshot(
     Ok(snapshot)
 }
 
-/// Every tree as built: each branch's snapshot installed.
+/// Every tree as built: each branch's snapshot installed, each file's map
+/// from `map` (given its tree, object and path).
 pub(in crate::tree_actor) fn read_trees(
     repo: &TreeGit,
     pointers: &Pointers,
     objects: &BTreeMap<TreeId, Objects>,
+    mut map: impl FnMut(TreeId, u64, &str) -> Result<Arc<FileBytes>>,
 ) -> Result<BTreeMap<TreeId, Tree>> {
     let mut trees = BTreeMap::new();
     let none = Objects::new();
     for id in refs::branches(pointers)?.into_keys() {
         let mut tree = Tree::default();
         let objects = objects.get(&id).unwrap_or(&none);
-        tree.install(tree_snapshot(repo, pointers, objects, id)?)?;
+        tree.install(
+            tree_snapshot(repo, pointers, objects, id)?,
+            |_, object, path| map(id, object, path),
+        )?;
         trees.insert(id, tree);
     }
     if !trees.contains_key(&TreeId::Root) {
@@ -153,6 +158,17 @@ pub(in crate::tree_actor) fn owners(
         .into_iter()
         .filter_map(|(oid, message)| Some((message::direct_event(&message)?, oid)))
         .collect())
+}
+
+/// Where `tree`'s checkout holds the file named `name`: its `files/` path
+/// under `trees/<tree>/` (`format::file_path`).
+pub(in crate::tree_actor) fn checkout_path(root: &Path, tree: TreeId, name: &str) -> PathBuf {
+    let (aa, bb) = format::fanout(name);
+    root.join("trees")
+        .join(tree.to_string())
+        .join(aa)
+        .join(bb)
+        .join(name)
 }
 
 /// Makes `tree`'s checkout `head`'s files, rewriting only what differs from

@@ -76,7 +76,9 @@ mkdir -p "$VIEW" "$RECEIPTS"
 rm -f "$RECEIPTS"/*
 chmod 0777 "$RECEIPTS"
 if [ -n "$FS" ]; then
-  sudo truncate -s 4G "$LOOP_IMG"
+  # close_1g's 1 GiB needs about 4 GiB while history builds: its journal
+  # segments, the pack (the blob and its line map) and the checkout.
+  sudo truncate -s 8G "$LOOP_IMG"
   if [ "$FS" = xfs ]; then
     sudo mkfs.xfs -q -f -m reflink=1 "$LOOP_IMG"
   else
@@ -211,7 +213,7 @@ if [ -n "$FS" ]; then
 w = {w["name"]: w for w in json.load(open(sys.argv[1]))["workloads"]}[sys.argv[2]]
 print(json.dumps(w.get(sys.argv[3], 0)))' "$report" "$1" "$2"
   }
-  assert_eq "close_4k create close_64m" \
+  assert_eq "close_4k create close_64m close_1g write_1g" \
     "$(python3 -c 'import json, sys; print(*(w["name"] for w in json.load(open(sys.argv[1]))["workloads"]))' "$report")" \
     'the report lists every workload'
   # A save each workload saw answered is in history once the built point reached
@@ -231,6 +233,9 @@ print(json.dumps(w.get(sys.argv[3], 0)))' "$report" "$1" "$2"
   fi
   if [ "$(figure close_64m finished)" = true ] && drained close_64m; then
     assert_eq 67108864 "$(in_history cat-file -s "root:files/$(fanned fig-64m)")" 'the 64 MiB save is in history'
+  fi
+  if [ "$(figure close_1g finished)" = true ] && drained close_1g; then
+    assert_eq 1073741824 "$(in_history cat-file -s "root:files/$(fanned fig-1g)")" 'the 1 GiB save is in history'
   fi
 fi
 pass 'tree views tracer'

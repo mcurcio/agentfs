@@ -900,3 +900,56 @@ Not blocking; the suite is built and green. Findings about the brief and the doc
    over each upstream commit the fork lacks, a landing reads base and incoming): where one `metadata.json` read was
    one blob, it is now a blob per file and per name history. Not measured at size; the take tests are small. A
    reader that reads only a commit's changed folders is the follow-up if takes on large trees prove slow.
+
+## 2026-11-14, speed B3 (file maps and segments): where the page is short, and what was built instead
+
+1. **The owned-files list is short.** Beyond §6's list: `history/mod.rs` (`read_trees` takes each file's map
+   from a closure; `checkout_path`), `history/built.rs` (the maps the builder hands the actor), `history/feed.rs`
+   (`Feed::blob_from` did not exist), `tree.rs`'s `Tree::install` (a map per file from a closure), `takes.rs`
+   (a take's files), `tree_actor/mod.rs` (format `agentfs-trees-8`, serve from the builder's maps, the open-files
+   limit), `failpoints.rs` (new points), `ci/e2e-tree-recording-faults.sh` (renamed compaction points),
+   `.github/workflows/image.yml` (the tracer job's timeout, 20 to 25 min) and AGENTS.md's figure.
+2. **`Source` has no home for a take's merged bytes.** They are in the take record's head (JSON line maps), not
+   in a tail. Built: a take record's tail holds the bytes of each file it leaves (`TakeRecord::tail`, `spans`),
+   and the actor's and builder's maps read them there.
+3. **`rebase` cannot work per piece as written.** "Pieces from steps `<= base.step`": a piece does not know its
+   step, and a call's record is older than the close that saved it, so a record-numbered rule would read a later
+   save's bytes from an older base. Built: a map carries the step of the save it is (`None` once it holds unsaved
+   calls), and `rebase` replaces a whole saved map whose step is at or before the base's.
+4. **Who rebases, and when.** The page leaves it to "a built event". The actor cannot know which checkouts are
+   current (a failed copy leaves them stale) nor which files changed. Built: the builder, after each checkout,
+   opens a `BaseFile` per checked-out file that still reads frames and rebases its own map; every map it changed
+   or rebased goes to the actor through History (`publish_maps`, `take_maps`), which takes each at its next call
+   where its saved map is the same step. An open whose map is still that save takes it too. Recovery serves the
+   builder's maps, so a checkout a failed copy left stale is never read.
+5. **`Saved { len, pieces }` cannot be "a hash of the piece list".** The two sides rebase at different built
+   points, so their piece lists differ in what the save kept. Built: an FNV-1a digest of the length, each piece
+   from the close's own frames with its offset and place, and the kept bytes as one run per gap
+   (`FileMap::digest`). Cost: it checks the apply, not the kept bytes' content (the earlier saves were checked).
+6. **Recovery needs the checkpoint to name pre-checkpoint frames.** A checkpoint is no longer first in the file,
+   and carried or kept frames of a closed generation's page writes must stay out (R12). Built: the checkpoint
+   lists the held page writes (`page_writes`); a live open's calls are found by its handle. Found by probe 3:
+   carried frames could push the checkpoint's segment (named for the next record) past 64 MiB, and the next
+   record's roll then tried to create a segment of the same name (`EEXIST`); fixed, with a unit test.
+   "Compaction becomes: write a checkpoint frame, drop segments" also loses what the old rewrite gave: a
+   restart's frames may be only in the kernel, and the rewrite's fsync made them durable without a leader fsync
+   (`ci/e2e-tree-recording-faults.sh`'s `tree.wal_before_fsync` kill met the startup's instead). Built: the
+   checkpoint fsyncs every segment and the directory, then raises the mark to what it covers.
+7. **One descriptor per file.** `BaseFile { file }` holds one open descriptor per non-empty built file and
+   tree: 50,000 for the creates figure. Not on the page. Built: the volume raises the soft open-files limit to
+   the hard one at serve (as the Go runtime does); a failed open logs `tree BaseFile` and keeps the frames.
+   `BaseFile.blob` is an `Option`: at start the builder knows no blob (it does not hash checkouts).
+8. **`FileMap` is public.** The view (`agentfs-fuse`) reads through it with the actor unlocked, so it cannot be
+   crate-private as §6 has it. `read` now returns the bytes whole (`Vec<u8>`); `file_map` and `read_open` give
+   maps.
+9. **Probe 3's figures counter cannot fire.** A compaction waits for the builder to catch up, and calls do not
+   wake the builder, so none runs while the 1 GiB file is written. `close_1g` reports `carried_bytes` anyway; the
+   test's inverted case is the detector.
+10. **The space estimate is short.** "About 3 GiB for a 1 GiB close": the line map is JSON with a number per
+    byte, so a 1 GiB random file's pack is about twice the file. The tracer's loop filesystem is 8 GiB, not 6.
+11. **Smaller departures.** The segment-rollover crash test is in `tree_actor.rs` (`crash_points.rs` is the
+    recording engine's harness); it fails the leader at `tree.segment_after_create`, between a new segment and
+    its directory fsync. A compaction that fails dropping segments no longer stops the actor (nothing is
+    unknown); its failpoints are `tree.compact_before_checkpoint` and `tree.compact_before_drop`. `close_1g` times
+    the close and `stat` after the writes (the engine's dirty bigclose); `write_1g`'s "a 1 MiB file's writes" is
+    32 files of one 1 MiB write. Page writes' bases (kernel page snapshots) stay in memory; the image is a map.

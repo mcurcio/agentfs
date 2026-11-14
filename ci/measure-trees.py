@@ -151,10 +151,15 @@ def calls(root, count):
             'elapsed_ns_including_close': time.monotonic_ns() - started, **distribution(samples)}
 
 
+def journal_size(journal):
+    """The journal's bytes: every segment in its directory."""
+    return sum(seg.stat().st_size for seg in journal.glob('*.seg'))
+
+
 def hour(root, wal, duration, interval):
     path = root / 'hour'
     fd = os.open(path, os.O_CREAT | os.O_TRUNC | os.O_WRONLY, 0o600)
-    start_size = wal.stat().st_size
+    start_size = journal_size(wal)
     started = time.monotonic_ns()
     deadline = started + int(duration * 1e9)
     count = 0
@@ -169,11 +174,11 @@ def hour(root, wal, duration, interval):
             if remaining > 0:
                 time.sleep(min(interval, remaining))
         elapsed = time.monotonic_ns() - started
-        end_size = wal.stat().st_size
+        end_size = journal_size(wal)
     finally:
         os.close(fd)
     return {'status': 'MEASURED' if duration >= 3600 and elapsed >= 3600 * 10**9 else 'SMOKE',
-            'definition': 'WAL logical file-size delta while one file stays write-open; excludes open and close records',
+            'definition': 'journal segments\' logical size delta while one file stays write-open; excludes open and close records',
             'write_pattern': 'pwrite 8-byte little-endian counter at offset 0; pause after each call',
             'pause_seconds': interval, 'write_count': count, 'bytes_written': count * 8,
             'elapsed_ns': elapsed, 'wal_start_bytes': start_size, 'wal_end_bytes': end_size,
@@ -589,7 +594,7 @@ def main():
             if a.mode in ('hour', 'smoke'):
                 with Ambient(report, a.metrics, 'ambient', pid=a.mount_pid):
                     report.measured('hour_journal_bytes', hour(
-                        Path(a.main), Path(a.state) / 'calls.wal',
+                        Path(a.main), Path(a.state) / 'journal',
                         3600 if a.mode == 'hour' else 2, a.interval))
             if a.landing and a.mode == 'calls':
                 with Ambient(report, a.metrics, 'ambient', pid=a.mount_pid):

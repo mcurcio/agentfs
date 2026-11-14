@@ -111,7 +111,7 @@ for label, root in (("main-", main), ("sandbox-", sandbox)):
         assert os.pread(f.fileno(), 100, 0) == expected
     saved(root / (label + "bytes"), expected)
     assert not (root / ".git").exists()
-    assert not (root / "calls.wal").exists()
+    assert not (root / "journal").exists()
     try:
         (root / "dir").mkdir()
     except OSError as e:
