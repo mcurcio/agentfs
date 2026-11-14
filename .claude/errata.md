@@ -1041,3 +1041,50 @@ Errata state, after this fix (each speed-epic entry the handoff listed as open):
 - 2026-11-14 B3: 7 closed by d7666ef (no descriptor per file); 9 closed by this fix (`carried_bytes` dropped from the
   figures); the rest closed (built, documented).
 - 2026-11-14 speed fix 1: 6 closed by this fix (`check_targets` strict); 8 stays (a pushed commit is never rewritten).
+
+## 2026-11-14, speed fix 3: what was found, what was built, the residuals as beads to cut
+
+1. **Patch e2e "never mounted" (run 43610665917).** The server's access log: the daemon's inbox fetch (`info/refs`,
+   upload-pack, the first request through fcgiwrap) answered 200 in 30.363 s, starting the instant its 401 was
+   answered; the mount waits `agentfs.patchFetchTimeout` (30 s by default) for that fetch, so it served 0.4 s after
+   the script's own 30 s wait. The server-side stall ended when the daemon was killed (its fetch thread still held
+   the connection), so git-http-backend or fcgiwrap waited on the client; not reproduced locally in 1,500 fetches
+   and 25 mounts under CPU load (git 2.43 locally, 2.56.1 on the runner). The script now waits 60 s and dumps the
+   daemon's threads, sockets and the server's git processes with kernel stacks on a fetch timeout or a missed mount.
+   Also seen, not fixed: after `patchFetchTimeout` the fetch thread keeps its connection up to libgit2's 300 s I/O
+   timeout, and fcgiwrap (one worker) serializes every later request behind it.
+2. **Memory per file.** About 20 KiB a file was libgit2: the one `Repository` handle `TreeGit` kept held a delta-base
+   cache (up to 16 MiB) for every pack it had read, and the builder adds a pack per batch. `refresh` (after each
+   batch) now drops the handle. Name versions, file-map pieces and each object's paths are vectors or one set, not
+   a B-tree map per file. Release, local: 3.4 to 3.8 KiB a file (VmRSS growth, 5,000 to 20,000 files). The rest:
+   the builder clones its whole state per batch (about 0.7 KiB a file, measured by taking instead of cloning), each
+   path held about four times in each projection. The `memory_create` bar is 2 KiB, so CI warns until those go.
+3. **Coherence 3** built as planned: `FramePos` is (record, offset) with the segment it reads; `Relocations` lives in
+   `Durability`; the actor moves its positions after `drop_behind`, the builder before each batch; the save digest
+   hashes (record, offset). A view's open file keeps its segment until it closes.
+4. **P3-4** built: `ci/power-loss-trees.sh` holds a file open across a 70 MiB rollover, a compaction and a carry,
+   mark `HC`. The workload ran locally against a view (carried 4 MiB, dropped 2 segments, history right); the
+   dm-log-writes replay was NOT RUN (CI-only, `power-loss.yml` after landing).
+5. **Beads to cut** (this agent may not create beads): each names its files and done condition.
+   - Coherence 5: `TreeActor::{create, open, take_next}` crate-private. Files: `crates/agentfs-core/src/tree_actor/mod.rs`,
+     a test-support handle over `Recording`, `crates/agentfs-core/tests/*.rs` (about 1,000 call sites),
+     `crates/agentfs-conformance` (its `Library` on `Recording`), `crates/agentfs-fuse/src/tree_view.rs`. Done: the
+     three are `pub(crate)`, `Recording::take_next` is the one take path, all tests green.
+   - Coherence 6: mounted replay never sees a lagging builder. Files: `crates/agentfs-conformance`,
+     `crates/agentfs-core/src/tree_actor/history/`. Done: a mounted replay where the builder trails the actor by
+     batches (a failpoint holding the builder), invariants read from git, green.
+   - Coherence 7: the builder's step duplicates tree transitions. Files: `history/builder.rs` (`BuildState::step`,
+     `apply`), `tree_actor/tree.rs` (`Shape::apply`), `tree_actor/mod.rs`. Done: one transition per change that both
+     projections run; conformance replays unchanged.
+   - Builder `owners` growth (P3-6): `owners` shared as an `Arc`, only each batch's new entries resolved. Files:
+     `history/builder.rs` (`built_owners`), `history/mod.rs`. Done: a batch's cost independent of earlier saves.
+   - Checkpoint size at millions of files: a checkpoint's objects map passes the 96 MiB frame limit, and compaction
+     then fails before its checkpoint every time. Files: `journal/commit_point.rs`, `journal/mod.rs`. Done: a
+     checkpoint of a tree with 2,000,000 objects is written and reopened.
+   - B4 8: a take on a large tree reads one blob per file. Files: `tree_actor/takes.rs`, `tree_git.rs`. Done: a take
+     figure on a 100,000-file tree in `ci/trees-figures.py` within its bar.
+   - Memory per file to 2 KiB: no per-batch clone of the builder's state (apply in place, or persistent maps), paths
+     shared. Files: `history/builder.rs`, `tree_actor/tree.rs`. Done: `memory_create` under 2 KiB on CI.
+   - Pack count: the builder adds a pack per batch and nothing repacks, so every lookup scans more packs. Files:
+     `history/builder.rs`, `tree_git.rs`. Done: pack count logarithmic in batches (geometric repack), with the
+     tracer's history checks green.

@@ -17,9 +17,14 @@ The code and the library/human docs win over all of these where they disagree; r
   commits after it) applied the review. All bars met at f7149c4; close_4k and create follow the runner's CPU
   (docs/performance.md): 0.66 to 1.90 ms p50 and 16 to 66 s for 50,000 creates on one commit. history_1g 31 to
   42 s, memory_1g +36 MiB.
-- Residuals with plans, in `.claude/errata.md` ("speed fix 2"): frame relocation owned by the journal (coherence 3),
-  `TreeActor` constructors crate-private (coherence 5), power-loss crossing compaction (P3-4), builder `owners`
-  growth (P3-6), about 20 KiB of view memory per file. `planted/budget.json` is stale; only the owner may re-record it.
+- Fix 3 (a19b657..6c39416): the patch e2e's "never mounted" (the inbox fetch answered in 30.4 s, the mount waits
+  agentfs.patchFetchTimeout = 30 s, the script waited 30 s; now waits 60 s and dumps state; the server's stall itself
+  not reproduced); view memory about 20 KiB a file to about 3.4-3.8 KiB (libgit2 handle let go per batch, small maps
+  as vectors; `memory_create` figure, bar 2 KiB, so it warns); frame relocation owned by the journal (coherence 3,
+  space test by allocated blocks); power-loss crosses rollover, compaction and carry (P3-4, CI-only after landing).
+- Residuals, each to be a bead (text in `.claude/errata.md`, "speed fix 3"): coherence 5, 6, 7, builder `owners`
+  growth, checkpoint size at millions of files, B4 8, memory per file to 2 KiB, pack count. `planted/budget.json`
+  is stale; only the owner may re-record it.
 
 ## Next, in order
 1. One full phase-1 dispatch on the final SHA (`gh workflow run phase-1.yml`), read its result.
