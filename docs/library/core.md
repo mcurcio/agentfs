@@ -37,7 +37,7 @@ recorded; [guarantees](../guarantees.md) says what the engine promises.
 | Several mounts, one writer | `history_service` | `HistoryServer`, `HistoryClient`, `FrontLease` |
 | Large files | `lfs` | `ObjectCache`, `Store`, `fetch`, `prune` |
 | Git-backed tree views | `tree_actor`, `state_area` | `TreeActor`, `TreeId` (a tree's identity, `root` or `fork/<n>`), `inspect`, `TreeStateArea` (the Volume domain's `StateArea` port) |
-| The domains' rows over a tree volume | `store`, `tree_actor` | `TreeStore` (the `ForkStore`, `ClientStore` and `QueueFacts` ports), `Chain`, `RowDomain`, `RowWrite`, `RowEvent` |
+| The domains' rows over a tree volume | `store`, `tree_actor` | `TreeStore` (the `VolumeStore`, `ForkStore`, `ClientStore` and `QueueFacts` ports), `Chain`, `RowDomain`, `RowWrite`, `RowEvent` |
 | Line identity across saves | `tree_reconcile` | `LineMap` (runs of lines, never bytes), `LineMap::align` (git's histogram diff over two `Image`s, read a line at a time), `LineMap::append`, `LineMap::expand` (line by line, for the landing rules), `pieces` (where a merged file's lines are in its sources): the line-map library, generic over the caller's numbered version (`Id`) |
 
 ## The state area
@@ -697,7 +697,7 @@ The domains (`agentfs-volume`, `agentfs-clients`, `agentfs-trees`) keep their
 records as rows on the volume's one tree actor, through the ports in
 `agentfs_contracts::ports`. `store::TreeStore::new(recording)` implements
 them over a served volume (`Arc<Recording>`): Trees' `ForkStore` (`load`,
-`create`, `end`, `drop_fork`), Clients' `ClientStore` and `QueueFacts`. Each write is one journal step, the same commit
+`create`, `end`, `drop_fork`), Clients' `ClientStore`, Volume's `VolumeStore` and `QueueFacts`. Each write is one journal step, the same commit
 point as a save: a fork's branch and its row are one record, or a row step
 holds rows alone. The store makes it durable (one group-commit fsync, outside
 the actor's lock) before it returns. Each row is the domain's value with its
@@ -733,6 +733,18 @@ fork, ends forks (`end`, `end_keyed`, and `on_last_detached` for an unkeyed
 fork), and `settle` drops each ended fork its queue facts let go;
 `ClientsService::on_fork_dropped` releases the claim. The composition root
 dispatches the events between them ([trees](../trees.md#forks-keys-end-and-the-drop)).
+
+Volume's `VolumeStore` (`load`, `record`) keeps the lifecycle row on
+`Chain::Volume` (`refs/agentfs/volume`): one row step per move, `VolumeStaged`,
+`VolumeDraining` (detail `Stop`) or `VolumeReleased` (detail `Keep`).
+`TreeStateArea` is Volume's `StateArea`, `VolumeStore` and `QueueFacts` in one:
+`open` recovers the volume and makes a `TreeStore` over it, to which the other
+two delegate; before `open` the row reads `None`, a write fails `Stopped` and no
+queue holds anything. `VolumeService` (`agentfs-volume`) stages the volume
+(`stage` opens the state area), unstages it, and on each `rejudge` while it
+drains records the release once no client is attached and no queue holds an
+entry; `ClientsService::on_volume_draining` and `on_volume_staged` refuse and
+allow attaches meanwhile ([trees](../trees.md#volume-lifecycle)).
 
 `StoreError` from a tree actor failure: `Stopped` and an unknown fsync
 outcome are `Stopped` (the reopen decides whether the step survived); a failed

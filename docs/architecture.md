@@ -65,7 +65,7 @@ missing from these tables or a row names a module that no longer exists;
 | Module | Role |
 |---|---|
 | `lib.rs` | Crate root: the Clients domain's overview |
-| `service.rs` | The Clients domain over its ports: attach, detach, reconcile and the per-tree index rebuilt from rows |
+| `service.rs` | The Clients domain over its ports: attach, detach, reconcile and the per-tree index rebuilt from rows; no attach while the volume drains |
 
 ### `agentfs-trees`
 
@@ -81,9 +81,9 @@ missing from these tables or a row names a module that no longer exists;
 | `lib.rs` | Crate root: the module list and the engine's overview |
 | `volume.rs` | Opens a state area: crash recovery, then the [`Recorder`](#the-synchronous-step) used at every boundary and the `Committer` that turns records into commits |
 | `record.rs` | What the journal stores: one record per change boundary, absolute state, never deltas |
-| `state_area.rs` | The `StateArea` port over the tree actor: inspect without the lock, create a volume with a new id, open and keep the recovered volume, served (`Recording`) |
+| `state_area.rs` | The `StateArea` port over the tree actor: inspect without the lock, create a volume with a new id, open and keep the recovered volume, served (`Recording`); once open, Volume's `VolumeStore` and `QueueFacts` through the `TreeStore` it makes |
 | `session.rs` | The history service's sessions (`Sessions`, the `SessionBinder` port): each bound to a client's authority; a `TreeSession` locks the actor with its tree and writer (writes `EROFS` without one, handles only its own); unbind saves the client's opens and makes them durable |
-| `store.rs` | The domains' store ports over one served volume (`TreeStore`): Trees' `ForkStore` (create, end, drop), Clients' `ClientStore` (attach, rebind, end, release a claim on each tree's Clients chain) and the `QueueFacts`, each write one journal step (a fork and its row, a drop and its row, or rows alone) made durable before it returns, off the actor's lock; the audit stamps' one home (`created` set once, `changed` each write); the ports' word for each actor failure |
+| `store.rs` | The domains' store ports over one served volume (`TreeStore`): Trees' `ForkStore` (create, end, drop), Clients' `ClientStore` (attach, rebind, end, release a claim on each tree's Clients chain), Volume's `VolumeStore` (the lifecycle row on `refs/agentfs/volume`) and the `QueueFacts`, each write one journal step (a fork and its row, a drop and its row, or rows alone) made durable before it returns, off the actor's lock; the audit stamps' one home (`created` set once, `changed` each write); the ports' word for each actor failure |
 | `tree_actor/mod.rs` | The tree actor: the actor, recovery and queue orchestration. A step is one unit of work: decided, appended to the journal as the change itself, applied to the saved state, with no git on the call path; creating a volume (its identity file, then `format` last), inspecting and opening a state area, recovery (history built through the journal, then abandoned opens closed); each tree's last head-moving step and the keys steps touched, which a take's land checks |
 | `tree_actor/history/mod.rs` | Tree history: the store opened and created in one place, snapshots read from commits with each tree's object numbers, the owners of direct saves, private checkouts, and the clean-up of a cut-short build's packs |
 | `tree_actor/history/builder.rs` | The builder, on its own thread: reads durable records from its own cursor along the segments, replays each step on the built trees with the actor's transitions, packs a batch's commits with `git fast-import` (a file's blob streamed from its map), then installs pack, built-log entry, refs, `config` and checkouts in that order, and rebases the checked-out files' maps onto their checkouts for the actor to take; a replay that disagrees with its record stops building (`Disagrees`) |
@@ -239,8 +239,8 @@ missing from these tables or a row names a module that no longer exists;
 
 | Module | Role |
 |---|---|
-| `trees_cmd.rs` | `trees init` (`ensure` through the Volume domain), `fork` and `mount` composition root (a new fork through the Trees domain on the store adapter; per view a client rebound or attached through the Clients domain, the rest reconciled, each served by the view host and detached as its view ends); separate state format |
-| `shared.rs` | One domain service shared on the composition root's thread (`Shared`): Trees, asked `facts` by Clients |
+| `trees_cmd.rs` | `trees init` (`ensure` through the Volume domain), `mount` and `end` composition root (`mount` stages through the Volume domain; a fork through the Trees domain on the store adapter; per view a client rebound or attached through the Clients domain, the rest reconciled, each served by the view host and detached as its view ends; SIGTERM, SIGINT or the last view's end unstages, and it exits once Volume releases; one channel carries every trigger of its loop); separate state format |
+| `shared.rs` | One domain service shared on the composition root's thread (`Shared`): Trees, asked `facts` by Clients; Clients, asked `attached_any` by Volume (none until restored) |
 | `domain_events.rs` | The composition root's in-process event queue (`DomainEvents`): every domain service of a volume publishes to one, in order |
 | `pod_args.rs` | The pod flags (`--namespace`, `--pod`, `--pod-uid`, `--node`) one clap group shares between the recording engine's commands and `trees` |
 | `main.rs` | The CLI (`Cli`), command dispatch, `init`, `status`, `record`, `flush`, `push` (direct), `run` and `mount` |
@@ -449,6 +449,7 @@ program where git does the job better.
 | Container image | `debian:trixie-slim` with `fuse3`, `libssl3t64`, `ca-certificates`, `git`, `tini` and `mergiraf`; both build and base images pinned by digest. Ships `agentfs` and `agentfs-csi` | Not distroless: the daemon runs `git repack`, and operators follow the runbooks with `git` through `kubectl exec`. `tini` is a subreaper, since the node plugin shares the host's pid namespace. It runs as root. `linux/amd64` only |
 | Front and CSI gRPC | `tonic` and `prost`, on `tokio`. The front's client is `hyper`'s HTTP/2 over the Unix socket | A request `hyper` hands back unsent is known never to have left, which tonic's `channel` would hide. No TLS: the sockets are node-local. `ci/check-deps.sh` checks the default build links no ring or rustls |
 | gRPC codegen | `protox` and `tonic-prost-build` in `build.rs` | A pure-Rust protobuf compiler: no `protoc` on build hosts or in the image |
+| Signals | `signal-hook`'s `iterator::Signals` on a thread of its own | SIGTERM and SIGINT become messages on a channel the command already waits on (`mount`'s and `run`'s wake channel, `trees mount`'s loop): a signal is an event, never a flag a loop polls, and nothing runs in the handler. The standard crate for safe signal handling in Rust |
 | Volume ids | the `uuid` crate (version 4, random) | The standard Rust implementation of RFC 9562: parsing and the hyphenated text in `agentfs-contracts`, generation (its `v4` feature, the OS's random source) only in the state-area adapter that creates a volume |
 | CSI spec | `csi.proto` v1.13.0, vendored in `crates/agentfs-csi/proto` | Pinned by copy; updating it is a deliberate change |
 | CSI sidecars | csi-provisioner (`--node-deployment`, in the node plugin pod), csi-node-driver-registrar and livenessprobe from `registry.k8s.io/sig-storage` | Pinned by digest in `deploy/csi/kustomization.yaml` |

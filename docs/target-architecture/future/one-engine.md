@@ -132,7 +132,9 @@ ci and image runs, plus what its row says. A "short run" of `phase-1.yml` is its
 shards; from M1 it runs on every PR and push to `main` ([CI tiers](#ci-tiers)). A "full run" adds the shards, on a
 manual trigger. Only a milestone that changes save or land logic needs the full run.
 
-**M1. Volumes and their lifecycle.** The four domains a launcher composes are built: Volume (`ensure`, `stage`,
+**M1. Volumes and their lifecycle.** Built: Volume's `ensure`, `stage`, `unstage`, the Stop drain and the
+release verdict, Clients, the view host and the fork lifecycle are in [docs/trees.md](../../trees.md); the tracer and
+the release figures run in `image.yml`. What M1 planned: the four domains a launcher composes are built: Volume (`ensure`, `stage`,
 `unstage`, the drain and the release verdict), Clients (attach and detach), Views (view hosts) and Trees (the fork
 lifecycle: create with settings and an idempotency key, end, drop). `ensure` takes a `VolumeSpec` value; the trial
 `trees` CLI builds it from the same flags `agentfs init` takes, so no new configuration format appears. A volume

@@ -1,12 +1,15 @@
 //! One domain service shared by the composition root and another service
 //! that asks it questions (docs/library/core.md, "Rows and domain events"):
-//! Clients asks Trees `facts` while the root also calls Trees. In-process and
-//! on one thread, as the services and their event queue are.
+//! Clients asks Trees `facts` while the root also calls Trees, and Volume asks
+//! Clients `attached_any`, Clients being restored only once Volume has staged.
+//! In-process and on one thread, as the services and their event queue are.
 
 use std::cell::{Ref, RefCell, RefMut};
 use std::rc::Rc;
 
-use agentfs_contracts::ports::{EventSink, ForkStore, QueueFacts};
+use agentfs_clients::ClientsService;
+use agentfs_contracts::clients::{AttachedLookup, ClientSet};
+use agentfs_contracts::ports::{ClientStore, EventSink, ForkStore, QueueFacts, SessionBinder};
 use agentfs_contracts::tree::ForkId;
 use agentfs_contracts::trees::{ForkFacts, ForkLookup};
 use agentfs_trees::TreesService;
@@ -50,6 +53,24 @@ where
 {
     fn facts(&self, fork: ForkId) -> Option<ForkFacts> {
         self.0.borrow().facts(fork)
+    }
+}
+
+/// Volume's one question to Clients: none attached while Clients is not
+/// restored yet (before `stage`).
+impl<S, B, F, E> AttachedLookup for Shared<Option<ClientsService<S, B, F, E>>>
+where
+    S: ClientStore,
+    B: SessionBinder,
+    F: ForkLookup,
+    E: EventSink,
+{
+    fn attached_any(&self) -> ClientSet {
+        self.0
+            .borrow()
+            .as_ref()
+            .map(AttachedLookup::attached_any)
+            .unwrap_or_default()
     }
 }
 

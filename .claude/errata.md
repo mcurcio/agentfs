@@ -1187,3 +1187,35 @@ Page: `.claude/handoff/m1-s5-recut.md`. None blocks the slice; each is built as 
 8. **No state format bump** for `Change::Drop`: a journal of format 10 without one reads as before; nothing is released.
 9. **Not built here:** the model's two `drop` traces stay excluded from the library and mounted replays (the replay's
    mapping, not this page's).
+
+## 2026-11-14, M1 S6 (volume lifecycle): where the re-cut page is short
+
+Page: `.claude/handoff/m1-s6-recut.md`. None blocks the slice; each is built as stated.
+1. **A mount's stage moves every failpoint count again.** After a clean exit the volume is `Released`, so the next
+   mount records `VolumeStaged` before its attach: two steps, in one builder batch or two, so a builder point's
+   count would race. `ci/e2e-tree-recording-faults.sh` and `ci/e2e-tree-enospc.sh`'s rename runs (not on the page's
+   file list) now kill a mount once its attach (or save) is built and wait for the lease (`flock actor.lock`): the
+   volume stays `Staged` (a stage writes nothing) and the client attached (the next mount rebinds it), so the
+   counted mount records one step, as in S4. The enospc fsync run, a first mount, counts two fsyncs: `@3`.
+2. **The take gate ended the take worker.** With `AGENTFS_TAKE_GATE`, the worker returned at the gate's end, so a
+   queue left at the end of a mounted replay never emptied and the stop drain never released: the mount would hang
+   at `finish`. Built: after the gate ends the worker takes as it does without one (`tree_view.rs`, one line, and
+   `failpoints.rs`'s doc; neither on the page's list). Nothing is compared after `finish`.
+3. **The last view's end is a stop.** The page names SIGTERM and SIGINT only; `trees mount` used to exit when every
+   view was unmounted, and every `ci/` script relies on it. Built: the last view's end unstages too (a convention
+   decision), so unmounting every view drains and exits 0 once released.
+4. **A stopped actor never releases.** With the actor stopped after a recording failure, `unstage` fails, so a loop
+   waiting for `VolumeReleased` would hang (`ci/e2e-tree-enospc.sh`'s failed-fsync run expects exit 1). Built: the
+   loop also ends once the actor has stopped and no view is left (`wait` reports the stop, exit 1); a stop while
+   stopped closes the views first.
+5. **`VolumeError` has no `Stopped`** (as S3 item 3 for `TreeError`): a store that cannot record maps to
+   `NotDurable(Other(EIO))` in `agentfs-volume`'s service. `release_verdict` judges an unreadable row as `Staged`.
+6. **`unstage` and `rejudge` carry no pod context**, but `VolumeStore::record` takes `at`: `VolumeService` keeps
+   `stage`'s `at` (the history service's) for the volume's later events. `VolumeService::area()` is new (inherent),
+   so the root reaches the `Recording` `stage` opened.
+7. **The SIGTERM test mounts the root alone.** With a fork, a sync queued at the stop holds the release past the
+   detach, so the probe "skip `Attached`" survived it; with no fork, no queue entry stands between the stop and the
+   release, and the test kills that probe.
+8. **Docs: the domain pages are trimmed only in part.** `volume.md` keeps only its unbuilt parts; `clients.md`,
+   `views.md` and `system.md` say at the top what is built and where, but their built sketches are not yet removed
+   (deferred to the docs step at M1's end).

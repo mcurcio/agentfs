@@ -296,16 +296,18 @@ impl Views for ViewHost {
 /// The take worker: takes one at a time, each decided off the actor's lock;
 /// after each landed take, the kernel's pages of what it changed dropped,
 /// then `Landed`. Woken by built and failed events (docs/trees.md, "Takes"),
-/// never a timer.
+/// never a timer. A test's gate, while it lasts, takes in its place.
 fn take_worker(
     recording: &Recording,
     views: &OpenViews,
     stop: &AtomicBool,
     notify: &(dyn Fn(HostEvent) + Send + Sync),
 ) -> io::Result<()> {
+    // Once a test's gate ends, takes go on as the worker's: a stop drain
+    // releases only with every queue empty.
     #[cfg(feature = "failpoints")]
     if let Some(gate) = agentfs_core::failpoints::take_gate() {
-        return run_take_gate(gate, recording, views);
+        run_take_gate(gate, recording, views)?;
     }
     let mut epoch = 0;
     loop {

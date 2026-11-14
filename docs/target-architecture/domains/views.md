@@ -1,6 +1,9 @@
 # Domain: Views
 
-**Proposed, not built.** This page proposes the Views domain (how each client sees and changes its tree), one part of the system around the git model ([the system](../system.md)). The git model ([git-model.md](../git-model.md)) wins wherever the two disagree. Rust sketches show surfaces only. The commit that lands the slice that builds this domain deletes this page and moves the behaviour into the library or operator docs.
+**Proposed, partly built.** The view host (one live view per client, mounted on its session, read-only for a
+read-only grant, closed lazily at a drain) is built and described in [docs/trees.md](../../trees.md#the-view) and the
+[filesystem layer](../../library/filesystem.md#tree-views); snapshot views, profiles and the rest are not. This page
+proposes the Views domain (how each client sees and changes its tree), one part of the system around the git model ([the system](../system.md)). The git model ([git-model.md](../git-model.md)) wins wherever the two disagree. Rust sketches show surfaces only. The commit that lands the slice that builds this domain deletes this page and moves the behaviour into the library or operator docs.
 
 **What this page covers:** how each client's view serves file calls, what a client sees and when, and what Views asks
 of its tree's actor. Saves, locks, syncs and transactions themselves are git-model §6–§9.

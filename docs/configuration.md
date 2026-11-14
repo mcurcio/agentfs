@@ -880,7 +880,13 @@ section. A subcommand with its own subcommands lists them after it.
   ([moving](runbooks/moving.md)), with `accept`, which accepts a tip of
   the start branch and clears the start-branch alarm. It takes no lock.
 - `trees`: tree views ([trees](trees.md)), with `init`, `mount` and
-  `end`.
+  `end`. `trees mount` stages the volume and serves its views; SIGTERM or
+  SIGINT, or unmounting every view, drains it: each client is detached (its
+  open files saved first), each view unmounted lazily, and the process exits
+  0 once the volume is released, which waits for every queue to empty and
+  every held file to close. Exit 75 while another process holds the volume;
+  exit 1 after a recording failure stopped it
+  ([lifecycle](trees.md#volume-lifecycle)).
 
 Commands that write the state area take its lock and exit 75 while
 another process holds it ([operator guide](operator-guide.md#9-the-state-area-lock)).

@@ -2,6 +2,9 @@
 //! identity"): the [`StateArea`] port over the tree actor. `inspect` reads
 //! `format` and the identity file only; `create` makes a volume with a new id;
 //! `open` recovers the tree actor and keeps it, served, for the other adapters.
+//! Once open, it is the Volume domain's row store and queue facts too, through
+//! the [`TreeStore`] it makes over that actor (docs/trees.md, "Volume
+//! lifecycle").
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -16,25 +19,33 @@ use agentfs_contracts::volume::{
     EnsureOutcome, IoKind, VolumeError, VolumeEvent, VolumeId, VolumeIdentity, VolumeState,
 };
 
+use crate::store::TreeStore;
 use crate::tree_actor::{self, Recording};
 
 /// A volume's state area at one path.
 pub struct TreeStateArea {
     root: PathBuf,
-    recording: Option<Arc<Recording>>,
+    /// The volume `open` recovered, and the store over it.
+    served: Option<(Arc<Recording>, TreeStore)>,
 }
 
 impl TreeStateArea {
     pub fn at(root: &Path) -> Self {
         Self {
             root: root.to_owned(),
-            recording: None,
+            served: None,
         }
     }
 
     /// The volume `open` recovered, served; `None` before.
     pub fn recording(&self) -> Option<Arc<Recording>> {
-        self.recording.clone()
+        self.served
+            .as_ref()
+            .map(|(recording, _)| Arc::clone(recording))
+    }
+
+    fn store(&self) -> Option<&TreeStore> {
+        self.served.as_ref().map(|(_, store)| store)
     }
 }
 
@@ -100,15 +111,16 @@ impl StateArea for TreeStateArea {
             .map_err(|e| volume_error(&e))?
             .identity()
             .clone();
-        self.recording = Some(recording);
+        let store = TreeStore::new(Arc::clone(&recording));
+        self.served = Some((recording, store));
         Ok(identity)
     }
 }
 
-/// Slice S6 builds the volume's row. `ensure` reads none.
+/// The volume's row, on the store `open` made: none before it, and no write.
 impl VolumeStore for TreeStateArea {
     fn load(&self) -> Result<Option<Audited<VolumeState>>, StoreError> {
-        todo!("S6")
+        self.store().map_or(Ok(None), VolumeStore::load)
     }
 
     fn record(
@@ -118,24 +130,24 @@ impl VolumeStore for TreeStateArea {
         by: &Principal,
         at: &PodContext,
     ) -> Result<(), StoreError> {
-        let _ = (state, event, by, at);
-        todo!("S6")
+        match self.served.as_mut() {
+            Some((_, store)) => store.record(state, event, by, at),
+            None => Err(StoreError::Stopped),
+        }
     }
 }
 
-/// Slice S6 asks these. `ensure` asks none.
+/// The queues, on the store `open` made: before it, none holds anything.
 impl QueueFacts for TreeStateArea {
     fn queued(&self) -> Vec<TreeId> {
-        todo!("S6")
+        self.store().map_or_else(Vec::new, QueueFacts::queued)
     }
 
     fn pending_from(&self, fork: ForkId) -> bool {
-        let _ = fork;
-        todo!("S6")
+        self.store().is_some_and(|store| store.pending_from(fork))
     }
 
     fn has_child(&self, fork: ForkId) -> bool {
-        let _ = fork;
-        todo!("S6")
+        self.store().is_some_and(|store| store.has_child(fork))
     }
 }

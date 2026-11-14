@@ -1,6 +1,6 @@
 //! The Clients domain over its ports (slice S4): attach, rebind, detach,
-//! reconcile and the per-tree index, rebuilt from the rows at boot
-//! (docs/trees.md, "Clients").
+//! reconcile and the per-tree index, rebuilt from the rows at boot; no attach
+//! while the volume drains (slice S6) (docs/trees.md, "Clients").
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -43,6 +43,8 @@ pub struct ClientsService<S, B, F, E> {
     claims: BTreeMap<ForkId, ClientId>,
     /// Clients ended this run: a second `detach` of one answers `Ok`.
     ended: BTreeSet<ClientId>,
+    /// From `VolumeDraining` until `VolumeStaged`: `attach` answers `Draining`.
+    draining: bool,
 }
 
 impl<S, B, F, E> ClientsService<S, B, F, E>
@@ -92,6 +94,7 @@ where
             index,
             claims,
             ended: BTreeSet::new(),
+            draining: false,
         })
     }
 
@@ -127,6 +130,16 @@ where
         self.store.release_claim(fork, &Principal::Agentfs)?;
         self.claims.remove(&fork);
         Ok(())
+    }
+
+    /// Consumes `VolumeDraining`: `attach` answers `Draining` from now.
+    pub fn on_volume_draining(&mut self) {
+        self.draining = true;
+    }
+
+    /// Consumes `VolumeStaged`: `attach` is accepted again.
+    pub fn on_volume_staged(&mut self) {
+        self.draining = false;
     }
 
     fn attachment(&self, client: &ClientId) -> Option<&Attachment> {
@@ -275,6 +288,9 @@ where
         session: SessionId,
         by: &LaunchCap,
     ) -> Result<Binding, ClientError> {
+        if self.draining {
+            return Err(ClientError::Draining);
+        }
         let tree = grant.tree();
         self.check_tree(tree, by)?;
         let claim = grant.access() == Access::ReadWrite && tree.fork().is_some();
@@ -725,5 +741,25 @@ mod tests {
         )
         .unwrap();
         assert!(restored.claims.is_empty());
+    }
+
+    /// While the volume drains no client attaches, nothing written; detach
+    /// still ends one; staged again, attach is accepted.
+    #[test]
+    fn no_attach_while_the_volume_drains() {
+        let mut clients = service();
+        let root = cap("cli", LaunchScope::Root);
+        let kept = attach(&mut clients, write(TreeId::Root), &root).unwrap();
+        clients.on_volume_draining();
+        let step = clients.store.step;
+        assert_eq!(
+            attach(&mut clients, write(TreeId::Root), &root),
+            Err(ClientError::Draining)
+        );
+        assert_eq!(clients.store.step, step, "no row written");
+        clients.detach(&kept, &root).unwrap();
+        assert!(clients.attached_any().is_empty());
+        clients.on_volume_staged();
+        attach(&mut clients, write(TreeId::Root), &root).unwrap();
     }
 }

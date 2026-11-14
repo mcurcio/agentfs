@@ -2,8 +2,11 @@
 
 **Proposed, not built.** This page proposes how the parts around [the git model](git-model.md) fit together: clients,
 views, tree storage and lifecycle, replication, the volume, health, telemetry, versions and deployment. It sketches
-their contracts and events in Rust surfaces. Nothing here is implemented. The commit that lands a slice of it deletes
-the part it builds and moves the behaviour into the library or operator docs.
+their contracts and events in Rust surfaces. The commit that lands a slice of it deletes the part it builds and moves
+the behaviour into the library or operator docs. Built (M1): the contracts crate, the Volume, Clients and Trees
+domains over their ports, their rows as event commits, and the composition root's event dispatch, described in
+[the library](../library/core.md#rows-and-domain-events) and [docs/trees.md](../trees.md); the sketches below of
+those parts stand only where they go beyond what is built.
 
 [git-model.md](git-model.md) is the one source of truth for trees as branches, saves, locks, the queue and its
 referee, collisions, syncs, transactions, nested forks and crash recovery. Where a page here seems to disagree with

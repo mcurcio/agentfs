@@ -18,11 +18,11 @@ use agentfs_contracts::clients::{AttachmentEndReason, ClientId, Ordinal};
 use agentfs_contracts::name::{ForkKey, LauncherId};
 use agentfs_contracts::pod::PodContext;
 use agentfs_contracts::ports::{
-    ClientRow, ClientStore, ForkStore, NewClient, QueueFacts, StoreError, TreeClients,
+    ClientRow, ClientStore, ForkStore, NewClient, QueueFacts, StoreError, TreeClients, VolumeStore,
 };
 use agentfs_contracts::tree::{ForkId, TreeId};
 use agentfs_contracts::trees::{ForkFacts, ForkPhase, ForkSettings};
-use agentfs_contracts::volume::IoKind;
+use agentfs_contracts::volume::{IoKind, VolumeEvent, VolumeState};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
@@ -38,9 +38,13 @@ const REBOUND: &str = "Rebound";
 const ATTACHMENT_ENDED: &str = "AttachmentEnded";
 const LAST_DETACHED: &str = "LastDetached";
 const CLAIM_RELEASED: &str = "ClaimReleased";
+/// The kinds of the events on the volume's chain.
+const VOLUME_STAGED: &str = "VolumeStaged";
+const VOLUME_DRAINING: &str = "VolumeDraining";
+const VOLUME_RELEASED: &str = "VolumeReleased";
 
-/// The domains' stores over one served volume: Trees' and Clients' rows and
-/// the queue facts now; Volume's in S6.
+/// The domains' stores over one served volume: Volume's, Trees' and Clients'
+/// rows and the queue facts.
 #[derive(Clone)]
 pub struct TreeStore {
     recording: Arc<Recording>,
@@ -66,13 +70,6 @@ impl TreeStore {
     }
 
     /// One step of one row alone on `chain`, stamped over its current row.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "slice S6 writes the volume's row alone through it"
-        )
-    )]
     fn write_row<T: Serialize + DeserializeOwned>(
         &self,
         chain: Chain,
@@ -480,6 +477,32 @@ impl ClientStore for TreeStore {
             actor.record_rows(|_| Ok(vec![write]))?;
             Ok(())
         })
+    }
+}
+
+/// The volume's lifecycle row on `refs/agentfs/volume`: one step per move,
+/// the row alone, its event's detail the drain or disposition.
+impl VolumeStore for TreeStore {
+    fn load(&self) -> Result<Option<Audited<VolumeState>>, StoreError> {
+        Ok(TreeStore::load(self, RowDomain::Volume)?.into_iter().next())
+    }
+
+    fn record(
+        &mut self,
+        state: VolumeState,
+        event: &VolumeEvent,
+        by: &Principal,
+        at: &PodContext,
+    ) -> Result<(), StoreError> {
+        let event = match event {
+            VolumeEvent::VolumeStaged => (VOLUME_STAGED, String::new()),
+            VolumeEvent::VolumeDraining(drain) => (VOLUME_DRAINING, format!("{drain:?}")),
+            VolumeEvent::VolumeReleased(disposition) => {
+                (VOLUME_RELEASED, format!("{disposition:?}"))
+            }
+        };
+        self.write_row(Chain::Volume, state, event, by, at)?;
+        Ok(())
     }
 }
 

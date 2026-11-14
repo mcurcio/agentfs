@@ -51,6 +51,18 @@ drain_queue() {
   done
   echo 'queue did not drain' >&2; return 1
 }
+# A mount of the root alone, killed once its client's attach is built: the
+# volume stays staged (a stage then writes nothing) and the client attached (a
+# mount then rebinds it). Returns once the killed process's lease is free.
+leave_root_attached() {
+  local before
+  before=$(tree_git_root_clients "$work/state/history.git")
+  start '' root
+  tree_git_wait_root_attached "$work/state/history.git" "$before"
+  kill -KILL "$pid"; wait "$pid" 2>/dev/null || true; pid=
+  fusermount3 -uz "$work/main"
+  flock "$work/state/actor.lock" true
+}
 points=(tree.wal_before_header tree.wal_after_payload tree.wal_before_fsync tree.wal_after_fsync tree.before_step tree.build_before_batch tree.build_after_pack tree.build_after_built_log tree.build_after_ref_copy)
 for point in "${points[@]}"; do
   rm -rf "$work/state" "$work/main" "$work/sandbox"
@@ -75,9 +87,13 @@ PY
   drain_queue candidate
   fusermount3 -u "$work/main"; fusermount3 -u "$work/sandbox"
   wait "$pid"; pid=
-  # The mount records one step of its own first, the root client's attach: one
-  # record, one fsync, one step and one builder batch, each a point's first hit.
-  # Its client's call meets the next.
+  # A clean exit released the volume: a mount now stages it, one step, before
+  # its client's attach, the two in one builder batch or two. A killed mount
+  # leaves it staged with its root client attached instead.
+  leave_root_attached
+  # So the mount records one step of its own first, the root client's rebind:
+  # one record, one fsync, one step and one builder batch, each a point's first
+  # hit. Its client's call meets the next.
   case "$point" in
     # A write appends with no fsync: the client's fsync is the next. The open
     # is the next record appended, the write the one after.

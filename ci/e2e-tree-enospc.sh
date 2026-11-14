@@ -115,9 +115,19 @@ assert os.write(fd, b'git-acknowledged') == 16
 os.fsync(fd)
 os.close(fd)
 PY
-  fusermount3 -u "$work/main"
-  wait "$pid"; pid=
-  # The mount's own step comes first (its root client's attach: one step, one
+  # Killed once the save is built, the mount leaves the volume staged (a stage
+  # then writes nothing) and its root client attached (a mount then rebinds it).
+  # A clean exit would release the volume, and the next mount's stage and attach
+  # be two steps, in one builder batch or two.
+  for _ in $(seq 1 300); do
+    tree_git_file "$work/volume/state/history.git" root source >/dev/null 2>&1 && break
+    kill -0 "$pid"; sleep .1
+  done
+  tree_git_file "$work/volume/state/history.git" root source >/dev/null
+  kill -KILL "$pid"; wait "$pid" 2>/dev/null || true; pid=
+  fusermount3 -uz "$work/main"
+  flock "$work/volume/state/actor.lock" true
+  # The mount's own step comes first (its root client's rebind: one step, one
   # builder batch, each the point's first hit), built before the rename starts,
   # so the rename meets the point's second hit.
   before=$(tree_git_root_clients "$work/volume/state/history.git")
@@ -186,12 +196,12 @@ rename_while_full tree.build_after_built_log NONE destination behind
 grep -Fq 'tree CopyStale' "$work/tree.build_after_built_log.log" || { cat "$work/tree.build_after_built_log.log" >&2; exit 1; }
 printf 'PASS\tenospc-after-commit-point\trename 0; destination\n' | tee -a "$work/results.tsv"
 # Only a failed fsync stops the actor: the file can no longer be trusted. A
-# write appends with no fsync; the first journal fsync after the mount's own (its
-# root client's attach) fails, the client's own or the builder's behind the
-# create, and every call after it answers EIO.
+# write appends with no fsync; the first journal fsync after the mount's own two
+# (its stage, then its root client's attach) fails, the client's own or the
+# builder's behind the create, and every call after it answers EIO.
 rm -rf "$work/volume/state"
 "$bin" --state "$work/volume/state" trees init --volume t
-AGENTFS_FAILPOINTS='tree.wal_before_fsync=error@2' "$bin" --state "$work/volume/state" trees mount "$work/main" >"$work/fsync-mount.log" 2>&1 & pid=$!
+AGENTFS_FAILPOINTS='tree.wal_before_fsync=error@3' "$bin" --state "$work/volume/state" trees mount "$work/main" >"$work/fsync-mount.log" 2>&1 & pid=$!
 wait_mounted "$work/main"
 python3 - "$work/main/synced" "$work/main/after-fsync" <<'PY'
 import errno, os, sys

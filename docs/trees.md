@@ -45,8 +45,10 @@ target/debug/agentfs --state /tmp/agentfs-trees/state trees mount \
 Use ordinary file calls in either view. The command prints `fork tree: fork/N` on
 stderr. Without `--fork-key` every mount makes a new fork, which ends when its view
 is unmounted; under a key, every mount finds the same fork until `trees end
---fork-key` ends it ([forks](#forks-keys-end-and-the-drop)). Unmount both views
-with `fusermount3 -u PATH`; unmounting every view ends the process.
+--fork-key` ends it ([forks](#forks-keys-end-and-the-drop)). Stop the mount with
+SIGTERM or SIGINT, or unmount every view with `fusermount3 -u PATH`: either drains
+the volume, and the process exits 0 once it is released
+([lifecycle](#volume-lifecycle)).
 
 | Command or flag | Meaning |
 |---|---|
@@ -141,7 +143,7 @@ reconcile ends what it left.
 ## Rows and event commits
 
 The volume's own events (a fork created, ended and dropped, clients attached,
-rebound and ended, and in a later slice the volume's lifecycle) are on record
+rebound and ended, the volume staged, draining and released) are on record
 like file changes: each is a commit in the volume's repository, on a chain of commits beside
 the tree it concerns.
 
@@ -149,7 +151,7 @@ the tree it concerns.
 |---|---|
 | `refs/agentfs/trees/fork/<n>` | fork `n`'s row (`ForkCreated`, `ForkEnded`, `ForkDropped`); kept after the fork is dropped |
 | `refs/agentfs/clients/<tree>` | the clients attached to a tree and a fork's writer claim (`Attached`, `Rebound`, `AttachmentEnded`, `LastDetached`, `ClaimReleased`) |
-| `refs/agentfs/volume` | the volume's lifecycle |
+| `refs/agentfs/volume` | the volume's lifecycle (`VolumeStaged`, `VolumeDraining Stop`, `VolumeReleased Keep`) |
 
 Each event commit's tree is one file, `row.json`: the row's value after the event
 with its audit stamps (`created` set at the row's first write and kept, `changed` at
@@ -219,6 +221,41 @@ before the call returns.
 The journal records a drop as `Change::Drop { fork }`: its pointer changes delete
 the branch and the queue entries, and the actor, the restart's replay and the
 builder each forget the tree.
+
+## Volume lifecycle
+
+A volume is staged while a mount serves it, draining once it is told to stop, and
+released when nothing promised would be lost if the process stopped now. Its row on
+`refs/agentfs/volume` says which; every move is one journal step with its event
+commit, durable before the call returns. A volume `trees init` just created has no
+row and counts as released.
+
+- **Stage.** `trees mount` stages the volume first: it takes the state area's lock,
+  recovers the volume and records `VolumeStaged` (by `launcher cli`, with the
+  mount's pod context). A mount after a kill finds the volume staged and writes
+  nothing; one during a drain cancels it. Then it restores the forks and clients,
+  rebinds or attaches each view's client, reconciles the rest, and drops what may
+  drop ([clients](#clients), [forks](#forks-keys-end-and-the-drop)).
+- **Stop.** SIGTERM or SIGINT, or the last view unmounted, unstages the volume:
+  `VolumeDraining Stop`. From then no client attaches. The mount detaches each
+  client, whose open files close as saves first (a file a process still holds open
+  is saved as it stands, and a write after that answers `EROFS`), then unmounts each
+  view lazily (`fusermount3 -uz`). Every signal is an event on the mount's one
+  channel; nothing polls.
+- **Release.** Each client's end and each landing a take makes re-judge the
+  release. It waits while the volume is staged, while any client is attached, and
+  while any tree's queue holds an entry; with none, `VolumeReleased Keep` (by
+  `agentfs`) is recorded, the mount leaves its loop, waits for every view to end,
+  and exits 0. A view whose file a process holds open ends when that file closes.
+  No remote is asked yet: with none, the volume is settled.
+- **A failed builder holds the release.** Queues are read from the journal, but an
+  entry is taken only once history is built behind it. While the builder fails,
+  the drain waits: the volume stays `Draining`, recording goes on, the process stays
+  up with the builder's alarm, and Kubernetes' grace period ends it. Nothing
+  recorded is lost: the next mount recovers every record and builds it.
+- **A stopped actor ends serving.** After a recording failure stops the actor,
+  nothing more can be recorded, so no drain can finish. Once its views have
+  ended, the mount exits 1 with the actor's error; a stop closes its views first.
 
 ## What a tree does
 

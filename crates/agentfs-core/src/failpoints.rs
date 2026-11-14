@@ -131,7 +131,8 @@ mod take_gate {
     /// answers taken|waiting|empty on `took`, or `error ...`; a line `settle`
     /// waits until history is built through every record so far and answers
     /// `settled`. An empty line ends
-    /// the gate, so an unmount can join the worker. The actor stays unlocked
+    /// the gate: the worker then takes as it does without one, so a stop
+    /// drain can empty the queues and the mount exit. The actor stays unlocked
     /// while it waits.
     pub struct TakeGate {
         go: BufReader<File>,

@@ -255,6 +255,61 @@ fusermount3 -u "$work/main"
 wait "$pid"
 pid=
 git --git-dir="$git_dir" log --format=%s "refs/agentfs/trees/$unkeyed" | grep -Fx "ForkEnded $unkeyed" >/dev/null
+# sigterm_with_a_file_open_saves_and_releases: SIGTERM drains the volume. The
+# root's client is detached, which saves the file a process holds open, the
+# view closes, the volume releases (refs/agentfs/volume ends VolumeReleased),
+# and the process exits 0 once the held file closes.
+: >"$work/term.log"
+# The root alone: no fork, so no queue entry holds the release back, and the
+# drain's detach is all that stands between the stop and the release.
+"$bin" --state "$work/state" trees mount "$work/main" >>"$work/term.log" 2>&1 &
+pid=$!
+for _ in $(seq 1 200); do
+    if mountpoint -q "$work/main"; then break; fi
+    kill -0 "$pid"
+    sleep 0.1
+done
+rm -f "$work/ack"
+python3 - "$work/main/held" "$work/ack" <<'PY' >"$work/holder.log" 2>&1 &
+import os
+from pathlib import Path
+import sys
+import time
+f = open(sys.argv[1], "wb", buffering=0)
+f.write(b"h" * 4096)
+os.fsync(f.fileno())
+Path(sys.argv[2]).write_text("ack")
+while True:
+    time.sleep(1)
+PY
+client=$!
+for _ in $(seq 1 200); do
+    [ ! -f "$work/ack" ] || break
+    kill -0 "$client"
+    sleep 0.1
+done
+test -f "$work/ack"
+kill -TERM "$pid"
+released=
+for _ in $(seq 1 300); do
+    kind=$(git --git-dir="$git_dir" log -1 --format='%(trailers:key=Agentfs-Kind,valueonly)' \
+        refs/agentfs/volume 2>/dev/null || true)
+    if [ "$kind" = VolumeReleased ]; then released=1; break; fi
+    kill -0 "$pid"
+    sleep 0.1
+done
+test -n "$released" || { echo "SIGTERM did not release the volume" >&2; exit 1; }
+# Saved by the drain while the file is still open: in the root's history now.
+test "$(tree_git_file "$git_dir" root held | wc -c)" -eq 4096
+test -z "$(tree_git_file "$git_dir" root held | tr -d h)"
+git --git-dir="$git_dir" log --format='%(trailers:key=Agentfs-Kind,valueonly)' refs/agentfs/volume \
+    | sed '/^$/d' | sed -n 1,3p | tr '\n' ' ' | grep -Fx 'VolumeReleased VolumeDraining VolumeStaged ' >/dev/null
+kill "$client"
+wait "$client" 2>/dev/null || true
+client=
+wait "$pid"
+pid=
+! mountpoint -q "$work/main"
 git --git-dir="$work/state/history.git" fsck --strict
 test "$mmap_status" -eq 0
 test "$tmpfile_status" -eq 0

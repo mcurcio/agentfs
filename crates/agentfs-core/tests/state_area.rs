@@ -1,5 +1,11 @@
 //! `ensure` on a real state area (docs/trees.md, "Volume identity"): one id
-//! however often it runs, and every refusal made before any write.
+//! however often it runs, and every refusal made before any write. The
+//! lifecycle over it (docs/trees.md, "Volume lifecycle"): each move one
+//! journal step with its row, and a drain that waits for the queues.
+#![cfg_attr(
+    not(feature = "failpoints"),
+    allow(unused_imports, dead_code, reason = "some tests need failpoints")
+)]
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -9,13 +15,20 @@ use agentfs_contracts::caps::{LaunchCap, LaunchScope, Minter};
 use agentfs_contracts::clients::{AttachedLookup, ClientSet};
 use agentfs_contracts::name::{LauncherId, VolumeName};
 use agentfs_contracts::pod::PodContext;
+use agentfs_contracts::ports::VolumeStore;
 use agentfs_contracts::ports::{Event, EventSink};
 use agentfs_contracts::volume::{
-    EnsureOutcome, SpecField, StartPoint, Volume, VolumeError, VolumeSpec,
+    Blocker, Disposition, Drain, EnsureOutcome, ReleaseVerdict, SpecField, StartPoint, Volume,
+    VolumeError, VolumeEvent, VolumeSpec, VolumeState,
 };
 use agentfs_core::state_area::TreeStateArea;
-use agentfs_core::tree_actor::{Error, TreeActor};
+use agentfs_core::store::TreeStore;
+use agentfs_core::tree_actor::{Error, Recording, TreeActor};
 use agentfs_volume::VolumeService;
+use std::sync::Arc;
+
+#[path = "support/trees.rs"]
+mod trees;
 
 struct NoClients;
 
@@ -25,14 +38,22 @@ impl AttachedLookup for NoClients {
     }
 }
 
-struct Events;
+/// The events published, shared by every clone.
+#[derive(Clone, Default)]
+struct Events(std::rc::Rc<std::cell::RefCell<Vec<Event>>>);
 
 impl EventSink for Events {
-    fn publish(&mut self, _: Event) {}
+    fn publish(&mut self, event: Event) {
+        self.0.borrow_mut().push(event);
+    }
 }
 
 fn volume(root: &Path) -> VolumeService<TreeStateArea, NoClients, Events> {
-    VolumeService::new(TreeStateArea::at(root), NoClients, Events)
+    volume_with(root, Events::default())
+}
+
+fn volume_with(root: &Path, events: Events) -> VolumeService<TreeStateArea, NoClients, Events> {
+    VolumeService::new(TreeStateArea::at(root), NoClients, events)
 }
 
 fn spec(name: &str) -> VolumeSpec {
@@ -161,4 +182,226 @@ fn open_never_creates() {
         Err(Error::NotCreated)
     ));
     assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
+}
+
+// Slice S6: the lifecycle.
+
+const WORKER: &str = "AGENTFS_STATE_AREA_WORKER";
+
+/// `git` in the state area's store: its stdout, trimmed.
+fn git(root: &Path, args: &[&str]) -> String {
+    let output = std::process::Command::new("git")
+        .env("GIT_DIR", root.join("history.git"))
+        .args(args)
+        .output()
+        .unwrap();
+    String::from_utf8(output.stdout)
+        .unwrap()
+        .trim_end()
+        .to_owned()
+}
+
+/// The volume's row as the reopened journal leaves it.
+fn row(root: &Path) -> Option<VolumeState> {
+    let recording = Recording::open(root, &PodContext::default()).unwrap();
+    TreeStore::new(recording)
+        .load()
+        .unwrap()
+        .map(|row| row.value)
+}
+
+/// A created volume, then its stage: whichever failpoint the spec names
+/// kills it on the way.
+#[test]
+fn stage_worker() {
+    let Some(dir) = std::env::var_os(WORKER) else {
+        return;
+    };
+    let root = Path::new(&dir);
+    let at = PodContext::default();
+    volume(root).ensure(spec("t"), &at, &root_cap()).unwrap();
+    let mut volume = volume(root);
+    volume.stage(&at, &root_cap()).unwrap();
+    volume.area().recording().unwrap().settle().unwrap();
+    unreachable!("the failpoint kills this process");
+}
+
+/// Runs `stage_worker` in a child process with the failpoint `spec`, which
+/// kills it; returns once the state area's lease is free.
+fn run_killed(root: &Path, spec: &str) {
+    use std::os::unix::process::ExitStatusExt;
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "stage_worker", "--nocapture"])
+        .env(WORKER, root)
+        .env(agentfs_core::failpoints::ENV_VAR, spec)
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.signal(),
+        Some(libc::SIGKILL),
+        "{spec} did not kill the worker: {output:?}"
+    );
+    trees::wait_for_lease(root);
+}
+
+/// A lifecycle move and its row are one record: killed before its step,
+/// the volume has no row and no event; killed once its bytes are in the
+/// journal, it is staged, though nothing had built its event commit.
+#[cfg(feature = "failpoints")]
+#[test]
+fn a_lifecycle_move_and_its_row_are_one_record() {
+    let tmp = tempfile::tempdir().unwrap();
+    let before = tmp.path().join("before");
+    run_killed(&before, "tree.before_step=kill@1");
+    assert_eq!(row(&before), None);
+    assert_eq!(git(&before, &["for-each-ref", "refs/agentfs/volume"]), "");
+
+    let after = tmp.path().join("after");
+    run_killed(&after, "tree.wal_after_payload=kill@1");
+    assert_eq!(git(&after, &["for-each-ref", "refs/agentfs/volume"]), "");
+    assert_eq!(row(&after), Some(VolumeState::Staged));
+    assert_eq!(
+        git(&after, &["log", "--format=%s", "refs/agentfs/volume"]),
+        "VolumeStaged"
+    );
+}
+
+/// The lifecycle on record: stage, unstage and release are three event
+/// commits on `refs/agentfs/volume`, each with its row, its principal and
+/// the history service's pod context.
+#[test]
+fn the_lifecycle_is_a_chain_of_events() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("state");
+    let at = PodContext {
+        pod: Some(agentfs_contracts::name::Label::parse("p-1").unwrap()),
+        ..PodContext::default()
+    };
+    volume(&root).ensure(spec("t"), &at, &root_cap()).unwrap();
+    let events = Events::default();
+    let mut volume = volume_with(&root, events.clone());
+    assert_eq!(volume.stage(&at, &root_cap()), Ok(VolumeState::Staged));
+    assert_eq!(
+        volume.unstage(&root_cap()),
+        Ok(VolumeState::Released(Disposition::Keep))
+    );
+    assert_eq!(
+        *events.0.borrow(),
+        [
+            Event::Volume(VolumeEvent::VolumeStaged),
+            Event::Volume(VolumeEvent::VolumeDraining(Drain::Stop)),
+            Event::Volume(VolumeEvent::VolumeReleased(Disposition::Keep)),
+        ]
+    );
+    volume.area().recording().unwrap().settle().unwrap();
+    assert_eq!(
+        git(
+            &root,
+            &[
+                "log",
+                "--format=%s|%(trailers:key=Agentfs-By,valueonly,separator=)|%(trailers:key=Agentfs-Pod,valueonly,separator=)",
+                "refs/agentfs/volume"
+            ]
+        ),
+        "VolumeReleased Keep|agentfs|p-1\nVolumeDraining Stop|launcher cli|p-1\nVolumeStaged|launcher cli|p-1"
+    );
+    let shown = git(&root, &["show", "refs/agentfs/volume:row.json"]);
+    assert!(
+        shown.contains("\"value\":{\"Released\":\"Keep\"}"),
+        "{shown}"
+    );
+    drop(volume);
+    // A new run stages a released volume again.
+    let mut volume = volume_with(&root, Events::default());
+    assert_eq!(volume.stage(&at, &root_cap()), Ok(VolumeState::Staged));
+}
+
+/// Principle 5 and the drain's wait: with the builder failing, a queued
+/// landing cannot be taken, so the drain waits (`Draining`, nothing
+/// released) while recording goes on; cleared, the landing is taken and
+/// the re-judgement releases.
+#[cfg(feature = "failpoints")]
+#[test]
+fn a_drain_goes_on_while_the_builder_fails() {
+    use agentfs_contracts::ports::ForkStore;
+    use agentfs_contracts::trees::{ForkSettings, Landing};
+    use agentfs_core::tree_actor::{Progress, TreeId};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("state");
+    let at = PodContext::default();
+    volume(&root).ensure(spec("t"), &at, &root_cap()).unwrap();
+    let held = agentfs_core::failpoints::configure("tree.build_before_batch=error@*").unwrap();
+    let events = Events::default();
+    let mut volume = volume_with(&root, events.clone());
+    assert_eq!(volume.stage(&at, &root_cap()), Ok(VolumeState::Staged));
+    let recording = volume.area().recording().unwrap();
+    let mut store = TreeStore::new(Arc::clone(&recording));
+    let fork = ForkStore::create(
+        &mut store,
+        TreeId::Root,
+        None,
+        ForkSettings {
+            landing: Landing::Automatic,
+        },
+        &LauncherId::parse("cli").unwrap(),
+        &at,
+    )
+    .unwrap()
+    .value
+    .fork;
+    {
+        let mut actor = recording.actor().unwrap();
+        let h = actor
+            .write_open(fork.into(), "f", &trees::writer("w"), true)
+            .unwrap();
+        actor.write(h, 0, b"landing\n", false).unwrap();
+        actor.close(h).unwrap();
+    }
+    assert_eq!(recording.progress().unwrap(), Progress::Waiting);
+    assert_eq!(
+        volume.unstage(&root_cap()),
+        Ok(VolumeState::Draining(Drain::Stop))
+    );
+    assert_eq!(
+        volume.release_verdict(),
+        ReleaseVerdict::Wait(vec![Blocker::QueuesNotEmpty(vec![TreeId::Root])])
+    );
+    assert_eq!(volume.rejudge(), Ok(VolumeState::Draining(Drain::Stop)));
+    assert!(
+        !events
+            .0
+            .borrow()
+            .contains(&Event::Volume(VolumeEvent::VolumeReleased(
+                Disposition::Keep
+            )))
+    );
+    // Recording goes on while the drain waits.
+    {
+        let mut actor = recording.actor().unwrap();
+        let h = actor
+            .write_open(TreeId::Root, "during", &trees::writer("w"), true)
+            .unwrap();
+        actor.write(h, 0, b"saved\n", false).unwrap();
+        actor.close(h).unwrap();
+    }
+    drop(held);
+    loop {
+        recording.settle().unwrap();
+        match recording.progress().unwrap() {
+            Progress::Landed => {}
+            Progress::Empty => break,
+            Progress::Waiting => panic!("every entry is built and nothing is open"),
+        }
+    }
+    assert_eq!(
+        volume.rejudge(),
+        Ok(VolumeState::Released(Disposition::Keep))
+    );
+    assert_eq!(
+        events.0.borrow().last(),
+        Some(&Event::Volume(VolumeEvent::VolumeReleased(
+            Disposition::Keep
+        )))
+    );
 }

@@ -12,6 +12,14 @@ design was reviewed on 2026-10-12.
 
 ### Added
 
+- **Tree views: the volume's lifecycle.** `trees mount` stages the volume
+  (`VolumeStaged` on `refs/agentfs/volume`) before it serves. SIGTERM, SIGINT or
+  unmounting every view drains it (`VolumeDraining Stop`): no client attaches,
+  each client is detached with its open files saved, each view unmounts lazily,
+  and once no client is attached and every queue is empty the volume is released
+  (`VolumeReleased Keep`) and the process exits 0. A failed builder holds the
+  release (the volume stays draining, recording goes on); a stopped actor exits 1.
+  Each move is one journal step with its event commit, durable before it returns.
 - **Tree views: fork keys, end and drop.** `trees mount --fork-mount DIR` mounts
   a new fork, which ends when its view is unmounted, or with `--fork-key KEY` the
   open fork under that key: a second create under a key returns its fork and

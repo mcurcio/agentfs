@@ -1,6 +1,9 @@
 # Domain: Clients
 
-**Proposed, not built.** This page proposes the Clients domain (who is attached to which tree, with what grant), one part of the system around the git model ([the system](../system.md)). The git model ([git-model.md](../git-model.md)) wins wherever the two disagree. Rust sketches show surfaces only. The commit that lands the slice that builds this domain deletes this page and moves the behaviour into the library or operator docs.
+**Proposed, partly built.** Attach, rebind, detach, reconcile, sessions, each fork's one writer for life and no
+attach while the volume drains are built and described in [docs/trees.md](../../trees.md#clients) and the
+[library](../../library/core.md#rows-and-domain-events); grants with view profiles and `Sees`, operator actors and
+`advance` are not. This page proposes the Clients domain (who is attached to which tree, with what grant), one part of the system around the git model ([the system](../system.md)). The git model ([git-model.md](../git-model.md)) wins wherever the two disagree. Rust sketches show surfaces only. The commit that lands the slice that builds this domain deletes this page and moves the behaviour into the library or operator docs.
 
 ## 1. What Clients owns, its language, and what it is not
 
