@@ -42,11 +42,6 @@ impl BaseFile {
         }))
     }
 
-    /// Its bytes' blob id, when known.
-    #[cfg(test)]
-    pub fn blob(&self) -> Option<Oid> {
-        self.blob
-    }
 }
 
 impl std::fmt::Debug for BaseFile {
@@ -489,7 +484,7 @@ mod tests {
     #[test]
     fn random_calls_agree_with_a_byte_oracle() {
         for seed in 1..40_u64 {
-            let mut rng = Rng(seed * 0x9e37_79b9_7f4a_7c15);
+            let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15));
             let mut frames = Scratch::new();
             let mut map = FileMap::empty();
             let mut bytes = Vec::new();

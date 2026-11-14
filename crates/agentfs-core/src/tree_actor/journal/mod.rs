@@ -59,7 +59,7 @@ pub(super) use commit_point::compact_at;
 use durable::{Durability, RecordNo};
 use segment::{FramePos, SEGMENT_BYTES, Segment};
 #[cfg(test)]
-pub(super) use fold::Folded;
+pub(super) use fold::{Folded, LiveOpen};
 pub(super) use fold::{FoldedOpen, fold, objects_through, runs_from_frame};
 
 const MAGIC: &[u8; 4] = b"AFJ3";
@@ -876,10 +876,10 @@ impl Journal {
         };
         let (segment, at) = self.current().clone();
         let written = (|| -> io::Result<()> {
+            crate::failpoints::hit("tree.compact_before_checkpoint")?;
             segment.file().write_all_at(&bytes, at)?;
             segment.file().sync_data()?;
-            sync_dir(&self.dir)?;
-            crate::failpoints::hit("tree.compact_before_drop")
+            sync_dir(&self.dir)
         })();
         if let Err(e) = written {
             if rolled {
@@ -913,6 +913,7 @@ impl Journal {
         built: RecordNo,
         live: &dyn Fn(&Record) -> bool,
     ) -> Result<DropStats> {
+        crate::failpoints::hit("tree.compact_before_drop")?;
         let mut stats = DropStats::default();
         let mut index = 0;
         while index + 1 < self.segments.len() {

@@ -420,13 +420,12 @@ fn a_page_write_records_only_changed_bytes_and_a_clean_one_nothing() {
     let a = k.open("a");
     k.map(a);
     k.store(0, b"a"); // The same byte: dirty, and nothing changed.
-    let journal = tmp.path().join("calls.wal");
-    let before = std::fs::metadata(&journal).unwrap().len();
+    let before = trees::journal_len(tmp.path());
     k.flush();
-    assert_eq!(std::fs::metadata(&journal).unwrap().len(), before);
+    assert_eq!(trees::journal_len(tmp.path()), before);
     k.store(0, b"Z");
     k.flush();
-    assert!(std::fs::metadata(&journal).unwrap().len() > before);
+    assert!(trees::journal_len(tmp.path()) > before);
     k.close(a);
     assert_eq!(k.saved(), b"Zbcdefgh");
 }
@@ -458,9 +457,9 @@ fn a_writable_descriptor_reads_page_writes_and_a_read_only_one_keeps_its_snapsho
     k.map(a);
     k.store(0, b"12");
     k.flush();
-    assert_eq!(k.v.read_open(b).unwrap(), b"12cdefgh", "an open before it");
+    assert_eq!(k.v.read_open(b).unwrap().to_vec().unwrap(), b"12cdefgh", "an open before it");
     let c = k.open("c");
-    assert_eq!(k.v.read_open(c).unwrap(), b"12cdefgh", "an open after it");
+    assert_eq!(k.v.read_open(c).unwrap().to_vec().unwrap(), b"12cdefgh", "an open after it");
     assert_eq!(k.v.read(TREE, PATH).unwrap(), SEED, "a new read-only open");
 }
 

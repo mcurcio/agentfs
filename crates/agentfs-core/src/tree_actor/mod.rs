@@ -1109,10 +1109,40 @@ mod tests {
     /// Two folds that add up to the same, but for how their records name
     /// pointer values (a step's, or the oid it was built as): the same names.
     fn same_fold(a: &journal::Folded, b: &journal::Folded) {
-        assert_eq!(a.opens, b.opens);
+        // Carried frames sit elsewhere: compare what they hold.
+        type Opens = Vec<(u64, journal::LiveOpen, Vec<(u64, recording::Call, Vec<u8>)>)>;
+        let opens = |f: &journal::Folded| -> Opens {
+            f.opens
+                .iter()
+                .map(|(handle, o)| {
+                    let calls = o
+                        .calls
+                        .iter()
+                        .map(|(seq, call, pos)| {
+                            (*seq, call.clone(), pos.bytes(0, call.carried()).unwrap())
+                        })
+                        .collect();
+                    (*handle, o.open.clone(), calls)
+                })
+                .collect()
+        };
+        type Writes = Vec<((TreeId, u64), Vec<(u64, u64, Vec<u8>)>)>;
+        let writes = |f: &journal::Folded| -> Writes {
+            f.page_writes
+                .iter()
+                .map(|(key, runs)| {
+                    let runs = runs
+                        .iter()
+                        .map(|(seq, run)| (*seq, run.offset, run.at.bytes(0, run.len).unwrap()))
+                        .collect();
+                    (*key, runs)
+                })
+                .collect()
+        };
+        assert_eq!(opens(a), opens(b));
         assert_eq!(a.upstreams, b.upstreams);
         assert_eq!(a.next_seq, b.next_seq);
-        assert_eq!(a.page_writes, b.page_writes);
+        assert_eq!(writes(a), writes(b));
         assert_eq!(a.saved_through, b.saved_through);
         let names = |f: &journal::Folded| -> Vec<String> {
             f.pointers.iter().map(|(n, _)| n.clone()).collect()
@@ -1144,7 +1174,7 @@ mod tests {
         v.record_page_write(
             ROOT,
             closed_object,
-            &[pages::Run {
+            &[pages::Changed {
                 offset: 0,
                 bytes: b"gone".to_vec(),
             }],
@@ -1159,7 +1189,8 @@ mod tests {
         assert_eq!(folded.opens[&held].calls.len(), 1);
         assert!(folded.opens[&anonymous].open.anonymous);
         assert_eq!(folded.upstreams.upstream_of(fork), Some(ROOT));
-        assert_eq!(folded.page_writes[&(ROOT, object)][0].1.bytes, b"WXYZ");
+        let run = &folded.page_writes[&(ROOT, object)][0].1;
+        assert_eq!(run.at.bytes(0, run.len).unwrap(), b"WXYZ");
         assert!(folded.saved_through.contains_key(&(ROOT, object)));
         assert!(!folded.page_writes.contains_key(&(ROOT, closed_object)));
         assert_eq!(folded.next_seq, v.next);
@@ -1240,7 +1271,7 @@ mod tests {
             panic!("the first frame is a checkpoint");
         };
         edit(pointers, upstreams);
-        fs::remove_file(tmp.path().join(JOURNAL)).unwrap();
+        fs::remove_dir_all(tmp.path().join(JOURNAL)).unwrap();
         Journal::create(&tmp.path().join(JOURNAL), &first).unwrap();
         TreeActor::open(tmp.path(), &PodContext::default())
     }
@@ -1287,6 +1318,7 @@ mod tests {
             "agentfs-trees-3\n",
             "agentfs-trees-4\n",
             "agentfs-trees-5\n",
+            "agentfs-trees-7\n",
         ] {
             let tmp = tempfile::tempdir().unwrap();
             drop(new_actor(tmp.path()));
