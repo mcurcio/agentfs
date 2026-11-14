@@ -20,16 +20,68 @@ use super::{Error, Result};
 pub(super) use ancestry::Broken;
 pub(super) use undecided::{Landed, Undecided, ended_files, undecided};
 
+/// A tree's files and name histories, each file's lines as stored (runs) or,
+/// for the rules, line by line ([`ByLine`]).
 #[derive(Clone, Debug, Default)]
-pub(super) struct Snapshot {
-    pub files: BTreeMap<MergeFileIdentity, File>,
+pub(super) struct Snapshot<L = Lines> {
+    pub files: BTreeMap<MergeFileIdentity, File<L>>,
     pub names: BTreeMap<MergeFileIdentity, NameHistory>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(super) struct File {
+pub(super) struct File<L = Lines> {
     pub object: u64,
-    pub lines: Lines,
+    pub lines: L,
+}
+
+/// A file's lines one by one, every version with its ancestor: what the rules read.
+pub(super) type Expanded = crate::tree_reconcile::Expanded<LineVersion>;
+
+/// A snapshot line by line.
+pub(super) type ByLine = Snapshot<Expanded>;
+
+impl Snapshot {
+    /// The snapshot line by line: a take's cost, its files' line counts.
+    pub(super) fn by_line(&self) -> ByLine {
+        Snapshot {
+            files: self
+                .files
+                .iter()
+                .map(|(id, f)| {
+                    (
+                        *id,
+                        File {
+                            object: f.object,
+                            lines: f.lines.expand(),
+                        },
+                    )
+                })
+                .collect(),
+            names: self.names.clone(),
+        }
+    }
+}
+
+impl ByLine {
+    /// The snapshot as stored.
+    pub(super) fn stored(self) -> Result<Snapshot> {
+        Ok(Snapshot {
+            files: self
+                .files
+                .into_iter()
+                .map(|(id, f)| {
+                    Ok((
+                        id,
+                        File {
+                            object: f.object,
+                            lines: Lines::from_expanded(&f.lines)?,
+                        },
+                    ))
+                })
+                .collect::<Result<_>>()?,
+            names: self.names,
+        })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -59,8 +111,8 @@ pub(super) struct Collision {
 }
 
 #[derive(Clone, Debug)]
-pub(super) struct Decision {
-    pub snapshot: Snapshot,
+pub(super) struct Decision<L = Lines> {
+    pub snapshot: Snapshot<L>,
     pub collisions: Vec<Collision>,
 }
 
@@ -87,6 +139,24 @@ pub(super) fn land(
     incoming: &Snapshot,
     prior: &PriorDecisions,
 ) -> Result<Decision> {
+    let decision = land_by_line(
+        &upstream.by_line(),
+        &base.by_line(),
+        &incoming.by_line(),
+        prior,
+    )?;
+    Ok(Decision {
+        snapshot: decision.snapshot.stored()?,
+        collisions: decision.collisions,
+    })
+}
+
+fn land_by_line(
+    upstream: &ByLine,
+    base: &ByLine,
+    incoming: &ByLine,
+    prior: &PriorDecisions,
+) -> Result<Decision<Expanded>> {
     let verdicts::Verdicts {
         mut candidates,
         applied_names,
@@ -103,12 +173,12 @@ pub(super) fn land(
             let object = incoming.files.get(&id).ok_or(Error::Format)?.object;
             entry.insert(File {
                 object,
-                lines: Lines::default(),
+                lines: Expanded::default(),
             });
         }
         applied.names.insert(id, name);
     }
-    let empty = Lines::default();
+    let empty = Expanded::default();
     for (id, verdicts) in files {
         let file = incoming.files.get(&id).ok_or(Error::Format)?;
         let theirs = upstream.files.get(&id);
@@ -150,15 +220,20 @@ pub(super) fn sync(
     undecided: &Undecided,
     last_lines: &BTreeMap<MergeFileIdentity, Lines>,
 ) -> Result<Snapshot> {
-    let mut placed = placing::sync_files(upstream, fork, &undecided.lines, last_lines)?;
-    let names = names::sync_names(upstream, fork, &undecided.names)?;
+    let (upstream, fork) = (upstream.by_line(), fork.by_line());
+    let last_lines = last_lines
+        .iter()
+        .map(|(id, lines)| (*id, lines.expand()))
+        .collect();
+    let mut placed = placing::sync_files(&upstream, &fork, &undecided.lines, &last_lines)?;
+    let names = names::sync_names(&upstream, &fork, &undecided.names)?;
     let mut files = BTreeMap::new();
     for (id, name) in &names {
         if !name.is_ended()? {
             files.insert(*id, placed.remove(id).ok_or(Error::Format)?);
         }
     }
-    Ok(Snapshot { files, names })
+    Snapshot { files, names }.stored()
 }
 
 /// A step's lock keys (R9, R9.1): every file whose name head or lines differ, and each path it
@@ -193,10 +268,88 @@ pub(super) fn touches(before: &Snapshot, after: &Snapshot) -> BTreeSet<queue::Ke
     keys
 }
 
+/// The rules' tests' bytes: a map holds none, so each test notes every new
+/// line's bytes by its version (a version is written once) and renders a map
+/// from them.
+#[cfg(test)]
+pub(super) mod test_bytes {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+
+    use super::Expanded;
+    use crate::tree_actor::tree::{EventNumber, LineVersion, Lines, Versions};
+    use crate::tree_reconcile::Line;
+
+    thread_local! {
+        static NOTED: RefCell<HashMap<LineVersion, Vec<u8>>> = RefCell::new(HashMap::new());
+    }
+
+    fn note_live(lines: &Expanded, image: &[u8]) {
+        let parts = image.split_inclusive(|b| *b == b'\n');
+        NOTED.with(|noted| {
+            let mut noted = noted.borrow_mut();
+            for (line, part) in lines.lines.iter().filter(|l| l.live).zip(parts) {
+                noted.entry(line.version).or_insert_with(|| part.to_vec());
+            }
+        });
+    }
+
+    /// The bytes of `lines`' live lines.
+    pub(in crate::tree_actor) fn of(lines: &Expanded) -> Vec<u8> {
+        NOTED.with(|noted| {
+            let noted = noted.borrow();
+            lines
+                .lines
+                .iter()
+                .filter(|l| l.live)
+                .flat_map(|l| noted[&l.version].clone())
+                .collect()
+        })
+    }
+
+    /// The bytes of a stored map's live lines.
+    pub(in crate::tree_actor) fn of_map(lines: &Lines) -> Vec<u8> {
+        of(&lines.expand())
+    }
+
+    /// `bytes` saved over `base` with `event`'s new versions.
+    pub(in crate::tree_actor) fn save(base: &Lines, bytes: &[u8], event: u64) -> Lines {
+        let old = of_map(base);
+        let mut versions = Versions::of(EventNumber::new(event));
+        let map = base.align_bytes(&old, bytes, |n| versions.take(n)).unwrap();
+        note_live(&map.expand(), bytes);
+        map
+    }
+
+    /// [`save`], line by line.
+    pub(in crate::tree_actor) fn save_lines(base: &Expanded, bytes: &[u8], event: u64) -> Expanded {
+        save(&Lines::from_expanded(base).unwrap(), bytes, event).expand()
+    }
+
+    /// `line` now of these bytes.
+    pub(in crate::tree_actor) fn set(line: &mut Line<LineVersion>, bytes: &[u8]) {
+        *line = self::line(line.identity, line.version, bytes);
+    }
+
+    /// A live line of these bytes.
+    pub(in crate::tree_actor) fn line(
+        identity: LineVersion,
+        version: LineVersion,
+        bytes: &[u8],
+    ) -> Line<LineVersion> {
+        NOTED.with(|noted| noted.borrow_mut().insert(version, bytes.to_vec()));
+        Line {
+            identity,
+            version,
+            live: true,
+            open: (!bytes.ends_with(b"\n")).then_some(bytes.len() as u64),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tree_actor::tree::Versions;
 
     /// The landing's rules, as the referee's one entry runs them.
     fn judge(
@@ -214,17 +367,15 @@ mod tests {
 
     fn file(snapshot: &mut Snapshot, id: u64, path: &str, bytes: &[u8]) {
         let key = MergeFileIdentity(id);
-        let mut versions = Versions::of(EventNumber::new(id));
-        let lines = Lines::default().align(bytes, || versions.next()).unwrap();
+        let lines = test_bytes::save(&Lines::default(), bytes, id);
         snapshot
             .names
             .insert(key, NameHistory::created(EventNumber::new(id), path.into()));
         snapshot.files.insert(key, File { object: id, lines });
     }
     fn edit(snapshot: &mut Snapshot, id: u64, bytes: &[u8], seq: u64) {
-        let mut versions = Versions::of(EventNumber::new(seq));
         let file = snapshot.files.get_mut(&MergeFileIdentity(id)).unwrap();
-        file.lines = file.lines.align(bytes, || versions.next()).unwrap();
+        file.lines = test_bytes::save(&file.lines, bytes, seq);
     }
     fn rename(snapshot: &mut Snapshot, id: u64, path: &str, seq: u64) {
         snapshot
@@ -266,7 +417,7 @@ mod tests {
             Some("renamed")
         );
         assert_eq!(
-            decision.snapshot.files[&MergeFileIdentity(1)].lines.bytes(),
+            test_bytes::of_map(&decision.snapshot.files[&MergeFileIdentity(1)].lines),
             b"ONE\ntwo\n"
         );
     }
@@ -300,7 +451,7 @@ mod tests {
         let decision = judge(&parent, &base, &child, &BTreeMap::new()).unwrap();
         assert!(!decision.collisions.is_empty());
         assert_eq!(
-            decision.snapshot.files[&MergeFileIdentity(1)].lines.bytes(),
+            test_bytes::of_map(&decision.snapshot.files[&MergeFileIdentity(1)].lines),
             b"one\nPARENT\n"
         );
     }
@@ -379,7 +530,10 @@ mod tests {
             Some("available")
         );
         assert_eq!(decision.snapshot.files[&renamed].object, 3);
-        assert_eq!(decision.snapshot.files[&renamed].lines.bytes(), b"");
+        assert_eq!(
+            test_bytes::of_map(&decision.snapshot.files[&renamed].lines),
+            b""
+        );
         assert_eq!(
             path(&decision.snapshot.names[&MergeFileIdentity(2)]).unwrap(),
             Some("contested")
@@ -401,7 +555,7 @@ mod tests {
             Some("a")
         );
         assert_eq!(
-            decision.snapshot.files[&MergeFileIdentity(2)].lines.bytes(),
+            test_bytes::of_map(&decision.snapshot.files[&MergeFileIdentity(2)].lines),
             b"parent\n"
         );
         assert!(
@@ -487,7 +641,7 @@ mod tests {
         assert_eq!(decision.collisions.len(), 1);
         assert_eq!(decision.collisions[0].kind, CollisionKind::Line);
         assert_eq!(
-            decision.snapshot.files[&MergeFileIdentity(1)].lines.bytes(),
+            test_bytes::of_map(&decision.snapshot.files[&MergeFileIdentity(1)].lines),
             b"one\nPARENT\n"
         );
     }
@@ -506,7 +660,7 @@ mod tests {
         assert!(decision.collisions.is_empty());
         assert_eq!(decision.snapshot.files[&MergeFileIdentity(1)].object, 1);
         assert_eq!(
-            decision.snapshot.files[&MergeFileIdentity(1)].lines.bytes(),
+            test_bytes::of_map(&decision.snapshot.files[&MergeFileIdentity(1)].lines),
             b"PARENT\nCHILD\n"
         );
         assert!(!decision.snapshot.files.contains_key(&MergeFileIdentity(3)));
@@ -516,12 +670,28 @@ mod tests {
 #[cfg(test)]
 mod sync_tests {
     use super::*;
-    use crate::tree_reconcile::Line;
+
+    /// A snapshot as the sync takes it.
+    trait Stored {
+        fn stored_snapshot(&self) -> Snapshot;
+    }
+
+    impl Stored for Snapshot {
+        fn stored_snapshot(&self) -> Snapshot {
+            self.clone()
+        }
+    }
+
+    impl Stored for ByLine {
+        fn stored_snapshot(&self) -> Snapshot {
+            self.clone().stored().unwrap()
+        }
+    }
 
     /// A sync with these undecided versions.
     fn sync(
-        upstream: &Snapshot,
-        fork: &Snapshot,
+        upstream: &impl Stored,
+        fork: &impl Stored,
         lines: &BTreeSet<LineVersion>,
         names: &BTreeSet<(MergeFileIdentity, EventNumber)>,
         last_lines: &BTreeMap<MergeFileIdentity, Lines>,
@@ -530,7 +700,12 @@ mod sync_tests {
             lines: lines.clone(),
             names: names.clone(),
         };
-        super::sync(upstream, fork, &undecided, last_lines)
+        super::sync(
+            &upstream.stored_snapshot(),
+            &fork.stored_snapshot(),
+            &undecided,
+            last_lines,
+        )
     }
 
     fn path(history: &NameHistory) -> Result<Option<&str>> {
@@ -549,13 +724,9 @@ mod sync_tests {
         format!("{}:1", event + 1).parse().unwrap()
     }
 
-    fn file(id: u64, path: &str, version: &str, bytes: &[u8]) -> Snapshot {
+    fn file(id: u64, path: &str, version: &str, bytes: &[u8]) -> ByLine {
         let identity = MergeFileIdentity(id);
-        let line = Line {
-            identity: v(&format!("line{id}")),
-            version: v(version),
-            bytes: Some(bytes.into()),
-        };
+        let line = test_bytes::line(v(&format!("line{id}")), v(version), bytes);
         Snapshot {
             names: [(
                 identity,
@@ -567,7 +738,7 @@ mod sync_tests {
                 identity,
                 File {
                     object: id,
-                    lines: Lines {
+                    lines: Expanded {
                         lines: vec![line],
                         ancestors: [(v(version), None)].into_iter().collect(),
                     },
@@ -589,13 +760,15 @@ mod sync_tests {
             .lines
             .lines[0]
             .version = v("parent");
-        parent
-            .files
-            .get_mut(&MergeFileIdentity(1))
-            .unwrap()
-            .lines
-            .lines[0]
-            .bytes = Some(b"parent\n".to_vec());
+        test_bytes::set(
+            &mut parent
+                .files
+                .get_mut(&MergeFileIdentity(1))
+                .unwrap()
+                .lines
+                .lines[0],
+            b"parent\n",
+        );
         parent
             .files
             .get_mut(&MergeFileIdentity(1))
@@ -609,12 +782,15 @@ mod sync_tests {
             .lines
             .lines[0]
             .version = v("fork");
-        fork.files
-            .get_mut(&MergeFileIdentity(1))
-            .unwrap()
-            .lines
-            .lines[0]
-            .bytes = Some(b"fork\n".to_vec());
+        test_bytes::set(
+            &mut fork
+                .files
+                .get_mut(&MergeFileIdentity(1))
+                .unwrap()
+                .lines
+                .lines[0],
+            b"fork\n",
+        );
         fork.files
             .get_mut(&MergeFileIdentity(1))
             .unwrap()
@@ -629,7 +805,10 @@ mod sync_tests {
             &BTreeMap::new(),
         )
         .unwrap();
-        assert_eq!(kept.files[&MergeFileIdentity(1)].lines.bytes(), b"fork\n");
+        assert_eq!(
+            test_bytes::of_map(&kept.files[&MergeFileIdentity(1)].lines),
+            b"fork\n"
+        );
         let decided = sync(
             &parent,
             &kept,
@@ -639,7 +818,7 @@ mod sync_tests {
         )
         .unwrap();
         assert_eq!(
-            decided.files[&MergeFileIdentity(1)].lines.bytes(),
+            test_bytes::of_map(&decided.files[&MergeFileIdentity(1)].lines),
             b"parent\n"
         );
     }
@@ -653,11 +832,7 @@ mod sync_tests {
             .unwrap()
             .lines
             .lines
-            .push(Line {
-                identity: v("insert"),
-                version: v("insert"),
-                bytes: Some(b"own\n".to_vec()),
-            });
+            .push(test_bytes::line(v("insert"), v("insert"), b"own\n"));
         fork.files
             .get_mut(&MergeFileIdentity(1))
             .unwrap()
@@ -672,7 +847,10 @@ mod sync_tests {
             &BTreeMap::new(),
         )
         .unwrap();
-        assert_eq!(result.files[&MergeFileIdentity(1)].lines.bytes(), b"own\n");
+        assert_eq!(
+            test_bytes::of_map(&result.files[&MergeFileIdentity(1)].lines),
+            b"own\n"
+        );
         let result = sync(
             &parent,
             &result,
@@ -682,7 +860,7 @@ mod sync_tests {
         )
         .unwrap();
         assert_eq!(
-            result.files[&MergeFileIdentity(1)].lines.bytes(),
+            test_bytes::of_map(&result.files[&MergeFileIdentity(1)].lines),
             b"partial"
         );
     }
@@ -695,15 +873,13 @@ mod sync_tests {
         let mut parent = file(1, "a", "base", b"old\n");
         let mut fork = parent.clone();
         let lines = &mut parent.files.get_mut(&key).unwrap().lines;
-        lines.lines.push(Line {
-            identity: v("later"),
-            version: v("later"),
-            bytes: Some(b"later\n".to_vec()),
-        });
+        lines
+            .lines
+            .push(test_bytes::line(v("later"), v("later"), b"later\n"));
         lines.ancestors.insert(v("later"), None);
         let lines = &mut fork.files.get_mut(&key).unwrap().lines;
         lines.lines[0].version = v("own");
-        lines.lines[0].bytes = Some(b"own".to_vec());
+        test_bytes::set(&mut lines.lines[0], b"own");
         lines.ancestors.insert(v("own"), Some(v("base")));
         // Without the hide the sync would read `ownlater\n`.
         let kept = sync(
@@ -714,7 +890,7 @@ mod sync_tests {
             &BTreeMap::new(),
         )
         .unwrap();
-        assert_eq!(kept.files[&key].lines.bytes(), b"own");
+        assert_eq!(test_bytes::of_map(&kept.files[&key].lines), b"own");
         let decided = sync(
             &parent,
             &kept,
@@ -723,7 +899,10 @@ mod sync_tests {
             &BTreeMap::new(),
         )
         .unwrap();
-        assert_eq!(decided.files[&key].lines.bytes(), b"old\nlater\n");
+        assert_eq!(
+            test_bytes::of_map(&decided.files[&key].lines),
+            b"old\nlater\n"
+        );
     }
 
     #[test]

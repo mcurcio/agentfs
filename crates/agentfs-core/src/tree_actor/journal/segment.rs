@@ -122,8 +122,8 @@ impl FramePos {
         self.segment.read_exact_at(buf, self.tail_at + offset)
     }
 
-    /// The tail's bytes `offset..offset + len`, read into memory: for the
-    /// builder's line maps and a page fill's image, never the call path.
+    /// The tail's bytes `offset..offset + len`, read into memory: for tests.
+    #[cfg(test)]
     pub fn bytes(&self, offset: u64, len: u64) -> io::Result<Vec<u8>> {
         let len = usize::try_from(len).map_err(|_| io::Error::from_raw_os_error(libc::EFBIG))?;
         let mut buf = vec![0; len];

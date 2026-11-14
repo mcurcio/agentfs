@@ -32,7 +32,7 @@ use crate::tree_actor::journal::durable::{Durability, RecordNo};
 use crate::tree_actor::journal::segment::{FramePos, Segment};
 use crate::tree_actor::journal::{
     At, Change, Entry, Frame, Record, SaveOutcome, Tail, TakeHead, TakeRecord, Target, frame_at,
-    runs_from_frame,
+    runs_from_frame, take_chunks,
 };
 use crate::tree_actor::pointers::Pointers;
 use crate::tree_actor::queue::Key;
@@ -40,10 +40,11 @@ use crate::tree_actor::recording::file_map::BaseFile;
 use crate::tree_actor::recording::{Call, FileMap, own_keys, pages};
 use crate::tree_actor::stages::{Timer, Which};
 use crate::tree_actor::tree::{
-    EventNumber, FileBytes, MergeFileIdentity, NameHistory, Tree, Versions,
+    EventNumber, FileBytes, Lines, MergeFileIdentity, NameHistory, Tree, Versions,
 };
 use crate::tree_actor::{Error, Result, TreeId, referee};
 use crate::tree_git::{RefUpdate, TreeGit};
+use crate::tree_reconcile::{Window, histogram_files};
 
 /// The most steps one batch builds: a batch's built event wakes the lag gate,
 /// so a long backlog is built in slices that each end in one.
@@ -177,6 +178,8 @@ pub(in crate::tree_actor) struct BuildState {
     whole: BTreeSet<TreeId>,
     /// Each tree's object numbers as built, as History publishes them.
     objects: BTreeMap<TreeId, Arc<Objects>>,
+    /// Chunk records no take has taken yet.
+    bytes: Vec<(u64, Tail)>,
 }
 
 /// A map for a file the builder's state just took: a save, a create, a take.
@@ -264,13 +267,18 @@ fn disagrees(step: u64) -> Error {
 
 impl BuildState {
     /// The state at a built point: the trees its pointers' heads hold, the
-    /// opens, calls and page writes live then.
+    /// opens, calls, page writes and take chunks live then.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "what a start reads, passed through"
+    )]
     pub(in crate::tree_actor) fn at(
         trees: BTreeMap<TreeId, Tree>,
         pointers: &Pointers,
         upstreams: Upstreams,
         opens: &BTreeMap<u64, crate::tree_actor::journal::FoldedOpen>,
         pages: BTreeMap<(TreeId, u64), Vec<(u64, pages::Run)>>,
+        bytes: Vec<(u64, Tail)>,
         owners: &BTreeMap<EventNumber, Oid>,
         heads: BTreeMap<RecordNo, Oid>,
     ) -> Result<Self> {
@@ -320,6 +328,7 @@ impl BuildState {
                 .collect(),
             whole: BTreeSet::new(),
             objects,
+            bytes,
         })
     }
 
@@ -367,11 +376,12 @@ impl BuildState {
                 .entry((tree.parse::<TreeId>()?, *object))
                 .or_default()
                 .extend(runs_from_frame(runs, tail)?.into_iter().map(|r| (seq, r))),
+            Entry::Bytes => self.bytes.push((seq, tail.clone())),
             Entry::Step {
                 by,
                 change,
                 pointers,
-            } => self.step(record, tail, by, change, pointers, ctx, batch)?,
+            } => self.step(record, by, change, pointers, ctx, batch)?,
         }
         Ok(())
     }
@@ -453,7 +463,6 @@ impl BuildState {
     fn step(
         &mut self,
         record: &Record,
-        tail: &Tail,
         by: &WriterAt,
         change: &Change,
         changes: &[crate::tree_actor::journal::PointerChange],
@@ -544,21 +553,16 @@ impl BuildState {
                             return Err(disagrees(seq));
                         }
                         let mut versions = Versions::of(event);
-                        let mut next_id = || versions.next();
+                        let base = t.bytes.get(&open.object).ok_or_else(|| disagrees(seq))?;
                         let old = t.lines.get(&open.object).ok_or_else(|| disagrees(seq))?;
                         let lines = if calls
                             .iter()
                             .all(|(call, _)| matches!(call, Call::Append { .. }))
                         {
-                            let mut suffix = Vec::new();
-                            for (call, pos) in &calls {
-                                suffix.extend_from_slice(&pos.bytes(0, call.carried())?);
-                            }
-                            old.append(&suffix, &mut next_id)?
+                            let added = Window::new(&map, base.len(), map.len() - base.len());
+                            old.append(&added, |n| versions.take(n))?
                         } else {
-                            let bytes = map.to_vec()?;
-                            let _timer = Timer::start(Which::Align);
-                            old.align(&bytes, &mut next_id)?
+                            align(ctx.root, old, base, &map, &mut versions)?
                         };
                         t.lines.insert(open.object, Arc::new(lines));
                         t.bytes.insert(open.object, saved_map(map, seq));
@@ -589,12 +593,13 @@ impl BuildState {
                             .ok_or(Error::Format)?
                             .advance(event, None, None);
                         let mut versions = Versions::of(event);
-                        let bytes = t.bytes.get(&object).ok_or(Error::Format)?.to_vec()?;
-                        let lines = t
-                            .lines
-                            .get(&replaced)
-                            .ok_or(Error::Format)?
-                            .align(&bytes, || versions.next())?;
+                        let lines = align(
+                            ctx.root,
+                            t.lines.get(&replaced).ok_or(Error::Format)?,
+                            t.bytes.get(&replaced).ok_or(Error::Format)?,
+                            t.bytes.get(&object).ok_or(Error::Format)?,
+                            &mut versions,
+                        )?;
                         t.lines.insert(object, Arc::new(lines));
                     }
                     replaced => {
@@ -651,7 +656,7 @@ impl BuildState {
             }
             Change::Take { tree, take } => {
                 let id = tree.parse::<TreeId>()?;
-                head = self.take(id, seq, take, tail, change, ctx, record.at_ns, batch)?;
+                head = self.take(id, seq, take, change, ctx, record.at_ns, batch)?;
                 batch.moved.insert(id);
             }
         }
@@ -693,13 +698,13 @@ impl BuildState {
         id: TreeId,
         seq: u64,
         take: &TakeRecord,
-        tail: &Tail,
         change: &Change,
         ctx: &Context<'_>,
         at_ns: u64,
         batch: &mut Batch<'_>,
     ) -> Result<Option<Parent>> {
         let event = EventNumber::new(seq);
+        let chunks = take_chunks(&mut self.bytes, seq, take.chunks)?;
         let current = self.tree(id)?;
         let mut snapshot = current.snapshot();
         for (identity, file) in &take.files {
@@ -718,7 +723,7 @@ impl BuildState {
         // A file the take leaves reads its bytes from the record's tail; every
         // other file keeps its map.
         let mut maps: BTreeMap<u64, FileMap> = take
-            .maps(&tail.pos, RecordNo::new(seq))?
+            .maps(&chunks, RecordNo::new(seq))?
             .into_iter()
             .collect();
         let mut taken = Vec::new();
@@ -865,6 +870,38 @@ pub(in crate::tree_actor) struct Context<'a> {
     pub identity: &'a VolumeIdentity,
     pub service: &'a PodContext,
     pub repo: &'a TreeGit,
+    /// The state area: where an alignment writes the files `git diff` reads.
+    pub root: &'a Path,
+}
+
+/// The line map of `after`'s bytes over `old`, the map of `before`'s: one
+/// histogram alignment, reading both maps a line at a time. Only when the two
+/// differ and `before` has bytes are they written to files for `git diff`, in
+/// the state area's `align/` (never memory or `/tmp`), and removed after.
+fn align(
+    root: &Path,
+    old: &Lines,
+    before: &FileMap,
+    after: &FileMap,
+    versions: &mut Versions,
+) -> Result<Lines> {
+    let _timer = Timer::start(Which::Align);
+    let dir = root.join("align");
+    let diff = || {
+        std::fs::create_dir_all(&dir)?;
+        let (a, b) = (dir.join("old"), dir.join("new"));
+        let written = (|| {
+            for (path, map) in [(&a, before), (&b, after)] {
+                let mut file = std::fs::File::create(path)?;
+                std::io::copy(&mut map.reader(), &mut file)?;
+            }
+            histogram_files(&a, &b)
+        })();
+        let _ = std::fs::remove_file(&a);
+        let _ = std::fs::remove_file(&b);
+        written
+    };
+    Ok(old.align(before, after, diff, |n| versions.take(n))?)
 }
 
 /// The builder thread's own state.
@@ -942,6 +979,7 @@ impl Builder {
             identity: &self.identity,
             service: &self.service,
             repo: &repo,
+            root: &self.root,
         };
         let mut batch = Batch {
             repo: &repo,

@@ -5,7 +5,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::verdicts::Candidate;
-use super::{CollisionKind, Snapshot, Version};
+use super::{ByLine as Snapshot, CollisionKind, Version};
 use crate::tree_actor::tree::{EventNumber, MergeFileIdentity, NameHistory};
 use crate::tree_actor::{Error, Result};
 

@@ -40,12 +40,51 @@ fn at_path(repo: &TreeGit, commit: git2::Oid, path: &str) -> Vec<u8> {
     repo.read_blob(oid).unwrap()
 }
 
+/// A line version as history stores it, `"<event>:<index>"` (docs/trees.md).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct Version(u64, u64);
+
+impl std::fmt::Display for Version {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:{}", self.0, self.1)
+    }
+}
+
+impl serde::Serialize for Version {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.collect_str(self)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Version {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(d)?;
+        let (event, index) = text
+            .split_once(':')
+            .ok_or_else(|| serde::de::Error::custom("a line version"))?;
+        Ok(Self(
+            event.parse().map_err(serde::de::Error::custom)?,
+            index.parse().map_err(serde::de::Error::custom)?,
+        ))
+    }
+}
+
+impl agentfs_core::tree_reconcile::Id for Version {
+    fn at(writer: u64, index: u64) -> Self {
+        Self(writer, index)
+    }
+    fn writer(&self) -> u64 {
+        self.0
+    }
+    fn index(&self) -> u64 {
+        self.1
+    }
+}
+
+type LineMap = agentfs_core::tree_reconcile::LineMap<Version>;
+
 /// A file's line map in a commit, with its identity: `lines/<aa>/<bb>/<name>`.
-fn line_map(
-    repo: &TreeGit,
-    commit: git2::Oid,
-    name: &str,
-) -> (u64, agentfs_core::tree_reconcile::LineMap) {
+fn line_map(repo: &TreeGit, commit: git2::Oid, name: &str) -> (u64, LineMap) {
     serde_json::from_slice(&at_path(repo, commit, &format!("lines/{}", fanned(name)))).unwrap()
 }
 
@@ -690,10 +729,11 @@ fn saved_line_map_and_bytes_share_a_commit_without_a_reserved_name() {
     let head = volume.head(ROOT).unwrap();
     let blob = at_path(&repo, head, &format!("files/{}", fanned("metadata.json")));
     assert_eq!(blob, b"first\npartial tail\nnext\n");
-    line_map(&repo, head, "metadata.json")
-        .1
-        .validate(&blob)
-        .unwrap();
+    let lines = line_map(&repo, head, "metadata.json").1;
+    let index = agentfs_core::tree_reconcile::LineIndex::of(&blob).unwrap();
+    lines.check(&blob, &index).unwrap();
+    // One map per save, each a run: the file's lines, never its bytes.
+    assert!(lines.encode().unwrap().len() < 300);
     assert_eq!(
         fs::read(checkout(tmp.path(), "root", "metadata.json")).unwrap(),
         blob
@@ -703,10 +743,7 @@ fn saved_line_map_and_bytes_share_a_commit_without_a_reserved_name() {
 #[test]
 fn atomic_replacement_keeps_merge_identity_but_changes_object_across_recovery() {
     // The object, from the actor; the identity and line map, from history.
-    fn metadata(
-        volume: &TreeActor,
-        root: &std::path::Path,
-    ) -> (u64, u64, agentfs_core::tree_reconcile::LineMap) {
+    fn metadata(volume: &TreeActor, root: &std::path::Path) -> (u64, u64, LineMap) {
         let (id, lines) = line_map(&repo(root), volume.head(ROOT).unwrap(), "target");
         (volume.object_at(ROOT, "target").unwrap(), id, lines)
     }
@@ -724,9 +761,10 @@ fn atomic_replacement_keeps_merge_identity_but_changes_object_across_recovery() 
     let after = metadata(&volume, tmp.path());
     assert_ne!(before.0, after.0);
     assert_eq!(before.1, after.1);
-    assert_eq!(before.2.lines[0].identity, after.2.lines[0].identity);
-    assert_eq!(before.2.lines[1].identity, after.2.lines[1].identity);
-    assert_ne!(before.2.lines[1].version, after.2.lines[1].version);
+    let (was, now) = (before.2.expand().lines, after.2.expand().lines);
+    assert_eq!(was[0].identity, now[0].identity);
+    assert_eq!(was[1].identity, now[1].identity);
+    assert_ne!(was[1].version, now[1].version);
     volume.write(old, 0, b"stale", false).unwrap();
     assert_eq!(volume.close(old).unwrap(), Saved::OrphanDropped);
     drop(volume);

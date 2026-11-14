@@ -455,7 +455,12 @@ impl TreeActor {
         };
         let pointers = self.publish(tree, seq);
         let started = std::time::Instant::now();
-        self.record_step(by.clone(), change.clone(), pointers, &[])?;
+        self.record_step(
+            by.clone(),
+            change.clone(),
+            pointers,
+            &mut std::iter::empty(),
+        )?;
         let t = self.trees.get_mut(&tree).ok_or(Error::NotFound)?;
         let keys = Self::apply_shape(&mut self.stopped, t, &change, seq);
         let mut empty = FileMap::empty();
@@ -487,7 +492,7 @@ impl TreeActor {
         let keys = shape.apply(&change, EventNumber::new(seq))?;
         let pointers = self.publish(tree, seq);
         let started = std::time::Instant::now();
-        self.record_step(by.clone(), change, pointers, &[])?;
+        self.record_step(by.clone(), change, pointers, &mut std::iter::empty())?;
         self.trees.get_mut(&tree).ok_or(Error::NotFound)?.shape = shape;
         self.touch(tree, seq, keys);
         self.count_save(started);
@@ -569,7 +574,7 @@ impl TreeActor {
         let started = std::time::Instant::now();
         // Every close lets its open's held keys go, a changed file's or not.
         let keys = self.tree(tree)?.shape.keys(object);
-        self.record_step(by, change, pointers, &[])?;
+        self.record_step(by, change, pointers, &mut std::iter::empty())?;
         self.touch(tree, seq, keys);
         self.pending_closes.retain(|pending| *pending != handle);
         self.handles.remove(&handle);

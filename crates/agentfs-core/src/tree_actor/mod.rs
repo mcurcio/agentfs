@@ -48,7 +48,6 @@ use history::{
     check_objects, clean_packs, objects_of, read_trees, refs, remove_stale_locks, sync_marker,
 };
 pub use journal::durable::{Durability, DurableError, RecordNo};
-use journal::segment::FramePos;
 use journal::{
     Change, Entry, FoldedOpen, Journal, PointerChange, Record, Replay, Target, compact_at, fold,
 };
@@ -59,7 +58,7 @@ use recording::{Handle, pages};
 use stages::Stages;
 use tree::{EventNumber, SavedTree};
 
-const FORMAT: &str = "agentfs-trees-8\n";
+const FORMAT: &str = "agentfs-trees-9\n";
 /// The volume identity file: [`VolumeIdentity`] as JSON, written once by
 /// [`TreeActor::create`], read before any write at every open.
 const IDENTITY: &str = "volume";
@@ -263,6 +262,9 @@ pub struct TreeActor {
     compacted: (RecordNo, BTreeMap<RecordNo, String>),
     _lock: Arc<FileLock>,
 }
+
+/// A take's bytes in chunks of at most `journal::TAKE_CHUNK`, recorded before it.
+type Chunks<'a> = &'a mut dyn Iterator<Item = io::Result<Vec<u8>>>;
 
 /// A started volume's history and its saved trees (`TreeActor::start_history`).
 struct Started {
@@ -590,7 +592,12 @@ impl TreeActor {
             .iter()
             .map(|(tree, t)| (*tree, SavedTree::of(t)))
             .collect();
-        let mut replay = Replay::new(saved, &at_built.opens, at_built.page_writes.clone())?;
+        let mut replay = Replay::new(
+            saved,
+            &at_built.opens,
+            at_built.page_writes.clone(),
+            at_built.bytes.clone(),
+        )?;
         for (record, tail) in &frames[upto..] {
             replay.apply(record, tail)?;
         }
@@ -607,6 +614,7 @@ impl TreeActor {
             at_built.upstreams.clone(),
             &at_built.opens,
             at_built.page_writes.clone(),
+            at_built.bytes.clone(),
             &owners,
             heads,
         )?;
@@ -857,7 +865,7 @@ impl TreeActor {
                 upstream: upstream.to_string(),
             },
             pointers,
-            &[],
+            &mut std::iter::empty(),
         )?;
         self.upstreams.add(seq, upstream);
         let mut tree = self.tree(upstream)?.clone();
@@ -989,30 +997,41 @@ impl TreeActor {
         by: WriterAt,
         change: Change,
         pointers: Vec<PointerChange>,
-        tail: &[u8],
-    ) -> Result<(u64, FramePos)> {
+        chunks: Chunks<'_>,
+    ) -> Result<(u64, Vec<journal::Tail>)> {
         if self.is_stopped() {
             return Err(Error::Stopped);
         }
         let (tree, bytes) = self.build_cost(&change);
         let mut pointers = pointers;
-        let recorded = (|| -> Result<(u64, FramePos)> {
+        let recorded = (|| -> Result<(u64, Vec<journal::Tail>)> {
             crate::failpoints::hit("tree.before_step")?;
             // A compaction due runs before the step's pointers are checked:
             // values read before it are named as what they were built as.
             self.before_record();
             self.resolve_compacted(&mut pointers)?;
             self.pointers.check_targets(&pointers)?;
-            self.journal_record(
+            // A take's bytes, then the take: no compaction comes between.
+            let mut tails = Vec::new();
+            for chunk in chunks {
+                let chunk = chunk?;
+                let (_, pos) = self.append_record(Entry::Bytes, &chunk)?;
+                tails.push(journal::Tail {
+                    pos,
+                    len: chunk.len() as u64,
+                });
+            }
+            let (seq, _) = self.append_record(
                 Entry::Step {
                     by,
                     change,
                     pointers: pointers.clone(),
                 },
-                tail,
-            )
+                &[],
+            )?;
+            Ok((seq, tails))
         })();
-        let (seq, pos) = match recorded {
+        let (seq, tails) = match recorded {
             Ok(recorded) => recorded,
             Err(e) => {
                 eprintln!("tree SaveFailed: {e}");
@@ -1026,7 +1045,7 @@ impl TreeActor {
             }
         }
         self.history.appended_step(RecordNo::new(seq), tree, bytes);
-        Ok((seq, pos))
+        Ok((seq, tails))
     }
 
     /// Takes each map the builder built that is the same save as the actor's
@@ -1356,7 +1375,9 @@ mod tests {
             "agentfs-trees-3\n",
             "agentfs-trees-4\n",
             "agentfs-trees-5\n",
+            "agentfs-trees-6\n",
             "agentfs-trees-7\n",
+            "agentfs-trees-8\n",
         ] {
             let tmp = tempfile::tempdir().unwrap();
             drop(new_actor(tmp.path()));

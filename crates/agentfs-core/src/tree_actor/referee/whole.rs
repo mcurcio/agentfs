@@ -2,16 +2,16 @@
 //! §7).
 
 use super::verdicts::Candidate;
-use super::{Collision, CollisionKind, Decision, Snapshot};
+use super::{ByLine, Collision, CollisionKind, Decision, Expanded};
 
 /// Sorts `candidates` by their order. A loss anywhere: every candidate is a collision, its own loss
 /// or `Whole` to the first loss's winner, and the snapshot is the upstream's. Else the snapshot is
 /// `applied`.
 pub(super) fn whole(
-    upstream: &Snapshot,
-    applied: Snapshot,
+    upstream: &ByLine,
+    applied: ByLine,
     mut candidates: Vec<Candidate>,
-) -> Decision {
+) -> Decision<Expanded> {
     candidates.sort_by_key(|candidate| candidate.order);
     let Some(first) = candidates
         .iter()
@@ -86,8 +86,8 @@ mod tests {
             candidate(true, 2, 0, line(2, "9:3"), Some(line(2, "7:1"))),
             candidate(false, 2, 0, name.clone(), None),
         ];
-        let upstream = Snapshot::default();
-        let decision = whole(&upstream, Snapshot::default(), candidates);
+        let upstream = ByLine::default();
+        let decision = whole(&upstream, ByLine::default(), candidates);
         let collisions: Vec<_> = decision
             .collisions
             .iter()
@@ -106,13 +106,13 @@ mod tests {
 
     #[test]
     fn no_loss_lands_what_applied() {
-        let mut applied = Snapshot::default();
+        let mut applied = ByLine::default();
         applied.names.insert(
             MergeFileIdentity(1),
             crate::tree_actor::tree::NameHistory::created(EventNumber::new(1), "a".into()),
         );
         let decision = whole(
-            &Snapshot::default(),
+            &ByLine::default(),
             applied,
             vec![candidate(true, 1, 0, line(1, "1:1"), None)],
         );

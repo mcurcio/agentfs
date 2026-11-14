@@ -167,6 +167,9 @@ pub(super) enum Entry {
         object: u64,
         runs: Vec<RunHead>,
     },
+    /// Part of the bytes of the take step that follows ([`TakeRecord::chunks`]),
+    /// in its tail.
+    Bytes,
     /// A step: the change itself, the commit point of it, and the pointer
     /// changes its build publishes. The builder makes its commits later.
     Step {
@@ -213,8 +216,9 @@ pub(super) enum Change {
     Fork {
         upstream: String,
     },
-    /// A queue take, decided on the built snapshot. Its frame's tail holds
-    /// the bytes of each file it leaves (`take.files` with a file, in order).
+    /// A queue take, decided on the built snapshot. The tails of the
+    /// [`Entry::Bytes`] records just before it hold the bytes of each file it
+    /// leaves (`take.files` with a file, in order).
     Take {
         tree: String,
         take: TakeRecord,
@@ -241,8 +245,8 @@ pub(super) enum SaveOutcome {
 }
 
 /// A take as decided: how the head moves, and the files and names it leaves
-/// that differ from the tree before it (bytes inside the line maps, and in
-/// the record's tail: [`TakeRecord::tail`]).
+/// that differ from the tree before it, each file's line map here and its
+/// bytes in the chunk records before it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct TakeRecord {
     pub entry: String,
@@ -253,56 +257,87 @@ pub(super) struct TakeRecord {
     pub files: Vec<(MergeFileIdentity, Option<referee::File>)>,
     pub names: Vec<(MergeFileIdentity, Option<NameHistory>)>,
     pub collisions: Vec<referee::Collision>,
+    /// The length of each file it leaves, in `files` order.
+    pub lens: Vec<u64>,
+    /// How many [`Entry::Bytes`] records just before it hold those files'
+    /// bytes, in order.
+    pub chunks: u64,
 }
 
 impl TakeRecord {
-    /// The record's tail: the bytes of each file it leaves, in `files` order,
-    /// which the actor's and the builder's maps read.
-    pub fn tail(&self) -> Vec<u8> {
-        self.files
-            .iter()
-            .filter_map(|(_, file)| file.as_ref())
-            .flat_map(|file| file.lines.bytes())
-            .collect()
-    }
-
     /// Each file it leaves as its object's saved map at step `seq`, reading
-    /// the record's tail at `tail`: what the actor, its replay and the
-    /// builder all install.
-    pub fn maps(&self, tail: &FramePos, seq: RecordNo) -> Result<Vec<(u64, FileMap)>> {
-        let spans = self.spans();
-        let mut maps = Vec::new();
-        for (identity, file) in &self.files {
-            let (Some(file), Some((at, len))) = (file, spans.get(identity)) else {
-                continue;
-            };
+    /// its bytes from `chunks`, the tails of the records just before it: what
+    /// the actor, its replay and the builder all install.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Format`] when the chunks are not its own or hold another
+    /// length than its files.
+    pub fn maps(&self, chunks: &[Tail], seq: RecordNo) -> Result<Vec<(u64, FileMap)>> {
+        let left: Vec<_> = self.files.iter().filter_map(|(_, f)| f.as_ref()).collect();
+        let total: u64 = chunks.iter().map(|c| c.len).sum();
+        if chunks.len() as u64 != self.chunks
+            || left.len() != self.lens.len()
+            || total != self.lens.iter().sum::<u64>()
+        {
+            return Err(Error::Format);
+        }
+        let mut chunks = chunks.iter();
+        let mut at: Option<(&Tail, u64)> = None;
+        let mut maps = Vec::with_capacity(left.len());
+        for (file, len) in left.iter().zip(&self.lens) {
             let mut map = FileMap::empty();
-            map.apply(
-                &Call::Write {
-                    offset: 0,
-                    len: *len,
-                },
-                &tail.at(*at),
-            )?;
+            let mut done = 0;
+            while done < *len {
+                let (chunk, offset) = match at {
+                    Some(place) if place.1 < place.0.len => place,
+                    _ => (chunks.next().ok_or(Error::Format)?, 0),
+                };
+                let n = (len - done).min(chunk.len - offset);
+                map.apply(
+                    &Call::Write {
+                        offset: done,
+                        len: n,
+                    },
+                    &chunk.pos.at(offset),
+                )?;
+                done += n;
+                at = Some((chunk, offset + n));
+            }
             map.saved_at(seq);
             maps.push((file.object, map));
         }
         Ok(maps)
     }
 
-    /// Where each file it leaves starts in [`TakeRecord::tail`], and its length.
-    pub fn spans(&self) -> BTreeMap<MergeFileIdentity, (u64, u64)> {
-        let mut at = 0;
-        let mut spans = BTreeMap::new();
-        for (identity, file) in &self.files {
-            if let Some(file) = file {
-                let len = file.lines.bytes().len() as u64;
-                spans.insert(*identity, (at, len));
-                at += len;
-            }
-        }
-        spans
+    /// How many chunk records `total` bytes take.
+    pub fn chunks_for(total: u64) -> u64 {
+        total.div_ceil(TAKE_CHUNK)
     }
+}
+
+/// The most bytes one [`Entry::Bytes`] record holds: a take's files of any size
+/// are recorded in frames well under a segment.
+pub(super) const TAKE_CHUNK: u64 = 16 << 20;
+
+/// A take step's chunks: the tails of the `n` [`Entry::Bytes`] records just
+/// before step `seq`, taken from `pending` (every such record not yet taken, in
+/// order); every pending one before it goes too, being a cut-short take's.
+///
+/// # Errors
+///
+/// [`Error::Format`] when they are not the `n` records just before it.
+pub(super) fn take_chunks(pending: &mut Vec<(u64, Tail)>, seq: u64, n: u64) -> Result<Vec<Tail>> {
+    let n = usize::try_from(n).map_err(|_| Error::Format)?;
+    let from = pending.len().checked_sub(n).ok_or(Error::Format)?;
+    let chunks: Vec<(u64, Tail)> = pending.drain(from..).collect();
+    pending.clear();
+    for (i, (record, _)) in chunks.iter().enumerate() {
+        if *record + (n - i) as u64 != seq {
+            return Err(Error::Format);
+        }
+    }
+    Ok(chunks.into_iter().map(|(_, tail)| tail).collect())
 }
 
 /// How a take moves its tree's head.

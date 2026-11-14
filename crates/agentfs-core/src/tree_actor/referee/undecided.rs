@@ -6,6 +6,7 @@ use std::collections::BTreeSet;
 use super::Snapshot;
 use crate::tree_actor::Result;
 use crate::tree_actor::tree::{EventNumber, LineVersion, MergeFileIdentity};
+use crate::tree_reconcile::Id;
 
 /// History's one answer the referee needs: whether the save numbered `save` is in the upstream's
 /// history.
@@ -28,9 +29,12 @@ pub(in crate::tree_actor) fn undecided<L: Landed + ?Sized>(
 ) -> Result<Undecided> {
     let mut undecided = Undecided::default();
     for file in fork.files.values() {
-        for line in &file.lines.lines {
-            if !landed.landed(line.version.event())? {
-                undecided.lines.insert(line.version);
+        for run in file.lines.runs() {
+            // A run's versions are one event's.
+            if !landed.landed(run.version.event())? {
+                undecided
+                    .lines
+                    .extend((0..run.count).map(|i| run.version.nth(i)));
             }
         }
     }

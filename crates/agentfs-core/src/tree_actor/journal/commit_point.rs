@@ -28,6 +28,16 @@ impl TreeActor {
             return Err(Error::Stopped);
         }
         self.before_record();
+        self.append_record(entry, tail)
+    }
+
+    /// [`TreeActor::journal_record`] with nothing run before it: records of
+    /// one step that no compaction may come between.
+    pub(in crate::tree_actor) fn append_record(
+        &mut self,
+        entry: Entry,
+        tail: &[u8],
+    ) -> Result<(u64, FramePos)> {
         if self.is_stopped() {
             return Err(Error::Stopped);
         }

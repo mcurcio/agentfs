@@ -140,17 +140,72 @@ pub fn histogram_with(
     let (a, b) = (dir.0.join("old"), dir.0.join("new"));
     std::fs::write(&a, old)?;
     std::fs::write(&b, new)?;
-    let out = spawn(&mut command(&dir.0, &a, &b))?.wait_with_output()?;
+    histogram_files(&a, &b, spawn)
+}
+
+/// Git's text-mode histogram diff of the files `old` and `new`, which differ,
+/// run in `old`'s directory. Its output is read as it streams and only the hunk
+/// headers are kept, so neither file's lines are held: the call for images too
+/// large to hold. `git diff` itself reads both files whole.
+pub fn histogram_files(
+    old: &Path,
+    new: &Path,
+    spawn: impl FnOnce(&mut Command) -> io::Result<Child>,
+) -> Result<Vec<Hunk>, Error> {
+    let dir = old.parent().unwrap_or(Path::new("/"));
+    let mut child = spawn(&mut command(dir, old, new))?;
+    let stdout = child.stdout.take().ok_or(Error::Invalid)?;
+    let headers = headers(stdout);
+    let out = child.wait_with_output()?;
+    let headers = headers?;
     if !matches!(out.status.code(), Some(0 | 1)) {
         return Err(Error::Git(
             String::from_utf8_lossy(&out.stderr).into_owned(),
         ));
     }
-    let hunks = parse(&out.stdout)?;
+    let hunks = parse(&headers)?;
     if hunks.is_empty() {
         return Err(Error::Invalid);
     }
     Ok(hunks)
+}
+
+/// The `@@ ` lines of a diff's output, each with its newline, read in chunks:
+/// every other line is skipped unread, however long.
+fn headers(mut reader: impl io::Read) -> Result<Vec<u8>, Error> {
+    let mut buf = vec![0; 64 << 10];
+    let mut out = Vec::new();
+    // At a line's start: the bytes of it seen so far, while they could be a
+    // header's; `None` past a line that is not one.
+    let mut line: Option<Vec<u8>> = Some(Vec::new());
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            return Ok(out);
+        }
+        let mut rest = &buf[..n];
+        while !rest.is_empty() {
+            let end = rest.iter().position(|b| *b == b'\n');
+            let (part, after) = match end {
+                Some(i) => (&rest[..=i], &rest[i + 1..]),
+                None => (rest, &[][..]),
+            };
+            if let Some(seen) = &mut line {
+                seen.extend_from_slice(part);
+                let prefix = seen.len().min(3);
+                if seen[..prefix] != b"@@ "[..prefix] {
+                    line = None;
+                }
+            }
+            if end.is_some() {
+                if let Some(seen) = line.take() {
+                    out.extend_from_slice(&seen);
+                }
+                line = Some(Vec::new());
+            }
+            rest = after;
+        }
+    }
 }
 
 /// [`histogram_with`], the program started as it is.
@@ -206,6 +261,28 @@ mod tests {
         assert_eq!(envs.len(), 4, "{envs:?}");
         assert!(envs.contains(&(OsStr::new("PATH"), Some(OsStr::new(GIT_PATH)))));
         assert!(format!("{command:?}").contains("--histogram"));
+    }
+
+    #[test]
+    fn only_header_lines_are_kept_however_long_the_others() {
+        let mut output = b"diff --git a/old b/new\n@@ -1 +1 @@\n-".to_vec();
+        output.extend(std::iter::repeat_n(b'@', 200_000));
+        output.extend_from_slice(b"\n+x\n@@ -3,0 +4,2 @@ ctx\n+y\n+z");
+        let kept = headers(&output[..]).unwrap();
+        assert_eq!(kept, b"@@ -1 +1 @@\n@@ -3,0 +4,2 @@ ctx\n");
+        assert_eq!(parse(&kept).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn two_files_are_diffed_as_two_strings_are() {
+        let dir = temp_dir().unwrap();
+        let (a, b) = (dir.0.join("a"), dir.0.join("b"));
+        std::fs::write(&a, b"a\nb\nc\n").unwrap();
+        std::fs::write(&b, b"a\nB\nc\nd\n").unwrap();
+        assert_eq!(
+            histogram_files(&a, &b, Command::spawn).unwrap(),
+            histogram(b"a\nb\nc\n", b"a\nB\nc\nd\n").unwrap()
+        );
     }
 
     #[test]

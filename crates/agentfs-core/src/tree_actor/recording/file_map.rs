@@ -105,6 +105,18 @@ pub struct FileMap {
     step: Option<RecordNo>,
 }
 
+/// A map read as an image: how a save's alignment reads both versions of a
+/// file without holding either.
+impl crate::tree_reconcile::Image for FileMap {
+    fn len(&self) -> u64 {
+        self.len
+    }
+
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+        self.read(offset, buf)
+    }
+}
+
 impl Default for FileMap {
     fn default() -> Self {
         Self::empty()

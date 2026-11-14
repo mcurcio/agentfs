@@ -270,7 +270,7 @@ appends it and applies it to the saved state the views serve; it runs no git.
   `actor.lock`, `format` and rebuilt private checkout caches, which the workload
   never sees. A create writes an `initializing` marker first and removes it last;
   the next `trees init` starts a cut-short create over. **Earlier state formats
-  (format 7 included) do not open**, and are never converted.
+  (format 8 included) do not open**, and are never converted.
 
 ## History trails the files
 

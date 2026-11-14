@@ -209,6 +209,50 @@ pub(in crate::tree_actor) fn read_snapshot(
     Ok(referee::Snapshot { files, names })
 }
 
+/// The object at `path` (slash-separated) under tree `tree`, if any.
+fn lookup(repo: &TreeGit, tree: Oid, path: &str) -> Result<Option<Oid>> {
+    let mut at = tree;
+    for part in path.split('/') {
+        match entry(&repo.list_tree(at)?, part) {
+            Some(oid) => at = oid,
+            None => return Ok(None),
+        }
+    }
+    Ok(Some(at))
+}
+
+/// One live file of a commit, by identity: its line map and its blob; none
+/// where the commit has no live file of that identity. Three paths read,
+/// never the whole snapshot.
+pub(in crate::tree_actor) fn file_of(
+    repo: &TreeGit,
+    commit: Oid,
+    identity: MergeFileIdentity,
+) -> Result<Option<(Lines, Oid)>> {
+    let commit = repo.read_commit(commit)?;
+    if !message::is_envelope(&commit.message) {
+        return Ok(None);
+    }
+    let Some(names) = lookup(repo, commit.tree, &names_path(identity))? else {
+        return Ok(None);
+    };
+    let history: NameHistory = serde_json::from_slice(&repo.read_blob(names)?)?;
+    let Some(path) = history.path()? else {
+        return Ok(None);
+    };
+    let (Some(lines), Some(blob)) = (
+        lookup(repo, commit.tree, &lines_path(path))?,
+        lookup(repo, commit.tree, &file_path(path))?,
+    ) else {
+        return Err(Error::Format);
+    };
+    let (id, lines): (MergeFileIdentity, Lines) = serde_json::from_slice(&repo.read_blob(lines)?)?;
+    if id != identity {
+        return Err(Error::Format);
+    }
+    Ok(Some((lines, blob)))
+}
+
 /// The files tree a commit's checkout holds: `files/`, or the Root commit's
 /// own (empty) tree.
 pub(in crate::tree_actor) fn files_tree(repo: &TreeGit, commit: Oid) -> Result<Oid> {

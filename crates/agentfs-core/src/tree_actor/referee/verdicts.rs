@@ -4,8 +4,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::ancestry::{self, Broken, Graph, descends};
-use super::{CollisionKind, File, PriorDecisions, Snapshot, Verdict, Version};
-use crate::tree_actor::tree::{LineVersion, Lines, MergeFileIdentity, NameHistory};
+use super::{ByLine as Snapshot, CollisionKind, PriorDecisions, Verdict, Version};
+use crate::tree_actor::tree::{LineVersion, MergeFileIdentity, NameHistory};
 use crate::tree_actor::{Error, Result};
 use crate::tree_reconcile::Line;
 
@@ -83,7 +83,7 @@ fn held_name(name: &NameHistory) -> Result<Held<crate::tree_actor::tree::EventNu
 fn held_line(line: &Line<LineVersion>) -> Held<LineVersion> {
     Held {
         version: line.version,
-        live: line.bytes.is_some(),
+        live: line.live,
     }
 }
 
@@ -91,8 +91,8 @@ fn held_line(line: &Line<LineVersion>) -> Held<LineVersion> {
 /// upstream's first live line not seen there (a line in that snapshot may itself be written over
 /// the upstream's).
 fn unseen_upstream_line(
-    base: Option<&File>,
-    upstream: Option<&File>,
+    base: Option<&super::File<super::Expanded>>,
+    upstream: Option<&super::File<super::Expanded>>,
 ) -> Result<Option<LineVersion>> {
     let Some(upstream) = upstream else {
         return Ok(None);
@@ -102,17 +102,12 @@ fn unseen_upstream_line(
             .lines
             .lines
             .iter()
-            .find(|line| line.bytes.is_some())
+            .find(|line| line.live)
             .map(|line| line.version));
     };
     let graph = ancestry::union(&base.lines.ancestors, &upstream.lines.ancestors)?;
     let seen: BTreeMap<_, _> = base.lines.lines.iter().map(|l| (&l.identity, l)).collect();
-    for line in upstream
-        .lines
-        .lines
-        .iter()
-        .filter(|line| line.bytes.is_some())
-    {
+    for line in upstream.lines.lines.iter().filter(|line| line.live) {
         match seen.get(&line.identity) {
             Some(old) if descends(&graph, old.version, line.version)? => {}
             _ => return Ok(Some(line.version)),
@@ -219,7 +214,7 @@ pub(super) fn verdicts(
             loss,
         });
     }
-    let empty = Lines::default();
+    let empty = super::Expanded::default();
     for id in &ids {
         let Some(file) = incoming.files.get(id) else {
             continue;
@@ -302,12 +297,12 @@ pub(super) fn verdicts(
 
 #[cfg(test)]
 mod tests {
+    use super::super::{Expanded as Lines, test_bytes};
     use super::*;
-    use crate::tree_actor::tree::{EventNumber, Versions};
+    use crate::tree_actor::tree::EventNumber;
 
     fn save(base: &Lines, bytes: &[u8], event: u64) -> Lines {
-        let mut versions = Versions::of(EventNumber::new(event));
-        base.align(bytes, || versions.next()).unwrap()
+        test_bytes::save_lines(base, bytes, event)
     }
 
     fn judge(
@@ -348,7 +343,7 @@ mod tests {
         let line = &root.lines[0];
         assert_eq!(judge(line, line, &root.ancestors), Verdict::Drop);
         let deleted = save(&root, b"", 2);
-        let line = deleted.lines.iter().find(|l| l.bytes.is_none()).unwrap();
+        let line = deleted.lines.iter().find(|l| !l.live).unwrap();
         assert_eq!(judge(line, line, &deleted.ancestors), Verdict::Drop);
 
         let mut name = NameHistory::created(EventNumber::new(1), "a".into());

@@ -164,6 +164,38 @@ def histogram_hunks(old, new):
     return hunks
 
 
+def nth(version, n):
+    """The version n after `version` ("<event>:<index>") in its event's numbering."""
+    if n == 0:
+        return version
+    event, index = version.split(":")
+    return f"{event}:{int(index) + n}"
+
+
+def expand(line_map, image):
+    """A stored line map (runs, docs/trees.md "What a commit holds") line by
+    line, each live line's bytes read from its file: a line ends at a newline,
+    or after `open` bytes for a run's last line that has none."""
+    lines, rest = [], image
+    for run in line_map["lines"]:
+        for i in range(run["count"]):
+            data = None
+            if not run.get("dead"):
+                if "open" in run and i + 1 == run["count"]:
+                    size = run["open"]
+                else:
+                    size = rest.index(b"\n") + 1
+                data, rest = list(rest[:size]), rest[size:]
+            lines.append({"identity": nth(run["identity"], i),
+                          "version": nth(run["version"], i), "bytes": data})
+    assert rest == b"", "bytes past the map's live lines"
+    ancestors = {}
+    for run in line_map["ancestors"]:
+        for i in range(run["count"]):
+            ancestors[nth(run["version"], i)] = nth(run["over"], i) if run.get("over") else None
+    return {"lines": lines, "ancestors": ancestors}
+
+
 def check_histogram(before, after, old_image, new_image):
     old = [x for x in before["lines"] if x["bytes"] is not None]
     new = [x for x in after["lines"] if x["bytes"] is not None]
@@ -215,12 +247,12 @@ def assert_aligned(commit, name):
             probe = subprocess.run(["git", "--git-dir=" + str(REPO), "cat-file", "-e", f"{rev}:files/{fanned(name)}"], stderr=subprocess.DEVNULL)
             assert probe.returncode != 0, (rev, name, "file missing its line map")
             return {"lines": [], "ancestors": {}}, b""
-        line_map = json.loads(git("show", f"{rev}:lines/{fanned(name)}"))[1]
+        image = bytes_at(rev, name)
+        line_map = expand(json.loads(git("show", f"{rev}:lines/{fanned(name)}"))[1], image)
         lines = line_map["lines"]
         ids = [line["identity"] for line in lines]
         versions = [line["version"] for line in lines]
         assert len(ids) == len(set(ids)) and len(versions) == len(set(versions))
-        image = bytes_at(rev, name)
         assert b"".join(bytes(line["bytes"]) for line in lines if line["bytes"] is not None) == image
         assert all(v in line_map["ancestors"] for v in versions)
         return line_map, image
@@ -428,7 +460,8 @@ def finding_32():
         "finding 32 bytes differ from model", bytes_at(commit, "finding32"), model["root"])
     message = git("show", "-s", "--format=%B", commit).decode().splitlines()
     assert "Agentfs-Format: envelope-1" in message
-    lines = json.loads(git("show", f"{commit}:lines/{fanned('finding32')}"))[1]["lines"]
+    lines = expand(json.loads(git("show", f"{commit}:lines/{fanned('finding32')}"))[1],
+                   bytes_at(commit, "finding32"))["lines"]
     live = [bytes(line["bytes"]) for line in lines if line["bytes"] is not None]
     assert all(line.endswith(b"\n") for line in live[:-1]), (
         "finding 32: an unfinished line precedes another line", live, bytes_at(commit, "finding32"))

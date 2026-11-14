@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use super::journal::{Change, SaveOutcome, TakeRecord};
 use super::recording::FileMap;
 use super::{Error, Result, queue, referee};
-use crate::tree_reconcile::LineMap;
+use crate::tree_reconcile::{Id, LineMap};
 
 /// A step's journal number. It numbers the step's name versions and line versions, and the object,
 /// handle or fork a step creates. Volume-wide; never reused.
@@ -87,6 +87,24 @@ impl LineVersion {
         buf[start - 1] = b':';
         let start = digits(buf, start - 1, self.event.0);
         &buf[start..]
+    }
+}
+
+/// An event's new versions number on: `<event>:<index>`, `<event>:<index + 1>`, ...
+impl Id for LineVersion {
+    fn at(writer: u64, index: u64) -> Self {
+        Self {
+            event: EventNumber(writer),
+            index,
+        }
+    }
+
+    fn writer(&self) -> u64 {
+        self.event.0
+    }
+
+    fn index(&self) -> u64 {
+        self.index
     }
 }
 
@@ -164,12 +182,19 @@ impl Versions {
         Self { event, last: 0 }
     }
 
+    #[cfg(test)]
     pub(super) fn next(&mut self) -> LineVersion {
-        self.last += 1;
-        LineVersion {
+        self.take(1)
+    }
+
+    /// `n` new versions in order; the first of them.
+    pub(super) fn take(&mut self, n: u64) -> LineVersion {
+        let first = LineVersion {
             event: self.event,
-            index: self.last,
-        }
+            index: self.last + 1,
+        };
+        self.last += n;
+        first
     }
 }
 
@@ -701,17 +726,19 @@ mod tests {
 
     #[test]
     fn the_stored_text_is_unchanged() {
-        let lines = Lines {
+        let lines = Lines::from_expanded(&crate::tree_reconcile::Expanded {
             lines: vec![
                 Line {
                     identity: v("9:1"),
                     version: v("9:1"),
-                    bytes: Some(b"a\n".to_vec()),
+                    live: true,
+                    open: None,
                 },
                 Line {
                     identity: v("9:2"),
                     version: v("10:1"),
-                    bytes: None,
+                    live: false,
+                    open: None,
                 },
             ],
             ancestors: [
@@ -721,8 +748,9 @@ mod tests {
             ]
             .into_iter()
             .collect(),
-        };
-        let stored = r#"{"lines":[{"identity":"9:1","version":"9:1","bytes":[97,10]},{"identity":"9:2","version":"10:1","bytes":null}],"ancestors":{"10:1":"9:2","9:1":null,"9:2":null}}"#;
+        })
+        .unwrap();
+        let stored = r#"{"lines":[{"identity":"9:1","version":"9:1","count":1},{"identity":"9:2","version":"10:1","count":1,"dead":true}],"ancestors":[{"version":"9:1","count":2},{"version":"10:1","count":1,"over":"9:2"}]}"#;
         assert_eq!(String::from_utf8(lines.encode().unwrap()).unwrap(), stored);
         assert_eq!(Lines::decode(stored.as_bytes()).unwrap(), lines);
 

@@ -29,10 +29,10 @@ fn drain(v: &mut TreeActor) {
     while v.progress().unwrap() {}
 }
 
-/// The bytes of each live line of `path` in the commit's own line map.
-fn live_lines(repo: &TreeGit, head: git2::Oid, path: &str) -> Vec<Vec<u8>> {
+/// The blob at `path` in a commit.
+fn at_path(repo: &TreeGit, head: git2::Oid, path: &str) -> Vec<u8> {
     let mut oid = repo.read_commit(head).unwrap().tree;
-    for part in format!("lines/{}", fanned(path)).split('/') {
+    for part in path.split('/') {
         oid = repo
             .list_tree(oid)
             .unwrap()
@@ -41,14 +41,34 @@ fn live_lines(repo: &TreeGit, head: git2::Oid, path: &str) -> Vec<Vec<u8>> {
             .unwrap()
             .oid;
     }
-    let map: serde_json::Value = serde_json::from_slice(&repo.read_blob(oid).unwrap()).unwrap();
-    map[1]["lines"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter(|line| !line["bytes"].is_null())
-        .map(|line| serde_json::from_value(line["bytes"].clone()).unwrap())
-        .collect()
+    repo.read_blob(oid).unwrap()
+}
+
+/// The bytes of each live line of `path` as the commit's own line map divides
+/// its file: each live run's lines end at a newline, its last at `open` bytes
+/// when it has none (docs/trees.md, "What a commit holds").
+fn live_lines(repo: &TreeGit, head: git2::Oid, path: &str) -> Vec<Vec<u8>> {
+    let map: serde_json::Value =
+        serde_json::from_slice(&at_path(repo, head, &format!("lines/{}", fanned(path)))).unwrap();
+    let bytes = at_path(repo, head, &format!("files/{}", fanned(path)));
+    let mut rest = &bytes[..];
+    let mut lines = Vec::new();
+    for run in map[1]["lines"].as_array().unwrap() {
+        if run["dead"].as_bool() == Some(true) {
+            continue;
+        }
+        let count = run["count"].as_u64().unwrap();
+        for i in 0..count {
+            let len = match run["open"].as_u64() {
+                Some(open) if i + 1 == count => open as usize,
+                _ => rest.iter().position(|b| *b == b'\n').unwrap() + 1,
+            };
+            lines.push(rest[..len].to_vec());
+            rest = &rest[len..];
+        }
+    }
+    assert!(rest.is_empty(), "the map holds every byte");
+    lines
 }
 
 fn lost(repo: &TreeGit, save: git2::Oid) -> bool {

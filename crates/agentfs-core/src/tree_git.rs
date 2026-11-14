@@ -435,6 +435,32 @@ impl TreeGit {
     pub fn read_blob(&self, oid: Oid) -> Result<Vec<u8>> {
         self.read_object(oid, ObjectType::Blob)
     }
+    /// A blob's length, read from its header without its bytes.
+    pub fn blob_size(&self, oid: Oid) -> Result<u64> {
+        self.with_repo(|repo| {
+            let (size, kind) = repo.odb()?.read_header(oid)?;
+            if kind != ObjectType::Blob {
+                return Err(Error::Invalid(format!("{oid} is a {kind}")));
+            }
+            Ok(size as u64)
+        })
+    }
+
+    /// Writes a blob's bytes to `file` as `git cat-file` streams them: a
+    /// blob of any size, never held whole in this process.
+    pub fn blob_to(&self, oid: Oid, file: &std::fs::File) -> Result<()> {
+        let mut cmd = self.command(true);
+        cmd.args(["cat-file", "blob", &oid.to_string()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(file.try_clone()?))
+            .stderr(Stdio::piped());
+        let out = crate::git_cli::counted(&mut cmd)?.wait_with_output()?;
+        if !out.status.success() {
+            return Err(classify(&out.stderr));
+        }
+        Ok(())
+    }
+
     /// Read immediate tree entries with raw names, in the tree's order.
     pub fn list_tree(&self, oid: Oid) -> Result<Vec<TreeEntry>> {
         self.with_repo(|repo| {
@@ -627,7 +653,13 @@ impl TreeGit {
                 self.checkout_entries(entry.oid, &path, scratch)?;
             }
             0o100644 | 0o100755 => {
-                std::fs::write(scratch, self.read_blob(entry.oid)?)?;
+                // A large blob streams from `git cat-file`; a small one is
+                // read in this process, sparing a child per file.
+                if self.blob_size(entry.oid)? > STREAMED_BLOB {
+                    self.blob_to(entry.oid, &std::fs::File::create(scratch)?)?;
+                } else {
+                    std::fs::write(scratch, self.read_blob(entry.oid)?)?;
+                }
                 std::fs::set_permissions(
                     scratch,
                     std::fs::Permissions::from_mode(entry.mode & 0o777),
@@ -690,6 +722,10 @@ impl TreeGit {
 /// The temporary name a checkout writes each file to before its rename: in
 /// the tree's top folder, where only two-hex-digit folders live.
 const CHECKOUT_SCRATCH: &str = ".agentfs-checkout";
+
+/// A blob over this many bytes is streamed by `git cat-file`, never read whole
+/// into this process: the most memory a checkout or a take spends on a file.
+pub const STREAMED_BLOB: u64 = 8 << 20;
 
 /// A tree entry's name as a path component; `.` and `..` never leave `dest`.
 fn entry_name(name: &[u8]) -> Result<OsString> {

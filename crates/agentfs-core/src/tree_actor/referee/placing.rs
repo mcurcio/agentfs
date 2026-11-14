@@ -4,8 +4,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::{File, Snapshot, Verdict, ancestry};
-use crate::tree_actor::tree::{LineVersion, Lines, MergeFileIdentity};
+use super::{ByLine as Snapshot, Expanded as Lines, Verdict, ancestry};
+use crate::tree_actor::tree::{LineVersion, MergeFileIdentity};
 use crate::tree_actor::{Error, Result};
 use crate::tree_reconcile::Line;
 
@@ -17,7 +17,7 @@ pub(super) struct Placed {
 }
 
 fn unfinished(line: &Line<LineVersion>) -> bool {
-    line.bytes.as_ref().is_some_and(|b| !b.ends_with(b"\n"))
+    line.live && line.open.is_some()
 }
 
 fn unfinished_tail(lines: &Lines) -> Option<&Line<LineVersion>> {
@@ -25,7 +25,7 @@ fn unfinished_tail(lines: &Lines) -> Option<&Line<LineVersion>> {
         .lines
         .iter()
         .rev()
-        .find(|line| line.bytes.is_some())
+        .find(|line| line.live)
         .filter(|line| unfinished(line))
 }
 
@@ -35,7 +35,7 @@ fn unfinished_before_kept(
     placed: &[Line<LineVersion>],
     selected: &BTreeSet<LineVersion>,
 ) -> Option<(LineVersion, LineVersion)> {
-    let mut live = placed.iter().filter(|line| line.bytes.is_some()).peekable();
+    let mut live = placed.iter().filter(|line| line.live).peekable();
     while let Some(line) = live.next() {
         if unfinished(line)
             && selected.contains(&line.identity)
@@ -102,7 +102,7 @@ pub(super) fn place(
     {
         for line in placed[pos + 1..]
             .iter()
-            .filter(|line| line.bytes.is_some() && selected.contains(&line.identity))
+            .filter(|line| line.live && selected.contains(&line.identity))
         {
             joins.push((line.version, partial.version));
             applying.remove(&line.identity);
@@ -145,7 +145,7 @@ pub(super) fn sync_file(
             .position(|line| line.version == partial.version)
         && lines[pos + 1..]
             .iter()
-            .any(|line| line.bytes.is_some() && selected.contains(&line.identity))
+            .any(|line| line.live && selected.contains(&line.identity))
     {
         lines.remove(pos);
     }
@@ -159,7 +159,7 @@ pub(super) fn sync_file(
         lines.extend(
             later
                 .into_iter()
-                .filter(|line| line.bytes.is_none() || selected.contains(&line.identity)),
+                .filter(|line| !line.live || selected.contains(&line.identity)),
         );
     }
     Ok(Lines { lines, ancestors })
@@ -173,7 +173,7 @@ pub(super) fn sync_files(
     fork: &Snapshot,
     undecided: &BTreeSet<LineVersion>,
     last_lines: &BTreeMap<MergeFileIdentity, Lines>,
-) -> Result<BTreeMap<MergeFileIdentity, File>> {
+) -> Result<BTreeMap<MergeFileIdentity, super::File<Lines>>> {
     let empty = Lines::default();
     let ids: BTreeSet<_> = upstream
         .files
@@ -184,7 +184,7 @@ pub(super) fn sync_files(
     let mut files = BTreeMap::new();
     for id in ids {
         let file = match (upstream.files.get(&id), fork.files.get(&id)) {
-            (Some(theirs), Some(own)) => File {
+            (Some(theirs), Some(own)) => super::File {
                 object: own.object,
                 lines: sync_file(&theirs.lines, &own.lines, undecided)?,
             },
@@ -192,14 +192,14 @@ pub(super) fn sync_files(
             // object, numbered by the event that ended it, which numbers nothing else. Its old
             // object stays with whoever holds it: an old writer reaches no file (R11.3), and after
             // an atomic save that object is now the replaced file's (finding 39).
-            (Some(theirs), None) => File {
+            (Some(theirs), None) => super::File {
                 object: fork
                     .names
                     .get(&id)
                     .map_or(theirs.object, |ended| ended.head.object()),
                 lines: sync_file(&theirs.lines, &empty, undecided)?,
             },
-            (None, Some(own)) => File {
+            (None, Some(own)) => super::File {
                 object: own.object,
                 lines: sync_file(last_lines.get(&id).unwrap_or(&empty), &own.lines, undecided)?,
             },
@@ -212,24 +212,23 @@ pub(super) fn sync_files(
 
 #[cfg(test)]
 mod tests {
-    use super::super::{CollisionKind, Version, land};
+    use super::super::{CollisionKind, File, Version, land, test_bytes};
     use super::*;
-    use crate::tree_actor::tree::{EventNumber, NameHistory, Versions};
+    use crate::tree_actor::tree::{EventNumber, NameHistory};
 
     const FILE: MergeFileIdentity = MergeFileIdentity(100);
 
     fn save(base: &Lines, bytes: &[u8], event: u64) -> Lines {
-        let mut versions = Versions::of(EventNumber::new(event));
-        base.align(bytes, || versions.next()).unwrap()
+        test_bytes::save_lines(base, bytes, event)
     }
 
-    fn snapshot(lines: &Lines) -> Snapshot {
-        Snapshot {
+    fn snapshot(lines: &Lines) -> super::super::Snapshot {
+        super::super::Snapshot {
             files: [(
                 FILE,
                 File {
                     object: 100,
-                    lines: lines.clone(),
+                    lines: super::super::Lines::from_expanded(lines).unwrap(),
                 },
             )]
             .into_iter()
@@ -266,7 +265,7 @@ mod tests {
             .iter()
             .map(|c| (line(&c.lost), line(&c.winner), c.kind.clone()))
             .collect();
-        (decision.snapshot.files[&FILE].lines.clone(), collisions)
+        (decision.snapshot.files[&FILE].lines.expand(), collisions)
     }
 
     #[test]
@@ -289,13 +288,13 @@ mod tests {
         let child = save(&base, b"a\nchild\nz\n", 3);
         let (content, collisions) = land_save(&parent, &base, &child);
         assert!(collisions.is_empty());
-        assert_eq!(content.bytes(), b"a\nparent\nchild\nz\n");
+        assert_eq!(test_bytes::of(&content), b"a\nparent\nchild\nz\n");
         let base = save(&Lines::default(), b"line\n", 7);
         let parent = save(&base, b"line\nappend\n", 8);
         let child = save(&base, b"edited\n", 9);
         let (content, collisions) = land_save(&parent, &base, &child);
         assert!(collisions.is_empty());
-        assert_eq!(content.bytes(), b"edited\nappend\n");
+        assert_eq!(test_bytes::of(&content), b"edited\nappend\n");
     }
 
     #[test]
@@ -309,9 +308,9 @@ mod tests {
         assert_eq!(collisions[0].1, parent.lines[1].version);
         let undecided = BTreeSet::from([child.lines[1].version]);
         let before = sync_file(&parent, &child, &undecided).unwrap();
-        assert_eq!(before.bytes(), b"base\nchild\n");
+        assert_eq!(test_bytes::of(&before), b"base\nchild\n");
         let after = sync_file(&parent, &before, &BTreeSet::new()).unwrap();
-        assert_eq!(after.bytes(), b"base\nunfinished");
+        assert_eq!(test_bytes::of(&after), b"base\nunfinished");
     }
 
     #[test]
@@ -321,7 +320,7 @@ mod tests {
         let child = save(&base, b"b\nchanged\n", 3);
         let (content, collisions) = land_save(&parent, &base, &child);
         assert!(collisions.is_empty());
-        assert_eq!(content.bytes(), b"b\nchanged\n");
+        assert_eq!(test_bytes::of(&content), b"b\nchanged\n");
         assert_eq!(content.lines[0].version, child.lines[0].version);
     }
 
@@ -346,7 +345,7 @@ mod tests {
         let child = save(&base, b"a\nchild", 3);
         let (content, collisions) = land_save(&parent, &base, &child);
         assert!(collisions.is_empty());
-        assert_eq!(content.bytes(), b"a\nparent\nchild");
+        assert_eq!(test_bytes::of(&content), b"a\nparent\nchild");
     }
 
     #[test]
@@ -363,23 +362,19 @@ mod tests {
         };
         let child = save(&base, b"y", 3);
         let before = sync_file(&parent, &child, &changed(&child)).unwrap();
-        assert_eq!(before.bytes(), b"y");
+        assert_eq!(test_bytes::of(&before), b"y");
         let after = sync_file(&parent, &before, &BTreeSet::new()).unwrap();
-        assert_eq!(after.bytes(), b"a\nb\nm7\n");
+        assert_eq!(test_bytes::of(&after), b"a\nb\nm7\n");
         // An unfinished line past the parent's lines hides nothing.
         let child = save(&base, b"a\nb\nchild", 10);
         assert_eq!(
-            sync_file(&parent, &child, &changed(&child))
-                .unwrap()
-                .bytes(),
+            test_bytes::of(&sync_file(&parent, &child, &changed(&child)).unwrap()),
             b"a\nb\nm7\nchild"
         );
         // Nor does a finished line.
         let child = save(&base, b"y\n", 11);
         assert_eq!(
-            sync_file(&parent, &child, &changed(&child))
-                .unwrap()
-                .bytes(),
+            test_bytes::of(&sync_file(&parent, &child, &changed(&child)).unwrap()),
             b"y\nm7\n"
         );
     }

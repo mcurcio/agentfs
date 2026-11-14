@@ -51,6 +51,8 @@ pub(in crate::tree_actor) struct Decision {
     /// Its plan's keys (a losing change's files included, R9.1).
     pub writes: BTreeSet<Key>,
     pub take: TakeRecord,
+    /// Where the bytes of the files it leaves are, written before its record.
+    pub bytes: plan::TakeBytes,
     started: Instant,
 }
 
@@ -141,6 +143,7 @@ pub(in crate::tree_actor) fn decide(
         snapshot: after,
         collisions,
         entry_done,
+        sources,
     } = decided;
     let mut writes = plans[index].files.clone();
     let (files, names) = match &after {
@@ -151,6 +154,9 @@ pub(in crate::tree_actor) fn decide(
         None => Default::default(),
     };
     reads.extend(writes.iter().cloned());
+    let bytes = plan::take_bytes(snapshot, tree, &files, &sources)?;
+    let lens = bytes.lens();
+    let chunks = TakeRecord::chunks_for(lens.iter().sum());
     Ok(Some(Decision {
         tree,
         entry: entry.clone(),
@@ -166,7 +172,10 @@ pub(in crate::tree_actor) fn decide(
             files,
             names,
             collisions,
+            lens,
+            chunks,
         },
+        bytes,
         started,
     }))
 }
@@ -375,10 +384,12 @@ impl TreeActor {
             tree,
             entry,
             take,
+            bytes,
             started,
             ..
         } = decision;
-        let seq = self.next;
+        // Its chunk records come first: the step's number is after them.
+        let seq = self.next + take.chunks;
         let event = EventNumber::new(seq);
         let landing = tree.is_root();
         let mut pointers = Vec::new();
@@ -418,18 +429,18 @@ impl TreeActor {
         let mut after = self.tree(tree)?.clone();
         let keys = after.shape.apply(&change, event)?;
         let by = self.agentfs();
-        // The files the take leaves are in its record's tail: each saved map
-        // reads them from there, never from memory.
-        let tail = match &change {
-            Change::Take { take, .. } => take.tail(),
-            _ => Vec::new(),
-        };
-        let (_, pos) = self.record_step(by, change.clone(), pointers, &tail)?;
+        // The files the take leaves are in its chunk records: each saved map
+        // reads them there, never from memory.
+        let (recorded, chunks) =
+            self.record_step(by, change.clone(), pointers, &mut bytes.chunks())?;
+        if recorded != seq {
+            return Err(Error::Format);
+        }
         self.touch(tree, seq, keys);
         if let Change::Take { take, .. } = &change {
             // The view drops each taken file's pages: a take that left one
             // as it was costs a page fill, never a byte compare.
-            for (object, map) in take.maps(&pos, RecordNo::new(seq))? {
+            for (object, map) in take.maps(&chunks, RecordNo::new(seq))? {
                 self.changed.push((tree, object));
                 after.bytes.insert(object, map);
             }

@@ -309,7 +309,11 @@ impl Git {
         for (path, blob) in self.leaves(oid, "lines")? {
             let entry: Value =
                 serde_json::from_slice(&self.object(&blob)?).map_err(|e| e.to_string())?;
-            let map = parse_map(&path, &entry).map_err(|e| format!("{oid} {path}: {e}"))?;
+            let bytes = commit
+                .files
+                .get(&path)
+                .ok_or_else(|| format!("{oid:.7}: lines of {path} with no file"))?;
+            let map = parse_map(&path, &entry, bytes).map_err(|e| format!("{oid} {path}: {e}"))?;
             if commit.name_path(map.identity) != Some(path.as_str()) {
                 return Err(format!(
                     "{oid:.7}: lines of {path} name file {}, whose name is elsewhere",
@@ -329,34 +333,63 @@ impl Drop for Git {
     }
 }
 
-/// A `lines/` entry: `[identity, line map]`.
-pub(crate) fn parse_map(path: &str, entry: &Value) -> Result<FileMap, String> {
+/// The version `n` after `version` (`"<event>:<index>"`) in its event's numbering.
+fn nth(version: &str, n: u64) -> Result<String, String> {
+    if n == 0 {
+        return Ok(version.to_owned());
+    }
+    let (event, index) = version.split_once(':').ok_or("bad version")?;
+    let index: u64 = index.parse().map_err(|_| "bad version")?;
+    Ok(format!("{event}:{}", index + n))
+}
+
+/// A `lines/` entry, `[identity, line map]`, over the file's bytes. The map is
+/// runs of lines whose identities and versions number on; each live line ends
+/// at a newline, or after `open` bytes for a run's last line that has none; the
+/// ancestors are runs too (docs/trees.md, "What a commit holds").
+pub(crate) fn parse_map(path: &str, entry: &Value, bytes: &[u8]) -> Result<FileMap, String> {
     let identity = entry[0].as_u64().ok_or("bad identity")?;
     let map = &entry[1];
+    let mut rest = bytes;
     let mut lines = Vec::new();
-    for l in map["lines"].as_array().ok_or("bad lines")? {
-        let bytes = match &l["bytes"] {
-            Value::Null => None,
-            b => Some(
-                b.as_array()
-                    .ok_or("bad bytes")?
-                    .iter()
-                    .map(|x| x.as_u64().map(|x| x as u8).ok_or("bad byte"))
-                    .collect::<Result<Vec<u8>, _>>()?,
-            ),
-        };
-        lines.push((
-            l["version"].as_str().ok_or("bad version")?.to_owned(),
-            l["identity"]
-                .as_str()
-                .ok_or("bad line identity")?
-                .to_owned(),
-            bytes,
-        ));
+    for run in map["lines"].as_array().ok_or("bad lines")? {
+        let first = run["identity"].as_str().ok_or("bad line identity")?;
+        let version = run["version"].as_str().ok_or("bad version")?;
+        let count = run["count"].as_u64().ok_or("bad count")?;
+        let dead = run["dead"].as_bool().unwrap_or(false);
+        for i in 0..count {
+            let bytes = if dead {
+                None
+            } else {
+                let len = match run["open"].as_u64() {
+                    Some(open) if i + 1 == count => open as usize,
+                    _ => {
+                        rest.iter()
+                            .position(|b| *b == b'\n')
+                            .ok_or("a live line past the file's bytes")?
+                            + 1
+                    }
+                };
+                if len > rest.len() {
+                    return Err("a live line past the file's bytes".into());
+                }
+                let (line, after) = rest.split_at(len);
+                rest = after;
+                Some(line.to_vec())
+            };
+            lines.push((nth(version, i)?, nth(first, i)?, bytes));
+        }
+    }
+    if !rest.is_empty() {
+        return Err("bytes past the map's live lines".into());
     }
     let mut ancestors = BTreeMap::new();
-    for (v, over) in map["ancestors"].as_object().ok_or("bad ancestors")? {
-        ancestors.insert(v.clone(), over.as_str().map(str::to_owned));
+    for run in map["ancestors"].as_array().ok_or("bad ancestors")? {
+        let version = run["version"].as_str().ok_or("bad version")?;
+        let over = run["over"].as_str();
+        for i in 0..run["count"].as_u64().ok_or("bad count")? {
+            ancestors.insert(nth(version, i)?, over.map(|o| nth(o, i)).transpose()?);
+        }
     }
     Ok(FileMap {
         path: path.to_owned(),
@@ -573,14 +606,14 @@ pub(crate) mod tests {
                 Some(lines) => {
                     let lines: Vec<String> = lines
                         .iter()
-                        .map(|v| {
-                            format!(r#"{{"version":"{v}","identity":"{v}","bytes":[120,10]}}"#)
-                        })
+                        .map(|v| format!(r#"{{"identity":"{v}","version":"{v}","count":1}}"#))
                         .collect();
+                    let ancestors: Vec<String> = lines_versions(&lines);
                     (
                         Some(format!(
-                            r#"[1,{{"lines":[{}],"ancestors":{{}}}}]"#,
-                            lines.join(",")
+                            r#"[1,{{"lines":[{}],"ancestors":[{}]}}]"#,
+                            lines.join(","),
+                            ancestors.join(",")
                         )),
                         r#"{"head":1,"versions":{"1":{"path":"a","over":null}}}"#.to_owned(),
                     )
@@ -602,10 +635,18 @@ pub(crate) mod tests {
                     folder(aa, &format!("040000 tree {bb}"))
                 )
             };
-            let mut listing = hashed("names", "56", "a6", "1", &history);
-            if let Some(map) = &map {
+            let mut listing = String::new();
+            if let (Some(map), Some(lines)) = (&map, lines) {
+                listing.push_str(&hashed(
+                    "files",
+                    "2e",
+                    "65",
+                    "a",
+                    &"x\n".repeat(lines.len()),
+                ));
                 listing.push_str(&hashed("lines", "2e", "65", "a", map));
             }
+            listing.push_str(&hashed("names", "56", "a6", "1", &history));
             let tree = self.git(&["mktree"], listing.as_bytes());
             let mut args = vec!["commit-tree", tree.as_str()];
             for parent in parents {
@@ -622,20 +663,32 @@ pub(crate) mod tests {
         }
     }
 
+    /// The ancestor runs of single-line runs: each version new.
+    fn lines_versions(lines: &[String]) -> Vec<String> {
+        lines
+            .iter()
+            .map(|run| {
+                let at = run.find(r#""version":""#).unwrap() + 11;
+                let version = &run[at..at + run[at..].find('"').unwrap()];
+                format!(r#"{{"version":"{version}","count":1}}"#)
+            })
+            .collect()
+    }
+
     /// The engine's history reads a landing's lost line, its bytes from the
     /// incoming commit and its tree by name, and a head's cause and parents.
     #[test]
     fn a_landings_lost_line_and_a_head_are_read_from_git() {
         let repo = Repo::new();
-        let base = repo.commit(&[], "Root", Some(&["b"]));
-        let before = repo.commit(&[&base], "Direct", Some(&["u"]));
-        let incoming = repo.commit(&[&base], "Direct", Some(&["f"]));
+        let base = repo.commit(&[], "Root", Some(&["1:1"]));
+        let before = repo.commit(&[&base], "Direct", Some(&["2:1"]));
+        let incoming = repo.commit(&[&base], "Direct", Some(&["3:1"]));
         let trailers = format!(
             "Agentfs-Tree: fork/3\n{}{}\n",
-            r#"Agentfs-Collisions: [{"lost":{"Line":{"file":1,"version":"f"}},"#,
-            r#""winner":{"Line":{"file":1,"version":"u"}},"kind":"Line"}]"#,
+            r#"Agentfs-Collisions: [{"lost":{"Line":{"file":1,"version":"3:1"}},"#,
+            r#""winner":{"Line":{"file":1,"version":"2:1"}},"kind":"Line"}]"#,
         );
-        let landing = repo.commit_with(&[&before, &incoming], "Landing", Some(&["u"]), &trailers);
+        let landing = repo.commit_with(&[&before, &incoming], "Landing", Some(&["2:1"]), &trailers);
         repo.git(&["update-ref", "refs/heads/root", &landing], b"");
         repo.git(&["update-ref", "refs/heads/fork/3", &incoming], b"");
         let mut history = EngineHistory::new(repo.path(), EngineNames::new()).unwrap();

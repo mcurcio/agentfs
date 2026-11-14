@@ -9,7 +9,9 @@ use git2::Oid;
 
 use super::durable::RecordNo;
 use super::segment::FramePos;
-use super::{Change, Entry, Frame, OpenRecord, Record, RunHead, SaveOutcome, Tail, Target};
+use super::{
+    Change, Entry, Frame, OpenRecord, Record, RunHead, SaveOutcome, Tail, Target, take_chunks,
+};
 use crate::tree_actor::history::Objects;
 use crate::tree_actor::history::upstreams::Upstreams;
 use crate::tree_actor::pointers::Pointers;
@@ -66,6 +68,8 @@ pub(in crate::tree_actor) struct Folded {
     pub(in crate::tree_actor) page_writes: BTreeMap<(TreeId, u64), Vec<(u64, pages::Run)>>,
     /// The last step that closed a write-open of a file, while one lives.
     pub(in crate::tree_actor) saved_through: BTreeMap<(TreeId, u64), u64>,
+    /// The chunk records no take step has taken yet ([`super::take_chunks`]).
+    pub(in crate::tree_actor) bytes: Vec<(u64, Tail)>,
 }
 
 impl Folded {
@@ -136,6 +140,8 @@ pub(in crate::tree_actor) struct Replay {
     pages: BTreeMap<(TreeId, u64), Vec<(u64, pages::Run)>>,
     /// False: shapes only, each save's map left as it was.
     maps: bool,
+    /// Chunk records no take has taken yet.
+    bytes: Vec<(u64, Tail)>,
 }
 
 impl Replay {
@@ -149,6 +155,7 @@ impl Replay {
         mut trees: BTreeMap<TreeId, SavedTree>,
         opens: &BTreeMap<u64, FoldedOpen>,
         page_writes: BTreeMap<(TreeId, u64), Vec<(u64, pages::Run)>>,
+        bytes: Vec<(u64, Tail)>,
     ) -> Result<Self> {
         let mut live = BTreeMap::new();
         for (handle, folded) in opens {
@@ -166,6 +173,7 @@ impl Replay {
             opens: live,
             pages: page_writes,
             maps: true,
+            bytes,
         })
     }
 
@@ -178,7 +186,7 @@ impl Replay {
         trees: BTreeMap<TreeId, SavedTree>,
         opens: &BTreeMap<u64, FoldedOpen>,
     ) -> Result<Self> {
-        let mut replay = Self::new(trees, opens, BTreeMap::new())?;
+        let mut replay = Self::new(trees, opens, BTreeMap::new(), Vec::new())?;
         replay.maps = false;
         Ok(replay)
     }
@@ -225,12 +233,13 @@ impl Replay {
                 .entry((tree.parse::<TreeId>()?, *object))
                 .or_default()
                 .extend(runs_from_frame(runs, tail)?.into_iter().map(|r| (seq, r))),
-            Entry::Step { change, .. } => self.step(seq, change, tail)?,
+            Entry::Bytes => self.bytes.push((seq, tail.clone())),
+            Entry::Step { change, .. } => self.step(seq, change)?,
         }
         Ok(())
     }
 
-    fn step(&mut self, seq: u64, change: &Change, tail: &Tail) -> Result<()> {
+    fn step(&mut self, seq: u64, change: &Change) -> Result<()> {
         let event = EventNumber::new(seq);
         match change {
             Change::Create { tree, .. } => {
@@ -296,13 +305,16 @@ impl Replay {
                 self.trees.insert(TreeId::Fork(seq), fork);
             }
             Change::Take { tree, take } => {
-                let maps = self.maps;
+                let chunks = take_chunks(&mut self.bytes, seq, take.chunks)?;
+                let maps = if self.maps {
+                    take.maps(&chunks, RecordNo::new(seq))?
+                } else {
+                    Vec::new()
+                };
                 let (_, t) = self.tree(tree)?;
                 t.shape.apply(change, event)?;
-                if maps {
-                    for (object, map) in take.maps(&tail.pos, RecordNo::new(seq))? {
-                        t.bytes.insert(object, map);
-                    }
+                for (object, map) in maps {
+                    t.bytes.insert(object, map);
                 }
             }
         }
@@ -385,6 +397,7 @@ pub(in crate::tree_actor) fn fold(frames: &[Frame]) -> Result<Folded> {
             .iter()
             .map(|(tree, object, seq)| Ok(((tree.parse::<TreeId>()?, *object), *seq)))
             .collect::<Result<_>>()?,
+        bytes: Vec::new(),
     };
     for (fork, upstream) in upstreams {
         folded.add_upstream(fork, upstream)?;
@@ -427,6 +440,7 @@ pub(in crate::tree_actor) fn fold(frames: &[Frame]) -> Result<Folded> {
                 .entry((tree.parse::<TreeId>()?, *object))
                 .or_default()
                 .extend(runs_from_frame(runs, tail)?.into_iter().map(|r| (seq, r))),
+            Entry::Bytes => folded.bytes.push((seq, tail.clone())),
             Entry::Step {
                 by,
                 change,
@@ -435,6 +449,9 @@ pub(in crate::tree_actor) fn fold(frames: &[Frame]) -> Result<Folded> {
                 folded.pointers.check_targets(pointers)?;
                 folded.pointers.apply_targets(pointers);
                 folded.add_step(seq, by, change)?;
+                if matches!(change, Change::Take { .. }) {
+                    folded.bytes.clear();
+                }
             }
         }
     }
