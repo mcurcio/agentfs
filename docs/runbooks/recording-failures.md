@@ -223,6 +223,13 @@ never as a volume that will not mount.
   state area fills and the workload's calls fail with `ENOSPC`.
 - **`git fast-import failed: <first line>`.** The packer exited or was killed. Its
   first stderr line says why; the next step retries with a new child.
+- **`histogram diff: ...` or `git diff failed: ...`.** The alignment of a save
+  failed. A save that is not an append runs one `git diff`, which reads both
+  versions of the file whole: an edit of a file near the host's memory is
+  killed there, and every retry fails the same way. Give the volume's
+  container the memory (about twice the file), or replace the file with a new
+  one, which aligns with no `git diff`. Its two files are in `align/` in the
+  state area while it runs and are removed after.
 - **`disagrees with step <n>`.** The builder's replay of step `n` does not give what
   the actor recorded (a length, a digest of the file's pieces, or a name). Every
   retry fails the same way. Preserve the state area (`cp -a "$STATE" "$STATE.saved"`)

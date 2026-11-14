@@ -147,7 +147,7 @@ actor: its waiters get its error and every later call `EIO` (see
 
 ## File maps
 
-No file's bytes are held in memory. A file is a map: pieces of journal frames
+No file's bytes are held in memory, by the views or by the builder. A file is a map: pieces of journal frames
 and of the private checkout's file as built, by file offset. A write adds one
 piece that points at its frame, so it costs its own bytes at any file size: a
 4 KiB write into a 1 GiB file copies 4 KiB, into its frame. An open starts from
@@ -165,8 +165,17 @@ clone it.
 - Each such file holds one open descriptor per tree. The view raises the soft
   limit on open files to the hard limit at start; a host whose hard limit is
   below the files it serves gets `EMFILE`.
-- A take's merged files are in its record's tail, and their maps read them
-  there.
+- A take's merged files are in chunk records of at most 16 MiB just before
+  its step, written from the files whose lines it keeps (a version's bytes are
+  the same in every file that holds it), and their maps read them there; a
+  take of a file of any size records.
+- The builder aligns a save reading both versions of the file a line at a
+  time, with a sampled index of where lines start. A new file and an append
+  run no `git diff`; any other save writes both versions to `align/` in the
+  state area for one `git diff` and removes them. `git diff` itself reads both
+  files whole, so an edit of a file near the host's memory needs that memory
+  in the `git` child. Blobs over 8 MiB stream through `git fast-import` and
+  `git cat-file` (`core.bigFileThreshold`), which never hold them whole.
 - The save record holds the result's length and a digest of its pieces: the
   close's own pieces with their places, and the bytes it kept as runs. The
   builder's replay must reach the same digest (`Disagrees`).
@@ -196,7 +205,7 @@ levels of hashed folders:
 
 ```text
 files/<aa>/<bb>/<name>   the file's bytes
-lines/<aa>/<bb>/<name>   JSON [identity, line map]
+lines/<aa>/<bb>/<name>   JSON [identity, line map]: the file's lines as runs, never their bytes
 names/<cc>/<dd>/<id>     JSON name history of one file identity, ended files included
 ```
 
@@ -208,6 +217,16 @@ builder's cost per save is the same at 100 files and at 100,000. `git log --
 files/2e/65/a` is the history of a file named `a` (`printf a | git hash-object
 --stdin` starts `2e65`). Each tree's private checkout (`trees/<tree>/` in the
 state area) mirrors `files/`: `trees/root/2e/65/a`.
+
+A line map is `{"lines": [runs], "ancestors": [runs]}`. A line run is
+`{"identity": "e:i", "version": "e:j", "count": n}`: `n` lines whose
+identities and versions number on (`e:i`, `e:i+1`, ...), with `"dead": true`
+for deleted lines and `"open": len` when its last line has no newline (that
+line's length in bytes). The live lines divide the file's bytes in order,
+each at its newline. An ancestor run `{"version": "e:j", "count": n, "over":
+"d:k"}` says each of `n` versions was written over the one numbered alike
+from `d:k`; without `over` they are new lines. A new file is one run of each
+at any size, so a map costs its saves' edits, not its file's bytes.
 
 Object numbers (which file an open handle writes to) are not in history. They are
 the journal's: a checkpoint holds each tree's objects as of its built point, and
@@ -250,7 +269,7 @@ appends it and applies it to the saved state the views serve; it runs no git.
   once the dead bytes they pin exceed their own, so the segments stay under about
   twice the live opens' bytes plus a segment. A reader holding a dropped segment
   keeps reading it; its space returns when the last lets go. Frames are at most
-  96 MiB. The constants are not settings. A checkpoint's pointers are the built
+  96 MiB; a take's bytes are in records of at most 16 MiB. The constants are not settings. A checkpoint's pointers are the built
   ones, so a compaction that is due waits for the first call after the builder
   has built every record; while history trails, the journal grows. A compaction
   that fails before its checkpoint changes nothing and is retried at the next
@@ -266,7 +285,7 @@ appends it and applies it to the saved state the views serve; it runs no git.
   with every later segment.
   Bit rot in the very last frame, or in records not yet durable, reads as a tear
   and drops those records; the log line and that file are the evidence.
-- The state area is `volume`, `history.git`, `journal/`, `built.log`,
+- The state area is `volume`, `history.git`, `journal/`, `built.log`, `align/`,
   `actor.lock`, `format` and rebuilt private checkout caches, which the workload
   never sees. A create writes an `initializing` marker first and removes it last;
   the next `trees init` starts a cut-short create over. **Earlier state formats
@@ -374,18 +393,17 @@ What the tree views do not support:
   replication, CSI, several view hosts, upgrades and snapshot opens** are not
   built. The designs for them are in [target-architecture](target-architecture/README.md).
 - **Telemetry export** is not wired. `--metrics-output` is the only measurement.
-- **Large files are slow to build.** The call path costs a write's own bytes,
-  but the builder reads a saved file whole to align its lines, and its line map
-  holds every byte and is written as JSON, so a large file taxes its builds and
-  the state area: a 1 GiB save needs about 4 GiB while history builds (its
-  journal segments, a pack of the blob and its line map, the checkout). Takes read
-  whole trees. In one debug-build run on CI, before file maps, a
-  100 MiB file took 31.9 s to write and close and 339 s until both views converged
-  (a 1 MiB file: 1.27 s), and five saves of unrelated small files took 238 to 241 s
-  each to appear while it was queued. The line map is never pruned, so per-save cost
-  grows with history: 10,000 one-line saves took 2,561 s in one run. See
-  [performance.md](performance.md). These are observations from single runs, not
-  budgets.
+- **Large files.** A save costs its own file: the builder's memory does not
+  grow with the file (17 MiB for a 1 GiB save in one local run, its history
+  built in about 40 s; see [performance.md](performance.md)). Still: the
+  state area needs about three times a large file while history builds (its
+  journal segments, its blob, its checkout); an edit that is not an append
+  runs `git diff`, which holds both versions; a take expands its files' line
+  maps line by line and reads the files it merges, through `git cat-file` for
+  any over 8 MiB; and a line map keeps every deleted line, so maps of files
+  edited often grow with their edits. In one debug-build run on CI, before
+  file maps and these line maps, a 100 MiB file took 339 s until both views
+  converged; 10,000 one-line saves took 2,561 s.
 - **A call can wait.** A client call on a mount waits behind a take that has begun.
   A file held open can hold other files' decisions back for minutes in the
   measurements above. Only the mounted cases and the held-log measurement cover the

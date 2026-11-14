@@ -953,3 +953,39 @@ Not blocking; the suite is built and green. Findings about the brief and the doc
     unknown); its failpoints are `tree.compact_before_checkpoint` and `tree.compact_before_drop`. `close_1g` times
     the close and `stat` after the writes (the engine's dirty bigclose); `write_1g`'s "a 1 MiB file's writes" is
     32 files of one 1 MiB write. Page writes' bases (kernel page snapshots) stay in memory; the image is a map.
+
+## 2026-11-14, speed fix 1 (fix-plan.md R1 to R3): where the plan is short, and what was built instead
+
+1. **R1 changes what `lines/` holds, not what history says.** A line map is now runs of lines (identity and
+   version numbering on, `dead`, `open` length for an unfinished last line) and runs of ancestors, never bytes
+   (docs/trees.md, "What a commit holds"). Bytes come from `files/`. The model's digests do not read the library's
+   layout and are unchanged; the conformance reader (`git_history.rs::parse_map`) and `ci/trees-conformance.py`
+   expand runs over the file's bytes. The state format is `agentfs-trees-9`. Lengths are not stored per line (a
+   line ends at its newline): a per-line form cannot meet "memory independent of file size" for a 1 GiB file of
+   short lines (millions of entries), so the established pattern is git blame's ranges of lines.
+2. **"Bounded independent of file size" holds for the builder process, not for every git child or a take.**
+   Measured (one container, release): agentfs 15 to 17 MiB at 64 MiB to 1 GiB; `git fast-import` and
+   `git cat-file` were made to stream (`core.bigFileThreshold=8m`, a 16 MiB pack window for `cat-file`), which
+   took the children from about 3x the file to 66 MiB. Still unbounded, and documented: an edit that is not an
+   append runs `git diff`, which reads both versions whole (git's xdiff), and a take expands its files' line maps
+   line by line (the referee works per line) and reads the files it merges. The bar names saves; takes and edits of
+   huge files would need a streaming diff and a run-level referee.
+3. **Take tails: chunk records, not a multi-frame tail.** A take's merged files are written from their sources
+   (`tree_reconcile::pieces`: a version's bytes are the same in every file that holds it) into `Entry::Bytes`
+   records of at most 16 MiB recorded just before the take step, with no compaction between (`append_record`);
+   `TakeRecord` gains `lens` and `chunks`. The take worker reads source blobs over 8 MiB through `git cat-file`
+   into an unlinked file of the state area.
+4. **R2: open compacts only when nothing is unbuilt.** A journal built through its last record compacts at open as
+   before; otherwise the threshold is 0 and compaction runs at the first record after the builder catches up. The
+   library's and the mounted replays' `crash` now settle after the reopen (they read git after every call).
+5. **R3b's class is gone with R2, not fixed in the builder.** Reopen failed because `serve` required a map the
+   builder had published for every named file; a linked anonymous file's map is empty and never published. Serving
+   from the journal's replay removes that requirement; the builder is unchanged there. The red test now fails only
+   if the replay's `Change::Link` arm is broken (probe run).
+6. **R3a, mechanism:** a compaction records each step value the pointers held and the oid it was built as; a step
+   whose pointers were read before it names those oids (`TreeActor::resolve_compacted`, run in `record_step`
+   after the compaction). `Pointers::check_targets` still tolerates step-versus-oid (left for Fix 2).
+7. **Validation tightened:** a line map's ancestry is acyclic because every version is over an earlier writer's
+   (checked by event number, not by walking chains). Every map the library writes satisfies it.
+8. **A `wip(trees):` commit (24ee3f5) is in the branch's history** (a checkpoint pushed to `wip/speed-fix1` before
+   the slice was green); it was not rewritten.

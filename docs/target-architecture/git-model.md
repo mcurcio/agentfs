@@ -244,7 +244,7 @@ Ref names are a design choice; the model uses the first five (with `refs/collisi
 | `refs/queue/<tree>/<n>` | one queue entry (§5) | until taken | never |
 
 A commit's tree (a design choice, the owner's pick Q1-A of 2026-11-14, hashed sub-folders) keeps each file at
-`files/<aa>/<bb>/<name>`, its line map at `lines/<aa>/<bb>/<name>` and each file identity's name history at
+`files/<aa>/<bb>/<name>`, its line map (runs of line identities and versions, never bytes) at `lines/<aa>/<bb>/<name>` and each file identity's name history at
 `names/<cc>/<dd>/<id>`, the folders hex digits 1-2 and 3-4 of `git hash-object` of the name (or the identity in
 decimal): fixed, so a file's path never moves, and a commit rewrites only its changed files' folders
 ([trees](../trees.md#what-a-commit-holds)). No ref holds object numbers; they are the journal's (§3).

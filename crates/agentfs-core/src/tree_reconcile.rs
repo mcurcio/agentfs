@@ -1278,6 +1278,66 @@ mod tests {
         assert_eq!(appended, aligned);
     }
 
+    /// A join (R10.8) can leave an unfinished line before another: its length,
+    /// not the next newline, ends it, in its own file and wherever it is taken.
+    #[test]
+    fn an_unfinished_line_mid_file_keeps_its_length() {
+        let joined = LineMap::from_runs(
+            vec![
+                Run {
+                    identity: V(1, 1),
+                    version: V(1, 1),
+                    count: 1,
+                    dead: false,
+                    open: Some(2),
+                },
+                Run {
+                    identity: V(2, 1),
+                    version: V(2, 1),
+                    count: 1,
+                    dead: false,
+                    open: None,
+                },
+            ],
+            vec![
+                Over {
+                    version: V(1, 1),
+                    count: 1,
+                    over: None,
+                },
+                Over {
+                    version: V(2, 1),
+                    count: 1,
+                    over: None,
+                },
+            ],
+        )
+        .unwrap();
+        let image: &[u8] = b"abc\n";
+        let parts = pieces(&joined, &[(&joined, &image)]).unwrap();
+        assert_eq!(
+            parts,
+            vec![Piece {
+                source: 0,
+                offset: 0,
+                len: 4
+            }]
+        );
+        let first = LineMap::from_runs(
+            joined.runs()[..1].to_vec(),
+            joined.ancestors()[..1].to_vec(),
+        )
+        .unwrap();
+        assert_eq!(
+            pieces(&first, &[(&joined, &image)]).unwrap(),
+            vec![Piece {
+                source: 0,
+                offset: 0,
+                len: 2
+            }]
+        );
+    }
+
     #[test]
     fn a_bad_map_is_refused() {
         let map = save(&LineMap::default(), b"", b"a\nb\n", 1);

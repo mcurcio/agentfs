@@ -12,6 +12,18 @@ design was reviewed on 2026-10-12.
 
 ### Added
 
+- **Tree views: a large file costs its save, not memory.** A line map holds each
+  line's identity and version as runs, never its bytes: bytes have one home, the
+  file. A save's alignment reads both versions a line at a time (a new file and an
+  append run no `git diff`), git streams blobs over 8 MiB, and a take's merged
+  files are written from their sources into chunk records of at most 16 MiB, so a
+  take of any size records. A 1 GiB save builds in about 40 s with the builder at
+  17 MiB (one local run); the figures add `history_1g` and `memory_1g`. Opening a
+  volume never waits for history: it serves the journal's records replayed on the
+  trees as built, and a failed build raises its alarm without refusing the open.
+  No record after a checkpoint names a step the checkpoint covers. The state
+  format is now `agentfs-trees-9`; older tree state areas do not open
+  (docs/trees.md, "What a commit holds", "File maps").
 - **Tree views: file maps and journal segments.** No file's bytes are held in
   memory: a file is a map of journal frames and its checkout as built, so a write
   costs its own bytes at any file size and a close compares only the bytes the

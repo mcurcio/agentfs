@@ -270,19 +270,20 @@ mode have differed by up to 2 times, so read a figure as one observation.
 | Held log and compaction | A log held open while another file takes 24 saves of 8 MiB: the journal peaks at 66,149,414 bytes, drops to 745 bytes at each of 2 compactions, and ends at 49,611,545. The held file's one line is all a compaction keeps. The 24 saves took 115.5 s |
 | 1,000 saves | 95.7 s; git children a save stay flat at 39.0 between saves 100 and 1,000 |
 
-### Large files in the tree are slow
+### Large files in the tree
 
-Every take reads and rewrites the whole tree, and every save writes its
-tree's whole line map, so a large file taxes every later step of every
-file, not just its own. The figures below were measured while every save
-also stored every file again.
+These figures were measured before file maps and line maps without bytes,
+while every save stored every file again and a line map held every byte;
+they are kept as the history of the problem. A save now costs its own file
+(see [Tree views, release build](#tree-views-release-build)); a take still
+expands its files' line maps line by line and reads the files it merges.
 
-- A 100 MiB file takes 339.1 s to converge in both views. A 1 MiB file
-  takes 1.27 s, so 100 times the bytes cost 267 times the time.
-- Other files pay for it. Five saves of unrelated small files took 238 to
+- A 100 MiB file took 339.1 s to converge in both views. A 1 MiB file
+  took 1.27 s, so 100 times the bytes cost 267 times the time.
+- Other files paid for it. Five saves of unrelated small files took 238 to
   241 s each to become visible while the large file was queued, and each
   new open of the held log took a median 138.8 s.
-- Where the time goes, over the whole run (seconds, number of runs):
+- Where the time went, over the whole run (seconds, number of runs):
   `snapshot_read` 1,797.4 (97), `queue_plan` 1,280.6 (48, which encloses
   some of the stages beside it), `objects` 288.6 (19, one rehash and sync
   of the blob on each later save), `judge` 263.0 (14) and `checkout` 24.7
@@ -290,10 +291,6 @@ also stored every file again.
 - In earlier runs in a debug build under Docker on macOS, the `judge`
   stage grew faster than linearly with the file's lines: 28 s at 32 MiB,
   109 s at 64 MiB, 316 s at 100 MiB.
-
-Keep large files out of a tree-view volume. Two costs are not reduced
-yet: parsed snapshots are not memoised by commit, and the line referee's
-own cost is unmeasured separately.
 
 ### Many saves slow each one
 
@@ -432,13 +429,29 @@ observation each):
 | `close_1g`, close and `stat` (total with the writes) | 5.44 s (5.85 s) | 5.75 s (6.05 s) |
 | `write_1g`, last 64 writes against a 1 MiB file's (ratio) | 0.40 ms against 0.59 ms (0.67) | 0.29 ms against 0.40 ms (0.72) |
 
-All meet their bars on both filesystems. `close_1g` is the fsync of the
-journal's gigabyte; nothing was copied forward (`carried_bytes` 0). Its history
-did not finish building within the 180 s the script waits on XFS; that run's
-ext4 `drain_s` was read from a metrics file older than the close and is not a
-figure (the script now waits for a newer one). The builder holds a saved file
-whole to align its lines, and on one 4-CPU container it held 6.1 GB while
-building a 1 GiB save.
+`close_1g` is the fsync of the journal's gigabyte; nothing was copied forward
+(`carried_bytes` 0). That run did not measure the 1 GiB save's history: it had
+not finished building within the 180 s the script waits on XFS, and the
+builder then held a saved file whole (about 6 GB for a 1 GiB save).
+
+Then line maps without bytes (docs/trees.md, "What a commit holds"): a
+save's map is runs of lines, its alignment reads both versions a line at a
+time, and git streams blobs over 8 MiB. Two more figures hold the 1 GiB save's
+build: `history_1g` (its `drain_s`, at most 60 s, the engine's own 1 GiB commit
+of 23 to 29 s with margin) and `memory_1g` (the view process's peak memory
+through the save and its build, at most 256 MiB over its memory before). On
+one 4-CPU container (ext4, release build, a random file written in 1 MiB
+writes, `.claude/handoff`'s `mem.py`; a local observation, not CI):
+
+| File | `drain_s` | agentfs peak memory | git children's peak | state area |
+|---|---|---|---|---|
+| 64 MiB | 2.6 s | 15 MiB | 8 MiB | 193 MiB |
+| 256 MiB | 9.7 s | 15 MiB | 146 MiB (mapped pack pages) | 769 MiB |
+| 1 GiB | 39.9 s | 17 MiB | 66 MiB | 3,073 MiB |
+
+The 256 MiB row predates bounding `git cat-file`'s pack window; with it the
+1 GiB save's children peak at 66 MiB. Before, the same container's 256 MiB
+save took 13.8 s with the children at 752 MiB.
 
 ## Performance budget
 

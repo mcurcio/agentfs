@@ -34,6 +34,12 @@ commit, not only the close.
                in one write each: `write_1g` is the median of the big file's
                last 64 writes over the median of those (a write costs its own
                bytes at any file size)
+    history_1g the 1 GiB save's drain_s: from its close and stat to the built
+               point reaching it (needs --metrics)
+    memory_1g  the view process's peak resident memory over its resident
+               memory before the 1 GiB workload, through its save and its
+               build, in MiB: the kernel's high-water mark, reset first
+               (/proc/PID/clear_refs, 5) and read once (needs --view-pid)
 
 Each workload runs on a worker thread. One the deadline catches inside a
 save gets `grace_s` more to come back; one still blocked then is stuck in
@@ -330,6 +336,31 @@ def drain(metrics, cap):
     return None
 
 
+def proc_kib(pid, field):
+    """A /proc/PID/status field in KiB, or None."""
+    try:
+        with open(f"/proc/{pid}/status") as status:
+            for line in status:
+                if line.startswith(field + ":"):
+                    return int(line.split()[1])
+    except OSError:
+        pass
+    return None
+
+
+def reset_peak(pid):
+    """Resets the process's resident high-water mark; returns its resident
+    memory now, in KiB, or None."""
+    try:
+        with open(f"/proc/{pid}/clear_refs", "w") as control:
+            control.write("5")
+    except OSError as error:
+        print(f"::warning title=tree views::could not reset the view's peak memory: {error}",
+              flush=True)
+        return None
+    return proc_kib(pid, "VmRSS")
+
+
 def abort_connection(dev):
     """Abort the view's FUSE connection, the one way to free a thread blocked
     in a request the view never answers. Returns whether it was aborted."""
@@ -362,6 +393,8 @@ def main():
                         help="the view's --metrics-output file: each workload then reports drain_s")
     parser.add_argument("--drain-cap", type=float, default=900.0,
                         help="how long to wait for history to be built after a workload")
+    parser.add_argument("--view-pid", type=int,
+                        help="the view's process: close_1g then reports its peak memory")
     parser.add_argument("--only", action="append", choices=[n for n, _ in WORKLOADS],
                         help="run only this workload (repeatable; a probe's shortcut)")
     args = parser.parse_args()
@@ -382,6 +415,7 @@ def main():
                               "not_run": "an earlier workload was stuck in the view", "warn": True})
             continue
         run = Run(time.monotonic() + budget["deadline_s"])
+        baseline = reset_peak(args.view_pid) if args.view_pid and name == "close_1g" else None
 
         def worker(work=work, run=run, target=budget.get("count")):
             try:
@@ -410,6 +444,16 @@ def main():
             derived = budgets["write_1g"]
             found.append(("write_1g", derived,
                           {"finished": figure["finished"], **figure.get("write_1g", {})}))
+            # history_1g and memory_1g: its build, held to theirs.
+            drained = figure.get("drain_s")
+            found.append(("history_1g", budgets["history_1g"],
+                          {"finished": figure["finished"] and drained is not None,
+                           "drain_s": drained}))
+            peak = proc_kib(args.view_pid, "VmHWM") if baseline is not None else None
+            found.append(("memory_1g", budgets["memory_1g"],
+                          {"finished": figure["finished"] and peak is not None,
+                           "peak_extra_mib": None if peak is None else round((peak - baseline) / 1024, 1),
+                           "peak_mib": None if peak is None else round(peak / 1024, 1)}))
         for shown, held, value in found:
             warn = missed(value, held, args.filesystem)
             workloads.append({**entry, "name": shown, "budget": held["text"], **value, "warn": warn})

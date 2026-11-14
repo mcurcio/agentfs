@@ -305,14 +305,23 @@ impl TreeGit {
     /// Starts `git fast-import` on this repository, its stdin piped and its
     /// marks exported to `marks` at the end: the tree builder's packer. It
     /// always writes a pack (`fastimport.unpackLimit=0`), never loose objects.
+    /// A blob over [`STREAMED_BLOB`] is streamed into the pack whole, never
+    /// held or deltified (`core.bigFileThreshold`), so the packer's memory does
+    /// not grow with a file's size.
     pub fn fast_import(&self, marks: &Path) -> Result<std::process::Child> {
         let mut cmd = self.command(true);
-        cmd.args(["-c", "fastimport.unpackLimit=0", "fast-import"])
-            .args(["--quiet", "--done", "--force"])
-            .arg(format!("--export-marks={}", marks.display()))
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped());
+        cmd.args([
+            "-c",
+            "fastimport.unpackLimit=0",
+            "-c",
+            BIG_FILE_THRESHOLD,
+            "fast-import",
+        ])
+        .args(["--quiet", "--done", "--force"])
+        .arg(format!("--export-marks={}", marks.display()))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
         Ok(crate::git_cli::counted(&mut cmd)?)
     }
 
@@ -447,10 +456,18 @@ impl TreeGit {
     }
 
     /// Writes a blob's bytes to `file` as `git cat-file` streams them: a
-    /// blob of any size, never held whole in this process.
+    /// blob of any size, never held whole in this process, and mapped by the
+    /// child 16 MiB of pack at a time (`core.packedGitWindowSize`).
     pub fn blob_to(&self, oid: Oid, file: &std::fs::File) -> Result<()> {
         let mut cmd = self.command(true);
-        cmd.args(["cat-file", "blob", &oid.to_string()])
+        cmd.args(["-c", BIG_FILE_THRESHOLD])
+            .args([
+                "-c",
+                "core.packedGitWindowSize=16m",
+                "-c",
+                "core.packedGitLimit=64m",
+            ])
+            .args(["cat-file", "blob", &oid.to_string()])
             .stdin(Stdio::null())
             .stdout(Stdio::from(file.try_clone()?))
             .stderr(Stdio::piped());
@@ -726,6 +743,11 @@ const CHECKOUT_SCRATCH: &str = ".agentfs-checkout";
 /// A blob over this many bytes is streamed by `git cat-file`, never read whole
 /// into this process: the most memory a checkout or a take spends on a file.
 pub const STREAMED_BLOB: u64 = 8 << 20;
+
+/// [`STREAMED_BLOB`] as git's own threshold: git streams a blob over it
+/// (`git fast-import` into the pack, `git cat-file` out of it) and never
+/// deltifies it, so a tree git child's memory does not grow with a file.
+const BIG_FILE_THRESHOLD: &str = "core.bigFileThreshold=8m";
 
 /// A tree entry's name as a path component; `.` and `..` never leave `dest`.
 fn entry_name(name: &[u8]) -> Result<OsString> {

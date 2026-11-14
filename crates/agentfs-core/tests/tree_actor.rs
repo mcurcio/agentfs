@@ -1626,6 +1626,31 @@ fn a_kill_at_either_compact_failpoint_loses_nothing() {
     }
 }
 
+/// A take of a file larger than a journal frame lands and reopens: its bytes
+/// are in chunk records before its step, its line maps hold none.
+#[test]
+fn a_take_of_a_file_larger_than_a_frame_lands_and_reopens() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut v = new_actor(tmp.path());
+    let fork = v.fork().unwrap();
+    let mut big = Vec::with_capacity(40 << 20);
+    for i in 0..640_u32 {
+        big.extend(std::iter::repeat_n(b'a' + (i % 26) as u8, (64 << 10) - 1));
+        big.push(b'\n');
+    }
+    put(&mut v, fork, "big", &big);
+    while v.progress().unwrap() {}
+    assert!(v.read(ROOT, "big").unwrap() == big, "the root took it");
+    drop(v);
+    let v = reopen(tmp.path());
+    assert!(
+        v.read(ROOT, "big").unwrap() == big,
+        "the reopened root reads it"
+    );
+    v.settle().unwrap();
+    assert!(fs::read(checkout(tmp.path(), "root", "big")).unwrap() == big);
+}
+
 /// Restart equals an uninterrupted run: a fork recorded as the first step
 /// after a compaction names the upstream's head as an oid, never a step the
 /// checkpoint covers, so a kill before its batch's built-log entry leaves a
