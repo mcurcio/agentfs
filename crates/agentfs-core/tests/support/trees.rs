@@ -90,6 +90,36 @@ pub fn journal_len(dir: &Path) -> u64 {
         .sum()
 }
 
+/// The disk blocks the journal's segments hold, in bytes: the linked ones,
+/// and the unlinked ones this process still has open (a reader holding a
+/// dropped segment keeps its space). Read from each file's allocated blocks.
+pub fn journal_blocks(dir: &Path) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    let journal = std::fs::canonicalize(dir.join("journal")).expect("the journal");
+    let linked: u64 = segments(dir)
+        .iter()
+        .map(|path| std::fs::metadata(path).expect("a segment").blocks() * 512)
+        .sum();
+    let mut held = 0;
+    for fd in std::fs::read_dir("/proc/self/fd").expect("lists descriptors") {
+        let fd = fd.expect("a descriptor").path();
+        let Ok(target) = std::fs::read_link(&fd) else {
+            continue;
+        };
+        let target = target.to_string_lossy();
+        let Some(path) = target.strip_suffix(" (deleted)") else {
+            continue;
+        };
+        if Path::new(path).parent() == Some(journal.as_path()) && path.ends_with(".seg") {
+            // The descriptor itself: its file has no name left to stat.
+            if let Ok(meta) = std::fs::metadata(&fd) {
+                held += meta.blocks() * 512;
+            }
+        }
+    }
+    linked + held
+}
+
 /// Where a torn tail is saved.
 pub fn torn(dir: &Path) -> std::path::PathBuf {
     dir.join("journal").join("torn")

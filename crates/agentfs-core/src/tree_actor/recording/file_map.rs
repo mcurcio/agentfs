@@ -20,7 +20,7 @@ use git2::Oid;
 
 use super::Call;
 use crate::tree_actor::journal::durable::RecordNo;
-use crate::tree_actor::journal::segment::FramePos;
+use crate::tree_actor::journal::segment::{FramePos, Relocations};
 use crate::tree_actor::stages;
 use crate::tree_actor::{Error, Result};
 
@@ -420,6 +420,24 @@ impl FileMap {
         *self = map;
     }
 
+    /// Moves each piece read from a frame compaction carried to its copy, so
+    /// the map no longer holds the dropped segment. Returns whether any moved.
+    pub(in crate::tree_actor) fn relocate(&mut self, moved: &Relocations) -> bool {
+        let found = |piece: &Piece| match &piece.source {
+            Source::Frame { pos, .. } => pos.relocated(moved),
+            _ => None,
+        };
+        if !self.pieces.iter().any(|(_, piece)| found(piece).is_some()) {
+            return false;
+        }
+        for (_, piece) in Arc::make_mut(&mut self.pieces).iter_mut() {
+            if let (Some(to), Source::Frame { pos, .. }) = (found(piece), &mut piece.source) {
+                *pos = to;
+            }
+        }
+        true
+    }
+
     /// Whether some piece reads a journal frame: the map pins a segment.
     pub(in crate::tree_actor) fn on_frames(&self) -> bool {
         self.pieces
@@ -456,12 +474,12 @@ impl FileMap {
                 if let Some((from, len)) = kept.take() {
                     hash.u64(0).u64(from).u64(len);
                 }
-                let (segment, tail) = pos.key();
+                let (record, offset) = pos.key();
                 hash.u64(1)
                     .u64(*start)
                     .u64(piece.len)
-                    .u64(segment)
-                    .u64(tail + at);
+                    .u64(record)
+                    .u64(offset + at);
                 continue;
             }
             kept = Some(match kept {

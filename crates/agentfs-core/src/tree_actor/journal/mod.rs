@@ -61,7 +61,7 @@ use durable::{Durability, RecordNo};
 #[cfg(test)]
 pub(super) use fold::{Folded, LiveOpen};
 pub(super) use fold::{FoldedOpen, Replay, fold, runs_from_frame};
-use segment::{FramePos, SEGMENT_BYTES, Segment};
+use segment::{FramePos, Relocations, SEGMENT_BYTES, Segment};
 
 const MAGIC: &[u8; 4] = b"AFJ3";
 const HEADER: usize = 44;
@@ -652,10 +652,7 @@ pub(super) fn frame_at(
     }
     let record = Record::parse(header.record, &head)?;
     let tail = Tail {
-        pos: FramePos {
-            segment: Arc::clone(segment),
-            tail_at,
-        },
+        pos: FramePos::new(Arc::clone(segment), header.record, tail_at),
         len: header.tail as u64,
     };
     Ok(At::Frame(Box::new((record, tail)), header.frame_len()))
@@ -800,10 +797,7 @@ impl Journal {
                     frame: (
                         record,
                         Tail {
-                            pos: FramePos {
-                                segment: Arc::clone(&segment),
-                                tail_at,
-                            },
+                            pos: FramePos::new(Arc::clone(&segment), header.record, tail_at),
                             len: tail.len() as u64,
                         },
                     ),
@@ -952,10 +946,11 @@ impl Journal {
         let last = self.segments.len() - 1;
         self.segments[last].1 = at + bytes.len() as u64;
         self.durability.appended_to(record.seq);
-        Ok(FramePos {
+        Ok(FramePos::new(
             segment,
-            tail_at: at + (HEADER + head.len()) as u64,
-        })
+            record.seq,
+            at + (HEADER + head.len()) as u64,
+        ))
     }
 
     /// True once this file cannot be trusted: reopen to recover.
@@ -1085,8 +1080,10 @@ impl Journal {
                 index += 1;
                 continue;
             }
+            let mut moved = Vec::new();
+            let current = Arc::clone(&self.current().0);
             if !kept.is_empty() {
-                let (current, mut end) = self.current().clone();
+                let mut end = self.current().1;
                 for (from, header) in &kept {
                     let mut body = vec![0; header.head + header.tail];
                     segment.read_exact_at(&mut body, from + HEADER as u64)?;
@@ -1105,6 +1102,7 @@ impl Journal {
                     );
                     current.file().write_all_at(&copy, end)?;
                     current.file().write_all_at(&body, end + HEADER as u64)?;
+                    moved.push((header.record, end + (HEADER + header.head) as u64));
                     end += header.frame_len();
                     stats.carried_bytes += header.frame_len();
                     stages::copied(header.tail as u64);
@@ -1117,6 +1115,11 @@ impl Journal {
                     .sync()
                     .inspect_err(|e| self.durability.fsync_failed(e))?;
             }
+            // The copies stand: holders may move to them, then the original goes.
+            for (record, tail) in moved {
+                self.durability.relocations().moved(record, &current, tail);
+            }
+            self.durability.relocations().dropped(&segment);
             fs::remove_file(segment.path())?;
             self.durability.remove_segment(segment.first());
             self.segments.remove(index);
@@ -1146,6 +1149,12 @@ impl Journal {
     /// Bytes compaction has copied forward since open.
     pub fn carried(&self) -> u64 {
         self.carried
+    }
+
+    /// Where compaction carried each live frame: what a holder reads to
+    /// move its positions off a dropped segment.
+    pub fn relocations(&self) -> &Relocations {
+        self.durability.relocations()
     }
 
     /// The linked segments' first records, in order.
@@ -1238,7 +1247,7 @@ mod tests {
         let second = call(2, 8, b"\0two\xff");
         let pos = journal.append(&first.0, &first.1).unwrap();
         assert_eq!(pos.bytes(0, 3).unwrap(), b"one");
-        journal.append(&second.0, &second.1).unwrap();
+        let held = journal.append(&second.0, &second.1).unwrap().at(1);
         let salt = journal.salt;
         journal
             .checkpoint(&checkpoint_with(3, vec![open_record(8)]))
@@ -1250,6 +1259,14 @@ mod tests {
         assert_eq!(stats.segments, 1);
         assert!(stats.carried_bytes > 0);
         assert_eq!(journal.segment_firsts(), vec![RecordNo::new(3)]);
+        // A holder moves to the copy: the same name, the same bytes, the
+        // dropped segment no longer held.
+        let moved = held.relocated(journal.relocations()).unwrap();
+        assert_eq!(moved.key(), held.key());
+        assert_eq!(moved.bytes(0, 3).unwrap(), b"two");
+        assert_eq!(moved.segment.first(), RecordNo::new(3));
+        assert!(held.relocated(journal.relocations()).is_some());
+        assert!(moved.relocated(journal.relocations()).is_none());
         let third = call(3, 8, b"three");
         journal.append(&third.0, &third.1).unwrap();
         drop(journal);

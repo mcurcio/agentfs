@@ -1326,6 +1326,40 @@ fn a_held_open_pins_only_its_own_bytes() {
     assert_eq!(v.read(ROOT, "held").unwrap().len(), 70 << 20);
 }
 
+/// A file held open across compactions has its frames carried forward, and
+/// the segments they came from give their space back: the journal's disk
+/// blocks, linked or unlinked but still open in this process, stay under
+/// twice its own bytes once the builder has run a batch (about ten times
+/// that while the actor's and the builder's positions held the old ones).
+#[test]
+fn carried_frames_free_their_old_segments() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut v = new_actor(tmp.path());
+    let held = v.write_open(ROOT, "held", &writer("w"), true).unwrap();
+    let own: u64 = 4 << 20;
+    for _ in 0..4 {
+        v.write(held, 0, &[7; 1 << 20], true).unwrap();
+    }
+    for n in 0..3 {
+        fill_journal(&mut v, &format!("other-{n}"));
+    }
+    assert!(v.metrics().journal_carried_bytes > 0, "nothing was carried");
+    // The builder moves its own positions at its next batch.
+    put(&mut v, ROOT, "poke", b"poke\n");
+    v.settle().unwrap();
+    let blocks = trees::journal_blocks(tmp.path());
+    assert!(
+        blocks < 2 * own,
+        "{blocks} bytes of segment blocks for a held open of {own}"
+    );
+    v.write(held, 0, b"!", true).unwrap();
+    v.close(held).unwrap();
+    assert_eq!(v.read(ROOT, "held").unwrap().len() as u64, own + 1);
+    drop(v);
+    let v = reopen(tmp.path());
+    assert_eq!(v.read(ROOT, "held").unwrap().len() as u64, own + 1);
+}
+
 /// A reader that opened a file read from its checkout as built keeps reading
 /// those bytes after a later save is built: the checkout writes a new file
 /// and renames it over the old, whose descriptor the reader holds.

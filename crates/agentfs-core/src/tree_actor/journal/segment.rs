@@ -2,13 +2,17 @@
 //! 64 MiB, a frame never spanning two (docs/trees.md, "Recording and
 //! durability"). A segment is shared as `Arc<Segment>`: a reader holding one
 //! keeps reading it after the journal unlinks it, and its space returns when
-//! the last holder lets go.
+//! the last holder lets go. A frame is named by its record and an offset into
+//! its tail ([`FramePos::key`]), wherever compaction carries it; the journal's
+//! [`Relocations`] say where a carried frame now is, and each holder moves its
+//! positions there ([`FramePos::relocated`]), letting go of the old segment.
 
+use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use super::durable::RecordNo;
 
@@ -115,25 +119,64 @@ thread_local! {
     pub(in crate::tree_actor) static SYNCS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
-/// Where one frame's tail starts: a record's bytes, read from its segment.
+/// A place in one record's tail: the record's bytes, read from the segment
+/// that holds its frame now.
 #[derive(Clone)]
 pub(in crate::tree_actor) struct FramePos {
     pub segment: Arc<Segment>,
-    pub tail_at: u64,
+    /// The frame's record: with `offset`, the name of these bytes.
+    pub record: RecordNo,
+    /// Where the record's tail starts in `segment`.
+    pub tail: u64,
+    /// Bytes into the tail.
+    pub offset: u64,
 }
 
 impl FramePos {
+    /// The start of `record`'s tail, at byte `tail` of `segment`.
+    pub fn new(segment: Arc<Segment>, record: RecordNo, tail: u64) -> Self {
+        Self {
+            segment,
+            record,
+            tail,
+            offset: 0,
+        }
+    }
+
     /// The position `offset` bytes further into the same tail.
     pub fn at(&self, offset: u64) -> Self {
         Self {
             segment: Arc::clone(&self.segment),
-            tail_at: self.tail_at + offset,
+            record: self.record,
+            tail: self.tail,
+            offset: self.offset + offset,
         }
     }
 
     /// Reads `buf.len()` bytes from `offset` into the tail.
     pub fn read(&self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
-        self.segment.read_exact_at(buf, self.tail_at + offset)
+        self.segment
+            .read_exact_at(buf, self.tail + self.offset + offset)
+    }
+
+    /// Reads from where compaction carried the frame, if it moved from the
+    /// segment this position reads.
+    pub fn relocate(&mut self, moved: &Relocations) {
+        if let Some(to) = self.relocated(moved) {
+            *self = to;
+        }
+    }
+
+    /// The same bytes where compaction carried their frame, if it moved
+    /// from the segment this position reads.
+    pub fn relocated(&self, moved: &Relocations) -> Option<Self> {
+        let (segment, tail) = moved.find(self.record)?;
+        (segment.first != self.segment.first).then(|| Self {
+            segment,
+            record: self.record,
+            tail,
+            offset: self.offset,
+        })
     }
 
     /// The tail's bytes `offset..offset + len`, read into memory: for tests.
@@ -146,16 +189,56 @@ impl FramePos {
         Ok(buf)
     }
 
-    /// The same bytes on disk: the same segment file and offset. Stable
-    /// across the actor's and the builder's handles on one segment.
+    /// The same bytes: the record and the offset into its tail. Stable
+    /// across the actor's and the builder's handles on one segment, and
+    /// across compaction carrying the frame to another.
     pub fn key(&self) -> (u64, u64) {
-        (self.segment.first.get(), self.tail_at)
+        (self.record.get(), self.offset)
     }
 }
 
 impl std::fmt::Debug for FramePos {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}@{}", self.segment.first.get(), self.tail_at)
+        write!(
+            f,
+            "{}+{}@{}",
+            self.record.get(),
+            self.offset,
+            self.segment.first.get()
+        )
+    }
+}
+
+/// Where compaction carried each live frame: its record's segment and tail
+/// now. The journal fills it as it drops a segment; the actor and the builder
+/// read it to move their positions, so the old segment's space returns. Shared
+/// by every clone.
+#[derive(Clone, Default)]
+pub(in crate::tree_actor) struct Relocations(Arc<Mutex<Moved>>);
+
+/// Each carried record's segment and tail now.
+type Moved = BTreeMap<RecordNo, (Arc<Segment>, u64)>;
+
+impl Relocations {
+    fn table(&self) -> std::sync::MutexGuard<'_, Moved> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// `record`'s frame is now at `tail` of `segment`.
+    pub(super) fn moved(&self, record: RecordNo, segment: &Arc<Segment>, tail: u64) {
+        self.table().insert(record, (Arc::clone(segment), tail));
+    }
+
+    /// `segment` is dropped: the frames it held that no copy names are no
+    /// longer anywhere.
+    pub(super) fn dropped(&self, segment: &Segment) {
+        self.table()
+            .retain(|_, (held, _)| held.first != segment.first);
+    }
+
+    /// Where `record`'s frame was carried, if it was.
+    pub fn find(&self, record: RecordNo) -> Option<(Arc<Segment>, u64)> {
+        self.table().get(&record).cloned()
     }
 }
 
@@ -176,13 +259,7 @@ pub(in crate::tree_actor) fn scratch(bytes: &[u8]) -> (tempfile::TempDir, FrameP
         .file
         .write_all_at(bytes, 0)
         .unwrap_or_else(|e| panic!("{e}"));
-    (
-        dir,
-        FramePos {
-            segment,
-            tail_at: 0,
-        },
-    )
+    (dir, FramePos::new(segment, RecordNo::new(1), 0))
 }
 
 /// Frames for unit tests: each `add` appends bytes to one scratch segment

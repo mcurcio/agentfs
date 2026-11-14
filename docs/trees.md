@@ -273,7 +273,12 @@ appends it and applies it to the saved state the views serve; it runs no git.
   holds no live open's call and no page write memory holds. A held file pins only its own
   frames: they are copied forward (marked `carried`, their record numbers kept)
   once the dead bytes they pin exceed their own, so the segments stay under about
-  twice the live opens' bytes plus a segment. A reader holding a dropped segment
+  twice the live opens' bytes plus a segment. A frame is named by its record
+  and an offset into it, wherever it is carried, so a save's digest does not
+  change when it moves. The journal records where each carried frame went; the
+  actor moves its live opens, page writes and saved maps there as it compacts,
+  and the builder moves its own before its next batch, so the dropped segment's
+  space returns then. A reader holding a dropped segment (a view's open file)
   keeps reading it; its space returns when the last lets go. Frames are at most
   96 MiB; a take's bytes are in records of at most 16 MiB. The constants are not
   settings. A checkpoint's pointers are the built ones, so a compaction that is

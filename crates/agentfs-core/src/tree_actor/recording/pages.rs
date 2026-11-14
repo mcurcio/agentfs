@@ -29,7 +29,7 @@ use std::collections::BTreeMap;
 use super::{Call, FileMap, Handle};
 use crate::tree_actor::journal::PagePiece;
 use crate::tree_actor::journal::durable::RecordNo;
-use crate::tree_actor::journal::segment::FramePos;
+use crate::tree_actor::journal::segment::{FramePos, Relocations};
 use crate::tree_actor::{Error, Result, TreeActor, TreeId};
 
 /// The bases' unit. Every kernel page size is a multiple of it, so a base map at
@@ -593,6 +593,27 @@ impl TreeActor {
         let state = self.pages.entry((tree, object)).or_default();
         state.writes = writes;
         state.saved_through = saved_through;
+    }
+}
+
+/// Moves the page writes `pages` holds, and each image built of them, to
+/// where compaction carried their frames.
+pub(in crate::tree_actor) fn relocate(
+    pages: &mut BTreeMap<(TreeId, u64), ObjectPages>,
+    moved: &Relocations,
+) {
+    for state in pages.values_mut() {
+        relocate_runs(&mut state.writes, moved);
+        if let Some(image) = &mut state.image {
+            image.relocate(moved);
+        }
+    }
+}
+
+/// Moves each run to where compaction carried its frame.
+pub(in crate::tree_actor) fn relocate_runs(runs: &mut [(u64, Run)], moved: &Relocations) {
+    for (_, run) in runs {
+        run.at.relocate(moved);
     }
 }
 

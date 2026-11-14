@@ -29,7 +29,7 @@ use super::message::{self, Action, Message};
 use super::upstreams::Upstreams;
 use super::{Objects, checkout, objects_of, refs};
 use crate::tree_actor::journal::durable::{Durability, RecordNo};
-use crate::tree_actor::journal::segment::{FramePos, Segment};
+use crate::tree_actor::journal::segment::{FramePos, Relocations, Segment};
 use crate::tree_actor::journal::{
     At, Change, Entry, Frame, Record, SaveOutcome, Tail, TakeHead, TakeRecord, Target, frame_at,
     runs_from_frame, take_chunks,
@@ -268,6 +268,34 @@ fn disagrees(step: u64) -> Error {
 }
 
 impl BuildState {
+    /// Moves every position the state holds (live opens' calls, held page
+    /// writes, take chunks, file maps) to where compaction carried its
+    /// frame, letting go of the dropped segments.
+    fn relocate(&mut self, moved: &Relocations) {
+        for open in self.opens.values_mut() {
+            for (_, _, pos) in &mut open.calls {
+                pos.relocate(moved);
+            }
+        }
+        for runs in self.pages.values_mut() {
+            pages::relocate_runs(runs, moved);
+        }
+        for (_, tail) in &mut self.bytes {
+            tail.pos.relocate(moved);
+        }
+        for tree in self.trees.values_mut() {
+            for bytes in tree.bytes.values_mut() {
+                if !bytes.on_frames() {
+                    continue;
+                }
+                let mut map = (**bytes).clone();
+                if map.relocate(moved) {
+                    *bytes = Arc::new(bytes.with_map(map));
+                }
+            }
+        }
+    }
+
     /// The state at a built point: the trees its pointers' heads hold, the
     /// opens, calls, page writes and take chunks live then.
     #[allow(
@@ -973,6 +1001,7 @@ impl Builder {
         // No record after the checkpoint names a step it covers
         // (`TreeActor::resolve_compacted`): those heads are never read again.
         self.state.heads.retain(|step, _| *step > checkpointed);
+        self.state.relocate(self.durability.relocations());
         let mut next = self.state.clone();
         let marks_path = self.root.join("build.marks");
         let repo = self.history.repo().clone();

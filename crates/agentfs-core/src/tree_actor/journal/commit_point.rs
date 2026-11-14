@@ -164,12 +164,34 @@ impl TreeActor {
         };
         // The builder reads the records after its built point from the
         // linked segments: those stay until it has.
-        let stats = self
-            .journal
-            .drop_behind(snapshot.at(), &live)
-            .map_err(|e| CompactError::After(std::io::Error::other(e.to_string())))?;
+        let stats = self.journal.drop_behind(snapshot.at(), &live);
+        // Whatever was carried before a failure has a copy: move to it.
+        self.relocate_frames();
+        let stats = stats.map_err(|e| CompactError::After(std::io::Error::other(e.to_string())))?;
         self.metrics.journal_dropped = self.metrics.journal_dropped.saturating_add(stats.segments);
         Ok(())
+    }
+
+    /// Moves every position the actor holds (live opens' calls and views,
+    /// held page writes, saved maps) to where compaction carried its frame,
+    /// letting go of the dropped segments. The builder moves its own at its
+    /// next batch; a reader's map keeps its segment until the reader lets go.
+    fn relocate_frames(&mut self) {
+        let moved = self.journal.relocations().clone();
+        for handle in self.handles.values_mut() {
+            for (_, _, pos) in &mut handle.calls {
+                pos.relocate(&moved);
+            }
+            handle.bytes.relocate(&moved);
+        }
+        crate::tree_actor::recording::pages::relocate(&mut self.pages, &moved);
+        for tree in self.trees.values_mut() {
+            for map in tree.bytes.values_mut() {
+                if map.on_frames() {
+                    map.relocate(&moved);
+                }
+            }
+        }
     }
 
     pub(in crate::tree_actor) fn compact_if_due(&mut self) {

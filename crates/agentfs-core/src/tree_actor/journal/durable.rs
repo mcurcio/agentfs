@@ -11,7 +11,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak};
 
 use serde::{Deserialize, Serialize};
 
-use super::segment::Segment;
+use super::segment::{Relocations, Segment};
 use crate::tree_actor::Error;
 use crate::tree_actor::call_path::Then;
 use crate::tree_actor::stages::{Timer, Which};
@@ -76,6 +76,9 @@ impl DurableError {
 /// one fsync of the journal runs at a time.
 pub struct Durability {
     state: Mutex<State>,
+    /// Where compaction carried each live frame: the actor's and the
+    /// builder's way off a dropped segment.
+    relocations: Relocations,
     /// Signalled whenever a leader's fsync ends.
     ended: Condvar,
     /// The waiter thread's queue of deferred waits ([`Durability::then`]).
@@ -152,12 +155,18 @@ impl Durability {
                     leading: false,
                     failed: None,
                 }),
+                relocations: Relocations::default(),
                 ended: Condvar::new(),
                 queue: Mutex::new(sender),
                 #[cfg(test)]
                 in_fsync: Mutex::new(None),
             }
         })
+    }
+
+    /// Where compaction carried each live frame.
+    pub(in crate::tree_actor) fn relocations(&self) -> &Relocations {
+        &self.relocations
     }
 
     fn state(&self) -> MutexGuard<'_, State> {
