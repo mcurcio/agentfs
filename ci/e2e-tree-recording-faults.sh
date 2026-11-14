@@ -15,11 +15,21 @@ cleanup() {
   for m in "$work/main" "$work/sandbox"; do fusermount3 -uz "$m" 2>/dev/null || true; done
 }
 trap cleanup EXIT
+# `start SPEC` mounts the root and the fork's sandbox, whose writer it attaches;
+# `start SPEC root` the root alone. The fork's one writer is spent at a clean
+# unmount, so a remount after one leaves the sandbox out.
 start() {
-  local spec=$1
-  AGENTFS_FAILPOINTS="$spec" "$bin" --state "$work/state" trees mount "$work/main" --sandbox "$work/sandbox" --fork "$fork" >"$work/mount.log" 2>&1 & pid=$!
+  local spec=$1 views=("$work/main")
+  local args=("$work/main")
+  if [ "${2:-}" != root ]; then
+    views+=("$work/sandbox")
+    args+=(--sandbox "$work/sandbox" --fork "$fork")
+  fi
+  AGENTFS_FAILPOINTS="$spec" "$bin" --state "$work/state" trees mount "${args[@]}" >"$work/mount.log" 2>&1 & pid=$!
   for _ in $(seq 1 200); do
-    if mountpoint -q "$work/main" && mountpoint -q "$work/sandbox"; then return; fi
+    local up=1 view
+    for view in "${views[@]}"; do mountpoint -q "$view" || up=; done
+    [ -z "$up" ] || return 0
     kill -0 "$pid" || { cat "$work/mount.log" >&2; return 1; }
     sleep .1
   done
@@ -64,14 +74,21 @@ PY
   drain_queue candidate
   fusermount3 -u "$work/main"; fusermount3 -u "$work/sandbox"
   wait "$pid"; pid=
+  # The mount records one step of its own first, the root client's attach: one
+  # record, one fsync, one step and one builder batch, each a point's first hit.
+  # Its client's call meets the next.
   case "$point" in
-    # A write appends with no fsync: the client's fsync is the first. The open
-    # is the first record appended, the write the second.
-    tree.wal_*fsync) spec="$point=kill" ;;
-    tree.wal_*) spec="$point=kill@2" ;;
-    *) spec="$point=kill" ;;
+    # A write appends with no fsync: the client's fsync is the next. The open
+    # is the next record appended, the write the one after.
+    tree.wal_*fsync) spec="$point=kill@2" ;;
+    tree.wal_*) spec="$point=kill@3" ;;
+    *) spec="$point=kill@2" ;;
   esac
-  start "$spec"
+  before=$(tree_git_root_clients "$work/state/history.git")
+  start "$spec" root
+  # The attach's batch built before the client's first record: else the two could
+  # share one batch, and a builder point's second hit would come later or never.
+  tree_git_wait_root_attached "$work/state/history.git" "$before"
   : > "$work/receipt"
   python3 - "$work/main/candidate" "$work/receipt" <<'PY' >"$work/client.log" 2>&1 & client=$!
 import os, sys
@@ -91,7 +108,7 @@ PY
   wait "$pid" 2>/dev/null || true; pid=
   wait "$client" 2>/dev/null || true
   grep -F "agentfs failpoint $point triggered (kill)" "$work/mount.log" >/dev/null || { cat "$work/mount.log" >&2; exit 1; }
-  fusermount3 -uz "$work/main"; fusermount3 -uz "$work/sandbox"
+  fusermount3 -uz "$work/main"
   "$bin" --state "$work/state" trees init --volume t
   gitdir=$work/state/history.git
   [ "$(tree_git_file "$gitdir" root baseline)" = baseline ]

@@ -69,6 +69,8 @@ tonic-prost-build = { version = "0.14.6", default-features = false }
 agentfs-volume = { version = "0.1.0", path = "../agentfs-volume" }
 # The Trees domain over the store adapter (tests/tree_store.rs).
 agentfs-trees = { version = "0.1.0", path = "../agentfs-trees" }
+# The Clients domain over the store adapter and sessions (tests/tree_clients.rs).
+agentfs-clients = { version = "0.1.0", path = "../agentfs-clients" }
 # In-memory exporters for the telemetry tests.
 opentelemetry_sdk = { version = "0.33.1", default-features = false, features = ["testing"] }
 tempfile = "3.27.0"

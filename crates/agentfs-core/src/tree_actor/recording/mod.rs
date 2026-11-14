@@ -9,6 +9,7 @@ pub(super) mod pages;
 use std::collections::BTreeSet;
 use std::ops::Range;
 
+use agentfs_contracts::name::WriterLabel;
 use agentfs_contracts::pod::WriterAt;
 
 pub(in crate::tree_actor) use super::journal::CallHead as Call;
@@ -279,6 +280,54 @@ impl TreeActor {
         Ok(self.tree(tree)?.anonymous.contains(&object))
     }
 
+    /// The tree and writer of an open: what a session checks before it
+    /// reaches the handle (`crate::session`).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotFound`] for no such open.
+    pub fn open_by(&self, handle: u64) -> Result<(TreeId, &WriterLabel)> {
+        let h = self.handles.get(&handle).ok_or(Error::NotFound)?;
+        Ok((h.tree, &h.by.writer))
+    }
+
+    /// Every open and pending close of `writer` in `tree` closes as a save,
+    /// in handle order, after the tree's closes already pending (git-model
+    /// §6): what an ended client's opens become. Answers each of its saves,
+    /// in that order. A failed save stops here: it and the rest stay pending,
+    /// saved at the tree's next step or at restart. The session's alone
+    /// (clippy.toml).
+    ///
+    /// # Errors
+    ///
+    /// A failed save, as [`TreeActor::close`].
+    pub fn close_writer(&mut self, tree: TreeId, writer: &WriterLabel) -> Result<Vec<Saved>> {
+        if self.is_stopped() {
+            return Err(Error::Stopped);
+        }
+        let mine: Vec<u64> = self
+            .handles
+            .iter()
+            .filter(|(_, h)| h.tree == tree && h.by.writer == *writer)
+            .map(|(handle, _)| *handle)
+            .collect();
+        for handle in &mine {
+            if !self.pending_closes.contains(handle) {
+                self.pending_closes.push(*handle);
+            }
+        }
+        let saved = self.save_pending(tree)?;
+        Ok(mine
+            .iter()
+            .filter_map(|handle| {
+                saved
+                    .iter()
+                    .find(|(h, _)| h == handle)
+                    .map(|(_, outcome)| *outcome)
+            })
+            .collect())
+    }
+
     /// An open's stable object number, including before its first link.
     pub fn open_object(&self, handle: u64) -> Result<u64> {
         Ok(self.handles.get(&handle).ok_or(Error::NotFound)?.object)
@@ -429,20 +478,26 @@ impl TreeActor {
         tree: TreeId,
         wanted: Option<u64>,
     ) -> Result<Saved> {
+        Ok(self
+            .save_pending(tree)?
+            .into_iter()
+            .find(|(handle, _)| wanted == Some(*handle))
+            .map_or(Saved::Unchanged, |(_, saved)| saved))
+    }
+
+    /// Saves this tree's pending closes in arrival order; answers each.
+    fn save_pending(&mut self, tree: TreeId) -> Result<Vec<(u64, Saved)>> {
         let due: Vec<u64> = self
             .pending_closes
             .iter()
             .copied()
             .filter(|handle| self.handles.get(handle).is_some_and(|h| h.tree == tree))
             .collect();
-        let mut outcome = Saved::Unchanged;
+        let mut saved = Vec::with_capacity(due.len());
         for handle in due {
-            let saved = self.close_step(handle)?;
-            if wanted == Some(handle) {
-                outcome = saved;
-            }
+            saved.push((handle, self.close_step(handle)?));
         }
-        Ok(outcome)
+        Ok(saved)
     }
 
     /// A create: the step that names a new object and opens it.

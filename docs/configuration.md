@@ -916,8 +916,10 @@ templates' variables, the commit trailers and the telemetry resource:
 | `--no-allow-other` | | FUSE `allow_other` on | `trees mount`: only the mounting user reaches the views. With `allow_other`, a mount by a user other than root needs `user_allow_other` in `/etc/fuse.conf` |
 | `--sandbox DIR` | | no sandbox mount | `trees mount`: also mount an isolated sandbox |
 | `--fork fork/N` | | create a new fork | `trees mount`: reuse this existing sandbox (not `root`); requires `--sandbox` |
-| `--writer LABEL` | | `root-client` | `trees mount`: trusted root writer label |
-| `--sandbox-writer LABEL` | | `sandbox-client` | `trees mount`: trusted sandbox writer label |
+| `--writer LABEL` | | `root-client` | `trees mount`: the root's client label, a safe name of at most 64 bytes; with the client's number, launcher and tree (`<label>#<n>@cli/root`) it is every save's writer. After a kill, the next mount rebinds the client of this label ([trees](trees.md#clients)) |
+| `--sandbox-writer LABEL` | | `sandbox-client` | `trees mount`: the sandbox's client label, as `--writer` |
+| `--read-only` | | read-write | `trees mount`: the root's client is read-only; its view is mounted read-only and every write answers `EROFS` |
+| `--sandbox-read-only` | | read-write | `trees mount`: the sandbox's client is read-only; requires `--sandbox`. How a fork whose writer has gone (a clean unmount ends it) is mounted again: a fork has one writer for life, and a second read-write mount exits 1 |
 | `--metrics-output FILE` | | no metrics file | `trees mount`: replace a JSON snapshot of process-local save, take and wait counters, the journal's length, and runs, time and Git children by actor stage, with the objects handed to Git's store and the fsyncs of its `objects/` directory (`stages`, process-wide: see `tree_actor/stages.rs`) at each history built or failed event, at least every 100 ms, and at unmount, each file numbered by `seq` (one more each time) and renamed into place; the existing parent directory must be outside state and views; collection errors are reported after unmount |
 
 The `trees` commands accept global `--state` and its environment equivalent. They refuse

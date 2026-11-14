@@ -203,7 +203,7 @@ the operation records it, whole, at its end (`Ops::capture_operation`). See
 | `invalidate` | Kernel cache coherence across a daemon's sessions |
 | `backing` | Confined access to the backing tree |
 | `access`, `creds`, `privileges` | Mode-bit checks, creating as the caller, what the daemon may do |
-| `tree_view` | The FUSE view of the tree library (below) |
+| `tree_view` | The view host: FUSE views of the tree library on clients' sessions (below) |
 
 `Ops` is where behaviour lives, and it has no kernel dependency, so tests run
 against a real directory and state area. Each operation returns
@@ -650,14 +650,47 @@ agentfs --state STATE trees mount ROOT --sandbox SANDBOX
 ```
 
 `trees mount` recovers and mounts the root's view, and with `--sandbox` also a
-sandbox fork (`fork/N`) of it; it never creates a volume. Each `Binding` names
-its tree by `agentfs_core::tree_actor::TreeId`, the writer its saves carry (a
-`WriterAt`) and the owner every file is presented as (`--owner`). The views
-mount with FUSE `allow_other` unless `--no-allow-other` (`MountOptions`). `--fork fork/N` reuses a sandbox, and `trees
-fork` makes one and prints its name. `--writer` and `--sandbox-writer` set
-each view's trusted writer label, and `--metrics-output FILE` writes counters
-every 100 ms and at unmount. Mount points must be empty, separate and outside
-the state area. Unmount every view to exit.
+sandbox fork (`fork/N`) of it; it never creates a volume. Each view is a client
+of its tree: the command rebinds the client a killed mount left (same launcher,
+tree, label and access), else attaches one, then ends its launcher's other
+clients, and detaches each client as its view ends ([trees](../trees.md#clients)).
+`--writer` and `--sandbox-writer` are the clients' labels; `--read-only` and
+`--sandbox-read-only` make a client read-only. A fork's second read-write client
+exits 1. `--fork fork/N` reuses a sandbox, and `trees fork` makes one and prints
+its name. The views mount with FUSE `allow_other` unless `--no-allow-other`
+(`MountOptions`), every file presented as `--owner`, and `--metrics-output FILE`
+writes counters every 100 ms and at unmount. Unmount every view to exit.
+
+### The view host
+
+`tree_view::ViewHost` serves one volume's views through its sessions
+(`agentfs_core::session::Sessions`) and implements the `Views` port:
+
+```rust
+use std::sync::Arc;
+use agentfs_contracts::views::{MountOptions, MountPoint, Views};
+use agentfs_fuse::tree_view::{HostEvent, ViewHost};
+
+// `sessions` holds the served volume; Clients bound `binding.session`.
+let notify = Arc::new(|event: HostEvent| { /* to the owner's thread */ });
+let mut host = ViewHost::new(sessions, &state, None, notify)?;
+let view = host.open(MountPoint(dir), binding, MountOptions { allow_other: true })?;
+// ... HostEvent::ViewEnded(view) once it is unmounted ...
+host.wait()?;
+```
+
+`new` starts the take worker (one take at a time, off the actor's lock, woken
+by built and failed events) and, with a metrics output, the metrics worker.
+`open` checks the session is bound (`UnknownSession`), the mount point (an
+existing empty directory outside the state area, every open view and the
+metrics output: `MountFailed(EINVAL)`) and that the tree is among the actor's
+saved trees (`MountFailed(ENOENT)`): it never waits for history. The view
+writes as the session's client, presents every file as the grant's `acts_as`,
+and is mounted read-only for a read-only grant. A thread joins each view's
+session, then sends `HostEvent::ViewEnded`; `Landed` follows each landed take,
+after its pages were dropped. `close` is a lazy unmount (`fusermount3 -uz`),
+idempotent. `wait`, after every view ended, joins the workers and fails when
+the actor stopped.
 
 The views use zero entry and attribute TTLs and direct I/O. Read-only
 descriptors keep saved bytes; writable ones read their own calls and the

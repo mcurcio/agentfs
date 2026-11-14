@@ -71,6 +71,7 @@ mod recovery;
 mod reference_tests;
 mod serve_git;
 mod serve_history;
+mod shared;
 mod start_cmd;
 mod trees_cmd;
 
@@ -452,7 +453,7 @@ fn real_main() -> Result<ExitCode> {
                 reason = "the composition root mints capabilities"
             )]
             let minter = agentfs_contracts::caps::Minter::new();
-            return trees_cmd::run(&cli.state, args, &minter);
+            return trees_cmd::run(&cli.state, args, minter);
         }
         Command::Init {
             volume,

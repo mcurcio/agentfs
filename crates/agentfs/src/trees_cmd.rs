@@ -1,33 +1,46 @@
 //! Target-model composition root (git-model.md, docs/trees.md): `trees init`
 //! ensures the volume through the Volume domain; `fork`, and `mount` with a
 //! new sandbox, create the fork through the Trees domain on the store adapter;
-//! `mount` serves the volume through the tree actor. It wires domains to
-//! adapters and decides nothing.
+//! `mount` attaches (or, after a kill, rebinds) one client per view through
+//! the Clients domain, then serves each view through the view host on its
+//! client's session, and detaches each client as its view ends. It wires
+//! domains to adapters and decides nothing.
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::Arc;
+use std::sync::{Arc, mpsc};
 
+use agentfs_clients::ClientsService;
 use agentfs_contracts::caps::{LaunchCap, LaunchScope, Minter};
-use agentfs_contracts::clients::{AttachedLookup, ClientSet, FileOwner};
-use agentfs_contracts::name::{LauncherId, VolumeName, WriterLabel};
-use agentfs_contracts::pod::{PodContext, WriterAt};
+use agentfs_contracts::clients::{
+    Access, AttachedLookup, Binding, ClientError, ClientId, ClientSet, Clients, Consistency,
+    FileOwner, Grant,
+};
+use agentfs_contracts::name::{ClientLabel, LauncherId, VolumeName};
+use agentfs_contracts::pod::PodContext;
 use agentfs_contracts::ports::{Found, StateArea};
 use agentfs_contracts::trees::{ForkSettings, Landing, Trees};
-use agentfs_contracts::views::MountOptions;
+use agentfs_contracts::views::{MountOptions, MountPoint, ViewId, Views};
 use agentfs_contracts::volume::{EnsureOutcome, StartPoint, Volume, VolumeError, VolumeSpec};
+use agentfs_core::session::Sessions;
 use agentfs_core::state_area::TreeStateArea;
 use agentfs_core::store::TreeStore;
 use agentfs_core::tree_actor::{self, Recording, TreeId};
-use agentfs_fuse::tree_view::{Binding, serve_with_metrics};
+use agentfs_fuse::tree_view::{HostEvent, ViewHost};
 use agentfs_trees::TreesService;
 use agentfs_volume::VolumeService;
 use anyhow::{Context, Result, bail};
 
 use crate::domain_events::DomainEvents;
 use crate::pod_args::PodArgs;
+use crate::shared::Shared;
 
 /// Exit status when another process holds the state area (`EX_TEMPFAIL`).
 const EXIT_BUSY: u8 = 75;
+
+/// What `mount` says when a fork's one writer has gone (C4).
+const FORK_TAKEN: &str =
+    "this fork has had its writer; mount it with --sandbox-read-only or use a new fork";
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -68,12 +81,20 @@ enum Command {
         /// Write process-local measurement counters to this private path.
         #[arg(long)]
         metrics_output: Option<PathBuf>,
-        /// The root's trusted writer label (not an authenticated identity).
+        /// The root's client label: a safe name of at most 64 bytes. With the
+        /// client's number, launcher and tree it is every save's writer.
         #[arg(long, default_value = "root-client")]
         writer: String,
-        /// The sandbox's trusted writer label.
+        /// The sandbox's client label.
         #[arg(long, default_value = "sandbox-client")]
         sandbox_writer: String,
+        /// Mount the root read-only: its client cannot write.
+        #[arg(long)]
+        read_only: bool,
+        /// Mount the sandbox read-only: how a fork whose writer has gone (a
+        /// clean unmount ends it) is mounted again.
+        #[arg(long, requires = "sandbox")]
+        sandbox_read_only: bool,
         /// A guard: refuse, before any write, a state area whose volume has
         /// another name.
         #[arg(long, env = "AGENTFS_VOLUME")]
@@ -104,7 +125,7 @@ fn parse_owner(text: &str) -> Result<FileOwner, String> {
     })
 }
 
-/// Clients until they are built: no client is ever attached.
+/// `trees init`'s Clients: it attaches none and judges no release.
 struct NoClients;
 
 impl AttachedLookup for NoClients {
@@ -128,10 +149,7 @@ fn root_cap(minter: &Minter) -> Result<LaunchCap> {
 
 /// A new unkeyed fork of the root, through the Trees domain on the store:
 /// its branch and its row are one step, durable when this returns.
-fn create_fork(recording: &Arc<Recording>, cap: &LaunchCap) -> Result<TreeId> {
-    let store = TreeStore::new(Arc::clone(recording));
-    let mut trees = TreesService::restore(store.clone(), store, DomainEvents::default())
-        .context("reading the forks' rows")?;
+fn fork_of_root(trees: &mut impl Trees, cap: &LaunchCap) -> Result<TreeId> {
     let settings = ForkSettings {
         landing: Landing::Automatic,
     };
@@ -141,13 +159,46 @@ fn create_fork(recording: &Arc<Recording>, cap: &LaunchCap) -> Result<TreeId> {
     Ok(fork.into())
 }
 
-pub fn run(state: &Path, args: Args, minter: &Minter) -> Result<ExitCode> {
+/// Hands on each domain event once its call returned. No consumer is built
+/// yet (slice S5 dispatches them): each is dropped.
+fn drain(events: &DomainEvents) {
+    while events.next().is_some() {}
+}
+
+/// One view `mount` serves: its tree, mount point and client.
+struct ViewSpec {
+    tree: TreeId,
+    at: PathBuf,
+    label: ClientLabel,
+    access: Access,
+}
+
+impl ViewSpec {
+    fn new(tree: TreeId, at: PathBuf, label: &str, read_only: bool) -> Result<Self> {
+        Ok(Self {
+            tree,
+            at,
+            label: ClientLabel::parse(label)?,
+            access: if read_only {
+                Access::ReadOnly
+            } else {
+                Access::ReadWrite
+            },
+        })
+    }
+}
+
+pub fn run(state: &Path, args: Args, minter: Minter) -> Result<ExitCode> {
     match args.command {
-        Command::Init { volume, pod } => init(state, &volume, &context(&pod)?, minter),
+        Command::Init { volume, pod } => init(state, &volume, &context(&pod)?, &minter),
         Command::Fork { pod } => {
             let recording = open(state, &context(&pod)?)?;
-            let fork = create_fork(&recording, &root_cap(minter)?)?;
+            let store = TreeStore::new(Arc::clone(&recording));
+            let mut trees = TreesService::restore(store.clone(), store, DomainEvents::default())
+                .context("reading the forks' rows")?;
+            let fork = fork_of_root(&mut trees, &root_cap(&minter)?)?;
             // Durable before the id is printed: dropping the volume fsyncs.
+            drop(trees);
             drop(recording);
             println!("{fork}");
             Ok(ExitCode::SUCCESS)
@@ -158,6 +209,8 @@ pub fn run(state: &Path, args: Args, minter: &Minter) -> Result<ExitCode> {
             fork,
             writer,
             sandbox_writer,
+            read_only,
+            sandbox_read_only,
             metrics_output,
             volume,
             owner,
@@ -176,54 +229,172 @@ pub fn run(state: &Path, args: Args, minter: &Minter) -> Result<ExitCode> {
                     _ => {}
                 }
             }
+            if fork.is_some_and(TreeId::is_root) {
+                bail!("--fork must name an existing fork/N, not the root");
+            }
             let owner = owner.unwrap_or_else(|| FileOwner {
                 uid: rustix::process::geteuid().as_raw(),
                 gid: rustix::process::getegid().as_raw(),
             });
-            let by = |label: &str| -> Result<WriterAt> {
-                Ok(WriterAt {
-                    writer: WriterLabel::parse(label)?,
-                    at: at.clone(),
-                })
-            };
-            let recording = open(state, &at)?;
-            let mut bindings = vec![Binding {
-                tree: TreeId::Root,
-                by: by(&writer)?,
+            let root = ViewSpec::new(TreeId::Root, root, &writer, read_only)?;
+            let sandbox = sandbox
+                .map(|at| ViewSpec::new(TreeId::Root, at, &sandbox_writer, sandbox_read_only))
+                .transpose()?;
+            let mount = Mount {
+                at,
                 owner,
-                mountpoint: root,
-            }];
-            if let Some(mountpoint) = sandbox {
-                let tree = if let Some(fork) = fork {
-                    if fork.is_root() {
-                        bail!("--fork must name an existing fork/N, not the root");
-                    }
-                    recording.actor()?.head(fork)?;
-                    fork
-                } else {
-                    create_fork(&recording, &root_cap(minter)?)?
-                };
-                eprintln!("sandbox tree: {tree}");
-                bindings.push(Binding {
-                    tree,
-                    by: by(&sandbox_writer)?,
-                    owner,
-                    mountpoint,
-                });
-            }
-            let options = MountOptions {
-                allow_other: !no_allow_other,
+                options: MountOptions {
+                    allow_other: !no_allow_other,
+                },
+                metrics_output,
             };
-            serve_with_metrics(
-                state,
-                recording,
-                bindings,
-                options,
-                metrics_output.as_deref(),
-            )
-            .context("serving tree views")?;
-            Ok(ExitCode::SUCCESS)
+            mount.run(state, root, sandbox.map(|s| (s, fork)), minter)
         }
+    }
+}
+
+/// `trees mount`, once its flags are read.
+struct Mount {
+    /// The pod context of every client it attaches.
+    at: PodContext,
+    owner: FileOwner,
+    options: MountOptions,
+    metrics_output: Option<PathBuf>,
+}
+
+impl Mount {
+    /// Restores Trees and Clients on one store; makes the sandbox's fork when
+    /// none is named; per view, rebinds the restored client of this launcher,
+    /// tree, label and access, else attaches one; reconciles the rest (a
+    /// view host dies with its process); serves each view on its session and
+    /// detaches its client when it ends.
+    fn run(
+        self,
+        state: &Path,
+        root: ViewSpec,
+        sandbox: Option<(ViewSpec, Option<TreeId>)>,
+        minter: Minter,
+    ) -> Result<ExitCode> {
+        let recording = open(state, &self.at)?;
+        let store = TreeStore::new(Arc::clone(&recording));
+        let events = DomainEvents::default();
+        let trees = Shared::new(
+            TreesService::restore(store.clone(), store.clone(), events.clone())
+                .context("reading the forks' rows")?,
+        );
+        let cap = root_cap(&minter)?;
+        let sessions = Sessions::new(recording);
+        let mut clients = ClientsService::restore(
+            store,
+            sessions.clone(),
+            trees.clone(),
+            events.clone(),
+            minter,
+        )
+        .context("reading the clients' rows")?;
+        let mut specs = vec![root];
+        if let Some((mut spec, fork)) = sandbox {
+            spec.tree = match fork {
+                Some(fork) => fork,
+                None => fork_of_root(&mut *trees.get_mut(), &cap)?,
+            };
+            drain(&events);
+            eprintln!("sandbox tree: {}", spec.tree);
+            specs.push(spec);
+        }
+        let mut bound: Vec<(PathBuf, Binding)> = Vec::new();
+        for spec in specs {
+            let session = sessions.open();
+            let answered = match clients.resumable(&cap, spec.tree, &spec.label, spec.access) {
+                Some(client) => clients.rebind(&client, self.at.clone(), session, &cap),
+                None => {
+                    let grant = match spec.access {
+                        Access::ReadWrite => {
+                            Grant::live_read_write(spec.tree, Consistency::PerFile, self.owner)
+                        }
+                        Access::ReadOnly => {
+                            Grant::live_read_only(spec.tree, Consistency::PerFile, self.owner)
+                        }
+                    };
+                    clients.attach(grant, spec.label, self.at.clone(), session, &cap)
+                }
+            };
+            drain(&events);
+            match answered {
+                Ok(binding) => bound.push((spec.at, binding)),
+                Err(refused) => {
+                    let ids: Vec<ClientId> = bound.into_iter().map(|(_, b)| b.client).collect();
+                    detach_all(&mut clients, &ids, &cap, &events);
+                    if refused == ClientError::ForkTaken {
+                        eprintln!("error: {FORK_TAKEN}");
+                        return Ok(ExitCode::FAILURE);
+                    }
+                    bail!("attaching the client of {}: {refused}", spec.tree);
+                }
+            }
+        }
+        let live: ClientSet = bound.iter().map(|(_, b)| b.client.clone()).collect();
+        clients.reconcile(&live, &cap);
+        drain(&events);
+        let (sender, ended) = mpsc::channel();
+        let notify = Arc::new(move |event: HostEvent| {
+            // The receiver goes only once every view has ended.
+            let _ = sender.send(event);
+        });
+        let mut host = ViewHost::new(sessions, state, self.metrics_output.as_deref(), notify)
+            .context("serving tree views")?;
+        let mut views: BTreeMap<ViewId, ClientId> = BTreeMap::new();
+        let mut unopened: Vec<ClientId> = Vec::new();
+        let mut failed = None;
+        for (at, binding) in bound {
+            let client = binding.client.clone();
+            if failed.is_some() {
+                unopened.push(client);
+                continue;
+            }
+            match host.open(MountPoint(at.clone()), binding, self.options) {
+                Ok(view) => {
+                    views.insert(view, client);
+                }
+                Err(e) => {
+                    failed = Some(format!("mounting {}: {e}", at.display()));
+                    unopened.push(client);
+                    for view in views.keys() {
+                        host.close(*view);
+                    }
+                }
+            }
+        }
+        detach_all(&mut clients, &unopened, &cap, &events);
+        while !views.is_empty() {
+            let Ok(event) = ended.recv() else { break };
+            if let HostEvent::ViewEnded(view) = event
+                && let Some(client) = views.remove(&view)
+            {
+                detach_all(&mut clients, &[client], &cap, &events);
+            }
+        }
+        host.wait().context("serving tree views")?;
+        if let Some(failed) = failed {
+            bail!("serving tree views: {failed}");
+        }
+        Ok(ExitCode::SUCCESS)
+    }
+}
+
+/// Detaches each client, its opens saved first; a failure is logged (the
+/// next boot's reconcile ends it).
+fn detach_all(
+    clients: &mut impl Clients,
+    ids: &[ClientId],
+    cap: &LaunchCap,
+    events: &DomainEvents,
+) {
+    for client in ids {
+        if let Err(e) = clients.detach(client, cap) {
+            eprintln!("tree DetachFailed: client={client}: {e}");
+        }
+        drain(events);
     }
 }
 
@@ -342,7 +513,7 @@ mod tests {
             reason = "a test is its own composition root"
         )]
         let minter = agentfs_contracts::caps::Minter::new();
-        let error = super::run(&state, args, &minter).unwrap_err();
+        let error = super::run(&state, args, minter).unwrap_err();
         assert!(
             format!("{error:#}").contains("trees init --volume"),
             "{error:#}"

@@ -128,6 +128,13 @@ impl WriterLabel {
         Self(Self::AGENTFS.to_owned())
     }
 
+    /// A client's writer: its id's text, which holds the rule by construction
+    /// (safe names, a number and a tree: at most 175 bytes, no control
+    /// character).
+    pub(crate) fn of_client(client: &crate::clients::ClientId) -> Self {
+        Self(client.to_string())
+    }
+
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -144,8 +151,14 @@ impl ClientLabel {
     ///
     /// [`NameError`] (`what`: `client label`).
     pub fn parse(text: &str) -> Result<Self, NameError> {
-        let _ = text;
-        todo!("S4")
+        check(
+            is_safe_name(text) && text.len() <= 64,
+            "client label",
+            text,
+            "a safe name of at most 64 bytes: an ASCII letter or digit, then letters, digits, \
+             '.', '_' or '-'; no '..', no trailing '.' or '.lock'",
+        )?;
+        Ok(Self(text.to_owned()))
     }
 
     pub fn as_str(&self) -> &str {
@@ -256,6 +269,14 @@ mod tests {
         assert!(VolumeName::parse("a..b").is_err());
         assert!(LauncherId::parse(&"c".repeat(64)).is_ok());
         assert!(LauncherId::parse(&"c".repeat(65)).is_err());
+        assert!(ClientLabel::parse(&"c".repeat(64)).is_ok());
+        assert_eq!(
+            ClientLabel::parse(&"c".repeat(65)).unwrap_err().what,
+            "client label"
+        );
+        for bad in ["", "a#b", "a@b", "a/b", "-a", "a..b"] {
+            assert!(ClientLabel::parse(bad).is_err(), "{bad}");
+        }
         assert!(Label::parse("ns-1").is_ok());
         assert!(Label::parse("").is_err());
         assert!(Label::parse("a b").is_err());

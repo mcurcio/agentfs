@@ -1132,3 +1132,30 @@ Page: `.claude/handoff/m1-s3-recut.md`. None blocks the slice; each is built as 
    `agentfs-core` (dev) for `agentfs-trees`.
 8. **`an_event_is_durable_before_create_returns`** checks the journal's durable mark against the last record with
    the builder failing before its own fsync: the process-wide `journal_fsync` count is shared by parallel tests.
+
+## 2026-11-14, M1 S4 (clients and views): where the re-cut page is short
+
+Page: `.claude/handoff/m1-s4-recut.md`. None blocks the slice; each is built as stated.
+1. **A mount's own steps move every failpoint count.** `trees mount` now records an attach (or rebind) per view
+   before it serves: a journal record, an fsync, a step and a builder batch each. The failpoint scripts counted from
+   the client's first call: `ci/e2e-tree-recording-faults.sh` (kill at the first hit) and `ci/e2e-tree-enospc.sh`
+   (`tree.before_step` and `tree.build_after_built_log` stalls, `tree.wal_before_fsync=error`) would fire in the
+   mount's attach. Neither is on the page's file list. Built: a remount after a clean unmount mounts the root alone
+   (one step, so exactly one builder batch), the counts move by one (`@2`, the wal records `@3`), and the script
+   waits until the attach's event commit is in Git before the client's call (`tree_git_wait_root_attached`, new in
+   `ci/tree-git-test-lib.sh`): otherwise the attach and the client's first record can share one batch, and a builder
+   point's second hit comes later or never. The faults script's remount leaves the sandbox out (its writer is spent).
+2. **`detach` and `reconcile` carry no pod context**, but `ClientStore::end` takes `at`: the service passes an empty
+   one, so `AttachmentEnded` and `LastDetached` have no pod trailers (as S3 item 2 for `ForkCreated`). `Attached`
+   and `Rebound` carry the client's.
+3. **The Clients row is `TreeClients` itself**, its entries (`Audited<ClientRow>`, the claim) each stamped by the one
+   helper (`store::stamp`); no outer `Audited` (the port's `load` answers `Vec<TreeClients>`).
+4. **The CLI cannot tell a restored client's access** from `attached` (ids only). Built: `ClientsService::resumable`
+   (inherent, not on the trait): the latest restored, unbound client of a launcher, tree, label and access.
+5. **`detach` after a restart of a client ended in an earlier run** answers `UnknownClient`: rows are hard-deleted at
+   an end, so only this run's ends are known (`ended`); within a run it is idempotent.
+6. **Read-only views mount read-only** (`MountOption::RO`) besides the session refusing writes (`EROFS` either way).
+7. **Files outside the owned list**, each a compile or test need: `crates/agentfs/Cargo.toml` (agentfs-clients),
+   `crates/agentfs-core/Cargo.toml` (dev: agentfs-clients), `crates/agentfs/src/domain_events.rs` (`next` is used
+   now: its `expect(dead_code)` went), `Cargo.lock`, and the three `ci/` files of item 1.
+8. **Not built here:** `Draining` (S6's `on_volume_draining`), `on_fork_dropped` and `release_claim` (S5).

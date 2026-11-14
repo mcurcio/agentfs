@@ -208,12 +208,28 @@ pub trait ClientStore {
         by: &Principal,
     ) -> Result<ClientId, StoreError>;
 
-    /// One step: each ended client's row removed, in order, with its
-    /// `AttachmentEnded`, then `LastDetached` for each of `emptied`.
+    /// One step: the client's row's `at` replaced (a restored client bound
+    /// again after a restart), with `Rebound`. Its id and its fork's claim
+    /// stay.
     ///
     /// # Errors
     ///
-    /// `Stopped` only: an end is never refused for space (room is reserved at attach).
+    /// `Refused` for a client without a row; `Stopped`, `NotDurable`.
+    fn rebind(
+        &mut self,
+        client: &ClientId,
+        at: &PodContext,
+        by: &Principal,
+    ) -> Result<(), StoreError>;
+
+    /// One step: each ended client's row removed, in order, with its
+    /// `AttachmentEnded`, then `LastDetached` for each of `emptied`. Nothing
+    /// to end writes nothing.
+    ///
+    /// # Errors
+    ///
+    /// `Stopped`, `NotDurable`. No room is reserved for an end: a failed one
+    /// changes nothing, and the next boot's reconcile ends what it left.
     fn end(
         &mut self,
         ended: &[(ClientId, AttachmentEndReason)],

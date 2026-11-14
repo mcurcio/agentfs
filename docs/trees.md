@@ -57,7 +57,8 @@ views with `fusermount3 -u PATH`; unmounting every view ends the process.
 | `--namespace`, `--pod`, `--pod-uid`, `--node` | Where the views run: the pod context of their commits (below) |
 | `--sandbox DIR` | Also mount a fork in DIR (a new one, or `--fork`) |
 | `--fork fork/N` | Reuse this fork (needs `--sandbox`); `root` is refused |
-| `--writer LABEL`, `--sandbox-writer LABEL` | The root's and the fork's writer label (default `root-client`, `sandbox-client`). A label is trusted, not an authenticated identity |
+| `--writer LABEL`, `--sandbox-writer LABEL` | The root's and the fork's client label (default `root-client`, `sandbox-client`): a safe name of at most 64 bytes. A label is the launcher's word, not an authenticated identity |
+| `--read-only`, `--sandbox-read-only` | Mount the root, or the fork, read-only: its client cannot write, and every write answers `EROFS` |
 | `--metrics-output FILE` | Write counters, the journal's length, each stage's runs, time and git children, and the objects stored, at each built or failed event, at least every 100 ms, and at unmount; each file carries `seq`, one more each time |
 
 Mount points must be empty, separate and outside the state area. Metrics never take
@@ -90,24 +91,61 @@ Agentfs-Open: <n>                  a save that closed an open
 Agentfs-Collisions: <json>         a landing that decided any
 ```
 
-A save carries its writer and the pod context of the mount it came through. The
+A save's writer is its client (below), `<label>#<n>@<launcher>/<tree>`, for example
+`root-client#5@cli/root`. A save carries its writer and the pod context of the
+mount it came through. The
 journal keeps both with each write-open, so a save recovery makes after a crash
 names the writer that opened the file and where it ran, not the restarted process.
 A landing merge's subject is `Landing by <writer>`, and its writer and pod trailers
 are those of the save it lands. A sync, a fork step and the Root commit are
 `agentfs`'s, with the pod context of the process that serves the volume.
 
+## Clients
+
+Each view is one **client** of its tree, attached by its launcher (the trial CLI,
+`cli`) before the view mounts. A client is named by its label, its number, its
+launcher and its tree: `<label>#<n>@<launcher>/<tree>`. Its number is the journal
+step of its attach, unique in the volume and never reused. The name is every save's
+writer, so a commit needs no lookup to say who made it; the label and launcher hold
+no `#`, `@` or `/`, so the name parses back.
+
+- **Sessions.** A view reaches its tree only through its client's session. A
+  read-write client's session writes as the client; a read-only client's writes
+  nothing (`EROFS`), and its view is mounted read-only. A session reaches only its
+  own client's open files.
+- **One writer per fork, for life.** A fork's first read-write client claims it. The
+  claim stays after the client ends, so a second read-write client is refused, while
+  the first is attached and after it ends. `trees mount` then exits 1: "this fork
+  has had its writer; mount it with --sandbox-read-only or use a new fork". The
+  root has no claim.
+- **Ends.** When a view is unmounted, its client is detached. Its open files close
+  as saves first, in handle order, durable before the detach returns; a write after
+  that answers `EROFS`. The end is one step with `AttachmentEnded`, then
+  `LastDetached` when its tree has no client left.
+- **Restart.** A killed `trees mount` leaves its clients attached. The next mount
+  rebinds the one of the same launcher, tree, label and access (the latest when
+  several are): the same client and writer, with the new mount's pod context
+  (`Rebound`), so a fork's writer comes back after a kill. Then it ends every other
+  client of its launcher (`AttachmentEnded`, reason `Reconciled`). A clean unmount
+  ends the client, so a fork's writer does not come back after one.
+- **Never waits for history.** Attach, rebind and end are durable before they
+  return, never wait at the lag gate or for history, and answer while the builder
+  fails.
+
+A failed end changes nothing: no room is reserved for it, and the next mount's
+reconcile ends what it left.
+
 ## Rows and event commits
 
-The volume's own events (a fork created, and in later slices clients attached and
-detached, forks ended and dropped, the volume's lifecycle) are on record like file
-changes: each is a commit in the volume's repository, on a chain of commits beside
+The volume's own events (a fork created, clients attached, rebound and ended, and
+in later slices forks ended and dropped and the volume's lifecycle) are on record
+like file changes: each is a commit in the volume's repository, on a chain of commits beside
 the tree it concerns.
 
 | Chain | Holds |
 |---|---|
 | `refs/agentfs/trees/fork/<n>` | fork `n`'s row; kept after the fork is dropped |
-| `refs/agentfs/clients/<tree>` | the clients attached to a tree |
+| `refs/agentfs/clients/<tree>` | the clients attached to a tree and a fork's writer claim (`Attached`, `Rebound`, `AttachmentEnded`, `LastDetached`) |
 | `refs/agentfs/volume` | the volume's lifecycle |
 
 Each event commit's tree is one file, `row.json`: the row's value after the event
@@ -245,7 +283,9 @@ durable and builds it.
 `wait_built`, built snapshots, lag), and `settle` waits until every record so far is
 built: call it before reading Git. `TreeActor::head` settles first. Each recorded call names
 its writer as a `WriterAt` (the writer and its pod context). `write_open`, `write`,
-`truncate` and `close` are the recorded calls. Upstream and fork
+`truncate` and `close` are the recorded calls. A view reaches them through
+`agentfs_core::session`: a `TreeSession` locks the actor with its client's tree and
+writer, and `Sessions` is the binder Clients binds each client's authority to. Upstream and fork
 share one bare repository. Merge identity is separate from an open object's
 identity. See [library/core.md](library/core.md).
 
@@ -438,7 +478,9 @@ decision waits until they stop.
 
 ## The view
 
-The FUSE adapter (`agentfs_fuse::tree_view`) uses zero entry and attribute TTLs and
+The view host (`agentfs_fuse::tree_view::ViewHost`) mounts each view on its
+client's session, never waiting for history: the tree must be among the actor's
+saved trees. The FUSE adapter uses zero entry and attribute TTLs and
 direct I/O, and negotiates neither passthrough nor the writeback cache. A read with
 no lock owner is a page fill and a write with `FUSE_WRITE_CACHE` is a page write.
 `max_background` is as high as the kernel allows, to keep a release ahead of a later

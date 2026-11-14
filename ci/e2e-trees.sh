@@ -22,7 +22,7 @@ mkdir "$work/main" "$work/sandbox"
 fork=$("$bin" --state "$work/state" trees fork)
 start() {
     "$bin" --state "$work/state" trees mount "$work/main" \
-        --sandbox "$work/sandbox" --fork "$fork" >>"$work/mount.log" 2>&1 &
+        --sandbox "$work/sandbox" --fork "$fork" "$@" >>"$work/mount.log" 2>&1 &
     pid=$!
     for _ in $(seq 1 200); do
         if mountpoint -q "$work/main" && mountpoint -q "$work/sandbox"; then return; fi
@@ -167,6 +167,10 @@ start
 test "$(cat "$work/main/crash")" = acknowledged-before-kill
 test "$(cat "$work/main/isolation")" = sandbox
 test "$(cat "$work/sandbox/isolation")" = sandbox
+# The kill left the fork's writer attached: the restart rebinds it (same
+# client), so the sandbox writes as before.
+printf after-restart > "$work/sandbox/restarted"
+test "$(cat "$work/sandbox/restarted")" = after-restart
 fusermount3 -u "$work/main"
 fusermount3 -u "$work/sandbox"
 wait "$pid"
@@ -178,6 +182,26 @@ if git --git-dir="$work/state/history.git" log --all -p --format= | grep '^+.*BA
     echo "orphan bytes entered history" >&2
     exit 1
 fi
+# A clean unmount ended the fork's writer, and a fork has one writer for life:
+# mounting it to write again exits 1, mounting nothing.
+status=0
+"$bin" --state "$work/state" trees mount "$work/main" --sandbox "$work/sandbox" --fork "$fork" \
+    >"$work/taken.log" 2>&1 || status=$?
+test "$status" -eq 1
+grep -F 'this fork has had its writer; mount it with --sandbox-read-only' "$work/taken.log" >/dev/null
+! mountpoint -q "$work/main"
+! mountpoint -q "$work/sandbox"
+# Read-only it mounts: reads answer, writes are refused.
+start --sandbox-read-only
+test "$(cat "$work/sandbox/restarted")" = after-restart
+if printf refused 2>/dev/null > "$work/sandbox/refused"; then
+    echo "a read-only sandbox took a write" >&2
+    exit 1
+fi
+fusermount3 -u "$work/main"
+fusermount3 -u "$work/sandbox"
+wait "$pid"
+pid=
 git --git-dir="$work/state/history.git" fsck --strict
 test "$mmap_status" -eq 0
 test "$tmpfile_status" -eq 0

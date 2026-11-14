@@ -82,7 +82,8 @@ missing from these tables or a row names a module that no longer exists;
 | `volume.rs` | Opens a state area: crash recovery, then the [`Recorder`](#the-synchronous-step) used at every boundary and the `Committer` that turns records into commits |
 | `record.rs` | What the journal stores: one record per change boundary, absolute state, never deltas |
 | `state_area.rs` | The `StateArea` port over the tree actor: inspect without the lock, create a volume with a new id, open and keep the recovered volume, served (`Recording`) |
-| `store.rs` | The domains' store ports over one served volume (`TreeStore`): Trees' `ForkStore` and the `QueueFacts`, each write one journal step (a fork and its row, or rows alone) made durable before it returns, off the actor's lock; the audit stamps' one home (`created` set once, `changed` each write); the ports' word for each actor failure |
+| `session.rs` | The history service's sessions (`Sessions`, the `SessionBinder` port): each bound to a client's authority; a `TreeSession` locks the actor with its tree and writer (writes `EROFS` without one, handles only its own); unbind saves the client's opens and makes them durable |
+| `store.rs` | The domains' store ports over one served volume (`TreeStore`): Trees' `ForkStore`, Clients' `ClientStore` (attach, rebind, end on each tree's Clients chain) and the `QueueFacts`, each write one journal step (a fork and its row, or rows alone) made durable before it returns, off the actor's lock; the audit stamps' one home (`created` set once, `changed` each write); the ports' word for each actor failure |
 | `tree_actor/mod.rs` | The tree actor: the actor, recovery and queue orchestration. A step is one unit of work: decided, appended to the journal as the change itself, applied to the saved state, with no git on the call path; creating a volume (its identity file, then `format` last), inspecting and opening a state area, recovery (history built through the journal, then abandoned opens closed); each tree's last head-moving step and the keys steps touched, which a take's land checks |
 | `tree_actor/history/mod.rs` | Tree history: the store opened and created in one place, snapshots read from commits with each tree's object numbers, the owners of direct saves, private checkouts, and the clean-up of a cut-short build's packs |
 | `tree_actor/history/builder.rs` | The builder, on its own thread: reads durable records from its own cursor along the segments, replays each step on the built trees with the actor's transitions, packs a batch's commits with `git fast-import` (a file's blob streamed from its map), then installs pack, built-log entry, refs, `config` and checkouts in that order, and rebases the checked-out files' maps onto their checkouts for the actor to take; a replay that disagrees with its record stops building (`Disagrees`) |
@@ -213,7 +214,7 @@ missing from these tables or a row names a module that no longer exists;
 
 | Module | Role |
 |---|---|
-| `tree_view.rs` | Main/sandbox FUSE views over one target-model actor: direct I/O, saved-reader snapshots, byte-call writes, FLUSH, FSYNC, FSYNCDIR and `O_SYNC` writes answered once durable, and the kernel's page fills, page writes and invalidations for shared mappings (rules ledger, R1.4) |
+| `tree_view.rs` | The view host (`ViewHost`, the `Views` port): each view a FUSE mount on its client's session, opened without waiting for history and ended by a lazy unmount, with the take and metrics workers and `HostEvent`s to its owner; direct I/O, saved-reader snapshots, byte-call writes, FLUSH, FSYNC, FSYNCDIR and `O_SYNC` writes answered once durable, and the kernel's page fills, page writes and invalidations for shared mappings (rules ledger, R1.4) |
 | `lib.rs` | Crate root and overview |
 | `ops.rs` | Every filesystem operation without the kernel, unit-tested against a real directory and state area |
 | `fuse.rs` | The kernel adapter: `fuser::Filesystem` over `Ops`, and kernel passthrough negotiation |
@@ -238,7 +239,8 @@ missing from these tables or a row names a module that no longer exists;
 
 | Module | Role |
 |---|---|
-| `trees_cmd.rs` | `trees init` (`ensure` through the Volume domain), `fork` and `mount` composition root (a new fork through the Trees domain on the store adapter); separate state format |
+| `trees_cmd.rs` | `trees init` (`ensure` through the Volume domain), `fork` and `mount` composition root (a new fork through the Trees domain on the store adapter; per view a client rebound or attached through the Clients domain, the rest reconciled, each served by the view host and detached as its view ends); separate state format |
+| `shared.rs` | One domain service shared on the composition root's thread (`Shared`): Trees, asked `facts` by Clients |
 | `domain_events.rs` | The composition root's in-process event queue (`DomainEvents`): every domain service of a volume publishes to one, in order |
 | `pod_args.rs` | The pod flags (`--namespace`, `--pod`, `--pod-uid`, `--node`) one clap group shares between the recording engine's commands and `trees` |
 | `main.rs` | The CLI (`Cli`), command dispatch, `init`, `status`, `record`, `flush`, `push` (direct), `run` and `mount` |

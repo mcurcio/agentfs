@@ -674,13 +674,30 @@ with. The behaviour, the state format and the current limits (flat files
 only) are in [trees](../trees.md); the FUSE adapter is in the [filesystem
 layer](filesystem.md#tree-views).
 
+### Sessions
+
+`session::Sessions::new(recording)` holds the history service's sessions of a
+served volume and is Clients' `SessionBinder`: `open()` gives a new
+`SessionId`, unique per run; Clients binds a client's authority to it (a
+`ClientCap` for a read-write client, its tree for a read-only one). A view
+reaches its tree only through `sessions.session(id)`, a `TreeSession`, whose
+`lock()` takes the actor's lock and reads the binding under it. The
+`SessionGuard` it gives has `TreeActor`'s file calls with the tree and writer
+left out: a write answers `Error::ReadOnly` (`EROFS`) without a writer, and a
+handle call answers `NotFound` unless the open is this tree's and this
+writer's. `admit_then`, `durable_then` and `durable_all_then` run unlocked.
+`unbind` removes the binding and, under the same lock,
+`TreeActor::close_writer` closes every open of the client's writer as a save,
+in handle order; then it makes them durable. A failure is logged and an
+unsaved close stays pending. Lock order: the actor, then the bindings.
+
 ### Rows and domain events
 
 The domains (`agentfs-volume`, `agentfs-clients`, `agentfs-trees`) keep their
 records as rows on the volume's one tree actor, through the ports in
 `agentfs_contracts::ports`. `store::TreeStore::new(recording)` implements
 them over a served volume (`Arc<Recording>`): Trees' `ForkStore` (`load`,
-`create`) and `QueueFacts`. Each write is one journal step, the same commit
+`create`), Clients' `ClientStore` and `QueueFacts`. Each write is one journal step, the same commit
 point as a save: a fork's branch and its row are one record, or a row step
 holds rows alone. The store makes it durable (one group-commit fsync, outside
 the actor's lock) before it returns. Each row is the domain's value with its
@@ -697,6 +714,13 @@ the store calls them (a clippy rule). The queue facts are the journal's too:
 `queued()`, `pending_from(fork)` (an entry `fork` queued in its upstream's
 queue) and `has_child(fork)` never wait for history. A stopped actor's
 `QueueFacts` answer empty and `false`; the next write fails `Stopped`.
+
+Clients' `ClientStore` (`load`, `attach`, `rebind`, `end`) keeps one row per
+tree on `Chain::Clients(tree)`: its attached clients (`ClientRow`: the id, the
+grant and the pod context) and a fork's writer claim, each entry stamped. An
+attach's step number is the client's ordinal. One `end` step removes every
+ended client with its `AttachmentEnded`, then writes `LastDetached` for each
+tree left empty.
 
 `StoreError` from a tree actor failure: `Stopped` and an unknown fsync
 outcome are `Stopped` (the reopen decides whether the step survived); a failed

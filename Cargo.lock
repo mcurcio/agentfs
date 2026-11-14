@@ -43,6 +43,7 @@ dependencies = [
 name = "agentfs"
 version = "0.1.0"
 dependencies = [
+ "agentfs-clients",
  "agentfs-contracts",
  "agentfs-core",
  "agentfs-csi",
@@ -117,6 +118,7 @@ name = "agentfs-core"
 version = "0.1.0"
 dependencies = [
  "agentfs-align",
+ "agentfs-clients",
  "agentfs-contracts",
  "agentfs-trees",
  "agentfs-volume",

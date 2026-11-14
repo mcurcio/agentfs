@@ -8,6 +8,7 @@ repository.workspace = true
 description = "agentfs command-line tool and daemon"
 
 [dependencies]
+agentfs-clients = { version = "0.1.0", path = "../agentfs-clients" }
 agentfs-contracts = { version = "0.1.0", path = "../agentfs-contracts" }
 agentfs-core = { version = "0.1.0", path = "../agentfs-core" }
 agentfs-fuse = { version = "0.1.0", path = "../agentfs-fuse" }

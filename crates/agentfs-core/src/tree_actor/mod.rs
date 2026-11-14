@@ -115,6 +115,10 @@ pub enum Error {
     NotFound,
     #[error("file already exists")]
     Exists,
+    /// A write through a session with no writer: a read-only client's, or one
+    /// whose client has ended.
+    #[error("this view is read-only")]
+    ReadOnly,
     #[error("file offset or journal record is too large")]
     TooLarge,
     #[error("journal corruption at byte {0}; operator recovery required")]
@@ -152,6 +156,7 @@ impl Error {
         match self {
             Self::NotFound => libc::ENOENT,
             Self::Exists => libc::EEXIST,
+            Self::ReadOnly => libc::EROFS,
             Self::Name => libc::EINVAL,
             Self::TooLarge => libc::EFBIG,
             Self::Busy => libc::EBUSY,

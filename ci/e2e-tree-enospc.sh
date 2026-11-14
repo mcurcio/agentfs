@@ -117,8 +117,13 @@ os.close(fd)
 PY
   fusermount3 -u "$work/main"
   wait "$pid"; pid=
-  AGENTFS_FAILPOINTS="$point=sleep(30000)" "$bin" --state "$work/volume/state" trees mount "$work/main" >"$log" 2>&1 & pid=$!
+  # The mount's own step comes first (its root client's attach: one step, one
+  # builder batch, each the point's first hit), built before the rename starts,
+  # so the rename meets the point's second hit.
+  before=$(tree_git_root_clients "$work/volume/state/history.git")
+  AGENTFS_FAILPOINTS="$point=sleep(30000)@2" "$bin" --state "$work/volume/state" trees mount "$work/main" >"$log" 2>&1 & pid=$!
   wait_mounted "$work/main"
+  tree_git_wait_root_attached "$work/volume/state/history.git" "$before"
   python3 - "$work/main/source" "$work/main/destination" "$2" <<'PY' >"$work/rename.log" 2>&1 & client=$!
 import errno, os, sys
 source, destination, want = sys.argv[1:]
@@ -181,11 +186,12 @@ rename_while_full tree.build_after_built_log NONE destination behind
 grep -Fq 'tree CopyStale' "$work/tree.build_after_built_log.log" || { cat "$work/tree.build_after_built_log.log" >&2; exit 1; }
 printf 'PASS\tenospc-after-commit-point\trename 0; destination\n' | tee -a "$work/results.tsv"
 # Only a failed fsync stops the actor: the file can no longer be trusted. A
-# write appends with no fsync; the first journal fsync fails, the client's own or
-# the builder's behind the create, and every call after it answers EIO.
+# write appends with no fsync; the first journal fsync after the mount's own (its
+# root client's attach) fails, the client's own or the builder's behind the
+# create, and every call after it answers EIO.
 rm -rf "$work/volume/state"
 "$bin" --state "$work/volume/state" trees init --volume t
-AGENTFS_FAILPOINTS='tree.wal_before_fsync=error' "$bin" --state "$work/volume/state" trees mount "$work/main" >"$work/fsync-mount.log" 2>&1 & pid=$!
+AGENTFS_FAILPOINTS='tree.wal_before_fsync=error@2' "$bin" --state "$work/volume/state" trees mount "$work/main" >"$work/fsync-mount.log" 2>&1 & pid=$!
 wait_mounted "$work/main"
 python3 - "$work/main/synced" "$work/main/after-fsync" <<'PY'
 import errno, os, sys

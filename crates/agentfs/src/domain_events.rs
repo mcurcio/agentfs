@@ -23,10 +23,6 @@ impl EventSink for DomainEvents {
 
 impl DomainEvents {
     /// The oldest event not yet handed on.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "slice S5's dispatcher hands each event on")
-    )]
     pub(crate) fn next(&self) -> Option<Event> {
         self.0.borrow_mut().pop_front()
     }

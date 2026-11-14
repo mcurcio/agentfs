@@ -1,21 +1,25 @@
-//! Flat-file view of the target actor (git-model.md).
-//! Direct I/O and zero TTLs; no passthrough or writeback-cache negotiation.
-//! Shared mappings go through the kernel's page cache all the same, so a read
-//! with no lock owner is a page fill and a write with `FUSE_WRITE_CACHE` a page
-//! write; `agentfs_core::tree_actor`'s `pages` module holds their rules (R1.4).
+//! The view host (docs/library/filesystem.md, "The view host"): each view is
+//! a flat-file FUSE mount of one tree, reached only through its client's
+//! session (`agentfs_core::session`), so its calls name no tree and no
+//! writer. Direct I/O and zero TTLs; no passthrough or writeback-cache
+//! negotiation. Shared mappings go through the kernel's page cache all the
+//! same, so a read with no lock owner is a page fill and a write with
+//! `FUSE_WRITE_CACHE` a page write; `agentfs_core::tree_actor`'s `pages`
+//! module holds their rules (R1.4).
 
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use agentfs_contracts::clients::FileOwner;
-use agentfs_contracts::pod::WriterAt;
-use agentfs_contracts::views::MountOptions;
-use agentfs_core::tree_actor::{Error, FileMap, Progress, Recording, Saved, TreeActor, TreeId};
+use agentfs_contracts::clients::{Access, Binding, FileOwner};
+use agentfs_contracts::views::{MountOptions, MountPoint, ViewError, ViewId, Views};
+use agentfs_core::session::{SessionGuard, Sessions, TreeSession};
+use agentfs_core::tree_actor::{Error, FileMap, Progress, Recording, Saved, TreeId};
 use fuser::*;
 
 const TTL: Duration = Duration::ZERO;
@@ -24,169 +28,322 @@ const TTL: Duration = Duration::ZERO;
 const READDIR_BATCH: usize = 1024;
 type Result<T> = std::result::Result<T, Errno>;
 
-/// Views in one process share one locked volume actor. Each view writes as
-/// `by`, and presents every file as `owner`'s.
-pub struct Binding {
-    pub tree: TreeId,
-    pub by: WriterAt,
-    pub owner: FileOwner,
-    pub mountpoint: PathBuf,
+/// What the view host tells its owner, from its own threads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostEvent {
+    /// The view's mount is gone (unmounted, by `close` or from outside) and
+    /// its session joined: every file it had open is released.
+    ViewEnded(ViewId),
+    /// A take landed and the kernel's pages of the files it changed were
+    /// dropped.
+    Landed,
 }
 
-/// Mount until every view is unmounted. All mountpoints must be empty,
-/// outside the private state and separate from one another.
-pub fn serve(
-    state: &Path,
-    recording: Arc<Recording>,
-    bindings: Vec<Binding>,
-    options: MountOptions,
-) -> io::Result<()> {
-    serve_with_metrics(state, recording, bindings, options, None)
+/// Where each open view is mounted, and its kernel channel.
+struct Mounted {
+    at: PathBuf,
+    tree: TreeId,
+    notifier: Notifier,
+    /// `close` has asked the kernel to unmount it.
+    closing: bool,
 }
 
-/// Serve views with optional process-local measurement snapshots. The output
-/// belongs outside the state area and views; no measurement affects decisions.
-pub fn serve_with_metrics(
-    state: &Path,
-    actor: Arc<Recording>,
-    bindings: Vec<Binding>,
-    options: MountOptions,
-    metrics_output: Option<&Path>,
-) -> io::Result<()> {
-    let state = state.canonicalize()?;
-    let mut points: Vec<PathBuf> = Vec::new();
-    for binding in &bindings {
-        let at = binding.mountpoint.canonicalize()?;
-        if !at.is_dir()
-            || std::fs::read_dir(&at)?.next().is_some()
-            || at.starts_with(&state)
-            || state.starts_with(&at)
-            || points
-                .iter()
-                .any(|p| at.starts_with(p) || p.starts_with(&at))
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "trees mounts must be empty directories, separate from state and each other",
-            ));
-        }
-        actor
-            .actor()
-            .map_err(io::Error::other)?
-            .head(binding.tree)
-            .map_err(io::Error::other)?;
-        points.push(at);
-    }
-    let metrics_output = metrics_output
-        .map(|path| {
-            let filename = path.file_name().ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "metrics output needs a filename",
-                )
-            })?;
-            let parent = path
-                .parent()
-                .filter(|p| !p.as_os_str().is_empty())
-                .unwrap_or(Path::new("."));
-            let path = parent.canonicalize()?.join(filename);
-            if path.starts_with(&state) || points.iter().any(|at| path.starts_with(at)) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "metrics output must be outside state and views",
-                ));
-            }
-            Ok(path)
+type OpenViews = Arc<Mutex<BTreeMap<ViewId, Mounted>>>;
+
+fn open_views(views: &OpenViews) -> MutexGuard<'_, BTreeMap<ViewId, Mounted>> {
+    views.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Every open view's tree and channel, read out of the lock: invalidation can
+/// wait on a page fill.
+fn notifiers(views: &OpenViews) -> Vec<(TreeId, Notifier)> {
+    open_views(views)
+        .values()
+        .map(|view| (view.tree, view.notifier.clone()))
+        .collect()
+}
+
+/// The views of one served volume, and its take and metrics workers.
+pub struct ViewHost {
+    sessions: Sessions,
+    /// The state area, canonical: no view may be inside it or hold it.
+    state: PathBuf,
+    metrics_output: Option<PathBuf>,
+    notify: Arc<dyn Fn(HostEvent) + Send + Sync>,
+    views: OpenViews,
+    next: u64,
+    stop: Arc<AtomicBool>,
+    takes: JoinHandle<io::Result<()>>,
+    metrics: Option<JoinHandle<io::Result<()>>>,
+    /// Each view's thread: it joins the view's session, then `ViewEnded`.
+    joins: Vec<JoinHandle<()>>,
+}
+
+impl ViewHost {
+    /// Starts the take worker (takes one at a time, each decided off the
+    /// actor's lock, woken by built and failed events: never a timer) and,
+    /// with `metrics_output`, the metrics worker. `notify` runs on the host's
+    /// threads. The output belongs outside the state area and every view; no
+    /// measurement affects a decision.
+    ///
+    /// # Errors
+    ///
+    /// `InvalidInput` for a metrics output with no filename or inside the
+    /// state area; a failed thread spawn.
+    pub fn new(
+        sessions: Sessions,
+        state: &Path,
+        metrics_output: Option<&Path>,
+        notify: Arc<dyn Fn(HostEvent) + Send + Sync>,
+    ) -> io::Result<Self> {
+        let state = state.canonicalize()?;
+        let metrics_output = metrics_output
+            .map(|path| {
+                let filename = path.file_name().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "metrics output needs a filename",
+                    )
+                })?;
+                let parent = path
+                    .parent()
+                    .filter(|p| !p.as_os_str().is_empty())
+                    .unwrap_or(Path::new("."));
+                let path = parent.canonicalize()?.join(filename);
+                if path.starts_with(&state) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "metrics output must be outside state and views",
+                    ));
+                }
+                Ok(path)
+            })
+            .transpose()?;
+        let views = OpenViews::default();
+        let stop = Arc::new(AtomicBool::new(false));
+        let takes = {
+            let recording = Arc::clone(sessions.recording());
+            let (views, stop, notify) =
+                (Arc::clone(&views), Arc::clone(&stop), Arc::clone(&notify));
+            std::thread::Builder::new()
+                .name("tree-takes".into())
+                .spawn(move || take_worker(&recording, &views, &stop, &*notify))?
+        };
+        let metrics = metrics_output
+            .clone()
+            .map(|output| {
+                let recording = Arc::clone(sessions.recording());
+                let stop = Arc::clone(&stop);
+                std::thread::Builder::new()
+                    .name("tree-metrics".into())
+                    .spawn(move || metrics_worker(&recording, &output, &stop))
+            })
+            .transpose()?;
+        Ok(Self {
+            sessions,
+            state,
+            metrics_output,
+            notify,
+            views,
+            next: 1,
+            stop,
+            takes,
+            metrics,
+            joins: Vec::new(),
         })
-        .transpose()?;
-    let mut sessions = Vec::new();
-    let mut notifiers: Vec<(TreeId, Notifier)> = Vec::new();
-    for (binding, at) in bindings.into_iter().zip(points) {
-        let tree = binding.tree;
+    }
+
+    /// After every view ended: stops and joins the workers. Serving ends with
+    /// an error when the actor stopped (a failed journal fsync stops it off
+    /// any view's thread).
+    ///
+    /// # Errors
+    ///
+    /// A worker's error or panic; the actor's [`Error::Stopped`].
+    pub fn wait(self) -> io::Result<()> {
+        self.stop.store(true, Ordering::Release);
+        self.sessions.recording().wake_workers();
+        let takes = self
+            .takes
+            .join()
+            .map_err(|_| io::Error::other("queue worker panicked"))?;
+        let metrics = self
+            .metrics
+            .map(|worker| {
+                worker
+                    .join()
+                    .map_err(|_| io::Error::other("metrics worker panicked"))?
+            })
+            .transpose();
+        for join in self.joins {
+            join.join()
+                .map_err(|_| io::Error::other("a view's thread panicked"))?;
+        }
+        takes?;
+        metrics?;
+        drop(
+            self.sessions
+                .recording()
+                .actor()
+                .map_err(io::Error::other)?,
+        );
+        Ok(())
+    }
+
+    /// The mount point checks: an existing empty directory, outside the
+    /// state area, every open view and the metrics output, holding none of
+    /// them.
+    fn mount_point(&self, at: &MountPoint) -> Option<PathBuf> {
+        let at = at.0.canonicalize().ok()?;
+        let empty = std::fs::read_dir(&at).ok()?.next().is_none();
+        let apart = |other: &Path| !at.starts_with(other) && !other.starts_with(&at);
+        let separate = open_views(&self.views).values().all(|view| apart(&view.at));
+        let metrics_apart = self
+            .metrics_output
+            .as_ref()
+            .is_none_or(|output| !output.starts_with(&at));
+        (at.is_dir() && empty && apart(&self.state) && separate && metrics_apart).then_some(at)
+    }
+}
+
+impl Views for ViewHost {
+    /// Mounts `binding`'s session's tree at `at`, every file presented as its
+    /// grant's `acts_as`, read-only for a read-only grant. Never waits for
+    /// history: the tree must be among the actor's saved trees.
+    fn open(
+        &mut self,
+        at: MountPoint,
+        binding: Binding,
+        options: MountOptions,
+    ) -> std::result::Result<ViewId, ViewError> {
+        let session = self
+            .sessions
+            .session(binding.session)
+            .ok_or(ViewError::UnknownSession)?;
+        let at = self
+            .mount_point(&at)
+            .ok_or(ViewError::MountFailed(libc::EINVAL))?;
+        let saved = self
+            .sessions
+            .recording()
+            .actor()
+            .map_err(|e| ViewError::MountFailed(e.errno()))?
+            .trees()
+            .contains(&session.tree());
+        if !saved {
+            return Err(ViewError::MountFailed(libc::ENOENT));
+        }
+        let tree = session.tree();
+        let read_only = binding.grant.access() == Access::ReadOnly;
         let view = View {
-            actor: actor.clone(),
-            tree: binding.tree,
-            by: binding.by,
-            owner: binding.owner,
+            session,
+            owner: binding.grant.acts_as(),
             handles: Arc::new(Mutex::new(Handles {
                 next: 1,
                 entries: BTreeMap::new(),
             })),
         };
-        let session = fuser::spawn_mount(view, at, &session_config(&options))?;
-        notifiers.push((tree, session.notifier()));
-        sessions.push(session);
+        let mounted = fuser::spawn_mount(view, &at, &session_config(&options, read_only))
+            .map_err(|e| ViewError::MountFailed(e.raw_os_error().unwrap_or(libc::EIO)))?;
+        let id = ViewId(self.next);
+        self.next += 1;
+        open_views(&self.views).insert(
+            id,
+            Mounted {
+                at,
+                tree,
+                notifier: mounted.notifier(),
+                closing: false,
+            },
+        );
+        let (views, notify) = (Arc::clone(&self.views), Arc::clone(&self.notify));
+        let join = std::thread::Builder::new()
+            .name("tree-view".into())
+            .spawn(move || {
+                if let Err(e) = mounted.join() {
+                    eprintln!("tree ViewFailed: tree={tree}: {e}");
+                }
+                open_views(&views).remove(&id);
+                notify(HostEvent::ViewEnded(id));
+            })
+            .map_err(|e| ViewError::MountFailed(e.raw_os_error().unwrap_or(libc::EIO)))?;
+        self.joins.push(join);
+        Ok(id)
     }
-    let progress_actor = Arc::clone(&actor);
-    let stop = Arc::new(AtomicBool::new(false));
-    let progress_stop = Arc::clone(&stop);
-    let progress_worker = std::thread::spawn(move || -> io::Result<()> {
-        #[cfg(feature = "failpoints")]
-        if let Some(gate) = agentfs_core::failpoints::take_gate() {
-            return run_take_gate(gate, &progress_actor, &notifiers);
+
+    /// A lazy unmount (`fusermount3 -uz`): the mount leaves the namespace at
+    /// once and its files close as the kernel releases them. Idempotent.
+    fn close(&mut self, view: ViewId) {
+        let at = match open_views(&self.views).get_mut(&view) {
+            Some(mounted) if !mounted.closing => {
+                mounted.closing = true;
+                mounted.at.clone()
+            }
+            _ => return,
+        };
+        match std::process::Command::new("fusermount3")
+            .arg("-uz")
+            .arg(&at)
+            .status()
+        {
+            Ok(status) if status.success() => {}
+            Ok(status) => eprintln!("tree UnmountFailed: {}: {status}", at.display()),
+            Err(e) => eprintln!("tree UnmountFailed: {}: {e}", at.display()),
         }
-        // Takes one at a time, each decided off the actor's lock; woken by
-        // built and failed events (docs/trees.md, "Takes"), never a timer.
-        let mut epoch = 0;
-        loop {
-            if progress_stop.load(Ordering::Acquire) {
-                return Ok(());
-            }
-            while progress_actor.progress().map_err(io::Error::other)? == Progress::Landed {
-                let changed = progress_actor.drain_changed().map_err(io::Error::other)?;
-                // With the actor unlocked: invalidation can wait on a page fill.
-                invalidate_changed(&notifiers, &changed);
-            }
-            epoch = progress_actor.wait_for_work(epoch);
+    }
+}
+
+/// The take worker: takes one at a time, each decided off the actor's lock;
+/// after each landed take, the kernel's pages of what it changed dropped,
+/// then `Landed`. Woken by built and failed events (docs/trees.md, "Takes"),
+/// never a timer.
+fn take_worker(
+    recording: &Recording,
+    views: &OpenViews,
+    stop: &AtomicBool,
+    notify: &(dyn Fn(HostEvent) + Send + Sync),
+) -> io::Result<()> {
+    #[cfg(feature = "failpoints")]
+    if let Some(gate) = agentfs_core::failpoints::take_gate() {
+        return run_take_gate(gate, recording, views);
+    }
+    let mut epoch = 0;
+    loop {
+        if stop.load(Ordering::Acquire) {
+            return Ok(());
         }
-    });
-    let metrics_worker = metrics_output.map(|output| {
-        let actor = Arc::clone(&actor);
-        let stop = Arc::clone(&stop);
-        std::thread::spawn(move || -> io::Result<()> {
-            // Each file carries `seq`, one more than the last: a reader that
-            // saw `n` knows a file numbered `n + 2` was read after it.
-            let (mut seq, mut epoch) = (0_u64, 0);
-            loop {
-                let last = stop.load(Ordering::Acquire);
-                seq += 1;
-                let metrics = actor.actor().map_err(io::Error::other)?.metrics();
-                let mut written = serde_json::to_value(&metrics)?;
-                if let Some(fields) = written.as_object_mut() {
-                    fields.insert("seq".into(), seq.into());
-                }
-                let bytes = serde_json::to_vec(&written)?;
-                let temporary =
-                    output.with_extension(format!("metrics-{}.tmp", std::process::id()));
-                std::fs::write(&temporary, bytes)?;
-                std::fs::rename(&temporary, &output)?;
-                if last {
-                    return Ok(());
-                }
-                // At each built or failed event, and every 100 ms between.
-                epoch = actor.wait_for_event_or(epoch, Duration::from_millis(100));
-            }
-        })
-    });
-    let result = sessions.into_iter().try_for_each(|session| session.join());
-    stop.store(true, Ordering::Release);
-    actor.wake_workers();
-    let progress_result = progress_worker
-        .join()
-        .map_err(|_| io::Error::other("queue worker panicked"))?;
-    let metrics_result = metrics_worker
-        .map(|worker| {
-            worker
-                .join()
-                .map_err(|_| io::Error::other("metrics worker panicked"))?
-        })
-        .transpose();
-    result?;
-    progress_result?;
-    metrics_result?;
-    // A failed journal fsync stops the actor off this thread: serving ends with it.
-    drop(actor.actor().map_err(io::Error::other)?);
-    Ok(())
+        while recording.progress().map_err(io::Error::other)? == Progress::Landed {
+            let changed = recording.drain_changed().map_err(io::Error::other)?;
+            // With the actor unlocked: invalidation can wait on a page fill.
+            invalidate_changed(&notifiers(views), &changed);
+            notify(HostEvent::Landed);
+        }
+        epoch = recording.wait_for_work(epoch);
+    }
+}
+
+/// Each file carries `seq`, one more than the last: a reader that saw `n`
+/// knows a file numbered `n + 2` was read after it.
+fn metrics_worker(recording: &Recording, output: &Path, stop: &AtomicBool) -> io::Result<()> {
+    let (mut seq, mut epoch) = (0_u64, 0);
+    loop {
+        let last = stop.load(Ordering::Acquire);
+        seq += 1;
+        let metrics = recording.actor().map_err(io::Error::other)?.metrics();
+        let mut written = serde_json::to_value(&metrics)?;
+        if let Some(fields) = written.as_object_mut() {
+            fields.insert("seq".into(), seq.into());
+        }
+        let bytes = serde_json::to_vec(&written)?;
+        let temporary = output.with_extension(format!("metrics-{}.tmp", std::process::id()));
+        std::fs::write(&temporary, bytes)?;
+        std::fs::rename(&temporary, output)?;
+        if last {
+            return Ok(());
+        }
+        // At each built or failed event, and every 100 ms between.
+        epoch = recording.wait_for_event_or(epoch, Duration::from_millis(100));
+    }
 }
 
 /// A test's takes in place of the worker's: one at each line (failpoints'
@@ -195,7 +352,7 @@ pub fn serve_with_metrics(
 fn run_take_gate(
     mut gate: agentfs_core::failpoints::TakeGate,
     actor: &Recording,
-    notifiers: &[(TreeId, Notifier)],
+    views: &OpenViews,
 ) -> io::Result<()> {
     while let Some(tree) = gate.next_tree()? {
         if tree == "settle" {
@@ -211,7 +368,7 @@ fn run_take_gate(
             .map_err(|e| e.to_string())
             .and_then(|tree| actor.take_next(tree).map_err(|e| e.to_string()));
         let changed = actor.drain_changed().map_err(io::Error::other)?;
-        invalidate_changed(notifiers, &changed);
+        invalidate_changed(&notifiers(views), &changed);
         let answer = match took {
             Ok(agentfs_core::tree_actor::Took::Taken) => "taken".to_owned(),
             Ok(agentfs_core::tree_actor::Took::Waiting) => "waiting".to_owned(),
@@ -238,15 +395,19 @@ fn invalidate_changed(notifiers: &[(TreeId, Notifier)], changed: &[(TreeId, u64)
 
 /// The fuser config for one view: FUSE `allow_other` (`SessionACL::All`) when
 /// `options.allow_other`, else the mounting user alone; permission checks by
-/// the kernel, no devices, no set-user-ID.
-fn session_config(options: &MountOptions) -> Config {
+/// the kernel, no devices, no set-user-ID; read-only for a read-only client.
+fn session_config(options: &MountOptions, read_only: bool) -> Config {
     let mut config = Config::default();
     config.mount_options = vec![
         MountOption::FSName("agentfs-trees".into()),
         MountOption::DefaultPermissions,
         MountOption::NoDev,
         MountOption::NoSuid,
-        MountOption::RW,
+        if read_only {
+            MountOption::RO
+        } else {
+            MountOption::RW
+        },
     ];
     config.acl = if options.allow_other {
         SessionACL::All
@@ -259,9 +420,7 @@ fn session_config(options: &MountOptions) -> Config {
 
 #[derive(Clone)]
 struct View {
-    actor: Arc<Recording>,
-    tree: TreeId,
-    by: WriterAt,
+    session: TreeSession,
     /// Every file's and directory's owner, until file metadata is recorded.
     owner: FileOwner,
     handles: Arc<Mutex<Handles>>,
@@ -316,31 +475,25 @@ impl View {
     /// other request (docs/trees.md, "History trails the files").
     fn gated(&self, call: impl FnOnce(&View, Result<()>) + Send + 'static) {
         let view = self.clone();
-        self.actor.admit_then(
-            self.tree,
-            Box::new(move |admitted| call(&view, admitted.map_err(errno))),
-        );
+        self.session.admit_then(Box::new(move |admitted| {
+            call(&view, admitted.map_err(errno));
+        }));
     }
 
-    fn actor(&self) -> Result<MutexGuard<'_, TreeActor>> {
-        self.actor.actor().map_err(|_| Errno::EIO)
+    fn actor(&self) -> Result<SessionGuard<'_>> {
+        self.session.lock().map_err(|_| Errno::EIO)
     }
     fn handles(&self) -> Result<MutexGuard<'_, Handles>> {
         self.handles.lock().map_err(|_| Errno::EIO)
     }
-    fn path(&self, v: &TreeActor, ino: INodeNo) -> Result<String> {
+    fn path(&self, v: &SessionGuard<'_>, ino: INodeNo) -> Result<String> {
         let object = ino.0.checked_sub(2).ok_or(Errno::ENOENT)?;
-        v.path_of(self.tree, object)
-            .map(str::to_owned)
-            .map_err(errno)
+        v.path_of(object).map(str::to_owned).map_err(errno)
     }
-    fn attr(&self, v: &TreeActor, ino: INodeNo, fh: Option<FileHandle>) -> Result<FileAttr> {
+    fn attr(&self, v: &SessionGuard<'_>, ino: INodeNo, fh: Option<FileHandle>) -> Result<FileAttr> {
         // First: the kernel keeps one size per inode, and an unlinked mapped
         // file's fstat has no path.
-        let open_size = ino
-            .0
-            .checked_sub(2)
-            .and_then(|object| v.inode_size(self.tree, object));
+        let open_size = ino.0.checked_sub(2).and_then(|object| v.inode_size(object));
         let size: u64 = if ino.0 == 1 {
             0
         } else if let Some(size) = open_size {
@@ -351,7 +504,7 @@ impl View {
                 Open::Read(bytes) => bytes.len(),
                 Open::Write { handle, .. } => v.read_open(*handle).map_err(errno)?.len(),
             }
-        } else if v.is_anonymous(self.tree, ino.0 - 2).map_err(errno)? {
+        } else if v.is_anonymous(ino.0 - 2).map_err(errno)? {
             let handles = self.handles()?;
             let handle = handles
                 .entries
@@ -367,7 +520,7 @@ impl View {
                 .ok_or(Errno::ENOENT)?;
             v.read_open(handle).map_err(errno)?.len()
         } else {
-            v.file_len(self.tree, &self.path(v, ino)?).map_err(errno)?
+            v.file_len(&self.path(v, ino)?).map_err(errno)?
         };
         let dir = ino.0 == 1;
         Ok(FileAttr {
@@ -386,7 +539,7 @@ impl View {
             perm: if dir { 0o700 } else { 0o600 },
             nlink: if dir {
                 2
-            } else if v.is_anonymous(self.tree, ino.0 - 2).map_err(errno)? {
+            } else if v.is_anonymous(ino.0 - 2).map_err(errno)? {
                 0
             } else {
                 1
@@ -398,7 +551,13 @@ impl View {
             flags: 0,
         })
     }
-    fn open_file(&self, v: &mut TreeActor, path: &str, flags: i32, create: bool) -> Result<u64> {
+    fn open_file(
+        &self,
+        v: &mut SessionGuard<'_>,
+        path: &str,
+        flags: i32,
+        create: bool,
+    ) -> Result<u64> {
         let mut handles = self.handles()?;
         let write = flags & libc::O_ACCMODE != libc::O_RDONLY;
         if flags & libc::O_TRUNC != 0 && !write {
@@ -406,9 +565,9 @@ impl View {
         }
         let entry = if write {
             let handle = if flags & libc::O_TRUNC != 0 {
-                v.write_open_truncating(self.tree, path, &self.by, create)
+                v.write_open_truncating(path, create)
             } else {
-                v.write_open(self.tree, path, &self.by, create)
+                v.write_open(path, create)
             }
             .map_err(errno)?;
             Open::Write {
@@ -419,12 +578,10 @@ impl View {
             }
         } else {
             if create {
-                let h = v
-                    .write_open(self.tree, path, &self.by, true)
-                    .map_err(errno)?;
+                let h = v.write_open(path, true).map_err(errno)?;
                 v.close(h).map_err(errno)?;
             }
-            Open::Read(v.file_map(self.tree, path).map_err(errno)?)
+            Open::Read(v.file_map(path).map_err(errno)?)
         };
         let fh = handles.next;
         handles.next += 1;
@@ -437,7 +594,10 @@ impl View {
         if let Open::Write { handle, .. } = entry
             && v.close(handle).map_err(errno)? == Saved::OrphanDropped
         {
-            eprintln!("tree OrphanDropped: tree={} open={handle}", self.tree);
+            eprintln!(
+                "tree OrphanDropped: tree={} open={handle}",
+                self.session.tree()
+            );
         }
         Ok(())
     }
@@ -470,7 +630,7 @@ impl Filesystem for View {
             }
             let name = name.to_str().ok_or(Errno::EINVAL)?;
             let v = self.actor()?;
-            let object = v.object_at(self.tree, name).map_err(errno)?;
+            let object = v.object_at(name).map_err(errno)?;
             self.attr(&v, INodeNo(object + 2), None)
         })();
         match result {
@@ -522,11 +682,11 @@ impl Filesystem for View {
                     }
                     let path = name.to_str().ok_or(Errno::EINVAL)?;
                     let mut v = view.actor()?;
-                    if flags & libc::O_EXCL != 0 && v.read(view.tree, path).is_ok() {
+                    if flags & libc::O_EXCL != 0 && v.read(path).is_ok() {
                         return Err(Errno::EEXIST);
                     }
                     let fh = view.open_file(&mut v, path, flags, true)?;
-                    let object = v.object_at(view.tree, path).map_err(errno)?;
+                    let object = v.object_at(path).map_err(errno)?;
                     Ok((
                         fh,
                         view.attr(&v, INodeNo(object + 2), Some(FileHandle(fh)))?,
@@ -561,7 +721,7 @@ impl Filesystem for View {
                         return Err(Errno::ENOTDIR);
                     }
                     let mut v = view.actor()?;
-                    let handle = v.anonymous_open(view.tree, &view.by).map_err(errno)?;
+                    let handle = v.anonymous_open().map_err(errno)?;
                     let object = v.open_object(handle).map_err(errno)?;
                     let mut handles = view.handles()?;
                     let fh = handles.next;
@@ -612,7 +772,7 @@ impl Filesystem for View {
                 // fill never does.
                 if owner.is_none() {
                     let object = ino.0.checked_sub(2).ok_or(Errno::EBADF)?;
-                    match v.page_fill(self.tree, object, offset, size) {
+                    match v.page_fill(object, offset, size) {
                         Err(Error::NotFound) => {}
                         filled => return filled.map_err(errno),
                     }
@@ -679,7 +839,7 @@ impl Filesystem for View {
         let written = data.len() as u32;
         match result {
             Ok(None) => reply.written(written),
-            Ok(Some(handle)) => self.actor.durable_then(
+            Ok(Some(handle)) => self.session.durable_then(
                 handle,
                 Box::new(move |result| match result {
                     Ok(()) => reply.written(written),
@@ -730,9 +890,7 @@ impl Filesystem for View {
                             }
                         } else {
                             let path = view.path(&v, ino)?;
-                            let h = v
-                                .write_open(view.tree, &path, &view.by, false)
-                                .map_err(errno)?;
+                            let h = v.write_open(&path, false).map_err(errno)?;
                             let result = v.truncate(h, size).map_err(errno);
                             v.close(h).map_err(errno)?;
                             result?;
@@ -772,7 +930,7 @@ impl Filesystem for View {
             Err(e) => return reply.error(e),
         };
         match handle {
-            Some(handle) => self.actor.durable_then(handle, answer_empty(reply)),
+            Some(handle) => self.session.durable_then(handle, answer_empty(reply)),
             None => reply.ok(),
         }
     }
@@ -795,8 +953,8 @@ impl Filesystem for View {
             Err(e) => return reply.error(e),
         };
         match handle {
-            Some(handle) => self.actor.durable_then(handle, answer_empty(reply)),
-            None => self.actor.durable_all_then(answer_empty(reply)),
+            Some(handle) => self.session.durable_then(handle, answer_empty(reply)),
+            None => self.session.durable_all_then(answer_empty(reply)),
         }
     }
     /// The directory's names: every record durable (renames, unlinks and
@@ -809,7 +967,7 @@ impl Filesystem for View {
         _datasync: bool,
         reply: ReplyEmpty,
     ) {
-        self.actor.durable_all_then(answer_empty(reply));
+        self.session.durable_all_then(answer_empty(reply));
     }
     fn release(
         &self,
@@ -826,7 +984,7 @@ impl Filesystem for View {
             Err(e) => {
                 eprintln!(
                     "tree SaveFailed: tree={} errno={e:?}; preserve state and restart",
-                    self.tree
+                    self.session.tree()
                 );
                 reply.error(e);
             }
@@ -843,16 +1001,11 @@ impl Filesystem for View {
                     let object = ino.0.checked_sub(2).ok_or(Errno::ENOENT)?;
                     let mut v = view.actor()?;
                     // Existing named-object hard links retain fuser's default EPERM.
-                    if !v.is_anonymous(view.tree, object).map_err(errno)? {
+                    if !v.is_anonymous(object).map_err(errno)? {
                         return Err(Errno::EPERM);
                     }
-                    v.first_link(
-                        view.tree,
-                        object,
-                        name.to_str().ok_or(Errno::EINVAL)?,
-                        &view.by,
-                    )
-                    .map_err(errno)?;
+                    v.first_link(object, name.to_str().ok_or(Errno::EINVAL)?)
+                        .map_err(errno)?;
                     view.attr(&v, ino, None)
                 })()
             });
@@ -871,7 +1024,7 @@ impl Filesystem for View {
                         return Err(Errno::ENOTDIR);
                     }
                     view.actor()?
-                        .unlink(view.tree, name.to_str().ok_or(Errno::EINVAL)?, &view.by)
+                        .unlink(name.to_str().ok_or(Errno::EINVAL)?)
                         .map_err(errno)
                 })()
             });
@@ -903,10 +1056,8 @@ impl Filesystem for View {
                     }
                     view.actor()?
                         .rename(
-                            view.tree,
                             name.to_str().ok_or(Errno::EINVAL)?,
                             newname.to_str().ok_or(Errno::EINVAL)?,
-                            &view.by,
                         )
                         .map_err(errno)
                 })()
@@ -939,7 +1090,7 @@ impl Filesystem for View {
                 .map(|name| (INodeNo(1), FileType::Directory, name.to_owned()))
                 .collect();
             entries.extend(
-                v.files_from(self.tree, skip.saturating_sub(2), READDIR_BATCH)
+                v.files_from(skip.saturating_sub(2), READDIR_BATCH)
                     .map_err(errno)?
                     .into_iter()
                     .map(|(p, o)| (INodeNo(o + 2), FileType::RegularFile, p)),
@@ -963,8 +1114,11 @@ impl Filesystem for View {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agentfs_contracts::name::{VolumeName, WriterLabel};
-    use agentfs_contracts::pod::PodContext;
+    use agentfs_contracts::caps::{ClientCap, Minter};
+    use agentfs_contracts::clients::{ClientId, Consistency, Grant, Ordinal, SessionId};
+    use agentfs_contracts::name::{ClientLabel, LauncherId, VolumeName};
+    use agentfs_contracts::pod::{PodContext, WriterAt};
+    use agentfs_contracts::ports::{SessionAuthority, SessionBinder};
     use agentfs_contracts::volume::{VolumeId, VolumeIdentity};
 
     fn new_actor(dir: &Path) -> Arc<Recording> {
@@ -975,81 +1129,124 @@ mod tests {
         Recording::create(dir, &identity, &PodContext::default()).unwrap()
     }
 
-    fn writer(label: &str) -> WriterAt {
-        WriterAt {
-            writer: WriterLabel::parse(label).unwrap(),
-            at: PodContext::default(),
-        }
-    }
-
     const OWNER: FileOwner = FileOwner {
         uid: 10000,
         gid: 10001,
     };
 
+    /// A session bound to write the root as client `label`.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "a test is its own composition root"
+    )]
+    fn writing(sessions: &mut Sessions, label: &str) -> TreeSession {
+        let client = ClientId {
+            launcher: LauncherId::parse("cli").unwrap(),
+            tree: TreeId::Root,
+            label: ClientLabel::parse(label).unwrap(),
+            n: Ordinal(1),
+        };
+        let writes_as = WriterAt {
+            writer: client.writer(),
+            at: PodContext::default(),
+        };
+        let id = sessions.open();
+        let cap = ClientCap::mint(&Minter::new(), client, TreeId::Root, writes_as);
+        sessions.bind(id, SessionAuthority::Write(cap));
+        sessions.session(id).unwrap()
+    }
+
+    fn view(session: TreeSession) -> View {
+        View {
+            session,
+            owner: OWNER,
+            handles: Arc::new(Mutex::new(Handles {
+                next: 1,
+                entries: BTreeMap::new(),
+            })),
+        }
+    }
+
+    fn host(sessions: &Sessions, state: &Path) -> ViewHost {
+        ViewHost::new(sessions.clone(), state, None, Arc::new(|_| {})).unwrap()
+    }
+
+    fn binding(session: SessionId, tree: TreeId) -> Binding {
+        Binding {
+            client: ClientId {
+                launcher: LauncherId::parse("cli").unwrap(),
+                tree,
+                label: ClientLabel::parse("c").unwrap(),
+                n: Ordinal(1),
+            },
+            session,
+            grant: Grant::live_read_only(tree, Consistency::PerFile, OWNER),
+        }
+    }
+
     #[test]
     fn session_config_allows_other_by_default() {
-        let config = session_config(&MountOptions { allow_other: true });
+        let config = session_config(&MountOptions { allow_other: true }, false);
         assert_eq!(config.acl, SessionACL::All);
         assert!(
             config
                 .mount_options
                 .contains(&MountOption::DefaultPermissions)
         );
-        let config = session_config(&MountOptions { allow_other: false });
+        assert!(config.mount_options.contains(&MountOption::RW));
+        let config = session_config(&MountOptions { allow_other: false }, true);
         assert_eq!(config.acl, SessionACL::Owner);
+        assert!(config.mount_options.contains(&MountOption::RO));
     }
 
+    /// A view is refused before any mount: an unbound session, a mount point
+    /// that would expose the state area, and a tree the actor has not saved.
     #[test]
-    fn all_bindings_are_checked_before_any_mount_can_expose_state() {
-        for invalid in ["state", "state/inside", "."] {
-            let tmp = tempfile::tempdir().unwrap();
-            let state = tmp.path().join("state");
-            let volume = new_actor(&state);
-            let outside = tmp.path().join("valid");
-            std::fs::create_dir(&outside).unwrap();
+    fn every_view_is_checked_before_its_mount_can_expose_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path().join("state");
+        let mut sessions = Sessions::new(new_actor(&state));
+        let mut host = host(&sessions, &state);
+        let options = MountOptions { allow_other: true };
+        let outside = tmp.path().join("valid");
+        std::fs::create_dir(&outside).unwrap();
+        let unbound = sessions.open();
+        assert_eq!(
+            host.open(
+                MountPoint(outside.clone()),
+                binding(unbound, TreeId::Root),
+                options
+            ),
+            Err(ViewError::UnknownSession)
+        );
+        let root = sessions.open();
+        sessions.bind(root, SessionAuthority::Read(TreeId::Root));
+        for invalid in ["state", "state/inside", ".", "missing"] {
             let invalid = tmp.path().join(invalid);
-            std::fs::create_dir_all(&invalid).unwrap();
-            let bindings = vec![
-                Binding {
-                    tree: TreeId::Root,
-                    by: writer("root-client"),
-                    owner: OWNER,
-                    mountpoint: outside,
-                },
-                Binding {
-                    tree: TreeId::Root,
-                    by: writer("other"),
-                    owner: OWNER,
-                    mountpoint: invalid,
-                },
-            ];
+            if !invalid.ends_with("missing") {
+                std::fs::create_dir_all(&invalid).unwrap();
+            }
             assert_eq!(
-                serve(&state, volume, bindings, MountOptions { allow_other: true })
-                    .unwrap_err()
-                    .kind(),
-                io::ErrorKind::InvalidInput
+                host.open(MountPoint(invalid), binding(root, TreeId::Root), options),
+                Err(ViewError::MountFailed(libc::EINVAL))
             );
         }
+        let fork = sessions.open();
+        sessions.bind(fork, SessionAuthority::Read(TreeId::Fork(9)));
+        assert_eq!(
+            host.open(MountPoint(outside), binding(fork, TreeId::Fork(9)), options),
+            Err(ViewError::MountFailed(libc::ENOENT))
+        );
+        host.wait().unwrap();
     }
 
     #[test]
     fn anonymous_inode_attributes_are_available_without_a_file_handle() {
         let tmp = tempfile::tempdir().unwrap();
-        let view = View {
-            actor: new_actor(tmp.path()),
-            tree: TreeId::Root,
-            by: writer("client"),
-            owner: OWNER,
-            handles: Arc::new(Mutex::new(Handles {
-                next: 2,
-                entries: BTreeMap::new(),
-            })),
-        };
+        let mut sessions = Sessions::new(new_actor(tmp.path()));
+        let view = view(writing(&mut sessions, "client"));
         let mut volume = view.actor().unwrap();
-        let handle = volume
-            .anonymous_open(TreeId::Root, &writer("client"))
-            .unwrap();
+        let handle = volume.anonymous_open().unwrap();
         let ino = INodeNo(volume.open_object(handle).unwrap() + 2);
         volume.write(handle, 0, b"private", false).unwrap();
         view.handles().unwrap().entries.insert(
@@ -1070,32 +1267,20 @@ mod tests {
     #[test]
     fn a_readers_snapshot_survives_a_later_save_and_readonly_truncation_is_refused() {
         let tmp = tempfile::tempdir().unwrap();
-        let view = View {
-            actor: new_actor(tmp.path()),
-            tree: TreeId::Root,
-            by: writer("client"),
-            owner: OWNER,
-            handles: Arc::new(Mutex::new(Handles {
-                next: 1,
-                entries: BTreeMap::new(),
-            })),
-        };
+        let mut sessions = Sessions::new(new_actor(tmp.path()));
+        let view = view(writing(&mut sessions, "client"));
         let mut volume = view.actor().unwrap();
-        let h = volume
-            .write_open(TreeId::Root, "a", &writer("seed"), true)
-            .unwrap();
+        let h = volume.write_open("a", true).unwrap();
         volume.write(h, 0, b"old", false).unwrap();
         volume.close(h).unwrap();
         let reader = view
             .open_file(&mut volume, "a", libc::O_RDONLY, false)
             .unwrap();
-        let h = volume
-            .write_open(TreeId::Root, "a", &writer("next"), false)
-            .unwrap();
+        let h = volume.write_open("a", false).unwrap();
         volume.truncate(h, 0).unwrap();
         volume.write(h, 0, b"new", false).unwrap();
         volume.close(h).unwrap();
-        assert_eq!(volume.read(TreeId::Root, "a").unwrap(), b"new");
+        assert_eq!(volume.read("a").unwrap(), b"new");
         match &view.handles().unwrap().entries[&reader] {
             Open::Read(map) => assert_eq!(map.to_vec().unwrap(), b"old"),
             _ => panic!("read-only open acquired a writer"),
@@ -1104,6 +1289,25 @@ mod tests {
             view.open_file(&mut volume, "a", libc::O_RDONLY | libc::O_TRUNC, false),
             Err(Errno::EACCES)
         );
-        assert_eq!(volume.read(TreeId::Root, "a").unwrap(), b"new");
+        assert_eq!(volume.read("a").unwrap(), b"new");
+    }
+
+    /// A read-only client's view answers `EROFS` to every write, whatever the
+    /// kernel lets through.
+    #[test]
+    fn a_read_only_view_refuses_writes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut sessions = Sessions::new(new_actor(tmp.path()));
+        let id = sessions.open();
+        sessions.bind(id, SessionAuthority::Read(TreeId::Root));
+        let view = view(sessions.session(id).unwrap());
+        let mut volume = view.actor().unwrap();
+        for flags in [libc::O_WRONLY, libc::O_RDWR, libc::O_RDONLY] {
+            assert_eq!(
+                view.open_file(&mut volume, "a", flags, true),
+                Err(Errno::EROFS)
+            );
+        }
+        assert_eq!(volume.anonymous_open().map_err(errno), Err(Errno::EROFS));
     }
 }
