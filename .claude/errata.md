@@ -790,3 +790,18 @@ Not blocking; the suite is built and green. Findings about the brief and the doc
    file on FUSE `release`, which the kernel sends after `close(2)` returns; the save is committed before the view
    answers any later request (one session thread, requests in order), which is what the tracer's step 2 and
    `trees-figures.py`'s timed stat rely on. The report's frozen string should say that, or the design should.
+
+## 2026-11-14, speed B3 (file maps and segments): dispatched before the slice it needs
+
+1. **B3 was dispatched, but B2b is not built.** The frozen pages (`speed-pages.md` §0) order the slices B2a, B2b,
+   B4, B3, and give B3 "Needs: B2b". On 6e4ce1e only B2a is landed: `History` (`tree_actor/history/built.rs`) and
+   `Recording`'s B2b methods (`call_path.rs`) are still `todo!("B2b")`, and `tree_actor/history/builder.rs` does not
+   exist.
+2. **B3's page cannot be built on B2a alone.** Its own files and interfaces rest on B2b's: `BaseFile` is "the
+   checkout's file as built" (B2b's private checkout and built point); `FileMap::rebase` runs "at a built event";
+   segments drop "once all its records are `<= built`"; the only change to `history/builder.rs` (a B2b file) is
+   streaming `FileMap::reader` into `Feed::blob_from` (a B2b type); the save record it changes,
+   `Saved { len, crc32 }`, is B2b's `SaveOutcome`. Building B3 now means building B2b's builder, built point and
+   checkout first, which is B2b's bead, not B3's.
+3. **What resumes it:** land B2b (and B4, by the page's order), then dispatch B3 unchanged. No re-cut of B3's page is
+   needed. Nothing of B3 was written.
