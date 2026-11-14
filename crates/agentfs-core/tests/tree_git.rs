@@ -403,4 +403,11 @@ fn missing_objects_names_what_is_lost_of_a_tip_and_not_its_parents() {
     let mut expected = vec![blob, table];
     expected.sort();
     assert_eq!(lost, expected);
+    // A lost tip is named itself, on every git this runs on.
+    lose(tip);
+    let mut lost = repo.missing_objects(&[tip, table]).unwrap();
+    lost.sort();
+    let mut expected = vec![tip, table];
+    expected.sort();
+    assert_eq!(lost, expected);
 }

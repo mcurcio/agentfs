@@ -212,6 +212,24 @@ impl TreeGit {
         for tip in tips {
             input.push_str(&format!("{tip}\n"));
         }
+        // Some git releases (2.43 among them) fail `rev-list --missing=print`
+        // with "bad object" for a missing tip instead of printing it, so the
+        // tips are checked first and only those present are walked.
+        let out = self.run(&["cat-file", "--batch-check"], Some(input.as_bytes()), true)?;
+        let mut missing: Vec<Oid> = out
+            .stdout
+            .split(|b| *b == b'\n')
+            .filter_map(|line| line.strip_suffix(b" missing"))
+            .map(parse_oid)
+            .collect::<Result<_>>()?;
+        let present: String = tips
+            .iter()
+            .filter(|tip| !missing.contains(tip))
+            .map(|tip| format!("{tip}\n"))
+            .collect();
+        if present.is_empty() {
+            return Ok(missing);
+        }
         let out = self.run(
             &[
                 "rev-list",
@@ -220,14 +238,17 @@ impl TreeGit {
                 "--missing=print",
                 "--stdin",
             ],
-            Some(input.as_bytes()),
+            Some(present.as_bytes()),
             true,
         )?;
-        out.stdout
+        for oid in out
+            .stdout
             .split(|b| *b == b'\n')
             .filter_map(|line| line.strip_prefix(b"?"))
-            .map(parse_oid)
-            .collect()
+        {
+            missing.push(parse_oid(oid)?);
+        }
+        Ok(missing)
     }
 
     /// Each commit reachable from `tips` with its raw message, in one Git
