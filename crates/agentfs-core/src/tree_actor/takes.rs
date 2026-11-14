@@ -434,7 +434,13 @@ impl TreeActor {
                     continue;
                 };
                 let mut map = FileMap::empty();
-                map.apply(&Call::Write { offset: 0, len: *len }, &pos.at(*at))?;
+                map.apply(
+                    &Call::Write {
+                        offset: 0,
+                        len: *len,
+                    },
+                    &pos.at(*at),
+                )?;
                 map.saved_at(RecordNo::new(seq));
                 let changed = match after.bytes.get(&file.object) {
                     Some(old) => {

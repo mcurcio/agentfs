@@ -15,7 +15,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use agentfs_contracts::clients::FileOwner;
 use agentfs_contracts::pod::WriterAt;
 use agentfs_contracts::views::MountOptions;
-use agentfs_core::tree_actor::{Error, Progress, Recording, Saved, TreeActor, TreeId};
+use agentfs_core::tree_actor::{Error, FileMap, Progress, Recording, Saved, TreeActor, TreeId};
 use fuser::*;
 
 const TTL: Duration = Duration::ZERO;
@@ -263,7 +263,9 @@ struct Handles {
     entries: BTreeMap<u64, Open>,
 }
 enum Open {
-    Read(Vec<u8>),
+    /// A read-only open's snapshot: the saved file's map at open, read with
+    /// the actor unlocked.
+    Read(FileMap),
     Write {
         handle: u64,
         append: bool,
@@ -330,10 +332,10 @@ impl View {
             .0
             .checked_sub(2)
             .and_then(|object| v.inode_size(self.tree, object));
-        let size = if ino.0 == 1 {
+        let size: u64 = if ino.0 == 1 {
             0
         } else if let Some(size) = open_size {
-            size as usize
+            size
         } else if let Some(fh) = fh {
             let handles = self.handles()?;
             match handles.entries.get(&fh.0).ok_or(Errno::EBADF)? {
@@ -356,13 +358,13 @@ impl View {
                 .ok_or(Errno::ENOENT)?;
             v.read_open(handle).map_err(errno)?.len()
         } else {
-            v.read(self.tree, &self.path(v, ino)?).map_err(errno)?.len()
+            v.file_len(self.tree, &self.path(v, ino)?).map_err(errno)?
         };
         let dir = ino.0 == 1;
         Ok(FileAttr {
             ino,
-            size: size as u64,
-            blocks: (size as u64).div_ceil(512),
+            size,
+            blocks: size.div_ceil(512),
             atime: UNIX_EPOCH,
             mtime: UNIX_EPOCH,
             ctime: UNIX_EPOCH,
@@ -413,7 +415,7 @@ impl View {
                     .map_err(errno)?;
                 v.close(h).map_err(errno)?;
             }
-            Open::Read(v.read(self.tree, path).map_err(errno)?.to_vec())
+            Open::Read(v.file_map(self.tree, path).map_err(errno)?)
         };
         let fh = handles.next;
         handles.next += 1;
@@ -593,30 +595,37 @@ impl Filesystem for View {
         reply: ReplyData,
     ) {
         let result = (|| {
-            let mut v = self.actor()?;
-            // A descriptor read on direct I/O always names a lock owner; a page
-            // fill never does.
-            if owner.is_none() {
-                let object = ino.0.checked_sub(2).ok_or(Errno::EBADF)?;
-                match v.page_fill(self.tree, object, offset, size) {
-                    Err(Error::NotFound) => {}
-                    filled => return filled.map_err(errno),
+            // The map is cloned under the locks and read after them: a read
+            // holds no other request (docs/trees.md, "File maps").
+            let map = {
+                let mut v = self.actor()?;
+                // A descriptor read on direct I/O always names a lock owner; a page
+                // fill never does.
+                if owner.is_none() {
+                    let object = ino.0.checked_sub(2).ok_or(Errno::EBADF)?;
+                    match v.page_fill(self.tree, object, offset, size) {
+                        Err(Error::NotFound) => {}
+                        filled => return filled.map_err(errno),
+                    }
                 }
-            }
-            let handles = self.handles()?;
-            let bytes = match handles.entries.get(&fh.0).ok_or(Errno::EBADF)? {
-                Open::Read(bytes) => bytes.as_slice(),
-                Open::Write {
-                    handle,
-                    readable: true,
-                    ..
-                } => v.read_open(*handle).map_err(errno)?,
-                _ => return Err(Errno::EBADF),
+                let handles = self.handles()?;
+                match handles.entries.get(&fh.0).ok_or(Errno::EBADF)? {
+                    Open::Read(map) => map.clone(),
+                    Open::Write {
+                        handle,
+                        readable: true,
+                        ..
+                    } => v.read_open(*handle).map_err(errno)?.clone(),
+                    _ => return Err(Errno::EBADF),
+                }
             };
-            let start = usize::try_from(offset)
-                .unwrap_or(usize::MAX)
-                .min(bytes.len());
-            Ok(bytes[start..start.saturating_add(size as usize).min(bytes.len())].to_vec())
+            let wanted = u64::from(size).min(map.len().saturating_sub(offset));
+            let mut bytes = vec![0; usize::try_from(wanted).map_err(|_| Errno::EFBIG)?];
+            let read = map
+                .read(offset, &mut bytes)
+                .map_err(|e| Errno::from_i32(e.raw_os_error().unwrap_or(libc::EIO)))?;
+            bytes.truncate(read);
+            Ok(bytes)
         })();
         match result {
             Ok(bytes) => reply.data(&bytes),
@@ -1079,7 +1088,7 @@ mod tests {
         volume.close(h).unwrap();
         assert_eq!(volume.read(TreeId::Root, "a").unwrap(), b"new");
         match &view.handles().unwrap().entries[&reader] {
-            Open::Read(bytes) => assert_eq!(bytes, b"old"),
+            Open::Read(map) => assert_eq!(map.to_vec().unwrap(), b"old"),
             _ => panic!("read-only open acquired a writer"),
         }
         assert_eq!(

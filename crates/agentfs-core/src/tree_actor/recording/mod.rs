@@ -11,15 +11,15 @@ use std::ops::Range;
 
 use agentfs_contracts::pod::WriterAt;
 
-pub use file_map::FileMap;
-use super::journal::durable::RecordNo;
 pub(in crate::tree_actor) use super::journal::CallHead as Call;
+use super::journal::durable::RecordNo;
 use super::journal::segment::FramePos;
 use super::journal::{Change, Entry, PagePiece, RunHead, SaveOutcome};
 use super::queue::Key;
 use super::tree::EventNumber;
 use super::{Error, Result, Saved, TreeActor, TreeId};
 use crate::paths::RepoPath;
+pub use file_map::FileMap;
 
 /// Calls name byte positions, never lines; their bytes are in their frame's
 /// tail. Append finds EOF at save time.
@@ -310,7 +310,12 @@ impl TreeActor {
     /// all `apply`'s errors depend on, and the head's replay is redone only
     /// when the saved length moved: a call costs its own bytes, not the
     /// file's or its open's.
-    pub(in crate::tree_actor) fn call(&mut self, handle: u64, call: Call, tail: &[u8]) -> Result<()> {
+    pub(in crate::tree_actor) fn call(
+        &mut self,
+        handle: u64,
+        call: Call,
+        tail: &[u8],
+    ) -> Result<()> {
         let h = self.handles.get(&handle).ok_or(Error::NotFound)?;
         call.len_after(h.bytes.len())?;
         let saved = self
@@ -645,8 +650,11 @@ mod tests {
         for len in [0, 1, 5, 12] {
             for call in &calls {
                 let mut map = FileMap::empty();
-                map.apply(&Call::Append { len }, &frames.add(&vec![b'.'; len as usize]))
-                    .unwrap();
+                map.apply(
+                    &Call::Append { len },
+                    &frames.add(&vec![b'.'; len as usize]),
+                )
+                .unwrap();
                 let pos = frames.add(&vec![b'x'; call.carried() as usize]);
                 map.apply(call, &pos).unwrap();
                 assert_eq!(call.len_after(len).unwrap(), map.len(), "{call:?} on {len}");

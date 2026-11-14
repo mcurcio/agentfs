@@ -1210,6 +1210,110 @@ fn a_log_held_open_does_not_pin_other_saves() {
     assert_eq!(opens_saved(tmp.path(), log), 1);
 }
 
+/// A file held open pins only its own frames: after 200 MiB of other files'
+/// saves and a build, the segments on disk stay under twice its own bytes
+/// plus a segment. Inverted: an open whose own bytes outweigh the dead ones
+/// beside them keeps its segments where they are, and nothing is copied.
+#[test]
+fn a_held_open_pins_only_its_own_bytes() {
+    const SEGMENT: u64 = 64 << 20;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut v = new_actor(tmp.path());
+    let held = v.write_open(ROOT, "held", &writer("w"), true).unwrap();
+    let own: u64 = 4 << 20;
+    for _ in 0..4 {
+        v.write(held, 0, &[7; 1 << 20], true).unwrap();
+    }
+    for n in 0..3 {
+        fill_journal(&mut v, &format!("other-{n}"));
+    }
+    let on_disk = trees::journal_len(tmp.path());
+    assert!(
+        on_disk < 2 * (own + SEGMENT),
+        "{on_disk} bytes of segments for a held open of {own}"
+    );
+    v.write(held, 0, b"!", true).unwrap();
+    v.close(held).unwrap();
+    assert_eq!(v.read(ROOT, "held").unwrap().len() as u64, own + 1);
+
+    let tmp = tempfile::tempdir().unwrap();
+    let mut v = new_actor(tmp.path());
+    let held = v.write_open(ROOT, "held", &writer("w"), true).unwrap();
+    for _ in 0..70 {
+        v.write(held, 0, &[7; 1 << 20], true).unwrap();
+    }
+    put(&mut v, ROOT, "small", b"dead bytes beside a live open");
+    v.settle().unwrap();
+    // The first call after the builder caught up compacts: a checkpoint in a
+    // third segment, the two before it kept.
+    let poke = v.write_open(ROOT, "small", &writer("w"), false).unwrap();
+    v.close(poke).unwrap();
+    assert_eq!(v.metrics().journal_carried_bytes, 0, "a live open's frames moved");
+    assert_eq!(trees::segments(tmp.path()).len(), 3);
+    assert!(trees::journal_len(tmp.path()) > 70 << 20);
+    drop(v);
+    let v = reopen(tmp.path());
+    assert_eq!(v.read(ROOT, "held").unwrap().len(), 70 << 20);
+}
+
+/// A reader that opened a file read from its checkout as built keeps reading
+/// those bytes after a later save is built: the checkout writes a new file
+/// and renames it over the old, whose descriptor the reader holds.
+#[test]
+fn a_reader_of_a_rebased_file_reads_the_old_version() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut v = new_actor(tmp.path());
+    put(&mut v, ROOT, "a", b"opened\n");
+    v.settle().unwrap();
+    // The next call takes the builder's map, read from the checkout.
+    put(&mut v, ROOT, "b", b"poke\n");
+    let reader = v.file_map(ROOT, "a").unwrap();
+    put(&mut v, ROOT, "a", b"rewritten\n");
+    v.settle().unwrap();
+    put(&mut v, ROOT, "b", b"poke again\n");
+    v.settle().unwrap();
+    assert_eq!(
+        fs::read(trees::checkout(tmp.path(), "root", "a")).unwrap(),
+        b"rewritten\n"
+    );
+    assert_eq!(reader.to_vec().unwrap(), b"opened\n");
+    assert_eq!(v.read(ROOT, "a").unwrap(), b"rewritten\n");
+}
+
+/// A new segment's directory entry is fsynced before the mark covers any
+/// record in it: failing there, the mark stays below the segment's first
+/// record, and a reopen still finds every record (a kill keeps the kernel's).
+#[cfg(feature = "failpoints")]
+#[test]
+fn a_record_in_a_segment_whose_entry_is_not_fsynced_is_never_marked_durable() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut v = new_actor(tmp.path());
+    let h = v.write_open(ROOT, "big", &writer("w"), true).unwrap();
+    let chunk = vec![b'x'; 33 << 20];
+    v.write(h, 0, &chunk, true).unwrap();
+    v.durability().make_all_durable().unwrap();
+    assert_eq!(trees::segments(tmp.path()).len(), 1);
+    // A frame past the first segment's size starts the next one.
+    v.write(h, 0, &chunk, true).unwrap();
+    let segments = trees::segments(tmp.path());
+    assert_eq!(segments.len(), 2);
+    let first: u64 = segments[1]
+        .file_stem()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let guard = agentfs_core::failpoints::configure("tree.segment_after_create=error").unwrap();
+    assert!(v.durability().make_all_durable().is_err());
+    drop(guard);
+    assert!(v.durability().mark().get() < first);
+    assert!(v.is_stopped());
+    drop(v);
+    let v = reopen(tmp.path());
+    assert_eq!(v.read(ROOT, "big").unwrap().len(), 66 << 20);
+}
+
 // Run a worker test in a child process with this failpoint spec, and wait for
 // the failpoint to kill it. The child prints the open it was closing.
 #[cfg(feature = "failpoints")]

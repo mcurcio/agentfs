@@ -49,6 +49,9 @@ use crate::tree_git::{RefUpdate, TreeGit};
 /// so a long backlog is built in slices that each end in one.
 const MAX_BATCH_STEPS: usize = 256;
 
+/// Where a reader stands: a segment and a byte in it.
+type ReadAt = (Arc<Segment>, u64);
+
 /// The builder's own reader of the journal: frames after its cursor, through
 /// the durable mark, along the segments in order. A segment it holds stays
 /// readable after compaction drops it; carried frames and checkpoints number
@@ -113,11 +116,7 @@ impl JournalReader {
     /// Frames after the cursor through `through` (at most the durable mark),
     /// stopping after `max_steps` steps, and where they end. The cursor moves
     /// only at [`JournalReader::advance`].
-    pub fn read(
-        &mut self,
-        through: RecordNo,
-        max_steps: usize,
-    ) -> Result<(Vec<Frame>, (Arc<Segment>, u64))> {
+    pub fn read(&mut self, through: RecordNo, max_steps: usize) -> Result<(Vec<Frame>, ReadAt)> {
         let mut frames = Vec::new();
         let mut steps = 0;
         let (start, start_offset) = (Arc::clone(&self.segment), self.offset);
@@ -127,7 +126,7 @@ impl JournalReader {
                     self.offset += len;
                     if frame.0.seq > self.cursor {
                         steps += usize::from(matches!(frame.0.entry, Entry::Step { .. }));
-                        frames.push(frame);
+                        frames.push(*frame);
                     }
                 }
                 At::Later => break,
@@ -146,7 +145,7 @@ impl JournalReader {
     }
 
     /// The batch read up to `end`, through `through`, is built.
-    pub fn advance(&mut self, end: (Arc<Segment>, u64), through: RecordNo) {
+    pub fn advance(&mut self, end: ReadAt, through: RecordNo) {
         (self.segment, self.offset) = end;
         self.cursor = self.cursor.max(through);
     }
@@ -525,7 +524,10 @@ impl BuildState {
                         t.lines.remove(&open.object);
                     }
                     SaveOutcome::Unchanged | SaveOutcome::OrphanDropped => {}
-                    SaveOutcome::Saved { len, pieces: digest } => {
+                    SaveOutcome::Saved {
+                        len,
+                        pieces: digest,
+                    } => {
                         let writes = self.pages.get(&(id, open.object));
                         let mut resolved = Vec::with_capacity(pieces.len());
                         for piece in pieces {
@@ -540,8 +542,8 @@ impl BuildState {
                             resolved.push((piece.record.get(), run));
                         }
                         let calls = pages::close_calls(&open.calls, &resolved);
-                        let mut map = (**t.bytes.get(&open.object).ok_or_else(|| disagrees(seq))?)
-                            .clone();
+                        let mut map =
+                            (**t.bytes.get(&open.object).ok_or_else(|| disagrees(seq))?).clone();
                         for (call, pos) in &calls {
                             map.apply(call, pos)?;
                         }
@@ -727,13 +729,25 @@ impl BuildState {
         t.install(snapshot, |identity, object, _| match spans.get(&identity) {
             Some((at, len)) => {
                 let mut map = FileMap::empty();
-                map.apply(&Call::Write { offset: 0, len: *len }, &tail.pos.at(*at))?;
+                map.apply(
+                    &Call::Write {
+                        offset: 0,
+                        len: *len,
+                    },
+                    &tail.pos.at(*at),
+                )?;
                 taken.push(object);
                 Ok(saved_map(map, seq))
             }
-            None => current.bytes.get(&object).cloned().ok_or_else(|| disagrees(seq)),
+            None => current
+                .bytes
+                .get(&object)
+                .cloned()
+                .ok_or_else(|| disagrees(seq)),
         })?;
-        batch.files.extend(taken.into_iter().map(|object| (id, object)));
+        batch
+            .files
+            .extend(taken.into_iter().map(|object| (id, object)));
         // The actor ran the shape's own transition: the two must agree.
         let mut shape = current.shape.clone();
         shape.apply(change, event)?;
@@ -1034,8 +1048,11 @@ impl Builder {
             let Some(t) = self.state.trees.get_mut(tree) else {
                 continue;
             };
-            let named: Vec<(String, u64)> =
-                t.names.iter().map(|(path, object)| (path.clone(), *object)).collect();
+            let named: Vec<(String, u64)> = t
+                .names
+                .iter()
+                .map(|(path, object)| (path.clone(), *object))
+                .collect();
             for (path, object) in named {
                 let Some(bytes) = t.bytes.get(&object) else {
                     continue;

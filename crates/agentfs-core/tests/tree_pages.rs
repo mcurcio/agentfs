@@ -457,9 +457,17 @@ fn a_writable_descriptor_reads_page_writes_and_a_read_only_one_keeps_its_snapsho
     k.map(a);
     k.store(0, b"12");
     k.flush();
-    assert_eq!(k.v.read_open(b).unwrap().to_vec().unwrap(), b"12cdefgh", "an open before it");
+    assert_eq!(
+        k.v.read_open(b).unwrap().to_vec().unwrap(),
+        b"12cdefgh",
+        "an open before it"
+    );
     let c = k.open("c");
-    assert_eq!(k.v.read_open(c).unwrap().to_vec().unwrap(), b"12cdefgh", "an open after it");
+    assert_eq!(
+        k.v.read_open(c).unwrap().to_vec().unwrap(),
+        b"12cdefgh",
+        "an open after it"
+    );
     assert_eq!(k.v.read(TREE, PATH).unwrap(), SEED, "a new read-only open");
 }
 

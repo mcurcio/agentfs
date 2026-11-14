@@ -57,10 +57,10 @@ use super::tree::{MergeFileIdentity, NameHistory};
 use super::{Error, Result, referee};
 pub(super) use commit_point::compact_at;
 use durable::{Durability, RecordNo};
-use segment::{FramePos, SEGMENT_BYTES, Segment};
 #[cfg(test)]
 pub(super) use fold::{Folded, LiveOpen};
 pub(super) use fold::{FoldedOpen, fold, objects_through, runs_from_frame};
+use segment::{FramePos, SEGMENT_BYTES, Segment};
 
 const MAGIC: &[u8; 4] = b"AFJ3";
 const HEADER: usize = 44;
@@ -401,7 +401,15 @@ impl Header {
 }
 
 /// A header's 44 bytes, its own checksum last.
-fn header_bytes(salt: u32, record: RecordNo, mark: RecordNo, flags: u32, head: u32, tail: u32, crc: u32) -> [u8; HEADER] {
+fn header_bytes(
+    salt: u32,
+    record: RecordNo,
+    mark: RecordNo,
+    flags: u32,
+    head: u32,
+    tail: u32,
+    crc: u32,
+) -> [u8; HEADER] {
     let mut bytes = [0; HEADER];
     bytes[..4].copy_from_slice(MAGIC);
     bytes[4..8].copy_from_slice(&salt.to_le_bytes());
@@ -497,7 +505,7 @@ fn durable_past(bytes: &[u8], salt: u32, last: RecordNo) -> bool {
 /// What a reader finds at a byte of a segment.
 pub(super) enum At {
     /// A whole valid frame, and its length.
-    Frame(Frame, u64),
+    Frame(Box<Frame>, u64),
     /// A valid frame numbered past what the reader asked for.
     Later,
     /// The end, or a frame not whole yet (an append the reader raced).
@@ -558,7 +566,7 @@ pub(super) fn frame_at(
         },
         len: header.tail as u64,
     };
-    Ok(At::Frame((record, tail), header.frame_len()))
+    Ok(At::Frame(Box::new((record, tail)), header.frame_len()))
 }
 
 fn sync_dir(dir: &Path) -> io::Result<()> {
@@ -729,7 +737,11 @@ impl Journal {
                 .open(dir.join("torn"))?;
             saved.write_all(&rest)?;
             saved.sync_all()?;
-            eprintln!("tree JournalTail: {} bytes at {}", rest.len(), global + offset);
+            eprintln!(
+                "tree JournalTail: {} bytes at {}",
+                rest.len(),
+                global + offset
+            );
             let (segment, length) = &segments[index];
             segment.file().set_len(*length)?;
             segment.file().sync_all()?;
@@ -748,7 +760,9 @@ impl Journal {
         let mut before: BTreeMap<RecordNo, Frame> = BTreeMap::new();
         for (index, f) in found.iter().enumerate() {
             if (index < at || f.carried) && named_live(&checkpoint.0.entry, &f.frame.0) {
-                before.entry(f.frame.0.seq).or_insert_with(|| f.frame.clone());
+                before
+                    .entry(f.frame.0.seq)
+                    .or_insert_with(|| f.frame.clone());
             }
         }
         let after = found[at + 1..]
@@ -786,10 +800,15 @@ impl Journal {
     }
 
     /// Starts segment `first` before a frame of `bytes` bytes when the
-    /// current one has records and would pass its size.
+    /// current one has records and would pass its size. A segment named
+    /// `first` already (a checkpoint's, holding only it and carried frames)
+    /// takes the frame however long it grows: the name is taken.
     fn roll(&mut self, first: RecordNo, bytes: u64) -> io::Result<bool> {
-        let (_, length) = self.current();
-        if *length == 0 || length.saturating_add(bytes) <= SEGMENT_BYTES {
+        let (segment, length) = self.current();
+        if *length == 0
+            || length.saturating_add(bytes) <= SEGMENT_BYTES
+            || segment.first() >= first
+        {
             return Ok(false);
         }
         let segment = Segment::create(&self.dir, first)?;
@@ -862,9 +881,17 @@ impl Journal {
     /// [`CompactError::Before`]: the journal is as it was.
     pub fn checkpoint(&mut self, checkpoint: &Record) -> std::result::Result<(), CompactError> {
         let first = covered_by(checkpoint).next();
-        let head = checkpoint.head().map_err(|e| CompactError::Before(e.into()))?;
-        let bytes = frame_bytes(self.salt, checkpoint.seq, self.durability.mark(), &head, &[])
-            .ok_or_else(|| CompactError::Before(io::Error::from_raw_os_error(libc::EFBIG)))?;
+        let head = checkpoint
+            .head()
+            .map_err(|e| CompactError::Before(e.into()))?;
+        let bytes = frame_bytes(
+            self.salt,
+            checkpoint.seq,
+            self.durability.mark(),
+            &head,
+            &[],
+        )
+        .ok_or_else(|| CompactError::Before(io::Error::from_raw_os_error(libc::EFBIG)))?;
         // An empty segment, or one holding only what this checkpoint covers
         // (an earlier checkpoint, carried frames), takes it as it is.
         let rolled = if self.current().1 == 0 || self.current().0.first() >= first {
@@ -1145,10 +1172,42 @@ mod tests {
                 .map(|(_, p)| fs::metadata(p).unwrap().len())
                 .sum::<u64>()
         );
-        assert_eq!(journal.durability().make_all_durable(), Ok(RecordNo::new(70)));
+        assert_eq!(
+            journal.durability().make_all_durable(),
+            Ok(RecordNo::new(70))
+        );
         drop(journal);
         let (_, frames) = Journal::open(&dir).unwrap();
         assert_eq!(frames.len(), 71);
+    }
+
+    /// Frames carried past a segment's size into a checkpoint's segment
+    /// (named for the next record) leave the next record there: a segment of
+    /// that name is taken.
+    #[test]
+    fn a_checkpoint_segment_carried_past_its_size_takes_the_next_record() {
+        let (_tmp, dir, mut journal) = journal();
+        let block = vec![5; 1 << 20];
+        // Three segments, each with fewer live frames (handle 8) than dead.
+        let mut live_frames = 0;
+        for seq in 1..=192 {
+            let handle = if seq % 64 < 30 { 8 } else { 9 };
+            live_frames += usize::from(handle == 8);
+            let (record, tail) = call(seq, handle, &block);
+            journal.append(&record, &tail).unwrap();
+        }
+        assert!(journal.segment_firsts().len() >= 3);
+        journal
+            .checkpoint(&checkpoint_with(193, vec![open_record(8)]))
+            .unwrap();
+        let live = |record: &Record| matches!(record.entry, Entry::Call { handle: 8, .. });
+        let stats = journal.drop_behind(RecordNo::new(192), &live).unwrap();
+        assert!(stats.carried_bytes > SEGMENT_BYTES, "{stats:?}");
+        let next = call(193, 8, &block);
+        journal.append(&next.0, &next.1).unwrap();
+        drop(journal);
+        let (_, frames) = Journal::open(&dir).unwrap();
+        assert_eq!(frames.len(), 1 + live_frames + 1);
     }
 
     #[test]

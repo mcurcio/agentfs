@@ -7,7 +7,7 @@ use std::sync::Mutex;
 
 use agentfs_contracts::pod::PodContext;
 use agentfs_core::tree_actor::stages::Stages;
-use agentfs_core::tree_actor::{Recording, TreeActor, TreeId};
+use agentfs_core::tree_actor::{Recording, Saved, TreeActor, TreeId};
 use trees::{identity, new_actor, reopen, writer};
 
 #[path = "support/trees.rs"]
@@ -124,6 +124,51 @@ fn stages_add_up() {
     // Durations are only measured, never exact: each ran and none ran backwards.
     assert!(after.stages.journal_append.nanos > before.stages.journal_append.nanos);
     assert!(after.stages.objects.max_nanos > 0);
+}
+
+/// A write costs its own bytes at any file size: a 4 KiB write into a 1 GiB
+/// file (sparse, in the engine) copies 4 KiB, its frame's tail, and nothing
+/// of the file (docs/trees.md, "File maps").
+#[test]
+fn bytes_copied_per_write_is_its_own() {
+    let _one = ONE_AT_A_TIME.lock().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let mut v = new_actor(&tmp.path().join("state"));
+    let h = v
+        .write_open(TreeId::Root, "big", &writer("w"), true)
+        .unwrap();
+    v.truncate(h, 1 << 30).unwrap();
+    v.write(h, 0, &[1; 4096], false).unwrap();
+    // Nothing of the builder's runs while this is measured: no step is unbuilt.
+    v.settle().unwrap();
+    let before = Stages::current().bytes_copied;
+    v.write(h, 512 << 20, &[2; 4096], false).unwrap();
+    let copied = Stages::current().bytes_copied - before;
+    assert_eq!(copied, 4096, "a 4 KiB write into a 1 GiB file copied {copied} bytes");
+    assert_eq!(v.read_open(h).unwrap().len(), 1 << 30);
+}
+
+/// A close that changes nothing is told by comparing only the open's own
+/// runs, never the whole file.
+#[test]
+fn unchanged_compares_only_the_opens_runs() {
+    let _one = ONE_AT_A_TIME.lock().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let mut v = new_actor(&tmp.path().join("state"));
+    let file: Vec<u8> = (0..(1 << 20)).map(|i| (i % 251) as u8).collect();
+    put(&mut v, "a", &file);
+    v.settle().unwrap();
+    let h = v
+        .write_open(TreeId::Root, "a", &writer("w"), false)
+        .unwrap();
+    let at = 300_000;
+    v.write(h, at as u64, &file[at..at + 4096], false).unwrap();
+    v.write(h, (at + 1024) as u64, &file[at + 1024..at + 2048], false)
+        .unwrap();
+    let before = Stages::current().bytes_compared;
+    assert_eq!(v.close(h).unwrap(), Saved::Unchanged);
+    let compared = Stages::current().bytes_compared - before;
+    assert_eq!(compared, 4096, "the open's runs are 4096 bytes; {compared} compared");
 }
 
 /// The call path runs no Git and writes no object: with the builder held, a

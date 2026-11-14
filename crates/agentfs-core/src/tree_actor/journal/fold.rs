@@ -210,7 +210,10 @@ pub(in crate::tree_actor) fn parse_oid(hex: &str) -> Result<Oid> {
 }
 
 /// A page write's runs, each where its bytes are in the frame's tail.
-pub(in crate::tree_actor) fn runs_from_frame(heads: &[RunHead], tail: &Tail) -> Result<Vec<pages::Run>> {
+pub(in crate::tree_actor) fn runs_from_frame(
+    heads: &[RunHead],
+    tail: &Tail,
+) -> Result<Vec<pages::Run>> {
     let mut at = 0_u64;
     let mut runs = Vec::with_capacity(heads.len());
     for head in heads {

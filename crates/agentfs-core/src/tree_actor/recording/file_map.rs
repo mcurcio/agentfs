@@ -41,7 +41,6 @@ impl BaseFile {
             blob,
         }))
     }
-
 }
 
 impl std::fmt::Debug for BaseFile {
@@ -550,6 +549,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::single_range_in_vec_init,
+        reason = "one range is a list of ranges"
+    )]
     fn same_as_compares_only_the_ranges_it_is_given() {
         let mut frames = Scratch::new();
         let mut a = FileMap::empty();

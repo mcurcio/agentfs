@@ -39,8 +39,6 @@ use serde::Serialize;
 use crate::file_lock::{FileLock, Mode};
 pub use agentfs_contracts::{NotATree, TreeId};
 pub use call_path::{Progress, Recording, Then};
-pub use recording::FileMap;
-pub use recording::file_map::FileMapReader;
 use history::builder::{BuildState, Builder, JournalReader, copy_all};
 pub use history::built::{BuildError, BuiltSnapshot, Health, History, Lag, TreeLag, WaitError};
 use history::built_log::{self, BuiltLog};
@@ -48,13 +46,15 @@ use history::message::Message;
 use history::upstreams::Upstreams;
 use history::{check_objects, clean_packs, read_trees, refs, remove_stale_locks, sync_marker};
 pub use journal::durable::{Durability, DurableError, RecordNo};
+use journal::segment::FramePos;
 use journal::{
     Change, Entry, FoldedOpen, Journal, PointerChange, Record, Target, compact_at, fold,
     objects_through,
 };
 use pointers::Pointers;
+pub use recording::FileMap;
+pub use recording::file_map::FileMapReader;
 use recording::{Handle, pages};
-use journal::segment::FramePos;
 use stages::Stages;
 use tree::{EventNumber, SavedTree};
 
@@ -325,19 +325,12 @@ fn write_durably(root: &Path, name: &str, bytes: &[u8]) -> io::Result<()> {
 // Only a create deletes, and only under its own marker: a cut one holds
 // nothing a call returned for.
 fn clear_cut_create(root: &Path) -> io::Result<()> {
-    for dir in ["history.git", "trees"] {
+    for dir in ["history.git", "trees", JOURNAL] {
         if root.join(dir).exists() {
             fs::remove_dir_all(root.join(dir))?;
         }
     }
-    for file in [
-        JOURNAL,
-        BUILT_LOG,
-        "format",
-        "format.tmp",
-        IDENTITY,
-        "volume.tmp",
-    ] {
+    for file in [BUILT_LOG, "format", "format.tmp", IDENTITY, "volume.tmp"] {
         match fs::remove_file(root.join(file)) {
             Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
             _ => {}
@@ -523,8 +516,8 @@ impl TreeActor {
                 Ok(Arc::default())
             })?
             .into_iter()
-                .map(|(tree, t)| (tree, t.shape))
-                .collect();
+            .map(|(tree, t)| (tree, t.shape))
+            .collect();
             objects_through(shapes, &checkpoint, &frames[1..upto])?
         } else {
             at_built.objects.clone()
@@ -1001,7 +994,11 @@ impl TreeActor {
     /// save takes it too.
     fn rebase_built(&mut self) {
         for (tree, object, map) in self.history.take_maps() {
-            let Some(saved) = self.trees.get_mut(&tree).and_then(|t| t.bytes.get_mut(&object)) else {
+            let Some(saved) = self
+                .trees
+                .get_mut(&tree)
+                .and_then(|t| t.bytes.get_mut(&object))
+            else {
                 continue;
             };
             if map.step().is_none() || saved.step() != map.step() || saved.len() != map.len() {

@@ -134,9 +134,10 @@ pub(in crate::tree_actor) fn read_trees(
     for id in refs::branches(pointers)?.into_keys() {
         let mut tree = Tree::default();
         let objects = objects.get(&id).unwrap_or(&none);
-        tree.install(tree_snapshot(repo, pointers, objects, id)?, |_, object, path| {
-            map(id, object, path)
-        })?;
+        tree.install(
+            tree_snapshot(repo, pointers, objects, id)?,
+            |_, object, path| map(id, object, path),
+        )?;
         trees.insert(id, tree);
     }
     if !trees.contains_key(&TreeId::Root) {

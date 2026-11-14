@@ -110,9 +110,9 @@ impl TreeActor {
         let live = |record: &Record| match &record.entry {
             Entry::Call { handle, .. } => handles.contains_key(handle),
             // A page write that names no tree is kept, never dropped.
-            Entry::PageWrite { tree, object, .. } => tree
-                .parse()
-                .map_or(true, |tree| pages::holds(pages, tree, *object, record.seq.get())),
+            Entry::PageWrite { tree, object, .. } => tree.parse().map_or(true, |tree| {
+                pages::holds(pages, tree, *object, record.seq.get())
+            }),
             _ => false,
         };
         let stats = self
