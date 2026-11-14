@@ -14,8 +14,9 @@ The code and the library/human docs win over all of these where they disagree; r
 
 ## State
 - Speed epic built (B0..B4, B3) and reviewed (`review/`); Fix 1 (3e9e1bc..fede47f) and Fix 2 (d7666ef and the
-  commit after it) applied the review. Figures at d7666ef (image run 43608163463): close_4k p50 1.23 / 0.74 ms,
-  50,000 creates in 43.5 / 18.8 s, history_1g 31.5 / 32.5 s, memory_1g +36 MiB; all bars met.
+  commits after it) applied the review. All bars met at f7149c4; close_4k and create follow the runner's CPU
+  (docs/performance.md): 0.66 to 1.90 ms p50 and 16 to 66 s for 50,000 creates on one commit. history_1g 31 to
+  42 s, memory_1g +36 MiB.
 - Residuals with plans, in `.claude/errata.md` ("speed fix 2"): frame relocation owned by the journal (coherence 3),
   `TreeActor` constructors crate-private (coherence 5), power-loss crossing compaction (P3-4), builder `owners`
   growth (P3-6), about 20 KiB of view memory per file. `planted/budget.json` is stale; only the owner may re-record it.

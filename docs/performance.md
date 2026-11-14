@@ -485,11 +485,19 @@ path stopped running git, with no change to the call path between several of
 them: the same code gave 0.66 ms and 1.25 ms on two runners (runs
 43595126271 and 43595132223), and 1.23 ms and 0.74 ms on the two jobs of
 this run. Its p99 of 137.9 ms in one run (commit f24ed4e) did not recur in
-the four runs since (2.5 to 4.0 ms). The report names each runner's CPU
-model and count (`host`) in later runs, so a move can be told from
-the runners'. `create` fell on both filesystems in this run; one code earlier
-gave 47 s and 76 s on two runners, so one run does not attribute the fall to
-this commit.
+the runs since (1.6 to 4.0 ms). The report names each runner's CPU (`host`),
+and one commit's four jobs (f7149c4, `image` runs 43610666059 and
+43610532396) show the spread is the runner's CPU, not the code or the
+filesystem:
+
+| Runner CPU (4 CPUs each) | Filesystem | `close_4k` p50 (p99) | 50,000 creates in |
+|---|---|---|---|
+| Intel Xeon 6975P-C | XFS | 0.66 ms (1.78 ms) | 16.1 s |
+| Intel Xeon 6975P-C | ext4 | 0.74 ms (1.57 ms) | 17.8 s |
+| Intel Xeon Platinum 8370C | XFS | 1.14 ms (2.51 ms) | 41.4 s |
+| Intel Xeon Platinum 8573C | ext4 | 1.90 ms (2.68 ms) | 65.8 s |
+
+Compare a figure across runs only on the same CPU.
 
 The 256 MiB row predates bounding `git cat-file`'s pack window; with it the
 1 GiB save's children peak at 66 MiB. Before, the same container's 256 MiB
