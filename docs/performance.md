@@ -418,6 +418,28 @@ All three meet their bars on both filesystems. The builder takes about
 builds measured the same (0.58 to 0.69 ms against 0.68 to 0.70 ms, 200 saves
 in a tree of 250 files), so the difference is the runners'.
 
+Then file maps and journal segments: no file's bytes are held in memory, a
+write costs its own bytes, and a close compares only what the open touched
+(docs/trees.md, "File maps"; `image` run 43587792812, commit f24ed4e, one
+observation each):
+
+| Workload | ext4 | XFS |
+|---|---|---|
+| `close_4k`, p50 (p99) | 1.42 ms (137.9 ms) | 0.91 ms (2.32 ms) |
+| `create`, created by the 300 s deadline | 50,000 in 97.7 s | 50,000 in 70.4 s |
+| `create`, `drain_s` | 126.3 s | 118.3 s |
+| `close_64m` | 0.40 s | 0.47 s |
+| `close_1g`, close and `stat` (total with the writes) | 5.44 s (5.85 s) | 5.75 s (6.05 s) |
+| `write_1g`, last 64 writes against a 1 MiB file's (ratio) | 0.40 ms against 0.59 ms (0.67) | 0.29 ms against 0.40 ms (0.72) |
+
+All meet their bars on both filesystems. `close_1g` is the fsync of the
+journal's gigabyte; nothing was copied forward (`carried_bytes` 0). Its history
+did not finish building within the 180 s the script waits on XFS; that run's
+ext4 `drain_s` was read from a metrics file older than the close and is not a
+figure (the script now waits for a newer one). The builder holds a saved file
+whole to align its lines, and on one 4-CPU container it held 6.1 GB while
+building a 1 GiB save.
+
 ## Performance budget
 
 The budget is

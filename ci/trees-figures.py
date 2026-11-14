@@ -305,10 +305,20 @@ def drain(metrics, cap):
     now, read from the metrics file the view rewrites; None past `cap`. A probe
     of a measurement, not a coordination."""
     start = time.monotonic()
-    now = history(metrics)
+    # The file is rewritten every 100 ms: a copy written before this call can
+    # predate the workload's last record, so the target comes from a newer one.
+    asked = time.time()
+
+    def fresh():
+        try:
+            return history(metrics) if os.stat(metrics).st_mtime > asked else None
+        except OSError:
+            return None
+
+    now = fresh()
     while now is None and time.monotonic() - start < cap:
         time.sleep(0.1)
-        now = history(metrics)
+        now = fresh()
     if now is None:
         return None
     target = now["appended"]
