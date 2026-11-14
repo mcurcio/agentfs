@@ -205,8 +205,9 @@ appends it and applies it to the saved state the views serve; it runs no git.
 
 ## History trails the files
 
-A builder thread makes each step's commits behind the call path, in batches. For a
-batch it makes every record through the last one appended durable (one fsync of the
+A builder thread makes each step's commits behind the call path, in batches of at
+most 256 steps, so a long backlog ends in a built event every batch. For a batch it
+makes every record through the last one appended durable (one fsync of the
 journal), reads them, replays each step on the trees as built (the same transitions
 the actor ran, then the line alignment), and feeds the commits to one
 `git fast-import`. It installs the batch in this order: the pack, then its index;

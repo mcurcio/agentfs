@@ -39,6 +39,10 @@ use crate::tree_actor::tree::{EventNumber, FileBytes, NameHistory, Tree, Version
 use crate::tree_actor::{Error, Result, TreeId, referee};
 use crate::tree_git::{RefUpdate, TreeGit};
 
+/// The most steps one batch builds: a batch's built event wakes the lag gate,
+/// so a long backlog is built in slices that each end in one.
+const MAX_BATCH_STEPS: usize = 256;
+
 /// The builder's own reader of the journal file: frames after its cursor,
 /// through the durable mark. It reopens the file after a compaction replaced
 /// it, skipping to the cursor.
@@ -82,16 +86,26 @@ impl JournalReader {
     }
 
     /// Frames after the cursor through `through` (at most the durable mark),
-    /// and where they end. The cursor moves only at [`JournalReader::advance`].
-    pub fn read(&mut self, through: RecordNo, generation: u64) -> Result<(Vec<Frame>, u64)> {
+    /// stopping after `max_steps` steps, and where they end. The cursor moves
+    /// only at [`JournalReader::advance`].
+    pub fn read(
+        &mut self,
+        through: RecordNo,
+        generation: u64,
+        max_steps: usize,
+    ) -> Result<(Vec<Frame>, u64)> {
         if generation != self.generation {
             self.reopen(generation)?;
         }
         let mut frames = Vec::new();
+        let mut steps = 0;
         let mut at = self.offset;
-        while let Some((frame, len)) = frame_at(&self.file, at, self.salt, through)? {
+        while steps < max_steps
+            && let Some((frame, len)) = frame_at(&self.file, at, self.salt, through)?
+        {
             at += len;
             if frame.0.seq > self.cursor {
+                steps += usize::from(matches!(frame.0.entry, Entry::Step { .. }));
                 frames.push(frame);
             }
         }
@@ -817,8 +831,22 @@ impl Builder {
         let generation = self.durability.generation();
         let (frames, offset) = self
             .reader
-            .read(through, generation)
+            .read(through, generation, MAX_BATCH_STEPS)
             .map_err(to_build_error)?;
+        // A batch cut at its step limit is built through its last record; the
+        // next batch follows at once, so built events (and the gate) keep coming.
+        let through = match frames.last() {
+            Some((record, _))
+                if frames
+                    .iter()
+                    .filter(|(r, _)| matches!(r.entry, Entry::Step { .. }))
+                    .count()
+                    >= MAX_BATCH_STEPS =>
+            {
+                record.seq
+            }
+            _ => through,
+        };
         let mut next = self.state.clone();
         let marks_path = self.root.join("build.marks");
         let repo = self.history.repo().clone();

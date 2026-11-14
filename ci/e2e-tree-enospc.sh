@@ -150,6 +150,11 @@ PY
   # A call waits at a call-path point; the builder's points are behind the call.
   [ "${4:-held}" != held ] || kill -0 "$client" || { echo 'rename returned before filesystem was filled' >&2; exit 1; }
   if ! wait "$client"; then cat "$work/rename.log" >&2; exit 1; fi
+  # The builder's point: keep the filesystem full until the builder, woken from
+  # the failpoint, has tried its copies.
+  if [ "${4:-held}" != held ]; then
+    for _ in $(seq 1 600); do grep -Fq 'tree CopyStale' "$log" && break; sleep .1; done
+  fi
   rm "$work/volume/filler"
   fusermount3 -u "$work/main"
   # Neither failure stops the actor.

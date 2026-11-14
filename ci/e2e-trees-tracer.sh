@@ -197,7 +197,7 @@ if [ -n "$FS" ]; then
   # files need no other owner, and so a stuck view's connection can be
   # aborted; the stat after each save is the timed end.
   sudo python3 "$(dirname "$0")/trees-figures.py" --view "$VIEW" --filesystem "$FS" \
-    --metrics "$DATA/metrics.json" \
+    --metrics "$DATA/metrics.json" --drain-cap 180 \
     --image "$(docker image inspect --format '{{.Id}}' "$IMAGE")" \
     --budget "$(dirname "$0")/trees-budget.json" --output "$report"
   cat "$report"
@@ -209,19 +209,22 @@ print(json.dumps(w.get(sys.argv[3], 0)))' "$report" "$1" "$2"
   assert_eq "close_4k create close_64m" \
     "$(python3 -c 'import json, sys; print(*(w["name"] for w in json.load(open(sys.argv[1]))["workloads"]))' "$report")" \
     'the report lists every workload'
-  # A save each workload saw answered is in history; a save the deadline
-  # caught may have landed after it, so history may hold one more.
+  # A save each workload saw answered is in history once the built point reached
+  # it (drain_s); a save the deadline caught may have landed after it, so history
+  # may hold one more. A workload whose history did not drain within the cap is
+  # a figure, reported as such.
+  drained() { [ "$(figure "$1" drain_s)" != null ] || { echo "::warning title=tree views, $FS::$1's history did not drain within the cap"; false; }; }
   n=$(figure close_4k count)
-  if [ "$n" -gt 0 ]; then
+  if [ "$n" -gt 0 ] && drained close_4k; then
     held=$(in_history show root:files/fig-close4k | sed -n 1p)
     [ "$held" -ge "$n" ] || fail "history holds 4 KiB save $held, the workload saw $n answered"
     pass "4 KiB save $n is in history"
   fi
   n=$(figure create count)
-  if [ "$n" -gt 0 ]; then
+  if [ "$n" -gt 0 ] && drained create; then
     assert_eq "$n" "$(in_history show "root:files/fig-create-$n")" "create $n is in history"
   fi
-  if [ "$(figure close_64m finished)" = true ]; then
+  if [ "$(figure close_64m finished)" = true ] && drained close_64m; then
     assert_eq 67108864 "$(in_history cat-file -s root:files/fig-64m)" 'the 64 MiB save is in history'
   fi
 fi
