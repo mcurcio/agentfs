@@ -236,10 +236,9 @@ pub(in crate::tree_actor) fn calls_for_close(
 }
 
 /// The calls a recorded save applies: the open's own calls merged with its
-/// page-write pieces, each resolved in the file's page writes. The builder
-/// and recovery's replay both run it, then [`FileMap::apply`]; `None` when a
+/// page-write pieces, each resolved in the file's page writes; `None` when a
 /// piece names no run of its record.
-pub(in crate::tree_actor) fn recorded_close_calls(
+fn recorded_close_calls(
     own: &[(u64, Call, FramePos)],
     writes: &[(u64, Run)],
     pieces: &[PagePiece],
@@ -255,6 +254,32 @@ pub(in crate::tree_actor) fn recorded_close_calls(
         resolved.push((record, resolve_piece(&runs, piece.offset, piece.len)?));
     }
     Some(close_calls(own, &resolved))
+}
+
+/// A recorded save replayed: the map it leaves and the calls it applied.
+pub(in crate::tree_actor) type Replayed = (FileMap, Vec<(Call, FramePos)>);
+
+/// What a recorded save leaves on `saved`: [`recorded_close_calls`] applied
+/// by [`FileMap::apply`], with those calls. The builder and recovery's replay
+/// both run it; `None` when a piece names no run of its record.
+///
+/// # Errors
+///
+/// A call that does not apply.
+pub(in crate::tree_actor) fn replay_close(
+    saved: &FileMap,
+    own: &[(u64, Call, FramePos)],
+    writes: &[(u64, Run)],
+    pieces: &[PagePiece],
+) -> Result<Option<Replayed>> {
+    let Some(calls) = recorded_close_calls(own, writes, pieces) else {
+        return Ok(None);
+    };
+    let mut map = saved.clone();
+    for (call, pos) in &calls {
+        map.apply(call, pos)?;
+    }
+    Ok(Some((map, calls)))
 }
 
 /// A piece of a page write, from its runs: the part of the run that holds

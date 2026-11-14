@@ -42,7 +42,7 @@ use crate::tree_actor::stages::{Timer, Which};
 use crate::tree_actor::tree::{
     EventNumber, FileBytes, Lines, MergeFileIdentity, NameHistory, Tree, Versions,
 };
-use crate::tree_actor::{Error, Result, TreeId, referee};
+use crate::tree_actor::{Error, Result, TreeId};
 use crate::tree_git::{RefUpdate, TreeGit};
 use crate::tree_reconcile::{Window, histogram_files};
 
@@ -540,17 +540,13 @@ impl BuildState {
                         pieces: digest,
                     } => {
                         let writes = self.pages.get(&(id, open.object));
-                        let calls = pages::recorded_close_calls(
+                        let (map, calls) = pages::replay_close(
+                            t.bytes.get(&open.object).ok_or_else(|| disagrees(seq))?,
                             &open.calls,
                             writes.map_or(&[][..], Vec::as_slice),
                             pieces,
-                        )
+                        )?
                         .ok_or_else(|| disagrees(seq))?;
-                        let mut map =
-                            (**t.bytes.get(&open.object).ok_or_else(|| disagrees(seq))?).clone();
-                        for (call, pos) in &calls {
-                            map.apply(call, pos)?;
-                        }
                         if map.len() != *len || map.digest(&own_keys(&calls)) != *digest {
                             return Err(disagrees(seq));
                         }
@@ -943,7 +939,7 @@ impl Builder {
     fn batch(&mut self) -> std::result::Result<(), BuildError> {
         crate::failpoints::hit("tree.build_before_batch")?;
         let started = std::time::Instant::now();
-        let checkpointed = self.history.state().checkpointed;
+        let checkpointed = self.history.checkpointed_through();
         if self
             .log
             .first()
@@ -974,6 +970,9 @@ impl Builder {
             }
             _ => through,
         };
+        // No record after the checkpoint names a step it covers
+        // (`TreeActor::resolve_compacted`): those heads are never read again.
+        self.state.heads.retain(|step, _| *step > checkpointed);
         let mut next = self.state.clone();
         let marks_path = self.root.join("build.marks");
         let repo = self.history.repo().clone();
@@ -1180,47 +1179,4 @@ pub(in crate::tree_actor) fn copy_all(
         checked_out.insert(tree, checkout(repo, root, tree, head, None)?);
     }
     Ok(checked_out)
-}
-
-/// A take's changed files and names, as its record holds them.
-pub(in crate::tree_actor) type TakeDiff = (
-    Vec<(
-        crate::tree_actor::tree::MergeFileIdentity,
-        Option<referee::File>,
-    )>,
-    Vec<(
-        crate::tree_actor::tree::MergeFileIdentity,
-        Option<NameHistory>,
-    )>,
-);
-
-/// A take's decision on a built tree as a record: the files and names that
-/// differ from `mine`.
-pub(in crate::tree_actor) fn take_diff(
-    mine: &referee::Snapshot,
-    decided: &referee::Snapshot,
-) -> TakeDiff {
-    let mut files = Vec::new();
-    for (id, file) in &decided.files {
-        if mine.files.get(id) != Some(file) {
-            files.push((*id, Some(file.clone())));
-        }
-    }
-    for id in mine.files.keys() {
-        if !decided.files.contains_key(id) {
-            files.push((*id, None));
-        }
-    }
-    let mut names = Vec::new();
-    for (id, history) in &decided.names {
-        if mine.names.get(id) != Some(history) {
-            names.push((*id, Some(history.clone())));
-        }
-    }
-    for id in mine.names.keys() {
-        if !decided.names.contains_key(id) {
-            names.push((*id, None));
-        }
-    }
-    (files, names)
 }

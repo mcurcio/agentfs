@@ -11,6 +11,10 @@ import statistics
 import subprocess
 import threading
 import time
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from tree_git_read import fanned  # noqa: E402
 
 
 class Report:
@@ -424,8 +428,7 @@ def line_map_storage(root, state, count, metrics, timeout, report, name, sample_
         raise RuntimeError('expected %d save commits, found %d' % (count, len(commits)))
     # The file's line map: lines/<aa>/<bb>/<name>, [identity, line map] (docs/trees.md).
     name = 'line-map-measure'
-    digest = hashlib.sha1(b'blob %d\0' % len(name) + name.encode()).hexdigest()
-    expressions = ''.join('%s:lines/%s/%s/%s\n' % (c, digest[:2], digest[2:4], name) for c in commits)
+    expressions = ''.join('%s:lines/%s\n' % (c, fanned(name)) for c in commits)
     records = git(repo, 'cat-file', '--batch-check=%(objectname) %(objecttype) %(objectsize) %(objectsize:disk)',
                   input_data=expressions).splitlines()
     if len(records) != count:

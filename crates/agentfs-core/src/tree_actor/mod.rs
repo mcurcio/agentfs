@@ -70,7 +70,21 @@ const INITIALIZING: &str = "initializing";
 /// The state area's lease file, under the state area: an exclusive `flock`
 /// held by the serving process and shared with its tree Git children, which
 /// outlive a killed holder until their parent-death signal lands.
-pub const LOCK: &str = "actor.lock";
+const LOCK: &str = "actor.lock";
+
+/// Returns once no process holds the state area's lease: taking it, blocking,
+/// is the event that every holder is gone (a killed server's Git children
+/// included); it is released at once. What a harness waits on before it
+/// reopens a volume whose server it killed.
+///
+/// # Errors
+///
+/// A failed open or lock of the lease file.
+pub fn wait_for_lease(root: &Path) -> io::Result<()> {
+    let file = FileLock::open(&root.join(LOCK))?;
+    drop(FileLock::wait(file, Mode::Exclusive)?);
+    Ok(())
+}
 type Result<T> = std::result::Result<T, Error>;
 
 #[derive(Debug, thiserror::Error)]
@@ -449,11 +463,13 @@ impl TreeActor {
     }
 
     /// Recovers a volume and serves it. Reads `format` and `volume` before any
-    /// write. Recovery builds history through the journal's last record, then
-    /// closes every abandoned write-open exactly once, as its own writer with
-    /// its journaled pod context; `service` is carried by the Sync commits this
-    /// run writes. It takes no queue entries: the view's worker or a caller
-    /// runs [`TreeActor::progress`].
+    /// write. Recovery serves the trees as built with every later record
+    /// replayed on them, never waiting for history (the builder catches up
+    /// behind); then closes every abandoned write-open exactly once, as its
+    /// own writer with its journaled pod context, and makes every record
+    /// durable. `service` is carried by the Sync commits this run writes. It
+    /// takes no queue entries: the view's worker or a caller runs
+    /// [`TreeActor::progress`].
     ///
     /// # Errors
     ///
@@ -1242,7 +1258,8 @@ mod tests {
         assert!(compacted.len() < whole.len());
         same_fold(&fold(&compacted).unwrap(), &folded);
 
-        // What follows lands on either start and adds up the same.
+        // What follows lands on the checkpoint: its records name the values
+        // the checkpoint covers as oids, so they fold only on top of it.
         v.write(held, 0, b"held-2", false).unwrap();
         v.write(shared, 0, b"!", true).unwrap();
         let again = v.write_open(ROOT, "again", &w, true).unwrap();
@@ -1252,8 +1269,11 @@ mod tests {
         while v.progress().unwrap() {}
         let now = frames_of(tmp.path());
         whole.extend_from_slice(&now[compacted.len()..]);
+        assert!(
+            matches!(fold(&whole), Err(Error::PointerMoved { .. })),
+            "a record after the checkpoint never folds on the journal before it"
+        );
         let folded = fold(&now).unwrap();
-        same_fold(&fold(&whole).unwrap(), &folded);
         assert!(!folded.opens[&anonymous].open.anonymous);
         assert_eq!(folded.opens[&held].calls.len(), 2);
         assert_eq!(folded.pointers, v.pointers);
@@ -1459,8 +1479,7 @@ mod tests {
             .parse()
             .unwrap();
         // The killed process's git children share its lease until they die.
-        let lease = FileLock::open(&tmp.path().join(LOCK)).unwrap();
-        drop(FileLock::wait(lease, Mode::Exclusive).unwrap());
+        wait_for_lease(tmp.path()).unwrap();
         let frames = frames_of(tmp.path());
         assert!(
             matches!(frames[0].0.entry, Entry::Checkpoint { .. }),

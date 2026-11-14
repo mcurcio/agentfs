@@ -61,16 +61,12 @@ impl Pointers<Target> {
     ///
     /// [`Error::PointerMoved`] when a change's `old` differs from the pointer
     /// now: a bug in the step that made it, caught before its record. A step's
-    /// value and an oid are not compared: one names what the other was built
-    /// as across a compaction, which only the built log can tell.
+    /// value and an oid never match: a value read before a compaction is
+    /// named as the oid it was built as before this check
+    /// (`TreeActor::resolve_compacted`).
     pub fn check_targets(&self, changes: &[PointerChange]) -> Result<()> {
         for change in changes {
-            let same = match (self.0.get(&change.name), change.old.as_ref()) {
-                (Some(Target::Oid(_)), Some(Target::Step(_)))
-                | (Some(Target::Step(_)), Some(Target::Oid(_))) => true,
-                (now, old) => now == old,
-            };
-            if !same {
+            if self.0.get(&change.name) != change.old.as_ref() {
                 return Err(Error::PointerMoved {
                     name: change.name.clone(),
                 });
@@ -179,6 +175,14 @@ mod tests {
             new: None,
             old: Some(step(1)),
         }];
+        // The oid step 1 was built as is not step 1 here: the step's
+        // record must name what it read.
+        let built = [PointerChange {
+            name: "refs/heads/root".into(),
+            new: None,
+            old: Some(Target::Oid(oid(1).to_string())),
+        }];
+        assert!(pointers.check_targets(&built).is_err());
         pointers.check_targets(&delete).unwrap();
         pointers.apply_targets(&delete);
         assert_eq!(pointers.get("refs/heads/root"), None);

@@ -31,6 +31,7 @@
 # hosts), and sudo (for the lazy unmount on the host).
 
 . "$(dirname "$0")/lib.sh"
+. "$(dirname "$0")/tree-git-test-lib.sh"
 
 IMAGE=${AGENTFS_IMAGE:-agentfs:ci}
 WORKLOAD_IMAGE=debian:trixie-slim@sha256:a29215f6a35e51e22adffa17f89e9d2ef06214e64a2bad10d765c46aea49f11f
@@ -98,9 +99,6 @@ in_state() { # program args...
 init() { # volume
   in_state agentfs --state /data/state trees init --volume "$1"
 }
-# A file's place in a commit, <aa>/<bb>/<name>: aa and bb are hex digits 1-2
-# and 3-4 of `git hash-object --stdin` of the name (docs/trees.md).
-fanned() { local hex; hex=$(printf %s "$1" | git hash-object --stdin); echo "${hex:0:2}/${hex:2:2}/$1"; }
 in_history() { # git args...
   in_state git --git-dir /data/state/history.git "$@"
 }
@@ -159,7 +157,7 @@ mount_view
 # The close's release reaches agentfs after close(2) returns; the view takes
 # requests in order, so the read that follows sees the release done.
 workload -- 'printf hello > /agentfs/root/a.txt && cat /agentfs/root/a.txt >/dev/null'
-built "root:files/$(fanned a.txt)" hello 'the root holds a.txt once its close returned and history is built'
+built "root:files/$(tree_git_fanned a.txt)" hello 'the root holds a.txt once its close returned and history is built'
 pass 'the root holds a.txt once its close returned and history is built'
 message=$(in_history log -1 --format=%B root)
 assert_contains "$message" 'Agentfs-Volume: t' 'the save names its volume'
@@ -182,10 +180,9 @@ sudo umount -l "$VIEW"
 answered=$(wc -l <"$RECEIPTS/answered")
 [ "$answered" -ge 20 ] || fail "only $answered writes answered"
 mount_view
-missing=$(docker run --rm -i -v "$DATA:/data" --entrypoint sh "$IMAGE" -c '
+missing=$(docker run --rm -i -v "$DATA:/data" --entrypoint bash "$IMAGE" -c "$(declare -f tree_git_fanned)"'
   while read -r n; do
-    hex=$(printf %s "f$n" | git hash-object --stdin)
-    path=files/$(echo "$hex" | cut -c1-2)/$(echo "$hex" | cut -c3-4)/f$n
+    path=files/$(tree_git_fanned "f$n")
     [ "$(git --git-dir /data/state/history.git show "root:$path" 2>/dev/null)" = "$n" ] || echo "f$n"
   done' <"$RECEIPTS/answered")
 assert_eq '' "$missing" "all $answered answered writes are in history"
@@ -193,7 +190,7 @@ unnamed=$(in_history log --format='%H%n%(trailers:key=Agentfs-Pod,valueonly)%n--
   awk '/^--$/ { if (!pod) print sha; sha = ""; pod = 0; next } !sha { sha = $0; next } $0 == "pod-t" { pod = 1 }')
 assert_eq '' "$unnamed" 'every commit on the root carries its pod trailers'
 workload -- 'printf again > /agentfs/root/after.txt && cat /agentfs/root/after.txt >/dev/null'
-built "root:files/$(fanned after.txt)" again 'a restarted workload writes through the new mount'
+built "root:files/$(tree_git_fanned after.txt)" again 'a restarted workload writes through the new mount'
 pass 'a restarted workload writes through the new mount'
 has_trailers "$(in_history log -1 --format=%B root)" 'its save'
 
@@ -224,19 +221,19 @@ print(json.dumps(w.get(sys.argv[3], 0)))' "$report" "$1" "$2"
   drained() { [ "$(figure "$1" drain_s)" != null ] || { echo "::warning title=tree views, $FS::$1's history did not drain within the cap"; false; }; }
   n=$(figure close_4k count)
   if [ "$n" -gt 0 ] && drained close_4k; then
-    held=$(in_history show "root:files/$(fanned fig-close4k)" | sed -n 1p)
+    held=$(in_history show "root:files/$(tree_git_fanned fig-close4k)" | sed -n 1p)
     [ "$held" -ge "$n" ] || fail "history holds 4 KiB save $held, the workload saw $n answered"
     pass "4 KiB save $n is in history"
   fi
   n=$(figure create count)
   if [ "$n" -gt 0 ] && drained create; then
-    assert_eq "$n" "$(in_history show "root:files/$(fanned "fig-create-$n")")" "create $n is in history"
+    assert_eq "$n" "$(in_history show "root:files/$(tree_git_fanned "fig-create-$n")")" "create $n is in history"
   fi
   if [ "$(figure close_64m finished)" = true ] && drained close_64m; then
-    assert_eq 67108864 "$(in_history cat-file -s "root:files/$(fanned fig-64m)")" 'the 64 MiB save is in history'
+    assert_eq 67108864 "$(in_history cat-file -s "root:files/$(tree_git_fanned fig-64m)")" 'the 64 MiB save is in history'
   fi
   if [ "$(figure close_1g finished)" = true ] && drained close_1g; then
-    assert_eq 1073741824 "$(in_history cat-file -s "root:files/$(fanned fig-1g)")" 'the 1 GiB save is in history'
+    assert_eq 1073741824 "$(in_history cat-file -s "root:files/$(tree_git_fanned fig-1g)")" 'the 1 GiB save is in history'
   fi
 fi
 pass 'tree views tracer'

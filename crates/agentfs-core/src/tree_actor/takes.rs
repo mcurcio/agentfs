@@ -11,7 +11,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Instant;
 
-use super::history::builder::take_diff;
 use super::history::built::{BuiltSnapshot, History};
 use super::history::take::{self as plan, Decided};
 use super::history::{self, refs};
@@ -314,15 +313,15 @@ impl TreeActor {
 
     /// Appends the take if no step after `decided_at` touched a key of
     /// `reads`, no write-open holds a key of `writes`, the entry is still
-    /// queued, and (a fast-forward) the head has not moved. A sync whose
-    /// upstream moved since its decision lands as the take at its decision
-    /// would: the upstream's later saves queue later entries.
-    /// has not moved; enqueues its moves under this record's number.
+    /// queued, and (a fast-forward) the head has not moved; enqueues its
+    /// moves under this record's number. A sync whose upstream moved since
+    /// its decision lands as the take at its decision would: the upstream's
+    /// later saves queue later entries.
     ///
     /// # Errors
     ///
-    /// A failed record ([`Error::Stopped`], an I/O error) or a take whose
-    /// shape does not apply.
+    /// A failed record ([`Error::Stopped`], an I/O error), a failed read of
+    /// the tree's write-opens, or a take whose shape does not apply.
     pub(in crate::tree_actor) fn land(
         &mut self,
         decision: Decision,
@@ -330,7 +329,7 @@ impl TreeActor {
         let tree = decision.tree;
         self.tree(tree)?;
         self.run_pending_closes(tree, None)?;
-        if let Some(refused) = self.refusal(&decision) {
+        if let Some(refused) = self.refusal(&decision)? {
             return Ok(Err(refused));
         }
         let event = self.record_take(decision)?;
@@ -338,10 +337,12 @@ impl TreeActor {
         Ok(Ok(event))
     }
 
-    fn refusal(&self, decision: &Decision) -> Option<Refused> {
+    /// Why `decision` may not land now, or `None`. A failed read of the
+    /// tree's write-opens is an error, never a land.
+    fn refusal(&self, decision: &Decision) -> Result<Option<Refused>> {
         let tree = decision.tree;
         if self.pointers.get(&decision.entry).is_none() {
-            return Some(Refused::EntryGone);
+            return Ok(Some(Refused::EntryGone));
         }
         let changed = self.touched.get(&tree).is_some_and(|touched| {
             decision
@@ -350,17 +351,17 @@ impl TreeActor {
                 .any(|key| touched.get(key).is_some_and(|at| *at > decision.decided_at))
         });
         if changed {
-            return Some(Refused::FilesChanged);
+            return Ok(Some(Refused::FilesChanged));
         }
-        let held = self.take_inputs(tree).ok()?.held;
+        let held = self.take_inputs(tree)?.held;
         if !decision.writes.is_disjoint(&held) {
-            return Some(Refused::Held);
+            return Ok(Some(Refused::Held));
         }
         let fast_forward = matches!(decision.take.head, TakeHead::FastForward { .. });
         if fast_forward && self.head_step(tree) != decision.head_at {
-            return Some(Refused::HeadMoved);
+            return Ok(Some(Refused::HeadMoved));
         }
-        None
+        Ok(None)
     }
 
     /// Drops touched keys no later decision reads: those at or before the
@@ -474,6 +475,49 @@ impl TreeActor {
 
 /// The touched keys of each tree, each key's last touching step.
 pub(in crate::tree_actor) type Touched = BTreeMap<TreeId, BTreeMap<Key, RecordNo>>;
+
+/// A take's changed files and names, as its record holds them.
+pub(in crate::tree_actor) type TakeDiff = (
+    Vec<(
+        crate::tree_actor::tree::MergeFileIdentity,
+        Option<referee::File>,
+    )>,
+    Vec<(
+        crate::tree_actor::tree::MergeFileIdentity,
+        Option<crate::tree_actor::tree::NameHistory>,
+    )>,
+);
+
+/// A take's decision on a built tree as a record: the files and names that
+/// differ from `mine`.
+pub(in crate::tree_actor) fn take_diff(
+    mine: &referee::Snapshot,
+    decided: &referee::Snapshot,
+) -> TakeDiff {
+    let mut files = Vec::new();
+    for (id, file) in &decided.files {
+        if mine.files.get(id) != Some(file) {
+            files.push((*id, Some(file.clone())));
+        }
+    }
+    for id in mine.files.keys() {
+        if !decided.files.contains_key(id) {
+            files.push((*id, None));
+        }
+    }
+    let mut names = Vec::new();
+    for (id, history) in &decided.names {
+        if mine.names.get(id) != Some(history) {
+            names.push((*id, Some(history.clone())));
+        }
+    }
+    for id in mine.names.keys() {
+        if !decided.names.contains_key(id) {
+            names.push((*id, None));
+        }
+    }
+    (files, names)
+}
 
 #[cfg(test)]
 mod tests {

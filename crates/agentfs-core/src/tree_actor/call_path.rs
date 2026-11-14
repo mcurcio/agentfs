@@ -274,6 +274,13 @@ impl Recording {
         self.history.wait_epoch(seen)
     }
 
+    /// [`Recording::wait_for_work`], returning by `at_most` at the latest: what
+    /// a metrics export waits on, so each built or failed event is written
+    /// at once and the gauges between events still move.
+    pub fn wait_for_event_or(&self, seen: u64, at_most: std::time::Duration) -> u64 {
+        self.history.wait_epoch_for(seen, at_most)
+    }
+
     /// Waits until every record appended so far is built: what a test, the
     /// CLI or a replay calls before it reads history.
     ///
@@ -433,10 +440,10 @@ mod tests {
         let through = rec.durability.appended();
         let (waited, wait) = mpsc::channel();
         let history = rec.history.clone();
-        let asked = history.state().requests;
+        let asked = history.requests();
         std::thread::spawn(move || waited.send(history.wait_built(through)).unwrap());
         // The waiter asks under History's lock and waits in the same hold.
-        while rec.history.state().requests == asked {
+        while rec.history.requests() == asked {
             std::thread::yield_now();
         }
         release.send(()).unwrap();

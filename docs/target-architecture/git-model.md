@@ -188,11 +188,13 @@ frame that a later good frame's mark shows was durable refuses to serve (`docs/r
 other bad frame starts a torn tail, saved aside. How a view host appends without a path into the state area is
 parked (views.md).
 
-Compaction replaces the file with one checkpoint (every pointer, the fork upstreams, the live opens, the next number)
-and then, unchanged, the calls and page writes of files with a live write-open: a file held open pins only its own
-calls, never other files' saves. It is due at a step once the file reaches `max(64 MiB, twice its length after the last
-compaction)`, and always runs at the end of a recovery. A checkpoint's pointers are built values, so compaction
-waits for the first step after the builder has caught up, and the checkpoint's redo start is the built point (§12).
+Compaction writes one checkpoint (every pointer, the fork upstreams, the live opens, the next number) at the start of
+a new segment and drops the segments before it that the builder has read, keeping the calls and page writes of files
+with a live write-open: a file held open pins only its own calls, never other files' saves. It is due once the
+segments reach `max(64 MiB, twice their length after the last compaction)`, and runs at open when every step is
+built. A checkpoint's pointers are built values, so compaction waits for the first record after the builder has built
+every step; calls after the last step never hold it back, since the checkpoint holds them. Its redo start is its last
+record (§12).
 
 Every commit carries three trailers. The model's exact format (the `#` comments are not part of it):
 
@@ -805,7 +807,8 @@ past the built point; takes are decided on built snapshots and landed only if wh
 
 A failure in 1 to 3 changes nothing: the call returns its errno and the actor keeps serving (§3). A close stays pending,
 its handle still counting as open, and saves first at the next step in its tree and at restart. A take stays queued for
-the next event. Only a failed `fsync` or rollback of the journal stops the actor: the file cannot be trusted then.
+the next event. Only a failed `fsync` (a flush's or a compaction's) or rollback of the journal stops the actor: the file
+cannot be trusted then.
 
 A failed batch is not a recording failure (AGENTS principle 5): nothing reachable changed, and it is retried. A failed
 copy after the built-log entry is logged, and the next batch rebuilds the refs whole and redoes the checkouts.
@@ -816,7 +819,7 @@ copy after the built-log entry is logged, and the next batch rebuilds the refs w
 | queue take | the decision (head move, changed files and names, collisions); the branch, the entry deleted, the entries the move causes, the collision ref | the entry is still there only if the take has no record: take it again; collision refs are named by the losing commit, so a rerun makes the same names |
 | transaction begin, commit, rollback | not built | every `txn/*` branch is deleted, its index dropped and its deferred calls applied: a crash rolls back every open transaction (A13; R5.3's pick, §9). A commit's ref transaction either happened (the branch is gone, the transaction ended) or did not (rolled back) |
 | fork create | the branch and its upstream | `config` is rewritten from the journal before any git command; a dropped fork is not built |
-| journal | each call appended before it returns, durable once a flush covers it (§3) | every frame is read, durable or not; a hole a later frame's mark shows was durable refuses to serve, any other bad tail is saved aside and discarded. Before any view serves the tree, each open with no record closing it is saved as its close would be, exactly once, and every record is flushed |
+| journal | each call appended before it returns, durable once a flush covers it (§3) | every frame is read, durable or not; a hole a later frame's mark shows was durable, or valid records that end before the built log's point, refuse to serve; any other bad tail is saved aside and discarded. Before any view serves the tree, each open with no record closing it is saved as its close would be, exactly once, and every record is flushed |
 | refs, `config`, `HEAD` | a copy of the records | `config` and `HEAD` are rewritten, then `refs/` and `packed-refs` are removed and every pointer is created in one `update-ref --stdin`, on every open, so this path always runs. A live `git` reader may see a step half copied |
 | locks | none: held in memory by the actor | none survive: open files ended with their clients and are saved from the journal (row above); an unfinished take has no record, so its entry is still there and is taken again. In the model a take is one step, so none is unfinished at a crash |
 | object table | each tree's object per file identity, in the checkpoint as of its built point; the steps after it move them | rebuilt from the checkpoint and the steps' own transitions, never by file identity; an open whose object no path names is replayed as an orphan (saves nothing, `OrphanDropped`) |

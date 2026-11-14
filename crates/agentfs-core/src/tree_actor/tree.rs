@@ -47,8 +47,8 @@ impl fmt::Display for EventNumber {
     }
 }
 
-/// One line version as history stores it, `"<event>:<index>"` (metadata.json,
-/// `Agentfs-Collisions`): the event that wrote it and its place among that event's new versions,
+/// One line version as history stores it, `"<event>:<index>"` (a line map's
+/// runs, `Agentfs-Collisions`): the event that wrote it and its place among that event's new versions,
 /// from 1. A line's identity is its first version.
 ///
 /// It **orders as its text** (`"10:1" < "9:1"`): the order a map of text keys wrote `ancestors`

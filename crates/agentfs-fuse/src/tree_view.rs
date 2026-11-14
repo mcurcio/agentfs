@@ -144,10 +144,18 @@ pub fn serve_with_metrics(
         let actor = Arc::clone(&actor);
         let stop = Arc::clone(&stop);
         std::thread::spawn(move || -> io::Result<()> {
+            // Each file carries `seq`, one more than the last: a reader that
+            // saw `n` knows a file numbered `n + 2` was read after it.
+            let (mut seq, mut epoch) = (0_u64, 0);
             loop {
                 let last = stop.load(Ordering::Acquire);
+                seq += 1;
                 let metrics = actor.actor().map_err(io::Error::other)?.metrics();
-                let bytes = serde_json::to_vec(&metrics)?;
+                let mut written = serde_json::to_value(&metrics)?;
+                if let Some(fields) = written.as_object_mut() {
+                    fields.insert("seq".into(), seq.into());
+                }
+                let bytes = serde_json::to_vec(&written)?;
                 let temporary =
                     output.with_extension(format!("metrics-{}.tmp", std::process::id()));
                 std::fs::write(&temporary, bytes)?;
@@ -155,7 +163,8 @@ pub fn serve_with_metrics(
                 if last {
                     return Ok(());
                 }
-                std::thread::sleep(Duration::from_millis(100));
+                // At each built or failed event, and every 100 ms between.
+                epoch = actor.wait_for_event_or(epoch, Duration::from_millis(100));
             }
         })
     });

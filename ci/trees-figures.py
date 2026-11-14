@@ -28,9 +28,8 @@ commit, not only the close.
                seconds, or the bytes written by the deadline
     close_1g   one 1 GiB file written the same way, then closed and statted:
                the seconds of the close and stat alone (the benchmark's dirty
-               bigclose), the total, the bytes the journal copied forward
-               meanwhile (`carried_bytes`, from --metrics), or the bytes
-               written by the deadline. Before it, 32 files of 1 MiB written
+               bigclose), the total, or the bytes written by the
+               deadline. Before it, 32 files of 1 MiB written
                in one write each: `write_1g` is the median of the big file's
                last 64 writes over the median of those (a write costs its own
                bytes at any file size)
@@ -201,7 +200,6 @@ def close_1g(view, run, _target, metrics=None):
             assert written == MIB, "one write of 1 MiB"
         finally:
             os.close(fd)
-    before = metrics_of(metrics)
     path = os.path.join(view, "fig-1g")
     writes = []
     start = time.monotonic()
@@ -231,10 +229,6 @@ def close_1g(view, run, _target, metrics=None):
     first = statistics.median(small)
     run.extra["write_1g"] = {"p50_last_ms": ms(last), "p50_1m_ms": ms(first),
                              "ratio": round(last / first, 3) if first else None}
-    after = metrics_of(metrics)
-    if before is not None and after is not None:
-        run.extra["carried_bytes"] = (after.get("journal_carried_bytes", 0)
-                                      - before.get("journal_carried_bytes", 0))
     run.finished = True
 
 
@@ -297,43 +291,86 @@ def missed(figure, budget, filesystem):
     return found is None or found > limit
 
 
-def history(metrics):
-    """The view's history metrics, or None while the file is not written yet."""
-    try:
-        with open(metrics) as file:
-            return json.load(file).get("history")
-    except (OSError, ValueError):
-        return None
+class Renames:
+    """The view's metrics file being renamed into place, as inotify events
+    (the view writes it at each built or failed event and every 100 ms
+    between): a reader waits on the event, never on a timer."""
+    IN_MOVED_TO = 0x80
+
+    def __init__(self, path):
+        import ctypes
+        self.libc = ctypes.CDLL(None, use_errno=True)
+        self.name = os.path.basename(path).encode()
+        self.fd = self.libc.inotify_init1(os.O_CLOEXEC)
+        if self.fd < 0:
+            raise OSError(ctypes.get_errno(), "inotify_init1")
+        directory = os.path.dirname(os.path.abspath(path)).encode()
+        if self.libc.inotify_add_watch(self.fd, directory, self.IN_MOVED_TO) < 0:
+            raise OSError(ctypes.get_errno(), "inotify_add_watch")
+
+    def wait(self, until):
+        """Returns once the file was renamed into place again, or False at
+        the monotonic time `until` (a bound on a hang)."""
+        import select
+        import struct
+        while True:
+            left = until - time.monotonic()
+            if left <= 0:
+                return False
+            ready, _, _ = select.select([self.fd], [], [], left)
+            if not ready:
+                return False
+            events = os.read(self.fd, 65536)
+            at = 0
+            while at < len(events):
+                _, _, _, size = struct.unpack_from("iIII", events, at)
+                name = events[at + 16:at + 16 + size].rstrip(b"\0")
+                at += 16 + size
+                if name == self.name:
+                    return True
+
+    def close(self):
+        os.close(self.fd)
 
 
 def drain(metrics, cap):
     """Seconds from now until the built point reaches the record last appended
-    now, read from the metrics file the view rewrites; None past `cap`. A probe
-    of a measurement, not a coordination."""
+    now, read from the metrics file the view rewrites; None past `cap`. Each
+    file carries `seq`: one numbered two past the file read now was written
+    from a snapshot taken after now, so its `appended` covers the workload."""
     start = time.monotonic()
-    # The file is rewritten every 100 ms: a copy written before this call can
-    # predate the workload's last record, so the target comes from a newer one.
-    asked = time.time()
+    until = start + cap
+    renames = Renames(metrics)
+    try:
+        seen = metrics_of(metrics)
+        floor = (seen or {}).get("seq", 0) + 2
+        target = None
+        while True:
+            now = metrics_of(metrics)
+            if now and now.get("seq", 0) >= floor:
+                if target is None:
+                    target = now["history"]["appended"]
+                if now["history"]["built_through"] >= target:
+                    return round(time.monotonic() - start, 3)
+            if not renames.wait(until):
+                return None
+    finally:
+        renames.close()
 
-    def fresh():
-        try:
-            return history(metrics) if os.stat(metrics).st_mtime > asked else None
-        except OSError:
-            return None
 
-    now = fresh()
-    while now is None and time.monotonic() - start < cap:
-        time.sleep(0.1)
-        now = fresh()
-    if now is None:
-        return None
-    target = now["appended"]
-    while time.monotonic() - start < cap:
-        built = history(metrics)
-        if built and built["built_through"] >= target:
-            return round(time.monotonic() - start, 3)
-        time.sleep(0.1)
-    return None
+def host():
+    """The runner's CPU model and count: runners of one label differ, and a
+    figure is compared across runs only with this beside it."""
+    model = None
+    try:
+        with open("/proc/cpuinfo") as cpuinfo:
+            for line in cpuinfo:
+                if line.startswith("model name"):
+                    model = line.split(":", 1)[1].strip()
+                    break
+    except OSError:
+        pass
+    return {"cpu": model, "cpus": os.cpu_count()}
 
 
 def proc_kib(pid, field):
@@ -464,7 +501,7 @@ def main():
                       flush=True)
 
     report = {"build": args.build, "filesystem": args.filesystem, "image": args.image,
-              "connection_aborted": aborted, "workloads": workloads}
+              "host": host(), "connection_aborted": aborted, "workloads": workloads}
     temporary = args.output + ".tmp"
     with open(temporary, "w") as out:
         json.dump(report, out, indent=2)

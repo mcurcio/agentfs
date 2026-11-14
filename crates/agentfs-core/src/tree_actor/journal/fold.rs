@@ -265,17 +265,14 @@ impl Replay {
                 let writes = self.pages.get(&(id, object));
                 let saved = match outcome {
                     SaveOutcome::Saved { .. } if self.maps => {
-                        let calls = pages::recorded_close_calls(
+                        let t = self.trees.get(&id).ok_or(Error::Format)?;
+                        let (mut map, _) = pages::replay_close(
+                            t.bytes.get(&object).ok_or(Error::Format)?,
                             &calls,
                             writes.map_or(&[][..], Vec::as_slice),
                             pieces,
-                        )
+                        )?
                         .ok_or(Error::Format)?;
-                        let t = self.trees.get(&id).ok_or(Error::Format)?;
-                        let mut map = t.bytes.get(&object).ok_or(Error::Format)?.clone();
-                        for (call, pos) in &calls {
-                            map.apply(call, pos)?;
-                        }
                         map.saved_at(RecordNo::new(seq));
                         Some(map)
                     }

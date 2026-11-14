@@ -8,7 +8,6 @@ use std::path::Path;
 use agentfs_contracts::name::{VolumeName, WriterLabel};
 use agentfs_contracts::pod::{PodContext, WriterAt};
 use agentfs_contracts::volume::{VolumeId, VolumeIdentity};
-use agentfs_core::file_lock::{FileLock, Mode};
 use agentfs_core::tree_actor::TreeActor;
 
 /// The identity [`new_actor`] gives: `test`, with a fixed id.
@@ -35,8 +34,7 @@ pub fn reopen(dir: &Path) -> TreeActor {
 /// lease can outlive the process a test waited for. Taking the lease, blocking,
 /// is the event that every holder is gone; it is released at once.
 pub fn wait_for_lease(dir: &Path) {
-    let file = FileLock::open(&dir.join(agentfs_core::tree_actor::LOCK)).expect("opens the lease");
-    drop(FileLock::wait(file, Mode::Exclusive).expect("takes the lease"));
+    agentfs_core::tree_actor::wait_for_lease(dir).expect("takes the lease");
 }
 
 /// [`reopen`] after the process that served the volume was killed.

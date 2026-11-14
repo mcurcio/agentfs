@@ -58,7 +58,7 @@ views with `fusermount3 -u PATH`; unmounting every view ends the process.
 | `--sandbox DIR` | Also mount a fork in DIR (a new one, or `--fork`) |
 | `--fork fork/N` | Reuse this fork (needs `--sandbox`); `root` is refused |
 | `--writer LABEL`, `--sandbox-writer LABEL` | The root's and the fork's writer label (default `root-client`, `sandbox-client`). A label is trusted, not an authenticated identity |
-| `--metrics-output FILE` | Write counters, the journal's length, each stage's runs, time and git children, and the objects stored, every 100 ms and at unmount |
+| `--metrics-output FILE` | Write counters, the journal's length, each stage's runs, time and git children, and the objects stored, at each built or failed event, at least every 100 ms, and at unmount; each file carries `seq`, one more each time |
 
 Mount points must be empty, separate and outside the state area. Metrics never take
 part in ordering. Every flag is in [configuration](configuration.md#flags-and-environment).
@@ -417,13 +417,13 @@ What the tree views do not support:
   runs `git diff`, which holds both versions; a take expands its files' line
   maps line by line and reads the files it merges, through `git cat-file` for
   any over 8 MiB; and a line map keeps every deleted line, so maps of files
-  edited often grow with their edits. In one debug-build run on CI, before
-  file maps and these line maps, a 100 MiB file took 339 s until both views
-  converged; 10,000 one-line saves took 2,561 s.
-- **A call can wait.** A client call on a mount waits behind a take that has begun.
-  A file held open can hold other files' decisions back for minutes in the
-  measurements above. Only the mounted cases and the held-log measurement cover the
-  wait; the model replays do not.
+  edited often grow with their edits.
+- **A call can wait.** A call that starts new work in a tree waits while that
+  tree's lag is over the limit, or while an overdue compaction waits for the
+  builder (see [History trails the files](#history-trails-the-files)); every call
+  waits while a take lands under the actor's lock. A take waits for its entry's
+  write-opens to close, so a file held open holds the takes that write it. The
+  model replays do not cover the waits; the mounted cases do.
 - **Shared mappings have a gap.** A write through an `mmap` is saved as a page. A
   mapped store that writes the bytes its page last held records nothing, so a
   descriptor write made meanwhile stands where Linux would keep the store: with a

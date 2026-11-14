@@ -607,12 +607,13 @@ mod tests {
     }
 
     #[test]
-    fn a_write_into_a_large_file_adds_one_piece_and_copies_nothing() {
+    /// A write splits the piece it lands in; the bytes copied are counted in
+    /// `tree_stages`' `bytes_copied_per_write_is_its_own`, which runs alone.
+    fn a_write_into_a_large_file_adds_one_piece() {
         let mut frames = Scratch::new();
         let mut map = FileMap::empty();
         map.apply(&Call::Truncate(1 << 30), &frames.add(b""))
             .unwrap();
-        let before = stages::Stages::current().bytes_copied;
         map.apply(
             &Call::Write {
                 offset: 1 << 29,
@@ -622,9 +623,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(map.pieces.len(), 3);
-        // Nothing read: the process-wide counter may move for other tests,
-        // so read the piece itself.
-        let _ = before;
         let mut four = [0; 4];
         map.read(1 << 29, &mut four).unwrap();
         assert_eq!(&four, b"abcd");

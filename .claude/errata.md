@@ -989,3 +989,55 @@ Not blocking; the suite is built and green. Findings about the brief and the doc
    (checked by event number, not by walking chains). Every map the library writes satisfies it.
 8. **A `wip(trees):` commit (24ee3f5) is in the branch's history** (a checkpoint pushed to `wip/speed-fix1` before
    the slice was green); it was not rewritten.
+
+## 2026-11-14, speed fix 2 (fix-plan.md "Fix 2"): what was built instead, residuals, and the errata's state
+
+1. **P2-2, built instead:** compaction waits for every *step* built and the builder past the oldest segment, not for
+   history built through every record. Records after the last step (calls, opens, page writes) are what the checkpoint
+   holds, so its redo start stays its last record; segments are dropped only up to the builder's built point (it reads
+   them). The segment that holds both dead records and calls after the builder's last batch waits for the next step
+   (bounded: one segment). Once the journal is twice its due length with steps unbuilt, the lag gate holds every
+   tree's new work until the builder catches up (an engineering choice, not the owner's). Steps replayed at open now
+   count in the gate (Fix 1's hand-over).
+2. **`check_targets` strict:** `compaction_keeps_the_fold`'s "lands on either start" premise was false after R3a:
+   records after a checkpoint name the values it covers as oids, so they fold only on top of it. The test now shows
+   the mixed fold is refused.
+3. **Coherence 3 (frame relocation owned by the journal), residual.** A live open's frames carried forward are still
+   read through the old segment's `Arc` until the open closes (the actor's `Handle.calls`, page runs, the builder's
+   opens), so a carried segment's space returns only then, and a statvfs test would fail today. Plan: `FramePos` names
+   (record, offset) with the save digest keyed by it (not by segment and byte), the journal keeps a relocation table
+   that `drop_behind` fills, and the actor and the builder (at its next batch, through History) rewrite their
+   positions from it; then a space test by statvfs. About half a day; it touches the digest, so the model-free
+   conformance replays are the check.
+4. **Coherence 5 (`TreeActor::{create, open, take_next}` crate-private), residual.** Open's durability is now one
+   path (`TreeActor::serve` makes recovered records durable), but the integration tests (about 1,000 call sites), the
+   conformance library and `tree_view` construct `TreeActor` directly. Plan: a test-support handle over `Recording`
+   that locks per call, the conformance `Library` on `Recording`, then `pub(crate)`; `TreeActor::take_next` and
+   `progress` go, `Recording::take_next` stays the one take path. B2b rest's item 9 stays with it.
+5. **P3-4 (power-loss-trees never crosses rollover or compaction), residual.** CI-only (`power-loss.yml` after
+   landing). Plan: a 70 MiB file in `ci/power-loss-trees.sh` before the marks, a mark kind for it in
+   `power-loss-trees-check.sh`; the 512 MiB data image holds it. This is also the true detector of probe A (an fsync
+   left out of the checkpoint); locally probe A is killed by a per-thread fsync count (`Segment::sync`).
+6. **P3-6, partly:** the builder drops heads the checkpoint covers; `owners` (each direct save's commit) still grows
+   with saves and is cloned and resolved whole each batch. Plan: share it as an `Arc` and resolve only the batch's
+   new entries.
+7. **New finding, not fixed:** the view holds about 1 GiB for the 50,000 files the `create` workload leaves (about
+   20 KiB a file across the actor's and the builder's trees; `memory_1g`'s `peak_mib` 1,106 at d7666ef). Not in the
+   plan; a memory-per-file figure is the first step.
+8. **Suspicions settled:** `whole` lost at restart is correct (the trees are read from the built heads, which match);
+   a hole in an early segment no longer reads every later segment into memory; a checkpoint's objects map passes the
+   96 MiB frame limit only at millions of files (the compaction then fails before its checkpoint every time: a
+   residual, not fixed).
+9. **Not run locally:** `ci/check-tree-git.sh` (needs the pinned git 2.47.3); the tracer and figures (docker and a
+   loop filesystem; the inotify wait was run against a simulated writer only).
+
+Errata state, after this fix (each speed-epic entry the handoff listed as open):
+- 2026-11-13 M1 S2: closed by B0 (c22a820, c828899): deadlines, no extrapolation, the guarantee string.
+- 2026-11-14 B3 dispatched before B2b: closed (B2b bb0d7b6..3b1ed68, B4 c2bf696, B3 f24ed4e landed in order).
+- 2026-11-14 B2b: closed; the lag formula and the kernel's directory lock are in docs/trees.md.
+- 2026-11-14 B2b rest: 1-8 closed (built, documented); 9 stays with item 4 above.
+- 2026-11-14 B4: 1-5 and 7 closed; 6 closed by this fix (`one_object_one_file` from the library's objects and a
+  mount's inodes); 8 (a snapshot read is one blob per file) stays: a follow-up if takes on large trees prove slow.
+- 2026-11-14 B3: 7 closed by d7666ef (no descriptor per file); 9 closed by this fix (`carried_bytes` dropped from the
+  figures); the rest closed (built, documented).
+- 2026-11-14 speed fix 1: 6 closed by this fix (`check_targets` strict); 8 stays (a pushed commit is never rewritten).

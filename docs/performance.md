@@ -322,8 +322,7 @@ warning and never fails the job.
 | `close_1g` | Writes a 1 GiB file in 1 MiB blocks; times the close and `stat` alone | 300 s | The engine's close of a dirty 1 GiB file: 12 s on ext4, 8 s on XFS |
 | `write_1g` | The same run's last 64 writes, against 32 files of 1 MiB written in one write each | 300 s | Median within 1.5 times a 1 MiB file's write |
 
-`close_1g` also reports its total, and `carried_bytes`: what compaction copied
-forward from the close's start to its end (read from `--metrics-output`).
+`close_1g` also reports its total.
 
 - **Each save is timed to its record.** Every timed save ends with a
   `stat` of the file. The view saves a file on the kernel's release, which
@@ -332,7 +331,9 @@ forward from the close's start to its end (read from `--metrics-output`).
   recorded: the guarantee each figure carries is "saved before the view
   answers any later request; history built later". The builder makes the
   commits behind it, and each workload reports `drain_s`, the time from its
-  last save to the built point reaching it (from `--metrics-output`). While
+  last save to the built point reaching it (from `--metrics-output`, read at
+  each rename of the file into place, its `seq` showing a snapshot taken
+  after the workload ended). While
   the lag gate holds the root's creates (docs/trees.md), `create` runs at
   the builder's pace.
 - **Each workload has its own deadline.** A workload reports what it
@@ -429,8 +430,7 @@ observation each):
 | `close_1g`, close and `stat` (total with the writes) | 5.44 s (5.85 s) | 5.75 s (6.05 s) |
 | `write_1g`, last 64 writes against a 1 MiB file's (ratio) | 0.40 ms against 0.59 ms (0.67) | 0.29 ms against 0.40 ms (0.72) |
 
-`close_1g` is the fsync of the journal's gigabyte; nothing was copied forward
-(`carried_bytes` 0). That run did not measure the 1 GiB save's history: it had
+`close_1g` is the fsync of the journal's gigabyte. That run did not measure the 1 GiB save's history: it had
 not finished building within the 180 s the script waits on XFS, and the
 builder then held a saved file whole (about 6 GB for a 1 GiB save).
 
@@ -462,11 +462,34 @@ On CI (`image` run 43600260345, commit c187fe3, one observation each):
 | `close_64m` | 0.11 s | 0.10 s |
 
 All meet their bars. The view's own memory before the 1 GiB workload was
-about 1 GiB, held for the 50,000 files the `create` workload left (their
-maps and descriptors), which is not this figure. `close_4k` and `create`
-moved from the earlier run's 0.68 and 0.58 ms and 52 and 53 s; the same code
-gave 0.66 ms and 47 s on one runner and 1.25 ms and 76 s on another (runs
-43595126271 and 43595132223), so they are within the runners' spread.
+about 1 GiB, held for the 50,000 files the `create` workload left (about
+20 KiB a file in the actor's and the builder's trees), which is not this
+figure.
+
+Then file maps without descriptors, compaction that waits only for steps,
+and one gate thread per volume (`image` run 43608163463, commit d7666ef, one
+observation each):
+
+| Workload | ext4 | XFS |
+|---|---|---|
+| `close_4k`, p50 (p99) | 1.23 ms (2.55 ms) | 0.74 ms (1.98 ms) |
+| `create`, 50,000 created in | 43.5 s | 18.8 s |
+| `create`, `drain_s` | 116.8 s | 110.7 s |
+| `close_64m` | 0.39 s | 0.11 s |
+| `close_1g`, close and `stat` (total with the writes) | 5.43 s (5.87 s) | 3.47 s (3.84 s) |
+| `history_1g` | 31.5 s | 32.5 s |
+| `memory_1g` | 35.8 MiB | 36.2 MiB |
+
+`close_4k`'s p50 has ranged from 0.46 to 1.50 ms across runs since the call
+path stopped running git, with no change to the call path between several of
+them: the same code gave 0.66 ms and 1.25 ms on two runners (runs
+43595126271 and 43595132223), and 1.23 ms and 0.74 ms on the two jobs of
+this run. Its p99 of 137.9 ms in one run (commit f24ed4e) did not recur in
+the four runs since (2.5 to 4.0 ms). The report names each runner's CPU
+model and count (`host`) in later runs, so a move can be told from
+the runners'. `create` fell on both filesystems in this run; one code earlier
+gave 47 s and 76 s on two runners, so one run does not attribute the fall to
+this commit.
 
 The 256 MiB row predates bounding `git cat-file`'s pack window; with it the
 1 GiB save's children peak at 66 MiB. Before, the same container's 256 MiB

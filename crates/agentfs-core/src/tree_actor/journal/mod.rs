@@ -823,11 +823,14 @@ impl Journal {
                 .map_or(global, |(_, offset, _)| global + offset);
             return Err(Error::CorruptJournal(at));
         }
-        if let Some((index, offset, mut rest)) = hole {
-            for (_, path) in &listed[index + 1..] {
-                rest.extend_from_slice(&fs::read(path)?);
+        if let Some((index, offset, rest)) = hole {
+            // One segment in memory at a time: frames never span two.
+            let later = &listed[index + 1..];
+            let mut durable = durable_past(&rest[1..], salt, covered);
+            for (_, path) in later {
+                durable = durable || durable_past(&fs::read(path)?, salt, covered);
             }
-            if (index == 0 && offset == 0) || durable_past(&rest[1..], salt, covered) {
+            if (index == 0 && offset == 0) || durable {
                 return Err(Error::CorruptJournal(global + offset));
             }
             let mut saved = OpenOptions::new()
@@ -836,12 +839,12 @@ impl Journal {
                 .mode(0o600)
                 .open(dir.join("torn"))?;
             saved.write_all(&rest)?;
+            let mut torn = rest.len() as u64;
+            for (_, path) in later {
+                torn += io::copy(&mut File::open(path)?, &mut saved)?;
+            }
             saved.sync_all()?;
-            eprintln!(
-                "tree JournalTail: {} bytes at {}",
-                rest.len(),
-                global + offset
-            );
+            eprintln!("tree JournalTail: {torn} bytes at {}", global + offset);
             let (segment, length) = &segments[index];
             segment.file().set_len(*length)?;
             segment.file().sync_all()?;

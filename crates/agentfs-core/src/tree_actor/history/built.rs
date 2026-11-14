@@ -125,41 +125,41 @@ pub(in crate::tree_actor) struct Inner {
 }
 
 /// History's state, behind one lock. Every change notifies `changed`.
-pub(in crate::tree_actor) struct State {
+struct State {
     /// The built point.
-    pub(in crate::tree_actor) built: RecordNo,
+    built: RecordNo,
     /// Every pointer as built.
-    pub(in crate::tree_actor) pointers: Arc<Pointers>,
+    pointers: Arc<Pointers>,
     /// Each direct save's commit, by its step: what a sync asks of a save.
-    pub(in crate::tree_actor) owners: Arc<BTreeMap<EventNumber, Oid>>,
+    owners: Arc<BTreeMap<EventNumber, Oid>>,
     /// Each tree's object numbers as built.
-    pub(in crate::tree_actor) objects: Arc<BuiltObjects>,
-    pub(in crate::tree_actor) failed: Option<BuildError>,
+    objects: Arc<BuiltObjects>,
+    failed: Option<BuildError>,
     /// The request count the failed batch started at: a wait asked after it
     /// waits for the retry.
-    pub(in crate::tree_actor) failed_at: u64,
+    failed_at: u64,
     /// The highest record the builder is asked to build through.
-    pub(in crate::tree_actor) wanted: RecordNo,
+    wanted: RecordNo,
     /// Bumped at each request: a failed builder retries at the next one.
-    pub(in crate::tree_actor) requests: u64,
+    requests: u64,
     /// Bumped at each built or failed event.
-    pub(in crate::tree_actor) epoch: u64,
+    epoch: u64,
     /// When the first step past the built point was appended.
-    pub(in crate::tree_actor) oldest_unbuilt: Option<Instant>,
+    oldest_unbuilt: Option<Instant>,
     /// Steps appended past the built point, with when each was appended.
-    pub(in crate::tree_actor) unbuilt: std::collections::VecDeque<(RecordNo, Instant)>,
+    unbuilt: std::collections::VecDeque<(RecordNo, Instant)>,
     /// The volume is shutting down: build what is wanted, then stop.
-    pub(in crate::tree_actor) stopping: bool,
+    stopping: bool,
     /// The builder has exited.
-    pub(in crate::tree_actor) stopped: bool,
+    stopped: bool,
     /// Each tree's lag and the builder's rates.
-    pub(in crate::tree_actor) gate: super::lag::LagGate,
+    gate: super::lag::LagGate,
     /// The journal's last checkpoint's redo start: built-log entries at or
     /// before it name nothing a restart reads.
-    pub(in crate::tree_actor) checkpointed: RecordNo,
+    checkpointed: RecordNo,
     /// Built files' maps the actor has not taken yet, in the order built:
     /// each save, create and take, and each map rebased onto its checkout.
-    pub(in crate::tree_actor) maps: Vec<(TreeId, u64, FileMap)>,
+    maps: Vec<(TreeId, u64, FileMap)>,
     /// Gated calls waiting for their tree's lag to fall, in arrival order:
     /// the one gate thread answers them ([`History::serve_gate`]).
     gated: Vec<(TreeId, Then)>,
@@ -274,7 +274,7 @@ impl History {
         }
     }
 
-    pub(in crate::tree_actor) fn state(&self) -> MutexGuard<'_, State> {
+    fn state(&self) -> MutexGuard<'_, State> {
         // Every holder leaves the state whole: a poisoned lock is still sound.
         self.inner
             .state
@@ -296,6 +296,19 @@ impl History {
     /// The store, for the builder and the copies it makes.
     pub(in crate::tree_actor) fn repo(&self) -> &TreeGit {
         &self.inner.repo
+    }
+
+    /// The last checkpoint's redo start: built-log entries at or before it
+    /// name nothing a restart reads.
+    pub(in crate::tree_actor) fn checkpointed_through(&self) -> RecordNo {
+        self.state().checkpointed
+    }
+
+    /// How many times the builder was asked: a test's sign that a waiter
+    /// has asked and waits.
+    #[cfg(all(test, feature = "failpoints"))]
+    pub(in crate::tree_actor) fn requests(&self) -> u64 {
+        self.state().requests
     }
 
     /// A checkpoint whose redo start is `built` is durable: the builder may
@@ -449,6 +462,26 @@ impl History {
         let mut state = self.state();
         while state.epoch <= seen && !state.stopped {
             state = self.wait(state);
+        }
+        state.epoch
+    }
+
+    /// [`History::wait_epoch`], returning by `at_most` at the latest: an
+    /// export that must also show what changes between events.
+    pub(in crate::tree_actor) fn wait_epoch_for(&self, seen: u64, at_most: Duration) -> u64 {
+        let deadline = Instant::now() + at_most;
+        let mut state = self.state();
+        while state.epoch <= seen && !state.stopped {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            state = self
+                .inner
+                .changed
+                .wait_timeout(state, left)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
         }
         state.epoch
     }

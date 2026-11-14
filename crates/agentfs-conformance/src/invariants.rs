@@ -518,8 +518,26 @@ impl Invariants {
         Ok(())
     }
 
+    /// One object, one file: no two names of a tree share an object (the
+    /// real system's numbering, never history's, which names none).
+    fn one_object_one_file<T: crate::Objects>(t: &T, id: TreeId) -> Result<(), String> {
+        let mut held: BTreeMap<u64, String> = BTreeMap::new();
+        for (path, object) in t.objects(id).map_err(|e| e.to_string())? {
+            if let Some(other) = held.insert(object, path.clone()) {
+                return Err(format!(
+                    "one_object_one_file: {id:?}'s {other} and {path} are one object {object}"
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// After one recorded call. A failed call changed nothing this oracle follows.
-    pub fn after<T: TreeCalls>(&mut self, t: &T, r: &Recorded) -> Result<(), String> {
+    pub fn after<T: TreeCalls + crate::Objects>(
+        &mut self,
+        t: &T,
+        r: &Recorded,
+    ) -> Result<(), String> {
         if r.failed.is_none() {
             self.note_call(r)?;
         }
@@ -533,6 +551,7 @@ impl Invariants {
             let head = self.head(id)?;
             Self::lines_whole(id, &head)?;
             self.bytes_match(t, id, &head)?;
+            Self::one_object_one_file(t, id)?;
             if let Some(tree) = self.trees.get_mut(&id) {
                 tree.identities = Self::identities(&head);
             }
@@ -743,6 +762,27 @@ mod tests {
             let error = judge(&wrong).unwrap_err();
             assert!(error.contains("Agentfs-Pod"), "{error}");
         }
+    }
+
+    /// Objects by path, for `one_object_one_file`.
+    struct Numbered(Vec<(String, u64)>);
+
+    impl crate::Objects for Numbered {
+        fn objects(&self, _: TreeId) -> Result<Vec<(String, u64)>, CallError> {
+            Ok(self.0.clone())
+        }
+    }
+
+    #[test]
+    fn one_object_one_file_refuses_two_names_of_one_object() {
+        let distinct = Numbered(vec![("a".into(), 3), ("b".into(), 4)]);
+        assert_eq!(
+            Invariants::one_object_one_file(&distinct, TreeId::ROOT),
+            Ok(())
+        );
+        let shared = Numbered(vec![("a".into(), 3), ("b".into(), 3)]);
+        let error = Invariants::one_object_one_file(&shared, TreeId::ROOT).unwrap_err();
+        assert!(error.contains("one_object_one_file"), "{error}");
     }
 
     /// What [`Invariants::drained`] reads of the trees; the other calls never run here.

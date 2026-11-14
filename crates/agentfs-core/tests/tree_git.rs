@@ -347,14 +347,14 @@ fn rebuild_refs_replaces_everything_with_what_it_is_given() {
     std::fs::write(path.join("refs/heads/root.lock"), b"stale").unwrap();
     repo.rebuild_refs(&[
         update("refs/heads/root", Some(tip), None),
-        update("refs/agentfs/objects/root", Some(blob), None),
+        update("refs/queue/root/2", Some(blob), None),
     ])
     .unwrap();
     assert_eq!(
         repo.list_refs("refs/").unwrap(),
         vec![
-            ("refs/agentfs/objects/root".to_owned(), blob),
             ("refs/heads/root".to_owned(), tip),
+            ("refs/queue/root/2".to_owned(), blob),
         ]
     );
     assert!(!path.join("packed-refs").exists());

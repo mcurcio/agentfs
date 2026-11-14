@@ -9,7 +9,6 @@
 
 use crate::engine_names::EngineNames;
 use crate::library::{fail, seed};
-use agentfs_core::file_lock::{FileLock, Mode};
 use agentfs_core::tree_actor::TreeId as EngineTree;
 use agentfs_model::calls::{CallError, Caller, Took, TreeCalls, TreeId};
 use std::collections::{BTreeMap, VecDeque};
@@ -420,9 +419,8 @@ impl TreeCalls for Mounted {
             // Its tree Git children share its lease and die of their
             // parent-death signal after it: taking the lease, blocking, is
             // the event that every holder is gone.
-            let lease = FileLock::open(&self.state.join(agentfs_core::tree_actor::LOCK))
+            agentfs_core::tree_actor::wait_for_lease(&self.state)
                 .map_err(|e| io_fail("lease", &e))?;
-            drop(FileLock::wait(lease, Mode::Exclusive).map_err(|e| io_fail("lease", &e))?);
         }
         for (fd, _) in std::mem::take(&mut self.opens) {
             // SAFETY: an open this harness holds; its connection is gone, so the
@@ -451,5 +449,19 @@ impl TreeCalls for Mounted {
         }
         paths.sort();
         Ok(paths)
+    }
+}
+
+impl crate::Objects for Mounted {
+    /// Each file's inode: the view numbers a file's object `object + 2`.
+    fn objects(&self, t: TreeId) -> Result<Vec<(String, u64)>, CallError> {
+        use std::os::unix::fs::MetadataExt;
+        let mut objects = Vec::new();
+        for path in self.paths(t)? {
+            let meta = std::fs::symlink_metadata(self.root(t).join(&path))
+                .map_err(|e| io_fail("stat", &e))?;
+            objects.push((path, meta.ino()));
+        }
+        Ok(objects)
     }
 }

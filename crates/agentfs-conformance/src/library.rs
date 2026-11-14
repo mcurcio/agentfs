@@ -238,3 +238,15 @@ impl TreeCalls for Library {
         Ok(paths)
     }
 }
+
+impl crate::Objects for Library {
+    fn objects(&self, t: TreeId) -> Result<Vec<(String, u64)>, CallError> {
+        Ok(self
+            .v()?
+            .files(self.names.name(t)?)
+            .map_err(fail)?
+            .into_iter()
+            .map(|(path, object, _)| (path, object))
+            .collect())
+    }
+}

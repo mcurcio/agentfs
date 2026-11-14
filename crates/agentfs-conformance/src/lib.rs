@@ -32,9 +32,19 @@ use agentfs_model::world::{ModelHistory, Policies, TreeNames, World};
 use invariants::Invariants;
 use std::path::{Path, PathBuf};
 
+/// Each file's object as the real system numbers it, by path: the library's
+/// object, a mount's inode. What `one_object_one_file` reads, since history
+/// names no object.
+pub trait Objects {
+    fn objects(
+        &self,
+        t: agentfs_model::calls::TreeId,
+    ) -> Result<Vec<(String, u64)>, agentfs_model::calls::CallError>;
+}
+
 /// The trace against `t`, recorded into `sink`, with its history and the real
 /// system's invariants read from `repo`.
-fn against_real<T: TreeCalls>(
+fn against_real<T: TreeCalls + Objects>(
     trace: &[Recorded],
     t: &mut T,
     repo: &Path,
