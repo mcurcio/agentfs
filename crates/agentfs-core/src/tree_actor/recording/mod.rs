@@ -50,6 +50,24 @@ impl Call {
     }
 
     /// The call as a journal frame stores it: a JSON head and raw tail bytes.
+    /// The length `apply` leaves on bytes of length `len`, with the errors
+    /// `apply` returns: a call's errors depend only on lengths, so a check
+    /// costs nothing like the bytes.
+    pub(in crate::tree_actor) fn len_after(&self, len: usize) -> Result<usize> {
+        match self {
+            Self::Write {
+                offset,
+                bytes: data,
+            } => {
+                let offset = usize::try_from(*offset).map_err(|_| Error::TooLarge)?;
+                let end = offset.checked_add(data.len()).ok_or(Error::TooLarge)?;
+                Ok(if data.is_empty() { len } else { len.max(end) })
+            }
+            Self::Append(data) => len.checked_add(data.len()).ok_or(Error::TooLarge),
+            Self::Truncate(size) => usize::try_from(*size).map_err(|_| Error::TooLarge),
+        }
+    }
+
     pub(in crate::tree_actor) fn to_frame(&self) -> (CallHead, &[u8]) {
         match self {
             Self::Write { offset, bytes } => (
@@ -93,6 +111,9 @@ pub(in crate::tree_actor) struct Handle {
     pub(in crate::tree_actor) bytes: Vec<u8>,
     /// This open's calls, each with its journal number.
     pub(in crate::tree_actor) calls: Vec<(u64, Call)>,
+    /// The saved length the calls were last checked on, and the length they
+    /// leave on it (see `call`).
+    pub(in crate::tree_actor) replayed: Option<(usize, usize)>,
 }
 
 impl TreeActor {
@@ -110,6 +131,44 @@ impl TreeActor {
             .names
             .iter()
             .map(|(p, o)| (p.clone(), *o, tree.bytes[o].len()))
+            .collect())
+    }
+
+    /// The object `path` names: one lookup, as a view's LOOKUP needs.
+    pub fn object_at(&self, tree: TreeId, path: &str) -> Result<u64> {
+        self.tree(tree)?
+            .names
+            .get(path)
+            .copied()
+            .ok_or(Error::NotFound)
+    }
+
+    /// The first path, in path order, naming `object`: one lookup, as a view
+    /// needs for an inode.
+    pub fn path_of(&self, tree: TreeId, object: u64) -> Result<&str> {
+        self.tree(tree)?
+            .names
+            .of(object)
+            .next()
+            .ok_or(Error::NotFound)
+    }
+
+    /// At most `count` of the paths [`TreeActor::files`] lists, with their
+    /// objects, from the `skip`th: one batch of a directory listing, without
+    /// copying the rest.
+    pub fn files_from(
+        &self,
+        tree: TreeId,
+        skip: usize,
+        count: usize,
+    ) -> Result<Vec<(String, u64)>> {
+        Ok(self
+            .tree(tree)?
+            .names
+            .iter()
+            .skip(skip)
+            .take(count)
+            .map(|(path, object)| (path.clone(), *object))
             .collect())
     }
 
@@ -171,6 +230,7 @@ impl TreeActor {
                 object,
                 bytes,
                 calls: Vec::new(),
+                replayed: None,
             },
         );
         self.pages_opened(tree, object);
@@ -199,6 +259,7 @@ impl TreeActor {
                 object: handle,
                 bytes: Vec::new(),
                 calls: Vec::new(),
+                replayed: None,
             },
         );
         self.pages_opened(tree, handle);
@@ -266,22 +327,32 @@ impl TreeActor {
         self.call(handle, Call::Truncate(size))
     }
 
+    /// Checks the call on the writer's view and on the saved head with every
+    /// earlier call, journals it, then applies it to the view. Both checks are
+    /// on lengths, which are all `apply`'s errors depend on, and the head's
+    /// replay is redone only when the saved length moved: a call costs its own
+    /// bytes, not the file's or its open's.
     pub(in crate::tree_actor) fn call(&mut self, handle: u64, call: Call) -> Result<()> {
         let h = self.handles.get(&handle).ok_or(Error::NotFound)?;
-        // Check both the writer's view and replay on the head before journaling.
-        let mut bytes = h.bytes.clone();
-        call.apply(&mut bytes)?;
-        let mut replay = self.tree(h.tree)?.bytes[&h.object].to_vec();
-        for c in h.calls.iter().map(|(_, c)| c).chain(std::iter::once(&call)) {
-            c.apply(&mut replay)?;
-        }
+        call.len_after(h.bytes.len())?;
+        let saved = self.tree(h.tree)?.bytes[&h.object].len();
+        let replayed = match h.replayed {
+            Some((base, len)) if base == saved => len,
+            _ => h
+                .calls
+                .iter()
+                .try_fold(saved, |len, (_, c)| c.len_after(len))?,
+        };
+        let replayed = call.len_after(replayed)?;
         let (head, tail) = call.to_frame();
         let seq = self.journal_record(Entry::Call { handle, call: head }, tail)?;
         let h = self.handles.get_mut(&handle).ok_or(Error::NotFound)?;
-        h.bytes = bytes;
-        h.calls.push((seq, call.clone()));
+        call.apply(&mut h.bytes)?;
+        h.replayed = Some((saved, replayed));
         let (tree, object) = (h.tree, h.object);
         self.pages_note_call(tree, object, &call);
+        let h = self.handles.get_mut(&handle).ok_or(Error::NotFound)?;
+        h.calls.push((seq, call));
         Ok(())
     }
 
@@ -450,7 +521,7 @@ impl TreeActor {
                 t.lines[&h.object].align(&bytes, &mut next_id)?
             };
             t.lines.insert(h.object, Arc::new(lines));
-            t.bytes.insert(h.object, Arc::new(bytes));
+            t.bytes.insert(h.object, Arc::new(bytes.into()));
             self.build_save(h.tree, t, &h.by, Action::Direct, event, Some(handle))?
         } else {
             Draft::new(&h.by, h.tree, t)
@@ -523,4 +594,49 @@ pub(in crate::tree_actor) fn name(path: &str) -> Result<()> {
         return Err(Error::Name);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `call` checks on lengths alone: `len_after` must give `apply`'s length
+    /// and fail where it fails.
+    #[test]
+    fn len_after_is_the_length_apply_leaves() {
+        let calls = [
+            Call::Write {
+                offset: 3,
+                bytes: b"abc".to_vec(),
+            },
+            Call::Write {
+                offset: 40,
+                bytes: Vec::new(),
+            },
+            Call::Write {
+                offset: 0,
+                bytes: b"x".to_vec(),
+            },
+            Call::Append(b"tail".to_vec()),
+            Call::Truncate(2),
+            Call::Truncate(9),
+        ];
+        for len in [0, 1, 5, 12] {
+            for call in &calls {
+                let mut bytes = vec![b'.'; len];
+                call.apply(&mut bytes).unwrap();
+                assert_eq!(
+                    call.len_after(len).unwrap(),
+                    bytes.len(),
+                    "{call:?} on {len}"
+                );
+            }
+        }
+        let too_far = Call::Write {
+            offset: u64::MAX,
+            bytes: b"a".to_vec(),
+        };
+        assert!(too_far.len_after(0).is_err());
+        assert!(too_far.apply(&mut Vec::new()).is_err());
+    }
 }

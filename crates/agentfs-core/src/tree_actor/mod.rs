@@ -261,6 +261,9 @@ pub struct TreeActor {
     /// A copy failed: the next step rebuilds refs whole and redoes checkouts.
     copies_stale: bool,
     stale_checkouts: BTreeSet<TreeId>,
+    /// The files tree each checkout holds, so the next rewrites only what
+    /// differs. A checkout not here (never made, or cut short) is made whole.
+    checked_out: BTreeMap<TreeId, Oid>,
     compact_threshold: u64,
     metrics: Metrics,
     waiting_since: BTreeMap<String, Instant>,
@@ -390,6 +393,7 @@ impl TreeActor {
         repo.write_config(&refs::head(), &BTreeMap::new())?;
         let tree = repo.write_tree(&[])?;
         let head = repo.write_commit(tree, &[], &Message::Root { service }.render(identity)?)?;
+        repo.sync_objects()?;
         Journal::create(
             &root.join(JOURNAL),
             &Record {
@@ -489,6 +493,7 @@ impl TreeActor {
             stopped: false,
             copies_stale: false,
             stale_checkouts: BTreeSet::new(),
+            checked_out: BTreeMap::new(),
             compact_threshold: u64::MAX,
             metrics: Metrics::default(),
             waiting_since: BTreeMap::new(),
@@ -512,6 +517,7 @@ impl TreeActor {
                     // Nothing reads it: this handle closes before serving.
                     bytes: Vec::new(),
                     calls,
+                    replayed: None,
                 },
             );
             volume.pages_opened(open.tree, open.object);
@@ -530,7 +536,8 @@ impl TreeActor {
             volume.close(handle)?;
         }
         for tree in volume.trees() {
-            volume.checkout(tree)?;
+            let files = volume.checkout(tree, None)?;
+            volume.checked_out.insert(tree, files);
         }
         volume.metrics.queued = volume.pointers.under(refs::QUEUES).len() as u64;
         match volume.compact() {
@@ -782,6 +789,7 @@ impl TreeActor {
         let recorded = (|| -> Result<Draft> {
             crate::failpoints::hit("tree.before_objects")?;
             let draft = build(self, event)?;
+            self.repo.sync_objects()?;
             crate::failpoints::hit("tree.after_objects_durable")?;
             self.pointers.check(&draft.changes)?;
             self.journal_record(draft.entry(), &[])?;
@@ -849,6 +857,7 @@ impl TreeActor {
                     object: open.object,
                     bytes,
                     calls: Vec::new(),
+                    replayed: None,
                 },
             );
             self.pages_opened(open.tree, open.object);
@@ -892,9 +901,12 @@ impl TreeActor {
         crate::failpoints::hit("tree.after_ref_copy")?;
         if !self.stale_checkouts.is_empty() {
             crate::failpoints::hit("tree.before_checkout")?;
-            for name in &self.stale_checkouts {
+            let stale: Vec<TreeId> = self.stale_checkouts.iter().copied().collect();
+            for name in stale {
                 let _timer = Timer::start(Which::Checkout);
-                self.checkout(*name)?;
+                let previous = self.checked_out.remove(&name);
+                let files = self.checkout(name, previous)?;
+                self.checked_out.insert(name, files);
             }
             self.stale_checkouts.clear();
             crate::failpoints::hit("tree.after_checkout")?;

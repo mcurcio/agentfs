@@ -219,8 +219,9 @@ impl TreeActor {
     ) -> Result<Draft> {
         let _timer = Timer::start(Which::Objects);
         let mut files = Vec::new();
-        for (path, object) in &t.names {
-            let blob = self.repo.write_blob(&t.bytes[object])?;
+        for (path, object) in t.names.iter() {
+            // Only a file whose bytes this save changed is stored again.
+            let blob = t.bytes[object].blob(|bytes| Ok(self.repo.write_blob(bytes)?))?;
             files.push(TreeEntry {
                 name: path.as_bytes().to_vec(),
                 mode: 0o100644,
@@ -229,7 +230,7 @@ impl TreeActor {
         }
         let files = self.repo.write_tree(&files)?;
         let mut metadata = BTreeMap::new();
-        for (path, object) in &t.names {
+        for (path, object) in t.names.iter() {
             metadata.insert(path, (object, t.identities[object], &*t.lines[object]));
         }
         let blob = self.repo.write_blob(&serde_json::to_vec(&metadata)?)?;
@@ -288,7 +289,14 @@ impl TreeActor {
         Ok(destinations.len() as u64)
     }
 
-    pub(in crate::tree_actor) fn checkout(&self, tree: TreeId) -> Result<()> {
+    /// Makes `tree`'s checkout its branch's files, rewriting only what differs
+    /// from `previous`, the files tree the checkout holds now. Returns the files
+    /// tree it holds after.
+    pub(in crate::tree_actor) fn checkout(
+        &self,
+        tree: TreeId,
+        previous: Option<Oid>,
+    ) -> Result<Oid> {
         let dir = self.root.join("trees").join(tree.to_string());
         fs::create_dir_all(&dir)?;
         // Rebuild from the branch, never from intermediate in-memory state.
@@ -304,7 +312,7 @@ impl TreeActor {
         } else {
             commit.tree
         };
-        self.repo.checkout_tree(files, &dir)?;
-        Ok(())
+        self.repo.checkout_tree(files, &dir, previous)?;
+        Ok(files)
     }
 }

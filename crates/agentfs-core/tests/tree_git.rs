@@ -84,7 +84,7 @@ fn objects_references_and_private_checkout() {
     let checkout = temp.path().join("cache");
     std::fs::create_dir(&checkout).unwrap();
     std::fs::write(checkout.join("stale"), b"stale").unwrap();
-    repo.checkout_tree(envelope, &checkout).unwrap();
+    repo.checkout_tree(envelope, &checkout, None).unwrap();
     assert!(!checkout.join("stale").exists());
     assert_eq!(
         std::fs::read(checkout.join("metadata/state")).unwrap(),
@@ -98,6 +98,123 @@ fn objects_references_and_private_checkout() {
             .unwrap(),
         Some(merged)
     );
+}
+
+/// From a checkout of one tree to the next, only entries that differ are
+/// written: an unchanged file is not touched, a removed one goes, and a
+/// changed subtree is updated inside.
+#[test]
+fn an_incremental_checkout_rewrites_only_what_differs() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo = TreeGit::init(temp.path().join("repo.git")).unwrap();
+    let entry = |name: &str, mode: u32, oid: Oid| TreeEntry {
+        name: name.as_bytes().to_vec(),
+        mode,
+        oid,
+    };
+    let blob = |bytes: &[u8]| repo.write_blob(bytes).unwrap();
+    let inner = repo
+        .write_tree(&[entry("x", 0o100644, blob(b"x1"))])
+        .unwrap();
+    let before = repo
+        .write_tree(&[
+            entry("same", 0o100644, blob(b"same")),
+            entry("gone", 0o100644, blob(b"gone")),
+            entry("changed", 0o100644, blob(b"old")),
+            entry("dir", 0o40000, inner),
+        ])
+        .unwrap();
+    let inner = repo
+        .write_tree(&[entry("x", 0o100644, blob(b"x2"))])
+        .unwrap();
+    let after = repo
+        .write_tree(&[
+            entry("same", 0o100644, blob(b"same")),
+            entry("changed", 0o100644, blob(b"new")),
+            entry("added", 0o100755, blob(b"added")),
+            entry("dir", 0o40000, inner),
+        ])
+        .unwrap();
+    let checkout = temp.path().join("cache");
+    repo.checkout_tree(before, &checkout, None).unwrap();
+    // Not what the tree holds: only a rewrite of this entry would undo it.
+    std::fs::write(checkout.join("same"), b"untouched").unwrap();
+    repo.checkout_tree(after, &checkout, Some(before)).unwrap();
+    let read = |name: &str| std::fs::read(checkout.join(name)).unwrap();
+    assert_eq!(read("same"), b"untouched");
+    assert!(!checkout.join("gone").exists());
+    assert_eq!(read("changed"), b"new");
+    assert_eq!(read("added"), b"added");
+    assert_eq!(read("dir/x"), b"x2");
+    use std::os::unix::fs::PermissionsExt;
+    let mode = std::fs::metadata(checkout.join("added"))
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o755);
+    // A whole checkout of the same tree gives the same files.
+    let whole = temp.path().join("whole");
+    repo.checkout_tree(after, &whole, None).unwrap();
+    let mut names: Vec<_> = std::fs::read_dir(&checkout)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    let mut whole_names: Vec<_> = std::fs::read_dir(&whole)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    names.sort();
+    whole_names.sort();
+    assert_eq!(names, whole_names);
+}
+
+/// A commit written in this process is the one `git commit-tree` writes for
+/// the same tree, parents, identity, date and message.
+#[test]
+fn a_commit_is_the_one_git_itself_would_make() {
+    use std::io::Write;
+    use std::process::Stdio;
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("repo.git");
+    let repo = TreeGit::init(&path).unwrap();
+    let tree = repo.write_tree(&[]).unwrap();
+    let first = repo.write_commit(tree, &[], "first\n").unwrap();
+    let message = "Subject\n\nBody\nAgentfs-Event: 7\n";
+    let mine = repo.write_commit(tree, &[first], message).unwrap();
+    let raw = git(&path, &["cat-file", "commit", &mine.to_string()]).stdout;
+    let raw = String::from_utf8(raw).unwrap();
+    let author = raw.lines().find_map(|l| l.strip_prefix("author ")).unwrap();
+    let date = author.split_once("> ").unwrap().1.to_owned();
+    let mut child = Command::new("git")
+        .arg("--git-dir")
+        .arg(&path)
+        .args(["commit-tree", &tree.to_string(), "-p", &first.to_string()])
+        .env("GIT_AUTHOR_NAME", "agentfs")
+        .env("GIT_AUTHOR_EMAIL", "agentfs@localhost")
+        .env("GIT_COMMITTER_NAME", "agentfs")
+        .env("GIT_COMMITTER_EMAIL", "agentfs@localhost")
+        .env("GIT_AUTHOR_DATE", &date)
+        .env("GIT_COMMITTER_DATE", &date)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(message.as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(
+        String::from_utf8(out.stdout).unwrap().trim(),
+        mine.to_string()
+    );
+    let fsck = git(&path, &["fsck", "--full", "--strict", "--no-progress"]);
+    assert!(fsck.status.success(), "{fsck:?}");
+    // Git's checks hold: a commit names a tree it stores and commits as parents.
+    assert!(repo.write_commit(first, &[], "x\n").is_err());
+    assert!(repo.write_commit(tree, &[tree], "x\n").is_err());
 }
 
 fn commit(repo: &TreeGit) -> Oid {

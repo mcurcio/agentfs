@@ -20,6 +20,9 @@ use agentfs_core::tree_actor::{Error, Saved, TreeActor, TreeId};
 use fuser::*;
 
 const TTL: Duration = Duration::ZERO;
+/// Files listed per READDIR at most: more than a reply's buffer holds, and the
+/// kernel asks again from where a reply stopped.
+const READDIR_BATCH: usize = 1024;
 type Result<T> = std::result::Result<T, Errno>;
 
 /// Views in one process share one locked volume actor. Each view writes as
@@ -365,12 +368,10 @@ impl View {
         self.handles.lock().map_err(|_| Errno::EIO)
     }
     fn path(&self, v: &TreeActor, ino: INodeNo) -> Result<String> {
-        v.files(self.tree)
-            .map_err(errno)?
-            .into_iter()
-            .find(|(_, o, _)| *o + 2 == ino.0)
-            .map(|(p, _, _)| p)
-            .ok_or(Errno::ENOENT)
+        let object = ino.0.checked_sub(2).ok_or(Errno::ENOENT)?;
+        v.path_of(self.tree, object)
+            .map(str::to_owned)
+            .map_err(errno)
     }
     fn attr(&self, v: &TreeActor, ino: INodeNo, fh: Option<FileHandle>) -> Result<FileAttr> {
         // First: the kernel keeps one size per inode, and an unlinked mapped
@@ -507,12 +508,7 @@ impl Filesystem for View {
             }
             let name = name.to_str().ok_or(Errno::EINVAL)?;
             let v = self.actor()?;
-            let (_, object, _) = v
-                .files(self.tree)
-                .map_err(errno)?
-                .into_iter()
-                .find(|(p, _, _)| p == name)
-                .ok_or(Errno::ENOENT)?;
+            let object = v.object_at(self.tree, name).map_err(errno)?;
             self.attr(&v, INodeNo(object + 2), None)
         })();
         match result {
@@ -557,13 +553,7 @@ impl Filesystem for View {
                 return Err(Errno::EEXIST);
             }
             let fh = self.open_file(&mut v, path, flags, true)?;
-            let object = v
-                .files(self.tree)
-                .map_err(errno)?
-                .into_iter()
-                .find(|(p, _, _)| p == path)
-                .ok_or(Errno::ENOENT)?
-                .1;
+            let object = v.object_at(self.tree, path).map_err(errno)?;
             Ok((
                 fh,
                 self.attr(&v, INodeNo(object + 2), Some(FileHandle(fh)))?,
@@ -876,23 +866,26 @@ impl Filesystem for View {
                 return Err(Errno::ENOTDIR);
             }
             let v = self.actor()?;
-            let mut entries = vec![
-                (INodeNo(1), FileType::Directory, ".".to_owned()),
-                (INodeNo(1), FileType::Directory, "..".to_owned()),
-            ];
+            // `.` and `..` are entries 0 and 1, the files 2 on: an offset is
+            // the number of entries already read.
+            let skip = usize::try_from(offset).map_err(|_| Errno::EINVAL)?;
+            let mut entries: Vec<(INodeNo, FileType, String)> = [".", ".."]
+                .into_iter()
+                .skip(skip)
+                .map(|name| (INodeNo(1), FileType::Directory, name.to_owned()))
+                .collect();
             entries.extend(
-                v.files(self.tree)
+                v.files_from(self.tree, skip.saturating_sub(2), READDIR_BATCH)
                     .map_err(errno)?
                     .into_iter()
-                    .map(|(p, o, _)| (INodeNo(o + 2), FileType::RegularFile, p)),
+                    .map(|(p, o)| (INodeNo(o + 2), FileType::RegularFile, p)),
             );
-            Ok(entries)
+            Ok((skip, entries))
         })();
         match result {
-            Ok(entries) => {
-                for (i, (ino, kind, name)) in entries.into_iter().enumerate().skip(offset as usize)
-                {
-                    if reply.add(ino, (i + 1) as u64, kind, name) {
+            Ok((skip, entries)) => {
+                for (i, (ino, kind, name)) in entries.into_iter().enumerate() {
+                    if reply.add(ino, (skip + i + 1) as u64, kind, name) {
                         break;
                     }
                 }

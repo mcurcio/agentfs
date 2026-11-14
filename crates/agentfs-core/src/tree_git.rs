@@ -5,6 +5,10 @@
 //! crash. Objects are durable before a record names them. agentfs writes
 //! `config` and `HEAD` itself, atomically, before any git command: git replaces
 //! `config` with no fsync, and an emptied one silently loses `core.fsync`.
+//!
+//! A save's work runs in this process, through libgit2 (docs/architecture.md,
+//! "Technology choices"): objects, the ref copy and the checkout. Only reads
+//! that walk history, and `init`, run the `git` program.
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
@@ -15,11 +19,12 @@ use std::os::unix::fs::{PermissionsExt, symlink};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use crate::file_lock::FileLock;
 
-use git2::Oid;
+use git2::{ErrorCode, ObjectType, Oid, Repository};
 use thiserror::Error;
 
 /// Errors from the Git executable or its storage.
@@ -35,6 +40,14 @@ pub enum Error {
     Invalid(String),
 }
 
+/// libgit2 says what failed in its message, with the system's text for an
+/// I/O error: a full state area must still reach the call as `ENOSPC`.
+impl From<git2::Error> for Error {
+    fn from(error: git2::Error) -> Self {
+        classify(error.message().as_bytes())
+    }
+}
+
 type Result<T> = std::result::Result<T, Error>;
 
 /// What git's stderr says went wrong. A full state area must reach the call as
@@ -46,6 +59,21 @@ fn classify(stderr: &[u8]) -> Error {
     } else {
         Error::Git(text)
     }
+}
+
+static OBJECT_WRITES: AtomicU64 = AtomicU64::new(0);
+static OBJECT_DIR_SYNCS: AtomicU64 = AtomicU64::new(0);
+
+/// Objects handed to a tree repository's store in this process, new or not.
+/// A measurement, like [`crate::git_cli::children`].
+pub(crate) fn object_writes() -> u64 {
+    OBJECT_WRITES.load(Ordering::Relaxed)
+}
+
+/// fsyncs of a tree repository's `objects/` directory in this process. A
+/// measurement.
+pub(crate) fn object_dir_syncs() -> u64 {
+    OBJECT_DIR_SYNCS.load(Ordering::Relaxed)
 }
 
 // The repository's whole configuration; nothing else writes it.
@@ -80,6 +108,24 @@ pub struct RefUpdate {
 pub struct TreeGit {
     path: PathBuf,
     lease: Option<Arc<FileLock>>,
+    store: Arc<Store>,
+}
+
+/// The repository as libgit2 opens it, shared by every clone of a [`TreeGit`].
+#[derive(Default)]
+struct Store {
+    /// Opened at first use, after `write_config` has made a cut repository whole.
+    repo: Mutex<Option<Repository>>,
+    /// An object was written since `objects/` was last fsynced.
+    unsynced: AtomicBool,
+}
+
+impl std::fmt::Debug for Store {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Store")
+            .field("unsynced", &self.unsynced.load(Ordering::Relaxed))
+            .finish_non_exhaustive()
+    }
 }
 
 impl TreeGit {
@@ -98,6 +144,7 @@ impl TreeGit {
         let repo = Self {
             path: std::fs::canonicalize(path)?,
             lease,
+            store: Arc::default(),
         };
         repo.run(&["init", "--bare"], None, false)?;
         sync_initialized_repository(&repo.path)?;
@@ -119,6 +166,7 @@ impl TreeGit {
         Ok(Self {
             path: std::fs::canonicalize(path)?,
             lease,
+            store: Arc::default(),
         })
     }
 
@@ -142,7 +190,8 @@ impl TreeGit {
     }
 
     /// Removes `refs/` and `packed-refs`, makes `refs/`, and creates every
-    /// pointer in one `update-ref --stdin`. No fsync: this is a copy.
+    /// pointer in one [`TreeGit::ref_transaction`]. A copy, which needs no
+    /// fsync; libgit2's process-wide setting fsyncs each ref all the same.
     pub fn rebuild_refs(&self, pointers: &[RefUpdate]) -> Result<()> {
         let refs = self.path.join("refs");
         match std::fs::remove_dir_all(&refs) {
@@ -276,65 +325,99 @@ impl TreeGit {
             .collect()
     }
 
+    /// libgit2's handle on the repository, opened at first use with the
+    /// process's libgit2 setup ([`crate::history`]): no configuration but the
+    /// repository's own, and objects and refs fsynced.
+    fn with_repo<R>(&self, f: impl FnOnce(&Repository) -> Result<R>) -> Result<R> {
+        let mut slot = self
+            .store
+            .repo
+            .lock()
+            .map_err(|_| Error::Git("the repository's lock is poisoned".into()))?;
+        let repo = match &mut *slot {
+            Some(repo) => repo,
+            empty => {
+                crate::history::init_libgit2();
+                empty.insert(Repository::open_bare(&self.path)?)
+            }
+        };
+        f(repo)
+    }
+
+    /// Stores one object. libgit2 fsyncs a new object's file and its fan-out
+    /// directory and leaves one it already holds as it is; `objects/`, which
+    /// names a fan-out directory the write may have made, waits for
+    /// [`TreeGit::sync_objects`].
+    fn write_object(&self, kind: ObjectType, bytes: &[u8]) -> Result<Oid> {
+        OBJECT_WRITES.fetch_add(1, Ordering::Relaxed);
+        let oid = self.with_repo(|repo| Ok(repo.odb()?.write(kind, bytes)?))?;
+        self.store.unsynced.store(true, Ordering::Release);
+        Ok(oid)
+    }
+
+    /// Makes every object written so far durable: one fsync of `objects/`
+    /// when any was written since the last. A step calls it before its
+    /// journal record names them.
+    pub fn sync_objects(&self) -> Result<()> {
+        if self.store.unsynced.swap(false, Ordering::AcqRel) {
+            let synced = std::fs::File::open(self.path.join("objects")).and_then(|d| d.sync_all());
+            if let Err(err) = synced {
+                self.store.unsynced.store(true, Ordering::Release);
+                return Err(err.into());
+            }
+            OBJECT_DIR_SYNCS.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(())
+    }
+
+    fn read_object(&self, oid: Oid, kind: ObjectType) -> Result<Vec<u8>> {
+        self.with_repo(|repo| {
+            let odb = repo.odb()?;
+            let object = odb.read(oid)?;
+            if object.kind() != kind {
+                return Err(Error::Invalid(format!("{oid} is a {}", object.kind())));
+            }
+            Ok(object.data().to_vec())
+        })
+    }
+
     /// Store raw blob bytes.
     pub fn write_blob(&self, bytes: &[u8]) -> Result<Oid> {
-        let oid = parse_oid(trim(
-            &self
-                .run(&["hash-object", "-w", "--stdin"], Some(bytes), true)?
-                .stdout,
-        ))?;
-        self.sync_object_dirs(oid)?;
-        Ok(oid)
+        self.write_object(ObjectType::Blob, bytes)
     }
     /// Read raw blob bytes without filters.
     pub fn read_blob(&self, oid: Oid) -> Result<Vec<u8>> {
-        Ok(self
-            .run(&["cat-file", "blob", &oid.to_string()], None, true)?
-            .stdout)
+        self.read_object(oid, ObjectType::Blob)
     }
-    /// Read immediate tree entries with raw names.
+    /// Read immediate tree entries with raw names, in the tree's order.
     pub fn list_tree(&self, oid: Oid) -> Result<Vec<TreeEntry>> {
-        let out = self.run(&["ls-tree", "-z", &oid.to_string()], None, true)?;
-        out.stdout
-            .split(|b| *b == 0)
-            .filter(|record| !record.is_empty())
-            .map(|record| {
-                let index = record
-                    .iter()
-                    .position(|b| *b == b'\t')
-                    .ok_or_else(|| Error::Invalid("tree entry".into()))?;
-                let (header, name) = (&record[..index], &record[index + 1..]);
-                let fields: Vec<_> = header.split(|b| *b == b' ').collect();
-                if fields.len() != 3 {
-                    return Err(Error::Invalid("tree header".into()));
-                }
-                let mode = u32::from_str_radix(
-                    std::str::from_utf8(fields[0])
-                        .map_err(|_| Error::Invalid("tree mode".into()))?,
-                    8,
-                )
-                .map_err(|_| Error::Invalid("tree mode".into()))?;
-                Ok(TreeEntry {
-                    name: name.to_vec(),
-                    mode,
-                    oid: parse_oid(fields[2])?,
+        self.with_repo(|repo| {
+            Ok(repo
+                .find_tree(oid)?
+                .iter()
+                .map(|entry| TreeEntry {
+                    name: entry.name_bytes().to_vec(),
+                    mode: u32::try_from(entry.filemode_raw()).unwrap_or(0),
+                    oid: entry.id(),
                 })
-            })
-            .collect()
+                .collect())
+        })
     }
-    /// Store immediate entries. Git checks the tree's format.
-    ///
-    /// Through `hash-object`, not `git mktree`: mktree reads no configuration,
-    /// so core.fsync never reaches it and its object can be an empty file after
-    /// a cut. Writing that tree again then finds the name taken and keeps the
-    /// empty file. ci/check-tree-git.sh checks that the writers used here sync.
+    /// Store immediate entries, checked as `git hash-object -t tree` checks
+    /// them: known modes, names that are not empty, `.` or `..` and hold no
+    /// `/` or NUL, each name once. The bytes are the ones Git would write.
     pub fn write_tree(&self, entries: &[TreeEntry]) -> Result<Oid> {
         let mut sorted = Vec::with_capacity(entries.len());
         for e in entries {
             if !matches!(e.mode, 0o40000 | 0o100644 | 0o100755 | 0o120000 | 0o160000) {
                 return Err(Error::Invalid("tree mode".into()));
             }
-            if e.name.is_empty() || e.name.contains(&0) || e.name.contains(&b'/') {
+            if e.name.is_empty()
+                || e.name == b"."
+                || e.name == b".."
+                || e.name.contains(&0)
+                || e.name.contains(&b'/')
+            {
                 return Err(Error::Invalid("tree entry name".into()));
             }
             // Git orders a directory as if its name ended in a slash.
@@ -345,6 +428,9 @@ impl TreeGit {
             sorted.push((key, e));
         }
         sorted.sort_by(|a, b| a.0.cmp(&b.0));
+        if sorted.windows(2).any(|w| w[0].1.name == w[1].1.name) {
+            return Err(Error::Invalid("duplicate tree entry".into()));
+        }
         let mut data = Vec::new();
         for (_, e) in sorted {
             write!(&mut data, "{:o} ", e.mode)?;
@@ -352,23 +438,11 @@ impl TreeGit {
             data.push(0);
             data.extend_from_slice(e.oid.as_bytes());
         }
-        let oid = parse_oid(trim(
-            &self
-                .run(
-                    &["hash-object", "-t", "tree", "-w", "--stdin"],
-                    Some(&data),
-                    true,
-                )?
-                .stdout,
-        ))?;
-        self.sync_object_dirs(oid)?;
-        Ok(oid)
+        self.write_object(ObjectType::Tree, &data)
     }
     /// Read a commit's tree, parents, and message.
     pub fn read_commit(&self, oid: Oid) -> Result<Commit> {
-        let bytes = self
-            .run(&["cat-file", "commit", &oid.to_string()], None, true)?
-            .stdout;
+        let bytes = self.read_object(oid, ObjectType::Commit)?;
         let boundary = bytes
             .windows(2)
             .position(|w| w == b"\n\n")
@@ -389,53 +463,76 @@ impl TreeGit {
             message: bytes[boundary + 2..].to_vec(),
         })
     }
-    /// Write a commit with the fixed service identity.
+    /// Write a commit with the fixed service identity, now, in the local
+    /// time zone: the bytes `git commit-tree` writes, message verbatim. Its
+    /// tree and parents must be stored, as `commit-tree` requires.
     pub fn write_commit(&self, tree: Oid, parents: &[Oid], message: &str) -> Result<Oid> {
-        let mut cmd = self.command(true);
-        cmd.arg("commit-tree").arg(tree.to_string());
+        self.with_repo(|repo| {
+            let odb = repo.odb()?;
+            for (oid, kind) in std::iter::once((tree, ObjectType::Tree))
+                .chain(parents.iter().map(|p| (*p, ObjectType::Commit)))
+            {
+                let (_, found) = odb.read_header(oid)?;
+                if found != kind {
+                    return Err(Error::Invalid(format!("{oid} is a {found}, not a {kind}")));
+                }
+            }
+            Ok(())
+        })?;
+        let signature = git2::Signature::now("agentfs", "agentfs@localhost")?;
+        let when = signature.when();
+        let offset = when.offset_minutes().abs();
+        let ident = format!(
+            "agentfs <agentfs@localhost> {} {}{:02}{:02}",
+            when.seconds(),
+            when.sign(),
+            offset / 60,
+            offset % 60
+        );
+        let mut data = format!("tree {tree}\n");
         for parent in parents {
-            cmd.arg("-p").arg(parent.to_string());
+            data.push_str(&format!("parent {parent}\n"));
         }
-        cmd.env("GIT_AUTHOR_NAME", "agentfs")
-            .env("GIT_AUTHOR_EMAIL", "agentfs@localhost")
-            .env("GIT_COMMITTER_NAME", "agentfs")
-            .env("GIT_COMMITTER_EMAIL", "agentfs@localhost");
-        let out = run_command(cmd, Some(message.as_bytes()))?;
-        let oid = parse_oid(trim(&out.stdout))?;
-        self.sync_object_dirs(oid)?;
-        Ok(oid)
+        data.push_str(&format!("author {ident}\ncommitter {ident}\n\n"));
+        data.push_str(message);
+        self.write_object(ObjectType::Commit, data.as_bytes())
     }
 
-    // Git fsyncs loose object data under core.fsync=objects. Persist the
-    // fan-out directory entry and any newly created fan-out directory before
-    // a subsequent transaction can publish this object.
-    fn sync_object_dirs(&self, oid: Oid) -> Result<()> {
-        let objects = self.path.join("objects");
-        let name = oid.to_string();
-        let fanout = objects.join(&name[..2]);
-        match std::fs::File::open(fanout) {
-            Ok(dir) => dir.sync_all()?,
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {} // Already packed.
-            Err(err) => return Err(err.into()),
-        }
-        std::fs::File::open(objects)?.sync_all()?;
-        Ok(())
-    }
-
-    /// Atomically apply all reference changes, checking every old value.
+    /// Atomically apply all reference changes, checking every old value: each
+    /// ref is locked, then every old value read under the locks, then all
+    /// move. A name Git would refuse fails before any lock.
     pub fn ref_transaction(&self, updates: &[RefUpdate]) -> Result<()> {
-        let mut data = Vec::new();
-        data.extend_from_slice(b"start\0");
         for u in updates {
-            self.run(&["check-ref-format", &u.refname], None, true)?;
-            let zero = Oid::ZERO_SHA1;
-            let new = u.new.unwrap_or(zero);
-            let old = u.expected_old.unwrap_or(zero);
-            write!(&mut data, "update {}\0{}\0{}\0", u.refname, new, old)?;
+            if !git2::Reference::is_valid_name(&u.refname) {
+                return Err(Error::Invalid(format!("reference name {:?}", u.refname)));
+            }
         }
-        data.extend_from_slice(b"prepare\0commit\0");
-        self.run(&["update-ref", "--stdin", "-z"], Some(&data), true)?;
-        Ok(())
+        self.with_repo(|repo| {
+            let mut transaction = repo.transaction()?;
+            for u in updates {
+                transaction.lock_ref(&u.refname)?;
+            }
+            for u in updates {
+                let found = match repo.find_reference(&u.refname) {
+                    Ok(reference) => reference.target(),
+                    Err(err) if err.code() == ErrorCode::NotFound => None,
+                    Err(err) => return Err(err.into()),
+                };
+                if found != u.expected_old {
+                    return Err(Error::Git(format!(
+                        "cannot lock ref '{}': expected {:?}, found {:?}",
+                        u.refname, u.expected_old, found
+                    )));
+                }
+                match (u.new, found) {
+                    (Some(new), _) => transaction.set_target(&u.refname, new, None, "agentfs")?,
+                    (None, Some(_)) => transaction.remove(&u.refname)?,
+                    (None, None) => {}
+                }
+            }
+            transaction.commit()?;
+            Ok(())
+        })
     }
     /// Whether the first commit is an ancestor of the second.
     pub fn is_ancestor(&self, ancestor: Oid, descendant: Oid) -> Result<bool> {
@@ -453,8 +550,14 @@ impl TreeGit {
             _ => Err(classify(&out.stderr)),
         }
     }
-    /// Replace a private cache directory with the exact tree, without Git filters.
-    pub fn checkout_tree(&self, tree: Oid, dest: &Path) -> Result<()> {
+    /// Make a private cache directory the exact tree, without Git filters.
+    /// With `previous`, the tree the directory holds now, only entries that
+    /// differ are rewritten (git-model §3); without it the directory is
+    /// replaced whole.
+    pub fn checkout_tree(&self, tree: Oid, dest: &Path, previous: Option<Oid>) -> Result<()> {
+        if let Some(previous) = previous {
+            return self.checkout_changes(previous, tree, dest);
+        }
         if dest.exists() {
             std::fs::remove_dir_all(dest)?;
         }
@@ -463,29 +566,75 @@ impl TreeGit {
     }
     fn checkout_entries(&self, tree: Oid, dest: &Path) -> Result<()> {
         for entry in self.list_tree(tree)? {
-            let name = OsString::from_vec(entry.name);
-            if name == OsStr::new(".") || name == OsStr::new("..") {
-                return Err(Error::Invalid("tree entry name".into()));
+            self.checkout_entry(&entry, dest)?;
+        }
+        Ok(())
+    }
+    fn checkout_entry(&self, entry: &TreeEntry, dest: &Path) -> Result<()> {
+        let path = dest.join(entry_name(&entry.name)?);
+        match entry.mode {
+            0o40000 => {
+                std::fs::create_dir(&path)?;
+                self.checkout_entries(entry.oid, &path)?;
             }
-            let path = dest.join(name);
-            match entry.mode {
-                0o40000 => {
-                    std::fs::create_dir(&path)?;
-                    self.checkout_entries(entry.oid, &path)?;
-                }
-                0o100644 | 0o100755 => {
-                    std::fs::write(&path, self.read_blob(entry.oid)?)?;
-                    std::fs::set_permissions(
-                        &path,
-                        std::fs::Permissions::from_mode(entry.mode & 0o777),
-                    )?;
-                }
-                0o120000 => symlink(OsString::from_vec(self.read_blob(entry.oid)?), path)?,
-                _ => return Err(Error::Invalid("unsupported checkout mode".into())),
+            0o100644 | 0o100755 => {
+                std::fs::write(&path, self.read_blob(entry.oid)?)?;
+                std::fs::set_permissions(
+                    &path,
+                    std::fs::Permissions::from_mode(entry.mode & 0o777),
+                )?;
+            }
+            0o120000 => symlink(OsString::from_vec(self.read_blob(entry.oid)?), path)?,
+            _ => return Err(Error::Invalid("unsupported checkout mode".into())),
+        }
+        Ok(())
+    }
+    /// `dest` holds `old`; leaves it holding `new`, touching only what differs.
+    fn checkout_changes(&self, old: Oid, new: Oid, dest: &Path) -> Result<()> {
+        if old == new {
+            return Ok(());
+        }
+        let key = |e: TreeEntry| (e.name.clone(), e);
+        let old: BTreeMap<Vec<u8>, TreeEntry> = self.list_tree(old)?.into_iter().map(key).collect();
+        let new: BTreeMap<Vec<u8>, TreeEntry> = self.list_tree(new)?.into_iter().map(key).collect();
+        for (name, was) in &old {
+            let now = new.get(name);
+            if now.is_some_and(|now| now.mode == was.mode && now.oid == was.oid) {
+                continue;
+            }
+            if let Some(now) = now
+                && now.mode == 0o40000
+                && was.mode == 0o40000
+            {
+                self.checkout_changes(was.oid, now.oid, &dest.join(entry_name(name)?))?;
+                continue;
+            }
+            let path = dest.join(entry_name(name)?);
+            if was.mode == 0o40000 {
+                std::fs::remove_dir_all(&path)?;
+            } else {
+                std::fs::remove_file(&path)?;
+            }
+            if let Some(now) = now {
+                self.checkout_entry(now, dest)?;
+            }
+        }
+        for (name, now) in &new {
+            if !old.contains_key(name) {
+                self.checkout_entry(now, dest)?;
             }
         }
         Ok(())
     }
+}
+
+/// A tree entry's name as a path component; `.` and `..` never leave `dest`.
+fn entry_name(name: &[u8]) -> Result<OsString> {
+    let name = OsString::from_vec(name.to_vec());
+    if name.is_empty() || name == OsStr::new(".") || name == OsStr::new("..") {
+        return Err(Error::Invalid("tree entry name".into()));
+    }
+    Ok(name)
 }
 
 // Git creates its skeleton before agentfs writes the config, with no

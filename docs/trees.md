@@ -58,7 +58,7 @@ views with `fusermount3 -u PATH`; unmounting every view ends the process.
 | `--sandbox DIR` | Also mount a fork in DIR (a new one, or `--fork`) |
 | `--fork fork/N` | Reuse this fork (needs `--sandbox`); `root` is refused |
 | `--writer LABEL`, `--sandbox-writer LABEL` | The root's and the fork's writer label (default `root-client`, `sandbox-client`). A label is trusted, not an authenticated identity |
-| `--metrics-output FILE` | Write counters, the journal's length and each stage's runs, time and git children every 100 ms and at unmount |
+| `--metrics-output FILE` | Write counters, the journal's length, each stage's runs, time and git children, and the objects stored, every 100 ms and at unmount |
 
 Mount points must be empty, separate and outside the state area. Metrics never take
 part in ordering. Every flag is in [configuration](configuration.md#flags-and-environment).

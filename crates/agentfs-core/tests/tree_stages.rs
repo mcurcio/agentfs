@@ -51,17 +51,24 @@ fn count(stages: &Stages, before: &Stages) -> Vec<(&'static str, u64)> {
         ),
         diff("event_owners", stages.event_owners, before.event_owners),
         ("git_children", stages.git_children - before.git_children),
+        ("object_writes", stages.object_writes - before.object_writes),
+        (
+            "object_dir_syncs",
+            stages.object_dir_syncs - before.object_dir_syncs,
+        ),
     ]
 }
 
-/// One save of one file on the root, step by step. Each save runs the Git programs
-/// below, in this many children: hash-object for the file, its tree, the line
-/// map, the name history, the envelope tree, the commit and the object table
-/// (7; a sync's marker blob only when the tree has forks, and here it has none);
-/// `git diff` aligning the lines (1); `check-ref-format` for the branch and the
-/// object table, then `update-ref` (3); `cat-file` of the commit, `ls-tree` of
-/// its envelope, `ls-tree` of the files and `cat-file` of the one file (4).
-const CHILDREN_PER_SAVE: u64 = 15;
+/// One save of one file on the root, step by step. A save runs one Git child,
+/// `git diff` aligning the lines; its objects, the ref copy and the checkout run
+/// in this process.
+const CHILDREN_PER_SAVE: u64 = 1;
+
+/// The objects one save hands to Git's store: the changed file's blob, the
+/// files tree, the line map, the name history, the envelope tree, the commit
+/// and the object table (a sync's marker blob only when the tree has forks, and
+/// here it has none). An unchanged file's blob is already known.
+const OBJECTS_PER_SAVE: u64 = 7;
 
 #[test]
 fn stages_add_up() {
@@ -92,6 +99,10 @@ fn stages_add_up() {
         ("prior_decisions", 0),
         ("event_owners", 0),
         ("git_children", CHILDREN_PER_SAVE * SAVES),
+        ("object_writes", OBJECTS_PER_SAVE * SAVES),
+        // Each step's new objects are made durable by one fsync of `objects/`
+        // before its journal record names them.
+        ("object_dir_syncs", SAVES),
     ];
     assert_eq!(got, expect);
     assert_eq!(after.saves - before.saves, SAVES);
@@ -99,6 +110,31 @@ fn stages_add_up() {
     // Durations are only measured, never exact: each ran and none ran backwards.
     assert!(after.stages.journal_fsync.nanos > before.stages.journal_fsync.nanos);
     assert!(after.stages.objects.max_nanos > 0);
+}
+
+/// A save's cost grows with its change, not the tree: one changed file in a
+/// tree of forty hands Git's store the objects it would in a tree of one, and
+/// starts the same Git children.
+#[test]
+fn a_save_stores_the_same_objects_at_any_tree_size() {
+    let _one = ONE_AT_A_TIME.lock().unwrap();
+    let cost = |files: usize| {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut v = new_actor(&tmp.path().join("state"));
+        for i in 0..files {
+            put(&mut v, &format!("f{i}"), format!("file {i}\n").as_bytes());
+        }
+        put(&mut v, "a", b"seed\n");
+        let before = v.metrics().stages;
+        put(&mut v, "a", b"changed\n");
+        let after = v.metrics().stages;
+        (
+            after.object_writes - before.object_writes,
+            after.git_children - before.git_children,
+        )
+    };
+    assert_eq!(cost(0), (OBJECTS_PER_SAVE, CHILDREN_PER_SAVE));
+    assert_eq!(cost(40), (OBJECTS_PER_SAVE, CHILDREN_PER_SAVE));
 }
 
 /// A save on the root and the sync that carries it to a sandbox must cost the same

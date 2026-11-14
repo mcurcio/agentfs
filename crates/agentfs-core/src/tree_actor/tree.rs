@@ -4,8 +4,11 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::ops::Deref;
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+
+use git2::Oid;
 
 use serde::{Deserialize, Serialize};
 
@@ -171,13 +174,110 @@ impl Versions {
 /// A file's line map as the engine stores it.
 pub(super) type Lines = LineMap<LineVersion>;
 
+/// A file's saved bytes and, once stored, their blob. New bytes are a new
+/// value, so a blob found once holds for as long as the bytes are shared: a
+/// save stores only the blobs of the files it changed.
+#[derive(Debug, Default)]
+pub(super) struct FileBytes {
+    bytes: Vec<u8>,
+    blob: OnceLock<Oid>,
+}
+
+impl FileBytes {
+    /// The bytes' blob, stored by `store` the first time it is asked for.
+    pub(super) fn blob(&self, store: impl FnOnce(&[u8]) -> Result<Oid>) -> Result<Oid> {
+        if let Some(oid) = self.blob.get() {
+            return Ok(*oid);
+        }
+        let oid = store(&self.bytes)?;
+        // Content-addressed: whoever set it first set the same id.
+        let _ = self.blob.set(oid);
+        Ok(oid)
+    }
+}
+
+impl From<Vec<u8>> for FileBytes {
+    fn from(bytes: Vec<u8>) -> Self {
+        Self {
+            bytes,
+            blob: OnceLock::new(),
+        }
+    }
+}
+
+impl Deref for FileBytes {
+    type Target = Vec<u8>;
+
+    fn deref(&self) -> &Vec<u8> {
+        &self.bytes
+    }
+}
+
+/// A tree's names, by path and by object: a view's lookups by name and by
+/// inode cost one map lookup, not a scan of the tree. Reads go through
+/// `Deref` to the map by path; every change goes through these methods, so
+/// the two maps cannot disagree.
+#[derive(Clone, Debug, Default)]
+pub(super) struct Names {
+    by_path: BTreeMap<String, u64>,
+    by_object: BTreeMap<u64, BTreeSet<String>>,
+}
+
+impl Names {
+    pub(super) fn insert(&mut self, path: String, object: u64) -> Option<u64> {
+        let replaced = self.by_path.insert(path.clone(), object);
+        if let Some(replaced) = replaced {
+            self.unindex(replaced, &path);
+        }
+        self.by_object.entry(object).or_default().insert(path);
+        replaced
+    }
+
+    pub(super) fn remove(&mut self, path: &str) -> Option<u64> {
+        let object = self.by_path.remove(path)?;
+        self.unindex(object, path);
+        Some(object)
+    }
+
+    pub(super) fn clear(&mut self) {
+        self.by_path.clear();
+        self.by_object.clear();
+    }
+
+    /// The paths naming `object`, in path order.
+    pub(super) fn of(&self, object: u64) -> impl Iterator<Item = &str> {
+        self.by_object
+            .get(&object)
+            .into_iter()
+            .flatten()
+            .map(String::as_str)
+    }
+
+    fn unindex(&mut self, object: u64, path: &str) {
+        if let Some(paths) = self.by_object.get_mut(&object) {
+            paths.remove(path);
+            if paths.is_empty() {
+                self.by_object.remove(&object);
+            }
+        }
+    }
+}
+
+impl Deref for Names {
+    type Target = BTreeMap<String, u64>;
+
+    fn deref(&self) -> &BTreeMap<String, u64> {
+        &self.by_path
+    }
+}
+
 /// The saved state of one tree. A step builds on a copy and installs it after
 /// its commit point, so file bytes and line maps sit behind `Arc`.
 #[derive(Clone, Default)]
 pub(super) struct Tree {
-    pub(super) names: BTreeMap<String, u64>,
+    pub(super) names: Names,
     pub(super) anonymous: BTreeSet<u64>,
-    pub(super) bytes: BTreeMap<u64, Arc<Vec<u8>>>,
+    pub(super) bytes: BTreeMap<u64, Arc<FileBytes>>,
     pub(super) lines: BTreeMap<u64, Arc<Lines>>,
     pub(super) identities: BTreeMap<u64, MergeFileIdentity>,
     pub(super) namespace: BTreeMap<MergeFileIdentity, NameHistory>,
@@ -196,10 +296,7 @@ impl Tree {
 
     /// The paths naming `object`, in path order.
     pub(super) fn paths_of(&self, object: u64) -> impl Iterator<Item = &str> {
-        self.names
-            .iter()
-            .filter(move |(_, named)| **named == object)
-            .map(|(path, _)| path.as_str())
+        self.names.of(object)
     }
 
     /// Whether any name reaches `object`. One no name reaches is an orphan: its close saves
@@ -232,7 +329,8 @@ impl Tree {
                 self.fresh_names.insert(file.object);
             }
             self.names.insert(path.to_owned(), file.object);
-            self.bytes.insert(file.object, Arc::new(file.lines.bytes()));
+            self.bytes
+                .insert(file.object, Arc::new(file.lines.bytes().into()));
             self.lines.insert(file.object, Arc::new(file.lines));
             self.identities.insert(file.object, id);
         }

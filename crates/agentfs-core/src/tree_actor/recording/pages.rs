@@ -337,7 +337,7 @@ impl TreeActor {
             let changed = after.bytes.iter().filter(|(object, bytes)| {
                 before
                     .get(object)
-                    .is_some_and(|old| !Arc::ptr_eq(old, bytes) && old != *bytes)
+                    .is_some_and(|old| !Arc::ptr_eq(old, bytes) && old[..] != bytes[..])
             });
             self.changed
                 .extend(changed.map(|(object, _)| (tree, *object)));
