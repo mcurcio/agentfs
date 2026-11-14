@@ -57,6 +57,7 @@ mod control;
 mod daemon;
 #[cfg(test)]
 mod doc_tables;
+mod domain_events;
 mod fork_cmd;
 mod front;
 mod hold;

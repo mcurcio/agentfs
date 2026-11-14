@@ -1,7 +1,8 @@
 //! Target-model composition root (git-model.md, docs/trees.md): `trees init`
-//! ensures the volume through the Volume domain, `fork` and `mount` serve it
-//! through the tree actor. It wires domains to adapters and decides nothing.
-use std::collections::VecDeque;
+//! ensures the volume through the Volume domain; `fork`, and `mount` with a
+//! new sandbox, create the fork through the Trees domain on the store adapter;
+//! `mount` serves the volume through the tree actor. It wires domains to
+//! adapters and decides nothing.
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -10,15 +11,19 @@ use agentfs_contracts::caps::{LaunchCap, LaunchScope, Minter};
 use agentfs_contracts::clients::{AttachedLookup, ClientSet, FileOwner};
 use agentfs_contracts::name::{LauncherId, VolumeName, WriterLabel};
 use agentfs_contracts::pod::{PodContext, WriterAt};
-use agentfs_contracts::ports::{Event, EventSink, Found, StateArea};
+use agentfs_contracts::ports::{Found, StateArea};
+use agentfs_contracts::trees::{ForkSettings, Landing, Trees};
 use agentfs_contracts::views::MountOptions;
 use agentfs_contracts::volume::{EnsureOutcome, StartPoint, Volume, VolumeError, VolumeSpec};
 use agentfs_core::state_area::TreeStateArea;
+use agentfs_core::store::TreeStore;
 use agentfs_core::tree_actor::{self, Recording, TreeId};
 use agentfs_fuse::tree_view::{Binding, serve_with_metrics};
+use agentfs_trees::TreesService;
 use agentfs_volume::VolumeService;
 use anyhow::{Context, Result, bail};
 
+use crate::domain_events::DomainEvents;
 use crate::pod_args::PodArgs;
 
 /// Exit status when another process holds the state area (`EX_TEMPFAIL`).
@@ -108,18 +113,32 @@ impl AttachedLookup for NoClients {
     }
 }
 
-/// The composition root's event queue: each event in order, for its consumers.
-#[derive(Default)]
-struct Events(VecDeque<Event>);
-
-impl EventSink for Events {
-    fn publish(&mut self, event: Event) {
-        self.0.push_back(event);
-    }
-}
-
 fn context(pod: &PodArgs) -> Result<PodContext> {
     pod.context().context("reading the pod flags")
+}
+
+/// The volume's own launcher: the trial CLI.
+fn root_cap(minter: &Minter) -> Result<LaunchCap> {
+    Ok(LaunchCap::mint(
+        minter,
+        LauncherId::parse("cli")?,
+        LaunchScope::Root,
+    ))
+}
+
+/// A new unkeyed fork of the root, through the Trees domain on the store:
+/// its branch and its row are one step, durable when this returns.
+fn create_fork(recording: &Arc<Recording>, cap: &LaunchCap) -> Result<TreeId> {
+    let store = TreeStore::new(Arc::clone(recording));
+    let mut trees = TreesService::restore(store.clone(), store, DomainEvents::default())
+        .context("reading the forks' rows")?;
+    let settings = ForkSettings {
+        landing: Landing::Automatic,
+    };
+    let fork = trees
+        .create(TreeId::Root, None, settings, cap)
+        .context("creating the fork")?;
+    Ok(fork.into())
 }
 
 pub fn run(state: &Path, args: Args, minter: &Minter) -> Result<ExitCode> {
@@ -127,7 +146,7 @@ pub fn run(state: &Path, args: Args, minter: &Minter) -> Result<ExitCode> {
         Command::Init { volume, pod } => init(state, &volume, &context(&pod)?, minter),
         Command::Fork { pod } => {
             let recording = open(state, &context(&pod)?)?;
-            let fork = recording.actor()?.fork()?;
+            let fork = create_fork(&recording, &root_cap(minter)?)?;
             // Durable before the id is printed: dropping the volume fsyncs.
             drop(recording);
             println!("{fork}");
@@ -182,7 +201,7 @@ pub fn run(state: &Path, args: Args, minter: &Minter) -> Result<ExitCode> {
                     recording.actor()?.head(fork)?;
                     fork
                 } else {
-                    recording.actor()?.fork()?
+                    create_fork(&recording, &root_cap(minter)?)?
                 };
                 eprintln!("sandbox tree: {tree}");
                 bindings.push(Binding {
@@ -220,8 +239,9 @@ fn init(state: &Path, name: &str, at: &PodContext, minter: &Minter) -> Result<Ex
         name: VolumeName::parse(name)?,
         start: StartPoint::Empty,
     };
-    let cap = LaunchCap::mint(minter, LauncherId::parse("cli")?, LaunchScope::Root);
-    let mut volume = VolumeService::new(TreeStateArea::at(state), NoClients, Events::default());
+    let cap = root_cap(minter)?;
+    let mut volume =
+        VolumeService::new(TreeStateArea::at(state), NoClients, DomainEvents::default());
     let ensured = match volume.ensure(spec.clone(), at, &cap) {
         Ok(ensured) => ensured,
         Err(VolumeError::Busy) => {

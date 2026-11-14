@@ -23,7 +23,7 @@ use git2::Oid;
 use super::built::BuiltObjects;
 use super::built::{BuildError, History};
 use super::built_log::{BuiltEntry, BuiltLog, BuiltValue};
-use super::feed::{CommitSpec, Feed, Parent};
+use super::feed::{BuildRef, CommitSpec, Feed, Parent};
 use super::format::{self, BlobRef};
 use super::message::{self, Action, Message};
 use super::upstreams::Upstreams;
@@ -31,8 +31,8 @@ use super::{Objects, checkout, objects_of, refs};
 use crate::tree_actor::journal::durable::{Durability, RecordNo};
 use crate::tree_actor::journal::segment::{FramePos, Relocations, Segment};
 use crate::tree_actor::journal::{
-    At, Change, Entry, Frame, Record, SaveOutcome, Tail, TakeHead, TakeRecord, Target, frame_at,
-    runs_from_frame, take_chunks,
+    At, Change, Entry, Frame, Record, RowRecord, SaveOutcome, Tail, TakeHead, TakeRecord, Target,
+    frame_at, runs_from_frame, take_chunks,
 };
 use crate::tree_actor::pointers::Pointers;
 use crate::tree_actor::queue::Key;
@@ -200,8 +200,8 @@ struct Batch<'a> {
     blobs: HashMap<*const FileBytes, (Arc<FileBytes>, u64)>,
     /// Every `Target::Step` the batch's records name, resolved.
     values: Vec<(RecordNo, String, Parent)>,
-    /// The last commit each `refs/build/<tree>` got.
-    scratch: BTreeMap<TreeId, u64>,
+    /// The last commit each scratch ref got.
+    scratch: BTreeMap<BuildRef, u64>,
     forked: bool,
     /// Trees whose names or objects a step moved.
     moved: BTreeSet<TreeId>,
@@ -411,7 +411,8 @@ impl BuildState {
                 by,
                 change,
                 pointers,
-            } => self.step(record, by, change, pointers, ctx, batch)?,
+                rows,
+            } => self.step(record, by, (change, rows), pointers, ctx, batch)?,
         }
         Ok(())
     }
@@ -452,15 +453,52 @@ impl BuildState {
         let mark = batch
             .feed()?
             .commit(&CommitSpec {
-                tree,
+                on: BuildRef::Tree(tree),
                 parents,
                 at_ns,
                 message,
                 edits: &edits,
             })
             .map_err(build_error)?;
-        batch.scratch.insert(tree, mark);
+        batch.scratch.insert(BuildRef::Tree(tree), mark);
         Ok(Parent::Mark(mark))
+    }
+
+    /// Each row of a step, in order, as an event commit over its chain's
+    /// tip in the batch (none: a root commit), dated by the step's record.
+    /// Returns each chain's last commit in this step.
+    fn commit_rows(
+        &mut self,
+        record: &Record,
+        rows: &[RowRecord],
+        ctx: &Context<'_>,
+        batch: &mut Batch<'_>,
+    ) -> Result<BTreeMap<String, Parent>> {
+        let mut tips = BTreeMap::new();
+        for row in rows {
+            let chain = refs::chain_of_row(&row.chain).ok_or(Error::Format)?;
+            let message = Message::Row {
+                row,
+                chain,
+                event: EventNumber::new(record.seq.get()),
+            }
+            .render(ctx.identity)?;
+            let parents: Vec<Parent> = self.pointers.get(&row.chain).into_iter().collect();
+            let mark = batch
+                .feed()?
+                .commit(&CommitSpec {
+                    on: BuildRef::Rows,
+                    parents: &parents,
+                    at_ns: record.at_ns,
+                    message: &message,
+                    edits: &format::row_edits(&row.row),
+                })
+                .map_err(build_error)?;
+            batch.scratch.insert(BuildRef::Rows, mark);
+            self.pointers.set(&row.chain, Some(Parent::Mark(mark)));
+            tips.insert(row.chain.clone(), Parent::Mark(mark));
+        }
+        Ok(tips)
     }
 
     /// A direct step's commit over the tree's head.
@@ -494,7 +532,7 @@ impl BuildState {
         &mut self,
         record: &Record,
         by: &WriterAt,
-        change: &Change,
+        (change, rows): (&Change, &[RowRecord]),
         changes: &[crate::tree_actor::journal::PointerChange],
         ctx: &Context<'_>,
         batch: &mut Batch<'_>,
@@ -685,6 +723,7 @@ impl BuildState {
                 head = self.take(id, seq, take, change, ctx, record.at_ns, batch)?;
                 batch.moved.insert(id);
             }
+            Change::Rows => {}
         }
         if let Some(head) = head {
             self.heads.insert(record.seq, head);
@@ -692,12 +731,24 @@ impl BuildState {
                 self.owners.insert(event, head);
             }
         }
+        // After the change, its rows: a row chain's `Step(n)` is step `n`'s
+        // last commit on that chain, never the step's head.
+        let row_tips = self.commit_rows(record, rows, ctx, batch)?;
         for pointer in changes {
             let value = match &pointer.new {
                 None => None,
                 Some(Target::Oid(hex)) => Some(Parent::Built(
                     Oid::from_str(hex).map_err(|_| Error::Format)?,
                 )),
+                Some(Target::Step(step)) if refs::chain_of_row(&pointer.name).is_some() => {
+                    // The actor names a chain's own step only (`record_step`).
+                    let value = *row_tips
+                        .get(&pointer.name)
+                        .filter(|_| *step == record.seq)
+                        .ok_or_else(|| disagrees(seq))?;
+                    batch.values.push((*step, pointer.name.clone(), value));
+                    Some(value)
+                }
                 Some(Target::Step(step)) if *step == record.seq => {
                     let value = head.ok_or_else(|| disagrees(seq))?;
                     batch.values.push((*step, pointer.name.clone(), value));
@@ -1066,10 +1117,10 @@ impl Builder {
         self.reader.advance(offset, through);
         let built = next.built_pointers().map_err(to_build_error)?;
         let owners = next.built_owners();
-        let scratch: Vec<(TreeId, Oid)> = batch
+        let scratch: Vec<(BuildRef, Oid)> = batch
             .scratch
             .iter()
-            .filter_map(|(tree, mark)| Some((*tree, *marks.get(mark)?)))
+            .filter_map(|(on, mark)| Some((*on, *marks.get(mark)?)))
             .collect();
         let forked = batch.forked;
         let files = std::mem::take(&mut batch.files);
@@ -1149,7 +1200,7 @@ impl Builder {
     fn copy(
         &mut self,
         built: &Pointers,
-        scratch: &[(TreeId, Oid)],
+        scratch: &[(BuildRef, Oid)],
         forked: bool,
     ) -> Result<Vec<TreeId>> {
         // The batch is built: from here a failure leaves only stale copies.
@@ -1165,8 +1216,8 @@ impl Builder {
                 repo.rebuild_refs(&built.creates())?;
             } else {
                 let mut changes = self.copied.changes_to(built);
-                changes.extend(scratch.iter().map(|(tree, oid)| RefUpdate {
-                    refname: format!("refs/build/{tree}"),
+                changes.extend(scratch.iter().map(|(on, oid)| RefUpdate {
+                    refname: on.refname(),
                     new: None,
                     expected_old: Some(*oid),
                 }));

@@ -1104,3 +1104,31 @@ Re-cut pages: `.claude/handoff/m1-s4-recut.md`, `m1-s5-recut.md`, `m1-s6-recut.m
 4. **`ClientStore::end`'s doc promises reserved room** that no page builds; `ClientError` and `TreeError` have no
    variant for a stopped actor. Re-cut: the doc names `Stopped`, `NotDurable`; both errors gain `Stopped` with one
    `From<StoreError>` each.
+
+## 2026-11-14, M1 S3 (store: volume events as commits beside their trees): where the page is short
+
+Page: `.claude/handoff/m1-s3-recut.md`. None blocks the slice; each is built as stated.
+1. **The probe "gate row steps → `a_failed_builder_stops_no_event`" cannot be killed by that test.** The lag gate
+   admits every call while the builder has failed (principle 5, `LagGate::admits`), so a store write that first
+   calls `Recording::admit` passes it (probe run: all seven `tree_store` tests green). Killing it needs a builder
+   that lags without failing and a gate limit of zero (`History::set_lag_limits` is crate-private), and then the
+   probe blocks rather than fails; no test was added for it. The other four probes are killed.
+2. **`Trees::create` carries no pod context**, but `ForkStore::create` takes `at`: `TreesService::create` passes an
+   empty `PodContext`, so `ForkCreated` has no pod trailers. The launcher's pod context needs a contract change
+   (a frozen interface: an erratum and a re-cut, not a local edit).
+3. **`TreeError` has no `Stopped`.** S3 maps `StoreError::Stopped` and `Damaged` to `TreeError::Io(Other(EIO))`,
+   `NotDurable(k)` to `Io(k)`, `Refused` to `UpstreamUnknown`; S5's page adds `Stopped` (`From<StoreError>`).
+4. **"`pending_from` ... set by `publish`" misses takes:** a landing's take enqueues syncs too. Each queue entry's
+   source is the step's tree, set in the one place every step is recorded (`TreeActor::record`), replayed after
+   the built point, and read at open from a built landing's `Agentfs-Tree` (a sync marker: its queue's upstream).
+5. **`fork_with(upstream)` with a fork upstream** would record a step recovery refuses (forks of forks are not
+   built; `Upstreams::check_recovered`). It answers `NotFound` before recording; Trees answers `NestedNotBuilt`
+   before that.
+6. **A row ref's `Step(n)` for an earlier step** is never written (`record` names a chain's own step only); the
+   builder answers `Disagrees` for one rather than resolving it.
+7. **Files outside the owned list, each a compile need:** `tree_actor/tree.rs` (`Shape::apply` arm for
+   `Change::Rows`), `tree_actor/call_path.rs` (`progress` uses the new `queued()`; the old `queued(tree)` is
+   `queue_holds`), `history/feed.rs` (`BuildRef`), and the `Cargo.toml` of `agentfs`, `agentfs-conformance` and
+   `agentfs-core` (dev) for `agentfs-trees`.
+8. **`an_event_is_durable_before_create_returns`** checks the journal's durable mark against the last record with
+   the builder failing before its own fsync: the process-wide `journal_fsync` count is shared by parallel tests.

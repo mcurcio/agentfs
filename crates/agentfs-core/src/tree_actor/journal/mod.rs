@@ -171,12 +171,28 @@ pub(super) enum Entry {
     /// in its tail.
     Bytes,
     /// A step: the change itself, the commit point of it, and the pointer
-    /// changes its build publishes. The builder makes its commits later.
+    /// changes its build publishes. The builder makes its commits later:
+    /// the change's, then one event commit per row, in order, on its chain.
     Step {
         by: WriterAt,
         change: Change,
         pointers: Vec<PointerChange>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        rows: Vec<RowRecord>,
     },
+}
+
+/// One event commit the build writes, in order: `chain` its ref
+/// (`refs::row_chain`), `row` the chain's new `row.json` text, the rest its
+/// message (`Message::Row`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(in crate::tree_actor) struct RowRecord {
+    pub chain: String,
+    pub row: String,
+    pub kind: String,
+    pub detail: String,
+    pub by: String,
+    pub at: agentfs_contracts::pod::PodContext,
 }
 
 /// What one step changes (git-model §12). The builder replays it on the
@@ -216,6 +232,8 @@ pub(super) enum Change {
     Fork {
         upstream: String,
     },
+    /// Rows alone: no branch moves.
+    Rows,
     /// A queue take, decided on the built snapshot. The tails of the
     /// [`Entry::Bytes`] records just before it hold the bytes of each file it
     /// leaves (`take.files` with a file, in order).
@@ -235,12 +253,14 @@ impl Change {
     /// The tree a step's build works in, and about how many bytes it writes:
     /// the bytes a save or take leaves and the listings each step writes
     /// (the lag gate's estimate; the builder's measured rate corrects it).
+    /// `None` for rows alone: they add to no tree's lag.
     ///
     /// # Errors
     ///
     /// [`Error::Format`] for a tree that is no [`super::TreeId`].
-    pub fn build_cost(&self) -> Result<(super::TreeId, u64)> {
+    pub fn build_cost(&self) -> Result<Option<(super::TreeId, u64)>> {
         let (tree, bytes) = match self {
+            Self::Rows => return Ok(None),
             Self::Create { tree, .. }
             | Self::Link { tree, .. }
             | Self::Rename { tree, .. }
@@ -253,7 +273,7 @@ impl Change {
             Self::Fork { upstream } => (upstream, 0),
         };
         let tree = tree.parse().map_err(|_| Error::Format)?;
-        Ok((tree, bytes.saturating_add(STEP_LISTINGS)))
+        Ok(Some((tree, bytes.saturating_add(STEP_LISTINGS))))
     }
 }
 

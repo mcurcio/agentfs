@@ -97,6 +97,55 @@ A landing merge's subject is `Landing by <writer>`, and its writer and pod trail
 are those of the save it lands. A sync, a fork step and the Root commit are
 `agentfs`'s, with the pod context of the process that serves the volume.
 
+## Rows and event commits
+
+The volume's own events (a fork created, and in later slices clients attached and
+detached, forks ended and dropped, the volume's lifecycle) are on record like file
+changes: each is a commit in the volume's repository, on a chain of commits beside
+the tree it concerns.
+
+| Chain | Holds |
+|---|---|
+| `refs/agentfs/trees/fork/<n>` | fork `n`'s row; kept after the fork is dropped |
+| `refs/agentfs/clients/<tree>` | the clients attached to a tree |
+| `refs/agentfs/volume` | the volume's lifecycle |
+
+Each event commit's tree is one file, `row.json`: the row's value after the event
+with its audit stamps (`created` set at the row's first write and kept, `changed` at
+every write, each a time and who). Its parent is the chain's previous event (none
+for the first). Its message is the event:
+
+```text
+<Kind> <detail>
+
+Agentfs-Kind: <Kind>
+Agentfs-By: <client <id> | launcher <id> | agentfs>
+Agentfs-Tree: <root | fork/<n>>    on a tree's chain only
+Agentfs-Event: <step number>
+Agentfs-Volume: <volume name>
+Agentfs-Volume-Id: <id>
+Agentfs-Namespace: <namespace>     each pod field only when given
+Agentfs-Pod: <pod>
+Agentfs-Pod-Uid: <pod uid>
+Agentfs-Node: <node>
+Agentfs-Format: row-1
+```
+
+An event commit has no `Agentfs-Writer` or `Agentfs-Cause`, so nothing that reads
+file commits takes it for a save. `git log refs/agentfs/trees/fork/3` is fork 3's
+life; `git show refs/agentfs/trees/fork/3:row.json` is its row now.
+
+- **One record.** A fork's create is one journal record: its branch and its row,
+  committed together or not at all, made durable (one group-commit fsync, outside
+  the actor's lock) before `trees fork` or a mount's new fork returns. Its event
+  commit is built behind, with the step's batch, as a save's commit is.
+- **Read from the journal.** Rows are read from the actor's saved state, never Git:
+  they answer while the builder lags or fails, and a row step never waits at the lag
+  gate. A restart reads each built chain's `row.json`, then replays the later
+  records.
+- **Local for now.** The row chains are kept in the volume's repository; pushing
+  them to remotes comes with replication.
+
 ## What a tree does
 
 - **Saves.** A close applies the file's byte calls to the current saved file and
@@ -237,9 +286,11 @@ the steps after it move them.
 ## The journal
 
 Every step (a create, a link, a close that saves, a rename, an unlink, a fork, a
-take) is one record in the journal: the change itself and the pointer changes its
-build publishes (branch moves, queue entries, collision refs), each
-value an oid or "what step `n`'s build gives". It is appended as a call is and made
+take, rows alone) is one record in the journal: the change itself, the rows it
+writes ([Rows and event commits](#rows-and-event-commits)), and the pointer changes
+its build publishes (branch moves, queue entries, collision refs, row chains), each
+value an oid or "what step `n`'s build gives" (on a row chain, step `n`'s last
+event commit on it). It is appended as a call is and made
 durable as a call is. That record is the commit point. The actor decides the step,
 appends it and applies it to the saved state the views serve; it runs no git.
 

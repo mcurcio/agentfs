@@ -272,9 +272,13 @@ impl Invariants {
 
     /// The commits no earlier check saw: each invariant of a single commit.
     fn check_new_commits(&mut self) -> Result<(), String> {
-        let all = self
-            .git
-            .run(&["rev-list", "--all", "--reverse", "--topo-order"])?;
+        let all = self.git.run(
+            &[
+                crate::git_history::FILE_COMMITS.as_slice(),
+                &["--reverse", "--topo-order"],
+            ]
+            .concat(),
+        )?;
         for oid in all.lines() {
             if self.commits.contains_key(oid) && self.checked(oid) {
                 continue;

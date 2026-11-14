@@ -16,6 +16,7 @@ mod pointers;
 mod queue;
 mod recording;
 mod referee;
+mod rows;
 pub mod stages;
 mod takes;
 mod tree;
@@ -49,16 +50,19 @@ use history::{
 };
 pub use journal::durable::{Durability, DurableError, RecordNo};
 use journal::{
-    Change, Entry, FoldedOpen, Journal, PointerChange, Record, Replay, Target, compact_at, fold,
+    Change, Entry, FoldedOpen, Journal, PointerChange, Record, Replay, RowRecord, Target,
+    compact_at, fold,
 };
 use pointers::Pointers;
 pub use recording::FileMap;
 pub use recording::file_map::FileMapReader;
 use recording::{Handle, pages};
+use rows::SavedRows;
+pub use rows::{Chain, RowDomain, RowEvent, RowWrite};
 use stages::Stages;
 use tree::{EventNumber, SavedTree};
 
-const FORMAT: &str = "agentfs-trees-9\n";
+const FORMAT: &str = "agentfs-trees-10\n";
 /// The volume identity file: [`VolumeIdentity`] as JSON, written once by
 /// [`TreeActor::create`], read before any write at every open.
 const IDENTITY: &str = "volume";
@@ -252,6 +256,10 @@ pub struct TreeActor {
     /// Each fork's upstream. The root has none.
     upstreams: Upstreams,
     trees: BTreeMap<TreeId, SavedTree>,
+    /// Each row chain's row, as the journal's records leave them.
+    rows: SavedRows,
+    /// The tree each queue entry came from: the step's tree that queued it.
+    sources: BTreeMap<String, TreeId>,
     handles: BTreeMap<u64, Handle>,
     /// Closes that could not save, in arrival order. Their handles count as
     /// open until a later step in their tree saves them, or a restart does.
@@ -288,6 +296,9 @@ struct Started {
     built: RecordNo,
     /// The saved trees as of the journal's last record.
     trees: BTreeMap<TreeId, SavedTree>,
+    /// The rows and queue entries' sources as of the journal's last record.
+    rows: SavedRows,
+    sources: BTreeMap<String, TreeId>,
 }
 
 /// What a state area holds: reads `format` and `volume` only, takes no lock,
@@ -390,6 +401,32 @@ fn resolve_pointers(
             })
             .collect::<Result<_>>()?,
     ))
+}
+
+/// Queue entries a step adds, each with its source, and removes (`None`).
+type SourceChanges = Vec<(String, Option<TreeId>)>;
+
+/// What a step's pointer changes do to the queue entries' sources: each entry
+/// it queues came from `tree`, the step's (`Some`), each it removes goes
+/// (`None`). [`Error::Format`] for an entry queued by a step of no tree.
+fn queue_sources(tree: Option<TreeId>, changes: &[PointerChange]) -> Result<SourceChanges> {
+    changes
+        .iter()
+        .filter(|change| change.name.starts_with(refs::QUEUES))
+        .map(|change| match change.new {
+            Some(_) => Ok((change.name.clone(), Some(tree.ok_or(Error::Format)?))),
+            None => Ok((change.name.clone(), None)),
+        })
+        .collect()
+}
+
+fn apply_sources(sources: &mut BTreeMap<String, TreeId>, changes: SourceChanges) {
+    for (name, tree) in changes {
+        match tree {
+            Some(tree) => sources.insert(name, tree),
+            None => sources.remove(&name),
+        };
+    }
 }
 
 impl TreeActor {
@@ -599,6 +636,8 @@ impl TreeActor {
         for (record, tail) in &frames[upto..] {
             replay.apply(record, tail)?;
         }
+        let (rows, sources) =
+            Self::rows_and_sources(&repo, &pointers, &at_built.upstreams, &frames[upto..])?;
         let heads = values
             .iter()
             .filter(|((_, name), _)| {
@@ -626,8 +665,7 @@ impl TreeActor {
         // and the lag gate's to count, as at their call.
         for (record, _) in &frames[upto..] {
             if let Entry::Step { change, .. } = &record.entry {
-                let (tree, bytes) = change.build_cost()?;
-                history.appended_step(record.seq, tree, bytes);
+                history.appended_step(record.seq, change.build_cost()?);
             }
         }
         let builder = Builder {
@@ -658,7 +696,51 @@ impl TreeActor {
             builder: handle,
             built,
             trees: replay.trees,
+            rows,
+            sources,
         })
+    }
+
+    /// The rows and the queue entries' sources as of the journal's last
+    /// record: each built chain's `row.json` and each built entry's tree (a
+    /// landing's `Agentfs-Tree`; a sync's, its queue's upstream), then the
+    /// steps after the built point replayed on them.
+    fn rows_and_sources(
+        repo: &crate::tree_git::TreeGit,
+        built: &Pointers,
+        upstreams: &Upstreams,
+        after: &[journal::Frame],
+    ) -> Result<(SavedRows, BTreeMap<String, TreeId>)> {
+        let mut rows = SavedRows::default();
+        for (name, tip) in built.under(refs::ROWS) {
+            let chain = refs::chain_of_row(&name).ok_or(Error::Format)?;
+            rows.insert(chain, history::format::read_row(repo, tip)?);
+        }
+        let sync = sync_marker();
+        let mut sources = BTreeMap::new();
+        for (name, oid) in built.under(refs::QUEUES) {
+            let source = if oid == sync {
+                let tree = refs::tree_of_queue_entry(&name).ok_or(Error::Format)?;
+                upstreams.upstream_of(tree).ok_or(Error::Format)?
+            } else {
+                history::message::tree_of(&repo.read_commit(oid)?.message)?.ok_or(Error::Format)?
+            };
+            sources.insert(name, source);
+        }
+        for (record, _) in after {
+            if let Entry::Step {
+                change,
+                pointers,
+                rows: written,
+                ..
+            } = &record.entry
+            {
+                rows.apply(written)?;
+                let tree = change.build_cost()?.map(|(tree, _)| tree);
+                apply_sources(&mut sources, queue_sources(tree, pointers)?);
+            }
+        }
+        Ok((rows, sources))
     }
 
     /// Recovers the locked state area of a volume of this format.
@@ -677,6 +759,8 @@ impl TreeActor {
             builder,
             built,
             trees,
+            rows,
+            sources,
         } = Self::start_history(
             &root,
             &lock,
@@ -699,6 +783,8 @@ impl TreeActor {
             pointers: folded.pointers,
             upstreams: folded.upstreams,
             trees,
+            rows,
+            sources,
             handles: BTreeMap::new(),
             pending_closes: Vec::new(),
             // Never a built record's: a journal that ends before the built
@@ -854,14 +940,28 @@ impl TreeActor {
         self.history.snapshot().head(tree).ok_or(Error::NotFound)
     }
 
-    /// Fork IDs are numeric and never reused. Forking a fork is not exposed yet.
-    /// A fork of the root, at the root's saved head.
-    pub fn fork(&mut self) -> Result<TreeId> {
-        let upstream = TreeId::Root;
+    /// One step: a fork of `upstream` at its saved head, and the rows `rows`
+    /// builds for it, given the fork and the step's number (which is the
+    /// fork's). Fork ids are never reused. Its writer is `agentfs` with the
+    /// service's pod context. The store adapter's alone (clippy.toml).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotFound`] for an upstream that is no tree, and for a fork:
+    /// forks are made of the root only (recovery refuses a fork of a fork);
+    /// `rows`' own error; a failed record, which changes nothing.
+    pub fn fork_with<F>(&mut self, upstream: TreeId, rows: F) -> Result<TreeId>
+    where
+        F: FnOnce(TreeId, RecordNo) -> Result<Vec<RowWrite>>,
+    {
         self.tree(upstream)?;
+        if !upstream.is_root() {
+            return Err(Error::NotFound);
+        }
         self.run_pending_closes(upstream, None)?;
         let seq = self.next;
         let fork = TreeId::Fork(seq);
+        let rows = rows(fork, RecordNo::new(seq))?;
         let head = self
             .pointers
             .get(&refs::branch(upstream))
@@ -872,14 +972,18 @@ impl TreeActor {
             old: None,
         }];
         let by = self.agentfs();
-        self.record_step(
+        let (recorded, _) = self.record(
             by,
             Change::Fork {
                 upstream: upstream.to_string(),
             },
             pointers,
             &mut std::iter::empty(),
+            rows,
         )?;
+        if recorded != seq {
+            return Err(Error::Format);
+        }
         self.upstreams.add(seq, upstream);
         let mut tree = self.tree(upstream)?.clone();
         for object in tree.shape.anonymous.clone() {
@@ -888,6 +992,71 @@ impl TreeActor {
         self.trees.insert(fork, tree);
         self.after_step();
         Ok(fork)
+    }
+
+    /// One step of rows alone: no branch moves. `rows` is given the step's
+    /// number. Its writer is `agentfs` with the service's pod context; it never
+    /// waits at the lag gate. The store adapter's alone (clippy.toml).
+    ///
+    /// # Errors
+    ///
+    /// `rows`' own error; a failed record, which changes nothing.
+    pub fn record_rows<F>(&mut self, rows: F) -> Result<RecordNo>
+    where
+        F: FnOnce(RecordNo) -> Result<Vec<RowWrite>>,
+    {
+        if self.is_stopped() {
+            return Err(Error::Stopped);
+        }
+        let seq = self.next;
+        let rows = rows(RecordNo::new(seq))?;
+        let by = self.agentfs();
+        let (recorded, _) =
+            self.record(by, Change::Rows, Vec::new(), &mut std::iter::empty(), rows)?;
+        if recorded != seq {
+            return Err(Error::Format);
+        }
+        self.after_step();
+        Ok(RecordNo::new(seq))
+    }
+
+    /// A chain's row, from the actor's saved rows (never Git's copy): it
+    /// answers while the builder lags or fails. `None`: no row yet.
+    pub fn row(&self, chain: Chain) -> Option<String> {
+        self.rows.get(chain)
+    }
+
+    /// Every chain of `domain` with its row, in chain order.
+    pub fn rows(&self, domain: RowDomain) -> Vec<(Chain, String)> {
+        self.rows.of(domain)
+    }
+
+    /// Every tree whose queue holds an entry, from the journal's pointers:
+    /// never waits for history.
+    pub fn queued(&self) -> Vec<TreeId> {
+        self.trees
+            .keys()
+            .copied()
+            .filter(|tree| self.queue_holds(*tree))
+            .collect()
+    }
+
+    /// Whether `fork`'s upstream's queue holds an entry `fork` queued, from
+    /// the journal's pointers and each entry's source: never waits for
+    /// history. False for the root and for no such tree.
+    pub fn pending_from(&self, fork: TreeId) -> bool {
+        let Some(upstream) = self.upstream_of(fork) else {
+            return false;
+        };
+        self.pointers
+            .under(&refs::queue(upstream))
+            .iter()
+            .any(|(name, _)| self.sources.get(name) == Some(&fork))
+    }
+
+    /// Whether a fork names `fork` as its upstream.
+    pub fn has_child(&self, fork: TreeId) -> bool {
+        self.upstreams.forks_of(fork).next().is_some()
     }
 
     fn tree(&self, tree: TreeId) -> Result<&SavedTree> {
@@ -933,21 +1102,6 @@ impl TreeActor {
         let history = self.history.clone();
         let mut actor = self;
         takes::take_one(&mut actor, &history, tree)
-    }
-
-    /// Whether a landing of `tree` waits in its upstream's queue, once every
-    /// record appended so far is built.
-    ///
-    /// # Errors
-    ///
-    /// As [`TreeActor::settle`], and a failed read of history.
-    #[cfg(test)]
-    pub(in crate::tree_actor) fn pending_from(&self, tree: TreeId) -> Result<bool> {
-        let Some(upstream) = self.upstream_of(tree) else {
-            return Ok(false);
-        };
-        self.settle()?;
-        history::take::pending_from(&self.history.snapshot(), tree, upstream)
     }
 
     /// A change of pointer `name` to `new`, from its value now.
@@ -1012,18 +1166,50 @@ impl TreeActor {
         pointers: Vec<PointerChange>,
         chunks: Chunks<'_>,
     ) -> Result<(u64, Vec<journal::Tail>)> {
+        self.record(by, change, pointers, chunks, Vec::new())
+    }
+
+    /// [`TreeActor::record_step`] with the rows the step writes, in order:
+    /// each chain's pointer moves to this step (`Target::Step`), named here,
+    /// after any compaction, and the rows are the actor's at once.
+    fn record(
+        &mut self,
+        by: WriterAt,
+        change: Change,
+        pointers: Vec<PointerChange>,
+        chunks: Chunks<'_>,
+        rows: Vec<RowWrite>,
+    ) -> Result<(u64, Vec<journal::Tail>)> {
         if self.is_stopped() {
             return Err(Error::Stopped);
         }
-        let (tree, bytes) = change.build_cost()?;
+        let cost = change.build_cost()?;
+        let rows: Vec<RowRecord> = rows.into_iter().map(RowWrite::record).collect();
+        // A take's step comes after its chunk records.
+        let ahead = match &change {
+            Change::Take { take, .. } => take.chunks,
+            _ => 0,
+        };
         let mut pointers = pointers;
-        let recorded = (|| -> Result<(u64, Vec<journal::Tail>)> {
+        let recorded = (|| -> Result<(u64, Vec<journal::Tail>, SourceChanges)> {
             crate::failpoints::hit("tree.before_step")?;
             // A compaction due runs before the step's pointers are checked:
             // values read before it are named as what they were built as.
             self.before_record();
             self.resolve_compacted(&mut pointers)?;
+            // Each chain's pointer, read after any compaction: its old value
+            // is never a step the compaction covers.
+            let step = Target::Step(RecordNo::new(self.next + ahead));
+            let mut chains = BTreeSet::new();
+            for row in &rows {
+                refs::chain_of_row(&row.chain).ok_or(Error::Format)?;
+                chains.insert(row.chain.clone());
+            }
+            for chain in chains {
+                pointers.push(self.change(chain, Some(step.clone())));
+            }
             self.pointers.check_targets(&pointers)?;
+            let sources = queue_sources(cost.map(|(tree, _)| tree), &pointers)?;
             // A take's bytes, then the take: no compaction comes between.
             let mut tails = Vec::new();
             for chunk in chunks {
@@ -1039,12 +1225,13 @@ impl TreeActor {
                     by,
                     change,
                     pointers: pointers.clone(),
+                    rows: rows.clone(),
                 },
                 &[],
             )?;
-            Ok((seq, tails))
+            Ok((seq, tails, sources))
         })();
-        let (seq, tails) = match recorded {
+        let (seq, tails, sources) = match recorded {
             Ok(recorded) => recorded,
             Err(e) => {
                 eprintln!("tree SaveFailed: {e}");
@@ -1052,12 +1239,15 @@ impl TreeActor {
             }
         };
         self.pointers.apply_targets(&pointers);
-        for change in &pointers {
-            if let Some(moved) = refs::tree_of_branch(&change.name) {
+        for moved in &pointers {
+            if let Some(moved) = refs::tree_of_branch(&moved.name) {
                 self.heads.insert(moved, RecordNo::new(seq));
             }
         }
-        self.history.appended_step(RecordNo::new(seq), tree, bytes);
+        // Each chain was checked before the record: this cannot fail.
+        self.rows.apply(&rows)?;
+        apply_sources(&mut self.sources, sources);
+        self.history.appended_step(RecordNo::new(seq), cost);
         Ok((seq, tails))
     }
 
@@ -1124,7 +1314,17 @@ pub(crate) mod test_support {
     use agentfs_contracts::pod::{PodContext, WriterAt};
     use agentfs_contracts::volume::{VolumeId, VolumeIdentity};
 
-    use super::TreeActor;
+    use super::{TreeActor, TreeId};
+
+    /// A fork of the root with no row: the engine's own tests, below the store.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "a tree actor test forks below the store"
+    )]
+    pub(crate) fn rowless_fork(v: &mut TreeActor) -> TreeId {
+        v.fork_with(TreeId::Root, |_, _| Ok(Vec::new()))
+            .expect("forks")
+    }
 
     /// A new volume `test` with a fixed id, served with an empty pod context.
     pub(crate) fn new_actor(dir: &Path) -> TreeActor {
@@ -1151,7 +1351,7 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use super::journal::Frame;
-    use super::test_support::{new_actor, reopen, writer};
+    use super::test_support::{new_actor, reopen, rowless_fork, writer};
     use super::*;
 
     const ROOT: TreeId = TreeId::Root;
@@ -1213,7 +1413,7 @@ mod tests {
         let w = writer("w");
         // Both kinds of live open with calls and page writes, closed opens with
         // both, a fork and a queue entry.
-        let fork = v.fork().unwrap();
+        let fork = rowless_fork(&mut v);
         let held = v.write_open(ROOT, "held", &w, true).unwrap();
         v.write(held, 0, b"held-1", false).unwrap();
         let shared = v.write_open(ROOT, "shared", &w, true).unwrap();
@@ -1311,7 +1511,7 @@ mod tests {
     fn reopen_with(edit: CheckpointEdit) -> Result<TreeActor> {
         let tmp = tempfile::tempdir().unwrap();
         let mut v = new_actor(tmp.path());
-        v.fork().unwrap();
+        rowless_fork(&mut v);
         v.settle().unwrap();
         v.compact().unwrap();
         drop(v);
@@ -1381,6 +1581,7 @@ mod tests {
             "agentfs-trees-6\n",
             "agentfs-trees-7\n",
             "agentfs-trees-8\n",
+            "agentfs-trees-9\n",
         ] {
             let tmp = tempfile::tempdir().unwrap();
             drop(new_actor(tmp.path()));
@@ -1399,20 +1600,80 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut v = new_actor(tmp.path());
         let w = writer("w");
-        let fork = v.fork().unwrap();
-        let other = v.fork().unwrap();
-        assert!(!v.pending_from(fork).unwrap());
-        assert!(!v.pending_from(ROOT).unwrap(), "the root lands nowhere");
+        let fork = rowless_fork(&mut v);
+        let other = rowless_fork(&mut v);
+        assert!(!v.pending_from(fork));
+        assert!(!v.pending_from(ROOT), "the root lands nowhere");
         let h = v.write_open(fork, "f", &w, true).unwrap();
         v.write(h, 0, b"x\n", false).unwrap();
         v.close(h).unwrap();
-        assert!(v.pending_from(fork).unwrap());
+        assert!(v.pending_from(fork));
         assert!(
-            !v.pending_from(other).unwrap(),
+            !v.pending_from(other),
             "another fork's landing is not this fork's"
         );
         while v.take_next(ROOT).unwrap() == Took::Taken {}
-        assert!(!v.pending_from(fork).unwrap());
+        assert!(!v.pending_from(fork));
+    }
+
+    /// The store's one-record fork: the rows land with the branch, and a
+    /// fork of a fork is refused before anything is recorded.
+    #[test]
+    #[allow(clippy::disallowed_methods, reason = "the actor's own fork step")]
+    fn a_fork_with_rows_is_one_step_and_only_of_the_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut v = new_actor(tmp.path());
+        let row = |chain, text: &str| RowWrite {
+            chain,
+            row: text.to_owned(),
+            event: RowEvent {
+                kind: "ForkCreated",
+                detail: String::new(),
+                by: "agentfs".to_owned(),
+                at: PodContext::default(),
+            },
+        };
+        let before = v.durability().appended();
+        let fork = v
+            .fork_with(ROOT, |fork, step| {
+                assert_eq!(fork, TreeId::Fork(step.get()));
+                let chain = Chain::Trees(fork.fork().unwrap());
+                Ok(vec![row(chain, "one"), row(chain, "two")])
+            })
+            .unwrap();
+        assert_eq!(
+            v.durability().appended().get(),
+            before.get() + 1,
+            "one record"
+        );
+        let chain = Chain::Trees(fork.fork().unwrap());
+        assert_eq!(v.row(chain).as_deref(), Some("two"));
+        assert!(matches!(
+            v.fork_with(fork, |_, _| Ok(Vec::new())),
+            Err(Error::NotFound)
+        ));
+        assert_eq!(v.trees(), [ROOT, fork]);
+        let step = v
+            .record_rows(|_| Ok(vec![row(Chain::Volume, "v")]))
+            .unwrap();
+        assert_eq!(step.get(), before.get() + 2);
+        assert_eq!(v.rows(RowDomain::Volume), [(Chain::Volume, "v".to_owned())]);
+        v.settle().unwrap();
+        // Two commits on the fork's chain, from one step; one on the volume's.
+        let count = |name: &str| {
+            let out = std::process::Command::new("git")
+                .env("GIT_DIR", tmp.path().join("history.git"))
+                .args(["rev-list", "--count", name])
+                .output()
+                .unwrap();
+            String::from_utf8(out.stdout).unwrap().trim().to_owned()
+        };
+        assert_eq!(count(&refs::row_chain(chain)), "2");
+        assert_eq!(count(&refs::row_chain(Chain::Volume)), "1");
+        drop(v);
+        let v = reopen(tmp.path());
+        assert_eq!(v.row(chain).as_deref(), Some("two"));
+        assert_eq!(v.row(Chain::Volume).as_deref(), Some("v"));
     }
 
     #[test]

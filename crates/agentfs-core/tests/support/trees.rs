@@ -8,7 +8,7 @@ use std::path::Path;
 use agentfs_contracts::name::{VolumeName, WriterLabel};
 use agentfs_contracts::pod::{PodContext, WriterAt};
 use agentfs_contracts::volume::{VolumeId, VolumeIdentity};
-use agentfs_core::tree_actor::TreeActor;
+use agentfs_core::tree_actor::{TreeActor, TreeId};
 
 /// The identity [`new_actor`] gives: `test`, with a fixed id.
 pub fn identity() -> VolumeIdentity {
@@ -21,6 +21,17 @@ pub fn identity() -> VolumeIdentity {
 /// A new volume [`identity`], served with an empty pod context.
 pub fn new_actor(dir: &Path) -> TreeActor {
     TreeActor::create(dir, &identity(), &PodContext::default()).expect("creates")
+}
+
+/// A fork of the root with no row: the engine's own tests, below the store
+/// adapter that writes each fork's row (`agentfs_core::store`).
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a tree actor test forks below the store"
+)]
+pub fn rowless_fork(v: &mut TreeActor) -> TreeId {
+    v.fork_with(TreeId::Root, |_, _| Ok(Vec::new()))
+        .expect("forks")
 }
 
 /// Opens the volume again.

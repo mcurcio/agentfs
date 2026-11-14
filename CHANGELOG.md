@@ -12,6 +12,18 @@ design was reviewed on 2026-10-12.
 
 ### Added
 
+- **Tree views: volume events on record as commits.** A fork's row is a commit
+  on its own chain, `refs/agentfs/trees/fork/<n>`, beside the fork: its tree is
+  `row.json` (the row with its audit stamps) and its message the event
+  (`ForkCreated`, with `Agentfs-Kind`, `Agentfs-By`, `Agentfs-Event` and the
+  volume and pod trailers, `Agentfs-Format: row-1`). The fork's branch and its row
+  are one journal record, durable before the call returns; the event commit is
+  built behind it. `trees fork` and a mount's new sandbox create forks through
+  the Trees domain on the new store adapter (`agentfs_core::store::TreeStore`).
+  Rows and queue facts are read from the journal, never Git, so they answer while
+  the builder lags or fails (docs/trees.md, "Rows and event commits"). The tree
+  state format is `agentfs-trees-10`; a state area of any other format is
+  refused, never converted.
 - **Tree views: a large file costs its save, not memory.** A line map holds each
   line's identity and version as runs, never its bytes: bytes have one home, the
   file. A save's alignment reads both versions a line at a time (a new file and an

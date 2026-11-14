@@ -6,6 +6,8 @@ use agentfs_contracts::name::{Label, WriterLabel};
 use agentfs_contracts::pod::{PodContext, WriterAt};
 use agentfs_contracts::volume::VolumeIdentity;
 
+use crate::tree_actor::journal::RowRecord;
+use crate::tree_actor::rows::Chain;
 use crate::tree_actor::tree::EventNumber;
 use crate::tree_actor::{Error, Result, TreeId, referee};
 
@@ -24,6 +26,10 @@ const COLLISIONS: &str = "Agentfs-Collisions: ";
 /// The cause a direct save's commit carries, written by `render` and read by `direct_event`.
 const DIRECT: &str = "Direct";
 const ENVELOPE: &str = "Agentfs-Format: envelope-1";
+const KIND: &str = "Agentfs-Kind: ";
+const BY: &str = "Agentfs-By: ";
+/// An event commit's format: no file-commit reader takes one for a save.
+const ROW_FORMAT: &str = "Agentfs-Format: row-1";
 
 /// A direct save's subject word: the call that saved.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -72,6 +78,16 @@ pub(in crate::tree_actor) enum Message<'a> {
     Sync {
         service: &'a PodContext,
         tree: TreeId,
+        event: EventNumber,
+    },
+    /// An event commit on a row chain: "{kind} {detail}"; `Agentfs-Kind`,
+    /// `Agentfs-By`, the chain's tree (none for the volume's), the step, the
+    /// volume, the principal's pod context, `Agentfs-Format: row-1`. No
+    /// `Agentfs-Writer` or `Agentfs-Cause`: no file-commit reader takes it
+    /// for a save.
+    Row {
+        row: &'a RowRecord,
+        chain: Chain,
         event: EventNumber,
     },
 }
@@ -143,19 +159,15 @@ impl Message<'_> {
                 *tree,
                 Some(*event),
             ),
+            Self::Row { row, chain, event } => {
+                return Ok(render_row(row, *chain, *event, volume));
+            }
         };
         let mut message = format!(
-            "{subject}\n\n{WRITER}{writer}\n{CAUSE}{cause}\n{TREE}{tree}\n{EVENT}{}\n\
-             {VOLUME}{}\n{VOLUME_ID}{}\n",
+            "{subject}\n\n{WRITER}{writer}\n{CAUSE}{cause}\n{TREE}{tree}\n{EVENT}{}\n",
             event.map_or(0, EventNumber::get),
-            volume.name,
-            volume.id.0.hyphenated(),
         );
-        for (key, value) in pod_fields(at) {
-            if let Some(value) = value {
-                message.push_str(&format!("{key}{value}\n"));
-            }
-        }
+        push_volume_and_pod(&mut message, volume, at);
         if event.is_some() {
             message.push_str(ENVELOPE);
             message.push('\n');
@@ -171,6 +183,45 @@ impl Message<'_> {
         }
         Ok(message)
     }
+}
+
+/// The trailers every message shares after its event: the volume, its id, and
+/// each present pod field.
+fn push_volume_and_pod(message: &mut String, volume: &VolumeIdentity, at: &PodContext) {
+    message.push_str(&format!(
+        "{VOLUME}{}\n{VOLUME_ID}{}\n",
+        volume.name,
+        volume.id.0.hyphenated()
+    ));
+    for (key, value) in pod_fields(at) {
+        if let Some(value) = value {
+            message.push_str(&format!("{key}{value}\n"));
+        }
+    }
+}
+
+/// An event commit's message (git-model §4): subject, Kind, By, the chain's
+/// tree, Event, the shared trailers, then the row format.
+fn render_row(
+    row: &RowRecord,
+    chain: Chain,
+    event: EventNumber,
+    volume: &VolumeIdentity,
+) -> String {
+    let subject = if row.detail.is_empty() {
+        row.kind.clone()
+    } else {
+        format!("{} {}", row.kind, row.detail)
+    };
+    let mut message = format!("{subject}\n\n{KIND}{}\n{BY}{}\n", row.kind, row.by);
+    if let Some(tree) = chain.tree() {
+        message.push_str(&format!("{TREE}{tree}\n"));
+    }
+    message.push_str(&format!("{EVENT}{event}\n"));
+    push_volume_and_pod(&mut message, volume, &row.at);
+    message.push_str(ROW_FORMAT);
+    message.push('\n');
+    message
 }
 
 fn lines(message: &[u8]) -> Option<std::str::Lines<'_>> {
@@ -415,6 +466,50 @@ mod tests {
                 )
             );
         }
+    }
+
+    #[test]
+    fn a_row_message_is_its_literal_text() {
+        let row = |detail: &str, at: PodContext| RowRecord {
+            chain: String::new(),
+            row: "{}".to_owned(),
+            kind: "ForkCreated".to_owned(),
+            detail: detail.to_owned(),
+            by: "launcher cli".to_owned(),
+            at,
+        };
+        let fork = row("", PodContext::default());
+        assert_eq!(
+            render(&Message::Row {
+                row: &fork,
+                chain: Chain::Trees(agentfs_contracts::tree::ForkId(7)),
+                event: EventNumber::new(7),
+            }),
+            format!(
+                "ForkCreated\n\nAgentfs-Kind: ForkCreated\nAgentfs-By: launcher cli\nAgentfs-Tree: fork/7\nAgentfs-Event: 7\n{VOLUME_TEXT}Agentfs-Format: row-1\n"
+            )
+        );
+        let detailed = row("of root", pod());
+        assert_eq!(
+            render(&Message::Row {
+                row: &detailed,
+                chain: Chain::Volume,
+                event: EventNumber::new(12),
+            }),
+            format!(
+                "ForkCreated of root\n\nAgentfs-Kind: ForkCreated\nAgentfs-By: launcher cli\nAgentfs-Event: 12\n{VOLUME_TEXT}{POD_TEXT}Agentfs-Format: row-1\n"
+            )
+        );
+        let text = render(&Message::Row {
+            row: &fork,
+            chain: Chain::Clients(TreeId::Root),
+            event: EventNumber::new(3),
+        });
+        assert!(text.contains("\nAgentfs-Tree: root\n"), "{text}");
+        // No file-commit reader takes an event commit for a save.
+        assert_eq!(writer_at(text.as_bytes()).unwrap(), None);
+        assert_eq!(direct_event(text.as_bytes()), None);
+        assert!(!is_envelope(text.as_bytes()));
     }
 
     #[test]

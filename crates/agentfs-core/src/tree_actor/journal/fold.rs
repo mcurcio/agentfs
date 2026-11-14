@@ -109,7 +109,7 @@ impl Folded {
             Change::Fork { upstream } => {
                 self.upstreams.add(seq, upstream.parse::<TreeId>()?);
             }
-            Change::Rename { .. } | Change::Unlink { .. } | Change::Take { .. } => {}
+            Change::Rename { .. } | Change::Unlink { .. } | Change::Take { .. } | Change::Rows => {}
         }
         Ok(())
     }
@@ -301,6 +301,7 @@ impl Replay {
                 }
                 self.trees.insert(TreeId::Fork(seq), fork);
             }
+            Change::Rows => {}
             Change::Take { tree, take } => {
                 let chunks = take_chunks(&mut self.bytes, seq, take.chunks)?;
                 let maps = if self.maps {
@@ -442,6 +443,7 @@ pub(in crate::tree_actor) fn fold(frames: &[Frame]) -> Result<Folded> {
                 by,
                 change,
                 pointers,
+                ..
             } => {
                 folded.pointers.check_targets(pointers)?;
                 folded.pointers.apply_targets(pointers);

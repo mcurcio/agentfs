@@ -39,6 +39,40 @@ fn c_path(p: &Path) -> Result<CString, CallError> {
     CString::new(p.as_os_str().as_bytes()).map_err(|e| CallError::new(e.to_string()))
 }
 
+/// Discards the events: this harness consumes none.
+struct NoConsumers;
+
+impl agentfs_contracts::ports::EventSink for NoConsumers {
+    fn publish(&mut self, _: agentfs_contracts::ports::Event) {}
+}
+
+/// The sandbox's fork, made as the trial CLI makes one: through the Trees
+/// domain on the store adapter, so the fork's row is on its chain.
+fn sandbox_fork(
+    recording: &std::sync::Arc<agentfs_core::tree_actor::Recording>,
+) -> Result<EngineTree, CallError> {
+    use agentfs_contracts::caps::{LaunchCap, LaunchScope, Minter};
+    use agentfs_contracts::name::LauncherId;
+    use agentfs_contracts::trees::{ForkSettings, Landing, Trees};
+    let store = agentfs_core::store::TreeStore::new(std::sync::Arc::clone(recording));
+    let mut trees = agentfs_trees::TreesService::restore(store.clone(), store, NoConsumers)
+        .map_err(|e| CallError::new(e.to_string()))?;
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the harness is its own composition root"
+    )]
+    let minter = Minter::new();
+    let launcher = LauncherId::parse("conformance").map_err(|e| CallError::new(e.to_string()))?;
+    let cap = LaunchCap::mint(&minter, launcher, LaunchScope::Root);
+    let settings = ForkSettings {
+        landing: Landing::Automatic,
+    };
+    let fork = trees
+        .create(EngineTree::Root, None, settings, &cap)
+        .map_err(|e| CallError::new(e.to_string()))?;
+    Ok(fork.into())
+}
+
 /// A mount of the root and at most one sandbox, and the opens this harness holds.
 pub struct Mounted {
     bin: PathBuf,
@@ -79,11 +113,21 @@ impl Mounted {
             std::fs::create_dir_all(dir).map_err(|e| io_fail("mkdir", &e))?;
         }
         {
-            let mut volume = crate::library::create(&state).map_err(fail)?;
-            seed(&mut volume, names.name(TreeId::ROOT)?).map_err(fail)?;
+            let recording = agentfs_core::tree_actor::Recording::create(
+                &state,
+                &crate::library::identity(),
+                &agentfs_contracts::pod::PodContext::default(),
+            )
+            .map_err(fail)?;
+            seed(
+                &mut *recording.actor().map_err(fail)?,
+                names.name(TreeId::ROOT)?,
+            )
+            .map_err(fail)?;
             if with_sandbox {
-                names.forked(volume.fork().map_err(fail)?)?;
+                names.forked(sandbox_fork(&recording)?)?;
             }
+            // Every record durable and built, and the lease free, at the drop.
         }
         for fifo in ["go", "took"] {
             let path = c_path(&gate.join(fifo))?;

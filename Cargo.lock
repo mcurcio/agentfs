@@ -47,6 +47,7 @@ dependencies = [
  "agentfs-core",
  "agentfs-csi",
  "agentfs-fuse",
+ "agentfs-trees",
  "agentfs-volume",
  "anyhow",
  "clap",
@@ -94,6 +95,7 @@ dependencies = [
  "agentfs-contracts",
  "agentfs-core",
  "agentfs-model",
+ "agentfs-trees",
  "libc",
  "serde_json",
  "tempfile",
@@ -116,6 +118,7 @@ version = "0.1.0"
 dependencies = [
  "agentfs-align",
  "agentfs-contracts",
+ "agentfs-trees",
  "agentfs-volume",
  "base64 0.23.1",
  "bstr",

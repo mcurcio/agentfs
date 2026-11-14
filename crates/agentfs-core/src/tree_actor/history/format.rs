@@ -29,6 +29,8 @@ use crate::tree_actor::tree::{FileBytes, Lines, MergeFileIdentity, NameHistory, 
 use crate::tree_actor::{Error, Result, referee};
 use crate::tree_git::{TreeEntry, TreeGit};
 
+/// An event commit's one blob: its chain's row, as the store wrote it.
+pub(in crate::tree_actor) const ROW_FILE: &str = "row.json";
 const FILES: &str = "files";
 const LINES: &str = "lines";
 const NAMES: &str = "names";
@@ -135,6 +137,29 @@ pub(in crate::tree_actor) fn edits(
         }
     }
     Ok(edits)
+}
+
+/// The edits of an event commit: its tree is `row.json` alone, whatever its
+/// parent's held.
+pub(in crate::tree_actor) fn row_edits(row: &str) -> Vec<Edit> {
+    vec![
+        Edit::DeleteAll,
+        Edit::Inline {
+            path: ROW_FILE.to_owned(),
+            bytes: row.as_bytes().to_vec(),
+        },
+    ]
+}
+
+/// A built event commit's row: its `row.json`.
+///
+/// # Errors
+///
+/// [`Error::Format`] for a commit with no `row.json` or one that is not UTF-8.
+pub(in crate::tree_actor) fn read_row(repo: &TreeGit, commit: Oid) -> Result<String> {
+    let tree = repo.read_commit(commit)?.tree;
+    let blob = entry(&repo.list_tree(tree)?, ROW_FILE).ok_or(Error::Format)?;
+    String::from_utf8(repo.read_blob(blob)?).map_err(|_| Error::Format)
 }
 
 /// The entry `name` of a listing.

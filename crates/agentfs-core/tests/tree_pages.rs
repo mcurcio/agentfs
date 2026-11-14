@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use agentfs_core::tree_actor::{TreeActor, TreeId};
-use trees::{checkout, new_actor, reopen, writer};
+use trees::{checkout, new_actor, reopen, rowless_fork, writer};
 
 #[path = "support/trees.rs"]
 mod trees;
@@ -537,7 +537,7 @@ fn a_take_names_the_files_it_changed_and_a_save_does_not() {
     let h = v.write_open(TREE, "other", &writer("seed"), true).unwrap();
     v.write(h, 0, b"other", false).unwrap();
     v.close(h).unwrap();
-    let fork = v.fork().unwrap();
+    let fork = rowless_fork(&mut v);
     while v.progress().unwrap() {}
     v.drain_changed();
 

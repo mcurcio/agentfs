@@ -318,11 +318,14 @@ impl History {
         state.checkpointed = state.checkpointed.max(built);
     }
 
-    /// The actor appended step `step` in `tree`, adding about `bytes` for the
-    /// builder to write: the builder's event, and the gate's count.
-    pub(in crate::tree_actor) fn appended_step(&self, step: RecordNo, tree: TreeId, bytes: u64) {
+    /// The actor appended step `step`, with `cost` its tree and about the
+    /// bytes it adds for the builder to write: the builder's event, and the
+    /// gate's count. `None` (rows alone) adds to no tree's lag.
+    pub(in crate::tree_actor) fn appended_step(&self, step: RecordNo, cost: Option<(TreeId, u64)>) {
         let mut state = self.state();
-        state.gate.appended(tree, step, bytes);
+        if let Some((tree, bytes)) = cost {
+            state.gate.appended(tree, step, bytes);
+        }
         let now = Instant::now();
         state.oldest_unbuilt.get_or_insert(now);
         state.unbuilt.push_back((step, now));

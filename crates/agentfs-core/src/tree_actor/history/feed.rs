@@ -55,8 +55,27 @@ pub(in crate::tree_actor) enum Edit {
     DeleteAll,
 }
 
+/// The scratch ref a batch's commits go on: `refs/build/<tree>` for a tree's
+/// commits, `refs/build/rows` for every event commit. Each is deleted once
+/// the batch's refs are copied.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(in crate::tree_actor) enum BuildRef {
+    Tree(TreeId),
+    Rows,
+}
+
+impl BuildRef {
+    pub(in crate::tree_actor) fn refname(self) -> String {
+        match self {
+            Self::Tree(tree) => format!("refs/build/{tree}"),
+            Self::Rows => "refs/build/rows".to_owned(),
+        }
+    }
+}
+
 pub(in crate::tree_actor) struct CommitSpec<'a> {
-    pub tree: TreeId,
+    pub on: BuildRef,
+    /// Empty only on [`BuildRef::Rows`]: a chain's first event commit.
     pub parents: &'a [Parent],
     pub at_ns: u64,
     pub message: &'a str,
@@ -160,28 +179,35 @@ impl Feed {
         Ok(mark)
     }
 
-    /// `commit refs/build/<tree>`, author and committer `agentfs
+    /// `commit` on the spec's scratch ref, author and committer `agentfs
     /// <agentfs@localhost>` at `at_ns` in `+0000`, `from` and `merge` from
-    /// `parents`, then the edits: the bytes `git commit-tree` would write.
+    /// `parents`, then the edits: the bytes `git commit-tree` would write. A
+    /// commit with no parent (a row chain's first) follows a `reset` of its
+    /// ref, so fast-import starts it from nothing.
     pub fn commit(&mut self, spec: &CommitSpec<'_>) -> Result<u64, BuildError> {
+        if spec.parents.is_empty() && spec.on != BuildRef::Rows {
+            return Err(packer("a built commit has a parent"));
+        }
         let mark = self.mark();
         let seconds = spec.at_ns / 1_000_000_000;
         let ident = format!("agentfs <agentfs@localhost> {seconds} +0000");
+        let refname = spec.on.refname();
         let out = self.out()?;
+        if spec.parents.is_empty() {
+            write!(out, "reset {refname}\n\n").map_err(packer)?;
+        }
         write!(
             out,
-            "commit refs/build/{}\nmark :{mark}\nauthor {ident}\ncommitter {ident}\ndata {}\n",
-            spec.tree,
+            "commit {refname}\nmark :{mark}\nauthor {ident}\ncommitter {ident}\ndata {}\n",
             spec.message.len()
         )
         .map_err(packer)?;
         out.write_all(spec.message.as_bytes()).map_err(packer)?;
         out.write_all(b"\n").map_err(packer)?;
         let mut parents = spec.parents.iter();
-        let first = parents
-            .next()
-            .ok_or_else(|| packer("a built commit has a parent"))?;
-        writeln!(out, "from {}", first.dataref()).map_err(packer)?;
+        if let Some(first) = parents.next() {
+            writeln!(out, "from {}", first.dataref()).map_err(packer)?;
+        }
         for parent in parents {
             writeln!(out, "merge {}", parent.dataref()).map_err(packer)?;
         }
@@ -317,7 +343,7 @@ mod tests {
         let blob = feed.blob(b"hello\n").unwrap();
         let first = feed
             .commit(&CommitSpec {
-                tree: TreeId::Root,
+                on: BuildRef::Tree(TreeId::Root),
                 parents: &[Parent::Built(root)],
                 at_ns: 1_700_000_000_000_000_000,
                 message: "Direct by w\n",
@@ -335,7 +361,7 @@ mod tests {
             .unwrap();
         let second = feed
             .commit(&CommitSpec {
-                tree: TreeId::Fork(3),
+                on: BuildRef::Tree(TreeId::Fork(3)),
                 parents: &[Parent::Mark(first)],
                 at_ns: 1_700_000_001_000_000_000,
                 message: "next\n",
@@ -367,6 +393,60 @@ mod tests {
             .output()
             .unwrap();
         assert!(fsck.status.success(), "{fsck:?}");
+    }
+
+    /// Two chains' first event commits in one batch, on the one rows ref:
+    /// each a root commit, never the other's child.
+    #[test]
+    fn a_first_event_commit_has_no_parent_on_the_shared_rows_ref() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = TreeGit::init(dir.path().join("r.git")).unwrap();
+        let mut feed = Feed::start(&repo, &dir.path().join("build.marks")).unwrap();
+        let row = |feed: &mut Feed, parents: &[Parent], text: &str| {
+            feed.commit(&CommitSpec {
+                on: BuildRef::Rows,
+                parents,
+                at_ns: 1_700_000_000_000_000_000,
+                message: "ForkCreated\n",
+                edits: &[
+                    Edit::DeleteAll,
+                    Edit::Inline {
+                        path: "row.json".into(),
+                        bytes: text.as_bytes().to_vec(),
+                    },
+                ],
+            })
+            .unwrap()
+        };
+        let one = row(&mut feed, &[], "1");
+        let two = row(&mut feed, &[], "2");
+        let next = row(&mut feed, &[Parent::Mark(one)], "1b");
+        assert!(
+            feed.commit(&CommitSpec {
+                on: BuildRef::Tree(TreeId::Root),
+                parents: &[],
+                at_ns: 0,
+                message: "x\n",
+                edits: &[],
+            })
+            .is_err(),
+            "only an event commit may have no parent"
+        );
+        let marks = feed.finish().unwrap();
+        repo.refresh().unwrap();
+        assert!(repo.read_commit(marks[&one]).unwrap().parents.is_empty());
+        assert!(repo.read_commit(marks[&two]).unwrap().parents.is_empty());
+        assert_eq!(
+            repo.read_commit(marks[&next]).unwrap().parents,
+            vec![marks[&one]]
+        );
+        let names: Vec<_> = repo
+            .list_tree(repo.read_commit(marks[&next]).unwrap().tree)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert_eq!(names, vec![b"row.json".to_vec()]);
     }
 
     #[test]

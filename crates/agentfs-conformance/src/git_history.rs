@@ -15,6 +15,11 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
+/// Every file commit, newest first: `rev-list` over every ref but the row
+/// chains under `refs/agentfs/`, which hold event commits (docs/trees.md,
+/// "Rows and event commits").
+pub const FILE_COMMITS: [&str; 3] = ["rev-list", "--exclude=refs/agentfs/*", "--all"];
+
 /// A line version in a commit: the file's identity, the line's, the bytes.
 #[derive(Clone, Debug)]
 pub(crate) struct FileMap {
@@ -470,7 +475,8 @@ impl EngineHistory {
         }
         let forks = self.git.run(&EngineNames::LIST_FORKS)?;
         self.names.read_forks(&forks).map_err(|e| e.to_string())?;
-        for oid in self.git.run(&["rev-list", "--all"])?.lines() {
+        // Every file commit: the row chains hold event commits only.
+        for oid in self.git.run(&FILE_COMMITS)?.lines() {
             if self.seen.insert(oid.to_owned())
                 && self.git.header(oid)?.trailers("Agentfs-Cause") == ["Landing"]
             {

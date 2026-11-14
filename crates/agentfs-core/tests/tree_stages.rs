@@ -8,7 +8,7 @@ use std::sync::Mutex;
 use agentfs_contracts::pod::PodContext;
 use agentfs_core::tree_actor::stages::Stages;
 use agentfs_core::tree_actor::{Recording, Saved, TreeActor, TreeId};
-use trees::{identity, new_actor, reopen, writer};
+use trees::{identity, new_actor, reopen, rowless_fork, writer};
 
 #[path = "support/trees.rs"]
 mod trees;
@@ -472,7 +472,7 @@ fn a_sync_costs_the_same_children_at_any_history_length() {
     let tmp = tempfile::tempdir().unwrap();
     let state = tmp.path().join("state");
     let mut v = new_actor(&state);
-    v.fork().unwrap();
+    rowless_fork(&mut v);
     let cycle = |v: &mut TreeActor, i: u64| {
         v.settle().unwrap();
         let before = Stages::current().git_children;
@@ -517,7 +517,7 @@ fn a_sync_costs_the_same_children_for_any_number_of_lines() {
     let children = |lines: usize| {
         let tmp = tempfile::tempdir().unwrap();
         let mut v = new_actor(&tmp.path().join("state"));
-        v.fork().unwrap();
+        rowless_fork(&mut v);
         let bytes: Vec<u8> = (0..lines)
             .flat_map(|i| format!("line {i}\n").into_bytes())
             .collect();

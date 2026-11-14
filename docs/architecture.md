@@ -72,7 +72,7 @@ missing from these tables or a row names a module that no longer exists;
 | Module | Role |
 |---|---|
 | `lib.rs` | Crate root: the Trees domain's overview |
-| `service.rs` | The Trees domain over its ports: fork create, end, end by key, the drop and the reaction to a tree's last detach |
+| `service.rs` | The Trees domain over its ports: every fork's row restored at boot, the facts Clients asks, the live forks, an unkeyed fork create (`ForkCreated` once its step is durable); end, end by key, the drop and the reaction to a tree's last detach (slice S5) |
 
 ### `agentfs-core`
 
@@ -82,17 +82,18 @@ missing from these tables or a row names a module that no longer exists;
 | `volume.rs` | Opens a state area: crash recovery, then the [`Recorder`](#the-synchronous-step) used at every boundary and the `Committer` that turns records into commits |
 | `record.rs` | What the journal stores: one record per change boundary, absolute state, never deltas |
 | `state_area.rs` | The `StateArea` port over the tree actor: inspect without the lock, create a volume with a new id, open and keep the recovered volume, served (`Recording`) |
+| `store.rs` | The domains' store ports over one served volume (`TreeStore`): Trees' `ForkStore` and the `QueueFacts`, each write one journal step (a fork and its row, or rows alone) made durable before it returns, off the actor's lock; the audit stamps' one home (`created` set once, `changed` each write); the ports' word for each actor failure |
 | `tree_actor/mod.rs` | The tree actor: the actor, recovery and queue orchestration. A step is one unit of work: decided, appended to the journal as the change itself, applied to the saved state, with no git on the call path; creating a volume (its identity file, then `format` last), inspecting and opening a state area, recovery (history built through the journal, then abandoned opens closed); each tree's last head-moving step and the keys steps touched, which a take's land checks |
 | `tree_actor/history/mod.rs` | Tree history: the store opened and created in one place, snapshots read from commits with each tree's object numbers, the owners of direct saves, private checkouts, and the clean-up of a cut-short build's packs |
 | `tree_actor/history/builder.rs` | The builder, on its own thread: reads durable records from its own cursor along the segments, replays each step on the built trees with the actor's transitions, packs a batch's commits with `git fast-import` (a file's blob streamed from its map), then installs pack, built-log entry, refs, `config` and checkouts in that order, and rebases the checked-out files' maps onto their checkouts for the actor to take; a replay that disagrees with its record stops building (`Disagrees`) |
 | `tree_actor/history/built_log.rs` | The built log, the builder's own file: one fsynced entry per batch naming the built point and the value each step's build gave its pointers |
 | `tree_actor/history/feed.rs` | The builder's packer: one `git fast-import` child per batch, fed blobs and commits; fsyncs the pack files it installed and their directory |
 | `tree_actor/history/lag.rs` | The lag gate's arithmetic, pure: each tree's lag from its unbuilt steps and the builder's measured rates, whether its new work may start, the health it gives, and the alarm and limit (constants) |
-| `tree_actor/history/format.rs` | A tree commit's layout, its one home: `files/`, `lines/` and `names/` under two levels of hashed folders, written as edits of the changed paths and read back as snapshots and checkouts |
+| `tree_actor/history/format.rs` | A tree commit's layout, its one home: `files/`, `lines/` and `names/` under two levels of hashed folders, written as edits of the changed paths and read back as snapshots and checkouts; an event commit's one `row.json` |
 | `tree_actor/call_path.rs` | The call path as a view host, the CLI and the conformance replay reach it (`Recording`): the actor behind its one lock, with durability waits outside it, blocking or deferred to a callback; History reached without the lock; takes, each decided with the lock released, and `settle`; dropping it makes every record durable and builds every step. The lag gate holds a tree's calls that start new work while its lag is over the limit, deferred to a callback for the view |
 | `tree_actor/history/built.rs` | History as built, the one owner of a tree volume's Git store: the built point, built snapshots (only it constructs one), built and failed events that wake waiters and the builder, the oldest unbuilt step's age and the builder's health |
-| `tree_actor/history/message.rs` | Every message a tree-view commit carries, its one home: each message's bytes (Root, direct saves, landings, syncs) with the volume and pod trailers, and the readers of its trailers, the landed writer's among them (target git-model §5) |
-| `tree_actor/history/refs.rs` | The ref layout of a tree volume's history, its one home: branches, queues and their entries, collision refs, and the tips that reach every save (target git-model §4) |
+| `tree_actor/history/message.rs` | Every message a tree-view commit carries, its one home: each message's bytes (Root, direct saves, landings, syncs, event commits) with the volume and pod trailers, and the readers of its trailers, the landed writer's among them (target git-model §5) |
+| `tree_actor/history/refs.rs` | The ref layout of a tree volume's history, its one home: branches, queues and their entries, collision refs, the row chains under `refs/agentfs/`, and the tips that reach every save (target git-model §4) |
 | `tree_actor/history/take.rs` | Queue takes decided on built history: a landing judged by the referee into its upstream, and a fork's prefix sync planned from its upstream's commits, each as the head move, snapshot and collisions a take step records |
 | `tree_actor/history/upstreams.rs` | Each fork's upstream, the shape of a volume's trees: added when a fork is made, checked at recovery, and written as the journal's checkpoint and Git's config |
 | `tree_actor/journal/mod.rs` | The actor's journal: salted checksummed frames in segments, each appended with one write and no fsync and carrying the durable mark, each returning where its tail is; the commit point for calls and steps (a step's record is the change itself and the pointer changes its build publishes), torn-tail and corruption rules across segments, compaction as a checkpoint segment and segments dropped behind it (a live open's frames copied forward only when the dead bytes they pin exceed their own, and where each went recorded for the actor and the builder to move to), and the builder's reads of a frame at an offset (target git-model §3) |
@@ -105,6 +106,7 @@ missing from these tables or a row names a module that no longer exists;
 | `tree_actor/recording/file_map.rs` | File maps: a file's bytes as pieces of journal frames and of the checkout's file as built (`BaseFile`), never bytes in memory; the one apply the actor's saved state, an open's view and the builder's replay run, reads per piece, the comparison of an open's runs, the rebase onto a checkout and the save record's digest of the pieces |
 | `tree_actor/recording/pages.rs` | The kernel's one page cache per file: page fills, page writes and the size replies for shared mappings, and the one rule of which page-write pieces a close applies, which the actor and the builder both run (rules ledger, R1.4) |
 | `tree_actor/queue.rs` | Queue and locks: P1 eligibility, held keys and the `Cut` of a prefix sync |
+| `tree_actor/rows.rs` | Rows, domain-agnostic: a row chain (`Chain`) and its domain, a step's row writes and their events, and each chain's row as the journal's records leave them (`SavedRows`, the one apply the call and the replay run) |
 | `tree_actor/referee/mod.rs` | The referee: every line and name rule of a fork and its upstream, pure. `land` composes verdicts, names, placing and whole into a decision; `sync` keeps a fork's undecided versions; `touches` gives a step's lock keys |
 | `tree_actor/referee/ancestry.rs` | The one ancestry walk (`descends`) over names and lines alike, and the one union of line ancestries |
 | `tree_actor/referee/names.rs` | Names: a landing's name onto a path a live upstream file holds (R11.2), and a sync's names with the fork's undecided ones kept |
@@ -236,7 +238,8 @@ missing from these tables or a row names a module that no longer exists;
 
 | Module | Role |
 |---|---|
-| `trees_cmd.rs` | `trees init` (`ensure` through the Volume domain), `fork` and `mount` composition root; separate state format |
+| `trees_cmd.rs` | `trees init` (`ensure` through the Volume domain), `fork` and `mount` composition root (a new fork through the Trees domain on the store adapter); separate state format |
+| `domain_events.rs` | The composition root's in-process event queue (`DomainEvents`): every domain service of a volume publishes to one, in order |
 | `pod_args.rs` | The pod flags (`--namespace`, `--pod`, `--pod-uid`, `--node`) one clap group shares between the recording engine's commands and `trees` |
 | `main.rs` | The CLI (`Cli`), command dispatch, `init`, `status`, `record`, `flush`, `push` (direct), `run` and `mount` |
 | `daemon.rs` | Signals and shutdown for `run` and `mount` |

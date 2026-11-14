@@ -37,6 +37,7 @@ recorded; [guarantees](../guarantees.md) says what the engine promises.
 | Several mounts, one writer | `history_service` | `HistoryServer`, `HistoryClient`, `FrontLease` |
 | Large files | `lfs` | `ObjectCache`, `Store`, `fetch`, `prune` |
 | Git-backed tree views | `tree_actor`, `state_area` | `TreeActor`, `TreeId` (a tree's identity, `root` or `fork/<n>`), `inspect`, `TreeStateArea` (the Volume domain's `StateArea` port) |
+| The domains' rows over a tree volume | `store`, `tree_actor` | `TreeStore` (the `ForkStore` and `QueueFacts` ports), `Chain`, `RowDomain`, `RowWrite`, `RowEvent` |
 | Line identity across saves | `tree_reconcile` | `LineMap` (runs of lines, never bytes), `LineMap::align` (git's histogram diff over two `Image`s, read a line at a time), `LineMap::append`, `LineMap::expand` (line by line, for the landing rules), `pieces` (where a merged file's lines are in its sources): the line-map library, generic over the caller's numbered version (`Id`) |
 
 ## The state area
@@ -660,8 +661,8 @@ names its writer as an `agentfs_contracts::pod::WriterAt`, the writer and its
 pod context, which the commit carries ([trees](../trees.md#volume-identity-and-trailers)). Every call names its tree by a `TreeId`: `root`, the
 tree with no upstream, or `fork/<n>`, made at journal event `n`. `trees()`
 lists them, the root first and then the forks by number; `TreeId` parses from
-and prints as that text. `fork()` makes a fork of the root and returns its
-`TreeId`, `read` reads a saved file whole into memory and `files` lists them;
+and prints as that text. A fork is made with its row, through the store
+adapter below; `read` reads a saved file whole into memory and `files` lists them;
 `file_map` gives a saved file as a `FileMap` (its pieces in the journal and the
 checkout as built, never bytes in memory), which a reader reads with
 `FileMap::read` or `reader` with the actor unlocked and keeps across later
@@ -672,6 +673,38 @@ the bytes as they were commits nothing. `Error::errno()` maps each error to the 
 with. The behaviour, the state format and the current limits (flat files
 only) are in [trees](../trees.md); the FUSE adapter is in the [filesystem
 layer](filesystem.md#tree-views).
+
+### Rows and domain events
+
+The domains (`agentfs-volume`, `agentfs-clients`, `agentfs-trees`) keep their
+records as rows on the volume's one tree actor, through the ports in
+`agentfs_contracts::ports`. `store::TreeStore::new(recording)` implements
+them over a served volume (`Arc<Recording>`): Trees' `ForkStore` (`load`,
+`create`) and `QueueFacts`. Each write is one journal step, the same commit
+point as a save: a fork's branch and its row are one record, or a row step
+holds rows alone. The store makes it durable (one group-commit fsync, outside
+the actor's lock) before it returns. Each row is the domain's value with its
+audit stamps (`agentfs_contracts::audit::Audited`): the store sets `created`
+at a row's first write and keeps it, and sets `changed` at every write.
+
+The actor knows no domain. A row names its chain (`tree_actor::Chain`:
+`Volume`, `Trees(fork)` or `Clients(tree)`) and its event (`RowEvent`: a kind
+such as `ForkCreated`, a detail, the principal as `Agentfs-By` text, and its
+pod context). `TreeActor::row(chain)` and `rows(domain)` read the rows from
+the actor's saved state, never Git, so they answer while history lags or the
+builder fails. `TreeActor::fork_with` and `record_rows` run the steps; only
+the store calls them (a clippy rule). The queue facts are the journal's too:
+`queued()`, `pending_from(fork)` (an entry `fork` queued in its upstream's
+queue) and `has_child(fork)` never wait for history. A stopped actor's
+`QueueFacts` answer empty and `false`; the next write fails `Stopped`.
+
+`StoreError` from a tree actor failure: `Stopped` and an unknown fsync
+outcome are `Stopped` (the reopen decides whether the step survived); a failed
+append is `NotDurable` (nothing recorded); damaged state is `Damaged`; a step
+the actor refused (no such upstream) is `Refused`. A domain publishes its
+event to its `EventSink` once the store returns; the composition root's queue
+hands each on in order. Each event is on record as a commit on its chain
+([trees](../trees.md#rows-and-event-commits)).
 
 ## Errors
 

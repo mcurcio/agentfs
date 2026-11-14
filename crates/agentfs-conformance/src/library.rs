@@ -129,8 +129,17 @@ impl Library {
 impl TreeCalls for Library {
     type Open = u64;
 
+    /// A fork with no row: this replay is the bare tree actor, below the
+    /// store adapter (the mounted replay forks through it).
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the library replay forks the bare tree actor"
+    )]
     fn fork(&mut self) -> Result<TreeId, CallError> {
-        let name = self.v_mut()?.fork().map_err(fail);
+        let name = self
+            .v_mut()?
+            .fork_with(EngineTree::Root, |_, _| Ok(Vec::new()))
+            .map_err(fail);
         let name = self.settled(name)?;
         self.names.forked(name)
     }

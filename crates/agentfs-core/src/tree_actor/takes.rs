@@ -211,7 +211,7 @@ pub(in crate::tree_actor) fn take_one(
     loop {
         let inputs = actor.with(|a| {
             a.tree(tree)?;
-            if !a.queued(tree) {
+            if !a.queue_holds(tree) {
                 return Ok(None);
             }
             // A take is a step: pending closes save first, and its plan reads
@@ -250,7 +250,7 @@ pub(in crate::tree_actor) fn take_one(
 
 impl TreeActor {
     /// Whether `tree`'s queue holds an entry, as the journal's records name it.
-    pub(in crate::tree_actor) fn queued(&self, tree: TreeId) -> bool {
+    pub(in crate::tree_actor) fn queue_holds(&self, tree: TreeId) -> bool {
         !self.pointers.under(&refs::queue(tree)).is_empty()
     }
 
@@ -302,7 +302,7 @@ impl TreeActor {
         seq: u64,
         keys: impl IntoIterator<Item = Key>,
     ) {
-        if !self.queued(tree) {
+        if !self.queue_holds(tree) {
             return;
         }
         let touched = self.touched.entry(tree).or_default();
@@ -368,7 +368,7 @@ impl TreeActor {
     /// built point (every later decision is at or after it), and every key
     /// of a tree whose queue is empty.
     fn prune_touched(&mut self, tree: TreeId) {
-        if !self.queued(tree) {
+        if !self.queue_holds(tree) {
             self.touched.remove(&tree);
             return;
         }
@@ -522,7 +522,7 @@ pub(in crate::tree_actor) fn take_diff(
 #[cfg(test)]
 mod tests {
     use super::super::history::message;
-    use super::super::test_support::{new_actor, writer};
+    use super::super::test_support::{new_actor, rowless_fork, writer};
     use super::*;
 
     const ROOT: TreeId = TreeId::Root;
@@ -541,12 +541,12 @@ mod tests {
         let mut v = new_actor(dir);
         put(&mut v, ROOT, "a", b"one\n");
         put(&mut v, ROOT, "b", b"x\n");
-        let fork = v.fork().unwrap();
+        let fork = rowless_fork(&mut v);
         put(&mut v, fork, "a", b"fork\n");
         if collide {
             put(&mut v, ROOT, "a", b"root\n");
         }
-        assert!(v.queued(ROOT));
+        assert!(v.queue_holds(ROOT));
         (v, fork)
     }
 
@@ -600,7 +600,7 @@ mod tests {
         put(&mut v, ROOT, "a", b"again\n");
         assert_eq!(v.land(decision).unwrap(), Err(Refused::FilesChanged));
         assert_eq!(v.take_next(ROOT).unwrap(), Took::Taken);
-        assert!(!v.queued(ROOT));
+        assert!(!v.queue_holds(ROOT));
     }
 
     #[test]
@@ -646,9 +646,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut v = new_actor(tmp.path());
         put(&mut v, ROOT, "a", b"one\n");
-        let fork = v.fork().unwrap();
+        let fork = rowless_fork(&mut v);
         put(&mut v, ROOT, "a", b"two\n");
-        assert!(v.queued(fork));
+        assert!(v.queue_holds(fork));
         let decision = decided(&v, fork);
         put(&mut v, ROOT, "b", b"new\n");
         assert!(v.land(decision).unwrap().is_ok());

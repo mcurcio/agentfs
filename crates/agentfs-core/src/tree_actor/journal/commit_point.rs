@@ -4,6 +4,7 @@
 use super::durable::RecordNo;
 use super::segment::FramePos;
 use super::{CompactError, Entry, OpenRecord, PointerChange, Record, Target};
+use crate::tree_actor::history::refs;
 use crate::tree_actor::recording::pages;
 use crate::tree_actor::stages::{Timer, Which};
 use crate::tree_actor::{Error, Result, TreeActor, now_ns};
@@ -143,9 +144,13 @@ impl TreeActor {
         self.journal.checkpoint(&checkpoint)?;
         self.history.checkpointed(last);
         // The records name built values only: no step past the checkpoint yet.
+        // A step's value here is its head; a row chain's (the step's event
+        // commit) is never read again: each row step names its chains' old
+        // values after any compaction (`TreeActor::record`).
         let built: std::collections::BTreeMap<RecordNo, String> = self
             .pointers
             .iter()
+            .filter(|(name, _)| !name.starts_with(refs::ROWS))
             .filter_map(|(name, target)| match target {
                 Target::Step(step) => Some((*step, snapshot.pointers().get(name)?.to_string())),
                 Target::Oid(_) => None,

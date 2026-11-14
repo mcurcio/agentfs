@@ -12,6 +12,7 @@ publish = false
 agentfs-contracts = { version = "0.1.0", path = "../agentfs-contracts" }
 agentfs-core = { version = "0.1.0", path = "../agentfs-core" }
 agentfs-model = { version = "0.0.0", path = "../agentfs-model" }
+agentfs-trees = { version = "0.1.0", path = "../agentfs-trees" }
 libc = "0.2.190"
 serde_json = "1.0.154"
 tempfile = "3.27.0"
