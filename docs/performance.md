@@ -387,12 +387,31 @@ each window, ms):
 | about 2,025 | | 45 | | 52 |
 | about 4,550 to 4,650 | | 85 | | 85 |
 
-Each commit still writes the whole files tree, the line map
-(`metadata.json`) and the name history (`namespace.json`) of its tree
-([Large files in the tree are slow](#large-files-in-the-tree-are-slow)), so
-it costs about 14 µs more for each file already in the tree, where it cost
+Each commit then wrote the whole files tree, the line map
+(`metadata.json`) and the name history (`namespace.json`) of its tree, so
+it cost about 14 µs more for each file already in the tree, where it cost
 6 to 7 ms. The figures above in this table were taken while the save made
-its commit; the builder now pays this cost behind the call path.
+its commit.
+
+Then a commit came to hold each file under two levels of hashed folders and
+to rewrite only the changed files' folders (docs/trees.md, "What a commit
+holds"), and a new file's first save stopped running `git diff` (`image` run
+43580482406, commit c2bf696, one observation each):
+
+| Workload | ext4 | XFS |
+|---|---|---|
+| `close_4k`, p50 (p99) | 1.48 ms (2.68 ms) | 1.31 ms (3.98 ms) |
+| `create`, created by the 300 s deadline | 50,000 in 85.8 s | 50,000 in 79.4 s |
+| `create`, `drain_s` | 124.0 s | 112.2 s |
+| `close_64m` | 0.28 s | 0.26 s |
+
+All three meet their bars on both filesystems. The builder takes about
+4.2 ms a create on ext4 and 3.8 ms on XFS (the run and its drain over
+50,000), flat in the tree's size: the median save stays near 1 ms from 1 to
+50,000 files. `close_4k`'s p50 is above the previous run's (0.95 ms and
+0.45 ms on those runners, commit 3b1ed68); on one machine, the two release
+builds measured the same (0.58 to 0.69 ms against 0.68 to 0.70 ms, 200 saves
+in a tree of 250 files), so the difference is the runners'.
 
 ## Performance budget
 
