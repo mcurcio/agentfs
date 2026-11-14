@@ -65,15 +65,46 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# What the daemon and the git server were doing: the daemon's threads and
+# sockets, and every git process under the server with its kernel stack.
+dump_state() {
+  echo "---- state: $*"
+  if [ -n "$MOUNT_PID" ]; then
+    sudo ps -o pid,stat,wchan:32,etime,cmd --ppid "$MOUNT_PID" -p "$MOUNT_PID" || true
+    for task in /proc/"$MOUNT_PID"/task/*; do
+      [ -d "$task" ] || continue
+      printf '%s %s: %s\n' "${task##*/}" "$(sudo cat "$task/comm" 2>/dev/null)" \
+        "$(sudo cat "$task/wchan" 2>/dev/null)"
+    done
+  fi
+  sudo ss -tnp state established 2>/dev/null | grep -E ':8080|:8443' || true
+  for pid in $(pgrep -f 'fcgiwrap|git-http-backend|upload-pack|receive-pack' || true); do
+    echo "-- $pid: $(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null)"
+    sudo cat "/proc/$pid/stack" 2>/dev/null || true
+    sudo ls -l "/proc/$pid/fd" 2>/dev/null || true
+  done
+  tail -n 20 "${GIT_SERVER_ACCESS_LOG:-/dev/null}" || true
+}
+
+# A mount waits for the patch inbox's fetch for up to agentfs.patchFetchTimeout
+# (30 s by default) before it serves the tree (docs/patches.md), so the wait
+# for the mount point outlasts that. A fetch that ran out of time is an alarm
+# in the daemon's log: its state is dumped then, while the fetch still holds
+# its connection.
 start_mount() {
-  local before
+  local before lines
   before=$(grep -c '^mounted ' "$LOG" 2>/dev/null || true)
+  lines=0
+  [ -f "$LOG" ] && lines=$(wc -l <"$LOG")
   sudo AGENTFS_REPLICA=ci-0 "$AGENTFS_BIN" --state "$STATE" mount \
     --passthrough "${AGENTFS_TEST_PASSTHROUGH:-auto}" "$BACKING" "$MNT" >>"$LOG" 2>&1 &
   MOUNT_PID=$!
-  wait_for 30 mountpoint -q "$MNT" || fail "never mounted"
+  wait_for 60 mountpoint -q "$MNT" || { dump_state "never mounted"; fail "never mounted"; }
   wait_for 30 sh -c "[ \$(grep -c '^mounted ' '$LOG') -gt ${before:-0} ]" ||
     fail "no startup line"
+  if tail -n +"$((lines + 1))" "$LOG" | grep 'patchFetchTimeout' >/dev/null; then
+    dump_state "the inbox fetch ran out of time"
+  fi
 }
 
 stop_mount() {
