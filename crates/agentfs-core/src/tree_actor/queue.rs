@@ -4,7 +4,7 @@
 use std::collections::BTreeSet;
 
 use super::TreeId;
-use super::tree::{MergeFileIdentity, Tree};
+use super::tree::{MergeFileIdentity, Shape};
 
 /// A file identity or a namespace slot involved in a change. Namespace slots
 /// are included because distinct files may compete for the same name.
@@ -47,7 +47,7 @@ pub(in crate::tree_actor) fn eligible(plans: &[Plan], open: &BTreeSet<Key>) -> O
 /// The keys a tree's write-opens hold (R9): each open object's identity and every path naming
 /// it; an object no name reaches holds none.
 pub(in crate::tree_actor) fn held(
-    tree: &Tree,
+    tree: &Shape,
     open_objects: impl IntoIterator<Item = u64>,
 ) -> BTreeSet<Key> {
     let mut keys = BTreeSet::new();
@@ -223,7 +223,7 @@ mod tests {
 
     #[test]
     fn held_keys_are_an_open_objects_identity_and_names_and_none_unnamed() {
-        let mut tree = Tree::default();
+        let mut tree = Shape::default();
         tree.names.insert("a".into(), 5);
         tree.names.insert("b".into(), 5);
         tree.names.insert("c".into(), 6);

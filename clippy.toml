@@ -31,6 +31,13 @@ disallowed-methods = [
     { path = "libc::listen", reason = "listen through agentfs_core::listening_socket::Listener", allow-invalid = true },
     { path = "nix::sys::socket::listen", reason = "listen through agentfs_core::listening_socket::Listener", allow-invalid = true },
 
+    # A tree volume's Git store is opened only by its History (the tree
+    # actor's `history` module): nothing else reads history past what is built.
+    { path = "agentfs_core::tree_git::TreeGit::open", reason = "a tree volume's store is History's: read it through tree_actor::History" },
+    { path = "agentfs_core::tree_git::TreeGit::open_with_lease", reason = "a tree volume's store is History's: read it through tree_actor::History" },
+    { path = "agentfs_core::tree_git::TreeGit::init", reason = "a tree volume's store is History's: read it through tree_actor::History" },
+    { path = "agentfs_core::tree_git::TreeGit::init_with_lease", reason = "a tree volume's store is History's: read it through tree_actor::History" },
+
     # Capabilities are minted only in a composition root: the `agentfs`
     # binary's `main`, and each test that plays one.
     { path = "agentfs_contracts::caps::Minter::new", reason = "capabilities are minted only in the composition root" },

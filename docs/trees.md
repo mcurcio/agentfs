@@ -152,8 +152,11 @@ actor: its waiters get its error and every later call `EIO` (see
 and `tree_actor::inspect` reads what a state area holds without the lease.
 `tree_actor::Recording` serves a volume: the actor behind its one lock, with
 `durable`, `durable_all` and their deferred forms waiting for durability outside it.
-`Recording::open` makes every recovered record durable before it serves, and
-dropping the last `Recording` makes every record durable. Each recorded call names
+`Recording::open` makes every recovered record durable and builds it before it
+serves, and dropping the last `Recording` makes every record durable and builds it.
+`Recording::history` is the one owner of the Git store (`History`: the built point,
+`wait_built`, built snapshots, lag), and `settle` waits until every record so far is
+built: call it before reading Git. `TreeActor::head` settles first. Each recorded call names
 its writer as a `WriterAt` (the writer and its pod context). `write_open`, `write`,
 `truncate` and `close` are the recorded calls. Upstream and fork
 share one bare repository. A commit stores the files under `files/`, line maps in
@@ -163,29 +166,30 @@ envelope-1`). Merge identity is separate from an open object's identity. See
 
 ## The journal
 
-Every step's pointer changes (branch moves, queue entries, collision refs, object
-tables) are one record in `calls.wal`, appended as a call is and made durable as a
-call is. That record is the commit point. Git's
-refs are a copy in the files format, rebuilt on every open, and nothing decides from
-them. A `git` command run during a step may see the copy half written; each queue
-entry is a loose ref file.
+Every step (a create, a link, a close that saves, a rename, an unlink, a fork, a
+take) is one record in `calls.wal`: the change itself and the pointer changes its
+build publishes (branch moves, queue entries, collision refs, object tables), each
+value an oid or "what step `n`'s build gives". It is appended as a call is and made
+durable as a call is. That record is the commit point. The actor decides the step,
+appends it and applies it to the saved state the views serve; it runs no git.
 
-A step writes its objects, checks and appends its record, then installs and copies.
-
-- A failed save keeps serving and saves at the next step in its tree. Only a failed
+- A failed step keeps serving and saves at the next step in its tree. Only a failed
   journal `fsync` or rollback, or a compaction failing after its rename, stops the
-  actor. A failed copy after the record is logged and the call succeeds.
-- Recovery reads the journal, rebuilds the refs and trees, closes abandoned opens
-  through the ordinary step and compacts. It refuses a missing journal, a missing
-  `format` file, a lost object at a pointer's tip, and a journal that names a tree
-  by anything but its identity, has no root, gives the root an upstream, gives an
-  upstream to a fork with no branch, or gives a fork an upstream other than the root
-  (forks are made only of the root). It deletes nothing outside a first init's own
-  marker.
+  actor.
+- Recovery reads the journal, builds history through its last record (see
+  [History trails the files](#history-trails-the-files)), reads the saved state
+  from it, closes abandoned opens through the ordinary step and compacts. It refuses
+  a missing journal, a missing `format` file, a lost object at a pointer's tip, and
+  a journal that names a tree by anything but its identity, has no root, gives the
+  root an upstream, gives an upstream to a fork with no branch, or gives a fork an
+  upstream other than the root (forks are made only of the root). It deletes
+  nothing outside a first init's own marker.
 - Compaction keeps the journal at most `max(64 MiB, twice the last compacted
   length)` plus the live calls, and keeps only the page writes memory holds. A held
   file pins only its own calls. Frames are at most 96 MiB. The constants are not
-  settings.
+  settings. A checkpoint's pointers are the built ones, so a compaction that is due
+  waits for the first call after the builder has built every record; while history
+  trails, the journal grows.
 - Every frame carries the durable mark: the last record a finished fsync covered
   when the frame was written. At the first invalid frame, a later valid frame with
   this journal's salt whose mark passes the last valid record means a durable record
@@ -193,11 +197,49 @@ A step writes its objects, checks and appends its record, then installs and copi
   torn tail of records no fsync had covered, saved to `calls.wal.torn` and cut off.
   Bit rot in the very last frame, or in records not yet durable, reads as a tear
   and drops those records; the log line and that file are the evidence.
-- The state area is `volume`, `history.git`, `calls.wal`, `actor.lock`, `format`
-  and rebuilt private checkout caches, which the workload never sees. A create writes
-  an `initializing` marker first and removes it last; the next `trees init` starts a
-  cut-short create over. **Earlier state formats (format 4 included) do not open**,
-  and are never converted.
+- The state area is `volume`, `history.git`, `calls.wal`, `built.log`,
+  `actor.lock`, `format` and rebuilt private checkout caches, which the workload
+  never sees. A create writes an `initializing` marker first and removes it last;
+  the next `trees init` starts a cut-short create over. **Earlier state formats
+  (format 5 included) do not open**, and are never converted.
+
+## History trails the files
+
+A builder thread makes each step's commits behind the call path, in batches of at
+most 256 steps, so a long backlog ends in a built event every batch. For a batch it
+makes every record through the last one appended durable (one fsync of the
+journal), reads them, replays each step on the trees as built (the same transitions
+the actor ran, then the line alignment), and feeds the commits to one
+`git fast-import`. It installs the batch in this order: the pack, then its index;
+the new pack files and `objects/pack` fsynced; the batch's entry in `built.log`
+fsynced. That entry moves the built point. Only then are Git's refs, `config` and
+the private checkouts copied, and waiters woken.
+
+- A save is visible to every view at its release, before it is built. Git's refs,
+  commits and checkouts show only what is built.
+- Takes are decided on history built through every record before them; a take waits
+  for the builder first.
+- A commit is dated by its step's record, in `+0000`. A replay after a crash may
+  make other objects for steps nothing had seen built.
+- A failed batch (`tree HistoryBuildFailed: <e>`) changes nothing reachable and is
+  retried at the next step or wait; recording goes on. A batch whose replay
+  disagrees with its record (`Disagrees`) fails the same way at every retry: see
+  [runbooks/recording-failures.md](runbooks/recording-failures.md). A failed copy
+  after the built-log entry is logged (`tree CopyStale`) and redone whole at the next
+  batch.
+- Dropping the volume builds every record appended, so a clean shutdown leaves
+  history built through its last record. Recovery builds what a kill left unbuilt.
+- `--metrics-output` reports `history`: the built point, the last record appended,
+  the oldest unbuilt step's age, the worst tree's lag and the builder's health.
+- **The lag gate.** Each tree's lag is the builder's estimated time for its unbuilt
+  steps: a fixed cost per step and a cost per byte it writes (the changed file and
+  the tree's listings), both measured on its last batch. Over 120 s, a call that
+  starts new work in that tree (a create, a write-open, `O_TMPFILE`, a link, a
+  rename, an unlink, a path truncate) waits for the built event that brings the lag
+  under; other trees, writes, flushes and closes do not wait, and a waiting call
+  holds no other request. A failed builder holds nothing back. Over 30 s,
+  `tree HistoryLagging` is logged once; over the limit, `tree HistoryStalled`.
+  The levels are constants, not settings.
 
 ## The view
 
@@ -228,8 +270,9 @@ What the tree views do not support:
   replication, CSI, several view hosts, upgrades and snapshot opens** are not
   built. The designs for them are in [target-architecture](target-architecture/README.md).
 - **Telemetry export** is not wired. `--metrics-output` is the only measurement.
-- **Large files are slow.** Every save and take reads and rewrites the whole tree, so
-  a large file taxes every later step of every file. In one debug-build run on CI, a
+- **Large files are slow.** The builder writes each commit's metadata whole and
+  replays a save on the whole file, so a large file taxes its builds; takes read
+  whole trees. In one debug-build run on CI, a
   100 MiB file took 31.9 s to write and close and 339 s until both views converged
   (a 1 MiB file: 1.27 s), and five saves of unrelated small files took 238 to 241 s
   each to appear while it was queued. The line map is never pruned, so per-save cost
@@ -251,9 +294,10 @@ What the tree views do not support:
 - **Close-to-open** rests on kernel 7.0 and the sources of v6.8, v6.14 and v7.0: 64
   closes over a busy view, from the same process and another. A readahead in flight
   on the handle was not exercised.
-- **The object-directory syncs** cannot be judged by prefix replay on ext4 and XFS
-  (the journal's fsync carries the earlier rename). `ci/trees-object-dir-syncs.sh`
-  proves only the order of system calls, not a crash.
+- **The pack syncs** cannot be judged by prefix replay on ext4 and XFS (a later
+  fsync carries the pack's directory entry). `ci/trees-object-dir-syncs.sh` proves
+  only the order of system calls (pack files and `objects/pack`, then the built-log
+  entry), not a crash.
 - **Replays are not a proof.** The model's scenarios and seeded random interleavings
   are replayed on the model, the library and real mounts. They show no `mmap` call
   and no client call waiting on a take, and do not cover every interleaving.

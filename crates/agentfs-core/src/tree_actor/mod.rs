@@ -1,13 +1,13 @@
 //! The tree actor (git-model §3, §6, §7, §12 and §18; `docs/trees.md`).
 //!
-//! One exclusively locked actor owns a repository, private checkouts and a
-//! journal. Every call is appended to the journal before it returns, with no
+//! One exclusively locked actor owns a journal and the saved state the views
+//! serve. Every call is appended to the journal before it returns, with no
 //! fsync; a FLUSH, an fsync or an FSYNCDIR makes the records durable by group
 //! commit, outside the actor's lock ([`Recording`], [`Durability`]). A step's
-//! pointer changes are one journal record, the commit point: objects are
-//! durable before it, and Git's refs and the private checkouts are copies made
-//! after it, rebuilt from the journal at every open and after any failed copy.
-//! Nothing decides from a copy.
+//! record is the change itself and its commit point: the actor decides,
+//! appends and applies it, and runs no git. The builder makes each durable
+//! step's commits behind it, and [`History`], the one owner of the Git store,
+//! hands out only what is built (docs/trees.md, "History trails the files").
 
 mod call_path;
 mod history;
@@ -25,6 +25,7 @@ use std::io;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::thread::JoinHandle;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use agentfs_contracts::name::WriterLabel;
@@ -35,27 +36,32 @@ use git2::Oid;
 use serde::Serialize;
 
 use crate::file_lock::{FileLock, Mode};
-use crate::tree_git::{RefUpdate, TreeGit};
 pub use agentfs_contracts::{NotATree, TreeId};
 pub use call_path::{Progress, Recording, Then};
+use history::builder::{BuildState, Builder, JournalReader, copy_all, take_diff};
 pub use history::built::{BuildError, BuiltSnapshot, Health, History, Lag, TreeLag, WaitError};
-use history::message::{self, Message};
+use history::built_log::{self, BuiltLog};
+use history::message::Message;
+use history::take::{self as takes, Decided};
 use history::upstreams::Upstreams;
-use history::{SyncStep, check_objects, refs, remove_stale_locks};
+use history::{check_objects, clean_packs, read_trees, refs, remove_stale_locks, sync_marker};
 pub use journal::durable::{Durability, DurableError, RecordNo};
 use journal::{
-    CompactError, Entry, FoldedOpen, Journal, LiveOpen, PointerChange, Record, compact_at, fold,
+    Change, CompactError, Entry, FoldedOpen, Journal, PointerChange, Record, TakeRecord, Target,
+    compact_at, fold,
 };
 use pointers::Pointers;
 use recording::{Handle, pages};
 use stages::{Stages, Timer, Which};
-use tree::{EventNumber, Tree};
+use tree::{EventNumber, SavedTree};
 
-const FORMAT: &str = "agentfs-trees-5\n";
+const FORMAT: &str = "agentfs-trees-6\n";
 /// The volume identity file: [`VolumeIdentity`] as JSON, written once by
 /// [`TreeActor::create`], read before any write at every open.
 const IDENTITY: &str = "volume";
 const JOURNAL: &str = "calls.wal";
+/// The builder's built log (`history::built_log`).
+const BUILT_LOG: &str = "built.log";
 const INITIALIZING: &str = "initializing";
 const LOCK: &str = "actor.lock";
 type Result<T> = std::result::Result<T, Error>;
@@ -96,6 +102,9 @@ pub enum Error {
     PointerMoved { name: String },
     #[error(transparent)]
     Durable(#[from] DurableError),
+    /// History could not be built through what a reader waited for.
+    #[error(transparent)]
+    History(#[from] WaitError),
 }
 
 impl From<NotATree> for Error {
@@ -139,11 +148,6 @@ fn now_ns() -> u64 {
         .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
 }
 
-enum QueueAction {
-    Landing(Oid),
-    Sync(Oid, queue::Cut<SyncStep>),
-}
-
 /// What [`TreeActor::take_next`] did: took one entry, found every entry waiting, or
 /// found none queued. Apart from the model's (`agentfs_model::calls::Took`):
 /// neither crate depends on the other.
@@ -158,14 +162,30 @@ pub enum Took {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Saved {
     Unchanged,
-    Commit(Oid),
+    /// The save is on record as this step; the builder makes its commit.
+    Commit(RecordNo),
     /// An old handle after unlink/rename-over must never reach a replacement.
     OrphanDropped,
 }
 
+/// The builder's progress, as metrics report it.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct HistoryMetrics {
+    /// The built point: the last record whose commits are built.
+    pub built_through: u64,
+    /// The last record appended.
+    pub appended: u64,
+    /// The age of the oldest step not yet built, in nanoseconds.
+    pub oldest_unbuilt_ns: u64,
+    /// The worst tree's lag (the lag gate's estimate), in milliseconds.
+    pub lag_ms_max: u64,
+    /// `current`, `lagging`, `stalled` or `failed`.
+    pub health: String,
+}
+
 /// Process-local counters for observing save and queue costs. Durations are
 /// measurements only and never participate in ordering or conflict decisions.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct Metrics {
     pub saves: u64,
     pub save_nanos: u64,
@@ -185,94 +205,33 @@ pub struct Metrics {
     pub stages: Stages,
     /// The journal file's length now: what a held open file keeps from compaction.
     pub journal_bytes: u64,
-}
-
-/// A step built on a copy of its tree and not yet on record.
-struct Draft {
-    by: WriterAt,
-    tree: TreeId,
-    built: Tree,
-    changes: Vec<RefUpdate>,
-    closes: Option<u64>,
-    opened: Option<LiveOpen>,
-    linked: Option<u64>,
-    /// A fork this step makes, by number, and its upstream.
-    fork: Option<(u64, TreeId)>,
-    saved: Saved,
-    enqueued: u64,
-    taken: u64,
-}
-
-impl Draft {
-    fn new(by: &WriterAt, tree: TreeId, built: Tree) -> Self {
-        Self {
-            by: by.clone(),
-            tree,
-            built,
-            changes: Vec::new(),
-            closes: None,
-            opened: None,
-            linked: None,
-            fork: None,
-            saved: Saved::Unchanged,
-            enqueued: 0,
-            taken: 0,
-        }
-    }
-
-    fn entry(&self) -> Entry {
-        let hex = |oid: Option<Oid>| oid.map(|oid| oid.to_string());
-        Entry::Step {
-            by: self.by.clone(),
-            closes: self.closes,
-            opened: self.opened.as_ref().map(|open| Box::new(open.record())),
-            linked: self.linked,
-            fork: self
-                .fork
-                .map(|(fork, upstream)| (TreeId::Fork(fork).to_string(), upstream.to_string())),
-            pointers: self
-                .changes
-                .iter()
-                .map(|change| PointerChange {
-                    name: change.refname.clone(),
-                    new: hex(change.new),
-                    old: hex(change.expected_old),
-                })
-                .collect(),
-        }
-    }
+    /// History as built behind the call path.
+    pub history: HistoryMetrics,
 }
 
 /// A single synchronous actor. Sharing requires a mutex; a second process
 /// cannot open this volume. No method exposes its state area to workloads.
 pub struct TreeActor {
-    root: PathBuf,
     /// The volume identity file's content: every commit's `Agentfs-Volume` and
     /// `Agentfs-Volume-Id`.
     identity: VolumeIdentity,
     /// The history service's pod context, carried by its own commits (Root, Sync).
     service: PodContext,
-    repo: TreeGit,
     journal: Journal,
-    /// Runtime pointer reads come from here, never from Git's copy.
-    pointers: Pointers,
+    /// The one owner of the Git store; the builder runs behind it.
+    history: History,
+    builder: Option<JoinHandle<()>>,
+    /// The pointers as the journal's records name them.
+    pointers: Pointers<Target>,
     /// Each fork's upstream. The root has none.
     upstreams: Upstreams,
-    trees: BTreeMap<TreeId, Tree>,
+    trees: BTreeMap<TreeId, SavedTree>,
     handles: BTreeMap<u64, Handle>,
     /// Closes that could not save, in arrival order. Their handles count as
     /// open until a later step in their tree saves them, or a restart does.
     pending_closes: Vec<u64>,
-    /// Each direct save's commit, by event number (see `rebuild_owners`).
-    owners: BTreeMap<EventNumber, Oid>,
     next: u64,
     stopped: bool,
-    /// A copy failed: the next step rebuilds refs whole and redoes checkouts.
-    copies_stale: bool,
-    stale_checkouts: BTreeSet<TreeId>,
-    /// The files tree each checkout holds, so the next rewrites only what
-    /// differs. A checkout not here (never made, or cut short) is made whole.
-    checked_out: BTreeMap<TreeId, Oid>,
     compact_threshold: u64,
     metrics: Metrics,
     waiting_since: BTreeMap<String, Instant>,
@@ -353,13 +312,42 @@ fn clear_cut_create(root: &Path) -> io::Result<()> {
             fs::remove_dir_all(root.join(dir))?;
         }
     }
-    for file in [JOURNAL, "format", "format.tmp", IDENTITY, "volume.tmp"] {
+    for file in [
+        JOURNAL,
+        BUILT_LOG,
+        "format",
+        "format.tmp",
+        IDENTITY,
+        "volume.tmp",
+    ] {
         match fs::remove_file(root.join(file)) {
             Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
             _ => {}
         }
     }
     Ok(())
+}
+
+/// Each pointer the records name, as built: an oid, or a step's value the
+/// built log resolved. [`Error::Format`] for a step value it lacks.
+fn resolve_pointers(
+    pointers: &Pointers<Target>,
+    values: &BTreeMap<(RecordNo, String), Oid>,
+) -> Result<Pointers> {
+    Ok(Pointers::new(
+        pointers
+            .iter()
+            .map(|(name, target)| {
+                let oid = match target {
+                    Target::Oid(hex) => Oid::from_str(hex).map_err(|_| Error::Format)?,
+                    Target::Step(step) => {
+                        *values.get(&(*step, name.clone())).ok_or(Error::Format)?
+                    }
+                };
+                Ok((name.clone(), oid))
+            })
+            .collect::<Result<_>>()?,
+    ))
 }
 
 impl TreeActor {
@@ -398,10 +386,12 @@ impl TreeActor {
         let mut text = serde_json::to_string(identity)?;
         text.push('\n');
         write_durably(&root, IDENTITY, text.as_bytes())?;
-        let repo = TreeGit::init_with_lease(root.join("history.git"), Arc::clone(&lock))?;
+        let repo = history::init_store(&root.join("history.git"), Arc::clone(&lock))?;
         repo.write_config(&refs::head(), &BTreeMap::new())?;
         let tree = repo.write_tree(&[])?;
         let head = repo.write_commit(tree, &[], &Message::Root { service }.render(identity)?)?;
+        // Every sync queue entry names this blob.
+        repo.write_blob(b"sync")?;
         repo.sync_objects()?;
         Journal::create(
             &root.join(JOURNAL),
@@ -409,7 +399,8 @@ impl TreeActor {
                 seq: RecordNo::ZERO,
                 at_ns: now_ns(),
                 entry: Entry::Checkpoint {
-                    next_seq: 1,
+                    next: RecordNo::new(1),
+                    built: RecordNo::ZERO,
                     pointers: [(refs::branch(TreeId::Root), head.to_string())]
                         .into_iter()
                         .collect(),
@@ -428,10 +419,11 @@ impl TreeActor {
     }
 
     /// Recovers a volume and serves it. Reads `format` and `volume` before any
-    /// write. Recovery closes every abandoned write-open exactly once, as its
-    /// own writer with its journaled pod context; `service` is carried by the
-    /// Sync commits this run writes. It takes no queue entries: the view's
-    /// worker or a caller runs [`TreeActor::progress`].
+    /// write. Recovery builds history through the journal's last record, then
+    /// closes every abandoned write-open exactly once, as its own writer with
+    /// its journaled pod context; `service` is carried by the Sync commits this
+    /// run writes. It takes no queue entries: the view's worker or a caller
+    /// runs [`TreeActor::progress`].
     ///
     /// # Errors
     ///
@@ -441,7 +433,8 @@ impl TreeActor {
     /// root an upstream or a fork an upstream that is no tree;
     /// [`Error::CorruptJournal`] and [`Error::MissingObject`] when the journal
     /// or a pointer's objects are damaged (docs/runbooks/recording-failures.md),
-    /// and any failure of a recovery close.
+    /// [`Error::History`] when history cannot be built, and any failure of a
+    /// recovery close.
     pub fn open(root: &Path, service: &PodContext) -> Result<Self> {
         found_volume(root)?;
         crate::history::init_libgit2();
@@ -467,6 +460,85 @@ impl TreeActor {
         }
     }
 
+    /// Starts History and the builder at the built point the built log and the
+    /// journal's checkpoint name, with every copy (refs, `config`, checkouts)
+    /// rebuilt from it.
+    fn start_history(
+        root: &Path,
+        lock: &Arc<FileLock>,
+        frames: &[journal::Frame],
+        folded_built: RecordNo,
+        durability: &Arc<Durability>,
+        identity: &VolumeIdentity,
+        service: &PodContext,
+    ) -> Result<(History, JoinHandle<()>, RecordNo)> {
+        let git_dir = root.join("history.git");
+        remove_stale_locks(&git_dir)?;
+        clean_packs(&git_dir)?;
+        let repo = history::open_store(&git_dir, Arc::clone(lock))?;
+        // Before any git command: an empty config silently loses core.fsync,
+        // and an empty HEAD is "not a git repository".
+        repo.write_config(&refs::head(), &BTreeMap::new())?;
+        let (built_log, entries) = BuiltLog::open(&root.join(BUILT_LOG))?;
+        let built = folded_built.max(built_log::built_through(&entries));
+        let values = built_log::values(&entries)?;
+        let upto = frames
+            .iter()
+            .position(|(record, _)| record.seq > built)
+            .unwrap_or(frames.len());
+        let at_built = fold(&frames[..upto])?;
+        let pointers = resolve_pointers(&at_built.pointers, &values)?;
+        check_objects(&repo, &pointers)?;
+        let trees = read_trees(&repo, &pointers)?;
+        at_built
+            .upstreams
+            .check_recovered(|fork| trees.contains_key(&fork))?;
+        let owners = history::owners(&repo, &pointers)?;
+        let checked_out = copy_all(&repo, root, &pointers, &at_built.upstreams)?;
+        let heads = values
+            .iter()
+            .filter(|((_, name), _)| {
+                name.starts_with("refs/heads/") || name.starts_with(refs::QUEUES)
+            })
+            .map(|((step, _), oid)| (*step, *oid))
+            .collect();
+        let state = BuildState::at(
+            trees,
+            &pointers,
+            at_built.upstreams.clone(),
+            &at_built.opens,
+            at_built.page_writes.clone(),
+            &owners,
+            heads,
+        )?;
+        let history = History::new(repo, built, pointers.clone(), owners);
+        history.checkpointed(folded_built);
+        let builder = Builder {
+            state,
+            reader: JournalReader::open(&root.join(JOURNAL), built, durability.generation())?,
+            history: history.clone(),
+            durability: Arc::clone(durability),
+            built_log,
+            root: root.to_owned(),
+            identity: identity.clone(),
+            service: service.clone(),
+            copied: pointers,
+            checked_out,
+            stale: false,
+            log: entries,
+        };
+        let owner = crate::failpoints::owner();
+        let handle = std::thread::Builder::new()
+            .name("tree-builder".into())
+            .spawn(move || {
+                crate::failpoints::adopt(owner);
+                let history = builder.history.clone();
+                builder.run();
+                history.builder_gone();
+            })?;
+        Ok((history, handle, built))
+    }
+
     /// Recovers the locked state area of a volume of this format.
     fn serve(
         root: PathBuf,
@@ -476,33 +548,30 @@ impl TreeActor {
     ) -> Result<Self> {
         let (journal, frames) = Journal::open(&root.join(JOURNAL))?;
         let folded = fold(&frames)?;
+        let (history, builder, built) = Self::start_history(
+            &root,
+            &lock,
+            &frames,
+            folded.built,
+            journal.durability(),
+            &identity,
+            &service,
+        )?;
         drop(frames);
-        let history = root.join("history.git");
-        remove_stale_locks(&history)?;
-        let repo = TreeGit::open_with_lease(&history, Arc::clone(&lock))?;
-        // Before any git command: an empty config silently loses core.fsync,
-        // and an empty HEAD is "not a git repository".
-        repo.write_config(&refs::head(), &folded.upstreams.merges())?;
-        check_objects(&repo, &folded.pointers)?;
-        repo.rebuild_refs(&folded.pointers.creates())?;
-        crate::failpoints::hit("tree.after_ref_rebuild")?;
         let mut volume = Self {
-            root,
             identity,
             service,
-            repo,
             journal,
-            pointers: folded.pointers,
+            history,
+            builder: Some(builder),
+            pointers: Pointers::default(),
             upstreams: folded.upstreams,
             trees: BTreeMap::new(),
             handles: BTreeMap::new(),
             pending_closes: Vec::new(),
-            owners: BTreeMap::new(),
-            next: folded.next_seq,
+            // A record built and then cut off as a torn tail keeps its number.
+            next: folded.next_seq.max(built.get().saturating_add(1)),
             stopped: false,
-            copies_stale: false,
-            stale_checkouts: BTreeSet::new(),
-            checked_out: BTreeMap::new(),
             compact_threshold: u64::MAX,
             metrics: Metrics::default(),
             waiting_since: BTreeMap::new(),
@@ -510,8 +579,14 @@ impl TreeActor {
             changed: Vec::new(),
             _lock: lock,
         };
-        volume.rebuild_owners()?;
-        volume.build_trees()?;
+        // The saved state is history built through the journal's last record.
+        volume.settle()?;
+        let snapshot = volume.history.snapshot();
+        volume.pointers = snapshot.pointers().to_targets();
+        volume.trees = read_trees(snapshot.repo(), snapshot.pointers())?
+            .iter()
+            .map(|(id, tree)| (*id, SavedTree::of(tree)))
+            .collect();
         for (handle, FoldedOpen { open, calls }) in folded.opens {
             let tree = volume.trees.get_mut(&open.tree).ok_or(Error::Format)?;
             if open.anonymous {
@@ -544,11 +619,8 @@ impl TreeActor {
         for handle in abandoned {
             volume.close(handle)?;
         }
-        for tree in volume.trees() {
-            let files = volume.checkout(tree, None)?;
-            volume.checked_out.insert(tree, files);
-        }
         volume.metrics.queued = volume.pointers.under(refs::QUEUES).len() as u64;
+        volume.settle()?;
         match volume.compact() {
             Ok(()) => {}
             Err(e @ CompactError::Before(_)) => eprintln!("tree CompactionFailed: {e}"),
@@ -556,25 +628,6 @@ impl TreeActor {
         }
         volume.compact_threshold = compact_at(volume.journal.len());
         Ok(volume)
-    }
-
-    /// Every branch is a tree's, the root among them, and every entry of the
-    /// upstream map is a fork with a branch whose upstream is the root (forks are
-    /// made only of the root, and only the root's queue holds landings): else
-    /// [`Error::Format`].
-    fn build_trees(&mut self) -> Result<()> {
-        for (id, head) in refs::branches(&self.pointers)? {
-            let mut snapshot = self.snapshot_at(head)?;
-            self.restore_object_table(id, &mut snapshot)?;
-            let mut tree = Tree::default();
-            tree.install(snapshot)?;
-            self.trees.insert(id, tree);
-        }
-        if !self.trees.contains_key(&TreeId::Root) {
-            return Err(Error::Format);
-        }
-        self.upstreams
-            .check_recovered(|fork| self.trees.contains_key(&fork))
     }
 
     /// Every tree: the root first, then the forks by number.
@@ -588,7 +641,7 @@ impl TreeActor {
 
     /// Snapshot measurements without exposing them through a workload view.
     pub fn metrics(&self) -> Metrics {
-        let mut metrics = self.metrics;
+        let mut metrics = self.metrics.clone();
         metrics.stages = Stages::current();
         metrics.journal_bytes = self.journal.len();
         for since in self.waiting_since.values() {
@@ -596,6 +649,25 @@ impl TreeActor {
             metrics.wait_nanos = metrics.wait_nanos.saturating_add(nanos);
             metrics.max_wait_nanos = metrics.max_wait_nanos.max(nanos);
         }
+        let lag = self.history.lag();
+        metrics.history = HistoryMetrics {
+            built_through: self.history.built_through().get(),
+            appended: self.durability().appended().get(),
+            oldest_unbuilt_ns: lag
+                .oldest_unbuilt
+                .map_or(0, |age| u64::try_from(age.as_nanos()).unwrap_or(u64::MAX)),
+            lag_ms_max: lag
+                .trees
+                .first()
+                .map_or(0, |worst| (worst.seconds * 1000.0) as u64),
+            health: match lag.health {
+                Health::Failed(_) => "failed",
+                Health::Current => "current",
+                Health::Lagging => "lagging",
+                Health::Stalled => "stalled",
+            }
+            .to_owned(),
+        };
         metrics
     }
 
@@ -611,6 +683,21 @@ impl TreeActor {
         self.journal.durability()
     }
 
+    /// History, the one owner of the Git store.
+    pub fn history(&self) -> &History {
+        &self.history
+    }
+
+    /// Waits until every record appended so far is built: what a test, the
+    /// CLI or a replay calls before it reads history.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::History`] when the builder failed or stopped first.
+    pub fn settle(&self) -> Result<RecordNo> {
+        Ok(self.history.wait_built(self.durability().appended())?)
+    }
+
     /// The last record a FLUSH of `open` must cover: its open record, its
     /// calls, its object's page writes.
     ///
@@ -624,75 +711,57 @@ impl TreeActor {
         Ok(RecordNo::new(open.max(calls).max(pages)))
     }
 
+    /// The tree's head as built, once every record appended so far is built.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotFound`] for no such tree, and as [`TreeActor::settle`].
     pub fn head(&self, tree: TreeId) -> Result<Oid> {
         self.tree(tree)?;
-        self.pointers
-            .get(&refs::branch(tree))
-            .ok_or(Error::NotFound)
+        self.settle()?;
+        self.history.snapshot().head(tree).ok_or(Error::NotFound)
     }
 
     /// Fork IDs are numeric and never reused. Forking a fork is not exposed yet.
     /// A fork of the root, at the root's saved head.
     pub fn fork(&mut self) -> Result<TreeId> {
         let upstream = TreeId::Root;
-        let (event, _) = self.step(upstream, |v, event| {
-            let fork = TreeId::Fork(event.get());
-            let at = v.head(upstream)?;
-            let mut tree = v.tree(upstream)?.clone();
-            for object in std::mem::take(&mut tree.anonymous) {
-                tree.drop_object(object);
-            }
-            let mut draft = Draft::new(&v.agentfs(), fork, tree);
-            draft.changes.push(RefUpdate {
-                refname: refs::branch(fork),
-                new: Some(at),
-                expected_old: None,
-            });
-            draft.fork = Some((event.get(), upstream));
-            Ok(draft)
-        })?;
-        Ok(TreeId::Fork(event.get()))
+        self.tree(upstream)?;
+        self.run_pending_closes(upstream, None)?;
+        let seq = self.next;
+        let fork = TreeId::Fork(seq);
+        let head = self
+            .pointers
+            .get(&refs::branch(upstream))
+            .ok_or(Error::Format)?;
+        let pointers = vec![PointerChange {
+            name: refs::branch(fork),
+            new: Some(head),
+            old: None,
+        }];
+        let by = self.agentfs();
+        self.record_step(
+            by,
+            Change::Fork {
+                upstream: upstream.to_string(),
+            },
+            pointers,
+        )?;
+        self.upstreams.add(seq, upstream);
+        let mut tree = self.tree(upstream)?.clone();
+        for object in tree.shape.anonymous.clone() {
+            tree.drop_object(object);
+        }
+        self.trees.insert(fork, tree);
+        self.after_step();
+        Ok(fork)
     }
 
-    fn tree(&self, tree: TreeId) -> Result<&Tree> {
+    fn tree(&self, tree: TreeId) -> Result<&SavedTree> {
         if self.is_stopped() {
             return Err(Error::Stopped);
         }
         self.trees.get(&tree).ok_or(Error::NotFound)
-    }
-
-    fn take_landing(&mut self, tree: TreeId, reference: &str, incoming: Oid) -> Result<()> {
-        let started = Instant::now();
-        self.pages_take(tree, |v, event| {
-            v.build_landing(tree, reference, incoming, event)
-        })?;
-        let nanos = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
-        self.metrics.takes = self.metrics.takes.saturating_add(1);
-        self.metrics.take_nanos = self.metrics.take_nanos.saturating_add(nanos);
-        self.metrics.max_take_nanos = self.metrics.max_take_nanos.max(nanos);
-        self.metrics.landings = self.metrics.landings.saturating_add(1);
-        self.metrics.landing_nanos = self.metrics.landing_nanos.saturating_add(nanos);
-        Ok(())
-    }
-
-    fn take_sync(
-        &mut self,
-        tree: TreeId,
-        reference: &str,
-        value: Oid,
-        cut: queue::Cut<SyncStep>,
-    ) -> Result<()> {
-        let started = Instant::now();
-        self.pages_take(tree, |v, event| {
-            v.build_sync(tree, reference, value, cut, event)
-        })?;
-        let nanos = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
-        self.metrics.takes = self.metrics.takes.saturating_add(1);
-        self.metrics.take_nanos = self.metrics.take_nanos.saturating_add(nanos);
-        self.metrics.max_take_nanos = self.metrics.max_take_nanos.max(nanos);
-        self.metrics.syncs = self.metrics.syncs.saturating_add(1);
-        self.metrics.sync_nanos = self.metrics.sync_nanos.saturating_add(nanos);
-        Ok(())
     }
 
     /// Take at most one eligible queue entry. Callers can release the actor
@@ -722,7 +791,8 @@ impl TreeActor {
     }
 
     /// One queue step in `tree`: its first entry P1 lets go is taken whole, in
-    /// this one call. Failures are not swallowed, unlike [`TreeActor::progress`].
+    /// this one call, decided on history built through every record appended
+    /// before it. Failures are not swallowed, unlike [`TreeActor::progress`].
     pub fn take_next(&mut self, tree: TreeId) -> Result<Took> {
         if self.is_stopped() {
             return Err(Error::Stopped);
@@ -732,9 +802,11 @@ impl TreeActor {
             return Ok(Took::Empty);
         }
         // A take is a step: pending closes save first, and its plan reads
-        // the tree they leave.
+        // the tree they leave, as built.
         self.run_pending_closes(tree, None)?;
-        let entries = self.pointers.under(&refs::queue(tree));
+        self.settle()?;
+        let snapshot = self.history.snapshot();
+        let entries = snapshot.pointers().under(&refs::queue(tree));
         let open = match self.trees.get(&tree) {
             Some(t) => queue::held(
                 t,
@@ -745,27 +817,22 @@ impl TreeActor {
             ),
             None => BTreeSet::new(),
         };
+        let mine = history::tree_snapshot(snapshot.repo(), snapshot.pointers(), tree)?;
         let mut plans = Vec::new();
-        let mut actions = Vec::new();
+        let mut cuts = Vec::new();
         let planning = Timer::start(Which::QueuePlan);
         for (_, oid) in &entries {
             if tree.is_root() {
-                let commit = self.repo.read_commit(*oid)?;
-                let base = *commit.parents.first().ok_or(Error::Format)?;
-                let source = message::tree_of(&commit.message)?.ok_or(Error::Format)?;
-                let keys = referee::touches(&self.snapshot_at(base)?, &self.snapshot_at(*oid)?);
-                plans.push(queue::Plan {
-                    source,
-                    files: keys,
-                });
-                actions.push(QueueAction::Landing(*oid));
+                plans.push(takes::plan_landing(&snapshot, *oid)?);
+                cuts.push(None);
             } else {
-                let sync = self.plan_sync(tree, &open)?;
+                let upstream = self.upstream_of(tree).ok_or(Error::Format)?;
+                let cut = takes::plan_sync(&snapshot, tree, upstream, &mine, &open)?;
                 plans.push(queue::Plan {
-                    source: self.upstream_of(tree).ok_or(Error::Format)?,
-                    files: sync.keys().clone(),
+                    source: upstream,
+                    files: cut.keys().clone(),
                 });
-                actions.push(QueueAction::Sync(*oid, sync));
+                cuts.push(Some(cut));
             }
         }
         drop(planning);
@@ -777,171 +844,284 @@ impl TreeActor {
                 self.metrics.waits = self.metrics.waits.saturating_add(1);
             }
         }
-        if let Some(index) = selected {
-            let reference = &entries[index].0;
-            if let Some(since) = self.waiting_since.remove(reference) {
-                let nanos = u64::try_from(since.elapsed().as_nanos()).unwrap_or(u64::MAX);
-                self.metrics.wait_nanos = self.metrics.wait_nanos.saturating_add(nanos);
-                self.metrics.max_wait_nanos = self.metrics.max_wait_nanos.max(nanos);
-            }
-            match actions.swap_remove(index) {
-                QueueAction::Landing(oid) => self.take_landing(tree, reference, oid)?,
-                QueueAction::Sync(oid, cut) => self.take_sync(tree, reference, oid, cut)?,
-            }
-            return Ok(Took::Taken);
+        let Some(index) = selected else {
+            return Ok(Took::Waiting);
+        };
+        let (reference, incoming) = entries[index].clone();
+        if let Some(since) = self.waiting_since.remove(&reference) {
+            let nanos = u64::try_from(since.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            self.metrics.wait_nanos = self.metrics.wait_nanos.saturating_add(nanos);
+            self.metrics.max_wait_nanos = self.metrics.max_wait_nanos.max(nanos);
         }
-        Ok(Took::Waiting)
+        let started = Instant::now();
+        let landing = tree.is_root();
+        let decided = match cuts.swap_remove(index) {
+            None => takes::decide_landing(&snapshot, tree, &mine, incoming)?,
+            Some(cut) => {
+                let upstream = self.upstream_of(tree).ok_or(Error::Format)?;
+                takes::decide_sync(&snapshot, tree, upstream, cut)?
+            }
+        };
+        self.land(
+            tree,
+            &reference,
+            incoming,
+            &mine,
+            snapshot.at(),
+            decided,
+            landing,
+        )?;
+        let nanos = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        self.metrics.takes = self.metrics.takes.saturating_add(1);
+        self.metrics.take_nanos = self.metrics.take_nanos.saturating_add(nanos);
+        self.metrics.max_take_nanos = self.metrics.max_take_nanos.max(nanos);
+        if landing {
+            self.metrics.landings = self.metrics.landings.saturating_add(1);
+            self.metrics.landing_nanos = self.metrics.landing_nanos.saturating_add(nanos);
+        } else {
+            self.metrics.syncs = self.metrics.syncs.saturating_add(1);
+            self.metrics.sync_nanos = self.metrics.sync_nanos.saturating_add(nanos);
+        }
+        Ok(Took::Taken)
     }
 
-    /// Saves this tree's pending closes, then runs the step `build` makes.
-    fn step<F>(&mut self, tree: TreeId, build: F) -> Result<(EventNumber, Saved)>
-    where
-        F: FnOnce(&Self, EventNumber) -> Result<Draft>,
-    {
-        self.run_pending_closes(tree, None)?;
-        self.run_step(build)
+    /// Whether a landing of `tree` waits in its upstream's queue, once every
+    /// record appended so far is built.
+    ///
+    /// # Errors
+    ///
+    /// As [`TreeActor::settle`], and a failed read of history.
+    #[cfg(test)]
+    pub(in crate::tree_actor) fn pending_from(&self, tree: TreeId) -> Result<bool> {
+        let Some(upstream) = self.upstream_of(tree) else {
+            return Ok(false);
+        };
+        self.settle()?;
+        takes::pending_from(&self.history.snapshot(), tree, upstream)
     }
 
-    /// One step, in order. A failure up to and including the journal record
-    /// changes nothing and returns its errno. After the record, the commit
-    /// point, the step has happened: a failed copy is logged and the call
-    /// succeeds (AGENTS principle 5).
-    fn run_step<F>(&mut self, build: F) -> Result<(EventNumber, Saved)>
-    where
-        F: FnOnce(&Self, EventNumber) -> Result<Draft>,
-    {
+    /// Records a decided take and applies it: its shape's transition and the
+    /// bytes of the files it changed.
+    #[allow(clippy::too_many_arguments, reason = "the decision and what it read")]
+    fn land(
+        &mut self,
+        tree: TreeId,
+        reference: &str,
+        incoming: Oid,
+        mine: &referee::Snapshot,
+        decided_at: RecordNo,
+        decided: Decided,
+        landing: bool,
+    ) -> Result<()> {
+        let seq = self.next;
+        let event = EventNumber::new(seq);
+        let (files, names) = decided
+            .snapshot
+            .as_ref()
+            .map(|after| take_diff(mine, after))
+            .unwrap_or_default();
+        let mut pointers = Vec::new();
+        let moved = !matches!(decided.head, journal::TakeHead::Stay);
+        match &decided.head {
+            journal::TakeHead::FastForward { to } => {
+                pointers.push(self.change(refs::branch(tree), Some(Target::Oid(to.clone()))));
+            }
+            journal::TakeHead::Landing { .. } | journal::TakeHead::Sync { .. } => {
+                pointers
+                    .push(self.change(refs::branch(tree), Some(Target::Step(RecordNo::new(seq)))));
+            }
+            journal::TakeHead::Stay => {}
+        }
+        if decided.entry_done {
+            pointers.push(self.change(reference.to_owned(), None));
+        }
+        if landing && !decided.collisions.is_empty() {
+            let name = refs::collision(tree, incoming);
+            if self.pointers.get(&name).is_none() {
+                pointers.push(self.change(name, Some(Target::Oid(incoming.to_string()))));
+            }
+        }
+        if moved {
+            pointers.push(self.change(
+                refs::object_table(tree),
+                Some(Target::Step(RecordNo::new(seq))),
+            ));
+        }
+        let mut enqueued = 0;
+        if landing {
+            enqueued = self.enqueue_syncs(tree, event, &mut pointers);
+        }
+        let change = Change::Take {
+            tree: tree.to_string(),
+            take: TakeRecord {
+                entry: reference.to_owned(),
+                whole: decided.entry_done,
+                decided_at,
+                head: decided.head,
+                files,
+                names,
+                collisions: decided.collisions,
+            },
+        };
+        // The shape's transition, tried before the record: a take that would
+        // put two files on one object fails here (finding 39).
+        let mut after = self.tree(tree)?.clone();
+        after.shape.apply(&change, event)?;
+        let by = self.agentfs();
+        self.record_step(by, change.clone(), pointers)?;
+        if let Change::Take { take, .. } = &change {
+            for (_, file) in &take.files {
+                let Some(file) = file else { continue };
+                let bytes = file.lines.bytes();
+                let changed = after
+                    .bytes
+                    .get(&file.object)
+                    .is_some_and(|old| old[..] != bytes[..]);
+                if changed {
+                    self.changed.push((tree, file.object));
+                }
+                after.bytes.insert(file.object, Arc::new(bytes.into()));
+            }
+        }
+        self.trees.insert(tree, after);
+        self.metrics.queued = self
+            .metrics
+            .queued
+            .saturating_sub(u64::from(decided.entry_done))
+            .saturating_add(enqueued);
+        self.after_step();
+        Ok(())
+    }
+
+    /// A change of pointer `name` to `new`, from its value now.
+    fn change(&self, name: String, new: Option<Target>) -> PointerChange {
+        PointerChange {
+            old: self.pointers.get(&name),
+            name,
+            new,
+        }
+    }
+
+    /// A sync entry, numbered by `event`, in each fork of `tree`.
+    fn enqueue_syncs(
+        &self,
+        tree: TreeId,
+        event: EventNumber,
+        pointers: &mut Vec<PointerChange>,
+    ) -> u64 {
+        let mut count = 0;
+        for fork in self.upstreams.forks_of(tree) {
+            pointers.push(PointerChange {
+                name: refs::queue_entry(fork, event),
+                new: Some(Target::Oid(sync_marker().to_string())),
+                old: None,
+            });
+            count += 1;
+        }
+        count
+    }
+
+    /// The pointer changes a step that saves `tree` publishes: its branch and
+    /// object table at this step's commit, and one entry per destination,
+    /// numbered by the step (order across restart, independent of commit
+    /// dates). A tree's head moves to its upstream as a landing and to each
+    /// tree it is the upstream of as a sync.
+    fn publish(&mut self, tree: TreeId, seq: u64) -> Vec<PointerChange> {
+        let step = Target::Step(RecordNo::new(seq));
+        let event = EventNumber::new(seq);
+        let mut pointers = vec![
+            self.change(refs::branch(tree), Some(step.clone())),
+            self.change(refs::object_table(tree), Some(step.clone())),
+        ];
+        let mut enqueued = 0;
+        if let Some(upstream) = self.upstream_of(tree) {
+            pointers.push(PointerChange {
+                name: refs::queue_entry(upstream, event),
+                new: Some(step),
+                old: None,
+            });
+            enqueued += 1;
+        }
+        enqueued += self.enqueue_syncs(tree, event, &mut pointers);
+        self.metrics.queued = self.metrics.queued.saturating_add(enqueued);
+        pointers
+    }
+
+    /// Appends one step: its record is the change's commit point. A failure
+    /// changes nothing and returns its errno. Then the builder is told; the
+    /// caller applies the change, which cannot fail, and calls `after_step`.
+    fn record_step(
+        &mut self,
+        by: WriterAt,
+        change: Change,
+        pointers: Vec<PointerChange>,
+    ) -> Result<u64> {
         if self.is_stopped() {
             return Err(Error::Stopped);
         }
-        let started = Instant::now();
-        let event = EventNumber::new(self.next);
-        let recorded = (|| -> Result<Draft> {
-            crate::failpoints::hit("tree.before_objects")?;
-            let draft = build(self, event)?;
-            self.repo.sync_objects()?;
-            crate::failpoints::hit("tree.after_objects_durable")?;
-            self.pointers.check(&draft.changes)?;
-            self.journal_record(draft.entry(), &[])?;
-            Ok(draft)
+        let (tree, bytes) = self.build_cost(&change);
+        let recorded = (|| -> Result<u64> {
+            crate::failpoints::hit("tree.before_step")?;
+            self.pointers.check_targets(&pointers)?;
+            self.journal_record(
+                Entry::Step {
+                    by,
+                    change,
+                    pointers: pointers.clone(),
+                },
+                &[],
+            )
         })();
-        let draft = match recorded {
-            Ok(draft) => draft,
+        let seq = match recorded {
+            Ok(seq) => seq,
             Err(e) => {
                 eprintln!("tree SaveFailed: {e}");
                 return Err(e);
             }
         };
-        let saved = draft.saved;
-        let is_fork = draft.fork.is_some();
-        let changes = draft.changes.clone();
-        let tree = draft.tree;
-        self.install(draft, event);
-        if let Saved::Commit(head) = saved {
-            self.owners.insert(event, head);
-        }
-        if matches!(saved, Saved::Commit(_)) {
-            let nanos = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
-            self.metrics.saves = self.metrics.saves.saturating_add(1);
-            self.metrics.save_nanos = self.metrics.save_nanos.saturating_add(nanos);
-            self.metrics.max_save_nanos = self.metrics.max_save_nanos.max(nanos);
-        }
-        if let Err(e) = self.copy_out(tree, is_fork, &changes) {
-            self.copies_stale = true;
-            eprintln!("tree CopyStale: {e}");
-        }
+        self.pointers.apply_targets(&pointers);
+        self.history.appended_step(RecordNo::new(seq), tree, bytes);
+        Ok(seq)
+    }
+
+    /// The tree a step's build works in, and about how many bytes it writes:
+    /// the file a save changed and the tree's listings (the lag gate's
+    /// estimate; the builder's measured rate corrects it).
+    fn build_cost(&self, change: &Change) -> (TreeId, u64) {
+        /// About what one file adds to a commit's listings and metadata.
+        const LISTED: u64 = 64;
+        let (tree, file) = match change {
+            Change::Create { tree, .. }
+            | Change::Link { tree, .. }
+            | Change::Rename { tree, .. }
+            | Change::Unlink { tree, .. }
+            | Change::Take { tree, .. } => (tree, 0),
+            Change::Save { tree, outcome, .. } => match outcome {
+                journal::SaveOutcome::Saved { len, .. } => (tree, *len),
+                _ => (tree, 0),
+            },
+            Change::Fork { upstream } => (upstream, 0),
+        };
+        let tree: TreeId = tree.parse().unwrap_or(TreeId::Root);
+        let listed = self.trees.get(&tree).map_or(0, |t| t.names.len() as u64);
+        (tree, file.saturating_add(listed.saturating_mul(LISTED)))
+    }
+
+    /// After a step is applied: a compaction when one is due.
+    fn after_step(&mut self) {
         self.compact_if_due();
-        Ok((event, saved))
     }
+}
 
-    /// Stage 6: the step is on record, so memory follows. Cannot fail.
-    fn install(&mut self, draft: Draft, event: EventNumber) {
-        let Draft {
-            tree,
-            built,
-            changes,
-            closes,
-            opened,
-            fork,
-            enqueued,
-            taken,
-            ..
-        } = draft;
-        if let Some((fork, upstream)) = fork {
-            self.upstreams.add(fork, upstream);
+impl Drop for TreeActor {
+    /// Builds every record appended, then stops the builder: a clean shutdown
+    /// leaves history built through the last record.
+    fn drop(&mut self) {
+        let appended = self.journal.durability().appended();
+        self.history.stop(appended);
+        if let Some(builder) = self.builder.take() {
+            let _ = builder.join();
         }
-        let closed = closes.and_then(|handle| {
-            self.pending_closes.retain(|pending| *pending != handle);
-            self.handles.remove(&handle)
-        });
-        if let Some(open) = opened {
-            let bytes = built
-                .bytes
-                .get(&open.object)
-                .map_or_else(Vec::new, |bytes| bytes.to_vec());
-            self.handles.insert(
-                open.handle,
-                Handle {
-                    tree: open.tree,
-                    by: open.by,
-                    object: open.object,
-                    bytes,
-                    calls: Vec::new(),
-                    replayed: None,
-                },
-            );
-            self.pages_opened(open.tree, open.object);
-        }
-        self.trees.insert(tree, built);
-        self.pointers.apply(&changes);
-        self.metrics.queued = self
-            .metrics
-            .queued
-            .saturating_sub(taken)
-            .saturating_add(enqueued);
-        if let Some(closed) = closed {
-            self.pages_saved(closed.tree, closed.object, event.get());
-        }
-    }
-
-    /// Stage 7: Git's refs and the checkouts, both copies of what is on record.
-    fn copy_out(&mut self, tree: TreeId, is_fork: bool, changes: &[RefUpdate]) -> Result<()> {
-        // Named first, so that a failure anywhere below redoes this checkout.
-        if changes
-            .iter()
-            .any(|change| change.refname == refs::branch(tree))
-        {
-            self.stale_checkouts.insert(tree);
-        }
-        crate::failpoints::hit("tree.after_commit_point")?;
-        {
-            let _timer = Timer::start(Which::RefCopy);
-            if self.copies_stale {
-                self.repo
-                    .write_config(&refs::head(), &self.upstreams.merges())?;
-                self.repo.rebuild_refs(&self.pointers.creates())?;
-            } else if !changes.is_empty() {
-                if is_fork {
-                    self.repo
-                        .write_config(&refs::head(), &self.upstreams.merges())?;
-                }
-                self.repo.ref_transaction(changes)?;
-            }
-        }
-        crate::failpoints::hit("tree.after_ref_copy")?;
-        if !self.stale_checkouts.is_empty() {
-            crate::failpoints::hit("tree.before_checkout")?;
-            let stale: Vec<TreeId> = self.stale_checkouts.iter().copied().collect();
-            for name in stale {
-                let _timer = Timer::start(Which::Checkout);
-                let previous = self.checked_out.remove(&name);
-                let files = self.checkout(name, previous)?;
-                self.checked_out.insert(name, files);
-            }
-            self.stale_checkouts.clear();
-            crate::failpoints::hit("tree.after_checkout")?;
-        }
-        self.copies_stale = false;
-        Ok(())
     }
 }
 
@@ -991,6 +1171,20 @@ mod tests {
         Journal::open(&root.join(JOURNAL)).unwrap().1
     }
 
+    /// Two folds that add up to the same, but for how their records name
+    /// pointer values (a step's, or the oid it was built as): the same names.
+    fn same_fold(a: &journal::Folded, b: &journal::Folded) {
+        assert_eq!(a.opens, b.opens);
+        assert_eq!(a.upstreams, b.upstreams);
+        assert_eq!(a.next_seq, b.next_seq);
+        assert_eq!(a.page_writes, b.page_writes);
+        assert_eq!(a.saved_through, b.saved_through);
+        let names = |f: &journal::Folded| -> Vec<String> {
+            f.pointers.iter().map(|(n, _)| n.clone()).collect()
+        };
+        assert_eq!(names(a), names(b));
+    }
+
     #[test]
     fn compaction_keeps_the_fold() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1036,10 +1230,11 @@ mod tests {
         assert_eq!(folded.next_seq, v.next);
         assert_eq!(folded.pointers, v.pointers);
 
+        v.settle().unwrap();
         v.compact().unwrap();
         let compacted = frames_of(tmp.path());
         assert!(compacted.len() < whole.len());
-        assert_eq!(fold(&compacted).unwrap(), folded);
+        same_fold(&fold(&compacted).unwrap(), &folded);
 
         // What follows lands on either start and adds up the same.
         v.write(held, 0, b"held-2", false).unwrap();
@@ -1052,7 +1247,7 @@ mod tests {
         let now = frames_of(tmp.path());
         whole.extend_from_slice(&now[compacted.len()..]);
         let folded = fold(&now).unwrap();
-        assert_eq!(fold(&whole).unwrap(), folded);
+        same_fold(&fold(&whole).unwrap(), &folded);
         assert!(!folded.opens[&anonymous].open.anonymous);
         assert_eq!(folded.opens[&held].calls.len(), 2);
         assert_eq!(folded.pointers, v.pointers);
@@ -1075,6 +1270,7 @@ mod tests {
         v.close(second).unwrap();
         // Held open across the compaction, as a long-lived log is.
         let _held = v.write_open(ROOT, "f", &w, false).unwrap();
+        v.settle().unwrap();
         v.compact().unwrap();
         drop(v);
         let v = reopen(tmp.path());
@@ -1090,6 +1286,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut v = new_actor(tmp.path());
         v.fork().unwrap();
+        v.settle().unwrap();
         v.compact().unwrap();
         drop(v);
         let mut frames = frames_of(tmp.path());
@@ -1154,6 +1351,7 @@ mod tests {
             "agentfs-trees-2\n",
             "agentfs-trees-3\n",
             "agentfs-trees-4\n",
+            "agentfs-trees-5\n",
         ] {
             let tmp = tempfile::tempdir().unwrap();
             drop(new_actor(tmp.path()));

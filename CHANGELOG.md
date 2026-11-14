@@ -12,6 +12,12 @@ design was reviewed on 2026-10-12.
 
 ### Added
 
+- **Tree views: history is built behind the calls.** A step's journal record is the
+  change itself; the call path runs no git. A builder thread makes the commits with
+  `git fast-import` behind it, and Git's refs, commits and checkouts show only what
+  is built (`Recording::settle` waits for it). A failed build is retried and never
+  fails a call. The state format is now `agentfs-trees-6`, with a `built.log`;
+  older tree state areas do not open.
 - **Tree views: a call is journalled without an fsync.** A write, create, rename
   or unlink is in the journal before it returns and survives a crash of agentfs;
   close, fsync, an `O_SYNC` write or an fsync of the view's directory make it

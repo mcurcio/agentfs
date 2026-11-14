@@ -1,28 +1,33 @@
-//! Tree history: snapshots read from and written to commits, a tree's object table, direct saves,
-//! queue entries and checkouts (target git-model §4, §5).
+//! Tree history: the builder that makes commits behind the call path, History that owns the
+//! store, snapshots read from commits, object tables and checkouts (target git-model §4, §5, §12;
+//! docs/trees.md, "History trails the files").
 
+pub(super) mod builder;
 pub(super) mod built;
+pub(super) mod built_log;
+pub(super) mod feed;
+pub(super) mod format;
+pub(super) mod lag;
 pub(super) mod message;
 pub(super) mod refs;
-mod take;
+pub(super) mod take;
 pub(super) mod upstreams;
 
 use std::collections::BTreeMap;
-use std::fs;
+use std::fs::{self, File};
 use std::io;
 use std::path::Path;
+use std::sync::Arc;
 
-use agentfs_contracts::pod::WriterAt;
 use git2::Oid;
 use serde::{Deserialize, Serialize};
 
 use super::pointers::Pointers;
 use super::stages::{Timer, Which};
-use super::tree::{EventNumber, Lines, MergeFileIdentity, Tree};
-use super::{Draft, Error, Result, Saved, TreeActor, TreeId, referee};
-use crate::tree_git::{RefUpdate, TreeEntry, TreeGit};
-use message::{Action, Message};
-pub(super) use take::SyncStep;
+use super::tree::{EventNumber, MergeFileIdentity, Tree};
+use super::{Error, Result, TreeId, referee};
+use crate::file_lock::FileLock;
+use crate::tree_git::TreeGit;
 
 #[derive(Serialize, Deserialize)]
 pub(in crate::tree_actor) struct ObjectTable {
@@ -75,245 +80,129 @@ pub(in crate::tree_actor) fn remove_stale_locks(gitdir: &Path) -> io::Result<()>
     Ok(())
 }
 
-impl TreeActor {
-    pub(in crate::tree_actor) fn snapshot_at(&self, head: Oid) -> Result<referee::Snapshot> {
-        let _timer = Timer::start(Which::SnapshotRead);
-        let commit = self.repo.read_commit(head)?;
-        if !message::is_envelope(&commit.message) {
-            // The Root commit alone has no envelope, and an empty tree.
-            if self.repo.list_tree(commit.tree)?.is_empty() {
-                return Ok(referee::Snapshot {
-                    files: BTreeMap::new(),
-                    names: BTreeMap::new(),
-                });
-            }
-            return Err(Error::Format);
-        }
-        let entries = self.repo.list_tree(commit.tree)?;
-        let metadata = entries
-            .iter()
-            .find(|e| e.name == b"metadata.json")
-            .ok_or(Error::Format)?;
-        let namespace = entries
-            .iter()
-            .find(|e| e.name == b"namespace.json")
-            .ok_or(Error::Format)?;
-        let by_path: BTreeMap<String, (u64, MergeFileIdentity, Lines)> =
-            serde_json::from_slice(&self.repo.read_blob(metadata.oid)?)?;
-        let names = serde_json::from_slice(&self.repo.read_blob(namespace.oid)?)?;
-        let files = by_path
-            .into_values()
-            .map(|(object, id, lines)| (id, referee::File { object, lines }))
-            .collect();
-        Ok(referee::Snapshot { files, names })
-    }
+/// Creates a volume's Git store: the one place that does (clippy.toml).
+pub(in crate::tree_actor) fn init_store(git_dir: &Path, lease: Arc<FileLock>) -> Result<TreeGit> {
+    #[expect(clippy::disallowed_methods, reason = "History's store is made here")]
+    Ok(TreeGit::init_with_lease(git_dir, lease)?)
+}
 
-    pub(in crate::tree_actor) fn snapshot_tree(&self, snapshot: &referee::Snapshot) -> Result<Oid> {
-        let _timer = Timer::start(Which::Objects);
-        let mut files = Vec::new();
-        let mut metadata = BTreeMap::new();
-        for (id, file) in &snapshot.files {
-            let history = snapshot.names.get(id).ok_or(Error::Format)?;
-            let path = history.path()?.ok_or(Error::Format)?;
-            let bytes = file.lines.bytes();
-            files.push(TreeEntry {
-                name: path.as_bytes().to_vec(),
-                mode: 0o100644,
-                oid: self.repo.write_blob(&bytes)?,
-            });
-            metadata.insert(path, (file.object, id, &file.lines));
-        }
-        let files = self.repo.write_tree(&files)?;
-        let metadata = self.repo.write_blob(&serde_json::to_vec(&metadata)?)?;
-        let namespace = self
-            .repo
-            .write_blob(&serde_json::to_vec(&snapshot.names)?)?;
-        self.envelope(files, metadata, namespace)
-    }
+/// Opens a volume's Git store for History: the one place that does.
+pub(in crate::tree_actor) fn open_store(git_dir: &Path, lease: Arc<FileLock>) -> Result<TreeGit> {
+    #[expect(clippy::disallowed_methods, reason = "History's store is opened here")]
+    Ok(TreeGit::open_with_lease(git_dir, lease)?)
+}
 
-    pub(in crate::tree_actor) fn envelope(
-        &self,
-        files: Oid,
-        metadata: Oid,
-        namespace: Oid,
-    ) -> Result<Oid> {
-        Ok(self.repo.write_tree(&[
-            TreeEntry {
-                name: b"files".to_vec(),
-                mode: 0o040000,
-                oid: files,
-            },
-            TreeEntry {
-                name: b"metadata.json".to_vec(),
-                mode: 0o100644,
-                oid: metadata,
-            },
-            TreeEntry {
-                name: b"namespace.json".to_vec(),
-                mode: 0o100644,
-                oid: namespace,
-            },
-        ])?)
-    }
+/// A tree's object table as a blob: each named file's object, by identity.
+pub(in crate::tree_actor) fn object_table(tree: &Tree) -> Result<Vec<u8>> {
+    let files: BTreeMap<MergeFileIdentity, u64> = tree
+        .names
+        .values()
+        .map(|object| Ok((*tree.identities.get(object).ok_or(Error::Format)?, *object)))
+        .collect::<Result<_>>()?;
+    Ok(serde_json::to_vec(&ObjectTable { files })?)
+}
 
-    pub(in crate::tree_actor) fn object_table_update(
-        &self,
-        tree: TreeId,
-        snapshot: &referee::Snapshot,
-        updates: &mut Vec<RefUpdate>,
-    ) -> Result<()> {
-        let name = refs::object_table(tree);
-        let files: BTreeMap<MergeFileIdentity, u64> = snapshot
-            .files
-            .iter()
-            .map(|(id, file)| (*id, file.object))
-            .collect();
-        let oid = self
-            .repo
-            .write_blob(&serde_json::to_vec(&ObjectTable { files })?)?;
-        updates.push(RefUpdate {
-            expected_old: self.pointers.get(&name),
-            refname: name,
-            new: Some(oid),
-        });
-        Ok(())
+/// Gives a snapshot's files the objects `tree`'s object table names.
+pub(in crate::tree_actor) fn restore_object_table(
+    repo: &TreeGit,
+    pointers: &Pointers,
+    tree: TreeId,
+    snapshot: &mut referee::Snapshot,
+) -> Result<()> {
+    if let Some(oid) = pointers.get(&refs::object_table(tree)) {
+        let table: ObjectTable = serde_json::from_slice(&repo.read_blob(oid)?)?;
+        for (id, file) in &mut snapshot.files {
+            file.object = *table.files.get(id).ok_or(Error::Format)?;
+        }
     }
+    Ok(())
+}
 
-    pub(in crate::tree_actor) fn restore_object_table(
-        &self,
-        tree: TreeId,
-        snapshot: &mut referee::Snapshot,
-    ) -> Result<()> {
-        if let Some(oid) = self.pointers.get(&refs::object_table(tree)) {
-            let table: ObjectTable = serde_json::from_slice(&self.repo.read_blob(oid)?)?;
-            for (id, file) in &mut snapshot.files {
-                file.object = *table.files.get(id).ok_or(Error::Format)?;
-            }
-        }
-        Ok(())
-    }
+/// `tree`'s snapshot as built: its head's, with its object table's objects.
+pub(in crate::tree_actor) fn tree_snapshot(
+    repo: &TreeGit,
+    pointers: &Pointers,
+    tree: TreeId,
+) -> Result<referee::Snapshot> {
+    let head = pointers.get(&refs::branch(tree)).ok_or(Error::NotFound)?;
+    let mut snapshot = format::read_snapshot(repo, head)?;
+    restore_object_table(repo, pointers, tree, &mut snapshot)?;
+    Ok(snapshot)
+}
 
-    /// The commit of every direct save on record, by its event number: one Git
-    /// child over everything the pointers reach. An event has one commit, so
-    /// no walk from a fork's head is needed to find it. A copy: `owners` is
-    /// folded as saves land and is empty-then-rebuilt here at every open.
-    pub(in crate::tree_actor) fn rebuild_owners(&mut self) -> Result<()> {
-        let _timer = Timer::start(Which::EventOwners);
-        self.owners = self
-            .repo
-            .commit_messages(&refs::owner_tips(&self.pointers))?
-            .into_iter()
-            .filter_map(|(oid, message)| Some((message::direct_event(&message)?, oid)))
-            .collect();
-        Ok(())
+/// Every tree as built: each branch's snapshot installed.
+pub(in crate::tree_actor) fn read_trees(
+    repo: &TreeGit,
+    pointers: &Pointers,
+) -> Result<BTreeMap<TreeId, Tree>> {
+    let mut trees = BTreeMap::new();
+    for id in refs::branches(pointers)?.into_keys() {
+        let mut tree = Tree::default();
+        tree.install(tree_snapshot(repo, pointers, id)?)?;
+        trees.insert(id, tree);
     }
+    if !trees.contains_key(&TreeId::Root) {
+        return Err(Error::Format);
+    }
+    Ok(trees)
+}
 
-    /// Writes `t`'s commit and the pointer changes that publish it.
-    pub(in crate::tree_actor) fn build_save(
-        &self,
-        tree: TreeId,
-        t: Tree,
-        by: &WriterAt,
-        action: Action,
-        event: EventNumber,
-        open: Option<u64>,
-    ) -> Result<Draft> {
-        let _timer = Timer::start(Which::Objects);
-        let mut files = Vec::new();
-        for (path, object) in t.names.iter() {
-            // Only a file whose bytes this save changed is stored again.
-            let blob = t.bytes[object].blob(|bytes| Ok(self.repo.write_blob(bytes)?))?;
-            files.push(TreeEntry {
-                name: path.as_bytes().to_vec(),
-                mode: 0o100644,
-                oid: blob,
-            });
-        }
-        let files = self.repo.write_tree(&files)?;
-        let mut metadata = BTreeMap::new();
-        for (path, object) in t.names.iter() {
-            metadata.insert(path, (object, t.identities[object], &*t.lines[object]));
-        }
-        let blob = self.repo.write_blob(&serde_json::to_vec(&metadata)?)?;
-        let namespace = self.repo.write_blob(&serde_json::to_vec(&t.namespace)?)?;
-        let content = self.envelope(files, blob, namespace)?;
-        let message = Message::Direct {
-            action,
-            by,
-            tree,
-            event,
-            open,
-        }
-        .render(&self.identity)?;
-        let current = self.head(tree)?;
-        let head = self.repo.write_commit(content, &[current], &message)?;
-        let mut changes = vec![RefUpdate {
-            refname: refs::branch(tree),
-            new: Some(head),
-            expected_old: Some(current),
-        }];
-        self.object_table_update(tree, &Self::snapshot_of(&t), &mut changes)?;
-        let enqueued = self.enqueue_moves(tree, head, event, &mut changes)?;
-        let mut draft = Draft::new(by, tree, t);
-        draft.changes = changes;
-        draft.enqueued = enqueued;
-        draft.saved = Saved::Commit(head);
-        Ok(draft)
-    }
+/// The commit of every direct save the pointers reach, by its event number:
+/// one Git child.
+pub(in crate::tree_actor) fn owners(
+    repo: &TreeGit,
+    pointers: &Pointers,
+) -> Result<BTreeMap<EventNumber, Oid>> {
+    let _timer = Timer::start(Which::EventOwners);
+    Ok(repo
+        .commit_messages(&refs::owner_tips(pointers))?
+        .into_iter()
+        .filter_map(|(oid, message)| Some((message::direct_event(&message)?, oid)))
+        .collect())
+}
 
-    // One entry per destination, numbered by the step that causes it: order
-    // across restart, independent of commit dates. A tree's head moves to its
-    // upstream as a landing and to each tree it is the upstream of as a sync.
-    pub(in crate::tree_actor) fn enqueue_moves(
-        &self,
-        tree: TreeId,
-        head: Oid,
-        event: EventNumber,
-        changes: &mut Vec<RefUpdate>,
-    ) -> Result<u64> {
-        let mut destinations: Vec<(TreeId, Oid)> = Vec::new();
-        if let Some(upstream) = self.upstream_of(tree) {
-            destinations.push((upstream, head));
-        }
-        let downstream: Vec<TreeId> = self.upstreams.forks_of(tree).collect();
-        if !downstream.is_empty() {
-            let sync = self.repo.write_blob(b"sync")?;
-            destinations.extend(downstream.into_iter().map(|fork| (fork, sync)));
-        }
-        for (destination, oid) in &destinations {
-            changes.push(RefUpdate {
-                refname: refs::queue_entry(*destination, event),
-                new: Some(*oid),
-                expected_old: None,
-            });
-        }
-        Ok(destinations.len() as u64)
-    }
+/// Makes `tree`'s checkout `head`'s files, rewriting only what differs from
+/// `previous`, the files tree the checkout holds now. Returns the files tree
+/// it holds after.
+pub(in crate::tree_actor) fn checkout(
+    repo: &TreeGit,
+    root: &Path,
+    tree: TreeId,
+    head: Oid,
+    previous: Option<Oid>,
+) -> Result<Oid> {
+    let _timer = Timer::start(Which::Checkout);
+    let dir = root.join("trees").join(tree.to_string());
+    fs::create_dir_all(&dir)?;
+    let files = format::files_tree(repo, head)?;
+    repo.checkout_tree(files, &dir, previous)?;
+    Ok(files)
+}
 
-    /// Makes `tree`'s checkout its branch's files, rewriting only what differs
-    /// from `previous`, the files tree the checkout holds now. Returns the files
-    /// tree it holds after.
-    pub(in crate::tree_actor) fn checkout(
-        &self,
-        tree: TreeId,
-        previous: Option<Oid>,
-    ) -> Result<Oid> {
-        let dir = self.root.join("trees").join(tree.to_string());
-        fs::create_dir_all(&dir)?;
-        // Rebuild from the branch, never from intermediate in-memory state.
-        let commit = self.repo.read_commit(self.head(tree)?)?;
-        // The trailer tells the Root commit even if a workload used our names.
-        let files = if message::is_envelope(&commit.message) {
-            self.repo
-                .list_tree(commit.tree)?
-                .into_iter()
-                .find(|e| e.name == b"files")
-                .ok_or(Error::Format)?
-                .oid
-        } else {
-            commit.tree
-        };
-        self.repo.checkout_tree(files, &dir, previous)?;
-        Ok(files)
+/// The marker blob of a sync queue entry, written at create.
+pub(in crate::tree_actor) fn sync_marker() -> Oid {
+    Oid::hash_object(git2::ObjectType::Blob, b"sync").unwrap_or(Oid::ZERO_SHA1)
+}
+
+/// What a cut-short build left in the store, which nothing names: fast-import's
+/// temporary packs, `.keep` files, an index without its pack.
+pub(in crate::tree_actor) fn clean_packs(gitdir: &Path) -> io::Result<()> {
+    let dir = gitdir.join("objects").join("pack");
+    let Ok(entries) = fs::read_dir(&dir) else {
+        return Ok(());
+    };
+    for entry in entries {
+        let path = entry?.path();
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let orphan_index =
+            path.extension().is_some_and(|e| e == "idx") && !path.with_extension("pack").exists();
+        if name.starts_with("tmp_") || path.extension().is_some_and(|e| e == "keep") || orphan_index
+        {
+            fs::remove_file(&path)?;
+        }
     }
+    File::open(&dir)?.sync_all()
 }

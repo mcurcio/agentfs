@@ -1,6 +1,6 @@
 //! Recording: a tree's file calls, each journalled (in the kernel, no fsync) before it returns,
-//! and the steps that save them: create, close, rename and unlink (docs/recording.md; target
-//! git-model §7).
+//! and the steps that save them: create, close, rename and unlink, each decided, appended and
+//! applied with no git (docs/recording.md, docs/trees.md; target git-model §7).
 
 pub(super) mod pages;
 
@@ -8,11 +8,10 @@ use std::sync::Arc;
 
 use agentfs_contracts::pod::WriterAt;
 
-use super::history::message::Action;
-use super::journal::{CallHead, Entry, LiveOpen, RunHead};
-use super::stages::{Timer, Which};
-use super::tree::{EventNumber, MergeFileIdentity, NameHistory, Versions};
-use super::{Draft, Error, Result, Saved, TreeActor, TreeId};
+use super::journal::durable::RecordNo;
+use super::journal::{CallHead, Change, Entry, PagePiece, RunHead, SaveOutcome};
+use super::tree::EventNumber;
+use super::{Error, Result, Saved, TreeActor, TreeId};
 use crate::paths::RepoPath;
 
 /// Calls name byte positions, never lines. Append finds EOF at save time.
@@ -209,9 +208,7 @@ impl TreeActor {
             if !create {
                 return Err(Error::NotFound);
             }
-            return self
-                .step(tree, |v, event| v.build_create(tree, path, by, event))
-                .map(|(event, _)| event.get());
+            return self.create_step(tree, path, by);
         };
         let handle = self.journal_record(
             Entry::Open {
@@ -283,19 +280,13 @@ impl TreeActor {
         if !t.anonymous.contains(&object) {
             return Err(Error::NotFound);
         }
-        self.step(tree, |v, event| {
-            let mut t = v.tree(tree)?.clone();
-            t.anonymous.remove(&object);
-            t.namespace.insert(
-                t.identities[&object],
-                NameHistory::created(event, path.to_owned()),
-            );
-            t.names.insert(path.to_owned(), object);
-            let mut draft = v.build_save(tree, t, by, Action::Create, event, None)?;
-            draft.linked = Some(object);
-            Ok(draft)
-        })?;
-        Ok(())
+        self.run_pending_closes(tree, None)?;
+        let change = Change::Link {
+            tree: tree.to_string(),
+            object,
+            path: path.to_owned(),
+        };
+        self.named_step(tree, by, change)
     }
 
     /// Whether this object has never had a name in this tree.
@@ -408,7 +399,13 @@ impl TreeActor {
             return Err(Error::NotFound);
         }
         if from != to {
-            self.step(tree, |v, event| v.build_rename(tree, from, to, by, event))?;
+            self.run_pending_closes(tree, None)?;
+            let change = Change::Rename {
+                tree: tree.to_string(),
+                from: from.to_owned(),
+                to: to.to_owned(),
+            };
+            self.named_step(tree, by, change)?;
         }
         Ok(())
     }
@@ -418,16 +415,12 @@ impl TreeActor {
         if !self.tree(tree)?.names.contains_key(path) {
             return Err(Error::NotFound);
         }
-        self.step(tree, |v, event| {
-            let mut t = v.tree(tree)?.clone();
-            let object = t.names.remove(path).ok_or(Error::NotFound)?;
-            t.namespace
-                .get_mut(&t.identities[&object])
-                .ok_or(Error::Format)?
-                .advance(event, None, None);
-            v.build_save(tree, t, by, Action::Unlink, event, None)
-        })?;
-        Ok(())
+        self.run_pending_closes(tree, None)?;
+        let change = Change::Unlink {
+            tree: tree.to_string(),
+            path: path.to_owned(),
+        };
+        self.named_step(tree, by, change)
     }
 
     /// Saves this tree's pending closes in arrival order, answering for `wanted`.
@@ -444,7 +437,7 @@ impl TreeActor {
             .collect();
         let mut outcome = Saved::Unchanged;
         for handle in due {
-            let (_, saved) = self.run_step(|v, event| v.build_close(handle, event))?;
+            let saved = self.close_step(handle)?;
             if wanted == Some(handle) {
                 outcome = saved;
             }
@@ -452,119 +445,144 @@ impl TreeActor {
         Ok(outcome)
     }
 
-    pub(in crate::tree_actor) fn build_create(
-        &self,
-        tree: TreeId,
-        path: &str,
-        by: &WriterAt,
-        event: EventNumber,
-    ) -> Result<Draft> {
-        let object = event.object();
-        let mut t = self.tree(tree)?.clone();
-        t.names.insert(path.to_owned(), object);
-        t.bytes.insert(object, Arc::default());
-        t.lines.insert(object, Arc::default());
-        t.identities.insert(object, MergeFileIdentity(object));
-        t.namespace.insert(
-            MergeFileIdentity(object),
-            NameHistory::created(event, path.to_owned()),
-        );
-        t.fresh_names.insert(object);
-        let mut draft = self.build_save(tree, t, by, Action::Create, event, None)?;
-        draft.opened = Some(LiveOpen {
-            handle: event.get(),
-            tree,
-            by: by.clone(),
-            object,
-            anonymous: false,
-        });
-        Ok(draft)
-    }
-
-    pub(in crate::tree_actor) fn build_close(
-        &self,
-        handle: u64,
-        event: EventNumber,
-    ) -> Result<Draft> {
-        let h = self.handles.get(&handle).ok_or(Error::NotFound)?;
-        let calls = self.pages_calls_for_close(h);
-        let mut t = self.tree(h.tree)?.clone();
-        let mut draft = if t.anonymous.remove(&h.object) {
-            t.drop_object(h.object);
-            Draft::new(&h.by, h.tree, t)
-        } else if !t.is_named(h.object) {
-            let mut draft = Draft::new(&h.by, h.tree, t);
-            draft.saved = Saved::OrphanDropped;
-            draft
-        } else if let Some(bytes) = changed_bytes(&t.bytes[&h.object], &calls)? {
-            let mut versions = Versions::of(event);
-            let mut next_id = || versions.next();
-            let lines = if calls.iter().all(|call| matches!(call, Call::Append(_))) {
-                let suffix: Vec<u8> = calls
-                    .iter()
-                    .flat_map(|call| match call {
-                        Call::Append(bytes) => bytes.as_slice(),
-                        _ => unreachable!(),
-                    })
-                    .copied()
-                    .collect();
-                t.lines[&h.object].append(&suffix, &mut next_id)?
-            } else {
-                let _timer = Timer::start(Which::Align);
-                t.lines[&h.object].align(&bytes, &mut next_id)?
-            };
-            t.lines.insert(h.object, Arc::new(lines));
-            t.bytes.insert(h.object, Arc::new(bytes.into()));
-            self.build_save(h.tree, t, &h.by, Action::Direct, event, Some(handle))?
-        } else {
-            Draft::new(&h.by, h.tree, t)
+    /// A create: the step that names a new object and opens it.
+    fn create_step(&mut self, tree: TreeId, path: &str, by: &WriterAt) -> Result<u64> {
+        self.run_pending_closes(tree, None)?;
+        let seq = self.next;
+        let change = Change::Create {
+            tree: tree.to_string(),
+            path: path.to_owned(),
         };
-        draft.closes = Some(handle);
-        Ok(draft)
+        let pointers = self.publish(tree, seq);
+        let started = std::time::Instant::now();
+        self.record_step(by.clone(), change.clone(), pointers)?;
+        let t = self.trees.get_mut(&tree).ok_or(Error::NotFound)?;
+        Self::apply_shape(&mut self.stopped, t, &change, seq);
+        t.bytes.insert(seq, Arc::default());
+        self.handles.insert(
+            seq,
+            Handle {
+                tree,
+                by: by.clone(),
+                object: seq,
+                bytes: Vec::new(),
+                calls: Vec::new(),
+                replayed: None,
+            },
+        );
+        self.pages_opened(tree, seq);
+        self.count_save(started);
+        self.after_step();
+        Ok(seq)
     }
 
-    pub(in crate::tree_actor) fn build_rename(
-        &self,
-        tree: TreeId,
-        from: &str,
-        to: &str,
-        by: &WriterAt,
-        event: EventNumber,
-    ) -> Result<Draft> {
-        let mut t = self.tree(tree)?.clone();
-        let object = t.names.remove(from).ok_or(Error::NotFound)?;
-        if let Some(replaced) = t.names.get(to).copied()
-            && t.fresh_names.contains(&object)
-        {
-            let source_id = t.identities[&object];
-            t.namespace
-                .get_mut(&source_id)
-                .ok_or(Error::Format)?
-                .advance(event, None, None);
-            let mut versions = Versions::of(event);
-            let lines = t.lines[&replaced].align(&t.bytes[&object], || versions.next())?;
-            t.lines.insert(object, Arc::new(lines));
-            t.identities.insert(object, t.identities[&replaced]);
-            if !t.fresh_names.contains(&replaced) {
-                t.fresh_names.remove(&object);
-            }
-        } else {
-            let source_id = t.identities[&object];
-            if let Some(replaced) = t.names.get(to).copied() {
-                let replaced_id = t.identities[&replaced];
-                t.namespace
-                    .get_mut(&replaced_id)
-                    .ok_or(Error::Format)?
-                    .advance(event, None, Some(source_id));
-            }
-            t.namespace
-                .get_mut(&source_id)
-                .ok_or(Error::Format)?
-                .advance(event, Some(to.to_owned()), None);
-            t.fresh_names.remove(&object);
+    /// A link, rename or unlink: a step that changes names, checked by
+    /// applying it to a copy of the shape first.
+    fn named_step(&mut self, tree: TreeId, by: &WriterAt, change: Change) -> Result<()> {
+        let seq = self.next;
+        let mut shape = self.tree(tree)?.shape.clone();
+        shape.apply(&change, EventNumber::new(seq))?;
+        let pointers = self.publish(tree, seq);
+        let started = std::time::Instant::now();
+        self.record_step(by.clone(), change, pointers)?;
+        self.trees.get_mut(&tree).ok_or(Error::NotFound)?.shape = shape;
+        self.count_save(started);
+        self.after_step();
+        Ok(())
+    }
+
+    /// Applies a recorded step's shape transition, which was checked before
+    /// its record: a failure now is a bug, and stops the actor.
+    fn apply_shape(
+        stopped: &mut bool,
+        tree: &mut super::tree::SavedTree,
+        change: &Change,
+        seq: u64,
+    ) {
+        if let Err(e) = tree.shape.apply(change, EventNumber::new(seq)) {
+            eprintln!("tree SaveFailed: a recorded step does not apply: {e}");
+            *stopped = true;
         }
-        t.names.insert(to.to_owned(), object);
-        self.build_save(tree, t, by, Action::Rename, event, None)
+    }
+
+    fn count_save(&mut self, started: std::time::Instant) {
+        let nanos = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        self.metrics.saves = self.metrics.saves.saturating_add(1);
+        self.metrics.save_nanos = self.metrics.save_nanos.saturating_add(nanos);
+        self.metrics.max_save_nanos = self.metrics.max_save_nanos.max(nanos);
+    }
+
+    /// A close: decides its outcome on the saved bytes, appends the save and
+    /// applies it. The builder replays the same calls on the built bytes.
+    fn close_step(&mut self, handle: u64) -> Result<Saved> {
+        let h = self.handles.get(&handle).ok_or(Error::NotFound)?;
+        let (tree, object, by) = (h.tree, h.object, h.by.clone());
+        let t = self.tree(tree)?;
+        let mut pieces = Vec::new();
+        let mut saved_bytes = None;
+        let outcome = if t.anonymous.contains(&object) {
+            SaveOutcome::AnonymousDropped
+        } else if !t.is_named(object) {
+            SaveOutcome::OrphanDropped
+        } else {
+            pieces = self.pages_close_pieces(h);
+            let calls = pages::close_calls(&h.calls, &pieces);
+            let saved = t.bytes.get(&object).ok_or(Error::NotFound)?;
+            match changed_bytes(saved, &calls)? {
+                Some(bytes) => {
+                    let outcome = SaveOutcome::Saved {
+                        len: bytes.len() as u64,
+                        crc32: crc32fast::hash(&bytes),
+                    };
+                    saved_bytes = Some(bytes);
+                    outcome
+                }
+                None => SaveOutcome::Unchanged,
+            }
+        };
+        let seq = self.next;
+        let pointers = if saved_bytes.is_some() {
+            self.publish(tree, seq)
+        } else {
+            Vec::new()
+        };
+        let change = Change::Save {
+            tree: tree.to_string(),
+            handle,
+            pages: pieces
+                .iter()
+                .map(|(record, run)| PagePiece {
+                    record: RecordNo::new(*record),
+                    offset: run.offset,
+                    len: run.bytes.len() as u64,
+                })
+                .collect(),
+            outcome,
+        };
+        let started = std::time::Instant::now();
+        self.record_step(by, change, pointers)?;
+        self.pending_closes.retain(|pending| *pending != handle);
+        self.handles.remove(&handle);
+        let t = self.trees.get_mut(&tree).ok_or(Error::NotFound)?;
+        t.shape.save(object, outcome);
+        match (outcome, saved_bytes) {
+            (SaveOutcome::AnonymousDropped, _) => t.drop_object(object),
+            (_, Some(bytes)) => {
+                t.bytes.insert(object, Arc::new(bytes.into()));
+            }
+            _ => {}
+        }
+        self.pages_saved(tree, object, seq);
+        let saved = match outcome {
+            SaveOutcome::Saved { .. } => {
+                self.count_save(started);
+                Saved::Commit(RecordNo::new(seq))
+            }
+            SaveOutcome::OrphanDropped => Saved::OrphanDropped,
+            SaveOutcome::Unchanged | SaveOutcome::AnonymousDropped => Saved::Unchanged,
+        };
+        self.after_step();
+        Ok(saved)
     }
 }
 

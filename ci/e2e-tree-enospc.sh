@@ -70,16 +70,18 @@ else:
 try: os.close(fd)
 except OSError: pass
 PY
-# A full state area fails the call and stops nothing: the view still answers.
+# A full state area stops nothing: the view still answers. A create is one small
+# journal frame, which may still fit the journal's last page: then it is recorded
+# and only the builder behind it fails (no space for its pack); else it fails ENOSPC.
 python3 - "$work/main" <<'PY'
 import errno, os, sys
 try:
     os.close(os.open(sys.argv[1] + '/while-full', os.O_CREAT | os.O_WRONLY, 0o600))
 except OSError as e:
     assert e.errno == errno.ENOSPC, e
+    assert os.listdir(sys.argv[1]) == ['file'], os.listdir(sys.argv[1])
 else:
-    raise AssertionError('create succeeded while the state filesystem was full')
-assert os.listdir(sys.argv[1]) == ['file'], os.listdir(sys.argv[1])
+    assert sorted(os.listdir(sys.argv[1])) == ['file', 'while-full'], os.listdir(sys.argv[1])
 PY
 rm "$work/volume/filler"
 fusermount3 -u "$work/main"; fusermount3 -u "$work/sandbox"
@@ -87,7 +89,7 @@ status=0
 wait "$pid" || status=$?
 pid=
 if [ "$status" != 0 ]; then echo "mount exited $status after a full state area" >&2; cat "$work/mount.log" >&2; exit 1; fi
-grep -Fq 'tree SaveFailed' "$work/mount.log" || { cat "$work/mount.log" >&2; exit 1; }
+grep -Eq 'tree (SaveFailed|HistoryBuildFailed)' "$work/mount.log" || { cat "$work/mount.log" >&2; exit 1; }
 "$bin" --state "$work/volume/state" trees init --volume t
 gitdir=$work/volume/state/history.git
 [ "$(tree_git_file "$gitdir" root file)" = acknowledged ]
@@ -125,7 +127,8 @@ try:
     os.rename(source, destination)
 except OSError as e:
     got = e.errno
-assert got == getattr(errno, want, 0), f'rename answered {got}, wanted {want}'
+assert got == getattr(errno, want, 0) or (want == 'ANY' and got in (0, errno.ENOSPC)), \
+    f'rename answered {got}, wanted {want}'
 PY
   for _ in $(seq 1 200); do
     if grep -Fq "agentfs failpoint $point triggered (sleep(30000))" "$log"; then break; fi
@@ -144,30 +147,42 @@ with open(sys.argv[1], 'wb', buffering=0) as f:
     except OSError as e:
         assert e.errno == errno.ENOSPC, e
 PY
-  kill -0 "$client" || { echo 'rename returned before filesystem was filled' >&2; exit 1; }
+  # A call waits at a call-path point; the builder's points are behind the call.
+  [ "${4:-held}" != held ] || kill -0 "$client" || { echo 'rename returned before filesystem was filled' >&2; exit 1; }
   if ! wait "$client"; then cat "$work/rename.log" >&2; exit 1; fi
+  # The builder's point: keep the filesystem full until the builder, woken from
+  # the failpoint, has tried its copies.
+  if [ "${4:-held}" != held ]; then
+    for _ in $(seq 1 600); do grep -Fq 'tree CopyStale' "$log" && break; sleep .1; done
+  fi
   rm "$work/volume/filler"
   fusermount3 -u "$work/main"
   # Neither failure stops the actor.
   wait "$pid"; pid=
   "$bin" --state "$work/volume/state" trees init --volume t
   gitdir=$work/volume/state/history.git
-  [ "$(tree_git_file "$gitdir" root "$3")" = git-acknowledged ]
+  if [ "$3" = either ]; then
+    [ "$(tree_git_file "$gitdir" root source 2>/dev/null || tree_git_file "$gitdir" root destination)" = git-acknowledged ]
+  else
+    [ "$(tree_git_file "$gitdir" root "$3")" = git-acknowledged ]
+  fi
   git --git-dir="$gitdir" fsck --full --strict --no-progress
   tree_git_no_duplicate_opens "$gitdir"
   head=$(git --git-dir="$gitdir" rev-parse root)
   "$bin" --state "$work/volume/state" trees init --volume t
   [ "$(git --git-dir="$gitdir" rev-parse root)" = "$head" ]
 }
-# Objects cannot be written: nothing is recorded, ENOSPC, the name stays.
-rename_while_full tree.before_objects ENOSPC source
-printf 'PASS\tenospc-before-commit-point\trename ENOSPC; source\n' | tee -a "$work/results.tsv"
-# The record stands and only the copies fail: the call succeeded.
-rename_while_full tree.after_commit_point NONE destination
-grep -Fq 'tree CopyStale' "$work/tree.after_commit_point.log" || { cat "$work/tree.after_commit_point.log" >&2; exit 1; }
+# A full state area at the step: its record is one small frame, which may still fit
+# the journal's last page (recorded, the destination) or not (ENOSPC, the source).
+rename_while_full tree.before_step ANY either
+printf 'PASS\tenospc-before-commit-point\trename 0 or ENOSPC; one name holds it\n' | tee -a "$work/results.tsv"
+# The record stands and only the builder's copies fail: the call succeeded.
+rename_while_full tree.build_after_built_log NONE destination behind
+grep -Fq 'tree CopyStale' "$work/tree.build_after_built_log.log" || { cat "$work/tree.build_after_built_log.log" >&2; exit 1; }
 printf 'PASS\tenospc-after-commit-point\trename 0; destination\n' | tee -a "$work/results.tsv"
 # Only a failed fsync stops the actor: the file can no longer be trusted. A
-# write appends with no fsync, so the client's fsync is the one that fails.
+# write appends with no fsync; the first journal fsync fails, the client's own or
+# the builder's behind the create, and every call after it answers EIO.
 rm -rf "$work/volume/state"
 "$bin" --state "$work/volume/state" trees init --volume t
 AGENTFS_FAILPOINTS='tree.wal_before_fsync=error' "$bin" --state "$work/volume/state" trees mount "$work/main" >"$work/fsync-mount.log" 2>&1 & pid=$!
@@ -181,10 +196,18 @@ def expect_eio(what, call):
         assert e.errno == errno.EIO, (what, e)
     else:
         raise AssertionError(f'{what} succeeded after a failed fsync')
-fd = os.open(sys.argv[1], os.O_CREAT | os.O_WRONLY, 0o600)
-assert os.write(fd, b'x') == 1
-expect_eio('fsync', lambda: os.fsync(fd))
-expect_eio('close', lambda: os.close(fd))
+fd = None
+try:
+    fd = os.open(sys.argv[1], os.O_CREAT | os.O_WRONLY, 0o600)
+    assert os.write(fd, b'x') == 1
+    os.fsync(fd)
+except OSError as e:
+    assert e.errno == errno.EIO, e
+else:
+    raise AssertionError('no call failed after the journal fsync failed')
+if fd is not None:
+    try: os.close(fd)
+    except OSError as e: assert e.errno == errno.EIO, e
 expect_eio('create', lambda: os.close(os.open(sys.argv[2], os.O_CREAT | os.O_WRONLY, 0o600)))
 PY
 fusermount3 -u "$work/main"

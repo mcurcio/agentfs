@@ -770,32 +770,37 @@ open saved once from the journal; a take is one step, so none is in progress); t
 not; the rest is a design choice.
 
 **One step, one journal record** (a recommendation the owner accepted, revisable; [OWNER-GUIDANCE.md](../../OWNER-GUIDANCE.md)). Each step
-writes its objects durably, then appends one journal record with every pointer it moves: the branch, queue
-entries, collision refs, the object table. That record is the commit point. Git's refs are then a copy, in the files
-format, and nothing decides from the copy: runtime reads come from the journal's pointers. Reftable's one atomic swap
-is no longer needed, and git's reftable writer could not survive a cut anyway (`reftable/writer.c` writes a table's
-footer after its last sync).
+appends one journal record: the change itself, and every pointer its build moves (the branch, queue entries, collision
+refs, the object table), each value an oid or "what step `n`'s build gives". That record is the commit point. The
+commits are built behind it by a builder (the owner, 2026-11-13: "only the diff/patch needs to be syncrhonosly
+collected and queued, while the git history persistence could be an asynchronous trailing process"). Git's refs are a
+copy of the built pointers, in the files format, and nothing decides from the copy. Reftable's one atomic swap is no
+longer needed, and git's reftable writer could not survive a cut anyway (`reftable/writer.c` writes a table's footer
+after its last sync).
 
-The order of a step:
+The order of a step, on the call path:
 
-1. Build on a copy of the tree. Only objects the step changed are written, in process through libgit2, each fsynced
-   with its fan-out directory; `objects/` is fsynced once, after the last, before the record names them.
+1. Decide it on the saved state: the outcome of a close (its length and checksum), the names it moves.
 2. Check the pointers it moves against their current values.
 3. Append the record, with no flush: **the commit point**. It survives power loss once a flush covers it (§3).
-4. Install the copy and apply the pointers.
-5. The copies: a fork's `config`, the refs, the private checkout.
+4. Apply it to the saved state the views serve.
+
+Then the builder, for a batch of durable records: it replays each step on the built trees with the same transitions,
+aligns the lines, feeds the commits to `git fast-import`, fsyncs the pack, then fsyncs the batch's entry in the built
+log (the built point). Only then are a fork's `config`, the refs and the private checkouts copied. Nothing reads Git
+past the built point; takes are decided on history built through every record before them.
 
 A failure in 1 to 3 changes nothing: the call returns its errno and the actor keeps serving (§3). A close stays pending,
 its handle still counting as open, and saves first at the next step in its tree and at restart. A take stays queued for
 the next event. Only a failed `fsync` or rollback of the journal stops the actor: the file cannot be trusted then.
 
-A failure in 4 and 5 is not a recording failure (AGENTS principle 5): the call succeeded. It is logged, and the next
-step rebuilds the refs whole and redoes that checkout.
+A failed batch is not a recording failure (AGENTS principle 5): nothing reachable changed, and it is retried. A failed
+copy after the built-log entry is logged, and the next batch rebuilds the refs whole and redoes the checkouts.
 
 | Step | Its one journal record | On restart |
 |---|---|---|
-| save | the branch, the landing entry at the upstream, a sync entry at each child, the object table; names the open it closes | nothing to do: the move and its entries are one record, or neither happened |
-| queue take | the branch, the entry deleted, the entries the move causes, the collision ref, the object table | the entry is still there only if the take has no record: take it again; collision refs are named by the losing commit, so a rerun makes the same names |
+| save | the close's calls by reference and its outcome; the branch, the landing entry at the upstream, a sync entry at each child, the object table; names the open it closes | build what is not built; the move and its entries are one record, or neither happened |
+| queue take | the decision (head move, changed files and names, collisions); the branch, the entry deleted, the entries the move causes, the collision ref, the object table | the entry is still there only if the take has no record: take it again; collision refs are named by the losing commit, so a rerun makes the same names |
 | transaction begin, commit, rollback | not built | every `txn/*` branch is deleted, its index dropped and its deferred calls applied: a crash rolls back every open transaction (A13; R5.3's pick, §9). A commit's ref transaction either happened (the branch is gone, the transaction ended) or did not (rolled back) |
 | fork create | the branch and its upstream | `config` is rewritten from the journal before any git command; a dropped fork is not built |
 | journal | each call appended before it returns, durable once a flush covers it (§3) | every frame is read, durable or not; a hole a later frame's mark shows was durable refuses to serve, any other bad tail is saved aside and discarded. Before any view serves the tree, each open with no record closing it is saved as its close would be, exactly once, and every record is flushed |

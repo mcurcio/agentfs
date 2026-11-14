@@ -109,8 +109,9 @@ impl Stages {
             prior_decisions: at(Which::PriorDecisions),
             event_owners: at(Which::EventOwners),
             git_children: crate::git_cli::children(),
-            object_writes: crate::tree_git::object_writes(),
-            object_dir_syncs: crate::tree_git::object_dir_syncs(),
+            object_writes: crate::tree_git::object_writes() + super::history::feed::fed(),
+            object_dir_syncs: crate::tree_git::object_dir_syncs()
+                + super::history::feed::pack_syncs(),
         }
     }
 }

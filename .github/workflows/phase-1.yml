@@ -210,7 +210,7 @@ jobs:
         env:
           AGENTFS_BIN: ${{ github.workspace }}/target/debug/agentfs
           POWER_LOSS_DIR: ${{ runner.temp }}/tree-power-loss
-      - name: object directories sync before the record
+      - name: pack files sync before their built-log entry
         if: matrix.fs == 'ext4'
         run: sudo env PATH="$PATH" AGENTFS_BIN="$AGENTFS_BIN" TMPDIR="$RUNNER_TEMP" ci/trees-object-dir-syncs.sh
         env:
