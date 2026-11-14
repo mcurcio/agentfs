@@ -4,12 +4,14 @@
 
 pub(super) mod pages;
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use agentfs_contracts::pod::WriterAt;
 
 use super::journal::durable::RecordNo;
 use super::journal::{CallHead, Change, Entry, PagePiece, RunHead, SaveOutcome};
+use super::queue::Key;
 use super::tree::EventNumber;
 use super::{Error, Result, Saved, TreeActor, TreeId};
 use crate::paths::RepoPath;
@@ -457,8 +459,9 @@ impl TreeActor {
         let started = std::time::Instant::now();
         self.record_step(by.clone(), change.clone(), pointers)?;
         let t = self.trees.get_mut(&tree).ok_or(Error::NotFound)?;
-        Self::apply_shape(&mut self.stopped, t, &change, seq);
+        let keys = Self::apply_shape(&mut self.stopped, t, &change, seq);
         t.bytes.insert(seq, Arc::default());
+        self.touch(tree, seq, keys);
         self.handles.insert(
             seq,
             Handle {
@@ -481,11 +484,12 @@ impl TreeActor {
     fn named_step(&mut self, tree: TreeId, by: &WriterAt, change: Change) -> Result<()> {
         let seq = self.next;
         let mut shape = self.tree(tree)?.shape.clone();
-        shape.apply(&change, EventNumber::new(seq))?;
+        let keys = shape.apply(&change, EventNumber::new(seq))?;
         let pointers = self.publish(tree, seq);
         let started = std::time::Instant::now();
         self.record_step(by.clone(), change, pointers)?;
         self.trees.get_mut(&tree).ok_or(Error::NotFound)?.shape = shape;
+        self.touch(tree, seq, keys);
         self.count_save(started);
         self.after_step();
         Ok(())
@@ -498,11 +502,14 @@ impl TreeActor {
         tree: &mut super::tree::SavedTree,
         change: &Change,
         seq: u64,
-    ) {
-        if let Err(e) = tree.shape.apply(change, EventNumber::new(seq)) {
-            eprintln!("tree SaveFailed: a recorded step does not apply: {e}");
-            *stopped = true;
-        }
+    ) -> BTreeSet<Key> {
+        tree.shape
+            .apply(change, EventNumber::new(seq))
+            .unwrap_or_else(|e| {
+                eprintln!("tree SaveFailed: a recorded step does not apply: {e}");
+                *stopped = true;
+                BTreeSet::new()
+            })
     }
 
     fn count_save(&mut self, started: std::time::Instant) {
@@ -560,7 +567,10 @@ impl TreeActor {
             outcome,
         };
         let started = std::time::Instant::now();
+        // Every close lets its open's held keys go, a changed file's or not.
+        let keys = self.tree(tree)?.shape.keys(object);
         self.record_step(by, change, pointers)?;
+        self.touch(tree, seq, keys);
         self.pending_closes.retain(|pending| *pending != handle);
         self.handles.remove(&handle);
         let t = self.trees.get_mut(&tree).ok_or(Error::NotFound)?;

@@ -196,6 +196,11 @@ impl BuiltSnapshot {
     pub(in crate::tree_actor) fn owners(&self) -> &BTreeMap<EventNumber, Oid> {
         &self.owners
     }
+
+    /// `tree`'s queue as built: each entry's ref and commit, in queue order.
+    pub(in crate::tree_actor) fn queue(&self, tree: TreeId) -> Vec<(String, Oid)> {
+        self.pointers.under(&refs::queue(tree))
+    }
 }
 
 /// The one owner of the Git store. Takes, push, the CLI and tests reach
@@ -368,6 +373,12 @@ impl History {
         state.stopped = true;
         state.stopping = true;
         drop(state);
+        self.notify();
+    }
+
+    /// Wakes every [`History::wait_epoch`] caller with a new epoch.
+    pub(in crate::tree_actor) fn wake_waiters(&self) {
+        self.state().epoch += 1;
         self.notify();
     }
 

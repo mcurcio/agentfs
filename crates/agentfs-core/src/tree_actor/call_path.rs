@@ -13,6 +13,7 @@ use agentfs_contracts::volume::VolumeIdentity;
 
 use super::history::built::History;
 use super::journal::durable::{Durability, RecordNo};
+use super::takes::{self, Lands};
 use super::{Error, Took, TreeActor, TreeId};
 
 /// What runs when a deferred call may go on: given the durability or gate
@@ -47,6 +48,13 @@ impl Drop for Recording {
     fn drop(&mut self) {
         // A failure is logged where the fsync failed; the next open recovers.
         let _ = self.durability.make_all_durable();
+    }
+}
+
+impl Lands for &Recording {
+    fn with<R>(&mut self, f: impl FnOnce(&mut TreeActor) -> Result<R, Error>) -> Result<R, Error> {
+        let mut actor = self.actor()?;
+        f(&mut actor)
     }
 }
 
@@ -191,33 +199,67 @@ impl Recording {
         &self.history
     }
 
-    /// At most one take, decided on history built through every record
-    /// appended before it, and landed under the lock. A failed take stays
-    /// queued for the next event.
+    /// At most one take: the root first, then the forks by number. Each is
+    /// decided on history built through every record appended before it,
+    /// with the actor unlocked, and landed under the lock (docs/trees.md,
+    /// "Takes"). A failed take is logged and stays queued for the next event.
     ///
     /// # Errors
     ///
     /// [`Error::Stopped`] when the actor stopped.
     pub fn progress(&self) -> Result<Progress, Error> {
-        let mut actor = self.actor()?;
-        if actor.pointers.under(super::refs::QUEUES).is_empty() {
+        let trees: Vec<TreeId> = {
+            let actor = self.actor()?;
+            actor
+                .trees()
+                .into_iter()
+                .filter(|tree| actor.queued(*tree))
+                .collect()
+        };
+        if trees.is_empty() {
             return Ok(Progress::Empty);
         }
-        Ok(if actor.progress()? {
-            Progress::Landed
-        } else {
-            Progress::Waiting
-        })
+        for tree in trees {
+            match self.take_next(tree) {
+                Ok(Took::Taken) => return Ok(Progress::Landed),
+                Ok(Took::Waiting | Took::Empty) => {}
+                Err(e) if !self.is_stopped() => eprintln!("tree SaveFailed: {e}"),
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(Progress::Waiting)
+    }
+
+    /// Whether the actor has stopped (or its lock is poisoned).
+    fn is_stopped(&self) -> bool {
+        self.actor.lock().map_or(true, |actor| actor.is_stopped())
     }
 
     /// One take in `tree`, as [`Recording::progress`] takes one: the
-    /// conformance replay's `take_next`.
+    /// conformance replay's `take_next`. Takes run one at a time: callers
+    /// take from one thread (the view's worker, or a test).
     ///
     /// # Errors
     ///
     /// [`Error::Stopped`] when the actor stopped; a failed decision or land.
     pub fn take_next(&self, tree: TreeId) -> Result<Took, Error> {
-        self.actor()?.take_next(tree)
+        let mut this = self;
+        takes::take_one(&mut this, &self.history, tree)
+    }
+
+    /// Objects takes changed since the last ask: the pages a view drops.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Stopped`] when the actor stopped.
+    pub fn drain_changed(&self) -> Result<Vec<(TreeId, u64)>, Error> {
+        Ok(self.actor()?.drain_changed())
+    }
+
+    /// Wakes every [`Recording::wait_for_work`] caller, as an event would:
+    /// what a view's shutdown calls before it joins its worker.
+    pub fn wake_workers(&self) {
+        self.history.wake_waiters();
     }
 
     /// Blocks until something a take may wait for has happened since `seen`

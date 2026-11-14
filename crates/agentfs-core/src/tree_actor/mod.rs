@@ -17,6 +17,7 @@ mod queue;
 mod recording;
 mod referee;
 pub mod stages;
+mod takes;
 mod tree;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -38,21 +39,20 @@ use serde::Serialize;
 use crate::file_lock::{FileLock, Mode};
 pub use agentfs_contracts::{NotATree, TreeId};
 pub use call_path::{Progress, Recording, Then};
-use history::builder::{BuildState, Builder, JournalReader, copy_all, take_diff};
+use history::builder::{BuildState, Builder, JournalReader, copy_all};
 pub use history::built::{BuildError, BuiltSnapshot, Health, History, Lag, TreeLag, WaitError};
 use history::built_log::{self, BuiltLog};
 use history::message::Message;
-use history::take::{self as takes, Decided};
 use history::upstreams::Upstreams;
 use history::{check_objects, clean_packs, read_trees, refs, remove_stale_locks, sync_marker};
 pub use journal::durable::{Durability, DurableError, RecordNo};
 use journal::{
-    Change, CompactError, Entry, FoldedOpen, Journal, PointerChange, Record, TakeRecord, Target,
-    compact_at, fold,
+    Change, CompactError, Entry, FoldedOpen, Journal, PointerChange, Record, Target, compact_at,
+    fold,
 };
 use pointers::Pointers;
 use recording::{Handle, pages};
-use stages::{Stages, Timer, Which};
+use stages::Stages;
 use tree::{EventNumber, SavedTree};
 
 const FORMAT: &str = "agentfs-trees-6\n";
@@ -241,6 +241,12 @@ pub struct TreeActor {
     pages: BTreeMap<(TreeId, u64), pages::ObjectPages>,
     /// Objects takes changed since the view last asked (`drain_changed`).
     changed: Vec<(TreeId, u64)>,
+    /// Each tree's last head-moving step since open: a fast-forward or a
+    /// sync is refused if a head it read moved ([`takes`]).
+    heads: BTreeMap<TreeId, RecordNo>,
+    /// Each key's last touching step, kept while its tree's queue holds an
+    /// entry ([`takes`]).
+    touched: takes::Touched,
     _lock: Arc<FileLock>,
 }
 
@@ -580,6 +586,8 @@ impl TreeActor {
             waiting_since: BTreeMap::new(),
             pages: BTreeMap::new(),
             changed: Vec::new(),
+            heads: BTreeMap::new(),
+            touched: BTreeMap::new(),
             _lock: lock,
         };
         // The saved state is history built through the journal's last record.
@@ -793,99 +801,16 @@ impl TreeActor {
         Ok(false)
     }
 
-    /// One queue step in `tree`: its first entry P1 lets go is taken whole, in
-    /// this one call, decided on history built through every record appended
-    /// before it. Failures are not swallowed, unlike [`TreeActor::progress`].
+    /// One queue step in `tree`: its first entry P1 lets go is taken whole,
+    /// decided on history built through every record appended before it
+    /// ([`takes`]). Failures are not swallowed, unlike [`TreeActor::progress`].
     pub fn take_next(&mut self, tree: TreeId) -> Result<Took> {
         if self.is_stopped() {
             return Err(Error::Stopped);
         }
-        self.tree(tree)?;
-        if self.pointers.under(&refs::queue(tree)).is_empty() {
-            return Ok(Took::Empty);
-        }
-        // A take is a step: pending closes save first, and its plan reads
-        // the tree they leave, as built.
-        self.run_pending_closes(tree, None)?;
-        self.settle()?;
-        let snapshot = self.history.snapshot();
-        let entries = snapshot.pointers().under(&refs::queue(tree));
-        let open = match self.trees.get(&tree) {
-            Some(t) => queue::held(
-                t,
-                self.handles
-                    .values()
-                    .filter(|h| h.tree == tree)
-                    .map(|h| h.object),
-            ),
-            None => BTreeSet::new(),
-        };
-        let mine = history::tree_snapshot(snapshot.repo(), snapshot.pointers(), tree)?;
-        let mut plans = Vec::new();
-        let mut cuts = Vec::new();
-        let planning = Timer::start(Which::QueuePlan);
-        for (_, oid) in &entries {
-            if tree.is_root() {
-                plans.push(takes::plan_landing(&snapshot, *oid)?);
-                cuts.push(None);
-            } else {
-                let upstream = self.upstream_of(tree).ok_or(Error::Format)?;
-                let cut = takes::plan_sync(&snapshot, tree, upstream, &mine, &open)?;
-                plans.push(queue::Plan {
-                    source: upstream,
-                    files: cut.keys().clone(),
-                });
-                cuts.push(Some(cut));
-            }
-        }
-        drop(planning);
-        let selected = queue::eligible(&plans, &open);
-        let blocked = selected.unwrap_or(entries.len());
-        for (reference, _) in entries.iter().take(blocked) {
-            if !self.waiting_since.contains_key(reference) {
-                self.waiting_since.insert(reference.clone(), Instant::now());
-                self.metrics.waits = self.metrics.waits.saturating_add(1);
-            }
-        }
-        let Some(index) = selected else {
-            return Ok(Took::Waiting);
-        };
-        let (reference, incoming) = entries[index].clone();
-        if let Some(since) = self.waiting_since.remove(&reference) {
-            let nanos = u64::try_from(since.elapsed().as_nanos()).unwrap_or(u64::MAX);
-            self.metrics.wait_nanos = self.metrics.wait_nanos.saturating_add(nanos);
-            self.metrics.max_wait_nanos = self.metrics.max_wait_nanos.max(nanos);
-        }
-        let started = Instant::now();
-        let landing = tree.is_root();
-        let decided = match cuts.swap_remove(index) {
-            None => takes::decide_landing(&snapshot, tree, &mine, incoming)?,
-            Some(cut) => {
-                let upstream = self.upstream_of(tree).ok_or(Error::Format)?;
-                takes::decide_sync(&snapshot, tree, upstream, cut)?
-            }
-        };
-        self.land(
-            tree,
-            &reference,
-            incoming,
-            &mine,
-            snapshot.at(),
-            decided,
-            landing,
-        )?;
-        let nanos = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
-        self.metrics.takes = self.metrics.takes.saturating_add(1);
-        self.metrics.take_nanos = self.metrics.take_nanos.saturating_add(nanos);
-        self.metrics.max_take_nanos = self.metrics.max_take_nanos.max(nanos);
-        if landing {
-            self.metrics.landings = self.metrics.landings.saturating_add(1);
-            self.metrics.landing_nanos = self.metrics.landing_nanos.saturating_add(nanos);
-        } else {
-            self.metrics.syncs = self.metrics.syncs.saturating_add(1);
-            self.metrics.sync_nanos = self.metrics.sync_nanos.saturating_add(nanos);
-        }
-        Ok(Took::Taken)
+        let history = self.history.clone();
+        let mut actor = self;
+        takes::take_one(&mut actor, &history, tree)
     }
 
     /// Whether a landing of `tree` waits in its upstream's queue, once every
@@ -900,100 +825,7 @@ impl TreeActor {
             return Ok(false);
         };
         self.settle()?;
-        takes::pending_from(&self.history.snapshot(), tree, upstream)
-    }
-
-    /// Records a decided take and applies it: its shape's transition and the
-    /// bytes of the files it changed.
-    #[allow(clippy::too_many_arguments, reason = "the decision and what it read")]
-    fn land(
-        &mut self,
-        tree: TreeId,
-        reference: &str,
-        incoming: Oid,
-        mine: &referee::Snapshot,
-        decided_at: RecordNo,
-        decided: Decided,
-        landing: bool,
-    ) -> Result<()> {
-        let seq = self.next;
-        let event = EventNumber::new(seq);
-        let (files, names) = decided
-            .snapshot
-            .as_ref()
-            .map(|after| take_diff(mine, after))
-            .unwrap_or_default();
-        let mut pointers = Vec::new();
-        let moved = !matches!(decided.head, journal::TakeHead::Stay);
-        match &decided.head {
-            journal::TakeHead::FastForward { to } => {
-                pointers.push(self.change(refs::branch(tree), Some(Target::Oid(to.clone()))));
-            }
-            journal::TakeHead::Landing { .. } | journal::TakeHead::Sync { .. } => {
-                pointers
-                    .push(self.change(refs::branch(tree), Some(Target::Step(RecordNo::new(seq)))));
-            }
-            journal::TakeHead::Stay => {}
-        }
-        if decided.entry_done {
-            pointers.push(self.change(reference.to_owned(), None));
-        }
-        if landing && !decided.collisions.is_empty() {
-            let name = refs::collision(tree, incoming);
-            if self.pointers.get(&name).is_none() {
-                pointers.push(self.change(name, Some(Target::Oid(incoming.to_string()))));
-            }
-        }
-        if moved {
-            pointers.push(self.change(
-                refs::object_table(tree),
-                Some(Target::Step(RecordNo::new(seq))),
-            ));
-        }
-        let mut enqueued = 0;
-        if landing {
-            enqueued = self.enqueue_syncs(tree, event, &mut pointers);
-        }
-        let change = Change::Take {
-            tree: tree.to_string(),
-            take: TakeRecord {
-                entry: reference.to_owned(),
-                whole: decided.entry_done,
-                decided_at,
-                head: decided.head,
-                files,
-                names,
-                collisions: decided.collisions,
-            },
-        };
-        // The shape's transition, tried before the record: a take that would
-        // put two files on one object fails here (finding 39).
-        let mut after = self.tree(tree)?.clone();
-        after.shape.apply(&change, event)?;
-        let by = self.agentfs();
-        self.record_step(by, change.clone(), pointers)?;
-        if let Change::Take { take, .. } = &change {
-            for (_, file) in &take.files {
-                let Some(file) = file else { continue };
-                let bytes = file.lines.bytes();
-                let changed = after
-                    .bytes
-                    .get(&file.object)
-                    .is_some_and(|old| old[..] != bytes[..]);
-                if changed {
-                    self.changed.push((tree, file.object));
-                }
-                after.bytes.insert(file.object, Arc::new(bytes.into()));
-            }
-        }
-        self.trees.insert(tree, after);
-        self.metrics.queued = self
-            .metrics
-            .queued
-            .saturating_sub(u64::from(decided.entry_done))
-            .saturating_add(enqueued);
-        self.after_step();
-        Ok(())
+        history::take::pending_from(&self.history.snapshot(), tree, upstream)
     }
 
     /// A change of pointer `name` to `new`, from its value now.
@@ -1083,6 +915,11 @@ impl TreeActor {
             }
         };
         self.pointers.apply_targets(&pointers);
+        for change in &pointers {
+            if let Some(moved) = refs::tree_of_branch(&change.name) {
+                self.heads.insert(moved, RecordNo::new(seq));
+            }
+        }
         self.history.appended_step(RecordNo::new(seq), tree, bytes);
         Ok(seq)
     }

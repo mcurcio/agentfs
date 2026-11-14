@@ -7,16 +7,15 @@
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::io;
-use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use agentfs_contracts::clients::FileOwner;
 use agentfs_contracts::pod::WriterAt;
 use agentfs_contracts::views::MountOptions;
-use agentfs_core::tree_actor::{Error, Recording, Saved, TreeActor, TreeId};
+use agentfs_core::tree_actor::{Error, Progress, Recording, Saved, TreeActor, TreeId};
 use fuser::*;
 
 const TTL: Duration = Duration::ZERO;
@@ -100,14 +99,12 @@ pub fn serve_with_metrics(
             Ok(path)
         })
         .transpose()?;
-    let signal = Arc::new(ProgressSignal::default());
     let mut sessions = Vec::new();
     let mut notifiers: Vec<(TreeId, Notifier)> = Vec::new();
     for (binding, at) in bindings.into_iter().zip(points) {
         let tree = binding.tree;
         let view = View {
             actor: actor.clone(),
-            signal: Arc::clone(&signal),
             tree: binding.tree,
             by: binding.by,
             owner: binding.owner,
@@ -121,46 +118,28 @@ pub fn serve_with_metrics(
         sessions.push(session);
     }
     let progress_actor = Arc::clone(&actor);
-    let progress_signal = Arc::clone(&signal);
+    let stop = Arc::new(AtomicBool::new(false));
+    let progress_stop = Arc::clone(&stop);
     let progress_worker = std::thread::spawn(move || -> io::Result<()> {
         #[cfg(feature = "failpoints")]
         if let Some(gate) = agentfs_core::failpoints::take_gate() {
             return run_take_gate(gate, &progress_actor, &notifiers);
         }
+        // Takes one at a time, each decided off the actor's lock; woken by
+        // built and failed events (docs/trees.md, "Takes"), never a timer.
+        let mut epoch = 0;
         loop {
-            {
-                let mut state = progress_signal
-                    .state
-                    .lock()
-                    .map_err(|_| io::Error::other("queue signal poisoned"))?;
-                while !state.pending && !state.stopped {
-                    state = progress_signal
-                        .changed
-                        .wait(state)
-                        .map_err(|_| io::Error::other("queue signal poisoned"))?;
-                }
-                if state.stopped {
-                    return Ok(());
-                }
-                state.pending = false;
+            if progress_stop.load(Ordering::Acquire) {
+                return Ok(());
             }
-            loop {
-                let (progressed, changed) = {
-                    let mut volume = progress_actor.actor().map_err(io::Error::other)?;
-                    let progressed = volume.progress().map_err(io::Error::other)?;
-                    (progressed, volume.drain_changed())
-                };
+            while progress_actor.progress().map_err(io::Error::other)? == Progress::Landed {
+                let changed = progress_actor.drain_changed().map_err(io::Error::other)?;
                 // With the actor unlocked: invalidation can wait on a page fill.
                 invalidate_changed(&notifiers, &changed);
-                if !progressed {
-                    break;
-                }
-                // Release the actor between takes so new client opens can run.
-                std::thread::yield_now();
             }
+            epoch = progress_actor.wait_for_work(epoch);
         }
     });
-    let stop = Arc::new(AtomicBool::new(false));
     let metrics_worker = metrics_output.map(|output| {
         let actor = Arc::clone(&actor);
         let stop = Arc::clone(&stop);
@@ -181,15 +160,8 @@ pub fn serve_with_metrics(
         })
     });
     let result = sessions.into_iter().try_for_each(|session| session.join());
-    {
-        let mut state = signal
-            .state
-            .lock()
-            .map_err(|_| io::Error::other("queue signal poisoned"))?;
-        state.stopped = true;
-        signal.changed.notify_one();
-    }
     stop.store(true, Ordering::Release);
+    actor.wake_workers();
     let progress_result = progress_worker
         .join()
         .map_err(|_| io::Error::other("queue worker panicked"))?;
@@ -225,14 +197,11 @@ fn run_take_gate(
             gate.answer(&answer)?;
             continue;
         }
-        let (took, changed) = {
-            let mut volume = actor.actor().map_err(io::Error::other)?;
-            let took = tree
-                .parse::<TreeId>()
-                .map_err(|e| e.to_string())
-                .and_then(|tree| volume.take_next(tree).map_err(|e| e.to_string()));
-            (took, volume.drain_changed())
-        };
+        let took = tree
+            .parse::<TreeId>()
+            .map_err(|e| e.to_string())
+            .and_then(|tree| actor.take_next(tree).map_err(|e| e.to_string()));
+        let changed = actor.drain_changed().map_err(io::Error::other)?;
         invalidate_changed(notifiers, &changed);
         let answer = match took {
             Ok(agentfs_core::tree_actor::Took::Taken) => "taken".to_owned(),
@@ -282,7 +251,6 @@ fn session_config(options: &MountOptions) -> Config {
 #[derive(Clone)]
 struct View {
     actor: Arc<Recording>,
-    signal: Arc<ProgressSignal>,
     tree: TreeId,
     by: WriterAt,
     /// Every file's and directory's owner, until file metadata is recorded.
@@ -290,58 +258,6 @@ struct View {
     handles: Arc<Mutex<Handles>>,
 }
 
-struct ProgressState {
-    pending: bool,
-    stopped: bool,
-}
-
-struct ProgressSignal {
-    state: Mutex<ProgressState>,
-    changed: Condvar,
-}
-
-impl Default for ProgressSignal {
-    fn default() -> Self {
-        Self {
-            state: Mutex::new(ProgressState {
-                pending: true,
-                stopped: false,
-            }),
-            changed: Condvar::new(),
-        }
-    }
-}
-
-struct ActorGuard<'a> {
-    volume: MutexGuard<'a, TreeActor>,
-    signal: &'a ProgressSignal,
-    modified: bool,
-}
-
-impl Deref for ActorGuard<'_> {
-    type Target = TreeActor;
-    fn deref(&self) -> &TreeActor {
-        &self.volume
-    }
-}
-
-impl DerefMut for ActorGuard<'_> {
-    fn deref_mut(&mut self) -> &mut TreeActor {
-        self.modified = true;
-        &mut self.volume
-    }
-}
-
-impl Drop for ActorGuard<'_> {
-    fn drop(&mut self) {
-        if self.modified
-            && let Ok(mut state) = self.signal.state.lock()
-        {
-            state.pending = true;
-            self.signal.changed.notify_one();
-        }
-    }
-}
 struct Handles {
     next: u64,
     entries: BTreeMap<u64, Open>,
@@ -395,13 +311,8 @@ impl View {
         );
     }
 
-    fn actor(&self) -> Result<ActorGuard<'_>> {
-        let v = self.actor.actor().map_err(|_| Errno::EIO)?;
-        Ok(ActorGuard {
-            volume: v,
-            signal: &self.signal,
-            modified: false,
-        })
+    fn actor(&self) -> Result<MutexGuard<'_, TreeActor>> {
+        self.actor.actor().map_err(|_| Errno::EIO)
     }
     fn handles(&self) -> Result<MutexGuard<'_, Handles>> {
         self.handles.lock().map_err(|_| Errno::EIO)
@@ -684,11 +595,10 @@ impl Filesystem for View {
         let result = (|| {
             let mut v = self.actor()?;
             // A descriptor read on direct I/O always names a lock owner; a page
-            // fill never does. Through `v.volume`: a fill changes nothing a take
-            // waits for, so it does not wake the queue worker.
+            // fill never does.
             if owner.is_none() {
                 let object = ino.0.checked_sub(2).ok_or(Errno::EBADF)?;
-                match v.volume.page_fill(self.tree, object, offset, size) {
+                match v.page_fill(self.tree, object, offset, size) {
                     Err(Error::NotFound) => {}
                     filled => return filled.map_err(errno),
                 }
@@ -1110,7 +1020,6 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let view = View {
             actor: new_actor(tmp.path()),
-            signal: Arc::new(ProgressSignal::default()),
             tree: TreeId::Root,
             by: writer("client"),
             owner: OWNER,
@@ -1145,7 +1054,6 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let view = View {
             actor: new_actor(tmp.path()),
-            signal: Arc::new(ProgressSignal::default()),
             tree: TreeId::Root,
             by: writer("client"),
             owner: OWNER,

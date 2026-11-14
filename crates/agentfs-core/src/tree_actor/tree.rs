@@ -302,6 +302,13 @@ impl Shape {
         self.paths_of(object).next().is_some()
     }
 
+    /// The keys a change to `object` touches, as a set.
+    pub(super) fn keys(&self, object: u64) -> BTreeSet<queue::Key> {
+        let mut keys = BTreeSet::new();
+        self.keys_of(object, &mut keys);
+        keys
+    }
+
     /// The keys a change to `object` touches: its identity and every path naming it.
     fn keys_of(&self, object: u64, keys: &mut BTreeSet<queue::Key>) {
         if let Some(id) = self.identities.get(&object) {

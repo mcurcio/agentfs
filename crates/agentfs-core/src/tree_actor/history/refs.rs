@@ -39,6 +39,11 @@ pub(in crate::tree_actor) fn branches(pointers: &Pointers) -> Result<BTreeMap<Tr
         .collect()
 }
 
+/// The tree whose branch `name` is, if it names one.
+pub(in crate::tree_actor) fn tree_of_branch(name: &str) -> Option<TreeId> {
+    name.strip_prefix(BRANCHES)?.parse().ok()
+}
+
 /// A tree's queue: the prefix of its entries, `refs/queue/<tree>/`.
 pub(in crate::tree_actor) fn queue(tree: TreeId) -> String {
     format!("{QUEUES}{tree}/")

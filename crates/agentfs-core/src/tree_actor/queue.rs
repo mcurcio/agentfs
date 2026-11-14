@@ -69,6 +69,7 @@ pub(in crate::tree_actor) struct Cut<T> {
     taken: Option<T>,
     remaining: bool,
     keys: BTreeSet<Key>,
+    held: BTreeSet<Key>,
 }
 
 impl<T> Cut<T> {
@@ -87,6 +88,12 @@ impl<T> Cut<T> {
     pub(in crate::tree_actor) fn keys(&self) -> &BTreeSet<Key> {
         &self.keys
     }
+
+    /// The held keys that cut it: those of the first change it did not take that open files
+    /// hold. A take decided on this cut read them (`takes::Decision::reads`).
+    pub(in crate::tree_actor) fn held(&self) -> &BTreeSet<Key> {
+        &self.held
+    }
 }
 
 /// Walks `changes` oldest first. `step` turns each into its result and the keys it writes,
@@ -104,10 +111,12 @@ pub(in crate::tree_actor) fn cut<C, T, E>(
     let mut taken = None;
     let mut keys = BTreeSet::new();
     let mut remaining = false;
+    let mut held = BTreeSet::new();
     for change in changes {
         let (result, writes) = step(taken.as_ref(), change)?;
         if !writes.is_disjoint(open) {
             remaining = true;
+            held = writes.intersection(open).cloned().collect();
             if taken.is_none() {
                 keys = writes;
             }
@@ -120,6 +129,7 @@ pub(in crate::tree_actor) fn cut<C, T, E>(
         taken,
         remaining,
         keys,
+        held,
     })
 }
 
