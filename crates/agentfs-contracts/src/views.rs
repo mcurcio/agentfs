@@ -1,5 +1,6 @@
-//! The Views domain's contract (docs/target-architecture/domains/views.md), M1's
-//! surface (slice S4): open a view for a binding, close it.
+//! The Views domain's contract (docs/library/filesystem.md, "Tree views"):
+//! open a view for a binding, close it. Snapshot views and profiles are not
+//! built (docs/target-architecture/domains/views.md).
 
 use std::path::PathBuf;
 
@@ -35,7 +36,7 @@ pub enum ViewError {
     UnknownSession,
 }
 
-/// The Views domain (views.md §5, M1's surface).
+/// The Views domain (docs/library/filesystem.md, "Tree views").
 pub trait Views {
     /// # Errors
     ///

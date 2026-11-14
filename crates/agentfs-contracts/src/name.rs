@@ -140,7 +140,7 @@ impl WriterLabel {
     }
 }
 
-/// A client's label, the launcher's word for it (clients.md): [`is_safe_name`],
+/// A client's label, the launcher's word for it (docs/trees.md, "Clients"): [`is_safe_name`],
 /// at most 64 bytes. Today's `--writer` label, from slice S4.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
@@ -192,7 +192,7 @@ impl LauncherId {
     }
 }
 
-/// A fork's idempotency key (trees.md §2): 1 to 128 bytes of printable ASCII
+/// A fork's idempotency key (docs/trees.md, "Forks: keys, end and the drop"): 1 to 128 bytes of printable ASCII
 /// with no whitespace, so a CSI volume handle fits.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]

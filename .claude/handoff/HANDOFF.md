@@ -1,9 +1,9 @@
-# Handoff: PR #39, tree views speed then M1 (2026-11-14)
+# Handoff: PR #39, tree views speed and M1 built (2026-11-14)
 
 Start here. This folder is working state for the next session, not product docs. **Delete `.claude/handoff/` in the commit that finishes this work, before #39 goes to the owner for review.**
 
 ## The problem, plainly
-agentfs is moving to one engine, the tree views (`crates/agentfs-core/src/tree_actor/`). The owner wants all of it on ONE PR, #39, branch `trees/module-cut-step-6`, and said "Keep going" until the baseline: Hermes sidecar CI on tree views, after milestones M1…M7. M1 (volumes, clients, forks, lifecycle) is paused after S1 because the tree views were far too slow; the owner ruled "Speed before S3" and set the bar "Match recording engine". Speed work is half done.
+agentfs is moving to one engine, the tree views (`crates/agentfs-core/src/tree_actor/`). The owner wants all of it on ONE PR, #39, branch `trees/module-cut-step-6`, and said "Keep going" until the baseline: Hermes sidecar CI on tree views, after milestones M1…M7. The owner ruled "Speed before S3" with the bar "Match recording engine"; the speed epic and M1 (volumes, clients, forks, lifecycle) are built. Next is M1's end review.
 
 ## Precedence
 1. `OWNER-GUIDANCE.md` (dated, verbatim; all answers through 2026-11-13 are recorded there).
@@ -13,23 +13,22 @@ agentfs is moving to one engine, the tree views (`crates/agentfs-core/src/tree_a
 The code and the library/human docs win over all of these where they disagree; report the disagreement.
 
 ## State
-- Speed epic built (B0..B4, B3) and reviewed (`review/`); Fix 1 (3e9e1bc..fede47f) and Fix 2 (d7666ef and the
-  commits after it) applied the review. All bars met at f7149c4; close_4k and create follow the runner's CPU
-  (docs/performance.md): 0.66 to 1.90 ms p50 and 16 to 66 s for 50,000 creates on one commit. history_1g 31 to
-  42 s, memory_1g +36 MiB.
-- Fix 3 (a19b657..6c39416): the patch e2e's "never mounted" (the inbox fetch answered in 30.4 s, the mount waits
-  agentfs.patchFetchTimeout = 30 s, the script waited 30 s; now waits 60 s and dumps state; the server's stall itself
-  not reproduced); view memory about 20 KiB a file to about 3.4-3.8 KiB (libgit2 handle let go per batch, small maps
-  as vectors; `memory_create` figure, bar 2 KiB, so it warns); frame relocation owned by the journal (coherence 3,
-  space test by allocated blocks); power-loss crosses rollover, compaction and carry (P3-4, CI-only after landing).
-- Residuals, each to be a bead (text in `.claude/errata.md`, "speed fix 3"): coherence 5, 6, 7, builder `owners`
-  growth, checkpoint size at millions of files, B4 8, memory per file to 2 KiB, pack count. `planted/budget.json`
-  is stale; only the owner may re-record it.
+- Speed epic built (B0..B4, B3), reviewed (`review/`) and fixed (Fix 1 3e9e1bc..fede47f, Fix 2 d7666ef.., Fix 3
+  a19b657..6c39416). Figures in docs/performance.md. Residuals, each to be a bead (text in `.claude/errata.md`,
+  "speed fix 3"): coherence 5, 6, 7, builder `owners` growth, checkpoint size at millions of files, B4 8, memory per
+  file to 2 KiB, pack count. `planted/budget.json` is stale; only the owner may re-record it.
+- M1 built: S3 9ea0aae (volume events as commits), S4 3674582 (clients, sessions, view host; 82982a0 conformance
+  fix), S5 fff3ddb (fork keys, end, drop), S6 af72555 (stage, Stop drain, release). Docs step done: docs/trees.md and
+  the library describe M1; the domains' invariants (C1..C7, VO1..VO6) are in docs/library/core.md, "Domain
+  invariants", and code comments cite them there; clients.md trimmed to its unbuilt parts; one-engine.md marks M1
+  built; recording-failures runbook section 7. Per-slice deviations are in `.claude/errata.md`.
 
 ## Next, in order
-1. One full phase-1 dispatch on the final SHA (`gh workflow run phase-1.yml`), read its result.
-2. Re-cut M1 S3's page on top of B2b, then S3 -> S4 -> S5 -> S6, docs step, end review and fix (`m1-pages.md`).
+1. End review of M1 (one review, then one fix round; CI is the gate).
+2. One full phase-1 dispatch on the final SHA (`gh workflow run phase-1.yml`), read its result.
 3. Then the plan in `docs/target-architecture/future/one-engine.md`: M2 -> M3 -> M4 -> M5 -> M7 (with M6) -> baseline.
+4. `docs/target-architecture/future/save-and-take-speed.md` still reads "Proposed, not built" with pre-speed figures;
+   decide whether the speed epic built it (then delete it and repoint its links) or trim it to what remains.
 
 ## How to work (the owner's complaints, 2026-11-13/14: far too slow; "a test suite should run in seconds to minutes, not hours")
 - Never dispatch the full phase-1 sweep or run the full model gate per slice. The default regression tier is enough: `cargo test -p agentfs-model`, `ci/model-digest.sh check`. One full sweep at the end of an epic.
@@ -40,6 +39,6 @@ The code and the library/human docs win over all of these where they disagree; r
 - Commit trailers per AGENTS.md "Git"; no model IDs in commits or docs.
 
 ## Not done or not run
-- M1 S3–S6; the full phase-1 sweep on the final SHA; the residuals above.
+- The M1 end review; the full phase-1 sweep on the final SHA; the residuals above.
 - The PR #39 description is stale (it describes step 6); rewrite it when the speed epic lands.
 - A rule change for the owner's skills repo (scoping the repository rule to projects that use a database) sits unpushed in the previous machine's local clone and is lost with it; it needs the owner's go to redo.

@@ -24,7 +24,7 @@ impl Minter {
     }
 }
 
-/// What a launcher may do (clients.md, C2; volume.md, VO6).
+/// What a launcher may do (docs/library/core.md, C2 and VO6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum LaunchScope {
     /// The volume's own launcher: ensure, stage, unstage, attach anywhere.
@@ -56,7 +56,7 @@ impl LaunchCap {
 }
 
 /// A read-write client's authority to write its own tree, as its own writer
-/// (clients.md, C1 and C5). Minted only by Clients' `attach`, with the
+/// (docs/library/core.md, C1 and C5). Minted only by Clients' `attach`, with the
 /// [`Minter`] the composition root lends it, and handed straight to the
 /// session it binds; a read-only client has none.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

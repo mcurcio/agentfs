@@ -1,6 +1,6 @@
 # The system around the git model
 
-**Proposed, not built.** This page proposes how the parts around [the git model](git-model.md) fit together: clients,
+**Proposed, partly built.** This page proposes how the parts around [the git model](git-model.md) fit together: clients,
 views, tree storage and lifecycle, replication, the volume, health, telemetry, versions and deployment. It sketches
 their contracts and events in Rust surfaces. The commit that lands a slice of it deletes the part it builds and moves
 the behaviour into the library or operator docs. Built (M1): the contracts crate, the Volume, Clients and Trees

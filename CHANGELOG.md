@@ -20,6 +20,8 @@ design was reviewed on 2026-10-12.
   (`VolumeReleased Keep`) and the process exits 0. A failed builder holds the
   release (the volume stays draining, recording goes on); a stopped actor exits 1.
   Each move is one journal step with its event commit, durable before it returns.
+  The recording-failures runbook's section 7 covers a tree mount that will not
+  start or stop; the domains' invariants are in docs/library/core.md.
 - **Tree views: fork keys, end and drop.** `trees mount --fork-mount DIR` mounts
   a new fork, which ends when its view is unmounted, or with `--fork-key KEY` the
   open fork under that key: a second create under a key returns its fork and

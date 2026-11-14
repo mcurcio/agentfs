@@ -28,11 +28,11 @@ Pages for a whole domain or the system:
 |---|---|
 | System composition and contracts: events, capabilities, versions, deployment compositions | [The system](system.md) |
 | Rules and view profiles: recorded or not, database groups, what each profile shows | [Rules](domains/rules.md) |
-| Clients, grants, sessions and attachment | [Clients](domains/clients.md) |
-| Views: one view per client, consistency settings, several view hosts | [Views](domains/views.md) |
-| Trees storage and lifecycle: fork end and drop, pinned snapshots, confinement | [Trees](domains/trees.md) |
+| Clients: grants with view profiles, snapshot clients, operator actors | [Clients](domains/clients.md) |
+| Views: snapshot views, consistency settings, several view hosts | [Views](domains/views.md) |
+| Trees storage: confinement, space, pinned snapshots | [Trees](domains/trees.md) |
 | Replication on the tree model: remotes, credentials, pushes, divergence | [Replication](domains/replication.md) |
-| Volume lifecycle, versions and the upgrade drain | [Volume](domains/volume.md) |
+| Volume: the start point, the upgrade drain, settlement by the remotes, what happens on release | [Volume](domains/volume.md) |
 | Health: liveness of the history service and view hosts | [Health](domains/health.md) |
 | The target telemetry domain: metrics, traces and alarms that never block | [Telemetry](domains/telemetry.md) |
 | Snapshot opens (parked) | [Snapshot opens](snapshot-opens.md) |
@@ -41,7 +41,7 @@ Smaller slices, one page each:
 
 | Slice | Page |
 |---|---|
-| Moving every launcher onto the tree views and deleting the recording engine: milestones M1 to M9, the baseline, the deferred extras | [One engine](future/one-engine.md) |
+| Moving every launcher onto the tree views and deleting the recording engine: milestones M2 to M9 (M1 is built), the baseline, the deferred extras | [One engine](future/one-engine.md) |
 | Cutting the tree actor into six modules | [Module cut](future/module-cut.md) |
 | The name the root is published under, apart from its identity | [Root branch name](future/root-branch-name.md) |
 | Transactions | [Transactions](future/transactions.md) |

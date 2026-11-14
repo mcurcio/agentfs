@@ -29,6 +29,7 @@ kubectl exec "$POD" -c agentfs -- agentfs status
 | `journal corruption at byte <offset>`, or `<ref> names lost object <oid>`, opening a tree state area | `agentfs trees` | [5](#5-a-tree-state-area-that-refuses-to-open) |
 | `tree JournalTail: <n> bytes at <offset>` | a tree actor's stderr at open | [5](#5-a-tree-state-area-that-refuses-to-open) |
 | `tree HistoryBuildFailed: <error>`, or a tree view's metrics with `history.health` `failed` or an `oldest_unbuilt_ns` that keeps growing | a tree actor's stderr; `--metrics-output` | [6](#6-a-tree-volumes-history-is-not-built) |
+| `trees mount` exits 75 or 1 at start, or does not exit after SIGTERM | `agentfs trees` | [7](#7-a-tree-mount-that-will-not-start-or-stop) |
 
 The `<error>` says what failed: `No space left on device` (`ENOSPC`),
 `Disk quota exceeded`, `Read-only file system` (`EROFS`), `Permission
@@ -247,6 +248,51 @@ never as a volume that will not mount.
 What `fast-import` left behind is cleared at the next open: `objects/pack/tmp_*`,
 `.keep` files, an index without its pack, and `refs/build/*`. An unreferenced pack
 from a batch whose built-log entry was never written stays; nothing names it.
+
+## 7. A tree mount that will not start or stop
+
+`trees mount` stages the volume, attaches a client for each view and drains the
+volume when it stops ([lifecycle](../trees.md#volume-lifecycle)). Each move is a
+commit on `refs/agentfs/volume` or `refs/agentfs/clients/<tree>`, so the record
+says where it is:
+
+```sh
+git --git-dir="$STATE/history.git" log --format='%s' refs/agentfs/volume
+git --git-dir="$STATE/history.git" show refs/agentfs/clients/root:row.json
+```
+
+These chains are built behind the journal, so they lag while the builder lags or
+fails ([6](#6-a-tree-volumes-history-is-not-built)).
+
+**It will not start.**
+
+| Exit and message | Meaning and fix |
+|---|---|
+| 75, `the volume is busy: another process holds its state area` | Another `trees mount`, `init` or `end` holds the state area's lock. Stop it, or wait for its drain to finish |
+| 1, `no volume here: create it first` | `trees mount` never creates a volume: run `trees init --volume NAME` first |
+| 1, `the volume here is "<a>", not "<b>"` or `another volume is here` | The state area belongs to another volume; nothing was written. Point the launcher at the right state area, or fix the name |
+| 1, `this fork has had its writer` | The fork's one read-write client has been used (C4 in the [library](../library/core.md#domain-invariants)). Mount it with `--fork-read-only`, or use a new key. A writer killed rather than unmounted comes back with the same launcher, tree, label and access |
+| 1, `the fork under this --fork-key has ended` | `trees end` ended it. Use a new key |
+
+**It will not stop.** After SIGTERM or SIGINT the process exits 0 only once the
+volume is released. It waits while:
+
+- **a client is attached.** A view whose file a process still holds open ends
+  when that file closes. Close it, or stop the process that holds it.
+- **a queue holds an entry.** An entry is taken only once history is built
+  behind it, so a failing builder holds the release: the volume stays
+  `Draining`, recording goes on, and the builder's alarm says why
+  ([6](#6-a-tree-volumes-history-is-not-built)). Fix the cause, or let the
+  grace period end the process: nothing recorded is lost, and the next mount
+  builds it.
+
+An exit of 1 after a recording failure means the tree actor stopped
+([5](#5-a-tree-state-area-that-refuses-to-open)): restart once the disk is fixed.
+
+Log lines that change nothing: `tree UnstageFailed` (the volume stays staged;
+the next stop asks again), `tree DetachFailed: client=<id>` (the next mount's
+reconcile ends that client), `tree SettleFailed` (a drop waits for the next
+judgement) and `tree EventFailed`.
 
 ## Verify
 

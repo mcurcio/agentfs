@@ -1,6 +1,7 @@
-//! The Volume domain's contract (docs/target-architecture/domains/volume.md):
-//! identity, spec, lifecycle and the release verdict. M1 builds `ensure` (slice
-//! S1) and `stage`, `unstage` and the Stop drain (slice S6).
+//! The Volume domain's contract (docs/trees.md, "Volume identity and trailers",
+//! "Volume lifecycle"): identity, spec, `ensure`, `stage`, `unstage`, the Stop
+//! drain and the release verdict. The start line, the upgrade drain and
+//! settlement by remotes are not built (docs/target-architecture/domains/volume.md).
 
 use serde::{Deserialize, Serialize};
 
@@ -63,7 +64,7 @@ pub struct Ensured {
     pub outcome: EnsureOutcome,
 }
 
-/// A volume's lifecycle (volume.md §2). A volume `ensure` just created is
+/// A volume's lifecycle (docs/trees.md, "Volume lifecycle"). A volume `ensure` just created is
 /// `Released`: nothing is staged and nothing could be lost.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum VolumeState {
@@ -107,7 +108,7 @@ pub enum Blocker {
     QueuesNotEmpty(Vec<TreeId>),
 }
 
-/// The pure release judgement of facts asked at that moment (VO1, VO4).
+/// The pure release judgement of facts asked at that moment (docs/library/core.md, VO1 and VO4).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReleaseVerdict {
     /// At least one blocker.
@@ -134,7 +135,7 @@ pub enum IoKind {
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum VolumeError {
-    /// A fork launcher (VO6).
+    /// A fork launcher (docs/library/core.md, VO6).
     #[error("only the volume's own launcher may do this")]
     NotPermitted,
     /// `stage` at a location `ensure` never created: mount never creates.
@@ -161,7 +162,7 @@ pub enum VolumeEvent {
     VolumeReleased(Disposition),
 }
 
-/// The Volume domain (volume.md §3, M1's surface).
+/// The Volume domain (docs/trees.md, "Volume lifecycle").
 pub trait Volume {
     /// Idempotent, at every start. Reads `format` and the volume identity file
     /// before any write: another format answers `OtherFormat`, another name

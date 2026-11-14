@@ -1,5 +1,6 @@
-//! The Trees domain's contract (docs/target-architecture/domains/trees.md), M1's
-//! surface: a fork's lifecycle (create in slice S3; keys, end and drop in S5).
+//! The Trees domain's contract (docs/trees.md, "Forks: keys, end and the
+//! drop"): a fork's lifecycle. Storage, space and pinned snapshots are not
+//! built (docs/target-architecture/domains/trees.md).
 
 use serde::{Deserialize, Serialize};
 
@@ -23,7 +24,7 @@ pub struct ForkSettings {
     pub landing: Landing,
 }
 
-/// Where a fork is in its life (trees.md §2).
+/// Where a fork is in its life (docs/trees.md, "Forks: keys, end and the drop").
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ForkPhase {
     Open,
@@ -87,12 +88,12 @@ pub enum TreesEvent {
     ForkDropped(ForkId),
 }
 
-/// Clients' one question to Trees (clients.md §3, "Calls out").
+/// Clients' one question to Trees (docs/library/core.md, C2).
 pub trait ForkLookup {
     fn facts(&self, fork: ForkId) -> Option<ForkFacts>;
 }
 
-/// The Trees domain (trees.md §5, M1's surface).
+/// The Trees domain (docs/trees.md, "Forks: keys, end and the drop").
 pub trait Trees: ForkLookup {
     /// One step: the fork's branch at its upstream's saved head and its row
     /// (`ForkCreated`). A second create under a key Trees holds for an open fork

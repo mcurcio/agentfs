@@ -1,4 +1,4 @@
-//! The Volume domain (docs/target-architecture/domains/volume.md): a volume's
+//! The Volume domain (docs/trees.md, "Volume lifecycle"): a volume's
 //! identity check at every start (`ensure`), its lifecycle and the release
 //! verdict. Pure: the state area, rows and facts are reached through the ports
 //! in `agentfs_contracts::ports`, and `decide_ensure` and `decide` take facts

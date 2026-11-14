@@ -481,7 +481,7 @@ mod tests {
         );
     }
 
-    /// volume.md §5: `stage` during a Stop drain cancels it, `Staged` again
+    /// docs/trees.md, "Volume lifecycle": `stage` during a Stop drain cancels it, `Staged` again
     /// with `VolumeStaged`, and nothing releases while staged.
     #[test]
     fn stage_during_a_stop_drain_cancels_it() {

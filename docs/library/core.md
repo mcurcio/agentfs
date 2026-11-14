@@ -754,6 +754,27 @@ event to its `EventSink` once the store returns; the composition root's queue
 hands each on in order. Each event is on record as a commit on its chain
 ([trees](../trees.md#rows-and-event-commits)).
 
+### Domain invariants
+
+The Volume, Clients and Trees domains hold these, and the code cites them by
+their labels. What the domains do not do yet is on their design pages
+([target architecture](../target-architecture/README.md)).
+
+| # | Invariant | Enforced by |
+|---|---|---|
+| C1 | Only Clients mints a `ClientCap`, so only Clients makes a client writer | private fields; `ClientCap::mint` takes the composition root's `Minter`; clippy bans `Minter::new` outside it |
+| C2 | A `ForksItCreates` launcher reaches only the forks it created, never the root | `ClientsService` checks the launcher against Trees' `facts(fork)` before any row |
+| C3 | A read-only client has no `ClientCap`: its session writes nothing | the session's authority is `Read` for a read-only grant |
+| C4 | A fork has at most one read-write client, for life | the writer claim in the fork's clients row, kept after its client ends and released only at `ForkDropped` |
+| C5 | A session binds one client, and the client acts only through it: its calls name no tree and no writer | `agentfs_core::session` owns the `ClientCap` |
+| C6 | `LastDetached{tree}` is published exactly once each time a tree's last client ends | the end and its events are one row step |
+| C7 | Every end has an event (detach, reconcile, a fork's end); no lease or heartbeat ends an attachment | no clock in the domains |
+| VO1 | `Released` only when the volume is not staged, no client is attached and every queue is empty | only the pure `release::decide` builds a `Cleared` |
+| VO3 | A move and its event are one unit | one row step, its event commit built from it |
+| VO4 | The release verdict reads only facts asked at judgement time; nothing polls | the verdict is pure over `ReleaseFacts`; no clock in the domain |
+| VO5 | A volume's id never changes, and an `ensure` with another name at the same location writes nothing | `decide_ensure` answers `SpecMismatch` before any write |
+| VO6 | A fork launcher cannot `ensure`, stage or unstage the volume | `LaunchCap` with `may: Root`, else `NotPermitted` |
+
 ## Errors
 
 Errors are `thiserror` enums, one per area; none is a catch-all.

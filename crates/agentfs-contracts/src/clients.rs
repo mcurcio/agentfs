@@ -1,5 +1,6 @@
-//! The Clients domain's contract (docs/target-architecture/domains/clients.md),
-//! M1's surface (slice S4): attach, rebind, detach, reconcile, attached.
+//! The Clients domain's contract (docs/trees.md, "Clients"): attach, rebind,
+//! detach, reconcile, attached. Grants with view profiles, snapshots and
+//! operator ends are not built (docs/target-architecture/domains/clients.md).
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -112,7 +113,7 @@ pub enum Access {
     ReadOnly,
 }
 
-/// How a live client sees its tree (views.md §3). M1 builds the default only.
+/// How a live client sees its tree (docs/target-architecture/domains/views.md). Only the default is built.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Consistency {
@@ -186,7 +187,7 @@ pub enum AttachmentEndReason {
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ClientError {
-    /// The grant exceeds the launcher (C2).
+    /// The grant exceeds the launcher (docs/library/core.md, C2).
     #[error("the grant exceeds the launcher's")]
     NotPermitted,
     #[error("no such client")]
@@ -195,7 +196,7 @@ pub enum ClientError {
     NotItsLauncher,
     #[error("no such tree, or the fork has ended")]
     TreeUnknown,
-    /// One writer per fork, for life (C4).
+    /// One writer per fork, for life (docs/library/core.md, C4).
     #[error("the fork has had its writer")]
     ForkTaken,
     /// After `VolumeDraining`; attach only.
@@ -228,18 +229,18 @@ pub enum ClientEvent {
         client: ClientId,
         why: AttachmentEndReason,
     },
-    /// `attached(tree)` became empty: exactly once each time (C6).
+    /// `attached(tree)` became empty: exactly once each time (docs/library/core.md, C6).
     LastDetached {
         tree: TreeId,
     },
 }
 
-/// Volume's one question to Clients (volume.md §3, "Asked").
+/// Volume's one question to Clients (docs/library/core.md, VO1).
 pub trait AttachedLookup {
     fn attached_any(&self) -> ClientSet;
 }
 
-/// The Clients domain (clients.md §3, M1's surface).
+/// The Clients domain (docs/trees.md, "Clients").
 pub trait Clients: AttachedLookup {
     /// One step: the client's row, a fork's writer claim for a read-write grant
     /// on a fork, and `Attached`; then its `ClientCap`, for a read-write grant,

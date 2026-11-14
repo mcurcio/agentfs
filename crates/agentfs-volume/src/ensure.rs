@@ -1,4 +1,4 @@
-//! What `ensure` does with what the state area holds (volume.md, "Ensure"):
+//! What `ensure` does with what the state area holds (docs/trees.md, "Volume identity and trailers"):
 //! one pure decision, so every launcher's start is judged alike.
 
 use agentfs_contracts::ports::Found;
