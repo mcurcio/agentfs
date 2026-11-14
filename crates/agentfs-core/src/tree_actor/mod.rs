@@ -1232,4 +1232,85 @@ mod tests {
         assert_eq!(compact_at(1 << 20), 64 << 20);
         assert_eq!(compact_at(100 << 20), 200 << 20);
     }
+
+    /// Files the restart test's volume holds at its checkpoint, and after it.
+    const RESTART_FILES: (usize, usize) = (500, 100);
+    const RESTART_WORKER: &str = "AGENTFS_TREE_RESTART_WORKER";
+
+    /// The restart test's served volume: files, a compaction, more files
+    /// made durable but not built, then a kill.
+    #[test]
+    fn restart_worker() {
+        let Some(root) = std::env::var_os(RESTART_WORKER) else {
+            return;
+        };
+        let mut v = new_actor(Path::new(&root));
+        let put = |v: &mut TreeActor, n: usize| {
+            let h = v
+                .write_open(TreeId::Root, &format!("f{n}"), &writer("w"), true)
+                .unwrap();
+            v.write(h, 0, format!("{n}\n").as_bytes(), false).unwrap();
+            v.close(h).unwrap();
+        };
+        for n in 0..RESTART_FILES.0 {
+            put(&mut v, n);
+        }
+        v.settle().unwrap();
+        v.compact().unwrap();
+        for n in RESTART_FILES.0..RESTART_FILES.0 + RESTART_FILES.1 {
+            put(&mut v, n);
+        }
+        v.durability().make_all_durable().unwrap();
+        println!("LAST {}", v.durability().appended().get());
+        std::io::Write::flush(&mut std::io::stdout()).unwrap();
+        // SAFETY: signals this process; nothing after it runs.
+        unsafe { libc::kill(libc::getpid(), libc::SIGKILL) };
+        unreachable!("killed");
+    }
+
+    #[test]
+    fn restart_replays_from_the_checkpoint() {
+        use std::os::unix::process::ExitStatusExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tree_actor::tests::restart_worker",
+                "--nocapture",
+            ])
+            .env(RESTART_WORKER, tmp.path())
+            .output()
+            .unwrap();
+        assert_eq!(output.status.signal(), Some(libc::SIGKILL), "{output:?}");
+        let last: u64 = String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .find_map(|line| line.strip_prefix("LAST "))
+            .unwrap()
+            .parse()
+            .unwrap();
+        // The killed process's git children share its lease until they die.
+        let lease = FileLock::open(&tmp.path().join(LOCK)).unwrap();
+        drop(FileLock::wait(lease, Mode::Exclusive).unwrap());
+        let frames = frames_of(tmp.path());
+        assert!(
+            matches!(frames[0].0.entry, Entry::Checkpoint { .. }),
+            "the journal starts at the checkpoint"
+        );
+        let started = Instant::now();
+        let v = super::test_support::reopen(tmp.path());
+        let reopened = started.elapsed();
+        println!(
+            "restart_replays_from_the_checkpoint: reopen of {} files ({} after the checkpoint) in {reopened:?}",
+            RESTART_FILES.0 + RESTART_FILES.1,
+            RESTART_FILES.1
+        );
+        assert_eq!(v.durability().appended().get(), last);
+        assert_eq!(
+            v.files(TreeId::Root).unwrap().len(),
+            RESTART_FILES.0 + RESTART_FILES.1
+        );
+        assert_eq!(v.settle().unwrap().get(), last);
+        assert_eq!(v.read(TreeId::Root, "f599").unwrap(), b"599\n");
+    }
 }

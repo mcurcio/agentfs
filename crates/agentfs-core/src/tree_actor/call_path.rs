@@ -343,4 +343,89 @@ mod tests {
         );
         assert_eq!(answer.recv().unwrap(), Some(libc::ENOENT));
     }
+
+    #[test]
+    fn a_save_is_visible_before_it_is_built() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rec = Recording::serve(new_actor(tmp.path()));
+        rec.settle().unwrap();
+        let before = rec.history().snapshot();
+        // Hold the builder in the fsync it makes before each batch.
+        let (entered, inside) = sync_channel::<()>(0);
+        let (release, released) = mpsc::channel::<()>();
+        let released = Mutex::new(released);
+        rec.durability.hold_fsync_with(move || {
+            let _ = entered.send(());
+            let _ = released.lock().map(|r| r.recv());
+        });
+        let h = rec
+            .actor()
+            .unwrap()
+            .write_open(TreeId::Root, "a", &writer("w"), true)
+            .unwrap();
+        rec.actor().unwrap().write(h, 0, b"saved", false).unwrap();
+        let saved = rec.actor().unwrap().close(h).unwrap();
+        let super::super::Saved::Commit(step) = saved else {
+            panic!("the close saves: {saved:?}");
+        };
+        inside.recv().unwrap();
+        // The builder is held before its batch: the save is visible, not built.
+        assert_eq!(
+            rec.actor().unwrap().read(TreeId::Root, "a").unwrap(),
+            b"saved"
+        );
+        let snapshot = rec.history().snapshot();
+        assert!(snapshot.at() < step);
+        assert_eq!(snapshot.head(TreeId::Root), before.head(TreeId::Root));
+        // Later fsyncs find both ends gone and pass.
+        release.send(()).unwrap();
+        drop((release, inside));
+        rec.settle().unwrap();
+        assert!(rec.history().snapshot().at() >= step);
+        assert_ne!(
+            rec.history().snapshot().head(TreeId::Root),
+            before.head(TreeId::Root)
+        );
+    }
+
+    #[test]
+    fn the_builder_never_reads_past_the_mark() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rec = Recording::serve(new_actor(tmp.path()));
+        for name in ["a", "b", "c"] {
+            let h = rec
+                .actor()
+                .unwrap()
+                .write_open(TreeId::Root, name, &writer("w"), true)
+                .unwrap();
+            rec.actor().unwrap().write(h, 0, b"x", false).unwrap();
+            rec.actor().unwrap().close(h).unwrap();
+        }
+        // No caller asked for durability: whatever is built, the builder made
+        // durable first.
+        let built = rec.settle().unwrap();
+        assert_eq!(built, rec.durability.appended());
+        assert!(rec.durability.mark() >= rec.history().built_through());
+    }
+
+    #[test]
+    fn drop_builds_everything() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rec = Recording::serve(new_actor(tmp.path()));
+        for n in 0..20 {
+            let h = rec
+                .actor()
+                .unwrap()
+                .write_open(TreeId::Root, &format!("f{n}"), &writer("w"), true)
+                .unwrap();
+            rec.actor().unwrap().write(h, 0, b"x", false).unwrap();
+            rec.actor().unwrap().close(h).unwrap();
+        }
+        let last = rec.durability.appended();
+        assert!(rec.history().built_through() <= last);
+        drop(rec);
+        let v = super::super::test_support::reopen(tmp.path());
+        assert_eq!(v.history().built_through(), last);
+        assert_eq!(v.durability().appended(), last);
+    }
 }

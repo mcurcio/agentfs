@@ -465,3 +465,141 @@ impl TreeActor {
 
 /// The touched keys of each tree, each key's last touching step.
 pub(in crate::tree_actor) type Touched = BTreeMap<TreeId, BTreeMap<Key, RecordNo>>;
+
+#[cfg(test)]
+mod tests {
+    use super::super::history::message;
+    use super::super::test_support::{new_actor, writer};
+    use super::*;
+
+    const ROOT: TreeId = TreeId::Root;
+
+    fn put(v: &mut TreeActor, tree: TreeId, path: &str, bytes: &[u8]) {
+        let create = v.read(tree, path).is_err();
+        let h = v.write_open(tree, path, &writer("w"), create).unwrap();
+        v.truncate(h, 0).unwrap();
+        v.write(h, 0, bytes, false).unwrap();
+        v.close(h).unwrap();
+    }
+
+    /// A root with `a` and `b`, a fork, and the fork's save of `a` queued
+    /// in the root; with `collide`, the root's own save of `a` after the fork.
+    fn queued_landing(dir: &std::path::Path, collide: bool) -> (TreeActor, TreeId) {
+        let mut v = new_actor(dir);
+        put(&mut v, ROOT, "a", b"one\n");
+        put(&mut v, ROOT, "b", b"x\n");
+        let fork = v.fork().unwrap();
+        put(&mut v, fork, "a", b"fork\n");
+        if collide {
+            put(&mut v, ROOT, "a", b"root\n");
+        }
+        assert!(v.queued(ROOT));
+        (v, fork)
+    }
+
+    /// The take of `tree`'s next entry, decided on history built through now.
+    fn decided(v: &TreeActor, tree: TreeId) -> Decision {
+        let inputs = v.take_inputs(tree).unwrap();
+        v.history.wait_built(inputs.through).unwrap();
+        decide(&v.history.snapshot(), &inputs).unwrap().unwrap()
+    }
+
+    /// What history says of the root as built: its head's tree and the
+    /// collisions its head's message names.
+    fn root_as_built(v: &TreeActor) -> (git2::Oid, Vec<String>) {
+        v.settle().unwrap();
+        let snapshot = v.history.snapshot();
+        let commit = snapshot
+            .repo()
+            .read_commit(snapshot.head(ROOT).unwrap())
+            .unwrap();
+        let collisions = message::collisions(&commit.message)
+            .unwrap()
+            .iter()
+            .map(|c| format!("{c:?}"))
+            .collect();
+        (commit.tree, collisions)
+    }
+
+    #[test]
+    fn a_take_decided_before_disjoint_saves_lands_as_one_decided_after() {
+        let (early, late) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (mut a, _) = queued_landing(early.path(), true);
+        let decision = decided(&a, ROOT);
+        put(&mut a, ROOT, "b", b"y\n");
+        assert!(a.land(decision).unwrap().is_ok());
+        let (mut b, _) = queued_landing(late.path(), true);
+        put(&mut b, ROOT, "b", b"y\n");
+        assert_eq!(b.take_next(ROOT).unwrap(), Took::Taken);
+        let built = root_as_built(&a);
+        assert!(!built.1.is_empty(), "the landing collides on a");
+        assert_eq!(built, root_as_built(&b));
+        for path in ["a", "b"] {
+            assert_eq!(a.read(ROOT, path).unwrap(), b.read(ROOT, path).unwrap());
+        }
+    }
+
+    #[test]
+    fn a_take_whose_read_key_changed_is_refused_then_redecided() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut v, _) = queued_landing(tmp.path(), true);
+        let decision = decided(&v, ROOT);
+        put(&mut v, ROOT, "a", b"again\n");
+        assert_eq!(v.land(decision).unwrap(), Err(Refused::FilesChanged));
+        assert_eq!(v.take_next(ROOT).unwrap(), Took::Taken);
+        assert!(!v.queued(ROOT));
+    }
+
+    #[test]
+    fn a_take_whose_written_key_is_held_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut v, _) = queued_landing(tmp.path(), true);
+        let decision = decided(&v, ROOT);
+        let held = v.write_open(ROOT, "a", &writer("w"), false).unwrap();
+        assert_eq!(v.land(decision).unwrap(), Err(Refused::Held));
+        assert_eq!(v.take_next(ROOT).unwrap(), Took::Waiting);
+        v.close(held).unwrap();
+        assert_eq!(v.take_next(ROOT).unwrap(), Took::Taken);
+    }
+
+    #[test]
+    fn a_fast_forward_after_a_head_move_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut v, _) = queued_landing(tmp.path(), false);
+        let decision = decided(&v, ROOT);
+        assert!(matches!(decision.take.head, TakeHead::FastForward { .. }));
+        put(&mut v, ROOT, "b", b"y\n");
+        assert_eq!(v.land(decision).unwrap(), Err(Refused::HeadMoved));
+        assert_eq!(v.take_next(ROOT).unwrap(), Took::Taken);
+        assert_eq!(v.read(ROOT, "a").unwrap(), b"fork\n");
+        assert_eq!(v.read(ROOT, "b").unwrap(), b"y\n");
+        let snapshot = {
+            v.settle().unwrap();
+            v.history.snapshot()
+        };
+        let head = snapshot
+            .repo()
+            .read_commit(snapshot.head(ROOT).unwrap())
+            .unwrap();
+        assert_eq!(
+            head.parents.len(),
+            2,
+            "a landing, not the refused fast-forward"
+        );
+    }
+
+    #[test]
+    fn a_sync_after_its_upstream_moved_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut v = new_actor(tmp.path());
+        put(&mut v, ROOT, "a", b"one\n");
+        let fork = v.fork().unwrap();
+        put(&mut v, ROOT, "a", b"two\n");
+        assert!(v.queued(fork));
+        let decision = decided(&v, fork);
+        put(&mut v, ROOT, "b", b"new\n");
+        assert_eq!(v.land(decision).unwrap(), Err(Refused::HeadMoved));
+        while v.take_next(fork).unwrap() == Took::Taken {}
+        assert_eq!(v.read(fork, "b").unwrap(), b"new\n");
+    }
+}

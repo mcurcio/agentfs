@@ -250,6 +250,8 @@ impl Feed {
             .and_then(|d| d.sync_all())
             .map_err(BuildError::from)?;
         PACK_SYNCS.fetch_add(synced, std::sync::atomic::Ordering::Relaxed);
+        #[cfg(test)]
+        SYNCED_HERE.with(|here| here.set(here.get() + synced));
         Ok(marks)
     }
 }
@@ -263,6 +265,12 @@ impl Drop for Feed {
             let _ = self.child.wait();
         }
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Pack files this thread's feeds fsynced: a unit test's exact count.
+    static SYNCED_HERE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 static PACK_SYNCS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -349,5 +357,38 @@ mod tests {
             .output()
             .unwrap();
         assert!(fsck.status.success(), "{fsck:?}");
+    }
+
+    #[test]
+    fn feed_fsyncs_what_it_installed() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = TreeGit::init(dir.path().join("r.git")).unwrap();
+        let pack_dir = dir.path().join("r.git/objects/pack");
+        let before = entries(&pack_dir).unwrap();
+        let synced = SYNCED_HERE.with(std::cell::Cell::get);
+        let mut feed = Feed::start(&repo, &dir.path().join("build.marks")).unwrap();
+        feed.blob(b"one\n").unwrap();
+        feed.blob(b"two\n").unwrap();
+        feed.finish().unwrap();
+        let installed: Vec<_> = entries(&pack_dir)
+            .unwrap()
+            .difference(&before)
+            .filter(|name| !name.to_string_lossy().starts_with("tmp_"))
+            .cloned()
+            .collect();
+        assert!(
+            installed
+                .iter()
+                .any(|n| n.to_string_lossy().ends_with(".pack"))
+                && installed
+                    .iter()
+                    .any(|n| n.to_string_lossy().ends_with(".idx")),
+            "{installed:?}"
+        );
+        assert_eq!(
+            SYNCED_HERE.with(std::cell::Cell::get) - synced,
+            installed.len() as u64,
+            "every file fast-import installed is fsynced"
+        );
     }
 }

@@ -539,3 +539,33 @@ fn a_take_names_the_files_it_changed_and_a_save_does_not() {
     assert_eq!(v.drain_changed(), [(fork, object)]);
     assert_eq!(v.drain_changed(), [], "drained");
 }
+
+// The builder applies a close's page-write pieces from the journal, by the
+// close rule the actor used: a mapped store written back on one handle and
+// saved by another open's close is in the commit, and the build agrees with
+// the save's length and checksum (a builder without the pieces refuses it).
+#[test]
+fn a_mapped_write_after_a_close_survives_the_build() {
+    let (tmp, mut k) = tree_with_seed(SEED);
+    let (a, b) = (k.open("a"), k.open("b"));
+    k.close(a);
+    k.map(b);
+    k.store(0, b"12");
+    k.flush();
+    assert_eq!(k.saved(), SEED, "a page write is no save");
+    let c = k.open("c");
+    k.close(c);
+    assert_eq!(k.saved(), b"12cdefgh");
+    k.v.settle().unwrap();
+    assert_eq!(
+        std::fs::read(tmp.path().join("trees/root").join(PATH)).unwrap(),
+        b"12cdefgh",
+        "the build applied the piece the close saved"
+    );
+    k.close(b);
+    k.v.settle().unwrap();
+    assert_eq!(
+        std::fs::read(tmp.path().join("trees/root").join(PATH)).unwrap(),
+        b"12cdefgh"
+    );
+}
