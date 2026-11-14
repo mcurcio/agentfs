@@ -254,6 +254,9 @@ mod tests {
             .unwrap()
             .write_open(TreeId::Root, "a", &writer("w"), true)
             .unwrap();
+        // The create is a step: once it is built, the builder has made its
+        // fsync and waits for the next step, so the flush leads the one held.
+        rec.settle().unwrap();
         rec.actor().unwrap().write(h, 0, b"x", false).unwrap();
         let (entered, inside) = sync_channel::<()>(0);
         let (release, released) = mpsc::channel::<()>();

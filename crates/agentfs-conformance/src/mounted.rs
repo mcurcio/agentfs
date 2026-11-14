@@ -9,6 +9,7 @@
 
 use crate::engine_names::EngineNames;
 use crate::library::{fail, seed};
+use agentfs_core::file_lock::{FileLock, Mode};
 use agentfs_core::tree_actor::TreeId as EngineTree;
 use agentfs_model::calls::{CallError, Caller, Took, TreeCalls, TreeId};
 use std::collections::{BTreeMap, VecDeque};
@@ -416,6 +417,12 @@ impl TreeCalls for Mounted {
         if let Some(mut child) = self.child.take() {
             child.kill().map_err(|e| io_fail("kill", &e))?;
             child.wait().map_err(|e| io_fail("wait", &e))?;
+            // Its tree Git children share its lease and die of their
+            // parent-death signal after it: taking the lease, blocking, is
+            // the event that every holder is gone.
+            let lease = FileLock::open(&self.state.join(agentfs_core::tree_actor::LOCK))
+                .map_err(|e| io_fail("lease", &e))?;
+            drop(FileLock::wait(lease, Mode::Exclusive).map_err(|e| io_fail("lease", &e))?);
         }
         for (fd, _) in std::mem::take(&mut self.opens) {
             // SAFETY: an open this harness holds; its connection is gone, so the

@@ -787,6 +787,6 @@ fn a_kill_after_a_write_returned_keeps_it() {
         "the child was not killed: {stderr}"
     );
     assert!(stderr.contains("agentfs failpoint tree.wal_after_payload triggered (kill)"));
-    let v = trees::reopen(&dir);
+    let v = trees::reopen_after_kill(&dir);
     assert_eq!(v.read(TreeId::Root, "a").unwrap(), b"kept");
 }

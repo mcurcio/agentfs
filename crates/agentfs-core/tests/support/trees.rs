@@ -8,6 +8,7 @@ use std::path::Path;
 use agentfs_contracts::name::{VolumeName, WriterLabel};
 use agentfs_contracts::pod::{PodContext, WriterAt};
 use agentfs_contracts::volume::{VolumeId, VolumeIdentity};
+use agentfs_core::file_lock::{FileLock, Mode};
 use agentfs_core::tree_actor::TreeActor;
 
 /// The identity [`new_actor`] gives: `test`, with a fixed id.
@@ -23,21 +24,25 @@ pub fn new_actor(dir: &Path) -> TreeActor {
     TreeActor::create(dir, &identity(), &PodContext::default()).expect("creates")
 }
 
-/// Opens the volume again. After a kill, an orphaned Git child of the killed
-/// process (the builder's `git fast-import`, which holds the state area's lease
-/// until its input closes and it exits) can hold the lease a moment longer: that
-/// open answers `Busy`, and this tries again, for up to ten seconds.
+/// Opens the volume again.
 pub fn reopen(dir: &Path) -> TreeActor {
-    let mut tries = 0;
-    loop {
-        match TreeActor::open(dir, &PodContext::default()) {
-            Err(agentfs_core::tree_actor::Error::Busy) if tries < 200 => {
-                tries += 1;
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
-            result => return result.expect("reopens"),
-        }
-    }
+    TreeActor::open(dir, &PodContext::default()).expect("reopens")
+}
+
+/// Returns once no process holds the state area's lease. A killed process's
+/// tree Git children (the builder's `git fast-import`) share its lease and die
+/// of their parent-death signal after it (`tree_git`'s `attach_lease`), so the
+/// lease can outlive the process a test waited for. Taking the lease, blocking,
+/// is the event that every holder is gone; it is released at once.
+pub fn wait_for_lease(dir: &Path) {
+    let file = FileLock::open(&dir.join(agentfs_core::tree_actor::LOCK)).expect("opens the lease");
+    drop(FileLock::wait(file, Mode::Exclusive).expect("takes the lease"));
+}
+
+/// [`reopen`] after the process that served the volume was killed.
+pub fn reopen_after_kill(dir: &Path) -> TreeActor {
+    wait_for_lease(dir);
+    reopen(dir)
 }
 
 /// `label` with an empty pod context.

@@ -10,7 +10,7 @@ use std::os::unix::fs::FileExt;
 use agentfs_contracts::name::WriterLabel;
 use agentfs_contracts::pod::PodContext;
 use agentfs_core::tree_actor::{Error, Saved, Took, TreeActor, TreeId};
-use trees::{new_actor, reopen, writer};
+use trees::{new_actor, reopen, reopen_after_kill, writer};
 
 const ROOT: TreeId = TreeId::Root;
 use agentfs_core::tree_git::TreeGit;
@@ -474,7 +474,7 @@ fn killed_actor_replays_acknowledged_calls() {
     }
     child.kill().unwrap();
     child.wait().unwrap();
-    let v = reopen(tmp.path());
+    let v = reopen_after_kill(tmp.path());
     assert_eq!(v.read(ROOT, "a").unwrap(), b"returned-write");
     let head = v.head(ROOT).unwrap();
     drop(v);
@@ -524,7 +524,7 @@ fn incoming_object_survives_kill_and_replays_later_open() {
     }
     child.kill().unwrap();
     child.wait().unwrap();
-    let mut volume = reopen(tmp.path());
+    let mut volume = reopen_after_kill(tmp.path());
     while volume.progress().unwrap() {}
     assert_eq!(
         volume.read(ROOT, "incoming").unwrap(),
@@ -1207,6 +1207,7 @@ fn run_killed_worker(worker: &str, root: &std::path::Path, spec: &str) -> u64 {
         Some(libc::SIGKILL),
         "{spec} did not kill the worker: {output:?}"
     );
+    trees::wait_for_lease(root);
     String::from_utf8(output.stdout)
         .unwrap()
         .lines()

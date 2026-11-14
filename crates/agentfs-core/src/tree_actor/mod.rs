@@ -63,7 +63,10 @@ const JOURNAL: &str = "calls.wal";
 /// The builder's built log (`history::built_log`).
 const BUILT_LOG: &str = "built.log";
 const INITIALIZING: &str = "initializing";
-const LOCK: &str = "actor.lock";
+/// The state area's lease file, under the state area: an exclusive `flock`
+/// held by the serving process and shared with its tree Git children, which
+/// outlive a killed holder until their parent-death signal lands.
+pub const LOCK: &str = "actor.lock";
 type Result<T> = std::result::Result<T, Error>;
 
 #[derive(Debug, thiserror::Error)]
