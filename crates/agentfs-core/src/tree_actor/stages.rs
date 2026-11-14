@@ -42,6 +42,11 @@ pub struct Stages {
     pub git_children: u64,
     pub object_writes: u64,
     pub object_dir_syncs: u64,
+    /// File bytes the actor and the builder copied: a frame's tail into its
+    /// buffer, a file map read into memory (docs/trees.md, "File maps").
+    pub bytes_copied: u64,
+    /// File bytes compared to tell a close that changes nothing.
+    pub bytes_compared: u64,
 }
 
 /// The stage a [`Timer`] adds to.
@@ -89,6 +94,18 @@ impl Total {
 }
 
 static TOTALS: [Total; STAGE_COUNT] = [const { Total::new() }; STAGE_COUNT];
+static COPIED: AtomicU64 = AtomicU64::new(0);
+static COMPARED: AtomicU64 = AtomicU64::new(0);
+
+/// Counts `n` file bytes copied.
+pub(super) fn copied(n: u64) {
+    COPIED.fetch_add(n, Ordering::Relaxed);
+}
+
+/// Counts `n` file bytes compared.
+pub(super) fn compared(n: u64) {
+    COMPARED.fetch_add(n, Ordering::Relaxed);
+}
 
 impl Stages {
     /// The totals so far in this process.
@@ -112,6 +129,8 @@ impl Stages {
             object_writes: crate::tree_git::object_writes() + super::history::feed::fed(),
             object_dir_syncs: crate::tree_git::object_dir_syncs()
                 + super::history::feed::pack_syncs(),
+            bytes_copied: COPIED.load(Ordering::Relaxed),
+            bytes_compared: COMPARED.load(Ordering::Relaxed),
         }
     }
 }

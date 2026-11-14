@@ -15,6 +15,7 @@ use super::super::TreeId;
 use super::super::journal::durable::RecordNo;
 use super::{Objects, refs};
 use crate::tree_actor::pointers::Pointers;
+use crate::tree_actor::recording::FileMap;
 use crate::tree_actor::tree::EventNumber;
 use crate::tree_git::TreeGit;
 
@@ -155,6 +156,9 @@ pub(in crate::tree_actor) struct State {
     /// The journal's last checkpoint's redo start: built-log entries at or
     /// before it name nothing a restart reads.
     pub(in crate::tree_actor) checkpointed: RecordNo,
+    /// Built files' maps the actor has not taken yet, in the order built:
+    /// each save, create and take, and each map rebased onto its checkout.
+    pub(in crate::tree_actor) maps: Vec<(TreeId, u64, FileMap)>,
 }
 
 /// The built state at one built point: heads, refs and the commits behind
@@ -258,6 +262,7 @@ impl History {
                     stopped: false,
                     checkpointed: RecordNo::ZERO,
                     gate: super::lag::LagGate::default(),
+                    maps: Vec::new(),
                 }),
                 changed: Condvar::new(),
             }),
@@ -361,6 +366,19 @@ impl History {
         state.epoch += 1;
         drop(state);
         self.notify();
+    }
+
+    /// The builder's maps of files it built or rebased, for the actor.
+    pub(in crate::tree_actor) fn publish_maps(&self, maps: Vec<(TreeId, u64, FileMap)>) {
+        if !maps.is_empty() {
+            self.state().maps.extend(maps);
+        }
+    }
+
+    /// Every map published since the last call, in the order built: the
+    /// actor takes each that is the same save as its own (`FileMap::step`).
+    pub(in crate::tree_actor) fn take_maps(&self) -> Vec<(TreeId, u64, FileMap)> {
+        std::mem::take(&mut self.state().maps)
     }
 
     /// A batch that started at request count `at` failed: waiters that asked

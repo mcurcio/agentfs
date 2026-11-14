@@ -13,6 +13,7 @@ use git2::Oid;
 use serde::{Deserialize, Serialize};
 
 use super::journal::{Change, SaveOutcome, TakeRecord};
+use super::recording::FileMap;
 use super::{Error, Result, queue, referee};
 use crate::tree_reconcile::LineMap;
 
@@ -175,12 +176,12 @@ impl Versions {
 /// A file's line map as the engine stores it.
 pub(super) type Lines = LineMap<LineVersion>;
 
-/// A file's saved bytes and, once built, their blob. New bytes are a new
-/// value, so a blob found once holds for as long as the bytes are shared: a
-/// build stores only the blobs of the files it changed.
+/// A built file's map and, once built, its blob. A new map is a new value,
+/// so a blob found once holds for as long as the map is shared: a build
+/// stores only the blobs of the files it changed.
 #[derive(Debug, Default)]
 pub(super) struct FileBytes {
-    bytes: Vec<u8>,
+    map: FileMap,
     blob: OnceLock<Oid>,
 }
 
@@ -197,20 +198,30 @@ impl FileBytes {
     }
 }
 
-impl From<Vec<u8>> for FileBytes {
-    fn from(bytes: Vec<u8>) -> Self {
+impl FileBytes {
+    /// The same bytes on another map (a rebase), keeping the blob.
+    pub(super) fn with_map(&self, map: FileMap) -> Self {
         Self {
-            bytes,
+            map,
+            blob: self.blob.clone(),
+        }
+    }
+}
+
+impl From<FileMap> for FileBytes {
+    fn from(map: FileMap) -> Self {
+        Self {
+            map,
             blob: OnceLock::new(),
         }
     }
 }
 
 impl Deref for FileBytes {
-    type Target = Vec<u8>;
+    type Target = FileMap;
 
-    fn deref(&self) -> &Vec<u8> {
-        &self.bytes
+    fn deref(&self) -> &FileMap {
+        &self.map
     }
 }
 
@@ -459,11 +470,11 @@ impl Shape {
 }
 
 /// The actor's saved state of one tree: its shape and each object's saved
-/// bytes. No line map and no name history: those are the builder's.
+/// map. No line map and no name history: those are the builder's.
 #[derive(Clone, Default)]
 pub(super) struct SavedTree {
     pub(super) shape: Shape,
-    pub(super) bytes: BTreeMap<u64, Arc<FileBytes>>,
+    pub(super) bytes: BTreeMap<u64, FileMap>,
 }
 
 impl Deref for SavedTree {
@@ -475,17 +486,21 @@ impl Deref for SavedTree {
 }
 
 impl SavedTree {
-    /// The saved state a built tree shows.
+    /// The saved state a built tree shows: its maps shared, never copied.
     pub(super) fn of(tree: &Tree) -> Self {
         Self {
             shape: tree.shape.clone(),
-            bytes: tree.bytes.clone(),
+            bytes: tree
+                .bytes
+                .iter()
+                .map(|(object, bytes)| (*object, (**bytes).clone()))
+                .collect(),
         }
     }
 
     pub(super) fn add_anonymous(&mut self, object: u64) {
         self.shape.add_anonymous(object);
-        self.bytes.insert(object, Arc::default());
+        self.bytes.insert(object, FileMap::empty());
     }
 
     pub(super) fn drop_object(&mut self, object: u64) {
@@ -527,10 +542,15 @@ impl Tree {
         self.lines.remove(&object);
     }
 
-    /// Replaces the names and files with `snapshot`'s. Two files on one object
+    /// Replaces the names and files with `snapshot`'s, each file's map from
+    /// `map` (given its identity, object and path). Two files on one object
     /// would read each other's bytes, so a view could differ from its commit: a
     /// step that would do it fails before its record (finding 39).
-    pub(super) fn install(&mut self, snapshot: referee::Snapshot) -> Result<()> {
+    pub(super) fn install(
+        &mut self,
+        snapshot: referee::Snapshot,
+        mut map: impl FnMut(MergeFileIdentity, u64, &str) -> Result<Arc<FileBytes>>,
+    ) -> Result<()> {
         self.shape.names.clear();
         self.shape.fresh_names.clear();
         let mut objects = BTreeSet::new();
@@ -544,8 +564,7 @@ impl Tree {
                 self.shape.fresh_names.insert(file.object);
             }
             self.shape.names.insert(path.to_owned(), file.object);
-            self.bytes
-                .insert(file.object, Arc::new(file.lines.bytes().into()));
+            self.bytes.insert(file.object, map(id, file.object, path)?);
             self.lines.insert(file.object, Arc::new(file.lines));
             self.shape.identities.insert(file.object, id);
         }

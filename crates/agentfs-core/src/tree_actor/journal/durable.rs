@@ -11,6 +11,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak};
 
 use serde::{Deserialize, Serialize};
 
+use super::segment::Segment;
 use crate::tree_actor::Error;
 use crate::tree_actor::call_path::Then;
 use crate::tree_actor::stages::{Timer, Which};
@@ -35,6 +36,11 @@ impl RecordNo {
     /// The record numbered `n`: the journal's frames and the actor's counter.
     pub(in crate::tree_actor) const fn new(n: u64) -> Self {
         Self(n)
+    }
+
+    /// The record after this one.
+    pub(in crate::tree_actor) const fn next(self) -> Self {
+        Self(self.0.saturating_add(1))
     }
 }
 
@@ -79,15 +85,20 @@ pub struct Durability {
 }
 
 struct State {
-    file: Arc<File>,
+    /// Every linked segment, in order: the leader fsyncs those that may hold
+    /// records past the mark.
+    segments: Vec<Arc<Segment>>,
+    /// The journal's directory.
+    dir: Arc<File>,
+    /// A segment was created since the directory's last fsync: its entry is
+    /// made durable before the mark covers any record in it.
+    dir_unsynced: bool,
     appended: RecordNo,
     mark: RecordNo,
     /// An fsync is running: a waiter it may cover waits for it to end.
     leading: bool,
     /// The errno of a failed fsync: nothing is durable past the mark again.
     failed: Option<i32>,
-    /// Bumped at each compaction: a reader of the file reopens it.
-    generation: u64,
 }
 
 /// Every deferred wait queued since the thread last looked is answered by one
@@ -111,10 +122,12 @@ fn serve_waits(durability: &Weak<Durability>, queue: &Receiver<(RecordNo, Then)>
 }
 
 impl Durability {
-    /// A journal file's group commit, with its records up to `appended` in the
-    /// file and up to `mark` known durable; starts its waiter thread.
+    /// A journal's group commit over its `segments` in directory `dir`, with
+    /// its records up to `appended` in the files and up to `mark` known
+    /// durable; starts its waiter thread.
     pub(in crate::tree_actor) fn new(
-        file: Arc<File>,
+        segments: Vec<Arc<Segment>>,
+        dir: File,
         appended: RecordNo,
         mark: RecordNo,
     ) -> Arc<Self> {
@@ -129,12 +142,13 @@ impl Durability {
                 .ok();
             Self {
                 state: Mutex::new(State {
-                    file,
+                    segments,
+                    dir: Arc::new(dir),
+                    dir_unsynced: false,
                     appended,
                     mark: mark.min(appended),
                     leading: false,
                     failed: None,
-                    generation: 0,
                 }),
                 ended: Condvar::new(),
                 queue: Mutex::new(sender),
@@ -154,10 +168,9 @@ impl Durability {
         self.state().mark
     }
 
-    /// The journal file's generation: it changes when a compaction replaces
-    /// the file.
-    pub(in crate::tree_actor) fn generation(&self) -> u64 {
-        self.state().generation
+    /// The linked segments, in order: what the builder's reader moves along.
+    pub(in crate::tree_actor) fn segments(&self) -> Vec<Arc<Segment>> {
+        self.state().segments.clone()
     }
 
     /// The highest record appended so far (in the kernel, maybe not on disk).
@@ -195,9 +208,16 @@ impl Durability {
         }
         state.leading = true;
         let target = state.appended;
-        let file = Arc::clone(&state.file);
+        // The segments that may hold records past the mark: from the one the
+        // record after it falls in. Carried frames are all at or below it.
+        let from = state
+            .segments
+            .partition_point(|s| s.first() <= state.mark.next())
+            .saturating_sub(1);
+        let files = state.segments[from..].to_vec();
+        let dir = std::mem::take(&mut state.dir_unsynced).then(|| Arc::clone(&state.dir));
         drop(state);
-        let synced = self.fsync(&file);
+        let synced = self.fsync(dir.as_deref(), &files);
         let mut state = self.state();
         state.leading = false;
         let result = match synced {
@@ -209,6 +229,7 @@ impl Durability {
                 let errno = e.raw_os_error().unwrap_or(libc::EIO);
                 eprintln!("tree JournalFsyncFailed: {e}");
                 state.failed = Some(errno);
+                state.dir_unsynced |= dir.is_some();
                 Err(DurableError::Io(errno))
             }
         };
@@ -217,9 +238,10 @@ impl Durability {
         result
     }
 
-    /// The leader's fsync, outside the lock: `fdatasync` covers the length a
-    /// read needs.
-    fn fsync(&self, file: &File) -> io::Result<()> {
+    /// The leader's fsync, outside the lock: the directory first when a
+    /// segment is new, then each segment in order; `fdatasync` covers the
+    /// length a read needs.
+    fn fsync(&self, dir: Option<&File>, files: &[Arc<Segment>]) -> io::Result<()> {
         crate::failpoints::hit("tree.wal_before_fsync")?;
         #[cfg(test)]
         if let Some(hook) = &*self.in_fsync.lock().unwrap_or_else(PoisonError::into_inner) {
@@ -227,7 +249,13 @@ impl Durability {
         }
         {
             let _timer = Timer::start(Which::JournalFsync);
-            file.sync_data()?;
+            if let Some(dir) = dir {
+                crate::failpoints::hit("tree.segment_after_create")?;
+                dir.sync_all()?;
+            }
+            for segment in files {
+                segment.file().sync_data()?;
+            }
         }
         crate::failpoints::hit("tree.wal_after_fsync")
     }
@@ -249,16 +277,17 @@ impl Durability {
         state.appended = state.appended.max(record);
     }
 
-    /// Compaction, under the actor lock, after the new file is fsynced and
-    /// renamed: every record through `last` is in it, so the mark rises to it.
-    pub(in crate::tree_actor) fn replace_file(&self, file: Arc<File>, last: RecordNo) {
+    /// A new segment, under the actor lock, before any record is appended
+    /// to it: the next leader fsyncs the directory before its mark covers it.
+    pub(in crate::tree_actor) fn add_segment(&self, segment: Arc<Segment>) {
         let mut state = self.state();
-        state.file = file;
-        state.generation += 1;
-        state.appended = state.appended.max(last);
-        state.mark = state.mark.max(last);
-        drop(state);
-        self.ended.notify_all();
+        state.segments.push(segment);
+        state.dir_unsynced = true;
+    }
+
+    /// A dropped segment, under the actor lock: all its records are built.
+    pub(in crate::tree_actor) fn remove_segment(&self, first: RecordNo) {
+        self.state().segments.retain(|s| s.first() != first);
     }
 
     /// Queues `then` on the waiter thread (started by `new`): one fsync
@@ -302,13 +331,16 @@ mod tests {
     use super::*;
     use crate::tree_actor::stages::Stages;
 
-    fn durability(appended: u64) -> (tempfile::NamedTempFile, Arc<Durability>) {
-        let file = tempfile::NamedTempFile::new().unwrap();
-        let handle = Arc::new(file.reopen().unwrap());
-        (
-            file,
-            Durability::new(handle, RecordNo::new(appended), RecordNo::ZERO),
-        )
+    fn durability(appended: u64) -> (tempfile::TempDir, Arc<Durability>) {
+        let dir = tempfile::tempdir().unwrap();
+        let segment = Segment::create(dir.path(), RecordNo::new(1)).unwrap();
+        let d = Durability::new(
+            vec![segment],
+            File::open(dir.path()).unwrap(),
+            RecordNo::new(appended),
+            RecordNo::ZERO,
+        );
+        (dir, d)
     }
 
     /// Process-wide counters: the tests that read them run one at a time.
@@ -405,11 +437,16 @@ mod tests {
     }
 
     #[test]
-    fn compaction_raises_the_mark_to_its_last_record() {
-        let (file, d) = durability(5);
-        d.replace_file(Arc::new(file.reopen().unwrap()), RecordNo::new(7));
-        assert_eq!(d.mark(), RecordNo::new(7));
-        assert_eq!(d.appended(), RecordNo::new(7));
-        assert_eq!(d.make_all_durable(), Ok(RecordNo::new(7)));
+    fn a_new_segment_is_fsynced_through_its_directory_first() {
+        let (dir, d) = durability(1);
+        assert_eq!(d.make_all_durable(), Ok(RecordNo::new(1)));
+        d.add_segment(Segment::create(dir.path(), RecordNo::new(2)).unwrap());
+        assert!(d.state().dir_unsynced);
+        d.appended_to(RecordNo::new(2));
+        assert_eq!(d.make_all_durable(), Ok(RecordNo::new(2)));
+        assert!(!d.state().dir_unsynced);
+        assert_eq!(d.segments().len(), 2);
+        d.remove_segment(RecordNo::new(1));
+        assert_eq!(d.segments()[0].first(), RecordNo::new(2));
     }
 }

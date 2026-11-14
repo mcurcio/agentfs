@@ -1,107 +1,68 @@
 //! Recording: a tree's file calls, each journalled (in the kernel, no fsync) before it returns,
 //! and the steps that save them: create, close, rename and unlink, each decided, appended and
-//! applied with no git (docs/recording.md, docs/trees.md; target git-model §7).
+//! applied with no git (docs/recording.md, docs/trees.md; target git-model §7). A file's bytes
+//! are a [`FileMap`] over journal frames and the checkout as built, never bytes in memory.
 
+pub(super) mod file_map;
 pub(super) mod pages;
 
 use std::collections::BTreeSet;
-use std::sync::Arc;
+use std::ops::Range;
 
 use agentfs_contracts::pod::WriterAt;
 
+pub use file_map::FileMap;
 use super::journal::durable::RecordNo;
-use super::journal::{CallHead, Change, Entry, PagePiece, RunHead, SaveOutcome};
+pub(in crate::tree_actor) use super::journal::CallHead as Call;
+use super::journal::segment::FramePos;
+use super::journal::{Change, Entry, PagePiece, RunHead, SaveOutcome};
 use super::queue::Key;
 use super::tree::EventNumber;
 use super::{Error, Result, Saved, TreeActor, TreeId};
 use crate::paths::RepoPath;
 
-/// Calls name byte positions, never lines. Append finds EOF at save time.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(in crate::tree_actor) enum Call {
-    Write { offset: u64, bytes: Vec<u8> },
-    Append(Vec<u8>),
-    Truncate(u64),
-}
-
+/// Calls name byte positions, never lines; their bytes are in their frame's
+/// tail. Append finds EOF at save time.
 impl Call {
-    pub(in crate::tree_actor) fn apply(&self, bytes: &mut Vec<u8>) -> Result<()> {
+    /// The bytes the call carries in its frame.
+    pub(in crate::tree_actor) fn carried(&self) -> u64 {
         match self {
-            Self::Write {
-                offset,
-                bytes: data,
-            } => {
-                let offset = usize::try_from(*offset).map_err(|_| Error::TooLarge)?;
-                let end = offset.checked_add(data.len()).ok_or(Error::TooLarge)?;
-                // A zero-length pwrite past EOF does not extend a file.
-                if !data.is_empty() {
-                    bytes.resize(bytes.len().max(end), 0);
-                    bytes[offset..end].copy_from_slice(data);
-                }
-            }
-            Self::Append(data) => {
-                bytes.len().checked_add(data.len()).ok_or(Error::TooLarge)?;
-                bytes.extend_from_slice(data);
-            }
-            Self::Truncate(size) => {
-                let size = usize::try_from(*size).map_err(|_| Error::TooLarge)?;
-                bytes.resize(size, 0);
-            }
-        }
-        Ok(())
-    }
-
-    /// The call as a journal frame stores it: a JSON head and raw tail bytes.
-    /// The length `apply` leaves on bytes of length `len`, with the errors
-    /// `apply` returns: a call's errors depend only on lengths, so a check
-    /// costs nothing like the bytes.
-    pub(in crate::tree_actor) fn len_after(&self, len: usize) -> Result<usize> {
-        match self {
-            Self::Write {
-                offset,
-                bytes: data,
-            } => {
-                let offset = usize::try_from(*offset).map_err(|_| Error::TooLarge)?;
-                let end = offset.checked_add(data.len()).ok_or(Error::TooLarge)?;
-                Ok(if data.is_empty() { len } else { len.max(end) })
-            }
-            Self::Append(data) => len.checked_add(data.len()).ok_or(Error::TooLarge),
-            Self::Truncate(size) => usize::try_from(*size).map_err(|_| Error::TooLarge),
+            Self::Write { len, .. } | Self::Append { len } => *len,
+            Self::Truncate(_) => 0,
         }
     }
 
-    pub(in crate::tree_actor) fn to_frame(&self) -> (CallHead, &[u8]) {
-        match self {
-            Self::Write { offset, bytes } => (
-                CallHead::Write {
-                    offset: *offset,
-                    len: bytes.len() as u64,
-                },
-                bytes,
-            ),
-            Self::Append(bytes) => (
-                CallHead::Append {
-                    len: bytes.len() as u64,
-                },
-                bytes,
-            ),
-            Self::Truncate(size) => (CallHead::Truncate(*size), &[]),
+    /// The length the call leaves on a file of length `len`, with the errors
+    /// [`FileMap::apply`] returns: a call's errors depend only on lengths, so
+    /// a check costs nothing like the bytes.
+    pub(in crate::tree_actor) fn len_after(&self, len: u64) -> Result<u64> {
+        match *self {
+            Self::Write { offset, len: n } => {
+                let end = offset.checked_add(n).ok_or(Error::TooLarge)?;
+                Ok(if n == 0 { len } else { len.max(end) })
+            }
+            Self::Append { len: n } => len.checked_add(n).ok_or(Error::TooLarge),
+            Self::Truncate(size) => Ok(size),
         }
     }
 
-    pub(in crate::tree_actor) fn from_frame(head: &CallHead, tail: &[u8]) -> Result<Self> {
-        let whole = |len: u64| {
-            (len == tail.len() as u64)
-                .then(|| tail.to_vec())
-                .ok_or(Error::Format)
-        };
-        match head {
-            CallHead::Write { offset, len } => Ok(Self::Write {
-                offset: *offset,
-                bytes: whole(*len)?,
-            }),
-            CallHead::Append { len } => Ok(Self::Append(whole(*len)?)),
-            CallHead::Truncate(size) => whole(0).map(|_| Self::Truncate(*size)),
+    /// The file range the call changes on a file of length `len`: a write's,
+    /// an append's at replay, a truncate's from its size up.
+    pub(in crate::tree_actor) fn touched(&self, len: u64) -> Option<Range<u64>> {
+        match *self {
+            Self::Write { len: 0, .. } | Self::Append { len: 0 } => None,
+            Self::Write { offset, len: n } => Some(offset..offset.saturating_add(n)),
+            Self::Append { len: n } => Some(len..len.saturating_add(n)),
+            Self::Truncate(size) => Some(size..u64::MAX),
+        }
+    }
+
+    /// Whether a frame's tail of `tail` bytes is this call's.
+    pub(in crate::tree_actor) fn check_tail(&self, tail: u64) -> Result<()> {
+        if self.carried() == tail {
+            Ok(())
+        } else {
+            Err(Error::Format)
         }
     }
 }
@@ -110,29 +71,46 @@ pub(in crate::tree_actor) struct Handle {
     pub(in crate::tree_actor) tree: TreeId,
     pub(in crate::tree_actor) by: WriterAt,
     pub(in crate::tree_actor) object: u64,
-    pub(in crate::tree_actor) bytes: Vec<u8>,
-    /// This open's calls, each with its journal number.
-    pub(in crate::tree_actor) calls: Vec<(u64, Call)>,
+    /// The open's view: the saved map at open (a clone, never a copy of
+    /// bytes), its own calls and the file's page writes.
+    pub(in crate::tree_actor) bytes: FileMap,
+    /// This open's calls, each with its journal number and where its bytes are.
+    pub(in crate::tree_actor) calls: Vec<(u64, Call, FramePos)>,
     /// The saved length the calls were last checked on, and the length they
     /// leave on it (see `call`).
-    pub(in crate::tree_actor) replayed: Option<(usize, usize)>,
+    pub(in crate::tree_actor) replayed: Option<(u64, u64)>,
 }
 
 impl TreeActor {
-    /// Saved bytes; an independent reader never sees an unfinished save.
-    pub fn read(&self, tree: TreeId, path: &str) -> Result<&[u8]> {
+    /// Saved bytes, whole, in memory: the library's read. An independent
+    /// reader never sees an unfinished save. A view reads through
+    /// [`TreeActor::file_map`] instead.
+    pub fn read(&self, tree: TreeId, path: &str) -> Result<Vec<u8>> {
+        Ok(self.file_map(tree, path)?.to_vec()?)
+    }
+
+    /// The saved file as a map: a clone of the actor's, O(1), which a reader
+    /// reads with the actor unlocked and keeps across later saves and builds.
+    pub fn file_map(&self, tree: TreeId, path: &str) -> Result<FileMap> {
         let tree = self.tree(tree)?;
         let object = tree.names.get(path).ok_or(Error::NotFound)?;
-        Ok(tree.bytes.get(object).ok_or(Error::NotFound)?)
+        Ok(tree.bytes.get(object).ok_or(Error::NotFound)?.clone())
+    }
+
+    /// The saved length of `path`.
+    pub fn file_len(&self, tree: TreeId, path: &str) -> Result<u64> {
+        let tree = self.tree(tree)?;
+        let object = tree.names.get(path).ok_or(Error::NotFound)?;
+        Ok(tree.bytes.get(object).ok_or(Error::NotFound)?.len())
     }
 
     /// Stable object IDs for a view's inode table (not merge identities).
-    pub fn files(&self, tree: TreeId) -> Result<Vec<(String, u64, usize)>> {
+    pub fn files(&self, tree: TreeId) -> Result<Vec<(String, u64, u64)>> {
         let tree = self.tree(tree)?;
         Ok(tree
             .names
             .iter()
-            .map(|(p, o)| (p.clone(), *o, tree.bytes[o].len()))
+            .map(|(p, o)| (p.clone(), *o, tree.bytes.get(o).map_or(0, FileMap::len)))
             .collect())
     }
 
@@ -212,7 +190,7 @@ impl TreeActor {
             }
             return self.create_step(tree, path, by);
         };
-        let handle = self.journal_record(
+        let (handle, _) = self.journal_record(
             Entry::Open {
                 tree: tree.to_string(),
                 path: path.to_owned(),
@@ -221,7 +199,12 @@ impl TreeActor {
             },
             &[],
         )?;
-        let bytes = self.tree(tree)?.bytes[&object].to_vec();
+        let bytes = self
+            .tree(tree)?
+            .bytes
+            .get(&object)
+            .cloned()
+            .unwrap_or_default();
         self.handles.insert(
             handle,
             Handle {
@@ -240,7 +223,7 @@ impl TreeActor {
     /// Create an unnamed open object. Its writes are journaled as usual.
     pub fn anonymous_open(&mut self, tree: TreeId, by: &WriterAt) -> Result<u64> {
         self.tree(tree)?;
-        let handle = self.journal_record(
+        let (handle, _) = self.journal_record(
             Entry::AnonymousOpen {
                 tree: tree.to_string(),
                 by: by.clone(),
@@ -257,7 +240,7 @@ impl TreeActor {
                 tree,
                 by: by.clone(),
                 object: handle,
-                bytes: Vec::new(),
+                bytes: FileMap::empty(),
                 calls: Vec::new(),
                 replayed: None,
             },
@@ -301,63 +284,73 @@ impl TreeActor {
         Ok(self.handles.get(&handle).ok_or(Error::NotFound)?.object)
     }
 
-    pub fn read_open(&self, handle: u64) -> Result<&[u8]> {
+    /// A write-open's view: its saved map at open, its own calls and the
+    /// file's page writes. A view clones it under the lock and reads it after.
+    pub fn read_open(&self, handle: u64) -> Result<&FileMap> {
         Ok(&self.handles.get(&handle).ok_or(Error::NotFound)?.bytes)
     }
 
     pub fn write(&mut self, handle: u64, offset: u64, bytes: &[u8], append: bool) -> Result<()> {
+        let len = bytes.len() as u64;
         let call = if append {
-            Call::Append(bytes.to_vec())
+            Call::Append { len }
         } else {
-            Call::Write {
-                offset,
-                bytes: bytes.to_vec(),
-            }
+            Call::Write { offset, len }
         };
-        self.call(handle, call)
+        self.call(handle, call, bytes)
     }
 
     pub fn truncate(&mut self, handle: u64, size: u64) -> Result<()> {
-        self.call(handle, Call::Truncate(size))
+        self.call(handle, Call::Truncate(size), &[])
     }
 
     /// Checks the call on the writer's view and on the saved head with every
-    /// earlier call, journals it, then applies it to the view. Both checks are
-    /// on lengths, which are all `apply`'s errors depend on, and the head's
-    /// replay is redone only when the saved length moved: a call costs its own
-    /// bytes, not the file's or its open's.
-    pub(in crate::tree_actor) fn call(&mut self, handle: u64, call: Call) -> Result<()> {
+    /// earlier call, journals it with its bytes `tail`, then applies it to the
+    /// view as one piece of its frame. Both checks are on lengths, which are
+    /// all `apply`'s errors depend on, and the head's replay is redone only
+    /// when the saved length moved: a call costs its own bytes, not the
+    /// file's or its open's.
+    pub(in crate::tree_actor) fn call(&mut self, handle: u64, call: Call, tail: &[u8]) -> Result<()> {
         let h = self.handles.get(&handle).ok_or(Error::NotFound)?;
         call.len_after(h.bytes.len())?;
-        let saved = self.tree(h.tree)?.bytes[&h.object].len();
+        let saved = self
+            .tree(h.tree)?
+            .bytes
+            .get(&h.object)
+            .map_or(0, FileMap::len);
         let replayed = match h.replayed {
             Some((base, len)) if base == saved => len,
             _ => h
                 .calls
                 .iter()
-                .try_fold(saved, |len, (_, c)| c.len_after(len))?,
+                .try_fold(saved, |len, (_, c, _)| c.len_after(len))?,
         };
         let replayed = call.len_after(replayed)?;
-        let (head, tail) = call.to_frame();
-        let seq = self.journal_record(Entry::Call { handle, call: head }, tail)?;
+        let (seq, pos) = self.journal_record(
+            Entry::Call {
+                handle,
+                call: call.clone(),
+            },
+            tail,
+        )?;
         let h = self.handles.get_mut(&handle).ok_or(Error::NotFound)?;
-        call.apply(&mut h.bytes)?;
+        h.bytes.apply(&call, &pos)?;
         h.replayed = Some((saved, replayed));
         let (tree, object) = (h.tree, h.object);
-        self.pages_note_call(tree, object, &call);
+        self.pages_note_call(tree, object, &call, &pos);
         let h = self.handles.get_mut(&handle).ok_or(Error::NotFound)?;
-        h.calls.push((seq, call));
+        h.calls.push((seq, call, pos));
         Ok(())
     }
 
     /// The journal call for a page write: only `pages` calls it (ledger R1.4).
-    /// Returns its journal number.
+    /// Returns its journal number and where its runs' bytes are, in order.
     pub(in crate::tree_actor) fn record_page_write(
         &mut self,
         tree: TreeId,
         object: u64,
-        runs: &[pages::Run],
-    ) -> Result<u64> {
+        runs: &[pages::Changed],
+    ) -> Result<(u64, FramePos)> {
         let heads = runs
             .iter()
             .map(|run| RunHead {
@@ -457,10 +450,12 @@ impl TreeActor {
         };
         let pointers = self.publish(tree, seq);
         let started = std::time::Instant::now();
-        self.record_step(by.clone(), change.clone(), pointers)?;
+        self.record_step(by.clone(), change.clone(), pointers, &[])?;
         let t = self.trees.get_mut(&tree).ok_or(Error::NotFound)?;
         let keys = Self::apply_shape(&mut self.stopped, t, &change, seq);
-        t.bytes.insert(seq, Arc::default());
+        let mut empty = FileMap::empty();
+        empty.saved_at(RecordNo::new(seq));
+        t.bytes.insert(seq, empty);
         self.touch(tree, seq, keys);
         self.handles.insert(
             seq,
@@ -468,7 +463,7 @@ impl TreeActor {
                 tree,
                 by: by.clone(),
                 object: seq,
-                bytes: Vec::new(),
+                bytes: FileMap::empty(),
                 calls: Vec::new(),
                 replayed: None,
             },
@@ -487,7 +482,7 @@ impl TreeActor {
         let keys = shape.apply(&change, EventNumber::new(seq))?;
         let pointers = self.publish(tree, seq);
         let started = std::time::Instant::now();
-        self.record_step(by.clone(), change, pointers)?;
+        self.record_step(by.clone(), change, pointers, &[])?;
         self.trees.get_mut(&tree).ok_or(Error::NotFound)?.shape = shape;
         self.touch(tree, seq, keys);
         self.count_save(started);
@@ -519,8 +514,8 @@ impl TreeActor {
         self.metrics.max_save_nanos = self.metrics.max_save_nanos.max(nanos);
     }
 
-    /// A close: decides its outcome on the saved bytes, appends the save and
-    /// applies it. The builder replays the same calls on the built bytes.
+    /// A close: decides its outcome on the saved map, appends the save and
+    /// applies it. The builder replays the same calls on the built map.
     fn close_step(&mut self, handle: u64) -> Result<Saved> {
         let h = self.handles.get(&handle).ok_or(Error::NotFound)?;
         let (tree, object, by) = (h.tree, h.object, h.by.clone());
@@ -535,13 +530,13 @@ impl TreeActor {
             pieces = self.pages_close_pieces(h);
             let calls = pages::close_calls(&h.calls, &pieces);
             let saved = t.bytes.get(&object).ok_or(Error::NotFound)?;
-            match changed_bytes(saved, &calls)? {
-                Some(bytes) => {
+            match changed(saved, &calls)? {
+                Some(map) => {
                     let outcome = SaveOutcome::Saved {
-                        len: bytes.len() as u64,
-                        crc32: crc32fast::hash(&bytes),
+                        len: map.len(),
+                        pieces: map.digest(&own_keys(&calls)),
                     };
-                    saved_bytes = Some(bytes);
+                    saved_bytes = Some(map);
                     outcome
                 }
                 None => SaveOutcome::Unchanged,
@@ -561,7 +556,7 @@ impl TreeActor {
                 .map(|(record, run)| PagePiece {
                     record: RecordNo::new(*record),
                     offset: run.offset,
-                    len: run.bytes.len() as u64,
+                    len: run.len,
                 })
                 .collect(),
             outcome,
@@ -569,7 +564,7 @@ impl TreeActor {
         let started = std::time::Instant::now();
         // Every close lets its open's held keys go, a changed file's or not.
         let keys = self.tree(tree)?.shape.keys(object);
-        self.record_step(by, change, pointers)?;
+        self.record_step(by, change, pointers, &[])?;
         self.touch(tree, seq, keys);
         self.pending_closes.retain(|pending| *pending != handle);
         self.handles.remove(&handle);
@@ -577,8 +572,9 @@ impl TreeActor {
         t.shape.save(object, outcome);
         match (outcome, saved_bytes) {
             (SaveOutcome::AnonymousDropped, _) => t.drop_object(object),
-            (_, Some(bytes)) => {
-                t.bytes.insert(object, Arc::new(bytes.into()));
+            (_, Some(mut map)) => {
+                map.saved_at(RecordNo::new(seq));
+                t.bytes.insert(object, map);
             }
             _ => {}
         }
@@ -596,17 +592,28 @@ impl TreeActor {
     }
 }
 
-/// The bytes `calls` leave on `saved`, or none if they leave it as it was: a save
+/// The map `calls` leave on `saved`, or none if they leave it as it was: a save
 /// that changes nothing commits nothing (finding 36; the owner, 2026-11-07, "1. A").
-pub(in crate::tree_actor) fn changed_bytes(
-    saved: &[u8],
-    calls: &[Call],
-) -> Result<Option<Vec<u8>>> {
-    let mut bytes = saved.to_vec();
-    for call in calls {
-        call.apply(&mut bytes)?;
+/// "As it was" compares only the bytes the calls touched, never the whole file.
+pub(in crate::tree_actor) fn changed(
+    saved: &FileMap,
+    calls: &[(Call, FramePos)],
+) -> Result<Option<FileMap>> {
+    let mut map = saved.clone();
+    let mut ranges = Vec::new();
+    for (call, pos) in calls {
+        ranges.extend(call.touched(map.len()));
+        map.apply(call, pos)?;
     }
-    Ok((bytes != saved).then_some(bytes))
+    if calls.is_empty() || (map.len() == saved.len() && map.same_as(saved, &ranges)?) {
+        return Ok(None);
+    }
+    Ok(Some(map))
+}
+
+/// The frames a close applied, as [`FileMap::digest`] names them.
+pub(in crate::tree_actor) fn own_keys(calls: &[(Call, FramePos)]) -> BTreeSet<(u64, u64)> {
+    calls.iter().map(|(_, pos)| pos.key()).collect()
 }
 
 pub(in crate::tree_actor) fn name(path: &str) -> Result<()> {
@@ -620,44 +627,54 @@ pub(in crate::tree_actor) fn name(path: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tree_actor::journal::segment::Scratch;
 
     /// `call` checks on lengths alone: `len_after` must give `apply`'s length
     /// and fail where it fails.
     #[test]
     fn len_after_is_the_length_apply_leaves() {
         let calls = [
-            Call::Write {
-                offset: 3,
-                bytes: b"abc".to_vec(),
-            },
-            Call::Write {
-                offset: 40,
-                bytes: Vec::new(),
-            },
-            Call::Write {
-                offset: 0,
-                bytes: b"x".to_vec(),
-            },
-            Call::Append(b"tail".to_vec()),
+            Call::Write { offset: 3, len: 3 },
+            Call::Write { offset: 40, len: 0 },
+            Call::Write { offset: 0, len: 1 },
+            Call::Append { len: 4 },
             Call::Truncate(2),
             Call::Truncate(9),
         ];
+        let mut frames = Scratch::new();
         for len in [0, 1, 5, 12] {
             for call in &calls {
-                let mut bytes = vec![b'.'; len];
-                call.apply(&mut bytes).unwrap();
-                assert_eq!(
-                    call.len_after(len).unwrap(),
-                    bytes.len(),
-                    "{call:?} on {len}"
-                );
+                let mut map = FileMap::empty();
+                map.apply(&Call::Append { len }, &frames.add(&vec![b'.'; len as usize]))
+                    .unwrap();
+                let pos = frames.add(&vec![b'x'; call.carried() as usize]);
+                map.apply(call, &pos).unwrap();
+                assert_eq!(call.len_after(len).unwrap(), map.len(), "{call:?} on {len}");
             }
         }
         let too_far = Call::Write {
             offset: u64::MAX,
-            bytes: b"a".to_vec(),
+            len: 1,
         };
         assert!(too_far.len_after(0).is_err());
-        assert!(too_far.apply(&mut Vec::new()).is_err());
+        assert!(FileMap::empty().apply(&too_far, &frames.add(b"a")).is_err());
+    }
+
+    #[test]
+    fn a_close_that_rewrites_the_same_bytes_changes_nothing() {
+        let mut frames = Scratch::new();
+        let mut saved = FileMap::empty();
+        saved
+            .apply(&Call::Append { len: 6 }, &frames.add(b"abcdef"))
+            .unwrap();
+        let same = [
+            (Call::Truncate(0), frames.add(b"")),
+            (Call::Write { offset: 0, len: 6 }, frames.add(b"abcdef")),
+        ];
+        assert!(changed(&saved, &same).unwrap().is_none());
+        let other = [(Call::Write { offset: 2, len: 1 }, frames.add(b"C"))];
+        let map = changed(&saved, &other).unwrap().unwrap();
+        assert_eq!(map.to_vec().unwrap(), b"abCdef");
+        assert!(changed(&saved, &[]).unwrap().is_none());
     }
 }

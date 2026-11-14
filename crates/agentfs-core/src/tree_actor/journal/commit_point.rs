@@ -2,6 +2,7 @@
 //! (target git-model §3).
 
 use super::durable::RecordNo;
+use super::segment::FramePos;
 use super::{CompactError, Entry, OpenRecord, Record};
 use crate::tree_actor::recording::pages;
 use crate::tree_actor::stages::{Timer, Which};
@@ -14,18 +15,20 @@ pub(in crate::tree_actor) fn compact_at(len_after_last: u64) -> u64 {
 }
 
 impl TreeActor {
-    /// Appends one record that moves no pointer, or the step `run_step` built,
-    /// with no fsync: the journal's [`Durability`](super::durable::Durability)
-    /// makes it durable when a caller asks. Only a file that can no longer be
-    /// trusted stops the actor.
+    /// Appends one record, with no fsync: the journal's
+    /// [`Durability`](super::durable::Durability) makes it durable when a
+    /// caller asks. Returns its number and where its tail is. Only a file
+    /// that can no longer be trusted stops the actor.
     pub(in crate::tree_actor) fn journal_record(
         &mut self,
         entry: Entry,
         tail: &[u8],
-    ) -> Result<u64> {
+    ) -> Result<(u64, FramePos)> {
         if self.is_stopped() {
             return Err(Error::Stopped);
         }
+        // Saved maps the builder has checked out let go of their frames first.
+        self.rebase_built();
         // A compaction due since history trailed runs at the first call after
         // it caught up, before that call's record.
         self.compact_if_due();
@@ -38,20 +41,26 @@ impl TreeActor {
             at_ns: now_ns(),
             entry,
         };
-        if let Err(e) = self.journal.append(&record, tail) {
-            self.stopped = self.journal.unknown();
-            return Err(e);
-        }
+        let pos = match self.journal.append(&record, tail) {
+            Ok(pos) => pos,
+            Err(e) => {
+                self.stopped = self.journal.unknown();
+                return Err(e);
+            }
+        };
         self.next += 1;
-        Ok(seq)
+        Ok((seq, pos))
     }
 
-    /// A fuzzy checkpoint (ARIES): the pointers, the live opens, and unchanged
-    /// the live opens' calls and the page writes memory still holds. A file held
-    /// open pins only its own calls, never other files' saves, and a closed
-    /// generation's page write stays out of the fold (R12). Only with history
-    /// built through every record: the checkpoint's pointers are the built
-    /// ones, and its redo start is its last record.
+    /// A fuzzy checkpoint (ARIES): the pointers and the live opens, written
+    /// as the first frame of a new segment, then every older segment dropped
+    /// whose records are built and which holds no live open's call or held
+    /// page write. A file held open pins only its own frames, never other
+    /// files' saves: they are copied forward once the dead bytes they pin
+    /// exceed their own. A closed generation's page write stays out of the
+    /// fold (R12). Only with history built through every record: the
+    /// checkpoint's pointers are the built ones, and its redo start is its
+    /// last record.
     pub(in crate::tree_actor) fn compact(&mut self) -> std::result::Result<(), CompactError> {
         let _timer = Timer::start(Which::Compaction);
         let snapshot = self.history.snapshot();
@@ -85,6 +94,7 @@ impl TreeActor {
                 upstreams: self.upstreams.to_text(),
                 opens,
                 page_saved: self.pages_saved_through(),
+                page_writes: self.pages_held(),
                 objects: snapshot
                     .all_objects()
                     .into_iter()
@@ -92,33 +102,24 @@ impl TreeActor {
                     .collect(),
             },
         };
-        let (handles, pages) = (&self.handles, &self.pages);
-        // The fold parsed every page write's tree; one that names none stops the
-        // compaction with the journal untouched, never a page write dropped.
-        let unparsed = std::cell::Cell::new(false);
-        let retained = self
-            .journal
-            .retained(|record| match &record.entry {
-                Entry::Call { handle, .. } => handles.contains_key(handle),
-                Entry::PageWrite { tree, object, .. } => match tree.parse() {
-                    Ok(tree) => pages::holds(pages, tree, *object, record.seq.get()),
-                    Err(_) => {
-                        unparsed.set(true);
-                        true
-                    }
-                },
-                _ => false,
-            })
-            .map_err(CompactError::Before)?;
-        if unparsed.get() {
-            return Err(CompactError::Before(std::io::Error::other(
-                "a journalled page write names no tree",
-            )));
-        }
-        self.journal.compact(&checkpoint, &retained)?;
+        self.journal.checkpoint(&checkpoint)?;
         self.history.checkpointed(last);
         // The records name built values only: no step past the checkpoint yet.
         self.pointers = snapshot.pointers().to_targets();
+        let (handles, pages) = (&self.handles, &self.pages);
+        let live = |record: &Record| match &record.entry {
+            Entry::Call { handle, .. } => handles.contains_key(handle),
+            // A page write that names no tree is kept, never dropped.
+            Entry::PageWrite { tree, object, .. } => tree
+                .parse()
+                .map_or(true, |tree| pages::holds(pages, tree, *object, record.seq.get())),
+            _ => false,
+        };
+        let stats = self
+            .journal
+            .drop_behind(last, &live)
+            .map_err(|e| CompactError::After(std::io::Error::other(e.to_string())))?;
+        self.metrics.journal_dropped = self.metrics.journal_dropped.saturating_add(stats.segments);
         Ok(())
     }
 
@@ -136,10 +137,10 @@ impl TreeActor {
             Ok(()) => self.compact_threshold = compact_at(self.journal.len()),
             // Untouched: the next step retries.
             Err(e @ CompactError::Before(_)) => eprintln!("tree CompactionFailed: {e}"),
-            // The open file may not be the named one.
+            // The checkpoint stands; the segments not dropped wait for the next.
             Err(e @ CompactError::After(_)) => {
                 eprintln!("tree CompactionFailed: {e}");
-                self.stopped = true;
+                self.compact_threshold = compact_at(self.journal.len());
             }
         }
     }

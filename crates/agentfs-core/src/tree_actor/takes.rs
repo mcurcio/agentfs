@@ -9,7 +9,6 @@
 //! take an atomic decision at the land would have made.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
 use std::time::Instant;
 
 use super::history::builder::take_diff;
@@ -19,6 +18,7 @@ use super::history::{self, refs};
 use super::journal::durable::RecordNo;
 use super::journal::{Change, TakeHead, TakeRecord, Target};
 use super::queue::{self, Key};
+use super::recording::{Call, FileMap};
 use super::stages::{Timer, Which};
 use super::tree::EventNumber;
 use super::{Error, Result, Took, TreeActor, TreeId, referee};
@@ -419,20 +419,34 @@ impl TreeActor {
         let mut after = self.tree(tree)?.clone();
         let keys = after.shape.apply(&change, event)?;
         let by = self.agentfs();
-        self.record_step(by, change.clone(), pointers)?;
+        // The files the take leaves are in its record's tail: each saved map
+        // reads them from there, never from memory.
+        let tail = match &change {
+            Change::Take { take, .. } => take.tail(),
+            _ => Vec::new(),
+        };
+        let (_, pos) = self.record_step(by, change.clone(), pointers, &tail)?;
         self.touch(tree, seq, keys);
         if let Change::Take { take, .. } = &change {
-            for (_, file) in &take.files {
-                let Some(file) = file else { continue };
-                let bytes = file.lines.bytes();
-                let changed = after
-                    .bytes
-                    .get(&file.object)
-                    .is_some_and(|old| old[..] != bytes[..]);
+            let spans = take.spans();
+            for (identity, file) in &take.files {
+                let (Some(file), Some((at, len))) = (file, spans.get(identity)) else {
+                    continue;
+                };
+                let mut map = FileMap::empty();
+                map.apply(&Call::Write { offset: 0, len: *len }, &pos.at(*at))?;
+                map.saved_at(RecordNo::new(seq));
+                let changed = match after.bytes.get(&file.object) {
+                    Some(old) => {
+                        old.len() != *len
+                            || old.to_vec()? != tail[*at as usize..(*at + *len) as usize]
+                    }
+                    None => false,
+                };
                 if changed {
                     self.changed.push((tree, file.object));
                 }
-                after.bytes.insert(file.object, Arc::new(bytes.into()));
+                after.bytes.insert(file.object, map);
             }
         }
         self.trees.insert(tree, after);
