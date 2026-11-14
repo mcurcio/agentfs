@@ -37,7 +37,7 @@ recorded; [guarantees](../guarantees.md) says what the engine promises.
 | Several mounts, one writer | `history_service` | `HistoryServer`, `HistoryClient`, `FrontLease` |
 | Large files | `lfs` | `ObjectCache`, `Store`, `fetch`, `prune` |
 | Git-backed tree views | `tree_actor`, `state_area` | `TreeActor`, `TreeId` (a tree's identity, `root` or `fork/<n>`), `inspect`, `TreeStateArea` (the Volume domain's `StateArea` port) |
-| The domains' rows over a tree volume | `store`, `tree_actor` | `TreeStore` (the `ForkStore` and `QueueFacts` ports), `Chain`, `RowDomain`, `RowWrite`, `RowEvent` |
+| The domains' rows over a tree volume | `store`, `tree_actor` | `TreeStore` (the `ForkStore`, `ClientStore` and `QueueFacts` ports), `Chain`, `RowDomain`, `RowWrite`, `RowEvent` |
 | Line identity across saves | `tree_reconcile` | `LineMap` (runs of lines, never bytes), `LineMap::align` (git's histogram diff over two `Image`s, read a line at a time), `LineMap::append`, `LineMap::expand` (line by line, for the landing rules), `pieces` (where a merged file's lines are in its sources): the line-map library, generic over the caller's numbered version (`Id`) |
 
 ## The state area
@@ -697,7 +697,7 @@ The domains (`agentfs-volume`, `agentfs-clients`, `agentfs-trees`) keep their
 records as rows on the volume's one tree actor, through the ports in
 `agentfs_contracts::ports`. `store::TreeStore::new(recording)` implements
 them over a served volume (`Arc<Recording>`): Trees' `ForkStore` (`load`,
-`create`), Clients' `ClientStore` and `QueueFacts`. Each write is one journal step, the same commit
+`create`, `end`, `drop_fork`), Clients' `ClientStore` and `QueueFacts`. Each write is one journal step, the same commit
 point as a save: a fork's branch and its row are one record, or a row step
 holds rows alone. The store makes it durable (one group-commit fsync, outside
 the actor's lock) before it returns. Each row is the domain's value with its
@@ -709,8 +709,13 @@ The actor knows no domain. A row names its chain (`tree_actor::Chain`:
 such as `ForkCreated`, a detail, the principal as `Agentfs-By` text, and its
 pod context). `TreeActor::row(chain)` and `rows(domain)` read the rows from
 the actor's saved state, never Git, so they answer while history lags or the
-builder fails. `TreeActor::fork_with` and `record_rows` run the steps; only
-the store calls them (a clippy rule). The queue facts are the journal's too:
+builder fails. `TreeActor::fork_with`, `record_rows` and `drop_fork` run the
+steps; only the store calls them (a clippy rule). `drop_fork(fork, rows)` is one
+step that deletes the fork's branch and its queue's entries with its rows, and
+forgets the tree at once; it answers `Busy` (the store's `Refused`) while its
+upstream's queue holds an entry it queued, a file is open in it, or a fork names
+it, so a drop never needs history. `service_at()` is the pod context of an
+`agentfs` event no caller gives one for. The queue facts are the journal's too:
 `queued()`, `pending_from(fork)` (an entry `fork` queued in its upstream's
 queue) and `has_child(fork)` never wait for history. A stopped actor's
 `QueueFacts` answer empty and `false`; the next write fails `Stopped`.
@@ -720,7 +725,14 @@ tree on `Chain::Clients(tree)`: its attached clients (`ClientRow`: the id, the
 grant and the pod context) and a fork's writer claim, each entry stamped. An
 attach's step number is the client's ordinal. One `end` step removes every
 ended client with its `AttachmentEnded`, then writes `LastDetached` for each
-tree left empty.
+tree left empty. `release_claim` removes a dropped fork's writer claim with
+`ClaimReleased` (nothing to release writes nothing).
+
+`TreesService` (`agentfs-trees`) answers a second keyed `create` with its open
+fork, ends forks (`end`, `end_keyed`, and `on_last_detached` for an unkeyed
+fork), and `settle` drops each ended fork its queue facts let go;
+`ClientsService::on_fork_dropped` releases the claim. The composition root
+dispatches the events between them ([trees](../trees.md#forks-keys-end-and-the-drop)).
 
 `StoreError` from a tree actor failure: `Stopped` and an unknown fsync
 outcome are `Stopped` (the reopen decides whether the step survived); a failed

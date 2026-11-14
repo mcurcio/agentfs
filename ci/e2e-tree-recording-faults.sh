@@ -15,15 +15,16 @@ cleanup() {
   for m in "$work/main" "$work/sandbox"; do fusermount3 -uz "$m" 2>/dev/null || true; done
 }
 trap cleanup EXIT
-# `start SPEC` mounts the root and the fork's sandbox, whose writer it attaches;
-# `start SPEC root` the root alone. The fork's one writer is spent at a clean
-# unmount, so a remount after one leaves the sandbox out.
+# `start SPEC` mounts the root and the keyed fork's sandbox (made at the first
+# mount), whose writer it attaches; `start SPEC root` the root alone. The fork's
+# one writer is spent at a clean unmount, so a remount after one leaves the
+# sandbox out. Keyed, the fork stays open: no end or drop moves a count.
 start() {
   local spec=$1 views=("$work/main")
   local args=("$work/main")
   if [ "${2:-}" != root ]; then
     views+=("$work/sandbox")
-    args+=(--sandbox "$work/sandbox" --fork "$fork")
+    args+=(--fork-mount "$work/sandbox" --fork-key faults)
   fi
   AGENTFS_FAILPOINTS="$spec" "$bin" --state "$work/state" trees mount "${args[@]}" >"$work/mount.log" 2>&1 & pid=$!
   for _ in $(seq 1 200); do
@@ -55,8 +56,8 @@ for point in "${points[@]}"; do
   rm -rf "$work/state" "$work/main" "$work/sandbox"
   mkdir "$work/main" "$work/sandbox"
   "$bin" --state "$work/state" trees init --volume t
-  fork=$("$bin" --state "$work/state" trees fork)
   start ''
+  fork=$(sed -n 's/^fork tree: //p' "$work/mount.log")
   # Establish an independently observed acknowledged write before the kill.
   : > "$work/baseline.receipt"
   python3 - "$work/main/baseline" "$work/baseline.receipt" <<'PY'
@@ -130,8 +131,8 @@ for point in tree.after_ref_rebuild tree.compact_before_checkpoint tree.compact_
   rm -rf "$work/state" "$work/main" "$work/sandbox"
   mkdir "$work/main" "$work/sandbox"
   "$bin" --state "$work/state" trees init --volume t
-  fork=$("$bin" --state "$work/state" trees fork)
   start ''
+  fork=$(sed -n 's/^fork tree: //p' "$work/mount.log")
   printf saved > "$work/main/kept"
   fusermount3 -u "$work/main"; fusermount3 -u "$work/sandbox"
   wait "$pid"; pid=
@@ -161,8 +162,8 @@ printf 'PASS\ttree.init_before_format\t-\n' | tee -a "$work/results.tsv"
 rm -rf "$work/state" "$work/main" "$work/sandbox"
 mkdir "$work/main" "$work/sandbox"
 "$bin" --state "$work/state" trees init --volume t
-fork=$("$bin" --state "$work/state" trees fork)
 start ''
+fork=$(sed -n 's/^fork tree: //p' "$work/mount.log")
 python3 - "$work/main" "$work/orphan-receipt" <<'PY' >"$work/orphan-client.log" 2>&1 & client=$!
 import os, sys, time
 root, receipt = sys.argv[1:]

@@ -109,6 +109,7 @@ impl Folded {
             Change::Fork { upstream } => {
                 self.upstreams.add(seq, upstream.parse::<TreeId>()?);
             }
+            Change::Drop { fork } => self.upstreams.remove(fork.parse::<TreeId>()?),
             Change::Rename { .. } | Change::Unlink { .. } | Change::Take { .. } | Change::Rows => {}
         }
         Ok(())
@@ -302,6 +303,11 @@ impl Replay {
                 self.trees.insert(TreeId::Fork(seq), fork);
             }
             Change::Rows => {}
+            Change::Drop { fork } => {
+                let fork = fork.parse::<TreeId>()?;
+                self.trees.remove(&fork).ok_or(Error::Format)?;
+                self.pages.retain(|(tree, _), _| *tree != fork);
+            }
             Change::Take { tree, take } => {
                 let chunks = take_chunks(&mut self.bytes, seq, take.chunks)?;
                 let maps = if self.maps {

@@ -234,6 +234,12 @@ pub(super) enum Change {
     },
     /// Rows alone: no branch moves.
     Rows,
+    /// A fork dropped: its branch and every entry of its queue deleted (the
+    /// step's pointer changes); the actor, its replay and the builder forget
+    /// the tree, and the builder deletes its checkout at its copy.
+    Drop {
+        fork: String,
+    },
     /// A queue take, decided on the built snapshot. The tails of the
     /// [`Entry::Bytes`] records just before it hold the bytes of each file it
     /// leaves (`take.files` with a file, in order).
@@ -253,14 +259,14 @@ impl Change {
     /// The tree a step's build works in, and about how many bytes it writes:
     /// the bytes a save or take leaves and the listings each step writes
     /// (the lag gate's estimate; the builder's measured rate corrects it).
-    /// `None` for rows alone: they add to no tree's lag.
+    /// `None` for rows alone and for a drop: they add to no tree's lag.
     ///
     /// # Errors
     ///
     /// [`Error::Format`] for a tree that is no [`super::TreeId`].
     pub fn build_cost(&self) -> Result<Option<(super::TreeId, u64)>> {
         let (tree, bytes) = match self {
-            Self::Rows => return Ok(None),
+            Self::Rows | Self::Drop { .. } => return Ok(None),
             Self::Create { tree, .. }
             | Self::Link { tree, .. }
             | Self::Rename { tree, .. }

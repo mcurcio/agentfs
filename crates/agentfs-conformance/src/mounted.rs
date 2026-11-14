@@ -46,13 +46,18 @@ impl agentfs_contracts::ports::EventSink for NoConsumers {
     fn publish(&mut self, _: agentfs_contracts::ports::Event) {}
 }
 
+/// The sandbox fork's key: `mount` finds the fork under it at every mount,
+/// the remount after a crash included.
+const FORK_KEY: &str = "conformance";
+
 /// The sandbox's fork, made as the trial CLI makes one: through the Trees
-/// domain on the store adapter, so the fork's row is on its chain.
+/// domain on the store adapter, under [`FORK_KEY`], so the fork's row is on
+/// its chain and the mount finds it.
 fn sandbox_fork(
     recording: &std::sync::Arc<agentfs_core::tree_actor::Recording>,
 ) -> Result<EngineTree, CallError> {
     use agentfs_contracts::caps::{LaunchCap, LaunchScope, Minter};
-    use agentfs_contracts::name::LauncherId;
+    use agentfs_contracts::name::{ForkKey, LauncherId};
     use agentfs_contracts::trees::{ForkSettings, Landing, Trees};
     let store = agentfs_core::store::TreeStore::new(std::sync::Arc::clone(recording));
     let mut trees = agentfs_trees::TreesService::restore(store.clone(), store, NoConsumers)
@@ -67,8 +72,9 @@ fn sandbox_fork(
     let settings = ForkSettings {
         landing: Landing::Automatic,
     };
+    let key = ForkKey::parse(FORK_KEY).map_err(|e| CallError::new(e.to_string()))?;
     let fork = trees
-        .create(EngineTree::Root, None, settings, &cap)
+        .create(EngineTree::Root, Some(key), settings, &cap)
         .map_err(|e| CallError::new(e.to_string()))?;
     Ok(fork.into())
 }
@@ -193,11 +199,11 @@ impl Mounted {
             .stdin(Stdio::null())
             .stdout(log.try_clone().map_err(|e| io_fail("mount log", &e))?)
             .stderr(log);
-        if let Some(fork) = self.sandbox_fork() {
+        if self.sandbox_fork().is_some() {
             command
-                .arg("--sandbox")
+                .arg("--fork-mount")
                 .arg(&self.sandbox)
-                .args(["--fork", &fork.to_string()]);
+                .args(["--fork-key", FORK_KEY]);
         }
         self.child = Some(command.spawn().map_err(|e| io_fail("spawn", &e))?);
         let started = Instant::now();

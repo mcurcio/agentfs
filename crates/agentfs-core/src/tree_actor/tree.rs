@@ -411,7 +411,7 @@ impl Shape {
                 self.names.remove(path);
             }
             Change::Take { take, .. } => self.take(take, &mut keys)?,
-            Change::Save { .. } | Change::Fork { .. } | Change::Rows => {}
+            Change::Save { .. } | Change::Fork { .. } | Change::Rows | Change::Drop { .. } => {}
         }
         Ok(keys)
     }

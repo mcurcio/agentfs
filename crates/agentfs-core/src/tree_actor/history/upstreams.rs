@@ -16,6 +16,11 @@ impl Upstreams {
         self.0.insert(TreeId::Fork(fork), upstream);
     }
 
+    /// A dropped fork leaves the shape: it syncs from and lands into nothing.
+    pub(in crate::tree_actor) fn remove(&mut self, fork: TreeId) {
+        self.0.remove(&fork);
+    }
+
     /// Recovery's check: [`Error::Format`] unless every fork has a branch (`has_branch`) and
     /// its upstream is the root. Forks are made only of the root, and only the root's queue
     /// holds landings (`take_next`, `refs::owner_tips`).
@@ -116,6 +121,20 @@ mod tests {
             upstreams.forks_of(TreeId::Fork(2)).collect::<Vec<_>>(),
             [TreeId::Fork(3)]
         );
+    }
+
+    #[test]
+    fn a_removed_fork_leaves_the_shape() {
+        let mut upstreams = of(&[(1, TreeId::Root), (2, TreeId::Root)]);
+        upstreams.remove(TreeId::Fork(1));
+        assert_eq!(upstreams.upstream_of(TreeId::Fork(1)), None);
+        assert_eq!(
+            upstreams.forks_of(TreeId::Root).collect::<Vec<_>>(),
+            [TreeId::Fork(2)]
+        );
+        upstreams
+            .check_recovered(|tree| tree != TreeId::Fork(1))
+            .unwrap();
     }
 
     #[test]

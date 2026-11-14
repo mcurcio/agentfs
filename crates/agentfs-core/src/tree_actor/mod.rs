@@ -1025,6 +1025,76 @@ impl TreeActor {
         Ok(RecordNo::new(seq))
     }
 
+    /// One step: `fork`'s branch and every entry of its queue deleted, with
+    /// the rows `rows` builds (given the step's number). The fork leaves the
+    /// saved trees, upstreams, pages, heads and touched keys at once; the
+    /// builder deletes its refs and, at its copy, its checkout. Its row chains
+    /// and collision refs stay. Its writer is `agentfs` with the service's pod
+    /// context. The store adapter's alone (clippy.toml).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Busy`] while its upstream's queue holds an entry it queued
+    /// ([`TreeActor::pending_from`]), a write-open or pending close lives in
+    /// it, or a fork names it as upstream ([`TreeActor::has_child`]);
+    /// [`Error::NotFound`] for the root or no such tree; `rows`' own error; a
+    /// failed record, which changes nothing.
+    pub fn drop_fork<F>(&mut self, fork: TreeId, rows: F) -> Result<()>
+    where
+        F: FnOnce(RecordNo) -> Result<Vec<RowWrite>>,
+    {
+        self.tree(fork)?;
+        if fork.is_root() {
+            return Err(Error::NotFound);
+        }
+        if self.pending_from(fork)
+            || self.handles.values().any(|h| h.tree == fork)
+            || self.has_child(fork)
+        {
+            return Err(Error::Busy);
+        }
+        let seq = self.next;
+        let rows = rows(RecordNo::new(seq))?;
+        let queue = self.pointers.under(&refs::queue(fork));
+        let mut pointers = vec![self.change(refs::branch(fork), None)];
+        pointers.extend(
+            queue
+                .iter()
+                .map(|(name, _)| self.change(name.clone(), None)),
+        );
+        let by = self.agentfs();
+        let (recorded, _) = self.record(
+            by,
+            Change::Drop {
+                fork: fork.to_string(),
+            },
+            pointers,
+            &mut std::iter::empty(),
+            rows,
+        )?;
+        if recorded != seq {
+            return Err(Error::Format);
+        }
+        self.upstreams.remove(fork);
+        self.trees.remove(&fork);
+        self.pages.retain(|(tree, _), _| *tree != fork);
+        self.changed.retain(|(tree, _)| *tree != fork);
+        self.heads.remove(&fork);
+        self.touched.remove(&fork);
+        for (name, _) in &queue {
+            self.waiting_since.remove(name);
+        }
+        self.metrics.queued = self.metrics.queued.saturating_sub(queue.len() as u64);
+        self.after_step();
+        Ok(())
+    }
+
+    /// The history service's pod context: the `at` of an `agentfs` event no
+    /// caller gives one for.
+    pub fn service_at(&self) -> &PodContext {
+        &self.service
+    }
+
     /// A chain's row, from the actor's saved rows (never Git's copy): it
     /// answers while the builder lags or fails. `None`: no row yet.
     pub fn row(&self, chain: Chain) -> Option<String> {

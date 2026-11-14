@@ -42,6 +42,7 @@ disallowed-methods = [
     # row and makes the step durable before it returns.
     { path = "agentfs_core::tree_actor::TreeActor::fork_with", reason = "fork through agentfs_core::store::TreeStore, which writes the fork's row" },
     { path = "agentfs_core::tree_actor::TreeActor::record_rows", reason = "write rows through agentfs_core::store::TreeStore" },
+    { path = "agentfs_core::tree_actor::TreeActor::drop_fork", reason = "drop a fork through agentfs_core::store::TreeStore, which writes its row" },
 
     # An ended client's opens are saved by its session's unbind
     # (agentfs_core::session), under the lock that also removes its writer.

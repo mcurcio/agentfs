@@ -1159,3 +1159,31 @@ Page: `.claude/handoff/m1-s4-recut.md`. None blocks the slice; each is built as 
    `crates/agentfs-core/Cargo.toml` (dev: agentfs-clients), `crates/agentfs/src/domain_events.rs` (`next` is used
    now: its `expect(dead_code)` went), `Cargo.lock`, and the three `ci/` files of item 1.
 8. **Not built here:** `Draining` (S6's `on_volume_draining`), `on_fork_dropped` and `release_claim` (S5).
+
+## 2026-11-14, M1 S5 (fork lifecycle): where the re-cut page is short
+
+Page: `.claude/handoff/m1-s5-recut.md`. None blocks the slice; each is built as stated.
+1. **The probe "skip `pending_from`" survives at either site alone.** The page puts the check in two places: Trees'
+   `settle` filter and the actor's `drop_fork` (`Busy`). Each masks the other, so no single-site mutation fails
+   `an_ended_fork_drops...`. Built: that test also calls `ForkStore::drop_fork` directly while the landing is queued
+   (expects `Refused`), which kills the actor-side probe; the Trees unit test `an_ended_fork_drops_once_nothing_holds_it`
+   now sets the pending landing and the child one at a time, which kills the settle-side probe.
+2. **`ForkEnded` and `ForkDropped` carry no pod trailers**: `Trees::end`, `end_keyed` and `settle` carry no pod
+   context, so the service passes an empty one (as S3 item 2). `ClaimReleased` carries `service_at()`, as the page says.
+3. **`release_claim` of a fork with no claim writes nothing** (a fork never written, or already released): the page
+   says "one step"; an empty step for nothing to release would only add a commit.
+4. **An unkeyed fork now ends and drops at its clean unmount**, which `ci/power-loss-trees-check.sh` (reads
+   `refs/heads/$FORK` at the final replay, after the unmount) and `ci/e2e-tree-recording-faults.sh` (step counts of the
+   next mount) cannot take. Both mount a keyed fork (`--fork-key power-loss`, `--fork-key faults`), which stays open:
+   the harnesses keep their meaning. The other scripts mount an unkeyed fork; `ci/e2e-trees.sh` gains the end, drop,
+   exit 75, ended key and unkeyed end checks.
+5. **`EntryGone` at the land of a decision on a dropped fork** is built (`TreeActor::land`) but not tested: it needs a
+   decision taken unlocked and a drop interleaved before its land, which no test can order without a hook.
+6. **Files outside the owned list**, each a compile or doc need: `tree_actor/tree.rs` (`Shape::apply` arm for
+   `Change::Drop`), `crates/agentfs/src/shared.rs` (an `expect` reason naming S5), `docs/library/{core,filesystem}.md`,
+   `docs/architecture.md`, `docs/target-architecture/future/one-engine.md` (the CLI's flag name).
+7. **`--fork-read-only` excludes `--fork-writer`** (the page's `|`): a read-only fork client takes the default label.
+   `trees end` restores Clients too, so its `ForkDropped` releases the claim at once.
+8. **No state format bump** for `Change::Drop`: a journal of format 10 without one reads as before; nothing is released.
+9. **Not built here:** the model's two `drop` traces stay excluded from the library and mounted replays (the replay's
+   mapping, not this page's).

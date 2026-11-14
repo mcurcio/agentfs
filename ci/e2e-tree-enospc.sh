@@ -38,7 +38,7 @@ wait_mounted() {
 }
 sudo mount -t tmpfs -o size=32m,mode=0777 tmpfs "$work/volume"
 "$bin" --state "$work/volume/state" trees init --volume t
-"$bin" --state "$work/volume/state" trees mount "$work/main" --sandbox "$work/sandbox" >"$work/mount.log" 2>&1 & pid=$!
+"$bin" --state "$work/volume/state" trees mount "$work/main" --fork-mount "$work/sandbox" >"$work/mount.log" 2>&1 & pid=$!
 wait_mounted "$work/main" "$work/sandbox"
 python3 - "$work/main" "$work/volume/filler" "$work/receipt" <<'PY'
 import errno, os, sys

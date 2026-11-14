@@ -28,13 +28,16 @@ use serde::de::DeserializeOwned;
 
 use crate::tree_actor::{self, Chain, Recording, RowDomain, RowEvent, RowWrite, TreeActor};
 
-/// The kind of the event that creates a fork's row.
+/// The kinds of the events on a fork's Trees chain.
 const FORK_CREATED: &str = "ForkCreated";
+const FORK_ENDED: &str = "ForkEnded";
+const FORK_DROPPED: &str = "ForkDropped";
 /// The kinds of the events on a tree's Clients chain.
 const ATTACHED: &str = "Attached";
 const REBOUND: &str = "Rebound";
 const ATTACHMENT_ENDED: &str = "AttachmentEnded";
 const LAST_DETACHED: &str = "LastDetached";
+const CLAIM_RELEASED: &str = "ClaimReleased";
 
 /// The domains' stores over one served volume: Trees' and Clients' rows and
 /// the queue facts now; Volume's in S6.
@@ -166,6 +169,29 @@ fn clients_row(actor: &TreeActor, tree: TreeId) -> Result<TreeClients, tree_acto
     })
 }
 
+/// `fork`'s row moved to `phase`, stamped over its current row, as the write
+/// of its event `kind`. [`tree_actor::Error::NotFound`] for no such row.
+fn fork_phase(
+    actor: &TreeActor,
+    fork: ForkId,
+    phase: ForkPhase,
+    kind: &'static str,
+    (by, at, now): (&Principal, &PodContext, UnixNanos),
+) -> Result<RowWrite, tree_actor::Error> {
+    let chain = Chain::Trees(fork);
+    let previous = actor.row(chain).ok_or(tree_actor::Error::NotFound)?;
+    let row: Audited<ForkFacts> = serde_json::from_str(&previous)?;
+    let facts = ForkFacts { phase, ..row.value };
+    let audited = stamp(Some(&row.created), facts, by, now);
+    row_write(
+        chain,
+        &audited,
+        (kind, TreeId::from(fork).to_string()),
+        by,
+        at,
+    )
+}
+
 /// A principal as an event commit's `Agentfs-By` names it.
 fn principal(by: &Principal) -> String {
     match by {
@@ -262,18 +288,28 @@ impl ForkStore for TreeStore {
     }
 
     fn end(&mut self, fork: ForkId, by: &Principal, at: &PodContext) -> Result<(), StoreError> {
-        let _ = (fork, by, at);
-        todo!("S5")
+        self.write(|actor, now| {
+            let write = fork_phase(actor, fork, ForkPhase::Ended, FORK_ENDED, (by, at, now))?;
+            #[expect(clippy::disallowed_methods, reason = "the store's own row step")]
+            actor.record_rows(|_| Ok(vec![write]))?;
+            Ok(())
+        })
     }
 
+    /// The branch, its queue and the row's `Dropped` are one step
+    /// (`TreeActor::drop_fork`): the actor refuses it, `Busy`, while anything
+    /// holds the fork.
     fn drop_fork(
         &mut self,
         fork: ForkId,
         by: &Principal,
         at: &PodContext,
     ) -> Result<(), StoreError> {
-        let _ = (fork, by, at);
-        todo!("S5")
+        self.write(|actor, now| {
+            let write = fork_phase(actor, fork, ForkPhase::Dropped, FORK_DROPPED, (by, at, now))?;
+            #[expect(clippy::disallowed_methods, reason = "the store's own drop step")]
+            actor.drop_fork(fork.into(), |_| Ok(vec![write]))
+        })
     }
 }
 
@@ -422,9 +458,28 @@ impl ClientStore for TreeStore {
         })
     }
 
+    /// Writes nothing for a fork with no claim (never written, or released
+    /// already): idempotent, as a boot's re-judgement needs. Its event carries
+    /// the history service's pod context.
     fn release_claim(&mut self, fork: ForkId, by: &Principal) -> Result<(), StoreError> {
-        let _ = (fork, by);
-        todo!("S5")
+        let tree = TreeId::from(fork);
+        self.write(|actor, _| {
+            let mut row = clients_row(actor, tree)?;
+            let Some(claim) = row.writer_claim.take() else {
+                return Ok(());
+            };
+            let at = actor.service_at().clone();
+            let write = row_write(
+                Chain::Clients(tree),
+                &row,
+                (CLAIM_RELEASED, claim.value.to_string()),
+                by,
+                &at,
+            )?;
+            #[expect(clippy::disallowed_methods, reason = "the store's own row step")]
+            actor.record_rows(|_| Ok(vec![write]))?;
+            Ok(())
+        })
     }
 }
 

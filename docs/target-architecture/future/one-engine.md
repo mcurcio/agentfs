@@ -121,7 +121,7 @@ A CSI fork claim's fork has one lifecycle owner, Trees: CreateVolume creates it 
 idempotency key, so a repeated CreateVolume finds the same fork, and DeleteVolume ends it by that key. The launcher
 keeps no map of its own. This is a domain change proposed for the owner's review ([Trees](../domains/trees.md)).
 
-The user-facing word for these is "fork". M7 renames "sandbox" in the binary (the trial CLI's `--sandbox`) and M8 in
+The user-facing word for these is "fork". M7 renames "sandbox" in the binary (the tree CLI already says `--fork-mount`) and M8 in
 the CSI driver, its chart and [supported configurations](../../supported-configurations.md) (example 5's "sandbox
 claim" becomes a fork claim). Each milestone's gate decides the new spellings.
 

@@ -124,8 +124,9 @@ where
     ///
     /// The store's write.
     pub fn on_fork_dropped(&mut self, fork: ForkId) -> Result<(), StoreError> {
-        let _ = fork;
-        todo!("S5")
+        self.store.release_claim(fork, &Principal::Agentfs)?;
+        self.claims.remove(&fork);
+        Ok(())
     }
 
     fn attachment(&self, client: &ClientId) -> Option<&Attachment> {
@@ -462,8 +463,12 @@ mod tests {
             Ok(())
         }
 
-        fn release_claim(&mut self, _: ForkId, _: &Principal) -> Result<(), StoreError> {
-            unreachable!("S5")
+        fn release_claim(&mut self, fork: ForkId, _: &Principal) -> Result<(), StoreError> {
+            self.step += 1;
+            if let Some(row) = self.rows.get_mut(&fork.into()) {
+                row.writer_claim = None;
+            }
+            Ok(())
         }
     }
 
@@ -694,5 +699,31 @@ mod tests {
             []
         );
         assert_eq!(clients.attached_any(), ClientSet::from([kept]));
+    }
+
+    /// C4 ends at the drop: a dropped fork's claim leaves the row and the
+    /// index, and a restore finds none.
+    #[test]
+    fn a_dropped_forks_claim_is_released() {
+        let mut clients = service();
+        let root = cap("cli", LaunchScope::Root);
+        let writer = attach(&mut clients, write(TreeId::Fork(1)), &root).unwrap();
+        clients.detach(&writer, &root).unwrap();
+        assert_eq!(
+            attach(&mut clients, write(TreeId::Fork(1)), &root),
+            Err(ClientError::ForkTaken)
+        );
+        clients.on_fork_dropped(ForkId(1)).unwrap();
+        assert!(clients.claims.is_empty());
+        assert!(clients.store.rows[&TreeId::Fork(1)].writer_claim.is_none());
+        let restored = ClientsService::restore(
+            clients.store,
+            Sessions::default(),
+            Forks,
+            Events::default(),
+            minter(),
+        )
+        .unwrap();
+        assert!(restored.claims.is_empty());
     }
 }

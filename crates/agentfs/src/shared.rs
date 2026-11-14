@@ -27,7 +27,10 @@ impl<T> Shared<T> {
 
     #[cfg_attr(
         not(test),
-        expect(dead_code, reason = "slice S5's dispatcher reads Trees through it")
+        expect(
+            dead_code,
+            reason = "the root writes Trees; Clients reads it through ForkLookup"
+        )
     )]
     pub(crate) fn get(&self) -> Ref<'_, T> {
         self.0.borrow()

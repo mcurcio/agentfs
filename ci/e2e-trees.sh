@@ -19,10 +19,12 @@ cleanup() {
 trap cleanup EXIT
 mkdir "$work/main" "$work/sandbox"
 "$bin" --state "$work/state" trees init --volume t
-fork=$("$bin" --state "$work/state" trees fork)
+# The sandbox is one keyed fork: the first mount makes it, every later mount
+# under the key finds it.
+key=e2e
 start() {
     "$bin" --state "$work/state" trees mount "$work/main" \
-        --sandbox "$work/sandbox" --fork "$fork" "$@" >>"$work/mount.log" 2>&1 &
+        --fork-mount "$work/sandbox" --fork-key "$key" "$@" >>"$work/mount.log" 2>&1 &
     pid=$!
     for _ in $(seq 1 200); do
         if mountpoint -q "$work/main" && mountpoint -q "$work/sandbox"; then return; fi
@@ -185,23 +187,74 @@ fi
 # A clean unmount ended the fork's writer, and a fork has one writer for life:
 # mounting it to write again exits 1, mounting nothing.
 status=0
-"$bin" --state "$work/state" trees mount "$work/main" --sandbox "$work/sandbox" --fork "$fork" \
+"$bin" --state "$work/state" trees mount "$work/main" --fork-mount "$work/sandbox" --fork-key "$key" \
     >"$work/taken.log" 2>&1 || status=$?
 test "$status" -eq 1
-grep -F 'this fork has had its writer; mount it with --sandbox-read-only' "$work/taken.log" >/dev/null
+grep -F 'this fork has had its writer; mount it with --fork-read-only' "$work/taken.log" >/dev/null
 ! mountpoint -q "$work/main"
 ! mountpoint -q "$work/sandbox"
 # Read-only it mounts: reads answer, writes are refused.
-start --sandbox-read-only
+start --fork-read-only
 test "$(cat "$work/sandbox/restarted")" = after-restart
 if printf refused 2>/dev/null > "$work/sandbox/refused"; then
     echo "a read-only sandbox took a write" >&2
     exit 1
 fi
+# The fork's last save has landed in the root: nothing of it stays queued.
+python3 - "$work/main/restarted" <<'PY'
+import sys, time
+until = time.monotonic() + 10
+while time.monotonic() < until:
+    try:
+        if open(sys.argv[1], 'rb').read() == b'after-restart':
+            sys.exit(0)
+    except FileNotFoundError:
+        pass
+    time.sleep(0.01)
+sys.exit("the fork's save never landed")
+PY
+# While a mount holds the volume, ending the key waits: exit 75.
+status=0
+"$bin" --state "$work/state" trees end --fork-key "$key" 2>"$work/busy.log" || status=$?
+test "$status" -eq 75
 fusermount3 -u "$work/main"
 fusermount3 -u "$work/sandbox"
 wait "$pid"
 pid=
+# Ended with nothing queued and no file open, the keyed fork drops at once:
+# its branch, queue and checkout go; its row chain stays, ending ForkDropped.
+fork=$(sed -n 's/^fork tree: //p' "$work/mount.log" | sed -n 1p)
+test -n "$fork"
+"$bin" --state "$work/state" trees end --fork-key "$key"
+git_dir="$work/state/history.git"
+! git --git-dir="$git_dir" rev-parse -q --verify "refs/heads/$fork" >/dev/null
+test -z "$(git --git-dir="$git_dir" for-each-ref "refs/queue/$fork/")"
+test ! -e "$work/state/trees/$fork"
+test "$(git --git-dir="$git_dir" log -1 --format=%s "refs/agentfs/trees/$fork")" = "ForkDropped $fork"
+# Its key has ended: mounting under it exits 1, mounting nothing.
+status=0
+"$bin" --state "$work/state" trees mount "$work/main" --fork-mount "$work/sandbox" --fork-key "$key" \
+    >"$work/ended.log" 2>&1 || status=$?
+test "$status" -eq 1
+grep -F 'the fork under this --fork-key has ended' "$work/ended.log" >/dev/null
+! mountpoint -q "$work/main"
+# A fork mounted with no key is new, and ends when its last client detaches.
+: >"$work/unkeyed.log"
+"$bin" --state "$work/state" trees mount "$work/main" --fork-mount "$work/sandbox" \
+    >>"$work/unkeyed.log" 2>&1 &
+pid=$!
+for _ in $(seq 1 200); do
+    if mountpoint -q "$work/main" && mountpoint -q "$work/sandbox"; then break; fi
+    kill -0 "$pid"
+    sleep 0.1
+done
+unkeyed=$(sed -n 's/^fork tree: //p' "$work/unkeyed.log")
+test -n "$unkeyed" && test "$unkeyed" != "$fork"
+fusermount3 -u "$work/sandbox"
+fusermount3 -u "$work/main"
+wait "$pid"
+pid=
+git --git-dir="$git_dir" log --format=%s "refs/agentfs/trees/$unkeyed" | grep -Fx "ForkEnded $unkeyed" >/dev/null
 git --git-dir="$work/state/history.git" fsck --strict
 test "$mmap_status" -eq 0
 test "$tmpfile_status" -eq 0

@@ -24,8 +24,7 @@ wait_mounted() {
 }
 mkdir "$work/main" "$work/sandbox"
 "$bin" --state "$work/state" trees init --volume t
-fork=$("$bin" --state "$work/state" trees fork)
-"$bin" --state "$work/state" trees mount "$work/main" --sandbox "$work/sandbox" --fork "$fork" >"$work/mount.log" 2>&1 & pid=$!
+"$bin" --state "$work/state" trees mount "$work/main" --fork-mount "$work/sandbox" >"$work/mount.log" 2>&1 & pid=$!
 wait_mounted "$work/main"
 wait_mounted "$work/sandbox"
 result=0

@@ -210,6 +210,10 @@ pub(in crate::tree_actor) fn take_one(
 ) -> Result<Took> {
     loop {
         let inputs = actor.with(|a| {
+            // A dropped fork's queue went with it: nothing to take.
+            if !a.is_stopped() && !a.trees.contains_key(&tree) {
+                return Ok(None);
+            }
             a.tree(tree)?;
             if !a.queue_holds(tree) {
                 return Ok(None);
@@ -327,6 +331,10 @@ impl TreeActor {
         decision: Decision,
     ) -> Result<std::result::Result<EventNumber, Refused>> {
         let tree = decision.tree;
+        // A fork dropped after the decision: its entry went with it.
+        if !self.is_stopped() && !self.trees.contains_key(&tree) {
+            return Ok(Err(Refused::EntryGone));
+        }
         self.tree(tree)?;
         self.run_pending_closes(tree, None)?;
         if let Some(refused) = self.refusal(&decision)? {

@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::caps::LaunchCap;
 use crate::name::{ForkKey, LauncherId};
+use crate::ports::StoreError;
 use crate::tree::{ForkId, TreeId};
 
 /// How a fork's changes land in its upstream.
@@ -62,6 +63,20 @@ pub enum TreeError {
     ForkUnknown,
     #[error("the fork's row could not be recorded: {0:?}")]
     Io(crate::volume::IoKind),
+    #[error("the volume has stopped; reopen it")]
+    Stopped,
+}
+
+impl From<StoreError> for TreeError {
+    /// A write that changed nothing for want of room or I/O is `Io`; every
+    /// other store failure leaves the volume unable to record. `create` reads
+    /// `Refused` as `UpstreamUnknown` before this.
+    fn from(error: StoreError) -> Self {
+        match error {
+            StoreError::NotDurable(kind) => Self::Io(kind),
+            StoreError::Stopped | StoreError::Damaged(_) | StoreError::Refused(_) => Self::Stopped,
+        }
+    }
 }
 
 /// Published by Trees, each once its row is durable.
@@ -86,7 +101,7 @@ pub trait Trees: ForkLookup {
     /// # Errors
     ///
     /// `UpstreamUnknown`; `NestedNotBuilt` for a fork upstream; `Ended` for a
-    /// key whose fork has ended; `Io`.
+    /// key whose fork has ended; `Io`, `Stopped`.
     fn create(
         &mut self,
         upstream: TreeId,
@@ -95,18 +110,20 @@ pub trait Trees: ForkLookup {
         by: &LaunchCap,
     ) -> Result<ForkId, TreeError>;
 
-    /// Ends an unkeyed fork; only its creating launcher. Idempotent.
+    /// Ends an unkeyed fork; only its creating launcher or the volume's own.
+    /// Idempotent. The fork drops once nothing holds it (`ForkDropped`).
     ///
     /// # Errors
     ///
-    /// `ForkUnknown`, `NotPermitted`, `Io`.
+    /// `ForkUnknown`, `NotPermitted` (another's fork, or a keyed one), `Io`,
+    /// `Stopped`.
     fn end(&mut self, fork: ForkId, by: &LaunchCap) -> Result<(), TreeError>;
 
     /// Ends a keyed fork, for any launcher presenting the key. Idempotent.
     ///
     /// # Errors
     ///
-    /// `KeyUnknown`, `Io`.
+    /// `KeyUnknown`, `Io`, `Stopped`.
     fn end_keyed(&mut self, key: &ForkKey, by: &LaunchCap) -> Result<(), TreeError>;
 
     /// Every fork not yet dropped.

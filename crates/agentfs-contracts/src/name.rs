@@ -203,8 +203,13 @@ impl ForkKey {
     ///
     /// [`NameError`] (`what`: `fork key`).
     pub fn parse(text: &str) -> Result<Self, NameError> {
-        let _ = text;
-        todo!("S5")
+        check(
+            (1..=128).contains(&text.len()) && text.bytes().all(|b| b.is_ascii_graphic()),
+            "fork key",
+            text,
+            "1 to 128 bytes of printable ASCII with no whitespace",
+        )?;
+        Ok(Self(text.to_owned()))
     }
 
     pub fn as_str(&self) -> &str {
@@ -270,6 +275,12 @@ mod tests {
         assert!(LauncherId::parse(&"c".repeat(64)).is_ok());
         assert!(LauncherId::parse(&"c".repeat(65)).is_err());
         assert!(ClientLabel::parse(&"c".repeat(64)).is_ok());
+        assert!(ForkKey::parse(&"k".repeat(128)).is_ok());
+        assert!(ForkKey::parse("pvc-1/claim:a").is_ok());
+        for bad in ["", "a b", "a\tb", "é"] {
+            assert_eq!(ForkKey::parse(bad).unwrap_err().what, "fork key", "{bad:?}");
+        }
+        assert!(ForkKey::parse(&"k".repeat(129)).is_err());
         assert_eq!(
             ClientLabel::parse(&"c".repeat(65)).unwrap_err().what,
             "client label"

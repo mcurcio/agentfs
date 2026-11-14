@@ -12,12 +12,26 @@ design was reviewed on 2026-10-12.
 
 ### Added
 
+- **Tree views: fork keys, end and drop.** `trees mount --fork-mount DIR` mounts
+  a new fork, which ends when its view is unmounted, or with `--fork-key KEY` the
+  open fork under that key: a second create under a key returns its fork and
+  writes nothing. `trees end --fork-key KEY` ends a keyed fork (exit 75 while a
+  mount holds the volume). An ended fork drops once its upstream's queue holds
+  nothing of it, no file is open in it and no fork names it: one journal step
+  (`Change::Drop`) with its `ForkDropped` row, after which its branch, queue
+  entries and checkout are gone while its row chain, collision refs and landed
+  saves stay; its writer claim is released (`ClaimReleased`). Ends and drops are
+  commits on the fork's chain (`ForkEnded`, `ForkDropped`), judged from the
+  journal at boot, after each landing and at each end, so a failing builder holds
+  none back (docs/trees.md, "Forks: keys, end and the drop"). `trees fork`,
+  `--sandbox`, `--fork`, `--sandbox-writer` and `--sandbox-read-only` are gone:
+  use `--fork-mount`, `--fork-key`, `--fork-writer` and `--fork-read-only`.
 - **Tree views: clients and sessions.** Each view of `trees mount` is a client of
   its tree, attached through the Clients domain, and every save names it:
   `Agentfs-Writer: <label>#<n>@<launcher>/<tree>` (`root-client#5@cli/root`), its
   number the attach's journal step. A view reaches its tree only through its
   client's session (`agentfs_core::session`): a read-only client's writes answer
-  `EROFS` (`--read-only`, `--sandbox-read-only`), and a session reaches only its
+  `EROFS` (`--read-only`, `--fork-read-only`), and a session reaches only its
   own open files. A fork has one writer for life: a second read-write mount of it,
   live or after a clean unmount, exits 1. After a kill the next mount rebinds the
   client (same id, the new pod context); a clean unmount detaches it, its open
@@ -25,7 +39,7 @@ design was reviewed on 2026-10-12.
   `refs/agentfs/clients/<tree>` (`Attached`, `Rebound`, `AttachmentEnded`,
   `LastDetached`), durable before they return, never waiting for history. The
   view host is `agentfs_fuse::tree_view::ViewHost` (docs/trees.md, "Clients").
-  `--writer` and `--sandbox-writer` are now client labels: safe names of at most
+  `--writer` and `--fork-writer` are now client labels: safe names of at most
   64 bytes.
 - **Tree views: volume events on record as commits.** A fork's row is a commit
   on its own chain, `refs/agentfs/trees/fork/<n>`, beside the fork: its tree is
@@ -33,7 +47,7 @@ design was reviewed on 2026-10-12.
   (`ForkCreated`, with `Agentfs-Kind`, `Agentfs-By`, `Agentfs-Event` and the
   volume and pod trailers, `Agentfs-Format: row-1`). The fork's branch and its row
   are one journal record, durable before the call returns; the event commit is
-  built behind it. `trees fork` and a mount's new sandbox create forks through
+  built behind it. A mount's new fork is created through
   the Trees domain on the new store adapter (`agentfs_core::store::TreeStore`).
   Rows and queue facts are read from the journal, never Git, so they answer while
   the builder lags or fails (docs/trees.md, "Rows and event commits"). The tree

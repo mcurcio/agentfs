@@ -39,26 +39,28 @@ cargo build --locked -p agentfs
 mkdir -p /tmp/agentfs-trees/root /tmp/agentfs-trees/fork
 target/debug/agentfs --state /tmp/agentfs-trees/state trees init --volume trial
 target/debug/agentfs --state /tmp/agentfs-trees/state trees mount \
-  /tmp/agentfs-trees/root --sandbox /tmp/agentfs-trees/fork
+  /tmp/agentfs-trees/root --fork-mount /tmp/agentfs-trees/fork --fork-key trial
 ```
 
-Use ordinary file calls in either view. The command prints the fork's `fork/N`
-name. Reuse it with `--fork fork/N`, or make one with `trees fork`. Unmount both
-views with `fusermount3 -u PATH`; unmounting every view ends the process.
+Use ordinary file calls in either view. The command prints `fork tree: fork/N` on
+stderr. Without `--fork-key` every mount makes a new fork, which ends when its view
+is unmounted; under a key, every mount finds the same fork until `trees end
+--fork-key` ends it ([forks](#forks-keys-end-and-the-drop)). Unmount both views
+with `fusermount3 -u PATH`; unmounting every view ends the process.
 
 | Command or flag | Meaning |
 |---|---|
 | `trees init --volume NAME` | Create the volume, or find it under the same name, then recover it; prints `<name> <id> created` or `found`. Another name or another format exits 1 with nothing written |
-| `trees fork` | Create a fork of the root at its saved head; prints its identity, `fork/N` |
 | `trees mount ROOT` | Recover and mount the root on an existing empty directory. It never creates a volume: run `trees init` first |
 | `--volume NAME` (`trees mount`) | Refuse, before anything is written, a volume with another name |
 | `--owner UID:GID` | Every file's owner in the views (default: the mounting process's user and group) |
 | `--no-allow-other` | Only the mounting user reaches the views. By default other users do (FUSE `allow_other`, which needs `user_allow_other` in `/etc/fuse.conf` when the mounting user is not root) |
 | `--namespace`, `--pod`, `--pod-uid`, `--node` | Where the views run: the pod context of their commits (below) |
-| `--sandbox DIR` | Also mount a fork in DIR (a new one, or `--fork`) |
-| `--fork fork/N` | Reuse this fork (needs `--sandbox`); `root` is refused |
-| `--writer LABEL`, `--sandbox-writer LABEL` | The root's and the fork's client label (default `root-client`, `sandbox-client`): a safe name of at most 64 bytes. A label is the launcher's word, not an authenticated identity |
-| `--read-only`, `--sandbox-read-only` | Mount the root, or the fork, read-only: its client cannot write, and every write answers `EROFS` |
+| `--fork-mount DIR` | Also mount a fork of the root in DIR: a new one, or with `--fork-key` the open one under that key (made the first time) |
+| `--fork-key KEY` | The fork's key (needs `--fork-mount`): 1 to 128 bytes of printable ASCII with no whitespace. A key whose fork has ended exits 1 |
+| `--writer LABEL`, `--fork-writer LABEL` | The root's and the fork's client label (default `root-client`, `fork-client`): a safe name of at most 64 bytes. A label is the launcher's word, not an authenticated identity |
+| `--read-only`, `--fork-read-only` | Mount the root, or the fork, read-only: its client cannot write, and every write answers `EROFS`. `--fork-read-only` takes the default fork label |
+| `trees end --fork-key KEY` | End the fork under the key; it drops once nothing holds it. Exits 75 while a mount holds the volume, 1 for an unknown key |
 | `--metrics-output FILE` | Write counters, the journal's length, each stage's runs, time and git children, and the objects stored, at each built or failed event, at least every 100 ms, and at unmount; each file carries `seq`, one more each time |
 
 Mount points must be empty, separate and outside the state area. Metrics never take
@@ -116,8 +118,9 @@ no `#`, `@` or `/`, so the name parses back.
 - **One writer per fork, for life.** A fork's first read-write client claims it. The
   claim stays after the client ends, so a second read-write client is refused, while
   the first is attached and after it ends. `trees mount` then exits 1: "this fork
-  has had its writer; mount it with --sandbox-read-only or use a new fork". The
-  root has no claim.
+  has had its writer; mount it with --fork-read-only or use a new fork". The
+  root has no claim. The claim is released when the fork is dropped
+  (`ClaimReleased`).
 - **Ends.** When a view is unmounted, its client is detached. Its open files close
   as saves first, in handle order, durable before the detach returns; a write after
   that answers `EROFS`. The end is one step with `AttachmentEnded`, then
@@ -137,15 +140,15 @@ reconcile ends what it left.
 
 ## Rows and event commits
 
-The volume's own events (a fork created, clients attached, rebound and ended, and
-in later slices forks ended and dropped and the volume's lifecycle) are on record
+The volume's own events (a fork created, ended and dropped, clients attached,
+rebound and ended, and in a later slice the volume's lifecycle) are on record
 like file changes: each is a commit in the volume's repository, on a chain of commits beside
 the tree it concerns.
 
 | Chain | Holds |
 |---|---|
-| `refs/agentfs/trees/fork/<n>` | fork `n`'s row; kept after the fork is dropped |
-| `refs/agentfs/clients/<tree>` | the clients attached to a tree and a fork's writer claim (`Attached`, `Rebound`, `AttachmentEnded`, `LastDetached`) |
+| `refs/agentfs/trees/fork/<n>` | fork `n`'s row (`ForkCreated`, `ForkEnded`, `ForkDropped`); kept after the fork is dropped |
+| `refs/agentfs/clients/<tree>` | the clients attached to a tree and a fork's writer claim (`Attached`, `Rebound`, `AttachmentEnded`, `LastDetached`, `ClaimReleased`) |
 | `refs/agentfs/volume` | the volume's lifecycle |
 
 Each event commit's tree is one file, `row.json`: the row's value after the event
@@ -175,7 +178,7 @@ life; `git show refs/agentfs/trees/fork/3:row.json` is its row now.
 
 - **One record.** A fork's create is one journal record: its branch and its row,
   committed together or not at all, made durable (one group-commit fsync, outside
-  the actor's lock) before `trees fork` or a mount's new fork returns. Its event
+  the actor's lock) before a mount's new fork returns. Its event
   commit is built behind, with the step's batch, as a save's commit is.
 - **Read from the journal.** Rows are read from the actor's saved state, never Git:
   they answer while the builder lags or fails, and a row step never waits at the lag
@@ -183,6 +186,39 @@ life; `git show refs/agentfs/trees/fork/3:row.json` is its row now.
   records.
 - **Local for now.** The row chains are kept in the volume's repository; pushing
   them to remotes comes with replication.
+
+## Forks: keys, end and the drop
+
+A fork is open, then ended, then dropped. Its row on `refs/agentfs/trees/fork/<n>`
+says which, and every move is one journal step with its event commit, durable
+before the call returns.
+
+- **Keys.** A launcher may create a fork under a key (`--fork-key`). A second create
+  under the key returns the open fork and writes nothing; once that fork has ended,
+  the key answers "ended" and makes no new fork.
+- **End.** A fork created without a key ends when its last client detaches (the
+  view is unmounted), by `agentfs`, or when its creating launcher (or the volume's
+  own) ends it. A keyed fork ends only by its key (`trees end --fork-key`), for any
+  launcher that presents it: a fork claim outlives the pods that mount it. An ended
+  fork is never written again.
+- **Drop.** An ended fork drops once its upstream's queue holds nothing it put
+  there (every save has reached the referee), no file is open in it and no fork
+  names it as upstream. The drop is one step with `ForkDropped`: the fork's branch
+  and every entry of its own queue go, and the builder deletes its refs and then
+  its checkout. Its row chain and the collision refs of its losing saves stay; its
+  landed saves stay reachable from the root's landing merges. Its sync merges carry
+  no edits of its own and become unreachable (`git fsck` lists them as dangling).
+- **When.** The drop is judged at boot, after each landing a view host takes, and at
+  each end; each judgement asks the journal, never history, so a failing builder
+  holds no drop back. A drop that meets an open file waits for the next judgement.
+- **Restart.** A drop on record is a drop after a crash: the restart forgets the
+  fork, deletes a checkout a crash left, and builds what was not built. A take of a
+  dropped fork finds nothing to take; one decided before the drop is refused when
+  it would land.
+
+The journal records a drop as `Change::Drop { fork }`: its pointer changes delete
+the branch and the queue entries, and the actor, the restart's replay and the
+builder each forget the tree.
 
 ## What a tree does
 

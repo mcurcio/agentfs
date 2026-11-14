@@ -56,7 +56,7 @@ dmsetup message "$lw" 0 mark mkfs
 mount "/dev/mapper/$lw" "$work/mnt" || notrun "cannot mount $fs test filesystem"
 export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null
 "$AGENTFS_BIN" --state "$work/mnt/state" trees init --volume t
-"$AGENTFS_BIN" --state "$work/mnt/state" trees mount "$work/main" --sandbox "$work/sandbox" \
+"$AGENTFS_BIN" --state "$work/mnt/state" trees mount "$work/main" --fork-mount "$work/sandbox" --fork-key power-loss \
   --metrics-output "$work/metrics.json" >"$work/mount.log" 2>&1 & pid=$!
 for _ in $(seq 1 200); do
   if mountpoint -q "$work/main" && mountpoint -q "$work/sandbox"; then break; fi
@@ -161,7 +161,7 @@ dmsetup remove "$lw"
 export REPLAY_DEV=$replay COW_DEV=$cow CHECK_MNT=$work/check CHECK_DM=$ck CHECK_COUNT=$work/count
 export FS=$fs AGENTFS_BIN RESULTS=$results EXTERNAL_RECEIPTS=$work/external-receipts
 export FORK
-FORK=$(sed -n 's/^sandbox tree: //p' "$work/mount.log")
+FORK=$(sed -n 's/^fork tree: //p' "$work/mount.log")
 [ -n "$FORK" ] || notrun 'mount log names no sandbox tree'
 : > "$CHECK_COUNT"
 # Replay each returned-call mark from an empty device. Reusing the final image

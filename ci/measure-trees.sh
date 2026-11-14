@@ -36,7 +36,7 @@ if [ ! -c /dev/fuse ] || [ ! -x "$bin" ]; then notrun 'missing /dev/fuse or exec
 if ! "$bin" --state "$work/state" trees init --volume t >"$work/init.log" 2>&1; then notrun 'tree init failed; see CI log'; cat "$work/init.log" >&2; exit 1; fi
 # The mount's log sits beside the report, so a run that is cut still has it.
 mount_log="$out.mount.log"
-"$bin" --state "$work/state" trees mount "$work/main" --sandbox "$work/sandbox" --metrics-output "$work/metrics.json" >"$mount_log" 2>&1 &
+"$bin" --state "$work/state" trees mount "$work/main" --fork-mount "$work/sandbox" --metrics-output "$work/metrics.json" >"$mount_log" 2>&1 &
 pid=$!
 for _ in $(seq 1 200); do
     if mountpoint -q "$work/main" && mountpoint -q "$work/sandbox"; then break; fi

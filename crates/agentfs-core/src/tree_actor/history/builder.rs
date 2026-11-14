@@ -202,6 +202,7 @@ struct Batch<'a> {
     values: Vec<(RecordNo, String, Parent)>,
     /// The last commit each scratch ref got.
     scratch: BTreeMap<BuildRef, u64>,
+    /// A fork made or dropped: `config`'s branch merges change.
     forked: bool,
     /// Trees whose names or objects a step moved.
     moved: BTreeSet<TreeId>,
@@ -724,6 +725,22 @@ impl BuildState {
                 batch.moved.insert(id);
             }
             Change::Rows => {}
+            Change::Drop { fork } => {
+                // Its branch and queue entries go with the step's pointer
+                // changes; its checkout at the copy.
+                let fork = fork.parse::<TreeId>()?;
+                if self.opens.values().any(|o| o.tree == fork) {
+                    return Err(disagrees(seq));
+                }
+                self.trees.remove(&fork).ok_or_else(|| disagrees(seq))?;
+                self.upstreams.remove(fork);
+                self.objects.remove(&fork);
+                self.whole.remove(&fork);
+                self.pages.retain(|(tree, _), _| *tree != fork);
+                batch.moved.remove(&fork);
+                batch.files.retain(|(tree, _)| *tree != fork);
+                batch.forked = true;
+            }
         }
         if let Some(head) = head {
             self.heads.insert(record.seq, head);
@@ -1228,8 +1245,23 @@ impl Builder {
         }
         let old = std::mem::replace(&mut self.copied, built.clone());
         crate::failpoints::hit("tree.build_after_ref_copy")?;
+        // A dropped fork's checkout goes after its refs.
+        let branches = refs::branches(built)?;
+        let dropped: Vec<TreeId> = self
+            .checked_out
+            .keys()
+            .copied()
+            .filter(|tree| !branches.contains_key(tree))
+            .collect();
+        for tree in dropped {
+            self.checked_out.remove(&tree);
+            remove_checkout(&self.root, tree)?;
+        }
+        if self.stale {
+            remove_stale_checkouts(&self.root, &branches)?;
+        }
         let mut rewritten = Vec::new();
-        for (tree, head) in refs::branches(built)? {
+        for (tree, head) in branches {
             if !self.stale && old.get(&refs::branch(tree)) == Some(head) {
                 continue;
             }
@@ -1254,9 +1286,41 @@ pub(in crate::tree_actor) fn copy_all(
     repo.write_config(&refs::head(), &upstreams.merges())?;
     repo.rebuild_refs(&pointers.creates())?;
     crate::failpoints::hit("tree.after_ref_rebuild")?;
+    let branches = refs::branches(pointers)?;
+    remove_stale_checkouts(root, &branches)?;
     let mut checked_out = BTreeMap::new();
-    for (tree, head) in refs::branches(pointers)? {
+    for (tree, head) in branches {
         checked_out.insert(tree, checkout(repo, root, tree, head, None)?);
     }
     Ok(checked_out)
+}
+
+/// Deletes `tree`'s checkout, if it has one.
+fn remove_checkout(root: &Path, tree: TreeId) -> Result<()> {
+    match std::fs::remove_dir_all(root.join("trees").join(tree.to_string())) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
+        _ => Ok(()),
+    }
+}
+
+/// Deletes each fork's checkout whose branch is gone: a dropped fork's, left
+/// by a copy that failed or a process that died before it.
+fn remove_stale_checkouts(root: &Path, branches: &BTreeMap<TreeId, Oid>) -> Result<()> {
+    let forks = root.join("trees").join("fork");
+    let entries = match std::fs::read_dir(&forks) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+    for entry in entries {
+        let name = entry?.file_name();
+        let tree = format!("fork/{}", name.to_string_lossy()).parse::<TreeId>();
+        match tree {
+            Ok(tree) if branches.contains_key(&tree) => {}
+            Ok(tree) => remove_checkout(root, tree)?,
+            // Nothing a tree's checkout is named: never agentfs's to delete.
+            Err(_) => {}
+        }
+    }
+    Ok(())
 }

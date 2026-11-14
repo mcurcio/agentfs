@@ -646,18 +646,24 @@ replacement for `mount`.
 
 ```sh
 agentfs --state STATE trees init --volume NAME
-agentfs --state STATE trees mount ROOT --sandbox SANDBOX
+agentfs --state STATE trees mount ROOT --fork-mount FORK [--fork-key KEY]
+agentfs --state STATE trees end --fork-key KEY
 ```
 
-`trees mount` recovers and mounts the root's view, and with `--sandbox` also a
-sandbox fork (`fork/N`) of it; it never creates a volume. Each view is a client
-of its tree: the command rebinds the client a killed mount left (same launcher,
+`trees mount` recovers and mounts the root's view, and with `--fork-mount` also a
+fork (`fork/N`) of it: a new one, which ends when its view is unmounted, or the
+open fork under `--fork-key`; it never creates a volume. Each view is a client of
+its tree: the command rebinds the client a killed mount left (same launcher,
 tree, label and access), else attaches one, then ends its launcher's other
-clients, and detaches each client as its view ends ([trees](../trees.md#clients)).
-`--writer` and `--sandbox-writer` are the clients' labels; `--read-only` and
-`--sandbox-read-only` make a client read-only. A fork's second read-write client
-exits 1. `--fork fork/N` reuses a sandbox, and `trees fork` makes one and prints
-its name. The views mount with FUSE `allow_other` unless `--no-allow-other`
+clients and drops the ended forks nothing holds, and detaches each client as its
+view ends ([trees](../trees.md#clients)). One dispatcher hands each domain event
+to its consumer after the call that caused it: `LastDetached` to Trees (an
+unkeyed fork ends), `ForkDropped` to Clients (its writer claim is released), and
+each landing the view host takes makes Trees judge the drops again
+([forks](../trees.md#forks-keys-end-and-the-drop)). `--writer` and
+`--fork-writer` are the clients' labels; `--read-only` and `--fork-read-only`
+make a client read-only. A fork's second read-write client exits 1. `trees end`
+ends a keyed fork (exit 75 while a mount holds the volume). The views mount with FUSE `allow_other` unless `--no-allow-other`
 (`MountOptions`), every file presented as `--owner`, and `--metrics-output FILE`
 writes counters every 100 ms and at unmount. Unmount every view to exit.
 
