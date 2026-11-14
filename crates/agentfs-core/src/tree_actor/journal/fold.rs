@@ -1,4 +1,6 @@
-//! What a journal's frames add up to: the fold recovery starts from (target git-model §12).
+//! What a journal's frames add up to: the fold recovery starts from, and each
+//! tree's object numbers, whose one home is the journal (target git-model §3,
+//! §12).
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -8,8 +10,10 @@ use git2::Oid;
 use super::durable::RecordNo;
 use super::{Change, Entry, Frame, OpenRecord, Record, RunHead, Target};
 use crate::tree_actor::history::upstreams::Upstreams;
+use crate::tree_actor::history::{Objects, objects_of};
 use crate::tree_actor::pointers::Pointers;
 use crate::tree_actor::recording::{Call, pages};
+use crate::tree_actor::tree::{EventNumber, Shape};
 use crate::tree_actor::{Error, Result, TreeId};
 
 /// A live write-open: a journal [`OpenRecord`] with its tree parsed.
@@ -50,6 +54,8 @@ pub(in crate::tree_actor) struct Folded {
     pub(in crate::tree_actor) pointers: Pointers<Target>,
     /// The checkpoint's redo start: its pointers' oids are as of this record.
     pub(in crate::tree_actor) built: RecordNo,
+    /// Each tree's object numbers as of `built`, from the checkpoint.
+    pub(in crate::tree_actor) objects: BTreeMap<TreeId, Objects>,
     /// Each fork's upstream. The root has none.
     pub(in crate::tree_actor) upstreams: Upstreams,
     pub(in crate::tree_actor) next_seq: u64,
@@ -113,6 +119,90 @@ impl Folded {
     }
 }
 
+/// Each tree's object numbers after the steps of `frames`, which follow the
+/// checkpoint folded in `checkpoint`; `shapes` are the trees' shapes at its
+/// built point. Each step's own transition ([`Shape::apply`], [`Shape::save`],
+/// a fork's copy), the one the actor ran at the call: object numbers are the
+/// journal's, never history's.
+///
+/// # Errors
+///
+/// [`Error::Format`] for a step naming a tree or open the journal lacks; a
+/// transition's own failure.
+pub(in crate::tree_actor) fn objects_through(
+    mut shapes: BTreeMap<TreeId, Shape>,
+    checkpoint: &Folded,
+    frames: &[Frame],
+) -> Result<BTreeMap<TreeId, Objects>> {
+    let mut opens: BTreeMap<u64, (TreeId, u64)> = BTreeMap::new();
+    for (handle, folded) in &checkpoint.opens {
+        let open = &folded.open;
+        if open.anonymous {
+            shapes
+                .get_mut(&open.tree)
+                .ok_or(Error::Format)?
+                .add_anonymous(open.object);
+        }
+        opens.insert(*handle, (open.tree, open.object));
+    }
+    for (record, _) in frames {
+        let seq = record.seq.get();
+        match &record.entry {
+            Entry::Open { tree, object, .. } => {
+                opens.insert(seq, (tree.parse()?, *object));
+            }
+            Entry::AnonymousOpen { tree, .. } => {
+                let tree = tree.parse::<TreeId>()?;
+                shapes
+                    .get_mut(&tree)
+                    .ok_or(Error::Format)?
+                    .add_anonymous(seq);
+                opens.insert(seq, (tree, seq));
+            }
+            Entry::Step { change, .. } => match change {
+                Change::Fork { upstream } => {
+                    let mut shape = shapes
+                        .get(&upstream.parse::<TreeId>()?)
+                        .ok_or(Error::Format)?
+                        .clone();
+                    for object in std::mem::take(&mut shape.anonymous) {
+                        shape.drop_object(object);
+                    }
+                    shapes.insert(TreeId::Fork(seq), shape);
+                }
+                Change::Save {
+                    handle, outcome, ..
+                } => {
+                    let (tree, object) = opens.remove(handle).ok_or(Error::Format)?;
+                    shapes
+                        .get_mut(&tree)
+                        .ok_or(Error::Format)?
+                        .save(object, *outcome);
+                }
+                Change::Create { tree, .. }
+                | Change::Link { tree, .. }
+                | Change::Rename { tree, .. }
+                | Change::Unlink { tree, .. }
+                | Change::Take { tree, .. } => {
+                    let tree = tree.parse::<TreeId>()?;
+                    shapes
+                        .get_mut(&tree)
+                        .ok_or(Error::Format)?
+                        .apply(change, EventNumber::new(seq))?;
+                    if matches!(change, Change::Create { .. }) {
+                        opens.insert(seq, (tree, seq));
+                    }
+                }
+            },
+            Entry::Checkpoint { .. } | Entry::Call { .. } | Entry::PageWrite { .. } => {}
+        }
+    }
+    shapes
+        .iter()
+        .map(|(tree, shape)| Ok((*tree, objects_of(shape)?)))
+        .collect()
+}
+
 pub(in crate::tree_actor) fn parse_oid(hex: &str) -> Result<Oid> {
     Oid::from_str(hex).map_err(|_| Error::Format)
 }
@@ -157,6 +247,7 @@ pub(in crate::tree_actor) fn fold(frames: &[Frame]) -> Result<Folded> {
                     upstreams,
                     opens,
                     page_saved,
+                    objects,
                 },
             ..
         },
@@ -176,6 +267,10 @@ pub(in crate::tree_actor) fn fold(frames: &[Frame]) -> Result<Folded> {
                 .collect::<Result<_>>()?,
         ),
         built: *built,
+        objects: objects
+            .iter()
+            .map(|(tree, objects)| Ok((tree.parse::<TreeId>()?, objects.clone())))
+            .collect::<Result<_>>()?,
         upstreams: Upstreams::default(),
         next_seq: next.get(),
         opens: BTreeMap::new(),

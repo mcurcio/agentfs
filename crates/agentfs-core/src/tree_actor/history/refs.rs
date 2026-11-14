@@ -60,11 +60,6 @@ pub(in crate::tree_actor) fn collision(tree: TreeId, loser: Oid) -> String {
     format!("{COLLISIONS}{tree}/{loser}")
 }
 
-/// A tree's object table: `refs/agentfs/objects/<tree>`.
-pub(in crate::tree_actor) fn object_table(tree: TreeId) -> String {
-    format!("refs/agentfs/objects/{tree}")
-}
-
 /// The tips that reach every save's commit: branches, the root's queue (only it holds
 /// landings; syncs are blobs), collision refs.
 pub(in crate::tree_actor) fn owner_tips(pointers: &Pointers) -> Vec<Oid> {
@@ -118,9 +113,6 @@ mod tests {
             collision(FORK_7, loser),
             format!("refs/collisions/fork/7/{}", "ab".repeat(20))
         );
-        assert_eq!(object_table(TreeId::Root), "refs/agentfs/objects/root");
-        assert_eq!(object_table(FORK_7), "refs/agentfs/objects/fork/7");
-        assert_eq!(object_table(FORK_70), "refs/agentfs/objects/fork/70");
     }
 
     #[test]
@@ -165,7 +157,6 @@ mod tests {
                 (queue_entry(TreeId::Root, EventNumber::new(5)), oid(2)),
                 (queue_entry(FORK_7, EventNumber::new(5)), oid(3)),
                 (collision(TreeId::Root, oid(4)), oid(4)),
-                (object_table(TreeId::Root), oid(5)),
             ]
             .into_iter()
             .collect(),

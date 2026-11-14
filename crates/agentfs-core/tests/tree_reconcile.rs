@@ -28,3 +28,32 @@ fn alignment_retains_identity_and_exact_binary_bytes() {
         .unwrap();
     assert_eq!(decoded, edited);
 }
+
+/// Against an empty old image the alignment's hunks are git's, with no child:
+/// each input's every line is new.
+#[test]
+fn an_empty_old_image_aligns_as_git_does() {
+    let inputs: [&[u8]; 9] = [
+        b"",
+        b"x",
+        b"x\n",
+        b"a\nb\nc\n",
+        b"a\nb\nno newline",
+        b"\n",
+        b"\n\n\n",
+        b"a\0b\nbinary\0\n\xff\xfe",
+        b"repeat\nrepeat\nrepeat\n",
+    ];
+    for new in inputs {
+        let ours = agentfs_core::tree_reconcile::histogram(b"", new).unwrap();
+        let git = agentfs_align::histogram(b"", new).unwrap();
+        assert_eq!(ours, git, "{new:?}");
+        let map = save(&LineMap::default(), new, "n");
+        assert_eq!(map.bytes(), new);
+        assert!(
+            map.lines
+                .iter()
+                .all(|l| map.ancestors[&l.version].is_none())
+        );
+    }
+}

@@ -5,7 +5,7 @@
     reason = "a test reads the store History writes"
 )]
 use agentfs_core::tree_actor::{TreeActor, TreeId};
-use trees::{new_actor, writer};
+use trees::{fanned, new_actor, writer};
 
 const ROOT: TreeId = TreeId::Root;
 use agentfs_core::tree_git::TreeGit;
@@ -31,16 +31,18 @@ fn drain(v: &mut TreeActor) {
 
 /// The bytes of each live line of `path` in the commit's own line map.
 fn live_lines(repo: &TreeGit, head: git2::Oid, path: &str) -> Vec<Vec<u8>> {
-    let tree = repo.read_commit(head).unwrap().tree;
-    let metadata = repo
-        .list_tree(tree)
-        .unwrap()
-        .into_iter()
-        .find(|e| e.name == b"metadata.json")
-        .unwrap();
-    let metadata: serde_json::Value =
-        serde_json::from_slice(&repo.read_blob(metadata.oid).unwrap()).unwrap();
-    metadata[path][2]["lines"]
+    let mut oid = repo.read_commit(head).unwrap().tree;
+    for part in format!("lines/{}", fanned(path)).split('/') {
+        oid = repo
+            .list_tree(oid)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == part.as_bytes())
+            .unwrap()
+            .oid;
+    }
+    let map: serde_json::Value = serde_json::from_slice(&repo.read_blob(oid).unwrap()).unwrap();
+    map[1]["lines"]
         .as_array()
         .unwrap()
         .iter()

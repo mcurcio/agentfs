@@ -48,14 +48,14 @@ use history::{check_objects, clean_packs, read_trees, refs, remove_stale_locks, 
 pub use journal::durable::{Durability, DurableError, RecordNo};
 use journal::{
     Change, CompactError, Entry, FoldedOpen, Journal, PointerChange, Record, Target, compact_at,
-    fold,
+    fold, objects_through,
 };
 use pointers::Pointers;
 use recording::{Handle, pages};
 use stages::Stages;
 use tree::{EventNumber, SavedTree};
 
-const FORMAT: &str = "agentfs-trees-6\n";
+const FORMAT: &str = "agentfs-trees-7\n";
 /// The volume identity file: [`VolumeIdentity`] as JSON, written once by
 /// [`TreeActor::create`], read before any write at every open.
 const IDENTITY: &str = "volume";
@@ -416,6 +416,7 @@ impl TreeActor {
                     upstreams: BTreeMap::new(),
                     opens: Vec::new(),
                     page_saved: Vec::new(),
+                    objects: BTreeMap::new(),
                 },
             },
         )?;
@@ -498,7 +499,20 @@ impl TreeActor {
         let at_built = fold(&frames[..upto])?;
         let pointers = resolve_pointers(&at_built.pointers, &values)?;
         check_objects(&repo, &pointers)?;
-        let trees = read_trees(&repo, &pointers)?;
+        // Object numbers as of the built point: the checkpoint's, moved by
+        // the steps built after it, on the trees as the checkpoint has them.
+        let objects = if built > folded_built {
+            let checkpoint = fold(&frames[..1])?;
+            let at_checkpoint = resolve_pointers(&checkpoint.pointers, &values)?;
+            let shapes = read_trees(&repo, &at_checkpoint, &checkpoint.objects)?
+                .into_iter()
+                .map(|(tree, t)| (tree, t.shape))
+                .collect();
+            objects_through(shapes, &checkpoint, &frames[1..upto])?
+        } else {
+            at_built.objects.clone()
+        };
+        let trees = read_trees(&repo, &pointers, &objects)?;
         at_built
             .upstreams
             .check_recovered(|fork| trees.contains_key(&fork))?;
@@ -520,7 +534,11 @@ impl TreeActor {
             &owners,
             heads,
         )?;
-        let history = History::new(repo, built, pointers.clone(), owners);
+        let objects = objects
+            .into_iter()
+            .map(|(tree, objects)| (tree, Arc::new(objects)))
+            .collect();
+        let history = History::new(repo, built, pointers.clone(), owners, objects);
         history.checkpointed(folded_built);
         let builder = Builder {
             state,
@@ -594,10 +612,14 @@ impl TreeActor {
         volume.settle()?;
         let snapshot = volume.history.snapshot();
         volume.pointers = snapshot.pointers().to_targets();
-        volume.trees = read_trees(snapshot.repo(), snapshot.pointers())?
-            .iter()
-            .map(|(id, tree)| (*id, SavedTree::of(tree)))
-            .collect();
+        volume.trees = read_trees(
+            snapshot.repo(),
+            snapshot.pointers(),
+            &snapshot.all_objects(),
+        )?
+        .iter()
+        .map(|(id, tree)| (*id, SavedTree::of(tree)))
+        .collect();
         for (handle, FoldedOpen { open, calls }) in folded.opens {
             let tree = volume.trees.get_mut(&open.tree).ok_or(Error::Format)?;
             if open.anonymous {
@@ -856,18 +878,15 @@ impl TreeActor {
         count
     }
 
-    /// The pointer changes a step that saves `tree` publishes: its branch and
-    /// object table at this step's commit, and one entry per destination,
+    /// The pointer changes a step that saves `tree` publishes: its branch at
+    /// this step's commit, and one entry per destination,
     /// numbered by the step (order across restart, independent of commit
     /// dates). A tree's head moves to its upstream as a landing and to each
     /// tree it is the upstream of as a sync.
     fn publish(&mut self, tree: TreeId, seq: u64) -> Vec<PointerChange> {
         let step = Target::Step(RecordNo::new(seq));
         let event = EventNumber::new(seq);
-        let mut pointers = vec![
-            self.change(refs::branch(tree), Some(step.clone())),
-            self.change(refs::object_table(tree), Some(step.clone())),
-        ];
+        let mut pointers = vec![self.change(refs::branch(tree), Some(step.clone()))];
         let mut enqueued = 0;
         if let Some(upstream) = self.upstream_of(tree) {
             pointers.push(PointerChange {

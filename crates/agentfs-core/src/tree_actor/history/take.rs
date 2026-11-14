@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use git2::Oid;
 
+use super::Objects;
 use super::built::BuiltSnapshot;
 use super::format::read_snapshot;
 use super::message;
@@ -97,7 +98,11 @@ pub(in crate::tree_actor) fn plan_landing(
     let commit = repo.read_commit(incoming)?;
     let base = *commit.parents.first().ok_or(Error::Format)?;
     let source = message::tree_of(&commit.message)?.ok_or(Error::Format)?;
-    let files = referee::touches(&read_snapshot(repo, base)?, &read_snapshot(repo, incoming)?);
+    let objects = snapshot.objects(source);
+    let files = referee::touches(
+        &read_snapshot(repo, base, objects)?,
+        &read_snapshot(repo, incoming, objects)?,
+    );
     Ok(queue::Plan { source, files })
 }
 
@@ -112,9 +117,12 @@ pub(in crate::tree_actor) fn decide_landing(
     let current = snapshot.head(tree).ok_or(Error::NotFound)?;
     let incoming_commit = repo.read_commit(incoming)?;
     let base_commit = *incoming_commit.parents.first().ok_or(Error::Format)?;
+    // A file new to `tree` comes on the object its writer's tree has it on.
+    let source = message::tree_of(&incoming_commit.message)?.ok_or(Error::Format)?;
+    let objects = snapshot.objects(source);
     let (base, theirs) = (
-        read_snapshot(repo, base_commit)?,
-        read_snapshot(repo, incoming)?,
+        read_snapshot(repo, base_commit, objects)?,
+        read_snapshot(repo, incoming, objects)?,
     );
     let prior = prior_decisions(repo, current)?;
     let decision = {
@@ -167,8 +175,9 @@ pub(in crate::tree_actor) fn plan_sync(
         cursor = *parent;
     }
     todo.reverse();
+    let objects = snapshot.objects(upstream);
     queue::cut(todo, open, |last: Option<&SyncStep>, oid| {
-        let parent = read_snapshot(repo, oid)?;
+        let parent = read_snapshot(repo, oid, objects)?;
         let undecided = referee::undecided(
             fork_snapshot,
             &mut LandedInto {
@@ -211,7 +220,7 @@ fn last_lines(
         let Some(previous) = repo.read_commit(cursor)?.parents.first().copied() else {
             break;
         };
-        let snapshot = read_snapshot(repo, previous)?;
+        let snapshot = read_snapshot(repo, previous, &Objects::new())?;
         wanted.retain(|id| match snapshot.files.get(id) {
             Some(file) => {
                 lines.insert(*id, file.lines.clone());
@@ -259,7 +268,7 @@ pub(in crate::tree_actor) fn decide_sync(
             entry_done,
         });
     };
-    let parent = read_snapshot(snapshot.repo(), target)?;
+    let parent = read_snapshot(snapshot.repo(), target, snapshot.objects(upstream))?;
     // R6.1: a sync that can fast-forward does. It can when nothing of the fork waits
     // for the upstream and the sync shows what the upstream's commit shows (the
     // model's `World::sync`). The fork then takes that commit's line maps and names,
