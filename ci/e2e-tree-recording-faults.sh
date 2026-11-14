@@ -26,10 +26,16 @@ start() {
   echo 'mount startup timed out' >&2; return 1
 }
 # Takes run on the view's worker. Let them finish before the kill, so the failpoint
-# meets the client's call rather than a leftover take.
+# meets the client's call rather than a leftover take. Git's refs trail the journal
+# (docs/trees.md, "History trails the files"): an empty queue in git means drained
+# only once the sandbox's head holds the last save's sync, which took its entry.
 drain_queue() {
+  local gitdir=$work/state/history.git
   for _ in $(seq 1 300); do
-    [ -n "$(git --git-dir="$work/state/history.git" for-each-ref refs/queue)" ] || return 0
+    if tree_git_file "$gitdir" "refs/heads/$fork" "$1" >/dev/null 2>&1 &&
+       [ -z "$(git --git-dir="$gitdir" for-each-ref refs/queue)" ]; then
+      return 0
+    fi
     sleep .1
   done
   echo 'queue did not drain' >&2; return 1
@@ -55,7 +61,7 @@ os.fsync(fd); receipt('fsync')
 os.close(fd); receipt('close')
 PY
   : > "$work/main/candidate"
-  drain_queue
+  drain_queue candidate
   fusermount3 -u "$work/main"; fusermount3 -u "$work/sandbox"
   wait "$pid"; pid=
   case "$point" in
