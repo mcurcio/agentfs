@@ -105,7 +105,7 @@ def main():
     host = mount(binary, state, root, log)
 
     check("the file holds what returned before the kill", held.read_bytes(), expected)
-    check("root history holds the same", read(state / "history.git", "root", "held", expected), expected)
+    check("root history holds the same", read(state / "history.git", "root", "held"), expected)
     check("one save besides the create", len(saves_of(state, "held")), 2)
     check("a file replaced before the kill stays the replacement",
           replaced.read_bytes(), b"replacement before the kill")
@@ -115,7 +115,7 @@ def main():
     write_fails("the old handle's write after the replacement", fd)
     check("the replacement is unchanged", held.read_bytes(), b"replacement")
     check("root history holds the replacement",
-          read(state / "history.git", "root", "held", b"replacement"), b"replacement")
+          read(state / "history.git", "root", "held"), b"replacement")
 
     view.close()
     for stale in (fd, old):

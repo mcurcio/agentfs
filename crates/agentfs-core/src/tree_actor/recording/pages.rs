@@ -24,11 +24,13 @@
 //! journal's page-write records; bases and image die with the kernel's pages.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
 use super::{Call, Handle};
-use crate::tree_actor::{Error, Result, TreeActor, TreeId};
+use crate::tree_actor::tree::EventNumber;
+use crate::tree_actor::{Draft, Error, Result, Saved, TreeActor, TreeId};
 
 /// The bases' unit. Every kernel page size is a multiple of it, so a base map at
 /// this size is exact whatever the kernel's own page size is.
@@ -139,41 +141,42 @@ fn over_touched(run: &Run, touched: &[(u64, u64)]) -> Vec<Run> {
     pieces
 }
 
-/// Which page-write pieces a close of an open applies, each with its page
-/// write's journal number: a page write above `saved_through` whole; one at or
-/// below it and newer than the open's first call, only over bytes the open's
-/// own earlier calls touched. A store that an earlier close saved stays where
-/// later saves left it, unless this open's replay would overwrite it (R1.4,
-/// R9.16's note: a later mapped write stands against a later close). Pure.
-pub(in crate::tree_actor) fn close_pieces(
+/// The calls a close of an open applies to the saved bytes, by journal number:
+/// every own call; a page write above `saved_through` whole; a page write at or
+/// below it and newer than the open's first call, only over bytes the open's own
+/// earlier calls touched. A store that an earlier close saved stays where later
+/// saves left it, unless this open's replay would overwrite it (R1.4, R9.16's
+/// note: a later mapped write stands against a later close). Pure.
+pub(in crate::tree_actor) fn calls_for_close(
     saved_len: u64,
     own: &[(u64, Call)],
     writes: &[(u64, Run)],
     saved_through: u64,
-) -> Vec<(u64, Run)> {
+) -> Vec<Call> {
     let first_call = own.first().map(|(seq, _)| *seq);
-    let mut chosen = Vec::new();
+    let mut calls = Vec::with_capacity(own.len());
     let mut len = saved_len;
     let mut touched = Vec::new();
     let mut own = own.iter().peekable();
     let mut writes = writes.iter().peekable();
     loop {
         let call_first = match (own.peek(), writes.peek()) {
-            (None, None) => return chosen,
+            (None, None) => return calls,
             (Some(_), None) => true,
             (None, Some(_)) => false,
             (Some((call, _)), Some((write, _))) => call < write,
         };
         if call_first {
             let Some((_, call)) = own.next() else {
-                return chosen;
+                return calls;
             };
             touched.extend(touched_by(len, call));
             len = len_after(len, call);
+            calls.push(call.clone());
             continue;
         }
         let Some((seq, run)) = writes.next() else {
-            return chosen;
+            return calls;
         };
         let pieces = if *seq > saved_through {
             vec![run.clone()]
@@ -184,59 +187,12 @@ pub(in crate::tree_actor) fn close_pieces(
         };
         for piece in pieces {
             len = len.max(piece.end());
-            chosen.push((*seq, piece));
-        }
-    }
-}
-
-/// The calls a close applies, in journal order: the open's own calls merged
-/// with the page-write pieces [`close_pieces`] chose. The actor and the
-/// builder both run this, then [`Call::apply`]. Pure.
-pub(in crate::tree_actor) fn close_calls(own: &[(u64, Call)], pieces: &[(u64, Run)]) -> Vec<Call> {
-    let mut calls = Vec::with_capacity(own.len() + pieces.len());
-    let mut own = own.iter().peekable();
-    let mut pieces = pieces.iter().peekable();
-    loop {
-        let call_first = match (own.peek(), pieces.peek()) {
-            (None, None) => return calls,
-            (Some(_), None) => true,
-            (None, Some(_)) => false,
-            (Some((call, _)), Some((write, _))) => call < write,
-        };
-        if call_first {
-            if let Some((_, call)) = own.next() {
-                calls.push(call.clone());
-            }
-        } else if let Some((_, piece)) = pieces.next() {
             calls.push(Call::Write {
                 offset: piece.offset,
-                bytes: piece.bytes.clone(),
+                bytes: piece.bytes,
             });
         }
     }
-}
-
-/// The calls a close of an open applies to the saved bytes: [`close_calls`]
-/// over [`close_pieces`]. The same function live and at recovery.
-pub(in crate::tree_actor) fn calls_for_close(
-    saved_len: u64,
-    own: &[(u64, Call)],
-    writes: &[(u64, Run)],
-    saved_through: u64,
-) -> Vec<Call> {
-    close_calls(own, &close_pieces(saved_len, own, writes, saved_through))
-}
-
-/// A piece's bytes, from its page write's runs: the run that holds the
-/// range. `None` when no run does (the record is not that write).
-pub(in crate::tree_actor) fn resolve_piece(runs: &[Run], offset: u64, len: u64) -> Option<Run> {
-    let end = offset.checked_add(len)?;
-    runs.iter().find_map(|run| {
-        (run.offset <= offset && end <= run.end()).then(|| Run {
-            offset,
-            bytes: run.bytes[(offset - run.offset) as usize..(end - run.offset) as usize].to_vec(),
-        })
-    })
 }
 
 impl TreeActor {
@@ -374,6 +330,29 @@ impl TreeActor {
         std::mem::take(&mut self.changed)
     }
 
+    /// A queue take: [`TreeActor::step`] plus a note of the files it changed.
+    pub(in crate::tree_actor) fn pages_take<F>(
+        &mut self,
+        tree: TreeId,
+        build: F,
+    ) -> Result<(EventNumber, Saved)>
+    where
+        F: FnOnce(&Self, EventNumber) -> Result<Draft>,
+    {
+        let before = self.tree(tree)?.bytes.clone();
+        let result = self.step(tree, build)?;
+        if let Some(after) = self.trees.get(&tree) {
+            let changed = after.bytes.iter().filter(|(object, bytes)| {
+                before
+                    .get(object)
+                    .is_some_and(|old| !Arc::ptr_eq(old, bytes) && old[..] != bytes[..])
+            });
+            self.changed
+                .extend(changed.map(|(object, _)| (tree, *object)));
+        }
+        Ok(result)
+    }
+
     /// Builds the image if it has none: saved bytes plus every live open's calls
     /// and the file's page writes, by the one close rule.
     fn pages_build_image(&mut self, key: &(TreeId, u64)) -> Result<()> {
@@ -452,23 +431,23 @@ impl TreeActor {
         }
     }
 
-    /// Hook: `closing` is about to save: which page-write pieces its save
-    /// applies, by journal number. Changes nothing, because the save may
-    /// still fail.
-    pub(in crate::tree_actor) fn pages_close_pieces(&self, closing: &Handle) -> Vec<(u64, Run)> {
+    /// Hook: `closing` is about to save, on a copy of its tree: this cannot
+    /// change anything, because the save may still fail. Returns the calls its
+    /// save applies to the saved bytes, by journal number.
+    pub(in crate::tree_actor) fn pages_calls_for_close(&self, closing: &Handle) -> Vec<Call> {
         let saved_len = self
             .trees
             .get(&closing.tree)
             .and_then(|t| t.bytes.get(&closing.object))
             .map_or(0, |bytes| bytes.len() as u64);
         match self.pages.get(&(closing.tree, closing.object)) {
-            Some(state) => close_pieces(
+            Some(state) => calls_for_close(
                 saved_len,
                 &closing.calls,
                 &state.writes,
                 state.saved_through,
             ),
-            None => Vec::new(),
+            None => calls_for_close(saved_len, &closing.calls, &[], 0),
         }
     }
 

@@ -23,21 +23,8 @@ pub fn new_actor(dir: &Path) -> TreeActor {
     TreeActor::create(dir, &identity(), &PodContext::default()).expect("creates")
 }
 
-/// Opens the volume again. After a kill, an orphaned Git child of the killed
-/// process (the builder's `git fast-import`, which holds the state area's lease
-/// until its input closes and it exits) can hold the lease a moment longer: that
-/// open answers `Busy`, and this tries again, for up to ten seconds.
 pub fn reopen(dir: &Path) -> TreeActor {
-    let mut tries = 0;
-    loop {
-        match TreeActor::open(dir, &PodContext::default()) {
-            Err(agentfs_core::tree_actor::Error::Busy) if tries < 200 => {
-                tries += 1;
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
-            result => return result.expect("reopens"),
-        }
-    }
+    TreeActor::open(dir, &PodContext::default()).expect("reopens")
 }
 
 /// `label` with an empty pod context.

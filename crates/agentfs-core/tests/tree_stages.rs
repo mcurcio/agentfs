@@ -1,6 +1,5 @@
 //! The actor's stage measurements (git-model §18, ledger R2): what a save does
-//! on the call path and in the builder behind it is counted by stage and by Git
-//! child, through a real `TreeActor` on real Git.
+//! is counted by stage and by Git child, through a real `TreeActor` on real Git.
 //! Measurements are never read by a decision; these tests read them.
 use std::path::Path;
 use std::sync::Mutex;
@@ -61,44 +60,38 @@ fn count(stages: &Stages, before: &Stages) -> Vec<(&'static str, u64)> {
     ]
 }
 
-/// One save of one file on the root, built: the builder runs two Git children,
-/// `git diff` aligning the lines and `git fast-import` packing the commit; the
-/// call path runs none.
-const CHILDREN_PER_SAVE: u64 = 2;
+/// One save of one file on the root, step by step. A save runs one Git child,
+/// `git diff` aligning the lines; its objects, the ref copy and the checkout run
+/// in this process.
+const CHILDREN_PER_SAVE: u64 = 1;
 
-/// The objects one save feeds `git fast-import`: the changed file's blob, the
-/// object table and the commit. Its trees, line map and name history are
-/// fast-import's and inline; an unchanged file's blob is already known.
-const OBJECTS_PER_SAVE: u64 = 3;
+/// The objects one save hands to Git's store: the changed file's blob, the
+/// files tree, the line map, the name history, the envelope tree, the commit
+/// and the object table (a sync's marker blob only when the tree has forks, and
+/// here it has none). An unchanged file's blob is already known.
+const OBJECTS_PER_SAVE: u64 = 7;
 
-/// Saves of an existing file, each built in its own batch: what the builder
-/// does for each, stage by stage.
 #[test]
 fn stages_add_up() {
     let _one = ONE_AT_A_TIME.lock().unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let mut v = new_actor(&tmp.path().join("state"));
     put(&mut v, "a", b"seed\n");
-    v.settle().unwrap();
     let before = v.metrics();
     const SAVES: u64 = 5;
     for i in 0..SAVES {
         put(&mut v, "a", format!("line {i}\n").as_bytes());
-        v.settle().unwrap();
     }
     let after = v.metrics();
-    let mut got = count(&after.stages, &before.stages);
-    let (_, syncs) = got.pop().unwrap();
+    let got = count(&after.stages, &before.stages);
     let expect = [
-        // the open, the truncate, the write, and the close as a step.
+        // the open, the truncate, the write, and the close as a pointer step.
         ("journal_append", 4 * SAVES),
-        // A call is appended with no fsync; the builder makes a batch durable
-        // before it reads it.
-        ("journal_fsync", SAVES),
+        // A call is appended with no fsync; only a FLUSH, fsync or FSYNCDIR syncs.
+        ("journal_fsync", 0),
         ("compaction", 0),
         ("align", SAVES),
-        // The edits and the pack's install.
-        ("objects", 2 * SAVES),
+        ("objects", SAVES),
         ("ref_copy", SAVES),
         ("checkout", SAVES),
         ("queue_plan", 0),
@@ -109,10 +102,11 @@ fn stages_add_up() {
         ("event_owners", 0),
         ("git_children", CHILDREN_PER_SAVE * SAVES),
         ("object_writes", OBJECTS_PER_SAVE * SAVES),
+        // Each step's new objects are made durable by one fsync of `objects/`
+        // before its journal record names them.
+        ("object_dir_syncs", SAVES),
     ];
     assert_eq!(got, expect);
-    // Each batch fsyncs its pack's files (pack, index and maybe a reverse index).
-    assert!(syncs >= 2 * SAVES, "{syncs} pack files fsynced");
     assert_eq!(after.saves - before.saves, SAVES);
     assert!(after.journal_bytes > before.journal_bytes);
     // Durations are only measured, never exact: each ran and none ran backwards.
@@ -120,55 +114,9 @@ fn stages_add_up() {
     assert!(after.stages.objects.max_nanos > 0);
 }
 
-/// The call path runs no Git and writes no object: with the builder held, a
-/// create, writes, a FLUSH, a close, a rename and an unlink start no Git
-/// child and do one journal fsync, the FLUSH's.
-#[cfg(feature = "failpoints")]
-#[test]
-fn the_call_path_runs_no_git() {
-    let _one = ONE_AT_A_TIME.lock().unwrap();
-    let tmp = tempfile::tempdir().unwrap();
-    let rec = Recording::create(
-        &tmp.path().join("state"),
-        &identity(),
-        &PodContext::default(),
-    )
-    .unwrap();
-    let w = writer("test-writer");
-    let held = agentfs_core::failpoints::configure("tree.build_before_batch=error@*").unwrap();
-    let before = Stages::current();
-    let h = rec
-        .actor()
-        .unwrap()
-        .write_open(TreeId::Root, "a", &w, true)
-        .unwrap();
-    rec.actor()
-        .unwrap()
-        .write(h, 0, &[b'x'; 4096], false)
-        .unwrap();
-    rec.durable(h).unwrap();
-    rec.actor().unwrap().close(h).unwrap();
-    rec.actor()
-        .unwrap()
-        .rename(TreeId::Root, "a", "b", &w)
-        .unwrap();
-    rec.actor().unwrap().unlink(TreeId::Root, "b", &w).unwrap();
-    let after = Stages::current();
-    drop(held);
-    assert_eq!(after.git_children - before.git_children, 0);
-    assert_eq!(after.object_writes - before.object_writes, 0);
-    assert_eq!(after.object_dir_syncs - before.object_dir_syncs, 0);
-    assert_eq!(after.align.count - before.align.count, 0);
-    assert_eq!(after.journal_fsync.count - before.journal_fsync.count, 1);
-    // The builder catches up once let go.
-    rec.settle().unwrap();
-    assert_eq!(rec.actor().unwrap().files(TreeId::Root).unwrap(), vec![]);
-}
-
 /// Calls are appended with no fsync, and a FLUSH makes all of an open's
 /// records durable with one: close_4k's path (open, truncate, write, FLUSH,
-/// RELEASE) does one journal fsync on the call path where it did four. The
-/// builder's batch makes the close's record durable with one more.
+/// RELEASE) does one journal fsync where it did four.
 #[test]
 fn a_call_is_not_fsynced_and_flush_fsyncs_once() {
     let _one = ONE_AT_A_TIME.lock().unwrap();
@@ -180,34 +128,29 @@ fn a_call_is_not_fsynced_and_flush_fsyncs_once() {
     )
     .unwrap();
     let w = writer("test-writer");
-    let h = rec
-        .actor()
-        .unwrap()
-        .write_open(TreeId::Root, "a", &w, true)
-        .unwrap();
-    rec.settle().unwrap();
     let before = Stages::current();
-    {
+    let h = {
         let mut v = rec.actor().unwrap();
+        let h = v.write_open(TreeId::Root, "a", &w, true).unwrap();
         v.truncate(h, 0).unwrap();
         for i in 0..8_u64 {
             v.write(h, i * 512, &[b'x'; 512], false).unwrap();
         }
-    }
+        h
+    };
     let written = Stages::current();
     assert_eq!(written.journal_fsync.count, before.journal_fsync.count);
     rec.durable(h).unwrap();
     // Covered already: a second FLUSH finds nothing to sync.
     rec.durable(h).unwrap();
     rec.actor().unwrap().close(h).unwrap();
-    rec.settle().unwrap();
     let after = Stages::current();
-    assert_eq!(after.journal_fsync.count - before.journal_fsync.count, 2);
-    assert_eq!(after.journal_append.count - before.journal_append.count, 10);
+    assert_eq!(after.journal_fsync.count - before.journal_fsync.count, 1);
+    assert_eq!(after.journal_append.count - before.journal_append.count, 11);
 }
 
 /// A save's cost grows with its change, not the tree: one changed file in a
-/// tree of forty feeds the builder the objects it would in a tree of one, and
+/// tree of forty hands Git's store the objects it would in a tree of one, and
 /// starts the same Git children.
 #[test]
 fn a_save_stores_the_same_objects_at_any_tree_size() {
@@ -219,10 +162,8 @@ fn a_save_stores_the_same_objects_at_any_tree_size() {
             put(&mut v, &format!("f{i}"), format!("file {i}\n").as_bytes());
         }
         put(&mut v, "a", b"seed\n");
-        v.settle().unwrap();
         let before = v.metrics().stages;
         put(&mut v, "a", b"changed\n");
-        v.settle().unwrap();
         let after = v.metrics().stages;
         (
             after.object_writes - before.object_writes,
@@ -244,11 +185,9 @@ fn a_sync_costs_the_same_children_at_any_history_length() {
     let mut v = new_actor(&state);
     v.fork().unwrap();
     let cycle = |v: &mut TreeActor, i: u64| {
-        v.settle().unwrap();
         let before = Stages::current().git_children;
         put(v, "a", format!("line {i}\n").as_bytes());
         while v.progress().unwrap() {}
-        v.settle().unwrap();
         Stages::current().git_children - before
     };
     let mut early = 0;
@@ -294,7 +233,6 @@ fn a_sync_costs_the_same_children_for_any_number_of_lines() {
         // The sandbox holds the first save's lines when the second one syncs.
         put(&mut v, "a", &bytes);
         while v.progress().unwrap() {}
-        v.settle().unwrap();
         let before = Stages::current().git_children;
         put(
             &mut v,
@@ -305,7 +243,6 @@ fn a_sync_costs_the_same_children_for_any_number_of_lines() {
                 .collect::<Vec<_>>(),
         );
         while v.progress().unwrap() {}
-        v.settle().unwrap();
         Stages::current().git_children - before
     };
     let (few, many) = (children(10), children(600));

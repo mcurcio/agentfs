@@ -70,7 +70,6 @@ impl Library {
     pub fn new(dir: &Path, names: EngineNames) -> Result<Self, CallError> {
         let mut volume = create(dir).map_err(fail)?;
         seed(&mut volume, names.name(TreeId::ROOT)?).map_err(fail)?;
-        volume.settle().map_err(fail)?;
         Ok(Self {
             volume: Some(volume),
             dir: dir.to_owned(),
@@ -96,15 +95,6 @@ impl Library {
             .ok_or_else(|| CallError::new("the volume is down"))
     }
 
-    /// `result`, once history is built through every record so far: the
-    /// invariants read git after each call, and the builder makes history
-    /// behind the call path.
-    fn settled<T>(&self, result: Result<T, CallError>) -> Result<T, CallError> {
-        let value = result?;
-        self.v()?.settle().map_err(fail)?;
-        Ok(value)
-    }
-
     /// The tree and writer label of a caller, owned: calls take `&mut self`.
     fn who(&self, c: &Caller) -> Result<(EngineTree, WriterAt), CallError> {
         let (tree, label) = match c {
@@ -119,8 +109,7 @@ impl Library {
         let h = self
             .v_mut()?
             .write_open(tree, path, &writer, create)
-            .map_err(fail);
-        let h = self.settled(h)?;
+            .map_err(fail)?;
         self.owners.insert(h, c.clone());
         Ok(h)
     }
@@ -130,8 +119,7 @@ impl TreeCalls for Library {
     type Open = u64;
 
     fn fork(&mut self) -> Result<TreeId, CallError> {
-        let name = self.v_mut()?.fork().map_err(fail);
-        let name = self.settled(name)?;
+        let name = self.v_mut()?.fork().map_err(fail)?;
         self.names.forked(name)
     }
 
@@ -168,20 +156,17 @@ impl TreeCalls for Library {
 
     fn close(&mut self, h: u64) -> Result<(), CallError> {
         self.owners.remove(&h);
-        let closed = self.v_mut()?.close(h).map(|_| ()).map_err(fail);
-        self.settled(closed)
+        self.v_mut()?.close(h).map(|_| ()).map_err(fail)
     }
 
     fn unlink(&mut self, c: &Caller, path: &str) -> Result<(), CallError> {
         let (tree, writer) = self.who(c)?;
-        let unlinked = self.v_mut()?.unlink(tree, path, &writer).map_err(fail);
-        self.settled(unlinked)
+        self.v_mut()?.unlink(tree, path, &writer).map_err(fail)
     }
 
     fn rename(&mut self, c: &Caller, from: &str, to: &str) -> Result<(), CallError> {
         let (tree, writer) = self.who(c)?;
-        let renamed = self.v_mut()?.rename(tree, from, to, &writer).map_err(fail);
-        self.settled(renamed)
+        self.v_mut()?.rename(tree, from, to, &writer).map_err(fail)
     }
 
     fn end_client(&mut self, c: &Caller) -> Result<(), CallError> {
@@ -199,8 +184,7 @@ impl TreeCalls for Library {
 
     fn take_next(&mut self, t: TreeId) -> Result<Took, CallError> {
         let tree = self.names.name(t)?;
-        let took = self.v_mut()?.take_next(tree).map_err(fail);
-        Ok(match self.settled(took)? {
+        Ok(match self.v_mut()?.take_next(tree).map_err(fail)? {
             tree_actor::Took::Taken => Took::Taken,
             tree_actor::Took::Waiting => Took::Waiting,
             tree_actor::Took::Empty => Took::Empty,

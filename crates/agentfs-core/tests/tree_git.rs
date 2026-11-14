@@ -1,7 +1,3 @@
-#![allow(
-    clippy::disallowed_methods,
-    reason = "a test reads the store History writes"
-)]
 use agentfs_core::tree_git::{RefUpdate, TreeEntry, TreeGit};
 use git2::Oid;
 use std::process::Command;

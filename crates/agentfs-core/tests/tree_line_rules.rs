@@ -1,9 +1,5 @@
 //! Line rules R10.8, R10.6 and R10.9 through the real `TreeActor`: its saves, its
 //! queue and its Git history. Target git-model §7.
-#![allow(
-    clippy::disallowed_methods,
-    reason = "a test reads the store History writes"
-)]
 use agentfs_core::tree_actor::{TreeActor, TreeId};
 use trees::{new_actor, writer};
 

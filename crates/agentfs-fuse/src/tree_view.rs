@@ -111,10 +111,10 @@ pub fn serve_with_metrics(
             tree: binding.tree,
             by: binding.by,
             owner: binding.owner,
-            handles: Arc::new(Mutex::new(Handles {
+            handles: Mutex::new(Handles {
                 next: 1,
                 entries: BTreeMap::new(),
-            })),
+            }),
         };
         let session = fuser::spawn_mount(view, at, &session_config(&options))?;
         notifiers.push((tree, session.notifier()));
@@ -217,14 +217,6 @@ fn run_take_gate(
     notifiers: &[(TreeId, Notifier)],
 ) -> io::Result<()> {
     while let Some(tree) = gate.next_tree()? {
-        if tree == "settle" {
-            let answer = match actor.settle() {
-                Ok(_) => "settled".to_owned(),
-                Err(e) => format!("error {e}"),
-            };
-            gate.answer(&answer)?;
-            continue;
-        }
         let (took, changed) = {
             let mut volume = actor.actor().map_err(io::Error::other)?;
             let took = tree
@@ -279,7 +271,6 @@ fn session_config(options: &MountOptions) -> Config {
     config
 }
 
-#[derive(Clone)]
 struct View {
     actor: Arc<Recording>,
     signal: Arc<ProgressSignal>,
@@ -287,7 +278,7 @@ struct View {
     by: WriterAt,
     /// Every file's and directory's owner, until file metadata is recorded.
     owner: FileOwner,
-    handles: Arc<Mutex<Handles>>,
+    handles: Mutex<Handles>,
 }
 
 struct ProgressState {
@@ -384,17 +375,6 @@ fn answer_empty(reply: ReplyEmpty) -> agentfs_core::tree_actor::Then {
 }
 
 impl View {
-    /// Runs `call` once the lag gate admits new work in this view's tree: at
-    /// once on this thread, else on a gate thread, so a held tree holds no
-    /// other request (docs/trees.md, "History trails the files").
-    fn gated(&self, call: impl FnOnce(&View, Result<()>) + Send + 'static) {
-        let view = self.clone();
-        self.actor.admit_then(
-            self.tree,
-            Box::new(move |admitted| call(&view, admitted.map_err(errno))),
-        );
-    }
-
     fn actor(&self) -> Result<ActorGuard<'_>> {
         let v = self.actor.actor().map_err(|_| Errno::EIO)?;
         Ok(ActorGuard {
@@ -563,22 +543,14 @@ impl Filesystem for View {
         }
     }
     fn open(&self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
-        let open = move |view: &View, admitted: Result<()>| {
-            let result = admitted.and_then(|()| {
-                let mut v = view.actor()?;
-                let path = view.path(&v, ino)?;
-                view.open_file(&mut v, &path, flags.0, false)
-            });
-            match result {
-                Ok(fh) => reply.opened(FileHandle(fh), FopenFlags::FOPEN_DIRECT_IO),
-                Err(e) => reply.error(e),
-            }
-        };
-        // A write-open starts new work, so the lag gate stands before it.
-        if flags.0 & libc::O_ACCMODE == libc::O_RDONLY {
-            open(self, Ok(()));
-        } else {
-            self.gated(open);
+        let result = (|| {
+            let mut v = self.actor()?;
+            let path = self.path(&v, ino)?;
+            self.open_file(&mut v, &path, flags.0, false)
+        })();
+        match result {
+            Ok(fh) => reply.opened(FileHandle(fh), FopenFlags::FOPEN_DIRECT_IO),
+            Err(e) => reply.error(e),
         }
     }
     fn create(
@@ -591,37 +563,32 @@ impl Filesystem for View {
         flags: i32,
         reply: ReplyCreate,
     ) {
-        let name = name.to_owned();
-        self.gated(move |view, admitted| {
-            let result = admitted.and_then(|()| {
-                (|| {
-                    if parent.0 != 1 {
-                        return Err(Errno::ENOTDIR);
-                    }
-                    let path = name.to_str().ok_or(Errno::EINVAL)?;
-                    let mut v = view.actor()?;
-                    if flags & libc::O_EXCL != 0 && v.read(view.tree, path).is_ok() {
-                        return Err(Errno::EEXIST);
-                    }
-                    let fh = view.open_file(&mut v, path, flags, true)?;
-                    let object = v.object_at(view.tree, path).map_err(errno)?;
-                    Ok((
-                        fh,
-                        view.attr(&v, INodeNo(object + 2), Some(FileHandle(fh)))?,
-                    ))
-                })()
-            });
-            match result {
-                Ok((fh, attr)) => reply.created(
-                    &TTL,
-                    &attr,
-                    Generation(0),
-                    FileHandle(fh),
-                    FopenFlags::FOPEN_DIRECT_IO,
-                ),
-                Err(e) => reply.error(e),
+        let result = (|| {
+            if parent.0 != 1 {
+                return Err(Errno::ENOTDIR);
             }
-        });
+            let path = name.to_str().ok_or(Errno::EINVAL)?;
+            let mut v = self.actor()?;
+            if flags & libc::O_EXCL != 0 && v.read(self.tree, path).is_ok() {
+                return Err(Errno::EEXIST);
+            }
+            let fh = self.open_file(&mut v, path, flags, true)?;
+            let object = v.object_at(self.tree, path).map_err(errno)?;
+            Ok((
+                fh,
+                self.attr(&v, INodeNo(object + 2), Some(FileHandle(fh)))?,
+            ))
+        })();
+        match result {
+            Ok((fh, attr)) => reply.created(
+                &TTL,
+                &attr,
+                Generation(0),
+                FileHandle(fh),
+                FopenFlags::FOPEN_DIRECT_IO,
+            ),
+            Err(e) => reply.error(e),
+        }
     }
     fn tmpfile(
         &self,
@@ -632,43 +599,39 @@ impl Filesystem for View {
         flags: i32,
         reply: ReplyCreate,
     ) {
-        self.gated(move |view, admitted| {
-            let result = admitted.and_then(|()| {
-                (|| {
-                    if parent.0 != 1 {
-                        return Err(Errno::ENOTDIR);
-                    }
-                    let mut v = view.actor()?;
-                    let handle = v.anonymous_open(view.tree, &view.by).map_err(errno)?;
-                    let object = v.open_object(handle).map_err(errno)?;
-                    let mut handles = view.handles()?;
-                    let fh = handles.next;
-                    handles.next += 1;
-                    handles.entries.insert(
-                        fh,
-                        Open::Write {
-                            handle,
-                            append: flags & libc::O_APPEND != 0,
-                            readable: flags & libc::O_ACCMODE == libc::O_RDWR,
-                            sync: sync_flags(flags),
-                        },
-                    );
-                    drop(handles);
-                    let ino = INodeNo(object + 2);
-                    Ok((fh, view.attr(&v, ino, Some(FileHandle(fh)))?))
-                })()
-            });
-            match result {
-                Ok((fh, attr)) => reply.created(
-                    &TTL,
-                    &attr,
-                    Generation(0),
-                    FileHandle(fh),
-                    FopenFlags::FOPEN_DIRECT_IO,
-                ),
-                Err(e) => reply.error(e),
+        let result = (|| {
+            if parent.0 != 1 {
+                return Err(Errno::ENOTDIR);
             }
-        });
+            let mut v = self.actor()?;
+            let handle = v.anonymous_open(self.tree, &self.by).map_err(errno)?;
+            let object = v.open_object(handle).map_err(errno)?;
+            let mut handles = self.handles()?;
+            let fh = handles.next;
+            handles.next += 1;
+            handles.entries.insert(
+                fh,
+                Open::Write {
+                    handle,
+                    append: flags & libc::O_APPEND != 0,
+                    readable: flags & libc::O_ACCMODE == libc::O_RDWR,
+                    sync: sync_flags(flags),
+                },
+            );
+            drop(handles);
+            let ino = INodeNo(object + 2);
+            Ok((fh, self.attr(&v, ino, Some(FileHandle(fh)))?))
+        })();
+        match result {
+            Ok((fh, attr)) => reply.created(
+                &TTL,
+                &attr,
+                Generation(0),
+                FileHandle(fh),
+                FopenFlags::FOPEN_DIRECT_IO,
+            ),
+            Err(e) => reply.error(e),
+        }
     }
     fn read(
         &self,
@@ -779,50 +742,38 @@ impl Filesystem for View {
         _flags: Option<BsdFileFlags>,
         reply: ReplyAttr,
     ) {
-        let setattr = move |view: &View, admitted: Result<()>| {
-            let result = admitted.and_then(|()| {
-                (|| {
-                    if mode.is_some()
-                        || uid.is_some()
-                        || gid.is_some()
-                        || atime.is_some()
-                        || mtime.is_some()
-                    {
-                        return Err(Errno::EOPNOTSUPP);
-                    }
-                    let mut v = view.actor()?;
-                    if let Some(size) = size {
-                        if let Some(fh) = fh {
-                            let handles = view.handles()?;
-                            match handles.entries.get(&fh.0).ok_or(Errno::EBADF)? {
-                                Open::Write { handle, .. } => {
-                                    v.truncate(*handle, size).map_err(errno)?
-                                }
-                                _ => return Err(Errno::EBADF),
-                            }
-                        } else {
-                            let path = view.path(&v, ino)?;
-                            let h = v
-                                .write_open(view.tree, &path, &view.by, false)
-                                .map_err(errno)?;
-                            let result = v.truncate(h, size).map_err(errno);
-                            v.close(h).map_err(errno)?;
-                            result?;
-                        }
-                    }
-                    view.attr(&v, ino, fh)
-                })()
-            });
-            match result {
-                Ok(attr) => reply.attr(&TTL, &attr),
-                Err(e) => reply.error(e),
+        let result = (|| {
+            if mode.is_some()
+                || uid.is_some()
+                || gid.is_some()
+                || atime.is_some()
+                || mtime.is_some()
+            {
+                return Err(Errno::EOPNOTSUPP);
             }
-        };
-        // A path truncate is a write-open, a truncate and a close: new work.
-        if size.is_some() && fh.is_none() {
-            self.gated(setattr);
-        } else {
-            setattr(self, Ok(()));
+            let mut v = self.actor()?;
+            if let Some(size) = size {
+                if let Some(fh) = fh {
+                    let handles = self.handles()?;
+                    match handles.entries.get(&fh.0).ok_or(Errno::EBADF)? {
+                        Open::Write { handle, .. } => v.truncate(*handle, size).map_err(errno)?,
+                        _ => return Err(Errno::EBADF),
+                    }
+                } else {
+                    let path = self.path(&v, ino)?;
+                    let h = v
+                        .write_open(self.tree, &path, &self.by, false)
+                        .map_err(errno)?;
+                    let result = v.truncate(h, size).map_err(errno);
+                    v.close(h).map_err(errno)?;
+                    result?;
+                }
+            }
+            self.attr(&v, ino, fh)
+        })();
+        match result {
+            Ok(attr) => reply.attr(&TTL, &attr),
+            Err(e) => reply.error(e),
         }
     }
     /// close(2): the open's records made durable before close returns. The
@@ -905,53 +856,43 @@ impl Filesystem for View {
         }
     }
     fn link(&self, _req: &Request, ino: INodeNo, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
-        let name = name.to_owned();
-        self.gated(move |view, admitted| {
-            let result = admitted.and_then(|()| {
-                (|| {
-                    if parent.0 != 1 {
-                        return Err(Errno::ENOTDIR);
-                    }
-                    let object = ino.0.checked_sub(2).ok_or(Errno::ENOENT)?;
-                    let mut v = view.actor()?;
-                    // Existing named-object hard links retain fuser's default EPERM.
-                    if !v.is_anonymous(view.tree, object).map_err(errno)? {
-                        return Err(Errno::EPERM);
-                    }
-                    v.first_link(
-                        view.tree,
-                        object,
-                        name.to_str().ok_or(Errno::EINVAL)?,
-                        &view.by,
-                    )
-                    .map_err(errno)?;
-                    view.attr(&v, ino, None)
-                })()
-            });
-            match result {
-                Ok(attr) => reply.entry(&TTL, &attr, Generation(0)),
-                Err(e) => reply.error(e),
+        let result = (|| {
+            if parent.0 != 1 {
+                return Err(Errno::ENOTDIR);
             }
-        });
+            let object = ino.0.checked_sub(2).ok_or(Errno::ENOENT)?;
+            let mut v = self.actor()?;
+            // Existing named-object hard links retain fuser's default EPERM.
+            if !v.is_anonymous(self.tree, object).map_err(errno)? {
+                return Err(Errno::EPERM);
+            }
+            v.first_link(
+                self.tree,
+                object,
+                name.to_str().ok_or(Errno::EINVAL)?,
+                &self.by,
+            )
+            .map_err(errno)?;
+            self.attr(&v, ino, None)
+        })();
+        match result {
+            Ok(attr) => reply.entry(&TTL, &attr, Generation(0)),
+            Err(e) => reply.error(e),
+        }
     }
     fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
-        let name = name.to_owned();
-        self.gated(move |view, admitted| {
-            let result = admitted.and_then(|()| {
-                (|| {
-                    if parent.0 != 1 {
-                        return Err(Errno::ENOTDIR);
-                    }
-                    view.actor()?
-                        .unlink(view.tree, name.to_str().ok_or(Errno::EINVAL)?, &view.by)
-                        .map_err(errno)
-                })()
-            });
-            match result {
-                Ok(()) => reply.ok(),
-                Err(e) => reply.error(e),
+        let result = (|| {
+            if parent.0 != 1 {
+                return Err(Errno::ENOTDIR);
             }
-        });
+            self.actor()?
+                .unlink(self.tree, name.to_str().ok_or(Errno::EINVAL)?, &self.by)
+                .map_err(errno)
+        })();
+        match result {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(e),
+        }
     }
     fn rename(
         &self,
@@ -963,31 +904,26 @@ impl Filesystem for View {
         flags: RenameFlags,
         reply: ReplyEmpty,
     ) {
-        let (name, newname) = (name.to_owned(), newname.to_owned());
-        self.gated(move |view, admitted| {
-            let result = admitted.and_then(|()| {
-                (|| {
-                    if parent.0 != 1 || newparent.0 != 1 {
-                        return Err(Errno::ENOTDIR);
-                    }
-                    if !flags.is_empty() {
-                        return Err(Errno::EOPNOTSUPP);
-                    }
-                    view.actor()?
-                        .rename(
-                            view.tree,
-                            name.to_str().ok_or(Errno::EINVAL)?,
-                            newname.to_str().ok_or(Errno::EINVAL)?,
-                            &view.by,
-                        )
-                        .map_err(errno)
-                })()
-            });
-            match result {
-                Ok(()) => reply.ok(),
-                Err(e) => reply.error(e),
+        let result = (|| {
+            if parent.0 != 1 || newparent.0 != 1 {
+                return Err(Errno::ENOTDIR);
             }
-        });
+            if !flags.is_empty() {
+                return Err(Errno::EOPNOTSUPP);
+            }
+            self.actor()?
+                .rename(
+                    self.tree,
+                    name.to_str().ok_or(Errno::EINVAL)?,
+                    newname.to_str().ok_or(Errno::EINVAL)?,
+                    &self.by,
+                )
+                .map_err(errno)
+        })();
+        match result {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(e),
+        }
     }
     fn readdir(
         &self,
@@ -1114,10 +1050,10 @@ mod tests {
             tree: TreeId::Root,
             by: writer("client"),
             owner: OWNER,
-            handles: Arc::new(Mutex::new(Handles {
+            handles: Mutex::new(Handles {
                 next: 2,
                 entries: BTreeMap::new(),
-            })),
+            }),
         };
         let mut volume = view.actor().unwrap();
         let handle = volume
@@ -1149,10 +1085,10 @@ mod tests {
             tree: TreeId::Root,
             by: writer("client"),
             owner: OWNER,
-            handles: Arc::new(Mutex::new(Handles {
+            handles: Mutex::new(Handles {
                 next: 1,
                 entries: BTreeMap::new(),
-            })),
+            }),
         };
         let mut volume = view.actor().unwrap();
         let h = volume

@@ -26,12 +26,6 @@ impl TreeActor {
         if self.is_stopped() {
             return Err(Error::Stopped);
         }
-        // A compaction due since history trailed runs at the first call after
-        // it caught up, before that call's record.
-        self.compact_if_due();
-        if self.is_stopped() {
-            return Err(Error::Stopped);
-        }
         let seq = self.next;
         let record = Record {
             seq: RecordNo::new(seq),
@@ -49,18 +43,9 @@ impl TreeActor {
     /// A fuzzy checkpoint (ARIES): the pointers, the live opens, and unchanged
     /// the live opens' calls and the page writes memory still holds. A file held
     /// open pins only its own calls, never other files' saves, and a closed
-    /// generation's page write stays out of the fold (R12). Only with history
-    /// built through every record: the checkpoint's pointers are the built
-    /// ones, and its redo start is its last record.
+    /// generation's page write stays out of the fold (R12).
     pub(in crate::tree_actor) fn compact(&mut self) -> std::result::Result<(), CompactError> {
         let _timer = Timer::start(Which::Compaction);
-        let snapshot = self.history.snapshot();
-        let last = RecordNo::new(self.next.saturating_sub(1));
-        if snapshot.at() < last {
-            return Err(CompactError::Before(std::io::Error::other(
-                "history is not built through the journal",
-            )));
-        }
         let opens = self
             .handles
             .iter()
@@ -79,9 +64,8 @@ impl TreeActor {
             seq: RecordNo::ZERO,
             at_ns: now_ns(),
             entry: Entry::Checkpoint {
-                next: RecordNo::new(self.next),
-                built: last,
-                pointers: snapshot.pointers().to_hex(),
+                next_seq: self.next,
+                pointers: self.pointers.to_hex(),
                 upstreams: self.upstreams.to_text(),
                 opens,
                 page_saved: self.pages_saved_through(),
@@ -110,21 +94,11 @@ impl TreeActor {
                 "a journalled page write names no tree",
             )));
         }
-        self.journal.compact(&checkpoint, &retained)?;
-        self.history.checkpointed(last);
-        // The records name built values only: no step past the checkpoint yet.
-        self.pointers = snapshot.pointers().to_targets();
-        Ok(())
+        self.journal.compact(&checkpoint, &retained)
     }
 
     pub(in crate::tree_actor) fn compact_if_due(&mut self) {
         if self.journal.len() < self.compact_threshold {
-            return;
-        }
-        // A checkpoint's pointers are the built ones: due, it waits for the
-        // first call after the builder has caught up. The call path never
-        // waits on the builder, so the journal grows while history trails.
-        if self.history.built_through() < self.durability().appended() {
             return;
         }
         match self.compact() {

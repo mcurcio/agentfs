@@ -45,8 +45,7 @@ import time
 
 MIB = 1 << 20
 BIG_BYTES = 64 * MIB
-GUARANTEE = ("saved before the view answers any later request; "
-             "history built later (drain_s: from the workload's end to the built point reaching it)")
+GUARANTEE = "committed before the view answers any later request"
 FUSECTL = "/sys/fs/fuse/connections"
 
 
@@ -211,35 +210,6 @@ def missed(figure, budget, filesystem):
     return figure[budget["metric"]] > limit
 
 
-def history(metrics):
-    """The view's history metrics, or None while the file is not written yet."""
-    try:
-        with open(metrics) as file:
-            return json.load(file).get("history")
-    except (OSError, ValueError):
-        return None
-
-
-def drain(metrics, cap):
-    """Seconds from now until the built point reaches the record last appended
-    now, read from the metrics file the view rewrites; None past `cap`. A probe
-    of a measurement, not a coordination."""
-    start = time.monotonic()
-    now = history(metrics)
-    while now is None and time.monotonic() - start < cap:
-        time.sleep(0.1)
-        now = history(metrics)
-    if now is None:
-        return None
-    target = now["appended"]
-    while time.monotonic() - start < cap:
-        built = history(metrics)
-        if built and built["built_through"] >= target:
-            return round(time.monotonic() - start, 3)
-        time.sleep(0.1)
-    return None
-
-
 def abort_connection(dev):
     """Abort the view's FUSE connection, the one way to free a thread blocked
     in a request the view never answers. Returns whether it was aborted."""
@@ -267,10 +237,6 @@ def main():
     parser.add_argument("--output", required=True)
     parser.add_argument("--build", default="release",
                         help="the build measured, as the report names it (the image ships release)")
-    parser.add_argument("--metrics",
-                        help="the view's --metrics-output file: each workload then reports drain_s")
-    parser.add_argument("--drain-cap", type=float, default=900.0,
-                        help="how long to wait for history to be built after a workload")
     parser.add_argument("--only", action="append", choices=[n for n, _ in WORKLOADS],
                         help="run only this workload (repeatable; a probe's shortcut)")
     args = parser.parse_args()
@@ -308,8 +274,6 @@ def main():
             entry["stuck"] = f"a save was still running {grace} s after the deadline"
         with run.lock:
             figure = figures(name, run, budget)
-        if args.metrics and not stopped:
-            figure["drain_s"] = drain(args.metrics, args.drain_cap)
         warn = missed(figure, budget, args.filesystem)
         workloads.append({**entry, **figure, "warn": warn})
         print(f"{name} on {args.filesystem}: {json.dumps(figure)}", flush=True)

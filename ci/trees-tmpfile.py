@@ -24,5 +24,5 @@ assert os.fstat(fd).st_nlink == 1
 assert (root / "linked").read_bytes() == b"", "open writes remain private after link"
 os.close(fd)
 assert (root / "linked").read_bytes() == b"anonymous data"
-assert read(repo, "root", "linked", b"anonymous data") == b"anonymous data"
+assert read(repo, "root", "linked") == b"anonymous data"
 print("O_TMPFILE, linkat, private writes, final close and history: passed", flush=True)

@@ -748,7 +748,7 @@ fn kill_or_fail_at_every_engine_point() {
 #[test]
 fn a_kill_after_a_write_returned_keeps_it() {
     use agentfs_contracts::pod::PodContext;
-    use agentfs_core::tree_actor::{Recording, TreeId};
+    use agentfs_core::tree_actor::{Recording, TreeActor, TreeId};
 
     if let Some(dir) = std::env::var_os("TREE_CRASH_CHILD") {
         let rec =
@@ -787,6 +787,6 @@ fn a_kill_after_a_write_returned_keeps_it() {
         "the child was not killed: {stderr}"
     );
     assert!(stderr.contains("agentfs failpoint tree.wal_after_payload triggered (kill)"));
-    let v = trees::reopen(&dir);
+    let v = TreeActor::open(&dir, &PodContext::default()).unwrap();
     assert_eq!(v.read(TreeId::Root, "a").unwrap(), b"kept");
 }

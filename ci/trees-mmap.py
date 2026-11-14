@@ -29,6 +29,6 @@ view.close()
 assert path.read_bytes() == new, "last unmap must publish before immediate open"
 assert prior.read() == old, "reader opened before mapping must retain its bytes"
 prior.close()
-recorded = read(repo, "root", "mapped", new)
+recorded = read(repo, "root", "mapped")
 assert recorded == new, "history must contain the mapped write"
 print("MAP_SHARED store, msync, saved readers, fd close, final unmap and history: passed", flush=True)

@@ -1,8 +1,4 @@
 //! The recording slice on real Git repositories and Linux byte operations.
-#![allow(
-    clippy::disallowed_methods,
-    reason = "a test reads the store History writes"
-)]
 use std::fs::{self, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
 use std::os::unix::fs::FileExt;
@@ -580,7 +576,6 @@ fn save_and_checkout_failures_keep_calls_and_recover_without_duplicate_commits()
     let tmp = tempfile::tempdir().unwrap();
     let mut v = new_actor(tmp.path());
     put(&mut v, ROOT, "a", b"base");
-    v.settle().unwrap();
     let h = v.write_open(ROOT, "a", &writer("writer"), false).unwrap();
     v.write(h, 0, b"journaled", true).unwrap();
     // A stale ref lock stands in for an interrupted Git ref update.
@@ -605,8 +600,7 @@ fn save_and_checkout_failures_keep_calls_and_recover_without_duplicate_commits()
     v.write(h, 0, b"once", true).unwrap();
     fs::remove_dir_all(tmp.path().join("trees/root")).unwrap();
     fs::write(tmp.path().join("trees/root"), b"checkout-blocked").unwrap();
-    assert!(matches!(v.close(h).unwrap(), Saved::Commit(_)));
-    v.settle().unwrap(); // Its checkout failed.
+    assert!(matches!(v.close(h).unwrap(), Saved::Commit(_))); // Checkout failed.
     let repo = repo(tmp.path());
     let committed = repo.head("refs/heads/root").unwrap().unwrap();
     assert_eq!(committed, v.head(ROOT).unwrap());
@@ -851,7 +845,6 @@ fn a_corrupt_copy_is_rebuilt_from_the_journal() {
     let fork = v.fork().unwrap();
     put(&mut v, ROOT, "a", b"main\n");
     put(&mut v, fork, "b", b"fork\n");
-    v.settle().unwrap();
     let refs = all_refs(tmp.path());
     assert!(refs.iter().any(|(name, _)| name.starts_with("refs/queue/")));
     drop(v);
@@ -871,7 +864,6 @@ fn removed_refs_are_rebuilt_from_the_journal() {
     let tmp = tempfile::tempdir().unwrap();
     let mut v = new_actor(tmp.path());
     put(&mut v, ROOT, "a", b"main\n");
-    v.settle().unwrap();
     let refs = all_refs(tmp.path());
     drop(v);
     fs::remove_dir_all(tmp.path().join("history.git/refs")).unwrap();
@@ -940,9 +932,8 @@ fn a_ref_copy_failure_is_not_a_call_failure() {
     assert_eq!(v.read(ROOT, "a").unwrap(), b"base!");
     let copy = repo(tmp.path());
     assert_eq!(copy.head("refs/heads/root").unwrap(), Some(before));
-    // The next batch rebuilds the copy whole and redoes the checkout.
+    // The next step rebuilds the copy whole and redoes the checkout.
     put(&mut v, ROOT, "b", b"next");
-    v.settle().unwrap();
     assert_eq!(
         copy.head("refs/heads/root").unwrap(),
         Some(v.head(ROOT).unwrap())
@@ -1064,21 +1055,27 @@ fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
 }
 
 #[test]
-fn a_lost_object_at_a_tip_refuses_to_serve() {
+fn a_lost_blob_at_a_tip_refuses_to_serve() {
     let tmp = tempfile::tempdir().unwrap();
     let mut v = new_actor(tmp.path());
     put(&mut v, ROOT, "a", b"will be lost");
-    let head = v.head(ROOT).unwrap();
+    let copy = repo(tmp.path());
+    let root = copy.read_commit(v.head(ROOT).unwrap()).unwrap().tree;
+    let blob = entry(&copy, entry(&copy, root, "files"), "a");
     drop(v);
-    // The builder's objects are in packs: lose them all.
-    for entry in fs::read_dir(tmp.path().join("history.git/objects/pack")).unwrap() {
-        fs::remove_file(entry.unwrap().path()).unwrap();
-    }
+    let name = blob.to_string();
+    fs::remove_file(
+        tmp.path()
+            .join("history.git/objects")
+            .join(&name[..2])
+            .join(&name[2..]),
+    )
+    .unwrap();
     assert!(matches!(
         TreeActor::open(tmp.path(), &PodContext::default()),
-        Err(Error::MissingObject { name, .. }) if name.starts_with("refs/")
+        Err(Error::MissingObject { name, oid })
+            if oid == blob && name.starts_with("refs/")
     ));
-    let _ = head;
 }
 
 #[test]
@@ -1151,9 +1148,7 @@ fn open_numbers_never_repeat_across_compaction() {
 }
 
 /// Takes the journal past the compaction threshold through real calls, leaving
-/// `FILLED` in the file so its save stays cheap. A compaction waits for the
-/// first call after the builder caught up: an open (closed, saving nothing) is
-/// that call.
+/// `FILLED` in the file so its save stays cheap.
 const FILLED: &[u8] = b"xxxxxx";
 fn fill_journal(v: &mut TreeActor, path: &str) {
     let h = v.write_open(ROOT, path, &writer("filler"), true).unwrap();
@@ -1163,11 +1158,6 @@ fn fill_journal(v: &mut TreeActor, path: &str) {
     }
     v.truncate(h, FILLED.len() as u64).unwrap();
     v.close(h).unwrap();
-    v.settle().unwrap();
-    // A compaction failing after its rename stops the actor: this open fails.
-    if let Ok(h) = v.write_open(ROOT, path, &writer("filler"), false) {
-        v.close(h).unwrap();
-    }
 }
 
 #[test]
@@ -1224,13 +1214,10 @@ fn step_worker() {
     };
     let mut v = new_actor(std::path::Path::new(&root));
     let h = v.write_open(ROOT, "a", &writer("writer"), true).unwrap();
-    // The create's batch, alone: the write's and the close's is the second.
-    v.settle().unwrap();
     v.write(h, 0, b"returned", false).unwrap();
     println!("OPEN {h}");
     std::io::stdout().flush().unwrap();
     v.close(h).unwrap();
-    v.settle().unwrap();
     unreachable!("the failpoint kills this process");
 }
 
@@ -1324,29 +1311,32 @@ fn a_save_that_changes_no_byte_commits_nothing() {
 fn a_step_killed_before_its_record_saves_at_restart() {
     let tmp = tempfile::tempdir().unwrap();
     // The create is the first hit; the close is the second.
-    let spec = "tree.before_step=kill@2";
-    let state = tmp.path().join(spec);
-    let open = run_killed_worker("step_worker", &state, spec);
-    let v = reopen(&state);
-    assert_eq!(v.read(ROOT, "a").unwrap(), b"returned", "{spec}");
-    let head = v.head(ROOT).unwrap();
-    assert_eq!(opens_saved(&state, open), 1, "{spec}");
-    drop(v);
-    let v = reopen(&state);
-    assert_eq!(v.head(ROOT).unwrap(), head, "{spec}");
-    assert_eq!(opens_saved(&state, open), 1, "{spec}");
+    for spec in [
+        "tree.before_objects=kill@2",
+        "tree.after_objects_durable=kill@2",
+    ] {
+        let state = tmp.path().join(spec);
+        let open = run_killed_worker("step_worker", &state, spec);
+        let v = reopen(&state);
+        assert_eq!(v.read(ROOT, "a").unwrap(), b"returned", "{spec}");
+        let head = v.head(ROOT).unwrap();
+        assert_eq!(opens_saved(&state, open), 1, "{spec}");
+        drop(v);
+        let v = reopen(&state);
+        assert_eq!(v.head(ROOT).unwrap(), head, "{spec}");
+        assert_eq!(opens_saved(&state, open), 1, "{spec}");
+    }
 }
 
 #[cfg(feature = "failpoints")]
 #[test]
 fn a_step_killed_after_its_record_is_not_saved_again() {
     let tmp = tempfile::tempdir().unwrap();
-    // The create's batch is the first; the close's is the second.
     for spec in [
-        "tree.build_before_batch=kill@2",
-        "tree.build_after_pack=kill@2",
-        "tree.build_after_built_log=kill@2",
-        "tree.build_after_ref_copy=kill@2",
+        "tree.after_commit_point=kill@2",
+        "tree.after_ref_copy=kill@2",
+        "tree.before_checkout=kill@2",
+        "tree.after_checkout=kill@2",
     ] {
         let state = tmp.path().join(spec);
         let open = run_killed_worker("step_worker", &state, spec);
@@ -1373,14 +1363,15 @@ fn a_step_killed_after_its_record_is_not_saved_again() {
 #[test]
 fn a_fast_forward_killed_at_any_step_lands_once() {
     let tmp = tempfile::tempdir().unwrap();
-    // Steps and their batches: the fork, the link, the close, then the landing: the fourth
-    // pass over each failpoint.
+    // Hits: the root's seed save and the sandbox's create (none on the root's fork), then the
+    // close, then the landing: the third pass over each failpoint.
     for spec in [
-        "tree.before_step=kill@4",
-        "tree.build_before_batch=kill@4",
-        "tree.build_after_pack=kill@4",
-        "tree.build_after_built_log=kill@4",
-        "tree.build_after_ref_copy=kill@4",
+        "tree.before_objects=kill@3",
+        "tree.after_objects_durable=kill@3",
+        "tree.after_commit_point=kill@3",
+        "tree.after_ref_copy=kill@3",
+        "tree.before_checkout=kill@3",
+        "tree.after_checkout=kill@3",
     ] {
         let state = tmp.path().join(spec);
         run_killed_worker("fast_forward_worker", &state, spec);
@@ -1409,19 +1400,14 @@ fn fast_forward_worker() {
         return;
     };
     let mut v = new_actor(std::path::Path::new(&root));
-    // One batch per step: the fork, the link, the close, the landing.
     let fork = v.fork().unwrap();
-    v.settle().unwrap();
     let h = v.anonymous_open(fork, &writer("w")).unwrap();
     v.write(h, 0, b"sandbox", false).unwrap();
     v.first_link(fork, v.open_object(h).unwrap(), "a", &writer("w"))
         .unwrap();
-    v.settle().unwrap();
     println!("OPEN {h}");
     v.close(h).unwrap();
-    v.settle().unwrap();
     assert_eq!(v.take_next(ROOT).unwrap(), Took::Taken);
-    v.settle().unwrap();
     panic!("a failpoint should have killed this worker");
 }
 
@@ -1477,7 +1463,6 @@ fn a_failure_before_the_rename_is_retried_at_the_next_step() {
     assert!(!v.is_stopped());
     let path = tmp.path().join("calls.wal");
     assert!(fs::metadata(&path).unwrap().len() > 64 << 20);
-    v.settle().unwrap();
     put(&mut v, ROOT, "a", b"next");
     assert!(fs::metadata(&path).unwrap().len() < 1 << 20);
     assert_eq!(v.read(ROOT, "a").unwrap(), b"next");
@@ -1508,25 +1493,25 @@ fn a_failed_save_keeps_serving_and_saves_at_the_next_step() {
     let h = v.write_open(ROOT, "a", &writer("writer"), false).unwrap();
     v.write(h, 0, b"+returned", true).unwrap();
     let head = v.head(ROOT).unwrap();
-    let point = "tree.before_step";
-    let guard = agentfs_core::failpoints::configure(&format!("{point}=error")).unwrap();
-    assert!(v.close(h).is_err(), "{point}");
-    drop(guard);
-    assert!(!v.is_stopped(), "{point}");
-    assert_eq!(v.read(ROOT, "a").unwrap(), b"base", "{point}");
-    assert_eq!(v.head(ROOT).unwrap(), head, "{point}");
+    for point in ["tree.before_objects", "tree.after_objects_durable"] {
+        let guard = agentfs_core::failpoints::configure(&format!("{point}=error")).unwrap();
+        assert!(v.close(h).is_err(), "{point}");
+        drop(guard);
+        assert!(!v.is_stopped(), "{point}");
+        assert_eq!(v.read(ROOT, "a").unwrap(), b"base", "{point}");
+        assert_eq!(v.head(ROOT).unwrap(), head, "{point}");
+    }
     // Other work goes on, the failed close's handle still counting as open.
     let other = v.write_open(ROOT, "other", &writer("writer"), true);
     assert!(other.is_ok());
     assert_eq!(v.read(ROOT, "a").unwrap(), b"base+returned");
-    v.settle().unwrap();
     assert_eq!(opens_saved(tmp.path(), h), 1);
     assert!(matches!(v.close(h), Err(Error::NotFound)));
 
     // A failed save a restart finds saves there, once.
     let h = v.write_open(ROOT, "a", &writer("writer"), false).unwrap();
     v.write(h, 0, b"+again", true).unwrap();
-    let guard = agentfs_core::failpoints::configure("tree.before_step=error").unwrap();
+    let guard = agentfs_core::failpoints::configure("tree.before_objects=error").unwrap();
     assert!(v.close(h).is_err());
     drop(guard);
     drop(v);
@@ -1627,7 +1612,7 @@ fn a_failed_take_stays_queued_for_the_next_event() {
     let mut v = new_actor(tmp.path());
     let fork = v.fork().unwrap();
     put(&mut v, fork, "a", b"sandbox");
-    let guard = agentfs_core::failpoints::configure("tree.before_step=error").unwrap();
+    let guard = agentfs_core::failpoints::configure("tree.before_objects=error").unwrap();
     assert!(!v.progress().unwrap());
     drop(guard);
     assert!(!v.is_stopped());
@@ -1691,12 +1676,10 @@ fn branch_and_queue_recover_together_after_the_commit_point() {
         .write_open(fork, "a", &writer("writer"), true)
         .unwrap();
     volume.write(h, 0, b"saved", false).unwrap();
-    volume.settle().unwrap();
     let repo = repo(tmp.path());
     let before = repo.list_refs("refs/queue/root/").unwrap().len();
-    let guard = agentfs_core::failpoints::configure("tree.build_after_built_log=error").unwrap();
+    let guard = agentfs_core::failpoints::configure("tree.after_commit_point=error").unwrap();
     assert!(matches!(volume.close(h).unwrap(), Saved::Commit(_)));
-    volume.settle().unwrap();
     drop(guard);
     let committed = volume.head(fork).unwrap();
     drop(volume);
@@ -1730,9 +1713,8 @@ fn recovery_enqueues_once_after_failure_before_the_commit_point() {
     let before_head = volume.head(fork).unwrap();
     let repo = repo(tmp.path());
     let before = repo.list_refs("refs/queue/root/").unwrap();
-    let guard = agentfs_core::failpoints::configure("tree.before_step=error").unwrap();
+    let guard = agentfs_core::failpoints::configure("tree.after_objects_durable=error").unwrap();
     assert!(volume.close(h).is_err());
-    volume.settle().unwrap();
     drop(guard);
     assert_eq!(
         repo.head(&format!("refs/heads/{fork}")).unwrap(),
@@ -1843,7 +1825,6 @@ fn takes_visit_the_root_then_forks_by_number() {
     assert_eq!(forks, (1..=11).map(TreeId::Fork).collect::<Vec<_>>());
     put(&mut v, forks[0], "f", b"sandbox\n");
     put(&mut v, ROOT, "r", b"root\n");
-    v.settle().unwrap();
     let queued = |tree: TreeId| {
         repo(tmp.path())
             .list_refs(&format!("refs/queue/{tree}/"))
@@ -1857,7 +1838,6 @@ fn takes_visit_the_root_then_forks_by_number() {
         if !v.progress().unwrap() {
             break;
         }
-        v.settle().unwrap();
         let after: Vec<usize> = v.trees().into_iter().map(queued).collect();
         let tree = (0..before.len())
             .find(|i| after[*i] < before[*i])
@@ -1934,7 +1914,6 @@ fn a_landing_names_its_landed_writer() {
     v.write(h, 0, b"forked\n", false).unwrap();
     v.close(h).unwrap();
     assert_eq!(v.take_next(ROOT).unwrap(), Took::Taken);
-    v.settle().unwrap();
     let parents = git(tmp.path(), &["log", "-1", "--format=%P", &ROOT.to_string()]).stdout;
     assert_eq!(
         String::from_utf8(parents)

@@ -99,12 +99,6 @@ init() { # volume
 in_history() { # git args...
   in_state git --git-dir /data/state/history.git "$@"
 }
-# History is built behind the calls (docs/trees.md): wait until `rev:path`
-# holds `want`, or fail.
-built() { # rev:path want what
-  wait_for 120 sh -c "[ \"\$(docker run --rm -v '$DATA:/data' --entrypoint git '$IMAGE' --git-dir /data/state/history.git show '$1' 2>/dev/null)\" = '$2' ]" ||
-    fail "$3: history never held $1"
-}
 # Every file under the state area with its SHA-256, in name order.
 state_hashes() {
   in_state sh -c 'cd /data/state && find . -type f -print0 | sort -z | xargs -0 sha256sum'
@@ -117,7 +111,6 @@ mount_view() {
     -v "$DATA:/data" "${POD[@]}" \
     --mount "type=bind,src=$MOUNT_DIR,dst=/agentfs,bind-propagation=rshared" \
     "$IMAGE" --state /data/state trees mount /agentfs/root --volume t --owner 10000:10000 \
-    --metrics-output /data/metrics.json \
     >/dev/null
   wait_for 60 mounted || { docker logs "$NAME" >&2; fail 'the tree view did not mount'; }
   pass 'the root is mounted'
@@ -154,8 +147,7 @@ mount_view
 # The close's release reaches agentfs after close(2) returns; the view takes
 # requests in order, so the read that follows sees the release done.
 workload -- 'printf hello > /agentfs/root/a.txt && cat /agentfs/root/a.txt >/dev/null'
-built root:files/a.txt hello 'the root holds a.txt once its close returned and history is built'
-pass 'the root holds a.txt once its close returned and history is built'
+assert_eq hello "$(in_history show root:files/a.txt)" 'the root holds a.txt once its close returned'
 message=$(in_history log -1 --format=%B root)
 assert_contains "$message" 'Agentfs-Volume: t' 'the save names its volume'
 assert_contains "$message" "Agentfs-Volume-Id: $id" 'and its id'
@@ -186,8 +178,7 @@ unnamed=$(in_history log --format='%H%n%(trailers:key=Agentfs-Pod,valueonly)%n--
   awk '/^--$/ { if (!pod) print sha; sha = ""; pod = 0; next } !sha { sha = $0; next } $0 == "pod-t" { pod = 1 }')
 assert_eq '' "$unnamed" 'every commit on the root carries its pod trailers'
 workload -- 'printf again > /agentfs/root/after.txt && cat /agentfs/root/after.txt >/dev/null'
-built root:files/after.txt again 'a restarted workload writes through the new mount'
-pass 'a restarted workload writes through the new mount'
+assert_eq again "$(in_history show root:files/after.txt)" 'a restarted workload writes through the new mount'
 has_trailers "$(in_history log -1 --format=%B root)" 'its save'
 
 if [ -n "$FS" ]; then
@@ -197,7 +188,6 @@ if [ -n "$FS" ]; then
   # files need no other owner, and so a stuck view's connection can be
   # aborted; the stat after each save is the timed end.
   sudo python3 "$(dirname "$0")/trees-figures.py" --view "$VIEW" --filesystem "$FS" \
-    --metrics "$DATA/metrics.json" --drain-cap 180 \
     --image "$(docker image inspect --format '{{.Id}}' "$IMAGE")" \
     --budget "$(dirname "$0")/trees-budget.json" --output "$report"
   cat "$report"
@@ -209,22 +199,19 @@ print(json.dumps(w.get(sys.argv[3], 0)))' "$report" "$1" "$2"
   assert_eq "close_4k create close_64m" \
     "$(python3 -c 'import json, sys; print(*(w["name"] for w in json.load(open(sys.argv[1]))["workloads"]))' "$report")" \
     'the report lists every workload'
-  # A save each workload saw answered is in history once the built point reached
-  # it (drain_s); a save the deadline caught may have landed after it, so history
-  # may hold one more. A workload whose history did not drain within the cap is
-  # a figure, reported as such.
-  drained() { [ "$(figure "$1" drain_s)" != null ] || { echo "::warning title=tree views, $FS::$1's history did not drain within the cap"; false; }; }
+  # A save each workload saw answered is in history; a save the deadline
+  # caught may have landed after it, so history may hold one more.
   n=$(figure close_4k count)
-  if [ "$n" -gt 0 ] && drained close_4k; then
+  if [ "$n" -gt 0 ]; then
     held=$(in_history show root:files/fig-close4k | sed -n 1p)
     [ "$held" -ge "$n" ] || fail "history holds 4 KiB save $held, the workload saw $n answered"
     pass "4 KiB save $n is in history"
   fi
   n=$(figure create count)
-  if [ "$n" -gt 0 ] && drained create; then
+  if [ "$n" -gt 0 ]; then
     assert_eq "$n" "$(in_history show "root:files/fig-create-$n")" "create $n is in history"
   fi
-  if [ "$(figure close_64m finished)" = true ] && drained close_64m; then
+  if [ "$(figure close_64m finished)" = true ]; then
     assert_eq 67108864 "$(in_history cat-file -s root:files/fig-64m)" 'the 64 MiB save is in history'
   fi
 fi

@@ -172,7 +172,7 @@ def two_writers(root, repo, name, kinds, offsets, reverse):
             case.log(f"fresh open after both closes, B first ({why})",
                      path.read_bytes(), expected)
             case.log(f"root history after both closes ({why})",
-                     read(repo, "root", path.name, expected), expected)
+                     read(repo, "root", path.name), expected)
             return
         # A's close saves what the kernel flushed, which holds B's mapped stores.
         case.log("fresh open after A closes while B remains open (R1.1, R1.4)",
@@ -180,7 +180,7 @@ def two_writers(root, repo, name, kinds, offsets, reverse):
         case.finish(writers[1])
         case.log("fresh open after B closes (R8, R9.16; Linux byte calls)",
                  path.read_bytes(), final)
-        case.log("root history after B closes (R8)", read(repo, "root", path.name, final), final)
+        case.log("root history after B closes (R8)", read(repo, "root", path.name), final)
 
     return Case(name).run(body)
 
@@ -201,7 +201,7 @@ def three_writers(root, repo, name, close_order):
         for i in close_order:
             case.finish(writers[i])
         case.log("fresh open after all close", path.read_bytes(), final)
-        case.log("root history after all close", read(repo, "root", path.name, final), final)
+        case.log("root history after all close", read(repo, "root", path.name), final)
 
     return Case(name).run(body)
 
@@ -252,7 +252,7 @@ def grown_mapping(root, repo):
 
         in_child(case, "ftruncate past the page, map, store, stat elsewhere", grow)
         case.log("fresh open after the save", path.read_bytes(), expected)
-        case.log("root history", read(repo, "root", path.name, expected), expected)
+        case.log("root history", read(repo, "root", path.name), expected)
 
     return Case("grown-mapping").run(body)
 
@@ -273,7 +273,7 @@ def create_then_map(root, repo):
         in_child(case, "create, ftruncate, map, store in one program", create)
         expected = PAYLOADS[0] + bytes(SIZE - 4)
         case.log("fresh open after the save", path.read_bytes(), expected)
-        case.log("root history", read(repo, "root", path.name, expected), expected)
+        case.log("root history", read(repo, "root", path.name), expected)
 
     return Case("create-then-map").run(body)
 

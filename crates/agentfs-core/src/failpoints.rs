@@ -42,14 +42,14 @@ pub const POINTS: &[&str] = &[
     "tree.wal_after_payload",
     "tree.wal_before_fsync",
     "tree.wal_after_fsync",
-    "tree.before_step",
+    "tree.before_objects",
+    "tree.after_objects_durable",
+    "tree.after_commit_point",
+    "tree.after_ref_copy",
+    "tree.before_checkout",
+    "tree.after_checkout",
     "tree.compact_before_rename",
     "tree.compact_after_rename",
-    // The tree builder, behind the call path (docs/trees.md).
-    "tree.build_before_batch",
-    "tree.build_after_pack",
-    "tree.build_after_built_log",
-    "tree.build_after_ref_copy",
     // The synchronous step.
     "pending.after_freeze",
     "journal.before_write",
@@ -96,20 +96,7 @@ pub fn hit(_name: &'static str) -> io::Result<()> {
 }
 
 #[cfg(feature = "failpoints")]
-pub use imp::{FailpointError, Guard, adopt, configure, hit, hits, owner, trace};
-
-/// The thread a [`configure`]d spec acts on when hit here: a worker thread
-/// passes this to [`adopt`] so its points act for the thread that started it.
-/// `None` in builds without the `failpoints` feature.
-#[cfg(not(feature = "failpoints"))]
-pub fn owner() -> Option<std::thread::ThreadId> {
-    None
-}
-
-/// Makes this thread's points act as `owner`'s ([`owner`]). A no-op in builds
-/// without the `failpoints` feature.
-#[cfg(not(feature = "failpoints"))]
-pub fn adopt(_owner: Option<std::thread::ThreadId>) {}
+pub use imp::{FailpointError, Guard, configure, hit, hits, trace};
 
 #[cfg(feature = "failpoints")]
 pub use take_gate::{TakeGate, take_gate};
@@ -126,9 +113,7 @@ mod take_gate {
 
     /// `AGENTFS_TAKE_GATE=<dir>` with fifos `go` and `took`: the worker takes
     /// nothing by itself; a line `tree` on `go` runs one `take_next(tree)` and
-    /// answers taken|waiting|empty on `took`, or `error ...`; a line `settle`
-    /// waits until history is built through every record so far and answers
-    /// `settled`. An empty line ends
+    /// answers taken|waiting|empty on `took`, or `error ...`. An empty line ends
     /// the gate, so an unmount can join the worker. The actor stays unlocked
     /// while it waits.
     pub struct TakeGate {
@@ -193,7 +178,7 @@ mod imp {
     pub enum FailpointError {
         #[error("unknown failpoint {0:?} (see agentfs_core::failpoints::POINTS)")]
         UnknownPoint(String),
-        #[error("bad failpoint spec {0:?}: expected name=kill|error|panic|sleep(ms)[@n|@*]")]
+        #[error("bad failpoint spec {0:?}: expected name=kill|error|panic|sleep(ms)[@n]")]
         BadSpec(String),
     }
 
@@ -231,24 +216,6 @@ mod imp {
     /// Whether any spec is in force: the fast path of [`hit`] is this
     /// one relaxed load.
     static ACTIVE: AtomicBool = AtomicBool::new(false);
-
-    thread_local! {
-        /// The thread whose configured spec this thread's points act on.
-        static OWNER: std::cell::Cell<Option<std::thread::ThreadId>> =
-            const { std::cell::Cell::new(None) };
-    }
-
-    /// The thread a [`configure`]d spec acts on when hit here: the adopted
-    /// owner, or this thread.
-    pub fn owner() -> Option<std::thread::ThreadId> {
-        Some(OWNER.get().unwrap_or_else(|| std::thread::current().id()))
-    }
-
-    /// Makes this thread's points act as `owner`'s: a worker started for a
-    /// test (the tree builder) fails where that test configured.
-    pub fn adopt(owner: Option<std::thread::ThreadId>) {
-        OWNER.set(owner);
-    }
     static STATE: Mutex<Option<State>> = Mutex::new(None);
     static ENV: Once = Once::new();
     /// Serialises in-process tests that configure failpoints.
@@ -269,9 +236,7 @@ mod imp {
                 .copied()
                 .find(|p| *p == name)
                 .ok_or_else(|| FailpointError::UnknownPoint(name.to_owned()))?;
-            // `@*` acts at every hit (stored as 0); `@n` at the nth only.
             let (action, nth) = match rest.trim().rsplit_once('@') {
-                Some((a, "*")) => (a, 0),
                 Some((a, n)) => (a, n.parse::<u64>().ok().filter(|n| *n > 0).ok_or_else(bad)?),
                 None => (rest.trim(), 1),
             };
@@ -327,7 +292,7 @@ mod imp {
             let Some(st) = guard.as_mut() else {
                 return Ok(());
             };
-            if st.thread.is_some_and(|t| Some(t) != owner()) {
+            if st.thread.is_some_and(|t| t != std::thread::current().id()) {
                 return Ok(());
             }
             let count = st.hits.entry(name).or_default();
@@ -335,7 +300,7 @@ mod imp {
             let count = *count;
             st.trace.push(name);
             match st.actions.get(name) {
-                Some((action, nth)) if *nth == count || *nth == 0 => *action,
+                Some((action, nth)) if *nth == count => *action,
                 _ => return Ok(()),
             }
         };

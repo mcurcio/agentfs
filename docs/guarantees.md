@@ -263,7 +263,4 @@ The [tree views](trees.md) have their own limits, which that page lists. A tree
 view records every call in its journal before the call returns, so a returned call
 survives a crash of agentfs. It survives a power cut once the file's `close(2)` or
 `fsync(2)`, an `O_SYNC` write, or an `fsync(2)` of the view's directory has
-returned ([trees.md](trees.md#recording-and-durability)). Its git history is built
-behind the calls: a save is visible to the views at its release, and in Git's refs
-and commits once the builder reaches it; nothing in Git names an object that is not
-durable ([trees.md](trees.md#history-trails-the-files)).
+returned ([trees.md](trees.md#recording-and-durability)).
