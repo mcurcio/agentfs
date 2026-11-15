@@ -91,6 +91,7 @@ on his answer.
 - **Guidance**, 2026-11-13. Asked how history lays out a directory of 100,000 files, he picked "Hashed sub-folders" [`files/7f/.../report.txt`; plain `git log -- path` and GitHub's folder view need the hashed path]. Applies to: the tree views' commit layout.
 - **Guidance**, 2026-11-14. After M1 S3-S6 and an estimate of two to three days more to the baseline: "stop after the next slice and then we'll discuss. i have lost faith in your abilities to drive this process. no other code takes 2-3 DAYS to build -- you are doing something fundamentally wrong". Earlier the same day, on running each slice as a separate agent: "The accepted normal practice is to use workflows instead".
 - **Guidance**, 2026-11-15. Asked whether one engine means migrating to the tree views: "yes, thats the plan". On how: "the work should be done quickly, with a reasonable local test suite". On what done means: "getting the one engine system back to its basic state where i can deploy it in hermes and start testing it". Applies to: `docs/target-architecture/future/one-engine.md`.
+- **Guidance**, 2026-11-15. On dropping per-slice design pages: "i agree with "no design pages", but you must still keep an architect-driven workflow style. the slices are only a rough plan and each one should be lead by an architecture round which guides the plan and sets the workflow steps". Applies to: how milestones are run.
 
 ## History and versions
 
