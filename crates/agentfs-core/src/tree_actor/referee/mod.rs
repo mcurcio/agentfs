@@ -14,24 +14,28 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
+use super::meta::Meta;
 use super::queue;
 use super::tree::{EventNumber, LineVersion, Lines, MergeFileIdentity, NameHistory};
 use super::{Error, Result};
 pub(super) use ancestry::Broken;
 pub(super) use undecided::{Landed, Undecided, ended_files, undecided};
 
-/// A tree's files and name histories, each file's lines as stored (runs) or,
-/// for the rules, line by line ([`ByLine`]).
+/// A tree's files, name histories and directories, each file's lines as
+/// stored (runs) or, for the rules, line by line ([`ByLine`]). `dirs` holds
+/// each directory's metadata by path, `""` the root.
 #[derive(Clone, Debug, Default)]
 pub(super) struct Snapshot<L = Lines> {
     pub files: BTreeMap<MergeFileIdentity, File<L>>,
     pub names: BTreeMap<MergeFileIdentity, NameHistory>,
+    pub dirs: BTreeMap<String, Meta>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct File<L = Lines> {
     pub object: u64,
     pub lines: L,
+    pub meta: Meta,
 }
 
 /// A file's lines one by one, every version with its ancestor: what the rules read.
@@ -53,11 +57,13 @@ impl Snapshot {
                         File {
                             object: f.object,
                             lines: f.lines.expand(),
+                            meta: f.meta,
                         },
                     )
                 })
                 .collect(),
             names: self.names.clone(),
+            dirs: self.dirs.clone(),
         }
     }
 }
@@ -75,11 +81,13 @@ impl ByLine {
                         File {
                             object: f.object,
                             lines: Lines::from_expanded(&f.lines)?,
+                            meta: f.meta,
                         },
                     ))
                 })
                 .collect::<Result<_>>()?,
             names: self.names,
+            dirs: self.dirs,
         })
     }
 }
@@ -164,16 +172,22 @@ fn land_by_line(
     } = verdicts::verdicts(upstream, base, incoming, prior)?;
     names::displace(upstream, base, incoming, &applied_names, &mut candidates)?;
     let mut applied = upstream.clone();
+    // Interim until the directory landing rules (MODEL.md R13-R15) are built:
+    // every directory of the change the upstream lacks is added; none goes.
+    for (path, meta) in &incoming.dirs {
+        applied.dirs.entry(path.clone()).or_insert(*meta);
+    }
     for (id, name) in applied_names {
         if name.is_ended()? {
             applied.files.remove(&id);
         } else if let std::collections::btree_map::Entry::Vacant(entry) = applied.files.entry(id) {
             // A live name for an identity the upstream lacks makes an empty file. Only lines of
             // this change apply; lines of an earlier change that lost stay absent.
-            let object = incoming.files.get(&id).ok_or(Error::Format)?.object;
+            let file = incoming.files.get(&id).ok_or(Error::Format)?;
             entry.insert(File {
-                object,
+                object: file.object,
                 lines: Expanded::default(),
+                meta: file.meta,
             });
         }
         applied.names.insert(id, name);
@@ -203,10 +217,21 @@ fn land_by_line(
             File {
                 object: theirs.map_or(file.object, |f| f.object),
                 lines: placed.lines,
+                meta: kept_meta(theirs, base.files.get(&id), file),
             },
         );
     }
     Ok(whole::whole(upstream, applied, candidates))
+}
+
+/// The metadata a landed file keeps. Interim until the directory landing
+/// rules (MODEL.md R13-R15) are built: the change's, when it changed the
+/// file's metadata or the upstream lacks the file; else the upstream's.
+fn kept_meta<L>(theirs: Option<&File<L>>, base: Option<&File<L>>, incoming: &File<L>) -> Meta {
+    match theirs {
+        Some(theirs) if base.is_some_and(|base| base.meta == incoming.meta) => theirs.meta,
+        _ => incoming.meta,
+    }
 }
 
 /// A sync never decides (R3a): the upstream's snapshot with the fork's undecided versions kept
@@ -233,11 +258,17 @@ pub(super) fn sync(
             files.insert(*id, placed.remove(id).ok_or(Error::Format)?);
         }
     }
-    Snapshot { files, names }.stored()
+    // Interim until the directory landing rules (MODEL.md R13-R15) are built:
+    // every directory of the upstream the fork lacks is added; none goes.
+    let mut dirs = fork.dirs.clone();
+    for (path, meta) in &upstream.dirs {
+        dirs.entry(path.clone()).or_insert(*meta);
+    }
+    Snapshot { files, names, dirs }.stored()
 }
 
-/// A step's lock keys (R9, R9.1): every file whose name head or lines differ, and each path it
-/// had or has.
+/// A step's lock keys (R9, R9.1): every file whose name head, lines or metadata differ, and each
+/// path it had or has; every directory added, removed or changed.
 pub(super) fn touches(before: &Snapshot, after: &Snapshot) -> BTreeSet<queue::Key> {
     let ids: BTreeSet<_> = before
         .names
@@ -252,8 +283,8 @@ pub(super) fn touches(before: &Snapshot, after: &Snapshot) -> BTreeSet<queue::Ke
         let old = before.names.get(&id);
         let new = after.names.get(&id);
         if old.map(|h| h.head) == new.map(|h| h.head)
-            && before.files.get(&id).map(|file| &file.lines)
-                == after.files.get(&id).map(|file| &file.lines)
+            && before.files.get(&id).map(|file| (&file.lines, file.meta))
+                == after.files.get(&id).map(|file| (&file.lines, file.meta))
         {
             continue;
         }
@@ -263,6 +294,11 @@ pub(super) fn touches(before: &Snapshot, after: &Snapshot) -> BTreeSet<queue::Ke
             if let Ok(Some(path)) = history.path() {
                 keys.insert(queue::Key::Name(path.to_owned()));
             }
+        }
+    }
+    for path in before.dirs.keys().chain(after.dirs.keys()) {
+        if before.dirs.get(path) != after.dirs.get(path) {
+            keys.insert(queue::Key::Name(path.clone()));
         }
     }
     keys
@@ -371,7 +407,14 @@ mod tests {
         snapshot
             .names
             .insert(key, NameHistory::created(EventNumber::new(id), path.into()));
-        snapshot.files.insert(key, File { object: id, lines });
+        snapshot.files.insert(
+            key,
+            File {
+                object: id,
+                lines,
+                meta: crate::tree_actor::meta::TEST_FILE,
+            },
+        );
     }
     fn edit(snapshot: &mut Snapshot, id: u64, bytes: &[u8], seq: u64) {
         let file = snapshot.files.get_mut(&MergeFileIdentity(id)).unwrap();
@@ -742,10 +785,12 @@ mod sync_tests {
                         lines: vec![line],
                         ancestors: [(v(version), None)].into_iter().collect(),
                     },
+                    meta: crate::tree_actor::meta::TEST_FILE,
                 },
             )]
             .into_iter()
             .collect(),
+            dirs: BTreeMap::new(),
         }
     }
 

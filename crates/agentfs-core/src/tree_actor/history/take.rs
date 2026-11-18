@@ -216,15 +216,17 @@ pub(in crate::tree_actor) fn take_bytes(
 }
 
 /// Whether two snapshots show the same: the same files, each with the same line
-/// versions in the same order, and the same name versions. The versions each line
-/// version was written over may differ.
+/// versions in the same order and the same metadata, the same name versions and
+/// the same directories. The versions each line version was written over may
+/// differ.
 fn shows_the_same(a: &referee::Snapshot, b: &referee::Snapshot) -> bool {
     a.files.len() == b.files.len()
         && a.names.len() == b.names.len()
+        && a.dirs == b.dirs
         && a.files.iter().all(|(id, file)| {
-            b.files
-                .get(id)
-                .is_some_and(|other| other.lines.runs() == file.lines.runs())
+            b.files.get(id).is_some_and(|other| {
+                other.lines.runs() == file.lines.runs() && other.meta == file.meta
+            })
         })
         && a.names.iter().all(|(id, history)| {
             b.names
@@ -285,11 +287,15 @@ pub(in crate::tree_actor) fn decide_landing(
         read_snapshot(repo, incoming, objects)?,
     );
     let prior = prior_decisions(repo, current)?;
-    let decision = {
+    let mut decision = {
         let _timer = Timer::start(Which::Judge);
         referee::land(mine, &base, &theirs, &prior)?
     };
     let head = if base_commit == current {
+        // Interim until the directory landing rules (MODEL.md R13-R15) are
+        // built: a fast-forward's tree is the change's commit, directories
+        // and all.
+        decision.snapshot.dirs = theirs.dirs.clone();
         // Made on the parent's current version: every line replaces the
         // parent's, so nothing collides, and the save itself is the head.
         if !decision.collisions.is_empty()

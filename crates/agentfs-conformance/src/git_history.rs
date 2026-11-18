@@ -286,15 +286,16 @@ impl Git {
 
     pub(crate) fn commit(&mut self, oid: &str) -> Result<Commit, String> {
         let header = self.header(oid)?;
-        // The root commit has no envelope and its files are at the top.
+        // The root commit has no envelope and holds no file: its tree is the
+        // root directory's record alone.
         if header.trailers("Agentfs-Format").is_empty() {
-            let mut files = BTreeMap::new();
             for line in self.run(&["ls-tree", "-r", "--full-tree", oid])?.lines() {
-                let (meta, path) = line.split_once('\t').ok_or_else(|| line.to_owned())?;
-                let blob = meta.rsplit(' ').next().ok_or_else(|| line.to_owned())?;
-                files.insert(path.to_owned(), self.object(blob)?);
+                let (_, path) = line.split_once('\t').ok_or_else(|| line.to_owned())?;
+                if path != "dirs/root" {
+                    return Err(format!("{oid:.7}: the root commit holds {path}"));
+                }
             }
-            return Ok(Commit { files, ..header });
+            return Ok(header);
         }
         let mut commit = header;
         for (name, blob) in self.leaves(oid, "files")? {
@@ -355,7 +356,7 @@ fn nth(version: &str, n: u64) -> Result<String, String> {
     Ok(format!("{event}:{}", index + n))
 }
 
-/// A `lines/` entry, `[identity, line map]`, over the file's bytes. The map is
+/// A `lines/` entry, `[identity, line map, meta]`, over the file's bytes. The map is
 /// runs of lines whose identities and versions number on; each live line ends
 /// at a newline, or after `open` bytes for a run's last line that has none; the
 /// ancestors are runs too (docs/trees.md, "What a commit holds").
@@ -624,7 +625,7 @@ pub(crate) mod tests {
                     let ancestors: Vec<String> = lines_versions(&lines);
                     (
                         Some(format!(
-                            r#"[1,{{"lines":[{}],"ancestors":[{}]}}]"#,
+                            r#"[1,{{"lines":[{}],"ancestors":[{}]}},{{"kind":"file","mode":"0644","uid":0,"gid":0}}]"#,
                             lines.join(","),
                             ancestors.join(",")
                         )),
@@ -669,7 +670,7 @@ pub(crate) mod tests {
             self.git(
             &args,
             format!(
-                "{cause}\n\nAgentfs-Writer: agentfs\nAgentfs-Cause: {cause}\nAgentfs-Format: envelope-1\n{extra}"
+                "{cause}\n\nAgentfs-Writer: agentfs\nAgentfs-Cause: {cause}\nAgentfs-Format: envelope-2\n{extra}"
             )
             .as_bytes(),
         )

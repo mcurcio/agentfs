@@ -1,7 +1,9 @@
 //! The view host (docs/library/filesystem.md, "The view host"): each view is
-//! a flat-file FUSE mount of one tree, reached only through its client's
-//! session (`agentfs_core::session`), so its calls name no tree and no
-//! writer. Direct I/O and zero TTLs; no passthrough or writeback-cache
+//! a FUSE mount of one tree, its directories and files with their recorded
+//! modes, reached only through its client's session (`agentfs_core::session`),
+//! so its calls name no tree and no writer. Inode 1 is the root directory;
+//! every other entry's inode is its node number + 2. Direct I/O and zero
+//! TTLs; no passthrough or writeback-cache
 //! negotiation. Shared mappings go through the kernel's page cache all the
 //! same, so a read with no lock owner is a page fill and a write with
 //! `FUSE_WRITE_CACHE` a page write; `agentfs_core::tree_actor`'s `pages`
@@ -19,7 +21,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use agentfs_contracts::clients::{Access, Binding, FileOwner};
 use agentfs_contracts::views::{MountOptions, MountPoint, ViewError, ViewId, Views};
 use agentfs_core::session::{SessionGuard, Sessions, TreeSession};
-use agentfs_core::tree_actor::{Error, FileMap, Progress, Recording, Saved, TreeId};
+use agentfs_core::tree_actor::{
+    Attrs, Error, FileMap, Kind, Node, Perm, Progress, Recording, RenameMode, Saved, TreeId,
+};
 use fuser::*;
 
 const TTL: Duration = Duration::ZERO;
@@ -423,7 +427,8 @@ fn session_config(options: &MountOptions, read_only: bool) -> Config {
 #[derive(Clone)]
 struct View {
     session: TreeSession,
-    /// Every file's and directory's owner, until file metadata is recorded.
+    /// Every file's and directory's presented owner, until the recorded
+    /// owner is presented.
     owner: FileOwner,
     handles: Arc<Mutex<Handles>>,
 }
@@ -457,6 +462,43 @@ fn errno(error: Error) -> Errno {
     Errno::from_i32(error.errno())
 }
 
+/// The inode of a node: 1 for the root directory, else its number + 2.
+fn inode(node: &Node) -> INodeNo {
+    INodeNo(node.number.map_or(1, |number| number + 2))
+}
+
+/// `dir`'s entry `name` as a tree path (`dir` `""` for the root).
+fn child_path(dir: &str, name: &OsStr) -> Result<String> {
+    let name = name.to_str().ok_or(Errno::EINVAL)?;
+    Ok(if dir.is_empty() {
+        name.to_owned()
+    } else {
+        format!("{dir}/{name}")
+    })
+}
+
+/// The directory holding `path`: `""` for a top-level entry.
+fn parent_dir(path: &str) -> &str {
+    path.rsplit_once('/').map_or("", |(parent, _)| parent)
+}
+
+/// A time as the kernel takes it.
+fn time(ns: u64) -> SystemTime {
+    UNIX_EPOCH + Duration::from_nanos(ns)
+}
+
+/// What a create gives the new entry: the mode the kernel gives (its umask
+/// applied), owned by the calling process.
+fn create_attrs(req: &Request, mode: u32) -> Attrs {
+    Attrs {
+        perm: Perm::from_mode(mode),
+        owner: FileOwner {
+            uid: req.uid(),
+            gid: req.gid(),
+        },
+    }
+}
+
 /// Whether an open's writes must each be durable before they are answered.
 fn sync_flags(flags: i32) -> bool {
     flags & (libc::O_SYNC | libc::O_DSYNC) != 0
@@ -488,15 +530,35 @@ impl View {
     fn handles(&self) -> Result<MutexGuard<'_, Handles>> {
         self.handles.lock().map_err(|_| Errno::EIO)
     }
+    /// The tree path of a named file, link or directory (`""` the root).
     fn path(&self, v: &SessionGuard<'_>, ino: INodeNo) -> Result<String> {
-        let object = ino.0.checked_sub(2).ok_or(Errno::ENOENT)?;
-        v.path_of(object).map(str::to_owned).map_err(errno)
+        if ino.0 == 1 {
+            return Ok(String::new());
+        }
+        let number = ino.0.checked_sub(2).ok_or(Errno::ENOENT)?;
+        v.node_at(number)
+            .map(|(path, _)| path.to_owned())
+            .map_err(errno)
+    }
+    /// The node of an inode: a named entry, or a file no name reaches (an
+    /// anonymous open's, or one unlinked while open).
+    fn node(&self, v: &SessionGuard<'_>, ino: INodeNo) -> Result<Node> {
+        if ino.0 == 1 {
+            return v.node("").map_err(errno);
+        }
+        let number = ino.0.checked_sub(2).ok_or(Errno::ENOENT)?;
+        match v.node_at(number) {
+            Ok((_, node)) => Ok(node),
+            Err(Error::NotFound) => v.open_node(number).map_err(errno),
+            Err(e) => Err(errno(e)),
+        }
     }
     fn attr(&self, v: &SessionGuard<'_>, ino: INodeNo, fh: Option<FileHandle>) -> Result<FileAttr> {
+        let node = self.node(v, ino)?;
         // First: the kernel keeps one size per inode, and an unlinked mapped
         // file's fstat has no path.
         let open_size = ino.0.checked_sub(2).and_then(|object| v.inode_size(object));
-        let size: u64 = if ino.0 == 1 {
+        let size: u64 = if node.meta.kind == Kind::Dir {
             0
         } else if let Some(size) = open_size {
             size
@@ -522,30 +584,23 @@ impl View {
                 .ok_or(Errno::ENOENT)?;
             v.read_open(handle).map_err(errno)?.len()
         } else {
-            v.file_len(&self.path(v, ino)?).map_err(errno)?
+            node.len
         };
-        let dir = ino.0 == 1;
         Ok(FileAttr {
             ino,
             size,
             blocks: size.div_ceil(512),
-            atime: UNIX_EPOCH,
-            mtime: UNIX_EPOCH,
-            ctime: UNIX_EPOCH,
-            crtime: UNIX_EPOCH,
-            kind: if dir {
-                FileType::Directory
-            } else {
-                FileType::RegularFile
+            atime: time(node.times.atime_ns),
+            mtime: time(node.times.mtime_ns),
+            ctime: time(node.times.ctime_ns),
+            crtime: time(node.times.ctime_ns),
+            kind: match node.meta.kind {
+                Kind::Dir => FileType::Directory,
+                Kind::Symlink => FileType::Symlink,
+                Kind::File => FileType::RegularFile,
             },
-            perm: if dir { 0o700 } else { 0o600 },
-            nlink: if dir {
-                2
-            } else if v.is_anonymous(ino.0 - 2).map_err(errno)? {
-                0
-            } else {
-                1
-            },
+            perm: u16::try_from(node.meta.mode.bits()).unwrap_or(0),
+            nlink: node.links,
             uid: self.owner.uid,
             gid: self.owner.gid,
             rdev: 0,
@@ -553,12 +608,22 @@ impl View {
             flags: 0,
         })
     }
+    /// The attributes of the entry at `path`.
+    fn attr_at(
+        &self,
+        v: &SessionGuard<'_>,
+        path: &str,
+        fh: Option<FileHandle>,
+    ) -> Result<FileAttr> {
+        let node = v.node(path).map_err(errno)?;
+        self.attr(v, inode(&node), fh)
+    }
     fn open_file(
         &self,
         v: &mut SessionGuard<'_>,
         path: &str,
         flags: i32,
-        create: bool,
+        create: Option<Attrs>,
     ) -> Result<u64> {
         let mut handles = self.handles()?;
         let write = flags & libc::O_ACCMODE != libc::O_RDONLY;
@@ -579,8 +644,8 @@ impl View {
                 sync: sync_flags(flags),
             }
         } else {
-            if create {
-                let h = v.write_open(path, true).map_err(errno)?;
+            if create.is_some() && v.node(path).is_err() {
+                let h = v.write_open(path, create).map_err(errno)?;
                 v.close(h).map_err(errno)?;
             }
             Open::Read(v.file_map(path).map_err(errno)?)
@@ -627,13 +692,9 @@ impl Filesystem for View {
     }
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         let result = (|| {
-            if parent.0 != 1 {
-                return Err(Errno::ENOTDIR);
-            }
-            let name = name.to_str().ok_or(Errno::EINVAL)?;
             let v = self.actor()?;
-            let object = v.object_at(name).map_err(errno)?;
-            self.attr(&v, INodeNo(object + 2), None)
+            let path = child_path(&self.path(&v, parent)?, name)?;
+            self.attr_at(&v, &path, None)
         })();
         match result {
             Ok(attr) => reply.entry(&TTL, &attr, Generation(0)),
@@ -651,7 +712,7 @@ impl Filesystem for View {
             let result = admitted.and_then(|()| {
                 let mut v = view.actor()?;
                 let path = view.path(&v, ino)?;
-                view.open_file(&mut v, &path, flags.0, false)
+                view.open_file(&mut v, &path, flags.0, None)
             });
             match result {
                 Ok(fh) => reply.opened(FileHandle(fh), FopenFlags::FOPEN_DIRECT_IO),
@@ -667,32 +728,26 @@ impl Filesystem for View {
     }
     fn create(
         &self,
-        _req: &Request,
+        req: &Request,
         parent: INodeNo,
         name: &OsStr,
-        _mode: u32,
+        mode: u32,
         _umask: u32,
         flags: i32,
         reply: ReplyCreate,
     ) {
         let name = name.to_owned();
+        let attrs = create_attrs(req, mode);
         self.gated(move |view, admitted| {
             let result = admitted.and_then(|()| {
                 (|| {
-                    if parent.0 != 1 {
-                        return Err(Errno::ENOTDIR);
-                    }
-                    let path = name.to_str().ok_or(Errno::EINVAL)?;
                     let mut v = view.actor()?;
-                    if flags & libc::O_EXCL != 0 && v.read(path).is_ok() {
+                    let path = child_path(&view.path(&v, parent)?, &name)?;
+                    if flags & libc::O_EXCL != 0 && v.node(&path).is_ok() {
                         return Err(Errno::EEXIST);
                     }
-                    let fh = view.open_file(&mut v, path, flags, true)?;
-                    let object = v.object_at(path).map_err(errno)?;
-                    Ok((
-                        fh,
-                        view.attr(&v, INodeNo(object + 2), Some(FileHandle(fh)))?,
-                    ))
+                    let fh = view.open_file(&mut v, &path, flags, Some(attrs))?;
+                    Ok((fh, view.attr_at(&v, &path, Some(FileHandle(fh)))?))
                 })()
             });
             match result {
@@ -709,21 +764,22 @@ impl Filesystem for View {
     }
     fn tmpfile(
         &self,
-        _req: &Request,
+        req: &Request,
         parent: INodeNo,
-        _mode: u32,
+        mode: u32,
         _umask: u32,
         flags: i32,
         reply: ReplyCreate,
     ) {
+        let attrs = create_attrs(req, mode);
         self.gated(move |view, admitted| {
             let result = admitted.and_then(|()| {
                 (|| {
-                    if parent.0 != 1 {
+                    let mut v = view.actor()?;
+                    if view.node(&v, parent)?.meta.kind != Kind::Dir {
                         return Err(Errno::ENOTDIR);
                     }
-                    let mut v = view.actor()?;
-                    let handle = v.anonymous_open().map_err(errno)?;
+                    let handle = v.anonymous_open(attrs).map_err(errno)?;
                     let object = v.open_object(handle).map_err(errno)?;
                     let mut handles = view.handles()?;
                     let fh = handles.next;
@@ -872,15 +928,24 @@ impl Filesystem for View {
         let setattr = move |view: &View, admitted: Result<()>| {
             let result = admitted.and_then(|()| {
                 (|| {
-                    if mode.is_some()
-                        || uid.is_some()
-                        || gid.is_some()
-                        || atime.is_some()
-                        || mtime.is_some()
-                    {
+                    if uid.is_some() || gid.is_some() || atime.is_some() || mtime.is_some() {
                         return Err(Errno::EOPNOTSUPP);
                     }
                     let mut v = view.actor()?;
+                    // A chmod: the new mode, the recorded owner kept. A file
+                    // no name reaches has no path to record it at.
+                    if let Some(mode) = mode {
+                        let path = view.path(&v, ino).map_err(|_| Errno::EOPNOTSUPP)?;
+                        let owner = v.node(&path).map_err(errno)?.meta.attrs().owner;
+                        v.set_meta(
+                            &path,
+                            Attrs {
+                                perm: Perm::from_mode(mode),
+                                owner,
+                            },
+                        )
+                        .map_err(errno)?;
+                    }
                     if let Some(size) = size {
                         if let Some(fh) = fh {
                             let handles = view.handles()?;
@@ -892,7 +957,7 @@ impl Filesystem for View {
                             }
                         } else {
                             let path = view.path(&v, ino)?;
-                            let h = v.write_open(&path, false).map_err(errno)?;
+                            let h = v.write_open(&path, None).map_err(errno)?;
                             let result = v.truncate(h, size).map_err(errno);
                             v.close(h).map_err(errno)?;
                             result?;
@@ -906,8 +971,9 @@ impl Filesystem for View {
                 Err(e) => reply.error(e),
             }
         };
-        // A path truncate is a write-open, a truncate and a close: new work.
-        if size.is_some() && fh.is_none() {
+        // A path truncate is a write-open, a truncate and a close, and a
+        // chmod a step: new work.
+        if (size.is_some() && fh.is_none()) || mode.is_some() {
             self.gated(setattr);
         } else {
             setattr(self, Ok(()));
@@ -997,17 +1063,14 @@ impl Filesystem for View {
         self.gated(move |view, admitted| {
             let result = admitted.and_then(|()| {
                 (|| {
-                    if parent.0 != 1 {
-                        return Err(Errno::ENOTDIR);
-                    }
-                    let object = ino.0.checked_sub(2).ok_or(Errno::ENOENT)?;
+                    let object = ino.0.checked_sub(2).ok_or(Errno::EPERM)?;
                     let mut v = view.actor()?;
+                    let path = child_path(&view.path(&v, parent)?, &name)?;
                     // Existing named-object hard links retain fuser's default EPERM.
                     if !v.is_anonymous(object).map_err(errno)? {
                         return Err(Errno::EPERM);
                     }
-                    v.first_link(object, name.to_str().ok_or(Errno::EINVAL)?)
-                        .map_err(errno)?;
+                    v.first_link(object, &path).map_err(errno)?;
                     view.attr(&v, ino, None)
                 })()
             });
@@ -1022,12 +1085,51 @@ impl Filesystem for View {
         self.gated(move |view, admitted| {
             let result = admitted.and_then(|()| {
                 (|| {
-                    if parent.0 != 1 {
-                        return Err(Errno::ENOTDIR);
-                    }
-                    view.actor()?
-                        .unlink(name.to_str().ok_or(Errno::EINVAL)?)
-                        .map_err(errno)
+                    let mut v = view.actor()?;
+                    let path = child_path(&view.path(&v, parent)?, &name)?;
+                    v.unlink(&path).map_err(errno)
+                })()
+            });
+            match result {
+                Ok(()) => reply.ok(),
+                Err(e) => reply.error(e),
+            }
+        });
+    }
+    fn mkdir(
+        &self,
+        req: &Request,
+        parent: INodeNo,
+        name: &OsStr,
+        mode: u32,
+        _umask: u32,
+        reply: ReplyEntry,
+    ) {
+        let name = name.to_owned();
+        let attrs = create_attrs(req, mode);
+        self.gated(move |view, admitted| {
+            let result = admitted.and_then(|()| {
+                (|| {
+                    let mut v = view.actor()?;
+                    let path = child_path(&view.path(&v, parent)?, &name)?;
+                    v.mkdir(&path, attrs).map_err(errno)?;
+                    view.attr_at(&v, &path, None)
+                })()
+            });
+            match result {
+                Ok(attr) => reply.entry(&TTL, &attr, Generation(0)),
+                Err(e) => reply.error(e),
+            }
+        });
+    }
+    fn rmdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        let name = name.to_owned();
+        self.gated(move |view, admitted| {
+            let result = admitted.and_then(|()| {
+                (|| {
+                    let mut v = view.actor()?;
+                    let path = child_path(&view.path(&v, parent)?, &name)?;
+                    v.rmdir(&path).map_err(errno)
                 })()
             });
             match result {
@@ -1050,18 +1152,18 @@ impl Filesystem for View {
         self.gated(move |view, admitted| {
             let result = admitted.and_then(|()| {
                 (|| {
-                    if parent.0 != 1 || newparent.0 != 1 {
-                        return Err(Errno::ENOTDIR);
-                    }
-                    if !flags.is_empty() {
-                        return Err(Errno::EOPNOTSUPP);
-                    }
-                    view.actor()?
-                        .rename(
-                            name.to_str().ok_or(Errno::EINVAL)?,
-                            newname.to_str().ok_or(Errno::EINVAL)?,
-                        )
-                        .map_err(errno)
+                    // RENAME_EXCHANGE and RENAME_WHITEOUT are not supported.
+                    let mode = if flags.is_empty() {
+                        RenameMode::Replace
+                    } else if flags == RenameFlags::RENAME_NOREPLACE {
+                        RenameMode::NoReplace
+                    } else {
+                        return Err(Errno::EINVAL);
+                    };
+                    let mut v = view.actor()?;
+                    let from = child_path(&view.path(&v, parent)?, &name)?;
+                    let to = child_path(&view.path(&v, newparent)?, &newname)?;
+                    v.rename(&from, &to, mode).map_err(errno)
                 })()
             });
             match result {
@@ -1079,23 +1181,34 @@ impl Filesystem for View {
         mut reply: ReplyDirectory,
     ) {
         let result = (|| {
-            if ino.0 != 1 {
-                return Err(Errno::ENOTDIR);
-            }
             let v = self.actor()?;
-            // `.` and `..` are entries 0 and 1, the files 2 on: an offset is
+            let dir = self.path(&v, ino)?;
+            // `..` is the parent's inode; the root is its own parent.
+            let up = if dir.is_empty() {
+                INodeNo(1)
+            } else {
+                inode(&v.node(parent_dir(&dir)).map_err(errno)?)
+            };
+            // `.` and `..` are entries 0 and 1, the entries 2 on: an offset is
             // the number of entries already read.
             let skip = usize::try_from(offset).map_err(|_| Errno::EINVAL)?;
-            let mut entries: Vec<(INodeNo, FileType, String)> = [".", ".."]
+            let mut entries: Vec<(INodeNo, FileType, String)> = [(".", ino), ("..", up)]
                 .into_iter()
                 .skip(skip)
-                .map(|name| (INodeNo(1), FileType::Directory, name.to_owned()))
+                .map(|(name, ino)| (ino, FileType::Directory, name.to_owned()))
                 .collect();
             entries.extend(
-                v.files_from(skip.saturating_sub(2), READDIR_BATCH)
+                v.children(&dir, skip.saturating_sub(2), READDIR_BATCH)
                     .map_err(errno)?
                     .into_iter()
-                    .map(|(p, o)| (INodeNo(o + 2), FileType::RegularFile, p)),
+                    .map(|entry| {
+                        let kind = match entry.kind {
+                            Kind::Dir => FileType::Directory,
+                            Kind::Symlink => FileType::Symlink,
+                            Kind::File => FileType::RegularFile,
+                        };
+                        (INodeNo(entry.number + 2), kind, entry.name)
+                    }),
             );
             Ok((skip, entries))
         })();
@@ -1134,6 +1247,12 @@ mod tests {
     const OWNER: FileOwner = FileOwner {
         uid: 10000,
         gid: 10001,
+    };
+
+    /// What a test's create gives a file: mode 0644, owned by [`OWNER`].
+    const ATTRS: Attrs = Attrs {
+        perm: Perm::from_mode(0o644),
+        owner: OWNER,
     };
 
     /// A session bound to write the root as client `label`.
@@ -1248,7 +1367,7 @@ mod tests {
         let mut sessions = Sessions::new(new_actor(tmp.path()));
         let view = view(writing(&mut sessions, "client"));
         let mut volume = view.actor().unwrap();
-        let handle = volume.anonymous_open().unwrap();
+        let handle = volume.anonymous_open(ATTRS).unwrap();
         let ino = INodeNo(volume.open_object(handle).unwrap() + 2);
         volume.write(handle, 0, b"private", false).unwrap();
         view.handles().unwrap().entries.insert(
@@ -1272,13 +1391,13 @@ mod tests {
         let mut sessions = Sessions::new(new_actor(tmp.path()));
         let view = view(writing(&mut sessions, "client"));
         let mut volume = view.actor().unwrap();
-        let h = volume.write_open("a", true).unwrap();
+        let h = volume.write_open("a", Some(ATTRS)).unwrap();
         volume.write(h, 0, b"old", false).unwrap();
         volume.close(h).unwrap();
         let reader = view
-            .open_file(&mut volume, "a", libc::O_RDONLY, false)
+            .open_file(&mut volume, "a", libc::O_RDONLY, None)
             .unwrap();
-        let h = volume.write_open("a", false).unwrap();
+        let h = volume.write_open("a", None).unwrap();
         volume.truncate(h, 0).unwrap();
         volume.write(h, 0, b"new", false).unwrap();
         volume.close(h).unwrap();
@@ -1288,7 +1407,7 @@ mod tests {
             _ => panic!("read-only open acquired a writer"),
         }
         assert_eq!(
-            view.open_file(&mut volume, "a", libc::O_RDONLY | libc::O_TRUNC, false),
+            view.open_file(&mut volume, "a", libc::O_RDONLY | libc::O_TRUNC, None),
             Err(Errno::EACCES)
         );
         assert_eq!(volume.read("a").unwrap(), b"new");
@@ -1306,10 +1425,13 @@ mod tests {
         let mut volume = view.actor().unwrap();
         for flags in [libc::O_WRONLY, libc::O_RDWR, libc::O_RDONLY] {
             assert_eq!(
-                view.open_file(&mut volume, "a", flags, true),
+                view.open_file(&mut volume, "a", flags, Some(ATTRS)),
                 Err(Errno::EROFS)
             );
         }
-        assert_eq!(volume.anonymous_open().map_err(errno), Err(Errno::EROFS));
+        assert_eq!(
+            volume.anonymous_open(ATTRS).map_err(errno),
+            Err(Errno::EROFS)
+        );
     }
 }

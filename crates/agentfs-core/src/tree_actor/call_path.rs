@@ -178,8 +178,8 @@ impl Recording {
     }
 
     /// The lag gate, before a call that starts new work in `tree` (a create,
-    /// a write-open, `O_TMPFILE`, a link, `rename(2)`, `unlink`, a path
-    /// `truncate(2)`): returns at once while the tree's lag is under the
+    /// a write-open, `O_TMPFILE`, a link, `mkdir(2)`, `rmdir(2)`,
+    /// `rename(2)`, `unlink`, `chmod(2)`, a path `truncate(2)`): returns at once while the tree's lag is under the
     /// limit or the builder has failed, else on the built event that brings
     /// it under. Never called with the actor locked; never before a write
     /// call or a RELEASE.
@@ -289,7 +289,7 @@ impl Recording {
 mod tests {
     use std::sync::mpsc::{self, sync_channel};
 
-    use super::super::test_support::{new_actor, writer};
+    use super::super::test_support::{ATTRS, new_actor, writer};
     use super::*;
 
     #[test]
@@ -299,7 +299,7 @@ mod tests {
         let h = rec
             .actor()
             .unwrap()
-            .write_open(TreeId::Root, "a", &writer("w"), true)
+            .write_open(TreeId::Root, "a", &writer("w"), Some(ATTRS))
             .unwrap();
         // The create is a step: once it is built, the builder has made its
         // fsync and waits for the next step, so the flush leads the one held.
@@ -332,7 +332,7 @@ mod tests {
         let h = rec
             .actor()
             .unwrap()
-            .write_open(TreeId::Root, "a", &writer("w"), true)
+            .write_open(TreeId::Root, "a", &writer("w"), Some(ATTRS))
             .unwrap();
         rec.actor().unwrap().write(h, 0, b"x", false).unwrap();
         let through = rec.actor().unwrap().durable_through(h).unwrap();
@@ -366,7 +366,7 @@ mod tests {
         let h = rec
             .actor()
             .unwrap()
-            .write_open(TreeId::Root, "a", &writer("w"), true)
+            .write_open(TreeId::Root, "a", &writer("w"), Some(ATTRS))
             .unwrap();
         rec.actor().unwrap().write(h, 0, b"saved", false).unwrap();
         let saved = rec.actor().unwrap().close(h).unwrap();
@@ -419,7 +419,7 @@ mod tests {
         let h = rec
             .actor()
             .unwrap()
-            .write_open(TreeId::Root, "a", &writer("w"), true)
+            .write_open(TreeId::Root, "a", &writer("w"), Some(ATTRS))
             .unwrap();
         inside.recv().unwrap();
         // The create is unbuilt and the limit is zero: a gated call waits.
@@ -466,7 +466,7 @@ mod tests {
             let h = rec
                 .actor()
                 .unwrap()
-                .write_open(TreeId::Root, name, &writer("w"), true)
+                .write_open(TreeId::Root, name, &writer("w"), Some(ATTRS))
                 .unwrap();
             rec.actor().unwrap().write(h, 0, b"x", false).unwrap();
             rec.actor().unwrap().close(h).unwrap();
@@ -486,7 +486,7 @@ mod tests {
             let h = rec
                 .actor()
                 .unwrap()
-                .write_open(TreeId::Root, &format!("f{n}"), &writer("w"), true)
+                .write_open(TreeId::Root, &format!("f{n}"), &writer("w"), Some(ATTRS))
                 .unwrap();
             rec.actor().unwrap().write(h, 0, b"x", false).unwrap();
             rec.actor().unwrap().close(h).unwrap();
@@ -496,7 +496,7 @@ mod tests {
         let h = rec
             .actor()
             .unwrap()
-            .write_open(TreeId::Root, "f0", &writer("w"), false)
+            .write_open(TreeId::Root, "f0", &writer("w"), None)
             .unwrap();
         rec.actor().unwrap().write(h, 0, b"y", false).unwrap();
         let last = rec.durability.appended();

@@ -426,7 +426,7 @@ def line_map_storage(root, state, count, metrics, timeout, report, name, sample_
         time.sleep(0.05)
     if len(commits) != count:
         raise RuntimeError('expected %d save commits, found %d' % (count, len(commits)))
-    # The file's line map: lines/<aa>/<bb>/<name>, [identity, line map] (docs/trees.md).
+    # The file's line map: lines/<aa>/<bb>/<name>, [identity, line map, meta] (docs/trees.md).
     name = 'line-map-measure'
     expressions = ''.join('%s:lines/%s\n' % (c, fanned(name)) for c in commits)
     records = git(repo, 'cat-file', '--batch-check=%(objectname) %(objecttype) %(objectsize) %(objectsize:disk)',
@@ -451,7 +451,7 @@ def line_map_storage(root, state, count, metrics, timeout, report, name, sample_
         raise RuntimeError('invalid commit object records')
     return {'status': 'MEASURED', 'save_count': count, 'elapsed_ns': elapsed,
             'pattern': 'seed an empty file before the window; truncate and write one distinct 9-byte line, close after each save',
-            'metadata_definition': 'the file\'s lines/<aa>/<bb>/<name> blob: its identity and line map; name histories are separate',
+            'metadata_definition': 'the file\'s lines/<aa>/<bb>/<name> blob: its identity, line map and metadata; name histories are separate',
             'metadata_snapshot_logical_bytes_sum': sum(sizes), 'final_metadata_logical_bytes': sizes[0],
             'unique_metadata_blob_count': len(objects),
             'unique_metadata_logical_bytes': sum(v[0] for v in objects.values()),

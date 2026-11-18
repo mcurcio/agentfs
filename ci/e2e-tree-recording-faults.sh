@@ -207,7 +207,7 @@ gitdir=$work/state/history.git
 git --git-dir="$gitdir" rev-list --all > "$work/orphan-commits"
 while read -r commit; do
   prefix=
-  if git --git-dir="$gitdir" show -s --format=%B "$commit" | grep -Fx 'Agentfs-Format: envelope-1' >/dev/null; then prefix=:files; fi
+  if git --git-dir="$gitdir" show -s --format=%B "$commit" | grep -Fx 'Agentfs-Format: envelope-2' >/dev/null; then prefix=:files; fi
   if git --git-dir="$gitdir" grep -F 'ORPHAN-BAD' "$commit$prefix" >/dev/null; then
     echo "orphan bytes entered history at $commit" >&2; exit 1
   else

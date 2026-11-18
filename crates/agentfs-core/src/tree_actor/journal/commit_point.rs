@@ -48,6 +48,7 @@ impl TreeActor {
             at_ns: now_ns(),
             entry,
         };
+        self.last_at_ns = record.at_ns;
         let pos = match self.journal.append(&record, tail) {
             Ok(pos) => pos,
             Err(e) => {
@@ -121,6 +122,11 @@ impl TreeActor {
                     .trees
                     .get(&h.tree)
                     .is_some_and(|t| t.anonymous.contains(&h.object)),
+                meta: self
+                    .trees
+                    .get(&h.tree)
+                    .filter(|t| t.anonymous.contains(&h.object))
+                    .and_then(|t| t.meta.get(&h.object).copied()),
             })
             .collect();
         let checkpoint = Record {
@@ -138,6 +144,12 @@ impl TreeActor {
                     .all_objects()
                     .into_iter()
                     .map(|(tree, objects)| (tree.to_string(), objects))
+                    .collect(),
+                // Every step is built: the actor's shapes are as of `built`.
+                locals: self
+                    .trees
+                    .iter()
+                    .map(|(tree, t)| (tree.to_string(), t.shape.locals()))
                     .collect(),
             },
         };

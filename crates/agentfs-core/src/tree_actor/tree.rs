@@ -12,7 +12,8 @@ use git2::Oid;
 
 use serde::{Deserialize, Serialize};
 
-use super::journal::{Change, SaveOutcome, TakeRecord};
+use super::journal::{Change, SaveOutcome, TakeRecord, TreeLocals};
+use super::meta::{Attrs, Kind, Meta, Perm, Times};
 use super::recording::FileMap;
 use super::{Error, Result, queue, referee};
 use crate::tree_reconcile::{Id, LineMap};
@@ -304,23 +305,156 @@ impl Deref for Names {
     }
 }
 
+/// One directory of a tree: its number (its mkdir record's; the root's is 0
+/// and never an inode's), its metadata and times, and how many directories
+/// it holds.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct DirState {
+    pub(super) number: u64,
+    pub(super) meta: Meta,
+    pub(super) times: Times,
+    pub(super) subdirs: u32,
+}
+
+/// A tree's directories, by path (`""` the root) and by number: a view's
+/// lookups cost one map lookup. Reads go through `Deref` to the map by path;
+/// every change goes through these methods, so the two maps cannot disagree.
+#[derive(Clone, Debug, Default)]
+pub(super) struct Dirs {
+    by_path: BTreeMap<String, DirState>,
+    by_number: BTreeMap<u64, String>,
+}
+
+impl Dirs {
+    fn insert(&mut self, path: String, state: DirState) {
+        if let Some(old) = self.by_path.remove(&path) {
+            self.by_number.remove(&old.number);
+        }
+        if !path.is_empty() {
+            self.by_number.insert(state.number, path.clone());
+        }
+        self.by_path.insert(path, state);
+    }
+
+    fn remove(&mut self, path: &str) -> Option<DirState> {
+        let state = self.by_path.remove(path)?;
+        if !path.is_empty() {
+            self.by_number.remove(&state.number);
+        }
+        Some(state)
+    }
+
+    /// The directory's state, to change all but its number.
+    fn get_mut(&mut self, path: &str) -> Option<&mut DirState> {
+        self.by_path.get_mut(path)
+    }
+
+    /// The path of directory `number`; never the root's.
+    pub(super) fn path_of(&self, number: u64) -> Option<&str> {
+        self.by_number.get(&number).map(String::as_str)
+    }
+
+    fn clear(&mut self) {
+        self.by_path.clear();
+        self.by_number.clear();
+    }
+}
+
+impl Deref for Dirs {
+    type Target = BTreeMap<String, DirState>;
+
+    fn deref(&self) -> &BTreeMap<String, DirState> {
+        &self.by_path
+    }
+}
+
+/// `S_ISGID`.
+const SET_GROUP_ID: u32 = 0o2000;
+
+/// The directory holding `path`: `""` for a top-level entry.
+pub(super) fn parent_of(path: &str) -> &str {
+    path.rsplit_once('/').map_or("", |(parent, _)| parent)
+}
+
+/// The prefix every path under directory `dir` starts with.
+fn under(dir: &str) -> String {
+    if dir.is_empty() {
+        String::new()
+    } else {
+        format!("{dir}/")
+    }
+}
+
+/// `path` with its leading `from` replaced by `to`.
+fn moved(path: &str, from: &str, to: &str) -> String {
+    format!("{to}{}", &path[from.len()..])
+}
+
+/// The keys of `map` that are direct children of the directory whose paths
+/// start with `prefix`, in order: a child directory's subtree is jumped
+/// over, never walked.
+fn direct_children<'a, V>(
+    map: &'a BTreeMap<String, V>,
+    prefix: &'a str,
+) -> impl Iterator<Item = (&'a str, &'a V)> + 'a {
+    let mut cursor = prefix.to_owned();
+    std::iter::from_fn(move || {
+        loop {
+            let (key, value) = map
+                .range::<str, _>((
+                    std::ops::Bound::Included(cursor.as_str()),
+                    std::ops::Bound::Unbounded,
+                ))
+                .next()?;
+            if !key.starts_with(prefix) {
+                return None;
+            }
+            let rest = &key[prefix.len()..];
+            match rest.find('/') {
+                // The directory itself (the root's `""`), never its own child.
+                _ if rest.is_empty() => cursor = format!("{key}\0"),
+                // A deeper entry: past the whole subtree of its child, whose
+                // paths all start with `<child>/` ('/' + 1 is '0').
+                Some(at) => cursor = format!("{prefix}{}0", &rest[..at]),
+                None => {
+                    cursor = format!("{key}\0");
+                    return Some((key.as_str(), value));
+                }
+            }
+        }
+    })
+}
+
+/// The number of the `index`th directory a take adds that its tree lacks: a
+/// take records directories by path only, so their numbers are its step's,
+/// apart from every record's (`EventNumber::object`) by the top bit.
+pub(super) const fn taken_dir_number(step: EventNumber, index: u64) -> u64 {
+    (1 << 63) | (step.0 << 20) | (index & 0xF_FFFF)
+}
+
 /// The names-level state of one tree, which both projections of the journal
 /// keep: the actor's saved state and the builder's trees. [`Shape::apply`] is
-/// its one transition.
+/// its one transition. Each file's and link's metadata and times are by
+/// object, each directory's in its [`DirState`].
 #[derive(Clone, Debug, Default)]
 pub(super) struct Shape {
     pub(super) names: Names,
+    pub(super) dirs: Dirs,
     pub(super) anonymous: BTreeSet<u64>,
     pub(super) identities: BTreeMap<u64, MergeFileIdentity>,
     pub(super) fresh_names: BTreeSet<u64>,
+    pub(super) meta: BTreeMap<u64, Meta>,
+    pub(super) times: BTreeMap<u64, Times>,
 }
 
 impl Shape {
     /// Adds an object that has no name.
-    pub(super) fn add_anonymous(&mut self, object: u64) {
+    pub(super) fn add_anonymous(&mut self, object: u64, meta: Meta, at_ns: u64) {
         self.anonymous.insert(object);
         self.identities.insert(object, MergeFileIdentity(object));
         self.fresh_names.insert(object);
+        self.meta.insert(object, meta);
+        self.times.insert(object, Times::at(at_ns));
     }
 
     /// The paths naming `object`, in path order.
@@ -332,6 +466,182 @@ impl Shape {
     /// nothing and its opens hold no keys.
     pub(super) fn is_named(&self, object: u64) -> bool {
         self.paths_of(object).next().is_some()
+    }
+
+    /// What `path` names: a file's or link's kind, or a directory.
+    pub(super) fn kind_at(&self, path: &str) -> Option<Kind> {
+        if self.dirs.contains_key(path) {
+            return Some(Kind::Dir);
+        }
+        let object = self.names.get(path)?;
+        Some(self.meta.get(object).map_or(Kind::File, |meta| meta.kind))
+    }
+
+    /// The entries directly in directory `dir`, in name order: each one's
+    /// name, number (a file's or link's object, a directory's number) and
+    /// kind, the `skip`th on, at most `count`. Read from the sorted maps,
+    /// jumping over each child directory's subtree.
+    pub(super) fn children(
+        &self,
+        dir: &str,
+        skip: usize,
+        count: usize,
+    ) -> Vec<(String, u64, Kind)> {
+        let prefix = under(dir);
+        let mut files = direct_children(&*self.names, &prefix).peekable();
+        let mut dirs = direct_children(&*self.dirs, &prefix).peekable();
+        let entries = std::iter::from_fn(move || {
+            let take_file = match (files.peek(), dirs.peek()) {
+                (Some((f, _)), Some((d, _))) => f < d,
+                (Some(_), None) => true,
+                (None, Some(_)) => false,
+                (None, None) => return None,
+            };
+            if take_file {
+                let (path, object) = files.next()?;
+                let kind = self.meta.get(object).map_or(Kind::File, |m| m.kind);
+                Some((path, *object, kind))
+            } else {
+                let (path, state) = dirs.next()?;
+                Some((path, state.number, Kind::Dir))
+            }
+        });
+        entries
+            .skip(skip)
+            .take(count)
+            .map(|(path, number, kind)| (path[prefix.len()..].to_owned(), number, kind))
+            .collect()
+    }
+
+    /// Whether directory `dir` holds no entry.
+    fn is_empty_dir(&self, dir: &str) -> bool {
+        let prefix = under(dir);
+        direct_children(&*self.names, &prefix).next().is_none()
+            && direct_children(&*self.dirs, &prefix).next().is_none()
+    }
+
+    /// Every entry under directory `dir`: its files' and links' paths with
+    /// their objects, and its directories' paths, in path order.
+    fn descendants(&self, dir: &str) -> (Vec<(String, u64)>, Vec<String>) {
+        let prefix = under(dir);
+        let files = self
+            .names
+            .range(prefix.clone()..)
+            .take_while(|(path, _)| path.starts_with(&prefix))
+            .map(|(path, object)| (path.clone(), *object))
+            .collect();
+        let dirs = self
+            .dirs
+            .range(prefix.clone()..)
+            .take_while(|(path, _)| path.starts_with(&prefix))
+            .map(|(path, _)| path.clone())
+            .collect();
+        (files, dirs)
+    }
+
+    /// [`Error::NotFound`] unless `path`'s parent is a directory of this
+    /// tree, [`Error::NotADirectory`] when a file stands where a directory of
+    /// its path should be.
+    fn check_parent(&self, path: &str) -> Result<()> {
+        let mut at = parent_of(path);
+        if self.dirs.contains_key(at) {
+            return Ok(());
+        }
+        loop {
+            if self.names.contains_key(at) {
+                return Err(Error::NotADirectory);
+            }
+            if self.dirs.contains_key(at) || at.is_empty() {
+                return Err(Error::NotFound);
+            }
+            at = parent_of(at);
+        }
+    }
+
+    /// The metadata a new entry of `kind` at `path` takes from `attrs`: in a
+    /// set-group-ID directory, the directory's group, and a new directory
+    /// keeps the set-group-ID bit (Linux's `inode_init_owner`).
+    pub(super) fn new_meta(&self, path: &str, kind: Kind, attrs: Attrs) -> Meta {
+        let mut meta = Meta::new(kind, attrs);
+        if let Some(parent) = self.dirs.get(parent_of(path))
+            && parent.meta.mode.bits() & SET_GROUP_ID != 0
+        {
+            meta.gid = parent.meta.gid;
+            if kind == Kind::Dir {
+                meta.mode = Perm::from_mode(meta.mode.bits() | SET_GROUP_ID);
+            }
+        }
+        meta
+    }
+
+    /// A new entry at `path`: [`Error::Exists`] if one is there, else as
+    /// [`Shape::check_parent`].
+    pub(super) fn check_new(&self, path: &str) -> Result<()> {
+        if self.kind_at(path).is_some() {
+            return Err(Error::Exists);
+        }
+        self.check_parent(path)
+    }
+
+    /// Whether `change` applies to this tree, as [`Shape::apply`] would
+    /// find: what a step checks before its record, so it applies after.
+    ///
+    /// # Errors
+    ///
+    /// As [`Shape::apply`].
+    pub(super) fn check(&self, change: &Change) -> Result<()> {
+        match change {
+            Change::Create { path, .. }
+            | Change::Mkdir { path, .. }
+            | Change::Symlink { path, .. } => self.check_new(path),
+            Change::Link { object, path, .. } => {
+                if !self.anonymous.contains(object) {
+                    return Err(Error::NotFound);
+                }
+                self.check_new(path)
+            }
+            Change::Rmdir { path, .. } => match self.kind_at(path) {
+                _ if path.is_empty() => Err(Error::Name),
+                Some(Kind::Dir) if self.is_empty_dir(path) => Ok(()),
+                Some(Kind::Dir) => Err(Error::NotEmpty),
+                Some(_) => Err(Error::NotADirectory),
+                None => Err(Error::NotFound),
+            },
+            Change::Unlink { path, .. } => match self.kind_at(path) {
+                Some(Kind::Dir) => Err(Error::IsADirectory),
+                Some(_) => Ok(()),
+                None => Err(Error::NotFound),
+            },
+            Change::Rename { from, to, .. } => self.check_rename(from, to),
+            Change::SetMeta { path, meta, .. } => match self.kind_at(path) {
+                Some(kind) if kind == meta.kind => Ok(()),
+                Some(_) => Err(Error::Format),
+                None => Err(Error::NotFound),
+            },
+            Change::SetTimes { path, .. } => self.kind_at(path).map(drop).ok_or(Error::NotFound),
+            Change::Save { .. }
+            | Change::Fork { .. }
+            | Change::Rows
+            | Change::Drop { .. }
+            | Change::Take { .. } => Ok(()),
+        }
+    }
+
+    /// A rename's errors, as POSIX gives them.
+    fn check_rename(&self, from: &str, to: &str) -> Result<()> {
+        let kind = self.kind_at(from).ok_or(Error::NotFound)?;
+        if from == to {
+            return Ok(());
+        }
+        self.check_parent(to)?;
+        let replaced = self.kind_at(to);
+        match (kind, replaced) {
+            (Kind::Dir, _) if to.starts_with(&under(from)) => Err(Error::Invalid),
+            (Kind::Dir, Some(Kind::Dir)) if !self.is_empty_dir(to) => Err(Error::NotEmpty),
+            (Kind::Dir, Some(Kind::File | Kind::Symlink)) => Err(Error::NotADirectory),
+            (Kind::File | Kind::Symlink, Some(Kind::Dir)) => Err(Error::IsADirectory),
+            _ => Ok(()),
+        }
     }
 
     /// The keys a change to `object` touches, as a set.
@@ -352,35 +662,101 @@ impl Shape {
         );
     }
 
-    /// The one transition of names, objects and identities for a step of this
-    /// tree, which the actor runs at the call and the builder at the build;
-    /// the keys it touched. A fork's step is the caller's (it copies another
+    /// Directory `dir`'s entries changed at `at_ns`: its mtime and ctime move.
+    fn dir_modified(&mut self, dir: &str, at_ns: u64) {
+        if let Some(state) = self.dirs.get_mut(dir) {
+            state.times.modified(at_ns);
+        }
+    }
+
+    fn object_changed(&mut self, object: u64, at_ns: u64) {
+        if let Some(times) = self.times.get_mut(&object) {
+            times.changed(at_ns);
+        }
+    }
+
+    /// Adds a file or link object at `path`, new at `at_ns`.
+    fn add_named(&mut self, path: &str, object: u64, meta: Meta, at_ns: u64) {
+        self.names.insert(path.to_owned(), object);
+        self.identities.insert(object, MergeFileIdentity(object));
+        self.fresh_names.insert(object);
+        self.meta.insert(object, meta);
+        self.times.insert(object, Times::at(at_ns));
+        self.dir_modified(parent_of(path), at_ns);
+    }
+
+    fn add_dir(&mut self, path: &str, number: u64, meta: Meta, at_ns: u64) {
+        self.dirs.insert(
+            path.to_owned(),
+            DirState {
+                number,
+                meta,
+                times: Times::at(at_ns),
+                subdirs: 0,
+            },
+        );
+        let parent = parent_of(path);
+        if let Some(state) = self.dirs.get_mut(parent) {
+            state.subdirs += 1;
+        }
+        self.dir_modified(parent, at_ns);
+    }
+
+    fn remove_dir(&mut self, path: &str, at_ns: u64) -> Option<DirState> {
+        let state = self.dirs.remove(path)?;
+        let parent = parent_of(path);
+        if let Some(state) = self.dirs.get_mut(parent) {
+            state.subdirs = state.subdirs.saturating_sub(1);
+        }
+        self.dir_modified(parent, at_ns);
+        Some(state)
+    }
+
+    /// The one transition of names, directories, objects, identities, their
+    /// metadata and times for a step of this tree, which the actor runs at the
+    /// call and the builder at the build; the keys it touched. `at_ns` is the
+    /// step's record's time. A fork's step is the caller's (it copies another
     /// tree), and a save's is [`Shape::save`].
     ///
     /// # Errors
     ///
-    /// [`Error::NotFound`] for a name or object the tree lacks, and
-    /// [`Error::Format`] for a take that would put two files on one object.
+    /// [`Error::NotFound`], [`Error::Exists`], [`Error::NotADirectory`],
+    /// [`Error::IsADirectory`], [`Error::NotEmpty`] and [`Error::Invalid`] as
+    /// POSIX gives them ([`Shape::check`], before anything changes), and
+    /// [`Error::Format`] for a take that would put two files on one object or
+    /// leave an entry without its directory.
     pub(super) fn apply(
         &mut self,
         change: &Change,
         step: EventNumber,
+        at_ns: u64,
     ) -> Result<BTreeSet<queue::Key>> {
+        self.check(change)?;
         let mut keys = BTreeSet::new();
         match change {
-            Change::Create { path, .. } => {
+            Change::Create { path, meta, .. } | Change::Symlink { path, meta, .. } => {
                 let object = step.object();
-                self.names.insert(path.clone(), object);
-                self.identities.insert(object, MergeFileIdentity(object));
-                self.fresh_names.insert(object);
+                self.add_named(path, object, *meta, at_ns);
                 self.keys_of(object, &mut keys);
             }
+            Change::Mkdir { path, meta, .. } => {
+                self.add_dir(path, step.get(), *meta, at_ns);
+                keys.insert(queue::Key::Name(path.clone()));
+            }
+            Change::Rmdir { path, .. } => {
+                self.remove_dir(path, at_ns);
+                keys.insert(queue::Key::Name(path.clone()));
+            }
             Change::Link { object, path, .. } => {
-                if !self.anonymous.remove(object) {
-                    return Err(Error::NotFound);
-                }
+                self.anonymous.remove(object);
                 self.names.insert(path.clone(), *object);
+                self.object_changed(*object, at_ns);
+                self.dir_modified(parent_of(path), at_ns);
                 self.keys_of(*object, &mut keys);
+            }
+            Change::Rename { from, to, .. } if from == to => {}
+            Change::Rename { from, to, .. } if self.dirs.contains_key(from.as_str()) => {
+                self.rename_dir(from, to, at_ns, &mut keys);
             }
             Change::Rename { from, to, .. } => {
                 let object = self.names.get(from).copied().ok_or(Error::NotFound)?;
@@ -403,26 +779,110 @@ impl Shape {
                     }
                 }
                 self.names.insert(to.clone(), object);
+                self.object_changed(object, at_ns);
+                self.dir_modified(parent_of(from), at_ns);
+                self.dir_modified(parent_of(to), at_ns);
                 keys.insert(queue::Key::Name(to.clone()));
             }
             Change::Unlink { path, .. } => {
                 let object = self.names.get(path).copied().ok_or(Error::NotFound)?;
                 self.keys_of(object, &mut keys);
                 self.names.remove(path);
+                self.object_changed(object, at_ns);
+                self.dir_modified(parent_of(path), at_ns);
             }
-            Change::Take { take, .. } => self.take(take, &mut keys)?,
+            Change::SetMeta { path, meta, .. } => {
+                if let Some(state) = self.dirs.get_mut(path) {
+                    state.meta = *meta;
+                    state.times.changed(at_ns);
+                    keys.insert(queue::Key::Name(path.clone()));
+                } else {
+                    let object = self.names.get(path).copied().ok_or(Error::NotFound)?;
+                    self.meta.insert(object, *meta);
+                    self.object_changed(object, at_ns);
+                    self.keys_of(object, &mut keys);
+                }
+            }
+            Change::SetTimes {
+                path, atime, mtime, ..
+            } => {
+                let times = match self.dirs.get_mut(path) {
+                    Some(state) => &mut state.times,
+                    None => {
+                        let object = self.names.get(path).copied().ok_or(Error::NotFound)?;
+                        self.times.entry(object).or_default()
+                    }
+                };
+                if let Some(atime) = atime {
+                    times.atime_ns = atime.resolve(at_ns);
+                }
+                if let Some(mtime) = mtime {
+                    times.mtime_ns = mtime.resolve(at_ns);
+                }
+                times.changed(at_ns);
+            }
+            Change::Take { take, .. } => self.take(take, step, at_ns, &mut keys)?,
             Change::Save { .. } | Change::Fork { .. } | Change::Rows | Change::Drop { .. } => {}
         }
         Ok(keys)
     }
 
-    /// A close's part: an anonymous object's close drops it; any other
-    /// changes no name. The keys a saved file's change touches.
-    pub(super) fn save(&mut self, object: u64, outcome: SaveOutcome) -> BTreeSet<queue::Key> {
+    /// A directory's rename: every entry under it moves with it, each
+    /// directory keeping its number and each file its object and identity.
+    /// A moved file's name is no longer fresh. An empty directory at `to` is
+    /// replaced.
+    fn rename_dir(&mut self, from: &str, to: &str, at_ns: u64, keys: &mut BTreeSet<queue::Key>) {
+        let (files, dirs) = self.descendants(from);
+        if self.dirs.contains_key(to) {
+            self.remove_dir(to, at_ns);
+        }
+        keys.insert(queue::Key::Name(from.to_owned()));
+        keys.insert(queue::Key::Name(to.to_owned()));
+        if let Some(mut state) = self.remove_dir(from, at_ns) {
+            state.times.changed(at_ns);
+            let subdirs = state.subdirs;
+            self.add_dir(to, state.number, state.meta, at_ns);
+            if let Some(moved_state) = self.dirs.get_mut(to) {
+                moved_state.times = state.times;
+                moved_state.subdirs = subdirs;
+            }
+        }
+        for dir in dirs {
+            if let Some(state) = self.dirs.remove(&dir) {
+                let new = moved(&dir, from, to);
+                keys.insert(queue::Key::Name(dir));
+                keys.insert(queue::Key::Name(new.clone()));
+                self.dirs.insert(new, state);
+            }
+        }
+        for (path, object) in files {
+            self.keys_of(object, keys);
+            self.names.remove(&path);
+            let new = moved(&path, from, to);
+            keys.insert(queue::Key::Name(new.clone()));
+            self.names.insert(new, object);
+            self.fresh_names.remove(&object);
+        }
+    }
+
+    /// A close's part: an anonymous object's close drops it; a save moves
+    /// its file's mtime and ctime; any other changes nothing. The keys a
+    /// saved file's change touches.
+    pub(super) fn save(
+        &mut self,
+        object: u64,
+        outcome: SaveOutcome,
+        at_ns: u64,
+    ) -> BTreeSet<queue::Key> {
         let mut keys = BTreeSet::new();
         match outcome {
             SaveOutcome::AnonymousDropped => self.drop_object(object),
-            SaveOutcome::Saved { .. } => self.keys_of(object, &mut keys),
+            SaveOutcome::Saved { .. } => {
+                if let Some(times) = self.times.get_mut(&object) {
+                    times.modified(at_ns);
+                }
+                self.keys_of(object, &mut keys);
+            }
             SaveOutcome::Unchanged | SaveOutcome::OrphanDropped => {}
         }
         keys
@@ -432,11 +892,21 @@ impl Shape {
         self.anonymous.remove(&object);
         self.identities.remove(&object);
         self.fresh_names.remove(&object);
+        self.meta.remove(&object);
+        self.times.remove(&object);
     }
 
-    /// A take: the files and names it changed laid over this tree's, as
-    /// installing its whole snapshot would leave them.
-    fn take(&mut self, take: &TakeRecord, keys: &mut BTreeSet<queue::Key>) -> Result<()> {
+    /// A take: the files, names and directories it changed laid over this
+    /// tree's, as installing its whole snapshot would leave them; then D1:
+    /// every entry's directory is a directory of the tree, and a path names
+    /// one entry at most.
+    fn take(
+        &mut self,
+        take: &TakeRecord,
+        step: EventNumber,
+        at_ns: u64,
+        keys: &mut BTreeSet<queue::Key>,
+    ) -> Result<()> {
         // Each named file: its object, path and whether its name is fresh.
         let mut files: BTreeMap<MergeFileIdentity, (u64, String, bool)> = BTreeMap::new();
         for (path, object) in self.names.iter() {
@@ -445,18 +915,26 @@ impl Shape {
                 .entry(id)
                 .or_insert_with(|| (*object, path.clone(), self.fresh_names.contains(object)));
         }
+        let before: BTreeSet<String> = self.names.keys().cloned().collect();
         for (id, file) in &take.files {
             keys.insert(queue::Key::File(*id));
             if let Some((_, path, _)) = files.get(id) {
                 keys.insert(queue::Key::Name(path.clone()));
             }
             match file {
-                Some(file) => match files.get_mut(id) {
-                    Some(entry) => entry.0 = file.object,
-                    None => {
-                        files.insert(*id, (file.object, String::new(), false));
+                Some(file) => {
+                    match files.get_mut(id) {
+                        Some(entry) => entry.0 = file.object,
+                        None => {
+                            files.insert(*id, (file.object, String::new(), false));
+                        }
                     }
-                },
+                    self.meta.insert(file.object, file.meta);
+                    self.times
+                        .entry(file.object)
+                        .or_insert_with(|| Times::at(at_ns))
+                        .modified(at_ns);
+                }
                 None => {
                     files.remove(id);
                 }
@@ -486,7 +964,139 @@ impl Shape {
                 self.fresh_names.insert(object);
             }
         }
+        // Directories: parents before children when adding, children
+        // before parents when removing.
+        let mut dirs: Vec<&(String, Option<Meta>)> = take.dirs.iter().collect();
+        dirs.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut added = 0;
+        for (path, meta) in &dirs {
+            let Some(meta) = meta else { continue };
+            keys.insert(queue::Key::Name(path.clone()));
+            match self.dirs.get_mut(path) {
+                Some(state) => {
+                    state.meta = *meta;
+                    state.times.changed(at_ns);
+                }
+                None => {
+                    self.add_dir(path, taken_dir_number(step, added), *meta, at_ns);
+                    added += 1;
+                }
+            }
+        }
+        for (path, meta) in dirs.iter().rev() {
+            if meta.is_none() {
+                keys.insert(queue::Key::Name(path.clone()));
+                self.remove_dir(path, at_ns).ok_or(Error::Format)?;
+            }
+        }
+        // Entries added or removed: their directories' mtimes move.
+        let after: BTreeSet<String> = self.names.keys().cloned().collect();
+        for path in before.symmetric_difference(&after) {
+            self.dir_modified(parent_of(path), at_ns);
+        }
+        self.check_d1()
+    }
+
+    /// D1: every entry's directory is a directory of this tree, and no path
+    /// is both a file and a directory. [`Error::Format`] otherwise.
+    pub(super) fn check_d1(&self) -> Result<()> {
+        if !self.dirs.contains_key("") {
+            return Err(Error::Format);
+        }
+        let dirs_ok = self
+            .dirs
+            .keys()
+            .filter(|path| !path.is_empty())
+            .all(|path| self.dirs.contains_key(parent_of(path)));
+        let files_ok = self.names.keys().all(|path| {
+            self.dirs.contains_key(parent_of(path)) && !self.dirs.contains_key(path.as_str())
+        });
+        if dirs_ok && files_ok {
+            Ok(())
+        } else {
+            Err(Error::Format)
+        }
+    }
+
+    /// What a checkpoint keeps of this shape that history never holds.
+    pub(super) fn locals(&self) -> TreeLocals {
+        TreeLocals {
+            dirs: self
+                .dirs
+                .iter()
+                .map(|(path, state)| (path.clone(), (state.number, state.times)))
+                .collect(),
+            files: self
+                .names
+                .values()
+                .chain(self.anonymous.iter())
+                .filter_map(|object| {
+                    Some((self.identities.get(object)?.0, *self.times.get(object)?))
+                })
+                .collect(),
+        }
+    }
+
+    /// Restores what [`Shape::locals`] kept, on a shape read from history:
+    /// each directory's number and times, each file's times.
+    /// [`Error::Format`] for a directory `locals` lacks.
+    pub(super) fn restore_locals(&mut self, locals: &TreeLocals) -> Result<()> {
+        let dirs: Vec<(String, DirState)> = self
+            .dirs
+            .iter()
+            .map(|(path, state)| {
+                let (number, times) = *locals.dirs.get(path).ok_or(Error::Format)?;
+                Ok((
+                    path.clone(),
+                    DirState {
+                        number,
+                        times,
+                        ..state.clone()
+                    },
+                ))
+            })
+            .collect::<Result<_>>()?;
+        self.dirs.clear();
+        for (path, state) in dirs {
+            self.dirs.insert(path, state);
+        }
+        let objects: Vec<u64> = self.names.values().copied().collect();
+        for object in objects {
+            let Some(id) = self.identities.get(&object) else {
+                continue;
+            };
+            if let Some(times) = locals.files.get(&id.0) {
+                self.times.insert(object, *times);
+            }
+        }
         Ok(())
+    }
+
+    /// Installs `dirs`, each directory's metadata, as this shape's
+    /// directories: numbers and times wait for [`Shape::restore_locals`].
+    fn install_dirs(&mut self, dirs: &BTreeMap<String, Meta>) {
+        self.dirs.clear();
+        for (path, meta) in dirs {
+            self.dirs.insert(
+                path.clone(),
+                DirState {
+                    number: 0,
+                    meta: *meta,
+                    times: Times::default(),
+                    subdirs: 0,
+                },
+            );
+        }
+        let parents: Vec<String> = dirs
+            .keys()
+            .filter(|path| !path.is_empty())
+            .map(|path| parent_of(path).to_owned())
+            .collect();
+        for parent in parents {
+            if let Some(state) = self.dirs.get_mut(&parent) {
+                state.subdirs += 1;
+            }
+        }
     }
 }
 
@@ -519,8 +1129,8 @@ impl SavedTree {
         }
     }
 
-    pub(super) fn add_anonymous(&mut self, object: u64) {
-        self.shape.add_anonymous(object);
+    pub(super) fn add_anonymous(&mut self, object: u64, meta: Meta, at_ns: u64) {
+        self.shape.add_anonymous(object, meta, at_ns);
         self.bytes.insert(object, FileMap::empty());
     }
 
@@ -551,8 +1161,8 @@ impl Deref for Tree {
 
 impl Tree {
     /// Adds an object that has no name and no saved state.
-    pub(super) fn add_anonymous(&mut self, object: u64) {
-        self.shape.add_anonymous(object);
+    pub(super) fn add_anonymous(&mut self, object: u64, meta: Meta, at_ns: u64) {
+        self.shape.add_anonymous(object, meta, at_ns);
         self.bytes.insert(object, Arc::default());
         self.lines.insert(object, Arc::default());
     }
@@ -563,10 +1173,12 @@ impl Tree {
         self.lines.remove(&object);
     }
 
-    /// Replaces the names and files with `snapshot`'s, each file's map from
-    /// `map` (given its identity, object and path). Two files on one object
-    /// would read each other's bytes, so a view could differ from its commit: a
-    /// step that would do it fails before its record (finding 39).
+    /// Replaces the names, directories and files with `snapshot`'s, each
+    /// file's map from `map` (given its identity, object and path). Two files
+    /// on one object would read each other's bytes, so a view could differ
+    /// from its commit: a step that would do it fails before its record
+    /// (finding 39). Directory numbers and times wait for
+    /// [`Shape::restore_locals`].
     pub(super) fn install(
         &mut self,
         snapshot: referee::Snapshot,
@@ -574,6 +1186,7 @@ impl Tree {
     ) -> Result<()> {
         self.shape.names.clear();
         self.shape.fresh_names.clear();
+        self.shape.install_dirs(&snapshot.dirs);
         let mut objects = BTreeSet::new();
         for (id, file) in snapshot.files {
             if !objects.insert(file.object) {
@@ -588,13 +1201,15 @@ impl Tree {
             self.bytes.insert(file.object, map(id, file.object, path)?);
             self.lines.insert(file.object, Arc::new(file.lines));
             self.shape.identities.insert(file.object, id);
+            self.shape.meta.insert(file.object, file.meta);
+            self.shape.times.entry(file.object).or_default();
         }
         self.namespace = snapshot.names;
-        Ok(())
+        self.shape.check_d1()
     }
 
-    /// The tree as the referee reads it: each named file's object and lines,
-    /// and every name history.
+    /// The tree as the referee reads it: each named file's object, lines and
+    /// metadata, every name history and each directory's metadata.
     pub(super) fn snapshot(&self) -> referee::Snapshot {
         let files = self
             .names
@@ -605,6 +1220,7 @@ impl Tree {
                     referee::File {
                         object: *object,
                         lines: (*self.lines[object]).clone(),
+                        meta: self.meta[object],
                     },
                 )
             })
@@ -612,6 +1228,11 @@ impl Tree {
         referee::Snapshot {
             files,
             names: self.namespace.clone(),
+            dirs: self
+                .dirs
+                .iter()
+                .map(|(path, state)| (path.clone(), state.meta))
+                .collect(),
         }
     }
 }

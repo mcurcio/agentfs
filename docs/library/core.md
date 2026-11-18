@@ -656,9 +656,10 @@ an exclusive lease on its state area (`Error::Busy` if another process holds
 it); `tree_actor::inspect(root)` reads what a state area holds without it, and
 `state_area::TreeStateArea` offers both to the Volume domain as its
 `StateArea` port. Its recorded calls are `write_open`, `write`, `truncate`,
-`sync`, `close`, `rename` and `unlink`; each write-open and namespace call
-names its writer as an `agentfs_contracts::pod::WriterAt`, the writer and its
-pod context, which the commit carries ([trees](../trees.md#volume-identity-and-trailers)). Every call names its tree by a `TreeId`: `root`, the
+`sync`, `close`, `mkdir`, `rmdir`, `symlink`, `rename`, `unlink`, `set_meta`
+and `set_times`; each write-open and namespace call names its writer as an
+`agentfs_contracts::pod::WriterAt`, the writer and its pod context, which the
+commit carries ([trees](../trees.md#volume-identity-and-trailers)). Every call names its tree by a `TreeId`: `root`, the
 tree with no upstream, or `fork/<n>`, made at journal event `n`. `trees()`
 lists them, the root first and then the forks by number; `TreeId` parses from
 and prints as that text. A fork is made with its row, through the store
@@ -670,9 +671,63 @@ saves, and `read_open` gives a write-open's; `take_next` and `progress`
 move queued changes between a tree and its upstream. `drain_changed` returns
 the objects queue takes changed, each with its `TreeId`. A close that leaves
 the bytes as they were commits nothing. `Error::errno()` maps each error to the errno a file call answers
-with. The behaviour, the state format and the current limits (flat files
-only) are in [trees](../trees.md); the FUSE adapter is in the [filesystem
+with. The behaviour, the state format and the current limits are in
+[trees](../trees.md); the FUSE adapter is in the [filesystem
 layer](filesystem.md#tree-views).
+
+### Directories, metadata, links and times
+
+Paths nest: `a/b/f` is file `f` in directory `a/b`, and `""` is the root
+directory, wherever a call reads an entry (`node`, `children`, `set_meta`,
+`set_times`). Each component is at most 255 bytes (`Error::NameTooLong`).
+
+```rust
+use agentfs_contracts::clients::FileOwner;
+use agentfs_core::tree_actor::{Attrs, Perm, RenameMode, SetTime, TreeId};
+
+let me = FileOwner { uid: 1000, gid: 1000 };
+let exec = Attrs { perm: Perm::from_mode(0o755), owner: me };
+v.mkdir(TreeId::Root, "bin", exec, &by)?;
+let h = v.write_open(TreeId::Root, "bin/run.sh", &by, Some(exec))?; // created 0755
+v.write(h, 0, b"#!/bin/sh\necho hi\n", false)?;
+v.close(h)?;
+v.rename(TreeId::Root, "bin", "tools", RenameMode::Replace, &by)?;      // everything under it moves
+v.symlink(TreeId::Root, "run", "tools/run.sh", me, &by)?;
+v.set_times(TreeId::Root, "run", None, Some(SetTime::At(0)), &by)?;  // no commit
+for entry in v.children(TreeId::Root, "", 0, 100)? { /* name, number, kind */ }
+```
+
+- `write_open(tree, path, by, create)` creates a missing file when `create`
+  gives its `Attrs` (permission bits and owner); `anonymous_open(tree, by,
+  attrs)` is `O_TMPFILE`. In a set-group-ID directory a new entry takes the
+  directory's group, and a new directory keeps the bit (Linux's
+  `inode_init_owner`).
+- `mkdir` returns the directory's node number, `rmdir` removes an empty one
+  (`Error::NotEmpty`), `symlink(tree, path, target, owner, by)` makes a link
+  (mode `0777`, its bytes its target: 1 to 4095 bytes, no NUL) and returns its
+  object, and `readlink` reads a link's target (`Error::Invalid` for anything
+  else).
+- `rename(tree, from, to, mode, by)` follows POSIX: a directory onto a file is
+  `NotADirectory`, a file onto a directory `IsADirectory`, onto a directory
+  with entries `NotEmpty`, into its own subtree `Invalid`, and
+  `RenameMode::NoReplace` onto an entry `Exists`; onto an empty directory it
+  replaces it, onto itself it changes nothing. A directory moves with every
+  entry under it, each file keeping its object and identity; an open of one
+  follows its object.
+- `set_meta(tree, path, attrs, by)` is chmod and chown: the entry's kind kept,
+  a step and a commit (`Meta by <writer>`) unless nothing changes.
+  `set_times(tree, path, atime, mtime, by)` sets times (`SetTime::Now` is the
+  step's time); it is a step that makes no commit.
+- `node(tree, path)` gives a `Node`: its node number (`None` for the root; a
+  view's inode is the number + 2), `Meta` (kind, mode, uid, gid), `Times`,
+  length and link count. `node_at(tree, number)` finds a named entry by its
+  number, with its path, and `open_node(tree, object)` a file no name reaches
+  (an anonymous open's, or one unlinked while open). `children(tree, dir,
+  skip, count)` lists one batch of a directory (`DirEntry`: name, number,
+  kind).
+- Times are each tree's own: a step's record time gives the mtime and ctime of
+  what it changes (a save the file's, an entry added, removed or renamed its
+  directories'), and history never holds them.
 
 ### Sessions
 

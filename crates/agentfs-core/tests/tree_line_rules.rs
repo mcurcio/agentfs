@@ -5,7 +5,7 @@
     reason = "a test reads the store History writes"
 )]
 use agentfs_core::tree_actor::{TreeActor, TreeId};
-use trees::{fanned, new_actor, rowless_fork, writer};
+use trees::{ATTRS, fanned, new_actor, rowless_fork, writer};
 
 const ROOT: TreeId = TreeId::Root;
 use agentfs_core::tree_git::TreeGit;
@@ -18,7 +18,7 @@ const PARENT: &[u8] = b"-\nm1.1\n-\n-\n-\n-\n";
 
 fn put(v: &mut TreeActor, tree: TreeId, path: &str, bytes: &[u8]) {
     let h = v
-        .write_open(tree, path, &writer("test-writer"), true)
+        .write_open(tree, path, &writer("test-writer"), Some(ATTRS))
         .unwrap();
     v.truncate(h, 0).unwrap();
     v.write(h, 0, bytes, false).unwrap();
@@ -90,7 +90,7 @@ fn a_save_with_an_unfinished_line_before_a_kept_line_loses_whole() {
     let fork = rowless_fork(&mut v);
     put(&mut v, fork, "c", b"y");
     let first = v.head(fork).unwrap();
-    let edit = v.write_open(fork, "c", &writer("editor"), false).unwrap();
+    let edit = v.write_open(fork, "c", &writer("editor"), None).unwrap();
     put(&mut v, ROOT, "c", PARENT);
     v.write(edit, 0, b"n6", false).unwrap();
     v.close(edit).unwrap();
@@ -142,7 +142,7 @@ fn a_sync_hides_the_parents_unfinished_line_until_decided() {
     put(&mut v, ROOT, "a", b"base\n");
     drain(&mut v);
     let fork = rowless_fork(&mut v);
-    let held = v.write_open(ROOT, "a", &writer("holder"), false).unwrap();
+    let held = v.write_open(ROOT, "a", &writer("holder"), None).unwrap();
     put(&mut v, fork, "a", b"base\nchild\n");
     put(&mut v, ROOT, "a", b"base\n}");
     drain(&mut v);
@@ -164,7 +164,7 @@ fn a_sync_hides_the_parents_later_lines_behind_an_undecided_unfinished_line() {
     put(&mut v, ROOT, "a", b"a\nb\n");
     drain(&mut v);
     let fork = rowless_fork(&mut v);
-    let held = v.write_open(ROOT, "a", &writer("holder"), false).unwrap();
+    let held = v.write_open(ROOT, "a", &writer("holder"), None).unwrap();
     put(&mut v, fork, "a", b"y");
     let save = v.head(fork).unwrap();
     put(&mut v, ROOT, "a", b"a\nb\nm7\n");

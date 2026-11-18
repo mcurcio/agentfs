@@ -145,7 +145,7 @@ pub(in crate::tree_actor) fn decide(
         sources,
     } = decided;
     let mut writes = plans[index].files.clone();
-    let (files, names) = match &after {
+    let (files, names, dirs) = match &after {
         Some(after) => {
             writes.extend(referee::touches(&mine, after));
             take_diff(&mine, after)
@@ -171,6 +171,7 @@ pub(in crate::tree_actor) fn decide(
             files,
             names,
             collisions,
+            dirs,
             lens,
             chunks,
         },
@@ -431,12 +432,12 @@ impl TreeActor {
         let whole = take.whole;
         let change = Change::Take {
             tree: tree.to_string(),
-            take,
+            take: Box::new(take),
         };
         // The shape's transition, tried before the record: a take that would
-        // put two files on one object fails here (finding 39).
-        let mut after = self.tree(tree)?.clone();
-        let keys = after.shape.apply(&change, event)?;
+        // put two files on one object or leave an entry without its
+        // directory fails here (finding 39, D1).
+        self.tree(tree)?.shape.clone().apply(&change, event, 0)?;
         let by = self.agentfs();
         // The files the take leaves are in its chunk records: each saved map
         // reads them there, never from memory.
@@ -445,6 +446,9 @@ impl TreeActor {
         if recorded != seq {
             return Err(Error::Format);
         }
+        // Again at the record's time, which gives the times it sets.
+        let mut after = self.tree(tree)?.clone();
+        let keys = after.shape.apply(&change, event, self.last_at_ns)?;
         self.touch(tree, seq, keys);
         if let Change::Take { take, .. } = &change {
             // The view drops each taken file's pages: a take that left one
@@ -484,7 +488,7 @@ impl TreeActor {
 /// The touched keys of each tree, each key's last touching step.
 pub(in crate::tree_actor) type Touched = BTreeMap<TreeId, BTreeMap<Key, RecordNo>>;
 
-/// A take's changed files and names, as its record holds them.
+/// A take's changed files, names and directories, as its record holds them.
 pub(in crate::tree_actor) type TakeDiff = (
     Vec<(
         crate::tree_actor::tree::MergeFileIdentity,
@@ -494,10 +498,11 @@ pub(in crate::tree_actor) type TakeDiff = (
         crate::tree_actor::tree::MergeFileIdentity,
         Option<crate::tree_actor::tree::NameHistory>,
     )>,
+    Vec<(String, Option<crate::tree_actor::meta::Meta>)>,
 );
 
-/// A take's decision on a built tree as a record: the files and names that
-/// differ from `mine`.
+/// A take's decision on a built tree as a record: the files, names and
+/// directories that differ from `mine`.
 pub(in crate::tree_actor) fn take_diff(
     mine: &referee::Snapshot,
     decided: &referee::Snapshot,
@@ -524,20 +529,33 @@ pub(in crate::tree_actor) fn take_diff(
             names.push((*id, None));
         }
     }
-    (files, names)
+    let mut dirs = Vec::new();
+    for (path, meta) in &decided.dirs {
+        if mine.dirs.get(path) != Some(meta) {
+            dirs.push((path.clone(), Some(*meta)));
+        }
+    }
+    for path in mine.dirs.keys() {
+        if !decided.dirs.contains_key(path) {
+            dirs.push((path.clone(), None));
+        }
+    }
+    (files, names, dirs)
 }
 
 #[cfg(test)]
 mod tests {
     use super::super::history::message;
-    use super::super::test_support::{new_actor, rowless_fork, writer};
+    use super::super::test_support::{ATTRS, new_actor, rowless_fork, writer};
     use super::*;
 
     const ROOT: TreeId = TreeId::Root;
 
     fn put(v: &mut TreeActor, tree: TreeId, path: &str, bytes: &[u8]) {
         let create = v.read(tree, path).is_err();
-        let h = v.write_open(tree, path, &writer("w"), create).unwrap();
+        let h = v
+            .write_open(tree, path, &writer("w"), create.then_some(ATTRS))
+            .unwrap();
         v.truncate(h, 0).unwrap();
         v.write(h, 0, bytes, false).unwrap();
         v.close(h).unwrap();
@@ -616,7 +634,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let (mut v, _) = queued_landing(tmp.path(), true);
         let decision = decided(&v, ROOT);
-        let held = v.write_open(ROOT, "a", &writer("w"), false).unwrap();
+        let held = v.write_open(ROOT, "a", &writer("w"), None).unwrap();
         assert_eq!(v.land(decision).unwrap(), Err(Refused::Held));
         assert_eq!(v.take_next(ROOT).unwrap(), Took::Waiting);
         v.close(held).unwrap();

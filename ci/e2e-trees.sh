@@ -36,7 +36,6 @@ start() {
 }
 start
 python3 - "$work/main" "$work/fork" <<'PY'
-import errno
 import os
 from pathlib import Path
 import sys
@@ -114,12 +113,6 @@ for label, root in (("main-", main), ("fork-", fork_view)):
     saved(root / (label + "bytes"), expected)
     assert not (root / ".git").exists()
     assert not (root / "journal").exists()
-    try:
-        (root / "dir").mkdir()
-    except OSError as e:
-        assert e.errno in (errno.ENOSYS, errno.EOPNOTSUPP)
-    else:
-        raise AssertionError("unsupported mkdir succeeded")
 
 (main / "isolation").write_bytes(b"parent")
 saved(main / "isolation", b"parent")
@@ -128,6 +121,8 @@ delivered(fork_view / "isolation", b"parent")
 saved(fork_view / "isolation", b"fork")
 delivered(main / "isolation", b"fork")
 PY
+# Directories and modes through the view; history is read after the restart.
+python3 ci/trees-posix.py view "$work/main"
 mmap_status=0
 python3 ci/trees-mmap.py "$work/main" "$work/state/history.git" || mmap_status=$?
 tmpfile_status=0
@@ -163,6 +158,7 @@ fusermount3 -uz "$work/fork"
 "$bin" --state "$work/state" trees init --volume t
 head=$(git --git-dir="$work/state/history.git" rev-parse root)
 test "$(tree_git_file "$work/state/history.git" root crash)" = acknowledged-before-kill
+python3 ci/trees-posix.py history "$work/state/history.git"
 "$bin" --state "$work/state" trees init --volume t
 test "$(git --git-dir="$work/state/history.git" rev-parse root)" = "$head"
 start

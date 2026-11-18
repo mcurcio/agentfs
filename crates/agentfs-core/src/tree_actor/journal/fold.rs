@@ -10,10 +10,12 @@ use git2::Oid;
 use super::durable::RecordNo;
 use super::segment::FramePos;
 use super::{
-    Change, Entry, Frame, OpenRecord, Record, RunHead, SaveOutcome, Tail, Target, take_chunks,
+    Change, Entry, Frame, OpenRecord, Record, RunHead, SaveOutcome, Tail, Target, TreeLocals,
+    take_chunks,
 };
 use crate::tree_actor::history::Objects;
 use crate::tree_actor::history::upstreams::Upstreams;
+use crate::tree_actor::meta::Meta;
 use crate::tree_actor::pointers::Pointers;
 use crate::tree_actor::recording::{Call, FileMap, pages};
 use crate::tree_actor::tree::{EventNumber, SavedTree};
@@ -28,6 +30,8 @@ pub(in crate::tree_actor) struct LiveOpen {
     pub(in crate::tree_actor) object: u64,
     /// Never linked: its object has no name and no saved state.
     pub(in crate::tree_actor) anonymous: bool,
+    /// An anonymous open's metadata.
+    pub(in crate::tree_actor) meta: Option<Meta>,
 }
 
 impl LiveOpen {
@@ -38,6 +42,7 @@ impl LiveOpen {
             by: record.by.clone(),
             object: record.object,
             anonymous: record.anonymous,
+            meta: record.meta,
         })
     }
 }
@@ -60,6 +65,9 @@ pub(in crate::tree_actor) struct Folded {
     pub(in crate::tree_actor) built: RecordNo,
     /// Each tree's object numbers as of `built`, from the checkpoint.
     pub(in crate::tree_actor) objects: BTreeMap<TreeId, Objects>,
+    /// Each tree's directory numbers and times and files' times as of
+    /// `built`, from the checkpoint.
+    pub(in crate::tree_actor) locals: BTreeMap<TreeId, TreeLocals>,
     /// Each fork's upstream. The root has none.
     pub(in crate::tree_actor) upstreams: Upstreams,
     pub(in crate::tree_actor) next_seq: u64,
@@ -96,12 +104,16 @@ impl Folded {
                 by: by.clone(),
                 object: seq,
                 anonymous: false,
+                meta: None,
             }),
             Change::Link { object, .. } => self
                 .opens
                 .values_mut()
                 .filter(|o| o.open.object == *object)
-                .for_each(|o| o.open.anonymous = false),
+                .for_each(|o| {
+                    o.open.anonymous = false;
+                    o.open.meta = None;
+                }),
             Change::Save { handle, .. } => {
                 let open = self.opens.remove(handle).ok_or(Error::Format)?.open;
                 self.saved_through.insert((open.tree, open.object), seq);
@@ -110,7 +122,15 @@ impl Folded {
                 self.upstreams.add(seq, upstream.parse::<TreeId>()?);
             }
             Change::Drop { fork } => self.upstreams.remove(fork.parse::<TreeId>()?),
-            Change::Rename { .. } | Change::Unlink { .. } | Change::Take { .. } | Change::Rows => {}
+            Change::Rename { .. }
+            | Change::Unlink { .. }
+            | Change::Take { .. }
+            | Change::Rows
+            | Change::Mkdir { .. }
+            | Change::Rmdir { .. }
+            | Change::Symlink { .. }
+            | Change::SetMeta { .. }
+            | Change::SetTimes { .. } => {}
         }
         Ok(())
     }
@@ -165,7 +185,7 @@ impl Replay {
                 trees
                     .get_mut(&open.tree)
                     .ok_or(Error::Format)?
-                    .add_anonymous(open.object);
+                    .add_anonymous(open.object, open.meta.ok_or(Error::Format)?, 0);
             }
             live.insert(*handle, (open.tree, open.object, folded.calls.clone()));
         }
@@ -216,9 +236,9 @@ impl Replay {
                 let tree = tree.parse::<TreeId>()?;
                 self.opened(seq, tree, *object);
             }
-            Entry::AnonymousOpen { tree, .. } => {
+            Entry::AnonymousOpen { tree, meta, .. } => {
                 let (id, t) = self.tree(tree)?;
-                t.add_anonymous(seq);
+                t.add_anonymous(seq, *meta, record.at_ns);
                 self.opened(seq, id, seq);
             }
             Entry::Call { handle, call } => {
@@ -235,26 +255,35 @@ impl Replay {
                 .or_default()
                 .extend(runs_from_frame(runs, tail)?.into_iter().map(|r| (seq, r))),
             Entry::Bytes => self.bytes.push((seq, tail.clone())),
-            Entry::Step { change, .. } => self.step(seq, change)?,
+            Entry::Step { change, .. } => self.step(seq, record.at_ns, change, tail)?,
         }
         Ok(())
     }
 
-    fn step(&mut self, seq: u64, change: &Change) -> Result<()> {
+    fn step(&mut self, seq: u64, at_ns: u64, change: &Change, tail: &Tail) -> Result<()> {
         let event = EventNumber::new(seq);
         match change {
             Change::Create { tree, .. } => {
                 let (id, t) = self.tree(tree)?;
-                t.shape.apply(change, event)?;
+                t.shape.apply(change, event, at_ns)?;
                 let mut empty = FileMap::empty();
                 empty.saved_at(RecordNo::new(seq));
                 t.bytes.insert(event.object(), empty);
                 self.opened(seq, id, event.object());
             }
+            Change::Symlink { tree, .. } => {
+                let (_, t) = self.tree(tree)?;
+                t.shape.apply(change, event, at_ns)?;
+                t.bytes.insert(event.object(), link_map(tail, seq)?);
+            }
             Change::Link { tree, .. }
             | Change::Rename { tree, .. }
-            | Change::Unlink { tree, .. } => {
-                self.tree(tree)?.1.shape.apply(change, event)?;
+            | Change::Unlink { tree, .. }
+            | Change::Mkdir { tree, .. }
+            | Change::Rmdir { tree, .. }
+            | Change::SetMeta { tree, .. }
+            | Change::SetTimes { tree, .. } => {
+                self.tree(tree)?.1.shape.apply(change, event, at_ns)?;
             }
             Change::Save {
                 tree,
@@ -280,7 +309,7 @@ impl Replay {
                     _ => None,
                 };
                 let (_, t) = self.tree(tree)?;
-                t.shape.save(object, *outcome);
+                t.shape.save(object, *outcome, at_ns);
                 if matches!(outcome, SaveOutcome::AnonymousDropped) {
                     t.drop_object(object);
                 }
@@ -316,7 +345,7 @@ impl Replay {
                     Vec::new()
                 };
                 let (_, t) = self.tree(tree)?;
-                t.shape.apply(change, event)?;
+                t.shape.apply(change, event, at_ns)?;
                 for (object, map) in maps {
                     t.bytes.insert(object, map);
                 }
@@ -324,6 +353,24 @@ impl Replay {
         }
         Ok(())
     }
+}
+
+/// A link's saved map: its target, the bytes of its step's own tail.
+///
+/// # Errors
+///
+/// As [`FileMap::apply`].
+pub(in crate::tree_actor) fn link_map(tail: &Tail, seq: u64) -> Result<FileMap> {
+    let mut map = FileMap::empty();
+    map.apply(
+        &Call::Write {
+            offset: 0,
+            len: tail.len,
+        },
+        &tail.pos,
+    )?;
+    map.saved_at(RecordNo::new(seq));
+    Ok(map)
 }
 
 pub(in crate::tree_actor) fn parse_oid(hex: &str) -> Result<Oid> {
@@ -369,6 +416,7 @@ pub(in crate::tree_actor) fn fold(frames: &[Frame]) -> Result<Folded> {
                     opens,
                     page_saved,
                     objects,
+                    locals,
                     ..
                 },
             ..
@@ -392,6 +440,10 @@ pub(in crate::tree_actor) fn fold(frames: &[Frame]) -> Result<Folded> {
         objects: objects
             .iter()
             .map(|(tree, objects)| Ok((tree.parse::<TreeId>()?, objects.clone())))
+            .collect::<Result<_>>()?,
+        locals: locals
+            .iter()
+            .map(|(tree, locals)| Ok((tree.parse::<TreeId>()?, locals.clone())))
             .collect::<Result<_>>()?,
         upstreams: Upstreams::default(),
         next_seq: next.get(),
@@ -422,13 +474,15 @@ pub(in crate::tree_actor) fn fold(frames: &[Frame]) -> Result<Folded> {
                 by: by.clone(),
                 object: *object,
                 anonymous: false,
+                meta: None,
             }),
-            Entry::AnonymousOpen { tree, by } => folded.add_open(LiveOpen {
+            Entry::AnonymousOpen { tree, by, meta } => folded.add_open(LiveOpen {
                 handle: seq,
                 tree: tree.parse::<TreeId>()?,
                 by: by.clone(),
                 object: seq,
                 anonymous: true,
+                meta: Some(*meta),
             }),
             Entry::Call { handle, call } => {
                 call.check_tail(tail.len)?;

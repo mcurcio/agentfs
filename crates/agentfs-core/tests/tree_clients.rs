@@ -27,9 +27,9 @@ use agentfs_contracts::ports::{Event, EventSink};
 use agentfs_contracts::trees::{ForkSettings, Landing, Trees};
 use agentfs_core::session::{Sessions, TreeSession};
 use agentfs_core::store::TreeStore;
-use agentfs_core::tree_actor::{Error, Recording, Saved, TreeId};
+use agentfs_core::tree_actor::{Error, Recording, RenameMode, Saved, TreeId};
 use agentfs_trees::TreesService;
-use trees::identity;
+use trees::{ATTRS, identity};
 
 #[path = "support/trees.rs"]
 mod trees;
@@ -145,7 +145,7 @@ impl Run {
 /// `path` written whole and closed through `session`: one save.
 fn save(session: &TreeSession, path: &str, bytes: &[u8]) -> Result<Saved, Error> {
     let mut guard = session.lock()?;
-    let handle = guard.write_open(path, true)?;
+    let handle = guard.write_open(path, Some(ATTRS))?;
     guard.write(handle, 0, bytes, false)?;
     guard.close(handle)
 }
@@ -366,11 +366,11 @@ fn a_read_only_session_cannot_write() {
     assert_eq!(guard.read("f").unwrap(), b"seen\n");
     assert!(!guard.writable());
     for refused in [
-        guard.write_open("f", false).map(drop),
-        guard.write_open("g", true).map(drop),
-        guard.write_open_truncating("f", false).map(drop),
-        guard.anonymous_open().map(drop),
-        guard.rename("f", "g"),
+        guard.write_open("f", None).map(drop),
+        guard.write_open("g", Some(ATTRS)).map(drop),
+        guard.write_open_truncating("f", None).map(drop),
+        guard.anonymous_open(ATTRS).map(drop),
+        guard.rename("f", "g", RenameMode::Replace),
         guard.unlink("f"),
     ] {
         let error = refused.unwrap_err();
@@ -397,7 +397,7 @@ fn a_session_reaches_only_its_own_handles() {
     let mine = one.session(&mine);
     let handle = {
         let mut guard = mine.lock().unwrap();
-        let handle = guard.write_open("f", true).unwrap();
+        let handle = guard.write_open("f", Some(ATTRS)).unwrap();
         guard.write(handle, 0, b"mine\n", false).unwrap();
         handle
     };
@@ -435,7 +435,7 @@ fn a_detached_clients_open_file_is_saved() {
     let session = one.session(&binding);
     let handle = {
         let mut guard = session.lock().unwrap();
-        let handle = guard.write_open("open", true).unwrap();
+        let handle = guard.write_open("open", Some(ATTRS)).unwrap();
         guard.write(handle, 0, b"unsaved\n", false).unwrap();
         handle
     };
@@ -461,7 +461,7 @@ fn a_detached_clients_open_file_is_saved() {
         Err(Error::NotFound)
     ));
     assert!(matches!(
-        guard.write_open("open", false),
+        guard.write_open("open", None),
         Err(Error::ReadOnly)
     ));
     drop(guard);

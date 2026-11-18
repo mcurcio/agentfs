@@ -50,7 +50,7 @@ def until(description, predicate):
 def bytes_at(ref, name):
     commit = git("rev-parse", f"{ref}^{{commit}}").strip().decode()
     message = git("show", "-s", "--format=%B", commit).decode()
-    path = f"files/{fanned(name)}" if "Agentfs-Format: envelope-1" in message.splitlines() else name
+    path = f"files/{fanned(name)}" if "Agentfs-Format: envelope-2" in message.splitlines() else name
     return git("show", f"{commit}:{path}")
 
 
@@ -236,7 +236,7 @@ def assert_aligned(commit, name):
     parent = git("rev-parse", commit + "^1").strip().decode()
     def read_map(rev, creation_allowed=False):
         message = git("show", "-s", "--format=%B", rev).decode().splitlines()
-        if "Agentfs-Format: envelope-1" not in message:
+        if "Agentfs-Format: envelope-2" not in message:
             assert creation_allowed
             probe = subprocess.run(["git", "--git-dir=" + str(REPO), "cat-file", "-e", f"{rev}:{name}"], stderr=subprocess.DEVNULL)
             assert probe.returncode != 0, (rev, name, "legacy file has no map")
@@ -459,7 +459,7 @@ def finding_32():
     assert bytes_at(commit, "finding32") == bytes.fromhex(model["root"]), (
         "finding 32 bytes differ from model", bytes_at(commit, "finding32"), model["root"])
     message = git("show", "-s", "--format=%B", commit).decode().splitlines()
-    assert "Agentfs-Format: envelope-1" in message
+    assert "Agentfs-Format: envelope-2" in message
     lines = expand(json.loads(git("show", f"{commit}:lines/{fanned('finding32')}"))[1],
                    bytes_at(commit, "finding32"))["lines"]
     live = [bytes(line["bytes"]) for line in lines if line["bytes"] is not None]

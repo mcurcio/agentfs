@@ -8,7 +8,7 @@ use std::sync::Mutex;
 use agentfs_contracts::pod::PodContext;
 use agentfs_core::tree_actor::stages::Stages;
 use agentfs_core::tree_actor::{Recording, Saved, TreeActor, TreeId};
-use trees::{identity, new_actor, reopen, rowless_fork, writer};
+use trees::{ATTRS, identity, new_actor, reopen, rowless_fork, writer};
 
 #[path = "support/trees.rs"]
 mod trees;
@@ -18,7 +18,7 @@ static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
 
 fn put(v: &mut TreeActor, path: &str, bytes: &[u8]) {
     let h = v
-        .write_open(TreeId::Root, path, &writer("test-writer"), true)
+        .write_open(TreeId::Root, path, &writer("test-writer"), Some(ATTRS))
         .unwrap();
     v.truncate(h, 0).unwrap();
     v.write(h, 0, bytes, false).unwrap();
@@ -135,7 +135,7 @@ fn bytes_copied_per_write_is_its_own() {
     let tmp = tempfile::tempdir().unwrap();
     let mut v = new_actor(&tmp.path().join("state"));
     let h = v
-        .write_open(TreeId::Root, "big", &writer("w"), true)
+        .write_open(TreeId::Root, "big", &writer("w"), Some(ATTRS))
         .unwrap();
     v.truncate(h, 1 << 30).unwrap();
     v.write(h, 0, &[1; 4096], false).unwrap();
@@ -161,9 +161,7 @@ fn unchanged_compares_only_the_opens_runs() {
     let file: Vec<u8> = (0..(1 << 20)).map(|i| (i % 251) as u8).collect();
     put(&mut v, "a", &file);
     v.settle().unwrap();
-    let h = v
-        .write_open(TreeId::Root, "a", &writer("w"), false)
-        .unwrap();
+    let h = v.write_open(TreeId::Root, "a", &writer("w"), None).unwrap();
     let at = 300_000;
     v.write(h, at as u64, &file[at..at + 4096], false).unwrap();
     v.write(h, (at + 1024) as u64, &file[at + 1024..at + 2048], false)
@@ -197,7 +195,7 @@ fn the_call_path_runs_no_git() {
     let h = rec
         .actor()
         .unwrap()
-        .write_open(TreeId::Root, "a", &w, true)
+        .write_open(TreeId::Root, "a", &w, Some(ATTRS))
         .unwrap();
     rec.actor()
         .unwrap()
@@ -207,7 +205,13 @@ fn the_call_path_runs_no_git() {
     rec.actor().unwrap().close(h).unwrap();
     rec.actor()
         .unwrap()
-        .rename(TreeId::Root, "a", "b", &w)
+        .rename(
+            TreeId::Root,
+            "a",
+            "b",
+            agentfs_core::tree_actor::RenameMode::Replace,
+            &w,
+        )
         .unwrap();
     rec.actor().unwrap().unlink(TreeId::Root, "b", &w).unwrap();
     let after = Stages::current();
@@ -240,7 +244,7 @@ fn a_call_is_not_fsynced_and_flush_fsyncs_once() {
     let h = rec
         .actor()
         .unwrap()
-        .write_open(TreeId::Root, "a", &w, true)
+        .write_open(TreeId::Root, "a", &w, Some(ATTRS))
         .unwrap();
     rec.settle().unwrap();
     let before = Stages::current();
@@ -337,7 +341,7 @@ fn an_empty_files_first_alignment_runs_no_child() {
                 TreeId::Root,
                 &format!("new{i}"),
                 &writer("test-writer"),
-                true,
+                Some(ATTRS),
             )
             .unwrap();
         v.settle().unwrap();

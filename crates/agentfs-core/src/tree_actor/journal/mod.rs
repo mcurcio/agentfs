@@ -52,6 +52,7 @@ use std::sync::Arc;
 use agentfs_contracts::pod::WriterAt;
 use serde::{Deserialize, Serialize};
 
+use super::meta::{Meta, SetTime, Times};
 use super::recording::{Call, FileMap};
 use super::stages::{self, Timer, Which};
 use super::tree::{MergeFileIdentity, NameHistory};
@@ -60,7 +61,7 @@ pub(super) use commit_point::compact_at;
 use durable::{Durability, RecordNo};
 #[cfg(test)]
 pub(super) use fold::{Folded, LiveOpen};
-pub(super) use fold::{FoldedOpen, Replay, fold, runs_from_frame};
+pub(super) use fold::{FoldedOpen, Replay, fold, link_map, runs_from_frame};
 use segment::{FramePos, Relocations, SEGMENT_BYTES, Segment};
 
 const MAGIC: &[u8; 4] = b"AFJ3";
@@ -93,7 +94,8 @@ impl Tail {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct Record {
     pub seq: RecordNo,
-    /// Audit only: no rule reads it (ledger R2).
+    /// When it was recorded. It also gives the times a tree presents (a
+    /// step's mtime and ctime); still no rule reads it (ledger R2).
     pub at_ns: u64,
     pub entry: Entry,
 }
@@ -133,12 +135,14 @@ pub(super) enum Entry {
     /// `objects`: each tree's object of each named file, by identity, as of
     /// `built`; the steps after it move them (git-model §3). The live opens'
     /// calls before it are read from the segments they were kept or carried
-    /// in.
+    /// in. `locals`: each tree's directory numbers and times, and its
+    /// files' times, as of `next`: what history never holds.
     Checkpoint {
         next: RecordNo,
         built: RecordNo,
         pointers: BTreeMap<String, String>,
         objects: BTreeMap<String, BTreeMap<u64, u64>>,
+        locals: BTreeMap<String, TreeLocals>,
         upstreams: BTreeMap<String, String>,
         opens: Vec<OpenRecord>,
         page_saved: Vec<(String, u64, u64)>,
@@ -156,6 +160,7 @@ pub(super) enum Entry {
     AnonymousOpen {
         tree: String,
         by: WriterAt,
+        meta: Meta,
     },
     Call {
         handle: u64,
@@ -204,6 +209,40 @@ pub(super) enum Change {
     Create {
         tree: String,
         path: String,
+        meta: Meta,
+    },
+    /// A directory; its number is this record's.
+    Mkdir {
+        tree: String,
+        path: String,
+        meta: Meta,
+    },
+    /// An empty directory removed.
+    Rmdir {
+        tree: String,
+        path: String,
+    },
+    /// A symbolic link: object = this record's number, its bytes (the
+    /// target) this record's tail.
+    Symlink {
+        tree: String,
+        path: String,
+        meta: Meta,
+    },
+    /// A chmod or chown: the entry's new metadata, its kind kept. `""` is
+    /// the root directory.
+    SetMeta {
+        tree: String,
+        path: String,
+        meta: Meta,
+    },
+    /// An explicit set of times. It builds no commit: times are each tree's
+    /// own. `Now` is this record's time.
+    SetTimes {
+        tree: String,
+        path: String,
+        atime: Option<SetTime>,
+        mtime: Option<SetTime>,
     },
     /// An anonymous object's first name.
     Link {
@@ -219,6 +258,7 @@ pub(super) enum Change {
         pages: Vec<PagePiece>,
         outcome: SaveOutcome,
     },
+    /// A rename; for a directory, every entry under it moves.
     Rename {
         tree: String,
         from: String,
@@ -245,7 +285,7 @@ pub(super) enum Change {
     /// leaves (`take.files` with a file, in order).
     Take {
         tree: String,
-        take: TakeRecord,
+        take: Box<TakeRecord>,
     },
 }
 
@@ -259,15 +299,20 @@ impl Change {
     /// The tree a step's build works in, and about how many bytes it writes:
     /// the bytes a save or take leaves and the listings each step writes
     /// (the lag gate's estimate; the builder's measured rate corrects it).
-    /// `None` for rows alone and for a drop: they add to no tree's lag.
+    /// `None` for rows alone, a drop and a set of times: they add to no
+    /// tree's lag.
     ///
     /// # Errors
     ///
     /// [`Error::Format`] for a tree that is no [`super::TreeId`].
     pub fn build_cost(&self) -> Result<Option<(super::TreeId, u64)>> {
         let (tree, bytes) = match self {
-            Self::Rows | Self::Drop { .. } => return Ok(None),
+            Self::Rows | Self::Drop { .. } | Self::SetTimes { .. } => return Ok(None),
             Self::Create { tree, .. }
+            | Self::Mkdir { tree, .. }
+            | Self::Rmdir { tree, .. }
+            | Self::Symlink { tree, .. }
+            | Self::SetMeta { tree, .. }
             | Self::Link { tree, .. }
             | Self::Rename { tree, .. }
             | Self::Unlink { tree, .. } => (tree, 0),
@@ -315,6 +360,8 @@ pub(super) struct TakeRecord {
     pub files: Vec<(MergeFileIdentity, Option<referee::File>)>,
     pub names: Vec<(MergeFileIdentity, Option<NameHistory>)>,
     pub collisions: Vec<referee::Collision>,
+    /// Each directory it adds, changes (`Some`) or removes (`None`).
+    pub dirs: Vec<(String, Option<Meta>)>,
     /// The length of each file it leaves, in `files` order.
     pub lens: Vec<u64>,
     /// How many [`Entry::Bytes`] records just before it hold those files'
@@ -420,6 +467,18 @@ pub(super) struct OpenRecord {
     pub object: u64,
     /// Never linked: its object has no name and no saved state.
     pub anonymous: bool,
+    /// An anonymous open's metadata, which no commit holds yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Meta>,
+}
+
+/// What a checkpoint keeps of one tree that history never holds: each
+/// directory's number and times by path (`""` the root), and each file's
+/// times by identity.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) struct TreeLocals {
+    pub dirs: BTreeMap<String, (u64, Times)>,
+    pub files: BTreeMap<u64, Times>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1211,6 +1270,7 @@ mod tests {
                 page_saved: Vec::new(),
                 page_writes: Vec::new(),
                 objects: BTreeMap::new(),
+                locals: BTreeMap::new(),
             },
         }
     }
@@ -1263,6 +1323,7 @@ mod tests {
             },
             object: handle,
             anonymous: false,
+            meta: None,
         }
     }
 
@@ -1585,12 +1646,14 @@ mod tests {
     #[test]
     fn a_replay_that_disagrees_with_its_record_stops_the_builder() {
         use crate::tree_actor::history::built::{BuildError, WaitError};
-        use crate::tree_actor::test_support::{new_actor, reopen, writer};
+        use crate::tree_actor::test_support::{ATTRS, new_actor, reopen, writer};
         use crate::tree_actor::{Saved, TreeId};
         let tmp = tempfile::tempdir().unwrap();
         let unbuilt = crate::failpoints::configure("tree.build_before_batch=error@*").unwrap();
         let mut v = new_actor(tmp.path());
-        let h = v.write_open(TreeId::Root, "a", &writer("w"), true).unwrap();
+        let h = v
+            .write_open(TreeId::Root, "a", &writer("w"), Some(ATTRS))
+            .unwrap();
         v.write(h, 0, b"bytes", false).unwrap();
         let Saved::Commit(step) = v.close(h).unwrap() else {
             panic!("the close saves");
@@ -1640,7 +1703,9 @@ mod tests {
             }
             other => panic!("expected Disagrees, got {other:?}"),
         }
-        let h = v.write_open(TreeId::Root, "b", &writer("w"), true).unwrap();
+        let h = v
+            .write_open(TreeId::Root, "b", &writer("w"), Some(ATTRS))
+            .unwrap();
         v.write(h, 0, b"recorded", false).unwrap();
         v.close(h).unwrap();
         assert_eq!(v.read(TreeId::Root, "b").unwrap(), b"recorded");

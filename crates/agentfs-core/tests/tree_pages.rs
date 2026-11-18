@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use agentfs_core::tree_actor::{TreeActor, TreeId};
-use trees::{checkout, new_actor, reopen, rowless_fork, writer};
+use trees::{ATTRS, checkout, new_actor, reopen, rowless_fork, writer};
 
 #[path = "support/trees.rs"]
 mod trees;
@@ -36,7 +36,9 @@ impl Kernel {
     /// A file holding `seed`, saved, with nothing open.
     fn new(root: &Path, seed: &[u8]) -> Self {
         let mut v = new_actor(root);
-        let h = v.write_open(TREE, PATH, &writer("seed"), true).unwrap();
+        let h = v
+            .write_open(TREE, PATH, &writer("seed"), Some(ATTRS))
+            .unwrap();
         v.write(h, 0, seed, false).unwrap();
         let object = v.open_object(h).unwrap();
         v.close(h).unwrap();
@@ -57,7 +59,7 @@ impl Kernel {
     fn open(&mut self, writer: &str) -> u64 {
         self.invalidate();
         self.v
-            .write_open(TREE, PATH, &trees::writer(writer), false)
+            .write_open(TREE, PATH, &trees::writer(writer), None)
             .unwrap()
     }
 
@@ -530,18 +532,22 @@ fn a_fill_with_no_write_open_reads_saved_bytes_and_keeps_no_state() {
 fn a_take_names_the_files_it_changed_and_a_save_does_not() {
     let tmp = tempfile::tempdir().unwrap();
     let mut v = new_actor(tmp.path());
-    let h = v.write_open(TREE, PATH, &writer("seed"), true).unwrap();
+    let h = v
+        .write_open(TREE, PATH, &writer("seed"), Some(ATTRS))
+        .unwrap();
     v.write(h, 0, SEED, false).unwrap();
     let object = v.open_object(h).unwrap();
     v.close(h).unwrap();
-    let h = v.write_open(TREE, "other", &writer("seed"), true).unwrap();
+    let h = v
+        .write_open(TREE, "other", &writer("seed"), Some(ATTRS))
+        .unwrap();
     v.write(h, 0, b"other", false).unwrap();
     v.close(h).unwrap();
     let fork = rowless_fork(&mut v);
     while v.progress().unwrap() {}
     v.drain_changed();
 
-    let h = v.write_open(TREE, PATH, &writer("w"), false).unwrap();
+    let h = v.write_open(TREE, PATH, &writer("w"), None).unwrap();
     v.write(h, 0, b"WX", false).unwrap();
     v.close(h).unwrap();
     assert_eq!(v.drain_changed(), [], "a save is no take");

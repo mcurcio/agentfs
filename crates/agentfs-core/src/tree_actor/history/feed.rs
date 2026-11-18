@@ -34,15 +34,18 @@ impl Parent {
 /// One change of a commit's tree, relative to its first parent's.
 #[derive(Clone, Debug)]
 pub(in crate::tree_actor) enum Edit {
-    /// A blob this batch fed.
+    /// A blob this batch fed, in git mode `mode` (`0o100644`, `0o100755`
+    /// or `0o120000`).
     Blob {
         path: String,
         mark: u64,
+        mode: u32,
     },
-    /// A blob already in the store.
+    /// A blob already in the store, in git mode `mode`.
     Stored {
         path: String,
         oid: Oid,
+        mode: u32,
     },
     Inline {
         path: String,
@@ -213,11 +216,11 @@ impl Feed {
         }
         for edit in spec.edits {
             match edit {
-                Edit::Blob { path, mark } => {
-                    writeln!(out, "M 100644 :{mark} {}", quoted(path)).map_err(packer)?;
+                Edit::Blob { path, mark, mode } => {
+                    writeln!(out, "M {mode:o} :{mark} {}", quoted(path)).map_err(packer)?;
                 }
-                Edit::Stored { path, oid } => {
-                    writeln!(out, "M 100644 {oid} {}", quoted(path)).map_err(packer)?;
+                Edit::Stored { path, oid, mode } => {
+                    writeln!(out, "M {mode:o} {oid} {}", quoted(path)).map_err(packer)?;
                 }
                 Edit::Inline { path, bytes } => {
                     writeln!(
@@ -351,6 +354,7 @@ mod tests {
                     Edit::Blob {
                         path: "files/a b".into(),
                         mark: blob,
+                        mode: 0o100644,
                     },
                     Edit::Inline {
                         path: "\"odd".into(),

@@ -11,7 +11,7 @@ tree_git_fanned() {
 
 tree_git_file() {
   local gitdir=$1 commit=$2 path=$3
-  if git --git-dir="$gitdir" show -s --format=%B "$commit" | grep -Fx 'Agentfs-Format: envelope-1' >/dev/null; then
+  if git --git-dir="$gitdir" show -s --format=%B "$commit" | grep -Fx 'Agentfs-Format: envelope-2' >/dev/null; then
     git --git-dir="$gitdir" cat-file -e "$commit:lines/$(tree_git_fanned "$path")" || return 1
     path=files/$(tree_git_fanned "$path")
   fi

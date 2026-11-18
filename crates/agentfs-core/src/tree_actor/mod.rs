@@ -12,6 +12,7 @@
 mod call_path;
 mod history;
 mod journal;
+mod meta;
 mod pointers;
 mod queue;
 mod recording;
@@ -53,16 +54,17 @@ use journal::{
     Change, Entry, FoldedOpen, Journal, PointerChange, Record, Replay, RowRecord, Target,
     compact_at, fold,
 };
+pub use meta::{Attrs, Kind, Meta, Perm, SetTime, Times};
 use pointers::Pointers;
-pub use recording::FileMap;
 pub use recording::file_map::FileMapReader;
+pub use recording::{DirEntry, FileMap, Node, RenameMode};
 use recording::{Handle, pages};
 use rows::SavedRows;
 pub use rows::{Chain, RowDomain, RowEvent, RowWrite};
 use stages::Stages;
 use tree::{EventNumber, SavedTree};
 
-const FORMAT: &str = "agentfs-trees-10\n";
+const FORMAT: &str = "agentfs-trees-11\n";
 /// The volume identity file: [`VolumeIdentity`] as JSON, written once by
 /// [`TreeActor::create`], read before any write at every open.
 const IDENTITY: &str = "volume";
@@ -107,7 +109,7 @@ pub enum Error {
     Busy,
     #[error("not a tree state area (or unsupported format)")]
     Format,
-    #[error("tree supports flat, git-safe UTF-8 names only")]
+    #[error("tree supports git-safe UTF-8 names only")]
     Name,
     #[error("no tree volume here: create it with `agentfs trees init --volume NAME`")]
     NotCreated,
@@ -115,6 +117,16 @@ pub enum Error {
     NotFound,
     #[error("file already exists")]
     Exists,
+    #[error("directory not empty")]
+    NotEmpty,
+    #[error("not a directory")]
+    NotADirectory,
+    #[error("is a directory")]
+    IsADirectory,
+    #[error("invalid argument")]
+    Invalid,
+    #[error("file name too long")]
+    NameTooLong,
     /// A write through a session with no writer: a read-only client's, or one
     /// whose client has ended.
     #[error("this view is read-only")]
@@ -156,6 +168,11 @@ impl Error {
         match self {
             Self::NotFound => libc::ENOENT,
             Self::Exists => libc::EEXIST,
+            Self::NotEmpty => libc::ENOTEMPTY,
+            Self::NotADirectory => libc::ENOTDIR,
+            Self::IsADirectory => libc::EISDIR,
+            Self::Invalid => libc::EINVAL,
+            Self::NameTooLong => libc::ENAMETOOLONG,
             Self::ReadOnly => libc::EROFS,
             Self::Name => libc::EINVAL,
             Self::TooLarge => libc::EFBIG,
@@ -270,6 +287,8 @@ pub struct TreeActor {
     /// open until a later step in their tree saves them, or a restart does.
     pending_closes: Vec<u64>,
     next: u64,
+    /// The last record's time: what a step just recorded applies its times at.
+    last_at_ns: u64,
     stopped: bool,
     compact_threshold: u64,
     metrics: Metrics,
@@ -408,6 +427,20 @@ fn resolve_pointers(
     ))
 }
 
+/// Each tree's directory numbers and times and files' times, which history
+/// never holds, restored on the trees read from it. [`Error::Format`] for a
+/// tree `locals` lacks.
+fn restore_locals(
+    trees: &mut BTreeMap<TreeId, tree::Tree>,
+    locals: &BTreeMap<TreeId, journal::TreeLocals>,
+) -> Result<()> {
+    for (id, tree) in trees.iter_mut() {
+        tree.shape
+            .restore_locals(locals.get(id).ok_or(Error::Format)?)?;
+    }
+    Ok(())
+}
+
 /// Queue entries a step adds, each with its source, and removes (`None`).
 type SourceChanges = Vec<(String, Option<TreeId>)>;
 
@@ -472,7 +505,17 @@ impl TreeActor {
         write_durably(&root, IDENTITY, text.as_bytes())?;
         let repo = history::init_store(&root.join("history.git"), Arc::clone(&lock))?;
         repo.write_config(&refs::head(), &BTreeMap::new())?;
-        let tree = repo.write_tree(&[])?;
+        // The root directory, owned by the process that creates the volume.
+        let root_dir = Meta {
+            kind: Kind::Dir,
+            mode: Perm::from_mode(0o755),
+            // SAFETY: neither call has preconditions or fails.
+            uid: unsafe { libc::geteuid() },
+            gid: unsafe { libc::getegid() },
+        };
+        // Every commit with no file names the empty tree.
+        repo.write_tree(&[])?;
+        let tree = history::format::root_tree(&repo, &root_dir)?;
         let head = repo.write_commit(tree, &[], &Message::Root { service }.render(identity)?)?;
         // Every sync queue entry names this blob.
         repo.write_blob(b"sync")?;
@@ -493,6 +536,17 @@ impl TreeActor {
                     page_saved: Vec::new(),
                     page_writes: Vec::new(),
                     objects: BTreeMap::new(),
+                    locals: [(
+                        TreeId::Root.to_string(),
+                        journal::TreeLocals {
+                            dirs: [(String::new(), (0, Times::at(now_ns())))]
+                                .into_iter()
+                                .collect(),
+                            files: BTreeMap::new(),
+                        },
+                    )]
+                    .into_iter()
+                    .collect(),
                 },
             },
         )?;
@@ -583,34 +637,43 @@ impl TreeActor {
         let at_built = fold(&frames[..upto])?;
         let pointers = resolve_pointers(&at_built.pointers, &values)?;
         check_objects(&repo, &pointers)?;
-        // Object numbers as of the built point: the checkpoint's, moved by
-        // the steps built after it, on the trees as the checkpoint has them.
-        let objects = if built > folded_built {
+        // Object numbers, directory numbers and times as of the built point:
+        // the checkpoint's, moved by the steps built after it, on the trees as
+        // the checkpoint has them.
+        let (objects, locals) = if built > folded_built {
             let checkpoint = fold(&frames[..1])?;
             let at_checkpoint = resolve_pointers(&checkpoint.pointers, &values)?;
-            let trees = read_trees(&repo, &at_checkpoint, &checkpoint.objects, |_, _, _| {
+            let mut trees = read_trees(&repo, &at_checkpoint, &checkpoint.objects, |_, _, _| {
                 Ok(Arc::default())
-            })?
-            .iter()
-            .map(|(tree, t)| (*tree, SavedTree::of(t)))
-            .collect();
+            })?;
+            restore_locals(&mut trees, &checkpoint.locals)?;
+            let trees = trees
+                .iter()
+                .map(|(tree, t)| (*tree, SavedTree::of(t)))
+                .collect();
             let mut replay = Replay::shapes(trees, &checkpoint.opens)?;
             for (record, tail) in &frames[1..upto] {
                 replay.apply(record, tail)?;
             }
-            replay
+            let objects = replay
                 .trees
                 .iter()
                 .map(|(tree, t)| Ok((*tree, objects_of(&t.shape)?)))
-                .collect::<Result<_>>()?
+                .collect::<Result<_>>()?;
+            let locals = replay
+                .trees
+                .iter()
+                .map(|(tree, t)| (*tree, t.shape.locals()))
+                .collect();
+            (objects, locals)
         } else {
-            at_built.objects.clone()
+            (at_built.objects.clone(), at_built.locals.clone())
         };
         let checked_out = copy_all(&repo, root, &pointers, &at_built.upstreams)?;
         let bases = root.join(history::BASES);
         recording::file_map::clear_bases(&bases)?;
         // Each file reads from its checkout as built: a map of no frame.
-        let trees = read_trees(&repo, &pointers, &objects, |tree, _, path| {
+        let mut trees = read_trees(&repo, &pointers, &objects, |tree, _, path| {
             let at = history::checkout_path(root, tree, path);
             let len = fs::metadata(&at)?.len();
             if len == 0 {
@@ -621,6 +684,7 @@ impl TreeActor {
             let base = recording::file_map::BaseFile::open(&bases, &at, built, None)?;
             Ok(Arc::new(FileMap::of_base(base, len).into()))
         })?;
+        restore_locals(&mut trees, &locals)?;
         at_built
             .upstreams
             .check_recovered(|fork| trees.contains_key(&fork))?;
@@ -795,6 +859,7 @@ impl TreeActor {
             // Never a built record's: a journal that ends before the built
             // log is corrupt (`Journal::open`).
             next: folded.next_seq.max(built.get().saturating_add(1)),
+            last_at_ns: 0,
             stopped: false,
             compact_threshold: compact_at(0),
             metrics: Metrics::default(),
@@ -977,13 +1042,13 @@ impl TreeActor {
             old: None,
         }];
         let by = self.agentfs();
-        let (recorded, _) = self.record(
+        let (recorded, _, _) = self.record(
             by,
             Change::Fork {
                 upstream: upstream.to_string(),
             },
             pointers,
-            &mut std::iter::empty(),
+            (&mut std::iter::empty(), &[]),
             rows,
         )?;
         if recorded != seq {
@@ -1016,8 +1081,13 @@ impl TreeActor {
         let seq = self.next;
         let rows = rows(RecordNo::new(seq))?;
         let by = self.agentfs();
-        let (recorded, _) =
-            self.record(by, Change::Rows, Vec::new(), &mut std::iter::empty(), rows)?;
+        let (recorded, _, _) = self.record(
+            by,
+            Change::Rows,
+            Vec::new(),
+            (&mut std::iter::empty(), &[]),
+            rows,
+        )?;
         if recorded != seq {
             return Err(Error::Format);
         }
@@ -1063,13 +1133,13 @@ impl TreeActor {
                 .map(|(name, _)| self.change(name.clone(), None)),
         );
         let by = self.agentfs();
-        let (recorded, _) = self.record(
+        let (recorded, _, _) = self.record(
             by,
             Change::Drop {
                 fork: fork.to_string(),
             },
             pointers,
-            &mut std::iter::empty(),
+            (&mut std::iter::empty(), &[]),
             rows,
         )?;
         if recorded != seq {
@@ -1241,20 +1311,22 @@ impl TreeActor {
         pointers: Vec<PointerChange>,
         chunks: Chunks<'_>,
     ) -> Result<(u64, Vec<journal::Tail>)> {
-        self.record(by, change, pointers, chunks, Vec::new())
+        let (seq, tails, _) = self.record(by, change, pointers, (chunks, &[]), Vec::new())?;
+        Ok((seq, tails))
     }
 
     /// [`TreeActor::record_step`] with the rows the step writes, in order:
     /// each chain's pointer moves to this step (`Target::Step`), named here,
-    /// after any compaction, and the rows are the actor's at once.
+    /// after any compaction, and the rows are the actor's at once. The step
+    /// record's own tail is `tail` (a link's target): returns where it is.
     fn record(
         &mut self,
         by: WriterAt,
         change: Change,
         pointers: Vec<PointerChange>,
-        chunks: Chunks<'_>,
+        (chunks, tail): (Chunks<'_>, &[u8]),
         rows: Vec<RowWrite>,
-    ) -> Result<(u64, Vec<journal::Tail>)> {
+    ) -> Result<(u64, Vec<journal::Tail>, journal::segment::FramePos)> {
         if self.is_stopped() {
             return Err(Error::Stopped);
         }
@@ -1266,7 +1338,13 @@ impl TreeActor {
             _ => 0,
         };
         let mut pointers = pointers;
-        let recorded = (|| -> Result<(u64, Vec<journal::Tail>, SourceChanges)> {
+        type Appended = (
+            u64,
+            Vec<journal::Tail>,
+            journal::segment::FramePos,
+            SourceChanges,
+        );
+        let recorded = (|| -> Result<Appended> {
             crate::failpoints::hit("tree.before_step")?;
             // A compaction due runs before the step's pointers are checked:
             // values read before it are named as what they were built as.
@@ -1295,18 +1373,18 @@ impl TreeActor {
                     len: chunk.len() as u64,
                 });
             }
-            let (seq, _) = self.append_record(
+            let (seq, pos) = self.append_record(
                 Entry::Step {
                     by,
                     change,
                     pointers: pointers.clone(),
                     rows: rows.clone(),
                 },
-                &[],
+                tail,
             )?;
-            Ok((seq, tails, sources))
+            Ok((seq, tails, pos, sources))
         })();
-        let (seq, tails, sources) = match recorded {
+        let (seq, tails, pos, sources) = match recorded {
             Ok(recorded) => recorded,
             Err(e) => {
                 eprintln!("tree SaveFailed: {e}");
@@ -1323,7 +1401,7 @@ impl TreeActor {
         self.rows.apply(&rows)?;
         apply_sources(&mut self.sources, sources);
         self.history.appended_step(RecordNo::new(seq), cost);
-        Ok((seq, tails))
+        Ok((seq, tails, pos))
     }
 
     /// Takes each map the builder built that is the same save as the actor's
@@ -1389,7 +1467,16 @@ pub(crate) mod test_support {
     use agentfs_contracts::pod::{PodContext, WriterAt};
     use agentfs_contracts::volume::{VolumeId, VolumeIdentity};
 
-    use super::{TreeActor, TreeId};
+    use super::{Attrs, Perm, TreeActor, TreeId};
+
+    /// What a test's create gives a file: mode 0644, owned by 1000:1000.
+    pub(crate) const ATTRS: Attrs = Attrs {
+        perm: Perm::from_mode(0o644),
+        owner: agentfs_contracts::clients::FileOwner {
+            uid: 1000,
+            gid: 1000,
+        },
+    };
 
     /// A fork of the root with no row: the engine's own tests, below the store.
     #[allow(
@@ -1426,7 +1513,7 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use super::journal::Frame;
-    use super::test_support::{new_actor, reopen, rowless_fork, writer};
+    use super::test_support::{ATTRS, new_actor, reopen, rowless_fork, writer};
     use super::*;
 
     const ROOT: TreeId = TreeId::Root;
@@ -1489,17 +1576,17 @@ mod tests {
         // Both kinds of live open with calls and page writes, closed opens with
         // both, a fork and a queue entry.
         let fork = rowless_fork(&mut v);
-        let held = v.write_open(ROOT, "held", &w, true).unwrap();
+        let held = v.write_open(ROOT, "held", &w, Some(ATTRS)).unwrap();
         v.write(held, 0, b"held-1", false).unwrap();
-        let shared = v.write_open(ROOT, "shared", &w, true).unwrap();
+        let shared = v.write_open(ROOT, "shared", &w, Some(ATTRS)).unwrap();
         v.write(shared, 0, b"shared", false).unwrap();
         let object = v.open_object(shared).unwrap();
-        let other = v.write_open(ROOT, "shared", &w, false).unwrap();
+        let other = v.write_open(ROOT, "shared", &w, None).unwrap();
         v.page_writeback(other, 1, b"WXYZ").unwrap();
         v.close(other).unwrap();
-        let anonymous = v.anonymous_open(ROOT, &w).unwrap();
+        let anonymous = v.anonymous_open(ROOT, &w, ATTRS).unwrap();
         v.write(anonymous, 0, b"unnamed", false).unwrap();
-        let closed = v.write_open(ROOT, "closed", &w, true).unwrap();
+        let closed = v.write_open(ROOT, "closed", &w, Some(ATTRS)).unwrap();
         v.write(closed, 0, b"closed", false).unwrap();
         let closed_object = v.open_object(closed).unwrap();
         v.record_page_write(
@@ -1512,7 +1599,7 @@ mod tests {
         )
         .unwrap();
         v.close(closed).unwrap();
-        v.write_open(fork, "sandbox", &w, true).unwrap();
+        v.write_open(fork, "sandbox", &w, Some(ATTRS)).unwrap();
 
         let mut whole = frames_of(tmp.path());
         let folded = fold(&whole).unwrap();
@@ -1537,7 +1624,7 @@ mod tests {
         // the checkpoint covers as oids, so they fold only on top of it.
         v.write(held, 0, b"held-2", false).unwrap();
         v.write(shared, 0, b"!", true).unwrap();
-        let again = v.write_open(ROOT, "again", &w, true).unwrap();
+        let again = v.write_open(ROOT, "again", &w, Some(ATTRS)).unwrap();
         v.close(shared).unwrap();
         v.first_link(ROOT, anonymous, "named", &w).unwrap();
         v.close(again).unwrap();
@@ -1563,14 +1650,14 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut v = new_actor(tmp.path());
         let w = writer("w");
-        let first = v.write_open(ROOT, "f", &w, true).unwrap();
+        let first = v.write_open(ROOT, "f", &w, Some(ATTRS)).unwrap();
         v.page_writeback(first, 0, b"XXXX").unwrap();
         v.close(first).unwrap();
-        let second = v.write_open(ROOT, "f", &w, false).unwrap();
+        let second = v.write_open(ROOT, "f", &w, None).unwrap();
         v.write(second, 0, b"YYYY", false).unwrap();
         v.close(second).unwrap();
         // Held open across the compaction, as a long-lived log is.
-        let _held = v.write_open(ROOT, "f", &w, false).unwrap();
+        let _held = v.write_open(ROOT, "f", &w, None).unwrap();
         v.settle().unwrap();
         v.compact().unwrap();
         drop(v);
@@ -1679,7 +1766,7 @@ mod tests {
         let other = rowless_fork(&mut v);
         assert!(!v.pending_from(fork));
         assert!(!v.pending_from(ROOT), "the root lands nowhere");
-        let h = v.write_open(fork, "f", &w, true).unwrap();
+        let h = v.write_open(fork, "f", &w, Some(ATTRS)).unwrap();
         v.write(h, 0, b"x\n", false).unwrap();
         v.close(h).unwrap();
         assert!(v.pending_from(fork));
@@ -1772,7 +1859,7 @@ mod tests {
         let mut v = new_actor(Path::new(&root));
         let put = |v: &mut TreeActor, n: usize| {
             let h = v
-                .write_open(TreeId::Root, &format!("f{n}"), &writer("w"), true)
+                .write_open(TreeId::Root, &format!("f{n}"), &writer("w"), Some(ATTRS))
                 .unwrap();
             v.write(h, 0, format!("{n}\n").as_bytes(), false).unwrap();
             v.close(h).unwrap();
@@ -1847,8 +1934,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut v = new_actor(tmp.path());
         let w = writer("w");
-        let log = v.write_open(ROOT, "log", &w, true).unwrap();
-        let big = v.write_open(ROOT, "big", &w, true).unwrap();
+        let log = v.write_open(ROOT, "log", &w, Some(ATTRS)).unwrap();
+        let big = v.write_open(ROOT, "big", &w, Some(ATTRS)).unwrap();
         v.settle().unwrap();
         // Hold the builder in the fsync it makes before its batch.
         let (entered, inside) = sync_channel::<()>(0);

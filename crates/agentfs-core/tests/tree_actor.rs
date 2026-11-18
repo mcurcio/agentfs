@@ -9,8 +9,8 @@ use std::os::unix::fs::FileExt;
 
 use agentfs_contracts::name::WriterLabel;
 use agentfs_contracts::pod::PodContext;
-use agentfs_core::tree_actor::{Error, Saved, Took, TreeActor, TreeId};
-use trees::{checkout, fanned, new_actor, reopen, reopen_after_kill, rowless_fork, writer};
+use agentfs_core::tree_actor::{Error, RenameMode, Saved, Took, TreeActor, TreeId};
+use trees::{ATTRS, checkout, fanned, new_actor, reopen, reopen_after_kill, rowless_fork, writer};
 
 const ROOT: TreeId = TreeId::Root;
 use agentfs_core::tree_git::TreeGit;
@@ -83,9 +83,12 @@ impl agentfs_core::tree_reconcile::Id for Version {
 
 type LineMap = agentfs_core::tree_reconcile::LineMap<Version>;
 
-/// A file's line map in a commit, with its identity: `lines/<aa>/<bb>/<name>`.
+/// A file's line map in a commit, with its identity: `lines/<aa>/<bb>/<name>`
+/// holds `[identity, line map, meta]`.
 fn line_map(repo: &TreeGit, commit: git2::Oid, name: &str) -> (u64, LineMap) {
-    serde_json::from_slice(&at_path(repo, commit, &format!("lines/{}", fanned(name)))).unwrap()
+    let (id, map, _): (u64, LineMap, serde_json::Value) =
+        serde_json::from_slice(&at_path(repo, commit, &format!("lines/{}", fanned(name)))).unwrap();
+    (id, map)
 }
 
 /// A file identity's name history in a commit: `names/<cc>/<dd>/<id>`.
@@ -141,7 +144,7 @@ fn opens_saved(root: &std::path::Path, open: u64) -> usize {
 
 fn put(v: &mut TreeActor, tree: TreeId, path: &str, bytes: &[u8]) -> u64 {
     let h = v
-        .write_open(tree, path, &writer("test-writer"), true)
+        .write_open(tree, path, &writer("test-writer"), Some(ATTRS))
         .unwrap();
     v.truncate(h, 0).unwrap();
     v.write(h, 0, bytes, false).unwrap();
@@ -154,7 +157,7 @@ fn byte_calls_match_a_plain_linux_file_and_publish_only_at_release() {
     let tmp = tempfile::tempdir().unwrap();
     let mut v = new_actor(&tmp.path().join("state"));
     put(&mut v, ROOT, "a", b"foo");
-    let h = v.write_open(ROOT, "a", &writer("writer"), false).unwrap();
+    let h = v.write_open(ROOT, "a", &writer("writer"), None).unwrap();
     let mut plain = OpenOptions::new()
         .create(true)
         .truncate(true)
@@ -214,7 +217,7 @@ fn append_finishes_a_partial_line_and_close_replays_on_the_current_head() {
     let tmp = tempfile::tempdir().unwrap();
     let mut v = new_actor(tmp.path());
     put(&mut v, ROOT, "a", b"foo");
-    let old = v.write_open(ROOT, "a", &writer("old"), false).unwrap();
+    let old = v.write_open(ROOT, "a", &writer("old"), None).unwrap();
     v.write(old, 0, b"bar", true).unwrap();
     put(&mut v, ROOT, "a", b"new");
     let before = v.head(ROOT).unwrap();
@@ -233,17 +236,18 @@ fn rename_over_and_unlink_keep_old_handles_orphaned_even_after_restart() {
     let mut v = new_actor(tmp.path());
     put(&mut v, ROOT, "a", b"old");
     let old = v
-        .write_open(ROOT, "a", &writer("old-writer"), false)
+        .write_open(ROOT, "a", &writer("old-writer"), None)
         .unwrap();
     put(&mut v, ROOT, "temp", b"replacement");
-    v.rename(ROOT, "temp", "a", &writer("editor")).unwrap();
+    v.rename(ROOT, "temp", "a", RenameMode::Replace, &writer("editor"))
+        .unwrap();
     v.write(old, 0, b"BAD", false).unwrap();
     let before = v.head(ROOT).unwrap();
     assert_eq!(v.close(old).unwrap(), Saved::OrphanDropped);
     assert_eq!(v.head(ROOT).unwrap(), before);
     assert_eq!(v.read(ROOT, "a").unwrap(), b"replacement");
     let old = v
-        .write_open(ROOT, "a", &writer("old-writer"), false)
+        .write_open(ROOT, "a", &writer("old-writer"), None)
         .unwrap();
     v.unlink(ROOT, "a", &writer("editor")).unwrap();
     put(&mut v, ROOT, "a", b"new-object");
@@ -261,9 +265,10 @@ fn rename_of_an_open_file_follows_the_object() {
     let tmp = tempfile::tempdir().unwrap();
     let mut v = new_actor(tmp.path());
     put(&mut v, ROOT, "a", b"foo");
-    let h = v.write_open(ROOT, "a", &writer("writer"), false).unwrap();
+    let h = v.write_open(ROOT, "a", &writer("writer"), None).unwrap();
     v.write(h, 0, b"bar", true).unwrap();
-    v.rename(ROOT, "a", "b", &writer("writer")).unwrap();
+    v.rename(ROOT, "a", "b", RenameMode::Replace, &writer("writer"))
+        .unwrap();
     v.close(h).unwrap();
     assert!(matches!(v.read(ROOT, "a"), Err(Error::NotFound)));
     assert_eq!(v.read(ROOT, "b").unwrap(), b"foobar");
@@ -273,7 +278,9 @@ fn rename_of_an_open_file_follows_the_object() {
 fn restart_closes_abandoned_opens_once_and_repairs_the_checkout() {
     let tmp = tempfile::tempdir().unwrap();
     let mut v = new_actor(tmp.path());
-    let h = v.write_open(ROOT, "a", &writer("writer"), true).unwrap();
+    let h = v
+        .write_open(ROOT, "a", &writer("writer"), Some(ATTRS))
+        .unwrap();
     v.write(h, 0, b"acknowledged", false).unwrap();
     let before = v.head(ROOT).unwrap();
     drop(v);
@@ -281,7 +288,7 @@ fn restart_closes_abandoned_opens_once_and_repairs_the_checkout() {
     let saved = v.head(ROOT).unwrap();
     assert_ne!(saved, before);
     assert_eq!(v.read(ROOT, "a").unwrap(), b"acknowledged");
-    let next = v.write_open(ROOT, "a", &writer("writer"), false).unwrap();
+    let next = v.write_open(ROOT, "a", &writer("writer"), None).unwrap();
     assert!(next > h);
     v.close(next).unwrap();
     drop(v);
@@ -328,7 +335,7 @@ fn a_landing_on_the_parents_head_is_a_fast_forward_across_restart() {
     put(&mut v, ROOT, "a", b"base\n");
     let fork = rowless_fork(&mut v);
     let h = v
-        .write_open(fork, "a", &writer("sandbox-writer"), true)
+        .write_open(fork, "a", &writer("sandbox-writer"), Some(ATTRS))
         .unwrap();
     v.write(h, 0, b"sandbox\n", true).unwrap();
     v.close(h).unwrap();
@@ -350,7 +357,7 @@ fn a_landing_on_the_parents_head_is_a_fast_forward_across_restart() {
     while v.progress().unwrap() {}
     assert_eq!(v.head(fork).unwrap(), saved);
     let h = v
-        .write_open(ROOT, "a", &writer("main-writer"), true)
+        .write_open(ROOT, "a", &writer("main-writer"), Some(ATTRS))
         .unwrap();
     v.write(h, 0, b"main\n", true).unwrap();
     v.close(h).unwrap();
@@ -371,7 +378,7 @@ fn sync_delivers_prefix_before_open_file_and_holds_later_changes() {
     put(&mut v, ROOT, "b", b"b0\n");
     put(&mut v, ROOT, "c", b"c0\n");
     let fork = rowless_fork(&mut v);
-    let held = v.write_open(fork, "a", &writer("holder"), false).unwrap();
+    let held = v.write_open(fork, "a", &writer("holder"), None).unwrap();
     put(&mut v, ROOT, "b", b"b1\n");
     while v.progress().unwrap() {}
     assert_eq!(v.read(fork, "b").unwrap(), b"b1\n");
@@ -394,7 +401,7 @@ fn queued_same_source_keeps_order_and_collision_remains_in_history() {
     put(&mut v, ROOT, "a", b"base\n");
     put(&mut v, ROOT, "b", b"base-b\n");
     let fork = rowless_fork(&mut v);
-    let held = v.write_open(ROOT, "a", &writer("parent"), false).unwrap();
+    let held = v.write_open(ROOT, "a", &writer("parent"), None).unwrap();
     put(&mut v, fork, "a", b"child\n");
     let losing = v.head(fork).unwrap();
     put(&mut v, fork, "b", b"child-b\n");
@@ -423,7 +430,8 @@ fn create_rename_and_unlink_versions_sync_and_land() {
     put(&mut v, ROOT, "a", b"content\n");
     while v.progress().unwrap() {}
     assert_eq!(v.read(fork, "a").unwrap(), b"content\n");
-    v.rename(ROOT, "a", "b", &writer("parent")).unwrap();
+    v.rename(ROOT, "a", "b", RenameMode::Replace, &writer("parent"))
+        .unwrap();
     while v.progress().unwrap() {}
     assert!(matches!(v.read(fork, "a"), Err(Error::NotFound)));
     assert_eq!(v.read(fork, "b").unwrap(), b"content\n");
@@ -432,7 +440,14 @@ fn create_rename_and_unlink_versions_sync_and_land() {
     assert!(matches!(v.read(fork, "b"), Err(Error::NotFound)));
     put(&mut v, fork, "child", b"child\n");
     while v.progress().unwrap() {}
-    v.rename(fork, "child", "moved", &writer("child")).unwrap();
+    v.rename(
+        fork,
+        "child",
+        "moved",
+        RenameMode::Replace,
+        &writer("child"),
+    )
+    .unwrap();
     while v.progress().unwrap() {}
     assert_eq!(v.read(ROOT, "moved").unwrap(), b"child\n");
     v.unlink(fork, "moved", &writer("child")).unwrap();
@@ -445,16 +460,19 @@ fn rename_after_rejected_create_keeps_rejected_content_out_of_parent() {
     let tmp = tempfile::tempdir().unwrap();
     let mut v = new_actor(tmp.path());
     let fork = rowless_fork(&mut v);
-    let parent = v.write_open(ROOT, "a", &writer("parent"), true).unwrap();
+    let parent = v
+        .write_open(ROOT, "a", &writer("parent"), Some(ATTRS))
+        .unwrap();
     put(&mut v, fork, "a", b"child\n");
-    let held = v.write_open(fork, "a", &writer("child"), false).unwrap();
+    let held = v.write_open(fork, "a", &writer("child"), None).unwrap();
     while v.progress().unwrap() {}
     v.write(parent, 0, b"parent\n", false).unwrap();
     v.close(parent).unwrap();
     while v.progress().unwrap() {}
     assert_eq!(v.read(ROOT, "a").unwrap(), b"parent\n");
     assert_eq!(v.read(fork, "a").unwrap(), b"child\n");
-    v.rename(fork, "a", "b", &writer("child")).unwrap();
+    v.rename(fork, "a", "b", RenameMode::Replace, &writer("child"))
+        .unwrap();
     v.close(held).unwrap();
     while v.progress().unwrap() {}
     assert_eq!(v.read(ROOT, "a").unwrap(), b"parent\n");
@@ -470,9 +488,11 @@ fn single_actor_and_invalid_names_fail_before_recording() {
         TreeActor::open(tmp.path(), &PodContext::default()),
         Err(Error::Busy)
     ));
-    for path in ["../a", "a/b", ".git", ".GiT", "git~1", "", "/tmp"] {
+    for path in [
+        "../a", "a//b", "a/", ".git", "d/.git", ".GiT", "git~1", "", "/tmp",
+    ] {
         assert!(matches!(
-            v.write_open(ROOT, path, &writer("writer"), true),
+            v.write_open(ROOT, path, &writer("writer"), Some(ATTRS)),
             Err(Error::Name)
         ));
     }
@@ -552,7 +572,7 @@ fn crash_worker() {
     };
     let mut v = new_actor(std::path::Path::new(&root));
     let h = v
-        .write_open(ROOT, "a", &writer("killed-client"), true)
+        .write_open(ROOT, "a", &writer("killed-client"), Some(ATTRS))
         .unwrap();
     v.write(h, 0, b"returned-write", false).unwrap();
     println!("ACK");
@@ -613,7 +633,7 @@ fn incoming_crash_worker() {
     while volume.progress().unwrap() {}
     assert_eq!(volume.read(ROOT, "incoming").unwrap(), b"from child");
     let handle = volume
-        .write_open(ROOT, "incoming", &writer("writer"), false)
+        .write_open(ROOT, "incoming", &writer("writer"), None)
         .unwrap();
     volume.write(handle, 0, b"; after landing", true).unwrap();
     println!("ACK");
@@ -627,8 +647,10 @@ fn incoming_crash_worker() {
 fn concurrent_writers_are_not_reserved_against_an_arbitrary_size_limit() {
     let tmp = tempfile::tempdir().unwrap();
     let mut v = new_actor(tmp.path());
-    let a = v.write_open(ROOT, "a", &writer("one"), true).unwrap();
-    let b = v.write_open(ROOT, "a", &writer("two"), false).unwrap();
+    let a = v
+        .write_open(ROOT, "a", &writer("one"), Some(ATTRS))
+        .unwrap();
+    let b = v.write_open(ROOT, "a", &writer("two"), None).unwrap();
     let size = 100 * 1024 * 1024;
     v.truncate(a, size).unwrap();
     v.write(b, 0, b"x", true).unwrap();
@@ -645,7 +667,7 @@ fn save_and_checkout_failures_keep_calls_and_recover_without_duplicate_commits()
     let mut v = new_actor(tmp.path());
     put(&mut v, ROOT, "a", b"base");
     v.settle().unwrap();
-    let h = v.write_open(ROOT, "a", &writer("writer"), false).unwrap();
+    let h = v.write_open(ROOT, "a", &writer("writer"), None).unwrap();
     v.write(h, 0, b"journaled", true).unwrap();
     // A stale ref lock stands in for an interrupted Git ref update.
     fs::write(
@@ -665,7 +687,7 @@ fn save_and_checkout_failures_keep_calls_and_recover_without_duplicate_commits()
     let mut v = reopen(tmp.path());
     assert_eq!(v.head(ROOT).unwrap(), recorded);
     assert_eq!(v.read(ROOT, "a").unwrap(), b"basejournaled");
-    let h = v.write_open(ROOT, "a", &writer("writer"), false).unwrap();
+    let h = v.write_open(ROOT, "a", &writer("writer"), None).unwrap();
     v.write(h, 0, b"once", true).unwrap();
     fs::remove_dir_all(tmp.path().join("trees/root")).unwrap();
     fs::write(tmp.path().join("trees/root"), b"checkout-blocked").unwrap();
@@ -692,7 +714,7 @@ fn anonymous_object_first_link_and_recovery_preserve_identity() {
     let object;
     {
         let mut v = new_actor(tmp.path());
-        let h = v.anonymous_open(ROOT, &writer("writer")).unwrap();
+        let h = v.anonymous_open(ROOT, &writer("writer"), ATTRS).unwrap();
         object = v.open_object(h).unwrap();
         v.write(h, 0, b"saved on recovery", false).unwrap();
         assert!(v.files(ROOT).unwrap().is_empty());
@@ -709,7 +731,7 @@ fn anonymous_object_first_link_and_recovery_preserve_identity() {
         v.first_link(ROOT, object, "other", &writer("writer")),
         Err(Error::NotFound)
     ));
-    let h = v.anonymous_open(ROOT, &writer("writer")).unwrap();
+    let h = v.anonymous_open(ROOT, &writer("writer"), ATTRS).unwrap();
     v.write(h, 0, b"unlinked", false).unwrap();
     assert_eq!(v.close(h).unwrap(), Saved::Unchanged);
     assert_eq!(v.files(ROOT).unwrap().len(), 1);
@@ -721,7 +743,7 @@ fn saved_line_map_and_bytes_share_a_commit_without_a_reserved_name() {
     let mut volume = new_actor(tmp.path());
     put(&mut volume, ROOT, "metadata.json", b"first\npartial");
     let handle = volume
-        .write_open(ROOT, "metadata.json", &writer("writer"), false)
+        .write_open(ROOT, "metadata.json", &writer("writer"), None)
         .unwrap();
     volume.write(handle, 0, b" tail\nnext\n", true).unwrap();
     volume.close(handle).unwrap();
@@ -751,12 +773,18 @@ fn atomic_replacement_keeps_merge_identity_but_changes_object_across_recovery() 
     let mut volume = new_actor(tmp.path());
     put(&mut volume, ROOT, "target", b"first\nsecond\n");
     let old = volume
-        .write_open(ROOT, "target", &writer("old"), false)
+        .write_open(ROOT, "target", &writer("old"), None)
         .unwrap();
     let before = metadata(&volume, tmp.path());
     put(&mut volume, ROOT, "temp", b"first\nchanged\n");
     volume
-        .rename(ROOT, "temp", "target", &writer("editor"))
+        .rename(
+            ROOT,
+            "temp",
+            "target",
+            RenameMode::Replace,
+            &writer("editor"),
+        )
         .unwrap();
     let after = metadata(&volume, tmp.path());
     assert_ne!(before.0, after.0);
@@ -780,7 +808,14 @@ fn sync_fast_forwards_after_atomic_replacement_with_different_objects() {
     put(&mut v, ROOT, "target", b"old\n");
     let fork = rowless_fork(&mut v);
     put(&mut v, fork, "temp", b"new\n");
-    v.rename(fork, "temp", "target", &writer("editor")).unwrap();
+    v.rename(
+        fork,
+        "temp",
+        "target",
+        RenameMode::Replace,
+        &writer("editor"),
+    )
+    .unwrap();
     let fork_object = v
         .files(fork)
         .unwrap()
@@ -797,7 +832,7 @@ fn sync_fast_forwards_after_atomic_replacement_with_different_objects() {
         .1;
     assert_ne!(fork_object, parent_object);
     let held = v
-        .write_open(fork, "target", &writer("writer"), false)
+        .write_open(fork, "target", &writer("writer"), None)
         .unwrap();
     while v.progress().unwrap() {}
     assert_eq!(v.read(ROOT, "target").unwrap(), b"new\n");
@@ -826,7 +861,7 @@ fn branch_moves_persist_ordered_queue_entries_across_restart() {
     put(&mut volume, ROOT, "shared", b"base\n");
     let fork = rowless_fork(&mut volume);
     let held = volume
-        .write_open(ROOT, "shared", &writer("holder"), false)
+        .write_open(ROOT, "shared", &writer("holder"), None)
         .unwrap();
     put(&mut volume, fork, "shared", b"child\n");
     while volume.progress().unwrap() {}
@@ -856,7 +891,9 @@ fn name_history_keeps_rename_and_unlink_versions_in_the_commit() {
     let mut volume = new_actor(tmp.path());
     put(&mut volume, ROOT, "a", b"content\n");
     let created = volume.head(ROOT).unwrap();
-    volume.rename(ROOT, "a", "b", &writer("writer")).unwrap();
+    volume
+        .rename(ROOT, "a", "b", RenameMode::Replace, &writer("writer"))
+        .unwrap();
     volume.unlink(ROOT, "b", &writer("writer")).unwrap();
     let repo = repo(tmp.path());
     let id = line_map(&repo, created, "a").0;
@@ -974,7 +1011,7 @@ fn a_ref_copy_failure_is_not_a_call_failure() {
     let mut v = new_actor(tmp.path());
     put(&mut v, ROOT, "a", b"base");
     let before = v.head(ROOT).unwrap();
-    let h = v.write_open(ROOT, "a", &writer("writer"), false).unwrap();
+    let h = v.write_open(ROOT, "a", &writer("writer"), None).unwrap();
     v.write(h, 0, b"!", true).unwrap();
     let lock = tmp.path().join("history.git/refs/heads/root.lock");
     fs::write(&lock, b"stale").unwrap();
@@ -1030,7 +1067,9 @@ impl BuiltSoFar {
 fn a_bad_final_frame_is_a_torn_tail() {
     let tmp = tempfile::tempdir().unwrap();
     let mut v = new_actor(tmp.path());
-    let h = v.write_open(ROOT, "a", &writer("writer"), true).unwrap();
+    let h = v
+        .write_open(ROOT, "a", &writer("writer"), Some(ATTRS))
+        .unwrap();
     v.write(h, 0, b"returned", false).unwrap();
     let built = built_so_far(&v, tmp.path());
     v.write(h, 8, b"-torn", false).unwrap();
@@ -1057,7 +1096,9 @@ fn a_bad_final_frame_is_a_torn_tail() {
 fn a_bad_frame_before_a_good_one_is_corruption() {
     let tmp = tempfile::tempdir().unwrap();
     let mut v = new_actor(tmp.path());
-    let h = v.write_open(ROOT, "a", &writer("writer"), true).unwrap();
+    let h = v
+        .write_open(ROOT, "a", &writer("writer"), Some(ATTRS))
+        .unwrap();
     v.write(h, 0, b"one", false).unwrap();
     // Durable before the next frame is written: that frame's mark says so.
     v.durability().make_all_durable().unwrap();
@@ -1105,7 +1146,9 @@ fn a_frame_in_a_workloads_bytes_is_not_a_frame() {
     let mut v = new_actor(tmp.path());
     let path = trees::current_segment(tmp.path());
     let salt = u32::from_le_bytes(fs::read(&path).unwrap()[4..8].try_into().unwrap());
-    let h = v.write_open(ROOT, "a", &writer("writer"), true).unwrap();
+    let h = v
+        .write_open(ROOT, "a", &writer("writer"), Some(ATTRS))
+        .unwrap();
     v.write(h, 0, b"returned", false).unwrap();
     let built = built_so_far(&v, tmp.path());
     let mut bytes = b"workload ".to_vec();
@@ -1226,13 +1269,13 @@ fn open_numbers_never_repeat_across_compaction() {
         );
     }
     let mut v = reopen(tmp.path());
-    let second = v.write_open(ROOT, "a", &writer("writer"), false).unwrap();
+    let second = v.write_open(ROOT, "a", &writer("writer"), None).unwrap();
     assert!(second > first);
     v.write(second, 0, b"two", true).unwrap();
     v.close(second).unwrap();
     drop(v);
     let mut v = reopen(tmp.path());
-    let third = v.write_open(ROOT, "a", &writer("writer"), false).unwrap();
+    let third = v.write_open(ROOT, "a", &writer("writer"), None).unwrap();
     assert!(third > second);
     assert_eq!(opens_saved(tmp.path(), second), 1);
 }
@@ -1243,7 +1286,9 @@ fn open_numbers_never_repeat_across_compaction() {
 /// that call.
 const FILLED: &[u8] = b"xxxxxx";
 fn fill_journal(v: &mut TreeActor, path: &str) {
-    let h = v.write_open(ROOT, path, &writer("filler"), true).unwrap();
+    let h = v
+        .write_open(ROOT, path, &writer("filler"), Some(ATTRS))
+        .unwrap();
     let chunk = vec![b'x'; 33 << 20];
     for _ in 0..2 {
         v.write(h, 0, &chunk, true).unwrap();
@@ -1252,7 +1297,7 @@ fn fill_journal(v: &mut TreeActor, path: &str) {
     v.close(h).unwrap();
     v.settle().unwrap();
     // An open is the first call after the builder caught up: it compacts.
-    if let Ok(h) = v.write_open(ROOT, path, &writer("filler"), false) {
+    if let Ok(h) = v.write_open(ROOT, path, &writer("filler"), None) {
         v.close(h).unwrap();
     }
 }
@@ -1261,7 +1306,9 @@ fn fill_journal(v: &mut TreeActor, path: &str) {
 fn a_log_held_open_does_not_pin_other_saves() {
     let tmp = tempfile::tempdir().unwrap();
     let mut v = new_actor(tmp.path());
-    let log = v.write_open(ROOT, "log", &writer("logger"), true).unwrap();
+    let log = v
+        .write_open(ROOT, "log", &writer("logger"), Some(ATTRS))
+        .unwrap();
     v.write(log, 0, b"before\n", true).unwrap();
     fill_journal(&mut v, "big");
     // The step compacted: the other file's calls are gone, the log's stayed.
@@ -1285,7 +1332,9 @@ fn a_held_open_pins_only_its_own_bytes() {
     const SEGMENT: u64 = 64 << 20;
     let tmp = tempfile::tempdir().unwrap();
     let mut v = new_actor(tmp.path());
-    let held = v.write_open(ROOT, "held", &writer("w"), true).unwrap();
+    let held = v
+        .write_open(ROOT, "held", &writer("w"), Some(ATTRS))
+        .unwrap();
     let own: u64 = 4 << 20;
     for _ in 0..4 {
         v.write(held, 0, &[7; 1 << 20], true).unwrap();
@@ -1304,7 +1353,9 @@ fn a_held_open_pins_only_its_own_bytes() {
 
     let tmp = tempfile::tempdir().unwrap();
     let mut v = new_actor(tmp.path());
-    let held = v.write_open(ROOT, "held", &writer("w"), true).unwrap();
+    let held = v
+        .write_open(ROOT, "held", &writer("w"), Some(ATTRS))
+        .unwrap();
     for _ in 0..70 {
         v.write(held, 0, &[7; 1 << 20], true).unwrap();
     }
@@ -1312,7 +1363,7 @@ fn a_held_open_pins_only_its_own_bytes() {
     v.settle().unwrap();
     // The first call after the builder caught up compacts: a checkpoint in a
     // third segment, the two before it kept.
-    let poke = v.write_open(ROOT, "small", &writer("w"), false).unwrap();
+    let poke = v.write_open(ROOT, "small", &writer("w"), None).unwrap();
     v.close(poke).unwrap();
     assert_eq!(
         v.metrics().journal_carried_bytes,
@@ -1335,7 +1386,9 @@ fn a_held_open_pins_only_its_own_bytes() {
 fn carried_frames_free_their_old_segments() {
     let tmp = tempfile::tempdir().unwrap();
     let mut v = new_actor(tmp.path());
-    let held = v.write_open(ROOT, "held", &writer("w"), true).unwrap();
+    let held = v
+        .write_open(ROOT, "held", &writer("w"), Some(ATTRS))
+        .unwrap();
     let own: u64 = 4 << 20;
     for _ in 0..4 {
         v.write(held, 0, &[7; 1 << 20], true).unwrap();
@@ -1392,7 +1445,9 @@ fn a_reader_of_a_rebased_file_reads_the_old_version() {
 fn a_record_in_a_segment_whose_entry_is_not_fsynced_is_never_marked_durable() {
     let tmp = tempfile::tempdir().unwrap();
     let mut v = new_actor(tmp.path());
-    let h = v.write_open(ROOT, "big", &writer("w"), true).unwrap();
+    let h = v
+        .write_open(ROOT, "big", &writer("w"), Some(ATTRS))
+        .unwrap();
     let chunk = vec![b'x'; 33 << 20];
     v.write(h, 0, &chunk, true).unwrap();
     v.durability().make_all_durable().unwrap();
@@ -1459,7 +1514,9 @@ fn step_worker() {
         return;
     };
     let mut v = new_actor(std::path::Path::new(&root));
-    let h = v.write_open(ROOT, "a", &writer("writer"), true).unwrap();
+    let h = v
+        .write_open(ROOT, "a", &writer("writer"), Some(ATTRS))
+        .unwrap();
     // The create's batch, alone: the write's and the close's is the second.
     v.settle().unwrap();
     v.write(h, 0, b"returned", false).unwrap();
@@ -1477,7 +1534,9 @@ fn compact_worker() {
         return;
     };
     let mut v = new_actor(std::path::Path::new(&root));
-    let log = v.write_open(ROOT, "log", &writer("logger"), true).unwrap();
+    let log = v
+        .write_open(ROOT, "log", &writer("logger"), Some(ATTRS))
+        .unwrap();
     v.write(log, 0, b"returned\n", true).unwrap();
     println!("OPEN {log}");
     std::io::stdout().flush().unwrap();
@@ -1495,7 +1554,7 @@ fn a_save_that_changes_no_byte_commits_nothing() {
     let state = tmp.path().join("state");
     let mut v = new_actor(&state);
     let fork = rowless_fork(&mut v);
-    let h = v.write_open(ROOT, "a", &writer("w"), true).unwrap();
+    let h = v.write_open(ROOT, "a", &writer("w"), Some(ATTRS)).unwrap();
     v.write(h, 0, b"same\n", false).unwrap();
     v.close(h).unwrap();
     while v.progress().unwrap() {}
@@ -1508,15 +1567,15 @@ fn a_save_that_changes_no_byte_commits_nothing() {
     };
     assert_eq!(queues(), "");
     for tree in [ROOT, fork] {
-        let h = v.write_open(tree, "a", &writer("w"), false).unwrap();
+        let h = v.write_open(tree, "a", &writer("w"), None).unwrap();
         v.truncate(h, 0).unwrap();
         v.write(h, 0, b"same\n", false).unwrap();
         assert_eq!(v.close(h).unwrap(), Saved::Unchanged, "{tree}: a rewrite");
         assert!(matches!(v.read_open(h), Err(Error::NotFound)), "{tree}");
-        let h = v.write_open(tree, "a", &writer("w"), false).unwrap();
+        let h = v.write_open(tree, "a", &writer("w"), None).unwrap();
         v.write(h, 0, b"sa", false).unwrap();
         assert_eq!(v.close(h).unwrap(), Saved::Unchanged, "{tree}: an offset");
-        let h = v.write_open(tree, "a", &writer("w"), false).unwrap();
+        let h = v.write_open(tree, "a", &writer("w"), None).unwrap();
         v.write(h, 0, b"", true).unwrap();
         assert_eq!(v.close(h).unwrap(), Saved::Unchanged, "{tree}: an append");
     }
@@ -1528,9 +1587,9 @@ fn a_save_that_changes_no_byte_commits_nothing() {
     assert_eq!(queues(), "", "no queue entry");
 
     // The close ends the open: the sync that waits for it goes.
-    let held = v.write_open(fork, "a", &writer("w"), false).unwrap();
+    let held = v.write_open(fork, "a", &writer("w"), None).unwrap();
     v.write(held, 0, b"same\n", false).unwrap();
-    let h = v.write_open(ROOT, "a", &writer("w"), false).unwrap();
+    let h = v.write_open(ROOT, "a", &writer("w"), None).unwrap();
     v.write(h, 0, b"more\n", true).unwrap();
     v.close(h).unwrap();
     assert_eq!(v.take_next(fork).unwrap(), Took::Waiting);
@@ -1540,7 +1599,7 @@ fn a_save_that_changes_no_byte_commits_nothing() {
 
     // A crash with such an open: the journal replays it to the same result, once.
     let at = (v.head(ROOT).unwrap(), v.head(fork).unwrap());
-    let open = v.write_open(fork, "a", &writer("w"), false).unwrap();
+    let open = v.write_open(fork, "a", &writer("w"), None).unwrap();
     v.truncate(open, 0).unwrap();
     v.write(open, 0, b"same\nmore\n", false).unwrap();
     drop(v);
@@ -1668,7 +1727,7 @@ fn fast_forward_worker() {
     // One batch per step: the fork, the link, the close, the landing.
     let fork = rowless_fork(&mut v);
     v.settle().unwrap();
-    let h = v.anonymous_open(fork, &writer("w")).unwrap();
+    let h = v.anonymous_open(fork, &writer("w"), ATTRS).unwrap();
     v.write(h, 0, b"sandbox", false).unwrap();
     v.first_link(fork, v.open_object(h).unwrap(), "a", &writer("w"))
         .unwrap();
@@ -1751,7 +1810,9 @@ fn fork_after_compaction_worker() {
         return;
     };
     let mut v = new_actor(std::path::Path::new(&root));
-    let h = v.write_open(ROOT, "big", &writer("filler"), true).unwrap();
+    let h = v
+        .write_open(ROOT, "big", &writer("filler"), Some(ATTRS))
+        .unwrap();
     v.settle().unwrap();
     let chunk = vec![b'x'; 33 << 20];
     for _ in 0..2 {
@@ -1808,7 +1869,7 @@ fn a_file_linked_while_held_open_reopens_before_its_link_is_built() {
     let tmp = tempfile::tempdir().unwrap();
     let mut v = new_actor(tmp.path());
     let held = agentfs_core::failpoints::configure("tree.build_before_batch=error@*").unwrap();
-    let h = v.anonymous_open(ROOT, &writer("w")).unwrap();
+    let h = v.anonymous_open(ROOT, &writer("w"), ATTRS).unwrap();
     v.write(h, 0, b"linked", false).unwrap();
     let object = v.open_object(h).unwrap();
     v.first_link(ROOT, object, "a", &writer("w")).unwrap();
@@ -1882,7 +1943,7 @@ fn a_failed_compaction_fsync_stops_the_actor() {
     drop(guard);
     assert!(v.is_stopped());
     assert!(
-        v.write_open(ROOT, "a", &writer("w"), true).is_err(),
+        v.write_open(ROOT, "a", &writer("w"), Some(ATTRS)).is_err(),
         "sticky"
     );
     drop(v);
@@ -1912,7 +1973,7 @@ fn a_failed_save_keeps_serving_and_saves_at_the_next_step() {
     let tmp = tempfile::tempdir().unwrap();
     let mut v = new_actor(tmp.path());
     put(&mut v, ROOT, "a", b"base");
-    let h = v.write_open(ROOT, "a", &writer("writer"), false).unwrap();
+    let h = v.write_open(ROOT, "a", &writer("writer"), None).unwrap();
     v.write(h, 0, b"+returned", true).unwrap();
     let head = v.head(ROOT).unwrap();
     let point = "tree.before_step";
@@ -1923,7 +1984,7 @@ fn a_failed_save_keeps_serving_and_saves_at_the_next_step() {
     assert_eq!(v.read(ROOT, "a").unwrap(), b"base", "{point}");
     assert_eq!(v.head(ROOT).unwrap(), head, "{point}");
     // Other work goes on, the failed close's handle still counting as open.
-    let other = v.write_open(ROOT, "other", &writer("writer"), true);
+    let other = v.write_open(ROOT, "other", &writer("writer"), Some(ATTRS));
     assert!(other.is_ok());
     assert_eq!(v.read(ROOT, "a").unwrap(), b"base+returned");
     v.settle().unwrap();
@@ -1931,7 +1992,7 @@ fn a_failed_save_keeps_serving_and_saves_at_the_next_step() {
     assert!(matches!(v.close(h), Err(Error::NotFound)));
 
     // A failed save a restart finds saves there, once.
-    let h = v.write_open(ROOT, "a", &writer("writer"), false).unwrap();
+    let h = v.write_open(ROOT, "a", &writer("writer"), None).unwrap();
     v.write(h, 0, b"+again", true).unwrap();
     let guard = agentfs_core::failpoints::configure("tree.before_step=error").unwrap();
     assert!(v.close(h).is_err());
@@ -1986,8 +2047,10 @@ fn a_fast_forward_takes_the_upstreams_names() {
     let mut v = new_actor(tmp.path());
     put(&mut v, ROOT, "a", b"x\n");
     let fork = rowless_fork(&mut v);
-    v.rename(fork, "a", "b", &writer("w")).unwrap();
-    v.rename(ROOT, "a", "c", &writer("w")).unwrap();
+    v.rename(fork, "a", "b", RenameMode::Replace, &writer("w"))
+        .unwrap();
+    v.rename(ROOT, "a", "c", RenameMode::Replace, &writer("w"))
+        .unwrap();
     assert_eq!(v.take_next(ROOT).unwrap(), Took::Taken);
     assert_eq!(v.take_next(fork).unwrap(), Took::Taken);
     assert_eq!(v.head(fork).unwrap(), v.head(ROOT).unwrap());
@@ -2032,7 +2095,7 @@ fn a_failed_truncate_at_open_leaves_no_open_behind() {
     // The open's record is the first append, the truncate's the second.
     let guard = agentfs_core::failpoints::configure("tree.wal_before_header=error@2").unwrap();
     assert!(
-        v.write_open_truncating(ROOT, "a", &writer("w"), false)
+        v.write_open_truncating(ROOT, "a", &writer("w"), None)
             .is_err()
     );
     drop(guard);
@@ -2061,7 +2124,9 @@ fn a_failed_take_stays_queued_for_the_next_event() {
 fn a_failed_write_changes_nothing_and_keeps_serving() {
     let tmp = tempfile::tempdir().unwrap();
     let mut v = new_actor(tmp.path());
-    let h = v.write_open(ROOT, "a", &writer("writer"), true).unwrap();
+    let h = v
+        .write_open(ROOT, "a", &writer("writer"), Some(ATTRS))
+        .unwrap();
     v.write(h, 0, b"one", false).unwrap();
     let path = trees::current_segment(tmp.path());
     let journal = fs::read(&path).unwrap();
@@ -2089,7 +2154,9 @@ fn a_failed_fsync_stops_the_actor() {
         "tree.build_before_batch=error@*;tree.wal_before_fsync=error",
     )
     .unwrap();
-    let h = v.write_open(ROOT, "a", &writer("writer"), true).unwrap();
+    let h = v
+        .write_open(ROOT, "a", &writer("writer"), Some(ATTRS))
+        .unwrap();
     v.write(h, 0, b"one", false).unwrap();
     v.write(h, 3, b"unknown", false).unwrap();
     assert!(v.durability().make_all_durable().is_err());
@@ -2112,7 +2179,7 @@ fn branch_and_queue_recover_together_after_the_commit_point() {
     let mut volume = new_actor(tmp.path());
     let fork = rowless_fork(&mut volume);
     let h = volume
-        .write_open(fork, "a", &writer("writer"), true)
+        .write_open(fork, "a", &writer("writer"), Some(ATTRS))
         .unwrap();
     volume.write(h, 0, b"saved", false).unwrap();
     volume.settle().unwrap();
@@ -2148,7 +2215,7 @@ fn recovery_enqueues_once_after_failure_before_the_commit_point() {
     let mut volume = new_actor(tmp.path());
     let fork = rowless_fork(&mut volume);
     let h = volume
-        .write_open(fork, "a", &writer("writer"), true)
+        .write_open(fork, "a", &writer("writer"), Some(ATTRS))
         .unwrap();
     volume.write(h, 0, b"saved", false).unwrap();
     let before_head = volume.head(fork).unwrap();
@@ -2314,7 +2381,7 @@ fn a_recovered_open_commits_with_its_writers_pod_context() {
         writer: WriterLabel::parse("w").unwrap(),
         at: pod("a"),
     };
-    let h = v.write_open(ROOT, "a", &by, true).unwrap();
+    let h = v.write_open(ROOT, "a", &by, Some(ATTRS)).unwrap();
     v.write(h, 0, b"abandoned\n", false).unwrap();
     drop(v);
     let v = TreeActor::open(tmp.path(), &pod("b")).unwrap();
@@ -2348,7 +2415,7 @@ fn a_landing_names_its_landed_writer() {
         writer: WriterLabel::parse("w").unwrap(),
         at: pod("p"),
     };
-    let h = v.write_open(fork, "c", &by, true).unwrap();
+    let h = v.write_open(fork, "c", &by, Some(ATTRS)).unwrap();
     v.write(h, 0, b"forked\n", false).unwrap();
     v.close(h).unwrap();
     assert_eq!(v.take_next(ROOT).unwrap(), Took::Taken);

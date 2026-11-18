@@ -15,7 +15,9 @@
 #    unchanged.
 # 2. The workload writes a.txt. Right after its close returns, the root's head
 #    holds it (at `files/<aa>/<bb>/a.txt`, as every envelope commit does: docs/trees.md), with `Agentfs-Volume: t`, the volume's id and the pod trailers
-#    the mount was given.
+#    the mount was given. The workload makes a directory and an executable
+#    script and runs it: history holds the script as `100755` and the
+#    directory's `dirs/` record.
 # 3. agentfs is killed with SIGKILL while the workload writes, the stale mount
 #    is lazily unmounted and agentfs mounts again: every write the workload saw
 #    answered is in history, with its pod trailers, and a restarted workload
@@ -163,6 +165,24 @@ message=$(in_history log -1 --format=%B root)
 assert_contains "$message" 'Agentfs-Volume: t' 'the save names its volume'
 assert_contains "$message" "Agentfs-Volume-Id: $id" 'and its id'
 has_trailers "$message" 'the save'
+# A directory and an executable bit, through the view and in history.
+workload -- 'mkdir -p /agentfs/root/tools/bin &&
+  printf "#!/bin/sh\necho hi\n" > /agentfs/root/tools/bin/run.sh &&
+  chmod +x /agentfs/root/tools/bin/run.sh &&
+  [ "$(/agentfs/root/tools/bin/run.sh)" = hi ]' || fail 'the workload could not make and run a script in a directory'
+pass 'the workload made a directory and ran an executable script in it'
+script=files/$(tree_git_fanned tools/bin/run.sh)
+built_mode() { # path want what
+  wait_for 120 sh -c "[ \"\$(docker run --rm -v '$DATA:/data' --entrypoint git '$IMAGE' --git-dir /data/state/history.git ls-tree --full-tree root -- '$1' 2>/dev/null | cut -d' ' -f1)\" = '$2' ]" ||
+    fail "$3: history never held $1 as $2"
+}
+built_mode "$script" 100755 'the script is executable in history'
+pass 'the script is 100755 in history'
+fanned_dir=$(tree_git_fanned tools/bin)
+record="dirs/${fanned_dir%/tools/bin}/tools%2Fbin"
+built_mode "$record" 100644 'the directory has its record'
+assert_contains "$(in_history show "root:$record")" '"kind":"dir"' 'the record is a directory'
+pass 'the directory tools/bin has its dirs/ record'
 
 step '3. SIGKILL mid-stream: every answered write is in history'
 workload -v "$RECEIPTS:/receipts" -d -- '

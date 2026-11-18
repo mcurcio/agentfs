@@ -24,7 +24,7 @@ use agentfs_contracts::trees::{ForkLookup, ForkPhase, ForkSettings, Landing, Tre
 use agentfs_core::store::TreeStore;
 use agentfs_core::tree_actor::{Chain, Recording, RowDomain, TreeId};
 use agentfs_trees::TreesService;
-use trees::{identity, writer};
+use trees::{ATTRS, identity, writer};
 
 #[path = "support/trees.rs"]
 mod trees;
@@ -323,7 +323,7 @@ fn queue_facts_come_from_the_journal() {
     {
         let mut actor = recording.actor().unwrap();
         let h = actor
-            .write_open(fork.into(), "f", &writer("w"), true)
+            .write_open(fork.into(), "f", &writer("w"), Some(ATTRS))
             .unwrap();
         actor.write(h, 0, b"landing\n", false).unwrap();
         actor.close(h).unwrap();
@@ -353,7 +353,9 @@ fn key(text: &str) -> agentfs_contracts::name::ForkKey {
 /// `name` in `tree` holds `bytes`: one create (or open), write and close.
 fn put(recording: &Arc<Recording>, tree: TreeId, name: &str, bytes: &[u8]) {
     let mut actor = recording.actor().unwrap();
-    let h = actor.write_open(tree, name, &writer("w"), true).unwrap();
+    let h = actor
+        .write_open(tree, name, &writer("w"), Some(ATTRS))
+        .unwrap();
     actor.truncate(h, 0).unwrap();
     actor.write(h, 0, bytes, false).unwrap();
     actor.close(h).unwrap();
@@ -485,7 +487,7 @@ fn a_drop_waits_for_its_open_file() {
     let held = recording
         .actor()
         .unwrap()
-        .write_open(fork.into(), "a", &writer("w"), false)
+        .write_open(fork.into(), "a", &writer("w"), None)
         .unwrap();
     trees.end(fork, &cap(), &at()).unwrap();
     assert_eq!(phase(&trees, fork), ForkPhase::Ended);

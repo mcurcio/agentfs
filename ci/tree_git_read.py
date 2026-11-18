@@ -19,7 +19,7 @@ def read_once(repo, ref, path):
                                        stderr=subprocess.DEVNULL)
     commit = git("rev-parse", ref).strip().decode("ascii")
     message = git("show", "-s", "--format=%B", commit).splitlines()
-    if b"Agentfs-Format: envelope-1" in message:
+    if b"Agentfs-Format: envelope-2" in message:
         path = "files/" + fanned(path)
     return git("show", commit + ":" + path)
 

@@ -1,7 +1,8 @@
 //! Recording: a tree's file calls, each journalled (in the kernel, no fsync) before it returns,
-//! and the steps that save them: create, close, rename and unlink, each decided, appended and
-//! applied with no git (docs/recording.md, docs/trees.md; target git-model §7). A file's bytes
-//! are a [`FileMap`] over journal frames and the checkout as built, never bytes in memory.
+//! and the steps that save them: create, close, mkdir, rmdir, symlink, rename, unlink, chmod,
+//! chown and times, each decided, appended and applied with no git (docs/recording.md,
+//! docs/trees.md; target git-model §7). A file's bytes are a [`FileMap`] over journal frames and
+//! the checkout as built, never bytes in memory.
 
 pub(super) mod file_map;
 pub(super) mod pages;
@@ -9,6 +10,7 @@ pub(super) mod pages;
 use std::collections::BTreeSet;
 use std::ops::Range;
 
+use agentfs_contracts::clients::FileOwner;
 use agentfs_contracts::name::WriterLabel;
 use agentfs_contracts::pod::WriterAt;
 
@@ -16,8 +18,9 @@ pub(in crate::tree_actor) use super::journal::CallHead as Call;
 use super::journal::durable::RecordNo;
 use super::journal::segment::FramePos;
 use super::journal::{Change, Entry, PagePiece, RunHead, SaveOutcome};
+use super::meta::{Attrs, Kind, Meta, Perm, SetTime, Times};
 use super::queue::Key;
-use super::tree::EventNumber;
+use super::tree::{DirState, EventNumber, SavedTree};
 use super::{Error, Result, Saved, TreeActor, TreeId};
 use crate::paths::RepoPath;
 pub use file_map::FileMap;
@@ -68,6 +71,51 @@ impl Call {
     }
 }
 
+/// One entry of a tree as a view presents it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Node {
+    /// Its node number: a file's or link's object, a directory's number;
+    /// `None` for the root directory. A view's inode is the number + 2.
+    pub number: Option<u64>,
+    pub meta: Meta,
+    pub times: Times,
+    /// Bytes: a file's length, a link's target's; 0 for a directory.
+    pub len: u64,
+    /// 1 for a named file or link, 0 for an anonymous one, 2 plus its child
+    /// directories for a directory.
+    pub links: u32,
+}
+
+/// One entry of a directory listing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DirEntry {
+    pub name: String,
+    pub number: u64,
+    pub kind: Kind,
+}
+
+/// Whether a rename may replace an entry at its destination.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RenameMode {
+    Replace,
+    /// `RENAME_NOREPLACE`: [`Error::Exists`] when the destination exists.
+    NoReplace,
+}
+
+/// The longest link target, in bytes (Linux's `PATH_MAX` less its NUL).
+const MAX_TARGET: usize = 4095;
+
+/// A directory's node.
+fn dir_node(path: &str, state: &DirState) -> Node {
+    Node {
+        number: (!path.is_empty()).then_some(state.number),
+        meta: state.meta,
+        times: state.times,
+        len: 0,
+        links: 2 + state.subdirs,
+    }
+}
+
 pub(in crate::tree_actor) struct Handle {
     pub(in crate::tree_actor) tree: TreeId,
     pub(in crate::tree_actor) by: WriterAt,
@@ -105,6 +153,233 @@ impl TreeActor {
         Ok(tree.bytes.get(object).ok_or(Error::NotFound)?.len())
     }
 
+    /// The entry at `path` (`""` the root directory) as a view presents it.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotFound`] for no such entry.
+    pub fn node(&self, tree: TreeId, path: &str) -> Result<Node> {
+        let t = self.tree(tree)?;
+        if let Some(state) = t.dirs.get(path) {
+            return Ok(dir_node(path, state));
+        }
+        let object = *t.names.get(path).ok_or(Error::NotFound)?;
+        Self::object_node(t, object)
+    }
+
+    /// The named file, link or directory numbered `number`, with its path
+    /// (the first in path order, for a file).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotFound`] for anything else: no such number, an anonymous
+    /// or orphaned file ([`TreeActor::open_node`]).
+    pub fn node_at(&self, tree: TreeId, number: u64) -> Result<(&str, Node)> {
+        let t = self.tree(tree)?;
+        if let Some(path) = t.dirs.path_of(number) {
+            let state = t.dirs.get(path).ok_or(Error::Format)?;
+            return Ok((path, dir_node(path, state)));
+        }
+        let path = t.names.of(number).next().ok_or(Error::NotFound)?;
+        Ok((path, Self::object_node(t, number)?))
+    }
+
+    /// The file or link object `object` as a view presents it, named or
+    /// not: an anonymous open's file, or one unlinked while open (no link).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotFound`] for an object the tree no longer has.
+    pub fn open_node(&self, tree: TreeId, object: u64) -> Result<Node> {
+        Self::object_node(self.tree(tree)?, object)
+    }
+
+    fn object_node(t: &SavedTree, object: u64) -> Result<Node> {
+        let meta = *t.meta.get(&object).ok_or(Error::NotFound)?;
+        Ok(Node {
+            number: Some(object),
+            meta,
+            times: t.times.get(&object).copied().unwrap_or_default(),
+            len: t.bytes.get(&object).map_or(0, FileMap::len),
+            links: u32::try_from(t.names.of(object).count()).unwrap_or(u32::MAX),
+        })
+    }
+
+    /// At most `count` entries of directory `dir` (`""` the root) in name
+    /// order, from the `skip`th: one batch of a directory listing.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotFound`] for no such entry, [`Error::NotADirectory`] for a
+    /// file or link.
+    pub fn children(
+        &self,
+        tree: TreeId,
+        dir: &str,
+        skip: usize,
+        count: usize,
+    ) -> Result<Vec<DirEntry>> {
+        let t = self.tree(tree)?;
+        match t.kind_at(dir) {
+            Some(Kind::Dir) => {}
+            Some(_) => return Err(Error::NotADirectory),
+            None => return Err(Error::NotFound),
+        }
+        Ok(t.children(dir, skip, count)
+            .into_iter()
+            .map(|(name, number, kind)| DirEntry { name, number, kind })
+            .collect())
+    }
+
+    /// A directory: a step. Its number is its record's, which it returns.
+    /// In a set-group-ID directory it takes the directory's group and keeps
+    /// the set-group-ID bit.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Exists`], [`Error::NotFound`] or [`Error::NotADirectory`] as
+    /// `mkdir(2)` answers; [`Error::Name`], [`Error::NameTooLong`]; a failed
+    /// record.
+    pub fn mkdir(&mut self, tree: TreeId, path: &str, attrs: Attrs, by: &WriterAt) -> Result<u64> {
+        name(path)?;
+        let meta = self.tree(tree)?.new_meta(path, Kind::Dir, attrs);
+        self.run_pending_closes(tree, None)?;
+        let change = Change::Mkdir {
+            tree: tree.to_string(),
+            path: path.to_owned(),
+            meta,
+        };
+        self.named_step(tree, by, change, (true, &[]))
+    }
+
+    /// An empty directory removed: a step.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotEmpty`], [`Error::NotADirectory`] or [`Error::NotFound`]
+    /// as `rmdir(2)` answers; a failed record.
+    pub fn rmdir(&mut self, tree: TreeId, path: &str, by: &WriterAt) -> Result<()> {
+        name(path)?;
+        self.run_pending_closes(tree, None)?;
+        let change = Change::Rmdir {
+            tree: tree.to_string(),
+            path: path.to_owned(),
+        };
+        self.named_step(tree, by, change, (true, &[])).map(drop)
+    }
+
+    /// A symbolic link to `target`, owned by `owner`, mode `0777`: a step.
+    /// Its object is its record's, which it returns; its bytes are the
+    /// target, recorded in the step's frame.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotFound`] for an empty target, [`Error::NameTooLong`] for
+    /// one over 4095 bytes, [`Error::Invalid`] for one holding NUL; as
+    /// [`TreeActor::mkdir`] for the path.
+    pub fn symlink(
+        &mut self,
+        tree: TreeId,
+        path: &str,
+        target: &str,
+        owner: FileOwner,
+        by: &WriterAt,
+    ) -> Result<u64> {
+        name(path)?;
+        if target.is_empty() {
+            return Err(Error::NotFound);
+        }
+        if target.len() > MAX_TARGET {
+            return Err(Error::NameTooLong);
+        }
+        if target.contains('\0') {
+            return Err(Error::Invalid);
+        }
+        let attrs = Attrs {
+            perm: Perm::from_mode(0o777),
+            owner,
+        };
+        let meta = self.tree(tree)?.new_meta(path, Kind::Symlink, attrs);
+        self.run_pending_closes(tree, None)?;
+        let change = Change::Symlink {
+            tree: tree.to_string(),
+            path: path.to_owned(),
+            meta,
+        };
+        self.named_step(tree, by, change, (true, target.as_bytes()))
+    }
+
+    /// A link's target.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Invalid`] for an entry that is no link, [`Error::NotFound`]
+    /// for none.
+    pub fn readlink(&self, tree: TreeId, path: &str) -> Result<Vec<u8>> {
+        if self.tree(tree)?.kind_at(path).ok_or(Error::NotFound)? != Kind::Symlink {
+            return Err(Error::Invalid);
+        }
+        self.read(tree, path)
+    }
+
+    /// A chmod or chown of the entry at `path` (`""` the root directory):
+    /// its kind kept, its mode and owner `attrs`'. A step, unless they are
+    /// its metadata already. A link's mode stays `0777`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotFound`] for no such entry; a failed record.
+    pub fn set_meta(
+        &mut self,
+        tree: TreeId,
+        path: &str,
+        attrs: Attrs,
+        by: &WriterAt,
+    ) -> Result<()> {
+        if !path.is_empty() {
+            name(path)?;
+        }
+        let kind = self.tree(tree)?.kind_at(path).ok_or(Error::NotFound)?;
+        let meta = Meta::new(kind, attrs);
+        if self.node(tree, path)?.meta == meta {
+            return Ok(());
+        }
+        self.run_pending_closes(tree, None)?;
+        let change = Change::SetMeta {
+            tree: tree.to_string(),
+            path: path.to_owned(),
+            meta,
+        };
+        self.named_step(tree, by, change, (true, &[])).map(drop)
+    }
+
+    /// An explicit set of the entry's access and modification times
+    /// (`utimensat(2)`; `""` the root directory): a step that builds no
+    /// commit, since times are each tree's own. Its ctime moves too.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotFound`] for no such entry; a failed record.
+    pub fn set_times(
+        &mut self,
+        tree: TreeId,
+        path: &str,
+        atime: Option<SetTime>,
+        mtime: Option<SetTime>,
+        by: &WriterAt,
+    ) -> Result<()> {
+        if !path.is_empty() {
+            name(path)?;
+        }
+        let change = Change::SetTimes {
+            tree: tree.to_string(),
+            path: path.to_owned(),
+            atime,
+            mtime,
+        };
+        self.named_step(tree, by, change, (false, &[])).map(drop)
+    }
+
     /// Stable object IDs for a view's inode table (not merge identities).
     pub fn files(&self, tree: TreeId) -> Result<Vec<(String, u64, u64)>> {
         let tree = self.tree(tree)?;
@@ -134,25 +409,6 @@ impl TreeActor {
             .ok_or(Error::NotFound)
     }
 
-    /// At most `count` of the paths [`TreeActor::files`] lists, with their
-    /// objects, from the `skip`th: one batch of a directory listing, without
-    /// copying the rest.
-    pub fn files_from(
-        &self,
-        tree: TreeId,
-        skip: usize,
-        count: usize,
-    ) -> Result<Vec<(String, u64)>> {
-        Ok(self
-            .tree(tree)?
-            .names
-            .iter()
-            .skip(skip)
-            .take(count)
-            .map(|(path, object)| (path.clone(), *object))
-            .collect())
-    }
-
     /// `open(O_TRUNC)`: a write-open and its truncate to zero, recorded in that
     /// order. When the truncate fails the kernel gets an error and sends no
     /// RELEASE, so the open closes here, or it would hold its file's takes until a
@@ -163,7 +419,7 @@ impl TreeActor {
         tree: TreeId,
         path: &str,
         by: &WriterAt,
-        create: bool,
+        create: Option<Attrs>,
     ) -> Result<u64> {
         let handle = self.write_open(tree, path, by, create)?;
         if let Err(error) = self.truncate(handle, 0) {
@@ -175,21 +431,35 @@ impl TreeActor {
         Ok(handle)
     }
 
-    /// Open a private write buffer. Creation is itself a recorded namespace call.
-    /// The returned number is persisted before it can be used and never repeats.
+    /// Open a private write buffer. With `create`, a missing file is made
+    /// with those attributes (in a set-group-ID directory, its group): a
+    /// recorded step. The returned number is persisted before it can be used
+    /// and never repeats.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::IsADirectory`] for a directory, [`Error::Invalid`] for a
+    /// link, [`Error::NotFound`] for a missing file without `create`, and as
+    /// [`TreeActor::mkdir`] for a create.
     pub fn write_open(
         &mut self,
         tree: TreeId,
         path: &str,
         by: &WriterAt,
-        create: bool,
+        create: Option<Attrs>,
     ) -> Result<u64> {
         name(path)?;
-        let Some(object) = self.tree(tree)?.names.get(path).copied() else {
-            if !create {
+        let t = self.tree(tree)?;
+        match t.kind_at(path) {
+            Some(Kind::Dir) => return Err(Error::IsADirectory),
+            Some(Kind::Symlink) => return Err(Error::Invalid),
+            Some(Kind::File) | None => {}
+        }
+        let Some(object) = t.names.get(path).copied() else {
+            let Some(attrs) = create else {
                 return Err(Error::NotFound);
-            }
-            return self.create_step(tree, path, by);
+            };
+            return self.create_step(tree, path, by, attrs);
         };
         let (handle, _) = self.journal_record(
             Entry::Open {
@@ -221,20 +491,24 @@ impl TreeActor {
         Ok(handle)
     }
 
-    /// Create an unnamed open object. Its writes are journaled as usual.
-    pub fn anonymous_open(&mut self, tree: TreeId, by: &WriterAt) -> Result<u64> {
+    /// Create an unnamed open object (`O_TMPFILE`) with these attributes.
+    /// Its writes are journaled as usual.
+    pub fn anonymous_open(&mut self, tree: TreeId, by: &WriterAt, attrs: Attrs) -> Result<u64> {
         self.tree(tree)?;
+        let meta = Meta::new(Kind::File, attrs);
         let (handle, _) = self.journal_record(
             Entry::AnonymousOpen {
                 tree: tree.to_string(),
                 by: by.clone(),
+                meta,
             },
             &[],
         )?;
+        let at_ns = self.last_at_ns;
         self.trees
             .get_mut(&tree)
             .ok_or(Error::NotFound)?
-            .add_anonymous(handle);
+            .add_anonymous(handle, meta, at_ns);
         self.handles.insert(
             handle,
             Handle {
@@ -259,20 +533,14 @@ impl TreeActor {
         by: &WriterAt,
     ) -> Result<()> {
         name(path)?;
-        let t = self.tree(tree)?;
-        if t.names.contains_key(path) {
-            return Err(Error::Exists);
-        }
-        if !t.anonymous.contains(&object) {
-            return Err(Error::NotFound);
-        }
-        self.run_pending_closes(tree, None)?;
         let change = Change::Link {
             tree: tree.to_string(),
             object,
             path: path.to_owned(),
         };
-        self.named_step(tree, by, change)
+        self.tree(tree)?.check(&change)?;
+        self.run_pending_closes(tree, None)?;
+        self.named_step(tree, by, change, (true, &[])).map(drop)
     }
 
     /// Whether this object has never had a name in this tree.
@@ -441,35 +709,59 @@ impl TreeActor {
         self.run_pending_closes(tree, Some(handle))
     }
 
-    pub fn rename(&mut self, tree: TreeId, from: &str, to: &str, by: &WriterAt) -> Result<()> {
+    /// `rename(2)`: a step. A directory moves with every entry under it,
+    /// each file keeping its object and identity; an open of one follows
+    /// its object. A move onto itself changes nothing.
+    ///
+    /// # Errors
+    ///
+    /// As POSIX: [`Error::NotFound`], [`Error::NotADirectory`] (a directory
+    /// onto a file), [`Error::IsADirectory`] (a file onto a directory),
+    /// [`Error::NotEmpty`] (onto a directory with entries),
+    /// [`Error::Invalid`] (a directory into its own subtree), and
+    /// [`Error::Exists`] for [`RenameMode::NoReplace`] onto an entry.
+    pub fn rename(
+        &mut self,
+        tree: TreeId,
+        from: &str,
+        to: &str,
+        mode: RenameMode,
+        by: &WriterAt,
+    ) -> Result<()> {
         name(from)?;
         name(to)?;
-        if !self.tree(tree)?.names.contains_key(from) {
-            return Err(Error::NotFound);
+        let change = Change::Rename {
+            tree: tree.to_string(),
+            from: from.to_owned(),
+            to: to.to_owned(),
+        };
+        let t = self.tree(tree)?;
+        t.check(&change)?;
+        if mode == RenameMode::NoReplace && t.kind_at(to).is_some() {
+            return Err(Error::Exists);
         }
         if from != to {
             self.run_pending_closes(tree, None)?;
-            let change = Change::Rename {
-                tree: tree.to_string(),
-                from: from.to_owned(),
-                to: to.to_owned(),
-            };
-            self.named_step(tree, by, change)?;
+            self.named_step(tree, by, change, (true, &[]))?;
         }
         Ok(())
     }
 
+    /// `unlink(2)`: a step.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::IsADirectory`] for a directory, [`Error::NotFound`] for no
+    /// such entry; a failed record.
     pub fn unlink(&mut self, tree: TreeId, path: &str, by: &WriterAt) -> Result<()> {
         name(path)?;
-        if !self.tree(tree)?.names.contains_key(path) {
-            return Err(Error::NotFound);
-        }
-        self.run_pending_closes(tree, None)?;
         let change = Change::Unlink {
             tree: tree.to_string(),
             path: path.to_owned(),
         };
-        self.named_step(tree, by, change)
+        self.tree(tree)?.check(&change)?;
+        self.run_pending_closes(tree, None)?;
+        self.named_step(tree, by, change, (true, &[])).map(drop)
     }
 
     /// Saves this tree's pending closes in arrival order, answering for `wanted`.
@@ -501,13 +793,22 @@ impl TreeActor {
     }
 
     /// A create: the step that names a new object and opens it.
-    fn create_step(&mut self, tree: TreeId, path: &str, by: &WriterAt) -> Result<u64> {
-        self.run_pending_closes(tree, None)?;
-        let seq = self.next;
+    fn create_step(
+        &mut self,
+        tree: TreeId,
+        path: &str,
+        by: &WriterAt,
+        attrs: Attrs,
+    ) -> Result<u64> {
+        let meta = self.tree(tree)?.new_meta(path, Kind::File, attrs);
         let change = Change::Create {
             tree: tree.to_string(),
             path: path.to_owned(),
+            meta,
         };
+        self.tree(tree)?.check(&change)?;
+        self.run_pending_closes(tree, None)?;
+        let seq = self.next;
         let pointers = self.publish(tree, seq);
         let started = std::time::Instant::now();
         self.record_step(
@@ -516,8 +817,9 @@ impl TreeActor {
             pointers,
             &mut std::iter::empty(),
         )?;
+        let at_ns = self.last_at_ns;
         let t = self.trees.get_mut(&tree).ok_or(Error::NotFound)?;
-        let keys = Self::apply_shape(&mut self.stopped, t, &change, seq);
+        let keys = Self::apply_shape(&mut self.stopped, t, &change, seq, at_ns);
         let mut empty = FileMap::empty();
         empty.saved_at(RecordNo::new(seq));
         t.bytes.insert(seq, empty);
@@ -539,32 +841,69 @@ impl TreeActor {
         Ok(seq)
     }
 
-    /// A link, rename or unlink: a step that changes names, checked by
-    /// applying it to a copy of the shape first.
-    fn named_step(&mut self, tree: TreeId, by: &WriterAt, change: Change) -> Result<()> {
+    /// A step that changes names, directories, metadata or times, checked
+    /// before its record and applied after it; with `publish`, its commit's
+    /// pointer changes (none for times), and `tail` its record's own bytes (a
+    /// link's target, whose saved map reads them there). Its number.
+    fn named_step(
+        &mut self,
+        tree: TreeId,
+        by: &WriterAt,
+        change: Change,
+        (publish, tail): (bool, &[u8]),
+    ) -> Result<u64> {
+        self.tree(tree)?.check(&change)?;
         let seq = self.next;
-        let mut shape = self.tree(tree)?.shape.clone();
-        let keys = shape.apply(&change, EventNumber::new(seq))?;
-        let pointers = self.publish(tree, seq);
+        let pointers = if publish {
+            self.publish(tree, seq)
+        } else {
+            Vec::new()
+        };
         let started = std::time::Instant::now();
-        self.record_step(by.clone(), change, pointers, &mut std::iter::empty())?;
-        self.trees.get_mut(&tree).ok_or(Error::NotFound)?.shape = shape;
+        let (recorded, _, pos) = self.record(
+            by.clone(),
+            change.clone(),
+            pointers,
+            (&mut std::iter::empty(), tail),
+            Vec::new(),
+        )?;
+        if recorded != seq {
+            return Err(Error::Format);
+        }
+        let at_ns = self.last_at_ns;
+        let t = self.trees.get_mut(&tree).ok_or(Error::NotFound)?;
+        let keys = Self::apply_shape(&mut self.stopped, t, &change, seq, at_ns);
+        if let Change::Symlink { .. } = change {
+            let mut map = FileMap::empty();
+            map.apply(
+                &Call::Write {
+                    offset: 0,
+                    len: tail.len() as u64,
+                },
+                &pos,
+            )?;
+            map.saved_at(RecordNo::new(seq));
+            t.bytes.insert(seq, map);
+        }
         self.touch(tree, seq, keys);
-        self.count_save(started);
+        if publish {
+            self.count_save(started);
+        }
         self.after_step();
-        Ok(())
+        Ok(seq)
     }
 
     /// Applies a recorded step's shape transition, which was checked before
     /// its record: a failure now is a bug, and stops the actor.
     fn apply_shape(
         stopped: &mut bool,
-        tree: &mut super::tree::SavedTree,
+        tree: &mut SavedTree,
         change: &Change,
         seq: u64,
+        at_ns: u64,
     ) -> BTreeSet<Key> {
         tree.shape
-            .apply(change, EventNumber::new(seq))
+            .apply(change, EventNumber::new(seq), at_ns)
             .unwrap_or_else(|e| {
                 eprintln!("tree SaveFailed: a recorded step does not apply: {e}");
                 *stopped = true;
@@ -633,8 +972,9 @@ impl TreeActor {
         self.touch(tree, seq, keys);
         self.pending_closes.retain(|pending| *pending != handle);
         self.handles.remove(&handle);
+        let at_ns = self.last_at_ns;
         let t = self.trees.get_mut(&tree).ok_or(Error::NotFound)?;
-        t.shape.save(object, outcome);
+        t.shape.save(object, outcome, at_ns);
         match (outcome, saved_bytes) {
             (SaveOutcome::AnonymousDropped, _) => t.drop_object(object),
             (_, Some(mut map)) => {
@@ -681,10 +1021,12 @@ pub(in crate::tree_actor) fn own_keys(calls: &[(Call, FramePos)]) -> BTreeSet<(u
     calls.iter().map(|(_, pos)| pos.key()).collect()
 }
 
+/// A path a tree may name: a git-safe relative path ([`RepoPath`]'s rules,
+/// `/` between components), each component at most 255 bytes.
 pub(in crate::tree_actor) fn name(path: &str) -> Result<()> {
     RepoPath::new(path).map_err(|_| Error::Name)?;
-    if path.contains('/') {
-        return Err(Error::Name);
+    if path.split('/').any(|component| component.len() > 255) {
+        return Err(Error::NameTooLong);
     }
     Ok(())
 }

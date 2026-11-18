@@ -15,7 +15,7 @@ use std::ffi::{OsStr, OsString};
 use std::io::{self, Write};
 use std::os::fd::{AsRawFd, BorrowedFd};
 use std::os::unix::ffi::OsStringExt;
-use std::os::unix::fs::{PermissionsExt, symlink};
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -679,7 +679,9 @@ impl TreeGit {
                 std::fs::create_dir(&path)?;
                 self.checkout_entries(entry.oid, &path, scratch)?;
             }
-            0o100644 | 0o100755 => {
+            // A link is a regular file holding its target: a checkout never
+            // holds a symlink, which could reach outside it.
+            0o100644 | 0o100755 | 0o120000 => {
                 // A large blob streams from `git cat-file`; a small one is
                 // read in this process, sparing a child per file.
                 if self.blob_size(entry.oid)? > STREAMED_BLOB {
@@ -687,13 +689,14 @@ impl TreeGit {
                 } else {
                     std::fs::write(scratch, self.read_blob(entry.oid)?)?;
                 }
-                std::fs::set_permissions(
-                    scratch,
-                    std::fs::Permissions::from_mode(entry.mode & 0o777),
-                )?;
+                let mode = if entry.mode == 0o120000 {
+                    0o600
+                } else {
+                    entry.mode & 0o777
+                };
+                std::fs::set_permissions(scratch, std::fs::Permissions::from_mode(mode))?;
                 std::fs::rename(scratch, &path)?;
             }
-            0o120000 => symlink(OsString::from_vec(self.read_blob(entry.oid)?), path)?,
             _ => return Err(Error::Invalid("unsupported checkout mode".into())),
         }
         Ok(())
@@ -720,7 +723,7 @@ impl TreeGit {
                 continue;
             }
             let path = dest.join(entry_name(name)?);
-            let file = |mode: u32| mode == 0o100644 || mode == 0o100755;
+            let file = |mode: u32| matches!(mode, 0o100644 | 0o100755 | 0o120000);
             if let Some(now) = now
                 && file(now.mode)
                 && file(was.mode)

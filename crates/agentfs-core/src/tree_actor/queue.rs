@@ -239,7 +239,7 @@ mod tests {
         tree.names.insert("c".into(), 6);
         tree.identities.insert(5, MergeFileIdentity(50));
         tree.identities.insert(6, MergeFileIdentity(60));
-        tree.add_anonymous(7);
+        tree.add_anonymous(7, crate::tree_actor::meta::TEST_FILE, 0);
         assert_eq!(
             held(&tree, [5, 7]),
             [file(50), Key::Name("a".into()), Key::Name("b".into())]

@@ -755,7 +755,7 @@ fn a_kill_after_a_write_returned_keeps_it() {
             Recording::create(Path::new(&dir), &trees::identity(), &PodContext::default()).unwrap();
         let mut v = rec.actor().unwrap();
         let h = v
-            .write_open(TreeId::Root, "a", &trees::writer("w"), true)
+            .write_open(TreeId::Root, "a", &trees::writer("w"), Some(trees::ATTRS))
             .unwrap();
         v.write(h, 0, b"kept", false).unwrap();
         unreachable!("the failpoint kills the child at the write");

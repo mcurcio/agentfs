@@ -32,7 +32,7 @@ use crate::tree_actor::journal::durable::{Durability, RecordNo};
 use crate::tree_actor::journal::segment::{FramePos, Relocations, Segment};
 use crate::tree_actor::journal::{
     At, Change, Entry, Frame, Record, RowRecord, SaveOutcome, Tail, TakeHead, TakeRecord, Target,
-    frame_at, runs_from_frame, take_chunks,
+    frame_at, link_map, runs_from_frame, take_chunks,
 };
 use crate::tree_actor::pointers::Pointers;
 use crate::tree_actor::queue::Key;
@@ -323,7 +323,11 @@ impl BuildState {
                 trees
                     .get_mut(&folded.open.tree)
                     .ok_or(Error::Format)?
-                    .add_anonymous(folded.open.object);
+                    .add_anonymous(
+                        folded.open.object,
+                        folded.open.meta.ok_or(Error::Format)?,
+                        0,
+                    );
             }
         }
         Ok(Self {
@@ -386,12 +390,12 @@ impl BuildState {
                 let tree = tree.parse::<TreeId>()?;
                 self.opened(seq, tree, *object);
             }
-            Entry::AnonymousOpen { tree, .. } => {
+            Entry::AnonymousOpen { tree, meta, .. } => {
                 let tree = tree.parse::<TreeId>()?;
                 self.trees
                     .get_mut(&tree)
                     .ok_or(Error::Format)?
-                    .add_anonymous(seq);
+                    .add_anonymous(seq, *meta, record.at_ns);
                 self.opened(seq, tree, seq);
             }
             Entry::Call { handle, call } => {
@@ -413,7 +417,7 @@ impl BuildState {
                 change,
                 pointers,
                 rows,
-            } => self.step(record, by, (change, rows), pointers, ctx, batch)?,
+            } => self.step(record, tail, by, (change, rows), pointers, ctx, batch)?,
         }
         Ok(())
     }
@@ -532,6 +536,7 @@ impl BuildState {
     fn step(
         &mut self,
         record: &Record,
+        tail: &Tail,
         by: &WriterAt,
         (change, rows): (&Change, &[RowRecord]),
         changes: &[crate::tree_actor::journal::PointerChange],
@@ -553,11 +558,19 @@ impl BuildState {
         // The commit this step makes or moves its tree's head to.
         let mut head: Option<Parent> = None;
         let mut owner = false;
+        let at_ns = record.at_ns;
+        let dir_rename = match change {
+            Change::Rename { tree, from, to } if from != to => self
+                .tree(tree.parse::<TreeId>()?)?
+                .dirs
+                .contains_key(from.as_str()),
+            _ => false,
+        };
         match change {
-            Change::Create { tree, path } => {
+            Change::Create { tree, path, .. } => {
                 let id = tree.parse::<TreeId>()?;
                 let t = self.tree_mut(id)?;
-                let keys = t.shape.apply(change, event)?;
+                let keys = t.shape.apply(change, event, at_ns)?;
                 let object = event.object();
                 t.bytes.insert(object, saved_map(FileMap::empty(), seq));
                 t.lines.insert(object, Arc::default());
@@ -571,10 +584,50 @@ impl BuildState {
                 owner = true;
                 batch.moved.insert(id);
             }
+            Change::Symlink { tree, path, .. } => {
+                let id = tree.parse::<TreeId>()?;
+                let t = self.tree_mut(id)?;
+                let keys = t.shape.apply(change, event, at_ns)?;
+                let object = event.object();
+                let map = link_map(tail, seq)?;
+                let mut versions = Versions::of(event);
+                let lines = Lines::default()
+                    .append(&Window::new(&map, 0, map.len()), |n| versions.take(n))?;
+                t.bytes.insert(object, Arc::new(map.into()));
+                t.lines.insert(object, Arc::new(lines));
+                batch.files.insert((id, object));
+                let identity = *t.identities.get(&object).ok_or(Error::Format)?;
+                t.namespace
+                    .insert(identity, NameHistory::created(event, path.clone()));
+                let message = direct(Action::Symlink, id, None)?;
+                head = Some(self.commit_direct(id, &keys, &message, at_ns, batch)?);
+                owner = true;
+                batch.moved.insert(id);
+            }
+            Change::Mkdir { tree, .. }
+            | Change::Rmdir { tree, .. }
+            | Change::SetMeta { tree, .. } => {
+                let id = tree.parse::<TreeId>()?;
+                let keys = self.tree_mut(id)?.shape.apply(change, event, at_ns)?;
+                let action = match change {
+                    Change::Mkdir { .. } => Action::Mkdir,
+                    Change::Rmdir { .. } => Action::Rmdir,
+                    _ => Action::Meta,
+                };
+                let message = direct(action, id, None)?;
+                head = Some(self.commit_direct(id, &keys, &message, at_ns, batch)?);
+                owner = true;
+                batch.moved.insert(id);
+            }
+            // Times are each tree's own: no commit.
+            Change::SetTimes { tree, .. } => {
+                let id = tree.parse::<TreeId>()?;
+                self.tree_mut(id)?.shape.apply(change, event, at_ns)?;
+            }
             Change::Link { tree, object, path } => {
                 let id = tree.parse::<TreeId>()?;
                 let t = self.tree_mut(id)?;
-                let keys = t.shape.apply(change, event)?;
+                let keys = t.shape.apply(change, event, at_ns)?;
                 let identity = *t.identities.get(object).ok_or_else(|| disagrees(seq))?;
                 t.namespace
                     .insert(identity, NameHistory::created(event, path.clone()));
@@ -595,7 +648,7 @@ impl BuildState {
                     return Err(disagrees(seq));
                 }
                 let t = self.trees.get_mut(&id).ok_or(Error::Format)?;
-                let keys = t.shape.save(open.object, *outcome);
+                let keys = t.shape.save(open.object, *outcome, at_ns);
                 match outcome {
                     SaveOutcome::AnonymousDropped => {
                         t.bytes.remove(&open.object);
@@ -646,6 +699,30 @@ impl BuildState {
                     self.pages.remove(&(id, open.object));
                 }
             }
+            Change::Rename { tree, from, to } if dir_rename => {
+                // A directory's rename: each file under it gets a new name version.
+                let id = tree.parse::<TreeId>()?;
+                let t = self.tree_mut(id)?;
+                let prefix = format!("{from}/");
+                let moved: Vec<(String, u64)> = t
+                    .names
+                    .range(prefix.clone()..)
+                    .take_while(|(path, _)| path.starts_with(&prefix))
+                    .map(|(path, object)| (path.clone(), *object))
+                    .collect();
+                for (path, object) in moved {
+                    let identity = *t.identities.get(&object).ok_or(Error::Format)?;
+                    t.namespace
+                        .get_mut(&identity)
+                        .ok_or(Error::Format)?
+                        .advance(event, Some(format!("{to}{}", &path[from.len()..])), None);
+                }
+                let keys = t.shape.apply(change, event, at_ns)?;
+                let message = direct(Action::Rename, id, None)?;
+                head = Some(self.commit_direct(id, &keys, &message, at_ns, batch)?);
+                owner = true;
+                batch.moved.insert(id);
+            }
             Change::Rename { tree, from, to } => {
                 let id = tree.parse::<TreeId>()?;
                 let t = self.tree_mut(id)?;
@@ -682,7 +759,7 @@ impl BuildState {
                         );
                     }
                 }
-                let keys = t.shape.apply(change, event)?;
+                let keys = t.shape.apply(change, event, at_ns)?;
                 let message = direct(Action::Rename, id, None)?;
                 head = Some(self.commit_direct(id, &keys, &message, record.at_ns, batch)?);
                 owner = true;
@@ -697,7 +774,7 @@ impl BuildState {
                     .get_mut(&identity)
                     .ok_or(Error::Format)?
                     .advance(event, None, None);
-                let keys = t.shape.apply(change, event)?;
+                let keys = t.shape.apply(change, event, at_ns)?;
                 let message = direct(Action::Unlink, id, None)?;
                 head = Some(self.commit_direct(id, &keys, &message, record.at_ns, batch)?);
                 owner = true;
@@ -813,6 +890,12 @@ impl BuildState {
                 None => snapshot.names.remove(identity),
             };
         }
+        for (path, meta) in &take.dirs {
+            match meta {
+                Some(meta) => snapshot.dirs.insert(path.clone(), *meta),
+                None => snapshot.dirs.remove(path),
+            };
+        }
         let mut t = current.clone();
         // A file the take leaves reads its bytes from the record's tail; every
         // other file keeps its map.
@@ -835,12 +918,18 @@ impl BuildState {
         batch
             .files
             .extend(taken.into_iter().map(|object| (id, object)));
-        // The actor ran the shape's own transition: the two must agree.
+        // The actor ran the shape's own transition: the two must agree. The
+        // tree takes the transition's shape, with its directories' numbers
+        // and its times.
         let mut shape = current.shape.clone();
-        shape.apply(change, event)?;
-        if *shape.names != *t.shape.names || shape.fresh_names != t.shape.fresh_names {
+        shape.apply(change, event, at_ns)?;
+        if *shape.names != *t.shape.names
+            || shape.fresh_names != t.shape.fresh_names
+            || shape.dirs.keys().ne(t.shape.dirs.keys())
+        {
             return Err(disagrees(seq));
         }
+        t.shape = shape;
         // What the commit rewrites: each identity the take changed, and the
         // paths it had and has.
         let identities: BTreeSet<MergeFileIdentity> = take
@@ -862,6 +951,7 @@ impl BuildState {
             }
         }
         changed.extend(identities.into_iter().map(Key::File));
+        changed.extend(take.dirs.iter().map(|(path, _)| Key::Name(path.clone())));
         let parent = self.head(id)?;
         self.trees.insert(id, t);
         let head = match &take.head {

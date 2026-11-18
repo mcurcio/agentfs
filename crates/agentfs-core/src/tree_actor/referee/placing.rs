@@ -184,9 +184,12 @@ pub(super) fn sync_files(
     let mut files = BTreeMap::new();
     for id in ids {
         let file = match (upstream.files.get(&id), fork.files.get(&id)) {
+            // Interim until the directory landing rules (MODEL.md R13-R15) are
+            // built: the upstream's metadata.
             (Some(theirs), Some(own)) => super::File {
                 object: own.object,
                 lines: sync_file(&theirs.lines, &own.lines, undecided)?,
+                meta: theirs.meta,
             },
             // A file this tree ended by an unlink or a rename-over that lost comes back as a new
             // object, numbered by the event that ended it, which numbers nothing else. Its old
@@ -198,10 +201,12 @@ pub(super) fn sync_files(
                     .get(&id)
                     .map_or(theirs.object, |ended| ended.head.object()),
                 lines: sync_file(&theirs.lines, &empty, undecided)?,
+                meta: theirs.meta,
             },
             (None, Some(own)) => super::File {
                 object: own.object,
                 lines: sync_file(last_lines.get(&id).unwrap_or(&empty), &own.lines, undecided)?,
+                meta: own.meta,
             },
             (None, None) => return Err(Error::Format),
         };
@@ -229,6 +234,7 @@ mod tests {
                 File {
                     object: 100,
                     lines: super::super::Lines::from_expanded(lines).unwrap(),
+                    meta: crate::tree_actor::meta::TEST_FILE,
                 },
             )]
             .into_iter()
@@ -239,6 +245,7 @@ mod tests {
             )]
             .into_iter()
             .collect(),
+            dirs: BTreeMap::new(),
         }
     }
 

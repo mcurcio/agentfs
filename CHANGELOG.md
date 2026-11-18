@@ -12,6 +12,20 @@ design was reviewed on 2026-10-12.
 
 ### Added
 
+- **Tree views: directories, modes and links.** A tree view serves
+  directories: `mkdir`, `rmdir`, files in any directory, and renames across
+  directories, a directory moving with everything under it, with POSIX's errors.
+  Each entry's kind, permission bits and owner are recorded (`lines/` is
+  `[identity, line map, meta]`, each directory a `dirs/` record, the root's
+  `dirs/root` in the Root commit), files keep git's modes in history (`100755`
+  for an executable, `120000` for a link), and `chmod` through a view is
+  recorded. The view shows each entry's recorded mode and times; owners are
+  still presented as `--owner`. The library also records symbolic links, owners
+  (`set_meta`) and explicit times (`set_times`, no commit); times are each
+  tree's own, kept by the journal, never in history. Commits are
+  `Agentfs-Format: envelope-2` and the state format `agentfs-trees-11`:
+  earlier tree volumes do not open. Takes add the directories their source has
+  and remove none, an interim rule until the model's directory rules are built.
 - **Tree views: recovery converges after a lost event.** An unkeyed fork with no
   client attached ends at the next judgement (boot, a last detach, a landing),
   so a crash between a client's end and the fork's end, or between a fork's

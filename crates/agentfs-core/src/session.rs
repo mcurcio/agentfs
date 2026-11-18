@@ -12,11 +12,14 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use agentfs_contracts::clients::SessionId;
+use agentfs_contracts::clients::{FileOwner, SessionId};
 use agentfs_contracts::pod::WriterAt;
 use agentfs_contracts::ports::{SessionAuthority, SessionBinder};
 
-use crate::tree_actor::{Error, FileMap, Recording, Saved, Then, TreeActor, TreeId};
+use crate::tree_actor::{
+    Attrs, DirEntry, Error, FileMap, Node, Recording, RenameMode, Saved, SetTime, Then, TreeActor,
+    TreeId,
+};
 
 type Result<T> = std::result::Result<T, Error>;
 
@@ -181,8 +184,54 @@ impl SessionGuard<'_> {
         self.actor.file_len(self.tree, path)
     }
 
-    pub fn files_from(&self, skip: usize, count: usize) -> Result<Vec<(String, u64)>> {
-        self.actor.files_from(self.tree, skip, count)
+    pub fn node(&self, path: &str) -> Result<Node> {
+        self.actor.node(self.tree, path)
+    }
+
+    pub fn node_at(&self, number: u64) -> Result<(&str, Node)> {
+        self.actor.node_at(self.tree, number)
+    }
+
+    pub fn open_node(&self, object: u64) -> Result<Node> {
+        self.actor.open_node(self.tree, object)
+    }
+
+    pub fn children(&self, dir: &str, skip: usize, count: usize) -> Result<Vec<DirEntry>> {
+        self.actor.children(self.tree, dir, skip, count)
+    }
+
+    pub fn readlink(&self, path: &str) -> Result<Vec<u8>> {
+        self.actor.readlink(self.tree, path)
+    }
+
+    pub fn mkdir(&mut self, path: &str, attrs: Attrs) -> Result<u64> {
+        let by = self.writes_as.as_ref().ok_or(Error::ReadOnly)?;
+        self.actor.mkdir(self.tree, path, attrs, by)
+    }
+
+    pub fn rmdir(&mut self, path: &str) -> Result<()> {
+        let by = self.writes_as.as_ref().ok_or(Error::ReadOnly)?;
+        self.actor.rmdir(self.tree, path, by)
+    }
+
+    pub fn symlink(&mut self, path: &str, target: &str, owner: FileOwner) -> Result<u64> {
+        let by = self.writes_as.as_ref().ok_or(Error::ReadOnly)?;
+        self.actor.symlink(self.tree, path, target, owner, by)
+    }
+
+    pub fn set_meta(&mut self, path: &str, attrs: Attrs) -> Result<()> {
+        let by = self.writes_as.as_ref().ok_or(Error::ReadOnly)?;
+        self.actor.set_meta(self.tree, path, attrs, by)
+    }
+
+    pub fn set_times(
+        &mut self,
+        path: &str,
+        atime: Option<SetTime>,
+        mtime: Option<SetTime>,
+    ) -> Result<()> {
+        let by = self.writes_as.as_ref().ok_or(Error::ReadOnly)?;
+        self.actor.set_times(self.tree, path, atime, mtime, by)
     }
 
     pub fn object_at(&self, path: &str) -> Result<u64> {
@@ -205,20 +254,20 @@ impl SessionGuard<'_> {
         self.actor.page_fill(self.tree, object, offset, size)
     }
 
-    pub fn write_open(&mut self, path: &str, create: bool) -> Result<u64> {
+    pub fn write_open(&mut self, path: &str, create: Option<Attrs>) -> Result<u64> {
         let by = self.writes_as.as_ref().ok_or(Error::ReadOnly)?;
         self.actor.write_open(self.tree, path, by, create)
     }
 
-    pub fn write_open_truncating(&mut self, path: &str, create: bool) -> Result<u64> {
+    pub fn write_open_truncating(&mut self, path: &str, create: Option<Attrs>) -> Result<u64> {
         let by = self.writes_as.as_ref().ok_or(Error::ReadOnly)?;
         self.actor
             .write_open_truncating(self.tree, path, by, create)
     }
 
-    pub fn anonymous_open(&mut self) -> Result<u64> {
+    pub fn anonymous_open(&mut self, attrs: Attrs) -> Result<u64> {
         let by = self.writes_as.as_ref().ok_or(Error::ReadOnly)?;
-        self.actor.anonymous_open(self.tree, by)
+        self.actor.anonymous_open(self.tree, by, attrs)
     }
 
     pub fn first_link(&mut self, object: u64, path: &str) -> Result<()> {
@@ -226,9 +275,9 @@ impl SessionGuard<'_> {
         self.actor.first_link(self.tree, object, path, by)
     }
 
-    pub fn rename(&mut self, from: &str, to: &str) -> Result<()> {
+    pub fn rename(&mut self, from: &str, to: &str, mode: RenameMode) -> Result<()> {
         let by = self.writes_as.as_ref().ok_or(Error::ReadOnly)?;
-        self.actor.rename(self.tree, from, to, by)
+        self.actor.rename(self.tree, from, to, mode, by)
     }
 
     pub fn unlink(&mut self, path: &str) -> Result<()> {

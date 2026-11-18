@@ -1,13 +1,23 @@
 //! The shared calls on the real library: `TreeActor`, in this process.
 
 use crate::engine_names::EngineNames;
+use agentfs_contracts::clients::FileOwner;
 use agentfs_contracts::name::{VolumeName, WriterLabel};
 use agentfs_contracts::pod::{PodContext, WriterAt};
 use agentfs_contracts::volume::{VolumeId, VolumeIdentity};
-use agentfs_core::tree_actor::{self, Error, TreeActor, TreeId as EngineTree};
+use agentfs_core::tree_actor::{
+    self, Attrs, Error, Perm, RenameMode, TreeActor, TreeId as EngineTree,
+};
 use agentfs_model::calls::{CallError, Caller, Took, TreeCalls, TreeId};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+
+/// What a replay's create gives a file: mode 0644, owned by 0:0. The model
+/// has no owners; history's metadata is not compared.
+const ATTRS: Attrs = Attrs {
+    perm: Perm::from_mode(0o644),
+    owner: FileOwner { uid: 0, gid: 0 },
+};
 
 /// The model's first commit: files a, b, c and d, each six `-` lines.
 pub const SEEDED: [&str; 4] = ["a", "b", "c", "d"];
@@ -20,10 +30,10 @@ pub fn seed(volume: &mut TreeActor, root: EngineTree) -> Result<(), Error> {
     let by = writer("agentfs-seed")?;
     for path in SEEDED {
         let new = format!("{path}.new");
-        let h = volume.write_open(root, &new, &by, true)?;
+        let h = volume.write_open(root, &new, &by, Some(ATTRS))?;
         volume.write(h, 0, SEED_BYTES, false)?;
         volume.close(h)?;
-        volume.rename(root, &new, path, &by)?;
+        volume.rename(root, &new, path, RenameMode::Replace, &by)?;
     }
     Ok(())
 }
@@ -118,7 +128,7 @@ impl Library {
         let (tree, writer) = self.who(c)?;
         let h = self
             .v_mut()?
-            .write_open(tree, path, &writer, create)
+            .write_open(tree, path, &writer, create.then_some(ATTRS))
             .map_err(fail);
         let h = self.settled(h)?;
         self.owners.insert(h, c.clone());
@@ -189,7 +199,10 @@ impl TreeCalls for Library {
 
     fn rename(&mut self, c: &Caller, from: &str, to: &str) -> Result<(), CallError> {
         let (tree, writer) = self.who(c)?;
-        let renamed = self.v_mut()?.rename(tree, from, to, &writer).map_err(fail);
+        let renamed = self
+            .v_mut()?
+            .rename(tree, from, to, RenameMode::Replace, &writer)
+            .map_err(fail);
         self.settled(renamed)
     }
 

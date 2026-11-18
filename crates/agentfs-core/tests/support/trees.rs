@@ -5,10 +5,20 @@
 
 use std::path::Path;
 
+use agentfs_contracts::clients::FileOwner;
 use agentfs_contracts::name::{VolumeName, WriterLabel};
 use agentfs_contracts::pod::{PodContext, WriterAt};
 use agentfs_contracts::volume::{VolumeId, VolumeIdentity};
-use agentfs_core::tree_actor::{TreeActor, TreeId};
+use agentfs_core::tree_actor::{Attrs, Perm, TreeActor, TreeId};
+
+/// What a test's create gives a file: mode 0644, owned by 1000:1000.
+pub const ATTRS: Attrs = Attrs {
+    perm: Perm::from_mode(0o644),
+    owner: FileOwner {
+        uid: 1000,
+        gid: 1000,
+    },
+};
 
 /// The identity [`new_actor`] gives: `test`, with a fixed id.
 pub fn identity() -> VolumeIdentity {

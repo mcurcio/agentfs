@@ -25,7 +25,7 @@ const OPEN: &str = "Agentfs-Open: ";
 const COLLISIONS: &str = "Agentfs-Collisions: ";
 /// The cause a direct save's commit carries, written by `render` and read by `direct_event`.
 const DIRECT: &str = "Direct";
-const ENVELOPE: &str = "Agentfs-Format: envelope-1";
+const ENVELOPE: &str = "Agentfs-Format: envelope-2";
 const KIND: &str = "Agentfs-Kind: ";
 const BY: &str = "Agentfs-By: ";
 /// An event commit's format: no file-commit reader takes one for a save.
@@ -37,6 +37,11 @@ pub(in crate::tree_actor) enum Action {
     Create,
     Rename,
     Unlink,
+    Mkdir,
+    Rmdir,
+    Symlink,
+    /// A chmod or chown.
+    Meta,
     /// A write-open's close.
     Direct,
 }
@@ -47,6 +52,10 @@ impl Action {
             Self::Create => "Create",
             Self::Rename => "Rename",
             Self::Unlink => "Unlink",
+            Self::Mkdir => "Mkdir",
+            Self::Rmdir => "Rmdir",
+            Self::Symlink => "Symlink",
+            Self::Meta => "Meta",
             Self::Direct => "Direct",
         }
     }
@@ -302,7 +311,7 @@ pub(in crate::tree_actor) fn collisions(message: &[u8]) -> Result<Vec<referee::C
     Ok(all)
 }
 
-/// Whether the commit is an envelope (`Agentfs-Format: envelope-1`): every commit but the Root.
+/// Whether the commit is an envelope (`Agentfs-Format: envelope-2`): every commit but the Root.
 pub(in crate::tree_actor) fn is_envelope(message: &[u8]) -> bool {
     lines(message).is_some_and(|mut lines| lines.any(|line| line == ENVELOPE))
 }
@@ -394,13 +403,13 @@ mod tests {
         assert_eq!(
             direct(None),
             format!(
-                "Rename by w x\n\nAgentfs-Writer: w x\nAgentfs-Cause: Direct\nAgentfs-Tree: fork/7\nAgentfs-Event: 42\n{VOLUME_TEXT}Agentfs-Format: envelope-1\n"
+                "Rename by w x\n\nAgentfs-Writer: w x\nAgentfs-Cause: Direct\nAgentfs-Tree: fork/7\nAgentfs-Event: 42\n{VOLUME_TEXT}Agentfs-Format: envelope-2\n"
             )
         );
         assert_eq!(
             direct(Some(5)),
             format!(
-                "Rename by w x\n\nAgentfs-Writer: w x\nAgentfs-Cause: Direct\nAgentfs-Tree: fork/7\nAgentfs-Event: 42\n{VOLUME_TEXT}Agentfs-Format: envelope-1\nAgentfs-Open: 5\n"
+                "Rename by w x\n\nAgentfs-Writer: w x\nAgentfs-Cause: Direct\nAgentfs-Tree: fork/7\nAgentfs-Event: 42\n{VOLUME_TEXT}Agentfs-Format: envelope-2\nAgentfs-Open: 5\n"
             )
         );
         let partial = PodContext {
@@ -416,7 +425,7 @@ mod tests {
                 open: Some(2),
             }),
             format!(
-                "Direct by w\n\nAgentfs-Writer: w\nAgentfs-Cause: Direct\nAgentfs-Tree: root\nAgentfs-Event: 3\n{VOLUME_TEXT}Agentfs-Pod: p-1\nAgentfs-Format: envelope-1\nAgentfs-Open: 2\n"
+                "Direct by w\n\nAgentfs-Writer: w\nAgentfs-Cause: Direct\nAgentfs-Tree: root\nAgentfs-Event: 3\n{VOLUME_TEXT}Agentfs-Pod: p-1\nAgentfs-Format: envelope-2\nAgentfs-Open: 2\n"
             )
         );
         for (action, word) in [
@@ -445,13 +454,13 @@ mod tests {
         assert_eq!(
             landing(PodContext::default(), &[]),
             format!(
-                "Landing by c3\n\nAgentfs-Writer: c3\nAgentfs-Cause: Landing\nAgentfs-Tree: root\nAgentfs-Event: 8\n{VOLUME_TEXT}Agentfs-Format: envelope-1\n"
+                "Landing by c3\n\nAgentfs-Writer: c3\nAgentfs-Cause: Landing\nAgentfs-Tree: root\nAgentfs-Event: 8\n{VOLUME_TEXT}Agentfs-Format: envelope-2\n"
             )
         );
         assert_eq!(
             landing(pod(), &[collision()]),
             format!(
-                "Landing by c3\n\nAgentfs-Writer: c3\nAgentfs-Cause: Landing\nAgentfs-Tree: root\nAgentfs-Event: 8\n{VOLUME_TEXT}{POD_TEXT}Agentfs-Format: envelope-1\nAgentfs-Collisions: [{{\"lost\":{{\"Name\":{{\"file\":3,\"version\":9}}}},\"winner\":{{\"Line\":{{\"file\":3,\"version\":\"10:2\"}}}},\"kind\":\"Line\"}}]\n"
+                "Landing by c3\n\nAgentfs-Writer: c3\nAgentfs-Cause: Landing\nAgentfs-Tree: root\nAgentfs-Event: 8\n{VOLUME_TEXT}{POD_TEXT}Agentfs-Format: envelope-2\nAgentfs-Collisions: [{{\"lost\":{{\"Name\":{{\"file\":3,\"version\":9}}}},\"winner\":{{\"Line\":{{\"file\":3,\"version\":\"10:2\"}}}},\"kind\":\"Line\"}}]\n"
             )
         );
         for (service, pods) in [(PodContext::default(), ""), (pod(), POD_TEXT)] {
@@ -462,7 +471,7 @@ mod tests {
                     event: EventNumber::new(11),
                 }),
                 format!(
-                    "Sync\n\nAgentfs-Writer: agentfs\nAgentfs-Cause: Sync\nAgentfs-Tree: fork/70\nAgentfs-Event: 11\n{VOLUME_TEXT}{pods}Agentfs-Format: envelope-1\n"
+                    "Sync\n\nAgentfs-Writer: agentfs\nAgentfs-Cause: Sync\nAgentfs-Tree: fork/70\nAgentfs-Event: 11\n{VOLUME_TEXT}{pods}Agentfs-Format: envelope-2\n"
                 )
             );
         }
@@ -634,7 +643,7 @@ mod tests {
     fn every_message_but_the_roots_is_an_envelope() {
         assert!(!is_envelope(root_text().as_bytes()));
         assert!(is_envelope(direct(None).as_bytes()));
-        assert!(!is_envelope(b"\xff\nAgentfs-Format: envelope-1\n"));
-        assert!(!is_envelope(b"x\n\nAgentfs-Format: envelope-1 \n"));
+        assert!(!is_envelope(b"\xff\nAgentfs-Format: envelope-2\n"));
+        assert!(!is_envelope(b"x\n\nAgentfs-Format: envelope-2 \n"));
     }
 }

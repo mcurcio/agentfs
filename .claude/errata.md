@@ -1313,3 +1313,32 @@ Each is to become a bead; none is open as one yet.
 4. **`R13` already appears in git-model.md §16**, as an old requirement id inside a quote of 2026-11-02 (with `R9`
    beside it, also reused). The ledger check reads only `rule N` citations and ledger ids, so nothing clashes in a
    check; R13 to R15 were taken as the brief's numbers.
+
+## 2026-11-18, M2 S1 (directories, modes and links in the tree views): where the brief was short
+
+Carried on in every case; none stopped the slice.
+
+1. **A take records its directories by path only, so a directory it adds has no mkdir number.** The brief says a
+   directory's number is its mkdir record's and "a take keeps the source tree's numbers", but `TakeRecord.dirs` is
+   `Vec<(String, Option<Meta>)>`, and the decision runs on built history, which holds no numbers. Reusing the source's
+   mkdir number can clash: a tree that renamed a synced directory keeps its number, and a later take adds the
+   source's directory of the old name. S1 numbers a directory a take adds `1 << 63 | step << 20 | index`
+   (`tree::taken_dir_number`): unique, the same at the call, the replay and the builder, and apart from every record
+   number. S3 may give `TakeRecord.dirs` the numbers instead.
+2. **An anonymous open's metadata needs a home in the checkpoint.** `Entry::AnonymousOpen` gains `meta`, but a
+   compaction that keeps a live anonymous open lists it as an `OpenRecord`, which had no metadata; a link after the
+   checkpoint would replay without it. `OpenRecord` gains `meta: Option<Meta>` (anonymous opens only).
+3. **A fast-forward landing takes the fork's commit whole.** "A take adds every directory the target lacks and
+   removes none" cannot hold for a landing that fast-forwards: the tree's head becomes the fork's own commit, so a
+   directory the fork removed would be in the actor's state and missing from the head commit and from a restart.
+   S1's fast-forward takes the commit's directories exactly (`decide_landing`); a merge landing and a sync follow the
+   brief's rule.
+4. **The view needs a file no name reaches.** `node_at` is NotFound for an anonymous or unlinked-while-open file,
+   which `getattr` must still answer (`O_TMPFILE`, an unlinked mapped file's `fstat`). S1 adds `open_node(tree,
+   object)`, mirrored on `SessionGuard`.
+5. **Lock keys and a sync's fast-forward test read metadata and directories.** `referee::touches` (a step's lock
+   keys) and `take::shows_the_same` compared lines and name heads only, so a chmod-only change took no lock and a sync
+   could fast-forward over a directory difference. Both now compare metadata and directories too: the interim rule's
+   minimum, which S3 replaces with the referee's.
+6. **"Each test file one const Attrs helper"**: the integration tests share `tests/support/trees.rs`, so the one
+   `ATTRS` lives there (one home), and each unit-test module imports the actor's `test_support::ATTRS`.

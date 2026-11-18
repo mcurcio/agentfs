@@ -29,6 +29,7 @@ use std::sync::Arc;
 
 #[path = "support/trees.rs"]
 mod trees;
+use trees::ATTRS;
 
 struct NoClients;
 
@@ -353,7 +354,7 @@ fn a_drain_goes_on_while_the_builder_fails() {
     {
         let mut actor = recording.actor().unwrap();
         let h = actor
-            .write_open(fork.into(), "f", &trees::writer("w"), true)
+            .write_open(fork.into(), "f", &trees::writer("w"), Some(ATTRS))
             .unwrap();
         actor.write(h, 0, b"landing\n", false).unwrap();
         actor.close(h).unwrap();
@@ -380,7 +381,7 @@ fn a_drain_goes_on_while_the_builder_fails() {
     {
         let mut actor = recording.actor().unwrap();
         let h = actor
-            .write_open(TreeId::Root, "during", &trees::writer("w"), true)
+            .write_open(TreeId::Root, "during", &trees::writer("w"), Some(ATTRS))
             .unwrap();
         actor.write(h, 0, b"saved\n", false).unwrap();
         actor.close(h).unwrap();

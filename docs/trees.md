@@ -26,6 +26,21 @@ what they do today, and where they stop.
   fork's save into its upstream. Two lines **collide** when each was written
   without seeing the other; the upstream's version wins and the loser's lines are
   kept.
+- A tree's entries are files, **links** (symbolic links: a file whose bytes are
+  its target) and **directories**. A directory is its path, as in git: it has no
+  identity of its own, so two trees that make the same directory make the same
+  one.
+- An entry's **metadata** is one value: its kind (file, link or directory), its
+  permission bits (`mode & 07777`), its uid and its gid. History records it, and
+  compares it whole.
+- A **directory record** is a directory's metadata in a commit (`dirs/`). Git
+  keeps no empty directory; a directory record keeps one.
+- An entry's **node number** says which file or directory a view's inode is: a
+  file's or link's object number, a directory's number (the record that made
+  it). Like object numbers, node numbers are the journal's, never history's.
+- **Tree-local times** are an entry's access, modification and change times.
+  Each tree keeps its own, in its journal and checkpoints; history never holds
+  them, as git records no file times.
 
 ## Run it
 
@@ -90,7 +105,7 @@ Agentfs-Namespace: <namespace>     each pod field only when given
 Agentfs-Pod: <pod>
 Agentfs-Pod-Uid: <pod uid>
 Agentfs-Node: <node>
-Agentfs-Format: envelope-1         every commit but the Root
+Agentfs-Format: envelope-2         every commit but the Root
 Agentfs-Open: <n>                  a save that closed an open
 Agentfs-Collisions: <json>         a landing that decided any
 ```
@@ -367,7 +382,10 @@ durable and builds it.
 `wait_built`, built snapshots, lag), and `settle` waits until every record so far is
 built: call it before reading Git. `TreeActor::head` settles first. Each recorded call names
 its writer as a `WriterAt` (the writer and its pod context). `write_open`, `write`,
-`truncate` and `close` are the recorded calls. A view reaches them through
+`truncate` and `close` are the recorded file calls; `mkdir`, `rmdir`, `symlink`,
+`rename`, `unlink`, `set_meta` (chmod and chown) and `set_times` the recorded
+steps on names, metadata and times. `node`, `node_at` and `children` show each
+entry as a view presents it. A view reaches them through
 `agentfs_core::session`: a `TreeSession` locks the actor with its client's tree and
 writer, and `Sessions` is the binder Clients binds each client's authority to. Upstream and fork
 share one bare repository. Merge identity is separate from an open object's
@@ -375,23 +393,45 @@ identity. See [library/core.md](library/core.md).
 
 ## What a commit holds
 
-Each commit (`Agentfs-Format: envelope-1`) keeps three entries per file, in two
-levels of hashed folders:
+Each commit (`Agentfs-Format: envelope-2`) keeps three entries per file or link
+and one per directory, in two levels of hashed folders:
 
 ```text
-files/<aa>/<bb>/<name>   the file's bytes
-lines/<aa>/<bb>/<name>   JSON [identity, line map]: the file's lines as runs, never their bytes
-names/<cc>/<dd>/<id>     JSON name history of one file identity, ended files included
+files/<aa>/<bb>/<path>      the file's bytes, a link's target
+lines/<aa>/<bb>/<path>      JSON [identity, line map, meta]: the file's lines as runs, never their bytes
+names/<cc>/<dd>/<id>        JSON name history of one file identity, ended files included
+dirs/<aa>/<bb>/<enc(path)>  JSON meta of one directory
+dirs/root                   JSON meta of the root directory
 ```
 
 `aa` and `bb` are hex digits 1-2 and 3-4 of `git hash-object --stdin` of the
-name's bytes; `cc` and `dd` the same of the identity in decimal. The folders are
-fixed (256 by 256), so a file's path never changes when files come or go, and a
-commit that changes one file rewrites only the folders on its three paths: the
-builder's cost per save is the same at 100 files and at 100,000. `git log --
+path's bytes; `cc` and `dd` the same of the identity in decimal. The folders are
+fixed (256 by 256), so an entry's place never changes when others come or go,
+and a commit that changes one file rewrites only the folders on its three paths:
+the builder's cost per save is the same at 100 files and at 100,000. `git log --
 files/2e/65/a` is the history of a file named `a` (`printf a | git hash-object
---stdin` starts `2e65`). Each tree's private checkout (`trees/<tree>/` in the
-state area) mirrors `files/`: `trees/root/2e/65/a`.
+--stdin` starts `2e65`). A file's path nests under its folders
+(`files/7f/3c/skills/web/SKILL.md`): a file and a directory never share a path,
+so no blob there is ever a folder too. A directory's record is one leaf, its path
+with `%` written `%25` and `/` written `%2F` (`dirs/<aa>/<bb>/a%2Fb` for `a/b`).
+The Root commit holds `dirs/root` alone, the root directory owned by the process
+that ran `trees init`, mode `0755`.
+
+A `files/` entry has git's own mode: `100755` when the owner may execute the
+file (`S_IXUSR`), else `100644`, and `120000` for a link, whose blob is its
+target. So `git checkout` and GitHub show executable bits and links. Metadata is
+JSON with the mode as four octal digits:
+`{"kind":"file","mode":"0644","uid":1000,"gid":1000}`. It travels in the
+`lines/` entry a save rewrites anyway, so a save costs no more. Each tree's
+private checkout (`trees/<tree>/` in the state area) mirrors `files/`:
+`trees/root/2e/65/a`. A link is checked out as a regular file (mode `0600`)
+holding its target: the state area never holds a symbolic link.
+
+A directory step is a commit like a save: `Mkdir by <writer>`, `Rmdir by
+<writer>`, `Symlink by <writer>`, and `Meta by <writer>` for a chmod or chown. A
+directory's rename is one commit: every file under it gets a new name version,
+so its cost grows with the entries under it. An explicit set of times
+(`utimensat`) makes no commit.
 
 A line map is `{"lines": [runs], "ancestors": [runs]}`. A line run is
 `{"identity": "e:i", "version": "e:j", "count": n}`: `n` lines whose
@@ -403,14 +443,17 @@ each at its newline. An ancestor run `{"version": "e:j", "count": n, "over":
 from `d:k`; without `over` they are new lines. A new file is one run of each
 at any size, so a map costs its saves' edits, not its file's bytes.
 
-Object numbers (which file an open handle writes to) are not in history. They are
-the journal's: a checkpoint holds each tree's objects as of its built point, and
-the steps after it move them.
+Object numbers (which file an open handle writes to), directory numbers and
+times are not in history. They are the journal's: a checkpoint holds each tree's
+objects as of its built point, and each tree's directory numbers and times and
+its files' times (`locals`), and the steps after it move them. A checkout of
+history shows checkout times, as git's does.
 
 ## The journal
 
-Every step (a create, a link, a close that saves, a rename, an unlink, a fork, a
-take, rows alone) is one record in the journal: the change itself, the rows it
+Every step (a create, a link, a close that saves, a mkdir, an rmdir, a symlink,
+a rename, an unlink, a chmod or chown, a set of times, a fork, a take, rows
+alone) is one record in the journal: the change itself, the rows it
 writes ([Rows and event commits](#rows-and-event-commits)), and the pointer changes
 its build publishes (branch moves, queue entries, collision refs, row chains), each
 value an oid or "what step `n`'s build gives" (on a row chain, step `n`'s last
@@ -525,7 +568,7 @@ the private checkouts copied, the checked-out files' maps rebased onto them
   hashed folder levels, which do not grow with the tree) at a cost per byte, each
   measured on the last batch as if it bore the whole batch. Over 120 s, a call
   that starts new work in that tree (a create, a write-open, `O_TMPFILE`, a link,
-  a rename, an unlink, a path truncate) waits for the built event that brings the
+  a mkdir, an rmdir, a rename, an unlink, a chmod, a path truncate) waits for the built event that brings the
   lag under; other trees, writes, flushes and closes do not wait, and the view
   answers other requests meanwhile. One gate thread per volume answers every
   waiting call at the built or failed event that admits it.
@@ -552,6 +595,14 @@ by `take_next`. Each take runs in three parts:
    gone (`EntryGone`). A refused take is logged (`tree TakeRefused`) and decided
    again at once, on the history that refused it.
 
+A take adds every directory its source has and its tree lacks (the fork's commit
+for a landing, the upstream's head for a sync), and removes none; a landing that
+fast-forwards takes the fork's commit, directories and all. A landed file keeps
+the change's metadata when the change set it (or the upstream lacks the file),
+else the upstream's; a sync takes the upstream's. A take never leaves an entry
+without its directory. These are interim rules: the model's metadata, directory
+and link rules (rules ledger R13 to R15) are not built yet.
+
 A landed take read nothing of its tree that changed after its decision, so it decides
 what a take made in one step at its land would. A sync reads its upstream's head as
 of its decision, as a sync taken then would; the upstream's later saves queue later
@@ -564,7 +615,21 @@ decision waits until they stop.
 
 The view host (`agentfs_fuse::tree_view::ViewHost`) mounts each view on its
 client's session, never waiting for history: the tree must be among the actor's
-saved trees. The FUSE adapter uses zero entry and attribute TTLs and
+saved trees. A view serves the tree's directories: `mkdir`, `rmdir`, creates
+anywhere, and renames across directories (`RENAME_NOREPLACE` too;
+`RENAME_EXCHANGE` and `RENAME_WHITEOUT` answer `EINVAL`), with POSIX's errors
+(`ENOTEMPTY`, `ENOTDIR`, `EISDIR`, `EINVAL` for a directory moved into itself).
+Inode 1 is the root directory; every other inode is its entry's node number + 2.
+Each entry shows its recorded kind, mode, link count, size and times; a new
+entry takes the mode the kernel gives (its umask applied) and the calling
+process's uid and gid, and in a set-group-ID directory that directory's group.
+`chmod` records the new mode and keeps the recorded owner; the kernel judges
+every access by the mode (`default_permissions`). The view still presents every
+entry as the mount's `--owner`, whoever owns it in history, and answers
+`EOPNOTSUPP` to `chown` and to setting times. It does not serve links: a link
+made through the library shows as a link, but `symlink` and `readlink` through a
+view are not answered. A file's mtime moves when it is saved (at its last close),
+not at each write. The FUSE adapter uses zero entry and attribute TTLs and
 direct I/O, and negotiates neither passthrough nor the writeback cache. A read with
 no lock owner is a page fill and a write with `FUSE_WRITE_CACHE` is a page write.
 `max_background` is as high as the kernel allows, to keep a release ahead of a later
@@ -585,8 +650,17 @@ Nothing truncates journal records or resets history as repair.
 
 What the tree views do not support:
 
-- **Flat regular files with git-safe UTF-8 names only.** Directories, symlinks and
-  non-UTF-8 names are not supported. Only an anonymous first link is covered.
+- **Git-safe UTF-8 names only**, each component at most 255 bytes. Hard links
+  past an anonymous file's first answer `EPERM`; devices, FIFOs, sockets,
+  extended attributes and ACLs are not supported.
+- **Owners, links and times through a view.** The library records owners,
+  links and explicit times; a view presents every entry as its mount's
+  `--owner`, does not serve `symlink`, `readlink`, `chown` or `utimensat`, and
+  does not track access times.
+- **Directories, metadata and links across forks** follow interim take rules
+  (see [Takes](#takes)): a directory one tree removes or renames stays in the
+  other, and a fork's chmod reaches its upstream when it lands but is undone in
+  the fork by a sync until then.
 - **Nested forks, transactions, `Client::Outside`, rules and view profiles,
   replication, CSI, several view hosts, upgrades and snapshot opens** are not
   built. The designs for them are in [target-architecture](target-architecture/README.md).
@@ -635,7 +709,8 @@ jobs in [development.md](development.md); the method is in
 `crates/agentfs-model/VERIFYING.md`.
 
 - `e2e-trees.sh`, `e2e-trees-ordering.sh`: recording, objects, anonymous first link,
-  immediate reopen.
+  immediate reopen; directories, modes, a moved directory and an executable
+  script through a view, and their history (`trees-posix.py`).
 - `e2e-tree-conformance.sh`: fixed model cases and byte calls against a plain Linux
   file.
 - `e2e-tree-replay.sh`: the model's in-scope scenarios replayed on a fresh model, the
