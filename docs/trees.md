@@ -70,7 +70,6 @@ the volume, and the process exits 0 once it is released
 | `trees init --volume NAME` | Create the volume, or find it under the same name, then recover it; prints `<name> <id> created` or `found`. Another name or another format exits 1 with nothing written |
 | `trees mount ROOT` | Recover and mount the root on an existing empty directory. It never creates a volume: run `trees init` first |
 | `--volume NAME` (`trees mount`) | Refuse, before anything is written, a volume with another name |
-| `--owner UID:GID` | Every file's owner in the views (default: the mounting process's user and group) |
 | `--no-allow-other` | Only the mounting user reaches the views. By default other users do (FUSE `allow_other`, which needs `user_allow_other` in `/etc/fuse.conf` when the mounting user is not root) |
 | `--namespace`, `--pod`, `--pod-uid`, `--node` | Where the views run: the pod context of their commits (below) |
 | `--fork-mount DIR` | Also mount a fork of the root in DIR: a new one, or with `--fork-key` the open one under that key (made the first time) |
@@ -620,16 +619,28 @@ anywhere, and renames across directories (`RENAME_NOREPLACE` too;
 `RENAME_EXCHANGE` and `RENAME_WHITEOUT` answer `EINVAL`), with POSIX's errors
 (`ENOTEMPTY`, `ENOTDIR`, `EISDIR`, `EINVAL` for a directory moved into itself).
 Inode 1 is the root directory; every other inode is its entry's node number + 2.
-Each entry shows its recorded kind, mode, link count, size and times; a new
-entry takes the mode the kernel gives (its umask applied) and the calling
-process's uid and gid, and in a set-group-ID directory that directory's group.
-`chmod` records the new mode and keeps the recorded owner; the kernel judges
-every access by the mode (`default_permissions`). The view still presents every
-entry as the mount's `--owner`, whoever owns it in history, and answers
-`EOPNOTSUPP` to `chown` and to setting times. It does not serve links: a link
-made through the library shows as a link, but `symlink` and `readlink` through a
-view are not answered. A file's mtime moves when it is saved (at its last close),
-not at each write. The FUSE adapter uses zero entry and attribute TTLs and
+Each entry shows its recorded kind, mode, owner, group, link count, size and
+times. A new entry takes the mode the kernel gives (its umask applied) and the
+calling process's uid and gid; in a set-group-ID directory it takes that
+directory's group, and a new directory keeps the set-group-ID bit. `chmod`,
+`chown` and `chgrp` record the new mode, owner and group as one change, the
+values not given kept. The kernel judges who may make them and every access by
+the recorded mode and owner (`default_permissions`): root may chown, an owner
+may chgrp to a group it is in. The mount root starts owned by the process that
+ran `trees init`, mode 0755; a workload that needs it gets it by a chown
+through the mount, which history records as any other.
+
+`symlink` makes a link (mode 0777, owned by the caller) whose target, which must
+be UTF-8, is its bytes; `readlink` reads it, the kernel follows links, and a
+link is renamed and removed like a file. Opening a link itself answers `ELOOP`.
+A regular file's `mknod` is a create; any other `mknod` answers `EPERM`.
+
+Times are each tree's own and never in history. A save (at its last close, not
+at each write) moves its file's mtime and ctime, and a create, rename or remove
+moves its directory's. `touch` and `utimensat` set atime and mtime as a step
+that builds no commit, so the head does not move; the times survive a restart.
+A time before the epoch answers `EINVAL`. atime is the last time set, else the
+mtime: reads do not move it. The FUSE adapter uses zero entry and attribute TTLs and
 direct I/O, and negotiates neither passthrough nor the writeback cache. A read with
 no lock owner is a page fill and a write with `FUSE_WRITE_CACHE` is a page write.
 `max_background` is as high as the kernel allows, to keep a release ahead of a later
@@ -650,13 +661,13 @@ Nothing truncates journal records or resets history as repair.
 
 What the tree views do not support:
 
-- **Git-safe UTF-8 names only**, each component at most 255 bytes. Hard links
-  past an anonymous file's first answer `EPERM`; devices, FIFOs, sockets,
-  extended attributes and ACLs are not supported.
-- **Owners, links and times through a view.** The library records owners,
-  links and explicit times; a view presents every entry as its mount's
-  `--owner`, does not serve `symlink`, `readlink`, `chown` or `utimensat`, and
-  does not track access times.
+- **Git-safe UTF-8 names only**, each component at most 255 bytes, and UTF-8
+  link targets. Hard links past an anonymous file's first answer `EPERM`;
+  devices, FIFOs and sockets answer `EPERM`; extended attributes and ACLs are
+  not supported.
+- **Times.** A file's mtime moves at its last close, not at each write
+  (close-to-open). Access times are not tracked: atime is the last time set,
+  else the mtime. A checkout of history shows checkout times, as git does.
 - **Directories, metadata and links across forks** follow interim take rules
   (see [Takes](#takes)): a directory one tree removes or renames stays in the
   other, and a fork's chmod reaches its upstream when it lands but is undone in

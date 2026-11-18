@@ -664,7 +664,7 @@ each landing the view host takes makes Trees judge the drops again
 `--fork-writer` are the clients' labels; `--read-only` and `--fork-read-only`
 make a client read-only. A fork's second read-write client exits 1. `trees end`
 ends a keyed fork (exit 75 while a mount holds the volume). The views mount with FUSE `allow_other` unless `--no-allow-other`
-(`MountOptions`), every file presented as `--owner`, and `--metrics-output FILE`
+(`MountOptions`), each entry presented with its recorded owner, and `--metrics-output FILE`
 writes counters every 100 ms and at unmount. Unmount every view to exit.
 
 ### The view host
@@ -691,16 +691,22 @@ by built and failed events) and, with a metrics output, the metrics worker.
 existing empty directory outside the state area, every open view and the
 metrics output: `MountFailed(EINVAL)`) and that the tree is among the actor's
 saved trees (`MountFailed(ENOENT)`): it never waits for history. The view
-writes as the session's client, presents every file as the grant's `acts_as`,
-and is mounted read-only for a read-only grant. It serves `lookup`, `readdir`,
-`create`, `mkdir`, `rmdir`, `unlink` and `rename` in any directory (inode 1 the
-root, every other inode its node number + 2, `..` its parent's), each entry's
-recorded kind, mode, link count, size and times in `getattr`, and `chmod` as
-`set_meta` with the recorded owner kept. A create, a `mkdir` and `O_TMPFILE`
-give the new entry the kernel's mode and the caller's uid and gid.
-`RENAME_NOREPLACE` is served; `RENAME_EXCHANGE` and `RENAME_WHITEOUT` answer
-`EINVAL`. `chown` and setting times answer `EOPNOTSUPP`, and `symlink` and
-`readlink` are not served. A thread joins each view's
+writes as the session's client and is mounted read-only for a read-only
+grant. It serves `lookup`, `readdir`, `create`, `mkdir`, `rmdir`, `unlink`,
+`rename`, `symlink` and `readlink` in any directory (inode 1 the root, every
+other inode its node number + 2, `..` its parent's), and each entry's recorded
+kind, mode, uid, gid, link count, size and times in `getattr`. A create, a
+`mkdir`, a regular file's `mknod`, a `symlink` and `O_TMPFILE` give the new
+entry the kernel's mode (`0777` for a link) and the caller's uid and gid; the
+library applies a set-group-ID directory's group. `setattr` maps a mode, uid
+and gid to one `set_meta`, the values not given kept from the entry's
+metadata, and stands behind the lag gate; atime and mtime map to one
+`set_times` (`TimeOrNow::Now` to `SetTime::Now`, a specific time to
+`SetTime::At`, one before the epoch `EINVAL`), which builds no commit and is
+not gated. The kernel judges authority and access (`default_permissions`).
+An open of a link answers `ELOOP`; `mknod` of a device, FIFO or socket
+answers `EPERM`; extended attributes are not served. `RENAME_NOREPLACE` is
+served; `RENAME_EXCHANGE` and `RENAME_WHITEOUT` answer `EINVAL`. A thread joins each view's
 session, then sends `HostEvent::ViewEnded`; `Landed` follows each landed take,
 after its pages were dropped. `close` is a lazy unmount (`fusermount3 -uz`),
 idempotent. `wait`, after every view ended, joins the workers and fails when

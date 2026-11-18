@@ -1342,3 +1342,17 @@ Carried on in every case; none stopped the slice.
    minimum, which S3 replaces with the referee's.
 6. **"Each test file one const Attrs helper"**: the integration tests share `tests/support/trees.rs`, so the one
    `ATTRS` lives there (one home), and each unit-test module imports the actor's `test_support::ATTRS`.
+
+## 2026-11-18, M2 S4 (owners, links and times in the view; `--owner` removed): where the brief was short
+
+Carried on in every case; none stopped the slice.
+
+1. **`crates/agentfs-contracts/src/views.rs` still names `acts_as`.** `MountOptions`'s doc comment says the presented
+   owner is "the binding's grant's `acts_as`". The brief says to grep `acts_as` and update every consumer, but its
+   owned paths leave this file out, so S4 did not edit it. The comment should now say each entry is presented with
+   its recorded owner. S5 (or whoever owns `views.rs`) fixes the one line.
+2. **The non-root cases need the e2e's work directory reachable.** `ci/e2e-trees.sh` mounts under `mktemp -d`
+   (mode 0700, root's), which uid 10000 cannot traverse; S4 makes it 0755 before mounting.
+3. **"touch makes no commit" needs a built history to compare.** History is built behind the calls, so
+   `ci/e2e-trees.sh` checks the head after a kill and the next `trees init`'s build, against the head it already
+   recorded, then mounts again to check the times survived. No wait on a timer.

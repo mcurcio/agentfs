@@ -67,7 +67,6 @@ pub struct View {
     txn: Option<TxnDir>,          // the open transaction's directory, served for opens after begin
     mode: Mode,                   // built once from the grant; replaced only by `rebound`
     view_profile: ViewProfileId,  // what Rules shows this client
-    acts_as: FileOwner,           // the owner it presents to the program
     rules: RuleSetVersion,        // judged with this rule set
     applied: Option<CommitId>,    // the last TreeMoved applied to the kernel
     state: ViewState,

@@ -918,7 +918,6 @@ templates' variables, the commit trailers and the telemetry resource:
 | Flag | Environment | Default | Commands |
 |---|---|---|---|
 | `--volume NAME` | `AGENTFS_VOLUME` | none: required by `trees init` | `trees init`: the volume's name, kept in its identity file. A new state area gets a new id; the same name finds it and writes nothing; another name, or another format (the trial's format 3 included), exits 1 with nothing written. Prints `<name> <id> created\|found`, then recovers the volume. Exit 75 while another process holds it. `trees mount`: optional, a guard: another name exits 1 before anything is written |
-| `--owner UID:GID` | `AGENTFS_OWNER` | this process's effective user and group | `trees mount`: every file's and directory's owner in the views |
 | `--no-allow-other` | | FUSE `allow_other` on | `trees mount`: only the mounting user reaches the views. With `allow_other`, a mount by a user other than root needs `user_allow_other` in `/etc/fuse.conf` |
 | `--fork-mount DIR` | | no fork mount | `trees mount`: also mount a fork of the root: a new one, ended when its last client detaches, or with `--fork-key` the open fork under that key (made the first time). Prints `fork tree: fork/N` on stderr |
 | `--fork-key KEY` | | an unkeyed fork | `trees mount`: the fork's key, 1 to 128 bytes of printable ASCII with no whitespace; requires `--fork-mount`. A key whose fork has ended exits 1. `trees end`: required, the key whose fork ends; the fork drops once nothing holds it. Exit 75 while a mount holds the volume, 1 for an unknown key ([trees](trees.md#forks-keys-end-and-the-drop)) |
@@ -1051,7 +1050,6 @@ equivalents above; a flag given on the command line wins.
 | `AGENTFS_WAIT_LOCK` | `--wait-lock` | all commands |
 | `AGENTFS_NAMESPACE`, `AGENTFS_POD`, `AGENTFS_POD_UID`, `AGENTFS_NODE`, `AGENTFS_REPLICA` | `--namespace`, `--pod`, `--pod-uid`, `--node`, `--replica` | the commands with pod flags, the `trees` commands among them (not `--replica`) |
 | `AGENTFS_VOLUME` | `--volume` | `init`, `patch submit`, `patch approve`, `trees init`, `trees mount` |
-| `AGENTFS_OWNER` | `--owner` | `trees mount` |
 | `AGENTFS_PASSTHROUGH` | `--passthrough` | `mount` |
 | `AGENTFS_THREADS` | `--threads` | `mount` |
 | `AGENTFS_ON_STALE_MOUNT` | `--on-stale-mount` | `mount` |

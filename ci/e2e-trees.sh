@@ -18,6 +18,8 @@ cleanup() {
 }
 trap cleanup EXIT
 mkdir "$work/main" "$work/fork"
+# trees-posix.py's non-root user reaches the views through it.
+chmod 755 "$work"
 "$bin" --state "$work/state" trees init --volume t
 # The fork view is one keyed fork: the first mount makes it, every later mount
 # under the key finds it.
@@ -121,7 +123,8 @@ delivered(fork_view / "isolation", b"parent")
 saved(fork_view / "isolation", b"fork")
 delivered(main / "isolation", b"fork")
 PY
-# Directories and modes through the view; history is read after the restart.
+# Directories, modes, owners, links and times through the view; history is
+# read after the restart.
 python3 ci/trees-posix.py view "$work/main"
 mmap_status=0
 python3 ci/trees-mmap.py "$work/main" "$work/state/history.git" || mmap_status=$?
@@ -162,6 +165,18 @@ python3 ci/trees-posix.py history "$work/state/history.git"
 "$bin" --state "$work/state" trees init --volume t
 test "$(git --git-dir="$work/state/history.git" rev-parse root)" = "$head"
 start
+# touch and touch -d set a file's times and build no commit: after a kill and
+# the next init's build, the head has not moved, and the times survive.
+python3 ci/trees-posix.py touch "$work/main"
+kill -KILL "$pid"
+tree_wait_exit "$pid" 2>/dev/null || true
+pid=
+fusermount3 -uz "$work/main"
+fusermount3 -uz "$work/fork"
+"$bin" --state "$work/state" trees init --volume t
+test "$(git --git-dir="$work/state/history.git" rev-parse root)" = "$head"
+start
+python3 ci/trees-posix.py touched "$work/main"
 test "$(cat "$work/main/crash")" = acknowledged-before-kill
 test "$(cat "$work/main/isolation")" = fork
 test "$(cat "$work/fork/isolation")" = fork
