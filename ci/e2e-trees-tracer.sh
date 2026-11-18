@@ -121,7 +121,7 @@ mount_view() {
     --device /dev/fuse --cap-add SYS_ADMIN --security-opt apparmor=unconfined \
     -v "$DATA:/data" "${POD[@]}" \
     --mount "type=bind,src=$MOUNT_DIR,dst=/agentfs,bind-propagation=rshared" \
-    "$IMAGE" --state /data/state trees mount /agentfs/root --volume t --owner 10000:10000 \
+    "$IMAGE" --state /data/state trees mount /agentfs/root --volume t \
     --metrics-output /data/metrics.json \
     >/dev/null
   wait_for 60 mounted || { docker logs "$NAME" >&2; fail 'the tree view did not mount'; }
@@ -156,6 +156,11 @@ assert_eq "$before" "$(state_hashes)" 'every file under the state area is unchan
 
 step '2. a close returns with its save on record, named'
 mount_view
+# The root starts owned by whoever ran `trees init` (root here), mode 0755:
+# root gives it to the workload's user through the mount, as with the
+# recording engine, and history records the new owner.
+docker exec "$NAME" chown 10000:10000 /agentfs/root || fail 'root could not chown the mount root'
+pass 'root chowned the mount root to the workload user through the mount'
 # The close's release reaches agentfs after close(2) returns; the view takes
 # requests in order, so the read that follows sees the release done.
 workload -- 'printf hello > /agentfs/root/a.txt && cat /agentfs/root/a.txt >/dev/null'
@@ -165,6 +170,9 @@ message=$(in_history log -1 --format=%B root)
 assert_contains "$message" 'Agentfs-Volume: t' 'the save names its volume'
 assert_contains "$message" "Agentfs-Volume-Id: $id" 'and its id'
 has_trailers "$message" 'the save'
+assert_contains "$(in_history show root:dirs/root)" '"uid":10000' 'history records the chowned mount root'
+assert_contains "$(in_history show "root:lines/$(tree_git_fanned a.txt)")" '"uid":10000' \
+  "history records a.txt as the workload user's"
 # A directory and an executable bit, through the view and in history.
 workload -- 'mkdir -p /agentfs/root/tools/bin &&
   printf "#!/bin/sh\necho hi\n" > /agentfs/root/tools/bin/run.sh &&

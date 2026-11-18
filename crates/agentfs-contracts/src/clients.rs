@@ -99,7 +99,7 @@ pub type ClientSet = BTreeSet<ClientId>;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SessionId(pub u64);
 
-/// The owner every file of a view is presented as, until M2's file metadata.
+/// A file's owner and group, as numeric ids (`agentfs_core::tree_actor::Attrs`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct FileOwner {
     pub uid: u32,
@@ -120,33 +120,30 @@ pub enum Consistency {
     PerFile,
 }
 
-/// What a client may do and see, and the owner its view presents. Built only by
-/// its constructors. Until Rules (M3) every client sees everything, so a grant
-/// names no view profile; snapshots wait for pinned snapshots.
+/// What a client may do and see. Built only by its constructors. Until Rules
+/// (M3) every client sees everything, so a grant names no view profile;
+/// snapshots wait for pinned snapshots.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Grant {
     access: Access,
     tree: TreeId,
     consistency: Consistency,
-    acts_as: FileOwner,
 }
 
 impl Grant {
-    pub fn live_read_write(tree: TreeId, consistency: Consistency, acts_as: FileOwner) -> Self {
+    pub fn live_read_write(tree: TreeId, consistency: Consistency) -> Self {
         Self {
             access: Access::ReadWrite,
             tree,
             consistency,
-            acts_as,
         }
     }
 
-    pub fn live_read_only(tree: TreeId, consistency: Consistency, acts_as: FileOwner) -> Self {
+    pub fn live_read_only(tree: TreeId, consistency: Consistency) -> Self {
         Self {
             access: Access::ReadOnly,
             tree,
             consistency,
-            acts_as,
         }
     }
 
@@ -160,10 +157,6 @@ impl Grant {
 
     pub fn consistency(&self) -> Consistency {
         self.consistency
-    }
-
-    pub fn acts_as(&self) -> FileOwner {
-        self.acts_as
     }
 }
 

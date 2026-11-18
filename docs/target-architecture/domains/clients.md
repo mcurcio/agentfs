@@ -13,7 +13,7 @@ is a design choice.
 
 | Term | Meaning here | Is not |
 |---|---|---|
-| **grant** | what a client may do (`Access`), see (`ViewProfileId`), how it sees (`Sees`), and the owner its view presents; built today with access, a live tree, `PerFile` and the owner | a role |
+| **grant** | what a client may do (`Access`), see (`ViewProfileId`), and how it sees (`Sees`); built today with access, a live tree and `PerFile`. A view presents each entry's recorded owner, so a grant names none | a role |
 | **launcher bound** | what a launcher may grant: the root or only forks it created (`ForksItCreates`, built), and the view profiles it may give | the grant |
 | **snapshot client** | a read-only client of a pinned snapshot of a tree (Trees'), moved only by `advance` | a read-only live client (built) |
 | **actor** (operator) | an authenticated operator, with roles as data | the git model's tree actor |
@@ -24,7 +24,7 @@ snapshots (Trees), what a profile shows (Rules), serving file calls (Views), vol
 ## 1. Contract additions
 
 ```rust
-pub struct Grant {                 // built: access, a live tree, PerFile, acts_as
+pub struct Grant {                 // built: access, a live tree, PerFile
     view_profile: ViewProfileId,   // minted by Rules, so it exists
     sees: Sees,                    // the one home of the consistency setting
 }
@@ -33,7 +33,7 @@ pub enum Sees {
     Snapshot { of: TreeRef },      // a pinned snapshot of `of`'s head, read-only, moved only by advance
 }
 impl Grant {
-    pub fn snapshot(of: TreeRef, v: ViewProfileId, acts_as: FileOwner) -> Grant; // always ReadOnly
+    pub fn snapshot(of: TreeRef, v: ViewProfileId) -> Grant; // always ReadOnly
 }
 pub struct Binding {               // built: client, session, tree; plus
     serves: Served,                // Tree(TreeRef), or Snapshot(SnapshotId) for Sees::Snapshot

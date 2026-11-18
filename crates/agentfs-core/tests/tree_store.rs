@@ -686,11 +686,10 @@ fn write_and_leave(
     sessions: &agentfs_core::session::Sessions,
     tree: TreeId,
 ) {
-    use agentfs_contracts::clients::{Clients, Consistency, FileOwner, Grant};
-    let owner = FileOwner { uid: 1, gid: 1 };
+    use agentfs_contracts::clients::{Clients, Consistency, Grant};
     let binding = clients
         .attach(
-            Grant::live_read_write(tree, Consistency::PerFile, owner),
+            Grant::live_read_write(tree, Consistency::PerFile),
             agentfs_contracts::name::ClientLabel::parse("c").unwrap(),
             PodContext::default(),
             sessions.open(),
@@ -765,10 +764,10 @@ fn a_dropped_forks_claim_is_released() {
             .writer_claim
     };
     let binding = {
-        use agentfs_contracts::clients::{Clients, Consistency, FileOwner, Grant};
+        use agentfs_contracts::clients::{Clients, Consistency, Grant};
         clients
             .attach(
-                Grant::live_read_write(tree, Consistency::PerFile, FileOwner { uid: 1, gid: 1 }),
+                Grant::live_read_write(tree, Consistency::PerFile),
                 agentfs_contracts::name::ClientLabel::parse("c").unwrap(),
                 PodContext::default(),
                 sessions.open(),
@@ -813,7 +812,7 @@ fn boot(recording: &Arc<Recording>, events: &Events) -> (SharedTrees, ClientsOf)
 /// after the create), each end at the next boot's settle and drop.
 #[test]
 fn a_lost_last_detached_ends_the_fork_at_the_next_boot() {
-    use agentfs_contracts::clients::{Clients, Consistency, FileOwner, Grant};
+    use agentfs_contracts::clients::{Clients, Consistency, Grant};
     let tmp = tempfile::tempdir().unwrap();
     let recording = serve(tmp.path());
     let events = Events::default();
@@ -826,11 +825,7 @@ fn a_lost_last_detached_ends_the_fork_at_the_next_boot() {
         .unwrap();
     let binding = clients
         .attach(
-            Grant::live_read_write(
-                detached.into(),
-                Consistency::PerFile,
-                FileOwner { uid: 1, gid: 1 },
-            ),
+            Grant::live_read_write(detached.into(), Consistency::PerFile),
             agentfs_contracts::name::ClientLabel::parse("c").unwrap(),
             PodContext::default(),
             sessions.open(),
@@ -866,7 +861,7 @@ fn a_lost_last_detached_ends_the_fork_at_the_next_boot() {
 /// reconcile, by agentfs.
 #[test]
 fn a_lost_fork_dropped_releases_the_claim_at_the_next_boot() {
-    use agentfs_contracts::clients::{Clients, Consistency, FileOwner, Grant};
+    use agentfs_contracts::clients::{Clients, Consistency, Grant};
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
     let recording = serve(dir);
@@ -880,11 +875,7 @@ fn a_lost_fork_dropped_releases_the_claim_at_the_next_boot() {
         .unwrap();
     let binding = clients
         .attach(
-            Grant::live_read_write(
-                fork.into(),
-                Consistency::PerFile,
-                FileOwner { uid: 1, gid: 1 },
-            ),
+            Grant::live_read_write(fork.into(), Consistency::PerFile),
             agentfs_contracts::name::ClientLabel::parse("c").unwrap(),
             PodContext::default(),
             sessions.open(),
@@ -919,7 +910,7 @@ fn a_lost_fork_dropped_releases_the_claim_at_the_next_boot() {
 /// the history service's (`ForkDropped`, `ClaimReleased`, an end by settle).
 #[test]
 fn each_event_carries_its_callers_pod_and_agentfs_the_services() {
-    use agentfs_contracts::clients::{Clients, Consistency, FileOwner, Grant};
+    use agentfs_contracts::clients::{Clients, Consistency, Grant};
     let pod = |name: &str| PodContext {
         pod: Some(agentfs_contracts::name::Label::parse(name).unwrap()),
         ..PodContext::default()
@@ -947,11 +938,7 @@ fn each_event_carries_its_callers_pod_and_agentfs_the_services() {
         .unwrap();
     let binding = clients
         .attach(
-            Grant::live_read_write(
-                settled.into(),
-                Consistency::PerFile,
-                FileOwner { uid: 1, gid: 1 },
-            ),
+            Grant::live_read_write(settled.into(), Consistency::PerFile),
             agentfs_contracts::name::ClientLabel::parse("c").unwrap(),
             pod("launcher"),
             sessions.open(),

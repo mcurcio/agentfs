@@ -44,11 +44,19 @@ pub(super) fn verdict<G: Graph + ?Sized>(
     })
 }
 
-/// A candidate's place: names before lines, then file identity, then the line's index in the
-/// incoming map. The order of `Agentfs-Collisions`.
+/// What a candidate is: an entry judged by rules 13 and 14, a name or a line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) enum Of {
+    Entry,
+    Name,
+    Line,
+}
+
+/// A candidate's place: entries, then names, then lines; then file identity, then the line's
+/// index in the incoming map (an entry's in its losses). The order of `Agentfs-Collisions`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) struct Order {
-    pub line: bool,
+    pub of: Of,
     pub file: MergeFileIdentity,
     pub at: usize,
 }
@@ -203,7 +211,7 @@ pub(super) fn verdicts(
         }
         out.candidates.push(Candidate {
             order: Order {
-                line: false,
+                of: Of::Name,
                 file: *id,
                 at: 0,
             },
@@ -239,7 +247,7 @@ pub(super) fn verdicts(
         let lost = |at: usize, line: &Line<LineVersion>| -> (Order, Version) {
             (
                 Order {
-                    line: true,
+                    of: Of::Line,
                     file: *id,
                     at,
                 },

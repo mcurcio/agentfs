@@ -19,7 +19,7 @@ use agentfs_clients::ClientsService;
 use agentfs_contracts::caps::{LaunchCap, LaunchScope, Minter};
 use agentfs_contracts::clients::{
     Access, AttachedLookup, Binding, ClientError, ClientEvent, ClientId, ClientSet, Clients,
-    Consistency, FileOwner, Grant,
+    Consistency, Grant,
 };
 use agentfs_contracts::name::{ClientLabel, ForkKey, LauncherId, VolumeName};
 use agentfs_contracts::pod::PodContext;
@@ -116,10 +116,6 @@ enum Command {
         /// another name.
         #[arg(long, env = "AGENTFS_VOLUME")]
         volume: Option<String>,
-        /// Every file's owner in the views, `UID:GID` (default: this
-        /// process's effective user and group).
-        #[arg(long, env = "AGENTFS_OWNER", value_parser = parse_owner, value_name = "UID:GID")]
-        owner: Option<FileOwner>,
         /// Only the mounting user reaches the views (no FUSE `allow_other`).
         #[arg(long)]
         no_allow_other: bool,
@@ -134,20 +130,6 @@ enum Command {
         #[command(flatten)]
         pod: PodArgs,
     },
-}
-
-fn parse_owner(text: &str) -> Result<FileOwner, String> {
-    let (uid, gid) = text
-        .split_once(':')
-        .ok_or_else(|| format!("{text:?} is not UID:GID"))?;
-    let id = |part: &str| {
-        part.parse::<u32>()
-            .map_err(|_| format!("{text:?} is not UID:GID"))
-    };
-    Ok(FileOwner {
-        uid: id(uid)?,
-        gid: id(gid)?,
-    })
 }
 
 /// `trees init`'s Clients: it attaches none and judges no release.
@@ -217,7 +199,6 @@ pub fn run(state: &Path, args: Args, minter: Minter) -> Result<ExitCode> {
             fork_read_only,
             metrics_output,
             volume,
-            owner,
             no_allow_other,
             pod,
         } => {
@@ -233,10 +214,6 @@ pub fn run(state: &Path, args: Args, minter: Minter) -> Result<ExitCode> {
                     _ => {}
                 }
             }
-            let owner = owner.unwrap_or_else(|| FileOwner {
-                uid: rustix::process::geteuid().as_raw(),
-                gid: rustix::process::getegid().as_raw(),
-            });
             let root = ViewSpec::new(TreeId::Root, root, &writer, read_only)?;
             let fork = fork_mount
                 .map(|at| -> Result<ForkView> {
@@ -248,7 +225,6 @@ pub fn run(state: &Path, args: Args, minter: Minter) -> Result<ExitCode> {
                 .transpose()?;
             let mount = Mount {
                 at,
-                owner,
                 options: MountOptions {
                     allow_other: !no_allow_other,
                 },
@@ -468,7 +444,6 @@ impl Domains {
 struct Mount {
     /// The pod context of every client it attaches.
     at: PodContext,
-    owner: FileOwner,
     options: MountOptions,
     metrics_output: Option<PathBuf>,
 }
@@ -559,11 +534,9 @@ impl Mount {
                 None => {
                     let grant = match spec.access {
                         Access::ReadWrite => {
-                            Grant::live_read_write(spec.tree, Consistency::PerFile, self.owner)
+                            Grant::live_read_write(spec.tree, Consistency::PerFile)
                         }
-                        Access::ReadOnly => {
-                            Grant::live_read_only(spec.tree, Consistency::PerFile, self.owner)
-                        }
+                        Access::ReadOnly => Grant::live_read_only(spec.tree, Consistency::PerFile),
                     };
                     domains.clients().attach(
                         grant,
@@ -813,14 +786,5 @@ mod tests {
             "{error:#}"
         );
         assert!(!state.exists());
-    }
-
-    #[test]
-    fn an_owner_is_uid_colon_gid() {
-        let owner = super::parse_owner("10000:10001").unwrap();
-        assert_eq!((owner.uid, owner.gid), (10000, 10001));
-        for bad in ["10000", "a:b", "1:", ":1", "1:2:3"] {
-            assert!(super::parse_owner(bad).is_err(), "{bad}");
-        }
     }
 }

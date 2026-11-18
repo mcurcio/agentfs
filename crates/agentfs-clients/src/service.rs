@@ -420,7 +420,7 @@ where
 #[cfg(test)]
 mod tests {
     use agentfs_contracts::audit::{Audited, Stamp, UnixNanos};
-    use agentfs_contracts::clients::{Consistency, FileOwner, Ordinal};
+    use agentfs_contracts::clients::{Consistency, Ordinal};
     use agentfs_contracts::name::LauncherId;
     use agentfs_contracts::ports::TreeClients;
     use agentfs_contracts::trees::{ForkFacts, ForkSettings, Landing};
@@ -598,14 +598,12 @@ mod tests {
         .unwrap()
     }
 
-    const OWNER: FileOwner = FileOwner { uid: 1, gid: 1 };
-
     fn write(tree: TreeId) -> Grant {
-        Grant::live_read_write(tree, Consistency::PerFile, OWNER)
+        Grant::live_read_write(tree, Consistency::PerFile)
     }
 
     fn read(tree: TreeId) -> Grant {
-        Grant::live_read_only(tree, Consistency::PerFile, OWNER)
+        Grant::live_read_only(tree, Consistency::PerFile)
     }
 
     fn label(text: &str) -> ClientLabel {

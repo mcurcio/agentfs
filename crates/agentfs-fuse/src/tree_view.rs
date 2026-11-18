@@ -1,7 +1,9 @@
 //! The view host (docs/library/filesystem.md, "The view host"): each view is
-//! a FUSE mount of one tree, its directories and files with their recorded
-//! modes, reached only through its client's session (`agentfs_core::session`),
-//! so its calls name no tree and no writer. Inode 1 is the root directory;
+//! a FUSE mount of one tree, its directories, files and symbolic links with
+//! their recorded modes and owners and the tree's own times, reached only
+//! through its client's session (`agentfs_core::session`), so its calls name
+//! no tree and no writer. The kernel judges every permission
+//! (`default_permissions`). Inode 1 is the root directory;
 //! every other entry's inode is its node number + 2. Direct I/O and zero
 //! TTLs; no passthrough or writeback-cache
 //! negotiation. Shared mappings go through the kernel's page cache all the
@@ -22,7 +24,8 @@ use agentfs_contracts::clients::{Access, Binding, FileOwner};
 use agentfs_contracts::views::{MountOptions, MountPoint, ViewError, ViewId, Views};
 use agentfs_core::session::{SessionGuard, Sessions, TreeSession};
 use agentfs_core::tree_actor::{
-    Attrs, Error, FileMap, Kind, Node, Perm, Progress, Recording, RenameMode, Saved, TreeId,
+    Attrs, Error, FileMap, Kind, Meta, Node, Perm, Progress, Recording, RenameMode, Saved, SetTime,
+    TreeId,
 };
 use fuser::*;
 
@@ -211,8 +214,8 @@ impl ViewHost {
 }
 
 impl Views for ViewHost {
-    /// Mounts `binding`'s session's tree at `at`, every file presented as its
-    /// grant's `acts_as`, read-only for a read-only grant. Never waits for
+    /// Mounts `binding`'s session's tree at `at`, each entry presented with
+    /// its recorded owner, read-only for a read-only grant. Never waits for
     /// history: the tree must be among the actor's saved trees.
     fn open(
         &mut self,
@@ -241,7 +244,6 @@ impl Views for ViewHost {
         let read_only = binding.grant.access() == Access::ReadOnly;
         let view = View {
             session,
-            owner: binding.grant.acts_as(),
             handles: Arc::new(Mutex::new(Handles {
                 next: 1,
                 entries: BTreeMap::new(),
@@ -427,9 +429,6 @@ fn session_config(options: &MountOptions, read_only: bool) -> Config {
 #[derive(Clone)]
 struct View {
     session: TreeSession,
-    /// Every file's and directory's presented owner, until the recorded
-    /// owner is presented.
-    owner: FileOwner,
     handles: Arc<Mutex<Handles>>,
 }
 
@@ -496,6 +495,50 @@ fn create_attrs(req: &Request, mode: u32) -> Attrs {
             uid: req.uid(),
             gid: req.gid(),
         },
+    }
+}
+
+/// A chmod, chown or chgrp: the given mode, uid and gid over the entry's
+/// current ones. The kernel has judged the caller's authority.
+fn changed_attrs(meta: &Meta, mode: Option<u32>, uid: Option<u32>, gid: Option<u32>) -> Attrs {
+    let now = meta.attrs();
+    Attrs {
+        perm: mode.map_or(now.perm, Perm::from_mode),
+        owner: FileOwner {
+            uid: uid.unwrap_or(now.owner.uid),
+            gid: now.owner.gid,
+        },
+    }
+}
+
+/// A utimensat time as the tree takes it: `EINVAL` before the epoch.
+fn set_time(time: TimeOrNow) -> Result<SetTime> {
+    match time {
+        TimeOrNow::Now => Ok(SetTime::Now),
+        TimeOrNow::SpecificTime(at) => {
+            let since = at.duration_since(UNIX_EPOCH).map_err(|_| Errno::EINVAL)?;
+            u64::try_from(since.as_nanos())
+                .map(SetTime::At)
+                .map_err(|_| Errno::EINVAL)
+        }
+    }
+}
+
+/// What a setattr asks for, besides its inode and handle.
+#[derive(Clone, Copy, Default)]
+struct AttrChanges {
+    mode: Option<u32>,
+    uid: Option<u32>,
+    gid: Option<u32>,
+    size: Option<u64>,
+    atime: Option<TimeOrNow>,
+    mtime: Option<TimeOrNow>,
+}
+
+impl AttrChanges {
+    /// A chmod, chown or chgrp: a step that builds a commit.
+    fn meta(&self) -> bool {
+        self.mode.is_some() || self.uid.is_some() || self.gid.is_some()
     }
 }
 
@@ -601,8 +644,8 @@ impl View {
             },
             perm: u16::try_from(node.meta.mode.bits()).unwrap_or(0),
             nlink: node.links,
-            uid: self.owner.uid,
-            gid: self.owner.gid,
+            uid: node.meta.uid,
+            gid: node.meta.gid,
             rdev: 0,
             blksize: 4096,
             flags: 0,
@@ -625,6 +668,13 @@ impl View {
         flags: i32,
         create: Option<Attrs>,
     ) -> Result<u64> {
+        // The kernel follows a link before it opens; a link reached here was
+        // opened with `O_NOFOLLOW`.
+        if v.node(path)
+            .is_ok_and(|node| node.meta.kind == Kind::Symlink)
+        {
+            return Err(Errno::ELOOP);
+        }
         let mut handles = self.handles()?;
         let write = flags & libc::O_ACCMODE != libc::O_RDONLY;
         if flags & libc::O_TRUNC != 0 && !write {
@@ -654,6 +704,59 @@ impl View {
         handles.next += 1;
         handles.entries.insert(fh, entry);
         Ok(fh)
+    }
+    /// A setattr's changes, in one order: the metadata (one `set_meta`),
+    /// the size, then the times (one `set_times`, which builds no commit). A
+    /// file no name reaches has no path to record metadata or times at.
+    fn set_attrs(
+        &self,
+        v: &mut SessionGuard<'_>,
+        ino: INodeNo,
+        changes: AttrChanges,
+        fh: Option<FileHandle>,
+    ) -> Result<FileAttr> {
+        let times = (
+            changes.atime.map(set_time).transpose()?,
+            changes.mtime.map(set_time).transpose()?,
+        );
+        if changes.meta() {
+            let path = self.path(v, ino).map_err(|_| Errno::EOPNOTSUPP)?;
+            let meta = v.node(&path).map_err(errno)?.meta;
+            let attrs = changed_attrs(&meta, changes.mode, changes.uid, changes.gid);
+            v.set_meta(&path, attrs).map_err(errno)?;
+        }
+        if let Some(size) = changes.size {
+            if let Some(fh) = fh {
+                let handles = self.handles()?;
+                match handles.entries.get(&fh.0).ok_or(Errno::EBADF)? {
+                    Open::Write { handle, .. } => v.truncate(*handle, size).map_err(errno)?,
+                    _ => return Err(Errno::EBADF),
+                }
+            } else {
+                let path = self.path(v, ino)?;
+                let h = v.write_open(&path, None).map_err(errno)?;
+                let result = v.truncate(h, size).map_err(errno);
+                v.close(h).map_err(errno)?;
+                result?;
+            }
+        }
+        if times.0.is_some() || times.1.is_some() {
+            let path = self.path(v, ino).map_err(|_| Errno::EOPNOTSUPP)?;
+            v.set_times(&path, times.0, times.1).map_err(errno)?;
+        }
+        self.attr(v, ino, fh)
+    }
+    /// A symbolic link at `path` to `target`, owned by `owner`: its attributes.
+    fn make_symlink(
+        &self,
+        v: &mut SessionGuard<'_>,
+        path: &str,
+        target: &Path,
+        owner: FileOwner,
+    ) -> Result<FileAttr> {
+        let target = target.to_str().ok_or(Errno::EINVAL)?;
+        v.symlink(path, target, owner).map_err(errno)?;
+        self.attr_at(v, path, None)
     }
     fn finish(&self, fh: FileHandle) -> Result<()> {
         let mut v = self.actor()?;
@@ -925,46 +1028,18 @@ impl Filesystem for View {
         _flags: Option<BsdFileFlags>,
         reply: ReplyAttr,
     ) {
+        let changes = AttrChanges {
+            mode,
+            uid,
+            gid,
+            size,
+            atime,
+            mtime,
+        };
         let setattr = move |view: &View, admitted: Result<()>| {
             let result = admitted.and_then(|()| {
-                (|| {
-                    if uid.is_some() || gid.is_some() || atime.is_some() || mtime.is_some() {
-                        return Err(Errno::EOPNOTSUPP);
-                    }
-                    let mut v = view.actor()?;
-                    // A chmod: the new mode, the recorded owner kept. A file
-                    // no name reaches has no path to record it at.
-                    if let Some(mode) = mode {
-                        let path = view.path(&v, ino).map_err(|_| Errno::EOPNOTSUPP)?;
-                        let owner = v.node(&path).map_err(errno)?.meta.attrs().owner;
-                        v.set_meta(
-                            &path,
-                            Attrs {
-                                perm: Perm::from_mode(mode),
-                                owner,
-                            },
-                        )
-                        .map_err(errno)?;
-                    }
-                    if let Some(size) = size {
-                        if let Some(fh) = fh {
-                            let handles = view.handles()?;
-                            match handles.entries.get(&fh.0).ok_or(Errno::EBADF)? {
-                                Open::Write { handle, .. } => {
-                                    v.truncate(*handle, size).map_err(errno)?
-                                }
-                                _ => return Err(Errno::EBADF),
-                            }
-                        } else {
-                            let path = view.path(&v, ino)?;
-                            let h = v.write_open(&path, None).map_err(errno)?;
-                            let result = v.truncate(h, size).map_err(errno);
-                            v.close(h).map_err(errno)?;
-                            result?;
-                        }
-                    }
-                    view.attr(&v, ino, fh)
-                })()
+                let mut v = view.actor()?;
+                view.set_attrs(&mut v, ino, changes, fh)
             });
             match result {
                 Ok(attr) => reply.attr(&TTL, &attr),
@@ -972,8 +1047,8 @@ impl Filesystem for View {
             }
         };
         // A path truncate is a write-open, a truncate and a close, and a
-        // chmod a step: new work.
-        if (size.is_some() && fh.is_none()) || mode.is_some() {
+        // chmod or chown a step: new work. A utimensat builds no commit.
+        if (size.is_some() && fh.is_none()) || changes.meta() {
             self.gated(setattr);
         } else {
             setattr(self, Ok(()));
@@ -1092,6 +1167,76 @@ impl Filesystem for View {
             });
             match result {
                 Ok(()) => reply.ok(),
+                Err(e) => reply.error(e),
+            }
+        });
+    }
+    fn symlink(
+        &self,
+        req: &Request,
+        parent: INodeNo,
+        link_name: &OsStr,
+        target: &Path,
+        reply: ReplyEntry,
+    ) {
+        let (name, target) = (link_name.to_owned(), target.to_owned());
+        let owner = FileOwner {
+            uid: req.uid(),
+            gid: req.gid(),
+        };
+        self.gated(move |view, admitted| {
+            let result = admitted.and_then(|()| {
+                let mut v = view.actor()?;
+                let path = child_path(&view.path(&v, parent)?, &name)?;
+                view.make_symlink(&mut v, &path, &target, owner)
+            });
+            match result {
+                Ok(attr) => reply.entry(&TTL, &attr, Generation(0)),
+                Err(e) => reply.error(e),
+            }
+        });
+    }
+    fn readlink(&self, _req: &Request, ino: INodeNo, reply: ReplyData) {
+        let result = (|| {
+            let v = self.actor()?;
+            let path = self.path(&v, ino)?;
+            v.readlink(&path).map_err(errno)
+        })();
+        match result {
+            Ok(target) => reply.data(&target),
+            Err(e) => reply.error(e),
+        }
+    }
+    /// A regular file's mknod is a create and a close; devices, FIFOs and
+    /// sockets are refused.
+    fn mknod(
+        &self,
+        req: &Request,
+        parent: INodeNo,
+        name: &OsStr,
+        mode: u32,
+        _umask: u32,
+        _rdev: u32,
+        reply: ReplyEntry,
+    ) {
+        if mode & libc::S_IFMT != libc::S_IFREG {
+            return reply.error(Errno::EPERM);
+        }
+        let name = name.to_owned();
+        let attrs = create_attrs(req, mode);
+        self.gated(move |view, admitted| {
+            let result = admitted.and_then(|()| {
+                let mut v = view.actor()?;
+                let path = child_path(&view.path(&v, parent)?, &name)?;
+                if v.node(&path).is_ok() {
+                    return Err(Errno::EEXIST);
+                }
+                let h = v.write_open(&path, Some(attrs)).map_err(errno)?;
+                v.close(h).map_err(errno)?;
+                view.attr_at(&v, &path, None)
+            });
+            match result {
+                Ok(attr) => reply.entry(&TTL, &attr, Generation(0)),
                 Err(e) => reply.error(e),
             }
         });
@@ -1280,7 +1425,6 @@ mod tests {
     fn view(session: TreeSession) -> View {
         View {
             session,
-            owner: OWNER,
             handles: Arc::new(Mutex::new(Handles {
                 next: 1,
                 entries: BTreeMap::new(),
@@ -1301,7 +1445,7 @@ mod tests {
                 n: Ordinal(1),
             },
             session,
-            grant: Grant::live_read_only(tree, Consistency::PerFile, OWNER),
+            grant: Grant::live_read_only(tree, Consistency::PerFile),
         }
     }
 
@@ -1411,6 +1555,104 @@ mod tests {
             Err(Errno::EACCES)
         );
         assert_eq!(volume.read("a").unwrap(), b"new");
+    }
+
+    /// A file's attributes carry its recorded owner, whoever mounted.
+    #[test]
+    fn attr_presents_the_recorded_owner() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut sessions = Sessions::new(new_actor(tmp.path()));
+        let view = view(writing(&mut sessions, "client"));
+        let mut volume = view.actor().unwrap();
+        let attrs = Attrs {
+            perm: Perm::from_mode(0o640),
+            owner: FileOwner {
+                uid: 4242,
+                gid: 4343,
+            },
+        };
+        let h = volume.write_open("a", Some(attrs)).unwrap();
+        volume.close(h).unwrap();
+        let attr = view.attr_at(&volume, "a", None).unwrap();
+        assert_eq!((attr.uid, attr.gid, attr.perm), (4242, 4343, 0o640));
+    }
+
+    /// A chgrp keeps the mode and the owner it does not name.
+    #[test]
+    fn setattr_with_only_gid_keeps_mode_and_uid() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut sessions = Sessions::new(new_actor(tmp.path()));
+        let view = view(writing(&mut sessions, "client"));
+        let mut volume = view.actor().unwrap();
+        let h = volume.write_open("a", Some(ATTRS)).unwrap();
+        volume.close(h).unwrap();
+        let ino = inode(&volume.node("a").unwrap());
+        let changes = AttrChanges {
+            gid: Some(77),
+            ..AttrChanges::default()
+        };
+        let attr = view.set_attrs(&mut volume, ino, changes, None).unwrap();
+        assert_eq!((attr.perm, attr.uid, attr.gid), (0o644, OWNER.uid, 77));
+        let meta = volume.node("a").unwrap().meta;
+        assert_eq!(
+            (meta.mode.bits(), meta.uid, meta.gid),
+            (0o644, OWNER.uid, 77)
+        );
+    }
+
+    /// `Now` is the step's time and a specific time is kept to the
+    /// nanosecond; a time before the epoch is refused.
+    #[test]
+    fn utimens_now_and_specific_times_map_to_set_times() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut sessions = Sessions::new(new_actor(tmp.path()));
+        let view = view(writing(&mut sessions, "client"));
+        let mut volume = view.actor().unwrap();
+        let h = volume.write_open("a", Some(ATTRS)).unwrap();
+        volume.close(h).unwrap();
+        let ino = inode(&volume.node("a").unwrap());
+        let before = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let at = UNIX_EPOCH + Duration::new(1_000_000_000, 5);
+        let changes = AttrChanges {
+            atime: Some(TimeOrNow::Now),
+            mtime: Some(TimeOrNow::SpecificTime(at)),
+            ..AttrChanges::default()
+        };
+        let attr = view.set_attrs(&mut volume, ino, changes, None).unwrap();
+        assert_eq!(attr.mtime, at);
+        let times = volume.node("a").unwrap().times;
+        assert_eq!(times.mtime_ns, 1_000_000_000_000_000_005);
+        assert!(u128::from(times.atime_ns) >= before, "{times:?}");
+        assert_eq!(set_time(TimeOrNow::Now), Ok(SetTime::Now));
+        let early = UNIX_EPOCH - Duration::from_secs(1);
+        assert_eq!(set_time(TimeOrNow::SpecificTime(early)), Err(Errno::EINVAL));
+    }
+
+    /// A symlink's reply is a link whose size is its target's length, and
+    /// its target reads back.
+    #[test]
+    fn a_symlink_reply_carries_kind_symlink_and_its_target_length() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut sessions = Sessions::new(new_actor(tmp.path()));
+        let view = view(writing(&mut sessions, "client"));
+        let mut volume = view.actor().unwrap();
+        let attr = view
+            .make_symlink(&mut volume, "l", Path::new("dir/target"), OWNER)
+            .unwrap();
+        assert_eq!(attr.kind, FileType::Symlink);
+        assert_eq!(attr.size, 10);
+        assert_eq!(
+            (attr.uid, attr.gid, attr.perm),
+            (OWNER.uid, OWNER.gid, 0o777)
+        );
+        assert_eq!(volume.readlink("l").unwrap(), b"dir/target");
+        assert_eq!(
+            view.open_file(&mut volume, "l", libc::O_RDONLY, None),
+            Err(Errno::ELOOP)
+        );
     }
 
     /// A read-only client's view answers `EROFS` to every write, whatever the

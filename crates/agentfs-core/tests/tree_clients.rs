@@ -19,7 +19,7 @@ use agentfs_clients::ClientsService;
 use agentfs_contracts::caps::{LaunchCap, LaunchScope, Minter};
 use agentfs_contracts::clients::{
     Access, AttachedLookup, AttachmentEndReason, Binding, ClientError, ClientEvent, ClientId,
-    ClientSet, Clients, Consistency, FileOwner, Grant,
+    ClientSet, Clients, Consistency, Grant,
 };
 use agentfs_contracts::name::{ClientLabel, Label, LauncherId};
 use agentfs_contracts::pod::PodContext;
@@ -35,7 +35,6 @@ use trees::{ATTRS, identity};
 mod trees;
 
 const ROOT: TreeId = TreeId::Root;
-const OWNER: FileOwner = FileOwner { uid: 1, gid: 1 };
 
 /// The events published, shared by every clone.
 #[derive(Clone, Default)]
@@ -115,8 +114,8 @@ fn pod(name: &str) -> PodContext {
 
 fn grant(tree: TreeId, access: Access) -> Grant {
     match access {
-        Access::ReadWrite => Grant::live_read_write(tree, Consistency::PerFile, OWNER),
-        Access::ReadOnly => Grant::live_read_only(tree, Consistency::PerFile, OWNER),
+        Access::ReadWrite => Grant::live_read_write(tree, Consistency::PerFile),
+        Access::ReadOnly => Grant::live_read_only(tree, Consistency::PerFile),
     }
 }
 

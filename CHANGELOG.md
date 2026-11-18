@@ -12,6 +12,17 @@ design was reviewed on 2026-10-12.
 
 ### Added
 
+- **Tree views: owners, links and times.** A view presents each entry's
+  recorded owner and group; root can `chown`, an owner can `chgrp`, and the
+  kernel lets each user do what the recorded modes and owners allow
+  (`default_permissions`). A set-group-ID directory gives new entries its
+  group, and new subdirectories keep the bit. `symlink` and `readlink` are
+  served, links rename and unlink like files, and opening a link answers
+  `ELOOP`; a regular file's `mknod` is a create, any other `EPERM`. `touch`
+  and `utimensat` set times that survive a restart and build no commit. The
+  mount root starts owned by the process that ran `trees init`, mode 0755: a
+  chown through the mount gives it to a workload. `trees mount --owner`
+  (`AGENTFS_OWNER`) and the grant's presented owner are removed.
 - **Tree views: directories, modes and links.** A tree view serves
   directories: `mkdir`, `rmdir`, files in any directory, and renames across
   directories, a directory moving with everything under it, with POSIX's errors.
@@ -19,8 +30,7 @@ design was reviewed on 2026-10-12.
   `[identity, line map, meta]`, each directory a `dirs/` record, the root's
   `dirs/root` in the Root commit), files keep git's modes in history (`100755`
   for an executable, `120000` for a link), and `chmod` through a view is
-  recorded. The view shows each entry's recorded mode and times; owners are
-  still presented as `--owner`. The library also records symbolic links, owners
+  recorded. The view shows each entry's recorded mode and times. The library also records symbolic links, owners
   (`set_meta`) and explicit times (`set_times`, no commit); times are each
   tree's own, kept by the journal, never in history. Commits are
   `Agentfs-Format: envelope-2` and the state format `agentfs-trees-11`:
@@ -186,7 +196,7 @@ design was reviewed on 2026-10-12.
   `Agentfs-Volume-Id` and the writer's pod context (`--namespace`, `--pod`,
   `--pod-uid`, `--node`); a landing merge names the writer it lands. `trees
   mount` never creates a volume, mounts with FUSE `allow_other` unless
-  `--no-allow-other`, and presents its files as `--owner UID:GID`.
+  `--no-allow-other`.
 - **Testing**: end-to-end CI against real FUSE mounts, git servers over
   HTTP, HTTPS and SSH, LFS servers, an OpenTelemetry collector, NFS, kind
   clusters and csi-sanity; crash injection and power-loss replay on XFS

@@ -143,7 +143,9 @@ pub(in crate::tree_actor) fn decide(
         collisions,
         entry_done,
         sources,
+        reads: consulted,
     } = decided;
+    reads.extend(consulted);
     let mut writes = plans[index].files.clone();
     let (files, names, dirs) = match &after {
         Some(after) => {
@@ -300,7 +302,10 @@ impl TreeActor {
 
     /// Records the keys a step of `tree` touched, while its queue holds an
     /// entry a decision may read: a decision reads a queue as built, so a
-    /// step before the entry was queued is before every decision on it.
+    /// step before the entry was queued is before every decision on it. A
+    /// name touches every directory above it too: a take that judged a
+    /// directory (rule 14) is refused by an entry made, moved or removed
+    /// under it.
     pub(in crate::tree_actor) fn touch(
         &mut self,
         tree: TreeId,
@@ -311,7 +316,7 @@ impl TreeActor {
             return;
         }
         let touched = self.touched.entry(tree).or_default();
-        for key in keys {
+        for key in referee::with_directories(keys) {
             touched.insert(key, RecordNo::new(seq));
         }
     }
