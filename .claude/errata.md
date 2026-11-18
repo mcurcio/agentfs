@@ -1356,3 +1356,23 @@ Carried on in every case; none stopped the slice.
 3. **"touch makes no commit" needs a built history to compare.** History is built behind the calls, so
    `ci/e2e-trees.sh` checks the head after a kill and the next `trees init`'s build, against the head it already
    recorded, then mounts again to check the times survived. No wait on a timer.
+
+## 2026-11-18, M2 S3 (forks land directories and metadata by rule): where the brief was short
+
+Carried on in every case; none stopped the slice.
+
+1. **The refusal test cannot live in `tests/tree_dir_landing.rs`.** The brief asks each test there to show that
+   a take refused for a consulted directory key is decided again, but a refusal needs a step between a take's
+   decision and its land, and the public API runs both in one `take_next`. The one refusal test is a unit test
+   in `tree_actor/takes.rs` (`a_take_refused_for_a_consulted_directory_key_is_decided_again`), beside the
+   existing `FilesChanged`, `Held` and `HeadMoved` ones; the integration file holds the model's 17 scenarios.
+2. **The brief lists 16 scenarios; S2 wrote 17.** `r15_a_link_is_a_file_whose_bytes_are_its_target` is the
+   seventeenth, and `tree_dir_landing.rs` has it too.
+3. **The library's collision record is shorter than the model's.** The model records a rule 13 or 14 loss with
+   the change's and the upstream's values (`lost`, `won`); the brief fixes the library's JSON as
+   `{"cause":..,"path":..}`, so the library names only the cause and the entry. The model's metadata layout
+   (`meta.<identity>`, `dir.<path>`) is its own choice; the library keeps the `lines/` and `dirs/` layout S1 built.
+4. **A sync past an undecided directory removal goes beyond the model.** When the fork's undecided `rmdir` or
+   directory rename removed a directory under which the upstream has an entry the fork never had, the model
+   panics ("not modelled", MODEL.md "Left out"). The library hides that entry until the upstream decides, as
+   rule 11 hides a clashing name, so D1 holds; no scenario covers it.
