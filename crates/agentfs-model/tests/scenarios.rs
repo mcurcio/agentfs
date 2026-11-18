@@ -6,6 +6,7 @@
 use agentfs_model::calls::{Client, TreeId};
 use agentfs_model::check::Checked;
 use agentfs_model::content::{BLANK, Content, Layout, Line, State};
+use agentfs_model::entries::{Kind, Meta};
 use agentfs_model::git::{git, with_reversed_dates};
 use agentfs_model::recording::{Target, Write};
 use agentfs_model::service::Step;
@@ -4115,4 +4116,419 @@ fn finding_46_a_sync_of_a_file_the_fork_replaced_passes_the_name_it_took() {
     assert!(w.last_take().is_some(), "the sync takes past the open d");
     w.close(held);
     drain(&mut w);
+}
+
+// ── rules 13, 14 and 15: metadata, directories, links ───────────────────
+
+/// Rules 13 to 15: the metadata of the entry at `p` in tree `t`, read from git.
+fn meta(w: &World, t: TreeId, p: &str) -> Option<Meta> {
+    let e = w.entries(&w.head(t));
+    e.dirs
+        .get(p)
+        .copied()
+        .or_else(|| e.files.values().find(|(q, _)| q == p).map(|(_, m)| *m))
+}
+
+/// Every entry of tree `t` by path, a directory's with a `/`, read from git.
+fn entries_of(w: &World, t: TreeId) -> Vec<String> {
+    let mut v: Vec<String> = w
+        .entries(&w.head(t))
+        .all()
+        .into_iter()
+        .map(|(p, id)| if id.is_some() { p } else { format!("{p}/") })
+        .collect();
+    v.sort();
+    v
+}
+
+/// The one collision of the run, and its record in git under the root's history.
+fn only_collision(w: &World) -> (By, String, Vec<String>, Vec<String>, String) {
+    let entry: Vec<_> = w.collisions.iter().filter(|c| c.by != By::Whole).collect();
+    assert_eq!(entry.len(), 1, "{:?}", w.collisions);
+    let c = entry[0];
+    let recorded = decisions_in(w.repo(), &[&w.head(TreeId::ROOT)]);
+    let (_, d) = recorded
+        .iter()
+        .find(|(on, d)| *on == c.result && d.by == c.by.word())
+        .expect("the record in its result commit");
+    (
+        c.by,
+        c.path.clone(),
+        c.lost.clone(),
+        c.won.clone(),
+        d.by.clone(),
+    )
+}
+
+/// A program's `symlink(target, tmp)` then `rename(tmp, p)`: an atomic replace of `p`
+/// by a link (rule 11's atomic save, rule 15).
+fn link_over(w: &mut World, c: &Client, p: &str, tmp: &str, target: &str) {
+    w.symlink(c, tmp, target, Meta::symlink(0, 0))
+        .expect("an unborn identity left");
+    w.rename(c, tmp, p);
+}
+
+/// Rule 13: a fork's chmod lands over the value it saw; history records the value in a
+/// record beside the file, and no time.
+#[test]
+fn r13_a_chmod_lands_over_the_value_it_saw() {
+    let mut w = world();
+    let f = w.create_fork(TreeId::ROOT);
+    w.set_meta(&Client::Fork(f), "a", Meta::file(0o755, 1000, 1000));
+    drain(&mut w);
+    for t in [TreeId::ROOT, f] {
+        assert_eq!(meta(&w, t, "a"), Some(Meta::file(0o755, 1000, 1000)));
+    }
+    assert_eq!(
+        git(
+            w.repo(),
+            &[
+                "cat-file",
+                "-p",
+                &format!("{}:meta.a", w.head(TreeId::ROOT))
+            ]
+        ),
+        "file:0755:1000:1000"
+    );
+    assert!(w.collisions.is_empty(), "{:?}", w.collisions);
+}
+
+/// Rule 13: two concurrent chmods of one file: the upstream holds a value the fork's
+/// writer never saw, so the upstream's wins and the fork's change loses whole,
+/// recorded as `metadata`.
+#[test]
+fn r13_concurrent_chmods_the_upstream_wins_and_the_change_loses_whole() {
+    let mut w = world();
+    let f = w.create_fork(TreeId::ROOT);
+    w.set_meta(&Client::Fork(f), "a", Meta::file(0o700, 0, 0));
+    w.set_meta(&m1(), "a", Meta::file(0o755, 0, 0));
+    drain(&mut w);
+    for t in [TreeId::ROOT, f] {
+        assert_eq!(meta(&w, t, "a"), Some(Meta::file(0o755, 0, 0)), "{t:?}");
+    }
+    let (by, path, lost, won, word) = only_collision(&w);
+    assert_eq!(
+        (by, path.as_str(), word.as_str()),
+        (By::Metadata, "a", "metadata")
+    );
+    assert_eq!(
+        (lost, won),
+        (
+            vec!["file:0700:0:0".to_string()],
+            vec!["file:0755:0:0".to_string()]
+        )
+    );
+}
+
+/// Rule 13: two trees writing the same new value agree: no collision.
+#[test]
+fn r13_the_same_new_value_agrees() {
+    let mut w = world();
+    let f = w.create_fork(TreeId::ROOT);
+    w.set_meta(&Client::Fork(f), "a", Meta::file(0o600, 7, 7));
+    w.set_meta(&m1(), "a", Meta::file(0o600, 7, 7));
+    drain(&mut w);
+    for t in [TreeId::ROOT, f] {
+        assert_eq!(meta(&w, t, "a"), Some(Meta::file(0o600, 7, 7)));
+    }
+    assert!(w.collisions.is_empty(), "{:?}", w.collisions);
+}
+
+/// Rule 13: metadata follows the file's identity, so a rename and a chmod of one file
+/// both apply.
+#[test]
+fn r13_a_rename_and_a_chmod_both_apply() {
+    let mut w = world();
+    let f = w.create_fork(TreeId::ROOT);
+    w.rename(&Client::Fork(f), "a", "x");
+    w.set_meta(&m1(), "a", Meta::file(0o700, 0, 0));
+    drain(&mut w);
+    for t in [TreeId::ROOT, f] {
+        assert_eq!(meta(&w, t, "x"), Some(Meta::file(0o700, 0, 0)), "{t:?}");
+        assert!(w.lookup(&w.head(t), "a").is_none());
+    }
+    assert!(w.collisions.is_empty(), "{:?}", w.collisions);
+}
+
+/// Rule 13 with rule 11's atomic save: the file keeps its identity and takes the new
+/// file's metadata, here its executable bit.
+#[test]
+fn r13_an_atomic_save_carries_the_new_files_metadata() {
+    let mut w = world();
+    let f = w.create_fork(TreeId::ROOT);
+    let c = Client::Fork(f);
+    let h = w.create(&c, "a.tmp").expect("an unborn identity left");
+    w.write(h, Write::Append("#!/bin/sh\n".into()));
+    w.close(h);
+    w.set_meta(&c, "a.tmp", Meta::file(0o755, 0, 0));
+    w.rename(&c, "a.tmp", "a");
+    assert_eq!(w.read(f, "a").name.line, "a", "the file keeps its identity");
+    drain(&mut w);
+    for t in [TreeId::ROOT, f] {
+        assert_eq!(meta(&w, t, "a"), Some(Meta::file(0o755, 0, 0)), "{t:?}");
+        assert_eq!(w.read(t, "a").bytes(), "#!/bin/sh\n");
+    }
+    assert!(w.collisions.is_empty(), "{:?}", w.collisions);
+}
+
+/// Rule 14: a directory is its path, so two trees making one directory agree.
+#[test]
+fn r14_two_trees_make_one_directory_and_agree() {
+    let mut w = world();
+    let f = w.create_fork(TreeId::ROOT);
+    w.mkdir(&Client::Fork(f), "cache", Meta::dir(0o755, 0, 0));
+    w.mkdir(&m1(), "cache", Meta::dir(0o755, 0, 0));
+    let h = w.create(&m1(), "cache/x").expect("an unborn identity left");
+    w.close(h);
+    drain(&mut w);
+    for t in [TreeId::ROOT, f] {
+        assert_eq!(entries_of(&w, t), ["a", "b", "c", "cache/", "cache/x", "d"]);
+    }
+    assert!(w.collisions.is_empty(), "{:?}", w.collisions);
+}
+
+/// Rule 14: an empty directory is kept, as its own record in history.
+#[test]
+fn r14_an_empty_directory_is_kept() {
+    let mut w = world();
+    let f = w.create_fork(TreeId::ROOT);
+    w.mkdir(&Client::Fork(f), "empty", Meta::dir(0o2775, 0, 100));
+    drain(&mut w);
+    for t in [TreeId::ROOT, f] {
+        assert_eq!(meta(&w, t, "empty"), Some(Meta::dir(0o2775, 0, 100)));
+    }
+    assert_eq!(
+        git(
+            w.repo(),
+            &[
+                "cat-file",
+                "-p",
+                &format!("{}:dir.empty", w.head(TreeId::ROOT))
+            ]
+        ),
+        "dir:2775:0:100"
+    );
+}
+
+/// Rule 14: a directory's rename is one change moving everything under it, each file
+/// keeping its identity (rule 11), so the upstream's concurrent edit of a file in it
+/// applies too.
+#[test]
+fn r14_renaming_a_directory_moves_everything_under_it_whole() {
+    let mut w = world();
+    w.mkdir(&m1(), "q", Meta::dir(0o755, 0, 0));
+    w.mkdir(&m1(), "q/s", Meta::dir(0o700, 0, 0));
+    let h = w.create(&m1(), "q/x").expect("an unborn identity left");
+    w.close(h);
+    let h = w.create(&m1(), "q/s/y").expect("an unborn identity left");
+    w.close(h);
+    let f = w.create_fork(TreeId::ROOT);
+    let before = w.head(f);
+    w.rename(&Client::Fork(f), "q", "e");
+    assert_eq!(
+        show(&w, &w.head(f), "%P"),
+        before,
+        "one commit on the fork's head"
+    );
+    let h = w.open_write(&m1(), "q/x");
+    w.write(h, Write::Append("edit\n".into()));
+    w.close(h);
+    drain(&mut w);
+    for t in [TreeId::ROOT, f] {
+        assert_eq!(
+            entries_of(&w, t),
+            ["a", "b", "c", "d", "e/", "e/s/", "e/s/y", "e/x"]
+        );
+        assert_eq!(meta(&w, t, "e/s"), Some(Meta::dir(0o700, 0, 0)));
+        assert_eq!(w.read(t, "e/x").bytes(), "edit\n");
+    }
+    assert!(w.collisions.is_empty(), "{:?}", w.collisions);
+}
+
+/// Rule 14: a fork's rmdir loses whole when the upstream has an entry under the
+/// directory its writer never saw, recorded as `directory-not-empty`.
+#[test]
+fn r14_removing_a_directory_the_upstream_filled_loses_whole() {
+    let mut w = world();
+    w.mkdir(&m1(), "q", Meta::dir(0o755, 0, 0));
+    let f = w.create_fork(TreeId::ROOT);
+    w.rmdir(&Client::Fork(f), "q");
+    let h = w.create(&m1(), "q/x").expect("an unborn identity left");
+    w.close(h);
+    next(&mut w, TreeId::ROOT);
+    drain(&mut w);
+    for t in [TreeId::ROOT, f] {
+        assert_eq!(entries_of(&w, t), ["a", "b", "c", "d", "q/", "q/x"]);
+    }
+    let (by, path, _, won, word) = only_collision(&w);
+    assert_eq!(
+        (by, path.as_str(), word.as_str()),
+        (By::DirectoryNotEmpty, "q/", "directory-not-empty")
+    );
+    assert_eq!(won, ["q/x"]);
+}
+
+/// Rule 14: a fork's move of a directory loses whole when the upstream has an entry
+/// under it the fork's writer never saw.
+#[test]
+fn r14_moving_a_directory_the_upstream_filled_loses_whole() {
+    let mut w = world();
+    w.mkdir(&m1(), "q", Meta::dir(0o755, 0, 0));
+    let f = w.create_fork(TreeId::ROOT);
+    w.rename(&Client::Fork(f), "q", "e");
+    let h = w.create(&m1(), "q/x").expect("an unborn identity left");
+    w.close(h);
+    next(&mut w, TreeId::ROOT);
+    drain(&mut w);
+    for t in [TreeId::ROOT, f] {
+        assert_eq!(entries_of(&w, t), ["a", "b", "c", "d", "q/", "q/x"]);
+    }
+    let (by, path, _, won, _) = only_collision(&w);
+    assert_eq!((by, path.as_str()), (By::DirectoryNotEmpty, "q/"));
+    assert_eq!(won, ["q/x"]);
+}
+
+/// Rule 14: a fork's move of a directory onto a path loses whole when the upstream has
+/// an entry there its writer never saw.
+#[test]
+fn r14_moving_onto_a_path_the_upstream_filled_loses_whole() {
+    let mut w = world();
+    w.mkdir(&m1(), "q", Meta::dir(0o755, 0, 0));
+    let h = w.create(&m1(), "q/x").expect("an unborn identity left");
+    w.close(h);
+    let f = w.create_fork(TreeId::ROOT);
+    w.rename(&Client::Fork(f), "q", "e");
+    w.mkdir(&m1(), "e", Meta::dir(0o755, 0, 0));
+    let h = w.create(&m1(), "e/y").expect("an unborn identity left");
+    w.close(h);
+    next(&mut w, TreeId::ROOT);
+    drain(&mut w);
+    for t in [TreeId::ROOT, f] {
+        assert_eq!(
+            entries_of(&w, t),
+            ["a", "b", "c", "d", "e/", "e/y", "q/", "q/x"]
+        );
+    }
+    let (by, path, lost, won, _) = only_collision(&w);
+    assert_eq!((by, path.as_str()), (By::DirectoryNotEmpty, "e/"));
+    assert_eq!(
+        (lost, won),
+        (vec!["e".to_string()], vec!["e/y".to_string()])
+    );
+}
+
+/// Rule 14: a fork's create into a directory the upstream removed loses whole, as the
+/// fork did not make that directory itself; recorded as `directory-gone`.
+#[test]
+fn r14_a_create_into_a_directory_the_upstream_removed_loses_whole() {
+    let mut w = world();
+    w.mkdir(&m1(), "q", Meta::dir(0o755, 0, 0));
+    let f = w.create_fork(TreeId::ROOT);
+    let h = w
+        .create(&Client::Fork(f), "q/x")
+        .expect("an unborn identity left");
+    w.close(h);
+    w.rmdir(&m1(), "q");
+    next(&mut w, TreeId::ROOT);
+    drain(&mut w);
+    for t in [TreeId::ROOT, f] {
+        assert_eq!(entries_of(&w, t), ["a", "b", "c", "d"]);
+    }
+    let (by, path, lost, _, word) = only_collision(&w);
+    assert_eq!(
+        (by, path.as_str(), word.as_str()),
+        (By::DirectoryGone, "q/", "directory-gone")
+    );
+    assert_eq!(lost, ["q/x"]);
+}
+
+/// Rule 14: until the upstream's queue decides, a sync keeps the directory a fork's
+/// undecided entry needs, though the upstream removed it; then the decision reaches the
+/// fork.
+#[test]
+fn r14_a_sync_keeps_the_directory_of_an_undecided_entry() {
+    let mut w = world();
+    w.mkdir(&m1(), "q", Meta::dir(0o755, 0, 0));
+    let f = w.create_fork(TreeId::ROOT);
+    let h = w
+        .create(&Client::Fork(f), "q/x")
+        .expect("an unborn identity left");
+    w.close(h);
+    w.rmdir(&m1(), "q");
+    next(&mut w, f);
+    assert!(w.last_take().is_some(), "the sync took");
+    assert_eq!(entries_of(&w, f), ["a", "b", "c", "d", "q/", "q/x"]);
+    assert_eq!(entries_of(&w, TreeId::ROOT), ["a", "b", "c", "d"]);
+    drain(&mut w);
+    assert_eq!(entries_of(&w, f), ["a", "b", "c", "d"]);
+    assert_eq!(only_collision(&w).0, By::DirectoryGone);
+}
+
+/// Rule 14: a decided upstream rmdir reaches the fork.
+#[test]
+fn r14_an_upstream_rmdir_reaches_the_fork() {
+    let mut w = world();
+    w.mkdir(&m1(), "q", Meta::dir(0o755, 0, 0));
+    let f = w.create_fork(TreeId::ROOT);
+    w.rmdir(&m1(), "q");
+    drain(&mut w);
+    assert_eq!(entries_of(&w, f), ["a", "b", "c", "d"]);
+    assert!(w.collisions.is_empty(), "{:?}", w.collisions);
+}
+
+/// Rule 15: a link is a file whose bytes are its target and whose kind is a link; it
+/// lands like any file.
+#[test]
+fn r15_a_link_is_a_file_whose_bytes_are_its_target() {
+    let mut w = world();
+    let f = w.create_fork(TreeId::ROOT);
+    let id = w
+        .symlink(&Client::Fork(f), "l", "a", Meta::symlink(1000, 1000))
+        .expect("an unborn identity left");
+    drain(&mut w);
+    for t in [TreeId::ROOT, f] {
+        assert_eq!(w.read(t, "l").bytes(), "a");
+        assert_eq!(w.read(t, "l").name.line, id);
+        assert_eq!(meta(&w, t, "l"), Some(Meta::symlink(1000, 1000)));
+    }
+}
+
+/// Rule 15: two concurrent retargets of one link (each an atomic replace) are two edits
+/// of one file: the upstream's wins and the fork's change loses whole.
+#[test]
+fn r15_concurrent_retargets_the_upstream_wins() {
+    let mut w = world();
+    w.symlink(&m1(), "l", "a", Meta::symlink(0, 0))
+        .expect("an unborn identity left");
+    let f = w.create_fork(TreeId::ROOT);
+    link_over(&mut w, &Client::Fork(f), "l", "l.tmp", "b");
+    link_over(&mut w, &m1(), "l", "l.tmp", "c");
+    drain(&mut w);
+    for t in [TreeId::ROOT, f] {
+        assert_eq!(w.read(t, "l").bytes(), "c", "{t:?}");
+        assert_eq!(meta(&w, t, "l"), Some(Meta::symlink(0, 0)));
+    }
+    assert!(
+        w.collisions
+            .iter()
+            .any(|c| c.tree == TreeId::ROOT && matches!(c.by, By::Line | By::File)),
+        "{:?}",
+        w.collisions
+    );
+}
+
+/// Rules 15 and 13: replacing a file by a link (an atomic save of a link over it)
+/// keeps the file's identity and changes its kind.
+#[test]
+fn r15_replacing_a_file_by_a_link_changes_its_kind() {
+    let mut w = world();
+    let f = w.create_fork(TreeId::ROOT);
+    link_over(&mut w, &Client::Fork(f), "a", "a.tmp", "b");
+    drain(&mut w);
+    for t in [TreeId::ROOT, f] {
+        assert_eq!(w.read(t, "a").name.line, "a", "the file keeps its identity");
+        assert_eq!(w.read(t, "a").bytes(), "b");
+        assert_eq!(meta(&w, t, "a").map(|m| m.kind), Some(Kind::Symlink));
+    }
+    assert!(w.collisions.is_empty(), "{:?}", w.collisions);
 }

@@ -55,19 +55,21 @@ fn key(i: &Incoming) -> (String, String) {
 
 /// Rules 3, 10 and 11 at the upstream's queue: one change (`incoming`, from
 /// commit `tip`) into the upstream's head `ours`, a fork's landing and a
-/// transaction's commit alike.
+/// transaction's commit alike. `lost`: the change already lost by rule 13 or 14
+/// (`crate::entries`), so none of its lines applies (rule 3e).
 pub(crate) fn land<L: Lineage + ?Sized>(
     git: &L,
     ours: &str,
     incoming: &[Incoming],
     tip: &str,
+    lost: bool,
 ) -> Plan {
     let r = Referee { git };
     let mut lines = Lines::undecided(incoming);
     r.verdicts(ours, tip, &mut lines);
     r.names(ours, incoming, &mut lines);
     r.joins(ours, tip, &mut lines);
-    r.whole(ours, tip, &lines)
+    r.whole(ours, tip, &lines, lost)
 }
 
 /// [`crate::world::MergeRule::PerLine`]'s sync of the upstream's `up` into the

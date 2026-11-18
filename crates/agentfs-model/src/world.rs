@@ -16,6 +16,9 @@
 //! | 9, progress (git-model.md §6) | P1: a [`TreeStep::Next`] takes the first entry no earlier waiting entry shares a file or a source with (`queue`'s scan), so several may wait ([`World::waits`]); no call ever waits on a waiting entry (P3 is gone, the owner's decision of 2026-11-04): a new open of a file a waiting entry waits for is granted; P2, the prefix sync: a sync delivers the upstream's commits in order up to the first whose delivery would overwrite a file open for writing in the fork, and waits for the rest (`queue`'s prefix, its `Cut`) |
 //! | 11. Deletes and renames | a file's name line: [`World::rename`] writes a new version, [`World::unlink`] a deleted one; the referee's land applies the per-line rule to it and couples a file's existence with its content. [`World::create`] makes a file (an unborn identity); an open holds an object ([`Handle::object`](crate::recording::Handle::object)), so a close saves to the file its object is named by ([`World::named`]) or, for an orphan, nothing ([`Orphan`](crate::recording::Orphan), kept by `recording`); a rename-over from a new file is an atomic save, a rewrite of the replaced file |
 //! | 12. The journal (git-model.md §3) | an open's calls are its journal; [`World::crash`] saves each open from it once (the `Agentfs-Open` trailer, [`World::saved`]); a take is one step, so none is in progress at a crash |
+//! | 13. Metadata | [`World::set_meta`] writes a record ([`entries`]); `resolve` asks `entries::land` before the referee, and a loss there loses the change whole; `adopt` keeps the fork's undecided records (`entries::sync`) |
+//! | 14. Directories | [`World::mkdir`], [`World::rmdir`], and [`World::rename`] of a directory (one commit moving every entry under it); judged and synced as rule 13 |
+//! | 15. Links | [`World::symlink`]: a file whose bytes are its target, made by one commit |
 //!
 //! No clock: commits carry a fixed date (`git.rs`) and order comes only
 //! from the queues and from git history.
@@ -31,6 +34,7 @@ use crate::calls::{
     Took, TreeCalls, TreeId, TxnId, gather_collisions, out_of_scope,
 };
 use crate::content::{self, Content, Edit, Layout, Line, PATHS, UNBORN};
+use crate::entries::{self, Entries, Meta, Raw, Writes};
 use crate::git::{git, git_in, try_git};
 use crate::program;
 pub use crate::program::LineEdit;
@@ -150,8 +154,53 @@ pub enum By {
     /// A line that did not collide itself, of a change that lost whole
     /// (rule 3e: a save, or a transaction, lands whole or loses whole): its
     /// `won` is the upstream's version that decided the change's loss, named
-    /// by a `Line` or `File` collision of the same change.
+    /// by a `Line` or `File` collision of the same change, or of rules 13 and 14
+    /// (the three below): then, the upstream's version of the same line, or for a
+    /// line the upstream lacks, its version of the file's name line.
     Whole,
+    /// Rule 13: the upstream holds metadata the change's writer never saw. Its
+    /// `path` is the entry ([`entries::Key::label`]), its one line `meta`, and its
+    /// lost and won the change's value and the upstream's ([`entries::value_text`]).
+    Metadata,
+    /// Rule 14: the change removes or moves a directory, or puts an entry onto a
+    /// path, where the upstream has an entry its writer never saw. Its one line is
+    /// `dir`, its lost what the change put there, its won that entry's path.
+    DirectoryNotEmpty,
+    /// Rule 14: the change puts an entry into a directory the upstream no longer
+    /// has and did not make it. Its one line is `dir`, its lost the entry's path.
+    DirectoryGone,
+}
+
+impl By {
+    /// The cause as a collision record names it: `Line`, `File` and `Whole`, and
+    /// rules 13 and 14's `metadata`, `directory-not-empty` and `directory-gone`,
+    /// the words the library's records use.
+    pub fn word(self) -> &'static str {
+        match self {
+            By::Line => "Line",
+            By::File => "File",
+            By::Whole => "Whole",
+            By::Metadata => "metadata",
+            By::DirectoryNotEmpty => "directory-not-empty",
+            By::DirectoryGone => "directory-gone",
+        }
+    }
+
+    /// A loss by rules 13 and 14, about an entry rather than a line.
+    pub fn of_entry(self) -> bool {
+        matches!(
+            self,
+            By::Metadata | By::DirectoryNotEmpty | By::DirectoryGone
+        )
+    }
+
+    fn of(c: entries::Cause) -> Self {
+        match c {
+            entries::Cause::Metadata => By::Metadata,
+            entries::Cause::DirectoryNotEmpty => By::DirectoryNotEmpty,
+            entries::Cause::DirectoryGone => By::DirectoryGone,
+        }
+    }
 }
 
 /// Rule 3's event: a change into an upstream lost, whole (rule 3e). One
@@ -328,7 +377,7 @@ impl Decision {
         Self {
             tree: names.name(c.tree),
             path: c.path.clone(),
-            by: format!("{:?}", c.by),
+            by: c.by.word().to_string(),
             loser: c.loser.clone(),
             reference: c.reference.clone(),
             lines: c.lines.clone(),
@@ -490,6 +539,12 @@ pub struct World {
     trace_mute: bool,
     /// What tells this world's trace file from another's (a seed).
     trace_label: Option<String>,
+    /// Whether a call has made a directory or set metadata (rules 13 to 15).
+    /// Until one has, no tree holds a record ([`entries`]), so none is read:
+    /// the random runs make none, and read git no more than before.
+    entries_used: bool,
+    /// Each commit's or tree's records, read once (objects never change).
+    records: RefCell<BTreeMap<String, Raw>>,
     /// This world's name for its trace and digest files, taken at the first
     /// ask ([`World::run_name`]).
     run_name: OnceCell<String>,
@@ -571,6 +626,8 @@ impl World {
             trace: std::env::var_os(TRACE_DIR).map(|_| Vec::new()),
             trace_mute: false,
             trace_label: None,
+            entries_used: false,
+            records: RefCell::new(BTreeMap::new()),
             run_name: OnceCell::new(),
         };
         let files = PATHS
@@ -820,6 +877,17 @@ impl World {
 
     /// `base`'s tree (a commit or tree id; none: empty) with `files` replaced.
     fn tree_with(&self, base: Option<&str>, files: &BTreeMap<String, Content>) -> String {
+        self.tree_writing(base, files, &Writes::new())
+    }
+
+    /// [`World::tree_with`], also writing records of directories and metadata
+    /// (rules 13 and 14): each its new text, or removed.
+    fn tree_writing(
+        &self,
+        base: Option<&str>,
+        files: &BTreeMap<String, Content>,
+        records: &Writes,
+    ) -> String {
         let mut entries: BTreeMap<String, String> = BTreeMap::new();
         if let Some(base) = base {
             for line in git(&self.repo, &["ls-tree", base]).lines() {
@@ -835,6 +903,17 @@ impl World {
                 &c.render(self.policies.layout),
             );
             entries.insert(p.clone(), format!("100644 blob {blob}\t{p}"));
+        }
+        for (name, text) in records {
+            match text {
+                Some(t) => {
+                    let blob = git_in(&self.repo, &["hash-object", "-w", "--stdin"], t);
+                    entries.insert(name.clone(), format!("100644 blob {blob}\t{name}"));
+                }
+                None => {
+                    entries.remove(name);
+                }
+            }
         }
         let listing: String = entries.values().map(|l| format!("{l}\n")).collect();
         git_in(&self.repo, &["mktree"], &listing)
@@ -914,6 +993,49 @@ impl World {
 
     fn tree_of(&self, c: &str) -> String {
         git(&self.repo, &["rev-parse", &format!("{c}^{{tree}}")])
+    }
+
+    /// The records of directories and metadata (rules 13 and 14) a commit or
+    /// tree holds, by name, read once ([`entries::read_raw`]); none until a call
+    /// has made one.
+    pub fn records(&self, at: &str) -> Raw {
+        if !self.entries_used {
+            return Raw::new();
+        }
+        if let Some(r) = self.records.borrow().get(at) {
+            return r.clone();
+        }
+        let r = entries::read_raw(&self.repo, at);
+        self.records.borrow_mut().insert(at.to_string(), r.clone());
+        r
+    }
+
+    /// What a commit or tree holds beside its files' lines: each live file's
+    /// path and metadata, each directory (rules 13 to 15).
+    pub fn entries(&self, at: &str) -> Entries {
+        Entries::read(
+            &self.records(at),
+            PATHS.iter().map(|f| (*f, self.file(at, f))),
+        )
+    }
+
+    /// Whether the upstream at `up` has decided the record `name` the fork at
+    /// `ours` holds: it has taken the commit that wrote the fork's text (or its
+    /// absence), found as [`origin_in`] finds a version's.
+    fn record_decided(&self, ours: &str, up: &str, name: &str) -> bool {
+        let mine = self.records(ours).get(name).cloned();
+        let parents = |c: &str| {
+            if let Some(v) = self.parents.borrow().get(c) {
+                return v.clone();
+            }
+            let v = commit_parents(&self.repo, c);
+            self.parents.borrow_mut().insert(c.to_string(), v.clone());
+            v
+        };
+        let origin = origin_in(ours, parents, |c| {
+            self.records(c).get(name).cloned() == mine
+        });
+        self.is_ancestor(&origin, up)
     }
 
     fn first_parent(&self, c: &str) -> String {
@@ -1031,11 +1153,45 @@ impl World {
     /// ([`referee::land`]) for one change into the upstream's head `ours`, its
     /// tree built here.
     fn resolve(&self, ours: &str, incoming: &[Incoming], tip: &str) -> Merged {
-        let referee::Plan { files, collisions } = referee::land(self, ours, incoming, tip);
-        let tree = if files.is_empty() {
+        // Rules 13 and 14 over the change's own edit, against its first parent.
+        let (entry_losses, records) = if self.entries_used {
+            let base = self.first_parent(tip);
+            let losses = entries::land(
+                &self.entries(&base),
+                &self.entries(tip),
+                &self.entries(ours),
+            );
+            let records = entries::changes(&self.records(&base), &self.records(tip));
+            (losses, records)
+        } else {
+            (Vec::new(), Writes::new())
+        };
+        let referee::Plan {
+            files,
+            mut collisions,
+        } = referee::land(self, ours, incoming, tip, !entry_losses.is_empty());
+        collisions.extend(entry_losses.into_iter().map(|l| Lost {
+            path: l.path,
+            lines: vec![if l.cause == entries::Cause::Metadata {
+                "meta".to_string()
+            } else {
+                "dir".to_string()
+            }],
+            lost: vec![l.lost],
+            won: vec![l.won],
+            by: By::of(l.cause),
+            loser: tip.to_string(),
+        }));
+        // Rule 3e: the change's records land with it, or not at all.
+        let records = if collisions.is_empty() {
+            records
+        } else {
+            Writes::new()
+        };
+        let tree = if files.is_empty() && records.is_empty() {
             self.tree_of(ours)
         } else {
-            self.tree_with(Some(ours), &files)
+            self.tree_writing(Some(ours), &files, &records)
         };
         Merged {
             tree,
@@ -1065,10 +1221,26 @@ impl World {
     /// its tree built here over `up`.
     fn adopt(&self, ours: &str, up: &str) -> String {
         let files = referee::sync(self, ours, up, self.changed(ours, up));
-        let tree = if files.is_empty() {
+        // Rules 13 and 14: the fork's undecided records stay, and so does every
+        // directory an entry of the result needs.
+        let records = if self.entries_used {
+            let paths: BTreeSet<String> = PATHS
+                .iter()
+                .filter_map(|f| {
+                    let c = files.get(*f).cloned().unwrap_or_else(|| self.file(up, f));
+                    c.path().map(str::to_string)
+                })
+                .collect();
+            entries::sync(&self.records(ours), &self.records(up), &paths, |n| {
+                self.record_decided(ours, up, n)
+            })
+        } else {
+            Writes::new()
+        };
+        let tree = if files.is_empty() && records.is_empty() {
             self.tree_of(up)
         } else {
-            self.tree_with(Some(up), &files)
+            self.tree_writing(Some(up), &files, &records)
         };
         self.no_clash(&tree);
         tree
@@ -1136,7 +1308,7 @@ impl World {
             out.push(Decision {
                 tree: self.names.name(t),
                 path: l.path.clone(),
-                by: format!("{:?}", l.by),
+                by: l.by.word().to_string(),
                 loser: l.loser.clone(),
                 reference,
                 lines: l.lines.clone(),
@@ -1441,6 +1613,12 @@ impl World {
     /// whose new tree it returns none for; the transaction's commit makes
     /// the one commit.
     fn commit_save(&mut self, save: Save) -> Option<String> {
+        self.commit_save_writing(save, &Writes::new())
+    }
+
+    /// [`World::commit_save`], also writing records of directories and metadata
+    /// (rules 13 and 14) in the same commit: one call, one change.
+    fn commit_save_writing(&mut self, save: Save, records: &Writes) -> Option<String> {
         let Save {
             target,
             writer,
@@ -1450,7 +1628,7 @@ impl World {
             open,
         } = save;
         let (writer, at) = (writer.as_str(), at.as_str());
-        let t = self.tree_with(Some(at), &files);
+        let t = self.tree_writing(Some(at), &files, records);
         match target {
             Target::Txn(f, id) => {
                 let txn = self.forks.get_mut(&f).expect("fork").txn.as_mut();
@@ -1502,6 +1680,17 @@ impl World {
     /// The file keeps its identity, so its opens and lines follow it.
     pub fn rename(&mut self, c: &Client, from: &str, to: &str) {
         let at = self.target_head(self.target_of(c));
+        if self.entries_used {
+            let e = self.entries(&at);
+            if e.dirs.contains_key(from) {
+                self.rename_dir(c, from, to);
+                return;
+            }
+            assert!(
+                e.is_dir(entries::parent(to)) && !e.dirs.contains_key(to),
+                "rename of {from} to {to}: its directory is missing, or a directory is there"
+            );
+        }
         let over = self.lookup(&at, to);
         let kind = Kind::Rename {
             to: to.to_string(),
@@ -1527,6 +1716,18 @@ impl World {
     fn run_path_call(&mut self, h: &Handle) {
         let (writer, txn) = self.handle_writer(h);
         let at = self.target_head(h.target);
+        // Rule 13: an atomic save (a rename-over from a new file, rule 11) carries
+        // the new file's metadata to the file it rewrites.
+        let records = match &h.kind {
+            Kind::Rename { to, .. } if self.entries_used => match self.lookup(&at, to) {
+                Some(g) if recording::fresh(&self.file(&at, &h.file)) => {
+                    let mine = self.records(&at).get(&entries::meta_name(&h.file)).cloned();
+                    Writes::from([(entries::meta_name(&g), mine)])
+                }
+                _ => Writes::new(),
+            },
+            _ => Writes::new(),
+        };
         let Some((save, from)) = self
             .recording
             .path_save(h, &writer, txn, &at, &self.objects)
@@ -1535,7 +1736,7 @@ impl World {
         };
         let tokens: Vec<&String> = save.set.iter().map(|e| &e.token).collect();
         self.note(format!("{:?} {:?}: saved {tokens:?}", h.client, h.kind));
-        self.commit_save(save);
+        self.commit_save_writing(save, &records);
         // An open of a file this call unlinked or replaced holds an object
         // no path names now, so no file of it is open: a take waiting for
         // that close is woken, in the tree or, for a transaction's call, its
@@ -1562,6 +1763,13 @@ impl World {
     pub fn create(&mut self, c: &Client, p: &str) -> Option<HandleId> {
         let target = self.target_of(c);
         let at = self.target_head(target);
+        if self.entries_used {
+            let e = self.entries(&at);
+            assert!(
+                e.is_dir(entries::parent(p)) && !e.dirs.contains_key(p),
+                "create of {p}: its directory is missing, or a directory is there"
+            );
+        }
         let writer = self.who(c).0;
         let txn = match target {
             Target::Txn(_, t) => Some(t),
@@ -1583,6 +1791,171 @@ impl World {
             h: u64::from(h),
         });
         Some(h)
+    }
+
+    // ── directories, metadata and links (rules 13, 14 and 15) ────────────
+
+    /// The tree a directory, metadata or link call of client `c` writes in: its
+    /// tree, never a transaction (MODEL.md, "Left out").
+    fn entry_tree(&mut self, c: &Client) -> TreeId {
+        let t = match self.target_of(c) {
+            Target::Tree(t) => t,
+            Target::Txn(..) => {
+                panic!("a directory, metadata or link call in a transaction: not modelled")
+            }
+        };
+        assert!(
+            t == TreeId::ROOT || self.forks[&t].txn.is_none(),
+            "a directory, metadata or link call beside an open transaction: not modelled"
+        );
+        self.entries_used = true;
+        t
+    }
+
+    /// One call that writes only records (rules 13 and 14): one commit on tree
+    /// `t`, by client `c`'s writer, at once.
+    fn commit_records(&mut self, c: &Client, t: TreeId, records: Writes) {
+        let at = self.head(t);
+        let save = Save {
+            target: Target::Tree(t),
+            writer: self.who(c).0,
+            at,
+            files: BTreeMap::new(),
+            set: Vec::new(),
+            open: None,
+        };
+        self.commit_save_writing(save, &records);
+    }
+
+    /// Rule 14: `mkdir(p)` with metadata `meta` (its kind a directory): a record
+    /// of the directory, one commit. Its parent must be a directory and nothing
+    /// may be at `p` (else the call fails, which the model does not make).
+    pub fn mkdir(&mut self, c: &Client, p: &str, meta: Meta) {
+        let t = self.entry_tree(c);
+        let e = self.entries(&self.head(t));
+        assert!(meta.kind == entries::Kind::Dir, "mkdir of {p} as {meta:?}");
+        assert!(
+            !p.is_empty() && e.is_dir(entries::parent(p)) && e.at(p).is_empty(),
+            "mkdir of {p}: its directory is missing, or {p} exists"
+        );
+        self.note(format!("mkdir {c:?} {t:?}:{p} {}", meta.text()));
+        self.commit_records(
+            c,
+            t,
+            Writes::from([(entries::dir_name(p), Some(meta.text()))]),
+        );
+        self.trace_call(out_of_scope("directories"));
+    }
+
+    /// Rule 14: `rmdir(p)` of an empty directory: its record removed, one commit.
+    pub fn rmdir(&mut self, c: &Client, p: &str) {
+        let t = self.entry_tree(c);
+        let e = self.entries(&self.head(t));
+        assert!(
+            e.dirs.contains_key(p) && e.under(p).is_empty(),
+            "rmdir of {p}: no such directory, or it is not empty"
+        );
+        self.note(format!("rmdir {c:?} {t:?}:{p}"));
+        self.commit_records(c, t, Writes::from([(entries::dir_name(p), None)]));
+        self.trace_call(out_of_scope("directories"));
+    }
+
+    /// Rule 13: `chmod` or `chown` of the entry at `p`: its new metadata `meta`,
+    /// of the same kind, one commit. A file's record goes when it holds the
+    /// default ([`Meta::FILE`]), so a record is there only when it says something.
+    pub fn set_meta(&mut self, c: &Client, p: &str, meta: Meta) {
+        let t = self.entry_tree(c);
+        let at = self.head(t);
+        let e = self.entries(&at);
+        let (name, was) = if let Some(m) = e.dirs.get(p) {
+            (entries::dir_name(p), *m)
+        } else {
+            let f = self
+                .lookup(&at, p)
+                .unwrap_or_else(|| panic!("set_meta of {p}: no such entry"));
+            (entries::meta_name(&f), e.files[&f].1)
+        };
+        assert_eq!(
+            was.kind, meta.kind,
+            "set_meta of {p}: a kind changes only by a new file"
+        );
+        let text = (meta != Meta::FILE || name.starts_with(entries::DIR)).then(|| meta.text());
+        self.note(format!("set_meta {c:?} {t:?}:{p} {}", meta.text()));
+        self.commit_records(c, t, Writes::from([(name, text)]));
+        self.trace_call(out_of_scope("metadata"));
+    }
+
+    /// Rule 15: `symlink(target, p)`: a new file at `p` whose bytes are `target`
+    /// and whose kind is a link, made by one commit (its name line, its one line,
+    /// its metadata). None once every unborn identity is taken.
+    pub fn symlink(&mut self, c: &Client, p: &str, target: &str, meta: Meta) -> Option<String> {
+        let t = self.entry_tree(c);
+        let at = self.head(t);
+        let e = self.entries(&at);
+        assert!(
+            meta.kind == entries::Kind::Symlink,
+            "symlink {p} as {meta:?}"
+        );
+        assert!(
+            e.is_dir(entries::parent(p)) && e.at(p).is_empty(),
+            "symlink {p}: its directory is missing, or {p} exists"
+        );
+        let writer = self.who(c).0;
+        let save = self.recording.create_holding(
+            p,
+            target,
+            &writer,
+            Target::Tree(t),
+            &at,
+            &self.objects,
+        )?;
+        let f = save.set[0].path.clone();
+        self.note(format!("symlink {c:?} {t:?}:{p} -> {target} as {f}"));
+        self.commit_save_writing(
+            save,
+            &Writes::from([(entries::meta_name(&f), Some(meta.text()))]),
+        );
+        self.trace_call(out_of_scope("symlinks"));
+        Some(f)
+    }
+
+    /// Rule 14: `rename(from, to)` of a directory: one commit moving every entry
+    /// under it, each file a new version of its name line (rule 11), each
+    /// directory's record to its new path. `to` must not exist, lie in `from`, or
+    /// lack its own directory.
+    fn rename_dir(&mut self, c: &Client, from: &str, to: &str) {
+        let t = self.entry_tree(c);
+        let at = self.head(t);
+        let e = self.entries(&at);
+        let inside = |p: &str| p == from || p.starts_with(&format!("{from}/"));
+        assert!(
+            e.at(to).is_empty() && !inside(to) && e.is_dir(entries::parent(to)),
+            "rename of directory {from} to {to}: not a free path outside it"
+        );
+        let moved = |p: &str| format!("{to}{}", &p[from.len()..]);
+        let files: Vec<(String, String)> = e
+            .files
+            .iter()
+            .filter(|(_, (p, _))| inside(p))
+            .map(|(f, (p, _))| (f.clone(), moved(p)))
+            .collect();
+        let raw = self.records(&at);
+        let mut records = Writes::new();
+        for d in e.dirs.keys().filter(|d| inside(d)) {
+            let name = entries::dir_name(d);
+            records.insert(entries::dir_name(&moved(d)), raw.get(&name).cloned());
+            records.insert(name, None);
+        }
+        let writer = self.who(c).0;
+        let save = self
+            .recording
+            .rename_all(&files, &writer, Target::Tree(t), &at, &self.objects);
+        self.note(format!(
+            "rename directory {c:?} {t:?}:{from} to {to}: {files:?}"
+        ));
+        self.commit_save_writing(save, &records);
+        self.wake(t);
+        self.trace_call(out_of_scope("directories"));
     }
 
     /// A close or a client's death in `t`: each waiting entry there whose
@@ -2180,10 +2553,12 @@ impl World {
         self.wake(t);
     }
 
-    /// The files tree `tree` changes from commit `ours`.
+    /// The files tree `tree` changes from commit `ours`, by identity: records of
+    /// directories and metadata are not files.
     fn changed(&self, ours: &str, tree: &str) -> BTreeSet<String> {
         git(&self.repo, &["diff-tree", "-r", "--name-only", ours, tree])
             .lines()
+            .filter(|p| !entries::is_record(p))
             .map(str::to_string)
             .collect()
     }
@@ -2533,27 +2908,32 @@ impl World {
                 (t, files)
             })
             .collect();
-        let collisions = gather_collisions(self.collisions.iter().map(|c| {
-            let lost = self.file(&c.loser, &c.path);
-            let path = self
-                .file(&c.result, &c.path)
-                .path()
-                .or(lost.path())
-                .unwrap_or_default()
-                .to_string();
-            ShownCollision {
-                tree: c.tree,
-                path,
-                lost_bytes: c
-                    .lost
-                    .iter()
-                    .filter_map(|t| lost.lines.iter().find(|l| l.id == *t))
-                    .filter_map(|l| l.text())
-                    .map(|t| t.as_bytes().to_vec())
-                    .collect(),
-                whole: c.by == By::Whole,
-            }
-        }));
+        let collisions = gather_collisions(
+            self.collisions
+                .iter()
+                .filter(|c| !c.by.of_entry())
+                .map(|c| {
+                    let lost = self.file(&c.loser, &c.path);
+                    let path = self
+                        .file(&c.result, &c.path)
+                        .path()
+                        .or(lost.path())
+                        .unwrap_or_default()
+                        .to_string();
+                    ShownCollision {
+                        tree: c.tree,
+                        path,
+                        lost_bytes: c
+                            .lost
+                            .iter()
+                            .filter_map(|t| lost.lines.iter().find(|l| l.id == *t))
+                            .filter_map(|l| l.text())
+                            .map(|t| t.as_bytes().to_vec())
+                            .collect(),
+                        whole: c.by == By::Whole,
+                    }
+                }),
+        );
         Shown { trees, collisions }
     }
 

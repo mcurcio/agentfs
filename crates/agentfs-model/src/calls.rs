@@ -347,7 +347,16 @@ pub fn scope_of(trace: &[Recorded]) -> Scope {
         .unwrap_or(Scope::Phase1)
 }
 
-const REASONS: [&str; 5] = ["transaction", "outside", "nested-fork", "drop", "policy"];
+const REASONS: [&str; 8] = [
+    "transaction",
+    "outside",
+    "nested-fork",
+    "drop",
+    "policy",
+    "directories",
+    "metadata",
+    "symlinks",
+];
 
 /// The reason a world marks its trace out of scope: one of the list [`parse`]
 /// reads back.

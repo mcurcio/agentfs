@@ -435,3 +435,45 @@ of their day: "main" is the root, a "sandbox" is a fork, a "parent" is an upstre
   Approved by the owner, 2026-11-05 (approval page). A compaction keeps that fold: only the page writes memory still
   holds stay in the journal, so a recovery close never lays a closed open's page write over later saves
   (`a_compaction_keeps_a_closed_opens_page_write_out_of_recovery`, a unit test in `tree_actor/mod.rs`). Tests: `r12_a_crash_saves_every_open_from_the_journal`, `r12_a_crash_during_a_close_saves_the_open_once`, and on the real journal `a_step_killed_before_its_record_saves_at_restart`, `a_step_killed_after_its_record_is_not_saved_again`, `a_failed_save_keeps_serving_and_saves_at_the_next_step`
+
+## 10. Directories, metadata and links
+
+The owner, 2026-11-18, asked whether these rules may go into the ledger as approved (metadata as one value per file
+and directory, landing only over the value the writer saw; a directory is its path, a directory rename is one
+change, removing or moving a directory loses whole over entries its writer never saw; a symbolic link is a file
+whose content is its target; no file times in history), with hard links past the first, lines moved between files,
+non-UTF-8 names, devices, pipes, sockets and extended attributes left out: "Yes".
+
+- **R13** · approved · A file's or a directory's metadata is one value: its kind (file, symbolic link or
+  directory), its mode bits, its owner and its group. History records no file times. `chmod` and `chown` write a
+  new value. At the upstream's queue the change's new value lands when the upstream still holds the value its
+  writer saw (in the change's first parent), or already holds the same new value; otherwise the upstream's value
+  wins and the change loses whole (R3e), recorded as `metadata`. Making or removing an entry is a value too, so an
+  unlink loses to an upstream's `chmod` its writer never saw. A rename and a metadata change of one file both
+  apply: metadata follows the file's identity (R11). An atomic save (R11.2) carries the new file's metadata to the
+  file it rewrites. Owner, 2026-11-18: "Yes".
+  Tests: `r13_a_chmod_lands_over_the_value_it_saw`,
+  `r13_concurrent_chmods_the_upstream_wins_and_the_change_loses_whole`, `r13_the_same_new_value_agrees`,
+  `r13_a_rename_and_a_chmod_both_apply`, `r13_an_atomic_save_carries_the_new_files_metadata`
+- **R14** · approved · A directory is its path, with no identity. Two trees making one directory agree, and
+  different metadata is decided by R13. An empty directory is kept. Renaming a directory is one change: each file
+  under it gets a new name version (R11), and every directory under it moves. A change that removes or moves a
+  directory loses whole when the upstream has an entry under it that the change's first parent lacks, and a change
+  that moves a directory onto a path loses whole when the upstream has an entry there that the first parent
+  lacks; both are recorded as `directory-not-empty`. A change that adds or moves an entry into a directory loses
+  whole when the upstream no longer has that directory and the change did not make it, recorded as
+  `directory-gone`. A sync keeps the fork's undecided directory changes, and every directory one of its undecided
+  entries needs, until the upstream's queue decides them; a decided upstream `rmdir` or rename then reaches the
+  fork. In every tree every entry's parent is a directory there, and a path names at most one entry (invariant D1).
+  Owner, 2026-11-18: "Yes".
+  Tests: `r14_two_trees_make_one_directory_and_agree`, `r14_an_empty_directory_is_kept`,
+  `r14_renaming_a_directory_moves_everything_under_it_whole`,
+  `r14_removing_a_directory_the_upstream_filled_loses_whole`,
+  `r14_moving_a_directory_the_upstream_filled_loses_whole`, `r14_moving_onto_a_path_the_upstream_filled_loses_whole`,
+  `r14_a_create_into_a_directory_the_upstream_removed_loses_whole`,
+  `r14_a_sync_keeps_the_directory_of_an_undecided_entry`, `r14_an_upstream_rmdir_reaches_the_fork`
+- **R15** · approved · A symbolic link is a file whose bytes are its target and whose kind is a link; every file
+  rule applies to it. Of two concurrent retargets the upstream's wins. Replacing a file by a link changes its kind
+  (R13). Owner, 2026-11-18: "Yes".
+  Tests: `r15_a_link_is_a_file_whose_bytes_are_its_target`, `r15_concurrent_retargets_the_upstream_wins`,
+  `r15_replacing_a_file_by_a_link_changes_its_kind`

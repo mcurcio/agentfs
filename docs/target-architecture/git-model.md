@@ -613,6 +613,37 @@ sequenceDiagram
   A->>A: sync: x's commit decided by the root, take m and the root's line 4
 ```
 
+### Directories, metadata and links (rules 13, 14 and 15)
+
+The owner approved these rules on 2026-11-18 ("Yes"; the [rules ledger](rules-ledger.md), R13 to R15). In git
+terms, a tree holds two kinds of record beside its files' blobs: a file's metadata, keyed by its identity, and a
+directory's record, keyed by its path. History records no file times, as git records none.
+
+- **Metadata is one value.** An entry's kind (file, symbolic link, directory), mode bits, owner and group are one
+  value. `chmod` and `chown` write a new one in one commit. At the upstream's queue the change's value lands when the
+  upstream holds the value in the change's first parent (its writer saw it) or the same new value; otherwise the
+  upstream wins and the change loses whole (§7, rule 3e), recorded as `metadata`. Whether the entry is there is part
+  of the value, so an unlink loses to a `chmod` its writer never saw, and two trees making one directory with one
+  value agree. A file's metadata follows its identity, so a rename and a `chmod` both apply, and an atomic save carries
+  the new file's metadata to the file it rewrites.
+- **A directory is its path.** It has no identity: two trees that both run `mkdir -p cache` must agree, and an
+  identity would make one of them lose with everything later made under it. An empty directory is kept, as its own
+  record (git keeps none). A directory's rename is one commit: a new name version of every file under it (rule 11)
+  and every directory record under it moved. A change loses whole as `directory-not-empty` when it removes or moves a
+  directory under which the upstream has an entry its first parent lacks, or moves a directory onto a path where the
+  upstream has such an entry; and as `directory-gone` when it puts an entry into a directory the upstream no longer
+  has and did not make itself. The model also loses a change whole as `directory-not-empty` when it puts an entry
+  where the upstream has an entry of the other kind its writer never saw (*choice*).
+- **A sync decides nothing here either** (§8): the fork keeps its undecided metadata and directory records (the
+  commit that wrote them is one the upstream has not taken) and every directory one of its undecided entries needs;
+  everything else is the upstream's. A decided upstream `rmdir` or rename then reaches the fork.
+- **A symbolic link is a file** whose bytes are its target and whose kind is a link. Every file rule applies: of two
+  concurrent retargets the upstream's wins, and replacing a file by a link keeps the file's identity and changes its
+  kind.
+
+The model's layout is its own (MODEL.md, rule 13): `meta.<identity>` beside a file's blob when its value is not the
+default, `dir.<path>` per directory. The library's layout is the tree library's.
+
 ## 8. Sync: fetch, then fast-forward to the decided state
 
 A sync decides nothing (rule 3a). It reads the upstream's head as it is when taken, never the one current when
@@ -904,7 +935,9 @@ policy of this revision included. Every check runs after every step, in every sc
 | A take writes no file open in its tree or in that tree's open transaction, by the harness's reading of the opens (§6, §9) | `oracle_locks` | `r9_a_file_open_in_a_transaction_holds_back_the_forks_sync`, `r9_a_file_open_in_a_transaction_holds_back_a_landing_into_its_fork` |
 | Nested forks follow the same rules | all checks | `r4_nested_forks_follow_the_same_rules` |
 | Full lineage, read by ancestry alone: a tree's history reaches every change it took | `full_lineage` | `r7_every_fork_commit_lands_on_its_own_in_the_roots_history`, `r7_the_root_reaches_a_losing_commit_and_its_ref_keeps_it`, `random_interleavings_full_lineage` |
-| Trees converge when writes stop | `check_converged` | `convergence_when_writes_stop` |
+| Trees converge when writes stop, directories and metadata included | `check_converged` | `convergence_when_writes_stop` |
+| D1: every entry's parent is a directory of its tree, and a path names at most one entry, read from git in every live tree (§7, rule 14) | `d1_entries` | `r14_a_sync_keeps_the_directory_of_an_undecided_entry`, `r14_a_create_into_a_directory_the_upstream_removed_loses_whole`, every scenario |
+| A change's metadata and directory records land whole or not at all, and a loss by rule 13 or 14 has its cause in git (§7) | `entries_whole`, `upstream_wins`, `losers_pushed` | `r13_concurrent_chmods_the_upstream_wins_and_the_change_loses_whole`, `r14_removing_a_directory_the_upstream_filled_loses_whole`, `r14_moving_onto_a_path_the_upstream_filled_loses_whole` |
 | No clock decides anything | canonical text compare (`digest.rs`) | `r2_no_clock_commit_dates_decide_nothing`, `random_interleavings_commit_dates_decide_nothing` |
 
 Ignored (open findings): `finding_43_a_sync_hides_a_line_the_fork_deleted_in_a_lost_save`, `finding_1_git_merge_base_on_crossing_merges`, `random_interleavings_git_merge_base`,
@@ -995,8 +1028,11 @@ power loss, failed save or view-host restart.
 
 **Not modelled.** The first-in-first-out replay test of P1 (§6); power loss
 before an `fsync`, a failed save retried, and refusals at the write call (§3); question 2's sync; an offset write's
-base older than the head at close (§6); directories, hard links, a line
-moved between files, path `truncate(2)` and `mmap`; binary files beyond NUL bytes (the model's bytes are ASCII); approvals and landing timing;
+base older than the head at close (§6); hard links past the first, a line
+moved between files, names that are not UTF-8, devices, FIFOs, sockets and extended attributes, path `truncate(2)` and
+`mmap`; directories, metadata and links in the random runs (only scenarios make them), in or beside a transaction,
+and a sync that would put an upstream's entry under a directory the fork's undecided change removed (the model stops
+loudly); binary files beyond NUL bytes (the model's bytes are ASCII); approvals and landing timing;
 integrator patches; restarts beyond the crash's journal replay, and the actor (§3, §12); space limits; history truncation; views, rules, commit window.
 
 ## 17. The older pages

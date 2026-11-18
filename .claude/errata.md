@@ -1291,3 +1291,25 @@ Each is to become a bead; none is open as one yet.
    are visible in the actor before `durable_all` (safe by threading, not structure); `remove_stale_checkouts` refuses
    an open on an unremovable checkout (principle 5 at boot); `ViewHost::wait` after the release is bounded only by
    Kubernetes' grace period.
+
+## 2026-11-18, M2 S2 (the model's rules for directories, metadata and links): where the brief was short
+
+1. **A case the rules do not decide: an upstream's decided entry under a directory the fork's undecided change
+   removed or moved.** A fork runs `rmdir d` (or renames `d` away); before its upstream's queue takes that change,
+   the upstream makes `d/x`, and a sync reaches the fork first. R14 says a sync keeps the fork's undecided directory
+   change, so the fork has no `d`, and the upstream's `d/x` is decided, so the fork takes it: invariant D1 breaks.
+   The landing itself is decided (`directory-not-empty`, the fork loses whole), so the question is only what the fork
+   shows in between. Options: (a) as R11.1 does for two renames to one path, the fork shows its tree without the
+   upstream's clashing entry until the upstream decides (recommended: it is the existing rule's reading); (b) the
+   sync shows `d` again at once with the upstream's entry, undoing the fork's undecided change before the decision.
+   Not invented: the model stops loudly there (`entries::sync`, "not modelled"), the scenarios order their steps so
+   the landing is decided first, and MODEL.md's "Left out" says so. An owner question, not blocking S2.
+2. **The cause word for an entry onto a path where the upstream has an entry of the other kind** (a file created
+   where the upstream made a directory, or the reverse). The approved summary says such a move loses whole; the brief
+   named three causes. The model records it as `directory-not-empty`, marked a choice in MODEL.md and git-model.md.
+3. **The owner's answer of 2026-11-18 was already in OWNER-GUIDANCE.md**, under "One engine" with the sweep answer.
+   S2 moved the rules answer to "Saves, landings and shared mappings", as the brief asks, and left the sweep answer
+   where it was: one home each, no copy.
+4. **`R13` already appears in git-model.md §16**, as an old requirement id inside a quote of 2026-11-02 (with `R9`
+   beside it, also reused). The ledger check reads only `rule N` citations and ledger ids, so nothing clashes in a
+   check; R13 to R15 were taken as the brief's numbers.

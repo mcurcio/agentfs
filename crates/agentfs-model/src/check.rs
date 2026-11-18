@@ -16,6 +16,7 @@ use lineage::Lineage;
 
 use crate::calls::{Client, TreeId, TxnId};
 use crate::content::{Content, Line, PATHS, State, is_root, writer_of};
+use crate::entries::{self, Entries, Key, Raw};
 use crate::git::{git, try_git};
 use crate::mirror::Mirror;
 use crate::queue::{Entry, Take, name_key};
@@ -153,6 +154,8 @@ struct Checker {
     /// again only once a ref moved (or a new discard adds tokens).
     refs_seen: Option<String>,
     met: Met,
+    /// The heads invariant D1 has held for (commits never change).
+    d1_held: BTreeSet<String>,
 }
 
 /// How many of each of the world's records the checks have read.
@@ -160,6 +163,7 @@ struct Checker {
 struct Cursors {
     collisions: usize,
     landings: usize,
+    entry_landings: usize,
     syncs: usize,
     ended: usize,
     placements: usize,
@@ -196,7 +200,131 @@ impl Checker {
         named("full_lineage", self.full_lineage(w))?;
         named("placed_and_unlinked", self.placed_and_unlinked(w))?;
         named("no_joined_lines", no_joined_lines(w))?;
+        named("d1_entries", self.d1_entries(w))?;
+        named("entries_whole", self.entries_whole(w))?;
         Ok(())
+    }
+
+    /// Invariant D1, read from git: in every live tree, every entry's parent is
+    /// a directory of that tree, and no path names two entries
+    /// ([`Entries::d1`]).
+    fn d1_entries(&mut self, w: &World) -> Result<(), String> {
+        for t in w.live_trees() {
+            let head = w.head(t);
+            if self.d1_held.contains(&head) {
+                continue;
+            }
+            entries_at(w, &head)
+                .d1()
+                .map_err(|e| format!("{t:?} at {head:.7}: {e}"))?;
+            self.d1_held.insert(head);
+        }
+        Ok(())
+    }
+
+    /// Rule 3e for rules 13 and 14, read from git: a take that won writes the
+    /// records of directories and metadata its change wrote (against its base),
+    /// and no other; one that lost writes none.
+    fn entries_whole(&mut self, w: &World) -> Result<(), String> {
+        for l in &w.landings[self.read.entry_landings..] {
+            let records = |a: &str, b: &str| -> BTreeSet<String> {
+                git(w.repo(), &["diff-tree", "-r", "--name-only", a, b])
+                    .lines()
+                    .filter(|n| entries::is_record(n))
+                    .map(str::to_string)
+                    .collect()
+            };
+            let (wrote, took) = (records(&l.base, &l.change), records(&l.before, &l.result));
+            if wrote.is_empty() && took.is_empty() {
+                continue;
+            }
+            let read = |at: &str| entries::read_raw(w.repo(), at);
+            let (change, before, result) = (read(&l.change), read(&l.before), read(&l.result));
+            let mut want: Raw = before;
+            if l.won {
+                for n in &wrote {
+                    match change.get(n) {
+                        Some(t) => want.insert(n.clone(), t.clone()),
+                        None => want.remove(n),
+                    };
+                }
+            }
+            if result != want {
+                return Err(format!(
+                    "{:.7} into {:?} (won: {}) left the records {result:?}, not {want:?}",
+                    l.change, l.tree, l.won
+                ));
+            }
+        }
+        self.read.entry_landings = w.landings.len();
+        Ok(())
+    }
+}
+
+/// What commit `at` holds beside its files' lines (rules 13 to 15), read from git.
+fn entries_at(w: &World, at: &str) -> Entries {
+    Entries::read(
+        &entries::read_raw(w.repo(), at),
+        PATHS.iter().map(|f| (*f, w.file(at, f))),
+    )
+}
+
+/// Rules 13 and 14, read from git: collision `c`, a loss by one of them, has its
+/// cause there. Its losing change's value differs from the upstream's, which the
+/// change's writer never saw (rule 13); or the upstream had an entry there that
+/// the change's first parent lacked (rule 14, `directory-not-empty`); or the
+/// upstream lacks the directory the change put an entry into, which its first
+/// parent had (rule 14, `directory-gone`). The result keeps the upstream's.
+fn entry_lost(w: &World, c: &Collision) -> Result<(), String> {
+    let (Some(base), [lost], [won]) = (
+        commit_parents(w.repo(), &c.loser).first().cloned(),
+        &c.lost[..],
+        &c.won[..],
+    ) else {
+        return Err(format!("{c:?}: not one lost and one won entry"));
+    };
+    let (b, t, o, r) = (
+        entries_at(w, &base),
+        entries_at(w, &c.loser),
+        entries_at(w, &c.winner),
+        entries_at(w, &c.result),
+    );
+    let real = match c.by {
+        By::Metadata => {
+            let k = match c.path.strip_suffix('/') {
+                Some(d) => Key::Dir(d.to_string()),
+                None => Key::File(c.path.clone()),
+            };
+            let text = |e: &Entries| entries::value_text(e.value(&k));
+            text(&t) == *lost
+                && text(&o) == *won
+                && text(&b) != *won
+                && lost != won
+                && text(&r) == *won
+        }
+        By::DirectoryNotEmpty => {
+            let seen: BTreeSet<entries::Entry> = b.all().into_iter().collect();
+            o.at(won)
+                .into_iter()
+                .any(|x| !seen.contains(&x) && r.at(won).contains(&x))
+        }
+        By::DirectoryGone => {
+            let d = c.path.strip_suffix('/').unwrap_or(&c.path);
+            !o.is_dir(d)
+                && !r.is_dir(d)
+                && b.is_dir(d)
+                && entries::parent(lost) == d
+                && !t.at(lost).is_empty()
+        }
+        By::Line | By::File | By::Whole => false,
+    };
+    if real {
+        Ok(())
+    } else {
+        Err(format!(
+            "{c:?}: git shows no {} collision there",
+            c.by.word()
+        ))
     }
 }
 
@@ -525,9 +653,12 @@ fn lock_keys(w: &World, a: &str, b: &str) -> BTreeSet<String> {
     files.into_iter().chain(names).collect()
 }
 
+/// The files (by identity) that differ from `a` to `b`: records of directories and
+/// metadata are not files, and lock nothing.
 fn diff_files(w: &World, a: &str, b: &str) -> BTreeSet<String> {
     git(w.repo(), &["diff-tree", "-r", "--name-only", a, b])
         .lines()
+        .filter(|n| !entries::is_record(n))
         .map(str::to_string)
         .collect()
 }
@@ -561,7 +692,14 @@ fn drained(w: &HistoryService) -> Result<(), String> {
 }
 
 fn trees_equal_root(w: &World) -> Result<(), String> {
+    let root = entries::read_raw(w.repo(), &w.head(TreeId::ROOT));
     for t in w.live_trees() {
+        let mine = entries::read_raw(w.repo(), &w.head(t));
+        if mine != root {
+            return Err(format!(
+                "{t:?}'s directories and metadata never converged: {mine:?} vs the root's {root:?}"
+            ));
+        }
         for p in PATHS {
             let (mine, root) = (w.file(&w.head(t), p), w.file(&w.head(TreeId::ROOT), p));
             if mine != root {
@@ -671,17 +809,21 @@ impl Checker {
 
     /// The change collision `c` names really collided in that take: a
     /// same-line or file-rule record of it ([`By::Line`], [`By::File`]) has a
-    /// lost version and a winner that are concurrent.
+    /// lost version and a winner that are concurrent, or a record of it by rule
+    /// 13 or 14 is there, which [`Self::upstream_wins`] holds to git
+    /// ([`entry_lost`]).
     fn really_collided(&self, w: &World, c: &Collision) -> bool {
         w.collisions.iter().any(|d| {
             d.tree == c.tree
                 && d.result == c.result
                 && d.loser == c.loser
                 && d.by != By::Whole
-                && d.lost
-                    .iter()
-                    .zip(&d.won)
-                    .any(|(x, y)| self.concurrent(x, y))
+                // excuse: R13 a loss by rule 13 or 14 is real when git shows its cause
+                && (d.by.of_entry()
+                    || d.lost
+                        .iter()
+                        .zip(&d.won)
+                        .any(|(x, y)| self.concurrent(x, y)))
         })
     }
 
@@ -708,6 +850,8 @@ impl Checker {
                             && match c.by {
                                 By::Whole => self.really_collided(w, c),
                                 By::Line | By::File => self.concurrent(x, won),
+                                // A loss by rule 13 or 14 names an entry, never a line.
+                                By::Metadata | By::DirectoryNotEmpty | By::DirectoryGone => false,
                             }
                     })
         })
@@ -877,6 +1021,11 @@ impl Checker {
                     w.trailer(&c.loser, "Agentfs-Tree"),
                 ));
             }
+            if c.by.of_entry() {
+                entry_lost(w, c)?;
+                Self::recorded(w, c)?;
+                continue;
+            }
             let (r, win, lose) = (
                 w.file(&c.result, &c.path),
                 w.file(&c.winner, &c.path),
@@ -902,6 +1051,9 @@ impl Checker {
                 By::File => pairs.any(|(x, y)| self.concurrent(x, y)),
                 // excuse: R3e a line lost with its change needs a real collision of that change
                 By::Whole => self.really_collided(w, c),
+                By::Metadata | By::DirectoryNotEmpty | By::DirectoryGone => {
+                    unreachable!("a loss by rule 13 or 14 is read by entry_lost")
+                }
             };
             if !real {
                 return Err(format!(
@@ -911,6 +1063,17 @@ impl Checker {
             if let Some(t) = c.lost.iter().find(|t| !lose.holds(t)) {
                 return Err(format!("{c:?}: lost {t} is not in the incoming commit"));
             }
+            Self::recorded(w, c)?;
+        }
+        self.read.collisions = w.collisions.len();
+        Ok(())
+    }
+
+    /// Collision `c` is kept and recorded: its ref names the losing change, its
+    /// result commit records it, and that commit's parents are the tree's head
+    /// before and the losing change.
+    fn recorded(w: &World, c: &Collision) -> Result<(), String> {
+        {
             // A missing ref is this check failing, not the harness: read it without panicking.
             let at = try_git(
                 w.repo(),
@@ -937,7 +1100,6 @@ impl Checker {
                 return Err(format!("{c:?}: result's parents are {parents:?}"));
             }
         }
-        self.read.collisions = w.collisions.len();
         Ok(())
     }
 
@@ -1051,6 +1213,10 @@ fn losers_pushed(w: &World, m: &Mirror) -> Result<(), String> {
                 at.stdout.trim()
             ));
         }
+        if c.by != By::Line.word() && c.by != By::File.word() && c.by != By::Whole.word() {
+            remote_entry_lost(remote, c)?;
+            continue;
+        }
         let file = Content::parse(&git(
             remote,
             &["cat-file", "-p", &format!("{}:{}", c.reference, c.path)],
@@ -1084,6 +1250,48 @@ fn losers_pushed(w: &World, m: &Mirror) -> Result<(), String> {
                 ));
             }
         }
+    }
+    Ok(())
+}
+
+/// [`losers_pushed`] for a loss by rule 13 or 14, read from the mirror alone: the
+/// losing change there holds what the record says it lost (the metadata value, or
+/// the entry a `directory-gone` put), and names one writer.
+fn remote_entry_lost(remote: &Path, c: &Decision) -> Result<(), String> {
+    let r = &c.reference;
+    let files = PATHS.iter().map(|f| {
+        let text = git(remote, &["cat-file", "-p", &format!("{r}:{f}")]);
+        (
+            *f,
+            Content::parse(&text).expect("a model file on the remote"),
+        )
+    });
+    let e = Entries::read(&entries::read_raw(remote, r), files);
+    let lost = c.lost.first().map(String::as_str).unwrap_or_default();
+    let holds = match c.by.as_str() {
+        "metadata" => {
+            let k = match c.path.strip_suffix('/') {
+                Some(d) => Key::Dir(d.to_string()),
+                None => Key::File(c.path.clone()),
+            };
+            entries::value_text(e.value(&k)) == lost
+        }
+        "directory-gone" => !e.at(lost).is_empty(),
+        _ => true,
+    };
+    let by = git(
+        remote,
+        &[
+            "log",
+            "-1",
+            "--format=%(trailers:key=Agentfs-Writer,valueonly)",
+            r,
+        ],
+    );
+    if !holds || by.lines().filter(|l| !l.is_empty()).count() != 1 {
+        return Err(format!(
+            "{c:?}: on the remote, its losing change does not hold {lost} or names writers {by:?}"
+        ));
     }
     Ok(())
 }

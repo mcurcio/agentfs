@@ -9,8 +9,11 @@ use super::{By, Lineage, Lines, Lost, Plan, Referee, Verdict, key};
 impl<L: Lineage + ?Sized> Referee<'_, L> {
     /// A landing's plan: if any version lost, every other version loses
     /// `By::Whole` to the first loss's winner and none applies; else the
-    /// applied versions are placed in the order `tip` has them.
-    pub(super) fn whole(&self, ours: &str, tip: &str, lines: &Lines<'_>) -> Plan {
+    /// applied versions are placed in the order `tip` has them. `entry_lost`: the
+    /// change lost by rule 13 or 14, so with no version lost, each loses
+    /// `By::Whole` to the upstream's version of its line, or of the file's name
+    /// line where the upstream has no version of it.
+    pub(super) fn whole(&self, ours: &str, tip: &str, lines: &Lines<'_>, entry_lost: bool) -> Plan {
         let by_path = &lines.by_path;
         let verdicts = &lines.verdicts;
         let by_file = &lines.by_file;
@@ -46,9 +49,13 @@ impl<L: Lineage + ?Sized> Referee<'_, L> {
             for i in ins {
                 let (into, won) = match (&verdicts[&key(i)], &decider) {
                     (Verdict::Drop, _) => continue,
-                    (Verdict::Apply, None) => {
+                    (Verdict::Apply, None) if !entry_lost => {
                         applied.push(i.version.clone());
                         continue;
+                    }
+                    (Verdict::Apply, None) => {
+                        let up = cur.member(&i.version.line).unwrap_or(&cur.name);
+                        (&mut whole, up.id.clone())
                     }
                     (Verdict::Apply, Some(d)) => (&mut whole, d.clone()),
                     (Verdict::Lose(won), _) => (&mut real, won.clone()),

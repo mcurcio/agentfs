@@ -46,6 +46,7 @@ pub mod calls;
 pub mod check;
 pub mod content;
 pub mod digest;
+pub mod entries;
 pub mod git;
 pub mod mirror;
 pub mod program;
