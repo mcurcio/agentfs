@@ -41,12 +41,11 @@ Smaller slices, one page each:
 
 | Slice | Page |
 |---|---|
-| Moving every launcher onto the tree views and deleting the recording engine: milestones M2 to M9 (M1 is built), the baseline, the deferred extras | [One engine](future/one-engine.md) |
+| Moving every launcher onto the tree views and deleting the recording engine: milestones M3 to M9 (M1 and M2 are built), the baseline, the deferred extras | [One engine](future/one-engine.md) |
 | Cutting the tree actor into six modules | [Module cut](future/module-cut.md) |
 | The name the root is published under, apart from its identity | [Root branch name](future/root-branch-name.md) |
 | Transactions | [Transactions](future/transactions.md) |
 | Nested forks on trees | [Nested forks](future/nested-forks.md) |
-| Directories, symlinks, non-UTF-8 names and more links in the tree views | [Beyond flat files](future/tree-views-beyond-flat-files.md) |
 | Telemetry export from the tree views | [Tree-view telemetry](future/tree-view-telemetry.md) |
 | Landing approvals and timing on trees | [Landing approvals](future/landing-approvals.md) |
 | Integrator patches, restore and revert on trees | [Integrator patches](future/integrator-patches.md) |

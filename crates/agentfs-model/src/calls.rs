@@ -16,11 +16,19 @@
 //! locks its files and writes them, and no call runs in between. So the trace
 //! is the order the calls ran in, and the trees are compared after every call.
 //!
+//! Directories, metadata and links (MODEL.md rules 13 to 15) are calls too:
+//! [`TreeCalls::mkdir`], [`TreeCalls::rmdir`], [`TreeCalls::set_meta`] and
+//! [`TreeCalls::symlink`], with a directory's rename a [`TreeCalls::rename`].
+//! [`Shown`] carries each tree's directories and every file's metadata that is not
+//! a created file's, and each loss by rules 13 and 14 with its cause.
+//!
 //! This crate has no dependencies, so [`CallError`] is written by hand and the
 //! trace format is [`render`] and [`parse`], one line per call with hex bytes.
 
 use std::collections::BTreeMap;
 use std::fmt;
+
+pub use crate::entries::{Cause, Kind, Meta};
 
 /// Who makes a call: one of the root's programs, or a fork's.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -133,13 +141,33 @@ pub trait TreeCalls {
     fn truncate(&mut self, h: Self::Open, size: u64) -> Result<(), CallError>;
     fn close(&mut self, h: Self::Open) -> Result<(), CallError>;
     fn unlink(&mut self, c: &Caller, path: &str) -> Result<(), CallError>;
+    /// A file's rename, or a directory's with everything under it (rule 14).
     fn rename(&mut self, c: &Caller, from: &str, to: &str) -> Result<(), CallError>;
     fn end_client(&mut self, c: &Caller) -> Result<(), CallError>;
     /// One take, whole: the first entry the tree's queue lets go, written.
     fn take_next(&mut self, t: TreeId) -> Result<Took, CallError>;
     fn crash(&mut self) -> Result<(), CallError>;
+    /// Rule 14: a directory at `path` with metadata `meta`.
+    fn mkdir(&mut self, c: &Caller, path: &str, meta: &Meta) -> Result<(), CallError>;
+    /// Rule 14: the empty directory at `path` removed.
+    fn rmdir(&mut self, c: &Caller, path: &str) -> Result<(), CallError>;
+    /// Rule 13: the entry at `path` given metadata `meta` (`chmod` and `chown`).
+    fn set_meta(&mut self, c: &Caller, path: &str, meta: &Meta) -> Result<(), CallError>;
+    /// Rule 15: a link at `path` to `target`, with metadata `meta`.
+    fn symlink(
+        &mut self,
+        c: &Caller,
+        path: &str,
+        target: &str,
+        meta: &Meta,
+    ) -> Result<(), CallError>;
+    /// A file's bytes (a link's: its target); none for no file at `path`.
     fn read(&self, t: TreeId, path: &str) -> Result<Option<Vec<u8>>, CallError>;
+    /// Every file and link, by path; directories are [`TreeCalls::entries`]'.
     fn paths(&self, t: TreeId) -> Result<Vec<String>, CallError>;
+    /// Every entry, by path, with its metadata: each file, link and directory,
+    /// the root directory excluded.
+    fn entries(&self, t: TreeId) -> Result<Vec<(String, Meta)>, CallError>;
 }
 
 /// One call. `h` is the model's number for an open: [`replay`] keeps the map.
@@ -201,6 +229,26 @@ pub enum RecordedCall {
         took: Took,
     },
     Crash,
+    Mkdir {
+        caller: Caller,
+        path: String,
+        meta: Meta,
+    },
+    Rmdir {
+        caller: Caller,
+        path: String,
+    },
+    SetMeta {
+        caller: Caller,
+        path: String,
+        meta: Meta,
+    },
+    Symlink {
+        caller: Caller,
+        path: String,
+        target: String,
+        meta: Meta,
+    },
     /// Something phase 1 does not build happened in this trace.
     OutOfScope(&'static str),
 }
@@ -280,16 +328,52 @@ impl Sink for Recorder {
 pub trait History<T: ?Sized> {
     /// Every collision so far, as [`gather_collisions`] gives them.
     fn collisions(&mut self, system: &T) -> Result<Vec<ShownCollision>, CallError>;
+    /// Every loss by rules 13 and 14 so far, as [`gather_entry_collisions`]
+    /// gives them.
+    fn entry_collisions(&mut self, system: &T) -> Result<Vec<EntryCollision>, CallError>;
     /// Tree `t`'s head: its `Agentfs-Cause` trailer and its number of parents
     /// (R6.1, R6.2).
     fn head(&mut self, system: &T, t: TreeId) -> Result<(String, usize), CallError>;
 }
 
-/// What the trees show: each tree's files by path, and every collision so far.
+/// What the trees show: each tree's files by path, its directories and the
+/// metadata of its entries that is not a created file's, and every collision so
+/// far.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Shown {
     pub trees: BTreeMap<TreeId, BTreeMap<String, Vec<u8>>>,
+    /// Each tree's directories, and each file or link whose metadata is not
+    /// [`Meta::FILE`], by path ([`shown_entries`]). A tree with none is absent.
+    pub entries: BTreeMap<TreeId, BTreeMap<String, Meta>>,
     pub collisions: Vec<ShownCollision>,
+    /// Every loss by rules 13 and 14 so far ([`gather_entry_collisions`]).
+    pub entry_collisions: Vec<EntryCollision>,
+}
+
+/// One loss by rule 13 or 14 in one tree: its cause and the entry it is about,
+/// a file's or link's path, or a directory's path and a `/`. A change's other
+/// losses (its lines', rule 3e) are [`ShownCollision`]s.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct EntryCollision {
+    pub tree: TreeId,
+    pub cause: Cause,
+    pub path: String,
+}
+
+/// Gathers entry losses into the form [`Shown`] compares: sorted, each once.
+pub fn gather_entry_collisions(
+    lost: impl IntoIterator<Item = EntryCollision>,
+) -> Vec<EntryCollision> {
+    let mut all: Vec<EntryCollision> = lost.into_iter().collect();
+    all.sort();
+    all.dedup();
+    all
+}
+
+/// What [`Shown::entries`] keeps of a tree's entries: its directories, and each
+/// file or link whose metadata is not [`Meta::FILE`].
+pub fn shown_entries(all: impl IntoIterator<Item = (String, Meta)>) -> BTreeMap<String, Meta> {
+    all.into_iter().filter(|(_, m)| *m != Meta::FILE).collect()
 }
 
 /// One file's lost lines in one tree: the lines that lost to a collision, or
@@ -347,16 +431,7 @@ pub fn scope_of(trace: &[Recorded]) -> Scope {
         .unwrap_or(Scope::Phase1)
 }
 
-const REASONS: [&str; 8] = [
-    "transaction",
-    "outside",
-    "nested-fork",
-    "drop",
-    "policy",
-    "directories",
-    "metadata",
-    "symlinks",
-];
+const REASONS: [&str; 5] = ["transaction", "outside", "nested-fork", "drop", "policy"];
 
 /// The reason a world marks its trace out of scope: one of the list [`parse`]
 /// reads back.
@@ -484,8 +559,37 @@ fn render_call(c: &RecordedCall) -> String {
             format!("take {} {took}", tree(*t))
         }
         RecordedCall::Crash => "crash".into(),
+        RecordedCall::Mkdir {
+            caller: c,
+            path,
+            meta,
+        } => format!("mkdir {} {} {}", caller(c), path_text(path), meta.text()),
+        RecordedCall::Rmdir { caller: c, path } => {
+            format!("rmdir {} {}", caller(c), path_text(path))
+        }
+        RecordedCall::SetMeta {
+            caller: c,
+            path,
+            meta,
+        } => format!("set-meta {} {} {}", caller(c), path_text(path), meta.text()),
+        RecordedCall::Symlink {
+            caller: c,
+            path,
+            target,
+            meta,
+        } => format!(
+            "symlink {} {} {} {}",
+            caller(c),
+            path_text(path),
+            path_text(target),
+            meta.text()
+        ),
         RecordedCall::OutOfScope(why) => format!("out {why}"),
     }
+}
+
+fn parse_meta(s: &str) -> Result<Meta, CallError> {
+    Meta::parse(s).ok_or_else(|| CallError::new(format!("bad metadata {s:?}")))
 }
 
 fn parse_call(s: &str) -> Result<RecordedCall, CallError> {
@@ -545,6 +649,26 @@ fn parse_call(s: &str) -> Result<RecordedCall, CallError> {
             },
         },
         ["crash"] => RecordedCall::Crash,
+        ["mkdir", c, p, m] => RecordedCall::Mkdir {
+            caller: parse_caller(c)?,
+            path: parse_path(p)?,
+            meta: parse_meta(m)?,
+        },
+        ["rmdir", c, p] => RecordedCall::Rmdir {
+            caller: parse_caller(c)?,
+            path: parse_path(p)?,
+        },
+        ["set-meta", c, p, m] => RecordedCall::SetMeta {
+            caller: parse_caller(c)?,
+            path: parse_path(p)?,
+            meta: parse_meta(m)?,
+        },
+        ["symlink", c, p, t, m] => RecordedCall::Symlink {
+            caller: parse_caller(c)?,
+            path: parse_path(p)?,
+            target: parse_path(t)?,
+            meta: parse_meta(m)?,
+        },
         ["out", why] => {
             RecordedCall::OutOfScope(REASONS.iter().copied().find(|r| r == why).ok_or_else(bad)?)
         }
@@ -552,13 +676,24 @@ fn parse_call(s: &str) -> Result<RecordedCall, CallError> {
     })
 }
 
+/// A tree's part: ` <path>=<bytes>` for each file, with `@<meta>` after its
+/// bytes when [`Shown::entries`] holds its metadata, then ` <path>=<meta>` for
+/// each other entry there (a directory). Bytes start with `x`, metadata never.
 fn render_shown(s: &Shown) -> String {
     let mut out = String::new();
+    let none = BTreeMap::new();
     for (t, files) in &s.trees {
         out.push_str(" t ");
         out.push_str(&tree(*t));
+        let entries = s.entries.get(t).unwrap_or(&none);
         for (p, b) in files {
             out.push_str(&format!(" {}={}", path_text(p), hex(b)));
+            if let Some(m) = entries.get(p) {
+                out.push_str(&format!("@{}", m.text()));
+            }
+        }
+        for (p, m) in entries.iter().filter(|(p, _)| !files.contains_key(*p)) {
+            out.push_str(&format!(" {}={}", path_text(p), m.text()));
         }
     }
     for c in &s.collisions {
@@ -573,6 +708,14 @@ fn render_shown(s: &Shown) -> String {
             out.push_str(&hex(b));
         }
     }
+    for c in &s.entry_collisions {
+        out.push_str(&format!(
+            " e {} {} {}",
+            tree(c.tree),
+            c.cause.word(),
+            path_text(&c.path)
+        ));
+    }
     out
 }
 
@@ -584,11 +727,40 @@ fn parse_shown(s: &str) -> Result<Shown, CallError> {
         match kind {
             "t" => {
                 let t = parse_tree(f.next().ok_or_else(bad)?)?;
-                let files = shown.trees.entry(t).or_default();
+                shown.trees.entry(t).or_default();
                 while let Some(x) = f.next_if(|x| x.contains('=')) {
-                    let (p, b) = x.split_once('=').ok_or_else(bad)?;
-                    files.insert(parse_path(p)?, unhex(b)?);
+                    let (p, v) = x.split_once('=').ok_or_else(bad)?;
+                    let p = parse_path(p)?;
+                    let (bytes, meta) = match v.split_once('@') {
+                        Some((b, m)) => (Some(b), Some(m)),
+                        None if v.starts_with('x') => (Some(v), None),
+                        None => (None, Some(v)),
+                    };
+                    if let Some(b) = bytes {
+                        shown
+                            .trees
+                            .entry(t)
+                            .or_default()
+                            .insert(p.clone(), unhex(b)?);
+                    }
+                    if let Some(m) = meta {
+                        shown
+                            .entries
+                            .entry(t)
+                            .or_default()
+                            .insert(p, parse_meta(m)?);
+                    }
                 }
+            }
+            "e" => {
+                let t = parse_tree(f.next().ok_or_else(bad)?)?;
+                let cause = Cause::from_word(f.next().ok_or_else(bad)?).ok_or_else(bad)?;
+                let path = parse_path(f.next().ok_or_else(bad)?)?;
+                shown.entry_collisions.push(EntryCollision {
+                    tree: t,
+                    cause,
+                    path,
+                });
             }
             "c" => {
                 let t = parse_tree(f.next().ok_or_else(bad)?)?;
@@ -674,12 +846,15 @@ pub fn parse(text: &str) -> Result<Vec<Recorded>, CallError> {
         .collect()
 }
 
+/// Each tree's files by path, and what [`Shown::entries`] keeps of its entries.
+type Trees = (
+    BTreeMap<TreeId, BTreeMap<String, Vec<u8>>>,
+    BTreeMap<TreeId, BTreeMap<String, Meta>>,
+);
+
 /// Every tree in `trees`, by path, as `t` shows it.
-fn read_trees<T: TreeCalls>(
-    t: &T,
-    trees: &[TreeId],
-) -> Result<BTreeMap<TreeId, BTreeMap<String, Vec<u8>>>, CallError> {
-    let mut out = BTreeMap::new();
+fn read_trees<T: TreeCalls>(t: &T, trees: &[TreeId]) -> Result<Trees, CallError> {
+    let (mut out, mut metas) = (BTreeMap::new(), BTreeMap::new());
     for id in trees {
         let mut files = BTreeMap::new();
         for p in t.paths(*id)? {
@@ -688,8 +863,12 @@ fn read_trees<T: TreeCalls>(
             }
         }
         out.insert(*id, files);
+        let entries = shown_entries(t.entries(*id)?);
+        if !entries.is_empty() {
+            metas.insert(*id, entries);
+        }
     }
-    Ok(out)
+    Ok((out, metas))
 }
 
 /// The first tree the trace lists that `got` shows otherwise.
@@ -715,11 +894,34 @@ fn compare_trees(got: &Shown, want: &Shown) -> Result<(), String> {
                 ));
             }
         }
+        let none = BTreeMap::new();
+        let (shows, wants) = (
+            got.entries.get(id).unwrap_or(&none),
+            want.entries.get(id).unwrap_or(&none),
+        );
+        if shows != wants {
+            let text = |m: &BTreeMap<String, Meta>| {
+                m.iter()
+                    .map(|(p, m)| format!("{p}={}", m.text()))
+                    .collect::<Vec<_>>()
+            };
+            return Err(format!(
+                "{id:?} shows directories and metadata {:?}, the trace {:?}",
+                text(shows),
+                text(wants)
+            ));
+        }
     }
     if got.collisions != want.collisions {
         return Err(format!(
             "collisions: the system recorded {:?}, the trace {:?}",
             got.collisions, want.collisions
+        ));
+    }
+    if got.entry_collisions != want.entry_collisions {
+        return Err(format!(
+            "entry collisions: the system recorded {:?}, the trace {:?}",
+            got.entry_collisions, want.entry_collisions
         ));
     }
     Ok(())
@@ -801,6 +1003,15 @@ fn make_call<T: TreeCalls>(
             opens.clear();
             crashed
         }
+        RecordedCall::Mkdir { caller, path, meta } => t.mkdir(caller, path, meta),
+        RecordedCall::Rmdir { caller, path } => t.rmdir(caller, path),
+        RecordedCall::SetMeta { caller, path, meta } => t.set_meta(caller, path, meta),
+        RecordedCall::Symlink {
+            caller,
+            path,
+            target,
+            meta,
+        } => t.symlink(caller, path, target, meta),
         RecordedCall::OutOfScope(why) => return Err(format!("out of scope: {why}")),
     };
     Ok((want.clone(), result))
@@ -860,10 +1071,12 @@ pub fn replay<T: TreeCalls, H: History<T>, S: Sink + ?Sized>(
         let at = |e: &dyn fmt::Display| format!("call {i} ({}): {e}", render_call(&want.call));
         let (call, result) =
             make_call(&want.call, system, &mut opens, &mut trees).map_err(|e| at(&e))?;
-        let shown = read_trees(system, &trees).and_then(|trees| {
+        let shown = read_trees(system, &trees).and_then(|(trees, entries)| {
             Ok(Shown {
                 trees,
+                entries,
                 collisions: history.collisions(system)?,
+                entry_collisions: history.entry_collisions(system)?,
             })
         });
         let head = match call {
@@ -913,12 +1126,14 @@ mod tests {
                 ),
                 (TreeId::new(2), BTreeMap::from([("c".into(), Vec::new())])),
             ]),
+            entries: BTreeMap::new(),
             collisions: vec![ShownCollision {
                 tree: TreeId::ROOT,
                 path: "a".into(),
                 lost_bytes: vec![b"x\n".to_vec(), Vec::new()],
                 whole: true,
             }],
+            entry_collisions: Vec::new(),
         };
         let calls = vec![
             RecordedCall::Fork { id: TreeId::new(1) },
@@ -979,6 +1194,100 @@ mod tests {
         assert!(text.contains("crash !-\n"), "{text}");
         assert_eq!(parse(&render(&trace)).unwrap(), trace);
         assert_eq!(scope_of(&trace), Scope::OutOfScope("drop"));
+    }
+
+    /// Every call of rules 13 to 15 prints and parses back to itself, and so do a
+    /// tree's directories, its files' metadata and an entry's collision.
+    #[test]
+    fn directory_metadata_and_link_calls_read_back_as_they_were_written() {
+        let fork = Caller::Fork(TreeId::new(1));
+        let root = Caller::Root("m 1".into());
+        let calls = [
+            RecordedCall::Mkdir {
+                caller: fork.clone(),
+                path: "q/s p".into(),
+                meta: Meta::dir(0o2775, 0, 100),
+            },
+            RecordedCall::Rmdir {
+                caller: root.clone(),
+                path: "q".into(),
+            },
+            RecordedCall::SetMeta {
+                caller: root.clone(),
+                path: "a".into(),
+                meta: Meta::file(0o4755, 1000, 1001),
+            },
+            RecordedCall::SetMeta {
+                caller: fork.clone(),
+                path: "q".into(),
+                meta: Meta::dir(0o700, 7, 7),
+            },
+            RecordedCall::Symlink {
+                caller: fork,
+                path: "l".into(),
+                target: "../a b".into(),
+                meta: Meta::symlink(1000, 1000),
+            },
+            RecordedCall::Rename {
+                caller: root,
+                from: "q".into(),
+                to: "e".into(),
+            },
+        ];
+        let shown = Shown {
+            trees: BTreeMap::from([
+                (
+                    TreeId::ROOT,
+                    BTreeMap::from([
+                        ("a".into(), b"-\n".to_vec()),
+                        ("l".into(), b"a".to_vec()),
+                        ("q/x".into(), Vec::new()),
+                    ]),
+                ),
+                (TreeId::new(1), BTreeMap::new()),
+            ]),
+            entries: BTreeMap::from([(
+                TreeId::ROOT,
+                BTreeMap::from([
+                    ("l".into(), Meta::symlink(0, 0)),
+                    ("q".into(), Meta::dir(0o755, 0, 0)),
+                    ("q/x".into(), Meta::file(0o600, 1, 2)),
+                ]),
+            )]),
+            collisions: Vec::new(),
+            entry_collisions: vec![
+                EntryCollision {
+                    tree: TreeId::ROOT,
+                    cause: Cause::DirectoryGone,
+                    path: "q/".into(),
+                },
+                EntryCollision {
+                    tree: TreeId::ROOT,
+                    cause: Cause::Metadata,
+                    path: "a".into(),
+                },
+                EntryCollision {
+                    tree: TreeId::new(1),
+                    cause: Cause::DirectoryNotEmpty,
+                    path: "e/".into(),
+                },
+            ],
+        };
+        let trace: Vec<Recorded> = calls
+            .into_iter()
+            .map(|call| Recorded {
+                call,
+                failed: None,
+                shown: Some(shown.clone()),
+                head: None,
+            })
+            .collect();
+        let text = render(&trace);
+        assert!(text.starts_with("mkdir f:1 "), "{text}");
+        assert!(text.contains(" e t0 directory-gone "), "{text}");
+        assert_eq!(parse(&text).unwrap(), trace);
+        assert_eq!(scope_of(&trace), Scope::Phase1);
+        assert!(parse_call("out directories").is_err(), "a call now");
     }
 
     #[test]
@@ -1061,11 +1370,26 @@ mod tests {
         fn crash(&mut self) -> Result<(), CallError> {
             Ok(())
         }
+        fn mkdir(&mut self, _: &Caller, _: &str, _: &Meta) -> Result<(), CallError> {
+            Ok(())
+        }
+        fn rmdir(&mut self, _: &Caller, _: &str) -> Result<(), CallError> {
+            Ok(())
+        }
+        fn set_meta(&mut self, _: &Caller, _: &str, _: &Meta) -> Result<(), CallError> {
+            Ok(())
+        }
+        fn symlink(&mut self, _: &Caller, _: &str, _: &str, _: &Meta) -> Result<(), CallError> {
+            Ok(())
+        }
         fn read(&self, _: TreeId, path: &str) -> Result<Option<Vec<u8>>, CallError> {
             Ok((path == "a").then(|| b"-\n".to_vec()))
         }
         fn paths(&self, _: TreeId) -> Result<Vec<String>, CallError> {
             Ok(vec!["a".into()])
+        }
+        fn entries(&self, _: TreeId) -> Result<Vec<(String, Meta)>, CallError> {
+            Ok(vec![("a".into(), Meta::FILE)])
         }
     }
 
@@ -1074,6 +1398,9 @@ mod tests {
 
     impl History<Scripted> for Merges {
         fn collisions(&mut self, _: &Scripted) -> Result<Vec<ShownCollision>, CallError> {
+            Ok(Vec::new())
+        }
+        fn entry_collisions(&mut self, _: &Scripted) -> Result<Vec<EntryCollision>, CallError> {
             Ok(Vec::new())
         }
         fn head(&mut self, _: &Scripted, _: TreeId) -> Result<(String, usize), CallError> {
@@ -1139,7 +1466,7 @@ mod tests {
         let files = BTreeMap::from([("a".to_owned(), b"-\n".to_vec())]);
         let shown = Shown {
             trees: BTreeMap::from([(TreeId::ROOT, files.clone()), (t1, files)]),
-            collisions: Vec::new(),
+            ..Shown::default()
         };
         let want: Vec<Recorded> = trace
             .iter()

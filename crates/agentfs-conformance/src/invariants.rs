@@ -8,8 +8,8 @@
 //! [`crate::git_history`]).
 
 use crate::engine_names::EngineNames;
-use crate::git_history::{Commit, Git, Version, content, decisions, descends};
-use agentfs_model::calls::{Caller, Recorded, RecordedCall, Took, TreeCalls, TreeId};
+use crate::git_history::{Commit, Git, Version, all_decisions, content, descends};
+use agentfs_model::calls::{Caller, Meta, Recorded, RecordedCall, Took, TreeCalls, TreeId};
 use agentfs_model::check::save_aligned;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -235,8 +235,38 @@ impl Invariants {
                 let t = self.trees.entry(Self::tree_of(caller)).or_default();
                 if let Some(own) = t.names.remove(from) {
                     t.names.insert(to.clone(), own);
+                } else {
+                    // A directory's rename moves every file under it (rule 14).
+                    let under = format!("{from}/");
+                    let moved: Vec<String> = t
+                        .names
+                        .keys()
+                        .filter(|p| p.starts_with(&under))
+                        .cloned()
+                        .collect();
+                    for p in moved {
+                        if let Some(own) = t.names.remove(&p) {
+                            t.names.insert(format!("{to}{}", &p[from.len()..]), own);
+                        }
+                    }
                 }
             }
+            RecordedCall::Symlink {
+                caller,
+                path,
+                target,
+                ..
+            } => {
+                // Rule 15: a new file whose bytes are its target.
+                self.next_object += 1;
+                let own = self.next_object;
+                let t = self.trees.entry(Self::tree_of(caller)).or_default();
+                t.names.insert(path.clone(), own);
+                t.bytes.insert(own, target.as_bytes().to_vec());
+            }
+            RecordedCall::Mkdir { .. }
+            | RecordedCall::Rmdir { .. }
+            | RecordedCall::SetMeta { .. } => {}
             RecordedCall::EndClient { caller } => {
                 let mine: Vec<u64> = self
                     .opens
@@ -342,7 +372,7 @@ impl Invariants {
         let (before, incoming_id) = (self.commit(before)?, incoming.clone());
         let incoming = self.commit(&incoming_id)?;
         let base = self.commit(incoming.parents.first().ok_or("a landing of a root")?)?;
-        let lost = decisions(c)?;
+        let (lost, entries) = all_decisions(c)?;
         let tree = c.trailers("Agentfs-Tree").join("");
         // What the incoming change itself wrote: versions its base lacks.
         let mut written = Vec::new();
@@ -353,7 +383,7 @@ impl Invariants {
                 }
             }
         }
-        if lost.is_empty() {
+        if lost.is_empty() && entries.is_empty() {
             for (file, version, identity) in &written {
                 let kept = c.maps.get(file).is_some_and(|m| {
                     m.lines
@@ -368,9 +398,9 @@ impl Invariants {
             }
             return Ok(());
         }
-        if c.files != before.files {
+        if c.files != before.files || c.dirs != before.dirs || metas(c) != metas(&before) {
             return Err(format!(
-                "changes_whole: {oid:.7} lost but its files are not the parent's: a partial change"
+                "changes_whole: {oid:.7} lost but its entries are not the parent's: a partial change"
             ));
         }
         let names: BTreeSet<&Version> = lost.iter().map(|d| &d.lost).collect();
@@ -414,6 +444,62 @@ impl Invariants {
         let at = self.git.run(&["rev-parse", &reference])?;
         if at.trim() != incoming_id {
             return Err(format!("loser_reachable: {reference} names {}", at.trim()));
+        }
+        Ok(())
+    }
+
+    /// Invariant D1, read from git: every entry's parent is a directory with a
+    /// record in `dirs/`, or the root, and a path names at most one entry.
+    pub(crate) fn d1(t: TreeId, c: &Commit) -> Result<(), String> {
+        let mut entries: BTreeMap<&str, &str> = BTreeMap::new();
+        let live = c.names.keys().filter_map(|file| c.name_path(*file));
+        let files = live.chain(c.files.keys().map(String::as_str));
+        let mut named = BTreeSet::new();
+        for p in c.names.keys().filter_map(|file| c.name_path(*file)) {
+            if !named.insert(p) {
+                return Err(format!("d1: {t:?}:{p} names two files"));
+            }
+        }
+        for p in files {
+            entries.insert(p, "file");
+        }
+        for d in c.dirs.keys().filter(|d| !d.is_empty()) {
+            if entries.insert(d, "directory").is_some() {
+                return Err(format!("d1: {t:?}:{d} is a file and a directory"));
+            }
+        }
+        for (p, what) in &entries {
+            let parent = p.rfind('/').map_or("", |i| &p[..i]);
+            if !parent.is_empty() && !c.dirs.contains_key(parent) {
+                return Err(format!(
+                    "d1: {t:?}'s {what} {p} has no directory {parent} in dirs/"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Each entry's metadata as the view shows it is what the tree's head commit
+    /// records: a file's in its `lines/` entry, a directory's in `dirs/`.
+    fn entries_match<T: TreeCalls>(t: &T, id: TreeId, head: &Commit) -> Result<(), String> {
+        let view: BTreeMap<String, Meta> = t
+            .entries(id)
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .collect();
+        let mut recorded = metas(head);
+        recorded.extend(
+            head.dirs
+                .iter()
+                .filter(|(d, _)| !d.is_empty())
+                .map(|(d, m)| (d.clone(), *m)),
+        );
+        if view != recorded {
+            return Err(format!(
+                "entries_match_commit: {id:?} shows {}, its commit {}",
+                print_meta(&view),
+                print_meta(&recorded)
+            ));
         }
         Ok(())
     }
@@ -485,8 +571,22 @@ impl Invariants {
             return Ok(());
         }
         let root_paths = t.paths(TreeId::ROOT).map_err(|e| e.to_string())?;
+        let entries = |id| -> Result<BTreeMap<String, Meta>, String> {
+            Ok(t.entries(id)
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .collect())
+        };
+        let root_entries = entries(TreeId::ROOT)?;
         let ids: Vec<TreeId> = self.trees.keys().copied().collect();
         for id in ids {
+            if entries(id)? != root_entries {
+                return Err(format!(
+                    "converged: {id:?}'s entries differ from the root's: {}, the root {}",
+                    print_meta(&entries(id)?),
+                    print_meta(&root_entries)
+                ));
+            }
             let paths = t.paths(id).map_err(|e| e.to_string())?;
             if paths != root_paths {
                 return Err(format!(
@@ -554,7 +654,9 @@ impl Invariants {
         for id in ids {
             let head = self.head(id)?;
             Self::lines_whole(id, &head)?;
+            Self::d1(id, &head)?;
             self.bytes_match(t, id, &head)?;
+            Self::entries_match(t, id, &head)?;
             Self::one_object_one_file(t, id)?;
             if let Some(tree) = self.trees.get_mut(&id) {
                 tree.identities = Self::identities(&head);
@@ -669,6 +771,19 @@ fn merge_originates(
         })
 }
 
+/// Each file's and link's metadata in commit `c`, by path.
+fn metas(c: &Commit) -> BTreeMap<String, Meta> {
+    c.maps.values().map(|m| (m.path.clone(), m.meta)).collect()
+}
+
+fn print_meta(entries: &BTreeMap<String, Meta>) -> String {
+    let shown: Vec<String> = entries
+        .iter()
+        .map(|(p, m)| format!("{p}={}", m.text()))
+        .collect();
+    shown.join(" ")
+}
+
 fn print(files: &BTreeMap<String, Vec<u8>>) -> String {
     let shown: Vec<String> = files
         .iter()
@@ -683,6 +798,7 @@ mod tests {
     use crate::EngineNames;
     use crate::git_history::tests::Repo;
     use agentfs_model::calls::CallError;
+    use std::process::Command;
 
     /// The root's engine name.
     fn root() -> String {
@@ -833,6 +949,18 @@ mod tests {
         fn crash(&mut self) -> Result<(), CallError> {
             unreachable!("drained only reads")
         }
+        fn mkdir(&mut self, _: &Caller, _: &str, _: &Meta) -> Result<(), CallError> {
+            unreachable!("drained only reads")
+        }
+        fn rmdir(&mut self, _: &Caller, _: &str) -> Result<(), CallError> {
+            unreachable!("drained only reads")
+        }
+        fn set_meta(&mut self, _: &Caller, _: &str, _: &Meta) -> Result<(), CallError> {
+            unreachable!("drained only reads")
+        }
+        fn symlink(&mut self, _: &Caller, _: &str, _: &str, _: &Meta) -> Result<(), CallError> {
+            unreachable!("drained only reads")
+        }
         fn read(&self, t: TreeId, path: &str) -> Result<Option<Vec<u8>>, CallError> {
             Ok(self.0.get(&t).and_then(|f| f.get(path)).cloned())
         }
@@ -841,6 +969,13 @@ mod tests {
                 .0
                 .get(&t)
                 .map(|f| f.keys().cloned().collect())
+                .unwrap_or_default())
+        }
+        fn entries(&self, t: TreeId) -> Result<Vec<(String, Meta)>, CallError> {
+            Ok(self
+                .0
+                .get(&t)
+                .map(|f| f.keys().map(|p| (p.clone(), Meta::FILE)).collect())
                 .unwrap_or_default())
         }
     }
@@ -925,5 +1060,72 @@ mod tests {
         let c = inv.commit(&keeps_lost).unwrap();
         let error = inv.landing(&keeps_lost, &c).unwrap_err();
         assert!(error.contains("upstream_kept:"), "{error}");
+    }
+
+    /// A commit holding file 1 at `path`, one line `x`, and a record for each of
+    /// `dirs`, each blob at `<top>/<aa>/<bb>/<leaf>` as the engine lays it out.
+    fn commit_at(repo: &Repo, path: &str, dirs: &[&str]) -> String {
+        let folders = |name: &str| {
+            let hex = repo.git(&["hash-object", "--stdin"], name.as_bytes());
+            format!("{}/{}", &hex[..2], &hex[2..4])
+        };
+        let blob = |text: &str| repo.git(&["hash-object", "-w", "--stdin"], text.as_bytes());
+        let lines = r#"[1,{"lines":[{"identity":"1:0","version":"1:0","count":1}],"ancestors":[{"version":"1:0","count":1}]},{"kind":"file","mode":"0644","uid":0,"gid":0}]"#;
+        let name = format!(r#"{{"head":1,"versions":{{"1":{{"path":"{path}","over":null}}}}}}"#);
+        let dir = r#"{"kind":"dir","mode":"0755","uid":0,"gid":0}"#;
+        let mut leaves = vec![
+            (format!("files/{}/{path}", folders(path)), blob("x\n")),
+            (format!("lines/{}/{path}", folders(path)), blob(lines)),
+            (format!("names/{}/1", folders("1")), blob(&name)),
+            ("dirs/root".to_owned(), blob(dir)),
+        ];
+        for d in dirs {
+            let leaf = d.replace('%', "%25").replace('/', "%2F");
+            leaves.push((format!("dirs/{}/{leaf}", folders(d)), blob(dir)));
+        }
+        let scratch = tempfile::tempdir().unwrap();
+        let index = scratch.path().join("index");
+        for (at, oid) in &leaves {
+            let status = Command::new("git")
+                .arg("--git-dir")
+                .arg(repo.path())
+                .args(["update-index", "--add", "--cacheinfo"])
+                .arg(format!("100644,{oid},{at}"))
+                .env("GIT_INDEX_FILE", &index)
+                .status()
+                .unwrap();
+            assert!(status.success(), "update-index {at}");
+        }
+        let out = Command::new("git")
+            .arg("--git-dir")
+            .arg(repo.path())
+            .arg("write-tree")
+            .env("GIT_INDEX_FILE", &index)
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        let tree = String::from_utf8(out.stdout).unwrap();
+        repo.git(
+            &["commit-tree", tree.trim(), "-F", "-"],
+            b"Direct\n\nAgentfs-Writer: agentfs\nAgentfs-Cause: Direct\nAgentfs-Format: envelope-2\n",
+        )
+    }
+
+    /// D1, read from the engine's history: a file whose directory has no record in
+    /// `dirs/` fails, as does a path that is a file and a directory; a file in a
+    /// recorded directory passes.
+    #[test]
+    fn d1_fails_on_a_parentless_file_in_history() {
+        let repo = Repo::new();
+        let mut git = Git::new(repo.path()).unwrap();
+        let held = git.commit(&commit_at(&repo, "q/x", &["q"])).unwrap();
+        assert_eq!(held.dirs.keys().collect::<Vec<_>>(), ["", "q"]);
+        assert_eq!(Invariants::d1(TreeId::ROOT, &held), Ok(()));
+        let parentless = git.commit(&commit_at(&repo, "q/x", &[])).unwrap();
+        let error = Invariants::d1(TreeId::ROOT, &parentless).unwrap_err();
+        assert!(error.contains("d1:") && error.contains("q/x"), "{error}");
+        let both = git.commit(&commit_at(&repo, "q", &["q"])).unwrap();
+        let error = Invariants::d1(TreeId::ROOT, &both).unwrap_err();
+        assert!(error.contains("a file and a directory"), "{error}");
     }
 }

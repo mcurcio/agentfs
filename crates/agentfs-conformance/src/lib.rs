@@ -27,7 +27,7 @@ pub use git_history::EngineHistory;
 pub use library::Library;
 pub use mounted::Mounted;
 
-use agentfs_model::calls::{Recorded, RecordedCall, Sink, TreeCalls, replay};
+use agentfs_model::calls::{Caller, Kind, Meta, Recorded, RecordedCall, Sink, TreeCalls, replay};
 use agentfs_model::world::{ModelHistory, Policies, TreeNames, World};
 use invariants::Invariants;
 use std::path::{Path, PathBuf};
@@ -103,12 +103,14 @@ pub fn against_model(trace: &[Recorded], sink: &mut dyn Sink) -> Result<(), Stri
 }
 
 /// Whether a trace fits "the root and one fork" on a real mount: at most one
-/// fork, made before the first client call, and no open that both appends and
-/// writes at an offset. Linux has no such descriptor: `pwrite` on an `O_APPEND`
-/// file appends, and the view reads `O_APPEND` when the file opens.
+/// fork, made before the first client call, no open that both appends and
+/// writes at an offset, and no call of rules 13 to 15 that Linux cannot make in
+/// one system call ([`one_syscall`]). Linux has no descriptor that both appends
+/// and writes at an offset: `pwrite` on an `O_APPEND` file appends, and the view
+/// reads `O_APPEND` when the file opens.
 pub fn mountable(trace: &[Recorded]) -> bool {
     let (mut forks, mut called) = (0, false);
-    for r in trace {
+    for (i, r) in trace.iter().enumerate() {
         match r.call {
             RecordedCall::Fork { .. } => {
                 forks += 1;
@@ -119,8 +121,46 @@ pub fn mountable(trace: &[Recorded]) -> bool {
             RecordedCall::Take { .. } => {}
             _ => called = true,
         }
+        let before = i.checked_sub(1).and_then(|j| trace[j].shown.as_ref());
+        if !one_syscall(&r.call, before) {
+            return false;
+        }
     }
     !one_open_mixes_append_and_offset(trace)
+}
+
+/// Who the mount harness is: root, which owns what it makes, as the model's
+/// created file ([`Meta::FILE`]) is owned.
+const HARNESS: (u32, u32) = (Meta::FILE.uid, Meta::FILE.gid);
+
+/// Whether one system call of the harness makes `call`, given what the trees
+/// showed before it. The model's metadata is one value, but Linux sets a mode
+/// (`chmod(2)`) and an owner (`lchown(2)`) in two calls, and two calls are two
+/// changes: so a metadata change of both, a directory or link made with an owner
+/// other than the harness's, or a directory whose mode `mkdir(2)` drops (the
+/// set-user-ID and set-group-ID bits) takes two, and the trace is not mountable.
+fn one_syscall(call: &RecordedCall, before: Option<&agentfs_model::calls::Shown>) -> bool {
+    match call {
+        RecordedCall::Mkdir { meta, .. } => {
+            meta.mode & !0o1777 == 0 && (meta.uid, meta.gid) == HARNESS
+        }
+        RecordedCall::Symlink { meta, .. } => (meta.uid, meta.gid) == HARNESS,
+        RecordedCall::SetMeta { caller, path, meta } => {
+            let tree = match caller {
+                Caller::Root(_) => agentfs_model::calls::TreeId::ROOT,
+                Caller::Fork(f) => *f,
+            };
+            let was = before
+                .and_then(|s| s.entries.get(&tree))
+                .and_then(|e| e.get(path))
+                .copied()
+                .unwrap_or(Meta::FILE);
+            let mode = meta.kind != Kind::Symlink && was.mode != meta.mode;
+            let owner = (was.uid, was.gid) != (meta.uid, meta.gid);
+            !(mode && owner)
+        }
+        _ => true,
+    }
 }
 
 fn one_open_mixes_append_and_offset(trace: &[Recorded]) -> bool {

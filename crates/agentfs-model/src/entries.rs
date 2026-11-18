@@ -293,7 +293,7 @@ impl Entries {
 }
 
 /// Why a change lost by rules 13 and 14: the cause a collision record names.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Cause {
     /// Rule 13: the upstream holds a value the writer never saw.
     Metadata,
@@ -303,6 +303,28 @@ pub enum Cause {
     /// Rule 14: the change puts an entry into a directory the upstream no
     /// longer has, and did not make that directory itself.
     DirectoryGone,
+}
+
+impl Cause {
+    const ALL: [Cause; 3] = [
+        Cause::Metadata,
+        Cause::DirectoryNotEmpty,
+        Cause::DirectoryGone,
+    ];
+
+    /// The word a collision record names it by, in the model and the library.
+    pub fn word(self) -> &'static str {
+        match self {
+            Cause::Metadata => "metadata",
+            Cause::DirectoryNotEmpty => "directory-not-empty",
+            Cause::DirectoryGone => "directory-gone",
+        }
+    }
+
+    /// The cause [`Cause::word`] names.
+    pub fn from_word(word: &str) -> Option<Cause> {
+        Cause::ALL.into_iter().find(|c| c.word() == word)
+    }
 }
 
 /// One loss of a change by rule 13 or 14: the entry it is about, what the

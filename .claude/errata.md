@@ -1376,3 +1376,32 @@ Carried on in every case; none stopped the slice.
    directory rename removed a directory under which the upstream has an entry the fork never had, the model
    panics ("not modelled", MODEL.md "Left out"). The library hides that entry until the upstream decides, as
    rule 11 hides a clashing name, so D1 holds; no scenario covers it.
+
+## 2026-11-18, M2 S5 (conformance replays directories, metadata and links; M2 docs close): where the brief was short
+
+Carried on in every case; none stopped the slice.
+
+1. **A mount cannot make the model's metadata change in one call.** The brief has the mounted replay make
+   `chmod(2)` plus `chown(2)` for one `set-meta`. The model's metadata is one value, but Linux sets a mode and an
+   owner in two system calls, and each is its own step and change: a fork's chmod then chown is two queue entries,
+   so the trace's one take lands half of it (`r13_a_chmod_lands_over_the_value_it_saw` showed `0755:0:0` against
+   the trace's `0755:1000:1000`), and two trees writing one new value disagree on the half-way value
+   (`r13_the_same_new_value_agrees` recorded a `metadata` collision the model has not). Likewise `mkdir(2)` drops
+   the set-group-ID bit (`r14_an_empty_directory_is_kept`'s `2775`) and a directory or link owned by another user
+   needs an `lchown(2)`. `mountable` now leaves out a trace with such a call; 5 of the 17 rules' traces replay on
+   mounts, all 17 on the library. This is real behaviour, not an engine bug: a program that runs chmod and chown
+   makes two changes. Whether the model should say so (a `set-meta` of mode or owner, not both) is the owner's call.
+2. **Directories are not paths.** The brief says `paths()`/`read()` report directories. `paths()` and `read()`
+   feed the byte invariants and the convergence check, which compare files; `TreeCalls` gains `entries()` (every
+   entry with its metadata) instead, one question per method.
+3. **The traces are not regressions.** "Record the new scenarios' traces into the conformance regressions, as
+   VERIFYING.md describes": `tests/regressions/` holds engine-found regressions, each with a `.patch` that removes
+   its fix. The 17 traces are the model's own, kept in `tests/rules/` with `tests/rules.rs`, which replays each on
+   the model and the library and requires both recordings to equal the trace.
+4. **A whole loss can name an entry as its winner.** The library writes a rule 13 or 14 loss's other versions as
+   `{"lost":{"Name":..},"winner":{"Entry":{"path":"e/"}},"kind":"Whole"}`; `docs/library/core.md` says only that
+   they lose `Whole`. The conformance reader takes `Entry` as a version.
+5. **The digest check needs the pinned git on the system path.** `ci/model-digest.sh` refuses a `git` other than
+   `ci/git-release` in `/usr/bin` too, and this container has no Docker. It ran in a private mount namespace with
+   git 2.47.3 bound over `/usr/bin/git`: 199 runs match; its one complaint, scenarios over 1.5 times their 5 s
+   budget, is the same (19 s) on the base commit.

@@ -6,18 +6,40 @@ use agentfs_contracts::name::{VolumeName, WriterLabel};
 use agentfs_contracts::pod::{PodContext, WriterAt};
 use agentfs_contracts::volume::{VolumeId, VolumeIdentity};
 use agentfs_core::tree_actor::{
-    self, Attrs, Error, Perm, RenameMode, TreeActor, TreeId as EngineTree,
+    self, Attrs, Error, Kind as EngineKind, Perm, RenameMode, TreeActor, TreeId as EngineTree,
 };
-use agentfs_model::calls::{CallError, Caller, Took, TreeCalls, TreeId};
+use agentfs_model::calls::{CallError, Caller, Kind, Meta, Took, TreeCalls, TreeId};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-/// What a replay's create gives a file: mode 0644, owned by 0:0. The model
-/// has no owners; history's metadata is not compared.
-const ATTRS: Attrs = Attrs {
-    perm: Perm::from_mode(0o644),
-    owner: FileOwner { uid: 0, gid: 0 },
-};
+/// What a replay's create gives a file: the model's created file's metadata
+/// ([`Meta::FILE`]), mode 0644, owned by 0:0.
+const ATTRS: Attrs = attrs(&Meta::FILE);
+
+/// The mode and owner of the model's metadata `m`, as the library takes them.
+pub(crate) const fn attrs(m: &Meta) -> Attrs {
+    Attrs {
+        perm: Perm::from_mode(m.mode),
+        owner: FileOwner {
+            uid: m.uid,
+            gid: m.gid,
+        },
+    }
+}
+
+/// The library's metadata of an entry in the model's terms.
+pub(crate) fn model_meta(m: &tree_actor::Meta) -> Meta {
+    Meta {
+        kind: match m.kind {
+            EngineKind::File => Kind::File,
+            EngineKind::Symlink => Kind::Symlink,
+            EngineKind::Dir => Kind::Dir,
+        },
+        mode: m.mode.bits(),
+        uid: m.uid,
+        gid: m.gid,
+    }
+}
 
 /// The model's first commit: files a, b, c and d, each six `-` lines.
 pub const SEEDED: [&str; 4] = ["a", "b", "c", "d"];
@@ -240,6 +262,47 @@ impl TreeCalls for Library {
         Ok(())
     }
 
+    fn mkdir(&mut self, c: &Caller, path: &str, meta: &Meta) -> Result<(), CallError> {
+        let (tree, writer) = self.who(c)?;
+        let made = self
+            .v_mut()?
+            .mkdir(tree, path, attrs(meta), &writer)
+            .map(drop)
+            .map_err(fail);
+        self.settled(made)
+    }
+
+    fn rmdir(&mut self, c: &Caller, path: &str) -> Result<(), CallError> {
+        let (tree, writer) = self.who(c)?;
+        let removed = self.v_mut()?.rmdir(tree, path, &writer).map_err(fail);
+        self.settled(removed)
+    }
+
+    fn set_meta(&mut self, c: &Caller, path: &str, meta: &Meta) -> Result<(), CallError> {
+        let (tree, writer) = self.who(c)?;
+        let set = self
+            .v_mut()?
+            .set_meta(tree, path, attrs(meta), &writer)
+            .map_err(fail);
+        self.settled(set)
+    }
+
+    fn symlink(
+        &mut self,
+        c: &Caller,
+        path: &str,
+        target: &str,
+        meta: &Meta,
+    ) -> Result<(), CallError> {
+        let (tree, writer) = self.who(c)?;
+        let linked = self
+            .v_mut()?
+            .symlink(tree, path, target, attrs(meta).owner, &writer)
+            .map(drop)
+            .map_err(fail);
+        self.settled(linked)
+    }
+
     fn read(&self, t: TreeId, path: &str) -> Result<Option<Vec<u8>>, CallError> {
         match self.v()?.read(self.names.name(t)?, path) {
             Ok(b) => Ok(Some(b.to_vec())),
@@ -258,6 +321,27 @@ impl TreeCalls for Library {
             .collect();
         paths.sort();
         Ok(paths)
+    }
+
+    /// Every entry under the root directory, walked through its listings.
+    fn entries(&self, t: TreeId) -> Result<Vec<(String, Meta)>, CallError> {
+        let (v, tree) = (self.v()?, self.names.name(t)?);
+        let (mut out, mut dirs) = (Vec::new(), vec![String::new()]);
+        while let Some(dir) = dirs.pop() {
+            for child in v.children(tree, &dir, 0, usize::MAX).map_err(fail)? {
+                let path = if dir.is_empty() {
+                    child.name
+                } else {
+                    format!("{dir}/{}", child.name)
+                };
+                let meta = model_meta(&v.node(tree, &path).map_err(fail)?.meta);
+                if meta.kind == Kind::Dir {
+                    dirs.push(path.clone());
+                }
+                out.push((path, meta));
+            }
+        }
+        Ok(out)
     }
 }
 

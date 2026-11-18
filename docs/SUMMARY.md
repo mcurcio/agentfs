@@ -75,7 +75,6 @@
   - [Root branch name](target-architecture/future/root-branch-name.md)
   - [Transactions](target-architecture/future/transactions.md)
   - [Nested forks](target-architecture/future/nested-forks.md)
-  - [Beyond flat files](target-architecture/future/tree-views-beyond-flat-files.md)
   - [Tree-view telemetry](target-architecture/future/tree-view-telemetry.md)
   - [Landing approvals](target-architecture/future/landing-approvals.md)
   - [Integrator patches](target-architecture/future/integrator-patches.md)

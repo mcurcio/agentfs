@@ -1,9 +1,10 @@
 # One engine: the tree views run the sidecar, CSI and CLI
 
-**Proposed; M1 is built.** This page plans how agentfs goes from two engines to one: the tree views take over every
+**Proposed; M1 and M2 are built.** This page plans how agentfs goes from two engines to one: the tree views take over every
 launcher, and the recording engine is deleted. It is the system-level plan; each milestone below starts with its
-own architect and design gate, one layer down. M1 (volumes, clients, forks and their lifecycle on the tree views) is
-built and described in [tree views](../../trees.md) and the [library](../../library/core.md#git-backed-tree-views). The commit that lands the last milestone (M9) deletes this page and
+own architect and design gate, one layer down. M1 (volumes, clients, forks and their lifecycle on the tree views) and
+M2 (directories, metadata and links) are built and described in [tree views](../../trees.md) and the
+[library](../../library/core.md#git-backed-tree-views). The commit that lands the last milestone (M9) deletes this page and
 moves the behaviour into the library and operator docs.
 
 ## Today
@@ -32,13 +33,13 @@ page's; "speed" is [save and take speed](save-and-take-speed.md).
 | A baseline build verified with a target application | [the baseline](#the-baseline), the plan's first acceptance point: M1 to M7, with M6 |
 | One engine | built: volumes and their lifecycle (M1); M7 and M8 (the launchers move), M9 (the recording engine is deleted) |
 | Nobody runs `trees init` by hand | built: `ensure` takes a `VolumeSpec` value, which the trial CLI builds from `trees init`'s flags (M1); M7 and M8 (each launcher calls `ensure`; `agentfs trees` folds into `init` and `mount`) |
-| One volume that root and non-root processes both use (the problem ArtifactFS stalled on) | built: other users reach the tree mount (M1); M2 (modes and owners decide what each may do) |
+| One volume that root and non-root processes both use (the problem ArtifactFS stalled on) | built: other users reach the tree mount (M1); modes and owners decide what each may do (M2) |
 | The launchers' speed holds | built: release-build figures against the tree-view budgets, `ci/trees-budget.json` (M1); speed (before M2, below); M7's gate |
 | History knows the root by identity; no hardcoded `main` | module cut 5b |
 | Consumers configure the name the root is published under, and may change it | [Root branch name](root-branch-name.md), built in M4 (the publisher and its key) |
 | The trailer records meaningful information | built: which tree, by identity (5b), and where, the volume and the pod (M1) |
 | Configuration: iac and the agent both edit it (`AGENTS.md`, "What agentfs is for") | M6; until it lands, a configured patch source raises a standing alarm (M7) |
-| Audit; recording is the baseline (principle 1) | built (a write is journaled before it returns; power loss replayed by `phase-1.yml`; where, and the volume's own events as commits: M1); M2 (every kind of change recorded or refused loudly); M3 (only operator rules skip a path) |
+| Audit; recording is the baseline (principle 1) | built (a write is journaled before it returns; power loss replayed by `phase-1.yml`; where, and the volume's own events as commits: M1; every kind of change recorded or refused loudly: M2); M3 (only operator rules skip a path) |
 | Invisible and untouchable (principle 2) | built (state outside the mount); M3 (the untracked area); M4 (credentials never in a view) |
 | Git idioms (principle 3) | M3 (operator files as a git-config include, built with their first owner; `info/exclude`, `info/attributes`); M4 (the published name's key) |
 | The right technology, recorded (principle 4) | M4 (the reused transports in architecture.md's "Technology choices"); M9 |
@@ -130,11 +131,13 @@ budgets, and debug-build figures say they will (about 96 ms a save against the r
 [performance](../../performance.md)). It comes first because M2, M3 and M4 extend the save and take path it
 rewrites. Gate: a full run; the budgets met.
 
-**M2. Beyond flat files.** Directories, symlinks, non-UTF-8 names and more links
-([beyond flat files](tree-views-beyond-flat-files.md)), and file metadata: modes, the presented owner and times, in
-place of today's `0600`, the daemon's uid and epoch times; permission checks follow them, so each user may do what
-the modes allow. Its architect writes the missing file-metadata page. The model gains rules, so it runs the full
-model gate. Gate: the full model gate; a full run.
+**M2. Beyond flat files.** Built. A tree holds directories (made, removed, renamed whole), symbolic links and each
+entry's metadata (kind, mode bits, owner and group); each entry is presented with its recorded owner and mode, and
+the kernel checks permissions by them. Times are each tree's own, never in history. Forks land directories, metadata
+and links by the model's rules 13 to 15, and a change that loses by them names its cause (`metadata`,
+`directory-not-empty`, `directory-gone`). [Tree views](../../trees.md) describes them and what a commit holds. Left
+out: hard links past the first, names that are not UTF-8, devices, pipes and sockets, and extended attributes, each
+refused as before; a line moved between files; an all-squash presented owner.
 
 **M3. Rules and the untracked area.** Operator rules decide what is recorded ([rules](../domains/rules.md),
 git-model §3), and unrecorded files live in the untracked area. Its gate decides whether untracked files get
@@ -203,7 +206,7 @@ What those applications need, and the milestone that gives it:
 | Need | Milestone |
 |---|---|
 | A volume created, or recovered, from the launcher's configuration | built (`ensure`, M1); M7 (the sidecar and Docker launchers call it) |
-| The mount at the application's data path, used by root, by other users and by a docker-in-docker tools container | built (other users reach the mount, M1); M2 (directories, symlinks, modes and owners) |
+| The mount at the application's data path, used by root, by other users and by a docker-in-docker tools container | built (other users reach the mount, M1; directories, symlinks, modes and owners, M2) |
 | Rule files: what is recorded, and untracked paths (secrets, databases, sessions, logs) never in history | M3 |
 | Every change pushed to a remote | M4 |
 | Health and alarms, and a sidecar-only restart onto a new mount | M5's first series |
@@ -342,7 +345,7 @@ workload container. Its steps are `ensure` and its refusal of another name, a sa
 trailers, a kill mid-write and a restart in place, and the release figures against the tree budgets. M7 changes
 only the two commands' names.
 
-Each milestone adds its step: M2 a directory and an executable bit; M3 a database file in the untracked area, never
+Each milestone adds its step. Built for M2: a directory, an executable bit and a chown through the mount. To come: M3 a database file in the untracked area, never
 in history; M4 a refusing remote (the filesystem keeps working), then a push under a configured name; M5 the alarm at
 a collector; M6 a producer's patch at the next mount and a `restore`; M7 the same steps through the sidecar on kind,
 and the patch-source alarm while M6 is not built; M8 a CSI volume and a fork claim. Not covered: several pods, LFS,
@@ -370,14 +373,17 @@ database groups, nested forks, transactions, upgrades.
 - Old state areas are archived, not converted: an operator keeps them, and their disk, as long as the audit trail
   is wanted.
 - M7 repoints or deletes about two dozen `ci/` scripts and renames the CSI driver's two recording entry points.
-- Two pages to write: file metadata (M2) and CSI on trees (M8). M2's new model rules run the costliest gate.
+- One page to write: CSI on trees (M8).
+- M2's new model rules ran on their scenarios and on the conformance replay of those scenarios on the library and on
+  mounts, at the regression tier; the random runs do not make their calls. The full model sweep was the owner's call,
+  and he chose to skip it (2026-11-18).
 - The baseline's gate adds no job: it is four existing jobs, run against the tree engine.
 - **CI.** Wall time and runner time differ, because jobs run side by side. Measured on run 43146523186: a full
   `phase-1.yml` run takes about 73 min wall and about 300 runner-min; without the 500-seed shards, about 20 min wall
   and about 41 runner-min. A full model gate takes about 41 min on a 4-CPU container, outside CI. Measured on the
   2026-11-12 pushes: ci 9 to 13 min and image 5 to 10 min wall, side by side; with helm, f8 and docs, about 25 to
   30 runner-min per pushed commit. Step 7 adds one or two model gates after the
-  baseline. From M2 to M8: full runs where save or land logic changes (expected: speed, M2, M3, M6) and short runs elsewhere (M4, M5, M7, M8), M2's model gate, the tracer job (about
+  baseline. From M2 to M8: full runs where save or land logic changes (expected: speed, M3, M6) and short runs elsewhere (M4, M5, M7, M8), the tracer job (about
   ten minutes in `image.yml`) and both engines' jobs in ci until M9. The core tier ([CI tiers](#ci-tiers)) adds about
   20 min wall, side by side with ci, and about 41 runner-min to every PR push and every push to `main`; the
   randomized shards cost only when triggered. The counts are estimates.

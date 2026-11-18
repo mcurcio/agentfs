@@ -303,6 +303,12 @@ row and counts as released.
   landing commit, so history does not show when it landed or that a queue took it.
   Writer and tree still show. A landing locks names as well as files, so it can wait
   on an open file it does not change.
+- **Directories, metadata and links.** A directory is its path, so two trees
+  making one directory agree; a chmod or chown lands over the value its writer
+  saw; a link lands as a file whose bytes are its target. A change that loses by
+  these rules loses whole and names its cause: `metadata`,
+  `directory-not-empty` or `directory-gone` ([landing directories, metadata and
+  links](library/core.md#landing-directories-metadata-and-links)).
 - **After a truncate**, writes count as a rewrite unless every call is an append.
 - **The release of `git` decides alignment.** An upgrade is a known change: later
   saves can align repeated lines differently. Stored bytes and identities do not
@@ -594,13 +600,11 @@ by `take_next`. Each take runs in three parts:
    gone (`EntryGone`). A refused take is logged (`tree TakeRefused`) and decided
    again at once, on the history that refused it.
 
-A take adds every directory its source has and its tree lacks (the fork's commit
-for a landing, the upstream's head for a sync), and removes none; a landing that
-fast-forwards takes the fork's commit, directories and all. A landed file keeps
-the change's metadata when the change set it (or the upstream lacks the file),
-else the upstream's; a sync takes the upstream's. A take never leaves an entry
-without its directory. These are interim rules: the model's metadata, directory
-and link rules (rules ledger R13 to R15) are not built yet.
+A take judges directories, metadata and links by the model's rules 13 to 15, as
+the library describes ([landing directories, metadata and
+links](library/core.md#landing-directories-metadata-and-links)); a landing that
+fast-forwards takes the fork's commit, directories and all. A take never leaves
+an entry without its directory.
 
 A landed take read nothing of its tree that changed after its decision, so it decides
 what a take made in one step at its land would. A sync reads its upstream's head as
@@ -668,10 +672,6 @@ What the tree views do not support:
 - **Times.** A file's mtime moves at its last close, not at each write
   (close-to-open). Access times are not tracked: atime is the last time set,
   else the mtime. A checkout of history shows checkout times, as git does.
-- **Directories, metadata and links across forks** follow interim take rules
-  (see [Takes](#takes)): a directory one tree removes or renames stays in the
-  other, and a fork's chmod reaches its upstream when it lands but is undone in
-  the fork by a sync until then.
 - **Nested forks, transactions, `Client::Outside`, rules and view profiles,
   replication, CSI, several view hosts, upgrades and snapshot opens** are not
   built. The designs for them are in [target-architecture](target-architecture/README.md).
@@ -721,12 +721,20 @@ jobs in [development.md](development.md); the method is in
 
 - `e2e-trees.sh`, `e2e-trees-ordering.sh`: recording, objects, anonymous first link,
   immediate reopen; directories, modes, a moved directory and an executable
-  script through a view, and their history (`trees-posix.py`).
+  script through a view, owners (chown, chgrp, a set-group-ID directory), links
+  and times (`touch` makes no commit), and their history (`trees-posix.py`).
 - `e2e-tree-conformance.sh`: fixed model cases and byte calls against a plain Linux
   file.
 - `e2e-tree-replay.sh`: the model's in-scope scenarios replayed on a fresh model, the
-  library and real mounts, comparing each tree and each collision's lost lines, with
-  invariants read from git.
+  library and real mounts, comparing each tree's files, directories, kinds and
+  metadata, each collision's lost lines and each loss's cause by rules 13 and 14,
+  with invariants read from git (D1 among them: every entry's parent has a `dirs/`
+  record). The rules' scenarios for directories, metadata and links are also kept
+  as traces in `crates/agentfs-conformance/tests/rules/`, which `cargo test`
+  replays on the model and the library. A mount makes only the calls one system
+  call can: a chmod and a chown are two changes on Linux, so a trace that changes
+  both at once, or makes a directory or link owned by another user, replays on the
+  library alone.
 - `e2e-tree-pagecache.sh`: shared-mapping behaviour in 21 cases, and 64 closes
   reopened.
 - `e2e-tree-restart.sh`, `e2e-tree-recording-faults.sh`, `e2e-tree-enospc.sh`:

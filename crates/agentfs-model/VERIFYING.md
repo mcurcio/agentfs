@@ -46,7 +46,7 @@ runs only when asked for.
 |---|---|---|
 | The model's tests, `cargo test --locked -p agentfs-model` | 73 s | 228 s (`AGENTFS_MODEL_SWEEP=1`) |
 | The digest, `ci/model-digest.sh check` | 66 s (the scenarios, then eleven seeds) | `check --all`: about 2054 s |
-| The library's replay of the recorded traces, in CI | 140 s (77 scenario and 25 seed traces) | 834 s (74 and 94) |
+| The library's replay of the recorded traces, in CI | 140 s (77 scenario and 25 seed traces; 94 and 25 since rules 13 to 15) | 834 s (74 and 94) |
 | The planted corpus, `run.py` | 518 s, 48 of 48 caught | 590 s (`--sweep`) |
 | CI's `phase-1` conformance job | 448 s, on every pull request and push | 1400 s, and about 80 minutes with the shards, on a manual run |
 
@@ -432,8 +432,11 @@ them unchanged and records each call plus what each tree showed (`src/calls.rs`)
 real library and real mounts (`crates/agentfs-conformance`); the real run must show the same, and passes invariants
 of its own.** Those read `git`, the crate's own reader of each commit's line maps and name histories and its own byte
 oracle, never the library's bookkeeping. Assertions reach the real system only through that equality, so only for
-what a trace's `Shown` exposes: each tree's files, and the lost lines of each collision, and for a take that took,
-its tree's head (`Agentfs-Cause` and the number of parents).
+what a trace's `Shown` exposes: each tree's files, its directories and the kind, mode and owner of every entry
+whose metadata is not a created file's, the lost lines of each collision, each loss by rules 13 and 14 with its
+cause (`metadata`, `directory-not-empty`, `directory-gone`) and entry, and for a take that took, its tree's head
+(`Agentfs-Cause` and the number of parents). The engine's own invariants include D1, read from its history: every
+entry's parent has a `dirs/` record, or is the root, and no path names two entries.
 
 The replay (`calls::replay`) is also the recorder's first source: it gives each call, with what the system answered
 and then showed, to a sink (`calls::Sink`; `calls::Recorder` keeps them as a trace), stopping after the first call
@@ -460,7 +463,11 @@ What a replay decides, each reported rather than hidden:
 
 - **Scope.** A trace is out if it used transactions, `Client::Outside`, nested forks, `Step::Drop` or another policy
   (`scope_of`). `random_interleavings_phase1_scope` and `random_interleavings_rounds_phase1_scope` make none of the
-  first four, every invariant on.
+  first four, every invariant on. Directories, metadata and links (rules 13 to 15) are in scope: `mkdir`, `rmdir`,
+  `set-meta` and `symlink` are calls, and a directory's rename is a `rename`. Only scenarios make them; the random
+  runs do not, so these rules meet the others only where a scenario puts them together. Their seventeen scenarios
+  are also kept as traces in `crates/agentfs-conformance/tests/rules/`, which `cargo test -p agentfs-conformance`
+  replays on the model and the library (re-record them as that test's header says).
 - **A take.** A take is one atomic step, at `take_next`, in the model as in the real system (the owner, 2026-11-08,
   finding 49: "Without any other information, B sounds reasonable. Obviously atomic operations are more reliable"): it
   chooses its entry, locks its keys and writes, with no call in between. So the trace is the order the calls ran in, a
@@ -469,7 +476,10 @@ What a replay decides, each reported rather than hidden:
   since a real take goes on to the free entry. No take is in progress at a crash. Until 2026-11-08 the model's take
   was two steps, and a take recorded later than it began could pick another entry at its recorded place (finding 49).
 - **Mounts.** `mountable` takes at most one fork, made before any client call, and no open that both appends and
-  writes at an offset: Linux has no such descriptor. The take gate (`AGENTFS_TAKE_GATE`, a failpoints build) runs each
+  writes at an offset: Linux has no such descriptor. Nor a call of rules 13 to 15 that Linux makes in two system
+  calls, which would be two changes: a metadata change of both mode and owner (`chmod(2)` and `lchown(2)`), a
+  directory or link owned by anyone but the harness (root), or a directory mode `mkdir(2)` drops (set-user-ID,
+  set-group-ID). The take gate (`AGENTFS_TAKE_GATE`, a failpoints build) runs each
   take at the trace's point and answers by a fifo, and a synchronous request after `close(2)` proves its `RELEASE`
   ran, so the replay has no poll and no timer but the wait for a mount to appear.
 
@@ -483,8 +493,9 @@ What a replay decides, each reported rather than hidden:
 | Automatic takes (R1) | a mount takes only through the gate | mounted P1/P2 cases |
 | R1.3 an open's own read, R1.1 another reader | no calls: the replay makes neither read, so nothing compares them | byte and page-cache jobs |
 
-At the regression seeds the in-scope traces are 77 from scenarios and 25 from seeds (9 and 6 of the tree-library
-generators, and 10 of the ordinary ones that happened to stay in scope), and 14 of those seeds are mountable. At the full sweep they
+At the regression seeds the in-scope traces are 94 from scenarios (17 of them rules 13 to 15's) and 25 from seeds (9
+and 6 of the tree-library generators, and 10 of the ordinary ones that happened to stay in scope); 79 of the
+scenario traces (5 of the rules') and 14 of the seeds are mountable. At the full sweep they
 were 74 and 94 (64 and 16 of the tree-library generators, and 14 of the ordinary ones), 16 of them mountable. The rest are
 excluded by the reasons above, and the replay prints the count of each. The floors in `.github/workflows/phase-1.yml` are
 what passes: on a push 74 and 25 on the library and 71 and 14 on mounts; on a manual run, the full sweep, 74 and 94 and

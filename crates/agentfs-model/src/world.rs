@@ -30,8 +30,9 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::calls::{
-    CallError, Caller, Client, HandleId, History, Recorded, RecordedCall, Shown, ShownCollision,
-    Took, TreeCalls, TreeId, TxnId, gather_collisions, out_of_scope,
+    CallError, Caller, Client, EntryCollision, HandleId, History, Recorded, RecordedCall, Shown,
+    ShownCollision, Took, TreeCalls, TreeId, TxnId, gather_collisions, gather_entry_collisions,
+    out_of_scope, shown_entries,
 };
 use crate::content::{self, Content, Edit, Layout, Line, PATHS, UNBORN};
 use crate::entries::{self, Entries, Meta, Raw, Writes};
@@ -180,18 +181,25 @@ impl By {
             By::Line => "Line",
             By::File => "File",
             By::Whole => "Whole",
-            By::Metadata => "metadata",
-            By::DirectoryNotEmpty => "directory-not-empty",
-            By::DirectoryGone => "directory-gone",
+            By::Metadata | By::DirectoryNotEmpty | By::DirectoryGone => {
+                self.cause().map_or("", entries::Cause::word)
+            }
         }
     }
 
     /// A loss by rules 13 and 14, about an entry rather than a line.
     pub fn of_entry(self) -> bool {
-        matches!(
-            self,
-            By::Metadata | By::DirectoryNotEmpty | By::DirectoryGone
-        )
+        self.cause().is_some()
+    }
+
+    /// Rules 13 and 14's cause of a loss by them.
+    pub fn cause(self) -> Option<entries::Cause> {
+        match self {
+            By::Metadata => Some(entries::Cause::Metadata),
+            By::DirectoryNotEmpty => Some(entries::Cause::DirectoryNotEmpty),
+            By::DirectoryGone => Some(entries::Cause::DirectoryGone),
+            By::Line | By::File | By::Whole => None,
+        }
     }
 
     fn of(c: entries::Cause) -> Self {
@@ -715,6 +723,13 @@ impl World {
     /// The file at path `p` where client `c` reads, if any.
     fn client_lookup(&self, c: &Client, p: &str) -> Option<String> {
         self.lookup(&self.target_head(self.target_of(c)), p)
+    }
+
+    /// Whether path `p` is a directory where client `c` reads (rule 14).
+    fn client_dir(&self, c: &Client, p: &str) -> bool {
+        self.entries(&self.target_head(self.target_of(c)))
+            .dirs
+            .contains_key(p)
     }
 
     /// The path file `f` has where client `c` reads (its open
@@ -1844,7 +1859,12 @@ impl World {
             t,
             Writes::from([(entries::dir_name(p), Some(meta.text()))]),
         );
-        self.trace_call(out_of_scope("directories"));
+        let caller = self.caller_of(c);
+        self.trace_call(RecordedCall::Mkdir {
+            caller,
+            path: p.to_string(),
+            meta,
+        });
     }
 
     /// Rule 14: `rmdir(p)` of an empty directory: its record removed, one commit.
@@ -1857,7 +1877,11 @@ impl World {
         );
         self.note(format!("rmdir {c:?} {t:?}:{p}"));
         self.commit_records(c, t, Writes::from([(entries::dir_name(p), None)]));
-        self.trace_call(out_of_scope("directories"));
+        let caller = self.caller_of(c);
+        self.trace_call(RecordedCall::Rmdir {
+            caller,
+            path: p.to_string(),
+        });
     }
 
     /// Rule 13: `chmod` or `chown` of the entry at `p`: its new metadata `meta`,
@@ -1882,7 +1906,12 @@ impl World {
         let text = (meta != Meta::FILE || name.starts_with(entries::DIR)).then(|| meta.text());
         self.note(format!("set_meta {c:?} {t:?}:{p} {}", meta.text()));
         self.commit_records(c, t, Writes::from([(name, text)]));
-        self.trace_call(out_of_scope("metadata"));
+        let caller = self.caller_of(c);
+        self.trace_call(RecordedCall::SetMeta {
+            caller,
+            path: p.to_string(),
+            meta,
+        });
     }
 
     /// Rule 15: `symlink(target, p)`: a new file at `p` whose bytes are `target`
@@ -1915,7 +1944,13 @@ impl World {
             save,
             &Writes::from([(entries::meta_name(&f), Some(meta.text()))]),
         );
-        self.trace_call(out_of_scope("symlinks"));
+        let caller = self.caller_of(c);
+        self.trace_call(RecordedCall::Symlink {
+            caller,
+            path: p.to_string(),
+            target: target.to_string(),
+            meta,
+        });
         Some(f)
     }
 
@@ -1955,7 +1990,12 @@ impl World {
         ));
         self.commit_save_writing(save, &records);
         self.wake(t);
-        self.trace_call(out_of_scope("directories"));
+        let caller = self.caller_of(c);
+        self.trace_call(RecordedCall::Rename {
+            caller,
+            from: from.to_string(),
+            to: to.to_string(),
+        });
     }
 
     /// A close or a client's death in `t`: each waiting entry there whose
@@ -2908,6 +2948,34 @@ impl World {
                 (t, files)
             })
             .collect();
+        // Rules 13 to 15: none until a call made a directory, a link or metadata.
+        let entries = if self.entries_used {
+            self.live_trees()
+                .into_iter()
+                .map(|t| (t, self.shown_entries(t)))
+                .filter(|(_, e)| !e.is_empty())
+                .collect()
+        } else {
+            BTreeMap::new()
+        };
+        let entry_collisions = gather_entry_collisions(self.collisions.iter().filter_map(|c| {
+            let cause = c.by.cause()?;
+            // A file's loss names its identity; the trees name it by its path.
+            let path = if c.path.ends_with('/') {
+                c.path.clone()
+            } else {
+                self.file(&c.result, &c.path)
+                    .path()
+                    .or(self.file(&c.loser, &c.path).path())
+                    .unwrap_or_default()
+                    .to_string()
+            };
+            Some(EntryCollision {
+                tree: c.tree,
+                cause,
+                path,
+            })
+        }));
         let collisions = gather_collisions(
             self.collisions
                 .iter()
@@ -2934,7 +3002,19 @@ impl World {
                     }
                 }),
         );
-        Shown { trees, collisions }
+        Shown {
+            trees,
+            entries,
+            collisions,
+            entry_collisions,
+        }
+    }
+
+    /// Tree `t`'s entries as [`Shown::entries`] keeps them.
+    fn shown_entries(&self, t: TreeId) -> BTreeMap<String, Meta> {
+        let e = self.entries(&self.head(t));
+        let files = e.files.into_values();
+        shown_entries(files.chain(e.dirs))
     }
 
     /// Every ref's commits, for history checks.
@@ -2999,6 +3079,10 @@ fn no_such(what: &str, path: &str) -> CallError {
 const fn libc_enoent() -> i32 {
     2
 }
+
+/// `EEXIST` and `ENOTEMPTY` on Linux, as [`libc_enoent`].
+const EEXIST: i32 = 17;
+const ENOTEMPTY: i32 = 39;
 
 fn text(bytes: &[u8]) -> Result<String, CallError> {
     String::from_utf8(bytes.to_vec()).map_err(|e| CallError::new(e.to_string()))
@@ -3071,7 +3155,7 @@ impl TreeCalls for World {
 
     fn rename(&mut self, c: &Caller, from: &str, to: &str) -> Result<(), CallError> {
         let client = client_of(c);
-        if self.client_lookup(&client, from).is_none() {
+        if self.client_lookup(&client, from).is_none() && !self.client_dir(&client, from) {
             return Err(no_such("rename", from));
         }
         World::rename(self, &client, from, to);
@@ -3117,6 +3201,70 @@ impl TreeCalls for World {
         Ok(())
     }
 
+    fn mkdir(&mut self, c: &Caller, path: &str, meta: &Meta) -> Result<(), CallError> {
+        let client = client_of(c);
+        let e = self.entries(&self.target_head(self.target_of(&client)));
+        if !e.is_dir(entries::parent(path)) {
+            return Err(no_such("mkdir", path));
+        }
+        if !e.at(path).is_empty() {
+            return Err(CallError {
+                errno: Some(EEXIST),
+                message: format!("mkdir of {path}: it exists"),
+            });
+        }
+        World::mkdir(self, &client, path, *meta);
+        Ok(())
+    }
+
+    fn rmdir(&mut self, c: &Caller, path: &str) -> Result<(), CallError> {
+        let client = client_of(c);
+        let e = self.entries(&self.target_head(self.target_of(&client)));
+        if !e.dirs.contains_key(path) {
+            return Err(no_such("rmdir", path));
+        }
+        if !e.under(path).is_empty() {
+            return Err(CallError {
+                errno: Some(ENOTEMPTY),
+                message: format!("rmdir of {path}: not empty"),
+            });
+        }
+        World::rmdir(self, &client, path);
+        Ok(())
+    }
+
+    fn set_meta(&mut self, c: &Caller, path: &str, meta: &Meta) -> Result<(), CallError> {
+        let client = client_of(c);
+        if self.client_lookup(&client, path).is_none() && !self.client_dir(&client, path) {
+            return Err(no_such("set_meta", path));
+        }
+        World::set_meta(self, &client, path, *meta);
+        Ok(())
+    }
+
+    fn symlink(
+        &mut self,
+        c: &Caller,
+        path: &str,
+        target: &str,
+        meta: &Meta,
+    ) -> Result<(), CallError> {
+        let client = client_of(c);
+        let e = self.entries(&self.target_head(self.target_of(&client)));
+        if !e.is_dir(entries::parent(path)) {
+            return Err(no_such("symlink", path));
+        }
+        if !e.at(path).is_empty() {
+            return Err(CallError {
+                errno: Some(EEXIST),
+                message: format!("symlink {path}: it exists"),
+            });
+        }
+        World::symlink(self, &client, path, target, *meta)
+            .map(drop)
+            .ok_or_else(|| CallError::new("every unborn identity is taken"))
+    }
+
     fn read(&self, t: TreeId, path: &str) -> Result<Option<Vec<u8>>, CallError> {
         let head = self.head(t);
         Ok(self
@@ -3133,6 +3281,11 @@ impl TreeCalls for World {
         paths.sort();
         Ok(paths)
     }
+
+    fn entries(&self, t: TreeId) -> Result<Vec<(String, Meta)>, CallError> {
+        let e = World::entries(self, &self.head(t));
+        Ok(e.files.into_values().chain(e.dirs).collect())
+    }
 }
 
 /// The model's own history, for [`crate::calls::replay`] driving a world: its
@@ -3142,6 +3295,10 @@ pub struct ModelHistory;
 impl History<World> for ModelHistory {
     fn collisions(&mut self, w: &World) -> Result<Vec<ShownCollision>, CallError> {
         Ok(w.shown().collisions)
+    }
+
+    fn entry_collisions(&mut self, w: &World) -> Result<Vec<EntryCollision>, CallError> {
+        Ok(w.shown().entry_collisions)
     }
 
     fn head(&mut self, w: &World, t: TreeId) -> Result<(String, usize), CallError> {

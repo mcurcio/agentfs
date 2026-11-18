@@ -12,6 +12,18 @@ design was reviewed on 2026-10-12.
 
 ### Added
 
+- **Tree views: forks land directories, metadata and links by the model's
+  rules.** A fork's change lands in its upstream, and a sync brings the
+  upstream's decisions back, by rules 13 to 15: an entry's kind, mode, owner
+  and group are one value, which lands over the value its writer saw; a
+  directory is its path, so two trees making one directory agree, and a
+  directory's rename moves everything under it as one change; a link is a file
+  whose bytes are its target. A change that loses by these rules loses whole,
+  and its landing's `Agentfs-Collisions` names the cause and the entry:
+  `metadata`, `directory-not-empty` or `directory-gone`. The conformance replay
+  runs the rules' scenarios on the library and on real mounts, comparing each
+  tree's directories, kinds and metadata and each loss's cause, and reads
+  invariant D1 (every entry's parent is a directory) from history.
 - **Tree views: owners, links and times.** A view presents each entry's
   recorded owner and group; root can `chown`, an owner can `chgrp`, and the
   kernel lets each user do what the recorded modes and owners allow
@@ -34,8 +46,7 @@ design was reviewed on 2026-10-12.
   (`set_meta`) and explicit times (`set_times`, no commit); times are each
   tree's own, kept by the journal, never in history. Commits are
   `Agentfs-Format: envelope-2` and the state format `agentfs-trees-11`:
-  earlier tree volumes do not open. Takes add the directories their source has
-  and remove none, an interim rule until the model's directory rules are built.
+  earlier tree volumes do not open.
 - **Tree views: recovery converges after a lost event.** An unkeyed fork with no
   client attached ends at the next judgement (boot, a last detach, a landing),
   so a crash between a client's end and the fork's end, or between a fork's

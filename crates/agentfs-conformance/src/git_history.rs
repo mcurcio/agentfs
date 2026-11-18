@@ -1,13 +1,17 @@
 //! The engine's history as a replay reads it, from its bare repository (VERIFYING.md,
 //! "The model as the conformance suite"): one long-lived `git cat-file`, this
 //! crate's own reader of each commit's layout (docs/trees.md, "What a commit
-//! holds": `files/`, `lines/` and `names/` under two hashed folders), and
-//! [`EngineHistory`], the collisions and heads a replay compares. Never the
+//! holds": `files/`, `lines/` and `names/` under two hashed folders, and each
+//! directory's record in `dirs/`), and [`EngineHistory`], the collisions and
+//! heads a replay compares. Never the
 //! library's bookkeeping (`tree_actor`): the folders are hashed here with `git
 //! hash-object`, not the library's code.
 
 use crate::engine_names::EngineNames;
-use agentfs_model::calls::{CallError, History, ShownCollision, TreeId, gather_collisions};
+use agentfs_model::calls::{
+    CallError, Cause, EntryCollision, History, Kind, Meta, ShownCollision, TreeId,
+    gather_collisions, gather_entry_collisions,
+};
 use agentfs_model::content::{Content, Line, State};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
@@ -34,6 +38,8 @@ pub(crate) struct FileMap {
     pub(crate) identity: u64,
     pub(crate) lines: Vec<(String, String, Option<Vec<u8>>)>,
     pub(crate) ancestors: BTreeMap<String, Option<String>>,
+    /// The file's or link's metadata, the entry's third part.
+    pub(crate) meta: Meta,
 }
 
 /// One commit, parsed.
@@ -45,6 +51,8 @@ pub(crate) struct Commit {
     pub(crate) maps: BTreeMap<u64, FileMap>,
     /// Each file identity's name history: head, versions.
     pub(crate) names: BTreeMap<u64, (u64, BTreeMap<u64, NameVersion>)>,
+    /// Each directory's record by path, the root's (`dirs/root`) at `""`.
+    pub(crate) dirs: BTreeMap<String, Meta>,
 }
 
 #[derive(Clone, Debug)]
@@ -81,14 +89,29 @@ impl Commit {
         match v {
             Version::Line { file, version } => self.holds_line(*file, version),
             Version::Name { file, version } => self.holds_name(*file, *version),
+            Version::Entry { path } => match path.strip_suffix('/') {
+                Some(dir) => self.dirs.contains_key(dir),
+                None => self.files.contains_key(path),
+            },
         }
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum Version {
-    Line { file: u64, version: String },
-    Name { file: u64, version: u64 },
+    Line {
+        file: u64,
+        version: String,
+    },
+    Name {
+        file: u64,
+        version: u64,
+    },
+    /// An entry rules 13 and 14 judged, the winner of a whole loss they decided:
+    /// a file's path, or a directory's and a `/`.
+    Entry {
+        path: String,
+    },
 }
 
 impl Version {
@@ -107,14 +130,23 @@ impl Version {
                 file: number(&name["file"])?,
                 version: number(&name["version"])?,
             })
+        } else if let Some(entry) = v.get("Entry") {
+            Ok(Self::Entry {
+                path: entry["path"]
+                    .as_str()
+                    .ok_or_else(|| format!("bad version {v}"))?
+                    .to_owned(),
+            })
         } else {
             Err(format!("bad version {v}"))
         }
     }
 
-    pub(crate) fn file(&self) -> u64 {
+    /// The file a line or name version is of; none for an entry.
+    pub(crate) fn file(&self) -> Option<u64> {
         match self {
-            Self::Line { file, .. } | Self::Name { file, .. } => *file,
+            Self::Line { file, .. } | Self::Name { file, .. } => Some(*file),
+            Self::Entry { .. } => None,
         }
     }
 }
@@ -126,19 +158,69 @@ pub(crate) struct Decision {
     pub(crate) whole: bool,
 }
 
-pub(crate) fn decisions(c: &Commit) -> Result<Vec<Decision>, String> {
-    let mut out = Vec::new();
+/// A loss by rule 13 or 14: `{"cause":..,"path":..}`, its path a file's or a
+/// directory's and a `/`.
+#[derive(Clone, Debug)]
+pub(crate) struct EntryDecision {
+    pub(crate) cause: Cause,
+    pub(crate) path: String,
+}
+
+/// A commit's recorded decisions: of line and name versions, and of entries.
+pub(crate) fn all_decisions(c: &Commit) -> Result<(Vec<Decision>, Vec<EntryDecision>), String> {
+    let (mut versions, mut entries) = (Vec::new(), Vec::new());
     for json in c.trailers("Agentfs-Collisions") {
         let parsed: Value = serde_json::from_str(json).map_err(|e| e.to_string())?;
         for d in parsed.as_array().ok_or("collisions are not a list")? {
-            out.push(Decision {
+            if let Some(cause) = d["cause"].as_str() {
+                entries.push(EntryDecision {
+                    cause: Cause::from_word(cause).ok_or_else(|| format!("bad cause {d}"))?,
+                    path: d["path"]
+                        .as_str()
+                        .ok_or_else(|| format!("bad entry {d}"))?
+                        .to_owned(),
+                });
+                continue;
+            }
+            versions.push(Decision {
                 lost: Version::parse(&d["lost"])?,
                 winner: Version::parse(&d["winner"])?,
                 whole: d["kind"] == "Whole",
             });
         }
     }
-    Ok(out)
+    Ok((versions, entries))
+}
+
+/// Metadata as history holds it: `{"kind":"file","mode":"0644","uid":0,"gid":0}`.
+pub(crate) fn parse_meta(v: &Value) -> Result<Meta, String> {
+    let bad = || format!("bad metadata {v}");
+    let kind = match v["kind"].as_str().ok_or_else(bad)? {
+        "file" => Kind::File,
+        "symlink" => Kind::Symlink,
+        "dir" => Kind::Dir,
+        _ => return Err(bad()),
+    };
+    let mode = v["mode"]
+        .as_str()
+        .filter(|m| m.len() == 4)
+        .ok_or_else(bad)?;
+    let number = |k: &str| {
+        v[k].as_u64()
+            .and_then(|n| u32::try_from(n).ok())
+            .ok_or_else(bad)
+    };
+    Ok(Meta {
+        kind,
+        mode: u32::from_str_radix(mode, 8).map_err(|_| bad())?,
+        uid: number("uid")?,
+        gid: number("gid")?,
+    })
+}
+
+/// A directory's path from its record's leaf: `%2F` is `/`, `%25` is `%`.
+fn dir_path(leaf: &str) -> String {
+    leaf.replace("%2F", "/").replace("%25", "%")
 }
 
 /// One long-lived `git cat-file --batch`, and short `git` commands.
@@ -295,9 +377,12 @@ impl Git {
                     return Err(format!("{oid:.7}: the root commit holds {path}"));
                 }
             }
-            return Ok(header);
+            let mut commit = header;
+            commit.dirs = self.dirs(oid)?;
+            return Ok(commit);
         }
         let mut commit = header;
+        commit.dirs = self.dirs(oid)?;
         for (name, blob) in self.leaves(oid, "files")? {
             let bytes = self.object(&blob)?;
             commit.files.insert(name, bytes);
@@ -339,6 +424,39 @@ impl Git {
     }
 }
 
+impl Git {
+    /// Every directory record of commit `oid`: `dirs/root`, and each
+    /// `dirs/<aa>/<bb>/<enc(path)>` in the folders its path hashes to. Any
+    /// other blob under `dirs/` is a layout the engine never writes.
+    fn dirs(&mut self, oid: &str) -> Result<BTreeMap<String, Meta>, String> {
+        let listing = self.run(&["ls-tree", "-r", "-z", "--full-tree", oid, "dirs/"])?;
+        let mut dirs = BTreeMap::new();
+        for record in listing.split_terminator('\0') {
+            let (head, path) = record.split_once('\t').ok_or_else(|| record.to_owned())?;
+            let blob = head.rsplit(' ').next().ok_or_else(|| record.to_owned())?;
+            let dir = match path.split('/').collect::<Vec<_>>().as_slice() {
+                ["dirs", "root"] => String::new(),
+                ["dirs", aa, bb, leaf] => {
+                    let dir = dir_path(leaf);
+                    if dir.is_empty() || self.folders(&dir)? != format!("{aa}/{bb}") {
+                        return Err(format!("{oid:.7}: {path} is not in its path's folders"));
+                    }
+                    dir
+                }
+                _ => return Err(format!("{oid:.7}: {path} is not dirs/<aa>/<bb>/<enc>")),
+            };
+            let meta: Value =
+                serde_json::from_slice(&self.object(blob)?).map_err(|e| e.to_string())?;
+            let meta = parse_meta(&meta).map_err(|e| format!("{oid:.7} {path}: {e}"))?;
+            if meta.kind != Kind::Dir {
+                return Err(format!("{oid:.7}: {path} records a {:?}", meta.kind));
+            }
+            dirs.insert(dir, meta);
+        }
+        Ok(dirs)
+    }
+}
+
 impl Drop for Git {
     fn drop(&mut self) {
         let _ = self.child.kill();
@@ -362,6 +480,10 @@ fn nth(version: &str, n: u64) -> Result<String, String> {
 /// ancestors are runs too (docs/trees.md, "What a commit holds").
 pub(crate) fn parse_map(path: &str, entry: &Value, bytes: &[u8]) -> Result<FileMap, String> {
     let identity = entry[0].as_u64().ok_or("bad identity")?;
+    let meta = parse_meta(&entry[2])?;
+    if meta.kind == Kind::Dir {
+        return Err("a directory's metadata on a file".into());
+    }
     let map = &entry[1];
     let mut rest = bytes;
     let mut lines = Vec::new();
@@ -409,6 +531,7 @@ pub(crate) fn parse_map(path: &str, entry: &Value, bytes: &[u8]) -> Result<FileM
         identity,
         lines,
         ancestors,
+        meta,
     })
 }
 
@@ -461,6 +584,7 @@ pub struct EngineHistory {
     refs: String,
     seen: BTreeSet<String>,
     lost: Vec<ShownCollision>,
+    lost_entries: Vec<EntryCollision>,
 }
 
 impl EngineHistory {
@@ -472,6 +596,7 @@ impl EngineHistory {
             refs: String::new(),
             seen: BTreeSet::new(),
             lost: Vec::new(),
+            lost_entries: Vec::new(),
         })
     }
 
@@ -506,12 +631,23 @@ impl EngineHistory {
             .names
             .tree(&name)
             .ok_or_else(|| format!("{oid:.7}: a landing in {name:?}, no tree of the trace"))?;
-        for d in decisions(&c)? {
-            let path = c
-                .name_path(d.lost.file())
-                .or(incoming.name_path(d.lost.file()))
-                .unwrap_or_default()
-                .to_owned();
+        let (versions, entries) = all_decisions(&c)?;
+        self.lost_entries
+            .extend(entries.into_iter().map(|d| EntryCollision {
+                tree,
+                cause: d.cause,
+                path: d.path,
+            }));
+        for d in versions {
+            let path = match (&d.lost, d.lost.file()) {
+                (Version::Entry { path }, _) => path.clone(),
+                (_, Some(file)) => c
+                    .name_path(file)
+                    .or(incoming.name_path(file))
+                    .unwrap_or_default()
+                    .to_owned(),
+                (_, None) => String::new(),
+            };
             let lost_bytes = match &d.lost {
                 Version::Line { file, version } => incoming
                     .maps
@@ -520,7 +656,7 @@ impl EngineHistory {
                     .and_then(|l| l.2.clone())
                     .into_iter()
                     .collect(),
-                Version::Name { .. } => Vec::new(),
+                Version::Name { .. } | Version::Entry { .. } => Vec::new(),
             };
             self.lost.push(ShownCollision {
                 tree,
@@ -537,6 +673,11 @@ impl<T: ?Sized> History<T> for EngineHistory {
     fn collisions(&mut self, _: &T) -> Result<Vec<ShownCollision>, CallError> {
         self.refresh().map_err(CallError::new)?;
         Ok(gather_collisions(self.lost.iter().cloned()))
+    }
+
+    fn entry_collisions(&mut self, _: &T) -> Result<Vec<EntryCollision>, CallError> {
+        self.refresh().map_err(CallError::new)?;
+        Ok(gather_entry_collisions(self.lost_entries.iter().cloned()))
     }
 
     fn head(&mut self, _: &T, t: TreeId) -> Result<(String, usize), CallError> {
