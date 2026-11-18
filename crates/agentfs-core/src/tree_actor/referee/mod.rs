@@ -1,9 +1,10 @@
-//! The referee: every line and name rule of one pair of trees, a fork and its upstream
-//! (docs/target-architecture/git-model.md §7, §8).
+//! The referee: every line, name, metadata and directory rule of one pair of trees, a fork and
+//! its upstream (docs/target-architecture/git-model.md §7, §8; docs/library/core.md).
 //! Pure: it reads history only through [`Landed`], writes nothing, and gives back plans: `land` a
 //! [`Decision`], `sync` a fork's snapshot. The actor owns queue order and durability.
 
 mod ancestry;
+mod entries;
 mod names;
 mod placing;
 mod undecided;
@@ -19,6 +20,7 @@ use super::queue;
 use super::tree::{EventNumber, LineVersion, Lines, MergeFileIdentity, NameHistory};
 use super::{Error, Result};
 pub(super) use ancestry::Broken;
+pub(super) use entries::{Cause, Record, with_directories};
 pub(super) use undecided::{Landed, Undecided, ended_files, undecided};
 
 /// A tree's files, name histories and directories, each file's lines as
@@ -102,6 +104,8 @@ pub(super) enum Version {
         file: MergeFileIdentity,
         version: LineVersion,
     },
+    /// An entry rules 13 and 14 judged: a file's path, or a directory's and a `/`.
+    Entry { path: String },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -109,13 +113,60 @@ pub(super) enum CollisionKind {
     Name,
     Line,
     Whole,
+    /// Rule 13 or 14: its cause; the collision's `lost` and `winner` are the entry.
+    Entry(Cause),
 }
 
+/// One decision of a landing. In `Agentfs-Collisions` a line or name decision is
+/// `{"lost":..,"winner":..,"kind":..}`; a decision by rule 13 or 14 is
+/// `{"cause":"metadata"|"directory-not-empty"|"directory-gone","path":..}`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "StoredCollision", into = "StoredCollision")]
 pub(super) struct Collision {
     pub lost: Version,
     pub winner: Version,
     pub kind: CollisionKind,
+}
+
+/// A [`Collision`] as history and the journal hold it.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+enum StoredCollision {
+    Entry {
+        cause: Cause,
+        path: String,
+    },
+    Versions {
+        lost: Version,
+        winner: Version,
+        kind: CollisionKind,
+    },
+}
+
+impl From<Collision> for StoredCollision {
+    fn from(c: Collision) -> Self {
+        match (c.kind, c.lost) {
+            (CollisionKind::Entry(cause), Version::Entry { path }) => Self::Entry { cause, path },
+            (kind, lost) => Self::Versions {
+                lost,
+                winner: c.winner,
+                kind,
+            },
+        }
+    }
+}
+
+impl From<StoredCollision> for Collision {
+    fn from(c: StoredCollision) -> Self {
+        match c {
+            StoredCollision::Entry { cause, path } => Self {
+                lost: Version::Entry { path: path.clone() },
+                winner: Version::Entry { path },
+                kind: CollisionKind::Entry(cause),
+            },
+            StoredCollision::Versions { lost, winner, kind } => Self { lost, winner, kind },
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -171,12 +222,23 @@ fn land_by_line(
         files,
     } = verdicts::verdicts(upstream, base, incoming, prior)?;
     names::displace(upstream, base, incoming, &applied_names, &mut candidates)?;
-    let mut applied = upstream.clone();
-    // Interim until the directory landing rules (MODEL.md R13-R15) are built:
-    // every directory of the change the upstream lacks is added; none goes.
-    for (path, meta) in &incoming.dirs {
-        applied.dirs.entry(path.clone()).or_insert(*meta);
+    // Rules 13 and 14: the change's metadata and directories against the upstream's.
+    for (at, loss) in entries::land(base, incoming, upstream)?
+        .into_iter()
+        .enumerate()
+    {
+        let entry = Version::Entry { path: loss.path };
+        candidates.push(verdicts::Candidate {
+            order: verdicts::Order {
+                of: verdicts::Of::Entry,
+                file: MergeFileIdentity(0),
+                at,
+            },
+            lost: entry.clone(),
+            loss: Some((entry, CollisionKind::Entry(loss.cause))),
+        });
     }
+    let mut applied = upstream.clone();
     for (id, name) in applied_names {
         if name.is_ended()? {
             applied.files.remove(&id);
@@ -217,21 +279,19 @@ fn land_by_line(
             File {
                 object: theirs.map_or(file.object, |f| f.object),
                 lines: placed.lines,
-                meta: kept_meta(theirs, base.files.get(&id), file),
+                meta: theirs.map_or(file.meta, |f| f.meta),
             },
         );
     }
+    // Rule 13: each value the change wrote, over the upstream's.
+    entries::apply(base, incoming, &mut applied)?;
     Ok(whole::whole(upstream, applied, candidates))
 }
 
-/// The metadata a landed file keeps. Interim until the directory landing
-/// rules (MODEL.md R13-R15) are built: the change's, when it changed the
-/// file's metadata or the upstream lacks the file; else the upstream's.
-fn kept_meta<L>(theirs: Option<&File<L>>, base: Option<&File<L>>, incoming: &File<L>) -> Meta {
-    match theirs {
-        Some(theirs) if base.is_some_and(|base| base.meta == incoming.meta) => theirs.meta,
-        _ => incoming.meta,
-    }
+/// The keys of the upstream a landing of the change from `base` to `incoming` reads beside its
+/// own (rule 14): a later step touching one refuses the take.
+pub(super) fn consulted(base: &Snapshot, incoming: &Snapshot) -> Result<BTreeSet<queue::Key>> {
+    entries::consulted(base, incoming)
 }
 
 /// A sync never decides (R3a): the upstream's snapshot with the fork's undecided versions kept
@@ -250,20 +310,21 @@ pub(super) fn sync(
         .iter()
         .map(|(id, lines)| (*id, lines.expand()))
         .collect();
-    let mut placed = placing::sync_files(&upstream, &fork, &undecided.lines, &last_lines)?;
-    let names = names::sync_names(&upstream, &fork, &undecided.names)?;
+    let mut placed = placing::sync_files(
+        &upstream,
+        &fork,
+        &undecided.lines,
+        &undecided.metas,
+        &last_lines,
+    )?;
+    let mut names = names::sync_names(&upstream, &fork, &undecided.names)?;
     let mut files = BTreeMap::new();
     for (id, name) in &names {
         if !name.is_ended()? {
             files.insert(*id, placed.remove(id).ok_or(Error::Format)?);
         }
     }
-    // Interim until the directory landing rules (MODEL.md R13-R15) are built:
-    // every directory of the upstream the fork lacks is added; none goes.
-    let mut dirs = fork.dirs.clone();
-    for (path, meta) in &upstream.dirs {
-        dirs.entry(path.clone()).or_insert(*meta);
-    }
+    let dirs = entries::sync(&upstream, &fork, &undecided.dirs, &mut names, &mut files)?;
     Snapshot { files, names, dirs }.stored()
 }
 
@@ -742,6 +803,7 @@ mod sync_tests {
         let undecided = Undecided {
             lines: lines.clone(),
             names: names.clone(),
+            ..Undecided::default()
         };
         super::sync(
             &upstream.stored_snapshot(),

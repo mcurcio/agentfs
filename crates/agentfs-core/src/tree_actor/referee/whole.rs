@@ -44,7 +44,7 @@ pub(super) fn whole(
 #[cfg(test)]
 mod tests {
     use super::super::Version;
-    use super::super::verdicts::Order;
+    use super::super::verdicts::{Of, Order};
     use super::*;
     use crate::tree_actor::tree::{EventNumber, LineVersion, MergeFileIdentity};
 
@@ -64,7 +64,7 @@ mod tests {
     ) -> Candidate {
         Candidate {
             order: Order {
-                line: line_,
+                of: if line_ { Of::Line } else { Of::Name },
                 file: MergeFileIdentity(file),
                 at,
             },

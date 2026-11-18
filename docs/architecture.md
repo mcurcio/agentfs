@@ -109,11 +109,12 @@ missing from these tables or a row names a module that no longer exists;
 | `tree_actor/recording/pages.rs` | The kernel's one page cache per file: page fills, page writes and the size replies for shared mappings, and the one rule of which page-write pieces a close applies, which the actor and the builder both run (rules ledger, R1.4) |
 | `tree_actor/queue.rs` | Queue and locks: P1 eligibility, held keys and the `Cut` of a prefix sync |
 | `tree_actor/rows.rs` | Rows, domain-agnostic: a row chain (`Chain`) and its domain, a step's row writes and their events, and each chain's row as the journal's records leave them (`SavedRows`, the one apply the call and the replay run) |
-| `tree_actor/referee/mod.rs` | The referee: every line and name rule of a fork and its upstream, pure. `land` composes verdicts, names, placing and whole into a decision; `sync` keeps a fork's undecided versions; `touches` gives a step's lock keys |
+| `tree_actor/referee/mod.rs` | The referee: every line, name, metadata and directory rule of a fork and its upstream, pure. `land` composes verdicts, names, entries, placing and whole into a decision; `sync` keeps a fork's undecided versions and records; `touches` gives a step's lock keys |
+| `tree_actor/referee/entries.rs` | Directories, metadata and links (rules 13 to 15): a landing's metadata and directory losses (`metadata`, `directory-not-empty`, `directory-gone`) and the directory keys it reads, and a sync's directories with the fork's undecided ones and those its entries need kept |
 | `tree_actor/referee/ancestry.rs` | The one ancestry walk (`descends`) over names and lines alike, and the one union of line ancestries |
 | `tree_actor/referee/names.rs` | Names: a landing's name onto a path a live upstream file holds (R11.2), and a sync's names with the fork's undecided ones kept |
 | `tree_actor/referee/placing.rs` | Where versions go in a file's lines: a landing's applying lines and its joins (R10.4, R10.8), a sync's undecided lines (R10.6, R10.9) |
-| `tree_actor/referee/undecided.rs` | A fork's undecided versions, through the referee's one question to history (`Landed`) |
+| `tree_actor/referee/undecided.rs` | A fork's undecided versions and metadata and directory records, through the referee's questions to history (`Landed`) |
 | `tree_actor/referee/verdicts.rs` | Rule 3 for one change, for names and lines alike: each changed version's verdict and its loss so far |
 | `tree_actor/referee/whole.rs` | R3e: a change lands whole or not at all; the collisions in their order |
 | `tree_actor/stages.rs` | Measurements only, never read by a decision: runs and time per actor stage, and the Git children the actor's path has started (counted at `git_cli::counted`, the one spawn site; target git-model §18) |

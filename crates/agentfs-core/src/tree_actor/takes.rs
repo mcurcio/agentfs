@@ -143,7 +143,9 @@ pub(in crate::tree_actor) fn decide(
         collisions,
         entry_done,
         sources,
+        reads: consulted,
     } = decided;
+    reads.extend(consulted);
     let mut writes = plans[index].files.clone();
     let (files, names, dirs) = match &after {
         Some(after) => {
@@ -300,7 +302,10 @@ impl TreeActor {
 
     /// Records the keys a step of `tree` touched, while its queue holds an
     /// entry a decision may read: a decision reads a queue as built, so a
-    /// step before the entry was queued is before every decision on it.
+    /// step before the entry was queued is before every decision on it. A
+    /// name touches every directory above it too: a take that judged a
+    /// directory (rule 14) is refused by an entry made, moved or removed
+    /// under it.
     pub(in crate::tree_actor) fn touch(
         &mut self,
         tree: TreeId,
@@ -311,7 +316,7 @@ impl TreeActor {
             return;
         }
         let touched = self.touched.entry(tree).or_default();
-        for key in keys {
+        for key in referee::with_directories(keys) {
             touched.insert(key, RecordNo::new(seq));
         }
     }
@@ -627,6 +632,36 @@ mod tests {
         assert_eq!(v.land(decision).unwrap(), Err(Refused::FilesChanged));
         assert_eq!(v.take_next(ROOT).unwrap(), Took::Taken);
         assert!(!v.queue_holds(ROOT));
+    }
+
+    /// Rule 14's read keys: a landing that judged directory `q` (the fork's
+    /// create under it) is refused by the root's rmdir of `q` after the
+    /// decision, though the take writes nothing of `q`; decided again, the
+    /// create loses whole as `directory-gone`.
+    #[test]
+    fn a_take_refused_for_a_consulted_directory_key_is_decided_again() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut v = new_actor(tmp.path());
+        put(&mut v, ROOT, "a", b"one\n");
+        v.mkdir(ROOT, "q", ATTRS, &writer("w")).unwrap();
+        let fork = rowless_fork(&mut v);
+        put(&mut v, fork, "q/x", b"");
+        // Not a fast-forward: the root moved past the fork's first parent.
+        put(&mut v, ROOT, "b", b"b\n");
+        let decision = decided(&v, ROOT);
+        assert!(decision.take.collisions.is_empty(), "q is there");
+        assert!(decision.reads.contains(&Key::Name("q".to_owned())));
+        assert!(!decision.writes.contains(&Key::Name("q".to_owned())));
+        v.rmdir(ROOT, "q", &writer("w")).unwrap();
+        assert_eq!(v.land(decision).unwrap(), Err(Refused::FilesChanged));
+        while v.take_next(ROOT).unwrap() == Took::Taken {}
+        assert!(!v.queue_holds(ROOT));
+        assert!(v.read(ROOT, "q/x").is_err());
+        let (_, collisions) = root_as_built(&v);
+        assert!(
+            collisions.iter().any(|c| c.contains("DirectoryGone")),
+            "{collisions:?}"
+        );
     }
 
     #[test]

@@ -15,31 +15,123 @@ use super::format::{self, read_snapshot};
 use super::message;
 use super::refs;
 use crate::tree_actor::journal::{TAKE_CHUNK, TakeHead};
+use crate::tree_actor::meta::Meta;
 use crate::tree_actor::stages::{Timer, Which};
-use crate::tree_actor::tree::{EventNumber, Lines, MergeFileIdentity};
+use crate::tree_actor::tree::{EventNumber, Lines, MergeFileIdentity, NameHistory};
 use crate::tree_actor::{Error, Result, TreeId, queue, referee};
 use crate::tree_git::{STREAMED_BLOB, TreeGit};
 use crate::tree_reconcile::{self, FileImage, Image, Piece};
 
+/// A record's value in one commit, as [`LandedInto`] caches it: the commit, and the record (a
+/// file's identity, or none and a directory's path).
+type RecordAt = (Oid, Option<MergeFileIdentity>, String);
+
 /// The actor's [`referee::Landed`]: whether a save's commit is in `upstream`'s history. That
 /// never changes, and every line one save wrote has that save's commit: ask Git once per commit,
-/// not once per line (an 8 MiB file is 8,000 lines).
+/// not once per line (an 8 MiB file is 8,000 lines). A record's writing commit is found from the
+/// fork's head as the model finds it: back through each parent holding the same value.
 struct LandedInto<'a> {
     repo: &'a TreeGit,
     owners: &'a BTreeMap<EventNumber, Oid>,
     upstream: Oid,
     reached: BTreeMap<Oid, bool>,
+    fork_head: Oid,
+    values: &'a mut BTreeMap<RecordAt, Option<Meta>>,
+}
+
+impl LandedInto<'_> {
+    /// Whether `commit` is in the upstream's history.
+    fn reaches(&mut self, commit: Oid) -> Result<bool> {
+        if let Some(known) = self.reached.get(&commit) {
+            return Ok(*known);
+        }
+        let answer = self.repo.is_ancestor(commit, self.upstream)?;
+        self.reached.insert(commit, answer);
+        Ok(answer)
+    }
+
+    fn value(&mut self, commit: Oid, record: referee::Record<'_>) -> Result<Option<Meta>> {
+        let key = match record {
+            referee::Record::Meta(id) => (commit, Some(id), String::new()),
+            referee::Record::Dir(path) => (commit, None, path.to_owned()),
+        };
+        if let Some(known) = self.values.get(&key) {
+            return Ok(*known);
+        }
+        let value = record_at(self.repo, commit, record)?;
+        self.values.insert(key, value);
+        Ok(value)
+    }
 }
 
 impl referee::Landed for LandedInto<'_> {
     fn landed(&mut self, save: EventNumber) -> Result<bool> {
         let owner = *self.owners.get(&save).ok_or(Error::Format)?;
-        if let Some(known) = self.reached.get(&owner) {
-            return Ok(*known);
+        self.reaches(owner)
+    }
+
+    /// The walk stops at the first commit in the upstream's history: the writing commit is that
+    /// one or older, so it is in it too. Only the fork's undecided commits are walked.
+    fn record_landed(&mut self, record: referee::Record<'_>) -> Result<bool> {
+        let mine = self.value(self.fork_head, record)?;
+        let mut at = self.fork_head;
+        loop {
+            if self.reaches(at)? {
+                return Ok(true);
+            }
+            let mut next = None;
+            for parent in self.repo.read_commit(at)?.parents {
+                if self.value(parent, record)? == mine {
+                    next = Some(parent);
+                    break;
+                }
+            }
+            match next {
+                Some(parent) => at = parent,
+                None => return Ok(false),
+            }
         }
-        let answer = self.repo.is_ancestor(owner, self.upstream)?;
-        self.reached.insert(owner, answer);
-        Ok(answer)
+    }
+}
+
+/// The object at `path` (slash-separated) under tree `tree`, if any.
+fn lookup(repo: &TreeGit, tree: Oid, path: &str) -> Result<Option<Oid>> {
+    let mut at = tree;
+    for part in path.split('/') {
+        match repo
+            .list_tree(at)?
+            .into_iter()
+            .find(|entry| entry.name == part.as_bytes())
+        {
+            Some(entry) => at = entry.oid,
+            None => return Ok(None),
+        }
+    }
+    Ok(Some(at))
+}
+
+/// A record's value in `commit`: a directory's record, or a live file's metadata from its line
+/// record. A few paths read, never the whole snapshot.
+fn record_at(repo: &TreeGit, commit: Oid, record: referee::Record<'_>) -> Result<Option<Meta>> {
+    let tree = repo.read_commit(commit)?.tree;
+    match record {
+        referee::Record::Dir(path) => match lookup(repo, tree, &format::dir_path(path))? {
+            Some(blob) => Ok(Some(serde_json::from_slice(&repo.read_blob(blob)?)?)),
+            None => Ok(None),
+        },
+        referee::Record::Meta(id) => {
+            let Some(names) = lookup(repo, tree, &format::names_path(id))? else {
+                return Ok(None);
+            };
+            let history: NameHistory = serde_json::from_slice(&repo.read_blob(names)?)?;
+            let Some(path) = history.path()? else {
+                return Ok(None);
+            };
+            let lines = lookup(repo, tree, &format::lines_path(path))?.ok_or(Error::Format)?;
+            let (_, _, meta): (MergeFileIdentity, serde::de::IgnoredAny, Meta) =
+                serde_json::from_slice(&repo.read_blob(lines)?)?;
+            Ok(Some(meta))
+        }
     }
 }
 
@@ -52,14 +144,16 @@ pub(in crate::tree_actor) struct SyncStep {
 }
 
 /// A take as decided: how the head moves, the snapshot it leaves, its
-/// collisions, whether its queue entry goes, and the commits other than the
-/// tree's head whose files hold its lines.
+/// collisions, whether its queue entry goes, the commits other than the
+/// tree's head whose files hold its lines, and the keys of the tree it read
+/// beside those it writes (a landing's directories, rule 14).
 pub(in crate::tree_actor) struct Decided {
     pub head: TakeHead,
     pub snapshot: Option<referee::Snapshot>,
     pub collisions: Vec<referee::Collision>,
     pub entry_done: bool,
     pub sources: Vec<Oid>,
+    pub reads: BTreeSet<queue::Key>,
 }
 
 /// Where a take's files' bytes are: the blobs of the files whose lines it
@@ -287,15 +381,12 @@ pub(in crate::tree_actor) fn decide_landing(
         read_snapshot(repo, incoming, objects)?,
     );
     let prior = prior_decisions(repo, current)?;
-    let mut decision = {
+    let decision = {
         let _timer = Timer::start(Which::Judge);
         referee::land(mine, &base, &theirs, &prior)?
     };
+    let reads = referee::consulted(&base, &theirs)?;
     let head = if base_commit == current {
-        // Interim until the directory landing rules (MODEL.md R13-R15) are
-        // built: a fast-forward's tree is the change's commit, directories
-        // and all.
-        decision.snapshot.dirs = theirs.dirs.clone();
         // Made on the parent's current version: every line replaces the
         // parent's, so nothing collides, and the save itself is the head.
         if !decision.collisions.is_empty()
@@ -317,6 +408,7 @@ pub(in crate::tree_actor) fn decide_landing(
         collisions: decision.collisions,
         entry_done: true,
         sources: vec![incoming],
+        reads,
     })
 }
 
@@ -343,15 +435,19 @@ pub(in crate::tree_actor) fn plan_sync(
     }
     todo.reverse();
     let objects = snapshot.objects(upstream);
+    let mut values = BTreeMap::new();
     queue::cut(todo, open, |last: Option<&SyncStep>, oid| {
         let parent = read_snapshot(repo, oid, objects)?;
         let undecided = referee::undecided(
             fork_snapshot,
+            &parent,
             &mut LandedInto {
                 repo,
                 owners: snapshot.owners(),
                 upstream: oid,
                 reached: BTreeMap::new(),
+                fork_head,
+                values: &mut values,
             },
         )?;
         let (last_lines, older) = last_lines(repo, &parent, oid, &undecided)?;
@@ -442,6 +538,7 @@ pub(in crate::tree_actor) fn decide_sync(
             collisions: Vec::new(),
             entry_done,
             sources: Vec::new(),
+            reads: BTreeSet::new(),
         });
     };
     let parent = read_snapshot(snapshot.repo(), target, snapshot.objects(upstream))?;
@@ -472,5 +569,6 @@ pub(in crate::tree_actor) fn decide_sync(
         collisions: Vec::new(),
         entry_done,
         sources,
+        reads: BTreeSet::new(),
     })
 }

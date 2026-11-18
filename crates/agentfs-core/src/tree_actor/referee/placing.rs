@@ -167,11 +167,13 @@ pub(super) fn sync_file(
 
 /// Every file either side holds, synced. A file the fork ended comes back as a new object
 /// numbered by the event that ended it (R11.3, `EventNumber::object`); one only the fork holds is
-/// synced over its `last_lines`.
+/// synced over its `last_lines`. A file both hold has the upstream's metadata, or the fork's
+/// when the fork's is undecided (`own_meta`, rule 13).
 pub(super) fn sync_files(
     upstream: &Snapshot,
     fork: &Snapshot,
     undecided: &BTreeSet<LineVersion>,
+    own_meta: &BTreeSet<MergeFileIdentity>,
     last_lines: &BTreeMap<MergeFileIdentity, Lines>,
 ) -> Result<BTreeMap<MergeFileIdentity, super::File<Lines>>> {
     let empty = Lines::default();
@@ -184,12 +186,14 @@ pub(super) fn sync_files(
     let mut files = BTreeMap::new();
     for id in ids {
         let file = match (upstream.files.get(&id), fork.files.get(&id)) {
-            // Interim until the directory landing rules (MODEL.md R13-R15) are
-            // built: the upstream's metadata.
             (Some(theirs), Some(own)) => super::File {
                 object: own.object,
                 lines: sync_file(&theirs.lines, &own.lines, undecided)?,
-                meta: theirs.meta,
+                meta: if own_meta.contains(&id) {
+                    own.meta
+                } else {
+                    theirs.meta
+                },
             },
             // A file this tree ended by an unlink or a rename-over that lost comes back as a new
             // object, numbered by the event that ended it, which numbers nothing else. Its old

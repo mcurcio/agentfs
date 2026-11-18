@@ -1,30 +1,37 @@
-//! A fork's undecided versions: those whose save is not in the upstream's history (R3a), the one
-//! question the referee asks of history (docs/target-architecture/git-model.md §8).
+//! A fork's undecided versions and records: those whose save is not in the upstream's history
+//! (R3a), the questions the referee asks of history (docs/target-architecture/git-model.md §8).
 
 use std::collections::BTreeSet;
 
-use super::Snapshot;
+use super::{Record, Snapshot};
 use crate::tree_actor::Result;
 use crate::tree_actor::tree::{EventNumber, LineVersion, MergeFileIdentity};
 use crate::tree_reconcile::Id;
 
-/// History's one answer the referee needs: whether the save numbered `save` is in the upstream's
-/// history.
+/// History's answers the referee needs: whether the save numbered `save` is in the upstream's
+/// history, and whether the commit that wrote the fork's value of a record is.
 pub(in crate::tree_actor) trait Landed {
     fn landed(&mut self, save: EventNumber) -> Result<bool>;
+    fn record_landed(&mut self, record: Record<'_>) -> Result<bool>;
 }
 
-/// The fork's versions the upstream has not decided.
+/// The fork's versions and records the upstream has not decided.
 #[derive(Debug, Default)]
 pub(in crate::tree_actor) struct Undecided {
     pub lines: BTreeSet<LineVersion>,
     pub names: BTreeSet<(MergeFileIdentity, EventNumber)>,
+    /// Files both hold whose metadata differs and is the fork's undecided value (rule 13).
+    pub metas: BTreeSet<MergeFileIdentity>,
+    /// Directory records that differ and are the fork's undecided value (rule 14).
+    pub dirs: BTreeSet<String>,
 }
 
-/// The fork's versions the upstream has not decided (R3a): files in identity order, lines in map
-/// order, then names.
+/// The fork's versions the upstream at `upstream` has not decided (R3a): files in identity
+/// order, lines in map order, then names; then the records where the two differ: each file's
+/// metadata, each directory's (rules 13 and 14).
 pub(in crate::tree_actor) fn undecided<L: Landed + ?Sized>(
     fork: &Snapshot,
+    upstream: &Snapshot,
     landed: &mut L,
 ) -> Result<Undecided> {
     let mut undecided = Undecided::default();
@@ -41,6 +48,20 @@ pub(in crate::tree_actor) fn undecided<L: Landed + ?Sized>(
     for (id, history) in &fork.names {
         if !landed.landed(history.head)? {
             undecided.names.insert((*id, history.head));
+        }
+    }
+    for (id, file) in &fork.files {
+        let differs = upstream.files.get(id).is_some_and(|f| f.meta != file.meta);
+        if differs && !landed.record_landed(Record::Meta(*id))? {
+            undecided.metas.insert(*id);
+        }
+    }
+    let paths: BTreeSet<&String> = fork.dirs.keys().chain(upstream.dirs.keys()).collect();
+    for path in paths {
+        if fork.dirs.get(path) != upstream.dirs.get(path)
+            && !landed.record_landed(Record::Dir(path))?
+        {
+            undecided.dirs.insert(path.clone());
         }
     }
     Ok(undecided)

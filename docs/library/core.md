@@ -729,6 +729,52 @@ for entry in v.children(TreeId::Root, "", 0, 100)? { /* name, number, kind */ }
   what it changes (a save the file's, an entry added, removed or renamed its
   directories'), and history never holds them.
 
+### Landing directories, metadata and links
+
+A fork's change lands in its upstream, and a sync brings the upstream's
+decisions to the fork, by the same rules as lines and names (rules 13 to 15 of
+the model, `crates/agentfs-model/MODEL.md`). The referee judges them with the
+change's first parent (what its writer saw), the change, and the upstream's
+head:
+
+- **Metadata.** A file's or a directory's kind, mode, uid and gid are one
+  value; whether the entry is there is part of it. A change's new value lands
+  when the upstream still holds the value the change's first parent holds, or
+  already holds the same new value. Otherwise the upstream's value wins and
+  the change loses whole, with cause `metadata`. A file's metadata follows its
+  identity, so a rename and a chmod of one file both apply, and an atomic save
+  carries the new file's metadata.
+- **Directories.** A directory is its path: two trees making one directory
+  with one value agree, and an empty directory is kept. A directory's rename
+  is one change: every entry under it moves with it, each file keeping its
+  identity, and the change lands or loses whole. A change loses whole, with
+  cause `directory-not-empty`, when it removes or moves a directory under
+  which the upstream has an entry its first parent lacks, moves a directory
+  onto a path under which the upstream has such an entry, or puts an entry
+  onto a path where the upstream has an unseen entry of the other kind (a
+  file where a directory is). It loses whole, with cause `directory-gone`,
+  when it puts an entry into a directory its first parent has and the
+  upstream no longer has.
+- **Links.** A link is a file whose bytes are its target and whose kind is
+  `symlink`: its target follows the line rules and its kind the metadata
+  rule. Of two concurrent retargets the upstream's wins; replacing a file by a
+  link keeps the file's identity and changes its kind.
+- **Syncs.** A sync takes the upstream's metadata and directories, except the
+  fork's own values the upstream's queue has not yet decided (their commit is
+  not in the upstream's history), and every directory one of the fork's
+  entries still needs, until the upstream decides. So every entry's parent is
+  a directory of its tree at every step, and a decided upstream `rmdir` or
+  directory rename reaches the fork.
+
+A losing change keeps its collision ref, as for lines and names. Its
+landing commit's `Agentfs-Collisions` line lists each rule 13 or 14 loss as
+`{"cause":"metadata"|"directory-not-empty"|"directory-gone","path":"<path>"}`,
+the path a file's path or a directory's with a trailing `/`, before the
+change's other versions, which lose `Whole`. A take's read keys include every
+directory these rules judged and every path an entry of the change arrives
+at: a step that makes, moves or removes an entry under such a directory after
+the decision refuses the take, which is decided again.
+
 ### Sessions
 
 `session::Sessions::new(recording)` holds the history service's sessions of a
