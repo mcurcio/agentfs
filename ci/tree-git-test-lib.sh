@@ -9,6 +9,14 @@ tree_git_fanned() {
   printf '%s/%s/%s\n' "${hex:0:2}" "${hex:2:2}" "$1"
 }
 
+# A directory's record in a tree commit: dirs/<aa>/<bb>/<key>, key the path's
+# whole blob id (docs/trees.md, "What a commit holds").
+tree_git_dir_record() {
+  local hex
+  hex=$(printf %s "$1" | git hash-object --stdin) || return 1
+  printf 'dirs/%s/%s/%s\n' "${hex:0:2}" "${hex:2:2}" "$hex"
+}
+
 tree_git_file() {
   local gitdir=$1 commit=$2 path=$3
   if git --git-dir="$gitdir" show -s --format=%B "$commit" | grep -Fx 'Agentfs-Format: envelope-2' >/dev/null; then

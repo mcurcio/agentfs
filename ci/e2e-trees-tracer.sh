@@ -186,10 +186,9 @@ built_mode() { # path want what
 }
 built_mode "$script" 100755 'the script is executable in history'
 pass 'the script is 100755 in history'
-fanned_dir=$(tree_git_fanned tools/bin)
-record="dirs/${fanned_dir%/tools/bin}/tools%2Fbin"
+record=$(tree_git_dir_record tools/bin)
 built_mode "$record" 100644 'the directory has its record'
-assert_contains "$(in_history show "root:$record")" '"kind":"dir"' 'the record is a directory'
+assert_contains "$(in_history show "root:$record")" '"path":"tools/bin","kind":"dir"' 'the record is the directory'
 pass 'the directory tools/bin has its dirs/ record'
 
 step '3. SIGKILL mid-stream: every answered write is in history'
