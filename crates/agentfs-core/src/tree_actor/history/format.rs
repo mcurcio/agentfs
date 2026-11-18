@@ -7,16 +7,18 @@
 //! files/<aa>/<bb>/<path>      the file's bytes (a link's: its target), in git's mode
 //! lines/<aa>/<bb>/<path>      JSON [identity, line map, meta]
 //! names/<cc>/<dd>/<id>        JSON name history, one per file identity, ended ones included
-//! dirs/<aa>/<bb>/<enc(path)>  JSON meta of one directory
-//! dirs/root                   JSON meta of the root directory
+//! dirs/<aa>/<bb>/<key>       JSON {path, meta} of one directory
+//! dirs/root                   JSON {path: "", meta} of the root directory
 //! ```
 //!
 //! `aa` and `bb` are hex digits 1-2 and 3-4 of the path's Git blob id
 //! (`git hash-object --stdin`), `cc` and `dd` the same of the identity in
 //! decimal: two fixed levels of 256, so an entry's place never changes when
 //! siblings come or go. A file's path nests under them (a file and a
-//! directory never share a path); a directory's record is one leaf, its path
-//! with `%` as `%25` and `/` as `%2F`. Object and directory numbers and times
+//! directory never share a path); a directory's record is one leaf named by
+//! its path's whole blob id (`key`, 40 hex digits), so no path, however
+//! deep, makes a name longer than a file system allows, and the record holds
+//! the path. Object and directory numbers and times
 //! are not in history: they are the journal's. The builder writes a commit as
 //! edits of its parent's tree; snapshots and checkouts read it.
 
@@ -75,40 +77,54 @@ pub(in crate::tree_actor) fn names_path(identity: MergeFileIdentity) -> String {
     hashed(NAMES, &identity.0.to_string())
 }
 
-/// A directory path as one leaf's name: `%` as `%25`, then `/` as `%2F`.
-fn encode_dir(path: &str) -> String {
-    path.replace('%', "%25").replace('/', "%2F")
+/// A directory path's leaf name: its bytes' whole Git blob id, of which
+/// [`fanout`] is the first four digits.
+fn dir_key(path: &str) -> String {
+    Oid::hash_object(git2::ObjectType::Blob, path.as_bytes())
+        .unwrap_or(Oid::ZERO_SHA1)
+        .to_string()
 }
 
-/// A leaf's path as the tree names it.
-#[allow(clippy::unnecessary_wraps, reason = "one of `leaves`' decoders")]
-fn as_is(name: &str) -> Result<String> {
-    Ok(name.to_owned())
-}
-
-/// [`encode_dir`] undone; [`Error::Format`] for a name it cannot give.
-fn decode_dir(name: &str) -> Result<String> {
-    let path = name.replace("%2F", "/").replace("%25", "%");
-    if encode_dir(&path) == name {
-        Ok(path)
-    } else {
-        Err(Error::Format)
-    }
-}
-
-/// A directory's record in a commit: `dirs/<aa>/<bb>/<enc(path)>`, the
-/// root's (`""`) `dirs/root`.
+/// A directory's record in a commit: `dirs/<aa>/<bb>/<key>`, the root's
+/// (`""`) `dirs/root`.
 pub(in crate::tree_actor) fn dir_path(path: &str) -> String {
     if path.is_empty() {
         return format!("{DIRS}/{ROOT_DIR}");
     }
     let (aa, bb) = fanout(path);
-    format!("{DIRS}/{aa}/{bb}/{}", encode_dir(path))
+    format!("{DIRS}/{aa}/{bb}/{}", dir_key(path))
+}
+
+/// A directory record's JSON: its path beside its metadata's fields.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct DirRecord<'a> {
+    #[serde(borrow)]
+    path: std::borrow::Cow<'a, str>,
+    #[serde(flatten)]
+    meta: Meta,
+}
+
+fn dir_record(path: &str, meta: &Meta) -> Result<Vec<u8>> {
+    Ok(serde_json::to_vec(&DirRecord {
+        path: path.into(),
+        meta: *meta,
+    })?)
+}
+
+/// A directory record's path and metadata; [`Error::Format`] for a record of
+/// another kind.
+fn read_dir_record(repo: &TreeGit, blob: Oid) -> Result<(String, Meta)> {
+    let bytes = repo.read_blob(blob)?;
+    let record: DirRecord<'_> = serde_json::from_slice(&bytes)?;
+    if record.meta.kind != Kind::Dir {
+        return Err(Error::Format);
+    }
+    Ok((record.path.into_owned(), record.meta))
 }
 
 /// The Root commit's tree: the root directory's record alone.
 pub(in crate::tree_actor) fn root_tree(repo: &TreeGit, root: &Meta) -> Result<Oid> {
-    let record = repo.write_blob(&serde_json::to_vec(root)?)?;
+    let record = repo.write_blob(&dir_record("", root)?)?;
     let dirs = repo.write_tree(&[TreeEntry {
         name: ROOT_DIR.as_bytes().to_vec(),
         mode: 0o100644,
@@ -160,7 +176,7 @@ pub(in crate::tree_actor) fn edits(
     let dir = |edits: &mut Vec<Edit>, path: &str, meta: &Meta| -> Result<()> {
         edits.push(Edit::Inline {
             path: dir_path(path),
-            bytes: serde_json::to_vec(meta)?,
+            bytes: dir_record(path, meta)?,
         });
         Ok(())
     };
@@ -249,16 +265,15 @@ fn entry(entries: &[TreeEntry], name: &str) -> Option<Oid> {
 }
 
 /// Every leaf under a top folder's two fan-out levels, its path nesting
-/// under them: its path (`decode` of what the tree names it) and blob. A
-/// leaf in a folder its path does not hash to cannot come from the builder:
-/// [`Error::Format`]. With `root`, the top's blob of that name is the leaf
-/// `""`.
-fn leaves(
+/// under them: `decode` of what the tree names it and its blob, a path and a
+/// value. A leaf in a folder its path does not hash to cannot come from the
+/// builder: [`Error::Format`]. A blob beside the fan-out folders (`dirs/root`)
+/// is left to the caller.
+fn leaves<T>(
     repo: &TreeGit,
     top: Option<Oid>,
-    root: Option<&str>,
-    decode: fn(&str) -> Result<String>,
-) -> Result<Vec<(String, Oid)>> {
+    mut decode: impl FnMut(&str, Oid) -> Result<(String, T)>,
+) -> Result<Vec<(String, T)>> {
     fn nested(
         repo: &TreeGit,
         folder: Oid,
@@ -281,32 +296,50 @@ fn leaves(
         return Ok(leaves);
     };
     for aa in repo.list_tree(top)? {
-        if root.is_some_and(|root| aa.name == root.as_bytes()) && aa.mode != FOLDER {
-            leaves.push((String::new(), aa.oid));
+        if aa.mode != FOLDER {
             continue;
         }
         for bb in repo.list_tree(aa.oid)? {
             let mut found = Vec::new();
             nested(repo, bb.oid, "", &mut found)?;
             for (name, oid) in found {
-                let path = decode(&name)?;
+                let (path, value) = decode(&name, oid)?;
                 let (a, b) = fanout(&path);
                 if a.as_bytes() != aa.name || b.as_bytes() != bb.name {
                     return Err(Error::Format);
                 }
-                leaves.push((path, oid));
+                leaves.push((path, value));
             }
         }
     }
     Ok(leaves)
 }
 
+/// A leaf whose name is its path, and its blob.
+#[allow(clippy::unnecessary_wraps, reason = "one of `leaves`' decoders")]
+fn as_is(name: &str, blob: Oid) -> Result<(String, Oid)> {
+    Ok((name.to_owned(), blob))
+}
+
 /// Each directory record of a commit's top tree, by path (`""` the root).
+/// A record not at its path's key, or a root record naming a path, is
+/// [`Error::Format`].
 fn read_dirs(repo: &TreeGit, entries: &[TreeEntry]) -> Result<BTreeMap<String, Meta>> {
-    let mut dirs = BTreeMap::new();
-    for (path, oid) in leaves(repo, entry(entries, DIRS), Some(ROOT_DIR), decode_dir)? {
-        let meta: Meta = serde_json::from_slice(&repo.read_blob(oid)?)?;
-        if meta.kind != Kind::Dir {
+    let Some(top) = entry(entries, DIRS) else {
+        return Ok(BTreeMap::new());
+    };
+    let mut dirs: BTreeMap<String, Meta> = leaves(repo, Some(top), |name, blob| {
+        let (path, meta) = read_dir_record(repo, blob)?;
+        if path.is_empty() || dir_key(&path) != name {
+            return Err(Error::Format);
+        }
+        Ok((path, meta))
+    })?
+    .into_iter()
+    .collect();
+    if let Some(root) = entry(&repo.list_tree(top)?, ROOT_DIR) {
+        let (path, meta) = read_dir_record(repo, root)?;
+        if !path.is_empty() {
             return Err(Error::Format);
         }
         dirs.insert(path, meta);
@@ -338,13 +371,13 @@ pub(in crate::tree_actor) fn read_snapshot(
         return Err(Error::Format);
     }
     let mut names = BTreeMap::new();
-    for (id, oid) in leaves(repo, entry(&entries, NAMES), None, as_is)? {
+    for (id, oid) in leaves(repo, entry(&entries, NAMES), as_is)? {
         let id = MergeFileIdentity(id.parse().map_err(|_| Error::Format)?);
         let history: NameHistory = serde_json::from_slice(&repo.read_blob(oid)?)?;
         names.insert(id, history);
     }
     let mut files = BTreeMap::new();
-    for (name, oid) in leaves(repo, entry(&entries, LINES), None, as_is)? {
+    for (name, oid) in leaves(repo, entry(&entries, LINES), as_is)? {
         let (id, lines, meta): (MergeFileIdentity, Lines, Meta) =
             serde_json::from_slice(&repo.read_blob(oid)?)?;
         if meta.kind == Kind::Dir {
@@ -418,6 +451,42 @@ pub(in crate::tree_actor) fn file_of(
     Ok(Some((lines, blob)))
 }
 
+/// A record's value in `commit`: a directory's record, or a live file's
+/// metadata from its line map's entry. A few paths read, never the whole
+/// snapshot.
+pub(in crate::tree_actor) fn meta_of(
+    repo: &TreeGit,
+    commit: Oid,
+    record: referee::Record<'_>,
+) -> Result<Option<Meta>> {
+    let tree = repo.read_commit(commit)?.tree;
+    match record {
+        referee::Record::Dir(path) => {
+            let Some(blob) = lookup(repo, tree, &dir_path(path))? else {
+                return Ok(None);
+            };
+            let (at, meta) = read_dir_record(repo, blob)?;
+            if at != path {
+                return Err(Error::Format);
+            }
+            Ok(Some(meta))
+        }
+        referee::Record::Meta(id) => {
+            let Some(names) = lookup(repo, tree, &names_path(id))? else {
+                return Ok(None);
+            };
+            let history: NameHistory = serde_json::from_slice(&repo.read_blob(names)?)?;
+            let Some(path) = history.path()? else {
+                return Ok(None);
+            };
+            let lines = lookup(repo, tree, &lines_path(path))?.ok_or(Error::Format)?;
+            let (_, _, meta): (MergeFileIdentity, serde::de::IgnoredAny, Meta) =
+                serde_json::from_slice(&repo.read_blob(lines)?)?;
+            Ok(Some(meta))
+        }
+    }
+}
+
 /// The files tree a commit's checkout holds: `files/`, or the empty tree
 /// (the Root commit's, and any commit's with no file: git keeps no empty
 /// tree).
@@ -445,18 +514,25 @@ mod tests {
         assert_eq!(names_path(MergeFileIdentity(7)), "names/c7/93/7");
         let (aa, bb) = fanout("a/b");
         assert_eq!(file_path("a/b"), format!("files/{aa}/{bb}/a/b"));
-        assert_eq!(dir_path("a/b"), format!("dirs/{aa}/{bb}/a%2Fb"));
+        // `printf a/b | git hash-object --stdin`.
+        let key = Oid::hash_object(git2::ObjectType::Blob, b"a/b").unwrap();
+        assert_eq!(dir_path("a/b"), format!("dirs/{aa}/{bb}/{key}"));
         assert_eq!(dir_path(""), "dirs/root");
     }
 
+    /// A directory's leaf name is 40 hex digits however deep its path: a
+    /// clone or checkout of history never meets a name past `NAME_MAX`.
     #[test]
-    fn a_directory_record_is_one_leaf_whatever_its_path_holds() {
-        for path in ["a", "a/b", "50%/x", "%2F", "a%2Fb/c"] {
-            let name = encode_dir(path);
-            assert!(!name.contains('/'), "{name}");
-            assert_eq!(decode_dir(&name).unwrap(), path);
+    fn a_directory_record_is_one_short_leaf_whatever_its_path_holds() {
+        let deep = vec!["d".repeat(200); 20].join("/");
+        for path in ["a", "a/b", "50%/x", "%2F", deep.as_str()] {
+            let leaf = dir_path(path).rsplit('/').next().unwrap().to_owned();
+            assert_eq!(leaf.len(), 40, "{path}");
+            assert_eq!(leaf, dir_key(path));
+            let meta = Meta::new(Kind::Dir, crate::tree_actor::test_support::ATTRS);
+            let bytes = dir_record(path, &meta).unwrap();
+            let record: DirRecord<'_> = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!((&*record.path, record.meta), (path, meta));
         }
-        assert!(decode_dir("a%2fb").is_err());
-        assert!(decode_dir("a/b").is_err());
     }
 }

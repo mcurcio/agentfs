@@ -276,16 +276,21 @@ pub(super) fn apply<L>(
 
 /// Rule 14 at a sync: the upstream's directories, the fork's undecided directory records
 /// (`own`) kept, then every directory an entry of the result needs kept as the fork has it,
-/// until the upstream decides. An entry the fork never had, under a directory the fork's
-/// undecided change removed or moved, is hidden until the upstream decides, as rule 11 hides
-/// a clashing name; a file the fork has keeps the fork's name.
+/// until the upstream decides; a file the fork has keeps the fork's name.
+///
+/// An upstream entry the fork never had, under a directory the fork's undecided change
+/// removed or moved, is a case the rules do not decide (`crates/agentfs-model/MODEL.md`,
+/// "Left out"). The result leaves it out and names its path ([`Synced::unruled`]): a sync
+/// that would show that result fails ([`Error::Unruled`]); one that delivers a later
+/// upstream commit, which decided the change, passes through it.
 pub(super) fn sync<L>(
     upstream: &Snapshot<L>,
     fork: &Snapshot<L>,
     own: &BTreeSet<String>,
     names: &mut BTreeMap<MergeFileIdentity, NameHistory>,
     files: &mut BTreeMap<MergeFileIdentity, File<L>>,
-) -> Result<BTreeMap<String, Meta>> {
+) -> Result<(BTreeMap<String, Meta>, Option<String>)> {
+    let mut unruled = None;
     let mut dirs = upstream.dirs.clone();
     for path in own {
         match fork.dirs.get(path) {
@@ -312,31 +317,31 @@ pub(super) fn sync<L>(
             }
         }
         let Some((path, id)) = orphan else {
-            return Ok(dirs);
+            return Ok((dirs, unruled));
         };
         let dir = parent_of(&path);
         if let Some(meta) = fork.dirs.get(dir) {
             dirs.insert(dir.to_owned(), *meta);
             continue;
         }
-        match id {
+        match id.map(|id| (id, fork.names.get(&id))) {
+            Some((id, Some(own))) if fork.files.contains_key(&id) => {
+                let name = names.get_mut(&id).ok_or(Error::Format)?;
+                if name.head == own.head {
+                    // The fork's own name needs a directory the fork lacks.
+                    return Err(Error::Format);
+                }
+                name.head = own.head;
+            }
+            Some((id, _)) => {
+                names.remove(&id);
+                files.remove(&id);
+                unruled.get_or_insert(path);
+            }
             None => {
                 dirs.remove(&path);
+                unruled.get_or_insert(path);
             }
-            Some(id) => match fork.names.get(&id) {
-                Some(own) if fork.files.contains_key(&id) => {
-                    let name = names.get_mut(&id).ok_or(Error::Format)?;
-                    if name.head == own.head {
-                        // The fork's own name needs a directory the fork lacks.
-                        return Err(Error::Format);
-                    }
-                    name.head = own.head;
-                }
-                _ => {
-                    names.remove(&id);
-                    files.remove(&id);
-                }
-            },
         }
     }
 }

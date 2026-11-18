@@ -1065,23 +1065,29 @@ mod tests {
     /// A commit holding file 1 at `path`, one line `x`, and a record for each of
     /// `dirs`, each blob at `<top>/<aa>/<bb>/<leaf>` as the engine lays it out.
     fn commit_at(repo: &Repo, path: &str, dirs: &[&str]) -> String {
+        let hash = |name: &str| repo.git(&["hash-object", "--stdin"], name.as_bytes());
         let folders = |name: &str| {
-            let hex = repo.git(&["hash-object", "--stdin"], name.as_bytes());
+            let hex = hash(name);
             format!("{}/{}", &hex[..2], &hex[2..4])
         };
         let blob = |text: &str| repo.git(&["hash-object", "-w", "--stdin"], text.as_bytes());
         let lines = r#"[1,{"lines":[{"identity":"1:0","version":"1:0","count":1}],"ancestors":[{"version":"1:0","count":1}]},{"kind":"file","mode":"0644","uid":0,"gid":0}]"#;
         let name = format!(r#"{{"head":1,"versions":{{"1":{{"path":"{path}","over":null}}}}}}"#);
-        let dir = r#"{"kind":"dir","mode":"0755","uid":0,"gid":0}"#;
+        let dir = |path: &str| {
+            format!(r#"{{"path":"{path}","kind":"dir","mode":"0755","uid":0,"gid":0}}"#)
+        };
         let mut leaves = vec![
             (format!("files/{}/{path}", folders(path)), blob("x\n")),
             (format!("lines/{}/{path}", folders(path)), blob(lines)),
             (format!("names/{}/1", folders("1")), blob(&name)),
-            ("dirs/root".to_owned(), blob(dir)),
+            ("dirs/root".to_owned(), blob(&dir(""))),
         ];
         for d in dirs {
-            let leaf = d.replace('%', "%25").replace('/', "%2F");
-            leaves.push((format!("dirs/{}/{leaf}", folders(d)), blob(dir)));
+            let leaf = hash(d);
+            leaves.push((
+                format!("dirs/{}/{}", folders(d), leaf.trim()),
+                blob(&dir(d)),
+            ));
         }
         let scratch = tempfile::tempdir().unwrap();
         let index = scratch.path().join("index");

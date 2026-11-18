@@ -451,7 +451,8 @@ non-UTF-8 names, devices, pipes, sockets and extended attributes left out: "Yes"
   wins and the change loses whole (R3e), recorded as `metadata`. Making or removing an entry is a value too, so an
   unlink loses to an upstream's `chmod` its writer never saw. A rename and a metadata change of one file both
   apply: metadata follows the file's identity (R11). An atomic save (R11.2) carries the new file's metadata to the
-  file it rewrites. Owner, 2026-11-18: "Yes".
+  file it rewrites. Owner, 2026-11-18: "Yes". A consequence, not part of the approved text: a value is compared,
+  not its history, so an upstream that went from the seen value to another and back counts as unchanged.
   Tests: `r13_a_chmod_lands_over_the_value_it_saw`,
   `r13_concurrent_chmods_the_upstream_wins_and_the_change_loses_whole`, `r13_the_same_new_value_agrees`,
   `r13_a_rename_and_a_chmod_both_apply`, `r13_an_atomic_save_carries_the_new_files_metadata`

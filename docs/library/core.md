@@ -699,9 +699,11 @@ for entry in v.children(TreeId::Root, "", 0, 100)? { /* name, number, kind */ }
 
 - `write_open(tree, path, by, create)` creates a missing file when `create`
   gives its `Attrs` (permission bits and owner); `anonymous_open(tree, by,
-  attrs)` is `O_TMPFILE`. In a set-group-ID directory a new entry takes the
-  directory's group, and a new directory keeps the bit (Linux's
-  `inode_init_owner`).
+  attrs)` is `O_TMPFILE`. `Attrs` is the part of an entry's `Meta` a caller
+  chooses: the call gives the kind. In a set-group-ID directory a new entry
+  takes the directory's group, and a new directory keeps the bit (Linux's
+  `inode_init_owner`); an `O_TMPFILE` file does not (see
+  [Limits](../trees.md#limits)).
 - `mkdir` returns the directory's node number, `rmdir` removes an empty one
   (`Error::NotEmpty`), `symlink(tree, path, target, owner, by)` makes a link
   (mode `0777`, its bytes its target: 1 to 4095 bytes, no NUL) and returns its
@@ -741,9 +743,14 @@ head:
   value; whether the entry is there is part of it. A change's new value lands
   when the upstream still holds the value the change's first parent holds, or
   already holds the same new value. Otherwise the upstream's value wins and
-  the change loses whole, with cause `metadata`. A file's metadata follows its
+  the change loses whole, with cause `metadata`. A value is compared, not its
+  history: an upstream that went from the seen value to another and back
+  counts as unchanged, so the change lands over it. A file's metadata follows its
   identity, so a rename and a chmod of one file both apply, and an atomic save
-  carries the new file's metadata.
+  carries the new file's metadata. On a view, `chmod(2)` and `chown(2)` are
+  two steps and two changes: a program that runs both (`install -m -o`, say)
+  in two trees can collide on the value between them, with cause `metadata`,
+  where one change of both would agree.
 - **Directories.** A directory is its path: two trees making one directory
   with one value agree, and an empty directory is kept. A directory's rename
   is one change: every entry under it moves with it, each file keeping its
@@ -764,7 +771,13 @@ head:
   not in the upstream's history), and every directory one of the fork's
   entries still needs, until the upstream decides. So every entry's parent is
   a directory of its tree at every step, and a decided upstream `rmdir` or
-  directory rename reaches the fork.
+  directory rename reaches the fork. One case the rules do not decide: an upstream
+  entry the fork never had, under a directory the fork's undecided change
+  removed or moved. A sync that would show the fork that case fails with
+  `Error::Unruled`, logged as a failed take, and stays queued: it goes through
+  once the upstream decides the fork's change, and until then the fork shows
+  its own tree. A sync that delivers the upstream's decision with it passes
+  through.
 
 A losing change keeps its collision ref, as for lines and names. Its
 landing commit's `Agentfs-Collisions` line lists each rule 13 or 14 loss as

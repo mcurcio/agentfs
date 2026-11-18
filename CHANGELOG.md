@@ -12,6 +12,14 @@ design was reviewed on 2026-10-12.
 
 ### Added
 
+- **Tree views: M2 fixes.** A directory's record in history is named by its
+  path's blob id, with the path inside, so a clone or checkout of history
+  works however deep a directory is. `fsync` and close of a descriptor make
+  every record so far durable, a `chmod` or `futimens` of the file included.
+  A save no longer moves a file's atime. A sync that would show an upstream
+  entry under a directory the fork's undecided change removed fails and waits
+  for the upstream's decision instead of hiding the entry. A take adds at most
+  2^20 directories.
 - **Tree views: forks land directories, metadata and links by the model's
   rules.** A fork's change lands in its upstream, and a sync brings the
   upstream's decisions back, by rules 13 to 15: an entry's kind, mode, owner

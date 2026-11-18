@@ -99,7 +99,7 @@ pub type ClientSet = BTreeSet<ClientId>;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SessionId(pub u64);
 
-/// A file's owner and group, as numeric ids (`agentfs_core::tree_actor::Attrs`).
+/// A file's numeric owner and group.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct FileOwner {
     pub uid: u32,

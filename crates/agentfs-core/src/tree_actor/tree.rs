@@ -425,11 +425,20 @@ fn direct_children<'a, V>(
     })
 }
 
+/// How many directories one take may add: the index field of
+/// [`taken_dir_number`].
+pub(super) const TAKEN_DIRS: u64 = 1 << 20;
+
 /// The number of the `index`th directory a take adds that its tree lacks: a
 /// take records directories by path only, so their numbers are its step's,
-/// apart from every record's (`EventNumber::object`) by the top bit.
-pub(super) const fn taken_dir_number(step: EventNumber, index: u64) -> u64 {
-    (1 << 63) | (step.0 << 20) | (index & 0xF_FFFF)
+/// apart from every record's (`EventNumber::object`) by the top bit. Unique
+/// by construction: [`Error::TooLarge`] for an index past [`TAKEN_DIRS`] or a
+/// step past 43 bits, which would share a number.
+pub(super) const fn taken_dir_number(step: EventNumber, index: u64) -> Result<u64> {
+    if index >= TAKEN_DIRS || step.0 >= 1 << 43 {
+        return Err(Error::TooLarge);
+    }
+    Ok((1 << 63) | (step.0 << 20) | index)
 }
 
 /// The names-level state of one tree, which both projections of the journal
@@ -978,7 +987,7 @@ impl Shape {
                     state.times.changed(at_ns);
                 }
                 None => {
-                    self.add_dir(path, taken_dir_number(step, added), *meta, at_ns);
+                    self.add_dir(path, taken_dir_number(step, added)?, *meta, at_ns);
                     added += 1;
                 }
             }
@@ -1380,6 +1389,21 @@ impl NameHistory {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn taken_directory_numbers_never_wrap() {
+        let step = EventNumber::new(7);
+        let last = taken_dir_number(step, TAKEN_DIRS - 1).unwrap();
+        assert_ne!(last, taken_dir_number(step, 0).unwrap());
+        assert!(matches!(
+            taken_dir_number(step, TAKEN_DIRS),
+            Err(Error::TooLarge)
+        ));
+        assert!(matches!(
+            taken_dir_number(EventNumber::new(1 << 43), 0),
+            Err(Error::TooLarge)
+        ));
+    }
 
     #[test]
     fn names_index_each_object_by_its_paths() {

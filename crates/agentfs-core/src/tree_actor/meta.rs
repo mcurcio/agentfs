@@ -137,12 +137,12 @@ impl Times {
         }
     }
 
-    /// Its content changed: mtime and ctime move, and atime follows the
-    /// mtime (atime is not tracked).
+    /// Its content changed: mtime and ctime move. atime stays, as Linux
+    /// leaves it at a write: it moves only when the entry is made or a time
+    /// is set (reads are not tracked).
     pub(super) fn modified(&mut self, at_ns: u64) {
         self.mtime_ns = at_ns;
         self.ctime_ns = at_ns;
-        self.atime_ns = at_ns;
     }
 
     /// Its metadata or name changed: ctime moves.
@@ -217,6 +217,14 @@ mod tests {
                 ..ATTRS
             }
         );
+    }
+
+    #[test]
+    fn a_save_keeps_the_atime() {
+        let mut times = Times::at(5);
+        times.atime_ns = 1;
+        times.modified(9);
+        assert_eq!((times.atime_ns, times.mtime_ns, times.ctime_ns), (1, 9, 9));
     }
 
     #[test]

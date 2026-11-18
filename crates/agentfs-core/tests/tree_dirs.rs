@@ -390,14 +390,16 @@ fn a_directory_record_is_kept_for_an_empty_directory() {
         .rsplit_once("/a/b")
         .map(|(f, r)| (f.to_owned(), r.to_owned()))
         .unwrap();
-    let record = format!("dirs/{aa_bb}/a%2Fb");
+    // The leaf is the path's whole blob id: `printf a/b | git hash-object --stdin`.
+    let key = git2::Oid::hash_object(git2::ObjectType::Blob, b"a/b").unwrap();
+    let record = format!("dirs/{aa_bb}/{key}");
     assert_eq!(
         mode_of(tmp.path(), &rev, &record).as_deref(),
         Some("100644")
     );
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(&show(tmp.path(), &rev, &record)).unwrap(),
-        serde_json::json!({"kind": "dir", "mode": "0700", "uid": 1000, "gid": 1000})
+        serde_json::json!({"path": "a/b", "kind": "dir", "mode": "0700", "uid": 1000, "gid": 1000})
     );
     assert_eq!(
         git(tmp.path(), &["log", "-1", "--format=%s", &rev]).trim(),
@@ -427,7 +429,7 @@ fn the_root_commit_holds_the_root_directory() {
     let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(&show(tmp.path(), root, "dirs/root")).unwrap(),
-        serde_json::json!({"kind": "dir", "mode": "0755", "uid": uid, "gid": gid})
+        serde_json::json!({"path": "", "kind": "dir", "mode": "0755", "uid": uid, "gid": gid})
     );
     let node = v.node(ROOT, "").unwrap();
     assert_eq!((node.meta.uid, node.meta.mode.bits()), (uid, 0o755));

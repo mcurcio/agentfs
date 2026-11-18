@@ -664,6 +664,83 @@ mod tests {
         );
     }
 
+    /// The root and a fork that removed `q` (undecided), the root moved past
+    /// the fork's first parent, so the fork's landing is no fast-forward.
+    fn fork_removed_q(dir: &std::path::Path) -> (TreeActor, TreeId) {
+        let mut v = new_actor(dir);
+        put(&mut v, ROOT, "a", b"one\n");
+        v.mkdir(ROOT, "q", ATTRS, &writer("w")).unwrap();
+        let fork = rowless_fork(&mut v);
+        v.rmdir(fork, "q", &writer("w")).unwrap();
+        put(&mut v, ROOT, "b", b"b\n");
+        (v, fork)
+    }
+
+    /// Rule 14's read keys reach above a name: a landing that judged the
+    /// fork's rmdir of `q` is refused by the root's create of `q/x` after the
+    /// decision, which names only `q/x`; decided again, the rmdir loses whole
+    /// as `directory-not-empty`.
+    #[test]
+    fn a_take_refused_for_an_entry_made_under_a_consulted_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut v, _) = fork_removed_q(tmp.path());
+        let decision = decided(&v, ROOT);
+        assert!(decision.take.collisions.is_empty(), "q is empty");
+        assert!(decision.reads.contains(&Key::Name("q".to_owned())));
+        put(&mut v, ROOT, "q/x", b"x\n");
+        assert_eq!(v.land(decision).unwrap(), Err(Refused::FilesChanged));
+        while v.take_next(ROOT).unwrap() == Took::Taken {}
+        assert_eq!(v.read(ROOT, "q/x").unwrap(), b"x\n");
+        let (_, collisions) = root_as_built(&v);
+        assert!(
+            collisions.iter().any(|c| c.contains("DirectoryNotEmpty")),
+            "{collisions:?}"
+        );
+    }
+
+    /// The case the rules leave out: the upstream's `q/x`, under the `q` the
+    /// fork's undecided rmdir removed. The fork's sync fails, shows nothing of
+    /// it and stays queued; once the upstream decides the rmdir (it loses),
+    /// the sync brings `q` and `q/x`.
+    #[test]
+    fn a_sync_under_a_directory_the_forks_undecided_change_removed_waits() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut v, fork) = fork_removed_q(tmp.path());
+        put(&mut v, ROOT, "q/x", b"x\n");
+        match v.take_next(fork) {
+            Err(Error::Unruled { path }) => assert_eq!(path, "q/x"),
+            other => panic!("{other:?}"),
+        }
+        assert!(v.read(fork, "q/x").is_err());
+        assert!(v.queue_holds(fork));
+        while v.take_next(ROOT).unwrap() == Took::Taken {}
+        while v.take_next(fork).unwrap() == Took::Taken {}
+        assert_eq!(v.read(fork, "q/x").unwrap(), b"x\n");
+    }
+
+    /// D1 is the last guard of a take's record: a take that would remove a
+    /// directory an entry is still under fails before anything is recorded,
+    /// and the tree stays as it was.
+    #[test]
+    fn a_take_that_would_break_d1_is_refused_before_its_record() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut v = new_actor(tmp.path());
+        put(&mut v, ROOT, "a", b"one\n");
+        v.mkdir(ROOT, "q", ATTRS, &writer("w")).unwrap();
+        put(&mut v, ROOT, "q/x", b"x\n");
+        let fork = rowless_fork(&mut v);
+        put(&mut v, fork, "a", b"fork\n");
+        put(&mut v, ROOT, "b", b"b\n");
+        let mut decision = decided(&v, ROOT);
+        decision.take.dirs.push(("q".to_owned(), None));
+        let next = v.next;
+        assert!(matches!(v.land(decision), Err(Error::Format)));
+        assert_eq!(v.next, next, "nothing recorded");
+        assert_eq!(v.read(ROOT, "q/x").unwrap(), b"x\n");
+        assert_eq!(v.take_next(ROOT).unwrap(), Took::Taken);
+        assert_eq!(v.read(ROOT, "a").unwrap(), b"fork\n");
+    }
+
     #[test]
     fn a_take_whose_written_key_is_held_is_refused() {
         let tmp = tempfile::tempdir().unwrap();

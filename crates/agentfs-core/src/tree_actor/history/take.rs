@@ -17,7 +17,7 @@ use super::refs;
 use crate::tree_actor::journal::{TAKE_CHUNK, TakeHead};
 use crate::tree_actor::meta::Meta;
 use crate::tree_actor::stages::{Timer, Which};
-use crate::tree_actor::tree::{EventNumber, Lines, MergeFileIdentity, NameHistory};
+use crate::tree_actor::tree::{EventNumber, Lines, MergeFileIdentity};
 use crate::tree_actor::{Error, Result, TreeId, queue, referee};
 use crate::tree_git::{STREAMED_BLOB, TreeGit};
 use crate::tree_reconcile::{self, FileImage, Image, Piece};
@@ -58,7 +58,7 @@ impl LandedInto<'_> {
         if let Some(known) = self.values.get(&key) {
             return Ok(*known);
         }
-        let value = record_at(self.repo, commit, record)?;
+        let value = format::meta_of(self.repo, commit, record)?;
         self.values.insert(key, value);
         Ok(value)
     }
@@ -94,53 +94,15 @@ impl referee::Landed for LandedInto<'_> {
     }
 }
 
-/// The object at `path` (slash-separated) under tree `tree`, if any.
-fn lookup(repo: &TreeGit, tree: Oid, path: &str) -> Result<Option<Oid>> {
-    let mut at = tree;
-    for part in path.split('/') {
-        match repo
-            .list_tree(at)?
-            .into_iter()
-            .find(|entry| entry.name == part.as_bytes())
-        {
-            Some(entry) => at = entry.oid,
-            None => return Ok(None),
-        }
-    }
-    Ok(Some(at))
-}
-
-/// A record's value in `commit`: a directory's record, or a live file's metadata from its line
-/// record. A few paths read, never the whole snapshot.
-fn record_at(repo: &TreeGit, commit: Oid, record: referee::Record<'_>) -> Result<Option<Meta>> {
-    let tree = repo.read_commit(commit)?.tree;
-    match record {
-        referee::Record::Dir(path) => match lookup(repo, tree, &format::dir_path(path))? {
-            Some(blob) => Ok(Some(serde_json::from_slice(&repo.read_blob(blob)?)?)),
-            None => Ok(None),
-        },
-        referee::Record::Meta(id) => {
-            let Some(names) = lookup(repo, tree, &format::names_path(id))? else {
-                return Ok(None);
-            };
-            let history: NameHistory = serde_json::from_slice(&repo.read_blob(names)?)?;
-            let Some(path) = history.path()? else {
-                return Ok(None);
-            };
-            let lines = lookup(repo, tree, &format::lines_path(path))?.ok_or(Error::Format)?;
-            let (_, _, meta): (MergeFileIdentity, serde::de::IgnoredAny, Meta) =
-                serde_json::from_slice(&repo.read_blob(lines)?)?;
-            Ok(Some(meta))
-        }
-    }
-}
-
 /// One upstream commit a sync can take, the fork's snapshot after it, and the
 /// older commits whose files hold lines it keeps (finding 44's last lines).
 pub(in crate::tree_actor) struct SyncStep {
     pub(in crate::tree_actor) commit: Oid,
     pub(in crate::tree_actor) snapshot: referee::Snapshot,
     pub(in crate::tree_actor) older: Vec<Oid>,
+    /// An entry the snapshot leaves out because the rules do not decide it
+    /// (`referee::Synced::unruled`): this step may not be the one shown.
+    pub(in crate::tree_actor) unruled: Option<String>,
 }
 
 /// A take as decided: how the head moves, the snapshot it leaves, its
@@ -456,12 +418,13 @@ pub(in crate::tree_actor) fn plan_sync(
             referee::sync(&parent, fork_snapshot, &undecided, &last_lines)?
         };
         let current = last.map_or(fork_snapshot, |step| &step.snapshot);
-        let keys = referee::touches(current, &next);
+        let keys = referee::touches(current, &next.snapshot);
         Ok((
             SyncStep {
                 commit: oid,
-                snapshot: next,
+                snapshot: next.snapshot,
                 older,
+                unruled: next.unruled,
             },
             keys,
         ))
@@ -530,6 +493,7 @@ pub(in crate::tree_actor) fn decide_sync(
         commit: target,
         snapshot: mut synced,
         older,
+        unruled,
     }) = cut.into_taken()
     else {
         return Ok(Decided {
@@ -541,6 +505,11 @@ pub(in crate::tree_actor) fn decide_sync(
             reads: BTreeSet::new(),
         });
     };
+    // The step shown is one the rules do not decide: the sync waits for the
+    // upstream to decide the fork's change, as the model stops there.
+    if let Some(path) = unruled {
+        return Err(Error::Unruled { path });
+    }
     let parent = read_snapshot(snapshot.repo(), target, snapshot.objects(upstream))?;
     // R6.1: a sync that can fast-forward does. It can when nothing of the fork waits
     // for the upstream and the sync shows what the upstream's commit shows (the

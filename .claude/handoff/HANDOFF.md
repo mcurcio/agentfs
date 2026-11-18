@@ -29,7 +29,13 @@ The code and the library/human docs win over all of these where they disagree; r
   "M1 end review fix round"; four residuals under "M1 residuals" (coordinator to a library, `stage` judges the name,
   failpoints armed by event, take worker to core), each to become a bead.
 
+- M2 (directories, metadata, links) built (b81afe6..800814f) and its one fix round landed: CI's root-only checks
+  under sudo, directory records keyed by blob id, fsync covering metadata steps, the unruled sync failing loudly,
+  phase-1 floors 94/79. Open owner questions and five residuals: `.claude/errata.md`, "M2 fix round".
+
 ## Next, in order
+0. Put the two M2 owner questions (errata "M2 fix round" items 1 and 2) to the owner; cut beads for the M2
+   residuals; then M3.
 1. Confirm CI (ci, image, phase-1) green on the fix round's SHA; cut beads for the four "M1 residuals".
 2. One full phase-1 dispatch on the final SHA (`gh workflow run phase-1.yml`), read its result.
 3. Then the plan in `docs/target-architecture/future/one-engine.md`: M2 -> M3 -> M4 -> M5 -> M7 (with M6) -> baseline.

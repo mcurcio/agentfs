@@ -218,19 +218,14 @@ pub(crate) fn parse_meta(v: &Value) -> Result<Meta, String> {
     })
 }
 
-/// A directory's path from its record's leaf: `%2F` is `/`, `%25` is `%`.
-fn dir_path(leaf: &str) -> String {
-    leaf.replace("%2F", "/").replace("%25", "%")
-}
-
 /// One long-lived `git cat-file --batch`, and short `git` commands.
 pub(crate) struct Git {
     dir: PathBuf,
     child: Child,
     input: ChildStdin,
     output: BufReader<ChildStdout>,
-    /// Each name's two hashed folders, once asked of `git hash-object`.
-    folders: BTreeMap<String, String>,
+    /// Each name's blob id, once asked of `git hash-object`.
+    hashes: BTreeMap<String, String>,
 }
 
 impl Git {
@@ -250,7 +245,7 @@ impl Git {
             child,
             input,
             output,
-            folders: BTreeMap::new(),
+            hashes: BTreeMap::new(),
         })
     }
 
@@ -311,8 +306,14 @@ impl Git {
     /// `<aa>/<bb>`: hex digits 1-2 and 3-4 of `git hash-object --stdin` of
     /// `name`, the folders the layout keeps it in.
     fn folders(&mut self, name: &str) -> Result<String, String> {
-        if let Some(folders) = self.folders.get(name) {
-            return Ok(folders.clone());
+        let hex = self.hash(name)?;
+        Ok(format!("{}/{}", &hex[..2], &hex[2..4]))
+    }
+
+    /// `git hash-object --stdin` of `name`: its blob id.
+    fn hash(&mut self, name: &str) -> Result<String, String> {
+        if let Some(hex) = self.hashes.get(name) {
+            return Ok(hex.clone());
         }
         let mut child = Command::new("git")
             .args(["hash-object", "--stdin"])
@@ -328,12 +329,12 @@ impl Git {
             .map_err(|e| e.to_string())?;
         let out = child.wait_with_output().map_err(|e| e.to_string())?;
         let hex = String::from_utf8(out.stdout).map_err(|e| e.to_string())?;
+        let hex = hex.trim().to_owned();
         if !out.status.success() || hex.len() < 4 {
             return Err(format!("git hash-object of {name:?}: {hex:?}"));
         }
-        let folders = format!("{}/{}", &hex[..2], &hex[2..4]);
-        self.folders.insert(name.to_owned(), folders.clone());
-        Ok(folders)
+        self.hashes.insert(name.to_owned(), hex.clone());
+        Ok(hex)
     }
 
     /// Every blob under `top/` of commit `oid`: its name and object. A blob
@@ -426,27 +427,31 @@ impl Git {
 
 impl Git {
     /// Every directory record of commit `oid`: `dirs/root`, and each
-    /// `dirs/<aa>/<bb>/<enc(path)>` in the folders its path hashes to. Any
-    /// other blob under `dirs/` is a layout the engine never writes.
+    /// `dirs/<aa>/<bb>/<key>` whose `key` is its recorded path's whole blob
+    /// id, in the folders that id starts with. Any other blob under `dirs/`
+    /// is a layout the engine never writes.
     fn dirs(&mut self, oid: &str) -> Result<BTreeMap<String, Meta>, String> {
         let listing = self.run(&["ls-tree", "-r", "-z", "--full-tree", oid, "dirs/"])?;
         let mut dirs = BTreeMap::new();
         for record in listing.split_terminator('\0') {
             let (head, path) = record.split_once('\t').ok_or_else(|| record.to_owned())?;
             let blob = head.rsplit(' ').next().ok_or_else(|| record.to_owned())?;
-            let dir = match path.split('/').collect::<Vec<_>>().as_slice() {
-                ["dirs", "root"] => String::new(),
-                ["dirs", aa, bb, leaf] => {
-                    let dir = dir_path(leaf);
-                    if dir.is_empty() || self.folders(&dir)? != format!("{aa}/{bb}") {
-                        return Err(format!("{oid:.7}: {path} is not in its path's folders"));
-                    }
-                    dir
-                }
-                _ => return Err(format!("{oid:.7}: {path} is not dirs/<aa>/<bb>/<enc>")),
-            };
             let meta: Value =
                 serde_json::from_slice(&self.object(blob)?).map_err(|e| e.to_string())?;
+            let dir = meta["path"]
+                .as_str()
+                .ok_or_else(|| format!("{oid:.7}: {path} names no path"))?
+                .to_owned();
+            match path.split('/').collect::<Vec<_>>().as_slice() {
+                ["dirs", "root"] if dir.is_empty() => {}
+                ["dirs", aa, bb, leaf] if !dir.is_empty() => {
+                    let key = self.hash(&dir)?;
+                    if key != *leaf || !key.starts_with(&format!("{aa}{bb}")) {
+                        return Err(format!("{oid:.7}: {path} is not at {dir:?}'s key"));
+                    }
+                }
+                _ => return Err(format!("{oid:.7}: {path} is not dirs/<aa>/<bb>/<key>")),
+            }
             let meta = parse_meta(&meta).map_err(|e| format!("{oid:.7} {path}: {e}"))?;
             if meta.kind != Kind::Dir {
                 return Err(format!("{oid:.7}: {path} records a {:?}", meta.kind));

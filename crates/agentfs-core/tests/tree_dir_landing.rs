@@ -333,12 +333,12 @@ fn an_empty_directory_is_kept() {
         tmp.path(),
         &[
             "show",
-            &format!("{}:dirs/{}/{}/empty", root_head(&v), &hex[..2], &hex[2..4]),
+            &format!("{}:dirs/{}/{}/{hex}", root_head(&v), &hex[..2], &hex[2..4]),
         ],
     );
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(&record).unwrap(),
-        serde_json::json!({"kind": "dir", "mode": "2775", "uid": 0, "gid": 100})
+        serde_json::json!({"path": "empty", "kind": "dir", "mode": "2775", "uid": 0, "gid": 100})
     );
 }
 

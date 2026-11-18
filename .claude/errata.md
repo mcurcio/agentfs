@@ -1405,3 +1405,36 @@ Carried on in every case; none stopped the slice.
    `ci/git-release` in `/usr/bin` too, and this container has no Docker. It ran in a private mount namespace with
    git 2.47.3 bound over `/usr/bin/git`: 199 runs match; its one complaint, scenarios over 1.5 times their 5 s
    budget, is the same (19 s) on the base commit.
+
+## 2026-11-18, M2 fix round: where the findings were short, and M2 residuals
+
+1. **"Make the library stop loudly as the model does" cannot fail every sync step.** The library syncs the upstream's
+   commits one at a time (P2), and `undecided` is judged at each commit, so an intermediate commit (the upstream's
+   `q/x` before its landing decided the fork's move of `q`) meets the unruled case even when the head has decided it:
+   `r14_moving_a_directory_the_upstream_filled_loses_whole` failed so on the library. The model judges only the state
+   a sync shows. So each step records the unruled path (`referee::Synced::unruled`) and only the step a sync would
+   show fails (`Error::Unruled`, logged, retried at the next event). The owner question of M2 S2 erratum 1 is still
+   open and must be put to him by the main session, labelled "absolute requirement", with its background.
+2. **The set-meta granularity question (M2 S5 erratum 1) is still the owner's.** docs/library/core.md now states the
+   two-change behaviour of `chmod` plus `chown`; whether the model should make set-meta mode-or-owner is unasked.
+3. **No M2 new-terms table exists in the repo** (finding B-F13). `Attrs` is now defined against `Meta` in
+   docs/library/core.md and `FileOwner`'s doc no longer points up a layer.
+4. **CI ran the root-only checks as the runner user.** `trees-posix.py` (view, touch, touched) and the mounted replay
+   now refuse a non-root euid at start, and CI runs them under `sudo`; the views' server still runs unprivileged in
+   `ci/e2e-trees.sh`. A non-root server could not be tried locally: this container's `/dev/fuse` is root's alone.
+
+M2 residuals (each to become a bead):
+
+- **Metadata for a file no name reaches** (B-F4). Files: `tree_actor/recording/mod.rs` (`set_meta`, `set_times`,
+  `anonymous_open` taking the parent directory), `journal` (a step keyed by object), `agentfs-fuse/src/tree_view.rs`
+  (`set_attrs`, `tmpfile`). Done: `O_TMPFILE` + `fchmod` + `linkat` keeps the mode, an `O_TMPFILE` in a set-group-ID
+  directory takes its group, a test of each; the "Limits" bullet in docs/trees.md removed.
+- **Blobs known after a restart** (B-F6). Files: `tree_actor/mod.rs` (the `read_trees` map at open),
+  `history/mod.rs`, `history/format.rs` (one walk of `files/`). Done: each `FileBytes` built from a checkout carries
+  its `files/` blob, so a directory rename after a restart feeds no bytes to fast-import; a test that shows it.
+- **An anonymous open's times across a replay** (B-F8). Files: `journal/fold.rs` (`add_anonymous(.., 0)`),
+  `tree.rs` (`restore_locals`). Done: a live `O_TMPFILE` across a compaction and reopen keeps its creation time.
+- **Power loss over the M2 step kinds** (B-F11). Files: `ci/power-loss-trees.sh`. Done: mkdir, chmod, touch, an
+  FSYNCDIR, a cut, and the modes, owners and times checked after replay (runs on main after landing).
+- **A stable readdir cookie** (B-F12). Files: `agentfs-fuse/src/tree_view.rs` (`readdir`), `Shape::children`.
+  Done: an unlink between two readdir batches skips no untouched entry; a test of it.

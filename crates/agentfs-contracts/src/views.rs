@@ -11,8 +11,8 @@ use crate::clients::Binding;
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct MountPoint(pub PathBuf);
 
-/// How the kernel mount is made. The owner every file is presented as is the
-/// binding's grant's `acts_as`, never an option.
+/// How the kernel mount is made. No option sets an owner: each entry is
+/// presented with its recorded owner and mode (docs/trees.md, "The view").
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MountOptions {
     /// FUSE `allow_other`: other users reach the mount (needs

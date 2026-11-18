@@ -134,14 +134,16 @@ impl Recording {
         Ok(actor)
     }
 
-    /// The last record a FLUSH of `open` must cover, read under the lock.
+    /// The last record a FLUSH of `open` must cover, read under the lock
+    /// ([`TreeActor::durable_through`]).
     fn durable_through(&self, open: u64) -> Result<RecordNo, Error> {
         self.actor()?.durable_through(open)
     }
 
     /// FLUSH, FSYNC, `msync(MS_SYNC)` and each write of an `O_SYNC` or
-    /// `O_DSYNC` open: the open's records made durable. Locks the actor only
-    /// to read the open's last record; the fsync runs outside the lock.
+    /// `O_DSYNC` open: every record so far made durable, the file's metadata
+    /// steps included. Locks the actor only to read the last record; the
+    /// fsync runs outside the lock.
     ///
     /// # Errors
     ///
@@ -289,6 +291,7 @@ impl Recording {
 mod tests {
     use std::sync::mpsc::{self, sync_channel};
 
+    use super::super::meta::{Attrs, Perm, SetTime};
     use super::super::test_support::{ATTRS, new_actor, writer};
     use super::*;
 
@@ -347,6 +350,34 @@ mod tests {
             Box::new(move |r| answered.send(r.err().map(|e| e.errno())).unwrap()),
         );
         assert_eq!(answer.recv().unwrap(), Some(libc::ENOENT));
+    }
+
+    /// fsync(2) covers a file's metadata: a chmod and a `futimens` of the
+    /// open's file, each a step of its own, are inside the flush's records.
+    #[test]
+    fn a_flush_covers_its_files_metadata_steps() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rec = Recording::serve(new_actor(tmp.path())).unwrap();
+        let mut actor = rec.actor().unwrap();
+        let h = actor
+            .write_open(TreeId::Root, "a", &writer("w"), Some(ATTRS))
+            .unwrap();
+        actor.write(h, 0, b"x", false).unwrap();
+        let written = actor.durable_through(h).unwrap();
+        let exec = Attrs {
+            perm: Perm::from_mode(0o755),
+            ..ATTRS
+        };
+        actor
+            .set_meta(TreeId::Root, "a", exec, &writer("w"))
+            .unwrap();
+        let chmod = actor.durable_through(h).unwrap();
+        assert!(chmod > written, "the chmod's step is covered");
+        actor
+            .set_times(TreeId::Root, "a", Some(SetTime::Now), None, &writer("w"))
+            .unwrap();
+        assert!(actor.durable_through(h).unwrap() > chmod);
+        assert_eq!(actor.durable_through(h).unwrap(), rec.durability.appended());
     }
 
     #[test]

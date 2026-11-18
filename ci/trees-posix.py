@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Directories, modes, owners, links and times through a tree view, then in its
-history (docs/trees.md, "The view" and "What a commit holds"). Run as root on
-a view mounted with allow_other: the non-root cases run in a forked child as
-uid and gid 10000.
+history (docs/trees.md, "The view" and "What a commit holds"). Run view,
+touch and touched as root (they refuse otherwise) on a view mounted with
+allow_other, whoever serves it: the non-root cases run in a forked child as uid
+and gid 10000.
 
     trees-posix.py view MOUNT      mkdir -p, files in subdirectories, a directory
                                    moved, rmdir of a directory with entries, chmod +x
@@ -23,16 +24,32 @@ import os
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
+
+
+def key(path):
+    """`git hash-object --stdin` of the path."""
+    data = path.encode()
+    return hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
 
 
 def fanned(path):
     """`<aa>/<bb>/<path>`: `aa` and `bb` hex digits 1-2 and 3-4 of `git
     hash-object --stdin` of the path."""
-    data = path.encode()
-    hexa = hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
+    hexa = key(path)
     return f"{hexa[:2]}/{hexa[2:4]}/{path}"
+
+
+def dir_record(path):
+    """A directory's record: `dirs/<aa>/<bb>/<key>`."""
+    hexa = key(path)
+    return f"dirs/{hexa[:2]}/{hexa[2:4]}/{hexa}"
+
+
+# A directory whose path is longer than a file name may be (NAME_MAX).
+DEEP = "posix/" + "/".join(c * 200 for c in "de")
 
 
 def mode(path):
@@ -233,6 +250,8 @@ def view(root):
     os.rmdir(root / "posix/c/locked")
     expect_errno(errno.ENOENT, os.stat, root / "posix/c/locked")
     expect_errno(errno.EISDIR, os.unlink, root / "posix/c/b")
+    os.makedirs(root / DEEP)
+    (root / DEEP / "f").write_bytes(b"deep\n")
     owners(root)
     setgid(root)
     links(root)
@@ -253,21 +272,29 @@ def history(git_dir):
     run = "files/" + fanned("posix/c/b/run.sh")
     assert modes.get(run) == "100755", (run, modes.get(run))
     assert modes.get("files/" + fanned("posix/c/notes")) == "100644"
-    aa, bb, _ = fanned("posix/c/b").split("/", 2)
-    record = f"dirs/{aa}/{bb}/posix%2Fc%2Fb"
+    record = dir_record("posix/c/b")
     assert record in modes, sorted(p for p in modes if p.startswith("dirs/"))
-    meta = git("show", f"{head}:{record}")
-    assert '"kind":"dir"' in meta and '"mode":"0755"' in meta, meta
+    meta = json.loads(git("show", f"{head}:{record}"))
+    assert meta == {"path": "posix/c/b", "kind": "dir", "mode": "0755", "uid": 0, "gid": 0}, meta
     assert "dirs/root" in modes
     assert not any("posix/a/" in path for path in modes), "the move left an entry"
-    assert not any(p.endswith("posix%2Fc%2Flocked") for p in modes), "rmdir left its record"
+    assert dir_record("posix/c/locked") not in modes, "rmdir left its record"
+    assert json.loads(git("show", f"{head}:{dir_record(DEEP)}"))["path"] == DEEP
+    # Every name in a commit fits a file system: a checkout of the whole
+    # commit, the deep directory's record included, succeeds.
+    with tempfile.TemporaryDirectory() as out:
+        subprocess.run(
+            ["git", "--git-dir=" + str(git_dir), "--work-tree=" + out, "checkout", "-f", head, "--", "."],
+            check=True,
+            env={**os.environ, "GIT_INDEX_FILE": os.path.join(out, ".index")},
+        )
+        assert Path(out, dir_record(DEEP)).is_file()
     # Owners: in the lines/ entry's meta and the directory records.
     entry = json.loads(git("show", f"{head}:lines/" + fanned("posix/o/mine")))
     assert entry[2] == {"kind": "file", "mode": "0644", "uid": USER, "gid": USER}, entry
     rootfile = json.loads(git("show", f"{head}:lines/" + fanned("posix/o/rootfile")))
     assert (rootfile[2]["uid"], rootfile[2]["gid"]) == (USER, USER), rootfile
-    aa, bb, _ = fanned("posix/shared/sub").split("/", 2)
-    sub = json.loads(git("show", f"{head}:dirs/{aa}/{bb}/posix%2Fshared%2Fsub"))
+    sub = json.loads(git("show", f"{head}:{dir_record('posix/shared/sub')}"))
     assert (sub["uid"], sub["gid"]) == (USER, 4000) and int(sub["mode"], 8) & stat.S_ISGID, sub
     # A link is a 120000 blob holding its target; removed links are gone.
     link = "files/" + fanned("posix/c/moved-link")
@@ -280,4 +307,8 @@ def history(git_dir):
 
 if __name__ == "__main__":
     commands = {"view": view, "history": history, "touch": touch, "touched": touched}
+    # The view checks chown, act as USER and touch root's files: as any other
+    # user they fail with EPERM far from the cause.
+    if sys.argv[1] != "history" and os.geteuid() != 0:
+        sys.exit(f"trees-posix.py {sys.argv[1]} must run as root (euid {os.geteuid()})")
     commands[sys.argv[1]](Path(sys.argv[2]))

@@ -1054,8 +1054,9 @@ impl Filesystem for View {
             setattr(self, Ok(()));
         }
     }
-    /// close(2): the open's records made durable before close returns. The
-    /// fsync runs off this thread; the reply comes when it ends.
+    /// close(2) of a write-open: every record so far (the open's, and its
+    /// file's metadata steps) made durable before close returns. The fsync
+    /// runs off this thread; the reply comes when it ends.
     fn flush(
         &self,
         _req: &Request,
@@ -1077,8 +1078,8 @@ impl Filesystem for View {
             None => reply.ok(),
         }
     }
-    /// A write-open's records made durable; a read-only descriptor's fsync
-    /// makes every record durable, as FSYNCDIR does.
+    /// Every record so far made durable, as FSYNCDIR does; a write-open's
+    /// fsync first checks the open is live.
     fn fsync(
         &self,
         _req: &Request,

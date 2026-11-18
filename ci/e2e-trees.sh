@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# Recording slice of target git-model §18. Requires Linux FUSE; no sudo.
+# Recording slice of target git-model §18. Requires Linux FUSE. The views'
+# server runs as the caller; trees-posix.py's view checks run as root (sudo when
+# the caller is not root), since they chown and act as another user.
 set -euo pipefail
 . "$(dirname "$0")/tree-git-test-lib.sh"
 bin=${AGENTFS_BIN:-$PWD/target/debug/agentfs}
@@ -17,6 +19,8 @@ cleanup() {
     rm -rf "$work"
 }
 trap cleanup EXIT
+as_root=()
+[ "$(id -u)" = 0 ] || as_root=(sudo)
 mkdir "$work/main" "$work/fork"
 # trees-posix.py's non-root user reaches the views through it.
 chmod 755 "$work"
@@ -125,7 +129,7 @@ delivered(main / "isolation", b"fork")
 PY
 # Directories, modes, owners, links and times through the view; history is
 # read after the restart.
-python3 ci/trees-posix.py view "$work/main"
+"${as_root[@]}" python3 ci/trees-posix.py view "$work/main"
 mmap_status=0
 python3 ci/trees-mmap.py "$work/main" "$work/state/history.git" || mmap_status=$?
 tmpfile_status=0
@@ -167,7 +171,7 @@ test "$(git --git-dir="$work/state/history.git" rev-parse root)" = "$head"
 start
 # touch and touch -d set a file's times and build no commit: after a kill and
 # the next init's build, the head has not moved, and the times survive.
-python3 ci/trees-posix.py touch "$work/main"
+"${as_root[@]}" python3 ci/trees-posix.py touch "$work/main"
 kill -KILL "$pid"
 tree_wait_exit "$pid" 2>/dev/null || true
 pid=
@@ -176,7 +180,7 @@ fusermount3 -uz "$work/fork"
 "$bin" --state "$work/state" trees init --volume t
 test "$(git --git-dir="$work/state/history.git" rev-parse root)" = "$head"
 start
-python3 ci/trees-posix.py touched "$work/main"
+"${as_root[@]}" python3 ci/trees-posix.py touched "$work/main"
 test "$(cat "$work/main/crash")" = acknowledged-before-kill
 test "$(cat "$work/main/isolation")" = fork
 test "$(cat "$work/fork/isolation")" = fork

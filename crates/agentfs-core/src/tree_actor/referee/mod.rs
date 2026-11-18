@@ -304,7 +304,7 @@ pub(super) fn sync(
     fork: &Snapshot,
     undecided: &Undecided,
     last_lines: &BTreeMap<MergeFileIdentity, Lines>,
-) -> Result<Snapshot> {
+) -> Result<Synced> {
     let (upstream, fork) = (upstream.by_line(), fork.by_line());
     let last_lines = last_lines
         .iter()
@@ -324,8 +324,18 @@ pub(super) fn sync(
             files.insert(*id, placed.remove(id).ok_or(Error::Format)?);
         }
     }
-    let dirs = entries::sync(&upstream, &fork, &undecided.dirs, &mut names, &mut files)?;
-    Snapshot { files, names, dirs }.stored()
+    let (dirs, unruled) = entries::sync(&upstream, &fork, &undecided.dirs, &mut names, &mut files)?;
+    Ok(Synced {
+        snapshot: Snapshot { files, names, dirs }.stored()?,
+        unruled,
+    })
+}
+
+/// A sync's result: the fork's snapshot, and the first entry it left out because the
+/// rules do not decide it ([`entries::sync`]).
+pub(in crate::tree_actor) struct Synced {
+    pub snapshot: Snapshot,
+    pub unruled: Option<String>,
 }
 
 /// A step's lock keys (R9, R9.1): every file whose name head, lines or metadata differ, and each
@@ -811,6 +821,7 @@ mod sync_tests {
             &undecided,
             last_lines,
         )
+        .map(|synced| synced.snapshot)
     }
 
     fn path(history: &NameHistory) -> Result<Option<&str>> {

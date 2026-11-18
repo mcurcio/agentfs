@@ -37,7 +37,9 @@ what they do today, and where they stop.
   keeps no empty directory; a directory record keeps one.
 - An entry's **node number** says which file or directory a view's inode is: a
   file's or link's object number, a directory's number (the record that made
-  it). Like object numbers, node numbers are the journal's, never history's.
+  it). A directory a take adds gets a new number from the take's step, never
+  the source tree's, and a take may add at most 1,048,576 (2^20) directories.
+  Like object numbers, node numbers are the journal's, never history's.
 - **Tree-local times** are an entry's access, modification and change times.
   Each tree keeps its own, in its journal and checkpoints; history never holds
   them, as git records no file times.
@@ -326,10 +328,12 @@ returned:
 
 - `close(2)` of a descriptor that wrote (FUSE `FLUSH`), or `fsync(2)` of it;
 - each `write(2)` of a descriptor opened `O_SYNC` or `O_DSYNC`;
-- `fsync(2)` of the view's directory (FSYNCDIR), or of a read-only descriptor:
-  every record so far, creates, renames and unlinks included.
+- `fsync(2)` of the view's directory (FSYNCDIR), or of a read-only descriptor.
 
-A power cut loses the calls, renames and unlinks made since the last of these.
+Each of these makes every record so far durable, not only the descriptor's own:
+creates, renames, unlinks, `mkdir`, `rmdir`, `symlink`, `chmod`, `chown` and
+time sets included, so `fchmod` then `fsync` keeps the mode. A power cut loses
+the calls and steps made since the last of these.
 Waits share fsyncs (group commit): one fsync answers every wait whose records were
 written before it began. The fsync runs off the view's request thread and outside
 the actor's lock, so a waiting close holds no other call. A failed fsync stops the
@@ -405,8 +409,8 @@ and one per directory, in two levels of hashed folders:
 files/<aa>/<bb>/<path>      the file's bytes, a link's target
 lines/<aa>/<bb>/<path>      JSON [identity, line map, meta]: the file's lines as runs, never their bytes
 names/<cc>/<dd>/<id>        JSON name history of one file identity, ended files included
-dirs/<aa>/<bb>/<enc(path)>  JSON meta of one directory
-dirs/root                   JSON meta of the root directory
+dirs/<aa>/<bb>/<key>        JSON path and meta of one directory
+dirs/root                   JSON path ("") and meta of the root directory
 ```
 
 `aa` and `bb` are hex digits 1-2 and 3-4 of `git hash-object --stdin` of the
@@ -417,8 +421,11 @@ the builder's cost per save is the same at 100 files and at 100,000. `git log --
 files/2e/65/a` is the history of a file named `a` (`printf a | git hash-object
 --stdin` starts `2e65`). A file's path nests under its folders
 (`files/7f/3c/skills/web/SKILL.md`): a file and a directory never share a path,
-so no blob there is ever a folder too. A directory's record is one leaf, its path
-with `%` written `%25` and `/` written `%2F` (`dirs/<aa>/<bb>/a%2Fb` for `a/b`).
+so no blob there is ever a folder too. A directory's record is one leaf named by
+`key`, the whole `git hash-object --stdin` of its path (40 hex digits, of which
+`aa` and `bb` are the first four), so a clone or checkout of history never meets
+a name too long however deep the directory; the record holds the path:
+`{"path":"a/b","kind":"dir","mode":"0755","uid":0,"gid":0}`.
 The Root commit holds `dirs/root` alone, the root directory owned by the process
 that ran `trees init`, mode `0755`.
 
@@ -644,7 +651,8 @@ at each write) moves its file's mtime and ctime, and a create, rename or remove
 moves its directory's. `touch` and `utimensat` set atime and mtime as a step
 that builds no commit, so the head does not move; the times survive a restart.
 A time before the epoch answers `EINVAL`. atime is the last time set, else the
-mtime: reads do not move it. The FUSE adapter uses zero entry and attribute TTLs and
+time the entry was made: as on Linux a write does not move it, and reads do not
+either. The FUSE adapter uses zero entry and attribute TTLs and
 direct I/O, and negotiates neither passthrough nor the writeback cache. A read with
 no lock owner is a page fill and a write with `FUSE_WRITE_CACHE` is a page write.
 `max_background` is as high as the kernel allows, to keep a release ahead of a later
@@ -670,8 +678,13 @@ What the tree views do not support:
   devices, FIFOs and sockets answer `EPERM`; extended attributes and ACLs are
   not supported.
 - **Times.** A file's mtime moves at its last close, not at each write
-  (close-to-open). Access times are not tracked: atime is the last time set,
-  else the mtime. A checkout of history shows checkout times, as git does.
+  (close-to-open). Reads are not tracked: atime is the last time set, else
+  the time the entry was made. A checkout of history shows checkout times, as git does.
+- **A file no name reaches has no metadata steps.** `fchmod`, `fchown` and
+  `futimens` of an `O_TMPFILE` file, or of a file unlinked while open, answer
+  `EOPNOTSUPP`, so the `O_TMPFILE`, `fchmod`, `linkat` pattern fails at the
+  `fchmod`. An `O_TMPFILE` file made in a set-group-ID directory keeps the
+  caller's group, and `linkat` keeps it.
 - **Nested forks, transactions, `Client::Outside`, rules and view profiles,
   replication, CSI, several view hosts, upgrades and snapshot opens** are not
   built. The designs for them are in [target-architecture](target-architecture/README.md).

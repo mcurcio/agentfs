@@ -141,6 +141,13 @@ pub enum Error {
     MissingObject { name: String, oid: Oid },
     #[error("pointer {name} is not at the value a step expected")]
     PointerMoved { name: String },
+    /// A sync met a case the landing rules do not decide: an upstream entry
+    /// the fork never had, at `path`, under a directory the fork's undecided
+    /// change removed or moved. The sync stays queued until the upstream
+    /// decides that change (docs/library/core.md, "Landing directories,
+    /// metadata and links").
+    #[error("sync of {path} waits: the fork's undecided change removed its directory")]
+    Unruled { path: String },
     #[error(transparent)]
     Durable(#[from] DurableError),
     /// History could not be built through what a reader waited for.
@@ -986,17 +993,18 @@ impl TreeActor {
         Ok(self.history.wait_built(self.durability().appended())?)
     }
 
-    /// The last record a FLUSH of `open` must cover: its open record, its
-    /// calls, its object's page writes.
+    /// The last record a FLUSH or FSYNC of `open` must cover: every record
+    /// appended so far. The open's own records (its open, calls and page
+    /// writes) are not enough: a chmod, chown or `futimens` of its file is a
+    /// step of its own, and `fsync(2)` covers a file's metadata. Group commit
+    /// makes the rest the same one fsync.
     ///
     /// # Errors
     ///
     /// [`Error::NotFound`] for no such open.
     pub fn durable_through(&self, open: u64) -> Result<RecordNo> {
-        let h = self.handles.get(&open).ok_or(Error::NotFound)?;
-        let calls = h.calls.last().map_or(open, |(seq, _, _)| *seq);
-        let pages = self.pages_last_write(h.tree, h.object).unwrap_or(open);
-        Ok(RecordNo::new(open.max(calls).max(pages)))
+        self.handles.get(&open).ok_or(Error::NotFound)?;
+        Ok(self.durability().appended())
     }
 
     /// The tree's head as built, once every record appended so far is built.
