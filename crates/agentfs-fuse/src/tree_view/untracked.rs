@@ -4,7 +4,7 @@
 //! call here is journaled, gated by the lag gate or made under the actor's
 //! lock; each change holds the area against a fork's copy while it runs.
 //!
-//! Inodes: an area entry's is `1 << 63 | n`, `n` from this table keyed by
+//! Inodes: an area entry's is `1 << 62 | n`, `n` from this table keyed by
 //! the backing file (`st_dev`, `st_ino`), each with the paths it is known
 //! by (more than one after a hard link).
 
@@ -24,12 +24,15 @@ use rustix::fs::{AtFlags, Mode, OFlags, RenameFlags, Stat, Timespec, Timestamps}
 
 use super::{AttrChanges, Result};
 
-/// The bit every untracked entry's inode carries; tracked inodes stay below it.
-pub(super) const UNTRACKED: u64 = 1 << 63;
+/// The start of the untracked entries' inodes, `[1 << 62, 1 << 63)`. Tracked
+/// inodes are outside it: a file's or link's object and a directory's number,
+/// plus 2, are below it, and a directory a take adds has bit 63 set
+/// (`taken_dir_number`); the view refuses any that is not (`tracked_inode`).
+pub(super) const UNTRACKED: u64 = 1 << 62;
 
 /// Whether `ino` is an untracked entry's.
 pub(super) fn is_untracked(ino: INodeNo) -> bool {
-    ino.0 & UNTRACKED != 0
+    ino.0 >> 62 == 1
 }
 
 /// An errno from the area's I/O.
@@ -220,16 +223,6 @@ impl Untracked {
             .map(|st| self.ino(&path, &st)))
     }
 
-    /// Makes the directories above `path` the area lacks, standing for the
-    /// tracked directories there.
-    pub(super) fn containers(
-        &self,
-        path: &str,
-        meta_of: &mut dyn FnMut(&str) -> Option<Meta>,
-    ) -> Result<()> {
-        self.area.containers(path, meta_of).map_err(io)
-    }
-
     /// Gives a new entry to its caller, when the daemon may.
     fn give(&self, fd: &OwnedFd, owner: (u32, u32)) -> Result<()> {
         if self.give {
@@ -246,8 +239,8 @@ impl Untracked {
     /// Opens the file at `path` with the caller's access mode, `O_TRUNC`
     /// and the sync flags, never following a link.
     pub(super) fn open(&self, path: &str, flags: i32) -> Result<OwnedFd> {
-        let (parent, name) = self.area.parent(path).map_err(io)?;
-        let _writing = (flags & libc::O_TRUNC != 0).then(|| self.area.writing());
+        let writing = self.area.writing();
+        let (parent, name) = writing.parent(path).map_err(io)?;
         let flags = open_flags(flags);
         rustix::fs::openat(&parent, name.as_str(), flags, Mode::empty()).map_err(io)
     }
@@ -263,9 +256,9 @@ impl Untracked {
         owner: (u32, u32),
         meta_of: &mut dyn FnMut(&str) -> Option<Meta>,
     ) -> Result<(OwnedFd, FileAttr)> {
-        self.containers(path, meta_of)?;
-        let _writing = self.area.writing();
-        let (parent, name) = self.area.parent(path).map_err(io)?;
+        let writing = self.area.writing();
+        writing.containers(path, meta_of).map_err(io)?;
+        let (parent, name) = writing.parent(path).map_err(io)?;
         let fd = match rustix::fs::openat(
             &parent,
             name.as_str(),
@@ -296,9 +289,9 @@ impl Untracked {
         owner: (u32, u32),
         meta_of: &mut dyn FnMut(&str) -> Option<Meta>,
     ) -> Result<FileAttr> {
-        self.containers(path, meta_of)?;
-        let _writing = self.area.writing();
-        let (parent, name) = self.area.parent(path).map_err(io)?;
+        let writing = self.area.writing();
+        writing.containers(path, meta_of).map_err(io)?;
+        let (parent, name) = writing.parent(path).map_err(io)?;
         rustix::fs::mkdirat(&parent, name.as_str(), Mode::from_raw_mode(mode & 0o7777))
             .map_err(io)?;
         let fd = rustix::fs::openat(
@@ -322,9 +315,9 @@ impl Untracked {
         owner: (u32, u32),
         meta_of: &mut dyn FnMut(&str) -> Option<Meta>,
     ) -> Result<FileAttr> {
-        self.containers(path, meta_of)?;
-        let _writing = self.area.writing();
-        let (parent, name) = self.area.parent(path).map_err(io)?;
+        let writing = self.area.writing();
+        writing.containers(path, meta_of).map_err(io)?;
+        let (parent, name) = writing.parent(path).map_err(io)?;
         rustix::fs::symlinkat(target.as_os_str(), &parent, name.as_str()).map_err(io)?;
         if self.give {
             rustix::fs::chownat(
@@ -348,7 +341,8 @@ impl Untracked {
 
     /// The target of the link at `path`.
     pub(super) fn readlink_at(&self, path: &str) -> Result<Vec<u8>> {
-        let (parent, name) = self.area.parent(path).map_err(io)?;
+        let writing = self.area.writing();
+        let (parent, name) = writing.parent(path).map_err(io)?;
         Ok(rustix::fs::readlinkat(&parent, name.as_str(), Vec::new())
             .map_err(io)?
             .into_bytes())
@@ -363,10 +357,10 @@ impl Untracked {
         fd: Option<&OwnedFd>,
     ) -> Result<FileAttr> {
         let path = self.path(ino)?;
-        let (parent, name) = self.area.parent(&path).map_err(io)?;
+        let writing = self.area.writing();
+        let (parent, name) = writing.parent(&path).map_err(io)?;
         let name = name.as_str();
         {
-            let _writing = self.area.writing();
             if let Some(mode) = changes.mode {
                 rustix::fs::chmodat(
                     &parent,
@@ -416,8 +410,8 @@ impl Untracked {
 
     /// Removes the non-directory at `path`.
     pub(super) fn unlink(&self, path: &str) -> Result<()> {
-        let _writing = self.area.writing();
-        let (parent, name) = self.area.parent(path).map_err(io)?;
+        let writing = self.area.writing();
+        let (parent, name) = writing.parent(path).map_err(io)?;
         rustix::fs::unlinkat(&parent, name.as_str(), AtFlags::empty()).map_err(io)?;
         self.forget(path);
         Ok(())
@@ -426,8 +420,8 @@ impl Untracked {
     /// Removes the empty directory at `path`; with `if_any`, nothing there
     /// is fine (a tracked directory's container).
     pub(super) fn rmdir(&self, path: &str, if_any: bool) -> Result<()> {
-        let _writing = self.area.writing();
-        let (parent, name) = match self.area.parent(path) {
+        let writing = self.area.writing();
+        let (parent, name) = match writing.parent(path) {
             Ok(found) => found,
             Err(e) if if_any && agentfs_core::confined::is_gone(&e) => return Ok(()),
             Err(e) => return Err(io(e)),
@@ -450,10 +444,10 @@ impl Untracked {
         no_replace: bool,
         meta_of: &mut dyn FnMut(&str) -> Option<Meta>,
     ) -> Result<()> {
-        self.containers(to, meta_of)?;
-        let _writing = self.area.writing();
-        let (old_parent, old_name) = self.area.parent(from).map_err(io)?;
-        let (new_parent, new_name) = self.area.parent(to).map_err(io)?;
+        let writing = self.area.writing();
+        writing.containers(to, meta_of).map_err(io)?;
+        let (old_parent, old_name) = writing.parent(from).map_err(io)?;
+        let (new_parent, new_name) = writing.parent(to).map_err(io)?;
         let flags = if no_replace {
             RenameFlags::NOREPLACE
         } else {
@@ -489,17 +483,19 @@ impl Untracked {
     }
 
     /// Before a tracked directory is renamed onto `to`: an empty container
-    /// left there is removed; any other entry answers `EXDEV`.
+    /// left there is removed; a container with entries makes the target's
+    /// listing non-empty, so `ENOTEMPTY`; any other entry answers `EXDEV`.
     pub(super) fn clear_for_dir(&self, to: &str) -> Result<()> {
         let Some(st) = self.area.stat(to).map_err(io)? else {
             return Ok(());
         };
-        if kind(u32::from(st.st_mode)) == FileType::Directory
-            && self.area.entries(to).map_err(io)?.is_empty()
-        {
-            return self.rmdir(to, true);
+        if kind(u32::from(st.st_mode)) != FileType::Directory {
+            return Err(Errno::EXDEV);
         }
-        Err(Errno::EXDEV)
+        if !self.area.entries(to).map_err(io)?.is_empty() {
+            return Err(Errno::ENOTEMPTY);
+        }
+        self.rmdir(to, true)
     }
 
     /// A hard link at `to` to the area's entry at `from`, made under the
@@ -510,10 +506,10 @@ impl Untracked {
         to: &str,
         meta_of: &mut dyn FnMut(&str) -> Option<Meta>,
     ) -> Result<FileAttr> {
-        self.containers(to, meta_of)?;
-        let _writing = self.area.writing();
-        let (old_parent, old_name) = self.area.parent(from).map_err(io)?;
-        let (new_parent, new_name) = self.area.parent(to).map_err(io)?;
+        let writing = self.area.writing();
+        writing.containers(to, meta_of).map_err(io)?;
+        let (old_parent, old_name) = writing.parent(from).map_err(io)?;
+        let (new_parent, new_name) = writing.parent(to).map_err(io)?;
         rustix::fs::linkat(
             &old_parent,
             old_name.as_str(),
@@ -536,9 +532,9 @@ impl Untracked {
         owner: (u32, u32),
         meta_of: &mut dyn FnMut(&str) -> Option<Meta>,
     ) -> Result<FileAttr> {
-        self.containers(path, meta_of)?;
-        let _writing = self.area.writing();
-        let (parent, name) = self.area.parent(path).map_err(io)?;
+        let writing = self.area.writing();
+        writing.containers(path, meta_of).map_err(io)?;
+        let (parent, name) = writing.parent(path).map_err(io)?;
         let name = name.as_str();
         let perm = Mode::from_raw_mode(mode & 0o7777);
         rustix::fs::mknodat(
@@ -567,17 +563,18 @@ impl Untracked {
         Ok(self.attr(path, &st))
     }
 
-    /// Puts `len` bytes of `src` at `path` with `meta`
-    /// ([`UntrackedArea::place`]): a tracked file or link moved out of the
-    /// tree. The containers above `path` must exist.
+    /// Puts `len` bytes of `src` at `path` with `meta`, under the area's
+    /// hold `writing` ([`AreaWrite::place`]): a tracked file or link moved
+    /// out of the tree. The containers above `path` must exist.
     pub(super) fn place(
         &self,
+        writing: &AreaWrite<'_>,
         path: &str,
         src: &mut dyn std::io::Read,
         len: u64,
         meta: Meta,
     ) -> Result<()> {
-        self.area.place(path, src, len, meta).map_err(io)?;
+        writing.place(path, src, len, meta).map_err(io)?;
         self.forget(path);
         Ok(())
     }
@@ -595,15 +592,7 @@ impl Untracked {
 
     /// Makes the area's directory at `path`, if it has one, durable.
     pub(super) fn fsync_dir(&self, path: &str) -> Result<()> {
-        match self
-            .area
-            .dir()
-            .open_at(path, OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty())
-        {
-            Ok(fd) => rustix::fs::fsync(&fd).map_err(io),
-            Err(e) if agentfs_core::confined::is_gone(&e) => Ok(()),
-            Err(e) => Err(io(e)),
-        }
+        self.area.sync_dir(path).map_err(io)
     }
 
     /// Paths at or under `from` are now under `to`.
@@ -688,8 +677,15 @@ pub(super) fn read(fd: &OwnedFd, offset: u64, size: u32) -> Result<Vec<u8>> {
 }
 
 /// A write at `offset`, or at the file's end for `append`: every byte, or
-/// an error.
-pub(super) fn write(fd: &OwnedFd, offset: u64, data: &[u8], append: bool) -> Result<()> {
+/// an error. It runs under the area's hold, so no fork's copy sees part of
+/// it.
+pub(super) fn write(
+    _writing: &AreaWrite<'_>,
+    fd: &OwnedFd,
+    offset: u64,
+    data: &[u8],
+    append: bool,
+) -> Result<()> {
     let mut at = if append {
         rustix::fs::fstat(fd).map_err(io)?.st_size as u64
     } else {

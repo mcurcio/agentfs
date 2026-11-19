@@ -415,7 +415,10 @@ fn run_take_gate(
 fn invalidate_changed(notifiers: &[(TreeId, Notifier)], changed: &[(TreeId, u64)]) {
     for (tree, object) in changed {
         for (_, notifier) in notifiers.iter().filter(|(name, _)| name == tree) {
-            if let Err(e) = notifier.inval_inode(INodeNo(object + 2), 0, 0) {
+            let Ok(ino) = tracked_inode(*object) else {
+                continue;
+            };
+            if let Err(e) = notifier.inval_inode(ino, 0, 0) {
                 eprintln!("tree InvalidateFailed: tree={tree} object={object}: {e}");
             }
         }
@@ -499,15 +502,21 @@ fn errno(error: Error) -> Errno {
     Errno::from_i32(error.errno())
 }
 
-/// The inode of a node: 1 for the root directory, else its number + 2,
-/// below every untracked entry's.
-fn inode(node: &Node) -> INodeNo {
-    let ino = node.number.map_or(1, |number| number + 2);
-    debug_assert!(
-        ino < untracked::UNTRACKED,
-        "a tracked inode reached 1 << 63"
-    );
-    INodeNo(ino)
+/// The inode of tracked node number `number`: the number + 2. Untracked
+/// inodes have a range of their own ([`untracked::UNTRACKED`]); a number
+/// whose inode would fall in it, or past `u64`, answers `EOVERFLOW` rather
+/// than name another entry.
+fn tracked_inode(number: u64) -> Result<INodeNo> {
+    number
+        .checked_add(2)
+        .map(INodeNo)
+        .filter(|ino| !is_untracked(*ino))
+        .ok_or(Errno::EOVERFLOW)
+}
+
+/// The inode of a node: 1 for the root directory, else [`tracked_inode`].
+fn inode(node: &Node) -> Result<INodeNo> {
+    node.number.map_or(Ok(INodeNo(1)), tracked_inode)
 }
 
 /// The kind a new entry of `kind` is, as the rules take it.
@@ -842,7 +851,7 @@ impl View {
         fh: Option<FileHandle>,
     ) -> Result<FileAttr> {
         let node = v.node(path).map_err(errno)?;
-        self.attr(v, inode(&node), fh)
+        self.attr(v, inode(&node)?, fh)
     }
     fn open_file(
         &self,
@@ -955,7 +964,7 @@ impl View {
         } else {
             let parent = parent_dir(&dir);
             match v.node(parent) {
-                Ok(node) => inode(&node),
+                Ok(node) => inode(&node)?,
                 Err(_) => self
                     .untracked
                     .lookup(parent)?
@@ -985,7 +994,7 @@ impl View {
                         Kind::File => FileType::RegularFile,
                     };
                     let next = (first + i + 1) as u64;
-                    entries.push((INodeNo(entry.number + 2), next, kind, entry.name));
+                    entries.push((tracked_inode(entry.number)?, next, kind, entry.name));
                 }
                 if full {
                     return Ok(entries);
@@ -1106,11 +1115,14 @@ impl View {
                 let meta = v.node(&from).map_err(errno)?.meta;
                 let map = v.file_map(&from).map_err(errno)?;
                 let meta_of = &mut |dir: &str| v.node(dir).ok().map(|n| n.meta);
-                self.untracked.containers(&to, meta_of)?;
+                let writing = self.untracked.writing();
+                writing.containers(&to, meta_of).map_err(untracked::io)?;
                 // Read with the actor unlocked, as a read open's snapshot is.
                 drop(v);
                 self.untracked
-                    .place(&to, &mut map.reader(), map.len(), meta)?;
+                    .place(&writing, &to, &mut map.reader(), map.len(), meta)?;
+                // The actor's lock is never taken under the area's hold.
+                drop(writing);
                 self.actor()?.unlink(&from).map_err(errno)
             }
             Move::Import => {
@@ -1215,7 +1227,7 @@ impl Filesystem for View {
             let (dir, up) = self.dir_of(&v, parent)?;
             let path = child_path(&dir, name)?;
             if !up && let Ok(node) = v.node(&path) {
-                return self.attr(&v, inode(&node), None);
+                return self.attr(&v, inode(&node)?, None);
             }
             self.untracked.lookup(&path)?.ok_or(Errno::ENOENT)
         })();
@@ -1374,7 +1386,7 @@ impl Filesystem for View {
                         },
                     );
                     drop(handles);
-                    let ino = INodeNo(object + 2);
+                    let ino = tracked_inode(object)?;
                     Ok((fh, view.attr(&v, ino, Some(FileHandle(fh)))?))
                 })()
             });
@@ -1462,8 +1474,8 @@ impl Filesystem for View {
                 // A page write lands where the kernel says; a write of an
                 // `O_APPEND` open at the file's end.
                 let append = open.append && !write_flags.contains(WriteFlags::FUSE_WRITE_CACHE);
-                let _writing = self.untracked.writing();
-                return match untracked::write(&open.fd, offset, data, append) {
+                let writing = self.untracked.writing();
+                return match untracked::write(&writing, &open.fd, offset, data, append) {
                     Ok(()) => reply.written(data.len() as u32),
                     Err(e) => reply.error(e),
                 };
@@ -2115,6 +2127,24 @@ mod tests {
         }
     }
 
+    /// Tracked and untracked inodes never meet: a directory a take adds has
+    /// bit 63 set in its number (`taken_dir_number`: bit 63, its step's
+    /// number shifted by 20, its index), and its inode is still tracked; a
+    /// number whose inode would be untracked, or past `u64`, is refused.
+    #[test]
+    fn tracked_inodes_stay_out_of_the_untracked_range() {
+        let taken_dir = (1_u64 << 63) | (7 << 20) | 3;
+        let ino = tracked_inode(taken_dir).unwrap();
+        assert!(!is_untracked(ino), "{ino:?}");
+        assert!(!is_untracked(tracked_inode(0).unwrap()));
+        assert_eq!(
+            tracked_inode(untracked::UNTRACKED - 2),
+            Err(Errno::EOVERFLOW)
+        );
+        assert_eq!(tracked_inode(u64::MAX - 1), Err(Errno::EOVERFLOW));
+        assert!(is_untracked(INodeNo(untracked::UNTRACKED | 1)));
+    }
+
     #[test]
     fn session_config_allows_other_by_default() {
         let config = session_config(&MountOptions { allow_other: true }, false);
@@ -2178,7 +2208,7 @@ mod tests {
         let view = view(writing(&mut sessions, "client"));
         let mut volume = view.actor().unwrap();
         let handle = volume.anonymous_open(ATTRS).unwrap();
-        let ino = INodeNo(volume.open_object(handle).unwrap() + 2);
+        let ino = tracked_inode(volume.open_object(handle).unwrap()).unwrap();
         volume.write(handle, 0, b"private", false).unwrap();
         view.handles().unwrap().entries.insert(
             1,
@@ -2252,7 +2282,7 @@ mod tests {
         let mut volume = view.actor().unwrap();
         let h = volume.write_open("a", Some(ATTRS)).unwrap();
         volume.close(h).unwrap();
-        let ino = inode(&volume.node("a").unwrap());
+        let ino = inode(&volume.node("a").unwrap()).unwrap();
         let changes = AttrChanges {
             gid: Some(77),
             ..AttrChanges::default()
@@ -2276,7 +2306,7 @@ mod tests {
         let mut volume = view.actor().unwrap();
         let h = volume.write_open("a", Some(ATTRS)).unwrap();
         volume.close(h).unwrap();
-        let ino = inode(&volume.node("a").unwrap());
+        let ino = inode(&volume.node("a").unwrap()).unwrap();
         let before = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -2331,13 +2361,13 @@ mod tests {
         let view = view(writing(&mut sessions, "client"));
         let area = view.session.untracked_area().unwrap();
         for name in ["hidden", "z-area"] {
-            std::fs::write(area.dir().path().join(name), b"area").unwrap();
+            std::fs::write(area.path().join(name), b"area").unwrap();
         }
         let tracked = {
             let mut volume = view.actor().unwrap();
             let h = volume.write_open("hidden", Some(ATTRS)).unwrap();
             volume.close(h).unwrap();
-            inode(&volume.node("hidden").unwrap())
+            inode(&volume.node("hidden").unwrap()).unwrap()
         };
         let listing = view.listing(INodeNo(1), 0).unwrap();
         let names: Vec<(&str, bool)> = listing
@@ -2395,8 +2425,8 @@ mod tests {
             v.close(h).unwrap();
             v.mkdir("d", ATTRS).unwrap();
         }
-        std::fs::write(area.dir().path().join("a.log"), b"new\n").unwrap();
-        std::fs::create_dir(area.dir().path().join("u.log")).unwrap();
+        std::fs::write(area.path().join("a.log"), b"new\n").unwrap();
+        std::fs::create_dir(area.path().join("u.log")).unwrap();
         let plan = |from: &str, to: &str| {
             let v = view.actor().unwrap();
             view.plan_move(&v, from, false, to, false)
@@ -2419,7 +2449,7 @@ mod tests {
         view.run_move(root, from, root, to, RenameMode::Replace)
             .unwrap();
         assert_eq!(view.actor().unwrap().read("notes.md").unwrap(), b"new\n");
-        assert!(!area.dir().path().join("a.log").exists());
+        assert!(!area.path().join("a.log").exists());
         assert!(view.untracked_fd(FileHandle(fh)).unwrap().unwrap().moved);
 
         // Out: the area holds the saved bytes, and the tree no longer has it.
@@ -2427,13 +2457,51 @@ mod tests {
         view.run_move(root, from, root, to, RenameMode::Replace)
             .unwrap();
         assert_eq!(
-            std::fs::read(area.dir().path().join("kept.log")).unwrap(),
+            std::fs::read(area.path().join("kept.log")).unwrap(),
             b"new\n"
         );
         assert!(matches!(
             view.actor().unwrap().node("notes.md"),
             Err(Error::NotFound)
         ));
+    }
+
+    /// A tracked directory renamed onto a tracked directory that holds
+    /// untracked entries answers `ENOTEMPTY`, as Linux does for a directory
+    /// whose listing is not empty; an empty container there is replaced.
+    #[test]
+    fn a_directory_renamed_onto_one_with_untracked_entries_is_not_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        drop(new_actor(tmp.path()));
+        let info = tmp.path().join("history.git/info");
+        std::fs::create_dir_all(&info).unwrap();
+        std::fs::write(info.join("exclude"), "*.log\n").unwrap();
+        let recording = Recording::open(tmp.path(), &PodContext::default()).unwrap();
+        let mut sessions = Sessions::new(recording);
+        let view = view(writing(&mut sessions, "client"));
+        let area = view.session.untracked_area().unwrap();
+        {
+            let mut v = view.actor().unwrap();
+            for dir in ["d", "e", "f"] {
+                v.mkdir(dir, ATTRS).unwrap();
+            }
+        }
+        std::fs::create_dir(area.path().join("e")).unwrap();
+        std::fs::write(area.path().join("e/x.log"), b"kept").unwrap();
+        std::fs::create_dir(area.path().join("f")).unwrap();
+        let root = INodeNo(1);
+        let rename = |from: &str, to: &str| {
+            view.run_move(
+                root,
+                OsStr::new(from),
+                root,
+                OsStr::new(to),
+                RenameMode::Replace,
+            )
+        };
+        assert_eq!(rename("d", "e"), Err(Errno::ENOTEMPTY));
+        assert!(area.path().join("e/x.log").exists());
+        assert_eq!(rename("d", "f"), Ok(()));
     }
 
     /// New names go where the rules and the built-ins place them.
@@ -2457,7 +2525,7 @@ mod tests {
         assert_eq!(half("notes.md", NewKind::File), Half::Tracked);
         assert_eq!(half("repo", NewKind::Dir), Half::Tracked);
         // Inside a nested repository: the area holds `repo/.git`.
-        std::fs::create_dir_all(area.dir().path().join("repo/.git")).unwrap();
+        std::fs::create_dir_all(area.path().join("repo/.git")).unwrap();
         assert_eq!(half("repo/x", NewKind::File), Half::Untracked);
         assert_eq!(
             view.half(&v, "x", true, NewKind::File).unwrap(),

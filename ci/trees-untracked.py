@@ -24,8 +24,11 @@ these rules (ci/e2e-trees.sh writes them before the first mount):
                                            removal, and the area holds its bytes
     trees-untracked.py fork FORK MAIN      a fork made after them starts with a
                                            copy; later writes stay on their side;
-                                           a database copied while being written
-                                           opens and passes integrity_check
+                                           a database whose writer and view host
+                                           were killed mid-write (a crash image)
+                                           is copied, opens and passes
+                                           integrity_check with every row its
+                                           writer committed before the kill
     trees-untracked.py badrules BIN DIR    a rule not built refuses the mount,
                                            naming its line
     trees-untracked.py untrack BIN DIR     a tracked file the rules come to mark
@@ -365,8 +368,10 @@ def fork(fork_root, main):
     assert (fork_root / ".env").read_bytes() == SECRET
     assert (fork_root / "sessions" / "s.json").read_bytes() == b'{"id": 1}'
     assert integrity(fork_root / "state.db") == 400
-    # Copied while a writer was writing it: it opens and passes integrity_check.
-    assert integrity(fork_root / "busy.db") >= 0
+    # The crash image of a database killed mid-write, copied: it opens and
+    # passes integrity_check. A copy taken while a writer is live is not
+    # tested here: no launcher makes a fork while its upstream's view serves.
+    assert integrity(fork_root / "busy.db") >= 50
     assert (fork_root / "notes.md").read_bytes() == b"recorded\n"
     # Later writes stay on their side.
     with open(main / "app.log", "ab") as f:

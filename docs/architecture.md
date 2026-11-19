@@ -228,7 +228,7 @@ missing from these tables or a row names a module that no longer exists;
 | Module | Role |
 |---|---|
 | `tree_view.rs` | The view host (`ViewHost`, the `Views` port): each view a FUSE mount on its client's session, opened without waiting for history and ended by a lazy unmount, with the take and metrics workers and `HostEvent`s to its owner; direct I/O, saved-reader snapshots, byte-call writes, FLUSH, FSYNC, FSYNCDIR and `O_SYNC` writes answered once durable, and the kernel's page fills, page writes and invalidations for shared mappings (rules ledger, R1.4) |
-| `tree_view/untracked.rs` | A view's untracked half: the inode table of area entries (`1<<63 \| n`, keyed by the backing file), attributes from `lstat`, and the passthrough calls on the tree's untracked area, never gated and never journaled |
+| `tree_view/untracked.rs` | A view's untracked half: the inode table of area entries (`1<<62 \| n`, keyed by the backing file), attributes from `lstat`, and the passthrough calls on the tree's untracked area, never gated and never journaled |
 | `lib.rs` | Crate root and overview |
 | `ops.rs` | Every filesystem operation without the kernel, unit-tested against a real directory and state area |
 | `fuse.rs` | The kernel adapter: `fuser::Filesystem` over `Ops`, and kernel passthrough negotiation |

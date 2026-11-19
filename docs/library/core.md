@@ -833,15 +833,16 @@ their own copies and save over it at their close.
 
 `TreeActor::untracked_area(tree)`, `Recording::untracked_area(tree)` and a
 view's `TreeSession::untracked_area()` give a tree's `UntrackedArea`,
-`<state>/untracked/<tree>/`, made on first use. It is reached only beneath its
-directory (`dir()`, a `confined::Dir`): `parent(path)` opens a path's parent for
-an `*at` call, `stat(path)` is an `lstat`, `entries(dir)` lists a directory,
+`<state>/untracked/<tree>/`, made on first use (`path()` names it). It is
+reached only beneath its directory: `stat(path)` is an `lstat`, `entries(dir)`
+lists a directory and `sync_dir(path)` fsyncs one. Every change goes through
+`writing()`, which holds the area against a fork's copy and gives an
+`AreaWrite`: `parent(path)` opens a path's parent for an `*at` call,
 `containers(path, meta_of)` makes the directories above a path with the modes
 and owners of the tracked directories they stand for, and `place(path, src,
 len, meta)` puts a file or link in place atomically (written under
-`<state>/untracked/.staging/`, fsynced, renamed). `writing()` holds the area
-against a fork's copy for one change; a caller holding it never takes the
-actor's lock. `fork_with` copies the upstream's area as the fork's before the
+`<state>/untracked/.staging/`, fsynced, renamed). A caller holding it never
+takes the actor's lock. `fork_with` copies the upstream's area as the fork's before the
 fork's step, holding the upstream's changes while it copies; `drop_fork`
 removes a dropped fork's area once its drop is recorded, and an open removes
 every copy no fork owns.

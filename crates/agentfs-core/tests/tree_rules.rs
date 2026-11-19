@@ -218,7 +218,7 @@ fn an_area_is_confined_beneath_its_directory() {
     let v = new_actor(tmp.path());
     let area = v.untracked_area(TreeId::Root).unwrap();
     assert_eq!(area.tree(), TreeId::Root);
-    let base = area.dir().path().to_path_buf();
+    let base = area.path().to_path_buf();
     assert_eq!(
         base,
         tmp.path().canonicalize().unwrap().join("untracked/root")
@@ -231,20 +231,22 @@ fn an_area_is_confined_beneath_its_directory() {
     symlink(outside.join("secret"), base.join("file-link")).unwrap();
 
     // A link on the way is never followed.
-    assert!(area.parent("escape/x").is_err());
+    assert!(area.writing().parent("escape/x").is_err());
     assert!(area.stat("escape/secret").unwrap().is_none());
     assert!(
-        area.place("escape/new", &mut &b"no"[..], 2, meta(Kind::File, 0o644))
+        area.writing()
+            .place("escape/new", &mut &b"no"[..], 2, meta(Kind::File, 0o644))
             .is_err()
     );
-    assert!(area.parent("../x").is_err());
+    assert!(area.writing().parent("../x").is_err());
     assert!(area.stat("../untracked").is_err() || area.stat("../untracked").unwrap().is_none());
     assert!(area.entries("escape").unwrap().is_empty());
     // A final link is the link itself, never its target.
     let st = area.stat("file-link").unwrap().unwrap();
     assert_eq!(st.st_mode & libc::S_IFMT, libc::S_IFLNK);
     // Placing over a final link replaces the link, never writes its target.
-    area.place("file-link", &mut &b"mine"[..], 4, meta(Kind::File, 0o600))
+    area.writing()
+        .place("file-link", &mut &b"mine"[..], 4, meta(Kind::File, 0o600))
         .unwrap();
     assert_eq!(fs::read(outside.join("secret")).unwrap(), b"x");
     assert_eq!(fs::read(base.join("file-link")).unwrap(), b"mine");
@@ -256,12 +258,13 @@ fn containers_take_the_given_modes_and_place_replaces_atomically() {
     let tmp = tempfile::tempdir().unwrap();
     let v = new_actor(tmp.path());
     let area = v.untracked_area(TreeId::Root).unwrap();
-    let base = area.dir().path().to_path_buf();
+    let base = area.path().to_path_buf();
     let modes: BTreeMap<&str, u32> = [("a", 0o750), ("a/b", 0o711)].into();
-    area.containers("a/b/c.log", &mut |dir| {
-        modes.get(dir).map(|m| meta(Kind::Dir, *m))
-    })
-    .unwrap();
+    area.writing()
+        .containers("a/b/c.log", &mut |dir| {
+            modes.get(dir).map(|m| meta(Kind::Dir, *m))
+        })
+        .unwrap();
     assert_eq!(fs::metadata(base.join("a")).unwrap().mode() & 0o7777, 0o750);
     assert_eq!(
         fs::metadata(base.join("a/b")).unwrap().mode() & 0o7777,
@@ -272,13 +275,15 @@ fn containers_take_the_given_modes_and_place_replaces_atomically() {
         "only the directories above"
     );
 
-    area.place("a/b/c.log", &mut &b"one"[..], 3, meta(Kind::File, 0o640))
+    area.writing()
+        .place("a/b/c.log", &mut &b"one"[..], 3, meta(Kind::File, 0o640))
         .unwrap();
     let first = fs::metadata(base.join("a/b/c.log")).unwrap();
     assert_eq!(first.mode() & 0o7777, 0o640);
     // A reader that opened the old file keeps it: the new one is renamed in.
     let mut old = fs::File::open(base.join("a/b/c.log")).unwrap();
-    area.place("a/b/c.log", &mut &b"two!"[..], 4, meta(Kind::File, 0o600))
+    area.writing()
+        .place("a/b/c.log", &mut &b"two!"[..], 4, meta(Kind::File, 0o600))
         .unwrap();
     let mut text = String::new();
     std::io::Read::read_to_string(&mut old, &mut text).unwrap();
@@ -288,7 +293,8 @@ fn containers_take_the_given_modes_and_place_replaces_atomically() {
         fs::metadata(base.join("a/b/c.log")).unwrap().ino(),
         first.ino()
     );
-    area.place("a/l", &mut &b"b/c.log"[..], 7, meta(Kind::Symlink, 0o777))
+    area.writing()
+        .place("a/l", &mut &b"b/c.log"[..], 7, meta(Kind::Symlink, 0o777))
         .unwrap();
     assert_eq!(
         fs::read_link(base.join("a/l")).unwrap(),
@@ -296,7 +302,8 @@ fn containers_take_the_given_modes_and_place_replaces_atomically() {
     );
     // A short source places nothing.
     assert!(
-        area.place("a/short", &mut &b"ab"[..], 5, meta(Kind::File, 0o644))
+        area.writing()
+            .place("a/short", &mut &b"ab"[..], 5, meta(Kind::File, 0o644))
             .is_err()
     );
     assert!(!base.join("a/short").exists());
@@ -320,7 +327,7 @@ fn a_fork_starts_with_a_copy_of_its_upstreams_area_and_loses_it_when_dropped() {
     let tmp = tempfile::tempdir().unwrap();
     let mut v = new_actor(tmp.path());
     let root = v.untracked_area(TreeId::Root).unwrap();
-    let base = root.dir().path().to_path_buf();
+    let base = root.path().to_path_buf();
     fs::create_dir(base.join("sessions")).unwrap();
     fs::write(base.join("sessions/s.json"), b"before").unwrap();
     fs::set_permissions(
@@ -331,7 +338,7 @@ fn a_fork_starts_with_a_copy_of_its_upstreams_area_and_loses_it_when_dropped() {
     symlink("sessions/s.json", base.join("latest")).unwrap();
     let fork = rowless_fork(&mut v);
     let copy = v.untracked_area(fork).unwrap();
-    let forked = copy.dir().path().to_path_buf();
+    let forked = copy.path().to_path_buf();
     assert_eq!(
         forked,
         tmp.path()
@@ -386,7 +393,7 @@ fn a_copy_a_crash_cut_short_leaves_no_fork_and_is_removed_at_open() {
     let tmp = tempfile::tempdir().unwrap();
     let mut v = new_actor(tmp.path());
     let root = v.untracked_area(TreeId::Root).unwrap();
-    fs::write(root.dir().path().join("db"), b"upstream").unwrap();
+    fs::write(root.path().join("db"), b"upstream").unwrap();
     let kept = rowless_fork(&mut v);
     drop(v);
     let untracked = tmp.path().join("untracked");
@@ -426,7 +433,7 @@ fn a_copy_waits_for_changes_in_progress_and_holds_new_ones() {
     let tmp = tempfile::tempdir().unwrap();
     let v = std::sync::Arc::new(std::sync::Mutex::new(new_actor(tmp.path())));
     let root = v.lock().unwrap().untracked_area(TreeId::Root).unwrap();
-    let base = root.dir().path().to_path_buf();
+    let base = root.path().to_path_buf();
     fs::write(base.join("wal"), b"").unwrap();
     let writing = root.writing();
     let (tx, rx) = std::sync::mpsc::channel();
@@ -448,7 +455,7 @@ fn a_copy_waits_for_changes_in_progress_and_holds_new_ones() {
     drop(writing);
     let fork = forking.join().unwrap();
     let area = v.lock().unwrap().untracked_area(fork).unwrap();
-    assert_eq!(fs::read(area.dir().path().join("wal")).unwrap(), b"frame");
+    assert_eq!(fs::read(area.path().join("wal")).unwrap(), b"frame");
 }
 
 /// Each fork's copy is the upstream's area at one instant: a writer that
@@ -459,7 +466,7 @@ fn every_copy_is_the_area_at_one_instant() {
     let tmp = tempfile::tempdir().unwrap();
     let mut v = new_actor(tmp.path());
     let root = std::sync::Arc::new(v.untracked_area(TreeId::Root).unwrap());
-    let base = root.dir().path().to_path_buf();
+    let base = root.path().to_path_buf();
     fs::write(base.join("a"), b"0").unwrap();
     fs::write(base.join("b"), b"0").unwrap();
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -489,7 +496,7 @@ fn every_copy_is_the_area_at_one_instant() {
     for fork in forks {
         let area = v.untracked_area(fork).unwrap();
         let read = |name: &str| -> u64 {
-            fs::read_to_string(area.dir().path().join(name))
+            fs::read_to_string(area.path().join(name))
                 .unwrap()
                 .parse()
                 .unwrap()
@@ -508,7 +515,7 @@ fn a_copy_keeps_hard_links_and_leaves_out_names_not_utf8() {
     let tmp = tempfile::tempdir().unwrap();
     let mut v = new_actor(tmp.path());
     let root = v.untracked_area(TreeId::Root).unwrap();
-    let base = root.dir().path().to_path_buf();
+    let base = root.path().to_path_buf();
     fs::create_dir(base.join("d")).unwrap();
     fs::write(base.join("d/a"), b"one file").unwrap();
     fs::hard_link(base.join("d/a"), base.join("b")).unwrap();
@@ -516,7 +523,7 @@ fn a_copy_keeps_hard_links_and_leaves_out_names_not_utf8() {
     fs::create_dir(&odd).unwrap();
     fs::write(odd.join("in"), b"never a tree's").unwrap();
     let fork = rowless_fork(&mut v);
-    let forked = v.untracked_area(fork).unwrap().dir().path().to_path_buf();
+    let forked = v.untracked_area(fork).unwrap().path().to_path_buf();
     let (a, b) = (
         fs::metadata(forked.join("d/a")).unwrap(),
         fs::metadata(forked.join("b")).unwrap(),
@@ -537,12 +544,7 @@ fn a_copy_keeps_hard_links_and_leaves_out_names_not_utf8() {
 /// The upstream's area for the copy-failure tests: three files.
 #[cfg(feature = "failpoints")]
 fn three_files(v: &mut TreeActor) {
-    let base = v
-        .untracked_area(TreeId::Root)
-        .unwrap()
-        .dir()
-        .path()
-        .to_path_buf();
+    let base = v.untracked_area(TreeId::Root).unwrap().path().to_path_buf();
     for name in ["a", "b", "c"] {
         fs::write(base.join(name), name).unwrap();
     }
@@ -668,12 +670,7 @@ fn copy_worker() {
 fn a_fork_dropped_before_any_build_loses_its_area_at_the_drop() {
     let tmp = tempfile::tempdir().unwrap();
     let mut v = new_actor(tmp.path());
-    let base = v
-        .untracked_area(TreeId::Root)
-        .unwrap()
-        .dir()
-        .path()
-        .to_path_buf();
+    let base = v.untracked_area(TreeId::Root).unwrap().path().to_path_buf();
     fs::write(base.join(".env"), b"TOKEN=x").unwrap();
     let fork = rowless_fork(&mut v);
     let forked = tmp.path().join(format!("untracked/{fork}"));

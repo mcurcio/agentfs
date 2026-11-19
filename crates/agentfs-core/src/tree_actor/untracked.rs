@@ -59,7 +59,10 @@ impl std::fmt::Debug for UntrackedArea {
 }
 
 /// A change to an area in progress: while any is held, no fork copies it.
+/// Every call that changes the area is a method of this hold, so none can
+/// run without it.
 pub struct AreaWrite<'a> {
+    area: &'a UntrackedArea,
     _held: RwLockReadGuard<'a, ()>,
 }
 
@@ -68,27 +71,27 @@ impl UntrackedArea {
         self.tree
     }
 
-    pub fn dir(&self) -> &confined::Dir {
-        &self.dir
+    /// The area's directory, for reading it from outside the view (tests,
+    /// an operator's tools). Changes go through [`UntrackedArea::writing`].
+    pub fn path(&self) -> &Path {
+        self.dir.path()
     }
 
-    /// Hold the area against a fork's copy for one change: every call that
-    /// changes a file, a name or metadata in the area holds this while it
-    /// runs. Never take the actor's lock while holding it.
+    /// Holds the area against a fork's copy for one change, and gives the
+    /// calls that make it ([`AreaWrite`]). The hold is shared: changes run
+    /// together, and a fork's copy waits for every one in progress. A call
+    /// that reaches a path's parent to read through it takes it too. Never
+    /// take the actor's lock while holding it.
     pub fn writing(&self) -> AreaWrite<'_> {
         AreaWrite {
+            area: self,
             _held: self.hold.read().unwrap_or_else(PoisonError::into_inner),
         }
     }
 
     /// `path`'s parent directory opened `O_PATH | O_DIRECTORY` beneath the
-    /// area, and its last name: where a passthrough `*at` call acts.
-    ///
-    /// # Errors
-    ///
-    /// `ENOENT` for a missing parent, `ELOOP` for a link on the way,
-    /// `ENOTDIR` for a file on the way.
-    pub fn parent(&self, path: &str) -> io::Result<(OwnedFd, String)> {
+    /// area, and its last name.
+    fn parent(&self, path: &str) -> io::Result<(OwnedFd, String)> {
         let (parent, name) = split(path);
         let fd = self
             .dir
@@ -106,48 +109,20 @@ impl UntrackedArea {
         }
     }
 
-    /// Makes each missing directory above `path` as a container standing for
-    /// the tracked directory there: the mode `meta_of` gives it (0755 when it
-    /// gives none), and its owner when this process may give files away.
+    /// Makes the area's directory at `path`, if it has one, durable.
     ///
     /// # Errors
     ///
-    /// A failed `mkdirat`, or an entry on the way that is no directory.
-    pub fn containers(
-        &self,
-        path: &str,
-        meta_of: &mut dyn FnMut(&str) -> Option<Meta>,
-    ) -> io::Result<()> {
-        let chown = confined::can_chown();
-        let mut end = 0;
-        let parts: Vec<&str> = path.split('/').collect();
-        for (i, part) in parts.iter().enumerate().take(parts.len().saturating_sub(1)) {
-            end += part.len() + usize::from(i > 0);
-            let dir = &path[..end];
-            if self.stat(dir)?.is_some() {
-                continue;
-            }
-            let meta = meta_of(dir);
-            let mode = meta.map_or(0o755, |m| m.mode.bits());
-            let (parent, name) = self.parent(dir)?;
-            match rustix::fs::mkdirat(&parent, name.as_str(), Mode::from_raw_mode(mode)) {
-                Ok(()) | Err(rustix::io::Errno::EXIST) => {}
-                Err(e) => return Err(e.into()),
-            }
-            let fd = self
-                .dir
-                .open_at(dir, OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty())?;
-            // The umask does not apply.
-            rustix::fs::fchmod(&fd, Mode::from_raw_mode(mode))?;
-            if let (true, Some(meta)) = (chown, meta) {
-                rustix::fs::fchown(
-                    &fd,
-                    Some(rustix::fs::Uid::from_raw(meta.uid)),
-                    Some(rustix::fs::Gid::from_raw(meta.gid)),
-                )?;
-            }
+    /// A failed open or fsync.
+    pub fn sync_dir(&self, path: &str) -> io::Result<()> {
+        match self
+            .dir
+            .open_at(path, OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty())
+        {
+            Ok(fd) => Ok(rustix::fs::fsync(&fd)?),
+            Err(e) if confined::is_gone(&e) => Ok(()),
+            Err(e) => Err(e),
         }
-        Ok(())
     }
 
     /// `dir`'s entries sorted by name, without `.` and `..`; names that are
@@ -187,6 +162,64 @@ impl UntrackedArea {
         out.sort_by(|a, b| a.0.cmp(&b.0));
         Ok(out)
     }
+}
+
+impl AreaWrite<'_> {
+    /// `path`'s parent directory opened `O_PATH | O_DIRECTORY` beneath the
+    /// area, and its last name: where a passthrough `*at` call acts.
+    ///
+    /// # Errors
+    ///
+    /// `ENOENT` for a missing parent, `ELOOP` for a link on the way,
+    /// `ENOTDIR` for a file on the way.
+    pub fn parent(&self, path: &str) -> io::Result<(OwnedFd, String)> {
+        self.area.parent(path)
+    }
+
+    /// Makes each missing directory above `path` as a container standing for
+    /// the tracked directory there: the mode `meta_of` gives it (0755 when it
+    /// gives none), and its owner when this process may give files away.
+    ///
+    /// # Errors
+    ///
+    /// A failed `mkdirat`, or an entry on the way that is no directory.
+    pub fn containers(
+        &self,
+        path: &str,
+        meta_of: &mut dyn FnMut(&str) -> Option<Meta>,
+    ) -> io::Result<()> {
+        let area = self.area;
+        let chown = confined::can_chown();
+        let mut end = 0;
+        let parts: Vec<&str> = path.split('/').collect();
+        for (i, part) in parts.iter().enumerate().take(parts.len().saturating_sub(1)) {
+            end += part.len() + usize::from(i > 0);
+            let dir = &path[..end];
+            if area.stat(dir)?.is_some() {
+                continue;
+            }
+            let meta = meta_of(dir);
+            let mode = meta.map_or(0o755, |m| m.mode.bits());
+            let (parent, name) = area.parent(dir)?;
+            match rustix::fs::mkdirat(&parent, name.as_str(), Mode::from_raw_mode(mode)) {
+                Ok(()) | Err(rustix::io::Errno::EXIST) => {}
+                Err(e) => return Err(e.into()),
+            }
+            let fd = area
+                .dir
+                .open_at(dir, OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty())?;
+            // The umask does not apply.
+            rustix::fs::fchmod(&fd, Mode::from_raw_mode(mode))?;
+            if let (true, Some(meta)) = (chown, meta) {
+                rustix::fs::fchown(
+                    &fd,
+                    Some(rustix::fs::Uid::from_raw(meta.uid)),
+                    Some(rustix::fs::Gid::from_raw(meta.gid)),
+                )?;
+            }
+        }
+        Ok(())
+    }
 
     /// Puts `len` bytes of `src` at `path` with `meta`'s mode and owner (a
     /// link when `meta.kind` is [`Kind::Symlink`], `src` holding its
@@ -203,11 +236,11 @@ impl UntrackedArea {
         if meta.kind == Kind::Dir {
             return Err(io::Error::from_raw_os_error(libc::EISDIR));
         }
-        let _writing = self.writing();
-        let (parent, name) = self.parent(path)?;
-        fs_create_dir(&self.staging)?;
+        let area = self.area;
+        let (parent, name) = area.parent(path)?;
+        fs_create_dir(&area.staging)?;
         let staging = rustix::fs::open(
-            &self.staging,
+            &area.staging,
             OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
             Mode::empty(),
         )?;
@@ -261,7 +294,7 @@ impl UntrackedArea {
             let _ = rustix::fs::unlinkat(&staging, temporary.as_str(), AtFlags::empty());
             return Err(e.into());
         }
-        let parent = self.dir.open_at(
+        let parent = area.dir.open_at(
             split(path).0,
             OFlags::RDONLY | OFlags::DIRECTORY,
             Mode::empty(),

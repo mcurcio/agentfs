@@ -729,12 +729,15 @@ durable, and record locks work within the view. No call on it is journaled or
 waits at the lag gate, takes and syncs never carry it, and history never shows
 it. Its mode, owner and times are the file's own; a new one is owned by the
 process that made it when the view host may give files away (`CAP_CHOWN` and
-`CAP_FOWNER`), else by the view host's user.
+`CAP_FOWNER`), else by the view host's user. Reads and writes through an open
+untracked file never wait for the volume's lock; calls that make, remove or
+rename an untracked name, and listings, take it as tracked calls do, so each
+name is in one half at a time.
 
 **One namespace.** `ls` shows both halves. A tracked entry wins its name: an
 untracked entry under the same name stays hidden until the tracked one goes. A
-tracked directory that holds untracked entries is not empty, so `rmdir`
-answers `ENOTEMPTY`; renaming it moves its untracked entries with it. Moves
+tracked directory that holds untracked entries is not empty, so `rmdir`, and a
+directory's rename onto it, answer `ENOTEMPTY`; renaming it moves its untracked entries with it. Moves
 and links between the halves are under "Moves across the halves" below.
 
 **Nested repositories.** `git init repo` in a view records the directory
@@ -922,3 +925,9 @@ jobs in [development.md](development.md); the method is in
 - `measure-trees.sh`: plain-FUSE comparison, an hour of writes, 10,000 saves, 1 and
   100 MiB files, waits and a held log. `[phase1-measure]` in a pushed commit message
   runs them all.
+
+Not tested: a fork's untracked copy taken while a program is writing through the
+upstream's view. `trees mount` makes its fork before any view serves, so no built
+launcher copies an area under live writes. `e2e-trees.sh` copies the crash image of
+a SQLite database whose writer and view host were killed mid-write; the library's
+`tree_rules` tests copy areas while threads change them under the area's hold.

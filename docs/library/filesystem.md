@@ -719,9 +719,10 @@ call to one half in `tree_view`, with the untracked half in
 `tree_view/untracked.rs`:
 
 - **Inodes.** A tracked entry's inode is its node number + 2; an untracked
-  entry's is `1 << 63 | n`, `n` from the view's table keyed by the backing
+  entry's is `1 << 62 | n`, `n` from the view's table keyed by the backing
   file, with the paths it is known by (more than one after a hard link), kept
-  through renames, links and unlinks.
+  through renames, links and unlinks. The ranges never meet: a tracked number
+  whose inode would fall in `[1 << 62, 1 << 63)` answers `EOVERFLOW`.
 - **Names.** `lookup` finds the tracked entry first, then the area's. A new
   name (`create`, a regular file's `mknod`, `mkdir`, `symlink`) goes to the
   half the rules place it in (`RuleSet::place`, judged under the actor's lock,
@@ -730,8 +731,8 @@ call to one half in `tree_view`, with the untracked half in
 - **Listings.** A tracked directory lists its tracked children at offsets 1
   on, then the area's entries at the same path that no tracked child hides, at
   offsets `(1 << 62) + j + 1`; an untracked directory lists the area's.
-- **Untracked calls.** Plain passthrough on the area, never gated, journaled or
-  made under the actor's lock: `open` (the caller's access flags with
+- **Untracked calls.** Plain passthrough on the area, never gated or
+  journaled: `open` (the caller's access flags with
   `O_NOFOLLOW`, `FOPEN_DIRECT_IO`), `pread` and `pwrite` (page fills and page
   writes included; an `O_APPEND` write at the file's end), `fsync` and
   `fdatasync` of the descriptor, `fchmodat`, `fchownat`, `ftruncate` and
@@ -740,7 +741,17 @@ call to one half in `tree_view`, with the untracked half in
   `linkat`, and `renameat2` within the half (`RENAME_NOREPLACE` served). A
   new entry is given to the caller when the view host has `CAP_CHOWN` and
   `CAP_FOWNER`. Every change holds the area against a fork's copy while it
-  runs. A read-only view answers `EROFS` to each.
+  runs (`AreaWrite`, the only way to change an area). A read-only view answers
+  `EROFS` to each.
+- **The actor's lock.** Calls through an open descriptor (`read`, `write`,
+  `fsync`, `getattr` and a setattr by descriptor) never take it; `open` and
+  `setattr` take it only to ask whether the view is writable. Calls that decide
+  or change a name (`lookup`, `create`, `mknod`, `mkdir`, `symlink`, `link`,
+  `unlink`, `rmdir`, `rename`) and listings do their area I/O under it, so a
+  name's half is decided at one instant against the tracked half: an `O_EXCL`
+  create, a rename across the halves and a merged listing each see both halves
+  as one. They wait behind every other call on the volume, a fork's copy
+  included.
 - **Across the halves.** A rename's target class is tracked when a tracked
   entry holds the name, untracked when a visible untracked entry does, else
   where `RuleSet::place` puts the source's kind; the table in

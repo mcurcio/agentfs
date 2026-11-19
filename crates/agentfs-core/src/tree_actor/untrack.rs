@@ -40,8 +40,12 @@ impl TreeActor {
                 let t = self.tree(tree)?;
                 let meta = *t.meta.get(&object).ok_or(Error::Format)?;
                 let bytes = t.bytes.get(&object).ok_or(Error::Format)?;
-                area.containers(&path, &mut |dir| t.dirs.get(dir).map(|state| state.meta))?;
-                area.place(&path, &mut bytes.reader(), bytes.len(), meta)?;
+                {
+                    let writing = area.writing();
+                    writing
+                        .containers(&path, &mut |dir| t.dirs.get(dir).map(|state| state.meta))?;
+                    writing.place(&path, &mut bytes.reader(), bytes.len(), meta)?;
+                }
                 crate::failpoints::hit("tree.untrack_after_place")?;
                 self.unlink(tree, &path, &by)?;
                 eprintln!(
