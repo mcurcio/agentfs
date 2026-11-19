@@ -644,7 +644,8 @@ through the mount, which history records as any other.
 `symlink` makes a link (mode 0777, owned by the caller) whose target, which must
 be UTF-8, is its bytes; `readlink` reads it, the kernel follows links, and a
 link is renamed and removed like a file. Opening a link itself answers `ELOOP`.
-A regular file's `mknod` is a create; any other `mknod` answers `EPERM`.
+A regular file's `mknod` is a create; a FIFO or a socket is made in the
+untracked area (below), and a device answers `EPERM`.
 
 Times are each tree's own and never in history. A save (at its last close, not
 at each write) moves its file's mtime and ctime, and a create, rename or remove
@@ -693,7 +694,8 @@ untracked paths. A path the tree already records stays recorded, whatever
 
 1. Its directory is untracked: everything under it is too.
 2. A `.git` component: a nested repository's own files.
-3. A FIFO or a socket (`mknod` of either still answers `EPERM`).
+3. A FIFO or a socket: `mkfifo`, and a unix socket's `bind`, make it in the
+   area.
 4. `-agentfs` in `info/attributes`: never recorded.
 5. Inside a nested repository: a directory above the name, other than the
    tree's root, holds a `.git` entry.
@@ -731,9 +733,8 @@ process that made it when the view host may give files away (`CAP_CHOWN` and
 **One namespace.** `ls` shows both halves. A tracked entry wins its name: an
 untracked entry under the same name stays hidden until the tracked one goes. A
 tracked directory that holds untracked entries is not empty, so `rmdir`
-answers `ENOTEMPTY`; renaming it moves its untracked entries with it. A rename
-between the halves, or onto a name of the other half, answers `EXDEV` (`mv`
-copies); a hard link to an untracked file answers `EPERM`.
+answers `ENOTEMPTY`; renaming it moves its untracked entries with it. Moves
+and links between the halves are under "Moves across the halves" below.
 
 **Nested repositories.** `git init repo` in a view records the directory
 `repo`; `repo/.git` and every file made inside `repo` afterwards are untracked,
@@ -751,6 +752,7 @@ taken when the fork is made:
   fork's step is recorded. A crash before the step leaves a copy no fork owns,
   which the next open removes.
 - Each file is reflinked where the filesystem can (`FICLONE`), else copied.
+  FIFOs and sockets are not copied.
 - Later writes on either side stay on that side.
 - A dropped fork's area is removed with its checkout.
 
@@ -765,6 +767,55 @@ stand for tracked directories take their mode and owner. Untracked data shares
 the state area's disk: an area that fills it stops recording too (`ENOSPC` on
 the journal).
 
+### Moves across the halves
+
+A rename's target is in the **tracked** class when a tracked entry holds the
+name, **untracked** when an untracked entry holds it, and otherwise where the
+rules would place a new name of the source's kind (so
+`mv notes.md logs/notes.md` with `/logs/` excluded moves the file out).
+
+| Source | Target class | What happens |
+|---|---|---|
+| Tracked file or link | Tracked | The tree's rename, as always |
+| Tracked directory | Tracked | The tree's rename; its untracked entries move with it |
+| Tracked file or link | Untracked | Moved out: its saved bytes, mode and owner are placed in the area, then its unlink is recorded |
+| Tracked directory | Untracked | `EXDEV`: `mv` copies the files across, then removes the tree's |
+| Untracked file | Tracked | Moved in: one save of the whole file under the new name, then the area's file is removed |
+| Untracked link | Tracked, no entry there | Moved in: a new link, then the area's link is removed |
+| Untracked link | Tracked, an entry there | `EXDEV` |
+| Untracked directory, FIFO or socket | Tracked | `EXDEV` |
+| Anything untracked | Untracked | A plain rename in the area |
+
+`RENAME_NOREPLACE` answers `EEXIST` for a name in either half;
+`RENAME_EXCHANGE` and `RENAME_WHITEOUT` answer `EINVAL`. A file moved in keeps
+the identity of the tracked file it replaces and the identities of its
+unchanged lines, as a save after an edit does. So Python's
+`tempfile.NamedTemporaryFile` plus `os.replace` from an excluded temporary name
+onto an allowlisted `config.yaml` records one save of `config.yaml`, and
+history never shows the temporary name.
+
+A hard link (`link`) is made within the untracked half; a tracked file that
+`O_TMPFILE` made takes its first name in the tree, as always; a named tracked
+file answers `EPERM`; a link across the halves answers `EXDEV`. `mkfifo` and a
+unix socket's `bind` make the entry in the area; `mknod` of a device answers
+`EPERM`. `O_TMPFILE` in an untracked directory answers `EOPNOTSUPP`, since
+its file could only become untracked. A read-only view answers `EROFS` to all
+of these.
+
+The costs:
+
+- A move across the halves copies the file's bytes. A move into the tree
+  copies them into the journal under the volume's lock, so every call on the
+  volume waits while it copies, for as long as the file takes.
+- A crash during a move across the halves may leave both copies: the file in
+  the area and in the tree.
+- A crash during a tracked directory's rename, after its tree step, may leave
+  its untracked entries under the old name.
+- A descriptor opened on an untracked file before it moved into the tree
+  answers `ESTALE` to writes and truncates; its reads keep the bytes it had.
+- A file moved out of the tree ends its write-opens as an unlink does: what
+  they had not saved is dropped (`tree OrphanDropped` on stderr).
+
 ## Recovery
 
 On a stopped actor, preserve the state, fix the I/O or space problem and reopen. On
@@ -778,8 +829,9 @@ What the tree views do not support:
 
 - **Git-safe UTF-8 names only** in the tree, each component at most 255 bytes,
   and UTF-8 link targets. A `.git` name lives in the untracked area; git's
-  other spellings of it (`.GIT`, `git~1`) answer `EINVAL`. Hard links past an anonymous file's first answer `EPERM`;
-  devices, FIFOs and sockets answer `EPERM`; extended attributes and ACLs are
+  other spellings of it (`.GIT`, `git~1`) answer `EINVAL`. Hard links to a
+  tracked file past an anonymous file's first answer `EPERM`; devices answer
+  `EPERM`; FIFOs and sockets are untracked; extended attributes and ACLs are
   not supported.
 - **Times.** A file's mtime moves at its last close, not at each write
   (close-to-open). Reads are not tracked: atime is the last time set, else

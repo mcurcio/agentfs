@@ -1,10 +1,10 @@
 # One engine: the tree views run the sidecar, CSI and CLI
 
-**Proposed; M1 and M2 are built.** This page plans how agentfs goes from two engines to one: the tree views take over every
+**Proposed; M1, M2 and M3 are built.** This page plans how agentfs goes from two engines to one: the tree views take over every
 launcher, and the recording engine is deleted. It is the system-level plan; each milestone below starts with its
-own architect and design gate, one layer down. M1 (volumes, clients, forks and their lifecycle on the tree views) and
-M2 (directories, metadata and links) are built and described in [tree views](../../trees.md) and the
-[library](../../library/core.md#git-backed-tree-views). The commit that lands the last milestone (M9) deletes this page and
+own architect and design gate, one layer down. M1 (volumes, clients, forks and their lifecycle on the tree views),
+M2 (directories, metadata and links) and M3 (operator rules and the untracked area) are built and described in
+[tree views](../../trees.md) and the [library](../../library/core.md#git-backed-tree-views). The commit that lands the last milestone (M9) deletes this page and
 moves the behaviour into the library and operator docs.
 
 ## Today
@@ -30,7 +30,7 @@ page's; "speed" is [save and take speed](save-and-take-speed.md).
 
 | End goal | Delivered by |
 |---|---|
-| A baseline build verified with a target application | [the baseline](#the-baseline), the plan's first acceptance point: M1 to M7, with M6 |
+| A baseline build verified with a target application | [the baseline](#the-baseline), the plan's first acceptance point: the first Hermes deploy, on a CSI volume claim, after M3, M7 and M8 |
 | One engine | built: volumes and their lifecycle (M1); M7 and M8 (the launchers move), M9 (the recording engine is deleted) |
 | Nobody runs `trees init` by hand | built: `ensure` takes a `VolumeSpec` value, which the trial CLI builds from `trees init`'s flags (M1); M7 and M8 (each launcher calls `ensure`; `agentfs trees` folds into `init` and `mount`) |
 | One volume that root and non-root processes both use (the problem ArtifactFS stalled on) | built: other users reach the tree mount (M1); modes and owners decide what each may do (M2) |
@@ -38,15 +38,15 @@ page's; "speed" is [save and take speed](save-and-take-speed.md).
 | History knows the root by identity; no hardcoded `main` | module cut 5b |
 | Consumers configure the name the root is published under, and may change it | [Root branch name](root-branch-name.md), built in M4 (the publisher and its key) |
 | The trailer records meaningful information | built: which tree, by identity (5b), and where, the volume and the pod (M1) |
-| Configuration: iac and the agent both edit it (`AGENTS.md`, "What agentfs is for") | M6; until it lands, a configured patch source raises a standing alarm (M7) |
-| Audit; recording is the baseline (principle 1) | built (a write is journaled before it returns; power loss replayed by `phase-1.yml`; where, and the volume's own events as commits: M1; every kind of change recorded or refused loudly: M2); M3 (only operator rules skip a path) |
-| Invisible and untouchable (principle 2) | built (state outside the mount); M3 (the untracked area); M4 (credentials never in a view) |
-| Git idioms (principle 3) | M3 (operator files as a git-config include, built with their first owner; `info/exclude`, `info/attributes`); M4 (the published name's key) |
+| Configuration: iac and the agent both edit it (`AGENTS.md`, "What agentfs is for") | M6, after the first Hermes deploy; until it lands, a configured patch source raises a standing alarm and logs the gap (M7, M8) |
+| Audit; recording is the baseline (principle 1) | built (a write is journaled before it returns; power loss replayed by `phase-1.yml`; where, and the volume's own events as commits: M1; every kind of change recorded or refused loudly: M2; only operator rules and named built-ins skip a path: M3) |
+| Invisible and untouchable (principle 2) | built (state outside the mount; the untracked area, M3); M4 (credentials never in a view) |
+| Git idioms (principle 3) | built: `info/exclude`, `info/attributes` (M3); M7 (operator settings as a git-config include); M4 (the published name's key) |
 | The right technology, recorded (principle 4) | M4 (the reused transports in architecture.md's "Technology choices"); M9 |
-| Keep operating (principle 5) | M4 (retry, divergence saved), M5 (alarms, liveness, restart in place, each of today's alerts and runbooks ported or dropped) |
+| Keep operating (principle 5) | M4 (retry, divergence saved), M5 (alarms, liveness, restart in place, each of today's alerts and runbooks ported or dropped), both after the first Hermes deploy; until then M7 and M8 say what is not built with an alarm and a log line, never silently |
 | Any remote, or none (principle 6) | built: the mirror leaves the model's world (module cut 6), and zero remotes is a valid volume (M1); M4 |
 | History is the product (principle 7) | built: identity (5b), where (M1); M4 (never forced; a divergence is saved); M7 and M8 (old state areas archived, never deleted) |
-| Recovery is manual but supported (principle 8); merging is an extra (principle 9) | M6 (restore, revert; patches at mount only, and `serve-git` as a patch source); M6 lands before the baseline |
+| Recovery is manual but supported (principle 8); merging is an extra (principle 9) | M6 (restore, revert; patches at mount only, and `serve-git` as a patch source), after the first Hermes deploy |
 | Three layers; OpenTelemetry for everything observable (principle 10) | each milestone's library page; M5 (telemetry, and the recorder's engine source) |
 | The model stays the baseline proof | module cut 6 and 7; built: the tree engine's core tests on every PR ([CI tiers](#ci-tiers)) |
 | Old state formats are not supported | 5b (tree format 3); M7 and M8 (a recording state area is refused at boot) |
@@ -124,7 +124,7 @@ with settings and a key, end, drop) are in [tree views](../../trees.md); their i
 other users reach the tree mount, and every commit carries the "where" trailers. The tracer and the release figures
 run in `image.yml` ([tracer](#tracer), [performance](../../performance.md#tree-views-release-build)), and
 `phase-1.yml` runs on every PR. Left to later milestones: a start point from another volume's line
-([deferred](#deferred-extras)), and operator settings as a git-config include, built with their first owner (M3).
+([deferred](#deferred-extras)), and operator settings as a git-config include, built with their first owner (M7).
 
 **Speed.** [Save and take speed](save-and-take-speed.md) comes before M2 when M1's release figures miss the
 budgets, and debug-build figures say they will (about 96 ms a save against the recording engine's 6 ms a file;
@@ -139,9 +139,20 @@ and links by the model's rules 13 to 15, and a change that loses by them names i
 out: hard links past the first, names that are not UTF-8, devices, pipes and sockets, and extended attributes, each
 refused as before; a line moved between files; an all-squash presented owner.
 
-**M3. Rules and the untracked area.** Operator rules decide what is recorded ([rules](../domains/rules.md),
-git-model §3), and unrecorded files live in the untracked area. Its gate decides whether untracked files get
-ordinary Linux open semantics and what a fork sees of its source's. Gate: a full run.
+**M3. Rules and the untracked area.** Built. `history.git/info/exclude` and `-agentfs` in `info/attributes` decide
+which new names a tree records (git-model §3), with the built-ins: `.git`, FIFOs and sockets, anything under an
+untracked directory or inside a nested repository. A tracked path stays recorded, and one `-agentfs` marks leaves
+history at the next open. Unrecorded files live in each tree's untracked area as ordinary Linux files (SQLite's
+write-ahead log works), merged into the view; a new fork starts with a copy of its upstream's area; renames, links,
+FIFOs and sockets across the two halves behave as on Linux or answer `EXDEV` where Linux tools expect it, and an
+atomic save from an excluded temporary name records one whole-file save. [Tree views](../../trees.md#rules-and-the-untracked-area)
+describes it; the pure crate is `agentfs-rules`. Left out, each refused at open, naming its line: database groups,
+size and store hints, LFS and every other `agentfs.*` attribute ([rules](../domains/rules.md) keeps them, with view
+profiles, rule-set versions across view hosts, tree rule files and bare-repository detection). Moved to M7: operator
+settings as a git-config include, because the engine owns and rewrites `history.git/config`, and M3's rules need no
+setting at their defaults (`nested = exclude` is built in). M3 needed no full run: no model rule or generator
+changed, and the whole-file replace, which no model call reaches, is guarded by a test that its commit equals an
+open, truncate, write and close of the same bytes; the conformance replay ran at the regression tier.
 
 **M4. Mirrors and the published name.** Mirrors on the tree model ([replication](../domains/replication.md)), the
 publisher, each volume's refs under its own prefix, and history a mirror's reader can read
@@ -169,7 +180,7 @@ the engine's own events.
 
 **M6. Patches, restore and revert on trees.** iac's patches applied at mount, `serve-git` as a patch source, and
 `restore` and `revert` on trees ([integrator patches](integrator-patches.md)). It needs M4's remotes and nothing
-later: it may land before or after M7, and lands before the baseline, whose every Hermes job lands a queued patch.
+later, and comes after the first Hermes deploy ([the baseline](#the-baseline)).
 Its gate names its commands, among them the producer's `patch submit`, so that no command serves both engines.
 Gate: a full run.
 
@@ -185,52 +196,55 @@ CSI launcher's call sites to match. Each entry point runs exactly one engine, an
 | the CSI front (today `mount --history-service`) and `serve-history` | recording | recording, under their own names | not called; deleted at M9 |
 | the recording one-shot commands (`record`, `flush`, `push`, `checkpoint`, `run`, `patch`, `fork`, `lfs`, `start accept`, `restore`, `revert`) | recording | recording, on a recording state area only | the same; deleted at M9 |
 
-The `ci/` scripts that call `init` or `mount` (about two dozen) are repointed or deleted in M7. Until M6 lands, a moved
-launcher whose configuration names a patch source (`agentfs.patchRemote` or any other `agentfs.patch*` key) starts
-and keeps the filesystem working (principle 5), logs the gap at every boot, and raises a standing alarm while it
-runs: patches are never silently not applied. M7 adds the migration runbook (below). Gate: the tracer's
+The `ci/` scripts that call `init` or `mount` (about two dozen) are repointed or deleted in M7. M7 does not wait for
+M4, M5 or M6, and says plainly what they have not built yet. Until M6 lands, a moved launcher whose configuration
+names a patch source (`agentfs.patchRemote` or any other `agentfs.patch*` key) starts and keeps the filesystem
+working (principle 5), logs the gap at every boot, and raises a standing alarm while it runs: patches are never
+silently not applied. A configured remote gets the same until M4 pushes to it. M7 also builds operator settings as a
+git-config include, their first owner being the launcher's configuration. M7 adds the migration runbook (below). Gate: the tracer's
 release-build many-file step within M1's tree budgets, run in CI before the merge (`bench.yml` runs only after
 landing and never fails, so it cannot hold the move); a miss holds the move. M7 also rewrites the migration Job of
 [deployment](../../deployment.md#10-hermes) (today `record` and `push`) to copy the files in through the mount.
 
-### The baseline
-
-The plan's first acceptance point: a baseline build, verified integrated with a target application, before anything
-else is moved or deleted. The applications are the ones agentfs already tests end to end: the generic sidecar
-example (`deploy/sidecar`) and upstream Hermes ([deployment](../../deployment.md#10-hermes)), each on the tree
-engine. The baseline builds nothing of its own. It is reached when M6 and M7 have both landed and its gate passes;
-a failure is fixed in the milestone that owns the gap, before M8 starts.
-
-What those applications need, and the milestone that gives it:
-
-| Need | Milestone |
-|---|---|
-| A volume created, or recovered, from the launcher's configuration | built (`ensure`, M1); M7 (the sidecar and Docker launchers call it) |
-| The mount at the application's data path, used by root, by other users and by a docker-in-docker tools container | built (other users reach the mount, M1; directories, symlinks, modes and owners, M2) |
-| Rule files: what is recorded, and untracked paths (secrets, databases, sessions, logs) never in history | M3 |
-| Every change pushed to a remote | M4 |
-| Health and alarms, and a sidecar-only restart onto a new mount | M5's first series |
-| iac's patches landing at the next start | M6 |
-| The start-up speed the probes allow | M1's budgets; speed, if M1's figures miss them |
-
-Only these come before it. M5's recorder series, M8, M9 and every [deferred extra](#deferred-extras) come after,
-or never block it.
-
-Gate: these CI jobs green with the launchers on the tree engine: image's `e2e (kind cluster)` (`ci/e2e-kind.sh`,
-the generic sidecar), hermes' `e2e (Hermes on kind, sidecar)` and `e2e (Hermes on kind, fence)`
-(`ci/e2e-hermes-kind.sh`), and docker's `e2e (docker compose, upstream Hermes)` (`ci/e2e-hermes.sh`). Each lands a
-queued patch, records a tool container's edit and keeps secrets and databases out of history. Hermes' third job,
-`e2e (Hermes on kind, csi)`, runs on the CSI driver and moves at M8.
-
 **M8. The CSI driver moves.** CreateVolume calls `ensure`; publish attaches a view host; DeleteVolume asks Volume's
-release verdict, or for a fork claim ends its fork by key. A fork claim makes an in-volume fork, owned by Trees
+release verdict, or for a fork claim ends its fork by key. Like M7, it does not wait for M4, M5 or M6, and says
+with an alarm and a log line what they have not built yet. A fork claim makes an in-volume fork, owned by Trees
 under the claim's handle (above); it lands automatically unless its class needs approval, and a fork whose settings
 need approval is refused by Trees until landing approvals is built. Its architect writes the missing CSI-on-trees
 page for one pod per volume; several pods on one volume, moving a volume between nodes and the other CSI extras are
 [deferred](#deferred-extras), and M8 refuses a claim that asks for one (a second pod's publish, `startFrom`,
 `link: unlinked`) with a clear error. Existing recording-format volumes move by the runbook below; a
 recording-format volume is never staged, and its DeleteVolume keeps its directory, with an alarm naming it. Gate:
-as M7, and hermes' `csi` job green on the tree engine.
+as M7, and [the baseline](#the-baseline)'s.
+
+### The baseline
+
+The plan's first acceptance point: the first Hermes deploy, on a CSI volume claim, so that the workload declares no
+sidecar (the owner, 2026-11-19, `OWNER-GUIDANCE.md`). It is upstream Hermes
+([deployment](../../deployment.md#10-hermes)) on the tree engine through the CSI driver. The baseline builds nothing
+of its own. It is reached when M3, M7 and M8 have landed and its gate passes; a failure is fixed in the milestone
+that owns the gap. Push, alarms and patches (M4, M5, M6) come after it, and until they land M7 and M8 say plainly,
+with an alarm and a log line and never silently, what is not built yet.
+
+What the deploy needs, and the milestone that gives it:
+
+| Need | Milestone |
+|---|---|
+| A volume created, or recovered, from the launcher's configuration | built (`ensure`, M1); M8 (CreateVolume calls it) |
+| The mount at the application's data path, used by root, by other users and by a docker-in-docker tools container | built (other users reach the mount, M1; directories, symlinks, modes and owners, M2) |
+| Rule files: what is recorded, and untracked paths (secrets, databases, sessions, logs) never in history | built (M3) |
+| The binary the CSI driver spawns runs the tree engine | M7 |
+| A CSI volume claim on the tree engine | M8 |
+| The start-up speed the probes allow | M1's budgets; speed, if M1's figures miss them |
+| What is not built yet (push, alarms, patches) said with an alarm and a log line | M7, M8 |
+
+Only these come before it. M4, M5, M6, M9 and every [deferred extra](#deferred-extras) come after, or never block
+it.
+
+Gate: hermes' `e2e (Hermes on kind, csi)` (`ci/e2e-hermes-kind.sh`) green on the tree engine: it records a tool
+container's edit, keeps secrets and databases out of history, and finds the log line and alarm for each gap. The
+sidecar and Docker jobs (image's `e2e (kind cluster)`, hermes' `sidecar` and `fence`, docker's
+`e2e (docker compose, upstream Hermes)`) move with M7.
 
 **M9. The recording engine is deleted.** Its domain logic and the passthrough FUSE layer go, with its patch queue and
 `serve-git` (rebuilt on trees by M6), its CSI entry points and one-shot commands, and every
@@ -241,34 +255,32 @@ goes; its deferred table moves to [the target architecture's index](../README.md
 ## Order
 
 ```text
- 6 → 5b → 5.1 → 5.2 → 5.3 → M1 → speed → M2 → M3 → M4 → M5 → M7 ─┬─▶ BASELINE ─┬─▶ M8 → M9 → deferred extras
-                                                        │    │        │             └─▶ 7 (the model's checker)
-                                                        │    └─▶ M5's recorder series (off the path)
-                                                        └─▶ M6 ───────┘
-                                           (M6: any time after M4, before the baseline)
+ 6 → 5b → 5.1 → 5.2 → 5.3 → M1 → speed → M2 → M3 → M7 → M8 ─▶ BASELINE ─┬─▶ M4 ─┬─▶ M5 ─┬─▶ M9 → deferred extras
+                                                                         │       └─▶ M6 ─┘
+                                                                         └─▶ 7 (the model's checker); M5's recorder series
 ```
 
-The order serves the baseline first: every milestone before it is one a target application needs, and nothing
-after it is. M1 is built.
+The order serves the baseline, the first Hermes deploy (the owner, 2026-11-19: on a CSI volume claim, after M3, M7
+and M8; push, alarms and patches after it). M1, M2 and M3 are built.
 
 - Step 6 is built before the plan's first milestone: its first slice moves the mirror out of `World`, which M4's
   publisher is checked against, and its transaction rules ride along because they were already in flight.
 - Step 5b precedes M1 because M1's "where" trailers and M4's publisher both name trees by identity, which 5b gives.
 - Step 7 (the model's checker reads git) is not on the baseline's path: the checker judges M2's new model rules as it
-  is today, reading some facts through `World`. It runs after the baseline, beside M8.
+  is today, reading some facts through `World`. It runs after the baseline.
 - Step 5 precedes M1 because M2, M3, M4 and M6 each extend a module step 5 makes.
 - Each serial edge has a reason. Speed precedes M2 because M2 to M4 extend the path it rewrites. M2 precedes M3
   because rules classify directories and symlinks, which M2 adds. M3 precedes M4 because a mirror publishes what
   rules record, and a path published before rules exclude it stays in history, which is never rewritten
-  (principle 7). M4 precedes M5 because the push and divergence alarms need the publisher. M5 precedes M7 because a
-  moved launcher without alarms or liveness would not keep operating (principle 5); only M5's first series is on the
-  path.
+  (principle 7). M7 precedes M8 because the CSI driver spawns the binary M7 moves. M4 precedes M5 because the push
+  and divergence alarms need the publisher, and M6 because patches need M4's remotes.
 - **Goals may lapse during the move.** agentfs is before its 1.0 release, so a launcher moves without waiting for
-  every goal its users rely on. M6 is off M7's path: from M7 until M6 lands, a moved launcher applies no iac patches
-  at mount, never silently (M7's alarm), and has no `restore` or `revert`, and example 3 of
-  [supported configurations](../../supported-configurations.md) is marked "not built". M6 must land before the
-  baseline, whose Hermes jobs land a patch. Each [deferred extra](#deferred-extras) is marked "not built" in
-  supported configurations from its launcher's move (M7 or M8) until its slice lands.
+  every goal its users rely on. M4, M5 and M6 are off M7's and M8's path: from each launcher's move until they land,
+  it pushes to no remote, has no tree-engine alarms beyond the ones M7 and M8 raise for these gaps, applies no iac
+  patches at mount, and has no `restore` or `revert`. Each gap is logged at boot and alarmed while it lasts, never
+  silent, and example 3 of [supported configurations](../../supported-configurations.md) is marked "not built". Each
+  [deferred extra](#deferred-extras) is marked "not built" in supported configurations from its launcher's move (M7
+  or M8) until its slice lands.
 - **Links to deleted pages.** The commit that deletes a plan page repoints every link to it: step 7's commit,
   which deletes the module cut, rewrites the references to its steps here and in
   [root branch name](root-branch-name.md) as the built behaviour's library pages; M4's commit, which deletes root
@@ -345,8 +357,9 @@ workload container. Its steps are `ensure` and its refusal of another name, a sa
 trailers, a kill mid-write and a restart in place, and the release figures against the tree budgets. M7 changes
 only the two commands' names.
 
-Each milestone adds its step. Built for M2: a directory, an executable bit and a chown through the mount. To come: M3 a database file in the untracked area, never
-in history; M4 a refusing remote (the filesystem keeps working), then a push under a configured name; M5 the alarm at
+Each milestone adds its step. Built for M2: a directory, an executable bit and a chown through the mount. Built for
+M3: with `*.db` and `.env` marked `-agentfs`, the workload's `state.db` and `.env` work through the mount, survive a
+restart, and never reach history. To come: M4 a refusing remote (the filesystem keeps working), then a push under a configured name; M5 the alarm at
 a collector; M6 a producer's patch at the next mount and a `restore`; M7 the same steps through the sidecar on kind,
 and the patch-source alarm while M6 is not built; M8 a CSI volume and a fork claim. Not covered: several pods, LFS,
 database groups, nested forks, transactions, upgrades.
@@ -363,7 +376,8 @@ database groups, nested forks, transactions, upgrades.
 ## Costs
 
 - Eight milestones and the speed slice after M1, touching every crate, doc, chart and workflow.
-- Goals and extras go dark for a while: iac's patches (alarmed), `restore` and `revert` from M7 until M6; each
+- Goals and extras go dark for a while: pushes until M4, tree-engine alarms until M5, iac's patches, `restore` and
+  `revert` until M6, each from its launcher's move (M7 or M8) and said with an alarm and a log line; each
   [deferred extra](#deferred-extras) from its launcher's move until its own slice lands, which no milestone here
   schedules. A user who needs one stays on a release before its launcher's move until then.
 - Existing volumes' history does not continue inside new ones. Whether a published name that a recording volume
@@ -377,13 +391,15 @@ database groups, nested forks, transactions, upgrades.
 - M2's new model rules ran on their scenarios and on the conformance replay of those scenarios on the library and on
   mounts, at the regression tier; the random runs do not make their calls. The full model sweep was the owner's call,
   and he chose to skip it (2026-11-18).
-- The baseline's gate adds no job: it is four existing jobs, run against the tree engine.
+- The baseline's gate adds no job: it is hermes' existing `csi` job, run against the tree engine.
+- M3 needed no full model sweep: no model rule or generator changed, and the whole-file replace is guarded by its
+  equality test instead.
 - **CI.** Wall time and runner time differ, because jobs run side by side. Measured on run 43146523186: a full
   `phase-1.yml` run takes about 73 min wall and about 300 runner-min; without the 500-seed shards, about 20 min wall
   and about 41 runner-min. A full model gate takes about 41 min on a 4-CPU container, outside CI. Measured on the
   2026-11-12 pushes: ci 9 to 13 min and image 5 to 10 min wall, side by side; with helm, f8 and docs, about 25 to
   30 runner-min per pushed commit. Step 7 adds one or two model gates after the
-  baseline. From M2 to M8: full runs where save or land logic changes (expected: speed, M3, M6) and short runs elsewhere (M4, M5, M7, M8), the tracer job (about
+  baseline. From M2 to M8: full runs where save or land logic changes (expected: speed, M6) and short runs elsewhere (M4, M5, M7, M8), the tracer job (about
   ten minutes in `image.yml`) and both engines' jobs in ci until M9. The core tier ([CI tiers](#ci-tiers)) adds about
   20 min wall, side by side with ci, and about 41 runner-min to every PR push and every push to `main`; the
   randomized shards cost only when triggered. The counts are estimates.

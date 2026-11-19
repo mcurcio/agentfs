@@ -27,7 +27,7 @@ Pages for a whole domain or the system:
 | Slice | Page |
 |---|---|
 | System composition and contracts: events, capabilities, versions, deployment compositions | [The system](system.md) |
-| Rules and view profiles: recorded or not, database groups, what each profile shows | [Rules](domains/rules.md) |
+| Rules, the unbuilt part: view profiles, database groups, size and store hints, rule-set versions across view hosts (what a tree records is built: [trees](../trees.md#rules-and-the-untracked-area)) | [Rules](domains/rules.md) |
 | Clients: grants with view profiles, snapshot clients, operator actors | [Clients](domains/clients.md) |
 | Views: snapshot views, consistency settings, several view hosts | [Views](domains/views.md) |
 | Trees storage: confinement, space, pinned snapshots | [Trees](domains/trees.md) |
@@ -41,7 +41,7 @@ Smaller slices, one page each:
 
 | Slice | Page |
 |---|---|
-| Moving every launcher onto the tree views and deleting the recording engine: milestones M3 to M9 (M1 and M2 are built), the baseline, the deferred extras | [One engine](future/one-engine.md) |
+| Moving every launcher onto the tree views and deleting the recording engine: milestones M4 to M9 (M1 to M3 are built), the baseline (the first Hermes deploy, on a CSI volume claim), the deferred extras | [One engine](future/one-engine.md) |
 | Cutting the tree actor into six modules | [Module cut](future/module-cut.md) |
 | The name the root is published under, apart from its identity | [Root branch name](future/root-branch-name.md) |
 | Transactions | [Transactions](future/transactions.md) |

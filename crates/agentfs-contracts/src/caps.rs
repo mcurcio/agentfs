@@ -33,8 +33,8 @@ pub enum LaunchScope {
     ForksItCreates,
 }
 
-/// A launcher's capability. Until Rules (M3) every launcher's view profiles are
-/// all of them, so it holds none.
+/// A launcher's capability. Until view profiles are built every launcher's
+/// view profiles are all of them, so it holds none.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct LaunchCap {
     launcher: LauncherId,

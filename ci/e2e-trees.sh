@@ -11,7 +11,7 @@ client=
 writer=
 cleanup() {
     status=$?
-    for mount in "$work/main" "$work/fork" "$work/untrack-mount"; do
+    for mount in "$work/main" "$work/fork" "$work/untrack-mount" "$work/save-mount"; do
         mountpoint -q "$mount" && fusermount3 -uz "$mount" || true
     done
     [ -z "$client" ] || kill "$client" 2>/dev/null || true
@@ -30,7 +30,7 @@ chmod 755 "$work"
 # The operator's rules (docs/trees.md, "Rules and the untracked area"), read at
 # each mount; trees-untracked.py checks what they keep out.
 mkdir -p "$work/state/history.git/info"
-printf '%s\n' '*.log' '/sessions/' >"$work/state/history.git/info/exclude"
+printf '%s\n' '*.log' '/sessions/' '/logs/' >"$work/state/history.git/info/exclude"
 printf '%s\n' '*.db -agentfs' '*.db-wal -agentfs' '*.db-shm -agentfs' '.env -agentfs' \
     >"$work/state/history.git/info/attributes"
 # The fork view is one keyed fork: the first mount makes it, every later mount
@@ -235,6 +235,7 @@ grep -F 'this fork has had its writer; mount it with --fork-read-only' "$work/ta
 # Read-only it mounts: reads answer, writes are refused.
 start --fork-read-only
 test "$(cat "$work/fork/restarted")" = after-restart
+python3 ci/trees-untracked.py readonly "$work/fork"
 if printf refused 2>/dev/null > "$work/fork/refused"; then
     echo "a read-only fork took a write" >&2
     exit 1
@@ -357,6 +358,8 @@ git --git-dir="$work/state/history.git" fsck --strict
 python3 ci/trees-untracked.py badrules "$bin" "$work"
 # A tracked file the rules come to mark -agentfs leaves history at the next mount.
 python3 ci/trees-untracked.py untrack "$bin" "$work"
+# Python's atomic save onto an allowlisted file, from an excluded temporary file.
+python3 ci/trees-untracked.py save "$bin" "$work"
 test "$mmap_status" -eq 0
 test "$tmpfile_status" -eq 0
 echo "tree-view recording, object and crash scenarios passed"

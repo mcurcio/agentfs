@@ -3,21 +3,25 @@
 (docs/trees.md, "Rules and the untracked area"). The views' volume carries
 these rules (ci/e2e-trees.sh writes them before the first mount):
 
-    history.git/info/exclude     *.log, /sessions/
+    history.git/info/exclude     *.log, /sessions/, /logs/
     history.git/info/attributes  *.db, *.db-wal, *.db-shm and .env -agentfs
 
     trees-untracked.py view MOUNT          as root: a secret, a log, a session,
                                            a tracked note, files of uid 10000,
                                            SQLite in WAL mode written by two
                                            processes, a nested git repository,
-                                           the merged listing, rmdir, EXDEV
+                                           the merged listing, rmdir, moves and
+                                           links across and within the halves,
+                                           a FIFO and a unix socket, O_TMPFILE
     trees-untracked.py early-fork MOUNT    a fork made before any of them shows
                                            none of the root's untracked files
     trees-untracked.py writer DB           writes the database until killed
     trees-untracked.py remount MOUNT       after a kill and a restart, the root's
                                            untracked files are still there
     trees-untracked.py history GIT_DIR     no untracked name is in history; the
-                                           note and the repository's directory are
+                                           note and the repository's directory are;
+                                           a file moved out was recorded, then its
+                                           removal, and the area holds its bytes
     trees-untracked.py fork FORK MAIN      a fork made after them starts with a
                                            copy; later writes stay on their side;
                                            a database copied while being written
@@ -27,14 +31,28 @@ these rules (ci/e2e-trees.sh writes them before the first mount):
     trees-untracked.py untrack BIN DIR     a tracked file the rules come to mark
                                            -agentfs leaves history at the next
                                            mount and reads back as it was
+    trees-untracked.py save BIN DIR        Python's atomic save from an excluded
+                                           temporary file onto an allowlisted
+                                           config.yaml (exclude /* and
+                                           !/config.yaml): recorded as one save
+                                           that keeps the unchanged lines'
+                                           identities, the temporary name never
+                                           in history, ESTALE through the
+                                           temporary file's descriptor
+    trees-untracked.py readonly MOUNT      a read-only view refuses each change
+                                           with EROFS
 """
+import ctypes
 import errno
 import hashlib
+import json
 import os
+import socket
 import sqlite3
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -43,7 +61,25 @@ SECRET = b"TOKEN=never-in-history\n"
 # Every name the rules leave out, as the view checks make them.
 UNTRACKED = [".env", "app.log", "sessions", "sessions/s.json", "state.db",
              "state.db-wal", "state.db-shm", "busy.db", "repo/.git", "repo/x",
-             "u/x.log", "u/.env", "d/x.log"]
+             "u/x.log", "u/.env", "d/x.log", "logs/moved.md", "logs/skills/SKILL.md",
+             "draft.log", "app-link.log", "pipe", "sock", "t2/a.log", "t/a.log"]
+MOVED = b"moved out of the tree\n"
+RENAME_NOREPLACE = 1
+AT_FDCWD = -100
+
+
+def fanned(path):
+    """`<aa>/<bb>/<path>`: `aa` and `bb` hex digits 1-2 and 3-4 of `git
+    hash-object --stdin` of the path."""
+    hexa = hashlib.sha1(b"blob %d\0" % len(path.encode()) + path.encode()).hexdigest()
+    return f"{hexa[:2]}/{hexa[2:4]}/{path}"
+
+
+def renameat2(old, new, flags):
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.renameat2(AT_FDCWD, os.fsencode(old), AT_FDCWD, os.fsencode(new), flags) != 0:
+        code = ctypes.get_errno()
+        raise OSError(code, os.strerror(code), str(old))
 
 
 def dir_record(path):
@@ -176,13 +212,73 @@ def view(root):
     (root / "d").mkdir()
     (root / "d" / "x.log").write_bytes(b"x")
     expect_errno(errno.ENOTEMPTY, os.rmdir, root / "d")
-    # Across the halves: EXDEV; within the untracked half: a rename.
-    expect_errno(errno.EXDEV, os.rename, root / "notes.md", root / "notes.log")
-    expect_errno(errno.EXDEV, os.rename, root / "app.log", root / "app.txt")
+    # Within the untracked half: a rename; RENAME_NOREPLACE onto a name there.
     os.rename(root / "app.log", root / "app2.log")
     os.rename(root / "app2.log", root / "app.log")
-    # A hard link to an untracked file is refused, as for a named tracked file.
-    expect_errno(errno.EPERM, os.link, root / "app.log", root / "app-link.log")
+    (root / "other.log").write_bytes(b"other")
+    expect_errno(errno.EEXIST, renameat2, root / "other.log", root / "app.log", RENAME_NOREPLACE)
+    os.unlink(root / "other.log")
+    # A hard link within the untracked half.
+    os.link(root / "app.log", root / "app-link.log")
+    assert os.lstat(root / "app.log").st_nlink == 2
+    assert (root / "app-link.log").read_bytes() == (root / "app.log").read_bytes()
+    os.unlink(root / "app-link.log")
+    assert os.lstat(root / "app.log").st_nlink == 1
+    # A tracked file moved into an excluded directory: its removal is recorded
+    # and the area holds its bytes (history checks both).
+    (root / "logs").mkdir()
+    (root / "moved.md").write_bytes(MOVED)
+    subprocess.run(["mv", str(root / "moved.md"), str(root / "logs" / "moved.md")], check=True)
+    assert (root / "logs" / "moved.md").read_bytes() == MOVED
+    assert not (root / "moved.md").exists()
+    # An untracked file renamed to a name the rules record: recorded.
+    (root / "draft.log").write_bytes(b"draft\n")
+    os.rename(root / "draft.log", root / "draft.txt")
+    assert (root / "draft.txt").read_bytes() == b"draft\n"
+    assert not (root / "draft.log").exists()
+    # Directories across the halves answer EXDEV, and mv copies.
+    (root / "skills").mkdir()
+    (root / "skills" / "SKILL.md").write_bytes(b"skill\n")
+    expect_errno(errno.EXDEV, os.rename, root / "skills", root / "logs" / "skills")
+    subprocess.run(["mv", str(root / "skills"), str(root / "logs" / "skills")], check=True)
+    assert (root / "logs" / "skills" / "SKILL.md").read_bytes() == b"skill\n"
+    assert not (root / "skills").exists()
+    # O_TMPFILE in an untracked directory has no tracked name to take.
+    expect_errno(errno.EOPNOTSUPP, os.open, root / "sessions", os.O_TMPFILE | os.O_RDWR, 0o600)
+    away = Path(tempfile.mkdtemp())
+    subprocess.run(["mv", str(root / "sessions"), str(away / "x")], check=True)
+    assert not (root / "sessions").exists()
+    assert (away / "x" / "s.json").read_bytes() == b'{"id": 1}'
+    subprocess.run(["mv", str(away / "x"), str(root / "sessions")], check=True)
+    assert (root / "sessions" / "s.json").read_bytes() == b'{"id": 1}'
+    os.rmdir(away)
+    # A tracked directory's untracked children move with it.
+    (root / "t").mkdir()
+    (root / "t" / "a.log").write_bytes(b"child")
+    os.rename(root / "t", root / "t2")
+    assert (root / "t2" / "a.log").read_bytes() == b"child"
+    assert "a.log" in os.listdir(root / "t2")
+    assert not (root / "t").exists()
+    # A FIFO and a unix socket live in the untracked area.
+    os.mkfifo(root / "pipe", 0o600)
+    assert stat.S_ISFIFO(os.lstat(root / "pipe").st_mode)
+    reader = os.open(root / "pipe", os.O_RDONLY | os.O_NONBLOCK)
+    writer_fd = os.open(root / "pipe", os.O_WRONLY | os.O_NONBLOCK)
+    os.write(writer_fd, b"through the pipe")
+    assert os.read(reader, 100) == b"through the pipe"
+    os.close(writer_fd)
+    os.close(reader)
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(str(root / "sock"))
+    server.listen(1)
+    assert stat.S_ISSOCK(os.lstat(root / "sock").st_mode)
+    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    client.connect(str(root / "sock"))
+    accepted, _ = server.accept()
+    client.sendall(b"hello")
+    assert accepted.recv(5) == b"hello"
+    for sock in (accepted, client, server):
+        sock.close()
 
 
 def early_fork(root):
@@ -233,6 +329,15 @@ def history(git_dir):
     text = git("log", "--all", "-p", "--format=")
     assert "never-in-history" not in text
     assert "in the nested repository" not in text
+    # Moved out of the tree: recorded, then its removal; the area holds it.
+    assert f"files/{fanned('moved.md')}" in paths
+    head = set(git("ls-tree", "-r", "--name-only", "root").splitlines())
+    assert f"files/{fanned('moved.md')}" not in head, "the move out recorded no removal"
+    area = Path(git_dir).parent / "untracked" / "root"
+    assert (area / "logs" / "moved.md").read_bytes() == MOVED
+    # Moved into the tree: recorded under its new name alone.
+    assert git("show", f"root:files/{fanned('draft.txt')}") == "draft\n"
+    assert (area / "t2" / "a.log").read_bytes() == b"child"
 
 
 def fork(fork_root, main):
@@ -347,6 +452,84 @@ def untrack(binary, work):
     assert len(unlinks()) == 1
 
 
+def live_lines(git, rev, path):
+    """`path`'s live lines at `rev` as (identity, version) pairs, from its
+    lines/ entry: a run numbers both on from its first line."""
+    def numbered(start, k):
+        epoch, first = start.rsplit(":", 1)
+        return f"{epoch}:{int(first) + k}"
+
+    line_map = json.loads(git("show", f"{rev}:lines/{fanned(path)}"))[1]
+    return [(numbered(run["identity"], k), numbered(run["version"], k))
+            for run in line_map["lines"] if not run.get("dead")
+            for k in range(run["count"])]
+
+
+def save(binary, work):
+    work = Path(work)
+    state, mount = work / "save-state", work / "save-mount"
+    mount.mkdir()
+    subprocess.run([binary, "--state", str(state), "trees", "init", "--volume", "save"],
+                   check=True, stdout=subprocess.DEVNULL)
+    info = state / "history.git" / "info"
+    info.mkdir(exist_ok=True)
+    # The Hermes allowlist's shape: every top-level name excluded but one.
+    (info / "exclude").write_text("/*\n!/config.yaml\n")
+
+    def git(*args):
+        return subprocess.check_output(["git", "--git-dir=" + str(state / "history.git"), *args],
+                                       text=True)
+
+    lines = [f"key{i}: {i}\n" for i in range(10)]
+    with open(work / "save.log", "ab") as log:
+        proc = serve(binary, state, mount, log)
+        (mount / "config.yaml").write_text("".join(lines))
+        lines[4] = "key4: changed\n"
+        with tempfile.NamedTemporaryFile(dir=mount, prefix=".config.yaml.", suffix=".tmp",
+                                         delete=False) as f:
+            f.write("".join(lines).encode())
+            f.flush()
+            os.fsync(f.fileno())
+            os.replace(f.name, mount / "config.yaml")
+            # The temporary file moved into the tree: its descriptor writes no more.
+            expect_errno(errno.ESTALE, os.write, f.fileno(), b"late\n")
+            assert os.pread(f.fileno(), 100, 0) == "".join(lines).encode()
+        assert (mount / "config.yaml").read_text() == "".join(lines)
+        assert not os.path.exists(f.name)
+        assert sorted(os.listdir(mount)) == ["config.yaml"], os.listdir(mount)
+        unmount(proc)
+    text = git("log", "--all", "-p", "--name-only", "--format=%B")
+    assert ".config.yaml." not in text, "the temporary name reached history"
+    assert git("show", f"root:files/{fanned('config.yaml')}") == "".join(lines)
+    commits = git("log", "--format=%H", "root", "--", f"lines/{fanned('config.yaml')}").split()
+    # The newest two: the replace, and the save before it.
+    after, before = (live_lines(git, rev, "config.yaml") for rev in commits[:2])
+    # Every line keeps its identity; the nine unchanged keep their versions too.
+    assert [i for i, _ in before] == [i for i, _ in after] and len(after) == 10, (before, after)
+    assert len(set(before) & set(after)) == 9, (before, after)
+
+
+def readonly(root):
+    for name, call, args in (
+        ("create", os.open, (root / "ro-new", os.O_CREAT | os.O_WRONLY, 0o644)),
+        ("rename", os.rename, (root / "restarted", root / "ro-renamed")),
+        ("link", os.link, (root / "restarted", root / "ro-linked")),
+        ("mkfifo", os.mkfifo, (root / "ro-pipe",)),
+        ("mkdir", os.mkdir, (root / "ro-dir",)),
+        ("tmpfile", os.open, (root, os.O_TMPFILE | os.O_RDWR, 0o600)),
+        ("unlink", os.unlink, (root / "restarted",)),
+    ):
+        try:
+            call(*args)
+        except OSError as e:
+            assert e.errno == errno.EROFS, (name, e)
+        else:
+            raise AssertionError(f"a read-only view took {name}")
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    expect_errno(errno.EROFS, sock.bind, str(root / "ro-sock"))
+    sock.close()
+
+
 if __name__ == "__main__":
     commands = {
         "view": lambda: view(Path(sys.argv[2])),
@@ -357,6 +540,8 @@ if __name__ == "__main__":
         "fork": lambda: fork(Path(sys.argv[2]), Path(sys.argv[3])),
         "badrules": lambda: badrules(sys.argv[2], sys.argv[3]),
         "untrack": lambda: untrack(sys.argv[2], sys.argv[3]),
+        "save": lambda: save(sys.argv[2], sys.argv[3]),
+        "readonly": lambda: readonly(Path(sys.argv[2])),
     }
     if sys.argv[1] in ("view", "remount", "fork") and os.geteuid() != 0:
         sys.exit(f"trees-untracked.py {sys.argv[1]} must run as root (euid {os.geteuid()})")

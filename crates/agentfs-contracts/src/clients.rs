@@ -120,9 +120,9 @@ pub enum Consistency {
     PerFile,
 }
 
-/// What a client may do and see. Built only by its constructors. Until Rules
-/// (M3) every client sees everything, so a grant names no view profile;
-/// snapshots wait for pinned snapshots.
+/// What a client may do and see. Built only by its constructors. Until view
+/// profiles are built every client sees everything, so a grant names no view
+/// profile; snapshots wait for pinned snapshots.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Grant {
     access: Access,

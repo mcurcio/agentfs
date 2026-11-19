@@ -5,13 +5,14 @@
 //! lock; each change holds the area against a fork's copy while it runs.
 //!
 //! Inodes: an area entry's is `1 << 63 | n`, `n` from this table keyed by
-//! the backing file (`st_dev`, `st_ino`), each with its last known path.
+//! the backing file (`st_dev`, `st_ino`), each with the paths it is known
+//! by (more than one after a hard link).
 
 // `stat` field types differ between architectures, so conversions written
 // to be portable are identities on some targets.
 #![allow(clippy::useless_conversion, clippy::unnecessary_cast)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::os::fd::OwnedFd;
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard, PoisonError};
@@ -41,8 +42,8 @@ pub(super) fn io(e: impl Into<std::io::Error>) -> Errno {
 struct Inodes {
     /// `n` by backing file.
     by_file: BTreeMap<(u64, u64), u64>,
-    /// Each `n`'s backing file and last known path.
-    entries: BTreeMap<u64, ((u64, u64), String)>,
+    /// Each `n`'s backing file and known paths.
+    entries: BTreeMap<u64, ((u64, u64), BTreeSet<String>)>,
     next: u64,
 }
 
@@ -126,7 +127,7 @@ impl Untracked {
     /// The inode of the entry at `path` with status `st`; its path is
     /// remembered.
     fn ino(&self, path: &str, st: &Stat) -> INodeNo {
-        let file = (st.st_dev as u64, st.st_ino as u64);
+        let file = file_of(st);
         let mut inodes = self.inodes();
         let n = match inodes.by_file.get(&file) {
             Some(n) => *n,
@@ -137,30 +138,18 @@ impl Untracked {
                 n
             }
         };
-        inodes.entries.insert(n, (file, path.to_owned()));
+        inodes
+            .entries
+            .entry(n)
+            .or_insert_with(|| (file, BTreeSet::new()))
+            .1
+            .insert(path.to_owned());
         INodeNo(UNTRACKED | n)
     }
 
     /// The attributes of the entry at `path` with status `st`.
     fn attr(&self, path: &str, st: &Stat) -> FileAttr {
-        let mode = u32::from(st.st_mode);
-        FileAttr {
-            ino: self.ino(path, st),
-            size: st.st_size as u64,
-            blocks: st.st_blocks as u64,
-            atime: time(st.st_atime as i64, st.st_atime_nsec as i64),
-            mtime: time(st.st_mtime as i64, st.st_mtime_nsec as i64),
-            ctime: time(st.st_ctime as i64, st.st_ctime_nsec as i64),
-            crtime: time(st.st_ctime as i64, st.st_ctime_nsec as i64),
-            kind: kind(mode),
-            perm: u16::try_from(mode & 0o7777).unwrap_or(0),
-            nlink: u32::try_from(st.st_nlink).unwrap_or(u32::MAX),
-            uid: st.st_uid,
-            gid: st.st_gid,
-            rdev: u32::try_from(st.st_rdev).unwrap_or(0),
-            blksize: 4096,
-            flags: 0,
-        }
+        attr_of(self.ino(path, st), st)
     }
 
     /// The last known path of an untracked inode.
@@ -168,7 +157,7 @@ impl Untracked {
         self.inodes()
             .entries
             .get(&(ino.0 & !UNTRACKED))
-            .map(|(_, path)| path.clone())
+            .and_then(|(_, paths)| paths.first().cloned())
             .ok_or(Errno::ENOENT)
     }
 
@@ -200,13 +189,13 @@ impl Untracked {
     }
 
     /// The attributes of an untracked inode: through its open descriptor
-    /// when one is given, else by its path.
+    /// when one is given (a file no name reaches has one), else by its path.
     pub(super) fn getattr(&self, ino: INodeNo, fd: Option<&OwnedFd>) -> Result<FileAttr> {
+        if let Some(fd) = fd {
+            return Ok(attr_of(ino, &rustix::fs::fstat(fd).map_err(io)?));
+        }
         let path = self.path(ino)?;
-        let st = match fd {
-            Some(fd) => rustix::fs::fstat(fd).map_err(io)?,
-            None => self.area.stat(&path).map_err(io)?.ok_or(Errno::ENOENT)?,
-        };
+        let st = self.area.stat(&path).map_err(io)?.ok_or(Errno::ENOENT)?;
         Ok(self.attr(&path, &st))
     }
 
@@ -233,7 +222,11 @@ impl Untracked {
 
     /// Makes the directories above `path` the area lacks, standing for the
     /// tracked directories there.
-    fn containers(&self, path: &str, meta_of: &mut dyn FnMut(&str) -> Option<Meta>) -> Result<()> {
+    pub(super) fn containers(
+        &self,
+        path: &str,
+        meta_of: &mut dyn FnMut(&str) -> Option<Meta>,
+    ) -> Result<()> {
         self.area.containers(path, meta_of).map_err(io)
     }
 
@@ -350,8 +343,12 @@ impl Untracked {
 
     /// A link's target.
     pub(super) fn readlink(&self, ino: INodeNo) -> Result<Vec<u8>> {
-        let path = self.path(ino)?;
-        let (parent, name) = self.area.parent(&path).map_err(io)?;
+        self.readlink_at(&self.path(ino)?)
+    }
+
+    /// The target of the link at `path`.
+    pub(super) fn readlink_at(&self, path: &str) -> Result<Vec<u8>> {
+        let (parent, name) = self.area.parent(path).map_err(io)?;
         Ok(rustix::fs::readlinkat(&parent, name.as_str(), Vec::new())
             .map_err(io)?
             .into_bytes())
@@ -470,6 +467,9 @@ impl Untracked {
             flags,
         )
         .map_err(io)?;
+        if from != to {
+            self.forget(to);
+        }
         self.moved(from, to);
         Ok(())
     }
@@ -488,6 +488,111 @@ impl Untracked {
         self.rename(from, to, false, meta_of)
     }
 
+    /// Before a tracked directory is renamed onto `to`: an empty container
+    /// left there is removed; any other entry answers `EXDEV`.
+    pub(super) fn clear_for_dir(&self, to: &str) -> Result<()> {
+        let Some(st) = self.area.stat(to).map_err(io)? else {
+            return Ok(());
+        };
+        if kind(u32::from(st.st_mode)) == FileType::Directory
+            && self.area.entries(to).map_err(io)?.is_empty()
+        {
+            return self.rmdir(to, true);
+        }
+        Err(Errno::EXDEV)
+    }
+
+    /// A hard link at `to` to the area's entry at `from`, made under the
+    /// containers `to` needs: its attributes, the inode now known by both.
+    pub(super) fn link(
+        &self,
+        from: &str,
+        to: &str,
+        meta_of: &mut dyn FnMut(&str) -> Option<Meta>,
+    ) -> Result<FileAttr> {
+        self.containers(to, meta_of)?;
+        let _writing = self.area.writing();
+        let (old_parent, old_name) = self.area.parent(from).map_err(io)?;
+        let (new_parent, new_name) = self.area.parent(to).map_err(io)?;
+        rustix::fs::linkat(
+            &old_parent,
+            old_name.as_str(),
+            &new_parent,
+            new_name.as_str(),
+            AtFlags::empty(),
+        )
+        .map_err(io)?;
+        let st = rustix::fs::statat(&new_parent, new_name.as_str(), AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(io)?;
+        Ok(self.attr(to, &st))
+    }
+
+    /// A new FIFO or socket at `path` (`mode` names which) with exactly
+    /// `mode`'s permission bits, made by the view host and given to `owner`.
+    pub(super) fn mknod(
+        &self,
+        path: &str,
+        mode: u32,
+        owner: (u32, u32),
+        meta_of: &mut dyn FnMut(&str) -> Option<Meta>,
+    ) -> Result<FileAttr> {
+        self.containers(path, meta_of)?;
+        let _writing = self.area.writing();
+        let (parent, name) = self.area.parent(path).map_err(io)?;
+        let name = name.as_str();
+        let perm = Mode::from_raw_mode(mode & 0o7777);
+        rustix::fs::mknodat(
+            &parent,
+            name,
+            rustix::fs::FileType::from_raw_mode(mode),
+            perm,
+            0,
+        )
+        .map_err(io)?;
+        // The daemon's umask does not apply. A FIFO or socket has no
+        // descriptor to change it through, and no link is followed: the
+        // entry was just made.
+        rustix::fs::chmodat(&parent, name, perm, AtFlags::empty()).map_err(io)?;
+        if self.give {
+            rustix::fs::chownat(
+                &parent,
+                name,
+                Some(rustix::fs::Uid::from_raw(owner.0)),
+                Some(rustix::fs::Gid::from_raw(owner.1)),
+                AtFlags::SYMLINK_NOFOLLOW,
+            )
+            .map_err(io)?;
+        }
+        let st = rustix::fs::statat(&parent, name, AtFlags::SYMLINK_NOFOLLOW).map_err(io)?;
+        Ok(self.attr(path, &st))
+    }
+
+    /// Puts `len` bytes of `src` at `path` with `meta`
+    /// ([`UntrackedArea::place`]): a tracked file or link moved out of the
+    /// tree. The containers above `path` must exist.
+    pub(super) fn place(
+        &self,
+        path: &str,
+        src: &mut dyn std::io::Read,
+        len: u64,
+        meta: Meta,
+    ) -> Result<()> {
+        self.area.place(path, src, len, meta).map_err(io)?;
+        self.forget(path);
+        Ok(())
+    }
+
+    /// The regular file at `path` opened read-only, never following a link,
+    /// and its status: the source of a move into the tree.
+    pub(super) fn open_source(&self, path: &str) -> Result<(std::fs::File, Stat)> {
+        let fd = self.open(path, libc::O_RDONLY)?;
+        let st = rustix::fs::fstat(&fd).map_err(io)?;
+        if u32::from(st.st_mode) & libc::S_IFMT != libc::S_IFREG {
+            return Err(Errno::EXDEV);
+        }
+        Ok((std::fs::File::from(fd), st))
+    }
+
     /// Makes the area's directory at `path`, if it has one, durable.
     pub(super) fn fsync_dir(&self, path: &str) -> Result<()> {
         match self
@@ -504,29 +609,63 @@ impl Untracked {
     /// Paths at or under `from` are now under `to`.
     fn moved(&self, from: &str, to: &str) {
         let prefix = format!("{from}/");
-        for (_, path) in self.inodes().entries.values_mut() {
-            if path == from {
-                *path = to.to_owned();
-            } else if let Some(rest) = path.strip_prefix(&prefix) {
-                *path = format!("{to}/{rest}");
-            }
+        for (_, paths) in self.inodes().entries.values_mut() {
+            *paths = std::mem::take(paths)
+                .into_iter()
+                .map(|path| {
+                    if path == from {
+                        to.to_owned()
+                    } else if let Some(rest) = path.strip_prefix(&prefix) {
+                        format!("{to}/{rest}")
+                    } else {
+                        path
+                    }
+                })
+                .collect();
         }
     }
 
-    /// The entry at `path` is gone: its inode no longer has a path.
+    /// The entry at `path` is gone: no inode has that path, and one left
+    /// with none is forgotten.
     fn forget(&self, path: &str) {
         let mut inodes = self.inodes();
-        let gone: Vec<u64> = inodes
-            .entries
-            .iter()
-            .filter(|(_, (_, p))| p == path)
-            .map(|(n, _)| *n)
-            .collect();
-        for n in gone {
-            if let Some((file, _)) = inodes.entries.remove(&n) {
-                inodes.by_file.remove(&file);
+        let mut gone = Vec::new();
+        for (n, (file, paths)) in &mut inodes.entries {
+            if paths.remove(path) && paths.is_empty() {
+                gone.push((*n, *file));
             }
         }
+        for (n, file) in gone {
+            inodes.entries.remove(&n);
+            inodes.by_file.remove(&file);
+        }
+    }
+}
+
+/// A backing file's identity: its device and inode numbers.
+pub(super) fn file_of(st: &Stat) -> (u64, u64) {
+    (st.st_dev as u64, st.st_ino as u64)
+}
+
+/// The attributes of inode `ino`, a file with status `st`.
+fn attr_of(ino: INodeNo, st: &Stat) -> FileAttr {
+    let mode = u32::from(st.st_mode);
+    FileAttr {
+        ino,
+        size: st.st_size as u64,
+        blocks: st.st_blocks as u64,
+        atime: time(st.st_atime as i64, st.st_atime_nsec as i64),
+        mtime: time(st.st_mtime as i64, st.st_mtime_nsec as i64),
+        ctime: time(st.st_ctime as i64, st.st_ctime_nsec as i64),
+        crtime: time(st.st_ctime as i64, st.st_ctime_nsec as i64),
+        kind: kind(mode),
+        perm: u16::try_from(mode & 0o7777).unwrap_or(0),
+        nlink: u32::try_from(st.st_nlink).unwrap_or(u32::MAX),
+        uid: st.st_uid,
+        gid: st.st_gid,
+        rdev: u32::try_from(st.st_rdev).unwrap_or(0),
+        blksize: 4096,
+        flags: 0,
     }
 }
 

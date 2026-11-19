@@ -1481,3 +1481,21 @@ M2 residuals (each to become a bead):
    owned): the file's image is dropped and the page writes made before the replace count as superseded, as a mapped
    write to a file renamed over is lost on Linux; the opens' own calls still save over it at their close. The
    arrival-order size the view reports for that open file (`inode_size`) is not reset until its last open closes.
+
+## 2026-11-19, M3 S3 (moves across the halves, close M3): where the brief was short
+
+1. **"One of ten lines changed keeps nine line identities" is not what the engine does.** A changed line keeps its
+   identity and gets a new version (`lines/`' runs carry both). `ci/trees-untracked.py save` checks that all ten
+   identities are kept and that nine (identity, version) pairs are unchanged.
+2. **The allowlist save cannot live in `view` and `history`.** Exclude `/*` with `!/config.yaml` would leave out every
+   name the main volume's checks record. It is a mode of its own, `save BIN DIR`, on its own volume, as `untrack` and
+   `badrules` are; `view` and `history` carry the other new checks (`/logs/` added to the main volume's exclude).
+3. **Mutation probe 2 is caught by the engine's rule guard, not by the history check.** An import by `first_link` of
+   the temporary name answers `EXDEV` (`Error::Untracked`, the engine refusing a name the rules place untracked), so
+   `view`'s rename of `draft.log` fails before any history is read. The history check's power against that mutation
+   is unproven; the guard makes it unreachable. Probe 1 likewise fails at `view`'s `draft.log` rename, before the
+   `save` mode's `os.replace`.
+4. **An import onto a tracked link is not specified.** `replace_file` answers `Error::Invalid` there; the view answers
+   `EXDEV` (`mv` then copies), and `EISDIR` onto a tracked directory, as rename(2) does.
+5. **`docs/target-architecture/future/module-cut.md` still says step 7 runs "beside its M8"** (not an owned path); after
+   the 2026-11-19 order it runs after the baseline, which now follows M8.

@@ -33,6 +33,17 @@ design was reviewed on 2026-10-12.
   volume opens: its bytes, mode and owner move to the tree's untracked area and
   one `Unlink by agentfs` commit records it. The recording engine's operator
   rules use the Rules domain's matcher.
+- **Tree views: moves between the tree and the untracked area.** A rename
+  from an excluded temporary file onto a recorded name (Python's
+  `NamedTemporaryFile` plus `os.replace`, an editor's atomic save) records one
+  whole-file save that keeps the file's and its unchanged lines' identities,
+  and history never shows the temporary name; a descriptor still open on the
+  temporary file answers `ESTALE` to writes. A tracked file or link renamed
+  onto an excluded name moves out: its removal is recorded and the area holds
+  its bytes. Directories across the two answer `EXDEV`, so `mv` copies. A hard
+  link within the untracked area works; `mkfifo` and a unix socket's `bind`
+  work and are never recorded; `O_TMPFILE` in an untracked directory answers
+  `EOPNOTSUPP`.
 - **Tree views: M2 fixes.** A directory's record in history is named by its
   path's blob id, with the path inside, so a clone or checkout of history
   works however deep a directory is. `fsync` and close of a descriptor make
