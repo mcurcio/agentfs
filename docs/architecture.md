@@ -90,7 +90,7 @@ missing from these tables or a row names a module that no longer exists;
 | `lib.rs` | Crate root: the module list and the engine's overview |
 | `volume.rs` | Opens a state area: crash recovery, then the [`Recorder`](#the-synchronous-step) used at every boundary and the `Committer` that turns records into commits |
 | `record.rs` | What the journal stores: one record per change boundary, absolute state, never deltas |
-| `state_area.rs` | The `StateArea` port over the tree actor: inspect without the lock, create a volume with a new id, open and keep the recovered volume, served (`Recording`); once open, Volume's `VolumeStore` and `QueueFacts` through the `TreeStore` it makes |
+| `state_area.rs` | The `StateArea` port over the tree actor: inspect without the lock, create a volume with a new id and its root owner, open and keep the recovered volume, served (`Recording`); once open, Volume's `VolumeStore` and `QueueFacts` through the `TreeStore` it makes |
 | `session.rs` | The history service's sessions (`Sessions`, the `SessionBinder` port): each bound to a client's authority; a `TreeSession` locks the actor with its tree and writer (writes `EROFS` without one, handles only its own); unbind saves the client's opens and makes them durable |
 | `store.rs` | The domains' store ports over one served volume (`TreeStore`): Trees' `ForkStore` (create, end, drop), Clients' `ClientStore` (attach, rebind, end, release a claim on each tree's Clients chain), Volume's `VolumeStore` (the lifecycle row on `refs/agentfs/volume`) and the `QueueFacts`, each write one journal step (a fork and its row, a drop and its row, or rows alone) made durable before it returns, off the actor's lock; the audit stamps' one home (`created` set once, `changed` each write); the ports' word for each actor failure |
 | `tree_actor/mod.rs` | The tree actor: the actor, recovery and queue orchestration. A step is one unit of work: decided, appended to the journal as the change itself, applied to the saved state, with no git on the call path; creating a volume (its identity file, then `format` last), inspecting and opening a state area, recovery (history built through the journal, then abandoned opens closed); each tree's last head-moving step and the keys steps touched, which a take's land checks |
@@ -186,9 +186,10 @@ missing from these tables or a row names a module that no longer exists;
 | `listening_socket.rs` | `Listener`, the one way agentfs listens on a Unix socket (control socket, history service, agentfs-csi), shut down (`SHUT_RDWR`) when stopped or dropped so a child process still sharing it cannot take connections no one answers; `clippy.toml` disallows raw listener construction elsewhere |
 | `fsutil.rs` | Small filesystem helpers: atomic JSON state files under `<state>/meta`, fsyncing a directory, making directories durably, and a file's bytes reflinked or copied, shared by the recording engine and the tree engine |
 | `config.rs` | Operator settings from the history repository's own git config, and `config::KEYS` |
+| `operator_settings.rs` | A tree volume's operator settings: `<state>/config`, its `include.path` lines written whole and read with libgit2 following them, and `classify`, the one table of keys tree volumes do not build yet (push, patches, LFS, other) |
 | `events.rs` | Alarm and event signals, handed to a non-blocking sink |
 | `failpoints.rs` | Named failpoints on the durable path, acting only in test builds with the `failpoints` feature ([crash model](#crash-model)) |
-| `telemetry.rs` | OpenTelemetry instruments and spans over the API only; the binary picks exporters |
+| `telemetry.rs` | OpenTelemetry instruments and spans over the API only, the `agentfs.not_built` gauge among them; the binary picks exporters |
 | `history_service/mod.rs` | One history service per volume fed by fronts |
 | `history_service/wire.rs` | The gRPC contract `agentfs.history.v2` (generated from `proto/`) and its validated conversions to agentfs types |
 | `history_service/bridge.rs` | Synchronous callers on a tokio runtime (Tokio's bridging pattern): multi-thread, or current-thread driven by its callers; for the client and the server |
@@ -227,7 +228,7 @@ missing from these tables or a row names a module that no longer exists;
 
 | Module | Role |
 |---|---|
-| `tree_view.rs` | The view host (`ViewHost`, the `Views` port): each view a FUSE mount on its client's session, opened without waiting for history and ended by a lazy unmount, with the take and metrics workers and `HostEvent`s to its owner; direct I/O, saved-reader snapshots, byte-call writes, FLUSH, FSYNC, FSYNCDIR and `O_SYNC` writes answered once durable, and the kernel's page fills, page writes and invalidations for shared mappings (rules ledger, R1.4) |
+| `tree_view.rs` | The view host (`ViewHost`, the `Views` port): each view a FUSE mount on its client's session, mounted as `agentfs:<volume>` and opened without waiting for history (stacked over a stale mount of its volume when asked, its stale layers detached when it ends), ended by a lazy unmount, with the take and metrics workers and `HostEvent`s to its owner; direct I/O, saved-reader snapshots, byte-call writes, FLUSH, FSYNC, FSYNCDIR and `O_SYNC` writes answered once durable, and the kernel's page fills, page writes and invalidations for shared mappings (rules ledger, R1.4) |
 | `tree_view/untracked.rs` | A view's untracked half: the inode table of area entries (`1<<62 \| n`, keyed by the backing file), attributes from `lstat`, and the passthrough calls on the tree's untracked area, never gated and never journaled |
 | `lib.rs` | Crate root and overview |
 | `ops.rs` | Every filesystem operation without the kernel, unit-tested against a real directory and state area |
@@ -247,7 +248,8 @@ missing from these tables or a row names a module that no longer exists;
 | `groups.rs` | fsync-class groups: holding writes while a group is captured, and scheduling captures |
 | `sweep.rs` | The periodic sweep: files held open, failed records, the fsync-class timer |
 | `privileges.rs` | What the daemon may do as the caller or as itself |
-| `mount.rs` | Layout checks, mounting (also stacked over a stale mount, for `--on-stale-mount recover`), unmounting, detaching stale layers, and the mount state at a path (mountinfo read through `agentfs_core::mountinfo`) |
+| `mount.rs` | Layout checks, mounting (also stacked over a stale mount, for `--on-stale-mount recover`) and unmounting |
+| `stale.rs` | Stale agentfs mounts, shared by `mount.rs` and `tree_view.rs`: the mount state at a path (mountinfo read through `agentfs_core::mountinfo`), the volume a source names, detaching stale layers, and stacking a new mount over a stale one |
 
 ### `agentfs`
 

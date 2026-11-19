@@ -283,9 +283,29 @@ could not repair (and where they are saved), and the count of swept and
 captured items. Committing and pushing the last records is the caller's: call
 `Service::shutdown` from the core layer after it.
 
-`mount_state(path)` tells `MountState::Live`, `Stale` (the daemon is gone),
-`NotMounted` or `Foreign` from `/proc/self/mountinfo` and a `statfs`. Nothing
-else is read: no state area, no lock. `detach(path)` clears a stale mount.
+### Stale mounts
+
+`agentfs_fuse::stale` holds what the recording mount and the tree view host
+share about mounts whose daemon died. An agentfs mount is a FUSE mount whose
+source starts `agentfs:`; `source_volume(source)` gives the volume it names
+(`agentfs:<volume>` or `agentfs:<volume>:<anything>`).
+
+- `mount_state(path)` tells `MountState::Live`, `Stale` (the daemon is gone),
+  `NotMounted` or `Foreign` from `/proc/self/mountinfo` and a `statfs`.
+  Nothing else is read: no state area, no lock.
+- `detach(path)` detaches whatever is mounted there lazily: `umount2` with
+  `MNT_DETACH` with the privilege to unmount, `fusermount3 -u -z` otherwise.
+- `detach_stale_layers(path, max)` detaches stale layers, topmost first, while
+  the topmost is stale, at most `max` (`STALE_LAYERS`, 16). `agentfs_layers`
+  counts the agentfs mounts at a path.
+- `prepare_stack_source(dir)` and `stack(dir, target)` stack a new mount over
+  a stale one. FUSE is mounted at a private empty directory, bind-mounted over
+  the stale mount, made shared so propagation carries it into every copy of
+  that mount (workload containers, subPath binds), and the private directory
+  is detached. Stacking needs `CAP_SYS_ADMIN`.
+
+`mount_state`, `detach`, `detach_stale_layers` and `agentfs_layers` are also
+re-exported at the crate root.
 
 ### Errors
 
@@ -680,17 +700,34 @@ use agentfs_fuse::tree_view::{HostEvent, ViewHost};
 // `sessions` holds the served volume; Clients bound `binding.session`.
 let notify = Arc::new(|event: HostEvent| { /* to the owner's thread */ });
 let mut host = ViewHost::new(sessions, &state, None, notify)?;
-let view = host.open(MountPoint(dir), binding, MountOptions { allow_other: true })?;
+let options = MountOptions { allow_other: true, over_stale: false };
+let view = host.open(MountPoint(dir), binding, options)?;
 // ... HostEvent::ViewEnded(view) once it is unmounted ...
 host.wait()?;
 ```
 
-`new` starts the take worker (one take at a time, off the actor's lock, woken
-by built and failed events) and, with a metrics output, the metrics worker.
-`open` checks the session is bound (`UnknownSession`), the mount point (an
-existing empty directory outside the state area, every open view and the
-metrics output: `MountFailed(EINVAL)`) and that the tree is among the actor's
-saved trees (`MountFailed(ENOENT)`): it never waits for history. The view
+`new` reads the volume's name and starts the take worker (one take at a time,
+off the actor's lock, woken by built and failed events) and, with a metrics
+output, the metrics worker. Each view mounts with the source
+`agentfs:<volume>` (`agentfs:<volume>:fork/<n>` for a fork's view) and the
+subtype `agentfs`, so `agentfs probe` and stale detection see it as an agentfs
+mount. `open` checks the session is bound (`UnknownSession`), then what is
+mounted at the mount point ([stale mounts](#stale-mounts)):
+
+- nothing: the mount point must be an existing empty directory outside the
+  state area, every open view and the metrics output (`MountFailed(EINVAL)`);
+- a stale mount of this volume with `MountOptions::over_stale`: the view is
+  stacked over it. FUSE is mounted at `<state>/stack/<view>`, bound over the
+  mount point, and the private mount detached; a failed stack (no
+  `CAP_SYS_ADMIN`: `EPERM`) unmounts it again and answers `MountFailed`. Once
+  the view ends, the stale layers under it are detached (logged as
+  `tree DetachedStale` or `tree DetachStaleFailed`);
+- a stale mount without `over_stale`, or one of another volume: `Stale`, with
+  its source, and nothing mounted;
+- a live mount or another filesystem: `MountFailed(EBUSY)`.
+
+It then checks that the tree is among the actor's saved trees
+(`MountFailed(ENOENT)`): it never waits for history. The view
 writes as the session's client and is mounted read-only for a read-only
 grant. It serves `lookup`, `readdir`, `create`, `mkdir`, `rmdir`, `unlink`,
 `rename`, `symlink` and `readlink` in any directory (inode 1 the root, every
@@ -709,7 +746,7 @@ the untracked area, and of a device answers `EPERM`; extended attributes are
 not served. `RENAME_NOREPLACE` is
 served; `RENAME_EXCHANGE` and `RENAME_WHITEOUT` answer `EINVAL`. A thread joins each view's
 session, then sends `HostEvent::ViewEnded`; `Landed` follows each landed take,
-after its pages were dropped. `close` is a lazy unmount (`fusermount3 -uz`),
+after its pages were dropped. `close` is a lazy unmount (`stale::detach`),
 idempotent. `wait`, after every view ended, joins the workers and fails when
 the actor stopped.
 

@@ -1546,3 +1546,21 @@ M3 residuals (each to become a bead; none blocks M7):
 6. **Untracked entry numbers are not bounded at allocation** (`tree_view/untracked.rs`, `Inodes::next`): past
    `1 << 62` lookups an entry's inode would leave its range. Unreachable (4.6e18 lookups); the bound would make it
    impossible by construction.
+
+## 2026-11-19, M7 S1 (library for launchers): where the brief was short
+
+1. **The stacking test cannot make its stale mount by aborting the connection in-process.** The brief's root-only
+   test aborts the first view's FUSE connection through `/sys/fs/fuse/connections/<dev>/abort` and opens a second
+   `ViewHost` on the same state. Neither holds: fuser's `Mount` drop (run when the view's session joins) reads the
+   aborted device's `POLLERR` as still mounted and unmounts the mount point, so no stale mount is left; and the first
+   host's actor keeps the state area's lock in that process, so a second `Recording::open` is `Busy`. Done instead:
+   `tree_view::tests::leave_stale_view` runs the view in a worker process (the test binary itself, by env var),
+   waits for its "ready" line (an event, not a timer) and kills it, which is the crash being recovered. The
+   assertions are the brief's.
+2. **`operator_settings`' module doc names docs/trees.md, "Operator settings"**, as the frozen page says, but that
+   section does not exist yet: docs/trees.md is S2's. S1 documents the API in docs/library/core.md ("Operator
+   settings"); S2 must add the docs/trees.md section the module doc names.
+3. **`write_includes` must run after `ensure`.** `tree_actor::inspect` calls a directory holding anything but
+   `lock` or the create marker, without `format`, `Other`: a `<state>/config` written before the create makes
+   `ensure` answer `OtherFormat`. S2's `init --include` writes the includes after `ensure` (the state area exists
+   then).

@@ -12,6 +12,17 @@ design was reviewed on 2026-10-12.
 
 ### Added
 
+- **Tree views: launcher support.** A new tree volume records its root
+  directory with the owner its launcher names (`VolumeSpec.root_owner`,
+  `UID:GID`), else the creating process's. A tree volume's operator settings
+  are `<state>/config`, git-config syntax, holding `include.path` lines that
+  libgit2 follows; every configured key tree volumes do not build yet (push,
+  patches, LFS, other) is classified, and the `agentfs.not_built` gauge counts
+  them by capability. Tree views mount as `agentfs:<volume>` with subtype
+  `agentfs`, so `probe` and stale detection see them, and a view can stack over
+  a stale mount of its volume left by a view host that died, detaching the
+  stale layers when it ends. The stale-mount helpers are one module,
+  `agentfs_fuse::stale`, shared with the recording mount.
 - **Tree views: operator rules and the untracked area.** A tree volume reads
   `history.git/info/exclude` and `history.git/info/attributes` when it opens.
   A new name they leave out (`-agentfs`, an `info/exclude` pattern), a `.git`

@@ -647,9 +647,14 @@ in the tree. See [recording](../recording.md) and [remotes](../remotes.md).
 
 `tree_actor::TreeActor` is a separate, smaller library: a git-backed volume
 whose saves are ordered by one actor. It is not the recorder above and does
-not share its state format. `TreeActor::create(root, identity, service)` makes a
+not share its state format. `TreeActor::create(root, identity, root_owner, service)` makes a
 volume with its identity (`agentfs_contracts::volume::VolumeIdentity`: a name
-and an id); `TreeActor::open(root, service)` recovers one and never creates
+and an id). Its Root commit records the root directory with mode 0755 and
+`root_owner` (an `agentfs_contracts::volume::Owner`, uid and gid, parsed from
+`UID:GID`), or the creating process's effective uid and gid when `None`.
+A launcher passes it as `VolumeSpec.root_owner`; `ensure` uses it only when it
+creates the volume and never compares it, since a found volume's root owner is
+content. `TreeActor::open(root, service)` recovers one and never creates
 (`Error::NotCreated`, `Error::Format` for another format). `service` is the pod
 context of the process that serves it, which its own commits carry. It holds
 an exclusive lease on its state area (`Error::Busy` if another process holds
@@ -674,6 +679,45 @@ the bytes as they were commits nothing. `Error::errno()` maps each error to the 
 with. The behaviour, the state format and the current limits are in
 [trees](../trees.md); the FUSE adapter is in the [filesystem
 layer](filesystem.md#tree-views).
+
+### Operator settings
+
+`operator_settings` reads and writes a tree volume's operator settings:
+`<state>/config` (`operator_settings::FILE`), in git-config syntax, holding the
+`include.path` lines a launcher writes (`agentfs init --include`). It is the
+launcher's file, apart from `history.git/config`, which the engine rewrites and
+its `git` children read.
+
+- `write_includes(state, includes)` makes `includes` exactly the file's
+  `include.path` lines. The file is written whole (a temporary file, fsync,
+  rename, a directory fsync) with mode 0600. Each include must be absolute
+  (`SettingsError::RelativeInclude`, nothing written).
+- `OperatorSettings::read(state)` reads the file with libgit2, which follows its
+  includes. A missing file is empty settings; a file or include that cannot be
+  read is `SettingsError::Read`. `includes()` gives the top-level includes as
+  written, and `missing_includes()` those that do not exist: git skips them
+  silently, so the launcher warns.
+- `not_built()` lists every configured key whose capability tree volumes do not
+  build yet, one per key, sorted. Each is a `NotBuilt { key, capability }`.
+  Nothing configured is silently ignored.
+
+`classify(key, value)` is the one table. It compares the key lower-cased, and
+the first match wins:
+
+| Key | Capability |
+|---|---|
+| `include.path`, `includeIf.<condition>.path` | none: structure |
+| `agentfs.nested` = `exclude` (any case) | none: tree volumes build it |
+| `agentfs.lfsThreshold`, `lfs.*`, `remote.<name>.lfsurl`, `remote.<name>.lfspushurl`, `remote.<name>.agentfsLfsCredentials`, `remote.<name>.agentfsMaxLfsObjectSize` | `Lfs` |
+| `agentfs.patch*`, `agentfsPusher.*` | `Patches` |
+| `remote.*`, `agentfs.pushInterval`, `agentfs.forkRefs`, `http.proxy` | `Push` |
+| anything else | `Other` |
+
+`Capability::as_str` names each (`push`, `patches`, `lfs`, `other`) and
+`Capability::meaning` says in one sentence what the volume does without it, for
+the boot log. `Telemetry::observe_not_built(&not_built)` registers the
+`agentfs.not_built` gauge: per capability, the number of settings configured
+and not built ([telemetry](../telemetry.md)).
 
 ### Directories, metadata, links and times
 
