@@ -691,7 +691,12 @@ among them, are ordinary content and decide nothing.
 **Rules decide only for new names**, as git's ignore rules apply only to
 untracked paths. A path the tree already records stays recorded, whatever
 `info/exclude` says; one `-agentfs` marks leaves history at the next open
-(below). A new name is placed by the first of these that matches:
+(below). The other way, a file already in the untracked area stays untracked
+when a rule is loosened (a pattern removed, an allowlist line such as
+`!/skills/` added): its later edits are not recorded. Each open names every
+such entry on stderr, `tree Unadopted: tree=<id> path=<path>: ...`; an
+untracked directory is named once, not walked. To record such a file, move it
+out of the mount and back in. A new name is placed by the first of these that matches:
 
 1. Its directory is untracked: everything under it is too.
 2. A `.git` component: a nested repository's own files.

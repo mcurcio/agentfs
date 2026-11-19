@@ -682,3 +682,45 @@ fn a_fork_dropped_before_any_build_loses_its_area_at_the_drop() {
     v.drop_fork(fork, |_| Ok(Vec::new())).unwrap();
     assert!(!forked.exists(), "removed as the drop returns");
 }
+
+/// Rules decide only for new names, in this direction too: an untracked
+/// file a looser rule would now record stays untracked, and the open names
+/// it. A nested repository's files, `.git` and an untracked directory's
+/// contents are not named.
+#[test]
+fn untracked_files_a_looser_rule_would_record_are_named_not_moved() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut v = ruled(tmp.path());
+    let w = writer("w");
+    v.mkdir(TreeId::Root, "repo", ATTRS, &w).unwrap();
+    v.mkdir(TreeId::Root, "notes", ATTRS, &w).unwrap();
+    let area = v.untracked_area(TreeId::Root).unwrap().path().to_path_buf();
+    fs::create_dir_all(area.join("repo/.git")).unwrap();
+    fs::write(area.join("repo/x.md"), b"nested").unwrap();
+    fs::create_dir_all(area.join("sessions/s")).unwrap();
+    fs::write(area.join("sessions/s/a.json"), b"{}").unwrap();
+    fs::create_dir(area.join("notes")).unwrap();
+    fs::write(area.join("notes/n.log"), b"log").unwrap();
+    fs::write(area.join("kept.log"), b"log").unwrap();
+    assert!(
+        v.unadopted().unwrap().is_empty(),
+        "the rules leave them all out"
+    );
+    drop(v);
+    // `*.log` and `/sessions/` are no longer excluded.
+    rules(tmp.path(), "", "*.db -agentfs\n");
+    let v = reopen(tmp.path());
+    assert_eq!(
+        v.unadopted().unwrap(),
+        [
+            (TreeId::Root, "kept.log".to_owned()),
+            (TreeId::Root, "notes/n.log".to_owned()),
+            (TreeId::Root, "sessions".to_owned()),
+        ]
+    );
+    assert!(matches!(
+        v.read(TreeId::Root, "kept.log"),
+        Err(Error::NotFound)
+    ));
+    assert!(area.join("kept.log").exists(), "still in the area");
+}

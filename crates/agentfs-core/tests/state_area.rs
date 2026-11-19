@@ -185,6 +185,25 @@ fn open_never_creates() {
     assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
 }
 
+/// A rule the volume does not build refuses `stage` with the rule itself,
+/// file and line, never as a durability failure.
+#[test]
+fn a_rule_not_built_refuses_stage_naming_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("state");
+    let at = PodContext::default();
+    volume(&root).ensure(spec("t"), &at, &root_cap()).unwrap();
+    let info = root.join("history.git/info");
+    fs::create_dir_all(&info).unwrap();
+    fs::write(info.join("attributes"), "*.db agentfs.group=x\n").unwrap();
+    assert_eq!(
+        volume(&root).stage(&at, &root_cap()),
+        Err(VolumeError::RulesRefused(
+            "info/attributes line 1: agentfs.group=x is not built for tree volumes".into()
+        ))
+    );
+}
+
 // Slice S6: the lifecycle.
 
 const WORKER: &str = "AGENTFS_STATE_AREA_WORKER";

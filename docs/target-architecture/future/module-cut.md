@@ -154,7 +154,7 @@ re-record, except where a row says the digest is re-baselined on purpose.
 **How each step runs.** Each step is its own session and its own PR to the repository's `main` branch, in this
 order. Step 3 is three PRs, 3a to 3c (guidance, owner, 2026-11-11: "2 PRs is fine"; then "New pr is fine"), and step 5
 is three, 5.1 to 5.3. Steps 5b, 5.1 to 5.3 and 6 are one PR instead (guidance, owner, 2026-11-13: "i only want one
-PR at the end"). Step 7 runs after the baseline of [one engine](one-engine.md), beside its M8:
+PR at the end"). Step 7 runs after the baseline of [one engine](one-engine.md), which follows its M8:
 
 1. **Architect.** It designs the step and probes its risky seams, before anyone implements it. Guidance, owner,
    2026-11-09: "I want each phase of the work to start with an architect".

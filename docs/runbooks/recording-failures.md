@@ -28,7 +28,7 @@ kubectl exec "$POD" -c agentfs -- agentfs status
 | `<n> path(s) could not be recorded ...` | the sidecar's log at stop | [4](#4-paths-a-mount-could-not-record-metarepairs) |
 | `journal corruption at byte <offset>`, or `<ref> names lost object <oid>`, opening a tree state area | `agentfs trees` | [5](#5-a-tree-state-area-that-refuses-to-open) |
 | `tree JournalTail: <n> bytes at <offset>` | a tree actor's stderr at open | [5](#5-a-tree-state-area-that-refuses-to-open) |
-| `tree RulesRefused: info/attributes line <n>: <attribute> ...` | a tree actor's stderr at open; `trees mount` exits 1 | [5](#5-a-tree-state-area-that-refuses-to-open) |
+| `the operator's rules refuse the volume: info/attributes line <n>: <attribute> ...` | `trees mount`'s error at start (exit 1) | [5](#5-a-tree-state-area-that-refuses-to-open) |
 | `tree HistoryBuildFailed: <error>`, or a tree view's metrics with `history.health` `failed` or an `oldest_unbuilt_ns` that keeps growing | a tree actor's stderr; `--metrics-output` | [6](#6-a-tree-volumes-history-is-not-built) |
 | `trees mount` exits 75 or 1 at start, or does not exit after SIGTERM | `agentfs trees` | [7](#7-a-tree-mount-that-will-not-start-or-stop) |
 
@@ -209,8 +209,8 @@ directory after a new segment) failed and the actor stopped: every later call
 answers `EIO`. Fix the disk or space problem, then restart; recovery reads every
 frame still in the segments.
 
-A `tree RulesRefused: info/attributes line <n>: <attribute> is not built for tree
-volumes` line means the operator's rules hold a rule tree volumes do not build: any
+An error `the operator's rules refuse the volume: info/attributes line <n>:
+<attribute> is not built for tree volumes` means the operator's rules hold a rule tree volumes do not build: any
 `agentfs.<name>` attribute, `filter=lfs`, or `agentfs=<value>`
 ([trees](../trees.md#rules-and-the-untracked-area)). The volume was refused before
 anything was written, so its state is as it was. Edit

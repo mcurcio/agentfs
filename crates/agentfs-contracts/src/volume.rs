@@ -152,6 +152,11 @@ pub enum VolumeError {
     Busy,
     #[error("the volume's state could not be made durable: {0:?}")]
     NotDurable(IoKind),
+    /// The operator's rules hold one the volume does not build: refused
+    /// before anything was written. Carries the refusal, naming the file and
+    /// line.
+    #[error("the operator's rules refuse the volume: {0}")]
+    RulesRefused(String),
     /// The tree actor stopped after a recording failure, or its state is
     /// damaged, or the volume is not served: nothing more is recorded until it
     /// is reopened.

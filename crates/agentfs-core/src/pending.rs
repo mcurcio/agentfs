@@ -238,12 +238,10 @@ pub(crate) fn copy_into(src: &Path, dst: &Path) -> io::Result<FreezeMethod> {
         .create_new(true)
         .mode(0o600)
         .open(dst)?;
-    let method = match rustix::fs::ioctl_ficlone(&to, &from) {
-        Ok(()) => FreezeMethod::Reflink,
-        Err(_) => {
-            io::copy(&mut &from, &mut &to)?;
-            FreezeMethod::Copy
-        }
+    let method = if crate::fsutil::clone_or_copy(&from, &to)? {
+        FreezeMethod::Reflink
+    } else {
+        FreezeMethod::Copy
     };
     to.sync_all()?;
     Ok(method)

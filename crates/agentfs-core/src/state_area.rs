@@ -55,6 +55,7 @@ fn volume_error(error: &tree_actor::Error) -> VolumeError {
         tree_actor::Error::Busy => VolumeError::Busy,
         tree_actor::Error::NotCreated => VolumeError::NotCreated,
         tree_actor::Error::Format => VolumeError::OtherFormat,
+        tree_actor::Error::Rules(refusal) => VolumeError::RulesRefused(refusal.to_string()),
         other => VolumeError::NotDurable(io_kind(other)),
     }
 }

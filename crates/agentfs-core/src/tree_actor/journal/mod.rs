@@ -42,6 +42,7 @@ pub(super) mod durable;
 mod fold;
 pub(super) mod segment;
 
+use crate::fsutil::sync_dir;
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -782,10 +783,6 @@ pub(super) fn frame_at(
         len: header.tail as u64,
     };
     Ok(At::Frame(Box::new((record, tail)), header.frame_len()))
-}
-
-fn sync_dir(dir: &Path) -> io::Result<()> {
-    File::open(dir)?.sync_all()
 }
 
 fn sync_parent(path: &Path) -> io::Result<()> {

@@ -184,7 +184,7 @@ missing from these tables or a row names a module that no longer exists;
 | `mountinfo.rs` | The one parser of `/proc/self/mountinfo`: device, root, mount point, fstype, source and super options of each mount, and the mount holding a path |
 | `local_socket.rs` | Unix sockets in the state area with peer-credential checks, for the control socket and the history service |
 | `listening_socket.rs` | `Listener`, the one way agentfs listens on a Unix socket (control socket, history service, agentfs-csi), shut down (`SHUT_RDWR`) when stopped or dropped so a child process still sharing it cannot take connections no one answers; `clippy.toml` disallows raw listener construction elsewhere |
-| `fsutil.rs` | Small helpers for the state files under `<state>/meta` |
+| `fsutil.rs` | Small filesystem helpers: atomic JSON state files under `<state>/meta`, fsyncing a directory, making directories durably, and a file's bytes reflinked or copied, shared by the recording engine and the tree engine |
 | `config.rs` | Operator settings from the history repository's own git config, and `config::KEYS` |
 | `events.rs` | Alarm and event signals, handed to a non-blocking sink |
 | `failpoints.rs` | Named failpoints on the durable path, acting only in test builds with the `failpoints` feature ([crash model](#crash-model)) |

@@ -41,6 +41,7 @@ use git2::Oid;
 use serde::Serialize;
 
 use crate::file_lock::{FileLock, Mode};
+use crate::fsutil::sync_dir;
 pub use agentfs_contracts::{NotATree, TreeId};
 pub use call_path::{Progress, Recording, Then};
 use history::builder::{BuildState, Builder, JournalReader, copy_all};
@@ -426,10 +427,6 @@ fn lock_area(root: &Path) -> Result<Arc<FileLock>> {
     Ok(Arc::new(
         FileLock::try_take(&root.join(LOCK), Mode::Exclusive)?.ok_or(Error::Busy)?,
     ))
-}
-
-fn sync_dir(root: &Path) -> io::Result<()> {
-    File::open(root)?.sync_all()
 }
 
 /// Writes `bytes` to `name` whole: a temporary file, fsynced, renamed into place.
@@ -873,15 +870,8 @@ impl TreeActor {
         service: PodContext,
     ) -> Result<Self> {
         // Before anything is written: a rule that is not built refuses the
-        // volume, said here in full since a caller's port may carry only its
-        // errno.
-        let rules = match read_rules(&root) {
-            Ok(rules) => Arc::new(rules),
-            Err(e) => {
-                eprintln!("tree RulesRefused: {e}");
-                return Err(e);
-            }
-        };
+        // volume (`Error::Rules`, carried by Volume as `RulesRefused`).
+        let rules = Arc::new(read_rules(&root)?);
         let (built_log, entries) = BuiltLog::open(&root.join(BUILT_LOG))?;
         let (journal, frames) =
             Journal::open(&root.join(JOURNAL), built_log::built_through(&entries))?;
@@ -967,6 +957,12 @@ impl TreeActor {
         }
         // Tracked paths the rules now never record leave history.
         volume.untrack_never_recorded()?;
+        // Untracked paths the rules would now record stay untracked, said.
+        for (tree, path) in volume.unadopted()? {
+            eprintln!(
+                "tree Unadopted: tree={tree} path={path}: the rules would record a new name here; this existing file stays untracked"
+            );
+        }
         volume.metrics.queued = volume.pointers.under(refs::QUEUES).len() as u64;
         // A journal whose steps are all built compacts at once; otherwise at
         // the first record after the builder catches up. Open never waits.

@@ -28,6 +28,7 @@ use rustix::fs::{AtFlags, FileType, Mode, OFlags, Stat, Timestamps};
 use super::TreeId;
 use super::meta::{Kind, Meta};
 use crate::confined;
+use crate::fsutil::{self, create_dir_durably, sync_dir};
 
 /// The state area's directory of untracked areas.
 pub(in crate::tree_actor) const UNTRACKED: &str = "untracked";
@@ -349,6 +350,17 @@ impl Areas {
         self.root.join(tree.to_string())
     }
 
+    /// `tree`'s area if it has one, never made.
+    pub(in crate::tree_actor) fn existing(
+        &self,
+        tree: TreeId,
+    ) -> io::Result<Option<UntrackedArea>> {
+        if !self.path(tree).is_dir() {
+            return Ok(None);
+        }
+        self.open(tree).map(Some)
+    }
+
     /// `tree`'s area, made (mode 0700) if it has none.
     pub(in crate::tree_actor) fn open(&self, tree: TreeId) -> io::Result<UntrackedArea> {
         let path = self.path(tree);
@@ -451,31 +463,6 @@ pub(in crate::tree_actor) fn remove_all(path: &Path) -> io::Result<()> {
     }
 }
 
-fn sync_dir(dir: &Path) -> io::Result<()> {
-    std::fs::File::open(dir)?.sync_all()
-}
-
-/// Makes `dir` and its missing parents (each mode 0700), and fsyncs the
-/// parent of each one made, so their names survive a power cut.
-fn create_dir_durably(dir: &Path) -> io::Result<()> {
-    let mut missing = Vec::new();
-    let mut at = dir;
-    while !at.exists() {
-        missing.push(at);
-        match at.parent() {
-            Some(parent) => at = parent,
-            None => break,
-        }
-    }
-    fs_create_dir(dir)?;
-    for made in missing.iter().rev() {
-        if let Some(parent) = made.parent() {
-            sync_dir(parent)?;
-        }
-    }
-    Ok(())
-}
-
 /// Copies the tree under `source` to the new directory `target`: each
 /// directory, file and link with its mode, owner (when this process may give
 /// files away) and times; each file reflinked where the filesystem can,
@@ -545,10 +532,7 @@ fn copy_tree(source: &confined::Dir, target: &Path) -> io::Result<()> {
                             | OFlags::CLOEXEC,
                         Mode::from_raw_mode(0o600),
                     )?;
-                    if rustix::fs::ioctl_ficlone(&dst, &src).is_err() {
-                        let mut dst = std::fs::File::from(dst.try_clone()?);
-                        io::copy(&mut std::fs::File::from(src), &mut dst)?;
-                    }
+                    fsutil::clone_or_copy(&src, &dst)?;
                     set_meta(&dst, &st, chown)?;
                     rustix::fs::fsync(&dst)?;
                     crate::failpoints::hit("tree.fork_copy_file")?;

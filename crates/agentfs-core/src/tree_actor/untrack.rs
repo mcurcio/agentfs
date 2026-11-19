@@ -9,8 +9,15 @@
 //! leaves the path tracked with a copy in the area; the next open places it
 //! again, replacing that copy, and records the unlink. Directories stay
 //! tracked: they are the containers of what is under them.
+//!
+//! The other way is not taken: an untracked file the rules would record if
+//! it were new stays untracked (rules decide only for new names). The open
+//! names each such path on stderr ([`TreeActor::unadopted`]), so a looser
+//! rule that changes nothing for existing files is never silent.
 
-use super::{Error, Result, TreeActor, TreeId};
+use super::untracked::UntrackedArea;
+use super::{Error, Kind, Result, TreeActor, TreeId};
+use rustix::fs::FileType;
 
 impl TreeActor {
     /// Moves every tracked file or link the rules never record into its
@@ -52,6 +59,66 @@ impl TreeActor {
                     "tree Untracked: tree={tree} path={path}: {}",
                     agentfs_rules::Untracked::NeverRecord
                 );
+            }
+        }
+        Ok(())
+    }
+
+    /// Every untracked entry the rules would place in the tree were it new,
+    /// by tree: a file, link or directory in a tree's untracked area that no
+    /// tracked entry hides and that no rule now leaves out. Directories the
+    /// area holds as containers of tracked ones are walked; an untracked
+    /// directory is judged as one entry, not walked.
+    ///
+    /// # Errors
+    ///
+    /// A failed read of an area.
+    pub fn unadopted(&self) -> Result<Vec<(TreeId, String)>> {
+        let mut found = Vec::new();
+        for &tree in self.trees.keys() {
+            let Some(area) = self.areas.existing(tree)? else {
+                continue;
+            };
+            self.unadopted_in(tree, &area, "", false, &mut found)?;
+        }
+        Ok(found)
+    }
+
+    fn unadopted_in(
+        &self,
+        tree: TreeId,
+        area: &UntrackedArea,
+        dir: &str,
+        inside_repository: bool,
+        found: &mut Vec<(TreeId, String)>,
+    ) -> Result<()> {
+        let t = self.tree(tree)?;
+        for (name, kind) in area.entries(dir)? {
+            let path = if dir.is_empty() {
+                name
+            } else {
+                format!("{dir}/{name}")
+            };
+            if let Some(tracked) = t.kind_at(&path) {
+                if tracked == Kind::Dir && kind == FileType::Directory {
+                    let inside = inside_repository || area.stat(&format!("{path}/.git"))?.is_some();
+                    self.unadopted_in(tree, area, &path, inside, found)?;
+                }
+                continue;
+            }
+            let kind = match kind {
+                FileType::Directory => agentfs_rules::NewKind::Dir,
+                FileType::Symlink => agentfs_rules::NewKind::Symlink,
+                FileType::RegularFile => agentfs_rules::NewKind::File,
+                // FIFOs, sockets and devices are untracked whatever the rules say.
+                _ => continue,
+            };
+            let facts = agentfs_rules::PathFacts {
+                parent_untracked: false,
+                inside_repository,
+            };
+            if self.rules.place(&path, kind, facts) == agentfs_rules::Placement::Tracked {
+                found.push((tree, path));
             }
         }
         Ok(())
