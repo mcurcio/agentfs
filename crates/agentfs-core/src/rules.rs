@@ -179,13 +179,8 @@ pub enum Decision {
     Skip(SkipReason),
 }
 
-/// An attribute's state for a path.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum AttrState {
-    Set,
-    Unset,
-    Value(String),
-}
+/// An attribute's state for a path: the Rules domain's, its one home.
+pub use agentfs_rules::AttrState;
 
 /// The attributes that apply to a path, by name. Unspecified attributes are
 /// absent.
@@ -232,9 +227,8 @@ pub fn is_agentfs_attr(name: &str) -> bool {
 pub struct Rules {
     tree: PathBuf,
     options: RuleOptions,
-    operator_ignore: gix_ignore::Search,
-    operator_attrs: gix_attributes::Search,
-    operator_macros: MetadataCollection,
+    /// `info/exclude` and `info/attributes`, matched by the Rules domain.
+    operator: agentfs_rules::OperatorRules,
     /// Whether any operator line mentions `agentfs.commit=fsync`, so callers
     /// can skip class lookups on volumes without databases.
     fsync_class: bool,
@@ -262,29 +256,10 @@ impl Rules {
         info_exclude: &[u8],
         info_attributes: &[u8],
     ) -> Self {
-        let mut operator_ignore = gix_ignore::Search::default();
-        // With no root the list has no base: patterns are relative to the
-        // root of the tree, as info/exclude's are in git.
-        operator_ignore
-            .add_patterns_buffer(info_exclude, "info/exclude", None, Ignore::default())
-            .expect("a list without a root has no base to convert");
-        let mut operator_macros = MetadataCollection::default();
-        let mut operator_attrs = gix_attributes::Search::default();
-        operator_attrs
-            .add_patterns_buffer(
-                info_attributes,
-                "info/attributes".into(),
-                None,
-                &mut operator_macros,
-                true,
-            )
-            .expect("a list without a root has no base to convert");
         Self {
             tree: tree.into(),
             options,
-            operator_ignore,
-            operator_attrs,
-            operator_macros,
+            operator: agentfs_rules::OperatorRules::parse(info_exclude, info_attributes),
             fsync_class: info_attributes
                 .windows(FSYNC_LINE.len())
                 .any(|w| w == FSYNC_LINE),
@@ -447,15 +422,12 @@ impl Rules {
             }
             let rela = prefix.as_bytes().as_bstr();
 
-            if let Some(m) = self.operator_ignore.pattern_matching_relative_path(
-                rela,
-                Some(is_dir),
-                Case::Sensitive,
-            ) && !m.pattern.is_negative()
-            {
+            // Every directory above `prefix` was checked on the way down and
+            // matched nothing, so the domain's answer is `prefix`'s own.
+            if let Some(pattern) = self.operator.ignored(&prefix, is_dir) {
                 return Ok(Some(SkipReason::Ignored {
                     source: RuleSource::OperatorExclude,
-                    pattern: m.pattern.to_string(),
+                    pattern,
                 }));
             }
             if let Some(search) = tree_search.as_mut() {
@@ -533,7 +505,7 @@ impl Rules {
     }
 
     fn operator_attributes(&self, path: &RepoPath) -> RawAttrs {
-        collect_attrs(&self.operator_attrs, &self.operator_macros, path)
+        self.operator.attributes(path.as_str())
     }
 
     /// Attributes from `.gitattributes` in the root and every ancestor

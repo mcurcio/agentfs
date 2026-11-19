@@ -628,6 +628,13 @@ impl Shape {
                 None => Err(Error::NotFound),
             },
             Change::SetTimes { path, .. } => self.kind_at(path).map(drop).ok_or(Error::NotFound),
+            Change::Replace { path, meta, .. } => match self.kind_at(path) {
+                _ if meta.kind != Kind::File => Err(Error::Format),
+                Some(Kind::File) => Ok(()),
+                Some(Kind::Dir) => Err(Error::IsADirectory),
+                Some(Kind::Symlink) => Err(Error::Invalid),
+                None => self.check_parent(path),
+            },
             Change::Save { .. }
             | Change::Fork { .. }
             | Change::Rows
@@ -831,6 +838,25 @@ impl Shape {
                 times.changed(at_ns);
             }
             Change::Take { take, .. } => self.take(take, step, at_ns, &mut keys)?,
+            // A save of the file there, with its new metadata; for a new
+            // path, a create and then a save.
+            Change::Replace { path, meta, .. } => {
+                let object = match self.names.get(path).copied() {
+                    Some(object) => {
+                        self.meta.insert(object, *meta);
+                        object
+                    }
+                    None => {
+                        let object = step.object();
+                        self.add_named(path, object, *meta, at_ns);
+                        object
+                    }
+                };
+                if let Some(times) = self.times.get_mut(&object) {
+                    times.modified(at_ns);
+                }
+                self.keys_of(object, &mut keys);
+            }
             Change::Save { .. } | Change::Fork { .. } | Change::Rows | Change::Drop { .. } => {}
         }
         Ok(keys)

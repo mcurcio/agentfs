@@ -295,6 +295,20 @@ impl SessionGuard<'_> {
         self.actor.rename(self.tree, from, to, mode, by)
     }
 
+    /// A whole-file replace of `path` with the `len` bytes of `src`
+    /// ([`TreeActor::replace_file`]).
+    pub fn replace_file(
+        &mut self,
+        path: &str,
+        attrs: Attrs,
+        src: &mut dyn std::io::Read,
+        len: u64,
+    ) -> Result<Saved> {
+        let by = self.writes_as.as_ref().ok_or(Error::ReadOnly)?;
+        self.actor
+            .replace_file(self.tree, path, attrs, src, len, by)
+    }
+
     pub fn unlink(&mut self, path: &str) -> Result<()> {
         let by = self.writes_as.as_ref().ok_or(Error::ReadOnly)?;
         self.actor.unlink(self.tree, path, by)

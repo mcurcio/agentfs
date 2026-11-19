@@ -44,6 +44,8 @@ pub const POINTS: &[&str] = &[
     "tree.segment_after_create",
     "tree.wal_after_fsync",
     "tree.before_step",
+    "tree.replace_before_step",
+    "tree.untrack_after_place",
     "tree.compact_before_checkpoint",
     "tree.compact_before_fsync",
     "tree.compact_before_drop",

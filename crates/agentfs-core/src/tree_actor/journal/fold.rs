@@ -11,7 +11,7 @@ use super::durable::RecordNo;
 use super::segment::FramePos;
 use super::{
     Change, Entry, Frame, OpenRecord, Record, RunHead, SaveOutcome, Tail, Target, TreeLocals,
-    take_chunks,
+    chunk_map, take_chunks,
 };
 use crate::tree_actor::history::Objects;
 use crate::tree_actor::history::upstreams::Upstreams;
@@ -76,7 +76,8 @@ pub(in crate::tree_actor) struct Folded {
     pub(in crate::tree_actor) page_writes: BTreeMap<(TreeId, u64), Vec<(u64, pages::Run)>>,
     /// The last step that closed a write-open of a file, while one lives.
     pub(in crate::tree_actor) saved_through: BTreeMap<(TreeId, u64), u64>,
-    /// The chunk records no take step has taken yet ([`super::take_chunks`]).
+    /// The chunk records no take or replace step has taken yet
+    /// ([`super::take_chunks`]).
     pub(in crate::tree_actor) bytes: Vec<(u64, Tail)>,
 }
 
@@ -125,6 +126,7 @@ impl Folded {
             Change::Rename { .. }
             | Change::Unlink { .. }
             | Change::Take { .. }
+            | Change::Replace { .. }
             | Change::Rows
             | Change::Mkdir { .. }
             | Change::Rmdir { .. }
@@ -161,7 +163,7 @@ pub(in crate::tree_actor) struct Replay {
     pages: BTreeMap<(TreeId, u64), Vec<(u64, pages::Run)>>,
     /// False: shapes only, each save's map left as it was.
     maps: bool,
-    /// Chunk records no take has taken yet.
+    /// Chunk records no take or replace has taken yet.
     bytes: Vec<(u64, Tail)>,
 }
 
@@ -350,6 +352,26 @@ impl Replay {
                     t.bytes.insert(object, map);
                 }
             }
+            Change::Replace {
+                tree,
+                path,
+                len,
+                chunks,
+                ..
+            } => {
+                let chunks = take_chunks(&mut self.bytes, seq, *chunks)?;
+                let map = if self.maps {
+                    Some(chunk_map(&chunks, *len, RecordNo::new(seq))?)
+                } else {
+                    None
+                };
+                let (_, t) = self.tree(tree)?;
+                let object = t.names.get(path).copied().unwrap_or(event.object());
+                t.shape.apply(change, event, at_ns)?;
+                if let Some(map) = map {
+                    t.bytes.insert(object, map);
+                }
+            }
         }
         Ok(())
     }
@@ -508,7 +530,7 @@ pub(in crate::tree_actor) fn fold(frames: &[Frame]) -> Result<Folded> {
                 folded.pointers.check_targets(pointers)?;
                 folded.pointers.apply_targets(pointers);
                 folded.add_step(seq, by, change)?;
-                if matches!(change, Change::Take { .. }) {
+                if matches!(change, Change::Take { .. } | Change::Replace { .. }) {
                     folded.bytes.clear();
                 }
             }

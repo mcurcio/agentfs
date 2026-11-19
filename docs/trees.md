@@ -687,8 +687,9 @@ among them, are ordinary content and decide nothing.
 ```
 
 **Rules decide only for new names**, as git's ignore rules apply only to
-untracked paths. A path the tree already records stays recorded, whatever the
-rules say. A new name is placed by the first of these that matches:
+untracked paths. A path the tree already records stays recorded, whatever
+`info/exclude` says; one `-agentfs` marks leaves history at the next open
+(below). A new name is placed by the first of these that matches:
 
 1. Its directory is untracked: everything under it is too.
 2. A `.git` component: a nested repository's own files.
@@ -704,6 +705,20 @@ Anything else is recorded. A rule tree volumes do not build refuses the
 volume when it opens, naming the line, before anything is written: any
 `agentfs.<name>` attribute, `filter=lfs`, and `agentfs=<value>`. Other git
 attributes are accepted and change nothing.
+
+**A tracked path marked `-agentfs` leaves history when the volume opens**, as
+`git rm --cached` takes a file out of the index and leaves it in place. For each
+tracked file or link of each tree that `-agentfs` now marks, the open first
+places its saved bytes, mode and owner in the tree's untracked area (its
+directories as containers with their own mode and owner), then records its
+unlink as writer `agentfs`: one `Unlink by agentfs` commit per path, and one
+stderr line, `tree Untracked: tree=<id> path=<path>: marked -agentfs in
+info/attributes`. The file reads back as before, now untracked. A crash between
+the two steps leaves the path tracked with a copy in the area; the next open
+places it again and records the unlink. Its earlier commits stay in history:
+rewriting them is a manual procedure
+([runbooks/history-rewrite.md](runbooks/history-rewrite.md)). Directories stay
+tracked.
 
 **What untracked means.** An untracked file is an ordinary Linux file: a write
 is seen at once by every reader, shared mappings stay coherent, `fsync` makes it

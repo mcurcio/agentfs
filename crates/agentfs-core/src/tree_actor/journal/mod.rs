@@ -172,8 +172,10 @@ pub(super) enum Entry {
         object: u64,
         runs: Vec<RunHead>,
     },
-    /// Part of the bytes of the take step that follows ([`TakeRecord::chunks`]),
-    /// in its tail.
+    /// Part of the bytes of the take or replace step that follows
+    /// ([`TakeRecord::chunks`], [`Change::Replace`]), in its tail. Chunk
+    /// records no step follows (a replace cut short, or one that changed
+    /// nothing) are never read.
     Bytes,
     /// A step: the change itself, the commit point of it, and the pointer
     /// changes its build publishes. The builder makes its commits later:
@@ -287,6 +289,18 @@ pub(super) enum Change {
         tree: String,
         take: Box<TakeRecord>,
     },
+    /// A whole-file replace: afterwards `path` holds the `len` bytes in the
+    /// tails of the `chunks` [`Entry::Bytes`] records just before it, with
+    /// `meta`. A file there keeps its object and identity, as a save; a
+    /// missing one is created at this record's number, as a create and a
+    /// save.
+    Replace {
+        tree: String,
+        path: String,
+        meta: Meta,
+        len: u64,
+        chunks: u64,
+    },
 }
 
 /// What one step adds to a commit besides its files' bytes: a commit, its
@@ -317,6 +331,7 @@ impl Change {
             | Self::Rename { tree, .. }
             | Self::Unlink { tree, .. } => (tree, 0),
             Self::Take { tree, take } => (tree, take.lens.iter().sum()),
+            Self::Replace { tree, len, .. } => (tree, *len),
             Self::Save { tree, outcome, .. } => match outcome {
                 SaveOutcome::Saved { len, .. } => (tree, *len),
                 _ => (tree, 0),
@@ -380,39 +395,14 @@ impl TakeRecord {
     /// length than its files.
     pub fn maps(&self, chunks: &[Tail], seq: RecordNo) -> Result<Vec<(u64, FileMap)>> {
         let left: Vec<_> = self.files.iter().filter_map(|(_, f)| f.as_ref()).collect();
-        let total: u64 = chunks.iter().map(|c| c.len).sum();
-        if chunks.len() as u64 != self.chunks
-            || left.len() != self.lens.len()
-            || total != self.lens.iter().sum::<u64>()
-        {
+        if chunks.len() as u64 != self.chunks || left.len() != self.lens.len() {
             return Err(Error::Format);
         }
-        let mut chunks = chunks.iter();
-        let mut at: Option<(&Tail, u64)> = None;
-        let mut maps = Vec::with_capacity(left.len());
-        for (file, len) in left.iter().zip(&self.lens) {
-            let mut map = FileMap::empty();
-            let mut done = 0;
-            while done < *len {
-                let (chunk, offset) = match at {
-                    Some(place) if place.1 < place.0.len => place,
-                    _ => (chunks.next().ok_or(Error::Format)?, 0),
-                };
-                let n = (len - done).min(chunk.len - offset);
-                map.apply(
-                    &Call::Write {
-                        offset: done,
-                        len: n,
-                    },
-                    &chunk.pos.at(offset),
-                )?;
-                done += n;
-                at = Some((chunk, offset + n));
-            }
-            map.saved_at(seq);
-            maps.push((file.object, map));
-        }
-        Ok(maps)
+        Ok(left
+            .iter()
+            .map(|file| file.object)
+            .zip(chunk_maps(chunks, &self.lens, seq)?)
+            .collect())
     }
 
     /// How many chunk records `total` bytes take.
@@ -421,13 +411,64 @@ impl TakeRecord {
     }
 }
 
-/// The most bytes one [`Entry::Bytes`] record holds: a take's files of any size
-/// are recorded in frames well under a segment.
+/// The files laid end to end in `chunks` (the tails of [`Entry::Bytes`]
+/// records), `lens` long each, as saved maps of step `seq` reading their
+/// bytes there: a take's files and a replace's one file.
+///
+/// # Errors
+///
+/// [`Error::Format`] when the chunks hold another length than the files.
+pub(super) fn chunk_maps(chunks: &[Tail], lens: &[u64], seq: RecordNo) -> Result<Vec<FileMap>> {
+    let total: u64 = chunks.iter().map(|c| c.len).sum();
+    if total != lens.iter().sum::<u64>() {
+        return Err(Error::Format);
+    }
+    let mut chunks = chunks.iter();
+    let mut at: Option<(&Tail, u64)> = None;
+    let mut maps = Vec::with_capacity(lens.len());
+    for len in lens {
+        let mut map = FileMap::empty();
+        let mut done = 0;
+        while done < *len {
+            let (chunk, offset) = match at {
+                Some(place) if place.1 < place.0.len => place,
+                _ => (chunks.next().ok_or(Error::Format)?, 0),
+            };
+            let n = (len - done).min(chunk.len - offset);
+            map.apply(
+                &Call::Write {
+                    offset: done,
+                    len: n,
+                },
+                &chunk.pos.at(offset),
+            )?;
+            done += n;
+            at = Some((chunk, offset + n));
+        }
+        map.saved_at(seq);
+        maps.push(map);
+    }
+    Ok(maps)
+}
+
+/// A replace step's file: its `len` bytes in `chunks`, as the saved map of
+/// step `seq`.
+///
+/// # Errors
+///
+/// [`Error::Format`] when the chunks hold another length.
+pub(super) fn chunk_map(chunks: &[Tail], len: u64, seq: RecordNo) -> Result<FileMap> {
+    chunk_maps(chunks, &[len], seq)?.pop().ok_or(Error::Format)
+}
+
+/// The most bytes one [`Entry::Bytes`] record holds: a take's or replace's
+/// files of any size are recorded in frames well under a segment.
 pub(super) const TAKE_CHUNK: u64 = 16 << 20;
 
-/// A take step's chunks: the tails of the `n` [`Entry::Bytes`] records just
-/// before step `seq`, taken from `pending` (every such record not yet taken, in
-/// order); every pending one before it goes too, being a cut-short take's.
+/// A take's or replace's chunks: the tails of the `n` [`Entry::Bytes`] records
+/// just before step `seq`, taken from `pending` (every such record not yet
+/// taken, in order); every pending one before it goes too, being a cut-short
+/// step's.
 ///
 /// # Errors
 ///

@@ -32,7 +32,7 @@ use crate::tree_actor::journal::durable::{Durability, RecordNo};
 use crate::tree_actor::journal::segment::{FramePos, Relocations, Segment};
 use crate::tree_actor::journal::{
     At, Change, Entry, Frame, Record, RowRecord, SaveOutcome, Tail, TakeHead, TakeRecord, Target,
-    frame_at, link_map, runs_from_frame, take_chunks,
+    chunk_map, frame_at, link_map, runs_from_frame, take_chunks,
 };
 use crate::tree_actor::pointers::Pointers;
 use crate::tree_actor::queue::Key;
@@ -671,18 +671,12 @@ impl BuildState {
                         if map.len() != *len || map.digest(&own_keys(&calls)) != *digest {
                             return Err(disagrees(seq));
                         }
-                        let mut versions = Versions::of(event);
                         let base = t.bytes.get(&open.object).ok_or_else(|| disagrees(seq))?;
                         let old = t.lines.get(&open.object).ok_or_else(|| disagrees(seq))?;
-                        let lines = if calls
+                        let appended = calls
                             .iter()
-                            .all(|(call, _)| matches!(call, Call::Append { .. }))
-                        {
-                            let added = Window::new(&map, base.len(), map.len() - base.len());
-                            old.append(&added, |n| versions.take(n))?
-                        } else {
-                            align(ctx.root, old, base, &map, &mut versions)?
-                        };
+                            .all(|(call, _)| matches!(call, Call::Append { .. }));
+                        let lines = saved_lines(ctx.root, old, base, &map, appended, event)?;
                         t.lines.insert(open.object, Arc::new(lines));
                         t.bytes.insert(open.object, saved_map(map, seq));
                         batch.files.insert((id, open.object));
@@ -801,6 +795,52 @@ impl BuildState {
                 let id = tree.parse::<TreeId>()?;
                 head = self.take(id, seq, take, change, ctx, record.at_ns, batch)?;
                 batch.moved.insert(id);
+            }
+            // A save of the file there, or a create and a save: built as both.
+            Change::Replace {
+                tree,
+                path,
+                len,
+                chunks,
+                ..
+            } => {
+                let id = tree.parse::<TreeId>()?;
+                let chunks = take_chunks(&mut self.bytes, seq, *chunks)?;
+                let map = chunk_map(&chunks, *len, record.seq)?;
+                let t = self.tree_mut(id)?;
+                let existing = t.names.get(path).copied();
+                let keys = t.shape.apply(change, event, at_ns)?;
+                let object = existing.unwrap_or(event.object());
+                let lines = match existing {
+                    Some(object) => saved_lines(
+                        ctx.root,
+                        t.lines.get(&object).ok_or_else(|| disagrees(seq))?,
+                        t.bytes.get(&object).ok_or_else(|| disagrees(seq))?,
+                        &map,
+                        false,
+                        event,
+                    )?,
+                    None => {
+                        let identity = *t.identities.get(&object).ok_or(Error::Format)?;
+                        t.namespace
+                            .insert(identity, NameHistory::created(event, path.clone()));
+                        batch.moved.insert(id);
+                        saved_lines(
+                            ctx.root,
+                            &Lines::default(),
+                            &FileMap::empty(),
+                            &map,
+                            false,
+                            event,
+                        )?
+                    }
+                };
+                t.lines.insert(object, Arc::new(lines));
+                t.bytes.insert(object, Arc::new(map.into()));
+                batch.files.insert((id, object));
+                let message = direct(Action::Direct, id, None)?;
+                head = Some(self.commit_direct(id, &keys, &message, at_ns, batch)?);
+                owner = true;
             }
             Change::Rows => {}
             Change::Drop { fork } => {
@@ -1087,6 +1127,26 @@ fn align(
         written
     };
     Ok(old.align(before, after, diff, |n| versions.take(n))?)
+}
+
+/// The line map a save of step `event` leaves: `after`'s bytes over `old`,
+/// the map of `before`'s. Lines a close only appended (`appended`) take new
+/// versions after the old ones; any other save is aligned ([`align`]). A
+/// close's save and a replace both build their lines here.
+fn saved_lines(
+    root: &Path,
+    old: &Lines,
+    before: &FileMap,
+    after: &FileMap,
+    appended: bool,
+    event: EventNumber,
+) -> Result<Lines> {
+    let mut versions = Versions::of(event);
+    if appended {
+        let added = Window::new(after, before.len(), after.len() - before.len());
+        return Ok(old.append(&added, |n| versions.take(n))?);
+    }
+    align(root, old, before, after, &mut versions)
 }
 
 /// The builder thread's own state.

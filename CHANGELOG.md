@@ -25,6 +25,14 @@ design was reviewed on 2026-10-12.
   fork's area is removed. A rule tree volumes do not build (`agentfs.<name>`,
   `filter=lfs`) refuses the volume, naming its line. The Rules domain is the
   new pure crate `agentfs-rules`.
+- **Tree views: a whole-file replace, and `-agentfs` on tracked paths.**
+  `TreeActor::replace_file` makes the atomic save a program makes by renaming
+  a finished file over a tracked one in one step: the file keeps its identity
+  and its unchanged lines keep theirs, and history never shows the temporary
+  name. A tracked file or link that `-agentfs` marks leaves history when the
+  volume opens: its bytes, mode and owner move to the tree's untracked area and
+  one `Unlink by agentfs` commit records it. The recording engine's operator
+  rules use the Rules domain's matcher.
 - **Tree views: M2 fixes.** A directory's record in history is named by its
   path's blob id, with the path inside, so a clone or checkout of history
   works however deep a directory is. `fsync` and close of a descriptor make

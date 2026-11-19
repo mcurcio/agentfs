@@ -21,6 +21,7 @@ mod rows;
 pub mod stages;
 mod takes;
 mod tree;
+mod untrack;
 mod untracked;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -964,6 +965,8 @@ impl TreeActor {
         for handle in abandoned {
             volume.close(handle)?;
         }
+        // Tracked paths the rules now never record leave history.
+        volume.untrack_never_recorded()?;
         volume.metrics.queued = volume.pointers.under(refs::QUEUES).len() as u64;
         // A journal whose steps are all built compacts at once; otherwise at
         // the first record after the builder catches up. Open never waits.
@@ -1423,6 +1426,21 @@ impl TreeActor {
         (chunks, tail): (Chunks<'_>, &[u8]),
         rows: Vec<RowWrite>,
     ) -> Result<(u64, Vec<journal::Tail>, journal::segment::FramePos)> {
+        self.record_with(by, change, pointers, (chunks, tail), rows, true)
+    }
+
+    /// [`TreeActor::record`]; without `before`, nothing runs before the
+    /// step's record: a replace's chunk records are already appended, and no
+    /// compaction may come between them and their step.
+    fn record_with(
+        &mut self,
+        by: WriterAt,
+        change: Change,
+        pointers: Vec<PointerChange>,
+        (chunks, tail): (Chunks<'_>, &[u8]),
+        rows: Vec<RowWrite>,
+        before: bool,
+    ) -> Result<(u64, Vec<journal::Tail>, journal::segment::FramePos)> {
         if self.is_stopped() {
             return Err(Error::Stopped);
         }
@@ -1444,7 +1462,9 @@ impl TreeActor {
             crate::failpoints::hit("tree.before_step")?;
             // A compaction due runs before the step's pointers are checked:
             // values read before it are named as what they were built as.
-            self.before_record();
+            if before {
+                self.before_record();
+            }
             self.resolve_compacted(&mut pointers)?;
             // Each chain's pointer, read after any compaction: its old value
             // is never a step the compaction covers.

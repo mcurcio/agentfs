@@ -17,7 +17,9 @@ use agentfs_contracts::pod::WriterAt;
 pub(in crate::tree_actor) use super::journal::CallHead as Call;
 use super::journal::durable::RecordNo;
 use super::journal::segment::FramePos;
-use super::journal::{Change, Entry, PagePiece, RunHead, SaveOutcome};
+use super::journal::{
+    Change, Entry, PagePiece, RunHead, SaveOutcome, TAKE_CHUNK, Tail, TakeRecord, chunk_map,
+};
 use super::meta::{Attrs, Kind, Meta, Perm, SetTime, Times};
 use super::queue::Key;
 use super::tree::{DirState, EventNumber, SavedTree};
@@ -778,6 +780,122 @@ impl TreeActor {
         self.tree(tree)?.check(&change)?;
         self.run_pending_closes(tree, None)?;
         self.named_step(tree, by, change, (true, &[])).map(drop)
+    }
+
+    /// One step: afterwards `path` holds exactly the `len` bytes of `src`,
+    /// with `attrs`'s mode and owner: the atomic save a program makes by
+    /// renaming a finished file over `path`.
+    ///
+    /// An existing file keeps its object and identity, and its unchanged
+    /// lines keep theirs (aligned against its saved lines as a close's save
+    /// is); a missing file is created as a create step would create it.
+    ///
+    /// The bytes go to the journal in chunk records just before the step; a
+    /// crash, or an error from `src`, before the step's record leaves `path`
+    /// as it was, and chunk records not followed by their step never reach a
+    /// later step.
+    ///
+    /// Its commit is a direct save's (no `Agentfs-Open` trailer) and is
+    /// queued for the upstream as every save is. Opens of the file keep
+    /// their own copies and save over it at their close, as with any save.
+    ///
+    /// Same bytes and same metadata: [`Saved::Unchanged`] and no commit.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::IsADirectory`] (a directory at `path`), [`Error::Invalid`] (a
+    /// link at `path`), [`Error::NotFound`] (no parent directory),
+    /// [`Error::Untracked`] (a missing path the rules place in the untracked
+    /// area), [`Error::Io`] from `src` (`UnexpectedEof` when it ends before
+    /// `len`), and a failed record.
+    pub fn replace_file(
+        &mut self,
+        tree: TreeId,
+        path: &str,
+        attrs: Attrs,
+        src: &mut dyn std::io::Read,
+        len: u64,
+        by: &WriterAt,
+    ) -> Result<Saved> {
+        name(path)?;
+        let t = self.tree(tree)?;
+        let existing = t
+            .names
+            .get(path)
+            .copied()
+            .filter(|_| t.kind_at(path) == Some(Kind::File));
+        if t.kind_at(path).is_none() {
+            self.recorded_name(path, Kind::File)?;
+        }
+        let t = self.tree(tree)?;
+        let meta = match existing {
+            Some(_) => Meta::new(Kind::File, attrs),
+            None => t.new_meta(path, Kind::File, attrs),
+        };
+        let change = Change::Replace {
+            tree: tree.to_string(),
+            path: path.to_owned(),
+            meta,
+            len,
+            chunks: TakeRecord::chunks_for(len),
+        };
+        t.check(&change)?;
+        self.run_pending_closes(tree, None)?;
+        if self.is_stopped() {
+            return Err(Error::Stopped);
+        }
+        let started = std::time::Instant::now();
+        // The chunks, then the step: no compaction comes between.
+        self.before_record();
+        let mut chunks = Vec::new();
+        let mut done = 0;
+        while done < len {
+            let n = (len - done).min(TAKE_CHUNK);
+            let mut buf = vec![0; usize::try_from(n).map_err(|_| Error::TooLarge)?];
+            src.read_exact(&mut buf)?;
+            let (_, pos) = self.append_record(Entry::Bytes, &buf)?;
+            chunks.push(Tail { pos, len: n });
+            done += n;
+        }
+        let seq = self.next;
+        let map = chunk_map(&chunks, len, RecordNo::new(seq))?;
+        if let Some(object) = existing {
+            let t = self.tree(tree)?;
+            let saved = t.bytes.get(&object).ok_or(Error::NotFound)?;
+            let whole = 0..len;
+            if t.meta.get(&object) == Some(&meta)
+                && map.same_as(saved, std::slice::from_ref(&whole))?
+            {
+                return Ok(Saved::Unchanged);
+            }
+        }
+        crate::failpoints::hit("tree.replace_before_step")?;
+        let pointers = self.publish(tree, seq);
+        let (recorded, _, _) = self.record_with(
+            by.clone(),
+            change.clone(),
+            pointers,
+            (&mut std::iter::empty(), &[]),
+            Vec::new(),
+            false,
+        )?;
+        if recorded != seq {
+            return Err(Error::Format);
+        }
+        let at_ns = self.last_at_ns;
+        let t = self.trees.get_mut(&tree).ok_or(Error::NotFound)?;
+        let keys = Self::apply_shape(&mut self.stopped, t, &change, seq, at_ns);
+        let object = existing.unwrap_or(seq);
+        t.bytes.insert(object, map);
+        self.touch(tree, seq, keys);
+        if existing.is_some() {
+            // The view drops the file's pages, as after a take.
+            self.changed.push((tree, object));
+        }
+        self.pages_saved(tree, object, seq);
+        self.count_save(started);
+        self.after_step();
+        Ok(Saved::Commit(RecordNo::new(seq)))
     }
 
     /// The guard on every call that makes a name: a name the rules place in

@@ -656,8 +656,8 @@ an exclusive lease on its state area (`Error::Busy` if another process holds
 it); `tree_actor::inspect(root)` reads what a state area holds without it, and
 `state_area::TreeStateArea` offers both to the Volume domain as its
 `StateArea` port. Its recorded calls are `write_open`, `write`, `truncate`,
-`sync`, `close`, `mkdir`, `rmdir`, `symlink`, `rename`, `unlink`, `set_meta`
-and `set_times`; each write-open and namespace call names its writer as an
+`sync`, `close`, `mkdir`, `rmdir`, `symlink`, `rename`, `unlink`, `set_meta`,
+`set_times` and `replace_file`; each write-open and namespace call names its writer as an
 `agentfs_contracts::pod::WriterAt`, the writer and its pod context, which the
 commit carries ([trees](../trees.md#volume-identity-and-trailers)). Every call names its tree by a `TreeId`: `root`, the
 tree with no upstream, or `fork/<n>`, made at journal event `n`. `trees()`
@@ -811,7 +811,25 @@ that makes a name (`write_open` with a create, `mkdir`, `symlink`,
 place untracked with `Error::Untracked { path, reason }` (`EXDEV`), before
 anything is journaled; a name that is not git-safe is refused first, as
 `Error::Name`. Rules decide only for new names: a path with an entry stays
-recorded.
+recorded, except that an open moves each tracked file or link `-agentfs` now
+marks into its tree's untracked area and records its unlink as writer `agentfs`
+(placed first, so a crash between the two places it again at the next open).
+
+`replace_file(tree, path, attrs, src, len, by)` (and `SessionGuard::replace_file`)
+is one step that leaves `path` holding exactly the `len` bytes read from `src`,
+with `attrs`' mode and owner: the atomic save a program makes by renaming a
+finished file over `path`.
+An existing file keeps its object and identity, and its unchanged lines keep
+theirs (its lines are aligned as a close's save aligns them); a missing file is
+created as a create would make it, refused with `Error::Untracked` where the
+rules place it untracked. The bytes go to the journal in chunk records just
+before the step, so an error from `src` (`Error::Io`, `UnexpectedEof` when it
+ends early) or a crash before the step leaves `path` as it was. The commit is a
+direct save's, `Direct by <writer>` with no `Agentfs-Open`, queued for the
+upstream as every save is; the same bytes and metadata answer `Saved::Unchanged`
+and commit nothing. A directory at `path` answers `Error::IsADirectory`, a link
+`Error::Invalid`, a missing parent `Error::NotFound`. Opens of the file keep
+their own copies and save over it at their close.
 
 `TreeActor::untracked_area(tree)`, `Recording::untracked_area(tree)` and a
 view's `TreeSession::untracked_area()` give a tree's `UntrackedArea`,

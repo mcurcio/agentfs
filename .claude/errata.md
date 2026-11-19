@@ -1467,3 +1467,17 @@ M2 residuals (each to become a bead):
 7. **`docs/target-architecture/future/one-engine.md` is not in S1's owned paths**, so its M3 row is left to S3.
 8. **A dropped fork's area goes with its checkout, so only a fork the builder had checked out loses its area at once.**
    One dropped before it was ever built keeps its area until the next open's sweep.
+
+## 2026-11-19, M3 S2 (whole-file replace, untrack at open): where the brief was short
+
+1. **A new failpoint needs its name in `failpoints::POINTS`** (`crates/agentfs-core/src/failpoints.rs`, not in S2's
+   owned paths): `every_hit_is_listed` and the spec parser refuse an unlisted name. S2 adds
+   `tree.replace_before_step` and `tree.untrack_after_place` there, two lines and nothing else.
+2. **A replace cannot tell "unchanged" before its chunk records are written**: `src` is read once. Its chunk records
+   go first (after any due compaction, and none between them and the step); a replace that changes neither bytes
+   nor metadata then answers `Saved::Unchanged` and leaves its chunk records with no step, which the next take or
+   replace step discards as it discards a cut-short one. The cost is those records' journal bytes until compaction.
+3. **A replace over a file with a live write-open runs the page cache's save hook** (`pages_saved`, `pages.rs` not
+   owned): the file's image is dropped and the page writes made before the replace count as superseded, as a mapped
+   write to a file renamed over is lost on Linux; the opens' own calls still save over it at their close. The
+   arrival-order size the view reports for that open file (`inode_size`) is not reset until its last open closes.
