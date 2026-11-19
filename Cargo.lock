@@ -208,6 +208,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "agentfs-rules"
+version = "0.1.0"
+dependencies = [
+ "agentfs-align",
+ "bstr",
+ "gix-attributes",
+ "gix-ignore",
+ "gix-parallel",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "agentfs-trees"
 version = "0.1.0"
 dependencies = [
