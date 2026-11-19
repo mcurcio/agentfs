@@ -1,43 +1,44 @@
 //! The `agentfs` command.
 //!
-//! `mount` mounts a backing tree through the FUSE layer (`agentfs_fuse`)
-//! and runs the commit and push loops in the same process until SIGINT,
-//! SIGTERM or an unmount. `record` records paths from a
-//! directory directly, through the same recorder, including its path rules:
-//! paths the rules exclude are reported as skipped, with the reason.
+//! `init`, `mount` and `fork end` run the tree engine ([`launcher`],
+//! docs/trees.md): `init` creates or finds a volume, `mount` serves its root
+//! (and optionally a fork) as tree views until SIGINT, SIGTERM, its command's
+//! exit or an unmount, and `fork end` ends a keyed fork. `probe` reports
+//! whether a mount point holds a live agentfs mount, for Kubernetes probes;
+//! `mount --on-stale-mount recover` makes a sidecar restarted after a crash
+//! mount over the stale mount its predecessor left, and `hold` makes it wait
+//! for a pod restart instead ([`hold`]).
+//!
+//! Every other command runs the recording engine, which the CSI driver
+//! runs, and refuses a tree volume before it reads or writes anything
+//! ([`refuse_tree_volume`]). `record` records paths from a directory through
+//! the recorder, including its path rules: paths the rules exclude are
+//! reported as skipped, with the reason.
 //!
 //! `push` pushes once to the configured remotes, or asks a running daemon
-//! (`mount`, `run`, `serve-history`) to commit and push now over its
-//! control socket ([`push_now`]); `run` runs the commit and
-//! push loops in the foreground until SIGINT or SIGTERM.
+//! (`run`, `serve-history`) to commit and push now over its control socket
+//! ([`push_now`]); `run` runs the commit and push loops in the foreground
+//! until SIGINT or SIGTERM.
 //!
 //! `restore` and `revert` write content from history back into the tree,
 //! recorded as one commit ([`recovery`]).
 //!
-//! `init` creates a state area or accepts one that already belongs to the
-//! volume, so a pod can run it at every start; `probe` reports whether a
-//! mount point holds a live agentfs mount, for Kubernetes probes; and
-//! `mount --on-stale-mount recover` makes a sidecar restarted after a crash
-//! mount over the stale mount its predecessor left, and `hold` makes it
-//! wait for a pod restart instead ([`hold`]).
+//! `serve-history` is a volume's history service and `front` and `record
+//! --history-service` are its fronts, one per pod ([`serve_history`],
+//! [`front`]): the service is the only writer of the journal and branch, and
+//! each front records its pod's changes through it, carrying its pod's
+//! committer. Only the CSI node plugin starts `front`.
 //!
-//! `serve-history` is a volume's history service and `mount
-//! --history-service` and `record --history-service` are its fronts, one
-//! per pod ([`serve_history`], [`front`]): the service is the
-//! only writer of the journal and branch, and each front records its pod's
-//! changes through it, carrying its pod's committer.
-//!
-//! `mount`, `run`, `record`, `flush`, `serve-history`, and `push`,
-//! `restore` and `revert` when no daemon answers, take the state-area lock
-//! and exit 75 while another process holds it; fronts take
-//! no lock; `status` is read-only and takes no lock.
+//! `run`, `record`, `flush`, `serve-history`, and `push`, `restore` and
+//! `revert` when no daemon answers, take the state-area lock and exit 75
+//! while another process holds it; fronts take no lock; `status` is
+//! read-only and takes no lock.
 //!
 //! `fork create` makes a fork of a volume, `fork finish` finishes and
 //! publishes it, `fork status` reads its state, `fork abandon` discards it
 //! on record and `fork list` lists the published changes on a fork remote
-//! ([`fork_cmd`]). A finished fork is read-only: `mount`
-//! (but not a front), `run`, `record`, `restore`, `revert` and `patch
-//! apply` refuse it.
+//! ([`fork_cmd`]). A finished fork is read-only: `run`, `record`,
+//! `restore`, `revert` and `patch apply` refuse it.
 //!
 //! `serve-git` serves the volume's history repository to pushers over
 //! git's smart HTTP, as the volume's patch source ([`serve_git`], bead
@@ -47,10 +48,10 @@
 //! from, clearing the start-branch alarm ([`start_cmd`]); it
 //! takes no lock.
 //!
-//! `mount`, `flush`, `record`, `push` and `run` export telemetry over OTLP
-//! when the standard `OTEL_*` variables configure an endpoint (see
-//! [`otel`]); alarms are also printed to stderr. `init` and
-//! `status` export nothing.
+//! `mount`, `front`, `flush`, `record`, `push` and `run` export telemetry
+//! over OTLP when the standard `OTEL_*` variables configure an endpoint
+//! (see [`otel`]); alarms are also printed to stderr. `init` and `status`
+//! export nothing.
 
 mod checkpoint_cmd;
 mod control;
@@ -61,7 +62,9 @@ mod domain_events;
 mod fork_cmd;
 mod front;
 mod hold;
+mod launcher;
 mod lfs_cmd;
+mod mountpoint;
 mod otel;
 mod patch_cmd;
 mod pod_args;
@@ -73,9 +76,8 @@ mod serve_git;
 mod serve_history;
 mod shared;
 mod start_cmd;
-mod trees_cmd;
 
-use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -90,23 +92,13 @@ use agentfs_core::history::History;
 use agentfs_core::identity::Context;
 use agentfs_core::lfs;
 use agentfs_core::lock::{LockError, StateLock};
-use agentfs_core::patch::attached::{self, Deferred, Judgement, PodScope};
 use agentfs_core::paths::{PathError, RepoPath};
 use agentfs_core::push::{self, LeaseOutcome, PushOutcome, RemotePusher, RemoteStatus};
 use agentfs_core::record::{Caller, Trigger};
 use agentfs_core::service::{FinalPush, Service};
 use agentfs_core::telemetry::Telemetry;
 use agentfs_core::volume::{self, Input, StateDir};
-use agentfs_fuse::mount::MountSource;
-use agentfs_fuse::{
-    Mount, MountConfig, MountError, MountKind, MountState, OverlayConfig, Passthrough, StackOver,
-    UnmountReport, agentfs_layers, detach_stale_layers, mount_state, preflight, preflight_overlay,
-    preflight_stacked,
-};
-
-/// Most stale layers a stop (or a hold) detaches at the mount point: one
-/// per crash recovered by stacking.
-pub const STALE_LAYERS: usize = 16;
+use agentfs_fuse::stale::{MountState, mount_state};
 
 use crate::daemon::{Daemon, Wake};
 
@@ -140,24 +132,18 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// The tree library: Git-backed main and sandbox trees.
-    Trees(trees_cmd::Args),
-    /// Create a state area, or check an existing one: safe to run at every
-    /// start (exit 0 when it already belongs to the volume, 1 when it
-    /// belongs to another volume or branch). With --root, also creates the
-    /// backing tree directory.
-    Init {
-        /// The volume's name, unique within any repository it pushes to.
-        #[arg(long, env = "AGENTFS_VOLUME")]
-        volume: String,
-        /// History branch (default: agentfs/<volume>).
-        #[arg(long)]
-        branch: Option<String>,
-        /// An operator config fragment to include (`include.path`, design); repeatable. When given, these become exactly the
-        /// state area's includes.
-        #[arg(long = "include", value_name = "FILE")]
-        includes: Vec<PathBuf>,
-    },
+    /// Create the tree volume, or find it (same name: nothing written), then
+    /// recover it. Prints `<name> <id> created|found`; exit 1 refused, 75
+    /// busy.
+    Init(launcher::InitArgs),
+    /// Stage the tree volume and mount its root, optionally also a fork, and
+    /// optionally run a command in it. SIGTERM, SIGINT, the command's exit
+    /// or unmounting every view drains it. Never creates a volume.
+    Mount(launcher::MountArgs),
+    /// A front of a history service (the CSI node plugin starts it): mount
+    /// BACKING at MOUNTPOINT and record every change through the service,
+    /// until SIGINT, SIGTERM or an unmount. A second signal exits at once.
+    Front(front::FrontArgs),
     /// Show the branch head, the last committed sequence and the backlog.
     Status(Pod),
     /// Commit every recorded change now.
@@ -176,7 +162,7 @@ enum Command {
         #[command(flatten)]
         history: HistoryArgs,
     },
-    /// Serve the volume's history to fronts (`mount --history-service`)
+    /// Serve the volume's history to fronts (`front`)
     /// until SIGINT or SIGTERM: the only writer of the journal and the
     /// branch, with the commit and push loops. Needs --root,
     /// the backing tree the fronts mount. A second signal exits at once.
@@ -295,10 +281,6 @@ enum Command {
         #[command(flatten)]
         pod: Pod,
     },
-    /// Mount BACKING at MOUNTPOINT and record every change through it,
-    /// with the commit and push loops, until SIGINT, SIGTERM or an unmount.
-    /// A second signal exits at once.
-    Mount(MountArgs),
     /// Report what is mounted at MOUNTPOINT: a live agentfs mount (exit 0),
     /// a stale one whose daemon died, nothing, or another filesystem (exit
     /// 1). Takes no lock and reads no state area: for startup and readiness
@@ -309,10 +291,6 @@ enum Command {
         /// crash).
         #[arg(long)]
         allow_stale: bool,
-        /// Expect the sandbox overlay's mount, not the main mount: either
-        /// kind's mount is exit 1 where the other is expected.
-        #[arg(long)]
-        sandbox_overlay: bool,
     },
     /// The patch queue: submit a patch for a volume, apply
     /// the queue now, or show it.
@@ -442,31 +420,24 @@ fn main() -> ExitCode {
 fn real_main() -> Result<ExitCode> {
     let cli = Cli::parse();
     let state = StateDir::new(&cli.state);
+    if let Err(refused) = tree_command_flags(&cli) {
+        eprintln!("error: {refused}");
+        return Ok(ExitCode::FAILURE);
+    }
+    if let Some(command) = recording_command(&cli.command)
+        && let Some(refused) = refuse_tree_volume(&cli.state, command)
+    {
+        return Ok(refused);
+    }
+    // The composition root: the one place capabilities are minted.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the composition root mints capabilities"
+    )]
+    let minter = agentfs_contracts::caps::Minter::new();
     match cli.command {
-        Command::Trees(args) => {
-            if cli.root.is_some() || !cli.wait_lock.is_zero() {
-                bail!("trees uses --state only; --root and --wait-lock are not supported");
-            }
-            // The composition root: the one place capabilities are minted.
-            #[allow(
-                clippy::disallowed_methods,
-                reason = "the composition root mints capabilities"
-            )]
-            let minter = agentfs_contracts::caps::Minter::new();
-            return trees_cmd::run(&cli.state, args, minter);
-        }
-        Command::Init {
-            volume,
-            branch,
-            includes,
-        } => init(
-            &state,
-            cli.root.as_deref(),
-            cli.wait_lock,
-            &volume,
-            branch,
-            includes,
-        )?,
+        Command::Init(args) => return launcher::init(&cli.state, args, minter),
+        Command::Mount(args) => return launcher::mount(&cli.state, args, minter),
         Command::Status(_pod) => {
             // Read-only: no recovery, no lock, so it is safe beside a
             // running `mount` or `run`.
@@ -709,103 +680,95 @@ fn real_main() -> Result<ExitCode> {
         Command::Probe {
             mountpoint,
             allow_stale,
-            sandbox_overlay,
-        } => {
-            let kind = if sandbox_overlay {
-                MountKind::SandboxOverlay
-            } else {
-                MountKind::Main
-            };
-            return Ok(probe(&mountpoint, allow_stale, kind));
-        }
+        } => return Ok(probe(&mountpoint, allow_stale)),
         Command::Patch { command } => {
             return patch_cmd::run(command, &state, cli.root.as_deref(), cli.wait_lock);
         }
         Command::Lfs { command } => return lfs_cmd::run(command, &state, cli.wait_lock),
+        Command::Fork {
+            command: fork_cmd::ForkCommand::End(args),
+        } => return launcher::end_fork(&cli.state, args, minter),
         Command::Fork { command } => {
             return fork_cmd::run(command, &state, cli.root.as_deref(), cli.wait_lock);
         }
         Command::Start { command } => return start_cmd::run(command, &state),
-        Command::Mount(args) => {
+        Command::Front(args) => {
             let daemon = Daemon::start()?;
-            // A restarted sidecar whose daemon died: the
-            // mount point, the sandbox overlay's, or both, are stale.
-            let stale = stale_source(&args.mountpoint);
-            let overlay_stale = args.sandbox_overlay.as_deref().and_then(stale_source);
-            let held: Vec<(&Path, &str)> = [
-                (args.mountpoint.as_path(), stale.as_deref()),
-                (
-                    args.sandbox_overlay.as_deref().unwrap_or(Path::new("")),
-                    overlay_stale.as_deref(),
-                ),
-            ]
-            .into_iter()
-            .filter_map(|(path, source)| Some((path, source?)))
-            .collect();
-            let (mut stacked, mut overlay_stacked) = (false, false);
-            if !held.is_empty() {
-                match args.on_stale_mount {
-                    // Mount nothing and take no lock.
-                    OnStaleMount::Hold => return Ok(hold::hold(daemon, &held)),
-                    OnStaleMount::Recover => {
-                        if let Some(refusal) = recover_refusal(&args) {
-                            for (path, source) in &held {
-                                eprintln!(
-                                    "error: --on-stale-mount recover: {refusal}; {} is a stale \
-                                     agentfs mount ({source}) and is left as it is",
-                                    path.display()
-                                );
-                                eprintln!(
-                                    "hint: use --on-stale-mount hold (and restart the pod), or \
-                                     detach it: umount -l {}",
-                                    path.display()
-                                );
-                            }
-                            return Ok(ExitCode::FAILURE);
-                        }
-                        stacked = stale.is_some();
-                        overlay_stacked = overlay_stale.is_some();
-                    }
-                    // preflight reports each, with the command that clears it.
-                    OnStaleMount::Refuse => {}
-                }
-            }
-            if let Some(address) = &args.history.history_service {
-                // A front takes no lock: the history service holds it.
-                return front::mount_front(daemon, &state, cli.root.as_deref(), &args, address);
-            }
-            // A front of a finished fork mounts (the CSI node plugin binds
-            // it read-only); its history service refuses
-            // every record.
-            refuse_finished(&state)?;
-            // The dead daemon's lock went with it.
-            let _lock = StateLock::acquire(&state, "mount", cli.wait_lock)?;
-            return mount(
-                daemon,
-                &state,
-                cli.root.as_deref(),
-                &args,
-                stacked,
-                overlay_stacked,
-            );
+            // A front takes no lock: the history service holds it. A front
+            // of a finished fork mounts (the CSI node plugin binds it
+            // read-only); its history service refuses every record.
+            return front::mount_front(daemon, &state, cli.root.as_deref(), &args);
         }
     }
     Ok(ExitCode::SUCCESS)
 }
 
-/// Detaches the stale layers earlier crashes left at `at`, under a mount
-/// stacked over them; whether any was there (or could not be checked).
-fn detach_layers_left(at: &Path) -> bool {
-    match detach_stale_layers(at, STALE_LAYERS) {
-        Ok(0) => false,
-        Ok(n) => {
-            eprintln!("detached {n} stale layer(s) at {}", at.display());
-            true
+/// `init`, `mount` and `fork end` (the tree engine's) take `--state` only:
+/// a given `--root` (or `AGENTFS_ROOT`) or a non-zero `--wait-lock` is
+/// refused, so an old manifest fails loudly.
+fn tree_command_flags(cli: &Cli) -> Result<(), &'static str> {
+    let tree = matches!(
+        cli.command,
+        Command::Init(_)
+            | Command::Mount(_)
+            | Command::Fork {
+                command: fork_cmd::ForkCommand::End(_)
+            }
+    );
+    if tree && (cli.root.is_some() || !cli.wait_lock.is_zero()) {
+        return Err(
+            "init, mount and fork end take --state only: a tree volume has no backing tree \
+             (--root, AGENTFS_ROOT), and a busy state area exits 75",
+        );
+    }
+    Ok(())
+}
+
+/// The name of a command that runs the recording engine only, as
+/// [`refuse_tree_volume`] says it; `None` for the tree engine's commands,
+/// `probe` and `serve-git`'s hooks. Every command is listed: a new one must
+/// say which engine it runs.
+fn recording_command(command: &Command) -> Option<&'static str> {
+    match command {
+        Command::Init(_) | Command::Mount(_) | Command::Probe { .. } => None,
+        Command::Fork {
+            command: fork_cmd::ForkCommand::End(_),
+        } => None,
+        Command::Fork { .. } => Some("fork"),
+        Command::ServeGit { hook: Some(_), .. } => None,
+        Command::ServeGit { hook: None, .. } => Some("serve-git"),
+        Command::Status(_) => Some("status"),
+        Command::Flush(_) => Some("flush"),
+        Command::Record { .. } => Some("record"),
+        Command::ServeHistory { .. } => Some("serve-history"),
+        Command::Front(_) => Some("front"),
+        Command::Push { .. } => Some("push"),
+        Command::Checkpoint { .. } => Some("checkpoint"),
+        Command::Run { .. } => Some("run"),
+        Command::Restore { .. } => Some("restore"),
+        Command::Revert { .. } => Some("revert"),
+        Command::Patch { .. } => Some("patch"),
+        Command::Lfs { .. } => Some("lfs"),
+        Command::Start { .. } => Some("start"),
+    }
+}
+
+/// Refuses, before anything is read or written, a recording command on a
+/// tree volume: prints "error: `agentfs <command>` runs on the recording
+/// engine only; <state> is a tree volume, where it is not built yet
+/// (docs/trees.md)" and answers exit 1. `None` when no tree volume is
+/// there.
+fn refuse_tree_volume(state: &Path, command: &'static str) -> Option<ExitCode> {
+    match agentfs_core::tree_actor::inspect(state) {
+        Ok(agentfs_contracts::ports::Found::Volume(_)) => {
+            eprintln!(
+                "error: `agentfs {command}` runs on the recording engine only; {} is a tree \
+                 volume, where it is not built yet (docs/trees.md)",
+                state.display()
+            );
+            Some(ExitCode::FAILURE)
         }
-        Err(e) => {
-            eprintln!("could not detach the stale layers at {}: {e}", at.display());
-            true
-        }
+        _ => None,
     }
 }
 
@@ -818,56 +781,6 @@ fn refuse_finished(state: &StateDir) -> Result<()> {
         Err(e @ volume::VolumeError::ForkFinished { .. }) => Err(e.into()),
         _ => Ok(()),
     }
-}
-
-/// `agentfs init`: creates the state area or checks an existing one,
-/// and creates `--root` when it is missing.
-fn init(
-    state: &StateDir,
-    root: Option<&Path>,
-    wait_lock: Duration,
-    volume: &str,
-    branch: Option<String>,
-    includes: Vec<PathBuf>,
-) -> Result<()> {
-    // An existing state area may be in use: take its lock. A new one is
-    // created whole, so there is nothing to lock yet (and a refused name
-    // leaves nothing behind).
-    let _lock = if state.git().join("config").exists() {
-        Some(StateLock::acquire(state, "init", wait_lock)?)
-    } else {
-        None
-    };
-    let includes = includes
-        .iter()
-        .map(std::path::absolute)
-        .collect::<std::io::Result<Vec<_>>>()
-        .context("resolving --include")?;
-    let includes = (!includes.is_empty()).then_some(includes.as_slice());
-    let outcome = volume::init_with(state, volume, branch.as_deref(), includes)
-        .with_context(|| format!("initialising {}", state.root().display()))?;
-    if let Some(root) = root
-        && !root.exists()
-    {
-        std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o755)
-            .create(root)
-            .with_context(|| format!("creating the backing tree {}", root.display()))?;
-        println!("created the backing tree {}", root.display());
-    }
-    match outcome {
-        volume::Init::Created => {
-            println!("initialised volume {volume} in {}", state.root().display());
-        }
-        volume::Init::AlreadyInitialised => {
-            println!(
-                "volume {volume} already initialised in {}",
-                state.root().display()
-            );
-        }
-    }
-    Ok(())
 }
 
 /// `agentfs push`: one attempt per selected remote, in name order.
@@ -1235,19 +1148,6 @@ fn list(names: &[String]) -> String {
     }
 }
 
-/// Why a mount stops: [`describe_wake`], naming the sandbox overlay when
-/// its session was the one unmounted from outside (`ended`, the session
-/// that ended first, at `overlay`).
-fn describe_mount_wake(wake: Wake, ended: Option<MountKind>, overlay: Option<&Path>) -> String {
-    match (wake, ended, overlay) {
-        (Wake::Unmounted, Some(MountKind::SandboxOverlay), Some(at)) => format!(
-            "the sandbox overlay at {} was unmounted from outside; stopping both mount points",
-            at.display()
-        ),
-        _ => describe_wake(wake),
-    }
-}
-
 fn describe_wake(wake: Wake) -> String {
     match wake {
         Wake::Signal(signal) => format!("signal {signal}"),
@@ -1304,257 +1204,17 @@ fn describe_final(result: &FinalPush) -> String {
     }
 }
 
-/// `agentfs mount`'s own options.
-#[derive(Args)]
-struct MountArgs {
-    /// The backing tree: the real directory whose files the mount shows.
-    backing: PathBuf,
-    /// Where to mount it. Must not be inside the backing tree or the state
-    /// area.
-    mountpoint: PathBuf,
-    #[command(flatten)]
-    pod: Pod,
-    /// Kernel passthrough of reads and writes: `auto` uses it when the
-    /// kernel (6.9+) and privileges (root) allow, `on` requires it, `off`
-    /// never uses it.
-    #[arg(long, env = "AGENTFS_PASSTHROUGH", default_value = "auto", value_parser = parse_passthrough)]
-    passthrough: Passthrough,
-    /// FUSE threads (default: the number of CPUs, between 2 and 16).
-    #[arg(long, env = "AGENTFS_THREADS", default_value_t = 0)]
-    threads: usize,
-    /// Mount without `allow_other`: only the mounting user can use it.
-    #[arg(long)]
-    no_allow_other: bool,
-    /// How long shutdown may spend on a last push of the final commit; 0s
-    /// skips it.
-    #[arg(long, default_value = "5s", value_parser = parse_grace)]
-    push_grace: Duration,
-    /// How long shutdown waits for a busy mount (files still open) to be
-    /// released after it is detached.
-    #[arg(long, default_value = "10s", value_parser = parse_grace)]
-    unmount_grace: Duration,
-    /// What to do when MOUNTPOINT is an agentfs mount whose daemon died:
-    /// `refuse` (exit 1 with the command that clears it), `hold` (a
-    /// restarted sidecar: mount nothing, wait for SIGTERM, then detach the
-    /// stale mount) or `recover` (a restarted sidecar: mount over the stale
-    /// mount, so the workload's copies of it reach the new daemon; needs
-    /// CAP_SYS_ADMIN).
-    #[arg(
-        long,
-        env = "AGENTFS_ON_STALE_MOUNT",
-        default_value = "refuse",
-        value_enum
-    )]
-    on_stale_mount: OnStaleMount,
-    /// Seal the bare mount point, and the sandbox overlay's, before
-    /// mounting: owned by root, mode 0000, so a non-root workload that
-    /// reaches it while no daemon is mounted (a `subPath` bound while the
-    /// sidecar restarts) gets EACCES instead of writing where nothing
-    /// records it. Needs root.
-    #[arg(long, env = "AGENTFS_SEAL_MOUNTPOINT")]
-    seal_mountpoint: bool,
-    /// Where a workload sees the mount when not at MOUNTPOINT (a container's
-    /// `mountPath`): `PATH`, or `PATH=DIR` for the tree's directory DIR (a
-    /// `subPath`). Absolute `gitdir:` targets under it, written by `git
-    /// worktree add`, then map exactly. Repeatable; the variable
-    /// takes a comma-separated list.
-    #[arg(
-        long = "workload-mount",
-        env = "AGENTFS_WORKLOAD_MOUNTS",
-        value_delimiter = ',',
-        value_parser = agentfs_fuse::views::parse_workload_mount
-    )]
-    workload_mounts: Vec<agentfs_core::nested::View>,
-    /// Also serve the sandbox overlay at PATH: a second mount point of the
-    /// volume that shows only the names the operator's rules would record,
-    /// and does every operation as --sandbox-owner. Must not be the mount
-    /// point or nested with it.
-    #[arg(
-        long,
-        env = "AGENTFS_SANDBOX_OVERLAY",
-        value_name = "PATH",
-        requires = "sandbox_owner",
-        conflicts_with = "history_service"
-    )]
-    sandbox_overlay: Option<PathBuf>,
-    /// The sandbox overlay's view owner: the user and group every
-    /// operation through it is checked and done as, whoever the caller is.
-    /// The daemon must be that user or root.
-    #[arg(
-        long,
-        env = "AGENTFS_SANDBOX_OWNER",
-        value_name = "UID:GID",
-        requires = "sandbox_overlay"
-    )]
-    sandbox_owner: Option<agentfs_fuse::overlay::OwnerIds>,
-    #[command(flatten)]
-    history: HistoryArgs,
-}
-
-/// `--sandbox-overlay` with `--sandbox-owner`: the overlay's mount point,
-/// created if missing and checked as the mount point is ([`mount`] has
-/// checked it against the main mount point, [`preflight_overlay`], before
-/// creating anything), and the view owner, which the daemon must be able
-/// to act as. `None` without the flags.
-///
-/// With `stacked` the overlay is stacked over the stale overlay mount a
-/// crashed daemon left (`--on-stale-mount recover`); otherwise a stale one
-/// is refused, and the bare mount point is checked for files and sealed
-/// (`--seal-mountpoint`) as the main mount point is.
-fn sandbox_overlay(
-    state: &StateDir,
-    settings: &agentfs_core::config::Settings,
-    args: &MountArgs,
-    stacked: bool,
-) -> Result<Option<OverlayConfig>> {
-    let (Some(at), Some(ids)) = (&args.sandbox_overlay, args.sandbox_owner) else {
-        return Ok(None);
-    };
-    let kind = MountKind::SandboxOverlay;
-    let overlay = if stacked {
-        preflight_stacked(state, settings, &args.backing, at, kind)?.1
-    } else {
-        create_mountpoint(at, kind)?;
-        if let Err(e) = rustix::fs::stat(at)
-            && e == rustix::io::Errno::NOTCONN
-        {
-            bail!(
-                "the sandbox overlay's mount point {p} is a stale FUSE mount (transport endpoint \
-                 is not connected), probably left by a daemon that died; start with \
-                 --on-stale-mount recover or hold, or unmount it first: umount -l {p}",
-                p = at.display()
-            );
-        }
-        let (_, overlay) = preflight(state, settings, &args.backing, at, kind)?;
-        if std::fs::read_dir(&overlay).is_ok_and(|mut d| d.next().is_some()) {
-            eprintln!(
-                "warning: the sandbox overlay's mount point {} is not empty: the files in it \
-                 are hidden by the mount and not recorded (a sandbox wrote there while no \
-                 daemon was mounted?)",
-                overlay.display()
-            );
-        }
-        if args.seal_mountpoint {
-            seal_mountpoint(&overlay)?;
-        }
-        overlay
-    };
-    let owner = match agentfs_fuse::overlay::ViewOwner::new(
-        ids,
-        &agentfs_fuse::privileges::Privileges::current(),
-        rustix::process::geteuid().as_raw(),
-    ) {
-        Ok(owner) => owner,
-        Err(e) => bail!("{e}"),
-    };
-    Ok(Some(OverlayConfig {
-        mountpoint: overlay,
-        owner,
-        stack_over: stacked.then(|| StackOver {
-            source: state.overlay_stack_source(),
-        }),
-        tmp_layer: state.tmp_layer(),
-    }))
-}
-
-/// The startup line's note of the sandbox overlay, if served: its mount
-/// point, view owner and passthrough status (each session negotiates its
-/// own).
-fn describe_overlay(mounted: &Mount, args: &MountArgs) -> String {
-    match (
-        mounted.overlay_mountpoint(),
-        args.sandbox_owner,
-        mounted.overlay_passthrough(),
-    ) {
-        (Some(at), Some(owner), Some(passthrough)) => format!(
-            ", sandbox overlay at {} as {owner}, passthrough {passthrough}",
-            at.display()
-        ),
-        _ => String::new(),
-    }
-}
-
-/// Where workloads see the tree before it is mounted: the mount
-/// point and `--workload-mount`.
-fn workload_views(mountpoint: &Path, args: &MountArgs) -> Vec<agentfs_core::nested::View> {
-    mountpoint
-        .to_str()
-        .and_then(|at| agentfs_core::nested::View::new(at, ""))
-        .into_iter()
-        .chain(args.workload_mounts.iter().cloned())
-        .collect()
-}
-
-/// Adds the other mounts of the mount at `mountpoint` this namespace shows
-/// (bind mounts) to the views.
-fn add_mounted_views(mountpoint: &Path) {
-    match agentfs_fuse::views::mounted_views(mountpoint) {
-        Ok(views) => agentfs_core::nested::add_views(views),
-        Err(e) => eprintln!("warning: reading the mount's bind mounts: {e}"),
-    }
-}
-
-/// The source of the stale agentfs mount at `path`, if it is one.
-fn stale_source(path: &Path) -> Option<String> {
-    match mount_state(path) {
-        Ok(MountState::Stale { source }) => Some(source),
-        _ => None,
-    }
-}
-
-/// `mount --on-stale-mount`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
-enum OnStaleMount {
-    Refuse,
-    Hold,
-    Recover,
-}
-
-/// Why `--on-stale-mount recover` cannot stack over a stale mount here.
-fn recover_refusal(args: &MountArgs) -> Option<&'static str> {
-    if args.history.history_service.is_some() {
-        // A front's mount is the CSI driver's to stack.
-        Some("fronts (--history-service) do not recover in place")
-    } else if !agentfs_fuse::privileges::Privileges::current().can_unmount() {
-        Some("stacking a mount needs CAP_SYS_ADMIN (run as root)")
-    } else {
-        None
-    }
-}
-
-fn parse_passthrough(value: &str) -> Result<Passthrough, String> {
-    value.parse()
-}
-
-/// `agentfs probe`: one line, exit 0 for a live agentfs mount of kind
-/// `kind` (or a stale one with `allow_stale`), else 1. A mount of the
-/// other kind says so.
-fn probe(mountpoint: &Path, allow_stale: bool, kind: MountKind) -> ExitCode {
+/// `agentfs probe`: one line, exit 0 for a live agentfs mount (or a stale
+/// one with `allow_stale`), else 1.
+fn probe(mountpoint: &Path, allow_stale: bool) -> ExitCode {
     match mount_state(mountpoint) {
         Ok(state) => {
-            let found = match &state {
-                MountState::Live { source } | MountState::Stale { source } => {
-                    Some(source_kind(source))
-                }
-                MountState::NotMounted | MountState::Foreign { .. } => None,
+            println!("{}", describe_state(&state));
+            let ok = match state {
+                MountState::Live { .. } => true,
+                MountState::Stale { .. } => allow_stale,
+                MountState::NotMounted | MountState::Foreign { .. } => false,
             };
-            let wrong = found.is_some_and(|found| found != kind);
-            let line = describe_state(&state);
-            if wrong {
-                let expected = match kind {
-                    MountKind::Main => "a main mount",
-                    MountKind::SandboxOverlay => "a sandbox overlay",
-                };
-                println!("{line}, not {expected}");
-            } else {
-                println!("{line}");
-            }
-            let ok = !wrong
-                && match state {
-                    MountState::Live { .. } => true,
-                    MountState::Stale { .. } => allow_stale,
-                    MountState::NotMounted | MountState::Foreign { .. } => false,
-                };
             if ok {
                 ExitCode::SUCCESS
             } else {
@@ -1568,400 +1228,15 @@ fn probe(mountpoint: &Path, allow_stale: bool, kind: MountKind) -> ExitCode {
     }
 }
 
-/// Which kind of mount an agentfs mount's source names; a source that
-/// names none is a main mount's (as every source was before the sandbox
-/// overlay).
-fn source_kind(source: &str) -> MountKind {
-    MountSource::parse(source).map_or(MountKind::Main, |s| s.kind)
-}
-
-/// What an agentfs mount of `source` is called: "agentfs mount" or
-/// "agentfs sandbox overlay".
-fn mount_noun(source: &str) -> &'static str {
-    match source_kind(source) {
-        MountKind::Main => "agentfs mount",
-        MountKind::SandboxOverlay => "agentfs sandbox overlay",
-    }
-}
-
 fn describe_state(state: &MountState) -> String {
     match state {
-        MountState::Live { source } => format!("live {} ({source})", mount_noun(source)),
-        MountState::Stale { source } => format!("stale {} (daemon gone)", mount_noun(source)),
+        MountState::Live { source } => format!("live agentfs mount ({source})"),
+        MountState::Stale { source } => format!("stale agentfs mount ({source}, daemon gone)"),
         MountState::NotMounted => "not mounted".to_owned(),
         MountState::Foreign { fstype } => format!("not an agentfs mount ({fstype})"),
     }
 }
 
-/// Creates a missing mount point of kind `kind` (one level: its parent
-/// must exist), so a sidecar can mount into a subdirectory of a fresh
-/// emptyDir.
-fn create_mountpoint(mountpoint: &Path, kind: MountKind) -> Result<()> {
-    match std::fs::symlink_metadata(mountpoint) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            std::fs::DirBuilder::new()
-                .mode(0o755)
-                .create(mountpoint)
-                .with_context(|| format!("creating {} {}", kind.label(), mountpoint.display()))?;
-            eprintln!("created {} {}", kind.label(), mountpoint.display());
-            Ok(())
-        }
-        // Anything else (it exists, or is stale) is preflight's to judge.
-        _ => Ok(()),
-    }
-}
-
-/// `--seal-mountpoint`: makes the bare mount point root's with mode 0000.
-/// The mount on top is unaffected; what it hides is a
-/// directory no non-root process (nor root without `CAP_DAC_OVERRIDE`) can
-/// write, so a workload that binds it while no daemon is mounted (a
-/// `subPath` bound while the sidecar restarts) gets EACCES instead of
-/// writing where nothing records it.
-fn seal_mountpoint(mountpoint: &Path) -> Result<()> {
-    if !rustix::process::geteuid().is_root() {
-        bail!(
-            "--seal-mountpoint (AGENTFS_SEAL_MOUNTPOINT) needs root: the sealed mount point is \
-             owned by root"
-        );
-    }
-    std::os::unix::fs::chown(mountpoint, Some(0), Some(0))
-        .and_then(|()| std::fs::set_permissions(mountpoint, std::fs::Permissions::from_mode(0o000)))
-        .with_context(|| format!("sealing the mount point {}", mountpoint.display()))?;
-    Ok(())
-}
-
-/// `agentfs mount`: the FUSE filesystem, the commit loop and the push loops
-/// in one process, until SIGINT, SIGTERM or an unmount. `stacked` and
-/// `overlay_stacked` stack the mount and the sandbox overlay over the stale
-/// mounts a crashed daemon left (`--on-stale-mount recover`).
-fn mount(
-    daemon: Daemon,
-    state: &StateDir,
-    root: Option<&Path>,
-    args: &MountArgs,
-    stacked: bool,
-    overlay_stacked: bool,
-) -> Result<ExitCode> {
-    if let Some(root) = root {
-        let same = match (root.canonicalize(), args.backing.canonicalize()) {
-            (Ok(a), Ok(b)) => a == b,
-            _ => false,
-        };
-        if !same {
-            bail!(
-                "--root (or AGENTFS_ROOT) {} is not the backing tree {}; drop it or make them agree",
-                root.display(),
-                args.backing.display()
-            );
-        }
-    }
-    // The sandbox overlay's mount point against the main one first, so a
-    // refused setting changes nothing: no mount point created, none sealed.
-    if let Some(at) = &args.sandbox_overlay {
-        preflight_overlay(&args.mountpoint, at)?;
-    }
-    let session = Session::start(state, &args.pod)?;
-    let settings = History::open(&state.git())
-        .with_context(|| format!("opening {}", state.root().display()))?
-        .settings()
-        .clone();
-    let (backing, mountpoint, stale_layers) = if stacked {
-        let (backing, mountpoint) = preflight_stacked(
-            state,
-            &settings,
-            &args.backing,
-            &args.mountpoint,
-            MountKind::Main,
-        )?;
-        let layers = agentfs_layers(&mountpoint).unwrap_or(1);
-        (backing, mountpoint, Some(layers))
-    } else {
-        create_mountpoint(&args.mountpoint, MountKind::Main)?;
-        let (backing, mountpoint) = preflight(
-            state,
-            &settings,
-            &args.backing,
-            &args.mountpoint,
-            MountKind::Main,
-        )?;
-        if std::fs::read_dir(&mountpoint).is_ok_and(|mut d| d.next().is_some()) {
-            eprintln!(
-                "warning: {} is not empty: the files in it are hidden by the mount and not \
-                 recorded (a workload wrote there while no daemon was mounted?)",
-                mountpoint.display()
-            );
-        }
-        if args.seal_mountpoint {
-            seal_mountpoint(&mountpoint)?;
-        }
-        (backing, mountpoint, None)
-    };
-    let overlay_layers = match &args.sandbox_overlay {
-        Some(at) if overlay_stacked => Some(agentfs_layers(at).unwrap_or(1)),
-        _ => None,
-    };
-    let overlay = sandbox_overlay(state, &settings, args, overlay_stacked)?;
-    // A stale layer below either mount may still be held by a workload.
-    let any_stacked = stacked || overlay_stacked;
-    agentfs_core::nested::add_views(workload_views(&mountpoint, args));
-    let events = session.events.clone();
-    let (recorder, committer, recovery) = session.open(state, &backing, &args.pod)?;
-    // The patch queue, before anything can see the tree: it
-    // lands only when the last mount stopped with nothing attached, or was
-    // another pod's while this mount point is in this pod's own volume,
-    // and no stale mount is below this one; otherwise it is judged and
-    // waits. A blocked queue is an alarm; the volume mounts anyway, and so
-    // it does when the queue cannot run at all.
-    let scope = PodScope::of(&args.pod.args.pod_uid, &mountpoint);
-    let deferred = if any_stacked {
-        Some(Deferred::StaleMount)
-    } else {
-        let judgement = attached::judge(state, scope.as_ref());
-        if let (Judgement::AnotherPod { uid }, Some(scope)) = (&judgement, &scope) {
-            eprintln!(
-                "patches: the previous mount of this volume (pod {uid}) did not stop with \
-                 nothing attached, but this is another pod ({}) with the mount point in its own \
-                 volume, which nothing attached to that pod's mount can reach: the queue runs",
-                scope.uid()
-            );
-        }
-        judgement.deferred()
-    };
-    patch_cmd::queue_at_start(
-        state,
-        &settings,
-        &recorder,
-        &committer,
-        &backing,
-        session.telemetry(),
-        &events,
-        deferred,
-    );
-    // From here until a stop with nothing attached, a workload may be.
-    attached::mark(state, scope.as_ref()).with_context(|| {
-        format!(
-            "writing {} (the patch queue's evidence of a clean stop)",
-            state.attached_mark().display()
-        )
-    })?;
-    let restorer = recorder.clone();
-    let pushers = push::open_all(state, &settings, events.clone(), session.telemetry())?;
-    let names: Vec<String> = pushers.iter().map(|p| p.name().to_owned()).collect();
-    let applier = patch_cmd::Applier::new(&committer, events.clone(), session.telemetry());
-    let service = Service::start(committer, pushers, events).context("starting the service")?;
-    let config = MountConfig {
-        volume: settings.volume.clone(),
-        backing: backing.clone(),
-        mountpoint: mountpoint.clone(),
-        passthrough: args.passthrough,
-        allow_other: !args.no_allow_other,
-        threads: args.threads,
-        sweep_interval: settings.sweep_interval,
-        repair_store: Some(state.repairs()),
-        stack_over: stacked.then(|| StackOver {
-            source: state.stack_source(),
-        }),
-        // A finished fork never gets here (`refuse_finished`).
-        read_only: false,
-        overlay,
-        unmount_grace: args.unmount_grace,
-    };
-    let mounted = match Mount::start(recorder, config) {
-        Ok(mounted) => mounted,
-        Err(e) => {
-            // The overlay failed after the mount point was served: the
-            // mount point was stopped as at a stop; report it as one.
-            if let MountError::Overlay { report, .. } = &e {
-                print_unmount(report, args.unmount_grace);
-            }
-            // Commits what recovery found; nothing was mounted, so nothing
-            // attached: the mark goes unless a stale mount is below.
-            let _ = service.shutdown(args.push_grace);
-            if !any_stacked {
-                clear_attached(state);
-            }
-            session.finish();
-            return Err(e.into());
-        }
-    };
-    // Restores and reverts through the mount. Without the
-    // socket the mount still works; restores then need it stopped.
-    // `agentfs push` through it too.
-    let control = start_control(
-        state,
-        push_now::handler(
-            state.clone(),
-            service.handle(),
-            misconfigured(&settings),
-            push_now::Restores::Serve(recovery::Daemon {
-                state: state.clone(),
-                recorder: restorer,
-                view: mounted.view(),
-                commit_window: settings.commit_window,
-            }),
-            applier,
-        ),
-    );
-    add_mounted_views(&mountpoint);
-    daemon.watch(mounted.ended(), Wake::Unmounted)?;
-    daemon.watch(mounted.failed(), Wake::PassthroughFailed)?;
-    let startup = mounted.startup_repairs();
-    if startup.loaded > 0 {
-        eprintln!(
-            "{} path(s) a previous mount could not record: {} repaired from the backing tree, \
-             {} still failing",
-            startup.loaded, startup.repaired, startup.still_queued
-        );
-    }
-    if let Some(layers) = stale_layers {
-        eprintln!(
-            "stacked over a stale mount left by a crashed daemon at {} ({layers} stale \
-             layer(s) below): the workload's copies of the mount now reach this daemon",
-            mountpoint.display()
-        );
-    }
-    if let (Some(layers), Some(at)) = (overlay_layers, mounted.overlay_mountpoint()) {
-        eprintln!(
-            "stacked the sandbox overlay over a stale mount left by a crashed daemon at {} \
-             ({layers} stale layer(s) below): the sandboxes' copies of it now reach this daemon",
-            at.display()
-        );
-    }
-    eprintln!(
-        "mounted {} at {} (volume {}, passthrough: {}, threads {}, {} uncommitted record(s) \
-         recovered, remotes: {}{}); stop with SIGINT or SIGTERM",
-        backing.display(),
-        mountpoint.display(),
-        settings.volume,
-        mounted.passthrough(),
-        mounted.threads(),
-        recovery.uncommitted,
-        list(&names),
-        describe_overlay(&mounted, args)
-    );
-
-    let wake = daemon.wait();
-    let failed = wake == Wake::PassthroughFailed;
-    if failed {
-        eprintln!("passthrough: {}", mounted.passthrough());
-    }
-    let overlay_at = mounted.overlay_mountpoint().map(Path::to_path_buf);
-    eprintln!(
-        "{}: unmounting (waiting up to {:?} for open files, then {:?} for the final push; signal \
-         again to exit now)",
-        describe_mount_wake(wake, mounted.ended_session(), overlay_at.as_deref()),
-        args.unmount_grace,
-        args.push_grace
-    );
-    // Before the unmount: a restore writes through the mount. Push
-    // requests waiting on the service return first.
-    service.handle().close();
-    if let Some(control) = control
-        && !control.shutdown(args.unmount_grace)
-    {
-        eprintln!("a restore was still running at shutdown; it stops with the unmount");
-    }
-    let report = mounted.shutdown();
-    print_unmount(&report, args.unmount_grace);
-    // The layers earlier crashes left under a stacked mount (the overlay's
-    // too).
-    let mut stale_left = false;
-    for at in std::iter::once(&mountpoint).chain(overlay_at.as_ref()) {
-        stale_left |= detach_layers_left(at);
-    }
-    // Nothing attached: the unmount was not busy, no file stayed open and
-    // no stale layer (which a workload may still hold) was below. Else the
-    // mark stays, and the next mount holds the patch queue.
-    if report.unmount_errors.is_empty() && !report.lazy && !report.session_abandoned && !stale_left
-    {
-        clear_attached(state);
-    } else if let Some(scope) = &scope {
-        eprintln!(
-            "a workload may still be attached: a restart of agentfs in this pod ({}) holds the \
-             patch queue until a mount stops with nothing attached; the next pod lands it \
-             (docs/runbooks/patch-queue.md)",
-            scope.uid()
-        );
-    } else {
-        eprintln!(
-            "a workload may still be attached: the next mount holds the patch queue until a \
-             mount stops with nothing attached (docs/runbooks/patch-queue.md)"
-        );
-    }
-    let code = stop_service(service, args.push_grace);
-    session.finish();
-    Ok(if failed { ExitCode::FAILURE } else { code })
-}
-
-/// Removes the attached mark: a mount stopped with nothing
-/// attached. A failure leaves it, and the next mount holds the queue.
-fn clear_attached(state: &StateDir) {
-    if let Err(e) = attached::clear(state) {
-        eprintln!(
-            "warning: removing {}: {e}; the next mount holds the patch queue",
-            state.attached_mark().display()
-        );
-    }
-}
-
-/// Reports what an unmount did and what it could not record.
-fn print_unmount(report: &UnmountReport, unmount_grace: Duration) {
-    for error in &report.unmount_errors {
-        eprintln!("unmount failed: {error}");
-    }
-    if report.lazy {
-        eprintln!("the mount was busy: detached lazily");
-    }
-    if report.session_abandoned {
-        if report.lazy || !report.unmount_errors.is_empty() {
-            eprintln!(
-                "files were still open after {unmount_grace:?}: their later changes are not \
-                 recorded"
-            );
-        } else {
-            // The unmount was not busy, so what holds the session is
-            // another mount of this filesystem, not this one.
-            eprintln!(
-                "the filesystem was still mounted elsewhere after {unmount_grace:?} (a bind of \
-                 it, such as a kubelet subPath mount, or a copy in another mount namespace): \
-                 the session ends as agentfs exits, and changes through those mounts after \
-                 this are not recorded"
-            );
-        }
-    }
-    if report.swept > 0 || report.repaired > 0 {
-        println!(
-            "final sweep: {} open file(s) recorded, {} failed record(s) repaired",
-            report.swept, report.repaired
-        );
-    }
-    if report.captured > 0 {
-        println!("unmount: {} database group(s) captured", report.captured);
-    }
-    if let Some(e) = &report.tmp_wipe_error {
-        eprintln!(
-            "warning: the sandbox overlay's tmp layer was not wiped: {e} (the next start wipes it)"
-        );
-    }
-    if report.unrepaired > 0 {
-        match &report.repairs_saved {
-            Some(store) => eprintln!(
-                "{} path(s) could not be recorded (see the alarms); they are saved in {} and \
-                 the next mount records them from the backing tree before it serves anything: {}",
-                report.unrepaired,
-                store.display(),
-                report.unrepaired_paths.join(", ")
-            ),
-            None => eprintln!(
-                "{} path(s) could not be recorded, nor saved for the next mount (see the \
-                 alarms); history differs from the backing tree at these paths until each is \
-                 changed again: {}",
-                report.unrepaired,
-                report.unrepaired_paths.join(", ")
-            ),
-        }
-    }
-}
 type Opened = (volume::Recorder, volume::Committer, volume::Recovery);
 
 fn volume_name(state: &StateDir) -> Result<String> {

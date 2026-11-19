@@ -12,7 +12,7 @@
 //!   ([`agentfs_core::release::decide`]) and never pushes;
 //! - the node plugin ([`node`], [`supervisor`]) starts one
 //!   `agentfs serve-history` per staged volume and one
-//!   `agentfs mount --history-service` front per pod, bind-mounted onto
+//!   `agentfs front --history-service` front per pod, bind-mounted onto
 //!   the kubelet's target, and recovers them when they crash;
 //! - the release scan ([`release_scan`]) pushes every worktree no pod
 //!   stages until a remote holds its head, and finishes and publishes the

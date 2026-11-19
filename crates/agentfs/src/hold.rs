@@ -1,9 +1,9 @@
 //! `mount --on-stale-mount hold`: what a restarted sidecar does when its
-//! previous daemon died and left the mount point, the sandbox overlay's
-//! mount point, or both, stale.
+//! previous daemon died and left a view's mount point stale (docs/trees.md,
+//! "Restarting after a crash").
 //!
-//! `--on-stale-mount recover` (the shipped sidecar's mode) mounts over the
-//! stale mount instead; hold is for operators who want to
+//! `--on-stale-mount recover` mounts over the stale mount instead; hold is
+//! for operators who want to
 //! recover by hand. With hold, the sidecar recovers a crashed daemon by
 //! restarting the pod. Detaching the dead mount
 //! and mounting afresh is not safe: workload containers still hold the
@@ -24,14 +24,13 @@
 use std::path::Path;
 use std::process::ExitCode;
 
-use agentfs_fuse::{MountState, detach_stale_layers, mount_state};
+use agentfs_fuse::stale::{MountState, STALE_LAYERS, detach_stale_layers, mount_state};
 
-use crate::STALE_LAYERS;
 use crate::daemon::Daemon;
 
 /// Holds until SIGINT or SIGTERM, then detaches each mount point in
-/// `stale` (the mount point, the sandbox overlay's, or both, each with the
-/// source of its stale agentfs mount) that is still a stale agentfs mount.
+/// `stale` (each with the source of its stale agentfs mount) that is still
+/// a stale agentfs mount.
 /// Always exits 1: nothing was mounted.
 pub fn hold(daemon: Daemon, stale: &[(&Path, &str)]) -> ExitCode {
     for (mountpoint, source) in stale {

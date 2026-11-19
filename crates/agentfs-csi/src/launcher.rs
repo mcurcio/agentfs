@@ -1,5 +1,5 @@
 //! Starting the `agentfs` children the node plugin supervises: one `agentfs serve-history` per staged volume, one
-//! `agentfs mount --history-service` front per published target, and the
+//! `agentfs front --history-service` front per published target, and the
 //! release scan's children ([`crate::release_scan`]): one `agentfs flush`
 //! then one `agentfs push` per worktree no pod stages, and one `agentfs
 //! fork finish` per fork
@@ -343,7 +343,7 @@ pub fn anonymous_replica(key: &str) -> String {
     format!("publish-{key}")
 }
 
-/// `agentfs --state S mount --history-service unix:<socket> ... B <source>`,
+/// `agentfs --state S front --history-service unix:<socket> ... B <source>`,
 /// with a `--workload-mount` for each of `workload_mounts`.
 #[allow(clippy::too_many_arguments)]
 pub fn front_spec(
@@ -359,7 +359,7 @@ pub fn front_spec(
     let mut args = vec![
         os("--state"),
         layout.state(handle).into_os_string(),
-        os("mount"),
+        os("front"),
         os("--history-service"),
         os(format!("unix:{}", layout.socket(handle).display())),
     ];
@@ -478,7 +478,7 @@ mod tests {
         assert_eq!(spec.label, "front ns/web-0 k");
         assert_eq!(
             strings(&spec).join(" "),
-            "--state /b/v/state mount --history-service unix:/n/run/v/history.sock \
+            "--state /b/v/state front --history-service unix:/n/run/v/history.sock \
              --history-slot 3 --history-wait 30000ms --threads 4 --passthrough auto \
              --namespace ns --pod web-0 --pod-uid u-1 --node n1 --replica web-0 /b/v/backing \
              /m/v/k"

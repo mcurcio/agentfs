@@ -1,5 +1,5 @@
 //! The node plugin's supervisor: one `agentfs
-//! serve-history` per staged volume, one `agentfs mount --history-service`
+//! serve-history` per staged volume, one `agentfs front --history-service`
 //! front per published target, and their recovery.
 //!
 //! - **Stage** checks the worktree under its lock: it never creates one

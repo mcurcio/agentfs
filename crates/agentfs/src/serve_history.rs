@@ -139,14 +139,14 @@ pub(crate) fn serve(
             state.clone(),
             service.handle(),
             misconfigured(&settings),
-            push_now::Restores::ServeFronts(recovery::ServiceDaemon {
+            push_now::Restores::ServeFronts(Box::new(recovery::ServiceDaemon {
                 state: state.clone(),
                 recorder,
                 fronts: server.listening_fronts(),
                 backing: backing.clone(),
                 commit_window,
                 stopping: stopping.clone(),
-            }),
+            })),
             applier,
         ),
     );

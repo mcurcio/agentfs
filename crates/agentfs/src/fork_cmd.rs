@@ -115,6 +115,10 @@ pub enum ForkCommand {
     /// receiver's git repository; exit 0 delivered or already, 1 refused,
     /// 75 unavailable (retry).
     Deliver(DeliverArgs),
+    /// A tree volume's keyed fork (`mount --fork-key`): end it. It drops
+    /// once its landings are taken and no file is open in it. Exits 75 while
+    /// a mount holds the volume.
+    End(crate::launcher::EndArgs),
 }
 
 #[derive(Args)]
@@ -450,6 +454,8 @@ pub fn run(
             Ok(ExitCode::SUCCESS)
         }
         ForkCommand::Deliver(args) => deliver_cmd(args),
+        // The tree engine's: `main` hands it to `launcher::end_fork`.
+        ForkCommand::End(_) => bail!("fork end runs the tree engine; it is not a recording command"),
     }
 }
 
