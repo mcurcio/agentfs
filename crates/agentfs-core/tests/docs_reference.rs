@@ -6,6 +6,7 @@
 //! - the same for the operator attributes ([`rules::OPERATOR_ATTRIBUTES`]);
 //! - every relative link and `#anchor` in README.md and docs/ resolves;
 //! - every CI job runs on the pinned runner, `ubuntu-24.04`;
+//! - the Dockerfile's dependency-cache stage stubs every workspace member;
 //! - every script under ci/ is executable, and no pipe in one ends in a
 //!   reader that exits early (pipefail turns its SIGPIPE into a failure);
 //! - every page under docs/ is in the book's docs/SUMMARY.md;
@@ -460,6 +461,49 @@ fn rust_toolchain_is_pinned_once() {
     assert!(
         problems.is_empty(),
         "rust-toolchain.toml pins {channel}; name it nowhere else:\n{}",
+        problems.join("\n")
+    );
+}
+
+/// The Dockerfile's dependency-cache stage copies every workspace member's
+/// manifest and stubs its `src/lib.rs`: cargo refuses to load a workspace
+/// with a member it cannot read, so a crate added to `Cargo.toml` and not
+/// here breaks every image build.
+#[test]
+fn dockerfile_stubs_every_workspace_member() {
+    let root = workspace();
+    let manifest = std::fs::read_to_string(root.join("Cargo.toml")).unwrap();
+    let members_line = manifest
+        .lines()
+        .find(|l| l.trim_start().starts_with("members = ["))
+        .expect("Cargo.toml lists its members on one line");
+    let members: Vec<&str> = members_line.split('"').skip(1).step_by(2).collect();
+    assert!(
+        !members.is_empty(),
+        "no workspace members in {members_line}"
+    );
+    let dockerfile = std::fs::read_to_string(root.join("Dockerfile")).unwrap();
+    let words: BTreeSet<&str> = dockerfile.split_whitespace().collect();
+    let mut problems = Vec::new();
+    for m in members {
+        let copied = dockerfile
+            .lines()
+            .any(|l| l.starts_with("COPY ") && l.contains(&format!("{m}/Cargo.toml")));
+        if !copied {
+            problems.push(format!("{m}: no COPY of {m}/Cargo.toml"));
+        }
+        if !words.contains(format!("{m}/src").as_str()) {
+            problems.push(format!("{m}: no stub directory {m}/src"));
+        }
+        if !words.contains(format!("{m}/src/lib.rs").as_str())
+            && !dockerfile.contains(&format!("> {m}/src/main.rs"))
+        {
+            problems.push(format!("{m}: no stub {m}/src/lib.rs or main.rs"));
+        }
+    }
+    assert!(
+        problems.is_empty(),
+        "the Dockerfile's dependency-cache stage misses workspace members:\n{}",
         problems.join("\n")
     );
 }
