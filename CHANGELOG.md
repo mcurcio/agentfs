@@ -12,6 +12,19 @@ design was reviewed on 2026-10-12.
 
 ### Added
 
+- **Tree views: operator rules and the untracked area.** A tree volume reads
+  `history.git/info/exclude` and `history.git/info/attributes` when it opens.
+  A new name they leave out (`-agentfs`, an `info/exclude` pattern), a `.git`
+  name, anything inside a nested repository and anything under an untracked
+  directory lives in the tree's untracked area: an ordinary Linux file the view
+  merges into the tree, never journaled, gated, landed or in history, so
+  secrets, SQLite databases, sessions and logs work through the mount and stay
+  out of history. A tracked entry wins its name, and rules decide only for new
+  names. A new fork starts with a copy of its upstream's untracked area, taken
+  at one instant while the upstream's untracked writes are held; a dropped
+  fork's area is removed. A rule tree volumes do not build (`agentfs.<name>`,
+  `filter=lfs`) refuses the volume, naming its line. The Rules domain is the
+  new pure crate `agentfs-rules`.
 - **Tree views: M2 fixes.** A directory's record in history is named by its
   path's blob id, with the path inside, so a clone or checkout of history
   works however deep a directory is. `fsync` and close of a descriptor make

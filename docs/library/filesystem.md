@@ -712,6 +712,37 @@ after its pages were dropped. `close` is a lazy unmount (`fusermount3 -uz`),
 idempotent. `wait`, after every view ended, joins the workers and fails when
 the actor stopped.
 
+Each view merges its tree's untracked area (`TreeSession::untracked_area`)
+into the tree ([trees](../trees.md#rules-and-the-untracked-area)), routing each
+call to one half in `tree_view`, with the untracked half in
+`tree_view/untracked.rs`:
+
+- **Inodes.** A tracked entry's inode is its node number + 2; an untracked
+  entry's is `1 << 63 | n`, `n` from the view's table keyed by the backing
+  file, with its last known path, kept through renames and unlinks.
+- **Names.** `lookup` finds the tracked entry first, then the area's. A new
+  name (`create`, a regular file's `mknod`, `mkdir`, `symlink`) goes to the
+  half the rules place it in (`RuleSet::place`, judged under the actor's lock,
+  with `inside_repository` read from the area); an existing name stays in its
+  half, and `O_EXCL` answers `EEXIST` for a name in either.
+- **Listings.** A tracked directory lists its tracked children at offsets 1
+  on, then the area's entries at the same path that no tracked child hides, at
+  offsets `(1 << 62) + j + 1`; an untracked directory lists the area's.
+- **Untracked calls.** Plain passthrough on the area, never gated, journaled or
+  made under the actor's lock: `open` (the caller's access flags with
+  `O_NOFOLLOW`, `FOPEN_DIRECT_IO`), `pread` and `pwrite` (page fills and page
+  writes included; an `O_APPEND` write at the file's end), `fsync` and
+  `fdatasync` of the descriptor, `fchmodat`, `fchownat`, `ftruncate` and
+  `utimensat` for `setattr`, `unlinkat`, `mkdirat`, `symlinkat`,
+  `readlinkat`, and `renameat2` within the half (`RENAME_NOREPLACE` served). A
+  new entry is given to the caller when the view host has `CAP_CHOWN` and
+  `CAP_FOWNER`. Every change holds the area against a fork's copy while it
+  runs. A read-only view answers `EROFS` to each.
+- **Across the halves.** A rename between them answers `EXDEV`, a hard link to
+  an untracked file `EPERM`. A tracked directory with untracked entries is not
+  empty (`ENOTEMPTY`); its rename moves them, and its `rmdir` removes its empty
+  container. `fsyncdir` makes the area's directory durable as well.
+
 The views use zero entry and attribute TTLs and direct I/O. Read-only
 descriptors keep saved bytes; writable ones read their own calls and the
 file's page writes. A read with no lock owner is a page fill and a write with

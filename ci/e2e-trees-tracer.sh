@@ -17,11 +17,14 @@
 #    holds it (at `files/<aa>/<bb>/a.txt`, as every envelope commit does: docs/trees.md), with `Agentfs-Volume: t`, the volume's id and the pod trailers
 #    the mount was given. The workload makes a directory and an executable
 #    script and runs it: history holds the script as `100755` and the
-#    directory's `dirs/` record.
+#    directory's `dirs/` record. With `*.db -agentfs` and `.env -agentfs` in
+#    history.git/info/attributes, the workload's state.db and .env work through
+#    the mount and never reach history (docs/trees.md, "Rules and the untracked
+#    area").
 # 3. agentfs is killed with SIGKILL while the workload writes, the stale mount
 #    is lazily unmounted and agentfs mounts again: every write the workload saw
 #    answered is in history, with its pod trailers, and a restarted workload
-#    writes through the new mount.
+#    writes through the new mount; state.db and .env are still there.
 # 4. (--figures) The flat workloads of ci/trees-figures.py through the mount,
 #    on the image's release build, each against its own deadline: the report
 #    is $RUNNER_TEMP/trees-figures-FS.json (docs/performance.md, "Tree views,
@@ -155,6 +158,9 @@ assert_contains "$(cat "$RECEIPTS/refused.log")" 'another volume is here' 'and s
 assert_eq "$before" "$(state_hashes)" 'every file under the state area is unchanged'
 
 step '2. a close returns with its save on record, named'
+# The operator's rules, read when the volume opens.
+in_state sh -c 'mkdir -p /data/state/history.git/info &&
+  printf "*.db -agentfs\n.env -agentfs\n" > /data/state/history.git/info/attributes'
 mount_view
 # The root starts owned by whoever ran `trees init` (root here), mode 0755:
 # root gives it to the workload's user through the mount, as with the
@@ -190,6 +196,19 @@ record=$(tree_git_dir_record tools/bin)
 built_mode "$record" 100644 'the directory has its record'
 assert_contains "$(in_history show "root:$record")" '"path":"tools/bin","kind":"dir"' 'the record is the directory'
 pass 'the directory tools/bin has its dirs/ record'
+# A database and a secret the rules keep out: written and read through the
+# mount, never in history.
+workload -- 'printf "SQLite format 3" > /agentfs/root/state.db &&
+  printf "TOKEN=x\n" > /agentfs/root/.env &&
+  [ "$(cat /agentfs/root/state.db)" = "SQLite format 3" ] &&
+  [ "$(cat /agentfs/root/.env)" = "TOKEN=x" ] &&
+  ls -a /agentfs/root | grep -x .env >/dev/null' || fail 'the workload could not write state.db and .env'
+# A later save is built after them: history up to it holds neither.
+workload -- 'printf later > /agentfs/root/later.txt'
+built "root:files/$(tree_git_fanned later.txt)" later 'a save after them is built'
+names=$(in_history log --all --name-only --format=)
+if grep -E '/(state\.db|\.env)$' <<<"$names"; then fail 'an untracked file reached history'; fi
+pass 'state.db and .env work through the mount and are not in history'
 
 step '3. SIGKILL mid-stream: every answered write is in history'
 workload -v "$RECEIPTS:/receipts" -d -- '
@@ -219,6 +238,9 @@ assert_eq '' "$unnamed" 'every commit on the root carries its pod trailers'
 workload -- 'printf again > /agentfs/root/after.txt && cat /agentfs/root/after.txt >/dev/null'
 built "root:files/$(tree_git_fanned after.txt)" again 'a restarted workload writes through the new mount'
 pass 'a restarted workload writes through the new mount'
+workload -- '[ "$(cat /agentfs/root/state.db)" = "SQLite format 3" ] &&
+  [ "$(cat /agentfs/root/.env)" = "TOKEN=x" ]' || fail 'state.db or .env did not survive the restart'
+pass 'state.db and .env survive the kill and restart'
 has_trailers "$(in_history log -1 --format=%B root)" 'its save'
 
 if [ -n "$FS" ]; then

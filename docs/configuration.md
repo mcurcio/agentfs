@@ -271,6 +271,14 @@ count only there, never in a tracked `.gitattributes`, whatever
 | `agentfs.group` | name | unset: the path alone | For the `fsync` class: paths in one directory with the same group and the same stem (`app.db`, `app.db-wal`, `app.db-journal`) are captured together |
 | `agentfs.maxSize` | positive size (`k`, `m`, `g`: powers of 1024) | unset | Any path: content larger than this is refused (`PathRefused`, reason `max_size`), whether stored as a blob or LFS. In a group, it refuses the whole capture |
 
+**Tree volumes** (`agentfs trees`) read `<state>/history.git/info/exclude`
+and `<state>/history.git/info/attributes` when the volume opens
+([trees](trees.md#rules-and-the-untracked-area)). They accept only `-agentfs`
+of the attributes above: any other `agentfs.<name>` attribute, `filter=lfs`
+and `agentfs=<value>` refuse the volume, before anything is written, with
+`info/attributes line N: agentfs.group=x is not built for tree volumes`.
+Other git attributes are accepted and change nothing.
+
 Values of `agentfs.commit`, `agentfs.coalesce` and `agentfs.maxSize` are
 checked when the volume opens: a bad one fails `mount`, `run`, `record`
 and the other commands with

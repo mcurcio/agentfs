@@ -1438,3 +1438,32 @@ M2 residuals (each to become a bead):
   FSYNCDIR, a cut, and the modes, owners and times checked after replay (runs on main after landing).
 - **A stable readdir cookie** (B-F12). Files: `agentfs-fuse/src/tree_view.rs` (`readdir`), `Shape::children`.
   Done: an unlink between two readdir batches skips no untouched entry; a test of it.
+
+## 2026-11-19, M3 S1 (operator rules and the untracked area): where the brief was short
+
+1. **The engine guard answers `Error::Name` for a `.git` name, not `Error::Untracked`.** `recording::name` (RepoPath)
+   refuses every git spelling of `.git` first, and `crates/agentfs-core/tests/tree_actor.rs`
+   (`single_actor_and_invalid_names_fail_before_recording`, not this slice's file) asserts `Error::Name` for `.git`
+   and `d/.git`. The guard runs after `name()`, so the engine answers `EINVAL` there and `EXDEV` for every other
+   untracked placement; the view never calls the engine for a `.git` name (it routes it to the area itself).
+2. **The rules error is lost on the CLI's path.** `trees mount` opens the volume through `VolumeService::stage`, whose
+   `StateArea` port (`state_area::volume_error`) maps every other actor error to `VolumeError::NotDurable(Other(errno))`,
+   so the user sees "the volume's state could not be made durable: Other(22)". The actor now logs
+   `tree RulesRefused: info/attributes line N: ...` before it fails, which names the line (the badrules e2e checks
+   that). The proper fix is a `VolumeError` variant carrying the reason (agentfs-contracts `volume.rs` and
+   `state_area.rs`, neither owned by S1).
+3. **A fork of a fork is not reachable.** `TreeActor::fork_with` refuses an upstream other than the root, so the owner's
+   requirement (4) ("a fork of a fork copies its own upstream's area") holds by construction (`copy_area(upstream,
+   fork)`) but has no test.
+4. **"A kill mid-copy" is tested by the state a kill leaves, not by a kill.** A failpoint inside the copy needs a name in
+   `failpoints::POINTS` (`crates/agentfs-core/src/failpoints.rs`, not owned). `tree_rules.rs` plants a cut copy under
+   `.staging/` and a published copy no fork owns, and checks the open removes both.
+5. **`agentfs-rules` also depends on `gix-parallel`** (feature `parallel`): without it `gix-attributes`' names are `Rc`
+   and a `RuleSet` is not `Send + Sync`, which the shared `Arc<RuleSet>` needs. Feature unification hid this in the
+   workspace build but not in `cargo test -p agentfs-rules`.
+6. **The brief's `fork FORKMOUNT` e2e mode ("shows none of the root's untracked files") contradicts the owner's
+   2026-11-19 answer.** It is split: `early-fork` checks a fork made before the root's untracked files has none of
+   them; `fork` checks a fork made after them starts with a copy, and that later writes stay on their side.
+7. **`docs/target-architecture/future/one-engine.md` is not in S1's owned paths**, so its M3 row is left to S3.
+8. **A dropped fork's area goes with its checkout, so only a fork the builder had checked out loses its area at once.**
+   One dropped before it was ever built keeps its area until the next open's sweep.

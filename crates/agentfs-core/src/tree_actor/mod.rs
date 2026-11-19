@@ -871,8 +871,16 @@ impl TreeActor {
         identity: VolumeIdentity,
         service: PodContext,
     ) -> Result<Self> {
-        // Before anything is written: a rule that is not built refuses the volume.
-        let rules = Arc::new(read_rules(&root)?);
+        // Before anything is written: a rule that is not built refuses the
+        // volume, said here in full since a caller's port may carry only its
+        // errno.
+        let rules = match read_rules(&root) {
+            Ok(rules) => Arc::new(rules),
+            Err(e) => {
+                eprintln!("tree RulesRefused: {e}");
+                return Err(e);
+            }
+        };
         let (built_log, entries) = BuiltLog::open(&root.join(BUILT_LOG))?;
         let (journal, frames) =
             Journal::open(&root.join(JOURNAL), built_log::built_through(&entries))?;

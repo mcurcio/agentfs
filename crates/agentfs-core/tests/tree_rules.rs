@@ -169,8 +169,7 @@ fn empty_or_missing_rule_files_change_nothing() {
             v.close(h).unwrap();
             v.unlink(TreeId::Root, path, &w).unwrap();
         }
-        // The built-ins stay: a name inside an untracked directory is not
-        // the engine's to judge, and a `.git` name is no git-safe name.
+        // A `.git` name is still refused: it is no git-safe name.
         assert!(matches!(
             v.mkdir(TreeId::Root, ".git", ATTRS, &w),
             Err(Error::Name)
@@ -450,4 +449,52 @@ fn a_copy_waits_for_changes_in_progress_and_holds_new_ones() {
     let fork = forking.join().unwrap();
     let area = v.lock().unwrap().untracked_area(fork).unwrap();
     assert_eq!(fs::read(area.dir().path().join("wal")).unwrap(), b"frame");
+}
+
+/// Each fork's copy is the upstream's area at one instant: a writer that
+/// writes `n` to `a` then to `b`, each change holding the area, is never seen
+/// with `a` and `b` more than one write apart, however the copy interleaves.
+#[test]
+fn every_copy_is_the_area_at_one_instant() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut v = new_actor(tmp.path());
+    let root = std::sync::Arc::new(v.untracked_area(TreeId::Root).unwrap());
+    let base = root.dir().path().to_path_buf();
+    fs::write(base.join("a"), b"0").unwrap();
+    fs::write(base.join("b"), b"0").unwrap();
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writer = {
+        let (root, stop, base) = (
+            std::sync::Arc::clone(&root),
+            std::sync::Arc::clone(&stop),
+            base.clone(),
+        );
+        std::thread::spawn(move || {
+            let mut n = 0_u64;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                n += 1;
+                for name in ["a", "b"] {
+                    let _writing = root.writing();
+                    fs::write(base.join(name), n.to_string()).unwrap();
+                }
+            }
+        })
+    };
+    let mut forks = Vec::new();
+    for _ in 0..20 {
+        forks.push(rowless_fork(&mut v));
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    writer.join().unwrap();
+    for fork in forks {
+        let area = v.untracked_area(fork).unwrap();
+        let read = |name: &str| -> u64 {
+            fs::read_to_string(area.dir().path().join(name))
+                .unwrap()
+                .parse()
+                .unwrap()
+        };
+        let (a, b) = (read("a"), read("b"));
+        assert!(a == b || a == b + 1, "{fork}: a {a}, b {b}");
+    }
 }

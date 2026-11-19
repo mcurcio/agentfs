@@ -788,6 +788,46 @@ directory these rules judged and every path an entry of the change arrives
 at: a step that makes, moves or removes an entry under such a directory after
 the decision refuses the take, which is decided again.
 
+### Rules and the untracked area
+
+The Rules domain is its own pure crate, `agentfs-rules`: no I/O, built once.
+`RuleSet::build(&RuleTexts { exclude, attributes }, Nested::Exclude)` takes the
+bytes of `info/exclude` and `info/attributes` and refuses a rule tree volumes do
+not build (`RulesError::NotBuilt` for an `agentfs.<name>` attribute or
+`filter=lfs`, `RulesError::BadValue` for `agentfs=<value>`, each with its line).
+`place(path, kind, PathFacts { parent_untracked, inside_repository })` answers
+`Placement::Tracked` or `Placement::Untracked(reason)` for a new name, the
+built-ins first; `never_records(path)` says whether `-agentfs` marks it.
+`OperatorRules` is the operator layer alone: `ignored(path, is_dir)` gives the
+`info/exclude` pattern that excludes a new path and `attributes(path)` what
+`info/attributes` sets ([trees](../trees.md#rules-and-the-untracked-area)).
+
+The tree actor reads `<state>/history.git/info/exclude` and
+`info/attributes` when it opens, before anything is written; a rule not built
+fails the open with `Error::Rules` (`EINVAL`). `TreeActor::rules()`,
+`Recording::rules()` and `TreeSession::rules()` give the rule set. Every call
+that makes a name (`write_open` with a create, `mkdir`, `symlink`,
+`first_link`, and `rename` onto a name with no entry) refuses one the rules
+place untracked with `Error::Untracked { path, reason }` (`EXDEV`), before
+anything is journaled; a name that is not git-safe is refused first, as
+`Error::Name`. Rules decide only for new names: a path with an entry stays
+recorded.
+
+`TreeActor::untracked_area(tree)`, `Recording::untracked_area(tree)` and a
+view's `TreeSession::untracked_area()` give a tree's `UntrackedArea`,
+`<state>/untracked/<tree>/`, made on first use. It is reached only beneath its
+directory (`dir()`, a `confined::Dir`): `parent(path)` opens a path's parent for
+an `*at` call, `stat(path)` is an `lstat`, `entries(dir)` lists a directory,
+`containers(path, meta_of)` makes the directories above a path with the modes
+and owners of the tracked directories they stand for, and `place(path, src,
+len, meta)` puts a file or link in place atomically (written under
+`<state>/untracked/.staging/`, fsynced, renamed). `writing()` holds the area
+against a fork's copy for one change; a caller holding it never takes the
+actor's lock. `fork_with` copies the upstream's area as the fork's before the
+fork's step, holding the upstream's changes while it copies; the builder
+removes a dropped fork's area with its checkout, and an open removes every
+copy no fork owns.
+
 ### Sessions
 
 `session::Sessions::new(recording)` holds the history service's sessions of a
