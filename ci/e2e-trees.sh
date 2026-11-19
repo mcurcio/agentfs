@@ -138,7 +138,7 @@ PY
 # Directories, modes, owners, links and times through the view; history is
 # read after the restart.
 "${as_root[@]}" python3 ci/trees-posix.py view "$work/main"
-"${as_root[@]}" python3 ci/trees-untracked.py view "$work/main"
+"${as_root[@]}" python3 ci/trees-untracked.py view "$work/main" "$pid"
 python3 ci/trees-untracked.py early-fork "$work/fork"
 mmap_status=0
 python3 ci/trees-mmap.py "$work/main" "$work/state/history.git" || mmap_status=$?
@@ -204,7 +204,7 @@ fusermount3 -uz "$work/fork"
 test "$(git --git-dir="$work/state/history.git" rev-parse root)" = "$head"
 start
 "${as_root[@]}" python3 ci/trees-posix.py touched "$work/main"
-"${as_root[@]}" python3 ci/trees-untracked.py remount "$work/main"
+"${as_root[@]}" python3 ci/trees-untracked.py remount "$work/main" "$pid"
 test "$(cat "$work/main/crash")" = acknowledged-before-kill
 test "$(cat "$work/main/isolation")" = fork
 test "$(cat "$work/fork/isolation")" = fork

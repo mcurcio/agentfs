@@ -6,7 +6,7 @@ these rules (ci/e2e-trees.sh writes them before the first mount):
     history.git/info/exclude     *.log, /sessions/, /logs/
     history.git/info/attributes  *.db, *.db-wal, *.db-shm and .env -agentfs
 
-    trees-untracked.py view MOUNT          as root: a secret, a log, a session,
+    trees-untracked.py view MOUNT HOST     as root: a secret, a log, a session,
                                            a tracked note, files of uid 10000,
                                            SQLite in WAL mode written by two
                                            processes, a nested git repository,
@@ -16,7 +16,7 @@ these rules (ci/e2e-trees.sh writes them before the first mount):
     trees-untracked.py early-fork MOUNT    a fork made before any of them shows
                                            none of the root's untracked files
     trees-untracked.py writer DB           writes the database until killed
-    trees-untracked.py remount MOUNT       after a kill and a restart, the root's
+    trees-untracked.py remount MOUNT HOST  after a kill and a restart, the root's
                                            untracked files are still there
     trees-untracked.py history GIT_DIR     no untracked name is in history; the
                                            note and the repository's directory are;
@@ -121,6 +121,22 @@ def owner(path):
     return (st.st_uid, st.st_gid)
 
 
+# The view host's process id (the mount command's), set from argv.
+HOST_PID = None
+
+
+def untracked_owner(caller):
+    """Who owns a new untracked file its caller made (docs/trees.md, "Rules
+    and the untracked area"): the caller when the view host may give files
+    away (CAP_CHOWN and CAP_FOWNER), else the host's own user and group."""
+    status = Path(f"/proc/{HOST_PID}/status").read_text().splitlines()
+    field = {line.split(":")[0]: line.split(":")[1].split() for line in status}
+    caps = int(field["CapEff"][0], 16)
+    if caps & (1 << 0) and caps & (1 << 3):
+        return caller
+    return (int(field["Uid"][1]), int(field["Gid"][1]))
+
+
 def write_rows(db, writer, rows):
     """One process's writes: `rows` inserts, each its own transaction."""
     con = sqlite3.connect(db, timeout=30)
@@ -143,7 +159,8 @@ def user_files(root):
     """uid 10000's files in a directory it may write: each owned by it."""
     for name in ("x.log", ".env", "n.md"):
         (root / "u" / name).write_bytes(b"mine")
-        assert owner(root / "u" / name) == (USER, USER), name
+        expected = (USER, USER) if name == "n.md" else untracked_owner((USER, USER))
+        assert owner(root / "u" / name) == expected, name
 
 
 def view(root):
@@ -152,8 +169,11 @@ def view(root):
     (root / "sessions").mkdir()
     (root / "sessions" / "s.json").write_bytes(b'{"id": 1}')
     (root / "notes.md").write_bytes(b"recorded\n")
-    for name in (".env", "app.log", "sessions/s.json", "notes.md"):
-        assert owner(root / name) == (0, 0), name
+    # A tracked file is its caller's; an untracked one is the caller's only
+    # when the view host may give files away.
+    assert owner(root / "notes.md") == (0, 0)
+    for name in (".env", "app.log", "sessions/s.json"):
+        assert owner(root / name) == untracked_owner((0, 0)), name
     # The secret is an ordinary file: its mode is the file's own.
     os.chmod(root / ".env", 0o600)
     assert stat.S_IMODE(os.stat(root / ".env").st_mode) == 0o600
@@ -309,7 +329,7 @@ def remount(root):
     assert (root / "app.log").read_bytes() == b"line 1\nline 2\n"
     assert integrity(root / "state.db") == 400
     assert (root / "notes.md").read_bytes() == b"recorded\n"
-    assert owner(root / "u" / "x.log") == (USER, USER)
+    assert owner(root / "u" / "x.log") == untracked_owner((USER, USER))
     assert (root / "repo" / ".git" / "HEAD").exists()
 
 
@@ -545,4 +565,6 @@ if __name__ == "__main__":
     }
     if sys.argv[1] in ("view", "remount", "fork") and os.geteuid() != 0:
         sys.exit(f"trees-untracked.py {sys.argv[1]} must run as root (euid {os.geteuid()})")
+    if sys.argv[1] in ("view", "remount"):
+        HOST_PID = int(sys.argv[3])
     commands[sys.argv[1]]()
