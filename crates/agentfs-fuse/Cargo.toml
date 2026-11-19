@@ -10,6 +10,8 @@ description = "The agentfs FUSE layer: a recording passthrough filesystem over a
 [dependencies]
 agentfs-contracts = { version = "0.1.0", path = "../agentfs-contracts" }
 agentfs-core = { version = "0.1.0", path = "../agentfs-core" }
+# The Rules domain: where a view's new names go (tree_view).
+agentfs-rules = { version = "0.1.0", path = "../agentfs-rules" }
 # Default features only: pure Rust (mount(2) as root, fusermount3
 # otherwise), no libfuse or pkg-config needed to build.
 fuser = "0.18.0"

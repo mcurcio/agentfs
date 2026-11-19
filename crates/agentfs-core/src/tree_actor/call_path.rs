@@ -42,6 +42,8 @@ pub struct Recording {
     durability: Arc<Durability>,
     /// The one owner of the Git store, reached without the actor's lock.
     history: History,
+    /// The operator's rules, read once at open, reached without the actor's lock.
+    rules: Arc<agentfs_rules::RuleSet>,
     /// The gate thread, joined at drop: it holds the store (and the state
     /// area's lease) until the builder has stopped.
     gate: Option<std::thread::JoinHandle<()>>,
@@ -81,6 +83,7 @@ impl Recording {
     fn serve(actor: TreeActor) -> Result<Arc<Self>, Error> {
         let durability = Arc::clone(actor.durability());
         let history = actor.history().clone();
+        let rules = Arc::clone(actor.rules());
         let gate = history.clone();
         let owner = crate::failpoints::owner();
         let gate = std::thread::Builder::new()
@@ -93,6 +96,7 @@ impl Recording {
             actor: Mutex::new(actor),
             durability,
             history,
+            rules,
             gate: Some(gate),
         }))
     }
@@ -117,6 +121,21 @@ impl Recording {
     /// As [`TreeActor::open`].
     pub fn open(root: &Path, service: &PodContext) -> Result<Arc<Self>, Error> {
         Self::serve(TreeActor::open(root, service)?)
+    }
+
+    /// The operator's rules, read when the volume opened: where each new
+    /// name of a tree lives (docs/trees.md, "Rules and the untracked area").
+    pub fn rules(&self) -> &Arc<agentfs_rules::RuleSet> {
+        &self.rules
+    }
+
+    /// `tree`'s untracked area, made if it has none.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotFound`] for no such tree; [`Error::Io`].
+    pub fn untracked_area(&self, tree: TreeId) -> Result<super::UntrackedArea, Error> {
+        self.actor()?.untracked_area(tree)
     }
 
     /// The actor, locked, for work that decides, appends and applies. The

@@ -160,6 +160,7 @@ fn every_module_is_in_the_architecture_map() {
     let mut problems = Vec::new();
     for krate in [
         "agentfs-contracts",
+        "agentfs-rules",
         "agentfs-volume",
         "agentfs-clients",
         "agentfs-trees",

@@ -662,6 +662,94 @@ and drops the kernel's pages of files a take changed. A file open for writing
 holds back that fork's syncs from its upstream until it closes; no alarm is raised
 for a waiting open. See [library/filesystem.md](library/filesystem.md).
 
+## Rules and the untracked area
+
+The operator's rules decide which new names a tree records. A name they leave
+out lives in the tree's **untracked area**: a plain directory of the state area
+that the view merges into the tree. Nothing in it reaches the journal, history,
+a queue or a remote.
+
+**The rule files.** `<state>/history.git/info/exclude` and
+`<state>/history.git/info/attributes`, in git's syntax. They are read once, when
+the volume opens, before anything is written; a missing file is empty, and a
+change takes a remount. Files in the tree, `.gitignore` and `.gitattributes`
+among them, are ordinary content and decide nothing.
+
+```text
+# history.git/info/exclude
+*.log
+/sessions/
+
+# history.git/info/attributes
+*.db     -agentfs
+*.db-wal -agentfs
+.env     -agentfs
+```
+
+**Rules decide only for new names**, as git's ignore rules apply only to
+untracked paths. A path the tree already records stays recorded, whatever the
+rules say. A new name is placed by the first of these that matches:
+
+1. Its directory is untracked: everything under it is too.
+2. A `.git` component: a nested repository's own files.
+3. A FIFO or a socket (`mknod` of either still answers `EPERM`).
+4. `-agentfs` in `info/attributes`: never recorded.
+5. Inside a nested repository: a directory above the name, other than the
+   tree's root, holds a `.git` entry.
+6. Excluded by `info/exclude`: the last matching pattern wins, matching is
+   case-sensitive, and once a directory is excluded nothing beneath it is
+   re-included.
+
+Anything else is recorded. A rule tree volumes do not build refuses the
+volume when it opens, naming the line, before anything is written: any
+`agentfs.<name>` attribute, `filter=lfs`, and `agentfs=<value>`. Other git
+attributes are accepted and change nothing.
+
+**What untracked means.** An untracked file is an ordinary Linux file: a write
+is seen at once by every reader, shared mappings stay coherent, `fsync` makes it
+durable, and record locks work within the view. No call on it is journaled or
+waits at the lag gate, takes and syncs never carry it, and history never shows
+it. Its mode, owner and times are the file's own; a new one is owned by the
+process that made it when the view host may give files away (`CAP_CHOWN` and
+`CAP_FOWNER`), else by the view host's user.
+
+**One namespace.** `ls` shows both halves. A tracked entry wins its name: an
+untracked entry under the same name stays hidden until the tracked one goes. A
+tracked directory that holds untracked entries is not empty, so `rmdir`
+answers `ENOTEMPTY`; renaming it moves its untracked entries with it. A rename
+between the halves, or onto a name of the other half, answers `EXDEV` (`mv`
+copies); a hard link to an untracked file answers `EPERM`.
+
+**Nested repositories.** `git init repo` in a view records the directory
+`repo`; `repo/.git` and every file made inside `repo` afterwards are untracked,
+so the repository works and its files stay out of the tree's history.
+
+**Forks.** A new fork's untracked area starts as a copy of its upstream's,
+taken when the fork is made:
+
+- The copy is the upstream's files at one instant. The upstream's untracked
+  changes wait while it is taken, so an open database is copied as a power cut
+  would leave it, and SQLite's write-ahead log recovers it when the fork first
+  opens it.
+- A fork never has part of a copy. The copy is made under
+  `<state>/untracked/.staging/`, made durable, and renamed into place before the
+  fork's step is recorded. A crash before the step leaves a copy no fork owns,
+  which the next open removes.
+- Each file is reflinked where the filesystem can (`FICLONE`), else copied.
+- Later writes on either side stay on that side.
+- A dropped fork's area is removed with its checkout.
+
+The costs: every secret in the upstream's area (an `.env`, a token) is copied
+into every fork; each copy takes space where reflinks are not available; and the
+upstream's untracked writes, with every call on the volume, wait while the copy
+is taken, for as long as copying the area takes.
+
+**Where it lives.** `<state>/untracked/<tree>/` (mode 0700), made on first use
+and reached only beneath it, never following a link. Directories in it that
+stand for tracked directories take their mode and owner. Untracked data shares
+the state area's disk: an area that fills it stops recording too (`ENOSPC` on
+the journal).
+
 ## Recovery
 
 On a stopped actor, preserve the state, fix the I/O or space problem and reopen. On
@@ -673,8 +761,9 @@ Nothing truncates journal records or resets history as repair.
 
 What the tree views do not support:
 
-- **Git-safe UTF-8 names only**, each component at most 255 bytes, and UTF-8
-  link targets. Hard links past an anonymous file's first answer `EPERM`;
+- **Git-safe UTF-8 names only** in the tree, each component at most 255 bytes,
+  and UTF-8 link targets. A `.git` name lives in the untracked area; git's
+  other spellings of it (`.GIT`, `git~1`) answer `EINVAL`. Hard links past an anonymous file's first answer `EPERM`;
   devices, FIFOs and sockets answer `EPERM`; extended attributes and ACLs are
   not supported.
 - **Times.** A file's mtime moves at its last close, not at each write
@@ -685,7 +774,12 @@ What the tree views do not support:
   `EOPNOTSUPP`, so the `O_TMPFILE`, `fchmod`, `linkat` pattern fails at the
   `fchmod`. An `O_TMPFILE` file made in a set-group-ID directory keeps the
   caller's group, and `linkat` keeps it.
-- **Nested forks, transactions, `Client::Outside`, rules and view profiles,
+- **Rules not built.** Only `-agentfs` and `info/exclude` decide; other
+  `agentfs.*` attributes, LFS, `agentfs.nested`, `respectTreeRules` and
+  extended attributes on untracked files are not built. A lookup that misses
+  and each create cost an `lstat` in the area, plus one per directory above
+  the name.
+- **Nested forks, transactions, `Client::Outside`, view profiles,
   replication, CSI, several view hosts, upgrades and snapshot opens** are not
   built. The designs for them are in [target-architecture](target-architecture/README.md).
 - **Telemetry export** is not wired. `--metrics-output` is the only measurement.

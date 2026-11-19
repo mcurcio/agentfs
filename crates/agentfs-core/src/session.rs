@@ -18,7 +18,7 @@ use agentfs_contracts::ports::{SessionAuthority, SessionBinder};
 
 use crate::tree_actor::{
     Attrs, DirEntry, Error, FileMap, Node, Recording, RenameMode, Saved, SetTime, Then, TreeActor,
-    TreeId,
+    TreeId, UntrackedArea,
 };
 
 type Result<T> = std::result::Result<T, Error>;
@@ -131,6 +131,21 @@ impl TreeSession {
             tree: self.tree,
             writes_as,
         })
+    }
+
+    /// The operator's rules ([`Recording::rules`]).
+    pub fn rules(&self) -> &Arc<agentfs_rules::RuleSet> {
+        self.sessions.recording.rules()
+    }
+
+    /// This session's tree's untracked area ([`Recording::untracked_area`]):
+    /// a view reaches no other tree's.
+    ///
+    /// # Errors
+    ///
+    /// As [`Recording::untracked_area`].
+    pub fn untracked_area(&self) -> Result<UntrackedArea> {
+        self.sessions.recording.untracked_area(self.tree)
     }
 
     /// This tree's lag gate ([`Recording::admit_then`]).

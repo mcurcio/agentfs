@@ -14,6 +14,7 @@ is. The libraries behind it, and why each was chosen, are under
 | `agentfs-fuse` | library | The FUSE layer: a passthrough filesystem over the backing tree that calls the engine at every change boundary |
 | `agentfs` | binary | The `agentfs` command (every subcommand is listed in [configuration](configuration.md#commands)); OpenTelemetry export |
 | `agentfs-csi` | library and binary | The CSI driver: `agentfs-csi`, one per node beside csi-provisioner, which makes the node's worktrees and supervises `agentfs serve-history`, `agentfs mount` and the release scan's `agentfs flush` and `agentfs push` children |
+| `agentfs-rules` | library | The Rules domain of the tree views, pure: where each new name of a tree lives, recorded or in its untracked area, from the operator's `info/exclude` and `info/attributes` ([trees](trees.md#rules-and-the-untracked-area)). Depends on `gix-ignore` and `gix-attributes` only; `agentfs-core` and `agentfs-fuse` depend on it |
 | `agentfs-align` | library | Git's histogram diff, called one way, for line identity (git-model §7). `agentfs-core` and `agentfs-model` both depend on it, so line identity does not depend on how `git` is called; one module, `lib.rs` |
 | `agentfs-contracts` | library | The shared kernel of the domains around the git model ([the system](target-architecture/system.md)): values (the tree and volume identities, names, the pod context), capabilities and their minter, each domain's trait, errors and events, and the ports adapters implement. No I/O; depends on no other agentfs crate |
 | `agentfs-volume` | library | The Volume domain, pure over its ports: `ensure`, the lifecycle and the release verdict |
@@ -50,6 +51,14 @@ missing from these tables or a row names a module that no longer exists;
 | `trees.rs` | The Trees domain's contract: fork settings, facts, phases, errors, events and the `Trees` trait |
 | `views.rs` | The Views domain's contract: mount points, mount options, errors and the `Views` trait |
 | `volume.rs` | The Volume domain's contract: identity, spec, lifecycle, the release verdict's facts and blockers, errors, events and the `Volume` trait |
+
+### `agentfs-rules`
+
+| Module | Role |
+|---|---|
+| `lib.rs` | Crate root: the Rules domain's overview |
+| `operator.rs` | `OperatorRules`: `info/exclude` and `info/attributes` parsed from buffers with `gix-ignore` and `gix-attributes`, case-sensitive, never a system, global or tree file |
+| `set.rs` | `RuleSet`: one volume's rules, built once at open, refusing rules tree volumes do not build (`RulesError`); `place` judges a new name `Tracked` or `Untracked` with its reason, built-ins first |
 
 ### `agentfs-volume`
 
@@ -119,6 +128,7 @@ missing from these tables or a row names a module that no longer exists;
 | `tree_actor/referee/whole.rs` | R3e: a change lands whole or not at all; the collisions in their order |
 | `tree_actor/stages.rs` | Measurements only, never read by a decision: runs and time per actor stage, and the Git children the actor's path has started (counted at `git_cli::counted`, the one spawn site; target git-model §18) |
 | `tree_actor/takes.rs` | Queue takes off the actor: a take's inputs read under the actor's lock, its decision made on a built snapshot with the lock released (`decide`, pure over the snapshot), and its land under the lock, refused (`FilesChanged`, `Held`, `HeadMoved`, `EntryGone`) when a step after the decision changed what it read in its tree; takes run one at a time |
+| `tree_actor/untracked.rs` | Each tree's untracked area (`UntrackedArea`): its files the rules leave out, under `<state>/untracked/<tree>/`, reached only beneath it through `confined::Dir`; containers for tracked directories, atomic placement, a new fork's copy of its upstream's area taken while the upstream's untracked changes are held, and the sweep at open of copies no fork owns |
 | `tree_actor/tree.rs` | A tree's shared types: the event number a step is given, the line versions (`<event>:<index>`, ordered as their text) and line maps it writes; a tree's shape (names, directories, objects, identities, metadata and times) with its one transition per step (`Shape::apply`, POSIX's errors checked before a record), the actor's saved state (`SavedTree`) and the builder's (`Tree`, with line maps and name histories) |
 | `tree_reconcile.rs` | The line-map library: line identities as runs, never bytes; histogram alignment streamed over images; a merged file's pieces of its sources. Generic over the caller's numbered version (`Id`) |
 | `tree_git.rs` | The tree actor's Git store: durable objects, the rebuildable copy of the refs in files format and the private checkouts through libgit2 in process (each file written to a temporary name and renamed into place); `config` and `HEAD`; the history walks and `init` as Git children, which retain the actor lease. It knows no ref layout and no trailer |
@@ -217,6 +227,7 @@ missing from these tables or a row names a module that no longer exists;
 | Module | Role |
 |---|---|
 | `tree_view.rs` | The view host (`ViewHost`, the `Views` port): each view a FUSE mount on its client's session, opened without waiting for history and ended by a lazy unmount, with the take and metrics workers and `HostEvent`s to its owner; direct I/O, saved-reader snapshots, byte-call writes, FLUSH, FSYNC, FSYNCDIR and `O_SYNC` writes answered once durable, and the kernel's page fills, page writes and invalidations for shared mappings (rules ledger, R1.4) |
+| `tree_view/untracked.rs` | A view's untracked half: the inode table of area entries (`1<<63 \| n`, keyed by the backing file), attributes from `lstat`, and the passthrough calls on the tree's untracked area, never gated and never journaled |
 | `lib.rs` | Crate root and overview |
 | `ops.rs` | Every filesystem operation without the kernel, unit-tested against a real directory and state area |
 | `fuse.rs` | The kernel adapter: `fuser::Filesystem` over `Ops`, and kernel passthrough negotiation |

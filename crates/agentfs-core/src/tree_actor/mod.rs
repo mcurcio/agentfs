@@ -21,6 +21,7 @@ mod rows;
 pub mod stages;
 mod takes;
 mod tree;
+mod untracked;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
@@ -63,6 +64,7 @@ use rows::SavedRows;
 pub use rows::{Chain, RowDomain, RowEvent, RowWrite};
 use stages::Stages;
 use tree::{EventNumber, SavedTree};
+pub use untracked::{AreaWrite, UntrackedArea};
 
 const FORMAT: &str = "agentfs-trees-11\n";
 /// The volume identity file: [`VolumeIdentity`] as JSON, written once by
@@ -153,6 +155,16 @@ pub enum Error {
     /// History could not be built through what a reader waited for.
     #[error(transparent)]
     History(#[from] WaitError),
+    /// The rules place this name in the untracked area: no tree records it.
+    #[error("{path} is not recorded: {reason}")]
+    Untracked {
+        path: String,
+        reason: agentfs_rules::Untracked,
+    },
+    /// The operator's rule files hold a rule tree volumes do not build: the
+    /// volume refuses to open, before anything is written.
+    #[error("operator rules: {0}")]
+    Rules(#[from] agentfs_rules::RulesError),
 }
 
 impl From<NotATree> for Error {
@@ -184,6 +196,8 @@ impl Error {
             Self::Name => libc::EINVAL,
             Self::TooLarge => libc::EFBIG,
             Self::Busy => libc::EBUSY,
+            Self::Untracked { .. } => libc::EXDEV,
+            Self::Rules(_) => libc::EINVAL,
             Self::Durable(e) => e.errno(),
             Self::TreeGit(crate::tree_git::Error::NoSpace(_)) => libc::ENOSPC,
             Self::Io(e)
@@ -313,6 +327,10 @@ pub struct TreeActor {
     /// pointers held then was built as: a step whose pointers were read
     /// before that compaction names oids, never a step it covers.
     compacted: (RecordNo, BTreeMap<RecordNo, String>),
+    /// The operator's rules, read once at open: where each new name lives.
+    rules: Arc<agentfs_rules::RuleSet>,
+    /// Each tree's untracked area and its hold.
+    areas: untracked::Areas,
     _lock: Arc<FileLock>,
 }
 
@@ -376,6 +394,33 @@ fn found_volume(root: &Path) -> Result<VolumeIdentity> {
 }
 
 /// The state area's exclusive lock: [`Error::Busy`] while another holds it.
+/// The operator's rules: `history.git/info/exclude` and
+/// `history.git/info/attributes`, a missing file empty, built into the rule
+/// set every new name is judged by (docs/trees.md, "Rules and the untracked
+/// area").
+///
+/// # Errors
+///
+/// [`Error::Io`] for a file that cannot be read, [`Error::Rules`] for a rule
+/// tree volumes do not build.
+fn read_rules(root: &Path) -> Result<agentfs_rules::RuleSet> {
+    let info = root.join("history.git").join("info");
+    let read = |name: &str| match fs::read(info.join(name)) {
+        Ok(bytes) => Ok(bytes),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(e),
+    };
+    let texts = agentfs_rules::RuleTexts {
+        exclude: read("exclude")?,
+        attributes: read("attributes")?,
+    };
+    // `agentfs.nested` is not read yet: nested repositories stay out.
+    Ok(agentfs_rules::RuleSet::build(
+        &texts,
+        agentfs_rules::Nested::Exclude,
+    )?)
+}
+
 fn lock_area(root: &Path) -> Result<Arc<FileLock>> {
     Ok(Arc::new(
         FileLock::try_take(&root.join(LOCK), Mode::Exclusive)?.ok_or(Error::Busy)?,
@@ -826,6 +871,8 @@ impl TreeActor {
         identity: VolumeIdentity,
         service: PodContext,
     ) -> Result<Self> {
+        // Before anything is written: a rule that is not built refuses the volume.
+        let rules = Arc::new(read_rules(&root)?);
         let (built_log, entries) = BuiltLog::open(&root.join(BUILT_LOG))?;
         let (journal, frames) =
             Journal::open(&root.join(JOURNAL), built_log::built_through(&entries))?;
@@ -876,8 +923,11 @@ impl TreeActor {
             heads: BTreeMap::new(),
             touched: BTreeMap::new(),
             compacted: (RecordNo::ZERO, BTreeMap::new()),
+            rules,
+            areas: untracked::Areas::new(&root),
             _lock: lock,
         };
+        volume.areas.sweep(&volume.trees())?;
         for (handle, FoldedOpen { open, calls }) in folded.opens {
             volume.handles.insert(
                 handle,
@@ -922,6 +972,21 @@ impl TreeActor {
         // compaction just made has done it.
         volume.durability().make_all_durable()?;
         Ok(volume)
+    }
+
+    /// The operator's rules, read when the volume opened.
+    pub fn rules(&self) -> &Arc<agentfs_rules::RuleSet> {
+        &self.rules
+    }
+
+    /// `tree`'s untracked area, made if it has none.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotFound`] for no such tree; [`Error::Io`].
+    pub fn untracked_area(&self, tree: TreeId) -> Result<UntrackedArea> {
+        self.tree(tree)?;
+        Ok(self.areas.open(tree)?)
     }
 
     /// Every tree: the root first, then the forks by number.
@@ -1023,11 +1088,16 @@ impl TreeActor {
     /// fork's). Fork ids are never reused. Its writer is `agentfs` with the
     /// service's pod context. The store adapter's alone (clippy.toml).
     ///
+    /// Before the step, the fork's untracked area is published as a copy of
+    /// its upstream's, taken while the upstream's untracked changes are held
+    /// (docs/trees.md, "Rules and the untracked area"): a fork on record has
+    /// its whole copy, and a copy no fork owns is removed at the next open.
+    ///
     /// # Errors
     ///
     /// [`Error::NotFound`] for an upstream that is no tree, and for a fork:
     /// forks are made of the root only (recovery refuses a fork of a fork);
-    /// `rows`' own error; a failed record, which changes nothing.
+    /// `rows`' own error; a failed copy or record, which changes nothing.
     pub fn fork_with<F>(&mut self, upstream: TreeId, rows: F) -> Result<TreeId>
     where
         F: FnOnce(TreeId, RecordNo) -> Result<Vec<RowWrite>>,
@@ -1050,7 +1120,8 @@ impl TreeActor {
             old: None,
         }];
         let by = self.agentfs();
-        let (recorded, _, _) = self.record(
+        self.areas.copy_area(upstream, fork)?;
+        let recorded = self.record(
             by,
             Change::Fork {
                 upstream: upstream.to_string(),
@@ -1058,7 +1129,16 @@ impl TreeActor {
             pointers,
             (&mut std::iter::empty(), &[]),
             rows,
-        )?;
+        );
+        let recorded = match recorded {
+            Ok((recorded, _, _)) => recorded,
+            Err(e) => {
+                if let Err(removed) = self.areas.remove(fork) {
+                    eprintln!("tree AreaRemoveFailed: {fork}: {removed}");
+                }
+                return Err(e);
+            }
+        };
         if recorded != seq {
             return Err(Error::Format);
         }

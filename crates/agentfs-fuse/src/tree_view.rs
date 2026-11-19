@@ -10,10 +10,19 @@
 //! same, so a read with no lock owner is a page fill and a write with
 //! `FUSE_WRITE_CACHE` a page write; `agentfs_core::tree_actor`'s `pages`
 //! module holds their rules (R1.4).
+//!
+//! The tree's untracked area (docs/trees.md, "Rules and the untracked area")
+//! is merged into each directory, overlayfs-style: a tracked entry wins its
+//! name, and a new name goes where the operator's rules place it. The
+//! untracked half is plain passthrough on real files (`untracked`); this
+//! module routes each call to one half or the other.
+
+mod untracked;
 
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::io;
+use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -27,7 +36,9 @@ use agentfs_core::tree_actor::{
     Attrs, Error, FileMap, Kind, Meta, Node, Perm, Progress, Recording, RenameMode, Saved, SetTime,
     TreeId,
 };
+use agentfs_rules::{NewKind, PathFacts, Placement};
 use fuser::*;
+use untracked::{Untracked, is_untracked};
 
 const TTL: Duration = Duration::ZERO;
 /// Files listed per READDIR at most: more than a reply's buffer holds, and the
@@ -242,12 +253,17 @@ impl Views for ViewHost {
         }
         let tree = session.tree();
         let read_only = binding.grant.access() == Access::ReadOnly;
+        let area = session
+            .untracked_area()
+            .map_err(|e| ViewError::MountFailed(e.errno()))?;
+        let give = crate::privileges::Privileges::current().can_chown_new();
         let view = View {
             session,
             handles: Arc::new(Mutex::new(Handles {
                 next: 1,
                 entries: BTreeMap::new(),
             })),
+            untracked: Arc::new(Untracked::new(area, give)),
         };
         let mounted = fuser::spawn_mount(view, &at, &session_config(&options, read_only))
             .map_err(|e| ViewError::MountFailed(e.raw_os_error().unwrap_or(libc::EIO)))?;
@@ -430,6 +446,8 @@ fn session_config(options: &MountOptions, read_only: bool) -> Config {
 struct View {
     session: TreeSession,
     handles: Arc<Mutex<Handles>>,
+    /// The tree's untracked half.
+    untracked: Arc<Untracked>,
 }
 
 struct Handles {
@@ -447,13 +465,16 @@ enum Open {
         /// `O_SYNC` or `O_DSYNC`: each write is durable before it is answered.
         sync: bool,
     },
+    /// An open of an untracked file: its descriptor in the area, read and
+    /// written with no lock held.
+    Untracked { fd: Arc<OwnedFd>, append: bool },
 }
 
 /// A write-open's actor handle; `None` for a read-only open.
 fn open_handle(open: &Open) -> Option<u64> {
     match open {
         Open::Write { handle, .. } => Some(*handle),
-        Open::Read(_) => None,
+        Open::Read(_) | Open::Untracked { .. } => None,
     }
 }
 
@@ -461,9 +482,42 @@ fn errno(error: Error) -> Errno {
     Errno::from_i32(error.errno())
 }
 
-/// The inode of a node: 1 for the root directory, else its number + 2.
+/// The inode of a node: 1 for the root directory, else its number + 2,
+/// below every untracked entry's.
 fn inode(node: &Node) -> INodeNo {
-    INodeNo(node.number.map_or(1, |number| number + 2))
+    let ino = node.number.map_or(1, |number| number + 2);
+    debug_assert!(
+        ino < untracked::UNTRACKED,
+        "a tracked inode reached 1 << 63"
+    );
+    INodeNo(ino)
+}
+
+/// The kind a new entry of `kind` is, as the rules take it.
+fn new_kind(kind: Kind) -> NewKind {
+    match kind {
+        Kind::File => NewKind::File,
+        Kind::Dir => NewKind::Dir,
+        Kind::Symlink => NewKind::Symlink,
+    }
+}
+
+/// A kind of the area's, as the rules take it.
+fn area_kind(kind: FileType) -> NewKind {
+    match kind {
+        FileType::Directory => NewKind::Dir,
+        FileType::Symlink => NewKind::Symlink,
+        FileType::NamedPipe => NewKind::Fifo,
+        FileType::Socket => NewKind::Socket,
+        _ => NewKind::File,
+    }
+}
+
+/// Where a name lives in a view.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Half {
+    Tracked,
+    Untracked,
 }
 
 /// `dir`'s entry `name` as a tree path (`dir` `""` for the root).
@@ -573,6 +627,86 @@ impl View {
     fn handles(&self) -> Result<MutexGuard<'_, Handles>> {
         self.handles.lock().map_err(|_| Errno::EIO)
     }
+    /// A directory inode's tree path, and whether it is untracked.
+    fn dir_of(&self, v: &SessionGuard<'_>, ino: INodeNo) -> Result<(String, bool)> {
+        if is_untracked(ino) {
+            Ok((self.untracked.path(ino)?, true))
+        } else {
+            Ok((self.path(v, ino)?, false))
+        }
+    }
+    /// Where `path`, in a directory untracked or not, lives: a tracked entry
+    /// wins its name, then an entry of the area; a new name goes where the
+    /// rules place it as a `kind`.
+    fn half(
+        &self,
+        v: &SessionGuard<'_>,
+        path: &str,
+        parent_untracked: bool,
+        kind: NewKind,
+    ) -> Result<Half> {
+        if !parent_untracked && v.node(path).is_ok() {
+            return Ok(Half::Tracked);
+        }
+        if parent_untracked || self.untracked.exists(path)? {
+            return Ok(Half::Untracked);
+        }
+        let facts = PathFacts {
+            parent_untracked,
+            inside_repository: self.untracked.inside_repository(path)?,
+        };
+        Ok(match self.session.rules().place(path, kind, facts) {
+            Placement::Tracked => Half::Tracked,
+            Placement::Untracked(_) => Half::Untracked,
+        })
+    }
+    /// A call that makes the name `name` in `parent` as a `kind`: run by
+    /// `make` under the actor's lock when it is untracked (never gated);
+    /// `None` when it is tracked, for the caller's gated call.
+    fn untracked_new<T>(
+        &self,
+        parent: INodeNo,
+        name: &OsStr,
+        kind: NewKind,
+        make: impl FnOnce(&SessionGuard<'_>, &str) -> Result<T>,
+    ) -> Option<Result<T>> {
+        let decided = (|| {
+            let v = self.actor()?;
+            let (dir, up) = self.dir_of(&v, parent)?;
+            let path = child_path(&dir, name)?;
+            Ok((self.half(&v, &path, up, kind)?, v, path))
+        })();
+        match decided {
+            Err(e) => Some(Err(e)),
+            Ok((Half::Tracked, _, _)) => None,
+            Ok((Half::Untracked, v, _)) if !v.writable() => Some(Err(Errno::EROFS)),
+            Ok((Half::Untracked, v, path)) => Some(make(&v, &path)),
+        }
+    }
+    /// An untracked open's descriptor and append flag; `None` for any other
+    /// handle.
+    fn untracked_fd(&self, fh: FileHandle) -> Result<Option<(Arc<OwnedFd>, bool)>> {
+        Ok(
+            match self.handles()?.entries.get(&fh.0).ok_or(Errno::EBADF)? {
+                Open::Untracked { fd, append } => Some((Arc::clone(fd), *append)),
+                _ => None,
+            },
+        )
+    }
+    /// Keeps an untracked open's descriptor: its handle.
+    fn keep_untracked(&self, fd: OwnedFd, flags: i32) -> Result<u64> {
+        let mut handles = self.handles()?;
+        let fh = handles.next;
+        handles.next += 1;
+        handles.entries.insert(
+            fh,
+            Open::Untracked {
+                fd: Arc::new(fd),
+                append: flags & libc::O_APPEND != 0,
+            },
+        );
+        Ok(fh)
+    }
     /// The tree path of a named file, link or directory (`""` the root).
     fn path(&self, v: &SessionGuard<'_>, ino: INodeNo) -> Result<String> {
         if ino.0 == 1 {
@@ -610,6 +744,7 @@ impl View {
             match handles.entries.get(&fh.0).ok_or(Errno::EBADF)? {
                 Open::Read(bytes) => bytes.len(),
                 Open::Write { handle, .. } => v.read_open(*handle).map_err(errno)?.len(),
+                Open::Untracked { .. } => return Err(Errno::EBADF),
             }
         } else if v.is_anonymous(ino.0 - 2).map_err(errno)? {
             let handles = self.handles()?;
@@ -758,7 +893,84 @@ impl View {
         v.symlink(path, target, owner).map_err(errno)?;
         self.attr_at(v, path, None)
     }
+    /// A tracked directory lists its tracked children at offsets 1 on, then
+    /// the area's entries no tracked child hides at offsets from
+    /// [`AREA_OFFSETS`] on, each its index in the area's sorted listing, so
+    /// a resume finds its place in either half. An untracked directory
+    /// lists the area's entries alone.
+    fn listing(&self, ino: INodeNo, offset: u64) -> Result<Vec<(INodeNo, u64, FileType, String)>> {
+        let v = self.actor()?;
+        let (dir, untracked) = self.dir_of(&v, ino)?;
+        // `..` is the parent's inode; the root is its own parent.
+        let up = if dir.is_empty() {
+            INodeNo(1)
+        } else {
+            let parent = parent_dir(&dir);
+            match v.node(parent) {
+                Ok(node) => inode(&node),
+                Err(_) => self
+                    .untracked
+                    .lookup(parent)?
+                    .map_or(INodeNo(1), |attr| attr.ino),
+            }
+        };
+        let mut entries: Vec<(INodeNo, u64, FileType, String)> = Vec::new();
+        let area_from = if offset >= AREA_OFFSETS {
+            offset - AREA_OFFSETS
+        } else {
+            // `.` and `..` are entries 0 and 1, the entries 2 on: an
+            // offset is the number of entries already read.
+            let skip = usize::try_from(offset).map_err(|_| Errno::EINVAL)?;
+            for (i, (name, ino)) in [(".", ino), ("..", up)].into_iter().enumerate().skip(skip) {
+                entries.push((ino, i as u64 + 1, FileType::Directory, name.to_owned()));
+            }
+            if !untracked {
+                let children = v
+                    .children(&dir, skip.saturating_sub(2), READDIR_BATCH)
+                    .map_err(errno)?;
+                let full = children.len() == READDIR_BATCH;
+                let first = skip.max(2);
+                for (i, entry) in children.into_iter().enumerate() {
+                    let kind = match entry.kind {
+                        Kind::Dir => FileType::Directory,
+                        Kind::Symlink => FileType::Symlink,
+                        Kind::File => FileType::RegularFile,
+                    };
+                    let next = (first + i + 1) as u64;
+                    entries.push((INodeNo(entry.number + 2), next, kind, entry.name));
+                }
+                if full {
+                    return Ok(entries);
+                }
+            }
+            0
+        };
+        let area_from = usize::try_from(area_from).map_err(|_| Errno::EINVAL)?;
+        for (j, (name, kind)) in self
+            .untracked
+            .entries(&dir)?
+            .into_iter()
+            .enumerate()
+            .skip(area_from)
+        {
+            let path = child_path(&dir, OsStr::new(&name))?;
+            // A tracked entry wins its name.
+            if !untracked && v.node(&path).is_ok() {
+                continue;
+            }
+            let Some(ino) = self.untracked.entry_ino(&dir, &name)? else {
+                continue;
+            };
+            entries.push((ino, AREA_OFFSETS + j as u64 + 1, kind, name));
+        }
+        Ok(entries)
+    }
     fn finish(&self, fh: FileHandle) -> Result<()> {
+        if self.untracked_fd(fh)?.is_some() {
+            // Closing the descriptor is all an untracked release does.
+            self.handles()?.entries.remove(&fh.0);
+            return Ok(());
+        }
         let mut v = self.actor()?;
         let entry = self.handles()?.entries.remove(&fh.0).ok_or(Errno::EBADF)?;
         if let Open::Write { handle, .. } = entry
@@ -796,8 +1008,12 @@ impl Filesystem for View {
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         let result = (|| {
             let v = self.actor()?;
-            let path = child_path(&self.path(&v, parent)?, name)?;
-            self.attr_at(&v, &path, None)
+            let (dir, up) = self.dir_of(&v, parent)?;
+            let path = child_path(&dir, name)?;
+            if !up && let Ok(node) = v.node(&path) {
+                return self.attr(&v, inode(&node), None);
+            }
+            self.untracked.lookup(&path)?.ok_or(Errno::ENOENT)
         })();
         match result {
             Ok(attr) => reply.entry(&TTL, &attr, Generation(0)),
@@ -805,12 +1021,41 @@ impl Filesystem for View {
         }
     }
     fn getattr(&self, _req: &Request, ino: INodeNo, fh: Option<FileHandle>, reply: ReplyAttr) {
+        if is_untracked(ino) {
+            let result = fh
+                .map(|fh| self.untracked_fd(fh))
+                .transpose()
+                .and_then(|fd| {
+                    let fd = fd.flatten();
+                    self.untracked
+                        .getattr(ino, fd.as_ref().map(|(fd, _)| fd.as_ref()))
+                });
+            return match result {
+                Ok(attr) => reply.attr(&TTL, &attr),
+                Err(e) => reply.error(e),
+            };
+        }
         match self.actor().and_then(|v| self.attr(&v, ino, fh)) {
             Ok(attr) => reply.attr(&TTL, &attr),
             Err(e) => reply.error(e),
         }
     }
     fn open(&self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
+        if is_untracked(ino) {
+            let changes =
+                flags.0 & libc::O_ACCMODE != libc::O_RDONLY || flags.0 & libc::O_TRUNC != 0;
+            let result = (|| {
+                if changes && !self.actor()?.writable() {
+                    return Err(Errno::EROFS);
+                }
+                let fd = self.untracked.open(&self.untracked.path(ino)?, flags.0)?;
+                self.keep_untracked(fd, flags.0)
+            })();
+            return match result {
+                Ok(fh) => reply.opened(FileHandle(fh), FopenFlags::FOPEN_DIRECT_IO),
+                Err(e) => reply.error(e),
+            };
+        }
         let open = move |view: &View, admitted: Result<()>| {
             let result = admitted.and_then(|()| {
                 let mut v = view.actor()?;
@@ -839,6 +1084,24 @@ impl Filesystem for View {
         flags: i32,
         reply: ReplyCreate,
     ) {
+        let owner = (req.uid(), req.gid());
+        let untracked = self.untracked_new(parent, name, NewKind::File, |v, path| {
+            let meta_of = &mut |dir: &str| v.node(dir).ok().map(|n| n.meta);
+            let (fd, attr) = self.untracked.create(path, flags, mode, owner, meta_of)?;
+            Ok((self.keep_untracked(fd, flags)?, attr))
+        });
+        if let Some(result) = untracked {
+            return match result {
+                Ok((fh, attr)) => reply.created(
+                    &TTL,
+                    &attr,
+                    Generation(0),
+                    FileHandle(fh),
+                    FopenFlags::FOPEN_DIRECT_IO,
+                ),
+                Err(e) => reply.error(e),
+            };
+        }
         let name = name.to_owned();
         let attrs = create_attrs(req, mode);
         self.gated(move |view, admitted| {
@@ -925,6 +1188,9 @@ impl Filesystem for View {
         reply: ReplyData,
     ) {
         let result = (|| {
+            if let Some((fd, _)) = self.untracked_fd(fh)? {
+                return untracked::read(&fd, offset, size);
+            }
             // The map is cloned under the locks and read after them: a read
             // holds no other request (docs/trees.md, "File maps").
             let map = {
@@ -946,7 +1212,7 @@ impl Filesystem for View {
                         readable: true,
                         ..
                     } => v.read_open(*handle).map_err(errno)?.clone(),
-                    _ => return Err(Errno::EBADF),
+                    Open::Write { .. } | Open::Untracked { .. } => return Err(Errno::EBADF),
                 }
             };
             let wanted = u64::from(size).min(map.len().saturating_sub(offset));
@@ -974,6 +1240,20 @@ impl Filesystem for View {
         _owner: Option<LockOwner>,
         reply: ReplyWrite,
     ) {
+        match self.untracked_fd(fh) {
+            Ok(Some((fd, append))) => {
+                // A page write lands where the kernel says; a write of an
+                // `O_APPEND` open at the file's end.
+                let append = append && !write_flags.contains(WriteFlags::FUSE_WRITE_CACHE);
+                let _writing = self.untracked.writing();
+                return match untracked::write(&fd, offset, data, append) {
+                    Ok(()) => reply.written(data.len() as u32),
+                    Err(e) => reply.error(e),
+                };
+            }
+            Ok(None) => {}
+            Err(e) => return reply.error(e),
+        }
         // The guards drop before a durability wait is queued.
         let result = (|| {
             let mut v = self.actor()?;
@@ -1036,6 +1316,20 @@ impl Filesystem for View {
             atime,
             mtime,
         };
+        if is_untracked(ino) {
+            let result = (|| {
+                if !self.actor()?.writable() {
+                    return Err(Errno::EROFS);
+                }
+                let fd = fh.map(|fh| self.untracked_fd(fh)).transpose()?.flatten();
+                self.untracked
+                    .setattr(ino, changes, fd.as_ref().map(|(fd, _)| fd.as_ref()))
+            })();
+            return match result {
+                Ok(attr) => reply.attr(&TTL, &attr),
+                Err(e) => reply.error(e),
+            };
+        }
         let setattr = move |view: &View, admitted: Result<()>| {
             let result = admitted.and_then(|()| {
                 let mut v = view.actor()?;
@@ -1085,9 +1379,24 @@ impl Filesystem for View {
         _req: &Request,
         _ino: INodeNo,
         fh: FileHandle,
-        _datasync: bool,
+        datasync: bool,
         reply: ReplyEmpty,
     ) {
+        match self.untracked_fd(fh) {
+            Ok(Some((fd, _))) => {
+                let synced = if datasync {
+                    rustix::fs::fdatasync(fd.as_ref())
+                } else {
+                    rustix::fs::fsync(fd.as_ref())
+                };
+                return match synced {
+                    Ok(()) => reply.ok(),
+                    Err(e) => reply.error(untracked::io(e)),
+                };
+            }
+            Ok(None) => {}
+            Err(e) => return reply.error(e),
+        }
         let handle = match self
             .handles()
             .map(|h| h.entries.get(&fh.0).map(open_handle))
@@ -1106,11 +1415,19 @@ impl Filesystem for View {
     fn fsyncdir(
         &self,
         _req: &Request,
-        _ino: INodeNo,
+        ino: INodeNo,
         _fh: FileHandle,
         _datasync: bool,
         reply: ReplyEmpty,
     ) {
+        // The area's directory at the same path holds the untracked names.
+        let synced = self
+            .actor()
+            .and_then(|v| self.dir_of(&v, ino))
+            .and_then(|(dir, _)| self.untracked.fsync_dir(&dir));
+        if let Err(e) = synced {
+            return reply.error(e);
+        }
         self.session.durable_all_then(answer_empty(reply));
     }
     fn release(
@@ -1139,6 +1456,10 @@ impl Filesystem for View {
         self.gated(move |view, admitted| {
             let result = admitted.and_then(|()| {
                 (|| {
+                    // An untracked file links as a named tracked file does not.
+                    if is_untracked(ino) {
+                        return Err(Errno::EPERM);
+                    }
                     let object = ino.0.checked_sub(2).ok_or(Errno::EPERM)?;
                     let mut v = view.actor()?;
                     let path = child_path(&view.path(&v, parent)?, &name)?;
@@ -1157,6 +1478,23 @@ impl Filesystem for View {
         });
     }
     fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        let untracked = (|| {
+            let v = self.actor()?;
+            let (dir, up) = self.dir_of(&v, parent)?;
+            let path = child_path(&dir, name)?;
+            if !up && v.node(&path).is_ok() {
+                return Ok(None);
+            }
+            if !v.writable() {
+                return Err(Errno::EROFS);
+            }
+            self.untracked.unlink(&path).map(Some)
+        })();
+        match untracked {
+            Ok(None) => {}
+            Ok(Some(())) => return reply.ok(),
+            Err(e) => return reply.error(e),
+        }
         let name = name.to_owned();
         self.gated(move |view, admitted| {
             let result = admitted.and_then(|()| {
@@ -1180,6 +1518,17 @@ impl Filesystem for View {
         target: &Path,
         reply: ReplyEntry,
     ) {
+        let untracked = self.untracked_new(parent, link_name, NewKind::Symlink, |v, path| {
+            let meta_of = &mut |dir: &str| v.node(dir).ok().map(|n| n.meta);
+            self.untracked
+                .symlink(path, target, (req.uid(), req.gid()), meta_of)
+        });
+        if let Some(result) = untracked {
+            return match result {
+                Ok(attr) => reply.entry(&TTL, &attr, Generation(0)),
+                Err(e) => reply.error(e),
+            };
+        }
         let (name, target) = (link_name.to_owned(), target.to_owned());
         let owner = FileOwner {
             uid: req.uid(),
@@ -1198,6 +1547,12 @@ impl Filesystem for View {
         });
     }
     fn readlink(&self, _req: &Request, ino: INodeNo, reply: ReplyData) {
+        if is_untracked(ino) {
+            return match self.untracked.readlink(ino) {
+                Ok(target) => reply.data(&target),
+                Err(e) => reply.error(e),
+            };
+        }
         let result = (|| {
             let v = self.actor()?;
             let path = self.path(&v, ino)?;
@@ -1222,6 +1577,20 @@ impl Filesystem for View {
     ) {
         if mode & libc::S_IFMT != libc::S_IFREG {
             return reply.error(Errno::EPERM);
+        }
+        let untracked = self.untracked_new(parent, name, NewKind::File, |v, path| {
+            let meta_of = &mut |dir: &str| v.node(dir).ok().map(|n| n.meta);
+            let flags = libc::O_WRONLY | libc::O_EXCL;
+            let (_, attr) =
+                self.untracked
+                    .create(path, flags, mode, (req.uid(), req.gid()), meta_of)?;
+            Ok(attr)
+        });
+        if let Some(result) = untracked {
+            return match result {
+                Ok(attr) => reply.entry(&TTL, &attr, Generation(0)),
+                Err(e) => reply.error(e),
+            };
         }
         let name = name.to_owned();
         let attrs = create_attrs(req, mode);
@@ -1251,6 +1620,20 @@ impl Filesystem for View {
         _umask: u32,
         reply: ReplyEntry,
     ) {
+        let untracked = self.untracked_new(parent, name, NewKind::Dir, |v, path| {
+            if v.node(path).is_ok() {
+                return Err(Errno::EEXIST);
+            }
+            let meta_of = &mut |dir: &str| v.node(dir).ok().map(|n| n.meta);
+            self.untracked
+                .mkdir(path, mode, (req.uid(), req.gid()), meta_of)
+        });
+        if let Some(result) = untracked {
+            return match result {
+                Ok(attr) => reply.entry(&TTL, &attr, Generation(0)),
+                Err(e) => reply.error(e),
+            };
+        }
         let name = name.to_owned();
         let attrs = create_attrs(req, mode);
         self.gated(move |view, admitted| {
@@ -1269,13 +1652,38 @@ impl Filesystem for View {
         });
     }
     fn rmdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        let untracked = (|| {
+            let v = self.actor()?;
+            let (dir, up) = self.dir_of(&v, parent)?;
+            let path = child_path(&dir, name)?;
+            if !up && v.node(&path).is_ok() {
+                return Ok(None);
+            }
+            if !v.writable() {
+                return Err(Errno::EROFS);
+            }
+            self.untracked.rmdir(&path, false).map(Some)
+        })();
+        match untracked {
+            Ok(None) => {}
+            Ok(Some(())) => return reply.ok(),
+            Err(e) => return reply.error(e),
+        }
         let name = name.to_owned();
         self.gated(move |view, admitted| {
             let result = admitted.and_then(|()| {
                 (|| {
                     let mut v = view.actor()?;
                     let path = child_path(&view.path(&v, parent)?, &name)?;
-                    v.rmdir(&path).map_err(errno)
+                    // Its untracked entries are its children too; its empty
+                    // container goes with it.
+                    if v.node(&path).is_ok_and(|node| node.meta.kind == Kind::Dir)
+                        && !view.untracked.entries(&path)?.is_empty()
+                    {
+                        return Err(Errno::ENOTEMPTY);
+                    }
+                    v.rmdir(&path).map_err(errno)?;
+                    view.untracked.rmdir(&path, true)
                 })()
             });
             match result {
@@ -1294,22 +1702,65 @@ impl Filesystem for View {
         flags: RenameFlags,
         reply: ReplyEmpty,
     ) {
+        // RENAME_EXCHANGE and RENAME_WHITEOUT are not supported.
+        let mode = if flags.is_empty() {
+            RenameMode::Replace
+        } else if flags == RenameFlags::RENAME_NOREPLACE {
+            RenameMode::NoReplace
+        } else {
+            return reply.error(Errno::EINVAL);
+        };
+        let untracked = (|| {
+            let v = self.actor()?;
+            let (from_dir, from_up) = self.dir_of(&v, parent)?;
+            let (to_dir, to_up) = self.dir_of(&v, newparent)?;
+            let from = child_path(&from_dir, name)?;
+            let to = child_path(&to_dir, newname)?;
+            let kind = if from_up {
+                None
+            } else {
+                v.node(&from).ok().map(|node| node.meta.kind)
+            };
+            let to_tracked = !to_up && v.node(&to).is_ok();
+            if let Some(kind) = kind {
+                // Tracked to a tracked name, or a new name the rules record.
+                if !to_tracked && self.half(&v, &to, to_up, new_kind(kind))? == Half::Untracked {
+                    return Err(Errno::EXDEV);
+                }
+                return Ok(None);
+            }
+            let from_kind = self.untracked.lookup(&from)?.ok_or(Errno::ENOENT)?.kind;
+            if to_tracked || self.half(&v, &to, to_up, area_kind(from_kind))? == Half::Tracked {
+                return Err(Errno::EXDEV);
+            }
+            if !v.writable() {
+                return Err(Errno::EROFS);
+            }
+            let meta_of = &mut |dir: &str| v.node(dir).ok().map(|n| n.meta);
+            self.untracked
+                .rename(&from, &to, mode == RenameMode::NoReplace, meta_of)
+                .map(Some)
+        })();
+        match untracked {
+            Ok(None) => {}
+            Ok(Some(())) => return reply.ok(),
+            Err(e) => return reply.error(e),
+        }
         let (name, newname) = (name.to_owned(), newname.to_owned());
         self.gated(move |view, admitted| {
             let result = admitted.and_then(|()| {
                 (|| {
-                    // RENAME_EXCHANGE and RENAME_WHITEOUT are not supported.
-                    let mode = if flags.is_empty() {
-                        RenameMode::Replace
-                    } else if flags == RenameFlags::RENAME_NOREPLACE {
-                        RenameMode::NoReplace
-                    } else {
-                        return Err(Errno::EINVAL);
-                    };
                     let mut v = view.actor()?;
                     let from = child_path(&view.path(&v, parent)?, &name)?;
                     let to = child_path(&view.path(&v, newparent)?, &newname)?;
-                    v.rename(&from, &to, mode).map_err(errno)
+                    let dir = v.node(&from).is_ok_and(|node| node.meta.kind == Kind::Dir);
+                    v.rename(&from, &to, mode).map_err(errno)?;
+                    // A tracked directory's untracked children move with it.
+                    if dir && from != to {
+                        let meta_of = &mut |dir: &str| v.node(dir).ok().map(|n| n.meta);
+                        view.untracked.follow_dir(&from, &to, meta_of)?;
+                    }
+                    Ok(())
                 })()
             });
             match result {
@@ -1326,42 +1777,11 @@ impl Filesystem for View {
         offset: u64,
         mut reply: ReplyDirectory,
     ) {
-        let result = (|| {
-            let v = self.actor()?;
-            let dir = self.path(&v, ino)?;
-            // `..` is the parent's inode; the root is its own parent.
-            let up = if dir.is_empty() {
-                INodeNo(1)
-            } else {
-                inode(&v.node(parent_dir(&dir)).map_err(errno)?)
-            };
-            // `.` and `..` are entries 0 and 1, the entries 2 on: an offset is
-            // the number of entries already read.
-            let skip = usize::try_from(offset).map_err(|_| Errno::EINVAL)?;
-            let mut entries: Vec<(INodeNo, FileType, String)> = [(".", ino), ("..", up)]
-                .into_iter()
-                .skip(skip)
-                .map(|(name, ino)| (ino, FileType::Directory, name.to_owned()))
-                .collect();
-            entries.extend(
-                v.children(&dir, skip.saturating_sub(2), READDIR_BATCH)
-                    .map_err(errno)?
-                    .into_iter()
-                    .map(|entry| {
-                        let kind = match entry.kind {
-                            Kind::Dir => FileType::Directory,
-                            Kind::Symlink => FileType::Symlink,
-                            Kind::File => FileType::RegularFile,
-                        };
-                        (INodeNo(entry.number + 2), kind, entry.name)
-                    }),
-            );
-            Ok((skip, entries))
-        })();
+        let result = self.listing(ino, offset);
         match result {
-            Ok((skip, entries)) => {
-                for (i, (ino, kind, name)) in entries.into_iter().enumerate() {
-                    if reply.add(ino, (skip + i + 1) as u64, kind, name) {
+            Ok(entries) => {
+                for (ino, next, kind, name) in entries {
+                    if reply.add(ino, next, kind, name) {
                         break;
                     }
                 }
@@ -1371,6 +1791,9 @@ impl Filesystem for View {
         }
     }
 }
+
+/// The first readdir offset of a tracked directory's untracked entries.
+const AREA_OFFSETS: u64 = 1 << 62;
 
 #[cfg(test)]
 mod tests {
@@ -1424,12 +1847,14 @@ mod tests {
     }
 
     fn view(session: TreeSession) -> View {
+        let area = session.untracked_area().unwrap();
         View {
             session,
             handles: Arc::new(Mutex::new(Handles {
                 next: 1,
                 entries: BTreeMap::new(),
             })),
+            untracked: Arc::new(Untracked::new(area, false)),
         }
     }
 
@@ -1653,6 +2078,87 @@ mod tests {
         assert_eq!(
             view.open_file(&mut volume, "l", libc::O_RDONLY, None),
             Err(Errno::ELOOP)
+        );
+    }
+
+    /// A tracked entry wins its name: the area's entry under it stays hidden,
+    /// and the area's other entries follow the tracked children at their own
+    /// offsets, from which a listing resumes.
+    #[test]
+    fn a_listing_merges_the_area_and_a_tracked_entry_hides_its_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut sessions = Sessions::new(new_actor(tmp.path()));
+        let view = view(writing(&mut sessions, "client"));
+        let area = view.session.untracked_area().unwrap();
+        for name in ["hidden", "z-area"] {
+            std::fs::write(area.dir().path().join(name), b"area").unwrap();
+        }
+        let tracked = {
+            let mut volume = view.actor().unwrap();
+            let h = volume.write_open("hidden", Some(ATTRS)).unwrap();
+            volume.close(h).unwrap();
+            inode(&volume.node("hidden").unwrap())
+        };
+        let listing = view.listing(INodeNo(1), 0).unwrap();
+        let names: Vec<(&str, bool)> = listing
+            .iter()
+            .map(|(ino, _, _, name)| (name.as_str(), is_untracked(*ino)))
+            .collect();
+        assert_eq!(
+            names,
+            [
+                (".", false),
+                ("..", false),
+                ("hidden", false),
+                ("z-area", true)
+            ]
+        );
+        assert_eq!(listing[2].0, tracked);
+        let (_, next, kind, _) = &listing[3];
+        assert!(*next > AREA_OFFSETS, "{next}");
+        assert_eq!(*kind, FileType::RegularFile);
+        assert!(view.listing(INodeNo(1), *next).unwrap().is_empty());
+        let resumed = view.listing(INodeNo(1), 3).unwrap();
+        assert_eq!(resumed.len(), 1, "{resumed:?}");
+        assert_eq!(resumed[0].3, "z-area");
+        // Looked up, the hidden name is the tracked file.
+        let v = view.actor().unwrap();
+        assert_eq!(
+            view.half(&v, "hidden", false, NewKind::File).unwrap(),
+            Half::Tracked
+        );
+        assert_eq!(
+            view.half(&v, "z-area", false, NewKind::File).unwrap(),
+            Half::Untracked
+        );
+    }
+
+    /// New names go where the rules and the built-ins place them.
+    #[test]
+    fn new_names_go_where_the_rules_place_them() {
+        let tmp = tempfile::tempdir().unwrap();
+        drop(new_actor(tmp.path()));
+        let info = tmp.path().join("history.git/info");
+        std::fs::create_dir_all(&info).unwrap();
+        std::fs::write(info.join("exclude"), "*.log\n").unwrap();
+        std::fs::write(info.join("attributes"), "*.db -agentfs\n").unwrap();
+        let recording = Recording::open(tmp.path(), &PodContext::default()).unwrap();
+        let mut sessions = Sessions::new(recording);
+        let view = view(writing(&mut sessions, "client"));
+        let area = view.session.untracked_area().unwrap();
+        let v = view.actor().unwrap();
+        let half = |path: &str, kind| view.half(&v, path, false, kind).unwrap();
+        assert_eq!(half("a.log", NewKind::File), Half::Untracked);
+        assert_eq!(half("s.db", NewKind::File), Half::Untracked);
+        assert_eq!(half(".git", NewKind::Dir), Half::Untracked);
+        assert_eq!(half("notes.md", NewKind::File), Half::Tracked);
+        assert_eq!(half("repo", NewKind::Dir), Half::Tracked);
+        // Inside a nested repository: the area holds `repo/.git`.
+        std::fs::create_dir_all(area.dir().path().join("repo/.git")).unwrap();
+        assert_eq!(half("repo/x", NewKind::File), Half::Untracked);
+        assert_eq!(
+            view.half(&v, "x", true, NewKind::File).unwrap(),
+            Half::Untracked
         );
     }
 

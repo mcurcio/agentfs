@@ -242,6 +242,9 @@ impl TreeActor {
     /// record.
     pub fn mkdir(&mut self, tree: TreeId, path: &str, attrs: Attrs, by: &WriterAt) -> Result<u64> {
         name(path)?;
+        if self.tree(tree)?.kind_at(path).is_none() {
+            self.recorded_name(path, Kind::Dir)?;
+        }
         let meta = self.tree(tree)?.new_meta(path, Kind::Dir, attrs);
         self.run_pending_closes(tree, None)?;
         let change = Change::Mkdir {
@@ -286,6 +289,9 @@ impl TreeActor {
         by: &WriterAt,
     ) -> Result<u64> {
         name(path)?;
+        if self.tree(tree)?.kind_at(path).is_none() {
+            self.recorded_name(path, Kind::Symlink)?;
+        }
         if target.is_empty() {
             return Err(Error::NotFound);
         }
@@ -449,6 +455,9 @@ impl TreeActor {
         create: Option<Attrs>,
     ) -> Result<u64> {
         name(path)?;
+        if create.is_some() && self.tree(tree)?.kind_at(path).is_none() {
+            self.recorded_name(path, Kind::File)?;
+        }
         let t = self.tree(tree)?;
         match t.kind_at(path) {
             Some(Kind::Dir) => return Err(Error::IsADirectory),
@@ -533,6 +542,9 @@ impl TreeActor {
         by: &WriterAt,
     ) -> Result<()> {
         name(path)?;
+        if self.tree(tree)?.kind_at(path).is_none() {
+            self.recorded_name(path, Kind::File)?;
+        }
         let change = Change::Link {
             tree: tree.to_string(),
             object,
@@ -730,6 +742,10 @@ impl TreeActor {
     ) -> Result<()> {
         name(from)?;
         name(to)?;
+        let t = self.tree(tree)?;
+        if let (Some(kind), None) = (t.kind_at(from), t.kind_at(to)) {
+            self.recorded_name(to, kind)?;
+        }
         let change = Change::Rename {
             tree: tree.to_string(),
             from: from.to_owned(),
@@ -762,6 +778,30 @@ impl TreeActor {
         self.tree(tree)?.check(&change)?;
         self.run_pending_closes(tree, None)?;
         self.named_step(tree, by, change, (true, &[])).map(drop)
+    }
+
+    /// The guard on every call that makes a name: a name the rules place in
+    /// the untracked area never enters a tree ([`Error::Untracked`]), judged
+    /// before anything is journaled (docs/trees.md, "Rules and the untracked
+    /// area"). Rules decide only for new names: callers ask only when no
+    /// entry is at `path`. A name that is not git-safe (a `.git` component
+    /// among them) is refused first, as [`Error::Name`].
+    fn recorded_name(&self, path: &str, kind: Kind) -> Result<()> {
+        let kind = match kind {
+            Kind::File => agentfs_rules::NewKind::File,
+            Kind::Dir => agentfs_rules::NewKind::Dir,
+            Kind::Symlink => agentfs_rules::NewKind::Symlink,
+        };
+        match self
+            .rules
+            .place(path, kind, agentfs_rules::PathFacts::default())
+        {
+            agentfs_rules::Placement::Tracked => Ok(()),
+            agentfs_rules::Placement::Untracked(reason) => Err(Error::Untracked {
+                path: path.to_owned(),
+                reason,
+            }),
+        }
     }
 
     /// Saves this tree's pending closes in arrival order, answering for `wanted`.

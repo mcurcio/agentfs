@@ -12,6 +12,8 @@ agentfs-align = { version = "0.1.0", path = "../agentfs-align" }
 # The shared kernel: values (the tree identity among them), capabilities and the
 # ports agentfs-core's adapters implement.
 agentfs-contracts = { version = "0.1.0", path = "../agentfs-contracts" }
+# The Rules domain: where each new name of a tree lives (tree_actor's untracked areas).
+agentfs-rules = { version = "0.1.0", path = "../agentfs-rules" }
 # known_hosts key blobs and hashed host names, and OpenSSH private key
 # headers.
 base64 = "0.23.1"
