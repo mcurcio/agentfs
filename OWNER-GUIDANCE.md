@@ -94,6 +94,7 @@ on his answer.
 - **Guidance**, 2026-11-15. Asked whether one engine means migrating to the tree views: "yes, thats the plan". On how: "the work should be done quickly, with a reasonable local test suite". On what done means: "getting the one engine system back to its basic state where i can deploy it in hermes and start testing it". Applies to: `docs/target-architecture/future/one-engine.md`.
 - **Guidance**, 2026-11-15. On dropping per-slice design pages: "i agree with "no design pages", but you must still keep an architect-driven workflow style. the slices are only a rough plan and each one should be lead by an architecture round which guides the plan and sets the workflow steps". Applies to: how milestones are run.
 - **Guidance**, 2026-11-18. Asked whether to run the full model sweep at the end of M2, whose random generator does not change: "Skip". Applies to: M2.
+- **Guidance**, 2026-11-19. Asked which milestones come before the first Hermes deploy: "M3 and M7 are a good place to start. But why a sidecar? with the CSI, doesnt agentfs do its work "magically" without the workload having to declare a sidecar?" Offered A (M3, M7 and M8, so Hermes is first deployed on a CSI volume claim) or B (the sidecar first, CSI later), he picked "A". [Push, alarms and patches (M4, M5, M6) come after the first deploy.] Applies to: `docs/target-architecture/future/one-engine.md` ("Order", "The baseline").
 
 ## History and versions
 
