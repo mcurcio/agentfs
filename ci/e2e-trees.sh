@@ -11,7 +11,7 @@ client=
 writer=
 cleanup() {
     status=$?
-    for mount in "$work/main" "$work/fork"; do
+    for mount in "$work/main" "$work/fork" "$work/untrack-mount"; do
         mountpoint -q "$mount" && fusermount3 -uz "$mount" || true
     done
     [ -z "$client" ] || kill "$client" 2>/dev/null || true
@@ -355,6 +355,8 @@ pid=
 git --git-dir="$work/state/history.git" fsck --strict
 # A rule tree volumes do not build refuses the mount, naming its line.
 python3 ci/trees-untracked.py badrules "$bin" "$work"
+# A tracked file the rules come to mark -agentfs leaves history at the next mount.
+python3 ci/trees-untracked.py untrack "$bin" "$work"
 test "$mmap_status" -eq 0
 test "$tmpfile_status" -eq 0
 echo "tree-view recording, object and crash scenarios passed"

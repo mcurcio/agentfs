@@ -333,15 +333,20 @@ fn a_replace_survives_a_reopen() {
 #[test]
 fn a_crash_before_the_step_leaves_the_old_bytes() {
     let tmp = tempfile::tempdir().unwrap();
+    // Nothing is built: the reopen replays every record, the chunk records
+    // the cut-short replace left among them.
+    let guard = agentfs_core::failpoints::configure(
+        "tree.build_before_batch=error@*;tree.replace_before_step=error",
+    )
+    .unwrap();
     let mut v = new_actor(tmp.path());
     put(&mut v, ROOT, "f", b"old\n");
-    {
-        let _guard = agentfs_core::failpoints::configure("tree.replace_before_step=error").unwrap();
-        let failed = v.replace_file(ROOT, "f", ATTRS, &mut &b"new\n"[..], 4, &writer("w"));
-        assert!(failed.is_err());
-    }
+    let failed = v.replace_file(ROOT, "f", ATTRS, &mut &b"new\n"[..], 4, &writer("w"));
+    assert!(failed.is_err());
+    assert_eq!(v.read(ROOT, "f").unwrap(), b"old\n");
     v.durability().make_all_durable().unwrap();
     drop(v);
+    drop(guard);
     let mut v = reopen(tmp.path());
     assert_eq!(v.read(ROOT, "f").unwrap(), b"old\n");
     assert!(matches!(

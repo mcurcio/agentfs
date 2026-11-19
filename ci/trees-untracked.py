@@ -24,6 +24,9 @@ these rules (ci/e2e-trees.sh writes them before the first mount):
                                            opens and passes integrity_check
     trees-untracked.py badrules BIN DIR    a rule not built refuses the mount,
                                            naming its line
+    trees-untracked.py untrack BIN DIR     a tracked file the rules come to mark
+                                           -agentfs leaves history at the next
+                                           mount and reads back as it was
 """
 import errno
 import hashlib
@@ -273,6 +276,77 @@ def badrules(binary, work):
     assert not os.path.ismount(mount)
 
 
+def serve(binary, state, mount, log):
+    """Mounts the root of the volume at `state` on `mount`: the server, once
+    the mount is up."""
+    proc = subprocess.Popen([binary, "--state", str(state), "trees", "mount", str(mount)],
+                            stdout=subprocess.DEVNULL, stderr=log)
+    for _ in range(600):
+        if os.path.ismount(mount):
+            return proc
+        assert proc.poll() is None, f"trees mount exited with {proc.returncode}"
+        time.sleep(0.1)
+    proc.kill()
+    raise AssertionError("trees mount did not come up")
+
+
+def unmount(proc):
+    proc.terminate()
+    assert proc.wait(timeout=120) == 0, proc.returncode
+
+
+def untrack(binary, work):
+    work = Path(work)
+    state, mount = work / "untrack-state", work / "untrack-mount"
+    mount.mkdir()
+    subprocess.run([binary, "--state", str(state), "trees", "init", "--volume", "untrack"],
+                   check=True, stdout=subprocess.DEVNULL)
+
+    def git(*args):
+        return subprocess.check_output(["git", "--git-dir=" + str(state / "history.git"), *args],
+                                       text=True)
+
+    def unlinks():
+        return [s for s in git("log", "--format=%s", "root").splitlines()
+                if s.startswith("Unlink")]
+
+    with open(work / "untrack.log", "ab") as log:
+        # Recorded with no attributes.
+        proc = serve(binary, state, mount, log)
+        (mount / "secret.env").write_bytes(SECRET)
+        os.chmod(mount / "secret.env", 0o600)
+        (mount / "keep.md").write_bytes(b"kept\n")
+        unmount(proc)
+        listed = git("ls-tree", "-r", "--name-only", "root")
+        assert "secret.env" in listed and "keep.md" in listed, listed
+        kept = [e for e in git("ls-tree", "-r", "root").splitlines() if e.endswith("keep.md")]
+        info = state / "history.git" / "info"
+        info.mkdir(exist_ok=True)
+        with open(info / "attributes", "a") as f:
+            f.write("*.env -agentfs\n")
+        # The next mount moves it to the untracked area and records its unlink.
+        proc = serve(binary, state, mount, log)
+        assert (mount / "secret.env").read_bytes() == SECRET
+        assert stat.S_IMODE(os.lstat(mount / "secret.env").st_mode) == 0o600
+        assert (mount / "keep.md").read_bytes() == b"kept\n"
+        unmount(proc)
+    listed = git("ls-tree", "-r", "--name-only", "root")
+    assert "secret.env" not in listed, listed
+    assert [e for e in git("ls-tree", "-r", "root").splitlines() if e.endswith("keep.md")] == kept
+    assert unlinks() == ["Unlink by agentfs"], unlinks()
+    assert git("log", "-1", "--format=%s", "root").strip() == "Unlink by agentfs"
+    text = (work / "untrack.log").read_text()
+    assert "tree Untracked: tree=root path=secret.env: marked -agentfs" in text, text
+    # A third mount records nothing new.
+    head = git("rev-parse", "root")
+    with open(work / "untrack.log", "ab") as log:
+        proc = serve(binary, state, mount, log)
+        assert (mount / "secret.env").read_bytes() == SECRET
+        unmount(proc)
+    assert git("rev-parse", "root") == head
+    assert len(unlinks()) == 1
+
+
 if __name__ == "__main__":
     commands = {
         "view": lambda: view(Path(sys.argv[2])),
@@ -282,6 +356,7 @@ if __name__ == "__main__":
         "history": lambda: history(Path(sys.argv[2])),
         "fork": lambda: fork(Path(sys.argv[2]), Path(sys.argv[3])),
         "badrules": lambda: badrules(sys.argv[2], sys.argv[3]),
+        "untrack": lambda: untrack(sys.argv[2], sys.argv[3]),
     }
     if sys.argv[1] in ("view", "remount", "fork") and os.geteuid() != 0:
         sys.exit(f"trees-untracked.py {sys.argv[1]} must run as root (euid {os.geteuid()})")
