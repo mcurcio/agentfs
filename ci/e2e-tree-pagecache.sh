@@ -24,8 +24,8 @@ wait_mounted() {
   mountpoint -q "$1"
 }
 mkdir "$work/main" "$work/fork"
-"$bin" --state "$work/state" trees init --volume t
-"$bin" --state "$work/state" trees mount "$work/main" --fork-mount "$work/fork" >"$work/mount.log" 2>&1 & pid=$!
+"$bin" --state "$work/state" init --volume t
+"$bin" --state "$work/state" mount "$work/main" --fork-mount "$work/fork" >"$work/mount.log" 2>&1 & pid=$!
 wait_mounted "$work/main"
 wait_mounted "$work/fork"
 result=0
@@ -37,8 +37,8 @@ tree_wait_exit "$pid"; pid=
 git --git-dir="$work/state/history.git" fsck --strict
 
 # A fork's takes would hold the actor too: this runs against the saves alone.
-"$bin" --state "$work/close-open" trees init --volume t
-"$bin" --state "$work/close-open" trees mount "$work/main" >>"$work/mount.log" 2>&1 & pid=$!
+"$bin" --state "$work/close-open" init --volume t
+"$bin" --state "$work/close-open" mount "$work/main" >>"$work/mount.log" 2>&1 & pid=$!
 wait_mounted "$work/main"
 python3 ci/trees-close-open.py "$work/main" || result=$?
 fusermount3 -u "$work/main"

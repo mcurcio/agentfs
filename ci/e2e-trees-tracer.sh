@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # The tree views' tracer, end to end on the built image (docs/trees.md):
-# `trees init` and `trees mount` in a privileged agentfs container, the
+# `init` and `mount` in a privileged agentfs container, the
 # workload in a second container as 10000:10000 that reaches the mount by
 # propagation, as the Docker example does (docs/docker.md).
 #
@@ -10,10 +10,12 @@
 #                                          ext4 or xfs (sudo)
 #   ci/e2e-trees-tracer.sh diagnose        the agentfs container's log and history
 #
-# 1. `trees init --volume t` twice gives one id, `created` then `found`;
+# 1. `init --volume t` twice gives one id, `created` then `found`;
 #    `--volume u` at the same state area exits 1 with every file's bytes
 #    unchanged.
-# 2. The workload writes a.txt. Right after its close returns, the root's head
+# 2. With an operator settings include naming a remote, the mount logs
+#    `not built: remote.origin.url (push)` and serves anyway. The workload
+#    writes a.txt. Right after its close returns, the root's head
 #    holds it (at `files/<aa>/<bb>/a.txt`, as every envelope commit does: docs/trees.md), with `Agentfs-Volume: t`, the volume's id and the pod trailers
 #    the mount was given. The workload makes a directory and an executable
 #    script and runs it: history holds the script as `100755` and the
@@ -21,19 +23,22 @@
 #    history.git/info/attributes, the workload's state.db and .env work through
 #    the mount and never reach history (docs/trees.md, "Rules and the untracked
 #    area").
-# 3. agentfs is killed with SIGKILL while the workload writes, the stale mount
-#    is lazily unmounted and agentfs mounts again: every write the workload saw
-#    answered is in history, with its pod trailers, and a restarted workload
-#    writes through the new mount; state.db and .env are still there.
+# 3. agentfs is killed with SIGKILL while the workload writes, and mounts
+#    again with `--on-stale-mount recover`, stacked over the stale mount it
+#    left: every write the workload saw answered is in history, with its pod
+#    trailers, and a restarted workload writes through the new mount;
+#    state.db and .env are still there.
 # 4. (--figures) The flat workloads of ci/trees-figures.py through the mount,
 #    on the image's release build, each against its own deadline: the report
 #    is $RUNNER_TEMP/trees-figures-FS.json (docs/performance.md, "Tree views,
-#    release build"), a missed bar in ci/trees-budget.json is a warning, and
-#    the root's history holds the last save each workload saw answered.
+#    release build"), a gated figure in ci/trees-budget.json (`create`) that
+#    misses its bar fails the script once the rest is checked, any other is a
+#    warning, and the root's history holds the last save each workload saw
+#    answered.
 #
 # Needs the agentfs image as $AGENTFS_IMAGE (default agentfs:ci), the fuse
 # module loaded, a shared mount under $RUNNER_TEMP (as / is on systemd
-# hosts), and sudo (for the lazy unmount on the host).
+# hosts), and sudo (for the cleanup's lazy unmount on the host).
 
 . "$(dirname "$0")/lib.sh"
 . "$(dirname "$0")/tree-git-test-lib.sh"
@@ -68,7 +73,8 @@ fi
 
 cleanup() {
   docker rm -f "$NAME" >/dev/null 2>&1 || true
-  sudo umount -l "$VIEW" 2>/dev/null || true
+  # Every layer: a view stacked over a stale mount leaves two.
+  while sudo umount -l "$VIEW" 2>/dev/null; do :; done
   if [ -n "$FS" ]; then
     sudo umount "$DATA" 2>/dev/null || sudo umount -l "$DATA" 2>/dev/null || true
     sudo rm -f "$LOOP_IMG"
@@ -102,7 +108,7 @@ in_state() { # program args...
   docker run --rm -v "$DATA:/data" "${POD[@]}" --entrypoint "$1" "$IMAGE" "${@:2}"
 }
 init() { # volume
-  in_state agentfs --state /data/state trees init --volume "$1"
+  in_state agentfs --state /data/state init --volume "$1"
 }
 in_history() { # git args...
   in_state git --git-dir /data/state/history.git "$@"
@@ -117,15 +123,16 @@ built() { # rev:path want what
 state_hashes() {
   in_state sh -c 'cd /data/state && find . -type f -print0 | sort -z | xargs -0 sha256sum'
 }
-mounted() { grep -qF " $VIEW " /proc/self/mountinfo; }
-mount_view() {
+# The mount's own line once every view is up (docs/trees.md, "Run it").
+mounted() { docker logs "$NAME" 2>&1 | grep -qF 'mounted volume t at /agentfs/root'; }
+mount_view() { # [mount flags]
   docker rm -f "$NAME" >/dev/null 2>&1 || true
   docker run -d --name "$NAME" \
     --device /dev/fuse --cap-add SYS_ADMIN --security-opt apparmor=unconfined \
     -v "$DATA:/data" "${POD[@]}" \
     --mount "type=bind,src=$MOUNT_DIR,dst=/agentfs,bind-propagation=rshared" \
-    "$IMAGE" --state /data/state trees mount /agentfs/root --volume t \
-    --metrics-output /data/metrics.json \
+    "$IMAGE" --state /data/state mount /agentfs/root --volume t \
+    --metrics-output /data/metrics.json "$@" \
     >/dev/null
   wait_for 60 mounted || { docker logs "$NAME" >&2; fail 'the tree view did not mount'; }
   pass 'the root is mounted'
@@ -161,8 +168,14 @@ step '2. a close returns with its save on record, named'
 # The operator's rules, read when the volume opens.
 in_state sh -c 'mkdir -p /data/state/history.git/info &&
   printf "*.db -agentfs\n.env -agentfs\n" > /data/state/history.git/info/attributes'
+# An operator settings include naming a remote: push is not built on tree
+# volumes yet, so the mount says so at boot and serves anyway.
+in_state sh -c 'printf "[remote \"origin\"]\n\turl = /nowhere\n" > /data/operator.conf'
+in_state agentfs --state /data/state init --volume t --include /data/operator.conf >/dev/null
 mount_view
-# The root starts owned by whoever ran `trees init` (root here), mode 0755:
+assert_contains "$(docker logs "$NAME" 2>&1)" 'not built: remote.origin.url (push)' \
+  'the mount logs the remote it does not push to'
+# The root starts owned by whoever ran `init` (root here), mode 0755:
 # root gives it to the workload's user through the mount, as with the
 # recording engine, and history records the new owner.
 docker exec "$NAME" chown 10000:10000 /agentfs/root || fail 'root could not chown the mount root'
@@ -222,10 +235,13 @@ wait_for 60 test -s "$RECEIPTS/answered" || fail 'the workload wrote nothing'
 wait_for 60 sh -c "[ \$(wc -l < '$RECEIPTS/answered') -ge 20 ]" || fail 'the workload stalled'
 docker kill -s KILL "$NAME" >/dev/null
 docker wait "$NAME" >/dev/null || true
-sudo umount -l "$VIEW"
 answered=$(wc -l <"$RECEIPTS/answered")
 [ "$answered" -ge 20 ] || fail "only $answered writes answered"
-mount_view
+# The killed daemon left its mount stale: the restart stacks over it.
+mount_view --on-stale-mount recover
+assert_contains "$(docker logs "$NAME" 2>&1)" \
+  'stacked over a stale mount at /agentfs/root left by a crashed daemon' \
+  'the restart stacks over the stale mount'
 missing=$(docker run --rm -i -v "$DATA:/data" --entrypoint bash "$IMAGE" -c "$(declare -f tree_git_fanned)"'
   while read -r n; do
     path=files/$(tree_git_fanned "f$n")
@@ -245,15 +261,22 @@ has_trailers "$(in_history log -1 --format=%B root)" 'its save'
 
 if [ -n "$FS" ]; then
   step "4. figures: the flat workloads on the release build, on $FS"
+  # The gate itself: a create short of its bar fails the run.
+  if python3 "$(dirname "$0")/trees-figures.py" --self-test --budget "$(dirname "$0")/trees-budget.json" >/dev/null; then
+    fail 'a create short of its bar would not fail the gate'
+  fi
+  pass 'a create short of its bar fails the gate'
   report=${RUNNER_TEMP:-/tmp}/trees-figures-$FS.json
   # As root, which the view lets through (docs/trees.md), so the runner's
   # files need no other owner, and so a stuck view's connection can be
   # aborted; the stat after each save is the timed end.
+  # Exit 1 when a gated figure missed its bar: the rest is checked first.
+  gated=0
   sudo python3 "$(dirname "$0")/trees-figures.py" --view "$VIEW" --filesystem "$FS" \
     --metrics "$DATA/metrics.json" --drain-cap 180 \
     --view-pid "$(docker inspect --format '{{.State.Pid}}' "$NAME")" \
     --image "$(docker image inspect --format '{{.Id}}' "$IMAGE")" \
-    --budget "$(dirname "$0")/trees-budget.json" --output "$report"
+    --budget "$(dirname "$0")/trees-budget.json" --output "$report" || gated=$?
   cat "$report"
   figure() { # workload field
     python3 -c 'import json, sys
@@ -284,5 +307,6 @@ print(json.dumps(w.get(sys.argv[3], 0)))' "$report" "$1" "$2"
   if [ "$(figure close_1g finished)" = true ] && drained close_1g; then
     assert_eq 1073741824 "$(in_history cat-file -s "root:files/$(tree_git_fanned fig-1g)")" 'the 1 GiB save is in history'
   fi
+  [ "$gated" = 0 ] || fail "a gated figure missed its bar on $FS (trees-figures.py exited $gated)"
 fi
 pass 'tree views tracer'

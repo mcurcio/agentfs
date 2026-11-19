@@ -26,7 +26,7 @@ as_root=()
 mkdir "$work/main" "$work/fork"
 # trees-posix.py's non-root user reaches the views through it.
 chmod 755 "$work"
-"$bin" --state "$work/state" trees init --volume t
+"$bin" --state "$work/state" init --volume t
 # The operator's rules (docs/trees.md, "Rules and the untracked area"), read at
 # each mount; trees-untracked.py checks what they keep out.
 mkdir -p "$work/state/history.git/info"
@@ -37,7 +37,7 @@ printf '%s\n' '*.db -agentfs' '*.db-wal -agentfs' '*.db-shm -agentfs' '.env -age
 # under the key finds it.
 key=e2e
 start() {
-    "$bin" --state "$work/state" trees mount "$work/main" \
+    "$bin" --state "$work/state" mount "$work/main" \
         --fork-mount "$work/fork" --fork-key "$key" "$@" >>"$work/mount.log" 2>&1 &
     pid=$!
     for _ in $(seq 1 200); do
@@ -45,7 +45,7 @@ start() {
         kill -0 "$pid"
         sleep 0.1
     done
-    echo "trees mounts did not start" >&2
+    echo "the tree mounts did not start" >&2
     return 1
 }
 start
@@ -184,12 +184,12 @@ wait "$writer" 2>/dev/null || true
 writer=
 fusermount3 -uz "$work/main"
 fusermount3 -uz "$work/fork"
-"$bin" --state "$work/state" trees init --volume t
+"$bin" --state "$work/state" init --volume t
 head=$(git --git-dir="$work/state/history.git" rev-parse root)
 test "$(tree_git_file "$work/state/history.git" root crash)" = acknowledged-before-kill
 python3 ci/trees-posix.py history "$work/state/history.git"
 python3 ci/trees-untracked.py history "$work/state/history.git"
-"$bin" --state "$work/state" trees init --volume t
+"$bin" --state "$work/state" init --volume t
 test "$(git --git-dir="$work/state/history.git" rev-parse root)" = "$head"
 start
 # touch and touch -d set a file's times and build no commit: after a kill and
@@ -200,7 +200,7 @@ tree_wait_exit "$pid" 2>/dev/null || true
 pid=
 fusermount3 -uz "$work/main"
 fusermount3 -uz "$work/fork"
-"$bin" --state "$work/state" trees init --volume t
+"$bin" --state "$work/state" init --volume t
 test "$(git --git-dir="$work/state/history.git" rev-parse root)" = "$head"
 start
 "${as_root[@]}" python3 ci/trees-posix.py touched "$work/main"
@@ -226,7 +226,7 @@ fi
 # A clean unmount ended the fork's writer, and a fork has one writer for life:
 # mounting it to write again exits 1, mounting nothing.
 status=0
-"$bin" --state "$work/state" trees mount "$work/main" --fork-mount "$work/fork" --fork-key "$key" \
+"$bin" --state "$work/state" mount "$work/main" --fork-mount "$work/fork" --fork-key "$key" \
     >"$work/taken.log" 2>&1 || status=$?
 test "$status" -eq 1
 grep -F 'this fork has had its writer; mount it with --fork-read-only' "$work/taken.log" >/dev/null
@@ -255,7 +255,7 @@ sys.exit("the fork's save never landed")
 PY
 # While a mount holds the volume, ending the key waits: exit 75.
 status=0
-"$bin" --state "$work/state" trees end --fork-key "$key" 2>"$work/busy.log" || status=$?
+"$bin" --state "$work/state" fork end --fork-key "$key" 2>"$work/busy.log" || status=$?
 test "$status" -eq 75
 fusermount3 -u "$work/main"
 fusermount3 -u "$work/fork"
@@ -265,7 +265,7 @@ pid=
 # its branch, queue and checkout go; its row chain stays, ending ForkDropped.
 fork=$(sed -n 's/^fork tree: //p' "$work/mount.log" | sed -n 1p)
 test -n "$fork"
-"$bin" --state "$work/state" trees end --fork-key "$key"
+"$bin" --state "$work/state" fork end --fork-key "$key"
 git_dir="$work/state/history.git"
 ! git --git-dir="$git_dir" rev-parse -q --verify "refs/heads/$fork" >/dev/null
 test -z "$(git --git-dir="$git_dir" for-each-ref "refs/queue/$fork/")"
@@ -274,14 +274,14 @@ test ! -e "$work/state/untracked/$fork"
 test "$(git --git-dir="$git_dir" log -1 --format=%s "refs/agentfs/trees/$fork")" = "ForkDropped $fork"
 # Its key has ended: mounting under it exits 1, mounting nothing.
 status=0
-"$bin" --state "$work/state" trees mount "$work/main" --fork-mount "$work/fork" --fork-key "$key" \
+"$bin" --state "$work/state" mount "$work/main" --fork-mount "$work/fork" --fork-key "$key" \
     >"$work/ended.log" 2>&1 || status=$?
 test "$status" -eq 1
 grep -F 'the fork under this --fork-key has ended' "$work/ended.log" >/dev/null
 ! mountpoint -q "$work/main"
 # A fork mounted with no key is new, and ends when its last client detaches.
 : >"$work/unkeyed.log"
-"$bin" --state "$work/state" trees mount "$work/main" --fork-mount "$work/fork" \
+"$bin" --state "$work/state" mount "$work/main" --fork-mount "$work/fork" \
     >>"$work/unkeyed.log" 2>&1 &
 pid=$!
 for _ in $(seq 1 200); do
@@ -305,7 +305,7 @@ git --git-dir="$git_dir" log --format=%s "refs/agentfs/trees/$unkeyed" | grep -F
 : >"$work/term.log"
 # The root alone: no fork, so no queue entry holds the release back, and the
 # drain's detach is all that stands between the stop and the release.
-"$bin" --state "$work/state" trees mount "$work/main" >>"$work/term.log" 2>&1 &
+"$bin" --state "$work/state" mount "$work/main" >>"$work/term.log" 2>&1 &
 pid=$!
 for _ in $(seq 1 200); do
     if mountpoint -q "$work/main"; then break; fi

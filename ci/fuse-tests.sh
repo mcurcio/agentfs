@@ -1,16 +1,15 @@
 #!/usr/bin/env bash
-# Runs the real FUSE mount tests (crates/agentfs/tests/mount.rs) as root,
-# and the unit tests that need root (creating as the caller, tree views
-# stacked over a stale mount).
+# Runs the real FUSE tests of `agentfs mount` (crates/agentfs/tests/
+# launcher_mount.rs) as root, and the unit tests that need root (creating as
+# the caller, tree views stacked over a stale mount).
 #
-# Needs Linux with /dev/fuse, fuse3 (fusermount3), sqlite3, git, jq, attr,
-# setpriv and passwordless sudo; the unprivileged-daemon test also needs
-# `user_allow_other` in /etc/fuse.conf. Reproducible on any such host:
+# Needs Linux with /dev/fuse, fuse3 (fusermount3), git, jq and passwordless
+# sudo. Reproducible on any such host:
 #
-#   AGENTFS_TEST_PASSTHROUGH=auto AGENTFS_TEST_UNPRIV_USER=$USER ci/fuse-tests.sh
+#   ci/fuse-tests.sh
 #
-# AGENTFS_TEST_PASSTHROUGH (auto, on, off) is passed to every mount.
-# Extra arguments go to the test binary (e.g. a test name filter).
+# Extra arguments go to the launcher_mount test binary (e.g. a test name
+# filter).
 
 . "$(dirname "$0")/lib.sh"
 
@@ -20,9 +19,9 @@ command -v jq >/dev/null || fail "jq is needed to find the test binary"
 
 step "build"
 cargo build --locked -p agentfs
-bin=$(cargo test --locked -p agentfs --test mount --no-run --message-format=json 2>/dev/null |
-  jq -r 'select(.executable != null and .target.name == "mount") | .executable' | tail -n 1)
-[ -x "$bin" ] || fail "could not find the mount test binary"
+bin=$(cargo test --locked -p agentfs --test launcher_mount --no-run --message-format=json 2>/dev/null |
+  jq -r 'select(.executable != null and .target.name == "launcher_mount") | .executable' | tail -n 1)
+[ -x "$bin" ] || fail "could not find the launcher_mount test binary"
 unit=$(cargo test --locked -p agentfs-fuse --lib --no-run --message-format=json 2>/dev/null |
   jq -r 'select(.executable != null and .target.name == "agentfs_fuse") | .executable' | tail -n 1)
 [ -x "$unit" ] || fail "could not find the agentfs-fuse unit test binary"
@@ -38,6 +37,5 @@ OUT=$(sudo "$unit" tree_view::tests::stale_view --ignored --test-threads=1 --noc
 echo "$OUT"
 case "$OUT" in *"test result: ok. 2 passed"*) ;; *) fail "the stale view tests did not both run" ;; esac
 
-step "kernel $(uname -r), passthrough ${AGENTFS_TEST_PASSTHROUGH:-auto}"
-sudo --preserve-env=AGENTFS_TEST_PASSTHROUGH,AGENTFS_TEST_UNPRIV_USER,RUST_BACKTRACE,RUNNER_TEMP \
-  "$bin" --ignored --test-threads=1 --nocapture "$@"
+step "agentfs mount, as root, kernel $(uname -r) (crates/agentfs/tests/launcher_mount.rs)"
+sudo --preserve-env=RUST_BACKTRACE,RUNNER_TEMP "$bin" --ignored --test-threads=1 --nocapture "$@"

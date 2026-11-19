@@ -3,14 +3,20 @@
 
 Runs four flat workloads through a mounted tree view, each against its own
 deadline, compares each figure with its bar in ci/trees-budget.json, and
-writes the report as JSON. A figure that misses its bar sets `warn` and
-prints a `::warning::` line; nothing here fails on a figure. A workload that
+writes the report as JSON. A figure that misses its bar sets `warn`. A gated
+one (`"gate": true` in the budget: the many-file `create`) prints an
+`::error::` line and the script exits 1 once the report is written; any
+other prints a `::warning::` line. A workload that
 runs out of time reports what it reached by its deadline; no figure is
 extrapolated, because a save's cost grows with the tree. ci/e2e-trees-tracer.sh
 runs it as its step 4. Standard library only.
 
     trees-figures.py --view DIR --filesystem FS --image ID --budget PATH --output PATH
                      [--build release] [--only WORKLOAD]...
+    trees-figures.py --self-test --budget PATH
+
+`--self-test` judges a synthetic report whose `create` fell one file short of
+its count, with no view, and exits as a run would: 1 while `create` is gated.
 
 Every timed save ends with a stat(2) of the file. The view saves a file when
 the kernel releases it, which reaches agentfs just after close(2) returns,
@@ -295,6 +301,36 @@ def missed(figure, budget, filesystem):
     return found is None or found > limit
 
 
+def gated_misses(workloads, budgets):
+    """The names of the gated workloads in a report that missed their bars."""
+    return [w["name"] for w in workloads
+            if w.get("warn") and budgets.get(w["name"], {}).get("gate")]
+
+
+def report_miss(name, held, value, filesystem):
+    """One line for a missed bar: `::error::` when it is gated, else
+    `::warning::`."""
+    shown = {k: v for k, v in value.items() if k != "cost_by_tree_size"}
+    if held.get("gate"):
+        print(f"::error title=tree views, {filesystem}::{name} missed its bar: {held['text']}: "
+              f"{json.dumps(shown)}", flush=True)
+    else:
+        print(f"::warning title=tree views, {filesystem}::{name} misses its bar, "
+              f"{held['text']}: {json.dumps(shown)}", flush=True)
+
+
+def self_test(budgets, filesystem="ext4"):
+    """Judges a synthetic `create` one file short of its count, unfinished:
+    the exit status a run with that figure has."""
+    held = budgets["create"]
+    value = {"finished": False, "target": held["count"], "count": held["count"] - 1}
+    workloads = [{"name": "create", **value, "warn": missed(value, held, filesystem)}]
+    for workload in workloads:
+        if workload["warn"]:
+            report_miss(workload["name"], held, value, filesystem)
+    return 1 if gated_misses(workloads, budgets) else 0
+
+
 class Renames:
     """The view's metrics file being renamed into place, as inotify events
     (the view writes it at each built or failed event and every 100 ms
@@ -423,11 +459,13 @@ WORKLOADS = [("close_4k", close_4k), ("create", create), ("close_64m", close_64m
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--view", required=True)
-    parser.add_argument("--filesystem", required=True)
-    parser.add_argument("--image", required=True)
+    parser.add_argument("--self-test", action="store_true",
+                        help="judge a synthetic report whose create fell short, and exit as a run would")
+    parser.add_argument("--view")
+    parser.add_argument("--filesystem")
+    parser.add_argument("--image")
     parser.add_argument("--budget", required=True)
-    parser.add_argument("--output", required=True)
+    parser.add_argument("--output")
     parser.add_argument("--build", default="release",
                         help="the build measured, as the report names it (the image ships release)")
     parser.add_argument("--metrics",
@@ -442,6 +480,11 @@ def main():
     with open(args.budget) as file:
         policy = json.load(file)
     budgets, grace = policy["budgets"], policy["grace_s"]
+    if args.self_test:
+        sys.exit(self_test(budgets))
+    for needed in ("view", "filesystem", "image", "output"):
+        if getattr(args, needed) is None:
+            parser.error(f"--{needed} is required")
     # Read before any workload: a stat of the view blocks while it is stuck.
     dev = os.stat(args.view).st_dev
 
@@ -452,8 +495,10 @@ def main():
         budget = budgets[name]
         entry = {"name": name, "budget": budget["text"], "guarantee": GUARANTEE}
         if stopped:
-            workloads.append({**entry, "deadline_s": budget["deadline_s"], "finished": False,
-                              "not_run": "an earlier workload was stuck in the view", "warn": True})
+            value = {"deadline_s": budget["deadline_s"], "finished": False,
+                     "not_run": "an earlier workload was stuck in the view"}
+            workloads.append({**entry, **value, "warn": True})
+            report_miss(name, budget, value, args.filesystem)
             continue
         run = Run(time.monotonic() + budget["deadline_s"])
         baseline = reset_peak(args.view_pid) if args.view_pid and name == "close_1g" else None
@@ -511,9 +556,7 @@ def main():
             workloads.append({**entry, "name": shown, "budget": held["text"], **value, "warn": warn})
             print(f"{shown} on {args.filesystem}: {json.dumps(value)}", flush=True)
             if warn:
-                print(f"::warning title=tree views, {args.filesystem}::{shown} misses its bar, "
-                      f"{held['text']}: {json.dumps({k: v for k, v in value.items() if k != 'cost_by_tree_size'})}",
-                      flush=True)
+                report_miss(shown, held, value, args.filesystem)
 
     report = {"build": args.build, "filesystem": args.filesystem, "image": args.image,
               "host": host(), "connection_aborted": aborted, "workloads": workloads}
@@ -524,7 +567,7 @@ def main():
     os.replace(temporary, args.output)
     sys.stdout.flush()
     # A worker still blocked in the view must not hold the exit.
-    os._exit(0)
+    os._exit(1 if gated_misses(workloads, budgets) else 0)
 
 
 if __name__ == "__main__":

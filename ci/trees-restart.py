@@ -27,7 +27,7 @@ def mounted(root):
 
 
 def mount(binary, state, root, log):
-    host = subprocess.Popen([binary, "--state", str(state), "trees", "mount", str(root)],
+    host = subprocess.Popen([binary, "--state", str(state), "mount", str(root)],
                             stdout=log, stderr=log)
     for _ in range(300):
         if mounted(root):

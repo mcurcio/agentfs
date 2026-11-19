@@ -37,8 +37,8 @@ wait_mounted() {
   done
 }
 sudo mount -t tmpfs -o size=32m,mode=0777 tmpfs "$work/volume"
-"$bin" --state "$work/volume/state" trees init --volume t
-"$bin" --state "$work/volume/state" trees mount "$work/main" --fork-mount "$work/fork" >"$work/mount.log" 2>&1 & pid=$!
+"$bin" --state "$work/volume/state" init --volume t
+"$bin" --state "$work/volume/state" mount "$work/main" --fork-mount "$work/fork" >"$work/mount.log" 2>&1 & pid=$!
 wait_mounted "$work/main" "$work/fork"
 python3 - "$work/main" "$work/volume/filler" "$work/receipt" <<'PY'
 import errno, os, sys
@@ -90,13 +90,13 @@ tree_wait_exit "$pid" || status=$?
 pid=
 if [ "$status" != 0 ]; then echo "mount exited $status after a full state area" >&2; cat "$work/mount.log" >&2; exit 1; fi
 grep -Eq 'tree (SaveFailed|HistoryBuildFailed)' "$work/mount.log" || { cat "$work/mount.log" >&2; exit 1; }
-"$bin" --state "$work/volume/state" trees init --volume t
+"$bin" --state "$work/volume/state" init --volume t
 gitdir=$work/volume/state/history.git
 [ "$(tree_git_file "$gitdir" root file)" = acknowledged ]
 git --git-dir="$gitdir" fsck --full --strict --no-progress
 tree_git_no_duplicate_opens "$gitdir"
 head=$(git --git-dir="$gitdir" rev-parse root)
-"$bin" --state "$work/volume/state" trees init --volume t
+"$bin" --state "$work/volume/state" init --volume t
 [ "$(git --git-dir="$gitdir" rev-parse root)" = "$head" ]
 printf 'PASS\tenospc\twrite fsync\n' | tee "$work/results.tsv"
 # Run a rename held at `point` while the real filesystem fills, then release it.
@@ -105,8 +105,8 @@ printf 'PASS\tenospc\twrite fsync\n' | tee "$work/results.tsv"
 rename_while_full() {
   local point=$1 log=$work/$1.log client
   rm -rf "$work/volume/state"
-  "$bin" --state "$work/volume/state" trees init --volume t
-  "$bin" --state "$work/volume/state" trees mount "$work/main" >"$work/setup-mount.log" 2>&1 & pid=$!
+  "$bin" --state "$work/volume/state" init --volume t
+  "$bin" --state "$work/volume/state" mount "$work/main" >"$work/setup-mount.log" 2>&1 & pid=$!
   wait_mounted "$work/main"
   python3 - "$work/main/source" <<'PY'
 import os, sys
@@ -131,7 +131,7 @@ PY
   # builder batch, each the point's first hit), built before the rename starts,
   # so the rename meets the point's second hit.
   before=$(tree_git_root_clients "$work/volume/state/history.git")
-  AGENTFS_FAILPOINTS="$point=sleep(30000)@2" "$bin" --state "$work/volume/state" trees mount "$work/main" >"$log" 2>&1 & pid=$!
+  AGENTFS_FAILPOINTS="$point=sleep(30000)@2" "$bin" --state "$work/volume/state" mount "$work/main" >"$log" 2>&1 & pid=$!
   wait_mounted "$work/main"
   tree_git_wait_root_attached "$work/volume/state/history.git" "$before"
   python3 - "$work/main/source" "$work/main/destination" "$2" <<'PY' >"$work/rename.log" 2>&1 & client=$!
@@ -174,7 +174,7 @@ PY
   fusermount3 -u "$work/main"
   # Neither failure stops the actor.
   tree_wait_exit "$pid"; pid=
-  "$bin" --state "$work/volume/state" trees init --volume t
+  "$bin" --state "$work/volume/state" init --volume t
   gitdir=$work/volume/state/history.git
   if [ "$3" = either ]; then
     [ "$(tree_git_file "$gitdir" root source 2>/dev/null || tree_git_file "$gitdir" root destination)" = git-acknowledged ]
@@ -184,7 +184,7 @@ PY
   git --git-dir="$gitdir" fsck --full --strict --no-progress
   tree_git_no_duplicate_opens "$gitdir"
   head=$(git --git-dir="$gitdir" rev-parse root)
-  "$bin" --state "$work/volume/state" trees init --volume t
+  "$bin" --state "$work/volume/state" init --volume t
   [ "$(git --git-dir="$gitdir" rev-parse root)" = "$head" ]
 }
 # A full state area at the step: its record is one small frame, which may still fit
@@ -200,8 +200,8 @@ printf 'PASS\tenospc-after-commit-point\trename 0; destination\n' | tee -a "$wor
 # (its stage, then its root client's attach) fails, the client's own or the
 # builder's behind the create, and every call after it answers EIO.
 rm -rf "$work/volume/state"
-"$bin" --state "$work/volume/state" trees init --volume t
-AGENTFS_FAILPOINTS='tree.wal_before_fsync=error@3' "$bin" --state "$work/volume/state" trees mount "$work/main" >"$work/fsync-mount.log" 2>&1 & pid=$!
+"$bin" --state "$work/volume/state" init --volume t
+AGENTFS_FAILPOINTS='tree.wal_before_fsync=error@3' "$bin" --state "$work/volume/state" mount "$work/main" >"$work/fsync-mount.log" 2>&1 & pid=$!
 wait_mounted "$work/main"
 python3 - "$work/main/synced" "$work/main/after-fsync" <<'PY'
 import errno, os, sys
@@ -228,6 +228,6 @@ expect_eio('create', lambda: os.close(os.open(sys.argv[2], os.O_CREAT | os.O_WRO
 PY
 fusermount3 -u "$work/main"
 expect_stopped "$work/fsync-mount.log"
-"$bin" --state "$work/volume/state" trees init --volume t
+"$bin" --state "$work/volume/state" init --volume t
 git --git-dir="$work/volume/state/history.git" fsck --full --strict --no-progress
 printf 'PASS\tfailed-fsync-stops\tEIO; stopped\n' | tee -a "$work/results.tsv"

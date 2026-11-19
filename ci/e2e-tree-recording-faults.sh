@@ -26,7 +26,7 @@ start() {
     views+=("$work/fork")
     args+=(--fork-mount "$work/fork" --fork-key faults)
   fi
-  AGENTFS_FAILPOINTS="$spec" "$bin" --state "$work/state" trees mount "${args[@]}" >"$work/mount.log" 2>&1 & pid=$!
+  AGENTFS_FAILPOINTS="$spec" "$bin" --state "$work/state" mount "${args[@]}" >"$work/mount.log" 2>&1 & pid=$!
   for _ in $(seq 1 200); do
     local up=1 view
     for view in "${views[@]}"; do mountpoint -q "$view" || up=; done
@@ -67,7 +67,7 @@ points=(tree.wal_before_header tree.wal_after_payload tree.wal_before_fsync tree
 for point in "${points[@]}"; do
   rm -rf "$work/state" "$work/main" "$work/fork"
   mkdir "$work/main" "$work/fork"
-  "$bin" --state "$work/state" trees init --volume t
+  "$bin" --state "$work/state" init --volume t
   start ''
   fork=$(sed -n 's/^fork tree: //p' "$work/mount.log")
   # Establish an independently observed acknowledged write before the kill.
@@ -126,7 +126,7 @@ PY
   wait "$client" 2>/dev/null || true
   grep -F "agentfs failpoint $point triggered (kill)" "$work/mount.log" >/dev/null || { cat "$work/mount.log" >&2; exit 1; }
   fusermount3 -uz "$work/main"
-  "$bin" --state "$work/state" trees init --volume t
+  "$bin" --state "$work/state" init --volume t
   gitdir=$work/state/history.git
   [ "$(tree_git_file "$gitdir" root baseline)" = baseline ]
   if grep -q "^write " "$work/receipt"; then
@@ -137,7 +137,7 @@ PY
   git --git-dir="$gitdir" fsck --full --strict --no-progress
   tree_git_no_duplicate_opens "$gitdir"
   head=$(git --git-dir="$gitdir" rev-parse root)
-  "$bin" --state "$work/state" trees init --volume t
+  "$bin" --state "$work/state" init --volume t
   [ "$(git --git-dir="$gitdir" rev-parse root)" = "$head" ]
   printf 'PASS\t%s\t%s\n' "$point" "$(tail -n 1 "$work/receipt")" | tee -a "$work/results.tsv"
 done
@@ -146,17 +146,17 @@ done
 for point in tree.after_ref_rebuild tree.compact_before_checkpoint tree.compact_before_drop; do
   rm -rf "$work/state" "$work/main" "$work/fork"
   mkdir "$work/main" "$work/fork"
-  "$bin" --state "$work/state" trees init --volume t
+  "$bin" --state "$work/state" init --volume t
   start ''
   fork=$(sed -n 's/^fork tree: //p' "$work/mount.log")
   printf saved > "$work/main/kept"
   fusermount3 -u "$work/main"; fusermount3 -u "$work/fork"
   tree_wait_exit "$pid"; pid=
   status=0
-  AGENTFS_FAILPOINTS="$point=kill" "$bin" --state "$work/state" trees init --volume t >"$work/open.log" 2>&1 || status=$?
+  AGENTFS_FAILPOINTS="$point=kill" "$bin" --state "$work/state" init --volume t >"$work/open.log" 2>&1 || status=$?
   [ "$status" = 137 ] || { echo "$point did not kill: $status" >&2; cat "$work/open.log" >&2; exit 1; }
   grep -F "agentfs failpoint $point triggered (kill)" "$work/open.log" >/dev/null
-  "$bin" --state "$work/state" trees init --volume t
+  "$bin" --state "$work/state" init --volume t
   gitdir=$work/state/history.git
   [ "$(tree_git_file "$gitdir" root kept)" = saved ]
   git --git-dir="$gitdir" fsck --full --strict --no-progress
@@ -166,10 +166,10 @@ done
 # A first init killed before its `format` starts over.
 rm -rf "$work/state"
 status=0
-AGENTFS_FAILPOINTS=tree.init_before_format=kill "$bin" --state "$work/state" trees init --volume t >"$work/open.log" 2>&1 || status=$?
+AGENTFS_FAILPOINTS=tree.init_before_format=kill "$bin" --state "$work/state" init --volume t >"$work/open.log" 2>&1 || status=$?
 [ "$status" = 137 ] || { echo "tree.init_before_format did not kill: $status" >&2; cat "$work/open.log" >&2; exit 1; }
 [ -e "$work/state/initializing" ]
-"$bin" --state "$work/state" trees init --volume t
+"$bin" --state "$work/state" init --volume t
 [ ! -e "$work/state/initializing" ]
 git --git-dir="$work/state/history.git" fsck --full --strict --no-progress
 printf 'PASS\ttree.init_before_format\t-\n' | tee -a "$work/results.tsv"
@@ -177,7 +177,7 @@ printf 'PASS\ttree.init_before_format\t-\n' | tee -a "$work/results.tsv"
 # never be replayed onto the new object at that pathname.
 rm -rf "$work/state" "$work/main" "$work/fork"
 mkdir "$work/main" "$work/fork"
-"$bin" --state "$work/state" trees init --volume t
+"$bin" --state "$work/state" init --volume t
 start ''
 fork=$(sed -n 's/^fork tree: //p' "$work/mount.log")
 python3 - "$work/main" "$work/orphan-receipt" <<'PY' >"$work/orphan-client.log" 2>&1 & client=$!
@@ -201,7 +201,7 @@ done
 kill -KILL "$pid"; tree_wait_exit "$pid" 2>/dev/null || true; pid=
 kill "$client"; wait "$client" 2>/dev/null || true
 fusermount3 -uz "$work/main"; fusermount3 -uz "$work/fork"
-"$bin" --state "$work/state" trees init --volume t
+"$bin" --state "$work/state" init --volume t
 gitdir=$work/state/history.git
 [ "$(tree_git_file "$gitdir" root old)" = replacement ]
 git --git-dir="$gitdir" rev-list --all > "$work/orphan-commits"
@@ -217,7 +217,7 @@ while read -r commit; do
 done < "$work/orphan-commits"
 tree_git_no_duplicate_opens "$gitdir"
 head=$(git --git-dir="$gitdir" rev-parse root)
-"$bin" --state "$work/state" trees init --volume t
+"$bin" --state "$work/state" init --volume t
 [ "$(git --git-dir="$gitdir" rev-parse root)" = "$head" ]
 git --git-dir="$gitdir" fsck --full --strict --no-progress
 printf 'PASS\treplaced-open-object\twrite fsync\n' | tee -a "$work/results.tsv"

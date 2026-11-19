@@ -173,13 +173,14 @@ jobs:
       - run: docker load -i "$RUNNER_TEMP/agentfs-image.tar"
       - run: ci/e2e-mergiraf.sh
 
-  # The tree views' tracer (ci/e2e-trees-tracer.sh): `trees init` and `trees
-  # mount` in the built image, a uid 10000 workload in another container,
-  # and the release figures of its step 4, with the state area on a fresh
-  # loop filesystem of each type (docs/performance.md, "Tree views, release
+  # The tree views' tracer (ci/e2e-trees-tracer.sh): `init` and `mount` in
+  # the built image, a uid 10000 workload in another container, and the
+  # release figures of its step 4, with the state area on a fresh loop
+  # filesystem of each type (docs/performance.md, "Tree views, release
   # build"). Each workload has its own deadline (ci/trees-budget.json), so
-  # step 4 ends in about fifteen minutes whatever the figures; a missed bar
-  # is a warning only.
+  # step 4 ends in about fifteen minutes whatever the figures; a gated
+  # figure (the many-file `create`) that misses its bar fails the job, any
+  # other is a warning.
   trees-tracer:
     name: e2e (tree views tracer in the image, ${{ matrix.fs }})
     needs: build

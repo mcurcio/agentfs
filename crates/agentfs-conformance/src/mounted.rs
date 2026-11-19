@@ -206,7 +206,7 @@ impl Mounted {
         command
             .arg("--state")
             .arg(&self.state)
-            .args(["trees", "mount"])
+            .arg("mount")
             .arg(&self.root)
             .env("AGENTFS_TAKE_GATE", &self.gate)
             .stdin(Stdio::null())

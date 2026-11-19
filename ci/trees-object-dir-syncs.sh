@@ -18,9 +18,9 @@ cleanup() {
   rm -rf "$work"
 }
 trap cleanup EXIT
-"$AGENTFS_BIN" --state "$work/state" trees init --volume t
+"$AGENTFS_BIN" --state "$work/state" init --volume t
 strace -f -y -qq -e trace=fsync,fdatasync,pwrite64 -o "$work/trace" \
-  "$AGENTFS_BIN" --state "$work/state" trees mount "$work/main" --fork-mount "$work/sandbox" >"$work/mount.log" 2>&1 & pid=$!
+  "$AGENTFS_BIN" --state "$work/state" mount "$work/main" --fork-mount "$work/sandbox" >"$work/mount.log" 2>&1 & pid=$!
 for _ in $(seq 1 200); do
   if mountpoint -q "$work/main" && mountpoint -q "$work/sandbox"; then break; fi
   kill -0 "$pid"; sleep .1

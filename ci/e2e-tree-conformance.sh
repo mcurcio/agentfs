@@ -16,8 +16,8 @@ cleanup() {
 }
 trap cleanup EXIT
 mkdir "$work/main" "$work/fork"
-"$bin" --state "$work/state" trees init --volume t
-"$bin" --state "$work/state" trees mount "$work/main" --fork-mount "$work/fork" --metrics-output "$work/metrics" >"$work/mount.log" 2>&1 &
+"$bin" --state "$work/state" init --volume t
+"$bin" --state "$work/state" mount "$work/main" --fork-mount "$work/fork" --metrics-output "$work/metrics" >"$work/mount.log" 2>&1 &
 pid=$!
 for _ in $(seq 1 200); do
     if mountpoint -q "$work/main" && mountpoint -q "$work/fork"; then break; fi

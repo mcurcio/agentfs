@@ -387,11 +387,11 @@ def badrules(binary, work):
     work = Path(work)
     state, mount = work / "bad-state", work / "bad-mount"
     mount.mkdir()
-    subprocess.run([binary, "--state", str(state), "trees", "init", "--volume", "bad"], check=True,
+    subprocess.run([binary, "--state", str(state), "init", "--volume", "bad"], check=True,
                    stdout=subprocess.DEVNULL)
     (state / "history.git" / "info").mkdir(exist_ok=True)
     (state / "history.git" / "info" / "attributes").write_text("*.db agentfs.group=x\n")
-    proc = subprocess.Popen([binary, "--state", str(state), "trees", "mount", str(mount)],
+    proc = subprocess.Popen([binary, "--state", str(state), "mount", str(mount)],
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     try:
         _, stderr = proc.communicate(timeout=60)
@@ -409,15 +409,15 @@ def badrules(binary, work):
 def serve(binary, state, mount, log):
     """Mounts the root of the volume at `state` on `mount`: the server, once
     the mount is up."""
-    proc = subprocess.Popen([binary, "--state", str(state), "trees", "mount", str(mount)],
+    proc = subprocess.Popen([binary, "--state", str(state), "mount", str(mount)],
                             stdout=subprocess.DEVNULL, stderr=log)
     for _ in range(600):
         if os.path.ismount(mount):
             return proc
-        assert proc.poll() is None, f"trees mount exited with {proc.returncode}"
+        assert proc.poll() is None, f"mount exited with {proc.returncode}"
         time.sleep(0.1)
     proc.kill()
-    raise AssertionError("trees mount did not come up")
+    raise AssertionError("mount did not come up")
 
 
 def unmount(proc):
@@ -429,7 +429,7 @@ def untrack(binary, work):
     work = Path(work)
     state, mount = work / "untrack-state", work / "untrack-mount"
     mount.mkdir()
-    subprocess.run([binary, "--state", str(state), "trees", "init", "--volume", "untrack"],
+    subprocess.run([binary, "--state", str(state), "init", "--volume", "untrack"],
                    check=True, stdout=subprocess.DEVNULL)
 
     def git(*args):
@@ -494,7 +494,7 @@ def save(binary, work):
     work = Path(work)
     state, mount = work / "save-state", work / "save-mount"
     mount.mkdir()
-    subprocess.run([binary, "--state", str(state), "trees", "init", "--volume", "save"],
+    subprocess.run([binary, "--state", str(state), "init", "--volume", "save"],
                    check=True, stdout=subprocess.DEVNULL)
     info = state / "history.git" / "info"
     info.mkdir(exist_ok=True)

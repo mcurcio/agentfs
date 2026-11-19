@@ -34,8 +34,7 @@ impl Setup {
         fs::create_dir_all(s.tree()).unwrap();
         fs::create_dir_all(s.home()).unwrap();
         Repository::init_bare(s.remote()).unwrap();
-        let out = s.agentfs(&["init", "--volume", "demo"]);
-        assert!(out.status.success(), "{}", text(&out.stderr));
+        agentfs_core::volume::init_with(&agentfs_core::volume::StateDir::new(s.state()), "demo", None, None).unwrap();
         let mut config = git2::Config::open(&s.state().join("git/config")).unwrap();
         config
             .set_str("remote.origin.url", &s.remote_url())

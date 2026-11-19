@@ -1,6 +1,6 @@
 //! The operator files under `deploy/`, checked through
-//! the CLI exactly as the init container and the sidecar use them: the
-//! config fragment is included with `agentfs init --include`, and the rule
+//! the CLI as the CSI driver uses them: the config fragment is included as
+//! `agentfs_core::volume::init_with` includes it (the driver's create), and the rule
 //! files become `<state>/git/info/exclude` and `info/attributes`. The
 //! sidecar manifest is checked for its crash recovery: `recover` mode and the
 //! read-only emptyDir fence.
@@ -44,14 +44,14 @@ impl Volume {
         let v = Self {
             dir: tempfile::tempdir().unwrap(),
         };
-        let out = v.run(&[
-            "init",
-            "--volume",
+        agentfs_core::volume::init_with(
+            &agentfs_core::volume::StateDir::new(v.dir.path().join("state")),
             "example",
-            "--include",
-            config.to_str().unwrap(),
-        ]);
-        assert!(out.status.success(), "{}", text(&out.stderr));
+            None,
+            Some(&[config.to_path_buf()]),
+        )
+        .unwrap();
+        std::fs::create_dir_all(v.tree()).unwrap();
         for (name, from) in [("exclude", exclude), ("attributes", attributes)] {
             std::fs::copy(from, v.dir.path().join("state/git/info").join(name)).unwrap();
         }
