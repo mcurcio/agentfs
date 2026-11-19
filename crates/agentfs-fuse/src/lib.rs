@@ -38,13 +38,15 @@ pub mod ops;
 pub mod overlay;
 pub mod privileges;
 pub mod session;
+pub mod stale;
 pub mod sweep;
 pub mod tree_view;
 pub mod views;
 
 pub use fuse::{Passthrough, PassthroughStatus};
 pub use mount::{
-    Mount, MountConfig, MountError, MountHooks, MountKind, MountState, MountView, OverlayConfig,
-    PreflightError, StackOver, StartupRepairs, UnmountReport, agentfs_layers, detach,
-    detach_stale_layers, mount_state, preflight, preflight_overlay, preflight_stacked,
+    Mount, MountConfig, MountError, MountHooks, MountKind, MountView, OverlayConfig,
+    PreflightError, StackOver, StartupRepairs, UnmountReport, preflight, preflight_overlay,
+    preflight_stacked,
 };
+pub use stale::{MountState, agentfs_layers, detach, detach_stale_layers, mount_state};

@@ -71,7 +71,7 @@ pub fn identity() -> VolumeIdentity {
 
 /// A new volume at `dir`, served with no pod context.
 pub fn create(dir: &Path) -> Result<TreeActor, Error> {
-    TreeActor::create(dir, &identity(), &PodContext::default())
+    TreeActor::create(dir, &identity(), None, &PodContext::default())
 }
 
 /// `label` as a writer with no pod context: the model's labels (`c3`) as they are.

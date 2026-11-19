@@ -36,7 +36,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use agentfs_contracts::name::WriterLabel;
 use agentfs_contracts::pod::{PodContext, WriterAt};
 use agentfs_contracts::ports::Found;
-use agentfs_contracts::volume::VolumeIdentity;
+use agentfs_contracts::volume::{Owner, VolumeIdentity};
 use git2::Oid;
 use serde::Serialize;
 
@@ -521,14 +521,20 @@ impl TreeActor {
     /// Creates a volume in an absent or empty directory (or one a cut-short
     /// create left under its marker): the marker, `volume`, the repository and
     /// its Root commit (writer `agentfs`, `service`'s pod context), the journal,
-    /// then `format`; each fsynced, the directory too. Then serves it, as
-    /// [`TreeActor::open`] does.
+    /// then `format`; each fsynced, the directory too. The Root commit records
+    /// the root directory with `root_owner`, or the process's effective uid and
+    /// gid when `None`, mode 0755. Then serves it, as [`TreeActor::open`] does.
     ///
     /// # Errors
     ///
     /// [`Error::Exists`] for any other directory, [`Error::Busy`] while another
     /// holds the state area, and any failed write.
-    pub fn create(root: &Path, identity: &VolumeIdentity, service: &PodContext) -> Result<Self> {
+    pub fn create(
+        root: &Path,
+        identity: &VolumeIdentity,
+        root_owner: Option<Owner>,
+        service: &PodContext,
+    ) -> Result<Self> {
         crate::history::init_libgit2();
         if !root.exists() {
             fs::DirBuilder::new()
@@ -555,13 +561,18 @@ impl TreeActor {
         write_durably(&root, IDENTITY, text.as_bytes())?;
         let repo = history::init_store(&root.join("history.git"), Arc::clone(&lock))?;
         repo.write_config(&refs::head(), &BTreeMap::new())?;
-        // The root directory, owned by the process that creates the volume.
-        let root_dir = Meta {
-            kind: Kind::Dir,
-            mode: Perm::from_mode(0o755),
+        // The root directory, owned as the launcher asked, else by the
+        // process that creates the volume.
+        let owner = root_owner.unwrap_or_else(|| Owner {
             // SAFETY: neither call has preconditions or fails.
             uid: unsafe { libc::geteuid() },
             gid: unsafe { libc::getegid() },
+        });
+        let root_dir = Meta {
+            kind: Kind::Dir,
+            mode: Perm::from_mode(0o755),
+            uid: owner.uid,
+            gid: owner.gid,
         };
         // Every commit with no file names the empty tree.
         repo.write_tree(&[])?;
@@ -1612,7 +1623,7 @@ pub(crate) mod test_support {
             name: VolumeName::parse("test").expect("a safe name"),
             id: VolumeId(uuid::Uuid::from_u128(1)),
         };
-        TreeActor::create(dir, &identity, &PodContext::default()).expect("creates")
+        TreeActor::create(dir, &identity, None, &PodContext::default()).expect("creates")
     }
 
     pub(crate) fn reopen(dir: &Path) -> TreeActor {

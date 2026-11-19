@@ -227,6 +227,7 @@ pub fn run(state: &Path, args: Args, minter: Minter) -> Result<ExitCode> {
                 at,
                 options: MountOptions {
                     allow_other: !no_allow_other,
+                    over_stale: false,
                 },
                 metrics_output,
             };
@@ -682,6 +683,7 @@ fn init(state: &Path, name: &str, at: &PodContext, minter: &Minter) -> Result<Ex
     let spec = VolumeSpec {
         name: VolumeName::parse(name)?,
         start: StartPoint::Empty,
+        root_owner: None,
     };
     let cap = root_cap(minter)?;
     let mut volume =

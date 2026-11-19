@@ -57,7 +57,7 @@ struct Run {
 }
 
 fn serve(dir: &Path) -> Arc<Recording> {
-    Recording::create(dir, &identity(), &PodContext::default()).expect("creates")
+    Recording::create(dir, &identity(), None, &PodContext::default()).expect("creates")
 }
 
 fn reopen(dir: &Path) -> Arc<Recording> {

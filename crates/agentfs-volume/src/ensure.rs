@@ -37,6 +37,7 @@ mod tests {
         VolumeSpec {
             name: VolumeName::parse(name).unwrap(),
             start: StartPoint::Empty,
+            root_owner: None,
         }
     }
 

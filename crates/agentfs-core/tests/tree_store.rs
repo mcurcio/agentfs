@@ -60,7 +60,7 @@ fn at() -> PodContext {
 }
 
 fn serve(dir: &Path) -> Arc<Recording> {
-    Recording::create(dir, &identity(), &PodContext::default()).expect("creates")
+    Recording::create(dir, &identity(), None, &PodContext::default()).expect("creates")
 }
 
 fn reopen(dir: &Path) -> Arc<Recording> {
@@ -917,7 +917,7 @@ fn each_event_carries_its_callers_pod_and_agentfs_the_services() {
     };
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
-    let recording = Recording::create(dir, &identity(), &pod("service")).unwrap();
+    let recording = Recording::create(dir, &identity(), None, &pod("service")).unwrap();
     let events = Events::default();
     let (trees, mut clients) = domains(&recording, &events);
     let sessions = agentfs_core::session::Sessions::new(Arc::clone(&recording));

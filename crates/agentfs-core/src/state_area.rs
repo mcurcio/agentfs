@@ -15,7 +15,7 @@ use agentfs_contracts::pod::PodContext;
 use agentfs_contracts::ports::{Found, QueueFacts, StateArea, StoreError, VolumeStore};
 use agentfs_contracts::tree::TreeId;
 use agentfs_contracts::volume::{
-    EnsureOutcome, VolumeError, VolumeEvent, VolumeId, VolumeIdentity, VolumeState,
+    EnsureOutcome, Owner, VolumeError, VolumeEvent, VolumeId, VolumeIdentity, VolumeState,
 };
 
 use crate::store::{TreeStore, io_kind};
@@ -72,13 +72,14 @@ impl StateArea for TreeStateArea {
     fn create(
         &mut self,
         name: &VolumeName,
+        root_owner: Option<Owner>,
         at: &PodContext,
     ) -> Result<(VolumeIdentity, EnsureOutcome), VolumeError> {
         let identity = VolumeIdentity {
             name: name.clone(),
             id: VolumeId(uuid::Uuid::new_v4()),
         };
-        match Recording::create(&self.root, &identity, at) {
+        match Recording::create(&self.root, &identity, root_owner, at) {
             Ok(recording) => {
                 // Every record durable before the call returns.
                 drop(recording);

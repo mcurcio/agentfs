@@ -29,6 +29,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::stale::{self, MountState};
 use agentfs_contracts::clients::{Access, Binding, FileOwner};
 use agentfs_contracts::views::{MountOptions, MountPoint, ViewError, ViewId, Views};
 use agentfs_core::session::{SessionGuard, Sessions, TreeSession};
@@ -41,6 +42,8 @@ use fuser::*;
 use untracked::{Untracked, is_untracked};
 
 const TTL: Duration = Duration::ZERO;
+/// The state area's directory of stacked views' private mount points.
+const STACK: &str = "stack";
 /// Files listed per READDIR at most: more than a reply's buffer holds, and the
 /// kernel asks again from where a reply stopped.
 const READDIR_BATCH: usize = 1024;
@@ -59,6 +62,8 @@ pub enum HostEvent {
 
 /// Where each open view is mounted, and its kernel channel.
 struct Mounted {
+    /// The mount point the workload sees (for a stacked view, where its
+    /// layer was bind-mounted).
     at: PathBuf,
     tree: TreeId,
     notifier: Notifier,
@@ -84,6 +89,8 @@ fn notifiers(views: &OpenViews) -> Vec<(TreeId, Notifier)> {
 /// The views of one served volume, and its take and metrics workers.
 pub struct ViewHost {
     sessions: Sessions,
+    /// The volume's name: every view's source is `agentfs:<volume>`.
+    volume: String,
     /// The state area, canonical: no view may be inside it or hold it.
     state: PathBuf,
     metrics_output: Option<PathBuf>,
@@ -115,6 +122,14 @@ impl ViewHost {
         notify: Arc<dyn Fn(HostEvent) + Send + Sync>,
     ) -> io::Result<Self> {
         let state = state.canonicalize()?;
+        let volume = sessions
+            .recording()
+            .actor()
+            .map_err(io::Error::other)?
+            .identity()
+            .name
+            .as_str()
+            .to_owned();
         let metrics_output = metrics_output
             .map(|path| {
                 let filename = path.file_name().ok_or_else(|| {
@@ -159,6 +174,7 @@ impl ViewHost {
             .transpose()?;
         Ok(Self {
             sessions,
+            volume,
             state,
             metrics_output,
             notify,
@@ -214,20 +230,46 @@ impl ViewHost {
     fn mount_point(&self, at: &MountPoint) -> Option<PathBuf> {
         let at = at.0.canonicalize().ok()?;
         let empty = std::fs::read_dir(&at).ok()?.next().is_none();
-        let apart = |other: &Path| !at.starts_with(other) && !other.starts_with(&at);
+        (at.is_dir() && empty && self.placed_apart(&at)).then_some(at)
+    }
+
+    /// A stale mount point's checks: resolved through its parent (the stale
+    /// mount answers `ENOTCONN`), then apart as [`Self::mount_point`]'s.
+    fn stale_mount_point(&self, at: &MountPoint) -> Option<PathBuf> {
+        let parent = at.0.parent().filter(|p| !p.as_os_str().is_empty())?;
+        let at = parent.canonicalize().ok()?.join(at.0.file_name()?);
+        self.placed_apart(&at).then_some(at)
+    }
+
+    /// `at` is outside the state area, every open view and the metrics
+    /// output, and holds none of them.
+    fn placed_apart(&self, at: &Path) -> bool {
+        let apart = |other: &Path| !at.starts_with(other) && !other.starts_with(at);
         let separate = open_views(&self.views).values().all(|view| apart(&view.at));
         let metrics_apart = self
             .metrics_output
             .as_ref()
-            .is_none_or(|output| !output.starts_with(&at));
-        (at.is_dir() && empty && apart(&self.state) && separate && metrics_apart).then_some(at)
+            .is_none_or(|output| !output.starts_with(at));
+        apart(&self.state) && separate && metrics_apart
+    }
+
+    /// The view's source: `agentfs:<volume>` for the root, and
+    /// `agentfs:<volume>:<tree>` for a fork.
+    fn fsname(&self, tree: TreeId) -> String {
+        match tree {
+            TreeId::Root => format!("agentfs:{}", self.volume),
+            fork => format!("agentfs:{}:{fork}", self.volume),
+        }
     }
 }
 
 impl Views for ViewHost {
     /// Mounts `binding`'s session's tree at `at`, each entry presented with
     /// its recorded owner, read-only for a read-only grant. Never waits for
-    /// history: the tree must be among the actor's saved trees.
+    /// history: the tree must be among the actor's saved trees. A stale
+    /// mount of this volume at `at` is stacked over with
+    /// `options.over_stale` (`ViewError::Stale` otherwise); a live or
+    /// foreign mount there is `MountFailed(EBUSY)`.
     fn open(
         &mut self,
         at: MountPoint,
@@ -238,9 +280,30 @@ impl Views for ViewHost {
             .sessions
             .session(binding.session)
             .ok_or(ViewError::UnknownSession)?;
-        let at = self
-            .mount_point(&at)
-            .ok_or(ViewError::MountFailed(libc::EINVAL))?;
+        let errno = |e: io::Error| ViewError::MountFailed(e.raw_os_error().unwrap_or(libc::EIO));
+        // Where FUSE is mounted, and for a stacked view the mount point its
+        // layer is bound over.
+        let (at, stacked) = match stale::mount_state(&at.0).map_err(errno)? {
+            MountState::NotMounted => (
+                self.mount_point(&at)
+                    .ok_or(ViewError::MountFailed(libc::EINVAL))?,
+                false,
+            ),
+            MountState::Stale { source }
+                if options.over_stale
+                    && stale::source_volume(&source) == Some(self.volume.as_str()) =>
+            {
+                (
+                    self.stale_mount_point(&at)
+                        .ok_or(ViewError::MountFailed(libc::EINVAL))?,
+                    true,
+                )
+            }
+            MountState::Stale { source } => return Err(ViewError::Stale { found: source }),
+            MountState::Live { .. } | MountState::Foreign { .. } => {
+                return Err(ViewError::MountFailed(libc::EBUSY));
+            }
+        };
         let saved = self
             .sessions
             .recording()
@@ -267,17 +330,31 @@ impl Views for ViewHost {
             notifier: Arc::default(),
         };
         let notifier = Arc::clone(&view.notifier);
-        let mounted = fuser::spawn_mount(view, &at, &session_config(&options, read_only))
-            .map_err(|e| ViewError::MountFailed(e.raw_os_error().unwrap_or(libc::EIO)))?;
+        let id = ViewId(self.next);
+        // A stacked view's FUSE goes to a private directory first: the stale
+        // mount point answers ENOTCONN.
+        let source = if stacked {
+            let source = self.state.join(STACK).join(id.0.to_string());
+            stale::prepare_stack_source(&source).map_err(errno)?;
+            source
+        } else {
+            at.clone()
+        };
+        let config = session_config(&options, read_only, &self.fsname(tree));
+        let mounted = fuser::spawn_mount(view, &source, &config).map_err(errno)?;
+        if stacked && let Err(e) = stale::stack(&source, &at) {
+            // Nothing is left stacked; unmounting the source ends the session.
+            let _ = mounted.umount_and_join();
+            return Err(errno(e));
+        }
         // A move into the tree in the instant before this drops no pages:
         // nothing of the new mount is mapped yet.
         let _ = notifier.set(mounted.notifier());
-        let id = ViewId(self.next);
         self.next += 1;
         open_views(&self.views).insert(
             id,
             Mounted {
-                at,
+                at: at.clone(),
                 tree,
                 notifier: mounted.notifier(),
                 closing: false,
@@ -290,6 +367,16 @@ impl Views for ViewHost {
                 if let Err(e) = mounted.join() {
                     eprintln!("tree ViewFailed: tree={tree}: {e}");
                 }
+                if stacked {
+                    // The stale layers this view was stacked over.
+                    match stale::detach_stale_layers(&at, stale::STALE_LAYERS) {
+                        Ok(n) => {
+                            eprintln!("tree DetachedStale: {}: {n} layer(s)", at.display());
+                        }
+                        Err(e) => eprintln!("tree DetachStaleFailed: {}: {e}", at.display()),
+                    }
+                    let _ = std::fs::remove_dir(&source);
+                }
                 open_views(&views).remove(&id);
                 notify(HostEvent::ViewEnded(id));
             })
@@ -298,8 +385,9 @@ impl Views for ViewHost {
         Ok(id)
     }
 
-    /// A lazy unmount (`fusermount3 -uz`): the mount leaves the namespace at
-    /// once and its files close as the kernel releases them. Idempotent.
+    /// A lazy unmount (`umount2(MNT_DETACH)` with the privilege, else
+    /// `fusermount3 -u -z`): the mount leaves the namespace at once and its
+    /// files close as the kernel releases them. Idempotent.
     fn close(&mut self, view: ViewId) {
         let at = match open_views(&self.views).get_mut(&view) {
             Some(mounted) if !mounted.closing => {
@@ -308,14 +396,8 @@ impl Views for ViewHost {
             }
             _ => return,
         };
-        match std::process::Command::new("fusermount3")
-            .arg("-uz")
-            .arg(&at)
-            .status()
-        {
-            Ok(status) if status.success() => {}
-            Ok(status) => eprintln!("tree UnmountFailed: {}: {status}", at.display()),
-            Err(e) => eprintln!("tree UnmountFailed: {}: {e}", at.display()),
+        if let Err(e) = stale::detach(&at) {
+            eprintln!("tree UnmountFailed: {}: {e}", at.display());
         }
     }
 }
@@ -425,13 +507,16 @@ fn invalidate_changed(notifiers: &[(TreeId, Notifier)], changed: &[(TreeId, u64)
     }
 }
 
-/// The fuser config for one view: FUSE `allow_other` (`SessionACL::All`) when
-/// `options.allow_other`, else the mounting user alone; permission checks by
-/// the kernel, no devices, no set-user-ID; read-only for a read-only client.
-fn session_config(options: &MountOptions, read_only: bool) -> Config {
+/// The fuser config for one view: source `fsname` and subtype `agentfs`, so
+/// `/proc/self/mountinfo` shows an agentfs mount; FUSE `allow_other`
+/// (`SessionACL::All`) when `options.allow_other`, else the mounting user
+/// alone; permission checks by the kernel, no devices, no set-user-ID;
+/// read-only for a read-only client.
+fn session_config(options: &MountOptions, read_only: bool, fsname: &str) -> Config {
     let mut config = Config::default();
     config.mount_options = vec![
-        MountOption::FSName("agentfs-trees".into()),
+        MountOption::FSName(fsname.to_owned()),
+        MountOption::Subtype("agentfs".into()),
         MountOption::DefaultPermissions,
         MountOption::NoDev,
         MountOption::NoSuid,
@@ -2057,11 +2142,15 @@ mod tests {
     use agentfs_contracts::volume::{VolumeId, VolumeIdentity};
 
     fn new_actor(dir: &Path) -> Arc<Recording> {
+        new_named(dir, "test")
+    }
+
+    fn new_named(dir: &Path, name: &str) -> Arc<Recording> {
         let identity = VolumeIdentity {
-            name: VolumeName::parse("test").unwrap(),
+            name: VolumeName::parse(name).unwrap(),
             id: VolumeId(uuid::Uuid::from_u128(1)),
         };
-        Recording::create(dir, &identity, &PodContext::default()).unwrap()
+        Recording::create(dir, &identity, None, &PodContext::default()).unwrap()
     }
 
     const OWNER: FileOwner = FileOwner {
@@ -2081,6 +2170,16 @@ mod tests {
         reason = "a test is its own composition root"
     )]
     fn writing(sessions: &mut Sessions, label: &str) -> TreeSession {
+        let id = writing_id(sessions, label);
+        sessions.session(id).unwrap()
+    }
+
+    /// The id of a session bound to write the root as client `label`.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "a test is its own composition root"
+    )]
+    fn writing_id(sessions: &mut Sessions, label: &str) -> SessionId {
         let client = ClientId {
             launcher: LauncherId::parse("cli").unwrap(),
             tree: TreeId::Root,
@@ -2094,7 +2193,7 @@ mod tests {
         let id = sessions.open();
         let cap = ClientCap::mint(&Minter::new(), client, TreeId::Root, writes_as);
         sessions.bind(id, SessionAuthority::Write(cap));
-        sessions.session(id).unwrap()
+        id
     }
 
     fn view(session: TreeSession) -> View {
@@ -2145,9 +2244,38 @@ mod tests {
         assert!(is_untracked(INodeNo(untracked::UNTRACKED | 1)));
     }
 
+    const OPTIONS: MountOptions = MountOptions {
+        allow_other: true,
+        over_stale: false,
+    };
+
+    /// Every view is an agentfs mount of its volume: `probe` and stale
+    /// detection read its source.
+    #[test]
+    fn a_view_is_mounted_as_its_volume() {
+        let config = session_config(&OPTIONS, false, "agentfs:t");
+        assert!(
+            config
+                .mount_options
+                .contains(&MountOption::FSName("agentfs:t".into()))
+        );
+        assert!(
+            config
+                .mount_options
+                .contains(&MountOption::Subtype("agentfs".into()))
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path().join("state");
+        let sessions = Sessions::new(new_named(&state, "t"));
+        let host = host(&sessions, &state);
+        assert_eq!(host.fsname(TreeId::Root), "agentfs:t");
+        assert_eq!(host.fsname(TreeId::Fork(3)), "agentfs:t:fork/3");
+        host.wait().unwrap();
+    }
+
     #[test]
     fn session_config_allows_other_by_default() {
-        let config = session_config(&MountOptions { allow_other: true }, false);
+        let config = session_config(&OPTIONS, false, "agentfs:t");
         assert_eq!(config.acl, SessionACL::All);
         assert!(
             config
@@ -2155,7 +2283,14 @@ mod tests {
                 .contains(&MountOption::DefaultPermissions)
         );
         assert!(config.mount_options.contains(&MountOption::RW));
-        let config = session_config(&MountOptions { allow_other: false }, true);
+        let config = session_config(
+            &MountOptions {
+                allow_other: false,
+                ..OPTIONS
+            },
+            true,
+            "agentfs:t",
+        );
         assert_eq!(config.acl, SessionACL::Owner);
         assert!(config.mount_options.contains(&MountOption::RO));
     }
@@ -2168,7 +2303,7 @@ mod tests {
         let state = tmp.path().join("state");
         let mut sessions = Sessions::new(new_actor(&state));
         let mut host = host(&sessions, &state);
-        let options = MountOptions { allow_other: true };
+        let options = OPTIONS;
         let outside = tmp.path().join("valid");
         std::fs::create_dir(&outside).unwrap();
         let unbound = sessions.open();
@@ -2553,5 +2688,184 @@ mod tests {
             volume.anonymous_open(ATTRS).map_err(errno),
             Err(Errno::EROFS)
         );
+    }
+
+    /// Set in a worker process: `<state>\n<mount point>`.
+    const STALE_WORKER: &str = "AGENTFS_STALE_VIEW_WORKER";
+    /// What a worker prints once its view is up and written.
+    const STALE_READY: &str = "agentfs-stale-view-ready";
+
+    /// Fails loudly unless this process may mount and stack.
+    fn needs_root_and_fuse() {
+        // SAFETY: a plain call.
+        assert_eq!(unsafe { libc::geteuid() }, 0, "this test needs root");
+        assert!(Path::new("/dev/fuse").exists(), "this test needs /dev/fuse");
+    }
+
+    /// In a worker: serves the volume at `state` with a writable root view
+    /// at the mount point, writes `kept`, says so, and waits to be killed.
+    /// Outside one: nothing.
+    fn stale_worker() {
+        let Ok(spec) = std::env::var(STALE_WORKER) else {
+            return;
+        };
+        let (state, at) = spec.split_once('\n').unwrap();
+        let mut sessions =
+            Sessions::new(Recording::open(Path::new(state), &PodContext::default()).unwrap());
+        let mut host = host(&sessions, Path::new(state));
+        let session = writing_id(&mut sessions, "worker");
+        let mut binding = binding(session, TreeId::Root);
+        binding.grant = Grant::live_read_write(TreeId::Root, Consistency::PerFile);
+        host.open(MountPoint(PathBuf::from(at)), binding, OPTIONS)
+            .unwrap();
+        std::fs::write(Path::new(at).join("kept"), b"kept\n").unwrap();
+        println!("{STALE_READY}");
+        loop {
+            std::thread::park();
+        }
+    }
+
+    /// Leaves a stale view of the volume at `state` on `at`: a worker
+    /// process serves it, and is killed once it said it wrote.
+    fn leave_stale_view(test: &str, state: &Path, at: &Path) {
+        use std::io::BufRead as _;
+        let mut worker = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                test,
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(
+                STALE_WORKER,
+                format!("{}\n{}", state.display(), at.display()),
+            )
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let out = std::io::BufReader::new(worker.stdout.take().unwrap());
+        let ready = out
+            .lines()
+            .map_while(io::Result::ok)
+            .any(|l| l.contains(STALE_READY));
+        worker.kill().unwrap();
+        worker.wait().unwrap();
+        assert!(ready, "the worker never served its view");
+        assert!(
+            matches!(stale::mount_state(at).unwrap(), MountState::Stale { .. }),
+            "the killed worker's view is stale"
+        );
+        assert_eq!(
+            rustix::fs::statfs(at).map(|_| ()),
+            Err(rustix::io::Errno::NOTCONN)
+        );
+    }
+
+    /// A view host restarted after its predecessor died stacks over the
+    /// stale view: the file reads through the original path; once the view
+    /// ends, no agentfs layer is left there. Without `over_stale` it is
+    /// refused.
+    #[test]
+    #[ignore = "needs root and /dev/fuse: ci/fuse-tests.sh"]
+    fn stale_view_is_stacked_over_and_its_layers_detached() {
+        stale_worker();
+        needs_root_and_fuse();
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path().join("state");
+        let at = tmp.path().join("mnt");
+        std::fs::create_dir(&at).unwrap();
+        drop(new_named(&state, "test"));
+        leave_stale_view(
+            "tree_view::tests::stale_view_is_stacked_over_and_its_layers_detached",
+            &state,
+            &at,
+        );
+
+        let mut sessions = Sessions::new(Recording::open(&state, &PodContext::default()).unwrap());
+        let (ended, events) = std::sync::mpsc::channel();
+        let ended = Mutex::new(ended);
+        let mut host = ViewHost::new(
+            sessions.clone(),
+            &state,
+            None,
+            Arc::new(move |event| {
+                if let HostEvent::ViewEnded(id) = event {
+                    let _ = ended.lock().unwrap().send(id);
+                }
+            }),
+        )
+        .unwrap();
+        let reader = sessions.open();
+        sessions.bind(reader, SessionAuthority::Read(TreeId::Root));
+        assert_eq!(
+            host.open(
+                MountPoint(at.clone()),
+                binding(reader, TreeId::Root),
+                OPTIONS
+            ),
+            Err(ViewError::Stale {
+                found: "agentfs:test".into()
+            })
+        );
+        let id = host
+            .open(
+                MountPoint(at.clone()),
+                binding(reader, TreeId::Root),
+                MountOptions {
+                    over_stale: true,
+                    ..OPTIONS
+                },
+            )
+            .unwrap();
+        assert_eq!(std::fs::read(at.join("kept")).unwrap(), b"kept\n");
+        assert_eq!(stale::agentfs_layers(&at).unwrap(), 2);
+        host.close(id);
+        assert_eq!(events.recv().unwrap(), id);
+        assert_eq!(stale::agentfs_layers(&at).unwrap(), 0);
+        host.wait().unwrap();
+    }
+
+    /// A stale mount of another volume is never stacked over: refused with
+    /// nothing mounted.
+    #[test]
+    #[ignore = "needs root and /dev/fuse: ci/fuse-tests.sh"]
+    fn stale_view_of_another_volume_is_refused() {
+        stale_worker();
+        needs_root_and_fuse();
+        let tmp = tempfile::tempdir().unwrap();
+        let other = tmp.path().join("other");
+        let at = tmp.path().join("mnt");
+        std::fs::create_dir(&at).unwrap();
+        drop(new_named(&other, "other"));
+        leave_stale_view(
+            "tree_view::tests::stale_view_of_another_volume_is_refused",
+            &other,
+            &at,
+        );
+
+        let state = tmp.path().join("state");
+        let mut sessions = Sessions::new(new_named(&state, "test"));
+        let mut host = host(&sessions, &state);
+        let reader = sessions.open();
+        sessions.bind(reader, SessionAuthority::Read(TreeId::Root));
+        let refused = host.open(
+            MountPoint(at.clone()),
+            binding(reader, TreeId::Root),
+            MountOptions {
+                over_stale: true,
+                ..OPTIONS
+            },
+        );
+        let layers = stale::agentfs_layers(&at).unwrap();
+        stale::detach_stale_layers(&at, stale::STALE_LAYERS).unwrap();
+        assert_eq!(
+            refused,
+            Err(ViewError::Stale {
+                found: "agentfs:other".into()
+            })
+        );
+        assert_eq!(layers, 1, "nothing was mounted");
+        host.wait().unwrap();
     }
 }

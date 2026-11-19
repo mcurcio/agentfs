@@ -186,6 +186,7 @@ fn the_call_path_runs_no_git() {
     let rec = Recording::create(
         &tmp.path().join("state"),
         &identity(),
+        None,
         &PodContext::default(),
     )
     .unwrap();
@@ -237,6 +238,7 @@ fn a_call_is_not_fsynced_and_flush_fsyncs_once() {
     let rec = Recording::create(
         &tmp.path().join("state"),
         &identity(),
+        None,
         &PodContext::default(),
     )
     .unwrap();

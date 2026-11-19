@@ -547,7 +547,8 @@ mod tests {
     #[test]
     fn created_survives_a_change_and_a_compaction() {
         let tmp = tempfile::tempdir().unwrap();
-        let recording = Recording::create(tmp.path(), &identity(), &PodContext::default()).unwrap();
+        let recording =
+            Recording::create(tmp.path(), &identity(), None, &PodContext::default()).unwrap();
         let store = TreeStore::new(Arc::clone(&recording));
         let at = PodContext::default();
         let first = store

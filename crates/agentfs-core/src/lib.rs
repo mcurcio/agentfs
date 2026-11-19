@@ -38,6 +38,7 @@ pub mod mountinfo;
 pub mod nested;
 pub mod non_empty;
 pub mod operations;
+pub mod operator_settings;
 pub mod patch;
 pub mod paths;
 pub mod pending;

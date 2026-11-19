@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Runs the real FUSE mount tests (crates/agentfs/tests/mount.rs) as root,
-# and the unit tests that need root (creating as the caller).
+# and the unit tests that need root (creating as the caller, tree views
+# stacked over a stale mount).
 #
 # Needs Linux with /dev/fuse, fuse3 (fusermount3), sqlite3, git, jq, attr,
 # setpriv and passwordless sudo; the unprivileged-daemon test also needs
@@ -30,6 +31,12 @@ step "creating as the caller, as root (crates/agentfs-fuse/src/creds.rs)"
 OUT=$(sudo "$unit" creds:: --nocapture 2>&1) || { echo "$OUT"; fail "creds tests failed"; }
 echo "$OUT"
 case "$OUT" in *"skipped: needs root"*) fail "the root test did not run as root" ;; esac
+
+step "tree views stacked over a stale mount, as root (crates/agentfs-fuse/src/tree_view.rs)"
+OUT=$(sudo "$unit" tree_view::tests::stale_view --ignored --test-threads=1 --nocapture 2>&1) ||
+  { echo "$OUT"; fail "stale view tests failed"; }
+echo "$OUT"
+case "$OUT" in *"test result: ok. 2 passed"*) ;; *) fail "the stale view tests did not both run" ;; esac
 
 step "kernel $(uname -r), passthrough ${AGENTFS_TEST_PASSTHROUGH:-auto}"
 sudo --preserve-env=AGENTFS_TEST_PASSTHROUGH,AGENTFS_TEST_UNPRIV_USER,RUST_BACKTRACE,RUNNER_TEMP \

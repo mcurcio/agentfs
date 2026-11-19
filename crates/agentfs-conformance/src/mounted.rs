@@ -134,6 +134,7 @@ impl Mounted {
             let recording = agentfs_core::tree_actor::Recording::create(
                 &state,
                 &crate::library::identity(),
+                None,
                 &agentfs_contracts::pod::PodContext::default(),
             )
             .map_err(fail)?;

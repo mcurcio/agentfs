@@ -25,12 +25,54 @@ pub struct VolumeIdentity {
     pub id: VolumeId,
 }
 
+/// The owner a new volume's root directory is recorded with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Owner {
+    pub uid: u32,
+    pub gid: u32,
+}
+
+/// Text that is not `UID:GID`.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{0:?} is not UID:GID (two decimal numbers)")]
+pub struct OwnerError(pub String);
+
+impl std::str::FromStr for Owner {
+    type Err = OwnerError;
+
+    /// `UID:GID`, each a decimal `u32`, nothing else.
+    fn from_str(text: &str) -> Result<Self, OwnerError> {
+        let refuse = || OwnerError(text.to_owned());
+        let (uid, gid) = text.split_once(':').ok_or_else(refuse)?;
+        let number = |part: &str| {
+            if part.is_empty() || !part.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(refuse());
+            }
+            part.parse::<u32>().map_err(|_| refuse())
+        };
+        Ok(Self {
+            uid: number(uid)?,
+            gid: number(gid)?,
+        })
+    }
+}
+
+impl std::fmt::Display for Owner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:{}", self.uid, self.gid)
+    }
+}
+
 /// What a launcher asks for, built from its configuration. No id: `ensure`
 /// assigns it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VolumeSpec {
     pub name: VolumeName,
     pub start: StartPoint,
+    /// The root directory's owner when `ensure` creates the volume; `None`
+    /// is the creating process's effective uid and gid. Never compared and
+    /// never applied to a found volume: its root's owner is content.
+    pub root_owner: Option<Owner>,
 }
 
 /// Where the root's history begins.
@@ -228,6 +270,36 @@ pub trait Volume {
 mod tests {
     use super::*;
     use crate::ports::StoreError;
+
+    #[test]
+    fn an_owner_is_two_decimal_numbers() {
+        let owner: Owner = "10000:10000".parse().unwrap();
+        assert_eq!(
+            owner,
+            Owner {
+                uid: 10000,
+                gid: 10000
+            }
+        );
+        assert_eq!(owner.to_string().parse::<Owner>(), Ok(owner));
+        assert_eq!(Owner { uid: 0, gid: 7 }.to_string(), "0:7");
+        for refused in [
+            "10000",
+            "a:b",
+            "1:2:3",
+            "-1:0",
+            "+1:0",
+            ":1",
+            "1:",
+            "4294967296:0",
+        ] {
+            assert_eq!(
+                refused.parse::<Owner>(),
+                Err(OwnerError(refused.to_owned())),
+                "{refused}"
+            );
+        }
+    }
 
     /// A store that cannot record is `Stopped`, as for Clients and Trees;
     /// a write that changed nothing keeps its kind.

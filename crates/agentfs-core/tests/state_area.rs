@@ -18,8 +18,8 @@ use agentfs_contracts::pod::PodContext;
 use agentfs_contracts::ports::VolumeStore;
 use agentfs_contracts::ports::{Event, EventSink};
 use agentfs_contracts::volume::{
-    Blocker, Disposition, Drain, EnsureOutcome, ReleaseVerdict, SpecField, StartPoint, Volume,
-    VolumeError, VolumeEvent, VolumeSpec, VolumeState,
+    Blocker, Disposition, Drain, EnsureOutcome, Owner, ReleaseVerdict, SpecField, StartPoint,
+    Volume, VolumeError, VolumeEvent, VolumeSpec, VolumeState,
 };
 use agentfs_core::state_area::TreeStateArea;
 use agentfs_core::store::TreeStore;
@@ -61,6 +61,7 @@ fn spec(name: &str) -> VolumeSpec {
     VolumeSpec {
         name: VolumeName::parse(name).unwrap(),
         start: StartPoint::Empty,
+        root_owner: None,
     }
 }
 
@@ -115,6 +116,45 @@ fn ensure_three_times_gives_one_id() {
     assert_eq!(
         fs::read_to_string(root.join("volume")).unwrap(),
         format!("{{\"name\":\"t\",\"id\":\"{}\"}}\n", first.id.0)
+    );
+}
+
+/// The Root commit's record of the root directory.
+fn root_record(root: &Path) -> String {
+    let first = git(root, &["rev-list", "--max-parents=0", "--all"]);
+    let commit = first.lines().next().expect("a Root commit");
+    git(root, &["cat-file", "blob", &format!("{commit}:dirs/root")])
+}
+
+/// The root owner is what the Root commit records the root directory with;
+/// without one, the creating process's ids. A found volume keeps its own.
+#[test]
+fn the_root_owner_is_recorded_at_create() {
+    let tmp = tempfile::tempdir().unwrap();
+    let at = PodContext::default();
+    let owned = tmp.path().join("owned");
+    let spec_owned = VolumeSpec {
+        root_owner: Some(Owner {
+            uid: 4242,
+            gid: 4343,
+        }),
+        ..spec("t")
+    };
+    volume(&owned).ensure(spec_owned, &at, &root_cap()).unwrap();
+    let record = root_record(&owned);
+    assert!(record.contains(r#""uid":4242,"gid":4343"#), "{record}");
+    let found = volume(&owned).ensure(spec("t"), &at, &root_cap()).unwrap();
+    assert_eq!(found.outcome, EnsureOutcome::Found);
+    assert_eq!(root_record(&owned), record);
+
+    let plain = tmp.path().join("plain");
+    volume(&plain).ensure(spec("t"), &at, &root_cap()).unwrap();
+    // SAFETY: neither call has preconditions or fails.
+    let ids = unsafe { (libc::geteuid(), libc::getegid()) };
+    let record = root_record(&plain);
+    assert!(
+        record.contains(&format!(r#""uid":{},"gid":{}"#, ids.0, ids.1)),
+        "{record}"
     );
 }
 

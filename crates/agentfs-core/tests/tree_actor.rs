@@ -1956,7 +1956,9 @@ fn a_failed_compaction_fsync_stops_the_actor() {
 fn a_cut_first_init_starts_over() {
     let tmp = tempfile::tempdir().unwrap();
     let guard = agentfs_core::failpoints::configure("tree.init_before_format=error").unwrap();
-    assert!(TreeActor::create(tmp.path(), &trees::identity(), &PodContext::default()).is_err());
+    assert!(
+        TreeActor::create(tmp.path(), &trees::identity(), None, &PodContext::default()).is_err()
+    );
     drop(guard);
     assert!(tmp.path().join("initializing").exists());
     assert!(tmp.path().join("history.git").exists());
@@ -2407,7 +2409,7 @@ fn a_recovered_open_commits_with_its_writers_pod_context() {
 #[test]
 fn a_landing_names_its_landed_writer() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut v = TreeActor::create(tmp.path(), &trees::identity(), &pod("svc")).unwrap();
+    let mut v = TreeActor::create(tmp.path(), &trees::identity(), None, &pod("svc")).unwrap();
     put(&mut v, ROOT, "a", b"base\n");
     let fork = rowless_fork(&mut v);
     put(&mut v, ROOT, "b", b"root moved\n");

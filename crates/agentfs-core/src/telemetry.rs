@@ -45,6 +45,7 @@ use opentelemetry::{Context, ContextGuard, InstrumentationScope, KeyValue};
 use crate::config::Settings;
 use crate::events::{Event, EventSink, Events};
 use crate::journal::Journal;
+use crate::operator_settings::{Capability, NotBuilt};
 use crate::push::{self, RemoteBacklog};
 use crate::record::Trigger;
 use crate::volume::StateDir;
@@ -106,6 +107,7 @@ pub mod names {
     pub const PRECHECK_REJECTED_PATHS: &str = "agentfs.precheck.rejected_paths";
     pub const STATE_BYTES: &str = "agentfs.state.bytes";
     pub const REMOTE_MISCONFIGURED: &str = "agentfs.remote.misconfigured";
+    pub const NOT_BUILT: &str = "agentfs.not_built";
     pub const REMOTES_MODE: &str = "agentfs.remotes.mode";
     pub const PATCH_QUEUE_DEPTH: &str = "agentfs.patch.queue_depth";
     pub const PATCH_BLOCKED: &str = "agentfs.patch.blocked";
@@ -623,6 +625,33 @@ impl Telemetry {
                 .racy_rechecks
                 .add(1, &[KeyValue::new("outcome", outcome)]);
         }
+    }
+
+    /// Registers `agentfs.not_built` (unit `{setting}`): one point per
+    /// capability with configured settings not built, their count, attribute
+    /// `capability` = [`Capability::as_str`]. Call once per process; a noop
+    /// telemetry registers nothing.
+    pub fn observe_not_built(&self, not_built: &[NotBuilt]) {
+        let Some(inner) = &self.inner else {
+            return;
+        };
+        let mut counts = std::collections::BTreeMap::<Capability, u64>::new();
+        for setting in not_built {
+            *counts.entry(setting.capability).or_default() += 1;
+        }
+        inner
+            .meter
+            .u64_observable_gauge(names::NOT_BUILT)
+            .with_unit("{setting}")
+            .with_description(
+                "Configured operator settings whose capability this volume does not build yet",
+            )
+            .with_callback(move |observer| {
+                for (capability, count) in &counts {
+                    observer.observe(*count, &[KeyValue::new("capability", capability.as_str())]);
+                }
+            })
+            .build();
     }
 
     /// Registers `agentfs.history_service.fronts`, the number of distinct
@@ -1659,6 +1688,27 @@ mod tests {
         );
         // No span was current, so the records carry no trace context.
         assert!(logs.iter().all(|r| r.trace_context().is_none()));
+    }
+
+    /// One point per capability with settings not built, their count; none
+    /// for a capability with nothing configured.
+    #[test]
+    fn not_built_settings_are_counted_by_capability() {
+        let h = Harness::new();
+        let setting = |key: &str, capability| NotBuilt {
+            key: key.to_owned(),
+            capability,
+        };
+        h.telemetry.observe_not_built(&[
+            setting("remote.origin.url", Capability::Push),
+            setting("remote.origin.push", Capability::Push),
+            setting("agentfs.patchremote", Capability::Patches),
+        ]);
+        let gauge = |capability| h.gauge_u64(names::NOT_BUILT, &[("capability", capability)]);
+        assert_eq!(gauge("push"), Some(2));
+        assert_eq!(gauge("patches"), Some(1));
+        assert_eq!(gauge("lfs"), None);
+        assert_eq!(gauge("other"), None);
     }
 
     #[test]

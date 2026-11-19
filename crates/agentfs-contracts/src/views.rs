@@ -19,6 +19,14 @@ pub struct MountOptions {
     /// `user_allow_other` in `/etc/fuse.conf` when not root), as the recording
     /// mount. On by default; `--no-allow-other` turns it off.
     pub allow_other: bool,
+    /// Stack over a stale agentfs mount of this volume at the mount point (a
+    /// view host restarted after its predecessor died): mounted at a private
+    /// directory of the state area, bind-mounted over the stale mount so every
+    /// copy of it (propagated mounts, subPath binds) reaches this view, the
+    /// private mount detached; the stale layers below are detached when the
+    /// view ends. Needs CAP_SYS_ADMIN. With no stale mount there, the view
+    /// mounts as without it.
+    pub over_stale: bool,
 }
 
 /// A mounted view, unique per view host run.
@@ -34,13 +42,17 @@ pub enum ViewError {
     /// The binding's session is unknown to the history service.
     #[error("no such session")]
     UnknownSession,
+    /// The mount point is a stale agentfs mount (its daemon died) this open
+    /// may not stack over: `over_stale` is off, or it is another volume's.
+    #[error("the mount point is a stale agentfs mount ({found})")]
+    Stale { found: String },
 }
 
 /// The Views domain (docs/library/filesystem.md, "Tree views").
 pub trait Views {
     /// # Errors
     ///
-    /// `MountFailed`, `UnknownSession`.
+    /// `MountFailed`, `UnknownSession`, `Stale`.
     fn open(
         &mut self,
         at: MountPoint,

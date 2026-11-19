@@ -12,7 +12,9 @@ use crate::name::{ClientLabel, ForkKey, LauncherId, VolumeName};
 use crate::pod::PodContext;
 use crate::tree::{ForkId, TreeId};
 use crate::trees::{ForkFacts, ForkSettings, TreesEvent};
-use crate::volume::{EnsureOutcome, IoKind, VolumeError, VolumeEvent, VolumeIdentity, VolumeState};
+use crate::volume::{
+    EnsureOutcome, IoKind, Owner, VolumeError, VolumeEvent, VolumeIdentity, VolumeState,
+};
 
 /// A store write or read that failed. A failed write changed nothing.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -56,7 +58,9 @@ pub trait StateArea {
     /// identity file (a new id), the repository and its Root commit (carrying
     /// `at`), the journal, then `format`, all under the `initializing` marker,
     /// and answers `Created`; a volume there by now (another launcher raced),
-    /// writes nothing and answers its identity with `Found`.
+    /// writes nothing and answers its identity with `Found`. The Root commit
+    /// records the root directory with `root_owner` (`None`: the creating
+    /// process's effective uid and gid).
     ///
     /// # Errors
     ///
@@ -64,6 +68,7 @@ pub trait StateArea {
     fn create(
         &mut self,
         name: &VolumeName,
+        root_owner: Option<Owner>,
         at: &PodContext,
     ) -> Result<(VolumeIdentity, EnsureOutcome), VolumeError>;
 

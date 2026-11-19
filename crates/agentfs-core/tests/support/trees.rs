@@ -30,7 +30,7 @@ pub fn identity() -> VolumeIdentity {
 
 /// A new volume [`identity`], served with an empty pod context.
 pub fn new_actor(dir: &Path) -> TreeActor {
-    TreeActor::create(dir, &identity(), &PodContext::default()).expect("creates")
+    TreeActor::create(dir, &identity(), None, &PodContext::default()).expect("creates")
 }
 
 /// A fork of the root with no row: the engine's own tests, below the store

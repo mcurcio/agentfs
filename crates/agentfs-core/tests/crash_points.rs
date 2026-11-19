@@ -751,8 +751,13 @@ fn a_kill_after_a_write_returned_keeps_it() {
     use agentfs_core::tree_actor::{Recording, TreeId};
 
     if let Some(dir) = std::env::var_os("TREE_CRASH_CHILD") {
-        let rec =
-            Recording::create(Path::new(&dir), &trees::identity(), &PodContext::default()).unwrap();
+        let rec = Recording::create(
+            Path::new(&dir),
+            &trees::identity(),
+            None,
+            &PodContext::default(),
+        )
+        .unwrap();
         let mut v = rec.actor().unwrap();
         let h = v
             .write_open(TreeId::Root, "a", &trees::writer("w"), Some(trees::ATTRS))

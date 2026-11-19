@@ -139,7 +139,7 @@ where
             }),
             EnsureStep::Refuse(refused) => Err(refused),
             EnsureStep::Create => {
-                let (identity, outcome) = self.area.create(&spec.name, at)?;
+                let (identity, outcome) = self.area.create(&spec.name, spec.root_owner, at)?;
                 // Another launcher may have created it since `inspect`: judge
                 // what it made by the same rule.
                 match outcome {
@@ -208,7 +208,9 @@ mod tests {
     use agentfs_contracts::clients::{ClientId, ClientSet, Ordinal};
     use agentfs_contracts::name::{ClientLabel, LauncherId, VolumeName};
     use agentfs_contracts::tree::TreeId;
-    use agentfs_contracts::volume::{SpecField, StartPoint, VolumeEvent, VolumeId, VolumeIdentity};
+    use agentfs_contracts::volume::{
+        Owner, SpecField, StartPoint, VolumeEvent, VolumeId, VolumeIdentity,
+    };
 
     use super::*;
 
@@ -219,6 +221,8 @@ mod tests {
         held: Option<VolumeIdentity>,
         other: bool,
         creates: u32,
+        /// Each create's root owner.
+        root_owners: Vec<Option<Owner>>,
         opened: bool,
         row: Option<VolumeState>,
         steps: Vec<(VolumeState, VolumeEvent)>,
@@ -241,12 +245,14 @@ mod tests {
         fn create(
             &mut self,
             name: &VolumeName,
+            root_owner: Option<Owner>,
             _: &PodContext,
         ) -> Result<(VolumeIdentity, EnsureOutcome), VolumeError> {
             if let Some(identity) = &self.held {
                 return Ok((identity.clone(), EnsureOutcome::Found));
             }
             self.creates += 1;
+            self.root_owners.push(root_owner);
             let identity = VolumeIdentity {
                 name: name.clone(),
                 id: VolumeId(uuid::Uuid::from_u128(u128::from(self.creates))),
@@ -327,6 +333,7 @@ mod tests {
         VolumeSpec {
             name: VolumeName::parse(name).unwrap(),
             start: StartPoint::Empty,
+            root_owner: None,
         }
     }
 
@@ -560,6 +567,25 @@ mod tests {
             assert_eq!(again.id, first.id);
             assert_eq!(again.outcome, EnsureOutcome::Found);
         }
+        assert_eq!(volume.area.creates, 1);
+    }
+
+    /// The root owner reaches the create; a found volume is never compared
+    /// on it and nothing is written.
+    #[test]
+    fn the_root_owner_is_used_only_at_create() {
+        let mut volume = service(Area::default());
+        let root = cap(LaunchScope::Root);
+        let at = PodContext::default();
+        let owned = |uid, gid| VolumeSpec {
+            root_owner: Some(Owner { uid, gid }),
+            ..spec("t")
+        };
+        let first = volume.ensure(owned(10, 20), &at, &root).unwrap();
+        assert_eq!(first.outcome, EnsureOutcome::Created);
+        assert_eq!(volume.area.root_owners, [Some(Owner { uid: 10, gid: 20 })]);
+        let again = volume.ensure(owned(30, 40), &at, &root).unwrap();
+        assert_eq!((again.id, again.outcome), (first.id, EnsureOutcome::Found));
         assert_eq!(volume.area.creates, 1);
     }
 
