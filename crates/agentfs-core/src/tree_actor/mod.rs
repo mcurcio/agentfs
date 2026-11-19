@@ -1196,8 +1196,8 @@ impl TreeActor {
 
     /// One step: `fork`'s branch and every entry of its queue deleted, with
     /// the rows `rows` builds (given the step's number). The fork leaves the
-    /// saved trees, upstreams, pages, heads and touched keys at once; the
-    /// builder deletes its refs and, at its copy, its checkout. Its row chains
+    /// saved trees, upstreams, pages, heads, touched keys and untracked area
+    /// at once; the builder deletes its refs and, at its copy, its checkout. Its row chains
     /// and collision refs stay. Its writer is `agentfs` with the service's pod
     /// context. The store adapter's alone (clippy.toml).
     ///
@@ -1254,6 +1254,12 @@ impl TreeActor {
             self.waiting_since.remove(name);
         }
         self.metrics.queued = self.metrics.queued.saturating_sub(queue.len() as u64);
+        // Its untracked area goes with it, built or not (docs/trees.md,
+        // "Forks"); one a crash or a failure here leaves is removed at the
+        // next open.
+        if let Err(e) = self.areas.remove(fork) {
+            eprintln!("tree AreaRemoveFailed: {fork}: {e}");
+        }
         self.after_step();
         Ok(())
     }

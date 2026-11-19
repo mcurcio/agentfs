@@ -8,7 +8,7 @@
 //!   files at one instant ([`copy_area`]). The copy is published before the
 //!   fork's record; an area no tree owns, and every copy a crash cut short,
 //!   is removed when the volume opens ([`sweep`]).
-//! - A dropped fork's area is removed with its checkout.
+//! - A dropped fork's area is removed when its drop is recorded.
 
 // `stat` field types differ between architectures, so conversions written
 // to be portable are identities on some targets.
@@ -319,7 +319,7 @@ impl Areas {
     /// `tree`'s area, made (mode 0700) if it has none.
     pub(in crate::tree_actor) fn open(&self, tree: TreeId) -> io::Result<UntrackedArea> {
         let path = self.path(tree);
-        fs_create_dir(&path)?;
+        create_dir_durably(&path)?;
         Ok(UntrackedArea {
             dir: confined::Dir::open(&path)?,
             tree,
@@ -350,17 +350,30 @@ impl Areas {
         let temporary = staging.join(format!("copy-{}", to.to_string().replace('/', "-")));
         remove_all(&temporary)?;
         let target = self.path(to);
-        let copied = copy_tree(&source, &temporary).and_then(|()| {
-            let parent = target.parent().unwrap_or(&self.root);
-            fs_create_dir(parent)?;
-            std::fs::rename(&temporary, &target)?;
-            sync_dir(parent)?;
-            sync_dir(&staging)
-        });
-        if copied.is_err() {
+        if let Err(e) = copy_tree(&source, &temporary) {
             let _ = remove_all(&temporary);
+            return Err(e);
         }
-        copied
+        let published = self.publish(&temporary, &target);
+        if published.is_err() {
+            // Past the rename the copy is under the fork's name: removed, so
+            // a fork made again in this process finds no copy in its way.
+            let _ = remove_all(&temporary);
+            let _ = remove_all(&target);
+        }
+        published
+    }
+
+    /// Renames the finished copy `temporary` to `target`, durably: every
+    /// directory made on the way to `target`, and the rename itself, are
+    /// fsynced in their parents.
+    fn publish(&self, temporary: &Path, target: &Path) -> io::Result<()> {
+        let parent = target.parent().unwrap_or(&self.root);
+        create_dir_durably(parent)?;
+        std::fs::rename(temporary, target)?;
+        sync_dir(parent)?;
+        sync_dir(&self.root.join(STAGING))?;
+        crate::failpoints::hit("tree.fork_after_copy")
     }
 
     /// Removes `tree`'s area, if it has one.
@@ -409,15 +422,40 @@ fn sync_dir(dir: &Path) -> io::Result<()> {
     std::fs::File::open(dir)?.sync_all()
 }
 
+/// Makes `dir` and its missing parents (each mode 0700), and fsyncs the
+/// parent of each one made, so their names survive a power cut.
+fn create_dir_durably(dir: &Path) -> io::Result<()> {
+    let mut missing = Vec::new();
+    let mut at = dir;
+    while !at.exists() {
+        missing.push(at);
+        match at.parent() {
+            Some(parent) => at = parent,
+            None => break,
+        }
+    }
+    fs_create_dir(dir)?;
+    for made in missing.iter().rev() {
+        if let Some(parent) = made.parent() {
+            sync_dir(parent)?;
+        }
+    }
+    Ok(())
+}
+
 /// Copies the tree under `source` to the new directory `target`: each
 /// directory, file and link with its mode, owner (when this process may give
 /// files away) and times; each file reflinked where the filesystem can,
-/// else copied; every file and directory fsynced. FIFOs, sockets and devices
-/// are left out.
+/// else copied; every file and directory fsynced. A file with several names
+/// is copied once and its other names linked to the copy. FIFOs, sockets,
+/// devices and names that are not UTF-8 are left out.
 fn copy_tree(source: &confined::Dir, target: &Path) -> io::Result<()> {
     let chown = confined::can_chown();
     std::fs::DirBuilder::new().mode(0o700).create(target)?;
     let target = confined::Dir::open(target)?;
+    let top = target.open_at("", OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty())?;
+    // Each multiply-linked file's first copy, by the source's device and inode.
+    let mut linked: BTreeMap<(u64, u64), String> = BTreeMap::new();
     let mut stack = vec![String::new()];
     let mut dirs = Vec::new();
     while let Some(dir) = stack.pop() {
@@ -429,14 +467,16 @@ fn copy_tree(source: &confined::Dir, target: &Path) -> io::Result<()> {
             if matches!(name.to_bytes(), b"." | b"..") {
                 continue;
             }
+            // A view makes no such name; one written into the state area
+            // directly is no file of the tree's, as `entries` leaves it out.
+            let Ok(utf8) = std::str::from_utf8(name.to_bytes()) else {
+                continue;
+            };
             let st = rustix::fs::statat(&from, name, AtFlags::SYMLINK_NOFOLLOW)?;
-            let rel = {
-                let name = String::from_utf8_lossy(name.to_bytes());
-                if dir.is_empty() {
-                    name.into_owned()
-                } else {
-                    format!("{dir}/{name}")
-                }
+            let rel = if dir.is_empty() {
+                utf8.to_owned()
+            } else {
+                format!("{dir}/{utf8}")
             };
             match FileType::from_raw_mode(st.st_mode) {
                 FileType::Directory => {
@@ -444,7 +484,18 @@ fn copy_tree(source: &confined::Dir, target: &Path) -> io::Result<()> {
                     stack.push(rel.clone());
                     dirs.push((rel, st));
                 }
+                FileType::RegularFile
+                    if st.st_nlink > 1
+                        && linked.contains_key(&(st.st_dev as u64, st.st_ino as u64)) =>
+                {
+                    // Another name of a file already copied: linked to its copy.
+                    let first = &linked[&(st.st_dev as u64, st.st_ino as u64)];
+                    rustix::fs::linkat(&top, first.as_str(), &to, name, AtFlags::empty())?;
+                }
                 FileType::RegularFile => {
+                    if st.st_nlink > 1 {
+                        linked.insert((st.st_dev as u64, st.st_ino as u64), rel.clone());
+                    }
                     let src = rustix::fs::openat(
                         &from,
                         name,
@@ -467,6 +518,7 @@ fn copy_tree(source: &confined::Dir, target: &Path) -> io::Result<()> {
                     }
                     set_meta(&dst, &st, chown)?;
                     rustix::fs::fsync(&dst)?;
+                    crate::failpoints::hit("tree.fork_copy_file")?;
                 }
                 FileType::Symlink => {
                     let link = rustix::fs::readlinkat(&from, name, Vec::new())?;
@@ -493,7 +545,6 @@ fn copy_tree(source: &confined::Dir, target: &Path) -> io::Result<()> {
         set_meta(&fd, st, chown)?;
         rustix::fs::fsync(&fd)?;
     }
-    let top = target.open_at("", OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty())?;
     rustix::fs::fsync(&top)?;
     Ok(())
 }

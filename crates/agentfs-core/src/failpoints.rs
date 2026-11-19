@@ -46,6 +46,8 @@ pub const POINTS: &[&str] = &[
     "tree.before_step",
     "tree.replace_before_step",
     "tree.untrack_after_place",
+    "tree.fork_copy_file",
+    "tree.fork_after_copy",
     "tree.compact_before_checkpoint",
     "tree.compact_before_fsync",
     "tree.compact_before_drop",

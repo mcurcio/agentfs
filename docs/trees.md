@@ -15,8 +15,9 @@ what they do today, and where they stop.
 ## Terms
 
 - A **tree** is a branch of one bare git repository.
-- A **fork** is a tree made from another tree, its **upstream**. A fork of a fork
-  has that fork as its upstream. A tree with no upstream is the root.
+- A **fork** is a tree made from another tree, its **upstream**. A tree with no
+  upstream is the root. Tree views make forks of the root only: a fork of a fork
+  is refused.
 - A tree's **identity** is `root` or `fork/<n>`, where `n` is the journal event that
   made the fork; it is never reused. The tree's branch (`refs/heads/root`,
   `refs/heads/fork/<n>`), its queue, its checkout and the `Agentfs-Tree` trailer of
@@ -751,10 +752,13 @@ taken when the fork is made:
   `<state>/untracked/.staging/`, made durable, and renamed into place before the
   fork's step is recorded. A crash before the step leaves a copy no fork owns,
   which the next open removes.
-- Each file is reflinked where the filesystem can (`FICLONE`), else copied.
-  FIFOs and sockets are not copied.
+- Each file is reflinked where the filesystem can (`FICLONE`), else copied. A
+  file with several names is copied once, and its other names are links to the
+  copy. FIFOs, sockets, and names that are not UTF-8 (which no view makes) are
+  not copied.
 - Later writes on either side stay on that side.
-- A dropped fork's area is removed with its checkout.
+- A dropped fork's area is removed when its drop is recorded, whether or not
+  anything built the fork.
 
 The costs: every secret in the upstream's area (an `.env`, a token) is copied
 into every fork; each copy takes space where reflinks are not available; and the

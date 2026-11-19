@@ -42,7 +42,6 @@ use crate::tree_actor::stages::{Timer, Which};
 use crate::tree_actor::tree::{
     EventNumber, FileBytes, Lines, MergeFileIdentity, NameHistory, Tree, Versions,
 };
-use crate::tree_actor::untracked;
 use crate::tree_actor::{Error, Result, TreeId};
 use crate::tree_git::{RefUpdate, TreeGit};
 use crate::tree_reconcile::{Window, histogram_files};
@@ -1407,9 +1406,6 @@ impl Builder {
         for tree in dropped {
             self.checked_out.remove(&tree);
             remove_checkout(&self.root, tree)?;
-            // Then its untracked area (docs/trees.md, "Rules and the
-            // untracked area"); one a crash left is removed at the next open.
-            untracked::remove_all(&self.root.join(untracked::UNTRACKED).join(tree.to_string()))?;
         }
         if self.stale {
             remove_stale_checkouts(&self.root, &branches)?;

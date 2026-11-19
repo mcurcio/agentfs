@@ -356,7 +356,7 @@ fn a_fork_starts_with_a_copy_of_its_upstreams_area_and_loses_it_when_dropped() {
     assert!(!forked.join("new").exists());
     assert!(!base.join("mine").exists());
 
-    // Dropped: the builder removes its area with its checkout.
+    // Dropped: its area goes with the drop.
     v.settle().unwrap();
     #[allow(
         clippy::disallowed_methods,
@@ -497,4 +497,191 @@ fn every_copy_is_the_area_at_one_instant() {
         let (a, b) = (read("a"), read("b"));
         assert!(a == b || a == b + 1, "{fork}: a {a}, b {b}");
     }
+}
+
+/// A file with two names in the upstream's area has two names in the
+/// fork's copy, one file; a name that is not UTF-8, which no view makes,
+/// is left out and does not stop the copy.
+#[test]
+fn a_copy_keeps_hard_links_and_leaves_out_names_not_utf8() {
+    use std::os::unix::ffi::OsStrExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut v = new_actor(tmp.path());
+    let root = v.untracked_area(TreeId::Root).unwrap();
+    let base = root.dir().path().to_path_buf();
+    fs::create_dir(base.join("d")).unwrap();
+    fs::write(base.join("d/a"), b"one file").unwrap();
+    fs::hard_link(base.join("d/a"), base.join("b")).unwrap();
+    let odd = base.join(std::ffi::OsStr::from_bytes(b"x\xff"));
+    fs::create_dir(&odd).unwrap();
+    fs::write(odd.join("in"), b"never a tree's").unwrap();
+    let fork = rowless_fork(&mut v);
+    let forked = v.untracked_area(fork).unwrap().dir().path().to_path_buf();
+    let (a, b) = (
+        fs::metadata(forked.join("d/a")).unwrap(),
+        fs::metadata(forked.join("b")).unwrap(),
+    );
+    assert_eq!((a.dev(), a.ino(), a.nlink()), (b.dev(), b.ino(), 2));
+    assert_eq!(fs::read(forked.join("b")).unwrap(), b"one file");
+    let mut names: Vec<_> = fs::read_dir(&forked)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    names.sort();
+    assert_eq!(names, ["b", "d"]);
+    // The copy is its own: a write to the upstream's file is not the fork's.
+    fs::write(base.join("b"), b"later").unwrap();
+    assert_eq!(fs::read(forked.join("d/a")).unwrap(), b"one file");
+}
+
+/// The upstream's area for the copy-failure tests: three files.
+#[cfg(feature = "failpoints")]
+fn three_files(v: &mut TreeActor) {
+    let base = v
+        .untracked_area(TreeId::Root)
+        .unwrap()
+        .dir()
+        .path()
+        .to_path_buf();
+    for name in ["a", "b", "c"] {
+        fs::write(base.join(name), name).unwrap();
+    }
+}
+
+/// The fork areas published under `<state>/untracked/fork/`, and what each holds.
+#[cfg(feature = "failpoints")]
+fn fork_areas(dir: &Path) -> BTreeMap<String, Vec<String>> {
+    let forks = dir.join("untracked/fork");
+    let Ok(entries) = fs::read_dir(&forks) else {
+        return BTreeMap::new();
+    };
+    entries
+        .map(|e| {
+            let e = e.unwrap();
+            let mut names: Vec<String> = fs::read_dir(e.path())
+                .unwrap()
+                .map(|f| f.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            names.sort();
+            (e.file_name().to_string_lossy().into_owned(), names)
+        })
+        .collect()
+}
+
+/// A copy that fails part way, or after its publish and before the fork's
+/// record, leaves no fork and no area, in this process too: the next fork
+/// takes the same number and gets the whole copy.
+#[cfg(feature = "failpoints")]
+#[test]
+fn a_failed_copy_leaves_no_fork_and_no_area() {
+    for spec in ["tree.fork_copy_file=error@2", "tree.fork_after_copy=error"] {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut v = new_actor(tmp.path());
+        three_files(&mut v);
+        {
+            let _guard = agentfs_core::failpoints::configure(spec).unwrap();
+            #[allow(
+                clippy::disallowed_methods,
+                reason = "a tree actor test forks below the store"
+            )]
+            let failed = v.fork_with(TreeId::Root, |_, _| Ok(Vec::new()));
+            assert!(failed.is_err(), "{spec}");
+        }
+        assert_eq!(v.trees(), [TreeId::Root], "{spec}");
+        assert!(fork_areas(tmp.path()).is_empty(), "{spec}");
+        let fork = rowless_fork(&mut v);
+        assert_eq!(
+            fork_areas(tmp.path()),
+            BTreeMap::from([(
+                fork.to_string()[5..].to_owned(),
+                vec!["a".into(), "b".into(), "c".into()]
+            )]),
+            "{spec}"
+        );
+    }
+}
+
+/// Killed mid-copy or after its publish, before the fork's record: no fork
+/// after the restart, and no area. Killed as the fork's step is written,
+/// the area was already published whole: the copy comes before the record.
+#[cfg(feature = "failpoints")]
+#[test]
+fn a_fork_killed_at_any_point_of_its_copy_has_its_whole_area_or_none() {
+    use std::os::unix::process::ExitStatusExt;
+    for spec in [
+        "tree.fork_copy_file=kill@2",
+        "tree.fork_after_copy=kill@1",
+        "tree.before_step=kill@1",
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("state");
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "copy_worker", "--nocapture"])
+            .env("AGENTFS_TREE_COPY_WORKER", &dir)
+            .env(agentfs_core::failpoints::ENV_VAR, spec)
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.signal(),
+            Some(libc::SIGKILL),
+            "{spec} did not kill the worker: {output:?}"
+        );
+        trees::wait_for_lease(&dir);
+        let published = fork_areas(&dir);
+        if spec.starts_with("tree.fork_copy_file") {
+            assert!(published.is_empty(), "{spec}: published {published:?}");
+        } else {
+            let whole = vec!["a".to_owned(), "b".to_owned(), "c".to_owned()];
+            assert_eq!(
+                published,
+                BTreeMap::from([("1".to_owned(), whole)]),
+                "{spec}: the copy is published whole before the step"
+            );
+        }
+        let mut v = reopen(&dir);
+        assert_eq!(v.trees(), [TreeId::Root], "{spec}");
+        assert!(fork_areas(&dir).is_empty(), "{spec}: swept at open");
+        assert!(!dir.join("untracked/.staging").exists(), "{spec}");
+        let fork = rowless_fork(&mut v);
+        let area = v.untracked_area(fork).unwrap();
+        assert_eq!(area.entries("").unwrap().len(), 3, "{spec}");
+    }
+}
+
+/// The worker [`a_fork_killed_at_any_point_of_its_copy_has_its_whole_area_or_none`]
+/// runs: an upstream area of three files, then a fork the failpoint kills.
+#[cfg(feature = "failpoints")]
+#[test]
+fn copy_worker() {
+    let Some(dir) = std::env::var_os("AGENTFS_TREE_COPY_WORKER") else {
+        return;
+    };
+    let mut v = new_actor(Path::new(&dir));
+    three_files(&mut v);
+    rowless_fork(&mut v);
+    unreachable!("the failpoint kills this process");
+}
+
+/// A fork dropped before anything built it loses its area with the drop,
+/// copied secrets included, not at the next open.
+#[test]
+fn a_fork_dropped_before_any_build_loses_its_area_at_the_drop() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut v = new_actor(tmp.path());
+    let base = v
+        .untracked_area(TreeId::Root)
+        .unwrap()
+        .dir()
+        .path()
+        .to_path_buf();
+    fs::write(base.join(".env"), b"TOKEN=x").unwrap();
+    let fork = rowless_fork(&mut v);
+    let forked = tmp.path().join(format!("untracked/{fork}"));
+    assert!(forked.join(".env").exists());
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the engine's drop, below the store"
+    )]
+    v.drop_fork(fork, |_| Ok(Vec::new())).unwrap();
+    assert!(!forked.exists(), "removed as the drop returns");
 }

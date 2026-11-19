@@ -842,9 +842,9 @@ len, meta)` puts a file or link in place atomically (written under
 `<state>/untracked/.staging/`, fsynced, renamed). `writing()` holds the area
 against a fork's copy for one change; a caller holding it never takes the
 actor's lock. `fork_with` copies the upstream's area as the fork's before the
-fork's step, holding the upstream's changes while it copies; the builder
-removes a dropped fork's area with its checkout, and an open removes every
-copy no fork owns.
+fork's step, holding the upstream's changes while it copies; `drop_fork`
+removes a dropped fork's area once its drop is recorded, and an open removes
+every copy no fork owns.
 
 ### Sessions
 
