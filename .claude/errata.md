@@ -1499,3 +1499,50 @@ M2 residuals (each to become a bead):
    `EXDEV` (`mv` then copies), and `EISDIR` onto a tracked directory, as rename(2) does.
 5. **`docs/target-architecture/future/module-cut.md` still says step 7 runs "beside its M8"** (not an owned path); after
    the 2026-11-19 order it runs after the baseline, which now follows M8.
+
+## 2026-11-19, M3 fix round: what was applied, and M3 residuals
+
+Applied (this entry closes them): M3 S1 item 2 (a rules refusal is `VolumeError::RulesRefused`, naming its line; the
+`tree RulesRefused` stderr line is gone), S1 item 4 and S2's failpoint reason (`tree.fork_copy_file` and
+`tree.fork_after_copy`, with kill and error tests in `tree_rules.rs`), S1 item 8 (`drop_fork` removes the area when
+the drop is recorded), S3 item 5 (`module-cut.md` says step 7 follows the baseline, which follows M8).
+
+Where the findings were wrong:
+
+1. **"Unreachable in practice" was wrong for the inode ranges.** A directory a take adds has bit 63 set in its
+   number (`tree::taken_dir_number`), so its inode fell in the untracked range (`1 << 63 | n`) and the view would have
+   served it from the area. Untracked inodes are now `[1 << 62, 1 << 63)` and `tracked_inode` answers `EOVERFLOW` for
+   a number that would meet them.
+2. **"Name calls never under the actor's lock" was the docs' error, not the code's.** The lock makes a name's half
+   one decision against the tracked half (an `O_EXCL` create, a rename across the halves, a merged listing). The
+   docs now say which calls take it; the code is unchanged.
+
+M3 residuals (each to become a bead; none blocks M7):
+
+1. **The owner's test "a SQLite database copied while being written opens and passes integrity_check" is not built.**
+   No launcher makes a fork while its upstream's view serves (`trees mount` forks before mounting), so a copy under
+   live writes has no real flow. Files: M8's fork claim path in `crates/agentfs-csi`, a test-only way to make a fork
+   on a live view host, `ci/trees-untracked.py`. Done when a fork made while a WAL-mode writer commits through the
+   root view copies a database that passes `integrity_check` with at least the rows committed before the fork.
+   docs/trees.md "How it is verified" lists it as untested.
+2. **A fork's copy holds the actor's lock for the whole copy** (`fork_with` runs `copy_area` under `&mut self`): every
+   call on the volume, tracked recording included, waits while an area is copied, one fsync per file where reflinks
+   are not available. The owner asked to hold the upstream's untracked writes, not the volume. Owner question for
+   M8 (general guidance): take the copy outside the actor's lock, holding only the upstream's area, then record the
+   step; or accept the stall as a cost of fork claims on a live volume. Files: `tree_actor/mod.rs` (`fork_with`),
+   `tree_actor/untracked.rs`. Done when the answer is recorded and built, with a test that a tracked write
+   completes during a long copy (or the cost in docs/trees.md if accepted).
+3. **Readdir cookies of the untracked half are indexes into a listing re-read per batch** (`tree_view.rs`,
+   `listing`): an entry made or removed between batches skips or repeats others. Same class as M2 residual B-F12;
+   fix both halves with one stable cookie (by name or hash) under that bead, covering the area half in its test.
+   The area listing is also re-read for every batch under the actor's lock (`ls -f` of 20,000 untracked entries
+   took 1.6 s against 0.012 s directly); page it in the same change.
+4. **A fork of a fork copies its own upstream's area (owner requirement 4) has no test**: forks of forks are not
+   built (`fork_with` refuses them; docs/trees.md says so). Done when forks of forks are built, with that test.
+5. **Readers still reach raw descriptors.** Every change to an area goes through `AreaWrite`, and the view's untracked
+   writes take it by signature, but an untracked file's open descriptor is a plain `OwnedFd`: a future write path
+   that skips `untracked::write` compiles. Done when the view's untracked opens are a core type whose write,
+   truncate and allocate methods take the hold (`tree_view.rs` `AreaOpen`, `tree_actor/untracked.rs`).
+6. **Untracked entry numbers are not bounded at allocation** (`tree_view/untracked.rs`, `Inodes::next`): past
+   `1 << 62` lookups an entry's inode would leave its range. Unreachable (4.6e18 lookups); the bound would make it
+   impossible by construction.

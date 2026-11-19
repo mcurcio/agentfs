@@ -1,4 +1,4 @@
-# Handoff: PR #39, tree views speed and M1 built (2026-11-14)
+# Handoff: PR #39, tree views speed, M1, M2 and M3 built (2026-11-19)
 
 Start here. This folder is working state for the next session, not product docs. **Delete `.claude/handoff/` in the commit that finishes this work, before #39 goes to the owner for review.**
 
@@ -33,12 +33,19 @@ The code and the library/human docs win over all of these where they disagree; r
   under sudo, directory records keyed by blob id, fsync covering metadata steps, the unruled sync failing loudly,
   phase-1 floors 94/79. Open owner questions and five residuals: `.claude/errata.md`, "M2 fix round".
 
+- M3 (operator rules, the untracked area, a fork's copy of its upstream's area: the owner's 2026-11-19 "fork a
+  copy") built (S1..S3, 752fcef) and its one fix round landed (9eaad3d..): the image build (agentfs-rules stubbed in
+  the Dockerfile, a test guards every member), CI's untracked owners by the host's capabilities, fork-copy
+  failpoints and kill tests, `AreaWrite` as the only way to change an area, inode ranges apart, `RulesRefused`,
+  `tree Unadopted`. Six "M3 residuals" in `.claude/errata.md`, "M3 fix round"; item 2 is an owner question for M8.
+
 ## Next, in order
-0. Put the two M2 owner questions (errata "M2 fix round" items 1 and 2) to the owner; cut beads for the M2
-   residuals; then M3.
-1. Confirm CI (ci, image, phase-1) green on the fix round's SHA; cut beads for the four "M1 residuals".
+0. Cut beads for the M3 residuals (errata "M3 fix round"); put residual 2 (the fork copy holds the actor's lock) to
+   the owner before M8. The M2 owner questions and residuals (errata "M2 fix round") are still open.
+1. Then `docs/target-architecture/future/one-engine.md`'s order (owner, 2026-11-19): M7 -> M8 -> the baseline (the
+   first Hermes deploy, on a CSI volume claim) -> M4, M5, M6. M7 and M8 do not wait for M4..M6 and say what is not
+   built with an alarm and a log line.
 2. One full phase-1 dispatch on the final SHA (`gh workflow run phase-1.yml`), read its result.
-3. Then the plan in `docs/target-architecture/future/one-engine.md`: M2 -> M3 -> M4 -> M5 -> M7 (with M6) -> baseline.
 4. `docs/target-architecture/future/save-and-take-speed.md` still reads "Proposed, not built" with pre-speed figures;
    decide whether the speed epic built it (then delete it and repoint its links) or trim it to what remains.
 
