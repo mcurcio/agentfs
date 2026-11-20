@@ -24,7 +24,7 @@ use git2::Oid;
 
 use super::pointers::Pointers;
 use super::stages::{Timer, Which};
-use super::tree::{EventNumber, FileBytes, Shape, Tree};
+use super::tree::{FileBytes, Shape, Tree};
 use super::{Error, Result, TreeId, referee};
 use crate::file_lock::FileLock;
 use crate::tree_git::TreeGit;
@@ -149,10 +149,7 @@ pub(in crate::tree_actor) fn read_trees(
 
 /// The commit of every direct save the pointers reach, by its event number:
 /// one Git child.
-pub(in crate::tree_actor) fn owners(
-    repo: &TreeGit,
-    pointers: &Pointers,
-) -> Result<BTreeMap<EventNumber, Oid>> {
+pub(in crate::tree_actor) fn owners(repo: &TreeGit, pointers: &Pointers) -> Result<built::Owners> {
     let _timer = Timer::start(Which::EventOwners);
     Ok(repo
         .commit_messages(&refs::owner_tips(pointers))?

@@ -22,12 +22,7 @@ use crate::tree_git::TreeGit;
 
 /// Each direct save's commit by its event, as built: the snapshot the
 /// builder hands History at each built event. Persistent, so the handover is
-/// O(1) and a batch adds only its own saves (agentfs-ln6.3 replaces the
-/// per-batch copy, `BTreeMap<EventNumber, Oid>`, with it).
-#[expect(
-    dead_code,
-    reason = "frozen interface: agentfs-ln6.3 hands owners over as this"
-)]
+/// O(1) and a batch adds only its own saves.
 pub(in crate::tree_actor) type Owners = imbl::OrdMap<EventNumber, Oid>;
 
 /// Why the builder could not build a batch. Recording goes on; the batch is
@@ -141,7 +136,7 @@ struct State {
     /// Every pointer as built.
     pointers: Arc<Pointers>,
     /// Each direct save's commit, by its step: what a sync asks of a save.
-    owners: Arc<BTreeMap<EventNumber, Oid>>,
+    owners: Owners,
     /// Each tree's object numbers as built.
     objects: Arc<BuiltObjects>,
     failed: Option<BuildError>,
@@ -182,7 +177,7 @@ pub struct BuiltSnapshot {
     inner: Arc<Inner>,
     at: RecordNo,
     pointers: Arc<Pointers>,
-    owners: Arc<BTreeMap<EventNumber, Oid>>,
+    owners: Owners,
     objects: Arc<BuiltObjects>,
 }
 
@@ -217,7 +212,8 @@ impl BuiltSnapshot {
         &self.pointers
     }
 
-    pub(in crate::tree_actor) fn owners(&self) -> &BTreeMap<EventNumber, Oid> {
+    /// Each direct save's commit by its event, as built at this point.
+    pub(in crate::tree_actor) fn owners(&self) -> &Owners {
         &self.owners
     }
 
@@ -254,7 +250,7 @@ impl History {
         repo: TreeGit,
         built: RecordNo,
         pointers: Pointers,
-        owners: BTreeMap<EventNumber, Oid>,
+        owners: Owners,
         objects: BuiltObjects,
     ) -> Self {
         Self {
@@ -263,7 +259,7 @@ impl History {
                 state: Mutex::new(State {
                     built,
                     pointers: Arc::new(pointers),
-                    owners: Arc::new(owners),
+                    owners,
                     objects: Arc::new(objects),
                     failed: None,
                     failed_at: 0,
@@ -385,12 +381,13 @@ impl History {
         }
     }
 
-    /// A batch is built and its built-log entry durable: the built point moves.
+    /// A batch is built and its built-log entry durable: the built point
+    /// moves. `owners` is the builder's own persistent map, shared: O(1).
     pub(in crate::tree_actor) fn built_event(
         &self,
         through: RecordNo,
         pointers: Pointers,
-        owners: BTreeMap<EventNumber, Oid>,
+        owners: Owners,
         objects: Arc<BuiltObjects>,
         elapsed: Duration,
     ) {
@@ -398,7 +395,7 @@ impl History {
         state.gate.built(through, elapsed);
         state.built = state.built.max(through);
         state.pointers = Arc::new(pointers);
-        state.owners = Arc::new(owners);
+        state.owners = owners;
         state.objects = objects;
         state.failed = None;
         while state
@@ -623,7 +620,7 @@ impl History {
             inner: Arc::clone(&self.inner),
             at: state.built,
             pointers: Arc::clone(&state.pointers),
-            owners: Arc::clone(&state.owners),
+            owners: state.owners.clone(),
             objects: Arc::clone(&state.objects),
         }
     }

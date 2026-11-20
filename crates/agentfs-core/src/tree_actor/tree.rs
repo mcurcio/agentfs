@@ -254,13 +254,14 @@ impl Deref for FileBytes {
 /// A tree's names, by path and by object: a view's lookups by name and by
 /// inode cost one map lookup, not a scan of the tree. Reads go through
 /// `Deref` to the map by path; every change goes through these methods, so
-/// the two maps cannot disagree.
+/// the two maps cannot disagree. Persistent maps: a copy shares every node
+/// and costs O(1), a change copies only its path.
 #[derive(Clone, Debug, Default)]
 pub(super) struct Names {
-    by_path: BTreeMap<String, u64>,
+    by_path: imbl::OrdMap<String, u64>,
     /// One entry per (object, path), not a set per object: a set's node costs
     /// hundreds of bytes for the one path most objects have.
-    by_object: BTreeSet<(u64, String)>,
+    by_object: imbl::OrdSet<(u64, String)>,
 }
 
 impl Names {
@@ -298,9 +299,9 @@ impl Names {
 }
 
 impl Deref for Names {
-    type Target = BTreeMap<String, u64>;
+    type Target = imbl::OrdMap<String, u64>;
 
-    fn deref(&self) -> &BTreeMap<String, u64> {
+    fn deref(&self) -> &imbl::OrdMap<String, u64> {
         &self.by_path
     }
 }
@@ -319,10 +320,11 @@ pub(super) struct DirState {
 /// A tree's directories, by path (`""` the root) and by number: a view's
 /// lookups cost one map lookup. Reads go through `Deref` to the map by path;
 /// every change goes through these methods, so the two maps cannot disagree.
+/// Persistent maps, as [`Names`].
 #[derive(Clone, Debug, Default)]
 pub(super) struct Dirs {
-    by_path: BTreeMap<String, DirState>,
-    by_number: BTreeMap<u64, String>,
+    by_path: imbl::OrdMap<String, DirState>,
+    by_number: imbl::OrdMap<u64, String>,
 }
 
 impl Dirs {
@@ -361,9 +363,9 @@ impl Dirs {
 }
 
 impl Deref for Dirs {
-    type Target = BTreeMap<String, DirState>;
+    type Target = imbl::OrdMap<String, DirState>;
 
-    fn deref(&self) -> &BTreeMap<String, DirState> {
+    fn deref(&self) -> &imbl::OrdMap<String, DirState> {
         &self.by_path
     }
 }
@@ -394,14 +396,14 @@ fn moved(path: &str, from: &str, to: &str) -> String {
 /// start with `prefix`, in order: a child directory's subtree is jumped
 /// over, never walked.
 fn direct_children<'a, V>(
-    map: &'a BTreeMap<String, V>,
+    map: &'a imbl::OrdMap<String, V>,
     prefix: &'a str,
 ) -> impl Iterator<Item = (&'a str, &'a V)> + 'a {
     let mut cursor = prefix.to_owned();
     std::iter::from_fn(move || {
         loop {
             let (key, value) = map
-                .range::<str, _>((
+                .range::<_, str>((
                     std::ops::Bound::Included(cursor.as_str()),
                     std::ops::Bound::Unbounded,
                 ))
@@ -444,16 +446,18 @@ pub(super) const fn taken_dir_number(step: EventNumber, index: u64) -> Result<u6
 /// The names-level state of one tree, which both projections of the journal
 /// keep: the actor's saved state and the builder's trees. [`Shape::apply`] is
 /// its one transition. Each file's and link's metadata and times are by
-/// object, each directory's in its [`DirState`].
+/// object, each directory's in its [`DirState`]. Every map is persistent: a
+/// shape's copy is O(1), so the builder's batch and the actor's saved state
+/// share what neither changed.
 #[derive(Clone, Debug, Default)]
 pub(super) struct Shape {
     pub(super) names: Names,
     pub(super) dirs: Dirs,
-    pub(super) anonymous: BTreeSet<u64>,
-    pub(super) identities: BTreeMap<u64, MergeFileIdentity>,
-    pub(super) fresh_names: BTreeSet<u64>,
-    pub(super) meta: BTreeMap<u64, Meta>,
-    pub(super) times: BTreeMap<u64, Times>,
+    pub(super) anonymous: imbl::OrdSet<u64>,
+    pub(super) identities: imbl::OrdMap<u64, MergeFileIdentity>,
+    pub(super) fresh_names: imbl::OrdSet<u64>,
+    pub(super) meta: imbl::OrdMap<u64, Meta>,
+    pub(super) times: imbl::OrdMap<u64, Times>,
 }
 
 impl Shape {
@@ -1163,7 +1167,8 @@ impl Deref for SavedTree {
 }
 
 impl SavedTree {
-    /// The saved state a built tree shows: its maps shared, never copied.
+    /// The saved state a built tree shows: its shape shared (O(1)), its maps
+    /// shared, never copied.
     pub(super) fn of(tree: &Tree) -> Self {
         Self {
             shape: tree.shape.clone(),
@@ -1187,14 +1192,15 @@ impl SavedTree {
 }
 
 /// The builder's state of one tree: its shape, bytes, line maps and name
-/// histories. A step builds on a copy and installs it after its commit is
-/// built, so file bytes and line maps sit behind `Arc`.
+/// histories. A batch builds on a copy and keeps it once its commits are
+/// built: every map is persistent, so the copy is O(1), and file bytes and
+/// line maps sit behind `Arc`.
 #[derive(Clone, Default)]
 pub(super) struct Tree {
     pub(super) shape: Shape,
-    pub(super) bytes: BTreeMap<u64, Arc<FileBytes>>,
-    pub(super) lines: BTreeMap<u64, Arc<Lines>>,
-    pub(super) namespace: BTreeMap<MergeFileIdentity, NameHistory>,
+    pub(super) bytes: imbl::OrdMap<u64, Arc<FileBytes>>,
+    pub(super) lines: imbl::OrdMap<u64, Arc<Lines>>,
+    pub(super) namespace: imbl::OrdMap<MergeFileIdentity, NameHistory>,
 }
 
 impl Deref for Tree {
@@ -1250,7 +1256,7 @@ impl Tree {
             self.shape.meta.insert(file.object, file.meta);
             self.shape.times.entry(file.object).or_default();
         }
-        self.namespace = snapshot.names;
+        self.namespace = snapshot.names.into_iter().collect();
         self.shape.check_d1()
     }
 
@@ -1273,7 +1279,11 @@ impl Tree {
             .collect();
         referee::Snapshot {
             files,
-            names: self.namespace.clone(),
+            names: self
+                .namespace
+                .iter()
+                .map(|(id, history)| (*id, history.clone()))
+                .collect(),
             dirs: self
                 .dirs
                 .iter()

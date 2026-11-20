@@ -1585,7 +1585,7 @@ impl TreeActor {
     /// what the actor does at once, without waiting for its next step. Bounded:
     /// O(1) plus the batch's maps. Lock order: the actor, then History.
     pub(in crate::tree_actor) fn on_built(&mut self) {
-        // agentfs-ln6.3: the built-event wake (take the builder's maps here).
+        self.rebase_built();
     }
 
     /// After a step is applied: a compaction when one is due.
@@ -2131,5 +2131,36 @@ mod tests {
         let v = reopen(tmp.path());
         assert_eq!(v.read(ROOT, "log").unwrap(), b"line\nline\nline\n");
         assert_eq!(v.read(ROOT, "big").unwrap().len(), 66 << 20);
+    }
+
+    /// The built event wakes the actor: once a close's save is built, one
+    /// `progress` (what a view's worker runs at each built event) takes the
+    /// builder's map read from the checkout, with no further step, and the
+    /// saved map lets go of its journal frames.
+    #[test]
+    fn a_built_event_lets_the_saved_map_go_of_its_frames_without_a_step() {
+        let tmp = tempfile::tempdir().unwrap();
+        let identity = VolumeIdentity {
+            name: agentfs_contracts::name::VolumeName::parse("test").unwrap(),
+            id: agentfs_contracts::volume::VolumeId(uuid::Uuid::from_u128(1)),
+        };
+        let rec = Recording::create(tmp.path(), &identity, None, &PodContext::default()).unwrap();
+        let h = rec
+            .actor()
+            .unwrap()
+            .write_open(ROOT, "a", &writer("w"), Some(ATTRS))
+            .unwrap();
+        rec.actor().unwrap().write(h, 0, b"bytes", false).unwrap();
+        rec.actor().unwrap().close(h).unwrap();
+        rec.settle().unwrap();
+        let on_frames = || {
+            let actor = rec.actor().unwrap();
+            let object = actor.object_at(ROOT, "a").unwrap();
+            actor.trees[&ROOT].bytes[&object].on_frames()
+        };
+        assert!(on_frames(), "no step has taken the built map yet");
+        rec.progress().unwrap();
+        assert!(!on_frames(), "the built event took the built map");
+        assert_eq!(rec.actor().unwrap().read(ROOT, "a").unwrap(), b"bytes");
     }
 }
