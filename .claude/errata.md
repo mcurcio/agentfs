@@ -1981,3 +1981,57 @@ Also for the re-cut:
 2. **E2 of the ln6.5 page could not fail** for a reader between listing and opening. Replaced by `a_pack_a_reader_listed_outlives_the_run_that_rolls_it_up`.
 3. **The run-2 re-cut's "skip `.tmp-*`" rule in `Feed::finish` is moot.** No repack writes in `objects/pack` any more.
 4. **Open.** `docs/architecture.md` still says the repack runs in the git directory (the docs step owns it). `clean_packs` in `history/mod.rs` still fails a reopen on `ENOENT`; tolerating it would be more robust (residual).
+
+## 2026-11-20, memory-and-stalls run 3: errata from the slices
+
+### 2026-11-20, agentfs-ln6.4 (one copy of each fact, overlay; landed 2f6b2b9): where the page was short or wrong (none stopped the slice)
+
+1. **F1 cannot pass as measured, whatever the overlay saves.** The bar reads RssAnon once history is built. glibc keeps freed heap resident.
+   - The builder lags far behind `create`: 20 s of building after 11 s of creates at 20k files, 66 s after 30 s at 50k. During the lag the overlay holds every unbuilt change. So the peak equals the old permanent copy, and RssAnon never comes down from it.
+   - Measured on a release build, local ext4: before 2.61 to 2.70, after 2.60 to 2.71 KiB/file (20k and 50k).
+   - After `gdb -ex 'call malloc_trim(0)'`, live anonymous memory went from 52.8 to 40.0 MB at 20k and from 131.6 to 93.5 MB at 50k, about 1.87 KiB/file.
+   - Meeting the bar needs one of: malloc_trim (deferred on the design page), a builder that keeps up, or a bar read some other way. That is the owner's call.
+
+2. **The frozen write API gives no step to most overlay writes.** Shape::save, drop_object, add_anonymous and Files insert/get_mut/remove carry no step. These are lane B's call sites, so I did not change their signatures.
+   - Such entries are noted at UNSEALED (u64::MAX).
+   - I added `SavedTree::seal(last)`, which the actor runs before `rebuilt` with its last record number. This is safe because every change noted at no step happened at or before that record.
+
+3. **`rebuilt` is O(entries changed since the last built event), not O(entries dropped).**
+   - Names, Dirs and Objects are built as built map plus changed keys re-applied, so each read is one lookup and range reads (children, descendants) stay simple.
+   - Files is the page's two-layer form.
+   - Dirs needed a guard: a directory renamed in the overlay may already be numbered at its new path. F3 found this.
+
+4. **Files::get_mut and Files::iter have no caller outside tests.** With -D warnings they would fail clippy as dead code, so they carry `cfg_attr(not(test), allow(dead_code))`.
+
+5. **The actor also rebuilds in after_step, not only in on_built.** A library user has no take worker calling `progress`, and without this its changed layer would grow without bound.
+
+6. **Docs not updated:** docs/trees.md and docs/library/core.md (overlay, built.log on disk only) are not owned paths.
+
+7. **Environment:** a long TMPDIR (the scratchpad path) breaks `tests/history_service.rs` with "path must be shorter than SUN_LEN". Run with TMPDIR=/tmp. The disk filled to 100% once during the run, which broke `tree_batch_alloc` until space was freed.
+
+### 2026-11-20, agentfs-ln6.6 (memory-and-stalls §4.7, restart): the attribution contradicts the frozen page (blocking)
+
+Measured at 2f6b2b9 on a release build. The state was 100,000 `fig-create-N` files made through a FUSE mount by the `create` workload's write. History was built, the view stopped with SIGTERM, and the store held 818 packs (history.git 2.0 GB). On the restart I sampled /proc RssAnon and RssFile every 100 ms and marked each start_history and serve phase with probes. massif ran on a 25k-file state.
+
+Today's restart at 100k: VmHWM 1,087 to 1,266 MB, mount 37 to 70 s (shared 4-CPU box). Attribution of the 1,087 MB peak:
+
+| Contributor | Size |
+|---|---|
+| libgit2 pack and index mmaps | about 661 MB, 61% (570 `.pack` + 95 `.idx` over 809 index files), touched by the first full read of the head's trees and never unmapped under libgit2's default mwindow limits |
+| checkpoint branch of start_history (`built > folded_built`, the usual case after a workload) | +189 MB anon, from reading the whole tree at the checkpoint (read_trees, read_snapshot then Tree::install); replay and objects_of add under 1 MB |
+| read_trees at the built point | +55 MB anon |
+| history::owners | +47 MB kept and about 60 MB transient (`git log` of every direct save held whole, plus a 16 MiB read_to_end buffer) |
+| copy_all | 0 MB at the peak, but 14 to 45 s of the mount |
+
+What-ifs (no code landed):
+- libgit2 `set_mwindow_size(32 MiB)` + `set_mwindow_mapped_limit(64 MiB)` + `set_mwindow_file_limit(32)`: VmHWM 517 MB.
+- Store repacked to one pack: VmHWM 517 MB, mount 27.5 s (copy_all 19 s of it).
+- Both together: 517 MB, mount 19.3 s.
+
+Where the page is wrong:
+1. **The frozen interface cannot express today's semantics.** `read_tree(repo, tree, head) -> Result<Tree>` lacks the journal's object numbers (`Objects`; git-model §3: the journal's, never history's) and the bytes-map source (checkout path, `bases`, built point). Building a Tree from the head alone needs a second renumbering pass, which is the forbidden intermediate copy. Re-cut: `read_tree(repo, tree, head, objects: &Objects, map: impl FnMut(u64, &str) -> Result<Arc<FileBytes>>) -> Result<Tree>`, filling the persistent maps straight from the leaves with no `referee::Snapshot`. format.rs must join the owned paths; it is under history/ already.
+2. **The design misses the largest contributors.** (a) 61% is file-backed pack pages. The repack lane (§4.5) or libgit2 mwindow limits fix it. The limits are process-global and belong in `crate::history::init_libgit2` (history.rs, not owned by this lane). (b) The checkpoint branch reads the whole tree a second time. A re-cut should read it once, for example by carrying `objects` and `locals` as of the built point in the built log or the checkpoint, or by replaying on the one read. (c) owners holds every direct-save message at once; it should stream (tree_git.rs commit_messages, not owned). The marker lever saves mount time (copy_all), not memory.
+3. **The marker as specified is unsafe on power loss.** TreeGit::checkout_entry writes each file with `fs::write` + rename and never fsyncs it. A marker fsynced last can then outlive lost or empty checkout files, and a restart would serve wrong bytes from the base maps (principle 1). The re-cut must make the checkout's files durable before `mark_checkout`: one `syncfs` on the state area per checkout, or an fsync per written file in tree_git.rs. Otherwise markers should be written only at a clean stop, after a syncfs.
+4. **G1's bar is superseded by the amendment.** The page holds `hwm_mib <= 256` at about 50k files; the amendment holds 512 MiB VmHWM at 100k. Even with every lever above, 100k measures about 517 MB before the read_tree and owners changes. The 256 MiB at 50k bar is not reachable by this page's levers alone.
+
+Suggested re-cut owned paths: add history.rs (init_libgit2 mwindow limits) and tree_git.rs (commit_messages streaming; checkout fsync or syncfs). The marker should live outside `trees/<tree>/` (for example `trees/<tree>.files`, which remove_checkout and remove_stale_checkouts must also delete).
