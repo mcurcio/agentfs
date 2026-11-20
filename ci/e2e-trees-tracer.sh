@@ -332,7 +332,7 @@ print(json.dumps(w.get(sys.argv[3], 0)))' "$report" "$1" "$2"
   # From the container's start to the view's `mounted` line, by their log
   # timestamps (RFC 3339, nanoseconds).
   mount_s=$(python3 - "$(docker inspect --format '{{.State.StartedAt}}' "$NAME")" \
-    "$(docker logs -t "$NAME" 2>&1 | grep -F 'mounted volume t at /agentfs/root' | head -n 1 | cut -d' ' -f1)" <<'PY'
+    "$(docker logs -t "$NAME" 2>&1 | grep -F 'mounted volume t at /agentfs/root' | sed -n 1p | cut -d' ' -f1)" <<'PY'
 import datetime, sys
 def at(stamp):
     whole, _, fraction = stamp.rstrip("Z").partition(".")
