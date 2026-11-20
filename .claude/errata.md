@@ -1974,3 +1974,10 @@ Also for the re-cut:
 - (2) The repacker starts in `serve` right after the volume is constructed, not inside `start_history`. A later recovery failure then stops it through Drop.
 - (3) E2's probe "Odb with refresh disabled" cannot be built through git2-rs. libgit2 refreshes the pack list on a miss.
 - (4) A daemon SIGKILL leaves an orphaned repack. Its own process group means nothing kills it. It is harmless: it is cut short or finishes, and keeps every object. PR_SET_PDEATHSIG would end it.
+
+## 2026-11-20, memory-and-stalls: the repack beside live readers (fixed in 80c92d2)
+
+1. **The design's section 4.5 was unsafe.** It ran `git repack --geometric=2 -d` in the store's own `objects/pack` beside live readers. git and libgit2 find a pack by listing the directory, then opening the index lazily, and list again only once on a miss. A reader that listed before the install and opened after the delete reported an object as missing (CI on 6cd7edf: four conformance hits). No object was lost: strace reproduction, `git cat-file -e` succeeds afterwards. Fixed in 80c92d2: each run repacks in a scratch object directory (hard links plus `GIT_ALTERNATE_OBJECT_DIRECTORIES`), links the new pack in with its index last, and deletes rolled-up packs only at a run that starts on a later built event. This is the deferral git's own incremental repack (`multi-pack-index repack`, then `expire`) uses. The repack child gets `PR_SET_PDEATHSIG`.
+2. **E2 of the ln6.5 page could not fail** for a reader between listing and opening. Replaced by `a_pack_a_reader_listed_outlives_the_run_that_rolls_it_up`.
+3. **The run-2 re-cut's "skip `.tmp-*`" rule in `Feed::finish` is moot.** No repack writes in `objects/pack` any more.
+4. **Open.** `docs/architecture.md` still says the repack runs in the git directory (the docs step owns it). `clean_packs` in `history/mod.rs` still fails a reopen on `ENOENT`; tolerating it would be more robust (residual).
