@@ -15,6 +15,11 @@ use super::built::{Health, TreeLag};
 pub(in crate::tree_actor) const LAG_ALARM: Duration = Duration::from_secs(30);
 /// Over this, a tree's calls that start new work wait for the builder.
 pub(in crate::tree_actor) const LAG_LIMIT: Duration = Duration::from_secs(120);
+/// Over this much overlay, a tree's calls that start new work wait for the
+/// builder (`agentfs.overlayLimit`'s default, docs/configuration.md): the
+/// memory the actor holds for changes history has not built yet.
+#[allow(dead_code, reason = "frozen interface of agentfs-ln6.13")]
+pub(in crate::tree_actor) const OVERLAY_LIMIT: u64 = 32 << 20;
 /// The builder's rates before it has measured a batch.
 const INITIAL_NS_PER_STEP: u64 = 5_000_000;
 const INITIAL_NS_PER_BYTE: u64 = 10;
@@ -54,6 +59,29 @@ impl LagGate {
             overdue: false,
             logged: Health::Current,
         }
+    }
+
+    /// The overlay limit: over it, a tree's new work waits ([`OVERLAY_LIMIT`]
+    /// until set).
+    #[allow(dead_code, reason = "frozen interface of agentfs-ln6.13")]
+    pub(in crate::tree_actor) fn set_overlay_limit(&mut self, bytes: u64) {
+        let _ = bytes;
+        todo!("agentfs-ln6.13")
+    }
+
+    /// The actor's overlay of `tree` is `bytes` now (its last report wins);
+    /// true when that changed whether `tree` is admitted.
+    #[allow(dead_code, reason = "frozen interface of agentfs-ln6.13")]
+    pub(in crate::tree_actor) fn overlay(&mut self, tree: TreeId, bytes: u64) -> bool {
+        let _ = (tree, bytes);
+        todo!("agentfs-ln6.13")
+    }
+
+    /// `tree`'s overlay as last reported: 0 before any report.
+    #[allow(dead_code, reason = "frozen interface of agentfs-ln6.13")]
+    pub(in crate::tree_actor) fn overlay_of(&self, tree: TreeId) -> u64 {
+        let _ = tree;
+        todo!("agentfs-ln6.13")
     }
 
     /// Sets whether the journal's compaction is overdue; true when that

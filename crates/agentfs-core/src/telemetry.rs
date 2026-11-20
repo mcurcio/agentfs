@@ -108,6 +108,7 @@ pub mod names {
     pub const STATE_BYTES: &str = "agentfs.state.bytes";
     pub const REMOTE_MISCONFIGURED: &str = "agentfs.remote.misconfigured";
     pub const NOT_BUILT: &str = "agentfs.not_built";
+    pub const HISTORY_UNVERIFIED: &str = "agentfs.history.unverified";
     pub const REMOTES_MODE: &str = "agentfs.remotes.mode";
     pub const PATCH_QUEUE_DEPTH: &str = "agentfs.patch.queue_depth";
     pub const PATCH_BLOCKED: &str = "agentfs.patch.blocked";
@@ -652,6 +653,20 @@ impl Telemetry {
                 }
             })
             .build();
+    }
+
+    /// Registers `agentfs.history.unverified` (unit `{step}`): a tree
+    /// volume's saves history could not check, read from `counts` at each
+    /// collection, one point per `verdict`: `unresolved` (flagged, not
+    /// checked again) and `mismatch_confirmed` (checked again and still
+    /// disagreeing), both always observed, zero included. Call once per
+    /// process; a noop telemetry registers nothing.
+    pub fn observe_unverified(
+        &self,
+        counts: Weak<dyn Fn() -> crate::tree_actor::UnverifiedCounts + Send + Sync>,
+    ) {
+        let _ = counts;
+        todo!("agentfs-ln6.11")
     }
 
     /// Registers `agentfs.history_service.fronts`, the number of distinct

@@ -51,6 +51,7 @@ use history::built_log::{self, BuiltLog};
 use history::message::Message;
 use history::repack::Repacker;
 use history::upstreams::Upstreams;
+pub use history::verify::{Checked, UnverifiedCounts, Verdict, Verification};
 use history::{
     check_objects, clean_packs, objects_of, read_trees, refs, remove_stale_locks, sync_marker,
 };

@@ -21,8 +21,11 @@ mod host;
 mod mountpoint;
 mod serving;
 mod settings;
+mod verify;
 
 pub use self::host::{HostArgs, host};
+#[allow(unused_imports, reason = "frozen interface of agentfs-ln6.11")]
+pub use self::verify::{VerifyArgs, verify};
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};

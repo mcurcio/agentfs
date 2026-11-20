@@ -11,6 +11,7 @@ use std::collections::BTreeMap;
 use std::os::unix::fs::FileExt;
 use std::sync::Arc;
 
+use super::durable::RecordNo;
 use super::segment::{FramePos, Segment};
 use super::{Entry, HEADER, Journal, Record, read_header};
 use crate::tree_actor::recording::Call;
@@ -112,6 +113,37 @@ impl CallReader {
             Ok(())
         })?;
         Ok(calls)
+    }
+
+    /// The frame of record `seq`, carried or not: what `agentfs verify`
+    /// reads a kept `Save` step from. `None` when no linked segment holds it.
+    ///
+    /// # Errors
+    ///
+    /// As [`CallReader::for_each_call`].
+    #[allow(dead_code, reason = "frozen interface of agentfs-ln6.11")]
+    pub(in crate::tree_actor) fn record(&self, seq: RecordNo) -> Result<Option<super::Frame>> {
+        let _ = seq;
+        todo!("agentfs-ln6.11")
+    }
+
+    /// The runs of each `PageWrite` record in `records` of `tree`'s
+    /// `object`, by record, as the builder holds them (`runs_from_frame`):
+    /// the page writes a kept save's pieces name.
+    ///
+    /// # Errors
+    ///
+    /// As [`CallReader::for_each_call`]; [`crate::tree_actor::Error::Format`]
+    /// for a record in `records` that is not such a page write.
+    #[allow(dead_code, reason = "frozen interface of agentfs-ln6.11")]
+    pub(in crate::tree_actor) fn page_writes(
+        &self,
+        tree: crate::tree_actor::TreeId,
+        object: u64,
+        records: &std::collections::BTreeSet<RecordNo>,
+    ) -> Result<Vec<(u64, crate::tree_actor::recording::pages::Run)>> {
+        let _ = (tree, object, records);
+        todo!("agentfs-ln6.11")
     }
 }
 

@@ -290,6 +290,12 @@ impl From<String> for PathName {
     }
 }
 
+/// What one changed entry of the overlay holds in memory, measured
+/// (`tests/tree_overlay_limit.rs` holds it to the allocation a create's
+/// entries make): [`SavedTree::overlay_bytes`]'s unit.
+#[allow(dead_code, reason = "frozen interface of agentfs-ln6.13")]
+pub(super) const OVERLAY_ENTRY_BYTES: u64 = 256;
+
 /// The step an overlay entry is noted at before its step is known: a save,
 /// a map or an object dropped, none of which is given its step. Sealed to the
 /// actor's last record at a built event ([`SavedTree::seal`]), so it is never
@@ -1726,6 +1732,16 @@ impl SavedTree {
     pub(super) fn add_anonymous(&mut self, object: u64, meta: Meta, at_ns: u64) {
         self.shape.add_anonymous(object, meta, at_ns);
         self.bytes.insert(object, FileMap::empty());
+    }
+
+    /// The overlay's memory, estimated: its changed entries (names,
+    /// directories, objects and maps changed since the built point) at
+    /// [`OVERLAY_ENTRY_BYTES`] each. O(1): each changed layer's length. A
+    /// changed map's own pieces are not counted (the lag gate's byte term
+    /// covers a save's bytes).
+    #[allow(dead_code, reason = "frozen interface of agentfs-ln6.13")]
+    pub(super) fn overlay_bytes(&self) -> u64 {
+        todo!("agentfs-ln6.13")
     }
 
     pub(super) fn drop_object(&mut self, object: u64) {

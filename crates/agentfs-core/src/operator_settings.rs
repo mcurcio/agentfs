@@ -75,6 +75,13 @@ pub enum SettingsError {
     },
     #[error("include {} is not an absolute path", .0.display())]
     RelativeInclude(PathBuf),
+    /// A key tree volumes build, set to a value they refuse.
+    #[error("operator settings: {key} = {value:?}: {expected}")]
+    BadValue {
+        key: String,
+        value: String,
+        expected: &'static str,
+    },
 }
 
 /// The settings `<state>/config` holds, its includes followed.
@@ -147,6 +154,18 @@ impl OperatorSettings {
             .into_iter()
             .map(|(key, capability)| NotBuilt { key, capability })
             .collect()
+    }
+
+    /// `agentfs.overlayLimit`, the last value set (git's rule): a positive
+    /// size (`k`, `m`, `g`: powers of 1024, `config::parse_size`), or the
+    /// lag gate's default when unset. Tree volumes build it: [`classify`]
+    /// answers `None` for it.
+    ///
+    /// # Errors
+    ///
+    /// [`SettingsError::BadValue`] for a value that is not a positive size.
+    pub fn overlay_limit(&self) -> Result<u64, SettingsError> {
+        todo!("agentfs-ln6.13")
     }
 }
 

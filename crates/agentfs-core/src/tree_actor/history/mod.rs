@@ -13,6 +13,7 @@ pub(super) mod refs;
 pub(super) mod repack;
 pub(super) mod take;
 pub(super) mod upstreams;
+pub(super) mod verify;
 
 use std::collections::BTreeMap;
 use std::fs::{self, File};
@@ -67,6 +68,70 @@ pub(in crate::tree_actor) fn objects_after(
         }
     }
     Ok(next)
+}
+
+/// What one batch moved of one tree's object numbers and locals (directory
+/// numbers and times, files' times): the built log's record of them, so a
+/// start after a kill folds the checkpoint's objects and locals forward to
+/// the built point without reading any tree (the checkpoint branch of
+/// `TreeActor::start_history`). O(what the batch moved), never the tree's
+/// size, but for a tree the batch made (a fork: every entry) or dropped.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(in crate::tree_actor) struct TreeMoved {
+    /// The tree, as the journal writes it (`TreeId`'s text).
+    pub tree: String,
+    /// The batch dropped the tree (a fork's drop): every other field empty.
+    pub dropped: bool,
+    /// Each identity whose object the batch set: (identity, object).
+    pub objects: Vec<(u64, u64)>,
+    /// Each identity the batch left with no object (unnamed, dropped).
+    pub unnamed: Vec<u64>,
+    /// Each directory whose number or times the batch set, `None` for one
+    /// it removed: path (`""` the root) and (number, times).
+    pub dirs: Vec<(String, Option<(u64, super::Times)>)>,
+    /// Each identity whose file times the batch set, `None` for one it
+    /// dropped.
+    pub files: Vec<(u64, Option<super::Times>)>,
+}
+
+impl TreeMoved {
+    /// What the batch moved of `tree` from `before` (its shape and objects
+    /// at the last built point; `None` for a tree the batch made) to `after`
+    /// (`None` for a tree the batch dropped): imbl's diff of the persistent
+    /// maps, so O(changes). `None` when nothing moved.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Format`] for an object with no identity.
+    #[allow(dead_code, reason = "frozen interface of agentfs-ln6.12")]
+    pub(in crate::tree_actor) fn between(
+        tree: TreeId,
+        before: Option<(&Shape, &Objects)>,
+        after: Option<(&Shape, &Objects)>,
+    ) -> Result<Option<Self>> {
+        let _ = (tree, before, after);
+        todo!("agentfs-ln6.12")
+    }
+
+    /// Moves `objects` and `locals` (every tree's, as a checkpoint holds
+    /// them) by this batch's change of its tree: the inverse of
+    /// [`TreeMoved::between`], so folding a batch's moves onto its
+    /// before-state gives `objects_of` and `Shape::locals` of its
+    /// after-state.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Format`] for a tree text that is no [`TreeId`], or a move of a
+    /// tree `objects` lacks that the batch did not make.
+    #[allow(dead_code, reason = "frozen interface of agentfs-ln6.12")]
+    pub(in crate::tree_actor) fn apply(
+        &self,
+        objects: &mut BTreeMap<TreeId, Objects>,
+        locals: &mut BTreeMap<TreeId, super::journal::TreeLocals>,
+    ) -> Result<()> {
+        let _ = (objects, locals);
+        todo!("agentfs-ln6.12")
+    }
 }
 
 // What is lost of any pointer's commit, tree and blobs refuses to serve. The

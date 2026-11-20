@@ -579,6 +579,32 @@ impl History {
         }
     }
 
+    /// The overlay limit of the lag gate (`agentfs.overlayLimit`): over it,
+    /// a tree's new work waits for the builder.
+    pub fn set_overlay_limit(&self, bytes: u64) {
+        let _ = bytes;
+        todo!("agentfs-ln6.13")
+    }
+
+    /// The actor's overlay of each tree, as it left them at a release of
+    /// its lock: the gate's memory term. Wakes the gate thread when a tree's
+    /// admission changed. Lock order: the actor, then History.
+    #[allow(dead_code, reason = "frozen interface of agentfs-ln6.13")]
+    pub(in crate::tree_actor) fn overlays(
+        &self,
+        overlays: impl IntoIterator<Item = (TreeId, u64)>,
+    ) {
+        let _ = overlays.into_iter();
+        todo!("agentfs-ln6.13")
+    }
+
+    /// `tree`'s overlay as last reported to the gate.
+    #[allow(dead_code, reason = "frozen interface of agentfs-ln6.13")]
+    pub(in crate::tree_actor) fn overlay_bytes(&self, tree: TreeId) -> u64 {
+        let _ = tree;
+        todo!("agentfs-ln6.13")
+    }
+
     /// The lag gate with these levels: a test's limit, so a call waits.
     #[cfg(all(test, feature = "failpoints"))]
     pub(in crate::tree_actor) fn set_lag_limits(&self, alarm: Duration, limit: Duration) {

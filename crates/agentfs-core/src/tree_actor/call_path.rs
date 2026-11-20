@@ -306,6 +306,14 @@ impl Recording {
         self.history.admit_then(tree, then);
     }
 
+    /// The lag gate's overlay limit (`agentfs.overlayLimit`, read by the
+    /// launcher from the operator settings): over it, a tree's new work waits
+    /// for the builder as it does over the lag limit.
+    pub fn set_overlay_limit(&self, bytes: u64) {
+        let _ = bytes;
+        todo!("agentfs-ln6.13")
+    }
+
     /// History, the one owner of the Git store.
     pub fn history(&self) -> &History {
         &self.history

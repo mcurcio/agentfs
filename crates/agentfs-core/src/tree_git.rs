@@ -206,6 +206,58 @@ impl TreeGit {
         self.ref_transaction(pointers)
     }
 
+    /// Every note under `notes_ref`: each annotated commit and its note's
+    /// text, in commit-id order; empty when the ref does not exist. Read
+    /// through libgit2, git's notes layout (fan-out included).
+    ///
+    /// # Errors
+    ///
+    /// A store read; [`Error::Invalid`] for a note that is not UTF-8.
+    pub fn notes(&self, notes_ref: &str) -> Result<Vec<(Oid, String)>> {
+        let _ = notes_ref;
+        todo!("agentfs-ln6.11")
+    }
+
+    /// Makes `text` the note of `commit` under `notes_ref`, in one new notes
+    /// commit whose parent is `expected` (the ref's tip, or `None` for a
+    /// ref not created yet), committed by `committer`; moves the ref from
+    /// `expected` only. The notes blob, tree and commit and the ref are
+    /// durable before it returns. Answers the new tip. Never rewrites: the
+    /// old tip stays the new commit's parent.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Git`] when the ref is no longer at `expected`; a store write.
+    pub fn write_note(
+        &self,
+        notes_ref: &str,
+        commit: Oid,
+        text: &str,
+        committer: &git2::Signature<'_>,
+        expected: Option<Oid>,
+    ) -> Result<Oid> {
+        let _ = (notes_ref, commit, text, committer, expected);
+        todo!("agentfs-ln6.11")
+    }
+
+    /// Visits each commit reachable from `tips` with its raw message, as
+    /// `git log` streams it, in one Git child: no message is held after its
+    /// visit, and the child's output is never read whole. Replaces
+    /// [`TreeGit::commit_messages`].
+    ///
+    /// # Errors
+    ///
+    /// The child's failure; [`Error::Invalid`] for output that names no
+    /// commit.
+    pub fn for_each_commit_message(
+        &self,
+        tips: &[Oid],
+        visit: impl FnMut(Oid, &[u8]),
+    ) -> Result<()> {
+        let _ = (tips, visit);
+        todo!("agentfs-ln6.12")
+    }
+
     /// What is lost of each tip's commit, tree and blobs, parents not walked.
     pub fn missing_objects(&self, tips: &[Oid]) -> Result<Vec<Oid>> {
         let mut input = String::new();
