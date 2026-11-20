@@ -63,8 +63,9 @@ needs the old driver; run it before or after the upgrade.
    kubectl -n agentfs-csi cp "${NODE_POD#pod/}":/tmp/<pv>.bundle ./<pv>.bundle -c agentfs-csi
    ```
 
-   Keep it wherever you keep history (a git server: `git clone
-   <pv>.bundle`, then push it). Check it with `git bundle verify`.
+   Keep it wherever you keep history (a git server:
+   `git clone <pv>.bundle`, then push it). Check it with
+   `git bundle verify`.
 
 4. **Archive the files** to carry into the new volume. The branch's tip
    holds every recorded file:
@@ -77,8 +78,9 @@ needs the old driver; run it before or after the upgrade.
    ```
 
    Files history never recorded (ignored or oversize ones) are only in
-   `<base>/<pv>/backing`; take them with `tar -C <base>/<pv>/backing -cf
-   /tmp/<pv>-backing.tar .` instead if the workload needs them.
+   `<base>/<pv>/backing`; take them with
+   `tar -C <base>/<pv>/backing -cf /tmp/<pv>-backing.tar .` instead if the
+   workload needs them.
 
 5. **Create a new claim on a tree class** (any class of the driver, now
    that it runs tree volumes), and a pod that mounts it. A helper pod on
@@ -121,11 +123,12 @@ While the node is up, copy the files out through the volume's mount into
 a new claim on the other node:
 
 1. Stop the workload, then run one pod on the old claim (on the old node)
-   and archive its mount: `kubectl -n <ns> exec <pod> -- tar -C <mount
-   path> -cf /tmp/files.tar .` and `kubectl cp` it out.
-2. Archive the history if you want it: `git --git-dir
-   <base>/<pv>/state/history.git bundle create /tmp/<pv>.bundle --all` in
-   the old node's plugin pod, as above.
+   and archive its mount:
+   `kubectl -n <ns> exec <pod> -- tar -C <mount path> -cf /tmp/files.tar .`
+   and `kubectl cp` it out.
+2. Archive the history if you want it:
+   `git --git-dir <base>/<pv>/state/history.git bundle create /tmp/<pv>.bundle --all`
+   in the old node's plugin pod, as above.
 3. Create a new claim whose first pod is scheduled on the other node, and
    unpack the files through its mount, as in step 6 above.
 4. Delete the old claim: DeleteVolume keeps its directory on the old node

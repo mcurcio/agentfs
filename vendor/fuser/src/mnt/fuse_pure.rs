@@ -477,11 +477,21 @@ fn fuse_mount_sys(
         source = name;
     }
 
+    // The kernel takes a subtype as the type's suffix (`fuse.<subtype>`),
+    // as libfuse's mount does, so mountinfo shows it.
+    #[cfg(target_os = "linux")]
+    let fstype = match options
+        .iter()
+        .find(|x| matches!(**x, MountOption::Subtype(_)))
+    {
+        Some(MountOption::Subtype(subtype)) => format!("fuse.{subtype}"),
+        _ => "fuse".to_owned(),
+    };
     #[cfg(target_os = "linux")]
     let result = nix::mount::mount(
         Some(source),
         mountpoint,
-        Some("fuse"),
+        Some(fstype.as_str()),
         flags,
         Some(mount_options.as_str()),
     );
