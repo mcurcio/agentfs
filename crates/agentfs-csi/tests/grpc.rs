@@ -320,9 +320,26 @@ async fn create_volume_refuses_what_it_does_not_support() {
         r,
         Some("cloning needs a fork class (fork: \"true\")"),
     ));
-    let mut r = create_req("v", &[("fork", "true")]);
+    cases.push((
+        "a fork class with no dataSource",
+        create_req("v", &[("fork", "true")]),
+        Some("a fork class needs a dataSource claim"),
+    ));
+    for (what, extra) in [
+        ("an unlinked fork class", ("link", "unlinked")),
+        ("a fork class with remotes", ("remotes", "r")),
+    ] {
+        let mut r = create_req("v", &[("fork", "true"), extra]);
+        r.volume_content_source = clone.clone();
+        cases.push((what, r, Some("unlinked forks are not built")));
+    }
+    let mut r = create_req("v", &[("fork", "true"), ("profile", "p")]);
     r.volume_content_source = clone;
-    cases.push(("a fork claim", r, Some("fork claims are not built yet")));
+    cases.push((
+        "a fork class with a profile",
+        r,
+        Some("profile is not a fork class's: a fork claim takes its source's"),
+    ));
     cases.push((
         "onDelete: delete",
         create_req("v", &[("profile", "p"), ("onDelete", "delete")]),
@@ -375,6 +392,51 @@ async fn create_volume_refuses_what_it_does_not_support() {
         }
     }
     assert!(!d.layout.volume_dir("v").exists(), "nothing was made");
+    d.stop().await;
+}
+
+fn fork_req(name: &str, source: &str) -> CreateVolumeRequest {
+    let mut r = create_req(name, &[("fork", "true")]);
+    r.volume_content_source = Some(VolumeContentSource {
+        r#type: Some(volume_content_source::Type::Volume(
+            volume_content_source::VolumeSource {
+                volume_id: source.into(),
+            },
+        )),
+    });
+    r
+}
+
+/// A fork claim is made on its source's node, of a tree volume: a source
+/// with no claim here, or a recording-format one, is FAILED_PRECONDITION,
+/// and nothing is made.
+#[tokio::test]
+async fn a_fork_claims_source_must_be_a_tree_volume_on_this_node() {
+    let d = Driver::start().await;
+    let mut c = d.controller();
+    let err = c.create_volume(fork_req("f", "src")).await.unwrap_err();
+    assert_eq!(err.code(), Code::FailedPrecondition, "{err:?}");
+    assert_eq!(
+        err.message(),
+        "source volume src is not on node node-1: a fork claim is made on its source's node \
+         (give its pod affinity to the source's pods)"
+    );
+    d.recording_fixture("old");
+    let err = c.create_volume(fork_req("f", "old")).await.unwrap_err();
+    assert_eq!(err.code(), Code::FailedPrecondition, "{err:?}");
+    assert_eq!(
+        err.message(),
+        format!(
+            "volume old is a recording-format volume ({}): this driver never serves or deletes \
+             it; archive it and remove the directory by hand (docs/runbooks/moving.md)",
+            d.layout.volume_dir("old").display()
+        )
+    );
+    assert_eq!(
+        code(c.create_volume(fork_req("f", "a/b")).await),
+        Code::InvalidArgument
+    );
+    assert!(!d.layout.volume_dir("f").exists(), "nothing was made");
     d.stop().await;
 }
 

@@ -11,17 +11,23 @@
 //! | `profile` | required: `<profile>.config`, `.exclude`, `.attributes` in the profiles directory |
 //! | `volumeName` | the agentfs volume name, a template over `{pvcNamespace}`, `{pvcName}` and `{pvName}` that must contain `{pvName}`; default [`DEFAULT_TEMPLATE`] (with the provisioner's `--extra-create-metadata`), else the PV name. In a static PV's attributes, a literal name |
 //! | `onDelete` | `retain` only: DeleteVolume keeps the volume |
-//! | `fork` | `"true"`: a fork class ([`is_fork_class`]); `"false"` or absent: an ordinary one |
+//! | `fork` | `"true"`: a fork class ([`is_fork_class`], read by [`ForkClass`]); `"false"` or absent: an ordinary one |
 //!
 //! `startFrom`, `workloadMounts` and `onDelete: delete` are refused: they
 //! are not built on tree volumes. Keys under `csi.storage.k8s.io/` (the
 //! provisioner's metadata) are read for the template and otherwise
 //! ignored; any other key is refused.
+//!
+//! A fork class's claim is a keyed fork in its source claim's volume
+//! ([`ForkClass`]): `landing` (`automatic`, the default, or `approval`,
+//! which Trees refuses) and `link` (`linked` only). It takes everything
+//! else from its source.
 
 use std::collections::HashMap;
 
 use agentfs_contracts::name::{Label, VolumeName};
 use agentfs_contracts::pod::PodContext;
+use agentfs_contracts::trees::{ForkSettings, Landing};
 
 /// The provisioner's metadata keys (`--extra-create-metadata`).
 pub const PVC_NAME: &str = "csi.storage.k8s.io/pvc/name";
@@ -55,6 +61,8 @@ pub const ON_DELETE_NOT_BUILT: &str = "onDelete: delete is not built on tree vol
 /// What `startFrom` is told.
 pub const START_FROM_NOT_BUILT: &str = "startFrom is not built on tree volumes: a volume starts \
     empty; moving a volume between nodes is not built (docs/runbooks/moving.md)";
+/// What `link: unlinked` and `remotes` are told.
+pub const UNLINKED_NOT_BUILT: &str = "unlinked forks are not built";
 /// What `workloadMounts` is told.
 pub const WORKLOAD_MOUNTS_NOT_BUILT: &str = "workloadMounts is not built on tree volumes: tree \
     volumes keep nested repositories untracked";
@@ -101,10 +109,21 @@ pub enum ParamError {
     WorkloadMountsNotBuilt,
     #[error("fork {0:?} must be \"true\" or \"false\"")]
     BadFork(String),
-    #[error("fork claims are not built yet")]
+    /// A fork class read as an ordinary one: [`ForkClass`] reads it.
+    #[error("fork \"true\" makes a fork class, whose claims are forks of a dataSource claim")]
     ForkClass,
     #[error("{0} is a fork class's parameter (fork: \"true\"); an ordinary class has no source")]
     ForkOnly(&'static str),
+    #[error("{}", UNLINKED_NOT_BUILT)]
+    UnlinkedNotBuilt,
+    #[error("landing {0:?} must be \"automatic\" or \"approval\"")]
+    BadLanding(String),
+    #[error("link {0:?} must be \"linked\" or \"unlinked\"")]
+    BadLink(String),
+    #[error("{0} is not a fork class's: a fork claim takes its source's")]
+    NotForkKey(String),
+    #[error("unknown fork class parameter {0:?} (known: fork, landing, link)")]
+    UnknownForkKey(String),
     #[error("the pod's {what} {value:?} is not a valid label")]
     BadPod { what: &'static str, value: String },
 }
@@ -150,6 +169,7 @@ impl VolumeParams {
                 "fork" if value == "false" => {}
                 "fork" if value == "true" => return Err(ParamError::ForkClass),
                 "fork" => return Err(ParamError::BadFork(value.clone())),
+                "landing" => return Err(ParamError::ForkOnly("landing")),
                 "link" => return Err(ParamError::ForkOnly("link")),
                 "remotes" => return Err(ParamError::ForkOnly("remotes")),
                 k if k.starts_with(CO_PREFIX) => {}
@@ -213,6 +233,55 @@ impl VolumeParams {
             ("profile".to_owned(), self.profile.clone()),
             ("volume".to_owned(), self.name.as_str().to_owned()),
         ])
+    }
+}
+
+/// A fork class's settings: what CreateVolume passes to Trees for the
+/// claim's fork.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForkClass {
+    pub settings: ForkSettings,
+}
+
+impl ForkClass {
+    /// `fork: "true"`; `landing`: `automatic` (default) | `approval` (passed
+    /// on: Trees refuses it); `link`: `linked` (default) | `unlinked`
+    /// (refused: [`UNLINKED_NOT_BUILT`]); `remotes`: refused, the same;
+    /// `profile`, `volumeName`, `onDelete`, `startFrom`, `branch`,
+    /// `workloadMounts`: refused, a fork claim takes its source's. Keys
+    /// under the CO's prefix are ignored; any other key is refused.
+    pub fn from_create(parameters: &HashMap<String, String>) -> Result<Self, ParamError> {
+        let mut landing = Landing::Automatic;
+        // Refusals in a fixed order, as for an ordinary class.
+        let mut keys: Vec<&String> = parameters.keys().collect();
+        keys.sort();
+        for key in keys {
+            let value = &parameters[key];
+            match key.as_str() {
+                "fork" if value == "true" => {}
+                "fork" => return Err(ParamError::BadFork(value.clone())),
+                "landing" => {
+                    landing = match value.as_str() {
+                        "automatic" => Landing::Automatic,
+                        "approval" => Landing::Approval,
+                        other => return Err(ParamError::BadLanding(other.to_owned())),
+                    };
+                }
+                "link" => match value.as_str() {
+                    "linked" => {}
+                    "unlinked" => return Err(ParamError::UnlinkedNotBuilt),
+                    other => return Err(ParamError::BadLink(other.to_owned())),
+                },
+                "remotes" => return Err(ParamError::UnlinkedNotBuilt),
+                k @ ("profile" | "volumeName" | "onDelete" | "startFrom" | "branch"
+                | "workloadMounts") => return Err(ParamError::NotForkKey(k.to_owned())),
+                k if k.starts_with(CO_PREFIX) => {}
+                other => return Err(ParamError::UnknownForkKey(other.to_owned())),
+            }
+        }
+        Ok(Self {
+            settings: ForkSettings { landing },
+        })
     }
 }
 
@@ -443,7 +512,12 @@ mod tests {
         );
         assert_eq!(
             refused(&[("fork", "true")]),
-            "fork claims are not built yet"
+            "fork \"true\" makes a fork class, whose claims are forks of a dataSource claim"
+        );
+        assert_eq!(
+            refused(&[("landing", "automatic")]),
+            "landing is a fork class's parameter (fork: \"true\"); an ordinary class has no \
+             source"
         );
         assert_eq!(
             refused(&[("volumeName", "{pvcName}")]),
@@ -484,6 +558,74 @@ mod tests {
         assert!(is_fork_class(&map(&[("fork", "true")])));
         assert!(!is_fork_class(&map(&[("fork", "false")])));
         assert!(!is_fork_class(&map(&[])));
+    }
+
+    fn fork_class(extra: &[(&str, &str)]) -> Result<ForkClass, ParamError> {
+        let mut m = with_meta(&[("fork", "true")]);
+        m.extend(map(extra));
+        ForkClass::from_create(&m)
+    }
+
+    #[test]
+    fn fork_class_keys() {
+        let automatic = ForkSettings {
+            landing: Landing::Automatic,
+        };
+        assert_eq!(fork_class(&[]).unwrap().settings, automatic);
+        assert_eq!(
+            fork_class(&[("landing", "automatic"), ("link", "linked")])
+                .unwrap()
+                .settings,
+            automatic
+        );
+        // Passed on: Trees is the one that refuses it.
+        assert_eq!(
+            fork_class(&[("landing", "approval")]).unwrap().settings,
+            ForkSettings {
+                landing: Landing::Approval
+            }
+        );
+    }
+
+    #[test]
+    fn every_fork_class_refusal_and_its_message() {
+        let refused = |extra: &[(&str, &str)]| fork_class(extra).unwrap_err().to_string();
+        assert_eq!(
+            refused(&[("link", "unlinked")]),
+            "unlinked forks are not built"
+        );
+        assert_eq!(refused(&[("remotes", "r")]), "unlinked forks are not built");
+        assert_eq!(
+            refused(&[("link", "loose")]),
+            "link \"loose\" must be \"linked\" or \"unlinked\""
+        );
+        assert_eq!(
+            refused(&[("landing", "manual")]),
+            "landing \"manual\" must be \"automatic\" or \"approval\""
+        );
+        for key in [
+            "profile",
+            "volumeName",
+            "onDelete",
+            "startFrom",
+            "branch",
+            "workloadMounts",
+        ] {
+            assert_eq!(
+                refused(&[(key, "x")]),
+                format!("{key} is not a fork class's: a fork claim takes its source's")
+            );
+        }
+        assert_eq!(
+            refused(&[("zone", "a")]),
+            "unknown fork class parameter \"zone\" (known: fork, landing, link)"
+        );
+        assert_eq!(
+            ForkClass::from_create(&map(&[("fork", "yes")]))
+                .unwrap_err()
+                .to_string(),
+            "fork \"yes\" must be \"true\" or \"false\""
+        );
     }
 
     #[test]

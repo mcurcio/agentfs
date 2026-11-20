@@ -8,6 +8,8 @@
 //!     csi.json                    the claim record (CreateVolume, or a static
 //!                                 PV over a kept volume)
 //!     csi.retained.json           the record once DeleteVolume kept the volume
+//!                                 (a fork claim's directory holds only its
+//!                                 csi.json: its fork is in its source's state)
 //! <node-state>/                   --node-state: on the node, survives plugin restarts
 //!   published/<handle>.json       the claim's published target
 //! <profiles>/<profile>.config|.exclude|.attributes

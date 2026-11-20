@@ -24,7 +24,9 @@ use crate::csi::v1::{
 use agentfs_contracts::host::TreeRef;
 use agentfs_contracts::ports::Found;
 
-use crate::controller::{FORKS_NOT_BUILT, inspect, recording_format};
+use agentfs_contracts::name::ForkKey;
+
+use crate::controller::{inspect, recording_format};
 use crate::error::Error;
 use crate::layout::validate_handle;
 use crate::params::{VolumeParams, is_ephemeral, pod_context};
@@ -88,8 +90,8 @@ fn node_capability(t: rpc::Type) -> NodeServiceCapability {
 }
 
 impl NodeService {
-    /// The view NodePublish opens: the claim's own volume, from its
-    /// `csi.json`, or a static PV over a kept volume, adopted (its
+    /// The view NodePublish opens: the claim's own volume, or a fork
+    /// claim's fork in its source's, from its `csi.json`, or a static PV over a kept volume, adopted (its
     /// `csi.json` written) only over a tree volume of the asked name.
     async fn resolve(
         &self,
@@ -105,7 +107,11 @@ impl NodeService {
         if let Some(record) = records::load_claim(layout, handle)? {
             return match record.claim {
                 ClaimKind::Volume { .. } => Ok((handle.to_owned(), TreeRef::Root)),
-                ClaimKind::Fork { .. } => Err(Error::Internal(FORKS_NOT_BUILT.into())),
+                // A fork claim's view: its fork, on its source volume's host.
+                ClaimKind::Fork { source } => {
+                    let key = ForkKey::parse(handle).map_err(|e| Error::Internal(e.to_string()))?;
+                    Ok((source, TreeRef::Fork(key)))
+                }
             };
         }
         let Found::Volume(identity) = found else {

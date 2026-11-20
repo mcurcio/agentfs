@@ -10,9 +10,11 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use agentfs_contracts::host::{Reply, Request, TreeRef};
-use agentfs_contracts::name::{ClientLabel, Label, VolumeName};
+use agentfs_contracts::host::{Refusal, RefusalKind, Reply, Request, TreeRef};
+use agentfs_contracts::name::{ClientLabel, ForkKey, Label, VolumeName};
 use agentfs_contracts::pod::PodContext;
+use agentfs_contracts::tree::TreeId;
+use agentfs_contracts::trees::{ForkSettings, Landing};
 use agentfs_csi::error::Error;
 use agentfs_csi::launcher::{Exit, Launcher, ProcessSpec, Spawned};
 use agentfs_csi::layout::{Layout, target_key};
@@ -38,6 +40,9 @@ struct World {
     specs: Vec<ProcessSpec>,
     /// At EOF a host exits with this code; `None`: when the test says.
     eof_exit: Option<i32>,
+    /// What hosts answer a fork create or end with, instead of `forked`
+    /// (fork 1) or `ended`.
+    fork_refusal: Option<RefusalKind>,
 }
 
 #[derive(Clone)]
@@ -109,7 +114,8 @@ fn describe(request: &Request) -> String {
         Request::Open(view) => format!("open {}", view.at.display()),
         Request::Close { at } => format!("close {}", at.display()),
         Request::Reconcile => "reconcile".into(),
-        other => format!("{other:?}"),
+        Request::ForkCreate { key, .. } => format!("fork_create {}", key.as_str()),
+        Request::ForkEnd { key } => format!("fork_end {}", key.as_str()),
     }
 }
 
@@ -148,6 +154,7 @@ impl Launcher for Fake {
         };
         Self::event(&self.log, format!("spawn host {volume}"));
         let log = self.log.clone();
+        let world = self.world.clone();
         tokio::spawn(async move {
             let (read, mut write) = theirs.into_split();
             let hello = format!(
@@ -173,7 +180,19 @@ impl Launcher for Fake {
                             },
                             Request::Close { .. } => Reply::Closed,
                             Request::Reconcile => Reply::Reconciled { ended: 0 },
-                            other => panic!("unexpected {other:?}"),
+                            Request::ForkCreate { .. } | Request::ForkEnd { .. } => {
+                                let refusal = world.lock().unwrap().fork_refusal;
+                                match (refusal, &request) {
+                                    (Some(kind), _) => Reply::Refused(Refusal {
+                                        kind,
+                                        message: format!("refused: {kind:?}"),
+                                    }),
+                                    (None, Request::ForkCreate { .. }) => Reply::Forked {
+                                        tree: TreeId::Fork(1),
+                                    },
+                                    (None, _) => Reply::Ended,
+                                }
+                            }
                         };
                         requests.lock().unwrap().push(request);
                         let mut line = serde_json::to_string(&reply).unwrap();
@@ -585,4 +604,143 @@ async fn ensure_runs_init_and_installs_the_rules() {
         n.sup.ensure("pvc-1", &missing).await.unwrap_err(),
         Error::InvalidArgument(_)
     ));
+}
+
+fn key(text: &str) -> ForkKey {
+    ForkKey::parse(text).unwrap()
+}
+
+fn automatic() -> ForkSettings {
+    ForkSettings {
+        landing: Landing::Automatic,
+    }
+}
+
+/// A fork claim's CreateVolume with no host running: one is started for
+/// the call, asked to create the fork under the claim's handle from the
+/// right upstream, and stopped after it (EOF).
+#[tokio::test(start_paused = true)]
+async fn create_fork_starts_a_host_for_the_call_and_stops_it() {
+    let n = Node::new();
+    n.volume("v");
+    let tree = n
+        .sup
+        .create_fork("v", TreeRef::Root, key("f"), automatic())
+        .await
+        .unwrap();
+    assert_eq!(tree, TreeId::Fork(1));
+    assert_eq!(
+        n.fake.events(),
+        ["spawn host v", "reconcile", "fork_create f", "eof host v"]
+    );
+    assert_eq!(
+        n.fake.requests(0)[1],
+        Request::ForkCreate {
+            upstream: TreeRef::Root,
+            key: key("f"),
+            settings: automatic(),
+        }
+    );
+    // A fork claim's fork as upstream goes as its key.
+    n.sup
+        .create_fork("v", TreeRef::Fork(key("f")), key("g"), automatic())
+        .await
+        .unwrap();
+    assert_eq!(
+        n.fake.requests(1)[1],
+        Request::ForkCreate {
+            upstream: TreeRef::Fork(key("f")),
+            key: key("g"),
+            settings: automatic(),
+        }
+    );
+    // Refusals: an ended key is ALREADY_EXISTS, Trees' refusals
+    // INVALID_ARGUMENT; the host is stopped after each.
+    for (kind, code) in [
+        (RefusalKind::KeyEnded, "AlreadyExists"),
+        (RefusalKind::NestedNotBuilt, "InvalidArgument"),
+        (RefusalKind::ApprovalNotBuilt, "InvalidArgument"),
+        (RefusalKind::KeyUnknown, "FailedPrecondition"),
+        (RefusalKind::Draining, "Unavailable"),
+    ] {
+        n.fake.world.lock().unwrap().fork_refusal = Some(kind);
+        let err = n
+            .sup
+            .create_fork("v", TreeRef::Root, key("f"), automatic())
+            .await
+            .unwrap_err();
+        assert!(format!("{err:?}").starts_with(code), "{kind:?}: {err:?}");
+        assert_eq!(err.to_string(), format!("refused: {kind:?}"));
+    }
+    let hosts = n.fake.hosts();
+    n.fake.until("eof host v", hosts).await;
+}
+
+/// With the volume's host running for a view, a fork create and end use
+/// it and leave it running.
+#[tokio::test(start_paused = true)]
+async fn forks_on_a_running_host_reuse_it_and_leave_it_running() {
+    let n = Node::new();
+    n.volume("v");
+    let a = n.target("a");
+    n.sup.publish(n.view("v", "v", &a)).await.unwrap();
+    n.sup
+        .create_fork("v", TreeRef::Root, key("f"), automatic())
+        .await
+        .unwrap();
+    n.sup.end_fork("v", key("f")).await.unwrap();
+    assert_eq!(n.fake.hosts(), 1);
+    assert_eq!(
+        n.fake.events(),
+        [
+            "spawn host v".to_owned(),
+            "reconcile".to_owned(),
+            format!("open {}", a.display()),
+            "fork_create f".to_owned(),
+            "fork_end f".to_owned(),
+        ]
+    );
+}
+
+/// DeleteVolume of a fork claim is idempotent: a fork ended already, or
+/// no fork under the key, is Ok; another refusal is not. Each call starts
+/// the host when none runs and stops it after.
+#[tokio::test(start_paused = true)]
+async fn end_fork_maps_an_unknown_or_ended_key_to_ok() {
+    let n = Node::new();
+    n.volume("v");
+    n.sup.end_fork("v", key("f")).await.unwrap();
+    assert_eq!(
+        n.fake.events(),
+        ["spawn host v", "reconcile", "fork_end f", "eof host v"]
+    );
+    for kind in [RefusalKind::KeyUnknown, RefusalKind::KeyEnded] {
+        n.fake.world.lock().unwrap().fork_refusal = Some(kind);
+        n.sup.end_fork("v", key("f")).await.unwrap();
+    }
+    n.fake.world.lock().unwrap().fork_refusal = Some(RefusalKind::Stopped);
+    assert!(matches!(
+        n.sup.end_fork("v", key("f")).await.unwrap_err(),
+        Error::Unavailable(_)
+    ));
+    assert_eq!(n.fake.hosts(), 4);
+    n.fake.until("eof host v", 4).await;
+}
+
+/// A fork claim's view is on its source volume's host: it makes the
+/// source in use, and is found as its own claim's.
+#[tokio::test(start_paused = true)]
+async fn a_fork_claims_view_puts_its_source_in_use() {
+    let n = Node::new();
+    n.volume("v");
+    let b = n.target("b");
+    let mut view = n.view("f", "v", &b);
+    view.tree = TreeRef::Fork(key("f"));
+    n.sup.publish(view).await.unwrap();
+    assert_eq!(n.sup.in_use("v").await.map(|r| r.handle), Some("f".into()));
+    assert_eq!(
+        n.sup.claim_in_use("v", "f").await.map(|r| r.target),
+        Some(b.clone())
+    );
+    assert_eq!(n.sup.claim_in_use("v", "v").await, None);
 }

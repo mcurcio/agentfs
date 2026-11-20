@@ -24,6 +24,10 @@
 //!   fails is tried again with backoff. These delays are the only timers.
 //! - **Release** (DeleteVolume) starts the volume's host with no view and
 //!   stops it: its exit 0 is Volume's release verdict.
+//! - **Forks** (a fork claim's CreateVolume and DeleteVolume) are created
+//!   and ended by key on the source volume's host, started for the call
+//!   when none runs and stopped after it when no view of the volume is
+//!   open. A fork claim's view is published on that same host.
 //! - **Reconcile**, at plugin start, drops the records whose target is
 //!   gone, starts a host per volume that still has views, and names the
 //!   recording-format volumes it never serves.
@@ -41,9 +45,11 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use agentfs_contracts::host::{Refusal, RefusalKind, Reply, Request, TreeRef, ViewRequest};
-use agentfs_contracts::name::ClientLabel;
+use agentfs_contracts::name::{ClientLabel, ForkKey};
 use agentfs_contracts::pod::PodContext;
 use agentfs_contracts::ports::Found;
+use agentfs_contracts::tree::TreeId;
+use agentfs_contracts::trees::ForkSettings;
 use agentfs_core::operator_settings::{RuleFiles, install_rules};
 use agentfs_core::tree_actor;
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard, watch};
@@ -200,6 +206,25 @@ fn refused(refusal: Refusal) -> Error {
         RefusalKind::NestedNotBuilt | RefusalKind::ApprovalNotBuilt => {
             Error::InvalidArgument(message)
         }
+    }
+}
+
+/// The error a host's refusal of a view's open is to the CO: a fork
+/// claim's fork that has had its writer or has ended is named by its claim.
+fn open_refused(view: &ViewSpec, refusal: Refusal) -> Error {
+    let TreeRef::Fork(_) = view.tree else {
+        return refused(refusal);
+    };
+    let handle = &view.handle;
+    match refusal.kind {
+        RefusalKind::ForkTaken => Error::FailedPrecondition(format!(
+            "the fork of claim {handle} has had its writer: a fork claim serves one pod \
+             (docs/csi.md)"
+        )),
+        RefusalKind::KeyUnknown | RefusalKind::KeyEnded => {
+            Error::FailedPrecondition(format!("the fork of claim {handle} has ended"))
+        }
+        _ => refused(refusal),
     }
 }
 
@@ -669,7 +694,7 @@ impl Supervisor {
                 );
                 Ok(())
             }
-            Ok(Reply::Refused(refusal)) => Err(refused(refusal)),
+            Ok(Reply::Refused(refusal)) => Err(open_refused(view, refusal)),
             Ok(other) => Err(Error::Internal(format!(
                 "the host of volume {} answered an open with {other:?}",
                 view.volume
@@ -723,6 +748,83 @@ impl Supervisor {
     pub async fn in_use(&self, volume: &str) -> Option<PublishedRecord> {
         let _lock = self.lock_volume(volume).await;
         self.records_of(volume).into_iter().next()
+    }
+
+    /// The published record of the claim `handle`, whose view is on
+    /// `volume`'s host, if any.
+    pub async fn claim_in_use(&self, volume: &str, handle: &str) -> Option<PublishedRecord> {
+        let _lock = self.lock_volume(volume).await;
+        self.records_of(volume)
+            .into_iter()
+            .find(|r| r.handle == handle)
+    }
+
+    /// One call on the volume's host, started for it when none runs (its
+    /// recorded views replayed) and stopped after it when no view is open.
+    async fn call_on_host(
+        self: &Arc<Self>,
+        volume: &str,
+        request: Request,
+    ) -> Result<Reply, Error> {
+        let _lock = self.lock_volume(volume).await;
+        let client = match self.client(volume) {
+            Some(client) => Ok(client),
+            None => self.start_host(volume, true, None).await.map(|s| s.client),
+        };
+        let reply = match client {
+            Ok(client) => client
+                .call(request)
+                .await
+                .map_err(|HostGone| self.gone(volume)),
+            Err(e) => Err(e),
+        };
+        self.stop_if_idle(volume).await;
+        reply
+    }
+
+    /// On the volume's host, started for the call if none runs and stopped
+    /// after it if no view is open: the open fork under `key`, or a new
+    /// fork of `upstream` under it.
+    pub async fn create_fork(
+        self: &Arc<Self>,
+        volume: &str,
+        upstream: TreeRef,
+        key: ForkKey,
+        settings: ForkSettings,
+    ) -> Result<TreeId, Error> {
+        let request = Request::ForkCreate {
+            upstream,
+            key,
+            settings,
+        };
+        match self.call_on_host(volume, request).await? {
+            Reply::Forked { tree } => Ok(tree),
+            Reply::Refused(Refusal {
+                kind: RefusalKind::KeyEnded,
+                message,
+            }) => Err(Error::AlreadyExists(message)),
+            Reply::Refused(refusal) => Err(refused(refusal)),
+            other => Err(Error::Internal(format!(
+                "the host of volume {volume} answered a fork create with {other:?}"
+            ))),
+        }
+    }
+
+    /// Ends the fork under `key` on the volume's host, started for the call
+    /// if none runs and stopped after it if no view is open. Ended, or no
+    /// fork under the key, are both Ok (idempotent DeleteVolume).
+    pub async fn end_fork(self: &Arc<Self>, volume: &str, key: ForkKey) -> Result<(), Error> {
+        match self.call_on_host(volume, Request::ForkEnd { key }).await? {
+            Reply::Ended
+            | Reply::Refused(Refusal {
+                kind: RefusalKind::KeyUnknown | RefusalKind::KeyEnded,
+                ..
+            }) => Ok(()),
+            Reply::Refused(refusal) => Err(refused(refusal)),
+            other => Err(Error::Internal(format!(
+                "the host of volume {volume} answered a fork end with {other:?}"
+            ))),
+        }
     }
 
     /// Starts the volume's host and stops it: Ok once it exits 0 (Volume
@@ -898,6 +1000,45 @@ mod tests {
             next_backoff(Some(cfg.max), cfg.reset_after, &cfg),
             cfg.initial,
             "a long run resets it"
+        );
+    }
+
+    #[test]
+    fn a_fork_claims_refused_open_names_its_claim() {
+        let view = |tree| ViewSpec {
+            handle: "f".into(),
+            volume: "v".into(),
+            tree,
+            target: "/t".into(),
+            read_only: false,
+            pod: PodContext::default(),
+        };
+        let refusal = |kind| Refusal {
+            kind,
+            message: "m".into(),
+        };
+        let fork = view(TreeRef::Fork(ForkKey::parse("f").unwrap()));
+        assert_eq!(
+            open_refused(&fork, refusal(RefusalKind::ForkTaken)),
+            Error::FailedPrecondition(
+                "the fork of claim f has had its writer: a fork claim serves one pod \
+                 (docs/csi.md)"
+                    .into()
+            )
+        );
+        for kind in [RefusalKind::KeyUnknown, RefusalKind::KeyEnded] {
+            assert_eq!(
+                open_refused(&fork, refusal(kind)),
+                Error::FailedPrecondition("the fork of claim f has ended".into())
+            );
+        }
+        assert_eq!(
+            open_refused(&fork, refusal(RefusalKind::Draining)),
+            Error::Unavailable("m".into())
+        );
+        assert_eq!(
+            open_refused(&view(TreeRef::Root), refusal(RefusalKind::KeyEnded)),
+            Error::FailedPrecondition("m".into())
         );
     }
 

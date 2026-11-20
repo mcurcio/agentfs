@@ -6,12 +6,18 @@
 //!   with `agentfs init` (Volume's ensure), which the request's
 //!   accessibility requirements must include (`RESOURCE_EXHAUSTED`
 //!   otherwise), installs the profile's rule files, writes `csi.json`, and
-//!   answers with this node's topology. Clones go only into fork classes,
-//!   and fork claims are not built yet.
-//! - DeleteVolume refuses a volume in use on this node, drains the volume
-//!   through its host (Volume releases it) and keeps the directory,
-//!   renaming `csi.json` to `csi.retained.json`: deleting a volume is not
-//!   built. A recording-format volume is never served or deleted:
+//!   answers with this node's topology. Clones go only into fork classes.
+//! - CreateVolume of a fork class makes a fork claim: a keyed fork, under
+//!   the claim's handle, of its `dataSource` claim's tree, made by Trees on
+//!   the source volume's host on this node. It writes only `csi.json`
+//!   (`ClaimKind::Fork`). A fork of a fork claim and `landing: approval`
+//!   are refused by Trees (`INVALID_ARGUMENT`).
+//! - DeleteVolume refuses a volume in use on this node (any claim's view
+//!   on its host, a fork claim's included), drains the volume through its
+//!   host (Volume releases it) and keeps the directory, renaming
+//!   `csi.json` to `csi.retained.json`: deleting a volume is not built. A
+//!   fork claim's DeleteVolume ends its fork by key and removes its
+//!   directory. A recording-format volume is never served or deleted:
 //!   `FAILED_PRECONDITION`, naming the directory and the moving runbook.
 //! - ControllerPublish and ControllerUnpublish are `UNIMPLEMENTED`: there
 //!   is no attach step (`attachRequired: false`); the PV's node affinity
@@ -22,6 +28,8 @@
 use std::fs;
 use std::sync::Arc;
 
+use agentfs_contracts::host::TreeRef;
+use agentfs_contracts::name::ForkKey;
 use agentfs_contracts::ports::Found;
 use agentfs_core::tree_actor;
 use tokio::sync::Mutex;
@@ -41,13 +49,10 @@ use crate::csi::v1::{
 use crate::error::Error;
 use crate::identity::TOPOLOGY_KEY;
 use crate::layout::{Layout, validate_handle};
-use crate::params::{ParamError, VolumeParams, is_fork_class};
+use crate::params::{ForkClass, ParamError, VolumeParams, is_fork_class};
 use crate::records::{self, ClaimKind, ClaimRecord, RECORD_VERSION};
 use crate::supervisor::Supervisor;
 use crate::volume;
-
-/// What fork claims are told until they are built.
-pub const FORKS_NOT_BUILT: &str = "fork claims are not built yet";
 
 #[derive(Clone)]
 pub struct ControllerService {
@@ -154,6 +159,23 @@ fn check_accessible(req: &CreateVolumeRequest, node_id: &str) -> Result<(), Erro
     )))
 }
 
+/// What a fork class without a `dataSource` is told.
+pub const FORK_NEEDS_SOURCE: &str = "a fork class needs a dataSource claim";
+
+/// The fork claim's key: its handle.
+fn fork_key(handle: &str) -> Result<ForkKey, Error> {
+    ForkKey::parse(handle).map_err(|e| Error::InvalidArgument(e.to_string()))
+}
+
+/// What a claim with a recording-format volume of its name is told.
+fn recording_format_exists(layout: &Layout, handle: &str) -> Error {
+    Error::AlreadyExists(format!(
+        "volume {handle}: a recording-format volume is here ({}); move it with \
+         docs/runbooks/moving.md",
+        layout.volume_dir(handle).display()
+    ))
+}
+
 impl ControllerService {
     async fn create_volume(
         &self,
@@ -166,8 +188,8 @@ impl ControllerService {
         validate_handle(handle).map_err(|e| Error::InvalidArgument(e.to_string()))?;
         volume::check_capabilities(&req.volume_capabilities)?;
         let fork_class = is_fork_class(&req.parameters);
-        match req.volume_content_source.as_ref().map(|s| &s.r#type) {
-            None => {}
+        let source = match req.volume_content_source.as_ref().map(|s| &s.r#type) {
+            None => None,
             Some(Some(volume_content_source::Type::Snapshot(_))) => {
                 return Err(Error::InvalidArgument("snapshots are not supported".into()));
             }
@@ -176,15 +198,16 @@ impl ControllerService {
                     "cloning needs a fork class (fork: \"true\")".into(),
                 ));
             }
-            Some(Some(volume_content_source::Type::Volume(_))) => {}
+            Some(Some(volume_content_source::Type::Volume(v))) => Some(v.volume_id.as_str()),
             Some(None) => {
                 return Err(Error::InvalidArgument(
                     "the volume content source names no volume".into(),
                 ));
             }
-        }
+        };
         if fork_class {
-            return Err(Error::InvalidArgument(FORKS_NOT_BUILT.into()));
+            let source = source.ok_or_else(|| Error::InvalidArgument(FORK_NEEDS_SOURCE.into()))?;
+            return self.create_fork(req, source).await;
         }
         let invalid = |e: ParamError| Error::InvalidArgument(e.to_string());
         let params = VolumeParams::from_create(handle, &req.parameters).map_err(invalid)?;
@@ -206,25 +229,9 @@ impl ControllerService {
         };
         // The state first: a recording driver's csi.json is no claim record.
         if inspect(layout, handle)? == Found::Other {
-            return Err(Error::AlreadyExists(format!(
-                "volume {handle}: a recording-format volume is here ({}); move it with \
-                 docs/runbooks/moving.md",
-                layout.volume_dir(handle).display()
-            )));
+            return Err(recording_format_exists(layout, handle));
         }
-        if let Some(existing) = records::load_claim(layout, handle)? {
-            if existing.capacity_bytes != capacity_bytes {
-                return Err(Error::AlreadyExists(format!(
-                    "volume {handle} exists with capacity {} bytes, not {capacity_bytes}",
-                    existing.capacity_bytes
-                )));
-            }
-            if existing.claim != claim {
-                return Err(Error::AlreadyExists(format!(
-                    "volume {handle} exists with other parameters ({:?})",
-                    existing.claim
-                )));
-            }
+        if existing(layout, handle, capacity_bytes, &claim)? {
             return Ok(response(capacity_bytes));
         }
         self.supervisor.ensure(handle, &params).await?;
@@ -244,6 +251,73 @@ impl ControllerService {
         Ok(response(capacity_bytes))
     }
 
+    /// CreateVolume of a fork class with the source claim `source`: a keyed
+    /// fork of the source's tree under the claim's handle, made on the
+    /// source volume's host.
+    async fn create_fork(
+        &self,
+        req: &CreateVolumeRequest,
+        source: &str,
+    ) -> Result<CreateVolumeResponse, Error> {
+        let layout = self.layout.as_ref();
+        let node_id = &*self.node_id;
+        let handle = req.name.as_str();
+        let invalid = |e: ParamError| Error::InvalidArgument(e.to_string());
+        let class = ForkClass::from_create(&req.parameters).map_err(invalid)?;
+        let capacity_bytes = capacity(req)?;
+        check_accessible(req, node_id)?;
+        validate_handle(source).map_err(|e| Error::InvalidArgument(e.to_string()))?;
+        if inspect(layout, source)? == Found::Other {
+            return Err(recording_format(layout, source));
+        }
+        let Some(source_record) = records::load_claim(layout, source)? else {
+            return Err(Error::FailedPrecondition(format!(
+                "source volume {source} is not on node {node_id}: a fork claim is made on its \
+                 source's node (give its pod affinity to the source's pods)"
+            )));
+        };
+        // The source's tree: a volume's root, or a fork claim's fork (which
+        // Trees refuses: forks of forks are not built).
+        let (volume, upstream) = match source_record.claim {
+            ClaimKind::Volume { .. } => (source.to_owned(), TreeRef::Root),
+            ClaimKind::Fork { source: dir } => (dir, TreeRef::Fork(fork_key(source)?)),
+        };
+        let key = fork_key(handle)?;
+        let claim = ClaimKind::Fork {
+            source: volume.clone(),
+        };
+        let response = || CreateVolumeResponse {
+            volume: Some(Volume {
+                capacity_bytes,
+                volume_id: handle.to_owned(),
+                volume_context: [("source".to_owned(), volume.clone())].into(),
+                content_source: req.volume_content_source.clone(),
+                accessible_topology: vec![topology(node_id)],
+            }),
+        };
+        if inspect(layout, handle)? == Found::Other {
+            return Err(recording_format_exists(layout, handle));
+        }
+        if existing(layout, handle, capacity_bytes, &claim)? {
+            return Ok(response());
+        }
+        let tree = self
+            .supervisor
+            .create_fork(&volume, upstream, key, class.settings)
+            .await?;
+        records::store_claim(
+            layout,
+            handle,
+            &ClaimRecord {
+                v: RECORD_VERSION,
+                capacity_bytes,
+                claim,
+            },
+        )?;
+        eprintln!("created fork {tree} of volume {volume} for claim {handle}");
+        Ok(response())
+    }
+
     async fn delete_volume(&self, req: &DeleteVolumeRequest) -> Result<(), Error> {
         let layout = self.layout.as_ref();
         required(&req.volume_id, "the volume id")?;
@@ -261,14 +335,31 @@ impl ControllerService {
             return Ok(());
         };
         match record.claim {
-            ClaimKind::Fork { .. } => Err(Error::Internal(FORKS_NOT_BUILT.into())),
+            ClaimKind::Fork { source } => {
+                if let Some(published) = self.supervisor.claim_in_use(&source, handle).await {
+                    return Err(in_use(handle, &published));
+                }
+                // A source whose state is gone has taken its forks with it.
+                match inspect(layout, &source)? {
+                    Found::Volume(_) => {
+                        self.supervisor.end_fork(&source, fork_key(handle)?).await?
+                    }
+                    Found::Nothing => {}
+                    Found::Other => return Err(recording_format(layout, &source)),
+                }
+                let dir = layout.volume_dir(handle);
+                match fs::remove_dir_all(&dir) {
+                    Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                        return Err(Error::io(format!("removing {}", dir.display()), e));
+                    }
+                    _ => {}
+                }
+                eprintln!("ended fork of claim {handle} in volume {source}");
+                Ok(())
+            }
             ClaimKind::Volume { .. } => {
                 if let Some(published) = self.supervisor.in_use(handle).await {
-                    return Err(Error::FailedPrecondition(format!(
-                        "volume {handle} is in use on this node (published at {}); nothing \
-                         deleted",
-                        published.target.display()
-                    )));
+                    return Err(in_use(handle, &published));
                 }
                 let dir = layout.volume_dir(handle);
                 if found == Found::Nothing {
@@ -288,6 +379,40 @@ impl ControllerService {
             }
         }
     }
+}
+
+/// What DeleteVolume of a claim in use is told.
+fn in_use(handle: &str, published: &records::PublishedRecord) -> Error {
+    Error::FailedPrecondition(format!(
+        "volume {handle} is in use on this node (published at {}); nothing deleted",
+        published.target.display()
+    ))
+}
+
+/// Whether the claim exists already as asked (CreateVolume is
+/// idempotent); `ALREADY_EXISTS` when it exists otherwise.
+fn existing(
+    layout: &Layout,
+    handle: &str,
+    capacity_bytes: i64,
+    claim: &ClaimKind,
+) -> Result<bool, Error> {
+    let Some(existing) = records::load_claim(layout, handle)? else {
+        return Ok(false);
+    };
+    if existing.capacity_bytes != capacity_bytes {
+        return Err(Error::AlreadyExists(format!(
+            "volume {handle} exists with capacity {} bytes, not {capacity_bytes}",
+            existing.capacity_bytes
+        )));
+    }
+    if existing.claim != *claim {
+        return Err(Error::AlreadyExists(format!(
+            "volume {handle} exists with other parameters ({:?})",
+            existing.claim
+        )));
+    }
+    Ok(true)
 }
 
 /// Renames `csi.json` to `csi.retained.json`: the claim is gone, the
