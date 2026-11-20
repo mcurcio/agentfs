@@ -5,8 +5,9 @@
 //! reconcile, the drain at EOF, a busy volume, the name guard and the
 //! not-built log. With root and /dev/fuse (ignored by default; run by
 //! ci/fuse-tests.sh with sudo): views opened with a pod context, closed,
-//! landed from a fork, rebound and stacked after a kill, and a fork's one
-//! writer.
+//! landed from a fork, rebound and stacked after a kill, a fork's one
+//! writer, and a close held open by a file waiting alone while the requests
+//! that name nothing it holds are answered by id.
 
 use std::io::{BufRead, BufReader, Read as _, Write as _};
 use std::os::fd::OwnedFd;
@@ -16,7 +17,7 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread::JoinHandle;
 
 use agentfs_contracts::host::{
-    HOST_PROTOCOL, Hello, Refusal, RefusalKind, Reply, Request, TreeRef, ViewRequest,
+    Envelope, HOST_PROTOCOL, Hello, Refusal, RefusalKind, Reply, Request, TreeRef, ViewRequest,
 };
 use agentfs_contracts::name::{ClientLabel, ForkKey, Label};
 use agentfs_contracts::pod::PodContext;
@@ -113,6 +114,7 @@ impl Volume {
             reader: BufReader::new(ours.try_clone().unwrap()),
             control: Some(ours),
             log: Some(log),
+            next: 1,
         }
     }
 
@@ -168,6 +170,8 @@ struct Host {
     control: Option<UnixStream>,
     reader: BufReader<UnixStream>,
     log: Option<JoinHandle<String>>,
+    /// The next request's id.
+    next: u64,
 }
 
 impl Host {
@@ -183,19 +187,41 @@ impl Host {
         serde_json::from_str(&line).unwrap()
     }
 
+    /// Sends `request` and reads the next line: its reply.
     fn ask(&mut self, request: &Request) -> Reply {
-        self.send(request);
-        self.reply()
+        let id = self.send(request);
+        self.reply_to(id)
     }
 
-    fn send(&mut self, request: &Request) {
+    /// Sends `request` with the next id, and returns the id.
+    fn send(&mut self, request: &Request) -> u64 {
+        let id = self.next;
+        self.next += 1;
+        self.send_as(id, request);
+        id
+    }
+
+    fn send_as(&mut self, id: u64, request: &Request) {
+        let line = serde_json::to_string(&Envelope {
+            id,
+            body: request.clone(),
+        })
+        .unwrap();
         let control = self.control.as_mut().expect("the channel is open");
-        writeln!(control, "{}", serde_json::to_string(request).unwrap()).unwrap();
+        writeln!(control, "{line}").unwrap();
     }
 
-    fn reply(&mut self) -> Reply {
+    /// The next line: a reply and the id it answers.
+    fn reply(&mut self) -> Envelope<Reply> {
         let line = self.line().expect("the host ended before it replied");
         serde_json::from_str(&line).unwrap()
+    }
+
+    /// The next line, which must answer `id`.
+    fn reply_to(&mut self, id: u64) -> Reply {
+        let reply = self.reply();
+        assert_eq!(reply.id, id, "the next reply answers another request");
+        reply.body
     }
 
     /// Shuts this test's end for writing (EOF; the reader is a clone of
@@ -522,9 +548,9 @@ fn a_view_opens_with_its_pod_and_closes() {
     // A file held open across the close keeps the view's session alive
     // after its mount has left the namespace: `closed` waits for its end.
     let held = std::fs::File::open(a.join("f")).unwrap();
-    host.send(&close(&a));
+    let id = host.send(&close(&a));
     drop(held);
-    assert_eq!(host.reply(), Reply::Closed);
+    assert_eq!(host.reply_to(id), Reply::Closed);
     assert_eq!(mount_state(&a).unwrap(), MountState::NotMounted);
     // `closed` came once the view had ended and its client was detached:
     // the place is free for another view at once.
@@ -809,4 +835,117 @@ fn a_fork_has_one_writer() {
     assert_eq!(mount_state(&b).unwrap(), MountState::NotMounted);
     let (status, log) = host.eof();
     assert_eq!(status.code(), Some(0), "{log}");
+}
+
+/// (o) A file held open keeps fork view a's close pending. Requests that
+/// name nothing a holds are answered by id before it: an open elsewhere,
+/// another view's close, a reconcile. An open at a's mount, the end of a's
+/// fork, and a reconcile behind that open wait, each in arrival order, and
+/// are answered once a has ended and its `closed` is written. Each check is
+/// the next line read: the socket's read timeout only guards a hang.
+#[test]
+#[ignore = "needs root and /dev/fuse: ci/fuse-tests.sh"]
+fn a_held_close_waits_alone() {
+    let Some(v) = Volume::mounted() else { return };
+    let (a, b, c) = (mkdir(&v, "a"), mkdir(&v, "b"), mkdir(&v, "c"));
+    let mut host = v.host(&[]);
+    host.reader
+        .get_ref()
+        .set_read_timeout(Some(std::time::Duration::from_secs(60)))
+        .unwrap();
+    host.hello();
+    forked(&host.ask(&fork_create(TreeRef::Root, "k", Landing::Automatic)));
+    assert!(matches!(
+        host.ask(&open(
+            TreeRef::Fork(key("k")),
+            &a,
+            "a",
+            PodContext::default()
+        )),
+        Reply::Opened { .. }
+    ));
+    assert!(matches!(
+        host.ask(&open(TreeRef::Root, &b, "b", PodContext::default())),
+        Reply::Opened { .. }
+    ));
+    std::fs::write(a.join("f"), "f\n").unwrap();
+    let held = std::fs::File::open(a.join("f")).unwrap();
+    let close_a = host.send(&close(&a));
+    assert!(matches!(
+        host.ask(&open(TreeRef::Root, &c, "c", PodContext::default())),
+        Reply::Opened { .. }
+    ));
+    assert_eq!(host.ask(&close(&b)), Reply::Closed);
+    assert!(matches!(
+        host.ask(&Request::Reconcile),
+        Reply::Reconciled { .. }
+    ));
+    // Each of these names something a holds, or waits behind one that does.
+    let reopen = host.send(&open(TreeRef::Root, &a, "a2", PodContext::default()));
+    let end = host.send(&Request::ForkEnd { key: key("k") });
+    let reconcile = host.send(&Request::Reconcile);
+    assert_eq!(
+        host.ask(&close(&v.p("nowhere"))),
+        Reply::Closed,
+        "answered before every waiting request"
+    );
+    drop(held);
+    assert_eq!(host.reply_to(close_a), Reply::Closed, "a's close first");
+    assert_eq!(
+        host.reply_to(reopen),
+        Reply::Opened {
+            tree: TreeId::Root,
+            stacked: false
+        }
+    );
+    assert_eq!(host.reply_to(end), Reply::Ended);
+    assert!(matches!(host.reply_to(reconcile), Reply::Reconciled { .. }));
+    assert_eq!(host.ask(&close(&a)), Reply::Closed);
+    assert_eq!(host.ask(&close(&c)), Reply::Closed);
+    let (status, log) = host.eof();
+    assert_eq!(status.code(), Some(0), "{log}");
+}
+
+/// (p) An id already in flight is a malformed line: the host stops with
+/// exit 2 (and, with a view open, leaves it stale).
+#[test]
+#[ignore = "needs root and /dev/fuse: ci/fuse-tests.sh"]
+fn a_duplicate_id_in_flight_is_malformed() {
+    let Some(v) = Volume::mounted() else { return };
+    let a = mkdir(&v, "a");
+    let mut host = v.host(&[]);
+    host.hello();
+    assert!(matches!(
+        host.ask(&open(TreeRef::Root, &a, "a", PodContext::default())),
+        Reply::Opened { .. }
+    ));
+    std::fs::write(a.join("f"), "f\n").unwrap();
+    let held = std::fs::File::open(a.join("f")).unwrap();
+    host.send_as(5, &close(&a));
+    host.send_as(5, &Request::Reconcile);
+    assert_eq!(host.line(), None, "no reply: the host stopped");
+    let status = host.child.wait().unwrap();
+    drop(held);
+    let log = host.log.take().unwrap().join().unwrap();
+    assert_eq!(status.code(), Some(2), "{log}");
+    assert!(log.contains("id 5 is already in flight"), "{log}");
+    agentfs_fuse::stale::detach_stale_layers(&a, 4).unwrap();
+}
+
+/// (q) An id may be used again once its reply is written; a missing id is
+/// a malformed line (exit 2).
+#[test]
+fn ids_are_answered_and_a_line_without_one_is_malformed() {
+    let v = Volume::new();
+    let mut host = v.host(&[]);
+    host.hello();
+    for _ in 0..2 {
+        host.send_as(9, &Request::Reconcile);
+        assert_eq!(host.reply_to(9), Reply::Reconciled { ended: 0 });
+    }
+    let control = host.control.as_mut().unwrap();
+    writeln!(control, r#"{{"op":"reconcile"}}"#).unwrap();
+    assert_eq!(host.line(), None);
+    let (status, log) = host.eof();
+    assert_eq!(status.code(), Some(2), "{log}");
 }

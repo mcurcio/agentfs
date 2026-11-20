@@ -14,7 +14,7 @@
 //! committed with the pod's trailers, a second pod is refused, a killed
 //! host comes back with the view live, NodeUnpublish leaves nothing
 //! behind; a fork claim's view runs beside its source's on one host and
-//! lands in it.
+//! lands in it; and a close held open by a file stalls only its own claim.
 
 use std::collections::HashMap;
 use std::fs;
@@ -23,6 +23,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 
+use agentfs_contracts::host::{Envelope, Reply, Request};
 use agentfs_contracts::ports::Found;
 use agentfs_core::tree_actor;
 use agentfs_csi::controller::ControllerService;
@@ -49,8 +50,9 @@ use tonic::transport::{Channel, Endpoint, Uri};
 use tower::service_fn;
 
 /// `AgentfsLauncher`, with every child's start (`spawn <label>`), exit
-/// (`exit <label> <exit>`) and each line a host writes back (`line <label>
-/// <line>`) logged as an event.
+/// (`exit <label> <exit>`), each line a host writes back (`line <label>
+/// <line>`) and each request written to it (`send <label> <request>`)
+/// logged as an event; an envelope is logged as its body.
 struct Tap {
     inner: AgentfsLauncher,
     log: Arc<watch::Sender<Vec<String>>>,
@@ -60,18 +62,25 @@ fn event(log: &watch::Sender<Vec<String>>, event: String) {
     log.send_modify(|l| l.push(event));
 }
 
-/// Copies lines from `from` to `to`, logging each with `tag` when given;
-/// at EOF shuts `to`'s write side, so the other end sees EOF too.
+/// Copies lines from `from` to `to`, logging each with `tag` (`line
+/// <label>` or `send <label>`); at EOF shuts `to`'s write side, so the
+/// other end sees EOF too.
 async fn copy_lines(
     from: OwnedReadHalf,
     mut to: OwnedWriteHalf,
-    tag: Option<(String, Arc<watch::Sender<Vec<String>>>)>,
+    tag: (String, Arc<watch::Sender<Vec<String>>>),
 ) {
     let mut lines = BufReader::new(from).lines();
     while let Ok(Some(line)) = lines.next_line().await {
-        if let Some((label, log)) = &tag {
-            event(log, format!("line {label} {line}"));
-        }
+        let (tag, log) = &tag;
+        let shown = if let Ok(sent) = serde_json::from_str::<Envelope<Request>>(&line) {
+            serde_json::to_string(&sent.body).unwrap()
+        } else if let Ok(reply) = serde_json::from_str::<Envelope<Reply>>(&line) {
+            serde_json::to_string(&reply.body).unwrap()
+        } else {
+            line.clone()
+        };
+        event(log, format!("{tag} {shown}"));
         if to.write_all(format!("{line}\n").as_bytes()).await.is_err() {
             break;
         }
@@ -96,11 +105,15 @@ impl Launcher for Tap {
             let (ours, theirs) = UnixStream::pair()?;
             let (host_read, host_write) = host.into_split();
             let (their_read, their_write) = theirs.into_split();
-            tokio::spawn(copy_lines(their_read, host_write, None));
+            tokio::spawn(copy_lines(
+                their_read,
+                host_write,
+                (format!("send {label}"), self.log.clone()),
+            ));
             tokio::spawn(copy_lines(
                 host_read,
                 their_write,
-                Some((label, self.log.clone())),
+                (format!("line {label}"), self.log.clone()),
             ));
             spawned.control = Some(ours);
         }
@@ -664,6 +677,7 @@ async fn views_at_the_kubelet_target() {
     }
     a_pod_view_at_the_kubelet_target().await;
     a_fork_claims_view_beside_its_source().await;
+    a_held_close_stalls_only_its_claim().await;
 }
 
 fn root_and_fuse() -> bool {
@@ -940,5 +954,76 @@ async fn a_fork_claims_view_beside_its_source() {
     c.delete_volume(delete_claim_req("pvc-2")).await.unwrap();
     c.delete_volume(delete_req()).await.unwrap();
     assert!(d.layout.retained_json("pvc-1").exists());
+    d.stop().await;
+}
+
+/// A file held open in claim A's view keeps A's NodeUnpublish pending (its
+/// close waits for the view's end). Meanwhile a second NodeUnpublish of A
+/// is ABORTED at once, and a NodePublish of claim B, a fork claim on the
+/// same volume and host, completes with its view live. Releasing the file
+/// completes A's NodeUnpublish.
+async fn a_held_close_stalls_only_its_claim() {
+    let d = Driver::start().await;
+    let mut c = d.controller();
+    let source = c
+        .create_volume(create_req(1 << 30))
+        .await
+        .unwrap()
+        .into_inner()
+        .volume
+        .unwrap();
+    let fork = c
+        .create_volume(fork_req("pvc-2", "pvc-1", &[]))
+        .await
+        .unwrap()
+        .into_inner()
+        .volume
+        .unwrap();
+    let (a, b) = (d.target("a"), d.target("b"));
+    let mut n = d.node();
+    n.node_publish_volume(publish_req(&a, pod_info(&source.volume_context)))
+        .await
+        .unwrap();
+    fs::write(a.join("held.md"), "held\n").unwrap();
+    let held = fs::File::open(a.join("held.md")).unwrap();
+    let unpublish = tokio::spawn({
+        let mut n = d.node();
+        let a = a.clone();
+        async move { n.node_unpublish_volume(unpublish_req(&a)).await }
+    });
+    d.until("send host pvc-1 {\"op\":\"close\"", 1).await;
+    let err = n
+        .node_unpublish_volume(unpublish_req(&a))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::Aborted, "{err:?}");
+
+    let mut fork_pod = fork.volume_context.clone();
+    for (k, v) in [
+        ("csi.storage.k8s.io/pod.name", "forker-1"),
+        ("csi.storage.k8s.io/pod.namespace", "apps"),
+        ("csi.storage.k8s.io/pod.uid", "u-3"),
+    ] {
+        fork_pod.insert(k.into(), v.into());
+    }
+    n.node_publish_volume(publish_claim_req("pvc-2", &b, fork_pod))
+        .await
+        .unwrap();
+    assert!(
+        matches!(mount_state(&b).unwrap(), MountState::Live { .. }),
+        "{:?}",
+        d.events()
+    );
+    assert!(!unpublish.is_finished(), "A's close is still pending");
+
+    drop(held);
+    unpublish.await.unwrap().unwrap();
+    assert!(!a.exists(), "the target directory is removed");
+    n.node_unpublish_volume(unpublish_claim_req("pvc-2", &b))
+        .await
+        .unwrap();
+    d.until("exit host pvc-1 exit code 0", 2).await;
+    c.delete_volume(delete_claim_req("pvc-2")).await.unwrap();
+    c.delete_volume(delete_req()).await.unwrap();
     d.stop().await;
 }

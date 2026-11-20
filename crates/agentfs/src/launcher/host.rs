@@ -3,7 +3,12 @@
 //! it and creates and ends keyed forks, over the host's standard input (a
 //! Unix socket only the parent holds the other end of), one JSON object per
 //! line ([`agentfs_contracts::host`]). It boots as `mount` does, then writes
-//! [`Hello`] and answers each request in order. The parent closing its end
+//! [`Hello`] and answers each request by its id: at once, unless a `close`
+//! whose view has not ended holds a resource the request names, or an
+//! earlier waiting request names one of them (per resource, in arrival
+//! order; a `reconcile` also waits for every open before it). A `close` is
+//! answered once its view has ended and its client is detached; then the
+//! waiting requests are looked at again, in order. The parent closing its end
 //! (EOF), SIGTERM or SIGINT stops it: with no view open it drains; with a
 //! view open it exits at once, each view's mount left stale and its client
 //! attached, as a crash leaves them, so the next host rebinds and stacks
@@ -22,7 +27,8 @@ use std::sync::mpsc;
 use agentfs_contracts::caps::{LaunchCap, LaunchScope, Minter};
 use agentfs_contracts::clients::{Access, ClientError, ClientSet};
 use agentfs_contracts::host::{
-    HOST_PROTOCOL, Hello, Refusal, RefusalKind, Reply, Request, TreeRef, ViewRequest,
+    Envelope, HOST_PROTOCOL, Hello, Refusal, RefusalKind, Reply, Request, Resources, TreeRef,
+    ViewRequest,
 };
 use agentfs_contracts::name::{ClientLabel, ForkKey, LauncherId};
 use agentfs_contracts::trees::{ForkPhase, ForkSettings, TreeError};
@@ -58,7 +64,7 @@ pub struct HostArgs {
 
 /// The host's own triggers: each line its parent wrote.
 enum Line {
-    Request(Request),
+    Request(Envelope<Request>),
     Malformed(String),
 }
 
@@ -118,8 +124,8 @@ pub fn host(state: &Path, args: HostArgs, minter: Minter) -> Result<ExitCode> {
     let mut driver = HostDriver {
         control: control.try_clone().context("cloning the control channel")?,
         open: BTreeMap::new(),
-        closing: None,
-        deferred: VecDeque::new(),
+        closing: BTreeMap::new(),
+        waiting: VecDeque::new(),
         stopping: false,
         malformed: false,
     };
@@ -128,7 +134,7 @@ pub fn host(state: &Path, args: HostArgs, minter: Minter) -> Result<ExitCode> {
         volume: volume.name.clone(),
         id: volume.id,
     };
-    driver.write(&mut serving, &hello);
+    driver.write_line(&mut serving, &hello);
     read_requests(control, sender)?;
     serving.run(&mut driver);
     if serving.left() {
@@ -163,7 +169,7 @@ fn read_requests(control: UnixStream, sender: mpsc::Sender<Trigger<Line>>) -> Re
         .spawn(move || {
             for line in BufReader::new(control).lines() {
                 let Ok(line) = line else { break };
-                let (trigger, last) = match serde_json::from_str::<Request>(&line) {
+                let (trigger, last) = match serde_json::from_str::<Envelope<Request>>(&line) {
                     Ok(request) => (Line::Request(request), false),
                     Err(e) => (Line::Malformed(e.to_string()), true),
                 };
@@ -184,16 +190,28 @@ struct OpenView {
     tree: TreeId,
     label: ClientLabel,
     access: Access,
+    /// Its mount, client and keyed fork ([`Resources::of_view`] of the
+    /// request that opened it): what it holds while its close is pending.
+    holds: Resources,
 }
 
-/// The host's part of the shared loop: each request answered in order.
+/// A `close` whose view has not ended.
+struct Closing {
+    id: u64,
+    holds: Resources,
+}
+
+/// The host's part of the shared loop: each request answered by its id.
+/// The ids in flight are those of `closing` and `waiting`: every other
+/// request is answered within the trigger that brought it.
 struct HostDriver {
     control: UnixStream,
     open: BTreeMap<PathBuf, OpenView>,
-    /// The view a `close` waits on: its reply is written once it has ended.
-    closing: Option<ViewId>,
-    /// Requests that came while a `close` waited, answered after it.
-    deferred: VecDeque<Request>,
+    /// Each close whose view has not ended: its request id and what the
+    /// view holds.
+    closing: BTreeMap<ViewId, Closing>,
+    /// Requests waiting on a closing view's resources, in arrival order.
+    waiting: VecDeque<Envelope<Request>>,
     stopping: bool,
     malformed: bool,
 }
@@ -222,21 +240,27 @@ impl Driver<Line> for HostDriver {
 
     fn view_ended(&mut self, serving: &mut Serving<Line>, view: ViewId) {
         self.open.retain(|_, open| open.view != view);
-        if self.closing == Some(view) {
-            self.closing = None;
-            self.write(serving, &Reply::Closed);
-            while self.closing.is_none()
-                && let Some(request) = self.deferred.pop_front()
-            {
-                self.handle(serving, request);
+        if let Some(closing) = self.closing.remove(&view) {
+            self.write(serving, closing.id, Reply::Closed);
+            // Each waiting request again, in arrival order: answered now
+            // unless it still waits.
+            for request in std::mem::take(&mut self.waiting) {
+                self.arrive(serving, request);
             }
         }
     }
 
     fn own(&mut self, serving: &mut Serving<Line>, trigger: Line) {
         match trigger {
-            Line::Request(request) if self.closing.is_some() => self.deferred.push_back(request),
-            Line::Request(request) => self.handle(serving, request),
+            Line::Request(request) if self.in_flight(request.id) => {
+                eprintln!(
+                    "error: host request: id {} is already in flight",
+                    request.id
+                );
+                self.malformed = true;
+                self.stop(serving);
+            }
+            Line::Request(request) => self.arrive(serving, request),
             Line::Malformed(e) => {
                 eprintln!("error: host request: {e}");
                 self.malformed = true;
@@ -247,9 +271,48 @@ impl Driver<Line> for HostDriver {
 }
 
 impl HostDriver {
+    /// Whether a request with `id` is unanswered: its view closing, or it
+    /// waiting.
+    fn in_flight(&self, id: u64) -> bool {
+        self.closing.values().any(|closing| closing.id == id)
+            || self.waiting.iter().any(|request| request.id == id)
+    }
+
+    /// Whether `request` waits: a closing view holds a resource it names,
+    /// or a request already waiting names one (each resource's requests in
+    /// arrival order). A `reconcile` names nothing, but also waits for the
+    /// opens before it: it ends the clients no live view uses, and a
+    /// waiting open is about to bind one.
+    fn waits(&self, request: &Request) -> bool {
+        let names = request.names();
+        self.closing
+            .values()
+            .any(|closing| names.overlaps(&closing.holds))
+            || self.waiting.iter().any(|earlier| {
+                names.overlaps(&earlier.body.names())
+                    || (matches!(request, Request::Reconcile)
+                        && matches!(earlier.body, Request::Open(_)))
+            })
+    }
+
+    /// A request that has arrived, or is looked at again: queued while it
+    /// waits, else answered.
+    fn arrive(&mut self, serving: &mut Serving<Line>, request: Envelope<Request>) {
+        if self.waits(&request.body) {
+            self.waiting.push_back(request);
+        } else {
+            self.handle(serving, request);
+        }
+    }
+
+    /// Writes one reply to the parent, with its request's id.
+    fn write(&mut self, serving: &mut Serving<Line>, id: u64, body: Reply) {
+        self.write_line(serving, &Envelope { id, body });
+    }
+
     /// Writes one line to the parent. A failed write (the parent gone) is a
     /// stop.
-    fn write(&mut self, serving: &mut Serving<Line>, value: &impl serde::Serialize) {
+    fn write_line(&mut self, serving: &mut Serving<Line>, value: &impl serde::Serialize) {
         let written = serde_json::to_string(value)
             .map_err(std::io::Error::from)
             .and_then(|line| writeln!(self.control, "{line}"));
@@ -272,7 +335,8 @@ impl HostDriver {
     }
 
     /// Answers `request`; a `close` of an open view answers once it ends.
-    fn handle(&mut self, serving: &mut Serving<Line>, request: Request) {
+    fn handle(&mut self, serving: &mut Serving<Line>, request: Envelope<Request>) {
+        let Envelope { id, body: request } = request;
         let reply = if self.stopping {
             Some(refused(
                 RefusalKind::Draining,
@@ -287,7 +351,7 @@ impl HostDriver {
         } else {
             match request {
                 Request::Open(request) => Some(self.open(serving, request)),
-                Request::Close { at } => self.close(serving, &at),
+                Request::Close { at } => self.close(serving, id, &at),
                 Request::Reconcile => {
                     let live: ClientSet = serving.views.values().cloned().collect();
                     let ended = serving.domains.reconcile(&live);
@@ -303,7 +367,7 @@ impl HostDriver {
             }
         };
         if let Some(reply) = reply {
-            self.write(serving, &reply);
+            self.write(serving, id, reply);
         }
     }
 
@@ -346,6 +410,7 @@ impl HostDriver {
                 Err(refusal) => return client_refusal(&refusal),
             };
         let client = binding.client.clone();
+        let holds = Resources::of_view(&request.at, &request.label, &request.tree);
         let options = MountOptions {
             allow_other: true,
             over_stale: true,
@@ -359,6 +424,7 @@ impl HostDriver {
                         tree,
                         label: request.label,
                         access,
+                        holds,
                     },
                 );
                 Reply::Opened { tree, stacked }
@@ -377,12 +443,19 @@ impl HostDriver {
     }
 
     /// `close`: an unknown mount point is closed already; an open view's
-    /// reply waits for its end.
-    fn close(&mut self, serving: &mut Serving<Line>, at: &Path) -> Option<Reply> {
+    /// reply, with the request's `id`, waits for its end, and the view's
+    /// resources are held until then.
+    fn close(&mut self, serving: &mut Serving<Line>, id: u64, at: &Path) -> Option<Reply> {
         let Some(open) = self.open.get(at) else {
             return Some(Reply::Closed);
         };
-        self.closing = Some(open.view);
+        self.closing.insert(
+            open.view,
+            Closing {
+                id,
+                holds: open.holds.clone(),
+            },
+        );
         serving.close(open.view);
         None
     }
