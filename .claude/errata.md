@@ -1691,3 +1691,32 @@ M7 residuals (each to become a bead; none blocks M8):
 3. **A Rust test of `agentfs front` on FUSE (F9).** One root-gated test in `crates/agentfs/tests/` mounting `front`
    against `serve-history` through `volume::init_with`, so the front's FUSE path has a local test until M9 deletes
    it. Done when `ci/fuse-tests.sh` runs it.
+
+## 2026-11-20, M8 S1 (`agentfs host`): where the brief was wrong or short
+
+1. **P3's mechanism is wrong.** The brief says replying `closed` before `HostEvent::ViewEnded` fails test (i)
+   "because A is still a mount at the reply". It is not: `ViewHost::close` detaches the mount lazily
+   (`umount2(MNT_DETACH)`), so the mount point leaves the namespace before `close` returns, whatever the reply
+   waits for. What `closed` after `ViewEnded` adds is that the view's files are released and its client detached.
+   Test (i) now holds a file open across the close and then opens another view at the same place, and (l) opens
+   the fork with a new label; under P3 these fail in about two runs of three, not every run. A test that kills P3
+   every time needs an event that says the host has handled the close while a file is still open (the mount table
+   changing, read through `poll` on `/proc/self/mountinfo`); none is in reach without unsafe code or a new
+   dependency.
+2. **`crates/agentfs/Cargo.toml` was not an owned path.** The brief asks for rustix's socket type of stdin, which
+   needs rustix's `net` feature in the binary's crate. S1 turned it on (one line, no new crate, Cargo.lock
+   unchanged).
+3. **Fork numbers are journal event numbers, not 1 and 2.** Test (c) says `Forked{fork 1}` and "the next automatic
+   create gets fork 2". A fork's number is the journal event that made it. Test (c) checks the refused approval
+   wrote nothing by running the same steps, without it, on a second volume and comparing the numbers.
+4. **Test (j)'s landing wait.** launcher_mount.rs has no landing wait to copy. Test (j) uses the drain: Volume
+   releases only with every queue empty, so the host's exit 0 at EOF is the landing's event. It then checks the
+   root's history and reads the file through a new host's view of the root.
+5. **Refusal kinds the frozen page has no row for.** `ClientError::NotDurable`, `TreeError::Io` and
+   `TreeError::NotPermitted` reply `stopped`. `ClientError::NotPermitted`, `UnknownClient` and `NotItsLauncher`
+   reply `mount_failed`. `ClientError::TreeUnknown` replies `key_ended`, and `TreeError::UpstreamUnknown` and
+   `ForkUnknown` reply `key_unknown`. Each refusal's message carries the real error.
+6. **Residual risks for S2.** An open whose mount fails detaches the client it bound, as `mount` does. For a fork's
+   writer that ends the fork's one writer, so a NodePublish retried after a transient mount failure gets
+   `fork_taken`. The include-under-a-view check of the operator settings cannot run at boot because `host` knows no
+   view then; it is not checked at open either.

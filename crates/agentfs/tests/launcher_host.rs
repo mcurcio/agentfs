@@ -184,8 +184,16 @@ impl Host {
     }
 
     fn ask(&mut self, request: &Request) -> Reply {
+        self.send(request);
+        self.reply()
+    }
+
+    fn send(&mut self, request: &Request) {
         let control = self.control.as_mut().expect("the channel is open");
         writeln!(control, "{}", serde_json::to_string(request).unwrap()).unwrap();
+    }
+
+    fn reply(&mut self) -> Reply {
         let line = self.line().expect("the host ended before it replied");
         serde_json::from_str(&line).unwrap()
     }
@@ -470,7 +478,8 @@ fn not_built_settings_are_logged() {
 }
 
 /// (i) A view of the root opened at a directory with a pod context: a live
-/// mount of `agentfs:t`; `close` answers once it is unmounted; the host
+/// mount of `agentfs:t`; `close` answers once the view has ended and its
+/// client is detached, so another view may open there at once; the host
 /// serves on with no view; the commit holding the write names the pod.
 #[test]
 #[ignore = "needs root and /dev/fuse: ci/fuse-tests.sh"]
@@ -503,8 +512,23 @@ fn a_view_opens_with_its_pod_and_closes() {
     let occupied = host.ask(&open(TreeRef::Root, &a, "other", PodContext::default()));
     assert_eq!(kind(&occupied), Some(RefusalKind::Occupied), "{occupied:?}");
     std::fs::write(a.join("f"), "f\n").unwrap();
-    assert_eq!(host.ask(&close(&a)), Reply::Closed);
+    // A file held open across the close keeps the view's session alive
+    // after its mount has left the namespace: `closed` waits for its end.
+    let held = std::fs::File::open(a.join("f")).unwrap();
+    host.send(&close(&a));
+    drop(held);
+    assert_eq!(host.reply(), Reply::Closed);
     assert_eq!(mount_state(&a).unwrap(), MountState::NotMounted);
+    // `closed` came once the view had ended and its client was detached:
+    // the place is free for another view at once.
+    assert_eq!(
+        host.ask(&open(TreeRef::Root, &a, "a2", pod("ns", "p3", "u3"))),
+        Reply::Opened {
+            tree: TreeId::Root,
+            stacked: false
+        }
+    );
+    assert_eq!(host.ask(&close(&a)), Reply::Closed);
     assert_eq!(host.ask(&close(&a)), Reply::Closed, "closed already");
     // The last view gone, the host serves on.
     assert_eq!(
