@@ -3,8 +3,9 @@ name: alerts
 # The example alert rules (deploy/alerts, docs/deployment.md "Alerts"):
 # promtool's checks and unit tests, the PrometheusRule generated from the
 # rules file, and the rules against the real binary's metrics in a real
-# Prometheus (ci/e2e-alerts.sh). Runs when the rules, their scripts or
-# the code that names and exports the metrics change.
+# Prometheus from a tree mount (ci/e2e-alerts.sh). Runs when the rules,
+# their scripts or the code that names, sets and exports the metrics
+# change.
 
 on:
   push:
@@ -16,7 +17,9 @@ on:
       - ci/lib.sh
       - .github/workflows/alerts.yml
       - crates/agentfs-core/src/telemetry.rs
+      - crates/agentfs-core/src/operator_settings.rs
       - crates/agentfs/src/otel.rs
+      - crates/agentfs/src/launcher/**
       - Cargo.lock
   pull_request:
     paths: *paths
@@ -54,6 +57,8 @@ jobs:
       - run: rustup toolchain install # the release rust-toolchain.toml pins
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: ci/install-prometheus.sh "$RUNNER_TEMP/prom"
+      # The tree mount is --no-allow-other: fusermount3 is enough.
+      - run: sudo apt-get update && sudo apt-get install -y fuse3
       - run: cargo build --locked -p agentfs
       - run: ci/e2e-alerts.sh
         env:

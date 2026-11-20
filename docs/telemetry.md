@@ -270,3 +270,13 @@ Example Prometheus alert rules on these metrics, each linking its
 runbook, are in [`deploy/alerts`](../deploy/alerts), as a rules file and a
 `PrometheusRule` ([deployment.md](deployment.md#alerts)); the CSI chart
 installs them with `alerts.enabled=true` ([helm.md](helm.md#3-values)).
+
+One of them, `AgentfsNotBuilt`, is for tree volumes: it warns, at once
+and for as long as the setting stays, while `agentfs_not_built` counts a
+configured operator setting whose capability tree volumes do not build
+yet, labelled by `capability`; it links
+[Operator settings](trees.md#operator-settings). The `alerts` workflow
+causes it from a real tree mount whose settings name a remote. The other
+rules but `AgentfsTelemetryExportFailing` are on the recording engine's
+metrics, which only the CSI driver emits; promtool's unit tests check
+them.
