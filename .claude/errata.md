@@ -1916,3 +1916,61 @@ Also for the re-cut:
 - **E5:** `ci/trees-figures.py` has no `long_history` workload on claude/kind-fermi-vvxywi at abc1ab6. Lane B's harness hasn't landed, so E5 cannot be measured yet.
 - **E2/E4 test hold:** git writes the new packs and deletes the old ones inside one process, so the hold "between git's pack write and delete" needs a test-only git wrapper per git directory. It runs the repack without `-d`, waits on a fifo, then runs the full command. The page should say so.
 - **Killing:** `join` should kill the child's whole process group. Killing only `git repack` leaves its `pack-objects` child running, holding stderr open and writing `.tmp-*` files.
+
+## 2026-11-20, memory-and-stalls run 2: spec errata from the slices
+
+### 2026-11-20, agentfs-ln6.1 (close tracer, landed 1b94d8b): where the page or the code was short
+
+1. **The A1 probe cannot fail.** The page's probe is "digest_since counts record > first instead of >=". It is an equivalent mutant. `first` is the open's own record, which is an Open, AnonymousOpen or Create step with no tail, so no frame ever has record == handle. Measured: with `>` in place, A1 passes at all 63 seeds. A probe that does fail: count every frame as the close's own. A1 then fails at seed 1, step 4. The page should name a probe that can fail.
+
+2. **A pre-existing builder disagreement, not caused by this slice.** History build "Disagrees" fires on some histories with page writes and two opens of one file.
+   - A/B on 1160def (a release of the base tree, an integration test using only the public API): seed 11 fails at record 60 there, as here. With a 3 ms pause before each close, seeds 11, 19 and 26 fail on 1160def. It depends on when the builder's batches run.
+   - Hypothesis, not verified: FileMap::digest decides which pieces are the close's own by `pos.key()` alone, ignoring a piece's `at`. A page-write run's remainder that an earlier save left in the saved map has the same key as the piece this close applies. It then counts as "own" when the saved map is on frames, and as kept when the map was rebased onto the checkout. The actor and the builder rebase at different times, so their digests differ.
+   - A compatible fix would carry each own piece's length, which changes the frozen own_keys/digest signatures. This needs its own bead and the model-verification skill.
+   - A1 therefore does not assert that settle() succeeds. It collects builder failures and prints them with --nocapture. Every close is still checked against the oracle.
+
+3. **`ActorGuard` is not exported from tree_actor/mod.rs**, and that file is not this lane's. session.rs cannot name the type, so SessionGuard holds it boxed as `Box<dyn DerefMut<Target = TreeActor> + 'a>`. That costs one small allocation per FUSE request. The page's field type `actor: ActorGuard<'a>` needs `pub use call_path::ActorGuard` added to tree_actor/mod.rs.
+
+4. **close_frag's 50 ms lock-hold bar is missed because of compaction, not the close.** On a release build, ext4, with `--only close_frag`, actor_lock max_nanos was 136.3 ms and stages.compaction max_nanos was 136.2 ms. The close itself went from 110.4 s to 0.086 s. write_1m's longest hold is compaction too: 834 ms. Section 4.1 does not bound compaction, which copies live frames forward while holding the lock, so this bar will keep warning until a slice does.
+
+5. **write_1m's peak memory got worse: 670 MiB before, 774 MiB after** (bar 256, warns either way). The likely cause is the Large `imbl::OrdMap`: a million appends at the end leave B-tree leaves about half full. This slice removed the call list, which offsets part of it. "Merging sequential write pieces" is listed as deferred on the design page.
+
+6. **The fast path only partly replaces the view path.** When the base did not move and the file has no page writes, CloseWork::decide never takes a CallReader either. So the A4 reader-count probe ("disable the fast path, then a reader is taken") is not caught by a reader count. It is caught by tests/tree_close.rs's lock-hold count, which goes from 1 to 2. Amendment 2's reader-count unit test still checks A6 (no reader for 100,000 calls) and that a moved base takes a reader.
+
+7. **Docs were not updated, because they are not owned paths:**
+   - docs/trees.md ("File maps", the close).
+   - docs/performance.md (the new figures, `--self-test-warn` and step 5).
+   - docs/library/core.md (`Recording::close_with`, ActorGuard, `TreeSession::close`).
+
+   AGENTS.md says docs travel with the code. The memory-and-stalls.md design page also stays for now.
+
+8. **pages_build_image now reads the journal under the lock** to rebuild a file's page-cache image. Each open with calls costs one walk of the segments' frame heads. That replaces walking an in-memory call list, so the first page fill after each save may stall longer than before. Not measured.
+
+### 2026-11-20, agentfs-ln6.5 run 2: the repack beside fast-import breaks Feed::finish (blocking)
+
+The frozen page has the repack task run `git repack --geometric=2 -d` "beside `git fast-import` ... never under the builder's lease and never stopping it". `crates/agentfs-core/src/tree_actor/history/feed.rs::Feed::finish` assumes fast-import is the only writer in `objects/pack`:
+- it lists the directory before and after;
+- it skips only `tmp_*` names;
+- it opens and fsyncs every other new name, and an ENOENT fails the batch.
+
+A concurrent repack's `.tmp-<pid>-pack-<hash>.{pack,idx,rev}` files appear in that difference and are renamed away before the open. The batch then fails with `BuildError::Io(2)`, and `settle()` returns `History(Failed(Io(2)))`.
+
+Measured on wip/agentfs-ln6.5 (f279d6b):
+- A probe that logged instead of failing saw several vanished `.tmp-*` names per 300-batch run.
+- `cargo test -p agentfs-core` fails `tests/tree_actor.rs::append_finishes_a_partial_line_and_close_replays_on_the_current_head` this way.
+- The slice's own E4 failed 2 times in 20 runs.
+
+The same race can also delete fast-import's own new `pack-*` before its fsync: a repack can roll that pack in and delete it before the open. That case was not observed.
+
+Re-cut: add `crates/agentfs-core/src/tree_actor/history/feed.rs` (Feed::finish only) to ln6.5's owned paths, with this rule:
+- Skip `.tmp-*` names: they are a repack's files in flight, not fast-import's.
+- Treat ENOENT on a new `pack-*` name as rolled in by a repack. git renames its new pack into place before it deletes old packs, and `core.fsync=objects,derived-metadata` fsyncs the new pack's contents. The builder's own `objects/pack` directory fsync, which follows, makes the rename durable.
+- Add a test: batches with the real task running, each settled, with no failed batch. (A scratch 300-batch stress shows the failure today.)
+
+The alternative is a mutual-exclusion between a batch's fast-import-to-fsync window and a repack. It needs builder.rs and contradicts "never stopping it".
+
+Also for the re-cut:
+- (1) The page's `child: Arc<Mutex<Option<Child>>>` holds the stop flag too: `Mutex<Slot { child, stopped }>`.
+- (2) The repacker starts in `serve` right after the volume is constructed, not inside `start_history`. A later recovery failure then stops it through Drop.
+- (3) E2's probe "Odb with refresh disabled" cannot be built through git2-rs. libgit2 refreshes the pack list on a miss.
+- (4) A daemon SIGKILL leaves an orphaned repack. Its own process group means nothing kills it. It is harmless: it is cut short or finishes, and keeps every object. PR_SET_PDEATHSIG would end it.
