@@ -2042,3 +2042,33 @@ Suggested re-cut owned paths: add history.rs (init_libgit2 mwindow limits) and t
 2. **Fixed by making the digest a function of the saved length and the close's calls alone** (`FileMap::close_digest`): it lays the calls on a map whose bytes are all "as before" and names each visible piece by file offset, length, record and frame offset. `own_keys` and `FileMap::digest(&own)` are gone. For every history outside this bug the value is unchanged (the quick path's `digest_since` equals it: `digest_since_equals_the_close_digest_of_the_calls`), so journals recorded before replay as before; a journal holding a save of exactly this shape would still fail its check once.
 3. **A1 now fails when a build fails.** `two_opens` panics on a failed `settle()` and settles at the end of each history; seeds 11, 19 and 26 (26 with a 3 ms pause before each close) are named regression tests.
 4. **Not done: page writes in the model's and the conformance generators.** The model has no page cache (MODEL.md "Left out": no `mmap`; VERIFYING.md: "R1.4 mappings: no mmap call"). Adding it is a model extension, not a generator tweak: a new `TreeCalls` call and trace line, R1.4's semantics in the model (the per-page bases a page write diffs against, `saved_through`, which close saves a store, recovery's `calls_for_close`), a mounted replay that drives one exact page write (mmap store plus `msync` on a whole page), and new regression-seed cover and digests. It needs its own bead under the model-verification procedure.
+
+## 2026-11-20, memory-and-stalls run 4: errata
+
+### 2026-11-20 agentfs-ln6.11: invariant 3 contradicts the overlay (implementer stopped)
+
+The frozen page of agentfs-ln6.11 says that if the builder publishes no map of a flagged (tree, object) at that step, the actor keeps serving the bytes the workload saved. The code does the opposite:
+- builder.rs:737 puts the replay into the builder's trees (`t.bytes.insert(open.object, saved_map(map, seq))`). Those trees are handed out by `built_event` (builder.rs:1471).
+- In tree_actor/mod.rs:1599-1619, `on_built` runs `rebuild()`, which calls `saved.rebuilt(built, through)`.
+- tree.rs:740-743 replaces the actor's bytes with the builder's and drops the actor's own changes at or before `through`.
+- tree_actor/mod.rs:772: `start_history` reads every file from its checkout ("Each file reads from its checkout as built"). Invariant 7 leaves the kept frames out of the fold, so nothing restores the saved bytes after a restart.
+
+Result: once the builder passes a flagged step, and after every restart, the workload reads history's replay. Today's fatal `Disagrees` turns into a silent change of a file the workload can see.
+
+Decision needed (amendment 1 of the protocol review, an absolute-requirement question for the owner):
+- (a) Serve the replay, with the cost stated: "the file may silently change to history's bytes".
+- (b) Serve the saved bytes, through a named mechanism that holds across `rebuild()` and `start_history`.
+- Or keep the step fatal for that file only.
+
+Amendments 2-10 of the same review are also open:
+- tests where the replay's bytes differ from the actor's;
+- verify run with the same binary is deterministic, so it confirms the mismatch and then drops the evidence;
+- the notes lock is held across an fsync on compaction's call path;
+- flags should be keyed by (step, commit);
+- the notes ref is a primary record, yet architecture.md, git-model.md and runbook section 5 call the refs a copy;
+- a note that fails to parse blocks the mount;
+- the owner's words are mixed with design choices in OWNER-GUIDANCE.md:150 and the bead;
+- the page has no Costs section;
+- the exit-code contract differs between main.rs's doc and invariant 10.
+
+The page needs a revision and a re-cut before this bead can be built.
