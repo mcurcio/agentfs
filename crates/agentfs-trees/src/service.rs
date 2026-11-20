@@ -12,7 +12,7 @@ use agentfs_contracts::pod::PodContext;
 use agentfs_contracts::ports::{Event, EventSink, ForkStore, StoreError};
 use agentfs_contracts::tree::{ForkId, TreeId};
 use agentfs_contracts::trees::{
-    ForkFacts, ForkLookup, ForkPhase, ForkSettings, TreeError, Trees, TreesEvent,
+    ForkFacts, ForkLookup, ForkPhase, ForkSettings, Landing, TreeError, Trees, TreesEvent,
 };
 
 /// One volume's Trees domain: every fork's row, loaded at boot.
@@ -157,7 +157,8 @@ where
 {
     /// A create is one store step: the branch and its row with
     /// `ForkCreated`, published once the step is durable. Under a key Trees
-    /// holds, the open fork is answered and nothing is written.
+    /// holds, the open fork is answered and nothing is written. Approval
+    /// landing is refused before anything else is asked or written.
     fn create(
         &mut self,
         upstream: TreeId,
@@ -166,6 +167,9 @@ where
         by: &LaunchCap,
         at: &PodContext,
     ) -> Result<ForkId, TreeError> {
+        if settings.landing == Landing::Approval {
+            return Err(TreeError::ApprovalNotBuilt);
+        }
         if let Some(facts) = key.as_ref().and_then(|key| self.keyed(key)) {
             return match facts.phase {
                 ForkPhase::Open => Ok(facts.fork),
@@ -225,7 +229,6 @@ mod tests {
     use agentfs_contracts::caps::Minter;
     use agentfs_contracts::clients::{ClientId, ClientSet, Ordinal};
     use agentfs_contracts::name::{ClientLabel, LauncherId};
-    use agentfs_contracts::trees::Landing;
     use agentfs_contracts::volume::IoKind;
 
     use super::*;
@@ -442,6 +445,33 @@ mod tests {
             restored.create(TreeId::Root, Some(key("pvc-2")), SETTINGS, &cap(), &pod()),
             Ok(other)
         );
+    }
+
+    /// A fork that needs approval is refused before anything is written,
+    /// under a key or not, and takes no fork number: the next create gets the
+    /// number it would have had.
+    #[test]
+    fn approval_is_refused_and_writes_nothing() {
+        let approval = ForkSettings {
+            landing: Landing::Approval,
+        };
+        let mut trees = trees();
+        let one = trees
+            .create(TreeId::Root, Some(key("k1")), SETTINGS, &cap(), &pod())
+            .unwrap();
+        let writes = trees.store.writes;
+        for key in [None, Some(key("k1")), Some(key("k3"))] {
+            assert_eq!(
+                trees.create(TreeId::Root, key, approval, &cap(), &pod()),
+                Err(TreeError::ApprovalNotBuilt)
+            );
+        }
+        assert_eq!(trees.store.writes, writes, "nothing written");
+        assert_eq!(trees.events.0.len(), 1, "one ForkCreated");
+        let two = trees
+            .create(TreeId::Root, None, SETTINGS, &cap(), &pod())
+            .unwrap();
+        assert_eq!(two, ForkId(one.0 + 1), "no fork number consumed");
     }
 
     #[test]

@@ -8,6 +8,7 @@
 pub mod audit;
 pub mod caps;
 pub mod clients;
+pub mod host;
 pub mod name;
 pub mod pod;
 pub mod ports;

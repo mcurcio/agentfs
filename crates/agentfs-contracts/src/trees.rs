@@ -17,6 +17,9 @@ pub enum Landing {
     /// The default and the only landing M1 builds (the owner, 2026-11-12: "The
     /// default should be automated landing"); approvals arrive with their slice.
     Automatic,
+    /// A change waits for an approval before it lands. Not built: `Trees::create` refuses it
+    /// (`TreeError::ApprovalNotBuilt`) before anything is written, so no row holds it.
+    Approval,
 }
 
 /// A fork's settings, given at create and kept with its row.
@@ -54,6 +57,9 @@ pub enum TreeError {
     /// A fork as upstream: nested forks are deferred.
     #[error("forks of forks are not built")]
     NestedNotBuilt,
+    /// `create` with settings that need an approval.
+    #[error("landing approvals are not built: a fork that needs approval cannot be created yet")]
+    ApprovalNotBuilt,
     /// A fork launcher ending another launcher's fork.
     #[error("not this launcher's fork")]
     NotPermitted,
@@ -105,8 +111,10 @@ pub trait Trees: ForkLookup {
     ///
     /// # Errors
     ///
-    /// `UpstreamUnknown`; `NestedNotBuilt` for a fork upstream; `Ended` for a
-    /// key whose fork has ended; `Io`, `Stopped`.
+    /// `ApprovalNotBuilt` for `Landing::Approval`, checked first: nothing is
+    /// written and no fork number is taken. `UpstreamUnknown`;
+    /// `NestedNotBuilt` for a fork upstream; `Ended` for a key whose fork has
+    /// ended; `Io`, `Stopped`.
     fn create(
         &mut self,
         upstream: TreeId,
