@@ -7,11 +7,14 @@
 //! Without root: CreateVolume makes a tree volume with the templated name,
 //! the profile included and its rules installed; DeleteVolume drains it
 //! through a host (no view, so no FUSE) and keeps it; a recording-format
-//! volume is refused. With root and /dev/fuse (ignored by default; run by
-//! ci/fuse-tests.sh with sudo): NodePublish mounts a view at the target,
-//! a write is committed with the pod's trailers, a second pod is refused,
-//! a killed host comes back with the view live, NodeUnpublish leaves
-//! nothing behind.
+//! volume is refused; a fork claim is a keyed fork in its source's volume,
+//! approvals and forks of forks are refused, and DeleteVolume ends it.
+//! With root and /dev/fuse (ignored by default; run by ci/fuse-tests.sh
+//! with sudo): NodePublish mounts a view at the target, a write is
+//! committed with the pod's trailers, a second pod is refused, a killed
+//! host comes back with the view live, NodeUnpublish leaves nothing
+//! behind; a fork claim's view runs beside its source's on one host and
+//! lands in it.
 
 use std::collections::HashMap;
 use std::fs;
@@ -204,6 +207,9 @@ impl Driver {
             .unwrap();
     }
 
+    /// The events so far that start with `prefix`. A child's exit is
+    /// logged from the tap's own task, after the supervisor has seen it:
+    /// wait for it with [`Driver::until`] before counting it.
     fn count(&self, prefix: &str) -> usize {
         self.events()
             .iter()
@@ -261,9 +267,49 @@ fn create_req(capacity: i64) -> CreateVolumeRequest {
     }
 }
 
+/// CreateVolume of the fork claim `name` of the claim `source`, with the
+/// fork class's `extra` parameters.
+fn fork_req(name: &str, source: &str, extra: &[(&str, &str)]) -> CreateVolumeRequest {
+    let mut parameters: HashMap<String, String> = [
+        ("fork", "true"),
+        ("csi.storage.k8s.io/pvc/name", "fork"),
+        ("csi.storage.k8s.io/pvc/namespace", "apps"),
+        ("csi.storage.k8s.io/pv/name", name),
+    ]
+    .iter()
+    .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+    .collect();
+    parameters.extend(
+        extra
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned())),
+    );
+    CreateVolumeRequest {
+        name: name.into(),
+        volume_capabilities: vec![mount_cap()],
+        parameters,
+        volume_content_source: Some(VolumeContentSource {
+            r#type: Some(volume_content_source::Type::Volume(
+                volume_content_source::VolumeSource {
+                    volume_id: source.into(),
+                },
+            )),
+        }),
+        ..Default::default()
+    }
+}
+
 fn publish_req(target: &Path, context: HashMap<String, String>) -> NodePublishVolumeRequest {
+    publish_claim_req("pvc-1", target, context)
+}
+
+fn publish_claim_req(
+    claim: &str,
+    target: &Path,
+    context: HashMap<String, String>,
+) -> NodePublishVolumeRequest {
     NodePublishVolumeRequest {
-        volume_id: "pvc-1".into(),
+        volume_id: claim.into(),
         target_path: target.to_str().unwrap().into(),
         volume_capability: Some(mount_cap()),
         volume_context: context,
@@ -272,17 +318,47 @@ fn publish_req(target: &Path, context: HashMap<String, String>) -> NodePublishVo
 }
 
 fn unpublish_req(target: &Path) -> NodeUnpublishVolumeRequest {
+    unpublish_claim_req("pvc-1", target)
+}
+
+fn unpublish_claim_req(claim: &str, target: &Path) -> NodeUnpublishVolumeRequest {
     NodeUnpublishVolumeRequest {
-        volume_id: "pvc-1".into(),
+        volume_id: claim.into(),
         target_path: target.to_str().unwrap().into(),
     }
 }
 
 fn delete_req() -> DeleteVolumeRequest {
+    delete_claim_req("pvc-1")
+}
+
+fn delete_claim_req(claim: &str) -> DeleteVolumeRequest {
     DeleteVolumeRequest {
-        volume_id: "pvc-1".into(),
+        volume_id: claim.into(),
         ..Default::default()
     }
+}
+
+/// The trees the source's hosts answered fork creates with, in order
+/// (`fork/<n>`).
+fn forked_trees(d: &Driver) -> Vec<String> {
+    let prefix = "line host pvc-1 {\"forked\":{\"tree\":\"";
+    d.events()
+        .iter()
+        .filter_map(|e| e.strip_prefix(prefix)?.split('"').next().map(str::to_owned))
+        .collect()
+}
+
+/// The refs of the volume's history under `prefix`.
+fn refs(state: &Path, prefix: &str) -> Vec<String> {
+    let out = Command::new("git")
+        .arg("--git-dir")
+        .arg(state.join("history.git"))
+        .args(["for-each-ref", "--format=%(refname)", prefix])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    text(&out.stdout).lines().map(str::to_owned).collect()
 }
 
 /// The volume context the kubelet sends with `podInfoOnMount`.
@@ -399,6 +475,7 @@ async fn create_volume_makes_a_tree_volume_and_delete_keeps_it() {
     fs::write(d.layout.profiles.join("p.exclude"), "*.log\n").unwrap();
     c.delete_volume(delete_req()).await.unwrap();
     assert_eq!(d.count("spawn host pvc-1"), 1, "{:?}", d.events());
+    d.until("exit host pvc-1 exit code 0", 1).await;
     assert_eq!(
         d.count("exit host pvc-1 exit code 0"),
         1,
@@ -415,6 +492,124 @@ async fn create_volume_makes_a_tree_volume_and_delete_keeps_it() {
     // Gone already: done.
     c.delete_volume(delete_req()).await.unwrap();
     assert_eq!(d.count("spawn host pvc-1"), 1);
+    d.stop().await;
+}
+
+/// A fork claim is a keyed fork, under its handle, in its source's volume,
+/// made on a host started for the call and stopped after it; a repeat
+/// answers the same; DeleteVolume ends the fork by key, removes the
+/// claim's directory, and is idempotent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fork_claim_is_a_keyed_fork_and_delete_ends_it() {
+    let d = Driver::start().await;
+    let mut c = d.controller();
+    c.create_volume(create_req(1 << 30)).await.unwrap();
+    let state = d.layout.state("pvc-1");
+    let req = fork_req(
+        "pvc-2",
+        "pvc-1",
+        &[("landing", "automatic"), ("link", "linked")],
+    );
+    let created = c
+        .create_volume(req.clone())
+        .await
+        .unwrap()
+        .into_inner()
+        .volume
+        .unwrap();
+    assert_eq!(created.volume_id, "pvc-2");
+    assert_eq!(
+        created.volume_context,
+        HashMap::from([("source".to_owned(), "pvc-1".to_owned())])
+    );
+    assert_eq!(created.content_source, req.volume_content_source);
+    let trees = forked_trees(&d);
+    assert_eq!(trees.len(), 1, "{:?}", d.events());
+    let fork_ref = format!("refs/agentfs/trees/{}", trees[0]);
+    assert_eq!(refs(&state, &fork_ref), vec![fork_ref.clone()]);
+    assert_eq!(d.count("spawn host pvc-1"), 1);
+    d.until("exit host pvc-1 exit code 0", 1).await;
+    assert_eq!(
+        d.count("exit host pvc-1 exit code 0"),
+        1,
+        "the host started for the call stopped after it: {:?}",
+        d.events()
+    );
+    let record = fs::read_to_string(d.layout.csi_json("pvc-2")).unwrap();
+    assert!(record.contains("\"kind\": \"fork\""), "{record}");
+    assert!(record.contains("\"source\": \"pvc-1\""), "{record}");
+    assert!(
+        !d.layout.state("pvc-2").exists(),
+        "a fork claim has no state"
+    );
+
+    // Idempotent: the same answer, no host.
+    let again = c
+        .create_volume(req.clone())
+        .await
+        .unwrap()
+        .into_inner()
+        .volume
+        .unwrap();
+    assert_eq!(again, created);
+    assert_eq!(d.count("spawn host pvc-1"), 1);
+
+    c.delete_volume(delete_claim_req("pvc-2")).await.unwrap();
+    assert!(!d.layout.volume_dir("pvc-2").exists());
+    assert_eq!(d.count("spawn host pvc-1"), 2);
+    d.until("exit host pvc-1 exit code 0", 2).await;
+    assert_eq!(d.count("exit host pvc-1 exit code 0"), 2);
+    c.delete_volume(delete_claim_req("pvc-2")).await.unwrap();
+    assert_eq!(d.count("spawn host pvc-1"), 2, "gone already: no host");
+    // The fork ended in the store: its key is not made again.
+    let err = c.create_volume(req).await.unwrap_err();
+    assert_eq!(err.code(), Code::AlreadyExists, "{err:?}");
+    assert!(err.message().contains("ended"), "{}", err.message());
+    assert!(!d.layout.csi_json("pvc-2").exists());
+    d.stop().await;
+}
+
+/// Trees refuses a fork claim that needs approval, writing nothing, and a
+/// fork of a fork claim; each is INVALID_ARGUMENT with Trees' words.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn approvals_and_forks_of_forks_are_refused_by_trees() {
+    let d = Driver::start().await;
+    let mut c = d.controller();
+    c.create_volume(create_req(1 << 30)).await.unwrap();
+    let state = d.layout.state("pvc-1");
+    let before = refs(&state, "refs/agentfs/trees/");
+    let err = c
+        .create_volume(fork_req("pvc-2", "pvc-1", &[("landing", "approval")]))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::InvalidArgument, "{err:?}");
+    assert!(
+        err.message().contains("landing approvals are not built"),
+        "{}",
+        err.message()
+    );
+    assert!(!d.layout.csi_json("pvc-2").exists());
+    assert_eq!(refs(&state, "refs/agentfs/trees/"), before, "no fork made");
+    assert!(forked_trees(&d).is_empty(), "{:?}", d.events());
+
+    c.create_volume(fork_req("pvc-3", "pvc-1", &[]))
+        .await
+        .unwrap();
+    assert_eq!(forked_trees(&d).len(), 1, "{:?}", d.events());
+    assert_eq!(refs(&state, "refs/agentfs/trees/").len(), before.len() + 1);
+
+    let err = c
+        .create_volume(fork_req("pvc-4", "pvc-3", &[]))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::InvalidArgument, "{err:?}");
+    assert!(
+        err.message().contains("forks of forks are not built"),
+        "{}",
+        err.message()
+    );
+    assert!(!d.layout.csi_json("pvc-4").exists());
+    assert_eq!(forked_trees(&d).len(), 1);
     d.stop().await;
 }
 
@@ -539,6 +734,7 @@ async fn a_pod_view_at_the_kubelet_target() {
         0,
         "no agentfs mount is left"
     );
+    d.until("exit host pvc-1 exit code 0", 1).await;
     assert_eq!(
         d.count("exit host pvc-1 exit code 0"),
         1,
@@ -555,7 +751,124 @@ async fn a_pod_view_at_the_kubelet_target() {
 
     d.controller().delete_volume(delete_req()).await.unwrap();
     assert!(d.layout.retained_json("pvc-1").exists());
+    d.until("exit host pvc-1 exit code 0", 2).await;
     assert_eq!(d.count("exit host pvc-1 exit code 0"), 2);
     let _ = &d.dir;
+    d.stop().await;
+}
+
+/// A fork claim's pod beside its source's, on one host: its write lands in
+/// the root with its own pod; one pod per fork claim; the source is in use
+/// while only the fork's view is open; once the fork's view has closed, the
+/// fork has had its writer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs root and /dev/fuse: ci/fuse-tests.sh"]
+async fn a_fork_claims_view_beside_its_source() {
+    if !root_and_fuse() {
+        return;
+    }
+    let d = Driver::start().await;
+    let mut c = d.controller();
+    let source = c
+        .create_volume(create_req(1 << 30))
+        .await
+        .unwrap()
+        .into_inner()
+        .volume
+        .unwrap();
+    let fork = c
+        .create_volume(fork_req("pvc-2", "pvc-1", &[]))
+        .await
+        .unwrap()
+        .into_inner()
+        .volume
+        .unwrap();
+    let tree = forked_trees(&d).pop().unwrap();
+    let state = d.layout.state("pvc-1");
+    let (a, b) = (d.target("a"), d.target("b"));
+    let mut n = d.node();
+    n.node_publish_volume(publish_req(&a, pod_info(&source.volume_context)))
+        .await
+        .unwrap();
+    let mut fork_pod = fork.volume_context.clone();
+    for (k, v) in [
+        ("csi.storage.k8s.io/pod.name", "forker-0"),
+        ("csi.storage.k8s.io/pod.namespace", "apps"),
+        ("csi.storage.k8s.io/pod.uid", "u-2"),
+    ] {
+        fork_pod.insert(k.into(), v.into());
+    }
+    n.node_publish_volume(publish_claim_req("pvc-2", &b, fork_pod.clone()))
+        .await
+        .unwrap();
+    // CreateVolume's host, then one host for both views.
+    assert_eq!(d.count("spawn host pvc-1"), 2, "{:?}", d.events());
+    assert_eq!(
+        mount_state(&b).unwrap(),
+        MountState::Live {
+            source: format!("agentfs:apps.data.pvc-1:{tree}")
+        }
+    );
+    fs::write(b.join("forked.md"), "from the fork\n").unwrap();
+
+    // One pod per fork claim.
+    let other = d.target("c");
+    let err = n
+        .node_publish_volume(publish_claim_req("pvc-2", &other, fork_pod.clone()))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::FailedPrecondition, "{err:?}");
+    assert!(
+        err.message()
+            .contains("several pods on one volume are not built"),
+        "{}",
+        err.message()
+    );
+
+    // The source's own pod gone, the fork's keeps it in use.
+    n.node_unpublish_volume(unpublish_req(&a)).await.unwrap();
+    let err = c.delete_volume(delete_req()).await.unwrap_err();
+    assert_eq!(err.code(), Code::FailedPrecondition, "{err:?}");
+    assert!(err.message().contains("is in use"), "{}", err.message());
+    assert!(d.layout.csi_json("pvc-1").exists(), "nothing deleted");
+
+    // The last view closed: the host drains, and Volume releases only with
+    // every queue empty, so its exit is the landing's event.
+    n.node_unpublish_volume(unpublish_claim_req("pvc-2", &b))
+        .await
+        .unwrap();
+    d.until("exit host pvc-1 exit code 0", 2).await;
+    assert_eq!(
+        d.count("exit host pvc-1 exit code 0"),
+        2,
+        "{:?}",
+        d.events()
+    );
+    let landed = messages(&state, "forked.md");
+    assert!(landed.contains("Agentfs-Pod: forker-0"), "{landed}");
+
+    // The fork has had its writer.
+    let err = n
+        .node_publish_volume(publish_claim_req("pvc-2", &b, fork_pod))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::FailedPrecondition, "{err:?}");
+    assert_eq!(
+        err.message(),
+        "the fork of claim pvc-2 has had its writer: a fork claim serves one pod (docs/csi.md)"
+    );
+
+    // Through the source's view.
+    n.node_publish_volume(publish_req(&a, pod_info(&source.volume_context)))
+        .await
+        .unwrap();
+    assert_eq!(
+        fs::read_to_string(a.join("forked.md")).unwrap(),
+        "from the fork\n"
+    );
+    n.node_unpublish_volume(unpublish_req(&a)).await.unwrap();
+    c.delete_volume(delete_claim_req("pvc-2")).await.unwrap();
+    c.delete_volume(delete_req()).await.unwrap();
+    assert!(d.layout.retained_json("pvc-1").exists());
     d.stop().await;
 }
