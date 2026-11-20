@@ -2,11 +2,11 @@
 
 | Path | What |
 |---|---|
-| [`sidecar/`](sidecar) | A kustomize base: a Deployment with agentfs as a privileged native sidecar, a `ReadWriteOncePod` PVC, the operator ConfigMap (settings, `info/exclude`, `info/attributes`) and the credentials Secret |
+| [`sidecar/`](sidecar) | A kustomize base: a Deployment with agentfs as a privileged native sidecar on the tree engine, a `ReadWriteOncePod` PVC for its state area, the operator ConfigMap (the settings include, and the rule files mounted as `history.git/info/exclude` and `info/attributes`) and the credentials Secret |
 | [`csi/`](csi) | The CSI driver: its namespace, CSIDriver, RBAC, controller Deployment, node DaemonSet, the profiles ConfigMap (`profiles/`) and the credentials Secret; sidecars pinned by digest. Installs only the driver |
 | [`csi/example/`](csi/example) | A workload on the driver: a restricted namespace, a StorageClass using the `example` profile, a `ReadWriteOnce` claim and a two-replica Deployment |
 | [`alerts/`](alerts) | Example alert rules for agentfs's metrics: a Prometheus rules file, the same as a `PrometheusRule`, and their promtool tests ([docs/deployment.md](../docs/deployment.md#alerts)) |
-| [`examples/hermes/`](examples/hermes) | Operator rules for Hermes, the first consumer |
+| [`examples/hermes/`](examples/hermes) | Operator settings and rules for Hermes, the first consumer |
 | [`examples/helm-sidecar/`](examples/helm-sidecar) | A workload chart using the `agentfs-sidecar` Helm library: `sidecar/` as Helm renders it, its settings and rules linked from `sidecar/config` |
 
 The Helm charts in [`../charts`](../charts) render the same objects as
@@ -15,7 +15,9 @@ The Helm charts in [`../charts`](../charts) render the same objects as
 The sidecar is explained in [docs/deployment.md](../docs/deployment.md):
 the image, the pod layout and why, configuration, users and permissions,
 operations, a crashed daemon, the security trade-offs of the privileged
-sidecar, and the Hermes example.
+sidecar, and the Hermes example. Moving a sidecar volume of the recording
+engine to the tree engine is
+[docs/runbooks/upgrading-the-sidecar.md](../docs/runbooks/upgrading-the-sidecar.md).
 
 The CSI driver is explained in [docs/csi.md](../docs/csi.md). In order:
 

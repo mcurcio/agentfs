@@ -13,7 +13,7 @@ resources:
   - deployment.yaml
 
 # The operator's settings and rules. The generated name carries a hash of
-# the content, so changing a rule or a remote rolls the pod: rules are read
+# the content, so changing a rule or a setting rolls the pod: both are read
 # at mount time.
 configMapGenerator:
   - name: agentfs-config

@@ -5,21 +5,17 @@ values map of this library (its alias's key):
 
   initContainers:          {{ include "agentfs-sidecar.initContainers" .Values.agentfs | nindent 8 }}
   a workload's mounts:     {{ include "agentfs-sidecar.workspaceMount" .Values.agentfs | nindent 12 }}
-  the sandbox overlay's:   {{ include "agentfs-sidecar.sandboxOverlayMount" .Values.agentfs | nindent 12 }}
   volumes:                 {{ include "agentfs-sidecar.volumes" .Values.agentfs | nindent 8 }}
   pod annotations:         {{ include "agentfs-sidecar.podAnnotations" .Values.agentfs | nindent 8 }}
   objects:                 agentfs-sidecar.configMap, .secret, .claim
 
-The pod must also stop slowly enough for the final commit
+The pod must also give the sidecar time to drain
 (terminationGracePeriodSeconds: 60) and run one at a time on the claim
 (strategy Recreate): docs/deployment.md.
 
-  /data                 the claim: backing/ (the files) and state/ (history)
+  /data                 the claim: state/, the volume's state area
   /agentfs              an emptyDir shared by every container
   /agentfs/workspace    the FUSE mount: what the workload uses
-  /agentfs-sandbox/overlay  with sandboxOverlay.enabled, the sandbox
-                        overlay: for a container that starts
-                        other containers (sandboxOverlay.mountPath)
 */}}
 
 {{- define "agentfs-sidecar.image" -}}
@@ -38,18 +34,17 @@ imagePullPolicy: {{ . }}
 {{- if not .volume }}
 {{- fail "agentfs-sidecar: set volume (the agentfs volume name)" }}
 {{- end }}
-{{- if and .sandboxOverlay.enabled (not .sandboxOverlay.owner) }}
-{{- fail "agentfs-sidecar: set sandboxOverlay.owner (UID:GID, the sandbox overlay's view owner)" }}
-{{- end }}
-# Creates the state area on first start, checks it on every later one,
-# creates /data/backing, and sets the operator config include.
+# Creates the volume on first start, finds it on every later one, and
+# makes the operator settings file include /etc/agentfs/config.
 - name: agentfs-init
   {{- include "agentfs-sidecar.image" . | nindent 2 }}
   args: [init, --include, /etc/agentfs/config]
   env:
     - { name: AGENTFS_VOLUME, value: {{ .volume | quote }} }
     - { name: AGENTFS_STATE, value: /data/state }
-    - { name: AGENTFS_ROOT, value: /data/backing }
+    {{- with .owner }}
+    - { name: AGENTFS_OWNER, value: {{ . | quote }} }
+    {{- end }}
   securityContext:
     runAsUser: 0
     runAsGroup: 0
@@ -65,10 +60,9 @@ imagePullPolicy: {{ . }}
 - name: agentfs
   {{- include "agentfs-sidecar.image" . | nindent 2 }}
   restartPolicy: Always
-  args: [mount, /data/backing, /agentfs/workspace]
+  args: [mount, /agentfs/workspace]
   env:
     - { name: AGENTFS_STATE, value: /data/state }
-    - { name: AGENTFS_ROOT, value: /data/backing }
     - { name: AGENTFS_ON_STALE_MOUNT, value: {{ .onStaleMount }} }
     - { name: AGENTFS_SEAL_MOUNTPOINT, value: {{ .sealMountpoint | toString | quote }} }
     - name: AGENTFS_POD
@@ -82,12 +76,6 @@ imagePullPolicy: {{ . }}
     {{- with .env }}
     {{- toYaml . | nindent 4 }}
     {{- end }}
-    {{- if .sandboxOverlay.enabled }}
-    # The sandbox overlay's mount point, in an emptyDir of its own (it may
-    # not share a parent with /agentfs/workspace), and its view owner.
-    - { name: AGENTFS_SANDBOX_OVERLAY, value: {{ include "agentfs-sidecar.sandboxOverlayPath" . | quote }} }
-    - { name: AGENTFS_SANDBOX_OWNER, value: {{ .sandboxOverlay.owner | quote }} }
-    {{- end }}
   # Privileged: Bidirectional propagation, mount(2) and /dev/fuse
   # (docs/deployment.md "Security trade-offs").
   securityContext:
@@ -98,26 +86,22 @@ imagePullPolicy: {{ . }}
   volumeMounts:
     - { name: data, mountPath: /data }
     - { name: agentfs-mount, mountPath: /agentfs, mountPropagation: Bidirectional }
-    - { name: config, mountPath: /data/state/git/info/exclude, subPath: exclude, readOnly: true }
-    - { name: config, mountPath: /data/state/git/info/attributes, subPath: attributes, readOnly: true }
+    - { name: config, mountPath: /data/state/history.git/info/exclude, subPath: exclude, readOnly: true }
+    - { name: config, mountPath: /data/state/history.git/info/attributes, subPath: attributes, readOnly: true }
     - { name: config, mountPath: /etc/agentfs, readOnly: true }
     - { name: credentials, mountPath: /run/secrets/agentfs, readOnly: true }
-    {{- if .sandboxOverlay.enabled }}
-    - { name: {{ .sandboxOverlay.volumeName }}, mountPath: {{ .sandboxOverlay.mountPath }}, mountPropagation: Bidirectional }
-    {{- end }}
   # Passes for a live mount and for the stale one a crash left (5 minutes
-  # for journal recovery at start). The sandbox overlay is mounted after
-  # the main mount, so probing it gates on both.
+  # for the volume's recovery at start).
   startupProbe:
     exec:
-      command: [agentfs, probe, --allow-stale, {{ include "agentfs-sidecar.probeArgs" . }}]
+      command: [agentfs, probe, --allow-stale, /agentfs/workspace]
     periodSeconds: 2
     failureThreshold: 150
   # A dead daemon shows as a NotReady pod. No livenessProbe: the kubelet
   # already restarts a daemon that exits.
   readinessProbe:
     exec:
-      command: [agentfs, probe, {{ include "agentfs-sidecar.probeArgs" . }}]
+      command: [agentfs, probe, /agentfs/workspace]
     periodSeconds: 10
     timeoutSeconds: 5
   {{- with .resources }}
@@ -139,34 +123,6 @@ mount propagated into /agentfs/workspace stays writable.
   recursiveReadOnly: Disabled
 {{- end }}
 
-{{/* The sandbox overlay's mount point: <mountPath>/overlay. */}}
-{{- define "agentfs-sidecar.sandboxOverlayPath" -}}
-{{ .sandboxOverlay.mountPath }}/overlay
-{{- end }}
-
-{{/* What the sidecar's probes check: the sandbox overlay when served, else the mount. */}}
-{{- define "agentfs-sidecar.probeArgs" -}}
-{{- if .sandboxOverlay.enabled -}}
---sandbox-overlay, {{ include "agentfs-sidecar.sandboxOverlayPath" . }}
-{{- else -}}
-/agentfs/workspace
-{{- end }}
-{{- end }}
-
-{{/*
-The mount for a container that starts other containers (for example a
-Docker daemon), with sandboxOverlay.enabled: only the sandbox overlay's
-emptyDir, never the main mount's. It binds paths under
-<mountPath>/overlay into its sandboxes; a container runtime binds with
-private propagation by default, so sandboxes started before a sidecar
-recovery keep the dead mount (docs/deployment.md).
-*/}}
-{{- define "agentfs-sidecar.sandboxOverlayMount" -}}
-- name: {{ .sandboxOverlay.volumeName }}
-  mountPath: {{ .sandboxOverlay.mountPath }}
-  mountPropagation: HostToContainer
-{{- end }}
-
 {{/* The pod's volumes for the helpers above. */}}
 {{- define "agentfs-sidecar.volumes" -}}
 - name: data
@@ -181,10 +137,6 @@ recovery keep the dead mount (docs/deployment.md).
   secret:
     secretName: {{ .credentials.secretName }}
     defaultMode: 0400
-{{- if .sandboxOverlay.enabled }}
-- name: {{ .sandboxOverlay.volumeName }}
-  emptyDir: {}
-{{- end }}
 {{- end }}
 
 {{/* Rolls the pod when the settings or rules change: they are read at mount. */}}
@@ -226,10 +178,7 @@ stringData:
 {{- end }}
 {{- end }}
 
-{{/*
-The claim: backing/ and state/ as siblings on one filesystem, mounted once
-at /data (recording freezes files with reflinks, which fail across mounts).
-*/}}
+{{/* The claim: the volume's state area, mounted at /data. */}}
 {{- define "agentfs-sidecar.claim" -}}
 apiVersion: v1
 kind: PersistentVolumeClaim

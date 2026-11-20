@@ -1,4 +1,5 @@
-# Mounted over <state>/git/info/exclude: paths never recorded when new
-# (git ignore syntax). Tracked paths stay recorded.
+# Mounted over <state>/history.git/info/exclude: new paths never recorded
+# (git ignore syntax); they live in the volume's untracked area. Tracked
+# paths stay recorded.
 *.log
 tmp/

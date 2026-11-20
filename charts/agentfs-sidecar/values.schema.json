@@ -39,6 +39,10 @@
     "volume": {
       "type": "string"
     },
+    "owner": {
+      "type": "string",
+      "pattern": "^([0-9]+:[0-9]+)?$"
+    },
     "labels": {
       "type": "object",
       "additionalProperties": {
@@ -119,27 +123,6 @@
     },
     "sealMountpoint": {
       "type": "boolean"
-    },
-    "sandboxOverlay": {
-      "type": "object",
-      "additionalProperties": false,
-      "properties": {
-        "enabled": {
-          "type": "boolean"
-        },
-        "volumeName": {
-          "type": "string",
-          "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"
-        },
-        "mountPath": {
-          "type": "string",
-          "pattern": "^/.+[^/]$"
-        },
-        "owner": {
-          "type": "string",
-          "pattern": "^([0-9]+:[0-9]+)?$"
-        }
-      }
     },
     "env": {
       "type": "array",
