@@ -10,6 +10,7 @@ pub(super) mod format;
 pub(super) mod lag;
 pub(super) mod message;
 pub(super) mod refs;
+pub(super) mod repack;
 pub(super) mod take;
 pub(super) mod upstreams;
 

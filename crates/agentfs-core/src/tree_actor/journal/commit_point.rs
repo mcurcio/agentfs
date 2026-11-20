@@ -126,7 +126,7 @@ impl TreeActor {
                     .trees
                     .get(&h.tree)
                     .filter(|t| t.anonymous.contains(&h.object))
-                    .and_then(|t| t.meta.get(&h.object).copied()),
+                    .and_then(|t| t.meta_of(h.object).copied()),
             })
             .collect();
         let checkpoint = Record {

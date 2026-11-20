@@ -117,6 +117,64 @@ pub enum RefusalKind {
     Stopped,
 }
 
+/// One line of the control channel after [`Hello`]: a request, or the reply
+/// that answers it, with the id that pairs them. The parent picks each
+/// request's id, unique among its requests in flight; the host's reply
+/// echoes it. Replies may come in any order (JSON-RPC's and LSP's ids).
+///
+/// ```text
+/// {"id":7,"body":{"op":"close","at":"/m"}}
+/// {"id":7,"body":"closed"}
+/// ```
+///
+/// Protocol v2 ([`HOST_PROTOCOL`]); wire lines pinned by this module's tests.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Envelope<T> {
+    pub id: u64,
+    pub body: T,
+}
+
+/// What a request names, and what a view holds while its close is pending:
+/// a request waits only while a pending close holds a resource it names
+/// (a lock manager's held resources). Never on the wire: both ends compute
+/// it from the request and the views they know.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Resources {
+    /// The mount point: an open's `at`, a close's `at`.
+    pub mount: Option<PathBuf>,
+    /// The client: an open's label.
+    pub client: Option<ClientLabel>,
+    /// The keyed fork: an open of a fork view, `fork_create`, `fork_end`.
+    pub fork: Option<ForkKey>,
+}
+
+impl Resources {
+    /// What a view of `tree` at `at` for the client `label` holds: its
+    /// mount, its client and, for a fork view, its fork. The one rule both
+    /// an open's names and a closing view's holdings come from.
+    pub fn of_view(at: &std::path::Path, label: &ClientLabel, tree: &TreeRef) -> Self {
+        let _ = (at, label, tree);
+        todo!("agentfs-ln6.2")
+    }
+
+    /// Whether `self` and `held` share a mount, a client or a fork.
+    pub fn overlaps(&self, held: &Resources) -> bool {
+        let _ = held;
+        todo!("agentfs-ln6.2")
+    }
+}
+
+impl Request {
+    /// What this request names: an open, its view's resources
+    /// ([`Resources::of_view`]); a close, its mount; `fork_create` and
+    /// `fork_end`, their key; `reconcile`, nothing (a closing view is still
+    /// live, so a reconcile never waits).
+    pub fn names(&self) -> Resources {
+        todo!("agentfs-ln6.2")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

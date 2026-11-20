@@ -18,7 +18,8 @@ pub(in crate::tree_actor) use super::journal::CallHead as Call;
 use super::journal::durable::RecordNo;
 use super::journal::segment::FramePos;
 use super::journal::{
-    Change, Entry, PagePiece, RunHead, SaveOutcome, TAKE_CHUNK, Tail, TakeRecord, chunk_map,
+    Change, Entry, FoldedOpen, PagePiece, RunHead, SaveOutcome, TAKE_CHUNK, Tail, TakeRecord,
+    chunk_map,
 };
 use super::meta::{Attrs, Kind, Meta, Perm, SetTime, Times};
 use super::queue::Key;
@@ -132,6 +133,22 @@ pub(in crate::tree_actor) struct Handle {
     pub(in crate::tree_actor) replayed: Option<(u64, u64)>,
 }
 
+impl Handle {
+    /// An open recovery found live, before any call is served: a recovery
+    /// close saves it at once. Its view is never read.
+    pub(in crate::tree_actor) fn recovered(folded: FoldedOpen) -> Self {
+        let FoldedOpen { open, calls } = folded;
+        Self {
+            tree: open.tree,
+            by: open.by,
+            object: open.object,
+            bytes: FileMap::empty(),
+            calls,
+            replayed: None,
+        }
+    }
+}
+
 impl TreeActor {
     /// Saved bytes, whole, in memory: the library's read. An independent
     /// reader never sees an unfinished save. A view reads through
@@ -197,11 +214,11 @@ impl TreeActor {
     }
 
     fn object_node(t: &SavedTree, object: u64) -> Result<Node> {
-        let meta = *t.meta.get(&object).ok_or(Error::NotFound)?;
+        let meta = *t.meta_of(object).ok_or(Error::NotFound)?;
         Ok(Node {
             number: Some(object),
             meta,
-            times: t.times.get(&object).copied().unwrap_or_default(),
+            times: t.times_of(object).copied().unwrap_or_default(),
             len: t.bytes.get(&object).map_or(0, FileMap::len),
             links: u32::try_from(t.names.of(object).count()).unwrap_or(u32::MAX),
         })
@@ -394,7 +411,7 @@ impl TreeActor {
         Ok(tree
             .names
             .iter()
-            .map(|(p, o)| (p.clone(), *o, tree.bytes.get(o).map_or(0, FileMap::len)))
+            .map(|(p, o)| (p.to_string(), *o, tree.bytes.get(o).map_or(0, FileMap::len)))
             .collect())
     }
 
@@ -863,7 +880,7 @@ impl TreeActor {
             let t = self.tree(tree)?;
             let saved = t.bytes.get(&object).ok_or(Error::NotFound)?;
             let whole = 0..len;
-            if t.meta.get(&object) == Some(&meta)
+            if t.meta_of(object) == Some(&meta)
                 && map.same_as(saved, std::slice::from_ref(&whole))?
             {
                 return Ok(Saved::Unchanged);

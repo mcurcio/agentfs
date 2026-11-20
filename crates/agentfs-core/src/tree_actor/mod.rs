@@ -55,8 +55,7 @@ use history::{
 };
 pub use journal::durable::{Durability, DurableError, RecordNo};
 use journal::{
-    Change, Entry, FoldedOpen, Journal, PointerChange, Record, Replay, RowRecord, Target,
-    compact_at, fold,
+    Change, Entry, Journal, PointerChange, Record, Replay, RowRecord, Target, compact_at, fold,
 };
 pub use meta::{Attrs, Kind, Meta, Perm, SetTime, Times};
 use pointers::Pointers;
@@ -969,20 +968,10 @@ impl TreeActor {
             _lock: lock,
         };
         volume.areas.sweep(&volume.trees())?;
-        for (handle, FoldedOpen { open, calls }) in folded.opens {
-            volume.handles.insert(
-                handle,
-                Handle {
-                    tree: open.tree,
-                    by: open.by,
-                    object: open.object,
-                    // Nothing reads it: this handle closes before serving.
-                    bytes: FileMap::empty(),
-                    calls,
-                    replayed: None,
-                },
-            );
-            volume.pages_opened(open.tree, open.object);
+        for (handle, open) in folded.opens {
+            let (tree, object) = (open.open.tree, open.open.object);
+            volume.handles.insert(handle, Handle::recovered(open));
+            volume.pages_opened(tree, object);
         }
         let mut page_writes = folded.page_writes;
         let saved = folded.saved_through;
@@ -1590,6 +1579,13 @@ impl TreeActor {
                 }
             }
         }
+    }
+
+    /// A built or failed event reached the view's worker (`Recording::progress`):
+    /// what the actor does at once, without waiting for its next step. Bounded:
+    /// O(1) plus the batch's maps. Lock order: the actor, then History.
+    pub(in crate::tree_actor) fn on_built(&mut self) {
+        // agentfs-ln6.3: the built-event wake (take the builder's maps here).
     }
 
     /// After a step is applied: a compaction when one is due.

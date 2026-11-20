@@ -20,6 +20,16 @@ use crate::tree_actor::recording::FileMap;
 use crate::tree_actor::tree::EventNumber;
 use crate::tree_git::TreeGit;
 
+/// Each direct save's commit by its event, as built: the snapshot the
+/// builder hands History at each built event. Persistent, so the handover is
+/// O(1) and a batch adds only its own saves (agentfs-ln6.3 replaces the
+/// per-batch copy, `BTreeMap<EventNumber, Oid>`, with it).
+#[expect(
+    dead_code,
+    reason = "frozen interface: agentfs-ln6.3 hands owners over as this"
+)]
+pub(in crate::tree_actor) type Owners = imbl::OrdMap<EventNumber, Oid>;
+
 /// Why the builder could not build a batch. Recording goes on; the batch is
 /// retried at the next step appended or the next wait.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]

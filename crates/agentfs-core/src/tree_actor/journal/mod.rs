@@ -40,6 +40,7 @@
 mod commit_point;
 pub(super) mod durable;
 mod fold;
+pub(super) mod readback;
 pub(super) mod segment;
 
 use crate::fsutil::sync_dir;

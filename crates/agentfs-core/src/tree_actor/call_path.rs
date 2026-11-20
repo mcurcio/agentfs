@@ -236,7 +236,11 @@ impl Recording {
     ///
     /// [`Error::Stopped`] when the actor stopped.
     pub fn progress(&self) -> Result<Progress, Error> {
-        let trees: Vec<TreeId> = self.actor()?.queued();
+        let trees: Vec<TreeId> = {
+            let mut actor = self.actor()?;
+            actor.on_built();
+            actor.queued()
+        };
         if trees.is_empty() {
             return Ok(Progress::Empty);
         }

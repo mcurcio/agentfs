@@ -466,6 +466,17 @@ impl Shape {
         self.times.insert(object, Times::at(at_ns));
     }
 
+    /// `object`'s metadata: the read the call path and the journal use, so
+    /// the per-object state can change shape behind it.
+    pub(super) fn meta_of(&self, object: u64) -> Option<&Meta> {
+        self.meta.get(&object)
+    }
+
+    /// `object`'s times, as [`Shape::meta_of`].
+    pub(super) fn times_of(&self, object: u64) -> Option<&Times> {
+        self.times.get(&object)
+    }
+
     /// The paths naming `object`, in path order.
     pub(super) fn paths_of(&self, object: u64) -> impl Iterator<Item = &str> {
         self.names.of(object)

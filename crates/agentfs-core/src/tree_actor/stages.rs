@@ -39,6 +39,11 @@ pub struct Stages {
     pub sync_merge: Stage,
     pub prior_decisions: Stage,
     pub event_owners: Stage,
+    /// Each hold of the actor's lock through the call path (`Recording::actor`):
+    /// its longest is the longest any other view of the volume waited.
+    pub actor_lock: Stage,
+    /// Each `git repack` of the tree history's repack task.
+    pub repack: Stage,
     pub git_children: u64,
     pub object_writes: u64,
     pub object_dir_syncs: u64,
@@ -65,9 +70,13 @@ pub(super) enum Which {
     SyncMerge,
     PriorDecisions,
     EventOwners,
+    /// The actor's lock held, from lock to unlock (agentfs-ln6.1).
+    ActorLock,
+    /// One repack run (agentfs-ln6.5).
+    Repack,
 }
 
-const STAGE_COUNT: usize = 13;
+const STAGE_COUNT: usize = 15;
 
 struct Total {
     count: AtomicU64,
@@ -125,6 +134,8 @@ impl Stages {
             sync_merge: at(Which::SyncMerge),
             prior_decisions: at(Which::PriorDecisions),
             event_owners: at(Which::EventOwners),
+            actor_lock: at(Which::ActorLock),
+            repack: at(Which::Repack),
             git_children: crate::git_cli::children(),
             object_writes: crate::tree_git::object_writes() + super::history::feed::fed(),
             object_dir_syncs: crate::tree_git::object_dir_syncs()
