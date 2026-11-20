@@ -139,3 +139,9 @@ on his answer.
 - **Guidance**, 2026-10-30. "the sandbox agent should only get write access to the agentfs overlay files"; "-- and potentially should only be able to see the agentfs overlay files at all" [hiding is the current choice, and "potentially" stays]; "i want sandboxes to be able to edit their own configuration and have it reflected back in the main container".
 - **Guidance**, 2026-10-30. His picture of the overlay: "like a real Linux overlay filesystem ... editing a file that matches the agentfs includes makes it recorded, whereas editing a file that doesn't match the includes would mean the file is created on the underlying tmp disk". [A sandbox's save temp file lives in the tmp layer.]
 - **Guidance**, 2026-10-30. "Security boundary. Agentfs is the gatekeeper that exposes only what we want sandboxes to see".
+
+## Performance
+
+- **Guidance**, 2026-11-20. On the tree view's shape, asked whether the actor keeps its own copy or a small overlay over the built shape (overlay recommended): "Approve". Applies to: `docs/target-architecture/future/memory-and-stalls.md`.
+- **Guidance**, 2026-11-20. Asked whether the 2 KiB-per-file bar should count clean git index pages the kernel can take back: "No" [the bar counts only memory the kernel cannot reclaim]. Applies to: `ci/trees-budget.json`, `memory_create`.
+- **Guidance**, 2026-11-20. Asked whether the new bars (peak memory, restart peak, longest lock hold, long-history ms per create) should fail CI or only warn: "No" [read as: they warn]. Applies to: `ci/trees-budget.json`, `image.yml`.
