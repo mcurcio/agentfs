@@ -598,9 +598,9 @@ impl History {
         todo!("agentfs-ln6.13")
     }
 
-    /// `tree`'s overlay as last reported to the gate.
-    #[allow(dead_code, reason = "frozen interface of agentfs-ln6.13")]
-    pub(in crate::tree_actor) fn overlay_bytes(&self, tree: TreeId) -> u64 {
+    /// `tree`'s overlay as the actor last reported it to the gate, in
+    /// estimated bytes: 0 before any report. For tests and metrics.
+    pub fn overlay_bytes(&self, tree: TreeId) -> u64 {
         let _ = tree;
         todo!("agentfs-ln6.13")
     }
