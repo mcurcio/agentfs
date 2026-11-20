@@ -451,11 +451,11 @@ outside stops the daemon, which unmounts the other.
 
 ## The `agentfs` command
 
-The binary runs two engines. `init`, `mount` and `fork end` run the tree views
-([below](#tree-views), and [trees](../trees.md)): the sidecar's, Docker's and the
-command line's launcher. The other commands run the recording engine as the CSI
-driver runs it ([csi](../csi.md)): a history service and a front per pod. No flag
-selects an engine. Every recording command refuses a tree volume before it reads
+The binary runs two engines. `init`, `mount`, `host` and `fork end` run the tree
+views ([below](#tree-views), and [trees](../trees.md)): `mount` is the sidecar's,
+Docker's and the command line's launcher, and `host` is the CSI driver's
+([csi](../csi.md)). The other commands run the recording engine, on recording
+state areas only. No flag selects an engine. Every recording command refuses a tree volume before it reads
 or writes anything (`` `agentfs push` runs on the recording engine only; <state>
 is a tree volume, where it is not built yet ``, exit 1), and `init` and `mount`
 refuse a recording state area, naming the
@@ -467,7 +467,8 @@ refuse a recording state area, naming the
 |---|---|
 | `init` | Creates a tree volume, or finds it under the same name; prints `<name> <id> created\|found`. Safe to run at every start. Exit 1 for another name or format, 75 busy. `--include` sets the operator settings' includes; `--owner` the new root's owner |
 | `mount` | Serves a tree volume's root, and optionally a fork, as tree views until SIGINT, SIGTERM, the exit of `-- COMMAND` or an unmount |
-| `front` | A front of a history service: a FUSE mount of a backing tree whose records go to the service. Only the CSI node plugin starts it |
+| `host` | Serves a tree volume's views on its parent's requests over its standard input, until EOF, SIGINT or SIGTERM ([below](#the-view-host-command)). The CSI node plugin runs one per volume in use |
+| `front` | A front of a history service: a FUSE mount of a recording volume's backing tree whose records go to the service |
 | `run` | Runs the commit and push loops in the foreground with no mount, serving `push` on the control socket |
 | `serve-history` | The history service of a volume, for fronts on the same node |
 | `serve-git` | Serves the volume's history repository over git's smart HTTP as the patch source. Takes no lock |
@@ -549,8 +550,7 @@ created); lease a pending slot; connect to the service, waiting up to
 then the FUSE session, whose repair queue is the slot's
 `meta/fronts/slot-N.repairs`. Every round trip is bounded by
 `--history-timeout` (10 s). `--history-slot N` asks for a particular slot, so
-a front restarted after a crash drains its predecessor's repairs; the CSI
-driver stacks a restarted front over its stale mount itself.
+a front restarted after a crash drains its predecessor's repairs.
 
 **Shutdown** on SIGINT, SIGTERM or an external unmount: stop answering the
 service's calls; unmount (a plain unmount, then a lazy detach if busy) and wait
@@ -615,7 +615,7 @@ and the [history-service-down runbook](../runbooks/history-service-down.md).
 
 `front`, `flush`, `record`, `push` and `run` export OpenTelemetry signals over
 OTLP when the standard `OTEL_*` variables configure an endpoint, and print
-alarms to stderr. `mount` exports the `agentfs.not_built` gauge (one series
+alarms to stderr. `mount` and `host` export the `agentfs.not_built` gauge (one series
 per capability a configured setting needs and tree volumes do not build) and
 the export-failure counter. `init` and `status` export nothing. All of these commands
 take the pod flags (`--pod`, `--namespace`, `--node`, `--replica` and their
@@ -624,13 +624,14 @@ See [telemetry](../telemetry.md).
 
 ## Tree views
 
-`init`, `mount` and `fork end` run the tree views over a git-backed tree library
-(`agentfs_core::tree_actor`), with their own state format, mounting directories
-and regular files with their recorded modes ([trees](../trees.md)).
+`init`, `mount`, `host` and `fork end` run the tree views over a git-backed tree
+library (`agentfs_core::tree_actor`), with their own state format, mounting
+directories and regular files with their recorded modes ([trees](../trees.md)).
 
 ```sh
 agentfs --state STATE init --volume NAME [--include FILE]... [--owner UID:GID]
 agentfs --state STATE mount ROOT [--fork-mount FORK [--fork-key KEY]] [-- COMMAND...]
+agentfs --state STATE host --launcher ID --volume NAME    # stdin: a Unix socket
 agentfs --state STATE fork end --fork-key KEY
 ```
 
@@ -661,6 +662,76 @@ mount as `agentfs:<volume>` (a fork's as `agentfs:<volume>:<tree>`), with FUSE
 with its recorded owner, and `--metrics-output FILE` writes counters every
 100 ms and at unmount. A stop, the command's exit or unmounting every view
 drains it.
+
+### The view host command
+
+`agentfs host` serves one tree volume's views on request: a parent process
+opens and closes views on it, and creates and ends keyed forks, over the
+host's standard input. It is the integration point for a launcher that serves
+views of one volume to several consumers over time; the CSI driver is one
+([library/kubernetes](kubernetes.md)). The transport follows the LSP and MCP
+stdio transports and Erlang ports: a parent drives its child with JSON
+messages over the child's own stdio. The messages are pure values in
+`agentfs_contracts::host`.
+
+**The control channel.** The standard input must be a Unix stream socket, one
+end of a socket pair whose other end only the parent holds. Anything else
+exits 2 before the state area is touched (`agentfs host is run by a launcher
+that controls it over its standard input, a Unix socket`). No socket path
+exists, so only the parent can reach it. The parent closing its end (EOF) is
+a stop, as SIGTERM and SIGINT are: the host drains and exits 0 once Volume
+releases the volume, so a host never outlives its parent. The last view
+ending does not stop it.
+
+**Boot.** As `mount`'s, under `--launcher ID`: the volume found (exit 1 for
+another format, 75 while another process holds it) and checked against
+`--volume`, the operator settings read and each key not built logged and
+counted by `agentfs.not_built`, the volume staged and its domains restored as
+that launcher, and the view host started. It then writes `Hello` and reads
+requests. `--namespace`, `--pod`, `--pod-uid` and `--node` are its own
+events' pod context and its telemetry resource's; each view's writer carries
+the pod context its `open` names.
+
+**Protocol, version 1.** One JSON object per line. The host writes `Hello`
+once, then exactly one reply per request, in order; the parent sends a request
+only after the previous reply has arrived.
+
+| Request (`op`) | Fields | Reply |
+|---|---|---|
+| (none: the host's first line) | | `{"v":1,"volume":NAME,"id":ID}` |
+| `open` | `tree` (`"root"` or `{"fork":KEY}`), `at`, `label`, `read_only`, `pod` | `{"opened":{"tree":..,"stacked":BOOL}}` |
+| `close` | `at` | `"closed"`, once the view has ended: its files released and its client detached |
+| `reconcile` | | `{"reconciled":{"ended":N}}`: the launcher's clients and keyed forks that no open view uses are ended |
+| `fork_create` | `upstream` (a tree as in `open`), `key`, `settings` (Trees' `ForkSettings`) | `{"forked":{"tree":..}}` |
+| `fork_end` | `key` | `"ended"` |
+
+Any request may instead get `{"refused":{"kind":KIND,"message":TEXT}}`. The
+kinds are exhaustive, so a parent maps each: `fork_taken` (the fork has had
+its one writer), `key_unknown`, `key_ended`, `nested_not_built` (forks of
+forks), `approval_not_built` (`Landing::Approval`), `mount_failed`, `stale`
+(another source's stale mount at `at`), `occupied` (a view is open there with
+another tree, label or access), `draining` and `stopped` (the actor stopped
+after a recording failure). The message carries the real error. A malformed
+line is the last one read: the host drains and exits 2.
+
+**Opening a view.** `at` is an existing empty directory, or a stale agentfs
+mount of the view's own source, which the view stacks over
+(`MountOptions::over_stale`; [stale mounts](#stale-mounts)). The view's client
+is rebound when the launcher, tree, label and access match one a crashed host
+left, else attached with the request's pod context, so a restarted host keeps a
+fork's one writer. An `open` of a view already open at `at` with the same tree,
+label and access answers `opened` again; with another, `occupied`. A stacked
+open logs `stacked over a stale mount at PATH left by a crashed daemon`. A
+`close` of a mount point with no view answers `closed`, and a `fork_create`
+under a key whose fork is open answers `forked` with that fork, so a parent
+can repeat a request after a crash. The `mount` command's flags for these
+choices (`--writer`, `--read-only`, `--on-stale-mount`) are not used: the
+request names the label and access, and a stale mount of the view's own
+source is always stacked over.
+
+**Exit status.** 0 once the volume is released; 1 for a refusal at boot or a
+stopped actor; 2 without a control channel or after a malformed line; 75 while
+another process holds the volume.
 
 ### The view host
 

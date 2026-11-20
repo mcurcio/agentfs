@@ -175,6 +175,42 @@ point is made root's with mode 0000 before mounting, so a non-root workload that
 reaches it while no view is mounted (a `subPath` bound while a sidecar restarts)
 gets `EACCES` instead of writing where nothing records it.
 
+### Serving views on request
+
+`agentfs host` runs one volume's view host for a parent process, which opens
+and closes views on it and creates and ends keyed forks over the host's
+standard input, a Unix socket only the parent holds:
+
+```sh
+agentfs --state STATE host --launcher ID --volume NAME   # stdin: the parent's socket
+```
+
+It boots as `mount` does, under the launcher `ID`: the volume checked against
+`--volume`, the operator settings read and each key not built logged, the
+volume staged and its domains restored, the view host started. It then writes
+a hello line and answers each request in order: `open` a view of the root or
+of the open fork under a key at a mount point, with a client label, an access
+and the pod context of its saves; `close` it; `reconcile` (end the launcher's
+clients and keyed forks no open view uses); `fork_create` and `fork_end` under
+a key. A view at a stale mount of its own source is stacked over it
+([restarting](#restarting-after-a-crash)), and its client rebound when one of
+the launcher, tree, label and access is left from a crashed host, so a fork's
+one writer survives the crash. The parent closing its end (EOF), SIGTERM or
+SIGINT drains the volume, and the host exits 0 once it is released
+([lifecycle](#volume-lifecycle)); the last view ending does not stop it. The
+messages and refusals are in
+[library/filesystem](library/filesystem.md#the-view-host-command).
+
+### CSI volumes
+
+The CSI driver ([csi](csi.md)) makes each claim's volume with `agentfs init
+--include <profile>.config` under `<base>/<pv>/state`, installs the profile's
+rule files into `state/history.git/info/`, and runs one `agentfs host
+--launcher csi` per volume in use on its node. Each pod's view is opened at the
+kubelet's target with that pod's context; a fork claim is a keyed fork of its
+source's root on the same host, under the claim's PV name. Deleting a root
+claim drains its volume and keeps the directory.
+
 ## Volume identity and trailers
 
 `init --volume NAME` gives a new volume a random id (RFC 9562 version 4) and

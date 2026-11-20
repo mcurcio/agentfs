@@ -487,8 +487,9 @@ advertises for the branch (listed for this call, never read from the push
 record), the journal's backlog, the class's `onDelete`, and a fork's state.
 It answers `Delete`, `Keep(Kept)` or `Wait(Waiting)`. It never answers
 `Delete` while a journal holds records history lacks, except for the unlinked
-fork with no remote of its own, where deleting loses history on purpose. The
-[Kubernetes layer](kubernetes.md) calls it from DeleteVolume.
+fork with no remote of its own, where deleting loses history on purpose. It
+serves recording worktrees only: the [Kubernetes layer](kubernetes.md) runs
+tree volumes, whose release is Volume's verdict at the end of a host's drain.
 
 ## Several mounts, one writer: the history service
 

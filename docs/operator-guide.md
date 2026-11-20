@@ -3,11 +3,13 @@
 How the recording engine runs: what it needs, how a volume is laid out,
 its flags and settings, what it records and when, how it starts and
 stops, and what to do when something goes wrong. The recording engine is
-what the CSI driver runs ([csi.md](csi.md)): a history service per volume,
-`agentfs serve-history`, and a front per pod, `agentfs front` (section
-16). The sidecar, the Docker examples and the CLI's `agentfs init` and
-`agentfs mount` run tree views instead: see [tree views](trees.md),
-[deployment.md](deployment.md) and [docker.md](docker.md). What agentfs
+a history service per volume, `agentfs serve-history`, and a front per
+mount, `agentfs front` (section 16), run by hand on a recording state
+area. No launcher runs it: the sidecar, the Docker examples, the CLI's
+`agentfs init` and `agentfs mount`, and the CSI driver run tree views:
+see [tree views](trees.md), [deployment.md](deployment.md),
+[docker.md](docker.md) and [csi.md](csi.md). A recording-format CSI
+volume is moved with [the moving runbook](runbooks/moving.md). What agentfs
 promises is in [guarantees](guarantees.md); how it records is in
 [recording](recording.md); the pushing side is in [remotes](remotes.md).
 Section numbers below refer to this page.
@@ -22,8 +24,8 @@ Section numbers below refer to this page.
   passing through the daemon; files opened for writing always go through
   the daemon. Without it everything still works, through the
   daemon.
-- **`/dev/fuse`.** The CSI node plugin has the device and the privileges
-  a mount other containers see needs (section 11).
+- **`/dev/fuse`**, and the privileges a mount other containers see
+  needs (section 11).
 - **Run as root** for multi-user volumes. What the daemon does is decided
   from its effective capabilities, not its uid:
   - with `CAP_CHOWN` and `CAP_FOWNER` it gives every new file to the user
@@ -64,9 +66,8 @@ A recording volume is three directories, side by side:
 <mount point>      where a front mounts the backing tree
 ```
 
-The CSI driver makes the state area itself, in-process, at
-`<basePath>/<pv-name>/state` on the node ([csi.md](csi.md#2-architecture));
-no `agentfs` command creates one. `agentfs front` refuses to start, before anything is mounted, if:
+No `agentfs` command creates a recording state area: the CSI driver
+made them at `<basePath>/<pv-name>/state` before it ran tree volumes. `agentfs front` refuses to start, before anything is mounted, if:
 
 | Error | Why |
 |---|---|
@@ -87,17 +88,15 @@ at shutdown; a stale one left by a crash is replaced at the next start.
 
 ## 3. How it runs
 
-The CSI driver starts every recording process
-([csi.md](csi.md)): at NodeStage, `agentfs serve-history` for the volume;
-at NodePublish, `agentfs front` for each pod, with that pod's identity.
-Section 16 shows the same commands by hand. There is no single-process
+Section 16 shows the commands: `agentfs serve-history` for the volume,
+and `agentfs front` for each mount, with its pod's identity. There is no single-process
 recording mount: `agentfs mount` serves tree views, and refuses a
 recording state area ([tree views](trees.md#run-it)).
 
 A volume with no remote section is local-only: its history stays in its
 state area until a remote is added, and its first push then sends all
 of it ([configuration reference](configuration.md#remotes-modes)). A
-volume's remotes, over HTTPS or SSH, come from the CSI profile
+volume's remotes, over HTTPS or SSH, come from its config
 ([remotes](remotes.md#credentials-and-transports)).
 
 Every change made through a front is recorded before the call that made
@@ -291,8 +290,7 @@ and up to one interval late: see [Databases](#14-databases-the-fsync-class).
   records stay journaled and are committed at the next start); `75` the
   state area is in use by another process; `130` a second signal.
 
-The CSI node plugin stops a pod's front at NodeUnpublish and the
-service at NodeUnstage ([csi.md](csi.md)). Pushing never delays shutdown
+Pushing never delays shutdown
 beyond `--push-grace`; commits still unpushed go out at the next start.
 
 ## 9. The state-area lock
@@ -343,8 +341,7 @@ when every chosen remote succeeded in time; a remote still pushing then
 makes it exit 1, and `agentfs status` shows how that push ended. A remote
 the daemon does not know is refused (exit 1, with the configured
 remotes). With no daemon running, `push` takes the lock and pushes
-directly. Under the CSI driver, run it in the node plugin pod of the
-volume's node (section 12).
+directly.
 
 **Replacing the volume's branch.** agentfs never force-pushes, and an
 operator never `git push`es a volume's branch either: the one way to put
@@ -380,11 +377,8 @@ stopped.
   not connected" (`ENOTCONN`). agentfs does not use `auto_unmount`, so the
   empty directory underneath is never exposed to writes nothing would
   record.
-- The CSI node plugin restarts the crashed front in the same slot and
-  mounts it over the dead one, and restarts a crashed history service,
-  which commits what its fronts had journaled
-  ([csi.md](csi.md#8-recovery), [csi-recovery.md](runbooks/csi-recovery.md)).
-  At start, records in the journal that are not in history yet are
+- A restarted history service commits what its fronts had journaled:
+  at start, records in the journal that are not in history yet are
   committed.
 - A stale mount point found by hand is cleared with
   `fusermount3 -u -z PATH` (or, as root, `umount -l PATH`); `agentfs
@@ -396,10 +390,10 @@ A tree view's crash and restart are in
 
 ## 11. Kubernetes
 
-On Kubernetes the recording engine runs only behind the CSI driver: its
-node plugin is privileged and runs the history service and the fronts,
-and workload pods need no privilege ([csi.md](csi.md)). The sidecar runs
-tree views ([deployment.md](deployment.md)).
+On Kubernetes nothing runs the recording engine: the CSI driver
+([csi.md](csi.md)) and the sidecar ([deployment.md](deployment.md)) run
+tree views. A recording-format CSI volume is never served; move it with
+[the moving runbook](runbooks/moving.md).
 
 ## 12. Recovery and undo
 
@@ -430,8 +424,7 @@ agentfs --state /data/state revert <commit>
   until history has caught up with the tree, has every front settle what
   is dirty and say what is open for writing, writes the backing tree,
   and has every front drop its kernel's caches, so each pod sees the
-  result at once (section 16). Under the CSI driver, run it in the node
-  plugin pod of the volume's node ([csi.md](csi.md#9-operations)).
+  result at once (section 16).
 - **Nothing is running**: the command takes the state-area lock and
   writes the backing tree (`--root`) itself.
 - **`agentfs run` runs**: it answers that it serves no restores; exit 75.
@@ -461,10 +454,10 @@ Runbooks, with the full procedures:
 - [history-service-down.md](runbooks/history-service-down.md): fronts
   failing with `EIO` because the history service is down, hung or
   refusing them (section 16);
-- [moving.md](runbooks/moving.md): a CSI volume continued on another
-  node (a node lost or retired) as a new volume started from its branch;
-  each worktree stays on its node's disk
-  ([csi.md](csi.md#11-where-worktrees-live));
+- [moving.md](runbooks/moving.md): a recording-format CSI volume moved
+  onto the tree engine, and a CSI volume's files copied to another node;
+  each volume stays on its node's disk
+  ([csi.md](csi.md#11-where-volumes-live));
 - [start-branch-moved.md](runbooks/start-branch-moved.md): the old branch
   received commits after a move (`StartBranchMoved`).
 
@@ -544,8 +537,7 @@ busy, may not open. The `fsync` class ([recording](recording.md)) records such f
 whole, consistent groups instead.
 
 - **Opting in.** Add a line to the operator's
-  `<state>/git/info/attributes` (under the CSI driver, the profile's
-  `attributes`), then restart the history service and its fronts:
+  `<state>/git/info/attributes`, then restart the history service and its fronts:
 
   ```text
   *.db* agentfs.commit=fsync agentfs.group=sqlite
@@ -726,11 +718,6 @@ state area). The fronts run as root or as the service's user: the
 service refuses any other peer. They speak gRPC over that socket
 ([library/core](library/core.md) has the protocol). Mounts on several nodes of one volume are not supported.
 
-**On Kubernetes**, the CSI driver runs this for you: a service per staged
-volume, a front per pod with that pod's identity, restarts in the same
-slot, and recovery of the mounts. See [csi.md](csi.md) and
-[runbooks/csi-recovery.md](runbooks/csi-recovery.md).
-
 **Start order.** Start the service first; a front waits up to
 `--history-wait` (30 s) for it, then exits 1 with nothing mounted.
 
@@ -806,8 +793,7 @@ the service), then the service: on SIGINT or SIGTERM
 it stops accepting, waits up to `--shutdown-grace` for fronts' requests,
 makes the final commit and then, as `run` does, pushes it: every
 remote that lacks commits gets one more attempt, all within `--push-grace`
-(pushes in progress included). The CSI driver stops the service after the volume's
-last pod, and nothing else would push that commit. A push still running
+(pushes in progress included). A push still running
 at the deadline is abandoned (one already updating a local remote is let
 finish, at most 10 s more), and a failed one leaves the commits for the
 next start or an `agentfs push`.

@@ -53,7 +53,7 @@ kubectl -n agentfs-csi exec "$NODE_POD" -c agentfs-csi -- du -sh "$STATE"/git "$
 `agentfs.state.bytes{part}` reports the same parts (`git`, `journal`,
 `pending`, `lfs`, `meta`) as apparent sizes, so a graph of it shows which
 one grew. The backing tree and the state area share the node's
-`basePath` disk ([csi.md](../csi.md#11-where-worktrees-live)), so a
+`basePath` disk ([csi.md](../csi.md#11-where-volumes-live)), so a
 workload that fills its own files fills the state area too.
 
 - **Grow the disk under `basePath`.** This is the fix that loses
