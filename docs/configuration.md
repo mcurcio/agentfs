@@ -903,8 +903,8 @@ section. A subcommand with its own subcommands lists them after it.
   line; 75 while another process holds the volume. It never creates a
   volume.
 - `front`: a front of a history service: a FUSE mount of a backing tree
-  whose records go to the service. Only the CSI node plugin starts it
-  ([csi](csi.md)).
+  whose records go to the service. No launcher starts it: the CSI driver runs
+  `agentfs host` on tree volumes ([csi](csi.md)).
 - `run`: run the service in the foreground without a mount: it serves
   `push` on the control socket until a signal, makes a final commit, and
   gives each remote that lacks commits one more push.
@@ -939,8 +939,8 @@ section. A subcommand with its own subcommands lists them after it.
   ([moving](runbooks/moving.md)), with `accept`, which accepts a tip of
   the start branch and clears the start-branch alarm. It takes no lock.
 `init`, `mount`, `host`, `fork end` and `probe` are the tree engine's (`probe`
-reads no state area). Every other command runs the recording engine, which
-the CSI driver runs, and refuses a tree volume before it reads or writes
+reads no state area). Every other command runs the recording engine and
+refuses a tree volume before it reads or writes
 anything: `` error: `agentfs push` runs on the recording engine only; <state>
 is a tree volume, where it is not built yet (docs/trees.md) ``, exit 1.
 
@@ -1005,10 +1005,10 @@ COMMAND once every view is up, with the mount's stdio and environment
 | `--threads N` | `AGENTFS_THREADS` | CPUs, 2 to 16 | `front` |
 | `--unmount-grace DURATION` | | `10s` | `front`: how long shutdown waits for the session to end |
 | `--workload-mount PATH[=DIR]` (repeatable) | `AGENTFS_WORKLOAD_MOUNTS` (comma-separated) | the mount point, and its bind mounts | `front`: where a workload sees the mount when not at the mount point (a container's `mountPath`; `=DIR` when it sees the tree's directory `DIR`, a `subPath`), so absolute `gitdir:` targets that `git worktree add` writes map exactly to nested repositories (see [recording](recording.md)); a front sends them to its history service |
-| `--push-grace DURATION` | | `5s` | `run`, `serve-history`: how long shutdown may spend on a last push of the final commit (one attempt per remote that lacks commits); `0s` skips it. A push to a path or `file://` remote already updating it is waited for up to 10 s more, so shutdown spends at most this + 10 s on pushes; keep this + 10 s + the final commit under the pod's `terminationGracePeriodSeconds` (the CSI driver sets `5s` against its 30 s unstage grace), or a kill can leave a ref lock in a local remote ([stuck-pushes.md](runbooks/stuck-pushes.md#at-shutdown)) |
+| `--push-grace DURATION` | | `5s` | `run`, `serve-history`: how long shutdown may spend on a last push of the final commit (one attempt per remote that lacks commits); `0s` skips it. A push to a path or `file://` remote already updating it is waited for up to 10 s more, so shutdown spends at most this + 10 s on pushes; keep this + 10 s + the final commit under the pod's `terminationGracePeriodSeconds`, or a kill can leave a ref lock in a local remote ([stuck-pushes.md](runbooks/stuck-pushes.md#at-shutdown)) |
 | `--listen ADDR` | `AGENTFS_HISTORY_LISTEN` | `<state>/meta/history/history.sock` | `serve-history`: `unix:<path>` or an absolute socket path |
 | `--shutdown-grace DURATION` | | `10s` | `serve-history`: how long shutdown waits for fronts' requests |
-| `--workload-attached` | | off | `serve-history`: a workload may be attached, so the patch queue is judged at start and not applied (see [patches](patches.md)); the CSI node plugin passes it while a pod of the volume is published on the node |
+| `--workload-attached` | | off | `serve-history`: a workload may be attached, so the patch queue is judged at start and not applied (see [patches](patches.md)) |
 | `--listen ADDR` | | none: required | `serve-git`: `HOST:PORT` to serve git's smart HTTP on (port `0` picks one); it prints `serve-git: listening on http://HOST:PORT/` once it listens. Plain HTTP: put TLS in front. It refuses to start while `agentfs.patchRemote` names a remote (set it to `none`), and waits up to 10 s for requests in progress when stopped |
 | `--history-service ADDR` | `AGENTFS_HISTORY_SERVICE` | none: required by `front` | `front`, `record`: run as a front of the history service at ADDR (`unix:<path>` or an absolute socket path) |
 | `--history-timeout DURATION` | `AGENTFS_HISTORY_TIMEOUT` | `10s` | `front`, `record` with `--history-service`: how long a boundary waits for the service before `EIO` |
@@ -1040,7 +1040,7 @@ COMMAND once every view is up, with the mount's stdio and environment
 | `--name NAME` | | the source's name | `fork create`: the fork's name before its random suffix (`<name>-<8 hex digits>`) |
 | `--link linked\|unlinked` | | `linked` | `fork create`: whether the fork delivers back to its source (`agentfs.fork.link`, fixed at create); `unlinked` makes an independent fork, which `fork finish` refuses and which has no `fork status` |
 | `--remotes FILE` | | none: local-only | `fork create`: with `--link unlinked`, the fork's own remotes, a config file of `[remote "<name>"]` sections (`agentfs.fork.remotes`, fixed at create, the file read at every open); refused for a linked fork. Without it the fork pushes nothing, and removing its state area loses its history |
-| `--timeout DURATION` | | until published | `fork finish`: stop publishing after this long and exit 1 (the CSI node plugin's finisher runs with `300000ms`, so the fork's lock is free between its scans) |
+| `--timeout DURATION` | | until published | `fork finish`: stop publishing after this long and exit 1 |
 | `--retry` | | | `fork finish`: clear a refused publish (the `refused` mark in `meta/fork.json`) and try again; without it a refused fork exits 1 at once, pushing nothing |
 | `--json` | | | `fork status`: the status document, version 1 (`version`, `fork`, `source`, `base`, `state`, `change`, `finish`, `remote`, `published_at_ms`, `refused`, `abandoned`, and `parent_finished`, the parent fork's name, present only when the fork published as a top-level fork because its parent had finished; additive, so still version 1); `fork list`: the listing (`changes`, `skipped`) |
 | `--reason TEXT` | | none: required, not empty | `fork abandon`: why the fork is discarded, kept in `meta/fork.json` with the time, the operator's uid and the state it was in |
