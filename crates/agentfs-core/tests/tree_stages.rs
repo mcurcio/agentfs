@@ -2,8 +2,9 @@
 //! on the call path and in the builder behind it is counted by stage and by Git
 //! child, through a real `TreeActor` on real Git.
 //! Measurements are never read by a decision; these tests read them.
+use std::collections::BTreeSet;
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Mutex, PoisonError};
 
 use agentfs_contracts::pod::PodContext;
 use agentfs_core::tree_actor::stages::Stages;
@@ -13,7 +14,8 @@ use trees::{ATTRS, identity, new_actor, reopen, rowless_fork, writer};
 #[path = "support/trees.rs"]
 mod trees;
 
-/// The counters are process-wide: one test reads them at a time.
+/// The counters are process-wide: one test reads them at a time. A test that
+/// fails holding the lock poisons it; the others still take it and run.
 static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
 
 fn put(v: &mut TreeActor, path: &str, bytes: &[u8]) {
@@ -71,7 +73,7 @@ const CHILDREN_PER_SAVE: u64 = 2;
 /// fast-import's; an unchanged file's blob is already known.
 const OBJECTS_PER_SAVE: u64 = 2;
 
-/// The objects one save of a file stores, counted in the pack: the file's
+/// The objects one save of a file stores, counted by id: the file's
 /// blob and line map, the seven folders on their two paths (the commit's own
 /// tree, `files/`, `files/<aa>/`, `files/<aa>/<bb>/` and the same under
 /// `lines/`) and the commit. Its name history is unchanged.
@@ -81,7 +83,7 @@ const STORED_PER_SAVE: u64 = 10;
 /// does for each, stage by stage.
 #[test]
 fn stages_add_up() {
-    let _one = ONE_AT_A_TIME.lock().unwrap();
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(PoisonError::into_inner);
     let tmp = tempfile::tempdir().unwrap();
     let mut v = new_actor(&tmp.path().join("state"));
     put(&mut v, "a", b"seed\n");
@@ -131,7 +133,7 @@ fn stages_add_up() {
 /// of the file (docs/trees.md, "File maps").
 #[test]
 fn bytes_copied_per_write_is_its_own() {
-    let _one = ONE_AT_A_TIME.lock().unwrap();
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(PoisonError::into_inner);
     let tmp = tempfile::tempdir().unwrap();
     let mut v = new_actor(&tmp.path().join("state"));
     let h = v
@@ -155,7 +157,7 @@ fn bytes_copied_per_write_is_its_own() {
 /// runs, never the whole file.
 #[test]
 fn unchanged_compares_only_the_opens_runs() {
-    let _one = ONE_AT_A_TIME.lock().unwrap();
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(PoisonError::into_inner);
     let tmp = tempfile::tempdir().unwrap();
     let mut v = new_actor(&tmp.path().join("state"));
     let file: Vec<u8> = (0..(1 << 20)).map(|i| (i % 251) as u8).collect();
@@ -181,7 +183,7 @@ fn unchanged_compares_only_the_opens_runs() {
 #[cfg(feature = "failpoints")]
 #[test]
 fn the_call_path_runs_no_git() {
-    let _one = ONE_AT_A_TIME.lock().unwrap();
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(PoisonError::into_inner);
     let tmp = tempfile::tempdir().unwrap();
     let rec = Recording::create(
         &tmp.path().join("state"),
@@ -231,7 +233,7 @@ fn the_call_path_runs_no_git() {
 /// run, from the lock taken to its release; the longest is kept.
 #[test]
 fn each_hold_of_the_actor_lock_is_counted() {
-    let _one = ONE_AT_A_TIME.lock().unwrap();
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(PoisonError::into_inner);
     let tmp = tempfile::tempdir().unwrap();
     let rec = Recording::create(
         &tmp.path().join("state"),
@@ -259,7 +261,7 @@ fn each_hold_of_the_actor_lock_is_counted() {
 /// builder's batch makes the close's record durable with one more.
 #[test]
 fn a_call_is_not_fsynced_and_flush_fsyncs_once() {
-    let _one = ONE_AT_A_TIME.lock().unwrap();
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(PoisonError::into_inner);
     let tmp = tempfile::tempdir().unwrap();
     let rec = Recording::create(
         &tmp.path().join("state"),
@@ -295,22 +297,29 @@ fn a_call_is_not_fsynced_and_flush_fsyncs_once() {
     assert_eq!(after.journal_append.count - before.journal_append.count, 10);
 }
 
-/// Objects in the store's packs, as `git count-objects` counts them.
-fn packed(state: &Path) -> u64 {
+/// The distinct objects the store holds, by id. The history's repack runs in
+/// the background at each built event and deletes the packs it rolled up only
+/// at a later run, so a count of packed copies (`git count-objects`
+/// "in-pack") rises and falls with it; nothing prunes, so the set of ids
+/// only grows.
+fn stored(state: &Path) -> BTreeSet<String> {
     let out = std::process::Command::new("git")
         .arg("--git-dir")
         .arg(state.join("history.git"))
-        .args(["count-objects", "-v"])
+        .args([
+            "cat-file",
+            "--batch-all-objects",
+            "--batch-check=%(objectname)",
+            "--unordered",
+        ])
         .output()
         .unwrap();
     assert!(out.status.success());
     String::from_utf8(out.stdout)
         .unwrap()
         .lines()
-        .find_map(|l| l.strip_prefix("in-pack: "))
-        .unwrap()
-        .parse()
-        .unwrap()
+        .map(str::to_owned)
+        .collect()
 }
 
 /// A volume whose root holds `files` files, `f0` to `f<files - 1>`, then `a`,
@@ -331,17 +340,17 @@ fn filled(state: &Path, files: usize) -> TreeActor {
 /// same Git children.
 #[test]
 fn a_save_stores_the_same_objects_at_100_and_10000_files() {
-    let _one = ONE_AT_A_TIME.lock().unwrap();
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(PoisonError::into_inner);
     let cost = |files: usize| {
         let tmp = tempfile::tempdir().unwrap();
         let state = tmp.path().join("state");
         let mut v = filled(&state, files);
-        let (before, stored) = (v.metrics().stages, packed(&state));
+        let (before, held) = (v.metrics().stages, stored(&state));
         put(&mut v, "a", b"changed\n");
         v.settle().unwrap();
         let after = v.metrics().stages;
         (
-            packed(&state) - stored,
+            stored(&state).difference(&held).count() as u64,
             after.object_writes - before.object_writes,
             after.git_children - before.git_children,
         )
@@ -355,7 +364,7 @@ fn a_save_stores_the_same_objects_at_100_and_10000_files() {
 /// `git diff` child, so a create's save starts only `git fast-import`.
 #[test]
 fn an_empty_files_first_alignment_runs_no_child() {
-    let _one = ONE_AT_A_TIME.lock().unwrap();
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(PoisonError::into_inner);
     let tmp = tempfile::tempdir().unwrap();
     let mut v = new_actor(&tmp.path().join("state"));
     v.settle().unwrap();
@@ -429,7 +438,7 @@ fn listed(state: &Path, top: &str) -> Vec<String> {
 /// hash-object --stdin` of the name or the identity in decimal.
 #[test]
 fn fanout_matches_git_hash_object() {
-    let _one = ONE_AT_A_TIME.lock().unwrap();
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(PoisonError::into_inner);
     let tmp = tempfile::tempdir().unwrap();
     let state = tmp.path().join("state");
     let mut v = new_actor(&state);
@@ -479,7 +488,7 @@ fn fanout_matches_git_hash_object() {
 /// 10,000 (two fixed levels of 256, never a fan-out that grows).
 #[test]
 fn a_files_path_never_changes_when_siblings_are_added() {
-    let _one = ONE_AT_A_TIME.lock().unwrap();
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(PoisonError::into_inner);
     let path = |files: usize| {
         let tmp = tempfile::tempdir().unwrap();
         let state = tmp.path().join("state");
@@ -500,7 +509,7 @@ fn a_files_path_never_changes_when_siblings_are_added() {
 /// each sync walking the whole history, one child per commit).
 #[test]
 fn a_sync_costs_the_same_children_at_any_history_length() {
-    let _one = ONE_AT_A_TIME.lock().unwrap();
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(PoisonError::into_inner);
     let tmp = tempfile::tempdir().unwrap();
     let state = tmp.path().join("state");
     let mut v = new_actor(&state);
@@ -544,7 +553,7 @@ fn a_sync_costs_the_same_children_at_any_history_length() {
 /// lines it wrote, so a sync costs the same children for 10 lines and 600.
 #[test]
 fn a_sync_costs_the_same_children_for_any_number_of_lines() {
-    let _one = ONE_AT_A_TIME.lock().unwrap();
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(PoisonError::into_inner);
     // A volume of its own for each size, so each save meets the same tree.
     let children = |lines: usize| {
         let tmp = tempfile::tempdir().unwrap();
