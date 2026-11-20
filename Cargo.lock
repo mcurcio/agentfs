@@ -48,6 +48,7 @@ dependencies = [
  "agentfs-core",
  "agentfs-csi",
  "agentfs-fuse",
+ "agentfs-rules",
  "agentfs-trees",
  "agentfs-volume",
  "anyhow",

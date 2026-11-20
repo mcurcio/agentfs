@@ -2,9 +2,10 @@ name: hermes
 
 # Upstream Hermes on agentfs in kind, one configuration per
 # job, each on its own runner (ci/e2e-hermes-kind.sh): the sidecar pod of
-# docs/deployment.md with the migration of existing data and a
-# sidecar-only restart, its read-only fence alternative, and Hermes on a
-# CSI volume. The Compose suite is docker.yml's hermes job.
+# docs/deployment.md on the tree engine, with the migration Job of existing
+# data and a sidecar-only restart, its read-only fence alternative, and
+# Hermes on a CSI volume (the recording engine). The Compose suite is
+# docker.yml's hermes job.
 
 on:
   push:
@@ -16,6 +17,7 @@ on:
       - ci/e2e-hermes-kind.sh
       - ci/hermes/**
       - ci/lib.sh
+      - ci/tree-git-test-lib.sh
       - ci/k8s/**
       - ci/k8s-csi/driver/**
       - ci/kind/**
@@ -97,6 +99,8 @@ jobs:
             --image "$KIND_NODE_IMAGE" --wait 120s
           kind load image-archive "$RUNNER_TEMP/agentfs-image.tar" --name agentfs-hermes
           kubectl get nodes -o wide
+      # The csi job's remote; the sidecar and fence jobs log theirs as not
+      # built and never reach it.
       - name: start git server
         run: |
           GIT_SERVER_EXTRA_LISTEN=$(ci/e2e-hermes-kind.sh gateway) \
