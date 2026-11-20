@@ -336,9 +336,10 @@ recorded and visible through the main mount at once. It is a boundary for
 names. The operator's view is the [sandbox-overlay
 runbook](../runbooks/sandbox-overlay.md).
 
-Turn it on with `mount --sandbox-overlay PATH --sandbox-owner UID:GID`.
-Its source is `agentfs:<volume>:sandbox-overlay`, so `probe` and recovery tell
-the two mounts apart.
+The `agentfs` binary does not serve it: tree volumes do not build it yet. A
+program linking `agentfs-fuse` turns it on with `MountConfig::overlay`. Its
+source is `agentfs:<volume>:sandbox-overlay`, so recovery tells the two mounts
+apart.
 
 **One daemon, two sessions, one `Ops`.** The daemon serves both mount points
 as two FUSE sessions over one `Ops`: one inode table, one name ordering, one
@@ -437,8 +438,8 @@ is the module documentation of `agentfs-fuse`'s `overlay.rs`.
   tested.
 - Locks are not shared between the two mounts, and mode-bit checks run outside
   the names lock.
-- The overlay is served only by a single-process `mount`. It is refused on a
-  front, so it is not available on CSI volumes. It is also refused with
+- The overlay is served only by a single-process `Mount` with no front; the
+  `agentfs` binary serves none. It is also refused with
   `agentfs.respectTreeRules`, whose rule files a sandbox could edit.
 
 **Boot refusals.** Each exits 1 before anything is mounted: tree rules, an
@@ -450,16 +451,23 @@ outside stops the daemon, which unmounts the other.
 
 ## The `agentfs` command
 
-The binary composes the layers: it takes the state-area lock, opens the
-volume, runs the patch phase, starts the service and the push loops, mounts
-FUSE, serves the control socket, and on a signal shuts down in order.
+The binary runs two engines. `init`, `mount` and `fork end` run the tree views
+([below](#tree-views), and [trees](../trees.md)): the sidecar's, Docker's and the
+command line's launcher. The other commands run the recording engine as the CSI
+driver runs it ([csi](../csi.md)): a history service and a front per pod. No flag
+selects an engine. Every recording command refuses a tree volume before it reads
+or writes anything (`` `agentfs push` runs on the recording engine only; <state>
+is a tree volume, where it is not built yet ``, exit 1), and `init` and `mount`
+refuse a recording state area, naming the
+[upgrading runbook](../runbooks/upgrading-the-sidecar.md).
 
 ### Commands
 
 | Command | What it does |
 |---|---|
-| `init` | Creates a state area, or accepts one that already belongs to the volume. Safe to run at every start. Exit 0 for the volume it holds, 1 for another volume or branch. `--include` sets the config's `include.path` entries; `--root` creates the backing tree |
-| `mount` | Mounts a backing tree at a mount point and runs the commit and push loops in the same process until SIGINT, SIGTERM or an unmount |
+| `init` | Creates a tree volume, or finds it under the same name; prints `<name> <id> created\|found`. Safe to run at every start. Exit 1 for another name or format, 75 busy. `--include` sets the operator settings' includes; `--owner` the new root's owner |
+| `mount` | Serves a tree volume's root, and optionally a fork, as tree views until SIGINT, SIGTERM, the exit of `-- COMMAND` or an unmount |
+| `front` | A front of a history service: a FUSE mount of a backing tree whose records go to the service. Only the CSI node plugin starts it |
 | `run` | Runs the commit and push loops in the foreground with no mount, serving `push` on the control socket |
 | `serve-history` | The history service of a volume, for fronts on the same node |
 | `serve-git` | Serves the volume's history repository over git's smart HTTP as the patch source. Takes no lock |
@@ -467,15 +475,14 @@ FUSE, serves the control socket, and on a signal shuts down in order.
 | `flush` | Commits every recorded change now |
 | `push` | Pushes once to every remote (or those named with `--remote`). With a daemon running, asks it over the control socket |
 | `status` | Read only: the head, the last committed sequence, the backlog, the lock holder, the LFS threshold and each remote's state. Takes no lock |
-| `probe` | Reports whether a mount point holds a live agentfs mount. Takes no lock and reads no state area |
+| `probe` | Reports whether a mount point holds a live agentfs mount, a tree view or a front. Takes no lock and reads no state area |
 | `restore` | Writes a path back as it was in a commit |
 | `revert` | Undoes a commit's changes |
 | `checkpoint` | Cuts a checkpoint on the change line |
 | `patch` | The patch queue |
 | `lfs` | The local LFS object cache |
-| `fork` | Forked volumes |
+| `fork` | Forked volumes, and `fork end` for a tree volume's keyed fork |
 | `start` | A volume started from another branch |
-| `trees` | The git-backed tree views (below) |
 
 Nested commands:
 
@@ -483,13 +490,12 @@ Nested commands:
 |---|---|
 | `patch` | `submit` (the producer's side, in its own git repository), `approve`, `apply`, `status` |
 | `lfs` | `fetch`, `prune` |
-| `fork` | `create`, `finish`, `status`, `abandon`, `list`, `deliver` |
+| `fork` | `create`, `finish`, `status`, `abandon`, `list`, `deliver`; `end` (tree volumes) |
 | `start` | `accept` |
-| `trees` | `init`, `fork`, `mount` |
 | `serve-git` | `admit` and `arrived`, the git hooks, hidden from help |
 
-A finished fork is read-only: `mount` (not a front), `run`, `record`,
-`restore`, `revert` and `patch` `apply` refuse it.
+A finished fork is read-only: `run`, `record`, `restore`, `revert` and `patch`
+`apply` refuse it; its front mounts read-only.
 
 Details worth knowing before you script them:
 
@@ -497,14 +503,12 @@ Details worth knowing before you script them:
   daemon. `push` prints a `queue:` line for the patch remote.
 - `probe MOUNTPOINT [--allow-stale]` exits 0 for a live agentfs mount; 1 for a
   stale one (0 with `--allow-stale`), for nothing, and for another
-  filesystem. With `--sandbox-overlay` it expects the overlay's mount, and a
-  mount of the other kind is exit 1 either way round. It is the startup and
-  readiness probe.
+  filesystem. It is the startup and readiness probe.
 - `restore PATH COMMIT` and `revert COMMIT` take `--force` and `--dry-run`.
-  Through a running mount or the history service, they go over the control
-  socket. With nothing running they write `--root` directly. Exit 0 done, 1
-  refused (with a reason and a hint) or failed, 75 busy. A restore or revert
-  is recorded as one commit.
+  Through the history service, they go over the control socket. With nothing
+  running they write `--root` directly. Exit 0 done, 1 refused (with a reason
+  and a hint) or failed, 75 busy. A restore or revert is recorded as one
+  commit.
 - `patch apply` with nothing running fetches and applies the queue under the
   lock. With a daemon running it asks the daemon, which judges without landing
   and says so (exit 75, "workload attached; lands at next mount").
@@ -520,76 +524,43 @@ Details worth knowing before you script them:
 
 ### The state-area lock and exit codes
 
-`mount`, `run`, `serve-history`, `record`, `flush`, `patch apply`, `fork
-create`, `fork finish`, `fork abandon`, and `init` of an existing state area
-take the state-area lock. They exit **75** (`EX_TEMPFAIL`) while another
-process holds it, unless `--wait-lock DURATION` (`AGENTFS_WAIT_LOCK`) says to
-wait. `push`, `restore` and `revert` take it only in direct mode, with no
-daemon answering. Fronts take no lock.
+`run`, `serve-history`, `record`, `flush`, `patch apply`, `fork create`, `fork
+finish` and `fork abandon` take the state-area lock. They exit **75**
+(`EX_TEMPFAIL`) while another process holds it, unless `--wait-lock DURATION`
+(`AGENTFS_WAIT_LOCK`) says to wait. `push`, `restore` and `revert` take it only
+in direct mode, with no daemon answering. Fronts take no lock. `init`, `mount`
+and `fork end` hold a tree volume's own lock (`actor.lock`) and exit 75 at once
+while another process holds it; they refuse `--wait-lock`.
 
 | Code | Meaning |
 |---|---|
 | 0 | Done |
 | 1 | Refused or failed. The message says why and, where there is one, the next command |
 | 75 | The state area, or the cache lock, is busy, or a remote is being pushed (`push --lease`): try again |
+| 127 | `mount -- COMMAND`: the command could not start |
 | 130 | A second signal arrived during shutdown: the process exits at once |
 
-### `mount`: order and shutdown
+### `front`: order and shutdown
 
-**Order.** Preflight; lock; open the volume (journal replay, repairs); the
-patch phase (fetch the inbox within `agentfs.patchFetchTimeout`, apply the
-queue, block on the first failure); then the service and the push loops;
-then the FUSE session; then the control socket. A blocked queue never stops
-the mount. The overlay, when asked for, is mounted last, so a probe of it
-gates on both mounts. If it fails to mount, the main mount is unmounted as at
-a stop.
+`front --history-service ADDR BACKING MOUNTPOINT` is a front: no lock and no
+control socket. **Order:** preflight (layout checks; a missing mount point is
+created); lease a pending slot; connect to the service, waiting up to
+`--history-wait` (30 s) and exiting 1 with nothing mounted if it never answers;
+then the FUSE session, whose repair queue is the slot's
+`meta/fronts/slot-N.repairs`. Every round trip is bounded by
+`--history-timeout` (10 s). `--history-slot N` asks for a particular slot, so
+a front restarted after a crash drains its predecessor's repairs; the CSI
+driver stacks a restarted front over its stale mount itself.
 
-**A mount point that is not empty** (and not stale) is mounted over with a
-warning: what is in it is hidden and was not recorded.
-
-**`--seal-mountpoint`** (`AGENTFS_SEAL_MOUNTPOINT`) makes the bare mount point
-root's with mode 0000 before mounting (needs root). What a workload reaches
-while no daemon is mounted is then a directory no non-root process can write:
-`EACCES` instead of a write nothing records. It seals the overlay's mount point
-too.
-
-**A stale mount point** (`--on-stale-mount`):
-
-- `refuse` (the default) exits 1 with the command that clears it.
-- `hold` mounts nothing and takes no lock, waits for SIGINT or SIGTERM, then
-  lazily detaches every stale layer and exits 1. Recovery is then a restart by
-  hand.
-- `recover` is for a restarted sidecar. It takes the lock (the kernel released
-  the dead daemon's), opens the volume, mounts FUSE at `<state>/meta/stack/mnt`,
-  bind-mounts that over the stale mount point, makes the new layer shared and
-  lazily detaches the private directory. Mount propagation carries the new
-  layer into every copy of the stale mount: workload containers and `subPath`
-  binds. It never detaches the stale mount first, because workload containers
-  hold copies and their writes would reach the bare directory in between. It
-  needs `CAP_SYS_ADMIN`, is refused for fronts (the CSI driver stacks those),
-  and refuses (exit 1, naming both) a stale mount whose source is not
-  `agentfs:<this volume>`, since stacking over another volume's dead mount
-  would send that volume's workloads into this one's history. With nothing
-  stale, `recover` is a normal mount. After each stop, a mount detaches the
-  stale layers (at most 16) still at its mount point.
-
-**Shutdown** on SIGINT, SIGTERM or an external unmount:
-
-1. Stop the control socket, which refuses a client's connect from then on.
-2. Unmount: a plain unmount, then a lazy detach if busy (`fusermount3 -u`,
-   then `-u -z`, when not root), and wait up to `--unmount-grace` (10 s) for
-   the session to end.
-3. Run a final sweep and capture every fsync-class group with changes.
-4. Make the final commit.
-5. Push it once more to each remote that lacks commits, within `--push-grace`
-   (default 5 s).
-6. Flush telemetry and release the lock.
-
-A second signal exits 130.
+**Shutdown** on SIGINT, SIGTERM or an external unmount: stop answering the
+service's calls; unmount (a plain unmount, then a lazy detach if busy) and wait
+up to `--unmount-grace` (10 s) for the session to end; run a final sweep and
+capture every fsync-class group with changes; flush telemetry. The commit and
+the pushes are the service's. A second signal exits 130.
 
 ### The control socket
 
-A running `mount`, `run` or `serve-history` listens on
+A running `run` or `serve-history` listens on
 `<state>/meta/control/agentfs.sock` while it holds the lock. The directory is
 `0700`, the socket `0600`, and each connection's peer credentials
 (`SO_PEERCRED`) must be root or the daemon's own user. Both ends address the
@@ -614,25 +585,17 @@ A reply is `{"ok":{...}}`, `{"pushed":{...}}`, `{"received":{...}}`,
 `{"error":"..."}`.
 
 One restore or revert runs at a time; a second gets `busy`. Pushes run beside
-them and each other. `mount` writes a restore through its own mount.
+them and each other.
 `serve-history` writes it into the backing tree after calling every live front
 to settle, report open files and drop caches. `run` serves no mount, so it
 answers `restore` and `revert` with `busy`. A daemon from before a newer operation answers `{"error":"malformed
 request: unknown variant ..."}`, and the command then falls back to its direct
 path, which the lock refuses with exit 75.
 
-### Fronts
+### The history service
 
-`mount --history-service ADDR` is a front: no lock and no control socket.
-Order: preflight; lease a pending slot; connect to the service, waiting up to
-`--history-wait` (30 s) and exiting 1 with nothing mounted if it never answers;
-then the FUSE session, whose repair queue is the slot's
-`meta/fronts/slot-N.repairs`. Every round trip is bounded by
-`--history-timeout` (10 s). `--history-slot N` asks for a particular slot, so
-a front restarted after a crash drains its predecessor's repairs.
-Shutdown is as for `mount`, without the commit and the pushes, which are the
-service's. `record --history-service ADDR` records paths through the service
-in the same way.
+`record --history-service ADDR` records paths through the service as a front
+does.
 
 `serve-history --root BACKING` takes the lock (holder `command=serve-history`),
 opens the volume, applies the patch queue only when no front lease is live and
@@ -650,42 +613,54 @@ and the [history-service-down runbook](../runbooks/history-service-down.md).
 
 ### Telemetry
 
-`mount`, `flush`, `record`, `push` and `run` export OpenTelemetry signals over
+`front`, `flush`, `record`, `push` and `run` export OpenTelemetry signals over
 OTLP when the standard `OTEL_*` variables configure an endpoint, and print
-alarms to stderr. `init` and `status` export nothing. All of these commands
+alarms to stderr. `mount` exports the `agentfs.not_built` gauge (one series
+per capability a configured setting needs and tree volumes do not build) and
+the export-failure counter. `init` and `status` export nothing. All of these commands
 take the pod flags (`--pod`, `--namespace`, `--node`, `--replica` and their
 `AGENTFS_*` variables), so every command's telemetry resource is the same.
 See [telemetry](../telemetry.md).
 
 ## Tree views
 
-`trees` is a separate set of commands over a git-backed tree library
-(`agentfs_core::tree_actor`). It has its own state format, not the volume's,
-and it mounts directories and regular files with their recorded modes. Use it to
-try the model; it is not a replacement for `mount`.
+`init`, `mount` and `fork end` run the tree views over a git-backed tree library
+(`agentfs_core::tree_actor`), with their own state format, mounting directories
+and regular files with their recorded modes ([trees](../trees.md)).
 
 ```sh
-agentfs --state STATE trees init --volume NAME
-agentfs --state STATE trees mount ROOT --fork-mount FORK [--fork-key KEY]
-agentfs --state STATE trees end --fork-key KEY
+agentfs --state STATE init --volume NAME [--include FILE]... [--owner UID:GID]
+agentfs --state STATE mount ROOT [--fork-mount FORK [--fork-key KEY]] [-- COMMAND...]
+agentfs --state STATE fork end --fork-key KEY
 ```
 
-`trees mount` recovers and mounts the root's view, and with `--fork-mount` also a
-fork (`fork/N`) of it: a new one, which ends when its view is unmounted, or the
-open fork under `--fork-key`; it never creates a volume. Each view is a client of
-its tree: the command rebinds the client a killed mount left (same launcher,
-tree, label and access), else attaches one, then ends its launcher's other
-clients and drops the ended forks nothing holds, and detaches each client as its
-view ends ([trees](../trees.md#clients)). One dispatcher hands each domain event
-to its consumer after the call that caused it: `LastDetached` to Trees (an
-unkeyed fork ends), `ForkDropped` to Clients (its writer claim is released), and
-each landing the view host takes makes Trees judge the drops again
-([forks](../trees.md#forks-keys-end-and-the-drop)). `--writer` and
-`--fork-writer` are the clients' labels; `--read-only` and `--fork-read-only`
-make a client read-only. A fork's second read-write client exits 1. `trees end`
-ends a keyed fork (exit 75 while a mount holds the volume). The views mount with FUSE `allow_other` unless `--no-allow-other`
-(`MountOptions`), each entry presented with its recorded owner, and `--metrics-output FILE`
-writes counters every 100 ms and at unmount. Unmount every view to exit.
+`mount` first judges each view's mount point (a live or foreign mount exits 1; a
+stale one is refused, held or stacked over by `--on-stale-mount`; a bare one is
+created when missing, refused when it holds files, and sealed with
+`--seal-mountpoint`), then reads the operator settings (`<state>/config`, an
+include under a view refused, each key not built yet logged and counted by
+`agentfs.not_built`), then recovers and mounts the root's view, and with
+`--fork-mount` also a fork (`fork/N`) of it: a new one, which ends when its view
+is unmounted, or the open fork under `--fork-key`; it never creates a volume.
+Each view is a client of its tree: the command rebinds the client a killed mount
+left (same launcher, tree, label and access), else attaches one, then ends its
+launcher's other clients and drops the ended forks nothing holds, and detaches
+each client as its view ends ([trees](../trees.md#clients)). One dispatcher
+hands each domain event to its consumer after the call that caused it:
+`LastDetached` to Trees (an unkeyed fork ends), `ForkDropped` to Clients (its
+writer claim is released), and each landing the view host takes makes Trees
+judge the drops again ([forks](../trees.md#forks-keys-end-and-the-drop)).
+`--writer` and `--fork-writer` are the clients' labels; `--read-only` and
+`--fork-read-only` make a client read-only. A fork's second read-write client
+exits 1. Once every view is up it prints `mounted volume NAME at ROOT[, fork
+fork/N at FORK]` and starts `-- COMMAND`, whose exit drains the volume and whose
+status, when not 0, is the mount's ([trees](../trees.md#running-a-command-in-the-mount)).
+`fork end` ends a keyed fork (exit 75 while a mount holds the volume). The views
+mount as `agentfs:<volume>` (a fork's as `agentfs:<volume>:<tree>`), with FUSE
+`allow_other` unless `--no-allow-other` (`MountOptions`), each entry presented
+with its recorded owner, and `--metrics-output FILE` writes counters every
+100 ms and at unmount. A stop, the command's exit or unmounting every view
+drains it.
 
 ### The view host
 
@@ -837,7 +812,7 @@ journal and the final release publishes. The code is `agentfs_fuse::tree_view`
   hard link made before the mount and never looked up is not known, so a
   change through another name is not recorded at it.
 - It does not commit or push by itself. The core layer's `Service` does;
-  `agentfs mount` runs both.
-- It does not serve the sandbox overlay on a front.
+  `agentfs serve-history` and `run` run it.
+- The `agentfs` binary serves no sandbox overlay.
 - It needs Linux 5.6 or later for the confined `openat2` access, and kernel
   6.9 or later with privileges for passthrough.

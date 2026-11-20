@@ -255,22 +255,27 @@ missing from these tables or a row names a module that no longer exists;
 
 | Module | Role |
 |---|---|
-| `trees_cmd.rs` | `trees init` (`ensure` through the Volume domain), `mount` and `end` composition root (`mount` stages through the Volume domain; a fork through the Trees domain on the store adapter; per view a client rebound or attached through the Clients domain, the rest reconciled, each served by the view host and detached as its view ends; SIGTERM, SIGINT or the last view's end unstages, and it exits once Volume releases; one channel carries every trigger of its loop); separate state format |
+| `launcher/mod.rs` | The tree engine's composition root: `init` (`ensure` through the Volume domain, then recovery and the operator settings' includes), `mount` and `fork end` (`mount` prepares its mount points, reads the operator settings, stages through the Volume domain; a fork through the Trees domain on the store adapter; per view a client rebound or attached through the Clients domain, the rest reconciled, each served by the view host and detached as its view ends; SIGTERM, SIGINT, the command's exit or the last view's end unstages, and it exits once Volume releases; one channel carries every trigger of its loop) |
+| `launcher/domains.rs` | One volume's domains restored on one store, and the one dispatcher that hands each domain event to its consumers |
+| `launcher/mountpoint.rs` | Each view's mount point before staging: a live or foreign mount refused, a stale one refused, held or stacked over (`--on-stale-mount`), a bare one created, checked empty and sealed |
+| `launcher/settings.rs` | The operator settings at every mount: includes under a view refused, missing ones warned of, each not-built key logged and counted |
+| `launcher/command.rs` | `mount -- COMMAND`: the command spawned once every view is up, its exit a trigger of the loop, a stop sent on as SIGTERM through a pidfd |
+| `mountpoint.rs` | Creating and sealing a bare mount point, shared by the launcher and the front |
 | `shared.rs` | One domain service shared on the composition root's thread (`Shared`): Trees, asked `facts` by Clients; Clients, asked `attached_any` by Volume (none until restored) |
 | `domain_events.rs` | The composition root's in-process event queue (`DomainEvents`): every domain service of a volume publishes to one, in order |
-| `pod_args.rs` | The pod flags (`--namespace`, `--pod`, `--pod-uid`, `--node`) one clap group shares between the recording engine's commands and `trees` |
-| `main.rs` | The CLI (`Cli`), command dispatch, `init`, `status`, `record`, `flush`, `push` (direct), `run` and `mount` |
-| `daemon.rs` | Signals and shutdown for `run` and `mount` |
-| `front.rs` | `mount --history-service`: a front of a history service |
+| `pod_args.rs` | The pod flags (`--namespace`, `--pod`, `--pod-uid`, `--node`) one clap group shares between the recording engine's commands and `init`, `mount` and `fork end` |
+| `main.rs` | The CLI (`Cli`), command dispatch, the tree-volume guard of every recording command, `probe`, `status`, `record`, `flush`, `push` (direct) and `run` |
+| `daemon.rs` | Signals and shutdown for `run`, `front` and a held `mount` |
+| `front.rs` | `agentfs front`: a front of a history service, which only the CSI node plugin starts, and `record --history-service` |
 | `serve_history.rs` | `agentfs serve-history`: the history service of a volume |
 | `serve_git.rs` | `agentfs serve-git`: the history repository as a git server for patch pushes (`git http-backend` behind an HTTP server), and its `pre-receive` and `post-receive` hooks |
-| `hold.rs` | `mount --on-stale-mount hold`: a restarted sidecar waiting out a stale mount (`recover`, which mounts over it, is in `main.rs`) |
-| `control.rs` | The control socket of a running daemon (`mount`, `run`, `serve-history`), through which `push`, `restore` and `revert` act |
+| `hold.rs` | `mount --on-stale-mount hold`: a restarted sidecar waiting out a stale mount (`recover`, which stacks over it, is the view host's) |
+| `control.rs` | The control socket of a running daemon (`run`, `serve-history`), through which `push`, `restore` and `revert` act |
 | `push_now.rs` | `agentfs push` through a running daemon: the daemon's handler and the client |
-| `recovery.rs` | `agentfs restore` and `agentfs revert`, through a mount, through the history service, or directly |
-| `patch_cmd.rs` | `agentfs patch` and the mount's patch phase |
+| `recovery.rs` | `agentfs restore` and `agentfs revert`, through the history service, or directly |
+| `patch_cmd.rs` | `agentfs patch` and the history service's patch phase |
 | `checkpoint_cmd.rs` | `agentfs checkpoint`: through a running daemon's control socket (its commit loop cuts it), else under the state-area lock |
-| `fork_cmd.rs` | `agentfs fork create`, `finish` (`--retry`), `status`, `abandon`, `list` and `deliver` |
+| `fork_cmd.rs` | `agentfs fork create`, `finish` (`--retry`), `status`, `abandon`, `list` and `deliver` (`fork end` is the launcher's) |
 | `start_cmd.rs` | `agentfs start accept --tip`: a started volume's answer to the start-branch alarm |
 | `lfs_cmd.rs` | `agentfs lfs`: fetching objects into the local LFS cache, and pruning it |
 | `otel.rs` | Telemetry export: the OpenTelemetry SDK, exporters (http/protobuf, http/json, gRPC on its own runtime) and the environment it reads |
@@ -417,7 +422,8 @@ order:
 
 SIGINT, SIGTERM or an external unmount start it (`daemon.rs`); a second
 signal exits at once with status 130, which the journal makes safe. For
-`mount` (`main.rs`, `mount.rs` `Mounted::shutdown`, `service.rs`):
+a recording mount (`front.rs`, `mount.rs` `Mounted::shutdown`, and the
+history service's `service.rs`):
 
 1. a restore in progress through the control socket gets up to
    `--unmount-grace` to finish (`control.rs`);
@@ -503,8 +509,7 @@ test builds only) that stop the process at that point; the crash
 harnesses kill or fail at each of them and check
 that nothing promised is lost and nothing is committed twice: the engine
 matrix in `agentfs-core/tests/crash_points.rs`, the processes in
-`agentfs/tests/crash_daemon.rs` and the FUSE mount in
-`agentfs/tests/crash_mount.rs` (run by `ci/crash-tests.sh`). `none`:
+`agentfs/tests/crash_daemon.rs` (run by `ci/crash-tests.sh`). `none`:
 covered by the process-level tests named in [development](development.md) instead.
 
 The daemon never holds the only copy of anything a returned call

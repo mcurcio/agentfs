@@ -39,8 +39,8 @@ include operator-owned fragments, for example a Kubernetes ConfigMap
 mounted read-only at `/etc/agentfs/config` (see
 [deployment.md](deployment.md)). Their keys count as if they were in
 `<state>/git/config`, at the point of the include, so a key after the
-include in the own file wins, as in git. `agentfs init --include FILE`
-sets the entries (repeatable; a re-run replaces them). agentfs is stricter
+include in the own file wins, as in git. The CSI driver sets the entries
+from its volume's profile ([csi](csi.md)). agentfs is stricter
 than git about includes, and every command that opens the volume fails
 when one is wrong:
 
@@ -52,7 +52,7 @@ when one is wrong:
 - a fragment must not set `agentfs.volume` or `agentfs.branch`: the
   volume's identity belongs to its state area, set by `agentfs init`;
 - conditional includes (`includeIf.<condition>.path`) are refused;
-- `agentfs mount` refuses an include under the backing tree or the mount
+- `agentfs front` refuses an include under the backing tree or the mount
   point, where the workload could rewrite it, like a credentials file.
 
 The `git` CLI reads the same includes, so `git --git-dir <state>/git
@@ -62,7 +62,7 @@ config --list --show-origin` shows where each key comes from.
 
 | Key | Type | Default | Meaning and validation |
 |---|---|---|---|
-| `include.path` | absolute path, repeatable | none | An operator config fragment whose keys count as the repository's own, at the point of the include. Must exist, be a readable regular file, not set `agentfs.volume` or `agentfs.branch`, and (for `mount`) be outside the backing tree and the mount point. Set by `agentfs init --include` |
+| `include.path` | absolute path, repeatable | none | An operator config fragment whose keys count as the repository's own, at the point of the include. Must exist, be a readable regular file, not set `agentfs.volume` or `agentfs.branch`, and (for `front`) be outside the backing tree and the mount point. Set by the CSI driver from its profile |
 | `includeIf.<condition>.path` | | | Refused: any conditional include fails every command that opens the volume |
 
 Set them with `git config`:
@@ -71,7 +71,7 @@ Set them with `git config`:
 git --git-dir /data/state/git config agentfs.pushInterval 30s
 ```
 
-`mount`, `run` and `serve-history` read the settings when they start;
+`serve-history`, its fronts and `run` read the settings when they start;
 changing a key takes a restart. `push` (when no daemon runs), `record`,
 `flush` and `status` read them at every run; `push` against a running
 daemon uses the daemon's settings. The
@@ -90,6 +90,29 @@ remotes carry on.
 Durations are `<integer><unit>` with unit `ms`, `s`, `m` or `h` (`200ms`,
 `60s`, `5m`). Sizes are integers with git's optional `k`, `m` or `g`
 suffix (`512k`, `100m`).
+
+### Tree volumes: the operator settings file
+
+A tree volume (`agentfs init` and `mount`, [trees](trees.md#operator-settings))
+keeps the operator's settings in `<state>/config`, git-config syntax,
+apart from `<state>/history.git/config`, which the engine rewrites and its
+git children read. `agentfs init --include FILE` (repeatable, each an
+absolute path that exists) makes the file exactly those `include.path`
+lines; without `--include` a re-run keeps them. Every `mount` reads it with
+libgit2, which follows the includes, and:
+
+- refuses (exit 1, before the volume is staged) an include under a view's
+  mount point, where the workload could change it;
+- warns `warning: operator settings: include <path> is missing` for an
+  include that does not exist (git skips it);
+- logs, at every boot, one line per key whose capability tree volumes do
+  not build yet: `not built: <key> (<capability>): <meaning>`, with
+  `capability` one of `push` (`remote.*`, `agentfs.pushInterval`,
+  `agentfs.forkRefs`, `http.proxy`), `patches` (`agentfs.patch*`,
+  `agentfsPusher.*`), `lfs` (`agentfs.lfsThreshold`, `lfs.*`, a remote's
+  LFS keys) and `other` (every other key, but `agentfs.nested = exclude`,
+  which tree volumes build). The `agentfs.not_built{capability}` gauge
+  counts them ([telemetry](telemetry.md)). The mount serves anyway.
 
 ## `[agentfs]`
 
@@ -271,7 +294,7 @@ count only there, never in a tracked `.gitattributes`, whatever
 | `agentfs.group` | name | unset: the path alone | For the `fsync` class: paths in one directory with the same group and the same stem (`app.db`, `app.db-wal`, `app.db-journal`) are captured together |
 | `agentfs.maxSize` | positive size (`k`, `m`, `g`: powers of 1024) | unset | Any path: content larger than this is refused (`PathRefused`, reason `max_size`), whether stored as a blob or LFS. In a group, it refuses the whole capture |
 
-**Tree volumes** (`agentfs trees`) read `<state>/history.git/info/exclude`
+**Tree volumes** (`agentfs init` and `mount`) read `<state>/history.git/info/exclude`
 and `<state>/history.git/info/attributes` when the volume opens
 ([trees](trees.md#rules-and-the-untracked-area)). They accept only `-agentfs`
 of the attributes above: any other `agentfs.<name>` attribute, `filter=lfs`
@@ -280,7 +303,7 @@ and `agentfs=<value>` refuse the volume, before anything is written, with
 Other git attributes are accepted and change nothing.
 
 Values of `agentfs.commit`, `agentfs.coalesce` and `agentfs.maxSize` are
-checked when the volume opens: a bad one fails `mount`, `run`, `record`
+checked when the volume opens: a bad one fails `front`, `run`, `record`
 and the other commands with
 `info/attributes line N: agentfs.coalesce=100ms: ...`. Attributes of
 other names are not checked, as in git. For SQLite:
@@ -374,7 +397,7 @@ soon as it is right. A missing or bad credential, key or passphrase, or an ssh-a
 be reached, fails as `auth`; a missing or unreadable known_hosts file as
 `untrusted_host`.
 
-`agentfs mount` additionally refuses to start (an error, not an alarm)
+`agentfs front` additionally refuses to start (an error, not an alarm)
 when any remote section, valid or not, names a credentials, key or
 known_hosts file under the backing tree or the mount point: the workload
 could read the secret, or rewrite known_hosts to trust any host.
@@ -610,7 +633,7 @@ kubectl create secret generic agentfs-origin-ssh \
 ```
 
 The key file's permissions are not checked (kubelet's mode varies); what
-protects it is that it is outside the mount, which `agentfs mount`
+protects it is that it is outside the mount, which `agentfs front`
 enforces.
 
 ## `[agentfsPusher "<name>"]`
@@ -666,7 +689,7 @@ printf '*.psd filter=lfs\n*.sqlite agentfs.store=blob\n' >> /data/state/git/info
 keeps a block of `filter=lfs diff=lfs merge=lfs -text` lines for the LFS
 paths at the end of the root `.gitattributes` **in history only**; the
 backing tree's own `.gitattributes` is never changed. Settings take effect
-at the next `mount` or `run`.
+at the next start of `serve-history` or `run`.
 
 ### Endpoints
 
@@ -730,7 +753,7 @@ A separate LFS host never sees the git host's credentials, and an `http`
 endpoint never gets those of an `https` remote. Redirects are not
 followed; the remote's proxy, if set, carries LFS requests too, and
 `HTTP(S)_PROXY` is ignored. The file is re-read when it
-changes; `agentfs mount` refuses one under the backing tree or the mount
+changes; `agentfs front` refuses one under the backing tree or the mount
 point.
 
 Two examples:
@@ -850,12 +873,22 @@ contacts an LFS endpoint. See
 `agentfs` has these subcommands. Every flag of each is in the next
 section. A subcommand with its own subcommands lists them after it.
 
-- `init`: create a volume's state area. It is safe to run again: exit 0
-  for the volume the state area already holds, 1 for another volume or
-  branch. `--root` creates the backing tree.
-- `mount`: run the FUSE session, the commit loop and the push loops in one
-  process. `--sandbox-overlay` also serves the sandbox overlay
-  ([operator guide](operator-guide.md#17-the-sandbox-overlay)).
+- `init`: create a tree volume, or find it ([trees](trees.md#run-it)).
+  Prints `<name> <id> created|found`; exit 1 for another name or another
+  format (a recording state area among them: never converted), 75 while
+  another process holds it. Safe to run at every start.
+- `mount`: stage a tree volume and serve its root, and optionally a fork,
+  as tree views; with `-- COMMAND`, run the command once every view is up
+  and drain when it exits. SIGTERM or SIGINT, the command's exit, or
+  unmounting every view drains it: each client is detached (its open files
+  saved first), each view unmounted lazily, and the process exits once the
+  volume is released, with the command's status when that is not 0 (127
+  when it could not start). Exit 75 while another process holds the
+  volume; exit 1 after a recording failure stopped it
+  ([lifecycle](trees.md#volume-lifecycle)). It never creates a volume.
+- `front`: a front of a history service: a FUSE mount of a backing tree
+  whose records go to the service. Only the CSI node plugin starts it
+  ([csi](csi.md)).
 - `run`: run the service in the foreground without a mount: it serves
   `push` on the control socket until a signal, makes a final commit, and
   gives each remote that lacks commits one more push.
@@ -883,18 +916,17 @@ section. A subcommand with its own subcommands lists them after it.
 - `lfs`: the LFS cache, with `fetch` and `prune`
   ([operator guide](operator-guide.md#13-large-files-lfs)).
 - `fork`: forked volumes ([forks](forks.md)), with `create`, `finish`,
-  `status`, `abandon`, `list` and `deliver`.
+  `status`, `abandon`, `list` and `deliver`; and `end`, which ends a tree
+  volume's keyed fork ([trees](trees.md#forks-keys-end-and-the-drop)): exit
+  75 while a mount holds the volume, 1 for an unknown key.
 - `start`: for a volume started from another worktree's branch
   ([moving](runbooks/moving.md)), with `accept`, which accepts a tip of
   the start branch and clears the start-branch alarm. It takes no lock.
-- `trees`: tree views ([trees](trees.md)), with `init`, `mount` and
-  `end`. `trees mount` stages the volume and serves its views; SIGTERM or
-  SIGINT, or unmounting every view, drains it: each client is detached (its
-  open files saved first), each view unmounted lazily, and the process exits
-  0 once the volume is released, which waits for every queue to empty and
-  every held file to close. Exit 75 while another process holds the volume;
-  exit 1 after a recording failure stopped it
-  ([lifecycle](trees.md#volume-lifecycle)).
+`init`, `mount`, `fork end` and `probe` are the tree engine's (`probe`
+reads no state area). Every other command runs the recording engine, which
+the CSI driver runs, and refuses a tree volume before it reads or writes
+anything: `` error: `agentfs push` runs on the recording engine only; <state>
+is a tree volume, where it is not built yet (docs/trees.md) ``, exit 1.
 
 Commands that write the state area take its lock and exit 75 while
 another process holds it ([operator guide](operator-guide.md#9-the-state-area-lock)).
@@ -910,66 +942,66 @@ variable). `agentfs <command> --help` prints them too.
 | Flag | Environment | Default | Commands |
 |---|---|---|---|
 | `--state DIR` | `AGENTFS_STATE` | `.` | all |
-| `--root DIR` | `AGENTFS_ROOT` | the current directory | all: required by `record` and `serve-history`; used by `flush`, `checkpoint`, `run`, `patch apply` (and `serve-git`'s `POST /agentfs/apply`), and `restore` and `revert` without a mount; must match the backing tree for `mount`; `init` creates it (mode 0755) when missing |
-| `--wait-lock DURATION` | `AGENTFS_WAIT_LOCK` | `0s`: exit 75 at once | all: those that take the state-area lock wait this long for it; `lfs prune` waits this long for the LFS cache lock that restores and fetches hold |
+| `--root DIR` | `AGENTFS_ROOT` | the current directory | all: the recording commands' only. Required by `record` and `serve-history`; used by `flush`, `checkpoint`, `run`, `patch apply` (and `serve-git`'s `POST /agentfs/apply`), and `restore` and `revert` without a history service; must match the backing tree for `front`. `init`, `mount` and `fork end` refuse it (exit 1): a tree volume has no backing tree |
+| `--wait-lock DURATION` | `AGENTFS_WAIT_LOCK` | `0s`: exit 75 at once | all: those that take the state-area lock wait this long for it; `lfs prune` waits this long for the LFS cache lock that restores and fetches hold. `init`, `mount` and `fork end` refuse a nonzero one (exit 1): a busy tree volume exits 75 at once |
 
 **Pod flags**, which name where the volume is mounted (see [recording](recording.md)). They fill the identity
 templates' variables, the commit trailers and the telemetry resource:
 
 | Flag | Environment | Default | Commands |
 |---|---|---|---|
-| `--namespace NAME`, `--pod NAME`, `--pod-uid UID`, `--node NAME`, `--replica NAME` | `AGENTFS_NAMESPACE`, `AGENTFS_POD`, `AGENTFS_POD_UID`, `AGENTFS_NODE`, `AGENTFS_REPLICA` | empty; `--pod-uid` defaults to the replica, and `--replica` (the committer's `{replica}`) to the pod name, else the host name. `mount` also records a given `--pod-uid` in `meta/attached.json` when the mount point is in that pod's own volume, so a different pod's start lands the patch queue over a mark the old pod's stop left (see [patches](patches.md)) | `mount`, `run`, `record`, `flush`, `push`, `checkpoint`, `serve-history`, `serve-git` (passed to its hooks and `patch apply` as the variables), `restore`, `revert`, `patch apply`, `fork finish`, `status` (accepted and ignored) |
-| `--namespace NAME`, `--pod NAME`, `--pod-uid UID`, `--node NAME` | `AGENTFS_NAMESPACE`, `AGENTFS_POD`, `AGENTFS_POD_UID`, `AGENTFS_NODE` | empty: absent from the commits. Each is 1 to 253 bytes of printable ASCII with no whitespace | `trees init`, `trees mount`, `trees end`: the pod context of a tree volume's commits, as `Agentfs-Namespace`, `Agentfs-Pod`, `Agentfs-Pod-Uid` and `Agentfs-Node` ([trees](trees.md#volume-identity-and-trailers)). `trees mount`'s are its views' writers' and its own syncs'; `trees init`'s are the Root commit's |
+| `--namespace NAME`, `--pod NAME`, `--pod-uid UID`, `--node NAME`, `--replica NAME` | `AGENTFS_NAMESPACE`, `AGENTFS_POD`, `AGENTFS_POD_UID`, `AGENTFS_NODE`, `AGENTFS_REPLICA` | empty; `--pod-uid` defaults to the replica, and `--replica` (the committer's `{replica}`) to the pod name, else the host name | `front`, `run`, `record`, `flush`, `push`, `checkpoint`, `serve-history`, `serve-git` (passed to its hooks and `patch apply` as the variables), `restore`, `revert`, `patch apply`, `fork finish`, `status` (accepted and ignored) |
+| `--namespace NAME`, `--pod NAME`, `--pod-uid UID`, `--node NAME` | `AGENTFS_NAMESPACE`, `AGENTFS_POD`, `AGENTFS_POD_UID`, `AGENTFS_NODE` | empty: absent from the commits. Each is 1 to 253 bytes of printable ASCII with no whitespace | `init`, `mount`, `fork end`: the pod context of a tree volume's commits, as `Agentfs-Namespace`, `Agentfs-Pod`, `Agentfs-Pod-Uid` and `Agentfs-Node` ([trees](trees.md#volume-identity-and-trailers)). `mount`'s are its views' writers' and its own syncs', and its telemetry resource's (the replica is the pod name, else the host name); `init`'s are the Root commit's |
 
-**Tree view flags** (`agentfs trees`; see [trees](trees.md)):
+**Tree volume flags** (`init`, `mount`, `fork end`; see [trees](trees.md)):
 
 | Flag | Environment | Default | Commands |
 |---|---|---|---|
-| `--volume NAME` | `AGENTFS_VOLUME` | none: required by `trees init` | `trees init`: the volume's name, kept in its identity file. A new state area gets a new id; the same name finds it and writes nothing; another name, or another format (the trial's format 3 included), exits 1 with nothing written. Prints `<name> <id> created\|found`, then recovers the volume. Exit 75 while another process holds it. `trees mount`: optional, a guard: another name exits 1 before anything is written |
-| `--no-allow-other` | | FUSE `allow_other` on | `trees mount`: only the mounting user reaches the views. With `allow_other`, a mount by a user other than root needs `user_allow_other` in `/etc/fuse.conf` |
-| `--fork-mount DIR` | | no fork mount | `trees mount`: also mount a fork of the root: a new one, ended when its last client detaches, or with `--fork-key` the open fork under that key (made the first time). Prints `fork tree: fork/N` on stderr |
-| `--fork-key KEY` | | an unkeyed fork | `trees mount`: the fork's key, 1 to 128 bytes of printable ASCII with no whitespace; requires `--fork-mount`. A key whose fork has ended exits 1. `trees end`: required, the key whose fork ends; the fork drops once nothing holds it. Exit 75 while a mount holds the volume, 1 for an unknown key ([trees](trees.md#forks-keys-end-and-the-drop)) |
-| `--writer LABEL` | | `root-client` | `trees mount`: the root's client label, a safe name of at most 64 bytes; with the client's number, launcher and tree (`<label>#<n>@cli/root`) it is every save's writer. After a kill, the next mount rebinds the client of this label ([trees](trees.md#clients)) |
-| `--fork-writer LABEL` | | `fork-client` | `trees mount`: the fork's client label, as `--writer`; requires `--fork-mount` |
-| `--read-only` | | read-write | `trees mount`: the root's client is read-only; its view is mounted read-only and every write answers `EROFS` |
-| `--fork-read-only` | | read-write | `trees mount`: the fork's client is read-only, with the default label; requires `--fork-mount`, excludes `--fork-writer`. How a keyed fork whose writer has gone (a clean unmount ends it) is mounted again: a fork has one writer for life, and a second read-write mount exits 1 |
-| `--metrics-output FILE` | | no metrics file | `trees mount`: replace a JSON snapshot of process-local save, take and wait counters, the journal's length, and runs, time and Git children by actor stage, with the objects handed to Git's store and the fsyncs of its `objects/` directory (`stages`, process-wide: see `tree_actor/stages.rs`) at each history built or failed event, at least every 100 ms, and at unmount, each file numbered by `seq` (one more each time) and renamed into place; the existing parent directory must be outside state and views; collection errors are reported after unmount |
+| `--volume NAME` | `AGENTFS_VOLUME` | none: required by `init` | `init`: the volume's name, kept in its identity file. A new state area gets a new id; the same name finds it and writes nothing; another name, or another format (a recording state area, or the trial's format 3), exits 1 with nothing written. Prints `<name> <id> created\|found`, then recovers the volume. Exit 75 while another process holds it. `mount`: optional, a guard: another name exits 1 before anything is written |
+| `--include FILE` (repeatable) | | keep the existing includes | `init`: an absolute path that exists (else exit 1, nothing written); these become exactly the `include.path` lines of `<state>/config` ([operator settings](#tree-volumes-the-operator-settings-file)), written under the volume's lock |
+| `--owner UID:GID` | `AGENTFS_OWNER` | the creating process's uid and gid | `init`: the owner the new volume's root directory is recorded with. A found volume is never compared or changed: it prints `found: --owner applies only when the volume is created` |
+| `--no-allow-other` | | FUSE `allow_other` on | `mount`: only the mounting user reaches the views. With `allow_other`, a mount by a user other than root needs `user_allow_other` in `/etc/fuse.conf`. `front`: only the mounting user can use the mount |
+| `--fork-mount DIR` | | no fork mount | `mount`: also mount a fork of the root: a new one, ended when its last client detaches, or with `--fork-key` the open fork under that key (made the first time). Prints `fork tree: fork/N` on stderr |
+| `--fork-key KEY` | | an unkeyed fork | `mount`: the fork's key, 1 to 128 bytes of printable ASCII with no whitespace; requires `--fork-mount`. A key whose fork has ended exits 1. `fork end`: required, the key whose fork ends; the fork drops once nothing holds it. Exit 75 while a mount holds the volume, 1 for an unknown key ([trees](trees.md#forks-keys-end-and-the-drop)) |
+| `--writer LABEL` | | `root-client` | `mount`: the root's client label, a safe name of at most 64 bytes; with the client's number, launcher and tree (`<label>#<n>@cli/root`) it is every save's writer. After a kill, the next mount rebinds the client of this label ([trees](trees.md#clients)) |
+| `--fork-writer LABEL` | | `fork-client` | `mount`: the fork's client label, as `--writer`; requires `--fork-mount` |
+| `--read-only` | | read-write | `mount`: the root's client is read-only; its view is mounted read-only and every write answers `EROFS` |
+| `--fork-read-only` | | read-write | `mount`: the fork's client is read-only, with the default label; requires `--fork-mount`, excludes `--fork-writer`. How a keyed fork whose writer has gone (a clean unmount ends it) is mounted again: a fork has one writer for life, and a second read-write mount exits 1 |
+| `--metrics-output FILE` | | no metrics file | `mount`: replace a JSON snapshot of process-local save, take and wait counters, the journal's length, and runs, time and Git children by actor stage, with the objects handed to Git's store and the fsyncs of its `objects/` directory (`stages`, process-wide: see `tree_actor/stages.rs`) at each history built or failed event, at least every 100 ms, and at unmount, each file numbered by `seq` (one more each time) and renamed into place; the existing parent directory must be outside state and views; collection errors are reported after unmount |
+| `--on-stale-mount refuse\|hold\|recover` | `AGENTFS_ON_STALE_MOUNT` | `refuse` | `mount`: when a view's mount point is an agentfs mount whose daemon died, `refuse` exits 1 naming the fix, `hold` mounts nothing and takes no lock, waits for SIGTERM, detaches every stale layer and exits 1, `recover` stacks each view over its stale mount of this volume (needs `CAP_SYS_ADMIN`; a stale mount of another volume exits 1) ([trees](trees.md#restarting-after-a-crash)) |
+| `--seal-mountpoint` | `AGENTFS_SEAL_MOUNTPOINT` | off | `mount`: before mounting, make each bare mount point root's with mode 0000, so a non-root workload that reaches it while no view is mounted (a `subPath` bound while a sidecar restarts) gets `EACCES` instead of writing unrecorded; needs root |
 
-The `trees` commands accept global `--state` and its environment equivalent. They refuse
-`--root` and nonzero `--wait-lock`; they fail immediately when the actor is busy.
-No production settings, rules or remotes are consumed.
+`init`, `mount` and `fork end` accept the global `--state` and its
+environment equivalent. They refuse `--root` (and `AGENTFS_ROOT`) and a
+nonzero `--wait-lock`, exit 1, so an old manifest fails loudly; a busy
+volume exits 75 at once. `mount ROOT [FLAGS] -- COMMAND [ARG]...` runs
+COMMAND once every view is up, with the mount's stdio and environment
+([trees](trees.md#running-a-command-in-the-mount)).
 
 **Command flags:**
 
 | Flag | Environment | Default | Commands |
 |---|---|---|---|
-| `--volume NAME` | `AGENTFS_VOLUME` | none: required | `init`: the volume's name; `patch submit`, `patch approve`: the volume the patch is for |
-| `--branch NAME` | | `agentfs/<volume>` | `init`: the history branch; `patch submit`: the volume's branch |
-| `--include FILE` (repeatable) | | keep the existing includes | `init`: exactly these `include.path` entries |
-| `--passthrough auto\|on\|off` | `AGENTFS_PASSTHROUGH` | `auto` | `mount`: kernel passthrough for files opened read-only; files opened for writing always go through the daemon (see [library/filesystem](library/filesystem.md)) |
-| `--threads N` | `AGENTFS_THREADS` | CPUs, 2 to 16 | `mount` |
-| `--no-allow-other` | | | `mount`: only the mounting user can use the mount |
-| `--unmount-grace DURATION` | | `10s` | `mount`: how long shutdown waits for the session to end; a stop that was busy, left files open or left the filesystem mounted elsewhere (a kubelet `subPath` bind) keeps `meta/attached.json`, so the next mount in the same pod, or outside a pod, holds the patch queue (see [patches](patches.md)) |
-| `--on-stale-mount refuse\|hold\|recover` | `AGENTFS_ON_STALE_MOUNT` | `refuse` | `mount`: when the mount point (or the sandbox overlay's) is an agentfs mount whose daemon died, `refuse` exits 1, `hold` waits for SIGTERM and detaches every stale one, `recover` mounts over each (needs `CAP_SYS_ADMIN`; not for fronts) |
-| `--seal-mountpoint` | `AGENTFS_SEAL_MOUNTPOINT` | off | `mount`: before mounting, make the bare mount point (and the sandbox overlay's) root's with mode 0000, so a non-root workload that reaches it while no daemon is mounted (a `subPath` bound while a sidecar restarts) gets `EACCES` instead of writing unrecorded; needs root; the shipped manifests set it |
-| `--workload-mount PATH[=DIR]` (repeatable) | `AGENTFS_WORKLOAD_MOUNTS` (comma-separated) | the mount point, and its bind mounts | `mount`: where a workload sees the mount when not at the mount point (a container's `mountPath`; `=DIR` when it sees the tree's directory `DIR`, a `subPath`), so absolute `gitdir:` targets that `git worktree add` writes map exactly to nested repositories (see [recording](recording.md)); a front sends them to its history service |
-| `--sandbox-overlay PATH` | `AGENTFS_SANDBOX_OVERLAY` | none | `mount`: also serve the sandbox overlay at `PATH`, a second mount point of the volume over the same operations that shows only the names the operator's rules would record, and refuses symlinks, hard links, special files, ownership changes and directory moves (`EXDEV`) (see [guarantees](guarantees.md)). A file a sandbox creates under a name the rules skip goes to the tmp layer, `<state>/tmp-layer`, private to the overlay, never recorded, moved into the tree by a rename onto a recordable name, and wiped at start and stop; it must be on the backing tree's filesystem. Needs `--sandbox-owner`. `PATH` must not be the mount point, nested with it, or in the same parent directory (a container given that directory would reach both). Mounted after the main mount; an unmount of either stops both. Refused on a front (`--history-service`) and with `agentfs.respectTreeRules`. Sealed by `--seal-mountpoint` and recovered by `--on-stale-mount` like the mount point |
-| `--sandbox-owner UID:GID` | `AGENTFS_SANDBOX_OWNER` | none | `mount`: the sandbox overlay's view owner, the one user and group every operation through it is checked and done as, whoever the caller is, with no supplementary groups (like NFS `all_squash`); the overlay checks access itself against the stored mode bits, with no `default_permissions`; the daemon must run as that uid or as root; needs `--sandbox-overlay` |
-| `--push-grace DURATION` | | `5s` | `mount`, `run`, `serve-history`: how long shutdown may spend on a last push of the final commit (one attempt per remote that lacks commits); `0s` skips it. A push to a path or `file://` remote already updating it is waited for up to 10 s more, so shutdown spends at most this + 10 s on pushes; keep this + 10 s + the final commit under the pod's `terminationGracePeriodSeconds` (the CSI driver sets `5s` against its 30 s unstage grace), or a kill can leave a ref lock in a local remote ([stuck-pushes.md](runbooks/stuck-pushes.md#at-shutdown)) |
+| `--volume NAME` | `AGENTFS_VOLUME` | none: required | `patch submit`, `patch approve`: the volume the patch is for |
+| `--branch NAME` | | `agentfs/<volume>` | `patch submit`: the volume's branch |
+| `--passthrough auto\|on\|off` | `AGENTFS_PASSTHROUGH` | `auto` | `front`: kernel passthrough for files opened read-only; files opened for writing always go through the daemon (see [library/filesystem](library/filesystem.md)) |
+| `--threads N` | `AGENTFS_THREADS` | CPUs, 2 to 16 | `front` |
+| `--unmount-grace DURATION` | | `10s` | `front`: how long shutdown waits for the session to end |
+| `--workload-mount PATH[=DIR]` (repeatable) | `AGENTFS_WORKLOAD_MOUNTS` (comma-separated) | the mount point, and its bind mounts | `front`: where a workload sees the mount when not at the mount point (a container's `mountPath`; `=DIR` when it sees the tree's directory `DIR`, a `subPath`), so absolute `gitdir:` targets that `git worktree add` writes map exactly to nested repositories (see [recording](recording.md)); a front sends them to its history service |
+| `--push-grace DURATION` | | `5s` | `run`, `serve-history`: how long shutdown may spend on a last push of the final commit (one attempt per remote that lacks commits); `0s` skips it. A push to a path or `file://` remote already updating it is waited for up to 10 s more, so shutdown spends at most this + 10 s on pushes; keep this + 10 s + the final commit under the pod's `terminationGracePeriodSeconds` (the CSI driver sets `5s` against its 30 s unstage grace), or a kill can leave a ref lock in a local remote ([stuck-pushes.md](runbooks/stuck-pushes.md#at-shutdown)) |
 | `--listen ADDR` | `AGENTFS_HISTORY_LISTEN` | `<state>/meta/history/history.sock` | `serve-history`: `unix:<path>` or an absolute socket path |
 | `--shutdown-grace DURATION` | | `10s` | `serve-history`: how long shutdown waits for fronts' requests |
 | `--workload-attached` | | off | `serve-history`: a workload may be attached, so the patch queue is judged at start and not applied (see [patches](patches.md)); the CSI node plugin passes it while a pod of the volume is published on the node |
 | `--listen ADDR` | | none: required | `serve-git`: `HOST:PORT` to serve git's smart HTTP on (port `0` picks one); it prints `serve-git: listening on http://HOST:PORT/` once it listens. Plain HTTP: put TLS in front. It refuses to start while `agentfs.patchRemote` names a remote (set it to `none`), and waits up to 10 s for requests in progress when stopped |
-| `--history-service ADDR` | `AGENTFS_HISTORY_SERVICE` | | `mount`, `record`: run as a front of the history service at ADDR |
-| `--history-timeout DURATION` | `AGENTFS_HISTORY_TIMEOUT` | `10s` | `mount`, `record` with `--history-service`: how long a boundary waits for the service before `EIO` |
-| `--history-wait DURATION` | `AGENTFS_HISTORY_WAIT` | `30s` | `mount`, `record` with `--history-service`: how long to wait for the service at start |
-| `--history-slot N` | `AGENTFS_HISTORY_SLOT` | the lowest free slot | `mount`, `record` with `--history-service`: lease pending slot N (1 to 1023) when it is free, else the lowest free slot; a front restarted after a crash passes its predecessor's slot to drain that slot's repairs |
+| `--history-service ADDR` | `AGENTFS_HISTORY_SERVICE` | none: required by `front` | `front`, `record`: run as a front of the history service at ADDR (`unix:<path>` or an absolute socket path) |
+| `--history-timeout DURATION` | `AGENTFS_HISTORY_TIMEOUT` | `10s` | `front`, `record` with `--history-service`: how long a boundary waits for the service before `EIO` |
+| `--history-wait DURATION` | `AGENTFS_HISTORY_WAIT` | `30s` | `front`, `record` with `--history-service`: how long to wait for the service at start |
+| `--history-slot N` | `AGENTFS_HISTORY_SLOT` | the lowest free slot | `front`, `record` with `--history-service`: lease pending slot N (1 to 1023) when it is free, else the lowest free slot; a front restarted after a crash passes its predecessor's slot to drain that slot's repairs |
 | `--allow-stale` | | | `probe`: exit 0 for a stale agentfs mount too |
-| `--sandbox-overlay` | | | `probe`: expect the sandbox overlay's mount (source `agentfs:<volume>:sandbox-overlay`) instead of the main mount; a mount of the other kind is exit 1. The overlay is mounted last, so a sidecar probing it gates on both mounts (see [library/filesystem](library/filesystem.md)) |
 | `--remote NAME` (repeatable) | | every remote | `push`: push only these remotes; `lfs fetch`: fetch only from these (in name order) |
 | `--timeout DURATION` | | `120s` | `push` through a running daemon: how long to wait for its pushes (clamped to 1s..10m); a push still running then carries on in the background, and the command exits 1 (also when a push stepped under `agentfsMaxPushSize` still has commits left). Pushing directly ignores it and keeps stepping until up to date or a failure |
 | `--force-with-lease OID` | | | `push`: replace this volume's own branch on one remote (`--remote NAME`, or the volume's only remote) with the local head, if the remote's branch is OID (a full commit id), OID shares a commit with the head, and the commits it would drop hold no history an agentfs recorder wrote that the head lacks (divergence case B is refused); nothing else is pushed. Always direct (never through a running daemon), under that remote's push lock only. Exit 0 pushed or up to date; 1 lease broken, unrelated history, recorded history or failure; 75 while another push to that remote runs. For the divergence and history-rewrite runbooks (see [operator guide](operator-guide.md#12-recovery-and-undo)) |
-| `--force` | | | `restore`: write even files open for writing through the mount; `revert`: also revert paths changed again since the commit, and write files open for writing |
+| `--force` | | | `restore`: write even files open for writing through a front; `revert`: also revert paths changed again since the commit, and write files open for writing |
 | `--dry-run` | | | `restore`, `revert`: print the plan and write nothing; `lfs fetch`: report the objects (and bytes) missing from the cache, contacting no server; `lfs prune`: report what would be deleted, deleting nothing |
 | `--older-than DURATION` | | every object | `lfs prune`: keep objects cached less than DURATION ago |
 | `--all` | | the branch head | `lfs fetch`: every object any commit on the branch references, instead of the head's (or the revisions given) |
@@ -1018,33 +1050,30 @@ deliver`'s stderr. Exit 0 accepts, 75 means try again, anything else
 refuses. `fork deliver` exits 0 delivered or already delivered, 1 refused
 (or not published), 75 unavailable: run it again.
 
-The [operator guide](operator-guide.md) section 4 describes the mount flags in
-full, and section 16 the history service and fronts; the
+The [operator guide](operator-guide.md) section 16 describes the history service and fronts; the
 [patch queue runbook](runbooks/patch-queue.md) the patch commands.
 
 ### `agentfs init`
 
-`init` writes `agentfs.volume` (and `agentfs.branch` with `--branch`) and
-creates the state area. It is safe to run at every start, as a
-Kubernetes init container does:
+`init --volume NAME` creates a tree volume or finds it, and is safe to run
+at every start, as a Kubernetes init container does
+([trees](trees.md#volume-lifecycle)):
 
-- **New state area** (no `<state>/git/config`, or one without
-  `agentfs.volume`): created, printing `initialised volume V in S`. Rule
-  files already in `<state>/git/info/` are kept.
-- **Same volume** (and the same branch, if `--branch` is given): exit 0,
-  printing `volume V already initialised in S`. It takes the state-area
-  lock (exit 75 while a mount holds it, or wait with `--wait-lock`),
-  re-creates missing directories, and with `--include` makes those files
-  exactly the config's `include.path` entries. Nothing else changes.
-- **Another volume or branch**: exit 1, nothing changed. A volume's name
-  and branch cannot be changed by `init`.
-- `--root DIR` (or `AGENTFS_ROOT`) also creates the backing tree directory
-  when it is missing.
-- The result is opened once before `init` exits, so a bad setting or
-  include fails `init`, not the first mount.
-- **No remote is fine**: a result with no push section is a local-only
-  volume ([Remotes modes](#remotes-modes)); a remote added later is
-  pushed from its first push.
+- **Nothing there** (no directory, an empty one, or a create a crash cut
+  short): created with a new id, its Root commit made, printing `<name>
+  <id> created`. With `--owner UID:GID` the root directory is recorded
+  with that owner.
+- **The same name**: printing `<name> <id> found`. The volume is recovered
+  (its journal replayed), as every start does; `--owner` changes nothing.
+- **Another name, or another format** (a recording state area, the trial's
+  format 3): exit 1, nothing written. A recording state area is never
+  converted: move it aside with the
+  [upgrading runbook](runbooks/upgrading-the-sidecar.md).
+- **Busy** (a mount holds it): exit 75.
+- `--include FILE` (repeatable): after the recovery, under the volume's
+  lock, `<state>/config` gets exactly those `include.path` lines
+  ([operator settings](#tree-volumes-the-operator-settings-file)). A
+  relative or missing file exits 1 before anything is written.
 
 ## Environment variables
 
@@ -1054,19 +1083,18 @@ equivalents above; a flag given on the command line wins.
 | Variable | Flag | Read by |
 |---|---|---|
 | `AGENTFS_STATE` | `--state` | all commands |
-| `AGENTFS_ROOT` | `--root` | all commands |
+| `AGENTFS_ROOT` | `--root` | the recording commands; `init`, `mount` and `fork end` refuse it |
 | `AGENTFS_WAIT_LOCK` | `--wait-lock` | all commands |
-| `AGENTFS_NAMESPACE`, `AGENTFS_POD`, `AGENTFS_POD_UID`, `AGENTFS_NODE`, `AGENTFS_REPLICA` | `--namespace`, `--pod`, `--pod-uid`, `--node`, `--replica` | the commands with pod flags, the `trees` commands among them (not `--replica`) |
-| `AGENTFS_VOLUME` | `--volume` | `init`, `patch submit`, `patch approve`, `trees init`, `trees mount` |
-| `AGENTFS_PASSTHROUGH` | `--passthrough` | `mount` |
-| `AGENTFS_THREADS` | `--threads` | `mount` |
+| `AGENTFS_NAMESPACE`, `AGENTFS_POD`, `AGENTFS_POD_UID`, `AGENTFS_NODE`, `AGENTFS_REPLICA` | `--namespace`, `--pod`, `--pod-uid`, `--node`, `--replica` | the commands with pod flags, `init`, `mount` and `fork end` among them (not `--replica`) |
+| `AGENTFS_VOLUME` | `--volume` | `init`, `mount`, `patch submit`, `patch approve` |
+| `AGENTFS_OWNER` | `--owner` | `init` |
+| `AGENTFS_PASSTHROUGH` | `--passthrough` | `front` |
+| `AGENTFS_THREADS` | `--threads` | `front` |
 | `AGENTFS_ON_STALE_MOUNT` | `--on-stale-mount` | `mount` |
 | `AGENTFS_SEAL_MOUNTPOINT` | `--seal-mountpoint` | `mount` |
-| `AGENTFS_WORKLOAD_MOUNTS` | `--workload-mount` | `mount` |
-| `AGENTFS_SANDBOX_OVERLAY` | `--sandbox-overlay` | `mount` |
-| `AGENTFS_SANDBOX_OWNER` | `--sandbox-owner` | `mount` |
+| `AGENTFS_WORKLOAD_MOUNTS` | `--workload-mount` | `front` |
 | `AGENTFS_HISTORY_LISTEN` | `--listen` | `serve-history` |
-| `AGENTFS_HISTORY_SERVICE`, `AGENTFS_HISTORY_TIMEOUT`, `AGENTFS_HISTORY_WAIT`, `AGENTFS_HISTORY_SLOT` | `--history-service`, `--history-timeout`, `--history-wait`, `--history-slot` | `mount`, `record` |
+| `AGENTFS_HISTORY_SERVICE`, `AGENTFS_HISTORY_TIMEOUT`, `AGENTFS_HISTORY_WAIT`, `AGENTFS_HISTORY_SLOT` | `--history-service`, `--history-timeout`, `--history-wait`, `--history-slot` | `front`, `record` |
 | `CSI_ENDPOINT`, `NODE_NAME`, `AGENTFS_CSI_POD`, `AGENTFS_CSI_NAMESPACE`, `AGENTFS_CSI_RELEASE_SCAN_INTERVAL` | `--endpoint`, `--node-id`, `--pod`, `--namespace`, `--release-scan-interval` | `agentfs-csi` ([below](#the-csi-driver-agentfs-csi)) |
 
 **Test builds only.** `AGENTFS_FAILPOINTS` sets failpoints on the durable
@@ -1074,7 +1102,7 @@ path (`name=kill|error|panic|sleep(ms)[@n]`, joined with `;`, [architecture.md](
 built with `--features agentfs/failpoints` reads it (its `--version` ends
 in `+failpoints`, and it warns at start when the variable is set); release
 builds and the image have no failpoints and ignore it. Never set it in
-production. In the same builds, `AGENTFS_TAKE_GATE=<dir>` stops `trees mount`'s
+production. In the same builds, `AGENTFS_TAKE_GATE=<dir>` stops `mount`'s
 queue worker: it takes only when a test asks through the fifos `go` and `took`
 in that directory (`agentfs_core::failpoints::TakeGate`).
 

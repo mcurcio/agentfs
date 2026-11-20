@@ -114,26 +114,19 @@ On Linux 5.6+ with `/dev/fuse`, as root, in a clone of this repository
 ```sh
 cargo build --release -p agentfs
 export PATH=$PWD/target/release:$PATH
-mkdir -p /data/backing /workspace
-git init --bare /data/remote.git
-printf '[remote "origin"]\n\turl = /data/remote.git\n' > /data/agentfs.conf
-agentfs --state /data/state init --volume demo --include /data/agentfs.conf
-agentfs --state /data/state mount /data/backing /workspace &
-until agentfs probe /workspace >/dev/null; do sleep 0.2; done   # mounted
-
-echo hello > /workspace/notes.txt              # recorded before close returns
-sleep 1                                         # commits follow within commitWindow (200ms)
-agentfs --state /data/state status              # head, committed seq, backlog
-git --git-dir /data/state/git log --stat refs/heads/agentfs/demo
-kill %1; wait                                   # final commit and push, unmount
-git --git-dir /data/remote.git log --oneline agentfs/demo
+agentfs --state /data/state init --volume demo
+# Serve /workspace, run one command in it, then stop.
+agentfs --state /data/state mount /workspace -- \
+  sh -c 'echo hello > /workspace/notes.txt'     # recorded before close returns
+git --git-dir /data/state/history.git log --stat root
 ```
 
-Stopping the mount prints `final commit:` and a `final push: origin: ...`
-line: the last commit is pushed before the mount exits, within
-`--push-grace` (5s). Otherwise remotes are pushed every
-`agentfs.pushInterval` (60s), or at once with `agentfs push`. Next: the
-[operator guide](docs/operator-guide.md).
+`init` creates the volume (and prints `demo <id> created`); `mount` serves
+it at `/workspace` until its command exits, SIGINT or SIGTERM, then drains
+and exits. History is in the state area's `history.git`, on the `root`
+branch. Leave out `-- COMMAND` to keep the mount up until a signal. Tree
+volumes push to no remote yet ([trees](docs/trees.md#limits)). Next: the
+[tree views](docs/trees.md).
 
 ### Docker
 

@@ -1564,3 +1564,27 @@ M3 residuals (each to become a bead; none blocks M7):
    `lock` or the create marker, without `format`, `Other`: a `<state>/config` written before the create makes
    `ensure` answer `OtherFormat`. S2's `init --include` writes the includes after `ensure` (the state area exists
    then).
+
+## 2026-11-19, M7 S2 (the binary moves): where the brief was short
+
+1. **A found `init` is never byte-unchanged.** Its recovery open appends to the journal (`journal/<seg>.seg`
+   differs after any found `init`, with or without `--owner`), so "`--owner` on a found volume changes no file"
+   cannot hold. `cli_init.rs` checks what must not change instead: the `root` ref and `root:dirs/root`.
+2. **The includes are written after the recovery open, under the volume's lock**, not between `ensure` and the
+   open: a busy volume then exits 75 with nothing written. Probe 5 (write before `ensure`) still fails the
+   another-name test.
+3. **Files outside the owned list that the slice breaks.** `docs/development.md` linked the deleted
+   `tests/mount.rs` and `tests/crash_mount.rs`, failing `docs_reference` locally: S2 rewrote those two bullets
+   (and one table row) minimally. Not edited, for S3/S4/S5: `ci/readme-quickstart.sh` (source mode still checks
+   `final push: origin: pushed` and `/data/remote.git`, so ci.yml's fuse job fails on the new README quick start);
+   ci.yml's fuse job still runs a passthrough matrix of three identical legs and sets
+   `AGENTFS_TEST_PASSTHROUGH`/`AGENTFS_TEST_UNPRIV_USER`, which launcher_mount ignores;
+   `docs/operator-guide.md` and `docs/supported-configurations.md` still name `mount --history-service` and the
+   recording mount; `agentfs-contracts`' `VolumeError::NotCreated` message still says `agentfs trees init`
+   (the launcher answers with its own message first); the sandbox overlay is still in `agentfs-fuse` (no
+   binary serves it).
+4. **The gate is red on the last measured figures.** docs/performance.md's last release run made 7,529 (ext4)
+   and 7,743 (XFS) creates of the bar's 50,000, so with `create` gated the image workflow's trees-tracer jobs fail
+   until the builder's cost per save drops. That is the gate doing its job; it is the milestone's to clear.
+5. **`--seal-mountpoint` seals every view's bare mount point** (the fork's too), not the root's alone: the frozen
+   page's "(root only, as today)" read as "needs root"; a fork bound by subPath has the same gap.

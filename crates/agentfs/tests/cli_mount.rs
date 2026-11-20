@@ -85,6 +85,8 @@ fn s(p: &Path) -> &str {
     p.to_str().unwrap()
 }
 
+/// Each refusal is checked with `-- true` after the mount point: were the
+/// refusal lost, the mount would serve and exit at once, never hang the test.
 fn refused(out: &Output, needle: &str) {
     assert_eq!(out.status.code(), Some(1), "{}", stderr(out));
     assert!(stderr(out).contains(needle), "{}", stderr(out));
@@ -95,7 +97,7 @@ fn refused(out: &Output, needle: &str) {
 #[test]
 fn mount_never_creates() {
     let l = Layout::new();
-    let out = run(&l.state(), &["mount", s(&l.p("mnt"))]);
+    let out = run(&l.state(), &["mount", s(&l.p("mnt")), "--", "true"]);
     refused(&out, "agentfs init --volume");
     assert!(!l.state().exists(), "the state area was made");
 }
@@ -106,7 +108,7 @@ fn a_held_state_area_exits_75() {
     let l = Layout::new();
     l.init(&[]);
     let held = Recording::open(&l.state(), &PodContext::default()).unwrap();
-    let out = run(&l.state(), &["mount", s(&l.p("mnt"))]);
+    let out = run(&l.state(), &["mount", s(&l.p("mnt")), "--", "true"]);
     assert_eq!(out.status.code(), Some(75), "{}", stderr(&out));
     assert!(stderr(&out).contains("busy"), "{}", stderr(&out));
     drop(held);
@@ -119,7 +121,7 @@ fn a_recording_state_area_is_refused() {
     let l = Layout::new();
     agentfs_core::volume::init_with(&StateDir::new(l.state()), "demo", None, None).unwrap();
     let before = l.files();
-    let out = run(&l.state(), &["mount", s(&l.p("mnt"))]);
+    let out = run(&l.state(), &["mount", s(&l.p("mnt")), "--", "true"]);
     refused(&out, "docs/runbooks/upgrading-the-sidecar.md");
     assert_eq!(l.files(), before, "the recording state area changed");
 }
@@ -141,7 +143,7 @@ fn an_include_under_a_view_is_refused_before_staging() {
     )
     .unwrap();
     let before = l.files();
-    let out = run(&l.state(), &["mount", s(&l.p("mnt"))]);
+    let out = run(&l.state(), &["mount", s(&l.p("mnt")), "--", "true"]);
     refused(&out, "is under the mount point");
     assert_eq!(l.files(), before, "the volume was staged");
 }
@@ -152,7 +154,7 @@ fn a_mount_point_with_files_is_refused() {
     let l = Layout::new();
     l.init(&[]);
     std::fs::write(l.p("mnt/left.txt"), "x").unwrap();
-    let out = run(&l.state(), &["mount", s(&l.p("mnt"))]);
+    let out = run(&l.state(), &["mount", s(&l.p("mnt")), "--", "true"]);
     refused(&out, "is not empty");
 }
 
@@ -233,7 +235,9 @@ fn recording_commands_refuse_a_tree_volume() {
         assert!(
             err.contains(&format!(
                 "`agentfs {}` runs on the recording engine only",
-                args.iter().find(|a| !a.starts_with('-') && **a != "b").unwrap()
+                args.iter()
+                    .find(|a| !a.starts_with('-') && **a != "b")
+                    .unwrap()
             )),
             "{args:?}: {err}"
         );

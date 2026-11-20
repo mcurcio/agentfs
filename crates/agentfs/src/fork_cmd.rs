@@ -455,7 +455,9 @@ pub fn run(
         }
         ForkCommand::Deliver(args) => deliver_cmd(args),
         // The tree engine's: `main` hands it to `launcher::end_fork`.
-        ForkCommand::End(_) => bail!("fork end runs the tree engine; it is not a recording command"),
+        ForkCommand::End(_) => {
+            bail!("fork end runs the tree engine; it is not a recording command")
+        }
     }
 }
 

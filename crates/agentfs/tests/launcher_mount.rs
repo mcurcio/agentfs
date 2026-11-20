@@ -208,14 +208,23 @@ fn not_built_settings_are_logged_and_the_view_records() {
         "[remote \"o\"]\n\turl = /x\n[agentfs]\n\tpatchRemote = o\n",
     )
     .unwrap();
-    let out = v.run(&["init", "--volume", "t", "--include", include.to_str().unwrap()]);
+    let out = v.run(&[
+        "init",
+        "--volume",
+        "t",
+        "--include",
+        include.to_str().unwrap(),
+    ]);
     assert!(out.status.success(), "{}", text(&out.stderr));
     let root = v.root().display().to_string();
     let out = v.mount(&["--", "sh", "-c", &format!("echo c > {root}/c")]);
     let err = text(&out.stderr);
     assert_eq!(out.status.code(), Some(0), "{err}");
     assert!(err.contains("not built: remote.o.url (push)"), "{err}");
-    assert!(err.contains("not built: agentfs.patchremote (patches)"), "{err}");
+    assert!(
+        err.contains("not built: agentfs.patchremote (patches)"),
+        "{err}"
+    );
     assert_eq!(v.history("c").as_deref(), Some("c\n"));
 }
 
@@ -276,7 +285,11 @@ fn refuse_and_hold_leave_a_stale_mount_alone() {
         "{}",
         text(&out.stderr)
     );
-    assert_eq!(v.probe(&["--allow-stale"]), Some(0), "the stale mount is left");
+    assert_eq!(
+        v.probe(&["--allow-stale"]),
+        Some(0),
+        "the stale mount is left"
+    );
     let mut held = v.spawn(&["--on-stale-mount", "hold"]);
     held.wait_for("Holding until SIGTERM");
     assert_eq!(v.probe(&["--allow-stale"]), Some(0), "nothing was mounted");

@@ -171,34 +171,18 @@ Every push runs [`.github/workflows/ci.yml`](../.github/workflows/ci.yml):
   [`ci/otel-certs.sh`](../ci/otel-certs.sh)), and checks that a wrong token,
   a missing client certificate and an unknown CA get the collector nothing
   while the command succeeds.
-- **e2e FUSE mount** ([`ci/fuse-tests.sh`](../ci/fuse-tests.sh)), with
-  passthrough `auto`, `on` and `off`: real mounts as root running the `#[ignore]`d
-  tests in [`crates/agentfs/tests/mount.rs`](../crates/agentfs/tests/mount.rs):
-  every operation of the no-gaps promise (editor saves, appends, truncate,
-  directory renames, `rm -r`, hard links, `chmod +x`, symlinks, unlink and
-  rename of open files, log rotation), `kill -9` right after a close, root
-  and uid 10000 writers, invisibility of the state area, rules and nested
-  repositories through the mount, SQLite (WAL and DELETE) and git on the
-  mount, extended attributes, a `.git` that is no repository, shutdown with
-  files open, external unmounts, the lock, and an unprivileged daemon
-  (refused under `on`). The job log shows the passthrough mode the runner's
-  kernel negotiated, and every mount asserts that no open fell back from
-  passthrough to the daemon. The same job runs restores and reverts through a real mount (the
-  `mount.rs` recovery tests: in-place rewrites, removals, owners, files
-  open for writing, direct mode with the workload stopped) and
-  [`ci/e2e-recovery.sh`](../ci/e2e-recovery.sh), the recovery runbook end to
-  end, from finding a change to pushing the restore commits. It also
-  runs SQLite databases in the `fsync` class: the `mount.rs` tests
-  restore every recorded version of WAL and DELETE databases with its
-  `-wal` or `-journal` and check it, and
+- **e2e FUSE mount** ([`ci/fuse-tests.sh`](../ci/fuse-tests.sh)): real
+  mounts as root running the `#[ignore]`d tests in
+  [`crates/agentfs/tests/launcher_mount.rs`](../crates/agentfs/tests/launcher_mount.rs):
+  `agentfs mount -- COMMAND` (the command's write recorded, its exit status
+  the mount's), the operator settings' `not built:` lines, `probe` on a
+  live and a stale view, and a restart after `kill -9` under each
+  `--on-stale-mount` policy; and the unit tests that need root (creating
+  as the caller, tree views stacked over a stale mount). The same job runs
+  [`ci/e2e-recovery.sh`](../ci/e2e-recovery.sh) and
   [`ci/e2e-sqlite.sh`](../ci/e2e-sqlite.sh) (with
   [`sqlite-writer.py`](../ci/sqlite-writer.py) and
-  [`sqlite-check.py`](../ci/sqlite-check.py)) checks that history catches up
-  within one interval while a WAL writer stays open, that captures are
-  at least one interval apart (a DELETE-mode writer does not capture
-  per transaction), that every version passes `PRAGMA integrity_check`
-  with whole transactions, and the database restore runbook, live and
-  direct, restoring one member and getting its whole group.
+  [`sqlite-check.py`](../ci/sqlite-check.py)).
 - **e2e multi-pod** ([`ci/e2e-multipod.sh`](../ci/e2e-multipod.sh)), with
   passthrough `auto` and `off`: two real FUSE front mounts of one backing
   tree as pods `pod-a` and `pod-b`, feeding one `agentfs serve-history`.
@@ -209,8 +193,7 @@ Every push runs [`.github/workflows/ci.yml`](../.github/workflows/ci.yml):
   restarts, a `kill -9` of the service right after a close returned, and
   the push. It then measures the per-close cost through a single-process
   mount and through a front ([`boundary-latency.py`](../ci/boundary-latency.py))
-  and the socket round trip, into the job summary. The `fuse` job also
-  runs `two_fronts_one_service` from `mount.rs`.
+  and the socket round trip, into the job summary.
 - **e2e crash injection** ([`ci/crash-tests.sh`](../ci/crash-tests.sh)): a build with the `failpoints` feature (test builds
   only; `AGENTFS_FAILPOINTS` names where to kill or fail) runs
   [`crash_points.rs`](../crates/agentfs-core/tests/crash_points.rs), a
@@ -223,10 +206,8 @@ Every push runs [`.github/workflows/ci.yml`](../.github/workflows/ci.yml):
   `git fsck --full --strict` on every repository.
   [`crash_daemon.rs`](../crates/agentfs/tests/crash_daemon.rs) kills
   `record`, `push`, `run`, `serve-history`, a `record --history-service`
-  front and `patch apply` at their failpoints, and
-  [`crash_mount.rs`](../crates/agentfs/tests/crash_mount.rs) a real FUSE
-  mount after a recorded close and while saving its repair queue. The
-  `test (all)` job runs the first two as well.
+  front and `patch apply` at their failpoints. The `test (all)` job runs
+  both as well.
 - **e2e csi-sanity** ([`ci/csi-sanity.sh`](../ci/csi-sanity.sh)): the
   Kubernetes CSI conformance suite csi-test (`csi-sanity` v5.6.0, pinned)
   against `agentfs-csi` with real history services and FUSE
@@ -393,7 +374,7 @@ them to where they run. The CI jobs are described above.
 
 | Promise | Where it is tested |
 |---|---|
-| Every change boundary is recorded: editor saves, appends, `truncate`, directory moves, `rm -r`, hard links, mode changes, symlinks, unlink and rename of open files, log rotation | the `fuse` job, through real mounts (`crates/agentfs/tests/mount.rs`, as root, with passthrough `auto`, `on` and `off`) |
+| Every change boundary is recorded: editor saves, appends, `truncate`, directory moves, `rm -r`, hard links, mode changes, symlinks, unlink and rename of open files, log rotation | the tree views' e2e scripts (`ci/e2e-trees.sh`, `ci/e2e-trees-ordering.sh`) through real mounts |
 | A change is recorded before the call returns: `kill -9` right after `close`, then remount | the `fuse` job; the engine matrix of the `crash` job |
 | Nothing is lost or duplicated at any step of record, commit, ref update and push | the `crash` job (`ci/crash-tests.sh`: the engine matrix, the process tests and the mount tests) with one oracle; power loss in the `power-loss` workflow |
 | Any user: root and uid 10000 write with normal permission semantics | the `fuse` job; the kind jobs, in a pod |

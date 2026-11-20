@@ -2,8 +2,10 @@
 
 A tree view is a mount of a git-backed tree. Each close saves the file into its
 own tree, and queues carry changes between an **upstream** and its **forks**. The
-tree views run on their own state area, with their own commands (`agentfs trees`),
-beside the recording mount described in [recording.md](recording.md).
+tree views are what `agentfs init` and `agentfs mount` run: a tree volume, on its
+own state area. The recording engine ([recording.md](recording.md)) is what the
+CSI driver runs; its commands refuse a tree volume, and `init` and `mount`
+refuse its state areas.
 
 Use them to try the model of upstreams and forks: a fork edits like an ordinary
 directory, its saves flow to its upstream, and the upstream's saves flow back,
@@ -54,15 +56,16 @@ release in CI.
 
 ```sh
 cargo build --locked -p agentfs
-mkdir -p /tmp/agentfs-trees/root /tmp/agentfs-trees/fork
-target/debug/agentfs --state /tmp/agentfs-trees/state trees init --volume trial
-target/debug/agentfs --state /tmp/agentfs-trees/state trees mount \
+target/debug/agentfs --state /tmp/agentfs-trees/state init --volume trial
+target/debug/agentfs --state /tmp/agentfs-trees/state mount \
   /tmp/agentfs-trees/root --fork-mount /tmp/agentfs-trees/fork --fork-key trial
 ```
 
-Use ordinary file calls in either view. The command prints `fork tree: fork/N` on
-stderr. Without `--fork-key` every mount makes a new fork, which ends when its view
-is unmounted; under a key, every mount finds the same fork until `trees end
+Use ordinary file calls in either view. Once every view is up the command prints
+`mounted volume trial at /tmp/agentfs-trees/root, fork fork/N at
+/tmp/agentfs-trees/fork; stop with SIGINT or SIGTERM` on stderr, after `fork tree:
+fork/N`. Without `--fork-key` every mount makes a new fork, which ends when its view
+is unmounted; under a key, every mount finds the same fork until `fork end
 --fork-key` ends it ([forks](#forks-keys-end-and-the-drop)). Stop the mount with
 SIGTERM or SIGINT, or unmount every view with `fusermount3 -u PATH`: either drains
 the volume, and the process exits 0 once it is released
@@ -70,24 +73,98 @@ the volume, and the process exits 0 once it is released
 
 | Command or flag | Meaning |
 |---|---|
-| `trees init --volume NAME` | Create the volume, or find it under the same name, then recover it; prints `<name> <id> created` or `found`. Another name or another format exits 1 with nothing written |
-| `trees mount ROOT` | Recover and mount the root on an existing empty directory. It never creates a volume: run `trees init` first |
-| `--volume NAME` (`trees mount`) | Refuse, before anything is written, a volume with another name |
+| `init --volume NAME` | Create the volume, or find it under the same name, then recover it; prints `<name> <id> created` or `found`. Another name or another format (a recording state area among them) exits 1 with nothing written |
+| `--owner UID:GID` (`init`) | The owner a new volume's root directory is recorded with; a found volume is never changed |
+| `--include FILE` (`init`) | The operator settings' includes ([operator settings](#operator-settings)) |
+| `mount ROOT` | Recover and mount the root on an empty directory, created when missing. It never creates a volume: run `init` first |
+| `mount ROOT -- COMMAND [ARG]...` | Run COMMAND once every view is up, and drain when it exits ([running a command](#running-a-command-in-the-mount)) |
+| `--volume NAME` (`mount`) | Refuse, before anything is written, a volume with another name |
 | `--no-allow-other` | Only the mounting user reaches the views. By default other users do (FUSE `allow_other`, which needs `user_allow_other` in `/etc/fuse.conf` when the mounting user is not root) |
 | `--namespace`, `--pod`, `--pod-uid`, `--node` | Where the views run: the pod context of their commits (below) |
 | `--fork-mount DIR` | Also mount a fork of the root in DIR: a new one, or with `--fork-key` the open one under that key (made the first time) |
 | `--fork-key KEY` | The fork's key (needs `--fork-mount`): 1 to 128 bytes of printable ASCII with no whitespace. A key whose fork has ended exits 1 |
 | `--writer LABEL`, `--fork-writer LABEL` | The root's and the fork's client label (default `root-client`, `fork-client`): a safe name of at most 64 bytes. A label is the launcher's word, not an authenticated identity |
 | `--read-only`, `--fork-read-only` | Mount the root, or the fork, read-only: its client cannot write, and every write answers `EROFS`. `--fork-read-only` takes the default fork label |
-| `trees end --fork-key KEY` | End the fork under the key; it drops once nothing holds it. Exits 75 while a mount holds the volume, 1 for an unknown key |
+| `--on-stale-mount refuse\|hold\|recover`, `--seal-mountpoint` | What a restart does with a stale mount its crashed predecessor left, and the fence on a bare mount point ([restarting](#restarting-after-a-crash)) |
+| `fork end --fork-key KEY` | End the fork under the key; it drops once nothing holds it. Exits 75 while a mount holds the volume, 1 for an unknown key |
 | `--metrics-output FILE` | Write counters, the journal's length, each stage's runs, time and git children, and the objects stored, at each built or failed event, at least every 100 ms, and at unmount; each file carries `seq`, one more each time |
 
-Mount points must be empty, separate and outside the state area. Metrics never take
-part in ordering. Every flag is in [configuration](configuration.md#flags-and-environment).
+Mount points must be empty, separate and outside the state area: a mount point
+holding files exits 1, since the mount would hide them and nothing would record
+them. `init`, `mount` and `fork end` take `--state` only: `--root`
+(`AGENTFS_ROOT`) or a nonzero `--wait-lock` exits 1, so an old manifest fails
+loudly. Metrics never take part in ordering. Every flag is in
+[configuration](configuration.md#flags-and-environment).
+
+### Operator settings
+
+The operator's settings of a tree volume are `<state>/config`, in git-config
+syntax, kept apart from `history.git/config`, which the engine rewrites and its git
+children read. `init --include FILE` (repeatable, absolute, existing) makes the
+file exactly those `include.path` lines, as git's own includes; without `--include`
+a re-run keeps them. Every `mount` reads the file with libgit2, which follows the
+includes, before the volume is staged:
+
+- an include under a view's mount point exits 1, since the workload could change
+  the operator's settings;
+- a missing include is warned of (`warning: operator settings: include <path> is
+  missing`), as git skips it;
+- each key whose capability tree volumes do not build yet is logged at every boot,
+  one line per key, and the mount serves anyway:
+
+  ```text
+  not built: remote.origin.url (push): this volume pushes to no remote yet; its history stays in the state area
+  not built: agentfs.patchremote (patches): queued patches are not applied
+  ```
+
+  The capabilities are `push` (remotes, `agentfs.pushInterval`, `agentfs.forkRefs`,
+  `http.proxy`), `patches` (`agentfs.patch*`, `agentfsPusher.*`), `lfs` and
+  `other`. The `agentfs.not_built` gauge counts them by `capability`
+  ([telemetry](telemetry.md)), the standing alarm for a setting that does
+  nothing yet. `agentfs.nested = exclude` is built and not listed. Every key is in
+  [configuration](configuration.md#tree-volumes-the-operator-settings-file).
+
+### Running a command in the mount
+
+`mount ROOT [FLAGS] -- COMMAND [ARG]...` starts COMMAND once every view is up,
+with the mount's stdio and environment, as `dbus-run-session` and `ssh-agent
+COMMAND` do. Its exit is a trigger like a stop: the volume drains, and the mount
+exits with the command's status when that is not 0 (128 plus the signal's number
+for a command a signal ended), else with the drain's. A SIGTERM or SIGINT while
+it runs is sent on to it as SIGTERM, and the drain starts. A command that cannot
+start (not found) drains the volume and exits 127. A migration copies files in
+this way, through the view, with no wait for the mount to appear.
+
+### Restarting after a crash
+
+A killed mount leaves each view's mount point a stale agentfs mount: every call on
+it answers `ENOTCONN`, and `agentfs probe` reports `stale` (exit 1, or 0 with
+`--allow-stale`). The views mount as `agentfs:<volume>`, and a fork view as
+`agentfs:<volume>:<tree>`, so `probe` and the restart tell them from other mounts.
+The next `mount` judges each mount point before it stages anything, by
+`--on-stale-mount` (`AGENTFS_ON_STALE_MOUNT`):
+
+- `refuse` (the default): exit 1, naming the fix (`--on-stale-mount recover` or
+  `hold`, or `umount -l PATH`).
+- `hold`: mount nothing and take no lock; wait for SIGTERM or SIGINT, then detach
+  every stale layer and exit 1. A pod held this way recovers at its next start.
+- `recover`: stack each view over its stale mount: FUSE mounts at a private
+  directory under `<state>/stack/`, is bind-mounted over the stale mount, so every
+  copy of it (a container's propagated mount, a `subPath` bind) reaches the new
+  view, and the private mount is detached. The mount prints `stacked over a stale
+  mount at PATH left by a crashed daemon`; the stale layers below are detached
+  when the view ends. It needs `CAP_SYS_ADMIN`; a stale mount of another volume
+  exits 1.
+
+A live mount there exits 1 (`already mounted`), and so does another filesystem.
+With `--seal-mountpoint` (`AGENTFS_SEAL_MOUNTPOINT`, root only) each bare mount
+point is made root's with mode 0000 before mounting, so a non-root workload that
+reaches it while no view is mounted (a `subPath` bound while a sidecar restarts)
+gets `EACCES` instead of writing where nothing records it.
 
 ## Volume identity and trailers
 
-`trees init --volume NAME` gives a new volume a random id (RFC 9562 version 4) and
+`init --volume NAME` gives a new volume a random id (RFC 9562 version 4) and
 writes it with the name to the state area's `volume` file, before the repository and
 `format`. Every start reads `format` and `volume` before it writes anything. The id
 never changes; the name is a label and a guard.
@@ -139,7 +216,7 @@ no `#`, `@` or `/`, so the name parses back.
   own client's open files.
 - **One writer per fork, for life.** A fork's first read-write client claims it. The
   claim stays after the client ends, so a second read-write client is refused, while
-  the first is attached and after it ends. `trees mount` then exits 1: "this fork
+  the first is attached and after it ends. `mount` then exits 1: "this fork
   has had its writer; mount it with --fork-read-only or use a new fork". The
   root has no claim. The claim is released when the fork is dropped
   (`ClaimReleased`).
@@ -147,7 +224,7 @@ no `#`, `@` or `/`, so the name parses back.
   as saves first, in handle order, durable before the detach returns; a write after
   that answers `EROFS`. The end is one step with `AttachmentEnded`, then
   `LastDetached` when its tree has no client left.
-- **Restart.** A killed `trees mount` leaves its clients attached. The next mount
+- **Restart.** A killed `mount` leaves its clients attached. The next mount
   rebinds the one of the same launcher, tree, label and access (the latest when
   several are): the same client and writer, with the new mount's pod context
   (`Rebound`), so a fork's writer comes back after a kill. Then it ends every other
@@ -220,7 +297,7 @@ before the call returns.
   the key answers "ended" and makes no new fork.
 - **End.** A fork created without a key ends, by `agentfs`, once no client is
   attached to it (its view is unmounted, or a crash left it with none), or when its
-  creating launcher (or the volume's own) ends it. A keyed fork ends only by its key (`trees end --fork-key`), for any
+  creating launcher (or the volume's own) ends it. A keyed fork ends only by its key (`fork end --fork-key`), for any
   launcher that presents it: a fork claim outlives the pods that mount it. An ended
   fork is never written again.
 - **Drop.** An ended fork drops once its upstream's queue holds nothing it put
@@ -252,16 +329,16 @@ builder each forget the tree.
 A volume is staged while a mount serves it, draining once it is told to stop, and
 released when nothing promised would be lost if the process stopped now. Its row on
 `refs/agentfs/volume` says which; every move is one journal step with its event
-commit, durable before the call returns. A volume `trees init` just created has no
+commit, durable before the call returns. A volume `init` just created has no
 row and counts as released.
 
-- **Stage.** `trees mount` stages the volume first: it takes the state area's lock,
+- **Stage.** `mount` stages the volume first: it takes the state area's lock,
   recovers the volume and records `VolumeStaged` (by `launcher cli`, with the
   mount's pod context). A mount after a kill finds the volume staged and writes
   nothing; one during a drain cancels it. Then it restores the forks and clients,
   rebinds or attaches each view's client, reconciles the rest, and drops what may
   drop ([clients](#clients), [forks](#forks-keys-end-and-the-drop)).
-- **Stop.** SIGTERM or SIGINT, or the last view unmounted, unstages the volume:
+- **Stop.** SIGTERM or SIGINT, the exit of `-- COMMAND`, or the last view unmounted, unstages the volume:
   `VolumeDraining Stop`. From then no client attaches. The mount detaches each
   client, whose open files close as saves first (a file a process still holds open
   is saved as it stands, and a write after that answers `EROFS`), then unmounts each
@@ -427,8 +504,8 @@ so no blob there is ever a folder too. A directory's record is one leaf named by
 `aa` and `bb` are the first four), so a clone or checkout of history never meets
 a name too long however deep the directory; the record holds the path:
 `{"path":"a/b","kind":"dir","mode":"0755","uid":0,"gid":0}`.
-The Root commit holds `dirs/root` alone, the root directory owned by the process
-that ran `trees init`, mode `0755`.
+The Root commit holds `dirs/root` alone, the root directory owned by
+`init --owner UID:GID`, else by the process that ran `init`, mode `0755`.
 
 A `files/` entry has git's own mode: `100755` when the owner may execute the
 file (`S_IXUSR`), else `100644`, and `120000` for a link, whose blob is its
@@ -539,7 +616,7 @@ appends it and applies it to the saved state the views serve; it runs no git.
 - The state area is `volume`, `history.git`, `journal/`, `built.log`, `align/`,
   `bases/`, `actor.lock`, `format` and rebuilt private checkout caches, which the workload
   never sees. A create writes an `initializing` marker first and removes it last;
-  the next `trees init` starts a cut-short create over. **Earlier state formats
+  the next `init` starts a cut-short create over. **Earlier state formats
   (format 8 included) do not open**, and are never converted.
 
 ## History trails the files
@@ -638,8 +715,8 @@ directory's group, and a new directory keeps the set-group-ID bit. `chmod`,
 `chown` and `chgrp` record the new mode, owner and group as one change, the
 values not given kept. The kernel judges who may make them and every access by
 the recorded mode and owner (`default_permissions`): root may chown, an owner
-may chgrp to a group it is in. The mount root starts owned by the process that
-ran `trees init`, mode 0755; a workload that needs it gets it by a chown
+may chgrp to a group it is in. The mount root starts owned by `init --owner`, else
+by the process that ran `init`, mode 0755; a workload that needs it gets it by a chown
 through the mount, which history records as any other.
 
 `symlink` makes a link (mode 0777, owned by the caller) whose target, which must
@@ -858,10 +935,18 @@ What the tree views do not support:
   extended attributes on untracked files are not built. A lookup that misses
   and each create cost an `lstat` in the area, plus one per directory above
   the name.
-- **Nested forks, transactions, `Client::Outside`, view profiles,
-  replication, CSI, several view hosts, upgrades and snapshot opens** are not
-  built. The designs for them are in [target-architecture](target-architecture/README.md).
-- **Telemetry export** is not wired. `--metrics-output` is the only measurement.
+- **Replication and patches are not built**: a tree volume pushes to no remote
+  and applies no patch queue. A configured remote or patch source is said at
+  every boot and counted by `agentfs.not_built` ([operator
+  settings](#operator-settings)). The recording commands (`status`, `push`,
+  `restore`, `revert`, `patch` and the rest) refuse a tree volume with `not built
+  yet`.
+- **Nested forks, transactions, `Client::Outside`, view profiles, CSI, several
+  view hosts, upgrades and snapshot opens** are not built. The designs for them
+  are in [target-architecture](target-architecture/README.md).
+- **Telemetry export** carries one gauge, `agentfs.not_built`, and the binary's
+  own export failures, over OTLP when the `OTEL_*` variables name a collector
+  ([telemetry](telemetry.md)). `--metrics-output` is the only other measurement.
 - **Large files.** A save costs its own file: the builder's memory does not
   grow with the file (17 MiB for a 1 GiB save in one local run, its history
   built in about 40 s; see [performance.md](performance.md)). Still: the
@@ -932,7 +1017,7 @@ jobs in [development.md](development.md); the method is in
   runs them all.
 
 Not tested: a fork's untracked copy taken while a program is writing through the
-upstream's view. `trees mount` makes its fork before any view serves, so no built
+upstream's view. `mount` makes its fork before any view serves, so no built
 launcher copies an area under live writes. `e2e-trees.sh` copies the crash image of
 a SQLite database whose writer and view host were killed mid-write; the library's
 `tree_rules` tests copy areas while threads change them under the area's hold.

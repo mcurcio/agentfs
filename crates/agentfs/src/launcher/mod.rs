@@ -475,8 +475,9 @@ fn stop_on_signals(sender: mpsc::Sender<RootEvent>) -> Result<()> {
 fn open_failure(at: &Path, error: &ViewError) -> String {
     match error {
         ViewError::Stale { found } => format!(
-            "mounting {}: it is a stale agentfs mount of another volume ({found}), which this \
-             mount never stacks over; detach it first: umount -l {}",
+            "mounting {}: it is a stale agentfs mount ({found}) this mount does not stack \
+             over: another volume's, or --on-stale-mount is not recover; detach it first: \
+             umount -l {}",
             at.display(),
             at.display()
         ),
@@ -572,8 +573,7 @@ impl Mount {
             match answered {
                 Ok(binding) => bound.push((spec.at, spec.tree, spec.over_stale, binding)),
                 Err(refused) => {
-                    let ids: Vec<ClientId> =
-                        bound.into_iter().map(|(.., b)| b.client).collect();
+                    let ids: Vec<ClientId> = bound.into_iter().map(|(.., b)| b.client).collect();
                     domains.detach_all(&ids);
                     if refused == ClientError::ForkTaken {
                         eprintln!("error: {FORK_TAKEN}");
@@ -653,10 +653,7 @@ impl Mount {
                 match command::spawn(&self.command, sender.clone()) {
                     Ok(started) => running = Some(started),
                     Err(e) => {
-                        eprintln!(
-                            "error: starting {}: {e}",
-                            self.command[0].to_string_lossy()
-                        );
+                        eprintln!("error: starting {}: {e}", self.command[0].to_string_lossy());
                         status = Some(EXIT_NOT_STARTED);
                         domains.unstage();
                     }
@@ -772,16 +769,7 @@ mod tests {
     fn init_needs_a_volume() {
         assert!(crate::Cli::try_parse_from(["agentfs", "--state", "s", "init"]).is_err());
         let cli = parse(&[
-            "agentfs",
-            "--state",
-            "s",
-            "init",
-            "--volume",
-            "t",
-            "--owner",
-            "10:20",
-            "--pod",
-            "p-1",
+            "agentfs", "--state", "s", "init", "--volume", "t", "--owner", "10:20", "--pod", "p-1",
         ]);
         let crate::Command::Init(args) = cli.command else {
             panic!("not init");
@@ -829,10 +817,7 @@ mod tests {
         ] {
             let cli = parse(args);
             let refused = crate::tree_command_flags(&cli).expect_err("refused");
-            assert!(
-                refused.contains("take --state only"),
-                "{args:?}: {refused}"
-            );
+            assert!(refused.contains("take --state only"), "{args:?}: {refused}");
         }
         let cli = parse(&["agentfs", "init", "--volume", "t"]);
         assert!(crate::tree_command_flags(&cli).is_ok());

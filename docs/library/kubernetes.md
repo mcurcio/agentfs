@@ -69,7 +69,7 @@ branch ([moving runbook](../runbooks/moving.md)).
 |---|---|
 | CreateVolume | Makes `<basePath>/<pv>/{backing,state,csi.json}` on this node. The request's topology must include this node (`RESOURCE_EXHAUSTED` otherwise). The state area is initialised in-process (`init_with`, or `start_from` for a start class) with the profile's config included and its rules installed. The answer carries the node's topology. A start class fetches once. A fork class clones its source locally with no network |
 | NodeStage | Checks the worktree and never creates one: a missing worktree is `NOT_FOUND` naming the node. A static PV is adopted only over an existing worktree of its volume (`reopen_with`). Starts `agentfs serve-history` for the volume and waits a bounded time for it to listen (`--stage-wait`, then `UNAVAILABLE`, and the kubelet retries) |
-| NodePublish | Starts a front, `agentfs mount --history-service`, with the pod's identity, mounted at a private source. Bind-mounts it onto the kubelet's target |
+| NodePublish | Starts a front, `agentfs front --history-service`, with the pod's identity, mounted at a private source. Bind-mounts it onto the kubelet's target |
 | NodeUnpublish | Detaches the target, then stops the front (SIGTERM, SIGKILL after `--unpublish-grace`) |
 | NodeUnstage | Refused while targets are published. Then stops the service (SIGTERM, SIGKILL after `--unstage-grace`; the journal makes that safe). The service makes its final commit and pushes it once more |
 | DeleteVolume | Asks the release decider and never pushes. *Delete* renames the directory to `.deleting.<handle>` under the state lock and removes it. *Keep* renames `csi.json` to `csi.retained.json`. *Wait* answers `UNAVAILABLE` and wakes the release scan |
@@ -337,7 +337,7 @@ stage, publish, unpublish and unstage waits, `--history-wait`,
 ## Recovery
 
 - A front crash leaves a stale mount, which the supervisor stacks a new mount
-  over ([filesystem layer](filesystem.md#mount-order-and-shutdown)). The
+  over ([filesystem layer](filesystem.md#stale-mounts)). The
   workload's calls fail with `ENOTCONN` meanwhile, and nothing is written where
   it would not be recorded.
 - A service crash is a restart. Boundaries during the outage fail with `EIO`.

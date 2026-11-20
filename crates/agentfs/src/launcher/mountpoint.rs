@@ -87,8 +87,8 @@ pub(super) fn prepare(views: &[&Path], policy: OnStaleMount, seal: bool) -> Resu
 /// `seal`.
 fn bare(at: &Path, seal: bool) -> Result<()> {
     mountpoint::create(at)?;
-    let mut entries =
-        std::fs::read_dir(at).with_context(|| format!("reading the mount point {}", at.display()))?;
+    let mut entries = std::fs::read_dir(at)
+        .with_context(|| format!("reading the mount point {}", at.display()))?;
     if entries.next().is_some() {
         bail!(
             "the mount point {} is not empty: files in it would be hidden by the mount and never \

@@ -56,7 +56,13 @@ impl Setup {
         fs::create_dir_all(s.tree()).unwrap();
         fs::create_dir_all(s.home()).unwrap();
         Repository::init_bare(s.remote()).unwrap();
-        agentfs_core::volume::init_with(&agentfs_core::volume::StateDir::new(s.state()), "demo", None, None).unwrap();
+        agentfs_core::volume::init_with(
+            &agentfs_core::volume::StateDir::new(s.state()),
+            "demo",
+            None,
+            None,
+        )
+        .unwrap();
         let mut config = git2::Config::open(&s.state().join("git/config")).unwrap();
         config
             .set_str(

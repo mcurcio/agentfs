@@ -50,7 +50,13 @@ impl Setup {
         };
         fs::create_dir_all(s.tree()).unwrap();
         fs::create_dir_all(s.dir.path().join("home")).unwrap();
-        agentfs_core::volume::init_with(&agentfs_core::volume::StateDir::new(s.state()), "demo", None, None).unwrap();
+        agentfs_core::volume::init_with(
+            &agentfs_core::volume::StateDir::new(s.state()),
+            "demo",
+            None,
+            None,
+        )
+        .unwrap();
         s.config().set_str("agentfs.patchRemote", "none").unwrap();
         s.record("a.txt", "a0\n");
         s

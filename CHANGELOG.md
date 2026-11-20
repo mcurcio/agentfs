@@ -10,6 +10,36 @@ there are releases.
 Nothing has been released yet. `main` has the following, built since the
 design was reviewed on 2026-10-12.
 
+### Changed
+
+- **`agentfs init` and `mount` run the tree engine.** `agentfs trees` is gone:
+  `init --volume NAME [--include FILE]... [--owner UID:GID]` creates or finds a
+  tree volume (`<name> <id> created|found`), `mount ROOT` serves it (with every
+  former `trees mount` flag, plus `--on-stale-mount refuse|hold|recover`,
+  `--seal-mountpoint` and a trailing `-- COMMAND` that runs once every view is
+  up and drains the mount when it exits), and `fork end --fork-key KEY` ends a
+  keyed fork. Each mount logs, at every boot, every operator setting whose
+  capability tree volumes do not build yet (`not built: remote.origin.url
+  (push): ...`) and counts them in the `agentfs.not_built` gauge, and refuses
+  an include under a view. A view restarted after a crash stacks over the stale
+  mount its predecessor left. `init`, `mount` and `fork end` refuse `--root`
+  (`AGENTFS_ROOT`) and a recording state area (move it with
+  `docs/runbooks/upgrading-the-sidecar.md`); every recording command (`status`,
+  `push`, `restore`, `run` and the rest) refuses a tree volume, saying it is not
+  built yet.
+- **The CSI driver's front is `agentfs front --history-service`.** It was `mount
+  --history-service`; the node plugin starts the new command with the same
+  flags.
+
+### Removed
+
+- The recording engine's standalone mount (`agentfs mount BACKING MOUNTPOINT`,
+  with `--passthrough`, `--threads`, `--unmount-grace`, `--push-grace`,
+  `--workload-mount` and the sandbox overlay's `--sandbox-overlay` and
+  `--sandbox-owner`; the fronts keep their own), `probe --sandbox-overlay`, and
+  the recording `init` (`--branch`); the CSI driver creates its state areas
+  itself.
+
 ### Added
 
 - **Tree views: launcher support.** A new tree volume records its root

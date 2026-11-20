@@ -311,8 +311,13 @@ The `image` workflow runs four flat workloads through a tree view of the
 built image, on its release build, with the state area on a fresh loop
 filesystem: once on ext4 and once on XFS (`ci/e2e-trees-tracer.sh
 --figures`, driving `ci/trees-figures.py`). Each figure is held to the
-recording engine's budget in `ci/trees-budget.json`. A missed bar prints a
-warning and never fails the job.
+recording engine's budget in `ci/trees-budget.json`. `create`, the
+many-file workload, is gated (`"gate": true`): when it misses its bar the
+script prints an `::error::` line, writes the report, and exits 1, and the
+tracer fails once the rest of its checks have run. Every other missed bar
+prints a warning and never fails the job. `trees-figures.py --self-test`
+checks the gate itself, with no view: a `create` one file short of its bar
+must exit 1, and the tracer runs it before the figures.
 
 | Workload | What it does | Deadline | Bar |
 |---|---|---|---|

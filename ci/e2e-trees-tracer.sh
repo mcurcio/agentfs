@@ -124,7 +124,7 @@ state_hashes() {
   in_state sh -c 'cd /data/state && find . -type f -print0 | sort -z | xargs -0 sha256sum'
 }
 # The mount's own line once every view is up (docs/trees.md, "Run it").
-mounted() { docker logs "$NAME" 2>&1 | grep -qF 'mounted volume t at /agentfs/root'; }
+mounted() { docker logs "$NAME" 2>&1 | grep -F 'mounted volume t at /agentfs/root' >/dev/null; }
 mount_view() { # [mount flags]
   docker rm -f "$NAME" >/dev/null 2>&1 || true
   docker run -d --name "$NAME" \

@@ -53,7 +53,7 @@ The image is the same (`ghcr.io/mcurcio/agentfs`): it ships `agentfs`,
  │ livenessprobe                                                     │
  │ tini ── agentfs-csi        Identity, Controller and Node services │
  │          ├─ agentfs serve-history          (per staged volume)    │
- │          ├─ agentfs mount --history-service (per pod)             │
+ │          ├─ agentfs front --history-service (per pod)             │
  │          └─ agentfs push / fork finish     (the release scan)     │
  └──────────────────────────────────────────────────────────────────┘
 ```
@@ -75,7 +75,7 @@ plugin** serves all three CSI services, beside its own csi-provisioner in
 - **The node services** supervise child processes of the `agentfs`
   binary, exactly the ones the single-node tests exercise: one `agentfs
   serve-history` per staged volume (the volume's single writer of
-  history), started at NodeStage; one front, `agentfs mount
+  history), started at NodeStage; one front, `agentfs front
   --history-service`, per pod using the volume, started at NodePublish
   with that pod's name, namespace and uid. The front mounts FUSE at a
   private source directory, which is bind-mounted onto the kubelet's
