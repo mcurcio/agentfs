@@ -1,36 +1,24 @@
 # shellcheck shell=bash
 # The checks the Hermes suites share (deployment.md):
-# ci/e2e-hermes.sh under Docker Compose and ci/e2e-hermes-kind.sh on kind.
-# Source it after ci/lib.sh. ENGINE says which engine the volume runs:
-# `tree` (the sidecar and Compose: docs/trees.md) or `recording` (the CSI
-# driver, until it moves). The caller defines how to reach each piece:
+# ci/e2e-hermes.sh under Docker Compose and ci/e2e-hermes-kind.sh on kind,
+# every configuration on the tree engine (docs/trees.md). Source it after
+# ci/lib.sh. The caller defines how to reach each piece:
 #
 #   hermes_exec ARGS...   a command in the Hermes container
 #   hermes_logs           Hermes' container log
 #   dind_exec ARGS...     a command in the docker-in-docker container
 #   model_exec ARGS...    a command in the model server's container
 #   history ARGS...       git on the volume's history (its state area)
+#   agentfs_logs          the log of every boot of the volume's agentfs
+#                         process: the sidecar's container, or the CSI node
+#                         plugin's container, which carries its hosts'
 #
-# for `tree`:
-#
-#   agentfs_logs          the agentfs container's log, every boot of it
-#
-# and for `recording`:
-#
-#   backing_exec ARGS...  a command where the backing tree is at $BACKING
-#   rgit ARGS...          git on the remote the volume pushes to
-#   agentfs_status        `agentfs status` of the volume
-#   run_producer          runs $PRODUCER_SUBMIT with MARKER, VOLUME and
-#                         ORIGIN set, where agentfs and git are
-#
-# and sets VOLUME and HERMES_DIR (Hermes' home in its container), and for
-# `recording` BRANCH and BACKING. Tool containers see Hermes' home at
-# /opt/data, as the scenarios' commands (ci/hermes/model/scenarios.json)
-# expect.
+# and sets HERMES_DIR (Hermes' home in its container). Tool containers see
+# Hermes' home at /opt/data, as the scenarios' commands
+# (ci/hermes/model/scenarios.json) expect.
 
 HERMES_LIB=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 . "$HERMES_LIB/../tree-git-test-lib.sh"
-: "${ENGINE:?set ENGINE to tree or recording}"
 SCENARIOS=$HERMES_LIB/model/scenarios.json
 HERMES_CONFIG=$HERMES_LIB/hermes/config.yaml
 HERMES_API_KEY=agentfs-ci-not-a-secret
@@ -95,13 +83,9 @@ hermes_ask() { # scenario
 }
 
 # Where a file's bytes are in a commit: the root's files/<aa>/<bb>/<path>
-# on the tree engine (docs/trees.md), <branch>:<path> on the recording one.
+# (docs/trees.md).
 file_rev() { # path
-  if [ "$ENGINE" = tree ]; then
-    echo "root:files/$(tree_git_fanned "$1")"
-  else
-    echo "$BRANCH:$1"
-  fi
+  echo "root:files/$(tree_git_fanned "$1")"
 }
 
 # History is built behind the calls: waits until git function $1 has
@@ -114,29 +98,19 @@ wait_content() { # git-fn path content [seconds]
   done
   pass "$1 has $2"
 }
-author() { "$1" log -1 --format=%an "$BRANCH" -- "$2"; } # git-fn path
-# The uid the tree engine's history records <path> with (lines/ metadata).
+# The uid the history records <path> with (lines/ metadata).
 owner_uid() { # path
   history show "root:lines/$(tree_git_fanned "$1")" | grep -o '"uid":[0-9]*' | cut -d: -f2
 }
-# Who wrote <path>, as each engine's history says: its owner's uid on the
-# tree engine, the author uid-<uid> on the recording one.
+# Who wrote <path>, as the history says: its owner's uid.
 assert_written_by() { # uid path what
-  if [ "$ENGINE" = tree ]; then
-    assert_eq "$1" "$(owner_uid "$2")" "$3"
-  else
-    assert_eq "uid-$1" "$(author rgit "$2")" "$3"
-  fi
+  assert_eq "$1" "$(owner_uid "$2")" "$3"
 }
 
-# Every path git function $1 ever recorded: on the tree engine, the paths
-# under files/<aa>/<bb>/.
+# Every path git function $1 ever recorded: the paths under
+# files/<aa>/<bb>/.
 recorded_paths() { # git-fn
-  if [ "$ENGINE" = tree ]; then
-    "$1" log --all --format= --name-only | sed -nE 's#^files/[0-9a-f]{2}/[0-9a-f]{2}/##p' | sort -u
-  else
-    "$1" log --all --format= --name-only | sort -u
-  fi
+  "$1" log --all --format= --name-only | sed -nE 's#^files/[0-9a-f]{2}/[0-9a-f]{2}/##p' | sort -u
 }
 
 # Fails if git function $1 ever recorded a path matching the regex <re>.
@@ -150,20 +124,8 @@ never_recorded() { # git-fn regex what
   pass "$1 never recorded $3"
 }
 
-# Waits until the remote's branch is the history's: everything committed
-# so far is pushed.
-wait_pushed() {
-  local deadline=$((SECONDS + 120))
-  until [ "$(rgit rev-parse "$BRANCH" 2>/dev/null)" = "$(history rev-parse "$BRANCH")" ]; do
-    [ $SECONDS -lt $deadline ] || fail "the remote never caught up with the history"
-    sleep 1
-  done
-  pass "the remote has the history's head"
-}
-
-# 1. Hermes' root start-up on the mount; files keep their owners. With
-# `migrated`, SOUL.md came from the initial import, not from Hermes.
-hermes_check_startup() { # [migrated]
+# 1. Hermes' root start-up on the mount; files keep their owners.
+hermes_check_startup() {
   local soul
   step "1. Hermes starts as upstream ships it (root init) on the mount"
   assert_contains "$(in_hermes "grep ' $HERMES_DIR ' /proc/self/mountinfo")" "fuse" "Hermes' $HERMES_DIR is the agentfs FUSE mount"
@@ -174,19 +136,11 @@ hermes_check_startup() { # [migrated]
   assert_eq hermes "$(in_hermes "stat -c %U $HERMES_DIR/skills")" "skills/ is hermes'"
   soul=$(in_hermes "cat $HERMES_DIR/SOUL.md")
   wait_content history SOUL.md "$soul"
-  if [ "$ENGINE" = tree ]; then
-    assert_written_by 10000 SOUL.md "history records SOUL.md as Hermes' user's"
-    return
-  fi
-  assert_eq 10000 "$(backing_exec stat -c %u "$BACKING/SOUL.md")" "the backing tree keeps SOUL.md's owner"
-  wait_content rgit SOUL.md "$soul"
-  if [ "${1:-}" != migrated ]; then
-    assert_written_by 10000 SOUL.md "SOUL.md is authored by Hermes' user"
-  fi
+  assert_written_by 10000 SOUL.md "history records SOUL.md as Hermes' user's"
 }
 
 # 2. A skill Hermes creates with its own skill tool is recorded, as its
-# user (and pushed, on the recording engine).
+# user.
 hermes_check_skill() { # scenario
   local name content
   name=$(scenario_field "$1" 'a["operations"][0]["name"]')
@@ -195,7 +149,6 @@ hermes_check_skill() { # scenario
   assert_eq "$content" "$(in_hermes "cat $HERMES_DIR/skills/$name/SKILL.md")" "Hermes wrote skills/$name"
   assert_eq hermes "$(in_hermes "stat -c %U $HERMES_DIR/skills/$name/SKILL.md")" "the skill is Hermes' user's"
   wait_content history "skills/$name/SKILL.md" "$content"
-  [ "$ENGINE" = tree ] || wait_content rgit "skills/$name/SKILL.md" "$content"
   assert_written_by 10000 "skills/$name/SKILL.md" "the skill is recorded as Hermes' user's"
 }
 
@@ -218,7 +171,7 @@ pull_tool_image() {
 }
 
 # 5. A tool container's edit, through Hermes' terminal tool, reaches
-# Hermes and is recorded, as root (and pushed, on the recording engine).
+# Hermes and is recorded, as root.
 hermes_check_tool_edit() {
   local note
   step "5. a tool container's edit reaches Hermes and is recorded"
@@ -229,70 +182,34 @@ hermes_check_tool_edit() {
   tool_container "$note" >/dev/null
   assert_eq root "$(in_hermes "stat -c %U $HERMES_DIR/skills/agentfs-sandbox/SKILL.md")" "the tool container's file is root's in Hermes too"
   wait_content history skills/agentfs-sandbox/SKILL.md "$note"
-  [ "$ENGINE" = tree ] || wait_content rgit skills/agentfs-sandbox/SKILL.md "$note"
   assert_written_by 0 skills/agentfs-sandbox/SKILL.md "the tool container's file is recorded as root's"
 }
 
 # 3. Secrets, sessions, logs and databases written during the run, by
 # Hermes and by the tool container, are in the tree but never in the
-# history (nor on the remote, on the recording engine). Run after 5.
+# history. Run after 5.
 hermes_check_exclusions() {
-  local path excluded git_fns=(history)
+  local path excluded
   step "3. secrets, sessions, logs and databases are never recorded"
   # Hermes keeps its sessions in state.db (upstream docker.md, v0.22.5).
   excluded=(.env state.db response_store.db logs/agent.log skills/agentfs-sandbox/auth.json skills/agentfs-sandbox/logs/run.log)
   for path in "${excluded[@]}"; do
     in_hermes "test -e $HERMES_DIR/$path" || fail "$path was never written, so this check proves nothing"
-    [ "$ENGINE" = tree ] || backing_exec test -e "$BACKING/$path" || fail "$path is not in the backing tree"
   done
   pass "written during the run: ${excluded[*]}"
-  if [ "$ENGINE" = tree ]; then
-    # Everything Hermes wrote before this is in the history: history is
-    # built behind the calls, and the skill of 5 was written after them.
-    wait_content history skills/agentfs-sandbox/SKILL.md "$(in_hermes "cat $HERMES_DIR/skills/agentfs-sandbox/SKILL.md")"
-  else
-    wait_pushed
-    git_fns+=(rgit)
-  fi
-  for git_fn in "${git_fns[@]}"; do
-    never_recorded "$git_fn" \
-      '(^|/)(\.env|auth\.json)$|\.(db|db-wal|db-shm|db-journal)$|\.sqlite|(^|/)(sessions|logs|checkpoints)/' \
-      "a secret, session, log or database"
-  done
-}
-
-# The producer's submit, as iac runs it: a SOUL.md with $MARKER queued
-# for $VOLUME on $ORIGIN with `agentfs patch submit`.
-# shellcheck disable=SC2016
-PRODUCER_SUBMIT='git init -q /tmp/producer && cd /tmp/producer
-git config user.name "Patch Producer" && git config user.email producer@example.com
-git remote add origin "$ORIGIN"
-printf "# A persona from the patch queue\n\n%s\n" "$MARKER" >/tmp/SOUL.md
-agentfs patch submit --volume "$VOLUME" --put SOUL.md=/tmp/SOUL.md -m "Set the persona"'
-
-# Queues patch <n> setting SOUL.md to carry <marker>.
-hermes_queue_patch() { # marker n
-  local out
-  out=$(run_producer "$1" 2>&1) || fail "patch submit failed: $out"
-  echo "$out"
-  assert_contains "$out" "queued patch $2" "patch $2 is queued on the remote"
-}
-
-# 4. Patch <n>, with <marker>, has landed: Hermes reads it, and its next
-# model request carries the patched SOUL.md.
-hermes_check_patch_landed() { # marker n
-  local nonce
-  assert_contains "$(agentfs_status)" "last applied $2" "agentfs applied patch $2"
-  assert_contains "$(in_hermes "cat $HERMES_DIR/SOUL.md")" "$1" "Hermes' container reads the patched SOUL.md"
-  assert_contains "$(history log -1 --format=%B "$BRANCH" -- SOUL.md)" "Agentfs-Trigger: patch" "the patch is its own commit in the history"
-  nonce=$(hermes_ask hello)
-  assert_contains "$(turn_text "$nonce" system)" "$1" "Hermes' next model request carries the patched SOUL.md"
+  # Everything Hermes wrote before this is in the history: history is
+  # built behind the calls, and the skill of 5 was written after them.
+  wait_content history skills/agentfs-sandbox/SKILL.md "$(in_hermes "cat $HERMES_DIR/skills/agentfs-sandbox/SKILL.md")"
+  never_recorded history \
+    '(^|/)(\.env|auth\.json)$|\.(db|db-wal|db-shm|db-journal)$|\.sqlite|(^|/)(sessions|logs|checkpoints)/' \
+    "a secret, session, log or database"
 }
 
 # On the tree engine, push and the patch queue are not built: every boot
-# of the agentfs container logs the remote and the patch source the
-# operator settings name (deploy/examples/hermes/config), one line per key,
-# and serves anyway. <boots> is how many times the container has started.
+# of the volume's agentfs process (the sidecar, or the CSI driver's host
+# of the volume) logs the remote and the patch source the operator
+# settings name (deploy/examples/hermes/config), one line per key, and
+# serves anyway. <boots> is how many times it has started.
 hermes_check_not_built() { # boots
   local logs key n
   logs=$(agentfs_logs)

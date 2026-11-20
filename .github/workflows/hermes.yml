@@ -4,7 +4,7 @@ name: hermes
 # job, each on its own runner (ci/e2e-hermes-kind.sh): the sidecar pod of
 # docs/deployment.md on the tree engine, with the migration Job of existing
 # data and a sidecar-only restart, its read-only fence alternative, and
-# Hermes on a CSI volume (the recording engine). The Compose suite is
+# Hermes on a CSI volume, all on the tree engine. The Compose suite is
 # docker.yml's hermes job.
 
 on:
@@ -22,7 +22,6 @@ on:
       - ci/k8s-csi/driver/**
       - ci/kind/**
       - ci/install-kind.sh
-      - ci/git-http-server.sh
       - deploy/examples/hermes/**
       - deploy/sidecar/**
       - deploy/csi/**
@@ -83,34 +82,24 @@ jobs:
         with:
           name: agentfs-image-hermes
           path: ${{ runner.temp }}
-      - name: FUSE, nginx and fcgiwrap
+      - name: FUSE
         run: |
           sudo modprobe fuse
           ls -l /dev/fuse
-          sudo apt-get update && sudo apt-get install -y nginx fcgiwrap
       - name: install kind and kubectl
         run: |
           ci/install-kind.sh "$RUNNER_TEMP/kind" >>"$GITHUB_ENV"
           echo "$RUNNER_TEMP/kind/bin" >>"$GITHUB_PATH"
       - name: create the cluster
         run: |
-          docker load -i "$RUNNER_TEMP/agentfs-image.tar"
           kind create cluster --name agentfs-hermes --config ci/kind/cluster.yaml \
             --image "$KIND_NODE_IMAGE" --wait 120s
           kind load image-archive "$RUNNER_TEMP/agentfs-image.tar" --name agentfs-hermes
           kubectl get nodes -o wide
-      # The csi job's remote; the sidecar and fence jobs log theirs as not
-      # built and never reach it.
-      - name: start git server
-        run: |
-          GIT_SERVER_EXTRA_LISTEN=$(ci/e2e-hermes-kind.sh gateway) \
-            ci/git-http-server.sh start "$RUNNER_TEMP/git-server" >>"$GITHUB_ENV"
       - run: ci/e2e-hermes-kind.sh ${{ matrix.mode }}
       - name: diagnose
         if: failure()
         run: ci/e2e-hermes-kind.sh diagnose ${{ matrix.mode }}
       - name: clean up
         if: always()
-        run: |
-          kind delete cluster --name agentfs-hermes || true
-          ci/git-http-server.sh stop "$RUNNER_TEMP/git-server"
+        run: kind delete cluster --name agentfs-hermes || true

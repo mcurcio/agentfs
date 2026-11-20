@@ -27,26 +27,20 @@
 #             3, the not built lines (4), and again after a pod restart.
 #   csi       Hermes and dind in one pod on an agentfs claim of the CSI
 #             driver (ci/hermes/k8s/csi-driver, ci/hermes/k8s/csi), on the
-#             recording engine until the CSI driver moves; 1-5, with a
-#             queued patch (4) landing at the next NodeStage and reaching
-#             Hermes' next model request.
+#             tree engine: the volume's `agentfs host` in the node plugin;
+#             1, 2, 5 and 3; the remote and the patch source logged as not
+#             built (4); then a pod restart: the plugin starts a new host,
+#             which logs the not built lines again, Hermes reads the
+#             SOUL.md it had, and a new skill is recorded.
 #
 #   ci/e2e-hermes-kind.sh <sidecar|fence|csi>
-#   ci/e2e-hermes-kind.sh gateway             the kind network's gateway
 #   ci/e2e-hermes-kind.sh diagnose <mode>     after a failure
 #
 # Needs docker, kind and kubectl (ci/install-kind.sh), a kind cluster
-# $KIND_CLUSTER (default agentfs-hermes) with the image agentfs:ci loaded,
-# and for csi the image in the runner's docker too (`agentfs patch submit`
-# runs from it) and the git server from ci/git-http-server.sh started with
-# GIT_SERVER_EXTRA_LISTEN set to the gateway, its output in the
-# environment (as ci/e2e-kind.sh). The FUSE module must be loaded.
+# $KIND_CLUSTER (default agentfs-hermes) with the image agentfs:ci loaded.
+# No configuration reaches a remote: push is not built on tree volumes.
+# The FUSE module must be loaded.
 
-# The engine each configuration runs, for ci/hermes/lib.sh.
-case "${1:-}/${2:-}" in
-csi/* | diagnose/csi) ENGINE=recording ;;
-*) ENGINE=tree ;;
-esac
 . "$(dirname "$0")/lib.sh"
 . "$(dirname "$0")/hermes/lib.sh"
 
@@ -56,37 +50,28 @@ K8S=ci/hermes/k8s
 LOGS=${E2E_HERMES_LOGS:-${RUNNER_TEMP:-/tmp}/agentfs-hermes-kind-logs}
 mkdir -p "$LOGS"
 
-gateway() {
-  docker network inspect kind -f '{{range .IPAM.Config}}{{.Gateway}} {{end}}' |
-    tr ' ' '\n' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | sed -n 1p
-}
 render() { kubectl kustomize --load-restrictor LoadRestrictionsNone "$1"; }
 apply_dir() { render "$1" | kubectl apply -f -; }
 
 MODE=${1:-}
 case "$MODE" in
-gateway) gateway; exit 0 ;;
 diagnose) MODE=${2:?diagnose <mode>} ;;
 sidecar | fence | csi) ;;
-*) echo "usage: $0 <sidecar|fence|csi> | gateway | diagnose <mode>" >&2; exit 2 ;;
+*) echo "usage: $0 <sidecar|fence|csi> | diagnose <mode>" >&2; exit 2 ;;
 esac
 
 case "$MODE" in
 csi)
   NS=hermes-csi
   APP=app.kubernetes.io/name=hermes
-  DEPLOYMENT=hermes
   DNS=agentfs-csi
   BASE=/var/lib/agentfs-csi/volumes
   PLUGIN_LABEL=app.kubernetes.io/name=agentfs-csi-node
-  PASSWORD=ci-csi-password
   HERMES_DIR=/opt/data
   ;;
 *)
   NS=agentfs-e2e
   APP=app.kubernetes.io/name=agentfs-example
-  DEPLOYMENT=agentfs-example
-  VOLUME=hermes
   HERMES_DIR=/opt/data
   [ "$MODE" = fence ] && HERMES_DIR=/agentfs/workspace
   ;;
@@ -107,9 +92,14 @@ hermes_logs() { k logs "$POD" -c hermes; }
 dind_exec() { k exec "$POD" -c dind -- "$@"; }
 model_exec() { k exec deploy/model -- "$@"; }
 if [ "$MODE" = csi ]; then
-  backing_exec() { in_plugin "$@"; }
-  history() { in_plugin git --git-dir "$STATE/git" "$@"; }
-  agentfs_status() { in_plugin agentfs --state "$STATE" status; }
+  # The volume's state area on the node, and the plugin's log, which
+  # carries its hosts' output (each line `[host <pv>] ...`): its previous
+  # container's, if any, then this one's.
+  history() { in_plugin git --git-dir "$BASE/$PV/state/history.git" "$@"; }
+  agentfs_logs() {
+    kd logs "$(plugin_pod)" -c agentfs-csi --previous 2>/dev/null || true
+    kd logs "$(plugin_pod)" -c agentfs-csi
+  }
 else
   history() { k exec "$POD" -c agentfs -- git --git-dir /data/state/history.git "$@"; }
   # The sidecar's previous boot in this pod, if any, then this one.
@@ -118,12 +108,6 @@ else
     k logs "$POD" -c agentfs
   }
 fi
-run_producer() { # marker
-  docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp \
-    -e MARKER="$1" -e VOLUME="$VOLUME" -e ORIGIN="$REMOTE" \
-    -v "$GIT_SERVER_REPOS:$GIT_SERVER_REPOS" \
-    --entrypoint sh agentfs:ci -ec "$PRODUCER_SUBMIT"
-}
 
 if [ "${1:-}" = diagnose ]; then
   set +e
@@ -146,7 +130,8 @@ if [ "${1:-}" = diagnose ]; then
     done
   fi
   POD=$(k get pod -l "$APP" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
-  if [ -n "$POD" ] && [ "$ENGINE" = tree ]; then
+  [ "$MODE" != csi ] || PV=$(k get pvc hermes -o jsonpath='{.spec.volumeName}' 2>/dev/null)
+  if [ -n "$POD" ]; then
     step "diagnose: the volume's history"
     history log --stat -5 root
   fi
@@ -166,44 +151,10 @@ for r in json.load(sys.stdin):
   tail -n 80 "$LOGS"/*.log 2>/dev/null
   echo "---- node mounts"
   docker exec "$NODE" sh -c "grep -E 'agentfs|fuse' /proc/self/mountinfo"
-  echo "---- git server"
-  tail -n 40 "${GIT_SERVER_DIR:-/nonexistent}"/logs/*.log 2>/dev/null
+  echo "---- node processes"
+  docker exec "$NODE" sh -c "ps -eo pid,args | grep -E 'agentfs|tini' | grep -v grep"
   exit 0
 fi
-
-if [ "$MODE" = csi ]; then
-  : "${GIT_SERVER_REPOS:?start ci/git-http-server.sh first}" "${GIT_SERVER_HTPASSWD:?}"
-  REMOTE=$GIT_SERVER_REPOS/history.git
-  rgit() { git --git-dir "$REMOTE" "$@"; }
-fi
-
-set_password() { # user password
-  local others
-  others=$(grep -v "^$1:" "$GIT_SERVER_HTPASSWD" || true)
-  { [ -n "$others" ] && echo "$others"; echo "$1:$(openssl passwd -apr1 "$2")"; } \
-    >"$GIT_SERVER_HTPASSWD"
-}
-
-# The runner's git server as the Service git-server of <namespace>.
-git_server_endpoint() { # namespace
-  kubectl apply -f - <<EOF
-apiVersion: discovery.k8s.io/v1
-kind: EndpointSlice
-metadata:
-  name: git-server-runner
-  namespace: $1
-  labels:
-    kubernetes.io/service-name: git-server
-    endpointslice.kubernetes.io/managed-by: ci.agentfs
-addressType: IPv4
-ports:
-  - name: http
-    port: 8080
-    protocol: TCP
-endpoints:
-  - addresses: ["$GW"]
-EOF
-}
 
 # The pod of <label> that is not being deleted.
 current_pod() { # label
@@ -257,19 +208,10 @@ pins_agree() {
 step "cluster"
 pins_agree
 kubectl get nodes -o wide
-if [ "$MODE" = csi ]; then
-  step "git server"
-  rm -rf "$REMOTE"
-  git init -q --bare "$REMOTE"
-  set_password agentfs "$PASSWORD"
-  GW=$(gateway)
-  [ -n "$GW" ] || fail "no IPv4 gateway on the kind network"
-fi
 
 if [ "$MODE" = csi ]; then
-  step "the CSI driver with a hermes profile (deploy/examples/hermes rules)"
+  step "the CSI driver with a hermes profile (deploy/examples/hermes settings and rules)"
   kubectl apply -f deploy/csi/namespace.yaml
-  git_server_endpoint "$DNS"
   apply_dir "$K8S/csi-driver"
   deadline=$((SECONDS + 300))
   until [ -n "$(plugin_pod)" ]; do
@@ -285,12 +227,7 @@ if [ "$MODE" = csi ]; then
   wait_ready
   PV=$(k get pvc hermes -o jsonpath='{.spec.volumeName}')
   [ -n "$PV" ] || fail "the claim is not bound"
-  VOLUME=$NS.hermes.$PV
-  BRANCH=agentfs/$VOLUME
-  STATE=$BASE/$PV/state
-  BACKING=$BASE/$PV/backing
-  SOCK=/var/lib/agentfs-csi/node/run/$PV/history.sock
-  echo "volume $VOLUME"
+  echo "volume $PV, history $BASE/$PV/state/history.git"
   hermes_check_startup
 else
   step "deploy ci/hermes/k8s/$MODE"
@@ -380,7 +317,7 @@ EOF
     in_hermes "test -e $HERMES_DIR/$path" || fail "$path did not reach the volume"
   done
   pass "excluded files and the nested repository are in the volume: ${KEPT_EXISTING[*]}"
-  hermes_check_startup migrated
+  hermes_check_startup
 elif [ "$MODE" = fence ]; then
   wait_ready
   hermes_check_startup
@@ -396,27 +333,6 @@ step "2. a skill Hermes creates with its own skill tool is recorded"
 hermes_check_skill create-skill
 hermes_check_tool_edit
 hermes_check_exclusions
-
-if [ "$MODE" = csi ]; then
-  marker="Patched by agentfs CI $(date +%s%N)"
-  step "4. queue a patch to SOUL.md"
-  hermes_queue_patch "$marker" 1
-  step "4. the queued patch lands at the next NodeStage"
-  k scale "deployment/$DEPLOYMENT" --replicas=0
-  wait_gone "$APP"
-  deadline=$((SECONDS + 180))
-  while docker exec "$NODE" test -e "$SOCK"; do
-    [ $SECONDS -lt $deadline ] || fail "the volume was never unstaged"
-    sleep 1
-  done
-  pass "the volume is unstaged"
-  k scale "deployment/$DEPLOYMENT" --replicas=1
-  wait_ready
-  kd logs "$(plugin_pod)" -c agentfs-csi | grep -E 'patch|stag' | tail -n 20 || true
-  hermes_check_patch_landed "$marker" 1
-  step "e2e-hermes-kind $MODE passed"
-  exit 0
-fi
 
 step "4. the remote and the patch source are logged as not built"
 hermes_check_not_built 1
@@ -459,13 +375,20 @@ if [ "$MODE" = sidecar ]; then
   step "Hermes records through the new mount"
   hermes_check_skill recovered-skill
 else
-  step "a pod restart: the new pod logs not built again, and Hermes' files stay"
+  step "a pod restart: not built is logged again, and Hermes' files stay"
   soul=$(in_hermes "cat $HERMES_DIR/SOUL.md")
   OLD=$POD
   k delete pod "$POD" --wait --timeout=180s
   wait_ready
   [ "$POD" != "$OLD" ] || fail "the pod was not replaced"
-  hermes_check_not_built 1
+  if [ "$MODE" = csi ]; then
+    # The plugin's log holds every boot of the volume's host: the old
+    # pod's went with it, and the new pod's view is a new host's.
+    hermes_check_not_built 2
+  else
+    # A new pod's agentfs container has booted once.
+    hermes_check_not_built 1
+  fi
   assert_eq "$soul" "$(in_hermes "cat $HERMES_DIR/SOUL.md")" "Hermes reads the SOUL.md it had"
   hermes_check_skill recovered-skill
 fi

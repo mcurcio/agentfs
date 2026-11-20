@@ -9,7 +9,8 @@ spec:
     requests:
       storage: 1Gi
 ---
-# HostToContainer: a replaced front reaches both containers live (csi.md).
+# HostToContainer: the view a restarted host mounts reaches both
+# containers live (csi.md). One pod: ReadWriteOncePod and Recreate.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
