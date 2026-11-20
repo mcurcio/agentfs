@@ -1,16 +1,18 @@
 #!/usr/bin/env bash
-# End-to-end test of the OTLP transports against a real
-# OpenTelemetry Collector: metrics, a span and an alarm log arrive over
+# End-to-end test of the OTLP transports against a real OpenTelemetry
+# Collector: `agentfs mount ROOT -- true` on a tree volume whose operator
+# settings name a remote delivers its `agentfs.not_built` gauge over
 # http/protobuf, http/json and gRPC, each from its own service name, with
 # OTEL_EXPORTER_OTLP_HEADERS sent along; with E2E_OTLP_TLS=1 (a binary
 # built with --features otlp-tls) also over TLS with a CA bundle and a
 # bearer token, and over mutual TLS, and a collector that refuses (a wrong
 # token, no client certificate, a CA the system store does not have) gets
-# nothing while the command still succeeds.
+# nothing while the mount still succeeds.
 #
 # Needs OTEL_OUT, the file the collector from ci/otelcol.yaml writes, the
-# collector on localhost (4317-4322 as that file says) and, for TLS,
-# OTEL_CERTS: the directory ci/otel-certs.sh wrote and the collector uses.
+# collector on localhost (4317-4322 as that file says), /dev/fuse and
+# fusermount3 (the mount is --no-allow-other) and, for TLS, OTEL_CERTS: the
+# directory ci/otel-certs.sh wrote and the collector uses.
 
 . "$(dirname "$0")/lib.sh"
 
@@ -19,25 +21,24 @@
 unset OTEL_EXPORTER_OTLP_ENDPOINT OTEL_EXPORTER_OTLP_PROTOCOL OTEL_SERVICE_NAME
 export OTEL_METRIC_EXPORT_INTERVAL=500
 
-new_volume transports
-EXPORTS=0
+WORK=$(mktemp -d)
+STATE=$WORK/state
+printf '[remote "origin"]\n\turl = https://git.example.com/acme/history.git\n' >"$WORK/settings"
+"$AGENTFS_BIN" --state "$STATE" init --volume transports --include "$WORK/settings" >/dev/null
+mkdir "$WORK/mnt"
 
 arrived() { # service-name needle: one export from service-name carries needle
   grep -F "\"$1\"" "$OTEL_OUT" | grep -F "$2" >/dev/null
 }
 
-record_with() { # service-name env-assignments...: records one file and a refused path
+mount_with() { # service-name env-assignments...: mounts, runs `true`, drains
   local name=$1
   shift
-  EXPORTS=$((EXPORTS + 1))
-  echo "$name" >"$TREE/f$EXPORTS.txt"
-  ln -sf elsewhere "$TREE/.gitmodules"
   env OTEL_SERVICE_NAME="$name" "$@" \
-    "$AGENTFS_BIN" --state "$STATE" --root "$TREE" record "f$EXPORTS.txt" .gitmodules \
-    >"$VOL/$name.out" 2>"$VOL/$name.err" || true
-  grep -q "1 record(s) into 1 commit(s)" "$VOL/$name.out" || {
-    cat "$VOL/$name.out" "$VOL/$name.err"
-    fail "$name: the record failed"
+    "$AGENTFS_BIN" --state "$STATE" mount "$WORK/mnt" --no-allow-other -- true \
+    >"$WORK/$name.out" 2>"$WORK/$name.err" || {
+    cat "$WORK/$name.out" "$WORK/$name.err"
+    fail "$name: the mount failed"
   }
 }
 
@@ -45,31 +46,28 @@ export_over() { # label service-name env-assignments...
   local label=$1 name=$2
   shift 2
   step "export over $label"
-  record_with "$name" "$@"
-  if grep -q "warning: telemetry" "$VOL/$name.err"; then
-    cat "$VOL/$name.err"
+  mount_with "$name" "$@"
+  if grep "warning: telemetry" "$WORK/$name.err" >/dev/null; then
+    cat "$WORK/$name.err"
     fail "$label: telemetry warned"
   fi
-  wait_for 20 arrived "$name" '"agentfs.record.duration"' || fail "$label: metrics never arrived"
-  pass "$label: metrics"
-  wait_for 20 arrived "$name" '"name":"agentfs.record"' || fail "$label: the record span never arrived"
-  pass "$label: the record span"
-  wait_for 20 arrived "$name" 'agentfs.path_refused' || fail "$label: the path_refused log never arrived"
-  pass "$label: the path_refused alarm log"
+  wait_for 20 arrived "$name" '"agentfs.not_built"' || fail "$label: agentfs.not_built never arrived"
+  pass "$label: agentfs.not_built"
 }
 
 refused_over() { # label service-name env-assignments...
   local label=$1 name=$2
   shift 2
   step "refused: $label"
-  record_with "$name" "$@"
-  grep -q "export failed" "$VOL/$name.err" || {
-    cat "$VOL/$name.err"
+  mount_with "$name" "$@"
+  grep "export failed" "$WORK/$name.err" >/dev/null || {
+    cat "$WORK/$name.err"
     fail "$label: no export failure was reported"
   }
-  pass "$label: the failure is reported, the command succeeded"
-  sleep 2
-  if grep -qF "\"$name\"" "$OTEL_OUT"; then fail "$label: the collector got data"; fi
+  pass "$label: the failure is reported, the mount succeeded"
+  # The collector refused the export the mount reports failed, so it has
+  # nothing of it to write.
+  if grep -F "\"$name\"" "$OTEL_OUT" >/dev/null; then fail "$label: the collector got data"; fi
   pass "$label: the collector got nothing"
 }
 

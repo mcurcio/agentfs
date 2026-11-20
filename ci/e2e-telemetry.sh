@@ -1,16 +1,15 @@
 #!/usr/bin/env bash
-# End-to-end test of telemetry against a real OpenTelemetry
-# Collector: every metric, span and alarm log this script names must arrive.
-# The failure counters come from real failures (an unreadable file, an
-# unwritable object store, an unwritable pack directory for the repack), and the history
-# service's fronts gauge, a front's round trip and its service failures
-# (a hung service: `timeout`; a stopped one: `connect`) from a real
-# `serve-history` and FUSE front mounts.
+# End-to-end test of a tree mount's telemetry against a real OpenTelemetry
+# Collector: a volume whose operator settings (docs/trees.md, "Operator
+# settings") name a remote and a patch source is mounted with OTEL_* set,
+# runs one command and drains. Its stderr must carry one `not built:` line
+# per key, and the collector must get `agentfs.not_built` points for
+# capability=push and capability=patches, and none for a capability no key
+# names, from a resource carrying agentfs.volume and service.name.
 #
 # Needs OTEL_OUT, the file the collector from ci/otelcol.yaml writes, the
-# collector listening on localhost:4318, jq (ci/otel-points.sh reads the
-# points), and for the fronts /dev/fuse, fuse3 and passwordless sudo. Runs as
-# a user other than root, so that permissions stop it.
+# collector listening on localhost:4318, jq, /dev/fuse and fusermount3. Runs
+# as any user: the mount is --no-allow-other.
 
 . "$(dirname "$0")/lib.sh"
 
@@ -18,221 +17,55 @@
 
 export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318
 export OTEL_METRIC_EXPORT_INTERVAL=500
-export OTEL_SERVICE_NAME=agentfs-ci
+export OTEL_SERVICE_NAME=agentfs-ci-telemetry
 
-new_volume telem
-REMOTE=$(mktemp -d)/remote.git
-git init -q --bare "$REMOTE"
-volume_config remote.good.url "$REMOTE"
-volume_config remote.gone.url "$VOL/does-not-exist.git"
-SMALL=$(mktemp -d)/small.git
-git init -q --bare "$SMALL"
-volume_config remote.small.url "$SMALL"
-volume_config remote.small.agentfsMaxBlobSize 8
-volume_config remote.broken.url "$REMOTE"
-volume_config remote.broken.agentfsMaxBlobSize lots
-volume_config agentfs.pushInterval 1s
+WORK=$(mktemp -d)
+STATE=$WORK/state
+VOLUME=telem
 
-step "generate every signal"
-echo ok >"$TREE/small.txt"
-echo "this file is over eight bytes" >"$TREE/big.txt"
-agentfs record small.txt big.txt || true # big.txt is refused by "small"
-set +e
-agentfs push --remote good --remote gone
-set -e
-# A diverged remote: another writer moves the branch.
-OTHER=$(mktemp -d)
-git clone -q "$REMOTE" "$OTHER/c" && git -C "$OTHER/c" checkout -q -b w origin/agentfs/telem
-echo x >"$OTHER/c/x" && git -C "$OTHER/c" add x
-git -C "$OTHER/c" -c user.name=o -c user.email=o@example.com commit -q -m other
-git -C "$OTHER/c" push -q origin w:refs/heads/agentfs/telem
-echo more >"$TREE/more.txt"
-agentfs record more.txt
-LOG=$VOL/run.log
-agentfs_start "$LOG" run
-RUN=$AGENTFS_PID
-sleep 4 # several metric export intervals and push attempts
-kill -TERM "$RUN"
-wait "$RUN" || { cat "$LOG"; fail "run did not exit cleanly"; }
+step "a tree volume whose settings name a remote and a patch source"
+cat >"$WORK/settings" <<'EOF'
+[remote "origin"]
+	url = https://git.example.com/acme/history.git
+[agentfs]
+	patchRemote = origin
+EOF
+"$AGENTFS_BIN" --state "$STATE" init --volume "$VOLUME" --include "$WORK/settings" >/dev/null
+pass "init --include"
 
-step "everything reached the collector"
-for name in \
-  agentfs.record.duration agentfs.commit.count agentfs.journal.backlog \
-  agentfs.push.unpushed_commits agentfs.push.oldest_unpushed_age \
-  agentfs.push.failures agentfs.push.diverged agentfs.remote.misconfigured agentfs.remotes.mode \
-  agentfs.precheck.rejected_paths agentfs.state.bytes \
-  agentfs.patch.queue_depth agentfs.patch.blocked; do
-  wait_for 20 grep -q "\"$name\"" "$OTEL_OUT" || fail "metric $name never arrived"
-  pass "metric $name"
-done
-for name in agentfs.record agentfs.commit agentfs.push; do
-  wait_for 20 grep -q "\"name\":\"$name\"" "$OTEL_OUT" || fail "span $name never arrived"
-  pass "span $name"
-done
-# Alarms only: a successful push is not logged.
-for name in agentfs.path_refused agentfs.push_failed agentfs.diverged \
-  agentfs.remote_misconfigured; do
-  wait_for 20 grep -q "$name" "$OTEL_OUT" || fail "log $name never arrived"
-  pass "log $name"
-done
-assert_contains "$(cat "$OTEL_OUT")" '"agentfs-ci"' "service.name is set"
+step "mount, run a command, drain"
+mkdir "$WORK/mnt"
+"$AGENTFS_BIN" --state "$STATE" mount "$WORK/mnt" --no-allow-other -- \
+  sh -c 'echo ok >"$1/ok.txt"' sh "$WORK/mnt" 2>"$WORK/mount.err" ||
+  { cat "$WORK/mount.err"; fail "the mount failed"; }
+ERR=$(cat "$WORK/mount.err")
+assert_contains "$ERR" "not built: remote.origin.url (push): " "stderr names the remote as not built"
+assert_contains "$ERR" "not built: agentfs.patchremote (patches): " "stderr names the patch source as not built"
+case "$ERR" in *"warning: telemetry"*) echo "$ERR"; fail "telemetry warned" ;; esac
+pass "no telemetry warning"
 
-step "a push over the size limit is stepped (PushLimited)"
-TINY=$(mktemp -d)/tiny.git
-git init -q --bare "$TINY"
-volume_config remote.tiny.url "$TINY"
-agentfs push --remote tiny >/dev/null # the history so far
-volume_config remote.tiny.agentfsMaxPushSize 6k
-# "small" would refuse these files outright (its 8-byte blob limit).
-git --git-dir "$STATE/git" config --unset remote.small.agentfsMaxBlobSize
-for n in 1 2 3; do
-  head -c 4000 /dev/urandom >"$TREE/rand-$n.bin"
-  agentfs record "rand-$n.bin" >/dev/null
-done
-OUT=$(agentfs push --remote tiny 2>&1) || { echo "$OUT"; fail "the stepped push failed"; }
-assert_contains "$OUT" "(push size limit: " "agentfs push stepped through the limit"
-[ "$(git --git-dir "$TINY" rev-parse refs/heads/agentfs/telem)" = "$(git --git-dir "$STATE/git" rev-parse refs/heads/agentfs/telem)" ] ||
-  fail "the tiny remote is not at the head"
-wait_for 20 grep -q '"agentfs.push.limited"' "$OTEL_OUT" || fail "metric agentfs.push.limited never arrived"
-pass "metric agentfs.push.limited"
-wait_for 20 grep -q agentfs.push_limited "$OTEL_OUT" || fail "log agentfs.push_limited never arrived"
-pass "log agentfs.push_limited"
-git --git-dir "$STATE/git" config --unset remote.tiny.agentfsMaxPushSize
-
-step "a failing exporter is reported, and counted over metrics"
-# Traces go to a port nothing listens on; metrics still reach the collector.
-echo again >"$TREE/again.txt"
-ERR=$VOL/failing.err
-OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=http://127.0.0.1:9/v1/traces \
-  agentfs record again.txt 2>"$ERR" || { cat "$ERR"; fail "record failed"; }
-assert_contains "$(cat "$ERR")" "warning: telemetry: traces export failed" \
-  "stderr warns about the failed trace export"
-wait_for 20 grep -q '"agentfs.telemetry.export_failures"' "$OTEL_OUT" ||
-  fail "metric agentfs.telemetry.export_failures never arrived"
-pass "metric agentfs.telemetry.export_failures"
-
-step "real failures: a record, a commit and a repack"
-# The runner is not root, so permissions stop it.
-echo s >"$TREE/secret.txt"
-chmod 000 "$TREE/secret.txt"
-if agentfs record secret.txt 2>"$VOL/secret.err"; then
-  fail "an unreadable file was recorded"
-fi
-chmod 644 "$TREE/secret.txt" && rm "$TREE/secret.txt"
-chmod -R a-w "$STATE/git/objects"
-echo c >"$TREE/commit-fails.txt"
-agentfs record commit-fails.txt 2>"$VOL/commit.err" || true
-chmod -R u+w "$STATE/git/objects"
-agentfs flush >/dev/null
-assert_contains "$(agentfs status)" "backlog:   0 record(s)" "the record stayed journaled and was committed later"
-# A repack that fails: git cannot write its pack (git runs with a fixed
-# PATH, so a fake git would not be found).
-volume_config agentfs.repackInterval 1m
-echo r >"$TREE/repack.txt"
-agentfs record repack.txt >/dev/null
-chmod a-w "$STATE/git/objects/pack"
-agentfs_start "$VOL/repack.log" run
-RUN=$AGENTFS_PID
-counted() { # metric attr-substring
-  ci/otel-points.sh "$OTEL_OUT" "$1" | grep -- "$2" | awk '$1 >= 1 { found = 1 } END { exit !found }'
+step "agentfs.not_built reached the collector"
+# The points of agentfs.not_built from this volume's resource, one per line:
+# the value, then the capability.
+not_built() {
+  jq -rR --arg volume "$VOLUME" '
+    fromjson? | .resourceMetrics[]?
+    | select(any(.resource.attributes[]?; .key == "agentfs.volume" and .value.stringValue == $volume))
+    | .scopeMetrics[]?.metrics[]? | select(.name == "agentfs.not_built")
+    | .gauge.dataPoints[]?
+    | "\(.asInt // .asDouble) \(.attributes[]? | select(.key == "capability") | .value.stringValue)"' "$OTEL_OUT"
 }
-wait_for 20 counted agentfs.record.failures trigger=close || fail "agentfs.record.failures never counted"
-pass "agentfs.record.failures from an unreadable file"
-wait_for 20 counted agentfs.commit.failures "" || fail "agentfs.commit.failures never counted"
-pass "agentfs.commit.failures from unwritable objects"
-wait_for 100 counted agentfs.repack.failures "" || { cat "$VOL/repack.log"; fail "agentfs.repack.failures never counted"; }
-pass "agentfs.repack.failures from an unwritable pack directory"
-wait_for 20 grep -q agentfs.repack_failed "$OTEL_OUT" || fail "log agentfs.repack_failed never arrived"
-pass "log agentfs.repack_failed"
-kill -TERM "$RUN"
-wait "$RUN" || { cat "$VOL/repack.log"; fail "run did not exit cleanly"; }
-chmod u+w "$STATE/git/objects/pack"
-
-step "fronts and the history service (FUSE)"
-[ -c /dev/fuse ] || fail "/dev/fuse is missing: this step needs FUSE"
-# As root throughout: the service and the fronts are root, and libgit2
-# refuses a repository another user owns.
-VOL=$(mktemp -d)
-STATE=$VOL/state
-TREE=$VOL/tree
-mkdir -p "$TREE"
-sudo "$AGENTFS_BIN" --state "$STATE" --root "$TREE" init --volume fronts >/dev/null
-sudo git --git-dir "$STATE/git" config agentfs.commitWindow 50ms
-SOCK=$STATE/meta/history/history.sock
-MNT_A=$VOL/mnt-a
-MNT_B=$VOL/mnt-b
-mkdir -p "$MNT_A" "$MNT_B"
-as_root() { # pidfile command...: runs as root with the telemetry settings, its PID in pidfile
-  local pidfile=$1; shift
-  sudo --preserve-env=OTEL_EXPORTER_OTLP_ENDPOINT,OTEL_METRIC_EXPORT_INTERVAL,OTEL_SERVICE_NAME \
-    sh -c 'echo $$ >"$0"; exec "$@"' "$pidfile" "$@"
-}
-front() { # pod mountpoint
-  as_root "$VOL/$1.pid" env AGENTFS_POD="$1" AGENTFS_POD_UID="$1-uid" AGENTFS_REPLICA="$1" \
-    "$AGENTFS_BIN" --state "$STATE" mount --history-service "$SOCK" --history-timeout 2s \
-    --history-wait 30s "$TREE" "$2" >>"$VOL/$1.log" 2>&1 &
-  wait_for 30 mountpoint -q "$2" || { cat "$VOL/$1.log"; fail "$1 never mounted"; }
-}
-cleanup_fronts() {
-  for p in pod-a pod-b service; do
-    [ -f "$VOL/$p.pid" ] && sudo kill -CONT "$(cat "$VOL/$p.pid")" 2>/dev/null || true
-    [ -f "$VOL/$p.pid" ] && sudo kill -TERM "$(cat "$VOL/$p.pid")" 2>/dev/null || true
-  done
-  sudo umount -l "$MNT_A" "$MNT_B" 2>/dev/null || true
-}
-trap cleanup_fronts EXIT
-fronts_now() { ci/otel-points.sh "$OTEL_OUT" agentfs.history_service.fronts | tail -n 1 | cut -d' ' -f1; }
-fronts_are() { [ "$(fronts_now)" = "$1" ]; }
-gone() { ! sudo kill -0 "$(cat "$1")" 2>/dev/null; }
-
-as_root "$VOL/service.pid" env AGENTFS_REPLICA=history-0 "$AGENTFS_BIN" --state "$STATE" \
-  --root "$TREE" serve-history >"$VOL/service.log" 2>&1 &
-wait_for 30 grep -q '^serving history' "$VOL/service.log" || { cat "$VOL/service.log"; fail "never served"; }
-wait_for 20 fronts_are 0 || fail "the fronts gauge never showed 0"
-pass "agentfs.history_service.fronts: 0"
-front pod-a "$MNT_A"
-wait_for 20 fronts_are 1 || fail "the fronts gauge never showed 1"
-pass "agentfs.history_service.fronts: 1"
-front pod-b "$MNT_B"
-wait_for 20 fronts_are 2 || fail "the fronts gauge never showed 2"
-pass "agentfs.history_service.fronts: 2"
-sudo kill -TERM "$(cat "$VOL/pod-b.pid")"
-wait_for 30 gone "$VOL/pod-b.pid" || fail "pod-b never stopped"
-wait_for 20 fronts_are 1 || fail "the fronts gauge never went back to 1"
-pass "agentfs.history_service.fronts: back to 1"
-SEQ=$(ci/otel-points.sh "$OTEL_OUT" agentfs.history_service.fronts | cut -d' ' -f1 | uniq | tr '\n' ' ')
-echo "fronts gauge: $SEQ"
-assert_contains " $SEQ" " 0 1 2 1 " "the gauge went 0, 1, 2, 1"
-
-sudo sh -c "echo one >'$MNT_A/one.txt'"
-wait_for 20 counted agentfs.front.round_trip request=record || fail "agentfs.front.round_trip never arrived"
-pass "agentfs.front.round_trip for a record"
-
-# A hung service: the front's close times out.
-sudo kill -STOP "$(cat "$VOL/service.pid")"
-sudo sh -c "echo two >'$MNT_A/two.txt'" 2>/dev/null || true
-sudo kill -CONT "$(cat "$VOL/service.pid")"
-# sudo (use_pty) stops itself when its command stops: continue it too, or
-# it never reaps the service, which then looks alive to `kill -0`.
-sudo pkill -CONT -x sudo || true
-wait_for 20 counted agentfs.front.service_failures stage=timeout ||
-  fail "agentfs.front.service_failures{stage=timeout} never counted"
-pass "agentfs.front.service_failures: timeout"
-
-# The service gone: the front cannot connect.
-sudo kill -TERM "$(cat "$VOL/service.pid")"
-wait_for 30 gone "$VOL/service.pid" || {
-  ps -o pid,ppid,stat,wchan:30,cmd -p "$(cat "$VOL/service.pid")" || true
-  cat "$VOL/service.log"
-  fail "the service never stopped"
-}
-for n in 1 2 3; do
-  sudo sh -c "echo three-$n >'$MNT_A/three.txt'" 2>/dev/null || true
+has_point() { not_built | grep -x -- "$1" >/dev/null; }
+for capability in push patches; do
+  wait_for 20 has_point "1 $capability" || {
+    not_built
+    fail "no agentfs.not_built point of 1 for capability=$capability from agentfs.volume=$VOLUME"
+  }
+  pass "agentfs.not_built{capability=$capability} = 1, agentfs.volume=$VOLUME"
 done
-wait_for 20 counted agentfs.front.service_failures stage=connect ||
-  fail "agentfs.front.service_failures{stage=connect} never counted"
-pass "agentfs.front.service_failures: connect"
-cleanup_fronts
-trap - EXIT
+POINTS=$(not_built)
+case "$POINTS" in *" lfs"* | *" other"*) echo "$POINTS"; fail "a capability no key names has a point" ;; esac
+pass "no point for lfs or other"
+assert_contains "$(cat "$OTEL_OUT")" "\"$OTEL_SERVICE_NAME\"" "service.name is set"
 
 step "telemetry passed"

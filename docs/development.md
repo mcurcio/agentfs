@@ -194,9 +194,10 @@ Four more workflows test what ships beside the binary:
   published from `main` ([helm.md](helm.md#6-how-it-is-tested)).
 - [`.github/workflows/alerts.yml`](../.github/workflows/alerts.yml), on
   pushes that touch the rules or the telemetry code: promtool checks and
-  unit tests of the example alert rules, and the rules against the
-  binary's metrics in a real Prometheus
-  ([deployment.md](deployment.md#alerts)).
+  unit tests of the example alert rules, and the rules against a tree
+  mount's metrics in a real Prometheus, `AgentfsNotBuilt` active for
+  settings that name a remote ([`ci/e2e-alerts.sh`](../ci/e2e-alerts.sh),
+  [deployment.md](deployment.md#alerts)).
 
 [`.github/workflows/docs.yml`](../.github/workflows/docs.yml) builds this
 documentation as a book with [mdBook](https://rust-lang.github.io/mdBook/)
