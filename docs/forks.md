@@ -7,12 +7,14 @@ publishes one **change**: a commit whose parent is the base and whose tree
 is the fork's final tree. Whatever receives the change decides what to do
 with it. agentfs never reviews, accepts or merges a fork's change.
 
-Forked volumes are the recording engine's, which the CSI driver runs: a
-fork claim (below) is one, and the `fork` commands work on the state areas
-it makes. Tree volumes have forks of their own, inside the volume, which
-land as they save ([tree views](trees.md#forks-keys-end-and-the-drop)); on
-a tree volume the `fork` commands other than `fork end` refuse, and fork
-delivery and unlinked forks are not built.
+Forked volumes are the recording engine's, on recording state areas; no
+launcher runs them. Tree volumes have forks of their own, inside the
+volume, which land as they save
+([tree views](trees.md#forks-keys-end-and-the-drop)); on a tree volume the
+`fork` commands other than `fork end` refuse, and fork delivery and
+unlinked forks are not built. A CSI fork claim is a tree volume's fork:
+its saves land in its source, and it publishes no change
+([csi.md](csi.md#14-forks)).
 
 ```sh
 # A fork of the recording volume at ./state, in ./fork with its tree in ./fork-tree:
@@ -25,11 +27,6 @@ agentfs fork list --remote origin --source src
 # and lands the exact change it reviewed in the source:
 agentfs patch submit --volume src <change commit>
 ```
-
-Under CSI, a claim with a `dataSource` claim on a fork StorageClass
-(`fork: "true"`, reclaim policy `Delete`) is a fork. Deleting it finishes
-the fork, and the driver deletes the volume only once it is published
-([csi.md](csi.md#14-forks)).
 
 ## Where a fork publishes
 
@@ -93,8 +90,7 @@ file's path are fixed at create.
   history, a source with no fork remote, and a source whose own forks could
   not roll up into it (an unlinked fork, one whose history is hidden, or a
   fork of a local-only source). A source's settings must be in included
-  files, because the fork reads only those; a CSI source's are its
-  profile's. Create packs every object reachable from the base into the
+  files, because the fork reads only those. Create packs every object reachable from the base into the
   fork's own object store, so a fork outlives its source, and writes the
   base's tree into the backing tree. Each step is idempotent, so a retry
   resumes.
@@ -152,7 +148,7 @@ is only as trustworthy as the remote's writers: whoever may write
 
 `agentfs fork deliver` hands one published change, checked as `fork list`
 checks it, to a receiver by one method, from the receiver's own clone and
-credentials. The CSI driver never delivers: a receiver runs this.
+credentials. No launcher delivers: a receiver runs this.
 
 ```sh
 # Queue it in a volume's inbox (at most once; applied at its next mount):

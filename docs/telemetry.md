@@ -8,9 +8,10 @@ record and alarm event, with its attributes, and how to turn export on.
 `mount`, `run`, `record`, `flush`, `push`, `serve-history`, `patch apply`,
 `fork finish`, `fork abandon`, and `restore` and `revert` without a mount
 export telemetry; a front (`mount` or `record` with `--history-service`)
-exports its own. Under the CSI driver, the release scan's `agentfs push`
-of each worktree no pod stages exports its own too, so its failures reach
-the collector as `PushFailed` with the node plugin's `OTEL_*` settings.
+exports its own. `host`, the CSI driver's per-volume process, exports
+the `agentfs.not_built` gauge and the export-failure counter through the
+`OTEL_*` variables the node plugin passes on ([csi.md](csi.md#9-operations));
+the plugin itself exports nothing.
 
 ```sh
 export OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318
@@ -82,7 +83,7 @@ exporter.
 | `agentfs.fuse.racy_rechecks` | counter, per outcome | Boundaries that would have recorded a file again only because its last record was racy: `skipped` when its bytes were that record's frozen copy, still the last state journaled at its path, else `recorded` |
 | `agentfs.reconcile.records` | counter | Records made reconciling moved directories |
 | `agentfs.reconcile.failures` | counter | Moved directories given up on after 5 failed reconciliations over at least 30 s (`reconcile_failed`) |
-| `agentfs.nested.gitdir_heuristic` | counter | Absolute `gitdir:` or `.git` symlink targets under no known view of the tree, found by trying their suffixes; set `--workload-mount` (CSI: `workloadMounts`) |
+| `agentfs.nested.gitdir_heuristic` | counter | Absolute `gitdir:` or `.git` symlink targets under no known view of the tree, found by trying their suffixes; set `--workload-mount` |
 | `agentfs.sandbox_overlay.refusals` | counter, by `reason` | Changes the sandbox overlay refused, each counted once: `not_recordable` (a name the rules skip for that kind: a directory they could record nothing beneath, a recorded file moved to a skipped name), `kind` (a symlink, hard link or special file), `cross_device` (a directory move, `EXDEV`), `hidden` (the source, or an entry at the target, is hidden), `rules_error` (the rules could not decide: `EIO`), `ownership` (an owner, group, set-id or sticky-bit change), `xattr` (an extended-attribute change). Reads of hidden names are not counted |
 | `agentfs.fork.publish.duration` | histogram, per remote | Seconds from a fork's finish commit to its fork remote holding the change and finish refs: one point per fork, when the published mark is written |
 
@@ -141,8 +142,7 @@ once (`agentfs.fork`, `agentfs.fork.change` when there is one,
 (`agentfs.fork`, `agentfs.remote`, `agentfs.fork.publish.outcome`:
 `published`, `pending` or `refused`, and `agentfs.fork.refused.reason`),
 with its `agentfs.push` spans inside it. `agentfs fork finish`
-exports like `push`, so the CSI node plugin's finisher children export
-too.
+exports like `push`.
 
 ## Logs
 
@@ -256,13 +256,17 @@ Prometheus's default OTLP translation does (`agentfs.record.failures` is
 each counter rule also matches a counter's first sample, since a counter
 appears at its first count and `increase()` alone needs two. Under the
 CSI driver one `instance` (the node plugin's pod) runs every volume on
-its node, so there `agentfs.volume` must be promoted to the label
-`agentfs_volume`, and the rules join a volume's series on it. The
+its node, each in its own `agentfs host`, so there `agentfs.volume` must be
+promoted to the label `agentfs_volume`, and the rules join a volume's
+series on it. The
 `alerts` workflow runs promtool's checks and unit tests on them and
 checks them against the binary's metrics in a real Prometheus. The CSI driver
 reports failed calls through the kubelet's events on the pod (FailedMount
-with the call's error); it emits no Events of its own, having no API
-access.
+with the call's error) and the provisioner's on the claim and PV
+(ProvisioningFailed, VolumeFailedDelete); it emits no Events of its own,
+having no API access. A PV the driver will not delete (a recording-format
+volume) stays `Released`: kube-state-metrics'
+`kube_persistentvolume_status_phase` can alert on it.
 
 ## Alerts
 
@@ -278,5 +282,5 @@ yet, labelled by `capability`; it links
 [Operator settings](trees.md#operator-settings). The `alerts` workflow
 causes it from a real tree mount whose settings name a remote. The other
 rules but `AgentfsTelemetryExportFailing` are on the recording engine's
-metrics, which only the CSI driver emits; promtool's unit tests check
+metrics, which no launcher emits any more; promtool's unit tests check
 them.

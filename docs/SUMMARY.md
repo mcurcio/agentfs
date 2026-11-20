@@ -41,7 +41,7 @@
 - [Upgrading the sidecar](runbooks/upgrading-the-sidecar.md)
 - [The history service is down](runbooks/history-service-down.md)
 - [Recovering CSI volumes](runbooks/csi-recovery.md)
-- [Moving a volume to another node](runbooks/moving.md)
+- [Moving a CSI volume](runbooks/moving.md)
 - [The start branch moved](runbooks/start-branch-moved.md)
 - [A fork's publish is refused](runbooks/fork-refused.md)
 - [A moved directory could not be reconciled](runbooks/reconcile-failed.md)

@@ -37,14 +37,12 @@ and the credentials Secret out of band:
 ```sh
 kubectl apply -f deploy/csi/namespace.yaml        # or create and label agentfs-csi
 kubectl -n agentfs-csi create secret generic agentfs-csi-credentials \
-  --from-literal=example-origin=$'username=agentfs\npassword=<token>' \
-  --from-literal=sandbox=$'username=agentfs\npassword=<token>'
+  --from-literal=example-origin=$'username=agentfs\npassword=<token>'
 helm install agentfs-csi oci://ghcr.io/mcurcio/charts/agentfs-csi \
   --namespace agentfs-csi --version <version> \
   --set credentials.existingSecret=agentfs-csi-credentials \
   --set-file profiles.example.config=deploy/csi/profiles/example.config \
   --set-file profiles.example.exclude=deploy/csi/profiles/example.exclude \
-  --set-file profiles.sandbox-remotes.config=deploy/csi/profiles/sandbox-remotes.config \
   -f storageclasses.yaml
 ```
 
@@ -57,19 +55,18 @@ storageClasses:
       profile: example
       volumeName: "{pvcNamespace}.{pvcName}.{pvName}"
       onDelete: retain
-  # A fork class (csi.md §14): claims cloning an `agentfs` claim. `link:
-  # unlinked` makes independent forks that never deliver back to their
-  # source and never push to its remotes; omit it (or `linked`) for forks
-  # that do deliver. `remotes` names the profile holding the forks' own
-  # remotes (`profiles.sandbox-remotes.config`, set above from
-  # deploy/csi/profiles/sandbox-remotes.config); without it they are
-  # local-only, and deleting a claim deletes its history.
-  - name: agentfs-sandbox
+  # A fork class (csi.md §14): a claim cloning an `agentfs` claim is a
+  # fork claim, a fork in its source's volume whose saves land in the
+  # source automatically. `landing: approval` and `link: unlinked` are
+  # refused as not built.
+  - name: agentfs-fork
     parameters:
       fork: "true"
-      link: unlinked
-      remotes: sandbox-remotes
 ```
+
+Push is not built on tree volumes: a profile's remote, and the
+credentials it names, are accepted, and each volume's host logs the
+remote as not built at every start (csi.md §1).
 
 The release notes (`helm status`) warn when the namespace enforces a Pod
 Security level other than `privileged`, and when no profile or
@@ -102,8 +99,7 @@ part of the one chart, and off by default.
   `history.git` once, and at every start sets `core.fsync committed`:
   git's default leaves loose objects (how a small push arrives) unsynced
   while it syncs the ref, so an unclean shutdown of the server's node
-  could leave a branch naming objects that are gone, after a driver saw
-  that branch and deleted its own copy (csi.md §7). The Service serves it at
+  could leave a branch naming objects that are gone. The Service serves it at
   `http://agentfs-git-server.<namespace>.svc:<server.service.port>/git/history.git`
   (port 8080 by default).
 - **Where the history lives.** On the claim `repos-agentfs-git-server-0`,
@@ -130,7 +126,10 @@ part of the one chart, and off by default.
 
   The credentials Secret
   (`credentials.*`) must not have its own `agentfs-server` key.
-- **A profile pushing to it**, as the release notes print it (csi.md §4):
+- **A profile naming it**, as the release notes print it (csi.md §4).
+  Push is not built on tree volumes: each volume's host logs `not built:
+  remote.server.url (push): ...` at every start, and nothing reaches the
+  server yet:
 
   ```ini
   [remote "server"]
@@ -191,7 +190,7 @@ labels").
 `sidecars.provisioner.extraArgs` passes flags to each node's
 csi-provisioner (`--retry-interval-max=20s` retries a waiting
 DeleteVolume sooner), and `node.extraArgs` to `agentfs-csi`
-(`--release-scan-interval`).
+(`--backoff-max`).
 
 ## 4. The sidecar helpers
 
@@ -300,21 +299,25 @@ on every push and pull request:
   and the `ci` profile e2e-csi uses, and the release kept; then
   [`ci/e2e-csi.sh`](../ci/e2e-csi.sh) with `CSI_INSTALL=chart` runs every
   e2e-csi check against the chart-installed driver (csi.md §13: RBAC,
-  two restricted pods on one claim, crashes and recovery, refusals,
-  restore and revert, teardown). The sidecar example then passes
+  a restricted writer on a view of its volume's host, a second pod
+  refused, crashes and recovery, refusals, teardown keeping the
+  volume). The sidecar example then passes
   server-side validation (`kubectl apply --dry-run=server`).
 - **e2e (CSI move between nodes)**, in the f8 workflow: `helm install` of
-  `charts/agentfs-csi` from this tree on a two-worker kind cluster
-  ([`ci/k8s-csi/move/values.yaml`](../ci/k8s-csi/move/values.yaml)), and
-  [`ci/e2e-csi-move.sh`](../ci/e2e-csi-move.sh) (csi.md §13).
+  `charts/agentfs-csi` from this tree on a two-worker kind cluster, with
+  values the script writes, and
+  [`ci/e2e-csi-move.sh`](../ci/e2e-csi-move.sh): a volume recorded on its
+  node only, `startFrom` refused, the deleted claim's directory kept
+  (csi.md §13).
 - **e2e (the chart's git server)**, in the f8 workflow: `helm lint
   --strict` and rendering checks with
   [`charts/agentfs-csi/ci/server.yaml`](../charts/agentfs-csi/ci/server.yaml)
   (not named `*-values.yaml`, so `ct install` above does not take it),
   then `helm install` on one kind node and
   [`ci/e2e-chart-server.sh`](../ci/e2e-chart-server.sh): a pod's write
-  reaches the server as `agentfs/<volume>` at the worktree's head (read
-  with `git ls-remote` through `kubectl port-forward`), the repository
+  is recorded and its host logs the server remote as not built, `git
+  ls-remote` through `kubectl port-forward` shows no agentfs ref, a push
+  from the runner with the chart's password succeeds, the repository
   has `core.fsync committed`, a wrong password
   is refused, the repository survives deleting the server pod, and
   `helm upgrade` keeps the password.

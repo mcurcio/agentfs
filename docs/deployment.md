@@ -7,8 +7,8 @@ guide covers the container image, the example manifests in
 [`deploy/sidecar`](../deploy/sidecar), why the pod is laid out the way it
 is, configuration, operations, what happens when the daemon crashes, the
 security cost of the privileged sidecar, and Hermes as upstream ships it.
-The sidecar runs the tree engine ([trees](trees.md)); the CSI driver
-([csi.md](csi.md)) runs the recording engine.
+The sidecar runs the tree engine ([trees](trees.md)), as the CSI driver
+([csi.md](csi.md)) does.
 Section numbers (§) on this page are this page's own. What agentfs
 promises is in [guarantees](guarantees.md). Running a mount
 outside Kubernetes is in the [operator guide](operator-guide.md); every
@@ -338,9 +338,9 @@ The CSI Helm chart installs the same `PrometheusRule` with
 `alerts.enabled=true` (off by default; [helm.md](helm.md#3-values)).
 
 For the sidecar, alert on `AgentfsNotBuilt`: the sidecar's mount exports
-`agentfs.not_built` and the count of failed exports. The other rules are
-on the recording engine's metrics, which the CSI driver emits
-([csi.md](csi.md)).
+`agentfs.not_built` and the count of failed exports, as each CSI volume's
+`agentfs host` does ([csi.md](csi.md#9-operations)). The other rules are
+on the recording engine's metrics, which no launcher emits any more.
 
 | Alert | Severity | Fires when |
 |---|---|---|
@@ -373,8 +373,8 @@ and `service.instance.id` (the pod name, or `AGENTFS_REPLICA`) become
 promoted (Prometheus: `otlp.promote_resource_attributes`). Promote
 `agentfs.volume`, which becomes `agentfs_volume`, wherever one
 `instance` runs several volumes. **Under the CSI driver it is
-required:** every history service on a node reports the node plugin's
-pod as `instance`, so without it the volumes' series merge, and their
+required:** every volume's `agentfs host` on a node reports the node
+plugin's pod as `instance`, so without it the volumes' series merge, and their
 interleaved counters look like resets. `AgentfsCommitsFailing` joins a
 volume's failures to its backlog on `job`, `instance` and
 `agentfs_volume`. A sidecar runs one volume, so there it only names the
@@ -753,8 +753,11 @@ manifests in [`ci/hermes/k8s`](../ci/hermes/k8s):
   pod restart that logs the not built lines again.
 - **csi**: Hermes and docker-in-docker in one pod on a claim of the CSI
   driver ([csi.md](csi.md)), with a `hermes` profile holding these
-  rules. The CSI driver runs the recording engine: there the import
-  is pushed and a queued patch lands at the next NodeStage.
+  rules: the volume's `agentfs host` in the node plugin, the import
+  recorded, the remote and the patch source logged as not built, then a
+  pod restart onto a new host where Hermes reads what it had and records
+  a new skill. The claim is `ReadWriteOncePod` with `strategy:
+  Recreate`: one pod per claim.
 
 Not tested: a profile's files, a real model, tool containers given only
 part of the volume, docker-in-docker without the mount, the fence pod
@@ -780,10 +783,8 @@ fence's `HERMES_WRITE_SAFE_ROOT`.
   every other one, and the read-only `emptyDir` has no such gap (§7).
 - The privileged sidecar (§9); the CSI driver ([csi.md](csi.md)) needs no
   privilege in workload pods.
-- One pod per volume. For several pods on one volume use the CSI driver
-  ([csi.md](csi.md)), which runs the recording engine: a history service
-  per volume and a front per pod, one node per volume at a time;
-  multi-node access modes are refused.
+- One pod per volume, as under the CSI driver, where a fork claim gives a
+  second pod its own fork of the volume ([csi.md](csi.md#14-forks)).
 - The image is not bit-reproducible (Debian packages are not pinned),
   and is not yet signed or shipped with an SBOM.
 

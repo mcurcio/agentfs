@@ -2,10 +2,10 @@
 
 Change a volume's files from outside it: queue a patch, and the volume's
 next start applies it before the workload sees the tree. Producers are iac,
-an operator or CI. The patch queue is the recording engine's, which the CSI
-driver runs ([csi.md](csi.md)). Tree volumes, which the sidecar, the Docker
-examples and the CLI's `agentfs init` and `agentfs mount` run, do not apply
-patches yet: a configured patch source (`agentfs.patchRemote` or any other
+an operator or CI. The patch queue is the recording engine's, on recording
+state areas, which no launcher runs any more. Tree volumes, which the
+sidecar, the Docker examples, the CLI's `agentfs init` and `agentfs mount`,
+and the CSI driver ([csi.md](csi.md)) run, do not apply patches yet: a configured patch source (`agentfs.patchRemote` or any other
 `agentfs.patch*` key) is logged at every boot as not built and counted by
 the `agentfs.not_built` gauge ([tree views](trees.md#operator-settings)),
 and the patch commands refuse a tree volume. This page is what the patch queue does and what it
@@ -18,8 +18,7 @@ promises. The procedures for when it blocks are in the runbook
 agentfs patch submit --volume demo --put config/app.yaml=./app.yaml -m "Raise the limit"
 agentfs patch submit --volume demo HEAD          # a commit whose parent is on agentfs/demo
 
-# On the volume, in the CSI node plugin pod of its node (STATE and BACKING
-# are /var/lib/agentfs-csi/volumes/<pv>/state and .../backing):
+# On a recording volume (STATE and BACKING its state area and backing tree):
 agentfs --state "$STATE" status                  # patches:   last applied 3, 0 queued, ok (from origin)
 agentfs --state "$STATE" patch status            # the queue, a block and why
 agentfs --state "$STATE" --root "$BACKING" patch apply   # with the volume stopped
@@ -73,8 +72,7 @@ Patches land only at a start with nothing attached. They never land while
 a workload may be using the volume (see
 [guarantees](guarantees.md)).
 
-- **At the history service's start** (under the CSI driver, NodeStage),
-  after journal replay and before it listens to fronts. `agentfs run` does
+- **At the history service's start**, after journal replay and before it listens to fronts. `agentfs run` does
   not run the queue.
 - **`agentfs patch apply`** with the volume stopped does the same. It
   takes the operator's word that nothing is attached.
@@ -91,9 +89,8 @@ the next start with nothing attached. The evidence is:
 
 - **A history service** defers while a front holds a lease
   (`fronts_running`), and when started with `--workload-attached`
-  (`workload_attached`). The CSI node plugin passes that whenever a pod of
-  the volume is published on the node, so a plugin restart under running
-  pods never lands the queue.
+  (`workload_attached`), which a launcher passes whenever a workload may
+  be attached.
 
 A run goes in this order:
 

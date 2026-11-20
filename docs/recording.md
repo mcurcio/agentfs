@@ -1,10 +1,11 @@
 # How agentfs records changes
 
 This page says what the recording engine records, when, and how it turns
-records into commits. The recording engine is what the CSI driver runs: a
-history service per volume and a front per pod ([csi.md](csi.md),
-[operator guide](operator-guide.md)). The sidecar, the Docker examples and
-the CLI's `agentfs init` and `agentfs mount` run tree views, which record
+records into commits. The recording engine is a history service per volume
+and a front per mount, on recording state areas; no launcher runs it any
+more ([operator guide](operator-guide.md)). The sidecar, the Docker
+examples, the CLI's `agentfs init` and `agentfs mount`, and the CSI driver
+([csi.md](csi.md)) run tree views, which record
 each save into a tree's journal and history in their own way
 ([tree views](trees.md)). The promises are in
 [guarantees.md](guarantees.md); every key and flag is in
@@ -452,7 +453,7 @@ Agentfs-Uid: 10000
 Agentfs-Pid: 4711
 ```
 
-- The CSI driver gets pod metadata from `podInfoOnMount`.
+- A front gets pod metadata from its pod flags.
 - Through a history service, each record keeps its front's origin (namespace,
   pod, pod UID, node, replica), so a replay after a crash commits it with the
   same committer. A commit never mixes origins. A front whose pod does not

@@ -2,9 +2,10 @@
 
 agentfs is a FUSE filesystem that records every change to a directory in
 git history its users cannot see. It has two engines: the tree views, which
-the sidecar, the Docker examples and the CLI's `init` and `mount` run, and
-the recording engine, which the CSI driver runs and which also pushes that
-history to git remotes and applies patches queued from outside. This is the index of its
+every launcher runs (the sidecar, the Docker examples, the CLI's `init` and
+`mount`, and the CSI driver), and the recording engine, which serves
+recording state areas, pushes their history to git remotes and applies
+patches queued from outside, and which no launcher runs any more. This is the index of its
 documentation, also published as a book at
 <https://mcurcio.github.io/agentfs/>. New here? Start with the
 [README's quick start](https://github.com/mcurcio/agentfs#quick-start).
@@ -18,11 +19,11 @@ are under [Future designs](#future-designs).
 
 | Page | For |
 |---|---|
-| [Tree views](trees.md) | What the sidecar, Docker and the CLI run: `init`, `mount`, operator settings, restarting after a crash, upstreams and forks, how saves flow |
+| [Tree views](trees.md) | What the sidecar, Docker, the CLI and the CSI driver run: `init`, `mount`, `host`, operator settings, restarting after a crash, upstreams and forks, how saves flow |
 | [Guarantees and limits](guarantees.md) | What agentfs promises, what it does not, and which test backs each claim |
-| [How agentfs records changes](recording.md) | The recording engine (the CSI driver's): what is recorded and when, and how records become commits |
+| [How agentfs records changes](recording.md) | The recording engine: what is recorded and when, and how records become commits |
 | [Remotes and pushing](remotes.md) | The recording engine's remotes: configuring them, when pushes run, what a failed push does, several volumes on one repository. Tree volumes push to no remote yet |
-| [Operator guide](operator-guide.md) | Running the recording engine under the CSI driver (`serve-history` and `front`): requirements, layout, flags, settings, permissions, what is recorded when, lifecycle, the state-area lock, crashes, recovery, LFS, databases, troubleshooting, several mounts of one volume |
+| [Operator guide](operator-guide.md) | Running the recording engine (`serve-history` and `front`) on a recording state area: requirements, layout, flags, settings, permissions, what is recorded when, lifecycle, the state-area lock, crashes, recovery, LFS, databases, troubleshooting, several mounts of one volume |
 | [Patches](patches.md) | Changing a recording volume's files from outside it through the patch queue. Not built on tree volumes |
 | [Forked volumes](forks.md) | The recording engine's forked volumes: a copy of a volume that publishes one change for review, and delivering that change |
 | [Telemetry](telemetry.md) | Turning on OpenTelemetry export, what is exported, and the example alerts |
@@ -43,7 +44,7 @@ are under [Future designs](#future-designs).
 |---|---|
 | [Docker](docker.md) | The agentfs container and workload containers, with `docker run` and Compose |
 | [Kubernetes sidecar](deployment.md) | The container image and the privileged native sidecar on tree views, with the alert rules and Hermes |
-| [CSI driver](csi.md) | Volumes as claims for unprivileged pods on the recording engine, several pods per volume on one node, forks |
+| [CSI driver](csi.md) | Tree volumes as claims for unprivileged pods: one `agentfs host` per volume, one pod per claim, fork claims landing in their source, kept volumes |
 | [Helm charts](helm.md) | The CSI driver chart and the sidecar library chart |
 
 ## Runbooks
@@ -63,8 +64,8 @@ that point to it.
 | [A crashed sidecar](runbooks/crashed-sidecar.md) | The daemon died in a pod |
 | [Upgrading the sidecar](runbooks/upgrading-the-sidecar.md) | Rolling out a new image for the sidecar, and moving a recording volume onto a tree volume |
 | [The history service is down](runbooks/history-service-down.md) | Fronts failing with `EIO` (`HistoryServiceUnavailable`) |
-| [Recovering CSI volumes](runbooks/csi-recovery.md) | Incidents under the CSI driver |
-| [Moving a volume to another node](runbooks/moving.md) | A node lost or retired: a new volume started from the old branch |
+| [Recovering CSI volumes](runbooks/csi-recovery.md) | Incidents under the CSI driver: a crashed host, a plugin upgrade, a pod that will not mount, a claim that will not delete |
+| [Moving a CSI volume](runbooks/moving.md) | A recording-format CSI volume never served (`FAILED_PRECONDITION` naming it), or a volume's files wanted on another node |
 | [The start branch moved](runbooks/start-branch-moved.md) | `StartBranchMoved`: the old branch received commits after a move |
 | [A fork's publish is refused](runbooks/fork-refused.md) | `ForkRefused`, by reason |
 | [A moved directory could not be reconciled](runbooks/reconcile-failed.md) | `ReconcileFailed` |

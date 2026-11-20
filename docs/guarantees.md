@@ -4,10 +4,11 @@ agentfs records every change a workload makes to a directory, in git history
 the workload cannot see. This page says what that promises, what it does not,
 and which test backs each claim. A claim with no test named says so.
 
-agentfs has two engines. The recording engine is what the CSI driver runs; most
-of this page is about it. The sidecar, the Docker examples and the CLI's
-`agentfs init` and `agentfs mount` run tree views, whose promises are under
-[tree views](#tree-views) below; they do not push or apply patches yet.
+agentfs has two engines. Every launcher runs tree views: the sidecar, the
+Docker examples, the CLI's `agentfs init` and `agentfs mount`, and the CSI
+driver. Their promises are under [tree views](#tree-views) below; they do not
+push or apply patches yet. Most of this page is about the recording engine,
+which serves recording state areas and which no launcher runs any more.
 
 Other pages hold the detail: [recording.md](recording.md) (what is recorded and
 when), [remotes.md](remotes.md) (pushing), [trees.md](trees.md) (the tree
@@ -101,8 +102,7 @@ left in `pending/`.
   workflow).
 
 **Not tested:** writes reordered between two flushes (replay is in write order
-only), and a power cut under the recording engine, which only the CSI driver
-runs. The commit order does not rely on the order of
+only), and a power cut under the recording engine. The commit order does not rely on the order of
 writes inside an epoch, but only review says so.
 
 ## Files changed in place
@@ -161,6 +161,9 @@ procedure, run with the workload stopped:
 
 ## Several pods on one volume
 
+This section is the recording engine's. A tree volume under the CSI driver
+serves one pod per claim; a second pod gets a fork claim ([csi.md](csi.md)).
+
 - Pods share one directory with the backing filesystem's semantics. Two pods
   writing the same file is last-writer-wins, as without agentfs. History
   records each pod's change boundaries in the order the history service
@@ -182,8 +185,7 @@ Accepted residuals of several pods on one volume:
   callers cannot read their supplementary groups. Creations that only a
   supplementary group (a pod's `fsGroup`) allows fall back to the daemon, a
   racing open from another pod can fail with `EACCES`, and `create`'s check of an
-  existing file counts the primary group only. The shipped CSI manifest sets
-  `hostPID: true`; the fallbacks are counted
+  existing file counts the primary group only. The fallbacks are counted
   (`agentfs.fuse.create_as_caller_fallbacks`).
 - **Clock steps.** A late record frozen before a backward step of the wall
   clock, and racing writes after it, are ordered by `ctime`, which the step
@@ -236,24 +238,23 @@ recordable names. It is **a boundary for names**, not a security sandbox.
     operation (not tested). The name checks run under the lock.
 - **Where it runs.** Only in a program that links `agentfs-fuse` and turns it
   on ([library/filesystem](library/filesystem.md#the-sandbox-overlay)). No
-  launcher offers it: tree volumes do not build it, and the CSI driver's fronts
-  never served it.
+  launcher offers it: tree volumes do not build it.
 - **Capability assumptions.** Sandboxes lack `CAP_SYS_ADMIN` and
   `CAP_DAC_READ_SEARCH`. Stopping a privileged container from reaching the disk
   by other means is not supported.
 
 ## Forks
 
-What a sandbox writes into a [fork](forks.md) is treated as potentially
+What a workload writes into a [fork](forks.md) is treated as potentially
 hostile in everything agentfs itself does with it: names, paths, sizes,
 symlinks and gitlinks are checked, and nothing is run. agentfs limits nothing
 that users' own CI may do with what a fork publishes.
 
-Accepted, with no hardening: a sandbox's file calls are served by the
-privileged node plugin, which holds every profile's credentials, so a bug in
-that front would expose node root and those credentials. Volume size is not
-enforced on the node's base path, so a sandbox can fill it for every volume on
-that node.
+Accepted, with no hardening: a CSI fork claim's file calls are served by its
+source volume's host in the privileged node plugin, which holds every
+profile's credentials, so a bug in that host would expose node root and those
+credentials. Volume size is not enforced on the node's base path, so a fork's
+pod can fill it for every volume on that node.
 
 ## Not goals
 

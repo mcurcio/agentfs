@@ -30,10 +30,10 @@ agentfs sits in front of an ordinary directory as a FUSE filesystem. Any
 process, root or not, uses the directory with normal file calls and never
 sees git. Every change is journaled before the call returns and becomes
 a commit on a git branch. The history lives outside the mount, where the
-workload cannot see or change it. The sidecar, the Docker examples and
-the CLI run agentfs's tree views; the CSI driver runs its recording
-engine, which also pushes the history to git remotes and applies patches
-queued from outside.
+workload cannot see or change it. The sidecar, the Docker examples, the
+CLI and the CSI driver run agentfs's tree views. Pushing the history to
+git remotes and applying patches queued from outside are built on its
+older recording engine and not yet on tree views.
 
 ## Why
 
@@ -61,10 +61,11 @@ audit trail can use it.
 
 ## Features
 
-agentfs has two engines. The **tree views** are what the sidecar, the
-Docker examples and the CLI's `agentfs init` and `agentfs mount` run
-([tree views](docs/trees.md)). The **recording engine** is what the CSI
-driver runs ([CSI driver](docs/csi.md)).
+agentfs has two engines. The **tree views** are what every launcher
+runs: the sidecar, the Docker examples, the CLI's `agentfs init` and
+`agentfs mount`, and the CSI driver ([tree views](docs/trees.md),
+[CSI driver](docs/csi.md)). The **recording engine** serves recording
+state areas, and no launcher runs it any more.
 
 On every launcher:
 
@@ -85,7 +86,7 @@ On every launcher:
 - **Observable.** OpenTelemetry, with example Prometheus alert rules
   that link their runbooks ([telemetry](docs/telemetry.md)).
 
-On tree volumes (the sidecar, Docker, the CLI):
+On tree volumes (every launcher):
 
 - **Untracked files that work.** Secrets, SQLite databases, sessions and
   logs the rules leave out are ordinary Linux files in the tree's
@@ -101,7 +102,7 @@ On tree volumes (the sidecar, Docker, the CLI):
   alarmed by the `agentfs.not_built` gauge
   ([operator settings](docs/trees.md#operator-settings)).
 
-On the recording engine (the CSI driver):
+On the recording engine (recording state areas, run by hand):
 
 - **Any remote, several, or none.** Local paths, `file://`, `http(s)://`
   with a token file, and SSH with verified host keys; fast-forward only,
@@ -161,10 +162,11 @@ mount to the host, so it is not supported.
 ### Kubernetes: the CSI driver with Helm
 
 The driver gives pods agentfs volumes as ordinary claims, with no
-privilege in the workload. Each claim is a worktree on the disk of the
-node its first pod runs on, writing only its own branch, and pushed to
-the profile's remotes; to continue on another node, a new claim starts
-from that branch ([moving](docs/runbooks/moving.md)). Create the
+privilege in the workload. Each claim is a tree volume on the disk of the
+node its first pod runs on, served to one pod by one `agentfs host` per
+volume; a fork claim gives a second pod a fork whose saves land in the
+volume. Push is not built yet: a profile's remotes are logged as not
+built, and a deleted claim's volume is kept on its node. Create the
 namespace and the credentials, then install the chart (the full steps
 and the values: [docs/helm.md](docs/helm.md)):
 
@@ -230,11 +232,8 @@ flowchart LR
 5. A fork's saves land in its upstream, and the upstream's flow back.
 
 Tree volumes push to no remote and apply no patches yet. Under the CSI
-driver the recording engine runs instead: a history service owns each
-volume's state area, every pod's mount is a front that hands it the
-changes, and it commits them to `agentfs/<volume>`, pushes that branch to
-the profile's remotes and applies the patch queue at its start
-([recording](docs/recording.md), [csi.md](docs/csi.md)). The full model:
+driver each volume in use on a node has one `agentfs host`, and each pod's
+mount is a view it serves ([csi.md](docs/csi.md)). The full model:
 [docs/architecture.md](docs/architecture.md) and
 [docs/guarantees.md](docs/guarantees.md).
 
@@ -245,8 +244,8 @@ The documentation is published at <https://mcurcio.github.io/agentfs/>;
 
 | Document | For |
 |---|---|
-| [Tree views](docs/trees.md) | What the sidecar, Docker and the CLI run: `init`, `mount`, operator settings, restarts, forks |
-| [Operator guide](docs/operator-guide.md) | Running the recording engine under the CSI driver: requirements, layout, flags, lifecycle, recovery, troubleshooting |
+| [Tree views](docs/trees.md) | What the sidecar, Docker, the CLI and the CSI driver run: `init`, `mount`, `host`, operator settings, restarts, forks |
+| [Operator guide](docs/operator-guide.md) | Running the recording engine on a recording state area: requirements, layout, flags, lifecycle, recovery, troubleshooting |
 | [Docker](docs/docker.md), [Kubernetes sidecar](docs/deployment.md), [CSI driver](docs/csi.md), [Helm](docs/helm.md) | Deploying it |
 | [Configuration](docs/configuration.md) | Every setting, attribute, flag and environment variable |
 | [Runbooks](docs/README.md#runbooks) | One procedure per failure mode |
@@ -262,10 +261,11 @@ passes its tests, and the Helm charts as `<version>-main.<run>`.
 
 | Area | State |
 |---|---|
-| Tree views behind the sidecar, the Docker examples and the CLI (`init`, `mount`, `fork end`): recording, directories, links, owners and modes, operator rules and the untracked area, forks, restart after a crash, the not-built alarm | Built, tested end to end in CI including a kind cluster and upstream Hermes |
+| Tree views behind the sidecar, the Docker examples, the CLI and the CSI driver (`init`, `mount`, `host`, `fork end`): recording, directories, links, owners and modes, operator rules and the untracked area, forks, restart after a crash, the not-built alarm | Built, tested end to end in CI including a kind cluster and upstream Hermes |
 | On tree volumes: push, the patch queue, `restore` and `revert`, telemetry beyond the not-built gauge, LFS, database groups, forked volumes and the sandbox overlay | Not built: each configured setting is logged at every boot and alarmed ([supported configurations](docs/supported-configurations.md#15-tree-volumes-the-sidecar-docker-the-cli-and-the-csi-driver)) |
-| The CSI driver, on the recording engine: push to any remote, path rules, the patch queue, recovery, Git LFS, databases, forked volumes, several pods on one volume | Built: one node per volume, its worktree on that node's disk; moving is a new volume started from its branch |
-| The CSI driver on tree views | Not built |
+| The CSI driver on tree views: one `agentfs host` per volume, one pod per claim, fork claims landing in their source, kept volumes | Built, tested in CI on kind (with upstream Hermes) and csi-sanity |
+| Under the CSI driver: deleting a volume, several pods on one claim, moving a volume, unlinked forks, landing approvals, forks of forks | Not built: refused with an error that says so ([CSI driver](docs/csi.md#12-limitations)) |
+| The recording engine (`serve-history`, `front`, `run` and the one-shot commands): push to any remote, the patch queue, recovery, Git LFS, databases, forked volumes | Built, on recording state areas; no launcher runs it. A recording-format CSI volume is never served ([moving](docs/runbooks/moving.md)) |
 | Docker examples, Helm charts, example alert rules | Built and tested in CI |
 | Several nodes writing one volume | Not supported: a volume has one node ([CSI driver](docs/csi.md)) |
 

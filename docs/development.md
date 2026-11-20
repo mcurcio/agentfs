@@ -115,9 +115,10 @@ Every push runs [`.github/workflows/ci.yml`](../.github/workflows/ci.yml):
   both as well.
 - **e2e csi-sanity** ([`ci/csi-sanity.sh`](../ci/csi-sanity.sh)): the
   Kubernetes CSI conformance suite csi-test (`csi-sanity` v5.6.0, pinned)
-  against `agentfs-csi` with real history services and FUSE
-  fronts: every controller and node call, error codes, idempotency and
-  cleanup, then no mount, record or volume directory left behind.
+  against `agentfs-csi` with real `agentfs init` and `agentfs host`
+  children and FUSE views: every controller and node call, error codes,
+  idempotency and cleanup, then no agentfs mount, published record or host
+  left behind, and every deleted volume kept.
 - **docs:** checks the documentation against the code: every git config
   key agentfs reads (`config::KEYS`, filled by a test that records every
   read), every operator attribute, every flag and environment variable of
@@ -160,20 +161,20 @@ tests the container image on every push:
   another kind cluster, with [`deploy/csi`](../deploy/csi) through its CI
   overlay [`ci/k8s-csi`](../ci/k8s-csi). It validates the manifests, checks
   the driver's registration and its RBAC inventory with `kubectl auth
-  can-i` and the provisioner admission policy, runs two restricted pods (uid 10000 and 10001, primary groups
-  other than their shared `fsGroup`) on one claim, has them create the
-  same new names at once, checks their distinct committers, trailers and
-  authors on the runner's git server, kills one pod's front (the other
-  pod unaffected, the front back in its slot and live), the history
-  service right after a write, and the node plugin pod, each recovered,
-  checks that inline volumes and `ReadWriteMany` are refused, and tears
-  down through DeleteVolume.
-- **e2e forked volumes** ([`ci/e2e-csi-forks.sh`](../ci/e2e-csi-forks.sh)):
-  forks on the CSI driver in kind: a sandbox's claim cloned from a claim
-  in use, its pushes reaching only the fork remote, the admission policy,
-  publishing after an outage and a node plugin restart, a refused
-  publish, and a change submitted twice applied once
-  ([csi.md](csi.md#14-forks)).
+  can-i` and the provisioner admission policy, runs a restricted writer
+  (uid 10000, primary group other than its `fsGroup`) on a view of its
+  volume's one `agentfs host`, checks its files and pod trailers in the
+  volume's history and that the git server gets no ref (push is logged as
+  not built), refuses a second pod, kills the host and deletes the node
+  plugin pod, each recovered with a new write recorded, checks that inline
+  volumes, `ReadWriteMany`, `onDelete: delete` and `startFrom` are
+  refused, and tears down through DeleteVolume, which keeps the volume.
+- **e2e fork claims** ([`ci/e2e-csi-forks.sh`](../ci/e2e-csi-forks.sh)):
+  fork claims on the CSI driver in kind: a fork claim of a claim in use,
+  served in its source's volume, its pod's write landing in the source
+  and seen by the source's pod, the admission policy, `link: unlinked`
+  and `landing: approval` refused, and deleting the fork claim ending the
+  fork ([csi.md](csi.md#14-forks)).
 - **publish** (main only, after the three kind tests): pushes the tested image to
   `ghcr.io/mcurcio/agentfs` as `<commit sha>` and `latest`.
 
@@ -224,12 +225,10 @@ their headers list the commands. `ci/csi-sanity.sh` needs FUSE,
 passwordless sudo and `csi-sanity`.
 `cargo bench -p agentfs-core --bench record_step` needs neither.
 
-The recording engine runs only under the CSI driver
-([csi.md](csi.md)), so no shell script drives it through the standalone
-`agentfs` launcher: its pushes, patch queue, LFS, several pods and state
-areas on NFS are tested by the Rust tests named below and by the CSI jobs
-on kind, and tree volumes do not build them yet
-([trees](trees.md#operator-settings)).
+No launcher runs the recording engine any more, so no shell script
+drives it: its pushes, patch queue, LFS, several pods and state areas on
+NFS are tested by the Rust tests named below, and tree volumes do not
+build them yet ([trees](trees.md#operator-settings)).
 
 ## What each promise is tested by
 
@@ -245,7 +244,7 @@ them to where they run. The CI jobs are described above.
 | The history is invisible: no history, journal, state or credential is reachable through the mount | the kind jobs and the Docker examples, where only the agentfs container mounts the state area; `launcher_mount.rs` (a mount point inside the state area is refused) |
 | Rules: ignores apply only to new paths, a tracked file stays recorded, tracked rule files cannot turn recording off | the unit tests of `agentfs-rules` and `rules.rs`; `ci/e2e-trees.sh`, with operator rules in `info/exclude` |
 | Nested repositories: a clone, a bare clone and `git init` at the root behave as documented, and nesting deletes nothing from history | the unit tests of `agentfs-rules` (names inside a nested repository stay untracked); not tested through a mount or a front |
-| Remotes: interval pushes reach two remotes, and an unreachable remote, a refused push and a non-fast-forward each raise an alarm while the filesystem keeps working | the unit tests of `push.rs`, `cli_push.rs`, the `crash` job's diverged remote, and pushes from CSI volumes in `ci/e2e-csi.sh` and the `f8` workflow |
+| Remotes: interval pushes reach two remotes, and an unreachable remote, a refused push and a non-fast-forward each raise an alarm while the filesystem keeps working | the unit tests of `push.rs`, `cli_push.rs`, the `crash` job's diverged remote |
 | Pre-commit checks: a path git's fsck or a remote limit would refuse is not recorded, and raises an alarm | the unit tests of `checks.rs` (the recording engine) |
 | Shared repositories: two volumes push on their own refs without contending, a rival writer is detected as divergence, identities follow the templates | the unit tests of `push.rs`, `crates/agentfs/tests/cli_identity.rs` |
 | Recovery: a file and a whole commit are restored, and the restore is recorded | `crates/agentfs/tests/cli_restore.rs` |
@@ -253,10 +252,10 @@ them to where they run. The CI jobs are described above.
 | Performance of tree views is recorded for the many-file create and the other release workloads on XFS and ext4 | `ci/e2e-trees-tracer.sh --figures` in the `image` workflow ([performance.md](performance.md#tree-views-release-build)) |
 | LFS content is readable through `git clone` plus `git lfs pull` | `crates/agentfs/tests/cli_lfs.rs` |
 | The patch queue: a conflicting patch is set aside and the rest go on, the volume mounts, and a crash and replay never applies a patch twice | the unit tests of `agentfs_core::patch`, `cli_patch.rs` |
-| Several pods on one node: each pod's changes carry its own committer identity and history keeps every boundary | `history_service.rs`, `ci/e2e-csi.sh` on kind |
-| A `ReadWriteMany` claim is refused | `ci/e2e-csi.sh` and `crates/agentfs-csi/tests/grpc.rs` |
-| A volume continues on another node as a new volume started from its branch | the `f8` workflow (`ci/e2e-csi-move.sh`, two-worker kind cluster) |
-| Forks: a fork publishes one change create-only, a refused publish stays refused, a forked claim in use clones | `fork/tests.rs`, `cli_fork.rs`, `cli_fork_deliver.rs`, `ci/e2e-csi-forks.sh`, `ci/e2e-csi-fork-of-fork.sh` |
+| Several pods on one node (the recording engine): each pod's changes carry its own committer identity and history keeps every boundary | `history_service.rs` |
+| A CSI claim serves one pod, its saves carry that pod's trailers, a crashed host comes back live | `crates/agentfs/tests/csi_trees.rs`, `ci/e2e-csi.sh` on kind |
+| A `ReadWriteMany` claim, `onDelete: delete` and `startFrom` are refused | `ci/e2e-csi.sh`, `ci/e2e-csi-move.sh` and the unit tests of `agentfs-csi` |
+| Forks: a recording fork publishes one change create-only and a refused publish stays refused; a CSI fork claim of a claim in use lands in its source, and a fork of a fork claim is refused | `fork/tests.rs`, `cli_fork.rs`, `cli_fork_deliver.rs`, `ci/e2e-csi-forks.sh`, `ci/e2e-csi-fork-of-fork.sh` |
 
 Not tested: the CSI driver on hardened node images (Talos) and across node
 reboots; two nodes writing one volume, which is not supported; power loss
