@@ -3,21 +3,21 @@
 //! "Technology choices"). Its durability is ours: [`Feed::finish`] fsyncs the
 //! pack files it installed and `objects/pack` before anything names them.
 //!
-//! The history's repack task ([`super::repack`]) runs `git repack
-//! --geometric=2 -d` beside fast-import, so `objects/pack` has two writers.
-//! [`Feed::finish`] fsyncs only what fast-import wrote: it skips a repack's
-//! `.tmp-*` files, which are in flight. A new `pack-*` name that is gone
-//! before its fsync was rolled up by a repack, which is not an error:
-//! - **No object is lost** (history is the product). A geometric repack
-//!   writes its new pack under `.tmp-*`, renames it into place, and only then
-//!   deletes the packs it rolled up; nothing prunes. So a batch's objects are
-//!   always in a pack whose name is in `objects/pack`.
+//! The history's repack task ([`super::repack`]) runs beside fast-import, so
+//! `objects/pack` has two writers. The task only links whole packs in, index
+//! last, and deletes packs it rolled up a built event later, so
+//! [`Feed::finish`] may see another pack's new name, which it fsyncs too. A
+//! new `pack-*` name that is gone before its fsync was rolled up and deleted
+//! by the task, which is not an error:
+//! - **No object is lost** (history is the product). The task links the new
+//!   pack into `objects/pack` and fsyncs it before it deletes any pack that
+//!   pack rolled up; nothing prunes. So a batch's objects are always in a
+//!   pack whose name is in `objects/pack`.
 //! - **History is durable before the journal is trimmed.** The repack runs
 //!   with `core.fsync=pack,pack-metadata` and `core.fsyncMethod=fsync`, so
-//!   git fsyncs the new pack's files before it renames them in, and the task
-//!   fsyncs `objects/pack` after each repack. [`Feed::finish`] fsyncs
-//!   `objects/pack` after its own files in any case, which makes the
-//!   repack's rename durable too. The builder records a batch as built, after
+//!   git fsyncs the new pack's files, and the task fsyncs `objects/pack`
+//!   after linking them in. [`Feed::finish`] fsyncs `objects/pack` after its
+//!   own files in any case. The builder records a batch as built, after
 //!   which the journal may drop its records, only after `finish` returns.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -295,14 +295,14 @@ impl Feed {
         let mut synced = 0_u64;
         for name in after.difference(&self.before) {
             let text = name.to_string_lossy();
-            // fast-import's temporary files, and a repack's files in flight.
-            if text.starts_with("tmp_") || text.starts_with(".tmp-") {
+            // fast-import's temporary files.
+            if text.starts_with("tmp_") {
                 continue;
             }
             match File::open(self.pack_dir.join(name)).and_then(|f| f.sync_all()) {
                 Ok(()) => synced += 1,
-                // A repack rolled this pack into one of its own and deleted
-                // it (see the module docs).
+                // The repack task rolled this pack into one of its own and
+                // deleted it (see the module docs).
                 Err(e) if e.kind() == io::ErrorKind::NotFound && text.starts_with("pack-") => {}
                 Err(e) => return Err(BuildError::from(e)),
             }
