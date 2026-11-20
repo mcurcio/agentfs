@@ -282,6 +282,11 @@ assert_eq "$PUSHED" "$(remote_ref "$RUNNER")" "the runner's pushed ref survived 
 git init -q --bare "$WORK/clone.git"
 git --git-dir "$WORK/clone.git" fetch -q "$(url "$PASSWORD")" "$RUNNER"
 assert_eq runner "$(git --git-dir "$WORK/clone.git" show "$PUSHED:runner.txt")" "and its commit holds runner.txt"
+refs=$(git ls-remote "$(url "$PASSWORD")")
+if grep -q "agentfs/" <<<"$refs"; then
+  fail "the server holds an agentfs ref, though push is not built: $refs"
+fi
+pass "the server still holds no agentfs ref"
 
 step "(f) helm upgrade keeps the password"
 before=$(token)
