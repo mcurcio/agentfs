@@ -1770,3 +1770,22 @@ M7 residuals (each to become a bead; none blocks M8):
    counted, S2's tests included.
 7. **S2's frozen addition `controller::FORKS_NOT_BUILT` is gone**, replaced by `FORK_NEEDS_SOURCE`; nothing else
    used it.
+
+## 2026-11-20, M8 S5 (docs): where the brief was wrong or short
+
+1. **Stale CSI text in pages the code slices own.** docs/configuration.md still says every recording command runs
+   "the recording engine, which the CSI driver runs" (the `agentfs` commands section), that the CSI driver sets
+   `--push-grace 5s` against a 30 s unstage grace, that the CSI node plugin passes `serve-history
+   --workload-attached`, and that only the CSI node plugin starts `front`. docs/architecture.md's crate table says
+   `agentfs-csi` "makes the node's worktrees and supervises `agentfs serve-history`, `agentfs mount` and the release
+   scan's `agentfs flush` and `agentfs push` children". S5 may not edit either page; the milestone's end should.
+2. **`ci/k8s-csi/move/values.yaml` (S3b's item 1) is still in the tree.** S5 removed docs/helm.md's link to it; the
+   file is under ci/, not an S5 path, so deleting it is left to the milestone's end.
+3. **Pages the brief did not list also said the CSI driver runs the recording engine**: docs/operator-guide.md,
+   docs/development.md, docs/README.md, docs/runbooks/recording-failures.md, worktree-heuristic.md and
+   reconcile-failed.md. S5 corrected them (owned under docs/**). The scoped runbooks keep their "Under CSI" command
+   blocks; one sentence each says those steps apply to no volume today, as the brief asked (no rewrite).
+4. **`deploy/csi` sets `OTEL_SDK_DISABLED=true`.** The brief says each host exports `agentfs.not_built` through the
+   plugin's `OTEL_*` variables; true, but off by default in the shipped manifest. docs/csi.md says so.
+5. **Landing order with a sibling in the same checkout.** S5's `git push HEAD` twice carried S4's local commits that
+   sat under S5's (58b7857, faa1eb4 on the first push), because siblings commit to one branch in one checkout.
