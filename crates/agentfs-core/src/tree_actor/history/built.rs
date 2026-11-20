@@ -461,6 +461,12 @@ impl History {
         self.notify();
     }
 
+    /// Whether the volume is shutting down: what ends a task that waits on
+    /// built events ([`super::repack::Repacker`]).
+    pub(in crate::tree_actor) fn stopping(&self) -> bool {
+        self.state().stopping
+    }
+
     /// Wakes every [`History::wait_epoch`] caller with a new epoch.
     pub(in crate::tree_actor) fn wake_waiters(&self) {
         self.state().epoch += 1;

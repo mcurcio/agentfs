@@ -574,7 +574,11 @@ fn one_spawn_site() {
             }
         }
     }
-    for file in files {
+    // The history's repack task starts its own `git repack`: it is not on the
+    // actor's path, so it stays uncounted and each operation's count of Git
+    // children stays exact.
+    let repack = src.join("tree_actor/history/repack.rs");
+    for file in files.into_iter().filter(|file| *file != repack) {
         let source = production(&file);
         // `Command` methods take no argument; a thread scope's `spawn` takes one.
         for spawn in [".spawn()", ".output()", ".status()"] {
