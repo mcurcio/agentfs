@@ -1729,3 +1729,24 @@ M7 residuals (each to become a bead; none blocks M8):
    CreateVolume now refuses. S3b's owned paths do not include it, so the move script now writes its own values to a
    temporary file and the old file is unused. docs/helm.md still links it: the docs slice (S5) or the milestone's
    end should delete the file and that link together.
+
+## 2026-11-20, M8 S2 (`agentfs-csi` on tree volumes, root claims): where the brief was wrong or short
+
+1. **CreateVolume's order.** The brief reads `csi.json` before inspecting the state for a recording-format volume. A
+   recording driver's `csi.json` does not parse as a `ClaimRecord`, so that order answers `INTERNAL` (a parse error),
+   never the recording-format `ALREADY_EXISTS`. CreateVolume inspects the state first, as DeleteVolume and NodePublish
+   do.
+2. **csi-sanity's `[host ` line.** A host writes nothing to its stderr when no setting is not built, so a profile with
+   no keys gives no `[host ` line. ci/csi-sanity/profiles/sanity.config sets `pushInterval`; the script checks each
+   host's `not built:` line.
+3. **Audit fields.** The frozen `ClaimRecord` and `PublishedRecord` carry no created or changed time or actor, which
+   `rules:global` asks of every persisted record. Built as frozen; a later re-cut decides.
+4. **Additions to the frozen page, all additive.** `Layout::published_dir()`; `mounter::detach_agentfs` (the frozen
+   `Mounter` has only `detach` and `state`, and a host that crashed twice leaves two stale layers);
+   `launcher::recent()`; `controller::FORKS_NOT_BUILT`. `validate_handle` keeps its `LayoutError` ("unchanged").
+5. **Texts the brief kept that are no longer true.** `volume::MULTI_NODE` says pods on other nodes read the history
+   "from the remote it pushes to"; push is not built. docs/configuration.md's `fork`, `link` and `remotes` rows still
+   describe the recording driver's forks (S4 owns them).
+6. **Seen, not S2's.** A host whose state area is removed under it (a failing root test's `TempDir` drop, recursing
+   through the live mount) stays in its drain after EOF with no builder thread, and never exits. The test's orphan was
+   killed by hand. Files: `crates/agentfs/src/launcher/serving.rs`, the tree actor's builder.

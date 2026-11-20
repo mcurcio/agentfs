@@ -433,7 +433,10 @@ async fn a_crashed_host_is_restarted_and_replays_its_views_then_reconciles() {
         crashed.elapsed() >= NodeConfig::new("x", n.layout.clone()).backoff.initial,
         "after the backoff"
     );
-    n.fake.until("reconcile", 2).await;
+    // The restart holds the volume's lock from before its spawn until the
+    // host has replayed and reconciled: the next call on the volume comes
+    // after it.
+    assert!(n.sup.in_use("v").await.is_some());
     let replayed: Vec<String> = n.fake.requests(1).iter().map(describe).collect();
     assert_eq!(
         replayed,
