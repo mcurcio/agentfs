@@ -196,10 +196,11 @@ docker exec agentfs-example git --git-dir /data/state/history.git log --stat roo
 - **History:** the tree's branch `root` in `history.git` in that Docker
   volume ([trees](trees.md)).
 - **Limits:** Linux with Docker Engine 25 or later; not Docker Desktop.
-  The history is lost with the Docker volume unless it is backed up or a
-  remote is added ([docker.md](docker.md#6-volumes-with-no-remote)).
+  The history is lost with the Docker volume unless the volume is backed
+  up: tree volumes push to no remote yet, so adding one keeps nothing
+  ([docker.md](docker.md#6-volumes-with-no-remote)).
 
-### Example 2: a Kubernetes sidecar pushing to GitHub
+### Example 2: a Kubernetes sidecar with a GitHub remote configured (push not built)
 
 **For:** one pod whose directory should be on record in a GitHub
 repository.

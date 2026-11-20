@@ -171,8 +171,8 @@ agentfs --state "$STATE" push
 ## A remote that hangs
 
 A remote that accepts the connection and then never answers holds only
-its own push: recording, committing and the other remotes go on (CI's
-`e2e-shared-remotes` job checks this through a live mount). Its status
+its own push: recording, committing and the other remotes go on (not
+tested through a live mount). Its status
 keeps the previous `last pushed` until libgit2 gives up (5 minutes
 without progress), which counts as `unreachable`; a shutdown meanwhile
 abandons it at the push grace's end, as above.

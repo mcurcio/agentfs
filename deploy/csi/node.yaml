@@ -3,7 +3,7 @@
 # livenessprobe (docs/csi.md "Architecture"). Each node
 # provisions the worktrees on its own disk: CreateVolume makes one under
 # the base path, NodeStage starts one `agentfs serve-history` per volume,
-# NodePublish one `agentfs mount --history-service` front per pod,
+# NodePublish one `agentfs front` per pod,
 # bind-mounted onto the kubelet's target, and the release scan pushes the
 # worktrees no pod stages.
 apiVersion: apps/v1

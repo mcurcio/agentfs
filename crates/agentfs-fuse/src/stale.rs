@@ -10,7 +10,8 @@
 //! A daemon that dies leaves its mount answering `ENOTCONN`. Stacking mounts
 //! FUSE at a private empty directory, bind-mounts it over the stale mount
 //! (made shared, so propagation carries it into every copy of the stale
-//! mount: workload containers, subPath binds) and detaches the private
+//! mount point: workload containers, subPath binds of the mount point itself;
+//! a bind of a directory inside it is not reached) and detaches the private
 //! directory; the stale layers below are detached once the new mount ends.
 
 use std::io;
@@ -248,7 +249,8 @@ mod tests {
             }
         );
         // The directory answers statfs here, so an agentfs entry is live;
-        // the stale case (ENOTCONN) needs a real dead mount (tests/mount.rs).
+        // the stale case (ENOTCONN) needs a real dead mount (tree_view.rs's
+        // root-only stale_view tests).
         let stack = [entry("tmpfs", "tmpfs"), entry("fuse.agentfs", "agentfs:v")];
         assert_eq!(
             mount_state_in(&stack, &mnt).unwrap(),

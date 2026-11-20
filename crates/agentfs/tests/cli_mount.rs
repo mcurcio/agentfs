@@ -217,32 +217,89 @@ fn seal_mountpoint_needs_root() {
 }
 
 /// A recording command on a tree volume exits 1 naming what is not built,
-/// before it reads or writes anything.
+/// before it reads or writes anything. Every recording command is driven:
+/// one that stopped refusing would run the recording engine on a tree area.
 #[test]
 fn recording_commands_refuse_a_tree_volume() {
     let l = Layout::new();
     l.init(&[]);
     let before = l.files();
-    for args in [
-        &["push"][..],
-        &["status"],
-        &["--root", "b", "record", "a"],
-        &["run"],
-    ] {
+    let (b, m) = (l.p("b"), l.p("m"));
+    let commands: &[(&str, &[&str])] = &[
+        ("status", &["status"]),
+        ("flush", &["flush"]),
+        ("record", &["--root", s(&b), "record", "a"]),
+        ("serve-history", &["serve-history"]),
+        (
+            "front",
+            &["front", "--history-service", "127.0.0.1:1", s(&b), s(&m)],
+        ),
+        ("serve-git", &["serve-git"]),
+        ("push", &["push"]),
+        ("checkpoint", &["checkpoint"]),
+        ("run", &["run"]),
+        ("restore", &["restore", "a", "HEAD"]),
+        ("revert", &["revert", "HEAD"]),
+        ("patch", &["patch", "status"]),
+        ("lfs", &["lfs", "fetch", "--all"]),
+        ("fork", &["fork", "finish"]),
+        ("start", &["start", "accept", "--tip", "0000"]),
+    ];
+    for (name, args) in commands {
         let out = run(&l.state(), args);
-        assert_eq!(out.status.code(), Some(1), "{args:?}: {}", stderr(&out));
-        let err = stderr(&out);
-        assert!(
-            err.contains(&format!(
-                "`agentfs {}` runs on the recording engine only",
-                args.iter()
-                    .find(|a| !a.starts_with('-') && **a != "b")
-                    .unwrap()
-            )),
-            "{args:?}: {err}"
-        );
-        assert!(err.contains("is a tree volume"), "{args:?}: {err}");
-        assert!(err.contains("not built yet"), "{args:?}: {err}");
+        assert_tree_refusal(&out, name, &l.state(), args);
     }
     assert_eq!(l.files(), before, "a recording command changed the volume");
+    assert!(
+        !b.exists() && !m.exists(),
+        "a recording command wrote outside the state area"
+    );
+}
+
+/// `fork create --source-state` names a tree volume as its source: refused
+/// as `--state` is, before the new fork's state area is touched.
+#[test]
+fn fork_create_refuses_a_tree_source() {
+    let l = Layout::new();
+    l.init(&[]);
+    let before = l.files();
+    let fork = l.p("fork");
+    let out = run(
+        &fork,
+        &[
+            "--root",
+            s(&l.p("b")),
+            "fork",
+            "create",
+            "--source-state",
+            s(&l.state()),
+        ],
+    );
+    assert_tree_refusal(&out, "fork", &l.state(), &["fork", "create"]);
+    assert!(!fork.exists(), "the fork's state area was written");
+    assert_eq!(l.files(), before, "fork create changed the source volume");
+}
+
+/// The guard fails closed: a tree area whose identity file is corrupt is
+/// still refused, on the format's marker alone.
+#[test]
+fn a_tree_area_with_a_corrupt_identity_is_refused() {
+    let l = Layout::new();
+    l.init(&[]);
+    std::fs::write(l.state().join("volume"), b"not json").unwrap();
+    let out = run(&l.state(), &["status"]);
+    assert_tree_refusal(&out, "status", &l.state(), &["status"]);
+}
+
+fn assert_tree_refusal(out: &Output, name: &str, state: &Path, args: &[&str]) {
+    let err = stderr(out);
+    assert_eq!(out.status.code(), Some(1), "{args:?}: {err}");
+    assert!(
+        err.contains(&format!(
+            "`agentfs {name}` runs on the recording engine only; {} is a tree volume",
+            state.display()
+        )),
+        "{args:?}: {err}"
+    );
+    assert!(err.contains("not built yet"), "{args:?}: {err}");
 }

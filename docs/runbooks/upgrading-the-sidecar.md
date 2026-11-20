@@ -129,6 +129,13 @@ order.
      cp -a . /mnt/volume/'
    ```
 
+   The block is not resumable: give the Job `backoffLimit: 0`, so a
+   failure stops it instead of a retry stopping at `mkdir`. After a
+   failure with `/data/recording-archive/state` in place, the archive
+   step ran: move a partial `/data/state` aside (`mv /data/state
+   /data/state.failed`), fix the cause from the Job's log, and run the
+   block again from its `agentfs ... init` line.
+
    The rule files go in before the mount, which reads them when the
    volume opens; each nested repository's `.git` goes first, so the files
    beside it stay untracked. Then check the history (`git --git-dir

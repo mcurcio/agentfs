@@ -239,14 +239,14 @@ them to where they run. The CI jobs are described above.
 | Promise | Where it is tested |
 |---|---|
 | Every change boundary is recorded: editor saves, appends, `truncate`, directory moves, `rm -r`, hard links, mode changes, symlinks, unlink and rename of open files, log rotation | the tree views' e2e scripts (`ci/e2e-trees.sh`, `ci/e2e-trees-ordering.sh`) through real mounts |
-| A change is recorded before the call returns: `kill -9` right after `close`, then remount | the `fuse` job; the engine matrix of the `crash` job |
+| A change is recorded before the call returns: `kill -9` right after `close`, then remount | `ci/e2e-trees.sh` (SIGKILL mid-write, then remount) and step 3 of `ci/e2e-trees-tracer.sh` in the `image` workflow; for the recording engine, the engine matrix of the `crash` job |
 | Nothing is lost or duplicated at any step of record, commit, ref update and push | the `crash` job (`ci/crash-tests.sh`: the engine matrix, the process tests and the mount tests) with one oracle; power loss of tree views in the `phase-1` workflow (`ci/power-loss-trees.sh`) |
-| Any user: root and uid 10000 write with normal permission semantics | the `fuse` job; the kind jobs, in a pod |
-| The history is invisible: no history, journal, state or credential is reachable through the mount | the `fuse` job; the kind jobs |
-| Rules: ignores apply only to new paths, a tracked file stays recorded, tracked rule files cannot turn recording off | the `fuse` job and the unit tests of `rules.rs` |
-| Nested repositories: a clone, a bare clone and `git init` at the root behave as documented, and nesting deletes nothing from history | the `fuse` job (`nothing_is_deleted_by_nesting`), through a mount and a front |
+| Any user: root and uid 10000 write with normal permission semantics | `ci/e2e-trees-tracer.sh` and the Docker examples (uid 10000 in a container); the kind jobs, in a pod |
+| The history is invisible: no history, journal, state or credential is reachable through the mount | the kind jobs and the Docker examples, where only the agentfs container mounts the state area; `launcher_mount.rs` (a mount point inside the state area is refused) |
+| Rules: ignores apply only to new paths, a tracked file stays recorded, tracked rule files cannot turn recording off | the unit tests of `agentfs-rules` and `rules.rs`; `ci/e2e-trees.sh`, with operator rules in `info/exclude` |
+| Nested repositories: a clone, a bare clone and `git init` at the root behave as documented, and nesting deletes nothing from history | the unit tests of `agentfs-rules` (names inside a nested repository stay untracked); not tested through a mount or a front |
 | Remotes: interval pushes reach two remotes, and an unreachable remote, a refused push and a non-fast-forward each raise an alarm while the filesystem keeps working | the unit tests of `push.rs`, `cli_push.rs`, the `crash` job's diverged remote, and pushes from CSI volumes in `ci/e2e-csi.sh` and the `f8` workflow |
-| Pre-commit checks: a path git's fsck or a remote limit would refuse is not recorded, and raises an alarm | the unit tests of `checks.rs` and the `fuse` job |
+| Pre-commit checks: a path git's fsck or a remote limit would refuse is not recorded, and raises an alarm | the unit tests of `checks.rs` (the recording engine) |
 | Shared repositories: two volumes push on their own refs without contending, a rival writer is detected as divergence, identities follow the templates | the unit tests of `push.rs`, `crates/agentfs/tests/cli_identity.rs` |
 | Recovery: a file and a whole commit are restored, and the restore is recorded | `crates/agentfs/tests/cli_restore.rs` |
 | Telemetry: the metrics are exported and move as expected | `cli_telemetry.rs` without a collector; `ci/e2e-telemetry.sh` (a tree mount's `agentfs.not_built`) against a real collector. The export of these counters is not tested, though the behaviour each counts is: `agentfs.history_service.superseded` and `.resyncs`, `agentfs.fuse.create_as_caller_fallbacks` and `.racy_rechecks`, `agentfs.reconcile.records` and `.failures`, `agentfs.nested.gitdir_heuristic` |

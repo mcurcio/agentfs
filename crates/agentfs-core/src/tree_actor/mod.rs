@@ -385,6 +385,29 @@ pub fn inspect(root: &Path) -> io::Result<Found> {
     }
 }
 
+/// Whether `root` carries this format's marker, whatever its identity file
+/// says: a tree volume, or one whose identity is missing or corrupt. Reads
+/// `format` only. `false` where there is no such file or `root` is no
+/// directory.
+///
+/// # Errors
+///
+/// The marker could not be read for another reason.
+pub fn holds_tree_format(root: &Path) -> io::Result<bool> {
+    match fs::read(root.join("format")) {
+        Ok(format) => Ok(format == FORMAT.as_bytes()),
+        Err(e)
+            if matches!(
+                e.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+            ) =>
+        {
+            Ok(false)
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// The identity of the volume at `root`: [`Error::NotCreated`] where there is
 /// none, [`Error::Format`] for another format.
 fn found_volume(root: &Path) -> Result<VolumeIdentity> {

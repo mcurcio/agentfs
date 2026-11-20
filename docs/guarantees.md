@@ -78,9 +78,9 @@ extended attributes are not recorded either.
   attributes or LFS endpoints.
 
 Tests: the engine killed or failed at every point a workload reaches
-(`crates/agentfs-core/tests/crash_points.rs`), the processes
-(`crash_daemon.rs`) and a FUSE mount (`crash_mount.rs`) are all checked by one
-oracle: every promised record committed exactly once, first-parent
+(`crates/agentfs-core/tests/crash_points.rs`) and the processes
+(`crash_daemon.rs`) are checked by one oracle (a recording FUSE front killed
+mid-write is not tested by it): every promised record committed exactly once, first-parent
 `Agentfs-Seq` strictly increasing, no empty commits, `git fsck` clean, nothing
 left in `pending/`.
 

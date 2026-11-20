@@ -416,9 +416,13 @@ manual step ([restarting after a crash](trees.md#restarting-after-a-crash)):
    instead would expose the bare directory to the workload; stacking over
    it never does.
 3. Mount propagation carries the new layer into every copy of the stale
-   mount: the workload containers' `HostToContainer` mounts and the
-   kubelet's `subPath` binds. The workload's next calls reach the new
-   daemon; no container restarts. The sidecar logs `stacked over a stale
+   mount point itself: the workload containers' `HostToContainer` mounts
+   and a kubelet `subPath` bind of the mount point (`subPath: workspace`).
+   The workload's next calls reach the new daemon; no container restarts.
+   A `subPath` that points deeper into the view (`subPath:
+   workspace/sub`) is a bind of a directory inside the dead mount, which
+   no new layer reaches: it keeps answering `ENOTCONN` until its
+   container restarts, which is the liveness probe's job. The sidecar logs `stacked over a stale
    mount at /agentfs/workspace left by a crashed daemon`, and the pod is
    Ready again once its readiness probe passes.
 4. When that view ends, the stale layers below it are detached (`tree
@@ -633,6 +637,10 @@ by a Job with Hermes scaled to zero and the same PVC mounted at `/data`:
 set -eu
 cd /data
 mkdir import
+# The volume root keeps the claim root's owner and mode: cp -a below copies
+# import's onto it.
+chown --reference=/data import
+chmod --reference=/data import
 # Move everything except the new directory into it.
 find . -mindepth 1 -maxdepth 1 ! -name import -exec mv -t import {} +
 agentfs --state /data/state init --volume hermes --include /etc/agentfs/config
@@ -654,7 +662,15 @@ The rule files go in before the mount: the volume reads them when it
 opens. `mount -- COMMAND` runs the copy once the view is up and drains
 when it exits ([running a command](trees.md#running-a-command-in-the-mount)),
 so the Job ends with the import recorded and its history built. `cp -a`
-keeps each file's owner and mode, and history records them. Files the
+keeps each file's owner and mode, and history records them; the volume
+root takes `/data/import`'s, which the block sets from `/data`.
+
+The block is not resumable: give the Job `backoffLimit: 0`, so a failure
+stops it instead of a retry stopping at `mkdir import`. After a failure,
+`/data/import` holds the original files. Move a partial `/data/state`
+aside (`mv /data/state /data/state.failed`; never into `/data/import`),
+fix the cause from the Job's log, and run the block again from its
+`agentfs ... init` line. Files the
 rules leave out (`.env`, the databases, sessions, logs, nested
 repositories) are copied into the volume's untracked area, never into
 history.

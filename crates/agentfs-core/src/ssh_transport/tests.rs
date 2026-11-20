@@ -1,6 +1,6 @@
 //! The SSH transport against an in-process russh server that runs the real
-//! `git upload-pack` and `git receive-pack`: what CI's
-//! e2e-ssh job checks against OpenSSH, here without sshd.
+//! `git upload-pack` and `git receive-pack`, without sshd (no test runs the
+//! transport against OpenSSH).
 
 use std::collections::HashMap;
 use std::fs;

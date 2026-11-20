@@ -2,7 +2,7 @@
 //!
 //! It holds the state-area lock, opens the volume (recovery included), and
 //! is the only writer of the journal and the branch: fronts
-//! (`mount --history-service`) hand it their records over a Unix socket,
+//! (`agentfs front`) hand it their records over a Unix socket,
 //! and its commit and push loops do the rest, as `run` does.
 //!
 //! Start order: lock, open (recovery), the patch queue (landed only when no
@@ -84,7 +84,8 @@ pub(crate) fn serve(
     if std::fs::metadata(state.repairs()).is_ok_and(|m| m.len() > 0) {
         eprintln!(
             "warning: {} lists paths a single-process mount could not record; fronts do not \
-             drain it (mount without --history-service once to repair them)",
+             drain it (stop the service, then `agentfs --root <backing tree> record <paths>` \
+             records each listed path)",
             state.repairs().display()
         );
     }

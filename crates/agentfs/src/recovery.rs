@@ -229,8 +229,8 @@ fn own_caller() -> Caller {
     }
 }
 
-/// `agentfs restore` / `agentfs revert`: through a running mount if one
-/// listens, else directly.
+/// `agentfs restore` / `agentfs revert`: through a running `run` or
+/// history service if one listens, else directly.
 pub fn run(
     state: &StateDir,
     root: Option<&Path>,

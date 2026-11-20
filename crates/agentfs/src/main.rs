@@ -203,7 +203,7 @@ enum Command {
         hook: Option<ServeGitHook>,
     },
     /// Push the volume's refs to its remotes once. With a daemon running
-    /// (`mount`, `run`, `serve-history`), asks it to commit and push now
+    /// (`run`, `serve-history`), asks it to commit and push now
     /// over its control socket; otherwise pushes directly. Exits 1 unless
     /// every selected remote succeeded. `--force-with-lease` always pushes
     /// directly, one remote only.
@@ -247,8 +247,8 @@ enum Command {
     },
     /// Write PATH (a file, symlink or directory, or `.` for the whole
     /// tree) back as it was in COMMIT, removing what COMMIT did not have
-    /// there; recorded as one commit. Goes through a running
-    /// mount or history service when there is one; otherwise writes --root
+    /// there; recorded as one commit. Goes through a running `run` or
+    /// history service when there is one; otherwise writes --root
     /// directly.
     Restore {
         /// Relative to the tree root.
@@ -265,7 +265,7 @@ enum Command {
         pod: Pod,
     },
     /// Undo COMMIT's changes (against its first parent); recorded as one
-    /// commit. Through a running mount or history service when
+    /// commit. Through a running `run` or history service when
     /// there is one; otherwise writes --root directly.
     Revert {
         /// A commit on the volume's branch (any git revision syntax).
@@ -424,10 +424,18 @@ fn real_main() -> Result<ExitCode> {
         eprintln!("error: {refused}");
         return Ok(ExitCode::FAILURE);
     }
-    if let Some(command) = recording_command(&cli.command)
-        && let Some(refused) = refuse_tree_volume(&cli.state, command)
-    {
-        return Ok(refused);
+    if let Some(command) = recording_command(&cli.command) {
+        let source = match &cli.command {
+            Command::Fork {
+                command: fork_cmd::ForkCommand::Create(args),
+            } => Some(args.source_state.as_path()),
+            _ => None,
+        };
+        for state in std::iter::once(cli.state.as_path()).chain(source) {
+            if let Some(refused) = refuse_tree_volume(state, command) {
+                return Ok(refused);
+            }
+        }
     }
     // The composition root: the one place capabilities are minted.
     #[allow(
@@ -756,11 +764,14 @@ fn recording_command(command: &Command) -> Option<&'static str> {
 /// Refuses, before anything is read or written, a recording command on a
 /// tree volume: prints "error: `agentfs <command>` runs on the recording
 /// engine only; <state> is a tree volume, where it is not built yet
-/// (docs/trees.md)" and answers exit 1. `None` when no tree volume is
-/// there.
+/// (docs/trees.md)" and answers exit 1. A state area carrying the tree
+/// format's marker is refused whatever its identity file says, and one whose
+/// marker cannot be read is refused too (exit 1, naming the error): the
+/// guard fails closed. `None` when no tree volume is there.
 fn refuse_tree_volume(state: &Path, command: &'static str) -> Option<ExitCode> {
-    match agentfs_core::tree_actor::inspect(state) {
-        Ok(agentfs_contracts::ports::Found::Volume(_)) => {
+    match agentfs_core::tree_actor::holds_tree_format(state) {
+        Ok(false) => None,
+        Ok(true) => {
             eprintln!(
                 "error: `agentfs {command}` runs on the recording engine only; {} is a tree \
                  volume, where it is not built yet (docs/trees.md)",
@@ -768,7 +779,14 @@ fn refuse_tree_volume(state: &Path, command: &'static str) -> Option<ExitCode> {
             );
             Some(ExitCode::FAILURE)
         }
-        _ => None,
+        Err(e) => {
+            eprintln!(
+                "error: `agentfs {command}` runs on the recording engine only, and whether {} \
+                 is a tree volume could not be read: {e}",
+                state.display()
+            );
+            Some(ExitCode::FAILURE)
+        }
     }
 }
 

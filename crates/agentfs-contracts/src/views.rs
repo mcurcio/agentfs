@@ -22,7 +22,8 @@ pub struct MountOptions {
     /// Stack over a stale agentfs mount of this volume at the mount point (a
     /// view host restarted after its predecessor died): mounted at a private
     /// directory of the state area, bind-mounted over the stale mount so every
-    /// copy of it (propagated mounts, subPath binds) reaches this view, the
+    /// copy of the mount point (propagated mounts, subPath binds of the mount
+    /// point itself; not binds of a directory inside it) reaches this view, the
     /// private mount detached; the stale layers below are detached when the
     /// view ends. Needs CAP_SYS_ADMIN. With no stale mount there, the view
     /// mounts as without it.
