@@ -1,15 +1,22 @@
-# A sandbox pod with a pod-scoped (generic ephemeral) claim on the fork
-# class whose dataSource is the source claim, in use by the writer
-# (ci/e2e-csi-forks.sh). Deleting the pod deletes the claim, which finishes
-# the fork.
+# A fork pod with a pod-scoped (generic ephemeral) claim on the fork class
+# whose dataSource is the source claim, in use by the writer
+# (ci/e2e-csi-forks.sh). The fork is made in the source's volume, on its
+# node: the pod has affinity to the writer. Deleting the pod deletes the
+# claim, which ends the fork.
 apiVersion: v1
 kind: Pod
 metadata:
-  name: sandbox
+  name: fork
   namespace: agentfs-csi-e2e-forks
 spec:
   automountServiceAccountToken: false
   terminationGracePeriodSeconds: 5
+  affinity:
+    podAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        - labelSelector:
+            matchLabels: { app.kubernetes.io/name: writer }
+          topologyKey: kubernetes.io/hostname
   securityContext:
     runAsNonRoot: true
     runAsUser: 10000
@@ -18,7 +25,7 @@ spec:
     fsGroupChangePolicy: OnRootMismatch
     seccompProfile: { type: RuntimeDefault }
   containers:
-    - name: sandbox
+    - name: fork
       image: agentfs:ci
       imagePullPolicy: Never
       command: [sh, -c, "trap 'exit 0' TERM; while :; do sleep 1; done"]
