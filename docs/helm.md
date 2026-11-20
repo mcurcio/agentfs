@@ -161,20 +161,20 @@ The defaults are those of `deploy/`, with these differences:
 |---|---|---|
 | `image.tag` (CSI) | the chart's appVersion | a published chart pins the image of its own commit (§7); in the repository it is `latest` |
 | `image.tag` (sidecar) | none, required | the library cannot know its consumer's release, so it refuses to render without a tag or digest |
-| `profiles` | none | `deploy/csi`'s `example` profile points at a placeholder remote; a profile with no `[remote]` section makes local-only volumes ([configuration](configuration.md#remotes-modes)) |
+| `profiles` | none | `deploy/csi`'s `example` profile names a placeholder remote, logged as not built at each host's start |
 | `credentials.existingSecret` | empty: the chart renders an empty `agentfs-csi-credentials` Secret | set it to keep secrets out of the release record |
 | `storageClasses` | none | they belong to the workloads' operator; `deploy/csi/example` has two |
 
 StorageClass `parameters` are passed to the driver as written
 ([configuration.md](configuration.md#the-csi-driver-agentfs-csi)): new
-driver parameters need no chart change, and a start class
-(`startFrom`) is an ordinary entry ([moving](runbooks/moving.md)).
-`reclaimPolicy` is always `Delete` (the schema allows nothing else, and
-the class admission policy refuses any other class of the driver):
-DeleteVolume must run for the driver's release decider to answer, and
-`onDelete: retain` is what keeps a worktree. `classAdmission.enabled`
-(on by default) installs that policy, `agentfs-class`; with it off a
-class with `Retain` loses nothing, but its PVs stay `Released` for ever.
+driver parameters need no chart change, and a parameter the driver
+refuses (`startFrom`, `onDelete: delete`) fails at CreateVolume, not at
+install. `reclaimPolicy` is always `Delete` (the schema allows nothing
+else, and the class admission policy refuses any other class of the
+driver): DeleteVolume must run, to drain and keep a volume and to end a
+fork claim's fork. `classAdmission.enabled` (on by default) installs that
+policy, `agentfs-class`; with it off a class with `Retain` loses nothing,
+but its PVs stay `Released` for ever and fork claims never end.
 
 `alerts.enabled=true` installs the example alert rules of
 [`deploy/alerts`](../deploy/alerts) as a Prometheus Operator
@@ -188,7 +188,7 @@ the volumes on a node share one `instance` (deployment.md "Names and
 labels").
 
 `sidecars.provisioner.extraArgs` passes flags to each node's
-csi-provisioner (`--retry-interval-max=20s` retries a waiting
+csi-provisioner (`--retry-interval-max=20s` retries a refused
 DeleteVolume sooner), and `node.extraArgs` to `agentfs-csi`
 (`--backoff-max`).
 

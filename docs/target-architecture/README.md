@@ -41,7 +41,7 @@ Smaller slices, one page each:
 
 | Slice | Page |
 |---|---|
-| Moving every launcher onto the tree views and deleting the recording engine: milestones M4 to M9 (M1 to M3 are built), the baseline (the first Hermes deploy, on a CSI volume claim), the deferred extras | [One engine](future/one-engine.md) |
+| Moving every launcher onto the tree views and deleting the recording engine: milestones M4, M5, M6 and M9 (M1, M2, M3, M7 and M8 are built), the baseline (the first Hermes deploy, on a CSI volume claim), the deferred extras | [One engine](future/one-engine.md) |
 | Cutting the tree actor into six modules | [Module cut](future/module-cut.md) |
 | The name the root is published under, apart from its identity | [Root branch name](future/root-branch-name.md) |
 | Transactions | [Transactions](future/transactions.md) |

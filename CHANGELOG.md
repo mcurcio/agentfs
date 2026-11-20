@@ -45,9 +45,32 @@ design was reviewed on 2026-10-12.
   or patch source in their settings is logged as not built at every boot.
   `docs/runbooks/upgrading-the-sidecar.md` moves a recording volume onto a
   tree volume, archiving the old state area.
-- **The CSI driver's front is `agentfs front --history-service`.** It was `mount
-  --history-service`; the node plugin starts the new command with the same
-  flags.
+- **The CSI driver runs the tree engine.** CreateVolume runs `agentfs init
+  --volume <name> --include <profile>.config` and installs the profile's rule
+  files; the node plugin runs one `agentfs host` per volume in use on its node,
+  driving it over the child's standard input (a Unix socket only the plugin
+  holds; JSON lines, protocol v1: `open`, `close`, `reconcile`, `fork_create`,
+  `fork_end`), and EOF drains it. NodePublish opens a view directly at the
+  kubelet's target with the pod's context (`Agentfs-Pod`, `Agentfs-Namespace`,
+  `Agentfs-Pod-Uid`, `Agentfs-Node` trailers); there is no NodeStage. A crashed
+  host, or a restarted plugin, opens every published view again, stacked over
+  the stale mounts, rebinding each client. One pod per claim: a second is
+  refused (`several pods on one volume are not built`). DeleteVolume of a root
+  claim drains the volume through a host and keeps its directory
+  (`csi.retained.json`); a static PV mounts a kept volume again. A **fork
+  claim** (a fork class, `fork: "true"`, `landing: automatic`, with a
+  `dataSource` claim on the same node) is an in-volume fork of its source,
+  owned by Trees under the claim's PV name, served by the source's host and
+  landing in the source automatically; DeleteVolume ends it. Refused as not
+  built: `onDelete: delete`, `startFrom`, `workloadMounts`, `link: unlinked`
+  and `remotes`, `landing: approval` and forks of forks (both refused by
+  Trees). Each host logs push, patch and LFS settings as `not built:` and
+  counts them in `agentfs.not_built` through the `OTEL_*` variables the plugin
+  passes on. A recording-format volume is never served or deleted: NodePublish
+  and DeleteVolume answer `FAILED_PRECONDITION` naming the directory and
+  `docs/runbooks/moving.md`, which archives it and moves its files onto a tree
+  volume. `agentfs host --launcher ID --volume NAME` is new, and
+  `agentfs_contracts::host` holds its messages.
 
 ### Removed
 
@@ -55,8 +78,12 @@ design was reviewed on 2026-10-12.
   with `--passthrough`, `--threads`, `--unmount-grace`, `--push-grace`,
   `--workload-mount` and the sandbox overlay's `--sandbox-overlay` and
   `--sandbox-owner`; the fronts keep their own), `probe --sandbox-overlay`, and
-  the recording `init` (`--branch`); the CSI driver creates its state areas
-  itself.
+  the recording `init` (`--branch`).
+- `agentfs-csi`'s recording-engine flags: `--mount-dir`, `--passthrough`,
+  `--front-threads`, `--stage-wait`, `--publish-wait`, `--unpublish-grace`,
+  `--unstage-grace`, `--history-wait` and `--release-scan-interval`
+  (`AGENTFS_CSI_RELEASE_SCAN_INTERVAL`), with the release scan, the push and
+  fork finishing it ran, NodeStage and NodeUnstage, and start classes.
 - The sandbox overlay's manifests: `deploy/examples/sidecar-sandbox-overlay`,
   the sidecar chart's `sandboxOverlay` values and the overlay runbook. No
   launcher offers the overlay.
@@ -64,7 +91,7 @@ design was reviewed on 2026-10-12.
   HTTP, HTTPS and SSH, shared and failing remotes, LFS, patches, several
   pods, NFS, SQLite, recovery, the runbooks, mergiraf, the Docker
   restart-and-patch job, and the `bench.yml` and `power-loss.yml`
-  workflows. The recording engine stays covered as the CSI driver runs it.
+  workflows. The recording engine is covered by its Rust tests.
 
 ### Added
 
@@ -299,12 +326,12 @@ design was reviewed on 2026-10-12.
   that hand it each change over gRPC on a Unix socket; each pod commits as
   itself.
 - **The CSI driver** (`agentfs-csi`): agentfs volumes as
-  PersistentVolumeClaims for several pods on one node, with operator
-  profiles per StorageClass and crashed fronts and services restarted.
-  Several nodes writing one volume are not supported, by decision.
+  PersistentVolumeClaims for unprivileged pods on one node, with operator
+  profiles per StorageClass and crashed volume hosts restarted. Several
+  nodes writing one volume are not supported, by decision.
 - **Forked volumes**: a fork of a volume for a sandbox, created, finished
   and published as one change, and delivered by inbox, branch, pull
-  request head, command or webhook; CSI claims cloned into forks.
+  request head, command or webhook.
 - **Telemetry**: OpenTelemetry metrics, traces and logs, exported over OTLP
   gRPC or http/json, with TLS (`otlp-tls`); alarms on stderr.
 - **Deployment**: the container image `ghcr.io/mcurcio/agentfs`, example
