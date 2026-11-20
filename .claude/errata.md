@@ -1789,3 +1789,61 @@ M7 residuals (each to become a bead; none blocks M8):
    plugin's `OTEL_*` variables; true, but off by default in the shipped manifest. docs/csi.md says so.
 5. **Landing order with a sibling in the same checkout.** S5's `git push HEAD` twice carried S4's local commits that
    sat under S5's (58b7857, faa1eb4 on the first push), because siblings commit to one branch in one checkout.
+
+## 2026-11-20, M8 fix round: what was applied, where the review was wrong, and M8 residuals
+
+Two reviews (A: F1..F10, B: F1..F9) and the CI report on f34bfa6. Applied (5670701, bac84b1, 3913f35 and the
+commit carrying this entry):
+
+- **A-F1 / B-F1 (e2e-csi fstype).** The product was wrong, not the script: the vendored fuser's pure mount dropped
+  the `Subtype` option and mounted type `fuse`. It now mounts `fuse.<subtype>` as libfuse does
+  (vendor/fuser/AGENTFS-PATCH.md); launcher_host (h) asserts the mountinfo type. The script's check stays strict.
+- **A-F2 (mdbook `<pv>`).** Code spans in docs/runbooks/moving.md no longer wrap; mdbook 0.5.4 builds with no warning.
+- **A-F3, A-F4, B-F3 (plugin restart).** Chosen: a host stopped (EOF, SIGTERM, SIGINT, a failed reply write) with a
+  view open exits 3 at once with no drain, each mount left stale and its client attached, as a crash leaves them; a
+  host with no view open drains as before. Every stop the supervisor asks for has no view open, so DeleteVolume's
+  release verdict (exit 0) is unchanged; only the plugin's shutdown or death meets views. Tests: launcher_host (m)
+  (a fork claim's writer rebound after EOF, both mounts stacked) and csi_trees (the fork scenario: kill -9 of the
+  host, then `Driver::restart`, then NodePublish of the same target and a write through the fork's view). Both fail
+  with the old drain (probed). Docs: csi.md sections 8, 12, 14; csi-recovery.md; filesystem.md; trees.md;
+  library/kubernetes.md.
+- **A-F5.** launcher_host (n): a host killed with a view open, a new host given EOF before any open: exit 0. With
+  the drain's reconcile removed the test hangs (probed; the host never exits).
+- **A-F7 / B-F4 (part).** A drain logs `tree DrainBlocked` with the attached clients of other launchers; csi.md
+  section 12 states the limit; csi-recovery.md "A host never exits" gives the remedy.
+- **A-F8, A-F9, B-F2.** architecture.md's crate row and configuration.md's front, recording-commands, `--push-grace`,
+  `--workload-attached` and `fork finish --timeout` rows rewritten; ci/k8s-csi/move/values.yaml deleted. Errata S3b 1
+  and S5 1, 2 are applied.
+- **A-F10.** Covered by the csi_trees fork scenario above (kill -9 under a published fork claim).
+- **B-F5.** "keyed forks" removed from the reconcile description (filesystem.md, trees.md); the supervisor logs
+  "client(s) no view used were ended".
+- **B-F6 (documented part).** csi-recovery.md, "A pod that will not mount", names the stall and how to find the
+  holder.
+- **B-F8.** `Domains::end_keyed` serves `host` and `fork end`; `Serving::open` decides and logs a stacked open once.
+- **B-F9.** Chosen: the launcher's 1 s bound per pipe stays (a grandchild may hold the pipes; an unbounded wait would
+  never report the exit) and is stated as the one timer beside the backoff (library/kubernetes.md, supervisor.rs).
+
+M8 residuals (each to become a bead):
+
+1. **A-F6: `closed` only after `ViewEnded` has no deterministic test.** An ordering witness needs the host to report
+   that it has handled a `close` while a file is still open; no request answers that. Files:
+   `crates/agentfs-contracts/src/host.rs` (a `status` request, or `close` answered at detach with a later
+   `view_ended` line), `crates/agentfs/src/launcher/host.rs`, `crates/agentfs/tests/launcher_host.rs`. Done when a
+   test fails every run with `close` answered at once. Until then the invariant is known untested.
+2. **B-F6: one `close` stalls every request of the volume.** Files: `crates/agentfs/src/launcher/host.rs` (defer
+   only requests about the same `at`, or answer `close` at detach and report the end separately),
+   `crates/agentfs-csi/src/host_client.rs`, docs/library/filesystem.md. Done when a NodePublish of another claim of
+   the volume completes while a held file keeps one view's close open (a csi_trees root test).
+3. **B-F4: the release verdict reaches the parent only as an exit code.** Files: `crates/agentfs-contracts/src/host.rs`
+   (a `stop` request answered `released` or `waiting` with Volume's blockers), `crates/agentfs/src/launcher/host.rs`,
+   `crates/agentfs-csi/src/supervisor.rs` (`release`, `stop_host`: answer `FAILED_PRECONDITION` naming the blocker,
+   never hold the controller's lock unbounded; a cancelled call leaves no untracked host). Done when DeleteVolume of a
+   volume with a foreign client answers at once, naming it, and a root test proves it.
+4. **B-F3 (alarm part): a replay the host refuses is dropped with a log line only.** agentfs-csi has no telemetry of
+   its own. Files: `crates/agentfs-csi/src/supervisor.rs` (`replay`), a gauge in the plugin or the host. Done when a
+   refused replay raises an alarm the example alert rules fire on, and the record is kept until NodeUnpublish.
+5. **B-F7: telemetry is off in the shipped CSI manifests** (`OTEL_SDK_DISABLED=true` in deploy/csi/node.yaml and the
+   chart), while the sidecar exports to a placeholder collector. Not changed here: a collector address is the
+   operator's, and each host flushes its exporter at exit, so an unreachable default would delay every host stop on
+   kind. The goal's row in one-engine.md says the log line is always on and the gauge needs the operator's collector.
+   For the owner (general guidance): keep the alarm opt-in under CSI, or ship a default endpoint as the sidecar does.

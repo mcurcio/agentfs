@@ -137,12 +137,18 @@ async lock; every on-demand start and stop happens under it.
   `FAILED_PRECONDITION` (`several pods on one volume are not built`), at the
   same target with another read-only flag `ALREADY_EXISTS`, at the same target
   with the same flag a success.
-- **Stopping a host** drops its `HostClient`: the task closes the stream, and
-  the host drains and exits 0 once Volume releases the volume.
+- **Stopping a host** drops its `HostClient`: the task closes the stream.
+  With no view open (every stop the supervisor asks for) the host drains and
+  exits 0 once Volume releases the volume; with views open (the plugin's
+  shutdown) it exits 3 at once and leaves them stale for the next host
+  ([the view host command](filesystem.md#the-view-host-command)).
 - **A host that exits unasked** is started again after `next_backoff` (1 s,
   doubling to `Backoff::max`, back to 1 s after a minute of uptime) while
   records of the volume remain, with every view replayed. A start that fails
-  is tried again with backoff. These delays are its only timers.
+  is tried again with backoff. These delays are its only timers, beside one
+  bound: `AgentfsLauncher` waits up to 1 s per output pipe for a child's last
+  lines before it reports the exit, because a grandchild may hold the pipes
+  open; lines later than that miss the exit's error text.
 - **Release** starts the volume's host with no view and stops it; its exit 0
   is Volume's release verdict.
 - **Reconcile**, at plugin start, drops the published records whose target is

@@ -23,7 +23,8 @@
 //!   shutdown) it exits 3 at once and leaves them stale for the next host.
 //! - **A host that exits unasked** is started again after a backoff while
 //!   records of the volume remain, with every view replayed. A start that
-//!   fails is tried again with backoff. These delays are the only timers.
+//!   fails is tried again with backoff. These delays are the only timers,
+//!   beside the launcher's bounded wait for a child's last log lines.
 //! - **Release** (DeleteVolume) starts the volume's host with no view and
 //!   stops it: its exit 0 is Volume's release verdict.
 //! - **Forks** (a fork claim's CreateVolume and DeleteVolume) are created

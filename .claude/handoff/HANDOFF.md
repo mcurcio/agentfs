@@ -46,9 +46,14 @@ The code and the library/human docs win over all of these where they disagree; r
   layers detached at start, one `FileOwner`. Findings and three "M7 residuals" in `.claude/errata.md`, "M7 fix
   round".
 
+- M8 (the CSI driver on `agentfs host`) built (S1..S5) and its one fix round landed (5670701..): views mount as
+  `fuse.agentfs` (vendored fuser patch), a host stopped with views open leaves them stale for the next host (a plugin
+  restart keeps pods' views and fork claims' writers), `tree DrainBlocked`, stale CSI docs rewritten. Five "M8
+  residuals" in `.claude/errata.md`, "M8 fix round"; residual 5 (CSI telemetry off by default) is for the owner.
+
 ## Next, in order
-0. M8 (the CSI driver moves), then the baseline (first Hermes deploy, on a CSI volume claim). Cut beads for the M7
-   residuals (errata "M7 fix round").
+0. The baseline (first Hermes deploy, on a CSI volume claim). Cut beads for the M7 and M8 residuals (errata "M7 fix
+   round", "M8 fix round").
 1. Cut beads for the M3 residuals (errata "M3 fix round"); put residual 2 (the fork copy holds the actor's lock) to
    the owner before M8. The M2 owner questions and residuals (errata "M2 fix round") are still open.
 1b. Then `docs/target-architecture/future/one-engine.md`'s order (owner, 2026-11-19): M8 -> the baseline (the

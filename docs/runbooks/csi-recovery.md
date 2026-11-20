@@ -115,6 +115,13 @@ event:
 - `the host of volume <pv> refused to start` or `exited before it served`,
   with its last lines: fix what they name (a full disk, a profile setting
   refused at boot).
+- The call times out (`DeadlineExceeded`) for every claim of one volume, a
+  fork claim's too: a host answers its requests in order, and a `close`
+  answers only once the closed view's files are released. A process on the
+  node, outside the pod, that still holds a file of a view being unpublished
+  holds every later call on that volume. Find it with
+  `in_plugin sh -c 'ls -l /proc/[0-9]*/fd 2>/dev/null | grep <target>'`
+  and stop it; the calls then complete.
 
 ## A claim that will not delete
 

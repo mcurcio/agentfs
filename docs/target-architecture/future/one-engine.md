@@ -248,7 +248,7 @@ What the deploy needs, and the milestone that gives it:
 | The binary the CSI driver spawns runs the tree engine | built: `init` and `mount` (M7); `init` and `host`, which the driver runs (M8) |
 | A CSI volume claim on the tree engine | built (M8) |
 | The start-up speed the probes allow | M1's budgets; speed, if M1's figures miss them |
-| What is not built yet (push, alarms, patches) said with an alarm and a log line | built for the binary (M7: `agentfs.not_built`, `AgentfsNotBuilt`, a `not built:` line per key) and each CSI volume's host (M8) |
+| What is not built yet (push, alarms, patches) said with an alarm and a log line | built for the binary (M7: `agentfs.not_built`, `AgentfsNotBuilt`, a `not built:` line per key) and each CSI volume's host (M8). The shipped CSI manifests set `OTEL_SDK_DISABLED=true`, so there the gauge exports only once the operator points `OTEL_*` at a collector; the log line is always on ([csi](../../csi.md#9-operations)) |
 
 Only these come before it. M4, M5, M6, M9 and every [deferred extra](#deferred-extras) come after, or never block
 it.
