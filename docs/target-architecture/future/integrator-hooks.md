@@ -1,6 +1,7 @@
 # Checkpoints and patch notices on trees
 
-**Proposed, not built.** This page proposes the integrator's checkpoint and the patch queue's notices on the tree
+**Proposed, not built.** Not built on tree volumes; the recording engine still runs both behind the CSI driver until
+it moves. This page proposes the integrator's checkpoint and the patch queue's notices on the tree
 views. The commit that lands this slice deletes this page and moves the behaviour into the library or operator
 docs.
 
@@ -16,7 +17,8 @@ and "Knobs"; [patches](../../patches.md)):
   each time the queue's verdicts change; a failure raises `NotifyFailed` and is sent again.
 
 The tree views have neither. [Integrator patches](integrator-patches.md) (milestone M6) builds the queue, `restore`
-and `revert`, not these. They go dark when the `agentfs` binary moves (M7) and are deleted at M9
+and `revert`, not these. On a tree volume `checkpoint` refuses, and a patch-notice setting is logged at every boot
+as not built and counted by `agentfs.not_built`. They go dark for the CSI driver at M8 and are deleted at M9
 ([one engine](one-engine.md), "Deferred extras").
 
 ## What it proposes

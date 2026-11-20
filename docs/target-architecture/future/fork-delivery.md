@@ -1,6 +1,7 @@
 # Fork delivery and unlinked forks on trees
 
-**Proposed, not built.** This page proposes handing a fork's change to a receiver, and forks that never land, on the
+**Proposed, not built.** Not built on tree volumes; the recording engine still runs both behind the CSI driver until
+it moves. This page proposes handing a fork's change to a receiver, and forks that never land, on the
 tree views. The commit that lands this slice deletes this page and moves the behaviour into the library or operator
 docs.
 
@@ -16,8 +17,9 @@ examples 5 and 8):
   delivers to its source and pushes only to remotes of its own, or none.
 
 On the tree views a fork lands in its source as it saves, unless its setting needs approval
-([landing approvals](landing-approvals.md)). Neither capability exists there. Each goes dark when its launcher moves
-(M7 for the binary, M8 for the CSI driver) and is deleted with the recording engine at M9
+([landing approvals](landing-approvals.md)). Neither capability exists there: on a tree volume (the sidecar, Docker,
+the CLI) `fork create` and `fork deliver` refuse, as not built. Both go dark for the CSI driver at M8 and are deleted
+with the recording engine at M9
 ([one engine](one-engine.md), "Deferred extras"). Until this slice lands, M8 refuses a claim on an unlinked class.
 
 ## What it proposes

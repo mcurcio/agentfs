@@ -6,14 +6,18 @@ as a push, raises an alarm and is retried. Nothing the workload wrote is
 lost from the backing tree; what may be missing is its history. The
 usual cause is a state area that is full or cannot be written.
 
-The commands below are for the sidecar of
-[deployment.md](../deployment.md), where the state area is `/data/state`
-and the backing tree `/data/backing`, on one claim. Elsewhere, use your
-own paths with `agentfs --state <state>`.
+Sections 1 to 4 are the recording engine's, which the CSI driver runs
+([csi.md](../csi.md#9-operations)): run their commands in the node plugin
+pod of the node that holds the volume. Sections 5 to 7 are the tree
+views', which the sidecar, the Docker examples and `agentfs mount` run
+([trees](../trees.md)); there `$STATE` is the volume's state area (the
+sidecar's and Docker's `/data/state`).
 
 ```sh
-POD=$(kubectl get pod -l app.kubernetes.io/name=agentfs-example -o name | head -n1)
-kubectl exec "$POD" -c agentfs -- agentfs status
+NODE_POD=$(kubectl -n agentfs-csi get pod -l app.kubernetes.io/name=agentfs-csi-node \
+  --field-selector spec.nodeName=<node> -o name)
+STATE=/var/lib/agentfs-csi/volumes/<pv>/state
+kubectl -n agentfs-csi exec "$NODE_POD" -c agentfs-csi -- agentfs --state "$STATE" status
 ```
 
 ## Symptoms
@@ -21,16 +25,16 @@ kubectl exec "$POD" -c agentfs -- agentfs status
 | What you see | Where | Section |
 |---|---|---|
 | `close`, `rename`, `unlink` or another call fails with `EIO` in the workload | the workload's own errors; many programs ignore errors from `close`, so the alarm is what to watch | [2](#2-a-failed-record-recordfailed-eio) |
-| `alarm: record failed (<trigger>) for <paths>: <error>` | the sidecar's stderr; log event `agentfs.record_failed`; counter `agentfs.record.failures{trigger}`; alert `AgentfsRecordFailed` | [2](#2-a-failed-record-recordfailed-eio) |
+| `alarm: record failed (<trigger>) for <paths>: <error>` | the node plugin's log (`[front ...]`, `[service ...]`); log event `agentfs.record_failed`; counter `agentfs.record.failures{trigger}`; alert `AgentfsRecordFailed` | [2](#2-a-failed-record-recordfailed-eio) |
 | `alarm: commit failed, <n> record(s) waiting: <error>` | stderr; log event `agentfs.commit_failed`; counter `agentfs.commit.failures`; gauge `agentfs.journal.backlog` growing; alert `AgentfsCommitsFailing` | [3](#3-commits-failing-commitfailed) |
 | `alarm: repack failed: <error>` | stderr; log event `agentfs.repack_failed`; counter `agentfs.repack.failures`; alert `AgentfsRepackFailed` | [1](#1-the-state-area-is-full-or-unwritable) |
-| `<n> path(s) a previous mount could not record: <r> repaired from the backing tree, <s> still failing` | the sidecar's log at start | [4](#4-paths-a-mount-could-not-record-metarepairs) |
-| `<n> path(s) could not be recorded ...` | the sidecar's log at stop | [4](#4-paths-a-mount-could-not-record-metarepairs) |
-| `journal corruption at byte <offset>`, or `<ref> names lost object <oid>`, opening a tree state area | `agentfs trees` | [5](#5-a-tree-state-area-that-refuses-to-open) |
+| `<n> path(s) a previous mount could not record: <r> repaired from the backing tree, <s> still failing` | a front's log at start | [4](#4-paths-a-mount-could-not-record-metarepairs) |
+| `<n> path(s) could not be recorded ...` | a front's log at stop | [4](#4-paths-a-mount-could-not-record-metarepairs) |
+| `journal corruption at byte <offset>`, or `<ref> names lost object <oid>`, opening a tree state area | `agentfs init` or `mount` | [5](#5-a-tree-state-area-that-refuses-to-open) |
 | `tree JournalTail: <n> bytes at <offset>` | a tree actor's stderr at open | [5](#5-a-tree-state-area-that-refuses-to-open) |
-| `the operator's rules refuse the volume: info/attributes line <n>: <attribute> ...` | `trees mount`'s error at start (exit 1) | [5](#5-a-tree-state-area-that-refuses-to-open) |
+| `the operator's rules refuse the volume: info/attributes line <n>: <attribute> ...` | `mount`'s error at start (exit 1) | [5](#5-a-tree-state-area-that-refuses-to-open) |
 | `tree HistoryBuildFailed: <error>`, or a tree view's metrics with `history.health` `failed` or an `oldest_unbuilt_ns` that keeps growing | a tree actor's stderr; `--metrics-output` | [6](#6-a-tree-volumes-history-is-not-built) |
-| `trees mount` exits 75 or 1 at start, or does not exit after SIGTERM | `agentfs trees` | [7](#7-a-tree-mount-that-will-not-start-or-stop) |
+| `agentfs mount` exits 75 or 1 at start, or does not exit after SIGTERM | the mount's stderr | [7](#7-a-tree-mount-that-will-not-start-or-stop) |
 
 The `<error>` says what failed: `No space left on device` (`ENOSPC`),
 `Disk quota exceeded`, `Read-only file system` (`EROFS`), `Permission
@@ -42,18 +46,18 @@ denied`, or an I/O error. The alerts are in
 Check space and what uses it:
 
 ```sh
-kubectl exec "$POD" -c agentfs -- df -h /data
-kubectl exec "$POD" -c agentfs -- du -sh /data/state/git /data/state/journal /data/state/pending /data/state/lfs /data/state/meta
+kubectl -n agentfs-csi exec "$NODE_POD" -c agentfs-csi -- df -h "$STATE"
+kubectl -n agentfs-csi exec "$NODE_POD" -c agentfs-csi -- du -sh "$STATE"/git "$STATE"/journal "$STATE"/pending "$STATE"/lfs "$STATE"/meta
 ```
 
 `agentfs.state.bytes{part}` reports the same parts (`git`, `journal`,
 `pending`, `lfs`, `meta`) as apparent sizes, so a graph of it shows which
-one grew. In the sidecar the backing tree shares the claim, so a workload
-that fills its own files fills the state area too.
+one grew. The backing tree and the state area share the node's
+`basePath` disk ([csi.md](../csi.md#11-where-worktrees-live)), so a
+workload that fills its own files fills the state area too.
 
-- **Grow the claim** when its StorageClass allows it
-  (`allowVolumeExpansion: true`): raise `spec.resources.requests.storage`
-  of the PVC. This is the fix that loses nothing.
+- **Grow the disk under `basePath`.** This is the fix that loses
+  nothing; the driver enforces no capacity.
 - **`lfs` is large:** objects that every remote already has can be
   removed with `agentfs lfs prune` (try `--dry-run` first,
   [lfs-storage.md](lfs-storage.md)).
@@ -67,27 +71,15 @@ that fills its own files fills the state area too.
 - **Free space in the backing tree** (the workload's own files) if they
   are what filled the claim.
 
-Never delete files under `/data/state` by hand: history, the journal and
+Never delete files under the state area by hand: history, the journal and
 the frozen copies are the record.
 
 **Unwritable** (`EROFS`, `Permission denied`): a filesystem the kernel
 remounted read-only after an error needs the node's logs (`dmesg`) and
-usually a new pod on a repaired volume; `Permission denied` means the
-state area's owner or mode changed. The daemon runs as root and the
-state area belongs to it: restore that ownership (`chown -R 0:0
-/data/state` from the sidecar).
-
-Kubernetes reports a claim's free space with the kubelet's
-`kubelet_volume_stats_available_bytes`; an alert on it gives warning
-before recording fails, for example:
-
-```yaml
-- alert: AgentfsClaimFilling
-  expr: kubelet_volume_stats_available_bytes{persistentvolumeclaim="agentfs-data"} / kubelet_volume_stats_capacity_bytes{persistentvolumeclaim="agentfs-data"} < 0.10
-  for: 15m
-```
-
-It is not in deploy/alerts, which covers agentfs's own metrics.
+usually a repaired disk; `Permission denied` means the state area's
+owner or mode changed. The node plugin runs as root and the state area
+belongs to it: restore that ownership (`chown -R 0:0 "$STATE"` in the
+node plugin pod).
 
 ## 2. A failed record (RecordFailed, EIO)
 
@@ -105,7 +97,7 @@ So once the cause is fixed (section 1), recording catches up by itself
 within a sweep. To check, the paths are in the alarm:
 
 ```sh
-kubectl exec "$POD" -c agentfs -- git --git-dir /data/state/git log --oneline -3 agentfs/example -- <path>
+kubectl -n agentfs-csi exec "$NODE_POD" -c agentfs-csi -- git --git-dir "$STATE"/git log --oneline -3 agentfs/<volume> -- <path>
 ```
 
 A record whose frozen copies are gone is dropped with `RecordFailed` instead of
@@ -120,17 +112,18 @@ locked. The records are safe and are retried, so history catches up by itself
 when the cause is gone.
 
 ```sh
-kubectl exec "$POD" -c agentfs -- agentfs status
+kubectl -n agentfs-csi exec "$NODE_POD" -c agentfs-csi -- agentfs --state "$STATE" status
 # backlog:   37 record(s)      <- records waiting for a commit
-kubectl logs "$POD" -c agentfs | grep 'commit failed' | tail -n 3
+kubectl -n agentfs-csi logs "$NODE_POD" -c agentfs-csi | grep 'commit failed' | tail -n 3
 ```
 
 - Fix space or permissions as in section 1.
 - A ref lock file a crash left (`<state>/git/refs/heads/agentfs/<volume>.lock`)
   is removed when the volume opens, so an error naming one clears with
-  a restart of the pod: the journal is replayed at the next start.
+  a restart of the history service ([csi-recovery.md](csi-recovery.md)):
+  the journal is replayed at the next start.
 - Do not downgrade agentfs while records are waiting: an older version may
-  not read the journal ([upgrading-the-sidecar.md](upgrading-the-sidecar.md#rolling-back)).
+  not read the journal.
 
 It is fixed when `agentfs status` shows `backlog:   0 record(s)` (or a
 small number that keeps changing), `agentfs.commit.count` rises, and the
@@ -155,16 +148,17 @@ anything. Its start shows the result:
   recorded, nor saved for the next mount ...: <paths>` (the state area
   could not take the file either). History differs from the backing tree
   at those paths until each changes again. Record them by writing each
-  again through the mount, from the sidecar, keeping owner and mode:
+  again through the mount, from the workload's pod, keeping owner and mode:
 
   ```sh
-  kubectl exec "$POD" -c agentfs -- sh -c 'cd /agentfs/workspace && cp -p notes/plan.md notes/plan.md.rerecord && mv notes/plan.md.rerecord notes/plan.md'
+  kubectl exec <pod> -- sh -c 'cd <mount path> && cp -p notes/plan.md notes/plan.md.rerecord && mv notes/plan.md.rerecord notes/plan.md'
   ```
 
   A path that no longer exists in the backing tree is recorded as
   removed by creating and removing it through the mount. With the volume
-  not mounted (the pod stopped), `agentfs --state /data/state --root
-  /data/backing record <path>` records them directly.
+  not staged (no pod uses it), `agentfs --state "$STATE" --root
+  <basePath>/<pv>/backing record <path>` in the node plugin pod records
+  them directly.
 
 ## 5. A tree state area that refuses to open
 
@@ -261,7 +255,7 @@ from a batch whose built-log entry was never written stays; nothing names it.
 
 ## 7. A tree mount that will not start or stop
 
-`trees mount` stages the volume, attaches a client for each view and drains the
+`agentfs mount` stages the volume, attaches a client for each view and drains the
 volume when it stops ([lifecycle](../trees.md#volume-lifecycle)). Each move is a
 commit on `refs/agentfs/volume` or `refs/agentfs/clients/<tree>`, so the record
 says where it is:
@@ -278,11 +272,11 @@ fails ([6](#6-a-tree-volumes-history-is-not-built)).
 
 | Exit and message | Meaning and fix |
 |---|---|
-| 75, `the volume is busy: another process holds its state area` | Another `trees mount`, `init` or `end` holds the state area's lock. Stop it, or wait for its drain to finish |
-| 1, `no volume here: create it first` | `trees mount` never creates a volume: run `trees init --volume NAME` first |
+| 75, `the volume is busy: another process holds its state area` | Another `mount`, `init` or `fork end` holds the state area's lock. Stop it, or wait for its drain to finish |
+| 1, ``no volume here: run `agentfs init --volume NAME` first`` | `mount` never creates a volume: run `init` first |
 | 1, `the volume here is "<a>", not "<b>"` or `another volume is here` | The state area belongs to another volume; nothing was written. Point the launcher at the right state area, or fix the name |
 | 1, `this fork has had its writer` | The fork's one read-write client has been used (C4 in the [library](../library/core.md#domain-invariants)). Mount it with `--fork-read-only`, or use a new key. A writer killed rather than unmounted comes back with the same launcher, tree, label and access |
-| 1, `the fork under this --fork-key has ended` | `trees end` ended it. Use a new key |
+| 1, `the fork under this --fork-key has ended` | `fork end` ended it. Use a new key |
 
 **It will not stop.** After SIGTERM or SIGINT the process exits 0 only once the
 volume is released. It waits while:

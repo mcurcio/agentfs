@@ -6,6 +6,12 @@ it, and every remote's LFS server. This runbook covers watching that
 space, freeing the local cache safely, and getting objects back. How it works: [recording](../recording.md), [remotes](../remotes.md); settings:
 [Git LFS](../configuration.md#git-lfs).
 
+LFS is the recording engine's, which the CSI driver runs
+([csi.md](../csi.md#9-operations)). Tree volumes (the sidecar, the Docker
+examples and `agentfs mount`) do not build it: a `filter=lfs` rule refuses
+the volume, and an LFS setting is logged at every boot as not built
+([trees](../trees.md#operator-settings)).
+
 ## Symptoms
 
 - `agentfs.state.bytes{part="lfs"}` grows, or the state volume fills up
@@ -163,12 +169,10 @@ then use the host's own tools to purge unreferenced objects.
 
 ## In Kubernetes
 
-Run the commands in the container that runs agentfs for the volume:
+Run the commands in the node plugin of the volume's node:
 
 ```sh
-# The sidecar (deploy/sidecar): AGENTFS_STATE is set in the container.
-kubectl -n "$NS" exec "$POD" -c agentfs -- agentfs lfs prune --dry-run
-# The CSI driver: in the node plugin of the volume's node, with the
+# In the node plugin of the volume's node, with the
 # volume's state area under the driver's --base-path (see csi.md and
 # csi-recovery.md for finding $NODE_POD and $PV).
 kubectl -n agentfs-csi exec "$NODE_POD" -c agentfs-csi -- \

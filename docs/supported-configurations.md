@@ -31,10 +31,20 @@ in:
   share commits through remotes. What matters is refs, order, merging and
   gating.
 
-Tree views (`agentfs trees`, [trees](trees.md)) are a separate mode: one
-local actor, a main mount and an optional isolated sandbox mount, flat files
-only, without remotes or CSI. The combinations below describe `agentfs
-mount` and the layers around it.
+agentfs has two engines, and each launcher runs one:
+
+- **Tree views** ([trees](trees.md)) are what the sidecar, the Docker
+  examples and the CLI's `agentfs init` and `agentfs mount` run. Section
+  1.5 says what they build and what they do not.
+- **The recording engine** is what the CSI driver runs: a history service
+  per volume (`serve-history`) and a front per pod (`front`), with the
+  one-shot commands on its state areas.
+
+Sections 1.1 to 1.4 describe the recording engine unless a cell says
+otherwise. On a tree volume, every value section 1.5 marks **not built**
+is said at boot, never silently: a configured setting is logged with a
+`not built:` line, counted by the `agentfs.not_built` gauge and alerted
+by `AgentfsNotBuilt`, and a recording command refuses the volume.
 
 ## 1. Dimensions
 
@@ -46,9 +56,9 @@ the lower ones ([architecture.md](architecture.md#crates)).
 | Layer | Crate | What a consumer uses | Status |
 |---|---|---|---|
 | Library | `agentfs-core` | Rust calls with no mount and no agentfs process: opening a state area and recording (`volume`, the `Recorder`), restore and revert planning (`restore`), the patch queue (`patch`), forks (`fork::create`, `fork::finish`, `fork::listing`), delivering a fork's change through the `Delivery` contract (`fork::deliver`), the deletion decider (`release::decide`) | **built** (module map: [architecture.md](architecture.md#agentfs-core)) |
-| Filesystem | `agentfs-fuse` and the `agentfs` binary | `agentfs mount` (the FUSE mount); `run` (the commit and push loops without a mount); `serve-history` with `mount --history-service` fronts; one-shot commands: `init`, `record`, `flush`, `push`, `checkpoint`, `status`, `probe`, `restore`, `revert`, `patch submit`, `patch approve`, `patch apply`, `patch status`, `fork create`, `fork finish`, `fork status`, `fork abandon`, `fork list`, `fork deliver`, `start accept`, `lfs fetch`, `lfs prune` | **built** ([flags](configuration.md#flags-and-environment)) |
+| Filesystem | `agentfs-fuse` and the `agentfs` binary | Tree views: `init`, `mount` (with `-- COMMAND`), `fork end` and `probe` ([trees](trees.md#run-it)). Recording engine: `serve-history` with `front` fronts, which the CSI driver starts; `run` (the commit and push loops without a mount); one-shot commands: `record`, `flush`, `push`, `checkpoint`, `status`, `probe`, `restore`, `revert`, `patch submit`, `patch approve`, `patch apply`, `patch status`, `fork create`, `fork finish`, `fork status`, `fork abandon`, `fork list`, `fork deliver`, `start accept`, `lfs fetch`, `lfs prune` | **built** ([flags](configuration.md#flags-and-environment)) |
 | Filesystem | the control socket, `meta/control/agentfs.sock` | `push` (push now), `restore`, `revert`, `apply`, `checkpoint` and `judge` against a running daemon; JSON lines, version 1, root or the daemon's user only | **built** |
-| Filesystem, packaged for Kubernetes | the sidecar manifests and the sidecar library chart | the binary as a privileged native sidecar, one pod per volume | **built** ([deployment.md](deployment.md), [helm.md](helm.md)) |
+| Filesystem, packaged for Kubernetes | the sidecar manifests and the sidecar library chart | the binary as a privileged native sidecar on tree views, one pod per volume | **built** ([deployment.md](deployment.md), [helm.md](helm.md)) |
 | Kubernetes adapter | `agentfs-csi` | StorageClass parameters (`profile`, `volumeName`, `onDelete`, `startFrom`, `workloadMounts`, `fork`, `link`, `remotes`), profiles in a ConfigMap, credentials in a Secret, claims, DeleteVolume's release decider | **built** ([parameters](configuration.md#the-csi-driver-agentfs-csi)) |
 | Every layer | what agentfs writes for others to read | the history branch and `refs/agentfs/<volume>/*` on remotes; the patch status ref; OpenTelemetry metrics, traces and alarms; `status`, `patch status --json` and `fork status --json` | **built** |
 | Filesystem | checkpoint: an integrator says a batch of work is done, which cuts one commit for it | `agentfs checkpoint [-m TEXT]`, or the control socket's `checkpoint`: one commit on `refs/agentfs/<volume>/change-line` | **built** |
@@ -64,10 +74,11 @@ sharing-one-volume world.
 
 | Value | How | What clients get | Status |
 |---|---|---|---|
-| One process, one mount | `agentfs mount BACKING MOUNTPOINT`; one workload process | Every change boundary recorded before the call returns | **built** |
-| Several processes, one mount | Several processes or containers use one FUSE mount: one pod's containers ([deployment.md](deployment.md#10-hermes): Hermes and its tool containers), or several Docker workload containers on one host mount ([docker.md](docker.md#2-the-layout)) | One kernel and one daemon. Grouped commits carry one `Agentfs-Uid` and `Agentfs-Pid` line per writer | **built** |
-| Several pods, one volume, one node | CSI only: one front per pod (`mount --history-service`), one history service per volume (`serve-history`) | Files shared with the backing filesystem's semantics: two pods writing one file is last writer wins; POSIX locks are not shared between pods, so a SQLite database is written from one pod ([csi.md](csi.md#6-using-a-volume)). A commit never holds two pods' changes; each pod has its own committer | **built** |
-| One daemon, two mount points: the main mount and the sandbox overlay | `agentfs mount --sandbox-overlay PATH --sandbox-owner UID:GID` (example 12) | One set of names, one set of open files, one recorder. The overlay shows only recordable files and keeps other new files in a private tmp layer; each kernel caches its own names, invalidated by events from the other; POSIX and BSD locks are not shared between the two mounts | **built** (single-process `mount` only); on a front or a CSI volume **not built** (not built) |
+| One process, one mount | Tree views: `agentfs mount ROOT`; one workload process | Every call recorded in the tree's journal before it returns ([trees](trees.md#recording-and-durability)) | **built** |
+| A mount and a fork of it | Tree views: `agentfs mount ROOT --fork-mount DIR [--fork-key KEY]` | The fork's saves land in the root as they save, and the root's flow back ([trees](trees.md#forks-keys-end-and-the-drop)) | **built** |
+| Several processes, one mount | Several processes or containers use one FUSE mount: one pod's containers ([deployment.md](deployment.md#10-hermes): Hermes and its tool containers), or several Docker workload containers on one host mount ([docker.md](docker.md#2-the-layout)) | One kernel and one daemon. Each save is its own commit, with the mount's writer and pod trailers ([trees](trees.md#volume-identity-and-trailers)) | **built** |
+| Several pods, one volume, one node | CSI only: one front per pod (`front --history-service`), one history service per volume (`serve-history`) | Files shared with the backing filesystem's semantics: two pods writing one file is last writer wins; POSIX locks are not shared between pods, so a SQLite database is written from one pod ([csi.md](csi.md#6-using-a-volume)). A commit never holds two pods' changes; each pod has its own committer | **built** |
+| One daemon, two mount points: the main mount and the sandbox overlay | A program linking `agentfs-fuse` with `MountConfig::overlay` ([library/filesystem](library/filesystem.md#the-sandbox-overlay)) | One set of names, one set of open files, one recorder. The overlay shows only recordable files and keeps other new files in a private tmp layer | **not built** on any launcher: tree volumes do not build it and fronts never served it (example 12) |
 | Several pods through the sidecar | | The sidecar is one pod per volume ([deployment.md](deployment.md#11-limitations)) | use the CSI driver |
 | Several nodes, one volume | `ReadWriteMany`, `ReadOnlyMany` | Refused: the claim stays Pending. Pods on other nodes read the history from a remote | **not supported** |
 | A volume moving between nodes | | A worktree stays on its node for good. Continuing elsewhere is a new volume started from the old branch (example 10) | **not supported** as a move ([moving.md](runbooks/moving.md)) |
@@ -91,7 +102,7 @@ exchanging-through-git world.
 | Patch producers | iac, CI or a person: `agentfs patch submit` or plain git, to `refs/agentfs/<volume>/inbox/<n>` on the patch remote, or pushed to `agentfs serve-git` | Applied in order with nothing attached. A patch that cannot land is set aside and the rest go on; the run stops only at a `gap`, `unrecorded` changes or a failure. Status in `refs/agentfs/<volume>/status` | **built** ([patches.md](patches.md)) |
 | A fork's change delivered | `agentfs fork deliver <fork> --to inbox\|branch\|command\|webhook`, run by the receiver with its own credentials | `inbox` queues it as a patch; `branch` creates a pull request's head branch; `command` and `webhook` hand the payload to a program. The CSI driver never delivers | **built** ([forks.md](forks.md#listing-and-delivering-a-change)) |
 | A forge in the loop (GitHub, Gitea) | An ordinary remote | agentfs pushes its own refs. It never opens, reads, reviews or merges a pull request. Anyone writing the volume's branch there is another writer: a divergence | **built** as a plain remote; nothing forge-specific |
-| A patch landed live into a running volume | | Patches land only with nothing attached: at mount, or `agentfs patch apply` with no daemon. Patches never land while a workload runs | **not built** |
+| A patch landed live into a running volume | | Patches land only with nothing attached: at the history service's start, or `agentfs patch apply` with no daemon. Patches never land while a workload runs | **not built** |
 | A patch that is a branch | Any line of single-parent commits on an ancestor of the head, pushed to `inbox/<n>` | Merged by the `git` program and landed as one commit | **built** |
 | A conflicting patch held while the rest go on; barriers | `patch submit --barrier` (an `Agentfs-Barrier: yes` tip) | A patch that cannot land is set aside whole (`PatchHeld`) and later patches go on. While a barrier is set aside, every later patch waits | **built** |
 
@@ -105,27 +116,55 @@ exchanging-through-git world.
 | `agentfs.sweepInterval` | config, default `30s` | The backstop that records files held open and retries failed records | **built** |
 | `agentfs.pushInterval` | config, default `60s` | How often each remote is pushed, and the base of the failure backoff | **built** |
 | Push now | `agentfs push` against a running daemon | Commits what is recorded and wakes each remote's push at once | **built** |
-| `--push-grace` | `mount`, `run`, `serve-history`, default `5s` | One last push of the final commit at shutdown; `0s` skips it | **built** |
+| `--push-grace` | `run`, `serve-history`, default `5s` | One last push of the final commit at shutdown; `0s` skips it | **built** |
 | `agentfsMaxPushSize` | per remote | A backlog too large for one push goes out in first-parent steps | **built** |
 | `agentfsMaxBlobSize`, `agentfsMaxLfsObjectSize` | per remote | Content over the smallest limit is refused at record time (`PathRefused`) unless stored as LFS | **built** |
-| `--passthrough auto\|on\|off` | `mount`; `agentfs-csi --passthrough` for fronts | Whether data reads and writes bypass the daemon. `fsync`-class paths never use passthrough | **built** |
+| `--passthrough auto\|on\|off` | `front`; `agentfs-csi --passthrough` for fronts | Whether data reads and writes bypass the daemon. `fsync`-class paths never use passthrough | **built** |
 | Git LFS: `agentfs.lfsThreshold`, `agentfs.store`, `filter=lfs`, `lfs.url`, `remote.<name>.lfsurl` | config, `info/attributes` | Which content is stored as LFS and where it is uploaded ([Git LFS](configuration.md#git-lfs)) | **built** |
 | Path rules: `info/exclude`, `-agentfs`, `agentfs.maxSize` | the git directory, set by the operator | Which new paths are recorded; `-agentfs` is never recorded even if tracked | **built** |
 | `agentfs.respectTreeRules` | config, default `false` | Whether tracked `.gitignore` and `.gitattributes` take part in path rules. They can never set `agentfs.*` attributes | **built** |
 | `agentfs.nested` | config, default `exclude` | Nested git repositories: record nothing in them, or their working files | **built** |
 | `agentfs.repackInterval` | config, default `1h` | Storage only: repacks history; changes no commit | **built** |
 | `agentfs.patchRemote`, `agentfs.patchFetchTimeout` | config | Where the inbox is fetched from and the queue status pushed; how long start waits for the fetch | **built** |
-| When patches are applied | none | At `mount`; at `serve-history` start with no fronts running, which under CSI is NodeStage; by `agentfs patch apply` with the volume stopped. `agentfs run` does not apply them | **built** |
+| When patches are applied | none | At `serve-history` start with no fronts running, which under CSI is NodeStage; by `agentfs patch apply` with the volume stopped. `agentfs run` does not apply them | **built** |
 | `patch submit --replace N`, `--skip N` | the producer | Replaces or skips patch N: a set-aside patch, or the one a stopped queue stopped at | **built** |
 | `agentfs.forkRefs`, `--link`, `--remotes`, `onDelete` | source config; `fork create`; StorageClass | Where forks push, whether they deliver back, and what deleting a claim does | **built** |
 | `[agentfs "identity"]` templates | config | Committer and author of each commit | **built** |
-| Restore and revert modes | `agentfs restore`, `revert`; `--dry-run`, `--force` | Through a running mount, through the history service, or directly with `--root` when nothing runs. Each is one commit. `run` serves none and the command exits 75 | **built** |
+| Restore and revert modes | `agentfs restore`, `revert`; `--dry-run`, `--force` | Through the history service, or directly with `--root` when nothing runs. Each is one commit. `run` serves none and the command exits 75 | **built** |
 | Checkpoint | `agentfs checkpoint`, `-m TEXT` | Cuts one commit per change intent on the change line | **built** |
 | Notify | `$GIT_DIR/hooks/patch-notify`; `agentfs.patchNotifyUrl`, `agentfs.patchNotifyCredentialFile`, `agentfs.patchNotifyTimeout` | One notice when the queue's verdicts change, after each queue run and each judging. A failure raises `NotifyFailed`, and the next queue event sends it again | **built** |
 | Apply | `agentfs patch apply`, `--no-fetch` | Lands waiting patches when nothing is attached. Under a running daemon it only judges, and each patch that would land is `ready` | **built**; landing into a running volume is **not built** |
 | Acceptance rule | `agentfs.patchAccept` = `cleanMerge` (default), `approval` (`agentfs patch approve N`) or `command` (`$GIT_DIR/hooks/patch-accept`); `agentfs.patchAcceptTimeout` | Whether a patch that merges cleanly may land | **built** |
 | Merge or rebase | `agentfs.patchIntegrate` = `merge` (default) or `rebase`; merge drivers from `$GIT_DIR/info/attributes` | How a patch is merged onto the head, by the `git` program. Either way it lands as one commit | **built** |
 | Which line a remote gets | `remote.<name>.agentfsPush` = `branch` (default) or `changeLine` | Every recorded commit, or only the checkpoints and the patches they merged | **built** |
+
+### 1.5 Tree volumes: the sidecar, Docker and the CLI
+
+What a tree volume builds, and what says so at boot when it does not. A
+`not built:` line names each configured key, one per key at every boot,
+with its capability (`push`, `patches`, `lfs`, `other`); the
+`agentfs.not_built{capability}` gauge counts them and `AgentfsNotBuilt`
+alerts on it ([operator settings](trees.md#operator-settings),
+[telemetry](telemetry.md)). A recording command run on a tree volume exits
+1 with ``error: `agentfs <command>` runs on the recording engine only;
+<state> is a tree volume, where it is not built yet``.
+
+| Value | Status on tree volumes | What says so |
+|---|---|---|
+| Operator rules: `info/exclude`, `-agentfs` in `info/attributes`, the untracked area | **built** ([trees](trees.md#rules-and-the-untracked-area)) | |
+| Operator settings as git-config includes (`init --include`) | **built** ([trees](trees.md#operator-settings)) | |
+| Restart in place after a crash (`--on-stale-mount recover`) | **built** ([trees](trees.md#restarting-after-a-crash)) | |
+| A command run in the mount (`mount ROOT -- COMMAND`) | **built** ([trees](trees.md#running-a-command-in-the-mount)) | |
+| Pushing to a remote (`[remote]`, `agentfs.pushInterval`, `agentfs.forkRefs`, `http.proxy`), and `push` | **not built**: history stays in the state area | `not built: remote.origin.url (push): this volume pushes to no remote yet; its history stays in the state area`; `agentfs.not_built{capability="push"}`; `push` and `status` refuse |
+| Patches (`agentfs.patch*`, `[agentfsPusher]`), `patch`, `serve-git` and patch notices | **not built**: queued patches are not applied | `not built: agentfs.patchremote (patches): queued patches are not applied`; `capability="patches"`; the commands refuse |
+| `restore` and `revert` | **not built** | the commands refuse; the history is plain git in `<state>/history.git` |
+| Git LFS (`agentfs.lfsThreshold`, `lfs.*`, `filter=lfs`) | **not built** | `capability="lfs"`; a `filter=lfs` rule refuses the volume, naming its line; `lfs` refuses |
+| Database groups (`agentfs.commit=fsync`, `agentfs.group`) and every other `agentfs.*` attribute | **not built** | the volume is refused at open, naming the line |
+| The sandbox overlay | **not built** | no launcher flag offers it |
+| Forked volumes, fork delivery, unlinked forks, hidden fork history | **not built**; a tree volume's own forks are built (section 1.2) | `fork create`, `fork deliver` and the other `fork` commands except `fork end` refuse; `agentfs.forkRefs` is logged as `push` |
+| Recording without a mount (`run`, `record`, `flush`) and checkpoints | **not built** | the commands refuse |
+| State areas on NFS | **not built** | not tested on tree volumes |
+| Every other key in the settings | **not built** | `capability="other"`: `tree volumes do not read this setting`. `agentfs.nested = exclude` is built and not listed |
 
 ## 2. Example configurations
 
@@ -140,7 +179,7 @@ on record and nothing leaving the host.
 
 | Dimension | Value |
 |---|---|
-| Integration point | filesystem (the agentfs container runs `agentfs mount`) |
+| Integration point | filesystem (the agentfs container runs `agentfs init` and `agentfs mount` on a tree volume) |
 | Sharing | one process, or several workload containers on one mount |
 | Remotes | none |
 
@@ -148,14 +187,14 @@ on record and nothing leaving the host.
 examples/docker/docker-run.sh up          # AGENTFS_CONFIG defaults to config/local: no [remote]
 examples/docker/docker-run.sh workload --name app --user 10000:10000 --cap-drop ALL \
   debian:trixie-slim sh -c 'echo hello > /agentfs/workspace/hello.txt; sleep infinity'
-docker exec agentfs-example git --git-dir /data/state/git log --format='%h %an %s' agentfs/example
+docker exec agentfs-example git --git-dir /data/state/history.git log --stat root
 ```
 
 - **The workload sees** an ordinary directory, `/agentfs/workspace`. It
   never sees the history, which is in a Docker volume only the agentfs
   container mounts ([docker.md](docker.md#2-the-layout)).
-- **History:** the branch `agentfs/example` in that Docker volume.
-  `agentfs status` says `remotes:   local-only (no remote)`.
+- **History:** the tree's branch `root` in `history.git` in that Docker
+  volume ([trees](trees.md)).
 - **Limits:** Linux with Docker Engine 25 or later; not Docker Desktop.
   The history is lost with the Docker volume unless it is backed up or a
   remote is added ([docker.md](docker.md#6-volumes-with-no-remote)).
@@ -167,16 +206,15 @@ repository.
 
 | Dimension | Value |
 |---|---|
-| Integration point | filesystem, packaged as the sidecar |
+| Integration point | filesystem, packaged as the sidecar (tree views) |
 | Sharing | one pod, one mount |
-| Remotes | one (GitHub); it is also the patch remote |
+| Remotes | one (GitHub): **not built** on tree volumes |
 
-`deploy/sidecar/config/config`, with the GitHub repository:
+`deploy/sidecar/config/config`, with the GitHub repository, which
+`init --include` makes one of the operator settings' includes
+([deployment.md](deployment.md#4-configuration)):
 
 ```ini
-[agentfs]
-	pushInterval = 60s
-
 [remote "origin"]
 	url = https://github.com/<owner>/<history repo>.git
 	agentfsCredentials = /run/secrets/agentfs/origin
@@ -184,14 +222,17 @@ repository.
 
 - **The workload sees** the FUSE mount in its container
   ([deployment.md](deployment.md#3-the-pod-piece-by-piece)).
-- **History:** `agentfs/<volume>` on GitHub, pushed every 60 s and at
-  shutdown within `--push-grace`. The credentials file holds a token
-  (or `username=` and `password=` lines) and is re-read when the Secret
-  rotates.
+- **History:** the branch `root` in `/data/state/history.git`, on the
+  pod's claim. Nothing reaches GitHub: pushing is **not built** on tree
+  volumes. Each boot logs `not built: remote.origin.url (push): this
+  volume pushes to no remote yet; its history stays in the state area`,
+  one line per remote key, and `agentfs.not_built{capability="push"}`
+  raises `AgentfsNotBuilt` for as long as the remote stays configured
+  (section 1.5).
 - **Limits:** a privileged sidecar
   ([deployment.md](deployment.md#9-security-trade-offs-of-the-privileged-sidecar));
-  one pod per volume. A failed push alarms and retries; recording carries
-  on.
+  one pod per volume. The recording engine pushes such a remote from a
+  CSI profile (example 4).
 
 ### Example 3: Hermes as the deploy example describes it
 
@@ -200,34 +241,29 @@ persona and profiles, whose configuration iac also changes.
 
 | Dimension | Value |
 |---|---|
-| Integration point | filesystem, as the sidecar |
+| Integration point | filesystem, as the sidecar (tree views) |
 | Sharing | several processes on one mount: Hermes and the docker-in-docker sidecar that runs its tool containers |
-| Remotes | one; it is the patch remote; iac is the patch producer |
-| Knobs | the Hermes rule files: an allowlist `exclude`, `-agentfs` on secrets, databases, sessions, logs and checkpoints; `agentfs.nested = exclude` |
+| Remotes | one; it is the patch remote; iac is the patch producer: pushing and patches **not built** on tree volumes |
+| Knobs | the Hermes rule files under `history.git/info`: an allowlist `exclude`, `-agentfs` on secrets, databases, sessions, logs and checkpoints |
 
 The files are in [`deploy/examples/hermes`](../deploy/examples/hermes),
 and the pod changes are in
-[deployment.md section 10](deployment.md#10-hermes). iac queues a change in its
-clone of the history repository, then restarts the pod:
-
-```sh
-agentfs patch submit --volume hermes --put config.yaml=./config.yaml -m "<why>"
-kubectl delete pod <hermes pod>
-```
+[deployment.md section 10](deployment.md#10-hermes).
 
 - **The workload sees** `/opt/data` as before. Tool containers see the
   same files when Hermes' `terminal.docker_volumes` passes the mount in.
-- **History:** the agent's edits to recorded paths, grouped by
-  `agentfs.commitWindow`; each applied patch as its own commit, authored
-  by the patch's author, with `Agentfs-Trigger: patch`.
-- **Limits:** patches apply only at a pod restart (deployment.md
-  [Restarts and patches](deployment.md#restarts-and-patches)); a restart
-  of the sidecar alone defers them to the next pod restart. A blocked
-  queue does not stop the pod; alert on `agentfs.patch.blocked`. Whether
-  tool containers get the mount is the deployment's policy choice; with
-  `terminal.docker_volumes` empty they still write their home into the
-  volume (never recorded). Check
-  the profile layout against the Hermes version you run.
+- **History:** the agent's edits to recorded paths, as saves on the
+  branch `root` in the state area. Secrets, databases, sessions and logs
+  live in the tree's untracked area and never reach history
+  ([trees](trees.md#rules-and-the-untracked-area)).
+- **Not built:** iac's patches and the push. A patch iac queues is not
+  applied; each boot logs `not built: agentfs.patchremote (patches):
+  queued patches are not applied` and a `push` line per remote key, and
+  `agentfs.not_built` raises `AgentfsNotBuilt` (section 1.5).
+- **Limits:** whether tool containers get the mount is the deployment's
+  policy choice; with `terminal.docker_volumes` empty they still write
+  their home into the volume (never recorded). Check the profile layout
+  against the Hermes version you run.
 
 ### Example 4: several pods on one CSI volume
 
@@ -350,13 +386,9 @@ Each volume's config names the same remote:
 	agentfsCredentials = /run/secrets/agentfs/origin
 ```
 
-```sh
-agentfs --state /data/a/state init --volume agent-a --include /etc/agentfs/config
-agentfs --state /data/b/state init --volume agent-b --include /etc/agentfs/config
-```
-
 Under CSI, the default `volumeName` template already makes each claim's
-name unique.
+name unique. Tree volumes (`agentfs init --volume agent-a`) push to no
+remote yet (section 1.5).
 
 - **Each workload sees** only its own volume.
 - **History:** `refs/heads/agentfs/agent-a` and `agentfs/agent-b`, with
@@ -408,7 +440,7 @@ or CI still opens the pull request.
 
 | Dimension | Value |
 |---|---|
-| Integration point | filesystem (`restore`, `revert`, over the control socket when a daemon runs) |
+| Integration point | filesystem (`restore`, `revert`, over the control socket when a daemon runs); on tree volumes **not built** |
 | Sharing | any |
 | Remotes | any; nothing is fetched |
 
@@ -424,16 +456,17 @@ kubectl -n agentfs-csi exec <node plugin pod> -c agentfs-csi -- \
   agentfs --state /var/lib/agentfs-csi/volumes/<pv>/state restore <path> <commit>
 ```
 
-- **The workload sees** the restored files at once when a mount or the
-  history service writes them.
+- **The workload sees** the restored files at once when the history
+  service writes them.
 - **History:** one commit per operation, `restore <path> from <id>` or
   `revert <id>: <subject>`, with `Agentfs-Trigger: restore` and the
   operator as author.
 - **Limits:** the commit must be on the volume's branch; a diverged ref
   is restored with plain git. A workload writing the same files can
   overwrite the restore (its writes are recorded too). While `agentfs run`
-  or `record` holds the volume, the command exits 75. Steps:
-  [recovery-and-undo.md](runbooks/recovery-and-undo.md).
+  or `record` holds the volume, the command exits 75. On a tree volume
+  (the sidecar, Docker, the CLI) both commands refuse, as not built.
+  Steps: [recovery-and-undo.md](runbooks/recovery-and-undo.md).
 
 ### Example 10: a CSI volume continued on another node
 
@@ -503,50 +536,18 @@ large files kept out of git.
   each remote needs an LFS server
   ([configuration](configuration.md#remote-name)).
 
-### Example 12: a sidecar with the sandbox overlay
+### Example 12: the sandbox overlay
 
-**For:** a workload that starts sandboxes through a container that
-starts other containers (for example a Docker daemon), where the
-sandboxes should see and change only the files that are recorded, and
-their changes should reach the workload at once.
-
-| Dimension | Value |
-|---|---|
-| Integration point | filesystem, packaged as the sidecar, with the sandbox overlay |
-| Sharing | one pod; one daemon serving two mount points (section 1.2) |
-| Remotes | any |
-| Knobs | `--sandbox-overlay`, `--sandbox-owner`; the operator's rules decide what the overlay shows |
-
-```sh
-kubectl apply -k deploy/examples/sidecar-sandbox-overlay
-# or, with the sidecar library chart: sandboxOverlay.enabled=true, sandboxOverlay.owner=<uid>:<gid>
-```
-
-The container that starts other containers mounts only the
-`agentfs-sandbox` `emptyDir`, and binds paths under
-`/agentfs-sandbox/overlay` into its sandboxes
-([deployment.md](deployment.md#12-the-sandbox-overlay)).
-
-- **The workload sees** the whole tree through the main mount, as in
-  example 2, and every change a sandbox makes to a recorded file as
-  soon as the call returns.
-- **A sandbox sees** only the recordable files and the directories that
-  could hold them; everything else answers "no such file". A file it
-  creates under a name the rules skip is a tmp file only sandboxes see,
-  never recorded, gone when the sidecar stops; renaming it onto a
-  recordable name records it there. Every operation is done as
-  the view owner, whatever user the sandbox runs as.
-- **History:** as example 2. Changes through the overlay are recorded
-  with the view owner as `Agentfs-Uid`. No tmp name reaches history.
-- **Restores and reverts** (example 9) check and settle the files open
-  through either mount point.
-- **Limits:** the boundary is for names only: a file a sandbox
-  holds open stays writable after it leaves view; volume-wide facts
-  leak; locks are not shared between the mounts. Sandboxes lose hard
-  links, creating symlinks, directory moves (`EXDEV`), WAL databases,
-  and `git init` and `git clone` through the overlay. It is not offered
-  under the CSI driver (example 4) or on fronts. Tested with FUSE mounts
-  in CI; the Component and the chart option only as rendered manifests.
+**Not built** on any launcher. The overlay is a second mount point that
+shows sandboxes only the files the rules would record, keeping other new
+files in a private tmp layer. Tree volumes do not build it, the sidecar's
+manifests and chart do not offer it, and the CSI driver's fronts never
+served it ([deployment.md](deployment.md#12-the-sandbox-overlay)). A
+program linking `agentfs-fuse` turns it on with `MountConfig::overlay`
+([library/filesystem](library/filesystem.md#the-sandbox-overlay)); what it
+covers and what it does not is in
+[guarantees](guarantees.md#the-sandbox-overlay), and the limits it would
+close are in [Overlay gaps](target-architecture/future/sandbox-overlay-gaps.md).
 
 ## 3. How to use this page
 
@@ -554,15 +555,17 @@ The container that starts other containers mounts only the
   it was written for. A change to how patches apply touches examples 3,
   5, 8 and 11; a change to the front protocol touches example 4 and
   every restore through the history service in example 9; a change to
-  the sandbox overlay touches examples 2, 9 and 12, and example 4 when
-  it is offered on fronts.
+  the sandbox overlay touches example 12, and example 4 when it is
+  offered on fronts. A change to tree volumes touches examples 1, 2 and 3
+  and section 1.5.
 - **Say which world the design lives in.** File semantics (locks,
   renames, caches) belong to section 1.2. Merging, order and gating
   belong to section 1.3. A design that needs both, such as landing a
   patch into a volume several pods use, must hold in both.
 - **Hermes combines several examples.** As deployed by the example it is
-  example 3 (several processes, iac patches) and can be example 8 (its
-  branch reviewed on GitHub). Receiving sandbox forks (example 5) and
+  example 3 (several processes; iac patches, not built on its sidecar)
+  and can be example 8 (its branch reviewed on GitHub, which needs a
+  push). Receiving sandbox forks (example 5) and
   forks of forks (example 6) use the patch queue.
 - **Never count an unbuilt value as available.** If a design needs a
   value marked **not built**, such as landing into a running volume, say

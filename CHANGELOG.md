@@ -27,6 +27,17 @@ design was reviewed on 2026-10-12.
   `docs/runbooks/upgrading-the-sidecar.md`); every recording command (`status`,
   `push`, `restore`, `run` and the rest) refuses a tree volume, saying it is not
   built yet.
+- **The sidecar, its chart, the Docker examples and Hermes run the tree
+  engine.** The sidecar's init container runs `agentfs init --include
+  /etc/agentfs/config`, and the sidecar mounts `/agentfs/workspace` with
+  `--on-stale-mount recover` and `--seal-mountpoint`; the rule files are
+  `history.git/info/exclude` and `info/attributes`, and there is no backing
+  tree. The Docker examples create the volume with `init --include --owner`
+  (no chown), and Hermes' migration Job copies the files in through `mount
+  -- COMMAND`. History is `/data/state/history.git`, branch `root`. A remote
+  or patch source in their settings is logged as not built at every boot.
+  `docs/runbooks/upgrading-the-sidecar.md` moves a recording volume onto a
+  tree volume, archiving the old state area.
 - **The CSI driver's front is `agentfs front --history-service`.** It was `mount
   --history-service`; the node plugin starts the new command with the same
   flags.
@@ -39,8 +50,21 @@ design was reviewed on 2026-10-12.
   `--sandbox-owner`; the fronts keep their own), `probe --sandbox-overlay`, and
   the recording `init` (`--branch`); the CSI driver creates its state areas
   itself.
+- The sandbox overlay's manifests: `deploy/examples/sidecar-sandbox-overlay`,
+  the sidecar chart's `sandboxOverlay` values and the overlay runbook. No
+  launcher offers the overlay.
+- The CI jobs that drove the standalone recording launcher: remotes over
+  HTTP, HTTPS and SSH, shared and failing remotes, LFS, patches, several
+  pods, NFS, SQLite, recovery, the runbooks, mergiraf, the Docker
+  restart-and-patch job, and the `bench.yml` and `power-loss.yml`
+  workflows. The recording engine stays covered as the CSI driver runs it.
 
 ### Added
+
+- **`AgentfsNotBuilt`.** An example alert rule, a warning while
+  `agentfs_not_built` counts a configured operator setting whose capability
+  tree volumes do not build yet, labelled by capability. The telemetry,
+  OTLP-transport and alerts checks run it against a tree mount.
 
 - **Tree views: launcher support.** A new tree volume records its root
   directory with the owner its launcher names (`VolumeSpec.root_owner`,

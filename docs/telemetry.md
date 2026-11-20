@@ -118,7 +118,7 @@ one of:
 Reads of hidden names are not counted: a hidden name answers like a
 missing one. A steady count usually means a sandbox's tool works in a
 way the overlay does not offer
-([runbook](runbooks/sandbox-overlay.md#a-sandbox-cannot-save)).
+([guarantees](guarantees.md#the-sandbox-overlay)).
 
 ## Spans
 

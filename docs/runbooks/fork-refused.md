@@ -9,6 +9,11 @@ retry can ever succeed. One function, `fork::finish::refused_reason`,
 decides which; those make the fork **refused**, and agentfs stops
 retrying it until an operator acts.
 
+Forked volumes are the recording engine's, which the CSI driver runs
+([forks](../forks.md)). A tree volume's forks land in their upstream as
+they save and are never refused this way
+([trees](../trees.md#forks-keys-end-and-the-drop)).
+
 Only a **linked** fork (the default, `agentfs.fork.link` unset) publishes,
 so only a linked one can be refused. A linked fork that cannot reach its
 source waits and alarms; it never delivers anywhere else, so the fixes

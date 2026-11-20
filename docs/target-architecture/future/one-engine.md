@@ -1,26 +1,28 @@
 # One engine: the tree views run the sidecar, CSI and CLI
 
-**Proposed; M1, M2 and M3 are built.** This page plans how agentfs goes from two engines to one: the tree views take over every
+**Proposed; M1, M2, M3 and M7 are built.** This page plans how agentfs goes from two engines to one: the tree views take over every
 launcher, and the recording engine is deleted. It is the system-level plan; each milestone below starts with its
 own architect and design gate, one layer down. M1 (volumes, clients, forks and their lifecycle on the tree views),
-M2 (directories, metadata and links) and M3 (operator rules and the untracked area) are built and described in
+M2 (directories, metadata and links), M3 (operator rules and the untracked area) and M7 (the `agentfs` binary's
+`init` and `mount`, so the sidecar, the Docker examples and the CLI) are built and described in
 [tree views](../../trees.md) and the [library](../../library/core.md#git-backed-tree-views). The commit that lands the last milestone (M9) deletes this page and
 moves the behaviour into the library and operator docs.
 
 ## Today
 
-Two engines ship. Every consumer runs the recording engine; the tree views are a trial that no consumer reaches.
+Two engines ship. The sidecar, the Docker examples and the CLI run the tree engine; the CSI driver runs the recording
+engine.
 
 ```text
- sidecar (deploy/sidecar, chart)  ─┐  agentfs init + mount     ┌─ agentfs trees init | mount | end    (trial CLI,
- Docker examples                  ─┤  (one launcher: the      │    hand-run, flat files, one host, no remote)
- CLI: push, patch, restore ...    ─┘   agentfs binary)        │            │
- CSI driver (agentfs-csi)  ──────────▶ RECORDING ENGINE        └─▶ TREE ENGINE  (git model, conformance, model)
-   (spawns the same binary: `mount --history-service`, `serve-history`)
+ sidecar (deploy/sidecar, chart)  ─┐  agentfs init, mount [-- COMMAND], fork end
+ Docker examples                  ─┤  (one launcher: the agentfs binary)  ─────────▶ TREE ENGINE
+ CLI                              ─┘                                                (git model, conformance, model)
+ CSI driver (agentfs-csi)  ──────────▶ agentfs serve-history, agentfs front  ─────▶ RECORDING ENGINE
+                                       (and the one-shot commands on its state areas: push, patch, restore ...)
 ```
 
-The end state: one engine, the tree views, behind every launcher. Nobody runs `agentfs trees init` by hand: each
-launcher builds a volume's spec from its configuration. The owner's guidance behind this plan is in
+The end state: one engine, the tree views, behind every launcher. Nobody builds a volume's spec by hand: each
+launcher builds it from its configuration, as `init` does from its flags. The owner's guidance behind this plan is in
 `OWNER-GUIDANCE.md` ("One engine").
 
 ## Goals and the step that delivers each
@@ -31,26 +33,26 @@ page's; "speed" is [save and take speed](save-and-take-speed.md).
 | End goal | Delivered by |
 |---|---|
 | A baseline build verified with a target application | [the baseline](#the-baseline), the plan's first acceptance point: the first Hermes deploy, on a CSI volume claim, after M3, M7 and M8 |
-| One engine | built: volumes and their lifecycle (M1); M7 and M8 (the launchers move), M9 (the recording engine is deleted) |
-| Nobody runs `trees init` by hand | built: `ensure` takes a `VolumeSpec` value, which the trial CLI builds from `trees init`'s flags (M1); M7 and M8 (each launcher calls `ensure`; `agentfs trees` folds into `init` and `mount`) |
+| One engine | built: volumes and their lifecycle (M1); the binary, so the sidecar, Docker and the CLI (M7, [tree views](../../trees.md#run-it)); M8 (the CSI driver moves), M9 (the recording engine is deleted) |
+| Nobody builds a volume's spec by hand | built: `ensure` takes a `VolumeSpec` value (M1); the binary's `init` builds it from its flags, and the sidecar and Docker from their configuration (M7); M8 (CreateVolume calls `ensure`) |
 | One volume that root and non-root processes both use (the problem ArtifactFS stalled on) | built: other users reach the tree mount (M1); modes and owners decide what each may do (M2) |
-| The launchers' speed holds | built: release-build figures against the tree-view budgets, `ci/trees-budget.json` (M1); speed (before M2, below); M7's gate |
+| The launchers' speed holds | built: release-build figures against the tree-view budgets, `ci/trees-budget.json` (M1); speed (before M2, below); M7's gate, the tracer's many-file step (`create`) gated in `ci/trees-budget.json` |
 | History knows the root by identity; no hardcoded `main` | module cut 5b |
 | Consumers configure the name the root is published under, and may change it | [Root branch name](root-branch-name.md), built in M4 (the publisher and its key) |
 | The trailer records meaningful information | built: which tree, by identity (5b), and where, the volume and the pod (M1) |
-| Configuration: iac and the agent both edit it (`AGENTS.md`, "What agentfs is for") | M6, after the first Hermes deploy; until it lands, a configured patch source raises a standing alarm and logs the gap (M7, M8) |
+| Configuration: iac and the agent both edit it (`AGENTS.md`, "What agentfs is for") | M6, after the first Hermes deploy; until it lands, a configured patch source raises a standing alarm and logs the gap: built for the binary (M7, [operator settings](../../trees.md#operator-settings)); M8 |
 | Audit; recording is the baseline (principle 1) | built (a write is journaled before it returns; power loss replayed by `phase-1.yml`; where, and the volume's own events as commits: M1; every kind of change recorded or refused loudly: M2; only operator rules and named built-ins skip a path: M3) |
 | Invisible and untouchable (principle 2) | built (state outside the mount; the untracked area, M3); M4 (credentials never in a view) |
-| Git idioms (principle 3) | built: `info/exclude`, `info/attributes` (M3); M7 (operator settings as a git-config include); M4 (the published name's key) |
+| Git idioms (principle 3) | built: `info/exclude`, `info/attributes` (M3); operator settings as a git-config include (M7, [operator settings](../../trees.md#operator-settings)); M4 (the published name's key) |
 | The right technology, recorded (principle 4) | M4 (the reused transports in architecture.md's "Technology choices"); M9 |
-| Keep operating (principle 5) | M4 (retry, divergence saved), M5 (alarms, liveness, restart in place, each of today's alerts and runbooks ported or dropped), both after the first Hermes deploy; until then M7 and M8 say what is not built with an alarm and a log line, never silently |
+| Keep operating (principle 5) | built: a view restarted after a crash stacks over its stale mount (M7, [restarting](../../trees.md#restarting-after-a-crash)); M4 (retry, divergence saved), M5 (alarms, liveness, each of today's alerts and runbooks ported or dropped), both after the first Hermes deploy; until then what is not built is said with the `agentfs.not_built` gauge, `AgentfsNotBuilt` and a log line, never silently (built for the binary, M7; M8) |
 | Any remote, or none (principle 6) | built: the mirror leaves the model's world (module cut 6), and zero remotes is a valid volume (M1); M4 |
-| History is the product (principle 7) | built: identity (5b), where (M1); M4 (never forced; a divergence is saved); M7 and M8 (old state areas archived, never deleted) |
+| History is the product (principle 7) | built: identity (5b), where (M1); old state areas refused at boot, archived and never deleted, by the [upgrading runbook](../../runbooks/upgrading-the-sidecar.md) (M7); M4 (never forced; a divergence is saved); M8 (CSI volumes) |
 | Recovery is manual but supported (principle 8); merging is an extra (principle 9) | M6 (restore, revert; patches at mount only, and `serve-git` as a patch source), after the first Hermes deploy |
 | Three layers; OpenTelemetry for everything observable (principle 10) | each milestone's library page; M5 (telemetry, and the recorder's engine source) |
 | The model stays the baseline proof | module cut 6 and 7; built: the tree engine's core tests on every PR ([CI tiers](#ci-tiers)) |
-| Old state formats are not supported | 5b (tree format 3); M7 and M8 (a recording state area is refused at boot) |
-| Extras that ship today (LFS, forks of forks, several pods on one volume, moving a volume, the fork overlay, `fork deliver`, unlinked forks and the rest) | Deferred: each is recorded with its home in [deferred extras](#deferred-extras), dropped at M9 until its slice lands |
+| Old state formats are not supported | 5b (tree format 3); built: `init` and `mount` refuse a recording state area, naming the runbook (M7); M8 (the CSI driver) |
+| Extras that ship today (LFS, forks of forks, several pods on one volume, moving a volume, the fork overlay, `fork deliver`, unlinked forks and the rest) | Deferred: each is recorded with its home in [deferred extras](#deferred-extras), marked "not built" for the sidecar, Docker and the CLI from M7 ([supported configurations](../../supported-configurations.md), section 1.5), dropped at M9 until its slice lands |
 
 ## The shape
 
@@ -106,7 +108,7 @@ A CSI fork claim's fork has one lifecycle owner, Trees: CreateVolume creates it 
 so a repeated CreateVolume finds the same fork, and DeleteVolume ends it by that key
 ([keyed forks](../../trees.md#forks-keys-end-and-the-drop), built). The launcher keeps no map of its own.
 
-The user-facing word for these is "fork". M7 renames "sandbox" in the binary (the tree CLI already says `--fork-mount`) and M8 in
+The user-facing word for these is "fork". The binary's tree commands say "fork" (`--fork-mount`; built, M7) and M8 renames "sandbox" in
 the CSI driver, its chart and [supported configurations](../../supported-configurations.md) (example 5's "sandbox
 claim" becomes a fork claim). Each milestone's gate decides the new spellings.
 
@@ -167,9 +169,9 @@ volume's name may change ([root branch name](root-branch-name.md), which M4 dele
 alert rules (`deploy/alerts/agentfs.rules.yml`: `AgentfsRecordFailed`, `AgentfsCommitsFailing`,
 `AgentfsRepackFailed`, `AgentfsReconcileFailed`, `AgentfsHistoryServiceUnreachable`, `AgentfsPushBacklogOld`,
 `AgentfsPushBacklogStale`, `AgentfsPushDiverged`, `AgentfsRemoteMisconfigured`, `AgentfsPatchQueueBlocked`,
-`AgentfsWorktreeHeuristic`, `AgentfsTelemetryExportFailing`) and 17 runbooks (`docs/runbooks/`: crashed sidecar,
+`AgentfsWorktreeHeuristic`, `AgentfsTelemetryExportFailing`; M7 added `AgentfsNotBuilt` for the tree mount) and 16 runbooks (`docs/runbooks/`: crashed sidecar,
 CSI recovery, divergence, fork refused, history rewrite, history service down, LFS storage, moving, patch queue,
-reconcile failed, recording failures, recovery and undo, sandbox overlay, start branch moved, stuck pushes,
+reconcile failed, recording failures, recovery and undo, start branch moved, stuck pushes,
 upgrading the sidecar, worktree heuristic) as ported or dropped, with the reason; a ported alert fires against the
 tree engine's own metrics in the alerts workflow's real Prometheus. A second PR series, which nothing later waits
 for, builds the recorder's engine source: agentfs-core's OpenTelemetry events feed the model's recorder
@@ -184,26 +186,31 @@ later, and comes after the first Hermes deploy ([the baseline](#the-baseline)).
 Its gate names its commands, among them the producer's `patch submit`, so that no command serves both engines.
 Gate: a full run.
 
-**M7. The `agentfs` binary moves.** The sidecar, the Docker examples and the CLI share one launcher, the binary's
-`init` and `mount`, so they move together. `agentfs trees` folds into `init` and `mount` and goes. The CSI driver
-spawns the same binary (`mount --history-service` and `serve-history`), so M7 cuts by entry point: the recording
-engine's two CSI entry points move to subcommands of their own, which only the CSI driver calls, and M7 edits the
-CSI launcher's call sites to match. Each entry point runs exactly one engine, and no flag selects one:
+**M7. The `agentfs` binary moves.** Built. The sidecar, the Docker examples and the CLI share one launcher, the
+binary's `init` and `mount`, on the tree engine; `agentfs trees` is gone ([tree views](../../trees.md#run-it)).
+`init --volume NAME [--include FILE]... [--owner UID:GID]` creates or finds a volume, recording its root with the
+owner given (`VolumeSpec.root_owner`); `mount ROOT` serves it with every former trial flag, `--on-stale-mount
+refuse|hold|recover` and `--seal-mountpoint` ([restarting](../../trees.md#restarting-after-a-crash)), and a trailing
+`-- COMMAND` that runs once every view is up and drains the mount when it exits
+([running a command](../../trees.md#running-a-command-in-the-mount)); `fork end --fork-key KEY` ends a keyed fork.
+Views mount as `agentfs:<volume>`, so `probe` sees them, and a view restarted after a crash stacks over its stale mount
+(`agentfs_fuse::stale`, shared with the recording mount). Operator settings are `<state>/config`, git-config
+`include.path` lines that `init --include` writes; each mount logs every key whose capability tree volumes do not
+build (`not built: <key> (<capability>): ...`), counts them in the `agentfs.not_built` gauge, and `AgentfsNotBuilt`
+alerts on it ([operator settings](../../trees.md#operator-settings)). The CSI driver spawns `agentfs serve-history`
+and `agentfs front` (the front was `mount --history-service`). Each entry point runs one engine, and no flag selects
+one: `init`, `mount` and `fork end` refuse `--root` and a recording state area, naming the
+[upgrading runbook](../../runbooks/upgrading-the-sidecar.md), and every recording command refuses a tree volume as not
+built. The sidecar's manifests and chart, the Docker examples and Hermes' pod ([deployment](../../deployment.md),
+[docker](../../docker.md)) run the tree engine; Hermes' migration Job copies the files in through `mount --
+COMMAND`. The sandbox overlay's manifests and flags are gone. The recording launcher's CI jobs are retired
+([costs](#costs)). Gate: the tracer's many-file step (`create`) is gated in `ci/trees-budget.json`.
 
-| Entry point | Before M7 | M7 to M8 | M8 to M9 |
+| Entry point | Before M7 | M7 to M8 (built) | M8 to M9 |
 |---|---|---|---|
-| `init`, `mount` | recording | tree | tree |
-| the CSI front (today `mount --history-service`) and `serve-history` | recording | recording, under their own names | not called; deleted at M9 |
-| the recording one-shot commands (`record`, `flush`, `push`, `checkpoint`, `run`, `patch`, `fork`, `lfs`, `start accept`, `restore`, `revert`) | recording | recording, on a recording state area only | the same; deleted at M9 |
-
-The `ci/` scripts that call `init` or `mount` (about two dozen) are repointed or deleted in M7. M7 does not wait for
-M4, M5 or M6, and says plainly what they have not built yet. Until M6 lands, a moved launcher whose configuration
-names a patch source (`agentfs.patchRemote` or any other `agentfs.patch*` key) starts and keeps the filesystem
-working (principle 5), logs the gap at every boot, and raises a standing alarm while it runs: patches are never
-silently not applied. A configured remote gets the same until M4 pushes to it. M7 also builds operator settings as a
-git-config include, their first owner being the launcher's configuration. M7 adds the migration runbook (below). Gate: the tracer's
-release-build many-file step within M1's tree budgets, run in CI before the merge; a miss holds the move. M7 also rewrites the migration Job of
-[deployment](../../deployment.md#10-hermes) (today `record` and `push`) to copy the files in through the mount.
+| `init`, `mount`, `fork end` | recording (`trees init`, `trees mount`, `trees end` the trial's) | tree | tree |
+| the CSI front and `serve-history` | recording (`mount --history-service`, `serve-history`) | recording: `front`, `serve-history` | not called; deleted at M9 |
+| the recording one-shot commands (`record`, `flush`, `push`, `checkpoint`, `run`, `patch`, `fork` but `end`, `lfs`, `start accept`, `restore`, `revert`, `status`) | recording | recording, on a recording state area only; a tree volume is refused | the same; deleted at M9 |
 
 **M8. The CSI driver moves.** CreateVolume calls `ensure`; publish attaches a view host; DeleteVolume asks Volume's
 release verdict, or for a fork claim ends its fork by key. Like M7, it does not wait for M4, M5 or M6, and says
@@ -232,10 +239,10 @@ What the deploy needs, and the milestone that gives it:
 | A volume created, or recovered, from the launcher's configuration | built (`ensure`, M1); M8 (CreateVolume calls it) |
 | The mount at the application's data path, used by root, by other users and by a docker-in-docker tools container | built (other users reach the mount, M1; directories, symlinks, modes and owners, M2) |
 | Rule files: what is recorded, and untracked paths (secrets, databases, sessions, logs) never in history | built (M3) |
-| The binary the CSI driver spawns runs the tree engine | M7 |
+| The binary the CSI driver spawns runs the tree engine | built: `init` and `mount` (M7); M8 (the driver calls them) |
 | A CSI volume claim on the tree engine | M8 |
 | The start-up speed the probes allow | M1's budgets; speed, if M1's figures miss them |
-| What is not built yet (push, alarms, patches) said with an alarm and a log line | M7, M8 |
+| What is not built yet (push, alarms, patches) said with an alarm and a log line | built for the binary (M7: `agentfs.not_built`, `AgentfsNotBuilt`, a `not built:` line per key); M8 |
 
 Only these come before it. M4, M5, M6, M9 and every [deferred extra](#deferred-extras) come after, or never block
 it.
@@ -243,7 +250,7 @@ it.
 Gate: hermes' `e2e (Hermes on kind, csi)` (`ci/e2e-hermes-kind.sh`) green on the tree engine: it records a tool
 container's edit, keeps secrets and databases out of history, and finds the log line and alarm for each gap. The
 sidecar and Docker jobs (image's `e2e (kind cluster)`, hermes' `sidecar` and `fence`, docker's
-`e2e (docker compose, upstream Hermes)`) move with M7.
+`e2e (docker compose, upstream Hermes)`) run the tree engine since M7.
 
 **M9. The recording engine is deleted.** Its domain logic and the passthrough FUSE layer go, with its patch queue and
 `serve-git` (rebuilt on trees by M6), its CSI entry points and one-shot commands, and every
@@ -260,7 +267,7 @@ goes; its deferred table moves to [the target architecture's index](../README.md
 ```
 
 The order serves the baseline, the first Hermes deploy (the owner, 2026-11-19: on a CSI volume claim, after M3, M7
-and M8; push, alarms and patches after it). M1, M2 and M3 are built.
+and M8; push, alarms and patches after it). M1, M2, M3 and M7 are built; M8 is next.
 
 - Step 6 is built before the plan's first milestone: its first slice moves the mirror out of `World`, which M4's
   publisher is checked against, and its transaction rules ride along because they were already in flight.
@@ -277,9 +284,9 @@ and M8; push, alarms and patches after it). M1, M2 and M3 are built.
   every goal its users rely on. M4, M5 and M6 are off M7's and M8's path: from each launcher's move until they land,
   it pushes to no remote, has no tree-engine alarms beyond the ones M7 and M8 raise for these gaps, applies no iac
   patches at mount, and has no `restore` or `revert`. Each gap is logged at boot and alarmed while it lasts, never
-  silent, and example 3 of [supported configurations](../../supported-configurations.md) is marked "not built". Each
-  [deferred extra](#deferred-extras) is marked "not built" in supported configurations from its launcher's move (M7
-  or M8) until its slice lands.
+  silent, and example 3 of [supported configurations](../../supported-configurations.md) is marked "not built" (built
+  for M7: its section 1.5 lists the binary's gaps). Each [deferred extra](#deferred-extras) is marked "not built" in
+  supported configurations from its launcher's move (M7 or M8) until its slice lands.
 - **Links to deleted pages.** The commit that deletes a plan page repoints every link to it: step 7's commit,
   which deletes the module cut, rewrites the references to its steps here and in
   [root branch name](root-branch-name.md) as the built behaviour's library pages; M4's commit, which deletes root
@@ -289,30 +296,31 @@ and M8; push, alarms and patches after it). M1, M2 and M3 are built.
 ## Deferred extras
 
 Every capability the recording engine ships that no milestone above rebuilds. None is needed for
-[the baseline](#the-baseline). Each goes dark when its launcher moves (M7 for the binary and the Docker examples,
-M8 for the CSI driver), is marked "not built" in [supported configurations](../../supported-configurations.md) from
-then, and is deleted with the recording engine at M9. Each returns as a slice of its own, from its home below; M9's
+[the baseline](#the-baseline). Each went dark for the binary, so for the sidecar, the Docker examples and the CLI, at
+M7, and is marked "not built" for them in [supported configurations](../../supported-configurations.md) (section
+1.5); it goes dark for the CSI driver at M8, and is deleted with the recording engine at M9. Each returns as a slice of its own, from its home below; M9's
 commit moves this table to [the target architecture's index](../README.md), so no row is lost with this page.
 
 | Capability | What it is | Who uses it today | Home | Until then |
 |---|---|---|---|---|
-| Git LFS | content over a threshold stored as LFS objects, uploaded beside each push | example 11; `cli_lfs.rs` | [Large and binary files](large-and-binary-files.md) | dropped at M9 until its slice lands |
-| Forks of forks | a fork of a linked fork, whose change rolls up through its parent | example 6; f8's `e2e-csi-fork-of-fork` | [Nested forks](nested-forks.md) | dropped at M9 until its slice lands |
+| Git LFS | content over a threshold stored as LFS objects, uploaded beside each push | example 11; `cli_lfs.rs` | [Large and binary files](large-and-binary-files.md) | not built on tree volumes from M7: a `filter=lfs` rule refuses the volume, and an `lfs` setting is logged and alarmed; the CSI driver keeps it until M8; dropped at M9 until its slice lands |
+| Forks of forks | a fork of a linked fork, whose change rolls up through its parent | example 6; f8's `e2e-csi-fork-of-fork` | [Nested forks](nested-forks.md) | `fork create` refuses a tree volume from M7; the CSI driver keeps it until M8; dropped at M9 until its slice lands |
 | Several pods on one volume | one history service per CSI volume, one front per pod | example 4; `history_service.rs`, image's `e2e-csi` | [The system](../system.md) (the "history service with view hosts" composition), [Views](../domains/views.md) | dropped at M9 until its slice lands; M8 refuses a second pod |
 | Moving a volume between nodes | a new volume on another node, started from the old one's branch, by the moving runbook | example 10; f8's `e2e-csi-move` | [Volume](../domains/volume.md) (the start point) | dropped at M9 until its slice lands |
 | `startFrom` and `start accept` | a CSI start class: a volume whose history begins at another volume's commit; `StartBranchMoved` while that branch moves | example 10; f8's `e2e-csi-move` | [Volume](../domains/volume.md) (`StartPoint::Line`, the start record) | dropped at M9 until its slice lands; only the empty start is built, and M8 refuses a start class |
-| The fork overlay | `mount --sandbox-overlay`: a second mount that shows a fork's workload only recordable files and keeps the rest in a private tmp layer | example 12; `crates/agentfs/tests/mount.rs`, the sidecar chart's overlay values | [The system](../system.md) (the overlay becomes a fork), [Overlay gaps](sandbox-overlay-gaps.md) | dropped at M9 until its slice lands |
-| `fork deliver` | a finished fork's change handed to a receiver as an inbox patch, a branch, a command or a webhook | example 8; `crates/agentfs/tests/cli_fork_deliver.rs` | [Fork delivery](fork-delivery.md) | dropped at M9 until its slice lands |
-| Unlinked forks | a fork that never delivers to its source and pushes only to its own remotes | example 5's `link: unlinked` class; `crates/agentfs/tests/cli_fork.rs`, `crates/agentfs-csi/tests/grpc.rs` | [Fork delivery](fork-delivery.md) | dropped at M9 until its slice lands; M8 refuses an unlinked class |
-| Recording without a mount | `agentfs run` (the commit and push loops with no mount), `record` and `flush` (named paths of the backing tree) | the recording engine's Rust tests (`cli_record.rs`, `cli_push.rs`) | [Recording without a mount](recording-without-a-mount.md) | dropped at M9 until its slice lands; M7 rewrites the migration Job and repoints the scripts |
-| Checkpoint and the change line | an integrator cuts one commit per change intent on `refs/agentfs/<volume>/change-line`; a remote may get only that line | `crates/agentfs/tests/cli_checkpoint.rs` | [Checkpoints and patch notices](integrator-hooks.md) | dropped at M9 until its slice lands |
-| Patch notices | the `patch-notify` hook and the `agentfs.patchNotifyUrl` webhook, sent when the queue's verdicts change | `cli_patch.rs` | [Checkpoints and patch notices](integrator-hooks.md) | dropped at M9 until its slice lands |
-| Database groups | `agentfs.commit=fsync` and `agentfs.group`: a database and its journal recorded whole at `fsync` | `cli_record.rs`, `cli_restore.rs` | [Open files and groups](files-open-groups.md) | dropped at M9 until its slice lands |
-| State areas on NFS | a CLI or sidecar state area on an NFS 4.1 export, its lock reaching other clients | nothing in CI | [State on NFS](state-on-nfs.md) | dropped at M9 until its slice lands |
-| Hidden fork history | `agentfs.forkRefs = hidden`: a fork's history outside `refs/heads/`; whether a forge runs CI on it is not verified | supported configurations, "Remote topology" | [Forge CI on hidden refs](forge-ci-on-hidden-refs.md) | dropped at M9 until its slice lands |
+| The fork overlay | the sandbox overlay (`mount --sandbox-overlay` until M7): a second mount that shows a fork's workload only recordable files and keeps the rest in a private tmp layer | example 12; `crates/agentfs-fuse/src/overlay/tests.rs` | [The system](../system.md) (the overlay becomes a fork), [Overlay gaps](sandbox-overlay-gaps.md) | offered by no launcher from M7: its flags, manifests and chart values are deleted; `agentfs-fuse` keeps it until M9; dropped at M9 until its slice lands |
+| `fork deliver` | a finished fork's change handed to a receiver as an inbox patch, a branch, a command or a webhook | example 8; `crates/agentfs/tests/cli_fork_deliver.rs` | [Fork delivery](fork-delivery.md) | the CSI driver's forked volumes only from M7; dropped at M9 until its slice lands |
+| Unlinked forks | a fork that never delivers to its source and pushes only to its own remotes | example 5's `link: unlinked` class; `crates/agentfs/tests/cli_fork.rs`, `crates/agentfs-csi/tests/grpc.rs` | [Fork delivery](fork-delivery.md) | `fork create` refuses a tree volume from M7; dropped at M9 until its slice lands; M8 refuses an unlinked class |
+| Recording without a mount | `agentfs run` (the commit and push loops with no mount), `record` and `flush` (named paths of the backing tree) | the recording engine's Rust tests (`cli_record.rs`, `cli_push.rs`) | [Recording without a mount](recording-without-a-mount.md) | `run`, `record` and `flush` refuse a tree volume from M7, and the migration Job copies through `mount -- COMMAND`; dropped at M9 until its slice lands |
+| Checkpoint and the change line | an integrator cuts one commit per change intent on `refs/agentfs/<volume>/change-line`; a remote may get only that line | `crates/agentfs/tests/cli_checkpoint.rs` | [Checkpoints and patch notices](integrator-hooks.md) | `checkpoint` refuses a tree volume from M7; dropped at M9 until its slice lands |
+| Patch notices | the `patch-notify` hook and the `agentfs.patchNotifyUrl` webhook, sent when the queue's verdicts change | `cli_patch.rs` | [Checkpoints and patch notices](integrator-hooks.md) | not built on tree volumes from M7: a patch setting is logged and alarmed; dropped at M9 until its slice lands |
+| Database groups | `agentfs.commit=fsync` and `agentfs.group`: a database and its journal recorded whole at `fsync` | `cli_record.rs`, `cli_restore.rs` | [Open files and groups](files-open-groups.md) | not built on tree volumes from M7: the attributes refuse the volume, naming the line; dropped at M9 until its slice lands |
+| State areas on NFS | a CLI or sidecar state area on an NFS 4.1 export, its lock reaching other clients | nothing in CI | [State on NFS](state-on-nfs.md) | not built on tree volumes from M7; dropped at M9 until its slice lands |
+| Hidden fork history | `agentfs.forkRefs = hidden`: a fork's history outside `refs/heads/`; whether a forge runs CI on it is not verified | supported configurations, "Remote topology" | [Forge CI on hidden refs](forge-ci-on-hidden-refs.md) | not built on tree volumes from M7: `agentfs.forkRefs` is logged and alarmed as `push`; dropped at M9 until its slice lands |
 | A fork of a claim in use | a fork claim whose source a pod is writing; Kubernetes may one day refuse such a clone | image's `e2e-csi-forks` | [Clone in use](clone-in-use.md) | not dropped: M8's fork claims are clones too, so the page stays and applies to them |
 
-Each row's CI job or test goes with the recording engine at M9 and returns with its slice.
+Each row's CI job or test goes with the recording engine at M9 and returns with its slice. The CI jobs that drove the
+standalone recording launcher went at M7, because no recording `init` remains ([costs](#costs)).
 
 ## CI tiers
 
@@ -323,44 +331,33 @@ for the full sweep once before it merges (its "full run").
 
 ## Existing recording volumes
 
-A recording state area is refused at boot by the format check (`FormatsOf`, [the system](../system.md)); there is no
-converter. M7 adds the move to the upgrading runbook ([upgrading the sidecar](../../runbooks/upgrading-the-sidecar.md)),
-and every step is required:
+Built for the binary (M7): `init` and `mount` refuse a recording state area and name the
+[upgrading runbook](../../runbooks/upgrading-the-sidecar.md), which pushes the backlog, archives the old state area
+(never deleted) and copies the files in through the new mount. There is no converter. What the new root's first push
+meets on a remote that holds the old branch depends on M4's prefix, which M4's gate checks.
 
-1. **Push.** With the old binary, push the backlog and check that every remote holds the head. A volume with no
-   remote skips this.
-2. **Archive the old state area.** Keep it, moved aside or copied out, never deleted. Its git directory stays
-   readable with plain git (`git --git-dir <archive>/git log`), also after M9, when agentfs can no longer open it.
-   For a volume with no remote, or with history its remotes lack, the archive is the only copy of its audit trail.
-3. **Copy the files in.** Create the volume from configuration and copy the files in through its mount, as
-   [deployment](../../deployment.md)'s migration Job does, so the copy is the new root's first save.
-
-The old history stays on its remotes under `refs/heads/agentfs/<volume>`. What the new root's first push meets
-there depends on M4's prefix. Under a prefix that publishes the root at that same ref, the push is not a
-fast-forward: Replication saves it as a divergence and raises an alarm, never overwrites. Under a prefix that nests
-refs beneath it (`agentfs/<volume>/…`), git refuses the push as a ref name conflict: an alarmed, retried push
-failure, which M4's gate checks. Under a prefix built from the UUID, nothing meets the old ref, and both histories
-stand side by side without an alarm. The runbook advises a published name that meets nothing.
-
-**CSI volumes.** Before the driver is upgraded to M8, each recording-format volume is pushed and archived (steps 1
-and 2, in its node's directory). After the upgrade, a new claim on a tree-engine class gets the files from the
-archive (`git archive` of the old branch's head, unpacked through the new mount). A recording-format volume is never
-staged by M8's driver; deleting its claim keeps its directory, whatever `onDelete` says, and raises an alarm naming
-it, so the operator archives it before removing it by hand.
+**CSI volumes (M8).** Before the driver is upgraded to M8, each recording-format volume is pushed and archived, in its
+node's directory. After the upgrade, a new claim on a tree-engine class gets the files from the archive (`git archive`
+of the old branch's head, unpacked through the new mount). A recording-format volume is never staged by M8's driver;
+deleting its claim keeps its directory, whatever `onDelete` says, and raises an alarm naming it, so the operator
+archives it before removing it by hand.
 
 ## Tracer
 
 Built: `image.yml`'s `trees-tracer` job runs `ci/e2e-trees-tracer.sh` on the shipped image, in the sidecar's and the
-Docker example's shape: `agentfs trees init` and `agentfs trees mount` in an agentfs container and an unprivileged
-workload container. Its steps are `ensure` and its refusal of another name, a save by another user with its "where"
-trailers, a kill mid-write and a restart in place, and the release figures against the tree budgets. M7 changes
-only the two commands' names.
+Docker example's shape: `agentfs init` and `agentfs mount` in an agentfs container and an unprivileged workload
+container. Its steps are `ensure` and its refusal of another name, a save by another user with its "where" trailers, a
+kill mid-write and a restart in place, and the release figures against the tree budgets, the many-file step (`create`)
+gated.
 
 Each milestone adds its step. Built for M2: a directory, an executable bit and a chown through the mount. Built for
 M3: with `*.db` and `.env` marked `-agentfs`, the workload's `state.db` and `.env` work through the mount, survive a
-restart, and never reach history. To come: M4 a refusing remote (the filesystem keeps working), then a push under a configured name; M5 the alarm at
-a collector; M6 a producer's patch at the next mount and a `restore`; M7 the same steps through the sidecar on kind,
-and the patch-source alarm while M6 is not built; M8 a CSI volume and a fork claim. Not covered: several pods, LFS,
+restart, and never reach history. Built for M7: the same steps through the sidecar on kind (`ci/e2e-kind.sh`), and
+the `not built:` line for the configured remote at every boot, with nothing reaching the git server (Hermes' kind
+jobs check the patch source's line too; `ci/e2e-telemetry.sh` and `ci/e2e-alerts.sh` the `agentfs.not_built` gauge).
+To come: M4 a refusing
+remote (the filesystem keeps working), then a push under a configured name; M5 the alarm at a collector; M6 a
+producer's patch at the next mount and a `restore`; M8 a CSI volume and a fork claim. Not covered: several pods, LFS,
 database groups, nested forks, transactions, upgrades.
 
 ## Design rules (design choices)
@@ -385,7 +382,19 @@ database groups, nested forks, transactions, upgrades.
   Under a prefix built from the UUID it publishes a parallel history beside the old one, with no alarm.
 - Old state areas are archived, not converted: an operator keeps them, and their disk, as long as the audit trail
   is wanted.
-- M7 repoints or deletes about two dozen `ci/` scripts and renames the CSI driver's two recording entry points.
+- M7 retired the recording launcher's CI: the scripts and jobs that drove a standalone recording `init` and `mount`
+  (remotes over HTTP, HTTPS and SSH, shared and failing remotes, LFS, patches, several pods, NFS, SQLite, recovery,
+  the runbooks, mergiraf, the Docker restart-and-patch job, the recording benchmarks and power loss), because no
+  recording `init` remains to create their state areas and a second one would be a dual path. The recording engine
+  stays covered as the CSI driver runs it: the agentfs-csi tests, `csi_service.rs`, `crash_daemon.rs`, image's CSI
+  job, f8 and hermes' `csi` job, and the one-shot commands' Rust tests, which create their state areas through the
+  library. Push, patches, LFS, NFS, several pods, database groups, recording power loss and the recording benchmarks
+  have no shell end-to-end test until their slices return.
+- A sidecar stopped alone while a `subPath` consumer (Hermes) holds the mount drains, unmounts its view and answers
+  the bind's writes with `EROFS`, but exits only when it is killed (the kubelet's kill after the pod's grace, or
+  `kill -9`); the consumer's bind then fails with `ENOTCONN` until its liveness probe restarts it onto the restarted
+  mount ([deployment](../../deployment.md#7-a-crashed-daemon)).
+  No shutdown grace or connection abort is added: either would be a timer in place of an event.
 - One page to write: CSI on trees (M8).
 - M2's new model rules ran on their scenarios and on the conformance replay of those scenarios on the library and on
   mounts, at the regression tier; the random runs do not make their calls. The full model sweep was the owner's call,
@@ -399,7 +408,7 @@ database groups, nested forks, transactions, upgrades.
   2026-11-12 pushes: ci 9 to 13 min and image 5 to 10 min wall, side by side; with helm, f8 and docs, about 25 to
   30 runner-min per pushed commit. Step 7 adds one or two model gates after the
   baseline. From M2 to M8: full runs where save or land logic changes (expected: speed, M6) and short runs elsewhere (M4, M5, M7, M8), the tracer job (about
-  ten minutes in `image.yml`) and both engines' jobs in ci until M9. The core tier ([CI tiers](#ci-tiers)) adds about
+  ten minutes in `image.yml`) and the recording engine's CSI jobs until M9. The core tier ([CI tiers](#ci-tiers)) adds about
   20 min wall, side by side with ci, and about 41 runner-min to every PR push and every push to `main`; the
   randomized shards cost only when triggered. The counts are estimates.
 - Not planned: a converter, an engine flag, mirror-back (pull requests from a forge into the root).

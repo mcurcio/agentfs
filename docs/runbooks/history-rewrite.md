@@ -11,6 +11,12 @@ replaced, by an operator, and only through that command: no runbook
 `git push`es a branch (a test, `runbooks_push_only_the_namespace`,
 holds them to refs under `refs/agentfs/`).
 
+This procedure is for the recording engine's volumes, which the CSI driver
+runs ([csi.md](../csi.md#9-operations)). A tree volume (the sidecar, the
+Docker examples and `agentfs mount`) keeps its history in
+`<state>/history.git` and pushes it nowhere yet; this runbook does not
+cover rewriting it.
+
 If the volume has forks ([forks](../forks.md)), read
 [Forks](#forks) before you start: two of its steps come between steps 2
 and 3, and one after step 9.
@@ -18,8 +24,8 @@ and 3, and one after step 9.
 Throughout:
 
 ```sh
-STATE=/data/state                    # the state area
-BACKING=/data/backing                # the backing tree
+STATE=/var/lib/agentfs-csi/volumes/<pv>/state     # the state area
+BACKING=/var/lib/agentfs-csi/volumes/<pv>/backing # the backing tree
 VOL=demo                             # the volume
 BRANCH=refs/heads/agentfs/$VOL
 SECRET_PATH=config/.env              # the recorded file, relative to the tree
@@ -37,9 +43,10 @@ before anything else.
 
 ## 1. Stop the workload and agentfs, and commit everything
 
-Stop the workload and the daemon (`agentfs mount` or `agentfs run`; in
-Kubernetes, scale the workload to zero and run the rest from a one-off
-pod with the volume's PVC). Then commit whatever is journaled and check
+Stop the workload and the daemon (`agentfs serve-history` and its fronts,
+or `agentfs run`; under the CSI driver, scale the workload to zero so the
+volume is unstaged, and run the rest in the node plugin pod of its node,
+[csi.md](../csi.md#9-operations)). Then commit whatever is journaled and check
 that nothing is left:
 
 <!-- ci: rewrite-flush -->

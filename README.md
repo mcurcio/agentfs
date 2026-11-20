@@ -28,11 +28,12 @@
 
 agentfs sits in front of an ordinary directory as a FUSE filesystem. Any
 process, root or not, uses the directory with normal file calls and never
-sees git. Each time a file is closed after a change, or renamed, deleted
-or linked, agentfs durably records the new state before the call returns.
-It commits those states to a git branch and pushes the branch to any git
-remotes you name. The history lives outside the mount, where the
-workload cannot see or change it.
+sees git. Every change is journaled before the call returns and becomes
+a commit on a git branch. The history lives outside the mount, where the
+workload cannot see or change it. The sidecar, the Docker examples and
+the CLI run agentfs's tree views; the CSI driver runs its recording
+engine, which also pushes the history to git remotes and applies patches
+queued from outside.
 
 ## Why
 
@@ -52,7 +53,7 @@ Snapshots miss what happens between them, a git repository in the
 directory is visible to (and can be broken by) the workload, and
 overwriting from outside destroys local changes. agentfs records at the
 filesystem boundary instead, into history kept beside the directory, and
-applies queued patches when the volume mounts. Its first consumer is an
+its recording engine applies queued patches when the volume starts. Its first consumer is an
 AI agent's configuration on Kubernetes
 ([`deploy/examples/hermes`](deploy/examples/hermes)), but nothing in it
 is specific to agents: any workload whose directory should carry an
@@ -60,49 +61,58 @@ audit trail can use it.
 
 ## Features
 
-- **Recorded before return.** Each change boundary (a close after a
-  change, a rename, delete, link or `chmod +x`) is journaled durably
-  before the call returns; commits follow within `agentfs.commitWindow`.
-  A recording failure fails the call loudly ([guarantees](docs/guarantees.md#recording-comes-first)).
+agentfs has two engines. The **tree views** are what the sidecar, the
+Docker examples and the CLI's `agentfs init` and `agentfs mount` run
+([tree views](docs/trees.md)). The **recording engine** is what the CSI
+driver runs ([CSI driver](docs/csi.md)).
+
+On every launcher:
+
+- **Recorded before return.** Every change is journaled before the call
+  returns; a recording failure fails the call loudly
+  ([guarantees](docs/guarantees.md#recording-comes-first)).
 - **Invisible and untouchable.** History, journal, state and credentials
   live in a state area outside the mount ([guarantees](docs/guarantees.md#threat-model)).
-- **Any user.** Root and non-root processes share one volume with normal
-  permissions; with the daemon running as root, new files belong to the
-  user who created them ([operator guide](docs/operator-guide.md#1-requirements)).
-- **Git idioms for rules.** `.gitignore`, `.gitattributes`, `.lfsconfig`,
-  `$GIT_DIR/info/*` and git-config syntax; nested repositories are
-  excluded by default ([recording](docs/recording.md#which-paths-are-recorded)).
-- **Any remote, several, or none.** Local paths, `file://`, `http(s)://` with a
-  token file, and SSH with verified host keys. Pushes are fast-forward
-  only and never forced; a divergence is saved and raises an alarm
-  ([remotes](docs/remotes.md)). Remotes can come
-  and go: a volume with none is local-only, not an error, and a remote
-  added later gets all its history.
-- **Git LFS** for large files, uploaded before the commits that use them
-  ([configuration](docs/configuration.md#git-lfs)).
-- **Databases.** SQLite and other files changed in place are captured
-  whole, as a crash would leave them
-  ([operator guide](docs/operator-guide.md#14-databases-the-fsync-class)).
-- **A patch queue.** Producers queue single-commit patches on the remote;
-  each mount applies them in order before anything sees the tree
+- **Any user.** Root and non-root processes share one volume, each entry
+  with its recorded owner and mode, checked by the kernel.
+- **Git idioms for rules.** The operator's `$GIT_DIR/info/exclude` and
+  `info/attributes` decide what is recorded; nested repositories are
+  excluded ([tree views](docs/trees.md#rules-and-the-untracked-area),
+  [recording](docs/recording.md#which-paths-are-recorded)).
+- **Kubernetes and Docker.** A privileged native sidecar, Docker and
+  Compose examples, and a CSI driver that gives unprivileged pods agentfs
+  volumes as claims; kustomize bases and Helm charts.
+- **Observable.** OpenTelemetry, with example Prometheus alert rules
+  that link their runbooks ([telemetry](docs/telemetry.md)).
+
+On tree volumes (the sidecar, Docker, the CLI):
+
+- **Untracked files that work.** Secrets, SQLite databases, sessions and
+  logs the rules leave out are ordinary Linux files in the tree's
+  untracked area, never in history.
+- **Forks.** A fork mount whose saves land in the root as they save,
+  with every collision decided by written rules
+  ([tree views](docs/trees.md#forks-keys-end-and-the-drop)).
+- **Restart in place.** A mount restarted after a crash stacks over the
+  stale mount its predecessor left
+  ([tree views](docs/trees.md#restarting-after-a-crash)).
+- **Said, never silent.** A configured remote, patch source or other
+  setting tree volumes do not build yet is logged at every boot and
+  alarmed by the `agentfs.not_built` gauge
+  ([operator settings](docs/trees.md#operator-settings)).
+
+On the recording engine (the CSI driver):
+
+- **Any remote, several, or none.** Local paths, `file://`, `http(s)://`
+  with a token file, and SSH with verified host keys; fast-forward only,
+  never forced, a divergence saved and alarmed ([remotes](docs/remotes.md)).
+- **A patch queue** applied in order before anything sees the tree
   ([patches](docs/patches.md)).
 - **Recovery.** `agentfs restore` and `agentfs revert`, each recorded as
-  one commit, and a runbook for every failure mode
-  ([operator guide](docs/operator-guide.md#12-recovery-and-undo)).
-- **Forked volumes.** A sandbox works on a copy of a volume and publishes
-  one reviewable change ([forks](docs/forks.md)).
-- **The sandbox overlay.** A second mount point that shows sandboxes
-  only the recordable files; their edits reach the main mount at once
-  ([guarantees](docs/guarantees.md#the-sandbox-overlay)).
-- **Several pods, one volume.** A history service with one front per pod
-  on one node, each pod committing as itself
-  ([operator guide](docs/operator-guide.md#16-several-mounts-of-one-volume-history-service)).
-- **Kubernetes.** A privileged native sidecar, or a CSI driver that gives
-  unprivileged pods agentfs volumes as claims; both as kustomize bases and
-  Helm charts.
-- **Observable.** OpenTelemetry metrics, traces and logs, with example
-  Prometheus alert rules that link their runbooks
-  ([telemetry](docs/telemetry.md)).
+  one commit ([operator guide](docs/operator-guide.md#12-recovery-and-undo)).
+- **Git LFS, databases recorded whole, forked volumes, and several pods
+  on one volume** ([operator guide](docs/operator-guide.md),
+  [forks](docs/forks.md)).
 
 ## Quick start
 
@@ -201,34 +211,32 @@ The steps, the pod piece by piece and the security trade-offs:
 ```mermaid
 flowchart LR
   W["workload processes<br/>(any user)"] -- "open, write, close,<br/>rename, unlink" --> M["mount point<br/>(FUSE)"]
-  M --> A["agentfs"]
-  A -- "file calls" --> B[("backing tree<br/>the real files")]
-  A -- "record before<br/>the call returns" --> J[("state area: journal<br/>and frozen copies")]
-  J -- "commit" --> H[("git history<br/>branch agentfs/VOLUME")]
-  H -- "push: fast-forward only" --> R[("git remotes")]
-  P["producers<br/>(iac, operators, CI)"] -- "agentfs patch submit" --> R
-  R -. "patch queue,<br/>applied at mount" .-> A
+  M --> A["agentfs mount<br/>(tree views)"]
+  A -- "journal before<br/>the call returns" --> J[("state area:<br/>journal")]
+  J -- "build behind<br/>the calls" --> H[("history.git<br/>branch root")]
+  A -- "untracked names" --> U[("untracked area")]
 ```
 
-1. A workload uses the mount like any directory. agentfs passes each call
-   through to the backing tree, a real directory, with kernel passthrough
-   for files opened read-only where the kernel allows it.
-2. At each change boundary agentfs freezes the file's content (a reflink,
-   else a copy) and journals the change in the state area before the call
-   returns.
-3. A commit loop turns journaled changes into commits on the volume's
-   branch, `agentfs/<volume>`: the writing user is the author, the pod
-   the committer, and trailers name the trigger and the pod.
-4. One push loop per remote pushes the branch, fast-forward only. A
-   failing remote raises an alarm and retries; the filesystem keeps
-   working.
-5. At mount, before anything sees the tree, agentfs fetches the patch
-   queue from the remote and applies each patch as one commit.
+1. `agentfs init` creates the volume in its state area; `agentfs mount`
+   serves its root, and optionally a fork, on empty directories.
+2. Every call that changes a recorded file is journaled before it
+   returns; a close, `fsync` or directory `fsync` makes it power-cut
+   safe ([tree views](docs/trees.md#recording-and-durability)).
+3. A builder turns journaled saves into commits on the tree's branch in
+   `history.git` (`root`, or `fork/<n>`), with trailers that name the
+   writer, the tree, the volume and the pod.
+4. Names the operator's rules leave out live in the tree's untracked
+   area, merged into the view and never in history.
+5. A fork's saves land in its upstream, and the upstream's flow back.
 
-The workload never sees the state area. Under the CSI driver, a history
-service owns each volume's state area and every pod's mount is a front
-that hands it the changes. The full model: [docs/architecture.md](docs/architecture.md),
-[docs/recording.md](docs/recording.md) and [docs/guarantees.md](docs/guarantees.md).
+Tree volumes push to no remote and apply no patches yet. Under the CSI
+driver the recording engine runs instead: a history service owns each
+volume's state area, every pod's mount is a front that hands it the
+changes, and it commits them to `agentfs/<volume>`, pushes that branch to
+the profile's remotes and applies the patch queue at its start
+([recording](docs/recording.md), [csi.md](docs/csi.md)). The full model:
+[docs/architecture.md](docs/architecture.md) and
+[docs/guarantees.md](docs/guarantees.md).
 
 ## Documentation
 
@@ -237,11 +245,12 @@ The documentation is published at <https://mcurcio.github.io/agentfs/>;
 
 | Document | For |
 |---|---|
-| [Operator guide](docs/operator-guide.md) | Running `agentfs mount`: requirements, layout, flags, lifecycle, recovery, troubleshooting |
+| [Tree views](docs/trees.md) | What the sidecar, Docker and the CLI run: `init`, `mount`, operator settings, restarts, forks |
+| [Operator guide](docs/operator-guide.md) | Running the recording engine under the CSI driver: requirements, layout, flags, lifecycle, recovery, troubleshooting |
 | [Docker](docs/docker.md), [Kubernetes sidecar](docs/deployment.md), [CSI driver](docs/csi.md), [Helm](docs/helm.md) | Deploying it |
 | [Configuration](docs/configuration.md) | Every setting, attribute, flag and environment variable |
 | [Runbooks](docs/README.md#runbooks) | One procedure per failure mode |
-| [Guarantees](docs/guarantees.md), [Recording](docs/recording.md), [Remotes](docs/remotes.md) | What agentfs promises, what it records and when, and how it pushes |
+| [Guarantees](docs/guarantees.md), [Recording](docs/recording.md), [Remotes](docs/remotes.md) | What agentfs promises, what the recording engine records and when, and how it pushes |
 | [Library](docs/library/core.md) | Building on `agentfs-core`, `agentfs-fuse` and `agentfs-csi` |
 | [Architecture](docs/architecture.md) | The crates and modules, and how a change flows through them |
 
@@ -253,22 +262,20 @@ passes its tests, and the Helm charts as `<version>-main.<run>`.
 
 | Area | State |
 |---|---|
-| Recording, commits, push to any remote, path rules, recovery, OpenTelemetry, the Kubernetes sidecar | Built, tested end to end in CI including a kind cluster |
-| Git LFS, databases (the `fsync` class) | Built |
-| The patch queue | Built |
-| Several pods on one volume, and the CSI driver | Built: one node per volume, its worktree on that node's disk; moving is a new volume started from its branch |
-| Forked volumes, linked (delivering their change back to the source) or unlinked (independent, pushing only to remotes of its own, or local-only) | Built ([forks](docs/forks.md)) |
+| Tree views behind the sidecar, the Docker examples and the CLI (`init`, `mount`, `fork end`): recording, directories, links, owners and modes, operator rules and the untracked area, forks, restart after a crash, the not-built alarm | Built, tested end to end in CI including a kind cluster and upstream Hermes |
+| On tree volumes: push, the patch queue, `restore` and `revert`, telemetry beyond the not-built gauge, LFS, database groups, forked volumes and the sandbox overlay | Not built: each configured setting is logged at every boot and alarmed ([supported configurations](docs/supported-configurations.md#15-tree-volumes-the-sidecar-docker-and-the-cli)) |
+| The CSI driver, on the recording engine: push to any remote, path rules, the patch queue, recovery, Git LFS, databases, forked volumes, several pods on one volume | Built: one node per volume, its worktree on that node's disk; moving is a new volume started from its branch |
+| The CSI driver on tree views | Not built |
 | Docker examples, Helm charts, example alert rules | Built and tested in CI |
-| Node-local worktrees, one branch each, with any remote as the backend | Built (CSI driver) |
-| Local-only volumes (no remote section), whose forks publish into their own history | Built ([configuration](docs/configuration.md#remotes-modes)) |
 | Several nodes writing one volume | Not supported: a volume has one node ([CSI driver](docs/csi.md)) |
 
 The measured costs and performance budget are in [docs/performance.md](docs/performance.md).
 Designs for work that is not built are in
 [docs/target-architecture](docs/target-architecture/README.md).
-Known limits: LFS over SSH needs a server with `git-lfs-authenticate`;
-proxies are plain `http://` proxies without authentication; restoring a
-database needs its workload stopped.
+Known limits of the recording engine: LFS over SSH needs a server with
+`git-lfs-authenticate`; proxies are plain `http://` proxies without
+authentication; restoring a database needs its workload stopped. The
+tree views' limits are in [docs/trees.md](docs/trees.md#limits).
 
 ## Contributing
 

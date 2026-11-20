@@ -4,9 +4,14 @@ agentfs records every change a workload makes to a directory, in git history
 the workload cannot see. This page says what that promises, what it does not,
 and which test backs each claim. A claim with no test named says so.
 
+agentfs has two engines. The recording engine is what the CSI driver runs; most
+of this page is about it. The sidecar, the Docker examples and the CLI's
+`agentfs init` and `agentfs mount` run tree views, whose promises are under
+[tree views](#tree-views) below; they do not push or apply patches yet.
+
 Other pages hold the detail: [recording.md](recording.md) (what is recorded and
 when), [remotes.md](remotes.md) (pushing), [trees.md](trees.md) (the tree
-views), [operator-guide.md](operator-guide.md) (running it).
+views), [operator-guide.md](operator-guide.md) (running the recording engine).
 
 ## What agentfs does
 
@@ -203,7 +208,7 @@ recordable names. It is **a boundary for names**, not a security sandbox.
   symlink, hard link or special file, move a directory, change ownership, or
   change a rule. Tests: `a8_refusals`,
   `a5_hidden_names_answer_the_same_whether_or_not_they_exist`,
-  `recorded_files_never_move_out`, `overlay_refusals`,
+  `recorded_files_never_move_out`,
   `the_overlay_is_refused_on_a_front_and_with_tree_rules`.
 - **What it does not cover.**
   - A file a sandbox already holds open stays writable after the main
@@ -214,7 +219,7 @@ recordable names. It is **a boundary for names**, not a security sandbox.
     from recording (`judge_answers`, `a11_directories`).
   - Volume-wide facts leak: free space (`statfs` is passed on; not tested),
     link counts (not tested), and "directory not empty" for a directory whose
-    remaining entries are hidden (`overlay_refusals`).
+    remaining entries are hidden (not tested).
   - Inode numbers of shown entries skip one per hidden entry in a listing,
     so a sandbox can count a directory's hidden entries, never name them (not
     tested). Lookups, removes and renames take no id for an entry hidden for its
@@ -229,8 +234,10 @@ recordable names. It is **a boundary for names**, not a security sandbox.
   - Mode-bit permission checks run outside the names lock, so a `chmod` through
     the main mount between the check and the operation is not seen by that one
     operation (not tested). The name checks run under the lock.
-- **Where it runs.** On single-process mounts (the sidecar, `agentfs mount`),
-  not on a history-service front and not on CSI volumes.
+- **Where it runs.** Only in a program that links `agentfs-fuse` and turns it
+  on ([library/filesystem](library/filesystem.md#the-sandbox-overlay)). No
+  launcher offers it: tree volumes do not build it, and the CSI driver's fronts
+  never served it.
 - **Capability assumptions.** Sandboxes lack `CAP_SYS_ADMIN` and
   `CAP_DAC_READ_SEARCH`. Stopping a privileged container from reaching the disk
   by other means is not supported.

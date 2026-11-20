@@ -333,8 +333,8 @@ names the operator's rules would record if they were new. A container that
 starts other containers is given only this mount point, so the sandboxes it
 starts see and change only recordable files, and what they change is
 recorded and visible through the main mount at once. It is a boundary for
-names. The operator's view is the [sandbox-overlay
-runbook](../runbooks/sandbox-overlay.md).
+names; what it covers and what it does not is in
+[guarantees](../guarantees.md#the-sandbox-overlay).
 
 The `agentfs` binary does not serve it: tree volumes do not build it yet. A
 program linking `agentfs-fuse` turns it on with `MountConfig::overlay`. Its
