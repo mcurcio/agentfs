@@ -191,6 +191,9 @@ pub(in crate::tree_actor) fn checkout(
     fs::create_dir_all(&dir)?;
     let files = format::files_tree(repo, head)?;
     repo.checkout_tree(files, &dir, previous)?;
+    // A checkout's files are written; its marker, which a restart trusts, is
+    // written after this point (agentfs-ln6.6).
+    crate::failpoints::hit("tree.checkout_before_marker")?;
     Ok(files)
 }
 
