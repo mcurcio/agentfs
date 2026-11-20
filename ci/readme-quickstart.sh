@@ -10,14 +10,16 @@
 #
 # From source: its `cargo build` runs as the calling user through a shim,
 # so the build uses the user's toolchain and target directory; everything
-# else runs as root, as the README says. Then checks that stopping the
-# mount pushed the final commit: the remote's log names notes.txt, and the
-# stop printed a `final push: origin: pushed` line. Needs Linux with
-# /dev/fuse, fuse3, git, cargo and passwordless sudo, and no /data or
-# /workspace (the README's paths).
+# else runs as root, as the README says. Then checks that the mount came
+# up, that the block exited 0 once its command ended, that the state
+# area's history.git holds notes.txt on the root branch (the tree engine's
+# layout), and that nothing is left mounted. Needs Linux with /dev/fuse,
+# fuse3, git, cargo and passwordless sudo, and no /data or /workspace (the
+# README's paths).
 #
 # Docker: runs the block against $AGENTFS_IMAGE (the README's default,
-# ghcr.io/mcurcio/agentfs:latest, when unset), then checks that agentfs
+# ghcr.io/mcurcio/agentfs:latest, when unset; docs.yml sets the image built
+# from the commit), then checks that agentfs
 # drained and exited 0, that the history left in the Docker volume (the
 # tree engine's, state/history.git) holds the workload's hello.txt with
 # uid 10000 as its owner, and that nothing is left mounted. Needs Linux
@@ -113,11 +115,12 @@ chmod 755 "$W/shim/cargo"
 sudo env "PATH=$W/shim:$PATH" bash -euxo pipefail -c "$block" 2>&1 | tee "$out"
 
 step "checks"
-text=$(cat "$out")
-assert_contains "$text" "final commit: " "the stop made the final commit"
-assert_contains "$text" "final push: origin: pushed" "the stop pushed the final commit"
-log=$(sudo git --git-dir /data/remote.git log --name-only --format=%s agentfs/demo)
-assert_contains "$log" "notes.txt" "the remote's history has notes.txt"
+. "$(dirname "$0")/tree-git-test-lib.sh"
+assert_contains "$(cat "$out")" "mounted volume demo at /workspace" "the mount came up"
+# pipefail (lib.sh) and set -e: reaching here means the block exited 0,
+# so the mount drained and exited 0 once its command ended.
+assert_eq hello "$(sudo git --git-dir /data/state/history.git show "root:files/$(tree_git_fanned notes.txt)")" \
+  "the history holds notes.txt"
 if grep -q " /workspace " /proc/self/mountinfo; then
   fail "/workspace is still mounted"
 fi

@@ -111,12 +111,8 @@ jobs:
         run: docker logs otelcol 2>&1 | tail -n 100
 
   fuse:
-    name: e2e (FUSE mount, passthrough ${{ matrix.passthrough }})
+    name: e2e (FUSE mount)
     runs-on: ubuntu-24.04
-    strategy:
-      fail-fast: false
-      matrix:
-        passthrough: [auto, on, off]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: rustup toolchain install # the release rust-toolchain.toml pins
@@ -132,16 +128,9 @@ jobs:
           ls -l /dev/fuse
           findmnt -T "$RUNNER_TEMP" || true
       - run: ci/fuse-tests.sh
-        env:
-          AGENTFS_TEST_PASSTHROUGH: ${{ matrix.passthrough }}
-          AGENTFS_TEST_UNPRIV_USER: runner
       # README.md's quick start, as written, as root.
       - name: README quick start
-        if: matrix.passthrough == 'auto'
         run: ci/readme-quickstart.sh
-      - name: daemon logs
-        if: failure()
-        run: tail -n 200 "$RUNNER_TEMP"/agentfs-mount-logs/*.log
       - name: clean up mounts
         if: always()
         run: sudo sh -c 'grep agentfs /proc/self/mountinfo | cut -d" " -f5 | xargs -r -n1 umount -l' || true

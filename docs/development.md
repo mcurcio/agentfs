@@ -128,8 +128,9 @@ Every push runs [`.github/workflows/ci.yml`](../.github/workflows/ci.yml):
   and every relative link and anchor in README.md and docs/ resolves.
 - **README quick start** (in the `fuse` job,
   [`ci/readme-quickstart.sh`](../ci/readme-quickstart.sh)): the README's
-  "From source" block, run as written, as root; the remote must hold the
-  final commit after the mount stops.
+  "From source" block, run as written, as root; the state area's
+  `history.git` must hold `notes.txt` on the `root` branch, and nothing may
+  be left mounted, after the mount's command exits.
 
 [`.github/workflows/image.yml`](../.github/workflows/image.yml) builds and
 tests the container image on every push:
@@ -204,8 +205,12 @@ documentation as a book with [mdBook](https://rust-lang.github.io/mdBook/)
 on every push and pull request ([`book.toml`](../book.toml),
 `docs/SUMMARY.md`), deploys it to GitHub Pages from `main`
 (<https://mcurcio.github.io/agentfs/>), and runs the README's Docker quick
-start as written against the published image
-([`ci/readme-quickstart.sh`](../ci/readme-quickstart.sh) with `docker`).
+start as written against the image built from the commit
+([`ci/readme-quickstart.sh`](../ci/readme-quickstart.sh) with `docker`, and
+`AGENTFS_IMAGE` set to that image), so a change to the commands the README
+uses passes before an image that understands them is published. The
+published image comes from the same `Dockerfile`; `image.yml` publishes it
+only after its e2e jobs pass.
 Build the book locally with `mdbook build` (output in `target/book`) or
 `mdbook serve`.
 
@@ -262,10 +267,10 @@ mount; and reordered writes within one flush epoch, because the replay is
 in write order.
 
 The `fuse` job also runs the README's from-source quick start as written,
-as root (`ci/readme-quickstart.sh`): its remote log after `kill %1; wait`
-must show the edited file, which only the final push at shutdown puts
-there. The `docs` workflow runs the README's Docker quick start as written
-against the published image. The README's Kubernetes quick starts are not
+as root (`ci/readme-quickstart.sh`): the `root` branch of the state area's
+`history.git` must hold the edited file once the mount's command exits.
+The `docs` workflow runs the README's Docker quick start as written
+against the image built from the commit. The README's Kubernetes quick starts are not
 run as written; the manifests and charts they use are tested by the
 `image` and `helm` workflows.
 
