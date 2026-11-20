@@ -348,6 +348,27 @@ must exit 1, and the tracer runs it before the figures.
   tree, so `create` reports the cost of a save against the tree's size
   (`cost_by_tree_size`: the median and the largest save in windows ending
   at 1, 2 and 5 times each power of ten), not a total scaled to 100,000.
+- **Every memory figure is the sampled peak of RssAnon.** RssAnon is the
+  view process's anonymous resident memory (`/proc/PID/status`): what the
+  kernel cannot reclaim. Clean file-backed pages, such as git's mapped
+  index and pack pages, are not counted (owner, 2026-11-20). A sampler
+  thread in `trees-figures.py` reads it every 20 ms from just before a
+  workload until that workload's history is built (after `drain_s`), so
+  the build is inside the window. A spike shorter than 20 ms can fall
+  between two samples. `memory_1g` and `write_1m` report `peak_extra_mib`,
+  the peak over the first sample, and `peak_anon_mib`, the peak.
+  `memory_create` reports `kib_per_file`, the peak over the first sample
+  per file created, and `peak_anon_mib`.
+- **`restart` samples the mount.** After the view is stopped and mounted
+  again on the figures' state, the tracer starts `trees-figures.py
+  --sample-peak` on the new container's process as soon as `docker run -d`
+  returns. It stops the sampler at the view's `mounted` line and passes its
+  output as `--restart-peak`; `restart`'s `peak_anon_mib` is that peak. The
+  first milliseconds, before the container's pid is read, are not sampled.
+- **Memory bars warn and never fail.** The numbers in
+  `ci/trees-budget.json` (256 MiB, 2 KiB a file) are marks for regressions,
+  not targets. The owner, 2026-11-20: "I dont have a number in mind. Im just
+  looking to cut waste".
 - The report is the job's artifact `trees-figures-<fs>`.
 
 Figures from two runs on GitHub `ubuntu-24.04` runners, each one
@@ -441,8 +462,11 @@ Then line maps without bytes (docs/trees.md, "What a commit holds"): a
 save's map is runs of lines, its alignment reads both versions a line at a
 time, and git streams blobs over 8 MiB. Two more figures hold the 1 GiB save's
 build: `history_1g` (its `drain_s`, at most 60 s, the engine's own 1 GiB commit
-of 23 to 29 s with margin) and `memory_1g` (the view process's peak memory
-through the save and its build, at most 256 MiB over its memory before). On
+of 23 to 29 s with margin) and `memory_1g` (the view's sampled RssAnon peak
+through the save and its build, at most 256 MiB over its memory before). The
+`memory_1g` figures in the CI tables below were read as the kernel's resident
+high-water mark (VmHWM, file pages included), not RssAnon, so they are not
+comparable with runs that read RssAnon. On
 one 4-CPU container (ext4, release build, a random file written in 1 MiB
 writes, `.claude/handoff`'s `mem.py`; a local observation, not CI):
 
@@ -505,9 +529,10 @@ The 256 MiB row predates bounding `git cat-file`'s pack window; with it the
 1 GiB save's children peak at 66 MiB. Before, the same container's 256 MiB
 save took 13.8 s with the children at 752 MiB.
 
-The view's memory per file is held by `memory_create`: its resident memory
-once the `create` workload's history is built, over its memory before, per
-file created, at most 2 KiB. About 20 KiB a file came from libgit2: the
+The view's memory per file is held by `memory_create`: its sampled RssAnon
+peak through the `create` workload and its build, over its RssAnon before,
+per file created, at most 2 KiB. The local figures below are resident memory
+read once the history was built, not that peak. About 20 KiB a file came from libgit2: the
 builder packs each batch with `git fast-import`, and one handle kept open
 held a cache of delta bases (up to 16 MiB) for every pack it had read. The
 handle is now let go after each batch. Small maps (a file's name versions,

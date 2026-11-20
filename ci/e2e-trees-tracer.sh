@@ -38,8 +38,9 @@
 # 5. (--figures) The view is stopped and mounted again on the state step 4
 #    left (about 50,000 files): `restart` is its time to mount, from the
 #    container's start to its `mounted` line by their log timestamps, and
-#    its peak memory; `long_history` is 2,000 more creates on it. Both are
-#    added to the same report and only warn (owner, 2026-11-20).
+#    its sampled RssAnon peak until that line; `long_history` is 2,000 more
+#    creates on it. Both are added to the same report and only warn (owner,
+#    2026-11-20).
 #
 # Needs the agentfs image as $AGENTFS_IMAGE (default agentfs:ci), the fuse
 # module loaded, a shared mount under $RUNNER_TEMP (as / is on systemd
@@ -130,8 +131,18 @@ state_hashes() {
 }
 # The mount's own line once every view is up (docs/trees.md, "Run it").
 mounted() { docker logs "$NAME" 2>&1 | grep -F 'mounted volume t at /agentfs/root' >/dev/null; }
+# With SAMPLE_PEAK=1, the view's RssAnon is sampled from just after `docker
+# run -d` returns until its `mounted` line (trees-figures.py --sample-peak):
+# the peak is $RESTART_PEAK. The first milliseconds, before the container's
+# pid is read, are unsampled.
+RESTART_PEAK=${RUNNER_TEMP:-/tmp}/restart-peak.json
 mount_view() { # [mount flags]
   docker rm -f "$NAME" >/dev/null 2>&1 || true
+  local sampler=
+  if [ "${SAMPLE_PEAK:-0}" = 1 ]; then
+    sudo rm -f "$DATA/restart.stop"
+    rm -f "$RESTART_PEAK"
+  fi
   docker run -d --name "$NAME" \
     --device /dev/fuse --cap-add SYS_ADMIN --security-opt apparmor=unconfined \
     -v "$DATA:/data" "${POD[@]}" \
@@ -139,8 +150,18 @@ mount_view() { # [mount flags]
     "$IMAGE" --state /data/state mount /agentfs/root --volume t \
     --metrics-output /data/metrics.json "$@" \
     >/dev/null
+  if [ "${SAMPLE_PEAK:-0}" = 1 ]; then
+    python3 "$(dirname "$0")/trees-figures.py" --sample-peak "$(docker inspect --format '{{.State.Pid}}' "$NAME")" \
+      --stop-file "$DATA/restart.stop" --peak-output "$RESTART_PEAK" &
+    sampler=$!
+  fi
   # A bound on a hang; step 5's restart reads a long history first.
   wait_for "${MOUNT_WAIT:-60}" mounted || { docker logs "$NAME" >&2; fail 'the tree view did not mount'; }
+  if [ -n "$sampler" ]; then
+    sudo touch "$DATA/restart.stop"
+    # A memory figure warns, never fails: an unsampled peak leaves `restart` unfinished.
+    wait "$sampler" || echo "::warning title=tree views, $FS::the restart's peak memory was not sampled"
+  fi
   pass 'the root is mounted'
 }
 workload() { # [docker run options] -- command
@@ -328,7 +349,7 @@ print(json.dumps(w.get(sys.argv[3], 0)))' "$report" "$1" "$2"
   step "5. restart: the view mounted again on the figures' state, then a long history"
   # A clean stop builds every record appended; the restart then reads it all.
   docker stop -t 600 "$NAME" >/dev/null
-  MOUNT_WAIT=600 mount_view --on-stale-mount recover
+  SAMPLE_PEAK=1 MOUNT_WAIT=600 mount_view --on-stale-mount recover
   # From the container's start to the view's `mounted` line, by their log
   # timestamps (RFC 3339, nanoseconds).
   mount_s=$(python3 - "$(docker inspect --format '{{.State.StartedAt}}' "$NAME")" \
@@ -347,7 +368,8 @@ PY
     --view-pid "$(docker inspect --format '{{.State.Pid}}' "$NAME")" \
     --image "$(docker image inspect --format '{{.Id}}' "$IMAGE")" \
     --budget "$(dirname "$0")/trees-budget.json" \
-    --baseline "$report" --restart-mount-s "$mount_s" --output "$report" || restarted=$?
+    --baseline "$report" --restart-mount-s "$mount_s" --restart-peak "$RESTART_PEAK" \
+    --output "$report" || restarted=$?
   cat "$report"
   assert_eq "close_4k create memory_create close_64m close_1g write_1g history_1g memory_1g close_frag write_1m restart long_history" \
     "$(listed)" 'the report lists the restart and the long history'
