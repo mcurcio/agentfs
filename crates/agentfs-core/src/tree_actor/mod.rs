@@ -419,6 +419,13 @@ fn found_volume(root: &Path) -> Result<VolumeIdentity> {
     }
 }
 
+/// Where the operator's rule files of the tree volume whose state area is
+/// `state` live: `<state>/history.git/info`, holding `exclude` and
+/// `attributes`, read when the volume opens.
+pub fn rules_dir(state: &Path) -> PathBuf {
+    state.join("history.git").join("info")
+}
+
 /// The state area's exclusive lock: [`Error::Busy`] while another holds it.
 /// The operator's rules: `history.git/info/exclude` and
 /// `history.git/info/attributes`, a missing file empty, built into the rule
@@ -430,7 +437,7 @@ fn found_volume(root: &Path) -> Result<VolumeIdentity> {
 /// [`Error::Io`] for a file that cannot be read, [`Error::Rules`] for a rule
 /// tree volumes do not build.
 fn read_rules(root: &Path) -> Result<agentfs_rules::RuleSet> {
-    let info = root.join("history.git").join("info");
+    let info = rules_dir(root);
     let read = |name: &str| match fs::read(info.join(name)) {
         Ok(bytes) => Ok(bytes),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),

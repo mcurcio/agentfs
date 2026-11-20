@@ -143,7 +143,9 @@ mod tests {
             &Hello {
                 v: HOST_PROTOCOL,
                 volume: VolumeName::parse("vol-a").unwrap(),
-                id: VolumeId(uuid::Uuid::from_u128(0x0123_4567_89ab_4def_8123_4567_89ab_cdef)),
+                id: VolumeId(uuid::Uuid::from_u128(
+                    0x0123_4567_89ab_4def_8123_4567_89ab_cdef,
+                )),
             },
             r#"{"v":1,"volume":"vol-a","id":"01234567-89ab-4def-8123-456789abcdef"}"#,
         );

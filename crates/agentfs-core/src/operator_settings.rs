@@ -236,6 +236,60 @@ pub fn write_includes(state: &Path, includes: &[PathBuf]) -> Result<(), Settings
     sync_dir(state).map_err(write)
 }
 
+/// The operator's rule files for a tree volume, as a launcher installs them.
+pub struct RuleFiles<'a> {
+    pub exclude: Option<&'a Path>,
+    pub attributes: Option<&'a Path>,
+}
+
+/// Makes `info/exclude` and `info/attributes` under
+/// [`tree_actor::rules_dir`](crate::tree_actor::rules_dir) copies of the
+/// given files, each written whole (a temporary file in the same directory,
+/// fsynced and renamed over it, then the directory fsynced). A `None` source
+/// removes the installed file. Call only while no process serves the volume:
+/// rules are read at open.
+///
+/// # Errors
+///
+/// `NotFound` when `<state>/history.git` does not exist; the I/O error of a
+/// read, write or rename.
+pub fn install_rules(state: &Path, rules: RuleFiles<'_>) -> std::io::Result<()> {
+    let git = state.join("history.git");
+    if !git.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!(
+                "no tree volume at {}: {} is missing",
+                state.display(),
+                git.display()
+            ),
+        ));
+    }
+    let info = crate::tree_actor::rules_dir(state);
+    fs::create_dir_all(&info)?;
+    for (name, source) in [("exclude", rules.exclude), ("attributes", rules.attributes)] {
+        let installed = info.join(name);
+        match source {
+            Some(source) => {
+                let bytes = fs::read(source)?;
+                let temporary = info.join(format!("{name}.tmp"));
+                {
+                    let mut file = File::create(&temporary)?;
+                    file.write_all(&bytes)?;
+                    file.sync_all()?;
+                }
+                fs::rename(&temporary, &installed)?;
+            }
+            None => match fs::remove_file(&installed) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            },
+        }
+    }
+    sync_dir(&info)
+}
+
 /// A git-config value in double quotes, with `\`, `"` and line breaks escaped.
 fn quoted(value: &str) -> String {
     let mut out = String::with_capacity(value.len() + 2);
@@ -312,6 +366,81 @@ mod tests {
     use std::process::Command;
 
     use super::*;
+
+    /// A volume's git directory, as `init` leaves it, and two rule files.
+    fn rules_fixture() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("state/history.git")).unwrap();
+        let exclude = dir.path().join("exclude.src");
+        let attributes = dir.path().join("attributes.src");
+        fs::write(&exclude, "*.tmp\n").unwrap();
+        fs::write(&attributes, "*.bin binary\n").unwrap();
+        (dir, exclude, attributes)
+    }
+
+    #[test]
+    fn install_rules_installs_replaces_and_removes() {
+        let (dir, exclude, attributes) = rules_fixture();
+        let state = dir.path().join("state");
+        let info = crate::tree_actor::rules_dir(&state);
+        install_rules(
+            &state,
+            RuleFiles {
+                exclude: Some(&exclude),
+                attributes: Some(&attributes),
+            },
+        )
+        .unwrap();
+        assert_eq!(fs::read_to_string(info.join("exclude")).unwrap(), "*.tmp\n");
+        assert_eq!(
+            fs::read_to_string(info.join("attributes")).unwrap(),
+            "*.bin binary\n"
+        );
+        // Replaced whole, no temporary left.
+        fs::write(&exclude, "cache/\n").unwrap();
+        install_rules(
+            &state,
+            RuleFiles {
+                exclude: Some(&exclude),
+                attributes: Some(&attributes),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read_to_string(info.join("exclude")).unwrap(),
+            "cache/\n"
+        );
+        assert!(!info.join("exclude.tmp").exists());
+        // `None` removes, and removing again is no error.
+        for _ in 0..2 {
+            install_rules(
+                &state,
+                RuleFiles {
+                    exclude: None,
+                    attributes: Some(&attributes),
+                },
+            )
+            .unwrap();
+            assert!(!info.join("exclude").exists());
+            assert!(info.join("attributes").exists());
+        }
+    }
+
+    #[test]
+    fn install_rules_needs_a_volume() {
+        let (dir, exclude, _) = rules_fixture();
+        let none = dir.path().join("none");
+        let refused = install_rules(
+            &none,
+            RuleFiles {
+                exclude: Some(&exclude),
+                attributes: None,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(refused.kind(), std::io::ErrorKind::NotFound);
+        assert!(!none.exists(), "nothing written");
+    }
 
     #[test]
     fn each_family_has_its_capability() {
