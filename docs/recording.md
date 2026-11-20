@@ -1,8 +1,14 @@
 # How agentfs records changes
 
-This page says what agentfs records, when, and how it turns records into
-commits. The promises are in [guarantees.md](guarantees.md); every key and
-flag is in [configuration.md](configuration.md).
+This page says what the recording engine records, when, and how it turns
+records into commits. The recording engine is what the CSI driver runs: a
+history service per volume and a front per pod ([csi.md](csi.md),
+[operator guide](operator-guide.md)). The sidecar, the Docker examples and
+the CLI's `agentfs init` and `agentfs mount` run tree views, which record
+each save into a tree's journal and history in their own way
+([tree views](trees.md)). The promises are in
+[guarantees.md](guarantees.md); every key and flag is in
+[configuration.md](configuration.md).
 
 ## The backing tree
 
@@ -198,8 +204,9 @@ idempotent and cannot undo a later change. Until it succeeds, history differs
 from the tree at those paths. A `release` whose record fails queues its paths
 too.
 
-The queue survives restarts (`meta/repairs` in the state area), and the next
-`agentfs mount` repairs what it lists before it serves any request. Paths still
+The queue survives restarts (`meta/repairs` in the state area, a front's in
+`meta/fronts/slot-N.repairs`), and the next process to open it repairs what it
+lists before it serves any request. Paths still
 queued at unmount are listed on exit with where they are saved; if the file
 cannot be written either, the exit message lists them and says history differs
 from the tree there until each path changes again.
@@ -262,7 +269,7 @@ apply:
 - Tree rule files count only if they are regular files, never through a
   symlink, and a file over 1 MiB is ignored.
 - `info/exclude` and `info/attributes` are read when the volume opens. Changing
-  them takes a remount.
+  them takes a restart of the history service and its fronts.
 
 ### Attributes
 
@@ -445,8 +452,7 @@ Agentfs-Uid: 10000
 Agentfs-Pid: 4711
 ```
 
-- A sidecar gets pod metadata from the downward API; the CSI driver from
-  `podInfoOnMount`.
+- The CSI driver gets pod metadata from `podInfoOnMount`.
 - Through a history service, each record keeps its front's origin (namespace,
   pod, pod UID, node, replica), so a replay after a crash commits it with the
   same committer. A commit never mixes origins. A front whose pod does not

@@ -1,8 +1,14 @@
 # Patches
 
-Change a volume's files from outside it: queue a patch, and the next mount
-applies it before the workload sees the tree. Producers are iac, an
-operator or CI. This page is what the patch queue does and what it
+Change a volume's files from outside it: queue a patch, and the volume's
+next start applies it before the workload sees the tree. Producers are iac,
+an operator or CI. The patch queue is the recording engine's, which the CSI
+driver runs ([csi.md](csi.md)). Tree volumes, which the sidecar, the Docker
+examples and the CLI's `agentfs init` and `agentfs mount` run, do not apply
+patches yet: a configured patch source (`agentfs.patchRemote` or any other
+`agentfs.patch*` key) is logged at every boot as not built and counted by
+the `agentfs.not_built` gauge ([tree views](trees.md#operator-settings)),
+and the patch commands refuse a tree volume. This page is what the patch queue does and what it
 promises. The procedures for when it blocks are in the runbook
 [the patch queue](runbooks/patch-queue.md); every key is in the
 [configuration reference](configuration.md).
@@ -66,8 +72,9 @@ Patches land only at a start with nothing attached. They never land while
 a workload may be using the volume (see
 [guarantees](guarantees.md)).
 
-- **At mount**, after journal replay and before the service and the FUSE
-  layer start. `agentfs run` does not run the queue.
+- **At the history service's start** (under the CSI driver, NodeStage),
+  after journal replay and before it listens to fronts. `agentfs run` does
+  not run the queue.
 - **`agentfs patch apply`** with the volume stopped does the same. It
   takes the operator's word that nothing is attached.
 - **While a daemon holds the volume**, `agentfs patch apply` asks it over
@@ -81,24 +88,6 @@ Otherwise it judges the queue without writing the tree, says why, raises
 `PatchQueueDeferred` when anything is queued, and leaves the patches for
 the next start with nothing attached. The evidence is:
 
-- **A single-process mount** writes `meta/attached.json` before the mount
-  can be seen. It removes it only after a stop whose unmount was not busy,
-  whose session ended within `--unmount-grace` (no file still open, and
-  the filesystem not still mounted elsewhere, such as a kubelet `subPath`
-  bind) and with no stale layer below it. A start that finds the mark
-  defers (`unclean_stop`): the last mount was killed or crashed, or a
-  workload held it as it stopped.
-  - One exception is a mark another pod wrote. When the mount point lies
-    in the pod's own volume, the mark records that pod's uid
-    (`AGENTFS_POD_UID`). A start in a different pod, whose mount point is
-    in its own volume, lands the queue over it: nothing attached to the old
-    pod's mount can reach the new pod's volume.
-  - A mark from the same pod (agentfs restarted alone), a mark without a
-    uid, or a start that is not pod-scoped (Docker, the CLI, a hostPath or
-    a memory-backed `emptyDir`) defers.
-  - A mount stacked over a stale one (`--on-stale-mount recover`) defers
-    too (`stale_mount`).
-  - A state area never mounted has no mark.
 - **A history service** defers while a front holds a lease
   (`fronts_running`), and when started with `--workload-attached`
   (`workload_attached`). The CSI node plugin passes that whenever a pod of
