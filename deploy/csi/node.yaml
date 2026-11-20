@@ -1,11 +1,11 @@
 # The node plugin: `agentfs-csi` under tini on every node, with
 # csi-provisioner (`--node-deployment`), node-driver-registrar and
-# livenessprobe (docs/csi.md "Architecture"). Each node
-# provisions the worktrees on its own disk: CreateVolume makes one under
-# the base path, NodeStage starts one `agentfs serve-history` per volume,
-# NodePublish one `agentfs front` per pod,
-# bind-mounted onto the kubelet's target, and the release scan pushes the
-# worktrees no pod stages.
+# livenessprobe (docs/csi.md "Architecture"). Each node keeps its
+# volumes on its own disk: CreateVolume runs `agentfs init` under the base
+# path, and the plugin runs one `agentfs host` per volume in use, its view
+# host. NodePublish opens a view (a FUSE mount) on it directly at the
+# kubelet's target, with the pod's context, and DeleteVolume keeps the
+# volume's directory.
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
@@ -17,8 +17,8 @@ spec:
   selector:
     matchLabels:
       app.kubernetes.io/name: agentfs-csi-node
-  # Restarting the plugin stops the fronts it runs: the mounts on that node
-  # answer ENOTCONN until the new plugin recovers them. Roll it by hand,
+  # Restarting the plugin stops the hosts it runs: the mounts on that node
+  # answer ENOTCONN until the new plugin reopens them. Roll it by hand,
   # one drained node at a time (docs/runbooks/csi-recovery.md).
   updateStrategy:
     type: OnDelete
@@ -32,10 +32,10 @@ spec:
       # into it alone (the `api-token` volume), never into agentfs-csi.
       automountServiceAccountToken: false
       priorityClassName: system-node-critical
-      # Longer than --unpublish-grace (20s) + --unstage-grace (30s): a
-      # stopped plugin lets its children make their final commits.
+      # A stopping plugin closes each host's standard input: the hosts
+      # drain (their last commits made) and exit within this grace.
       terminationGracePeriodSeconds: 60
-      # The workloads' processes must be visible to the fronts: FUSE reports
+      # The workloads' processes must be visible to the hosts: FUSE reports
       # a caller outside the plugin's pid namespace as pid 0, whose
       # supplementary groups (a pod's fsGroup) are then unknown, and new
       # files are created as root before being given to the pod (docs/csi.md "Pod Security").
@@ -52,7 +52,6 @@ spec:
             - --endpoint=unix:///csi/csi.sock
             - --base-path=/var/lib/agentfs-csi/volumes
             - --node-state=/var/lib/agentfs-csi/node
-            - --mount-dir=/run/agentfs-csi/mounts
             - --profiles-dir=/etc/agentfs-csi/profiles
           env:
             - name: NODE_NAME
@@ -62,7 +61,8 @@ spec:
             - name: AGENTFS_CSI_NAMESPACE
               valueFrom: { fieldRef: { fieldPath: metadata.namespace } }
             # OpenTelemetry (docs/telemetry.md), inherited by every
-            # service and front: point it at your collector.
+            # host, which exports the agentfs.not_built gauge: point it at
+            # your collector.
             - { name: OTEL_SDK_DISABLED, value: "true" }
           ports:
             - { name: healthz, containerPort: 9808 }
@@ -79,16 +79,13 @@ spec:
             runAsUser: 0
           volumeMounts:
             - { name: plugin-dir, mountPath: /csi }
-            # The kubelet's targets: the binds made here must reach the
-            # host, and the workloads' containers.
+            # The kubelet's targets: the views mounted here must reach the
+            # node, and the workloads' containers.
             - { name: kubelet-dir, mountPath: /var/lib/kubelet, mountPropagation: Bidirectional }
-            # This node's worktrees, on its own disk.
+            # This node's volumes, on its own disk.
             - { name: base, mountPath: /var/lib/agentfs-csi/volumes, mountPropagation: HostToContainer }
-            # Staged and published records: what a restarted plugin
-            # reconciles from.
+            # Published records: what a restarted plugin reconciles from.
             - { name: node-state, mountPath: /var/lib/agentfs-csi/node }
-            # The fronts' FUSE mounts (sources of the binds).
-            - { name: mounts, mountPath: /run/agentfs-csi }
             - { name: profiles, mountPath: /etc/agentfs-csi/profiles, readOnly: true }
             - { name: credentials, mountPath: /etc/agentfs-csi/credentials, readOnly: true }
             - { name: dev-fuse, mountPath: /dev/fuse }
@@ -99,9 +96,9 @@ spec:
             # PVC name and namespace for the volume name.
             - --extra-create-metadata
             # One provisioner per node: it creates and deletes only the
-            # worktrees of its own node (NODE_NAME).
+            # volumes of its own node (NODE_NAME).
             - --node-deployment
-            # A start class's CreateVolume fetches the start branch once.
+            # DeleteVolume starts the volume's host and drains it.
             - --timeout=300s
           env:
             - name: NODE_NAME
@@ -151,8 +148,6 @@ spec:
           hostPath: { path: /var/lib/agentfs-csi/volumes, type: DirectoryOrCreate }
         - name: node-state
           hostPath: { path: /var/lib/agentfs-csi/node, type: DirectoryOrCreate }
-        - name: mounts
-          emptyDir: {}
         - name: dev-fuse
           hostPath: { path: /dev/fuse, type: CharDevice }
         - name: profiles

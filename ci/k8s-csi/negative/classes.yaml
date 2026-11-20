@@ -1,0 +1,103 @@
+# Classes CreateVolume refuses as not built on tree volumes, each with a
+# claim and a pod using it (WaitForFirstConsumer: provisioning starts once
+# a pod is scheduled). Both claims stay Pending with ProvisioningFailed
+# events naming the refusal (ci/e2e-csi.sh).
+#
+# onDelete: delete would destroy the volume's only history (push is not
+# built yet).
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: agentfs-ci-ondelete-delete
+provisioner: agentfs.mcurcio.github.io
+parameters:
+  profile: ci
+  onDelete: delete
+reclaimPolicy: Delete
+volumeBindingMode: WaitForFirstConsumer
+allowVolumeExpansion: false
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ondelete-delete
+spec:
+  storageClassName: agentfs-ci-ondelete-delete
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ondelete-delete-user
+spec:
+  automountServiceAccountToken: false
+  terminationGracePeriodSeconds: 1
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 10000
+    seccompProfile: { type: RuntimeDefault }
+  containers:
+    - name: c
+      image: ghcr.io/mcurcio/agentfs
+      imagePullPolicy: IfNotPresent
+      command: [sleep, infinity]
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities: { drop: [ALL] }
+      volumeMounts:
+        - { name: data, mountPath: /data }
+  volumes:
+    - name: data
+      persistentVolumeClaim: { claimName: ondelete-delete }
+---
+# A start class: a volume whose history begins at another's commit.
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: agentfs-ci-start-from
+provisioner: agentfs.mcurcio.github.io
+parameters:
+  profile: ci
+  startFrom: "origin:agentfs/old@0123456789abcdef0123456789abcdef01234567"
+reclaimPolicy: Delete
+volumeBindingMode: WaitForFirstConsumer
+allowVolumeExpansion: false
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: start-from
+spec:
+  storageClassName: agentfs-ci-start-from
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: start-from-user
+spec:
+  automountServiceAccountToken: false
+  terminationGracePeriodSeconds: 1
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 10000
+    seccompProfile: { type: RuntimeDefault }
+  containers:
+    - name: c
+      image: ghcr.io/mcurcio/agentfs
+      imagePullPolicy: IfNotPresent
+      command: [sleep, infinity]
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities: { drop: [ALL] }
+      volumeMounts:
+        - { name: data, mountPath: /data }
+  volumes:
+    - name: data
+      persistentVolumeClaim: { claimName: start-from }

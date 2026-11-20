@@ -3,7 +3,7 @@
 # a Secret mounted into the driver's own pods, never read through the API.
 #
 # The node plugin's account is used by one container only, csi-provisioner
-# (`--node-deployment`), which provisions and deletes the worktrees of its
+# (`--node-deployment`), which provisions and deletes the volumes of its
 # own node: the DaemonSet does not mount the token, and projects it into
 # that sidecar alone, never into agentfs-csi. RBAC cannot scope PVs by
 # driver or node: provisioner-admission.yaml narrows these rights to this

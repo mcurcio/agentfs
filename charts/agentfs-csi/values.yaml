@@ -20,7 +20,7 @@ sidecars:
   provisioner:
     image:
       # -- csi-provisioner's image: in the node plugin pod of every node
-      # (`--node-deployment`), provisioning that node's worktrees.
+      # (`--node-deployment`), provisioning that node's volumes.
       repository: registry.k8s.io/sig-storage/csi-provisioner
       # -- csi-provisioner's tag.
       tag: v6.4.0
@@ -56,7 +56,7 @@ sidecars:
 kubeletDir: /var/lib/kubelet
 
 basePath:
-  # -- Where each node keeps its worktrees (`--base-path`): a hostPath
+  # -- Where each node keeps its volumes (`--base-path`): a hostPath
   # directory on the node's own disk, ideally a disk of its own, since a
   # full disk makes the kubelet evict every pod on the node. A network
   # filesystem is refused (docs/csi.md).
@@ -65,23 +65,24 @@ basePath:
 node:
   # -- The node plugin's priority class.
   priorityClassName: system-node-critical
-  # -- Longer than `--unpublish-grace` plus `--unstage-grace`, so a
-  # stopped plugin lets its children make their final commits.
+  # -- A stopping plugin closes each host's standard input: the hosts
+  # drain, making their last commits, and exit within this grace.
   terminationGracePeriodSeconds: 60
-  # -- Where the node keeps its staged and published records
+  # -- Where the node keeps its published records
   # (`--node-state`); must survive plugin restarts.
   stateDir: /var/lib/agentfs-csi/node
   # -- More `agentfs-csi` flags (docs/configuration.md), e.g.
-  # `--release-scan-interval=10s`.
+  # `--backoff-max=30s`.
   extraArgs: []
-  # -- Environment of the node plugin, inherited by every history service
-  # and front: the `OTEL_*` variables (docs/telemetry.md). Point
+  # -- Environment of the node plugin, inherited by every volume's
+  # `agentfs host`: the `OTEL_*` variables (docs/telemetry.md), which
+  # export the `agentfs.not_built` gauge. Point
   # `OTEL_EXPORTER_OTLP_ENDPOINT` at your collector to turn telemetry on.
   env:
     - name: OTEL_SDK_DISABLED
       value: "true"
-  # -- The agentfs-csi container's resources. Every history service and
-  # front on the node runs in this container, inside these limits.
+  # -- The agentfs-csi container's resources. Every `agentfs host` on the
+  # node runs in this container, inside these limits.
   resources: {}
   # -- Annotations on the node plugin's pods.
   podAnnotations: {}
@@ -112,9 +113,9 @@ credentials:
 classAdmission:
   # -- Install the ValidatingAdmissionPolicy `agentfs-class`, which refuses
   # any StorageClass of the driver whose reclaim policy is not Delete, so
-  # DeleteVolume always runs and the release decider always answers
-  # (docs/csi.md). Off: a class with Retain loses nothing, but its PVs
-  # stay Released for ever.
+  # DeleteVolume always runs: it keeps a claim's volume on its node and
+  # ends a fork claim's fork (docs/csi.md). Off: a class with Retain loses
+  # nothing, but its PVs stay Released for ever.
   enabled: true
 
 alerts:
@@ -173,12 +174,10 @@ server:
 # volumeBindingMode, annotations}]`. `parameters` go to the driver as
 # written (docs/configuration.md "The CSI driver"). `reclaimPolicy`
 # defaults to Delete (the class admission policy refuses any other; a
-# worktree is kept by `onDelete: retain`, the default); `volumeBindingMode`
-# to WaitForFirstConsumer, which picks the node first. A fork class
-# (`fork: "true"`) may set `link: linked` (the default: its forks deliver
-# their change back to the source) or `link: unlinked` (independent forks,
-# nothing ever delivered, never pushed to the source's remotes). An
-# unlinked class's `remotes: <profile>` names the profile whose config
-# holds the forks' own remotes; without it they are local-only and
-# deleting a claim loses its history (docs/csi.md).
+# claim's volume is kept on its node by `onDelete: retain`, the default
+# and the only choice built); `volumeBindingMode` to WaitForFirstConsumer,
+# which picks the node first. A fork class (`fork: "true"`) takes only
+# `landing: automatic` (the default): its fork claims are forks of their
+# source's volume whose changes land in it. `link: unlinked`, `landing:
+# approval` and `startFrom` are refused as not built (docs/csi.md).
 storageClasses: []

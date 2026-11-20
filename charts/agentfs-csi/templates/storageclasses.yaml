@@ -21,7 +21,7 @@ parameters:
   {{- toYaml . | nindent 2 }}
 {{- end }}
 # Always Delete (the class admission policy refuses any other):
-# DeleteVolume decides what a released worktree needs.
+# DeleteVolume keeps a claim's volume and ends a fork claim's fork.
 reclaimPolicy: {{ .reclaimPolicy | default "Delete" }}
 volumeBindingMode: {{ .volumeBindingMode | default "WaitForFirstConsumer" }}
 allowVolumeExpansion: false

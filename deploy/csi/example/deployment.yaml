@@ -1,6 +1,7 @@
-# Two replicas on one agentfs volume. Each pod gets its own front (and
-# committer identity, from podInfoOnMount); the node plugin runs one history
-# service for both. ReadWriteOnce keeps them on one node.
+# One pod on one agentfs volume: the volume's host opens a view for it at
+# the kubelet's target, and every commit names the pod (podInfoOnMount).
+# Recreate, so a rollout stops the old pod before the new one publishes:
+# a second pod on the volume is refused.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -9,7 +10,9 @@ metadata:
   labels:
     app.kubernetes.io/name: agents
 spec:
-  replicas: 2
+  replicas: 1
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app.kubernetes.io/name: agents
@@ -37,8 +40,8 @@ spec:
             capabilities: { drop: [ALL] }
             readOnlyRootFilesystem: true
           volumeMounts:
-            # HostToContainer: when the node plugin replaces a crashed front,
-            # the new mount reaches this container without a restart
+            # HostToContainer: when the node plugin restarts a crashed host,
+            # its new view reaches this container without a restart
             # (docs/csi.md "Recovery").
             - name: workspace
               mountPath: /workspace
