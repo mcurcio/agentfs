@@ -6,14 +6,17 @@
 #   docker compose -f examples/docker/compose.yaml exec workload sh
 #   docker compose -f examples/docker/compose.yaml down
 #
-# This file alone is a volume with no remote: the history stays in the
-# Docker volume `data`. Add compose.remote.yaml for a git server it pushes
-# to (`-f compose.yaml -f compose.remote.yaml`).
+# The history stays in the Docker volume `data`, in
+# state/history.git. compose.remote.yaml adds a git server and names it as
+# a remote (`-f compose.yaml -f compose.remote.yaml`); push is not built on
+# tree volumes yet, so the mount logs that remote as not built at every
+# boot.
 #
 #   ./mnt                 on the host: the directory the mount appears in
 #   ./mnt/workspace       the FUSE mount; the workload's /agentfs/workspace
-#   data (volume)         /data in the agentfs containers only: backing/
-#                         (the files) and state/ (the history)
+#   data (volume)         /data in the agentfs containers only: state/,
+#                         the volume's state area (its files, journal and
+#                         history.git)
 #
 # ./mnt must be on a shared mount (it is on systemd hosts, where / is
 # shared); Docker Desktop cannot propagate mounts to the host.
@@ -24,16 +27,16 @@ x-agentfs: &agentfs
   image: ${AGENTFS_IMAGE:-ghcr.io/mcurcio/agentfs:latest}
   environment: &agentfs-env
     AGENTFS_STATE: /data/state
-    AGENTFS_ROOT: /data/backing
   volumes:
     - data:/data
     - ./config/local:/etc/agentfs/config:ro
 
 services:
-  # Creates the state area and /data/backing on the first run, checks them
-  # on every later one (another volume's state area stops here), names the
-  # config fragment as the history's include.path, and gives the tree's
-  # root to the workload's user so it can write at the top of the volume.
+  # Creates the volume on the first run and finds it on every later one
+  # (another volume, or a recording state area, stops here), makes the
+  # operator settings file include the config file, and records a new
+  # volume's root as the workload's user's, so it can write at the top of
+  # the volume.
   agentfs-init:
     <<: *agentfs
     environment:
@@ -41,7 +44,7 @@ services:
       AGENTFS_VOLUME: ${VOLUME:-example}
       WORKLOAD_USER: ${WORKLOAD_USER:-10000:10000}
     entrypoint: [sh, -c]
-    command: ['agentfs init --include /etc/agentfs/config && chown "$$WORKLOAD_USER" /data/backing']
+    command: ['agentfs init --include /etc/agentfs/config --owner "$$WORKLOAD_USER"']
     restart: "no"
 
   # The recorder. FUSE needs /dev/fuse and CAP_SYS_ADMIN, and Docker's
@@ -50,16 +53,17 @@ services:
   agentfs:
     <<: *agentfs
     hostname: agentfs
-    command: [mount, /data/backing, /agentfs/workspace]
+    command: [mount, /agentfs/workspace]
     environment:
       <<: *agentfs-env
-      # Restarted after a crash: mount over the stale mount the dead daemon
+      # Restarted after a crash: stack over the stale mount the dead daemon
       # left; the new mount reaches the workload through propagation, with
       # no restart of the workload.
       AGENTFS_ON_STALE_MOUNT: recover
       # The bare mount point becomes root's with mode 0000.
       AGENTFS_SEAL_MOUNTPOINT: "true"
-      # Point this at your collector instead (docs/telemetry.md).
+      # Point this at your collector instead (docs/telemetry.md): it
+      # carries agentfs.not_built, the alarm for settings not built yet.
       OTEL_SDK_DISABLED: "true"
     devices: [/dev/fuse]
     cap_add: [SYS_ADMIN]
@@ -74,11 +78,11 @@ services:
         bind:
           propagation: rshared
     restart: unless-stopped
-    # Longer than --unmount-grace (10s) + --push-grace (5s) + the final
-    # commit, so `docker compose down` always makes the final commit.
+    # Time for the drain at `docker compose down`, once the workload has
+    # stopped.
     stop_grace_period: 60s
-    # The workload starts once the mount is live; 5 minutes for journal
-    # recovery at start.
+    # The workload starts once the mount is live; 5 minutes for the
+    # volume's recovery at start.
     healthcheck:
       test: [CMD, agentfs, probe, /agentfs/workspace]
       interval: 10s
