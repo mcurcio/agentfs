@@ -132,8 +132,9 @@ where
         Ok(())
     }
 
-    /// The fork held under `key`, whatever its phase.
-    fn keyed(&self, key: &ForkKey) -> Option<&ForkFacts> {
+    /// The fork held under `key`, whatever its phase: how a launcher that
+    /// names forks by key finds one's tree, never creating it.
+    pub fn keyed(&self, key: &ForkKey) -> Option<&ForkFacts> {
         self.forks
             .values()
             .find(|facts| facts.key.as_ref() == Some(key))

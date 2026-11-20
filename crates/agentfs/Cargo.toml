@@ -32,8 +32,9 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 rustls-native-certs = { version = "0.8", optional = true }
 rustls-pki-types = { version = "1.15", features = ["std"], optional = true }
 tonic = { version = "0.14", default-features = false, features = ["tls-ring", "tls-native-roots"], optional = true }
-# The restore thread's id (`thread`), and signals in tests (`process`).
-rustix = { version = "1.1.5", features = ["fs", "process", "thread"] }
+# The restore thread's id (`thread`), signals in tests (`process`), and
+# `agentfs host`'s check that its standard input is a stream socket (`net`).
+rustix = { version = "1.1.5", features = ["fs", "net", "process", "thread"] }
 # close(2) and its errno in the FUSE tests (a front failing a boundary with
 # EIO).
 libc = "0.2.190"

@@ -886,6 +886,22 @@ section. A subcommand with its own subcommands lists them after it.
   when it could not start). Exit 75 while another process holds the
   volume; exit 1 after a recording failure stopped it
   ([lifecycle](trees.md#volume-lifecycle)). It never creates a volume.
+- `host`: serve one tree volume's views on its launcher's requests, which
+  it reads from its standard input: a Unix stream socket whose other end
+  only the launcher holds, one JSON object per line
+  (`agentfs_contracts::host`). It boots as `mount` does (the volume checked,
+  the operator settings logged, the volume staged), writes its hello line,
+  then answers each request in order: open a view at a directory with a pod
+  context, close it, reconcile, create or end a keyed fork. A fork that
+  needs a landing approval is refused (not built). The launcher closing its
+  end (EOF), SIGTERM or SIGINT drains it as `mount` drains; the last view
+  ending does not. Exit 0 once the volume is released; 1 for no volume,
+  another name or another format, or after a recording failure stopped it;
+  2 when its standard input is not a Unix stream socket (`error: agentfs
+  host is run by a launcher that controls it over its standard input, a
+  Unix socket`, the state area untouched) or after a malformed request
+  line; 75 while another process holds the volume. It never creates a
+  volume.
 - `front`: a front of a history service: a FUSE mount of a backing tree
   whose records go to the service. Only the CSI node plugin starts it
   ([csi](csi.md)).
@@ -922,7 +938,7 @@ section. A subcommand with its own subcommands lists them after it.
 - `start`: for a volume started from another worktree's branch
   ([moving](runbooks/moving.md)), with `accept`, which accepts a tip of
   the start branch and clears the start-branch alarm. It takes no lock.
-`init`, `mount`, `fork end` and `probe` are the tree engine's (`probe`
+`init`, `mount`, `host`, `fork end` and `probe` are the tree engine's (`probe`
 reads no state area). Every other command runs the recording engine, which
 the CSI driver runs, and refuses a tree volume before it reads or writes
 anything: `` error: `agentfs push` runs on the recording engine only; <state>
@@ -942,8 +958,8 @@ variable). `agentfs <command> --help` prints them too.
 | Flag | Environment | Default | Commands |
 |---|---|---|---|
 | `--state DIR` | `AGENTFS_STATE` | `.` | all |
-| `--root DIR` | `AGENTFS_ROOT` | the current directory | all: the recording commands' only. Required by `record` and `serve-history`; used by `flush`, `checkpoint`, `run`, `patch apply` (and `serve-git`'s `POST /agentfs/apply`), and `restore` and `revert` without a history service; must match the backing tree for `front`. `init`, `mount` and `fork end` refuse it (exit 1): a tree volume has no backing tree |
-| `--wait-lock DURATION` | `AGENTFS_WAIT_LOCK` | `0s`: exit 75 at once | all: those that take the state-area lock wait this long for it; `lfs prune` waits this long for the LFS cache lock that restores and fetches hold. `init`, `mount` and `fork end` refuse a nonzero one (exit 1): a busy tree volume exits 75 at once |
+| `--root DIR` | `AGENTFS_ROOT` | the current directory | all: the recording commands' only. Required by `record` and `serve-history`; used by `flush`, `checkpoint`, `run`, `patch apply` (and `serve-git`'s `POST /agentfs/apply`), and `restore` and `revert` without a history service; must match the backing tree for `front`. `init`, `mount`, `host` and `fork end` refuse it (exit 1): a tree volume has no backing tree |
+| `--wait-lock DURATION` | `AGENTFS_WAIT_LOCK` | `0s`: exit 75 at once | all: those that take the state-area lock wait this long for it; `lfs prune` waits this long for the LFS cache lock that restores and fetches hold. `init`, `mount`, `host` and `fork end` refuse a nonzero one (exit 1): a busy tree volume exits 75 at once |
 
 **Pod flags**, which name where the volume is mounted (see [recording](recording.md)). They fill the identity
 templates' variables, the commit trailers and the telemetry resource:
@@ -951,13 +967,14 @@ templates' variables, the commit trailers and the telemetry resource:
 | Flag | Environment | Default | Commands |
 |---|---|---|---|
 | `--namespace NAME`, `--pod NAME`, `--pod-uid UID`, `--node NAME`, `--replica NAME` | `AGENTFS_NAMESPACE`, `AGENTFS_POD`, `AGENTFS_POD_UID`, `AGENTFS_NODE`, `AGENTFS_REPLICA` | empty; `--pod-uid` defaults to the replica, and `--replica` (the committer's `{replica}`) to the pod name, else the host name | `front`, `run`, `record`, `flush`, `push`, `checkpoint`, `serve-history`, `serve-git` (passed to its hooks and `patch apply` as the variables), `restore`, `revert`, `patch apply`, `fork finish`, `status` (accepted and ignored) |
-| `--namespace NAME`, `--pod NAME`, `--pod-uid UID`, `--node NAME` | `AGENTFS_NAMESPACE`, `AGENTFS_POD`, `AGENTFS_POD_UID`, `AGENTFS_NODE` | empty: absent from the commits. Each is 1 to 253 bytes of printable ASCII with no whitespace | `init`, `mount`, `fork end`: the pod context of a tree volume's commits, as `Agentfs-Namespace`, `Agentfs-Pod`, `Agentfs-Pod-Uid` and `Agentfs-Node` ([trees](trees.md#volume-identity-and-trailers)). `mount`'s are its views' writers' and its own syncs', and its telemetry resource's (the replica is the pod name, else the host name); `init`'s are the Root commit's |
+| `--namespace NAME`, `--pod NAME`, `--pod-uid UID`, `--node NAME` | `AGENTFS_NAMESPACE`, `AGENTFS_POD`, `AGENTFS_POD_UID`, `AGENTFS_NODE` | empty: absent from the commits. Each is 1 to 253 bytes of printable ASCII with no whitespace | `init`, `mount`, `host`, `fork end`: the pod context of a tree volume's commits, as `Agentfs-Namespace`, `Agentfs-Pod`, `Agentfs-Pod-Uid` and `Agentfs-Node` ([trees](trees.md#volume-identity-and-trailers)). `mount`'s are its views' writers' and its own syncs', and its telemetry resource's (the replica is the pod name, else the host name); `init`'s are the Root commit's; `host`'s are its own events' and its telemetry resource's, while each view's writer carries the pod context its open request names |
 
-**Tree volume flags** (`init`, `mount`, `fork end`; see [trees](trees.md)):
+**Tree volume flags** (`init`, `mount`, `host`, `fork end`; see [trees](trees.md)):
 
 | Flag | Environment | Default | Commands |
 |---|---|---|---|
-| `--volume NAME` | `AGENTFS_VOLUME` | none: required by `init` | `init`: the volume's name, kept in its identity file. A new state area gets a new id; the same name finds it and writes nothing; another name, or another format (a recording state area, or the trial's format 3), exits 1 with nothing written. Prints `<name> <id> created\|found`, then recovers the volume. Exit 75 while another process holds it. `mount`: optional, a guard: another name exits 1 before anything is written |
+| `--volume NAME` | `AGENTFS_VOLUME` | none: required by `init` | `init`: the volume's name, kept in its identity file. A new state area gets a new id; the same name finds it and writes nothing; another name, or another format (a recording state area, or the trial's format 3), exits 1 with nothing written. Prints `<name> <id> created\|found`, then recovers the volume. Exit 75 while another process holds it. `mount`: optional, a guard: another name exits 1 before anything is written. `host`: required, the same guard |
+| `--launcher ID` | | none: required | `host`: the launcher its clients and forks are recorded under, a launcher id (a safe name); a restarted host rebinds the clients of this launcher, tree, label and access, so a fork's one writer survives a crash. The volume's own scope, as `mount`'s `cli` |
 | `--include FILE` (repeatable) | | keep the existing includes | `init`: an absolute path that exists (else exit 1, nothing written); these become exactly the `include.path` lines of `<state>/config` ([operator settings](#tree-volumes-the-operator-settings-file)), written under the volume's lock |
 | `--owner UID:GID` | `AGENTFS_OWNER` | the creating process's uid and gid | `init`: the owner the new volume's root directory is recorded with. A found volume is never compared or changed: it prints `found: --owner applies only when the volume is created` |
 | `--no-allow-other` | | FUSE `allow_other` on | `mount`: only the mounting user reaches the views. With `allow_other`, a mount by a user other than root needs `user_allow_other` in `/etc/fuse.conf`. `front`: only the mounting user can use the mount |
@@ -971,7 +988,7 @@ templates' variables, the commit trailers and the telemetry resource:
 | `--on-stale-mount refuse\|hold\|recover` | `AGENTFS_ON_STALE_MOUNT` | `refuse` | `mount`: when a view's mount point is an agentfs mount whose daemon died, `refuse` exits 1 naming the fix, `hold` mounts nothing and takes no lock, waits for SIGTERM, detaches every stale layer and exits 1, `recover` stacks each view over its stale mount of this volume (needs `CAP_SYS_ADMIN`; a stale mount of another volume exits 1) ([trees](trees.md#restarting-after-a-crash)) |
 | `--seal-mountpoint` | `AGENTFS_SEAL_MOUNTPOINT` | off | `mount`: before mounting, make each bare mount point root's with mode 0000, so a non-root workload that reaches it while no view is mounted (a `subPath` bound while a sidecar restarts) gets `EACCES` instead of writing unrecorded; needs root |
 
-`init`, `mount` and `fork end` accept the global `--state` and its
+`init`, `mount`, `host` and `fork end` accept the global `--state` and its
 environment equivalent. They refuse `--root` (and `AGENTFS_ROOT`) and a
 nonzero `--wait-lock`, exit 1, so an old manifest fails loudly; a busy
 volume exits 75 at once. `mount ROOT [FLAGS] -- COMMAND [ARG]...` runs
@@ -1083,10 +1100,10 @@ equivalents above; a flag given on the command line wins.
 | Variable | Flag | Read by |
 |---|---|---|
 | `AGENTFS_STATE` | `--state` | all commands |
-| `AGENTFS_ROOT` | `--root` | the recording commands; `init`, `mount` and `fork end` refuse it |
+| `AGENTFS_ROOT` | `--root` | the recording commands; `init`, `mount`, `host` and `fork end` refuse it |
 | `AGENTFS_WAIT_LOCK` | `--wait-lock` | all commands |
-| `AGENTFS_NAMESPACE`, `AGENTFS_POD`, `AGENTFS_POD_UID`, `AGENTFS_NODE`, `AGENTFS_REPLICA` | `--namespace`, `--pod`, `--pod-uid`, `--node`, `--replica` | the commands with pod flags, `init`, `mount` and `fork end` among them (not `--replica`) |
-| `AGENTFS_VOLUME` | `--volume` | `init`, `mount`, `patch submit`, `patch approve` |
+| `AGENTFS_NAMESPACE`, `AGENTFS_POD`, `AGENTFS_POD_UID`, `AGENTFS_NODE`, `AGENTFS_REPLICA` | `--namespace`, `--pod`, `--pod-uid`, `--node`, `--replica` | the commands with pod flags, `init`, `mount`, `host` and `fork end` among them (not `--replica`) |
+| `AGENTFS_VOLUME` | `--volume` | `init`, `mount`, `host`, `patch submit`, `patch approve` |
 | `AGENTFS_OWNER` | `--owner` | `init` |
 | `AGENTFS_PASSTHROUGH` | `--passthrough` | `front` |
 | `AGENTFS_THREADS` | `--threads` | `front` |

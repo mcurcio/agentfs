@@ -140,6 +140,11 @@ enum Command {
     /// optionally run a command in it. SIGTERM, SIGINT, the command's exit
     /// or unmounting every view drains it. Never creates a volume.
     Mount(launcher::MountArgs),
+    /// Serve one tree volume's views on its launcher's requests, read from
+    /// the standard input (a Unix socket the launcher holds the other end
+    /// of). Its EOF, SIGTERM or SIGINT drains it. Exit 1 refused, 2 not run
+    /// by a launcher or told a malformed line, 75 busy.
+    Host(launcher::HostArgs),
     /// A front of a history service (the CSI node plugin starts it): mount
     /// BACKING at MOUNTPOINT and record every change through the service,
     /// until SIGINT, SIGTERM or an unmount. A second signal exits at once.
@@ -446,6 +451,7 @@ fn real_main() -> Result<ExitCode> {
     match cli.command {
         Command::Init(args) => return launcher::init(&cli.state, args, minter),
         Command::Mount(args) => return launcher::mount(&cli.state, args, minter),
+        Command::Host(args) => return launcher::host(&cli.state, args, minter),
         Command::Status(_pod) => {
             // Read-only: no recovery, no lock, so it is safe beside a
             // running `mount` or `run`.
@@ -711,7 +717,7 @@ fn real_main() -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// `init`, `mount` and `fork end` (the tree engine's) take `--state` only:
+/// `init`, `mount`, `host` and `fork end` (the tree engine's) take `--state` only:
 /// a given `--root` (or `AGENTFS_ROOT`) or a non-zero `--wait-lock` is
 /// refused, so an old manifest fails loudly.
 fn tree_command_flags(cli: &Cli) -> Result<(), &'static str> {
@@ -719,13 +725,14 @@ fn tree_command_flags(cli: &Cli) -> Result<(), &'static str> {
         cli.command,
         Command::Init(_)
             | Command::Mount(_)
+            | Command::Host(_)
             | Command::Fork {
                 command: fork_cmd::ForkCommand::End(_)
             }
     );
     if tree && (cli.root.is_some() || !cli.wait_lock.is_zero()) {
         return Err(
-            "init, mount and fork end take --state only: a tree volume has no backing tree \
+            "init, mount, host and fork end take --state only: a tree volume has no backing tree \
              (--root, AGENTFS_ROOT), and a busy state area exits 75",
         );
     }
@@ -738,7 +745,7 @@ fn tree_command_flags(cli: &Cli) -> Result<(), &'static str> {
 /// say which engine it runs.
 fn recording_command(command: &Command) -> Option<&'static str> {
     match command {
-        Command::Init(_) | Command::Mount(_) | Command::Probe { .. } => None,
+        Command::Init(_) | Command::Mount(_) | Command::Host(_) | Command::Probe { .. } => None,
         Command::Fork {
             command: fork_cmd::ForkCommand::End(_),
         } => None,

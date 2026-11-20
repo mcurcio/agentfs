@@ -1,17 +1,19 @@
 //! One volume's domains restored on one store, and the one dispatcher that
 //! hands each domain event to its consumers (docs/trees.md, "Volume
-//! lifecycle"): what `mount` and `fork end` share. It wires domains to
-//! adapters and decides nothing.
+//! lifecycle"): what `mount`, `host` and `fork end` share. It wires domains
+//! to adapters and decides nothing.
 use std::cell::RefMut;
 use std::sync::Arc;
 
 use agentfs_clients::ClientsService;
 use agentfs_contracts::caps::{LaunchCap, Minter};
-use agentfs_contracts::clients::{ClientEvent, ClientId, ClientSet, Clients};
-use agentfs_contracts::name::ForkKey;
+use agentfs_contracts::clients::{
+    Access, Binding, ClientError, ClientEvent, ClientId, ClientSet, Clients, Consistency, Grant,
+};
+use agentfs_contracts::name::{ClientLabel, ForkKey};
 use agentfs_contracts::pod::PodContext;
 use agentfs_contracts::ports::Event;
-use agentfs_contracts::trees::{ForkSettings, Landing, TreeError, Trees, TreesEvent};
+use agentfs_contracts::trees::{ForkPhase, ForkSettings, TreeError, Trees, TreesEvent};
 use agentfs_contracts::volume::{Volume, VolumeEvent};
 use agentfs_core::session::Sessions;
 use agentfs_core::state_area::TreeStateArea;
@@ -21,7 +23,6 @@ use agentfs_trees::TreesService;
 use agentfs_volume::VolumeService;
 use anyhow::{Context, Result};
 
-use super::root_cap;
 use crate::domain_events::DomainEvents;
 use crate::shared::Shared;
 
@@ -54,10 +55,10 @@ pub(super) struct Domains {
 impl Domains {
     /// Trees and Clients restored over `recording`, as every start restores
     /// them, publishing to `events`; Clients fills `clients`, which `volume`
-    /// asks.
+    /// asks. `cap` is the launcher every call is made as.
     pub(super) fn restore(
         recording: Arc<Recording>,
-        (minter, at): (Minter, PodContext),
+        (minter, cap, at): (Minter, LaunchCap, PodContext),
         events: DomainEvents,
         clients: ClientsSlot,
         volume: Option<VolumeOf>,
@@ -67,7 +68,6 @@ impl Domains {
             TreesService::restore(store.clone(), events.clone())
                 .context("reading the forks' rows")?,
         );
-        let cap = root_cap(&minter)?;
         let sessions = Sessions::new(recording);
         let restored = ClientsService::restore(
             store,
@@ -173,13 +173,46 @@ impl Domains {
 
     /// Clients' re-judgement: this launcher's clients not in `live` end, and
     /// dropped forks' claims are released. A failure raises the alarm; the
-    /// next reconcile (the drain's, or the next boot's) asks again.
-    pub(super) fn reconcile(&mut self, live: &ClientSet) {
+    /// next reconcile (the drain's, or the next boot's) asks again. Answers
+    /// how many clients it ended.
+    pub(super) fn reconcile(&mut self, live: &ClientSet) -> u32 {
         let reconciled = self.clients().reconcile(live, &self.cap, &self.at);
-        if let Err(e) = reconciled {
-            eprintln!("tree ReconcileFailed: {e}");
-        }
+        let ended = match reconciled {
+            Ok(ended) => u32::try_from(ended.len()).unwrap_or(u32::MAX),
+            Err(e) => {
+                eprintln!("tree ReconcileFailed: {e}");
+                0
+            }
+        };
         self.dispatch();
+        ended
+    }
+
+    /// One view's client on a new session, with `at` its pod context: the
+    /// restored client of this launcher, tree, label and access rebound
+    /// (its view host died with the process), else a new one attached
+    /// (live, consistent per file).
+    pub(super) fn bind(
+        &mut self,
+        tree: TreeId,
+        label: ClientLabel,
+        access: Access,
+        at: PodContext,
+    ) -> Result<Binding, ClientError> {
+        let session = self.sessions.open();
+        let resumable = self.clients().resumable(&self.cap, tree, &label, access);
+        let answered = match resumable {
+            Some(client) => self.clients().rebind(&client, at, session, &self.cap),
+            None => {
+                let grant = match access {
+                    Access::ReadWrite => Grant::live_read_write(tree, Consistency::PerFile),
+                    Access::ReadOnly => Grant::live_read_only(tree, Consistency::PerFile),
+                };
+                self.clients().attach(grant, label, at, session, &self.cap)
+            }
+        };
+        self.dispatch();
+        answered
     }
 
     /// Ends every unkeyed fork no client is attached to and drops every
@@ -196,18 +229,28 @@ impl Domains {
         self.dispatch();
     }
 
-    /// The fork view's fork: the open one under its key, or a new one. Its
+    /// A fork of `upstream`: the open one under its key, or a new one. Its
     /// branch and its row are one step, durable when this returns.
-    pub(super) fn fork(&mut self, key: Option<ForkKey>) -> Result<TreeId, TreeError> {
-        let settings = ForkSettings {
-            landing: Landing::Automatic,
-        };
+    pub(super) fn fork(
+        &mut self,
+        upstream: TreeId,
+        key: Option<ForkKey>,
+        settings: ForkSettings,
+    ) -> Result<TreeId, TreeError> {
         let fork = self
             .trees
             .get_mut()
-            .create(TreeId::Root, key, settings, &self.cap, &self.at);
+            .create(upstream, key, settings, &self.cap, &self.at);
         self.dispatch();
         Ok(fork?.into())
+    }
+
+    /// The fork under `key` and its phase, whatever the phase; never made.
+    pub(super) fn keyed(&self, key: &ForkKey) -> Option<(TreeId, ForkPhase)> {
+        let trees = self.trees.get_mut();
+        trees
+            .keyed(key)
+            .map(|facts| (facts.fork.into(), facts.phase))
     }
 
     /// Detaches each client, its opens saved first; a failure is logged (the

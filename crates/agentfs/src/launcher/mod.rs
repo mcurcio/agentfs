@@ -8,44 +8,48 @@
 //! client's session, optionally runs a command in it ([`command`]), detaches
 //! each client as its view ends, and on a stop (SIGTERM, SIGINT, the
 //! command's exit, or its last view gone) unstages and exits once Volume
-//! releases; `fork end` ends a keyed fork. One dispatcher ([`domains`])
-//! hands each domain event to its consumers after the call that caused it
-//! returns, and one channel carries every trigger of the loop. It wires
-//! domains to adapters and decides nothing.
+//! releases; `host` serves one volume's views on its parent's requests
+//! ([`host`]); `fork end` ends a keyed fork. `mount` and `host` share their
+//! boot and drain ([`serving`]). One dispatcher ([`domains`]) hands each
+//! domain event to its consumers after the call that caused it returns, and
+//! one channel carries every trigger of the loop. It wires domains to
+//! adapters and decides nothing.
 
 mod command;
 mod domains;
+mod host;
 mod mountpoint;
+mod serving;
 mod settings;
 
-use std::collections::BTreeMap;
+pub use self::host::{HostArgs, host};
+
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::{Arc, mpsc};
 
 use agentfs_contracts::caps::{LaunchCap, LaunchScope, Minter};
 use agentfs_contracts::clients::FileOwner;
 use agentfs_contracts::clients::{
-    Access, AttachedLookup, Binding, ClientError, ClientId, ClientSet, Clients, Consistency, Grant,
+    Access, AttachedLookup, Binding, ClientError, ClientId, ClientSet,
 };
 use agentfs_contracts::name::{ClientLabel, ForkKey, LauncherId, VolumeName};
 use agentfs_contracts::pod::PodContext;
 use agentfs_contracts::ports::{Found, StateArea};
-use agentfs_contracts::trees::{TreeError, Trees};
-use agentfs_contracts::views::{MountOptions, MountPoint, ViewError, ViewId, Views};
-use agentfs_contracts::volume::{EnsureOutcome, StartPoint, Volume, VolumeError, VolumeSpec};
+use agentfs_contracts::trees::{ForkSettings, Landing, TreeError, Trees};
+use agentfs_contracts::views::{MountOptions, ViewError, ViewId};
+use agentfs_contracts::volume::{
+    EnsureOutcome, StartPoint, Volume, VolumeError, VolumeIdentity, VolumeSpec,
+};
 use agentfs_core::identity::Context as Identity;
 use agentfs_core::operator_settings;
 use agentfs_core::state_area::TreeStateArea;
 use agentfs_core::tree_actor::{self, Recording, TreeId};
-use agentfs_fuse::tree_view::{HostEvent, ViewHost};
 use agentfs_volume::VolumeService;
 use anyhow::{Context, Result, bail};
-use signal_hook::consts::{SIGINT, SIGTERM};
-use signal_hook::iterator::Signals;
 
 use self::domains::{ClientsSlot, Domains};
+use self::serving::{Serving, Trigger};
 use crate::daemon::Daemon;
 use crate::domain_events::DomainEvents;
 use crate::pod_args::PodArgs;
@@ -201,6 +205,44 @@ fn context(pod: &PodArgs) -> Result<PodContext> {
     pod.context().context("reading the pod flags")
 }
 
+/// The volume at `state`, read before any write; `Err` holds the exit
+/// status (1) of no volume, with the hint to create one, or of another
+/// format.
+///
+/// # Errors
+///
+/// The state area cannot be read.
+fn found(state: &Path) -> Result<std::result::Result<VolumeIdentity, ExitCode>> {
+    Ok(
+        match tree_actor::inspect(state).context("reading the state area")? {
+            Found::Nothing => {
+                eprintln!("error: no volume here: run `agentfs init --volume NAME` first");
+                Err(ExitCode::FAILURE)
+            }
+            Found::Other => Err(other_format(state)),
+            Found::Volume(identity) => Ok(identity),
+        },
+    )
+}
+
+/// The `--volume` guard: another name at the state area is refused before
+/// any write.
+///
+/// # Errors
+///
+/// The refusal, or a name that is no volume name.
+fn guard(name: &VolumeName, wanted: &str) -> Result<()> {
+    let wanted = VolumeName::parse(wanted)?;
+    if wanted != *name {
+        bail!(
+            "the volume here is {:?}, not {:?}: nothing was written",
+            name.as_str(),
+            wanted.as_str()
+        );
+    }
+    Ok(())
+}
+
 /// The volume's own launcher: the CLI.
 fn root_cap(minter: &Minter) -> Result<LaunchCap> {
     Ok(LaunchCap::mint(
@@ -328,23 +370,12 @@ pub fn mount(state: &Path, args: MountArgs, minter: Minter) -> Result<ExitCode> 
             })
         })
         .transpose()?;
-    let name = match tree_actor::inspect(state).context("reading the state area")? {
-        Found::Nothing => {
-            eprintln!("error: no volume here: run `agentfs init --volume NAME` first");
-            return Ok(ExitCode::FAILURE);
-        }
-        Found::Other => return Ok(other_format(state)),
-        Found::Volume(identity) => identity.name,
+    let name = match found(state)? {
+        Ok(identity) => identity.name,
+        Err(code) => return Ok(code),
     };
     if let Some(wanted) = args.volume {
-        let wanted = VolumeName::parse(&wanted)?;
-        if wanted != name {
-            bail!(
-                "the volume here is {:?}, not {:?}: nothing was written",
-                name.as_str(),
-                wanted.as_str()
-            );
-        }
+        guard(&name, &wanted)?;
     }
     let views: Vec<&Path> = std::iter::once(root.at.as_path())
         .chain(fork.as_ref().map(|f| f.spec.at.as_path()))
@@ -425,9 +456,10 @@ pub fn end_fork(state: &Path, args: EndArgs, minter: Minter) -> Result<ExitCode>
         Err(tree_actor::Error::Busy) => return Ok(busy()),
         Err(e) => return Err(e).context("opening tree state"),
     };
+    let cap = root_cap(&minter)?;
     let mut domains = Domains::restore(
         recording,
-        (minter, at.clone()),
+        (minter, cap, at.clone()),
         DomainEvents::default(),
         ClientsSlot::new(None),
         None,
@@ -444,12 +476,8 @@ pub fn end_fork(state: &Path, args: EndArgs, minter: Minter) -> Result<ExitCode>
     }
 }
 
-/// Every trigger of `mount`'s loop, on its one channel: the view host's
-/// events, a stop (SIGTERM or SIGINT) from the signal thread, and the exit
-/// of `-- COMMAND`.
-enum RootEvent {
-    Host(HostEvent),
-    Stop,
+/// `mount`'s own triggers: the exit of `-- COMMAND`.
+enum MountTrigger {
     CommandExited(std::io::Result<std::process::ExitStatus>),
 }
 
@@ -462,24 +490,6 @@ struct Mount {
     /// `-- COMMAND`: empty for none.
     command: Vec<OsString>,
     volume: VolumeName,
-}
-
-/// Sends a [`RootEvent::Stop`] at each SIGTERM or SIGINT, from a thread of
-/// its own: installed once the volume is staged, so a signal while it boots
-/// waits in the channel for the loop.
-fn stop_on_signals(sender: mpsc::Sender<RootEvent>) -> Result<()> {
-    let mut signals = Signals::new([SIGTERM, SIGINT]).context("installing signal handlers")?;
-    std::thread::Builder::new()
-        .name("tree-signals".into())
-        .spawn(move || {
-            for _ in signals.forever() {
-                if sender.send(RootEvent::Stop).is_err() {
-                    break;
-                }
-            }
-        })
-        .context("starting the signal thread")?;
-    Ok(())
 }
 
 /// What a view that could not open says.
@@ -496,6 +506,37 @@ fn open_failure(at: &Path, error: &ViewError) -> String {
     }
 }
 
+/// `mount`'s part of the shared loop: the command told to stop at a stop,
+/// its exit a stop, and the last view ending a stop.
+struct MountDriver {
+    running: Option<command::Running>,
+    status: Option<u8>,
+}
+
+impl serving::Driver<MountTrigger> for MountDriver {
+    fn stopping(&mut self, _: &mut Serving<MountTrigger>) {
+        if let Some(command) = &self.running {
+            command.terminate();
+        }
+    }
+
+    fn view_ended(&mut self, serving: &mut Serving<MountTrigger>, _: ViewId) {
+        if serving.views.is_empty() {
+            serving.domains.unstage();
+        }
+    }
+
+    fn own(&mut self, serving: &mut Serving<MountTrigger>, trigger: MountTrigger) {
+        let MountTrigger::CommandExited(exited) = trigger;
+        self.running = None;
+        self.status = Some(command::exit_code(&exited));
+        if let Err(e) = &exited {
+            eprintln!("error: waiting for the command: {e}");
+        }
+        serving.domains.unstage();
+    }
+}
+
 impl Mount {
     /// Stages the volume (it recovers it, and never creates one); restores
     /// Trees and Clients on one store; makes or finds the fork view's fork;
@@ -507,7 +548,6 @@ impl Mount {
     /// every view unmounted) unstages: the clients are detached, their opens
     /// saved, the views closed, and the process exits once the volume is
     /// released, with the command's status when that is not 0.
-    #[allow(clippy::too_many_lines, reason = "one loop and its setup")]
     fn run(
         self,
         state: &Path,
@@ -515,32 +555,18 @@ impl Mount {
         fork: Option<ForkView>,
         minter: Minter,
     ) -> Result<ExitCode> {
-        let events = DomainEvents::default();
-        let clients = ClientsSlot::new(None);
-        let mut volume =
-            VolumeService::new(TreeStateArea::at(state), clients.clone(), events.clone());
-        match volume.stage(&self.at, &root_cap(&minter)?) {
-            Ok(_) => {}
-            Err(VolumeError::Busy) => return Ok(busy()),
-            Err(VolumeError::OtherFormat) => return Ok(other_format(state)),
-            Err(e) => bail!("opening tree state: {e}"),
-        }
-        let (sender, triggers) = mpsc::channel();
-        stop_on_signals(sender.clone())?;
-        let recording = volume
-            .area()
-            .recording()
-            .context("opening tree state: the staged volume is not served")?;
-        let mut domains = Domains::restore(
-            recording,
-            (minter, self.at.clone()),
-            events,
-            clients,
-            Some(volume),
-        )?;
+        let cap = root_cap(&minter)?;
+        let mut staged = match serving::stage::<MountTrigger>(state, &self.at, cap, minter)? {
+            Ok(staged) => staged,
+            Err(code) => return Ok(code),
+        };
+        let domains = &mut staged.domains;
         let mut specs = vec![root];
         if let Some(ForkView { mut spec, key }) = fork {
-            spec.tree = match domains.fork(key) {
+            let automatic = ForkSettings {
+                landing: Landing::Automatic,
+            };
+            spec.tree = match domains.fork(TreeId::Root, key, automatic) {
                 Ok(tree) => tree,
                 Err(TreeError::Ended) => {
                     eprintln!("error: {KEY_ENDED}");
@@ -553,35 +579,7 @@ impl Mount {
         }
         let mut bound: Vec<(PathBuf, TreeId, bool, Binding)> = Vec::new();
         for spec in specs {
-            let session = domains.sessions.open();
-            let resumable =
-                domains
-                    .clients()
-                    .resumable(&domains.cap, spec.tree, &spec.label, spec.access);
-            let answered = match resumable {
-                Some(client) => {
-                    domains
-                        .clients()
-                        .rebind(&client, self.at.clone(), session, &domains.cap)
-                }
-                None => {
-                    let grant = match spec.access {
-                        Access::ReadWrite => {
-                            Grant::live_read_write(spec.tree, Consistency::PerFile)
-                        }
-                        Access::ReadOnly => Grant::live_read_only(spec.tree, Consistency::PerFile),
-                    };
-                    domains.clients().attach(
-                        grant,
-                        spec.label,
-                        self.at.clone(),
-                        session,
-                        &domains.cap,
-                    )
-                }
-            };
-            domains.dispatch();
-            match answered {
+            match domains.bind(spec.tree, spec.label, spec.access, self.at.clone()) {
                 Ok(binding) => bound.push((spec.at, spec.tree, spec.over_stale, binding)),
                 Err(refused) => {
                     let ids: Vec<ClientId> = bound.into_iter().map(|(.., b)| b.client).collect();
@@ -597,21 +595,7 @@ impl Mount {
         let live: ClientSet = bound.iter().map(|(.., b)| b.client.clone()).collect();
         domains.reconcile(&live);
         domains.settle();
-        let notify = {
-            let sender = sender.clone();
-            Arc::new(move |event: HostEvent| {
-                // The receiver goes only once the loop has ended.
-                let _ = sender.send(RootEvent::Host(event));
-            })
-        };
-        let mut host = ViewHost::new(
-            domains.sessions.clone(),
-            state,
-            self.metrics_output.as_deref(),
-            notify,
-        )
-        .context("serving tree views")?;
-        let mut views: BTreeMap<ViewId, ClientId> = BTreeMap::new();
+        let (mut serving, sender) = Serving::start(staged, state, self.metrics_output.as_deref())?;
         let mut unopened: Vec<ClientId> = Vec::new();
         let mut opened: Vec<(PathBuf, TreeId)> = Vec::new();
         let mut failed = None;
@@ -625,9 +609,8 @@ impl Mount {
                 allow_other: self.allow_other,
                 over_stale,
             };
-            match host.open(MountPoint(at.clone()), binding, options) {
-                Ok(view) => {
-                    views.insert(view, client);
+            match serving.open(&at, binding, options) {
+                Ok(_) => {
                     if over_stale {
                         eprintln!(
                             "stacked over a stale mount at {} left by a crashed daemon",
@@ -639,17 +622,17 @@ impl Mount {
                 Err(e) => {
                     failed = Some(open_failure(&at, &e));
                     unopened.push(client);
-                    for view in views.keys() {
-                        host.close(*view);
-                    }
+                    serving.close_all();
                 }
             }
         }
-        domains.detach_all(&unopened);
-        let mut running = None;
-        let mut status: Option<u8> = None;
-        if views.is_empty() {
-            domains.unstage();
+        serving.domains.detach_all(&unopened);
+        let mut driver = MountDriver {
+            running: None,
+            status: None,
+        };
+        if serving.views.is_empty() {
+            serving.domains.unstage();
         } else if failed.is_none() {
             let mut line = format!("mounted volume {}", self.volume);
             for (i, (at, tree)) in opened.iter().enumerate() {
@@ -662,83 +645,33 @@ impl Mount {
             eprintln!("{line}; stop with SIGINT or SIGTERM");
             if !self.command.is_empty() {
                 match command::spawn(&self.command, sender.clone()) {
-                    Ok(started) => running = Some(started),
+                    Ok(started) => driver.running = Some(started),
                     Err(e) => {
                         eprintln!("error: starting {}: {e}", self.command[0].to_string_lossy());
-                        status = Some(EXIT_NOT_STARTED);
-                        domains.unstage();
+                        driver.status = Some(EXIT_NOT_STARTED);
+                        serving.domains.unstage();
                     }
                 }
             }
         }
         drop(sender);
-        // Each trigger is an event: no flag is polled and no timer runs. A
-        // stopped actor records nothing more, so no drain can finish: serving
-        // ends once its views have, and `wait` reports the stop.
-        loop {
-            if domains.released || (views.is_empty() && domains.stopped()) {
-                break;
-            }
-            if domains.draining {
-                domains.draining = false;
-                let ids: Vec<ClientId> = views.values().cloned().collect();
-                domains.detach_all(&ids);
-                // Every client of this launcher ends, not only the views':
-                // the release is judged from the Clients index alone.
-                domains.reconcile(&ClientSet::new());
-                for view in views.keys() {
-                    host.close(*view);
-                }
-                continue;
-            }
-            let Ok(trigger) = triggers.recv() else { break };
-            match trigger {
-                RootEvent::Stop => {
-                    if let Some(command) = &running {
-                        command.terminate();
-                    }
-                    domains.unstage();
-                    if domains.stopped() {
-                        for view in views.keys() {
-                            host.close(*view);
-                        }
-                    }
-                }
-                RootEvent::CommandExited(exited) => {
-                    running = None;
-                    status = Some(command::exit_code(&exited));
-                    if let Err(e) = &exited {
-                        eprintln!("error: waiting for the command: {e}");
-                    }
-                    domains.unstage();
-                }
-                RootEvent::Host(HostEvent::ViewEnded(view)) => {
-                    if let Some(client) = views.remove(&view) {
-                        domains.detach_all(&[client]);
-                    }
-                    if views.is_empty() {
-                        domains.unstage();
-                    }
-                }
-                RootEvent::Host(HostEvent::Landed) => domains.settle(),
-            }
-        }
+        serving.run(&mut driver);
         // The views are gone: a command still running is told to stop, and
         // its status is waited for.
-        if let Some(command) = running.take() {
+        if let Some(command) = driver.running.take() {
             command.terminate();
-            while let Ok(trigger) = triggers.recv() {
-                if let RootEvent::CommandExited(exited) = trigger {
-                    status = Some(command::exit_code(&exited));
+            while let Some(trigger) = serving.next() {
+                if let Trigger::Own(MountTrigger::CommandExited(exited)) = trigger {
+                    driver.status = Some(command::exit_code(&exited));
                     break;
                 }
             }
         }
-        host.wait().context("serving tree views")?;
+        serving.finish()?;
         if let Some(failed) = failed {
             bail!("serving tree views: {failed}");
         }
-        Ok(match status {
+        Ok(match driver.status {
             Some(code) if code != 0 => ExitCode::from(code),
             _ => ExitCode::SUCCESS,
         })
@@ -816,13 +749,33 @@ mod tests {
         assert_eq!(args.fork_key, "k");
     }
 
-    /// `init`, `mount` and `fork end` take `--state` only: a given `--root`
+    /// `init`, `mount`, `host` and `fork end` take `--state` only: a given `--root`
     /// (or `AGENTFS_ROOT`) or `--wait-lock` exits 1 before anything runs.
     #[test]
     fn the_tree_commands_refuse_root_and_wait_lock() {
         for args in [
             &["agentfs", "--root", "b", "init", "--volume", "t"][..],
             &["agentfs", "--root", "b", "mount", "m"][..],
+            &[
+                "agentfs",
+                "--root",
+                "b",
+                "host",
+                "--launcher",
+                "csi",
+                "--volume",
+                "t",
+            ][..],
+            &[
+                "agentfs",
+                "--wait-lock",
+                "1s",
+                "host",
+                "--launcher",
+                "csi",
+                "--volume",
+                "t",
+            ][..],
             &["agentfs", "--root", "b", "fork", "end", "--fork-key", "k"][..],
             &["agentfs", "--wait-lock", "1s", "init", "--volume", "t"][..],
         ] {

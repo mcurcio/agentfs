@@ -44,6 +44,7 @@ missing from these tables or a row names a module that no longer exists;
 | `audit.rs` | Principals and the audit stamps every row carries (`Audited<T>`), written by the store adapter |
 | `caps.rs` | Capabilities (`LaunchCap`, `ClientCap`) and the one `Minter` a composition root makes |
 | `clients.rs` | The Clients domain's contract: client ids, grants, bindings, errors, events and the `Clients` trait |
+| `host.rs` | The view host's control messages, one JSON object per line on `agentfs host`'s standard input and back: the hello, requests (open, close, reconcile, fork create, fork end), replies and refusal kinds |
 | `name.rs` | Validated names and labels (volume, pod field, writer, client, launcher, fork key) and the one safe-name rule |
 | `pod.rs` | The pod context a writer ran in, and a writer with it (`WriterAt`), as commits name them |
 | `ports.rs` | The ports adapters implement: the state area, each domain's rows as journal steps, queue facts, sessions and the event sink |
@@ -186,7 +187,7 @@ missing from these tables or a row names a module that no longer exists;
 | `listening_socket.rs` | `Listener`, the one way agentfs listens on a Unix socket (control socket, history service, agentfs-csi), shut down (`SHUT_RDWR`) when stopped or dropped so a child process still sharing it cannot take connections no one answers; `clippy.toml` disallows raw listener construction elsewhere |
 | `fsutil.rs` | Small filesystem helpers: atomic JSON state files under `<state>/meta`, fsyncing a directory, making directories durably, and a file's bytes reflinked or copied, shared by the recording engine and the tree engine |
 | `config.rs` | Operator settings from the history repository's own git config, and `config::KEYS` |
-| `operator_settings.rs` | A tree volume's operator settings: `<state>/config`, its `include.path` lines written whole and read with libgit2 following them, and `classify`, the one table of keys tree volumes do not build yet (push, patches, LFS, other) |
+| `operator_settings.rs` | A tree volume's operator settings: `<state>/config`, its `include.path` lines written whole and read with libgit2 following them, `classify`, the one table of keys tree volumes do not build yet (push, patches, LFS, other), and `install_rules`, which installs a launcher's operator rule files as `info/exclude` and `info/attributes`, each written whole |
 | `events.rs` | Alarm and event signals, handed to a non-blocking sink |
 | `failpoints.rs` | Named failpoints on the durable path, acting only in test builds with the `failpoints` feature ([crash model](#crash-model)) |
 | `telemetry.rs` | OpenTelemetry instruments and spans over the API only, the `agentfs.not_built` gauge among them; the binary picks exporters |
@@ -255,8 +256,10 @@ missing from these tables or a row names a module that no longer exists;
 
 | Module | Role |
 |---|---|
-| `launcher/mod.rs` | The tree engine's composition root: `init` (`ensure` through the Volume domain, then recovery and the operator settings' includes), `mount` and `fork end` (`mount` prepares its mount points, reads the operator settings, stages through the Volume domain; a fork through the Trees domain on the store adapter; per view a client rebound or attached through the Clients domain, the rest reconciled, each served by the view host and detached as its view ends; SIGTERM, SIGINT, the command's exit or the last view's end unstages, and it exits once Volume releases; one channel carries every trigger of its loop) |
-| `launcher/domains.rs` | One volume's domains restored on one store, and the one dispatcher that hands each domain event to its consumers |
+| `launcher/mod.rs` | The tree engine's composition root: `init` (`ensure` through the Volume domain, then recovery and the operator settings' includes), `mount` and `fork end` (`mount` prepares its mount points, reads the operator settings, stages through the Volume domain; a fork through the Trees domain on the store adapter; per view a client rebound or attached through the Clients domain, the rest reconciled, each served by the view host and detached as its view ends; SIGTERM, SIGINT, the command's exit or the last view's end unstages, and it exits once Volume releases) |
+| `launcher/serving.rs` | What `mount` and `host` share: the volume staged and its domains restored as one launcher, the view host started, each view's client detached as its view ends, and the drain at a stop until Volume releases; one channel carries every trigger of the loop, and each command adds its own |
+| `launcher/host.rs` | `agentfs host`: its standard input checked as a Unix stream socket, the boot as `mount`'s under `--launcher`, the hello line, then each request of its parent answered in order (a view opened, rebinding or attaching its client with the request's pod context and stacking over a stale mount of its own source; closed once it has ended; reconcile; a keyed fork created or ended); EOF, SIGTERM or SIGINT drains it |
+| `launcher/domains.rs` | One volume's domains restored on one store as one launcher, the one dispatcher that hands each domain event to its consumers, and a view's client rebound or attached |
 | `launcher/mountpoint.rs` | Each view's mount point before staging: a live or foreign mount refused, a stale one refused, held or stacked over (`--on-stale-mount`), a bare one created, checked empty and sealed |
 | `launcher/settings.rs` | The operator settings at every mount: includes under a view refused, missing ones warned of, each not-built key logged and counted |
 | `launcher/command.rs` | `mount -- COMMAND`: the command spawned once every view is up, its exit a trigger of the loop, a stop sent on as SIGTERM through a pidfd |

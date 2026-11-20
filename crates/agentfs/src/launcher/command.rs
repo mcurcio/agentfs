@@ -13,7 +13,8 @@ use std::sync::mpsc;
 
 use rustix::process::{Pid, PidfdFlags, Signal, pidfd_open, pidfd_send_signal};
 
-use super::RootEvent;
+use super::MountTrigger;
+use super::serving::Trigger;
 
 /// The command, running. Signalled through a pidfd, so a signal never
 /// reaches another process that took its pid once it was reaped.
@@ -32,12 +33,15 @@ impl Running {
 }
 
 /// Spawns `argv` and a thread that waits for it and sends
-/// [`RootEvent::CommandExited`] on `sender`.
+/// [`MountTrigger::CommandExited`] on `sender`.
 ///
 /// # Errors
 ///
 /// The spawn's error (a missing program, say).
-pub(super) fn spawn(argv: &[OsString], sender: mpsc::Sender<RootEvent>) -> io::Result<Running> {
+pub(super) fn spawn(
+    argv: &[OsString],
+    sender: mpsc::Sender<Trigger<MountTrigger>>,
+) -> io::Result<Running> {
     let (program, args) = argv
         .split_first()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no command given"))?;
@@ -57,7 +61,7 @@ pub(super) fn spawn(argv: &[OsString], sender: mpsc::Sender<RootEvent>) -> io::R
         .spawn(move || {
             let status = child.wait();
             // The receiver goes only once the loop has ended.
-            let _ = sender.send(RootEvent::CommandExited(status));
+            let _ = sender.send(Trigger::Own(MountTrigger::CommandExited(status)));
         })?;
     Ok(Running { pidfd })
 }
