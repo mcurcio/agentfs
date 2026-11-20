@@ -6,11 +6,10 @@ as a push, raises an alarm and is retried. Nothing the workload wrote is
 lost from the backing tree; what may be missing is its history. The
 usual cause is a state area that is full or cannot be written.
 
-Sections 1 to 4 are the recording engine's, which the CSI driver runs
-([csi.md](../csi.md#9-operations)): run their commands in the node plugin
-pod of the node that holds the volume. Sections 5 to 7 are the tree
-views', which the sidecar, the Docker examples and `agentfs mount` run
-([trees](../trees.md)); there `$STATE` is the volume's state area (the
+Sections 1 to 4 are the recording engine's, on recording state areas, which no launcher runs any more ([moving.md](moving.md) moves the CSI volumes
+an older driver made); their `kubectl` lines apply to no volume today.
+Sections 5 to 7 are the tree views', which the sidecar, the Docker
+examples, `agentfs mount` and the CSI driver run ([trees](../trees.md)); there `$STATE` is the volume's state area (the
 sidecar's and Docker's `/data/state`).
 
 ```sh

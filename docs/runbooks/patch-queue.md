@@ -10,9 +10,9 @@ and forks of forks roll up through it ([section 9](#9-forks-of-forks)).
 A start that may have a workload attached holds the queue
 ([section 10](#10-patches-held-while-a-workload-may-be-attached)). How it works: [patches](../patches.md), [remotes](../remotes.md).
 
-The patch queue is the recording engine's, which the CSI driver runs
-([csi.md](../csi.md#9-operations)). Tree volumes (the sidecar, the Docker
-examples and `agentfs mount`) apply no patches yet: a configured patch
+The patch queue is the recording engine's, on recording state areas, which no launcher runs any more ([moving.md](moving.md) moves the CSI volumes
+an older driver made). Its "Under CSI" steps apply to no volume today: the CSI driver runs tree volumes. Tree volumes (the sidecar, the Docker
+examples, `agentfs mount` and the CSI driver) apply no patches yet: a configured patch
 source is logged at every boot as not built and counted by the
 `agentfs.not_built` gauge, which raises `AgentfsNotBuilt`
 ([trees](../trees.md#operator-settings)), and the `patch` commands refuse a

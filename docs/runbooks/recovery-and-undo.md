@@ -3,8 +3,8 @@
 Bring files back to an earlier state after an agent (or anyone) changed
 them by mistake. Safety promise: [guarantees](../guarantees.md).
 
-`restore` and `revert` are the recording engine's, which the CSI driver
-runs ([csi.md](../csi.md#9-operations)). On a tree volume (the sidecar, the Docker examples and `agentfs mount`)
+`restore` and `revert` are the recording engine's, on recording state areas, which no launcher runs any more
+([moving.md](moving.md) moves the CSI volumes an older driver made). Its "Under CSI" steps apply to no volume today: the CSI driver runs tree volumes. On a tree volume (the sidecar, the Docker examples, `agentfs mount` and the CSI driver)
 they are not built yet and refuse; its history is still plain git in
 `<state>/history.git` (section 5's plain-git steps read it,
 [trees](../trees.md)).

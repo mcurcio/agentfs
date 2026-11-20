@@ -1,156 +1,143 @@
-# Runbook: moving a volume to another node
+# Runbook: moving a CSI volume
 
-Each claim's worktree (its files and its branch `agentfs/<volume>`) lives
-on the disk of the node that created it, for good: one branch per
-worktree ([csi.md](../csi.md)). A volume never moves. To continue its work on another node,
-you make a **new volume started from the old branch**: a claim on a
-start class (`startFrom: <remote>:agentfs/<old volume>@<commit>`) gets a
-new worktree on the node its pod is scheduled to, whose history begins at
-that commit, fetched once from the remote, on a new branch
-`agentfs/<new volume>`. Which branch is current is your choice; nothing
-fences the old one. Move when a node is lost, drained for good or being
-retired.
+The CSI driver runs tree volumes ([csi.md](../csi.md)). Each claim's
+volume lives on the disk of the node that created it, for good, and the
+driver never serves a volume an older driver made on the recording
+engine. This runbook covers both moves an operator makes by hand:
 
-What a move costs: the new volume has a new branch, so readers, iac's
-patches and alerts must be pointed at it by hand, and the old volume's
-patch queue and `diverged/*` refs stay with the old branch. A start
-writes the commit's tree, so files history does not record (ignored or
-oversize ones), ownership (set the pod's `fsGroup`), modes beyond the
-executable bit, timestamps, xattrs and empty directories are not carried
-over. A local-only volume (no remote) cannot move: its history dies with
-its disk.
+- [moving a recording-format volume onto the tree engine](#moving-a-recording-format-volume-onto-the-tree-engine):
+  a claim made before the driver ran tree volumes;
+- [moving a tree volume to another node](#moving-a-tree-volume-to-another-node):
+  not built; its files can be copied, and its history does not continue.
 
-This procedure is not run in CI as written; `ci/e2e-csi-move.sh` runs the
-same steps on a two-node kind cluster.
+Throughout, `<base>` is the node plugin's `--base-path` (default
+`/var/lib/agentfs-csi/volumes`) and `$NODE_POD` the node plugin pod on the
+volume's node:
 
-## Symptoms
+```sh
+NODE_POD=$(kubectl -n agentfs-csi get pod -l app.kubernetes.io/name=agentfs-csi-node \
+  --field-selector spec.nodeName=<node> -o name)
+```
 
-- `kubectl get nodes` shows the volume's node `NotReady`, or you are
-  retiring it.
-- The workload's pods are `Pending` with a `FailedScheduling` event
-  naming a volume node affinity conflict: the PV is pinned to the node
-  (`topology.agentfs.mcurcio.github.io/node`).
+The PV names its node in `nodeAffinity` (`kubectl get pv <pv> -o yaml`).
+Neither procedure is run in CI as written.
 
-## Steps
+## Moving a recording-format volume onto the tree engine
 
-1. **Find the volume and the commit to start from.** The PV, its volume
-   name and node:
+**Symptoms.** After the driver's upgrade, a pod of an old claim waits in
+`ContainerCreating` with a `FailedMount` event, or a deleted old claim's
+PV stays `Released` with `VolumeFailedDelete` warning events, each
+saying:
 
-   ```sh
-   kubectl get pvc <claim> -n <ns> -o jsonpath='{.spec.volumeName}{"\n"}'
-   kubectl get pv <pv> -o jsonpath='{.spec.csi.volumeAttributes.volume}{"\n"}{.spec.nodeAffinity}{"\n"}'
-   ```
+```text
+volume <pv> is a recording-format volume (<base>/<pv>): this driver never serves or deletes it; archive it and remove the directory by hand (docs/runbooks/moving.md)
+```
 
-   Then the branch's tip on the remote the new volume will start from (a
-   push remote of the profile):
+The plugin also names each such directory in its log at start
+(`recording-format volume <pv> at <dir> is not served by this driver`).
+kube-state-metrics' `kube_persistentvolume_status_phase{phase="Released"}`
+can alert on the PVs left this way.
 
-   ```sh
-   git ls-remote <remote url> refs/heads/agentfs/<volume>
-   ```
+A recording-format directory holds `backing/` (the files the pods saw),
+`state/` (its state area; the history is `state/git`, branch
+`agentfs/<volume>`) and the old driver's `csi.json`. The volume name is
+the PV's `spec.csi.volumeAttributes.volume`. Nothing in this procedure
+needs the old driver; run it before or after the upgrade.
 
-   - **The old node is up** (a planned move): stop the workload first
-     (step 2), then check the old worktree from that node's plugin pod.
-     Every remote must show no unpushed commits, and the tip `git
-     ls-remote` shows is the commit to pin:
+1. **Stop the old claim's pods**, so nothing writes the directory.
 
-     ```sh
-     NODE_POD=$(kubectl -n agentfs-csi get pod -l app.kubernetes.io/name=agentfs-csi-node \
-       --field-selector spec.nodeName=<old node> -o name)
-     kubectl -n agentfs-csi exec "$NODE_POD" -c agentfs-csi -- \
-       agentfs --state /var/lib/agentfs-csi/volumes/<pv>/state status
-     ```
-
-     `remote: ... 0 unpushed` on every remote line, and `last pushed`
-     equal to that tip. If a remote lacks commits, wait for the release
-     scan to push them (the volume is not staged once the pods are gone),
-     or run `agentfs push` there.
-   - **The old node is lost**: pin the remote's tip. Commits the lost
-     node had not pushed are on its disk only. If it comes back, its
-     release scan pushes them to the old branch, and the new volume's
-     start-branch alarm names them
-     ([start-branch-moved.md](start-branch-moved.md)).
-   - **The remote was on the lost node** (a git server pod with storage
-     on it): recover the remote first; nothing can start without it.
-
-2. **Stop the workload**: scale it to 0 and wait for its pods to go.
+2. **Commit what the old volume's journal holds**, if anything. The
+   recording commands still read a recording state area:
 
    ```sh
-   kubectl scale deployment/<workload> -n <ns> --replicas=0
+   kubectl -n agentfs-csi exec "$NODE_POD" -c agentfs-csi -- \
+     agentfs --state <base>/<pv>/state --root <base>/<pv>/backing flush
    ```
 
-   A pod on a lost node stays `Terminating`: delete it with `--force
-   --grace-period=0` once you know the node is down.
-
-3. **Delete the claim.** Its PV turns `Released`: DeleteVolume runs on
-   the old node, and waits (`UNAVAILABLE`, retried) while a remote lacks
-   the branch's head, or the node is gone.
+3. **Archive the history**, whole, as a git bundle, and copy it off the
+   node:
 
    ```sh
-   kubectl delete pvc <claim> -n <ns>
+   kubectl -n agentfs-csi exec "$NODE_POD" -c agentfs-csi -- \
+     git --git-dir <base>/<pv>/state/git bundle create /tmp/<pv>.bundle --all
+   kubectl -n agentfs-csi cp "${NODE_POD#pod/}":/tmp/<pv>.bundle ./<pv>.bundle -c agentfs-csi
    ```
 
-4. **Create a start class** pinned to the commit, with the old class's
-   profile and parameters:
+   Keep it wherever you keep history (a git server: `git clone
+   <pv>.bundle`, then push it). Check it with `git bundle verify`.
 
-   ```yaml
-   apiVersion: storage.k8s.io/v1
-   kind: StorageClass
-   metadata:
-     name: <class>-move-<volume>
-   provisioner: agentfs.mcurcio.github.io
-   parameters:
-     profile: <profile>
-     startFrom: "<remote>:agentfs/<volume>@<commit>"
-   reclaimPolicy: Delete
-   volumeBindingMode: WaitForFirstConsumer
-   ```
-
-   `<remote>` is a remote section of the profile (`origin`), `<commit>`
-   the full id from step 1. A `refs/...` name such as a `diverged/*` ref
-   is refused: start from a branch.
-
-5. **Re-create the claim** on the start class (same name, so the
-   workload needs no change), and **scale up**:
+4. **Archive the files** to carry into the new volume. The branch's tip
+   holds every recorded file:
 
    ```sh
-   kubectl scale deployment/<workload> -n <ns> --replicas=1
+   kubectl -n agentfs-csi exec "$NODE_POD" -c agentfs-csi -- \
+     git --git-dir <base>/<pv>/state/git archive --format=tar \
+       -o /tmp/<pv>.tar agentfs/<volume>
+   kubectl -n agentfs-csi cp "${NODE_POD#pod/}":/tmp/<pv>.tar ./<pv>.tar -c agentfs-csi
    ```
 
-   The pod is scheduled to a node, and that node's provisioner makes the
-   new worktree there from the pinned commit. A claim that stays
-   `Pending` names the reason in its `ProvisioningFailed` events (an
-   unreachable remote is retried; a commit not on the branch is not).
+   Files history never recorded (ignored or oversize ones) are only in
+   `<base>/<pv>/backing`; take them with `tar -C <base>/<pv>/backing -cf
+   /tmp/<pv>-backing.tar .` instead if the workload needs them.
 
-6. **Delete the start class** once the claim is bound: any later claim
-   on it would start from the same commit, in any namespace.
+5. **Create a new claim on a tree class** (any class of the driver, now
+   that it runs tree volumes), and a pod that mounts it. A helper pod on
+   the same claim must be the only pod: one pod per claim.
+
+6. **Unpack the archive through the new claim's mount**, from that pod,
+   so every file is recorded in the new volume's history:
 
    ```sh
-   kubectl delete storageclass <class>-move-<volume>
+   kubectl -n <ns> cp ./<pv>.tar <pod>:/tmp/<pv>.tar
+   kubectl -n <ns> exec <pod> -- tar -C <mount path> -xf /tmp/<pv>.tar
    ```
 
-7. **Point readers at the new branch**: the new volume's branch is
-   `agentfs/<new volume>` (its `volume` attribute in `kubectl get pv`).
-   Retarget iac's patches (the new volume's inbox) and any alerts or
-   dashboards keyed on the old volume.
+   Then delete the helper pod and point the workload at the new claim.
 
-8. **The old PV.** If the old node comes back, its release scan pushes
-   what it had not, and DeleteVolume completes on its own (`onDelete:
-   delete` removes the old worktree; `retain` keeps it on that node's
-   disk, `csi.retained.json`). If the node is gone for good, the PV
-   stays `Released` with the provisioner's finalizer: remove it, and the
-   old worktree's unpushed commits are lost with the disk.
+7. **Remove the old directory by hand** on the old node, once the bundle
+   is safe:
 
    ```sh
-   kubectl patch pv <old pv> --type json \
-     -p '[{"op":"remove","path":"/metadata/finalizers"}]'
+   kubectl -n agentfs-csi exec "$NODE_POD" -c agentfs-csi -- rm -rf <base>/<pv>
    ```
+
+8. **Delete the old claim**, if it is not deleted yet. The provisioner's
+   next retry of DeleteVolume finds no volume and succeeds, and the PV
+   goes.
+
+What the move costs: the new volume's history starts at the unpacked
+files (one save per file the pod wrote); the old history stays in the
+bundle, not in the new volume. Ownership, modes beyond the executable
+bit, timestamps and extended attributes are what `tar` and the pod's
+user give them.
+
+## Moving a tree volume to another node
+
+**Not built.** A tree volume never leaves its node, and a class with
+`startFrom` is refused (`startFrom is not built on tree volumes`).
+Draining or losing the node leaves its pods `Pending`.
+
+While the node is up, copy the files out through the volume's mount into
+a new claim on the other node:
+
+1. Stop the workload, then run one pod on the old claim (on the old node)
+   and archive its mount: `kubectl -n <ns> exec <pod> -- tar -C <mount
+   path> -cf /tmp/files.tar .` and `kubectl cp` it out.
+2. Archive the history if you want it: `git --git-dir
+   <base>/<pv>/state/history.git bundle create /tmp/<pv>.bundle --all` in
+   the old node's plugin pod, as above.
+3. Create a new claim whose first pod is scheduled on the other node, and
+   unpack the files through its mount, as in step 6 above.
+4. Delete the old claim: DeleteVolume keeps its directory on the old node
+   (`csi.retained.json`). Remove `<base>/<pv>` there by hand once you no
+   longer need it.
+
+The new volume's history starts at the copied files; the old one's does
+not continue. A volume on a node that is lost for good is lost with its
+disk: push is not built, so no remote holds its history.
 
 ## Related
 
-- [start-branch-moved.md](start-branch-moved.md): the old branch received
-  commits after the move.
-- [divergence.md](divergence.md): a remote branch another writer wrote.
-- [csi-recovery.md](csi-recovery.md): crashed fronts, services and node
-  plugins on a node that is still up.
-- [history-service-down.md](history-service-down.md): fronts failing
-  with `EIO` while the history service is down.
+- [csi-recovery.md](csi-recovery.md): crashed hosts and node plugins on a
+  node that is still up.
+- [csi.md](../csi.md#11-where-volumes-live): where volumes live.

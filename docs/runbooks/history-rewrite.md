@@ -11,8 +11,8 @@ replaced, by an operator, and only through that command: no runbook
 `git push`es a branch (a test, `runbooks_push_only_the_namespace`,
 holds them to refs under `refs/agentfs/`).
 
-This procedure is for the recording engine's volumes, which the CSI driver
-runs ([csi.md](../csi.md#9-operations)). A tree volume (the sidecar, the
+This procedure is for the recording engine's volumes, on recording state areas, which no launcher runs any more
+([moving.md](moving.md) moves the CSI volumes an older driver made). Its "Under CSI" steps apply to no volume today: the CSI driver runs tree volumes. A tree volume (the sidecar, the
 Docker examples and `agentfs mount`) keeps its history in
 `<state>/history.git` and pushes it nowhere yet; this runbook does not
 cover rewriting it.

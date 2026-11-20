@@ -4,9 +4,9 @@ Someone else moved the volume's branch on a remote, so agentfs can no
 longer push to it without overwriting their commits, which it never
 does. How pushes and shared branches work is in [remotes](../remotes.md).
 
-This runbook is for the recording engine, which the CSI driver runs
-([csi.md](../csi.md#9-operations)). Tree volumes (the sidecar, the Docker
-examples and `agentfs mount`) push to no remote yet, so they never diverge.
+This runbook is for the recording engine, on recording state areas, which no launcher runs any more ([moving.md](moving.md) moves the CSI volumes
+an older driver made). Its "Under CSI" steps apply to no volume today: the CSI driver runs tree volumes. Tree volumes (the sidecar, the Docker
+examples, `agentfs mount` and the CSI driver) push to no remote yet, so they never diverge.
 
 ## Symptoms
 

@@ -5,9 +5,9 @@ committing are unaffected: commits stay safe in the state area and go out
 with the next successful push. How it works: [remotes](../remotes.md), alarms and metrics:
 [telemetry](../telemetry.md).
 
-This runbook is for the recording engine, which the CSI driver runs
-([csi.md](../csi.md#9-operations)). Tree volumes (the sidecar, the Docker
-examples and `agentfs mount`) push to no remote yet: a configured remote
+This runbook is for the recording engine, on recording state areas, which no launcher runs any more ([moving.md](moving.md) moves the CSI volumes
+an older driver made). Its "Under CSI" steps apply to no volume today: the CSI driver runs tree volumes. Tree volumes (the sidecar, the Docker
+examples, `agentfs mount` and the CSI driver) push to no remote yet: a configured remote
 is logged at every boot as not built and counted by the
 `agentfs.not_built` gauge ([trees](../trees.md#operator-settings)).
 

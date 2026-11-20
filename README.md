@@ -263,7 +263,7 @@ passes its tests, and the Helm charts as `<version>-main.<run>`.
 | Area | State |
 |---|---|
 | Tree views behind the sidecar, the Docker examples and the CLI (`init`, `mount`, `fork end`): recording, directories, links, owners and modes, operator rules and the untracked area, forks, restart after a crash, the not-built alarm | Built, tested end to end in CI including a kind cluster and upstream Hermes |
-| On tree volumes: push, the patch queue, `restore` and `revert`, telemetry beyond the not-built gauge, LFS, database groups, forked volumes and the sandbox overlay | Not built: each configured setting is logged at every boot and alarmed ([supported configurations](docs/supported-configurations.md#15-tree-volumes-the-sidecar-docker-and-the-cli)) |
+| On tree volumes: push, the patch queue, `restore` and `revert`, telemetry beyond the not-built gauge, LFS, database groups, forked volumes and the sandbox overlay | Not built: each configured setting is logged at every boot and alarmed ([supported configurations](docs/supported-configurations.md#15-tree-volumes-the-sidecar-docker-the-cli-and-the-csi-driver)) |
 | The CSI driver, on the recording engine: push to any remote, path rules, the patch queue, recovery, Git LFS, databases, forked volumes, several pods on one volume | Built: one node per volume, its worktree on that node's disk; moving is a new volume started from its branch |
 | The CSI driver on tree views | Not built |
 | Docker examples, Helm charts, example alert rules | Built and tested in CI |

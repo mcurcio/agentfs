@@ -6,9 +6,9 @@ it, and every remote's LFS server. This runbook covers watching that
 space, freeing the local cache safely, and getting objects back. How it works: [recording](../recording.md), [remotes](../remotes.md); settings:
 [Git LFS](../configuration.md#git-lfs).
 
-LFS is the recording engine's, which the CSI driver runs
-([csi.md](../csi.md#9-operations)). Tree volumes (the sidecar, the Docker
-examples and `agentfs mount`) do not build it: a `filter=lfs` rule refuses
+LFS is the recording engine's, on recording state areas, which no launcher runs any more ([moving.md](moving.md) moves the CSI volumes
+an older driver made). Its "Under CSI" steps apply to no volume today: the CSI driver runs tree volumes. Tree volumes (the sidecar, the Docker
+examples, `agentfs mount` and the CSI driver) do not build it: a `filter=lfs` rule refuses
 the volume, and an LFS setting is logged at every boot as not built
 ([trees](../trees.md#operator-settings)).
 

@@ -11,8 +11,8 @@ finds the right repository, but it can be fooled: two repositories
 whose admin directories end the same way, or a path the workload never
 meant.
 
-This runbook is for the recording engine, which the CSI driver runs
-([csi.md](../csi.md)). Tree volumes (the sidecar, the Docker examples and
+This runbook is for the recording engine, on recording state areas, which
+no launcher runs any more; the CSI driver runs tree volumes ([csi.md](../csi.md)). Tree volumes (the sidecar, the Docker examples and
 `agentfs mount`) never record inside a nested repository and have no
 heuristic ([trees](../trees.md#rules-and-the-untracked-area)).
 
