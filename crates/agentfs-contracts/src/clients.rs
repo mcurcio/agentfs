@@ -99,11 +99,43 @@ pub type ClientSet = BTreeSet<ClientId>;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SessionId(pub u64);
 
-/// A file's numeric owner and group.
+/// A file's numeric owner and group; also the owner a new volume's root
+/// directory is recorded with (`VolumeSpec::root_owner`, `init --owner`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct FileOwner {
     pub uid: u32,
     pub gid: u32,
+}
+
+/// Text that is not `UID:GID`.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{0:?} is not UID:GID (two decimal numbers)")]
+pub struct OwnerError(pub String);
+
+impl std::str::FromStr for FileOwner {
+    type Err = OwnerError;
+
+    /// `UID:GID`, each a decimal `u32`, nothing else.
+    fn from_str(text: &str) -> Result<Self, OwnerError> {
+        let refuse = || OwnerError(text.to_owned());
+        let (uid, gid) = text.split_once(':').ok_or_else(refuse)?;
+        let number = |part: &str| {
+            if part.is_empty() || !part.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(refuse());
+            }
+            part.parse::<u32>().map_err(|_| refuse())
+        };
+        Ok(Self {
+            uid: number(uid)?,
+            gid: number(gid)?,
+        })
+    }
+}
+
+impl std::fmt::Display for FileOwner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:{}", self.uid, self.gid)
+    }
 }
 
 /// What a client may do.

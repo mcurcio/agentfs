@@ -25,6 +25,7 @@ use std::process::ExitCode;
 use std::sync::{Arc, mpsc};
 
 use agentfs_contracts::caps::{LaunchCap, LaunchScope, Minter};
+use agentfs_contracts::clients::FileOwner;
 use agentfs_contracts::clients::{
     Access, AttachedLookup, Binding, ClientError, ClientId, ClientSet, Clients, Consistency, Grant,
 };
@@ -33,9 +34,7 @@ use agentfs_contracts::pod::PodContext;
 use agentfs_contracts::ports::{Found, StateArea};
 use agentfs_contracts::trees::{TreeError, Trees};
 use agentfs_contracts::views::{MountOptions, MountPoint, ViewError, ViewId, Views};
-use agentfs_contracts::volume::{
-    EnsureOutcome, Owner, StartPoint, Volume, VolumeError, VolumeSpec,
-};
+use agentfs_contracts::volume::{EnsureOutcome, StartPoint, Volume, VolumeError, VolumeSpec};
 use agentfs_core::identity::Context as Identity;
 use agentfs_core::operator_settings;
 use agentfs_core::state_area::TreeStateArea;
@@ -98,7 +97,7 @@ pub struct InitArgs {
     /// The owner a new volume's root directory is recorded with. Applies
     /// only when the volume is created.
     #[arg(long, env = "AGENTFS_OWNER", value_name = "UID:GID")]
-    pub owner: Option<Owner>,
+    pub owner: Option<FileOwner>,
     #[command(flatten)]
     pub pod: PodArgs,
 }

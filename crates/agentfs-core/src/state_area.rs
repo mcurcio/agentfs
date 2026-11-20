@@ -10,12 +10,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use agentfs_contracts::audit::{Audited, Principal};
+use agentfs_contracts::clients::FileOwner;
 use agentfs_contracts::name::VolumeName;
 use agentfs_contracts::pod::PodContext;
 use agentfs_contracts::ports::{Found, QueueFacts, StateArea, StoreError, VolumeStore};
 use agentfs_contracts::tree::TreeId;
 use agentfs_contracts::volume::{
-    EnsureOutcome, Owner, VolumeError, VolumeEvent, VolumeId, VolumeIdentity, VolumeState,
+    EnsureOutcome, VolumeError, VolumeEvent, VolumeId, VolumeIdentity, VolumeState,
 };
 
 use crate::store::{TreeStore, io_kind};
@@ -72,7 +73,7 @@ impl StateArea for TreeStateArea {
     fn create(
         &mut self,
         name: &VolumeName,
-        root_owner: Option<Owner>,
+        root_owner: Option<FileOwner>,
         at: &PodContext,
     ) -> Result<(VolumeIdentity, EnsureOutcome), VolumeError> {
         let identity = VolumeIdentity {

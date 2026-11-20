@@ -650,7 +650,7 @@ whose saves are ordered by one actor. It is not the recorder above and does
 not share its state format. `TreeActor::create(root, identity, root_owner, service)` makes a
 volume with its identity (`agentfs_contracts::volume::VolumeIdentity`: a name
 and an id). Its Root commit records the root directory with mode 0755 and
-`root_owner` (an `agentfs_contracts::volume::Owner`, uid and gid, parsed from
+`root_owner` (an `agentfs_contracts::clients::FileOwner`, uid and gid, parsed from
 `UID:GID`), or the creating process's effective uid and gid when `None`.
 A launcher passes it as `VolumeSpec.root_owner`; `ensure` uses it only when it
 creates the volume and never compares it, since a found volume's root owner is

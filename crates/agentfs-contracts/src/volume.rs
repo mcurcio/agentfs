@@ -6,7 +6,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::caps::LaunchCap;
-use crate::clients::ClientSet;
+use crate::clients::{ClientSet, FileOwner};
 use crate::name::VolumeName;
 use crate::pod::PodContext;
 use crate::tree::TreeId;
@@ -25,44 +25,6 @@ pub struct VolumeIdentity {
     pub id: VolumeId,
 }
 
-/// The owner a new volume's root directory is recorded with.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct Owner {
-    pub uid: u32,
-    pub gid: u32,
-}
-
-/// Text that is not `UID:GID`.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("{0:?} is not UID:GID (two decimal numbers)")]
-pub struct OwnerError(pub String);
-
-impl std::str::FromStr for Owner {
-    type Err = OwnerError;
-
-    /// `UID:GID`, each a decimal `u32`, nothing else.
-    fn from_str(text: &str) -> Result<Self, OwnerError> {
-        let refuse = || OwnerError(text.to_owned());
-        let (uid, gid) = text.split_once(':').ok_or_else(refuse)?;
-        let number = |part: &str| {
-            if part.is_empty() || !part.bytes().all(|b| b.is_ascii_digit()) {
-                return Err(refuse());
-            }
-            part.parse::<u32>().map_err(|_| refuse())
-        };
-        Ok(Self {
-            uid: number(uid)?,
-            gid: number(gid)?,
-        })
-    }
-}
-
-impl std::fmt::Display for Owner {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}:{}", self.uid, self.gid)
-    }
-}
-
 /// What a launcher asks for, built from its configuration. No id: `ensure`
 /// assigns it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -72,7 +34,7 @@ pub struct VolumeSpec {
     /// The root directory's owner when `ensure` creates the volume; `None`
     /// is the creating process's effective uid and gid. Never compared and
     /// never applied to a found volume: its root's owner is content.
-    pub root_owner: Option<Owner>,
+    pub root_owner: Option<FileOwner>,
 }
 
 /// Where the root's history begins.
@@ -181,7 +143,7 @@ pub enum VolumeError {
     #[error("only the volume's own launcher may do this")]
     NotPermitted,
     /// `stage` at a location `ensure` never created: mount never creates.
-    #[error("no volume here: create it first (`agentfs trees init --volume NAME`)")]
+    #[error("no volume here: create it first (`agentfs init --volume NAME`)")]
     NotCreated,
     #[error("another volume is here: its {0:?} differs")]
     SpecMismatch(SpecField),
@@ -269,20 +231,21 @@ pub trait Volume {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::clients::OwnerError;
     use crate::ports::StoreError;
 
     #[test]
     fn an_owner_is_two_decimal_numbers() {
-        let owner: Owner = "10000:10000".parse().unwrap();
+        let owner: FileOwner = "10000:10000".parse().unwrap();
         assert_eq!(
             owner,
-            Owner {
+            FileOwner {
                 uid: 10000,
                 gid: 10000
             }
         );
-        assert_eq!(owner.to_string().parse::<Owner>(), Ok(owner));
-        assert_eq!(Owner { uid: 0, gid: 7 }.to_string(), "0:7");
+        assert_eq!(owner.to_string().parse::<FileOwner>(), Ok(owner));
+        assert_eq!(FileOwner { uid: 0, gid: 7 }.to_string(), "0:7");
         for refused in [
             "10000",
             "a:b",
@@ -294,7 +257,7 @@ mod tests {
             "4294967296:0",
         ] {
             assert_eq!(
-                refused.parse::<Owner>(),
+                refused.parse::<FileOwner>(),
                 Err(OwnerError(refused.to_owned())),
                 "{refused}"
             );

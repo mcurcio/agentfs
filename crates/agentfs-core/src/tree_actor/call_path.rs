@@ -8,8 +8,9 @@
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use agentfs_contracts::clients::FileOwner;
 use agentfs_contracts::pod::PodContext;
-use agentfs_contracts::volume::{Owner, VolumeIdentity};
+use agentfs_contracts::volume::VolumeIdentity;
 
 use super::history::built::History;
 use super::journal::durable::{Durability, RecordNo};
@@ -109,7 +110,7 @@ impl Recording {
     pub fn create(
         root: &Path,
         identity: &VolumeIdentity,
-        root_owner: Option<Owner>,
+        root_owner: Option<FileOwner>,
         service: &PodContext,
     ) -> Result<Arc<Self>, Error> {
         Self::serve(TreeActor::create(root, identity, root_owner, service)?)

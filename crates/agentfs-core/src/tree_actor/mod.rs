@@ -33,10 +33,11 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use agentfs_contracts::clients::FileOwner;
 use agentfs_contracts::name::WriterLabel;
 use agentfs_contracts::pod::{PodContext, WriterAt};
 use agentfs_contracts::ports::Found;
-use agentfs_contracts::volume::{Owner, VolumeIdentity};
+use agentfs_contracts::volume::VolumeIdentity;
 use git2::Oid;
 use serde::Serialize;
 
@@ -115,7 +116,7 @@ pub enum Error {
     Format,
     #[error("tree supports git-safe UTF-8 names only")]
     Name,
-    #[error("no tree volume here: create it with `agentfs trees init --volume NAME`")]
+    #[error("no tree volume here: create it with `agentfs init --volume NAME`")]
     NotCreated,
     #[error("no such tree, file or handle")]
     NotFound,
@@ -555,7 +556,7 @@ impl TreeActor {
     pub fn create(
         root: &Path,
         identity: &VolumeIdentity,
-        root_owner: Option<Owner>,
+        root_owner: Option<FileOwner>,
         service: &PodContext,
     ) -> Result<Self> {
         crate::history::init_libgit2();
@@ -586,7 +587,7 @@ impl TreeActor {
         repo.write_config(&refs::head(), &BTreeMap::new())?;
         // The root directory, owned as the launcher asked, else by the
         // process that creates the volume.
-        let owner = root_owner.unwrap_or_else(|| Owner {
+        let owner = root_owner.unwrap_or_else(|| FileOwner {
             // SAFETY: neither call has preconditions or fails.
             uid: unsafe { libc::geteuid() },
             gid: unsafe { libc::getegid() },

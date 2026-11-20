@@ -7,14 +7,12 @@
 
 use crate::audit::{Audited, Principal};
 use crate::caps::ClientCap;
-use crate::clients::{AttachmentEndReason, ClientEvent, ClientId, Grant, SessionId};
+use crate::clients::{AttachmentEndReason, ClientEvent, ClientId, FileOwner, Grant, SessionId};
 use crate::name::{ClientLabel, ForkKey, LauncherId, VolumeName};
 use crate::pod::PodContext;
 use crate::tree::{ForkId, TreeId};
 use crate::trees::{ForkFacts, ForkSettings, TreesEvent};
-use crate::volume::{
-    EnsureOutcome, IoKind, Owner, VolumeError, VolumeEvent, VolumeIdentity, VolumeState,
-};
+use crate::volume::{EnsureOutcome, IoKind, VolumeError, VolumeEvent, VolumeIdentity, VolumeState};
 
 /// A store write or read that failed. A failed write changed nothing.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -68,7 +66,7 @@ pub trait StateArea {
     fn create(
         &mut self,
         name: &VolumeName,
-        root_owner: Option<Owner>,
+        root_owner: Option<FileOwner>,
         at: &PodContext,
     ) -> Result<(VolumeIdentity, EnsureOutcome), VolumeError>;
 

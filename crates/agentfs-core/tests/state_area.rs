@@ -12,14 +12,15 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use agentfs_contracts::caps::{LaunchCap, LaunchScope, Minter};
+use agentfs_contracts::clients::FileOwner;
 use agentfs_contracts::clients::{AttachedLookup, ClientSet};
 use agentfs_contracts::name::{LauncherId, VolumeName};
 use agentfs_contracts::pod::PodContext;
 use agentfs_contracts::ports::VolumeStore;
 use agentfs_contracts::ports::{Event, EventSink};
 use agentfs_contracts::volume::{
-    Blocker, Disposition, Drain, EnsureOutcome, Owner, ReleaseVerdict, SpecField, StartPoint,
-    Volume, VolumeError, VolumeEvent, VolumeSpec, VolumeState,
+    Blocker, Disposition, Drain, EnsureOutcome, ReleaseVerdict, SpecField, StartPoint, Volume,
+    VolumeError, VolumeEvent, VolumeSpec, VolumeState,
 };
 use agentfs_core::state_area::TreeStateArea;
 use agentfs_core::store::TreeStore;
@@ -134,7 +135,7 @@ fn the_root_owner_is_recorded_at_create() {
     let at = PodContext::default();
     let owned = tmp.path().join("owned");
     let spec_owned = VolumeSpec {
-        root_owner: Some(Owner {
+        root_owner: Some(FileOwner {
             uid: 4242,
             gid: 4343,
         }),

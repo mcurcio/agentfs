@@ -452,22 +452,18 @@ fn print_unmount(report: &UnmountReport, unmount_grace: Duration) {
     if report.captured > 0 {
         println!("unmount: {} database group(s) captured", report.captured);
     }
-    if let Some(e) = &report.tmp_wipe_error {
-        eprintln!(
-            "warning: the sandbox overlay's tmp layer was not wiped: {e} (the next start wipes it)"
-        );
-    }
     if report.unrepaired > 0 {
         match &report.repairs_saved {
             Some(store) => eprintln!(
-                "{} path(s) could not be recorded (see the alarms); they are saved in {} and \
-                 the next mount records them from the backing tree before it serves anything: {}",
+                "{} path(s) could not be recorded (see the alarms); they are saved in {}: with \
+                 the history service stopped, `agentfs --root <backing tree> record <paths>` \
+                 records them: {}",
                 report.unrepaired,
                 store.display(),
                 report.unrepaired_paths.join(", ")
             ),
             None => eprintln!(
-                "{} path(s) could not be recorded, nor saved for the next mount (see the \
+                "{} path(s) could not be recorded, nor saved (see the \
                  alarms); history differs from the backing tree at these paths until each is \
                  changed again: {}",
                 report.unrepaired,
