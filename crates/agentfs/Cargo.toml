@@ -53,10 +53,13 @@ git2 = { version = "0.21.0", default-features = false }
 # The tree engine's rule set, for the deploy examples' rule files
 # (deploy_examples.rs).
 agentfs-rules = { version = "0.1.0", path = "../agentfs-rules" }
-# Drives a real `agentfs serve-history` through the CSI supervisor
-# (csi_service.rs).
+# Drives the real `agentfs init` and `agentfs host` through the CSI
+# driver's services over a gRPC socket (csi_trees.rs), with its client
+# over a Unix socket.
 agentfs-csi = { version = "0.1.0", path = "../agentfs-csi" }
-tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "time", "net"] }
+hyper-util = { version = "0.1.21", features = ["tokio"] }
+tower = { version = "0.5.3", features = ["util"] }
+tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "time", "net", "sync", "io-util"] }
 # Decodes OTLP payloads in the fake collector of the telemetry test.
 opentelemetry-proto = { version = "0.33.1", default-features = false, features = ["gen-tonic", "with-serde", "trace", "metrics", "logs"] }
 # The fake gRPC collector.

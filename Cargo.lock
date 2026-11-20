@@ -54,6 +54,7 @@ dependencies = [
  "anyhow",
  "clap",
  "git2",
+ "hyper-util",
  "libc",
  "opentelemetry",
  "opentelemetry-otlp",
@@ -74,6 +75,7 @@ dependencies = [
  "tiny_http",
  "tokio",
  "tonic",
+ "tower",
 ]
 
 [[package]]
