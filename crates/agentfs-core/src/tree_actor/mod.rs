@@ -49,6 +49,7 @@ use history::builder::{BuildState, Builder, JournalReader, copy_all};
 pub use history::built::{BuildError, BuiltSnapshot, Health, History, Lag, TreeLag, WaitError};
 use history::built_log::{self, BuiltLog};
 use history::message::Message;
+use history::repack::Repacker;
 use history::upstreams::Upstreams;
 use history::{
     check_objects, clean_packs, objects_of, read_trees, refs, remove_stale_locks, sync_marker,
@@ -296,6 +297,8 @@ pub struct TreeActor {
     /// The one owner of the Git store; the builder runs behind it.
     history: History,
     builder: Option<JoinHandle<()>>,
+    /// The history's repack task, beside the builder; stopped after it.
+    repacker: Option<Repacker>,
     /// The pointers as the journal's records name them.
     pointers: Pointers<Target>,
     /// Each fork's upstream. The root has none.
@@ -942,6 +945,7 @@ impl TreeActor {
             journal,
             history,
             builder: Some(builder),
+            repacker: None,
             // As the records name them: a step not yet built by its number.
             pointers: folded.pointers,
             upstreams: folded.upstreams,
@@ -967,6 +971,11 @@ impl TreeActor {
             areas: untracked::Areas::new(&root),
             _lock: lock,
         };
+        // After the builder, and once the volume stops it on any error below.
+        volume.repacker = Some(Repacker::start(
+            volume.history.clone(),
+            root.join("history.git"),
+        )?);
         volume.areas.sweep(&volume.trees())?;
         for (handle, open) in folded.opens {
             let (tree, object) = (open.open.tree, open.open.object);
@@ -1603,6 +1612,10 @@ impl TreeActor {
         self.history.stop(appended);
         if let Some(builder) = self.builder.take() {
             let _ = builder.join();
+        }
+        // History has stopped: the task ends, killing a repack in progress.
+        if let Some(repacker) = self.repacker.take() {
+            repacker.join();
         }
     }
 }

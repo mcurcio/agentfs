@@ -199,8 +199,9 @@ pub(in crate::tree_actor) fn sync_marker() -> Oid {
     Oid::hash_object(git2::ObjectType::Blob, b"sync").unwrap_or(Oid::ZERO_SHA1)
 }
 
-/// What a cut-short build left in the store, which nothing names: fast-import's
-/// temporary packs, `.keep` files, an index without its pack.
+/// What a cut-short build or a killed repack left in the store, which nothing
+/// names: fast-import's temporary packs, `.keep` files, an index without its
+/// pack, and `git repack`'s `.tmp-*` files.
 pub(in crate::tree_actor) fn clean_packs(gitdir: &Path) -> io::Result<()> {
     let dir = gitdir.join("objects").join("pack");
     let Ok(entries) = fs::read_dir(&dir) else {
@@ -214,7 +215,10 @@ pub(in crate::tree_actor) fn clean_packs(gitdir: &Path) -> io::Result<()> {
             .unwrap_or_default();
         let orphan_index =
             path.extension().is_some_and(|e| e == "idx") && !path.with_extension("pack").exists();
-        if name.starts_with("tmp_") || path.extension().is_some_and(|e| e == "keep") || orphan_index
+        if name.starts_with("tmp_")
+            || name.starts_with(".tmp-")
+            || path.extension().is_some_and(|e| e == "keep")
+            || orphan_index
         {
             fs::remove_file(&path)?;
         }
