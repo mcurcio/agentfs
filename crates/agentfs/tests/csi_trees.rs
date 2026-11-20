@@ -637,6 +637,18 @@ async fn a_recording_format_volume_is_not_published() {
     d.stop().await;
 }
 
+/// The root tests, one after the other: ci/fuse-tests.sh runs this one
+/// ignored test and checks that it ran.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs root and /dev/fuse: ci/fuse-tests.sh"]
+async fn views_at_the_kubelet_target() {
+    if !root_and_fuse() {
+        return;
+    }
+    a_pod_view_at_the_kubelet_target().await;
+    a_fork_claims_view_beside_its_source().await;
+}
+
 fn root_and_fuse() -> bool {
     if !rustix::process::geteuid().is_root() || !Path::new("/dev/fuse").exists() {
         eprintln!("skipped: needs root and /dev/fuse (ci/fuse-tests.sh)");
@@ -649,12 +661,7 @@ fn root_and_fuse() -> bool {
 /// committed with the pod's trailers; one pod per claim; a killed host
 /// comes back with the view live; NodeUnpublish leaves nothing; and
 /// DeleteVolume keeps the volume.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "needs root and /dev/fuse: ci/fuse-tests.sh"]
 async fn a_pod_view_at_the_kubelet_target() {
-    if !root_and_fuse() {
-        return;
-    }
     let d = Driver::start().await;
     let created = d
         .controller()
@@ -762,12 +769,7 @@ async fn a_pod_view_at_the_kubelet_target() {
 /// the root with its own pod; one pod per fork claim; the source is in use
 /// while only the fork's view is open; once the fork's view has closed, the
 /// fork has had its writer.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "needs root and /dev/fuse: ci/fuse-tests.sh"]
 async fn a_fork_claims_view_beside_its_source() {
-    if !root_and_fuse() {
-        return;
-    }
     let d = Driver::start().await;
     let mut c = d.controller();
     let source = c

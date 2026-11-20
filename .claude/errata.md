@@ -1750,3 +1750,23 @@ M7 residuals (each to become a bead; none blocks M8):
 6. **Seen, not S2's.** A host whose state area is removed under it (a failing root test's `TempDir` drop, recursing
    through the live mount) stays in its drain after EOF with no builder thread, and never exits. The test's orphan was
    killed by hand. Files: `crates/agentfs/src/launcher/serving.rs`, the tree actor's builder.
+
+## 2026-11-20, M8 S4 (fork claims): where the brief was wrong or short
+
+1. **ci/fuse-tests.sh pins one csi_trees root test.** It requires `test result: ok. 1 passed`; a second `#[ignore]`
+   root test (the brief's fork scenario) fails that line. ci/ is not S4's path, so both root scenarios now run under one
+   ignored entry point, `views_at_the_kubelet_target`. A later change to the script could match "0 failed" instead.
+2. **P4's mechanism is shared.** With `in_use` counting only the claim's own records, the source's DeleteVolume is still
+   refused, by `Supervisor::release`'s own guard (a host runs), with a shorter message. The root test now pins the full
+   in-use text naming the fork's target, which P4 fails.
+3. **P3 first failed on a host count, not on the store.** The test now checks first that the ended key is not made
+   again (CreateVolume of the same claim answers `ALREADY_EXISTS`), which P3 fails because the fork stays open.
+4. **"The next number".** Fork numbers are journal event numbers (S1's errata 3), so the approval test checks that the
+   refused claim added no ref under `refs/agentfs/trees/` and that the next automatic claim adds one.
+5. **`end_fork` also takes `key_ended` as Ok**, beside `ended` and `key_unknown`: a retried DeleteVolume of a fork
+   already ended must succeed whatever the host answers.
+6. **Exits were counted, not waited for.** csi_trees counted `exit host` events right after a call returned; the tap
+   logs them from its own task, so the count could run first. Each is now waited for (`Driver::until`) before it is
+   counted, S2's tests included.
+7. **S2's frozen addition `controller::FORKS_NOT_BUILT` is gone**, replaced by `FORK_NEEDS_SOURCE`; nothing else
+   used it.
