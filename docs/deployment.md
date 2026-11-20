@@ -7,6 +7,8 @@ guide covers the container image, the example manifests in
 [`deploy/sidecar`](../deploy/sidecar), why the pod is laid out the way it
 is, configuration, operations, what happens when the daemon crashes, the
 security cost of the privileged sidecar, and Hermes as upstream ships it.
+The sidecar runs the tree engine ([trees](trees.md)); the CSI driver
+([csi.md](csi.md)) runs the recording engine.
 Section numbers (§) on this page are this page's own. What agentfs
 promises is in [guarantees](guarantees.md). Running a mount
 outside Kubernetes is in the [operator guide](operator-guide.md); every
@@ -60,11 +62,12 @@ rebuilds only the agentfs crates.
 
 ## 2. Quick start
 
-1. Edit [`deploy/sidecar/config/config`](../deploy/sidecar/config/config):
-   your remote's URL (and `pushInterval`). Edit `exclude` and
-   `attributes` next to it for the paths not to record.
-2. Create the credentials Secret out of band (a token with push access to
-   the history repository):
+1. Edit [`deploy/sidecar/config/exclude`](../deploy/sidecar/config/exclude)
+   and `attributes` next to it: the paths not to record. `config` holds the
+   operator settings; the remote it names is logged as not built until push
+   is built for tree volumes (§4).
+2. Create the namespace (the sidecar is privileged), and the credentials
+   Secret out of band for when push is built:
 
    ```sh
    kubectl create namespace agents
@@ -74,7 +77,7 @@ rebuilds only the agentfs crates.
    ```
 
    and drop `secret.yaml` from the kustomization (or keep it for a first
-   try and edit the password).
+   try).
 3. Replace the `workload` container in
    [`deployment.yaml`](../deploy/sidecar/deployment.yaml) with yours, or
    patch it from an overlay.
@@ -83,12 +86,15 @@ rebuilds only the agentfs crates.
    ```sh
    kubectl -n agents apply -k deploy/sidecar
    kubectl -n agents get pods -l app.kubernetes.io/name=agentfs-example
-   kubectl -n agents logs deploy/agentfs-example -c agentfs | grep '^mounted '
+   kubectl -n agents logs deploy/agentfs-example -c agentfs | grep -E '^(mounted|not built) '
    ```
 
-The workload sees the volume at `/agentfs/workspace`. Every change it
-makes there is recorded before the call returns, committed to the branch
-`agentfs/<volume>` and pushed every `pushInterval`.
+The workload sees the volume at `/agentfs/workspace`. The sidecar runs the
+tree engine ([trees](trees.md)): every change the workload makes there is
+recorded before the call returns, and lands in the volume's history,
+`/data/state/history.git` (branch `root`), on the claim. Push is not built
+on tree volumes yet: the history stays on the claim, and the sidecar logs
+each remote of its settings as not built at every boot.
 
 With Helm, the `agentfs-sidecar` library chart renders the same pod
 pieces into your workload's own chart ([helm.md](helm.md#4-the-sidecar-helpers)).
@@ -98,24 +104,21 @@ pieces into your workload's own chart ([helm.md](helm.md#4-the-sidecar-helpers))
 ```
 pod
 ├── init container  agentfs-init   agentfs init --include /etc/agentfs/config
-├── native sidecar  agentfs        agentfs mount /data/backing /agentfs/workspace
+├── native sidecar  agentfs        agentfs mount /agentfs/workspace
 └── containers      workload       uses /agentfs/workspace
 
 volumes
-├── data           PVC (ReadWriteOncePod)   /data: backing/ and state/
+├── data           PVC (ReadWriteOncePod)   /data: state/, the volume's state area
 ├── agentfs-mount  emptyDir                 /agentfs; the FUSE mount is /agentfs/workspace
-├── config         ConfigMap                /etc/agentfs, and info/exclude, info/attributes
+├── config         ConfigMap                /etc/agentfs, and history.git/info/exclude, info/attributes
 └── credentials    Secret                   /run/secrets/agentfs
 ```
 
-**The PVC is mounted once, at `/data`.** The backing tree
-(`/data/backing`) and the state area (`/data/state`) are siblings on one
-filesystem, never two `subPath` mounts of the volume: recording freezes a
-file's content with a `FICLONE` reflink into `state/pending`, and reflinks
-fail with `EXDEV` across mounts. Siblings also keep the state area
-out of the backing tree, which `mount` checks. XFS (or btrfs) is
-recommended for the volume: a reflink costs the same whatever the file's
-size; on ext4 it is a copy.
+**The PVC is mounted once, at `/data`, in the agentfs containers only.**
+The state area, `/data/state`, holds everything of the volume: its files,
+its untracked area, its journal and its history (`history.git`). There is
+no backing tree: the workload's files are the volume's, reached only
+through the mount.
 
 **The mount point is a subdirectory of the `emptyDir`,** `/agentfs/workspace`,
 not the `emptyDir`'s root. If the daemon dies, only that subdirectory
@@ -124,7 +127,9 @@ With the mount on the root, the volume directory itself would answer
 `ENOTCONN`: the container runtime, which stats a bind-mount source, could
 fail to create the restarted sidecar, and the kubelet could fail to remove
 the pod's volumes, leaving the pod stuck Terminating. (This is reasoned,
-not tested; the subdirectory layout is what the kind test exercises.) `agentfs mount` creates the subdirectory when it is missing.
+not tested; the subdirectory layout is what the kind test exercises.)
+`agentfs mount` creates the subdirectory when it is missing, and refuses
+one that holds files.
 
 **Mount propagation.** The sidecar mounts the `emptyDir` with
 `Bidirectional` propagation, so the FUSE mount it makes inside it
@@ -135,22 +140,22 @@ mount the same `emptyDir` with `HostToContainer`. Kubernetes allows
 **The workload mounts the `emptyDir` read-only** (`readOnly: true`,
 `recursiveReadOnly: Disabled`). The FUSE mount propagated into it is a
 mount of its own and stays writable; the bare directory underneath is
-not. That is the fence for the moments no daemon is mounted (a sidecar
-that exited and is being restarted, §7): writes fail with `EROFS`
+not. That is the fence for the moments no view is mounted (a sidecar
+that stopped and is being restarted, §7): writes fail with `EROFS`
 instead of landing where nothing records them. A container that mounts
 the workspace itself through `subPath` cannot be fenced this way (a
 read-only subPath would make the FUSE mount read-only); for it the
 sidecar **seals the mount point** (`AGENTFS_SEAL_MOUNTPOINT=true`): the
 bare directory under the mount is root's with mode 0000, so a non-root
 container (or root without `CAP_DAC_OVERRIDE`) that binds it while no
-daemon is mounted gets `EACCES`. Give it the liveness probe commented in
+view is mounted gets `EACCES`. Give it the liveness probe commented in
 the example too (its mount point must be a FUSE mount: `stat -f -c %T`
-prints `fuseblk`), so it is restarted onto the new mount after a clean
-exit of the daemon.
+prints `fuseblk`), so it is restarted onto the new mount after the daemon
+has gone.
 
 **Crash recovery.** `AGENTFS_ON_STALE_MOUNT=recover`: when the kubelet
-restarts a crashed sidecar, it mounts over the stale mount the dead
-daemon left, and mount propagation carries the new mount into the
+restarts a crashed sidecar, it stacks its view over the stale mount the
+dead daemon left, and mount propagation carries the new mount into the
 workload containers (§7).
 
 **Startup order.** The sidecar is a native sidecar: an init container
@@ -158,65 +163,79 @@ with `restartPolicy: Always`. The kubelet starts it after `agentfs-init`
 and starts the workload containers only once its **startup probe**
 (`agentfs probe --allow-stale /agentfs/workspace`) passes, that is, once
 the mount is live. The probe allows 5 minutes (`periodSeconds: 2`,
-`failureThreshold: 150`) for journal recovery at start. Its **readiness
-probe** (`agentfs probe /agentfs/workspace`) makes a dead daemon visible
-as a NotReady pod. There is **no liveness probe**: the kubelet already restarts a
-daemon that exits or crashes, and killing a slow but live one (a long
-journal recovery) would only interrupt it.
+`failureThreshold: 150`) for the volume's recovery at start. Its
+**readiness probe** (`agentfs probe /agentfs/workspace`) follows the
+mount: a dead daemon, or a drained one whose view is unmounted, shows as a
+NotReady pod. There is **no liveness probe**: the kubelet already restarts
+a daemon that exits or crashes, and killing a slow but live one (a long
+recovery) would only interrupt it.
 
 **One writer.** `ReadWriteOncePod` lets only one pod in the cluster use
 the volume, and the Deployment's `Recreate` strategy stops the old pod
 before the new one starts, so a rollout never has two pods (and two
-daemons) on one state area. The state-area lock is the last line
-of defence. Most clusters need a CSI driver for `ReadWriteOncePod`.
+daemons) on one state area. The state area's lock is the last line of
+defence: a second mount exits 75. Most clusters need a CSI driver for
+`ReadWriteOncePod`.
 
 **Termination.** Native sidecars are stopped after the workload
-containers, so the daemon unmounts once nothing uses the mount, runs a
-final sweep, makes the final commit and pushes it once more, within
-`--push-grace` (5 s; the log shows `final commit:` and a `final push:`
-line per remote). A workload container that mounts the FUSE root itself through
-a `subPath` (Hermes, §10 below) gets a kubelet bind of the mount that
-stays until the kubelet tears the pod's volumes down, after the sidecar
-has exited. The daemon's unmount succeeds, but the bind keeps the
-filesystem mounted elsewhere, so the daemon waits its `--unmount-grace`
-(10 s) for the session to end, says so (`the filesystem was still
-mounted elsewhere`), and exits; the bind then fails with `ENOTCONN` until
-the kubelet removes it. The stop keeps the attached mark, which the next
-pod's start passes over because it was another pod's ([patches](patches.md)). `terminationGracePeriodSeconds: 60`
-covers both with room to spare; keep it above `--unmount-grace` plus
-`--push-grace` plus a few seconds.
+containers. At SIGTERM the sidecar drains the volume
+([lifecycle](trees.md#volume-lifecycle)): it detaches the view's client
+(files still open are saved as they stand), unmounts the view lazily, and
+exits 0 once the volume is released and the view has ended. A clean stop
+leaves history built through its last record. A workload container that
+mounts the view itself through a `subPath` (Hermes, §10) gets a kubelet
+bind of the mount that stays until the kubelet tears the pod's volumes
+down, after the sidecar has exited. The view cannot end while that bind
+holds it, so the sidecar completes its drain and then waits: the kubelet
+kills it at `terminationGracePeriodSeconds`. Nothing is lost, since the
+drain finished first, but every stop of such a pod takes the whole grace.
+Keep the grace long enough for the drain (60 s in the example).
 
 **`agentfs-init`** runs `agentfs init` at every start. On the first start
-it creates the state area and `/data/backing`; afterwards it checks that
-the state area belongs to the configured volume (`AGENTFS_VOLUME`) and
-exits 0, or exits 1 if the PVC holds another volume, which stops the pod
-before anything is mounted. It also sets the config include (§4 below).
+it creates the volume (`<volume> <id> created`); afterwards it finds it
+(`found`). A state area of another volume, or of the recording engine,
+exits 1 with nothing written, which stops the pod before anything is
+mounted; for the latter it names
+[upgrading-the-sidecar.md](runbooks/upgrading-the-sidecar.md). It also
+makes the volume's operator settings file include `/etc/agentfs/config`
+(§4). With `AGENTFS_OWNER=UID:GID` a new volume's root directory is
+recorded as that user's (§5).
 
 ## 4. Configuration
 
-**Settings and remotes** live in the ConfigMap key `config`, a git-config
-fragment mounted at `/etc/agentfs/config`. `agentfs init --include
-/etc/agentfs/config` names it in the state area's config as
-`include.path`, so the sidecar, `kubectl exec` commands and the `git`
-CLI all read it. agentfs checks includes more strictly than git
-([configuration reference](configuration.md#where-settings-live)): the
-path must be absolute and exist, it must not set `agentfs.volume` or
-`agentfs.branch`, and it must be outside the backing tree and the mount
-point.
+**Operator settings** live in the ConfigMap key `config`, a git-config
+file mounted at `/etc/agentfs/config`. `agentfs init --include
+/etc/agentfs/config` makes it the include of the volume's operator
+settings file, `/data/state/config`, which every mount reads
+([operator settings](trees.md#operator-settings), [the
+keys](configuration.md#tree-volumes-the-operator-settings-file)). It is
+kept out of `history.git/config`, which the engine rewrites. An include
+under the mount point exits 1: the workload could change it.
 
-**Egress proxies** are set in the same fragment with git's keys,
-`http.proxy` (every remote) or `remote.<name>.proxy` (one remote; empty
-for none); the pod's `HTTP_PROXY`, `HTTPS_PROXY` and `NO_PROXY` are never
-read ([Proxies](configuration.md#proxies)):
+**What is not built yet.** Tree volumes do not build push, the patch
+queue or LFS yet. A key of one of them (a `[remote]` section,
+`agentfs.pushInterval`, `http.proxy`, `agentfs.patch*`, `lfs.*`, ...) does
+nothing: the sidecar serves anyway, and logs each such key at every
+boot, one line per key:
 
-```ini
-[http]
-    proxy = http://egress-proxy.infra.svc:3128
+```text
+not built: remote.origin.url (push): this volume pushes to no remote yet; its history stays in the state area
+not built: agentfs.patchremote (patches): queued patches are not applied
 ```
 
+and exports the `agentfs.not_built` gauge, by `capability`
+([telemetry](telemetry.md)); the `AgentfsNotBuilt` alert fires on it
+(below). `agentfs.nested = exclude` is built and not listed: nested
+repositories stay out of history.
+
 **Rules.** The ConfigMap keys `exclude` and `attributes` are mounted
-read-only over `/data/state/git/info/exclude` and `info/attributes`, in
-the sidecar only (`subPath` mounts). Rules are read at mount time ([recording](recording.md)).
+read-only over `/data/state/history.git/info/exclude` and
+`info/attributes`, in the sidecar only (`subPath` mounts). They are read
+when the volume opens, before anything is written, and decide only for new
+names: a name they leave out lives in the volume's untracked area, never
+in history ([rules](trees.md#rules-and-the-untracked-area)). A rule tree
+volumes do not build (an `agentfs.<name>` attribute, `filter=lfs`)
+refuses the volume, naming the line.
 
 **Changing settings or rules** is a rollout: the kustomization's
 `configMapGenerator` puts a hash of the content in the ConfigMap's name,
@@ -224,50 +243,41 @@ so a change gives the pod template a new ConfigMap and rolls the pod. A
 ConfigMap edited in place would not reach the `subPath` mounts.
 
 **Credentials** come from the Secret mounted at `/run/secrets/agentfs`
-(mode `0400`): `remote.origin.agentfsCredentials =
-/run/secrets/agentfs/origin`. The file is re-read whenever it changes, so
-rotating the Secret needs no restart. For an SSH remote, keep the private
-key, its passphrase file if it is encrypted, and a known_hosts file in
-the Secret and name them with `agentfsSshKey`, `agentfsSshKeyPassphrase`
-and `agentfsKnownHosts` (or name an ssh-agent socket with
-`agentfsSshAgent` instead of a key)
-([SSH remotes](configuration.md#ssh-remotes)); the commented example in
-`config/config` shows the keys.
-With Git LFS on (`agentfs.lfsThreshold`, [remotes](remotes.md)), an LFS server on
-another host than the git remote takes its own credentials file from the
-same Secret (`remote.origin.agentfsLfsCredentials =
-/run/secrets/agentfs/origin-lfs`); the LFS endpoint derived from an
-`https` remote reuses `agentfsCredentials`. The commented LFS lines in
-`config/config` show the keys, and the image is built with the `https`
-feature, which https LFS servers need. LFS objects are cached under
-`/data/state/lfs` and never pruned: size the PVC for them
-([operator guide](operator-guide.md#13-large-files-lfs)).
+(mode `0400`), named in the settings (`remote.origin.agentfsCredentials =
+/run/secrets/agentfs/origin`). Nothing reads them until push is built;
+keeping the Secret in the pod means the remote works without a pod change
+then. The keys of each kind of remote are in the
+[configuration reference](configuration.md#remote-name).
 
 **The downward API** fills `AGENTFS_POD`, `AGENTFS_POD_UID`,
-`AGENTFS_NAMESPACE` and `AGENTFS_NODE`: the commit trailers
-(`Agentfs-Pod: ...`), the committer identity and the telemetry resource
-([recording](recording.md), [telemetry](telemetry.md)).
+`AGENTFS_NAMESPACE` and `AGENTFS_NODE`: the pod context of every commit
+(`Agentfs-Pod: ...` and the other trailers,
+[trees](trees.md#volume-identity-and-trailers)) and the telemetry
+resource ([telemetry](telemetry.md)).
 
 **Telemetry.** Set `OTEL_EXPORTER_OTLP_ENDPOINT` to your collector (OTLP
 http/protobuf by default; `OTEL_EXPORTER_OTLP_PROTOCOL=grpc` with the
 collector's port 4317, or `http/json`; `https://` with `OTEL_EXPORTER_OTLP_CERTIFICATE` and, for
-mutual TLS, the client certificate and key, mounted from a Secret), or `OTEL_SDK_DISABLED=true`. The example
-samples 1% of traces (`parentbased_traceidratio`, `0.01`); metrics and
-alarm logs are not sampled. See [telemetry.md](telemetry.md).
+mutual TLS, the client certificate and key, mounted from a Secret), or
+`OTEL_SDK_DISABLED=true`. The sidecar's mount exports metrics only:
+`agentfs.not_built` and the count of failed exports. See
+[telemetry.md](telemetry.md).
 
 ## 5. Users and permissions
 
-Any user can use the mount (`allow_other`), and the kernel checks real
-ownership and modes from the backing tree (`default_permissions`). Files
-belong to the user who created them, with the mode they asked for.
+Any user can use the mount (`allow_other`), and the kernel checks the
+ownership and modes the volume records. Files belong to the user who
+created them, with the mode they asked for, and history records each
+file's and directory's owner and mode ([what a commit
+holds](trees.md#what-a-commit-holds)).
 
-- **The root of the tree** (`/data/backing`) is created by `agentfs-init`
-  as root, mode `0755`. A non-root workload therefore needs a directory
-  of its own: create it once as root through the mount (`mkdir
+- **The root of the volume** is recorded at `init` as owned by the user
+  that ran it (root in the example), mode `0755`, or by
+  `AGENTFS_OWNER=UID:GID` (`init --owner`; the chart's `owner` value). A
+  found volume is never changed. A non-root workload therefore needs either
+  that, or a directory of its own made as root through the mount (`mkdir
   /agentfs/workspace/app && chown 10000:10000 /agentfs/workspace/app`,
-  from a root container or `kubectl exec`), or have an init step chown
-  the backing tree's root. Directories are not recorded, but their files
-  are.
+  from a root container or `kubectl exec`).
 - **`fsGroup` is not used.** The kubelet applies it by recursively
   changing the group of the volume, which would also hit the state area,
   and FUSE mounts do not take part in it anyway. Use explicit ownership.
@@ -278,42 +288,45 @@ belong to the user who created them, with the mode they asked for.
 ## 6. Operations
 
 Everything runs in the sidecar with `kubectl exec`; its environment
-already names the state area:
+already names the state area. History is git, read with the `git` the
+image ships:
 
 ```sh
 POD=$(kubectl get pod -l app.kubernetes.io/name=agentfs-example -o name | head -n1)
-kubectl exec "$POD" -c agentfs -- agentfs status
-kubectl exec "$POD" -c agentfs -- git --git-dir /data/state/git log --oneline agentfs/example -- notes/plan.md
-kubectl exec "$POD" -c agentfs -- agentfs restore notes/plan.md <commit>
-kubectl exec "$POD" -c agentfs -- agentfs revert <commit>
+kubectl exec "$POD" -c agentfs -- git --git-dir /data/state/history.git log --stat root
+kubectl exec "$POD" -c agentfs -- agentfs probe /agentfs/workspace
 ```
 
-`restore` and `revert` go to the running daemon over its control socket
-and write through the mount, so the workload sees the result at once
-([recovery runbook](runbooks/recovery-and-undo.md)).
+A commit keeps a file's bytes at `files/<aa>/<bb>/<path>`, where `aa` and
+`bb` are the first hex digits of `git hash-object --stdin` of the path
+([what a commit holds](trees.md#what-a-commit-holds)), so `git log --
+files/<aa>/<bb>/<path>` is one file's history.
+
+**Not built on tree volumes yet:** `status`, `push`, `restore`, `revert`,
+`flush` and the other commands of the recording engine refuse a tree
+volume with a message naming what is not built. Undo is reading the old
+bytes from history and writing them back through the mount.
 
 - **Upgrading agentfs:** change the image tag; the rollout (Recreate)
-  stops the old pod, whose sidecar makes its final commit, and the new
-  pod mounts the same volume
-  ([upgrading-the-sidecar.md](runbooks/upgrading-the-sidecar.md)).
-- **Downgrading agentfs:** a newer version can journal changes an older
-  one cannot read (a directory move): the older one then refuses to open
-  the state area with an error naming `agentfs flush`. Stop the pod
-  normally (its final commit empties the journal), or run `agentfs flush`
-  with the newer image against the state area, before rolling back
+  stops the old pod, whose sidecar drains, and the new pod mounts the
+  same volume
+  ([upgrading-the-sidecar.md](runbooks/upgrading-the-sidecar.md)). A
+  volume of the recording engine (a `/data/backing` beside `/data/state`)
+  is moved to the tree engine once, by that runbook; the new image's
+  `init` refuses it until then.
+- **Rolling back** to an image of the recording engine is restoring the
+  archive the move kept
   ([the runbook](runbooks/upgrading-the-sidecar.md#rolling-back)).
-- **Changing rules or remotes:** edit `config/`, apply; the pod rolls
+- **Changing rules or settings:** edit `config/`, apply; the pod rolls
   (§4 above).
-- **Pushes failing:** [stuck-pushes.md](runbooks/stuck-pushes.md).
-  `agentfs push` (run in the sidecar) asks the running mount to push
-  now; otherwise the mount's own push loop retries.
-- **Recording failing** (`EIO` in the workload, `RecordFailed` or
-  `CommitFailed`): [recording-failures.md](runbooks/recording-failures.md).
+- **Recording failing** (`EIO` in the workload, `tree HistoryBuildFailed`
+  in the sidecar's log):
+  [recording-failures.md](runbooks/recording-failures.md).
 
 ### Alerts
 
-[`deploy/alerts`](../deploy/alerts) has example alert rules for the
-metrics of [telemetry](telemetry.md), each with a runbook link:
+[`deploy/alerts`](../deploy/alerts) has example alert rules, each with a
+runbook link:
 
 | File | What |
 |---|---|
@@ -324,8 +337,15 @@ metrics of [telemetry](telemetry.md), each with a runbook link:
 The CSI Helm chart installs the same `PrometheusRule` with
 `alerts.enabled=true` (off by default; [helm.md](helm.md#3-values)).
 
+For the sidecar, alert on `AgentfsNotBuilt`: the sidecar's mount exports
+`agentfs.not_built` and the count of failed exports. The other rules are
+on the recording engine's metrics, which the CSI driver emits
+([csi.md](csi.md)).
+
 | Alert | Severity | Fires when |
 |---|---|---|
+| `AgentfsNotBuilt` | warning | a tree volume's operator settings name a key whose capability is not built yet (`agentfs.not_built`), for as long as the key stays |
+| `AgentfsTelemetryExportFailing` | warning | a telemetry export failed in the last 15 minutes |
 | `AgentfsRecordFailed` | critical | a record failed in the last 10 minutes (`agentfs.record.failures`) |
 | `AgentfsCommitsFailing` | critical | commits failed in every 5 minutes for 10 minutes while the journal holds records |
 | `AgentfsRepackFailed` | warning | a periodic repack failed in the last 3 hours |
@@ -336,12 +356,11 @@ The CSI Helm chart installs the same `PrometheusRule` with
 | `AgentfsRemoteMisconfigured` | warning | a remote section is invalid, so never pushed |
 | `AgentfsPatchQueueBlocked` | warning | the patch queue is blocked |
 | `AgentfsWorktreeHeuristic` | info | a worktree's gitdir was found by the suffix heuristic in the last hour |
-| `AgentfsTelemetryExportFailing` | warning | a telemetry export failed in the last 15 minutes |
 
-The thresholds and windows are examples. Alarms that are logs only
-(`PatchFetchFailed`, `ForkRefused`, `IdentityFallback`, ...) need a
-log-based alert; a dead daemon is the sidecar's readiness and restart
-count, from kube-state-metrics.
+The thresholds and windows are examples. Logged alarms (the sidecar's
+`tree HistoryBuildFailed`, `tree HistoryLagging`, ...) need a log-based
+alert; a dead daemon is the sidecar's readiness and restart count, from
+kube-state-metrics.
 
 **Names and labels.** agentfs exports OpenTelemetry metrics over OTLP.
 The rules use the names Prometheus gives them with its default OTLP
@@ -359,10 +378,8 @@ pod as `instance`, so without it the volumes' series merge, and their
 interleaved counters look like resets. `AgentfsCommitsFailing` joins a
 volume's failures to its backlog on `job`, `instance` and
 `agentfs_volume`. A sidecar runs one volume, so there it only names the
-volume. An `agentfs` command run by `kubectl exec` in the sidecar
-exports under the daemon's `instance` and volume too, so for its run a
-metric both export is one series. Another translation, such as
-`NoTranslation`, needs the names in the rules changed.
+volume. Another translation, such as `NoTranslation`, needs the names in
+the rules changed.
 
 **Counters** appear at their first count, so `increase()` alone, which
 needs two samples, would miss a process's first failure. Each counter
@@ -373,20 +390,15 @@ earlier.
 ([`.github/workflows/alerts.yml`](../.github/workflows/alerts.yml)) runs
 `promtool check rules` and the unit tests, checks that the
 `PrometheusRule` is the rules file's output, and runs
-[`ci/e2e-alerts.sh`](../ci/e2e-alerts.sh): the binary exports into a real
-Prometheus with the rules loaded, every metric the rules name must exist
-there by that name (except the repack, reconcile and front failure
-counters, which `ci/e2e-telemetry.sh` causes), the promoted
-`agentfs.volume` must be a label, and a failed record, a failed
-telemetry export, a diverged remote and a misconfigured one must fire
-their alerts. The `PrometheusRule` is not applied to a Prometheus
-Operator in CI.
+[`ci/e2e-alerts.sh`](../ci/e2e-alerts.sh) against a real Prometheus with
+the rules loaded (its header says what it causes). The `PrometheusRule`
+is not applied to a Prometheus Operator in CI.
 
 ## 7. A crashed daemon
 
 Every change the workload saw succeed was journaled first, so a crash
 loses nothing that returned. What happens to the dead mount, with no
-manual step:
+manual step ([restarting after a crash](trees.md#restarting-after-a-crash)):
 
 1. The workload's file calls under `/agentfs/workspace` fail with
    `ENOTCONN` ("Transport endpoint is not connected"). agentfs never
@@ -394,91 +406,91 @@ manual step:
    underneath, where it would not be recorded.
 2. The kubelet restarts the sidecar container (`restartPolicy: Always`;
    after repeated crashes with its usual backoff). It runs with
-   `AGENTFS_ON_STALE_MOUNT=recover`: it sees that the mount point is an
-   agentfs mount whose daemon died, takes the state-area lock (the kernel
-   released it with the dead process), recovers the journal (`N
-   uncommitted record(s) recovered`), mounts FUSE at a private directory
-   of the state area (`meta/stack/mnt`) and **bind-mounts it over the
-   stale mount**. Detaching the dead mount instead would expose the bare
-   directory to the workload; stacking over it never does.
+   `AGENTFS_ON_STALE_MOUNT=recover`: it sees that the mount point is a
+   stale mount of its own volume (`agentfs probe` reports `stale agentfs
+   mount (agentfs:<volume>, daemon gone)`), takes the state area's lock
+   (the kernel released it with the dead process), recovers the volume,
+   rebinds the view's client (the same writer, with the new pod context),
+   mounts FUSE at a private directory under `/data/state/stack/`, and
+   **bind-mounts it over the stale mount**. Detaching the dead mount
+   instead would expose the bare directory to the workload; stacking over
+   it never does.
 3. Mount propagation carries the new layer into every copy of the stale
    mount: the workload containers' `HostToContainer` mounts and the
    kubelet's `subPath` binds. The workload's next calls reach the new
    daemon; no container restarts. The sidecar logs `stacked over a stale
-   mount left by a crashed daemon at /agentfs/workspace (N stale layer(s)
-   below)` and the pod is Ready again once its readiness probe passes.
-4. When that sidecar stops, it unmounts its own layer and detaches the
-   stale layers beneath it (`detached N stale layer(s)`), so pod deletion
-   leaves nothing mounted.
+   mount at /agentfs/workspace left by a crashed daemon`, and the pod is
+   Ready again once its readiness probe passes.
+4. When that view ends, the stale layers below it are detached (`tree
+   DetachedStale: /agentfs/workspace: N layer(s)`).
 
 `--on-stale-mount hold` is the manual alternative: the restarted sidecar
-mounts nothing, the pod stays NotReady with the workload failing with
-`ENOTCONN`, and deleting the pod recovers. The
+mounts nothing and takes no lock, the pod stays NotReady with the
+workload failing with `ENOTCONN`, and deleting the pod recovers. The
 [crashed sidecar runbook](runbooks/crashed-sidecar.md) covers both, and
 when to step in. The kind end-to-end test checks recovery after `kill -9`
 of the daemon from the node.
 
-**A clean exit mid-pod** (an operator sends the sidecar SIGTERM,
-something unmounts the mount, a `--passthrough on` failure) leaves no
-stale mount: the daemon unmounts, makes its final commit and push, and
-the kubelet restarts it into a fresh mount. In the gap the workload's
-`/agentfs` is the bare `emptyDir`, which it mounts **read-only**
-(`readOnly: true`, with `recursiveReadOnly: Disabled` so the FUSE mount
-propagated into it stays writable): writes fail with `EROFS` ("Read-only
-file system") instead of landing where nothing records them. A workload
-that mounts the workspace itself through `subPath` cannot be fenced that
-way (a read-only subPath would make the FUSE mount read-only too); it
-keeps the dead mount, failing with `ENOTCONN`, until it restarts. Give
-it the liveness probe commented in the example (the mount point must be
-a live FUSE mount), so the kubelet restarts it onto the new mount. If it
-restarts before the sidecar has mounted again, its `subPath` binds the
-bare directory, which the sidecar sealed: a non-root container's writes
-fail with `EACCES` ("Permission denied"). A root container with
-`CAP_DAC_OVERRIDE` (the default capabilities) still writes there: those
-writes are not recorded and are hidden once the probe restarts it onto
-the new mount (the next mount warns that the mount point is not empty).
-Run `subPath` consumers as non-root, or with `capabilities: {drop:
-[ALL]}`, or use the read-only `emptyDir`, which has no such gap.
+**A clean stop mid-pod** (an operator sends the sidecar SIGTERM, or
+something unmounts the view) leaves no stale mount: the drain unmounts the
+view (§3, termination) and the pod turns NotReady. In the gap the
+workload's `/agentfs` is the bare `emptyDir`, which it mounts
+**read-only** (`readOnly: true`, with `recursiveReadOnly: Disabled` so
+the FUSE mount propagated into it stays writable): writes fail with
+`EROFS` ("Read-only file system") instead of landing where nothing
+records them. Once the process has exited, the kubelet restarts it into a
+fresh mount on the bare mount point.
+
+**A sidecar stopped alone while a `subPath` consumer holds the mount**
+completes its drain but does not exit: the consumer's bind still holds
+the drained view, whose writes fail with `EROFS`, and the view ends only
+when the bind goes. The process exits only when it is killed (the pod's
+grace at a pod stop, or `kill -9`). The consumer's bind then fails with
+`ENOTCONN`, and its liveness probe restarts it onto the restarted
+sidecar's mount. If the consumer restarts before the sidecar has mounted
+again, its `subPath` binds the bare directory, which the sidecar sealed: a
+non-root container's writes fail with `EACCES` ("Permission denied"). A
+root container with `CAP_DAC_OVERRIDE` (the default capabilities) still
+writes there: those writes are not recorded, and the restarted sidecar
+exits 1 on a mount point that holds files until they are removed. Run
+`subPath` consumers as non-root, or with `capabilities: {drop: [ALL]}`,
+or use the read-only `emptyDir`, which has no such gap.
 
 **Limits:**
 
-- Files opened for writing before a crash with kernel passthrough
-  (`--passthrough auto` as root; only a writer sharing a reader's
-  backing file) keep writing to their backing file after the daemon
-  died, unrecorded, for as long as the workload holds them open; a
-  recovered sidecar does not notice those changes until the file is
-  changed again through the mount or the sweep sees it. With in-place
-  recovery the workload keeps running, so such a descriptor can live
-  longer than under a pod restart. Use `--passthrough off` where every
-  write must be recorded.
 - A hung daemon (alive, not answering) is not detected: there is no
   liveness probe on the sidecar, since killing a slow but live daemon
-  would interrupt its recovery or commits. See the runbook.
+  would interrupt its recovery. See the runbook.
 - Repeated crashes put the sidecar in `CrashLoopBackOff` (10 s, 20 s, ...
   up to 5 minutes between restarts); alert on its restart count.
+- A view stacked over a stale mount detaches the layers below only when
+  it ends. When a `subPath` consumer makes the pod's stop end in the
+  kubelet's kill, the stacked view never ends, and the dead layer is left
+  under the `emptyDir` for the kubelet to tear down. Not tested: the kind
+  test does not delete a pod after a stacked recovery.
 
 ## 8. How it is tested
 
 The `e2e-kind` job of [`.github/workflows/image.yml`](../.github/workflows/image.yml)
 runs [`ci/e2e-kind.sh`](../ci/e2e-kind.sh) against a kind cluster with
 the image just built, deploying [`ci/k8s`](../ci/k8s) (this example with a
-remote on the runner's git server, fast pushes, and two writers: root,
-and uid 10000 through a `subPath` mount of the FUSE root at
-`/workspace`). It checks writes as both users with normal permissions,
-the operator rules, that the state area is invisible, authors and
-`Agentfs-Pod`/`-Namespace`/`-Node` trailers in the commits pushed over
-HTTP with the credential Secret, a restore through `kubectl exec`, the
-final commit and push when the pod is deleted, the in-place recovery of
-§7 after `kill -9` of the daemon from the node (both writers carry on
-without a restart, and `agentfs push` in the sidecar pushes at once), and
-the sealed mount point (checked from the node), and the clean-exit fence
-(`EROFS` in the gap; the subPath writer, restarted inside the gap, refused
-with `EACCES`, then restarted onto the new mount by its liveness probe),
-and the rollback's flush Pod of
-[upgrading-the-sidecar.md](runbooks/upgrading-the-sidecar.md#rolling-back)
-run as written against the claim. `kubectl apply --dry-run=server`
-validates `deploy/sidecar` itself. It runs locally on any Linux host with
-docker, kind, kubectl, nginx and fcgiwrap (see the script's header).
+remote on the runner's git server, and two writers: root, and uid 10000
+through a `subPath` mount of the view at `/workspace`). It checks writes
+as both users with normal permissions; that the history holds them with
+their owners and the `Agentfs-Pod`/`-Pod-Uid`/`-Namespace`/`-Node`
+trailers; that the operator rules keep an excluded and a `-agentfs` file
+out of history; that the state area is invisible; that the remote is
+logged as not built at every boot and nothing reaches the server; a
+replaced pod finding the volume; the sealed mount point (checked from the
+node); the clean stop of §7 (the pod turns NotReady, `EROFS` in the gap,
+the drained sidecar waiting for the `subPath` bind until killed, the
+subPath writer restarted inside the gap refused with `EACCES` or
+recorded, then restarted onto the new mount by its liveness probe); and
+the in-place recovery after `kill -9` of the daemon from the node (both
+writers carry on without a restart, and their writes are recorded).
+`kubectl apply --dry-run=server` validates `deploy/sidecar` itself. It
+runs locally on any Linux host with docker, kind, kubectl, nginx and
+fcgiwrap (see the script's header).
 
 ## 9. Security trade-offs of the privileged sidecar
 
@@ -494,22 +506,20 @@ the node. The namespace has to allow it (Pod Security Admission
   containers, and it is how a mount made in one container reaches the
   others;
 - `mount(2)` and opening `/dev/fuse` need `CAP_SYS_ADMIN` (and the
-  device);
-- FUSE passthrough needs `CAP_SYS_ADMIN` in the initial user namespace;
-- creating new files as their creators needs `CAP_SETUID` and `CAP_SETGID`,
-  and giving them to their creators `CAP_CHOWN` and `CAP_FOWNER`.
+  device), and so does stacking a view over a stale mount (§7);
+- giving untracked files to their creators needs `CAP_CHOWN` and
+  `CAP_FOWNER`.
 
 **Mitigations in the example:**
 
 - a single-purpose image pinned by digest, root filesystem read-only;
 - no service account token (`automountServiceAccountToken: false`) and
-  no network listener (the control socket is a Unix socket in the state
-  area, mode `0600`, root or the daemon's user only);
+  no network listener;
 - the init container runs with every capability dropped and no privilege
   escalation;
 - workload containers run as non-root, capabilities dropped,
   `RuntimeDefault` seccomp, and never see `/data`, the state area or the
-  credentials (`mount` refuses layouts that would expose them);
+  credentials (an include under the mount point is refused);
 - a dedicated namespace for agentfs workloads, so `privileged` PSA does
   not widen what other teams can run.
 
@@ -533,7 +543,9 @@ persona, profiles) are worth recording, next to state that is not
 
 ### What is recorded
 
-The rule files are in [`deploy/examples/hermes`](../deploy/examples/hermes):
+The operator files are in [`deploy/examples/hermes`](../deploy/examples/hermes).
+The rule files become `/data/state/history.git/info/exclude` and
+`info/attributes`:
 
 - [`exclude`](../deploy/examples/hermes/exclude) is an allowlist: every
   new path at the top of Hermes' home is excluded except `skills/`,
@@ -542,14 +554,18 @@ The rule files are in [`deploy/examples/hermes`](../deploy/examples/hermes):
 - [`attributes`](../deploy/examples/hermes/attributes) marks secrets
   (`.env`, `auth.json`), databases (`*.db`, `*.sqlite*` and their
   journals), `sessions/`, `logs/` and `checkpoints/` `-agentfs`
-  everywhere: never recorded, even if tracked or re-included by a later
-  exclude change. Upstream Hermes v0.22.5 keeps its sessions in
+  everywhere: never recorded, and a tracked path they mark leaves history
+  when the volume opens. Upstream Hermes v0.22.5 keeps its sessions in
   `state.db`, not `sessions/`; both are covered.
-- [`config`](../deploy/examples/hermes/config) keeps nested repositories
-  out (`nested = exclude`) and names the push remote.
+- [`config`](../deploy/examples/hermes/config), the operator settings,
+  keeps nested repositories out (`nested = exclude`, built), and names a
+  remote and a patch source (`patchRemote`), which the sidecar logs as not
+  built at every boot.
 
-`crates/agentfs/tests/deploy_examples.rs` checks these files against a
-representative layout in every CI run. Check the profile layout against
+What the rules leave out stays in the volume, in its untracked area:
+Hermes reads and writes it like any other file. `crates/agentfs/tests/deploy_examples.rs`
+checks these files against a representative layout in every CI run,
+through the tree engine's own rule set. Check the profile layout against
 the Hermes version you run.
 
 ### The pod changes
@@ -558,8 +574,8 @@ Starting from Hermes' own workload:
 
 - **Add `agentfs-init` and the `agentfs` sidecar** from
   `deploy/sidecar/deployment.yaml`, with the volumes `data`,
-  `agentfs-mount`, `config` and `credentials`, the Hermes rule files as
-  the ConfigMap, and `AGENTFS_VOLUME=hermes`.
+  `agentfs-mount`, `config` and `credentials`, the Hermes settings and
+  rule files as the ConfigMap, and `AGENTFS_VOLUME=hermes`.
 - **The Hermes container** keeps its data path, `/opt/data`, by mounting
   the FUSE mount itself there:
 
@@ -572,14 +588,13 @@ Starting from Hermes' own workload:
   ```
 
   Give it the liveness probe a subPath consumer needs (§3, with
-  `/opt/data`) so a clean exit of the daemon restarts it onto the new
-  mount. Hermes' start-up runs as root, which the sealed mount point
-  does not stop (§7). **Queued patches do not land in this pod** (see
-  [Restarts and patches](#restarts-and-patches)).
+  `/opt/data`) so it is restarted onto the new mount after the daemon has
+  gone. Hermes' start-up runs as root, which the sealed mount point does
+  not stop (§7). The `subPath` binds make every stop of this pod, and of
+  the sidecar alone, wait until the kubelet kills the sidecar (§3, §7).
 
-  The alternative, which the read-only fence covers and under which
-  patches land: mount the `emptyDir` read-only at `/agentfs`, as
-  `deploy/sidecar`'s workload does, and set
+  The alternative, which the read-only fence covers: mount the `emptyDir`
+  read-only at `/agentfs`, as `deploy/sidecar`'s workload does, and set
   `HERMES_HOME=/agentfs/workspace` and
   `HERMES_WRITE_SAFE_ROOT=/agentfs/workspace`. The image sets the second
   to `/opt/data`, and Hermes' file tools refuse writes outside it
@@ -601,58 +616,73 @@ Starting from Hermes' own workload:
   `$HERMES_HOME/sandboxes/`, all resolved by the docker-in-docker
   daemon, so those writes land in the volume (never recorded under these
   rules).
-- **Root init.** Hermes' start-up runs as root; with `default_permissions`
-  and a real backing tree, root reads and writes the mount like any other
-  directory, and files keep their owners.
+- **Root init.** Hermes' start-up runs as root; root reads and writes the
+  mount like any other directory, and files keep their owners, in Hermes
+  and in history.
 - **The volume** changes from `ReadWriteOnce` to `ReadWriteOncePod`
   (§3 above), with the Deployment's `Recreate` strategy.
 
 ### Migrating the existing data
 
-Hermes' current volume holds its files at the root. agentfs needs them
-under `backing/`, next to `state/`. A one-time Job, with Hermes scaled to
-zero and the same PVC mounted at `/data`:
+Hermes' current volume holds its files at the root. A tree volume keeps
+them in its state area, so they are copied in through the mount, once,
+by a Job with Hermes scaled to zero and the same PVC mounted at `/data`:
 
 <!-- ci: hermes-migration -->
 ```sh
 set -eu
 cd /data
-mkdir backing
+mkdir import
 # Move everything except the new directory into it.
-find . -mindepth 1 -maxdepth 1 ! -name backing -exec mv -t backing {} +
-agentfs --state /data/state --root /data/backing init --volume hermes --include /etc/agentfs/config
-cp /etc/agentfs/exclude /data/state/git/info/exclude
-cp /etc/agentfs/attributes /data/state/git/info/attributes
-# The initial import: record every file the rules accept.
-cd /data/backing
-find . -name .git -prune -o \( -type f -o -type l \) -printf '%P\n' |
-  xargs -r agentfs --state /data/state --root /data/backing record
-agentfs --state /data/state push
+find . -mindepth 1 -maxdepth 1 ! -name import -exec mv -t import {} +
+agentfs --state /data/state init --volume hermes --include /etc/agentfs/config
+mkdir -p /data/state/history.git/info
+cp /etc/agentfs/exclude /data/state/history.git/info/exclude
+cp /etc/agentfs/attributes /data/state/history.git/info/attributes
+mkdir -p /mnt/hermes
+# The import, through the mount. Each nested repository's .git first, so
+# the files beside it are made inside a repository and stay untracked.
+agentfs --state /data/state mount /mnt/hermes -- sh -ec '
+  cd /data/import
+  find . -name .git -prune -print0 | xargs -0 -r cp -a --parents -t /mnt/hermes
+  cp -a . /mnt/hermes/'
 ```
 
-Run it with the agentfs image, as root, with the Hermes ConfigMap at
-`/etc/agentfs` and the credentials Secret at `/run/secrets/agentfs`.
-`record` reports each path it skips and why. Then deploy the new pod
-spec; from then on every change is recorded through the mount.
+Run it with the agentfs image, privileged (FUSE needs `/dev/fuse` and
+`CAP_SYS_ADMIN`), as root, with the Hermes ConfigMap at `/etc/agentfs`.
+The rule files go in before the mount: the volume reads them when it
+opens. `mount -- COMMAND` runs the copy once the view is up and drains
+when it exits ([running a command](trees.md#running-a-command-in-the-mount)),
+so the Job ends with the import recorded and its history built. `cp -a`
+keeps each file's owner and mode, and history records them. Files the
+rules leave out (`.env`, the databases, sessions, logs, nested
+repositories) are copied into the volume's untracked area, never into
+history.
+
+Then check the history, and remove the import:
+
+```sh
+git --git-dir /data/state/history.git log --stat root
+rm -rf /data/import
+```
+
+and deploy the new pod spec; from then on every change is recorded
+through the mount.
 
 ### Restarts and patches
 
-iac's patches to Hermes' files (the [patch queue](patches.md)) apply only at
-mount, which for Hermes means a pod restart: iac queues them with
-`agentfs patch submit` (or plain git) on the remote the sidecar pushes
-to, then restarts the pod (`kubectl delete pod`, or a rollout). The
-sidecar's startup probe allows for the fetch, which waits at most
-`agentfs.patchFetchTimeout` (30s). A blocked queue does not stop the pod;
-alert on `agentfs.patch.blocked`. See
-[patch-queue.md](runbooks/patch-queue.md).
+The patch queue is not built on tree volumes yet: iac's patches to
+Hermes' files are not applied. The Hermes settings name the patch source
+(`agentfs.patchRemote`), so every boot of the sidecar logs `not built:
+agentfs.patchremote (patches): queued patches are not applied` and the
+`AgentfsNotBuilt` alert fires, instead of the queue being silently
+ignored.
 
-**With Hermes' data path mounted through `subPath`**, the kubelet still
-holds the mount when the sidecar stops, through the subPath binds it made
-for Hermes and docker-in-docker, so the stop keeps the attached mark. The mark names the pod (`AGENTFS_POD_UID`), and the next
-pod lands the queue over it: the old pod's binds cannot reach the new
-pod's `emptyDir`. A restart of the sidecar alone under running Hermes
-defers the queue (`PatchQueueDeferred`, reason `unclean_stop`), as it
-should; the patches land at the next pod restart.
+A restart of the sidecar alone under running Hermes (a crash, or a
+SIGTERM to it) is §7's: after a crash the restarted sidecar stacks over
+the stale mount and Hermes carries on; after a SIGTERM the sidecar drains
+and waits, held by the `subPath` binds, until it is killed, and Hermes'
+liveness probe then restarts it onto the new mount.
 
 ### How it is tested
 
@@ -660,54 +690,55 @@ Upstream Hermes is tested in four configurations, with the checks of
 [`ci/hermes/lib.sh`](../ci/hermes/lib.sh). The `docker` workflow runs
 this setup under Docker Compose: [`ci/e2e-hermes.sh`](../ci/e2e-hermes.sh) with
 [`ci/hermes/compose.yaml`](../ci/hermes/compose.yaml) over the compose
-example and its git server ([docker.md](docker.md)), with this
-section's `exclude` and `attributes` and the example's remote settings
-(the Hermes `config` names a placeholder remote). Hermes is the
-upstream image, pinned by digest and started as shipped (`gateway run`,
-root start-up), with the mount at `/opt/data`; its tool containers run on
-a docker-in-docker service that has the mount too, and
-`terminal.docker_volumes` passes it into them. A scripted stand-in for
-the model API makes every turn deterministic. The job checks that:
+example ([docker.md](docker.md)), with this section's settings and rule
+files. Hermes is the upstream image, pinned by digest and started as
+shipped (`gateway run`, root start-up), with the mount at `/opt/data`;
+its tool containers run on a docker-in-docker service that has the mount
+too, and `terminal.docker_volumes` passes it into them. A scripted
+stand-in for the model API makes every turn deterministic. The job checks
+that:
 
-- Hermes' root start-up runs on the mount and files keep their owners;
-- a skill Hermes creates with its own skill tool is committed as its user
-  and pushed;
+- Hermes' root start-up runs on the mount and files keep their owners, in
+  Hermes and in history;
+- a skill Hermes creates with its own skill tool is recorded as its
+  user's;
 - a tool container's edit, made through Hermes' terminal tool, reaches
-  the Hermes container and is committed as root and pushed;
+  the Hermes container and is recorded as root's;
 - `.env`, `state.db` (which holds the sessions), `response_store.db`,
   `logs/`, and an `auth.json` and a log a tool container writes inside
-  `skills/`, are in the tree but never in the history, locally or on the
-  remote;
-- a patch queued with `agentfs patch submit` lands when Hermes and
-  docker-in-docker are stopped and agentfs restarted, and Hermes' next
-  model request carries the patched `SOUL.md`;
+  `skills/`, are in the tree but never in history;
+- the remote and the patch source are logged as not built at each boot,
+  across a restart of agentfs with Hermes and docker-in-docker stopped,
+  after which Hermes reads the files it had;
 - with `terminal.docker_volumes` emptied, a tool container's write to
   `/opt/data` stays in the tool container, reaching neither Hermes nor
-  the history; Hermes' `skills/` is read-only there; a file in the tool
+  history; Hermes' `skills/` is read-only there; a file in the tool
   container's home lands in Hermes' `sandboxes/` and is never recorded;
   Hermes' own edits are still recorded.
 
 The `hermes` workflow runs [`ci/e2e-hermes-kind.sh`](../ci/e2e-hermes-kind.sh)
-on kind, one job per configuration, with the same checks (start-up,
-Hermes' skill, a tool container's edit, exclusions, a queued patch at the
-next start) and the manifests in [`ci/hermes/k8s`](../ci/hermes/k8s):
+on kind, one job per configuration, with the same checks and the
+manifests in [`ci/hermes/k8s`](../ci/hermes/k8s):
 
-- **sidecar**: this pod, from `deploy/sidecar` with the Hermes rule
-  files, `subPath` mounts and their liveness probes, docker-in-docker as
-  a native sidecar. First upstream Hermes runs on the plain volume, then
-  the migration Job above runs as written: the import records Hermes'
-  files and pushes them, and reports `.env`, the databases, the logs and
-  a nested repository as skipped. Then a clean exit of the sidecar alone:
-  Hermes' liveness probe restarts it onto the new mount, it records
-  again, and a queued patch is deferred (`PatchQueueDeferred`); it lands
-  at the next pod restart. The import also records what Hermes keeps in `skills/` beside
-  the skills: the bundled skills it syncs there and its own
-  `.usage.json`, `.curator_ledger.jsonl` and `.bundled_manifest`.
-- **fence**: the read-only fence alternative, on a fresh volume; the
-  patch lands at the next pod restart.
+- **sidecar**: this pod, from `deploy/sidecar` with the Hermes settings
+  and rule files, `subPath` mounts and their liveness probes,
+  docker-in-docker as a native sidecar. First upstream Hermes runs on the
+  plain volume, then the migration Job above runs as written: the import
+  records Hermes' files with their owners, and `.env`, the databases, the
+  logs and a nested repository are in the volume but not in history. Then
+  a SIGTERM to the sidecar alone: the pod turns NotReady, the sidecar
+  waits for the `subPath` binds until it is killed, its restart logs the
+  not built lines again, and Hermes' liveness probe restarts it onto the
+  new mount, where it records again. The import also records what Hermes
+  keeps in `skills/` beside the skills: the bundled skills it syncs there
+  and its own `.usage.json`, `.curator_ledger.jsonl` and
+  `.bundled_manifest`.
+- **fence**: the read-only fence alternative, on a fresh volume, and a
+  pod restart that logs the not built lines again.
 - **csi**: Hermes and docker-in-docker in one pod on a claim of the CSI
   driver ([csi.md](csi.md)), with a `hermes` profile holding these
-  rules; the patch lands at the next NodeStage.
+  rules. The CSI driver runs the recording engine: there the import
+  is pushed and a queued patch lands at the next NodeStage.
 
 Not tested: a profile's files, a real model, tool containers given only
 part of the volume, docker-in-docker without the mount, the fence pod
@@ -717,98 +748,33 @@ fence's `HERMES_WRITE_SAFE_ROOT`.
 ## 11. Limitations
 
 - `linux/amd64` images only.
-- Recording costs about 2 to 4 ms per changed small file, and closing a large
-  file costs a copy on ext4 (2.9 s per clean GiB; 3 ms on XFS): put the
-  backing volume on XFS when files are large, and keep bulk trees such as
-  `node_modules/` off the mount. See [performance.md](performance.md).
-- A hung daemon is not detected, and passthrough descriptors opened
-  before a crash write unrecorded until closed (§7).
+- Push, the patch queue and LFS are not built on tree volumes yet: the
+  history stays on the claim, and their settings are logged and alarmed
+  (§4). `status`, `restore`, `revert` and `flush` refuse a tree volume
+  (§6).
+- Recording's cost per save is in [performance.md](performance.md); keep
+  bulk trees such as `node_modules/` off the mount, or out of history
+  with the rules.
+- A hung daemon is not detected (§7).
+- A `subPath` consumer makes every stop of the pod, and of the sidecar
+  alone, end in the kubelet's kill; the drain finishes first (§3, §7).
 - A `subPath` consumer that runs as root with `CAP_DAC_OVERRIDE`,
-  restarted while the daemon is being restarted after a clean exit, can
+  restarted while the sidecar is being restarted after a clean stop, can
   write to the bare directory, unrecorded; the sealed mount point stops
   every other one, and the read-only `emptyDir` has no such gap (§7).
 - The privileged sidecar (§9); the CSI driver ([csi.md](csi.md)) needs no
   privilege in workload pods.
-- One pod per volume. The sidecar stays single-process (`agentfs mount`
-  without `--history-service`). For several pods on one volume use the
-  CSI driver ([csi.md](csi.md)), which runs a history service per volume
-  and a front per pod, one node per volume at a time; multi-node access
-  modes are refused.
-- A state area on NFS must be NFS 4.1 or later, without `nolock` and
-  with `local_lock=none`: the state lock is the only guard against a
-  second writer, and agentfs refuses other NFS mounts at start. Even
-  then, a node cut off but still running keeps writing: if another node
-  mounts the same state area once the NFS lease expires, two writers can
-  corrupt the journal. The CSI driver keeps every worktree on its node's
-  own disk and refuses a network filesystem
-  ([csi.md](csi.md#11-where-worktrees-live)); moving a volume is a new
-  volume started from its branch ([runbooks/moving.md](runbooks/moving.md)).
+- One pod per volume. For several pods on one volume use the CSI driver
+  ([csi.md](csi.md)), which runs the recording engine: a history service
+  per volume and a front per pod, one node per volume at a time;
+  multi-node access modes are refused.
 - The image is not bit-reproducible (Debian packages are not pinned),
   and is not yet signed or shipped with an SBOM.
 
 ## 12. The sandbox overlay
 
-A workload that starts sandboxes through a container that starts other
-containers (for example a Docker daemon) can give them the sandbox
-overlay instead of the mount: a second mount point of the same volume
-that shows only the files the operator's rules would record, records
-what sandboxes change there, and keeps their other files in a private
-tmp layer ([operator guide](operator-guide.md#17-the-sandbox-overlay); its limits
-are in [guarantees](guarantees.md)). The kustomize Component
-[`deploy/sidecar/sandbox-overlay`](../deploy/sidecar/sandbox-overlay)
-adds it to the example sidecar
-([`deploy/examples/sidecar-sandbox-overlay`](../deploy/examples/sidecar-sandbox-overlay)
-uses it), and the sidecar library chart's `sandboxOverlay` values do the
-same ([helm.md](helm.md#4-the-sidecar-helpers)).
-
-```
-volumes
-├── agentfs-mount    emptyDir   /agentfs; the mount is /agentfs/workspace
-└── agentfs-sandbox  emptyDir   /agentfs-sandbox; the overlay is /agentfs-sandbox/overlay
-```
-
-- **A second `emptyDir`.** The sidecar mounts another `emptyDir`,
-  `agentfs-sandbox`, at a directory of its own (`/agentfs-sandbox`) with
-  `Bidirectional` propagation, and serves the overlay in its
-  subdirectory `overlay`. The two mount points must not share a parent
-  directory: `agentfs mount` refuses that, because a container given that
-  directory would reach both.
-- **Settings.** Set `AGENTFS_SANDBOX_OVERLAY=/agentfs-sandbox/overlay`
-  and `AGENTFS_SANDBOX_OWNER=<uid>:<gid>`, the view owner every operation
-  through the overlay is checked and done as. Pick the user that owns the
-  files sandboxes should edit, usually the workload's own.
-- **Probes.** The startup probe runs `agentfs probe --allow-stale
-  --sandbox-overlay /agentfs-sandbox/overlay` and the readiness probe
-  `agentfs probe --sandbox-overlay /agentfs-sandbox/overlay`. The overlay
-  is mounted after the main mount, so these gate on both.
-- **The container that starts other containers** mounts only the
-  `agentfs-sandbox` `emptyDir`, with `mountPropagation: HostToContainer`,
-  never `agentfs-mount`, and binds paths under
-  `/agentfs-sandbox/overlay` into the sandboxes it starts:
-
-  ```yaml
-  volumeMounts:
-    - name: agentfs-sandbox
-      mountPath: /agentfs-sandbox
-      mountPropagation: HostToContainer
-  ```
-
-  Not tested: the Component and the chart option are checked as
-  rendered manifests only ([helm.md](helm.md#5-deploy-and-the-charts)); no CI job runs
-  a container runtime against the overlay in a pod.
-- **After a sidecar recovery.** A container runtime binds a path into a
-  sandbox with private propagation by default, so a sandbox started
-  before the sidecar recovered from a crash keeps the dead mount
-  (`ENOTCONN`) and never sees the new one. Restart such sandboxes, or bind
-  with `rslave` propagation (Docker: `--mount
-  type=bind,src=...,dst=...,bind-propagation=rslave`) so the recovered
-  mount reaches them. Not tested.
-- **Either mount ending stops both.** An unmount of either mount point
-  from outside stops the daemon; the kubelet restarts the sidecar into
-  fresh mounts ([runbook](runbooks/sandbox-overlay.md#the-overlay-was-unmounted-from-outside-and-both-mounts-stopped)).
-- **Sidecar only.** The overlay is served by a single-process `agentfs
-  mount`. It is not offered on CSI volumes or on fronts
-  (`--history-service`), which refuse it at start.
-
-Failure modes and their fixes:
-[runbooks/sandbox-overlay.md](runbooks/sandbox-overlay.md).
+The sandbox overlay, a second mount point showing sandboxes only the
+files the rules would record, is not built on the tree engine. The
+sidecar's manifests and chart do not offer it, and `agentfs mount` has no
+flag for it. A container that starts sandboxes is given the mount itself,
+as Hermes' docker-in-docker sidecar is (§10).

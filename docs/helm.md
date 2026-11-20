@@ -238,9 +238,14 @@ agentfs:
 ```
 
 plus `agentfs-sidecar.configMap`, `.secret` and `.claim` for the objects
-they mount. The workload uses `/agentfs/workspace`. What the pod itself
-must do (one pod at a time on the claim, a grace period long enough for
-the final commit) is in deployment.md §3;
+they mount. The workload uses `/agentfs/workspace`. The sidecar runs the
+tree engine ([trees](trees.md)): `config.settings` is the operator
+settings include, whose keys not built yet (remotes, patches, LFS) are
+logged and alarmed, and `config.exclude` and `config.attributes` are
+mounted as `history.git/info/exclude` and `info/attributes`. `owner`
+(`UID:GID`) records a new volume's root as a non-root workload's. What the
+pod itself must do (one pod at a time on the claim, a grace period long
+enough for the drain) is in deployment.md §3;
 [`deploy/examples/helm-sidecar`](../deploy/examples/helm-sidecar) is a
 complete chart, with the settings and rules kept as files of the chart.
 

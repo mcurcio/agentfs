@@ -4,6 +4,7 @@
 #   examples/docker/docker-run.sh up
 #   examples/docker/docker-run.sh workload [docker run options] IMAGE [COMMAND...]
 #   examples/docker/docker-run.sh down
+#   examples/docker/docker-run.sh history [GIT ARGS...]
 #
 # `up` initialises the volume and starts the agentfs container, which
 # FUSE-mounts it at $MOUNT_DIR/workspace on the host (an `rshared` bind of
@@ -11,6 +12,8 @@
 # container that sees that directory at /agentfs (an `rslave`, read-only
 # bind) and works in /agentfs/workspace. `down` stops the workload
 # containers, then agentfs, which drains the volume and unmounts.
+# `history` runs git on the volume's history (state/history.git; its
+# branch is root) in a one-off container, whether agentfs runs or not.
 #
 # The volume's files and its history (state/history.git) live in the
 # Docker volume agentfs-$VOLUME, mounted only into the agentfs containers:
@@ -123,9 +126,16 @@ down() {
   echo "stopped volume $VOLUME; its history stays in the Docker volume $DATA"
 }
 
+# git on the volume's history, read-only.
+history() {
+  docker run --rm -v "$DATA:/data:ro" --entrypoint git "$AGENTFS_IMAGE" \
+    --git-dir /data/state/history.git "$@"
+}
+
 case "${1:-}" in
 up) up ;;
 workload) shift; workload "$@" ;;
 down) down ;;
-*) echo "usage: $0 up | workload [docker run options] IMAGE [COMMAND...] | down" >&2; exit 2 ;;
+history) shift; history "$@" ;;
+*) echo "usage: $0 up | workload [docker run options] IMAGE [COMMAND...] | down | history [GIT ARGS...]" >&2; exit 2 ;;
 esac

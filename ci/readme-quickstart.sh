@@ -17,9 +17,10 @@
 # /workspace (the README's paths).
 #
 # Docker: runs the block against $AGENTFS_IMAGE (the README's default,
-# ghcr.io/mcurcio/agentfs:latest, when unset), then checks that the
-# history left in the Docker volume holds the workload's hello.txt with
-# uid 10000 as its author, and that nothing is left mounted. Needs Linux
+# ghcr.io/mcurcio/agentfs:latest, when unset), then checks that agentfs
+# drained and exited 0, that the history left in the Docker volume (the
+# tree engine's, state/history.git) holds the workload's hello.txt with
+# uid 10000 as its owner, and that nothing is left mounted. Needs Linux
 # with Docker Engine 25+, the fuse module, and no volume agentfs-example.
 #
 # Both are reproducible on a CI runner.
@@ -71,11 +72,11 @@ if [ "$MODE" = docker ]; then
   bash -euxo pipefail -c "$block" 2>&1 | tee "$out"
 
   step "checks"
-  assert_contains "$(cat "$out")" "final commit" "stopping made the final commit"
-  log=$(docker run --rm -v agentfs-example:/data --entrypoint git "$IMAGE" \
-    --git-dir /data/state/git log --name-only --format='author %an' agentfs/example)
-  assert_contains "$log" "hello.txt" "the history holds the workload's hello.txt"
-  assert_contains "$log" "author uid-10000" "uid 10000 is the author"
+  . "$(dirname "$0")/tree-git-test-lib.sh"
+  assert_contains "$(cat "$out")" "agentfs exited 0" "stopping drained the volume"
+  hgit() { docker run --rm -v agentfs-example:/data --entrypoint git "$IMAGE" --git-dir /data/state/history.git "$@"; }
+  assert_eq hello "$(hgit show "root:files/$(tree_git_fanned hello.txt)")" "the history holds the workload's hello.txt"
+  assert_contains "$(hgit show "root:lines/$(tree_git_fanned hello.txt)")" '"uid":10000' "uid 10000 is its owner"
   if grep -q " $PWD/$MNT/workspace " /proc/self/mountinfo; then
     fail "$MNT/workspace is still mounted"
   fi

@@ -36,20 +36,23 @@ host
 ├── <dir>/                  a directory on a shared mount
 │   └── workspace/          the FUSE mount (what workloads use)
 └── docker volume           /data in the agentfs containers only:
-                            backing/ (the files) and state/ (the history)
+                            state/, the volume's state area (its files,
+                            journal and history.git)
 
-agentfs-init   agentfs init --include /etc/agentfs/config   (runs once per start)
-agentfs        agentfs mount /data/backing /agentfs/workspace
+agentfs-init   agentfs init --include /etc/agentfs/config --owner <uid:gid>   (runs once per start)
+agentfs        agentfs mount /agentfs/workspace
                <dir> bound at /agentfs, rshared
 workload       <dir> bound at /agentfs, read-only, rslave, recursive writable
 ```
 
-- **The volume's files and history share one Docker volume**, mounted at
-  `/data` in the agentfs containers only. The backing tree and the state
-  area are siblings on one filesystem, as on Kubernetes ([deployment.md
-  §3](deployment.md#3-the-pod-piece-by-piece)): reflinks fail across
-  mounts. The workload never mounts it, so the history, journal, state
-  and credentials are out of its sight ([guarantees](guarantees.md)).
+- **The volume lives in one Docker volume**, mounted at `/data` in the
+  agentfs containers only: its state area, `/data/state`, holds the
+  files, the journal and the history (`history.git`, branch `root`), as
+  on Kubernetes ([deployment.md §3](deployment.md#3-the-pod-piece-by-piece)).
+  The containers run the tree engine ([trees](trees.md)): there is no
+  backing tree. The workload never mounts the Docker volume, so the
+  history, journal, state and credentials are out of its sight
+  ([guarantees](guarantees.md)).
 - **The agentfs container binds the host directory with `rshared`
   propagation** and mounts FUSE at `workspace/` inside it, so the mount
   appears on the host. It is a subdirectory, not the bound directory
@@ -70,9 +73,12 @@ workload       <dir> bound at /agentfs, read-only, rslave, recursive writable
   §9](deployment.md#9-security-trade-offs-of-the-privileged-sidecar): a
   bug in agentfs is a bug in a container that can mount filesystems on
   the host. Workload containers need no privileges.
-- **Settings and remotes** come from a git-config fragment bound at
-  `/etc/agentfs/config`, which `agentfs init --include` names in the
-  state area's config ([deployment.md §4](deployment.md#4-configuration)).
+- **Operator settings** come from a git-config file bound at
+  `/etc/agentfs/config`, which `agentfs init --include` makes the include
+  of the volume's operator settings file, read at every mount
+  ([deployment.md §4](deployment.md#4-configuration)). A key tree volumes
+  do not build yet, such as a remote, is logged as `not built` at every
+  boot.
 
 ## 3. `docker run`
 
@@ -83,26 +89,27 @@ script, so CI runs exactly what this page describes:
 examples/docker/docker-run.sh up
 examples/docker/docker-run.sh workload --name app --user 10000:10000 --cap-drop ALL \
   debian:trixie-slim sh -c 'echo hello > /agentfs/workspace/hello.txt; sleep infinity'
-sleep 1                     # the commit follows within commitWindow (200ms)
-docker exec agentfs-example git --git-dir /data/state/git log --format='%h %an %s' agentfs/example
+docker exec agentfs-example git --git-dir /data/state/history.git log --stat root
 examples/docker/docker-run.sh down
 ```
 
 - `up` creates the Docker volume `agentfs-$VOLUME`, runs `agentfs init`
   in a one-off container, starts the container `agentfs-$VOLUME` and
   waits until its health check (`agentfs probe /agentfs/workspace`) sees
-  the live mount.
+  the live mount. History is built behind the calls: `git log` shows a
+  save a moment after its close returned.
 - `workload` runs `docker run -d` with the workload's bind of the host
   directory and the working directory `/agentfs/workspace`, plus your
   own options and image.
 - `down` stops the workload containers first, so nothing holds the
-  mount, then agentfs, which makes its final commit and unmounts (it
-  prints the `final commit:` line). The history stays in the Docker
-  volume for the next `up`.
+  mount, then agentfs, which drains the volume, unmounts and exits 0 (it
+  prints `agentfs exited 0`); a clean stop leaves history built through
+  its last record. The history stays in the Docker volume for the next
+  `up`.
 
 Its settings are environment variables, listed at the top of the script:
-`VOLUME` (the branch is `agentfs/<volume>`), `MOUNT_DIR` (the host
-directory), `AGENTFS_IMAGE`, `AGENTFS_CONFIG` (the fragment; default
+`VOLUME`, `MOUNT_DIR` (the host directory), `AGENTFS_IMAGE`,
+`AGENTFS_CONFIG` (the operator settings; default
 [`config/local`](../examples/docker/config/local), no remote),
 `AGENTFS_SECRETS` (a directory of credential files, bound at
 `/run/secrets`) and `WORKLOAD_USER`.
@@ -112,11 +119,11 @@ The agentfs container's flags, besides the privileges of §2:
 | Flag | Why |
 |---|---|
 | `--restart unless-stopped` | Docker restarts a crashed daemon (§5 below) |
-| `--stop-timeout 60` | Longer than `--unmount-grace` (10 s) plus `--push-grace` (5 s) plus the final commit, so `docker stop` never cuts the final commit short |
-| `-e AGENTFS_ON_STALE_MOUNT=recover` | A restarted daemon mounts over the stale mount the dead one left |
+| `--stop-timeout 60` | Time for the drain at `docker stop` |
+| `-e AGENTFS_ON_STALE_MOUNT=recover` | A restarted daemon stacks over the stale mount the dead one left |
 | `-e AGENTFS_SEAL_MOUNTPOINT=true` | The bare mount point is root's with mode 0000 |
 | `-e OTEL_SDK_DISABLED=true` | No collector in the example; set `OTEL_EXPORTER_OTLP_ENDPOINT` instead ([telemetry.md](telemetry.md)) |
-| `--health-cmd 'agentfs probe /agentfs/workspace'` | Healthy once the mount is live; 5 minutes' start period for journal recovery |
+| `--health-cmd 'agentfs probe /agentfs/workspace'` | Healthy once the mount is live; 5 minutes' start period for the volume's recovery |
 
 ## 4. Docker Compose
 
@@ -132,35 +139,37 @@ cd examples/docker
 mkdir -p mnt                # Docker does not create a long-syntax bind's source
 docker compose up -d
 docker compose exec workload sh -c 'echo hello > hello.txt'
-sleep 1                     # the commit follows within commitWindow (200ms)
-docker compose exec agentfs git --git-dir /data/state/git log --format='%h %an %s' agentfs/example
+docker compose exec agentfs git --git-dir /data/state/history.git log --stat root
 docker compose down
 ```
 
 `docker compose down` stops `workload` before `agentfs`, which then
-makes its final commit; `stop_grace_period: 60s` gives it the time.
+drains the volume; `stop_grace_period: 60s` gives it the time.
 `down -v` also deletes the volume and its history.
 
 **With a remote.** [`compose.remote.yaml`](../examples/docker/compose.remote.yaml)
 adds a throwaway git server (nginx and `git http-backend`, built from
 [`git-server/`](../examples/docker/git-server)), binds
-[`config/remote`](../examples/docker/config/remote) as the fragment
-instead (the remote `origin` at `http://git-server:8080/git/history.git`,
-pushed every 5 s), and passes the credentials file
-[`secrets/origin`](../examples/docker/secrets/origin) as a Compose
+[`config/remote`](../examples/docker/config/remote) as the operator
+settings instead (the remote `origin` at
+`http://git-server:8080/git/history.git`), and passes the credentials
+file [`secrets/origin`](../examples/docker/secrets/origin) as a Compose
 secret at `/run/secrets/origin`, which the server also reads for its own
-password:
+password. **Push is not built on tree volumes yet:** nothing is pushed,
+and the agentfs container logs the remote's keys as not built at every
+boot:
 
 ```sh
 docker compose -f compose.yaml -f compose.remote.yaml up -d
-docker compose -f compose.yaml -f compose.remote.yaml \
-  exec -u www-data git-server git --git-dir /srv/git/history.git log agentfs/example
+docker compose -f compose.yaml -f compose.remote.yaml logs agentfs | grep '^not built'
+# not built: remote.origin.agentfscredentials (push): this volume pushes to no remote yet; its history stays in the state area
+# not built: remote.origin.url (push): this volume pushes to no remote yet; its history stays in the state area
 ```
 
 For a real remote, put its URL in `config/remote`, your token in the
-secret (never committed), and drop the `git-server` service. SSH remotes
-and LFS take the keys in [configuration.md](configuration.md#ssh-remotes),
-as on Kubernetes.
+secret (never committed), and drop the `git-server` service; it is
+pushed to once push is built. The keys of each kind of remote are in
+[configuration.md](configuration.md#ssh-remotes).
 
 The same image is the CSI chart's git server ([helm.md](helm.md#the-git-server)),
 published as `ghcr.io/mcurcio/agentfs-git-server`. Its entrypoint takes
@@ -177,50 +186,48 @@ names an htpasswd file to use instead of `/run/secrets/origin`, and
 
 ## 5. Users, operations and crashes
 
-**Users.** `agentfs-init` gives the root of the tree to `WORKLOAD_USER`
-(default `10000:10000`) after `agentfs init`, so a non-root workload can
-write at the top of the volume; directories are not recorded, their
-files are. Files belong to the user who created them, with the mode they
-asked for ([deployment.md §5](deployment.md#5-users-and-permissions)).
-The daemon cannot read the supplementary groups of a caller in another
-container's pid namespace ([recording](recording.md)),
-the same limit as the Kubernetes sidecar.
+**Users.** `agentfs init --owner "$WORKLOAD_USER"` (default
+`10000:10000`) records a new volume's root directory as that user's, so a
+non-root workload can write at the top of the volume; a found volume is
+never changed. Files belong to the user who created them, with the mode
+they asked for, and history records each one's owner and mode
+([deployment.md §5](deployment.md#5-users-and-permissions)).
 
 **Operations** run in the agentfs container, whose environment names the
 state area, as `kubectl exec` does in [deployment.md
 §6](deployment.md#6-operations):
 
 ```sh
-docker exec agentfs-example agentfs status
-docker exec agentfs-example agentfs push          # push now
-docker exec agentfs-example agentfs restore notes/plan.md <commit>
+docker exec agentfs-example git --git-dir /data/state/history.git log --stat root
+docker exec agentfs-example agentfs probe /agentfs/workspace
 ```
 
-(With Compose: `docker compose exec agentfs agentfs status`.)
+(With Compose: `docker compose exec agentfs ...`.) `status`, `push`,
+`restore` and `revert` are not built on tree volumes yet: each refuses
+with a message naming what is not built.
 
 **A crashed daemon.** Writes fail with `ENOTCONN` until Docker restarts
 the container (`restart: unless-stopped`). The new daemon finds the
-stale mount at `/agentfs/workspace`, recovers the journal and mounts
-over it (`stacked over a stale mount` in its log), and propagation
-carries the new mount to the host and into the running workload
-containers, which need no restart ([deployment.md
-§7](deployment.md#7-a-crashed-daemon)). A daemon stopped cleanly while a
-workload runs leaves the workload on the bare, read-only directory:
-restart the workload after agentfs. If the host itself is left with a
-dead mount (the Docker daemon stopped, say), `umount -l <dir>/workspace`
-as root clears it; the next `up` mounts again.
+stale mount at `/agentfs/workspace`, recovers the volume and stacks over
+it (`stacked over a stale mount at /agentfs/workspace left by a crashed
+daemon` in its log), and propagation carries the new mount to the host
+and into the running workload containers, which need no restart
+([deployment.md §7](deployment.md#7-a-crashed-daemon)). A daemon stopped
+cleanly while a workload runs drains the volume and leaves the workload
+on the bare, read-only directory: restart the workload after agentfs. If
+the host itself is left with a dead mount (the Docker daemon stopped,
+say), `umount -l <dir>/workspace` as root clears it; the next `up` mounts
+again.
 
 ## 6. Volumes with no remote
 
 The examples without `compose.remote.yaml` are local-only:
-[`config/local`](../examples/docker/config/local) has no `[remote]`
-section, so agentfs records and commits every change to the history in
-the Docker volume and never pushes, and `agentfs status` says
-`remotes:   local-only (no remote)`
-([configuration](configuration.md#remotes-modes)). Zero remotes is not
-an error and needs nothing declared. Back up the Docker volume, or add a
-remote (its first push sends all the history), if the history must
-outlive the host.
+[`config/local`](../examples/docker/config/local) names no remote, so
+agentfs records every change into the history in the Docker volume and
+logs nothing as not built. Zero remotes is not an error and needs
+nothing declared. Until push is built for tree volumes every volume is
+local-only: back up the Docker volume if the history must outlive the
+host.
 
 ## 7. Why there is no Docker volume plugin
 
@@ -271,22 +278,24 @@ checks that:
 - the workload sees only the mount under `/agentfs` and only its own
   files in the tree, and has neither `/data` nor the Docker volume
   mounted;
-- the writes are committed to `agentfs/<volume>` with the writers' uids
-  as authors, and with the remote, reach the git server;
-- `agentfs status` runs in the agentfs container;
-- stopping makes the final commit (and pushes it, with the remote), and
-  leaves nothing mounted on the host.
+- uid 10000 writes at the top of the volume (`init --owner`);
+- the writes are in the history (`state/history.git`, branch `root`) with
+  the writers' uids as their owners;
+- `agentfs status` refuses the tree volume, naming what is not built;
+- with the remote, its keys are logged as not built and nothing reaches
+  the git server;
+- stopping drains the volume (agentfs exits 0, and history holds the last
+  write), and leaves nothing mounted on the host.
 
 The `compose` job also kills the daemon with `SIGKILL` from the host and
-checks that Docker restarts it, that it mounts over the stale mount, and
+checks that Docker restarts it, that it stacks over the stale mount, and
 that the running workload writes through the new mount without a
 restart.
 
-A further job runs upstream Hermes on the compose example, with the git
-server and docker-in-docker for its tool containers
+A further job runs upstream Hermes on the compose example, with
+docker-in-docker for its tool containers
 ([deployment.md §10](deployment.md#how-it-is-tested)).
 
 Not tested: Docker Desktop and rootless Docker, `--privileged` instead
-of the three narrower options, `restore` and `push` through `docker
-exec`, SSH and LFS remotes under Docker, and a clean stop of agentfs while
-a workload runs.
+of the three narrower options, and a clean stop of agentfs while a
+workload runs.

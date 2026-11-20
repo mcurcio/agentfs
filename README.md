@@ -138,10 +138,10 @@ volume only the agentfs container mounts:
 ```sh
 examples/docker/docker-run.sh up
 examples/docker/docker-run.sh workload --name app --user 10000:10000 --cap-drop ALL \
-  debian:trixie-slim sh -c 'echo hello > /agentfs/workspace/hello.txt; sleep infinity'
-sleep 1                     # the commit follows within commitWindow (200ms)
-docker exec agentfs-example git --git-dir /data/state/git log --format='%h %an %s' agentfs/example
-examples/docker/docker-run.sh down
+  debian:trixie-slim sleep infinity
+docker exec app sh -c 'echo hello > hello.txt'   # recorded before close returns
+examples/docker/docker-run.sh down               # stops app, then drains the volume
+examples/docker/docker-run.sh history log --stat root
 ```
 
 Docker Compose, remotes and why the containers are wired as they are:
@@ -178,14 +178,18 @@ parameters, recovery and security: [docs/csi.md](docs/csi.md).
 ### Kubernetes: the sidecar
 
 agentfs runs as a privileged native sidecar in the workload's own pod and
-mounts the volume into an `emptyDir` the workload's containers share.
-Edit the remote in `deploy/sidecar/config/config`, create the credentials
-Secret, put your container in place of the example workload, then:
+mounts the volume into an `emptyDir` the workload's containers share; the
+history stays in the volume's claim, at `/data/state/history.git`. Edit
+the rules in `deploy/sidecar/config/`, put your container in place of
+the example workload, then:
 
 ```sh
 kubectl -n agents apply -k deploy/sidecar
-kubectl -n agents logs deploy/agentfs-example -c agentfs | grep '^mounted '
+kubectl -n agents logs deploy/agentfs-example -c agentfs | grep -E '^(mounted|not built) '
 ```
+
+The example's settings name a remote: push is not built for the sidecar
+yet, so it logs each remote key as `not built` at every boot.
 
 The steps, the pod piece by piece and the security trade-offs:
 [docs/deployment.md](docs/deployment.md). With Helm, the
