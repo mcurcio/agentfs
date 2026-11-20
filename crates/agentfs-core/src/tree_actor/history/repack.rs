@@ -11,12 +11,15 @@
 //! A stop kills a repack in progress, with every process it started (its
 //! own process group): git writes new packs before it deletes old ones, so
 //! nothing is lost, and the next open removes its temporary files
-//! ([`super::clean_packs`]).
+//! ([`super::clean_packs`]). A repack fsyncs the pack it writes and then
+//! `objects/pack`, so a batch whose pack it rolls up is as durable as one
+//! it did not (history/feed.rs).
 //!
 //! The child is not counted with the actor's Git children
 //! ([`crate::git_cli::counted`]): it is not on the actor's path, and a count
 //! a background task adds to would not tell what an operation started.
 
+use std::fs::File;
 use std::io::{self, Read};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -39,6 +42,30 @@ struct Slot {
 pub(in crate::tree_actor) struct Repacker {
     thread: std::thread::JoinHandle<()>,
     child: Arc<Mutex<Slot>>,
+}
+
+/// The fsync settings a repack runs with, whatever the repository's config
+/// says: git fsyncs the pack it writes before it renames it in, which
+/// history/feed.rs relies on when a batch's pack is rolled up before its own
+/// fsync.
+const FSYNC: [&str; 4] = [
+    "-c",
+    "core.fsync=pack,pack-metadata",
+    "-c",
+    "core.fsyncMethod=fsync",
+];
+
+/// Why one repack failed: the task logs it and tries again at the next event.
+#[derive(Debug, thiserror::Error)]
+enum TaskError {
+    #[error(transparent)]
+    Repack(#[from] RepackError),
+    #[error("syncing {path}: {source}")]
+    Sync {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
 }
 
 /// How one run ended, when git could be run.
@@ -127,14 +154,15 @@ fn program(git_dir: &Path) -> PathBuf {
 /// One `git <REPACK_ARGS>` in `git_dir`, in a process group of its own so a
 /// stop kills every process it started. The child is reaped only after the
 /// slot lets go of it, so a stop never signals a process id reused since.
-fn repack_once(git: &Path, git_dir: &Path, slot: &Mutex<Slot>) -> Result<Ran, RepackError> {
+fn repack_once(git: &Path, git_dir: &Path, slot: &Mutex<Slot>) -> Result<Ran, TaskError> {
     let _timer = Timer::start(Which::Repack);
     let mut held = lock(slot);
     if held.stopped {
         return Ok(Ran::Stopped);
     }
     let mut cmd = crate::git_cli::command(git, git_dir);
-    cmd.args(REPACK_ARGS)
+    cmd.args(FSYNC)
+        .args(REPACK_ARGS)
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .process_group(0);
@@ -168,8 +196,18 @@ fn repack_once(git: &Path, git_dir: &Path, slot: &Mutex<Slot>) -> Result<Ran, Re
                 .next()
                 .unwrap_or_default()
                 .to_owned(),
-        });
+        }
+        .into());
     }
+    // git fsynced the new pack's files; this makes their names, and the old
+    // packs' removal, durable.
+    let pack_dir = git_dir.join("objects").join("pack");
+    File::open(&pack_dir)
+        .and_then(|dir| dir.sync_all())
+        .map_err(|source| TaskError::Sync {
+            path: pack_dir,
+            source,
+        })?;
     Ok(Ran::Done)
 }
 
@@ -521,6 +559,23 @@ exec git "$@" -d"#;
                 "{name:?} is left"
             );
         }
+        drop(v);
+    }
+
+    /// Batches built while the task repacks beside them: none fails, though
+    /// a repack's files in flight come and go in `objects/pack` while a
+    /// batch installs its pack, and a repack may roll that pack in first
+    /// (history/feed.rs).
+    #[test]
+    fn batches_beside_the_task_never_fail() {
+        let tmp = tempfile::tempdir().unwrap();
+        let git_dir = tmp.path().join("history.git");
+        let mut v = new_actor(tmp.path());
+        batches(&mut v, 0, 100);
+        let reachable = read_reachable(&git_dir);
+        drop(v);
+        let v = reopen(tmp.path());
+        assert_eq!(read_reachable(&git_dir), reachable);
         drop(v);
     }
 

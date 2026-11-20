@@ -2,10 +2,27 @@
 //! and commits on its stdin, which writes one pack (docs/architecture.md,
 //! "Technology choices"). Its durability is ours: [`Feed::finish`] fsyncs the
 //! pack files it installed and `objects/pack` before anything names them.
+//!
+//! The history's repack task ([`super::repack`]) runs `git repack
+//! --geometric=2 -d` beside fast-import, so `objects/pack` has two writers.
+//! [`Feed::finish`] fsyncs only what fast-import wrote: it skips a repack's
+//! `.tmp-*` files, which are in flight. A new `pack-*` name that is gone
+//! before its fsync was rolled up by a repack, which is not an error:
+//! - **No object is lost** (history is the product). A geometric repack
+//!   writes its new pack under `.tmp-*`, renames it into place, and only then
+//!   deletes the packs it rolled up; nothing prunes. So a batch's objects are
+//!   always in a pack whose name is in `objects/pack`.
+//! - **History is durable before the journal is trimmed.** The repack runs
+//!   with `core.fsync=pack,pack-metadata` and `core.fsyncMethod=fsync`, so
+//!   git fsyncs the new pack's files before it renames them in, and the task
+//!   fsyncs `objects/pack` after each repack. [`Feed::finish`] fsyncs
+//!   `objects/pack` after its own files in any case, which makes the
+//!   repack's rename durable too. The builder records a batch as built, after
+//!   which the journal may drop its records, only after `finish` returns.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
-use std::io::{BufWriter, Read, Write};
+use std::io::{self, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin};
 
@@ -277,13 +294,18 @@ impl Feed {
         let after = entries(&self.pack_dir)?;
         let mut synced = 0_u64;
         for name in after.difference(&self.before) {
-            if name.to_string_lossy().starts_with("tmp_") {
+            let text = name.to_string_lossy();
+            // fast-import's temporary files, and a repack's files in flight.
+            if text.starts_with("tmp_") || text.starts_with(".tmp-") {
                 continue;
             }
-            File::open(self.pack_dir.join(name))
-                .and_then(|f| f.sync_all())
-                .map_err(BuildError::from)?;
-            synced += 1;
+            match File::open(self.pack_dir.join(name)).and_then(|f| f.sync_all()) {
+                Ok(()) => synced += 1,
+                // A repack rolled this pack into one of its own and deleted
+                // it (see the module docs).
+                Err(e) if e.kind() == io::ErrorKind::NotFound && text.starts_with("pack-") => {}
+                Err(e) => return Err(BuildError::from(e)),
+            }
         }
         File::open(&self.pack_dir)
             .and_then(|d| d.sync_all())
