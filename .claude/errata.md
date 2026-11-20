@@ -1847,3 +1847,72 @@ M8 residuals (each to become a bead):
    operator's, and each host flushes its exporter at exit, so an unreachable default would delay every host stop on
    kind. The goal's row in one-engine.md says the log line is always on and the gauge needs the operator's collector.
    For the owner (general guidance): keep the alarm opt-in under CSI, or ship a default endpoint as the sidecar does.
+
+## 2026-11-20, memory-and-stalls run 1: spec errata from the slices
+
+### 2026-11-20, agentfs-ln6.1 (close tracer): where the frozen page is wrong
+
+1. **Blocking: `LenRule::Fixed(u64)` cannot satisfy A2.** The page asks for `on(saved_len)` to fail with `TooLarge` exactly when folding `Call::len_after` over the calls from `saved_len` fails. An `Append` before a `Truncate` can overflow (`len.checked_add(n)`), and whether it does depends on the saved length. `Fixed(s)` has no room for that bound. Counter-example: calls `[Append{len: u64::MAX}, Truncate(0)]`. The fold from 0 is `Ok(0)`; the fold from 1 is `Err(TooLarge)`; the rule is `Fixed(0)` for both. Without the fix, `call` accepts a call that today's re-fold refuses (after another handle's save grows the file), and the close's replay then fails with `TooLarge`. Proposed re-cut: `Fixed { len: u64, grown: u64 }`, where `grown` is the `add` of the calls before the first truncate and `on(L)` fails iff `L + grown` overflows. Keep A2 as written. The probe "Truncate composes as Shift" still applies.
+2. **A4 and A6 in `tests/tree_close.rs` cannot read "a `#[cfg(test)]` counter in readback.rs".** An integration test compiles the crate without `cfg(test)`. Either move the reader-count assertion into a unit test (`call_path.rs` or `recording/mod.rs`), with `tree_close.rs` keeping the public `actor_lock` and `bytes_compared` deltas, or expose the count publicly (for example as a `Stages` field, which is another lane's file).
+3. **`ActorGuard { since: Instant }`:** `stages.rs` records a run only through a `Timer` it starts (its fields are private, and there is no add-a-run function). The guard must hold a `Timer`. The field is private, so this is cosmetic.
+4. **`close_frag`'s `lock_hold_max_ms` from `stages.actor_lock.max_nanos`** is the maximum over the whole process. In a full figures run it includes the create workload's holds and any compaction's. Only `--only close_frag` measures the close itself. State this in the budget text, or have the figure run alone.
+5. **A6:** "100k-call open closed on the fast path" holds only for overwrites of a small range plus one length change. 100,000 appends make about 100,000 pieces, which is above `SMALL_PIECES` (32), so the close is never fast. The test must say which.
+
+### 2026-11-20, agentfs-ln6.2 (host protocol v2): where the frozen page and the review were wrong or short
+
+1. **Frozen signatures changed by the review's amendments**:
+   - `lock_claim` is `fn lock_claim(&self, handle) -> Result<OwnedMutexGuard<()>, Error>`. It tries the lock and returns ABORTED on conflict, not an async wait (amendment 2, the CSI rule for rejecting secondary calls).
+   - `idle` is `fn idle(&self, using: &Using, volume) -> bool`. It must take the caller's guard: otherwise deciding idle and removing the host could not be one critical section (amendment 1).
+   - `HostClient::start` returns `Result<_, StartError { Gone(HostGone), Version { host, plugin } }>` (amendment 5).
+   - New `HostClient::close()` (amendment 1).
+   - `HostDriver.in_flight` is computed from `closing` and `waiting`, not stored (amendment 7).
+   - `OpenView` gains `holds: Resources`, which is where a Closing gets the fork key (amendment 7).
+   - `unpublish` takes `self: &Arc<Self>`.
+
+   The page should be re-cut to match.
+2. **`using` changed meaning (amendment 6).** It now holds only the opens in flight, not "claims with a record or an open in flight". `idle` = `using` empty and no record on disk, so the records stay the one source of truth. Sites that now decide through `idle()`: restart, release, stop_if_idle. The plugin-start reconcile goes through stop_if_idle.
+3. **Docs not changed in this commit, because they are not owned paths**:
+   - docs/library/filesystem.md:701-707 still says "Protocol, version 1 ... exactly one reply per request, in order" and shows `{"v":1,...}`.
+   - docs/library/kubernetes.md:124 still says "Each volume's calls run one at a time under a per-volume" lock.
+   - docs/csi.md should state the ABORTED answer to a secondary NodePublish or NodeUnpublish.
+
+   AGENTS.md requires library docs to travel with the code. The split to ln6.7 needs either that commit to land next, or an owner exception recorded in OWNER-GUIDANCE.md. I recorded neither.
+4. **Design page not edited (memory-and-stalls.md is not owned):**
+   - §5 needs the review's alternative written up: refuse a request that overlaps a closing view with a retryable kind, and keep no waiting queue. Why per-resource waits are better: the parent cannot tell when to retry; every refusal costs a round trip and a backoff; the order between a close and a re-open of the same mount would come from the parent's retry timing, not the host. Two costs to state: the host keeps waiting requests in memory, and none can be cancelled (there is no `$/cancelRequest`).
+   - §6 row 6 is wrong. Labels come from the target, so a re-publish at a new target shares no client with the closing view. On the plugin side the second call of the same claim is answered ABORTED, not queued. A fork claim's re-open ends in ForkTaken.
+5. **Fork waits kept (finding 10 rebutted).** Requests that name the same fork are answered in v1 order. Dropping the `fork` field would itself need a frozen-interface erratum. C3 asserts that fork_end waits.
+6. **serde limit.** `#[serde(deny_unknown_fields)]` on the internally tagged `Request` cannot reject extra fields on `reconcile`, which has none. This is pinned in the test comment.
+7. **Residuals 1 and 2 are covered by this commit.** M8 residual 1 (A-F6) is covered by launcher_host (o) with the probe "answer close at once -> fails". Residual 2 (B-F6) is covered by csi_trees `a_held_close_stalls_only_its_claim`. The commit marking them applied in .claude/errata.md is the main loop's: errata.md is not an owned path.
+8. **Still open: a waiting host request has no cancel.** A request queued behind a close that never ends waits forever at the host. The plugin side is bounded: one task per claim, retries get ABORTED. A fork_create or fork_end that waits holds the volume's start lock for the whole call, which would stall that volume's starts and stops. It can only wait while a view of that fork is closing, which in practice the controller's claim_in_use refusal prevents. This is close to B-F4 residual 3.
+
+### agentfs-ln6.3
+
+agentfs-ln6.3 frozen page, findings (none stopped the slice; nothing written to .claude/errata.md):
+
+1. `History::owners(&self) -> &Owners` cannot be written as specified. History keeps its state behind a Mutex, so it cannot hand out a reference. Nothing calls it, and an unused function would fail clippy -D warnings, so it was not added. BuiltSnapshot::owners() -> &Owners was done as specified. If History needs this question later, it should return an Owners clone (O(1)).
+
+2. The D1 probe as written does not prove the test can fail. Making `trees` (or `opens`) a BTreeMap again leaves the ratio at about 1.46, because each Tree's own maps are now persistent and cloning the outer map of a few trees is cheap. Making Tree.bytes a BTreeMap still passes too (ratio 1.6). 50 creates make only about 3 batches, so the fixed per-create cost (about 8.6 MB) hides a single map that deep-clones again. A probe that shows the class needs Shape or Tree maps back as BTreeMaps (the original code gives a ratio of 4.27), or a test that settles after each create.
+
+3. A batch is still proportional to the volume in one place. `objects: imbl::OrdMap<TreeId, Arc<Objects>>`, with `Objects = BTreeMap<u64, u64>`, is rebuilt by `objects_of(&shape)` for every tree a batch moves, which walks every name. This is most of the remaining growth in D1 (about 4 MB more at 20,000 files than at 2,000). Making it proportional to the batch means changing the `Objects` type, which journal/fold.rs, journal/commit_point.rs and history/format.rs::read_snapshot also use; none of those files are mine. It is left for whoever owns them (a later bead could update the map per step from the keys each step returns).
+
+4. Environment: worktrees -2, -4, -5 and the main checkout all have branch `work` checked out. When one lane commits, the others' HEADs move, and their indexes then show the other lane's changes as staged reverts. When I committed, my index held a staged reverse of 683bb83 (seven host and CSI files). My commit used explicit paths and contains only my 7 files, but any commit without paths from one of these worktrees would revert a sibling's work.
+
+### agentfs-ln6.5 (memory-and-stalls §4.5): an uncounted repack spawn under tree_actor/ is forbidden by a source test
+
+The frozen page puts the repack task in `crates/agentfs-core/src/tree_actor/history/repack.rs` and makes its `git repack` child "uncounted (not on the actor's path)". It also lists only repack.rs, built.rs, history/mod.rs and tree_actor/mod.rs as owned.
+
+But `crates/agentfs-core/tests/tree_stages.rs::one_spawn_site` fails on any `.spawn()`, `.output()` or `.status()` in the production code of every file under `src/tree_actor/`. Its message is "starts a process ... outside git_cli::counted", and `git_cli::counted` is the only spawn allowed.
+
+So the bead cannot land as written:
+- **Spawning through `git_cli::counted`** breaks "uncounted". A background repack would also make the process-wide count of git children, which tree_stages.rs checks per operation, nondeterministic.
+- **Spawning directly in repack.rs** fails `one_spawn_site`.
+- **`crate::repack::repack`** is excluded by the page. It is also unusable: it does nothing when there are no loose objects, and the tree history is packs only.
+
+Re-cut: add one of these to the bead's owned paths.
+- (a) `crates/agentfs-core/tests/tree_stages.rs`: exempt `tree_actor/history/repack.rs` from `one_spawn_site`, saying why: the repack task is not on the actor's path.
+- (b) `crates/agentfs-core/src/git_cli.rs`: a second named spawn site for uncounted background work, plus the guard's count changed from 1 to 2.
+
+Also for the re-cut:
+- **E5:** `ci/trees-figures.py` has no `long_history` workload on claude/kind-fermi-vvxywi at abc1ab6. Lane B's harness hasn't landed, so E5 cannot be measured yet.
+- **E2/E4 test hold:** git writes the new packs and deletes the old ones inside one process, so the hold "between git's pack write and delete" needs a test-only git wrapper per git directory. It runs the repack without `-d`, waits on a fifo, then runs the full command. The page should say so.
+- **Killing:** `join` should kill the child's whole process group. Killing only `git repack` leaves its `pack-objects` child running, holding stderr open and writing `.tmp-*` files.
