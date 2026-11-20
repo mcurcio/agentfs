@@ -1,22 +1,28 @@
 #!/usr/bin/env bash
-# End-to-end test of the CSI chart's git server (server.enabled, F8, design, docs/helm.md "The git server") on a one-node kind
-# cluster: the chart from this tree with charts/agentfs-csi/ci/server.yaml,
-# its server on the cluster's default StorageClass with the chart's own
-# random password, and a profile pushing to it with the credentials the
-# chart wires into the node plugin. Each line is one assertion:
+# End-to-end test of the CSI chart's git server (server.enabled,
+# docs/helm.md "The git server") on a one-node kind cluster: the chart from
+# this tree with charts/agentfs-csi/ci/server.yaml, its server on the
+# cluster's default StorageClass with the chart's own random password, and
+# a profile naming it as a remote with the credentials the chart wires
+# into the node plugin. Push is not built on tree volumes yet: the volume's
+# host logs the remote as not built, so the server gets no agentfs ref,
+# while a push from the runner shows the server itself works. Each line is
+# one assertion:
 #
 #   a. rendering: with the server off, no server object and the plain
 #      credentials Secret; with it on, a Secret, Service and StatefulSet,
 #      and the node plugin projects the `token` key of the very Secret
 #      whose `htpasswd` key the server reads;
 #   b. the install's notes name the server's URL and the credentials key;
-#   c. a pod writes a file: `git ls-remote` through `kubectl port-forward`
-#      to the Service shows agentfs/<volume> at the worktree's head, and
-#      that commit holds the file; the repository has core.fsync
-#      committed (loose objects synced before the ref);
+#   c. a pod writes a file, recorded in the volume's history: the plugin
+#      logs `not built: remote.server.url (push): ` for the volume's host,
+#      and `git ls-remote` through `kubectl port-forward` to the Service
+#      shows no agentfs/ ref; a push from the runner with the chart's
+#      password succeeds; the repository has core.fsync committed (loose
+#      objects synced before the ref);
 #   d. a wrong password is refused, and the server logs the mismatch;
-#   e. the server pod is deleted and comes back with the repository intact
-#      (its claim), and the next write reaches it;
+#   e. the server pod is deleted and comes back with the runner's pushed
+#      ref intact (its claim);
 #   f. `helm upgrade` keeps the password (the chart's lookup).
 #
 # Needs docker, kind, kubectl, helm and git, a kind cluster $KIND_CLUSTER
@@ -30,6 +36,7 @@
 #   ci/e2e-chart-server.sh        # ci/e2e-chart-server.sh diagnose after a failure
 
 . "$(dirname "$0")/lib.sh"
+. "$(dirname "$0")/tree-git-test-lib.sh"
 
 DNS=agentfs-csi
 APPS=agentfs-csi-e2e-server
@@ -93,8 +100,18 @@ until_ok() { # seconds message command...
 }
 
 plugin() { kd get pod -l "$PLUGIN_LABEL" -o jsonpath='{.items[0].metadata.name}'; }
-local_head() { # pv volume
-  kd exec "$(plugin)" -c agentfs-csi -- git --git-dir "$BASE/$1/state/git" rev-parse "refs/heads/agentfs/$2"
+plugin_log() { kd logs "$(plugin)" -c agentfs-csi; }
+# The volume's history, in the node plugin: <path>'s bytes at root
+# (docs/trees.md).
+history_file() { # pv path
+  kd exec "$(plugin)" -c agentfs-csi -- git --git-dir "$BASE/$1/state/history.git" \
+    show "root:files/$(tree_git_fanned "$2")"
+}
+history_file_is() { [ "$(history_file "$1" "$2" 2>/dev/null)" = "$3" ]; } # pv path content
+not_built_logged() { # pv
+  local said # captured first: grep -q closing a pipe would fail it (pipefail)
+  said=$(plugin_log 2>/dev/null)
+  grep -qF "[host $1] not built: remote.server.url (push): " <<<"$said"
 }
 # The token as the chart made it: `username=` and `password=` lines.
 token() { kd get secret "$SERVER" -o jsonpath='{.data.token}' | base64 -d; }
@@ -105,17 +122,6 @@ remote_ref() { # ref
   local said
   said=$(git ls-remote "$(url "$PASSWORD")" "$1") || return 1
   awk '{print $1}' <<<"$said"
-}
-remote_ref_is() { [ "$(remote_ref "$1")" = "$2" ]; } # ref oid
-moved_from() { # pv volume commit: the worktree's head is another commit
-  local head
-  head=$(local_head "$1" "$2") || return 1
-  [ "$head" != "$3" ]
-}
-pushed() { # pv volume: the remote's branch is at the worktree's head
-  local head
-  head=$(local_head "$1" "$2") || return 1
-  remote_ref_is "refs/heads/agentfs/$2" "$head"
 }
 port_forward() {
   [ -z "$PF" ] || kill "$PF" 2>/dev/null || true
@@ -191,7 +197,7 @@ metadata:
     pod-security.kubernetes.io/enforce: restricted
 EOF
 
-step "(c) a pod writes; the server holds agentfs/<volume> at the worktree's head"
+step "(c) a pod writes: push is logged as not built; the runner's push works"
 ka apply -f - <<EOF
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -232,15 +238,26 @@ spec:
 EOF
 ka wait --for=condition=Ready pod/writer --timeout=300s >/dev/null || fail "the writer never became Ready"
 PV=$(ka get pvc data -o jsonpath='{.spec.volumeName}')
-V=$APPS.data.$PV
-echo "volume $V ($PV)"
+[ -n "$PV" ] || fail "the claim is not bound"
+echo "volume $PV"
 port_forward
 in_pod 'printf one > /data/one.txt'
-until_ok 120 "agentfs/$V on the server is at the worktree's head" pushed "$PV" "$V"
-ONE=$(remote_ref "refs/heads/agentfs/$V")
-git init -q --bare "$WORK/clone.git"
-git --git-dir "$WORK/clone.git" fetch -q "$(url "$PASSWORD")" "refs/heads/agentfs/$V"
-assert_eq one "$(git --git-dir "$WORK/clone.git" show "$ONE:one.txt")" "the pushed commit $ONE holds one.txt"
+until_ok 120 "the volume's history has one.txt" history_file_is "$PV" one.txt one
+until_ok 60 "the plugin logs: [host $PV] not built: remote.server.url (push): " not_built_logged "$PV"
+refs=$(git ls-remote "$(url "$PASSWORD")")
+if grep -q "agentfs/" <<<"$refs"; then
+  fail "the server holds an agentfs ref, though push is not built: $refs"
+fi
+pass "the server holds no agentfs ref: nothing pushed to it"
+# The server works: a push from the runner with the chart's password.
+RUNNER=refs/heads/ci-runner
+git init -q "$WORK/runner"
+printf runner >"$WORK/runner/runner.txt"
+git -C "$WORK/runner" add runner.txt
+git -C "$WORK/runner" -c user.name=ci -c user.email=ci@example.invalid commit -q -m "from the runner"
+PUSHED=$(git -C "$WORK/runner" rev-parse HEAD)
+git -C "$WORK/runner" push -q "$(url "$PASSWORD")" "HEAD:$RUNNER" || fail "a push with the chart's password failed"
+assert_eq "$PUSHED" "$(remote_ref "$RUNNER")" "a push from the runner with the chart's password lands"
 # A small push arrives as loose objects, which git's default core.fsync
 # leaves unsynced while it syncs the ref (entrypoint.sh).
 assert_eq committed "$(kd exec "$SERVER-0" -c git-server -- git --git-dir /srv/git/history.git config core.fsync)" \
@@ -261,18 +278,10 @@ until_ok 180 "a new server pod is Ready" sh -c \
   "[ \"\$(kubectl -n $DNS get pod $SERVER-0 -o jsonpath='{.metadata.uid}')\" != '$uid' ] &&
    kubectl -n $DNS wait --for=condition=Ready pod/$SERVER-0 --timeout=5s"
 port_forward
-assert_eq "$ONE" "$(remote_ref "refs/heads/agentfs/$V")" "the repository survived the pod (its claim)"
-in_pod 'printf two > /data/two.txt'
-# Committed first: until then the worktree's head is still $ONE, which
-# the server already holds.
-until_ok 60 "the next write is committed" moved_from "$PV" "$V" "$ONE"
-until_ok 120 "the next write reaches the new server pod" pushed "$PV" "$V"
-TWO=$(remote_ref "refs/heads/agentfs/$V")
-[ "$TWO" != "$ONE" ] || fail "agentfs/$V did not move"
-git --git-dir "$WORK/clone.git" fetch -q "$(url "$PASSWORD")" "refs/heads/agentfs/$V"
-git --git-dir "$WORK/clone.git" merge-base --is-ancestor "$ONE" "$TWO" ||
-  fail "the second commit does not follow the first"
-pass "agentfs/$V moved from $ONE to $TWO"
+assert_eq "$PUSHED" "$(remote_ref "$RUNNER")" "the runner's pushed ref survived the pod (its claim)"
+git init -q --bare "$WORK/clone.git"
+git --git-dir "$WORK/clone.git" fetch -q "$(url "$PASSWORD")" "$RUNNER"
+assert_eq runner "$(git --git-dir "$WORK/clone.git" show "$PUSHED:runner.txt")" "and its commit holds runner.txt"
 
 step "(f) helm upgrade keeps the password"
 before=$(token)
