@@ -1,5 +1,5 @@
 {
-  "comment": "The bars ci/trees-figures.py holds the tree views' release figures to: the recording engine's budgets (ci/bench-budget.json, docs/performance.md). A gated figure (`\"gate\": true`: the many-file `create`) that misses its bar fails the tracer; every other missed bar is a warning. Every workload has its own `deadline_s` and reports what it reached by then; nothing is extrapolated. A workload misses its bar when it does not finish by its deadline, or when its `metric` is over `max` (one number, or one per filesystem). `create` runs for half the engine's 600 s and is held to half its 100,000 creates, the engine's rate of 6 ms a create. `close_64m` is held, unscaled, to the engine's close of a dirty 1 GiB file, and `close_1g` to the same, at its size: the close and stat after the writes. `write_1g` holds the same run's last 64 writes to 1.5 times a 1 MiB file's write. `history_1g` holds that save's drain to 60 s, the engine's own 1 GiB commit (23 to 29 s) with margin, and `memory_1g` the view process's peak memory through it to 256 MiB over its memory before, whatever the file's size. `memory_create` holds the view's resident memory per file the `create` workload left, read once its history is built, to 2 KiB a file. `grace_s` is how long a save the deadline caught may run on before the view's connection is aborted.",
+  "comment": "The bars ci/trees-figures.py holds the tree views' release figures to: the recording engine's budgets (ci/bench-budget.json, docs/performance.md). A gated figure (`\"gate\": true`: the many-file `create`) that misses its bar fails the tracer; every other missed bar is a warning. Every workload has its own `deadline_s` and reports what it reached by then; nothing is extrapolated. A workload misses its bar when it does not finish by its deadline, or when its `metric` is over `max` (one number, or one per filesystem), or any of its `metrics` is over its own max. `create` runs for half the engine's 600 s and is held to half its 100,000 creates, the engine's rate of 6 ms a create. `close_64m` is held, unscaled, to the engine's close of a dirty 1 GiB file, and `close_1g` to the same, at its size: the close and stat after the writes. `write_1g` holds the same run's last 64 writes to 1.5 times a 1 MiB file's write. `history_1g` holds that save's drain to 60 s, the engine's own 1 GiB commit (23 to 29 s) with margin, and `memory_1g` the view process's peak memory through it to 256 MiB over its memory before, whatever the file's size. `memory_create` holds the view's anonymous resident memory (RssAnon: clean file-backed git index pages are not counted, owner 2026-11-20) per file the `create` workload left, read once its history is built, to 2 KiB a file. The memory and stall figures warn and never fail (owner, 2026-11-20): `close_frag` holds the longest hold of the volume's actor lock through a 64 MiB file's close after 200,000 random 64-byte writes to 50 ms (stages.actor_lock.max_nanos, the process's maximum: only a run with `--only close_frag` holds that close alone), `write_1m` the view's peak memory through a close of 1,000,000 64-byte appends to 256 MiB over its memory before, `restart` the view mounted again on the state the figures left (about 50,000 files) to 15 s and a 256 MiB peak, and `long_history` 2,000 more creates on it to 1.2 times the ms a create of `create`'s first 2,000 took. `grace_s` is how long a save the deadline caught may run on before the view's connection is aborted.",
   "grace_s": 30,
   "budgets": {
     "close_4k": {
@@ -43,13 +43,36 @@
       "deadline_s": 300,
       "metric": "kib_per_file",
       "max": 2,
-      "text": "the view's resident memory per file the create workload left, at most 2 KiB a file once its history is built (a 100,000-file tree in under 200 MiB, inside the sidecar's 512 Mi limit)"
+      "text": "the view's anonymous resident memory (RssAnon) per file the create workload left, at most 2 KiB a file once its history is built (a 100,000-file tree in under 200 MiB, inside the sidecar's 512 Mi limit)"
     },
     "write_1g": {
       "deadline_s": 300,
       "metric": "ratio",
       "max": 1.5,
       "text": "the last 64 1 MiB writes of a 1 GiB file, median within 1.5 times a 1 MiB file's write"
+    },
+    "close_frag": {
+      "deadline_s": 300,
+      "metric": "lock_hold_max_ms",
+      "max": 50,
+      "text": "the longest hold of the actor lock through a 64 MiB file's close after 200,000 random 64-byte writes, at most 50 ms (read alone with --only close_frag: a full run's maximum is the whole process's)"
+    },
+    "write_1m": {
+      "deadline_s": 300,
+      "metric": "peak_extra_mib",
+      "max": 256,
+      "text": "the view's peak memory through a close of 1,000,000 64-byte appends in one open, and its build, under 256 MiB over its memory before"
+    },
+    "restart": {
+      "metrics": {"hwm_mib": 256, "mount_s": 15},
+      "text": "the view mounted again on the figures' state (about 50,000 files) within 15 s, its peak memory through the mount under 256 MiB"
+    },
+    "long_history": {
+      "deadline_s": 120,
+      "count": 2000,
+      "metric": "ratio",
+      "max": 1.2,
+      "text": "2,000 creates on the restarted view, at most 1.2 times the ms a create of the create workload's first 2,000 took"
     }
   }
 }

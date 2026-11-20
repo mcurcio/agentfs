@@ -35,6 +35,11 @@
 #    misses its bar fails the script once the rest is checked, any other is a
 #    warning, and the root's history holds the last save each workload saw
 #    answered.
+# 5. (--figures) The view is stopped and mounted again on the state step 4
+#    left (about 50,000 files): `restart` is its time to mount, from the
+#    container's start to its `mounted` line by their log timestamps, and
+#    its peak memory; `long_history` is 2,000 more creates on it. Both are
+#    added to the same report and only warn (owner, 2026-11-20).
 #
 # Needs the agentfs image as $AGENTFS_IMAGE (default agentfs:ci), the fuse
 # module loaded, a shared mount under $RUNNER_TEMP (as / is on systemd
@@ -134,7 +139,8 @@ mount_view() { # [mount flags]
     "$IMAGE" --state /data/state mount /agentfs/root --volume t \
     --metrics-output /data/metrics.json "$@" \
     >/dev/null
-  wait_for 60 mounted || { docker logs "$NAME" >&2; fail 'the tree view did not mount'; }
+  # A bound on a hang; step 5's restart reads a long history first.
+  wait_for "${MOUNT_WAIT:-60}" mounted || { docker logs "$NAME" >&2; fail 'the tree view did not mount'; }
   pass 'the root is mounted'
 }
 workload() { # [docker run options] -- command
@@ -266,6 +272,10 @@ if [ -n "$FS" ]; then
     fail 'a create short of its bar would not fail the gate'
   fi
   pass 'a create short of its bar fails the gate'
+  # And only create's: every other bar missed only warns (owner, 2026-11-20).
+  python3 "$(dirname "$0")/trees-figures.py" --self-test-warn --budget "$(dirname "$0")/trees-budget.json" >/dev/null ||
+    fail 'a bar other than create would fail the run'
+  pass 'every other bar missed only warns'
   report=${RUNNER_TEMP:-/tmp}/trees-figures-$FS.json
   # As root, which the view lets through (docs/trees.md), so the runner's
   # files need no other owner, and so a stuck view's connection can be
@@ -283,9 +293,9 @@ if [ -n "$FS" ]; then
 w = {w["name"]: w for w in json.load(open(sys.argv[1]))["workloads"]}[sys.argv[2]]
 print(json.dumps(w.get(sys.argv[3], 0)))' "$report" "$1" "$2"
   }
-  assert_eq "close_4k create memory_create close_64m close_1g write_1g history_1g memory_1g" \
-    "$(python3 -c 'import json, sys; print(*(w["name"] for w in json.load(open(sys.argv[1]))["workloads"]))' "$report")" \
-    'the report lists every workload'
+  listed() { python3 -c 'import json, sys; print(*(w["name"] for w in json.load(open(sys.argv[1]))["workloads"]))' "$report"; }
+  assert_eq "close_4k create memory_create close_64m close_1g write_1g history_1g memory_1g close_frag write_1m" \
+    "$(listed)" 'the report lists every workload'
   # A save each workload saw answered is in history once the built point reached
   # it (drain_s); a save the deadline caught may have landed after it, so history
   # may hold one more. A workload whose history did not drain within the cap is
@@ -307,6 +317,45 @@ print(json.dumps(w.get(sys.argv[3], 0)))' "$report" "$1" "$2"
   if [ "$(figure close_1g finished)" = true ] && drained close_1g; then
     assert_eq 1073741824 "$(in_history cat-file -s "root:files/$(tree_git_fanned fig-1g)")" 'the 1 GiB save is in history'
   fi
+  closed() { case $(figure "$1" close_s) in 0 | null) false ;; esac; }
+  if closed close_frag && drained close_frag; then
+    assert_eq 67108864 "$(in_history cat-file -s "root:files/$(tree_git_fanned fig-frag)")" 'the fragmented 64 MiB save is in history'
+  fi
+  if closed write_1m && drained write_1m; then
+    assert_eq 64000000 "$(in_history cat-file -s "root:files/$(tree_git_fanned fig-appends)")" 'the million appends are in history'
+  fi
+
+  step "5. restart: the view mounted again on the figures' state, then a long history"
+  # A clean stop builds every record appended; the restart then reads it all.
+  docker stop -t 600 "$NAME" >/dev/null
+  MOUNT_WAIT=600 mount_view --on-stale-mount recover
+  # From the container's start to the view's `mounted` line, by their log
+  # timestamps (RFC 3339, nanoseconds).
+  mount_s=$(python3 - "$(docker inspect --format '{{.State.StartedAt}}' "$NAME")" \
+    "$(docker logs -t "$NAME" 2>&1 | grep -F 'mounted volume t at /agentfs/root' | head -n 1 | cut -d' ' -f1)" <<'PY'
+import datetime, sys
+def at(stamp):
+    whole, _, fraction = stamp.rstrip("Z").partition(".")
+    seconds = datetime.datetime.fromisoformat(whole).replace(tzinfo=datetime.timezone.utc).timestamp()
+    return seconds + float("0." + (fraction or "0"))
+print(round(at(sys.argv[2]) - at(sys.argv[1]), 3))
+PY
+)
+  restarted=0
+  sudo python3 "$(dirname "$0")/trees-figures.py" --view "$VIEW" --filesystem "$FS" \
+    --metrics "$DATA/metrics.json" --drain-cap 180 \
+    --view-pid "$(docker inspect --format '{{.State.Pid}}' "$NAME")" \
+    --image "$(docker image inspect --format '{{.Id}}' "$IMAGE")" \
+    --budget "$(dirname "$0")/trees-budget.json" \
+    --baseline "$report" --restart-mount-s "$mount_s" --output "$report" || restarted=$?
+  cat "$report"
+  assert_eq "close_4k create memory_create close_64m close_1g write_1g history_1g memory_1g close_frag write_1m restart long_history" \
+    "$(listed)" 'the report lists the restart and the long history'
+  n=$(figure long_history count)
+  if [ "$n" -gt 0 ] && drained long_history; then
+    assert_eq "$n" "$(in_history show "root:files/$(tree_git_fanned "fig-history-$n")")" "long history create $n is in history"
+  fi
+  [ "$restarted" = 0 ] || fail "a gated figure missed its bar after the restart on $FS (trees-figures.py exited $restarted)"
   [ "$gated" = 0 ] || fail "a gated figure missed its bar on $FS (trees-figures.py exited $gated)"
 fi
 pass 'tree views tracer'

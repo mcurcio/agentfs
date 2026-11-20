@@ -189,16 +189,14 @@ impl TreeActor {
         Ok(())
     }
 
-    /// Moves every position the actor holds (live opens' calls and views,
-    /// held page writes, saved maps) to where compaction carried its frame,
-    /// letting go of the dropped segments. The builder moves its own at its
+    /// Moves every position the actor holds (live opens' views, held page
+    /// writes, saved maps) to where compaction carried its frame, letting go
+    /// of the dropped segments. An open's calls are read back from the
+    /// journal, which finds them carried. The builder moves its own at its
     /// next batch; a reader's map keeps its segment until the reader lets go.
     fn relocate_frames(&mut self) {
         let moved = self.journal.relocations().clone();
         for handle in self.handles.values_mut() {
-            for (_, _, pos) in &mut handle.calls {
-                pos.relocate(&moved);
-            }
             handle.bytes.relocate(&moved);
         }
         crate::tree_actor::recording::pages::relocate(&mut self.pages, &moved);

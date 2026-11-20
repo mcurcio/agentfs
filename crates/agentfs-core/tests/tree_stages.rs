@@ -227,6 +227,32 @@ fn the_call_path_runs_no_git() {
     assert_eq!(rec.actor().unwrap().files(TreeId::Root).unwrap(), vec![]);
 }
 
+/// Each hold of the actor's lock through the call path is one `actor_lock`
+/// run, from the lock taken to its release; the longest is kept.
+#[test]
+fn each_hold_of_the_actor_lock_is_counted() {
+    let _one = ONE_AT_A_TIME.lock().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let rec = Recording::create(
+        &tmp.path().join("state"),
+        &identity(),
+        None,
+        &PodContext::default(),
+    )
+    .unwrap();
+    rec.settle().unwrap();
+    let before = Stages::current().actor_lock;
+    for _ in 0..3 {
+        drop(rec.actor().unwrap());
+    }
+    let held = rec.actor().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    drop(held);
+    let after = Stages::current().actor_lock;
+    assert_eq!(after.count - before.count, 4);
+    assert!(after.max_nanos >= 20_000_000, "the longest hold: {after:?}");
+}
+
 /// Calls are appended with no fsync, and a FLUSH makes all of an open's
 /// records durable with one: close_4k's path (open, truncate, write, FLUSH,
 /// RELEASE) does one journal fsync on the call path where it did four. The

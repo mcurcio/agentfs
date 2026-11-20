@@ -1,10 +1,13 @@
 //! The call path as a view host, the CLI and the conformance replay reach it:
 //! the tree actor behind its one lock, with the lock discipline in this one
 //! place. Under the lock a call decides, appends (no fsync) and applies;
-//! durability waits and lag-gate waits run outside it (docs/trees.md,
-//! "Recording and durability").
+//! durability waits, lag-gate waits and a close's decision run outside it
+//! (docs/trees.md, "Recording and durability"). Each hold is measured
+//! (`Stages::actor_lock`): its longest is the longest any other view of the
+//! volume waited.
 //!
 
+use std::ops::{Deref, DerefMut};
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -14,8 +17,32 @@ use agentfs_contracts::volume::VolumeIdentity;
 
 use super::history::built::History;
 use super::journal::durable::{Durability, RecordNo};
+use super::recording::CloseStart;
+use super::stages::{Timer, Which};
 use super::takes::{self, Lands};
-use super::{Error, Took, TreeActor, TreeId};
+use super::{Error, Saved, Took, TreeActor, TreeId};
+
+/// The actor, locked through the call path: [`TreeActor`] by `Deref`. Each
+/// guard adds one run of `Stages::actor_lock` when it is dropped, from the
+/// lock taken to its release.
+pub struct ActorGuard<'a> {
+    guard: MutexGuard<'a, TreeActor>,
+    _held: Timer,
+}
+
+impl Deref for ActorGuard<'_> {
+    type Target = TreeActor;
+
+    fn deref(&self) -> &TreeActor {
+        &self.guard
+    }
+}
+
+impl DerefMut for ActorGuard<'_> {
+    fn deref_mut(&mut self) -> &mut TreeActor {
+        &mut self.guard
+    }
+}
 
 /// What runs when a deferred call may go on: given the durability or gate
 /// outcome, it sends the FUSE reply. Runs on the journal's waiter thread or
@@ -48,6 +75,9 @@ pub struct Recording {
     /// The gate thread, joined at drop: it holds the store (and the state
     /// area's lease) until the builder has stopped.
     gate: Option<std::thread::JoinHandle<()>>,
+    /// Tests: runs where a close's decision runs, with the lock released.
+    #[cfg(test)]
+    in_decide: Mutex<Option<Box<dyn Fn() + Send>>>,
 }
 
 impl Drop for Recording {
@@ -99,6 +129,8 @@ impl Recording {
             history,
             rules,
             gate: Some(gate),
+            #[cfg(test)]
+            in_decide: Mutex::new(None),
         }))
     }
 
@@ -147,12 +179,64 @@ impl Recording {
     /// # Errors
     ///
     /// [`Error::Stopped`] when the actor stopped or its lock is poisoned.
-    pub fn actor(&self) -> Result<MutexGuard<'_, TreeActor>, Error> {
+    pub fn actor(&self) -> Result<ActorGuard<'_>, Error> {
         let actor = self.actor.lock().map_err(|_| Error::Stopped)?;
+        let held = Timer::start(Which::ActorLock);
         if actor.is_stopped() {
             return Err(Error::Stopped);
         }
-        Ok(actor)
+        Ok(ActorGuard {
+            guard: actor,
+            _held: held,
+        })
+    }
+
+    /// RELEASE: `check` and the close's first half under one hold
+    /// ([`TreeActor::close_begin`]), the decision with the lock released
+    /// ([`super::recording::CloseWork::decide`]), and its landing under the
+    /// lock again ([`TreeActor::close_finish`]). Other calls of the volume
+    /// run meanwhile. The save is recorded before this returns, or the close
+    /// stays pending as any failed close does.
+    ///
+    /// # Errors
+    ///
+    /// `check`'s error, with nothing done; as [`TreeActor::close`].
+    pub fn close_with(
+        &self,
+        handle: u64,
+        check: impl FnOnce(&TreeActor) -> Result<(), Error>,
+    ) -> Result<Saved, Error> {
+        let work = {
+            let mut actor = self.actor()?;
+            check(&actor)?;
+            match actor.close_begin(handle)? {
+                CloseStart::Done(saved) => return Ok(saved),
+                CloseStart::Decide(work) => work,
+            }
+        };
+        #[cfg(test)]
+        if let Some(hook) = &*self
+            .in_decide
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
+            hook();
+        }
+        let decided = work.decide();
+        let mut actor = self.actor()?;
+        match decided {
+            Ok(decision) => actor.close_finish(decision),
+            Err(e) => Err(actor.close_failed(handle, e)),
+        }
+    }
+
+    /// Tests: `hook` runs in every close's decision, with the lock released.
+    #[cfg(test)]
+    pub(in crate::tree_actor) fn hold_decide_with(&self, hook: impl Fn() + Send + 'static) {
+        *self
+            .in_decide
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::new(hook));
     }
 
     /// The last record a FLUSH of `open` must cover, read under the lock
@@ -512,6 +596,132 @@ mod tests {
         drop(failing);
         let built = rec.settle().unwrap();
         assert_eq!(built, rec.durability.appended(), "a retry built it all");
+    }
+
+    /// A saved file `a` of ten bytes, and an open of it whose close keeps the
+    /// length: decided with the lock released.
+    fn held_close(rec: &Recording) -> u64 {
+        let w = writer("w");
+        let h = rec
+            .actor()
+            .unwrap()
+            .write_open(TreeId::Root, "a", &w, Some(ATTRS))
+            .unwrap();
+        rec.actor()
+            .unwrap()
+            .write(h, 0, b"0123456789", false)
+            .unwrap();
+        rec.close_with(h, |_| Ok(())).unwrap();
+        let h = rec
+            .actor()
+            .unwrap()
+            .write_open(TreeId::Root, "a", &w, None)
+            .unwrap();
+        rec.actor().unwrap().write(h, 2, b"AB", false).unwrap();
+        h
+    }
+
+    /// The first close's decision waits for `release`; `inside` says it is
+    /// there. Later decisions pass.
+    fn hold_first_decide(rec: &Recording) -> (mpsc::Receiver<()>, mpsc::Sender<()>) {
+        let (entered, inside) = mpsc::channel::<()>();
+        let (release, released) = mpsc::channel::<()>();
+        let released = Mutex::new(released);
+        let first = std::sync::atomic::AtomicBool::new(true);
+        rec.hold_decide_with(move || {
+            if first.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                let _ = entered.send(());
+                let _ = released.lock().map(|r| r.recv());
+            }
+        });
+        (inside, release)
+    }
+
+    /// A3: while one close is being decided, the actor's lock is free and
+    /// another client's open, write and close complete.
+    #[test]
+    fn a_close_decides_with_the_lock_released() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rec = Recording::serve(new_actor(tmp.path())).unwrap();
+        let h = held_close(&rec);
+        let (inside, release) = hold_first_decide(&rec);
+        std::thread::scope(|scope| {
+            let closing = scope.spawn(|| rec.close_with(h, |_| Ok(())));
+            inside.recv().unwrap();
+            if rec.actor.try_lock().is_err() {
+                // Let the close go first, so the failure is a failure, not a hang.
+                release.send(()).unwrap();
+                let _ = closing.join();
+                panic!("the lock is held in the decision");
+            }
+            let other = writer("other");
+            let g = rec
+                .actor()
+                .unwrap()
+                .write_open(TreeId::Root, "b", &other, Some(ATTRS))
+                .unwrap();
+            rec.actor().unwrap().write(g, 0, b"b", false).unwrap();
+            let saved = rec.close_with(g, |_| Ok(())).unwrap();
+            assert!(matches!(saved, Saved::Commit(_)), "{saved:?}");
+            release.send(()).unwrap();
+            let saved = closing.join().unwrap().unwrap();
+            assert!(matches!(saved, Saved::Commit(_)), "{saved:?}");
+        });
+        let actor = rec.actor().unwrap();
+        assert_eq!(actor.read(TreeId::Root, "a").unwrap(), b"01AB456789");
+        assert_eq!(actor.read(TreeId::Root, "b").unwrap(), b"b");
+    }
+
+    /// A5: another open saves the file while a close is being decided: the
+    /// decision is stale, the close is redone under the lock on the new
+    /// save, and its save is in the journal before `close_with` returns.
+    #[test]
+    fn a_close_whose_file_moved_meanwhile_is_redone_and_recorded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rec = Recording::serve(new_actor(tmp.path())).unwrap();
+        let h = held_close(&rec);
+        let (inside, release) = hold_first_decide(&rec);
+        let saved = std::thread::scope(|scope| {
+            let closing = scope.spawn(|| rec.close_with(h, |_| Ok(())));
+            inside.recv().unwrap();
+            let w = writer("w");
+            let g = rec
+                .actor()
+                .unwrap()
+                .write_open(TreeId::Root, "a", &w, None)
+                .unwrap();
+            rec.actor().unwrap().write(g, 0, b"zz", true).unwrap();
+            rec.close_with(g, |_| Ok(())).unwrap();
+            release.send(()).unwrap();
+            closing.join().unwrap().unwrap()
+        });
+        let Saved::Commit(step) = saved else {
+            panic!("the close saves: {saved:?}");
+        };
+        let (_, frames) = super::super::journal::Journal::open(
+            &tmp.path().join(super::super::JOURNAL),
+            RecordNo::ZERO,
+        )
+        .unwrap();
+        let recorded = frames.iter().any(|(record, _)| {
+            record.seq == step
+                && matches!(
+                    &record.entry,
+                    super::super::journal::Entry::Step {
+                        change: super::super::journal::Change::Save {
+                            handle,
+                            outcome: super::super::journal::SaveOutcome::Saved { len: 12, .. },
+                            ..
+                        },
+                        ..
+                    } if *handle == h
+                )
+        });
+        assert!(recorded, "the close's save is in the journal");
+        assert_eq!(
+            rec.actor().unwrap().read(TreeId::Root, "a").unwrap(),
+            b"01AB456789zz"
+        );
     }
 
     #[test]
