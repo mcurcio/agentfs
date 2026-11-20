@@ -1,6 +1,6 @@
 The agentfs CSI driver ({{ include "agentfs-csi.driverName" . }}) is installed in {{ .Release.Namespace }}.
 
-Check it (one node plugin per node, each provisioning its own node's worktrees):
+Check it (one node plugin per node, each keeping its own node's volumes):
   kubectl -n {{ .Release.Namespace }} wait --for=condition=Ready pod -l app.kubernetes.io/name=agentfs-csi-node
   kubectl -n {{ .Release.Namespace }} get pods -l app.kubernetes.io/name=agentfs-csi-node -o wide
 {{- $ns := lookup "v1" "Namespace" "" .Release.Namespace }}
@@ -27,7 +27,9 @@ does not start until it exists.
 {{- $url := printf "http://agentfs-git-server.%s.svc:%v/git/history.git" .Release.Namespace .Values.server.service.port }}
 
 The git server serves {{ $url }}
-(user and password: key `token` of Secret {{ include "agentfs-csi.serverSecret" . }}). A profile pushes to it with:
+(user and password: key `token` of Secret {{ include "agentfs-csi.serverSecret" . }}). A profile names it with
+the lines below. Push is not built on tree volumes yet: each volume's host logs the
+remote as not built (`not built: remote.server.url (push)`) and keeps the history.
   [remote "server"]
       url = {{ $url }}
       agentfsCredentials = /etc/agentfs-csi/credentials/agentfs-server

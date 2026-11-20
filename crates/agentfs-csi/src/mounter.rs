@@ -1,41 +1,23 @@
-//! The mount operations of the node plugin: what is
-//! mounted at a path, bind mounts of a front's own mount onto the
-//! kubelet's target, and lazy detaches. A trait so tests can keep an
-//! in-memory mount table.
+//! The mount operations of the node plugin: what is mounted at a path, and
+//! lazy detaches of a view a host no longer serves. A trait so tests can
+//! keep an in-memory mount table.
 
 use std::io;
 use std::path::Path;
 
 use agentfs_fuse::MountState;
-use rustix::mount::{MountFlags, MountPropagationFlags, UnmountFlags};
+use rustix::mount::UnmountFlags;
 
-/// Most layers [`Mounter::detach_all`] removes: each crash of a front
-/// leaves one stale layer under the bind stacked over it.
+/// Most layers [`detach_agentfs`] removes: each crash of a host leaves one
+/// stale layer under the view the restarted host stacks over it.
 pub const MAX_LAYERS: usize = 64;
 
 pub trait Mounter: Send + Sync + 'static {
+    /// Lazily detaches the topmost mount at `path` (`MNT_DETACH`); `Ok`
+    /// when nothing is mounted there.
+    fn detach(&self, path: &Path) -> io::Result<()>;
     /// The topmost mount at `path`.
     fn state(&self, path: &Path) -> io::Result<MountState>;
-    /// Bind-mounts `source` onto `target`, on top of whatever is there
-    /// (read-only when asked).
-    fn bind(&self, source: &Path, target: &Path, readonly: bool) -> io::Result<()>;
-    /// Lazily detaches the topmost mount at `path`.
-    fn detach(&self, path: &Path) -> io::Result<()>;
-    /// Detaches every mount at `path`; returns how many.
-    fn detach_all(&self, path: &Path) -> io::Result<usize> {
-        let mut n = 0;
-        while n < MAX_LAYERS {
-            if self.state(path)? == MountState::NotMounted {
-                return Ok(n);
-            }
-            self.detach(path)?;
-            n += 1;
-        }
-        Err(io::Error::other(format!(
-            "{} still has mounts after {MAX_LAYERS} detaches",
-            path.display()
-        )))
-    }
 }
 
 /// The kernel's mount table.
@@ -43,29 +25,36 @@ pub trait Mounter: Send + Sync + 'static {
 pub struct KernelMounter;
 
 impl Mounter for KernelMounter {
+    fn detach(&self, path: &Path) -> io::Result<()> {
+        match rustix::mount::unmount(path, UnmountFlags::DETACH) {
+            // Not a mount point.
+            Err(rustix::io::Errno::INVAL) => Ok(()),
+            other => other.map_err(io::Error::from),
+        }
+    }
+
     fn state(&self, path: &Path) -> io::Result<MountState> {
         agentfs_fuse::mount_state(path)
     }
+}
 
-    fn bind(&self, source: &Path, target: &Path, readonly: bool) -> io::Result<()> {
-        rustix::mount::mount_bind(source, target)?;
-        if readonly {
-            let flags =
-                MountFlags::BIND | MountFlags::RDONLY | MountFlags::NOSUID | MountFlags::NODEV;
-            if let Err(e) = rustix::mount::mount_remount(target, flags, "") {
-                let _ = self.detach(target);
-                return Err(e.into());
-            }
+/// Detaches every agentfs mount stacked at `path`, live or stale; returns
+/// how many. Anything else mounted there is left alone.
+///
+/// # Errors
+///
+/// A failed detach or mount table read, or more than [`MAX_LAYERS`] layers.
+pub fn detach_agentfs(mounter: &dyn Mounter, path: &Path) -> io::Result<usize> {
+    for n in 0..MAX_LAYERS {
+        match mounter.state(path)? {
+            MountState::Live { .. } | MountState::Stale { .. } => mounter.detach(path)?,
+            MountState::NotMounted | MountState::Foreign { .. } => return Ok(n),
         }
-        // The target is in the kubelet's shared peer group; make sure the
-        // new layer propagates to the pod's HostToContainer mounts.
-        let _ = rustix::mount::mount_change(target, MountPropagationFlags::SHARED);
-        Ok(())
     }
-
-    fn detach(&self, path: &Path) -> io::Result<()> {
-        rustix::mount::unmount(path, UnmountFlags::DETACH).map_err(io::Error::from)
-    }
+    Err(io::Error::other(format!(
+        "{} still has agentfs mounts after {MAX_LAYERS} detaches",
+        path.display()
+    )))
 }
 
 #[cfg(test)]
@@ -90,9 +79,6 @@ mod tests {
                 .and_then(|s| s.last().cloned())
                 .unwrap_or(MountState::NotMounted))
         }
-        fn bind(&self, _: &Path, _: &Path, _: bool) -> io::Result<()> {
-            unimplemented!()
-        }
         fn detach(&self, path: &Path) -> io::Result<()> {
             self.0.lock().unwrap().get_mut(path).and_then(Vec::pop);
             Ok(())
@@ -100,29 +86,33 @@ mod tests {
     }
 
     #[test]
-    fn detach_all_pops_every_layer_and_gives_up_at_the_cap() {
+    fn every_agentfs_layer_goes_and_nothing_else() {
         let t = Table::default();
         let stale = MountState::Stale {
             source: "agentfs:v".into(),
         };
-        t.0.lock()
-            .unwrap()
-            .insert("/t".into(), vec![stale.clone(), stale.clone(), stale]);
-        assert_eq!(t.detach_all(Path::new("/t")).unwrap(), 3);
-        assert_eq!(t.detach_all(Path::new("/t")).unwrap(), 0);
+        let foreign = MountState::Foreign {
+            fstype: "tmpfs".into(),
+        };
+        t.0.lock().unwrap().insert(
+            "/t".into(),
+            vec![foreign.clone(), stale.clone(), stale.clone(), stale],
+        );
+        assert_eq!(detach_agentfs(&t, Path::new("/t")).unwrap(), 3);
+        assert_eq!(t.state(Path::new("/t")).unwrap(), foreign);
+        assert_eq!(detach_agentfs(&t, Path::new("/none")).unwrap(), 0);
 
         struct Stuck;
         impl Mounter for Stuck {
             fn state(&self, _: &Path) -> io::Result<MountState> {
-                Ok(MountState::Foreign { fstype: "x".into() })
-            }
-            fn bind(&self, _: &Path, _: &Path, _: bool) -> io::Result<()> {
-                Ok(())
+                Ok(MountState::Stale {
+                    source: "agentfs:v".into(),
+                })
             }
             fn detach(&self, _: &Path) -> io::Result<()> {
                 Ok(())
             }
         }
-        assert!(Stuck.detach_all(Path::new("/t")).is_err());
+        assert!(detach_agentfs(&Stuck, Path::new("/t")).is_err());
     }
 }

@@ -1612,15 +1612,7 @@ fn validate_fork_lfs(remote: &RemoteSettings, lfs: &LfsSettings) -> Result<(), C
 /// limited to `[A-Za-z0-9][A-Za-z0-9._-]*`, without `..` or a `.lock`
 /// suffix. A `/` would let one volume's namespace contain another's.
 pub fn validate_name(key: &str, value: &str) -> Result<(), ConfigError> {
-    let bytes = value.as_bytes();
-    let ok = bytes.first().is_some_and(u8::is_ascii_alphanumeric)
-        && bytes
-            .iter()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
-        && !value.contains("..")
-        && !value.ends_with(".lock")
-        && !value.ends_with('.');
-    if ok {
+    if agentfs_contracts::name::is_safe_name(value) {
         Ok(())
     } else {
         Err(ConfigError::BadName {

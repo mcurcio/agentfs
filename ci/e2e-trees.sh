@@ -1,47 +1,62 @@
 #!/usr/bin/env bash
-# Recording slice of target git-model §18. Requires Linux FUSE; no sudo.
+# Recording slice of target git-model §18. Requires Linux FUSE. The views'
+# server runs as the caller; trees-posix.py's view checks run as root (sudo when
+# the caller is not root), since they chown and act as another user.
 set -euo pipefail
 . "$(dirname "$0")/tree-git-test-lib.sh"
 bin=${AGENTFS_BIN:-$PWD/target/debug/agentfs}
 work=$(mktemp -d)
 pid=
 client=
+writer=
 cleanup() {
     status=$?
-    for mount in "$work/main" "$work/sandbox"; do
+    for mount in "$work/main" "$work/fork" "$work/untrack-mount" "$work/save-mount"; do
         mountpoint -q "$mount" && fusermount3 -uz "$mount" || true
     done
     [ -z "$client" ] || kill "$client" 2>/dev/null || true
-    [ -z "$pid" ] || kill "$pid" 2>/dev/null || true
+    [ -z "$writer" ] || kill -KILL "$writer" 2>/dev/null || true
+    [ -z "$pid" ] || tree_stop "$pid"
     if [ "$status" != 0 ]; then cat "$work"/*.log 2>/dev/null || true; fi
     rm -rf "$work"
 }
 trap cleanup EXIT
-mkdir "$work/main" "$work/sandbox"
-"$bin" --state "$work/state" trees init
-fork=$("$bin" --state "$work/state" trees fork)
+as_root=()
+[ "$(id -u)" = 0 ] || as_root=(sudo)
+mkdir "$work/main" "$work/fork"
+# trees-posix.py's non-root user reaches the views through it.
+chmod 755 "$work"
+"$bin" --state "$work/state" init --volume t
+# The operator's rules (docs/trees.md, "Rules and the untracked area"), read at
+# each mount; trees-untracked.py checks what they keep out.
+mkdir -p "$work/state/history.git/info"
+printf '%s\n' '*.log' '/sessions/' '/logs/' >"$work/state/history.git/info/exclude"
+printf '%s\n' '*.db -agentfs' '*.db-wal -agentfs' '*.db-shm -agentfs' '.env -agentfs' \
+    >"$work/state/history.git/info/attributes"
+# The fork view is one keyed fork: the first mount makes it, every later mount
+# under the key finds it.
+key=e2e
 start() {
-    "$bin" --state "$work/state" trees mount "$work/main" \
-        --sandbox "$work/sandbox" --fork "$fork" >>"$work/mount.log" 2>&1 &
+    "$bin" --state "$work/state" mount "$work/main" \
+        --fork-mount "$work/fork" --fork-key "$key" "$@" >>"$work/mount.log" 2>&1 &
     pid=$!
     for _ in $(seq 1 200); do
-        if mountpoint -q "$work/main" && mountpoint -q "$work/sandbox"; then return; fi
+        if mountpoint -q "$work/main" && mountpoint -q "$work/fork"; then return; fi
         kill -0 "$pid"
         sleep 0.1
     done
-    echo "trees mounts did not start" >&2
+    echo "the tree mounts did not start" >&2
     return 1
 }
 start
-python3 - "$work/main" "$work/sandbox" <<'PY'
-import errno
+python3 - "$work/main" "$work/fork" <<'PY'
 import os
 from pathlib import Path
 import sys
 import tempfile
 import time
 
-main, sandbox = map(Path, sys.argv[1:])
+main, fork_view = map(Path, sys.argv[1:])
 
 def saved(path, expected):
     assert path.read_bytes() == expected, (path, expected)
@@ -58,7 +73,7 @@ def delivered(path, expected):
         time.sleep(0.01)
     raise AssertionError((path, expected, path.read_bytes()))
 
-for label, root in (("main-", main), ("sandbox-", sandbox)):
+for label, root in (("main-", main), ("fork-", fork_view)):
     p = root / (label + "a")
     with p.open("w+b", buffering=0) as writer:
         writer.write(b"foo")
@@ -111,21 +126,20 @@ for label, root in (("main-", main), ("sandbox-", sandbox)):
         assert os.pread(f.fileno(), 100, 0) == expected
     saved(root / (label + "bytes"), expected)
     assert not (root / ".git").exists()
-    assert not (root / "calls.wal").exists()
-    try:
-        (root / "dir").mkdir()
-    except OSError as e:
-        assert e.errno in (errno.ENOSYS, errno.EOPNOTSUPP)
-    else:
-        raise AssertionError("unsupported mkdir succeeded")
+    assert not (root / "journal").exists()
 
 (main / "isolation").write_bytes(b"parent")
 saved(main / "isolation", b"parent")
-delivered(sandbox / "isolation", b"parent")
-(sandbox / "isolation").write_bytes(b"sandbox")
-saved(sandbox / "isolation", b"sandbox")
-delivered(main / "isolation", b"sandbox")
+delivered(fork_view / "isolation", b"parent")
+(fork_view / "isolation").write_bytes(b"fork")
+saved(fork_view / "isolation", b"fork")
+delivered(main / "isolation", b"fork")
 PY
+# Directories, modes, owners, links and times through the view; history is
+# read after the restart.
+"${as_root[@]}" python3 ci/trees-posix.py view "$work/main"
+"${as_root[@]}" python3 ci/trees-untracked.py view "$work/main" "$pid"
+python3 ci/trees-untracked.py early-fork "$work/fork"
 mmap_status=0
 python3 ci/trees-mmap.py "$work/main" "$work/state/history.git" || mmap_status=$?
 tmpfile_status=0
@@ -150,26 +164,57 @@ for _ in $(seq 1 200); do
     sleep 0.1
 done
 test -f "$work/ack"
+# A database written when the view host dies: the next fork copies it as left.
+python3 ci/trees-untracked.py writer "$work/main/busy.db" >"$work/writer.log" 2>&1 &
+writer=$!
+for _ in $(seq 1 200); do
+    ! grep -q writing "$work/writer.log" || break
+    kill -0 "$writer"
+    sleep 0.1
+done
+grep -q writing "$work/writer.log"
 kill -KILL "$pid"
-wait "$pid" 2>/dev/null || true
+tree_wait_exit "$pid" 2>/dev/null || true
 pid=
 kill "$client"
 wait "$client" 2>/dev/null || true
 client=
+kill -KILL "$writer"
+wait "$writer" 2>/dev/null || true
+writer=
 fusermount3 -uz "$work/main"
-fusermount3 -uz "$work/sandbox"
-"$bin" --state "$work/state" trees init
-head=$(git --git-dir="$work/state/history.git" rev-parse main)
-test "$(tree_git_file "$work/state/history.git" main crash)" = acknowledged-before-kill
-"$bin" --state "$work/state" trees init
-test "$(git --git-dir="$work/state/history.git" rev-parse main)" = "$head"
+fusermount3 -uz "$work/fork"
+"$bin" --state "$work/state" init --volume t
+head=$(git --git-dir="$work/state/history.git" rev-parse root)
+test "$(tree_git_file "$work/state/history.git" root crash)" = acknowledged-before-kill
+python3 ci/trees-posix.py history "$work/state/history.git"
+python3 ci/trees-untracked.py history "$work/state/history.git"
+"$bin" --state "$work/state" init --volume t
+test "$(git --git-dir="$work/state/history.git" rev-parse root)" = "$head"
 start
+# touch and touch -d set a file's times and build no commit: after a kill and
+# the next init's build, the head has not moved, and the times survive.
+"${as_root[@]}" python3 ci/trees-posix.py touch "$work/main"
+kill -KILL "$pid"
+tree_wait_exit "$pid" 2>/dev/null || true
+pid=
+fusermount3 -uz "$work/main"
+fusermount3 -uz "$work/fork"
+"$bin" --state "$work/state" init --volume t
+test "$(git --git-dir="$work/state/history.git" rev-parse root)" = "$head"
+start
+"${as_root[@]}" python3 ci/trees-posix.py touched "$work/main"
+"${as_root[@]}" python3 ci/trees-untracked.py remount "$work/main" "$pid"
 test "$(cat "$work/main/crash")" = acknowledged-before-kill
-test "$(cat "$work/main/isolation")" = sandbox
-test "$(cat "$work/sandbox/isolation")" = sandbox
+test "$(cat "$work/main/isolation")" = fork
+test "$(cat "$work/fork/isolation")" = fork
+# The kill left the fork's writer attached: the restart rebinds it (same
+# client), so the fork writes as before.
+printf after-restart > "$work/fork/restarted"
+test "$(cat "$work/fork/restarted")" = after-restart
 fusermount3 -u "$work/main"
-fusermount3 -u "$work/sandbox"
-wait "$pid"
+fusermount3 -u "$work/fork"
+tree_wait_exit "$pid"
 pid=
 # Both roots replace and unlink an open object. Check the actual RELEASE
 # outcomes after unmounting, and verify no orphan bytes entered history.
@@ -178,7 +223,143 @@ if git --git-dir="$work/state/history.git" log --all -p --format= | grep '^+.*BA
     echo "orphan bytes entered history" >&2
     exit 1
 fi
+# A clean unmount ended the fork's writer, and a fork has one writer for life:
+# mounting it to write again exits 1, mounting nothing.
+status=0
+"$bin" --state "$work/state" mount "$work/main" --fork-mount "$work/fork" --fork-key "$key" \
+    >"$work/taken.log" 2>&1 || status=$?
+test "$status" -eq 1
+grep -F 'this fork has had its writer; mount it with --fork-read-only' "$work/taken.log" >/dev/null
+! mountpoint -q "$work/main"
+! mountpoint -q "$work/fork"
+# Read-only it mounts: reads answer, writes are refused.
+start --fork-read-only
+test "$(cat "$work/fork/restarted")" = after-restart
+python3 ci/trees-untracked.py readonly "$work/fork"
+if printf refused 2>/dev/null > "$work/fork/refused"; then
+    echo "a read-only fork took a write" >&2
+    exit 1
+fi
+# The fork's last save has landed in the root: nothing of it stays queued.
+python3 - "$work/main/restarted" <<'PY'
+import sys, time
+until = time.monotonic() + 10
+while time.monotonic() < until:
+    try:
+        if open(sys.argv[1], 'rb').read() == b'after-restart':
+            sys.exit(0)
+    except FileNotFoundError:
+        pass
+    time.sleep(0.01)
+sys.exit("the fork's save never landed")
+PY
+# While a mount holds the volume, ending the key waits: exit 75.
+status=0
+"$bin" --state "$work/state" fork end --fork-key "$key" 2>"$work/busy.log" || status=$?
+test "$status" -eq 75
+fusermount3 -u "$work/main"
+fusermount3 -u "$work/fork"
+tree_wait_exit "$pid"
+pid=
+# Ended with nothing queued and no file open, the keyed fork drops at once:
+# its branch, queue and checkout go; its row chain stays, ending ForkDropped.
+fork=$(sed -n 's/^fork tree: //p' "$work/mount.log" | sed -n 1p)
+test -n "$fork"
+"$bin" --state "$work/state" fork end --fork-key "$key"
+git_dir="$work/state/history.git"
+! git --git-dir="$git_dir" rev-parse -q --verify "refs/heads/$fork" >/dev/null
+test -z "$(git --git-dir="$git_dir" for-each-ref "refs/queue/$fork/")"
+test ! -e "$work/state/trees/$fork"
+test ! -e "$work/state/untracked/$fork"
+test "$(git --git-dir="$git_dir" log -1 --format=%s "refs/agentfs/trees/$fork")" = "ForkDropped $fork"
+# Its key has ended: mounting under it exits 1, mounting nothing.
+status=0
+"$bin" --state "$work/state" mount "$work/main" --fork-mount "$work/fork" --fork-key "$key" \
+    >"$work/ended.log" 2>&1 || status=$?
+test "$status" -eq 1
+grep -F 'the fork under this --fork-key has ended' "$work/ended.log" >/dev/null
+! mountpoint -q "$work/main"
+# A fork mounted with no key is new, and ends when its last client detaches.
+: >"$work/unkeyed.log"
+"$bin" --state "$work/state" mount "$work/main" --fork-mount "$work/fork" \
+    >>"$work/unkeyed.log" 2>&1 &
+pid=$!
+for _ in $(seq 1 200); do
+    if mountpoint -q "$work/main" && mountpoint -q "$work/fork"; then break; fi
+    kill -0 "$pid"
+    sleep 0.1
+done
+unkeyed=$(sed -n 's/^fork tree: //p' "$work/unkeyed.log")
+test -n "$unkeyed" && test "$unkeyed" != "$fork"
+# Made now, it starts with a copy of the root's untracked area.
+"${as_root[@]}" python3 ci/trees-untracked.py fork "$work/fork" "$work/main"
+fusermount3 -u "$work/fork"
+fusermount3 -u "$work/main"
+tree_wait_exit "$pid"
+pid=
+git --git-dir="$git_dir" log --format=%s "refs/agentfs/trees/$unkeyed" | grep -Fx "ForkEnded $unkeyed" >/dev/null
+# sigterm_with_a_file_open_saves_and_releases: SIGTERM drains the volume. The
+# root's client is detached, which saves the file a process holds open, the
+# view closes, the volume releases (refs/agentfs/volume ends VolumeReleased),
+# and the process exits 0 once the held file closes.
+: >"$work/term.log"
+# The root alone: no fork, so no queue entry holds the release back, and the
+# drain's detach is all that stands between the stop and the release.
+"$bin" --state "$work/state" mount "$work/main" >>"$work/term.log" 2>&1 &
+pid=$!
+for _ in $(seq 1 200); do
+    if mountpoint -q "$work/main"; then break; fi
+    kill -0 "$pid"
+    sleep 0.1
+done
+rm -f "$work/ack"
+python3 - "$work/main/held" "$work/ack" <<'PY' >"$work/holder.log" 2>&1 &
+import os
+from pathlib import Path
+import sys
+import time
+f = open(sys.argv[1], "wb", buffering=0)
+f.write(b"h" * 4096)
+os.fsync(f.fileno())
+Path(sys.argv[2]).write_text("ack")
+while True:
+    time.sleep(1)
+PY
+client=$!
+for _ in $(seq 1 200); do
+    [ ! -f "$work/ack" ] || break
+    kill -0 "$client"
+    sleep 0.1
+done
+test -f "$work/ack"
+kill -TERM "$pid"
+released=
+for _ in $(seq 1 300); do
+    kind=$(git --git-dir="$git_dir" log -1 --format='%(trailers:key=Agentfs-Kind,valueonly)' \
+        refs/agentfs/volume 2>/dev/null || true)
+    if [ "$kind" = VolumeReleased ]; then released=1; break; fi
+    kill -0 "$pid"
+    sleep 0.1
+done
+test -n "$released" || { echo "SIGTERM did not release the volume" >&2; exit 1; }
+# Saved by the drain while the file is still open: in the root's history now.
+test "$(tree_git_file "$git_dir" root held | wc -c)" -eq 4096
+test -z "$(tree_git_file "$git_dir" root held | tr -d h)"
+git --git-dir="$git_dir" log --format='%(trailers:key=Agentfs-Kind,valueonly)' refs/agentfs/volume \
+    | sed '/^$/d' | sed -n 1,3p | tr '\n' ' ' | grep -Fx 'VolumeReleased VolumeDraining VolumeStaged ' >/dev/null
+kill "$client"
+wait "$client" 2>/dev/null || true
+client=
+tree_wait_exit "$pid"
+pid=
+! mountpoint -q "$work/main"
 git --git-dir="$work/state/history.git" fsck --strict
+# A rule tree volumes do not build refuses the mount, naming its line.
+python3 ci/trees-untracked.py badrules "$bin" "$work"
+# A tracked file the rules come to mark -agentfs leaves history at the next mount.
+python3 ci/trees-untracked.py untrack "$bin" "$work"
+# Python's atomic save onto an allowlisted file, from an excluded temporary file.
+python3 ci/trees-untracked.py save "$bin" "$work"
 test "$mmap_status" -eq 0
 test "$tmpfile_status" -eq 0
 echo "tree-view recording, object and crash scenarios passed"

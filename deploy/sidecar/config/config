@@ -1,7 +1,14 @@
-# Operator settings and remotes, included from the state area's config
-# (`agentfs init --include /etc/agentfs/config`). Every key is
-# in docs/configuration.md. A fragment must not set agentfs.volume or
-# agentfs.branch: the init container sets them from AGENTFS_VOLUME.
+# The operator settings, included from the volume's operator settings file
+# (`agentfs init --include /etc/agentfs/config`) and read at every mount.
+# Every key is in docs/configuration.md.
+#
+# Push is not built on tree volumes yet: the sidecar serves anyway and
+# logs each of these keys at every boot, one line per key, for example
+#
+#   not built: remote.origin.url (push): this volume pushes to no remote yet; its history stays in the state area
+#
+# and exports the agentfs.not_built gauge (alert AgentfsNotBuilt). The
+# history stays in /data/state/history.git until push is built.
 [agentfs]
 	pushInterval = 60s
 
@@ -13,22 +20,4 @@
 # [remote "origin"]
 # 	url = ssh://git@git.example.com/acme/agent-history.git
 # 	agentfsSshKey = /run/secrets/agentfs/ssh-privatekey
-# 	agentfsSshKeyPassphrase = /run/secrets/agentfs/passphrase   # if encrypted
 # 	agentfsKnownHosts = /run/secrets/agentfs/known_hosts
-
-# An egress proxy for every remote (git's key; docs/configuration.md#proxies):
-# a plain http:// proxy without a password. HTTP(S)_PROXY and NO_PROXY in
-# the environment are never read; remote.<name>.proxy = "" turns it off for
-# one remote.
-# [http]
-# 	proxy = http://egress-proxy.infra.svc:3128
-
-# Git LFS (docs/configuration.md#git-lfs), off by default. Files
-# over the threshold go to the remote's LFS endpoint; this one is derived
-# from the url (<url>/info/lfs) and reuses agentfsCredentials. A separate
-# LFS host takes its own credentials file from the same Secret:
-# [agentfs]
-# 	lfsThreshold = 8m
-# [remote "origin"]
-# 	lfsurl = https://lfs.example.com/acme/agent-history
-# 	agentfsLfsCredentials = /run/secrets/agentfs/origin-lfs

@@ -102,6 +102,14 @@ fn main() -> ExitCode {
         eprintln!("mount needs AGENTFS_BIN: a failpoints build of agentfs");
         return ExitCode::from(2);
     }
+    // The mounted harness is root, the owner of what the model makes
+    // (agentfs_conformance::mounted): as another user every chown and every
+    // open of a seed file fails far from the cause.
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    if args.mode == Mode::Mount && unsafe { libc::geteuid() } != 0 {
+        eprintln!("mount must run as root: the harness owns what it makes as uid 0");
+        return ExitCode::from(2);
+    }
     if let Some(Err(e)) = args.record.as_deref().map(empty_dir) {
         eprintln!("--record {e}");
         return ExitCode::from(2);

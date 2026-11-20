@@ -343,6 +343,51 @@ impl Content {
     }
 }
 
+/// A transaction's one commit, file by file (MODEL.md rule 5): the file
+/// `index` holds after the transaction's staged saves, as one save over
+/// the file `begin` holds, so it passes the check every save passes
+/// (`check::save_aligned`) and holds the index's bytes. A line `begin`
+/// holds keeps `begin`'s version if its last staged version holds the same
+/// bytes and state (a line staged and written back), else that last
+/// version written over `begin`'s: the versions staged between are in no
+/// commit. A line `begin` lacks that is live at the end is a new line, its
+/// identity its last version's id; one gone at the end is not in the file.
+/// A file whose name line ends as `begin` has it, not live, is as `begin`
+/// has it (a file the transaction created and ended changed nothing
+/// anyone sees). A moved line is a delete and a new line in the index
+/// already: each save aligns it so.
+pub fn one_save(begin: &Content, index: &Content) -> Content {
+    fn over(b: &Line, x: &Line) -> Line {
+        if x.id == b.id || x.state == b.state {
+            return b.clone();
+        }
+        Line {
+            id: x.id.clone(),
+            line: b.line.clone(),
+            over: Some(b.id.clone()),
+            state: x.state.clone(),
+        }
+    }
+    let name = over(&begin.name, &index.name);
+    if name == begin.name && !name.live() {
+        return begin.clone();
+    }
+    let lines = index
+        .lines
+        .iter()
+        .filter_map(|x| match begin.member(&x.line) {
+            Some(b) => Some(over(b, x)),
+            None => x.live().then(|| Line {
+                id: x.id.clone(),
+                line: x.id.clone(),
+                over: None,
+                state: x.state.clone(),
+            }),
+        })
+        .collect();
+    Content { name, lines }
+}
+
 /// The writer a version id names.
 pub fn writer_of(token: &str) -> &str {
     token.split('.').next().unwrap_or(token)
@@ -393,6 +438,60 @@ mod tests {
         assert_eq!(c.at(3), "b3");
         assert!(is_root("b3") && is_root("b") && !is_root("b6") && !is_root("c1.1"));
         assert_eq!(c.member("b").and_then(Line::text), Some("b"));
+    }
+
+    /// `one_save`'s cases, each from begin's root file `a` (or unborn `g`).
+    #[test]
+    fn one_save_is_one_save_over_begin() {
+        let live = |id: &str, line: &str, over: Option<&str>, t: &str| Line {
+            id: id.into(),
+            line: line.into(),
+            over: over.map(Into::into),
+            state: State::Live(t.into()),
+        };
+        let gone = |id: &str, line: &str, over: Option<&str>| Line {
+            id: id.into(),
+            line: line.into(),
+            over: over.map(Into::into),
+            state: State::Gone,
+        };
+        let begin = Content::root("a");
+        // Nothing staged: begin.
+        assert_eq!(one_save(&begin, &begin), begin);
+        let mut index = begin.clone();
+        // a0 staged twice: its last version, written over begin's.
+        index.lines[0] = live("w.2~t1", "a0", Some("w.1~t1"), "x\n");
+        // a1 staged, then written back to begin's bytes: begin's version.
+        index.lines[1] = live("w.4~t1", "a1", Some("w.3~t1"), "-\n");
+        // a2 deleted: a delete written over begin's.
+        index.lines[2] = gone("w.5~t1", "a2", Some("a2"));
+        // A new line staged twice: one new line, its identity its last version.
+        index
+            .lines
+            .insert(3, live("w.7~t1", "w.6~t1", Some("w.6~t1"), "n\n"));
+        // A new line staged and deleted: not in the file.
+        index
+            .lines
+            .insert(4, gone("w.9~t1", "w.8~t1", Some("w.8~t1")));
+        let t = one_save(&begin, &index);
+        assert_eq!(t.lines[0], live("w.2~t1", "a0", Some("a0"), "x\n"));
+        assert_eq!(t.lines[1], begin.lines[1]);
+        assert_eq!(t.lines[2], gone("w.5~t1", "a2", Some("a2")));
+        assert_eq!(t.lines[3], live("w.7~t1", "w.7~t1", None, "n\n"));
+        assert_eq!(t.lines.len(), begin.lines.len() + 1);
+        assert_eq!(t.bytes(), index.bytes());
+        assert_eq!(t.name, begin.name);
+        // A file created and ended in the transaction: as begin has it.
+        let unborn = Content::root("g");
+        let mut g = unborn.clone();
+        g.name = gone("w.11~t1", "g", Some("w.10~t1"));
+        g.lines.push(live("w.12~t1", "w.12~t1", None, "z\n"));
+        assert_eq!(one_save(&unborn, &g), unborn);
+        // Created and renamed: one create at its last path.
+        g.name = live("w.11~t1", "g", Some("w.10~t1"), "e");
+        let t = one_save(&unborn, &g);
+        assert_eq!(t.name, live("w.11~t1", "g", Some("g"), "e"));
+        assert_eq!(t.lines, g.lines);
     }
 
     #[test]

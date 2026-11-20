@@ -94,7 +94,13 @@ fn a_started_volume_alarms_until_the_moved_tip_is_accepted() {
         root: dir.path().join("v1"),
     };
     fs::create_dir_all(v1.tree()).unwrap();
-    v1.ok(&["init", "--volume", "v1", "--include", &include]);
+    agentfs_core::volume::init_with(
+        &agentfs_core::volume::StateDir::new(v1.state()),
+        "v1",
+        None,
+        Some(&[PathBuf::from(&include)]),
+    )
+    .unwrap();
     v1.record("f.txt", "f");
     v1.ok(&["push"]);
     let f = branch(&remote, "refs/heads/agentfs/v1").unwrap();

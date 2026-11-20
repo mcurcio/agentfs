@@ -9,6 +9,11 @@ retry can ever succeed. One function, `fork::finish::refused_reason`,
 decides which; those make the fork **refused**, and agentfs stops
 retrying it until an operator acts.
 
+Forked volumes are the recording engine's, on recording state areas,
+which no launcher runs any more ([forks](../forks.md)). Its "Under CSI" steps apply to no volume today: the CSI driver runs tree volumes ([csi.md](../csi.md)). A tree volume's forks, a CSI fork claim's among them, land in their upstream as
+they save and are never refused this way
+([trees](../trees.md#forks-keys-end-and-the-drop)).
+
 Only a **linked** fork (the default, `agentfs.fork.link` unset) publishes,
 so only a linked one can be refused. A linked fork that cannot reach its
 source waits and alarms; it never delivers anywhere else, so the fixes
@@ -44,7 +49,7 @@ agentfs --state "$STATE" fork status
 ```
 
 Under CSI, in the node plugin pod on the fork's node (see
-[csi-recovery.md](csi-recovery.md#a-fork-that-will-not-delete) for
+[csi-recovery.md](csi-recovery.md) for
 finding `$NODE_POD` and `$PV`):
 
 ```sh

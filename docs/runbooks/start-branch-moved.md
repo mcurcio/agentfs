@@ -1,5 +1,9 @@
 # Runbook: the start branch moved
 
+This runbook is for the recording engine's volumes, on recording state
+areas, which no launcher runs any more: the CSI driver runs tree volumes
+and refuses `startFrom` ([csi.md](../csi.md#5-parameters)).
+
 A volume started from another worktree's branch (a move,
 [moving.md](moving.md)) watches that branch: at every push to its start
 remote it lists the start branch, and while the branch holds commits this

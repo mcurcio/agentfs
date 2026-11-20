@@ -1,7 +1,8 @@
 # The node plugin: `agentfs-csi` under tini on every node, with
 # csi-provisioner (`--node-deployment`), node-driver-registrar and
-# livenessprobe (docs/csi.md "Architecture"). Each node
-# provisions the worktrees on its own disk.
+# livenessprobe (docs/csi.md "Architecture"). Each node keeps its
+# volumes on its own disk, and the plugin runs one `agentfs host` per
+# volume in use; NodePublish opens a view on it at the kubelet's target.
 {{- $kubelet := .Values.kubeletDir }}
 {{- $pluginDir := printf "%s/plugins/%s" $kubelet (include "agentfs-csi.driverName" .) }}
 apiVersion: apps/v1
@@ -16,7 +17,7 @@ spec:
   selector:
     matchLabels:
       app.kubernetes.io/name: agentfs-csi-node
-  # Restarting the plugin stops the fronts it runs: roll it by hand, one
+  # Restarting the plugin stops the hosts it runs: roll it by hand, one
   # drained node at a time (docs/runbooks/csi-recovery.md).
   updateStrategy:
     type: OnDelete
@@ -37,7 +38,7 @@ spec:
       priorityClassName: {{ . }}
       {{- end }}
       terminationGracePeriodSeconds: {{ .Values.node.terminationGracePeriodSeconds }}
-      # The workloads' processes must be visible to the fronts (docs/csi.md "Pod Security").
+      # The workloads' processes must be visible to the hosts (docs/csi.md "Pod Security").
       hostPID: true
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
@@ -65,7 +66,6 @@ spec:
             - --endpoint=unix:///csi/csi.sock
             - --base-path={{ .Values.basePath.path }}
             - --node-state={{ .Values.node.stateDir }}
-            - --mount-dir=/run/agentfs-csi/mounts
             - --profiles-dir=/etc/agentfs-csi/profiles
             {{- with .Values.node.extraArgs }}
             {{- toYaml . | nindent 12 }}
@@ -102,7 +102,6 @@ spec:
             - { name: kubelet-dir, mountPath: {{ $kubelet }}, mountPropagation: Bidirectional }
             - { name: base, mountPath: {{ .Values.basePath.path }}, mountPropagation: HostToContainer }
             - { name: node-state, mountPath: {{ .Values.node.stateDir }} }
-            - { name: mounts, mountPath: /run/agentfs-csi }
             - { name: profiles, mountPath: /etc/agentfs-csi/profiles, readOnly: true }
             - { name: credentials, mountPath: /etc/agentfs-csi/credentials, readOnly: true }
             - { name: dev-fuse, mountPath: /dev/fuse }
@@ -113,9 +112,9 @@ spec:
             # PVC name and namespace for the volume name.
             - --extra-create-metadata
             # One provisioner per node: it creates and deletes only the
-            # worktrees of its own node (NODE_NAME).
+            # volumes of its own node (NODE_NAME).
             - --node-deployment
-            # A start class's CreateVolume fetches the start branch once.
+            # DeleteVolume starts the volume's host and drains it.
             - --timeout=300s
             {{- with .Values.sidecars.provisioner.extraArgs }}
             {{- toYaml . | nindent 12 }}
@@ -173,8 +172,6 @@ spec:
           hostPath: { path: {{ .Values.basePath.path }}, type: DirectoryOrCreate }
         - name: node-state
           hostPath: { path: {{ .Values.node.stateDir }}, type: DirectoryOrCreate }
-        - name: mounts
-          emptyDir: {}
         - name: dev-fuse
           hostPath: { path: /dev/fuse, type: CharDevice }
         - name: profiles

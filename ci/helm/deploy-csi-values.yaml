@@ -15,5 +15,3 @@ storageClasses:
   - name: agentfs-fork
     parameters:
       fork: "true"
-      volumeName: "{pvcNamespace}.{pvcName}.{pvName}"
-      onDelete: delete

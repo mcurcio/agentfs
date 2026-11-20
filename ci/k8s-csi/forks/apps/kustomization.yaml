@@ -1,6 +1,7 @@
-# The e2e-csi-forks workloads (ci/e2e-csi-forks.sh): a source claim of the
-# `cifork` profile with a pod writing to it, and the fork class sandboxes
-# clone it with. The sandbox (sandbox.yaml) is applied by the script.
+# The fork claim workloads (ci/e2e-csi-forks.sh, ci/e2e-csi-fork-of-fork.sh):
+# a source claim of the `cifork` profile with a pod writing to it, and the
+# fork class its fork claims use. The scripts apply the fork pods
+# (fork.yaml) and the refused claims (refused.yaml).
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 

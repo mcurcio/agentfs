@@ -1,15 +1,17 @@
 #!/usr/bin/env bash
-# Runs the real FUSE mount tests (crates/agentfs/tests/mount.rs) as root,
-# and the unit tests that need root (creating as the caller).
+# Runs the real FUSE tests of `agentfs mount` (crates/agentfs/tests/
+# launcher_mount.rs), `agentfs host` (crates/agentfs/tests/
+# launcher_host.rs) and the CSI driver on tree volumes (crates/agentfs/
+# tests/csi_trees.rs) as root, and the unit tests that need root (creating
+# as the caller, tree views stacked over a stale mount).
 #
-# Needs Linux with /dev/fuse, fuse3 (fusermount3), sqlite3, git, jq, attr,
-# setpriv and passwordless sudo; the unprivileged-daemon test also needs
-# `user_allow_other` in /etc/fuse.conf. Reproducible on any such host:
+# Needs Linux with /dev/fuse, fuse3 (fusermount3), git, jq and passwordless
+# sudo. Reproducible on any such host:
 #
-#   AGENTFS_TEST_PASSTHROUGH=auto AGENTFS_TEST_UNPRIV_USER=$USER ci/fuse-tests.sh
+#   ci/fuse-tests.sh
 #
-# AGENTFS_TEST_PASSTHROUGH (auto, on, off) is passed to every mount.
-# Extra arguments go to the test binary (e.g. a test name filter).
+# Extra arguments go to the launcher_mount test binary (e.g. a test name
+# filter).
 
 . "$(dirname "$0")/lib.sh"
 
@@ -19,9 +21,15 @@ command -v jq >/dev/null || fail "jq is needed to find the test binary"
 
 step "build"
 cargo build --locked -p agentfs
-bin=$(cargo test --locked -p agentfs --test mount --no-run --message-format=json 2>/dev/null |
-  jq -r 'select(.executable != null and .target.name == "mount") | .executable' | tail -n 1)
-[ -x "$bin" ] || fail "could not find the mount test binary"
+bin=$(cargo test --locked -p agentfs --test launcher_mount --no-run --message-format=json 2>/dev/null |
+  jq -r 'select(.executable != null and .target.name == "launcher_mount") | .executable' | tail -n 1)
+[ -x "$bin" ] || fail "could not find the launcher_mount test binary"
+host_bin=$(cargo test --locked -p agentfs --test launcher_host --no-run --message-format=json 2>/dev/null |
+  jq -r 'select(.executable != null and .target.name == "launcher_host") | .executable' | tail -n 1)
+[ -x "$host_bin" ] || fail "could not find the launcher_host test binary"
+csi_bin=$(cargo test --locked -p agentfs --test csi_trees --no-run --message-format=json 2>/dev/null |
+  jq -r 'select(.executable != null and .target.name == "csi_trees") | .executable' | tail -n 1)
+[ -x "$csi_bin" ] || fail "could not find the csi_trees test binary"
 unit=$(cargo test --locked -p agentfs-fuse --lib --no-run --message-format=json 2>/dev/null |
   jq -r 'select(.executable != null and .target.name == "agentfs_fuse") | .executable' | tail -n 1)
 [ -x "$unit" ] || fail "could not find the agentfs-fuse unit test binary"
@@ -31,6 +39,24 @@ OUT=$(sudo "$unit" creds:: --nocapture 2>&1) || { echo "$OUT"; fail "creds tests
 echo "$OUT"
 case "$OUT" in *"skipped: needs root"*) fail "the root test did not run as root" ;; esac
 
-step "kernel $(uname -r), passthrough ${AGENTFS_TEST_PASSTHROUGH:-auto}"
-sudo --preserve-env=AGENTFS_TEST_PASSTHROUGH,AGENTFS_TEST_UNPRIV_USER,RUST_BACKTRACE,RUNNER_TEMP \
-  "$bin" --ignored --test-threads=1 --nocapture "$@"
+step "tree views stacked over a stale mount, as root (crates/agentfs-fuse/src/tree_view.rs)"
+OUT=$(sudo "$unit" tree_view::tests::stale_view --ignored --test-threads=1 --nocapture 2>&1) ||
+  { echo "$OUT"; fail "stale view tests failed"; }
+echo "$OUT"
+case "$OUT" in *"test result: ok. 3 passed"*) ;; *) fail "the stale view tests did not all run" ;; esac
+
+step "agentfs mount, as root, kernel $(uname -r) (crates/agentfs/tests/launcher_mount.rs)"
+sudo --preserve-env=RUST_BACKTRACE,RUNNER_TEMP "$bin" --ignored --test-threads=1 --nocapture "$@"
+
+step "agentfs host, as root (crates/agentfs/tests/launcher_host.rs)"
+OUT=$(sudo --preserve-env=RUST_BACKTRACE,RUNNER_TEMP "$host_bin" --ignored --test-threads=1 --nocapture 2>&1) ||
+  { echo "$OUT"; fail "agentfs host tests failed"; }
+echo "$OUT"
+case "$OUT" in *"skipped: needs root"*) fail "the host tests did not run as root" ;; esac
+
+step "the CSI driver on tree volumes, as root (crates/agentfs/tests/csi_trees.rs)"
+OUT=$(sudo --preserve-env=RUST_BACKTRACE,RUNNER_TEMP "$csi_bin" --ignored --test-threads=1 --nocapture 2>&1) ||
+  { echo "$OUT"; fail "csi_trees root tests failed"; }
+echo "$OUT"
+case "$OUT" in *"skipped: needs root"*) fail "the csi_trees tests did not run as root" ;; esac
+case "$OUT" in *"test result: ok. 1 passed"*) ;; *) fail "the csi_trees root test did not run" ;; esac

@@ -22,38 +22,39 @@ git init --bare "$repo"
 export GIT_DIR=$repo GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
 export GIT_AUTHOR_NAME=probe GIT_AUTHOR_EMAIL=probe@localhost GIT_COMMITTER_NAME=probe GIT_COMMITTER_EMAIL=probe@localhost
 printf '[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n\tbare = true\n\tfsync = objects,derived-metadata\n\tfsyncMethod = fsync\n' > "$repo/config"
-printf 'ref: refs/heads/main\n' > "$repo/HEAD"
+printf 'ref: refs/heads/root\n' > "$repo/HEAD"
 test "$(git config --get core.fsync)" = objects,derived-metadata
 blob=$(printf 'bytes' | git hash-object -w --stdin)
 tree=$(printf '100644 blob %s\ta\n' "$blob" | git mktree)
 commit=$(git commit-tree -m tip "$tree")
-table=$(printf 'table' | git hash-object -w --stdin)
+# A sync queue entry names the marker blob `sync` (docs/trees.md).
+entry=$(printf 'sync' | git hash-object -w --stdin)
 zero=0000000000000000000000000000000000000000
-create() { printf 'start\0update refs/heads/main\0%s\0%s\0update refs/agentfs/objects/main\0%s\0%s\0prepare\0commit\0' "$commit" "$zero" "$table" "$zero" | git update-ref --stdin -z; }
+create() { printf 'start\0update refs/heads/root\0%s\0%s\0update refs/queue/root/00000000000000000001\0%s\0%s\0prepare\0commit\0' "$commit" "$zero" "$entry" "$zero" | git update-ref --stdin -z; }
 create
 
 # A rebuild over a damaged HEAD and damaged refs: fsck is clean, refs the same.
 echo garbage > "$repo/HEAD"
-echo garbage > "$repo/refs/heads/main"
+echo garbage > "$repo/refs/heads/root"
 rm -rf "$repo/refs" "$repo/packed-refs"
-printf 'ref: refs/heads/main\n' > "$repo/HEAD"
+printf 'ref: refs/heads/root\n' > "$repo/HEAD"
 mkdir "$repo/refs"
 create
-test "$(git rev-parse refs/heads/main)" = "$commit"
-test "$(git rev-parse refs/agentfs/objects/main)" = "$table"
+test "$(git rev-parse refs/heads/root)" = "$commit"
+test "$(git rev-parse refs/queue/root/00000000000000000001)" = "$entry"
 git fsck --full --strict --no-progress
 
 # What is lost of a tip: --missing=print names it, whether blob, tree or tip.
 lost() {
   printf '%s\n' "$@" | git rev-list --objects --no-walk --missing=print --stdin | sed -n 's/^?//p'
 }
-test -z "$(lost "$commit" "$table")"
+test -z "$(lost "$commit" "$entry")"
 mv "$repo/objects/${blob:0:2}/${blob:2}" "$probe/blob"
-test "$(lost "$commit" "$table")" = "$blob"
+test "$(lost "$commit" "$entry")" = "$blob"
 mv "$probe/blob" "$repo/objects/${blob:0:2}/${blob:2}"
-mv "$repo/objects/${table:0:2}/${table:2}" "$probe/table"
-test "$(lost "$commit" "$table")" = "$table"
-mv "$probe/table" "$repo/objects/${table:0:2}/${table:2}"
+mv "$repo/objects/${entry:0:2}/${entry:2}" "$probe/entry"
+test "$(lost "$commit" "$entry")" = "$entry"
+mv "$probe/entry" "$repo/objects/${entry:0:2}/${entry:2}"
 
 # Every object writer agentfs uses must read core.fsync (`git mktree` does not,
 # which is why agentfs does not use it: tree_git.rs).

@@ -8,7 +8,8 @@
 
 use agentfs_model::calls::TreeId;
 use agentfs_model::git::{git, try_git};
-use agentfs_model::world::{Direction, Step, World};
+use agentfs_model::service::Step;
+use agentfs_model::world::{Direction, World};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -252,13 +253,23 @@ pub fn observe(w: &World) -> Result<(), String> {
             let (change, won): (String, bool) = match dir {
                 Direction::Transaction => {
                     let m = l.meta(&r);
-                    let head = m.stored.get(1).cloned().ok_or("ledger: a transaction commit with one parent")?;
+                    // The transaction's one commit T: a fast-forward of the
+                    // fork (one parent, its begin, the fork's head before),
+                    // or the merge's second parent.
+                    if m.stored.len() == 1 {
+                        if Some(&m.stored[0]) != before.as_ref() {
+                            return Err(format!("ledger: transaction commit {r:.7} on no fork head"));
+                        }
+                        (r.clone(), true)
+                    } else {
+                    let head = m.stored.get(1).cloned().ok_or("ledger: a transaction commit with no parent")?;
                     let lost = losers.contains(&head);
                     losers.retain(|o| *o != head);
                     if lost && l.tree_id(&r) != l.tree_id(&m.stored[0]) {
                         return Err(format!("ledger: transaction {r:.7} lost but changed the tree"));
                     }
                     (head, !lost)
+                    }
                 }
                 Direction::Landing => {
                     // The harness's queue: the entries not yet taken that

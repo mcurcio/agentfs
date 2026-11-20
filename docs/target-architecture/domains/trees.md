@@ -1,10 +1,12 @@
-# Trees: storage and lifecycle
+# Trees: storage, quotas and pinned snapshots
 
-**Proposed, not built.** This page proposes the Trees domain (where working trees live and the fork lifecycle), one part of the system around the git model ([the system](../system.md)). The git model ([git-model.md](../git-model.md)) wins wherever the two disagree. Rust sketches show surfaces only. The commit that lands the slice that builds this domain deletes this page and moves the behaviour into the library or operator docs.
+**Proposed, not built.** The fork lifecycle (create, keys, end, the drop) is built and described in
+[docs/trees.md](../../trees.md#forks-keys-end-and-the-drop). This page proposes the rest of the Trees domain (where
+working trees live, their space, and pinned snapshots), one part of the system around the git model ([the system](../system.md)). The git model ([git-model.md](../git-model.md)) wins wherever the two disagree. Rust sketches show surfaces only. The commit that lands the slice that builds this domain deletes this page and moves the behaviour into the library or operator docs.
 
 **What this page covers.** In git terms a tree is a branch with its own index and working tree (git-model §2, §3);
 its branch, saves, queue, syncs and transactions are the git model's. Trees owns the rest: where the working tree's
-files live, their confinement and space, and each fork's lifecycle.
+files live, their confinement and space, and pinned snapshots.
 
 ## 0. Guidance this domain serves
 
@@ -17,29 +19,12 @@ The owner's guidance that applies here is in `OWNER-GUIDANCE.md` at the reposito
 | **storage**: where each tree's working tree and each transaction's directory live, and serving them from less space than full copies, if it can | the branch, index or what a checkout writes (git-model §3) |
 | **confinement**: every path is reached beneath its tree's root, no symlink followed | which names a view shows (Rules, Views) |
 | **space**: each fork's limit and the volume's fork budget | the volume's lifecycle (Volume) |
-| **the fork lifecycle**: create, end, drop; publishes `ForkEnded`, `ForkDropped` | who writes a fork (Clients' claim) |
 | **pinned snapshots**: a read-only tree of one commit, for `Sees::Snapshot` | history reads (git) |
 
 ## 2. The fork lifecycle
 
-A fork's upstream is the root or another fork (git-model §10). Creating it creates its branch at the upstream's head with
-its upstream set, and its working tree (git-model §12, "fork create"); so a new fork starts from everything landed
-so far.
-
-```mermaid
-stateDiagram-v2
-  [*] --> Open: create(upstream) by a launcher: branch at the upstream's head, working tree, space reserved
-  Open --> Ended: LastDetached of its tree, or its launcher's end
-  Ended --> Dropped: no live child, and none of its entries waits in its upstream's queue
-  Dropped --> [*]: ForkDropped: branch and working tree deleted (git-model §12); space released
-```
-
-| Rule (design choices) | Why |
-|---|---|
-| A fork ends at its last client's leaving | one writer for life ([clients](clients.md) C4): it is never written again, and a deleted pod's launcher may never call `end` |
-| An ended fork drops only once its upstream's queue has taken every entry it put there | every save reaches the referee, so a losing one is kept as a collision ref (git-model §4) before the branch goes |
-| A fork with a live child does not drop | the child's upstream is its branch |
-| After the drop | the root still reaches the fork's landed commits (full lineage); every losing commit stays under its collision ref (git-model §4, §11) |
+Built: [docs/trees.md](../../trees.md#forks-keys-end-and-the-drop). What remains here: a fork's space is reserved at
+create and released at its drop (section 4), and forks of forks (git-model §10) are not built.
 
 ## 3. Pinned snapshots
 
@@ -70,27 +55,19 @@ clone of its upstream's working tree, or an overlay over it (a "fork layer"), on
 ## 5. Public contract
 
 ```rust
-pub trait Trees {
-    fn create(&mut self, upstream: TreeRef, by: &LaunchCap) -> Result<ForkId, TreeError>; // branch, working tree, quota
+pub trait Trees {                                                                      // + create, end, end_keyed, facts, live (built)
     fn pin(&mut self, of: TreeRef, by: &PinCap) -> Result<SnapshotId, TreeError>;      // ends at its LastDetached
-    fn end(&mut self, f: ForkId, by: &LaunchCap) -> Result<(), TreeError>;             // only its creating launcher
-    fn facts(&self, f: ForkId) -> Option<ForkFacts>;                                   // upstream, created by, ended
-    fn live(&self) -> Vec<ForkId>;                                                     // not yet dropped: an upgrade's drain
     fn handle(&self, s: Served) -> TreeHandle;                                         // confined root for a view
 }
-pub enum TreeError {
-    UpstreamUnknown,
-    NotPermitted,       // a fork launcher ending another's fork
+pub enum TreeError {                                                                   // + the built variants
     SpaceLimit,         // the fork budget cannot reserve the limit
     QuotaUnavailable,   // no per-tree quota support: editable forks refused (T4)
-    Ended,
+    ApprovalNotBuilt,   // the fork's settings need landing approvals, which is not built
     EscapesRoot,
-    Io(IoKind),
 }
 ```
 
-Consumes `LastDetached` (Clients). Publishes `ForkEnded{fork}` and `ForkDropped{fork}` (Clients, Replication,
-Volume). Persists each fork's row (`Audited`, S6) in `store`; the filesystem holds the files.
+The filesystem holds the files; each fork's row is built (docs/trees.md, "Rows and event commits").
 
 ## 6. Tests
 
@@ -100,8 +77,7 @@ Volume). Persists each fork's row (`Audited`, S6) in `store`; the filesystem hol
 | A reader opened before a landing rewrites p reads the old bytes whole; a reopen reads the new | torn reads (T3) |
 | A fork fills its quota while the root saves: the root's save succeeds | a fork denying the root (T4) |
 | The same scenarios on full checkouts and on optimised storage give identical files | storage as a second truth (T5) |
-| An ended fork with a save still in its upstream's queue: no drop until it is taken; then branch gone, its collision ref kept | a save lost at drop |
-| An upstream with a live child never drops; a crash while filling a snapshot leaves none visible | reads through a deleted branch; a partial snapshot |
+| A crash while filling a snapshot leaves none visible | a partial snapshot |
 
 ## 7. Costs
 

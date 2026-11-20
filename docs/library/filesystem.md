@@ -203,7 +203,7 @@ the operation records it, whole, at its end (`Ops::capture_operation`). See
 | `invalidate` | Kernel cache coherence across a daemon's sessions |
 | `backing` | Confined access to the backing tree |
 | `access`, `creds`, `privileges` | Mode-bit checks, creating as the caller, what the daemon may do |
-| `tree_view` | The FUSE view of the tree library (below) |
+| `tree_view` | The view host: FUSE views of the tree library on clients' sessions (below) |
 
 `Ops` is where behaviour lives, and it has no kernel dependency, so tests run
 against a real directory and state area. Each operation returns
@@ -283,9 +283,29 @@ could not repair (and where they are saved), and the count of swept and
 captured items. Committing and pushing the last records is the caller's: call
 `Service::shutdown` from the core layer after it.
 
-`mount_state(path)` tells `MountState::Live`, `Stale` (the daemon is gone),
-`NotMounted` or `Foreign` from `/proc/self/mountinfo` and a `statfs`. Nothing
-else is read: no state area, no lock. `detach(path)` clears a stale mount.
+### Stale mounts
+
+`agentfs_fuse::stale` holds what the recording mount and the tree view host
+share about mounts whose daemon died. An agentfs mount is a FUSE mount whose
+source starts `agentfs:`; `source_volume(source)` gives the volume it names
+(`agentfs:<volume>` or `agentfs:<volume>:<anything>`).
+
+- `mount_state(path)` tells `MountState::Live`, `Stale` (the daemon is gone),
+  `NotMounted` or `Foreign` from `/proc/self/mountinfo` and a `statfs`.
+  Nothing else is read: no state area, no lock.
+- `detach(path)` detaches whatever is mounted there lazily: `umount2` with
+  `MNT_DETACH` with the privilege to unmount, `fusermount3 -u -z` otherwise.
+- `detach_stale_layers(path, max)` detaches stale layers, topmost first, while
+  the topmost is stale, at most `max` (`STALE_LAYERS`, 16). `agentfs_layers`
+  counts the agentfs mounts at a path.
+- `prepare_stack_source(dir)` and `stack(dir, target)` stack a new mount over
+  a stale one. FUSE is mounted at a private empty directory, bind-mounted over
+  the stale mount, made shared so propagation carries it into every copy of
+  that mount (workload containers, subPath binds), and the private directory
+  is detached. Stacking needs `CAP_SYS_ADMIN`.
+
+`mount_state`, `detach`, `detach_stale_layers` and `agentfs_layers` are also
+re-exported at the crate root.
 
 ### Errors
 
@@ -313,12 +333,13 @@ names the operator's rules would record if they were new. A container that
 starts other containers is given only this mount point, so the sandboxes it
 starts see and change only recordable files, and what they change is
 recorded and visible through the main mount at once. It is a boundary for
-names. The operator's view is the [sandbox-overlay
-runbook](../runbooks/sandbox-overlay.md).
+names; what it covers and what it does not is in
+[guarantees](../guarantees.md#the-sandbox-overlay).
 
-Turn it on with `mount --sandbox-overlay PATH --sandbox-owner UID:GID`.
-Its source is `agentfs:<volume>:sandbox-overlay`, so `probe` and recovery tell
-the two mounts apart.
+The `agentfs` binary does not serve it: tree volumes do not build it yet. A
+program linking `agentfs-fuse` turns it on with `MountConfig::overlay`. Its
+source is `agentfs:<volume>:sandbox-overlay`, so recovery tells the two mounts
+apart.
 
 **One daemon, two sessions, one `Ops`.** The daemon serves both mount points
 as two FUSE sessions over one `Ops`: one inode table, one name ordering, one
@@ -417,8 +438,8 @@ is the module documentation of `agentfs-fuse`'s `overlay.rs`.
   tested.
 - Locks are not shared between the two mounts, and mode-bit checks run outside
   the names lock.
-- The overlay is served only by a single-process `mount`. It is refused on a
-  front, so it is not available on CSI volumes. It is also refused with
+- The overlay is served only by a single-process `Mount` with no front; the
+  `agentfs` binary serves none. It is also refused with
   `agentfs.respectTreeRules`, whose rule files a sandbox could edit.
 
 **Boot refusals.** Each exits 1 before anything is mounted: tree rules, an
@@ -430,16 +451,24 @@ outside stops the daemon, which unmounts the other.
 
 ## The `agentfs` command
 
-The binary composes the layers: it takes the state-area lock, opens the
-volume, runs the patch phase, starts the service and the push loops, mounts
-FUSE, serves the control socket, and on a signal shuts down in order.
+The binary runs two engines. `init`, `mount`, `host` and `fork end` run the tree
+views ([below](#tree-views), and [trees](../trees.md)): `mount` is the sidecar's,
+Docker's and the command line's launcher, and `host` is the CSI driver's
+([csi](../csi.md)). The other commands run the recording engine, on recording
+state areas only. No flag selects an engine. Every recording command refuses a tree volume before it reads
+or writes anything (`` `agentfs push` runs on the recording engine only; <state>
+is a tree volume, where it is not built yet ``, exit 1), and `init` and `mount`
+refuse a recording state area, naming the
+[upgrading runbook](../runbooks/upgrading-the-sidecar.md).
 
 ### Commands
 
 | Command | What it does |
 |---|---|
-| `init` | Creates a state area, or accepts one that already belongs to the volume. Safe to run at every start. Exit 0 for the volume it holds, 1 for another volume or branch. `--include` sets the config's `include.path` entries; `--root` creates the backing tree |
-| `mount` | Mounts a backing tree at a mount point and runs the commit and push loops in the same process until SIGINT, SIGTERM or an unmount |
+| `init` | Creates a tree volume, or finds it under the same name; prints `<name> <id> created\|found`. Safe to run at every start. Exit 1 for another name or format, 75 busy. `--include` sets the operator settings' includes; `--owner` the new root's owner |
+| `mount` | Serves a tree volume's root, and optionally a fork, as tree views until SIGINT, SIGTERM, the exit of `-- COMMAND` or an unmount |
+| `host` | Serves a tree volume's views on its parent's requests over its standard input, until EOF, SIGINT or SIGTERM ([below](#the-view-host-command)). The CSI node plugin runs one per volume in use |
+| `front` | A front of a history service: a FUSE mount of a recording volume's backing tree whose records go to the service |
 | `run` | Runs the commit and push loops in the foreground with no mount, serving `push` on the control socket |
 | `serve-history` | The history service of a volume, for fronts on the same node |
 | `serve-git` | Serves the volume's history repository over git's smart HTTP as the patch source. Takes no lock |
@@ -447,15 +476,14 @@ FUSE, serves the control socket, and on a signal shuts down in order.
 | `flush` | Commits every recorded change now |
 | `push` | Pushes once to every remote (or those named with `--remote`). With a daemon running, asks it over the control socket |
 | `status` | Read only: the head, the last committed sequence, the backlog, the lock holder, the LFS threshold and each remote's state. Takes no lock |
-| `probe` | Reports whether a mount point holds a live agentfs mount. Takes no lock and reads no state area |
+| `probe` | Reports whether a mount point holds a live agentfs mount, a tree view or a front. Takes no lock and reads no state area |
 | `restore` | Writes a path back as it was in a commit |
 | `revert` | Undoes a commit's changes |
 | `checkpoint` | Cuts a checkpoint on the change line |
 | `patch` | The patch queue |
 | `lfs` | The local LFS object cache |
-| `fork` | Forked volumes |
+| `fork` | Forked volumes, and `fork end` for a tree volume's keyed fork |
 | `start` | A volume started from another branch |
-| `trees` | The git-backed tree views (below) |
 
 Nested commands:
 
@@ -463,13 +491,12 @@ Nested commands:
 |---|---|
 | `patch` | `submit` (the producer's side, in its own git repository), `approve`, `apply`, `status` |
 | `lfs` | `fetch`, `prune` |
-| `fork` | `create`, `finish`, `status`, `abandon`, `list`, `deliver` |
+| `fork` | `create`, `finish`, `status`, `abandon`, `list`, `deliver`; `end` (tree volumes) |
 | `start` | `accept` |
-| `trees` | `init`, `fork`, `mount` |
 | `serve-git` | `admit` and `arrived`, the git hooks, hidden from help |
 
-A finished fork is read-only: `mount` (not a front), `run`, `record`,
-`restore`, `revert` and `patch` `apply` refuse it.
+A finished fork is read-only: `run`, `record`, `restore`, `revert` and `patch`
+`apply` refuse it; its front mounts read-only.
 
 Details worth knowing before you script them:
 
@@ -477,14 +504,12 @@ Details worth knowing before you script them:
   daemon. `push` prints a `queue:` line for the patch remote.
 - `probe MOUNTPOINT [--allow-stale]` exits 0 for a live agentfs mount; 1 for a
   stale one (0 with `--allow-stale`), for nothing, and for another
-  filesystem. With `--sandbox-overlay` it expects the overlay's mount, and a
-  mount of the other kind is exit 1 either way round. It is the startup and
-  readiness probe.
+  filesystem. It is the startup and readiness probe.
 - `restore PATH COMMIT` and `revert COMMIT` take `--force` and `--dry-run`.
-  Through a running mount or the history service, they go over the control
-  socket. With nothing running they write `--root` directly. Exit 0 done, 1
-  refused (with a reason and a hint) or failed, 75 busy. A restore or revert
-  is recorded as one commit.
+  Through the history service, they go over the control socket. With nothing
+  running they write `--root` directly. Exit 0 done, 1 refused (with a reason
+  and a hint) or failed, 75 busy. A restore or revert is recorded as one
+  commit.
 - `patch apply` with nothing running fetches and applies the queue under the
   lock. With a daemon running it asks the daemon, which judges without landing
   and says so (exit 75, "workload attached; lands at next mount").
@@ -500,76 +525,42 @@ Details worth knowing before you script them:
 
 ### The state-area lock and exit codes
 
-`mount`, `run`, `serve-history`, `record`, `flush`, `patch apply`, `fork
-create`, `fork finish`, `fork abandon`, and `init` of an existing state area
-take the state-area lock. They exit **75** (`EX_TEMPFAIL`) while another
-process holds it, unless `--wait-lock DURATION` (`AGENTFS_WAIT_LOCK`) says to
-wait. `push`, `restore` and `revert` take it only in direct mode, with no
-daemon answering. Fronts take no lock.
+`run`, `serve-history`, `record`, `flush`, `patch apply`, `fork create`, `fork
+finish` and `fork abandon` take the state-area lock. They exit **75**
+(`EX_TEMPFAIL`) while another process holds it, unless `--wait-lock DURATION`
+(`AGENTFS_WAIT_LOCK`) says to wait. `push`, `restore` and `revert` take it only
+in direct mode, with no daemon answering. Fronts take no lock. `init`, `mount`
+and `fork end` hold a tree volume's own lock (`actor.lock`) and exit 75 at once
+while another process holds it; they refuse `--wait-lock`.
 
 | Code | Meaning |
 |---|---|
 | 0 | Done |
 | 1 | Refused or failed. The message says why and, where there is one, the next command |
 | 75 | The state area, or the cache lock, is busy, or a remote is being pushed (`push --lease`): try again |
+| 127 | `mount -- COMMAND`: the command could not start |
 | 130 | A second signal arrived during shutdown: the process exits at once |
 
-### `mount`: order and shutdown
+### `front`: order and shutdown
 
-**Order.** Preflight; lock; open the volume (journal replay, repairs); the
-patch phase (fetch the inbox within `agentfs.patchFetchTimeout`, apply the
-queue, block on the first failure); then the service and the push loops;
-then the FUSE session; then the control socket. A blocked queue never stops
-the mount. The overlay, when asked for, is mounted last, so a probe of it
-gates on both mounts. If it fails to mount, the main mount is unmounted as at
-a stop.
+`front --history-service ADDR BACKING MOUNTPOINT` is a front: no lock and no
+control socket. **Order:** preflight (layout checks; a missing mount point is
+created); lease a pending slot; connect to the service, waiting up to
+`--history-wait` (30 s) and exiting 1 with nothing mounted if it never answers;
+then the FUSE session, whose repair queue is the slot's
+`meta/fronts/slot-N.repairs`. Every round trip is bounded by
+`--history-timeout` (10 s). `--history-slot N` asks for a particular slot, so
+a front restarted after a crash drains its predecessor's repairs.
 
-**A mount point that is not empty** (and not stale) is mounted over with a
-warning: what is in it is hidden and was not recorded.
-
-**`--seal-mountpoint`** (`AGENTFS_SEAL_MOUNTPOINT`) makes the bare mount point
-root's with mode 0000 before mounting (needs root). What a workload reaches
-while no daemon is mounted is then a directory no non-root process can write:
-`EACCES` instead of a write nothing records. It seals the overlay's mount point
-too.
-
-**A stale mount point** (`--on-stale-mount`):
-
-- `refuse` (the default) exits 1 with the command that clears it.
-- `hold` mounts nothing and takes no lock, waits for SIGINT or SIGTERM, then
-  lazily detaches every stale layer and exits 1. Recovery is then a restart by
-  hand.
-- `recover` is for a restarted sidecar. It takes the lock (the kernel released
-  the dead daemon's), opens the volume, mounts FUSE at `<state>/meta/stack/mnt`,
-  bind-mounts that over the stale mount point, makes the new layer shared and
-  lazily detaches the private directory. Mount propagation carries the new
-  layer into every copy of the stale mount: workload containers and `subPath`
-  binds. It never detaches the stale mount first, because workload containers
-  hold copies and their writes would reach the bare directory in between. It
-  needs `CAP_SYS_ADMIN`, is refused for fronts (the CSI driver stacks those),
-  and refuses (exit 1, naming both) a stale mount whose source is not
-  `agentfs:<this volume>`, since stacking over another volume's dead mount
-  would send that volume's workloads into this one's history. With nothing
-  stale, `recover` is a normal mount. After each stop, a mount detaches the
-  stale layers (at most 16) still at its mount point.
-
-**Shutdown** on SIGINT, SIGTERM or an external unmount:
-
-1. Stop the control socket, which refuses a client's connect from then on.
-2. Unmount: a plain unmount, then a lazy detach if busy (`fusermount3 -u`,
-   then `-u -z`, when not root), and wait up to `--unmount-grace` (10 s) for
-   the session to end.
-3. Run a final sweep and capture every fsync-class group with changes.
-4. Make the final commit.
-5. Push it once more to each remote that lacks commits, within `--push-grace`
-   (default 5 s).
-6. Flush telemetry and release the lock.
-
-A second signal exits 130.
+**Shutdown** on SIGINT, SIGTERM or an external unmount: stop answering the
+service's calls; unmount (a plain unmount, then a lazy detach if busy) and wait
+up to `--unmount-grace` (10 s) for the session to end; run a final sweep and
+capture every fsync-class group with changes; flush telemetry. The commit and
+the pushes are the service's. A second signal exits 130.
 
 ### The control socket
 
-A running `mount`, `run` or `serve-history` listens on
+A running `run` or `serve-history` listens on
 `<state>/meta/control/agentfs.sock` while it holds the lock. The directory is
 `0700`, the socket `0600`, and each connection's peer credentials
 (`SO_PEERCRED`) must be root or the daemon's own user. Both ends address the
@@ -594,25 +585,17 @@ A reply is `{"ok":{...}}`, `{"pushed":{...}}`, `{"received":{...}}`,
 `{"error":"..."}`.
 
 One restore or revert runs at a time; a second gets `busy`. Pushes run beside
-them and each other. `mount` writes a restore through its own mount.
+them and each other.
 `serve-history` writes it into the backing tree after calling every live front
 to settle, report open files and drop caches. `run` serves no mount, so it
 answers `restore` and `revert` with `busy`. A daemon from before a newer operation answers `{"error":"malformed
 request: unknown variant ..."}`, and the command then falls back to its direct
 path, which the lock refuses with exit 75.
 
-### Fronts
+### The history service
 
-`mount --history-service ADDR` is a front: no lock and no control socket.
-Order: preflight; lease a pending slot; connect to the service, waiting up to
-`--history-wait` (30 s) and exiting 1 with nothing mounted if it never answers;
-then the FUSE session, whose repair queue is the slot's
-`meta/fronts/slot-N.repairs`. Every round trip is bounded by
-`--history-timeout` (10 s). `--history-slot N` asks for a particular slot, so
-a front restarted after a crash drains its predecessor's repairs.
-Shutdown is as for `mount`, without the commit and the pushes, which are the
-service's. `record --history-service ADDR` records paths through the service
-in the same way.
+`record --history-service ADDR` records paths through the service as a front
+does.
 
 `serve-history --root BACKING` takes the lock (holder `command=serve-history`),
 opens the volume, applies the patch queue only when no front lease is live and
@@ -630,31 +613,256 @@ and the [history-service-down runbook](../runbooks/history-service-down.md).
 
 ### Telemetry
 
-`mount`, `flush`, `record`, `push` and `run` export OpenTelemetry signals over
+`front`, `flush`, `record`, `push` and `run` export OpenTelemetry signals over
 OTLP when the standard `OTEL_*` variables configure an endpoint, and print
-alarms to stderr. `init` and `status` export nothing. All of these commands
+alarms to stderr. `mount` and `host` export the `agentfs.not_built` gauge (one series
+per capability a configured setting needs and tree volumes do not build) and
+the export-failure counter. `init` and `status` export nothing. All of these commands
 take the pod flags (`--pod`, `--namespace`, `--node`, `--replica` and their
 `AGENTFS_*` variables), so every command's telemetry resource is the same.
 See [telemetry](../telemetry.md).
 
 ## Tree views
 
-`trees` is a separate set of commands over a git-backed tree library
-(`agentfs_core::tree_actor`). It has its own state format, not the volume's,
-and it mounts flat regular files only. Use it to try the model; it is not a
-replacement for `mount`.
+`init`, `mount`, `host` and `fork end` run the tree views over a git-backed tree
+library (`agentfs_core::tree_actor`), with their own state format, mounting
+directories and regular files with their recorded modes ([trees](../trees.md)).
 
 ```sh
-agentfs --state STATE trees init
-agentfs --state STATE trees mount MAIN --sandbox SANDBOX
+agentfs --state STATE init --volume NAME [--include FILE]... [--owner UID:GID]
+agentfs --state STATE mount ROOT [--fork-mount FORK [--fork-key KEY]] [-- COMMAND...]
+agentfs --state STATE host --launcher ID --volume NAME    # stdin: a Unix socket
+agentfs --state STATE fork end --fork-key KEY
 ```
 
-`trees mount` recovers and mounts the main view, and with `--sandbox` also a
-sandbox branch (`fork/N`) of it. `--fork fork/N` reuses a sandbox, and `trees
-fork` makes one and prints its name. `--writer` and `--sandbox-writer` set
-each view's trusted writer label, and `--metrics-output FILE` writes counters
-every 100 ms and at unmount. Mount points must be empty, separate and outside
-the state area. Unmount every view to exit.
+`mount` first judges each view's mount point (a live or foreign mount exits 1; a
+stale one is refused, held or stacked over by `--on-stale-mount`; a bare one is
+created when missing, refused when it holds files, and sealed with
+`--seal-mountpoint`), then reads the operator settings (`<state>/config`, an
+include under a view refused, each key not built yet logged and counted by
+`agentfs.not_built`), then recovers and mounts the root's view, and with
+`--fork-mount` also a fork (`fork/N`) of it: a new one, which ends when its view
+is unmounted, or the open fork under `--fork-key`; it never creates a volume.
+Each view is a client of its tree: the command rebinds the client a killed mount
+left (same launcher, tree, label and access), else attaches one, then ends its
+launcher's other clients and drops the ended forks nothing holds, and detaches
+each client as its view ends ([trees](../trees.md#clients)). One dispatcher
+hands each domain event to its consumer after the call that caused it:
+`LastDetached` to Trees (an unkeyed fork ends), `ForkDropped` to Clients (its
+writer claim is released), and each landing the view host takes makes Trees
+judge the drops again ([forks](../trees.md#forks-keys-end-and-the-drop)).
+`--writer` and `--fork-writer` are the clients' labels; `--read-only` and
+`--fork-read-only` make a client read-only. A fork's second read-write client
+exits 1. Once every view is up it prints `mounted volume NAME at ROOT[, fork
+fork/N at FORK]` and starts `-- COMMAND`, whose exit drains the volume and whose
+status, when not 0, is the mount's ([trees](../trees.md#running-a-command-in-the-mount)).
+`fork end` ends a keyed fork (exit 75 while a mount holds the volume). The views
+mount as `agentfs:<volume>` (a fork's as `agentfs:<volume>:<tree>`), with FUSE
+`allow_other` unless `--no-allow-other` (`MountOptions`), each entry presented
+with its recorded owner, and `--metrics-output FILE` writes counters every
+100 ms and at unmount. A stop, the command's exit or unmounting every view
+drains it.
+
+### The view host command
+
+`agentfs host` serves one tree volume's views on request: a parent process
+opens and closes views on it, and creates and ends keyed forks, over the
+host's standard input. It is the integration point for a launcher that serves
+views of one volume to several consumers over time; the CSI driver is one
+([library/kubernetes](kubernetes.md)). The transport follows the LSP and MCP
+stdio transports and Erlang ports: a parent drives its child with JSON
+messages over the child's own stdio. The messages are pure values in
+`agentfs_contracts::host`.
+
+**The control channel.** The standard input must be a Unix stream socket, one
+end of a socket pair whose other end only the parent holds. Anything else
+exits 2 before the state area is touched (`agentfs host is run by a launcher
+that controls it over its standard input, a Unix socket`). No socket path
+exists, so only the parent can reach it. The parent closing its end (EOF) is
+a stop, as SIGTERM and SIGINT are, so a host never outlives its parent. With
+no view open the host drains and exits 0 once Volume releases the volume. With
+a view open it exits 3 at once, logging `stopped with N view(s) open`: each
+view's mount is left stale and its client attached, as a crash leaves them,
+because the views belong to pods the parent does not own; the next host
+rebinds each client and stacks over each mount. Every change a view took is in
+the journal already. A drain logs `tree DrainBlocked` with the clients of
+other launchers it waits for: only their own launcher ends them. The last view
+ending does not stop the host.
+
+**Boot.** As `mount`'s, under `--launcher ID`: the volume found (exit 1 for
+another format, 75 while another process holds it) and checked against
+`--volume`, the operator settings read and each key not built logged and
+counted by `agentfs.not_built`, the volume staged and its domains restored as
+that launcher, and the view host started. It then writes `Hello` and reads
+requests. `--namespace`, `--pod`, `--pod-uid` and `--node` are its own
+events' pod context and its telemetry resource's; each view's writer carries
+the pod context its `open` names.
+
+**Protocol, version 1.** One JSON object per line. The host writes `Hello`
+once, then exactly one reply per request, in order; the parent sends a request
+only after the previous reply has arrived.
+
+| Request (`op`) | Fields | Reply |
+|---|---|---|
+| (none: the host's first line) | | `{"v":1,"volume":NAME,"id":ID}` |
+| `open` | `tree` (`"root"` or `{"fork":KEY}`), `at`, `label`, `read_only`, `pod` | `{"opened":{"tree":..,"stacked":BOOL}}` |
+| `close` | `at` | `"closed"`, once the view has ended: its files released and its client detached |
+| `reconcile` | | `{"reconciled":{"ended":N}}`: the launcher's clients that no open view uses are ended |
+| `fork_create` | `upstream` (a tree as in `open`), `key`, `settings` (Trees' `ForkSettings`) | `{"forked":{"tree":..}}` |
+| `fork_end` | `key` | `"ended"` |
+
+Any request may instead get `{"refused":{"kind":KIND,"message":TEXT}}`. The
+kinds are exhaustive, so a parent maps each: `fork_taken` (the fork has had
+its one writer), `key_unknown`, `key_ended`, `nested_not_built` (forks of
+forks), `approval_not_built` (`Landing::Approval`), `mount_failed`, `stale`
+(another source's stale mount at `at`), `occupied` (a view is open there with
+another tree, label or access), `draining` and `stopped` (the actor stopped
+after a recording failure). The message carries the real error. A malformed
+line is the last one read: the host stops and exits 2.
+
+**Opening a view.** `at` is an existing empty directory, or a stale agentfs
+mount of the view's own source, which the view stacks over
+(`MountOptions::over_stale`; [stale mounts](#stale-mounts)). The view's client
+is rebound when the launcher, tree, label and access match one a crashed host
+left, else attached with the request's pod context, so a restarted host keeps a
+fork's one writer. An `open` of a view already open at `at` with the same tree,
+label and access answers `opened` again; with another, `occupied`. A stacked
+open logs `stacked over a stale mount at PATH left by a crashed daemon`. A
+`close` of a mount point with no view answers `closed`, and a `fork_create`
+under a key whose fork is open answers `forked` with that fork, so a parent
+can repeat a request after a crash. The `mount` command's flags for these
+choices (`--writer`, `--read-only`, `--on-stale-mount`) are not used: the
+request names the label and access, and a stale mount of the view's own
+source is always stacked over.
+
+**Exit status.** 0 once the volume is released; 1 for a refusal at boot or a
+stopped actor; 2 without a control channel or after a malformed line; 3 when
+stopped with views open (left stale, the volume not released); 75 while
+another process holds the volume.
+
+### The view host
+
+`tree_view::ViewHost` serves one volume's views through its sessions
+(`agentfs_core::session::Sessions`) and implements the `Views` port:
+
+```rust
+use std::sync::Arc;
+use agentfs_contracts::views::{MountOptions, MountPoint, Views};
+use agentfs_fuse::tree_view::{HostEvent, ViewHost};
+
+// `sessions` holds the served volume; Clients bound `binding.session`.
+let notify = Arc::new(|event: HostEvent| { /* to the owner's thread */ });
+let mut host = ViewHost::new(sessions, &state, None, notify)?;
+let options = MountOptions { allow_other: true, over_stale: false };
+let view = host.open(MountPoint(dir), binding, options)?;
+// ... HostEvent::ViewEnded(view) once it is unmounted ...
+host.wait()?;
+```
+
+`new` reads the volume's name and starts the take worker (one take at a time,
+off the actor's lock, woken by built and failed events) and, with a metrics
+output, the metrics worker. Each view mounts with the source
+`agentfs:<volume>` (`agentfs:<volume>:fork/<n>` for a fork's view) and the
+subtype `agentfs`, so `agentfs probe` and stale detection see it as an agentfs
+mount. `open` checks the session is bound (`UnknownSession`), then what is
+mounted at the mount point ([stale mounts](#stale-mounts)):
+
+- nothing: the mount point must be an existing empty directory outside the
+  state area, every open view and the metrics output (`MountFailed(EINVAL)`);
+- a stale mount of this volume with `MountOptions::over_stale`: the view is
+  stacked over it. FUSE is mounted at `<state>/stack/<view>`, bound over the
+  mount point, and the private mount detached; a failed stack (no
+  `CAP_SYS_ADMIN`: `EPERM`) unmounts it again and answers `MountFailed`. Once
+  the view ends, the stale layers under it are detached (logged as
+  `tree DetachedStale` or `tree DetachStaleFailed`);
+- a stale mount without `over_stale`, or one of another volume: `Stale`, with
+  its source, and nothing mounted;
+- a live mount or another filesystem: `MountFailed(EBUSY)`.
+
+It then checks that the tree is among the actor's saved trees
+(`MountFailed(ENOENT)`): it never waits for history. The view
+writes as the session's client and is mounted read-only for a read-only
+grant. It serves `lookup`, `readdir`, `create`, `mkdir`, `rmdir`, `unlink`,
+`rename`, `symlink` and `readlink` in any directory (inode 1 the root, every
+other inode its node number + 2, `..` its parent's), and each entry's recorded
+kind, mode, uid, gid, link count, size and times in `getattr`. A create, a
+`mkdir`, a regular file's `mknod`, a `symlink` and `O_TMPFILE` give the new
+entry the kernel's mode (`0777` for a link) and the caller's uid and gid; the
+library applies a set-group-ID directory's group. `setattr` maps a mode, uid
+and gid to one `set_meta`, the values not given kept from the entry's
+metadata, and stands behind the lag gate; atime and mtime map to one
+`set_times` (`TimeOrNow::Now` to `SetTime::Now`, a specific time to
+`SetTime::At`, one before the epoch `EINVAL`), which builds no commit and is
+not gated. The kernel judges authority and access (`default_permissions`).
+An open of a link answers `ELOOP`; `mknod` of a FIFO or a socket makes it in
+the untracked area, and of a device answers `EPERM`; extended attributes are
+not served. `RENAME_NOREPLACE` is
+served; `RENAME_EXCHANGE` and `RENAME_WHITEOUT` answer `EINVAL`. A thread joins each view's
+session, then sends `HostEvent::ViewEnded`; `Landed` follows each landed take,
+after its pages were dropped. `close` is a lazy unmount (`stale::detach`),
+idempotent. `wait`, after every view ended, joins the workers and fails when
+the actor stopped.
+
+Each view merges its tree's untracked area (`TreeSession::untracked_area`)
+into the tree ([trees](../trees.md#rules-and-the-untracked-area)), routing each
+call to one half in `tree_view`, with the untracked half in
+`tree_view/untracked.rs`:
+
+- **Inodes.** A tracked entry's inode is its node number + 2; an untracked
+  entry's is `1 << 62 | n`, `n` from the view's table keyed by the backing
+  file, with the paths it is known by (more than one after a hard link), kept
+  through renames, links and unlinks. The ranges never meet: a tracked number
+  whose inode would fall in `[1 << 62, 1 << 63)` answers `EOVERFLOW`.
+- **Names.** `lookup` finds the tracked entry first, then the area's. A new
+  name (`create`, a regular file's `mknod`, `mkdir`, `symlink`) goes to the
+  half the rules place it in (`RuleSet::place`, judged under the actor's lock,
+  with `inside_repository` read from the area); an existing name stays in its
+  half, and `O_EXCL` answers `EEXIST` for a name in either.
+- **Listings.** A tracked directory lists its tracked children at offsets 1
+  on, then the area's entries at the same path that no tracked child hides, at
+  offsets `(1 << 62) + j + 1`; an untracked directory lists the area's.
+- **Untracked calls.** Plain passthrough on the area, never gated or
+  journaled: `open` (the caller's access flags with
+  `O_NOFOLLOW`, `FOPEN_DIRECT_IO`), `pread` and `pwrite` (page fills and page
+  writes included; an `O_APPEND` write at the file's end), `fsync` and
+  `fdatasync` of the descriptor, `fchmodat`, `fchownat`, `ftruncate` and
+  `utimensat` for `setattr`, `unlinkat`, `mkdirat`, `symlinkat`, `mknodat`
+  of a FIFO or socket (the rules place both untracked), `readlinkat`,
+  `linkat`, and `renameat2` within the half (`RENAME_NOREPLACE` served). A
+  new entry is given to the caller when the view host has `CAP_CHOWN` and
+  `CAP_FOWNER`. Every change holds the area against a fork's copy while it
+  runs (`AreaWrite`, the only way to change an area). A read-only view answers
+  `EROFS` to each.
+- **The actor's lock.** Calls through an open descriptor (`read`, `write`,
+  `fsync`, `getattr` and a setattr by descriptor) never take it; `open` and
+  `setattr` take it only to ask whether the view is writable. Calls that decide
+  or change a name (`lookup`, `create`, `mknod`, `mkdir`, `symlink`, `link`,
+  `unlink`, `rmdir`, `rename`) and listings do their area I/O under it, so a
+  name's half is decided at one instant against the tracked half: an `O_EXCL`
+  create, a rename across the halves and a merged listing each see both halves
+  as one. They wait behind every other call on the volume, a fork's copy
+  included.
+- **Across the halves.** A rename's target class is tracked when a tracked
+  entry holds the name, untracked when a visible untracked entry does, else
+  where `RuleSet::place` puts the source's kind; the table in
+  [trees](../trees.md#moves-across-the-halves) gives what each move does.
+  Every move but one within the untracked half stands behind the lag gate. A
+  tracked file or link moved out is read from a clone of its saved map with the
+  actor unlocked, placed with `UntrackedArea::place`, then unlinked
+  (`SessionGuard::unlink`). An untracked file moved in is one
+  `SessionGuard::replace_file` of the source's descriptor (`O_RDONLY |
+  O_NOFOLLOW`; mode, uid, gid and size from its `fstat`), then `unlinkat`; the
+  view marks every open it has of that file (same `st_dev` and `st_ino`)
+  moved, so its writes and truncates answer `ESTALE`, and drops the kernel's
+  pages of the target from another thread. A tracked directory's rename first
+  removes an empty container left at the target (any other entry there:
+  `EXDEV`), then moves its own container after the engine's step. A hard link
+  is `linkat` within the untracked half, `first_link` for a tracked anonymous
+  file, `EPERM` for a named tracked file and `EXDEV` across the halves.
+  `O_TMPFILE` in an untracked directory answers `EOPNOTSUPP`. A tracked
+  directory with untracked entries is not empty (`ENOTEMPTY`), and its `rmdir`
+  removes its empty container. `fsyncdir` makes the area's directory durable
+  as well.
 
 The views use zero entry and attribute TTLs and direct I/O. Read-only
 descriptors keep saved bytes; writable ones read their own calls and the
@@ -682,7 +890,7 @@ journal and the final release publishes. The code is `agentfs_fuse::tree_view`
   hard link made before the mount and never looked up is not known, so a
   change through another name is not recorded at it.
 - It does not commit or push by itself. The core layer's `Service` does;
-  `agentfs mount` runs both.
-- It does not serve the sandbox overlay on a front.
+  `agentfs serve-history` and `run` run it.
+- The `agentfs` binary serves no sandbox overlay.
 - It needs Linux 5.6 or later for the confined `openat2` access, and kernel
   6.9 or later with privileges for passthrough.

@@ -11,9 +11,10 @@ of=${2:?how many shards}
 last=${3:?the last seed}
 traces=${4:?a directory of traces}
 cargo build --locked -p agentfs-conformance --bin phase1-replay
-cargo test --locked -p agentfs-model --test interleavings --no-run
-# The test binary cargo just built: the newest of that name.
-bin=$(find target/debug/deps -maxdepth 1 -type f -executable -name 'interleavings-*' -printf '%T@ %p\n' | sort -n | tail -1 | cut -d' ' -f2)
+# The test binary's path as cargo reports it, so nothing depends on cargo's directory layout.
+bin=$(cargo test --locked -p agentfs-model --test interleavings --no-run --message-format=json |
+    jq -r 'select(.executable != null and .target.name == "interleavings") | .executable' | tail -n 1)
+[ -x "$bin" ] || { echo "could not find the interleavings test binary" >&2; exit 1; }
 mkdir -p "$traces"
 seq 1 "$last" | awk -v s="$shard" -v n="$of" '$1 % n == s' |
     AGENTFS_MODEL_TRACE_DIR=$traces xargs -P "$(nproc)" -I{} env AGENTFS_MODEL_SEED={} "$bin" phase1_scope >/dev/null

@@ -1,6 +1,5 @@
-//! `agentfs restore` and `agentfs revert` with no mount running: direct
-//! mode, writing the backing tree. The same
-//! commands through a running mount are tested in `mount.rs`.
+//! `agentfs restore` and `agentfs revert` with no history service running:
+//! direct mode, writing the backing tree.
 
 use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
@@ -27,8 +26,13 @@ impl Volume {
         };
         fs::create_dir_all(v.tree()).unwrap();
         fs::create_dir_all(v.dir.path().join("home")).unwrap();
-        let out = v.raw(&["init", "--volume", "demo"]);
-        assert!(out.status.success(), "{}", stderr(&out));
+        agentfs_core::volume::init_with(
+            &agentfs_core::volume::StateDir::new(v.state()),
+            "demo",
+            None,
+            None,
+        )
+        .unwrap();
         v.config("agentfs.commitWindow", "10ms");
         v
     }

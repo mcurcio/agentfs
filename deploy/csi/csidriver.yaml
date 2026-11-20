@@ -4,16 +4,16 @@ kind: CSIDriver
 metadata:
   name: agentfs.mcurcio.github.io
 spec:
-  # No attach step: a worktree lives on one node's disk, and its PV's node
+  # No attach step: a volume lives on one node's disk, and its PV's node
   # affinity (the topology CreateVolume answers) keeps its pods there.
   attachRequired: false
   # NodePublish gets the pod's name, namespace, uid and service account:
-  # each pod's front commits under its own identity.
+  # each pod's view records its commits with that pod's context.
   podInfoOnMount: true
   # PersistentVolumes only: inline (ephemeral) volumes would let a pod
   # author choose the parameters, which are the operator's.
   volumeLifecycleModes: [Persistent]
-  # The kubelet applies a pod's fsGroup through the mount (the front
+  # The kubelet applies a pod's fsGroup through the mount (the view
   # records the chown/chmod as metadata changes).
   fsGroupPolicy: File
   requiresRepublish: false

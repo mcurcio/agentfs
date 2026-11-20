@@ -1,10 +1,10 @@
-//! The driver's persisted records: `csi.json` per worktree
-//! on its node's disk, and the node's staged and published records, from
-//! which a restarted node plugin reconciles. Written atomically (mode
-//! 0600) with [`agentfs_core::fsutil::write_json_atomic`]. A field this
-//! driver does not know fails the load, so a record written for a
-//! behaviour it lacks is refused, never half-read (the attach and
-//! multi-node fields of earlier builds included: no compatibility).
+//! The driver's persisted records (docs/csi.md): the claim record
+//! `csi.json` in each volume directory, and the node's published records,
+//! from which a restarted node plugin reconciles. Each is JSON written
+//! whole (a temporary file renamed over it, mode 0600) with
+//! [`agentfs_core::fsutil::write_json_atomic`]. A field this driver does not
+//! know fails the load, so a record of another build (the recording
+//! driver's `csi.json` included) is refused, never half-read.
 
 use std::fs::{self, DirBuilder};
 use std::io;
@@ -14,248 +14,264 @@ use std::path::{Path, PathBuf};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-use crate::params::{PodInfo, VolumeParams};
+use agentfs_contracts::host::TreeRef;
+use agentfs_contracts::name::{ClientLabel, VolumeName};
+use agentfs_contracts::pod::PodContext;
+
+use crate::error::Error;
+use crate::layout::Layout;
+
+/// The records' version, in each record's `v`.
+pub const RECORD_VERSION: u32 = 1;
+
+/// What a claim is.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ClaimKind {
+    /// A tree volume of its own in `<base>/<handle>/state`.
+    Volume { name: VolumeName, profile: String },
+    /// A fork in `source`'s volume under the key `<handle>` (the fork-claim
+    /// slice builds it).
+    Fork { source: String },
+}
 
 /// `<base>/<handle>/csi.json`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct VolumeRecord {
-    pub params: VolumeParams,
+pub struct ClaimRecord {
+    pub v: u32,
     /// As requested; recorded, not enforced.
     pub capacity_bytes: i64,
-    /// Unix seconds.
-    pub created: u64,
-    /// Adopted from a static PV over an existing worktree rather than
-    /// created by CreateVolume.
-    #[serde(default)]
-    pub static_volume: bool,
-    /// DeleteVolume of a fork asked for it to be finished;
-    /// never cleared. The node plugin's release scan finishes and
-    /// publishes it.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub finish_requested: bool,
+    pub claim: ClaimKind,
 }
 
-/// `<node-state>/staged/<handle>.json`: the volume's history service runs
-/// on this node.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct StagedRecord {
-    pub handle: String,
-    pub params: VolumeParams,
-}
-
-/// `<node-state>/published/<handle>/<key>.json`: a front serves this
-/// target.
+/// `<node_state>/published/<handle>.json`: the claim's view is open at
+/// `target`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PublishedRecord {
+    pub v: u32,
     pub handle: String,
+    /// The volume directory holding the state: the host serving the view.
+    pub volume: String,
+    pub tree: TreeRef,
     pub target: PathBuf,
-    pub readonly: bool,
-    /// SINGLE_NODE_SINGLE_WRITER: no other target may publish the volume.
-    #[serde(default)]
-    pub single_writer: bool,
-    pub pod: Option<PodInfo>,
-    /// The front's pending slot, preferred again after a crash.
-    pub slot: Option<u16>,
-    pub front_pid: Option<u32>,
-    /// `--workload-mount` values for the front (`workloadMounts`).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub workload_mounts: Vec<String>,
+    pub read_only: bool,
+    pub pod: PodContext,
+    pub label: ClientLabel,
 }
 
 /// Reads a record; `None` if there is none.
-pub fn load<T: DeserializeOwned>(path: &Path) -> io::Result<Option<T>> {
+fn load<T: DeserializeOwned>(path: &Path) -> Result<Option<T>, Error> {
     match fs::read(path) {
-        Ok(bytes) => serde_json::from_slice(&bytes).map(Some).map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("{}: {e}", path.display()),
-            )
-        }),
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .map(Some)
+            .map_err(|e| Error::Internal(format!("reading {}: {e}", path.display()))),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e),
+        Err(e) => Err(Error::io(format!("reading {}", path.display()), e)),
     }
 }
 
-/// Writes a record atomically, creating its directory (0700).
-pub fn store<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {
-    if let Some(dir) = path.parent() {
-        DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
-    }
-    agentfs_core::fsutil::write_json_atomic(path, value)
+/// Writes a record whole, creating its directory (0700).
+fn store<T: Serialize>(path: &Path, value: &T) -> Result<(), Error> {
+    let write = || -> io::Result<()> {
+        if let Some(dir) = path.parent() {
+            DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
+        }
+        agentfs_core::fsutil::write_json_atomic(path, value)
+    };
+    write().map_err(|e| Error::io(format!("writing {}", path.display()), e))
 }
 
-/// Removes a record; a missing one is fine.
-pub fn remove(path: &Path) -> io::Result<()> {
-    match fs::remove_file(path) {
-        Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
-        _ => Ok(()),
-    }
+/// The claim record of `handle`, if the claim exists on this node.
+pub fn load_claim(layout: &Layout, handle: &str) -> Result<Option<ClaimRecord>, Error> {
+    load(&layout.csi_json(handle))
 }
 
-/// Records that could not be read, with why.
-pub type Unreadable = Vec<(PathBuf, io::Error)>;
-
-/// The `*.json` record files directly in `dir`, unsorted; none when `dir`
-/// is missing.
-fn record_paths(dir: &Path) -> io::Result<Vec<PathBuf>> {
-    match fs::read_dir(dir) {
-        Ok(entries) => Ok(entries
-            .filter_map(Result::ok)
-            .map(|e| e.path())
-            .filter(|p| p.extension().is_some_and(|x| x == "json"))
-            .collect()),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
-        Err(e) => Err(e),
-    }
+/// The name and profile of the tree volume in the directory `volume`: from
+/// its `csi.json`, else from its `csi.retained.json` (a kept volume).
+/// `None` when neither names a volume of its own.
+pub fn load_volume_claim(
+    layout: &Layout,
+    volume: &str,
+) -> Result<Option<(VolumeName, String)>, Error> {
+    let record = match load_claim(layout, volume)? {
+        Some(record) => Some(record),
+        None => load::<ClaimRecord>(&layout.retained_json(volume))?,
+    };
+    Ok(match record.map(|r| r.claim) {
+        Some(ClaimKind::Volume { name, profile }) => Some((name, profile)),
+        Some(ClaimKind::Fork { .. }) | None => None,
+    })
 }
 
-/// Whether `dir` holds any `*.json` record, readable or not. An error
-/// listing it is returned: the caller cannot tell.
-pub fn any(dir: &Path) -> io::Result<bool> {
-    Ok(!record_paths(dir)?.is_empty())
+/// Writes the claim record of `handle`.
+pub fn store_claim(layout: &Layout, handle: &str, record: &ClaimRecord) -> Result<(), Error> {
+    store(&layout.csi_json(handle), record)
 }
 
-/// Every `*.json` record directly in `dir`, in name order, with the files
-/// that could not be read.
-pub fn load_all<T: DeserializeOwned>(dir: &Path) -> io::Result<(Vec<T>, Unreadable)> {
-    let mut paths = record_paths(dir)?;
+/// Every published record, in name order, and the names under the
+/// published directory that are no readable record (an older driver's
+/// node state among them), which are left where they are.
+pub fn load_published(layout: &Layout) -> (Vec<PublishedRecord>, Vec<String>) {
+    let dir = layout.published_dir();
+    let mut paths: Vec<PathBuf> = match fs::read_dir(&dir) {
+        Ok(entries) => entries.filter_map(Result::ok).map(|e| e.path()).collect(),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => return (Vec::new(), vec![format!("{}: {e}", dir.display())]),
+    };
     paths.sort();
     let mut good = Vec::new();
     let mut bad = Vec::new();
     for path in paths {
-        match load(&path) {
+        let name = path.display().to_string();
+        if path.extension().is_some_and(|x| x == "tmp") {
+            continue;
+        }
+        if !path.is_file() || path.extension().is_none_or(|x| x != "json") {
+            bad.push(name);
+            continue;
+        }
+        match load::<PublishedRecord>(&path) {
             Ok(Some(record)) => good.push(record),
             Ok(None) => {}
-            Err(e) => bad.push((path, e)),
+            Err(e) => bad.push(format!("{name}: {e}")),
         }
     }
-    Ok((good, bad))
+    (good, bad)
+}
+
+/// Writes a published record.
+pub fn store_published(layout: &Layout, record: &PublishedRecord) -> Result<(), Error> {
+    store(&layout.published(&record.handle), record)
+}
+
+/// Removes the published record of `handle`; a missing one is fine.
+pub fn remove_published(layout: &Layout, handle: &str) -> Result<(), Error> {
+    let path = layout.published(handle);
+    match fs::remove_file(&path) {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => {
+            Err(Error::io(format!("removing {}", path.display()), e))
+        }
+        _ => Ok(()),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use std::os::unix::fs::PermissionsExt;
 
+    use agentfs_contracts::name::{ForkKey, Label};
+
     use super::*;
-    use crate::params::OnDelete;
 
-    fn params() -> VolumeParams {
-        VolumeParams {
-            profile: "p".into(),
-            volume: "v".into(),
-            on_delete: OnDelete::Delete,
-            start_from: None,
-            workload_mounts: Vec::new(),
+    fn layout(dir: &Path) -> Layout {
+        Layout {
+            base: dir.join("base"),
+            node_state: dir.join("node"),
+            profiles: dir.join("profiles"),
         }
     }
 
-    #[test]
-    fn records_round_trip_atomically() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("a/b/csi.json");
-        assert_eq!(load::<VolumeRecord>(&path).unwrap(), None);
-        let rec = VolumeRecord {
-            params: VolumeParams {
-                start_from: Some(format!("origin:agentfs/v1@{}", "1".repeat(40))),
-                ..params()
-            },
+    fn volume_claim() -> ClaimRecord {
+        ClaimRecord {
+            v: RECORD_VERSION,
             capacity_bytes: 1 << 30,
-            created: 1,
-            static_volume: false,
-            finish_requested: false,
-        };
-        store(&path, &rec).unwrap();
-        assert_eq!(load::<VolumeRecord>(&path).unwrap(), Some(rec));
+            claim: ClaimKind::Volume {
+                name: VolumeName::parse("apps.data.pvc-1").unwrap(),
+                profile: "p".into(),
+            },
+        }
+    }
+
+    #[test]
+    fn claim_records_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let l = layout(dir.path());
+        assert_eq!(load_claim(&l, "pvc-1").unwrap(), None);
+        assert_eq!(load_volume_claim(&l, "pvc-1").unwrap(), None);
+        store_claim(&l, "pvc-1", &volume_claim()).unwrap();
+        assert_eq!(load_claim(&l, "pvc-1").unwrap(), Some(volume_claim()));
+        let text = fs::read_to_string(l.csi_json("pvc-1")).unwrap();
+        assert!(text.contains("\"kind\": \"volume\""), "{text}");
         let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode(&path), 0o600);
-        assert_eq!(mode(path.parent().unwrap()), 0o700);
-        let text = fs::read_to_string(&path).unwrap();
-        assert!(text.contains("\"on_delete\": \"delete\""), "{text}");
-        remove(&path).unwrap();
-        remove(&path).unwrap();
-        assert!(!path.exists());
-    }
+        assert_eq!(mode(&l.csi_json("pvc-1")), 0o600);
+        assert_eq!(mode(&l.volume_dir("pvc-1")), 0o700);
+        let found = load_volume_claim(&l, "pvc-1").unwrap().unwrap();
+        assert_eq!(found.0.as_str(), "apps.data.pvc-1");
+        assert_eq!(found.1, "p");
+        // A kept volume is found by its retained record.
+        fs::rename(l.csi_json("pvc-1"), l.retained_json("pvc-1")).unwrap();
+        assert_eq!(load_claim(&l, "pvc-1").unwrap(), None);
+        assert_eq!(load_volume_claim(&l, "pvc-1").unwrap(), Some(found));
 
-    #[test]
-    fn a_record_with_fields_this_driver_does_not_know_is_refused() {
-        // The attach node of an earlier build, for one: refused, naming it.
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("csi.json");
-        let rec = VolumeRecord {
-            params: params(),
-            capacity_bytes: 1,
-            created: 1,
-            static_volume: false,
-            finish_requested: false,
+        let fork = ClaimRecord {
+            v: RECORD_VERSION,
+            capacity_bytes: 0,
+            claim: ClaimKind::Fork {
+                source: "pvc-1".into(),
+            },
         };
-        for field in ["published_node", "published_nodes", "replicas"] {
-            let mut json = serde_json::to_value(&rec).unwrap();
-            json[field] = serde_json::json!("node-1");
-            fs::write(&path, json.to_string()).unwrap();
-            let err = load::<VolumeRecord>(&path).unwrap_err();
-            assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{err}");
-            assert!(
-                err.to_string()
-                    .contains(&format!("unknown field `{field}`")),
-                "{err}"
-            );
-            assert!(err.to_string().contains("csi.json"), "{err}");
-        }
+        store_claim(&l, "pvc-2", &fork).unwrap();
+        assert_eq!(load_claim(&l, "pvc-2").unwrap(), Some(fork));
+        assert_eq!(load_volume_claim(&l, "pvc-2").unwrap(), None);
+    }
+
+    /// The recording driver's `csi.json` is no claim record.
+    #[test]
+    fn a_recording_csi_json_does_not_parse() {
+        let dir = tempfile::tempdir().unwrap();
+        let l = layout(dir.path());
+        fs::create_dir_all(l.volume_dir("old")).unwrap();
+        fs::write(
+            l.csi_json("old"),
+            r#"{"params":{"profile":"p","volume":"v","on_delete":"retain"},"capacity_bytes":1,"created":1,"static_volume":false}"#,
+        )
+        .unwrap();
+        let err = load_claim(&l, "old").unwrap_err();
+        assert!(matches!(err, Error::Internal(_)), "{err:?}");
+        assert!(err.to_string().contains("csi.json"), "{err}");
+        // A field this driver does not know is refused too.
+        let mut json = serde_json::to_value(volume_claim()).unwrap();
+        json["created"] = serde_json::json!(1);
+        fs::write(l.csi_json("old"), json.to_string()).unwrap();
+        assert!(load_claim(&l, "old").is_err());
     }
 
     #[test]
-    fn load_all_reads_every_record_and_reports_bad_ones() {
+    fn published_records_round_trip_and_bad_ones_are_listed() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(
-            load_all::<StagedRecord>(&dir.path().join("none"))
-                .unwrap()
-                .0
-                .is_empty()
-        );
-        for h in ["b", "a"] {
-            store(
-                &dir.path().join(format!("{h}.json")),
-                &StagedRecord {
-                    handle: h.into(),
-                    params: params(),
-                },
-            )
-            .unwrap();
-        }
-        fs::write(dir.path().join("c.json"), "{").unwrap();
-        fs::write(dir.path().join("ignored.tmp"), "x").unwrap();
-        let (good, bad): (Vec<StagedRecord>, _) = load_all(dir.path()).unwrap();
-        assert_eq!(
-            good.iter().map(|r| r.handle.as_str()).collect::<Vec<_>>(),
-            ["a", "b"]
-        );
-        assert_eq!(bad.len(), 1);
-        assert!(bad[0].0.ends_with("c.json"));
-    }
-
-    #[test]
-    fn published_records_keep_the_pod_and_slot() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("k.json");
-        let rec = PublishedRecord {
-            handle: "v".into(),
-            target: "/t".into(),
-            readonly: false,
-            single_writer: true,
-            pod: Some(PodInfo {
-                namespace: "ns".into(),
-                name: "p".into(),
-                uid: "u".into(),
-                service_account: "sa".into(),
-            }),
-            slot: Some(3),
-            front_pid: Some(42),
-            workload_mounts: vec!["/workspace".into()],
+        let l = layout(dir.path());
+        assert_eq!(load_published(&l), (Vec::new(), Vec::new()));
+        let record = |handle: &str, tree: TreeRef| PublishedRecord {
+            v: RECORD_VERSION,
+            handle: handle.into(),
+            volume: "pvc-1".into(),
+            tree,
+            target: format!("/var/lib/kubelet/pods/{handle}/mount").into(),
+            read_only: false,
+            pod: PodContext {
+                namespace: Some(Label::parse("apps").unwrap()),
+                pod: Some(Label::parse("w-0").unwrap()),
+                pod_uid: None,
+                node: Some(Label::parse("n1").unwrap()),
+            },
+            label: ClientLabel::parse("csi-0123456789abcdef").unwrap(),
         };
-        store(&path, &rec).unwrap();
-        assert_eq!(load::<PublishedRecord>(&path).unwrap(), Some(rec));
+        let b = record("b", TreeRef::Fork(ForkKey::parse("b").unwrap()));
+        let a = record("a", TreeRef::Root);
+        store_published(&l, &b).unwrap();
+        store_published(&l, &a).unwrap();
+        // An older driver's node state: a directory per volume, and junk.
+        fs::create_dir_all(l.published_dir().join("old-volume")).unwrap();
+        fs::write(l.published("c"), "{").unwrap();
+        let (good, bad) = load_published(&l);
+        assert_eq!(good, vec![a, b]);
+        assert_eq!(bad.len(), 2, "{bad:?}");
+        assert!(bad.iter().any(|b| b.ends_with("old-volume")), "{bad:?}");
+        assert!(bad.iter().any(|b| b.contains("c.json")), "{bad:?}");
+        remove_published(&l, "a").unwrap();
+        remove_published(&l, "a").unwrap();
+        assert!(!l.published("a").exists());
     }
 }

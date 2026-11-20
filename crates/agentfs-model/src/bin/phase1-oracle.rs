@@ -6,7 +6,7 @@
 use agentfs_model::calls::{Client, TreeId};
 use agentfs_model::git::git;
 use agentfs_model::recording::Write;
-use agentfs_model::world::{MODEL_ROOT, Policies, Step, TreeNames, World};
+use agentfs_model::world::{Policies, TreeNames, TreeStep, World};
 use std::fmt::Write as _;
 
 fn hex(bytes: &[u8]) -> String {
@@ -30,7 +30,7 @@ fn save(world: &mut World, client: &Client, bytes: &str) {
 }
 
 fn finding_32() {
-    let mut w = World::new(Policies::default(), TreeNames::new(MODEL_ROOT));
+    let mut w = World::new(Policies::default(), TreeNames::new());
     let root = Client::Root("m1".into());
     let base = w.read(TreeId::ROOT, "c").bytes();
     let f = w.create_fork(TreeId::ROOT);
@@ -56,7 +56,7 @@ fn finding_32() {
     );
     w.close(edit);
     for _ in 0..2 {
-        w.step(&Step::Next(TreeId::ROOT));
+        w.take_step(&TreeStep::Next(TreeId::ROOT));
     }
     let content = w.read(TreeId::ROOT, "c");
     let lines = content
@@ -74,18 +74,18 @@ fn finding_32() {
 }
 
 fn p1_append() {
-    let mut w = World::new(Policies::default(), TreeNames::new(MODEL_ROOT));
+    let mut w = World::new(Policies::default(), TreeNames::new());
     let root = Client::Root("m1".into());
     save(&mut w, &root, "base\n");
     let f = w.create_fork(TreeId::ROOT);
     let held = w.open_write(&root, "a");
     save(&mut w, &Client::Fork(f), "sandbox-log\n");
-    w.step(&Step::Next(TreeId::ROOT));
+    w.take_step(&TreeStep::Next(TreeId::ROOT));
     let append = w.open_write(&Client::Root("m2".into()), "a");
     w.write(append, Write::Append("child\n".into()));
     w.close(append);
     w.close(held);
-    w.settle();
+    w.settle_trees();
     println!(
         "{{\"root\":\"{}\"}}",
         hex(w.read(TreeId::ROOT, "a").bytes().as_bytes())
@@ -113,7 +113,7 @@ fn main() {
         "edited-place" => ("a0\na1\n", "a0\na1\nparent\n", "a0\nchild\n"),
         _ => panic!("unknown case: {name}"),
     };
-    let mut world = World::new(Policies::default(), TreeNames::new(MODEL_ROOT));
+    let mut world = World::new(Policies::default(), TreeNames::new());
     let root = Client::Root("m1".into());
     save(&mut world, &root, base);
     let fork = world.create_fork(TreeId::ROOT);
@@ -121,7 +121,7 @@ fn main() {
     let child_head = world.head(fork);
     save(&mut world, &root, parent);
     let parent_head = world.head(TreeId::ROOT);
-    world.settle();
+    world.settle_trees();
     let history = git(
         world.repo(),
         &["rev-list", "--first-parent", &world.head(TreeId::ROOT)],

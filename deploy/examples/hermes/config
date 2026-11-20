@@ -1,9 +1,17 @@
-# Hermes: the operator fragment, mounted from a ConfigMap and
-# included with `agentfs init --include /etc/agentfs/config`.
+# Hermes: the operator settings, mounted from a ConfigMap and included
+# with `agentfs init --include /etc/agentfs/config`.
+#
+# Push and the patch queue are not built on tree volumes yet: the volume
+# serves anyway and logs the remote and the patch source as not built at
+# every boot (`not built: remote.origin.url (push): ...`, `not built:
+# agentfs.patchremote (patches): ...`), counted by the agentfs.not_built
+# gauge. The history stays in the state area until push is built.
 [agentfs]
 	# Nested repositories (a skill cloned with git) are not recorded.
 	nested = exclude
 	pushInterval = 60s
+	# Where iac queues patches to Hermes' files.
+	patchRemote = origin
 
 [remote "origin"]
 	url = https://git.example.com/acme/hermes-history.git

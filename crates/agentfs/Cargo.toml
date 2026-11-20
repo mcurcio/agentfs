@@ -8,8 +8,12 @@ repository.workspace = true
 description = "agentfs command-line tool and daemon"
 
 [dependencies]
+agentfs-clients = { version = "0.1.0", path = "../agentfs-clients" }
+agentfs-contracts = { version = "0.1.0", path = "../agentfs-contracts" }
 agentfs-core = { version = "0.1.0", path = "../agentfs-core" }
 agentfs-fuse = { version = "0.1.0", path = "../agentfs-fuse" }
+agentfs-trees = { version = "0.1.0", path = "../agentfs-trees" }
+agentfs-volume = { version = "0.1.0", path = "../agentfs-volume" }
 anyhow = "1.0.104"
 clap = { version = "4.6.7", features = ["derive", "env"] }
 signal-hook = "0.4.5"
@@ -28,8 +32,9 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 rustls-native-certs = { version = "0.8", optional = true }
 rustls-pki-types = { version = "1.15", features = ["std"], optional = true }
 tonic = { version = "0.14", default-features = false, features = ["tls-ring", "tls-native-roots"], optional = true }
-# The restore thread's id (`thread`), and signals in tests (`process`).
-rustix = { version = "1.1.5", features = ["fs", "process", "thread"] }
+# The restore thread's id (`thread`), signals in tests (`process`), and
+# `agentfs host`'s check that its standard input is a stream socket (`net`).
+rustix = { version = "1.1.5", features = ["fs", "net", "process", "thread"] }
 # close(2) and its errno in the FUSE tests (a front failing a boundary with
 # EIO).
 libc = "0.2.190"
@@ -45,10 +50,16 @@ tiny_http = "0.12.0"
 git2 = { version = "0.21.0", default-features = false }
 
 [dev-dependencies]
-# Drives a real `agentfs serve-history` through the CSI supervisor
-# (csi_service.rs).
+# The tree engine's rule set, for the deploy examples' rule files
+# (deploy_examples.rs).
+agentfs-rules = { version = "0.1.0", path = "../agentfs-rules" }
+# Drives the real `agentfs init` and `agentfs host` through the CSI
+# driver's services over a gRPC socket (csi_trees.rs), with its client
+# over a Unix socket.
 agentfs-csi = { version = "0.1.0", path = "../agentfs-csi" }
-tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "time", "net"] }
+hyper-util = { version = "0.1.21", features = ["tokio"] }
+tower = { version = "0.5.3", features = ["util"] }
+tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "time", "net", "sync", "io-util"] }
 # Decodes OTLP payloads in the fake collector of the telemetry test.
 opentelemetry-proto = { version = "0.33.1", default-features = false, features = ["gen-tonic", "with-serde", "trace", "metrics", "logs"] }
 # The fake gRPC collector.

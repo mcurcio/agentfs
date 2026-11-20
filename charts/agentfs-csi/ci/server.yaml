@@ -1,7 +1,9 @@
 # charts/agentfs-csi's values for the chart server job (ci/e2e-chart-server.sh,
 # f8 workflow): the images the job built, the chart's git server on the
 # cluster's default StorageClass with the chart's own random password, and
-# a profile pushing to it with the credentials the chart wires.
+# a profile naming it as a remote with the credentials the chart wires.
+# Push is not built on tree volumes yet: each volume's host logs the
+# remote as not built, and the job checks the server gets no ref of it.
 #
 # Not named *-values.yaml: chart-testing would take it for `ct install` in
 # the helm workflow too, where the server image is not loaded.
@@ -18,11 +20,10 @@ server:
     size: 1Gi
 profiles:
   server:
-    # The fragment NOTES.txt prints, pushing every 2 seconds.
+    # The fragment NOTES.txt prints.
     config: |
       [agentfs]
           pushInterval = 2s
-          commitWindow = 100ms
       [remote "server"]
           url = http://agentfs-git-server.agentfs-csi.svc:8080/git/history.git
           agentfsCredentials = /etc/agentfs-csi/credentials/agentfs-server
@@ -30,4 +31,3 @@ storageClasses:
   - name: agentfs-server
     parameters:
       profile: server
-      onDelete: delete

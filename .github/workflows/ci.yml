@@ -20,10 +20,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
-        with:
-          toolchain: stable
-          components: rustfmt, clippy
+      - run: rustup toolchain install # the release rust-toolchain.toml pins
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config
       - run: cargo fmt --all --check
@@ -46,9 +43,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
-        with:
-          toolchain: stable
+      - run: rustup toolchain install # the release rust-toolchain.toml pins
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: docs
@@ -70,9 +65,7 @@ jobs:
         features: [default, all]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
-        with:
-          toolchain: stable
+      - run: rustup toolchain install # the release rust-toolchain.toml pins
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: ${{ matrix.features }}
@@ -83,114 +76,12 @@ jobs:
       - run: git lfs version
       - run: cargo test --workspace --locked ${{ matrix.features == 'all' && '--all-features' || '' }}
 
-  e2e-remotes:
-    name: e2e (http and https remotes)
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
-        with:
-          toolchain: stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          key: https
-      - run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config nginx fcgiwrap
-      - run: cargo build --locked -p agentfs --features https
-      - name: start git server
-        run: ci/git-http-server.sh start "$RUNNER_TEMP/git-server" --trust-ca >>"$GITHUB_ENV"
-      - run: ci/e2e-remotes.sh
-        env:
-          E2E_HTTPS: 1
-      - name: server logs
-        if: failure()
-        run: tail -n 100 "$RUNNER_TEMP"/git-server/logs/*.log
-      - if: always()
-        run: ci/git-http-server.sh stop "$RUNNER_TEMP/git-server"
-
-  e2e-shared-remotes:
-    name: e2e (shared and failing remotes, FUSE)
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
-        with:
-          toolchain: stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          key: shared-remotes
-      - run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config nginx fcgiwrap fuse3 jq python3 socat
-      - run: cargo build --locked --release -p agentfs --features https
-      - name: start git server
-        run: ci/git-http-server.sh start "$RUNNER_TEMP/git-server" --trust-ca >>"$GITHUB_ENV"
-      - name: two volumes push to one remote at once
-        run: ci/e2e-shared-remote.sh
-        env:
-          AGENTFS_BIN: ${{ github.workspace }}/target/release/agentfs
-      - name: the mount keeps working while remotes fail
-        run: ci/e2e-remote-failures.sh
-        env:
-          AGENTFS_BIN: ${{ github.workspace }}/target/release/agentfs
-      - name: server logs
-        if: failure()
-        run: tail -n 100 "$RUNNER_TEMP"/git-server/logs/*.log
-      - if: always()
-        run: ci/git-http-server.sh stop "$RUNNER_TEMP/git-server"
-      - name: clean up mounts
-        if: always()
-        run: sudo sh -c 'grep agentfs /proc/self/mountinfo | cut -d" " -f5 | xargs -r -n1 umount -l' || true
-
-  e2e-patches:
-    name: e2e (patch queue over http, FUSE)
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
-        with:
-          toolchain: stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          key: patches
-      - run: sudo apt-get update && sudo apt-get install -y nginx fcgiwrap fuse3
-      - run: cargo build --locked -p agentfs
-      - name: start git server
-        run: ci/git-http-server.sh start "$RUNNER_TEMP/git-server" >>"$GITHUB_ENV"
-      - run: ci/e2e-patches.sh
-      - name: server logs
-        if: failure()
-        run: tail -n 100 "$RUNNER_TEMP"/git-server/logs/*.log
-      - if: always()
-        run: ci/git-http-server.sh stop "$RUNNER_TEMP/git-server"
-
-  e2e-ssh:
-    name: e2e (ssh remotes)
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
-        with:
-          toolchain: stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          key: ssh
-      - run: sudo apt-get update && sudo apt-get install -y openssh-server openssh-client
-      - run: cargo build --locked -p agentfs --features ssh
-      - name: start ssh server
-        run: ci/git-ssh-server.sh start "$RUNNER_TEMP/ssh-server" >>"$GITHUB_ENV"
-      - run: ci/e2e-ssh.sh
-      - name: sshd log
-        if: failure()
-        run: sudo tail -n 200 "$RUNNER_TEMP/ssh-server/sshd.log"
-      - if: always()
-        run: ci/git-ssh-server.sh stop "$RUNNER_TEMP/ssh-server"
-
   e2e-telemetry:
     name: e2e (OpenTelemetry collector)
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
-        with:
-          toolchain: stable
+      - run: rustup toolchain install # the release rust-toolchain.toml pins
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: sudo apt-get update && sudo apt-get install -y fuse3 jq
       - run: cargo build --locked -p agentfs --features otlp-tls
@@ -219,38 +110,12 @@ jobs:
         if: failure()
         run: docker logs otelcol 2>&1 | tail -n 100
 
-  e2e-runbooks:
-    name: e2e (operator runbooks)
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
-        with:
-          toolchain: stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      - run: sudo apt-get update && sudo apt-get install -y git-filter-repo
-      - run: git filter-repo --version && git --version
-      - id: build
-        run: cargo build --locked -p agentfs
-      - run: ci/e2e-runbooks.sh
-      # Its own step, run even when the one above fails, so a flake of
-      # the history-rewrite step there stays attributable (AGENTS.md).
-      - name: history rewrite with forks
-        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-        run: ci/e2e-runbooks.sh forks
-
   fuse:
-    name: e2e (FUSE mount, passthrough ${{ matrix.passthrough }})
+    name: e2e (FUSE mount)
     runs-on: ubuntu-24.04
-    strategy:
-      fail-fast: false
-      matrix:
-        passthrough: [auto, on, off]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
-        with:
-          toolchain: stable
+      - run: rustup toolchain install # the release rust-toolchain.toml pins
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: fuse
@@ -263,22 +128,9 @@ jobs:
           ls -l /dev/fuse
           findmnt -T "$RUNNER_TEMP" || true
       - run: ci/fuse-tests.sh
-        env:
-          AGENTFS_TEST_PASSTHROUGH: ${{ matrix.passthrough }}
-          AGENTFS_TEST_UNPRIV_USER: runner
       # README.md's quick start, as written, as root.
       - name: README quick start
-        if: matrix.passthrough == 'auto'
         run: ci/readme-quickstart.sh
-      - run: ci/e2e-recovery.sh
-        env:
-          AGENTFS_TEST_PASSTHROUGH: ${{ matrix.passthrough }}
-      - run: ci/e2e-sqlite.sh
-        env:
-          AGENTFS_TEST_PASSTHROUGH: ${{ matrix.passthrough }}
-      - name: daemon logs
-        if: failure()
-        run: tail -n 200 "$RUNNER_TEMP"/agentfs-mount-logs/*.log
       - name: clean up mounts
         if: always()
         run: sudo sh -c 'grep agentfs /proc/self/mountinfo | cut -d" " -f5 | xargs -r -n1 umount -l' || true
@@ -291,195 +143,27 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
-        with:
-          toolchain: stable
+      - run: rustup toolchain install # the release rust-toolchain.toml pins
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: crash
       - run: sudo apt-get update && sudo apt-get install -y fuse3 jq
       - run: ci/crash-tests.sh
 
-  e2e-multipod:
-    name: e2e (two FUSE mounts, one history service, passthrough ${{ matrix.passthrough }})
-    runs-on: ubuntu-24.04
-    strategy:
-      fail-fast: false
-      matrix:
-        passthrough: [auto, off]
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
-        with:
-          toolchain: stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          key: multipod
-      - run: sudo apt-get update && sudo apt-get install -y fuse3 jq python3
-      - name: enable user_allow_other, show the kernel
-        run: |
-          echo user_allow_other | sudo tee -a /etc/fuse.conf
-          uname -a
-          findmnt -T "$RUNNER_TEMP" || true
-      - run: cargo build --locked --release -p agentfs
-      - run: ci/e2e-multipod.sh
-        env:
-          AGENTFS_TEST_PASSTHROUGH: ${{ matrix.passthrough }}
-          AGENTFS_BIN: ${{ github.workspace }}/target/release/agentfs
-      # Fails when a front's record costs over 1.6 times the
-      # single-process one at the median of several runs.
-      - name: round-trip benchmark
-        run: ci/round-trip-bench.sh
-        env:
-          AGENTFS_TEST_PASSTHROUGH: ${{ matrix.passthrough }}
-      - name: daemon logs
-        if: failure()
-        run: tail -n 200 "$RUNNER_TEMP"/agentfs-multipod-logs/*.log
-      - name: clean up mounts
-        if: always()
-        run: sudo sh -c 'grep agentfs /proc/self/mountinfo | cut -d" " -f5 | xargs -r -n1 umount -l' || true
-
-  e2e-nfs:
-    name: e2e (NFS state areas, passthrough ${{ matrix.passthrough }})
-    runs-on: ubuntu-24.04
-    timeout-minutes: 20
-    strategy:
-      fail-fast: false
-      matrix:
-        passthrough: [auto, off]
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
-        with:
-          toolchain: stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          key: nfs
-      - run: sudo apt-get update && sudo apt-get install -y fuse3 jq python3
-      - name: enable user_allow_other, show the kernel
-        run: |
-          echo user_allow_other | sudo tee -a /etc/fuse.conf
-          uname -a
-      - run: cargo build --locked --release -p agentfs -p agentfs-csi
-      - run: ci/e2e-nfs.sh
-        env:
-          AGENTFS_TEST_PASSTHROUGH: ${{ matrix.passthrough }}
-          AGENTFS_BIN: ${{ github.workspace }}/target/release/agentfs
-          AGENTFS_CSI_BIN: ${{ github.workspace }}/target/release/agentfs-csi
-      - name: diagnose
-        if: failure()
-        run: |
-          sudo sh -c 'cat /proc/fs/nfsd/clients/*/info' 2>/dev/null || true
-          findmnt -t nfs4 || true
-          sudo journalctl -u nfs-server --no-pager -n 50 || true
-          sudo dmesg | tail -n 50 || true
-          tail -n 200 "$RUNNER_TEMP"/agentfs-nfs-logs/*.log 2>/dev/null || true
-      - name: clean up
-        if: always()
-        run: |
-          sudo sh -c 'grep agentfs /proc/self/mountinfo | cut -d" " -f5 | xargs -r -n1 umount -l' || true
-          for m in /mnt/nfs-a /mnt/nfs-b /mnt/nfs-v40 /mnt/nfs-flock; do timeout 20 sudo umount -f -l "$m" || true; done
-
-  e2e-lfs:
-    name: e2e (Git LFS)
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
-        with:
-          toolchain: stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          key: lfs
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
-        with:
-          go-version: stable
-          cache: false
-      - run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config nginx fcgiwrap git-lfs tinyproxy
-      - name: build lfs-test-server (git-lfs's reference server, pinned)
-        run: |
-          GOBIN="$RUNNER_TEMP/bin" go install github.com/git-lfs/lfs-test-server@d27ad23fddc1949ecd9a4ba6a3d074bc6a567084
-          echo "LFS_TEST_SERVER=$RUNNER_TEMP/bin/lfs-test-server" >>"$GITHUB_ENV"
-      - run: cargo build --locked -p agentfs --features https
-      - name: start git server with LFS routes
-        run: GIT_SERVER_LFS=1 ci/git-http-server.sh start "$RUNNER_TEMP/git-server" --trust-ca >>"$GITHUB_ENV"
-      - name: start LFS servers
-        run: ci/lfs-server.sh start "$RUNNER_TEMP/lfs-server" >>"$GITHUB_ENV"
-      - name: start the HTTP proxy
-        run: ci/proxy-server.sh start "$RUNNER_TEMP/proxy" >>"$GITHUB_ENV"
-      - run: ci/e2e-lfs.sh
-        env:
-          E2E_HTTPS: 1
-      - run: ci/e2e-lfs-transfers.sh
-        env:
-          E2E_HTTPS: 1
-      - name: server logs
-        if: failure()
-        run: |
-          tail -n 200 "$RUNNER_TEMP"/git-server/logs/*.log
-          tail -n 100 "$RUNNER_TEMP"/lfs-server/*.log
-          tail -n 100 "$RUNNER_TEMP"/proxy/tinyproxy.log || true
-      - if: always()
-        run: |
-          ci/proxy-server.sh stop "$RUNNER_TEMP/proxy"
-          ci/lfs-server.sh stop "$RUNNER_TEMP/lfs-server"
-          ci/git-http-server.sh stop "$RUNNER_TEMP/git-server"
-
-  e2e-lfs-ssh:
-    name: "e2e (Git LFS over ssh: git-lfs-authenticate)"
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
-        with:
-          toolchain: stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          key: lfs-ssh
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
-        with:
-          go-version: stable
-          cache: false
-      - run: sudo apt-get update && sudo apt-get install -y openssh-server openssh-client nginx fcgiwrap git-lfs libssl-dev pkg-config
-      - name: build lfs-test-server (git-lfs's reference server, pinned)
-        run: |
-          GOBIN="$RUNNER_TEMP/bin" go install github.com/git-lfs/lfs-test-server@d27ad23fddc1949ecd9a4ba6a3d074bc6a567084
-          echo "LFS_TEST_SERVER=$RUNNER_TEMP/bin/lfs-test-server" >>"$GITHUB_ENV"
-      - run: cargo build --locked -p agentfs --features ssh
-      # --trust-ca: lfs-server.sh also starts (and checks) the https LFS
-      # server, whose certificate the throwaway CA signs.
-      - name: start git server with LFS routes
-        run: GIT_SERVER_LFS=1 ci/git-http-server.sh start "$RUNNER_TEMP/git-server" --trust-ca >>"$GITHUB_ENV"
-      - name: start LFS servers
-        run: ci/lfs-server.sh start "$RUNNER_TEMP/lfs-server" >>"$GITHUB_ENV"
-      - name: start ssh server with git-lfs-authenticate
-        run: GIT_SSH_LFS_AUTH=1 ci/git-ssh-server.sh start "$RUNNER_TEMP/ssh-server" >>"$GITHUB_ENV"
-      - run: ci/e2e-lfs-ssh.sh
-      - name: server logs
-        if: failure()
-        run: |
-          sudo tail -n 200 "$RUNNER_TEMP/ssh-server/sshd.log"
-          sudo cat /home/agentfs-git/lfs-auth/log || true
-          tail -n 200 "$RUNNER_TEMP"/git-server/logs/*.log
-          tail -n 100 "$RUNNER_TEMP"/lfs-server/*.log
-      - if: always()
-        run: |
-          ci/git-ssh-server.sh stop "$RUNNER_TEMP/ssh-server"
-          ci/lfs-server.sh stop "$RUNNER_TEMP/lfs-server"
-          ci/git-http-server.sh stop "$RUNNER_TEMP/git-server"
-
   trees:
     name: e2e (phase 1 tree views)
     runs-on: ubuntu-24.04
+    # A drain that never releases fails here, not at GitHub's 6-hour default.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
-        with:
-          toolchain: stable
+      - run: rustup toolchain install # the release rust-toolchain.toml pins
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: trees
       - run: sudo apt-get update && sudo apt-get install -y fuse3
+      # The tree views mount with FUSE allow_other by default.
+      - run: echo user_allow_other | sudo tee -a /etc/fuse.conf
       - uses: ./.github/actions/pinned-git
       - run: cargo build --locked -p agentfs
       - run: ci/e2e-trees.sh
@@ -490,9 +174,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
-        with:
-          toolchain: stable
+      - run: rustup toolchain install # the release rust-toolchain.toml pins
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: csi

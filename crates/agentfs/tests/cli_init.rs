@@ -1,13 +1,14 @@
-//! `agentfs init` from the command line: safe to
-//! re-run for the same volume, refusing another volume or branch, setting
-//! `include.path` from `--include`, and creating `--root`.
+//! `agentfs init` from the command line (docs/trees.md, "Volume lifecycle"):
+//! it creates a tree volume or finds it (one id), refuses another name and
+//! another format with nothing written, writes exactly the `--include`
+//! lines of the operator settings, and records `--owner` on the new root
+//! directory only. No FUSE.
 
+use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-use std::time::Duration;
 
-use agentfs_core::lock::StateLock;
 use agentfs_core::volume::StateDir;
 
 struct Dir {
@@ -25,12 +26,8 @@ impl Dir {
         self.dir.path().join(rel)
     }
 
-    fn state(&self) -> StateDir {
-        StateDir::new(self.p("state"))
-    }
-
-    fn config(&self) -> String {
-        std::fs::read_to_string(self.p("state/git/config")).unwrap()
+    fn state(&self) -> PathBuf {
+        self.p("state")
     }
 
     fn run<I, S>(&self, args: I) -> Output
@@ -49,7 +46,7 @@ impl Dir {
                 cmd.env_remove(name);
             }
         }
-        cmd.arg("--state").arg(self.state().root());
+        cmd.arg("--state").arg(self.state());
         cmd
     }
 
@@ -68,6 +65,49 @@ impl Dir {
         std::fs::write(&path, content).unwrap();
         path
     }
+
+    /// Every file under the state area with its bytes.
+    fn files(&self) -> BTreeMap<PathBuf, Vec<u8>> {
+        fn walk(dir: &Path, out: &mut BTreeMap<PathBuf, Vec<u8>>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else {
+                    out.insert(path.clone(), std::fs::read(&path).unwrap_or_default());
+                }
+            }
+        }
+        let mut out = BTreeMap::new();
+        walk(&self.state(), &mut out);
+        out
+    }
+
+    /// `git config --file <state>/config --get-all include.path`.
+    fn includes(&self) -> Vec<String> {
+        let out = Command::new("git")
+            .args(["config", "--file"])
+            .arg(self.state().join("config"))
+            .args(["--get-all", "include.path"])
+            .output()
+            .unwrap();
+        stdout(&out).lines().map(str::to_owned).collect()
+    }
+
+    /// `git show <rev>` in the volume's history.
+    fn show(&self, rev: &str) -> String {
+        let out = Command::new("git")
+            .arg("--git-dir")
+            .arg(self.state().join("history.git"))
+            .args(["show", rev])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", stderr(&out));
+        stdout(&out)
+    }
 }
 
 fn stdout(out: &Output) -> String {
@@ -82,18 +122,17 @@ fn s(p: &Path) -> &str {
     p.to_str().unwrap()
 }
 
+/// `<name> <id> created`, then `found` with the same id; the volume may come
+/// from the environment (the downward API).
 #[test]
-fn a_rerun_for_the_same_volume_succeeds_and_changes_nothing() {
+fn created_then_found_give_one_id() {
     let d = Dir::new();
-    let out = d.ok(["init", "--volume", "demo"]);
-    assert!(out.contains("initialised volume demo in"), "{out}");
-    let before = d.config();
-    let out = d.ok(["init", "--volume", "demo"]);
-    assert!(out.contains("volume demo already initialised in"), "{out}");
-    let out = d.ok(["init", "--volume", "demo", "--branch", "agentfs/demo"]);
-    assert!(out.contains("already initialised"), "{out}");
-    assert_eq!(d.config(), before);
-    // The volume can come from the environment (the downward API).
+    let first = d.ok(["init", "--volume", "demo"]);
+    let words: Vec<&str> = first.split_whitespace().collect();
+    assert_eq!(words.len(), 3, "{first}");
+    assert_eq!((words[0], words[2]), ("demo", "created"), "{first}");
+    let again = d.ok(["init", "--volume", "demo"]);
+    assert_eq!(again.trim(), format!("demo {} found", words[1]));
     let out = d
         .command()
         .arg("init")
@@ -101,66 +140,56 @@ fn a_rerun_for_the_same_volume_succeeds_and_changes_nothing() {
         .output()
         .unwrap();
     assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(stdout(&out).trim(), format!("demo {} found", words[1]));
 }
 
+/// Another name at the same state area exits 1 and changes no byte, even
+/// with `--include` given.
 #[test]
-fn another_volume_or_branch_is_refused_and_nothing_changes() {
+fn another_name_is_refused_with_nothing_written() {
     let d = Dir::new();
     d.ok(["init", "--volume", "demo"]);
-    let before = d.config();
-    let out = d.run(["init", "--volume", "other"]);
-    assert_eq!(out.status.code(), Some(1));
+    let before = d.files();
+    let include = d.fragment("a.conf", "[agentfs]\n\tnested = exclude\n");
+    let out = d.run(["init", "--volume", "other", "--include", s(&include)]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
     assert!(
-        stderr(&out).contains("belongs to volume \"demo\", not \"other\""),
+        stderr(&out).contains("another volume is here"),
         "{}",
         stderr(&out)
     );
-    let out = d.run(["init", "--volume", "demo", "--branch", "elsewhere"]);
-    assert_eq!(out.status.code(), Some(1));
-    assert!(
-        stderr(&out).contains("branch is \"agentfs/demo\", not \"elsewhere\""),
-        "{}",
-        stderr(&out)
-    );
-    assert_eq!(d.config(), before);
+    assert_eq!(d.files(), before, "a file under the state area changed");
 }
 
+/// A recording state area is another format: refused, never converted,
+/// pointing at the runbook that moves it aside.
 #[test]
-fn a_rerun_takes_the_state_area_lock() {
+fn a_recording_state_area_is_refused_and_left_alone() {
     let d = Dir::new();
-    d.ok(["init", "--volume", "demo"]);
-    let lock = StateLock::acquire(&d.state(), "test", Duration::ZERO).unwrap();
+    agentfs_core::volume::init_with(&StateDir::new(d.state()), "demo", None, None).unwrap();
+    let before = d.files();
     let out = d.run(["init", "--volume", "demo"]);
-    assert_eq!(out.status.code(), Some(75), "{}", stderr(&out));
-    drop(lock);
-    d.ok(["init", "--volume", "demo"]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    let err = stderr(&out);
+    assert!(err.contains("holds another format"), "{err}");
+    assert!(
+        err.contains("docs/runbooks/upgrading-the-sidecar.md"),
+        "{err}"
+    );
+    assert_eq!(d.files(), before, "the recording state area changed");
 }
 
+/// `--include` writes exactly the given lines, in order, replacing the
+/// last list; without it a re-run keeps them.
 #[test]
-fn includes_are_set_once_and_replaced() {
+fn includes_are_exactly_the_given_lines() {
     let d = Dir::new();
-    let a = d.fragment(
-        "a.conf",
-        "[agentfs]\n\tpushInterval = 7s\n[remote \"origin\"]\n\turl = /srv/history.git\n",
-    );
-    let b = d.fragment("b.conf", "[agentfs]\n\tcommitWindow = 1s\n");
+    let a = d.fragment("a.conf", "[remote \"origin\"]\n\turl = /srv/history.git\n");
+    let b = d.fragment("b.conf", "[agentfs]\n\tnested = exclude\n");
     d.ok(["init", "--volume", "demo", "--include", s(&a)]);
-    d.ok(["init", "--volume", "demo", "--include", s(&a)]);
-    assert_eq!(d.config().matches("path = ").count(), 1, "{}", d.config());
-    // A remote defined only in the fragment.
-    let status = d.ok(["status"]);
-    assert!(
-        status.contains("remote:    origin /srv/history.git"),
-        "{status}"
-    );
-    // Given again with another list: exactly that list.
+    assert_eq!(d.includes(), [s(&a)]);
     d.ok(["init", "--volume", "demo", "--include", s(&b)]);
-    let config = d.config();
-    assert!(!config.contains("a.conf"), "{config}");
-    assert_eq!(config.matches("path = ").count(), 1, "{config}");
-    let status = d.ok(["status"]);
-    assert!(!status.contains("origin"), "{status}");
-    // Both, in order. Without --include, a re-run keeps them.
+    assert_eq!(d.includes(), [s(&b)]);
     d.ok([
         "init",
         "--volume",
@@ -171,30 +200,12 @@ fn includes_are_set_once_and_replaced() {
         s(&b),
     ]);
     d.ok(["init", "--volume", "demo"]);
-    let config = d.config();
-    let (ia, ib) = (
-        config.find("a.conf").unwrap(),
-        config.find("b.conf").unwrap(),
-    );
-    assert!(ia < ib, "{config}");
+    assert_eq!(d.includes(), [s(&a), s(&b)]);
 }
 
+/// A missing or relative include exits 1 before anything is written.
 #[test]
-fn a_relative_include_is_made_absolute() {
-    let d = Dir::new();
-    d.fragment("a.conf", "[agentfs]\n\tpushInterval = 7s\n");
-    let out = d
-        .command()
-        .current_dir(d.dir.path())
-        .args(["init", "--volume", "demo", "--include", "a.conf"])
-        .output()
-        .unwrap();
-    assert!(out.status.success(), "{}", stderr(&out));
-    assert!(d.config().contains(s(&d.p("a.conf"))), "{}", d.config());
-}
-
-#[test]
-fn a_missing_include_fails() {
+fn a_missing_or_relative_include_writes_nothing() {
     let d = Dir::new();
     let out = d.run([
         "init",
@@ -203,75 +214,68 @@ fn a_missing_include_fails() {
         "--include",
         s(&d.p("missing.conf")),
     ]);
-    assert_eq!(out.status.code(), Some(1));
-    assert!(stderr(&out).contains("cannot be read"), "{}", stderr(&out));
-    // Repaired by a re-run with a file that exists.
-    let good = d.fragment("good.conf", "");
-    d.ok(["init", "--volume", "demo", "--include", s(&good)]);
-    d.ok(["status"]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert!(stderr(&out).contains("no such file"), "{}", stderr(&out));
+    assert!(!d.state().exists(), "the state area was made");
+    d.fragment("a.conf", "");
+    let out = d
+        .command()
+        .current_dir(d.dir.path())
+        .args(["init", "--volume", "demo", "--include", "a.conf"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert!(stderr(&out).contains("absolute path"), "{}", stderr(&out));
+    assert!(!d.state().exists(), "the state area was made");
 }
 
+/// `--owner` is the new root directory's owner in its `dirs/` record; on a
+/// found volume it changes nothing of the root and says so. (Every found
+/// `init` recovers the volume, which appends to its journal: the root's
+/// history is what must not change.)
 #[test]
-fn root_is_created() {
+fn owner_is_recorded_at_create_only() {
     let d = Dir::new();
-    let root = d.p("data/backing");
-    let out = d.ok([
-        "--root".as_ref(),
-        root.as_os_str(),
-        "init".as_ref(),
-        "--volume".as_ref(),
-        "demo".as_ref(),
-    ]);
-    assert!(out.contains("created the backing tree"), "{out}");
-    assert!(root.is_dir());
-    use std::os::unix::fs::PermissionsExt;
-    let mode = std::fs::metadata(&root).unwrap().permissions().mode() & 0o7777;
-    // 0755 less the umask.
-    assert_eq!(mode & !0o755, 0, "{mode:o}");
-    // Existing: left alone.
-    let out = d.ok([
-        "--root".as_ref(),
-        root.as_os_str(),
-        "init".as_ref(),
-        "--volume".as_ref(),
-        "demo".as_ref(),
-    ]);
-    assert!(!out.contains("created"), "{out}");
-}
-
-#[test]
-fn existing_rule_files_are_kept() {
-    let d = Dir::new();
-    let info = d.p("state/git/info");
-    std::fs::create_dir_all(&info).unwrap();
-    std::fs::write(info.join("exclude"), "*.log\n").unwrap();
-    d.ok(["init", "--volume", "demo"]);
-    assert_eq!(
-        std::fs::read_to_string(info.join("exclude")).unwrap(),
-        "*.log\n"
-    );
-}
-
-/// Owner, 2026-10-17: "Remotes can come and go. It's not a error to have
-/// zero remotes". init takes a volume with no remote section and writes
-/// nothing to declare it; status says local-only, with no alarm. A remote
-/// section in an include makes it pushed.
-#[test]
-fn init_takes_a_volume_without_remotes() {
-    let d = Dir::new();
-    let out = d.ok(["init", "--volume", "demo"]);
-    assert!(out.contains("initialised volume demo"), "{out}");
-    assert!(!d.config().contains("remotes"), "{}", d.config());
-    let out = d.run(["status"]);
+    d.ok(["init", "--volume", "demo", "--owner", "10000:10000"]);
+    let record = d.show("root:dirs/root");
+    assert!(record.contains("\"uid\":10000"), "{record}");
+    assert!(record.contains("\"gid\":10000"), "{record}");
+    let head = d.show("root");
+    let out = d.run(["init", "--volume", "demo", "--owner", "20000:20000"]);
     assert!(out.status.success(), "{}", stderr(&out));
     assert!(
-        stdout(&out).contains("remotes:   local-only (no remote)"),
+        stderr(&out).contains("--owner applies only when the volume is created"),
         "{}",
-        stdout(&out)
+        stderr(&out)
     );
-    assert!(!stderr(&out).contains("alarm"), "{}", stderr(&out));
+    assert_eq!(d.show("root"), head, "the root's history changed");
+    assert_eq!(d.show("root:dirs/root"), record, "the root's owner changed");
+}
+
+/// `init`, `mount` and `fork end` take `--state` only: `--root` or
+/// `AGENTFS_ROOT` exits 1, so an old manifest fails loudly.
+#[test]
+fn root_is_refused() {
     let d = Dir::new();
-    let a = d.fragment("a.conf", "[remote \"origin\"]\n\turl = /srv/history.git\n");
-    d.ok(["init", "--volume", "demo", "--include", s(&a)]);
-    assert!(d.ok(["status"]).contains("remotes:   1 pushed"));
+    for args in [
+        &["--root", "b", "init", "--volume", "demo"][..],
+        &["--root", "b", "mount", "m"][..],
+        &["--root", "b", "fork", "end", "--fork-key", "k"][..],
+    ] {
+        let out = d.run(args);
+        assert_eq!(out.status.code(), Some(1), "{args:?}: {}", stderr(&out));
+        assert!(
+            stderr(&out).contains("take --state only"),
+            "{args:?}: {}",
+            stderr(&out)
+        );
+    }
+    let out = d
+        .command()
+        .args(["init", "--volume", "demo"])
+        .env("AGENTFS_ROOT", d.p("b"))
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert!(!d.state().exists(), "the state area was made");
 }

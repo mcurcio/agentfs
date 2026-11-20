@@ -1,0 +1,23 @@
+[package]
+name = "agentfs-rules"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The Rules domain of agentfs's tree views: which new names a tree records"
+
+[dependencies]
+bstr = "1.13.1"
+gix-attributes = "0.37.0"
+gix-ignore = "0.24.0"
+# Only for its `parallel` feature, which backs gix-attributes' names with
+# `Arc` instead of `Rc`, so a rule set is `Send + Sync` and shared by every
+# view's thread.
+gix-parallel = { version = "0.50.0", features = ["parallel"] }
+thiserror = "2.0.21"
+
+[dev-dependencies]
+# The fixed PATH the tree engine finds `git` on (tests/git_parity.rs).
+agentfs-align = { version = "0.1.0", path = "../agentfs-align" }
+tempfile = "3.27.0"

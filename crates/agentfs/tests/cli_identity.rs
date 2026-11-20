@@ -2,8 +2,7 @@
 //! templates, end to end through the command line: every variable from the pod flags, the `{replica}` and `{podUid}`
 //! fallbacks, the refusal of a bad template, fronts of a history service
 //! committing as their own pods, and a template change across a restart
-//! of the service. No FUSE; the mounts are in `tests/mount.rs`
-//! (`identity_templates_through_mount`).
+//! of the service. No FUSE.
 
 use std::fs;
 use std::path::PathBuf;
@@ -60,12 +59,7 @@ impl Volume {
             dir: tempfile::tempdir().unwrap(),
         };
         fs::create_dir_all(v.tree()).unwrap();
-        let out = v
-            .command()
-            .args(["init", "--volume", "demo"])
-            .output()
-            .unwrap();
-        assert!(out.status.success(), "{}", text(&out.stderr));
+        agentfs_core::volume::init_with(&v.state(), "demo", None, None).unwrap();
         v.config("agentfs.commitWindow", "10ms");
         v
     }

@@ -11,6 +11,11 @@ finds the right repository, but it can be fooled: two repositories
 whose admin directories end the same way, or a path the workload never
 meant.
 
+This runbook is for the recording engine, on recording state areas, which
+no launcher runs any more; the CSI driver runs tree volumes ([csi.md](../csi.md)). Tree volumes (the sidecar, the Docker examples and
+`agentfs mount`) never record inside a nested repository and have no
+heuristic ([trees](../trees.md#rules-and-the-untracked-area)).
+
 ## Symptoms
 
 - `agentfs.nested.gitdir_heuristic` is above zero and growing: each
@@ -31,15 +36,10 @@ agentfs was not told where the workload mounts the volume. It knows:
   when it sees only the tree's directory `DIR` (a `subPath`);
 - at a history service, the views each front reported.
 
-A sidecar whose workload container mounts the shared volume at another
-`mountPath` than the sidecar's own, and every CSI volume without
-`workloadMounts`, are such cases.
+Every CSI volume without `workloadMounts` is such a case.
 
 ## Fix
 
-- **Sidecar:** add the workload's `mountPath` to the agentfs container,
-  for example `--workload-mount /workspace`, or `/workspace=proj` for a
-  `subPath: proj`. One flag per container mount that differs.
 - **CSI:** set the `workloadMounts` StorageClass parameter (or the
   static PV's volume attribute) to the `mountPath`s pods use, comma
   separated, with the same `PATH[=DIR]` syntax

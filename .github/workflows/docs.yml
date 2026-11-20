@@ -6,7 +6,8 @@ name: docs
 # (book.toml, docs/SUMMARY.md) built, and deployed to GitHub Pages from
 # main (https://mcurcio.github.io/agentfs/); the plain-git demo of the
 # fork and upstream rules (docs/target-architecture/demo/); and the
-# README's Docker quick start run as written. Links and the configuration and
+# README's Docker quick start run as written against the image built from
+# the commit. Links and the configuration and
 # architecture references are checked against the code by the docs job
 # of ci.yml; the README's from-source quick start runs in its fuse job.
 
@@ -123,18 +124,33 @@ jobs:
       - id: deployment
         uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
 
-  # The README's "### Docker" block as written, against the published
-  # image a reader would pull (docker.yml tests the examples against the
-  # image built from the commit).
+  # The README's "### Docker" block as written, against the image built
+  # from this commit: a change to the commands the README uses lands with
+  # the image that understands them. The published image is built from the
+  # same Dockerfile and published by image.yml only after its e2e jobs pass.
   readme-docker:
     name: README Docker quick start
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      # Reads the image workflow's layer cache and writes none, as
+      # docker.yml does.
+      - name: build the image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          push: false
+          load: true
+          tags: agentfs:ci
+          cache-from: type=gha,scope=agentfs-image
+          provenance: false
       - name: FUSE and Docker
         run: |
           sudo modprobe fuse
           ls -l /dev/fuse
           docker version
       - run: ci/readme-quickstart.sh docker
+        env:
+          AGENTFS_IMAGE: agentfs:ci

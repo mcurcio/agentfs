@@ -25,14 +25,7 @@ impl Volume {
         // A remote, so that `push` has work and needs the lock.
         let profile = v.dir.path().join("profile");
         std::fs::write(&profile, "[remote \"r\"]\n\turl = /nowhere\n").unwrap();
-        let out = v.run([
-            "init".as_ref(),
-            "--volume".as_ref(),
-            "demo".as_ref(),
-            "--include".as_ref(),
-            profile.as_os_str(),
-        ]);
-        assert!(out.status.success(), "{}", stderr(&out));
+        agentfs_core::volume::init_with(&v.state(), "demo", None, Some(&[profile])).unwrap();
         v
     }
 

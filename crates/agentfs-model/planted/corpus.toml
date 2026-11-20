@@ -74,30 +74,25 @@ replace = '''
 '''
 
 [[bug]]
-id = "losing_save_applies_its_clean_lines"
+id = "mirror_ignores_a_forks_collision"
+rule = "R4"
+seeds = 64
+find = '''
+            .any(|m| m.tree == TreeId::ROOT || !m.collisions.is_empty())'''
+replace = '''
+            .any(|m| m.tree == TreeId::ROOT)'''
+
+[[bug]]
+id = "losing_change_applies_its_clean_lines"
 rule = "R3e"
 seeds = 64
 find = '''
                     (Verdict::Apply, Some(d)) => (&mut whole, d.clone()),'''
 replace = '''
-                    (Verdict::Apply, Some(_)) if lines.dir == crate::world::Direction::Landing => {
+                    (Verdict::Apply, Some(_)) => {
                         applied.push(i.version.clone());
                         continue;
-                    }
-                    (Verdict::Apply, Some(d)) => (&mut whole, d.clone()),'''
-
-[[bug]]
-id = "losing_transaction_applies_its_clean_lines"
-rule = "R5"
-seeds = 64
-find = '''
-                    (Verdict::Apply, Some(d)) => (&mut whole, d.clone()),'''
-replace = '''
-                    (Verdict::Apply, Some(_)) if lines.dir == crate::world::Direction::Transaction => {
-                        applied.push(i.version.clone());
-                        continue;
-                    }
-                    (Verdict::Apply, Some(d)) => (&mut whole, d.clone()),'''
+                    }'''
 
 [[bug]]
 id = "file_rule_loss_does_not_cost_the_change"
@@ -116,10 +111,10 @@ id = "judge_skips_one_of_a_takes_changes"
 rule = "R3e"
 seeds = 64
 find = '''
-            &self.edit_of(&self.first_parent(c), c),
-            c,
-        )'''
+        self.resolve(ours, &self.edit_of(&self.first_parent(c), c), c)'''
 replace = '''
+        self.resolve(
+            ours,
             &{
                 let mut e = self.edit_of(&self.first_parent(c), c);
                 e.pop();
@@ -152,11 +147,22 @@ id = "line_follows_the_upstreams_unfinished_last_line"
 rule = "R10.4"
 seeds = 64
 find = '''
-                for l in after {
-                    verdicts.insert((p.to_string(), l.line.clone()), Verdict::Lose(q.id.clone()));
-                }'''
+            for l in after {
+                verdicts.insert((p.to_string(), l.line.clone()), Verdict::Lose(q.id.clone()));
+            }'''
 replace = '''
-                let _ = after;'''
+            let _ = after;'''
+
+[[bug]]
+id = "unfinished_line_lands_before_a_kept_line"
+rule = "R10.8"
+seeds = 64
+find = '''
+            if let Some((line, next)) = unfinished_before_kept(&placed, &applied) {
+                verdicts.insert((p.to_string(), line), Verdict::Lose(next));
+            }'''
+replace = '''
+            let _ = (&placed, unfinished_before_kept);'''
 
 [[bug]]
 id = "hole_is_not_nul"
@@ -181,9 +187,9 @@ id = "collision_record_in_the_wrong_commit"
 rule = "R5.1"
 seeds = 64
 find = '''
-            self.record(t, Direction::Transaction, &m, &decisions, &ours, &c);'''
+                let refs = self.record(f, Direction::Transaction, &m, &decisions, &ours, &c);'''
 replace = '''
-            self.record(t, Direction::Transaction, &m, &decisions, &ours, &ours);'''
+                let refs = self.record(f, Direction::Transaction, &m, &decisions, &ours, &ours);'''
 
 [[bug]]
 id = "incoming_insert_before_the_upstreams"
@@ -280,17 +286,15 @@ replace = '''
                     files: open.clone(),'''
 
 [[bug]]
-id = "crash_drops_a_transactions_journal"
-rule = "R12"
+id = "crash_keeps_an_open_transaction"
+rule = "R5.3"
 seeds = 64
 find = '''
-    fn restart_open_unshown(&mut self, id: HandleId) {'''
-replace = '''
-    fn restart_open_unshown(&mut self, id: HandleId) {
-        if matches!(self.recording.handle(id).target, Target::Txn(..)) {
-            self.recording.remove(id);
-            return;
+        for f in open {
+            self.rollback_only(f).expect("open");
         }'''
+replace = '''
+        let _ = open;'''
 
 [[bug]]
 id = "sync_delivers_past_an_open_file"
@@ -373,16 +377,15 @@ id = "crash_drops_deferred_calls"
 rule = "R5.3"
 seeds = 64
 find = '''
-        self.queues.clear_waits();
-        let replay = self'''
+        for f in forks {
+            while self.apply_deferred(f).is_some() {}
+        }'''
 replace = '''
-        self.queues.clear_waits();
-        for f in self.forks.keys() {
-            while let Some(h) = self.queues.next_deferred(*f) {
+        for f in forks {
+            while let Some(h) = self.queues.next_deferred(f) {
                 self.recording.remove(h);
             }
-        }
-        let replay = self'''
+        }'''
 
 [[bug]]
 id = "p43a_hide_after_any_own_line"
@@ -458,3 +461,63 @@ find = '''
 replace = '''
         for &c in children.iter().take(1) {
             self.next_seq += 1;'''
+
+[[bug]]
+id = "transaction_open_holds_nothing"
+rule = "R9.18"
+seeds = 64
+find = '''
+            targets.push(Target::Txn(t, txn.id));'''
+replace = '''
+            let _ = txn;'''
+
+[[bug]]
+id = "transaction_close_wakes_nothing"
+rule = "R9.18"
+seeds = 64
+find = '''
+        // A close in a fork's transaction wakes the fork's takes too (R9.18).
+        let (Target::Tree(t) | Target::Txn(t, _)) = target;
+        self.wake(t);'''
+replace = '''
+        if let Target::Tree(t) = target {
+            self.wake(t);
+        }'''
+
+[[bug]]
+id = "transaction_save_commits"
+rule = "R5.5"
+seeds = 64
+find = '''
+                txn.index = t.clone();'''
+replace = '''
+                txn.index = t.clone();
+                let c = git_in(&self.repo, &["commit-tree", &t, "-m", "Direct\n\nAgentfs-Writer: x\nAgentfs-Cause: Direct\nAgentfs-Tree: txn/0\n"], "");
+                git(&self.repo, &["update-ref", &TreeNames::txn_branch(id), &c]);'''
+
+[[bug]]
+id = "transaction_commit_keeps_the_raw_index"
+rule = "R5.5"
+seeds = 64
+find = '''
+                let t = content::one_save(&b, &self.file(&index, &p));'''
+replace = '''
+                let t = self.file(&index, &p);'''
+
+[[bug]]
+id = "transaction_commit_always_merges"
+rule = "R6.2"
+seeds = 64
+find = '''
+            let (c, lines) = if ours == start {'''
+replace = '''
+            let (c, lines) = if false && ours == start {'''
+
+[[bug]]
+id = "transaction_that_changes_nothing_commits"
+rule = "R5.5"
+seeds = 64
+find = '''
+                (t != b).then_some((p, t))'''
+replace = '''
+                Some((p, t))'''

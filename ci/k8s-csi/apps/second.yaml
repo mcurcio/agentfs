@@ -1,0 +1,32 @@
+# A second pod on the writer's claim, for the refusal step of
+# ci/e2e-csi.sh only (not in the kustomization): ReadWriteOnce lets it
+# onto the writer's node, and the driver refuses its publish (several pods
+# on one volume are not built). The image is the one ci/e2e-csi.sh loads.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: second
+  namespace: agentfs-csi-e2e-apps
+spec:
+  automountServiceAccountToken: false
+  terminationGracePeriodSeconds: 1
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 10000
+    runAsGroup: 3000
+    fsGroup: 3001
+    fsGroupChangePolicy: OnRootMismatch
+    seccompProfile: { type: RuntimeDefault }
+  containers:
+    - name: second
+      image: agentfs:ci
+      imagePullPolicy: IfNotPresent
+      command: [sleep, infinity]
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities: { drop: [ALL] }
+      volumeMounts:
+        - { name: shared, mountPath: /data }
+  volumes:
+    - name: shared
+      persistentVolumeClaim: { claimName: shared }

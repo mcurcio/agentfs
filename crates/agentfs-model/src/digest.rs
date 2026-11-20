@@ -4,14 +4,14 @@
 //! The text holds every commit reachable from `refs/heads` and
 //! `refs/collisions`, numbered by a depth-first walk from those refs in label
 //! order: its git tree, its parents by number and its whole message. Then each
-//! of those refs, and each the shared remote holds, with the number of its tip.
+//! of those refs, and each the mirror holds, with the number of its tip.
 //! A commit id depends on the commit's date, and under
 //! [`crate::git::with_reversed_dates`] on how many git processes ran before it,
 //! so no commit id is in the text. Every tree name, as a ref or as a message's
 //! `Agentfs-Tree` or `Agentfs-Collision` field, becomes a label: `T0` the root,
 //! `T<fork id>` a fork, `X<id>` a transaction. The names come from the one place
-//! that names trees ([`TreeNames`]), so renaming a tree, the root included,
-//! changes no digest. The loser in
+//! that names trees ([`TreeNames`]), so a change to a tree's name changes no
+//! digest. The loser in
 //! `Agentfs-Collision` becomes its number. New trailers are in by default.
 //! Collision refs stay verbatim.
 
@@ -21,9 +21,10 @@ use std::path::Path;
 use crate::calls::TreeId;
 use crate::calls::TxnId;
 use crate::git::{git, git_in, try_git};
-use crate::world::{COLLISION, TreeNames, World};
+use crate::service::HistoryService;
+use crate::world::{COLLISION, TreeNames};
 
-/// Where `World::drop` writes each run's digest.
+/// Where `HistoryService::drop` writes each run's digest.
 pub const DIGEST_DIR: &str = "AGENTFS_MODEL_DIGEST_DIR";
 
 /// Set, it writes each run's canonical text beside its digest, to diff.
@@ -171,7 +172,7 @@ fn canonical_line(
     line.to_string()
 }
 
-/// The canonical text of `repo` and its shared `remote`, tree names replaced by
+/// The canonical text of `repo` and its mirror `remote`, tree names replaced by
 /// `labels`.
 fn canonical(repo: &Path, remote: &Path, labels: &BTreeMap<String, String>) -> String {
     let commits = commits(repo);
@@ -211,21 +212,21 @@ fn canonical(repo: &Path, remote: &Path, labels: &BTreeMap<String, String>) -> S
 }
 
 /// The run as one canonical text (this module's doc comment).
-pub fn canonical_text(w: &World) -> String {
-    let labels = labels_of(w.names(), w.trees(), w.txns_begun());
-    canonical(w.repo(), w.remote(), &labels)
+pub fn canonical_text(s: &HistoryService) -> String {
+    let labels = labels_of(s.names(), s.trees(), s.txns_begun());
+    canonical(s.repo(), s.mirror().repo(), &labels)
 }
 
 /// The sha of [`canonical_text`], as `git hash-object` gives it.
-pub fn digest(w: &World) -> String {
-    git_in(w.repo(), &["hash-object", "--stdin"], &canonical_text(w))
+pub fn digest(s: &HistoryService) -> String {
+    git_in(s.repo(), &["hash-object", "--stdin"], &canonical_text(s))
 }
 
 /// Writes `<name>.digest` to `dir`, and `<name>.text` when [`DIGEST_TEXT`] is
 /// set. A digest that cannot be written must fail the job.
-pub(crate) fn write(w: &World, dir: &Path, name: &str) {
-    let text = canonical_text(w);
-    let sha = git_in(w.repo(), &["hash-object", "--stdin"], &text);
+pub(crate) fn write(s: &HistoryService, dir: &Path, name: &str) {
+    let text = canonical_text(s);
+    let sha = git_in(s.repo(), &["hash-object", "--stdin"], &text);
     let write = |ext: &str, body: &str| {
         let file = dir.join(format!("{name}.{ext}"));
         std::fs::create_dir_all(dir)
@@ -241,7 +242,6 @@ pub(crate) fn write(w: &World, dir: &Path, name: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::world::MODEL_ROOT;
     use std::path::PathBuf;
 
     /// A temporary directory, removed when dropped.
@@ -281,7 +281,7 @@ mod tests {
         let (repo, remote) = (dir.0.join("repo"), dir.0.join("origin.git"));
         std::fs::create_dir_all(&repo).unwrap();
         std::fs::create_dir_all(&remote).unwrap();
-        let names = TreeNames::new(MODEL_ROOT);
+        let names = TreeNames::new();
         let root_name = names.name(TreeId::ROOT);
         git(&repo, &["init", "-q", "-b", &root_name]);
         git(&remote, &["init", "-q", "--bare", "-b", &root_name]);
@@ -374,55 +374,4 @@ R refs/collisions/1 1
 P T0 0
 P refs/collisions/1 1
 ";
-
-    /// The canonical text of one run under root name `root`: a fork's
-    /// committed transaction loses at the root (a collision), and the root and
-    /// the collision ref are replicated to the remote.
-    fn text_of_a_run_under(root: &str) -> String {
-        use crate::calls::Client;
-        use crate::world::Policies;
-        let mut w = World::new(Policies::default(), TreeNames::new(root));
-        let f = w.create_fork(TreeId::ROOT);
-        w.begin(f).expect("a transaction");
-        w.save(&Client::Fork(f), "a", 0);
-        w.save(&Client::Fork(f), "a", 2);
-        w.commit_txn(f).expect("the transaction commits");
-        let m1 = Client::Root("m1".into());
-        w.save(&m1, "a", 0);
-        w.save(&m1, "a", 1);
-        while let Some(s) = w.pending().into_iter().next() {
-            w.step(&s);
-        }
-        canonical_text(&w)
-    }
-
-    /// The root's name reaches no digest: the same run under other names,
-    /// one of them nested and one the engine's, gives the same text.
-    #[test]
-    fn the_roots_name_changes_no_digest() {
-        let text = text_of_a_run_under(MODEL_ROOT);
-        for needed in [COLLISION, "\nAgentfs-Tree: X1\n", "\nP T0 "] {
-            assert!(text.contains(needed), "no {needed:?} in:\n{text}");
-        }
-        assert!(!text.contains(MODEL_ROOT), "the root's name is in:\n{text}");
-        for root in ["main", "trunk", "team/main"] {
-            assert_eq!(text_of_a_run_under(root), text, "under {root:?}");
-        }
-    }
-
-    /// A root name that would collide with a fork's or a transaction's is
-    /// refused; any other git accepts is taken.
-    #[test]
-    fn tree_names_refuses_a_fork_or_transaction_name() {
-        for bad in ["", "fork", "txn", "fork/1", "txn/1"] {
-            let made = std::panic::catch_unwind(|| TreeNames::new(bad));
-            assert!(made.is_err(), "{bad:?} was accepted");
-        }
-        for good in ["root", "main", "forks", "team/fork"] {
-            assert_eq!(
-                TreeNames::new(good).branch(TreeId::ROOT),
-                format!("refs/heads/{good}")
-            );
-        }
-    }
 }

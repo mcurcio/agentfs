@@ -1,8 +1,11 @@
 # agentfs documentation
 
 agentfs is a FUSE filesystem that records every change to a directory in
-git history its users cannot see, pushes that history to git remotes, and
-applies patches queued from outside. This is the index of its
+git history its users cannot see. It has two engines: the tree views, which
+every launcher runs (the sidecar, the Docker examples, the CLI's `init` and
+`mount`, and the CSI driver), and the recording engine, which serves
+recording state areas, pushes their history to git remotes and applies
+patches queued from outside, and which no launcher runs any more. This is the index of its
 documentation, also published as a book at
 <https://mcurcio.github.io/agentfs/>. New here? Start with the
 [README's quick start](https://github.com/mcurcio/agentfs#quick-start).
@@ -16,13 +19,13 @@ are under [Future designs](#future-designs).
 
 | Page | For |
 |---|---|
+| [Tree views](trees.md) | What the sidecar, Docker, the CLI and the CSI driver run: `init`, `mount`, `host`, operator settings, restarting after a crash, upstreams and forks, how saves flow |
 | [Guarantees and limits](guarantees.md) | What agentfs promises, what it does not, and which test backs each claim |
-| [How agentfs records changes](recording.md) | What is recorded and when, and how records become commits |
-| [Remotes and pushing](remotes.md) | Configuring remotes, when pushes run, what a failed push does, several volumes on one repository |
-| [Tree views](trees.md) | Mounts of git-backed trees: upstreams and forks, how saves flow, running them |
-| [Operator guide](operator-guide.md) | Running `agentfs mount`: requirements, layout, flags, settings, permissions, what is recorded when, lifecycle, the state-area lock, crashes, recovery, LFS, databases, troubleshooting, several mounts of one volume |
-| [Patches](patches.md) | Changing a volume's files from outside it through the patch queue |
-| [Forked volumes](forks.md) | A sandbox's copy of a volume that publishes one change for review, and delivering that change |
+| [How agentfs records changes](recording.md) | The recording engine: what is recorded and when, and how records become commits |
+| [Remotes and pushing](remotes.md) | The recording engine's remotes: configuring them, when pushes run, what a failed push does, several volumes on one repository. Tree volumes push to no remote yet |
+| [Operator guide](operator-guide.md) | Running the recording engine (`serve-history` and `front`) on a recording state area: requirements, layout, flags, settings, permissions, what is recorded when, lifecycle, the state-area lock, crashes, recovery, LFS, databases, troubleshooting, several mounts of one volume |
+| [Patches](patches.md) | Changing a recording volume's files from outside it through the patch queue. Not built on tree volumes |
+| [Forked volumes](forks.md) | The recording engine's forked volumes: a copy of a volume that publishes one change for review, and delivering that change |
 | [Telemetry](telemetry.md) | Turning on OpenTelemetry export, what is exported, and the example alerts |
 | [Configuration reference](configuration.md) | Every git config key, operator attribute, flag and environment variable (checked against the code in CI) |
 | [Supported configurations](supported-configurations.md) | The dimensions a configuration varies on (integration point, sharing, remotes, knobs), built or designed, and named example configurations to check a design against |
@@ -40,8 +43,8 @@ are under [Future designs](#future-designs).
 | Page | For |
 |---|---|
 | [Docker](docker.md) | The agentfs container and workload containers, with `docker run` and Compose |
-| [Kubernetes sidecar](deployment.md) | The container image and the privileged native sidecar, with the alert rules and the sandbox overlay |
-| [CSI driver](csi.md) | Volumes as claims for unprivileged pods, several pods per volume on one node, forks |
+| [Kubernetes sidecar](deployment.md) | The container image and the privileged native sidecar on tree views, with the alert rules and Hermes |
+| [CSI driver](csi.md) | Tree volumes as claims for unprivileged pods: one `agentfs host` per volume, one pod per claim, fork claims landing in their source, kept volumes |
 | [Helm charts](helm.md) | The CSI driver chart and the sidecar library chart |
 
 ## Runbooks
@@ -59,15 +62,14 @@ that point to it.
 | [The patch queue](runbooks/patch-queue.md) | A held patch or a blocked queue (`PatchHeld`, `PatchBlocked`, `PatchRuleFailed`), patches held after an unclean stop (`PatchQueueDeferred`), a notice that failed (`NotifyFailed`), a refused push to `serve-git`, a fork of a fork whose parent finished first (`ForkParentFinished`), a fork that finished with patches its change does not carry (`ForkInboxNotCarried`) |
 | [LFS storage](runbooks/lfs-storage.md) | The LFS cache's size, pruning and fetching objects |
 | [A crashed sidecar](runbooks/crashed-sidecar.md) | The daemon died in a pod |
-| [Upgrading the sidecar](runbooks/upgrading-the-sidecar.md) | Rolling out a new image for the sidecar |
+| [Upgrading the sidecar](runbooks/upgrading-the-sidecar.md) | Rolling out a new image for the sidecar, and moving a recording volume onto a tree volume |
 | [The history service is down](runbooks/history-service-down.md) | Fronts failing with `EIO` (`HistoryServiceUnavailable`) |
-| [Recovering CSI volumes](runbooks/csi-recovery.md) | Incidents under the CSI driver |
-| [Moving a volume to another node](runbooks/moving.md) | A node lost or retired: a new volume started from the old branch |
+| [Recovering CSI volumes](runbooks/csi-recovery.md) | Incidents under the CSI driver: a crashed host, a plugin upgrade, a pod that will not mount, a claim that will not delete |
+| [Moving a CSI volume](runbooks/moving.md) | A recording-format CSI volume never served (`FAILED_PRECONDITION` naming it), or a volume's files wanted on another node |
 | [The start branch moved](runbooks/start-branch-moved.md) | `StartBranchMoved`: the old branch received commits after a move |
 | [A fork's publish is refused](runbooks/fork-refused.md) | `ForkRefused`, by reason |
 | [A moved directory could not be reconciled](runbooks/reconcile-failed.md) | `ReconcileFailed` |
 | [Worktree paths found by the heuristic](runbooks/worktree-heuristic.md) | `agentfs.nested.gitdir_heuristic` counting |
-| [The sandbox overlay](runbooks/sandbox-overlay.md) | The overlay refuses to start, a sandbox cannot save, tmp files gone, both mounts stopped, sandboxes still on a dead mount (`agentfs.sandbox_overlay.refusals`) |
 
 ## How it works
 
@@ -85,6 +87,8 @@ that point to it.
 [Overview](target-architecture/README.md). The designs of slices that are not
 built are under `target-architecture/`; the baseline pages are listed above. When
 a slice is built, its page is deleted and the behaviour is in the pages above.
+The plan from today's two engines to one is
+[One engine](target-architecture/future/one-engine.md).
 
 ## The project
 

@@ -1,39 +1,39 @@
 #!/usr/bin/env bash
-# End-to-end test of the CSI driver (docs/csi.md) in a kind
-# cluster: deploys ci/k8s-csi/driver (the CI overlay of deploy/csi) and
-# ci/k8s-csi/apps, and checks, from real pods:
+# End-to-end test of the CSI driver (docs/csi.md) on the tree engine in a
+# kind cluster: deploys ci/k8s-csi/driver (the CI overlay of deploy/csi)
+# and ci/k8s-csi/apps, and checks, from real pods:
 #
-#   - deploy/csi passes server-side validation, the driver registers on
-#     the node with its topology, the RBAC inventory holds (`kubectl auth
-#     can-i`: the node plugin's account is csi-provisioner's, and its token
-#     reaches no other container), the class admission policy refuses
-#     a class with reclaim policy Retain, and the provisioner policy
-#     refuses that account another driver's PV, and this driver's without
-#     a token naming the PV's node (every claim below is provisioned and
-#     deleted through it, with the real token);
-#   - two restricted pods (uid 10000 and 10001, primary groups 3000 and
-#     3001, one fsGroup) on one RWO claim, its PV pinned to the node by the
-#     driver's topology, both write; the remote branch
-#     on the runner's git server gets commits from both, with distinct
-#     committers, pod trailers and uid authors; `agentfs status` in the
-#     node plugin shows the service and two fronts;
-#   - both pods create the same new names at once, through their
-#     supplementary fsGroup, without an error (the plugin's hostPID);
-#   - kill -9 of writer-a's front: writer-b is unaffected, writer-a's
-#     front restarts in the same slot and its mount comes back live
-#     (HostToContainer), and what it writes is pushed;
-#   - kill -9 of the history service right after a write: the write is
-#     committed and pushed after the restart, and writes resume;
-#   - deleting the node plugin pod: the new one reconciles, writer-a
-#     recovers live, writer-b after a container restart;
-#     a patch queued before it must not land under the running pods
-#     (bead agentfs-4do; a landing fails the script at its end);
-#   - an inline (ephemeral) volume and a ReadWriteMany claim are refused;
-#   - a restore and a revert run from the node plugin reach both pods at
-#     once and are pushed;
-#   - deleting the pods unpublishes and unstages (no mounts left, the
-#     socket gone, the final commit made), and deleting the claim removes
-#     the volume directory once the remote holds its head.
+#   (a) deploy/csi passes server-side validation;
+#   (b) the driver registers on the node with its topology;
+#   (c) the RBAC inventory holds (`kubectl auth can-i`: the node plugin's
+#       account is csi-provisioner's, and its token reaches no other
+#       container), the class admission policy refuses a class with reclaim
+#       policy Retain, and the provisioner policy refuses that account
+#       another driver's PV, and this driver's without a token naming the
+#       PV's node (every claim below is provisioned and deleted through it,
+#       with the real token);
+#   (d) one restricted writer (uid 10000, primary group 3000, fsGroup 3001)
+#       on a RWO claim, its PV pinned to the node by the driver's topology;
+#       one `agentfs host` runs the volume, and the writer's /data is a view
+#       of it (source agentfs:<volume>) at the kubelet's target;
+#   (e) the writer's files, created through its fsGroup, are in the
+#       volume's history (`<base>/<pv>/state/history.git`, ref root), with
+#       Agentfs-Pod and Agentfs-Namespace trailers naming the pod;
+#   (f) the profile's remote is logged as not built at the host's boot, and
+#       the runner's git server never gets a ref;
+#   (g) a second pod on the claim gets a FailedMount event: several pods on
+#       one volume are not built;
+#   (h) kill -9 of the volume's host: the plugin starts a new one, the
+#       writer's mount comes back live (HostToContainer), and a new write
+#       is recorded;
+#   (i) deleting the node plugin pod: the new one reconciles, the writer's
+#       mount comes back live, and a new write is recorded;
+#   (j) an inline (ephemeral) volume and a ReadWriteMany claim are refused,
+#       and claims of classes with onDelete: delete and startFrom stay
+#       Pending, each with a ProvisioningFailed event naming the refusal;
+#   (k) deleting the writer leaves no view of the volume on the node and no
+#       host; deleting the claim deletes the PV and keeps the volume's
+#       directory (csi.retained.json) and its history.
 #
 # Needs docker, kind and kubectl (ci/install-kind.sh), a kind cluster
 # $KIND_CLUSTER (default agentfs-csi) with the image agentfs:ci loaded,
@@ -54,6 +54,7 @@
 # The FUSE module must be loaded on the host (modprobe fuse).
 
 . "$(dirname "$0")/lib.sh"
+. "$(dirname "$0")/tree-git-test-lib.sh"
 
 KIND_CLUSTER=${KIND_CLUSTER:-agentfs-csi}
 NODE=$KIND_CLUSTER-control-plane
@@ -61,7 +62,6 @@ DNS=agentfs-csi
 APPS=agentfs-csi-e2e-apps
 DRIVER=agentfs.mcurcio.github.io
 BASE=/var/lib/agentfs-csi/volumes
-NODE_STATE=/var/lib/agentfs-csi/node
 PLUGIN_LABEL=app.kubernetes.io/name=agentfs-csi-node
 LOGS=${E2E_CSI_LOGS:-${RUNNER_TEMP:-/tmp}/agentfs-csi-kind-logs}
 mkdir -p "$LOGS"
@@ -71,7 +71,7 @@ ka() { kubectl -n "$APPS" "$@"; }
 
 gateway() {
   docker network inspect kind -f '{{range .IPAM.Config}}{{.Gateway}} {{end}}' |
-    tr ' ' '\n' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -n1
+    tr ' ' '\n' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | sed -n 1p
 }
 
 diagnose() {
@@ -82,6 +82,7 @@ diagnose() {
   kubectl get csidriver,csinode,pv -o wide
   ka get pvc,pods -o wide
   ka describe pods
+  ka describe pvc
   kd describe pods
   ka get events --sort-by=.lastTimestamp | tail -n 60
   kd get events --sort-by=.lastTimestamp | tail -n 40
@@ -97,6 +98,8 @@ diagnose() {
   docker exec "$NODE" sh -c "grep -E 'agentfs|fuse|kubernetes.io~csi' /proc/self/mountinfo"
   echo "---- node processes"
   docker exec "$NODE" sh -c "ps -eo pid,args | grep -E 'agentfs|tini' | grep -v grep"
+  echo "---- volumes on the node"
+  docker exec "$NODE" sh -c "ls -la $BASE $BASE/* 2>&1"
   echo "---- git server"
   tail -n 40 "${GIT_SERVER_DIR:-/nonexistent}"/logs/*.log 2>/dev/null
   return 0
@@ -111,7 +114,6 @@ esac
 
 : "${GIT_SERVER_REPOS:?start ci/git-http-server.sh first}" "${GIT_SERVER_HTPASSWD:?}"
 REMOTE=$GIT_SERVER_REPOS/history.git
-rgit() { git --git-dir "$REMOTE" "$@"; }
 
 set_password() { # user password
   local others
@@ -120,51 +122,48 @@ set_password() { # user password
     >"$GIT_SERVER_HTPASSWD"
 }
 
-# Waits until the remote branch has <path> with <content>.
-wait_remote() { # path content [seconds]
-  local deadline=$((SECONDS + ${3:-90}))
-  until [ "$(rgit show "$BRANCH:$1" 2>/dev/null)" = "$2" ]; do
-    [ $SECONDS -lt $deadline ] || fail "the remote never had $1 = '$2'"
-    sleep 1
-  done
-  pass "remote has $1"
-}
-
-# Of the newest remote commit that touched <path>.
-remote_committer() { rgit log -1 --format=%cn "$BRANCH" -- "$1"; }
-remote_committer_email() { rgit log -1 --format=%ce "$BRANCH" -- "$1"; }
-remote_author() { rgit log -1 --format=%an "$BRANCH" -- "$1"; }
-remote_message() { rgit log -1 --format=%B "$BRANCH" -- "$1"; }
-
 plugin_pod() {
   kd get pod -l "$PLUGIN_LABEL" -o go-template \
     --template '{{range .items}}{{if not .metadata.deletionTimestamp}}{{.metadata.name}}{{"\n"}}{{end}}{{end}}' |
-    head -n1
+    sed -n 1p
 }
 in_plugin() { kd exec "$(plugin_pod)" -c agentfs-csi -- "$@"; }
 plugin_log() { kd logs "$(plugin_pod)" -c agentfs-csi; }
 
-# Runs a shell command in a writer.
-in_pod() { ka exec "$1" -- sh -c "$2"; }
+# git on the volume's history, in the node plugin.
+hgit() { in_plugin git --git-dir "$BASE/$PV/state/history.git" "$@"; }
+# Where <path>'s bytes are in a tree commit (docs/trees.md).
+file_rev() { echo "root:files/$(tree_git_fanned "$1")"; }
 
-# Waits up to <seconds> for <pod> to write <file> (the mount works).
-wait_writable() { # pod file content seconds
-  local deadline=$((SECONDS + $4)) out
-  until out=$(in_pod "$1" "printf '$3' > /data/$2" 2>&1); do
-    [ $SECONDS -lt $deadline ] || fail "$1 could not write $2 within $4 s: $out"
+# History is built behind the calls: waits until the root's history has
+# <path> with <content>.
+wait_history() { # path content [seconds]
+  local deadline=$((SECONDS + ${3:-90}))
+  until [ "$(hgit show "$(file_rev "$1")" 2>/dev/null)" = "$2" ]; do
+    [ $SECONDS -lt $deadline ] || fail "the volume's history never had $1 = '$2'"
     sleep 1
   done
-  pass "$1 wrote $2"
+  pass "the history has $1"
+}
+# The message of the newest root commit that recorded <path>.
+history_message() { hgit log -1 --format=%B root -- "files/$(tree_git_fanned "$1")"; }
+# The uid the history records <path> with (lines/ metadata).
+history_uid() {
+  hgit show "root:lines/$(tree_git_fanned "$1")" | grep -o '"uid":[0-9]*' | cut -d: -f2
 }
 
-# Waits until no write of <pod> succeeds (its mount is broken).
-wait_broken() { # pod seconds
-  local deadline=$((SECONDS + $2))
-  while in_pod "$1" "printf x > /data/probe-$1.txt" >/dev/null 2>&1; do
-    [ $SECONDS -lt $deadline ] || fail "$1's writes still succeed"
-    sleep 0.5
+# Runs a shell command in a pod of the apps namespace.
+in_pod() { ka exec "$1" -- sh -c "$2"; }
+
+# Waits until the writer reads a.txt, which only a live view of the volume
+# shows: its mount is back.
+wait_live() { # seconds
+  local deadline=$((SECONDS + $1))
+  until [ "$(in_pod writer 'cat /data/a.txt' 2>/dev/null)" = a ]; do
+    [ $SECONDS -lt $deadline ] || fail "the writer's view never came back within $1 s"
+    sleep 1
   done
-  pass "$1's mount is broken"
+  pass "the writer's view is live"
 }
 
 # Waits for an event on <object> whose message contains <text>.
@@ -179,8 +178,22 @@ wait_event() { # object-name reason text seconds
   pass "$1: $2 names '$3'"
 }
 
+# The pids and command lines of the processes on the node whose command
+# line matches the glob <pattern>, one per line. (The node image has no
+# pgrep.)
+node_procs() { # pattern
+  docker exec "$NODE" sh -c '
+    for d in /proc/[0-9]*; do
+      [ "${d#/proc/}" = $$ ] && continue
+      c=$(tr "\\0" " " <"$d/cmdline" 2>/dev/null) || continue
+      case "$c" in
+        $1) echo "${d#/proc/} $c" ;;
+      esac
+    done' sh "$1"
+}
+
 # SIGKILLs every process on the node whose command line matches the glob
-# <pattern>; fails if there is none. (The node image has no pkill.)
+# <pattern>; fails if there is none.
 node_kill() { # pattern
   docker exec "$NODE" sh -c '
     found=1
@@ -193,6 +206,34 @@ node_kill() { # pattern
     done
     exit $found' sh "$1"
 }
+
+# The volume's host: `agentfs --state <base>/<pv>/state host ...`.
+host_pattern() { echo "*--state $BASE/$PV/state host *"; }
+host_pids() { node_procs "$(host_pattern)" | cut -d' ' -f1; }
+# Waits until exactly one host of the volume runs, other than pid <old>;
+# sets HOST_PID.
+wait_host() { # [old-pid] [seconds]
+  local deadline=$((SECONDS + ${2:-120})) pids
+  while :; do
+    pids=$(host_pids)
+    if [ "$(printf '%s' "$pids" | grep -c .)" = 1 ] && [ "$pids" != "${1:-}" ]; then
+      HOST_PID=$pids
+      break
+    fi
+    [ $SECONDS -lt $deadline ] || fail "no single new host of $PV (old: ${1:-none}; now: $(node_procs "$(host_pattern)"))"
+    sleep 1
+  done
+  pass "one host of $PV runs (pid $HOST_PID)"
+}
+
+# How many times the plugin's log has the host's not-built line for the
+# profile's remote: once per boot of the host under this plugin.
+not_built_lines() {
+  plugin_log | grep -cF "[host $PV] not built: remote.origin.url (push): " || true
+}
+
+# The node's mounts whose source is the volume's view (agentfs:<volume>).
+view_mounts() { docker exec "$NODE" grep -F " agentfs:$VOLUME" /proc/self/mountinfo || true; }
 
 # `yes` or `no` for the service account <sa> of the driver's namespace.
 can_i() { # sa verb resource [namespace]
@@ -245,7 +286,7 @@ kd wait --for=condition=Ready pod -l "$PLUGIN_LABEL" --timeout=300s >/dev/null |
   fail "the node plugin never became Ready"
 pass "the node plugin is Ready"
 deadline=$((SECONDS + 120))
-until kubectl get csinode "$NODE_NAME" -o jsonpath='{.spec.drivers[*].name}' | grep -qw "$DRIVER"; do
+until kubectl get csinode "$NODE_NAME" -o jsonpath='{.spec.drivers[*].name}' | grep -w "$DRIVER" >/dev/null; do
   [ $SECONDS -lt $deadline ] || fail "the CSINode of $NODE_NAME never listed $DRIVER"
   sleep 1
 done
@@ -336,128 +377,100 @@ assert_contains "$denied" "PVs of the agentfs driver" "named as another driver's
 out=$(pv_as_node "$DRIVER") && fail "a PV created with a token naming no node was admitted: $out"
 assert_contains "$out" "pinned to its own node" "this driver's PV needs a token bound to a pod on its node"
 
-step "(d) two restricted pods on one claim"
+step "(d) one restricted writer on a claim"
 kubectl apply -k ci/k8s-csi/apps
-ka wait --for=condition=Ready pod/writer-a pod/writer-b --timeout=300s >/dev/null ||
-  fail "the writers never became Ready"
-pass "writer-a and writer-b are Ready (admitted under restricted)"
+ka wait --for=condition=Ready pod/writer --timeout=300s >/dev/null ||
+  fail "the writer never became Ready"
+pass "the writer is Ready (admitted under restricted)"
 PV=$(ka get pvc shared -o jsonpath='{.spec.volumeName}')
 [ -n "$PV" ] || fail "the claim is not bound"
-# The default volumeName: {pvcNamespace}.{pvcName}.{pvName}.
-VOLUME=$APPS.shared.$PV
-BRANCH=agentfs/$VOLUME
-STATE=$BASE/$PV/state
-SOCK=$NODE_STATE/run/$PV/history.sock
-UID_A=$(ka get pod writer-a -o jsonpath='{.metadata.uid}')
-UID_B=$(ka get pod writer-b -o jsonpath='{.metadata.uid}')
-echo "volume $PV, writer-a $UID_A, writer-b $UID_B"
+WRITER_UID=$(ka get pod writer -o jsonpath='{.metadata.uid}')
 assert_eq "$TOPOLOGY $NODE_NAME" \
   "$(kubectl get pv "$PV" -o jsonpath='{.spec.nodeAffinity.required.nodeSelectorTerms[0].matchExpressions[0].key} {.spec.nodeAffinity.required.nodeSelectorTerms[0].matchExpressions[0].values[0]}')" \
-  "the PV is pinned to the node that holds its worktree"
+  "the PV is pinned to the node that holds its volume"
+created=$(plugin_log | grep -F "created volume $PV on node $NODE_NAME (agentfs volume " || true)
+[ -n "$created" ] || fail "the plugin never logged: created volume $PV on node $NODE_NAME"
+VOLUME=$(sed -n 's/.*(agentfs volume \([^,]*\), profile ci).*/\1/p' <<<"$created" | sed -n 1p)
+[ -n "$VOLUME" ] || fail "no agentfs volume or profile ci in: $created"
+pass "created volume $PV (agentfs volume $VOLUME, profile ci)"
+echo "volume $PV ($VOLUME), writer $WRITER_UID"
+docker exec "$NODE" test -f "$BASE/$PV/csi.json" || fail "no $BASE/$PV/csi.json on the node"
+docker exec "$NODE" test -d "$BASE/$PV/state/history.git" || fail "no $BASE/$PV/state/history.git on the node"
+pass "the volume is at $BASE/$PV (csi.json, state/history.git)"
+wait_host
+assert_contains "$(node_procs "$(host_pattern)")" "host --launcher csi --volume $VOLUME" \
+  "the host runs under launcher csi, guarded by the volume's name"
+mounts=$(view_mounts)
+echo "$mounts"
+assert_contains "$mounts" "kubernetes.io~csi/$PV/mount" "the view is mounted at the kubelet's target"
+assert_contains "$mounts" "fuse.agentfs agentfs:$VOLUME " "the view is an agentfs FUSE mount of $VOLUME"
 
-step "(e) both pods write; commits from both reach the remote"
-# A group-writable directory: fsGroup gives it the group, umask the mode.
-in_pod writer-a 'umask 002 && printf a > /data/a.txt && mkdir -p /data/shared && printf a > /data/shared/from-a.txt'
-in_pod writer-b 'printf b > /data/b.txt && printf b > /data/shared/from-b.txt'
-assert_eq a "$(in_pod writer-b 'cat /data/a.txt')" "writer-b reads writer-a's file"
-assert_eq "10000 10000" "$(in_pod writer-a 'stat -c "%u %g" /data/a.txt')" "writer-a's file is uid 10000, fsGroup 10000"
-assert_eq "10001 10000" "$(in_pod writer-b 'stat -c "%u %g" /data/b.txt')" "writer-b's file is uid 10001, fsGroup 10000"
-wait_remote a.txt a
-wait_remote b.txt b
-wait_remote shared/from-a.txt a
-wait_remote shared/from-b.txt b
-assert_eq writer-a "$(remote_committer a.txt)" "a.txt committed by writer-a"
-assert_eq writer-b "$(remote_committer b.txt)" "b.txt committed by writer-b"
-email_a=$(remote_committer_email a.txt)
-email_b=$(remote_committer_email b.txt)
-[ "$email_a" != "$email_b" ] || fail "the committers share an email: $email_a"
-pass "distinct committer emails ($email_a, $email_b)"
-assert_eq "writer-a.$UID_A@$APPS.$VOLUME.csi.invalid" "$email_a" "writer-a's email from {pod}.{podUid}@{namespace}.{volume}"
-assert_eq "writer-b.$UID_B@$APPS.$VOLUME.csi.invalid" "$email_b" "writer-b's email from the same template"
-assert_eq uid-10000 "$(remote_author a.txt)" "a.txt authored by uid-10000"
-assert_eq uid-10001 "$(remote_author b.txt)" "b.txt authored by uid-10001"
-msg=$(remote_message b.txt)
-assert_contains "$msg" "Agentfs-Pod: writer-b" "pod trailer"
+step "(e) the writer's files are in the volume's history, naming the pod"
+assert_eq 3001 "$(in_pod writer 'stat -c %g /data')" "the kubelet gave the volume's root the fsGroup"
+# Not the writer's own directory, nor its primary group: the creates go
+# through the supplementary fsGroup.
+[ "$(in_pod writer 'stat -c %u /data')" != 10000 ] || fail "the volume's root is the writer's own"
+in_pod writer 'umask 002 && printf a > /data/a.txt && mkdir /data/notes && printf b > /data/notes/b.txt'
+assert_eq "10000 3001" "$(in_pod writer 'stat -c "%u %g" /data/a.txt')" "a.txt is uid 10000, fsGroup 3001"
+assert_eq 3001 "$(in_pod writer 'stat -c %g /data/notes/b.txt')" "notes/b.txt carries the fsGroup"
+wait_history a.txt a
+wait_history notes/b.txt b
+assert_eq 10000 "$(history_uid a.txt)" "the history records a.txt as uid 10000's"
+msg=$(history_message a.txt)
+echo "$msg"
+assert_contains "$msg" "Agentfs-Pod: writer" "pod trailer"
 assert_contains "$msg" "Agentfs-Namespace: $APPS" "namespace trailer"
-assert_contains "$msg" "Agentfs-Node: $NODE_NAME" "node trailer"
-status=$(in_plugin agentfs --state "$STATE" status)
-echo "$status"
-assert_contains "$status" "history:   serving fronts at unix:$SOCK" "status shows the history service"
-assert_contains "$status" "pod=writer-a" "status lists writer-a's front"
-assert_contains "$status" "pod=writer-b" "status lists writer-b's front"
-SLOT_A=$(sed -n 's/^fronts: *slot \([0-9]*\): .*pod=writer-a .*/\1/p' <<<"$status")
-[ -n "$SLOT_A" ] || fail "no slot for writer-a in: $status"
-
-step "(e2) both pods create the same new names at once"
-# runAsGroup is not the fsGroup: each pod may create in the shared
-# directory only through its supplementary fsGroup, which its front sees
-# through the node plugin's hostPID. Each loop opens f$i with O_CREAT and
-# no O_EXCL: one pod creates, the other opens what the first made, and
-# neither may get EACCES from a file briefly root's.
-in_pod writer-a 'umask 002 && mkdir -p /data/race'
-race_loop='umask 002; i=0; while [ $i -lt 40 ]; do echo x >> /data/race/f$i || exit 1; i=$((i+1)); done'
-in_pod writer-a "$race_loop" >"$LOGS/race-a.log" 2>&1 & race_a=$!
-in_pod writer-b "$race_loop" >"$LOGS/race-b.log" 2>&1 & race_b=$!
-wait "$race_a" || fail "writer-a's creates failed: $(cat "$LOGS/race-a.log")"
-wait "$race_b" || fail "writer-b's creates failed: $(cat "$LOGS/race-b.log")"
-pass "40 racing creates from each pod all succeeded"
-assert_eq "x x" "$(in_pod writer-b 'cat /data/race/f39' | xargs)" "both pods appended to f39"
-assert_eq 10000 "$(in_pod writer-a 'stat -c %g /data/race/f0 /data/race/f39 | sort -u')" \
-  "the racing files carry the fsGroup"
-if plugin_log | grep -q "process id is 0"; then
-  fail "a front could not see a pod's process (hostPID): $(plugin_log | grep 'process id is 0')"
+assert_contains "$msg" "Agentfs-Pod-Uid: $WRITER_UID" "pod uid trailer"
+assert_contains "$msg" "Agentfs-Volume: $VOLUME" "volume trailer"
+if plugin_log | grep "process id is 0" >/dev/null; then
+  fail "the host could not see a pod's process (hostPID): $(plugin_log | grep 'process id is 0')"
 fi
-pass "every front saw its callers' groups"
+pass "the host saw its callers' groups"
 
-step "(f) kill -9 writer-a's front: it restarts in its slot, live"
-node_kill "*--pod-uid $UID_A *" || fail "no front of writer-a to kill"
-pass "killed writer-a's front"
-wait_broken writer-a 30
-in_pod writer-b 'printf during > /data/during-front-crash.txt'
-pass "writer-b keeps working"
-wait_writable writer-a after-crash.txt after 60
-wait_remote after-crash.txt after
-assert_eq writer-a "$(remote_committer after-crash.txt)" "after-crash.txt committed by writer-a"
-wait_remote during-front-crash.txt during
-log=$(plugin_log)
-assert_contains "$log" "front for $APPS/writer-a exited" "the plugin saw the front exit"
-assert_contains "$log" "restarted in slot $SLOT_A" "the front restarted in slot $SLOT_A"
+step "(f) the profile's remote is logged as not built, and never reached"
+BOOTS=$(not_built_lines)
+[ "$BOOTS" -ge 1 ] || fail "the host never logged: not built: remote.origin.url (push)"
+pass "the host's boot logged: not built: remote.origin.url (push)"
+refs=$(git ls-remote "$REMOTE")
+[ -z "$refs" ] || fail "the runner's git server got refs: $refs"
+pass "the runner's git server has no ref"
 
-step "(g) kill -9 the history service right after a write"
-in_pod writer-b 'printf journaled > /data/before-service-crash.txt'
-node_kill "*--state $STATE --root * serve-history *" || fail "no history service to kill"
-pass "killed the history service"
-wait_remote before-service-crash.txt journaled 120
-assert_eq writer-b "$(remote_committer before-service-crash.txt)" "the journaled write keeps its committer"
-wait_writable writer-a after-service-crash.txt again 60
-wait_remote after-service-crash.txt again
-assert_contains "$(plugin_log)" "service for $PV exited" "the plugin restarted the service"
+step "(g) a second pod on the claim is refused"
+kubectl apply -f ci/k8s-csi/apps/second.yaml
+wait_event second FailedMount "several pods on one volume are not built" 180
+in_pod writer 'printf during > /data/during-second.txt'
+wait_history during-second.txt during
+ka delete pod second --wait --timeout=120s
+assert_eq 1 "$(printf '%s\n' "$(host_pids)" | grep -c .)" "one host still runs the volume"
 
-step "(h) restart the node plugin: reconcile"
-# Bead agentfs-4do: a patch queued while both pods run (plain git, as
-# docs/runbooks/patch-queue.md "With plain git") must not land under them
-# when the plugin restarts: reconcile starts the service with
-# --workload-attached, the pods being published. Checked after the
-# restart; a landing fails the script at its end, so the rest still runs.
-PATCH_FILE=patched-under-pod.txt
-patch_head=$(rgit rev-parse "$BRANCH")
-patch_blob=$(printf landed | rgit hash-object -w --stdin)
-patch_index=$(mktemp -u)
-GIT_INDEX_FILE=$patch_index rgit read-tree "$patch_head"
-GIT_INDEX_FILE=$patch_index rgit update-index --add --cacheinfo "100644,$patch_blob,$PATCH_FILE"
-patch_tree=$(GIT_INDEX_FILE=$patch_index rgit write-tree)
-rm -f "$patch_index"
-patch_tip=$(GIT_AUTHOR_NAME=producer GIT_AUTHOR_EMAIL=producer@example.com \
-  GIT_COMMITTER_NAME=producer GIT_COMMITTER_EMAIL=producer@example.com \
-  rgit commit-tree "$patch_tree" -p "$patch_head" -m "agentfs-4do: a patch queued under live pods")
-rgit update-ref "refs/agentfs/$VOLUME/inbox/0000000001" "$patch_tip" ""
-pass "queued patch 1 ($patch_tip) adding $PATCH_FILE while writer-a and writer-b run"
+step "(h) kill -9 the volume's host: a new one serves the writer, live"
+OLD_HOST=$HOST_PID
+node_kill "$(host_pattern)" || fail "no host of $PV to kill"
+pass "killed the host (pid $OLD_HOST)"
+wait_host "$OLD_HOST"
+deadline=$((SECONDS + 120))
+until [ "$(not_built_lines)" -gt "$BOOTS" ]; do
+  [ $SECONDS -lt $deadline ] || fail "the new host never booted (one not-built line)"
+  sleep 1
+done
+pass "the new host booted (its not-built line logged again)"
+wait_live 120
+in_pod writer 'printf after > /data/after-host-crash.txt' || fail "the writer could not write after the host's restart"
+wait_history after-host-crash.txt after
+assert_eq 10000 "$(history_uid after-host-crash.txt)" "the write after the crash is recorded as the writer's"
+
+step "(i) restart the node plugin: reconcile"
 OLD_PLUGIN=$(plugin_pod)
+OLD_HOST=$HOST_PID
 kd logs -f "$OLD_PLUGIN" -c agentfs-csi >"$LOGS/old-plugin.log" 2>&1 &
 FOLLOWER=$!
 kd delete pod "$OLD_PLUGIN" --wait --timeout=120s
 for _ in $(seq 30); do kill -0 "$FOLLOWER" 2>/dev/null || break; sleep 1; done
 kill "$FOLLOWER" 2>/dev/null || true
+if docker exec "$NODE" kill -0 "$OLD_HOST" 2>/dev/null; then
+  fail "the old plugin's host (pid $OLD_HOST) outlived it"
+fi
+pass "the old plugin's host exited with it"
 deadline=$((SECONDS + 300))
 until NEW_PLUGIN=$(plugin_pod) && [ -n "$NEW_PLUGIN" ] && [ "$NEW_PLUGIN" != "$OLD_PLUGIN" ]; do
   [ $SECONDS -lt $deadline ] || fail "the node plugin was not recreated"
@@ -466,100 +479,57 @@ done
 kd wait --for=condition=Ready "pod/$NEW_PLUGIN" --timeout=300s >/dev/null ||
   fail "the new node plugin never became Ready"
 pass "new node plugin $NEW_PLUGIN"
-log=$(plugin_log)
-assert_contains "$log" "reconcile: started the history service for $PV" "reconcile restarted the service"
-assert_contains "$log" "reconcile: recovering the front for $APPS/writer-a" "reconcile recovers writer-a's front"
-assert_contains "$log" "reconcile: recovering the front for $APPS/writer-b" "reconcile recovers writer-b's front"
-wait_writable writer-a after-restart-a.txt a2 90
-ka exec writer-b -- sh -c 'kill 1' || true
-deadline=$((SECONDS + 120))
-until [ "$(ka get pod writer-b -o jsonpath='{.status.containerStatuses[0].restartCount}')" -ge 1 ]; do
-  [ $SECONDS -lt $deadline ] || fail "writer-b's container never restarted"
-  sleep 1
-done
-ka wait --for=condition=Ready pod/writer-b --timeout=120s >/dev/null || fail "writer-b never became Ready again"
-wait_writable writer-b after-restart-b.txt b2 60
-wait_remote after-restart-a.txt a2
-wait_remote after-restart-b.txt b2
-assert_eq writer-b "$(remote_committer after-restart-b.txt)" "writer-b still commits as itself"
-echo "---- agentfs-4do: the new plugin's patch lines"
-grep -E 'patch|front\(s\) are running' "$LOGS/old-plugin.log" | sed 's/^/old plugin: /' || true
-plugin_log | grep -E 'patch|front\(s\) are running' | sed 's/^/new plugin: /' || true
-in_plugin agentfs --state "$STATE" status 2>&1 | grep -E '^patches:' || true
-PATCH_SEEN=$(in_pod writer-a "cat /data/$PATCH_FILE 2>&1" || true)
-echo "---- agentfs-4do: writer-a (running since before the restart) reads /data/$PATCH_FILE: '$PATCH_SEEN'"
-CSI_4DO_BUG=
-if [ "$PATCH_SEEN" = landed ]; then
-  CSI_4DO_BUG="agentfs-4do: patch 1 landed under running pod writer-a when the node plugin restarted"
-  printf '\033[31mBUG:\033[0m %s\n' "$CSI_4DO_BUG"
-else
-  pass "agentfs-4do: patch 1 did not land under the running pods"
-fi
+wait_host "$OLD_HOST" 300
+wait_live 180
+in_pod writer 'printf again > /data/after-plugin-restart.txt' || fail "the writer could not write after the plugin's restart"
+wait_history after-plugin-restart.txt again
+[ "$(not_built_lines)" -ge 1 ] || fail "the new plugin's host never logged its not-built line"
+pass "the new plugin's host logged its not-built line"
 
-step "(i) inline volumes and ReadWriteMany are refused"
+step "(j) refused: inline volumes, ReadWriteMany, onDelete: delete, startFrom"
 kubectl apply -k ci/k8s-csi/negative
 wait_event inline FailedMount Ephemeral 180
 wait_event rwx ProvisioningFailed multi-node 180
+wait_event ondelete-delete ProvisioningFailed "onDelete: delete is not built on tree volumes" 180
+wait_event start-from ProvisioningFailed "startFrom is not built on tree volumes" 180
+for claim in ondelete-delete start-from; do
+  assert_eq Pending "$(ka get pvc "$claim" -o jsonpath='{.status.phase}')" "the claim $claim stays Pending"
+done
 kubectl delete -k ci/k8s-csi/negative --wait --timeout=120s
 
-step "(j) restore and revert live through the history service"
-# The service settles both fronts, writes the volume and has both drop
-# their kernel caches: both pods see the restore at once.
-lgit() { in_plugin git --git-dir "$STATE/git" "$@"; }
-in_pod writer-a 'umask 002 && printf r1 > /data/restored.txt'
-wait_remote restored.txt r1
-R1=$(lgit log -1 --format=%H "$BRANCH" -- restored.txt)
-in_pod writer-b 'printf r2-longer > /data/restored.txt'
-wait_remote restored.txt r2-longer
-assert_eq r2-longer "$(in_pod writer-a 'cat /data/restored.txt')" "writer-a reads r2-longer"
-in_plugin agentfs --state "$STATE" restore restored.txt "$R1"
-assert_eq r1 "$(in_pod writer-a 'cat /data/restored.txt')" "writer-a sees the restore"
-assert_eq r1 "$(in_pod writer-b 'cat /data/restored.txt')" "writer-b sees the restore"
-wait_remote restored.txt r1
-assert_contains "$(rgit log -1 --format=%B "$BRANCH")" "Agentfs-Trigger: restore" "the restore reached the remote"
-in_plugin agentfs --state "$STATE" revert HEAD
-assert_eq r2-longer "$(in_pod writer-a 'cat /data/restored.txt')" "writer-a sees the revert"
-assert_eq r2-longer "$(in_pod writer-b 'cat /data/restored.txt')" "writer-b sees the revert"
-wait_remote restored.txt r2-longer
-wait_writable writer-b after-restore.txt after 30
-wait_remote after-restore.txt after
-assert_eq writer-b "$(remote_committer after-restore.txt)" "writes after the restore are recorded"
-
-step "(k) teardown: unpublish, unstage, delete"
-in_pod writer-a 'printf final > /data/final.txt'
-ka delete pod writer-a writer-b --wait --timeout=180s
+step "(k) teardown: the writer goes, then the claim; the volume is kept"
+in_pod writer 'printf final > /data/final.txt'
+ka delete pod writer --wait --timeout=180s
 deadline=$((SECONDS + 180))
-while docker exec "$NODE" grep -q "kubernetes.io~csi/$PV" /proc/self/mountinfo; do
-  [ $SECONDS -lt $deadline ] || fail "mounts of $PV are left on the node"
+while [ -n "$(view_mounts)" ]; do
+  [ $SECONDS -lt $deadline ] || fail "views of $VOLUME are left on the node: $(view_mounts)"
   sleep 1
 done
-pass "no mounts of $PV left on the node"
+pass "no agentfs:$VOLUME mount left on the node"
 deadline=$((SECONDS + 120))
-while docker exec "$NODE" test -e "$SOCK"; do
-  [ $SECONDS -lt $deadline ] || fail "the history socket $SOCK was not removed"
+while [ -n "$(host_pids)" ]; do
+  [ $SECONDS -lt $deadline ] || fail "the host of $PV still runs: $(node_procs "$(host_pattern)")"
   sleep 1
 done
-pass "the history service stopped and removed its socket"
-assert_eq final "$(in_plugin git --git-dir "$STATE/git" show "$BRANCH:final.txt")" "the final commit is in the volume's history"
-# The service has exited: the final push at NodeUnstage sent the final
-# commit, or the release scan's push of the unstaged
-# worktree does at once.
-deadline=$((SECONDS + 60))
-until [ "$(in_plugin git --git-dir "$STATE/git" rev-parse "$BRANCH")" = "$(rgit rev-parse "$BRANCH")" ]; do
-  [ $SECONDS -lt $deadline ] || fail "the remote never got the volume's last commit"
-  sleep 1
-done
-pass "the remote has the volume's last commit before the claim is deleted"
-assert_eq final "$(rgit show "$BRANCH:final.txt")" "final.txt reached the remote"
-assert_contains "$(plugin_log)" "unstaged volume $PV" "the volume was unstaged"
+pass "no host of $PV runs"
+assert_eq final "$(hgit show "$(file_rev final.txt)")" "the final write is in the volume's history"
 ka delete pvc shared --wait --timeout=180s
 deadline=$((SECONDS + 180))
-while docker exec "$NODE" test -e "$BASE/$PV"; do
-  [ $SECONDS -lt $deadline ] || fail "the volume directory $BASE/$PV was not removed"
+while kubectl get pv "$PV" >/dev/null 2>&1; do
+  [ $SECONDS -lt $deadline ] || fail "the PV $PV was never deleted"
   sleep 1
 done
-pass "DeleteVolume removed $BASE/$PV (onDelete: delete)"
-
-[ -z "$CSI_4DO_BUG" ] || fail "$CSI_4DO_BUG"
+pass "DeleteVolume succeeded: the PV $PV is gone"
+docker exec "$NODE" test -f "$BASE/$PV/csi.retained.json" ||
+  fail "$BASE/$PV/csi.retained.json is missing: the volume was not kept"
+if docker exec "$NODE" test -e "$BASE/$PV/csi.json"; then
+  fail "$BASE/$PV/csi.json is still there: the volume is not marked kept"
+fi
+pass "the volume's directory is kept ($BASE/$PV/csi.retained.json)"
+assert_eq final "$(hgit show "$(file_rev final.txt)")" "the kept history has the final write"
+assert_contains "$(plugin_log)" "kept volume $PV at " "the plugin logged the kept volume"
+refs=$(git ls-remote "$REMOTE")
+[ -z "$refs" ] || fail "the runner's git server got refs: $refs"
+pass "the runner's git server still has no ref"
 
 step "e2e-csi passed"

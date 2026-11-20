@@ -2,9 +2,9 @@
 //!
 //! Runs in the node DaemonSet on every node, privileged, beside
 //! csi-provisioner (`--node-deployment`) and node-driver-registrar, and
-//! serves the Identity, Controller and Node services (F8 R8). Its base
-//! path must be on the node's own disk: a network filesystem is refused
-//! before anything is served (F8 R1).
+//! serves the Identity, Controller and Node services. Its base path must
+//! be on the node's own disk: a network filesystem is refused before
+//! anything is served.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -16,11 +16,10 @@ use clap::Parser;
 use agentfs_core::config::parse_duration;
 use agentfs_csi::controller::ControllerService;
 use agentfs_csi::identity::IdentityService;
-use agentfs_csi::launcher::{AgentfsLauncher, FrontOptions, PluginIdentity};
+use agentfs_csi::launcher::{AgentfsLauncher, PluginIdentity};
 use agentfs_csi::layout::{Layout, validate_node};
 use agentfs_csi::mounter::KernelMounter;
 use agentfs_csi::node::NodeService;
-use agentfs_csi::release_scan::ReleaseScan;
 use agentfs_csi::server;
 use agentfs_csi::supervisor::{Backoff, NodeConfig, Supervisor};
 
@@ -38,58 +37,29 @@ struct Cli {
     /// This node's name: `spec.nodeName`.
     #[arg(long, env = "NODE_NAME")]
     node_id: String,
-    /// Where this node's worktrees live: a directory on the node's own
-    /// disk (a network filesystem is refused).
+    /// Where this node's volumes live: a directory on the node's own disk
+    /// (a network filesystem is refused).
     #[arg(long, default_value = "/var/lib/agentfs-csi/volumes")]
     base_path: PathBuf,
-    /// The node's records of staged and published volumes, and the history
-    /// services' sockets; must survive plugin restarts.
+    /// The node's records of published volumes; must survive plugin
+    /// restarts.
     #[arg(long, default_value = "/var/lib/agentfs-csi/node")]
     node_state: PathBuf,
-    /// Where each front mounts before the bind onto the kubelet's target.
-    #[arg(long, default_value = "/run/agentfs-csi/mounts")]
-    mount_dir: PathBuf,
     /// The profiles: `<profile>.config`, `.exclude`, `.attributes`.
     #[arg(long, default_value = "/etc/agentfs-csi/profiles")]
     profiles_dir: PathBuf,
     /// The `agentfs` binary the node plugin runs.
     #[arg(long, default_value = "/usr/local/bin/agentfs")]
     agentfs_bin: PathBuf,
-    /// Fronts' kernel passthrough: auto, on or off.
-    #[arg(long, default_value = "auto")]
-    passthrough: String,
-    /// FUSE threads per front.
-    #[arg(long, default_value_t = 4)]
-    front_threads: usize,
-    /// How long NodeStage waits for the history service before answering
-    /// UNAVAILABLE (the kubelet retries).
-    #[arg(long, default_value = "60s", value_parser = duration)]
-    stage_wait: Duration,
-    /// How long NodePublish waits for the front's mount.
-    #[arg(long, default_value = "60s", value_parser = duration)]
-    publish_wait: Duration,
-    /// How long NodeUnpublish waits for a front to stop before SIGKILL.
-    #[arg(long, default_value = "20s", value_parser = duration)]
-    unpublish_grace: Duration,
-    /// How long NodeUnstage waits for a service to stop before SIGKILL.
-    #[arg(long, default_value = "30s", value_parser = duration)]
-    unstage_grace: Duration,
-    /// How long a front waits for its history service.
-    #[arg(long, default_value = "30s", value_parser = duration)]
-    history_wait: Duration,
-    /// The longest delay between restarts of a crashed child.
+    /// The longest delay between restarts of a crashed host.
     #[arg(long, default_value = "30s", value_parser = duration)]
     backoff_max: Duration,
-    /// The plugin pod's name, for the history services' identity.
+    /// The plugin pod's name, for its children's identity.
     #[arg(long, env = "AGENTFS_CSI_POD", default_value = "")]
     pod: String,
     /// The plugin pod's namespace.
     #[arg(long, env = "AGENTFS_CSI_NAMESPACE", default_value = "")]
     namespace: String,
-    /// How often the release scan pushes the worktrees no pod stages, and
-    /// finishes the forks whose deletion asked for it (F8 D1, design); the first delay after a failed push.
-    #[arg(long, env = "AGENTFS_CSI_RELEASE_SCAN_INTERVAL", default_value = "30s", value_parser = duration)]
-    release_scan_interval: Duration,
 }
 
 #[tokio::main]
@@ -113,19 +83,13 @@ async fn run(cli: Cli) -> Result<(), String> {
             cli.profiles_dir.display()
         )
     })?;
-    if !matches!(cli.passthrough.as_str(), "auto" | "on" | "off") {
-        return Err(format!(
-            "--passthrough {:?} must be auto, on or off",
-            cli.passthrough
-        ));
-    }
     let node_id = cli.node_id.clone();
     if node_id.is_empty() {
         return Err("--node-id (or NODE_NAME) is required".into());
     }
     validate_node(&node_id).map_err(|e| e.to_string())?;
-    // Worktrees live on this node's own disk (F8 R1): a network
-    // filesystem is refused before anything is served, naming its type.
+    // Volumes live on this node's own disk: a network filesystem is
+    // refused before anything is served, naming its type.
     std::fs::create_dir_all(&cli.base_path)
         .map_err(|e| agentfs_csi::volume::chain(&e))
         .and_then(|()| {
@@ -135,7 +99,7 @@ async fn run(cli: Cli) -> Result<(), String> {
         .and_then(|network| match network {
             None => Ok(()),
             Some(mount) => Err(format!(
-                "it is on {} ({} at {}), a network filesystem: each node keeps its worktrees \
+                "it is on {} ({} at {}), a network filesystem: each node keeps its volumes \
                  on its own disk; use a local directory, ideally on a disk of its \
                  own",
                 mount.fstype,
@@ -147,54 +111,31 @@ async fn run(cli: Cli) -> Result<(), String> {
     let layout = Layout {
         base: cli.base_path.clone(),
         node_state: cli.node_state.clone(),
-        mount_dir: cli.mount_dir.clone(),
         profiles: cli.profiles_dir.clone(),
     };
-    let (stop_tx, stop_scan) = tokio::sync::watch::channel(false);
     let mut cfg = NodeConfig::new(node_id.clone(), layout.clone());
     cfg.plugin = PluginIdentity {
         namespace: cli.namespace.clone(),
         pod: cli.pod.clone(),
         node: node_id.clone(),
     };
-    let plugin = cfg.plugin.clone();
-    cfg.front = FrontOptions {
-        passthrough: cli.passthrough.clone(),
-        threads: cli.front_threads,
-        history_wait: cli.history_wait,
-    };
-    cfg.stage_wait = cli.stage_wait;
-    cfg.publish_wait = cli.publish_wait;
-    cfg.unpublish_grace = cli.unpublish_grace;
-    cfg.unstage_grace = cli.unstage_grace;
     cfg.backoff = Backoff {
         max: cli.backoff_max,
         ..Backoff::default()
     };
-    let backoff = cfg.backoff;
     let launcher = Arc::new(AgentfsLauncher {
         bin: cli.agentfs_bin.clone(),
     });
-    let supervisor = Supervisor::new(cfg, launcher.clone(), Arc::new(KernelMounter));
-    let report = supervisor.reconcile().await.map_err(|e| e.to_string())?;
-    for bad in &report.unreadable {
-        eprintln!("warning: an unreadable node record was skipped: {bad}");
-    }
+    let supervisor = Supervisor::new(cfg, launcher, Arc::new(KernelMounter));
+    let report = supervisor.reconcile().await;
     eprintln!(
-        "reconciled: {} history service(s) started, {} front(s) recovering, {} record(s) \
-         dropped",
-        report.services, report.recovering, report.dropped
+        "reconciled: {} host(s) started, {} view(s) opened again, {} record(s) dropped, {} \
+         unreadable",
+        report.hosts,
+        report.views,
+        report.dropped,
+        report.unreadable.len()
     );
-    // Unstaged worktrees and forks asked to finish: at once, then on an
-    // interval and whenever DeleteVolume waits.
-    let release = Arc::new(ReleaseScan::new(
-        Arc::new(layout.clone()),
-        launcher,
-        plugin,
-        cli.release_scan_interval,
-        backoff,
-    ));
-    tokio::spawn(release.clone().run(stop_scan));
     eprintln!(
         "agentfs-csi {} serving on {} for node {node_id} (base path {})",
         env!("CARGO_PKG_VERSION"),
@@ -206,7 +147,7 @@ async fn run(cli: Cli) -> Result<(), String> {
             bound
                 .serve(
                     IdentityService::new(),
-                    ControllerService::new(layout, node_id, release),
+                    ControllerService::new(layout, node_id, supervisor.clone()),
                     NodeService::new(supervisor.clone()),
                     shutdown_signal(),
                 )
@@ -214,8 +155,7 @@ async fn run(cli: Cli) -> Result<(), String> {
         }
         Err(e) => Err(e),
     };
-    let _ = stop_tx.send(true);
-    eprintln!("stopping the fronts and history services");
+    eprintln!("stopping the hosts");
     supervisor.shutdown().await;
     result.map_err(|e| e.to_string())
 }

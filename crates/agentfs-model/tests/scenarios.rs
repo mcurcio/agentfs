@@ -6,16 +6,18 @@
 use agentfs_model::calls::{Client, TreeId};
 use agentfs_model::check::Checked;
 use agentfs_model::content::{BLANK, Content, Layout, Line, State};
+use agentfs_model::entries::{Kind, Meta};
 use agentfs_model::git::{git, with_reversed_dates};
 use agentfs_model::recording::{Target, Write};
+use agentfs_model::service::Step;
 use agentfs_model::world::{
-    By, Direction, Life, LineEdit, MODEL_ROOT, MergeRule, ModelError, Overwritten, Policies, Step,
-    TreeNames, TxnOutcome, World, decisions_in,
+    By, Direction, Life, LineEdit, MergeRule, ModelError, Overwritten, Policies, TreeNames, TxnEnd,
+    TxnOutcome, World, decisions_in,
 };
 use std::collections::BTreeSet;
 
 fn world() -> Checked {
-    Checked::new(Policies::default(), TreeNames::new(MODEL_ROOT))
+    Checked::new(Policies::default(), TreeNames::new())
 }
 
 /// Every invariant, now.
@@ -352,8 +354,8 @@ fn r3_a_save_after_the_sync_wins_upstream_by_lineage() {
 /// fork's queue. x's first parent is the head the fork held, without
 /// m, so x and m are concurrent whatever order they were written in, and
 /// the root's m wins at the root's queue. The fork shows x, then m, never x
-/// again; Replication, a step of its own, then pushes x to the shared
-/// remote, naming its writer.
+/// again; the mirror's push, a step of its own, then carries x to the
+/// mirror, naming its writer.
 #[test]
 fn r3_a_save_before_the_sync_arrives_loses_to_the_upstream() {
     let mut w = world();
@@ -373,11 +375,14 @@ fn r3_a_save_before_the_sync_arrives_loses_to_the_upstream() {
         .collect();
     assert_eq!(lost, [(TreeId::ROOT, vec![x.clone()], vec![m.clone()])],);
     assert!(
-        !w.pending().contains(&Step::Replicate),
-        "drained, Replication included"
+        !w.pending().contains(&Step::Push),
+        "drained, the mirror's push included"
     );
-    let pushed = git(w.remote(), &["rev-parse", &w.collisions[0].reference]);
-    assert_eq!(pushed, xc, "the loser is on the shared remote");
+    let pushed = git(
+        w.mirror().repo(),
+        &["rev-parse", &w.collisions[0].reference],
+    );
+    assert_eq!(pushed, xc, "the loser is on the mirror");
 }
 
 /// Rule 3, "a sync carries the parent's current version, never a stale
@@ -418,7 +423,7 @@ fn crossing(merge: MergeRule) -> (Checked, String) {
             merge,
             ..Policies::default()
         },
-        TreeNames::new(MODEL_ROOT),
+        TreeNames::new(),
     );
     let f = w.create_fork(TreeId::ROOT);
     let x = w.save(&Client::Fork(f), "a", 0);
@@ -506,7 +511,7 @@ fn r3_a_save_loses_whole_with_its_clean_lines() {
     );
     for c in &w.collisions {
         assert_eq!(
-            git(w.remote(), &["rev-parse", &c.reference]),
+            git(w.mirror().repo(), &["rev-parse", &c.reference]),
             save,
             "pushed"
         );
@@ -553,7 +558,6 @@ fn r3_a_transaction_loses_whole_and_is_told() {
     w.begin(f).unwrap();
     let s = w.save(&c, "a", 0);
     let s2 = w.save(&c, "b", 0);
-    let staged = w.forks[&f].txn.as_ref().expect("open").head.clone();
     let m = w.save(&m1(), "a", 0);
     drain(&mut w);
     assert_eq!(
@@ -576,6 +580,8 @@ fn r3_a_transaction_loses_whole_and_is_told() {
         })
     );
     ok(&mut w);
+    // The transaction's one commit, the merge's second parent, lost.
+    let staged = git(w.repo(), &["rev-parse", &format!("{}^2", w.head(f))]);
     assert_eq!(
         decided(&w),
         [
@@ -773,7 +779,7 @@ fn neighbours(merge: MergeRule) -> (Checked, [String; 2]) {
             merge,
             layout: Layout::Adjacent,
         },
-        TreeNames::new(MODEL_ROOT),
+        TreeNames::new(),
     );
     let f = w.create_fork(TreeId::ROOT);
     let k = w.save(&Client::Fork(f), "a", 1);
@@ -912,6 +918,114 @@ fn r5_transaction_commits_clean() {
     assert!(has(&w, TreeId::ROOT, "a", &sa) && has(&w, TreeId::ROOT, "b", &sb));
     assert_eq!(root_writers(&w).len(), before + 1, "one commit");
     assert_eq!(root_writers(&w)[0], "c1");
+}
+
+/// R5.5 (the owner, 2026-11-13: "a transaction should be recorded as one
+/// commit"): saves in a transaction make no commit; `txn/<n>` stays at begin.
+/// The commit is one commit T on begin, naming each open it staged a save
+/// of; with the fork still at begin it is a fast-forward (R6.2), so the
+/// fork's history gains exactly T.
+#[test]
+fn r5_a_transaction_is_recorded_as_one_commit() {
+    let mut w = world();
+    let f = w.create_fork(TreeId::ROOT);
+    let c = Client::Fork(f);
+    let begin = w.head(f);
+    w.begin(f).unwrap();
+    let branch = TreeNames::txn_branch(1);
+    let all = w.all_commits().len();
+    let (ha, hb) = (w.open_write(&c, "a"), w.open_write(&c, "b"));
+    let sa = w.edit(ha, LineEdit::At(0)).unwrap();
+    let sb = w.edit(hb, LineEdit::At(0)).unwrap();
+    w.close(ha);
+    w.close(hb);
+    ok(&mut w);
+    assert_eq!(w.all_commits().len(), all, "a staged save makes no commit");
+    assert_eq!(git(w.repo(), &["rev-parse", &branch]), begin);
+    assert!(w.client_reads(&c, "a").contains(&sa));
+    assert_eq!(w.commit_txn(f), Ok(TxnOutcome::Committed));
+    ok(&mut w);
+    let t = w.head(f);
+    assert_eq!(
+        git(w.repo(), &["rev-list", &format!("{begin}..{t}")]),
+        t,
+        "one commit"
+    );
+    assert_eq!(show(&w, &t, "%P"), begin);
+    assert_eq!(
+        show(&w, &t, "%(trailers:key=Agentfs-Cause,valueonly)"),
+        "Transaction t1"
+    );
+    assert_eq!(
+        show(&w, &t, "%(trailers:key=Agentfs-Tree,valueonly)"),
+        "fork/1"
+    );
+    assert_eq!(
+        show(
+            &w,
+            &t,
+            "%(trailers:key=Agentfs-Open,valueonly,separator=%x2c)"
+        ),
+        format!("{ha},{hb}")
+    );
+    assert!(has(&w, f, "a", &sa) && has(&w, f, "b", &sb));
+    assert!(
+        git(w.repo(), &["for-each-ref", &branch]).is_empty(),
+        "its branch is gone"
+    );
+    drain(&mut w);
+    assert!(has(&w, TreeId::ROOT, "a", &sa) && has(&w, TreeId::ROOT, "b", &sb));
+}
+
+/// R5.5: a line staged twice is one version in T, written over begin's: the
+/// version staged between is in no commit. A line staged and written back
+/// keeps begin's version.
+#[test]
+fn r5_a_line_staged_twice_is_one_version_over_begin() {
+    let mut w = world();
+    let f = w.create_fork(TreeId::ROOT);
+    let c = Client::Fork(f);
+    w.begin(f).unwrap();
+    w.save(&c, "a", 0);
+    let last = w.save(&c, "a", 0);
+    w.save(&c, "a", 1);
+    let h = w.open_write(&c, "a");
+    w.edit_text(h, LineEdit::At(1), BLANK);
+    w.close(h);
+    let staged = w.save(&c, "a", 2);
+    assert_eq!(w.commit_txn(f), Ok(TxnOutcome::Committed));
+    ok(&mut w);
+    let a = w.file(&w.head(f), "a");
+    let root = Content::root("a");
+    assert_eq!(a.lines[0].id, last);
+    assert_eq!(
+        a.lines[0].over.as_deref(),
+        Some("a0"),
+        "written over begin's"
+    );
+    assert_eq!(a.lines[1], root.lines[1], "written back: begin's version");
+    assert_eq!(a.lines[2].id, staged);
+    assert_eq!(a.lines[2].over.as_deref(), Some("a2"));
+    drain(&mut w);
+}
+
+/// R5.5, net nothing: a transaction whose staged saves are all written back
+/// changes nothing over begin, so it makes no commit and is told `Empty`.
+#[test]
+fn r5_a_transaction_that_changes_nothing_makes_no_commit() {
+    let mut w = world();
+    let f = w.create_fork(TreeId::ROOT);
+    let c = Client::Fork(f);
+    let begin = w.head(f);
+    w.begin(f).unwrap();
+    w.save(&c, "a", 0);
+    let h = w.open_write(&c, "a");
+    w.edit_text(h, LineEdit::At(0), BLANK);
+    w.close(h);
+    assert_eq!(w.commit_txn(f), Ok(TxnOutcome::Empty));
+    ok(&mut w);
+    assert_eq!(w.head(f), begin);
+    drain(&mut w);
 }
 
 /// Rule 5, no race: the same calls as
@@ -1696,28 +1810,94 @@ fn r9_a_landing_waits_for_an_open_file_that_took_a_name_it_touches() {
     drain(&mut w);
 }
 
-/// Coherence finding 30: a transaction's line after its fork's own
-/// unfinished last line. R10.4 is about an upstream and a fork; no rule says
-/// what happens inside one tree.
+/// R10.5 (finding 30, the owner, 2026-11-05: "A"): a line a transaction
+/// appended after its fork's unfinished last line collides at the commit, as
+/// R10.4 does at a landing. The fork's line wins, the transaction loses whole
+/// and is told, naming its line; no tree shows the two lines as one.
 #[test]
-#[ignore = "coherence finding 30: a transaction commit puts its line after the fork's unfinished last line, and two lines read as one"]
-fn finding_30_a_transactions_line_after_the_forks_unfinished_line() {
+fn r10_a_transactions_line_after_the_forks_unfinished_line_loses_whole() {
     let mut w = world();
     let f = w.create_fork(TreeId::ROOT);
     let c = Client::Fork(f);
     w.begin(f).unwrap();
     calls(&mut w, &c, "b", &[Write::Append("n9\n".into())]);
+    let staged = w.file(&w.forks[&f].txn.as_ref().expect("open").index, "b");
+    let n9 = staged.last().to_string();
+    let n9_line = staged.live().last().expect("n9").line.clone();
     // The fork's own unfinished line arrives after begin, by a sync.
     calls(&mut w, &m1(), "b", &[Write::Append("}".into())]);
     next(&mut w, f);
-    assert_eq!(w.commit_txn(f), Ok(TxnOutcome::Committed));
-    let b = w.read(f, "b");
+    let brace = w.read(f, "b").last().to_string();
+    assert_eq!(&bytes(&w, f, "b")[12..], "}");
     assert_eq!(
-        b.bytes().lines().count(),
-        b.live().count(),
-        "{:?}: only a file's last line can lack a newline",
-        b.bytes()
+        w.commit_txn(f),
+        Ok(TxnOutcome::Lost {
+            lines: vec![Overwritten {
+                path: "b".into(),
+                line: n9_line,
+                staged: n9.clone(),
+                kept: brace,
+            }],
+        })
     );
+    ok(&mut w);
+    assert_eq!(&bytes(&w, f, "b")[12..], "}", "the fork keeps its `}}`");
+    assert!(!has(&w, f, "b", &n9), "none of the transaction applies");
+    drain(&mut w);
+    for t in [TreeId::ROOT, f] {
+        assert_eq!(&bytes(&w, t, "b")[12..], "}", "{t:?}");
+    }
+}
+
+/// R10.11 (the owner, 2026-11-12: "A"): a transaction's commit follows every
+/// landing rule, R10.8 included. The transaction rewrites its file's last line
+/// with no newline; a sync then brings the fork a line after it. At the commit
+/// the unfinished line would stand in front of a line the fork keeps: it
+/// collides, the fork's line wins and the transaction loses whole and is told.
+#[test]
+fn r10_a_transactions_unfinished_line_before_a_kept_line_loses_whole() {
+    let mut w = world();
+    let f = w.create_fork(TreeId::ROOT);
+    let c = Client::Fork(f);
+    w.begin(f).unwrap();
+    calls(
+        &mut w,
+        &c,
+        "c",
+        &[
+            Write::Pwrite {
+                offset: 10,
+                bytes: "y".into(),
+            },
+            Write::Truncate(11),
+        ],
+    );
+    let staged = w.file(&w.forks[&f].txn.as_ref().expect("open").index, "c");
+    assert_eq!(staged.bytes(), "-\n-\n-\n-\n-\ny");
+    let y = staged.last().to_string();
+    let y_line = staged.live().last().expect("y").line.clone();
+    calls(&mut w, &m1(), "c", &[Write::Append("z\n".into())]);
+    next(&mut w, f);
+    let z = w.read(f, "c").last().to_string();
+    let fork = bytes(&w, f, "c");
+    assert_eq!(fork, "-\n-\n-\n-\n-\n-\nz\n");
+    assert_eq!(
+        w.commit_txn(f),
+        Ok(TxnOutcome::Lost {
+            lines: vec![Overwritten {
+                path: "c".into(),
+                line: y_line,
+                staged: y.clone(),
+                kept: z,
+            }],
+        })
+    );
+    ok(&mut w);
+    assert_eq!(bytes(&w, f, "c"), fork, "the fork keeps its file");
+    drain(&mut w);
+    for t in [TreeId::ROOT, f] {
+        assert_eq!(bytes(&w, t, "c"), fork, "{t:?}");
+    }
 }
 
 /// Rule 8 and 10, a line written in two calls, and two calls over one
@@ -1808,6 +1988,60 @@ fn r9_a_sync_waits_for_an_open_writer_then_applies() {
     w.save(&m1(), "c", 0);
     next(&mut w, f); // c only: does not wait for b
     w.close(h);
+    drain(&mut w);
+}
+
+/// R9.18 (the owner, 2026-11-08: "Yes. “Waiting longer” is a feature of locks and
+/// transactions, not a bug"): a file open inside a transaction holds back the
+/// fork's sync of it until it closes, as an open on the fork does (R9.3).
+#[test]
+fn r9_a_file_open_in_a_transaction_holds_back_the_forks_sync() {
+    let mut w = world();
+    let f = w.create_fork(TreeId::ROOT);
+    w.begin(f).unwrap();
+    let h = w.open_write(&Client::Fork(f), "a");
+    assert!(
+        matches!(w.handle(h).target, Target::Txn(..)),
+        "in the transaction"
+    );
+    let m = w.save(&m1(), "a", 0);
+    take(&mut w, &Step::Next(f));
+    assert_eq!(w.waiting_for(f), BTreeSet::from(["a".to_string()]));
+    assert!(!w.pending().contains(&Step::Next(f)));
+    assert!(!has(&w, f, "a", &m), "not written");
+    let x = w.edit(h, LineEdit::At(1)).unwrap();
+    w.close(h);
+    ok(&mut w);
+    assert!(w.waits().is_empty(), "the close woke it");
+    next(&mut w, f);
+    assert!(has(&w, f, "a", &m), "the sync took the root's line");
+    assert_eq!(w.commit_txn(f), Ok(TxnOutcome::Committed));
+    let a = w.read(f, "a");
+    assert_eq!((a.at(0), a.at(1)), (m.as_str(), x.as_str()));
+    drain(&mut w);
+}
+
+/// R9.18 for every take (the owner, 2026-11-12, picking "A file open inside a
+/// transaction holds back every take into its fork until it closes"): a
+/// landing from the fork's own fork waits for the file open inside the
+/// fork's transaction, as R9.1's landing waits for an open on the fork.
+#[test]
+fn r9_a_file_open_in_a_transaction_holds_back_a_landing_into_its_fork() {
+    let mut w = world();
+    let f = w.create_fork(TreeId::ROOT);
+    let g = w.create_fork(f);
+    w.begin(f).unwrap();
+    let h = w.open_write(&Client::Fork(f), "a");
+    let y = w.save(&Client::Fork(g), "a", 2);
+    take(&mut w, &Step::Next(f));
+    assert_eq!(w.waiting_for(f), BTreeSet::from(["a".to_string()]));
+    assert!(!has(&w, f, "a", &y), "not written");
+    w.close(h);
+    ok(&mut w);
+    assert!(w.waits().is_empty(), "the close woke it");
+    next(&mut w, f);
+    assert!(has(&w, f, "a", &y), "the landing took g's line");
+    assert_eq!(w.commit_txn(f), Ok(TxnOutcome::Empty));
     drain(&mut w);
 }
 
@@ -2152,11 +2386,13 @@ fn r5_a_clients_death_applies_what_its_transaction_deferred() {
     assert!(has(&w, TreeId::ROOT, "a", &x) && has(&w, TreeId::ROOT, "a", &y));
 }
 
-/// R5.3 with rule 12: a crash keeps a deferred call in the journal behind
-/// its transaction, which survives; an open of its file defers at the
-/// restart's replay. Each applies once, after the commit.
+/// R5.3 with rule 12 (the owner, 2026-11-05: "the crash rolls the
+/// transaction back and applies the call"): a crash rolls the open
+/// transaction back, leaving nothing of it, then applies the calls it
+/// deferred, in order; an open of its file is replayed from the journal into
+/// the fork, as its close would have saved it.
 #[test]
-fn r5_a_crash_keeps_what_a_transaction_deferred() {
+fn r5_a_crash_rolls_back_and_applies_what_it_deferred() {
     let mut w = world();
     let f = w.create_fork(TreeId::ROOT);
     let t = f;
@@ -2169,21 +2405,20 @@ fn r5_a_crash_keeps_what_a_transaction_deferred() {
     w.close(closed);
     w.unlink(&other, "b");
     let y = w.edit(open, LineEdit::Append).unwrap();
-    let start = w.head(t);
+    assert_eq!(w.deferred(f).len(), 2);
     w.crash();
     ok(&mut w);
-    assert_eq!(w.head(t), start, "still behind the transaction");
-    assert_eq!(w.deferred(f).len(), 3);
-    assert!(w.handles().all(|h| h.deferred));
-    assert_eq!(w.commit_txn(f), Ok(TxnOutcome::Committed));
-    ok(&mut w);
+    assert!(w.forks[&f].txn.is_none(), "the crash rolled it back");
+    assert_eq!(w.ended.last().unwrap().how, TxnEnd::Rollback);
+    assert!(w.deferred(f).is_empty() && w.handles().next().is_none());
     let a = w.file(&w.head(t), "a");
-    assert!(a.holds(&x) && a.holds(&y) && a.holds(&staged));
-    let result = w.ended.last().unwrap().result.clone().unwrap();
-    assert!(w.file(&result, "b").holds(&staged_b));
-    assert_eq!(w.path_of(t, "b"), None);
+    assert!(a.holds(&x) && a.holds(&y) && !a.holds(&staged));
+    assert!(!w.file(&w.head(t), "b").holds(&staged_b));
+    assert_eq!(w.path_of(t, "b"), None, "the deferred unlink applied");
+    assert_eq!(w.commit_txn(f), Err(ModelError::NoTransaction));
     drain(&mut w);
     assert!(has(&w, TreeId::ROOT, "a", &x) && has(&w, TreeId::ROOT, "a", &y));
+    assert!(!has(&w, TreeId::ROOT, "a", &staged));
 }
 
 /// R5.3 with R3c.2 and rule 9: a deferred save has not happened, so its file
@@ -2243,8 +2478,8 @@ fn r10_an_agreeing_delete_of_a_rename_overs_file_agrees() {
 /// R5.1 and R9.9, read from git: a take's decision lives in its own result
 /// commit (its tree named), with no notes ref; the losing commit, which cannot
 /// be edited, holds none and keeps its collision ref; and the record reaches
-/// the shared remote with the root's history, a transaction's and a nested
-/// fork's included.
+/// the mirror with the root's history, a transaction's and a nested fork's
+/// included.
 #[test]
 fn r5_a_decision_is_in_its_result_commit_with_its_tree() {
     let mut w = world();
@@ -2264,7 +2499,7 @@ fn r5_a_decision_is_in_its_result_commit_with_its_tree() {
     assert!(!refs.contains("refs/notes"), "no notes ref: {refs}");
     for x in &w.collisions {
         let d = agentfs_model::world::Decision::of(x, w.names());
-        for repo in [w.repo(), w.remote()] {
+        for repo in [w.repo(), w.mirror().repo()] {
             let on = decisions_in(repo, &["-1", &x.result]);
             assert!(on.iter().any(|(_, n)| *n == d), "the result holds it");
             assert!(decisions_in(repo, &["-1", &x.loser]).is_empty());
@@ -3440,33 +3675,25 @@ fn r9_a_writer_holding_a_waited_file_is_not_made_to_wait() {
     assert_eq!(w.read(TreeId::ROOT, "a"), w.read(f, "a"));
 }
 
-/// Rule 12 inside a transaction: an open in the transaction is in the
-/// journal like any other, so a crash saves its calls into the
-/// transaction's branch (a ref, which survives); the commit then carries
-/// them into the fork and on to the root.
+/// Rule 12 inside a transaction (R5: "a failure is an implicit rollback"):
+/// a crash rolls the open transaction back, so an open in it ends unsaved,
+/// as at a rollback; nothing of it reaches any tree or any commit.
 #[test]
-fn r12_a_crash_saves_an_open_inside_a_transaction() {
+fn r12_a_crash_rolls_back_an_open_transaction() {
     let mut w = world();
     let f = w.create_fork(TreeId::ROOT);
+    let start = w.head(f);
     w.begin(f).unwrap();
     let h = w.open_write(&Client::Fork(f), "a");
     w.write(h, Write::Append("txn\n".into()));
     w.crash();
     ok(&mut w);
-    assert!(w.saved(h), "the replay saved the open");
+    assert!(!w.saved(h), "the open is not saved");
     assert_eq!(w.handles().count(), 0);
-    assert!(
-        !w.read(f, "a").bytes().ends_with("txn\n"),
-        "the transaction's save stays in its branch until commit"
-    );
-    assert_eq!(w.commit_txn(f), Ok(TxnOutcome::Committed));
-    ok(&mut w);
-    assert!(
-        w.read(f, "a").bytes().ends_with("txn\n"),
-        "the commit carries the replayed call"
-    );
+    assert_eq!(w.head(f), start);
+    assert_eq!(w.commit_txn(f), Err(ModelError::NoTransaction));
     drain(&mut w);
-    assert!(w.read(TreeId::ROOT, "a").bytes().ends_with("txn\n"));
+    assert!(!w.read(TreeId::ROOT, "a").bytes().ends_with("txn\n"));
 }
 
 /// Rule 9 with P1 (the review of 2026-11-04, P1-c): a long-held file holds
@@ -3856,7 +4083,7 @@ fn finding_47_a_rename_over_agrees_with_an_unlink_over_an_unseen_edit() {
         "the root takes the fork's rename-over"
     );
     assert!(w.collisions.is_empty(), "{:?}", w.collisions);
-    let paths = TreeCalls::paths(&*w, TreeId::ROOT).unwrap();
+    let paths = TreeCalls::paths(&**w, TreeId::ROOT).unwrap();
     assert!(
         paths.contains(&"c".to_string()) && !paths.contains(&"b".to_string()),
         "{paths:?}"
@@ -3889,4 +4116,419 @@ fn finding_46_a_sync_of_a_file_the_fork_replaced_passes_the_name_it_took() {
     assert!(w.last_take().is_some(), "the sync takes past the open d");
     w.close(held);
     drain(&mut w);
+}
+
+// ── rules 13, 14 and 15: metadata, directories, links ───────────────────
+
+/// Rules 13 to 15: the metadata of the entry at `p` in tree `t`, read from git.
+fn meta(w: &World, t: TreeId, p: &str) -> Option<Meta> {
+    let e = w.entries(&w.head(t));
+    e.dirs
+        .get(p)
+        .copied()
+        .or_else(|| e.files.values().find(|(q, _)| q == p).map(|(_, m)| *m))
+}
+
+/// Every entry of tree `t` by path, a directory's with a `/`, read from git.
+fn entries_of(w: &World, t: TreeId) -> Vec<String> {
+    let mut v: Vec<String> = w
+        .entries(&w.head(t))
+        .all()
+        .into_iter()
+        .map(|(p, id)| if id.is_some() { p } else { format!("{p}/") })
+        .collect();
+    v.sort();
+    v
+}
+
+/// The one collision of the run, and its record in git under the root's history.
+fn only_collision(w: &World) -> (By, String, Vec<String>, Vec<String>, String) {
+    let entry: Vec<_> = w.collisions.iter().filter(|c| c.by != By::Whole).collect();
+    assert_eq!(entry.len(), 1, "{:?}", w.collisions);
+    let c = entry[0];
+    let recorded = decisions_in(w.repo(), &[&w.head(TreeId::ROOT)]);
+    let (_, d) = recorded
+        .iter()
+        .find(|(on, d)| *on == c.result && d.by == c.by.word())
+        .expect("the record in its result commit");
+    (
+        c.by,
+        c.path.clone(),
+        c.lost.clone(),
+        c.won.clone(),
+        d.by.clone(),
+    )
+}
+
+/// A program's `symlink(target, tmp)` then `rename(tmp, p)`: an atomic replace of `p`
+/// by a link (rule 11's atomic save, rule 15).
+fn link_over(w: &mut World, c: &Client, p: &str, tmp: &str, target: &str) {
+    w.symlink(c, tmp, target, Meta::symlink(0, 0))
+        .expect("an unborn identity left");
+    w.rename(c, tmp, p);
+}
+
+/// Rule 13: a fork's chmod lands over the value it saw; history records the value in a
+/// record beside the file, and no time.
+#[test]
+fn r13_a_chmod_lands_over_the_value_it_saw() {
+    let mut w = world();
+    let f = w.create_fork(TreeId::ROOT);
+    w.set_meta(&Client::Fork(f), "a", Meta::file(0o755, 1000, 1000));
+    drain(&mut w);
+    for t in [TreeId::ROOT, f] {
+        assert_eq!(meta(&w, t, "a"), Some(Meta::file(0o755, 1000, 1000)));
+    }
+    assert_eq!(
+        git(
+            w.repo(),
+            &[
+                "cat-file",
+                "-p",
+                &format!("{}:meta.a", w.head(TreeId::ROOT))
+            ]
+        ),
+        "file:0755:1000:1000"
+    );
+    assert!(w.collisions.is_empty(), "{:?}", w.collisions);
+}
+
+/// Rule 13: two concurrent chmods of one file: the upstream holds a value the fork's
+/// writer never saw, so the upstream's wins and the fork's change loses whole,
+/// recorded as `metadata`.
+#[test]
+fn r13_concurrent_chmods_the_upstream_wins_and_the_change_loses_whole() {
+    let mut w = world();
+    let f = w.create_fork(TreeId::ROOT);
+    w.set_meta(&Client::Fork(f), "a", Meta::file(0o700, 0, 0));
+    w.set_meta(&m1(), "a", Meta::file(0o755, 0, 0));
+    drain(&mut w);
+    for t in [TreeId::ROOT, f] {
+        assert_eq!(meta(&w, t, "a"), Some(Meta::file(0o755, 0, 0)), "{t:?}");
+    }
+    let (by, path, lost, won, word) = only_collision(&w);
+    assert_eq!(
+        (by, path.as_str(), word.as_str()),
+        (By::Metadata, "a", "metadata")
+    );
+    assert_eq!(
+        (lost, won),
+        (
+            vec!["file:0700:0:0".to_string()],
+            vec!["file:0755:0:0".to_string()]
+        )
+    );
+}
+
+/// Rule 13: two trees writing the same new value agree: no collision.
+#[test]
+fn r13_the_same_new_value_agrees() {
+    let mut w = world();
+    let f = w.create_fork(TreeId::ROOT);
+    w.set_meta(&Client::Fork(f), "a", Meta::file(0o600, 7, 7));
+    w.set_meta(&m1(), "a", Meta::file(0o600, 7, 7));
+    drain(&mut w);
+    for t in [TreeId::ROOT, f] {
+        assert_eq!(meta(&w, t, "a"), Some(Meta::file(0o600, 7, 7)));
+    }
+    assert!(w.collisions.is_empty(), "{:?}", w.collisions);
+}
+
+/// Rule 13: metadata follows the file's identity, so a rename and a chmod of one file
+/// both apply.
+#[test]
+fn r13_a_rename_and_a_chmod_both_apply() {
+    let mut w = world();
+    let f = w.create_fork(TreeId::ROOT);
+    w.rename(&Client::Fork(f), "a", "x");
+    w.set_meta(&m1(), "a", Meta::file(0o700, 0, 0));
+    drain(&mut w);
+    for t in [TreeId::ROOT, f] {
+        assert_eq!(meta(&w, t, "x"), Some(Meta::file(0o700, 0, 0)), "{t:?}");
+        assert!(w.lookup(&w.head(t), "a").is_none());
+    }
+    assert!(w.collisions.is_empty(), "{:?}", w.collisions);
+}
+
+/// Rule 13 with rule 11's atomic save: the file keeps its identity and takes the new
+/// file's metadata, here its executable bit.
+#[test]
+fn r13_an_atomic_save_carries_the_new_files_metadata() {
+    let mut w = world();
+    let f = w.create_fork(TreeId::ROOT);
+    let c = Client::Fork(f);
+    let h = w.create(&c, "a.tmp").expect("an unborn identity left");
+    w.write(h, Write::Append("#!/bin/sh\n".into()));
+    w.close(h);
+    w.set_meta(&c, "a.tmp", Meta::file(0o755, 0, 0));
+    w.rename(&c, "a.tmp", "a");
+    assert_eq!(w.read(f, "a").name.line, "a", "the file keeps its identity");
+    drain(&mut w);
+    for t in [TreeId::ROOT, f] {
+        assert_eq!(meta(&w, t, "a"), Some(Meta::file(0o755, 0, 0)), "{t:?}");
+        assert_eq!(w.read(t, "a").bytes(), "#!/bin/sh\n");
+    }
+    assert!(w.collisions.is_empty(), "{:?}", w.collisions);
+}
+
+/// Rule 14: a directory is its path, so two trees making one directory agree.
+#[test]
+fn r14_two_trees_make_one_directory_and_agree() {
+    let mut w = world();
+    let f = w.create_fork(TreeId::ROOT);
+    w.mkdir(&Client::Fork(f), "cache", Meta::dir(0o755, 0, 0));
+    w.mkdir(&m1(), "cache", Meta::dir(0o755, 0, 0));
+    let h = w.create(&m1(), "cache/x").expect("an unborn identity left");
+    w.close(h);
+    drain(&mut w);
+    for t in [TreeId::ROOT, f] {
+        assert_eq!(entries_of(&w, t), ["a", "b", "c", "cache/", "cache/x", "d"]);
+    }
+    assert!(w.collisions.is_empty(), "{:?}", w.collisions);
+}
+
+/// Rule 14: an empty directory is kept, as its own record in history.
+#[test]
+fn r14_an_empty_directory_is_kept() {
+    let mut w = world();
+    let f = w.create_fork(TreeId::ROOT);
+    w.mkdir(&Client::Fork(f), "empty", Meta::dir(0o2775, 0, 100));
+    drain(&mut w);
+    for t in [TreeId::ROOT, f] {
+        assert_eq!(meta(&w, t, "empty"), Some(Meta::dir(0o2775, 0, 100)));
+    }
+    assert_eq!(
+        git(
+            w.repo(),
+            &[
+                "cat-file",
+                "-p",
+                &format!("{}:dir.empty", w.head(TreeId::ROOT))
+            ]
+        ),
+        "dir:2775:0:100"
+    );
+}
+
+/// Rule 14: a directory's rename is one change moving everything under it, each file
+/// keeping its identity (rule 11), so the upstream's concurrent edit of a file in it
+/// applies too.
+#[test]
+fn r14_renaming_a_directory_moves_everything_under_it_whole() {
+    let mut w = world();
+    w.mkdir(&m1(), "q", Meta::dir(0o755, 0, 0));
+    w.mkdir(&m1(), "q/s", Meta::dir(0o700, 0, 0));
+    let h = w.create(&m1(), "q/x").expect("an unborn identity left");
+    w.close(h);
+    let h = w.create(&m1(), "q/s/y").expect("an unborn identity left");
+    w.close(h);
+    let f = w.create_fork(TreeId::ROOT);
+    let before = w.head(f);
+    w.rename(&Client::Fork(f), "q", "e");
+    assert_eq!(
+        show(&w, &w.head(f), "%P"),
+        before,
+        "one commit on the fork's head"
+    );
+    let h = w.open_write(&m1(), "q/x");
+    w.write(h, Write::Append("edit\n".into()));
+    w.close(h);
+    drain(&mut w);
+    for t in [TreeId::ROOT, f] {
+        assert_eq!(
+            entries_of(&w, t),
+            ["a", "b", "c", "d", "e/", "e/s/", "e/s/y", "e/x"]
+        );
+        assert_eq!(meta(&w, t, "e/s"), Some(Meta::dir(0o700, 0, 0)));
+        assert_eq!(w.read(t, "e/x").bytes(), "edit\n");
+    }
+    assert!(w.collisions.is_empty(), "{:?}", w.collisions);
+}
+
+/// Rule 14: a fork's rmdir loses whole when the upstream has an entry under the
+/// directory its writer never saw, recorded as `directory-not-empty`.
+#[test]
+fn r14_removing_a_directory_the_upstream_filled_loses_whole() {
+    let mut w = world();
+    w.mkdir(&m1(), "q", Meta::dir(0o755, 0, 0));
+    let f = w.create_fork(TreeId::ROOT);
+    w.rmdir(&Client::Fork(f), "q");
+    let h = w.create(&m1(), "q/x").expect("an unborn identity left");
+    w.close(h);
+    next(&mut w, TreeId::ROOT);
+    drain(&mut w);
+    for t in [TreeId::ROOT, f] {
+        assert_eq!(entries_of(&w, t), ["a", "b", "c", "d", "q/", "q/x"]);
+    }
+    let (by, path, _, won, word) = only_collision(&w);
+    assert_eq!(
+        (by, path.as_str(), word.as_str()),
+        (By::DirectoryNotEmpty, "q/", "directory-not-empty")
+    );
+    assert_eq!(won, ["q/x"]);
+}
+
+/// Rule 14: a fork's move of a directory loses whole when the upstream has an entry
+/// under it the fork's writer never saw.
+#[test]
+fn r14_moving_a_directory_the_upstream_filled_loses_whole() {
+    let mut w = world();
+    w.mkdir(&m1(), "q", Meta::dir(0o755, 0, 0));
+    let f = w.create_fork(TreeId::ROOT);
+    w.rename(&Client::Fork(f), "q", "e");
+    let h = w.create(&m1(), "q/x").expect("an unborn identity left");
+    w.close(h);
+    next(&mut w, TreeId::ROOT);
+    drain(&mut w);
+    for t in [TreeId::ROOT, f] {
+        assert_eq!(entries_of(&w, t), ["a", "b", "c", "d", "q/", "q/x"]);
+    }
+    let (by, path, _, won, _) = only_collision(&w);
+    assert_eq!((by, path.as_str()), (By::DirectoryNotEmpty, "q/"));
+    assert_eq!(won, ["q/x"]);
+}
+
+/// Rule 14: a fork's move of a directory onto a path loses whole when the upstream has
+/// an entry there its writer never saw.
+#[test]
+fn r14_moving_onto_a_path_the_upstream_filled_loses_whole() {
+    let mut w = world();
+    w.mkdir(&m1(), "q", Meta::dir(0o755, 0, 0));
+    let h = w.create(&m1(), "q/x").expect("an unborn identity left");
+    w.close(h);
+    let f = w.create_fork(TreeId::ROOT);
+    w.rename(&Client::Fork(f), "q", "e");
+    w.mkdir(&m1(), "e", Meta::dir(0o755, 0, 0));
+    let h = w.create(&m1(), "e/y").expect("an unborn identity left");
+    w.close(h);
+    next(&mut w, TreeId::ROOT);
+    drain(&mut w);
+    for t in [TreeId::ROOT, f] {
+        assert_eq!(
+            entries_of(&w, t),
+            ["a", "b", "c", "d", "e/", "e/y", "q/", "q/x"]
+        );
+    }
+    let (by, path, lost, won, _) = only_collision(&w);
+    assert_eq!((by, path.as_str()), (By::DirectoryNotEmpty, "e/"));
+    assert_eq!(
+        (lost, won),
+        (vec!["e".to_string()], vec!["e/y".to_string()])
+    );
+}
+
+/// Rule 14: a fork's create into a directory the upstream removed loses whole, as the
+/// fork did not make that directory itself; recorded as `directory-gone`.
+#[test]
+fn r14_a_create_into_a_directory_the_upstream_removed_loses_whole() {
+    let mut w = world();
+    w.mkdir(&m1(), "q", Meta::dir(0o755, 0, 0));
+    let f = w.create_fork(TreeId::ROOT);
+    let h = w
+        .create(&Client::Fork(f), "q/x")
+        .expect("an unborn identity left");
+    w.close(h);
+    w.rmdir(&m1(), "q");
+    next(&mut w, TreeId::ROOT);
+    drain(&mut w);
+    for t in [TreeId::ROOT, f] {
+        assert_eq!(entries_of(&w, t), ["a", "b", "c", "d"]);
+    }
+    let (by, path, lost, _, word) = only_collision(&w);
+    assert_eq!(
+        (by, path.as_str(), word.as_str()),
+        (By::DirectoryGone, "q/", "directory-gone")
+    );
+    assert_eq!(lost, ["q/x"]);
+}
+
+/// Rule 14: until the upstream's queue decides, a sync keeps the directory a fork's
+/// undecided entry needs, though the upstream removed it; then the decision reaches the
+/// fork.
+#[test]
+fn r14_a_sync_keeps_the_directory_of_an_undecided_entry() {
+    let mut w = world();
+    w.mkdir(&m1(), "q", Meta::dir(0o755, 0, 0));
+    let f = w.create_fork(TreeId::ROOT);
+    let h = w
+        .create(&Client::Fork(f), "q/x")
+        .expect("an unborn identity left");
+    w.close(h);
+    w.rmdir(&m1(), "q");
+    next(&mut w, f);
+    assert!(w.last_take().is_some(), "the sync took");
+    assert_eq!(entries_of(&w, f), ["a", "b", "c", "d", "q/", "q/x"]);
+    assert_eq!(entries_of(&w, TreeId::ROOT), ["a", "b", "c", "d"]);
+    drain(&mut w);
+    assert_eq!(entries_of(&w, f), ["a", "b", "c", "d"]);
+    assert_eq!(only_collision(&w).0, By::DirectoryGone);
+}
+
+/// Rule 14: a decided upstream rmdir reaches the fork.
+#[test]
+fn r14_an_upstream_rmdir_reaches_the_fork() {
+    let mut w = world();
+    w.mkdir(&m1(), "q", Meta::dir(0o755, 0, 0));
+    let f = w.create_fork(TreeId::ROOT);
+    w.rmdir(&m1(), "q");
+    drain(&mut w);
+    assert_eq!(entries_of(&w, f), ["a", "b", "c", "d"]);
+    assert!(w.collisions.is_empty(), "{:?}", w.collisions);
+}
+
+/// Rule 15: a link is a file whose bytes are its target and whose kind is a link; it
+/// lands like any file.
+#[test]
+fn r15_a_link_is_a_file_whose_bytes_are_its_target() {
+    let mut w = world();
+    let f = w.create_fork(TreeId::ROOT);
+    let id = w
+        .symlink(&Client::Fork(f), "l", "a", Meta::symlink(1000, 1000))
+        .expect("an unborn identity left");
+    drain(&mut w);
+    for t in [TreeId::ROOT, f] {
+        assert_eq!(w.read(t, "l").bytes(), "a");
+        assert_eq!(w.read(t, "l").name.line, id);
+        assert_eq!(meta(&w, t, "l"), Some(Meta::symlink(1000, 1000)));
+    }
+}
+
+/// Rule 15: two concurrent retargets of one link (each an atomic replace) are two edits
+/// of one file: the upstream's wins and the fork's change loses whole.
+#[test]
+fn r15_concurrent_retargets_the_upstream_wins() {
+    let mut w = world();
+    w.symlink(&m1(), "l", "a", Meta::symlink(0, 0))
+        .expect("an unborn identity left");
+    let f = w.create_fork(TreeId::ROOT);
+    link_over(&mut w, &Client::Fork(f), "l", "l.tmp", "b");
+    link_over(&mut w, &m1(), "l", "l.tmp", "c");
+    drain(&mut w);
+    for t in [TreeId::ROOT, f] {
+        assert_eq!(w.read(t, "l").bytes(), "c", "{t:?}");
+        assert_eq!(meta(&w, t, "l"), Some(Meta::symlink(0, 0)));
+    }
+    assert!(
+        w.collisions
+            .iter()
+            .any(|c| c.tree == TreeId::ROOT && matches!(c.by, By::Line | By::File)),
+        "{:?}",
+        w.collisions
+    );
+}
+
+/// Rules 15 and 13: replacing a file by a link (an atomic save of a link over it)
+/// keeps the file's identity and changes its kind.
+#[test]
+fn r15_replacing_a_file_by_a_link_changes_its_kind() {
+    let mut w = world();
+    let f = w.create_fork(TreeId::ROOT);
+    link_over(&mut w, &Client::Fork(f), "a", "a.tmp", "b");
+    drain(&mut w);
+    for t in [TreeId::ROOT, f] {
+        assert_eq!(w.read(t, "a").name.line, "a", "the file keeps its identity");
+        assert_eq!(w.read(t, "a").bytes(), "b");
+        assert_eq!(meta(&w, t, "a").map(|m| m.kind), Some(Kind::Symlink));
+    }
+    assert!(w.collisions.is_empty(), "{:?}", w.collisions);
 }

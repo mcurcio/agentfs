@@ -1,9 +1,15 @@
-# Adds a remote to compose.yaml: a local git server (git-server/) that the
-# volume pushes to, with the credentials in secrets/origin (docs/docker.md).
+# Adds a remote to compose.yaml: a local git server (git-server/) named in
+# config/remote, with the credentials in secrets/origin (docs/docker.md).
 #
 #   docker compose -f examples/docker/compose.yaml -f examples/docker/compose.remote.yaml up -d
 #   docker compose -f examples/docker/compose.yaml -f examples/docker/compose.remote.yaml \
-#     exec -u www-data git-server git --git-dir /srv/git/history.git log agentfs/example
+#     logs agentfs | grep '^not built'
+#
+# Push is not built on tree volumes yet: the volume pushes nothing, and
+# the agentfs container logs each remote key as not built at every boot
+# (`not built: remote.origin.url (push): ...`) and exports the
+# agentfs.not_built gauge. The history stays in the Docker volume until
+# push is built.
 #
 # For a real remote, keep config/remote's [remote] section with your URL,
 # drop the git-server service, and put your token in the secret.

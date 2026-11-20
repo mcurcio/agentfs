@@ -27,12 +27,12 @@ Pages for a whole domain or the system:
 | Slice | Page |
 |---|---|
 | System composition and contracts: events, capabilities, versions, deployment compositions | [The system](system.md) |
-| Rules and view profiles: recorded or not, database groups, what each profile shows | [Rules](domains/rules.md) |
-| Clients, grants, sessions and attachment | [Clients](domains/clients.md) |
-| Views: one view per client, consistency settings, several view hosts | [Views](domains/views.md) |
-| Trees storage and lifecycle: fork end and drop, pinned snapshots, confinement | [Trees](domains/trees.md) |
+| Rules, the unbuilt part: view profiles, database groups, size and store hints, rule-set versions across view hosts (what a tree records is built: [trees](../trees.md#rules-and-the-untracked-area)) | [Rules](domains/rules.md) |
+| Clients: grants with view profiles, snapshot clients, operator actors | [Clients](domains/clients.md) |
+| Views: snapshot views, consistency settings, several view hosts | [Views](domains/views.md) |
+| Trees storage: confinement, space, pinned snapshots | [Trees](domains/trees.md) |
 | Replication on the tree model: remotes, credentials, pushes, divergence | [Replication](domains/replication.md) |
-| Volume lifecycle, versions and the upgrade drain | [Volume](domains/volume.md) |
+| Volume: the start point, the upgrade drain, settlement by the remotes, what happens on release | [Volume](domains/volume.md) |
 | Health: liveness of the history service and view hosts | [Health](domains/health.md) |
 | The target telemetry domain: metrics, traces and alarms that never block | [Telemetry](domains/telemetry.md) |
 | Snapshot opens (parked) | [Snapshot opens](snapshot-opens.md) |
@@ -41,11 +41,11 @@ Smaller slices, one page each:
 
 | Slice | Page |
 |---|---|
+| Moving every launcher onto the tree views and deleting the recording engine: milestones M4, M5, M6 and M9 (M1, M2, M3, M7 and M8 are built), the baseline (the first Hermes deploy, on a CSI volume claim), the deferred extras | [One engine](future/one-engine.md) |
 | Cutting the tree actor into six modules | [Module cut](future/module-cut.md) |
-| Configuring the root branch's name instead of `main` | [Root branch name](future/root-branch-name.md) |
+| The name the root is published under, apart from its identity | [Root branch name](future/root-branch-name.md) |
 | Transactions | [Transactions](future/transactions.md) |
 | Nested forks on trees | [Nested forks](future/nested-forks.md) |
-| Directories, symlinks, non-UTF-8 names and more links in the tree views | [Beyond flat files](future/tree-views-beyond-flat-files.md) |
 | Telemetry export from the tree views | [Tree-view telemetry](future/tree-view-telemetry.md) |
 | Landing approvals and timing on trees | [Landing approvals](future/landing-approvals.md) |
 | Integrator patches, restore and revert on trees | [Integrator patches](future/integrator-patches.md) |
@@ -62,6 +62,10 @@ Smaller slices, one page each:
 | Reloading OTLP TLS files | [OTLP TLS reload](future/otlp-tls-reload.md) |
 | Cloning a claim that is in use | [Clone in use](future/clone-in-use.md) |
 | Forge CI on hidden fork refs | [Forge CI](future/forge-ci-on-hidden-refs.md) |
+| Handing a fork's change to a receiver; forks that never land | [Fork delivery](future/fork-delivery.md) |
+| The integrator's checkpoint and the patch queue's notices | [Checkpoints and patch notices](future/integrator-hooks.md) |
+| Recording, committing and pushing with no mount | [Recording without a mount](future/recording-without-a-mount.md) |
+| A state area on NFS | [State on NFS](future/state-on-nfs.md) |
 
 ## How to read a page
 

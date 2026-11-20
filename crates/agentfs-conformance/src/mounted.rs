@@ -1,6 +1,8 @@
 //! The shared calls on a real mount: `open(2)`, `pwrite(2)`, `ftruncate(2)`,
-//! `close(2)`, `rename(2)` and `unlink(2)` against one process serving the root
-//! and at most one sandbox. Linux only, with `/dev/fuse` and `fusermount3`.
+//! `close(2)`, `rename(2)`, `unlink(2)`, `mkdir(2)`, `rmdir(2)`, `symlink(2)`,
+//! and `chmod(2)` with `lchown(2)` for metadata, against one process serving the
+//! root and at most one fork. Linux only, with `/dev/fuse` and `fusermount3`; the
+//! harness runs as root, so it may give an entry any owner.
 //!
 //! The process is a failpoints build with `AGENTFS_TAKE_GATE` set: it takes
 //! nothing by itself. Each take runs at the trace's point and answers on a fifo,
@@ -9,14 +11,14 @@
 
 use crate::engine_names::EngineNames;
 use crate::library::{fail, seed};
-use agentfs_core::tree_actor::Volume;
-use agentfs_model::calls::{CallError, Caller, Took, TreeCalls, TreeId};
+use agentfs_core::tree_actor::TreeId as EngineTree;
+use agentfs_model::calls::{CallError, Caller, Kind, Meta, Took, TreeCalls, TreeId};
 use std::collections::{BTreeMap, VecDeque};
 use std::ffi::CString;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
 use std::os::fd::RawFd;
-use std::os::unix::ffi::OsStrExt;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -39,14 +41,60 @@ fn c_path(p: &Path) -> Result<CString, CallError> {
     CString::new(p.as_os_str().as_bytes()).map_err(|e| CallError::new(e.to_string()))
 }
 
-/// A mount of the root and at most one sandbox, and the opens this harness holds.
+/// Discards the events: this harness consumes none.
+struct NoConsumers;
+
+impl agentfs_contracts::ports::EventSink for NoConsumers {
+    fn publish(&mut self, _: agentfs_contracts::ports::Event) {}
+}
+
+/// The fork view's key: `mount` finds the fork under it at every mount,
+/// the remount after a crash included.
+const FORK_KEY: &str = "conformance";
+
+/// The fork view's fork, made as the trial CLI makes one: through the Trees
+/// domain on the store adapter, under [`FORK_KEY`], so the fork's row is on
+/// its chain and the mount finds it.
+fn keyed_fork(
+    recording: &std::sync::Arc<agentfs_core::tree_actor::Recording>,
+) -> Result<EngineTree, CallError> {
+    use agentfs_contracts::caps::{LaunchCap, LaunchScope, Minter};
+    use agentfs_contracts::name::{ForkKey, LauncherId};
+    use agentfs_contracts::trees::{ForkSettings, Landing, Trees};
+    let store = agentfs_core::store::TreeStore::new(std::sync::Arc::clone(recording));
+    let mut trees = agentfs_trees::TreesService::restore(store, NoConsumers)
+        .map_err(|e| CallError::new(e.to_string()))?;
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the harness is its own composition root"
+    )]
+    let minter = Minter::new();
+    let launcher = LauncherId::parse("conformance").map_err(|e| CallError::new(e.to_string()))?;
+    let cap = LaunchCap::mint(&minter, launcher, LaunchScope::Root);
+    let settings = ForkSettings {
+        landing: Landing::Automatic,
+    };
+    let key = ForkKey::parse(FORK_KEY).map_err(|e| CallError::new(e.to_string()))?;
+    let fork = trees
+        .create(
+            EngineTree::Root,
+            Some(key),
+            settings,
+            &cap,
+            &agentfs_contracts::pod::PodContext::default(),
+        )
+        .map_err(|e| CallError::new(e.to_string()))?;
+    Ok(fork.into())
+}
+
+/// A mount of the root and at most one fork, and the opens this harness holds.
 pub struct Mounted {
     bin: PathBuf,
     state: PathBuf,
     root: PathBuf,
-    sandbox: PathBuf,
+    fork_view: PathBuf,
     gate: PathBuf,
-    /// The root's name, and the sandbox's fork when there is one.
+    /// The root's name, and the fork view's fork when there is one.
     names: EngineNames,
     fork_used: bool,
     child: Option<Child>,
@@ -66,24 +114,39 @@ impl Mounted {
         bin: &Path,
         work: &Path,
         mut names: EngineNames,
-        with_sandbox: bool,
+        with_fork: bool,
         appends: Vec<bool>,
     ) -> Result<Self, CallError> {
-        let (state, root, sandbox, gate) = (
+        let (state, root, fork_view, gate) = (
             work.join("state"),
             work.join("root"),
-            work.join("sandbox"),
+            work.join("fork"),
             work.join("gate"),
         );
-        for dir in [&root, &sandbox, &gate] {
+        for dir in [&root, &fork_view, &gate] {
             std::fs::create_dir_all(dir).map_err(|e| io_fail("mkdir", &e))?;
         }
+        // A trace's mkdir gives the mode it names: `mountable` admits only modes
+        // `mkdir(2)` keeps, and no umask may take bits from them.
+        // SAFETY: a plain call; the harness creates every file with a mode it names.
+        unsafe { libc::umask(0) };
         {
-            let mut volume = Volume::open(&state).map_err(fail)?;
-            seed(&mut volume, names.name(TreeId::ROOT)?).map_err(fail)?;
-            if with_sandbox {
-                names.forked(volume.fork().map_err(fail)?)?;
+            let recording = agentfs_core::tree_actor::Recording::create(
+                &state,
+                &crate::library::identity(),
+                None,
+                &agentfs_contracts::pod::PodContext::default(),
+            )
+            .map_err(fail)?;
+            seed(
+                &mut *recording.actor().map_err(fail)?,
+                names.name(TreeId::ROOT)?,
+            )
+            .map_err(fail)?;
+            if with_fork {
+                names.forked(keyed_fork(&recording)?)?;
             }
+            // Every record durable and built, and the lease free, at the drop.
         }
         for fifo in ["go", "took"] {
             let path = c_path(&gate.join(fifo))?;
@@ -106,7 +169,7 @@ impl Mounted {
             log: work.join("mount.log"),
             state,
             root,
-            sandbox,
+            fork_view,
             gate,
             names,
             fork_used: false,
@@ -127,8 +190,8 @@ impl Mounted {
 
     fn mountpoints(&self) -> Vec<PathBuf> {
         let mut points = vec![self.root.clone()];
-        if self.sandbox_fork().is_some() {
-            points.push(self.sandbox.clone());
+        if self.fork_tree().is_some() {
+            points.push(self.fork_view.clone());
         }
         points
     }
@@ -143,17 +206,17 @@ impl Mounted {
         command
             .arg("--state")
             .arg(&self.state)
-            .args(["trees", "mount"])
+            .arg("mount")
             .arg(&self.root)
             .env("AGENTFS_TAKE_GATE", &self.gate)
             .stdin(Stdio::null())
             .stdout(log.try_clone().map_err(|e| io_fail("mount log", &e))?)
             .stderr(log);
-        if let Some(fork) = self.sandbox_fork() {
+        if self.fork_tree().is_some() {
             command
-                .arg("--sandbox")
-                .arg(&self.sandbox)
-                .args(["--fork", fork]);
+                .arg("--fork-mount")
+                .arg(&self.fork_view)
+                .args(["--fork-key", FORK_KEY]);
         }
         self.child = Some(command.spawn().map_err(|e| io_fail("spawn", &e))?);
         let started = Instant::now();
@@ -183,22 +246,22 @@ impl Mounted {
         std::fs::read_to_string(&self.log).unwrap_or_default()
     }
 
-    /// The sandbox's fork, the one `mountable` allows, if `new` made it.
-    fn sandbox_fork(&self) -> Option<&str> {
+    /// The fork view's fork, the one `mountable` allows, if `new` made it.
+    fn fork_tree(&self) -> Option<EngineTree> {
         self.names.name(TreeId::new(1)).ok()
     }
 
     fn root(&self, t: TreeId) -> &Path {
         match t {
             TreeId::ROOT => &self.root,
-            _ => &self.sandbox,
+            _ => &self.fork_view,
         }
     }
 
     fn at(&self, c: &Caller, path: &str) -> PathBuf {
         match c {
             Caller::Root(_) => self.root.join(path),
-            Caller::Fork(_) => self.sandbox.join(path),
+            Caller::Fork(_) => self.fork_view.join(path),
         }
     }
 
@@ -215,6 +278,7 @@ impl Mounted {
             return Err(last_error("open"));
         }
         self.opens.insert(fd, c.clone());
+        self.settle()?;
         Ok(fd)
     }
 
@@ -234,7 +298,72 @@ impl Mounted {
         if unsafe { libc::close(fd) } != 0 {
             return Err(last_error("close"));
         }
-        self.released()
+        self.released()?;
+        self.settle()
+    }
+
+    /// Asks the gate to wait until history is built through every record so
+    /// far: the invariants read git after each call, and the builder makes
+    /// history behind the call path.
+    fn settle(&mut self) -> Result<(), CallError> {
+        writeln!(self.go, "settle").map_err(|e| io_fail("ask the gate", &e))?;
+        let mut answer = String::new();
+        self.took
+            .read_line(&mut answer)
+            .map_err(|e| io_fail("read the gate", &e))?;
+        match answer.trim_end() {
+            "settled" => Ok(()),
+            other => Err(CallError::new(format!("the gate answered {other:?}"))),
+        }
+    }
+
+    /// Gives the entry at `at` the mode and owner of `meta`: `chmod(2)` (never a
+    /// link's, whose mode is always 0777) and `lchown(2)`, each only when the entry
+    /// differs, so a call that matches already makes no step.
+    fn fit(&mut self, at: &Path, meta: &Meta) -> Result<(), CallError> {
+        use std::os::unix::fs::MetadataExt;
+        let now = std::fs::symlink_metadata(at).map_err(|e| io_fail("stat", &e))?;
+        let path = c_path(at)?;
+        if meta.kind != Kind::Symlink && now.mode() & 0o7777 != meta.mode {
+            // SAFETY: `path` is a valid C string for the call's duration.
+            if unsafe { libc::chmod(path.as_ptr(), meta.mode as libc::mode_t) } != 0 {
+                return Err(last_error("chmod"));
+            }
+        }
+        if (now.uid(), now.gid()) != (meta.uid, meta.gid) {
+            // SAFETY: as above.
+            if unsafe { libc::lchown(path.as_ptr(), meta.uid, meta.gid) } != 0 {
+                return Err(last_error("lchown"));
+            }
+        }
+        self.settle()
+    }
+
+    /// Every entry of tree `t` under the root directory, by path, with its
+    /// `lstat(2)`.
+    fn walk(&self, t: TreeId) -> Result<Vec<(String, std::fs::Metadata)>, CallError> {
+        let (mut out, mut dirs) = (Vec::new(), vec![String::new()]);
+        while let Some(dir) = dirs.pop() {
+            let listing =
+                std::fs::read_dir(self.root(t).join(&dir)).map_err(|e| io_fail("readdir", &e))?;
+            for entry in listing {
+                let entry = entry.map_err(|e| io_fail("readdir", &e))?;
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let path = if dir.is_empty() {
+                    name
+                } else {
+                    format!("{dir}/{name}")
+                };
+                let meta = std::fs::symlink_metadata(self.root(t).join(&path))
+                    .map_err(|e| io_fail("stat", &e))?;
+                if meta.is_dir() {
+                    dirs.push(path.clone());
+                }
+                out.push((path, meta));
+            }
+        }
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(out)
     }
 
     fn unmount(&self, lazy: bool) -> Result<(), CallError> {
@@ -289,7 +418,7 @@ impl TreeCalls for Mounted {
 
     /// `new` made the one fork `mountable` allows.
     fn fork(&mut self) -> Result<TreeId, CallError> {
-        if self.sandbox_fork().is_none() || self.fork_used {
+        if self.fork_tree().is_none() || self.fork_used {
             return Err(CallError::new("not a mountable trace"));
         }
         self.fork_used = true;
@@ -354,11 +483,13 @@ impl TreeCalls for Mounted {
     }
 
     fn unlink(&mut self, c: &Caller, path: &str) -> Result<(), CallError> {
-        std::fs::remove_file(self.at(c, path)).map_err(|e| io_fail("unlink", &e))
+        std::fs::remove_file(self.at(c, path)).map_err(|e| io_fail("unlink", &e))?;
+        self.settle()
     }
 
     fn rename(&mut self, c: &Caller, from: &str, to: &str) -> Result<(), CallError> {
-        std::fs::rename(self.at(c, from), self.at(c, to)).map_err(|e| io_fail("rename", &e))
+        std::fs::rename(self.at(c, from), self.at(c, to)).map_err(|e| io_fail("rename", &e))?;
+        self.settle()
     }
 
     fn end_client(&mut self, c: &Caller) -> Result<(), CallError> {
@@ -375,18 +506,20 @@ impl TreeCalls for Mounted {
     }
 
     fn take_next(&mut self, t: TreeId) -> Result<Took, CallError> {
-        let tree = self.names.name(t)?.to_owned();
+        let tree = self.names.name(t)?;
         writeln!(self.go, "{tree}").map_err(|e| io_fail("ask the gate", &e))?;
         let mut answer = String::new();
         self.took
             .read_line(&mut answer)
             .map_err(|e| io_fail("read the gate", &e))?;
-        match answer.trim_end() {
-            "taken" => Ok(Took::Taken),
-            "waiting" => Ok(Took::Waiting),
-            "empty" => Ok(Took::Empty),
-            other => Err(CallError::new(format!("the gate answered {other:?}"))),
-        }
+        let took = match answer.trim_end() {
+            "taken" => Took::Taken,
+            "waiting" => Took::Waiting,
+            "empty" => Took::Empty,
+            other => return Err(CallError::new(format!("the gate answered {other:?}"))),
+        };
+        self.settle()?;
+        Ok(took)
     }
 
     /// `SIGKILL`, wait on the pid, drop what the harness holds, `fusermount3 -uz`,
@@ -395,6 +528,11 @@ impl TreeCalls for Mounted {
         if let Some(mut child) = self.child.take() {
             child.kill().map_err(|e| io_fail("kill", &e))?;
             child.wait().map_err(|e| io_fail("wait", &e))?;
+            // Its tree Git children share its lease and die of their
+            // parent-death signal after it: taking the lease, blocking, is
+            // the event that every holder is gone.
+            agentfs_core::tree_actor::wait_for_lease(&self.state)
+                .map_err(|e| io_fail("lease", &e))?;
         }
         for (fd, _) in std::mem::take(&mut self.opens) {
             // SAFETY: an open this harness holds; its connection is gone, so the
@@ -402,24 +540,107 @@ impl TreeCalls for Mounted {
             unsafe { libc::close(fd) };
         }
         self.unmount(true)?;
-        self.mount()
+        self.mount()?;
+        // Open never waits for history; the invariants read it after each call.
+        self.settle()
     }
 
+    fn mkdir(&mut self, c: &Caller, path: &str, meta: &Meta) -> Result<(), CallError> {
+        let at = self.at(c, path);
+        let p = c_path(&at)?;
+        // SAFETY: `p` is a valid C string for the call's duration.
+        if unsafe { libc::mkdir(p.as_ptr(), meta.mode as libc::mode_t) } != 0 {
+            return Err(last_error("mkdir"));
+        }
+        self.fit(&at, meta)
+    }
+
+    fn rmdir(&mut self, c: &Caller, path: &str) -> Result<(), CallError> {
+        std::fs::remove_dir(self.at(c, path)).map_err(|e| io_fail("rmdir", &e))?;
+        self.settle()
+    }
+
+    fn set_meta(&mut self, c: &Caller, path: &str, meta: &Meta) -> Result<(), CallError> {
+        let at = self.at(c, path);
+        self.fit(&at, meta)
+    }
+
+    fn symlink(
+        &mut self,
+        c: &Caller,
+        path: &str,
+        target: &str,
+        meta: &Meta,
+    ) -> Result<(), CallError> {
+        let at = self.at(c, path);
+        std::os::unix::fs::symlink(target, &at).map_err(|e| io_fail("symlink", &e))?;
+        self.fit(&at, meta)
+    }
+
+    /// A file's bytes, or a link's target (`readlink(2)`).
     fn read(&self, t: TreeId, path: &str) -> Result<Option<Vec<u8>>, CallError> {
-        match std::fs::read(self.root(t).join(path)) {
+        let at = self.root(t).join(path);
+        let read = match std::fs::symlink_metadata(&at) {
+            Ok(m) if m.file_type().is_symlink() => {
+                std::fs::read_link(&at).map(|l| l.into_os_string().into_vec())
+            }
+            Ok(m) if m.is_dir() => return Ok(None),
+            Ok(_) => std::fs::read(&at),
+            Err(e) => Err(e),
+        };
+        match read {
             Ok(b) => Ok(Some(b)),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(io_fail("read", &e)),
         }
     }
 
+    /// Every file and link at any depth.
     fn paths(&self, t: TreeId) -> Result<Vec<String>, CallError> {
-        let mut paths = Vec::new();
-        for entry in std::fs::read_dir(self.root(t)).map_err(|e| io_fail("readdir", &e))? {
-            let entry = entry.map_err(|e| io_fail("readdir", &e))?;
-            paths.push(entry.file_name().to_string_lossy().into_owned());
+        Ok(self
+            .walk(t)?
+            .into_iter()
+            .filter(|(_, m)| !m.is_dir())
+            .map(|(p, _)| p)
+            .collect())
+    }
+
+    fn entries(&self, t: TreeId) -> Result<Vec<(String, Meta)>, CallError> {
+        use std::os::unix::fs::MetadataExt;
+        self.walk(t)?
+            .into_iter()
+            .map(|(p, m)| {
+                let kind = if m.is_dir() {
+                    Kind::Dir
+                } else if m.file_type().is_symlink() {
+                    Kind::Symlink
+                } else if m.is_file() {
+                    Kind::File
+                } else {
+                    return Err(CallError::new(format!("{p}: no kind the view makes")));
+                };
+                let meta = Meta {
+                    kind,
+                    mode: m.mode() & 0o7777,
+                    uid: m.uid(),
+                    gid: m.gid(),
+                };
+                Ok((p, meta))
+            })
+            .collect()
+    }
+}
+
+impl crate::Objects for Mounted {
+    /// Each file's inode: the view numbers a file's object `object + 2`.
+    fn objects(&self, t: TreeId) -> Result<Vec<(String, u64)>, CallError> {
+        use std::os::unix::fs::MetadataExt;
+        let mut objects = Vec::new();
+        for path in self.paths(t)? {
+            let meta = std::fs::symlink_metadata(self.root(t).join(&path))
+                .map_err(|e| io_fail("stat", &e))?;
+            objects.push((path, meta.ino()));
         }
-        paths.sort();
-        Ok(paths)
+        Ok(objects)
     }
 }

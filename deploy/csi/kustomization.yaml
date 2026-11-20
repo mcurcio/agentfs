@@ -22,8 +22,7 @@ resources:
 # One profile per `<name>.config` (with optional `.exclude` and
 # `.attributes`); a StorageClass picks one with `profile: <name>`. No hash
 # suffix: the pods see edits through the mounted ConfigMap without being
-# restarted (a state area includes its profile's config at each read, and
-# NodeStage reinstalls the rules).
+# restarted (a volume's host reads its profile when it starts).
 configMapGenerator:
   - name: agentfs-csi-profiles
     namespace: agentfs-csi

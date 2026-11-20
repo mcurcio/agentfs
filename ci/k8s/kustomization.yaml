@@ -1,6 +1,7 @@
 # The CI overlay of deploy/sidecar for the e2e-kind job (ci/e2e-kind.sh):
-# the image built by the job, a remote on the runner's git server, fast
-# pushes, and two writers (root and uid 10000) instead of the workload.
+# the image built by the job, a remote on the runner's git server (logged
+# as not built: push is not built on tree volumes yet), and two writers
+# (root and uid 10000) instead of the workload.
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 

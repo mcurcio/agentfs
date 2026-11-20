@@ -34,7 +34,13 @@ impl Volume {
         };
         fs::create_dir_all(v.tree()).unwrap();
         fs::create_dir_all(v.home()).unwrap();
-        v.ok(&["init", "--volume", "demo"]);
+        agentfs_core::volume::init_with(
+            &agentfs_core::volume::StateDir::new(v.state()),
+            "demo",
+            None,
+            None,
+        )
+        .unwrap();
         v
     }
 

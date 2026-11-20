@@ -16,21 +16,6 @@ fail() {
   exit 1
 }
 
-# Annotates the last lines of a log file on the run (GitHub Actions only),
-# so a failure can be read without the job's log.
-annotate_log() { # file [lines]
-  [ -n "${GITHUB_ACTIONS:-}" ] && [ -f "$1" ] || return 0
-  local body
-  body=$(tail -n "${2:-15}" "$1" | sed 's/\x1b\[[0-9;]*m//g' | tr '\n' '|' | cut -c1-3000)
-  printf '::warning title=%s::%s\n' "$(basename "$1")" "$body"
-}
-# Posts a measurement summary as a notice on the run (GitHub Actions
-# only), so the numbers can be read through the API, as the step summary
-# cannot.
-notice_summary() { # title text
-  [ -n "${GITHUB_ACTIONS:-}" ] || return 0
-  printf '::notice title=%s::%s\n' "$1" "$(printf '%s' "$2" | tr '\n' '|' | cut -c1-3000)"
-}
 pass() { printf '\033[32mok\033[0m   %s\n' "$*"; }
 
 # Operator runbooks run as written: the fenced block after
@@ -70,43 +55,6 @@ wait_for() {
     [ $SECONDS -lt $deadline ] || return 1
     sleep 0.5
   done
-}
-
-# A fresh volume in a new temporary directory. Sets VOL, STATE and TREE.
-new_volume() { # volume-name
-  VOL=$(mktemp -d)
-  STATE=$VOL/state
-  TREE=$VOL/tree
-  mkdir -p "$TREE"
-  agentfs init --volume "$1" >/dev/null
-}
-
-# Runs agentfs against the current volume.
-agentfs() {
-  AGENTFS_STATE=$STATE AGENTFS_ROOT=$TREE AGENTFS_POD=${AGENTFS_POD:-ci-0} \
-    "$AGENTFS_BIN" "$@"
-}
-
-# Starts agentfs in the background with output to $1, setting AGENTFS_PID to
-# the binary's own PID (so signals reach it, not a subshell).
-agentfs_start() { # log args...
-  local log=$1; shift
-  AGENTFS_STATE=$STATE AGENTFS_ROOT=$TREE AGENTFS_POD=${AGENTFS_POD:-ci-0} \
-    "$AGENTFS_BIN" "$@" >"$log" 2>&1 &
-  AGENTFS_PID=$!
-}
-
-# Sets keys in the volume's history repository config.
-volume_config() { # key value
-  git --git-dir "$STATE/git" config "$1" "$2"
-}
-
-local_head() { # volume-name
-  git --git-dir "$STATE/git" rev-parse "refs/heads/agentfs/$1"
-}
-
-remote_ref() { # bare-repo ref
-  git --git-dir "$1" rev-parse --verify --quiet "$2" || true
 }
 
 # The LFS host of ci/git-http-server.sh (GIT_SERVER_LFS=1, 127.0.0.1:8081)

@@ -59,17 +59,13 @@ GitHub Actions. Run what you can locally and let CI run the rest.
 ### A local Linux gate in a container
 
 On macOS, or without the toolchain installed, run the gate in a container.
-Build a development image once with Docker (Podman takes the same commands),
-from the same Rust image the [Dockerfile](Dockerfile) builds with:
+Build a development image once with Docker (Podman takes the same commands,
+with `DOCKER=podman`), from the same Rust image the [Dockerfile](Dockerfile)
+builds with, which is the release [rust-toolchain.toml](rust-toolchain.toml)
+pins. Build it again when that pin changes:
 
 ```sh
-docker build -t agentfs-dev -f - . <<'EOF'
-FROM docker.io/library/rust:1.99-trixie
-RUN apt-get update \
- && apt-get install -y --no-install-recommends libssl-dev pkg-config git-lfs \
- && rm -rf /var/lib/apt/lists/* \
- && rustup component add rustfmt clippy
-EOF
+ci/dev-image.sh            # tags agentfs-dev
 ```
 
 This image has the release of `git` that CI and the agentfs image run

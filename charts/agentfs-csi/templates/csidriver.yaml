@@ -6,10 +6,10 @@ metadata:
   labels:
     {{- include "agentfs-csi.labels" . | nindent 4 }}
 spec:
-  # No attach step: a worktree lives on one node's disk, and its PV's node
+  # No attach step: a volume lives on one node's disk, and its PV's node
   # affinity keeps its pods there.
   attachRequired: false
-  # NodePublish gets the pod's identity: each pod's front commits as itself.
+  # NodePublish gets the pod's identity: its view records the pod's context.
   podInfoOnMount: true
   # PersistentVolumes only: inline volumes would let a pod author choose
   # the parameters, which are the operator's.

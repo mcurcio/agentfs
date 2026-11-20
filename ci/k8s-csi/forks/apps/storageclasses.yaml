@@ -1,5 +1,5 @@
 # The source's class, and the fork class (as deploy/csi/example's
-# agentfs-fork).
+# agentfs-fork, with its landing written out).
 apiVersion: storage.k8s.io/v1
 kind: StorageClass
 metadata:
@@ -7,7 +7,6 @@ metadata:
 provisioner: agentfs.mcurcio.github.io
 parameters:
   profile: cifork
-  onDelete: delete
 reclaimPolicy: Delete
 volumeBindingMode: WaitForFirstConsumer
 allowVolumeExpansion: false
@@ -19,7 +18,7 @@ metadata:
 provisioner: agentfs.mcurcio.github.io
 parameters:
   fork: "true"
-  volumeName: "{pvcNamespace}.{pvcName}.{pvName}"
+  landing: automatic
 reclaimPolicy: Delete
 volumeBindingMode: WaitForFirstConsumer
 allowVolumeExpansion: false

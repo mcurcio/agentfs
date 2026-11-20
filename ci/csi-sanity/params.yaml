@@ -1,4 +1,4 @@
 # CreateVolume parameters for csi-sanity (ci/csi-sanity.sh): the profile in
-# ci/csi-sanity/profiles.
+# ci/csi-sanity/profiles. onDelete is retain, the only disposition built.
 profile: sanity
-onDelete: delete
+onDelete: retain

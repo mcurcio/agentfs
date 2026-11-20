@@ -479,13 +479,9 @@ fn a_finished_fork_is_read_only() {
         assert!(text_status.contains(line), "{line}: {text_status}");
     }
     fs::write(s.path("fork-tree/c.txt"), "c\n").unwrap();
-    fs::create_dir_all(s.path("mnt")).unwrap();
-    let mnt = s.path("mnt").display().to_string();
-    let tree = s.path("fork-tree").display().to_string();
     for args in [
         vec!["record", "c.txt"],
         vec!["run"],
-        vec!["mount", tree.as_str(), mnt.as_str()],
         vec!["restore", "b.txt", "HEAD"],
         vec!["revert", "HEAD"],
         vec!["patch", "apply"],

@@ -1,6 +1,11 @@
 # Runbook: the history service is down
 
-With several mounts of one volume, every front (`agentfs mount
+This runbook is for the recording engine, on recording state areas, which
+no launcher runs any more: the CSI driver runs tree volumes, one
+`agentfs host` per volume ([csi.md](../csi.md)), and starts no history
+service.
+
+With several mounts of one volume, every front (`agentfs front
 --history-service`) hands each change boundary to the volume's history
 service (`agentfs serve-history`) and waits for it. While the service is
 down, hung or refusing a front, changes through that front are not

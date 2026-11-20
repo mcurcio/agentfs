@@ -4,8 +4,9 @@
 
 ## What stands until then
 
-`trees mount --metrics-output FILE` writes counters, the journal's length and each actor stage's runs, time and git
-children every 100 ms and at unmount. It never takes part in ordering. Nothing is exported to a collector.
+`mount --metrics-output FILE` writes counters, the journal's length and each actor stage's runs, time and git
+children every 100 ms and at unmount. It never takes part in ordering. Of the tree views, only the
+`agentfs.not_built` gauge is exported to a collector ([telemetry](../../telemetry.md)).
 
 ## What it proposes
 

@@ -1,11 +1,17 @@
 //! The engine's history as a replay reads it, from its bare repository (VERIFYING.md,
 //! "The model as the conformance suite"): one long-lived `git cat-file`, this
-//! crate's own parse of each commit's `metadata.json` and `namespace.json`, and
-//! [`EngineHistory`], the collisions and heads a replay compares. Never the
-//! library's bookkeeping (`tree_actor`).
+//! crate's own reader of each commit's layout (docs/trees.md, "What a commit
+//! holds": `files/`, `lines/` and `names/` under two hashed folders, and each
+//! directory's record in `dirs/`), and [`EngineHistory`], the collisions and
+//! heads a replay compares. Never the
+//! library's bookkeeping (`tree_actor`): the folders are hashed here with `git
+//! hash-object`, not the library's code.
 
 use crate::engine_names::EngineNames;
-use agentfs_model::calls::{CallError, History, ShownCollision, TreeId, gather_collisions};
+use agentfs_model::calls::{
+    CallError, Cause, EntryCollision, History, Kind, Meta, ShownCollision, TreeId,
+    gather_collisions, gather_entry_collisions,
+};
 use agentfs_model::content::{Content, Line, State};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
@@ -13,14 +19,27 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
+/// Every file commit, newest first: `rev-list` over every ref but the row
+/// chains under `refs/agentfs/`, which hold event commits (docs/trees.md,
+/// "Rows and event commits"), and the builder's scratch ref of a batch's
+/// event commits, `refs/build/rows`, there while a batch is in flight (a
+/// mount's attach is built while the harness reads).
+pub const FILE_COMMITS: [&str; 4] = [
+    "rev-list",
+    "--exclude=refs/agentfs/*",
+    "--exclude=refs/build/rows",
+    "--all",
+];
+
 /// A line version in a commit: the file's identity, the line's, the bytes.
 #[derive(Clone, Debug)]
 pub(crate) struct FileMap {
     pub(crate) path: String,
-    pub(crate) object: u64,
     pub(crate) identity: u64,
     pub(crate) lines: Vec<(String, String, Option<Vec<u8>>)>,
     pub(crate) ancestors: BTreeMap<String, Option<String>>,
+    /// The file's or link's metadata, the entry's third part.
+    pub(crate) meta: Meta,
 }
 
 /// One commit, parsed.
@@ -32,6 +51,8 @@ pub(crate) struct Commit {
     pub(crate) maps: BTreeMap<u64, FileMap>,
     /// Each file identity's name history: head, versions.
     pub(crate) names: BTreeMap<u64, (u64, BTreeMap<u64, NameVersion>)>,
+    /// Each directory's record by path, the root's (`dirs/root`) at `""`.
+    pub(crate) dirs: BTreeMap<String, Meta>,
 }
 
 #[derive(Clone, Debug)]
@@ -68,14 +89,29 @@ impl Commit {
         match v {
             Version::Line { file, version } => self.holds_line(*file, version),
             Version::Name { file, version } => self.holds_name(*file, *version),
+            Version::Entry { path } => match path.strip_suffix('/') {
+                Some(dir) => self.dirs.contains_key(dir),
+                None => self.files.contains_key(path),
+            },
         }
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum Version {
-    Line { file: u64, version: String },
-    Name { file: u64, version: u64 },
+    Line {
+        file: u64,
+        version: String,
+    },
+    Name {
+        file: u64,
+        version: u64,
+    },
+    /// An entry rules 13 and 14 judged, the winner of a whole loss they decided:
+    /// a file's path, or a directory's and a `/`.
+    Entry {
+        path: String,
+    },
 }
 
 impl Version {
@@ -94,14 +130,23 @@ impl Version {
                 file: number(&name["file"])?,
                 version: number(&name["version"])?,
             })
+        } else if let Some(entry) = v.get("Entry") {
+            Ok(Self::Entry {
+                path: entry["path"]
+                    .as_str()
+                    .ok_or_else(|| format!("bad version {v}"))?
+                    .to_owned(),
+            })
         } else {
             Err(format!("bad version {v}"))
         }
     }
 
-    pub(crate) fn file(&self) -> u64 {
+    /// The file a line or name version is of; none for an entry.
+    pub(crate) fn file(&self) -> Option<u64> {
         match self {
-            Self::Line { file, .. } | Self::Name { file, .. } => *file,
+            Self::Line { file, .. } | Self::Name { file, .. } => Some(*file),
+            Self::Entry { .. } => None,
         }
     }
 }
@@ -113,19 +158,64 @@ pub(crate) struct Decision {
     pub(crate) whole: bool,
 }
 
-pub(crate) fn decisions(c: &Commit) -> Result<Vec<Decision>, String> {
-    let mut out = Vec::new();
+/// A loss by rule 13 or 14: `{"cause":..,"path":..}`, its path a file's or a
+/// directory's and a `/`.
+#[derive(Clone, Debug)]
+pub(crate) struct EntryDecision {
+    pub(crate) cause: Cause,
+    pub(crate) path: String,
+}
+
+/// A commit's recorded decisions: of line and name versions, and of entries.
+pub(crate) fn all_decisions(c: &Commit) -> Result<(Vec<Decision>, Vec<EntryDecision>), String> {
+    let (mut versions, mut entries) = (Vec::new(), Vec::new());
     for json in c.trailers("Agentfs-Collisions") {
         let parsed: Value = serde_json::from_str(json).map_err(|e| e.to_string())?;
         for d in parsed.as_array().ok_or("collisions are not a list")? {
-            out.push(Decision {
+            if let Some(cause) = d["cause"].as_str() {
+                entries.push(EntryDecision {
+                    cause: Cause::from_word(cause).ok_or_else(|| format!("bad cause {d}"))?,
+                    path: d["path"]
+                        .as_str()
+                        .ok_or_else(|| format!("bad entry {d}"))?
+                        .to_owned(),
+                });
+                continue;
+            }
+            versions.push(Decision {
                 lost: Version::parse(&d["lost"])?,
                 winner: Version::parse(&d["winner"])?,
                 whole: d["kind"] == "Whole",
             });
         }
     }
-    Ok(out)
+    Ok((versions, entries))
+}
+
+/// Metadata as history holds it: `{"kind":"file","mode":"0644","uid":0,"gid":0}`.
+pub(crate) fn parse_meta(v: &Value) -> Result<Meta, String> {
+    let bad = || format!("bad metadata {v}");
+    let kind = match v["kind"].as_str().ok_or_else(bad)? {
+        "file" => Kind::File,
+        "symlink" => Kind::Symlink,
+        "dir" => Kind::Dir,
+        _ => return Err(bad()),
+    };
+    let mode = v["mode"]
+        .as_str()
+        .filter(|m| m.len() == 4)
+        .ok_or_else(bad)?;
+    let number = |k: &str| {
+        v[k].as_u64()
+            .and_then(|n| u32::try_from(n).ok())
+            .ok_or_else(bad)
+    };
+    Ok(Meta {
+        kind,
+        mode: u32::from_str_radix(mode, 8).map_err(|_| bad())?,
+        uid: number("uid")?,
+        gid: number("gid")?,
+    })
 }
 
 /// One long-lived `git cat-file --batch`, and short `git` commands.
@@ -134,6 +224,8 @@ pub(crate) struct Git {
     child: Child,
     input: ChildStdin,
     output: BufReader<ChildStdout>,
+    /// Each name's blob id, once asked of `git hash-object`.
+    hashes: BTreeMap<String, String>,
 }
 
 impl Git {
@@ -153,6 +245,7 @@ impl Git {
             child,
             input,
             output,
+            hashes: BTreeMap::new(),
         })
     }
 
@@ -210,34 +303,94 @@ impl Git {
         })
     }
 
+    /// `<aa>/<bb>`: hex digits 1-2 and 3-4 of `git hash-object --stdin` of
+    /// `name`, the folders the layout keeps it in.
+    fn folders(&mut self, name: &str) -> Result<String, String> {
+        let hex = self.hash(name)?;
+        Ok(format!("{}/{}", &hex[..2], &hex[2..4]))
+    }
+
+    /// `git hash-object --stdin` of `name`: its blob id.
+    fn hash(&mut self, name: &str) -> Result<String, String> {
+        if let Some(hex) = self.hashes.get(name) {
+            return Ok(hex.clone());
+        }
+        let mut child = Command::new("git")
+            .args(["hash-object", "--stdin"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .map_err(|e| e.to_string())?;
+        child
+            .stdin
+            .take()
+            .ok_or("no stdin")?
+            .write_all(name.as_bytes())
+            .map_err(|e| e.to_string())?;
+        let out = child.wait_with_output().map_err(|e| e.to_string())?;
+        let hex = String::from_utf8(out.stdout).map_err(|e| e.to_string())?;
+        let hex = hex.trim().to_owned();
+        if !out.status.success() || hex.len() < 4 {
+            return Err(format!("git hash-object of {name:?}: {hex:?}"));
+        }
+        self.hashes.insert(name.to_owned(), hex.clone());
+        Ok(hex)
+    }
+
+    /// Every blob under `top/` of commit `oid`: its name and object. A blob
+    /// outside the folders its name hashes to is a layout the engine never
+    /// writes.
+    fn leaves(&mut self, oid: &str, top: &str) -> Result<Vec<(String, String)>, String> {
+        let listing = self.run(&[
+            "ls-tree",
+            "-r",
+            "-z",
+            "--full-tree",
+            oid,
+            &format!("{top}/"),
+        ])?;
+        let mut leaves = Vec::new();
+        for record in listing.split_terminator('\0') {
+            let (meta, path) = record.split_once('\t').ok_or_else(|| record.to_owned())?;
+            let blob = meta.rsplit(' ').next().ok_or_else(|| record.to_owned())?;
+            let mut parts = path.splitn(4, '/');
+            let (Some(_), Some(aa), Some(bb), Some(name)) =
+                (parts.next(), parts.next(), parts.next(), parts.next())
+            else {
+                return Err(format!("{oid:.7}: {path} is not {top}/<aa>/<bb>/<name>"));
+            };
+            if self.folders(name)? != format!("{aa}/{bb}") {
+                return Err(format!("{oid:.7}: {path} is not in its name's folders"));
+            }
+            leaves.push((name.to_owned(), blob.to_owned()));
+        }
+        Ok(leaves)
+    }
+
     pub(crate) fn commit(&mut self, oid: &str) -> Result<Commit, String> {
         let header = self.header(oid)?;
-        let mut files = BTreeMap::new();
-        for line in self
-            .run(&["ls-tree", "-r", "--full-tree", oid, "files/"])?
-            .lines()
-        {
-            let (meta, path) = line.split_once('\t').ok_or_else(|| line.to_owned())?;
-            let blob = meta.rsplit(' ').next().ok_or_else(|| line.to_owned())?;
-            let name = path.strip_prefix("files/").unwrap_or(path).to_owned();
-            files.insert(name, self.object(blob)?);
-        }
-        let mut commit = Commit { files, ..header };
-        // The root commit has no envelope.
-        if commit.trailers("Agentfs-Format").is_empty() {
+        // The root commit has no envelope and holds no file: its tree is the
+        // root directory's record alone.
+        if header.trailers("Agentfs-Format").is_empty() {
+            for line in self.run(&["ls-tree", "-r", "--full-tree", oid])?.lines() {
+                let (_, path) = line.split_once('\t').ok_or_else(|| line.to_owned())?;
+                if path != "dirs/root" {
+                    return Err(format!("{oid:.7}: the root commit holds {path}"));
+                }
+            }
+            let mut commit = header;
+            commit.dirs = self.dirs(oid)?;
             return Ok(commit);
         }
-        let metadata: Value =
-            serde_json::from_slice(&self.object(&format!("{oid}:metadata.json"))?)
-                .map_err(|e| e.to_string())?;
-        for (path, entry) in metadata.as_object().ok_or("metadata is not a map")? {
-            let map = parse_map(path, entry).map_err(|e| format!("{oid} {path}: {e}"))?;
-            commit.maps.insert(map.identity, map);
+        let mut commit = header;
+        commit.dirs = self.dirs(oid)?;
+        for (name, blob) in self.leaves(oid, "files")? {
+            let bytes = self.object(&blob)?;
+            commit.files.insert(name, bytes);
         }
-        let namespace: Value =
-            serde_json::from_slice(&self.object(&format!("{oid}:namespace.json"))?)
-                .map_err(|e| e.to_string())?;
-        for (file, history) in namespace.as_object().ok_or("namespace is not a map")? {
+        for (file, blob) in self.leaves(oid, "names")? {
+            let history: Value =
+                serde_json::from_slice(&self.object(&blob)?).map_err(|e| e.to_string())?;
             let file: u64 = file.parse().map_err(|_| "bad file identity")?;
             let head = history["head"].as_u64().ok_or("bad name head")?;
             let mut versions = BTreeMap::new();
@@ -252,7 +405,60 @@ impl Git {
             }
             commit.names.insert(file, (head, versions));
         }
+        for (path, blob) in self.leaves(oid, "lines")? {
+            let entry: Value =
+                serde_json::from_slice(&self.object(&blob)?).map_err(|e| e.to_string())?;
+            let bytes = commit
+                .files
+                .get(&path)
+                .ok_or_else(|| format!("{oid:.7}: lines of {path} with no file"))?;
+            let map = parse_map(&path, &entry, bytes).map_err(|e| format!("{oid} {path}: {e}"))?;
+            if commit.name_path(map.identity) != Some(path.as_str()) {
+                return Err(format!(
+                    "{oid:.7}: lines of {path} name file {}, whose name is elsewhere",
+                    map.identity
+                ));
+            }
+            commit.maps.insert(map.identity, map);
+        }
         Ok(commit)
+    }
+}
+
+impl Git {
+    /// Every directory record of commit `oid`: `dirs/root`, and each
+    /// `dirs/<aa>/<bb>/<key>` whose `key` is its recorded path's whole blob
+    /// id, in the folders that id starts with. Any other blob under `dirs/`
+    /// is a layout the engine never writes.
+    fn dirs(&mut self, oid: &str) -> Result<BTreeMap<String, Meta>, String> {
+        let listing = self.run(&["ls-tree", "-r", "-z", "--full-tree", oid, "dirs/"])?;
+        let mut dirs = BTreeMap::new();
+        for record in listing.split_terminator('\0') {
+            let (head, path) = record.split_once('\t').ok_or_else(|| record.to_owned())?;
+            let blob = head.rsplit(' ').next().ok_or_else(|| record.to_owned())?;
+            let meta: Value =
+                serde_json::from_slice(&self.object(blob)?).map_err(|e| e.to_string())?;
+            let dir = meta["path"]
+                .as_str()
+                .ok_or_else(|| format!("{oid:.7}: {path} names no path"))?
+                .to_owned();
+            match path.split('/').collect::<Vec<_>>().as_slice() {
+                ["dirs", "root"] if dir.is_empty() => {}
+                ["dirs", aa, bb, leaf] if !dir.is_empty() => {
+                    let key = self.hash(&dir)?;
+                    if key != *leaf || !key.starts_with(&format!("{aa}{bb}")) {
+                        return Err(format!("{oid:.7}: {path} is not at {dir:?}'s key"));
+                    }
+                }
+                _ => return Err(format!("{oid:.7}: {path} is not dirs/<aa>/<bb>/<key>")),
+            }
+            let meta = parse_meta(&meta).map_err(|e| format!("{oid:.7} {path}: {e}"))?;
+            if meta.kind != Kind::Dir {
+                return Err(format!("{oid:.7}: {path} records a {:?}", meta.kind));
+            }
+            dirs.insert(dir, meta);
+        }
+        Ok(dirs)
     }
 }
 
@@ -263,41 +469,74 @@ impl Drop for Git {
     }
 }
 
-pub(crate) fn parse_map(path: &str, entry: &Value) -> Result<FileMap, String> {
-    let object = entry[0].as_u64().ok_or("bad object")?;
-    let identity = entry[1].as_u64().ok_or("bad identity")?;
-    let map = &entry[2];
+/// The version `n` after `version` (`"<event>:<index>"`) in its event's numbering.
+fn nth(version: &str, n: u64) -> Result<String, String> {
+    if n == 0 {
+        return Ok(version.to_owned());
+    }
+    let (event, index) = version.split_once(':').ok_or("bad version")?;
+    let index: u64 = index.parse().map_err(|_| "bad version")?;
+    Ok(format!("{event}:{}", index + n))
+}
+
+/// A `lines/` entry, `[identity, line map, meta]`, over the file's bytes. The map is
+/// runs of lines whose identities and versions number on; each live line ends
+/// at a newline, or after `open` bytes for a run's last line that has none; the
+/// ancestors are runs too (docs/trees.md, "What a commit holds").
+pub(crate) fn parse_map(path: &str, entry: &Value, bytes: &[u8]) -> Result<FileMap, String> {
+    let identity = entry[0].as_u64().ok_or("bad identity")?;
+    let meta = parse_meta(&entry[2])?;
+    if meta.kind == Kind::Dir {
+        return Err("a directory's metadata on a file".into());
+    }
+    let map = &entry[1];
+    let mut rest = bytes;
     let mut lines = Vec::new();
-    for l in map["lines"].as_array().ok_or("bad lines")? {
-        let bytes = match &l["bytes"] {
-            Value::Null => None,
-            b => Some(
-                b.as_array()
-                    .ok_or("bad bytes")?
-                    .iter()
-                    .map(|x| x.as_u64().map(|x| x as u8).ok_or("bad byte"))
-                    .collect::<Result<Vec<u8>, _>>()?,
-            ),
-        };
-        lines.push((
-            l["version"].as_str().ok_or("bad version")?.to_owned(),
-            l["identity"]
-                .as_str()
-                .ok_or("bad line identity")?
-                .to_owned(),
-            bytes,
-        ));
+    for run in map["lines"].as_array().ok_or("bad lines")? {
+        let first = run["identity"].as_str().ok_or("bad line identity")?;
+        let version = run["version"].as_str().ok_or("bad version")?;
+        let count = run["count"].as_u64().ok_or("bad count")?;
+        let dead = run["dead"].as_bool().unwrap_or(false);
+        for i in 0..count {
+            let bytes = if dead {
+                None
+            } else {
+                let len = match run["open"].as_u64() {
+                    Some(open) if i + 1 == count => open as usize,
+                    _ => {
+                        rest.iter()
+                            .position(|b| *b == b'\n')
+                            .ok_or("a live line past the file's bytes")?
+                            + 1
+                    }
+                };
+                if len > rest.len() {
+                    return Err("a live line past the file's bytes".into());
+                }
+                let (line, after) = rest.split_at(len);
+                rest = after;
+                Some(line.to_vec())
+            };
+            lines.push((nth(version, i)?, nth(first, i)?, bytes));
+        }
+    }
+    if !rest.is_empty() {
+        return Err("bytes past the map's live lines".into());
     }
     let mut ancestors = BTreeMap::new();
-    for (v, over) in map["ancestors"].as_object().ok_or("bad ancestors")? {
-        ancestors.insert(v.clone(), over.as_str().map(str::to_owned));
+    for run in map["ancestors"].as_array().ok_or("bad ancestors")? {
+        let version = run["version"].as_str().ok_or("bad version")?;
+        let over = run["over"].as_str();
+        for i in 0..run["count"].as_u64().ok_or("bad count")? {
+            ancestors.insert(nth(version, i)?, over.map(|o| nth(o, i)).transpose()?);
+        }
     }
     Ok(FileMap {
         path: path.to_owned(),
-        object,
         identity,
         lines,
         ancestors,
+        meta,
     })
 }
 
@@ -350,6 +589,7 @@ pub struct EngineHistory {
     refs: String,
     seen: BTreeSet<String>,
     lost: Vec<ShownCollision>,
+    lost_entries: Vec<EntryCollision>,
 }
 
 impl EngineHistory {
@@ -361,6 +601,7 @@ impl EngineHistory {
             refs: String::new(),
             seen: BTreeSet::new(),
             lost: Vec::new(),
+            lost_entries: Vec::new(),
         })
     }
 
@@ -372,7 +613,8 @@ impl EngineHistory {
         }
         let forks = self.git.run(&EngineNames::LIST_FORKS)?;
         self.names.read_forks(&forks).map_err(|e| e.to_string())?;
-        for oid in self.git.run(&["rev-list", "--all"])?.lines() {
+        // Every file commit: the row chains hold event commits only.
+        for oid in self.git.run(&FILE_COMMITS)?.lines() {
             if self.seen.insert(oid.to_owned())
                 && self.git.header(oid)?.trailers("Agentfs-Cause") == ["Landing"]
             {
@@ -394,12 +636,23 @@ impl EngineHistory {
             .names
             .tree(&name)
             .ok_or_else(|| format!("{oid:.7}: a landing in {name:?}, no tree of the trace"))?;
-        for d in decisions(&c)? {
-            let path = c
-                .name_path(d.lost.file())
-                .or(incoming.name_path(d.lost.file()))
-                .unwrap_or_default()
-                .to_owned();
+        let (versions, entries) = all_decisions(&c)?;
+        self.lost_entries
+            .extend(entries.into_iter().map(|d| EntryCollision {
+                tree,
+                cause: d.cause,
+                path: d.path,
+            }));
+        for d in versions {
+            let path = match (&d.lost, d.lost.file()) {
+                (Version::Entry { path }, _) => path.clone(),
+                (_, Some(file)) => c
+                    .name_path(file)
+                    .or(incoming.name_path(file))
+                    .unwrap_or_default()
+                    .to_owned(),
+                (_, None) => String::new(),
+            };
             let lost_bytes = match &d.lost {
                 Version::Line { file, version } => incoming
                     .maps
@@ -408,7 +661,7 @@ impl EngineHistory {
                     .and_then(|l| l.2.clone())
                     .into_iter()
                     .collect(),
-                Version::Name { .. } => Vec::new(),
+                Version::Name { .. } | Version::Entry { .. } => Vec::new(),
             };
             self.lost.push(ShownCollision {
                 tree,
@@ -425,6 +678,11 @@ impl<T: ?Sized> History<T> for EngineHistory {
     fn collisions(&mut self, _: &T) -> Result<Vec<ShownCollision>, CallError> {
         self.refresh().map_err(CallError::new)?;
         Ok(gather_collisions(self.lost.iter().cloned()))
+    }
+
+    fn entry_collisions(&mut self, _: &T) -> Result<Vec<EntryCollision>, CallError> {
+        self.refresh().map_err(CallError::new)?;
+        Ok(gather_entry_collisions(self.lost_entries.iter().cloned()))
     }
 
     fn head(&mut self, _: &T, t: TreeId) -> Result<(String, usize), CallError> {
@@ -502,37 +760,54 @@ pub(crate) mod tests {
             lines: Option<&[&str]>,
             extra: &str,
         ) -> String {
-            let (metadata, namespace) = match lines {
+            // File 1 at `a` (`git hash-object` gives 2e65...), its name history
+            // at `1` (56a6...).
+            let (map, history) = match lines {
                 Some(lines) => {
                     let lines: Vec<String> = lines
                         .iter()
-                        .map(|v| {
-                            format!(r#"{{"version":"{v}","identity":"{v}","bytes":[120,10]}}"#)
-                        })
+                        .map(|v| format!(r#"{{"identity":"{v}","version":"{v}","count":1}}"#))
                         .collect();
+                    let ancestors: Vec<String> = lines_versions(&lines);
                     (
-                        format!(
-                            r#"{{"a":[1,1,{{"lines":[{}],"ancestors":{{}}}}]}}"#,
-                            lines.join(",")
-                        ),
-                        r#"{"1":{"head":1,"versions":{"1":{"path":"a","over":null}}}}"#.to_owned(),
+                        Some(format!(
+                            r#"[1,{{"lines":[{}],"ancestors":[{}]}},{{"kind":"file","mode":"0644","uid":0,"gid":0}}]"#,
+                            lines.join(","),
+                            ancestors.join(",")
+                        )),
+                        r#"{"head":1,"versions":{"1":{"path":"a","over":null}}}"#.to_owned(),
                     )
                 }
                 None => (
-                    "{}".to_owned(),
-                    r#"{"1":{"head":2,"versions":{"2":{"path":null,"over":1}}}}"#.to_owned(),
+                    None,
+                    r#"{"head":2,"versions":{"2":{"path":null,"over":1}}}"#.to_owned(),
                 ),
             };
             let blob = |text: &str| self.git(&["hash-object", "-w", "--stdin"], text.as_bytes());
-            let tree = self.git(
-                &["mktree"],
+            let folder = |name: &str, entry: &str| {
+                self.git(&["mktree"], format!("{entry}\t{name}\n").as_bytes())
+            };
+            let hashed = |top: &str, aa: &str, bb: &str, leaf: &str, text: &str| {
+                let leaf = folder(leaf, &format!("100644 blob {}", blob(text)));
+                let bb = folder(bb, &format!("040000 tree {leaf}"));
                 format!(
-                    "100644 blob {}\tmetadata.json\n100644 blob {}\tnamespace.json\n",
-                    blob(&metadata),
-                    blob(&namespace)
+                    "040000 tree {}\t{top}\n",
+                    folder(aa, &format!("040000 tree {bb}"))
                 )
-                .as_bytes(),
-            );
+            };
+            let mut listing = String::new();
+            if let (Some(map), Some(lines)) = (&map, lines) {
+                listing.push_str(&hashed(
+                    "files",
+                    "2e",
+                    "65",
+                    "a",
+                    &"x\n".repeat(lines.len()),
+                ));
+                listing.push_str(&hashed("lines", "2e", "65", "a", map));
+            }
+            listing.push_str(&hashed("names", "56", "a6", "1", &history));
+            let tree = self.git(&["mktree"], listing.as_bytes());
             let mut args = vec!["commit-tree", tree.as_str()];
             for parent in parents {
                 args.extend(["-p", parent]);
@@ -541,11 +816,23 @@ pub(crate) mod tests {
             self.git(
             &args,
             format!(
-                "{cause}\n\nAgentfs-Writer: agentfs\nAgentfs-Cause: {cause}\nAgentfs-Format: envelope-1\n{extra}"
+                "{cause}\n\nAgentfs-Writer: agentfs\nAgentfs-Cause: {cause}\nAgentfs-Format: envelope-2\n{extra}"
             )
             .as_bytes(),
         )
         }
+    }
+
+    /// The ancestor runs of single-line runs: each version new.
+    fn lines_versions(lines: &[String]) -> Vec<String> {
+        lines
+            .iter()
+            .map(|run| {
+                let at = run.find(r#""version":""#).unwrap() + 11;
+                let version = &run[at..at + run[at..].find('"').unwrap()];
+                format!(r#"{{"version":"{version}","count":1}}"#)
+            })
+            .collect()
     }
 
     /// The engine's history reads a landing's lost line, its bytes from the
@@ -553,18 +840,18 @@ pub(crate) mod tests {
     #[test]
     fn a_landings_lost_line_and_a_head_are_read_from_git() {
         let repo = Repo::new();
-        let base = repo.commit(&[], "Root", Some(&["b"]));
-        let before = repo.commit(&[&base], "Direct", Some(&["u"]));
-        let incoming = repo.commit(&[&base], "Direct", Some(&["f"]));
+        let base = repo.commit(&[], "Root", Some(&["1:1"]));
+        let before = repo.commit(&[&base], "Direct", Some(&["2:1"]));
+        let incoming = repo.commit(&[&base], "Direct", Some(&["3:1"]));
         let trailers = format!(
             "Agentfs-Tree: fork/3\n{}{}\n",
-            r#"Agentfs-Collisions: [{"lost":{"Line":{"file":1,"version":"f"}},"#,
-            r#""winner":{"Line":{"file":1,"version":"u"}},"kind":"Line"}]"#,
+            r#"Agentfs-Collisions: [{"lost":{"Line":{"file":1,"version":"3:1"}},"#,
+            r#""winner":{"Line":{"file":1,"version":"2:1"}},"kind":"Line"}]"#,
         );
-        let landing = repo.commit_with(&[&before, &incoming], "Landing", Some(&["u"]), &trailers);
-        repo.git(&["update-ref", "refs/heads/r", &landing], b"");
+        let landing = repo.commit_with(&[&before, &incoming], "Landing", Some(&["2:1"]), &trailers);
+        repo.git(&["update-ref", "refs/heads/root", &landing], b"");
         repo.git(&["update-ref", "refs/heads/fork/3", &incoming], b"");
-        let mut history = EngineHistory::new(repo.path(), EngineNames::new("r")).unwrap();
+        let mut history = EngineHistory::new(repo.path(), EngineNames::new()).unwrap();
         let fork = TreeId::new(1);
         assert_eq!(
             History::<()>::collisions(&mut history, &()).unwrap(),

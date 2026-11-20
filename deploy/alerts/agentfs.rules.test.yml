@@ -3,7 +3,7 @@
 #   promtool test rules deploy/alerts/agentfs.rules.test.yml
 #
 # Series are as Prometheus stores agentfs's OTLP metrics; `_` is no sample,
-# so `_x5 1x30` is a counter that first appears at its first count. Three
+# so `_x5 1x30` is a counter that first appears at its first count. Four
 # alerts are checked with their annotations (the templates); the rest
 # through the ALERTS series, labels only.
 rule_files:
@@ -205,3 +205,27 @@ tests:
       - expr: ALERTS{alertname="AgentfsPushDiverged"}
         eval_time: 14m
         exp_samples: []
+
+  # A setting a tree volume does not build yet warns at once and for as
+  # long as it is configured: a capability counted 0 does not.
+  - interval: 1m
+    input_series:
+      - series: 'agentfs_not_built{job="agentfs",instance="pod-0",agentfs_volume="v",capability="push"}'
+        values: '1x10'
+      - series: 'agentfs_not_built{job="agentfs",instance="pod-0",agentfs_volume="v",capability="patches"}'
+        values: '0x10'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: AgentfsNotBuilt
+        exp_alerts:
+          - exp_labels: {severity: warning, job: agentfs, instance: pod-0, agentfs_volume: v, capability: push}
+            exp_annotations:
+              summary: "configured but not built yet: push (pod-0)"
+              description: "The volume's operator settings name 1 setting(s) of capability push, which tree volumes do not build yet: they do nothing. The volume keeps working. The mount's log has one \"not built:\" line per key; see docs/trees.md, \"Operator settings\"."
+              runbook_url: https://github.com/mcurcio/agentfs/blob/main/docs/trees.md#operator-settings
+    promql_expr_test:
+      - expr: ALERTS{alertname="AgentfsNotBuilt"}
+        eval_time: 5m
+        exp_samples:
+          - labels: 'ALERTS{alertname="AgentfsNotBuilt",alertstate="firing",severity="warning",job="agentfs",instance="pod-0",agentfs_volume="v",capability="push"}'
+            value: 1

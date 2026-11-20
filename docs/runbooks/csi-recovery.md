@@ -1,9 +1,10 @@
 # Runbook: recovering CSI volumes
 
-What to do when an agentfs CSI volume misbehaves: a crashed front or
-history service, a node plugin upgrade, a node reboot, a volume stuck
-staging, an undo in a live volume. The node plugin recovers crashes by itself; this runbook is for
-checking that it did and for the cases it cannot handle. Library: [kubernetes](../library/kubernetes.md); operator guide:
+What to do when an agentfs CSI volume misbehaves: a crashed volume host, a
+node plugin upgrade, a node reboot, a pod that will not mount, a claim that
+will not delete. The node plugin recovers crashes by itself; this runbook
+is for checking that it did and for the cases it cannot handle. Library:
+[kubernetes](../library/kubernetes.md); operator guide:
 [csi.md](../csi.md#8-recovery).
 
 Throughout, `$NODE_POD` is the node plugin pod on the node running the
@@ -14,257 +15,168 @@ NODE=$(kubectl -n <ns> get pod <pod> -o jsonpath='{.spec.nodeName}')
 NODE_POD=$(kubectl -n agentfs-csi get pod -l app.kubernetes.io/name=agentfs-csi-node \
   --field-selector spec.nodeName=$NODE -o name)
 PV=$(kubectl -n <ns> get pvc <claim> -o jsonpath='{.spec.volumeName}')
-status() { kubectl -n agentfs-csi exec $NODE_POD -c agentfs-csi -- \
-  agentfs --state /var/lib/agentfs-csi/volumes/$PV/state status; }
 plugin_log() { kubectl -n agentfs-csi logs $NODE_POD -c agentfs-csi "$@"; }
+in_plugin() { kubectl -n agentfs-csi exec $NODE_POD -c agentfs-csi -- "$@"; }
 ```
 
-## A crashed front
+## The host per volume
 
-**Symptoms.** One pod's file calls on the volume fail with "Transport
-endpoint is not connected" (`ENOTCONN`) for a few seconds; other pods on
-the volume keep working. The plugin log says:
+Each volume in use on a node has one `agentfs host` process in that node's
+plugin container: the volume's view host. Every pod's mount of the volume
+is a view it serves at the kubelet's target, and a fork claim's pod is
+served by its source volume's host.
 
+```sh
+in_plugin pgrep -af ' host --launcher csi'
+plugin_log | grep "\[host $PV\]"
 ```
-[front <ns>/<pod> <key>] ...
-front for <ns>/<pod> exited (killed by SIGKILL); restarting in 1s in slot 3
-front for <ns>/<pod> restarted in slot 3; its mount is stacked over the stale one at /var/lib/kubelet/pods/.../mount
-```
 
-**Check.**
+A host logs its settings that are not built (`not built: <key>
+(<capability>): ...`) at each start; that is expected, not a fault.
 
-1. `status` lists a front for the pod (`fronts:    slot 3: pid=… pod=<pod>`)
-   with a new pid, in the same slot as before.
-2. In the pod: `ls <mountPath>` works. If it still fails with `ENOTCONN`
-   and the volume mount has no `mountPropagation: HostToContainer`, the
-   container still sees the dead mount: restart the container (`kubectl
-   exec <pod> -- kill 1`, or delete the pod). Add `HostToContainer` to
-   the workload ([csi.md](../csi.md)).
-3. A front restarting in a loop (`restarting in 30s`) logs why in the
-   lines prefixed `[front <ns>/<pod> …]` above it: a full disk, a broken
-   profile, a service that refuses it (`refused this front: …`).
+## A crashed host
 
-Nothing is lost: a change whose call returned was journaled by the
-service ([guarantees](../guarantees.md)); changes whose call failed are recorded with their
-final state by the new front's repairs ([recording](../recording.md)).
+**Symptoms.** File calls in the volume's pods fail with "Transport
+endpoint is not connected" (`ENOTCONN`) for a few seconds.
 
-## A crashed or crash-looping history service
+The plugin starts the host again with backoff (1 s, doubling to
+`--backoff-max`, back to 1 s after a minute of uptime). The new host opens
+every published view of the volume again, stacked over the dead mount at
+each kubelet target, rebinding each view's client so a fork keeps its one
+writer, then reconciles.
 
-**Symptoms.** Every pod on the volume gets `EIO` on closes and renames,
-`HistoryServiceUnavailable` alarms fire, and the plugin log says
-`service for <pv> exited (…); restarting in …`.
+1. Check the log: `[host <pv>] exited: <exit>; restarting in 1s`, then
+   `published volume <pv> at <target>, over a stale mount`.
+2. A container without `mountPropagation: HostToContainer` keeps seeing
+   the dead mount: restart that container (or its pod).
+3. Repeated restarts with growing delays mean the host fails at start: its
+   last lines, prefixed `[host <pv>]`, say why (a full disk, a refused
+   setting). Fix the cause; the next attempt picks it up.
 
-**Check.**
-
-1. `plugin_log | grep "\[service $PV\]" | tail -n 50`: the service's own
-   last lines say why it stopped.
-2. `status`: `history:   serving fronts at unix:…` once it is back; the
-   journal line shows what it recovered.
-3. **The lock holder.** If the service cannot start because the state
-   area is locked (`locked by pid=… command=…`), something else holds it:
-   a leftover process from a previous plugin (check `ps` on the node), or
-   an operator's `agentfs` command in the plugin pod. Stop it; the plugin
-   retries with backoff.
-4. Fronts reconnect by themselves within their next request; no pod
-   restart is needed.
-
-For a service that keeps failing on the journal or history, follow
-[history-service-down.md](history-service-down.md) inside the plugin pod.
+To test the recovery, kill a host: `in_plugin pkill -9 -f "volumes/$PV/state
+host"`.
 
 ## Upgrading the node plugin
 
-The DaemonSet uses `updateStrategy: OnDelete`, because a restarting plugin
-stops its children: every agentfs mount on that node answers `ENOTCONN`
-until the new plugin has recovered them (seconds), and containers without
-`HostToContainer` propagation need a restart.
+A node plugin's restart stops that node's hosts: on SIGTERM (or when the
+plugin dies) each host's control channel closes. A host with no view open
+drains and exits 0; a host with views open exits at once with status 3,
+logging `stopped with N view(s) open`, and leaves each mount stale as a
+crash does. Their FUSE sessions cannot be handed to another process, so the
+node's mounts answer `ENOTCONN` until the new plugin opens them again from
+`<nodeState>/published/`, stacked over the stale mounts; each view's client
+is rebound, so a fork claim keeps its writer. The DaemonSet is
+`updateStrategy: OnDelete`: roll it node by node, stopping the node's
+agentfs pods first, so nothing is interrupted:
 
-Per node:
+```sh
+kubectl -n agentfs-csi set image daemonset/agentfs-csi-node agentfs-csi=<new image>
+for node in <nodes>; do
+  kubectl cordon "$node"
+  # Stop the node's pods that use agentfs volumes; they wait for this
+  # node (their PVs are pinned to it).
+  kubectl delete pod -A --field-selector spec.nodeName="$node" -l <your agentfs workloads>
+  kubectl -n agentfs-csi delete pod -l app.kubernetes.io/name=agentfs-csi-node \
+    --field-selector spec.nodeName="$node"
+  kubectl -n agentfs-csi wait pod -l app.kubernetes.io/name=agentfs-csi-node \
+    --field-selector spec.nodeName="$node" --for=condition=Ready --timeout=5m
+  kubectl uncordon "$node"
+done
+```
 
-1. Either drain it (`kubectl drain <node> --ignore-daemonsets`), so no
-   workload is affected, or accept a brief `ENOTCONN` for its pods.
-2. `kubectl -n agentfs-csi apply -k deploy/csi` (the new image), once.
-3. `kubectl -n agentfs-csi delete pod $NODE_POD`. On SIGTERM the plugin
-   stops every front and service; each makes its final commit within the
-   pod's grace period (60 s).
-4. The new pod logs `reconcile: started the history service for <pv>`
-   and `reconcile: recovering the front for <ns>/<pod> at …` for every
-   volume and target. Check `status` per volume.
-5. Restart containers without `HostToContainer` propagation, then
-   `kubectl uncordon <node>`.
-
-To roll back to an older image, do the same: the final commits in step 3
-empty every journal. A state area whose journal still holds a change the
-older version cannot read (a directory move) fails to open with an error
-naming `agentfs flush`; run it there with the newer image, then retry.
+With Helm, `helm upgrade` changes the DaemonSet the same way, and each
+node takes the new plugin only when its pod is deleted. Check each node's
+new plugin log for `reconciled: N host(s) started, M view(s) opened
+again, ...`. Deleting a plugin pod with the workloads still running also
+works: they see `ENOTCONN` until the new plugin has opened their views, and
+containers without `HostToContainer` need a restart.
 
 ## A node reboot
 
-Nothing to do in the common case: the records under
-`/var/lib/agentfs-csi/node` survive, the new plugin restarts the staged
-volumes' services, forgets the targets that no longer exist, and the
-kubelet stages and publishes the volumes again for the pods it restarts.
-Each service recovers its journal before it serves.
+The kubelet publishes the volumes of the pods it restarts, and the
+plugin's records from before the reboot are reconciled: those whose target
+is gone are dropped (`reconciled: ... N record(s) dropped`).
 
-Check that the plugin log has no `warning: an unreadable node record was
-skipped` lines; a record the plugin could not read is left in place and
-named there. Remove it by
-hand once the volume it names is not in use.
+## A pod that will not mount
 
-## A volume stuck staging
+**Symptoms.** A pod waits in `ContainerCreating` with a `FailedMount`
+event:
 
-**Symptoms.** Pods stay `ContainerCreating`; their events say
-`MountVolume.MountDevice failed … Unavailable desc = volume <pv>'s history
-service is starting (journal recovery or patch fetch); still waiting after
-60s` and repeat.
-
-The service is still starting: NodeStage waits `--stage-wait`, answers
-`UNAVAILABLE` and the kubelet retries, while the service keeps running.
-It is usually:
-
-- **Journal recovery** of a large journal (`[service <pv>] recovering …`).
-  Wait.
-- **Applying queued patches** ([patches](../patches.md)), bounded by
-  `agentfs.patchFetchTimeout`. Wait, or check the queue with
-  [patch-queue.md](patch-queue.md).
-- **A service that exits** at start: the event then says
-  `FailedPrecondition desc = volume <pv>'s history service exited (…)`
-  with its last log lines (a profile that
-  does not exist, a state area of another volume, a full disk). Fix the
-  cause; the kubelet's next attempt starts it again.
+- `several pods on one volume are not built`: another pod has the claim.
+  Stop it first; use `ReadWriteOncePod` and `strategy: Recreate`
+  ([csi.md](../csi.md#6-using-a-volume)).
+- `has had its writer`: a fork claim serves one pod for that pod's life.
+  Delete the fork claim and make a new one ([csi.md](../csi.md#14-forks)).
+- `is a recording-format volume`: a volume an older driver made, never
+  served: [moving.md](moving.md).
+- `no volume <pv> on node <node> under <base>; the pod waits`: the
+  directory is gone from the node's disk (a wiped disk). The volume is
+  lost; make a new claim.
+- `the host of volume <pv> refused to start` or `exited before it served`,
+  with its last lines: fix what they name (a full disk, a profile setting
+  refused at boot).
+- The call times out (`DeadlineExceeded`) for every claim of one volume, a
+  fork claim's too: a host answers its requests in order, and a `close`
+  answers only once the closed view's files are released. A process on the
+  node, outside the pod, that still holds a file of a view being unpublished
+  holds every later call on that volume. Find it with
+  `in_plugin sh -c 'ls -l /proc/[0-9]*/fd 2>/dev/null | grep <target>'`
+  and stop it; the calls then complete.
 
 ## A claim that will not delete
 
-**Symptoms.** A deleted claim's PV stays `Released` (or `Failed`), and
-its events (or the csi-provisioner's log) say `DeleteVolume … Failed
-precondition desc = volume <pv> has history no remote holds (origin
-lacks 3 commit(s)); nothing deleted`.
+**Symptoms.** A deleted claim's PV stays `Released`, with
+`VolumeFailedDelete` events (or lines in the csi-provisioner's log):
 
-The StorageClass says `onDelete: delete`, but the history service's
-final push at NodeUnstage did not reach every remote (the remote was
-down, its credentials were wrong, or `--push-grace` ran out), and nothing
-pushes an unstaged volume. Deleting would lose those commits, so the
-driver refuses and the provisioner retries
-([csi.md §9](../csi.md#9-operations)).
+- `volume <pv> is in use on this node (published at <target>); nothing
+  deleted`: a pod of the volume, or of one of its fork claims, still runs.
+  Stop it; the provisioner retries.
+- `is a recording-format volume`: archive it and remove its directory by
+  hand ([moving.md](moving.md)); the next retry succeeds.
+- `the host of volume <pv> did not release it`: the drain failed; its
+  lines say why.
+- The call never answers (`DeadlineExceeded` in the provisioner's log) and
+  the plugin log shows `tree DrainBlocked`: see the next section.
 
-1. Find the cause in the node plugin's log (`[service <pv>] … push
-   failed …`) or with `agentfs --state <basePath>/<pv>/state status` in
-   the node plugin pod (each remote's last error and unpushed commits).
-2. Fix it, then push by hand in the node plugin pod, which holds the
-   credentials:
+A deleted root claim's volume is kept, never removed: the plugin logs
+`kept volume <pv> at <dir>: ...`, and the directory stays with
+`csi.retained.json`. Mount it again with a static PV
+([csi.md](../csi.md#5-parameters)), or remove `<base>/<pv>` by hand once
+its history is archived (`git --git-dir <base>/<pv>/state/history.git
+bundle create <file> --all`).
 
-   ```sh
-   kubectl -n agentfs-csi exec "$NODE_POD" -c agentfs-csi -- \
-     agentfs --state /var/lib/agentfs-csi/volumes/<pv>/state push
-   ```
+## A host never exits
 
-   A diverged remote first needs [divergence.md](divergence.md).
-3. The provisioner's next retry deletes the volume.
+**Symptoms.** DeleteVolume, or a NodeUnpublish that closes a volume's last
+view, never answers; later calls on the volume answer `volume <pv> is busy:
+another process holds its state area`. The plugin log has
+`[host <pv>] tree DrainBlocked: the release waits for client(s) of another
+launcher to end: <label>#<n>@<launcher>/<tree>, ...`.
 
-To give the history up instead, remove `<basePath>/<pv>` by hand on the
-node; the next retry then finds no volume and succeeds.
+**Cause.** A host drains by ending launcher `csi`'s clients. A client another
+launcher attached and never ended (an operator's `agentfs mount` of the
+volume that was killed, launcher `cli`) holds the release, and only its own
+launcher ends it.
 
-## A fork that will not delete
+**Recovery.**
 
-**Symptoms.** A deleted fork claim's PV stays `Released`, and the
-csi-provisioner's log says `DeleteVolume … Unavailable desc = volume <pv>: the
-fork is active` (or `finished`, or `refused`) `: it is deleted once it is
-published or abandoned`.
-
-This is intended ([forks](../forks.md), [csi.md §14](../csi.md#14-forks)):
-a linked fork (the default) is deleted only once its fork remote holds
-its change and finish refs. An unlinked fork (`link: unlinked` in its
-class) never answers this way: it is never finished, and its
-DeleteVolume waits only as any worktree's does, while one of its own
-remotes (its class's `remotes` profile) lacks its head ([A claim that
-will not delete](#a-claim-that-will-not-delete)). With no remote of its
-own it never waits: `onDelete: delete`, a fork class's default, removes
-it with its history, and `retain` keeps it on the node. Recover such a
-fork's history only before deleting its claim: copy
-`<basePath>/<pv>/state` off the node, or give the class a `remotes`
-profile for the forks made after (the profile path is fixed in each
-fork's identity at create, so a fork made without one stays
-local-only). The node plugin's release scan runs `agentfs fork finish` for it at
-start and every `--release-scan-interval`; the finisher retries with
-backoff until the remote takes the push, or refuses it for good. First
-look at the fork, in the node plugin pod (no lock, no network):
-
-```sh
-kubectl -n agentfs-csi exec "$NODE_POD" -c agentfs-csi -- \
-  agentfs --state /var/lib/agentfs-csi/volumes/$PV/state fork status
-```
-
-`state:` is `active` or `finished` (pending: steps 1 and 2), `refused`
-(step 4), or `published` (the next DeleteVolume completes). `publish:`
-says why.
-
-1. Find the finisher's output in the node plugin's log: `[fork <pv>] …`,
-   with each push failure and why (unreachable, auth, refused).
-2. Fix the remote (it is the profile's fork remote: the section with
-   `agentfsForkRemote = true`, else the patch remote). The finisher's
-   next attempt, and then the provisioner's next DeleteVolume, complete
-   by themselves. To publish at once, in the node plugin pod:
+1. Stop the blocked host (it has no view open):
+   `in_plugin pkill -9 -f "volumes/$PV/state host"`.
+2. For launcher `cli`, run a mount of the volume that ends at once; its drain
+   ends `cli`'s clients:
 
    ```sh
-   kubectl -n agentfs-csi exec "$NODE_POD" -c agentfs-csi -- \
-     agentfs --state /var/lib/agentfs-csi/volumes/$PV/state \
-       --root /var/lib/agentfs-csi/volumes/$PV/backing fork finish --timeout 60s
+   in_plugin sh -c 'mkdir -p /tmp/end && agentfs --state <base>/<pv>/state mount /tmp/end -- true'
    ```
 
-   Exit 0 is published, 1 not yet or refused (it says why), 75 means the
-   release scan's own finisher holds the fork: add `--wait-lock 6m` (it
-   frees the lock at its 5-minute timeout).
-3. `FAILED_PRECONDITION … reading the fork status …; nothing deleted`:
-   the fork's settings or `meta/fork.json` cannot be read. The volume is
-   kept until they can; fix the profile, or move a corrupt
-   `meta/fork.json` aside (the next publish writes it again once the
-   remote confirms; a refusal or an abandon it recorded is lost with it).
-4. **Refused** (`state: refused`; the alarm `ForkRefused`, once; the
-   release scan starts no further finisher): the fork remote refuses for
-   good, and `publish:` names the reason. Each reason, its fix, and
-   publishing again with `fork finish --retry`, are in
-   [fork-refused.md](fork-refused.md).
-5. **Give the fork up** (unreachable for good, or its change not
-   wanted): abandon it on record, and the next DeleteVolume applies
-   `onDelete`, discarding the change (it stays in the fork's branch on the
-   fork remote, if it got there):
+   For another launcher, run `agentfs host --launcher <launcher>` on the
+   volume from that launcher and close its input.
+3. The provisioner retries DeleteVolume (or the kubelet NodeUnpublish), and
+   the new host releases.
 
-   ```sh
-   kubectl -n agentfs-csi exec "$NODE_POD" -c agentfs-csi -- \
-     agentfs --wait-lock 6m --state /var/lib/agentfs-csi/volumes/$PV/state \
-       fork abandon --reason "<why>"
-   ```
+## Related
 
-   It is refused for a published fork, and exits 75 while another
-   process holds the fork. After it nothing agentfs runs pushes the fork;
-   a push already running finishes or times out.
-
-## Undoing a change in a live volume
-
-Restores and reverts run through the volume's history service, with the
-pods still running
-([recovery-and-undo.md](recovery-and-undo.md)), from the node plugin pod
-on the node that stages the volume:
-
-```sh
-kubectl -n agentfs-csi exec "$NODE_POD" -c agentfs-csi -- \
-  agentfs --state /var/lib/agentfs-csi/volumes/$PV/state restore <path> <commit>
-```
-
-- **Exit status 1, open for writing**: a pod holds the file open. Pause
-  the workload, or add `--force` (the pod's later writes are recorded
-  too).
-- **Exit status 75, `not listening for the history service's calls`**: a
-  front named by slot is not reachable. `agentfs status` in the plugin
-  pod lists the fronts by slot; one restarting comes back within
-  seconds, so retry. A front from an older plugin image cannot listen:
-  restart its pod after the upgrade.
-- **Exit status 75, a front could not record what is dirty in it**: the
-  restore did not start (a `--dry-run` asks the fronts too). Retry once
-  the front is healthy; its pod's front log says why.
-- **Exit status 1 partway, `opened for writing`**: the service asks the
-  fronts again before each path; a pod opened that one for writing after
-  the first check. The paths before it are restored and recorded; pause
-  the workload and run the restore again.
-- **A warning that a front could not drop its caches**: the restore is
-  done and recorded, but that pod may show the old content until its
-  kernel's cache times out; restarting the pod clears it.
+- [moving.md](moving.md): recording-format volumes, and copying a volume
+  to another node.
+- [recording-failures.md](recording-failures.md): writes failing with
+  `EIO` or `ENOSPC`.

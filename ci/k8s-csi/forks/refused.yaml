@@ -1,0 +1,123 @@
+# Fork classes CreateVolume refuses as not built, each with a fork claim
+# of the source and a pod using it on the source's node
+# (WaitForFirstConsumer: provisioning starts once the pod is scheduled).
+# Both claims stay Pending with ProvisioningFailed events naming the
+# refusal (ci/e2e-csi-forks.sh): unlinked forks and landing approvals are
+# not built.
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: agentfs-ci-fork-unlinked
+provisioner: agentfs.mcurcio.github.io
+parameters:
+  fork: "true"
+  link: unlinked
+reclaimPolicy: Delete
+volumeBindingMode: WaitForFirstConsumer
+allowVolumeExpansion: false
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: unlinked
+  namespace: agentfs-csi-e2e-forks
+spec:
+  storageClassName: agentfs-ci-fork-unlinked
+  dataSource:
+    kind: PersistentVolumeClaim
+    name: source
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: unlinked-user
+  namespace: agentfs-csi-e2e-forks
+spec:
+  automountServiceAccountToken: false
+  terminationGracePeriodSeconds: 1
+  affinity:
+    podAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        - labelSelector:
+            matchLabels: { app.kubernetes.io/name: writer }
+          topologyKey: kubernetes.io/hostname
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 10000
+    seccompProfile: { type: RuntimeDefault }
+  containers:
+    - name: c
+      image: agentfs:ci
+      imagePullPolicy: Never
+      command: [sleep, infinity]
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities: { drop: [ALL] }
+      volumeMounts:
+        - { name: data, mountPath: /data }
+  volumes:
+    - name: data
+      persistentVolumeClaim: { claimName: unlinked }
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: agentfs-ci-fork-approval
+provisioner: agentfs.mcurcio.github.io
+parameters:
+  fork: "true"
+  landing: approval
+reclaimPolicy: Delete
+volumeBindingMode: WaitForFirstConsumer
+allowVolumeExpansion: false
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: approval
+  namespace: agentfs-csi-e2e-forks
+spec:
+  storageClassName: agentfs-ci-fork-approval
+  dataSource:
+    kind: PersistentVolumeClaim
+    name: source
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: approval-user
+  namespace: agentfs-csi-e2e-forks
+spec:
+  automountServiceAccountToken: false
+  terminationGracePeriodSeconds: 1
+  affinity:
+    podAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        - labelSelector:
+            matchLabels: { app.kubernetes.io/name: writer }
+          topologyKey: kubernetes.io/hostname
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 10000
+    seccompProfile: { type: RuntimeDefault }
+  containers:
+    - name: c
+      image: agentfs:ci
+      imagePullPolicy: Never
+      command: [sleep, infinity]
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities: { drop: [ALL] }
+      volumeMounts:
+        - { name: data, mountPath: /data }
+  volumes:
+    - name: data
+      persistentVolumeClaim: { claimName: approval }

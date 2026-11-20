@@ -26,8 +26,8 @@ Kubernetes: `>=1.30.0-0`
 |-----|------|---------|-------------|
 | alerts.enabled | bool | `false` | Install the example alert rules of deploy/alerts as a Prometheus Operator PrometheusRule (docs/deployment.md "Alerts"). Needs its CRD. |
 | alerts.labels | object | `{}` | More labels on the PrometheusRule, for your Prometheus's ruleSelector (kube-prometheus-stack selects `release: <its release>`). |
-| basePath.path | string | `"/var/lib/agentfs-csi/volumes"` | Where each node keeps its worktrees (`--base-path`): a hostPath directory on the node's own disk, ideally a disk of its own, since a full disk makes the kubelet evict every pod on the node. A network filesystem is refused (docs/csi.md). |
-| classAdmission.enabled | bool | `true` | Install the ValidatingAdmissionPolicy `agentfs-class`, which refuses any StorageClass of the driver whose reclaim policy is not Delete, so DeleteVolume always runs and the release decider always answers (docs/csi.md). Off: a class with Retain loses nothing, but its PVs stay Released for ever. |
+| basePath.path | string | `"/var/lib/agentfs-csi/volumes"` | Where each node keeps its volumes (`--base-path`): a hostPath directory on the node's own disk, ideally a disk of its own, since a full disk makes the kubelet evict every pod on the node. A network filesystem is refused (docs/csi.md). |
+| classAdmission.enabled | bool | `true` | Install the ValidatingAdmissionPolicy `agentfs-class`, which refuses any StorageClass of the driver whose reclaim policy is not Delete, so DeleteVolume always runs: it keeps a claim's volume on its node and ends a fork claim's fork (docs/csi.md). Off: a class with Retain loses nothing, but its PVs stay Released for ever. |
 | credentials.existingSecret | string | `""` | Use this existing Secret for remote credentials instead of the chart's; create it out of band (`kubectl create secret generic`). |
 | credentials.stringData | object | `{}` | Keys of the chart's own Secret, mounted at `/etc/agentfs-csi/credentials/<key>`. Prefer `existingSecret`: values end up in the release record. |
 | image.digest | string | `""` | A digest (`sha256:...`); when set, it pins the image. |
@@ -37,14 +37,14 @@ Kubernetes: `>=1.30.0-0`
 | imagePullSecrets | list | `[]` | Pull secrets for every image, as `[{name: ...}]`. |
 | kubeletDir | string | `"/var/lib/kubelet"` | The kubelet's directory on the nodes. Some distributions move it (k0s: `/var/lib/k0s/kubelet`). |
 | node.affinity | object | `{}` | The node plugin's affinity. |
-| node.env | list | `[{"name":"OTEL_SDK_DISABLED","value":"true"}]` | Environment of the node plugin, inherited by every history service and front: the `OTEL_*` variables (docs/telemetry.md). Point `OTEL_EXPORTER_OTLP_ENDPOINT` at your collector to turn telemetry on. |
-| node.extraArgs | list | `[]` | More `agentfs-csi` flags (docs/configuration.md), e.g. `--release-scan-interval=10s`. |
+| node.env | list | `[{"name":"OTEL_SDK_DISABLED","value":"true"}]` | Environment of the node plugin, inherited by every volume's `agentfs host`: the `OTEL_*` variables (docs/telemetry.md), which export the `agentfs.not_built` gauge. Point `OTEL_EXPORTER_OTLP_ENDPOINT` at your collector to turn telemetry on. |
+| node.extraArgs | list | `[]` | More `agentfs-csi` flags (docs/configuration.md), e.g. `--backoff-max=30s`. |
 | node.nodeSelector | object | `{}` | The node plugin's node selector. |
 | node.podAnnotations | object | `{}` | Annotations on the node plugin's pods. |
 | node.priorityClassName | string | `"system-node-critical"` | The node plugin's priority class. |
-| node.resources | object | `{}` | The agentfs-csi container's resources. Every history service and front on the node runs in this container, inside these limits. |
-| node.stateDir | string | `"/var/lib/agentfs-csi/node"` | Where the node keeps its staged and published records (`--node-state`); must survive plugin restarts. |
-| node.terminationGracePeriodSeconds | int | `60` | Longer than `--unpublish-grace` plus `--unstage-grace`, so a stopped plugin lets its children make their final commits. |
+| node.resources | object | `{}` | The agentfs-csi container's resources. Every `agentfs host` on the node runs in this container, inside these limits. |
+| node.stateDir | string | `"/var/lib/agentfs-csi/node"` | Where the node keeps its published records (`--node-state`); must survive plugin restarts. |
+| node.terminationGracePeriodSeconds | int | `60` | A stopping plugin closes each host's standard input: the hosts drain, making their last commits, and exit within this grace. |
 | node.tolerations | list | `[{"operator":"Exists"}]` | The node plugin runs on every node by default. |
 | profiles | object | `{}` | Profiles: every setting of a volume, by name (docs/csi.md "Profiles and credentials"). Each is `{config, exclude, attributes}`: the git-config fragment and the optional rule files. A StorageClass picks one with the parameter `profile: <name>`. Load files with `--set-file profiles.<name>.config=<path>`. |
 | server.affinity | object | `{}` | The server's affinity. |
@@ -72,7 +72,7 @@ Kubernetes: `>=1.30.0-0`
 | sidecars.nodeDriverRegistrar.resources | object | `{}` | node-driver-registrar's resources. |
 | sidecars.provisioner.extraArgs | list | `[]` | More csi-provisioner flags, e.g. `--retry-interval-max=20s`. |
 | sidecars.provisioner.image.digest | string | `"sha256:6ebe60fd8ed67a7f8a90d34402e9e706b274e53612d6fa5fbb8285728db622e2"` | csi-provisioner's digest. |
-| sidecars.provisioner.image.repository | string | `"registry.k8s.io/sig-storage/csi-provisioner"` | csi-provisioner's image: in the node plugin pod of every node (`--node-deployment`), provisioning that node's worktrees. |
+| sidecars.provisioner.image.repository | string | `"registry.k8s.io/sig-storage/csi-provisioner"` | csi-provisioner's image: in the node plugin pod of every node (`--node-deployment`), provisioning that node's volumes. |
 | sidecars.provisioner.image.tag | string | `"v6.4.0"` | csi-provisioner's tag. |
 | sidecars.provisioner.resources | object | `{}` | csi-provisioner's resources. |
-| storageClasses | list | `[]` | StorageClasses of the driver: `[{name, parameters, reclaimPolicy, volumeBindingMode, annotations}]`. `parameters` go to the driver as written (docs/configuration.md "The CSI driver"). `reclaimPolicy` defaults to Delete (the class admission policy refuses any other; a worktree is kept by `onDelete: retain`, the default); `volumeBindingMode` to WaitForFirstConsumer, which picks the node first. A fork class (`fork: "true"`) may set `link: linked` (the default: its forks deliver their change back to the source) or `link: unlinked` (independent forks, nothing ever delivered, never pushed to the source's remotes). An unlinked class's `remotes: <profile>` names the profile whose config holds the forks' own remotes; without it they are local-only and deleting a claim loses its history (docs/csi.md). |
+| storageClasses | list | `[]` | StorageClasses of the driver: `[{name, parameters, reclaimPolicy, volumeBindingMode, annotations}]`. `parameters` go to the driver as written (docs/configuration.md "The CSI driver"). `reclaimPolicy` defaults to Delete (the class admission policy refuses any other; a claim's volume is kept on its node by `onDelete: retain`, the default and the only choice built); `volumeBindingMode` to WaitForFirstConsumer, which picks the node first. A fork class (`fork: "true"`) takes only `landing: automatic` (the default): its fork claims are forks of their source's volume whose changes land in it. `link: unlinked`, `landing: approval` and `startFrom` are refused as not built (docs/csi.md). |

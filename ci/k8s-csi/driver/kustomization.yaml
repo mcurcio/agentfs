@@ -1,6 +1,6 @@
 # The CI overlay of deploy/csi for the e2e-csi job (ci/e2e-csi.sh): the
-# image built by the job, a `ci` profile pushing to the runner's git server
-# every 2 seconds, and its credentials.
+# image built by the job, a `ci` profile naming the runner's git server as
+# its remote (logged as not built), and its credentials.
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 

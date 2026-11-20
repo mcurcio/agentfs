@@ -8,6 +8,10 @@ lost from the backing tree; history may differ from it beneath the
 destination until each affected file changes again or is recorded by
 hand.
 
+This alarm is the recording engine's, on recording state areas, which no
+launcher runs any more; tree volumes, the CSI driver's among them
+([csi.md](../csi.md)), do not raise it.
+
 ## Symptoms
 
 - A `ReconcileFailed` alarm (stderr `alarm: reconciling the move of

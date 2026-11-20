@@ -1,5 +1,6 @@
 # The source volume, kept in use by a pod that writes to it every few
-# seconds while it is forked.
+# seconds while it is forked. Fork claims are made on the source's node:
+# their pods have affinity to the writer's label.
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -17,6 +18,7 @@ kind: Pod
 metadata:
   name: writer
   namespace: agentfs-csi-e2e-forks
+  labels: { app.kubernetes.io/name: writer }
 spec:
   automountServiceAccountToken: false
   terminationGracePeriodSeconds: 5

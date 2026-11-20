@@ -2,10 +2,12 @@
 
 `agentfs-csi` is a CSI driver. It lets a cluster hand an agentfs volume to a
 pod the way it hands out any other volume: a StorageClass, a claim, a mount.
-It is the third integration layer. It adds no recording of its own. For every
-long-running piece it starts the `agentfs` binary from the [filesystem
-layer](filesystem.md), and for the volume lifecycle it uses
-[`agentfs-core`](core.md).
+It is the third integration layer. It adds no recording of its own: every
+volume is a tree volume ([trees](../trees.md)), and the driver runs the
+`agentfs` binary of the [filesystem layer](filesystem.md) for it, `agentfs
+init` to make a volume and one `agentfs host` per volume in use, driven over
+the host's control protocol ([the view host
+command](filesystem.md#the-view-host-command)).
 
 Use this page when you build on the driver as a library, test against fakes of
 its process and mount operations, or need to know exactly what each CSI call
@@ -22,27 +24,28 @@ csi-provisioner in `--node-deployment` mode, node-driver-registrar and
 livenessprobe. It serves all three CSI services (Identity, Controller and
 Node) on one Unix socket, with the CSI v1.13 protocol.
 
-Each claim is a **worktree**: a directory of files and its own git branch
-`agentfs/<volume>`, on the disk of the node that made it, for good. Any number
-of pods on that node share it. Every multi-node access mode is refused.
-Continuing a volume on another node is a new volume started from the old
-branch ([moving runbook](../runbooks/moving.md)).
+Each claim is a tree volume on the disk of the node that made it, for good,
+served to one pod; a fork claim is a fork inside its source's volume. Every
+multi-node access mode is refused.
 
-- There is no controller Deployment and no attach step. The driver advertises
-  `VOLUME_ACCESSIBILITY_CONSTRAINTS`. NodeGetInfo and CreateVolume answer the
-  node's topology, `topology.agentfs.mcurcio.github.io/node = <node>`, so the
-  PV's node affinity keeps every pod of the claim on that node. Use
-  `WaitForFirstConsumer` so the scheduler picks the node first.
-- `CSIDriver.attachRequired` is `false`. ControllerPublish and
-  ControllerUnpublish are not offered.
+- There is no controller Deployment, no attach step and no stage step. The
+  driver advertises `VOLUME_ACCESSIBILITY_CONSTRAINTS`. NodeGetInfo and
+  CreateVolume answer the node's topology,
+  `topology.agentfs.mcurcio.github.io/node = <node>`, so the PV's node affinity
+  keeps every pod of the claim on that node. Use `WaitForFirstConsumer` so the
+  scheduler picks the node first.
+- `CSIDriver.attachRequired` is `false`. ControllerPublish, ControllerUnpublish,
+  NodeStage and NodeUnstage answer `UNIMPLEMENTED`; the node does not advertise
+  `STAGE_UNSTAGE_VOLUME`.
 - The driver name is `agentfs.mcurcio.github.io` (`agentfs_csi::DRIVER_NAME`).
 - It supports persistent volumes only (`volumeLifecycleModes: [Persistent]`).
-  Inline ephemeral volumes are refused (`EPHEMERAL_REFUSED`), since their
+  Inline ephemeral volumes are refused (`node::EPHEMERAL_REFUSED`), since their
   parameters would be the pod author's.
 - It supports mount volumes with a single-node access mode
   (`SINGLE_NODE_WRITER`, `SINGLE_NODE_SINGLE_WRITER`,
   `SINGLE_NODE_MULTI_WRITER`, `SINGLE_NODE_READER_ONLY`), with no mount flags.
-  A block volume, a mount flag or a multi-node mode is `INVALID_ARGUMENT`.
+  A block volume, a mount flag or a multi-node mode (`volume::MULTI_NODE`) is
+  `INVALID_ARGUMENT`.
 - It advertises `CLONE_VOLUME` and clones only into a fork class. Any other
   content source, and every snapshot, is `INVALID_ARGUMENT`.
 
@@ -50,38 +53,39 @@ branch ([moving runbook](../runbooks/moving.md)).
 |---|---|
 | `csi` | The vendored CSI v1.13 protocol, generated at build time |
 | `identity` | `IdentityService` and the topology key |
-| `controller` | `ControllerService`: CreateVolume and DeleteVolume on this node |
-| `node` | `NodeService`: validates a call and hands it to the supervisor |
-| `supervisor` | `Supervisor`: the per-volume service, the per-pod fronts, restarts, recovery |
-| `release_scan` | `ReleaseScan`: pushes and finishes worktrees that no pod stages |
-| `launcher` | `Launcher` and `AgentfsLauncher`: spawns the `agentfs` binary |
-| `mounter` | `Mounter` and `KernelMounter`: bind mounts onto the kubelet's targets |
-| `params` | StorageClass and PV parameters, `VolumeParams`, `ForkClass` |
-| `layout` | `Layout`: where the driver keeps things |
-| `records` | `VolumeRecord`, `StagedRecord`, `PublishedRecord`: written atomically |
-| `volume` | Creating, adopting and forking worktrees; capability checks |
-| `server` | `serve`: the CSI endpoint on a Unix socket, with graceful shutdown |
+| `controller` | `ControllerService`: CreateVolume and DeleteVolume on this node; the recording-format refusal |
+| `node` | `NodeService`: validates a call, resolves the claim (adopting a static PV over a kept volume) and hands it to the supervisor |
+| `supervisor` | `Supervisor`: `agentfs init` per volume made, one `agentfs host` per volume in use, views opened at the kubelet's targets, one pod per claim, restarts with backoff, reconcile at start, release |
+| `host_client` | `HostClient`: the plugin's end of a host's control channel, an actor owning the stream |
+| `launcher` | `Launcher` and `AgentfsLauncher`: spawns `agentfs init` and `agentfs host` (`init_spec`, `host_spec`), the host's standard input one end of a socket pair |
+| `mounter` | `Mounter` and `KernelMounter`: what is mounted at a target, and lazy detaches of views no host serves |
+| `params` | StorageClass and PV parameters (`VolumeParams`), the refusals' texts, the pod context of a publish |
+| `layout` | `Layout`: where the driver keeps things; `target_key`, the view's label |
+| `records` | `ClaimRecord` (`csi.json`) and `PublishedRecord` (`<nodeState>/published/<pv>.json`), written whole |
+| `volume` | Capability checks and a profile's config |
+| `server` | The CSI endpoint on a Unix socket, with graceful shutdown |
 | `error` | `Error`, mapped onto gRPC status codes |
 
 ## How a CSI call maps onto agentfs
 
 | CSI call | What happens |
 |---|---|
-| CreateVolume | Makes `<basePath>/<pv>/{backing,state,csi.json}` on this node. The request's topology must include this node (`RESOURCE_EXHAUSTED` otherwise). The state area is initialised in-process (`init_with`, or `start_from` for a start class) with the profile's config included and its rules installed. The answer carries the node's topology. A start class fetches once. A fork class clones its source locally with no network |
-| NodeStage | Checks the worktree and never creates one: a missing worktree is `NOT_FOUND` naming the node. A static PV is adopted only over an existing worktree of its volume (`reopen_with`). Starts `agentfs serve-history` for the volume and waits a bounded time for it to listen (`--stage-wait`, then `UNAVAILABLE`, and the kubelet retries) |
-| NodePublish | Starts a front, `agentfs mount --history-service`, with the pod's identity, mounted at a private source. Bind-mounts it onto the kubelet's target |
-| NodeUnpublish | Detaches the target, then stops the front (SIGTERM, SIGKILL after `--unpublish-grace`) |
-| NodeUnstage | Refused while targets are published. Then stops the service (SIGTERM, SIGKILL after `--unstage-grace`; the journal makes that safe). The service makes its final commit and pushes it once more |
-| DeleteVolume | Asks the release decider and never pushes. *Delete* renames the directory to `.deleting.<handle>` under the state lock and removes it. *Keep* renames `csi.json` to `csi.retained.json`. *Wait* answers `UNAVAILABLE` and wakes the release scan |
+| CreateVolume | Inspects `<base>/<pv>/state` first (a recording-format state area is `ALREADY_EXISTS`, naming the moving runbook). Then `Supervisor::ensure` runs `agentfs --state <base>/<pv>/state init --volume <name> --include <profiles>/<profile>.config` (Volume's ensure) and installs the profile's rule files, and `csi.json` is written. The request's topology must include this node (`RESOURCE_EXHAUSTED` otherwise). A fork class makes a fork claim ([CSI](../csi.md#14-forks)) |
+| NodePublish | Resolves the claim to a volume and a tree (`TreeRef::Root`, or `TreeRef::Fork(key)` for a fork claim). `Supervisor::publish` refuses a claim published at another target, starts the volume's host if none runs, sends `open` with the target, the label `csi-<target_key>`, the read-only flag and the pod's context, and writes the published record |
+| NodeUnpublish | `Supervisor::unpublish` sends `close`, removes the record and the target directory, and stops the host after its last view |
+| DeleteVolume | A root claim: `FAILED_PRECONDITION` while the volume is published on the node; else `Supervisor::release` starts a host with no view and stops it (exit 0 is Volume's release), and `csi.json` is renamed `csi.retained.json`. A fork claim: `fork_end` by key on its source's host |
 
-The node plugin spawns the `agentfs` binary for every long-running piece
-rather than linking FUSE into the gRPC server. A crashed front or service
-cannot take the server down, and the processes, flags and logs are the ones
-the single-node setup uses. The process tree is `tini`, then `agentfs-csi`,
-then its children.
+The node plugin spawns the `agentfs` binary for each volume rather than
+linking FUSE into the gRPC server. A crashed host cannot take the server down,
+and the boot, telemetry and drain are the binary's own. The process tree is
+`tini`, then `agentfs-csi`, then its children. Children's output goes to the
+plugin's stderr line by line, prefixed `[host <pv>]` or `[init <pv>]`; the last
+lines are kept for error messages. Inherited `AGENTFS_*` variables are removed
+from a child's environment; `OTEL_*` ones pass through.
 
-`podInfoOnMount` gives NodePublish the pod's name, namespace and uid. The front
-passes them on as its origin, so each pod commits as itself.
+`podInfoOnMount` gives NodePublish the pod's name, namespace and uid
+(`params::pod_context`), with the node's name; the host's view writes as a
+client with that context, so each save carries its pod's trailers.
 
 ## Error mapping
 
@@ -89,284 +93,108 @@ passes them on as its origin, so each pod commits as itself.
 tonic::Status` maps them: `InvalidArgument`, `NotFound`, `AlreadyExists`,
 `FailedPrecondition`, `Aborted`, `Unavailable`, `ResourceExhausted` and
 `Internal`. A message says what to do about it. `Unavailable` means "not ready
-yet": the container orchestrator retries. Little network work happens in a call:
-CreateVolume of a start class fetches once, DeleteVolume lists each remote once,
-and NodeUnstage waits on the service's final push, bounded by `--push-grace`.
-No call pushes.
+yet": the container orchestrator retries. A host's refusal maps by its kind:
+`fork_taken`, `key_unknown`, `key_ended` and `stale` to `FAILED_PRECONDITION`,
+`occupied` to `ALREADY_EXISTS`, `mount_failed` to `INTERNAL`, `draining` and
+`stopped` to `UNAVAILABLE`, `nested_not_built` and `approval_not_built` to
+`INVALID_ARGUMENT`, each with the host's message. No call does network work.
 
 ## Parameters
 
-A StorageClass, or a static PV's volume context, is parsed by
-`params::VolumeParams::from_create(name, &parameters)` and
-`from_context`:
+A StorageClass is parsed by `params::VolumeParams::from_create(pv_name,
+&parameters)`, a static PV's volume attributes (and the context CreateVolume
+returns, `to_context`) by `from_static`:
 
 | Key | Meaning |
 |---|---|
-| `profile` | Required. Names a profile: `<profile>.config` (a git-config fragment), `.exclude` and `.attributes`, under `--profiles-dir`. Credentials are files of a Secret in the driver's namespace |
-| `volumeName` | A template over the claim's namespace and name and the PV name. The default is `{pvcNamespace}.{pvcName}.{pvName}`. It must contain `{pvName}`, so a re-made claim is a new worktree with a new branch |
-| `onDelete` | `retain` (the default) or `delete` |
-| `startFrom` | `"<remote>:<branch>@<commit>"`: every claim starts as a new worktree whose history begins at that commit of another worktree's branch |
-| `workloadMounts` | Comma-separated `PATH` or `PATH=DIR`, passed to every front as `--workload-mount` so a worktree's absolute `gitdir:` targets map exactly |
-| `fork`, `link`, `remotes` | Fork classes only (`params::ForkClass`) |
+| `profile` | Required. Names a profile: `<profile>.config`, `.exclude` and `.attributes`, under `--profiles-dir` |
+| `volumeName` | A template over the claim's namespace and name and the PV name. The default is `{pvcNamespace}.{pvcName}.{pvName}`. It must contain `{pvName}`, so a re-made claim is a new volume. In a static PV, a literal name (`volume` is the same key) |
+| `onDelete` | `retain` only; `delete` is `ON_DELETE_NOT_BUILT` |
+| `fork` | `"true"`: a fork class (`is_fork_class`) |
 
-An unknown key is refused. There is no `branch` parameter: a worktree's branch
-is always `agentfs/<volume>`, named once in its identity, which no include,
-static PV, stage or start can change. `VolumeParams::branch_name()` returns it.
-
-A start point names a branch only. A `refs/...` name is refused
-(`INVALID_ARGUMENT`, "not a branch"), and so is the new volume's own branch.
-Start-class codes: `INVALID_ARGUMENT` (shape, a remote not in the profile, own
-branch), `FAILED_PRECONDITION` (no such branch, commit not on it),
-`UNAVAILABLE` (a fetch or an LFS download failed; retried), `ALREADY_EXISTS`
-(the name exists with another start point).
-
-A fork class is a StorageClass with `fork: "true"`. It must not set `profile`,
-`branch` or `startFrom`. It has its source's profile, its own branch, and starts
-from its source's head. Its `volumeName` must name `{pvName}` and its `onDelete`
-defaults to `delete`. The source must be on the fork's node
-(`FAILED_PRECONDITION` otherwise, naming the remedy: pod affinity to the
-source's pods). See [forks](../forks.md).
+`startFrom` (`START_FROM_NOT_BUILT`) and `workloadMounts`
+(`WORKLOAD_MOUNTS_NOT_BUILT`) are refused as not built; `link` and `remotes`
+are a fork class's. An unknown key is refused, `branch` included. Keys under
+`csi.storage.k8s.io/` feed the template and are otherwise ignored. A fork
+class takes `fork` and `landing` only ([CSI](../csi.md#14-forks)).
 
 ## The supervisor
 
-`Supervisor` is what NodeService calls. Build one from a `NodeConfig`, a
-`Launcher` and a `Mounter`:
+`Supervisor::new(NodeConfig, Arc<dyn Launcher>, Arc<dyn Mounter>)` owns every
+host on the node. Each volume's calls run one at a time under a per-volume
+async lock; every on-demand start and stop happens under it.
 
-```rust
-use std::sync::Arc;
-use agentfs_csi::launcher::AgentfsLauncher;
-use agentfs_csi::layout::Layout;
-use agentfs_csi::mounter::KernelMounter;
-use agentfs_csi::supervisor::{NodeConfig, Supervisor};
+- **Ensure** runs `agentfs init` and installs the profile's rule files
+  (`agentfs_core::operator_settings::install_rules`) into
+  `state/history.git/info/`. It refuses while the volume is served, since its
+  settings change only while it is not.
+- **Starting a host** installs the rule files again, spawns `agentfs host`
+  (`launcher::host_spec`), reads its `Hello` (checking the volume's name), then
+  opens every recorded view of the volume whose target is still there, stacked
+  over a stale mount a crashed host left, and sends `reconcile`. A recorded
+  view whose target is gone is dropped.
+- **Publish** allows one pod per claim: a claim published at another target is
+  `FAILED_PRECONDITION` (`several pods on one volume are not built`), at the
+  same target with another read-only flag `ALREADY_EXISTS`, at the same target
+  with the same flag a success.
+- **Stopping a host** drops its `HostClient`: the task closes the stream.
+  With no view open (every stop the supervisor asks for) the host drains and
+  exits 0 once Volume releases the volume; with views open (the plugin's
+  shutdown) it exits 3 at once and leaves them stale for the next host
+  ([the view host command](filesystem.md#the-view-host-command)).
+- **A host that exits unasked** is started again after `next_backoff` (1 s,
+  doubling to `Backoff::max`, back to 1 s after a minute of uptime) while
+  records of the volume remain, with every view replayed. A start that fails
+  is tried again with backoff. These delays are its only timers, beside one
+  bound: `AgentfsLauncher` waits up to 1 s per output pipe for a child's last
+  lines before it reports the exit, because a grandchild may hold the pipes
+  open; lines later than that miss the exit's error text.
+- **Release** starts the volume's host with no view and stops it; its exit 0
+  is Volume's release verdict.
+- **Reconcile**, at plugin start, drops the published records whose target is
+  gone, starts a host per volume that still has views, and logs each
+  recording-format volume under the base path, which it never serves
+  (`ReconcileReport`).
+- **Shutdown** stops every host and waits for each to exit.
 
-let layout = Layout {
-    base: "/var/lib/agentfs-csi/volumes".into(),
-    node_state: "/var/lib/agentfs-csi/node".into(),
-    mount_dir: "/run/agentfs-csi/mounts".into(),
-    profiles: "/etc/agentfs-csi/profiles".into(),
-};
-let config = NodeConfig::new("node-a", layout);
-let supervisor = Supervisor::new(
-    config,
-    Arc::new(AgentfsLauncher { bin: "/usr/local/bin/agentfs".into() }),
-    Arc::new(KernelMounter),
-);
-
-// Rebuild services and recover fronts from the records, then serve.
-let report = supervisor.reconcile().await?;
-```
-
-`Launcher` and `Mounter` are public traits so a test injects fakes:
-
-```rust
-pub trait Launcher: Send + Sync + 'static {
-    fn spawn(&self, spec: ProcessSpec) -> io::Result<Spawned>;
-    fn signal(&self, pid: u32, signal: Signal) -> io::Result<()>;
-}
-
-pub trait Mounter: Send + Sync + 'static {
-    fn state(&self, path: &Path) -> io::Result<MountState>;
-    fn bind(&self, source: &Path, target: &Path, readonly: bool) -> io::Result<()>;
-    fn detach(&self, path: &Path) -> io::Result<()>;
-    fn detach_all(&self, path: &Path) -> io::Result<usize>; // provided
-}
-```
-
-`AgentfsLauncher` starts the binary with a clean `AGENTFS_*` environment, forwards
-its output prefixed with a label, keeps its last 20 lines for error messages,
-and reports its exit.
-
-What the supervisor guarantees:
-
-- **Stage** checks the worktree under its lock, sets the profile's include,
-  installs the profile's rules, records the volume in `<node-state>/staged/`,
-  starts the service on a node-local socket and waits for it to write its
-  address.
-- **Publish** starts a front that FUSE-mounts the backing tree at its own source
-  directory, waits until the mount is live, bind-mounts it onto the kubelet's
-  target and records the target in `<node-state>/published/`. A finished fork is
-  published read-only (`MS_RDONLY`) whatever the request asks, and its front
-  mounts it read-only (`ro`), so the kernel answers `EROFS` through any bind.
-- **A front that exits unasked** (a crash, `kill -9`, an external unmount) is
-  restarted after a backoff in the same pending slot, with the same pod flags.
-  Its stale source is detached and the new mount is bind-stacked over the stale
-  target, without unmounting it first, so it propagates into containers that
-  mount the volume with `HostToContainer`. A target whose directory is gone (the
-  pod is gone) is forgotten instead.
-- **A service that exits unasked** is restarted after a backoff. It recovers its
-  journal and the fronts reconnect by themselves.
-- **A restart that cannot spawn** (a failed fork under PID or memory pressure, a
-  full disk) is tried again with backoff. The entry and the records stay, so the
-  volume and its targets are never dropped for it.
-- **Reconcile**, at plugin start, rebuilds services for staged volumes and
-  recovers fronts for targets whose topmost mount is a stale agentfs mount. It
-  returns a `ReconcileReport`.
-- Each volume's calls run one at a time, behind a per-volume async lock. Waits
-  happen outside it, so a slow start never delays another pod's recovery.
-- A NodePublish of a published target with other flags (read-only,
-  single-writer) is `ALREADY_EXISTS`, as the CSI spec asks.
-
-Restart delays are `supervisor::Backoff`: an initial delay that doubles up to
-`max` (`--backoff-max`, 30 s by default) and resets after a child has run long
-enough.
-
-## The release decider
-
-DeleteVolume asks `agentfs_core::release::decide`, the one pure decider of what
-happens to a worktree. DeleteVolume gathers its facts: whether the branch
-exists, the remotes mode (`Declared::of`), what each pushed remote advertises
-for the branch in a listing made for that call, how many journaled records
-history lacks (`volume::inspect`, read under the state lock), the class's
-`onDelete`, and a fork's state.
-
-```rust
-use agentfs_core::release::{self, Declared, Kind, OnDelete, Release, Seen, Worktree};
-
-let seen: Vec<Seen> = /* one per pushed remote, from RemotePusher::branch_claim */;
-let release = release::decide(&Worktree {
-    has_history: true,
-    uncommitted: 0,
-    on_delete: OnDelete::Retain,
-    remotes: Declared::of(&settings, &seen),
-    kind: Kind::of(None, &settings),
-});
-match release {
-    Release::Delete => { /* remove the worktree */ }
-    Release::Keep(_) => { /* release the volume, keep the directory */ }
-    Release::Wait(why) => { /* answer UNAVAILABLE naming `why` */ }
-}
-```
-
-- **Delete.** Every push remote holds the head (or there is no history), the
-  journal holds nothing history lacks, and `onDelete` is `delete`. Also: an
-  unlinked fork with no remote of its own, and `onDelete: delete`, whatever its
-  history holds. That is the only case where unpushed history is removed, and it
-  is the user's choice.
-- **Keep.** `onDelete: retain` once every remote holds the head and the journal
-  is committed, or a worktree with no remote at all (nothing elsewhere can hold
-  it).
-- **Wait.** `UNAVAILABLE`, naming the first remote that does not hold the head
-  and why (lacking, unreachable, diverged), a remote that holds the head but
-  lacks a ref of a fork received into this history, every remote section
-  invalid, a journal holding records history lacks, or a fork not yet published
-  or abandoned.
-
-A diverged remote branch is never removed until an operator resolves it
-([divergence runbook](../runbooks/divergence.md)). DeleteVolume refuses
-(`FAILED_PRECONDITION`) a worktree staged on its node, one whose state lock is
-held, and one whose settings cannot be read. Nothing is deleted or released
-then. Every class of the driver has `reclaimPolicy: Delete`, so DeleteVolume
-always runs and the decider always answers: data safety is the decider's, not
-Kubernetes'. With `onDelete: retain` the worktree stays on disk after its PV
-goes.
-
-## The release scan
-
-`ReleaseScan::new(layout, launcher, identity, interval, backoff)` runs at start,
-every `--release-scan-interval` (30 s) and whenever DeleteVolume waits
-(`wake()`). For every `csi.json` or `csi.retained.json` on its node that no pod
-stages, it:
-
-1. runs `agentfs flush` while the journal holds records history lacks;
-2. then runs `agentfs push` unless the last push of it exited 0 at its current
-   head with the same remotes (`<name> <push URL>`: a remote added to the
-   profile since is pushed to).
-
-That memory is in process: a restarted plugin pushes each worktree once more. A
-failed flush or push backs off per worktree, doubling up to `--backoff-max`;
-exit 75 is retried at the next scan. Each failed push raises `PushFailed`
-through the child's own alarms and telemetry, which is what alarms while
-unpushed commits sit in an unstaged worktree.
-
-A fork asked to finish (DeleteVolume of a fork records `finish_requested` in
-`csi.json`) gets `agentfs fork finish --timeout 300s` instead. The scan skips a
-fork that is refused or abandoned. A fork's finish and publish are the scan's
-alone.
-
-`scan()` returns a `ScanReport`: the forks being finished, the worktrees being
-flushed and pushed, the children still running, the worktrees whose last push is
-held, those backing off, and unreadable records.
+`HostClient::start(stream)` reads the `Hello`; `call(request)` sends one request
+and awaits its reply. One task owns the stream: a caller whose wait the
+kubelet's deadline cancels only drops its wait, and the task still reads and
+discards that reply, so the replies that follow stay in step.
 
 ## Where things live
 
-| Path | Holds |
-|---|---|
-| `<base>/<handle>/backing` | The worktree's files |
-| `<base>/<handle>/state` | Its state area |
-| `<base>/<handle>/csi.json` | The `VolumeRecord`: parameters, requested capacity, creation time, whether it was adopted, whether a fork's finish was asked for |
-| `<base>/<handle>/csi.retained.json` | The record of a released, kept worktree |
-| `<base>/.deleting.<handle>` | A worktree being deleted |
-| `<node-state>/staged/<handle>.json` | The volume's history service runs on this node |
-| `<node-state>/published/<handle>/<key>.json` | A front serves this target |
-| `<node-state>/run/<handle>/history.sock` | The history service's socket |
-| `<mount-dir>/<handle>/<key>` | A front's own mount, before the bind onto the kubelet's target |
-| `<profiles>/<profile>.{config,exclude,attributes}` | The operator's profile |
-
-`Layout` computes these. A handle is validated: `[A-Za-z0-9][A-Za-z0-9._-]*`,
-with no `..` and no `.lock` suffix. `records::store` writes a record
-atomically. The base path must be on the node's own disk: `agentfs-csi` refuses
-a network filesystem at start, naming its type.
-
-## Serving
-
-```rust
-use agentfs_csi::{controller::ControllerService, identity::IdentityService,
-                  node::NodeService, server};
-
-server::serve(
-    std::path::Path::new("/csi/csi.sock"),
-    IdentityService::new(),
-    ControllerService::new(layout, "node-a".into(), release_scan),
-    NodeService::new(supervisor.clone()),
-    shutdown_signal(),                 // any future
-).await?;
+```text
+<base>/                         --base-path: this node's own disk, never a network filesystem
+  <pv>/                         a claim's directory (the PV name), 0700
+    state/                      the tree state area (history in state/history.git)
+    csi.json                    the claim record (CreateVolume, or a static PV)
+    csi.retained.json           the record once DeleteVolume kept the volume
+  <fork-pv>/csi.json            a fork claim: its fork lives in its source's volume
+<node-state>/published/<pv>.json   the claim's published view
+<profiles>/<profile>.config|.exclude|.attributes
 ```
 
-`serve` binds the socket (replacing a stale one, mode 0660), serves all three
-services until `shutdown` completes, then stops accepting, lets running calls
-finish and removes the socket. The controller's calls are serialised and run
-their blocking work off the async threads.
-
-The `agentfs-csi` command wires these together from its flags
-(`--endpoint`, `--node-id`, `--base-path`, `--node-state`, `--mount-dir`,
-`--profiles-dir`, `--agentfs-bin`, `--passthrough`, `--front-threads`, the
-stage, publish, unpublish and unstage waits, `--history-wait`,
-`--backoff-max`, `--release-scan-interval`). The flags are in
-[configuration](../configuration.md).
+Records are JSON written whole (a temporary file renamed over it, mode 0600).
+A field this driver does not know fails the load, so a record of another build
+is refused, never half-read.
 
 ## Recovery
 
-- A front crash leaves a stale mount, which the supervisor stacks a new mount
-  over ([filesystem layer](filesystem.md#mount-order-and-shutdown)). The
-  workload's calls fail with `ENOTCONN` meanwhile, and nothing is written where
-  it would not be recorded.
-- A service crash is a restart. Boundaries during the outage fail with `EIO`.
-  Their final states are recorded by the fronts' repairs, release and sweep, but
-  intermediate states are lost.
-- A plugin restart runs `reconcile`.
-- Operator procedures: [csi-recovery](../runbooks/csi-recovery.md),
-  [history-service-down](../runbooks/history-service-down.md),
-  [moving](../runbooks/moving.md).
+A crashed host is started again with its views replayed and its clients
+rebound (same launcher `csi`, tree, label and access), so a fork keeps its one
+writer. A restarted plugin does the same from `<node-state>/published/`. The
+procedures are in [CSI](../csi.md#8-recovery) and the [CSI recovery
+runbook](../runbooks/csi-recovery.md).
 
 ## What this layer does not do
 
-- It does not offer a multi-node volume. A volume lives on one node's disk. A
-  pod on another node reads the history from the remote the volume pushes to.
-- It does not fence which branch is current. A second worktree that writes a
-  name another created is an unrelated history, saved as a divergence. Not
-  covered: a hand-copied state area, local and `file://` remotes (libgit2
-  updates them without compare-and-swap), and anyone holding the remote's
-  credentials.
-- It does not push from a CSI call. The history service pushes on its interval
-  and at shutdown, and the release scan pushes what no pod stages.
-- It does not serve the sandbox overlay. The overlay is refused on a front.
-- It does not create a worktree at NodeStage. Only CreateVolume creates one.
-- It does not snapshot, expand or resize volumes, and capacity is recorded but
-  not enforced.
-- It does not delete a worktree that holds history no remote has, except the
-  unlinked fork with no remote of its own.
-- It does not link FUSE into its server. A front or service crash does not take
-  the plugin down; the plugin restarts it.
-- Cloning a claim that a pod is using, and following later Kubernetes and
-  provisioner releases, are not covered; see [CSI](../csi.md) for the supported
-  cases.
+- It records nothing itself: the hosts it runs do.
+- It pushes nothing, lands no patches and runs no release scan: push and the
+  patch queue are not built on tree volumes, and each host logs those settings
+  as not built.
+- It does not delete a volume: DeleteVolume keeps the directory.
+- It serves one pod per claim, and never a volume on two nodes.
+- It never serves a recording-format volume.
+- It exports no telemetry of its own; its hosts do, through the `OTEL_*`
+  variables it passes on.

@@ -1,12 +1,14 @@
 # CI overlay for ci/e2e-hermes.sh: upstream Hermes (NousResearch/
 # hermes-agent, its published image pinned by digest) on an agentfs
-# volume, over examples/docker/compose.yaml and compose.remote.yaml (the
-# agentfs services and the git server they push to). Relative paths
-# resolve against examples/docker, the first compose file's directory.
+# volume of the tree engine, over examples/docker/compose.yaml (the
+# agentfs services). Relative paths resolve against examples/docker, the
+# first compose file's directory.
 #
-#   agentfs-init   the example's init step, which also installs the
-#                  Hermes rule files (deploy/examples/hermes) as
-#                  info/exclude and info/attributes
+#   agentfs-init   the example's init step with the Hermes settings
+#                  (deploy/examples/hermes/config: a remote and a patch
+#                  source, both logged as not built), which also installs
+#                  the Hermes rule files as history.git/info/exclude and
+#                  info/attributes
 #   hermes         upstream's image and command (`gateway run`), started
 #                  as root as upstream ships it, with the FUSE mount at
 #                  its data path /opt/data
@@ -16,7 +18,6 @@
 #   model          a scripted stand-in for the model API (model/model.py)
 #   hermes-config  puts ci/hermes/hermes/config.yaml in the volume before
 #                  Hermes' first start, as an operator would
-#   producer       a patch producer (`agentfs patch submit`), run on demand
 #
 # Hermes and dind bind the mount itself (./mnt/workspace), so a new mount
 # reaches them when they restart, never while they run: the test restarts
@@ -33,14 +34,19 @@ x-hermes-image: &hermes-image
   image: ${HERMES_IMAGE:-nousresearch/hermes-agent:v0.22.5@sha256:9c5561579f3ffdf333401797094ac3a743738d6c25d40f4331c7bf77b694238d}
 
 services:
-  # The example's init step, plus the Hermes rule files copied into the
-  # state area, as deployment.md migration does. (Bind-mounting
-  # each file over the volume, as the sidecar mounts them, left the volume
-  # busy at `docker compose down -v` on the runner.)
+  # The example's init step with the Hermes settings, plus the Hermes rule
+  # files copied into the state area, as deployment.md's migration does.
+  # (Bind-mounting each file over the volume, as the sidecar mounts them,
+  # left the volume busy at `docker compose down -v` on the runner.)
   agentfs-init:
-    command: ['agentfs init --include /etc/agentfs/config && cp /etc/agentfs/hermes/exclude /etc/agentfs/hermes/attributes /data/state/git/info/ && chown "$$WORKLOAD_USER" /data/backing']
+    command: ['agentfs init --include /etc/agentfs/config --owner "$$WORKLOAD_USER" && mkdir -p /data/state/history.git/info && cp /etc/agentfs/hermes/exclude /etc/agentfs/hermes/attributes /data/state/history.git/info/']
     volumes:
       - ../../deploy/examples/hermes:/etc/agentfs/hermes:ro
+      - ../../deploy/examples/hermes/config:/etc/agentfs/config:ro
+
+  agentfs:
+    volumes:
+      - ../../deploy/examples/hermes/config:/etc/agentfs/config:ro
 
   # The example's idle workload is not part of this test.
   workload:
@@ -112,9 +118,3 @@ services:
         condition: service_healthy
       model:
         condition: service_healthy
-
-  producer:
-    image: ${AGENTFS_IMAGE:-ghcr.io/mcurcio/agentfs:latest}
-    profiles: [producer]
-    entrypoint: [sh, -ec]
-    secrets: [origin]

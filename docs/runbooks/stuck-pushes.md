@@ -5,6 +5,12 @@ committing are unaffected: commits stay safe in the state area and go out
 with the next successful push. How it works: [remotes](../remotes.md), alarms and metrics:
 [telemetry](../telemetry.md).
 
+This runbook is for the recording engine, on recording state areas, which no launcher runs any more ([moving.md](moving.md) moves the CSI volumes
+an older driver made). Its "Under CSI" steps apply to no volume today: the CSI driver runs tree volumes. Tree volumes (the sidecar, the Docker
+examples, `agentfs mount` and the CSI driver) push to no remote yet: a configured remote
+is logged at every boot as not built and counted by the
+`agentfs.not_built` gauge ([trees](../trees.md#operator-settings)).
+
 ## Symptoms
 
 - `PushFailed` alarms (stderr, and log event `agentfs.push_failed`) with
@@ -105,16 +111,16 @@ attempts. A success resets it. The alarm's `next retry` says when.
 
 ## Retry now
 
-- **No mount or `run` is running**: `agentfs --state "$STATE" push`
+- **No history service or `run` is running**: `agentfs --state "$STATE" push`
   pushes every remote once (or `--remote <name>`), prints the outcome and
   exits 1 unless all succeeded.
-- **A mount, `run` or `serve-history` is running**: the same command asks
+- **`run` or `serve-history` is running**: the same command asks
   it over its control socket to commit and push now, past the interval
   and any backoff. It waits up to `--timeout` (120 s) and prints
   `through the running daemon (pid N): ...` and each remote's outcome; a
   push still running then carries on in the background, and `agentfs
-  status` shows how it ended. In a sidecar: `kubectl exec <pod> -c agentfs
-  -- agentfs push`.
+  status` shows how it ended. Under the CSI driver, run it in the node
+  plugin pod of the volume's node ([csi.md](../csi.md#9-operations)).
 
 After fixing a credentials, key or known_hosts file alone, nothing is
 needed: they are re-read at the next attempt.
@@ -165,8 +171,8 @@ agentfs --state "$STATE" push
 ## A remote that hangs
 
 A remote that accepts the connection and then never answers holds only
-its own push: recording, committing and the other remotes go on (CI's
-`e2e-shared-remotes` job checks this through a live mount). Its status
+its own push: recording, committing and the other remotes go on (not
+tested through a live mount). Its status
 keeps the previous `last pushed` until libgit2 gives up (5 minutes
 without progress), which counts as `unreachable`; a shutdown meanwhile
 abandons it at the push grace's end, as above.

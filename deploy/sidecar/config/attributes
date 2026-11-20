@@ -1,4 +1,4 @@
-# Mounted over <state>/git/info/attributes: agentfs attributes.
-# `-agentfs` is never recorded, even when tracked. A directory pattern does
-# not cover its contents: write `dir/**`.
+# Mounted over <state>/history.git/info/attributes: `-agentfs` is never
+# recorded, and a tracked path it marks leaves history when the volume
+# opens. A directory pattern does not cover its contents: write `dir/**`.
 secrets/** -agentfs

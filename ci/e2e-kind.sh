@@ -1,40 +1,40 @@
 #!/usr/bin/env bash
-# End-to-end test of the sidecar deployment (docs/deployment.md) in a kind cluster: deploys ci/k8s (the CI overlay of
-# deploy/sidecar) and checks, from real pods:
+# End-to-end test of the sidecar deployment (docs/deployment.md) on the tree engine in a kind cluster: deploys ci/k8s (the CI
+# overlay of deploy/sidecar) and checks, from real pods:
 #
+#   - init creates the volume and the sidecar mounts it; the remote of the
+#     operator settings (the runner's git server) is logged as not built
+#     (push) at every boot, and nothing reaches the server;
 #   - root and uid 10000 write through the mount with normal permissions,
-#     the uid 10000 writer through a subPath mount of
-#     the FUSE root at a fixed path;
-#   - the operator rules from the ConfigMap apply, and nothing of the state
-#     area is visible to the writers (test 5);
-#   - commits carry the writers' uids as authors and the pod, namespace and
-#     node trailers from the downward API, and reach a bare repository on
-#     the runner's git server over HTTP with the credential Secret (test 8);
-#   - `kubectl exec ... agentfs restore` through the control socket (test
-#     11);
-#   - deleting the pod makes the final commit and pushes it, and the new
-#     pod does not defer the patch queue although the subPath writer's
-#     bind held the old pod's mount as it stopped;
-#   - after `kill -9` of the daemon, writes fail with ENOTCONN, the kubelet
-#     restarts the sidecar (a write that races the recovery and succeeds
-#     must be recorded), which stacks a new mount over the stale one
-#     (`--on-stale-mount recover`) with no manual step; both writers
-#     (HostToContainer and subPath) reach it without a restart, and
-#     everything written before and after the kill reaches the remote
-#     (test 2 in a pod); the failed write is nowhere;
-#   - `agentfs push` in the sidecar asks the running daemon to push now;
+#     the uid 10000 writer through a subPath mount of the view at a fixed
+#     path;
+#   - the volume's history (state/history.git, branch root) holds their
+#     files with their owners and the pod, namespace and node trailers
+#     from the downward API;
+#   - the operator rules from the ConfigMap, mounted under
+#     history.git/info, keep an excluded file and a `-agentfs` file out of
+#     history, and nothing of the state area is visible to the writers
+#     (test 5);
+#   - a replaced pod (Recreate) finds the volume, logs the remote as not
+#     built again, and the old pod's last write is in history with its pod
+#     trailer;
 #   - the sidecar seals the bare mount point (root's, mode 0000; checked
 #     from the node through a non-recursive bind of the emptyDir);
-#   - a clean exit of the sidecar mid-pod: writes in the gap fail with
-#     EROFS (the workload's read-only emptyDir) and reach nothing; the
-#     subPath writer, restarted inside the gap, gets EACCES from the sealed
-#     mount point (or, if the sidecar was back first, writes through the
-#     new mount and is recorded), its liveness probe restarts it onto the
-#     new mount, and both write through the restarted sidecar's mount;
-#   - deleting the recovered pod leaves nothing mounted on the node;
-#   - the rollback's flush Pod of docs/runbooks/upgrading-the-sidecar.md
-#     (`ci: rollback-flush`), run as written: it finds the Deployment's
-#     hashed ConfigMap, flushes, and the volume mounts again after it.
+#   - a clean exit of the sidecar mid-pod: the drain unmounts the view and
+#     the readiness probe follows (the pod turns NotReady), the root
+#     writer's writes fail with EROFS (the read-only emptyDir) and reach
+#     nothing; the sidecar waits for the subPath writer's bind until it is
+#     killed (as the kubelet kills it at its grace); the subPath writer,
+#     restarted inside the gap, gets EACCES from the sealed mount point
+#     (or, if the sidecar was back first, writes through the new mount and
+#     is recorded); its liveness probe restarts it onto the new mount, and
+#     both write through the restarted sidecar's mount;
+#   - after `kill -9` of the daemon from the node, writes fail with
+#     ENOTCONN, the kubelet restarts the sidecar (a write that races the
+#     restart and succeeds must be recorded), which stacks a new mount
+#     over the stale one (`--on-stale-mount recover`) with no manual step;
+#     both writers (HostToContainer and subPath) reach it without a
+#     restart, their writes are recorded, and the failed write is nowhere.
 #
 # Needs docker, kind and kubectl (ci/install-kind.sh), a kind cluster
 # $KIND_CLUSTER (default agentfs-e2e) with the image agentfs:ci loaded, and
@@ -51,22 +51,21 @@
 # The FUSE node module must be loaded on the host (modprobe fuse).
 
 . "$(dirname "$0")/lib.sh"
+. "$(dirname "$0")/tree-git-test-lib.sh"
 
 KIND_CLUSTER=${KIND_CLUSTER:-agentfs-e2e}
 NODE=$KIND_CLUSTER-control-plane
 NS=agentfs-e2e
 APP=app.kubernetes.io/name=agentfs-example
 VOLUME=ci-kind
-BRANCH=agentfs/$VOLUME
 WS=/agentfs/workspace
-LOGS=${E2E_KIND_LOGS:-${RUNNER_TEMP:-/tmp}/agentfs-kind-logs}
-mkdir -p "$LOGS"
+NOT_BUILT='not built: remote.origin.url (push): '
 
 k() { kubectl -n "$NS" "$@"; }
 
 gateway() {
   docker network inspect kind -f '{{range .IPAM.Config}}{{.Gateway}} {{end}}' |
-    tr ' ' '\n' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -n1
+    tr ' ' '\n' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | sed -n 1p
 }
 
 diagnose() {
@@ -78,19 +77,17 @@ diagnose() {
   k describe pods
   k get events --sort-by=.lastTimestamp | tail -n 60
   for pod in $(k get pods -o name); do
-    for c in agentfs-init agentfs writer-root writer-10000 flush; do
+    for c in agentfs-init agentfs writer-root writer-10000; do
       echo "---- $pod $c"
       k logs "$pod" -c "$c" --tail=100
       echo "---- $pod $c (previous)"
       k logs "$pod" -c "$c" --previous --tail=100 2>/dev/null
     done
+    echo "---- $pod history"
+    k exec "$pod" -c agentfs -- git --git-dir /data/state/history.git log --format='%h %s' -20 root 2>/dev/null
   done
-  echo "---- saved logs"
-  tail -n 50 "$LOGS"/*.log 2>/dev/null
   echo "---- node mounts"
   docker exec "$NODE" sh -c "grep -E 'agentfs|fuse' /proc/self/mountinfo"
-  echo "---- git server"
-  tail -n 40 "${GIT_SERVER_DIR:-/nonexistent}"/logs/*.log 2>/dev/null
   return 0
 }
 
@@ -105,11 +102,18 @@ esac
 REMOTE=$GIT_SERVER_REPOS/history.git
 rgit() { git --git-dir "$REMOTE" "$@"; }
 
+set_password() { # user password
+  local others
+  others=$(grep -v "^$1:" "$GIT_SERVER_HTPASSWD" || true)
+  { [ -n "$others" ] && echo "$others"; echo "$1:$(openssl passwd -apr1 "$2")"; } \
+    >"$GIT_SERVER_HTPASSWD"
+}
+
 # The pod of the Deployment that is not being deleted.
 current_pod() {
   k get pod -l "$APP" -o go-template \
     --template '{{range .items}}{{if not .metadata.deletionTimestamp}}{{.metadata.name}}{{"\n"}}{{end}}{{end}}' |
-    head -n1
+    sed -n 1p
 }
 
 wait_ready() { # -> POD
@@ -128,40 +132,33 @@ wait_ready() { # -> POD
 in_root() { k exec "$POD" -c writer-root -- sh -c "$1"; }
 in_user() { k exec "$POD" -c writer-10000 -- sh -c "$1"; }
 in_sidecar() { k exec "$POD" -c agentfs -- "$@"; }
+# git on the volume's history, in the sidecar.
+history() { in_sidecar git --git-dir /data/state/history.git "$@"; }
 
-# Waits until the remote branch has <path> with <content>.
-wait_remote() { # path content [seconds]
-  local deadline=$((SECONDS + ${3:-60}))
-  until rgit cat-file -e "$BRANCH:$1" 2>/dev/null && [ "$(rgit show "$BRANCH:$1")" = "$2" ]; do
-    [ $SECONDS -lt $deadline ] || fail "the remote never had $1 = '$2'"
+# History is built behind the calls (docs/trees.md): waits until the
+# root's branch has <path> with <content>.
+wait_history() { # path content [seconds]
+  local deadline=$((SECONDS + ${3:-120}))
+  until [ "$(history show "root:files/$(tree_git_fanned "$1")" 2>/dev/null)" = "$2" ]; do
+    [ $SECONDS -lt $deadline ] || fail "the history never had $1 = '$2'"
     sleep 1
   done
-  pass "remote has $1"
+  pass "the history has $1"
 }
-
-# The message of the newest remote commit that touched <path>.
-remote_message() { rgit log -1 --format=%B "$BRANCH" -- "$1"; }
-remote_author() { rgit log -1 --format=%an "$BRANCH" -- "$1"; }
-remote_ident() { rgit log -1 --format="$2" "$BRANCH" -- "$1"; } # path format
-
-set_password() { # user password
-  local others
-  others=$(grep -v "^$1:" "$GIT_SERVER_HTPASSWD" || true)
-  { [ -n "$others" ] && echo "$others"; echo "$1:$(openssl passwd -apr1 "$2")"; } \
-    >"$GIT_SERVER_HTPASSWD"
+# The uid history records <path> with (its metadata in lines/).
+owner() { history show "root:lines/$(tree_git_fanned "$1")" | grep -o '"uid":[0-9]*' | cut -d: -f2; }
+# The message of the newest commit that touched <path>.
+message() { history log -1 --format=%B root -- "files/$(tree_git_fanned "$1")"; }
+# Fails if <path> was ever recorded, on any branch.
+never_recorded() { # path what
+  if history log --all --format= --name-only | grep -Fx "files/$(tree_git_fanned "$1")" >/dev/null; then
+    fail "$1 was recorded ($2)"
+  fi
+  pass "$1 is not in history ($2)"
 }
-
-# Follows a container's log into $LOGS/<name>.log in the background;
-# FOLLOWER is the follower's pid. end_follow waits up to 30 s for it.
-follow_log() { # pod container name
-  k logs -f "$1" -c "$2" >"$LOGS/$3.log" 2>&1 &
-  FOLLOWER=$!
-}
-end_follow() {
-  local i
-  for i in $(seq 30); do kill -0 "$FOLLOWER" 2>/dev/null || break; sleep 1; done
-  kill "$FOLLOWER" 2>/dev/null || true
-  wait "$FOLLOWER" 2>/dev/null || true
+# The not built line, once per boot in this container's current log.
+assert_not_built_logged() { # what
+  assert_eq 1 "$(k logs "$POD" -c agentfs | grep -cF "$NOT_BUILT" || true)" "$1"
 }
 
 step "git server and cluster"
@@ -199,19 +196,14 @@ EOF
 kubectl apply -k ci/k8s
 wait_ready
 FIRST_POD=$POD
-startup=$(k logs "$POD" -c agentfs | grep '^mounted ' || true)
-echo "sidecar: $startup"
-assert_contains "$startup" "volume $VOLUME" "the sidecar mounted the volume"
-assert_contains "$(k logs "$POD" -c agentfs-init)" "initialised volume $VOLUME" "the init container created the state area"
+assert_contains "$(k logs "$POD" -c agentfs-init)" "$VOLUME " "the init container ran"
+assert_contains "$(k logs "$POD" -c agentfs-init)" " created" "the init container created the volume"
+assert_contains "$(k logs "$POD" -c agentfs)" "mounted volume $VOLUME at $WS" "the sidecar mounted the volume"
+assert_not_built_logged "the sidecar logged the remote as not built"
+assert_eq "live agentfs mount (agentfs:$VOLUME)" "$(in_sidecar agentfs probe "$WS")" "probe sees the tree view"
 
 step "root and uid 10000 write with normal permissions"
-# A shell's `>` is two records, the empty file and then its content, and a
-# busy machine puts the empty file in a commit of its own. Here
-# it always does, so the restore below meets that history in every run.
-in_root "cd $WS && : > root.txt"
-wait_remote root.txt ""
 in_root "cd $WS && printf root > root.txt && chmod 600 root.txt && mkdir u10000 && chown 10000:10000 u10000"
-sleep 1
 in_user 'printf user > /workspace/u10000/user.txt'
 assert_eq 10000 "$(in_root "stat -c %u $WS/u10000/user.txt")" "uid 10000's file is its own"
 assert_eq 600 "$(in_root "stat -c %a $WS/root.txt")" "chmod 600 persists"
@@ -226,68 +218,45 @@ in_root "cd $WS && mkdir -p scratch secrets && printf x > scratch/x.log && print
 assert_eq "root.txt scratch secrets u10000" "$(in_root "ls -A $WS" | tr '\n' ' ' | sed 's/ $//')" "the writer sees only its files"
 assert_eq "workspace" "$(in_root 'ls -A /agentfs')" "nothing else in the shared emptyDir"
 assert_eq "root.txt scratch secrets u10000" "$(in_user 'ls -A /workspace' | tr '\n' ' ' | sed 's/ $//')" "the subPath writer sees the same"
+assert_eq k "$(in_root "cat $WS/secrets/k")" "the -agentfs file reads back through the mount"
 if in_root 'test -e /data'; then fail "the writer can reach /data"; fi
 pass "the writers cannot reach /data"
 
-step "commits reach the remote with authors and trailers"
-wait_remote root.txt root
-wait_remote u10000/user.txt user
-assert_eq uid-0 "$(remote_author root.txt)" "root.txt authored by uid-0"
-assert_eq uid-10000 "$(remote_author u10000/user.txt)" "u10000/user.txt authored by uid-10000"
-# The identity templates of ci/k8s/config/config, rendered exactly.
+step "the history holds the writes with their owners and the pod trailers"
+wait_history root.txt root
+wait_history u10000/user.txt user
+assert_eq 0 "$(owner root.txt)" "history records root.txt as root's"
+assert_eq 10000 "$(owner u10000/user.txt)" "history records u10000/user.txt as uid 10000's"
 POD_UID=$(k get pod "$POD" -o jsonpath="{.metadata.uid}")
-assert_eq "$POD on $NODE_NAME" "$(remote_ident u10000/user.txt %cn)" "committer name from {pod} on {node}"
-assert_eq "$POD_UID@$NS.$VOLUME.ci.invalid" "$(remote_ident u10000/user.txt %ce)" "committer email from {podUid}@{namespace}.{volume}"
-assert_eq "uid-10000.gid-10000@$VOLUME.ci.invalid" "$(remote_ident u10000/user.txt %ae)" "author email from uid-{uid}.gid-{gid}"
-assert_eq "uid-0.gid-0@$VOLUME.ci.invalid" "$(remote_ident root.txt %ae)" "root's author email"
-msg=$(remote_message u10000/user.txt)
+msg=$(message u10000/user.txt)
+assert_contains "$msg" "Agentfs-Volume: $VOLUME" "volume trailer"
 assert_contains "$msg" "Agentfs-Pod: $POD" "pod trailer"
+assert_contains "$msg" "Agentfs-Pod-Uid: $POD_UID" "pod uid trailer"
 assert_contains "$msg" "Agentfs-Namespace: $NS" "namespace trailer"
 assert_contains "$msg" "Agentfs-Node: $NODE_NAME" "node trailer"
-assert_contains "$msg" "Agentfs-Uid: 10000" "uid trailer"
-sleep 3
-for path in scratch/x.log secrets/k; do
-  if rgit cat-file -e "$BRANCH:$path" 2>/dev/null; then fail "$path was recorded"; fi
-done
-pass "excluded and -agentfs paths are not in history"
+# A later save is built after them: history up to it holds neither.
+in_root "printf later > $WS/later.txt"
+wait_history later.txt later
+never_recorded scratch/x.log "excluded by info/exclude"
+never_recorded secrets/k "-agentfs in info/attributes"
+assert_eq "" "$(rgit for-each-ref)" "nothing reached the git server: push is not built"
 
-step "restore through the sidecar's control socket"
-# The remote's head: wait_remote saw it hold root.txt, and nothing wrote that
-# file since. Not the commit that added the file, which may hold it empty.
-SOURCE=$(rgit rev-parse "$BRANCH")
-assert_eq root "$(rgit show "$SOURCE:root.txt")" "the commit to restore from holds the content"
-in_root "printf changed > $WS/root.txt"
-wait_remote root.txt changed
-in_sidecar agentfs restore root.txt "$SOURCE"
-assert_eq root "$(in_root "cat $WS/root.txt")" "the writer reads the restored content"
-wait_remote root.txt root
-assert_contains "$(remote_message root.txt)" "Agentfs-Restore: $SOURCE" "the restore is its own commit"
-
-step "deleting the pod makes the final commit"
-follow_log "$POD" agentfs graceful
+step "a replaced pod finds the volume and logs not built again"
 in_root "printf final > $WS/final.txt"
-k delete pod "$POD" --wait --timeout=120s
-end_follow
-graceful=$(cat "$LOGS/graceful.log")
-assert_contains "$graceful" "signal 15: unmounting" "the sidecar got SIGTERM"
-assert_contains "$graceful" "final commit:" "the sidecar made its final commit"
-assert_contains "$graceful" "final push: " "the sidecar pushed its final commit at shutdown"
 OLD=$POD
+# The subPath writer's bind holds the view until the pod's volumes are torn
+# down, after the sidecar: the sidecar drains, then waits out the grace.
+k delete pod "$POD" --wait --timeout=180s
 wait_ready
 [ "$POD" != "$OLD" ] || fail "the pod was not replaced"
-wait_remote final.txt final
-assert_contains "$(remote_message final.txt)" "Agentfs-Pod: $OLD" "final.txt was committed by the deleted pod"
-assert_contains "$(k logs "$POD" -c agentfs-init)" "volume $VOLUME already initialised" "init accepted the existing state area"
-# The writer's subPath bind kept the old pod's mount until the kubelet tore
-# its volumes down, after the sidecar's stop; a new pod still runs the
-# patch queue.
-grep -E 'elsewhere|attached' "$LOGS/graceful.log" || true
-case "$(k logs "$POD" -c agentfs)" in
-*"patches: not applied at this start"*) fail "the new pod deferred the patch queue: $(k logs "$POD" -c agentfs | grep -m1 'patches: not applied')" ;;
-esac
-pass "the new pod did not defer the patch queue"
+assert_contains "$(k logs "$POD" -c agentfs-init)" "$VOLUME " "init ran in the new pod"
+assert_contains "$(k logs "$POD" -c agentfs-init)" " found" "init found the volume"
+assert_not_built_logged "the new pod's sidecar logged the remote as not built"
+wait_history final.txt final
+assert_contains "$(message final.txt)" "Agentfs-Pod: $OLD" "final.txt was recorded by the deleted pod"
+assert_eq root "$(in_root "cat $WS/root.txt")" "the new pod serves the volume's files"
 
-# Restart counts and the sidecar's pid on the node.
+# Restart counts and pids on the node.
 sidecar_restarts() {
   k get pod "$POD" -o jsonpath='{.status.initContainerStatuses[?(@.name=="agentfs")].restartCount}'
 }
@@ -304,19 +273,16 @@ container_pid() { # container
   cid=$(k get pod "$POD" -o jsonpath="{.status.containerStatuses[?(@.name==\"$1\")].containerID}")
   docker exec "$NODE" crictl inspect --output go-template --template '{{.info.pid}}' "${cid#*://}"
 }
-# Signals the sidecar from the node (PID 1 ignores SIGKILL from inside its
-# own namespace) and waits until it is gone.
-signal_sidecar() { # signal
-  local pid
-  pid=$(sidecar_pid)
-  [ -n "$pid" ] || fail "no pid for the sidecar"
-  docker exec "$NODE" kill "-$1" "$pid"
+# SIGKILLs <pid> from the node (PID 1 ignores SIGKILL from inside its own
+# namespace) and waits until it is gone.
+kill_from_node() { # pid
+  docker exec "$NODE" kill -KILL "$1"
   local deadline=$((SECONDS + 60))
-  while docker exec "$NODE" kill -0 "$pid" 2>/dev/null; do
-    [ $SECONDS -lt $deadline ] || fail "the sidecar (pid $pid) did not exit after SIG$1"
+  while docker exec "$NODE" kill -0 "$1" 2>/dev/null; do
+    [ $SECONDS -lt $deadline ] || fail "the sidecar (pid $1) did not exit after SIGKILL"
     sleep 0.2
   done
-  pass "SIG$1 to the sidecar (pid $pid on the node); it is gone"
+  pass "SIGKILL to the sidecar (pid $1 on the node); it is gone"
 }
 wait_sidecar_restarted() { # previous-count
   local deadline=$((SECONDS + 180))
@@ -341,56 +307,32 @@ docker exec "$NODE" umount /tmp/peek
 assert_eq "0 0" "$sealed" "the bare mount point is root's with mode 0000"
 assert_contains "$sealout" "Permission denied" "uid 10000 cannot write to the bare mount point"
 
-step "kill -9 the daemon: the restarted sidecar recovers in place"
-in_root "printf before > $WS/before-crash.txt"
-wait_remote before-crash.txt before
-restarts=$(sidecar_restarts)
-user_restarts=$(writer_restarts writer-10000)
-signal_sidecar KILL
-# The kubelet restarts the sidecar at once after a first exit, and recovery
-# can win the race against this write: then it must be recorded.
-if out=$(in_root "printf x > $WS/during.txt" 2>&1); then
-  during=recorded
-  echo "the sidecar recovered before the write; during.txt must be recorded"
-else
-  during=refused
-  assert_contains "$out" "Transport endpoint is not connected" "a write after the crash fails with ENOTCONN"
-fi
-wait_sidecar_restarted "$restarts"
-recovered=$(k logs "$POD" -c agentfs)
-echo "$recovered" | grep -E '^(stacked|mounted) ' || true
-assert_contains "$recovered" "stacked over a stale mount left by a crashed daemon at $WS" "the sidecar stacked over the stale mount"
-assert_eq "live agentfs mount (agentfs:$VOLUME)" "$(in_sidecar agentfs probe "$WS")" "probe sees the new mount"
-in_root "printf after > $WS/after-crash.txt"
-in_user 'printf after-subpath > /workspace/u10000/after-crash-subpath.txt'
-assert_eq after "$(in_user 'cat /workspace/after-crash.txt')" "the subPath writer reaches the new mount"
-assert_eq "$user_restarts" "$(writer_restarts writer-10000)" "the subPath writer was not restarted"
-out=$(in_sidecar agentfs push --timeout 60s) || fail "agentfs push through the daemon failed: $out"
-echo "$out"
-assert_contains "$out" "through the running daemon (pid " "agentfs push asked the running daemon"
-assert_contains "$out" "origin: " "agentfs push reported the remote"
-wait_remote after-crash.txt after
-wait_remote u10000/after-crash-subpath.txt after-subpath
-assert_contains "$(remote_message after-crash.txt)" "Agentfs-Pod: $POD" "the recovered daemon records and pushes"
-rgit cat-file -e "$BRANCH:before-crash.txt" || fail "before-crash.txt left history"
-if [ "$during" = refused ]; then
-  if rgit cat-file -e "$BRANCH:during.txt" 2>/dev/null; then fail "during.txt is in history"; fi
-  if in_sidecar test -e /data/backing/during.txt; then fail "during.txt reached the backing tree"; fi
-  pass "the write that failed is nowhere"
-else
-  wait_remote during.txt x
-fi
-
 step "a clean exit mid-pod: the read-only emptyDir and the sealed mount point fence the gap"
 restarts=$(sidecar_restarts)
+pid=$(sidecar_pid)
+[ -n "$pid" ] || fail "no pid for the sidecar"
+docker exec "$NODE" kill -TERM "$pid"
+# The drain detaches the view's client, then unmounts the view: the
+# readiness probe follows the mount.
+k wait --for=condition=Ready=false "pod/$POD" --timeout=120s >/dev/null ||
+  fail "the pod never turned NotReady after the sidecar's stop"
+pass "the readiness probe follows the mount: the pod is NotReady"
+if out=$(in_root "printf gap > $WS/gap-0.txt" 2>&1); then
+  fail "a write in the gap succeeded"
+fi
+assert_contains "$out" "Read-only file system" "a write in the gap fails with EROFS (the read-only emptyDir)"
+# The subPath writer's bind still holds the drained view: the sidecar
+# waits for it, as it does for the kubelet's teardown at a pod's stop.
+docker exec "$NODE" kill -0 "$pid" || fail "the sidecar exited while the subPath bind held the view"
+assert_eq "$restarts" "$(sidecar_restarts)" "the drained sidecar waits for the subPath bind"
+# As the kubelet does at the end of its grace.
+kill_from_node "$pid"
+# Restart the subPath writer inside the gap (the sidecar's restart may wait
+# out the kubelet's backoff): its subPath is bound to the bare, sealed
+# directory.
 user_restarts=$(writer_restarts writer-10000)
-signal_sidecar TERM
-# Restart the subPath writer inside the gap (the sidecar's second restart
-# waits out the kubelet's backoff): its subPath is bound to the bare,
-# sealed directory.
 docker exec "$NODE" kill -KILL "$(container_pid writer-10000)"
-gaps=0
-n=0
+n=1
 sub=""
 subgap() { # tries the restarted subPath writer once; sets sub
   [ -z "$sub" ] || return 0
@@ -409,32 +351,28 @@ subgap() { # tries the restarted subPath writer once; sets sub
 }
 until out=$(in_root "printf gap > $WS/gap-$n.txt" 2>&1); do
   case "$out" in
-  *"Read-only file system"* | *"Transport endpoint is not connected"*) ;;
+  *"Read-only file system"*) ;;
   *) fail "a write in the gap failed unexpectedly: $out" ;;
   esac
   subgap
-  gaps=$((gaps + 1))
   n=$((n + 1))
-  [ $gaps -lt 600 ] || fail "writes never worked again"
+  [ "$n" -lt 600 ] || fail "writes never worked again"
   sleep 0.5
 done
-echo "$gaps write(s) refused in the gap; gap-$n.txt went to the new mount"
-[ "$gaps" -ge 1 ] || fail "no write was refused in the gap"
-pass "writes in the gap fail (EROFS) instead of landing unrecorded"
+echo "$n write(s) refused in the gap; gap-$n.txt went to the new mount"
 wait_sidecar_restarted "$restarts"
-previous=$(k logs "$POD" -c agentfs --previous)
-assert_contains "$previous" "final commit:" "the stopped sidecar made its final commit"
-assert_contains "$previous" "detached 1 stale layer(s) at $WS" "it detached the layer the crash left"
+assert_contains "$(k logs "$POD" -c agentfs)" "mounted volume $VOLUME at $WS" "the restarted sidecar mounted the volume"
+assert_not_built_logged "the restarted sidecar logged the remote as not built again"
 in_root "printf post-gap > $WS/post-gap.txt"
-wait_remote post-gap.txt post-gap
-wait_remote "gap-$n.txt" gap
+wait_history post-gap.txt post-gap
+wait_history "gap-$n.txt" gap
 i=0
 while [ $i -lt "$n" ]; do
-  if rgit cat-file -e "$BRANCH:gap-$i.txt" 2>/dev/null; then fail "gap-$i.txt is in history"; fi
-  if in_sidecar test -e "/data/backing/gap-$i.txt"; then fail "gap-$i.txt reached the backing tree"; fi
+  never_recorded "gap-$i.txt" "refused in the gap"
+  if in_root "test -e $WS/gap-$i.txt"; then fail "gap-$i.txt is in the volume"; fi
   i=$((i + 1))
 done
-pass "no refused write reached history or the backing tree"
+pass "no refused write reached the volume or its history"
 deadline=$((SECONDS + 120))
 until [ -n "$sub" ]; do
   [ $SECONDS -lt $deadline ] || fail "the subPath writer never came back after its restart"
@@ -444,12 +382,11 @@ done
 case "$sub" in
 refused)
   pass "the subPath writer restarted in the gap was refused (EACCES on the sealed mount point)"
-  if in_sidecar test -e /data/backing/u10000/subgap.txt; then fail "subgap.txt reached the backing tree"; fi
-  if rgit cat-file -e "$BRANCH:u10000/subgap.txt" 2>/dev/null; then fail "subgap.txt is in history"; fi
+  never_recorded u10000/subgap.txt "refused in the gap"
   ;;
 wrote)
   # The sidecar was back before the writer: the write went to the new mount.
-  wait_remote u10000/subgap.txt subgap
+  wait_history u10000/subgap.txt subgap
   pass "the subPath writer restarted after the gap and its write was recorded"
   ;;
 esac
@@ -460,42 +397,47 @@ until in_user 'printf post-gap-subpath > /workspace/u10000/post-gap-subpath.txt'
   sleep 2
 done
 k wait --for=condition=Ready "pod/$POD" --timeout=120s >/dev/null || fail "the pod never became Ready"
-wait_remote u10000/post-gap-subpath.txt post-gap-subpath
+wait_history u10000/post-gap-subpath.txt post-gap-subpath
 pass "the subPath writer restarted onto the new mount"
 
-step "deleting the recovered pod leaves nothing mounted"
-follow_log "$POD" agentfs last
-LAST_UID=$(k get pod "$POD" -o jsonpath='{.metadata.uid}')
-k delete pod "$POD" --wait --timeout=120s || fail "the pod could not be deleted"
-end_follow
-assert_contains "$(cat "$LOGS/last.log")" "final push: " "the last sidecar pushed at shutdown"
-if docker exec "$NODE" grep "/pods/$LAST_UID/" /proc/self/mountinfo; then
-  fail "mounts of the deleted pod were left on the node"
+step "kill -9 the daemon: the restarted sidecar stacks over the stale mount in place"
+in_root "printf before > $WS/before-crash.txt"
+wait_history before-crash.txt before
+restarts=$(sidecar_restarts)
+user_restarts=$(writer_restarts writer-10000)
+root_restarts=$(writer_restarts writer-root)
+kill_from_node "$(sidecar_pid)"
+# The kubelet restarts the sidecar at once after a first exit, and the
+# restart can win the race against this write: then it must be recorded.
+if out=$(in_root "printf x > $WS/during.txt" 2>&1); then
+  during=recorded
+  echo "the sidecar was back before the write; during.txt must be recorded"
+else
+  during=refused
+  assert_contains "$out" "Transport endpoint is not connected" "a write after the crash fails with ENOTCONN"
 fi
-pass "nothing of the deleted pod is left mounted on the node"
-echo "first pod $FIRST_POD, recovered in place: $POD"
-
-step "the rollback's flush Pod runs as written (docs/runbooks/upgrading-the-sidecar.md)"
-wait_ready
-CONFIG=$(k get deployment agentfs-example -o jsonpath='{.spec.template.spec.volumes[?(@.name=="config")].configMap.name}')
-case "$CONFIG" in
-agentfs-config-?*) pass "the ConfigMap's name carries kustomize's hash ($CONFIG)" ;;
-*) fail "the ConfigMap is named '$CONFIG', not agentfs-config-<hash>" ;;
-esac
-# The runbook's kubectl, in this namespace, with the image under test. A
-# plain subshell, so set -e stops at the block's first failure (diagnose
-# prints the saved log and describes the flush Pod).
-(
-  kubectl() { command kubectl -n "$NS" "$@"; }
-  POD=pod/$POD
-  NEWER=agentfs:ci
-  run_block upgrading-the-sidecar.md rollback-flush
-) >"$LOGS/rollback-flush.log" 2>&1
-cat "$LOGS/rollback-flush.log"
-assert_contains "$(cat "$LOGS/rollback-flush.log")" "record(s) into" "agentfs flush ran in the flush Pod"
-k scale deployment/agentfs-example --replicas=1
-wait_ready
-in_root "printf after-flush > $WS/after-flush.txt"
-wait_remote after-flush.txt after-flush
+wait_sidecar_restarted "$restarts"
+recovered=$(k logs "$POD" -c agentfs)
+echo "$recovered" | grep -E '^(stacked|mounted|not built) ' || true
+assert_contains "$recovered" "stacked over a stale mount at $WS left by a crashed daemon" "the sidecar stacked over the stale mount"
+assert_not_built_logged "the stacked sidecar logged the remote as not built again"
+assert_eq "live agentfs mount (agentfs:$VOLUME)" "$(in_sidecar agentfs probe "$WS")" "probe sees the new mount"
+in_root "printf after > $WS/after-crash.txt"
+in_user 'printf after-subpath > /workspace/u10000/after-crash-subpath.txt'
+assert_eq after "$(in_user 'cat /workspace/after-crash.txt')" "the subPath writer reaches the new mount"
+assert_eq "$user_restarts" "$(writer_restarts writer-10000)" "the subPath writer was not restarted"
+assert_eq "$root_restarts" "$(writer_restarts writer-root)" "the root writer was not restarted"
+wait_history after-crash.txt after
+wait_history u10000/after-crash-subpath.txt after-subpath
+assert_contains "$(message after-crash.txt)" "Agentfs-Pod: $POD" "the stacked view records with the pod's trailers"
+wait_history before-crash.txt before
+if [ "$during" = refused ]; then
+  never_recorded during.txt "refused after the crash"
+  if in_root "test -e $WS/during.txt"; then fail "during.txt is in the volume"; fi
+  pass "the write that failed is nowhere"
+else
+  wait_history during.txt x
+fi
+echo "first pod $FIRST_POD; replaced, stopped mid-pod and recovered in place: $POD"
 
 step "e2e-kind passed"

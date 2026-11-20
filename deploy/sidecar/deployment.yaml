@@ -1,7 +1,8 @@
 # A workload with agentfs as a privileged native sidecar. The
 # layout and every choice here are explained in docs/deployment.md.
 #
-#   /data                 the PVC: backing/ (the files) and state/ (history)
+#   /data                 the PVC: state/, the volume's state area (its
+#                         files, journal and history.git)
 #   /agentfs              an emptyDir shared by every container
 #   /agentfs/workspace    the FUSE mount: what the workload uses
 #
@@ -28,21 +29,23 @@ spec:
       labels:
         app.kubernetes.io/name: agentfs-example
     spec:
-      # Longer than --unmount-grace (10s) + --push-grace (5s) + the final
-      # commit, so a deleted pod always makes its final commit.
+      # Time for the sidecar's drain. A consumer that mounts the workspace
+      # through subPath holds the mount until the pod's volumes are torn
+      # down, so the sidecar exits only at this grace (docs/deployment.md).
       terminationGracePeriodSeconds: 60
       automountServiceAccountToken: false
       initContainers:
-        # Creates the state area on first start, checks it on every later
-        # one (another volume on this PVC fails the pod), creates
-        # /data/backing, and sets the operator config include.
+        # Creates the volume on first start, finds it on every later one
+        # (another volume on this PVC, or a recording state area, fails the
+        # pod), and makes the operator settings file include
+        # /etc/agentfs/config. AGENTFS_OWNER (UID:GID) would give a new
+        # volume's root directory to the workload's user.
         - name: agentfs-init
           image: ghcr.io/mcurcio/agentfs
           args: [init, --include, /etc/agentfs/config]
           env:
             - { name: AGENTFS_VOLUME, value: example }
             - { name: AGENTFS_STATE, value: /data/state }
-            - { name: AGENTFS_ROOT, value: /data/backing }
           securityContext:
             runAsUser: 0
             runAsGroup: 0
@@ -59,11 +62,10 @@ spec:
         - name: agentfs
           image: ghcr.io/mcurcio/agentfs
           restartPolicy: Always
-          args: [mount, /data/backing, /agentfs/workspace]
+          args: [mount, /agentfs/workspace]
           env:
             - { name: AGENTFS_STATE, value: /data/state }
-            - { name: AGENTFS_ROOT, value: /data/backing }
-            # Restarted by the kubelet after a crash: mount over the stale
+            # Restarted by the kubelet after a crash: stack over the stale
             # mount the dead daemon left, so the workload's copies of it
             # (and subPath binds) reach the new daemon with no manual step
             # (docs/runbooks/crashed-sidecar.md). `hold`
@@ -74,7 +76,8 @@ spec:
             # workload whose subPath is bound in that gap gets EACCES
             # instead of writing where nothing records it.
             - { name: AGENTFS_SEAL_MOUNTPOINT, value: "true" }
-            # Commit trailers, committer identity and telemetry resource.
+            # The pod context of every commit (Agentfs-Pod and the other
+            # trailers) and the telemetry resource.
             - name: AGENTFS_POD
               valueFrom: { fieldRef: { fieldPath: metadata.name } }
             - name: AGENTFS_POD_UID
@@ -84,7 +87,9 @@ spec:
             - name: AGENTFS_NODE
               valueFrom: { fieldRef: { fieldPath: spec.nodeName } }
             # OpenTelemetry (docs/telemetry.md): point this at your
-            # collector, or set OTEL_SDK_DISABLED=true.
+            # collector, or set OTEL_SDK_DISABLED=true. The mount exports
+            # agentfs.not_built, the alarm for a setting in
+            # /etc/agentfs/config that tree volumes do not build yet.
             - { name: OTEL_EXPORTER_OTLP_ENDPOINT, value: "http://otel-collector.observability.svc:4318" }
             - { name: OTEL_SERVICE_NAME, value: agentfs }
             - { name: OTEL_RESOURCE_ATTRIBUTES, value: k8s.container.name=agentfs }
@@ -92,8 +97,8 @@ spec:
             - { name: OTEL_TRACES_SAMPLER_ARG, value: "0.01" }
           securityContext:
             # Bidirectional propagation is only allowed in privileged
-            # containers; mount(2), /dev/fuse and passthrough need
-            # CAP_SYS_ADMIN anyway. See "Security trade-offs" in
+            # containers; mount(2) and /dev/fuse need CAP_SYS_ADMIN
+            # anyway. See "Security trade-offs" in
             # docs/deployment.md.
             privileged: true
             runAsUser: 0
@@ -102,15 +107,18 @@ spec:
           volumeMounts:
             - { name: data, mountPath: /data }
             - { name: agentfs-mount, mountPath: /agentfs, mountPropagation: Bidirectional }
-            # Operator rules over the state area's own files, in the
-            # sidecar only (the workload never sees /data).
-            - { name: config, mountPath: /data/state/git/info/exclude, subPath: exclude, readOnly: true }
-            - { name: config, mountPath: /data/state/git/info/attributes, subPath: attributes, readOnly: true }
+            # Operator rules over the history's own files, read when the
+            # volume opens, in the sidecar only (the workload never sees
+            # /data).
+            - { name: config, mountPath: /data/state/history.git/info/exclude, subPath: exclude, readOnly: true }
+            - { name: config, mountPath: /data/state/history.git/info/attributes, subPath: attributes, readOnly: true }
             - { name: config, mountPath: /etc/agentfs, readOnly: true }
+            # For the remotes of /etc/agentfs/config, once push is built.
             - { name: credentials, mountPath: /run/secrets/agentfs, readOnly: true }
           # Gates the workload containers until the mount is live. It also
           # passes for the stale mount a crash left, so the kubelet does not
-          # kill a restarted sidecar while it recovers (or holds). 5 minutes for journal recovery at start.
+          # kill a restarted sidecar while it recovers (or holds). 5 minutes
+          # for the volume's recovery at start.
           startupProbe:
             exec:
               command: [agentfs, probe, --allow-stale, /agentfs/workspace]
@@ -124,7 +132,7 @@ spec:
             timeoutSeconds: 5
           # No livenessProbe: the kubelet already restarts a daemon that
           # exits or crashes, and killing a live one that is slow (a long
-          # journal recovery, a big commit) would only interrupt it.
+          # recovery) would only interrupt it.
           resources:
             requests:
               cpu: 50m

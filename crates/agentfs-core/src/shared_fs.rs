@@ -270,8 +270,7 @@ mod tests {
         ] {
             assert!(!is_network(&mount(fstype, "rw")), "{fstype}");
         }
-        // A missing path is an error naming it (ci/e2e-nfs.sh refuses a
-        // real NFS base path).
+        // A missing path is an error naming it.
         let err = network_filesystem(Path::new("/no/such/agentfs/dir")).unwrap_err();
         assert!(err.to_string().contains("/no/such/agentfs/dir"), "{err}");
     }

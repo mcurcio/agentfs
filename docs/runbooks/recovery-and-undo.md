@@ -2,8 +2,12 @@
 
 Bring files back to an earlier state after an agent (or anyone) changed
 them by mistake. Safety promise: [guarantees](../guarantees.md).
-`ci/e2e-recovery.sh` runs this procedure end to end through a real mount
-in CI.
+
+`restore` and `revert` are the recording engine's, on recording state areas, which no launcher runs any more
+([moving.md](moving.md) moves the CSI volumes an older driver made). Its "Under CSI" steps apply to no volume today: the CSI driver runs tree volumes. On a tree volume (the sidecar, the Docker examples, `agentfs mount` and the CSI driver)
+they are not built yet and refuse; its history is still plain git in
+`<state>/history.git` (section 5's plain-git steps read it,
+[trees](../trees.md)).
 
 Use it when a file or directory in a volume holds the wrong content, or
 a whole change (one commit) must be undone. For content that must leave
@@ -14,8 +18,8 @@ commit, it never removes old ones.
 Throughout:
 
 ```sh
-STATE=/data/state       # the state area
-BACKING=/data/backing   # the backing tree
+STATE=/var/lib/agentfs-csi/volumes/<pv>/state     # the state area
+BACKING=/var/lib/agentfs-csi/volumes/<pv>/backing # the backing tree
 VOL=demo                # the volume (agentfs.volume)
 BRANCH=refs/heads/agentfs/$VOL
 ```
@@ -51,16 +55,16 @@ A restore can run with the workload live, but a workload writing the same
 files at the same moment can overwrite the restore again (nothing is
 lost: its writes are recorded too). Pause it first when you can:
 
-- **Keep the mount, pause the agent.** In Kubernetes, stop the agent
-  inside the pod (its own pause control, or `kubectl exec` a
-  `kill -STOP <pid>` into its container) while the agentfs sidecar keeps
-  running, and run `agentfs restore` in the sidecar (`kubectl exec -c
-  agentfs ...`). Resume the agent afterwards (`kill -CONT`). Elsewhere,
-  stop the agent process and leave `agentfs mount` running.
-- **Stop everything.** Scale the workload to zero (this stops the
-  sidecar too), then run `agentfs` in a one-off pod that mounts the
-  volume's PVC: with no mount running it writes the backing tree directly
-  (`--root`). Scale back up afterwards.
+- **Keep the mount, pause the agent.** Stop the agent inside its pod
+  (its own pause control, or `kubectl exec` a `kill -STOP <pid>` into its
+  container) while its volume stays published, and run `agentfs restore`
+  in the node plugin pod of the volume's node
+  ([csi.md](../csi.md#9-operations)). Resume the agent afterwards
+  (`kill -CONT`).
+- **Stop everything.** Scale the workload to zero, so the volume is
+  unstaged, then run `agentfs` in the node plugin pod: with no history
+  service running it writes the backing tree directly (`--root`). Scale
+  back up afterwards.
 
 ## 3. Restore or revert
 
@@ -92,16 +96,11 @@ plain git (section 5).
 
 ### Which mode runs
 
-- **The volume is mounted** (`agentfs mount` running): the command asks
-  the mount over its control socket (`$STATE/meta/control/agentfs.sock`,
-  root or the daemon's user only). The daemon waits until history has
-  caught up with the tree, checks, and writes through its own mount, so
-  the workload sees the restored files at once and the FUSE layer records
-  them. `--root` is not needed.
 - **Nothing runs**: the command takes the state-area lock itself, commits
   anything journaled, writes `--root` directly and records what it wrote.
 - **`agentfs serve-history` runs** (fronts mount the volume):
-  the command asks the service over the same control socket. Every live
+  the command asks the service over its control socket
+  (`$STATE/meta/control/agentfs.sock`, root or the service's user only). Every live
   front must be listening for the service's calls (otherwise exit status
   75: a front from an older release, or one reconnecting; retry, or
   restart it; also 75 when a front cannot record what is dirty in it).
@@ -114,7 +113,7 @@ plain git (section 5).
   service during a restore stops it before its next path, with what it
   wrote recorded: run it again.
 - **`agentfs run` (or `record`, `flush`, `push`) holds the state area**:
-  exit status 75. `run` serves no restores: stop it (or mount instead).
+  exit status 75. `run` serves no restores: stop it first.
 
 ### Output and exit status
 
@@ -228,12 +227,10 @@ one point in time. Every commit holds a consistent group, which SQLite
 opens as it would after a crash. `-shm` is never recorded. `restore` and
 `revert` of any member bring back the whole group from one commit: the
 members the commit has are written, the ones it lacks are removed, and
-the result is one restore commit. `ci/e2e-sqlite.sh` runs this procedure
-in CI, both through a mount and directly.
+the result is one restore commit.
 
 1. **Find the version.** List the commits that changed the database, then
-   check one before restoring it (optional; `ci/sqlite-check.py` checks
-   every version at once):
+   check one before restoring it (optional):
 
    ```sh
    DB=data/app.db

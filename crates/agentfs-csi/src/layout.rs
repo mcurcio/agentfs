@@ -1,25 +1,19 @@
-//! Where the driver keeps things.
+//! Where the driver keeps things (docs/csi.md).
 //!
 //! ```text
 //! <base>/                         --base-path: a directory on this node's own
-//!                                 disk, never a network filesystem (F8 R1)
-//!   <handle>/                     a worktree (the PV name), 0700
-//!     backing/                    the files the pods see
-//!     state/                      the state area
-//!     csi.json                    the record of the volume (CreateVolume, or
-//!                                 a static PV adopted over the worktree)
-//!     csi.retained.json           the record once DeleteVolume kept the worktree
-//!   .deleting.<handle>/           a worktree DeleteVolume is removing
+//!                                 disk, never a network filesystem
+//!   <handle>/                     a claim's volume directory (the PV name), 0700
+//!     state/                      the tree state area (history in state/history.git)
+//!     csi.json                    the claim record (CreateVolume, or a static
+//!                                 PV over a kept volume)
+//!     csi.retained.json           the record once DeleteVolume kept the volume
+//!                                 (a fork claim's directory holds only its
+//!                                 csi.json: its fork is in its source's state)
 //! <node-state>/                   --node-state: on the node, survives plugin restarts
-//!   run/<handle>/history.sock     the volume's history service (directory 0700)
-//!   staged/<handle>.json          a staged volume: its service runs
-//!   published/<handle>/<key>.json a published target: its front runs
-//! <mount-dir>/<handle>/<key>      --mount-dir: each front's own FUSE mount,
-//!                                 bind-mounted onto the kubelet's target
+//!   published/<handle>.json       the claim's published target
 //! <profiles>/<profile>.config|.exclude|.attributes
 //! ```
-//!
-//! `<key>` is [`target_key`]: a hash of the kubelet's target path.
 
 use std::path::{Path, PathBuf};
 
@@ -43,86 +37,46 @@ pub enum LayoutError {
 pub struct Layout {
     /// `--base-path`: the volumes.
     pub base: PathBuf,
-    /// `--node-state`: node records and service sockets.
+    /// `--node-state`: the published records.
     pub node_state: PathBuf,
-    /// `--mount-dir`: the fronts' own mounts.
-    pub mount_dir: PathBuf,
     /// `--profiles-dir`: the operator's profiles.
     pub profiles: PathBuf,
 }
 
 impl Layout {
+    /// `<base>/<handle>`.
     pub fn volume_dir(&self, handle: &str) -> PathBuf {
         self.base.join(handle)
     }
 
-    /// The volume's state area.
+    /// The volume's tree state area, `<base>/<handle>/state`.
     pub fn state(&self, handle: &str) -> PathBuf {
         self.volume_dir(handle).join("state")
     }
 
-    /// The volume's backing tree.
-    pub fn backing(&self, handle: &str) -> PathBuf {
-        self.volume_dir(handle).join("backing")
-    }
-
-    /// The controller's record of the volume; the volume exists while it
-    /// does.
+    /// The claim record; the claim exists while it does.
     pub fn csi_json(&self, handle: &str) -> PathBuf {
         self.volume_dir(handle).join("csi.json")
     }
 
-    /// Where a retained volume's record goes after DeleteVolume.
+    /// The claim record once DeleteVolume kept the volume.
     pub fn retained_json(&self, handle: &str) -> PathBuf {
         self.volume_dir(handle).join("csi.retained.json")
     }
 
-    /// Where DeleteVolume (`onDelete: delete`) moves a volume before
-    /// removing its files. Handles start with an alphanumeric, so this
-    /// never names a volume.
-    pub fn deleting_dir(&self, handle: &str) -> PathBuf {
-        self.base.join(format!(".deleting.{handle}"))
-    }
-
-    /// The directory of the volume's history service socket (0700).
-    pub fn run_dir(&self, handle: &str) -> PathBuf {
-        self.node_state.join("run").join(handle)
-    }
-
-    /// The volume's history service socket, node-local.
-    pub fn socket(&self, handle: &str) -> PathBuf {
-        self.run_dir(handle).join("history.sock")
-    }
-
-    pub fn staged_dir(&self) -> PathBuf {
-        self.node_state.join("staged")
-    }
-
-    pub fn staged_record(&self, handle: &str) -> PathBuf {
-        self.staged_dir().join(format!("{handle}.json"))
-    }
-
-    pub fn published_root(&self) -> PathBuf {
+    /// The directory of the published records.
+    pub fn published_dir(&self) -> PathBuf {
         self.node_state.join("published")
     }
 
-    pub fn published_dir(&self, handle: &str) -> PathBuf {
-        self.published_root().join(handle)
+    /// The claim's published target, `<node_state>/published/<handle>.json`.
+    pub fn published(&self, handle: &str) -> PathBuf {
+        self.published_dir().join(format!("{handle}.json"))
     }
 
-    pub fn published_record(&self, handle: &str, key: &str) -> PathBuf {
-        self.published_dir(handle).join(format!("{key}.json"))
-    }
-
-    /// Where the front for `key` mounts the volume, before the bind mount
-    /// onto the target.
-    pub fn front_source(&self, handle: &str, key: &str) -> PathBuf {
-        self.mount_dir.join(handle).join(key)
-    }
-
-    /// `<profiles>/<profile>.<kind>` (`config`, `exclude`, `attributes`).
-    pub fn profile_file(&self, profile: &str, kind: &str) -> PathBuf {
-        self.profiles.join(format!("{profile}.{kind}"))
+    /// `<profiles>/<profile>.<ext>` (`config`, `exclude`, `attributes`).
+    pub fn profile_file(&self, profile: &str, ext: &str) -> PathBuf {
+        self.profiles.join(format!("{profile}.{ext}"))
     }
 }
 
@@ -131,13 +85,13 @@ pub fn validate_handle(handle: &str) -> Result<(), LayoutError> {
     validate_name("volume id", handle).map_err(|_| LayoutError::BadHandle(handle.to_owned()))
 }
 
-/// A node id names a marker file.
+/// A node id names a topology segment.
 pub fn validate_node(node: &str) -> Result<(), LayoutError> {
     validate_name("node id", node).map_err(|_| LayoutError::BadNode(node.to_owned()))
 }
 
 /// The first 16 hex digits of the SHA-256 of `target`: a short, stable
-/// file name for a kubelet target path.
+/// name for a kubelet target path.
 pub fn target_key(target: &Path) -> String {
     let digest = Sha256::digest(target.as_os_str().as_encoded_bytes());
     digest[..8].iter().map(|b| format!("{b:02x}")).collect()
@@ -179,20 +133,13 @@ mod tests {
         let l = Layout {
             base: "/b".into(),
             node_state: "/n".into(),
-            mount_dir: "/m".into(),
             profiles: "/p".into(),
         };
+        assert_eq!(l.volume_dir("v"), Path::new("/b/v"));
         assert_eq!(l.state("v"), Path::new("/b/v/state"));
-        assert_eq!(l.backing("v"), Path::new("/b/v/backing"));
         assert_eq!(l.csi_json("v"), Path::new("/b/v/csi.json"));
         assert_eq!(l.retained_json("v"), Path::new("/b/v/csi.retained.json"));
-        assert_eq!(l.socket("v"), Path::new("/n/run/v/history.sock"));
-        assert_eq!(l.staged_record("v"), Path::new("/n/staged/v.json"));
-        assert_eq!(
-            l.published_record("v", "k"),
-            Path::new("/n/published/v/k.json")
-        );
-        assert_eq!(l.front_source("v", "k"), Path::new("/m/v/k"));
+        assert_eq!(l.published("v"), Path::new("/n/published/v.json"));
         assert_eq!(l.profile_file("ci", "config"), Path::new("/p/ci.config"));
     }
 }

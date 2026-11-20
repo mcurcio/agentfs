@@ -389,13 +389,19 @@ impl Recording {
             .map(|((_, f), _)| f.clone())
     }
 
-    /// The files clients writing in tree `t` (at `at`, its head) have open, and the files
-    /// their deferred calls (R5.3) will save: identities, not lock keys. An open whose
-    /// object no path names (an orphan) has no file open.
-    pub(crate) fn open_files(&self, t: TreeId, at: &str, git: &impl Files) -> BTreeSet<String> {
+    /// The files clients writing in `target` (a tree, or a fork's transaction; at `at`,
+    /// its head) have open, and the files their deferred calls (R5.3) will save:
+    /// identities, not lock keys. An open whose object no path names (an orphan) has no
+    /// file open.
+    pub(crate) fn open_files(
+        &self,
+        target: Target,
+        at: &str,
+        git: &impl Files,
+    ) -> BTreeSet<String> {
         self.handles
             .values()
-            .filter(|h| h.target == Target::Tree(t))
+            .filter(|h| h.target == target)
             .flat_map(|h| {
                 let mut files: Vec<String> = self.named(h, at, git).into_iter().collect();
                 if h.kind != Kind::Write {
@@ -671,6 +677,72 @@ impl Recording {
             set,
             open: None,
         })
+    }
+
+    /// Rule 15: `symlink(bytes, p)` at `at`: [`Recording::create`] of a new file
+    /// whose one save also writes `bytes` (the link's target) as its lines, so
+    /// the link is made by one commit. Never in a transaction.
+    pub(crate) fn create_holding(
+        &mut self,
+        p: &str,
+        bytes: &str,
+        writer: &str,
+        target: Target,
+        at: &str,
+        git: &impl Files,
+    ) -> Option<Save> {
+        let mut save = self.create(p, writer, None, target, at, git)?;
+        let f = save.set[0].path.clone();
+        let mut n = save.files[&f].clone();
+        let calls = [Write::Pwrite {
+            offset: 0,
+            bytes: bytes.to_string(),
+        }];
+        let (lines, set) = self.rewrite(&n, &f, &calls, writer, None, &mut Vec::new());
+        n.lines = lines;
+        save.files.insert(f, n);
+        save.set.extend(set);
+        Some(save)
+    }
+
+    /// Rule 14, a directory's rename at `at`: one save writing a new version of
+    /// each moved file's name line, `(identity, new path)`. Never in a transaction.
+    pub(crate) fn rename_all(
+        &mut self,
+        moves: &[(String, String)],
+        writer: &str,
+        target: Target,
+        at: &str,
+        git: &impl Files,
+    ) -> Save {
+        let mut files = BTreeMap::new();
+        let mut set = Vec::new();
+        for (f, to) in moves {
+            let c = git.file(at, f);
+            let id = self.token(writer, None);
+            set.push(Edit {
+                path: f.clone(),
+                line: f.clone(),
+                token: id.clone(),
+                gone: false,
+            });
+            let mut n = c.clone();
+            n.name = Line {
+                id,
+                line: c.name.line.clone(),
+                over: Some(c.name.id.clone()),
+                state: State::Live(to.clone()),
+            };
+            files.insert(f.clone(), n);
+        }
+        Save {
+            target,
+            writer: writer.to_string(),
+            at: at.to_string(),
+            files,
+            set,
+            open: None,
+        }
     }
 
     /// The calls of the save committed as `commit`, as the program made them.

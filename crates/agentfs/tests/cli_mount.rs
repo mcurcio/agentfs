@@ -1,12 +1,15 @@
-//! `agentfs mount` refusals that need no FUSE device: every one happens before anything is mounted, so these run
-//! anywhere. Real mounts are tested in `mount.rs`, in CI. Also `agentfs
-//! probe` on paths with no agentfs mount.
+//! `agentfs mount` refusals that need no FUSE device (docs/trees.md, "Run
+//! it"): every one happens before anything is mounted, so these run
+//! anywhere; real mounts are `launcher_mount.rs`'s, run as root by
+//! ci/fuse-tests.sh. Also `agentfs probe` on paths with no agentfs mount,
+//! and the recording commands refusing a tree volume.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-use std::time::Duration;
 
-use agentfs_core::lock::StateLock;
+use agentfs_contracts::pod::PodContext;
+use agentfs_core::tree_actor::Recording;
 use agentfs_core::volume::StateDir;
 
 struct Layout {
@@ -18,9 +21,7 @@ impl Layout {
         let l = Self {
             dir: tempfile::tempdir().unwrap(),
         };
-        for d in ["backing", "mnt"] {
-            std::fs::create_dir_all(l.p(d)).unwrap();
-        }
+        std::fs::create_dir_all(l.p("mnt")).unwrap();
         l
     }
 
@@ -28,9 +29,35 @@ impl Layout {
         self.dir.path().join(rel)
     }
 
-    fn init(&self, state: &Path) {
-        let out = run(state, &["init", "--volume", "demo"]);
+    fn state(&self) -> PathBuf {
+        self.p("state")
+    }
+
+    fn init(&self, extra: &[&str]) {
+        let mut args = vec!["init", "--volume", "demo"];
+        args.extend_from_slice(extra);
+        let out = run(&self.state(), &args);
         assert!(out.status.success(), "{}", stderr(&out));
+    }
+
+    /// Every file under the state area with its bytes.
+    fn files(&self) -> BTreeMap<PathBuf, Vec<u8>> {
+        fn walk(dir: &Path, out: &mut BTreeMap<PathBuf, Vec<u8>>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else {
+                    out.insert(path.clone(), std::fs::read(&path).unwrap_or_default());
+                }
+            }
+        }
+        let mut out = BTreeMap::new();
+        walk(&self.state(), &mut out);
+        out
     }
 }
 
@@ -58,189 +85,158 @@ fn s(p: &Path) -> &str {
     p.to_str().unwrap()
 }
 
+/// Each refusal is checked with `-- true` after the mount point: were the
+/// refusal lost, the mount would serve and exit at once, never hang the test.
 fn refused(out: &Output, needle: &str) {
     assert_eq!(out.status.code(), Some(1), "{}", stderr(out));
     assert!(stderr(out).contains(needle), "{}", stderr(out));
-    assert!(!stderr(out).contains("mounted "), "{}", stderr(out));
+    assert!(!stderr(out).contains("mounted volume"), "{}", stderr(out));
 }
 
+/// `mount` recovers a volume and never creates one: nothing is written.
 #[test]
-fn state_area_inside_the_backing_tree() {
+fn mount_never_creates() {
     let l = Layout::new();
-    let state = l.p("backing/.state");
-    l.init(&state);
-    let out = run(&state, &["mount", s(&l.p("backing")), s(&l.p("mnt"))]);
-    refused(&out, "is inside the backing tree");
+    let out = run(&l.state(), &["mount", s(&l.p("mnt")), "--", "true"]);
+    refused(&out, "agentfs init --volume");
+    assert!(!l.state().exists(), "the state area was made");
 }
 
+/// Another process holding the state area: exit 75, nothing mounted.
 #[test]
-fn mount_point_inside_the_backing_tree() {
+fn a_held_state_area_exits_75() {
     let l = Layout::new();
-    let state = l.p("state");
-    l.init(&state);
-    std::fs::create_dir_all(l.p("backing/mnt")).unwrap();
-    let out = run(
-        &state,
-        &["mount", s(&l.p("backing")), s(&l.p("backing/mnt"))],
+    l.init(&[]);
+    let held = Recording::open(&l.state(), &PodContext::default()).unwrap();
+    let out = run(&l.state(), &["mount", s(&l.p("mnt")), "--", "true"]);
+    assert_eq!(out.status.code(), Some(75), "{}", stderr(&out));
+    assert!(stderr(&out).contains("busy"), "{}", stderr(&out));
+    drop(held);
+}
+
+/// A recording state area is refused, pointing at the runbook that moves
+/// it aside, and left as it was.
+#[test]
+fn a_recording_state_area_is_refused() {
+    let l = Layout::new();
+    agentfs_core::volume::init_with(&StateDir::new(l.state()), "demo", None, None).unwrap();
+    let before = l.files();
+    let out = run(&l.state(), &["mount", s(&l.p("mnt")), "--", "true"]);
+    refused(&out, "docs/runbooks/upgrading-the-sidecar.md");
+    assert_eq!(l.files(), before, "the recording state area changed");
+}
+
+/// An include the workload could reach through a view: exit 1 before the
+/// volume is staged (staging recovers it, and so writes its journal).
+#[test]
+fn an_include_under_a_view_is_refused_before_staging() {
+    let l = Layout::new();
+    let include = l.p("outside.conf");
+    std::fs::write(&include, "").unwrap();
+    l.init(&["--include", s(&include)]);
+    // The include, moved under the mount point after init wrote it.
+    let inside = l.p("mnt/operator.conf");
+    let config = std::fs::read_to_string(l.state().join("config")).unwrap();
+    std::fs::write(
+        l.state().join("config"),
+        config.replace(s(&include), s(&inside)),
+    )
+    .unwrap();
+    let before = l.files();
+    let out = run(&l.state(), &["mount", s(&l.p("mnt")), "--", "true"]);
+    refused(&out, "is under the mount point");
+    assert_eq!(l.files(), before, "the volume was staged");
+}
+
+/// An include named by an included file is checked as a top-level one: one
+/// under a view is refused, and the refusal comes before the mount point is
+/// created.
+#[test]
+fn a_nested_include_under_a_view_is_refused_before_anything_is_created() {
+    let l = Layout::new();
+    let top = l.p("top.conf");
+    let at = l.p("fresh");
+    std::fs::write(
+        &top,
+        format!("[include]\n\tpath = {}/operator.conf\n", s(&at)),
+    )
+    .unwrap();
+    l.init(&["--include", s(&top)]);
+    let before = l.files();
+    let out = run(&l.state(), &["mount", s(&at), "--", "true"]);
+    refused(&out, "is under the mount point");
+    assert!(
+        !at.exists(),
+        "the mount point was created before the refusal"
     );
-    refused(&out, "the mount point");
-    let out = run(&state, &["mount", s(&l.p("backing")), s(&l.p("backing"))]);
-    refused(&out, "the same directory");
+    assert_eq!(l.files(), before, "the volume was staged");
 }
 
+/// A missing include named by an included file is warned of.
 #[test]
-fn credentials_inside_the_backing_tree() {
+fn a_missing_nested_include_is_warned_of() {
     let l = Layout::new();
-    let state = l.p("state");
-    l.init(&state);
-    std::fs::write(l.p("backing/token"), "secret").unwrap();
-    let git = state.join("git");
-    let config = |k: &str, v: &str| {
-        let ok = Command::new("git")
-            .args(["--git-dir", s(&git), "config", k, v])
-            .status()
-            .unwrap()
-            .success();
-        assert!(ok);
-    };
-    config("remote.origin.url", "file:///nowhere.git");
-    config("remote.origin.agentfsCredentials", s(&l.p("backing/token")));
-    let out = run(&state, &["mount", s(&l.p("backing")), s(&l.p("mnt"))]);
-    refused(&out, "agentfsCredentials file");
+    let top = l.p("top.conf");
+    std::fs::write(&top, "[include]\n\tpath = nested-missing\n").unwrap();
+    l.init(&["--include", s(&top)]);
+    // A mount point with files stops the mount after the settings are read,
+    // before anything is mounted.
+    std::fs::write(l.p("mnt/left.txt"), "x").unwrap();
+    let out = run(&l.state(), &["mount", s(&l.p("mnt")), "--", "true"]);
+    refused(&out, "is not empty");
+    assert!(
+        stderr(&out).contains(&format!(
+            "warning: operator settings: include {} is missing",
+            l.p("nested-missing").display()
+        )),
+        "{}",
+        stderr(&out)
+    );
 }
 
-/// An SSH key or known_hosts file under the backing tree is refused before
-/// anything is mounted, whether or not this build supports SSH (without the
-/// `ssh` feature the remote is misconfigured, and its files are still
-/// checked).
+/// A mount point inside the state area is refused before anything is
+/// created there, for the root's view and a fork's.
 #[test]
-fn ssh_files_inside_the_backing_tree() {
-    for (key, known_hosts, expected) in [
-        ("backing/id", "known_hosts", "agentfsSshKey file"),
-        ("id", "backing/known_hosts", "agentfsKnownHosts file"),
+fn a_mount_point_inside_the_state_area_is_refused() {
+    let l = Layout::new();
+    l.init(&[]);
+    let before = l.files();
+    let inside = l.state().join("inside");
+    for args in [
+        vec!["mount", s(&inside), "--", "true"],
+        vec![
+            "mount",
+            s(&l.p("mnt")),
+            "--fork-mount",
+            s(&inside),
+            "--",
+            "true",
+        ],
     ] {
-        let l = Layout::new();
-        let state = l.p("state");
-        l.init(&state);
-        let git = state.join("git");
-        let config = |k: &str, v: &str| {
-            let ok = Command::new("git")
-                .args(["--git-dir", s(&git), "config", k, v])
-                .status()
-                .unwrap()
-                .success();
-            assert!(ok);
-        };
-        config("remote.origin.url", "ssh://git@git.example/r.git");
-        config("remote.origin.agentfsSshKey", s(&l.p(key)));
-        config("remote.origin.agentfsKnownHosts", s(&l.p(known_hosts)));
-        let out = run(&state, &["mount", s(&l.p("backing")), s(&l.p("mnt"))]);
-        refused(&out, expected);
+        let out = run(&l.state(), &args);
+        refused(&out, "is inside the state area");
+        assert!(!inside.exists(), "{args:?}: the mount point was created");
+        assert_eq!(l.files(), before, "{args:?}: the state area changed");
     }
 }
 
+/// A mount point holding files is refused: the mount would hide them.
 #[test]
-fn root_must_match_the_backing_tree() {
+fn a_mount_point_with_files_is_refused() {
     let l = Layout::new();
-    let state = l.p("state");
-    l.init(&state);
-    let out = run(
-        &state,
-        &[
-            "--root",
-            s(&l.p("mnt")),
-            "mount",
-            s(&l.p("backing")),
-            s(&l.p("mnt")),
-        ],
-    );
-    refused(&out, "is not the backing tree");
-}
-
-#[test]
-fn a_held_state_area_exits_75_before_mounting() {
-    let l = Layout::new();
-    let state = l.p("state");
-    l.init(&state);
-    let _lock = StateLock::acquire(&StateDir::new(&state), "test-holder", Duration::ZERO).unwrap();
-    let out = run(&state, &["mount", s(&l.p("backing")), s(&l.p("mnt"))]);
-    assert_eq!(out.status.code(), Some(75), "{}", stderr(&out));
-    assert!(
-        stderr(&out).contains("command=test-holder"),
-        "{}",
-        stderr(&out)
-    );
-}
-
-#[test]
-fn bad_passthrough_values_are_rejected() {
-    let l = Layout::new();
-    let state = l.p("state");
-    l.init(&state);
-    let out = run(
-        &state,
-        &[
-            "mount",
-            "--passthrough",
-            "maybe",
-            s(&l.p("backing")),
-            s(&l.p("mnt")),
-        ],
-    );
-    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
-}
-
-#[test]
-fn an_include_inside_the_backing_tree() {
-    let l = Layout::new();
-    let state = l.p("state");
-    std::fs::write(l.p("backing/agentfs.conf"), "").unwrap();
-    let out = run(
-        &state,
-        &[
-            "init",
-            "--volume",
-            "demo",
-            "--include",
-            s(&l.p("backing/agentfs.conf")),
-        ],
-    );
-    assert!(out.status.success(), "{}", stderr(&out));
-    let out = run(&state, &["mount", s(&l.p("backing")), s(&l.p("mnt"))]);
-    refused(&out, "include.path");
-}
-
-#[test]
-fn a_missing_mount_point_is_created_before_the_checks() {
-    let l = Layout::new();
-    let state = l.p("state");
-    l.init(&state);
-    // Created, then refused by the layout check: the point is that
-    // preflight saw a directory, not "does not exist".
-    let out = run(
-        &state,
-        &["mount", s(&l.p("backing")), s(&l.p("backing/new-mnt"))],
-    );
-    refused(&out, "the mount point");
-    assert!(l.p("backing/new-mnt").is_dir());
-    // Only one level: a missing parent is an error.
-    let out = run(&state, &["mount", s(&l.p("backing")), s(&l.p("a/b"))]);
-    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
-    assert!(
-        stderr(&out).contains("creating the mount point"),
-        "{}",
-        stderr(&out)
-    );
+    l.init(&[]);
+    std::fs::write(l.p("mnt/left.txt"), "x").unwrap();
+    let out = run(&l.state(), &["mount", s(&l.p("mnt")), "--", "true"]);
+    refused(&out, "is not empty");
 }
 
 #[test]
 fn probe_without_a_mount() {
     let l = Layout::new();
-    let state = l.p("state");
+    let state = l.state();
     for args in [
         &["probe", s(&l.p("mnt"))][..],
         &["probe", "--allow-stale", s(&l.p("mnt"))],
-        &["probe", "--sandbox-overlay", s(&l.p("mnt"))],
     ] {
         let out = run(&state, args);
         assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
@@ -262,55 +258,27 @@ fn probe_without_a_mount() {
     );
 }
 
+/// With no stale mount, `hold` mounts as `refuse` does: here, no volume.
 #[test]
 fn hold_without_a_stale_mount_behaves_like_refuse() {
     let l = Layout::new();
-    let state = l.p("state");
-    l.init(&state);
-    std::fs::create_dir_all(l.p("backing/mnt")).unwrap();
-    let out = run(
-        &state,
-        &[
-            "mount",
-            "--on-stale-mount",
-            "hold",
-            s(&l.p("backing")),
-            s(&l.p("backing/mnt")),
-        ],
-    );
-    refused(&out, "the mount point");
-    let out = run(
-        &state,
-        &[
-            "mount",
-            "--on-stale-mount",
-            "maybe",
-            s(&l.p("backing")),
-            s(&l.p("mnt")),
-        ],
-    );
-    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+    for mode in ["hold", "refuse"] {
+        let out = run(
+            &l.state(),
+            &["mount", "--on-stale-mount", mode, s(&l.p("mnt"))],
+        );
+        refused(&out, "agentfs init --volume");
+    }
 }
 
-/// `--seal-mountpoint` needs root, and says so before anything is mounted.
-/// Root (as in the FUSE job) seals instead: `mount.rs`.
 #[test]
 fn seal_mountpoint_needs_root() {
     if rustix::process::geteuid().is_root() {
         return;
     }
     let l = Layout::new();
-    let state = l.p("state");
-    l.init(&state);
-    let out = run(
-        &state,
-        &[
-            "mount",
-            "--seal-mountpoint",
-            s(&l.p("backing")),
-            s(&l.p("mnt")),
-        ],
-    );
+    l.init(&[]);
+    let out = run(&l.state(), &["mount", "--seal-mountpoint", s(&l.p("mnt"))]);
     refused(
         &out,
         "--seal-mountpoint (AGENTFS_SEAL_MOUNTPOINT) needs root",
@@ -320,171 +288,90 @@ fn seal_mountpoint_needs_root() {
     assert_ne!(mode & 0o777, 0, "the mount point was sealed");
 }
 
+/// A recording command on a tree volume exits 1 naming what is not built,
+/// before it reads or writes anything. Every recording command is driven:
+/// one that stopped refusing would run the recording engine on a tree area.
 #[test]
-fn the_sandbox_overlay_flags_come_in_pairs() {
+fn recording_commands_refuse_a_tree_volume() {
     let l = Layout::new();
-    let state = l.p("state");
-    let pairs = [
-        ("--sandbox-overlay", l.p("overlay"), "--sandbox-owner"),
+    l.init(&[]);
+    let before = l.files();
+    let (b, m) = (l.p("b"), l.p("m"));
+    let commands: &[(&str, &[&str])] = &[
+        ("status", &["status"]),
+        ("flush", &["flush"]),
+        ("record", &["--root", s(&b), "record", "a"]),
+        ("serve-history", &["serve-history"]),
         (
-            "--sandbox-owner",
-            PathBuf::from("10000:10000"),
-            "--sandbox-overlay",
+            "front",
+            &["front", "--history-service", "127.0.0.1:1", s(&b), s(&m)],
         ),
+        ("serve-git", &["serve-git"]),
+        ("push", &["push"]),
+        ("checkpoint", &["checkpoint"]),
+        ("run", &["run"]),
+        ("restore", &["restore", "a", "HEAD"]),
+        ("revert", &["revert", "HEAD"]),
+        ("patch", &["patch", "status"]),
+        ("lfs", &["lfs", "fetch", "--all"]),
+        ("fork", &["fork", "finish"]),
+        ("start", &["start", "accept", "--tip", "0000"]),
     ];
-    for (flag, value, missing) in pairs {
-        let out = run(
-            &state,
-            &["mount", s(&l.p("backing")), s(&l.p("mnt")), flag, s(&value)],
-        );
-        assert_eq!(out.status.code(), Some(2), "{flag}: {}", stderr(&out));
-        assert!(stderr(&out).contains(missing), "{flag}: {}", stderr(&out));
+    for (name, args) in commands {
+        let out = run(&l.state(), args);
+        assert_tree_refusal(&out, name, &l.state(), args);
     }
-    let out = run(
-        &state,
-        &[
-            "mount",
-            s(&l.p("backing")),
-            s(&l.p("mnt")),
-            "--sandbox-overlay",
-            s(&l.p("overlay")),
-            "--sandbox-owner",
-            "10000",
-        ],
-    );
-    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
-    assert!(stderr(&out).contains("UID:GID"), "{}", stderr(&out));
-}
-
-#[test]
-fn the_sandbox_overlay_inside_the_mount_point_is_refused() {
-    let l = Layout::new();
-    let state = l.p("state");
-    l.init(&state);
-    let out = run(
-        &state,
-        &[
-            "mount",
-            s(&l.p("backing")),
-            s(&l.p("mnt")),
-            "--sandbox-overlay",
-            s(&l.p("mnt/overlay")),
-            "--sandbox-owner",
-            "10000:10000",
-        ],
-    );
-    refused(&out, "one is inside the other");
-}
-
-/// Two mount points in one directory: a container given that directory
-/// would reach both.
-#[test]
-fn the_sandbox_overlay_beside_the_mount_point_is_refused() {
-    let l = Layout::new();
-    let state = l.p("state");
-    l.init(&state);
-    let out = run(
-        &state,
-        &[
-            "mount",
-            s(&l.p("backing")),
-            s(&l.p("mnt")),
-            "--sandbox-overlay",
-            s(&l.p("overlay")),
-            "--sandbox-owner",
-            "10000:10000",
-        ],
-    );
-    refused(&out, "are both in");
-    refused(&out, "give the sandbox overlay a directory of its own");
-}
-
-/// A refused overlay mount point changes nothing: with `--seal-mountpoint`,
-/// the main mount point's parent given as the overlay's keeps its owner
-/// and mode, and the missing main mount point is not created.
-#[test]
-fn a_refused_overlay_mount_point_is_left_as_it_was() {
-    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
-    let l = Layout::new();
-    let state = l.p("state");
-    l.init(&state);
-    let work = l.p("work");
-    std::fs::create_dir(&work).unwrap();
-    std::fs::set_permissions(&work, std::fs::Permissions::from_mode(0o750)).unwrap();
-    let before = std::fs::metadata(&work).unwrap();
-    let out = run(
-        &state,
-        &[
-            "mount",
-            "--seal-mountpoint",
-            s(&l.p("backing")),
-            s(&l.p("work/mnt")),
-            "--sandbox-overlay",
-            s(&work),
-            "--sandbox-owner",
-            "10000:10000",
-        ],
-    );
-    refused(&out, "one is inside the other");
-    let after = std::fs::metadata(&work).unwrap();
-    assert_eq!(
-        (after.uid(), after.gid(), after.mode()),
-        (before.uid(), before.gid(), before.mode())
-    );
+    assert_eq!(l.files(), before, "a recording command changed the volume");
     assert!(
-        !l.p("work/mnt").exists(),
-        "the main mount point was created"
+        !b.exists() && !m.exists(),
+        "a recording command wrote outside the state area"
     );
 }
 
-/// The overlay's mount point is named as what it is.
+/// `fork create --source-state` names a tree volume as its source: refused
+/// as `--state` is, before the new fork's state area is touched.
 #[test]
-fn a_missing_overlay_parent_names_the_sandbox_overlay() {
+fn fork_create_refuses_a_tree_source() {
     let l = Layout::new();
-    let state = l.p("state");
-    l.init(&state);
+    l.init(&[]);
+    let before = l.files();
+    let fork = l.p("fork");
     let out = run(
-        &state,
+        &fork,
         &[
-            "mount",
-            s(&l.p("backing")),
-            s(&l.p("mnt")),
-            "--sandbox-overlay",
-            s(&l.p("a/b")),
-            "--sandbox-owner",
-            "10000:10000",
+            "--root",
+            s(&l.p("b")),
+            "fork",
+            "create",
+            "--source-state",
+            s(&l.state()),
         ],
     );
-    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
-    assert!(
-        stderr(&out).contains("creating the sandbox overlay's mount point"),
-        "{}",
-        stderr(&out)
-    );
+    assert_tree_refusal(&out, "fork", &l.state(), &["fork", "create"]);
+    assert!(!fork.exists(), "the fork's state area was written");
+    assert_eq!(l.files(), before, "fork create changed the source volume");
 }
 
+/// The guard fails closed: a tree area whose identity file is corrupt is
+/// still refused, on the format's marker alone.
 #[test]
-fn the_sandbox_overlay_is_not_served_on_a_front() {
+fn a_tree_area_with_a_corrupt_identity_is_refused() {
     let l = Layout::new();
-    let state = l.p("state");
-    let out = run(
-        &state,
-        &[
-            "mount",
-            s(&l.p("backing")),
-            s(&l.p("mnt")),
-            "--sandbox-overlay",
-            s(&l.p("overlay")),
-            "--sandbox-owner",
-            "10000:10000",
-            "--history-service",
-            "unix:/nonexistent.sock",
-        ],
-    );
-    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+    l.init(&[]);
+    std::fs::write(l.state().join("volume"), b"not json").unwrap();
+    let out = run(&l.state(), &["status"]);
+    assert_tree_refusal(&out, "status", &l.state(), &["status"]);
+}
+
+fn assert_tree_refusal(out: &Output, name: &str, state: &Path, args: &[&str]) {
+    let err = stderr(out);
+    assert_eq!(out.status.code(), Some(1), "{args:?}: {err}");
     assert!(
-        stderr(&out).contains("--history-service"),
-        "{}",
-        stderr(&out)
+        err.contains(&format!(
+            "`agentfs {name}` runs on the recording engine only; {} is a tree volume",
+            state.display()
+        )),
+        "{args:?}: {err}"
     );
+    assert!(err.contains("not built yet"), "{args:?}: {err}");
 }

@@ -21,7 +21,7 @@ spec:
       annotations:
         {{- include "agentfs-sidecar.podAnnotations" $agentfs | nindent 8 }}
     spec:
-      # Longer than --unmount-grace + --push-grace + the final commit.
+      # Time for the sidecar's drain (docs/deployment.md).
       terminationGracePeriodSeconds: 60
       automountServiceAccountToken: false
       initContainers:

@@ -1,5 +1,5 @@
-# What the driver refuses (ci/e2e-csi.sh): an inline (ephemeral) volume and
-# a ReadWriteMany claim.
+# What the driver refuses (ci/e2e-csi.sh): an inline (ephemeral) volume, a
+# ReadWriteMany claim, and classes with onDelete: delete and startFrom.
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
@@ -8,6 +8,7 @@ namespace: agentfs-csi-e2e-apps
 resources:
   - inline.yaml
   - rwx.yaml
+  - classes.yaml
 
 images:
   - name: ghcr.io/mcurcio/agentfs

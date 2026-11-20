@@ -5,25 +5,16 @@
 //! checks and writing are `agentfs_core::restore`; this module picks the
 //! mode and reports.
 //!
-//! - **Mount mode**: when `agentfs mount` is running it listens on the
-//!   control socket ([`crate::control`]). The command sends it the request;
-//!   the daemon ([`serve`]) waits until history has caught up with the
-//!   tree, checks against its mount point (refusing files open for
-//!   writing unless `--force`), and writes through its own mount from the
-//!   connection's thread, registered as the operation's actor: the FUSE
-//!   layer records those writes like any workload's, as part of the
-//!   operation, so kernel caches, the inode table and dirty detection stay
-//!   coherent. `--root` is not needed.
 //! - **Service mode**: `agentfs serve-history` listens on the control
-//!   socket too, and serves restores for the fronts that mount the volume
+//!   socket ([`crate::control`]), and serves restores for the fronts that mount the volume
 //!   ([`ServiceDaemon`]). Every live front must be listening (or the
 //!   request is busy, 75); the service has each one settle (record what is
 //!   dirty in it), waits until history has caught up, checks the backing
 //!   tree with the fronts' answers about files open for writing, writes
 //!   the backing tree itself and records what it wrote as one operation,
 //!   then has every front drop its kernel's caches of the paths written.
-//! - **Direct mode** (nothing listening): no mount, and so no workload
-//!   through one, can be running. The command takes the state-area lock,
+//! - **Direct mode** (nothing listening): no history service, and so no
+//!   front, can be running. The command takes the state-area lock,
 //!   commits what is journaled, writes the backing tree (`--root`) itself
 //!   and records what it wrote, as one operation.
 //!
@@ -53,7 +44,6 @@ use agentfs_core::restore::{
     self, Liveness, NotLive, Pathspec, Plan, RecordMode, Request, RestoreError,
 };
 use agentfs_core::volume::{Recorder, StateDir};
-use agentfs_fuse::MountView;
 
 use crate::control::{self, ClientError, Op, Outcome, Reply};
 use crate::{EXIT_LOCKED, Pod, Session, current_gid, current_uid};
@@ -239,8 +229,8 @@ fn own_caller() -> Caller {
     }
 }
 
-/// `agentfs restore` / `agentfs revert`: through a running mount if one
-/// listens, else directly.
+/// `agentfs restore` / `agentfs revert`: through a running `run` or
+/// history service if one listens, else directly.
 pub fn run(
     state: &StateDir,
     root: Option<&Path>,
@@ -442,118 +432,6 @@ fn refusal_reply(error: &RestoreError) -> Reply {
         kind: error.kind().to_owned(),
         message: error.to_string(),
         hint: error.hint().map(str::to_owned),
-    }
-}
-
-/// The daemon side of mount mode: serves restores and reverts that arrive
-/// on the control socket, writing through the mount.
-pub struct Daemon {
-    pub state: StateDir,
-    pub recorder: Recorder,
-    pub view: MountView,
-    pub commit_window: Duration,
-}
-
-impl Daemon {
-    /// Serves one request, on the connection's own thread.
-    pub fn serve(&self, request: control::Request, peer: control::Peer) -> Reply {
-        let ask = match Ask::from_wire(request) {
-            Ok(ask) => ask,
-            Err(e) => return refusal_reply(&e),
-        };
-        match self.serve_ask(&ask, peer) {
-            Ok(done) => Reply::Ok(done),
-            Err(e) if e.is_refusal() => refusal_reply(&e),
-            Err(e) => Reply::Error(e.to_string()),
-        }
-    }
-
-    /// How long to wait for history to catch up with the tree.
-    fn history_wait(&self) -> Duration {
-        (self.commit_window * 20).max(MIN_HISTORY_WAIT)
-    }
-
-    fn serve_ask(&self, ask: &Ask, peer: control::Peer) -> Result<Outcome, RestoreError> {
-        // Everything recorded before the request must be in history before
-        // the tree is compared with it.
-        if let Some(seq) = self.recorder.last_seq()
-            && !self.recorder.wait_committed(seq, self.history_wait())
-        {
-            return Err(RestoreError::HistoryBehind);
-        }
-        let history = History::open(&self.state.git()).map_err(other)?;
-        let repo = history.repo();
-        let tree = Dir::open(self.view.mountpoint())?;
-        let plan = restore::plan(repo, &history.settings().branch_ref, &ask.request)?;
-        let live: &dyn Liveness = &self.view;
-        let objects = Objects::new(&self.state, history.settings(), ask.dry_run)?;
-        let plan = restore::check(
-            plan,
-            repo,
-            &self.recorder,
-            objects.get(),
-            &tree,
-            live,
-            ask.force,
-        )?;
-        let mut done = Outcome {
-            plan: plan_lines(&plan),
-            dry_run: ask.dry_run,
-            lfs_uncached: objects.uncached().0,
-            lfs_uncached_bytes: objects.uncached().1,
-            ..Outcome::default()
-        };
-        if ask.dry_run || plan.steps.is_empty() {
-            return Ok(done);
-        }
-        // FUSE reports the calling thread's id as the pid; the process id
-        // is registered too in case a kernel reports the thread group.
-        let tid = rustix::thread::gettid().as_raw_nonzero().get() as u32;
-        let guard = self
-            .recorder
-            .begin_operation(
-                plan.kind,
-                plan.source.to_string(),
-                plan.summary.clone(),
-                Caller {
-                    uid: peer.uid,
-                    gid: peer.gid,
-                    pid: peer.pid,
-                },
-                &[tid, std::process::id()],
-            )
-            .map_err(other)?;
-        let result = restore::apply(&plan, repo, objects.get(), &tree, live, ask.force);
-        // Databases: each group the operation changed is
-        // recorded whole now, as part of it; nothing recorded them before.
-        let captured = self.view.capture_operation();
-        let last = guard.finish();
-        let applied = match &result {
-            Ok(applied) => applied.clone(),
-            Err(e) => e.applied.clone(),
-        };
-        done.written = applied.written.len();
-        done.removed = applied.removed.len();
-        if let Some(last) = last
-            && self.recorder.wait_committed(last, self.history_wait())
-        {
-            done.commit = commit_with_seq(&history, last);
-        }
-        match result {
-            Ok(_) => match captured {
-                Ok(_) => Ok(done),
-                Err(e) => Err(other(format!(
-                    "the {} path(s) were written, but recording a database group failed: {e}; \
-                     it is recorded by the next capture",
-                    done.written + done.removed
-                ))),
-            },
-            Err(e) => Err(other(format!(
-                "failed part way: {e}; the {} path(s) written and {} removed before it are \
-                 recorded",
-                done.written, done.removed
-            ))),
-        }
     }
 }
 

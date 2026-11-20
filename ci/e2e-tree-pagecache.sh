@@ -2,14 +2,15 @@
 # Shared mappings on a real mount (ledger R1.4), on Linux CI only: the page-cache
 # cases, the strict mapping script, then close-to-open on a mount of its own.
 set -euo pipefail
+. "$(dirname "$0")/tree-git-test-lib.sh"
 bin=${AGENTFS_BIN:-$PWD/target/debug/agentfs}
 work=$(mktemp -d)
 pid=
 cleanup() {
   status=$?
   fusermount3 -uz "$work/main" >/dev/null 2>&1 || true
-  fusermount3 -uz "$work/sandbox" >/dev/null 2>&1 || true
-  [ -z "$pid" ] || { kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; }
+  fusermount3 -uz "$work/fork" >/dev/null 2>&1 || true
+  [ -z "$pid" ] || tree_stop "$pid"
   [ "$status" = 0 ] || cat "$work/mount.log" >&2 || true
   rm -rf "$work"
 }
@@ -22,25 +23,24 @@ wait_mounted() {
   done
   mountpoint -q "$1"
 }
-mkdir "$work/main" "$work/sandbox"
-"$bin" --state "$work/state" trees init
-fork=$("$bin" --state "$work/state" trees fork)
-"$bin" --state "$work/state" trees mount "$work/main" --sandbox "$work/sandbox" --fork "$fork" >"$work/mount.log" 2>&1 & pid=$!
+mkdir "$work/main" "$work/fork"
+"$bin" --state "$work/state" init --volume t
+"$bin" --state "$work/state" mount "$work/main" --fork-mount "$work/fork" >"$work/mount.log" 2>&1 & pid=$!
 wait_mounted "$work/main"
-wait_mounted "$work/sandbox"
+wait_mounted "$work/fork"
 result=0
-python3 ci/trees-pagecache.py "$work/main" "$work/state/history.git" "$work/sandbox" || result=$?
+python3 ci/trees-pagecache.py "$work/main" "$work/state/history.git" "$work/fork" || result=$?
 python3 ci/trees-mmap.py "$work/main" "$work/state/history.git" || result=$?
 fusermount3 -u "$work/main"
-fusermount3 -u "$work/sandbox"
-wait "$pid"; pid=
+fusermount3 -u "$work/fork"
+tree_wait_exit "$pid"; pid=
 git --git-dir="$work/state/history.git" fsck --strict
 
-# A sandbox's takes would hold the actor too: this runs against the saves alone.
-"$bin" --state "$work/close-open" trees init
-"$bin" --state "$work/close-open" trees mount "$work/main" >>"$work/mount.log" 2>&1 & pid=$!
+# A fork's takes would hold the actor too: this runs against the saves alone.
+"$bin" --state "$work/close-open" init --volume t
+"$bin" --state "$work/close-open" mount "$work/main" >>"$work/mount.log" 2>&1 & pid=$!
 wait_mounted "$work/main"
 python3 ci/trees-close-open.py "$work/main" || result=$?
 fusermount3 -u "$work/main"
-wait "$pid"; pid=
+tree_wait_exit "$pid"; pid=
 exit "$result"

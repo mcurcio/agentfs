@@ -1,7 +1,7 @@
-# One node at a time (2026-10-15): ReadWriteOnce (several
-# pods on one node) or ReadWriteOncePod. Every multi-node mode
-# (ReadWriteMany, ReadOnlyMany) is refused; pods on other nodes read the
-# volume's history from the remote it pushes to. The size is not enforced.
+# One pod per volume: ReadWriteOncePod lets the scheduler itself keep a
+# second pod off the claim (the driver refuses a second pod's publish
+# either way). Every multi-node mode (ReadWriteMany, ReadOnlyMany) is
+# refused. The size is not enforced.
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -9,7 +9,7 @@ metadata:
   namespace: agentfs-example
 spec:
   storageClassName: agentfs
-  accessModes: [ReadWriteOnce]
+  accessModes: [ReadWriteOncePod]
   resources:
     requests:
       storage: 1Gi

@@ -1,5 +1,6 @@
-# The e2e-csi workloads (ci/e2e-csi.sh): two restricted pods on one RWO
-# claim of the `ci` profile.
+# The e2e-csi workload (ci/e2e-csi.sh): one restricted writer on a RWO
+# claim of the `ci` profile. second.yaml, a second pod on the claim, is
+# applied only by the refusal step.
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
@@ -7,7 +8,7 @@ resources:
   - namespace.yaml
   - storageclass.yaml
   - pvc.yaml
-  - writers.yaml
+  - writer.yaml
 
 images:
   - name: ghcr.io/mcurcio/agentfs

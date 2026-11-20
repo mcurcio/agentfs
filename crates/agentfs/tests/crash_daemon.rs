@@ -10,8 +10,7 @@
 //! queue.
 //!
 //! Built only with the `failpoints` feature: `cargo test -p agentfs
-//! --features failpoints --test crash_daemon`. No FUSE and no root (the
-//! mount points are in `crash_mount.rs`). Skipped, with a message, when
+//! --features failpoints --test crash_daemon`. No FUSE and no root. Skipped, with a message, when
 //! `git` is not installed (the patch queue and fsck need it).
 
 #![cfg(feature = "failpoints")]
@@ -57,7 +56,13 @@ impl Setup {
         fs::create_dir_all(s.tree()).unwrap();
         fs::create_dir_all(s.home()).unwrap();
         Repository::init_bare(s.remote()).unwrap();
-        s.ok(&["init", "--volume", "demo"]);
+        agentfs_core::volume::init_with(
+            &agentfs_core::volume::StateDir::new(s.state()),
+            "demo",
+            None,
+            None,
+        )
+        .unwrap();
         let mut config = git2::Config::open(&s.state().join("git/config")).unwrap();
         config
             .set_str(

@@ -1,11 +1,11 @@
 # Runbook: upgrading the sidecar
 
 Moving a workload's agentfs sidecar ([deployment.md](../deployment.md),
-[`deploy/sidecar`](../../deploy/sidecar)) to another image, and back.
-An upgrade is a pod replacement: the old sidecar stops after the
-workload, makes its final commit and pushes once, then the new pod mounts
-the same volume. Nothing is migrated by hand. The CSI driver is upgraded
-differently ([csi.md](../csi.md)).
+[`deploy/sidecar`](../../deploy/sidecar)) to another image, and back, and
+moving a volume of the recording engine to the tree engine the sidecar
+now runs. An upgrade is a pod replacement: the old sidecar stops after the
+workload and drains the volume, then the new pod mounts it. The CSI driver
+is upgraded differently ([csi.md](../csi.md)).
 
 ```sh
 POD=$(kubectl get pod -l app.kubernetes.io/name=agentfs-example -o name | head -n1)
@@ -19,22 +19,20 @@ POD=$(kubectl get pod -l app.kubernetes.io/name=agentfs-example -o name | head -
    ([deployment.md](../deployment.md#1-the-image)). The commits between
    the running one and the new one (`git log --oneline <old>..<new>` in a
    clone of agentfs) say what changed, and [CHANGELOG.md](../../CHANGELOG.md) lists the
-releases.
+   releases.
 2. **Note where the volume is:**
 
    ```sh
    kubectl exec "$POD" -c agentfs -- agentfs --version
-   kubectl exec "$POD" -c agentfs -- agentfs status
+   kubectl exec "$POD" -c agentfs -- git --git-dir /data/state/history.git log -1 --format=%H root
    ```
 
-   Keep the `head:` line, and check `backlog:` and each `remote:` line.
-   Unpushed commits are kept across the upgrade, but pushing first
-   (`kubectl exec "$POD" -c agentfs -- agentfs push`) means a remote holds
-   the history if the upgrade goes wrong.
-3. **No recording failures open.** A `RecordFailed` or `CommitFailed`
-   alarm, or the alerts `AgentfsRecordFailed` and `AgentfsCommitsFailing`,
-   should be resolved first ([recording-failures.md](recording-failures.md)),
-   so the final commit can empty the journal.
+   Keep the commit. A volume of the recording engine (its pod mounts
+   `/data/backing`, and `/data/state/git` holds its history) is moved once,
+   below, instead of upgraded.
+3. **No recording failures open.** `tree HistoryBuildFailed` in the
+   sidecar's log should be resolved first
+   ([recording-failures.md](recording-failures.md)).
 
 ## Upgrade
 
@@ -45,117 +43,129 @@ old pod before the new one starts, so only one daemon ever holds the
 `ReadWriteOncePod` claim and the state area's lock.
 
 The old sidecar's stop, within `terminationGracePeriodSeconds` (60 s in
-the example; keep it longer than the unmount grace of 10 s, the push
-grace of 5 s and the final commit):
+the example):
 
 1. the workload containers stop first, then the sidecar gets SIGTERM;
-2. it unmounts, commits what is journaled and pushes each remote that
-   lacks commits once, within the push grace ([remotes](../remotes.md));
-3. commits that did not get out are pushed by the new pod.
+2. it drains the volume: files still open are saved, the view is
+   unmounted, and a clean stop leaves history built through its last
+   record;
+3. with a `subPath` consumer the kubelet's bind holds the view, so the
+   sidecar waits after its drain until the kubelet kills it at the grace
+   ([deployment.md](../deployment.md#3-the-pod-piece-by-piece)).
 
-If the old pod is killed before its final commit (the grace ran out, or
-the node died), nothing is lost: the new daemon replays the journal at
-start (`... uncommitted record(s) recovered`).
+If the old pod is killed before its drain (the grace ran out, or the node
+died), nothing is lost: the new daemon recovers the journal at start and
+builds what was left unbuilt.
 
 ## Verify
 
 ```sh
 kubectl rollout status deployment/agentfs-example
 kubectl exec "$POD" -c agentfs -- agentfs --version
-kubectl exec "$POD" -c agentfs -- agentfs status
+kubectl exec "$POD" -c agentfs -- agentfs probe /agentfs/workspace
 kubectl logs "$POD" -c agentfs | head -n 20
 ```
 
 (`POD` again after the rollout: the pod is new.)
 
 - The pod is Ready: the readiness probe sees a live mount.
-- `head:` is the head you noted, or a descendant of it
-  (`git --git-dir /data/state/git merge-base --is-ancestor <old> <new>`
-  in the sidecar); `backlog:` drains.
-- No `remote: <name>: misconfigured` line: a newer version may refuse a
-  setting an older one accepted (`RemoteMisconfigured`,
-  [stuck-pushes.md](stuck-pushes.md#diagnose-by-kind)).
-- The startup log has no `path(s) a previous mount could not record`
-  with paths `still failing` ([recording-failures.md](recording-failures.md#4-paths-a-mount-could-not-record-metarepairs)).
-- A change by the workload appears in `git log` and reaches the remotes
-  (`agentfs status`, or the `AgentfsPushBacklogOld` alert staying quiet).
+- The history's head is the commit you noted, or a descendant of it
+  (`git --git-dir /data/state/history.git merge-base --is-ancestor <old>
+  root` in the sidecar).
+- The log's `not built:` lines are the operator settings you expect
+  ([deployment.md](../deployment.md#4-configuration)).
+- A change by the workload appears in `git log root`.
+
+## Moving a recording volume to the tree engine
+
+A volume the sidecar recorded with the recording engine has `/data/backing`
+(the files) and `/data/state` (the journal and `git/`, its history) on the
+claim. The tree engine's `init` refuses that state area, with nothing
+written, naming this runbook: the pod with the new image stops at
+`agentfs-init` until the volume is moved. Every step is required, in
+order.
+
+1. **With the old image, push the backlog.** Every remote must hold the
+   head, because the old history does not move into the new volume: it
+   stays on its remotes and in the archive.
+
+   ```sh
+   kubectl exec "$POD" -c agentfs -- agentfs push
+   kubectl exec "$POD" -c agentfs -- agentfs status
+   ```
+
+   Each `remote:` line must say it holds the head (`0 unpushed`). A volume
+   with no remote skips this step: step 2's archive is then the only copy
+   of its audit trail.
+2. **Archive the old volume.** Scale the workload to 0. The Job of
+   step 3 starts by moving `/data/state` and `/data/backing` aside on the
+   claim, to `/data/recording-archive/`. Never delete them. The archived
+   git directory stays readable with plain git:
+
+   ```sh
+   git --git-dir /data/recording-archive/state/git log --oneline agentfs/<volume>
+   ```
+
+3. **Deploy the new pod spec once with a migration Job.** With the new
+   image, privileged (FUSE needs `/dev/fuse` and `CAP_SYS_ADMIN`), as
+   root, with the claim at `/data` and the new ConfigMap (settings and
+   rules) at `/etc/agentfs`, run the same steps as the Hermes migration
+   ([deployment.md](../deployment.md#migrating-the-existing-data)): the
+   archive of step 2, `init`, the rule files, then the archived files
+   copied in through the mount:
+
+   ```sh
+   set -eu
+   mkdir /data/recording-archive
+   mv /data/state /data/backing /data/recording-archive/
+   agentfs --state /data/state init --volume <volume> --include /etc/agentfs/config
+   mkdir -p /data/state/history.git/info
+   cp /etc/agentfs/exclude /data/state/history.git/info/exclude
+   cp /etc/agentfs/attributes /data/state/history.git/info/attributes
+   mkdir -p /mnt/volume
+   agentfs --state /data/state mount /mnt/volume -- sh -ec '
+     cd /data/recording-archive/backing
+     find . -name .git -prune -print0 | xargs -0 -r cp -a --parents -t /mnt/volume
+     cp -a . /mnt/volume/'
+   ```
+
+   The block is not resumable: give the Job `backoffLimit: 0`, so a
+   failure stops it instead of a retry stopping at `mkdir`. After a
+   failure with `/data/recording-archive/state` in place, the archive
+   step ran: move a partial `/data/state` aside (`mv /data/state
+   /data/state.failed`), fix the cause from the Job's log, and run the
+   block again from its `agentfs ... init` line.
+
+   The rule files go in before the mount, which reads them when the
+   volume opens; each nested repository's `.git` goes first, so the files
+   beside it stay untracked. Then check the history (`git --git-dir
+   /data/state/history.git log --stat root`) and scale the workload back
+   to 1 with the new pod spec. The new volume's history starts at this
+   import; nothing is pushed until push is built for tree volumes, and
+   the old branch stays on its remotes.
 
 ## Rolling back
 
-A newer version can journal changes an older one cannot read (a
-directory move): the older one then refuses to open the state area, with
-an error naming `agentfs flush`. Nothing is discarded.
+**To the recording engine**, after a move: scale the workload to 0, move
+the tree volume's `/data/state` aside (never delete it: its history holds
+every change made since the move), move `/data/recording-archive/state`
+and `/data/recording-archive/backing` back to `/data`, and deploy the old
+pod spec with the old image. Changes made on the tree volume since the
+move are in its history, not in the recording volume: copy what you need
+back by hand.
 
-- **The newer pod stopped normally:** its final commit emptied the
-  journal. Set the older image and apply.
-- **It did not** (a crash, a kill), or the older pod refuses to start:
-  empty the journal with the newer image first, as below, then set the
-  older image and apply.
-
-Name the newer image, then scale the Deployment to 0 and run
-`agentfs flush` with it against the claim. The flush Pod mounts the
-Deployment's ConfigMap, read from the Deployment because kustomize adds
-a hash of the content to its name (`agentfs-config-<hash>`):
-
-```sh
-NEWER=ghcr.io/mcurcio/agentfs:<newer sha>
-```
-
-<!-- ci: rollback-flush -->
-```sh
-kubectl scale deployment/agentfs-example --replicas=0
-kubectl wait --for=delete "$POD" --timeout=120s
-CONFIG=$(kubectl get deployment agentfs-example \
-  -o jsonpath='{.spec.template.spec.volumes[?(@.name=="config")].configMap.name}')
-kubectl apply -f - <<EOF
-apiVersion: v1
-kind: Pod
-metadata:
-  name: agentfs-flush
-spec:
-  restartPolicy: Never
-  containers:
-    - name: flush
-      image: $NEWER
-      args: [flush]
-      env:
-        - { name: AGENTFS_STATE, value: /data/state }
-        - { name: AGENTFS_ROOT, value: /data/backing }
-      securityContext:
-        runAsUser: 0
-        runAsGroup: 0
-      volumeMounts:
-        - { name: data, mountPath: /data }
-        - { name: config, mountPath: /data/state/git/info/exclude, subPath: exclude, readOnly: true }
-        - { name: config, mountPath: /data/state/git/info/attributes, subPath: attributes, readOnly: true }
-        - { name: config, mountPath: /etc/agentfs, readOnly: true }
-  volumes:
-    - name: data
-      persistentVolumeClaim:
-        claimName: agentfs-data
-    - name: config
-      configMap:
-        name: $CONFIG
-EOF
-kubectl wait --for=jsonpath='{.status.phase}'=Succeeded pod/agentfs-flush --timeout=300s
-kubectl logs agentfs-flush
-kubectl delete pod agentfs-flush
-```
-
-The log says `<n> record(s) into <m> commit(s)`. Then set the older
-image and scale back to 1
-(`kubectl scale deployment/agentfs-example --replicas=1`).
+**Between images of the tree engine**: set the older image and apply.
 
 Commits the newer version made stay in history: a rollback changes the
 binary, never the history.
 
 ## What is tested
 
-The kind job of the `image` workflow checks the stop this relies on: the
-final commit and push when the pod is deleted, and recovery after the
-daemon is killed ([deployment.md](../deployment.md#8-how-it-is-tested)).
-The same job runs the flush block above as written (`ci: rollback-flush`),
-with the image under test as `NEWER`: the Pod starts with the
-Deployment's ConfigMap, the flush succeeds, and the volume mounts again
-after the scale back. A rollout from one released image to another, and
-an older image reading the flushed state area, are not run in CI.
+The kind job of the `image` workflow checks the stop and start an upgrade
+relies on: a replaced pod finds its volume, and its last write before the
+stop is in history ([deployment.md](../deployment.md#8-how-it-is-tested)).
+The Hermes kind job runs the migration Job of
+[deployment.md](../deployment.md#migrating-the-existing-data), the same
+shape as step 3, as written. A move of a real recording volume, the
+rollback to the recording engine, and a rollout from one released image to
+another are not run in CI.

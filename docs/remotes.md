@@ -1,7 +1,13 @@
 # Remotes and pushing
 
-agentfs pushes a volume's history to git remotes, over HTTPS or SSH, or to local
-paths. This page says how remotes are configured, how and when pushes run, what
+The recording engine pushes a volume's history to git remotes, over HTTPS or
+SSH, or to local paths. It serves recording state areas, and no launcher runs
+it any more. Tree volumes, which the sidecar, the Docker examples, the CLI's
+`agentfs init` and `agentfs mount`, and the CSI driver ([csi.md](csi.md)) run,
+push to no remote yet: a
+configured remote is logged at every boot and counted by the
+`agentfs.not_built` gauge, and the history stays in the state area
+([tree views](trees.md#operator-settings)). This page says how remotes are configured, how and when pushes run, what
 happens when one fails, and how several volumes share a repository. Every key is
 in [configuration.md](configuration.md); the operator's view of failures is in
 [runbooks/stuck-pushes.md](runbooks/stuck-pushes.md) and
@@ -88,7 +94,7 @@ known_hosts), so a Secret mounted late or being rotated works once it appears.
   is treated as empty. A per-remote lock keeps two attempts on one remote from
   overlapping.
 
-**At shutdown**, after the final commit, `mount`, `run` and `serve-history` give
+**At shutdown**, after the final commit, `run` and `serve-history` give
 each remote that lacks commits one more attempt, all within `--push-grace`
 (default 5 s), never retrying. At the deadline every attempt is cancelled: one
 that has not finished negotiating sends nothing and is reported as cancelled,
@@ -98,9 +104,7 @@ the deadline is waited for, up to 10 s more, because exiting inside it leaves a
 ref lock ([runbooks/stuck-pushes.md](runbooks/stuck-pushes.md#at-shutdown)).
 Pushes take at most `--push-grace` plus 10 s from the stop signal, not counting
 the final commit. A pod needs a `terminationGracePeriodSeconds` above that sum
-plus the commit; under the CSI driver the node plugin kills the service 30 s
-after it asks it to stop, so the sum must stay under 30 s (the driver sets
-`--push-grace 5s`). `--push-grace 0s` skips the final push. Each remote's
+plus the commit. `--push-grace 0s` skips the final push. Each remote's
 result is printed (`final push: <remote>: ...`).
 
 ## Limits
@@ -212,8 +216,8 @@ the operator continues under a new name. Forged trailers fool the check.
 
 ### The start-branch alarm
 
-A volume started from another worktree's branch (a start class, see
-[csi.md](csi.md)) keeps its start point in its identity
+A recording volume started from another worktree's branch (`fork::start`)
+keeps its start point in its identity
 (`agentfs.start.remote`, `.branch`, `.commit`). At every push attempt to the
 start remote it lists the start branch first. If the branch holds commits this
 volume does not have (the tip unknown here, or not an ancestor of the head or of
@@ -316,7 +320,7 @@ else `x-access-token`.
   is never given to any other host.
 - It gets one attempt per connection: a rejected credential is an authentication
   failure, not a retry loop.
-- `mount` refuses a credential file under the backing tree or the mount point.
+- `front` refuses a credential file under the backing tree or the mount point.
 - HTTPS needs the `https` cargo feature (OpenSSL).
 
 ### Proxies

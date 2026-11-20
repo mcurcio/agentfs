@@ -4,9 +4,15 @@ agentfs records every change a workload makes to a directory, in git history
 the workload cannot see. This page says what that promises, what it does not,
 and which test backs each claim. A claim with no test named says so.
 
+agentfs has two engines. Every launcher runs tree views: the sidecar, the
+Docker examples, the CLI's `agentfs init` and `agentfs mount`, and the CSI
+driver. Their promises are under [tree views](#tree-views) below; they do not
+push or apply patches yet. Most of this page is about the recording engine,
+which serves recording state areas and which no launcher runs any more.
+
 Other pages hold the detail: [recording.md](recording.md) (what is recorded and
 when), [remotes.md](remotes.md) (pushing), [trees.md](trees.md) (the tree
-views), [operator-guide.md](operator-guide.md) (running it).
+views), [operator-guide.md](operator-guide.md) (running the recording engine).
 
 ## What agentfs does
 
@@ -73,9 +79,9 @@ extended attributes are not recorded either.
   attributes or LFS endpoints.
 
 Tests: the engine killed or failed at every point a workload reaches
-(`crates/agentfs-core/tests/crash_points.rs`), the processes
-(`crash_daemon.rs`) and a FUSE mount (`crash_mount.rs`) are all checked by one
-oracle: every promised record committed exactly once, first-parent
+(`crates/agentfs-core/tests/crash_points.rs`) and the processes
+(`crash_daemon.rs`) are checked by one oracle (a recording FUSE front killed
+mid-write is not tested by it): every promised record committed exactly once, first-parent
 `Agentfs-Seq` strictly increasing, no empty commits, `git fsck` clean, nothing
 left in `pending/`.
 
@@ -89,13 +95,14 @@ left in `pending/`.
   its records still journaled, or the new head with everything it names.
 - Crash safety is tested by killing at every step of record, commit, ref
   update and push.
-- Power loss is tested on ext4 and XFS: `dm-log-writes` records every write and
-  flush of a workload, and the log is replayed to every FUA (or flush) point,
-  where the same promises are checked (`ci/power-loss.sh`).
+- Power loss is tested for tree views on ext4 and XFS: `dm-log-writes` records
+  every write and flush of a workload through a mount, and the log is replayed
+  to every flush point, where the same promises are checked
+  ([`ci/power-loss-trees.sh`](../ci/power-loss-trees.sh), the `phase-1`
+  workflow).
 
 **Not tested:** writes reordered between two flushes (replay is in write order
-only), and a power cut through a FUSE mount (the power-loss job drives the
-`record` command, not a mount). The commit order does not rely on the order of
+only), and a power cut under the recording engine. The commit order does not rely on the order of
 writes inside an epoch, but only review says so.
 
 ## Files changed in place
@@ -154,6 +161,9 @@ procedure, run with the workload stopped:
 
 ## Several pods on one volume
 
+This section is the recording engine's. A tree volume under the CSI driver
+serves one pod per claim; a second pod gets a fork claim ([csi.md](csi.md)).
+
 - Pods share one directory with the backing filesystem's semantics. Two pods
   writing the same file is last-writer-wins, as without agentfs. History
   records each pod's change boundaries in the order the history service
@@ -175,8 +185,7 @@ Accepted residuals of several pods on one volume:
   callers cannot read their supplementary groups. Creations that only a
   supplementary group (a pod's `fsGroup`) allows fall back to the daemon, a
   racing open from another pod can fail with `EACCES`, and `create`'s check of an
-  existing file counts the primary group only. The shipped CSI manifest sets
-  `hostPID: true`; the fallbacks are counted
+  existing file counts the primary group only. The fallbacks are counted
   (`agentfs.fuse.create_as_caller_fallbacks`).
 - **Clock steps.** A late record frozen before a backward step of the wall
   clock, and racing writes after it, are ordered by `ctime`, which the step
@@ -201,7 +210,7 @@ recordable names. It is **a boundary for names**, not a security sandbox.
   symlink, hard link or special file, move a directory, change ownership, or
   change a rule. Tests: `a8_refusals`,
   `a5_hidden_names_answer_the_same_whether_or_not_they_exist`,
-  `recorded_files_never_move_out`, `overlay_refusals`,
+  `recorded_files_never_move_out`,
   `the_overlay_is_refused_on_a_front_and_with_tree_rules`.
 - **What it does not cover.**
   - A file a sandbox already holds open stays writable after the main
@@ -212,7 +221,7 @@ recordable names. It is **a boundary for names**, not a security sandbox.
     from recording (`judge_answers`, `a11_directories`).
   - Volume-wide facts leak: free space (`statfs` is passed on; not tested),
     link counts (not tested), and "directory not empty" for a directory whose
-    remaining entries are hidden (`overlay_refusals`).
+    remaining entries are hidden (not tested).
   - Inode numbers of shown entries skip one per hidden entry in a listing,
     so a sandbox can count a directory's hidden entries, never name them (not
     tested). Lookups, removes and renames take no id for an entry hidden for its
@@ -227,24 +236,25 @@ recordable names. It is **a boundary for names**, not a security sandbox.
   - Mode-bit permission checks run outside the names lock, so a `chmod` through
     the main mount between the check and the operation is not seen by that one
     operation (not tested). The name checks run under the lock.
-- **Where it runs.** On single-process mounts (the sidecar, `agentfs mount`),
-  not on a history-service front and not on CSI volumes.
+- **Where it runs.** Only in a program that links `agentfs-fuse` and turns it
+  on ([library/filesystem](library/filesystem.md#the-sandbox-overlay)). No
+  launcher offers it: tree volumes do not build it.
 - **Capability assumptions.** Sandboxes lack `CAP_SYS_ADMIN` and
   `CAP_DAC_READ_SEARCH`. Stopping a privileged container from reaching the disk
   by other means is not supported.
 
 ## Forks
 
-What a sandbox writes into a [fork](forks.md) is treated as potentially
+What a workload writes into a [fork](forks.md) is treated as potentially
 hostile in everything agentfs itself does with it: names, paths, sizes,
 symlinks and gitlinks are checked, and nothing is run. agentfs limits nothing
 that users' own CI may do with what a fork publishes.
 
-Accepted, with no hardening: a sandbox's file calls are served by the
-privileged node plugin, which holds every profile's credentials, so a bug in
-that front would expose node root and those credentials. Volume size is not
-enforced on the node's base path, so a sandbox can fill it for every volume on
-that node.
+Accepted, with no hardening: a CSI fork claim's file calls are served by its
+source volume's host in the privileged node plugin, which holds every
+profile's credentials, so a bug in that host would expose node root and those
+credentials. Volume size is not enforced on the node's base path, so a fork's
+pod can fill it for every volume on that node.
 
 ## Not goals
 
@@ -259,4 +269,11 @@ that node.
 
 ## Tree views
 
-The [tree views](trees.md) have their own limits, which that page lists.
+The [tree views](trees.md) have their own limits, which that page lists. A tree
+view records every call in its journal before the call returns, so a returned call
+survives a crash of agentfs. It survives a power cut once the file's `close(2)` or
+`fsync(2)`, an `O_SYNC` write, or an `fsync(2)` of the view's directory has
+returned ([trees.md](trees.md#recording-and-durability)). Its git history is built
+behind the calls: a save is visible to the views at its release, and in Git's refs
+and commits once the builder reaches it; nothing in Git names an object that is not
+durable ([trees.md](trees.md#history-trails-the-files)).

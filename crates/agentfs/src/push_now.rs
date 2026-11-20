@@ -62,17 +62,15 @@ pub const CONTROL_GRACE: Duration = Duration::from_secs(5);
 
 /// What a daemon does with restores and reverts.
 pub enum Restores {
-    /// A mount writes them through itself.
-    Serve(recovery::Daemon),
     /// The history service writes the backing tree, calling its fronts.
-    ServeFronts(recovery::ServiceDaemon),
+    ServeFronts(Box<recovery::ServiceDaemon>),
     /// Answered `busy` with this message.
     Refuse(&'static str),
 }
 
 /// `agentfs run`'s answer to a restore.
 pub const RUN_SERVES_NO_RESTORES: &str = "`agentfs run` holds the state area and serves no \
-     restores; stop it (or mount the volume instead), then retry";
+     restores; stop it, then retry";
 
 /// The control socket's handler for a daemon of the state area `state`
 /// whose service is `service`. `misconfigured` lists the remotes the
@@ -91,7 +89,6 @@ pub fn handler(
         Op::Judge => crate::patch_cmd::serve_judge(&state, &applier),
         Op::Checkpoint => crate::checkpoint_cmd::serve(&service, &request, peer),
         Op::Restore | Op::Revert => match &restores {
-            Restores::Serve(daemon) => daemon.serve(request, peer),
             Restores::ServeFronts(daemon) => daemon.serve(request, peer),
             Restores::Refuse(message) => Reply::Busy((*message).to_owned()),
         },

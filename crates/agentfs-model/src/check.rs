@@ -2,9 +2,9 @@
 //! repository and the trees after every step. Each returns the first
 //! violation found. The checker's own state (its last view of each tree, how
 //! far it has read the world's records, caches over git objects, which never
-//! change) lives in a [`Checker`], owned with its world by [`Checked`]: the
-//! world does not know it is checked, and the checker reads the world and git
-//! but writes neither.
+//! change) lives in a [`Checker`], owned with its history service by
+//! [`Checked`]: the world does not know it is checked, and the checker reads
+//! the world, the mirror and git but writes none of them.
 
 mod lineage;
 
@@ -16,11 +16,14 @@ use lineage::Lineage;
 
 use crate::calls::{Client, TreeId, TxnId};
 use crate::content::{Content, Line, PATHS, State, is_root, writer_of};
+use crate::entries::{self, Entries, Key, Raw};
 use crate::git::{git, try_git};
+use crate::mirror::Mirror;
 use crate::queue::{Entry, Take, name_key};
 use crate::recording::{Kind, Target};
+use crate::service::{HistoryService, Step};
 use crate::world::{
-    By, Collision, Decision, Direction, Landed, Life, Policies, Step, TreeNames, TxnEnd,
+    By, Collision, Decision, Direction, Landed, Life, Policies, TreeNames, TreeStep, TxnEnd,
     TxnOutcome, World, commit_parents, decisions_in, origin_in,
 };
 
@@ -29,26 +32,28 @@ fn named<T>(check: &'static str, r: Result<T, String>) -> Result<T, String> {
     r.map_err(|e| format!("{check}: {e}"))
 }
 
-/// A world and its checker, one per world, fixed at construction. It derefs
-/// to the [`World`], so a test drives the world through it; the checks run
-/// only through [`Checked::check`], [`Checked::step_checked`] and
+/// A history service and its checker, one per service, fixed at
+/// construction. It derefs to the [`HistoryService`] (and on to its
+/// [`World`]), so a test drives the system through it; the checks run only
+/// through [`Checked::check`], [`Checked::step_checked`] and
 /// [`Checked::converged`].
 pub struct Checked {
-    world: World,
+    service: HistoryService,
     checker: Checker,
 }
 
 impl Checked {
     pub fn new(policies: Policies, names: TreeNames) -> Self {
         Self {
-            world: World::new(policies, names),
+            service: HistoryService::new(policies, names),
             checker: Checker::default(),
         }
     }
 
     /// Every invariant that holds after any step.
     pub fn check(&mut self) -> Result<(), String> {
-        self.checker.check(&self.world)
+        self.checker.check(&self.service)?;
+        named("mirror_current", mirror_current(&self.service))
     }
 
     /// One step, with what only the step itself shows. A take (rule 9) is one
@@ -61,18 +66,27 @@ impl Checked {
     /// sync records no collision (only an upstream's queue decides one) and
     /// carries the head its take read. Returns the queue entries taken. The
     /// checks only read the world, before and after; the step alone changes it.
+    /// After the mirror's push, the mirror lacks nothing of the local root and
+    /// collision refs (read from git, both sides).
     pub fn step_checked(&mut self, s: &Step) -> Result<usize, String> {
-        let before = named("step_checked", before_step(&self.world, s))?;
-        let taken = self.world.step(s);
+        let before = named("step_checked", before_step(&self.service, s))?;
+        let taken = self.service.step(s);
+        if *s == Step::Push
+            && let Some(r) = lagging(&self.service)
+        {
+            return Err(format!(
+                "step_checked: after the push, the mirror lacks {r}"
+            ));
+        }
         match before {
-            Some(b) => named("step_checked", after_step(&self.world, b, taken)),
+            Some(b) => named("step_checked", after_step(&self.service, b, taken)),
             None => Ok(taken),
         }
     }
 
     /// Once writes stop and every queue has drained ([`check_converged`]).
     pub fn converged(&self) -> Result<(), String> {
-        check_converged(&self.world)
+        check_converged(&self.service)
     }
 
     /// What the checks counted, so a run can show it exercised them.
@@ -83,21 +97,21 @@ impl Checked {
     /// Whether version `newer` was written over `older` (or is it), by the
     /// checker's own record, read from git first.
     pub fn descends(&mut self, newer: &str, older: &str) -> bool {
-        self.checker.lineage.read_new(self.world.repo());
+        self.checker.lineage.read_new(self.service.repo());
         self.checker.lineage.descends(newer, older)
     }
 }
 
 impl Deref for Checked {
-    type Target = World;
-    fn deref(&self) -> &World {
-        &self.world
+    type Target = HistoryService;
+    fn deref(&self) -> &HistoryService {
+        &self.service
     }
 }
 
 impl DerefMut for Checked {
-    fn deref_mut(&mut self) -> &mut World {
-        &mut self.world
+    fn deref_mut(&mut self) -> &mut HistoryService {
+        &mut self.service
     }
 }
 
@@ -132,12 +146,16 @@ struct Checker {
     /// Per open transaction, its fork's head and the files it had saved at
     /// the last check.
     txn_files_seen: BTreeMap<TxnId, (String, BTreeSet<String>)>,
+    /// Each transaction's begin, as its ref `txn/<n>` held it when first seen.
+    txn_begins: BTreeMap<TxnId, String>,
     /// What each version was written over, read from git.
     lineage: Lineage,
     /// Every ref and its commit at the last read of history: history is read
     /// again only once a ref moved (or a new discard adds tokens).
     refs_seen: Option<String>,
     met: Met,
+    /// The heads invariant D1 has held for (commits never change).
+    d1_held: BTreeSet<String>,
 }
 
 /// How many of each of the world's records the checks have read.
@@ -145,9 +163,11 @@ struct Checker {
 struct Cursors {
     collisions: usize,
     landings: usize,
+    entry_landings: usize,
     syncs: usize,
     ended: usize,
     placements: usize,
+    staged: usize,
 }
 
 impl Checker {
@@ -166,6 +186,7 @@ impl Checker {
         named("transactions_undisturbed", self.transactions_undisturbed(w))?;
         let discards = self.grepped.0 != w.discarded.len();
         let refs = lineage::refs(w.repo());
+        named("transactions_frozen", self.transactions_frozen(w, &refs))?;
         if self.refs_seen.as_ref() != Some(&refs) || discards {
             let all = w.all_commits();
             named("one_writer", self.one_writer(w, &all))?;
@@ -178,7 +199,132 @@ impl Checker {
         named("rename_overs_whole", self.rename_overs_whole(w))?;
         named("full_lineage", self.full_lineage(w))?;
         named("placed_and_unlinked", self.placed_and_unlinked(w))?;
+        named("no_joined_lines", no_joined_lines(w))?;
+        named("d1_entries", self.d1_entries(w))?;
+        named("entries_whole", self.entries_whole(w))?;
         Ok(())
+    }
+
+    /// Invariant D1, read from git: in every live tree, every entry's parent is
+    /// a directory of that tree, and no path names two entries
+    /// ([`Entries::d1`]).
+    fn d1_entries(&mut self, w: &World) -> Result<(), String> {
+        for t in w.live_trees() {
+            let head = w.head(t);
+            if self.d1_held.contains(&head) {
+                continue;
+            }
+            entries_at(w, &head)
+                .d1()
+                .map_err(|e| format!("{t:?} at {head:.7}: {e}"))?;
+            self.d1_held.insert(head);
+        }
+        Ok(())
+    }
+
+    /// Rule 3e for rules 13 and 14, read from git: a take that won writes the
+    /// records of directories and metadata its change wrote (against its base),
+    /// and no other; one that lost writes none.
+    fn entries_whole(&mut self, w: &World) -> Result<(), String> {
+        for l in &w.landings[self.read.entry_landings..] {
+            let records = |a: &str, b: &str| -> BTreeSet<String> {
+                git(w.repo(), &["diff-tree", "-r", "--name-only", a, b])
+                    .lines()
+                    .filter(|n| entries::is_record(n))
+                    .map(str::to_string)
+                    .collect()
+            };
+            let (wrote, took) = (records(&l.base, &l.change), records(&l.before, &l.result));
+            if wrote.is_empty() && took.is_empty() {
+                continue;
+            }
+            let read = |at: &str| entries::read_raw(w.repo(), at);
+            let (change, before, result) = (read(&l.change), read(&l.before), read(&l.result));
+            let mut want: Raw = before;
+            if l.won {
+                for n in &wrote {
+                    match change.get(n) {
+                        Some(t) => want.insert(n.clone(), t.clone()),
+                        None => want.remove(n),
+                    };
+                }
+            }
+            if result != want {
+                return Err(format!(
+                    "{:.7} into {:?} (won: {}) left the records {result:?}, not {want:?}",
+                    l.change, l.tree, l.won
+                ));
+            }
+        }
+        self.read.entry_landings = w.landings.len();
+        Ok(())
+    }
+}
+
+/// What commit `at` holds beside its files' lines (rules 13 to 15), read from git.
+fn entries_at(w: &World, at: &str) -> Entries {
+    Entries::read(
+        &entries::read_raw(w.repo(), at),
+        PATHS.iter().map(|f| (*f, w.file(at, f))),
+    )
+}
+
+/// Rules 13 and 14, read from git: collision `c`, a loss by one of them, has its
+/// cause there. Its losing change's value differs from the upstream's, which the
+/// change's writer never saw (rule 13); or the upstream had an entry there that
+/// the change's first parent lacked (rule 14, `directory-not-empty`); or the
+/// upstream lacks the directory the change put an entry into, which its first
+/// parent had (rule 14, `directory-gone`). The result keeps the upstream's.
+fn entry_lost(w: &World, c: &Collision) -> Result<(), String> {
+    let (Some(base), [lost], [won]) = (
+        commit_parents(w.repo(), &c.loser).first().cloned(),
+        &c.lost[..],
+        &c.won[..],
+    ) else {
+        return Err(format!("{c:?}: not one lost and one won entry"));
+    };
+    let (b, t, o, r) = (
+        entries_at(w, &base),
+        entries_at(w, &c.loser),
+        entries_at(w, &c.winner),
+        entries_at(w, &c.result),
+    );
+    let real = match c.by {
+        By::Metadata => {
+            let k = match c.path.strip_suffix('/') {
+                Some(d) => Key::Dir(d.to_string()),
+                None => Key::File(c.path.clone()),
+            };
+            let text = |e: &Entries| entries::value_text(e.value(&k));
+            text(&t) == *lost
+                && text(&o) == *won
+                && text(&b) != *won
+                && lost != won
+                && text(&r) == *won
+        }
+        By::DirectoryNotEmpty => {
+            let seen: BTreeSet<entries::Entry> = b.all().into_iter().collect();
+            o.at(won)
+                .into_iter()
+                .any(|x| !seen.contains(&x) && r.at(won).contains(&x))
+        }
+        By::DirectoryGone => {
+            let d = c.path.strip_suffix('/').unwrap_or(&c.path);
+            !o.is_dir(d)
+                && !r.is_dir(d)
+                && b.is_dir(d)
+                && entries::parent(lost) == d
+                && !t.at(lost).is_empty()
+        }
+        By::Line | By::File | By::Whole => false,
+    };
+    if real {
+        Ok(())
+    } else {
+        Err(format!(
+            "{c:?}: git shows no {} collision there",
+            c.by.word()
+        ))
     }
 }
 
@@ -445,7 +591,7 @@ fn locks(w: &World) -> Result<(), String> {
             }
         }
         // P1: an entry no waiting one shares a file or a source with goes.
-        if p1_first(w, *t).is_some() && !w.pending().contains(&Step::Next(*t)) {
+        if p1_first(w, *t).is_some() && !w.tree_steps().contains(&TreeStep::Next(*t)) {
             return Err(format!("{t:?}: an entry free to go is not offered"));
         }
     }
@@ -507,9 +653,12 @@ fn lock_keys(w: &World, a: &str, b: &str) -> BTreeSet<String> {
     files.into_iter().chain(names).collect()
 }
 
+/// The files (by identity) that differ from `a` to `b`: records of directories and
+/// metadata are not files, and lock nothing.
 fn diff_files(w: &World, a: &str, b: &str) -> BTreeSet<String> {
     git(w.repo(), &["diff-tree", "-r", "--name-only", a, b])
         .lines()
+        .filter(|n| !entries::is_record(n))
         .map(str::to_string)
         .collect()
 }
@@ -519,17 +668,17 @@ fn diff_files(w: &World, a: &str, b: &str) -> BTreeSet<String> {
 /// fork's untouched files equal the root and touched files equal the root or the
 /// fork's newer non-colliding edit": once the queues drain, a fork has no
 /// newer edit left.
-fn check_converged(w: &World) -> Result<(), String> {
-    named("check_converged", drained(w))?;
-    named("losers_pushed", losers_pushed(w))?;
-    named("check_converged", trees_equal_root(w))
+fn check_converged(s: &HistoryService) -> Result<(), String> {
+    named("check_converged", drained(s))?;
+    named("losers_pushed", losers_pushed(s, s.mirror()))?;
+    named("check_converged", trees_equal_root(s))
 }
 
-fn drained(w: &World) -> Result<(), String> {
+fn drained(w: &HistoryService) -> Result<(), String> {
     if let Some(s) = w
         .pending()
         .iter()
-        .find(|s| matches!(s, Step::Next(_) | Step::Replicate))
+        .find(|s| matches!(s, Step::Next(_) | Step::Push))
     {
         return Err(format!("not drained: {s:?} still pending"));
     }
@@ -543,7 +692,14 @@ fn drained(w: &World) -> Result<(), String> {
 }
 
 fn trees_equal_root(w: &World) -> Result<(), String> {
+    let root = entries::read_raw(w.repo(), &w.head(TreeId::ROOT));
     for t in w.live_trees() {
+        let mine = entries::read_raw(w.repo(), &w.head(t));
+        if mine != root {
+            return Err(format!(
+                "{t:?}'s directories and metadata never converged: {mine:?} vs the root's {root:?}"
+            ));
+        }
         for p in PATHS {
             let (mine, root) = (w.file(&w.head(t), p), w.file(&w.head(TreeId::ROOT), p));
             if mine != root {
@@ -653,17 +809,21 @@ impl Checker {
 
     /// The change collision `c` names really collided in that take: a
     /// same-line or file-rule record of it ([`By::Line`], [`By::File`]) has a
-    /// lost version and a winner that are concurrent.
+    /// lost version and a winner that are concurrent, or a record of it by rule
+    /// 13 or 14 is there, which [`Self::upstream_wins`] holds to git
+    /// ([`entry_lost`]).
     fn really_collided(&self, w: &World, c: &Collision) -> bool {
         w.collisions.iter().any(|d| {
             d.tree == c.tree
                 && d.result == c.result
                 && d.loser == c.loser
                 && d.by != By::Whole
-                && d.lost
-                    .iter()
-                    .zip(&d.won)
-                    .any(|(x, y)| self.concurrent(x, y))
+                // excuse: R13 a loss by rule 13 or 14 is real when git shows its cause
+                && (d.by.of_entry()
+                    || d.lost
+                        .iter()
+                        .zip(&d.won)
+                        .any(|(x, y)| self.concurrent(x, y)))
         })
     }
 
@@ -690,6 +850,8 @@ impl Checker {
                             && match c.by {
                                 By::Whole => self.really_collided(w, c),
                                 By::Line | By::File => self.concurrent(x, won),
+                                // A loss by rule 13 or 14 names an entry, never a line.
+                                By::Metadata | By::DirectoryNotEmpty | By::DirectoryGone => false,
                             }
                     })
         })
@@ -859,6 +1021,11 @@ impl Checker {
                     w.trailer(&c.loser, "Agentfs-Tree"),
                 ));
             }
+            if c.by.of_entry() {
+                entry_lost(w, c)?;
+                Self::recorded(w, c)?;
+                continue;
+            }
             let (r, win, lose) = (
                 w.file(&c.result, &c.path),
                 w.file(&c.winner, &c.path),
@@ -884,6 +1051,9 @@ impl Checker {
                 By::File => pairs.any(|(x, y)| self.concurrent(x, y)),
                 // excuse: R3e a line lost with its change needs a real collision of that change
                 By::Whole => self.really_collided(w, c),
+                By::Metadata | By::DirectoryNotEmpty | By::DirectoryGone => {
+                    unreachable!("a loss by rule 13 or 14 is read by entry_lost")
+                }
             };
             if !real {
                 return Err(format!(
@@ -893,6 +1063,17 @@ impl Checker {
             if let Some(t) = c.lost.iter().find(|t| !lose.holds(t)) {
                 return Err(format!("{c:?}: lost {t} is not in the incoming commit"));
             }
+            Self::recorded(w, c)?;
+        }
+        self.read.collisions = w.collisions.len();
+        Ok(())
+    }
+
+    /// Collision `c` is kept and recorded: its ref names the losing change, its
+    /// result commit records it, and that commit's parents are the tree's head
+    /// before and the losing change.
+    fn recorded(w: &World, c: &Collision) -> Result<(), String> {
+        {
             // A missing ref is this check failing, not the harness: read it without panicking.
             let at = try_git(
                 w.repo(),
@@ -919,7 +1100,6 @@ impl Checker {
                 return Err(format!("{c:?}: result's parents are {parents:?}"));
             }
         }
-        self.read.collisions = w.collisions.len();
         Ok(())
     }
 
@@ -988,19 +1168,19 @@ impl Checker {
     }
 }
 
-/// Every losing change is replicated to the shared remote, eventually, and
+/// Every losing change is pushed to the mirror, eventually, and
 /// stays there attributable (owner, 2026-11-03: "yes, \"losing\" patches
 /// should still be part of the history. i want to know who changed what
-/// when"). Run once Replication has drained ([`check_converged`]). Read from
-/// the remote alone: the commits of the root's history there hold exactly the
+/// when"). Run once the mirror's push has drained ([`check_converged`]). Read
+/// from the mirror alone: the commits of the root's history there hold exactly the
 /// run's collision records, each in its result commit, which places the
 /// decision in the root's order; each record's ref
 /// names its losing commit; and each lost version is in its file there and was
 /// written by a commit naming that version's writer (who, what). The commit's date is kept as its
 /// audit "when" but never read to decide anything (rule 2), and not
 /// checked here.
-fn losers_pushed(w: &World) -> Result<(), String> {
-    let remote = w.remote();
+fn losers_pushed(w: &World, m: &Mirror) -> Result<(), String> {
+    let remote = m.repo();
     let root = w.names().branch(TreeId::ROOT);
     let exists = try_git(remote, &["rev-parse", "--verify", "-q", &root], None);
     let records = if exists.code == 0 {
@@ -1032,6 +1212,10 @@ fn losers_pushed(w: &World) -> Result<(), String> {
                 c.reference,
                 at.stdout.trim()
             ));
+        }
+        if c.by != By::Line.word() && c.by != By::File.word() && c.by != By::Whole.word() {
+            remote_entry_lost(remote, c)?;
+            continue;
         }
         let file = Content::parse(&git(
             remote,
@@ -1070,10 +1254,134 @@ fn losers_pushed(w: &World) -> Result<(), String> {
     Ok(())
 }
 
+/// [`losers_pushed`] for a loss by rule 13 or 14, read from the mirror alone: the
+/// losing change there holds what the record says it lost (the metadata value, or
+/// the entry a `directory-gone` put), and names one writer.
+fn remote_entry_lost(remote: &Path, c: &Decision) -> Result<(), String> {
+    let r = &c.reference;
+    let files = PATHS.iter().map(|f| {
+        let text = git(remote, &["cat-file", "-p", &format!("{r}:{f}")]);
+        (
+            *f,
+            Content::parse(&text).expect("a model file on the remote"),
+        )
+    });
+    let e = Entries::read(&entries::read_raw(remote, r), files);
+    let lost = c.lost.first().map(String::as_str).unwrap_or_default();
+    let holds = match c.by.as_str() {
+        "metadata" => {
+            let k = match c.path.strip_suffix('/') {
+                Some(d) => Key::Dir(d.to_string()),
+                None => Key::File(c.path.clone()),
+            };
+            entries::value_text(e.value(&k)) == lost
+        }
+        "directory-gone" => !e.at(lost).is_empty(),
+        _ => true,
+    };
+    let by = git(
+        remote,
+        &[
+            "log",
+            "-1",
+            "--format=%(trailers:key=Agentfs-Writer,valueonly)",
+            r,
+        ],
+    );
+    if !holds || by.lines().filter(|l| !l.is_empty()).count() != 1 {
+        return Err(format!(
+            "{c:?}: on the remote, its losing change does not hold {lost} or names writers {by:?}"
+        ));
+    }
+    Ok(())
+}
+
+/// No tree and no open transaction shows a joined line (R10.4, R10.5, R10.6,
+/// R10.8, R10.9, R10.11): in each file at each head, read from git, only the last
+/// live line may lack its `\n`. A save's bytes split into lines can end
+/// unfinished only at the end, so a line with no `\n` before another is two
+/// writers' lines read as one, bytes nobody wrote.
+fn no_joined_lines(w: &World) -> Result<(), String> {
+    let txns = w.forks.values().filter_map(|f| {
+        f.txn
+            .as_ref()
+            .map(|x| (format!("txn {}", x.id), x.index.clone()))
+    });
+    let trees = w
+        .live_trees()
+        .into_iter()
+        .map(|t| (format!("{t:?}"), w.head(t)));
+    for (on, head) in trees.chain(txns) {
+        for p in PATHS {
+            let file = w.file(&head, p);
+            let mut live = file.live().peekable();
+            while let Some(l) = live.next() {
+                if l.text().is_some_and(|t| !t.ends_with('\n'))
+                    && let Some(next) = live.peek()
+                {
+                    return Err(format!(
+                        "{on} shows {p}'s unfinished line {} joined to {}: {:?}",
+                        l.id,
+                        next.id,
+                        file.bytes()
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The root's branch and every collision ref, each with its commit, as
+/// `for-each-ref` reads them in `repo`.
+fn pushed_refs(repo: &Path, root: &str) -> BTreeMap<String, String> {
+    git(
+        repo,
+        &[
+            "for-each-ref",
+            "--format=%(refname) %(objectname)",
+            root,
+            "refs/collisions",
+        ],
+    )
+    .lines()
+    .filter_map(|l| l.split_once(' '))
+    .map(|(r, c)| (r.to_string(), c.to_string()))
+    .collect()
+}
+
+/// The first of the local root's tip and collision refs the mirror lacks (or
+/// holds at another commit), read from git on both sides.
+fn lagging(s: &HistoryService) -> Option<String> {
+    let root = s.names().branch(TreeId::ROOT);
+    let local = pushed_refs(s.repo(), &root);
+    let mirrored = pushed_refs(s.mirror().repo(), &root);
+    local
+        .into_iter()
+        .find(|(r, c)| mirrored.get(r) != Some(c))
+        .map(|(r, c)| format!("{r} at {c}"))
+}
+
+/// Push timing (git-model.md §4): whenever the mirror lacks the local root's
+/// tip or a collision ref, a fork's included before it ever lands, the
+/// service lists [`Step::Push`]. Truth from git, both sides: it judges the
+/// service's claim, it does not ask the mirror whether it is due. A listed
+/// push makes any lag allowed, so git is read only when none is listed.
+fn mirror_current(s: &HistoryService) -> Result<(), String> {
+    if s.push_due() {
+        return Ok(());
+    }
+    match lagging(s) {
+        Some(r) => Err(format!("the mirror lacks {r}, and no push is pending")),
+        None => Ok(()),
+    }
+}
+
 /// The collision's result is a `Landing` (or the transaction's) commit made
 /// on `c.tree`, and its losing commit was made in a fork strictly below
-/// `c.tree` (a nested fork's commit can reach it by fast-forward), or on
-/// the branch of a transaction of fork `c.tree`.
+/// `c.tree` (a nested fork's commit can reach it by fast-forward), or is the
+/// one commit of a transaction of fork `c.tree` (named for the fork, its
+/// cause naming the transaction).
 fn decided_at_the_upstreams_queue(w: &World, c: &Collision) -> bool {
     let cause = w.trailer(&c.result, "Agentfs-Cause");
     if w.trailer(&c.result, "Agentfs-Tree") != w.names().name(c.tree) {
@@ -1090,8 +1398,9 @@ fn decided_at_the_upstreams_queue(w: &World, c: &Collision) -> bool {
         }
         Direction::Transaction => {
             cause.starts_with("Transaction ")
-                && from
-                    .strip_prefix("txn/")
+                && from == w.names().name(c.tree)
+                && w.trailer(&c.loser, "Agentfs-Cause")
+                    .strip_prefix("Transaction t")
                     .and_then(|n| n.parse::<TxnId>().ok())
                     .is_some_and(|n| w.ended.iter().any(|e| e.txn == n && e.fork == c.tree))
         }
@@ -1346,51 +1655,97 @@ impl Checker {
         Ok(())
     }
 
-    /// Rule 5, as the program was told, whole (rule 3e): a committed
-    /// transaction's every staged edit is in the fork's commit that carries it
-    /// (or overwritten by a later edit of its own), and no collision names
-    /// that commit; a transaction that lost has none of its staged versions in
-    /// that commit, a collision in the fork that really collided, and its
-    /// every staged edit named in the answer (by its last staged version of
-    /// that line), with a collision in the fork naming it and the version
-    /// named as kept in the commit; the answer names every line the commit's collisions lost. A
-    /// rolled-back one's every staged token is discarded
-    /// (`discarded_leave_no_trace` holds that); an empty one staged nothing.
+    /// Rule 5, as the program was told, whole (rule 3e), judged on the
+    /// transaction's one commit T read from git: the fork's commit that
+    /// carries it is T (a fast-forward) or a merge whose second parent is T,
+    /// made only if the fork had moved since begin (R6.2).
+    /// T has one parent, the commit the transaction began on, names
+    /// `Transaction t<n>` and the fork, and every version it sets is one the
+    /// transaction staged (T mints nothing). A committed transaction's every
+    /// version of T is in the fork's commit (or a version written over it),
+    /// entered the fork, and no collision names that commit; one that lost
+    /// has none of T's versions in that commit, a collision in the fork that
+    /// really collided, and every version of T named in the answer, with a
+    /// collision in the fork naming it and the version named as kept in the
+    /// commit; the answer names every line the commit's collisions lost. An
+    /// empty one made no commit: it staged nothing, or its index holds
+    /// begin's bytes and names in every file it staged. A rolled-back one's
+    /// every staged token is discarded (`discarded_leave_no_trace` holds
+    /// that). T's bytes against the program's own are the harness's leg
+    /// (`oracle_txn_commit` in the interleavings).
     fn transactions_end_as_told(&mut self, w: &World) -> Result<(), String> {
         for e in &w.ended[self.read.ended..] {
             let fork = e.fork;
-            // Whether the transaction created `s`'s file (a new file) and its
-            // last staged version of the file's name line ended it: then the
-            // file changed nothing anyone sees (an atomic save's new file), so
-            // none of its staged versions is in the commit (`World::edits`).
-            // excuse: R11.2 a file a transaction created and ended changed nothing anyone sees
-            let created_and_ended = |s: &crate::content::Edit| {
-                let names = || {
-                    e.staged
-                        .iter()
-                        .filter(|x| x.path == s.path && x.line == s.path)
+            let mine = |token: &str| e.staged.iter().any(|s| s.token == token);
+            let one = |r: &str| -> Result<(String, Vec<crate::content::Edit>), String> {
+                let parents = commit_parents(w.repo(), r);
+                let t = match parents.len() {
+                    1 => r.to_string(),
+                    _ => parents[1].clone(),
                 };
-                crate::content::UNBORN.contains(&s.path.as_str())
-                    && names().any(|x| !x.gone)
-                    && names().next_back().is_some_and(|x| x.gone)
+                let base = commit_parents(w.repo(), &t);
+                let named = w.trailer(&t, "Agentfs-Cause") == format!("Transaction t{}", e.txn)
+                    && w.trailer(&t, "Agentfs-Tree") == w.names().name(fork);
+                // R6.2: a merge only when the fork had moved since begin.
+                let merged_at_begin = parents.len() > 1 && base.first() == Some(&parents[0]);
+                if !named
+                    || merged_at_begin
+                    || base.len() != 1
+                    || self.txn_begins.get(&e.txn).is_some_and(|b| *b != base[0])
+                {
+                    return Err(format!(
+                        "t{}'s commit {t:.7} is not one commit on its begin (parents {base:?})",
+                        e.txn
+                    ));
+                }
+                // T names each open it staged a save of, in order (rule 5).
+                let staged_opens: Vec<String> = w
+                    .staged
+                    .iter()
+                    .filter(|s| s.txn == e.txn)
+                    .filter_map(|s| s.open.map(|h| h.to_string()))
+                    .collect();
+                let named_opens = w.trailer(&t, crate::world::OPEN);
+                let named_opens: Vec<&str> = named_opens
+                    .lines()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                if named_opens != staged_opens {
+                    return Err(format!(
+                        "t{}'s commit {t:.7} names opens {named_opens:?}, but it staged saves of {staged_opens:?}",
+                        e.txn
+                    ));
+                }
+                let edits = w.edits(&base[0], &t);
+                if let Some(x) = edits.iter().find(|x| !mine(&x.token)) {
+                    return Err(format!(
+                        "t{}'s commit {t:.7} sets {} it never staged",
+                        e.txn, x.token
+                    ));
+                }
+                Ok((t, edits))
             };
             let ok = match (&e.how, &e.result) {
                 (TxnEnd::Commit(TxnOutcome::Committed), Some(r)) => {
+                    let (_, edits) = one(r)?;
                     let none_lost = !w.collisions.iter().any(|c| c.result == *r);
-                    let staged = e.staged.iter().filter(|s| !created_and_ended(s)).all(|s| {
-                        w.file(r, &s.path)
-                            .member(&s.line)
-                            .is_some_and(|v| self.lineage.descends(&v.id, &s.token))
-                            && w.entered.iter().any(|(t, x)| {
-                                *t == fork
-                                    && x.path == s.path
-                                    && x.line == s.line
-                                    && self.lineage.descends(&x.token, &s.token)
-                            })
-                    });
-                    none_lost && staged
+                    let applied = !edits.is_empty()
+                        && edits.iter().all(|s| {
+                            w.file(r, &s.path)
+                                .member(&s.line)
+                                .is_some_and(|v| self.lineage.descends(&v.id, &s.token))
+                                && w.entered.iter().any(|(t, x)| {
+                                    *t == fork
+                                        && x.path == s.path
+                                        && x.line == s.line
+                                        && self.lineage.descends(&x.token, &s.token)
+                                })
+                        });
+                    none_lost && applied
                 }
                 (TxnEnd::Commit(TxnOutcome::Lost { lines }), Some(r)) => {
+                    let (_, edits) = one(r)?;
                     let mine: Vec<&Collision> =
                         w.collisions.iter().filter(|c| c.result == *r).collect();
                     let real = mine
@@ -1401,17 +1756,22 @@ impl Checker {
                             && holds(w, r, &o.kept)
                     });
                     let all_told = mine.iter().map(|c| c.lost.len()).sum::<usize>() == lines.len();
-                    let none_applied = e.staged.iter().all(|s| !w.file(r, &s.path).holds(&s.token));
-                    let named = e.staged.iter().filter(|s| !created_and_ended(s)).all(|s| {
-                        lines.iter().any(|o| {
-                            o.path == s.path
-                                && o.line == s.line
-                                && self.lineage.descends(&o.staged, &s.token)
-                        })
+                    let none_applied = edits.iter().all(|s| !w.file(r, &s.path).holds(&s.token));
+                    let named = edits.iter().all(|s| {
+                        lines
+                            .iter()
+                            .any(|o| o.path == s.path && o.line == s.line && o.staged == s.token)
                     });
                     real && told && all_told && none_applied && named
                 }
-                (TxnEnd::Commit(TxnOutcome::Empty), None) => e.staged.is_empty(),
+                (TxnEnd::Commit(TxnOutcome::Empty), None) => {
+                    e.staged.is_empty()
+                        || diff_files(w, &e.start, &e.index).iter().all(|p| {
+                            let (b, x) = (w.file(&e.start, p), w.file(&e.index, p));
+                            b.name.state == x.name.state
+                                && (!b.name.live() || b.bytes() == x.bytes())
+                        })
+                }
                 (TxnEnd::Rollback, None) => e.staged.iter().all(|s| w.discarded.contains(&s.token)),
                 _ => false,
             };
@@ -1423,6 +1783,48 @@ impl Checker {
             }
         }
         self.read.ended = w.ended.len();
+        Ok(())
+    }
+
+    /// Rule 5's "no commit before the commit", read from git: while a
+    /// transaction is open its ref `txn/<n>` holds the commit it held when
+    /// first seen (begin never moves; not always an ancestor of its fork's
+    /// head: a sync may fast-forward past the fork's own sync merge, R6.1), and
+    /// every save it staged meets the rules every save meets, read from the
+    /// index before and after it: rule 10's alignment ([`save_aligned`]) and
+    /// rule 8's `O_APPEND` ([`appends_exact`]). (`one_writer` holds that no
+    /// commit names `txn/<n>` but its one commit.)
+    fn transactions_frozen(&mut self, w: &World, refs: &str) -> Result<(), String> {
+        for f in w.forks.values() {
+            let Some(txn) = &f.txn else { continue };
+            let name = format!("refs/heads/{}", TreeNames::txn_name(txn.id));
+            let at = refs
+                .lines()
+                .find_map(|l| {
+                    l.split_once(' ')
+                        .filter(|(_, r)| *r == name)
+                        .map(|(o, _)| o.to_string())
+                })
+                .ok_or_else(|| format!("t{} is open, but {name} is gone", txn.id))?;
+            let begin = self.txn_begins.entry(txn.id).or_insert_with(|| at.clone());
+            if *begin != at {
+                return Err(format!(
+                    "{name} moved to {at:.7} from {begin:.7} while t{} is open: a commit before its commit",
+                    txn.id
+                ));
+            }
+        }
+        for s in &w.staged[self.read.staged..] {
+            for p in diff_files(w, &s.before, &s.after) {
+                let (base, now) = (w.file(&s.before, &p), w.file(&s.after, &p));
+                save_aligned(&base, &now).map_err(|e| format!("t{} staged {p}: {e}", s.txn))?;
+                if let Some(calls) = &s.calls {
+                    appends_exact(&base, &now, calls)
+                        .map_err(|e| format!("t{} staged {p}: {e}", s.txn))?;
+                }
+            }
+        }
+        self.read.staged = w.staged.len();
         Ok(())
     }
 
@@ -1451,7 +1853,7 @@ impl Checker {
                     c = git(w.repo(), &["rev-parse", &format!("{c}^1")]);
                 }
             }
-            seen.insert(txn.id, (head, diff_files(w, &txn.start, &txn.head)));
+            seen.insert(txn.id, (head, diff_files(w, &txn.start, &txn.index)));
         }
         self.txn_files_seen = seen;
         Ok(())
@@ -1479,7 +1881,7 @@ impl Checker {
         "--no-walk=unsorted".into(),
         "--diff-merges=first-parent".into(),
         "-p".into(),
-        "--format=%x01%H%x1f%P%x1f%(trailers:key=Agentfs-Writer,valueonly,separator=%x1e)%x1f%(trailers:key=Agentfs-Cause,valueonly)%x1f%(trailers:key=Agentfs-Open,valueonly,separator=%x1e)%x02".into(),
+        "--format=%x01%H%x1f%P%x1f%(trailers:key=Agentfs-Writer,valueonly,separator=%x1e)%x1f%(trailers:key=Agentfs-Cause,valueonly)%x1f%(trailers:key=Agentfs-Open,valueonly,separator=%x1e)%x1f%(trailers:key=Agentfs-Tree,valueonly)%x02".into(),
     ];
         args.extend(new.iter().cloned());
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -1487,17 +1889,42 @@ impl Checker {
         for block in log.split('\x01').skip(1) {
             let (header, diff) = block.split_once('\x02').unwrap_or((block, ""));
             let fields: Vec<&str> = header.split('\x1f').collect();
-            let [commit, parents, writers, cause, opens] = fields[..] else {
+            let [commit, parents, writers, cause, opens, on] = fields[..] else {
                 return Err(format!("unparsable log header {header:?}"));
             };
-            // git-model.md §3: a save from an open names that open, once; no
+            let parents: Vec<&str> = parents.split_whitespace().collect();
+            // Rule 5: a transaction's one commit T, named by its cause, has one
+            // parent (its begin) and is made once it ended; no commit names a
+            // transaction's branch.
+            let txn = cause
+                .trim()
+                .strip_prefix("Transaction t")
+                .filter(|_| parents.len() == 1);
+            if let Some(n) = txn {
+                let open = w
+                    .forks
+                    .values()
+                    .any(|f| f.txn.as_ref().is_some_and(|x| x.id.to_string() == n));
+                if open {
+                    return Err(format!("{commit} is t{n}'s commit, but t{n} is still open"));
+                }
+            }
+            if on.trim().starts_with("txn/") {
+                return Err(format!(
+                    "{commit} names the branch {}: no commit is made there",
+                    on.trim()
+                ));
+            }
+            // git-model.md §3: a save from an open names that open, once; a
+            // transaction's commit names each open it staged a save of; no
             // open is saved twice (a crash's replay of the journal included).
             let opens: Vec<&str> = opens
                 .split('\x1e')
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .collect();
-            if w.save_calls().contains_key(commit) != (opens.len() == 1) || opens.len() > 1 {
+            let save = w.save_calls().contains_key(commit);
+            if txn.is_none() && (save != (opens.len() == 1) || opens.len() > 1) {
                 return Err(format!("{commit} names opens {opens:?}"));
             }
             for o in opens {
@@ -1505,7 +1932,6 @@ impl Checker {
                     return Err(format!("open {o} saved twice: {c:.7} and {commit:.7}"));
                 }
             }
-            let parents: Vec<&str> = parents.split_whitespace().collect();
             let writers: Vec<&str> = writers.split('\x1e').filter(|s| !s.is_empty()).collect();
             if writers.len() != 1 {
                 return Err(format!("{commit} names writers {writers:?}"));
@@ -1532,7 +1958,8 @@ impl Checker {
                         .or_insert((by.clone(), v));
                 }
             }
-            if cause.trim() == "Direct" && parents.len() == 1 {
+            // A save, and a transaction's one commit as one save on its begin.
+            if (cause.trim() == "Direct" || txn.is_some()) && parents.len() == 1 {
                 let paths: BTreeSet<&String> = added.iter().map(|(p, _)| p).collect();
                 for path in paths {
                     let (base, now) = (w.file(parents[0], path), w.file(commit, path));
@@ -1875,29 +2302,28 @@ impl Checker {
         let mut met = (0, 0);
         for l in &w.landings[self.read.placements..] {
             let (u, base) = (&l.change, &l.base);
-            // R10.4, read from git: a landing leaves no line after the upstream's
-            // unfinished last line.
-            if l.direction == Direction::Landing {
-                for p in PATHS {
-                    let b = w.file(&l.before, p);
-                    let Some(q) = b
-                        .live()
-                        .last()
-                        .filter(|x| x.text().is_some_and(|t| !t.ends_with('\n')))
-                    else {
-                        continue;
-                    };
-                    if let Some(x) = w
-                        .file(&l.result, p)
-                        .live()
-                        .skip_while(|x| x.id != q.id)
-                        .nth(1)
-                    {
-                        return Err(format!(
-                            "{u:.7}'s line {} in {p} comes after the upstream's unfinished last line {}",
-                            x.id, q.id
-                        ));
-                    }
+            // R10.4 and R10.5, read from git: a take (a landing, or a
+            // transaction's commit into its fork) leaves no line after the
+            // upstream's unfinished last line.
+            for p in PATHS {
+                let b = w.file(&l.before, p);
+                let Some(q) = b
+                    .live()
+                    .last()
+                    .filter(|x| x.text().is_some_and(|t| !t.ends_with('\n')))
+                else {
+                    continue;
+                };
+                if let Some(x) = w
+                    .file(&l.result, p)
+                    .live()
+                    .skip_while(|x| x.id != q.id)
+                    .nth(1)
+                {
+                    return Err(format!(
+                        "{u:.7}'s line {} in {p} comes after the upstream's unfinished last line {}",
+                        x.id, q.id
+                    ));
                 }
             }
             for p in PATHS {

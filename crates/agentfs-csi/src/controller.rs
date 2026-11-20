@@ -1,57 +1,39 @@
-//! The CSI Controller service, served by every node plugin
-//! pod, with csi-provisioner beside it (`--node-deployment`, F8 R8): each
-//! node provisions and deletes the worktrees on its own disk.
+//! The CSI Controller service (docs/csi.md), served by every node plugin
+//! pod, with csi-provisioner beside it (`--node-deployment`): each node
+//! provisions and deletes the volumes on its own disk.
 //!
-//! - CreateVolume makes `<base>/<pv-name>/{backing,state,csi.json}` on
-//!   this node, which the request's accessibility requirements must
-//!   include (`RESOURCE_EXHAUSTED` otherwise), and answers with this
-//!   node's topology. A start class (`startFrom`) starts the worktree from
-//!   another worktree's branch, fetched once from the start remote
-//!   ([`agentfs_core::fork::start::start_from`]). A fork class (`fork:
-//!   "true"`) with a `dataSource` claim makes a fork of a
-//!   source on this node, from its local history, without its lock or any
-//!   credentials.
-//! - DeleteVolume asks the one release decider
-//!   ([`agentfs_core::release::decide`], F8 rule 3) over facts gathered
-//!   here: the worktree's declared remotes, what each pushed remote
-//!   advertises for the branch in a listing made for this call
-//!   ([`agentfs_core::push::RemotePusher::branch_claim`]) and for the refs
-//!   of forks received into its history
-//!   ([`agentfs_core::push::RemotePusher::received_lacking`]), the journal's
-//!   backlog ([`agentfs_core::volume::inspect`], read under the state
-//!   lock), the class's `onDelete`, a fork's status, and whether it is an
-//!   unlinked fork (local-only, it is deleted unpushed). `Delete` removes
-//!   the directory; `Keep` releases the volume and keeps the worktree,
-//!   renaming `csi.json` to `csi.retained.json`; `Wait` is `UNAVAILABLE`,
-//!   naming the remote (or the journal) and why, and wakes the node
-//!   plugin's release scan, which commits and pushes the worktree
-//!   (DeleteVolume never commits or pushes). A fork's deletion is
-//!   its request to be finished (`finish_requested` in `csi.json`), which
-//!   the release scan carries out. It refuses a worktree staged on this
-//!   node, or whose state area is locked. `Delete` renames the directory
-//!   to `.deleting.<handle>` under the state lock and removes it after
-//!   releasing the lock.
+//! - CreateVolume makes `<base>/<pv-name>/state` a tree volume on this node
+//!   with `agentfs init` (Volume's ensure), which the request's
+//!   accessibility requirements must include (`RESOURCE_EXHAUSTED`
+//!   otherwise), installs the profile's rule files, writes `csi.json`, and
+//!   answers with this node's topology. Clones go only into fork classes.
+//! - CreateVolume of a fork class makes a fork claim: a keyed fork, under
+//!   the claim's handle, of its `dataSource` claim's tree, made by Trees on
+//!   the source volume's host on this node. It writes only `csi.json`
+//!   (`ClaimKind::Fork`). A fork of a fork claim and `landing: approval`
+//!   are refused by Trees (`INVALID_ARGUMENT`).
+//! - DeleteVolume refuses a volume in use on this node (any claim's view
+//!   on its host, a fork claim's included), drains the volume through its
+//!   host (Volume releases it) and keeps the directory, renaming
+//!   `csi.json` to `csi.retained.json`: deleting a volume is not built. A
+//!   fork claim's DeleteVolume ends its fork by key and removes its
+//!   directory. A recording-format volume is never served or deleted:
+//!   `FAILED_PRECONDITION`, naming the directory and the moving runbook.
 //! - ControllerPublish and ControllerUnpublish are `UNIMPLEMENTED`: there
 //!   is no attach step (`attachRequired: false`); the PV's node affinity
-//!   keeps a worktree's pods on its node.
+//!   keeps a volume's pods on its node.
 //!
-//! Calls are serialised. DeleteVolume's listing is the only network call.
+//! Calls are serialised.
 
 use std::fs;
-use std::io;
 use std::sync::Arc;
 
+use agentfs_contracts::host::TreeRef;
+use agentfs_contracts::name::ForkKey;
+use agentfs_contracts::ports::Found;
+use agentfs_core::tree_actor;
 use tokio::sync::Mutex;
 use tonic::{Request, Response, Status};
-
-use agentfs_core::config::Settings;
-use agentfs_core::events::NullSink;
-use agentfs_core::fork::finish::ForkState;
-use agentfs_core::journal;
-use agentfs_core::push::RemotePusher;
-use agentfs_core::release::{self, Declared, Kind, Release, Seen, Waiting, Worktree};
-use agentfs_core::telemetry::Telemetry;
-use agentfs_core::volume::{self as core_volume, StateDir};
 
 use crate::csi::v1::controller_server::Controller;
 use crate::csi::v1::controller_service_capability::{self, rpc};
@@ -67,43 +49,43 @@ use crate::csi::v1::{
 use crate::error::Error;
 use crate::identity::TOPOLOGY_KEY;
 use crate::layout::{Layout, validate_handle};
-use crate::params::{ForkClass, OnDelete, VolumeParams};
-use crate::records::VolumeRecord;
-use crate::release_scan::ReleaseScan;
+use crate::params::{ForkClass, ParamError, VolumeParams, is_fork_class};
+use crate::records::{self, ClaimKind, ClaimRecord, RECORD_VERSION};
+use crate::supervisor::Supervisor;
 use crate::volume;
 
 #[derive(Clone)]
 pub struct ControllerService {
     layout: Arc<Layout>,
     node_id: Arc<str>,
-    release: Arc<ReleaseScan>,
+    supervisor: Arc<Supervisor>,
     serial: Arc<Mutex<()>>,
 }
 
 impl ControllerService {
-    pub fn new(layout: Layout, node_id: String, release: Arc<ReleaseScan>) -> Self {
+    pub fn new(layout: Layout, node_id: String, supervisor: Arc<Supervisor>) -> Self {
         Self {
             layout: Arc::new(layout),
             node_id: node_id.into(),
-            release,
+            supervisor,
             serial: Arc::new(Mutex::new(())),
         }
     }
+}
 
-    /// Runs `f` on the blocking pool, one call at a time.
-    async fn run<T: Send + 'static>(
-        &self,
-        f: impl FnOnce(&Layout, &str, &ReleaseScan) -> Result<T, Error> + Send + 'static,
-    ) -> Result<T, Status> {
-        let _serial = self.serial.lock().await;
-        let layout = self.layout.clone();
-        let node_id = self.node_id.clone();
-        let release = self.release.clone();
-        tokio::task::spawn_blocking(move || f(&layout, &node_id, &release))
-            .await
-            .map_err(|e| Status::internal(format!("controller task failed: {e}")))?
-            .map_err(Status::from)
-    }
+/// What a state area holds; a failure to read it is `INTERNAL`.
+pub(crate) fn inspect(layout: &Layout, handle: &str) -> Result<Found, Error> {
+    let state = layout.state(handle);
+    tree_actor::inspect(&state).map_err(|e| Error::io(format!("reading {}", state.display()), e))
+}
+
+/// What a recording-format volume is told: it is never served or deleted.
+pub(crate) fn recording_format(layout: &Layout, handle: &str) -> Error {
+    Error::FailedPrecondition(format!(
+        "volume {handle} is a recording-format volume ({}): this driver never serves or deletes \
+         it; archive it and remove the directory by hand (docs/runbooks/moving.md)",
+        layout.volume_dir(handle).display()
+    ))
 }
 
 fn capability(t: rpc::Type) -> ControllerServiceCapability {
@@ -151,7 +133,7 @@ pub fn topology(node_id: &str) -> Topology {
 }
 
 /// `RESOURCE_EXHAUSTED` when the request's requisite topologies name
-/// other nodes only: a worktree is made on this node's disk or not at
+/// other nodes only: a volume is made on this node's disk or not at
 /// all. A segment without this driver's key does not constrain.
 fn check_accessible(req: &CreateVolumeRequest, node_id: &str) -> Result<(), Error> {
     let Some(wanted) = &req.accessibility_requirements else {
@@ -172,335 +154,273 @@ fn check_accessible(req: &CreateVolumeRequest, node_id: &str) -> Result<(), Erro
         .collect();
     Err(Error::ResourceExhausted(format!(
         "the volume must be on node {}, and this is node {node_id}: each node provisions its own \
-         worktrees",
+         volumes",
         nodes.join(" or ")
     )))
 }
 
-pub(crate) fn create_volume(
-    layout: &Layout,
-    node_id: &str,
-    req: &CreateVolumeRequest,
-) -> Result<CreateVolumeResponse, Error> {
-    required(&req.name, "the volume name")?;
-    let handle = req.name.as_str();
-    validate_handle(handle).map_err(|e| Error::InvalidArgument(e.to_string()))?;
-    volume::check_capabilities(&req.volume_capabilities)?;
-    let invalid = |e: crate::params::ParamError| Error::InvalidArgument(e.to_string());
-    let class = ForkClass::from_create(handle, &req.parameters).map_err(invalid)?;
-    let source = match req.volume_content_source.as_ref().map(|s| &s.r#type) {
-        None => None,
-        Some(Some(volume_content_source::Type::Volume(v))) => Some(v.volume_id.clone()),
-        Some(Some(volume_content_source::Type::Snapshot(_))) => {
-            return Err(Error::InvalidArgument("snapshots are not supported".into()));
-        }
-        Some(None) => {
-            return Err(Error::InvalidArgument(
-                "the volume content source names no volume".into(),
-            ));
-        }
-    };
-    let capacity_bytes = capacity(req)?;
-    let (params, fork) = match (class, source) {
-        (Some(class), Some(source)) => (None, Some((class, source))),
-        (Some(_), None) => {
-            return Err(Error::InvalidArgument(
-                "a fork class needs a dataSource claim".into(),
-            ));
-        }
-        (None, Some(_)) => {
-            return Err(Error::InvalidArgument(
-                "cloning needs a fork class (fork: \"true\")".into(),
-            ));
-        }
-        (None, None) => (
-            Some(VolumeParams::from_create(handle, &req.parameters).map_err(invalid)?),
-            None,
-        ),
-    };
-    check_accessible(req, node_id)?;
-    let response = |record: &VolumeRecord, content_source| CreateVolumeResponse {
-        volume: Some(Volume {
-            capacity_bytes: record.capacity_bytes,
-            volume_id: handle.to_owned(),
-            volume_context: record.params.to_context(),
-            content_source,
-            accessible_topology: vec![topology(node_id)],
-        }),
-    };
-    if let Some((class, source)) = fork {
-        validate_handle(&source).map_err(|e| Error::NotFound(e.to_string()))?;
-        let record = match volume::load(layout, handle)? {
-            Some(existing) => existing,
-            None => volume::create_fork(layout, node_id, handle, &class, &source, capacity_bytes)?,
-        };
-        return Ok(response(&record, req.volume_content_source.clone()));
-    }
-    let params = params.expect("an ordinary volume has its parameters");
-    let record = match volume::load(layout, handle)? {
-        Some(existing) => {
-            if existing.capacity_bytes != capacity_bytes {
-                return Err(Error::AlreadyExists(format!(
-                    "volume {handle} exists with capacity {} bytes, not {capacity_bytes}",
-                    existing.capacity_bytes
-                )));
-            }
-            if existing.params != params {
-                return Err(Error::AlreadyExists(format!(
-                    "volume {handle} exists with other parameters ({:?})",
-                    existing.params
-                )));
-            }
-            existing
-        }
-        None => {
-            let record = volume::create(layout, handle, &params, capacity_bytes)?;
-            let started = params
-                .start_from
-                .as_deref()
-                .map(|s| format!(", started from {s}"))
-                .unwrap_or_default();
-            eprintln!(
-                "created volume {handle} on node {node_id} (agentfs volume {}, branch {}, profile \
-                 {}, onDelete {}{started})",
-                params.volume,
-                params.branch_name(),
-                params.profile,
-                params.on_delete
-            );
-            record
-        }
-    };
-    Ok(response(&record, None))
+/// What a fork class without a `dataSource` is told.
+pub const FORK_NEEDS_SOURCE: &str = "a fork class needs a dataSource claim";
+
+/// The fork claim's key: its handle.
+fn fork_key(handle: &str) -> Result<ForkKey, Error> {
+    ForkKey::parse(handle).map_err(|e| Error::InvalidArgument(e.to_string()))
 }
 
-pub(crate) fn delete_volume(
-    layout: &Layout,
-    release: &ReleaseScan,
-    req: &DeleteVolumeRequest,
-) -> Result<(), Error> {
-    required(&req.volume_id, "the volume id")?;
-    let handle = req.volume_id.as_str();
-    if validate_handle(handle).is_err() {
-        // Not one of ours, so already gone.
-        return Ok(());
-    }
-    // What an earlier delete of this name could not remove.
-    if let Err(e) = remove_tree(&layout.deleting_dir(handle)) {
-        eprintln!("{e}");
-    }
-    let Some(record) = volume::load(layout, handle)? else {
-        return Ok(());
-    };
-    if layout.staged_record(handle).exists() {
-        return Err(Error::FailedPrecondition(format!(
-            "volume {handle} is staged on this node: its pods still use it"
-        )));
-    }
-    let state = StateDir::new(layout.state(handle));
-    // A fork's deletion asks for it to be finished: checked
-    // before the lock, which the finisher holds while it publishes, and
-    // again under it. A fork not yet published or abandoned is answered
-    // here, without the lock: the decider asks it nothing else.
-    if let Some(fork) = fork_gate(layout, handle, &state, &record)?
-        && !fork.may_delete()
-    {
-        let unpublished = release::decide(&Worktree {
-            has_history: true,
-            uncommitted: 0,
-            on_delete: record.params.on_delete,
-            remotes: Declared::Pushed(&[]),
-            kind: Kind::LinkedFork(fork),
-        });
-        if let Release::Wait(waiting) = unpublished {
-            return Err(wait(handle, release, &waiting));
-        }
-    }
-    let lock = if state.root().exists() {
-        Some(volume::lock(&state, "agentfs-csi delete")?)
-    } else {
-        None
-    };
-    let fork = fork_gate(layout, handle, &state, &record)?;
-    let decision = decide(handle, &state, record.params.on_delete, fork)?;
-    match decision {
-        Release::Delete => {
-            let dir = layout.volume_dir(handle);
-            // Under the lock, the volume goes aside in one rename (it no
-            // longer exists for any call); the files go after the lock is
-            // dropped, so the held lock file is never unlinked under it.
-            let aside = layout.deleting_dir(handle);
-            remove_tree(&aside)?;
-            match fs::rename(&dir, &aside) {
-                Err(e) if e.kind() != io::ErrorKind::NotFound => {
-                    return Err(Error::io(format!("moving {} aside", dir.display()), e));
-                }
-                _ => {}
-            }
-            drop(lock);
-            if let Err(e) = remove_tree(&aside) {
-                // The volume is gone; the next DeleteVolume of this name,
-                // or the operator, removes what is left.
-                eprintln!("deleted volume {handle}, but its files remain: {e}");
-            } else {
-                eprintln!(
-                    "deleted volume {handle} ({}): nothing a remote lacks was on it, or it \
-                     was an unlinked fork with no remote of its own",
-                    dir.display()
-                );
-            }
-            Ok(())
-        }
-        Release::Keep(kept) => {
-            let to = layout.retained_json(handle);
-            fs::rename(layout.csi_json(handle), &to)
-                .map_err(|e| Error::io(format!("writing {}", to.display()), e))?;
-            drop(lock);
-            eprintln!(
-                "deleted volume {handle}; its worktree stays in {} ({kept})",
-                layout.volume_dir(handle).display()
-            );
-            Ok(())
-        }
-        Release::Wait(waiting) => {
-            drop(lock);
-            Err(wait(handle, release, &waiting))
-        }
-    }
-}
-
-/// DeleteVolume's answer to [`Release::Wait`]: `UNAVAILABLE`, naming why,
-/// after waking the release scan, which commits and pushes (or finishes)
-/// the worktree meanwhile. A remote that lacks the head (or a received
-/// fork's ref) contradicts the
-/// scan's memory of a push that held it (the remote lost the branch since,
-/// or was added after): the scan forgets it and pushes again.
-fn wait(handle: &str, release: &ReleaseScan, waiting: &Waiting) -> Error {
-    if let Waiting::Lacking { .. } | Waiting::ReceivedLacking { .. } = waiting {
-        release.forget(handle);
-    }
-    release.wake();
-    Error::Unavailable(format!(
-        "volume {handle}: {waiting}; nothing deleted, DeleteVolume is retried"
+/// What a claim with a recording-format volume of its name is told.
+fn recording_format_exists(layout: &Layout, handle: &str) -> Error {
+    Error::AlreadyExists(format!(
+        "volume {handle}: a recording-format volume is here ({}); move it with \
+         docs/runbooks/moving.md",
+        layout.volume_dir(handle).display()
     ))
 }
 
-/// The release decision for the worktree in `state`, from facts gathered
-/// here ([`release::decide`]). Settings that cannot be read are
-/// `FAILED_PRECONDITION`: what the remotes hold cannot be asked, so
-/// nothing is deleted or released.
-fn decide(
-    handle: &str,
-    state: &StateDir,
-    on_delete: OnDelete,
-    fork: Option<ForkState>,
-) -> Result<Release, Error> {
-    let unreadable = |e: &dyn std::error::Error| {
-        Error::FailedPrecondition(format!(
-            "volume {handle}: reading {}: {}; nothing deleted",
-            state.root().display(),
-            volume::chain(e)
-        ))
-    };
-    if !state.git().join("config").exists() {
-        let (records, _) = journal::read_records(&state.journal()).map_err(|e| unreadable(&e))?;
-        return Ok(release::decide(&Worktree {
-            has_history: false,
-            uncommitted: records.len(),
-            on_delete,
-            // Never weighed: with no history only the journal counts.
-            remotes: Declared::LocalOnly,
-            // No config: no settings name it a fork, and fork_gate finds
-            // no status.
-            kind: fork.map_or(Kind::Ordinary, Kind::LinkedFork),
-        }));
+impl ControllerService {
+    async fn create_volume(
+        &self,
+        req: &CreateVolumeRequest,
+    ) -> Result<CreateVolumeResponse, Error> {
+        let layout = self.layout.as_ref();
+        let node_id = &*self.node_id;
+        required(&req.name, "the volume name")?;
+        let handle = req.name.as_str();
+        validate_handle(handle).map_err(|e| Error::InvalidArgument(e.to_string()))?;
+        volume::check_capabilities(&req.volume_capabilities)?;
+        let fork_class = is_fork_class(&req.parameters);
+        let source = match req.volume_content_source.as_ref().map(|s| &s.r#type) {
+            None => None,
+            Some(Some(volume_content_source::Type::Snapshot(_))) => {
+                return Err(Error::InvalidArgument("snapshots are not supported".into()));
+            }
+            Some(Some(volume_content_source::Type::Volume(_))) if !fork_class => {
+                return Err(Error::InvalidArgument(
+                    "cloning needs a fork class (fork: \"true\")".into(),
+                ));
+            }
+            Some(Some(volume_content_source::Type::Volume(v))) => Some(v.volume_id.as_str()),
+            Some(None) => {
+                return Err(Error::InvalidArgument(
+                    "the volume content source names no volume".into(),
+                ));
+            }
+        };
+        if fork_class {
+            let source = source.ok_or_else(|| Error::InvalidArgument(FORK_NEEDS_SOURCE.into()))?;
+            return self.create_fork(req, source).await;
+        }
+        let invalid = |e: ParamError| Error::InvalidArgument(e.to_string());
+        let params = VolumeParams::from_create(handle, &req.parameters).map_err(invalid)?;
+        let capacity_bytes = capacity(req)?;
+        volume::profile_config(layout, &params.profile)?;
+        check_accessible(req, node_id)?;
+        let claim = ClaimKind::Volume {
+            name: params.name.clone(),
+            profile: params.profile.clone(),
+        };
+        let response = |capacity_bytes| CreateVolumeResponse {
+            volume: Some(Volume {
+                capacity_bytes,
+                volume_id: handle.to_owned(),
+                volume_context: params.to_context(),
+                content_source: None,
+                accessible_topology: vec![topology(node_id)],
+            }),
+        };
+        // The state first: a recording driver's csi.json is no claim record.
+        if inspect(layout, handle)? == Found::Other {
+            return Err(recording_format_exists(layout, handle));
+        }
+        if existing(layout, handle, capacity_bytes, &claim)? {
+            return Ok(response(capacity_bytes));
+        }
+        self.supervisor.ensure(handle, &params).await?;
+        records::store_claim(
+            layout,
+            handle,
+            &ClaimRecord {
+                v: RECORD_VERSION,
+                capacity_bytes,
+                claim,
+            },
+        )?;
+        eprintln!(
+            "created volume {handle} on node {node_id} (agentfs volume {}, profile {})",
+            params.name, params.profile
+        );
+        Ok(response(capacity_bytes))
     }
-    // Under the state lock: the journal's backlog is what a stopped (or
-    // killed) history service left uncommitted, and nothing appends to it.
-    let (history, inspection) = core_volume::inspect(state).map_err(|e| unreadable(&e))?;
-    let head = inspection.head;
-    let settings: Settings = history.settings().clone();
-    let mut seen = Vec::new();
-    // A fork's remotes are not asked: publishing is its gate.
-    if let (Some(head), None) = (head, fork) {
-        for remote in settings.remotes.pushed() {
-            let pusher = RemotePusher::open(
-                state,
-                &settings,
-                remote,
-                Arc::new(NullSink),
-                &Telemetry::noop(),
-            )
-            .map_err(|e| unreadable(&e))?;
-            let (branch, received_lacking) = match pusher.branch_claim(head) {
-                Ok(claim) => match pusher.received_lacking() {
-                    Ok(lacking) => (Ok(claim), lacking),
-                    Err(why) => (Err(why), None),
-                },
-                Err(why) => (Err(why), None),
-            };
-            seen.push(Seen {
-                remote: remote.name.clone(),
-                branch,
-                received_lacking,
-            });
+
+    /// CreateVolume of a fork class with the source claim `source`: a keyed
+    /// fork of the source's tree under the claim's handle, made on the
+    /// source volume's host.
+    async fn create_fork(
+        &self,
+        req: &CreateVolumeRequest,
+        source: &str,
+    ) -> Result<CreateVolumeResponse, Error> {
+        let layout = self.layout.as_ref();
+        let node_id = &*self.node_id;
+        let handle = req.name.as_str();
+        let invalid = |e: ParamError| Error::InvalidArgument(e.to_string());
+        let class = ForkClass::from_create(&req.parameters).map_err(invalid)?;
+        let capacity_bytes = capacity(req)?;
+        check_accessible(req, node_id)?;
+        validate_handle(source).map_err(|e| Error::InvalidArgument(e.to_string()))?;
+        if inspect(layout, source)? == Found::Other {
+            return Err(recording_format(layout, source));
+        }
+        let Some(source_record) = records::load_claim(layout, source)? else {
+            return Err(Error::FailedPrecondition(format!(
+                "source volume {source} is not on node {node_id}: a fork claim is made on its \
+                 source's node (give its pod affinity to the source's pods)"
+            )));
+        };
+        // The source's tree: a volume's root, or a fork claim's fork (which
+        // Trees refuses: forks of forks are not built).
+        let (volume, upstream) = match source_record.claim {
+            ClaimKind::Volume { .. } => (source.to_owned(), TreeRef::Root),
+            ClaimKind::Fork { source: dir } => (dir, TreeRef::Fork(fork_key(source)?)),
+        };
+        let key = fork_key(handle)?;
+        let claim = ClaimKind::Fork {
+            source: volume.clone(),
+        };
+        let response = || CreateVolumeResponse {
+            volume: Some(Volume {
+                capacity_bytes,
+                volume_id: handle.to_owned(),
+                volume_context: [("source".to_owned(), volume.clone())].into(),
+                content_source: req.volume_content_source.clone(),
+                accessible_topology: vec![topology(node_id)],
+            }),
+        };
+        if inspect(layout, handle)? == Found::Other {
+            return Err(recording_format_exists(layout, handle));
+        }
+        if existing(layout, handle, capacity_bytes, &claim)? {
+            return Ok(response());
+        }
+        let tree = self
+            .supervisor
+            .create_fork(&volume, upstream, key, class.settings)
+            .await?;
+        records::store_claim(
+            layout,
+            handle,
+            &ClaimRecord {
+                v: RECORD_VERSION,
+                capacity_bytes,
+                claim,
+            },
+        )?;
+        eprintln!("created fork {tree} of volume {volume} for claim {handle}");
+        Ok(response())
+    }
+
+    async fn delete_volume(&self, req: &DeleteVolumeRequest) -> Result<(), Error> {
+        let layout = self.layout.as_ref();
+        required(&req.volume_id, "the volume id")?;
+        let handle = req.volume_id.as_str();
+        if validate_handle(handle).is_err() {
+            // Not one of ours, so already gone.
+            return Ok(());
+        }
+        // The state first: a recording driver's csi.json is no claim record.
+        let found = inspect(layout, handle)?;
+        if found == Found::Other {
+            return Err(recording_format(layout, handle));
+        }
+        let Some(record) = records::load_claim(layout, handle)? else {
+            return Ok(());
+        };
+        match record.claim {
+            ClaimKind::Fork { source } => {
+                if let Some(published) = self.supervisor.claim_in_use(&source, handle).await {
+                    return Err(in_use(handle, &published));
+                }
+                // A source whose state is gone has taken its forks with it.
+                match inspect(layout, &source)? {
+                    Found::Volume(_) => {
+                        self.supervisor.end_fork(&source, fork_key(handle)?).await?
+                    }
+                    Found::Nothing => {}
+                    Found::Other => return Err(recording_format(layout, &source)),
+                }
+                let dir = layout.volume_dir(handle);
+                match fs::remove_dir_all(&dir) {
+                    Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                        return Err(Error::io(format!("removing {}", dir.display()), e));
+                    }
+                    _ => {}
+                }
+                eprintln!("ended fork of claim {handle} in volume {source}");
+                Ok(())
+            }
+            ClaimKind::Volume { .. } => {
+                if let Some(published) = self.supervisor.in_use(handle).await {
+                    return Err(in_use(handle, &published));
+                }
+                let dir = layout.volume_dir(handle);
+                if found == Found::Nothing {
+                    keep(layout, handle)?;
+                    eprintln!("volume {handle} had no state area");
+                    return Ok(());
+                }
+                self.supervisor.release(handle).await?;
+                keep(layout, handle)?;
+                eprintln!(
+                    "kept volume {handle} at {}: a deleted claim's tree volume is kept (deleting \
+                     it is not built); its history is {}/state/history.git",
+                    dir.display(),
+                    dir.display()
+                );
+                Ok(())
+            }
         }
     }
-    Ok(release::decide(&Worktree {
-        has_history: head.is_some(),
-        uncommitted: inspection.backlog,
-        on_delete,
-        remotes: Declared::of(&settings, &seen),
-        kind: Kind::of(fork, &settings),
-    }))
 }
 
-/// For a fork: records that its deletion asks for it to be finished, and
-/// its state; a status that cannot be read is `FAILED_PRECONDITION`.
-/// `None` for any other worktree.
-fn fork_gate(
+/// What DeleteVolume of a claim in use is told.
+fn in_use(handle: &str, published: &records::PublishedRecord) -> Error {
+    Error::FailedPrecondition(format!(
+        "volume {handle} is in use on this node (published at {}); nothing deleted",
+        published.target.display()
+    ))
+}
+
+/// Whether the claim exists already as asked (CreateVolume is
+/// idempotent); `ALREADY_EXISTS` when it exists otherwise.
+fn existing(
     layout: &Layout,
     handle: &str,
-    state: &StateDir,
-    record: &VolumeRecord,
-) -> Result<Option<ForkState>, Error> {
-    if !state.git().join("config").exists() {
-        return Ok(None);
-    }
-    let status = match fork_status(state) {
-        Err(why) => return Err(Error::FailedPrecondition(format!("{why}; nothing deleted"))),
-        Ok(None) => return Ok(None),
-        Ok(Some(status)) => status,
+    capacity_bytes: i64,
+    claim: &ClaimKind,
+) -> Result<bool, Error> {
+    let Some(existing) = records::load_claim(layout, handle)? else {
+        return Ok(false);
     };
-    let stored = volume::load(layout, handle)?;
-    if !stored.as_ref().unwrap_or(record).finish_requested {
-        let mut requested = record.clone();
-        requested.finish_requested = true;
-        volume::store(layout, handle, &requested)?;
-        eprintln!("fork {handle}: finishing requested by DeleteVolume");
+    if existing.capacity_bytes != capacity_bytes {
+        return Err(Error::AlreadyExists(format!(
+            "volume {handle} exists with capacity {} bytes, not {capacity_bytes}",
+            existing.capacity_bytes
+        )));
     }
-    Ok(Some(status.state))
+    if existing.claim != *claim {
+        return Err(Error::AlreadyExists(format!(
+            "volume {handle} exists with other parameters ({:?})",
+            existing.claim
+        )));
+    }
+    Ok(true)
 }
 
-/// The fork status of the state area, or why it cannot be read.
-fn fork_status(state: &StateDir) -> Result<Option<agentfs_core::fork::finish::ForkStatus>, String> {
-    agentfs_core::fork::finish::status(state).map_err(|e| {
-        format!(
-            "reading the fork status of {}: {}",
-            state.root().display(),
-            volume::chain(&e)
-        )
-    })
-}
-
-/// Removes a directory tree, if it exists.
-fn remove_tree(dir: &std::path::Path) -> Result<(), Error> {
-    match fs::remove_dir_all(dir) {
-        Err(e) if e.kind() != io::ErrorKind::NotFound => {
-            Err(Error::io(format!("removing {}", dir.display()), e))
-        }
-        _ => Ok(()),
-    }
+/// Renames `csi.json` to `csi.retained.json`: the claim is gone, the
+/// volume stays.
+fn keep(layout: &Layout, handle: &str) -> Result<(), Error> {
+    let to = layout.retained_json(handle);
+    fs::rename(layout.csi_json(handle), &to)
+        .map_err(|e| Error::io(format!("writing {}", to.display()), e))
 }
 
 pub(crate) fn validate(
@@ -516,7 +436,7 @@ pub(crate) fn validate(
     let handle = req.volume_id.as_str();
     let not_found = || Error::NotFound(format!("volume {handle} does not exist"));
     validate_handle(handle).map_err(|_| not_found())?;
-    if volume::load(layout, handle)?.is_none() {
+    if records::load_claim(layout, handle)?.is_none() {
         return Err(not_found());
     }
     Ok(match volume::check_capabilities(&req.volume_capabilities) {
@@ -543,9 +463,8 @@ impl Controller for ControllerService {
         request: Request<CreateVolumeRequest>,
     ) -> Result<Response<CreateVolumeResponse>, Status> {
         let req = request.into_inner();
-        self.run(move |l, node, _| create_volume(l, node, &req))
-            .await
-            .map(Response::new)
+        let _serial = self.serial.lock().await;
+        Ok(Response::new(self.create_volume(&req).await?))
     }
 
     async fn delete_volume(
@@ -553,8 +472,8 @@ impl Controller for ControllerService {
         request: Request<DeleteVolumeRequest>,
     ) -> Result<Response<DeleteVolumeResponse>, Status> {
         let req = request.into_inner();
-        self.run(move |l, _, release| delete_volume(l, release, &req))
-            .await?;
+        let _serial = self.serial.lock().await;
+        self.delete_volume(&req).await?;
         Ok(Response::new(DeleteVolumeResponse {}))
     }
 
@@ -563,7 +482,7 @@ impl Controller for ControllerService {
         _request: Request<ControllerPublishVolumeRequest>,
     ) -> Result<Response<ControllerPublishVolumeResponse>, Status> {
         Err(Status::unimplemented(
-            "agentfs-csi has no attach step (attachRequired: false): a worktree's pods run on its \
+            "agentfs-csi has no attach step (attachRequired: false): a volume's pods run on its \
              node",
         ))
     }
@@ -582,9 +501,8 @@ impl Controller for ControllerService {
         request: Request<ValidateVolumeCapabilitiesRequest>,
     ) -> Result<Response<ValidateVolumeCapabilitiesResponse>, Status> {
         let req = request.into_inner();
-        self.run(move |l, _, _| validate(l, &req))
-            .await
-            .map(Response::new)
+        let _serial = self.serial.lock().await;
+        Ok(Response::new(validate(&self.layout, &req)?))
     }
 
     async fn controller_get_capabilities(

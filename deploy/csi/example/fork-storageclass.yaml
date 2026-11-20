@@ -1,9 +1,11 @@
-# A fork class (docs/csi.md): a claim on it whose
-# dataSource is a claim of the `agentfs` class is a fork of that volume,
-# with its profile, made on the source's node (give the fork's pod
-# affinity to its source's pods). A pod-scoped ephemeral claim finishes the fork when the
-# pod goes; the driver deletes the volume once the fork is published to its
-# fork remote.
+# A fork class (docs/csi.md): a claim on it whose dataSource is a claim of
+# the `agentfs` class is a fork claim, a fork of that volume in the same
+# volume, owned by its source's host under the claim's handle. Its changes
+# land in the source automatically. It is made on the source's node: give
+# the fork claim's pod affinity to its source's pod. Deleting the fork
+# claim ends its fork. A fork class takes only `fork` and `landing`
+# (`automatic`, the default); `link: unlinked` and `landing: approval` are
+# refused as not built.
 apiVersion: storage.k8s.io/v1
 kind: StorageClass
 metadata:
@@ -11,9 +13,6 @@ metadata:
 provisioner: agentfs.mcurcio.github.io
 parameters:
   fork: "true"
-  # Keep {pvName}: each fork must be unique on the remote.
-  volumeName: "{pvcNamespace}.{pvcName}.{pvName}"
-  onDelete: delete
 # Only Delete (the admission policy in deploy/csi refuses anything else).
 reclaimPolicy: Delete
 volumeBindingMode: WaitForFirstConsumer

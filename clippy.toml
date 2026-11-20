@@ -30,4 +30,25 @@ disallowed-methods = [
     { path = "rustix::net::listen", reason = "listen through agentfs_core::listening_socket::Listener", allow-invalid = true },
     { path = "libc::listen", reason = "listen through agentfs_core::listening_socket::Listener", allow-invalid = true },
     { path = "nix::sys::socket::listen", reason = "listen through agentfs_core::listening_socket::Listener", allow-invalid = true },
+
+    # A tree volume's Git store is opened only by its History (the tree
+    # actor's `history` module): nothing else reads history past what is built.
+    { path = "agentfs_core::tree_git::TreeGit::open", reason = "a tree volume's store is History's: read it through tree_actor::History" },
+    { path = "agentfs_core::tree_git::TreeGit::open_with_lease", reason = "a tree volume's store is History's: read it through tree_actor::History" },
+    { path = "agentfs_core::tree_git::TreeGit::init", reason = "a tree volume's store is History's: read it through tree_actor::History" },
+    { path = "agentfs_core::tree_git::TreeGit::init_with_lease", reason = "a tree volume's store is History's: read it through tree_actor::History" },
+
+    # A row's step is the store adapter's (agentfs_core::store): it stamps the
+    # row and makes the step durable before it returns.
+    { path = "agentfs_core::tree_actor::TreeActor::fork_with", reason = "fork through agentfs_core::store::TreeStore, which writes the fork's row" },
+    { path = "agentfs_core::tree_actor::TreeActor::record_rows", reason = "write rows through agentfs_core::store::TreeStore" },
+    { path = "agentfs_core::tree_actor::TreeActor::drop_fork", reason = "drop a fork through agentfs_core::store::TreeStore, which writes its row" },
+
+    # An ended client's opens are saved by its session's unbind
+    # (agentfs_core::session), under the lock that also removes its writer.
+    { path = "agentfs_core::tree_actor::TreeActor::close_writer", reason = "end a client through agentfs_core::session::Sessions::unbind" },
+
+    # Capabilities are minted only in a composition root: the `agentfs`
+    # binary's `main`, and each test that plays one.
+    { path = "agentfs_contracts::caps::Minter::new", reason = "capabilities are minted only in the composition root" },
 ]

@@ -58,12 +58,13 @@ impl Setup {
         Repository::init_bare(s.path("forks.git")).unwrap();
         let profile = profile(&s);
         fs::write(s.path("profile"), profile).unwrap();
-        let profile = s.path("profile").display().to_string();
-        s.ok(
-            "state",
-            "tree",
-            &["init", "--volume", "src", "--include", &profile],
-        );
+        agentfs_core::volume::init_with(
+            &agentfs_core::volume::StateDir::new(s.path("state")),
+            "src",
+            None,
+            Some(&[s.path("profile")]),
+        )
+        .unwrap();
         s
     }
 

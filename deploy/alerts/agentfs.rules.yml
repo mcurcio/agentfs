@@ -168,6 +168,20 @@ groups:
             suffixes. Set --workload-mount (CSI: workloadMounts) to map it
             exactly.
           runbook_url: https://github.com/mcurcio/agentfs/blob/main/docs/runbooks/worktree-heuristic.md
+      - alert: AgentfsNotBuilt
+        expr: agentfs_not_built > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "configured but not built yet: {{ $labels.capability }} ({{ $labels.instance }})"
+          description: >-
+            The volume's operator settings name {{ $value }} setting(s) of
+            capability {{ $labels.capability }}, which tree volumes do not
+            build yet: they do nothing. The volume keeps working. The mount's
+            log has one "not built:" line per key; see docs/trees.md,
+            "Operator settings".
+          runbook_url: https://github.com/mcurcio/agentfs/blob/main/docs/trees.md#operator-settings
       - alert: AgentfsTelemetryExportFailing
         expr: |
           increase(agentfs_telemetry_export_failures_total[15m]) > 0

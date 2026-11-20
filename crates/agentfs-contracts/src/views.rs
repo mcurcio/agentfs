@@ -1,0 +1,67 @@
+//! The Views domain's contract (docs/library/filesystem.md, "Tree views"):
+//! open a view for a binding, close it. Snapshot views and profiles are not
+//! built (docs/target-architecture/domains/views.md).
+
+use std::path::PathBuf;
+
+use crate::clients::Binding;
+
+/// Where a view is mounted: an existing empty directory outside the state area
+/// and every other view.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct MountPoint(pub PathBuf);
+
+/// How the kernel mount is made. No option sets an owner: each entry is
+/// presented with its recorded owner and mode (docs/trees.md, "The view").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MountOptions {
+    /// FUSE `allow_other`: other users reach the mount (needs
+    /// `user_allow_other` in `/etc/fuse.conf` when not root), as the recording
+    /// mount. On by default; `--no-allow-other` turns it off.
+    pub allow_other: bool,
+    /// Stack over a stale agentfs mount of this view's own source (this volume
+    /// and this tree) at the mount point (a
+    /// view host restarted after its predecessor died): mounted at a private
+    /// directory of the state area, bind-mounted over the stale mount so every
+    /// copy of the mount point (propagated mounts, subPath binds of the mount
+    /// point itself; not binds of a directory inside it) reaches this view, the
+    /// private mount detached; the stale layers below are detached when the
+    /// view ends. Needs CAP_SYS_ADMIN. With no stale mount there, the view
+    /// mounts as without it.
+    pub over_stale: bool,
+}
+
+/// A mounted view, unique per view host run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ViewId(pub u64);
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ViewError {
+    /// The mount point is missing, not empty, inside the state area or another
+    /// view; or the kernel refused the mount (errno).
+    #[error("the view could not be mounted (errno {0})")]
+    MountFailed(i32),
+    /// The binding's session is unknown to the history service.
+    #[error("no such session")]
+    UnknownSession,
+    /// The mount point is a stale agentfs mount (its daemon died) this open
+    /// may not stack over: `over_stale` is off, or it is another volume's.
+    #[error("the mount point is a stale agentfs mount ({found})")]
+    Stale { found: String },
+}
+
+/// The Views domain (docs/library/filesystem.md, "Tree views").
+pub trait Views {
+    /// # Errors
+    ///
+    /// `MountFailed`, `UnknownSession`, `Stale`.
+    fn open(
+        &mut self,
+        at: MountPoint,
+        binding: Binding,
+        options: MountOptions,
+    ) -> Result<ViewId, ViewError>;
+
+    /// Unmounts; its open files close as the kernel releases them. Idempotent.
+    fn close(&mut self, view: ViewId);
+}

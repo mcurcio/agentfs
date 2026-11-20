@@ -1,14 +1,16 @@
 name: f8
 
-# F8, one branch per worktree: end-to-end jobs on kind,
-# each on its own runner. e2e-csi-move moves a volume between the two
-# workers of ci/kind/two-workers.yaml (ci/e2e-csi-move.sh,
-# docs/runbooks/moving.md), with the CSI chart from this tree and the
-# example git server as a pod. e2e-chart-server runs the chart's own git
-# server (server.enabled, ci/e2e-chart-server.sh, docs/helm.md).
-# e2e-csi-fork-of-fork forks a fork and rolls the grandchild's change up
-# into the child's queue on an authenticated fork remote
-# (ci/e2e-csi-fork-of-fork.sh, bead agentfs-mia.7).
+# F8: end-to-end jobs on kind, each on its own runner, against the
+# tree-engine CSI driver. e2e-csi-move keeps volumes node-local on the two
+# workers of ci/kind/two-workers.yaml: moving a volume between nodes
+# (`startFrom`) is refused by design until its slice lands
+# (ci/e2e-csi-move.sh, docs/runbooks/moving.md), and a deleted claim's
+# directory is kept on its node. e2e-chart-server runs the chart's own git
+# server (server.enabled, ci/e2e-chart-server.sh, docs/helm.md): the
+# server works, and pushing to it is logged as not built.
+# e2e-csi-fork-of-fork asserts that a fork claim of a fork claim is refused
+# by design until nested forks are built (ci/e2e-csi-fork-of-fork.sh,
+# docs/target-architecture/future/nested-forks.md).
 
 on:
   push:
@@ -31,6 +33,8 @@ env:
   HELM_VERSION: v3.22.1
 
 jobs:
+  # Node-local volumes on two workers (ci/e2e-csi-move.sh): a move between
+  # nodes is refused (`startFrom is not built on tree volumes`).
   e2e-csi-move:
     name: e2e (CSI move between nodes)
     runs-on: ubuntu-24.04
@@ -51,8 +55,6 @@ jobs:
           tags: agentfs:ci
           cache-from: type=gha,scope=agentfs-image
           provenance: false
-      - name: build the git server image
-        run: docker build -t agentfs-git-server:ci examples/docker/git-server
       - name: FUSE
         run: |
           sudo modprobe fuse
@@ -66,7 +68,7 @@ jobs:
         run: |
           kind create cluster --name agentfs-move --config ci/kind/two-workers.yaml \
             --image "$KIND_NODE_IMAGE" --wait 180s
-          kind load docker-image agentfs:ci agentfs-git-server:ci --name agentfs-move
+          kind load docker-image agentfs:ci --name agentfs-move
           kubectl get nodes -o wide
       - run: ci/e2e-csi-move.sh
       - name: diagnose
@@ -77,7 +79,8 @@ jobs:
         run: kind delete cluster --name agentfs-move || true
 
   # The CSI chart's git server (server.enabled): ci/e2e-chart-server.sh on
-  # one kind node, with charts/agentfs-csi/ci/server.yaml.
+  # one kind node, with charts/agentfs-csi/ci/server.yaml. The server takes
+  # the runner's push; the volume's host logs its remote as not built.
   e2e-chart-server:
     name: e2e (the chart's git server)
     runs-on: ubuntu-24.04
@@ -122,9 +125,11 @@ jobs:
         if: always()
         run: kind delete cluster --name agentfs-server || true
 
-  # Forks of forks on the CSI driver (ci/e2e-csi-fork-of-fork.sh): the
-  # grandchild's roll-up into the child's queue logs in to the fork remote
-  # with its agentfsCredentials (nginx auth_basic, ci/git-http-server.sh).
+  # Forks of forks on the CSI driver (ci/e2e-csi-fork-of-fork.sh): a child
+  # fork claim binds and lands in its source; a fork claim of the child is
+  # refused (`forks of forks are not built`). The git server
+  # (ci/git-http-server.sh) is the profile's remote, logged as not built:
+  # the job checks it never gets a ref.
   e2e-csi-fork-of-fork:
     name: e2e (CSI forks of forks)
     runs-on: ubuntu-24.04

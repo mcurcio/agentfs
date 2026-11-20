@@ -45,8 +45,7 @@ impl Volume {
             dir: tempfile::tempdir().unwrap(),
         };
         fs::create_dir_all(v.tree()).unwrap();
-        let out = v.run(["init", "--volume", "demo"]);
-        assert!(out.status.success(), "{}", stderr(&out));
+        agentfs_core::volume::init_with(&v.state(), "demo", None, None).unwrap();
         // Commit at once, so the history is there when a test looks.
         git2::Config::open(&v.state().git().join("config"))
             .unwrap()

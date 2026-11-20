@@ -1,6 +1,9 @@
 # Domain: Views
 
-**Proposed, not built.** This page proposes the Views domain (how each client sees and changes its tree), one part of the system around the git model ([the system](../system.md)). The git model ([git-model.md](../git-model.md)) wins wherever the two disagree. Rust sketches show surfaces only. The commit that lands the slice that builds this domain deletes this page and moves the behaviour into the library or operator docs.
+**Proposed, partly built.** The view host (one live view per client, mounted on its session, read-only for a
+read-only grant, closed lazily at a drain) is built and described in [docs/trees.md](../../trees.md#the-view) and the
+[filesystem layer](../../library/filesystem.md#tree-views); snapshot views, profiles and the rest are not. This page
+proposes the Views domain (how each client sees and changes its tree), one part of the system around the git model ([the system](../system.md)). The git model ([git-model.md](../git-model.md)) wins wherever the two disagree. Rust sketches show surfaces only. The commit that lands the slice that builds this domain deletes this page and moves the behaviour into the library or operator docs.
 
 **What this page covers:** how each client's view serves file calls, what a client sees and when, and what Views asks
 of its tree's actor. Saves, locks, syncs and transactions themselves are git-model §6–§9.
@@ -64,7 +67,6 @@ pub struct View {
     txn: Option<TxnDir>,          // the open transaction's directory, served for opens after begin
     mode: Mode,                   // built once from the grant; replaced only by `rebound`
     view_profile: ViewProfileId,  // what Rules shows this client
-    acts_as: FileOwner,           // the owner it presents to the program
     rules: RuleSetVersion,        // judged with this rule set
     applied: Option<CommitId>,    // the last TreeMoved applied to the kernel
     state: ViewState,
@@ -101,55 +103,28 @@ Clients ends its attachments, which drops their waiting opens.
 
 ## 5. Public contract
 
+Built, and not repeated here: the `Views` trait (`open(at, binding, options)`, `close`) and `ViewError` in
+`agentfs_contracts::views`, and the session a view's calls cross (`agentfs_core::session::TreeSession`: write-opens,
+writes, `fsync`, path calls and closes, each naming no client and no tree), described in the
+[filesystem layer](../../library/filesystem.md#tree-views) and [docs/trees.md](../../trees.md#the-view). What follows
+goes beyond them.
+
 ```rust
-// ── Offered to launchers (system §2) ──
-pub trait Views {
-    fn open(&mut self, at: MountPoint, b: Binding) -> Result<ViewId, ViewError>;
-    fn rebound(&mut self, v: ViewId, b: Binding) -> Result<(), ViewError>; // after advance or a service restart
-    fn close(&mut self, v: ViewId);
-}
-pub enum ViewError {
-    MountFailed(IoKind),          // mount point missing, not empty, stale under `refuse`
-    ServiceUnavailable,           // no ServiceReady yet
-    OtherFamily(Version),         // the service's major.minor differs (system §4)
-}
+// ── Not built: added to Views ──
+fn rebound(&mut self, v: ViewId, b: Binding) -> Result<(), ViewError>; // after advance or a service restart
+// ViewError gains:
+//   ServiceUnavailable,        // no ServiceReady yet
+//   OtherFamily(Version),      // the service's major.minor differs (system §4)
 
-// ── What a view asks of its tree's actor, over its session ──
-// The session supplies the client and the tree. Every rule behind these calls is git-model's;
-// this is only the crossing. Each call completes on an event, never a timer.
-pub trait TreeSession {
-    /// Completes once no take holds p or waits for it (git-model §6, P3). Rules' path refusals answer here,
-    /// since RELEASE cannot carry one. WriteOpen names the object and the commit the open read (its base).
-    fn open_for_writing(&self, p: &RelPath) -> Pending<Result<WriteOpen, OpenError>>;
-    /// In the tree's journal before it returns (git-model §3); the view changes its copy only after.
-    fn record(&self, w: &WriteOpen, c: WriteCall) -> Result<(), RecordError>;
-    /// fsync, fdatasync, an O_SYNC write, and every FLUSH whose open has records not yet durable.
-    fn make_durable(&self, w: &WriteOpen) -> Result<(), RecordError>;
-    /// unlink, rename, truncate by path: journaled durably, then run; waits like a write-open.
-    fn path_call(&self, c: PathCall) -> Pending<Result<(), SaveError>>;
-    /// At RELEASE: the actor saves from the journal (git-model §6–§7). Nothing to answer: every call is recorded.
-    fn release(&self, w: WriteOpen);
-    fn begin(&self) -> Result<TxnDir, TxnError>;                   // git-model §9
-    fn commit(&self) -> Result<Overwritten, TxnError>;            // the lines its fork's own lines overwrote
-    fn rollback(&self) -> Result<(), TxnError>;
-}
-pub enum WriteCall {              // the POSIX calls, all a save gets; git-model §6–§7 maps them to lines
-    Append(Bytes),                // O_APPEND: new lines after the file's end as the head has it; no alignment
-    WriteAt { offset: u64, bytes: Bytes }, // bytes only: the save aligns the base's lines with the bytes at close, once
-    Truncate { len: u64 },        // to 0 (or O_TRUNC at open) then writes: a rewrite, aligned with the head's lines
-}
-pub enum OpenError {
-    Refused(RuleRefusal),         // EACCES: a Rules group refusal, a fact of the path alone
-}
-pub enum RecordError {
-    NoSpace,                      // ENOSPC: the state area cannot take the call; the open file is unchanged
-    TooLarge,                     // EFBIG: past the path's size rule
-    Io(IoKind),                   // EIO
-}
+// ── Not built: added to the session ──
+fn begin(&self) -> Result<TxnDir, TxnError>;                   // git-model §9
+fn commit(&self) -> Result<Overwritten, TxnError>;            // the lines its fork's own lines overwrote
+fn rollback(&self) -> Result<(), TxnError>;
 pub enum TxnError { InTransaction, NoTransaction, Ended, OpenFiles, Empty } // git-model §9
+// A write-open Rules refuse answers EACCES (`Refused(RuleRefusal)`), a fact of the path alone.
 
-// ── Published ──
-pub struct ViewCaughtUp { view: ViewId, tree: TreeRef, to: CommitId }
+// ── Not built: published ──
+pub struct ViewCaughtUp { view: ViewId, tree: TreeId, to: CommitId }
 ```
 
 **What a program sees.** One table, one home.

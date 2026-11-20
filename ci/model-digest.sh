@@ -7,8 +7,10 @@
 #                                                planted/budget.json
 #   ci/model-digest.sh check [--all]             one run against the golden: the scenarios
 #                                                first, stopping at their first difference
-#                                                before any seed runs; --all runs everything
-#                                                and reports every difference
+#                                                before any seed runs, then the regression
+#                                                seeds (tests/regression-seeds.txt, the fast
+#                                                tier); --all runs every seed and reports
+#                                                every difference
 #   ci/model-digest.sh collect DIR [SHARD OF]    one shard's digests, into a new or empty DIR
 #   ci/model-digest.sh accept|compare DIR...     filled DIRs into, or against, the golden
 # A shard splits the run under a time limit, each into its own DIR, chained with `&&`:
@@ -84,11 +86,12 @@ within_budget() {
 
 # collect DIR [SHARD OF [WHAT]]: the scenarios (in shard 0) and that shard's seeds, each seed
 # in its own process with its digests in DIR, named as the run; a marker if all passed.
-# WHAT is `scenarios` or `seeds` to collect only those (check's two halves; no marker).
+# WHAT is `scenarios` or `seeds` to collect only those, or `regression` for only the
+# regression seeds (check's halves; no marker).
 collect() {
     local dir=$1 shard=${2:-0} of=${3:-1} what=${4:-all}
     git_release
-    if [ "$what" != seeds ] && [ -e "$dir" ] && [ -n "$(ls -A "$dir")" ]; then
+    if [ "$what" != seeds ] && [ "$what" != regression ] && [ -e "$dir" ] && [ -n "$(ls -A "$dir")" ]; then
         echo "$dir is not empty: collect each shard into a new directory" >&2
         exit 1
     fi
@@ -104,7 +107,7 @@ collect() {
         echo "cargo printed no test binary" >&2
         exit 1
     fi
-    if [ "$shard" = 0 ] && [ "$what" != seeds ]; then
+    if [ "$shard" = 0 ] && [ "$what" != seeds ] && [ "$what" != regression ]; then
         local s=$SECONDS
         echo "unit-start: scenarios"
         # In the package's directory, as cargo runs it.
@@ -115,7 +118,7 @@ collect() {
         printf 'scenarios %s\n' $((SECONDS - s)) >> "$dir/units.tsv"
     fi
     if [ "$what" != scenarios ]; then
-        seq 1 "$last" | awk -v s="$shard" -v n="$of" '$1 % n == s % n' |
+        { if [ "$what" = regression ]; then regression_seeds; else seq 1 "$last"; fi; } | awk -v s="$shard" -v n="$of" '$1 % n == s % n' |
             (cd crates/agentfs-model && AGENTFS_MODEL_DIGEST_DIR=$dir xargs -P "$jobs" -I{} \
                 env AGENTFS_MODEL_SEED={} DIR="$dir" BIN="$bin" LIMIT="$limit" THREADS="$threads" sh -c '
                     s=$(date +%s); echo "unit-start: seed $AGENTFS_MODEL_SEED"
@@ -169,9 +172,22 @@ listing() {
     done | LC_ALL=C sort
 }
 
-# The golden's runs; with `scenarios`, only theirs (a seed's run ends in `.seed<n>`).
+# The regression seeds, both kinds, one per line (tests/regression-seeds.txt).
+regression_seeds() {
+    grep -v '^#' "$root/crates/agentfs-model/tests/regression-seeds.txt" |
+        awk '{ for (i = 2; i <= NF; i++) print $i }' | sort -nu
+}
+
+# The golden's runs; with `scenarios`, only theirs (a seed's run ends in `.seed<n>`); with
+# `regression`, the scenarios' and the regression seeds'.
 golden_lines() {
-    if [ "${1:-}" = scenarios ]; then
+    if [ "${1:-}" = regression ]; then
+        grep -v '^#' "$golden" |
+            awk -v keep="$(regression_seeds | paste -sd' ' -)" '
+                BEGIN { n = split(keep, k, " "); for (i = 1; i <= n; i++) want[k[i]] = 1 }
+                !match($1, /\.seed[0-9]+$/) { print; next }
+                want[substr($1, RSTART + 5)] { print }'
+    elif [ "${1:-}" = scenarios ]; then
         grep -v '^#' "$golden" | grep -Ev '\.seed[0-9]+ ' || true
     else
         grep -v '^#' "$golden"
@@ -270,15 +286,16 @@ PY
             echo "the scenarios' digests differ from $golden (first difference above): no seed runs" >&2
             exit 1
         fi
-        within_budget scenarios_seconds "$(slowest scenarios "$dir")" || exit 1
-        collect "$dir" 0 1 seeds
-        golden_lines > "$want"
+        # The budget after the seeds, so a slow scenario run never hides their result.
+        scenario_seconds=$(slowest scenarios "$dir")
+        collect "$dir" 0 1 regression
+        golden_lines regression > "$want"
         if [ "$tests_failed" != 0 ] || ! differences <(listing "$dir") "$want" first; then
-            echo "the seeds' digests differ from $golden (first difference above; check --all lists all)" >&2
+            echo "the regression seeds' digests differ from $golden (first difference above; check --all runs every seed)" >&2
             exit 1
         fi
-        within_budget full_seconds $((SECONDS - start)) || exit 1
-        echo "$(grep -vc '^#' "$golden") runs match $golden"
+        echo "$(wc -l < "$want") runs of the scenarios and the regression seeds match $golden"
+        within_budget scenarios_seconds "$scenario_seconds" || exit 1
         ;;
     collect)
         collect "${2:?a directory}" "${3:-0}" "${4:-1}"

@@ -1,6 +1,8 @@
 # Sandbox overlay: shared locks, inode gaps, hosting on a front
 
-**Proposed, not built.** This page proposes closing three limits of the sandbox overlay. The commit that lands this slice deletes this page and moves the behaviour into the library or operator docs.
+**Proposed, not built.** This page proposes closing three limits of the sandbox overlay. No launcher offers the overlay:
+tree volumes do not build it, and the CSI driver's fronts never served it; a program linking `agentfs-fuse` turns it on
+([library/filesystem](../../library/filesystem.md#the-sandbox-overlay)). The commit that lands this slice deletes this page and moves the behaviour into the library or operator docs.
 
 ## What stands until then
 
@@ -8,7 +10,8 @@
   through the mount point is not seen through the overlay.
 - **Shown entries' inode numbers skip one per hidden entry.** This tells a sandbox how many hidden entries a
   directory holds, not their names. Not tested.
-- **The overlay is served only by a single-process `mount`**, so not on CSI volumes, where every pod's mount is a front.
+- **The overlay is served only by a single FUSE session that also serves the main mount**, so not on a front, which
+  is how every CSI pod mounts.
 
 ## What it proposes
 

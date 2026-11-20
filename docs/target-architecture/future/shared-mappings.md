@@ -11,7 +11,7 @@ dies with the view host, which Linux would keep. `stat` and `sendfile` show unsa
 ## What it proposes
 
 Refuse `MAP_SHARED` writable mappings, so the gap cannot occur. The code that handles page fills and page writes is
-in `tree_actor/pages.rs` and the view's read, write and size paths, so removing it is cheap.
+in `tree_actor/recording/pages.rs` and the view's read, write and size paths, so removing it is cheap.
 
 ## Open choices
 

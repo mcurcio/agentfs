@@ -5,7 +5,8 @@
 //! enclose another (`queue_plan` encloses `snapshot_read` and `sync_merge`;
 //! `journal_append` encloses `journal_fsync`). `event_owners` is the one Git
 //! child that rebuilds the map of each save's commit at open. Totals are
-//! process-wide, like the counter of Git children in [`crate::git_cli`]: one
+//! process-wide, like the counters of Git children in [`crate::git_cli`] and
+//! of objects in [`crate::tree_git`]: one
 //! actor runs per process, so a reader compares two snapshots.
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -21,7 +22,8 @@ pub struct Stage {
     pub max_nanos: u64,
 }
 
-/// Every stage, and the Git children the actor's path has started.
+/// Every stage, the Git children the actor's path has started, the objects it
+/// handed to Git's store and the fsyncs of the store's `objects/` directory.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct Stages {
     pub journal_append: Stage,
@@ -38,6 +40,13 @@ pub struct Stages {
     pub prior_decisions: Stage,
     pub event_owners: Stage,
     pub git_children: u64,
+    pub object_writes: u64,
+    pub object_dir_syncs: u64,
+    /// File bytes the actor and the builder copied: a frame's tail into its
+    /// buffer, a file map read into memory (docs/trees.md, "File maps").
+    pub bytes_copied: u64,
+    /// File bytes compared to tell a close that changes nothing.
+    pub bytes_compared: u64,
 }
 
 /// The stage a [`Timer`] adds to.
@@ -85,6 +94,18 @@ impl Total {
 }
 
 static TOTALS: [Total; STAGE_COUNT] = [const { Total::new() }; STAGE_COUNT];
+static COPIED: AtomicU64 = AtomicU64::new(0);
+static COMPARED: AtomicU64 = AtomicU64::new(0);
+
+/// Counts `n` file bytes copied.
+pub(super) fn copied(n: u64) {
+    COPIED.fetch_add(n, Ordering::Relaxed);
+}
+
+/// Counts `n` file bytes compared.
+pub(super) fn compared(n: u64) {
+    COMPARED.fetch_add(n, Ordering::Relaxed);
+}
 
 impl Stages {
     /// The totals so far in this process.
@@ -105,6 +126,11 @@ impl Stages {
             prior_decisions: at(Which::PriorDecisions),
             event_owners: at(Which::EventOwners),
             git_children: crate::git_cli::children(),
+            object_writes: crate::tree_git::object_writes() + super::history::feed::fed(),
+            object_dir_syncs: crate::tree_git::object_dir_syncs()
+                + super::history::feed::pack_syncs(),
+            bytes_copied: COPIED.load(Ordering::Relaxed),
+            bytes_compared: COMPARED.load(Ordering::Relaxed),
         }
     }
 }

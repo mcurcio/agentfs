@@ -2,8 +2,11 @@
 
 Someone else moved the volume's branch on a remote, so agentfs can no
 longer push to it without overwriting their commits, which it never
-does. How pushes and shared branches work is in [remotes](../remotes.md). `ci/e2e-runbooks.sh` runs
-case A below, block for block, in CI.
+does. How pushes and shared branches work is in [remotes](../remotes.md).
+
+This runbook is for the recording engine, on recording state areas, which no launcher runs any more ([moving.md](moving.md) moves the CSI volumes
+an older driver made). Its "Under CSI" steps apply to no volume today: the CSI driver runs tree volumes. Tree volumes (the sidecar, the Docker
+examples, `agentfs mount` and the CSI driver) push to no remote yet, so they never diverge.
 
 ## Symptoms
 
@@ -28,7 +31,7 @@ this volume's).
 Throughout:
 
 ```sh
-STATE=/data/state                                  # the state area
+STATE=/var/lib/agentfs-csi/volumes/<pv>/state     # the state area
 VOL=demo                                           # the volume
 NAME=origin                                        # the diverged remote's name
 URL=https://github.com/acme/agent-history.git      # its push URL
@@ -41,7 +44,7 @@ the URL for this session only. `agentfs push` uses the volume's own.
 
 For an SSH remote, point `git` at a key with write access and at the
 remote's own known_hosts file, so this session trusts exactly the host
-agentfs trusts (`ci/e2e-ssh.sh` pushes as another writer this way):
+agentfs trusts:
 
 ```sh
 URL=ssh://git@git.example.com/acme/agent-history.git
@@ -78,7 +81,7 @@ worktree): a branch another worktree writes is never taken over.
 | What the remote's new commits look like | What happened | Resolve with |
 |---|---|---|
 | No `Agentfs-*` trailers, a person or another tool as committer | A foreign or mistaken writer pushed to the volume's branch | Case A |
-| `Agentfs-*` trailers, but another `Agentfs-Pod` or committer replica, and `Agentfs-Seq` unrelated to ours | Another worktree writes this branch: two recorders use the same volume name in this repository (names must be unique, see [remotes](../remotes.md)) | Rename this volume: it continues under a new name (under CSI, a new claim: its PV name is the volume name; a CLI or sidecar volume, a new state area with its own `--volume`). The other worktree keeps the branch. This volume's head stays saved under its `diverged/*` ref: take what you need from there with a restore ([recovery-and-undo.md](recovery-and-undo.md), section 5) |
+| `Agentfs-*` trailers, but another `Agentfs-Pod` or committer replica, and `Agentfs-Seq` unrelated to ours | Another worktree writes this branch: two recorders use the same volume name in this repository (names must be unique, see [remotes](../remotes.md)) | Rename this volume: it continues under a new name (a new claim: its PV name is the volume name). The other worktree keeps the branch. This volume's head stays saved under its `diverged/*` ref: take what you need from there with a restore ([recovery-and-undo.md](recovery-and-undo.md), section 5) |
 | `Agentfs-*` trailers from this volume, with `Agentfs-Seq` beyond ours | This state area is older than the remote: it was restored from a backup, or replaced | Case B |
 
 If the foreign commits hold work you want, keep them (case A saves them)
@@ -137,14 +140,10 @@ a new name, started from the branch, so nothing on either side is lost:
 
 1. Stop the workload and the stale volume, and keep its state area as it
    is: its head is saved on the remote under `diverged/*` already.
-2. Under CSI, follow [moving.md](moving.md) from its step 2: a start class
+2. Follow [moving.md](moving.md) from its step 2: a start class
    with `startFrom: <remote>:agentfs/<volume>@<the branch's tip>` (a
    branch, never a `diverged/*` ref: that is refused), a new claim on it,
    and readers pointed at the new branch.
-3. A CLI or sidecar volume has no start command: create a new
-   volume (`agentfs init --volume <new name>`) whose backing tree holds the
-   branch's tip (`git --git-dir "$STATE/git" fetch -q "$URL" "$BRANCH"`,
-   then `git archive` of that commit into it), and record it.
 
 What the stale state area held beyond the remote is on its `diverged/*`
 ref: restore what you need from there in the new volume
@@ -155,8 +154,8 @@ exercised in CI; rehearse it on a copy first.
 ## 5. Verify
 
 The next push of that remote is a fast-forward (or up to date), and the
-divergence clears. Push now: `agentfs push` pushes directly with no mount running,
-and asks the running mount (or `run`) to push at once otherwise.
+divergence clears. Push now: `agentfs push` pushes directly with no history service running,
+and asks the running service (or `run`) to push at once otherwise.
 
 <!-- ci: divergence-verify -->
 ```sh

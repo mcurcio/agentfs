@@ -1,12 +1,11 @@
-# Settings for a volume that pushes to the example git server
-# (compose.remote.yaml, docs/docker.md). Every key is in
-# docs/configuration.md; a fragment must not set agentfs.volume or
-# agentfs.branch (`agentfs init` sets them).
-[agentfs]
-	commitWindow = 200ms
-	# A local server: push often.
-	pushInterval = 5s
-
+# Settings for a volume with the example git server as its remote
+# (compose.remote.yaml, docs/docker.md), included from the volume's
+# operator settings file. Every key is in docs/configuration.md.
+#
+# Push is not built on tree volumes yet: the mount serves anyway and logs
+# each of these keys at every boot, one line per key:
+#
+#   not built: remote.origin.url (push): this volume pushes to no remote yet; its history stays in the state area
 [remote "origin"]
 	url = http://git-server:8080/git/history.git
 	# The Compose secret `origin` (secrets/origin), at /run/secrets/origin.
