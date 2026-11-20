@@ -556,16 +556,17 @@ async fn a_fork_claim_is_a_keyed_fork_and_delete_ends_it() {
 
     c.delete_volume(delete_claim_req("pvc-2")).await.unwrap();
     assert!(!d.layout.volume_dir("pvc-2").exists());
-    assert_eq!(d.count("spawn host pvc-1"), 2);
-    d.until("exit host pvc-1 exit code 0", 2).await;
-    assert_eq!(d.count("exit host pvc-1 exit code 0"), 2);
-    c.delete_volume(delete_claim_req("pvc-2")).await.unwrap();
-    assert_eq!(d.count("spawn host pvc-1"), 2, "gone already: no host");
     // The fork ended in the store: its key is not made again.
     let err = c.create_volume(req).await.unwrap_err();
     assert_eq!(err.code(), Code::AlreadyExists, "{err:?}");
     assert!(err.message().contains("ended"), "{}", err.message());
     assert!(!d.layout.csi_json("pvc-2").exists());
+    // A host for each call, each stopped after it.
+    assert_eq!(d.count("spawn host pvc-1"), 3);
+    d.until("exit host pvc-1 exit code 0", 3).await;
+    assert_eq!(d.count("exit host pvc-1 exit code 0"), 3);
+    c.delete_volume(delete_claim_req("pvc-2")).await.unwrap();
+    assert_eq!(d.count("spawn host pvc-1"), 3, "gone already: no host");
     d.stop().await;
 }
 
@@ -829,7 +830,13 @@ async fn a_fork_claims_view_beside_its_source() {
     n.node_unpublish_volume(unpublish_req(&a)).await.unwrap();
     let err = c.delete_volume(delete_req()).await.unwrap_err();
     assert_eq!(err.code(), Code::FailedPrecondition, "{err:?}");
-    assert!(err.message().contains("is in use"), "{}", err.message());
+    assert_eq!(
+        err.message(),
+        format!(
+            "volume pvc-1 is in use on this node (published at {}); nothing deleted",
+            b.display()
+        )
+    );
     assert!(d.layout.csi_json("pvc-1").exists(), "nothing deleted");
 
     // The last view closed: the host drains, and Volume releases only with
