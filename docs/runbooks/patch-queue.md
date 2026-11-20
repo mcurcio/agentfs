@@ -8,8 +8,7 @@ rest go on; integrators are notified of every verdict change; the queue
 can also be served over git ([section 8](#8-serving-the-queue-over-git-serve-git)),
 and forks of forks roll up through it ([section 9](#9-forks-of-forks)).
 A start that may have a workload attached holds the queue
-([section 10](#10-patches-held-after-an-unclean-stop)). How it works: [patches](../patches.md), [remotes](../remotes.md). `ci/e2e-patches.sh`
-follows this runbook against a smart-HTTP remote and a real mount.
+([section 10](#10-patches-held-after-an-unclean-stop)). How it works: [patches](../patches.md), [remotes](../remotes.md).
 
 Throughout:
 
@@ -385,9 +384,6 @@ git --git-dir "$STATE/git" config merge.mergiraf.driver \
   'mergiraf merge --git %O %A %B -s %S -x %X -y %Y -p %P -l %L'
 printf '*.rs merge=mergiraf\n' >>"$STATE/git/info/attributes"
 ```
-
-`ci/e2e-mergiraf.sh` merges two patches to one `.rs` file this way in the
-built image.
 
 ## 7. Notifying the integrator
 

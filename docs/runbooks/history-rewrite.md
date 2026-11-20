@@ -11,12 +11,6 @@ replaced, by an operator, and only through that command: no runbook
 `git push`es a branch (a test, `runbooks_push_only_the_namespace`,
 holds them to refs under `refs/agentfs/`).
 
-`ci/e2e-runbooks.sh` runs every block below, as written, in CI (against
-a `file://` remote), and checks that the secret's blobs are gone from the
-state area and the remote, that pushes are fast-forwards again and that
-`Agentfs-Seq` keeps increasing. `ci/e2e-runbooks.sh forks` runs the
-whole procedure again with [Forks](#forks), on a volume with two forks.
-
 If the volume has forks ([forks](../forks.md)), read
 [Forks](#forks) before you start: two of its steps come between steps 2
 and 3, and one after step 9.

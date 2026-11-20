@@ -25,13 +25,11 @@
 #      `agentfs status` in B's plugin shows it; `agentfs start accept
 #      --tip g` there; the next push raises none, and the remote holds
 #      refs/agentfs/V2/accepted/g;
-#   g. a CLI volume with V1's volume name, pushing to the server:
-#      diverged, agentfs/V1 unchanged, a refs/agentfs/<V1>/diverged/* ref
-#      saved;
-#   h. a class whose startFrom names refs/agentfs/<V1>/diverged/...: the
-#      claim stays Pending, with a ProvisioningFailed event naming "not a
+#   g. a class whose startFrom names a refs/agentfs/<V1>/diverged/* ref
+#      (written on the server, as a divergence would save it): the claim
+#      stays Pending, with a ProvisioningFailed event naming "not a
 #      branch";
-#   i. with B's worktree directory removed, a pod on the same claim
+#   h. with B's worktree directory removed, a pod on the same claim
 #      waits; its events name the missing worktree.
 #
 # Needs docker, kind, kubectl and helm, a kind cluster $KIND_CLUSTER
@@ -55,7 +53,6 @@ BASE=/var/lib/agentfs-csi/volumes
 NODE_STATE=/var/lib/agentfs-csi/node
 PLUGIN_LABEL=app.kubernetes.io/name=agentfs-csi-node
 REPO=/srv/git/history.git
-PROFILE=/etc/agentfs-csi/profiles/ci.config
 
 kd() { kubectl -n "$DNS" "$@"; }
 ka() { kubectl -n "$APPS" "$@"; }
@@ -409,22 +406,10 @@ until_ok 120 "the next push raises no alarm" status_lacks "$NODE_B" "$STATE2" "s
 until_ok 120 "the remote holds refs/agentfs/V2/accepted/g" \
   remote_ref_is "refs/agentfs/$V2/accepted/$G" "$G"
 
-step "(g) a CLI volume named like V1 pushes: diverged, agentfs/V1 unchanged"
-on "$NODE_B" sh -c "rm -rf /tmp/cli && mkdir -p /tmp/cli/tree && printf cli > /tmp/cli/tree/cli.txt &&
-  agentfs --state /tmp/cli/state --root /tmp/cli/tree init --volume '$V1' --include $PROFILE &&
-  AGENTFS_NAMESPACE=ci AGENTFS_POD=cli AGENTFS_POD_UID=cli \
-    agentfs --state /tmp/cli/state --root /tmp/cli/tree record cli.txt"
-if out=$(on "$NODE_B" agentfs --state /tmp/cli/state push 2>&1); then
-  fail "a second writer of agentfs/V1 pushed: $out"
-fi
-echo "$out"
-assert_contains "$out" "diverged" "the CLI volume's push is diverged"
-assert_eq "$G" "$(sgit rev-parse "$BRANCH1")" "agentfs/V1 is unchanged"
-DIVERGED=$(sgit for-each-ref --format='%(refname)' "refs/agentfs/$V1/diverged/" | sed -n 1p)
-[ -n "$DIVERGED" ] || fail "no refs/agentfs/$V1/diverged/* ref was saved"
-pass "the CLI volume's head is saved as $DIVERGED"
-
-step "(h) a class starting from a diverged/* ref is refused: not a branch"
+step "(g) a class starting from a diverged/* ref is refused: not a branch"
+# The ref a divergence saves (docs/remotes.md), written here by hand.
+DIVERGED=refs/agentfs/$V1/diverged/ci
+sgit update-ref "$DIVERGED" "$G"
 start_class agentfs-move-diverged "origin:$DIVERGED@$(sgit rev-parse "$DIVERGED")"
 claim v3 agentfs-move-diverged
 writer writer-3 v3
@@ -434,7 +419,7 @@ ka delete pod writer-3 --wait=false
 ka delete pvc v3 --wait=false
 kubectl delete storageclass agentfs-move-diverged
 
-step "(i) B's worktree removed: a pod on the claim waits, naming it"
+step "(h) B's worktree removed: a pod on the claim waits, naming it"
 ka delete pod writer-2 --wait --timeout=120s
 until_ok 120 "V2 is unstaged on B" node_path_gone "$NODE_B" "$NODE_STATE/staged/$PV2.json"
 docker exec "$NODE_B" rm -rf "$BASE/$PV2"

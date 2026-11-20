@@ -5,11 +5,12 @@ What recording costs, measured. agentfs makes the call that ends a change
 is durable (see [recording](recording.md)): the content is frozen into `pending/` and a
 journal record is appended and `fsync`ed. Hashing, compression, commits
 and pushes come afterwards, off the workload's path. This page gives the
-cost of both parts, the benchmark that measures them, and the
-performance budget.
+cost of both parts for the recording engine, the budget its figures set,
+and the figures of tree views held to that budget.
 
 Unless a section says otherwise, the numbers below are from CI runs of
-the benchmark on GitHub's `ubuntu-24.04` runner, 4 vCPUs (AMD EPYC 7763),
+the recording engine's benchmark ([The recording
+benchmark](#the-recording-benchmark)) on GitHub's `ubuntu-24.04` runner, 4 vCPUs (AMD EPYC 7763),
 16 GiB, kernel 6.17, FUSE passthrough on for files opened read-only and,
 in these runs, also for files opened for writing (see
 [Writes through the daemon](#writes-through-the-daemon)), each filesystem a fresh 20 GiB loop device on
@@ -83,11 +84,11 @@ the commit loop running, so FUSE is not included. Microseconds:
 
 ## Workloads through a mount
 
-[`ci/bench.sh`](../ci/bench.sh) runs each workload in an `agentfs mount`
-of a fresh volume and, as the baseline, in a plain directory on the same
-filesystem, with the page cache dropped first. After each it waits until
-`agentfs status` shows no backlog ("catch-up") and checks the history
-against the backing tree.
+The recording benchmark ran each workload in a recording mount of a
+fresh volume and, as the baseline, in a plain directory on the same
+filesystem, with the page cache dropped first. After each it waited
+until `agentfs status` showed no backlog ("catch-up") and checked the
+history against the backing tree.
 
 This table is from two runs. Both XFS jobs ran on AMD EPYC 7763 and
 both ext4 jobs on Intel (Xeon Platinum 8370C, then Xeon 6973P-C). Each
@@ -125,7 +126,7 @@ What the numbers mean:
   (`nested=working-tree`); the 55–82 commits per clone came out at the
   default `commitWindow` of 200 ms.
 - **Excluded paths** (`info/exclude`) are decided at once and nothing is
-  frozen or journaled (the benchmark checks that the workload adds no
+  frozen or journaled (the benchmark checked that the workload added no
   records), but every operation still goes through the daemon: `create`,
   `open`, `flush` and `release` round trips. Keep large dependency trees
   (`node_modules/`, build output) out of the mount altogether when that
@@ -189,11 +190,10 @@ costs:
   `agentfs.fuse.racy_rechecks{outcome}` counts skipped and recorded
   outcomes.
 
-The benchmark checks that close4k and create make one record per
-boundary (plus 1 % and 10 of slack for the sweep), so a regression to
-the double record fails the job. It also checks that renaming the
-directory of 100,000 created files is one record and leaves every file
-in the history at its new path.
+The benchmark checked that close4k and create made one record per
+boundary (plus 1 % and 10 of slack for the sweep), and that renaming the
+directory of 100,000 created files was one record and left every file in
+the history at its new path.
 
 ### Writes through the daemon
 
@@ -232,8 +232,7 @@ costs instead comes after the call has returned:
 With several pods on one volume (see [library/core](library/core.md)), each pod's mount is a
 front that sends every boundary to the volume's history service over
 gRPC on a Unix socket, and returns once the service has made it durable.
-Measured in the `e2e-multipod` jobs of CI (`ubuntu-24.04`, kernel
-6.17, ext4), medians in
+Measured in CI (`ubuntu-24.04`, kernel 6.17, ext4), medians in
 microseconds, passthrough `auto` / `off`:
 
 | Measurement | auto | off |
@@ -247,14 +246,13 @@ microseconds, passthrough `auto` / `off`:
 A front's single-thread record costs 1.33 and 1.32 times the
 single-process one (1.23 to 1.30 in reruns); with 8 threads the two are
 within 22 % (front 2516 and 2470 µs against 2083 and 2028 µs). The
-freeze and the journal's `fsync`, which both modes pay, dominate. The round trip varies with the runner from 49 to 148 µs. CI fails when
-the single-thread ratio's median over several runs of the bench exceeds
-1.6 ([`ci/round-trip-bench.sh`](../ci/round-trip-bench.sh)).
+freeze and the journal's `fsync`, which both modes pay, dominate. The round trip varies with the runner from 49 to 148 µs. Several pods on
+one volume run only under the CSI driver, and no CI job measures this
+round trip.
 
 ## Tree views
 
-These figures are for the tree-view mode (`agentfs trees`, see
-[trees](trees.md)). They are observations, not budgets: no figure here is
+These figures are for tree views (see [trees](trees.md)). They are observations, not budgets: no figure here is
 gated. They come from one run of each case, in a debug build, on one CI
 runner (ext4, git 2.47.3, Linux 7.0, `FOPEN_DIRECT_IO`). Two runs of one
 mode have differed by up to 2 times, so read a figure as one observation.
@@ -525,11 +523,12 @@ in each of the actor's and the builder's trees.
 
 ## Performance budget
 
-The budget is
-[`ci/bench-budget.json`](../ci/bench-budget.json), checked by every run
-of the benchmark. It is **advisory**: a result over budget is a warning
-in the job and its summary, never a failure, because shared runners are
-noisy. Each limit is about 1.5 times the slowest of the first three runs
+The recording engine's budget is
+[`ci/bench-budget.json`](../ci/bench-budget.json). No run checks it: it
+is the source of the bars the tree views' release figures are held to
+([Tree views, release build](#tree-views-release-build),
+`ci/trees-budget.json`). It was **advisory**: a result over budget was a
+warning, never a failure, because shared runners are noisy. Each limit is about 1.5 times the slowest of the first three runs
 (six jobs, on two CPU types; see [Run to run](#run-to-run)). Workloads
 are budgeted in absolute time, not as ratios. Clone and npm run once per
 job, so their budgets apply to one sample rather than a median of three,
@@ -597,47 +596,16 @@ The budget is a regression alarm, not a promise about other hardware.
 On a dedicated disk with a fast `fsync` the small-file numbers are lower;
 on network storage they are higher, by the cost of an `fsync` per change.
 
-## The benchmark
+## The recording benchmark
 
-[`.github/workflows/bench.yml`](../.github/workflows/bench.yml) runs on
-every push to main that changes more than documentation, and on demand
-(with `quick` for a smoke run of smaller workloads), on XFS created
-with `mkfs.xfs -m reflink=1` and on ext4. It runs after a change lands
-and does not hold it: a budget warning or a failed check is a follow-up. Each filesystem runs as two parallel jobs,
-the shards of `ci/bench.sh` (`BENCH_SHARD`): `many` (create, mvdir and
-rm of 100,000 files, the longest part) and `rest` (everything else).
-Each job:
+The recording engine's figures above came from a benchmark workflow,
+`bench.yml`, that mounted volumes with the recording launcher. It was
+removed with that launcher, so nothing in CI runs it. The tree views'
+release figures and the bars they are held to are in [Tree views, release
+build](#tree-views-release-build); the many-file `create` is gated there.
 
-1. creates and mounts the loop filesystem, and writes `env.json` (kernel,
-   CPU, memory, commit, shard);
-2. in the `rest` shard, runs the `record_step` bench, built in the job's
-   build step, on it with
-   `AGENTFS_BENCH_EXPECT_FREEZE=reflink` (XFS) or `copy` (ext4), which
-   fails the job if the freeze used the other method;
-3. runs its share of the workloads above ([`ci/bench-workloads.py`](../ci/bench-workloads.py),
-   [`ci/boundary-latency.py`](../ci/boundary-latency.py)) and their
-   checks: the history equals the backing tree, the clone's git
-   directory and `node_modules/` are not in it, every created and
-   removed file is, the excluded files journaled nothing (a recorded
-   marker written after the npm run must account for every new
-   sequence number), close4k and create made one record per boundary
-   (with a little slack), the rename of the created directory one record,
-   and every workload's backlog drained within 30 minutes;
-4. uploads everything as the `bench-<fs>-<shard>` artifact (such as
-   `bench-xfs-many`), kept 90 days: `record.jsonl`, `results.jsonl`,
-   `record.md`, `env.json` and the mount logs.
-
-A `report` job then reads the four artifacts and writes the report
-([`ci/bench-report.py`](../ci/bench-report.py)) to its summary: one
-section per filesystem from both of its shards, the budget warnings, and
-a "no result" line for each budget a reported filesystem has no result
-for, so a workload missing from one shard shows. A failed check fails
-its job; a slow result only warns.
-
-### Running it yourself
-
-The engine bench needs nothing but a directory on the filesystem to
-measure:
+The engine bench of the synchronous step still runs, and needs nothing
+but a directory on the filesystem to measure:
 
 ```sh
 AGENTFS_BENCH_DIR=/mnt/xfs/bench cargo bench -p agentfs-core --bench record_step
@@ -648,31 +616,13 @@ AGENTFS_BENCH_DIR=/mnt/xfs/bench cargo bench -p agentfs-core --bench record_step
 `AGENTFS_BENCH_JSON` (a file to append JSON lines to) and
 `AGENTFS_BENCH_EXPECT_FREEZE` (`reflink` or `copy`) configure it.
 
-The workloads need Linux with `/dev/fuse`, `fuse3`, `git`, `jq`,
-`python3` and passwordless sudo, and fetch git.git from GitHub
-(`BENCH_GIT_URL`, `BENCH_GIT_TAG` to change it):
+### Columns of the workload table
 
-```sh
-cargo build --release -p agentfs
-ci/bench.sh dir /mnt/xfs/bench       # the filesystem that directory is on
-ci/bench.sh xfs                      # or a fresh loop filesystem (also ext4)
-python3 ci/bench-report.py --budget ci/bench-budget.json bench-out
-```
-
-`BENCH_QUICK=1` shrinks every workload; `BENCH_OUT` sets the output
-directory (default `./bench-out`); `BENCH_SHARD` (`many`, `rest` or the
-default `all`) picks the steps. The report merges every directory given
-for one filesystem.
-
-### Columns of the report
-
-- *Plain directory*, *agentfs*: the workload's main metric, median of
-  the runs; *Ratio* is agentfs over plain (none for the big-file closes,
-  where a plain close costs nothing).
-- *Commit catch-up*: from the end of the workload until `agentfs status`
-  shows an empty backlog.
+- *plain*, *agentfs*: the workload's main metric, median of the runs.
+- *Catch-up*: from the end of the workload until `agentfs status`
+  showed an empty backlog.
 - *Records*: how far the committed journal sequence (`Agentfs-Seq` of the
-  branch head) moved: the records journaled during the workload. A last record whose commit would change
-  nothing (such as a duplicate committed on its own) leaves no commit and does not move the sequence,
-  so this can be a little lower than the records journaled.
-- *Commits*: commits added to the branch.
+  branch head) moved: the records journaled during the workload. A last
+  record whose commit would change nothing (such as a duplicate committed
+  on its own) leaves no commit and does not move the sequence, so this
+  can be a little lower than the records journaled.

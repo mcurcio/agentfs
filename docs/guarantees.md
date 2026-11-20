@@ -89,13 +89,15 @@ left in `pending/`.
   its records still journaled, or the new head with everything it names.
 - Crash safety is tested by killing at every step of record, commit, ref
   update and push.
-- Power loss is tested on ext4 and XFS: `dm-log-writes` records every write and
-  flush of a workload, and the log is replayed to every FUA (or flush) point,
-  where the same promises are checked (`ci/power-loss.sh`).
+- Power loss is tested for tree views on ext4 and XFS: `dm-log-writes` records
+  every write and flush of a workload through a mount, and the log is replayed
+  to every flush point, where the same promises are checked
+  ([`ci/power-loss-trees.sh`](../ci/power-loss-trees.sh), the `phase-1`
+  workflow).
 
 **Not tested:** writes reordered between two flushes (replay is in write order
-only), and a power cut through a FUSE mount (the power-loss job drives the
-`record` command, not a mount). The commit order does not rely on the order of
+only), and a power cut under the recording engine, which only the CSI driver
+runs. The commit order does not rely on the order of
 writes inside an epoch, but only review says so.
 
 ## Files changed in place

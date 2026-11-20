@@ -8,8 +8,8 @@ views. The commit that lands this slice deletes this page and moves the behaviou
 The recording engine records without a mount ([configuration](../../configuration.md#flags-and-environment)):
 
 - `agentfs run` runs the commit and push loops in the foreground with no mount: it serves `push` on the control
-  socket until a signal, makes a final commit and pushes once more. Several end-to-end scripts drive a volume this
-  way (`ci/e2e-remotes.sh`, `ci/e2e-ssh.sh`, `ci/e2e-telemetry.sh`, `ci/e2e-alerts.sh`).
+  socket until a signal, makes a final commit and pushes once more. Its Rust tests create their state areas through
+  the library.
 - `agentfs record` and `flush` record named paths of the backing tree directly, as the Hermes migration Job's
   initial import does ([deployment](../../deployment.md#10-hermes)).
 

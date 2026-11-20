@@ -2,8 +2,6 @@
 
 Bring files back to an earlier state after an agent (or anyone) changed
 them by mistake. Safety promise: [guarantees](../guarantees.md).
-`ci/e2e-recovery.sh` runs this procedure end to end through a real mount
-in CI.
 
 Use it when a file or directory in a volume holds the wrong content, or
 a whole change (one commit) must be undone. For content that must leave
@@ -228,12 +226,10 @@ one point in time. Every commit holds a consistent group, which SQLite
 opens as it would after a crash. `-shm` is never recorded. `restore` and
 `revert` of any member bring back the whole group from one commit: the
 members the commit has are written, the ones it lacks are removed, and
-the result is one restore commit. `ci/e2e-sqlite.sh` runs this procedure
-in CI, both through a mount and directly.
+the result is one restore commit.
 
 1. **Find the version.** List the commits that changed the database, then
-   check one before restoring it (optional; `ci/sqlite-check.py` checks
-   every version at once):
+   check one before restoring it (optional):
 
    ```sh
    DB=data/app.db

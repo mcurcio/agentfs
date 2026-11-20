@@ -691,9 +691,8 @@ included), never the base path.
   return pushing its late commit to the old branch by its release scan
   (`PushFailed` while the server is down, DeleteVolume `UNAVAILABLE`,
   then the PV and the worktree gone), the new volume's start-branch
-  alarm and `start accept`, a CLI volume reusing the old name diverged
-  and saved, a start class on a `diverged/*` ref refused, and a missing
-  worktree making a pod wait.
+  alarm and `start accept`, a start class on a `diverged/*` ref refused,
+  and a missing worktree making a pod wait.
 - **Forks on kind** (`ci/e2e-csi-forks.sh`, the `e2e-csi-forks` job in
   the image workflow): a sandbox's ephemeral claim cloning a source claim
   in use, its pushes to the fork remote only, the class admission
@@ -714,12 +713,13 @@ included), never the base path.
   pod, each recovered, the refusals of inline volumes and
   `ReadWriteMany`, and teardown: the last commit reaches the remote, then
   DeleteVolume removes the volume.
-- **NFS** (`ci/e2e-nfs.sh`, the `e2e-nfs` job): `agentfs-csi` refuses a
-  base path on an NFS export (4.2 and 4.0), naming the type; the state
-  areas of `serve-history` and its fronts on NFS are covered there too.
-- **Not tested**: a node whose disk is lost for good (the finalizer
-  removal of [moving](runbooks/moving.md)), Talos and other hardened node
-  images, node reboots, and the moving runbook as written.
+- **NFS**: the unit tests of `agentfs_core::shared_fs` check that a base
+  path on a network filesystem is recognised from the mount table and
+  refused, naming the type.
+- **Not tested**: a base path on a real NFS export, a node whose disk is
+  lost for good (the finalizer removal of [moving](runbooks/moving.md)),
+  Talos and other hardened node images, node reboots, and the moving
+  runbook as written.
 
 ## 14. Forks
 

@@ -2,8 +2,7 @@
 
 Someone else moved the volume's branch on a remote, so agentfs can no
 longer push to it without overwriting their commits, which it never
-does. How pushes and shared branches work is in [remotes](../remotes.md). `ci/e2e-runbooks.sh` runs
-case A below, block for block, in CI.
+does. How pushes and shared branches work is in [remotes](../remotes.md).
 
 ## Symptoms
 
@@ -41,7 +40,7 @@ the URL for this session only. `agentfs push` uses the volume's own.
 
 For an SSH remote, point `git` at a key with write access and at the
 remote's own known_hosts file, so this session trusts exactly the host
-agentfs trusts (`ci/e2e-ssh.sh` pushes as another writer this way):
+agentfs trusts:
 
 ```sh
 URL=ssh://git@git.example.com/acme/agent-history.git

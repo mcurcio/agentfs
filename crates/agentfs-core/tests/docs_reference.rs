@@ -548,7 +548,7 @@ fn ci_scripts_are_executable() {
 /// early: `head`, and `grep` with `-q`, `-m`, `-l` or `-L` (or a long
 /// form). Under `set -o pipefail` the producer then dies of SIGPIPE (141)
 /// whenever it is still writing, and the pipeline fails though the reader
-/// matched (ci run 43420737106, ci/e2e-mergiraf.sh).
+/// matched (ci run 43420737106).
 fn early_exit_readers(line: &str) -> Vec<String> {
     let bytes = line.as_bytes();
     let mut found = Vec::new();

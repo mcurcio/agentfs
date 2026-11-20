@@ -202,8 +202,7 @@ names a patch source (`agentfs.patchRemote` or any other `agentfs.patch*` key) s
 working (principle 5), logs the gap at every boot, and raises a standing alarm while it runs: patches are never
 silently not applied. A configured remote gets the same until M4 pushes to it. M7 also builds operator settings as a
 git-config include, their first owner being the launcher's configuration. M7 adds the migration runbook (below). Gate: the tracer's
-release-build many-file step within M1's tree budgets, run in CI before the merge (`bench.yml` runs only after
-landing and never fails, so it cannot hold the move); a miss holds the move. M7 also rewrites the migration Job of
+release-build many-file step within M1's tree budgets, run in CI before the merge; a miss holds the move. M7 also rewrites the migration Job of
 [deployment](../../deployment.md#10-hermes) (today `record` and `push`) to copy the files in through the mount.
 
 **M8. The CSI driver moves.** CreateVolume calls `ensure`; publish attaches a view host; DeleteVolume asks Volume's
@@ -297,19 +296,19 @@ commit moves this table to [the target architecture's index](../README.md), so n
 
 | Capability | What it is | Who uses it today | Home | Until then |
 |---|---|---|---|---|
-| Git LFS | content over a threshold stored as LFS objects, uploaded beside each push | example 11; ci's `e2e-lfs` and `e2e-lfs-ssh` | [Large and binary files](large-and-binary-files.md) | dropped at M9 until its slice lands |
+| Git LFS | content over a threshold stored as LFS objects, uploaded beside each push | example 11; `cli_lfs.rs` | [Large and binary files](large-and-binary-files.md) | dropped at M9 until its slice lands |
 | Forks of forks | a fork of a linked fork, whose change rolls up through its parent | example 6; f8's `e2e-csi-fork-of-fork` | [Nested forks](nested-forks.md) | dropped at M9 until its slice lands |
-| Several pods on one volume | one history service per CSI volume, one front per pod | example 4; ci's `e2e-multipod` | [The system](../system.md) (the "history service with view hosts" composition), [Views](../domains/views.md) | dropped at M9 until its slice lands; M8 refuses a second pod |
+| Several pods on one volume | one history service per CSI volume, one front per pod | example 4; `history_service.rs`, image's `e2e-csi` | [The system](../system.md) (the "history service with view hosts" composition), [Views](../domains/views.md) | dropped at M9 until its slice lands; M8 refuses a second pod |
 | Moving a volume between nodes | a new volume on another node, started from the old one's branch, by the moving runbook | example 10; f8's `e2e-csi-move` | [Volume](../domains/volume.md) (the start point) | dropped at M9 until its slice lands |
 | `startFrom` and `start accept` | a CSI start class: a volume whose history begins at another volume's commit; `StartBranchMoved` while that branch moves | example 10; f8's `e2e-csi-move` | [Volume](../domains/volume.md) (`StartPoint::Line`, the start record) | dropped at M9 until its slice lands; only the empty start is built, and M8 refuses a start class |
 | The fork overlay | `mount --sandbox-overlay`: a second mount that shows a fork's workload only recordable files and keeps the rest in a private tmp layer | example 12; `crates/agentfs/tests/mount.rs`, the sidecar chart's overlay values | [The system](../system.md) (the overlay becomes a fork), [Overlay gaps](sandbox-overlay-gaps.md) | dropped at M9 until its slice lands |
 | `fork deliver` | a finished fork's change handed to a receiver as an inbox patch, a branch, a command or a webhook | example 8; `crates/agentfs/tests/cli_fork_deliver.rs` | [Fork delivery](fork-delivery.md) | dropped at M9 until its slice lands |
 | Unlinked forks | a fork that never delivers to its source and pushes only to its own remotes | example 5's `link: unlinked` class; `crates/agentfs/tests/cli_fork.rs`, `crates/agentfs-csi/tests/grpc.rs` | [Fork delivery](fork-delivery.md) | dropped at M9 until its slice lands; M8 refuses an unlinked class |
-| Recording without a mount | `agentfs run` (the commit and push loops with no mount), `record` and `flush` (named paths of the backing tree) | the Hermes migration Job; ci's `e2e-remotes`, `e2e-ssh`, `e2e-telemetry`; alerts' `ci/e2e-alerts.sh` | [Recording without a mount](recording-without-a-mount.md) | dropped at M9 until its slice lands; M7 rewrites the migration Job and repoints the scripts |
+| Recording without a mount | `agentfs run` (the commit and push loops with no mount), `record` and `flush` (named paths of the backing tree) | the recording engine's Rust tests (`cli_record.rs`, `cli_push.rs`) | [Recording without a mount](recording-without-a-mount.md) | dropped at M9 until its slice lands; M7 rewrites the migration Job and repoints the scripts |
 | Checkpoint and the change line | an integrator cuts one commit per change intent on `refs/agentfs/<volume>/change-line`; a remote may get only that line | `crates/agentfs/tests/cli_checkpoint.rs` | [Checkpoints and patch notices](integrator-hooks.md) | dropped at M9 until its slice lands |
-| Patch notices | the `patch-notify` hook and the `agentfs.patchNotifyUrl` webhook, sent when the queue's verdicts change | ci's `e2e-patches` | [Checkpoints and patch notices](integrator-hooks.md) | dropped at M9 until its slice lands |
-| Database groups | `agentfs.commit=fsync` and `agentfs.group`: a database and its journal recorded whole at `fsync` | ci's `fuse` job (`ci/e2e-sqlite.sh`) | [Open files and groups](files-open-groups.md) | dropped at M9 until its slice lands |
-| State areas on NFS | a CLI or sidecar state area on an NFS 4.1 export, its lock reaching other clients | ci's `e2e-nfs` | [State on NFS](state-on-nfs.md) | dropped at M9 until its slice lands |
+| Patch notices | the `patch-notify` hook and the `agentfs.patchNotifyUrl` webhook, sent when the queue's verdicts change | `cli_patch.rs` | [Checkpoints and patch notices](integrator-hooks.md) | dropped at M9 until its slice lands |
+| Database groups | `agentfs.commit=fsync` and `agentfs.group`: a database and its journal recorded whole at `fsync` | `cli_record.rs`, `cli_restore.rs` | [Open files and groups](files-open-groups.md) | dropped at M9 until its slice lands |
+| State areas on NFS | a CLI or sidecar state area on an NFS 4.1 export, its lock reaching other clients | nothing in CI | [State on NFS](state-on-nfs.md) | dropped at M9 until its slice lands |
 | Hidden fork history | `agentfs.forkRefs = hidden`: a fork's history outside `refs/heads/`; whether a forge runs CI on it is not verified | supported configurations, "Remote topology" | [Forge CI on hidden refs](forge-ci-on-hidden-refs.md) | dropped at M9 until its slice lands |
 | A fork of a claim in use | a fork claim whose source a pod is writing; Kubernetes may one day refuse such a clone | image's `e2e-csi-forks` | [Clone in use](clone-in-use.md) | not dropped: M8's fork claims are clones too, so the page stays and applies to them |
 
