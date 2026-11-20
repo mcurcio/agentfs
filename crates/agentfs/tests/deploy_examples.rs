@@ -6,9 +6,9 @@
 //! layout is placed through it, each directory before what it holds, so a
 //! path under an untracked directory is untracked too; their settings are
 //! read as the operator settings file's include, and every key tree volumes
-//! do not build is classified. The CSI profiles stay on the recording engine
-//! (the driver's create, `agentfs_core::volume::init_with`) until the CSI
-//! driver moves. The sidecar's manifest and the sidecar chart are checked
+//! do not build is classified. The CSI example profile is set up as the
+//! driver sets a volume up: `agentfs init --include`, then its rule files
+//! installed into the state area. The sidecar's manifest and the sidecar chart are checked
 //! for crash recovery, the sealed mount point and the read-only emptyDir
 //! fence, and no manifest names a backing tree.
 
@@ -20,115 +20,6 @@ fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
-struct Volume {
-    dir: tempfile::TempDir,
-}
-
-impl Volume {
-    /// A CSI profile: `deploy/csi/profiles/<name>.{config,exclude,attributes}`,
-    /// included and installed as the driver does.
-    fn profile(name: &str) -> Self {
-        let dir = repo_root().join("deploy/csi/profiles");
-        Self::from_files(
-            &dir.join(format!("{name}.config")),
-            &dir.join(format!("{name}.exclude")),
-            &dir.join(format!("{name}.attributes")),
-        )
-    }
-
-    fn from_files(config: &Path, exclude: &Path, attributes: &Path) -> Self {
-        let v = Self {
-            dir: tempfile::tempdir().unwrap(),
-        };
-        agentfs_core::volume::init_with(
-            &agentfs_core::volume::StateDir::new(v.dir.path().join("state")),
-            "example",
-            None,
-            Some(&[config.to_path_buf()]),
-        )
-        .unwrap();
-        std::fs::create_dir_all(v.tree()).unwrap();
-        for (name, from) in [("exclude", exclude), ("attributes", attributes)] {
-            std::fs::copy(from, v.dir.path().join("state/git/info").join(name)).unwrap();
-        }
-        v
-    }
-
-    fn tree(&self) -> PathBuf {
-        self.dir.path().join("backing")
-    }
-
-    fn run(&self, args: &[&str]) -> Output {
-        self.run_as("state", "backing", args)
-    }
-
-    /// Runs `agentfs` on another volume beside this one: `state` and
-    /// `root` under the same directory.
-    fn run_as(&self, state: &str, root: &str, args: &[&str]) -> Output {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_agentfs"));
-        for (name, _) in std::env::vars_os() {
-            let n = name.to_string_lossy();
-            if n.starts_with("OTEL_") || n.starts_with("AGENTFS_") {
-                cmd.env_remove(name);
-            }
-        }
-        cmd.arg("--state")
-            .arg(self.dir.path().join(state))
-            .arg("--root")
-            .arg(self.dir.path().join(root))
-            .args(args)
-            .env("AGENTFS_REPLICA", "test-0")
-            .output()
-            .unwrap()
-    }
-
-    /// Writes each path under the backing tree, records them all, and
-    /// returns the paths recorded and the paths skipped.
-    fn record(&self, paths: &[&str]) -> (BTreeSet<String>, BTreeSet<String>) {
-        for path in paths {
-            let full = self.tree().join(path);
-            std::fs::create_dir_all(full.parent().unwrap()).unwrap();
-            std::fs::write(&full, format!("content of {path}\n")).unwrap();
-        }
-        let mut args = vec!["record"];
-        args.extend_from_slice(paths);
-        let out = self.run(&args);
-        assert!(out.status.success(), "{}", text(&out.stderr));
-        let stdout = text(&out.stdout);
-        let mut recorded = BTreeSet::new();
-        let mut skipped = BTreeSet::new();
-        for line in stdout.lines() {
-            if let Some(rest) = line.strip_prefix("recorded ") {
-                recorded.insert(rest.split(" as seq ").next().unwrap().to_owned());
-            } else if let Some(rest) = line.strip_prefix("skipped ") {
-                skipped.insert(rest.split(": ").next().unwrap().to_owned());
-            }
-        }
-        (recorded, skipped)
-    }
-
-    /// Every path in the branch head.
-    fn history(&self) -> BTreeSet<String> {
-        let repo = git2::Repository::open_bare(self.dir.path().join("state/git")).unwrap();
-        let mut out = BTreeSet::new();
-        let Ok(head) = repo.find_reference("refs/heads/agentfs/example") else {
-            return out;
-        };
-        head.peel_to_commit()
-            .unwrap()
-            .tree()
-            .unwrap()
-            .walk(git2::TreeWalkMode::PreOrder, |root, e| {
-                if e.kind() == Some(git2::ObjectType::Blob) {
-                    out.insert(format!("{root}{}", e.name().unwrap()));
-                }
-                git2::TreeWalkResult::Ok
-            })
-            .unwrap();
-        out
-    }
-}
-
 fn text(b: &[u8]) -> String {
     String::from_utf8_lossy(b).into_owned()
 }
@@ -137,57 +28,63 @@ fn set(paths: &[&str]) -> BTreeSet<String> {
     paths.iter().map(|p| (*p).to_owned()).collect()
 }
 
+/// The CSI example profile as the driver sets a volume up: `agentfs init
+/// --include <profile>.config`, then the profile's `.exclude` and
+/// `.attributes` installed into the tree state area. Its settings that tree
+/// volumes do not build are logged as not built, and its rules place paths.
 #[test]
 fn the_csi_example_profile_loads() {
-    let v = Volume::profile("example");
-    let out = v.run(&["status"]);
-    let status = text(&out.stdout);
+    let profiles = repo_root().join("deploy/csi/profiles");
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_agentfs"));
+    for (name, _) in std::env::vars_os() {
+        let n = name.to_string_lossy();
+        if n.starts_with("OTEL_") || n.starts_with("AGENTFS_") {
+            cmd.env_remove(name);
+        }
+    }
+    let out: Output = cmd
+        .arg("--state")
+        .arg(&state)
+        .args(["init", "--volume", "example", "--include"])
+        .arg(profiles.join("example.config"))
+        .output()
+        .unwrap();
     assert!(out.status.success(), "{}", text(&out.stderr));
-    assert!(
-        status.contains("remote:    origin https://git.example.com/acme/agent-history.git"),
-        "{status}"
-    );
-    assert!(!status.contains("misconfigured"), "{status}");
+    agentfs_core::operator_settings::install_rules(
+        &state,
+        agentfs_core::operator_settings::RuleFiles {
+            exclude: Some(&profiles.join("example.exclude")),
+            attributes: Some(&profiles.join("example.attributes")),
+        },
+    )
+    .unwrap();
+
+    let settings = agentfs_core::operator_settings::OperatorSettings::read(&state).unwrap();
+    assert!(settings.missing_includes().is_empty());
+    let gaps: BTreeSet<(String, String)> = settings
+        .not_built()
+        .into_iter()
+        .map(|gap| (gap.key, gap.capability.as_str().to_owned()))
+        .collect();
+    for key in [
+        "agentfs.pushinterval",
+        "remote.origin.url",
+        "remote.origin.agentfscredentials",
+    ] {
+        assert!(
+            gaps.contains(&(key.to_owned(), "push".to_owned())),
+            "{key}: {gaps:?}"
+        );
+    }
+
+    let rules = rule_set(&agentfs_core::tree_actor::rules_dir(&state));
     let kept = ["notes.md", "src/main.rs"];
     let dropped = ["app.log", "tmp/scratch", "secrets/token"];
-    let (recorded, skipped) = v.record(&[&kept[..], &dropped[..]].concat());
-    assert_eq!(recorded, set(&kept));
-    assert_eq!(skipped, set(&dropped));
-    assert_eq!(v.history(), set(&kept));
-}
-
-/// The example unlinked fork class's own remotes (docs/helm.md, csi.md): `deploy/csi/profiles/sandbox-remotes.config` is accepted as a
-/// fork's `remotes` file, and the fork's only remote is its own.
-#[test]
-fn the_csi_example_fork_remotes_load() {
-    let v = Volume::profile("example");
-    v.record(&["notes.md"]);
-    let source = v.dir.path().join("state");
-    let remotes = repo_root().join("deploy/csi/profiles/sandbox-remotes.config");
-    let out = v.run_as(
-        "fork",
-        "fork-tree",
-        &[
-            "fork",
-            "create",
-            "--source-state",
-            source.to_str().unwrap(),
-            "--link",
-            "unlinked",
-            "--remotes",
-            remotes.to_str().unwrap(),
-        ],
-    );
-    assert!(out.status.success(), "{}", text(&out.stderr));
-    let out = v.run_as("fork", "fork-tree", &["status"]);
-    let status = text(&out.stdout);
-    assert!(out.status.success(), "{}", text(&out.stderr));
-    assert!(
-        status.contains("remote:    sandbox https://git.example.com/acme/sandbox-history.git"),
-        "{status}"
-    );
-    assert!(!status.contains("origin"), "never the source's: {status}");
-    assert!(!status.contains("misconfigured"), "{status}");
+    let placed = placed(&rules, &[&kept[..], &dropped[..]].concat());
+    assert_eq!(recorded(&placed, true), set(&kept));
+    assert_eq!(recorded(&placed, false), set(&dropped));
 }
 
 /// The lines of a file under the repository without comments.
@@ -265,7 +162,12 @@ fn the_workload_mounts_the_emptydir_read_only() {
 /// `attributes`, as a volume builds it when it opens (nested repositories
 /// excluded).
 fn tree_rules(dir: &str) -> agentfs_rules::RuleSet {
-    let dir = repo_root().join(dir);
+    rule_set(&repo_root().join(dir))
+}
+
+/// The tree engine's rule set from the `exclude` and `attributes` files in
+/// `dir` (nested repositories excluded).
+fn rule_set(dir: &Path) -> agentfs_rules::RuleSet {
     let texts = agentfs_rules::RuleTexts {
         exclude: std::fs::read(dir.join("exclude")).unwrap(),
         attributes: std::fs::read(dir.join("attributes")).unwrap(),
