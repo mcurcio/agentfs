@@ -366,7 +366,11 @@ impl Replay {
                     None
                 };
                 let (_, t) = self.tree(tree)?;
-                let object = t.names.get(path).copied().unwrap_or(event.object());
+                let object = t
+                    .names
+                    .get(path.as_str())
+                    .copied()
+                    .unwrap_or(event.object());
                 t.shape.apply(change, event, at_ns)?;
                 if let Some(map) = map {
                     t.bytes.insert(object, map);
@@ -461,7 +465,10 @@ pub(in crate::tree_actor) fn fold(frames: &[Frame]) -> Result<Folded> {
         built: *built,
         objects: objects
             .iter()
-            .map(|(tree, objects)| Ok((tree.parse::<TreeId>()?, objects.clone())))
+            .map(|(tree, objects)| {
+                let objects = objects.iter().map(|(id, object)| (*id, *object)).collect();
+                Ok((tree.parse::<TreeId>()?, objects))
+            })
             .collect::<Result<_>>()?,
         locals: locals
             .iter()

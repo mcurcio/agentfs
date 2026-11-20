@@ -31,21 +31,42 @@ use crate::tree_git::TreeGit;
 
 /// One tree's object numbers: each named file's object, by its identity's
 /// number. The journal's, never history's (git-model §3): a checkpoint holds
-/// them as of its built point, and the steps after it move them.
-pub(in crate::tree_actor) type Objects = BTreeMap<u64, u64>;
+/// them as of its built point, and the steps after it move them. Persistent:
+/// a batch changes only what its steps moved, and hands the map over in O(1).
+pub(in crate::tree_actor) type Objects = imbl::OrdMap<u64, u64>;
 
 /// The object each named file of `shape` is on, by identity.
 pub(in crate::tree_actor) fn objects_of(shape: &Shape) -> Result<Objects> {
     shape
         .names
         .values()
-        .map(|object| {
-            Ok((
-                shape.identities.get(object).ok_or(Error::Format)?.0,
-                *object,
-            ))
-        })
+        .map(|object| Ok((shape.identity_of(*object).ok_or(Error::Format)?.0, *object)))
         .collect()
+}
+
+/// [`objects_of`] `after`, from `objects`, those of `before`, which `after`
+/// was changed from: only the objects a name or a state moved are visited,
+/// so a batch costs its own steps, never every name.
+pub(in crate::tree_actor) fn objects_after(
+    before: &Shape,
+    objects: &Objects,
+    after: &Shape,
+) -> Result<Objects> {
+    let mut next = objects.clone();
+    let moved = after.objects_changed_since(before);
+    for object in &moved {
+        if let Some(id) = before.identity_of(*object)
+            && next.get(&id.0) == Some(object)
+        {
+            next.remove(&id.0);
+        }
+    }
+    for object in &moved {
+        if after.is_named(*object) {
+            next.insert(after.identity_of(*object).ok_or(Error::Format)?.0, *object);
+        }
+    }
+    Ok(next)
 }
 
 // What is lost of any pointer's commit, tree and blobs refuses to serve. The

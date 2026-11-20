@@ -6,7 +6,7 @@
 //!
 use std::collections::BTreeMap;
 use std::io;
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Condvar, LazyLock, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use git2::Oid;
@@ -17,7 +17,7 @@ use super::{Objects, refs};
 use crate::tree_actor::call_path::Then;
 use crate::tree_actor::pointers::Pointers;
 use crate::tree_actor::recording::FileMap;
-use crate::tree_actor::tree::EventNumber;
+use crate::tree_actor::tree::{EventNumber, Tree};
 use crate::tree_git::TreeGit;
 
 /// Each direct save's commit by its event, as built: the snapshot the
@@ -138,7 +138,10 @@ struct State {
     /// Each direct save's commit, by its step: what a sync asks of a save.
     owners: Owners,
     /// Each tree's object numbers as built.
-    objects: Arc<BuiltObjects>,
+    objects: BuiltObjects,
+    /// The builder's trees as built: what the actor's saved trees rest on
+    /// (`SavedTree::rebuilt`). None until the first built event.
+    trees: imbl::OrdMap<TreeId, Tree>,
     failed: Option<BuildError>,
     /// The request count the failed batch started at: a wait asked after it
     /// waits for the retry.
@@ -178,11 +181,12 @@ pub struct BuiltSnapshot {
     at: RecordNo,
     pointers: Arc<Pointers>,
     owners: Owners,
-    objects: Arc<BuiltObjects>,
+    objects: BuiltObjects,
 }
 
-/// Every tree's object numbers at one built point.
-pub(in crate::tree_actor) type BuiltObjects = BTreeMap<TreeId, Arc<Objects>>;
+/// Every tree's object numbers at one built point: persistent, as
+/// [`Objects`].
+pub(in crate::tree_actor) type BuiltObjects = imbl::OrdMap<TreeId, Objects>;
 
 impl BuiltSnapshot {
     /// The built point this snapshot is at.
@@ -219,15 +223,18 @@ impl BuiltSnapshot {
 
     /// `tree`'s object numbers as built; none for a tree not built.
     pub(in crate::tree_actor) fn objects(&self, tree: TreeId) -> &Objects {
-        static NONE: Objects = Objects::new();
-        self.objects.get(&tree).map_or(&NONE, |o| o)
+        static NONE: LazyLock<Objects> = LazyLock::new(Objects::new);
+        self.objects.get(&tree).unwrap_or(&NONE)
     }
 
-    /// Every tree's object numbers as built.
-    pub(in crate::tree_actor) fn all_objects(&self) -> BTreeMap<TreeId, Objects> {
+    /// Every tree's object numbers as built, as a checkpoint holds them.
+    pub(in crate::tree_actor) fn all_objects(&self) -> BTreeMap<TreeId, BTreeMap<u64, u64>> {
         self.objects
             .iter()
-            .map(|(tree, objects)| (*tree, (**objects).clone()))
+            .map(|(tree, objects)| {
+                let objects = objects.iter().map(|(id, object)| (*id, *object)).collect();
+                (*tree, objects)
+            })
             .collect()
     }
 
@@ -260,7 +267,8 @@ impl History {
                     built,
                     pointers: Arc::new(pointers),
                     owners,
-                    objects: Arc::new(objects),
+                    objects,
+                    trees: imbl::OrdMap::new(),
                     failed: None,
                     failed_at: 0,
                     wanted: built,
@@ -382,13 +390,13 @@ impl History {
     }
 
     /// A batch is built and its built-log entry durable: the built point
-    /// moves. `owners` is the builder's own persistent map, shared: O(1).
+    /// moves. `owners`, `objects` and `trees` are the builder's own persistent
+    /// maps, shared: O(1).
     pub(in crate::tree_actor) fn built_event(
         &self,
         through: RecordNo,
         pointers: Pointers,
-        owners: Owners,
-        objects: Arc<BuiltObjects>,
+        (owners, objects, trees): (Owners, BuiltObjects, imbl::OrdMap<TreeId, Tree>),
         elapsed: Duration,
     ) {
         let mut state = self.state();
@@ -397,6 +405,7 @@ impl History {
         state.pointers = Arc::new(pointers);
         state.owners = owners;
         state.objects = objects;
+        state.trees = trees;
         state.failed = None;
         while state
             .unbuilt
@@ -627,8 +636,18 @@ impl History {
             at: state.built,
             pointers: Arc::clone(&state.pointers),
             owners: state.owners.clone(),
-            objects: Arc::clone(&state.objects),
+            objects: state.objects.clone(),
         }
+    }
+
+    /// The builder's trees at the built point, with the point, once the
+    /// built point is past `since`: shared, O(1).
+    pub(in crate::tree_actor) fn built_trees(
+        &self,
+        since: RecordNo,
+    ) -> Option<(RecordNo, imbl::OrdMap<TreeId, Tree>)> {
+        let state = self.state();
+        (state.built > since && !state.trees.is_empty()).then(|| (state.built, state.trees.clone()))
     }
 
     /// Each tree's lag, the oldest unbuilt step's age and the builder's health.

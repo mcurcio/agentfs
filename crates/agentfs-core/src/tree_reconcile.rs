@@ -504,6 +504,8 @@ fn canonical_overs<V: Id>(mut overs: Vec<Over<V>>) -> Result<Vec<Over<V>>, Error
         }
         out.push(o);
     }
+    // Exact: a built map is kept for as long as its file is.
+    out.shrink_to_fit();
     Ok(out)
 }
 
@@ -614,8 +616,10 @@ impl<V: Id> LineMap<V> {
             }
             runs.push(run);
         }
+        let mut lines = runs.0;
+        lines.shrink_to_fit();
         let map = Self {
-            lines: runs.0,
+            lines,
             ancestors: canonical_overs(ancestors)?,
         };
         map.validate()?;
@@ -989,8 +993,10 @@ impl<V: Id> LineMap<V> {
             }
         }
         cursor.copy_until_live(old_index.count, &mut out);
+        let mut lines = out.0;
+        lines.shrink_to_fit();
         let result = Self {
-            lines: out.0,
+            lines,
             ancestors: canonical_overs(ancestors)?,
         };
         result.validate()?;

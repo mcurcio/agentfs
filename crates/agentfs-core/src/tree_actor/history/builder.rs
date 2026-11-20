@@ -12,6 +12,7 @@
 //! with its record (`Disagrees`) stops building with the alarm.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::ops::Bound;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -26,7 +27,7 @@ use super::feed::{BuildRef, CommitSpec, Feed, Parent};
 use super::format::{self, BlobRef};
 use super::message::{self, Action, Message};
 use super::upstreams::Upstreams;
-use super::{Objects, checkout, objects_of, refs};
+use super::{checkout, objects_after, objects_of, refs};
 use crate::tree_actor::journal::durable::{Durability, RecordNo};
 use crate::tree_actor::journal::segment::{FramePos, Relocations, Segment};
 use crate::tree_actor::journal::{
@@ -185,7 +186,7 @@ pub(in crate::tree_actor) struct BuildState {
     /// fast-forward): the next commit lists the whole tree.
     whole: imbl::OrdSet<TreeId>,
     /// Each tree's object numbers as built, as History publishes them.
-    objects: imbl::OrdMap<TreeId, Arc<Objects>>,
+    objects: BuiltObjects,
     /// Chunk records no take has taken yet.
     bytes: imbl::Vector<(u64, Tail)>,
     /// Files whose built map still reads journal frames: what rebase visits.
@@ -356,7 +357,7 @@ impl BuildState {
         let mut trees = trees;
         let objects = trees
             .iter()
-            .map(|(id, tree)| Ok((*id, Arc::new(objects_of(&tree.shape)?))))
+            .map(|(id, tree)| Ok((*id, objects_of(&tree.shape)?)))
             .collect::<Result<_>>()?;
         for folded in opens.values() {
             if folded.open.anonymous {
@@ -625,7 +626,7 @@ impl BuildState {
                 t.bytes.insert(object, saved_map(FileMap::empty(), seq));
                 t.lines.insert(object, Arc::default());
                 batch.files.insert((id, object));
-                let identity = *t.identities.get(&object).ok_or(Error::Format)?;
+                let identity = t.identity_of(object).ok_or(Error::Format)?;
                 t.namespace
                     .insert(identity, NameHistory::created(event, path.clone()));
                 let message = direct(Action::Create, id, None)?;
@@ -646,7 +647,7 @@ impl BuildState {
                 t.bytes.insert(object, Arc::new(map.into()));
                 t.lines.insert(object, Arc::new(lines));
                 batch.files.insert((id, object));
-                let identity = *t.identities.get(&object).ok_or(Error::Format)?;
+                let identity = t.identity_of(object).ok_or(Error::Format)?;
                 t.namespace
                     .insert(identity, NameHistory::created(event, path.clone()));
                 let message = direct(Action::Symlink, id, None)?;
@@ -678,7 +679,7 @@ impl BuildState {
                 let id = tree.parse::<TreeId>()?;
                 let t = self.tree_mut(id)?;
                 let keys = t.shape.apply(change, event, at_ns)?;
-                let identity = *t.identities.get(object).ok_or_else(|| disagrees(seq))?;
+                let identity = t.identity_of(*object).ok_or_else(|| disagrees(seq))?;
                 t.namespace
                     .insert(identity, NameHistory::created(event, path.clone()));
                 let message = direct(Action::Create, id, None)?;
@@ -756,12 +757,12 @@ impl BuildState {
                 let prefix = format!("{from}/");
                 let moved: Vec<(String, u64)> = t
                     .names
-                    .range(prefix.clone()..)
+                    .range::<_, str>((Bound::Included(prefix.as_str()), Bound::Unbounded))
                     .take_while(|(path, _)| path.starts_with(&prefix))
-                    .map(|(path, object)| (path.clone(), *object))
+                    .map(|(path, object)| (path.to_string(), *object))
                     .collect();
                 for (path, object) in moved {
-                    let identity = *t.identities.get(&object).ok_or(Error::Format)?;
+                    let identity = t.identity_of(object).ok_or(Error::Format)?;
                     t.namespace
                         .get_mut(&identity)
                         .ok_or(Error::Format)?
@@ -776,10 +777,10 @@ impl BuildState {
             Change::Rename { tree, from, to } => {
                 let id = tree.parse::<TreeId>()?;
                 let t = self.tree_mut(id)?;
-                let object = *t.names.get(from).ok_or_else(|| disagrees(seq))?;
-                let source = *t.identities.get(&object).ok_or_else(|| disagrees(seq))?;
-                match t.names.get(to).copied() {
-                    Some(replaced) if t.fresh_names.contains(&object) => {
+                let object = *t.names.get(from.as_str()).ok_or_else(|| disagrees(seq))?;
+                let source = t.identity_of(object).ok_or_else(|| disagrees(seq))?;
+                match t.names.get(to.as_str()).copied() {
+                    Some(replaced) if t.is_fresh(object) => {
                         t.namespace
                             .get_mut(&source)
                             .ok_or(Error::Format)?
@@ -796,7 +797,7 @@ impl BuildState {
                     }
                     replaced => {
                         if let Some(replaced) = replaced {
-                            let replaced = *t.identities.get(&replaced).ok_or(Error::Format)?;
+                            let replaced = t.identity_of(replaced).ok_or(Error::Format)?;
                             t.namespace
                                 .get_mut(&replaced)
                                 .ok_or(Error::Format)?
@@ -818,8 +819,8 @@ impl BuildState {
             Change::Unlink { tree, path } => {
                 let id = tree.parse::<TreeId>()?;
                 let t = self.tree_mut(id)?;
-                let object = *t.names.get(path).ok_or_else(|| disagrees(seq))?;
-                let identity = *t.identities.get(&object).ok_or(Error::Format)?;
+                let object = *t.names.get(path.as_str()).ok_or_else(|| disagrees(seq))?;
+                let identity = t.identity_of(object).ok_or(Error::Format)?;
                 t.namespace
                     .get_mut(&identity)
                     .ok_or(Error::Format)?
@@ -881,7 +882,7 @@ impl BuildState {
                 let chunks = self.take_chunks(seq, *chunks)?;
                 let map = chunk_map(&chunks, *len, record.seq)?;
                 let t = self.tree_mut(id)?;
-                let existing = t.names.get(path).copied();
+                let existing = t.names.get(path.as_str()).copied();
                 let keys = t.shape.apply(change, event, at_ns)?;
                 let object = existing.unwrap_or(event.object());
                 let lines = match existing {
@@ -894,7 +895,7 @@ impl BuildState {
                         event,
                     )?,
                     None => {
-                        let identity = *t.identities.get(&object).ok_or(Error::Format)?;
+                        let identity = t.identity_of(object).ok_or(Error::Format)?;
                         t.namespace
                             .insert(identity, NameHistory::created(event, path.clone()));
                         batch.moved.insert(id);
@@ -1060,7 +1061,7 @@ impl BuildState {
         let mut shape = current.shape.clone();
         shape.apply(change, event, at_ns)?;
         if *shape.names != *t.shape.names
-            || shape.fresh_names != t.shape.fresh_names
+            || shape.fresh_objects().ne(t.shape.fresh_objects())
             || shape.dirs.keys().ne(t.shape.dirs.keys())
         {
             return Err(disagrees(seq));
@@ -1078,11 +1079,10 @@ impl BuildState {
         for tree in [current, &t] {
             for (path, object) in tree.names.iter() {
                 if tree
-                    .identities
-                    .get(object)
-                    .is_some_and(|i| identities.contains(i))
+                    .identity_of(*object)
+                    .is_some_and(|i| identities.contains(&i))
                 {
-                    changed.insert(Key::Name(path.clone()));
+                    changed.insert(Key::Name(path.to_string()));
                 }
             }
         }
@@ -1306,8 +1306,6 @@ pub(in crate::tree_actor) struct Builder {
     pub checked_out: BTreeMap<TreeId, Oid>,
     /// A copy failed: the next batch rebuilds refs, config and checkouts whole.
     pub stale: bool,
-    /// The built log's entries since its last rewrite.
-    pub log: Vec<BuiltEntry>,
 }
 
 impl Builder {
@@ -1329,12 +1327,12 @@ impl Builder {
         let started = std::time::Instant::now();
         let checkpointed = self.history.checkpointed_through();
         if self
-            .log
-            .first()
-            .is_some_and(|entry| entry.through <= checkpointed)
+            .built_log
+            .first_through()
+            .is_some_and(|through| through <= checkpointed)
         {
-            self.log.retain(|entry| entry.through > checkpointed);
-            self.built_log.rewrite(&self.log)?;
+            let keep = self.built_log.entries_after(checkpointed)?;
+            self.built_log.rewrite(&keep)?;
         }
         let through = self.durability.appended();
         self.durability
@@ -1408,16 +1406,23 @@ impl Builder {
         #[cfg(test)]
         next.check_framed();
         for tree in &batch.moved {
-            let objects = objects_of(&next.tree(*tree).map_err(to_build_error)?.shape)
-                .map_err(to_build_error)?;
-            next.objects.insert(*tree, Arc::new(objects));
+            let after = &next.tree(*tree).map_err(to_build_error)?.shape;
+            // A tree this batch made (a fork) has none to start from.
+            let objects = match (self.state.trees.get(tree), self.state.objects.get(tree)) {
+                (Some(before), Some(objects)) => objects_after(&before.shape, objects, after),
+                _ => objects_of(after),
+            }
+            .map_err(to_build_error)?;
+            // The unit tests' check, at every batch: the objects moved are
+            // all the tree's.
+            #[cfg(test)]
+            assert!(
+                objects_of(after).is_ok_and(|all| all == objects),
+                "{tree}: the objects a batch moved disagree with its tree's"
+            );
+            next.objects.insert(*tree, objects);
         }
-        let objects: Arc<BuiltObjects> = Arc::new(
-            next.objects
-                .iter()
-                .map(|(tree, objects)| (*tree, Arc::clone(objects)))
-                .collect(),
-        );
+        let objects = next.objects.clone();
         for (bytes, mark) in batch.blobs.values() {
             if let Some(oid) = marks.get(mark) {
                 bytes.set_blob(*oid);
@@ -1434,13 +1439,12 @@ impl Builder {
             values.push(BuiltValue {
                 step: *step,
                 name: name.clone(),
-                oid: oid.to_string(),
+                oid,
             });
         }
         crate::failpoints::hit("tree.build_after_pack")?;
         let entry = BuiltEntry { through, values };
         self.built_log.append(&entry)?;
-        self.log.push(entry);
         self.reader.advance(offset, through);
         let built = next.built_pointers().map_err(to_build_error)?;
         let owners = next.owners.clone();
@@ -1462,8 +1466,9 @@ impl Builder {
         };
         let maps = self.rebase(through, &checked_out, files);
         self.history.publish_maps(maps);
+        let trees = self.state.trees.clone();
         self.history
-            .built_event(through, built, owners, objects, started.elapsed());
+            .built_event(through, built, (owners, objects, trees), started.elapsed());
         Ok(())
     }
 

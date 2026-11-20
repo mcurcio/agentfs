@@ -158,9 +158,9 @@ pub(in crate::tree_actor) fn edits(
     let mut edits = Vec::new();
     let mut file = |edits: &mut Vec<Edit>, name: &str, object: u64| -> Result<()> {
         let bytes = after.bytes.get(&object).ok_or(Error::Format)?;
-        let id = after.identities.get(&object).ok_or(Error::Format)?;
+        let id = after.identity_of(object).ok_or(Error::Format)?;
         let lines = after.lines.get(&object).ok_or(Error::Format)?;
-        let meta = after.meta.get(&object).ok_or(Error::Format)?;
+        let meta = after.meta_of(object).ok_or(Error::Format)?;
         let path = file_path(name);
         let mode = meta.git_mode();
         edits.push(match blob(bytes)? {
@@ -169,7 +169,7 @@ pub(in crate::tree_actor) fn edits(
         });
         edits.push(Edit::Inline {
             path: lines_path(name),
-            bytes: serde_json::to_vec(&(id, &**lines, meta))?,
+            bytes: serde_json::to_vec(&(&id, &**lines, meta))?,
         });
         Ok(())
     };
@@ -203,7 +203,7 @@ pub(in crate::tree_actor) fn edits(
     for key in changed {
         match key {
             Key::Name(name) => {
-                match after.names.get(name) {
+                match after.names.get(name.as_str()) {
                     Some(object) => file(&mut edits, name, *object)?,
                     None if !name.is_empty() => {
                         edits.push(Edit::Delete {
@@ -215,7 +215,7 @@ pub(in crate::tree_actor) fn edits(
                     }
                     None => {}
                 }
-                match after.dirs.get(name) {
+                match after.dirs.get(name.as_str()) {
                     Some(state) => dir(&mut edits, name, &state.meta)?,
                     None => edits.push(Edit::Delete {
                         path: dir_path(name),

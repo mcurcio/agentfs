@@ -304,6 +304,8 @@ pub struct TreeActor {
     /// Each fork's upstream. The root has none.
     upstreams: Upstreams,
     trees: BTreeMap<TreeId, SavedTree>,
+    /// The built point the saved trees rest on ([`SavedTree::rebuilt`]).
+    rebuilt: RecordNo,
     /// Each row chain's row, as the journal's records leave them.
     rows: SavedRows,
     /// The tree each queue entry came from: the step's tree that queued it.
@@ -818,10 +820,7 @@ impl TreeActor {
             &owners,
             heads,
         )?;
-        let objects = objects
-            .into_iter()
-            .map(|(tree, objects)| (tree, Arc::new(objects)))
-            .collect();
+        let objects = objects.into_iter().collect();
         let history = History::new(repo, built, pointers.clone(), owners, objects);
         history.checkpointed(folded_built);
         // The steps replayed past the built point are the builder's to build,
@@ -843,7 +842,6 @@ impl TreeActor {
             copied: pointers,
             checked_out,
             stale: false,
-            log: entries,
         };
         let owner = crate::failpoints::owner();
         let handle = std::thread::Builder::new()
@@ -950,6 +948,7 @@ impl TreeActor {
             pointers: folded.pointers,
             upstreams: folded.upstreams,
             trees,
+            rebuilt: built,
             rows,
             sources,
             handles: BTreeMap::new(),
@@ -1568,17 +1567,19 @@ impl TreeActor {
     /// save takes it too.
     fn rebase_built(&mut self) {
         for (tree, object, map) in self.history.take_maps() {
-            let Some(saved) = self
-                .trees
-                .get_mut(&tree)
-                .and_then(|t| t.bytes.get_mut(&object))
-            else {
+            let Some(t) = self.trees.get_mut(&tree) else {
+                continue;
+            };
+            let Some(saved) = t.bytes.get(&object) else {
                 continue;
             };
             if map.step().is_none() || saved.step() != map.step() || saved.len() != map.len() {
                 continue;
             }
-            *saved = map.clone();
+            // A map the built layer gives is the builder's already.
+            if let Some(saved) = t.bytes.changed_mut(&object) {
+                *saved = map.clone();
+            }
             for handle in self.handles.values_mut() {
                 if handle.tree == tree
                     && handle.object == object
@@ -1592,13 +1593,37 @@ impl TreeActor {
 
     /// A built or failed event reached the view's worker (`Recording::progress`):
     /// what the actor does at once, without waiting for its next step. Bounded:
-    /// O(1) plus the batch's maps. Lock order: the actor, then History.
+    /// O(1) plus the batch's maps and what changed since the last built point.
+    /// Lock order: the actor, then History.
     pub(in crate::tree_actor) fn on_built(&mut self) {
+        self.rebuild();
         self.rebase_built();
     }
 
-    /// After a step is applied: a compaction when one is due.
+    /// Moves every saved tree onto the builder's at the built point, when it
+    /// moved: what is built is held once, the builder's, and only what the
+    /// actor's steps changed since is the actor's own. Every step so far is
+    /// applied, so each change of no known step is at or before the last
+    /// record.
+    fn rebuild(&mut self) {
+        let Some((through, built)) = self.history.built_trees(self.rebuilt) else {
+            return;
+        };
+        let last = EventNumber::new(self.next.saturating_sub(1));
+        let through_step = EventNumber::new(through.get());
+        for (tree, saved) in &mut self.trees {
+            saved.seal(last);
+            if let Some(built) = built.get(tree) {
+                saved.rebuilt(built, through_step);
+            }
+        }
+        self.rebuilt = through;
+    }
+
+    /// After a step is applied: the saved trees onto a new built point, and a
+    /// compaction when one is due.
     fn after_step(&mut self) {
+        self.rebuild();
         self.compact_if_due();
     }
 }
