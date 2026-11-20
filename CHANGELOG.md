@@ -26,7 +26,14 @@ design was reviewed on 2026-10-12.
   (`AGENTFS_ROOT`) and a recording state area (move it with
   `docs/runbooks/upgrading-the-sidecar.md`); every recording command (`status`,
   `push`, `restore`, `run` and the rest) refuses a tree volume, saying it is not
-  built yet.
+  built yet; the check reads the tree format's marker, refuses when it cannot
+  read it, and covers `fork create --source-state`. `mount` refuses a mount
+  point inside the state area, an include under a view at any depth, and
+  every other refusal before it creates or seals a mount point; it logs an
+  `includeIf` line as not built, logs not-built settings on a held boot too,
+  stacks only over a view's own stale mount (never a new unkeyed fork over a
+  crashed one's), and detaches dead layers left under `<state>/stack/` at
+  start.
 - **The sidecar, its chart, the Docker examples and Hermes run the tree
   engine.** The sidecar's init container runs `agentfs init --include
   /etc/agentfs/config`, and the sidecar mounts `/agentfs/workspace` with

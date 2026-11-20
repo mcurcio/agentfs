@@ -1,4 +1,4 @@
-# Handoff: PR #39, tree views speed, M1, M2 and M3 built (2026-11-19)
+# Handoff: PR #39, tree views speed, M1, M2, M3 and M7 built (2026-11-20)
 
 Start here. This folder is working state for the next session, not product docs. **Delete `.claude/handoff/` in the commit that finishes this work, before #39 goes to the owner for review.**
 
@@ -39,10 +39,19 @@ The code and the library/human docs win over all of these where they disagree; r
   failpoints and kill tests, `AreaWrite` as the only way to change an area, inode ranges apart, `RulesRefused`,
   `tree Unadopted`. Six "M3 residuals" in `.claude/errata.md`, "M3 fix round"; item 2 is an owner question for M8.
 
+- M7 (the binary on the tree engine: init, mount, sidecar, Docker, Hermes) built (S1..S5, ..afc118a) and its one
+  fix round landed (510270f..): README quick starts checked against the tree engine (the Docker one against the
+  image built from the commit), every recording command refused on a tree area (fail closed), every mount refusal
+  before a mount point is made, one stacking judge (`stale::stackable`), includes checked at any depth, dead stack
+  layers detached at start, one `FileOwner`. Findings and three "M7 residuals" in `.claude/errata.md`, "M7 fix
+  round".
+
 ## Next, in order
-0. Cut beads for the M3 residuals (errata "M3 fix round"); put residual 2 (the fork copy holds the actor's lock) to
+0. M8 (the CSI driver moves), then the baseline (first Hermes deploy, on a CSI volume claim). Cut beads for the M7
+   residuals (errata "M7 fix round").
+1. Cut beads for the M3 residuals (errata "M3 fix round"); put residual 2 (the fork copy holds the actor's lock) to
    the owner before M8. The M2 owner questions and residuals (errata "M2 fix round") are still open.
-1. Then `docs/target-architecture/future/one-engine.md`'s order (owner, 2026-11-19): M7 -> M8 -> the baseline (the
+1b. Then `docs/target-architecture/future/one-engine.md`'s order (owner, 2026-11-19): M8 -> the baseline (the
    first Hermes deploy, on a CSI volume claim) -> M4, M5, M6. M7 and M8 do not wait for M4..M6 and say what is not
    built with an alarm and a log line.
 2. One full phase-1 dispatch on the final SHA (`gh workflow run phase-1.yml`), read its result.

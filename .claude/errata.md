@@ -1648,3 +1648,46 @@ M3 residuals (each to become a bead; none blocks M7):
   with S2; the "directory not empty" leak is now marked not tested.
 - **AGENTS.md's bench/power-loss rule (decided 2026-10-15) had no workflows left** after S4. Replaced by the one
   rule that still applies: a release figure other than `create` missing its bar is a warning to follow up.
+
+## 2026-11-20, M7 fix round: where the review was wrong, and M7 residuals
+
+- **F4's hang does not happen.** With `command.terminate()` removed from the Stop arm, `mount -- sh -c 'cd ROOT;
+  trap ... TERM; sleep & wait'` still exits 7 with nothing mounted (run locally, as root): the loop ends at the
+  volume's release (`domains.released`) without waiting for the busy view to end, and the terminate after the loop
+  then stops the command. The Stop-arm terminate only sends the signal earlier, at the drain's start, which no
+  outcome a test can observe without a race distinguishes. `launcher_mount.rs` (f) now checks the documented
+  behaviour (SIGTERM sent on, exit 7, nothing left mounted); it does not kill that mutant.
+- **F5's probe scenario is refused earlier now.** `--fork-mount <state>/inside` is refused by `prepare` (F11) before
+  anything is staged, so it no longer reaches a failed view open. The test of "a refused view means the command never
+  runs" (`launcher_mount.rs` (g)) uses a view only the view host refuses: the fork's mount point holding
+  `--metrics-output`. It kills the `failed.is_none() || true` mutant (the marker is made).
+- **F9 corrected.** `csi_service.rs` and `crash_daemon.rs` drive the history service through `record
+  --history-service`; no Rust test runs the FUSE `agentfs front` now. The front's FUSE path is covered only by CI's
+  CSI e2e jobs (image e2e-csi, f8, hermes csi). docs/guarantees.md says the recording FUSE front killed mid-write is
+  not tested by the crash oracle.
+- **S2 item 4 is superseded.** The trees-tracer gate passes in CI: create reached 50,000 (image run 44649022393).
+- **C2 decided:** the docs workflow's README Docker job builds the image from the commit and runs the README block
+  against it (`AGENTFS_IMAGE=agentfs:ci`); docs/development.md and AGENTS.md's workflow table say so. The published
+  image is gated by image.yml's e2e jobs before publish.
+- **C5 for a keyed fork:** `mount`'s prepare cannot know a keyed fork's tree before staging, so it accepts a stale
+  `agentfs:<volume>:...` there and the view host makes the exact check at open (`stale::stackable`). A root-only test
+  of a fork's stale mount at the root's path through the view host is not written (the stale worker mounts the root
+  only); the rule is tested by `stale::tests::only_the_exact_source_is_stackable` and, through the binary, by
+  `launcher_mount.rs` (h) (an unkeyed fork never stacks over a crashed one).
+
+M7 residuals (each to become a bead; none blocks M8):
+
+1. **Delete the recording mount's dead stacking and the sandbox overlay.** `agentfs-fuse`'s `overlay` module,
+   `MountConfig::stack_over`, `OverlayConfig::stack_over`, `preflight_stacked` and the overlay half of `mount.rs`
+   (`tmp_wipe_error` and the rest) have no caller since S2 (`front.rs` passes `None`); `agentfs_core::patch::attached`'s
+   `UncleanStop`, `StaleMount`, `mark` and `meta/attached.json` are produced by no binary path. Files:
+   `crates/agentfs-fuse/src/{overlay.rs,overlay/,mount.rs}`, `crates/agentfs-core/src/patch/attached.rs`, their docs
+   in docs/library/filesystem.md and docs/architecture.md. Done when no symbol is unreachable from a binary or test of
+   a live path and `cargo test --workspace` passes. Due at M9 at the latest.
+2. **The view's memory per file (F15).** memory_create missed its bar on ext4 and XFS (4.33 and 4.59 KiB per file
+   against 2 KiB; about 250 MiB RSS for 50k files; a 100k-file tree nears the sidecar's 512Mi limit). Files:
+   `crates/agentfs-fuse/src/tree_view.rs` handles and the actor's per-file state in `crates/agentfs-core/src/tree_actor/`.
+   Done when `ci/e2e-trees-tracer.sh --figures` meets `ci/trees-budget.json`'s memory bar on both filesystems.
+3. **A Rust test of `agentfs front` on FUSE (F9).** One root-gated test in `crates/agentfs/tests/` mounting `front`
+   against `serve-history` through `volume::init_with`, so the front's FUSE path has a local test until M9 deletes
+   it. Done when `ci/fuse-tests.sh` runs it.
