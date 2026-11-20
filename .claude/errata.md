@@ -1720,3 +1720,12 @@ M7 residuals (each to become a bead; none blocks M8):
    writer that ends the fork's one writer, so a NodePublish retried after a transient mount failure gets
    `fork_taken`. The include-under-a-view check of the operator settings cannot run at boot because `host` knows no
    view then; it is not checked at open either.
+
+## 2026-11-20, M8 S3b (f8 jobs and the forks job): where the brief was short
+
+1. **`ci/k8s-csi/move/values.yaml` is stale and owned by no slice.** ci/e2e-csi-move.sh installed the chart with
+   it. It passes `--release-scan-interval=5s`, a flag agentfs-csi no longer has (S2 removed the release scan, so the
+   node plugin would exit at its first argument parse), and its `agentfs-move` class sets `onDelete: delete`, which
+   CreateVolume now refuses. S3b's owned paths do not include it, so the move script now writes its own values to a
+   temporary file and the old file is unused. docs/helm.md still links it: the docs slice (S5) or the milestone's
+   end should delete the file and that link together.
