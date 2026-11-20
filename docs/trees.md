@@ -502,9 +502,14 @@ clone it.
   files whole, so an edit of a file near the host's memory needs that memory
   in the `git` child. Blobs over 8 MiB stream through `git fast-import` and
   `git cat-file` (`core.bigFileThreshold`), which never hold them whole.
-- The save record holds the result's length and a digest of its pieces: the
-  close's own pieces with their places, and the bytes it kept as runs. The
-  builder's replay must reach the same digest (`Disagrees`).
+- The save record holds the result's length and a digest of what the close
+  wrote: each piece its own calls and page-write pieces left, by file offset,
+  length and place in the journal, and the bytes it kept as runs. The digest
+  is computed from the saved length and the close's calls alone, never from
+  how the kept bytes are sourced (journal frames or the checkout's file), so
+  the builder, which rebases at other points than the view, reaches the same
+  digest for the same save. A replay that does not reach it fails
+  (`Disagrees`).
 
 ## The library
 

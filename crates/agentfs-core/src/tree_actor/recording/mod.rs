@@ -309,8 +309,8 @@ impl CloseWork {
     pub(in crate::tree_actor) fn decide(self) -> Result<CloseDecision> {
         if self.reader.is_none() && self.pages.is_none() {
             let ranges = self.view.differs_from(&self.saved);
-            let (outcome, map) = judge(&self.saved, self.view.clone(), &ranges, |map| {
-                map.digest_since(self.handle)
+            let (outcome, map) = judge(&self.saved, self.view.clone(), &ranges, || {
+                Ok(self.view.digest_since(self.handle))
             })?;
             return Ok(CloseDecision {
                 work: self,
@@ -347,14 +347,14 @@ fn judge(
     saved: &FileMap,
     map: FileMap,
     ranges: &[Range<u64>],
-    digest: impl FnOnce(&FileMap) -> u64,
+    digest: impl FnOnce() -> Result<u64>,
 ) -> Result<(SaveOutcome, Option<FileMap>)> {
     if map.len() == saved.len() && map.same_as(saved, ranges)? {
         return Ok((SaveOutcome::Unchanged, None));
     }
     let outcome = SaveOutcome::Saved {
         len: map.len(),
-        pieces: digest(&map),
+        pieces: digest()?,
     };
     Ok((outcome, Some(map)))
 }
@@ -374,7 +374,9 @@ fn replay_judge(
         ranges.extend(call.touched(map.len()));
         map.apply(call, pos)?;
     }
-    judge(saved, map, &ranges, |map| map.digest(&own_keys(calls)))
+    judge(saved, map, &ranges, || {
+        FileMap::close_digest(saved.len(), calls)
+    })
 }
 
 impl TreeActor {
@@ -1546,11 +1548,6 @@ pub(in crate::tree_actor) fn changed(
     Ok(Some(map))
 }
 
-/// The frames a close applied, as [`FileMap::digest`] names them.
-pub(in crate::tree_actor) fn own_keys(calls: &[(Call, FramePos)]) -> BTreeSet<(u64, u64)> {
-    calls.iter().map(|(_, pos)| pos.key()).collect()
-}
-
 /// A path a tree may name: a git-safe relative path ([`RepoPath`]'s rules,
 /// `/` between components), each component at most 255 bytes.
 pub(in crate::tree_actor) fn name(path: &str) -> Result<()> {
@@ -1739,7 +1736,7 @@ mod tests {
             Some(map) => (
                 SaveOutcome::Saved {
                     len: map.len(),
-                    pieces: map.digest(&own_keys(&calls)),
+                    pieces: FileMap::close_digest(saved.len(), &calls).unwrap(),
                 },
                 map.to_vec().unwrap(),
             ),
@@ -1748,9 +1745,12 @@ mod tests {
     }
 
     /// Runs one random history of two opens of one file, closing each
-    /// against the oracle; `closed` gets each close's outcome, `built` each
-    /// failed build.
-    fn two_opens(seed: u64, closed: &mut Vec<SaveOutcome>, built: &mut Vec<String>) {
+    /// against the oracle, and builds it: every build must succeed, so the
+    /// builder's own check of each save (`Disagrees`) agrees with the
+    /// actor's. `pause` waits 3 ms before each close, which lets the
+    /// builder's batches run, and rebase the saved map, at other points.
+    /// `closed` gets each close's outcome.
+    fn two_opens(seed: u64, pause: bool, closed: &mut Vec<SaveOutcome>) {
         let mut rng = Rng::new(seed);
         let tmp = tempfile::tempdir().unwrap();
         let mut v = new_actor(tmp.path());
@@ -1783,18 +1783,15 @@ mod tests {
                 }
                 8 | 9 => v.page_writeback(h, rng.next(len + 30), &data).unwrap(),
                 10 => {
-                    // Built, so the next record rebases the saved map. The
-                    // builder's own check of each save (`Disagrees`) is not
-                    // this property's: with page writes it fails at a few
-                    // seeds, depending on when the builder's batches run,
-                    // on the commit before the off-lock close too (seeds
-                    // 11, 19 and 26 there with a 3 ms pause before each
-                    // close). Each close here is still held to the oracle.
+                    // Built, so the next record rebases the saved map.
                     if let Err(e) = v.settle() {
-                        built.push(format!("seed {seed} step {step}: {e}"));
+                        panic!("seed {seed} step {step}: {e}");
                     }
                 }
                 _ => {
+                    if pause {
+                        std::thread::sleep(std::time::Duration::from_millis(3));
+                    }
                     let (outcome, bytes) = oracle(&v, tmp.path(), h);
                     v.close(h).unwrap();
                     open[which] = None;
@@ -1812,20 +1809,22 @@ mod tests {
                 }
             }
         }
+        if let Err(e) = v.settle() {
+            panic!("seed {seed} at the end: {e}");
+        }
     }
 
     /// A1: seeds 1..64 of two opens of one file (writes, appends, truncates,
     /// the same bytes rewritten, page writes, the other open's save while
     /// one is open, builds that rebase the saved map): each close records
-    /// the outcome and the digest the oracle gives, and saves its bytes.
+    /// the outcome and the digest the oracle gives, and saves its bytes; the
+    /// builder replays every save to the same digest.
     #[test]
     fn a_close_decides_as_the_oracle_does() {
-        let (mut closed, mut built) = (Vec::new(), Vec::new());
+        let mut closed = Vec::new();
         for seed in 1..64 {
-            two_opens(seed, &mut closed, &mut built);
+            two_opens(seed, false, &mut closed);
         }
-        // Shown with --nocapture: the builder's disagreements, apart.
-        eprintln!("builds that failed: {built:#?}");
         // The histories reach every outcome a named file's close has.
         assert!(
             closed
@@ -1833,6 +1832,31 @@ mod tests {
                 .any(|o| matches!(o, SaveOutcome::Saved { .. }))
         );
         assert!(closed.contains(&SaveOutcome::Unchanged));
+    }
+
+    /// The histories where the builder's check of a save once disagreed
+    /// with the actor's: a close that applies part of a page write whose
+    /// rest an earlier close saved, with the saved map on its frames on one
+    /// side and rebased onto the checkout on the other.
+    #[test]
+    fn seed_11_builds_every_save() {
+        two_opens(11, false, &mut Vec::new());
+    }
+
+    #[test]
+    fn seed_19_builds_every_save() {
+        two_opens(19, false, &mut Vec::new());
+    }
+
+    #[test]
+    fn seed_26_builds_every_save_with_a_pause_before_each_close() {
+        two_opens(26, true, &mut Vec::new());
+    }
+
+    #[test]
+    fn seeds_11_and_19_build_every_save_with_a_pause_before_each_close() {
+        two_opens(11, true, &mut Vec::new());
+        two_opens(19, true, &mut Vec::new());
     }
 
     use crate::tree_actor::journal::readback::READERS;

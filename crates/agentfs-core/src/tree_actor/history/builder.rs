@@ -37,7 +37,7 @@ use crate::tree_actor::journal::{
 use crate::tree_actor::pointers::Pointers;
 use crate::tree_actor::queue::Key;
 use crate::tree_actor::recording::file_map::BaseFile;
-use crate::tree_actor::recording::{Call, FileMap, own_keys, pages};
+use crate::tree_actor::recording::{Call, FileMap, pages};
 use crate::tree_actor::stages::{Timer, Which};
 use crate::tree_actor::tree::{
     EventNumber, FileBytes, Lines, MergeFileIdentity, NameHistory, Tree, Versions,
@@ -717,14 +717,14 @@ impl BuildState {
                             .map(|runs| runs.iter().cloned().collect())
                             .unwrap_or_default();
                         let own: Vec<(u64, Call, FramePos)> = open.calls.iter().cloned().collect();
-                        let (map, calls) = pages::replay_close(
-                            t.bytes.get(&open.object).ok_or_else(|| disagrees(seq))?,
-                            &own,
-                            &writes,
-                            pieces,
-                        )?
-                        .ok_or_else(|| disagrees(seq))?;
-                        if map.len() != *len || map.digest(&own_keys(&calls)) != *digest {
+                        let saved = t.bytes.get(&open.object).ok_or_else(|| disagrees(seq))?;
+                        let (map, calls) = pages::replay_close(saved, &own, &writes, pieces)?
+                            .ok_or_else(|| disagrees(seq))?;
+                        // What the save wrote, by place, never how each side
+                        // sources the bytes from before.
+                        if map.len() != *len
+                            || FileMap::close_digest(saved.len(), &calls)? != *digest
+                        {
                             return Err(disagrees(seq));
                         }
                         let base = t.bytes.get(&open.object).ok_or_else(|| disagrees(seq))?;

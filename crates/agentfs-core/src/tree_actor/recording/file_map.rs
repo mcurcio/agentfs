@@ -12,7 +12,6 @@
 //! offset, so a write costs O(log pieces + pieces it covers) at any number
 //! of pieces, and a clone stays O(1).
 
-use std::collections::BTreeSet;
 use std::fs::File;
 use std::io::{self, Read};
 use std::ops::Range;
@@ -690,26 +689,47 @@ impl FileMap {
         })
     }
 
-    /// The save record's digest of the piece list (FNV-1a, 64 bits): the
-    /// length, then each piece from a frame in `own` (the close's own calls
-    /// and page pieces, by [`FramePos::key`]) with its offset, length and
-    /// place in the frame. Everything else is what the file held before the
-    /// close, as one run per gap, however each side sources it: the actor
-    /// and the builder rebase at different built points. The builder's
-    /// replay must reach the same digest (`Disagrees`).
-    pub(in crate::tree_actor) fn digest(&self, own: &BTreeSet<(u64, u64)>) -> u64 {
-        self.digest_by(|pos| own.contains(&pos.key()))
+    /// The save record's digest of a close (FNV-1a, 64 bits): what the close
+    /// wrote, by place, from the saved length and the close's calls alone.
+    /// The calls are laid on a map of `saved_len` bytes that are all "as
+    /// before"; the digest is the resulting length, then each piece a call
+    /// left visible (its file offset, its length, and its bytes' place in the
+    /// journal: record and offset in the frame), with each run of bytes kept
+    /// from before as one gap. It reads no map, so how either side sources
+    /// the bytes from before (journal frames, the checkout's file, a page
+    /// write an earlier close saved) cannot change it: the actor and the
+    /// builder rebase at different built points. The bytes from before are
+    /// the previous save's, which the builder checked at that save. The
+    /// builder's replay must reach the same digest (`Disagrees`).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::TooLarge`] where a call would end past `u64`, as
+    /// [`FileMap::apply`].
+    pub(in crate::tree_actor) fn close_digest(
+        saved_len: u64,
+        calls: &[(Call, FramePos)],
+    ) -> Result<u64> {
+        let mut written = Self::empty();
+        written.truncate(saved_len);
+        for (call, pos) in calls {
+            written.apply(call, pos)?;
+        }
+        Ok(written.digest_by(|_| true))
     }
 
-    /// [`FileMap::digest`] with every frame whose record is `first` or later
-    /// counted as the close's own. Equals `digest(&own_keys(close_calls))`
-    /// for an open whose base did not move and whose file has no page
-    /// writes: its own calls are the only frames from its open (record
-    /// `first`) on.
+    /// [`FileMap::close_digest`] read off an open's view: every frame whose
+    /// record is `first` or later is a piece the close wrote. Equal to
+    /// `close_digest(saved.len(), own calls)` for an open whose saved map
+    /// did not move and whose file has no page writes: its own calls are
+    /// then the only frames from its open (record `first`) on, laid on the
+    /// saved map in the same order, so they leave the same pieces.
     pub(in crate::tree_actor) fn digest_since(&self, first: u64) -> u64 {
         self.digest_by(|pos| pos.record.get() >= first)
     }
 
+    /// The length, then each piece read from a frame `own` names, and one
+    /// gap for each run of every other piece.
     fn digest_by(&self, own: impl Fn(&FramePos) -> bool) -> u64 {
         let mut hash = Fnv::new();
         hash.u64(self.len);
@@ -1100,29 +1120,74 @@ mod tests {
         assert_eq!(open.to_vec().unwrap(), b"Saved!");
     }
 
+    /// A close that writes part of a page write whose rest an earlier close
+    /// saved: the earlier save's piece and this close's piece read one frame
+    /// from one place, and the saved map holds the rest on that frame on one
+    /// side and on the checkout's file on the other. The bytes agree, and so
+    /// does the digest, which names only what the close wrote.
     #[test]
-    fn the_digest_ignores_how_earlier_bytes_are_sourced() {
+    fn a_close_digest_names_what_the_close_wrote_not_where_earlier_bytes_are() {
         let mut frames = Scratch::new();
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("checkout");
-        std::fs::write(&path, b"0123456789").unwrap();
         let mut framed = FileMap::empty();
         framed
-            .apply(&Call::Append { len: 10 }, &frames.add(b"0123456789"))
+            .apply(
+                &Call::Append { len: 20 },
+                &frames.add(b"0123456789abcdefghij"),
+            )
+            .unwrap();
+        let run = frames.add(b"PAGEWRITE!");
+        framed
+            .apply(&Call::Write { offset: 4, len: 10 }, &run)
             .unwrap();
         framed.saved_at(RecordNo::new(3));
+        let path = dir.path().join("checkout");
+        std::fs::write(&path, framed.to_vec().unwrap()).unwrap();
         let mut based = framed.clone();
         based.rebase(BaseFile::open(dir.path(), &path, RecordNo::new(3), None).unwrap());
-        let write = frames.add(b"ab");
-        let call = Call::Write { offset: 4, len: 2 };
-        framed.apply(&call, &write).unwrap();
-        based.apply(&call, &write).unwrap();
-        let own: BTreeSet<(u64, u64)> = [write.key()].into_iter().collect();
-        assert_eq!(framed.digest(&own), based.digest(&own));
-        let mut other = framed.clone();
-        other
-            .apply(&Call::Write { offset: 5, len: 1 }, &frames.add(b"b"))
-            .unwrap();
-        assert_ne!(framed.digest(&own), other.digest(&own));
+        assert!(!based.on_frames());
+        // The close applies the run's first three bytes again: the same frame
+        // position as the earlier save's piece.
+        let calls = [(Call::Write { offset: 4, len: 3 }, run.clone())];
+        for (call, pos) in &calls {
+            framed.apply(call, pos).unwrap();
+            based.apply(call, pos).unwrap();
+        }
+        assert_eq!(framed.to_vec().unwrap(), based.to_vec().unwrap());
+        let digest = FileMap::close_digest(20, &calls).unwrap();
+        // What the close wrote is in it: the whole run is another close.
+        let whole = [(Call::Write { offset: 4, len: 10 }, run.clone())];
+        assert_ne!(digest, FileMap::close_digest(20, &whole).unwrap());
+        // As is where its bytes are in the journal, and the length before.
+        let moved = [(Call::Write { offset: 4, len: 3 }, run.at(1))];
+        assert_ne!(digest, FileMap::close_digest(20, &moved).unwrap());
+        assert_ne!(digest, FileMap::close_digest(21, &calls).unwrap());
+    }
+
+    /// The quick close's digest, read off the view, equals the digest of the
+    /// open's calls: random calls on a saved map read from the checkout.
+    #[test]
+    fn digest_since_equals_the_close_digest_of_the_calls() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("checkout");
+        std::fs::write(&path, [7_u8; 64]).unwrap();
+        let base = BaseFile::open(dir.path(), &path, RecordNo::new(1), None).unwrap();
+        for seed in 1..24_u64 {
+            let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15));
+            let mut frames = Scratch::new();
+            let saved = FileMap::of_base(Arc::clone(&base), rng.next(65));
+            let mut view = saved.clone();
+            let mut calls = Vec::new();
+            for step in 0..120 {
+                let (call, pos, _) = random_call(&mut rng, &mut frames, view.len());
+                view.apply(&call, &pos).unwrap();
+                calls.push((call, pos));
+                assert_eq!(
+                    view.digest_since(0),
+                    FileMap::close_digest(saved.len(), &calls).unwrap(),
+                    "seed {seed} step {step}"
+                );
+            }
+        }
     }
 }
