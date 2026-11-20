@@ -1588,3 +1588,63 @@ M3 residuals (each to become a bead; none blocks M7):
    until the builder's cost per save drops. That is the gate doing its job; it is the milestone's to clear.
 5. **`--seal-mountpoint` seals every view's bare mount point** (the fork's too), not the root's alone: the frozen
    page's "(root only, as today)" read as "needs root"; a fork bound by subPath has the same gap.
+
+## 2026-11-20, M7 S4 (retire the recording launcher's CI): where the brief was short
+
+- **e2e-csi-move step (h) needed step (g).** The brief said to delete step (g) (a CLI recording volume pushing,
+  diverged) and renumber. Step (h) (a start class on a `refs/agentfs/<V1>/diverged/*` ref refused as "not a branch")
+  read the ref (g)'s divergence saved. Done: (g) is gone; (h) becomes (g) and writes that ref on the git server with
+  `git update-ref` (as root, through `sgit`), so the refusal is still checked; (i) becomes (h). Untested locally (kind).
+- **No alert list in docs/telemetry.md.** The alert table is in docs/deployment.md (S3's). telemetry.md's "Alerts"
+  section gained a paragraph on `AgentfsNotBuilt`; deployment.md's table still lacks the row (S3 or S5).
+- **AgentfsTelemetryExportFailing cannot be caused by a tree mount.** It exports metrics only (no spans, no logs), so
+  the only export that could fail would carry the count. e2e-alerts lists `agentfs_telemetry_export_failures_total`
+  in NOT_CAUSED with that reason.
+- **References outside S4's paths to deleted jobs or files:** AGENTS.md's workflow table (`power-loss.yml`,
+  `bench.yml`, and ci.yml's covered list) for S5; `ci/bench-budget.json`'s comment names `ci/bench-report.py` (kept
+  file, not owned); docs/runbooks/stuck-pushes.md names the `e2e-shared-remotes` job; crates/agentfs-core/src/
+  ssh_transport/tests.rs names the `e2e-ssh` job; ci/git-http-server.sh documents `GIT_SERVER_LFS` for
+  ci/lfs-server.sh and `lfs_faults`, so lfs-server.sh and the LFS helpers in ci/lib.sh were kept (now used by no
+  script). The runbooks' `<!-- ci: ... -->` markers stay, run by no script now.
+
+## 2026-11-20, M7 S3 (sidecar, Docker and Hermes on the tree engine): where the brief was wrong or short
+
+- **The migration Job's `cp -a` can record a nested repository's files.** Rules decide when a name is made, and
+  "inside a nested repository" needs the `.git` entry to exist first. GNU `cp -a` copies a directory's entries in
+  inode order: a repository whose files predate its `.git` (files first, then `git init`) has them recorded. Seen
+  locally with the real binary: `skills/cloned/SKILL.md` reached history. Done: deployment.md §10's block (and the
+  upgrading runbook's move) copies each `.git` first (`find . -name .git -prune -print0 | xargs -0 -r cp -a
+  --parents -t <mount>`), then `cp -a .`; with it the file stays untracked. The rest of the block is as the brief
+  wrote it.
+- **F3 is half right.** Locally, a mount stopped with SIGTERM while a bind of its view (a `subPath` stand-in) holds
+  it drains, unmounts the view (the mount point turns bare), answers the bind's writes with `EROFS`, and stays alive
+  until the bind goes. So the restart after the kill mounts the bare mount point; it does not stack (nothing is
+  stale at the mount point). The consumer's bind then fails `ENOTCONN` and its liveness probe restarts it, as with
+  the recording engine. A sidecar-only SIGTERM never ends on its own (no kubelet grace applies): it ends at a kill.
+  deployment.md §7 and the kind and Hermes kind tests say and check that.
+- **Possible stuck Terminating (not tested).** A view stacked over a stale layer detaches it only when the view
+  ends; with a `subPath` consumer a pod stop ends in the kubelet's kill, so the dead layer stays under the emptyDir
+  for the kubelet's teardown, which may not remove it. The old kind step "deleting the recovered pod leaves nothing
+  mounted" is gone (it was the recording engine's exit path); deployment.md §7 lists this as a limit. For M8/M9.
+- **Files outside the owned paths, needed by the slice:** `ci/helm-equivalence.sh` and
+  `ci/helm/sidecar-sandbox-overlay-values.yaml` (the deleted overlay's comparison), `ci/readme-quickstart.sh`'s
+  docker checks (the README Docker block runs on the tree engine now; its source mode is untouched), and
+  `crates/agentfs/Cargo.toml` + `Cargo.lock` (`agentfs-rules` as a dev-dependency for deploy_examples.rs).
+
+## 2026-11-20, M7 S5 (docs close): where the brief was short or the code disagrees
+
+- **Links to the deleted overlay runbook outside S5's paths.** `docs/library/filesystem.md` and `docs/telemetry.md`
+  linked `runbooks/sandbox-overlay.md`; the link check fails without repointing them. Done: both now point to
+  guarantees.md's "The sandbox overlay", committed with S5 although not in its owned paths.
+- **`trees mount` still named outside S5's paths:** `docs/architecture.md` (Technology choices, "Signals" row) and
+  `docs/target-architecture/future/tree-view-telemetry.md`. Not changed. In code, `crates/agentfs-contracts/src/
+  volume.rs`'s `NoVolume` error text still says ``agentfs trees init --volume NAME`` (the launcher prints its own
+  message, so it is reached only through the library).
+- **Dead recording code after the single-process mount went:** `agentfs_core::patch::attached`'s `UncleanStop`,
+  `StaleMount`, `mark` and `meta/attached.json` are produced by no binary path now (only `serve-history`'s
+  `FrontsRunning`/`WorkloadAttached` remain). The patch-queue runbook's `unclean_stop` and `stale_mount` rows and
+  their Docker and sidecar steps were removed; the code is for M9 or a cleanup bead.
+- **guarantees.md cited a deleted test.** `overlay_refusals` (an integration test in the binary's mount tests) went
+  with S2; the "directory not empty" leak is now marked not tested.
+- **AGENTS.md's bench/power-loss rule (decided 2026-10-15) had no workflows left** after S4. Replaced by the one
+  rule that still applies: a release figure other than `create` missing its bar is a warning to follow up.
