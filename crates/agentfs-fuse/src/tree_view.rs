@@ -152,6 +152,13 @@ impl ViewHost {
                 Ok(path)
             })
             .transpose()?;
+        let detached = stale::clear_stack_sources(&state.join(STACK))?;
+        if detached > 0 {
+            eprintln!(
+                "tree DetachedStale: {}: {detached} layer(s)",
+                state.join(STACK).display()
+            );
+        }
         let views = OpenViews::default();
         let stop = Arc::new(AtomicBool::new(false));
         let takes = {
@@ -236,8 +243,7 @@ impl ViewHost {
     /// A stale mount point's checks: resolved through its parent (the stale
     /// mount answers `ENOTCONN`), then apart as [`Self::mount_point`]'s.
     fn stale_mount_point(&self, at: &MountPoint) -> Option<PathBuf> {
-        let parent = at.0.parent().filter(|p| !p.as_os_str().is_empty())?;
-        let at = parent.canonicalize().ok()?.join(at.0.file_name()?);
+        let at = stale::resolved_mountpoint(&at.0).ok()?;
         self.placed_apart(&at).then_some(at)
     }
 
@@ -253,13 +259,21 @@ impl ViewHost {
         apart(&self.state) && separate && metrics_apart
     }
 
-    /// The view's source: `agentfs:<volume>` for the root, and
-    /// `agentfs:<volume>:<tree>` for a fork.
+    /// The view's source, [`view_source`] of this volume.
     fn fsname(&self, tree: TreeId) -> String {
-        match tree {
-            TreeId::Root => format!("agentfs:{}", self.volume),
-            fork => format!("agentfs:{}:{fork}", self.volume),
-        }
+        view_source(&self.volume, tree)
+    }
+}
+
+/// A tree view's mount source: `agentfs:<volume>` for the root, and
+/// `agentfs:<volume>:<tree>` for a fork. A stale mount is stacked over only
+/// where its source is the one the view would mount with
+/// ([`stale::stackable`]).
+#[must_use]
+pub fn view_source(volume: &str, tree: TreeId) -> String {
+    match tree {
+        TreeId::Root => format!("agentfs:{volume}"),
+        fork => format!("agentfs:{volume}:{fork}"),
     }
 }
 
@@ -267,7 +281,8 @@ impl Views for ViewHost {
     /// Mounts `binding`'s session's tree at `at`, each entry presented with
     /// its recorded owner, read-only for a read-only grant. Never waits for
     /// history: the tree must be among the actor's saved trees. A stale
-    /// mount of this volume at `at` is stacked over with
+    /// mount of this view's own source ([`view_source`]) at `at` is stacked
+    /// over with
     /// `options.over_stale` (`ViewError::Stale` otherwise); a live or
     /// foreign mount there is `MountFailed(EBUSY)`.
     fn open(
@@ -281,6 +296,7 @@ impl Views for ViewHost {
             .session(binding.session)
             .ok_or(ViewError::UnknownSession)?;
         let errno = |e: io::Error| ViewError::MountFailed(e.raw_os_error().unwrap_or(libc::EIO));
+        let tree = session.tree();
         // Where FUSE is mounted, and for a stacked view the mount point its
         // layer is bound over.
         let (at, stacked) = match stale::mount_state(&at.0).map_err(errno)? {
@@ -290,8 +306,7 @@ impl Views for ViewHost {
                 false,
             ),
             MountState::Stale { source }
-                if options.over_stale
-                    && stale::source_volume(&source) == Some(self.volume.as_str()) =>
+                if options.over_stale && stale::stackable(&source, &self.fsname(tree)) =>
             {
                 (
                     self.stale_mount_point(&at)
@@ -310,11 +325,10 @@ impl Views for ViewHost {
             .actor()
             .map_err(|e| ViewError::MountFailed(e.errno()))?
             .trees()
-            .contains(&session.tree());
+            .contains(&tree);
         if !saved {
             return Err(ViewError::MountFailed(libc::ENOENT));
         }
-        let tree = session.tree();
         let read_only = binding.grant.access() == Access::ReadOnly;
         let area = session
             .untracked_area()
@@ -2823,6 +2837,36 @@ mod tests {
         host.close(id);
         assert_eq!(events.recv().unwrap(), id);
         assert_eq!(stale::agentfs_layers(&at).unwrap(), 0);
+        host.wait().unwrap();
+    }
+
+    /// A dead layer a crash left under `<state>/stack/<id>` (a stacked view's
+    /// private source, mounted and never bound) is detached when the next
+    /// view host starts, whichever view ids it opens.
+    #[test]
+    #[ignore = "needs root and /dev/fuse: ci/fuse-tests.sh"]
+    fn stale_view_left_under_the_stack_is_detached_at_start() {
+        stale_worker();
+        needs_root_and_fuse();
+        let tmp = tempfile::tempdir().unwrap();
+        let other = tmp.path().join("other");
+        let state = tmp.path().join("state");
+        drop(new_named(&other, "other"));
+        drop(new_named(&state, "test"));
+        let source = state.join(STACK).join("2");
+        std::fs::create_dir_all(&source).unwrap();
+        leave_stale_view(
+            "tree_view::tests::stale_view_left_under_the_stack_is_detached_at_start",
+            &other,
+            &source,
+        );
+        assert_eq!(stale::agentfs_layers(&source).unwrap(), 1);
+        let sessions = Sessions::new(Recording::open(&state, &PodContext::default()).unwrap());
+        let host = host(&sessions, &state);
+        let layers = stale::agentfs_layers(&source).unwrap();
+        stale::detach_stale_layers(&source, stale::STALE_LAYERS).unwrap();
+        assert_eq!(layers, 0, "the dead layer under the stack was left");
+        assert!(!source.exists(), "the empty stack entry was left");
         host.wait().unwrap();
     }
 

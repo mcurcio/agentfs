@@ -19,7 +19,8 @@ pub struct MountOptions {
     /// `user_allow_other` in `/etc/fuse.conf` when not root), as the recording
     /// mount. On by default; `--no-allow-other` turns it off.
     pub allow_other: bool,
-    /// Stack over a stale agentfs mount of this volume at the mount point (a
+    /// Stack over a stale agentfs mount of this view's own source (this volume
+    /// and this tree) at the mount point (a
     /// view host restarted after its predecessor died): mounted at a private
     /// directory of the state area, bind-mounted over the stale mount so every
     /// copy of the mount point (propagated mounts, subPath binds of the mount

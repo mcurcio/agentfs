@@ -309,9 +309,10 @@ pub fn init(state: &Path, args: InitArgs, minter: Minter) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// `agentfs mount`: the mount points judged and prepared, the volume
-/// checked, the operator settings read and logged, then the views served
-/// until a stop.
+/// `agentfs mount`: the volume checked, the operator settings read and
+/// logged (at every boot, a held one included), then the mount points
+/// judged and prepared, then the views served until a stop. Every refusal
+/// comes before a mount point is created or sealed.
 ///
 /// # Errors
 ///
@@ -328,24 +329,6 @@ pub fn mount(state: &Path, args: MountArgs, minter: Minter) -> Result<ExitCode> 
             })
         })
         .transpose()?;
-    let paths: Vec<&Path> = std::iter::once(root.at.as_path())
-        .chain(fork.as_ref().map(|f| f.spec.at.as_path()))
-        .collect();
-    let stacked = match mountpoint::prepare(&paths, args.on_stale_mount, args.seal_mountpoint)? {
-        mountpoint::Plan::Mount(stacked) => stacked,
-        mountpoint::Plan::Hold(stale) => {
-            let stale: Vec<(&Path, &str)> = stale
-                .iter()
-                .map(|(path, source)| (path.as_path(), source.as_str()))
-                .collect();
-            // Mounts nothing and takes no lock.
-            return Ok(crate::hold::hold(Daemon::start()?, &stale));
-        }
-    };
-    root.over_stale = stacked[0];
-    if let Some(fork) = fork.as_mut() {
-        fork.spec.over_stale = stacked.get(1).copied().unwrap_or(false);
-    }
     let name = match tree_actor::inspect(state).context("reading the state area")? {
         Found::Nothing => {
             eprintln!("error: no volume here: run `agentfs init --volume NAME` first");
@@ -367,9 +350,38 @@ pub fn mount(state: &Path, args: MountArgs, minter: Minter) -> Result<ExitCode> 
     let views: Vec<&Path> = std::iter::once(root.at.as_path())
         .chain(fork.as_ref().map(|f| f.spec.at.as_path()))
         .collect();
+    mountpoint::outside_the_state_area(state, &views)?;
     let not_built = settings::at_boot(state, &views)?;
     let otel = crate::otel::init(name.as_str(), &identity(name.as_str(), &args.pod));
     otel.telemetry().observe_not_built(&not_built);
+    let expect: Vec<mountpoint::Expect> = std::iter::once(mountpoint::Expect::Source(
+        agentfs_fuse::tree_view::view_source(name.as_str(), TreeId::Root),
+    ))
+    .chain(fork.as_ref().map(|f| match f.key {
+        Some(_) => mountpoint::Expect::KeyedFork {
+            volume: name.as_str().to_owned(),
+        },
+        None => mountpoint::Expect::UnkeyedFork,
+    }))
+    .collect();
+    let stacked =
+        match mountpoint::prepare(&views, &expect, args.on_stale_mount, args.seal_mountpoint)? {
+            mountpoint::Plan::Mount(stacked) => stacked,
+            mountpoint::Plan::Hold(stale) => {
+                let stale: Vec<(&Path, &str)> = stale
+                    .iter()
+                    .map(|(path, source)| (path.as_path(), source.as_str()))
+                    .collect();
+                // Mounts nothing and takes no lock.
+                let code = crate::hold::hold(Daemon::start()?, &stale);
+                drop(otel);
+                return Ok(code);
+            }
+        };
+    root.over_stale = stacked[0];
+    if let Some(fork) = fork.as_mut() {
+        fork.spec.over_stale = stacked.get(1).copied().unwrap_or(false);
+    }
     let mount = Mount {
         at,
         allow_other: !args.no_allow_other,

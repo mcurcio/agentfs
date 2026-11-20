@@ -83,10 +83,9 @@ pub struct OperatorSettings {
     /// Every entry, key and value, in file order with includes resolved in
     /// place.
     entries: Vec<(String, String)>,
-    /// The top-level file's `include.path` values, as written.
+    /// Every `include.path` at any depth, each resolved against the directory
+    /// of the file that includes it, as git resolves it; in the order found.
     includes: Vec<PathBuf>,
-    /// The state area: where a relative include resolves, as git resolves it.
-    base: PathBuf,
 }
 
 impl OperatorSettings {
@@ -103,10 +102,7 @@ impl OperatorSettings {
             path: path.clone(),
             source,
         };
-        let mut settings = Self {
-            base: state.to_path_buf(),
-            ..Self::default()
-        };
+        let mut settings = Self::default();
         if !path.exists() {
             return Ok(settings);
         }
@@ -116,25 +112,24 @@ impl OperatorSettings {
             let entry = entry.map_err(read)?;
             let key = String::from_utf8_lossy(entry.name_bytes()).into_owned();
             let value = String::from_utf8_lossy(entry.value_bytes()).into_owned();
-            if entry.include_depth() == 0 && key.eq_ignore_ascii_case("include.path") {
-                settings.includes.push(PathBuf::from(&value));
-            }
             settings.entries.push((key, value));
         }
+        settings.includes = includes_of(&path)?;
         Ok(settings)
     }
 
-    /// The top-level file's `include.path` values, in order, as written.
+    /// Every `include.path` at any depth, in the order found, each resolved
+    /// against the directory of the file that includes it.
     pub fn includes(&self) -> &[PathBuf] {
         &self.includes
     }
 
-    /// The includes that do not exist (git skips them silently; the launcher
-    /// warns).
+    /// The includes, at any depth, that do not exist (git skips them
+    /// silently; the launcher warns).
     pub fn missing_includes(&self) -> Vec<PathBuf> {
         self.includes
             .iter()
-            .filter(|include| !self.base.join(include).exists())
+            .filter(|include| !include.exists())
             .cloned()
             .collect()
     }
@@ -153,6 +148,44 @@ impl OperatorSettings {
             .map(|(key, capability)| NotBuilt { key, capability })
             .collect()
     }
+}
+
+/// The `include.path` entries of `file` and, depth first, of each file it
+/// includes, each resolved against the directory of the file naming it (git's
+/// rule for a relative include). A missing include is listed and not followed;
+/// a file already visited is not read again (an include cycle).
+fn includes_of(file: &Path) -> Result<Vec<PathBuf>, SettingsError> {
+    let mut found = Vec::new();
+    let mut visited = std::collections::BTreeSet::new();
+    let mut pending = vec![file.to_path_buf()];
+    while let Some(file) = pending.pop() {
+        if !visited.insert(file.clone()) || !file.exists() {
+            continue;
+        }
+        let read = |source| SettingsError::Read {
+            path: file.clone(),
+            source,
+        };
+        let config = git2::Config::open(&file).map_err(read)?;
+        let dir = file.parent().unwrap_or(Path::new("/")).to_path_buf();
+        let mut direct = Vec::new();
+        let mut entries = config.entries(None).map_err(read)?;
+        while let Some(entry) = entries.next() {
+            let entry = entry.map_err(read)?;
+            // Depth 0: this file's own lines; deeper ones are read from the
+            // file that holds them, resolved against its directory.
+            if entry.include_depth() == 0
+                && String::from_utf8_lossy(entry.name_bytes()).eq_ignore_ascii_case("include.path")
+            {
+                let value = String::from_utf8_lossy(entry.value_bytes()).into_owned();
+                direct.push(dir.join(value));
+            }
+        }
+        found.extend(direct.iter().cloned());
+        // Depth first, in file order.
+        pending.extend(direct.into_iter().rev());
+    }
+    Ok(found)
 }
 
 /// Makes `includes` exactly the `include.path` lines of `<state>/config`: the
@@ -220,15 +253,15 @@ fn quoted(value: &str) -> String {
     out
 }
 
-/// Pure. `None` for structure (`include.path`, `includeif.<c>.path`) and for
-/// what tree volumes build (`agentfs.nested` = `exclude`, case-insensitive).
+/// Pure. `None` for `include.path` (structure) and for what tree volumes build (`agentfs.nested` = `exclude`, case-insensitive).
 /// The key is compared lower-cased (libgit2 lower-cases section and variable
 /// names). First match wins: `agentfs.lfsthreshold`, `lfs.*`,
 /// `remote.<n>.lfsurl`, `remote.<n>.lfspushurl`,
 /// `remote.<n>.agentfslfscredentials`, `remote.<n>.agentfsmaxlfsobjectsize`
 /// → Lfs; `agentfs.patch*`, `agentfspusher.*` → Patches; `remote.*`,
 /// `agentfs.pushinterval`, `agentfs.forkrefs`, `http.proxy` → Push;
-/// everything else → Other.
+/// everything else → Other, `includeif.<c>.path` included (its target is
+/// never read).
 pub fn classify(key: &str, value: &str) -> Option<Capability> {
     let key = key.to_ascii_lowercase();
     let remote_variable = |variable: &str| {
@@ -236,8 +269,13 @@ pub fn classify(key: &str, value: &str) -> Option<Capability> {
             .and_then(|rest| rest.rsplit_once('.'))
             .is_some_and(|(_, name)| name == variable)
     };
-    if key == "include.path" || (key.starts_with("includeif.") && key.ends_with(".path")) {
+    if key == "include.path" {
         return None;
+    }
+    // libgit2 reading a standalone file evaluates no condition: an
+    // includeIf's target is never read, so the line is logged.
+    if key.starts_with("includeif.") && key.ends_with(".path") {
+        return Some(Capability::Other);
     }
     if key == "agentfs.nested" && value.trim().eq_ignore_ascii_case("exclude") {
         return None;
@@ -309,7 +347,7 @@ mod tests {
             ("agentfs.nested", "Exclude", None),
             ("agentfs.nested", "working-tree", Some(Capability::Other)),
             ("include.path", "/x", None),
-            ("includeif.gitdir:/x.path", "/x", None),
+            ("includeif.gitdir:/x.path", "/x", Some(Capability::Other)),
             ("core.autocrlf", "true", Some(Capability::Other)),
         ];
         for (key, value, expected) in cases {
@@ -357,12 +395,42 @@ mod tests {
     }
 
     #[test]
-    fn a_relative_include_is_reported_as_written() {
+    fn a_relative_include_resolves_against_the_state_area() {
         let state = tempfile::tempdir().unwrap();
         fs::write(state.path().join(FILE), "[include]\n\tpath = here\n").unwrap();
         let settings = OperatorSettings::read(state.path()).unwrap();
-        assert_eq!(settings.includes(), [PathBuf::from("here")]);
-        assert_eq!(settings.missing_includes(), [PathBuf::from("here")]);
+        assert_eq!(settings.includes(), [state.path().join("here")]);
+        assert_eq!(settings.missing_includes(), [state.path().join("here")]);
+    }
+
+    /// An include inside an included file is listed too, resolved against
+    /// the directory of the file naming it; a missing one is listed as
+    /// missing.
+    #[test]
+    fn nested_includes_are_listed_at_every_depth() {
+        let state = tempfile::tempdir().unwrap();
+        let fragments = tempfile::tempdir().unwrap();
+        let top = fragments.path().join("top");
+        let sub = fragments.path().join("sub");
+        fs::create_dir(&sub).unwrap();
+        fs::write(
+            &top,
+            "[include]\n\tpath = sub/inner\n\tpath = nested-missing\n",
+        )
+        .unwrap();
+        fs::write(
+            sub.join("inner"),
+            "[include]\n\tpath = deep\n[core]\n\tx = 1\n",
+        )
+        .unwrap();
+        write_includes(state.path(), std::slice::from_ref(&top)).unwrap();
+        let settings = OperatorSettings::read(state.path()).unwrap();
+        let missing = fragments.path().join("nested-missing");
+        assert_eq!(
+            settings.includes(),
+            [top, sub.join("inner"), missing.clone(), sub.join("deep")]
+        );
+        assert_eq!(settings.missing_includes(), [missing, sub.join("deep")]);
     }
 
     fn written(state: &Path) -> String {

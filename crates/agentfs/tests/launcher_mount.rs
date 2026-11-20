@@ -1,7 +1,8 @@
 //! `agentfs mount` on real FUSE mounts (docs/trees.md, "Run it"): a command
-//! run in the mount, the operator settings' not-built lines, `probe` on a
-//! live and a stale view, and a restart after a crash under each
-//! `--on-stale-mount` policy. Ignored by default: they need root and
+//! run in the mount, a stop sent on to it, a refused view keeping it from
+//! running, the operator settings' not-built lines, `probe` on a live and a
+//! stale view, and a restart after a crash under each `--on-stale-mount`
+//! policy. Ignored by default: they need root and
 //! /dev/fuse, and ci/fuse-tests.sh runs them with sudo.
 
 use std::io::{BufRead, BufReader};
@@ -290,7 +291,19 @@ fn refuse_and_hold_leave_a_stale_mount_alone() {
         Some(0),
         "the stale mount is left"
     );
+    // A held boot reads and logs the operator settings too.
+    let include = v.p("operator.conf");
+    std::fs::write(&include, "[remote \"o\"]\n\turl = /x\n").unwrap();
+    let out = v.run(&[
+        "init",
+        "--volume",
+        "t",
+        "--include",
+        include.to_str().unwrap(),
+    ]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
     let mut held = v.spawn(&["--on-stale-mount", "hold"]);
+    held.wait_for("not built: remote.o.url (push)");
     held.wait_for("Holding until SIGTERM");
     assert_eq!(v.probe(&["--allow-stale"]), Some(0), "nothing was mounted");
     rustix::process::kill_process(
@@ -302,4 +315,84 @@ fn refuse_and_hold_leave_a_stale_mount_alone() {
     assert_eq!(status.code(), Some(1), "{}", held.seen.join("\n"));
     assert_eq!(v.probe(&[]), Some(1));
     assert_eq!(agentfs_fuse::stale::agentfs_layers(&v.root()).unwrap(), 0);
+}
+
+/// (f) A SIGTERM to the mount while its command runs is sent on to the
+/// command: a command whose cwd is in the mount (so the view stays busy
+/// until it exits) traps it and exits 7, the mount exits 7, and nothing is
+/// left mounted.
+#[test]
+#[ignore = "needs root and /dev/fuse: ci/fuse-tests.sh"]
+fn a_stop_is_sent_on_to_the_command() {
+    let Some(v) = Volume::new() else { return };
+    let root = v.root().display().to_string();
+    let script = format!(
+        "cd {root}; trap 'kill $! 2>/dev/null; exit 7' TERM; sleep 1000 & echo up >&2; wait"
+    );
+    let mut mount = v.spawn(&["--", "sh", "-c", &script]);
+    mount.wait_for("up");
+    rustix::process::kill_process(
+        rustix::process::Pid::from_child(&mount.child),
+        rustix::process::Signal::TERM,
+    )
+    .unwrap();
+    let status = mount.child.wait().unwrap();
+    assert_eq!(status.code(), Some(7), "{}", mount.seen.join("\n"));
+    assert_eq!(v.probe(&["--allow-stale"]), Some(1), "nothing is mounted");
+    assert_eq!(agentfs_fuse::stale::agentfs_layers(&v.root()).unwrap(), 0);
+}
+
+/// (g) A view that cannot open means the command never runs: the root's
+/// view opens, then the fork's is refused when it opens (the metrics output
+/// is inside its mount point, which only the view host judges); the mount
+/// exits 1, the command's marker is never made, and no view is left
+/// mounted.
+#[test]
+#[ignore = "needs root and /dev/fuse: ci/fuse-tests.sh"]
+fn a_view_that_cannot_open_means_the_command_never_runs() {
+    let Some(v) = Volume::new() else { return };
+    let marker = v.p("marker");
+    let fork = v.p("fork");
+    let out = v.mount(&[
+        "--fork-mount",
+        fork.to_str().unwrap(),
+        "--metrics-output",
+        fork.join("metrics.json").to_str().unwrap(),
+        "--",
+        "touch",
+        marker.to_str().unwrap(),
+    ]);
+    let err = text(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{err}");
+    assert!(
+        err.contains(&format!("mounting {}", fork.display())),
+        "{err}"
+    );
+    assert!(!marker.exists(), "the command ran: {err}");
+    assert_eq!(v.probe(&["--allow-stale"]), Some(1), "nothing is mounted");
+    assert_eq!(agentfs_fuse::stale::agentfs_layers(&v.root()).unwrap(), 0);
+    assert_eq!(agentfs_fuse::stale::agentfs_layers(&fork).unwrap(), 0);
+}
+
+/// (h) A restart with `recover` never stacks a new fork over a crashed
+/// fork's mount: a crashed `mount ROOT --fork-mount F` without --fork-key
+/// restarted the same way exits 1 naming the fix, and F stays stale.
+#[test]
+#[ignore = "needs root and /dev/fuse: ci/fuse-tests.sh"]
+fn recover_never_stacks_a_new_fork_over_a_crashed_one() {
+    let Some(v) = Volume::new() else { return };
+    let fork = v.p("fork");
+    let fork_arg = fork.to_str().unwrap();
+    let mut mount = v.spawn(&["--fork-mount", fork_arg]);
+    mount.wait_for("mounted volume t");
+    mount.child.kill().unwrap();
+    mount.child.wait().unwrap();
+    let out = v.mount(&["--fork-mount", fork_arg, "--on-stale-mount", "recover"]);
+    let err = text(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{err}");
+    assert!(err.contains("--fork-key"), "{err}");
+    assert!(!err.contains("mounted volume"), "{err}");
+    assert_eq!(agentfs_fuse::stale::agentfs_layers(&fork).unwrap(), 1);
+    agentfs_fuse::stale::detach_stale_layers(&fork, 16).unwrap();
+    agentfs_fuse::stale::detach_stale_layers(&v.root(), 16).unwrap();
 }

@@ -103,12 +103,18 @@ syntax, kept apart from `history.git/config`, which the engine rewrites and its 
 children read. `init --include FILE` (repeatable, absolute, existing) makes the
 file exactly those `include.path` lines, as git's own includes; without `--include`
 a re-run keeps them. Every `mount` reads the file with libgit2, which follows the
-includes, before the volume is staged:
+includes, before the volume is staged and before a mount point is created or
+sealed (a boot that holds over a stale mount reads and logs it too). An include
+at any depth (one named by an included file too, a relative one resolved against
+the directory of the file naming it, as git does) is checked:
 
 - an include under a view's mount point exits 1, since the workload could change
   the operator's settings;
 - a missing include is warned of (`warning: operator settings: include <path> is
   missing`), as git skips it;
+- an `includeIf.<condition>.path` line is logged as not built (`other`): libgit2
+  evaluates no condition for a file outside a repository, so its target is never
+  read;
 - each key whose capability tree volumes do not build yet is logged at every boot,
   one line per key, and the mount serves anyway:
 
@@ -150,13 +156,20 @@ The next `mount` judges each mount point before it stages anything, by
   every stale layer and exit 1. A pod held this way recovers at its next start.
 - `recover`: stack each view over its stale mount: FUSE mounts at a private
   directory under `<state>/stack/`, is bind-mounted over the stale mount, so every
-  copy of it (a container's propagated mount, a `subPath` bind) reaches the new
-  view, and the private mount is detached. The mount prints `stacked over a stale
-  mount at PATH left by a crashed daemon`; the stale layers below are detached
-  when the view ends. It needs `CAP_SYS_ADMIN`; a stale mount of another volume
-  exits 1.
+  copy of the mount point (a container's propagated mount, a `subPath` bind of the
+  mount point itself) reaches the new view, and the private mount is detached. A
+  bind of a directory inside the dead view is not reached: it answers `ENOTCONN`
+  until its container restarts. The mount prints `stacked over a stale mount at
+  PATH left by a crashed daemon`; the stale layers below are detached when the view
+  ends, and a dead layer a crash left under `<state>/stack/` is detached at the
+  next start. It needs `CAP_SYS_ADMIN`. A view stacks only over its own stale
+  mount, the exact source it would mount with: a stale mount of another volume or
+  of another tree (a fork's at the root's mount point) exits 1, and so does a fork
+  mount without `--fork-key`, which makes a new fork that never stacks over a
+  crashed fork's mount (give that fork's key to resume it, or `umount -l PATH`).
 
-A live mount there exits 1 (`already mounted`), and so does another filesystem.
+A mount point inside the state area exits 1 before anything is created there. A
+live mount there exits 1 (`already mounted`), and so does another filesystem.
 With `--seal-mountpoint` (`AGENTFS_SEAL_MOUNTPOINT`, root only) each bare mount
 point is made root's with mode 0000 before mounting, so a non-root workload that
 reaches it while no view is mounted (a `subPath` bound while a sidecar restarts)

@@ -61,9 +61,26 @@ pub fn mount_state(path: &Path) -> io::Result<MountState> {
     mount_state_in(&mountinfo::read()?, path)
 }
 
-/// `path` resolved as mountinfo names it, through its parent when the path
-/// itself cannot be reached (a stale mount).
-fn resolve_mountpoint(path: &Path) -> io::Result<PathBuf> {
+/// Whether a view whose source would be `expected` may stack over the stale
+/// agentfs mount whose source is `found`: only over its own, the exact
+/// source. A stale mount of another volume, or of another tree of this one
+/// (a fork's at the root's mount point, or a crashed unkeyed fork's under a
+/// new fork), is another mount point's, and stacking over it would show the
+/// workload's open paths a different tree. The one judge of that rule: the
+/// view host, the recording mount and `agentfs mount` all ask it.
+#[must_use]
+pub fn stackable(found: &str, expected: &str) -> bool {
+    found == expected
+}
+
+/// `path` resolved as mountinfo names it: canonical, or through its parent
+/// when the path itself cannot be reached (a stale mount answers
+/// `ENOTCONN`). The one implementation of that rule.
+///
+/// # Errors
+///
+/// Neither the path nor its parent resolves.
+pub fn resolved_mountpoint(path: &Path) -> io::Result<PathBuf> {
     Ok(match path.canonicalize() {
         Ok(p) => p,
         Err(_) => match (path.parent(), path.file_name()) {
@@ -82,7 +99,7 @@ fn resolve_mountpoint(path: &Path) -> io::Result<PathBuf> {
 
 fn mount_state_in(entries: &[MountEntry], path: &Path) -> io::Result<MountState> {
     // A path whose parent does not exist yet has nothing mounted on it.
-    let resolved = match resolve_mountpoint(path) {
+    let resolved = match resolved_mountpoint(path) {
         Ok(resolved) => resolved,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(MountState::NotMounted),
         Err(e) => return Err(e),
@@ -139,7 +156,7 @@ pub fn detach_stale_layers(path: &Path, max: usize) -> io::Result<usize> {
 
 /// Counts the agentfs mounts at `path` (stacked layers included).
 pub fn agentfs_layers(path: &Path) -> io::Result<usize> {
-    let resolved = resolve_mountpoint(path)?;
+    let resolved = resolved_mountpoint(path)?;
     Ok(mountinfo::read()?
         .iter()
         .filter(|e| e.mountpoint == resolved && e.is_agentfs())
@@ -167,6 +184,32 @@ pub fn prepare_stack_source(source: &Path) -> io::Result<()> {
         )));
     }
     Ok(())
+}
+
+/// Detaches the stale layers under every entry of `stack` (the state area's
+/// directory of private stacking sources), whichever view ids this run
+/// opens: a crash between mounting a stacked view's source and binding it
+/// leaves a dead mount at its entry, which no later run might reuse. Empty
+/// entries are removed. Answers the layers detached; a missing `stack` holds
+/// none.
+///
+/// # Errors
+///
+/// The directory could not be read, or a layer could not be detached.
+pub fn clear_stack_sources(stack: &Path) -> io::Result<usize> {
+    let entries = match std::fs::read_dir(stack) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(e),
+    };
+    let mut detached = 0;
+    for entry in entries {
+        let source = entry?.path();
+        detached += detach_stale_layers(&source, STALE_LAYERS)?;
+        // Best effort: a live source (another layer) or a file stays.
+        let _ = std::fs::remove_dir(&source);
+    }
+    Ok(detached)
 }
 
 /// Bind-mounts the mount at `source` over `target`, makes the new layer
@@ -214,6 +257,18 @@ mod tests {
         assert_eq!(source_volume("agentfs:"), None);
         assert_eq!(source_volume("agentfs::x"), None);
         assert_eq!(source_volume("tmpfs"), None);
+    }
+
+    /// Only a view's own stale mount is stackable: the exact source, never
+    /// another tree of the same volume.
+    #[test]
+    fn only_the_exact_source_is_stackable() {
+        assert!(stackable("agentfs:t", "agentfs:t"));
+        assert!(stackable("agentfs:t:fork/3", "agentfs:t:fork/3"));
+        assert!(!stackable("agentfs:t:fork/3", "agentfs:t"));
+        assert!(!stackable("agentfs:t", "agentfs:t:fork/3"));
+        assert!(!stackable("agentfs:t:fork/2", "agentfs:t:fork/3"));
+        assert!(!stackable("agentfs:u", "agentfs:t"));
     }
 
     #[test]

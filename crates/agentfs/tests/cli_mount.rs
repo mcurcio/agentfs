@@ -148,6 +148,78 @@ fn an_include_under_a_view_is_refused_before_staging() {
     assert_eq!(l.files(), before, "the volume was staged");
 }
 
+/// An include named by an included file is checked as a top-level one: one
+/// under a view is refused, and the refusal comes before the mount point is
+/// created.
+#[test]
+fn a_nested_include_under_a_view_is_refused_before_anything_is_created() {
+    let l = Layout::new();
+    let top = l.p("top.conf");
+    let at = l.p("fresh");
+    std::fs::write(
+        &top,
+        format!("[include]\n\tpath = {}/operator.conf\n", s(&at)),
+    )
+    .unwrap();
+    l.init(&["--include", s(&top)]);
+    let before = l.files();
+    let out = run(&l.state(), &["mount", s(&at), "--", "true"]);
+    refused(&out, "is under the mount point");
+    assert!(
+        !at.exists(),
+        "the mount point was created before the refusal"
+    );
+    assert_eq!(l.files(), before, "the volume was staged");
+}
+
+/// A missing include named by an included file is warned of.
+#[test]
+fn a_missing_nested_include_is_warned_of() {
+    let l = Layout::new();
+    let top = l.p("top.conf");
+    std::fs::write(&top, "[include]\n\tpath = nested-missing\n").unwrap();
+    l.init(&["--include", s(&top)]);
+    // A mount point with files stops the mount after the settings are read,
+    // before anything is mounted.
+    std::fs::write(l.p("mnt/left.txt"), "x").unwrap();
+    let out = run(&l.state(), &["mount", s(&l.p("mnt")), "--", "true"]);
+    refused(&out, "is not empty");
+    assert!(
+        stderr(&out).contains(&format!(
+            "warning: operator settings: include {} is missing",
+            l.p("nested-missing").display()
+        )),
+        "{}",
+        stderr(&out)
+    );
+}
+
+/// A mount point inside the state area is refused before anything is
+/// created there, for the root's view and a fork's.
+#[test]
+fn a_mount_point_inside_the_state_area_is_refused() {
+    let l = Layout::new();
+    l.init(&[]);
+    let before = l.files();
+    let inside = l.state().join("inside");
+    for args in [
+        vec!["mount", s(&inside), "--", "true"],
+        vec![
+            "mount",
+            s(&l.p("mnt")),
+            "--fork-mount",
+            s(&inside),
+            "--",
+            "true",
+        ],
+    ] {
+        let out = run(&l.state(), &args);
+        refused(&out, "is inside the state area");
+        assert!(!inside.exists(), "{args:?}: the mount point was created");
+        assert_eq!(l.files(), before, "{args:?}: the state area changed");
+    }
+}
+
 /// A mount point holding files is refused: the mount would hide them.
 #[test]
 fn a_mount_point_with_files_is_refused() {

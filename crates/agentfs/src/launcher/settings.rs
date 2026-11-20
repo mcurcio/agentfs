@@ -22,7 +22,7 @@ pub(super) fn at_boot(state: &Path, views: &[&Path]) -> Result<Vec<NotBuilt>> {
     let settings = OperatorSettings::read(state).context("reading the operator settings")?;
     let views: Vec<PathBuf> = views.iter().map(|at| resolved(at)).collect();
     for include in settings.includes() {
-        let path = resolved(&state.join(include));
+        let path = resolved(include);
         if let Some(view) = views.iter().find(|view| path.starts_with(view)) {
             bail!(
                 "operator settings: include {} is under the mount point {}, where the workload \

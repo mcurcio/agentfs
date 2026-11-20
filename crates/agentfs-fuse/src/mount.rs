@@ -441,15 +441,9 @@ pub fn preflight_stacked(
     mountpoint: &Path,
     kind: MountKind,
 ) -> Result<(PathBuf, PathBuf), PreflightError> {
-    let (Some(parent), Some(name)) = (mountpoint.parent(), mountpoint.file_name()) else {
+    let Ok(resolved) = crate::stale::resolved_mountpoint(mountpoint) else {
         return Err(PreflightError::NotStale(mountpoint.to_path_buf()));
     };
-    let parent = if parent.as_os_str().is_empty() {
-        Path::new(".")
-    } else {
-        parent
-    };
-    let resolved = canonical_dir(kind.label(), parent)?.join(name);
     match mount_state(&resolved) {
         Ok(MountState::Stale { source }) => {
             same_volume(&resolved, source, &settings.volume, kind)?;
@@ -468,7 +462,7 @@ fn same_volume(
     kind: MountKind,
 ) -> Result<(), PreflightError> {
     let expected = MountSource::new(volume, kind).render();
-    if source == expected {
+    if crate::stale::stackable(&source, &expected) {
         return Ok(());
     }
     Err(PreflightError::OtherVolume {

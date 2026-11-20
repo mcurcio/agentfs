@@ -35,7 +35,7 @@ step "tree views stacked over a stale mount, as root (crates/agentfs-fuse/src/tr
 OUT=$(sudo "$unit" tree_view::tests::stale_view --ignored --test-threads=1 --nocapture 2>&1) ||
   { echo "$OUT"; fail "stale view tests failed"; }
 echo "$OUT"
-case "$OUT" in *"test result: ok. 2 passed"*) ;; *) fail "the stale view tests did not both run" ;; esac
+case "$OUT" in *"test result: ok. 3 passed"*) ;; *) fail "the stale view tests did not all run" ;; esac
 
 step "agentfs mount, as root, kernel $(uname -r) (crates/agentfs/tests/launcher_mount.rs)"
 sudo --preserve-env=RUST_BACKTRACE,RUNNER_TEMP "$bin" --ignored --test-threads=1 --nocapture "$@"
