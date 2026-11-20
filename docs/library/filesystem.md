@@ -679,9 +679,15 @@ end of a socket pair whose other end only the parent holds. Anything else
 exits 2 before the state area is touched (`agentfs host is run by a launcher
 that controls it over its standard input, a Unix socket`). No socket path
 exists, so only the parent can reach it. The parent closing its end (EOF) is
-a stop, as SIGTERM and SIGINT are: the host drains and exits 0 once Volume
-releases the volume, so a host never outlives its parent. The last view
-ending does not stop it.
+a stop, as SIGTERM and SIGINT are, so a host never outlives its parent. With
+no view open the host drains and exits 0 once Volume releases the volume. With
+a view open it exits 3 at once, logging `stopped with N view(s) open`: each
+view's mount is left stale and its client attached, as a crash leaves them,
+because the views belong to pods the parent does not own; the next host
+rebinds each client and stacks over each mount. Every change a view took is in
+the journal already. A drain logs `tree DrainBlocked` with the clients of
+other launchers it waits for: only their own launcher ends them. The last view
+ending does not stop the host.
 
 **Boot.** As `mount`'s, under `--launcher ID`: the volume found (exit 1 for
 another format, 75 while another process holds it) and checked against
@@ -701,7 +707,7 @@ only after the previous reply has arrived.
 | (none: the host's first line) | | `{"v":1,"volume":NAME,"id":ID}` |
 | `open` | `tree` (`"root"` or `{"fork":KEY}`), `at`, `label`, `read_only`, `pod` | `{"opened":{"tree":..,"stacked":BOOL}}` |
 | `close` | `at` | `"closed"`, once the view has ended: its files released and its client detached |
-| `reconcile` | | `{"reconciled":{"ended":N}}`: the launcher's clients and keyed forks that no open view uses are ended |
+| `reconcile` | | `{"reconciled":{"ended":N}}`: the launcher's clients that no open view uses are ended |
 | `fork_create` | `upstream` (a tree as in `open`), `key`, `settings` (Trees' `ForkSettings`) | `{"forked":{"tree":..}}` |
 | `fork_end` | `key` | `"ended"` |
 
@@ -712,7 +718,7 @@ forks), `approval_not_built` (`Landing::Approval`), `mount_failed`, `stale`
 (another source's stale mount at `at`), `occupied` (a view is open there with
 another tree, label or access), `draining` and `stopped` (the actor stopped
 after a recording failure). The message carries the real error. A malformed
-line is the last one read: the host drains and exits 2.
+line is the last one read: the host stops and exits 2.
 
 **Opening a view.** `at` is an existing empty directory, or a stale agentfs
 mount of the view's own source, which the view stacks over
@@ -730,7 +736,8 @@ request names the label and access, and a stale mount of the view's own
 source is always stacked over.
 
 **Exit status.** 0 once the volume is released; 1 for a refusal at boot or a
-stopped actor; 2 without a control channel or after a malformed line; 75 while
+stopped actor; 2 without a control channel or after a malformed line; 3 when
+stopped with views open (left stale, the volume not released); 75 while
 another process holds the volume.
 
 ### The view host

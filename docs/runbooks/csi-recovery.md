@@ -58,11 +58,14 @@ host"`.
 
 ## Upgrading the node plugin
 
-A node plugin's restart stops that node's hosts: on SIGTERM it closes each
-host's control channel, and each host drains (its last saves made) and
-exits, within the pod's 60 s grace. Their FUSE sessions cannot be handed to
-another process, so the node's mounts answer `ENOTCONN` until the new
-plugin opens them again from `<nodeState>/published/`. The DaemonSet is
+A node plugin's restart stops that node's hosts: on SIGTERM (or when the
+plugin dies) each host's control channel closes. A host with no view open
+drains and exits 0; a host with views open exits at once with status 3,
+logging `stopped with N view(s) open`, and leaves each mount stale as a
+crash does. Their FUSE sessions cannot be handed to another process, so the
+node's mounts answer `ENOTCONN` until the new plugin opens them again from
+`<nodeState>/published/`, stacked over the stale mounts; each view's client
+is rebound, so a fork claim keeps its writer. The DaemonSet is
 `updateStrategy: OnDelete`: roll it node by node, stopping the node's
 agentfs pods first, so nothing is interrupted:
 
@@ -85,8 +88,8 @@ With Helm, `helm upgrade` changes the DaemonSet the same way, and each
 node takes the new plugin only when its pod is deleted. Check each node's
 new plugin log for `reconciled: N host(s) started, M view(s) opened
 again, ...`. Deleting a plugin pod with the workloads still running also
-works: they see `ENOTCONN` for seconds, and containers without
-`HostToContainer` need a restart.
+works: they see `ENOTCONN` until the new plugin has opened their views, and
+containers without `HostToContainer` need a restart.
 
 ## A node reboot
 
@@ -125,6 +128,8 @@ event:
   hand ([moving.md](moving.md)); the next retry succeeds.
 - `the host of volume <pv> did not release it`: the drain failed; its
   lines say why.
+- The call never answers (`DeadlineExceeded` in the provisioner's log) and
+  the plugin log shows `tree DrainBlocked`: see the next section.
 
 A deleted root claim's volume is kept, never removed: the plugin logs
 `kept volume <pv> at <dir>: ...`, and the directory stays with
@@ -132,6 +137,35 @@ A deleted root claim's volume is kept, never removed: the plugin logs
 ([csi.md](../csi.md#5-parameters)), or remove `<base>/<pv>` by hand once
 its history is archived (`git --git-dir <base>/<pv>/state/history.git
 bundle create <file> --all`).
+
+## A host never exits
+
+**Symptoms.** DeleteVolume, or a NodeUnpublish that closes a volume's last
+view, never answers; later calls on the volume answer `volume <pv> is busy:
+another process holds its state area`. The plugin log has
+`[host <pv>] tree DrainBlocked: the release waits for client(s) of another
+launcher to end: <label>#<n>@<launcher>/<tree>, ...`.
+
+**Cause.** A host drains by ending launcher `csi`'s clients. A client another
+launcher attached and never ended (an operator's `agentfs mount` of the
+volume that was killed, launcher `cli`) holds the release, and only its own
+launcher ends it.
+
+**Recovery.**
+
+1. Stop the blocked host (it has no view open):
+   `in_plugin pkill -9 -f "volumes/$PV/state host"`.
+2. For launcher `cli`, run a mount of the volume that ends at once; its drain
+   ends `cli`'s clients:
+
+   ```sh
+   in_plugin sh -c 'mkdir -p /tmp/end && agentfs --state <base>/<pv>/state mount /tmp/end -- true'
+   ```
+
+   For another launcher, run `agentfs host --launcher <launcher>` on the
+   volume from that launcher and close its input.
+3. The provisioner retries DeleteVolume (or the kubelet NodeUnpublish), and
+   the new host releases.
 
 ## Related
 

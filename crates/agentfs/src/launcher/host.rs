@@ -4,8 +4,12 @@
 //! Unix socket only the parent holds the other end of), one JSON object per
 //! line ([`agentfs_contracts::host`]). It boots as `mount` does, then writes
 //! [`Hello`] and answers each request in order. The parent closing its end
-//! (EOF), SIGTERM or SIGINT drains it; the last view ending does not. Prior
-//! art: the LSP and MCP stdio transports, Erlang ports.
+//! (EOF), SIGTERM or SIGINT stops it: with no view open it drains; with a
+//! view open it exits at once, each view's mount left stale and its client
+//! attached, as a crash leaves them, so the next host rebinds and stacks
+//! over them (the views belong to pods the parent does not own). The last
+//! view ending does not stop it. Prior art: the LSP and MCP stdio
+//! transports, Erlang ports.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::io::{BufRead as _, BufReader, Write as _};
@@ -21,10 +25,9 @@ use agentfs_contracts::host::{
     HOST_PROTOCOL, Hello, Refusal, RefusalKind, Reply, Request, TreeRef, ViewRequest,
 };
 use agentfs_contracts::name::{ClientLabel, ForkKey, LauncherId};
-use agentfs_contracts::trees::{ForkPhase, ForkSettings, TreeError, Trees};
+use agentfs_contracts::trees::{ForkPhase, ForkSettings, TreeError};
 use agentfs_contracts::views::{MountOptions, ViewError, ViewId};
 use agentfs_core::tree_actor::TreeId;
-use agentfs_fuse::stale::{MountState, mount_state};
 use anyhow::{Context as _, Result};
 
 use super::serving::{self, Driver, Serving, Trigger};
@@ -33,6 +36,10 @@ use crate::pod_args::PodArgs;
 
 /// Exit status of a host not run by a launcher, or told a malformed line.
 const EXIT_USAGE: u8 = 2;
+
+/// Exit status of a host stopped with views open: they are left stale for
+/// the next host, and the volume is not released.
+const EXIT_LEFT_OPEN: u8 = 3;
 
 /// `agentfs host`'s flags.
 #[derive(clap::Args)]
@@ -75,7 +82,8 @@ fn control_channel() -> Option<UnixStream> {
 /// started and [`Hello`] written; then each request answered until a stop.
 /// Exits 0 once the volume is released, 1 for a refusal at boot or a
 /// stopped actor, 2 without a control channel or after a malformed line,
-/// 75 while another process holds the volume.
+/// 3 when stopped with views open (left stale), 75 while another process
+/// holds the volume.
 ///
 /// # Errors
 ///
@@ -123,6 +131,19 @@ pub fn host(state: &Path, args: HostArgs, minter: Minter) -> Result<ExitCode> {
     driver.write(&mut serving, &hello);
     read_requests(control, sender)?;
     serving.run(&mut driver);
+    if serving.left() {
+        let open = serving.abandon();
+        eprintln!(
+            "stopped with {open} view(s) open: each mount is left stale (ENOTCONN) and its \
+             client attached, for the next host to rebind and stack over"
+        );
+        drop(otel);
+        return Ok(ExitCode::from(if driver.malformed {
+            EXIT_USAGE
+        } else {
+            EXIT_LEFT_OPEN
+        }));
+    }
     let finished = serving.finish();
     drop(otel);
     finished?;
@@ -177,6 +198,13 @@ struct HostDriver {
     malformed: bool,
 }
 
+/// Whether a stop leaves the views mounted rather than draining: some view
+/// is open and the actor still records (a stopped actor's views are closed,
+/// as nothing more can be recorded through them).
+fn leaves(serving: &Serving<Line>) -> bool {
+    !serving.views.is_empty() && !serving.domains.stopped()
+}
+
 fn refused(kind: RefusalKind, message: impl ToString) -> Reply {
     Reply::Refused(Refusal {
         kind,
@@ -185,8 +213,11 @@ fn refused(kind: RefusalKind, message: impl ToString) -> Reply {
 }
 
 impl Driver<Line> for HostDriver {
-    fn stopping(&mut self, _: &mut Serving<Line>) {
+    fn stopping(&mut self, serving: &mut Serving<Line>) {
         self.stopping = true;
+        if leaves(serving) {
+            serving.leave();
+        }
     }
 
     fn view_ended(&mut self, serving: &mut Serving<Line>, view: ViewId) {
@@ -232,7 +263,11 @@ impl HostDriver {
     fn stop(&mut self, serving: &mut Serving<Line>) {
         if !self.stopping {
             self.stopping = true;
-            serving.stop();
+            if leaves(serving) {
+                serving.leave();
+            } else {
+                serving.stop();
+            }
         }
     }
 
@@ -311,19 +346,12 @@ impl HostDriver {
                 Err(refusal) => return client_refusal(&refusal),
             };
         let client = binding.client.clone();
-        let stale = matches!(mount_state(&request.at), Ok(MountState::Stale { .. }));
         let options = MountOptions {
             allow_other: true,
             over_stale: true,
         };
         match serving.open(&request.at, binding, options) {
-            Ok(view) => {
-                if stale {
-                    eprintln!(
-                        "stacked over a stale mount at {} left by a crashed daemon",
-                        request.at.display()
-                    );
-                }
+            Ok((view, stacked)) => {
                 self.open.insert(
                     request.at,
                     OpenView {
@@ -333,10 +361,7 @@ impl HostDriver {
                         access,
                     },
                 );
-                Reply::Opened {
-                    tree,
-                    stacked: stale,
-                }
+                Reply::Opened { tree, stacked }
             }
             Err(e) => {
                 serving.domains.detach_all(&[client]);
@@ -402,15 +427,9 @@ fn fork_create(
 
 /// `fork_end`: the keyed fork ends, and drops once nothing holds it.
 fn fork_end(serving: &mut Serving<Line>, key: &ForkKey) -> Reply {
-    let domains = &mut serving.domains;
-    let ended = domains
-        .trees
-        .get_mut()
-        .end_keyed(key, &domains.cap, &domains.at);
-    domains.dispatch();
-    match ended {
+    match serving.domains.end_keyed(key) {
         Ok(()) => {
-            domains.settle();
+            serving.domains.settle();
             Reply::Ended
         }
         Err(refusal) => tree_refusal(&refusal),

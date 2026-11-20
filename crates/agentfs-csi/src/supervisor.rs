@@ -17,8 +17,10 @@
 //!   every recorded view of the volume whose target is still there
 //!   (stacked over a stale mount a crashed host left) and asks the host to
 //!   reconcile, which ends what no view uses any more.
-//! - **Stopping a host** drops its control channel: the host sees EOF,
-//!   drains, and exits 0 once Volume has released the volume.
+//! - **Stopping a host** drops its control channel: the host sees EOF. With
+//!   no view open (every stop the supervisor asks for) it drains and exits 0
+//!   once Volume has released the volume; with views open (the plugin's
+//!   shutdown) it exits 3 at once and leaves them stale for the next host.
 //! - **A host that exits unasked** is started again after a backoff while
 //!   records of the volume remain, with every view replayed. A start that
 //!   fails is tried again with backoff. These delays are the only timers.
@@ -473,7 +475,7 @@ impl Supervisor {
         };
         match client.call(Request::Reconcile).await {
             Ok(Reply::Reconciled { ended }) if ended > 0 => {
-                eprintln!("volume {volume}: {ended} fork(s) no view used were ended");
+                eprintln!("volume {volume}: {ended} client(s) no view used were ended");
             }
             Ok(Reply::Reconciled { .. }) => {}
             Ok(other) => {

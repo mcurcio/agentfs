@@ -128,18 +128,26 @@ impl Driver {
         let dir = tempfile::tempdir().unwrap();
         // Absolute: `agentfs init --include` takes an absolute path.
         let root = dir.path().canonicalize().unwrap();
+        let profiles = root.join("profiles");
+        fs::create_dir_all(&profiles).unwrap();
+        fs::write(
+            profiles.join("p.config"),
+            "# the test profile\n[agentfs]\n\tpushInterval = 60s\n",
+        )
+        .unwrap();
+        fs::write(profiles.join("p.exclude"), EXCLUDE).unwrap();
+        Self::start_in(dir).await
+    }
+
+    /// The plugin started over `dir`, reconciling its records first, as
+    /// `agentfs-csi` starts.
+    async fn start_in(dir: tempfile::TempDir) -> Self {
+        let root = dir.path().canonicalize().unwrap();
         let layout = Layout {
             base: root.join("base"),
             node_state: root.join("node"),
             profiles: root.join("profiles"),
         };
-        fs::create_dir_all(&layout.profiles).unwrap();
-        fs::write(
-            layout.profiles.join("p.config"),
-            "# the test profile\n[agentfs]\n\tpushInterval = 60s\n",
-        )
-        .unwrap();
-        fs::write(layout.profiles.join("p.exclude"), EXCLUDE).unwrap();
         let log = Arc::new(watch::channel(Vec::new()).0);
         let launcher = Arc::new(Tap {
             inner: AgentfsLauncher {
@@ -152,6 +160,7 @@ impl Driver {
             launcher,
             Arc::new(KernelMounter),
         );
+        supervisor.reconcile().await;
         let socket = root.join("csi.sock");
         let bound = server::bind(&socket).unwrap();
         let (stop, stopped) = oneshot::channel::<()>();
@@ -233,6 +242,14 @@ impl Driver {
     async fn stop(mut self) {
         let _ = self.stop.take().unwrap().send(());
         self.task.take().unwrap().await.unwrap();
+    }
+
+    /// The plugin stopped (its hosts' control channels closed) and started
+    /// again over the same node.
+    async fn restart(mut self) -> Self {
+        let _ = self.stop.take().unwrap().send(());
+        self.task.take().unwrap().await.unwrap();
+        Self::start_in(self.dir).await
     }
 }
 
@@ -814,6 +831,47 @@ async fn a_fork_claims_view_beside_its_source() {
     );
     fs::write(b.join("forked.md"), "from the fork\n").unwrap();
 
+    // A killed host comes back with both views, the fork's writer rebound.
+    let pids = host_pids(&state);
+    assert_eq!(pids.len(), 1, "{pids:?}");
+    let killed = Command::new("kill")
+        .args(["-9", &pids[0].to_string()])
+        .status()
+        .unwrap();
+    assert!(killed.success());
+    d.until("exit host pvc-1 killed by SIGKILL", 1).await;
+    d.until("line host pvc-1 {\"reconciled\"", 3).await;
+    for at in [&a, &b] {
+        assert!(
+            matches!(mount_state(at).unwrap(), MountState::Live { .. }),
+            "{at:?}: {:?}",
+            d.events()
+        );
+    }
+    fs::write(b.join("after-kill.md"), "after the kill\n").unwrap();
+
+    // The plugin restarts with both pods running: the host leaves their
+    // mounts stale, and the new plugin's host stacks over them, the fork's
+    // writer rebound, not taken.
+    let d = d.restart().await;
+    let mut c = d.controller();
+    let mut n = d.node();
+    for at in [&a, &b] {
+        assert!(
+            matches!(mount_state(at).unwrap(), MountState::Live { .. }),
+            "{at:?}: {:?}",
+            d.events()
+        );
+    }
+    assert_eq!(
+        fs::read_to_string(b.join("after-kill.md")).unwrap(),
+        "after the kill\n"
+    );
+    n.node_publish_volume(publish_claim_req("pvc-2", &b, fork_pod.clone()))
+        .await
+        .unwrap();
+    fs::write(b.join("after-restart.md"), "after the restart\n").unwrap();
+
     // One pod per fork claim.
     let other = d.target("c");
     let err = n
@@ -846,15 +904,18 @@ async fn a_fork_claims_view_beside_its_source() {
     n.node_unpublish_volume(unpublish_claim_req("pvc-2", &b))
         .await
         .unwrap();
-    d.until("exit host pvc-1 exit code 0", 2).await;
+    // This plugin's log starts at the restart: its one host has exited.
+    d.until("exit host pvc-1 exit code 0", 1).await;
     assert_eq!(
         d.count("exit host pvc-1 exit code 0"),
-        2,
+        1,
         "{:?}",
         d.events()
     );
-    let landed = messages(&state, "forked.md");
-    assert!(landed.contains("Agentfs-Pod: forker-0"), "{landed}");
+    for file in ["forked.md", "after-kill.md", "after-restart.md"] {
+        let landed = messages(&state, file);
+        assert!(landed.contains("Agentfs-Pod: forker-0"), "{file}: {landed}");
+    }
 
     // The fork has had its writer.
     let err = n

@@ -342,12 +342,15 @@ of DeleteVolume succeeds.
   see the new mount at once; others after a container restart. A restart that
   cannot start (a full disk, PID pressure) is tried again with the same
   backoff while the volume has records.
-- **The node plugin restarts** (an upgrade, a crash): on SIGTERM it closes
-  every host's control channel, and each host drains (its last saves made) and
-  exits; the mounts on the node answer `ENOTCONN` meanwhile. The new plugin
-  reconciles from `<nodeState>/published/`: records whose target the kubelet
-  removed are dropped, and every other volume gets a host that replays its
-  views, as for a crashed host. Because this interrupts the node's mounts, the
+- **The node plugin restarts** (an upgrade, a crash): its hosts' control
+  channels close, whether it stopped on SIGTERM or died. A host with no view
+  open drains and exits 0. A host with views open exits at once (status 3),
+  leaving each view's mount stale and its client attached, as a crash does:
+  the pods' mounts answer `ENOTCONN` meanwhile, and a fork claim keeps its one
+  writer. Every change a view took is already in the volume's journal. The new
+  plugin reconciles from `<nodeState>/published/`: records whose target the
+  kubelet removed are dropped, and every other volume gets a host that replays
+  its views, stacked over the stale mounts, as for a crashed host. Because this interrupts the node's mounts, the
   DaemonSet uses `updateStrategy: OnDelete`: roll it node by node
   ([runbook](runbooks/csi-recovery.md)).
 - **The node reboots**: the kubelet publishes the volumes of the pods it
@@ -507,6 +510,13 @@ Each node keeps its volumes under its own `--base-path`, on its own disk.
 - Draining a node leaves its agentfs pods `Pending` until its plugin returns.
   A fork claim's pod needs affinity to its source's pod (§14).
 - No capacity enforcement, snapshots or expansion.
+- A volume whose clients another launcher attached (an operator's
+  `agentfs mount` of the volume that crashed, launcher `cli`) cannot be
+  released by the driver: its host's drain ends only launcher `csi`'s
+  clients. DeleteVolume, and a NodeUnpublish that stops the volume's last
+  view, wait on that host until the CO's deadline; the host logs
+  `tree DrainBlocked` with the clients it waits for
+  ([runbook](runbooks/csi-recovery.md#a-host-never-exits)).
 - Restarting the node plugin interrupts that node's mounts until it has opened
   them again (seconds); containers without `HostToContainer` propagation need a
   restart to see the new mount.
@@ -611,7 +621,8 @@ spec:
   carries that pod's trailers and lands in the source automatically, so the
   source's pod sees it.
 - **One pod, for that pod's life.** The fork pod's view is the fork's one
-  writer. A restarted host rebinds it, so a host crash keeps it. Once that
+  writer. A restarted host rebinds it, so a host crash or a node plugin
+  restart keeps it (§8). Once that
   writer detaches (its pod ended), a new pod of the same fork claim is refused:
   the fork `has had its writer`.
 - **Delete.** Deleting the fork claim (a pod-scoped ephemeral claim goes with

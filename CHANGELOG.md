@@ -50,7 +50,11 @@ design was reviewed on 2026-10-12.
   files; the node plugin runs one `agentfs host` per volume in use on its node,
   driving it over the child's standard input (a Unix socket only the plugin
   holds; JSON lines, protocol v1: `open`, `close`, `reconcile`, `fork_create`,
-  `fork_end`), and EOF drains it. NodePublish opens a view directly at the
+  `fork_end`). EOF, SIGTERM or SIGINT drains a host with no view open; a host
+  with views open exits 3 at once and leaves their mounts stale, as a crash
+  does, so a plugin restart keeps every pod's view and a fork claim's one
+  writer. A drain logs `tree DrainBlocked` naming the clients of other
+  launchers it waits for. Views mount as type `fuse.agentfs`. NodePublish opens a view directly at the
   kubelet's target with the pod's context (`Agentfs-Pod`, `Agentfs-Namespace`,
   `Agentfs-Pod-Uid`, `Agentfs-Node` trailers); there is no NodeStage. A crashed
   host, or a restarted plugin, opens every published view again, stacked over

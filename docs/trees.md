@@ -191,13 +191,15 @@ volume staged and its domains restored, the view host started. It then writes
 a hello line and answers each request in order: `open` a view of the root or
 of the open fork under a key at a mount point, with a client label, an access
 and the pod context of its saves; `close` it; `reconcile` (end the launcher's
-clients and keyed forks no open view uses); `fork_create` and `fork_end` under
+clients no open view uses); `fork_create` and `fork_end` under
 a key. A view at a stale mount of its own source is stacked over it
 ([restarting](#restarting-after-a-crash)), and its client rebound when one of
 the launcher, tree, label and access is left from a crashed host, so a fork's
 one writer survives the crash. The parent closing its end (EOF), SIGTERM or
-SIGINT drains the volume, and the host exits 0 once it is released
-([lifecycle](#volume-lifecycle)); the last view ending does not stop it. The
+SIGINT stops the host: with no view open it drains the volume and exits 0 once
+it is released ([lifecycle](#volume-lifecycle)); with views open it exits 3 at
+once and leaves them stale, as a crash does, for the next host to rebind and
+stack over. The last view ending does not stop it. The
 messages and refusals are in
 [library/filesystem](library/filesystem.md#the-view-host-command).
 

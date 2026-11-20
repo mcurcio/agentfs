@@ -17,6 +17,7 @@ use agentfs_contracts::pod::PodContext;
 use agentfs_contracts::views::{MountOptions, MountPoint, ViewError, ViewId, Views};
 use agentfs_contracts::volume::{Volume, VolumeError};
 use agentfs_core::state_area::TreeStateArea;
+use agentfs_fuse::stale::{MountState, mount_state};
 use agentfs_fuse::tree_view::{HostEvent, ViewHost};
 use agentfs_volume::VolumeService;
 use anyhow::{Context as _, Result, bail};
@@ -123,6 +124,8 @@ pub(super) struct Serving<T> {
     /// Each open view's client: detached when the view ends.
     pub(super) views: BTreeMap<ViewId, ClientId>,
     triggers: mpsc::Receiver<Trigger<T>>,
+    /// [`Self::leave`] was asked: the loop ends with the views left mounted.
+    left: bool,
 }
 
 impl<T: Send + 'static> Serving<T> {
@@ -157,6 +160,7 @@ impl<T: Send + 'static> Serving<T> {
                 host,
                 views: BTreeMap::new(),
                 triggers,
+                left: false,
             },
             sender,
         ))
@@ -165,6 +169,8 @@ impl<T: Send + 'static> Serving<T> {
 
 impl<T> Serving<T> {
     /// Mounts `binding`'s view at `at`; its client is detached when it ends.
+    /// Answers whether it was stacked over a stale mount (allowed by
+    /// `options.over_stale`), which it logs.
     ///
     /// # Errors
     ///
@@ -174,13 +180,20 @@ impl<T> Serving<T> {
         at: &Path,
         binding: Binding,
         options: MountOptions,
-    ) -> std::result::Result<ViewId, ViewError> {
+    ) -> std::result::Result<(ViewId, bool), ViewError> {
         let client = binding.client.clone();
+        let stacked = options.over_stale && matches!(mount_state(at), Ok(MountState::Stale { .. }));
         let view = self
             .host
             .open(MountPoint(at.to_path_buf()), binding, options)?;
         self.views.insert(view, client);
-        Ok(view)
+        if stacked {
+            eprintln!(
+                "stacked over a stale mount at {} left by a crashed daemon",
+                at.display()
+            );
+        }
+        Ok((view, stacked))
     }
 
     /// Asks the view host to unmount `view`: [`Driver::view_ended`] follows.
@@ -204,6 +217,32 @@ impl<T> Serving<T> {
         }
     }
 
+    /// Ends the loop at once, with no drain: every open view stays mounted
+    /// and its client attached. The caller must then end the process
+    /// without dropping `self` (see [`Self::abandon`]), so each mount goes
+    /// stale as at a crash, and the next start rebinds its client and
+    /// stacks over it (docs/csi.md, "Recovery").
+    pub(super) fn leave(&mut self) {
+        self.left = true;
+    }
+
+    /// Whether [`Self::leave`] ended the loop.
+    pub(super) fn left(&self) -> bool {
+        self.left
+    }
+
+    /// After a [`Self::leave`]: forgets the view host without unmounting
+    /// anything, and answers how many views were open. Every change a view
+    /// took is in the journal already (docs/trees.md, "Recording and
+    /// durability"); the process's exit closes each view's kernel channel.
+    pub(super) fn abandon(self) -> usize {
+        let open = self.views.len();
+        // Dropping the view host would unmount its views, and dropping the
+        // domains would wait on the sessions it holds.
+        std::mem::forget(self);
+        open
+    }
+
     /// The next trigger; `None` once every sender is gone.
     pub(super) fn next(&self) -> Option<Trigger<T>> {
         self.triggers.recv().ok()
@@ -216,7 +255,10 @@ impl<T> Serving<T> {
     /// reports the stop.
     pub(super) fn run(&mut self, driver: &mut impl Driver<T>) {
         loop {
-            if self.domains.released || (self.views.is_empty() && self.domains.stopped()) {
+            if self.left
+                || self.domains.released
+                || (self.views.is_empty() && self.domains.stopped())
+            {
                 break;
             }
             if self.domains.draining {
@@ -226,6 +268,7 @@ impl<T> Serving<T> {
                 // Every client of this launcher ends, not only the views':
                 // the release is judged from the Clients index alone.
                 self.domains.reconcile(&ClientSet::new());
+                self.domains.log_foreign_clients();
                 self.close_all();
                 continue;
             }
@@ -233,7 +276,9 @@ impl<T> Serving<T> {
             match trigger {
                 Trigger::Stop => {
                     driver.stopping(self);
-                    self.stop();
+                    if !self.left {
+                        self.stop();
+                    }
                 }
                 Trigger::Host(HostEvent::ViewEnded(view)) => {
                     if let Some(client) = self.views.remove(&view) {

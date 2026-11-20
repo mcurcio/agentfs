@@ -501,6 +501,13 @@ fn a_view_opens_with_its_pod_and_closes() {
             source: "agentfs:t".into()
         }
     );
+    // The kernel names the filesystem by its subtype, as libfuse's mounts do.
+    let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").unwrap();
+    let entry = mountinfo
+        .lines()
+        .find(|line| line.split(' ').nth(4) == Some(a.to_str().unwrap()))
+        .unwrap_or_else(|| panic!("no mount at {a:?} in {mountinfo}"));
+    assert!(entry.contains(" - fuse.agentfs agentfs:t "), "{entry}");
     assert_eq!(
         host.ask(&open(TreeRef::Root, &a, "a", pod("ns", "p1", "u1"))),
         Reply::Opened {
@@ -543,8 +550,9 @@ fn a_view_opens_with_its_pod_and_closes() {
 }
 
 /// (j) A fork's view, opened beside the root's with its own pod: its write
-/// lands in the root, with that pod's trailers. The drain at EOF releases
-/// only with every queue empty, so the exit is the landing's event.
+/// lands in the root, with that pod's trailers. The drain at EOF (no view
+/// open) releases only with every queue empty, so the exit is the landing's
+/// event.
 #[test]
 #[ignore = "needs root and /dev/fuse: ci/fuse-tests.sh"]
 fn a_fork_view_lands_in_the_root() {
@@ -577,6 +585,7 @@ fn a_fork_view_lands_in_the_root() {
     );
     std::fs::write(b.join("g"), "g\n").unwrap();
     assert_eq!(host.ask(&close(&b)), Reply::Closed);
+    assert_eq!(host.ask(&close(&a)), Reply::Closed);
     let (status, log) = host.eof();
     assert_eq!(status.code(), Some(0), "{log}");
     let messages = v.messages("g");
@@ -589,13 +598,15 @@ fn a_fork_view_lands_in_the_root() {
         Reply::Opened { .. }
     ));
     assert_eq!(std::fs::read_to_string(a.join("g")).unwrap(), "g\n");
+    assert_eq!(host.ask(&close(&a)), Reply::Closed);
     let (status, log) = host.eof();
     assert_eq!(status.code(), Some(0), "{log}");
 }
 
 /// (k) After a kill, a new host opens both views with the same labels: each
 /// rebinds its client (so the fork's one writer is not taken) and stacks
-/// over its stale mount; reconcile ends nothing; EOF leaves nothing mounted.
+/// over its stale mount; reconcile ends nothing; closed, nothing is left
+/// mounted.
 #[test]
 #[ignore = "needs root and /dev/fuse: ci/fuse-tests.sh"]
 fn a_restarted_host_rebinds_and_stacks() {
@@ -651,6 +662,8 @@ fn a_restarted_host_rebinds_and_stacks() {
     assert_eq!(std::fs::read_to_string(a.join("f")).unwrap(), "f\n");
     assert_eq!(std::fs::read_to_string(b.join("g")).unwrap(), "g\n");
     std::fs::write(b.join("h"), "after the restart\n").unwrap();
+    assert_eq!(host.ask(&close(&a)), Reply::Closed);
+    assert_eq!(host.ask(&close(&b)), Reply::Closed);
     let (status, log) = host.eof();
     assert_eq!(status.code(), Some(0), "{log}");
     assert!(
@@ -664,6 +677,105 @@ fn a_restarted_host_rebinds_and_stacks() {
         assert_eq!(mount_state(at).unwrap(), MountState::NotMounted, "{at:?}");
         assert_eq!(agentfs_fuse::stale::agentfs_layers(at).unwrap(), 0);
     }
+}
+
+/// (m) A stop with views open (the parent gone: EOF) drains nothing: the
+/// host exits 3, each mount left stale and its client attached, as at a
+/// crash. The next host rebinds both clients, so the fork claim keeps its
+/// one writer, and stacks over both mounts; what the views wrote is there.
+#[test]
+#[ignore = "needs root and /dev/fuse: ci/fuse-tests.sh"]
+fn a_stop_with_views_open_leaves_them_for_the_next_host() {
+    let Some(v) = Volume::mounted() else { return };
+    let (a, b) = (mkdir(&v, "a"), mkdir(&v, "b"));
+    let mut host = v.host(&[]);
+    host.hello();
+    assert!(matches!(
+        host.ask(&open(TreeRef::Root, &a, "a", pod("ns", "p1", "u1"))),
+        Reply::Opened { .. }
+    ));
+    let fork = forked(&host.ask(&fork_create(TreeRef::Root, "k", Landing::Automatic)));
+    assert!(matches!(
+        host.ask(&open(
+            TreeRef::Fork(key("k")),
+            &b,
+            "b",
+            pod("ns", "p2", "u2")
+        )),
+        Reply::Opened { .. }
+    ));
+    std::fs::write(a.join("f"), "f\n").unwrap();
+    std::fs::write(b.join("g"), "g\n").unwrap();
+    let (status, log) = host.eof();
+    assert_eq!(status.code(), Some(3), "{log}");
+    assert!(log.contains("stopped with 2 view(s) open"), "{log}");
+    for at in [&a, &b] {
+        assert!(
+            matches!(mount_state(at).unwrap(), MountState::Stale { .. }),
+            "{at:?}"
+        );
+    }
+
+    let mut host = v.host(&[]);
+    host.hello();
+    assert_eq!(
+        host.ask(&open(TreeRef::Root, &a, "a", pod("ns", "p1", "u1"))),
+        Reply::Opened {
+            tree: TreeId::Root,
+            stacked: true
+        }
+    );
+    assert_eq!(
+        host.ask(&open(
+            TreeRef::Fork(key("k")),
+            &b,
+            "b",
+            pod("ns", "p2", "u2")
+        )),
+        Reply::Opened {
+            tree: fork,
+            stacked: true
+        },
+        "the fork claim's writer is rebound, not taken"
+    );
+    assert_eq!(
+        host.ask(&Request::Reconcile),
+        Reply::Reconciled { ended: 0 }
+    );
+    assert_eq!(std::fs::read_to_string(a.join("f")).unwrap(), "f\n");
+    assert_eq!(std::fs::read_to_string(b.join("g")).unwrap(), "g\n");
+    assert_eq!(host.ask(&close(&a)), Reply::Closed);
+    assert_eq!(host.ask(&close(&b)), Reply::Closed);
+    let (status, log) = host.eof();
+    assert_eq!(status.code(), Some(0), "{log}");
+    for at in [&a, &b] {
+        assert_eq!(mount_state(at).unwrap(), MountState::NotMounted, "{at:?}");
+        assert_eq!(agentfs_fuse::stale::agentfs_layers(at).unwrap(), 0);
+    }
+    assert!(v.messages("f").contains("Agentfs-Pod: p1"));
+}
+
+/// (n) A host killed with a view open leaves its client attached. A new
+/// host stopped before any open or reconcile still releases: its drain ends
+/// every client of its launcher, not only its views'.
+#[test]
+#[ignore = "needs root and /dev/fuse: ci/fuse-tests.sh"]
+fn a_drain_ends_a_crashed_hosts_clients() {
+    let Some(v) = Volume::mounted() else { return };
+    let a = mkdir(&v, "a");
+    let mut host = v.host(&[]);
+    host.hello();
+    assert!(matches!(
+        host.ask(&open(TreeRef::Root, &a, "a", pod("ns", "p1", "u1"))),
+        Reply::Opened { .. }
+    ));
+    host.kill();
+    let mut host = v.host(&[]);
+    host.hello();
+    let (status, log) = host.eof();
+    assert_eq!(status.code(), Some(0), "{log}");
+    assert!(!log.contains("DrainBlocked"), "{log}");
+    agentfs_fuse::stale::detach_stale_layers(&a, 4).unwrap();
 }
 
 /// (l) A fork has one writer for life: once its view closed cleanly, a view

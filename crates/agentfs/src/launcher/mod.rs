@@ -36,7 +36,7 @@ use agentfs_contracts::clients::{
 use agentfs_contracts::name::{ClientLabel, ForkKey, LauncherId, VolumeName};
 use agentfs_contracts::pod::PodContext;
 use agentfs_contracts::ports::{Found, StateArea};
-use agentfs_contracts::trees::{ForkSettings, Landing, TreeError, Trees};
+use agentfs_contracts::trees::{ForkSettings, Landing, TreeError};
 use agentfs_contracts::views::{MountOptions, ViewError, ViewId};
 use agentfs_contracts::volume::{
     EnsureOutcome, StartPoint, Volume, VolumeError, VolumeIdentity, VolumeSpec,
@@ -464,9 +464,7 @@ pub fn end_fork(state: &Path, args: EndArgs, minter: Minter) -> Result<ExitCode>
         ClientsSlot::new(None),
         None,
     )?;
-    let ended = domains.trees.get_mut().end_keyed(&key, &domains.cap, &at);
-    domains.dispatch();
-    match ended {
+    match domains.end_keyed(&key) {
         Ok(()) => Ok(ExitCode::SUCCESS),
         Err(refused @ TreeError::KeyUnknown) => {
             eprintln!("error: {refused}");
@@ -610,15 +608,7 @@ impl Mount {
                 over_stale,
             };
             match serving.open(&at, binding, options) {
-                Ok(_) => {
-                    if over_stale {
-                        eprintln!(
-                            "stacked over a stale mount at {} left by a crashed daemon",
-                            at.display()
-                        );
-                    }
-                    opened.push((at, tree));
-                }
+                Ok(_) => opened.push((at, tree)),
                 Err(e) => {
                     failed = Some(open_failure(&at, &e));
                     unopened.push(client);

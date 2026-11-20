@@ -8,7 +8,8 @@ use std::sync::Arc;
 use agentfs_clients::ClientsService;
 use agentfs_contracts::caps::{LaunchCap, Minter};
 use agentfs_contracts::clients::{
-    Access, Binding, ClientError, ClientEvent, ClientId, ClientSet, Clients, Consistency, Grant,
+    Access, AttachedLookup as _, Binding, ClientError, ClientEvent, ClientId, ClientSet, Clients,
+    Consistency, Grant,
 };
 use agentfs_contracts::name::{ClientLabel, ForkKey};
 use agentfs_contracts::pod::PodContext;
@@ -188,6 +189,27 @@ impl Domains {
         ended
     }
 
+    /// Logs, at a drain's start, the attached clients of other launchers:
+    /// the release waits for them, and only their own launcher ends them
+    /// (docs/runbooks/csi-recovery.md, "A host never exits").
+    pub(super) fn log_foreign_clients(&self) {
+        let ours = self.cap.launcher();
+        let foreign: Vec<String> = self
+            .clients()
+            .attached_any()
+            .into_iter()
+            .filter(|client| client.launcher != *ours)
+            .map(|client| client.to_string())
+            .collect();
+        if !foreign.is_empty() {
+            eprintln!(
+                "tree DrainBlocked: the release waits for client(s) of another launcher to end: \
+                 {}; start that launcher on this volume again and stop it, which ends them",
+                foreign.join(", ")
+            );
+        }
+    }
+
     /// One view's client on a new session, with `at` its pod context: the
     /// restored client of this launcher, tree, label and access rebound
     /// (its view host died with the process), else a new one attached
@@ -243,6 +265,13 @@ impl Domains {
             .create(upstream, key, settings, &self.cap, &self.at);
         self.dispatch();
         Ok(fork?.into())
+    }
+
+    /// Ends the keyed fork under `key`: it drops once nothing holds it.
+    pub(super) fn end_keyed(&mut self, key: &ForkKey) -> Result<(), TreeError> {
+        let ended = self.trees.get_mut().end_keyed(key, &self.cap, &self.at);
+        self.dispatch();
+        ended
     }
 
     /// The fork under `key` and its phase, whatever the phase; never made.
