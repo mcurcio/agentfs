@@ -1,6 +1,6 @@
 //! The CSI Identity service: the driver's name and version,
 //! and its capabilities: the Controller service, served by every node
-//! plugin (F8 R8), and volume accessibility constraints, since a worktree
+//! plugin, and volume accessibility constraints, since a volume
 //! lives on one node's disk ([`TOPOLOGY_KEY`]).
 
 use std::collections::HashMap;
@@ -15,9 +15,9 @@ use crate::csi::v1::{
     GetPluginInfoResponse, PluginCapability, ProbeRequest, ProbeResponse,
 };
 
-/// The topology key of every agentfs worktree: the node whose disk holds
+/// The topology key of every agentfs volume: the node whose disk holds
 /// it. NodeGetInfo reports it (the kubelet labels the node with it), and
-/// CreateVolume answers it, so the PV's node affinity keeps a worktree's
+/// CreateVolume answers it, so the PV's node affinity keeps a volume's
 /// pods on its node.
 pub const TOPOLOGY_KEY: &str = "topology.agentfs.mcurcio.github.io/node";
 

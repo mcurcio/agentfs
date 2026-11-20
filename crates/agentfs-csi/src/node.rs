@@ -1,8 +1,11 @@
-//! The CSI Node service: validates the calls and hands them
-//! to the [`Supervisor`]. NodeGetInfo reports this node's topology
+//! The CSI Node service (docs/csi.md): validates the calls, resolves the
+//! claim, and hands them to the [`Supervisor`]. There is no stage step:
+//! NodePublish opens the pod's view at the kubelet's target on the volume's
+//! host. NodeGetInfo reports this node's topology
 //! ([`crate::identity::TOPOLOGY_KEY`]), which the kubelet puts on the node
 //! as a label and the PVs' node affinity matches.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -18,10 +21,15 @@ use crate::csi::v1::{
     NodeUnpublishVolumeRequest, NodeUnpublishVolumeResponse, NodeUnstageVolumeRequest,
     NodeUnstageVolumeResponse, VolumeCapability,
 };
+use agentfs_contracts::host::TreeRef;
+use agentfs_contracts::ports::Found;
+
+use crate::controller::{FORKS_NOT_BUILT, inspect, recording_format};
 use crate::error::Error;
 use crate::layout::validate_handle;
-use crate::params::{self, PodInfo, is_ephemeral};
-use crate::supervisor::{PublishRequest, StageRequest, Supervisor};
+use crate::params::{VolumeParams, is_ephemeral, pod_context};
+use crate::records::{self, ClaimKind, ClaimRecord, RECORD_VERSION};
+use crate::supervisor::{Supervisor, ViewSpec};
 use crate::volume::check_capability;
 
 /// What an inline ephemeral volume is told.
@@ -79,40 +87,81 @@ fn node_capability(t: rpc::Type) -> NodeServiceCapability {
     }
 }
 
+impl NodeService {
+    /// The view NodePublish opens: the claim's own volume, from its
+    /// `csi.json`, or a static PV over a kept volume, adopted (its
+    /// `csi.json` written) only over a tree volume of the asked name.
+    async fn resolve(
+        &self,
+        handle: &str,
+        volume_context: &HashMap<String, String>,
+    ) -> Result<(String, TreeRef), Error> {
+        let config = self.supervisor.config();
+        let layout = &config.layout;
+        let found = inspect(layout, handle)?;
+        if found == Found::Other {
+            return Err(recording_format(layout, handle));
+        }
+        if let Some(record) = records::load_claim(layout, handle)? {
+            return match record.claim {
+                ClaimKind::Volume { .. } => Ok((handle.to_owned(), TreeRef::Root)),
+                ClaimKind::Fork { .. } => Err(Error::Internal(FORKS_NOT_BUILT.into())),
+            };
+        }
+        let Found::Volume(identity) = found else {
+            return Err(Error::NotFound(format!(
+                "no volume {handle} on node {} under {}; the pod waits",
+                config.node_id,
+                layout.base.display()
+            )));
+        };
+        let params = VolumeParams::from_static(handle, volume_context)
+            .map_err(|e| Error::InvalidArgument(e.to_string()))?;
+        if identity.name != params.name {
+            return Err(Error::AlreadyExists(format!(
+                "volume {handle} holds agentfs volume {}, not {}",
+                identity.name, params.name
+            )));
+        }
+        self.supervisor.ensure(handle, &params).await?;
+        records::store_claim(
+            layout,
+            handle,
+            &ClaimRecord {
+                v: RECORD_VERSION,
+                capacity_bytes: 0,
+                claim: ClaimKind::Volume {
+                    name: params.name.clone(),
+                    profile: params.profile.clone(),
+                },
+            },
+        )?;
+        eprintln!(
+            "adopted volume {handle} (agentfs volume {}, profile {}) through a static PV",
+            params.name, params.profile
+        );
+        Ok((handle.to_owned(), TreeRef::Root))
+    }
+}
+
 #[tonic::async_trait]
 impl Node for NodeService {
     async fn node_stage_volume(
         &self,
-        request: Request<NodeStageVolumeRequest>,
+        _request: Request<NodeStageVolumeRequest>,
     ) -> Result<Response<NodeStageVolumeResponse>, Status> {
-        let req = request.into_inner();
-        required(&req.volume_id, "the volume id")?;
-        absolute(&req.staging_target_path, "the staging target path")?;
-        capability(req.volume_capability.as_ref())?;
-        if is_ephemeral(&req.volume_context) {
-            return Err(Error::InvalidArgument(EPHEMERAL_REFUSED.into()).into());
-        }
-        let handle = handle(&req.volume_id)?.to_owned();
-        self.supervisor
-            .stage(StageRequest {
-                handle,
-                volume_context: req.volume_context,
-            })
-            .await?;
-        Ok(Response::new(NodeStageVolumeResponse {}))
+        Err(Status::unimplemented(
+            "agentfs-csi has no stage step (no STAGE_UNSTAGE_VOLUME): NodePublish opens the view",
+        ))
     }
 
     async fn node_unstage_volume(
         &self,
-        request: Request<NodeUnstageVolumeRequest>,
+        _request: Request<NodeUnstageVolumeRequest>,
     ) -> Result<Response<NodeUnstageVolumeResponse>, Status> {
-        let req = request.into_inner();
-        required(&req.volume_id, "the volume id")?;
-        absolute(&req.staging_target_path, "the staging target path")?;
-        if validate_handle(&req.volume_id).is_ok() {
-            self.supervisor.unstage(&req.volume_id).await?;
-        }
-        Ok(Response::new(NodeUnstageVolumeResponse {}))
+        Err(Status::unimplemented(
+            "agentfs-csi has no stage step (no STAGE_UNSTAGE_VOLUME)",
+        ))
     }
 
     async fn node_publish_volume(
@@ -126,17 +175,18 @@ impl Node for NodeService {
         if is_ephemeral(&req.volume_context) {
             return Err(Error::InvalidArgument(EPHEMERAL_REFUSED.into()).into());
         }
-        absolute(&req.staging_target_path, "the staging target path")?;
         let handle = handle(&req.volume_id)?.to_owned();
+        let pod = pod_context(&req.volume_context, &self.supervisor.config().node_id)
+            .map_err(|e| Error::InvalidArgument(e.to_string()))?;
+        let (volume, tree) = self.resolve(&handle, &req.volume_context).await?;
         self.supervisor
-            .publish(PublishRequest {
+            .publish(ViewSpec {
                 handle,
+                volume,
+                tree,
                 target,
-                readonly: req.readonly || mode == Mode::SingleNodeReaderOnly,
-                single_writer: mode == Mode::SingleNodeSingleWriter,
-                pod: PodInfo::from_context(&req.volume_context),
-                workload_mounts: params::workload_mounts(&req.volume_context)
-                    .map_err(|e| Error::InvalidArgument(e.to_string()))?,
+                read_only: req.readonly || mode == Mode::SingleNodeReaderOnly,
+                pod,
             })
             .await?;
         Ok(Response::new(NodePublishVolumeResponse {}))
@@ -160,13 +210,10 @@ impl Node for NodeService {
         _request: Request<NodeGetCapabilitiesRequest>,
     ) -> Result<Response<NodeGetCapabilitiesResponse>, Status> {
         Ok(Response::new(NodeGetCapabilitiesResponse {
-            capabilities: [
-                rpc::Type::StageUnstageVolume,
-                rpc::Type::SingleNodeMultiWriter,
-            ]
-            .into_iter()
-            .map(node_capability)
-            .collect(),
+            capabilities: [rpc::Type::SingleNodeMultiWriter]
+                .into_iter()
+                .map(node_capability)
+                .collect(),
         }))
     }
 

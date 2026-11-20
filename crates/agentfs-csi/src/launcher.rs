@@ -1,47 +1,54 @@
-//! Starting the `agentfs` children the node plugin supervises: one `agentfs serve-history` per staged volume, one
-//! `agentfs front --history-service` front per published target, and the
-//! release scan's children ([`crate::release_scan`]): one `agentfs flush`
-//! then one `agentfs push` per worktree no pod stages, and one `agentfs
-//! fork finish` per fork
-//! whose deletion asked for it to be finished.
+//! Starting the `agentfs` children the node plugin runs (docs/csi.md): one
+//! `agentfs init` per CreateVolume (and per static PV adopted), and one
+//! `agentfs host` per volume in use on the node, driven over its standard
+//! input ([`crate::host_client`]).
 //!
-//! The children are the same commands the single-node deployments run, so
-//! a crashed front or service never takes the gRPC server down. Their
-//! output is forwarded line by line to the plugin's stderr with a
-//! `[service <handle>]` or `[front <ns>/<pod> <key>]` prefix; the last
-//! [`RECENT_LINES`] are kept for error messages.
+//! A child per volume follows the FUSE CSI drivers' practice (one FUSE
+//! daemon per volume in its own process), so a crashed host never takes the
+//! gRPC server down. The children's output is forwarded line by line to the
+//! plugin's stderr with a `[host <volume>]` or `[init <handle>]` prefix; the
+//! last [`RECENT_LINES`] are kept for error messages.
 
 use std::collections::VecDeque;
 use std::ffi::OsString;
 use std::fmt;
 use std::io;
+use std::os::fd::OwnedFd;
 use std::os::unix::process::ExitStatusExt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{ExitStatus, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use agentfs_contracts::name::VolumeName;
 use rustix::process::{Pid, Signal};
 use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::process::Command;
 use tokio::sync::watch;
 
 use crate::layout::Layout;
-use crate::params::PodInfo;
+use crate::params::VolumeParams;
 
 /// How many of a child's last output lines are kept.
 pub const RECENT_LINES: usize = 20;
 
+/// The launcher id the hosts record their clients under: what a restarted
+/// host rebinds them by.
+pub const LAUNCHER_ID: &str = "csi";
+
 /// A child to start.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcessSpec {
-    /// The log prefix, without brackets: `service <handle>`.
+    /// The log prefix, without brackets: `host <volume>`.
     pub label: String,
     /// Arguments after the program.
     pub args: Vec<OsString>,
     /// Variables set for the child, after every inherited `AGENTFS_*` one
     /// is removed.
     pub env: Vec<(OsString, OsString)>,
+    /// Whether the child's standard input is a control channel: one end of
+    /// a Unix socket pair whose other end is [`Spawned::control`].
+    pub control: bool,
 }
 
 /// How a child ended.
@@ -75,33 +82,29 @@ impl fmt::Display for Exit {
 /// The last lines a child printed.
 pub type RecentLog = Arc<Mutex<VecDeque<String>>>;
 
+/// The recent output of a child, one line per line.
+pub fn recent(log: &RecentLog) -> String {
+    log.lock()
+        .map(|l| l.iter().cloned().collect::<Vec<_>>().join("\n"))
+        .unwrap_or_default()
+}
+
 /// A started child.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Spawned {
     pub pid: u32,
     /// `Some` once the child has exited.
     pub exited: watch::Receiver<Option<Exit>>,
     pub recent_log: RecentLog,
-}
-
-impl Spawned {
-    /// The recent output, one line per line.
-    pub fn recent(&self) -> String {
-        self.recent_log
-            .lock()
-            .map(|l| l.iter().cloned().collect::<Vec<_>>().join("\n"))
-            .unwrap_or_default()
-    }
-
-    /// How it exited, if it has.
-    pub fn exit(&self) -> Option<Exit> {
-        *self.exited.borrow()
-    }
+    /// The parent's end of the control channel, when the spec asked for one.
+    pub control: Option<tokio::net::UnixStream>,
 }
 
 /// Starts and signals children. A trait so tests can fake processes.
 pub trait Launcher: Send + Sync + 'static {
-    /// Starts a child. Called within a tokio runtime.
+    /// Starts a child. Called within a tokio runtime. With
+    /// [`ProcessSpec::control`], the child's standard input is one end of a
+    /// socket pair and [`Spawned::control`] the other.
     fn spawn(&self, spec: ProcessSpec) -> io::Result<Spawned>;
     /// Sends `signal` to a child.
     fn signal(&self, pid: u32, signal: Signal) -> io::Result<()>;
@@ -117,9 +120,17 @@ impl Launcher for AgentfsLauncher {
     fn spawn(&self, spec: ProcessSpec) -> io::Result<Spawned> {
         let mut cmd = Command::new(&self.bin);
         cmd.args(&spec.args)
-            .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        let ours = if spec.control {
+            let (ours, theirs) = std::os::unix::net::UnixStream::pair()?;
+            cmd.stdin(Stdio::from(OwnedFd::from(theirs)));
+            ours.set_nonblocking(true)?;
+            Some(tokio::net::UnixStream::from_std(ours)?)
+        } else {
+            cmd.stdin(Stdio::null());
+            None
+        };
         for (key, _) in std::env::vars_os() {
             if key.to_string_lossy().starts_with("AGENTFS_") {
                 cmd.env_remove(key);
@@ -127,6 +138,10 @@ impl Launcher for AgentfsLauncher {
         }
         cmd.envs(spec.env.iter().map(|(k, v)| (k, v)));
         let mut child = cmd.spawn()?;
+        // The child's end of the socket pair went with `cmd`'s stdin: once
+        // `cmd` is dropped only the child holds it, so the child's exit is
+        // EOF on ours.
+        drop(cmd);
         let pid = child.id().unwrap_or(0);
         let recent: RecentLog = Arc::new(Mutex::new(VecDeque::with_capacity(RECENT_LINES)));
         let label = Arc::new(spec.label);
@@ -157,6 +172,7 @@ impl Launcher for AgentfsLauncher {
             pid,
             exited: rx,
             recent_log: recent,
+            control: ours,
         })
     }
 
@@ -187,8 +203,8 @@ pub fn push_line(recent: &RecentLog, line: String) {
     }
 }
 
-/// The node plugin's own identity, from the downward API: the history
-/// services' `--namespace`, `--pod` and `--node`.
+/// The node plugin's own identity, from the downward API: the children's
+/// `--namespace`, `--pod` and `--node`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PluginIdentity {
     pub namespace: String,
@@ -196,230 +212,87 @@ pub struct PluginIdentity {
     pub node: String,
 }
 
-/// How fronts mount.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FrontOptions {
-    /// `--passthrough`: auto, on or off.
-    pub passthrough: String,
-    /// `--threads`.
-    pub threads: usize,
-    /// `--history-wait`.
-    pub history_wait: Duration,
-}
-
 fn os(s: impl Into<OsString>) -> OsString {
     s.into()
 }
 
-fn secs(d: Duration) -> OsString {
-    os(format!("{}ms", d.as_millis()))
-}
-
-/// How long a history service waits for its volume's state lock.
-pub const SERVICE_LOCK_WAIT: Duration = Duration::from_secs(30);
-
-/// `agentfs --state S --root B --wait-lock 30000ms serve-history --listen unix:<socket> ...`
-///
-/// It waits up to [`SERVICE_LOCK_WAIT`] for the state lock, which the
-/// release scan's `agentfs push` of the then unstaged worktree, a
-/// finisher or DeleteVolume's listing may hold for a moment as the volume
-/// is staged. `workload_attached` (a pod of the volume is published on
-/// the node) adds `--workload-attached`: the service judges the patch
-/// queue and does not land it.
-pub fn service_spec(
-    layout: &Layout,
-    handle: &str,
-    plugin: &PluginIdentity,
-    workload_attached: bool,
-) -> ProcessSpec {
-    let mut args = vec![
-        os("--state"),
-        layout.state(handle).into_os_string(),
-        os("--root"),
-        layout.backing(handle).into_os_string(),
-        os("--wait-lock"),
-        secs(SERVICE_LOCK_WAIT),
-        os("serve-history"),
-        os("--listen"),
-        os(format!("unix:{}", layout.socket(handle).display())),
+fn identity_args(plugin: &PluginIdentity) -> [OsString; 6] {
+    [
         os("--namespace"),
         os(plugin.namespace.as_str()),
         os("--pod"),
         os(plugin.pod.as_str()),
         os("--node"),
         os(plugin.node.as_str()),
-        os("--shutdown-grace"),
-        os("10s"),
-        os("--push-grace"),
-        os("5s"),
-    ];
-    if workload_attached {
-        args.push(os("--workload-attached"));
-    }
-    ProcessSpec {
-        label: format!("service {handle}"),
-        args,
-        env: Vec::new(),
-    }
-}
-
-/// `agentfs --state <state> push` for the release scan, with the plugin's identity env.
-pub fn push_spec(layout: &Layout, handle: &str, identity: &PluginIdentity) -> ProcessSpec {
-    ProcessSpec {
-        label: format!("push {handle}"),
-        args: vec![
-            os("--state"),
-            layout.state(handle).into_os_string(),
-            os("push"),
-        ],
-        env: identity_env(identity),
-    }
-}
-
-/// `agentfs --state <state> --root <backing> flush` for the release scan:
-/// commits what a stopped history service left in the journal, before the
-/// push; with the plugin's identity env.
-pub fn flush_spec(layout: &Layout, handle: &str, identity: &PluginIdentity) -> ProcessSpec {
-    ProcessSpec {
-        label: format!("flush {handle}"),
-        args: vec![
-            os("--state"),
-            layout.state(handle).into_os_string(),
-            os("--root"),
-            layout.backing(handle).into_os_string(),
-            os("flush"),
-        ],
-        env: identity_env(identity),
-    }
-}
-
-fn identity_env(identity: &PluginIdentity) -> Vec<(OsString, OsString)> {
-    vec![
-        (os("AGENTFS_NAMESPACE"), os(identity.namespace.as_str())),
-        (os("AGENTFS_POD"), os(identity.pod.as_str())),
-        (os("AGENTFS_NODE"), os(identity.node.as_str())),
     ]
 }
 
-/// How long one finisher child publishes before it exits 1 and frees the
-/// fork's state lock; the release scan's next pass starts another. Between
-/// them an operator's `fork abandon --wait-lock` gets the lock.
-pub const FINISH_TIMEOUT: Duration = Duration::from_secs(300);
-
-/// argv of the finisher child, with the plugin's identity flags: `--state
-/// S --root B fork finish --timeout 300000ms --namespace NS --pod POD --node
-/// NODE` ([`FINISH_TIMEOUT`]).
-pub fn fork_finish_args(state: &Path, root: &Path, identity: &PluginIdentity) -> Vec<OsString> {
-    vec![
-        os("--state"),
-        state.as_os_str().to_owned(),
-        os("--root"),
-        root.as_os_str().to_owned(),
-        os("fork"),
-        os("finish"),
-        os("--timeout"),
-        secs(FINISH_TIMEOUT),
-        os("--namespace"),
-        os(identity.namespace.as_str()),
-        os("--pod"),
-        os(identity.pod.as_str()),
-        os("--node"),
-        os(identity.node.as_str()),
-    ]
-}
-
-/// The finisher child of the fork `handle`.
-pub fn fork_finish_spec(layout: &Layout, handle: &str, identity: &PluginIdentity) -> ProcessSpec {
-    ProcessSpec {
-        label: format!("fork {handle}"),
-        args: fork_finish_args(&layout.state(handle), &layout.backing(handle), identity),
-        env: Vec::new(),
-    }
-}
-
-/// The replica name of a front without pod information (csi-sanity, a CO
-/// without podInfoOnMount).
-pub fn anonymous_replica(key: &str) -> String {
-    format!("publish-{key}")
-}
-
-/// `agentfs --state S front --history-service unix:<socket> ... B <source>`,
-/// with a `--workload-mount` for each of `workload_mounts`.
-#[allow(clippy::too_many_arguments)]
-pub fn front_spec(
+/// `agentfs --state <base>/<h>/state init --volume <name> --include
+/// <profiles>/<p>.config --namespace .. --pod .. --node ..`, label
+/// `init <h>`.
+pub fn init_spec(
     layout: &Layout,
     handle: &str,
-    key: &str,
-    pod: Option<&PodInfo>,
-    slot: Option<u16>,
-    node: &str,
-    options: &FrontOptions,
-    workload_mounts: &[String],
+    params: &VolumeParams,
+    plugin: &PluginIdentity,
 ) -> ProcessSpec {
     let mut args = vec![
         os("--state"),
         layout.state(handle).into_os_string(),
-        os("front"),
-        os("--history-service"),
-        os(format!("unix:{}", layout.socket(handle).display())),
+        os("init"),
+        os("--volume"),
+        os(params.name.as_str()),
+        os("--include"),
+        layout
+            .profile_file(&params.profile, "config")
+            .into_os_string(),
     ];
-    if let Some(slot) = slot {
-        args.extend([os("--history-slot"), os(slot.to_string())]);
-    }
-    let (namespace, name, uid, replica) = match pod {
-        Some(p) => (
-            p.namespace.as_str(),
-            p.name.as_str(),
-            p.uid.as_str(),
-            p.name.clone(),
-        ),
-        None => ("", "", "", anonymous_replica(key)),
-    };
-    args.extend([
-        os("--history-wait"),
-        secs(options.history_wait),
-        os("--threads"),
-        os(options.threads.to_string()),
-        os("--passthrough"),
-        os(options.passthrough.as_str()),
-        os("--namespace"),
-        os(namespace),
-        os("--pod"),
-        os(name),
-        os("--pod-uid"),
-        os(uid),
-        os("--node"),
-        os(node),
-        os("--replica"),
-        os(replica),
-    ]);
-    for mount in workload_mounts {
-        args.extend([os("--workload-mount"), os(mount.as_str())]);
-    }
-    args.extend([
-        layout.backing(handle).into_os_string(),
-        layout.front_source(handle, key).into_os_string(),
-    ]);
-    let label = match pod {
-        Some(p) => format!("front {}/{} {key}", p.namespace, p.name),
-        None => format!("front {handle} {key}"),
-    };
+    args.extend(identity_args(plugin));
     ProcessSpec {
-        label,
+        label: format!("init {handle}"),
         args,
         env: Vec::new(),
+        control: false,
+    }
+}
+
+/// `agentfs --state <base>/<v>/state host --launcher csi --volume <name>
+/// --namespace .. --pod .. --node ..`, label `host <v>`, with a control
+/// channel.
+pub fn host_spec(
+    layout: &Layout,
+    volume: &str,
+    name: &VolumeName,
+    plugin: &PluginIdentity,
+) -> ProcessSpec {
+    let mut args = vec![
+        os("--state"),
+        layout.state(volume).into_os_string(),
+        os("host"),
+        os("--launcher"),
+        os(LAUNCHER_ID),
+        os("--volume"),
+        os(name.as_str()),
+    ];
+    args.extend(identity_args(plugin));
+    ProcessSpec {
+        label: format!("host {volume}"),
+        args,
+        env: Vec::new(),
+        control: true,
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use tokio::io::AsyncWriteExt as _;
+
     use super::*;
 
     fn layout() -> Layout {
         Layout {
             base: "/b".into(),
             node_state: "/n".into(),
-            mount_dir: "/m".into(),
             profiles: "/p".into(),
         }
     }
@@ -431,71 +304,43 @@ mod tests {
             .collect()
     }
 
-    #[test]
-    fn service_arguments() {
-        let plugin = PluginIdentity {
+    fn plugin() -> PluginIdentity {
+        PluginIdentity {
             namespace: "agentfs-csi".into(),
             pod: "agentfs-csi-node-x".into(),
             node: "n1".into(),
+        }
+    }
+
+    #[test]
+    fn init_arguments() {
+        let params = VolumeParams {
+            profile: "example".into(),
+            name: VolumeName::parse("apps.data.pvc-1").unwrap(),
         };
-        let spec = service_spec(&layout(), "v", &plugin, false);
-        assert_eq!(spec.label, "service v");
-        let expected = "--state /b/v/state --root /b/v/backing --wait-lock 30000ms \
-                        serve-history --listen unix:/n/run/v/history.sock --namespace \
-                        agentfs-csi --pod agentfs-csi-node-x --node n1 --shutdown-grace 10s \
-                        --push-grace 5s";
-        assert_eq!(strings(&spec).join(" "), expected);
-        let attached = service_spec(&layout(), "v", &plugin, true);
+        let spec = init_spec(&layout(), "pvc-1", &params, &plugin());
+        assert_eq!(spec.label, "init pvc-1");
+        assert!(!spec.control);
+        assert!(spec.env.is_empty());
         assert_eq!(
-            strings(&attached).join(" "),
-            format!("{expected} --workload-attached")
+            strings(&spec).join(" "),
+            "--state /b/pvc-1/state init --volume apps.data.pvc-1 --include /p/example.config \
+             --namespace agentfs-csi --pod agentfs-csi-node-x --node n1"
         );
     }
 
     #[test]
-    fn front_arguments() {
-        let options = FrontOptions {
-            passthrough: "auto".into(),
-            threads: 4,
-            history_wait: Duration::from_secs(30),
-        };
-        let pod = PodInfo {
-            namespace: "ns".into(),
-            name: "web-0".into(),
-            uid: "u-1".into(),
-            service_account: "sa".into(),
-        };
-        let spec = front_spec(
-            &layout(),
-            "v",
-            "k",
-            Some(&pod),
-            Some(3),
-            "n1",
-            &options,
-            &[],
-        );
-        assert_eq!(spec.label, "front ns/web-0 k");
+    fn host_arguments() {
+        let name = VolumeName::parse("apps.data.pvc-1").unwrap();
+        let spec = host_spec(&layout(), "pvc-1", &name, &plugin());
+        assert_eq!(spec.label, "host pvc-1");
+        assert!(spec.control);
+        assert!(spec.env.is_empty());
         assert_eq!(
             strings(&spec).join(" "),
-            "--state /b/v/state front --history-service unix:/n/run/v/history.sock \
-             --history-slot 3 --history-wait 30000ms --threads 4 --passthrough auto \
-             --namespace ns --pod web-0 --pod-uid u-1 --node n1 --replica web-0 /b/v/backing \
-             /m/v/k"
+            "--state /b/pvc-1/state host --launcher csi --volume apps.data.pvc-1 --namespace \
+             agentfs-csi --pod agentfs-csi-node-x --node n1"
         );
-        let mounts = ["/workspace".to_owned(), "/src=proj".to_owned()];
-        let spec = front_spec(&layout(), "v", "k", None, None, "n1", &options, &mounts);
-        let args = strings(&spec);
-        assert!(
-            args.join(" ").ends_with(
-                "--workload-mount /workspace --workload-mount /src=proj /b/v/backing /m/v/k"
-            ),
-            "{args:?}"
-        );
-        assert!(!args.contains(&"--history-slot".to_owned()), "{args:?}");
-        let replica = args.iter().position(|a| a == "--replica").unwrap();
-        assert_eq!(args[replica + 1], "publish-k");
-        assert_eq!(spec.label, "front v k");
     }
 
     #[test]
@@ -507,18 +352,17 @@ mod tests {
 
     #[test]
     fn the_recent_log_keeps_the_last_lines() {
-        let recent: RecentLog = Arc::default();
+        let log: RecentLog = Arc::default();
         for i in 0..RECENT_LINES + 5 {
-            push_line(&recent, i.to_string());
+            push_line(&log, i.to_string());
         }
-        let lines = recent.lock().unwrap();
-        assert_eq!(lines.len(), RECENT_LINES);
-        assert_eq!(lines.front().unwrap(), "5");
+        assert_eq!(log.lock().unwrap().len(), RECENT_LINES);
+        assert!(recent(&log).starts_with("5\n6"));
     }
 
     #[tokio::test]
     async fn a_real_child_reports_its_output_exit_and_signals() {
-        // SAFETY of the test: AGENTFS_* in the parent must not reach it.
+        // AGENTFS_* in the parent must not reach it.
         let launcher = AgentfsLauncher { bin: "sh".into() };
         let spawned = launcher
             .spawn(ProcessSpec {
@@ -528,25 +372,56 @@ mod tests {
                     os("echo out; echo err >&2; echo \"v=${AGENTFS_X:-unset} y=$Y\"; exit 7"),
                 ],
                 env: vec![(os("Y"), os("set"))],
+                control: false,
             })
             .unwrap();
+        assert!(spawned.control.is_none());
         let mut exited = spawned.exited.clone();
         let exit = *exited.wait_for(Option::is_some).await.unwrap();
         assert_eq!(exit, Some(Exit::Code(7)));
-        let recent = spawned.recent();
-        assert!(recent.contains("out") && recent.contains("err"), "{recent}");
-        assert!(recent.contains("v=unset y=set"), "{recent}");
+        let text = recent(&spawned.recent_log);
+        assert!(text.contains("out") && text.contains("err"), "{text}");
+        assert!(text.contains("v=unset y=set"), "{text}");
 
         let sleeper = launcher
             .spawn(ProcessSpec {
                 label: "sleep".into(),
                 args: vec![os("-c"), os("exec sleep 30")],
                 env: Vec::new(),
+                control: false,
             })
             .unwrap();
         launcher.signal(sleeper.pid, Signal::KILL).unwrap();
         let mut exited = sleeper.exited.clone();
         let exit = *exited.wait_for(Option::is_some).await.unwrap();
         assert_eq!(exit, Some(Exit::Signal(9)));
+    }
+
+    /// The control channel is the child's standard input: what the parent
+    /// writes the child reads, what the child writes back on it the parent
+    /// reads, and the child's exit is EOF.
+    #[tokio::test]
+    async fn the_control_channel_is_the_childs_stdin() {
+        let launcher = AgentfsLauncher { bin: "sh".into() };
+        let spawned = launcher
+            .spawn(ProcessSpec {
+                label: "echo".into(),
+                args: vec![os("-c"), os("read line; echo \"got $line\" >&0")],
+                env: Vec::new(),
+                control: true,
+            })
+            .unwrap();
+        let control = spawned.control.unwrap();
+        let (read, mut write) = control.into_split();
+        write.write_all(b"hello\n").await.unwrap();
+        let mut lines = tokio::io::BufReader::new(read).lines();
+        assert_eq!(
+            lines.next_line().await.unwrap().as_deref(),
+            Some("got hello")
+        );
+        assert_eq!(lines.next_line().await.unwrap(), None, "EOF at the exit");
+        let mut exited = spawned.exited.clone();
+        let exit = *exited.wait_for(Option::is_some).await.unwrap();
+        assert_eq!(exit, Some(Exit::Code(0)));
     }
 }

@@ -5,12 +5,17 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "The agentfs CSI driver: persistent volumes with a history service per volume and a front per pod"
+description = "The agentfs CSI driver: tree volumes, each served by one agentfs host per volume on its node"
 
 [dependencies]
+# The view host's control messages, names and pod contexts.
+agentfs-contracts = { version = "0.1.0", path = "../agentfs-contracts" }
+# Only what reads a state area without serving it (tree_actor::inspect),
+# installs the operator's rule files, and the shared helpers (atomic JSON,
+# the network filesystem check, the listening socket).
 agentfs-core = { version = "0.1.0", path = "../agentfs-core" }
 # Only mount_state (live or stale FUSE mounts) and MountState; the FUSE
-# session itself runs in `agentfs` children.
+# session itself runs in `agentfs host` children.
 agentfs-fuse = { version = "0.1.0", path = "../agentfs-fuse" }
 clap = { version = "4.6.7", features = ["derive", "env"] }
 # gRPC over a Unix socket, as CSI requires. Default
@@ -39,4 +44,3 @@ hyper-util = { version = "0.1.21", features = ["tokio"] }
 tempfile = "3.27.0"
 tower = { version = "0.5.3", features = ["util"] }
 tokio = { version = "1.53", features = ["test-util"] }
-git2 = { version = "0.21.0", default-features = false }

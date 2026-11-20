@@ -1,37 +1,27 @@
 //! StorageClass and PersistentVolume parameters, and what the CO tells a
-//! node about the pod.
+//! node about the pod (docs/csi.md).
 //!
 //! Every setting of a volume is the operator's: a StorageClass's
 //! `parameters` (or a static PV's `volumeAttributes`) name a **profile**,
-//! a config fragment, rules and credentials the driver's own pods mount
-//! from its namespace. Pod authors choose only the StorageClass.
+//! a config fragment and rule files the driver's own pods mount from its
+//! namespace. Pod authors choose only the StorageClass.
 //!
 //! | Parameter | Meaning |
 //! |---|---|
 //! | `profile` | required: `<profile>.config`, `.exclude`, `.attributes` in the profiles directory |
 //! | `volumeName` | the agentfs volume name, a template over `{pvcNamespace}`, `{pvcName}` and `{pvName}` that must contain `{pvName}`; default [`DEFAULT_TEMPLATE`] (with the provisioner's `--extra-create-metadata`), else the PV name. In a static PV's attributes, a literal name |
-//! | `onDelete` | `retain` (default: DeleteVolume keeps the directory) or `delete` ([`OnDelete`]) |
-//! | `startFrom` | `<remote>:<branch>@<commit>`: the new worktree starts from that commit of another worktree's branch (F8 R2; [`StartPoint`]) |
-//! | `fork` | `"true"`: a fork class ([`ForkClass`]); `"false"` or absent: an ordinary one |
-//! | `link` | a fork class only: `linked` (default: the fork's finish delivers its change back to the source) or `unlinked` (an independent fork, nothing ever delivered; [`ForkLink`]) |
-//! | `remotes` | a fork class with `link: unlinked` only: a profile whose `<remotes>.config` holds the fork's own `[remote "<name>"]` sections (`agentfs.fork.remotes`); without it the fork is local-only, and DeleteVolume with `onDelete: delete` removes it unpushed |
+//! | `onDelete` | `retain` only: DeleteVolume keeps the volume |
+//! | `fork` | `"true"`: a fork class ([`is_fork_class`]); `"false"` or absent: an ordinary one |
 //!
-//! Keys under `csi.storage.k8s.io/` (the provisioner's metadata) are read
-//! for the template and otherwise ignored; any other key is refused,
-//! `branch` too: a worktree's branch is always `agentfs/<volume>` (F8
-//! rule 1, one branch per worktree, for good).
-//!
-//! The name must include the PV name, so it is unique per volume (F8 rule 1): a claim deleted and created again is a new worktree
-//! with a new branch, never a second writer of the old claim's branch.
+//! `startFrom`, `workloadMounts` and `onDelete: delete` are refused: they
+//! are not built on tree volumes. Keys under `csi.storage.k8s.io/` (the
+//! provisioner's metadata) are read for the template and otherwise
+//! ignored; any other key is refused.
 
 use std::collections::HashMap;
 
-use serde::{Deserialize, Serialize};
-
-use agentfs_core::config::validate_name;
-use agentfs_core::fork::identity::{BadStartPoint, ForkLink, StartPoint};
-
-pub use agentfs_core::release::OnDelete;
+use agentfs_contracts::name::{Label, VolumeName};
+use agentfs_contracts::pod::PodContext;
 
 /// The provisioner's metadata keys (`--extra-create-metadata`).
 pub const PVC_NAME: &str = "csi.storage.k8s.io/pvc/name";
@@ -42,7 +32,6 @@ pub const PV_NAME: &str = "csi.storage.k8s.io/pv/name";
 pub const POD_NAME: &str = "csi.storage.k8s.io/pod.name";
 pub const POD_NAMESPACE: &str = "csi.storage.k8s.io/pod.namespace";
 pub const POD_UID: &str = "csi.storage.k8s.io/pod.uid";
-pub const POD_SERVICE_ACCOUNT: &str = "csi.storage.k8s.io/serviceAccount.name";
 /// Set by the kubelet for inline (ephemeral) volumes, which are refused.
 pub const EPHEMERAL: &str = "csi.storage.k8s.io/ephemeral";
 
@@ -60,6 +49,16 @@ pub const DEFAULT_TEMPLATE: &str = "{pvcNamespace}.{pvcName}.{pvName}";
 /// valid ConfigMap key.
 pub const MAX_PROFILE_LEN: usize = 63;
 
+/// What `onDelete: delete` is told.
+pub const ON_DELETE_NOT_BUILT: &str = "onDelete: delete is not built on tree volumes: a deleted \
+    claim's volume is kept, because its history is pushed nowhere yet";
+/// What `startFrom` is told.
+pub const START_FROM_NOT_BUILT: &str = "startFrom is not built on tree volumes: a volume starts \
+    empty; moving a volume between nodes is not built (docs/runbooks/moving.md)";
+/// What `workloadMounts` is told.
+pub const WORKLOAD_MOUNTS_NOT_BUILT: &str = "workloadMounts is not built on tree volumes: tree \
+    volumes keep nested repositories untracked";
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ParamError {
     #[error("the StorageClass parameter `profile` is required")]
@@ -69,15 +68,9 @@ pub enum ParamError {
          ending with a letter or digit, at most 63 characters"
     )]
     BadProfile(String),
-    #[error(
-        "unknown StorageClass parameter {0:?} (known: profile, volumeName, onDelete, startFrom, \
-         workloadMounts, fork, link, remotes; a worktree's branch is always agentfs/<volume>)"
-    )]
+    #[error("unknown StorageClass parameter {0:?} (known: profile, volumeName, onDelete, fork)")]
     UnknownKey(String),
-    #[error(
-        "unknown volume attribute {0:?} (known: profile, volumeName (or volume), onDelete, \
-         workloadMounts; a worktree's branch is always agentfs/<volume>)"
-    )]
+    #[error("unknown volume attribute {0:?} (known: profile, volumeName (or volume), onDelete)")]
     UnknownAttribute(String),
     #[error("the volume attributes name two volumes, {a:?} and {b:?} (volume and volumeName)")]
     ConflictingNames { a: String, b: String },
@@ -93,79 +86,69 @@ pub enum ParamError {
         "volumeName {template:?} gives {value:?}, which is not a valid agentfs volume name ([A-Za-z0-9][A-Za-z0-9._-]*, no '..', no .lock suffix)"
     )]
     BadVolumeName { template: String, value: String },
-    #[error(transparent)]
-    BadOnDelete(#[from] agentfs_core::release::BadOnDelete),
-    #[error(transparent)]
-    BadStartFrom(#[from] BadStartPoint),
-    #[error("workloadMounts: {0}")]
-    BadWorkloadMount(String),
+    /// Any class: volumeName must contain {pvName}.
     #[error(
-        "a fork class (fork: \"true\") must not set {0}: a fork's profile is its source's, its \
-         branch is its own and it starts from its source's head"
-    )]
-    ForkClassSets(&'static str),
-    #[error("fork {0:?} must be \"true\" or \"false\"")]
-    BadFork(String),
-    #[error("link {0:?} must be \"linked\" or \"unlinked\"")]
-    BadLink(String),
-    #[error("{0} is a fork class's parameter (fork: \"true\"); an ordinary class has no source")]
-    ForkOnly(&'static str),
-    #[error(
-        "remotes is an unlinked fork class's parameter (link: unlinked): a linked fork pushes \
-         only to its source's fork remote"
-    )]
-    RemotesNeedUnlinked,
-    /// Any class: volumeName must contain {pvName} (rule 1).
-    #[error(
-        "volumeName {template:?} must contain {{pvName}}, so each claim is a worktree with its \
-         own branch (one branch per worktree, for good)"
+        "volumeName {template:?} must contain {{pvName}}, so each claim is a volume of its own"
     )]
     NameNotUnique { template: String },
+    #[error("{}", ON_DELETE_NOT_BUILT)]
+    OnDeleteNotBuilt,
+    #[error("onDelete {0:?} must be \"retain\"")]
+    BadOnDelete(String),
+    #[error("{}", START_FROM_NOT_BUILT)]
+    StartFromNotBuilt,
+    #[error("{}", WORKLOAD_MOUNTS_NOT_BUILT)]
+    WorkloadMountsNotBuilt,
+    #[error("fork {0:?} must be \"true\" or \"false\"")]
+    BadFork(String),
+    #[error("fork claims are not built yet")]
+    ForkClass,
+    #[error("{0} is a fork class's parameter (fork: \"true\"); an ordinary class has no source")]
+    ForkOnly(&'static str),
+    #[error("the pod's {what} {value:?} is not a valid label")]
+    BadPod { what: &'static str, value: String },
 }
 
-/// A volume's settings, from CreateVolume's parameters or a static PV's
-/// volume context.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// A tree volume's settings, from CreateVolume's parameters or a static
+/// PV's volume attributes.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VolumeParams {
     pub profile: String,
-    /// `branch` is gone: the branch is always agentfs/<volume> (rule 1).
-    pub volume: String,
-    pub on_delete: OnDelete,
-    /// The class's raw `startFrom`, kept in csi.json only so that a retried CreateVolume with other
-    /// parameters is AlreadyExists; the worktree's identity (agentfs.start.*) is the authority.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub start_from: Option<String>,
-    /// Where pods mount the volume (`workloadMounts`: comma-separated
-    /// `PATH` or `PATH=DIR`), passed to every front as `--workload-mount`
-    /// so absolute worktree `gitdir:` targets map exactly.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub workload_mounts: Vec<String>,
+    pub name: VolumeName,
+}
+
+/// `onDelete`: only `retain` is built.
+fn on_delete(value: &str) -> Result<(), ParamError> {
+    match value {
+        "retain" => Ok(()),
+        "delete" => Err(ParamError::OnDeleteNotBuilt),
+        other => Err(ParamError::BadOnDelete(other.to_owned())),
+    }
 }
 
 impl VolumeParams {
-    /// From CreateVolume: `name` is the PV name the CO chose, `parameters`
-    /// the StorageClass's (plus the provisioner's metadata).
+    /// From CreateVolume: `pv_name` is the PV name the CO chose,
+    /// `parameters` the StorageClass's (plus the provisioner's metadata).
     pub fn from_create(
-        name: &str,
+        pv_name: &str,
         parameters: &HashMap<String, String>,
     ) -> Result<Self, ParamError> {
         let mut profile = None;
         let mut template = None;
-        let mut on_delete = OnDelete::default();
-        let mut start_from = None;
-        let mut workload_mounts = Vec::new();
-        for (key, value) in parameters {
+        // Refusals in a fixed order, so a class with several gets the same
+        // answer every time.
+        let mut keys: Vec<&String> = parameters.keys().collect();
+        keys.sort();
+        for key in keys {
+            let value = &parameters[key];
             match key.as_str() {
                 "profile" => profile = Some(value.clone()),
                 "volumeName" => template = Some(value.clone()),
-                "onDelete" => on_delete = value.parse()?,
-                "startFrom" => {
-                    StartPoint::parse(value)?;
-                    start_from = Some(value.clone());
-                }
-                "workloadMounts" => workload_mounts = parse_workload_mounts(value)?,
-                // An ordinary class may say so; a fork class is a ForkClass.
+                "onDelete" => on_delete(value)?,
+                "startFrom" => return Err(ParamError::StartFromNotBuilt),
+                "workloadMounts" => return Err(ParamError::WorkloadMountsNotBuilt),
                 "fork" if value == "false" => {}
+                "fork" if value == "true" => return Err(ParamError::ForkClass),
                 "fork" => return Err(ParamError::BadFork(value.clone())),
                 "link" => return Err(ParamError::ForkOnly("link")),
                 "remotes" => return Err(ParamError::ForkOnly("remotes")),
@@ -175,58 +158,39 @@ impl VolumeParams {
         }
         let profile = profile.ok_or(ParamError::MissingProfile)?;
         validate_profile(&profile)?;
-        let volume = unique_volume_name(name, template, parameters)?;
-        Ok(Self {
-            profile,
-            volume,
-            on_delete,
-            start_from,
-            workload_mounts,
-        })
+        let name = unique_volume_name(pv_name, template, parameters)?;
+        Ok(Self { profile, name })
     }
 
-    /// The class's start point, if it names one.
-    pub fn start_point(&self) -> Result<Option<StartPoint>, ParamError> {
-        Ok(self
-            .start_from
-            .as_deref()
-            .map(StartPoint::parse)
-            .transpose()?)
-    }
-
-    /// From a volume context: what CreateVolume returned, or a static PV's
-    /// `volumeAttributes`: `profile` (required), `volumeName` (a literal
-    /// name, not a template; `volume`, as CreateVolume returns it, is the
-    /// same; default: the volume handle), `onDelete` and
-    /// `workloadMounts`. Keys
-    /// under the CO's prefixes (`csi.storage.k8s.io/`,
-    /// `storage.kubernetes.io/csiProvisionerIdentity`) are ignored; any
-    /// other key is refused (`branch` too), so a typo in a static PV fails
+    /// From a static PV's `volumeAttributes`: `profile` (required),
+    /// `volumeName` or `volume` (a literal name, not a template; default:
+    /// the volume handle) and `onDelete` (`retain` only). Keys under the
+    /// CO's prefixes are ignored; any other key is refused, so a typo fails
     /// loudly rather than naming the volume after its handle.
-    pub fn from_context(
+    pub fn from_static(
         handle: &str,
-        context: &HashMap<String, String>,
+        attributes: &HashMap<String, String>,
     ) -> Result<Self, ParamError> {
         let mut profile = None;
         let mut names: Vec<&str> = Vec::new();
-        let mut on_delete = OnDelete::default();
-        let mut workload_mounts = Vec::new();
-        for (key, value) in context {
+        let mut keys: Vec<&String> = attributes.keys().collect();
+        keys.sort();
+        for key in keys {
+            let value = &attributes[key];
             match key.as_str() {
                 "profile" => profile = Some(value.clone()),
                 "volume" | "volumeName" => names.push(value),
-                "onDelete" => on_delete = value.parse()?,
-                "workloadMounts" => workload_mounts = parse_workload_mounts(value)?,
+                "onDelete" => on_delete(value)?,
                 k if CO_CONTEXT_PREFIXES.iter().any(|p| k.starts_with(p)) => {}
                 other => return Err(ParamError::UnknownAttribute(other.to_owned())),
             }
         }
         let profile = profile.ok_or(ParamError::MissingProfile)?;
         validate_profile(&profile)?;
-        let volume = match names.as_slice() {
-            [] => handle.to_owned(),
-            [one] => (*one).to_owned(),
-            [a, b] if a == b => (*a).to_owned(),
+        let name = match names.as_slice() {
+            [] => handle,
+            [one] => *one,
+            [a, b] if a == b => *a,
             [a, b, ..] => {
                 return Err(ParamError::ConflictingNames {
                     a: (*a).to_owned(),
@@ -234,41 +198,27 @@ impl VolumeParams {
                 });
             }
         };
-        if validate_name("agentfs.volume", &volume).is_err() {
-            return Err(ParamError::BadVolumeName {
-                template: "volumeName".into(),
-                value: volume,
-            });
-        }
-        Ok(Self {
-            profile,
-            volume,
-            on_delete,
-            start_from: None,
-            workload_mounts,
-        })
-    }
-
-    /// "agentfs/<volume>".
-    pub fn branch_name(&self) -> String {
-        format!("agentfs/{}", self.volume)
+        let name = VolumeName::parse(name).map_err(|_| ParamError::BadVolumeName {
+            template: "volumeName".into(),
+            value: name.to_owned(),
+        })?;
+        Ok(Self { profile, name })
     }
 
     /// The volume context CreateVolume returns, which every node call
-    /// carries back. It reads back with [`VolumeParams::from_context`]
-    /// (NodeStage of a worktree whose `csi.json` is gone), so it carries
-    /// no key that a static PV may not set.
+    /// carries back: `profile` and `volume`. It reads back with
+    /// [`VolumeParams::from_static`].
     pub fn to_context(&self) -> HashMap<String, String> {
-        let mut context = HashMap::from([
+        HashMap::from([
             ("profile".to_owned(), self.profile.clone()),
-            ("volume".to_owned(), self.volume.clone()),
-            ("onDelete".to_owned(), self.on_delete.to_string()),
-        ]);
-        if !self.workload_mounts.is_empty() {
-            context.insert(WORKLOAD_MOUNTS.to_owned(), self.workload_mounts.join(","));
-        }
-        context
+            ("volume".to_owned(), self.name.as_str().to_owned()),
+        ])
     }
+}
+
+/// Whether the StorageClass is a fork class (`fork: "true"`).
+pub fn is_fork_class(parameters: &HashMap<String, String>) -> bool {
+    parameters.get("fork").is_some_and(|v| v == "true")
 }
 
 /// The default `volumeName` template: [`DEFAULT_TEMPLATE`] when the
@@ -282,142 +232,19 @@ fn default_template(parameters: &HashMap<String, String>) -> String {
 }
 
 /// The volume name of a class's `volumeName` template (default
-/// [`default_template`]) for the PV `name`: it must contain `{pvName}`
-/// (rule 1, [`ParamError::NameNotUnique`]).
+/// [`default_template`]) for the PV `name`: it must contain `{pvName}`.
 fn unique_volume_name(
     name: &str,
     template: Option<String>,
     parameters: &HashMap<String, String>,
-) -> Result<String, ParamError> {
+) -> Result<VolumeName, ParamError> {
     let template = template.unwrap_or_else(|| default_template(parameters));
     if !template.contains("{pvName}") {
         return Err(ParamError::NameNotUnique { template });
     }
-    volume_name(name, &template, parameters)
-}
-
-/// `template` rendered for the PV `name`, as a valid volume name.
-fn volume_name(
-    name: &str,
-    template: &str,
-    parameters: &HashMap<String, String>,
-) -> Result<String, ParamError> {
     let pv_name = parameters.get(PV_NAME).map_or(name, String::as_str);
-    let volume = render(template, parameters, pv_name)?;
-    if validate_name("agentfs.volume", &volume).is_err() {
-        return Err(ParamError::BadVolumeName {
-            template: template.to_owned(),
-            value: volume,
-        });
-    }
-    Ok(volume)
-}
-
-/// A fork class's settings: a StorageClass with `fork:
-/// "true"`, whose claims clone a `dataSource` claim.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ForkClass {
-    /// The fork's volume name, unique on the remote (it names
-    /// `{pvName}`).
-    pub volume: String,
-    pub on_delete: OnDelete,
-    pub workload_mounts: Vec<String>,
-    /// `link`: whether the fork delivers back to its source, written into
-    /// its identity at create and never changed after.
-    pub link: ForkLink,
-    /// `remotes`: an unlinked fork's own remotes, the profile whose
-    /// `.config` holds them; `None`, it is local-only.
-    pub remotes: Option<String>,
-}
-
-impl ForkClass {
-    /// `Ok(None)` unless `parameters` has `fork: "true"`. A fork class must
-    /// not set `profile`, `branch` or `startFrom`, and its `volumeName`
-    /// template must contain `{pvName}`, as every class's; `onDelete`
-    /// defaults to `delete` (publishing already gates deletion, design).
-    pub fn from_create(
-        name: &str,
-        parameters: &HashMap<String, String>,
-    ) -> Result<Option<Self>, ParamError> {
-        match parameters.get("fork").map(String::as_str) {
-            None | Some("false") => return Ok(None),
-            Some("true") => {}
-            Some(other) => return Err(ParamError::BadFork(other.to_owned())),
-        }
-        let mut template = None;
-        let mut on_delete = OnDelete::Delete;
-        let mut workload_mounts = Vec::new();
-        let mut link = ForkLink::default();
-        let mut remotes = None;
-        for (key, value) in parameters {
-            match key.as_str() {
-                "fork" => {}
-                "link" => {
-                    link =
-                        ForkLink::parse(value).ok_or_else(|| ParamError::BadLink(value.clone()))?;
-                }
-                "remotes" => {
-                    validate_profile(value)?;
-                    remotes = Some(value.clone());
-                }
-                "profile" => return Err(ParamError::ForkClassSets("profile")),
-                "branch" => return Err(ParamError::ForkClassSets("branch")),
-                "startFrom" => return Err(ParamError::ForkClassSets("startFrom")),
-                "volumeName" => template = Some(value.clone()),
-                "onDelete" => on_delete = value.parse()?,
-                "workloadMounts" => workload_mounts = parse_workload_mounts(value)?,
-                k if k.starts_with(CO_PREFIX) => {}
-                other => return Err(ParamError::UnknownKey(other.to_owned())),
-            }
-        }
-        if remotes.is_some() && link == ForkLink::Linked {
-            return Err(ParamError::RemotesNeedUnlinked);
-        }
-        Ok(Some(Self {
-            volume: unique_volume_name(name, template, parameters)?,
-            on_delete,
-            workload_mounts,
-            link,
-            remotes,
-        }))
-    }
-
-    /// The fork's parameters: the source's profile.
-    pub fn params(&self, source: &VolumeParams) -> VolumeParams {
-        VolumeParams {
-            profile: source.profile.clone(),
-            volume: self.volume.clone(),
-            on_delete: self.on_delete,
-            start_from: None,
-            workload_mounts: self.workload_mounts.clone(),
-        }
-    }
-}
-
-/// The StorageClass parameter and volume attribute naming where pods mount
-/// the volume.
-pub const WORKLOAD_MOUNTS: &str = "workloadMounts";
-
-/// `workloadMounts`: comma-separated `PATH` or `PATH=DIR`,
-/// each as `agentfs mount --workload-mount` takes it.
-pub fn parse_workload_mounts(value: &str) -> Result<Vec<String>, ParamError> {
-    value
-        .split(',')
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .map(|v| {
-            agentfs_fuse::views::parse_workload_mount(v)
-                .map(|_| v.to_owned())
-                .map_err(ParamError::BadWorkloadMount)
-        })
-        .collect()
-}
-
-/// The `workloadMounts` of a NodePublish volume context; none if absent.
-pub fn workload_mounts(context: &HashMap<String, String>) -> Result<Vec<String>, ParamError> {
-    context
-        .get(WORKLOAD_MOUNTS)
-        .map_or(Ok(Vec::new()), |v| parse_workload_mounts(v))
+    let value = render(&template, parameters, pv_name)?;
+    VolumeName::parse(&value).map_err(|_| ParamError::BadVolumeName { template, value })
 }
 
 /// `[a-z0-9]([a-z0-9-]*[a-z0-9])?`, at most [`MAX_PROFILE_LEN`].
@@ -476,144 +303,41 @@ fn render(
     Ok(out)
 }
 
-/// What the kubelet says about the pod a volume is published for
-/// (`podInfoOnMount: true`).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PodInfo {
-    pub namespace: String,
-    pub name: String,
-    pub uid: String,
-    pub service_account: String,
-}
-
-impl PodInfo {
-    /// The pod from NodePublish's volume context, if the CO sent it (the
-    /// kubelet does with `podInfoOnMount`; csi-sanity does not).
-    pub fn from_context(context: &HashMap<String, String>) -> Option<Self> {
-        let get = |k: &str| context.get(k).filter(|v| !v.is_empty()).cloned();
-        Some(Self {
-            namespace: get(POD_NAMESPACE)?,
-            name: get(POD_NAME)?,
-            uid: get(POD_UID)?,
-            service_account: get(POD_SERVICE_ACCOUNT).unwrap_or_default(),
-        })
-    }
+/// The pod context of a view: the pod's namespace, name and uid from the
+/// `podInfoOnMount` keys (each absent when the CO does not send it, as
+/// csi-sanity does not), and this node.
+pub fn pod_context(
+    volume_context: &HashMap<String, String>,
+    node: &str,
+) -> Result<PodContext, ParamError> {
+    let label = |what: &'static str, value: Option<&str>| {
+        value
+            .filter(|v| !v.is_empty())
+            .map(|v| {
+                Label::parse(v).map_err(|_| ParamError::BadPod {
+                    what,
+                    value: v.to_owned(),
+                })
+            })
+            .transpose()
+    };
+    let get = |key: &str| volume_context.get(key).map(String::as_str);
+    Ok(PodContext {
+        namespace: label("namespace", get(POD_NAMESPACE))?,
+        pod: label("name", get(POD_NAME))?,
+        pod_uid: label("uid", get(POD_UID))?,
+        node: label("node", Some(node))?,
+    })
 }
 
 /// Whether the volume context is an inline ephemeral volume's.
-pub fn is_ephemeral(context: &HashMap<String, String>) -> bool {
-    context.get(EPHEMERAL).is_some_and(|v| v == "true")
+pub fn is_ephemeral(volume_context: &HashMap<String, String>) -> bool {
+    volume_context.get(EPHEMERAL).is_some_and(|v| v == "true")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// A12: what a fork class may and may not set.
-    #[test]
-    fn fork_classes() {
-        let meta = [
-            (PVC_NAME, "sandbox"),
-            (PVC_NAMESPACE, "agents"),
-            (PV_NAME, "pvc-9"),
-        ];
-        let with = |extra: &[(&'static str, &'static str)]| {
-            let mut pairs = meta.to_vec();
-            pairs.extend_from_slice(extra);
-            map(&pairs)
-        };
-        assert_eq!(ForkClass::from_create("pvc-9", &with(&[])).unwrap(), None);
-        assert_eq!(
-            ForkClass::from_create("pvc-9", &with(&[("fork", "false")])).unwrap(),
-            None
-        );
-        let class = ForkClass::from_create("pvc-9", &with(&[("fork", "true")]))
-            .unwrap()
-            .unwrap();
-        assert_eq!(class.volume, "agents.sandbox.pvc-9");
-        assert_eq!(class.on_delete, OnDelete::Delete);
-        assert_eq!(class.link, ForkLink::Linked);
-        for (value, want) in [
-            ("linked", ForkLink::Linked),
-            ("unlinked", ForkLink::Unlinked),
-        ] {
-            let class =
-                ForkClass::from_create("pvc-9", &with(&[("fork", "true"), ("link", value)]))
-                    .unwrap()
-                    .unwrap();
-            assert_eq!(class.link, want);
-        }
-        for value in ["Unlinked", "none", ""] {
-            assert_eq!(
-                ForkClass::from_create("pvc-9", &with(&[("fork", "true"), ("link", value)])),
-                Err(ParamError::BadLink(value.into()))
-            );
-        }
-        assert_eq!(
-            VolumeParams::from_create("pvc-1", &map(&[("profile", "p"), ("link", "unlinked")])),
-            Err(ParamError::ForkOnly("link"))
-        );
-        // An unlinked fork's own remotes: a profile name, and only with
-        // link: unlinked.
-        let class = ForkClass::from_create(
-            "pvc-9",
-            &with(&[
-                ("fork", "true"),
-                ("link", "unlinked"),
-                ("remotes", "sandbox-git"),
-            ]),
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(class.remotes.as_deref(), Some("sandbox-git"));
-        assert_eq!(
-            ForkClass::from_create("pvc-9", &with(&[("fork", "true"), ("remotes", "r")])),
-            Err(ParamError::RemotesNeedUnlinked)
-        );
-        assert_eq!(
-            ForkClass::from_create(
-                "pvc-9",
-                &with(&[
-                    ("fork", "true"),
-                    ("link", "unlinked"),
-                    ("remotes", "Bad_Name")
-                ])
-            ),
-            Err(ParamError::BadProfile("Bad_Name".into()))
-        );
-        assert_eq!(
-            VolumeParams::from_create("pvc-1", &map(&[("profile", "p"), ("remotes", "r")])),
-            Err(ParamError::ForkOnly("remotes"))
-        );
-        let source = VolumeParams::from_create("pvc-1", &map(&[("profile", "example")])).unwrap();
-        let params = class.params(&source);
-        assert_eq!(params.profile, "example");
-        assert_eq!(params.start_from, None);
-        assert_eq!(params.branch_name(), "agentfs/agents.sandbox.pvc-9");
-        for key in ["profile", "branch", "startFrom"] {
-            assert_eq!(
-                ForkClass::from_create("pvc-9", &with(&[("fork", "true"), (key, "x")])),
-                Err(ParamError::ForkClassSets(key))
-            );
-        }
-        assert!(matches!(
-            ForkClass::from_create(
-                "pvc-9",
-                &with(&[("fork", "true"), ("volumeName", "{pvcName}")])
-            ),
-            Err(ParamError::NameNotUnique { .. })
-        ));
-        assert_eq!(
-            ForkClass::from_create("pvc-9", &with(&[("fork", "yes")])),
-            Err(ParamError::BadFork("yes".into()))
-        );
-        // An ordinary class accepts fork: "false" and refuses anything else.
-        VolumeParams::from_create("pvc-1", &map(&[("profile", "p"), ("fork", "false")])).unwrap();
-        assert_eq!(
-            VolumeParams::from_create("pvc-1", &map(&[("profile", "p"), ("fork", "true")])),
-            Err(ParamError::BadFork("true".into()))
-        );
-    }
 
     fn map(pairs: &[(&str, &str)]) -> HashMap<String, String> {
         pairs
@@ -622,313 +346,208 @@ mod tests {
             .collect()
     }
 
+    fn name(text: &str) -> VolumeName {
+        VolumeName::parse(text).unwrap()
+    }
+
+    const META: [(&str, &str); 3] = [
+        (PVC_NAME, "data"),
+        (PVC_NAMESPACE, "apps"),
+        (PV_NAME, "pvc-1"),
+    ];
+
+    fn with_meta(extra: &[(&str, &str)]) -> HashMap<String, String> {
+        let mut m = map(&META);
+        m.extend(map(extra));
+        m
+    }
+
     #[test]
-    fn the_volume_name_defaults_to_namespace_claim_and_pv() {
+    fn every_accepted_key() {
+        let p = VolumeParams::from_create("pvc-1", &with_meta(&[("profile", "p")])).unwrap();
+        assert_eq!(
+            p,
+            VolumeParams {
+                profile: "p".into(),
+                name: name("apps.data.pvc-1")
+            }
+        );
+        // Without the metadata the PV name is the volume name.
+        let p = VolumeParams::from_create("pvc-2", &map(&[("profile", "p")])).unwrap();
+        assert_eq!(p.name, name("pvc-2"));
         let p = VolumeParams::from_create(
-            "pvc-1234",
-            &map(&[
-                ("profile", "example"),
-                (PVC_NAME, "data"),
-                (PVC_NAMESPACE, "agents"),
-                (PV_NAME, "pvc-1234"),
+            "pvc-1",
+            &with_meta(&[
+                ("profile", "web-1"),
+                ("volumeName", "x-{pvcName}-{pvName}"),
+                ("onDelete", "retain"),
+                ("fork", "false"),
             ]),
         )
         .unwrap();
-        assert_eq!(p.volume, "agents.data.pvc-1234");
-        assert_eq!(p.branch_name(), "agentfs/agents.data.pvc-1234");
-        assert_eq!(p.on_delete, OnDelete::Retain);
-        let ctx = p.to_context();
-        assert_eq!(ctx["profile"], "example");
-        assert_eq!(ctx["volume"], "agents.data.pvc-1234");
-        assert_eq!(ctx["onDelete"], "retain");
-        assert!(!ctx.contains_key("branch"), "{ctx:?}");
-        // The context round-trips.
-        let back = VolumeParams::from_context("pvc-1234", &ctx).unwrap();
-        assert_eq!(back.volume, p.volume);
-        assert_eq!(back.branch_name(), p.branch_name());
-    }
-
-    /// F8 rule 1: every class's name names the PV, and no class or static
-    /// PV names a branch.
-    #[test]
-    fn every_name_is_unique_and_no_class_names_a_branch() {
-        for template in ["team-{pvcName}", "{pvcNamespace}.{pvcName}", "fixed"] {
-            let err = VolumeParams::from_create(
-                "pvc-1",
-                &map(&[
-                    ("profile", "p"),
-                    ("volumeName", template),
-                    (PVC_NAME, "data"),
-                    (PVC_NAMESPACE, "ns"),
-                ]),
-            )
-            .unwrap_err();
-            assert_eq!(
-                err,
-                ParamError::NameNotUnique {
-                    template: template.into()
-                }
-            );
-        }
+        assert_eq!(p.profile, "web-1");
+        assert_eq!(p.name, name("x-data-pvc-1"));
         assert_eq!(
-            VolumeParams::from_create("v", &map(&[("profile", "p"), ("branch", "team/x")])),
-            Err(ParamError::UnknownKey("branch".into()))
+            p.to_context(),
+            map(&[("profile", "web-1"), ("volume", "x-data-pvc-1")])
         );
-        assert_eq!(
-            VolumeParams::from_context("h", &map(&[("profile", "p"), ("branch", "team/x")])),
-            Err(ParamError::UnknownAttribute("branch".into()))
-        );
+        // The context reads back as a static PV's attributes.
+        assert_eq!(VolumeParams::from_static("h", &p.to_context()).unwrap(), p);
     }
 
     #[test]
-    fn a_start_class() {
-        let c = "0123456789abcdef0123456789abcdef01234567";
-        let value = format!("origin:agentfs/ns.data.pvc-1@{c}");
-        let p =
-            VolumeParams::from_create("pvc-2", &map(&[("profile", "p"), ("startFrom", &value)]))
-                .unwrap();
-        assert_eq!(p.start_from.as_deref(), Some(value.as_str()));
-        assert_eq!(p.start_point().unwrap().unwrap().to_string(), value);
-        assert!(
-            !p.to_context().contains_key("startFrom"),
-            "the identity is the authority"
-        );
-        let diverged = format!("origin:refs/agentfs/ns.data.pvc-1/diverged/x@{c}");
-        let err =
-            VolumeParams::from_create("pvc-2", &map(&[("profile", "p"), ("startFrom", &diverged)]))
-                .unwrap_err();
-        assert!(
-            matches!(
-                err,
-                ParamError::BadStartFrom(BadStartPoint::NotABranch { .. })
-            ),
-            "{err:?}"
-        );
-        assert!(err.to_string().contains("not a branch"), "{err}");
-        assert!(matches!(
-            VolumeParams::from_create("pvc-2", &map(&[("profile", "p"), ("startFrom", "x")])),
-            Err(ParamError::BadStartFrom(BadStartPoint::Shape { .. }))
-        ));
-    }
-
-    #[test]
-    fn without_metadata_the_volume_is_the_pv_name() {
-        let p = VolumeParams::from_create("sanity-x-1", &map(&[("profile", "s")])).unwrap();
-        assert_eq!(p.volume, "sanity-x-1");
-        let p = VolumeParams::from_create("ignored", &map(&[("profile", "s"), (PV_NAME, "pvc-9")]))
-            .unwrap();
-        assert_eq!(p.volume, "pvc-9");
-    }
-
-    #[test]
-    fn templates_render_and_fail_clearly() {
-        let md = [
-            ("profile", "p"),
-            (PVC_NAME, "data"),
-            (PVC_NAMESPACE, "ns"),
-            (PV_NAME, "pvc-1"),
-        ];
-        let with = |t: &str| {
-            let mut m = map(&md);
-            m.insert("volumeName".into(), t.into());
+    fn every_refusal_and_its_message() {
+        let refused = |extra: &[(&str, &str)]| {
+            let mut m = with_meta(&[("profile", "p")]);
+            m.extend(map(extra));
             VolumeParams::from_create("pvc-1", &m)
+                .unwrap_err()
+                .to_string()
         };
         assert_eq!(
-            with("team-{pvcName}-{pvName}").unwrap().volume,
-            "team-data-pvc-1"
+            refused(&[("onDelete", "delete")]),
+            "onDelete: delete is not built on tree volumes: a deleted claim's volume is kept, \
+             because its history is pushed nowhere yet"
         );
-        assert_eq!(with("{pvName}").unwrap().volume, "pvc-1");
         assert_eq!(
-            with("{pvcNamespace}_{pvcName}_{pvName}").unwrap().volume,
-            "ns_data_pvc-1"
+            refused(&[("onDelete", "Retain")]),
+            "onDelete \"Retain\" must be \"retain\""
         );
-        assert!(matches!(
-            with("{pod}.{pvName}").unwrap_err(),
-            ParamError::UnknownPlaceholder { .. }
-        ));
-        assert!(matches!(
-            with("a/{pvName}").unwrap_err(),
-            ParamError::BadVolumeName { .. }
-        ));
-        assert!(matches!(
-            with("{pvName}..x").unwrap_err(),
-            ParamError::BadVolumeName { .. }
-        ));
-        assert!(matches!(
-            with("{pvName}.lock").unwrap_err(),
-            ParamError::BadVolumeName { .. }
-        ));
-        let err = VolumeParams::from_create(
-            "pvc-1",
-            &map(&[("profile", "p"), ("volumeName", "{pvcName}.{pvName}")]),
-        )
-        .unwrap_err();
-        assert!(matches!(err, ParamError::MissingMetadata { .. }));
-        assert!(err.to_string().contains("--extra-create-metadata"), "{err}");
-    }
-
-    #[test]
-    fn profile_names_follow_dns_label_rules() {
-        for good in ["a", "example", "ci-2", "0"] {
-            validate_profile(good).unwrap();
-        }
-        let long = "a".repeat(64);
-        for bad in [
-            "",
-            "Example",
-            "-a",
-            "a-",
-            "a.b",
-            "a_b",
-            "a/b",
-            long.as_str(),
-        ] {
-            assert!(validate_profile(bad).is_err(), "{bad}");
-        }
         assert_eq!(
-            VolumeParams::from_create("v", &map(&[])).unwrap_err(),
+            refused(&[("startFrom", "origin:agentfs/v@x")]),
+            "startFrom is not built on tree volumes: a volume starts empty; moving a volume \
+             between nodes is not built (docs/runbooks/moving.md)"
+        );
+        assert_eq!(
+            refused(&[("workloadMounts", "/workspace")]),
+            "workloadMounts is not built on tree volumes: tree volumes keep nested repositories \
+             untracked"
+        );
+        assert_eq!(
+            refused(&[("branch", "main")]),
+            "unknown StorageClass parameter \"branch\" (known: profile, volumeName, onDelete, \
+             fork)"
+        );
+        assert_eq!(
+            refused(&[("link", "linked")]),
+            "link is a fork class's parameter (fork: \"true\"); an ordinary class has no source"
+        );
+        assert_eq!(
+            refused(&[("remotes", "r")]),
+            "remotes is a fork class's parameter (fork: \"true\"); an ordinary class has no \
+             source"
+        );
+        assert_eq!(
+            refused(&[("fork", "yes")]),
+            "fork \"yes\" must be \"true\" or \"false\""
+        );
+        assert_eq!(
+            refused(&[("fork", "true")]),
+            "fork claims are not built yet"
+        );
+        assert_eq!(
+            refused(&[("volumeName", "{pvcName}")]),
+            "volumeName \"{pvcName}\" must contain {pvName}, so each claim is a volume of its own"
+        );
+        assert_eq!(
+            refused(&[("volumeName", "{pvName}-{zone}")]),
+            "volumeName \"{pvName}-{zone}\": unknown placeholder {zone} (known: pvcNamespace, \
+             pvcName, pvName)"
+        );
+        assert_eq!(
+            refused(&[("volumeName", "-{pvName}")]),
+            "volumeName \"-{pvName}\" gives \"-pvc-1\", which is not a valid agentfs volume \
+             name ([A-Za-z0-9][A-Za-z0-9._-]*, no '..', no .lock suffix)"
+        );
+        assert_eq!(
+            VolumeParams::from_create(
+                "pvc-1",
+                &map(&[("profile", "p"), ("volumeName", "{pvcName}.{pvName}")])
+            )
+            .unwrap_err()
+            .to_string(),
+            "volumeName \"{pvcName}.{pvName}\" uses {pvcName}, which the CO did not provide (run \
+             csi-provisioner with --extra-create-metadata)"
+        );
+        assert_eq!(
+            VolumeParams::from_create("pvc-1", &map(&[])).unwrap_err(),
             ParamError::MissingProfile
         );
-        assert!(matches!(
-            VolumeParams::from_create("v", &map(&[("profile", "../etc")])).unwrap_err(),
-            ParamError::BadProfile(_)
-        ));
-    }
-
-    #[test]
-    fn on_delete_and_unknown_keys() {
-        let p = VolumeParams::from_create("v", &map(&[("profile", "p"), ("onDelete", "delete")]))
-            .unwrap();
-        assert_eq!(p.on_delete, OnDelete::Delete);
         assert_eq!(
-            VolumeParams::from_create("v", &map(&[("profile", "p"), ("onDelete", "keep")]))
-                .unwrap_err(),
-            ParamError::BadOnDelete(agentfs_core::release::BadOnDelete("keep".into()))
-        );
-        assert_eq!(
-            VolumeParams::from_create("v", &map(&[("profile", "p"), ("remote", "x")])).unwrap_err(),
-            ParamError::UnknownKey("remote".into())
-        );
-        // The CO's own keys are ignored.
-        VolumeParams::from_create(
-            "v",
-            &map(&[("profile", "p"), ("csi.storage.k8s.io/fstype", "ext4")]),
-        )
-        .unwrap();
-    }
-
-    #[test]
-    fn workload_mounts_reach_the_volume_context_and_back() {
-        let p = VolumeParams::from_create(
-            "pv-1",
-            &map(&[
-                ("profile", "p"),
-                ("workloadMounts", "/workspace, /src=proj"),
-            ]),
-        )
-        .unwrap();
-        assert_eq!(p.workload_mounts, ["/workspace", "/src=proj"]);
-        let context = p.to_context();
-        assert_eq!(context["workloadMounts"], "/workspace,/src=proj");
-        let back = VolumeParams::from_context("pv-1", &context).unwrap();
-        assert_eq!(back.workload_mounts, p.workload_mounts);
-        assert_eq!(
-            workload_mounts(&context).unwrap(),
-            ["/workspace", "/src=proj"]
-        );
-        assert!(workload_mounts(&map(&[])).unwrap().is_empty());
-        for bad in ["workspace", "/w=../up"] {
-            assert!(matches!(
-                VolumeParams::from_create("v", &map(&[("profile", "p"), ("workloadMounts", bad)])),
-                Err(ParamError::BadWorkloadMount(_))
-            ));
-        }
-        // Without it, the context is as before.
-        let p = VolumeParams::from_create("v", &map(&[("profile", "p")])).unwrap();
-        assert!(!p.to_context().contains_key("workloadMounts"));
-    }
-
-    #[test]
-    fn a_static_pv_context_defaults_the_volume_to_the_handle() {
-        let p = VolumeParams::from_context(
-            "retained-1",
-            &map(&[
-                ("profile", "p"),
-                ("storage.kubernetes.io/csiProvisionerIdentity", "x"),
-            ]),
-        )
-        .unwrap();
-        assert_eq!(p.volume, "retained-1");
-        assert_eq!(p.branch_name(), "agentfs/retained-1");
-        assert_eq!(
-            VolumeParams::from_context("h", &map(&[])).unwrap_err(),
-            ParamError::MissingProfile
-        );
-        assert!(
-            VolumeParams::from_context("h", &map(&[("profile", "p"), ("volume", "a/b")])).is_err()
+            VolumeParams::from_create("pvc-1", &map(&[("profile", "Bad")])).unwrap_err(),
+            ParamError::BadProfile("Bad".into())
         );
     }
 
     #[test]
-    fn a_static_pv_names_its_volume_with_volume_name() {
-        // As docs/csi.md documents it.
-        let p = VolumeParams::from_context(
-            "pvc-0b6f",
-            &map(&[("profile", "p"), ("volumeName", "research.notes")]),
-        )
-        .unwrap();
-        assert_eq!(p.volume, "research.notes");
-        assert_eq!(p.branch_name(), "agentfs/research.notes");
-        // `volume` (CreateVolume's context) is the same key; agreeing is fine.
-        let both = map(&[("profile", "p"), ("volume", "x"), ("volumeName", "x")]);
-        assert_eq!(VolumeParams::from_context("h", &both).unwrap().volume, "x");
-        let clash = map(&[("profile", "p"), ("volume", "x"), ("volumeName", "y")]);
-        assert!(matches!(
-            VolumeParams::from_context("h", &clash).unwrap_err(),
-            ParamError::ConflictingNames { .. }
-        ));
-        // Not a template.
-        assert!(matches!(
-            VolumeParams::from_context("h", &map(&[("profile", "p"), ("volumeName", "{pvName}")]))
-                .unwrap_err(),
-            ParamError::BadVolumeName { .. }
-        ));
-        // A typo is refused, not ignored; the CO's own keys are ignored.
-        assert_eq!(
-            VolumeParams::from_context("h", &map(&[("profile", "p"), ("volumename", "x")]))
-                .unwrap_err(),
-            ParamError::UnknownAttribute("volumename".into())
-        );
-        VolumeParams::from_context(
+    fn fork_classes() {
+        assert!(is_fork_class(&map(&[("fork", "true")])));
+        assert!(!is_fork_class(&map(&[("fork", "false")])));
+        assert!(!is_fork_class(&map(&[])));
+    }
+
+    #[test]
+    fn static_attributes() {
+        let p = VolumeParams::from_static("h", &map(&[("profile", "p")])).unwrap();
+        assert_eq!(p.name, name("h"));
+        let p = VolumeParams::from_static(
             "h",
             &map(&[
                 ("profile", "p"),
+                ("volumeName", "apps.data.pvc-1"),
+                ("onDelete", "retain"),
                 ("storage.kubernetes.io/csiProvisionerIdentity", "x"),
                 (POD_NAME, "w"),
             ]),
         )
         .unwrap();
+        assert_eq!(p.name, name("apps.data.pvc-1"));
+        assert_eq!(
+            VolumeParams::from_static(
+                "h",
+                &map(&[("profile", "p"), ("volume", "a"), ("volumeName", "b")])
+            )
+            .unwrap_err(),
+            ParamError::ConflictingNames {
+                a: "a".into(),
+                b: "b".into()
+            }
+        );
+        assert_eq!(
+            VolumeParams::from_static("h", &map(&[("profile", "p"), ("volumename", "x")]))
+                .unwrap_err(),
+            ParamError::UnknownAttribute("volumename".into())
+        );
+        assert_eq!(
+            VolumeParams::from_static("h", &map(&[("profile", "p"), ("onDelete", "delete")]))
+                .unwrap_err(),
+            ParamError::OnDeleteNotBuilt
+        );
+        assert!(matches!(
+            VolumeParams::from_static("h", &map(&[("profile", "p"), ("volume", "a b")]))
+                .unwrap_err(),
+            ParamError::BadVolumeName { .. }
+        ));
     }
 
     #[test]
-    fn pod_info_and_ephemeral() {
+    fn pod_contexts_and_ephemeral() {
         let ctx = map(&[
             (POD_NAME, "writer-a"),
             (POD_NAMESPACE, "apps"),
             (POD_UID, "1234"),
-            (POD_SERVICE_ACCOUNT, "default"),
+            ("csi.storage.k8s.io/serviceAccount.name", "default"),
         ]);
-        let pod = PodInfo::from_context(&ctx).unwrap();
-        assert_eq!(
-            pod,
-            PodInfo {
-                namespace: "apps".into(),
-                name: "writer-a".into(),
-                uid: "1234".into(),
-                service_account: "default".into(),
-            }
-        );
-        assert_eq!(PodInfo::from_context(&map(&[(POD_NAME, "x")])), None);
+        let pod = pod_context(&ctx, "node-1").unwrap();
+        assert_eq!(pod.pod.unwrap().as_str(), "writer-a");
+        assert_eq!(pod.namespace.unwrap().as_str(), "apps");
+        assert_eq!(pod.pod_uid.unwrap().as_str(), "1234");
+        assert_eq!(pod.node.unwrap().as_str(), "node-1");
+        let bare = pod_context(&map(&[]), "node-1").unwrap();
+        assert_eq!(bare.pod, None);
+        assert_eq!(bare.namespace, None);
+        assert_eq!(bare.node.unwrap().as_str(), "node-1");
+        assert!(pod_context(&map(&[(POD_NAME, "a b")]), "n").is_err());
         assert!(!is_ephemeral(&ctx));
         assert!(is_ephemeral(&map(&[(EPHEMERAL, "true")])));
         assert!(!is_ephemeral(&map(&[(EPHEMERAL, "false")])));

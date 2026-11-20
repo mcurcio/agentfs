@@ -1112,7 +1112,7 @@ equivalents above; a flag given on the command line wins.
 | `AGENTFS_WORKLOAD_MOUNTS` | `--workload-mount` | `front` |
 | `AGENTFS_HISTORY_LISTEN` | `--listen` | `serve-history` |
 | `AGENTFS_HISTORY_SERVICE`, `AGENTFS_HISTORY_TIMEOUT`, `AGENTFS_HISTORY_WAIT`, `AGENTFS_HISTORY_SLOT` | `--history-service`, `--history-timeout`, `--history-wait`, `--history-slot` | `front`, `record` |
-| `CSI_ENDPOINT`, `NODE_NAME`, `AGENTFS_CSI_POD`, `AGENTFS_CSI_NAMESPACE`, `AGENTFS_CSI_RELEASE_SCAN_INTERVAL` | `--endpoint`, `--node-id`, `--pod`, `--namespace`, `--release-scan-interval` | `agentfs-csi` ([below](#the-csi-driver-agentfs-csi)) |
+| `CSI_ENDPOINT`, `NODE_NAME`, `AGENTFS_CSI_POD`, `AGENTFS_CSI_NAMESPACE` | `--endpoint`, `--node-id`, `--pod`, `--namespace` | `agentfs-csi` ([below](#the-csi-driver-agentfs-csi)) |
 
 **Test builds only.** `AGENTFS_FAILPOINTS` sets failpoints on the durable
 path (`name=kill|error|panic|sleep(ms)[@n]`, joined with `;`, [architecture.md](architecture.md#crash-model)). Only a binary
@@ -1175,24 +1175,26 @@ chart's git server on (the `server.*` values: `enabled`, `image`,
 scheduling, listed in the [chart's README](../charts/agentfs-csi/README.md)),
 `agentfs-server` there is its credentials file, for a profile's
 `agentfsCredentials` ([helm.md](helm.md#the-git-server)). Each claim's
-worktree (its files and its branch `agentfs/<volumeName>`) lives on the
-disk of the node that created it, for good.
+tree volume (`<base>/<pv>/state`, its history in `state/history.git`)
+lives on the disk of the node that created it, for good. Push is not
+built on tree volumes: a profile's remotes and push settings are logged
+as not built.
 
 **StorageClass parameters** (or a static PV's `volumeAttributes`, where unknown keys are refused too):
 
 | Parameter | Default | Meaning |
 |---|---|---|
-| `profile` | required | the profile, a DNS label |
-| `volumeName` | `{pvcNamespace}.{pvcName}.{pvName}`, else the PV name | the agentfs volume name; a template over `{pvcNamespace}`, `{pvcName}`, `{pvName}` that must contain `{pvName}` (`INVALID_ARGUMENT` otherwise): each claim is a worktree with its own branch, `agentfs/<volumeName>`, and a claim deleted and created again is a new one. There is no `branch` parameter. In a static PV's attributes, a literal name (`volume` is the same key), default the volume handle |
-| `onDelete` | `retain` | what DeleteVolume does once nothing would be lost: `retain` keeps the worktree on its node (`csi.retained.json`), `delete` removes it. Either way it waits (`UNAVAILABLE`, retried) while a remote lacks the branch's head, and a worktree with no remote section (local-only) is kept whatever this says, except an unlinked fork with no remote of its own, which `delete` removes unpushed |
-| `startFrom` | none | `<remote>:<branch>@<commit>`: a start class. Each claim on it is a new worktree whose history begins at `<commit>` of another worktree's `<branch>`, fetched once from `<remote>` (a push section of the profile) at CreateVolume, and kept in its identity (`[agentfs "start"]`). `<branch>` is a branch name such as `agentfs/<old volume>`, never a `refs/...` ref (a `diverged/*` ref is refused: "not a branch"), never the new volume's own branch; `<commit>` is a full id on it. Moving a volume to another node: [runbooks/moving.md](runbooks/moving.md). Not a static PV attribute |
-| `workloadMounts` | none | where pods mount the volume: comma-separated `PATH` or `PATH=DIR`, passed to every front as `--workload-mount` so worktree `gitdir:` paths map exactly (see [recording](recording.md)) |
+| `profile` | required | the profile, a DNS label: CreateVolume runs `agentfs init --include <profile>.config` and installs `<profile>.exclude` and `<profile>.attributes`; a host installs them again each time it starts. A missing `<profile>.config` is `INVALID_ARGUMENT` |
+| `volumeName` | `{pvcNamespace}.{pvcName}.{pvName}`, else the PV name | the agentfs volume name; a template over `{pvcNamespace}`, `{pvcName}`, `{pvName}` that must contain `{pvName}` (`INVALID_ARGUMENT` otherwise): each claim is a volume of its own, and a claim deleted and created again is a new one. There is no `branch` parameter. In a static PV's attributes, a literal name (`volume` is the same key), default the volume handle; it must be the name the kept volume holds (`ALREADY_EXISTS` otherwise) |
+| `onDelete` | `retain` | `retain` only: DeleteVolume drains the volume and keeps its directory (`csi.json` becomes `csi.retained.json`). `delete` is refused, not built: a deleted claim's volume is kept, because its history is pushed nowhere yet |
+| `startFrom` | none | refused, not built: a volume starts empty; moving a volume between nodes is not built ([runbooks/moving.md](runbooks/moving.md)) |
+| `workloadMounts` | none | refused, not built: tree volumes keep nested repositories untracked |
 | `fork` | `"false"` | `"true"` makes a fork class (see [forks](forks.md)): a claim on it with a `dataSource` claim is a fork of that claim's volume, with the source's profile, made on the source's node (give the fork's pod affinity to its source's pods; elsewhere CreateVolume answers `FAILED_PRECONDITION`). A fork class must not set `profile`, `branch` or `startFrom`, its `onDelete` defaults to `delete`. Not a static PV attribute |
 | `link` | `linked` | a fork class only (`INVALID_ARGUMENT` in any other): `linked` forks deliver their change back to the source when their claim is deleted; `unlinked` forks are independent, never finished, never push to the source's remotes (only to their `remotes`), and DeleteVolume applies `onDelete` once their own remotes hold the head, as for any worktree; with no remote of their own they are local-only and `onDelete: delete` removes them unpushed. Written into each fork's identity (`agentfs.fork.link`) at CreateVolume; changing the class moves no fork that exists. Not a static PV attribute |
 | `remotes` | none: local-only | a fork class with `link: unlinked` only (`INVALID_ARGUMENT` in any other): a profile name whose `<remotes>.config` holds the fork's own remotes ([`agentfs.fork.remotes`](#agentfs-fork)), written into each fork's identity at CreateVolume; the config must exist. Not a static PV attribute |
 
 Every class of the driver must have `reclaimPolicy: Delete`, so that
-DeleteVolume always runs and the release decider answers; the chart's
+DeleteVolume always runs and drains the volume; the chart's
 admission policy (`classAdmission.enabled`, [helm.md](helm.md)) refuses
 any other.
 
@@ -1202,22 +1204,13 @@ any other.
 |---|---|---|---|
 | `--endpoint ADDR` | `CSI_ENDPOINT` | `unix:///csi/csi.sock` | the CSI socket (`unix://`, `unix:` or an absolute path) |
 | `--node-id NAME` | `NODE_NAME` | required | this node's name (`spec.nodeName`), its topology (`topology.agentfs.mcurcio.github.io/node`) |
-| `--base-path DIR` | | `/var/lib/agentfs-csi/volumes` | where this node's worktrees live: a directory on the node's own disk, ideally a disk of its own (a full disk makes the kubelet evict every pod on the node). A network filesystem (NFS, SMB, CephFS, GlusterFS, Lustre, GPFS, AFS) is refused before anything is served, naming its type |
-| `--node-state DIR` | | `/var/lib/agentfs-csi/node` | the node's staged and published records and the services' sockets; must survive plugin restarts |
-| `--mount-dir DIR` | | `/run/agentfs-csi/mounts` | where fronts mount before the bind onto the kubelet's target |
+| `--base-path DIR` | | `/var/lib/agentfs-csi/volumes` | where this node's volumes live (`<base>/<pv>/state`, `csi.json`): a directory on the node's own disk, ideally a disk of its own (a full disk makes the kubelet evict every pod on the node). A network filesystem (NFS, SMB, CephFS, GlusterFS, Lustre, GPFS, AFS) is refused before anything is served, naming its type |
+| `--node-state DIR` | | `/var/lib/agentfs-csi/node` | the node's published records (`published/<pv>.json`); must survive plugin restarts |
 | `--profiles-dir DIR` | | `/etc/agentfs-csi/profiles` | the profiles |
-| `--agentfs-bin PATH` | | `/usr/local/bin/agentfs` | the `agentfs` binary the node plugin runs |
-| `--passthrough auto\|on\|off` | | `auto` | the fronts' FUSE passthrough, for files opened read-only (see [library/filesystem](library/filesystem.md)) |
-| `--front-threads N` | | `4` | FUSE threads per front |
-| `--stage-wait DURATION` | | `60s` | how long NodeStage waits for the history service before answering `UNAVAILABLE` |
-| `--publish-wait DURATION` | | `60s` | how long NodePublish waits for the front's mount |
-| `--unpublish-grace DURATION` | | `20s` | how long NodeUnpublish waits for a front to stop before SIGKILL |
-| `--unstage-grace DURATION` | | `30s` | how long NodeUnstage waits for a service to stop before SIGKILL |
-| `--history-wait DURATION` | | `30s` | the fronts' `--history-wait` |
-| `--backoff-max DURATION` | | `30s` | the longest delay between restarts of a crashed service or front |
-| `--pod NAME`, `--namespace NAME` | `AGENTFS_CSI_POD`, `AGENTFS_CSI_NAMESPACE` | empty | the plugin pod's name and namespace, passed to the history services (their own identity in telemetry) |
-| `--release-scan-interval DURATION` | `AGENTFS_CSI_RELEASE_SCAN_INTERVAL` | `30s` | how often the release scan runs `agentfs push` for every worktree no pod stages on this node, until a push exits 0 at its head, and `agentfs fork finish` for every fork whose deletion asked for it (see [library/kubernetes](library/kubernetes.md)); also the first delay after a failed push, doubling up to `--backoff-max` (at least this). It runs once at start and whenever DeleteVolume waits |
+| `--agentfs-bin PATH` | | `/usr/local/bin/agentfs` | the `agentfs` binary the node plugin runs: `agentfs init` per CreateVolume, one `agentfs host` per volume in use on the node |
+| `--backoff-max DURATION` | | `30s` | the longest delay between restarts of a crashed host |
+| `--pod NAME`, `--namespace NAME` | `AGENTFS_CSI_POD`, `AGENTFS_CSI_NAMESPACE` | empty | the plugin pod's name and namespace, passed to `agentfs init` and `agentfs host` (their own identity in telemetry) |
 
-The node plugin passes its `OTEL_*` variables on to every service and
-front; it removes inherited `AGENTFS_*` variables, so the per-volume and
-per-pod flags it sets are the only ones.
+The node plugin passes its `OTEL_*` variables on to every host; it
+removes inherited `AGENTFS_*` variables, so the per-volume flags it sets
+are the only ones.

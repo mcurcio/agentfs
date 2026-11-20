@@ -164,10 +164,10 @@ dependencies = [
 name = "agentfs-csi"
 version = "0.1.0"
 dependencies = [
+ "agentfs-contracts",
  "agentfs-core",
  "agentfs-fuse",
  "clap",
- "git2",
  "hyper-util",
  "prost",
  "prost-types",

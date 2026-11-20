@@ -95,7 +95,7 @@ pub fn bind(socket: &Path) -> Result<BoundSocket, ServerError> {
 
 impl BoundSocket {
     /// Serves Identity, Controller and Node (every node plugin serves all
-    /// three, F8 R8) until `shutdown` completes; then stops accepting calls,
+    /// three) until `shutdown` completes; then stops accepting calls,
     /// lets running ones finish, and removes the socket.
     pub async fn serve<N: Node>(
         self,

@@ -1,54 +1,37 @@
-//! The node plugin's supervisor: one `agentfs
-//! serve-history` per staged volume, one `agentfs front --history-service`
-//! front per published target, and their recovery.
+//! The node plugin's supervisor (docs/csi.md): one `agentfs host` per volume
+//! in use on this node, each pod's view opened on it at the kubelet's
+//! target, and the hosts' recovery.
 //!
-//! - **Stage** checks the worktree under its lock: it never creates one
-//!   (F8 rule 1); a worktree missing from this node's disk is `NOT_FOUND`,
-//!   and a static PV is adopted only over an existing worktree of its
-//!   volume. It then sets the profile's include, installs the profile's
-//!   rules, records the volume
-//!   in `<node-state>/staged/`, starts the service on a node-local socket
-//!   and waits for it to write its address (at most `stage_wait`; then
-//!   `UNAVAILABLE`, and the kubelet retries while the service recovers its
-//!   journal or fetches patches).
-//! - **Publish** starts a front that FUSE-mounts the backing tree at its
-//!   own source directory, waits until that mount is live, bind-mounts it
-//!   onto the kubelet's target and records the target in
-//!   `<node-state>/published/`. A finished fork is published read-only
-//!   (`MS_RDONLY`) whatever the request asks; its service
-//!   still starts and refuses every record, and its front mounts it
-//!   read-only, so the kernel refuses writes through any bind.
-//! - **A front that exits unasked** (a crash, `kill -9`, an external
-//!   unmount) is restarted after a backoff in the same pending slot, with
-//!   the same pod flags; its stale source is detached and the new mount is
-//!   bind-stacked over the stale target, without unmounting it first, so
-//!   it propagates into containers that mount the volume with
-//!   `HostToContainer`. A target whose directory is gone (the pod is gone)
-//!   is forgotten instead.
-//! - **A service that exits unasked** is restarted after a backoff; it
-//!   recovers its journal, and the fronts reconnect by themselves.
-//! - **Unpublish** detaches the target, then stops the front (SIGTERM,
-//!   SIGKILL after `unpublish_grace`). **Unstage** is refused while
-//!   targets are published, then stops the service (SIGTERM, SIGKILL after
-//!   `unstage_grace`; the journal makes that safe). The service makes its
-//!   final commit and pushes it once more within `--push-grace`.
-//! - **Reconcile**, at plugin start, rebuilds the
-//!   above from the records: services for staged volumes, front recovery
-//!   for targets whose topmost mount is a stale agentfs mount.
-//! - **A restart that cannot spawn** (a failed fork under PID or memory
-//!   pressure, a full disk) is tried again with backoff; the entry and
-//!   the records stay, so the volume and its targets are never dropped
-//!   for it, at a restart or at reconcile.
+//! - **Ensure** runs `agentfs init` for a claim's volume (Volume's ensure:
+//!   it creates the tree volume or finds it, and makes the profile's config
+//!   its include), then installs the profile's rule files.
+//! - **Publish** allows one pod per claim: a claim published at another
+//!   target is refused. It starts the volume's host when none runs, then
+//!   asks it to open a view at the target with the pod's context, and
+//!   records the target in `<node-state>/published/<handle>.json`.
+//! - **Unpublish** asks the host to close the view (or detaches the target
+//!   when no host runs), removes the record and the target directory, and
+//!   stops the host once its last view is closed.
+//! - **Starting a host** installs the profile's rule files (rules are read
+//!   when a volume opens), spawns the host and reads its hello, then opens
+//!   every recorded view of the volume whose target is still there
+//!   (stacked over a stale mount a crashed host left) and asks the host to
+//!   reconcile, which ends what no view uses any more.
+//! - **Stopping a host** drops its control channel: the host sees EOF,
+//!   drains, and exits 0 once Volume has released the volume.
+//! - **A host that exits unasked** is started again after a backoff while
+//!   records of the volume remain, with every view replayed. A start that
+//!   fails is tried again with backoff. These delays are the only timers.
+//! - **Release** (DeleteVolume) starts the volume's host with no view and
+//!   stops it: its exit 0 is Volume's release verdict.
+//! - **Reconcile**, at plugin start, drops the records whose target is
+//!   gone, starts a host per volume that still has views, and names the
+//!   recording-format volumes it never serves.
 //!
-//! Each volume's calls run one at a time (a per-volume async lock). Waits
-//! happen outside it: for a restarted child, for a service NodeStage
-//! started and for a front NodePublish started, so a slow start never
-//! delays another pod's recovery. A child NodeStage or NodePublish started
-//! that exits before it is ready is that call's failure, not restarted.
-//! A NodePublish of a published target with other flags (read-only,
-//! single-writer) is `ALREADY_EXISTS`, as the CSI spec requires.
+//! Each volume's calls run one at a time, under a per-volume async lock;
+//! every on-demand start and stop happens under it.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fs::{self, DirBuilder};
 use std::io;
 use std::os::unix::fs::DirBuilderExt;
@@ -57,18 +40,21 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use agentfs_core::history_service::FrontLease;
-use agentfs_core::volume::{self as core_volume, StateDir};
-use agentfs_fuse::MountState;
-use rustix::process::Signal;
-use tokio::sync::Mutex as AsyncMutex;
+use agentfs_contracts::host::{Refusal, RefusalKind, Reply, Request, TreeRef, ViewRequest};
+use agentfs_contracts::name::ClientLabel;
+use agentfs_contracts::pod::PodContext;
+use agentfs_contracts::ports::Found;
+use agentfs_core::operator_settings::{RuleFiles, install_rules};
+use agentfs_core::tree_actor;
+use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard, watch};
 
 use crate::error::Error;
-use crate::launcher::{self, Exit, FrontOptions, Launcher, PluginIdentity, Spawned};
-use crate::layout::{Layout, target_key};
-use crate::mounter::Mounter;
-use crate::params::{PodInfo, VolumeParams};
-use crate::records::{self, PublishedRecord, StagedRecord};
+use crate::host_client::{HostClient, HostGone};
+use crate::launcher::{self, Exit, Launcher, PluginIdentity, RecentLog, Spawned};
+use crate::layout::{Layout, target_key, validate_handle};
+use crate::mounter::{Mounter, detach_agentfs};
+use crate::params::VolumeParams;
+use crate::records::{self, PublishedRecord, RECORD_VERSION};
 use crate::volume;
 
 /// Restart delays: `initial`, doubling up to `max`, back to `initial`
@@ -104,16 +90,9 @@ pub fn next_backoff(prev: Option<Duration>, uptime: Duration, cfg: &Backoff) -> 
 pub struct NodeConfig {
     pub node_id: String,
     pub layout: Layout,
-    /// The plugin pod's own identity, given to the history services.
+    /// The plugin pod's own identity, given to its children.
     pub plugin: PluginIdentity,
-    pub front: FrontOptions,
-    pub stage_wait: Duration,
-    pub publish_wait: Duration,
-    pub unpublish_grace: Duration,
-    pub unstage_grace: Duration,
     pub backoff: Backoff,
-    /// How often readiness is checked.
-    pub poll: Duration,
 }
 
 impl NodeConfig {
@@ -123,95 +102,63 @@ impl NodeConfig {
             node_id: node_id.into(),
             layout,
             plugin: PluginIdentity::default(),
-            front: FrontOptions {
-                passthrough: "auto".into(),
-                threads: 4,
-                history_wait: Duration::from_secs(30),
-            },
-            stage_wait: Duration::from_secs(60),
-            publish_wait: Duration::from_secs(60),
-            unpublish_grace: Duration::from_secs(20),
-            unstage_grace: Duration::from_secs(30),
             backoff: Backoff::default(),
-            poll: Duration::from_millis(100),
         }
     }
 }
 
-/// NodeStage, validated.
-#[derive(Debug, Clone)]
-pub struct StageRequest {
+/// One pod's view, as NodePublish asks for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ViewSpec {
+    /// The claim.
     pub handle: String,
-    pub volume_context: HashMap<String, String>,
-}
-
-/// NodePublish, validated.
-#[derive(Debug, Clone)]
-pub struct PublishRequest {
-    pub handle: String,
+    /// The volume directory whose host serves the view.
+    pub volume: String,
+    pub tree: TreeRef,
     pub target: PathBuf,
-    pub readonly: bool,
-    /// SINGLE_NODE_SINGLE_WRITER (ReadWriteOncePod).
-    pub single_writer: bool,
-    pub pod: Option<PodInfo>,
-    /// `--workload-mount` values for the front (the `workloadMounts`
-    /// volume attribute).
-    pub workload_mounts: Vec<String>,
+    pub read_only: bool,
+    pub pod: PodContext,
 }
 
-/// What [`Supervisor::reconcile`] found.
+/// What [`Supervisor::reconcile`] did.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ReconcileReport {
-    /// Services started for staged volumes.
-    pub services: usize,
-    /// Targets whose fronts are being recovered.
-    pub recovering: usize,
-    /// Records of targets that were gone or no longer mounted.
+    /// Hosts started.
+    pub hosts: usize,
+    /// Views opened again.
+    pub views: usize,
+    /// Records dropped: their target was gone, or the host refused them.
     pub dropped: usize,
-    /// Records that could not be read.
+    /// Names under the published directory that are no readable record.
     pub unreadable: Vec<String>,
 }
 
-/// A supervised child.
-#[derive(Debug)]
-struct Child {
-    spawned: Spawned,
+/// A running host.
+struct Host {
+    client: HostClient,
+    exited: watch::Receiver<Option<Exit>>,
+    recent_log: RecentLog,
     generation: u64,
     started: Instant,
-    /// Started by NodeStage (a service) or NodePublish (a front) and not
-    /// yet seen ready: if it exits, that call reports it (`FAILED_PRECONDITION`
-    /// with its log) and it is not restarted, unless fronts already use the
-    /// service's volume.
-    starting: bool,
-    /// Asked to stop: its exit is not a crash.
-    stopping: bool,
-    /// The delay before this child was started, if it is a restart.
+    /// The delay before this host was started, if it is a restart.
     backoff: Option<Duration>,
 }
 
-#[derive(Debug)]
-struct ServiceEntry {
-    child: Child,
-}
-
-#[derive(Debug)]
-struct FrontEntry {
-    child: Child,
-    record: PublishedRecord,
-}
-
-#[derive(Debug, Default)]
-struct Children {
-    services: HashMap<String, ServiceEntry>,
-    fronts: HashMap<PathBuf, FrontEntry>,
+/// A host just started.
+struct Started {
+    client: HostClient,
+    views: usize,
+    dropped: usize,
 }
 
 pub struct Supervisor {
     cfg: NodeConfig,
     launcher: Arc<dyn Launcher>,
     mounter: Arc<dyn Mounter>,
-    children: Mutex<Children>,
-    volume_locks: Mutex<HashMap<String, Arc<AsyncMutex<()>>>>,
+    /// The running hosts by volume. An entry removed is a host asked to
+    /// stop: its exit is no crash.
+    hosts: Mutex<HashMap<String, Host>>,
+    locks: Mutex<HashMap<String, Arc<AsyncMutex<()>>>>,
     generation: AtomicU64,
     shutting_down: AtomicBool,
 }
@@ -224,31 +171,55 @@ impl std::fmt::Debug for Supervisor {
     }
 }
 
-fn io_error(what: impl std::fmt::Display) -> impl FnOnce(io::Error) -> Error {
-    move |e| Error::io(what, e)
-}
-
 /// Whether something is at `path`. Only `NotFound` means absent: a stale
 /// FUSE mount answers `stat` with `ENOTCONN`, and it is very much there.
-pub(crate) fn exists(path: &Path) -> bool {
+fn exists(path: &Path) -> bool {
     match fs::symlink_metadata(path) {
         Ok(_) => true,
         Err(e) => e.kind() != io::ErrorKind::NotFound,
     }
 }
 
+/// The child's exit, once it has one.
+async fn wait_exit(exited: &mut watch::Receiver<Option<Exit>>) -> Exit {
+    let waited = exited.wait_for(Option::is_some).await.ok().and_then(|e| *e);
+    waited.or(*exited.borrow()).unwrap_or(Exit::Code(-1))
+}
+
+/// The error a host's refusal is to the CO.
+fn refused(refusal: Refusal) -> Error {
+    let Refusal { kind, message } = refusal;
+    match kind {
+        RefusalKind::ForkTaken
+        | RefusalKind::KeyUnknown
+        | RefusalKind::KeyEnded
+        | RefusalKind::Stale => Error::FailedPrecondition(message),
+        RefusalKind::Occupied => Error::AlreadyExists(message),
+        RefusalKind::MountFailed => Error::Internal(message),
+        RefusalKind::Draining | RefusalKind::Stopped => Error::Unavailable(message),
+        RefusalKind::NestedNotBuilt | RefusalKind::ApprovalNotBuilt => {
+            Error::InvalidArgument(message)
+        }
+    }
+}
+
+/// A profile file, when the operator gave one.
+fn optional(path: PathBuf) -> Option<PathBuf> {
+    path.exists().then_some(path)
+}
+
 impl Supervisor {
     pub fn new(
-        cfg: NodeConfig,
+        config: NodeConfig,
         launcher: Arc<dyn Launcher>,
         mounter: Arc<dyn Mounter>,
     ) -> Arc<Self> {
         Arc::new(Self {
-            cfg,
+            cfg: config,
             launcher,
             mounter,
-            children: Mutex::new(Children::default()),
-            volume_locks: Mutex::new(HashMap::new()),
+            hosts: Mutex::new(HashMap::new()),
+            locks: Mutex::new(HashMap::new()),
             generation: AtomicU64::new(1),
             shutting_down: AtomicBool::new(false),
         })
@@ -262,1088 +233,649 @@ impl Supervisor {
         &self.cfg.layout
     }
 
-    fn children(&self) -> MutexGuard<'_, Children> {
-        // A panic while holding it leaves plain maps; keep going.
-        self.children
+    fn hosts(&self) -> MutexGuard<'_, HashMap<String, Host>> {
+        // A panic while holding it leaves a plain map; keep going.
+        self.hosts
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    async fn lock_volume(&self, handle: &str) -> tokio::sync::OwnedMutexGuard<()> {
+    async fn lock_volume(&self, volume: &str) -> OwnedMutexGuard<()> {
         let lock = self
-            .volume_locks
+            .locks
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .entry(handle.to_owned())
+            .entry(volume.to_owned())
             .or_default()
             .clone();
         lock.lock_owned().await
     }
 
-    /// Runs a mount-table call on the blocking pool: `statfs` on a hung
-    /// FUSE mount can block.
-    async fn mount_call<T: Send + 'static>(
-        &self,
-        f: impl FnOnce(&dyn Mounter) -> io::Result<T> + Send + 'static,
-    ) -> io::Result<T> {
+    fn shutting_down(&self) -> bool {
+        self.shutting_down.load(Ordering::Relaxed)
+    }
+
+    /// The running host's client.
+    fn client(&self, volume: &str) -> Option<HostClient> {
+        self.hosts().get(volume).map(|h| h.client.clone())
+    }
+
+    fn recent(&self, volume: &str) -> String {
+        self.hosts()
+            .get(volume)
+            .map(|h| launcher::recent(&h.recent_log))
+            .unwrap_or_default()
+    }
+
+    /// The published records of `volume`.
+    fn records_of(&self, volume: &str) -> Vec<PublishedRecord> {
+        records::load_published(self.layout())
+            .0
+            .into_iter()
+            .filter(|r| r.volume == volume)
+            .collect()
+    }
+
+    /// What a host gone mid-call is to the CO.
+    fn gone(&self, volume: &str) -> Error {
+        Error::Unavailable(format!(
+            "the host of volume {volume} is gone; it is started again:\n{}",
+            self.recent(volume)
+        ))
+    }
+
+    /// Detaches every agentfs mount at `path`, on the blocking pool:
+    /// `statfs` on a hung FUSE mount can block.
+    async fn detach(&self, path: &Path) -> Result<(), Error> {
         let mounter = self.mounter.clone();
-        tokio::task::spawn_blocking(move || f(mounter.as_ref()))
-            .await
-            .map_err(io::Error::other)?
-    }
-
-    async fn mount_state(&self, path: &Path) -> io::Result<MountState> {
-        let path = path.to_path_buf();
-        self.mount_call(move |m| m.state(&path)).await
-    }
-
-    async fn detach_all(&self, path: &Path) -> Result<usize, Error> {
         let p = path.to_path_buf();
-        self.mount_call(move |m| m.detach_all(&p))
+        tokio::task::spawn_blocking(move || detach_agentfs(mounter.as_ref(), &p))
             .await
-            .map_err(io_error(format!("detaching {}", path.display())))
+            .map_err(io::Error::other)
+            .and_then(|r| r)
+            .map(|_| ())
+            .map_err(|e| Error::io(format!("detaching {}", path.display()), e))
     }
 
-    /// The pid of the volume's history service, while it runs.
-    pub fn service_pid(&self, handle: &str) -> Option<u32> {
-        let children = self.children();
-        let child = &children.services.get(handle)?.child;
-        child.spawned.exit().is_none().then_some(child.spawned.pid)
-    }
+    // ----- volumes --------------------------------------------------------
 
-    /// The pid of the front serving `target`, while it runs.
-    pub fn front_pid(&self, target: &Path) -> Option<u32> {
-        let children = self.children();
-        let child = &children.fronts.get(target)?.child;
-        child.spawned.exit().is_none().then_some(child.spawned.pid)
-    }
-
-    /// The pending slot of the front serving `target`, once known.
-    pub fn front_slot(&self, target: &Path) -> Option<u16> {
-        self.children().fronts.get(target)?.record.slot
-    }
-
-    fn next_generation(&self) -> u64 {
-        self.generation.fetch_add(1, Ordering::Relaxed)
-    }
-
-    // ----- services -------------------------------------------------------
-
-    /// NodeStage.
-    pub async fn stage(self: &Arc<Self>, req: StageRequest) -> Result<(), Error> {
-        let handle = req.handle.as_str();
-        {
-            let _lock = self.lock_volume(handle).await;
-            if !self.children().services.contains_key(handle) {
-                let layout = self.layout().clone();
-                let node_id = self.cfg.node_id.clone();
-                let h = handle.to_owned();
-                let context = req.volume_context.clone();
-                let params =
-                    tokio::task::spawn_blocking(move || prepare(&layout, &node_id, &h, &context))
-                        .await
-                        .map_err(|e| Error::Internal(format!("staging task failed: {e}")))??;
-                self.start_service(handle, None, true)?;
-                eprintln!(
-                    "staging volume {handle} (agentfs volume {}): history service started",
-                    params.volume
-                );
-            }
-        }
-        // Without the lock: a front's recovery must not wait behind a slow
-        // journal recovery.
-        self.wait_service(handle).await
-    }
-
-    /// Starts the volume's service and its monitor (`starting`: for
-    /// NodeStage, see [`Child::starting`]). The caller holds the
-    /// volume's lock.
-    fn start_service(
-        self: &Arc<Self>,
-        handle: &str,
-        backoff: Option<Duration>,
-        starting: bool,
-    ) -> Result<(), Error> {
+    /// `agentfs init` for the claim's volume, then install_rules from the
+    /// profile.
+    pub async fn ensure(&self, handle: &str, params: &VolumeParams) -> Result<(), Error> {
+        let _lock = self.lock_volume(handle).await;
         let layout = self.layout();
-        let run = layout.run_dir(handle);
-        DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(&run)
-            .map_err(io_error(format!("creating {}", run.display())))?;
-        let address = address_file(layout, handle);
-        records::remove(&address).map_err(io_error(format!("removing {}", address.display())))?;
-        // A pod of the volume published on this node is attached, whether
-        // or not its front runs yet: the service must not land the patch
-        // queue. Only no published record at all is evidence
-        // that nothing is; a directory that cannot be listed is not.
-        let attached = records::any(&layout.published_dir(handle)).unwrap_or(true);
-        let spec = launcher::service_spec(layout, handle, &self.cfg.plugin, attached);
-        let spawned = self
+        volume::profile_config(layout, &params.profile)?;
+        if self.hosts().contains_key(handle) {
+            return Err(Error::Unavailable(format!(
+                "volume {handle} is served on this node: its settings change only while it is not"
+            )));
+        }
+        for dir in [&layout.base, &layout.volume_dir(handle)] {
+            DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(dir)
+                .map_err(|e| Error::io(format!("creating {}", dir.display()), e))?;
+        }
+        let spec = launcher::init_spec(layout, handle, params, &self.cfg.plugin);
+        let Spawned {
+            mut exited,
+            recent_log,
+            ..
+        } = self
             .launcher
             .spawn(spec)
-            .map_err(io_error("starting agentfs serve-history"))?;
-        let generation = self.next_generation();
-        let mut exited = spawned.exited.clone();
-        self.children().services.insert(
-            handle.to_owned(),
-            ServiceEntry {
-                child: Child {
-                    spawned,
-                    generation,
-                    started: Instant::now(),
-                    starting,
-                    stopping: false,
-                    backoff,
-                },
-            },
-        );
-        let this = Arc::clone(self);
-        let handle = handle.to_owned();
-        tokio::spawn(async move {
-            let exit = exited.wait_for(Option::is_some).await.ok().and_then(|e| *e);
-            this.service_exited(handle, generation, exit).await;
-        });
-        Ok(())
-    }
-
-    /// Waits until the service has written its address. Called without the
-    /// volume's lock; takes it only to give up on a service that exited.
-    async fn wait_service(&self, handle: &str) -> Result<(), Error> {
-        let expected = format!("unix:{}", self.layout().socket(handle).display());
-        let address = address_file(self.layout(), handle);
-        let deadline = Instant::now() + self.cfg.stage_wait;
-        loop {
-            let exited = {
-                let children = self.children();
-                let Some(entry) = children.services.get(handle) else {
-                    return Err(Error::Aborted(format!(
-                        "volume {handle} was unstaged meanwhile"
-                    )));
-                };
-                entry
-                    .child
-                    .spawned
-                    .exit()
-                    .map(|e| (e, entry.child.spawned.recent(), entry.child.generation))
-            };
-            match exited {
-                None => {
-                    let found = fs::read_to_string(&address).unwrap_or_default();
-                    if found.trim() == expected {
-                        // It listens: from now on a crash is restarted.
-                        if let Some(e) = self.children().services.get_mut(handle) {
-                            e.child.starting = false;
-                        }
-                        return Ok(());
-                    }
-                }
-                Some((exit, log, generation)) => {
-                    if self.has_fronts(handle) {
-                        return Err(Error::Unavailable(format!(
-                            "volume {handle}'s history service exited ({exit}) and is being \
-                             restarted"
-                        )));
-                    }
-                    // Not a restart: give up, and let the kubelet retry
-                    // from the start, unless something else already acted.
-                    let _lock = self.lock_volume(handle).await;
-                    let mut children = self.children();
-                    if !matches!(
-                        children.services.get(handle),
-                        Some(e) if e.child.generation == generation
-                    ) {
-                        return Err(Error::Unavailable(format!(
-                            "volume {handle}'s history service exited ({exit}); its volume \
-                             changed meanwhile"
-                        )));
-                    }
-                    children.services.remove(handle);
-                    drop(children);
-                    let _ = records::remove(&self.layout().staged_record(handle));
-                    return Err(Error::FailedPrecondition(format!(
-                        "volume {handle}'s history service exited ({exit}):\n{log}"
-                    )));
-                }
-            }
-            if Instant::now() >= deadline {
+            .map_err(|e| Error::io("starting agentfs init", e))?;
+        match wait_exit(&mut exited).await {
+            Exit::Code(0) => {}
+            Exit::Code(75) => {
                 return Err(Error::Unavailable(format!(
-                    "volume {handle}'s history service is starting (journal recovery or patch \
-                     fetch); still waiting after {:?}",
-                    self.cfg.stage_wait
+                    "volume {handle} is busy: another process holds its state area"
                 )));
             }
-            tokio::time::sleep(self.cfg.poll).await;
+            exit => {
+                return Err(Error::FailedPrecondition(format!(
+                    "agentfs init of volume {handle} failed ({exit}):\n{}",
+                    launcher::recent(&recent_log)
+                )));
+            }
         }
+        self.install_rules(handle, &params.profile)
     }
 
-    fn has_fronts(&self, handle: &str) -> bool {
-        self.children()
-            .fronts
-            .values()
-            .any(|f| f.record.handle == handle)
-    }
-
-    /// Whether the service entry of `generation` is still the one to
-    /// restart: current, not stopping, and not a NodeStage start that
-    /// NodeStage reports itself.
-    fn service_current(&self, handle: &str, generation: u64) -> bool {
-        let children = self.children();
-        let fronts = children.fronts.values().any(|f| f.record.handle == handle);
-        matches!(
-            children.services.get(handle),
-            Some(e) if e.child.generation == generation
-                && !e.child.stopping
-                && (!e.child.starting || fronts)
+    /// The profile's rule files into the volume's state area; an absent one
+    /// removes the installed copy.
+    fn install_rules(&self, volume: &str, profile: &str) -> Result<(), Error> {
+        let layout = self.layout();
+        let state = layout.state(volume);
+        let exclude = optional(layout.profile_file(profile, "exclude"));
+        let attributes = optional(layout.profile_file(profile, "attributes"));
+        install_rules(
+            &state,
+            RuleFiles {
+                exclude: exclude.as_deref(),
+                attributes: attributes.as_deref(),
+            },
         )
+        .map_err(|e| match e.kind() {
+            io::ErrorKind::NotFound => Error::FailedPrecondition(format!(
+                "volume {volume}: installing the rules of profile {profile:?}: {e}"
+            )),
+            _ => Error::io(
+                format!("volume {volume}: installing the rules of profile {profile:?}"),
+                e,
+            ),
+        })
     }
 
-    async fn service_exited(self: Arc<Self>, handle: String, generation: u64, exit: Option<Exit>) {
-        let (uptime, prev) = {
-            let children = self.children();
-            match children.services.get(&handle) {
-                Some(e) if e.child.generation == generation && !e.child.stopping => {
-                    (e.child.started.elapsed(), e.child.backoff)
-                }
-                _ => return,
+    // ----- hosts ----------------------------------------------------------
+
+    /// Starts the volume's host: its rules installed, its hello read, then
+    /// (`replay`) every recorded view of the volume opened again, then a
+    /// reconcile. The caller holds the volume's lock.
+    async fn start_host(
+        self: &Arc<Self>,
+        volume: &str,
+        replay: bool,
+        backoff: Option<Duration>,
+    ) -> Result<Started, Error> {
+        let layout = self.layout().clone();
+        let Some((name, profile)) = records::load_volume_claim(&layout, volume)? else {
+            return Err(Error::NotFound(format!(
+                "no claim of volume {volume} under {}",
+                layout.base.display()
+            )));
+        };
+        self.install_rules(volume, &profile)?;
+        let spec = launcher::host_spec(&layout, volume, &name, &self.cfg.plugin);
+        let Spawned {
+            mut exited,
+            recent_log,
+            control,
+            ..
+        } = self
+            .launcher
+            .spawn(spec)
+            .map_err(|e| Error::io("starting agentfs host", e))?;
+        let Some(control) = control else {
+            return Err(Error::Internal(
+                "the launcher gave the host no control channel".into(),
+            ));
+        };
+        let (client, hello) = match HostClient::start(control).await {
+            Ok(started) => started,
+            Err(HostGone) => {
+                let exit = wait_exit(&mut exited).await;
+                let log = launcher::recent(&recent_log);
+                return Err(match exit {
+                    Exit::Code(75) => Error::Unavailable(format!(
+                        "volume {volume} is busy: another process holds its state area"
+                    )),
+                    Exit::Code(1 | 2) => Error::FailedPrecondition(format!(
+                        "the host of volume {volume} refused to start ({exit}):\n{log}"
+                    )),
+                    _ => Error::Unavailable(format!(
+                        "the host of volume {volume} exited before it served ({exit}):\n{log}"
+                    )),
+                });
             }
         };
-        if self.shutting_down.load(Ordering::Relaxed) || !self.service_current(&handle, generation)
-        {
-            return;
+        if hello.volume != name {
+            drop(client);
+            wait_exit(&mut exited).await;
+            return Err(Error::Internal(format!(
+                "the host of volume {volume} serves agentfs volume {}, not {name}",
+                hello.volume
+            )));
         }
-        let delay = next_backoff(prev, uptime, &self.cfg.backoff);
-        eprintln!(
-            "service for {handle} exited ({}); restarting in {delay:?}",
-            describe(exit)
+        let generation = self.generation.fetch_add(1, Ordering::Relaxed);
+        self.hosts().insert(
+            volume.to_owned(),
+            Host {
+                client: client.clone(),
+                exited: exited.clone(),
+                recent_log,
+                generation,
+                started: Instant::now(),
+                backoff,
+            },
         );
-        self.restart_service(handle, Some(generation), delay).await;
+        self.watch(volume.to_owned(), generation, exited);
+        let (views, dropped) = if replay {
+            self.replay(volume, &client).await?
+        } else {
+            (0, 0)
+        };
+        match client.call(Request::Reconcile).await {
+            Ok(Reply::Reconciled { ended }) if ended > 0 => {
+                eprintln!("volume {volume}: {ended} fork(s) no view used were ended");
+            }
+            Ok(Reply::Reconciled { .. }) => {}
+            Ok(other) => {
+                return Err(Error::Internal(format!(
+                    "the host of volume {volume} answered a reconcile with {other:?}"
+                )));
+            }
+            Err(HostGone) => return Err(self.gone(volume)),
+        }
+        Ok(Started {
+            client,
+            views,
+            dropped,
+        })
     }
 
-    /// Restarts the volume's service after `delay`, and keeps trying with
-    /// backoff while starting it fails (a failed fork under PID or memory
-    /// pressure, a full disk): the entry of `generation` stays meanwhile,
-    /// so its fronts keep their volume. `None`: no entry (reconcile), while
-    /// the volume is still staged.
-    async fn restart_service(
-        self: &Arc<Self>,
-        handle: String,
-        generation: Option<u64>,
-        mut delay: Duration,
-    ) {
-        loop {
-            tokio::time::sleep(delay).await;
-            let _lock = self.lock_volume(&handle).await;
-            let current = match generation {
-                Some(g) => self.service_current(&handle, g),
-                None => {
-                    !self.children().services.contains_key(&handle)
-                        && self.layout().staged_record(&handle).exists()
+    /// Opens every recorded view of `volume` again: its target still there
+    /// (a stale mount of it included), else its record dropped. A view the
+    /// host refuses is logged and its record dropped.
+    async fn replay(&self, volume: &str, client: &HostClient) -> Result<(usize, usize), Error> {
+        let mut views = 0;
+        let mut dropped = 0;
+        for record in self.records_of(volume) {
+            let why = if exists(&record.target) {
+                match client.call(Request::Open(view_request(&record))).await {
+                    Ok(Reply::Opened { .. }) => {
+                        views += 1;
+                        continue;
+                    }
+                    Ok(Reply::Refused(refusal)) => refusal.message,
+                    Ok(other) => format!("the host answered {other:?}"),
+                    Err(HostGone) => return Err(self.gone(volume)),
                 }
+            } else {
+                "its target is gone".to_owned()
             };
-            if !current || self.shutting_down.load(Ordering::Relaxed) {
+            eprintln!(
+                "volume {volume}: dropped the view of {} at {}: {why}",
+                record.handle,
+                record.target.display()
+            );
+            records::remove_published(self.layout(), &record.handle)?;
+            dropped += 1;
+        }
+        Ok((views, dropped))
+    }
+
+    /// Watches a host's exit: an exit nobody asked for is a crash.
+    fn watch(
+        self: &Arc<Self>,
+        volume: String,
+        generation: u64,
+        mut exited: watch::Receiver<Option<Exit>>,
+    ) {
+        let this = Arc::clone(self);
+        tokio::spawn(async move {
+            let exit = wait_exit(&mut exited).await;
+            this.exited(volume, generation, exit).await;
+        });
+    }
+
+    async fn exited(self: Arc<Self>, volume: String, generation: u64, exit: Exit) {
+        let delay = {
+            let _lock = self.lock_volume(&volume).await;
+            let host = {
+                let mut hosts = self.hosts();
+                if hosts
+                    .get(&volume)
+                    .is_none_or(|h| h.generation != generation)
+                {
+                    // Asked to stop, or replaced.
+                    return;
+                }
+                hosts.remove(&volume)
+            };
+            let Some(host) = host else { return };
+            if self.shutting_down() {
                 return;
             }
-            match self.start_service(&handle, Some(delay), false) {
-                Ok(()) => return,
+            let delay = next_backoff(host.backoff, host.started.elapsed(), &self.cfg.backoff);
+            eprintln!("[host {volume}] exited: {exit}; restarting in {delay:?}");
+            delay
+        };
+        self.restart(volume, delay).await;
+    }
+
+    /// Starts the volume's host again after `delay` while records of it
+    /// remain, and keeps trying with backoff while that fails.
+    async fn restart(self: Arc<Self>, volume: String, mut delay: Duration) {
+        loop {
+            tokio::time::sleep(delay).await;
+            let _lock = self.lock_volume(&volume).await;
+            if self.shutting_down()
+                || self.hosts().contains_key(&volume)
+                || self.records_of(&volume).is_empty()
+            {
+                return;
+            }
+            match self.start_host(&volume, true, Some(delay)).await {
+                Ok(started) => {
+                    drop(started.client);
+                    self.stop_if_idle(&volume).await;
+                    return;
+                }
+                // Started, then gone: its watcher restarts it.
+                Err(_) if self.hosts().contains_key(&volume) => return,
                 Err(e) => {
                     delay = next_backoff(Some(delay), Duration::ZERO, &self.cfg.backoff);
                     eprintln!(
-                        "restarting the service for {handle}: {e}; trying again in {delay:?}"
+                        "starting the host of volume {volume} again: {e}; trying again in \
+                         {delay:?}"
                     );
                 }
             }
         }
     }
 
-    /// NodeUnstage.
-    pub async fn unstage(&self, handle: &str) -> Result<(), Error> {
-        let _lock = self.lock_volume(handle).await;
-        let published = self.published_targets(handle)?;
-        if !published.is_empty() {
-            return Err(Error::FailedPrecondition(format!(
-                "volume {handle} is still published at {}",
-                published
-                    .iter()
-                    .map(|p| p.display().to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ")
+    /// Stops the volume's host: removed (so its exit is no crash), its
+    /// client dropped (EOF: it drains), its exit awaited. The caller holds
+    /// the volume's lock and no clone of the client.
+    async fn stop_host(&self, volume: &str) -> Option<(Exit, RecentLog)> {
+        let host = self.hosts().remove(volume)?;
+        let Host {
+            client,
+            mut exited,
+            recent_log,
+            ..
+        } = host;
+        drop(client);
+        let exit = wait_exit(&mut exited).await;
+        Some((exit, recent_log))
+    }
+
+    /// Stops the volume's host when no view of it remains.
+    async fn stop_if_idle(&self, volume: &str) {
+        if self.hosts().contains_key(volume) && self.records_of(volume).is_empty() {
+            self.stop_host(volume).await;
+        }
+    }
+
+    // ----- views ----------------------------------------------------------
+
+    /// NodePublish: one pod per claim; the view opened at the target on the
+    /// volume's host, started when none runs.
+    pub async fn publish(self: &Arc<Self>, view: ViewSpec) -> Result<(), Error> {
+        let _lock = self.lock_volume(&view.volume).await;
+        let handle = view.handle.as_str();
+        let published = records::load_published(self.layout())
+            .0
+            .into_iter()
+            .find(|r| r.handle == handle);
+        if let Some(record) = published {
+            if record.target != view.target {
+                return Err(Error::FailedPrecondition(format!(
+                    "volume {handle} is published at {} on this node: one pod per volume; \
+                     several pods on one volume are not built (docs/csi.md)",
+                    record.target.display()
+                )));
+            }
+            if record.read_only == view.read_only {
+                return Ok(());
+            }
+            return Err(Error::AlreadyExists(format!(
+                "volume {handle} is published at {} with read_only={}, not read_only={}",
+                record.target.display(),
+                record.read_only,
+                view.read_only
             )));
         }
-        let child = self.children().services.get_mut(handle).map(|e| {
-            e.child.stopping = true;
-            e.child.spawned.clone()
-        });
-        if let Some(spawned) = child {
-            self.stop_child(
-                &spawned,
-                self.cfg.unstage_grace,
-                &format!("service for {handle}"),
-            )
-            .await;
-            self.children().services.remove(handle);
-            eprintln!("unstaged volume {handle}: history service stopped");
+        let result = self.open(&view).await;
+        if result.is_err() {
+            self.stop_if_idle(&view.volume).await;
         }
-        let layout = self.layout();
-        records::remove(&layout.staged_record(handle))
-            .map_err(io_error("removing the staged record"))?;
-        match fs::remove_dir_all(layout.run_dir(handle)) {
-            Err(e) if e.kind() != io::ErrorKind::NotFound => {
-                return Err(Error::io("removing the service's socket directory", e));
-            }
-            _ => {}
-        }
-        Ok(())
+        result
     }
 
-    /// Targets published for `handle`: supervised fronts and records.
-    fn published_targets(&self, handle: &str) -> Result<Vec<PathBuf>, Error> {
-        let mut targets: Vec<PathBuf> = self
-            .children()
-            .fronts
-            .iter()
-            .filter(|(_, f)| f.record.handle == handle)
-            .map(|(t, _)| t.clone())
-            .collect();
-        let dir = self.layout().published_dir(handle);
-        let (found, _) = records::load_all::<PublishedRecord>(&dir)
-            .map_err(io_error(format!("reading {}", dir.display())))?;
-        for rec in found {
-            if !targets.contains(&rec.target) {
-                targets.push(rec.target);
-            }
-        }
-        targets.sort();
-        Ok(targets)
-    }
-
-    /// SIGTERM, then SIGKILL after `grace`; waits for the exit.
-    async fn stop_child(&self, spawned: &Spawned, grace: Duration, what: &str) {
-        let mut exited = spawned.exited.clone();
-        if spawned.exit().is_some() {
-            return;
-        }
-        let _ = self.launcher.signal(spawned.pid, Signal::TERM);
-        if tokio::time::timeout(grace, exited.wait_for(Option::is_some))
-            .await
-            .is_err()
-        {
-            eprintln!("{what} did not stop within {grace:?}; killing it");
-            let _ = self.launcher.signal(spawned.pid, Signal::KILL);
-            let _ = tokio::time::timeout(Duration::from_secs(10), exited.wait_for(Option::is_some))
-                .await;
-        }
-    }
-
-    // ----- fronts ---------------------------------------------------------
-
-    /// NodePublish. The volume's lock is held to check and start the
-    /// front, released while it mounts (so other pods' recoveries do not
-    /// wait behind it), and taken again to attach the target.
-    pub async fn publish(self: &Arc<Self>, req: PublishRequest) -> Result<(), Error> {
-        let mut req = req;
-        if !req.readonly && self.fork_finished(&req.handle) {
-            eprintln!(
-                "volume {}: a finished fork, published read-only",
-                req.handle
-            );
-            req.readonly = true;
-        }
-        let handle = req.handle.as_str();
-        let target = req.target.as_path();
-        let key = target_key(target);
-        let source = self.layout().front_source(handle, &key);
-        let generation = {
-            let _lock = self.lock_volume(handle).await;
-            if !self.children().services.contains_key(handle) {
-                return Err(Error::FailedPrecondition(format!(
-                    "volume {handle} is not staged on this node"
-                )));
-            }
-            self.check_publish(&req)?;
-            if !self.children().fronts.contains_key(target) {
-                fs::create_dir_all(target)
-                    .map_err(io_error(format!("creating {}", target.display())))?;
-                let record = PublishedRecord {
-                    handle: handle.to_owned(),
-                    target: target.to_path_buf(),
-                    readonly: req.readonly,
-                    single_writer: req.single_writer,
-                    pod: req.pod.clone(),
-                    slot: None,
-                    front_pid: None,
-                    workload_mounts: req.workload_mounts.clone(),
-                };
-                self.start_front(record, None, true).await?;
-            }
-            self.children()
-                .fronts
-                .get(target)
-                .map(|f| f.child.generation)
+    /// Opens the view and records it. The caller holds the volume's lock.
+    async fn open(self: &Arc<Self>, view: &ViewSpec) -> Result<(), Error> {
+        let client = match self.client(&view.volume) {
+            Some(client) => client,
+            None => self.start_host(&view.volume, true, None).await?.client,
         };
-        let waited = self
-            .wait_front(target, &source, self.cfg.publish_wait)
-            .await;
-        let _lock = self.lock_volume(handle).await;
-        let current = || {
-            matches!(
-                self.children().fronts.get(target),
-                Some(f) if Some(f.child.generation) == generation && !f.child.stopping
-            )
-        };
-        match waited {
-            FrontWait::Live if current() => {}
-            FrontWait::Exited(exit, log) if current() => {
-                self.children().fronts.remove(target);
-                let _ = self.detach_all(&source).await;
-                return Err(Error::FailedPrecondition(format!(
-                    "the front for {} exited ({exit}):\n{log}",
-                    target.display()
-                )));
-            }
-            FrontWait::Timeout if current() => {
-                return Err(Error::Unavailable(format!(
-                    "the front for {} is not mounted yet after {:?} (waiting for the history \
-                     service?)",
-                    target.display(),
-                    self.cfg.publish_wait
-                )));
-            }
-            FrontWait::Live | FrontWait::Exited(..) | FrontWait::Timeout | FrontWait::Gone => {
-                return Err(Error::Aborted(format!(
-                    "{} was unpublished or restarted meanwhile",
-                    target.display()
-                )));
-            }
-        }
-        self.attach_target(target, &source).await
-    }
-
-    /// Whether the volume is a finished fork, which is read-only. Anything else wrong with its state area is the front's to
-    /// report.
-    fn fork_finished(&self, handle: &str) -> bool {
-        let state = StateDir::new(self.layout().state(handle));
-        matches!(
-            core_volume::refuse_finished(&state),
-            Err(core_volume::VolumeError::ForkFinished { .. })
-        )
-    }
-
-    /// NodePublish's checks against what is published: the target for
-    /// another volume or with other flags, a single-writer volume
-    /// elsewhere. The caller holds the volume's lock.
-    fn check_publish(&self, req: &PublishRequest) -> Result<(), Error> {
-        let handle = req.handle.as_str();
-        let target = req.target.as_path();
-        let children = self.children();
-        if let Some(f) = children.fronts.get(target) {
-            if f.record.handle != handle {
-                return Err(Error::FailedPrecondition(format!(
-                    "{} is already published for volume {}",
-                    target.display(),
-                    f.record.handle
-                )));
-            }
-            // The CSI spec: the same target with an incompatible
-            // capability or read-only flag is ALREADY_EXISTS.
-            if f.record.readonly != req.readonly || f.record.single_writer != req.single_writer {
-                return Err(Error::AlreadyExists(format!(
-                    "{} is already published for volume {handle} with readonly={}, \
-                     single_writer={}, not readonly={}, single_writer={}",
-                    target.display(),
-                    f.record.readonly,
-                    f.record.single_writer,
-                    req.readonly,
-                    req.single_writer
-                )));
-            }
-        }
-        let other = children
-            .fronts
-            .iter()
-            .find(|(t, f)| f.record.handle == handle && t.as_path() != target);
-        if let Some((other, f)) = other
-            && (req.single_writer || f.record.single_writer)
-        {
-            return Err(Error::FailedPrecondition(format!(
-                "volume {handle} is single-writer (ReadWriteOncePod) and already published at {}",
-                other.display()
-            )));
-        }
-        Ok(())
-    }
-
-    /// Detaches a leftover source mount, then starts a front for `record`
-    /// (preferring its slot) and its monitor. The caller holds the
-    /// volume's lock.
-    async fn start_front(
-        self: &Arc<Self>,
-        record: PublishedRecord,
-        backoff: Option<Duration>,
-        starting: bool,
-    ) -> Result<(), Error> {
-        let handle = record.handle.clone();
-        let target = record.target.clone();
-        let key = target_key(&target);
-        let source = self.layout().front_source(&handle, &key);
-        fs::create_dir_all(&source).or_else(|e| {
-            // A stale mount is detached below. `mkdir` on it fails with
-            // EEXIST, and create_dir_all then cannot stat it (ENOTCONN).
+        let target = &view.target;
+        fs::create_dir_all(target).or_else(|e| {
+            // A stale mount there: `mkdir` fails with EEXIST, and
+            // create_dir_all then cannot stat it (ENOTCONN).
             if e.kind() == io::ErrorKind::AlreadyExists
                 || e.raw_os_error() == Some(rustix::io::Errno::NOTCONN.raw_os_error())
             {
                 Ok(())
             } else {
-                Err(Error::io(format!("creating {}", source.display()), e))
+                Err(Error::io(format!("creating {}", target.display()), e))
             }
         })?;
-        self.detach_all(&source).await?;
-        let spec = launcher::front_spec(
-            self.layout(),
-            &handle,
-            &key,
-            record.pod.as_ref(),
-            record.slot,
-            &self.cfg.node_id,
-            &self.cfg.front,
-            &record.workload_mounts,
-        );
-        let spawned = self
-            .launcher
-            .spawn(spec)
-            .map_err(io_error("starting agentfs mount"))?;
-        let generation = self.next_generation();
-        let mut exited = spawned.exited.clone();
-        let mut record = record;
-        record.front_pid = Some(spawned.pid);
-        self.children().fronts.insert(
-            target.clone(),
-            FrontEntry {
-                child: Child {
-                    spawned,
-                    generation,
-                    started: Instant::now(),
-                    starting,
-                    stopping: false,
-                    backoff,
-                },
-                record,
-            },
-        );
-        let this = Arc::clone(self);
-        tokio::spawn(async move {
-            let exit = exited.wait_for(Option::is_some).await.ok().and_then(|e| *e);
-            this.front_exited(handle, target, generation, exit).await;
-        });
-        Ok(())
-    }
-
-    /// Waits until the front for `target` has its source mounted.
-    async fn wait_front(&self, target: &Path, source: &Path, wait: Duration) -> FrontWait {
-        let deadline = Instant::now() + wait;
-        let generation = self
-            .children()
-            .fronts
-            .get(target)
-            .map(|f| f.child.generation);
-        loop {
-            let exited = {
-                let children = self.children();
-                match children.fronts.get(target) {
-                    Some(f) if Some(f.child.generation) == generation && !f.child.stopping => f
-                        .child
-                        .spawned
-                        .exit()
-                        .map(|e| (e, f.child.spawned.recent())),
-                    _ => return FrontWait::Gone,
-                }
-            };
-            if let Some((exit, log)) = exited {
-                return FrontWait::Exited(exit, log);
-            }
-            if matches!(self.mount_state(source).await, Ok(MountState::Live { .. })) {
-                return FrontWait::Live;
-            }
-            if Instant::now() >= deadline {
-                return FrontWait::Timeout;
-            }
-            tokio::time::sleep(self.cfg.poll).await;
-        }
-    }
-
-    /// With the front's source live: learns its slot, binds it onto the
-    /// target unless the target's topmost mount is already live, and
-    /// records the target. The caller holds the volume's lock.
-    async fn attach_target(&self, target: &Path, source: &Path) -> Result<(), Error> {
-        let (handle, pid, known_slot, readonly) = {
-            let children = self.children();
-            let f = children
-                .fronts
-                .get(target)
-                .ok_or_else(|| Error::Aborted(format!("{} is unpublished", target.display())))?;
-            (
-                f.record.handle.clone(),
-                f.child.spawned.pid,
-                f.record.slot,
-                f.record.readonly,
-            )
+        let label = ClientLabel::parse(&format!("csi-{}", target_key(target)))
+            .map_err(|e| Error::Internal(e.to_string()))?;
+        let record = PublishedRecord {
+            v: RECORD_VERSION,
+            handle: view.handle.clone(),
+            volume: view.volume.clone(),
+            tree: view.tree.clone(),
+            target: target.clone(),
+            read_only: view.read_only,
+            pod: view.pod.clone(),
+            label,
         };
-        let state = StateDir::new(self.layout().state(&handle));
-        let slot = tokio::task::spawn_blocking(move || slot_of(&state, pid))
-            .await
-            .ok()
-            .flatten()
-            .or(known_slot);
-        let top = self
-            .mount_state(target)
-            .await
-            .map_err(io_error(format!("inspecting {}", target.display())))?;
-        let stacked = !matches!(top, MountState::NotMounted);
-        if !matches!(top, MountState::Live { .. }) {
-            let (s, t) = (source.to_path_buf(), target.to_path_buf());
-            self.mount_call(move |m| m.bind(&s, &t, readonly))
-                .await
-                .map_err(io_error(format!(
-                    "bind-mounting {} onto {}",
-                    source.display(),
-                    target.display()
-                )))?;
-        }
-        let record = {
-            let mut children = self.children();
-            let f = children
-                .fronts
-                .get_mut(target)
-                .ok_or_else(|| Error::Aborted(format!("{} is unpublished", target.display())))?;
-            f.record.slot = slot;
-            f.child.starting = false;
-            f.record.front_pid = Some(pid);
-            f.record.clone()
-        };
-        let path = self.layout().published_record(&handle, &target_key(target));
-        records::store(&path, &record).map_err(io_error(format!("writing {}", path.display())))?;
-        if stacked && !matches!(top, MountState::Live { .. }) {
-            eprintln!(
-                "front for {} restarted in slot {}; its mount is stacked over the stale one at {}",
-                who(&record),
-                slot.map_or_else(|| "?".to_owned(), |s| s.to_string()),
-                target.display()
-            );
-        }
-        Ok(())
-    }
-
-    /// A boxed future: it restarts a front, whose monitor calls it again.
-    fn front_exited(
-        self: Arc<Self>,
-        handle: String,
-        target: PathBuf,
-        generation: u64,
-        exit: Option<Exit>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
-        Box::pin(async move {
-            let (uptime, prev, record) = {
-                let children = self.children();
-                match children.fronts.get(&target) {
-                    Some(f)
-                        if f.child.generation == generation
-                            && !f.child.stopping
-                            && !f.child.starting =>
-                    {
-                        (f.child.started.elapsed(), f.child.backoff, f.record.clone())
-                    }
-                    _ => return,
+        match client.call(Request::Open(view_request(&record))).await {
+            Ok(Reply::Opened { stacked, .. }) => {
+                if let Err(e) = records::store_published(self.layout(), &record) {
+                    let _ = client.call(Request::Close { at: target.clone() }).await;
+                    return Err(e);
                 }
-            };
-            if self.shutting_down.load(Ordering::Relaxed) {
-                return;
-            }
-            let delay = next_backoff(prev, uptime, &self.cfg.backoff);
-            eprintln!(
-                "front for {} exited ({}); restarting in {delay:?} in slot {}",
-                who(&record),
-                describe(exit),
-                record
-                    .slot
-                    .map_or_else(|| "?".to_owned(), |s| s.to_string())
-            );
-            tokio::time::sleep(delay).await;
-            let lock = self.lock_volume(&handle).await;
-            let current = matches!(
-                self.children().fronts.get(&target),
-                Some(f) if f.child.generation == generation && !f.child.stopping && !f.child.starting
-            );
-            if !current || self.shutting_down.load(Ordering::Relaxed) {
-                return;
-            }
-            // Read the record again: attach_target may have learnt the slot.
-            let record = self
-                .children()
-                .fronts
-                .get(&target)
-                .map_or(record, |f| f.record.clone());
-            self.recover_front(lock, record, Some(delay)).await;
-        })
-    }
-
-    /// Restarts the front of a published target and stacks its mount over
-    /// the target, or forgets the target if its directory is gone. Takes
-    /// the volume's lock, and releases it while the front starts. A front
-    /// that cannot be started (a failed fork, a full disk) is tried again
-    /// with backoff for as long as the target is published.
-    async fn recover_front(
-        self: &Arc<Self>,
-        lock: tokio::sync::OwnedMutexGuard<()>,
-        record: PublishedRecord,
-        backoff: Option<Duration>,
-    ) {
-        let handle = record.handle.clone();
-        let target = record.target.clone();
-        let key = target_key(&target);
-        let source = self.layout().front_source(&handle, &key);
-        let published = self.layout().published_record(&handle, &key);
-        // The entry this recovery replaces: none from reconcile.
-        let expected = self
-            .children()
-            .fronts
-            .get(&target)
-            .map(|f| f.child.generation);
-        let mut lock = lock;
-        let mut backoff = backoff;
-        loop {
-            if !exists(&target) {
                 eprintln!(
-                    "{} is gone; forgetting the front for {}",
+                    "published volume {} at {}{}",
+                    view.handle,
                     target.display(),
-                    who(&record)
+                    if stacked { ", over a stale mount" } else { "" }
                 );
-                self.children().fronts.remove(&target);
-                let _ = self.detach_all(&source).await;
-                let _ = fs::remove_dir(&source);
-                let _ = records::remove(&published);
-                return;
+                Ok(())
             }
-            let Err(e) = self.start_front(record.clone(), backoff, false).await else {
-                break;
-            };
-            let delay = next_backoff(backoff, Duration::ZERO, &self.cfg.backoff);
-            eprintln!(
-                "restarting the front for {}: {e}; trying again in {delay:?}",
-                target.display()
-            );
-            drop(lock);
-            tokio::time::sleep(delay).await;
-            lock = self.lock_volume(&handle).await;
-            let current = match self.children().fronts.get(&target) {
-                None => expected.is_none(),
-                Some(f) => Some(f.child.generation) == expected && !f.child.stopping,
-            };
-            // Unpublished meanwhile (the record is gone), or recovered by
-            // someone else.
-            if !current || !published.exists() || self.shutting_down.load(Ordering::Relaxed) {
-                return;
-            }
-            backoff = Some(delay);
-        }
-        drop(lock);
-        // No timeout: the front waits for the service itself, and its
-        // exit restarts it again.
-        match self.wait_front(&target, &source, Duration::MAX / 4).await {
-            FrontWait::Live => {
-                let _lock = self.lock_volume(&handle).await;
-                if let Err(e) = self.attach_target(&target, &source).await {
-                    eprintln!("recovering {}: {e}", target.display());
-                }
-            }
-            FrontWait::Exited(..) | FrontWait::Gone | FrontWait::Timeout => {}
+            Ok(Reply::Refused(refusal)) => Err(refused(refusal)),
+            Ok(other) => Err(Error::Internal(format!(
+                "the host of volume {} answered an open with {other:?}",
+                view.volume
+            ))),
+            Err(HostGone) => Err(self.gone(&view.volume)),
         }
     }
 
-    /// NodeUnpublish.
+    /// NodeUnpublish: the view closed (or the target detached when no host
+    /// runs), the record and the target directory removed, and the host
+    /// stopped once no view of its volume remains.
     pub async fn unpublish(&self, handle: &str, target: &Path) -> Result<(), Error> {
-        let _lock = self.lock_volume(handle).await;
-        let key = target_key(target);
-        let child = self.children().fronts.get_mut(target).map(|f| {
-            f.child.stopping = true;
-            f.child.spawned.clone()
-        });
-        // The target first, so the front's final sweep sees no new opens.
-        if exists(target) {
-            self.detach_all(target).await?;
-        }
-        if let Some(spawned) = child {
-            self.stop_child(
-                &spawned,
-                self.cfg.unpublish_grace,
-                &format!("front for {}", target.display()),
-            )
-            .await;
-            self.children().fronts.remove(target);
-        }
-        let source = self.layout().front_source(handle, &key);
-        if exists(&source) {
-            self.detach_all(&source).await?;
-            let _ = fs::remove_dir(&source);
-        }
-        match fs::remove_dir(target) {
-            Err(e) if e.kind() != io::ErrorKind::NotFound => {
-                return Err(Error::io(format!("removing {}", target.display()), e));
+        let find = || {
+            records::load_published(self.layout())
+                .0
+                .into_iter()
+                .find(|r| r.handle == handle && r.target == target)
+        };
+        let volume = find().map_or_else(|| handle.to_owned(), |r| r.volume);
+        let _lock = self.lock_volume(&volume).await;
+        if let Some(record) = find() {
+            let closed = match self.client(&record.volume) {
+                Some(client) => match client.call(Request::Close { at: target.into() }).await {
+                    Ok(Reply::Closed) => true,
+                    Ok(Reply::Refused(refusal)) => return Err(refused(refusal)),
+                    Ok(other) => {
+                        return Err(Error::Internal(format!(
+                            "the host of volume {volume} answered a close with {other:?}"
+                        )));
+                    }
+                    Err(HostGone) => false,
+                },
+                None => false,
+            };
+            if !closed {
+                self.detach(target).await?;
             }
-            _ => {}
+            records::remove_published(self.layout(), handle)?;
+            remove_target(target)?;
+            eprintln!("unpublished volume {handle} at {}", target.display());
+            self.stop_if_idle(&record.volume).await;
+            return Ok(());
         }
-        records::remove(&self.layout().published_record(handle, &key))
-            .map_err(io_error("removing the published record"))?;
-        eprintln!("unpublished volume {handle} from {}", target.display());
-        Ok(())
+        // Nothing of ours is published there: done already, but an agentfs
+        // mount left there goes, and so does the directory.
+        self.detach(target).await?;
+        remove_target(target)
     }
 
-    // ----- start and stop -------------------------------------------------
+    /// The first published record using `volume`, if any.
+    pub async fn in_use(&self, volume: &str) -> Option<PublishedRecord> {
+        let _lock = self.lock_volume(volume).await;
+        self.records_of(volume).into_iter().next()
+    }
 
-    /// At plugin start: starts the services of staged volumes and recovers
-    /// published targets (in the background). Published records whose
-    /// target is gone are dropped first, so each service starts knowing
-    /// which of its pods are still attached (: a volume with a
-    /// published pod never lands its patch queue, whenever its fronts come
-    /// back).
-    pub async fn reconcile(self: &Arc<Self>) -> Result<ReconcileReport, Error> {
+    /// Starts the volume's host and stops it: Ok once it exits 0 (Volume
+    /// released).
+    pub async fn release(self: &Arc<Self>, volume: &str) -> Result<(), Error> {
+        let _lock = self.lock_volume(volume).await;
+        if self.hosts().contains_key(volume) || !self.records_of(volume).is_empty() {
+            return Err(Error::FailedPrecondition(format!(
+                "volume {volume} is in use on this node"
+            )));
+        }
+        match self.start_host(volume, false, None).await {
+            Ok(started) => drop(started.client),
+            Err(e) => {
+                self.stop_host(volume).await;
+                return Err(e);
+            }
+        }
+        match self.stop_host(volume).await {
+            Some((Exit::Code(0), _)) => Ok(()),
+            Some((exit, log)) => Err(Error::Unavailable(format!(
+                "the host of volume {volume} did not release it ({exit}):\n{}",
+                launcher::recent(&log)
+            ))),
+            None => Err(Error::Internal(format!(
+                "the host of volume {volume} was stopped meanwhile"
+            ))),
+        }
+    }
+
+    /// At plugin start: records whose target is gone dropped, one host per
+    /// volume that still has views, unreadable records and recording-format
+    /// volumes named and left alone.
+    pub async fn reconcile(self: &Arc<Self>) -> ReconcileReport {
         let layout = self.layout().clone();
-        let mut report = ReconcileReport::default();
-        let (staged, bad) = records::load_all::<StagedRecord>(&layout.staged_dir())
-            .map_err(io_error("reading the staged records"))?;
-        report.unreadable.extend(
-            bad.into_iter()
-                .map(|(p, e)| format!("{}: {e}", p.display())),
-        );
-        let staged_handles: std::collections::HashSet<String> =
-            staged.iter().map(|rec| rec.handle.clone()).collect();
-        let mut published = Vec::new();
-        if let Ok(dirs) = fs::read_dir(layout.published_root()) {
-            for dir in dirs.flatten() {
-                let (found, bad) = records::load_all::<PublishedRecord>(&dir.path())
-                    .map_err(io_error("reading the published records"))?;
-                published.extend(found);
-                report.unreadable.extend(
-                    bad.into_iter()
-                        .map(|(p, e)| format!("{}: {e}", p.display())),
-                );
-            }
+        let (found, unreadable) = records::load_published(&layout);
+        for bad in &unreadable {
+            eprintln!("node record {bad} is not this driver's: left as it is");
         }
-        let mut recover = Vec::new();
-        for rec in published {
-            let key = target_key(&rec.target);
-            let path = layout.published_record(&rec.handle, &key);
-            // Staged, whether or not its service has started yet: a front waits
-            // for its service, so a later start recovers it.
-            let staged = staged_handles.contains(&rec.handle);
-            let state = if exists(&rec.target) {
-                self.mount_state(&rec.target).await.ok()
-            } else {
-                None
-            };
-            match state {
-                Some(MountState::Stale { .. } | MountState::Live { .. }) if staged => {
-                    recover.push(rec);
-                }
-                _ => {
-                    // Gone, or no longer mounted (a reboot): the kubelet
-                    // publishes it again if the pod still wants it.
-                    report.dropped += 1;
-                    let _ = records::remove(&path);
-                }
-            }
-        }
-        for rec in staged {
-            let _lock = self.lock_volume(&rec.handle).await;
-            if self.children().services.contains_key(&rec.handle) {
+        let mut report = ReconcileReport {
+            unreadable,
+            ..ReconcileReport::default()
+        };
+        let mut volumes = BTreeSet::new();
+        for record in found {
+            if exists(&record.target) {
+                volumes.insert(record.volume);
                 continue;
             }
-            match self.start_service(&rec.handle, None, false) {
-                Ok(()) => {
-                    report.services += 1;
-                    eprintln!("reconcile: started the history service for {}", rec.handle);
+            eprintln!(
+                "volume {}: dropped the view at {}: its target is gone",
+                record.handle,
+                record.target.display()
+            );
+            if let Err(e) = records::remove_published(&layout, &record.handle) {
+                eprintln!("{e}");
+            }
+            report.dropped += 1;
+        }
+        for volume in volumes {
+            let _lock = self.lock_volume(&volume).await;
+            if self.hosts().contains_key(&volume) {
+                continue;
+            }
+            match self.start_host(&volume, true, None).await {
+                Ok(started) => {
+                    report.hosts += 1;
+                    report.views += started.views;
+                    report.dropped += started.dropped;
+                    drop(started.client);
+                    self.stop_if_idle(&volume).await;
                 }
+                Err(_) if self.hosts().contains_key(&volume) => {}
                 Err(e) => {
                     let delay = self.cfg.backoff.initial;
                     eprintln!(
-                        "reconcile: starting the service for {}: {e}; trying again in {delay:?}",
-                        rec.handle
+                        "starting the host of volume {volume}: {e}; trying again in {delay:?}"
                     );
-                    let this = Arc::clone(self);
-                    let handle = rec.handle.clone();
-                    tokio::spawn(async move { this.restart_service(handle, None, delay).await });
+                    tokio::spawn(Arc::clone(self).restart(volume.clone(), delay));
                 }
             }
         }
-        for rec in recover {
-            report.recovering += 1;
+        for (handle, dir) in recording_volumes(&layout) {
             eprintln!(
-                "reconcile: recovering the front for {} at {}",
-                who(&rec),
-                rec.target.display()
+                "recording-format volume {handle} at {} is not served by this driver: move it \
+                 with docs/runbooks/moving.md",
+                dir.display()
             );
-            let this = Arc::clone(self);
-            tokio::spawn(async move {
-                let lock = this.lock_volume(&rec.handle).await;
-                if this.children().fronts.contains_key(&rec.target) {
-                    return;
-                }
-                this.recover_front(lock, rec, None).await;
-            });
         }
-        Ok(report)
+        report
     }
 
-    /// Stops supervising without stopping the children: no restarts
-    /// follow. They die with the plugin container; tests use this to stand
-    /// in for a plugin that died.
-    pub fn forget(&self) {
-        self.shutting_down.store(true, Ordering::Relaxed);
-        let mut children = self.children();
-        children.fronts.clear();
-        children.services.clear();
-    }
-
-    /// Plugin shutdown: stops the fronts (their final sweep), then the
-    /// services (their final commit). Records are kept for the next
-    /// plugin's reconcile.
+    /// Stops every host: each sees EOF, drains, and exits.
     pub async fn shutdown(&self) {
         self.shutting_down.store(true, Ordering::Relaxed);
-        let fronts: Vec<Spawned> = self
-            .children()
-            .fronts
-            .values_mut()
-            .map(|f| {
-                f.child.stopping = true;
-                f.child.spawned.clone()
-            })
-            .collect();
-        let grace = self.cfg.unpublish_grace;
-        futures_join(fronts.iter().map(|s| self.stop_child(s, grace, "front"))).await;
-        let services: Vec<Spawned> = self
-            .children()
-            .services
-            .values_mut()
-            .map(|s| {
-                s.child.stopping = true;
-                s.child.spawned.clone()
-            })
-            .collect();
-        let grace = self.cfg.unstage_grace;
-        futures_join(
-            services
-                .iter()
-                .map(|s| self.stop_child(s, grace, "service")),
-        )
-        .await;
-        let mut children = self.children();
-        children.fronts.clear();
-        children.services.clear();
-    }
-}
-
-enum FrontWait {
-    Live,
-    Exited(Exit, String),
-    Gone,
-    Timeout,
-}
-
-/// Runs the futures concurrently.
-async fn futures_join<F: std::future::Future<Output = ()>>(futures: impl Iterator<Item = F>) {
-    let mut set = Vec::new();
-    for f in futures {
-        set.push(Box::pin(f));
-    }
-    for f in set {
-        f.await;
-    }
-}
-
-fn address_file(layout: &Layout, handle: &str) -> PathBuf {
-    StateDir::new(layout.state(handle))
-        .history_dir()
-        .join("address")
-}
-
-/// The slot `pid` leases, from the lease holders' lines.
-fn slot_of(state: &StateDir, pid: u32) -> Option<u16> {
-    let prefix = format!("pid={pid} ");
-    FrontLease::holders(state)
-        .ok()?
-        .into_iter()
-        .find(|(_, line)| line.starts_with(&prefix))
-        .map(|(slot, _)| slot)
-}
-
-fn describe(exit: Option<Exit>) -> String {
-    exit.map_or_else(|| "unknown status".to_owned(), |e| e.to_string())
-}
-
-fn who(record: &PublishedRecord) -> String {
-    match &record.pod {
-        Some(p) => format!("{}/{}", p.namespace, p.name),
-        None => format!("{} {}", record.handle, target_key(&record.target)),
-    }
-}
-
-/// Stage's blocking part: the worktree's checks (rule 1, "NodeStage never
-/// creates": it must be on this node's disk and name the volume; a static
-/// PV is adopted only over its worktree), its includes, rules and staged
-/// record. A missing worktree is `NOT_FOUND` naming the node: the pod
-/// waits, and its events say why.
-fn prepare(
-    layout: &Layout,
-    node_id: &str,
-    handle: &str,
-    context: &HashMap<String, String>,
-) -> Result<VolumeParams, Error> {
-    let state = StateDir::new(layout.state(handle));
-    let missing = || {
-        volume::reopen_error(
-            layout,
-            node_id,
-            core_volume::VolumeError::NoWorktree {
-                path: state.root().to_path_buf(),
-            },
-        )
-    };
-    let record = volume::load(layout, handle)?;
-    let params = match &record {
-        Some(record) => record.params.clone(),
-        None if context.contains_key("profile") => VolumeParams::from_context(handle, context)
-            .map_err(|e| Error::InvalidArgument(e.to_string()))?,
-        None => return Err(missing()),
-    };
-    // Checked before the lock, whose file would create the state area.
-    if !state.git().join("config").exists() {
-        return Err(missing());
-    }
-    let config = volume::profile_config(layout, &params.profile)?;
-    {
-        let _lock = volume::lock(&state, "agentfs-csi stage")?;
-        match record {
-            Some(_) => core_volume::reopen_with(&state, &params.volume, &[config])
-                .map_err(|e| volume::reopen_error(layout, node_id, e))?,
-            None => {
-                volume::adopt(layout, node_id, handle, &params)?;
-                eprintln!(
-                    "adopted static volume {handle} over its worktree (agentfs volume {})",
-                    params.volume
-                );
-            }
+        let hosts: Vec<(String, Host)> = self.hosts().drain().collect();
+        let mut exits = Vec::new();
+        for (volume, host) in hosts {
+            let Host { client, exited, .. } = host;
+            drop(client);
+            exits.push((volume, exited));
+        }
+        for (volume, mut exited) in exits {
+            let exit = wait_exit(&mut exited).await;
+            eprintln!("[host {volume}] stopped: {exit}");
         }
     }
-    volume::install_rules(layout, handle, &params.profile)?;
-    let staged = layout.staged_record(handle);
-    records::store(
-        &staged,
-        &StagedRecord {
-            handle: handle.to_owned(),
-            params: params.clone(),
-        },
-    )
-    .map_err(io_error(format!("writing {}", staged.display())))?;
-    Ok(params)
+}
+
+/// The open request of a recorded view.
+fn view_request(record: &PublishedRecord) -> ViewRequest {
+    ViewRequest {
+        tree: record.tree.clone(),
+        at: record.target.clone(),
+        label: record.label.clone(),
+        read_only: record.read_only,
+        pod: record.pod.clone(),
+    }
+}
+
+/// Removes the target directory; a missing one is fine.
+fn remove_target(target: &Path) -> Result<(), Error> {
+    match fs::remove_dir(target) {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => {
+            Err(Error::io(format!("removing {}", target.display()), e))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// The volume directories under the base path whose state area holds
+/// another format: the recording driver's.
+fn recording_volumes(layout: &Layout) -> Vec<(String, PathBuf)> {
+    let Ok(entries) = fs::read_dir(&layout.base) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in entries.filter_map(Result::ok) {
+        let Some(handle) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if validate_handle(&handle).is_err() || !entry.path().is_dir() {
+            continue;
+        }
+        if matches!(
+            tree_actor::inspect(&layout.state(&handle)),
+            Ok(Found::Other)
+        ) {
+            out.push((handle, entry.path()));
+        }
+    }
+    out.sort();
+    out
 }
 
 #[cfg(test)]
@@ -1351,20 +883,48 @@ mod tests {
     use super::*;
 
     #[test]
-    fn backoff_doubles_to_the_cap_and_resets_after_uptime() {
+    fn backoff_doubles_to_its_cap_and_resets_after_a_long_run() {
         let cfg = Backoff::default();
-        let short = Duration::from_secs(1);
-        let mut d = next_backoff(None, short, &cfg);
-        let mut seen = vec![d];
-        for _ in 0..6 {
-            d = next_backoff(Some(d), short, &cfg);
-            seen.push(d);
-        }
-        let secs: Vec<u64> = seen.iter().map(Duration::as_secs).collect();
-        assert_eq!(secs, [1, 2, 4, 8, 16, 30, 30]);
+        let first = next_backoff(None, Duration::ZERO, &cfg);
+        assert_eq!(first, cfg.initial);
+        let second = next_backoff(Some(first), Duration::ZERO, &cfg);
+        assert_eq!(second, cfg.initial * 2);
         assert_eq!(
-            next_backoff(Some(Duration::from_secs(30)), Duration::from_secs(61), &cfg),
-            Duration::from_secs(1)
+            next_backoff(Some(cfg.max), Duration::ZERO, &cfg),
+            cfg.max,
+            "capped"
         );
+        assert_eq!(
+            next_backoff(Some(cfg.max), cfg.reset_after, &cfg),
+            cfg.initial,
+            "a long run resets it"
+        );
+    }
+
+    #[test]
+    fn every_refusal_kind_has_its_code() {
+        let code = |kind| {
+            format!(
+                "{:?}",
+                refused(Refusal {
+                    kind,
+                    message: "m".into()
+                })
+            )
+        };
+        for (kind, want) in [
+            (RefusalKind::ForkTaken, "FailedPrecondition"),
+            (RefusalKind::KeyUnknown, "FailedPrecondition"),
+            (RefusalKind::KeyEnded, "FailedPrecondition"),
+            (RefusalKind::Stale, "FailedPrecondition"),
+            (RefusalKind::Occupied, "AlreadyExists"),
+            (RefusalKind::MountFailed, "Internal"),
+            (RefusalKind::Draining, "Unavailable"),
+            (RefusalKind::Stopped, "Unavailable"),
+            (RefusalKind::NestedNotBuilt, "InvalidArgument"),
+            (RefusalKind::ApprovalNotBuilt, "InvalidArgument"),
+        ] {
+            assert!(code(kind).starts_with(want), "{kind:?}: {}", code(kind));
+        }
     }
 }

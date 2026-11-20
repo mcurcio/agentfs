@@ -307,15 +307,15 @@ missing from these tables or a row names a module that no longer exists;
 | `csi.rs` | The CSI v1 protocol, generated at build time |
 | `server.rs` | Serving the CSI services on a Unix socket |
 | `identity.rs` | The CSI Identity service and the topology key |
-| `controller.rs` | The Controller service on each node: CreateVolume on this node (topology, start classes, forks of a local source), DeleteVolume through the release decider |
-| `node.rs` | The Node service: validates calls and hands them to the supervisor; this node's topology |
-| `supervisor.rs` | One `serve-history` per staged volume and one front per pod, restarted when they crash; NodeStage never creates a worktree; a finished fork published read-only |
-| `launcher.rs` | Starting the `agentfs` children |
-| `release_scan.rs` | The release scan: one `agentfs flush` per worktree no pod stages whose journal holds records history lacks, then one `agentfs push` until it exits 0 at the head and remotes, with backoff; one `agentfs fork finish` per fork whose deletion asked for it, skipping refused and abandoned forks |
-| `mounter.rs` | The node plugin's mount operations: bind mounts onto the kubelet's targets |
-| `params.rs` | StorageClass and PersistentVolume parameters |
-| `volume.rs` | Worktrees on this node's disk: creating one (empty, started, a fork), adopting a static PV over its worktree |
-| `records.rs` | The driver's persisted records (`csi.json`) |
+| `controller.rs` | The Controller service on each node: CreateVolume runs `agentfs init` on this node (topology); DeleteVolume refuses a volume in use, drains it through its host and keeps it; a recording-format volume is refused |
+| `node.rs` | The Node service: validates calls, resolves the claim (a static PV adopted over a kept volume), hands publishes to the supervisor; this node's topology |
+| `supervisor.rs` | One `agentfs host` per volume in use: views opened at the kubelet's targets, one pod per claim, the host restarted with its views replayed when it crashes, stopped after its last view; release by the host's drain |
+| `launcher.rs` | Starting the `agentfs` children: `init`, and `host` with a socket pair as its standard input |
+| `host_client.rs` | The plugin's end of a host's control channel: one task owns the stream, calls answered in order, cancel-safe |
+| `mounter.rs` | The node plugin's mount operations: what is mounted at a target, lazy detaches |
+| `params.rs` | StorageClass and PersistentVolume parameters, with the refusals of what is not built; a view's pod context |
+| `volume.rs` | The supported access modes and a profile's config file |
+| `records.rs` | The driver's persisted records: the claim record (`csi.json`) and the published records |
 | `layout.rs` | Where the driver keeps things |
 | `error.rs` | Errors mapped onto gRPC status codes |
 
@@ -504,8 +504,8 @@ What a crash at each point leaves, and what the next open does. "Returned" means
 | The patch phase, after the commit and before the ref moves | The commit on the branch; `inbox/<n>` still there, no `applied/<n>` | The next run finds the commit by its trailers and finishes the ref moves (`applied/<n>` set, `inbox/<n>` deleted): what is applied is decided by the branch, never by refs | `patch.after_commit`, `queue.after_status` |
 | A namespace record that failed (`EIO`), with paths on the repair queue | `meta/repairs`, rewritten whenever the queue changes (`meta/fronts/slot-N.repairs` for a front) | The next mount (or the front reusing the slot) re-derives each path's absolute state from the backing tree and records it before it serves any request; a queue left in the temporary file (a crash before its rename) is loaded too | `repairs.before_rename` |
 | The daemon of a mount in a pod | A stale FUSE mount: the workload's calls fail with `ENOTCONN`, never reaching the bare directory beneath | The kubelet restarts the sidecar, which runs `mount --on-stale-mount recover`: it takes the lock, replays the journal and bind-stacks a new mount over the stale one, which propagation carries into the workload containers; at its stop it detaches the stale layers. With `hold` it mounts nothing and the pod is restarted by hand ([runbook](runbooks/crashed-sidecar.md)) | none |
-| A CSI front or service | A stale mount at the pod's target, or fronts failing with `EIO` | The supervisor restarts it with backoff (1 s to 30 s): a front in its predecessor's slot, its new mount bind-stacked over the stale target; a service replays its journal | none |
-| The CSI node plugin (deleted, upgraded or crashed) | Its children stop with it (with final commits when it is stopped gracefully); the staged and published records on the hostPath | Reconcile at plugin start: services for staged volumes (journal replay), fronts recovered for targets whose mount is still there, live or stale; targets the kubelet removed are forgotten. Containers that mount with `HostToContainer` see the new mount; others after a container restart ([runbook](runbooks/csi-recovery.md)) | none |
+| A CSI volume's `agentfs host` | A stale mount at each of its pods' targets | The supervisor starts the host again with backoff (1 s to 30 s); it opens each recorded view again, stacked over its stale target, rebinding its client, then reconciles | none |
+| The CSI node plugin (deleted, upgraded or crashed) | Its hosts see EOF on their standard input and drain; the published records on the hostPath | Reconcile at plugin start: records whose target the kubelet removed are dropped, and one host per volume opens the rest again, stacked over the stale mounts. Containers that mount with `HostToContainer` see the new mount; others after a container restart ([runbook](runbooks/csi-recovery.md)) | none |
 
 The Failpoint column names the failpoints (`agentfs_core::failpoints`,
 test builds only) that stop the process at that point; the crash
