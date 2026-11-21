@@ -83,6 +83,7 @@
   - [Line map and renames](target-architecture/future/line-map-and-renames.md)
   - [Shared mappings](target-architecture/future/shared-mappings.md)
   - [Save and take speed](target-architecture/future/save-and-take-speed.md)
+  - [Latency and upkeep](target-architecture/future/latency-upkeep.md)
   - [Live landing](target-architecture/future/live-landing.md)
   - [Recovery tooling](target-architecture/future/recovery-tooling.md)
   - [Overlay gaps](target-architecture/future/sandbox-overlay-gaps.md)
