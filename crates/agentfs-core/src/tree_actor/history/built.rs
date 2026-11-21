@@ -13,6 +13,7 @@ use git2::Oid;
 
 use super::super::TreeId;
 use super::super::journal::durable::RecordNo;
+use super::retired::{DeferredDrops, Retired};
 use super::{Objects, refs};
 use crate::tree_actor::call_path::Then;
 use crate::tree_actor::pointers::Pointers;
@@ -131,6 +132,8 @@ pub(in crate::tree_actor) struct Inner {
     repo: TreeGit,
     state: Mutex<State>,
     changed: Condvar,
+    /// What the actor's catch-ups let go, dropped after its lock is released.
+    drops: DeferredDrops,
     /// Tests: runs at each batch's start and once it has read the record it
     /// builds through ([`History::batch_read`]).
     #[cfg(test)]
@@ -316,6 +319,7 @@ impl History {
                     gated: Vec::new(),
                 }),
                 changed: Condvar::new(),
+                drops: DeferredDrops::new(),
                 #[cfg(test)]
                 batch_read: Mutex::new(None),
             }),
@@ -511,6 +515,18 @@ impl History {
         if !maps.is_empty() {
             self.state().maps.extend(maps);
         }
+    }
+
+    /// Values the actor let go under its lock (replaced saved maps and
+    /// shapes), to be dropped after it is released ([`DeferredDrops`]).
+    pub(in crate::tree_actor) fn defer_drops(&self, values: Retired) {
+        self.inner.drops.defer(values);
+    }
+
+    /// Every value deferred so far dropped: the actor's shutdown, after the
+    /// builder has stopped and before the lease is released.
+    pub(in crate::tree_actor) fn finish_drops(&self) {
+        self.inner.drops.finish();
     }
 
     /// Every map published since the last call, in the order built: the

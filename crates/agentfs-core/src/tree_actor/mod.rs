@@ -50,6 +50,7 @@ pub use history::built::{BuildError, BuiltSnapshot, Health, History, Lag, TreeLa
 use history::built_log::{self, BuiltLog};
 use history::message::Message;
 use history::repack::Repacker;
+use history::retired::Retired;
 use history::upstreams::Upstreams;
 use history::verify;
 pub use history::verify::{
@@ -1598,6 +1599,7 @@ impl TreeActor {
     /// journal segments it read. An open with no call of its own since that
     /// save takes it too.
     fn rebase_built(&mut self) {
+        let mut retired = Retired::default();
         for (tree, object, map) in self.history.take_maps() {
             let Some(t) = self.trees.get_mut(&tree) else {
                 continue;
@@ -1610,16 +1612,19 @@ impl TreeActor {
             }
             // A map the built layer gives is the builder's already.
             if let Some(saved) = t.bytes.changed_mut(&object) {
-                *saved = map.clone();
+                retired.push(std::mem::replace(saved, map.clone()));
             }
             for handle in self.handles.values_mut() {
                 if handle.tree == tree
                     && handle.object == object
                     && handle.bytes.step() == map.step()
                 {
-                    handle.bytes = map.clone();
+                    retired.push(std::mem::replace(&mut handle.bytes, map.clone()));
                 }
             }
+        }
+        if !retired.is_empty() {
+            self.history.defer_drops(retired);
         }
     }
 
@@ -1649,13 +1654,15 @@ impl TreeActor {
         let last = EventNumber::new(self.next.saturating_sub(1));
         let through_step = EventNumber::new(through.get());
         let mut left = false;
+        let mut retired = Retired::default();
         for (tree, saved) in &mut self.trees {
             saved.seal(last);
             if let Some(built) = built.get(tree) {
-                saved.rebuilt(built, through_step);
+                retired.append(saved.rebuilt(built, through_step));
             }
             left |= saved.overlay_bytes() > 0;
         }
+        self.history.defer_drops(retired);
         self.rebuilt = through;
         if left && last.get() > through.get() {
             self.history.want_through(RecordNo::new(last.get()));
@@ -1684,6 +1691,8 @@ impl TreeActor {
         if let Some(repacker) = self.repacker.take() {
             repacker.join();
         }
+        // A deferred base file's drop removes its link: done before the lease goes.
+        self.history.finish_drops();
     }
 }
 

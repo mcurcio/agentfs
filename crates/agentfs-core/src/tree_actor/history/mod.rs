@@ -5,12 +5,14 @@
 pub(super) mod builder;
 pub(super) mod built;
 pub(super) mod built_log;
+pub(super) mod compactor;
 pub(super) mod feed;
 pub(super) mod format;
 pub(super) mod lag;
 pub(super) mod message;
 pub(super) mod refs;
 pub(super) mod repack;
+pub(super) mod retired;
 pub(super) mod take;
 pub(super) mod upstreams;
 pub(super) mod verify;
