@@ -18,8 +18,6 @@
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
-use git2::Oid;
-
 use super::built::{BuiltObjects, History};
 use crate::tree_actor::TreeId;
 use crate::tree_actor::journal::DropStats;
@@ -41,10 +39,12 @@ pub(in crate::tree_actor) struct AtBuilt {
     pub objects: BuiltObjects,
     /// The builder's trees at B: the checkpoint's `locals` come from their shapes.
     pub trees: imbl::OrdMap<TreeId, Tree>,
-    /// Each pointer's latest step head at or below B, step to the oid it
-    /// built, kept until the built point passes the record at which the
-    /// actor switched that pointer to an oid (C3, C4). At most one per pointer.
-    pub step_heads: imbl::OrdMap<RecordNo, Oid>,
+    /// Each pointer the actor switched from a step to an oid, with the
+    /// record before which it switched ([`History::switched`]), kept until
+    /// History's built point passes that record: the checkpoint drops the
+    /// pointer's step head once the switch is at or before B + 1 (C3, C4).
+    /// At most one per pointer.
+    pub switched: imbl::OrdMap<String, RecordNo>,
     /// The first record of the newest segment the actor has rolled to
     /// ([`History::rolled`]): every segment that starts before it is rolled
     /// past (C2a).

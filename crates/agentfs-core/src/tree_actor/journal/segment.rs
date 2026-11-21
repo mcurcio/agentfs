@@ -254,6 +254,16 @@ impl Relocations {
     pub fn find(&self, record: RecordNo) -> Option<(Arc<Segment>, u64)> {
         self.table().get(&record).cloned()
     }
+
+    /// How many times frames were carried or let go: a holder that saw
+    /// this value has moved to every copy made before it. O(1).
+    #[expect(
+        dead_code,
+        reason = "interfaces of the compaction slice (latency-upkeep.md, slice 2), wired by it"
+    )]
+    pub(in crate::tree_actor) fn generation(&self) -> u64 {
+        todo!()
+    }
 }
 
 impl PartialEq for FramePos {

@@ -65,7 +65,7 @@ pub(in crate::tree_actor) const CHECKPOINT_TMP: &str = "checkpoint.tmp";
 /// | `page_saved` | the fold's last saving step per file with a live write-open (`Folded::saved_through`) |
 /// | `page_writes` | the page writes recovery holds (`TreeActor::pages_restore` keeps every one the fold gives): the record numbers in `Folded::page_writes`, sorted, each once |
 /// | `chunks` | the fold's chunk records no take or replace step has taken yet (`Folded::bytes`) |
-/// | `step_heads` | History's step heads at B ([`History::at_built`]): for every pointer, row chains included (today's exception for them rests on compaction switching the actor's pointers in its own hold, which no longer happens), the latest step at or below B that set it and the oid it built, kept until History's built point passes the record at which the actor switched that pointer to an oid (C3, C4) |
+/// | `step_heads` | for every pointer, row chains included, whose latest step at or below B is a step (`Folded::pointers` gives `Target::Step`), that step and History's built value of the pointer at B; with every head of the previous checkpoint whose pointer no step in between set; less every pointer the actor switched to an oid at or before B + 1 (`AtBuilt::switched`), whose later records name the oid. Keyed by pointer, so at most one per pointer (C3, C4) |
 /// | `carried` | the carry files this checkpoint names live frames in |
 ///
 /// `next` is `built + 1`: records after B carry their own numbers. Today's
@@ -86,7 +86,9 @@ pub(in crate::tree_actor) struct Checkpoint {
     pub page_saved: Vec<(String, u64, u64)>,
     pub page_writes: Vec<RecordNo>,
     pub chunks: Vec<RecordNo>,
-    pub step_heads: BTreeMap<RecordNo, String>,
+    /// Pointer to the step that last set it at or below B and the oid that
+    /// step built, while a record after B may still name that step.
+    pub step_heads: BTreeMap<String, (RecordNo, String)>,
     /// Each carry file by the `built` of the compaction that wrote it.
     pub carried: Vec<RecordNo>,
 }
@@ -113,12 +115,23 @@ pub(in crate::tree_actor) struct Durable {
 pub(in crate::tree_actor) struct Published {
     built: RecordNo,
     carried: Vec<RecordNo>,
+    oldest_head: Option<RecordNo>,
 }
 
 impl Published {
     /// The redo start's record before: every record at or below it is covered.
     pub(in crate::tree_actor) fn built(&self) -> RecordNo {
         self.built
+    }
+
+    /// The oldest step the published checkpoint keeps a head for
+    /// (`Checkpoint::step_heads`): the built log and the builder keep what
+    /// names it, so History never reports a checkpoint past the record
+    /// before it ([`History::published`]).
+    ///
+    /// [`History::published`]: crate::tree_actor::History::published
+    pub(in crate::tree_actor) fn oldest_head(&self) -> Option<RecordNo> {
+        self.oldest_head
     }
 }
 

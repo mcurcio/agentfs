@@ -16,6 +16,35 @@ pub(in crate::tree_actor) fn compact_at(len_after_last: u64) -> u64 {
 }
 
 impl TreeActor {
+    /// At a built event, under the lock (`TreeActor::on_built`): every
+    /// pointer whose value is a step at or below History's built point
+    /// becomes the oid that step built, and each switch is told to History
+    /// before the next record ([`History::switched`], C3, C4). O(pointers
+    /// switched). Replaces the switch compaction made in its own hold.
+    ///
+    /// [`History::switched`]: crate::tree_actor::History::switched
+    #[expect(
+        dead_code,
+        reason = "interfaces of the compaction slice (latency-upkeep.md, slice 2), wired by it"
+    )]
+    pub(in crate::tree_actor) fn switch_built(&mut self) {
+        todo!()
+    }
+
+    /// At a built event, under the lock, only when the compactor carried
+    /// frames since the last time (`Relocations::generation` moved): moves
+    /// the actor's positions to the carried copies, so the unlinked
+    /// segments' space returns. The one rare walk compaction leaves under
+    /// the lock, timed as `Hold::Compaction` (design rule 1: named and
+    /// measured). Nothing else of compaction runs under the lock.
+    #[expect(
+        dead_code,
+        reason = "interfaces of the compaction slice (latency-upkeep.md, slice 2), wired by it"
+    )]
+    pub(in crate::tree_actor) fn relocate_if_moved(&mut self) {
+        todo!()
+    }
+
     /// Appends one record, with no fsync: the journal's
     /// [`Durability`](super::durable::Durability) makes it durable when a
     /// caller asks. Returns its number and where its tail is. Only a file

@@ -555,9 +555,11 @@ impl History {
     }
 
     /// A checkpoint at `published.built()` is in place: only now may History
-    /// forget the built-log entries it covers (C3), which
-    /// [`History::checkpointed_through`] then reports, never past a step
-    /// head still kept. Replaces `checkpointed`.
+    /// forget the built-log entries it covers (C3). From now
+    /// [`History::checkpointed_through`] reports `published.built()`, or the
+    /// record before `published.oldest_head()` when that is earlier, so the
+    /// builder keeps every step head a later record may name. Replaces
+    /// `checkpointed`. O(1).
     #[expect(
         dead_code,
         reason = "interfaces of the compaction slice (latency-upkeep.md, slice 2), wired by it"

@@ -225,6 +225,68 @@ pub(in crate::tree_actor) fn close_calls<L: Located>(
     }
 }
 
+/// One call a close applies: one of the open's own calls, borrowed where
+/// the open's calls are held, or a page-write piece's call, made as the
+/// merge reaches it (one copy of each open's calls, ln6.10).
+#[expect(
+    dead_code,
+    reason = "interfaces of the one-copy slice (latency-upkeep.md, slice 5), wired by it"
+)]
+pub(in crate::tree_actor) enum CloseCall<'a, L: Located> {
+    Own(&'a Call, &'a L),
+    Piece(Call, L),
+}
+
+#[expect(
+    dead_code,
+    reason = "interfaces of the one-copy slice (latency-upkeep.md, slice 5), wired by it"
+)]
+impl<L: Located> CloseCall<'_, L> {
+    /// The call.
+    pub(in crate::tree_actor) fn call(&self) -> &Call {
+        todo!()
+    }
+
+    /// Where its bytes are.
+    pub(in crate::tree_actor) fn at(&self) -> &L {
+        todo!()
+    }
+}
+
+/// [`close_calls`] as a lazy merge in journal order: the open's own calls
+/// (`own`, any cloneable iterator over where they are held: a `Vec`'s slice,
+/// the builder's persistent vector) with the chosen page-write pieces, never
+/// collected. A pass that must read the calls twice clones the merge before
+/// the first pass: O(1) plus the pieces left, which are few. Pure.
+#[expect(
+    dead_code,
+    reason = "interfaces of the one-copy slice (latency-upkeep.md, slice 5), wired by it"
+)]
+#[derive(Clone)]
+pub(in crate::tree_actor) struct CloseCalls<'a, L: Located + 'a, O>
+where
+    O: Iterator<Item = &'a (u64, Call, L)> + Clone,
+{
+    own: std::iter::Peekable<O>,
+    pieces: std::iter::Peekable<std::vec::IntoIter<(u64, Run<L>)>>,
+}
+
+impl<'a, L: Located + 'a, O> Iterator for CloseCalls<'a, L, O>
+where
+    O: Iterator<Item = &'a (u64, Call, L)> + Clone,
+{
+    type Item = CloseCall<'a, L>;
+
+    /// The next call by journal number; an own call first at a tie, as
+    /// [`close_calls`] orders them.
+    fn next(&mut self) -> Option<CloseCall<'a, L>> {
+        todo!(
+            "{}",
+            self.own.peek().is_some() || self.pieces.peek().is_some()
+        )
+    }
+}
+
 /// The calls a close of an open applies to the saved bytes: [`close_calls`]
 /// over [`close_pieces`]. The same function live and at recovery.
 pub(in crate::tree_actor) fn calls_for_close(
