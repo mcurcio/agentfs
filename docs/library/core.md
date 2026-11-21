@@ -693,6 +693,23 @@ passes `OperatorSettings::overlay_limit()`); `History::overlay_bytes(tree)`
 gives a tree's overlay as last reported, in estimated bytes (0 before any
 report), and `History::lag()` the lags and the builder's health.
 
+Saves history could not check ([trees](../trees.md#when-history-cannot-check-a-save))
+are flagged in their commits' `Agentfs-Unverified` trailer.
+`TreeActor::verification()` gives the volume's `Verification` handle, whose
+`counts()` (`UnverifiedCounts`: `unresolved`, `mismatch_confirmed`) never
+takes the actor's lock; a launcher hands it to
+`Telemetry::observe_unverified` for the `agentfs.history.unverified` gauge.
+`tree_actor::verify_flagged(root, by, release)` is `agentfs verify`: it takes
+the state area's lock (`Error::Busy`), opens only its `history.git`, and
+checks every standing flag with `release` (`tree_actor::release()`, this
+binary as `agentfs <version> build <hash>`), answering a `VerifyReport` of
+each `Checked` flag (`Outcome::Wrote(Verdict)`, `SameRelease` or
+`NoEvidence`), the commits whose verdict note does not parse, and how many
+flags stand. The notes refs are `tree_actor::VERIFY_REF` and
+`tree_actor::EVIDENCE_REF`; `tree_git::TreeGit` reads and writes git notes in
+git's layout (`notes`, `note`, `note_tip`, `write_note`, the last a
+compare-and-swap of the notes ref).
+
 ### Operator settings
 
 `operator_settings` reads and writes a tree volume's operator settings:

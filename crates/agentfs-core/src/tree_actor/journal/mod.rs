@@ -175,7 +175,8 @@ pub(super) enum Entry {
         runs: Vec<RunHead>,
     },
     /// Part of the bytes of the take or replace step that follows
-    /// ([`TakeRecord::chunks`], [`Change::Replace`]), in its tail. Chunk
+    /// ([`TakeRecord::chunks`], [`Change::Replace`]), or of the layout of the
+    /// save that follows ([`SaveOutcome::Saved`]), in its tail. Chunk
     /// records no step follows (a replace cut short, or one that changed
     /// nothing) are never read.
     Bytes,
@@ -354,11 +355,13 @@ pub(super) struct PagePiece {
     pub len: u64,
 }
 
-/// What a close saved: the result's length and the digest of its piece list
-/// (`FileMap::digest`), which the builder checks its replay against.
+/// What a close saved: the result's length, and how many [`Entry::Bytes`]
+/// records just before the step hold its layout (`recording::layout`): each
+/// range the close wrote, the rest of the file as before. The builder checks
+/// its own replay against it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) enum SaveOutcome {
-    Saved { len: u64, pieces: u64 },
+    Saved { len: u64, chunks: u64 },
     Unchanged,
     OrphanDropped,
     AnonymousDropped,
@@ -467,7 +470,7 @@ pub(super) fn chunk_map(chunks: &[Tail], len: u64, seq: RecordNo) -> Result<File
 /// files of any size are recorded in frames well under a segment.
 pub(super) const TAKE_CHUNK: u64 = 16 << 20;
 
-/// A take's or replace's chunks: the tails of the `n` [`Entry::Bytes`] records
+/// A take's, replace's or save's chunks: the tails of the `n` [`Entry::Bytes`] records
 /// just before step `seq`, taken from `pending` (every such record not yet
 /// taken, in order); every pending one before it goes too, being a cut-short
 /// step's.
@@ -1678,14 +1681,53 @@ mod tests {
         assert_eq!(read, vec![1, 2], "the unsynced frame waits for its fsync");
     }
 
-    /// A replay that disagrees with its record stops building with the alarm
-    /// (`Disagrees`), and recording goes on: the save's record claims pieces
-    /// the builder's replay of its calls does not reach.
+    /// Rewrites, in the live segment, the head of the first frame whose head
+    /// holds `field` followed by `old`, with `new` (the same length) in its
+    /// place, and fixes its checksums: a damaged record that still reads.
+    #[cfg(feature = "failpoints")]
+    fn rewrite_head(root: &Path, field: &str, old: &str, new: &str) {
+        assert_eq!(old.len(), new.len());
+        let path = only_segment(&root.join("journal"));
+        let bytes = fs::read(&path).unwrap();
+        let salt = u32_at(&bytes, 4);
+        let needle = format!("{field}{old}");
+        let mut at = 0;
+        loop {
+            let (header, head, _) = read_frame(&bytes[at..], salt).unwrap();
+            let text = String::from_utf8(head.to_vec()).unwrap();
+            if let Some(found) = text.find(&needle) {
+                let mut head = head.to_vec();
+                let place = found + field.len();
+                head[place..place + old.len()].copy_from_slice(new.as_bytes());
+                let tail =
+                    bytes[at + HEADER + head.len()..at + header.frame_len() as usize].to_vec();
+                let fixed = header_bytes(
+                    salt,
+                    header.record,
+                    header.mark,
+                    header.flags,
+                    head.len() as u32,
+                    tail.len() as u32,
+                    crc_body(&head, &tail),
+                );
+                let file = OpenOptions::new().write(true).open(&path).unwrap();
+                file.write_all_at(&fixed, at as u64).unwrap();
+                file.write_all_at(&head, (at + HEADER) as u64).unwrap();
+                file.sync_all().unwrap();
+                return;
+            }
+            at += header.frame_len() as usize;
+        }
+    }
+
+    /// A5: a recorded layout that names bytes "as before" past the file it
+    /// is laid on (its save's length tampered with) cannot be laid: building
+    /// stops at its step with the alarm (`Disagrees`), and recording goes on.
     #[cfg(feature = "failpoints")]
     #[test]
-    fn a_replay_that_disagrees_with_its_record_stops_the_builder() {
+    fn a_layout_past_the_file_stops_the_builder() {
         use crate::tree_actor::history::built::{BuildError, WaitError};
-        use crate::tree_actor::test_support::{ATTRS, new_actor, reopen, writer};
+        use crate::tree_actor::test_support::{ATTRS, new_actor, writer};
         use crate::tree_actor::{Saved, TreeId};
         let tmp = tempfile::tempdir().unwrap();
         let unbuilt = crate::failpoints::configure("tree.build_before_batch=error@*").unwrap();
@@ -1698,56 +1740,73 @@ mod tests {
             panic!("the close saves");
         };
         v.durability().make_all_durable().unwrap();
-        drop(v);
+        // The step's length, 5, as 9: four bytes "as before" past an empty file.
+        rewrite_head(tmp.path(), "\"Saved\":{\"len\":", "5", "9");
         drop(unbuilt);
-        // The step's record, its digest changed in place: the same length.
-        let dir = tmp.path().join("journal");
-        let path = only_segment(&dir);
-        let mut bytes = fs::read(&path).unwrap();
-        let salt = u32_at(&bytes, 4);
-        let mut at = 0;
-        loop {
-            let (header, head, _) = read_frame(&bytes[at..], salt).unwrap();
-            if header.record == step {
-                let text = String::from_utf8(head.to_vec()).unwrap();
-                let digits = text.split("\"pieces\":").nth(1).unwrap();
-                let end = digits.find(|c: char| !c.is_ascii_digit()).unwrap();
-                let place = text.len() - digits.len() + end - 1;
-                let mut head = head.to_vec();
-                head[place] = if head[place] == b'1' { b'2' } else { b'1' };
-                let tail =
-                    bytes[at + HEADER + head.len()..at + header.frame_len() as usize].to_vec();
-                let fixed = header_bytes(
-                    salt,
-                    header.record,
-                    header.mark,
-                    header.flags,
-                    head.len() as u32,
-                    tail.len() as u32,
-                    crc_body(&head, &tail),
-                );
-                bytes[at..at + HEADER].copy_from_slice(&fixed);
-                bytes[at + HEADER..at + HEADER + head.len()].copy_from_slice(&head);
-                break;
-            }
-            at += header.frame_len() as usize;
-        }
-        fs::write(&path, &bytes).unwrap();
-        let mut v = reopen(tmp.path());
-        // Served from the journal; history stops at the step with the alarm.
-        assert_eq!(v.read(TreeId::Root, "a").unwrap(), b"bytes");
         match v.settle() {
             Err(Error::History(WaitError::Failed(BuildError::Disagrees(at)))) => {
                 assert_eq!(at, step);
             }
             other => panic!("expected Disagrees, got {other:?}"),
         }
+        assert_eq!(v.read(TreeId::Root, "a").unwrap(), b"bytes");
         let h = v
             .write_open(TreeId::Root, "b", &writer("w"), Some(ATTRS))
             .unwrap();
         v.write(h, 0, b"recorded", false).unwrap();
         v.close(h).unwrap();
         assert_eq!(v.read(TreeId::Root, "b").unwrap(), b"recorded");
+    }
+
+    /// A6: a save whose page-write piece names a run the builder does not
+    /// track (the page write's record names another file) replays to
+    /// nothing: the commit is flagged, history holds the bytes the workload
+    /// saved, read from the journal by the run's record, and building goes
+    /// on.
+    #[cfg(feature = "failpoints")]
+    #[test]
+    fn a_save_whose_pieces_name_no_run_is_flagged_and_keeps_its_bytes() {
+        use crate::tree_actor::test_support::{ATTRS, new_actor, writer};
+        use crate::tree_actor::{TreeId, UnverifiedCounts};
+        let tmp = tempfile::tempdir().unwrap();
+        let unbuilt = crate::failpoints::configure("tree.build_before_batch=error@*").unwrap();
+        let mut v = new_actor(tmp.path());
+        let h = v
+            .write_open(TreeId::Root, "a", &writer("w"), Some(ATTRS))
+            .unwrap();
+        v.write(h, 0, b"hello world", false).unwrap();
+        v.page_writeback(h, 6, b"PAGES").unwrap();
+        v.close(h).unwrap();
+        let saved = v.read(TreeId::Root, "a").unwrap();
+        assert_eq!(saved, b"hello PAGES");
+        v.durability().make_all_durable().unwrap();
+        // The page write's record names object 9, a file that never was.
+        rewrite_head(
+            tmp.path(),
+            "\"object\":",
+            &format!("{h},\"runs\""),
+            "9,\"runs\"",
+        );
+        drop(unbuilt);
+        v.settle().unwrap();
+        assert_eq!(v.read(TreeId::Root, "a").unwrap(), saved);
+        let repo = v.history().repo().clone();
+        let head = v.head(TreeId::Root).unwrap();
+        let message = String::from_utf8(repo.read_commit(head).unwrap().message).unwrap();
+        assert!(
+            message.contains("\nAgentfs-Unverified: recorded 11:")
+                && message.contains(" replayed none by "),
+            "{message}"
+        );
+        let checkout = crate::tree_actor::history::checkout_path(tmp.path(), TreeId::Root, "a");
+        assert_eq!(fs::read(checkout).unwrap(), saved);
+        assert_eq!(
+            v.verification().counts(),
+            UnverifiedCounts {
+                unresolved: 1,
+                mismatch_confirmed: 0
+            }
+        );
     }
 
     #[test]

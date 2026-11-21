@@ -120,6 +120,7 @@ pub fn host(state: &Path, args: HostArgs, minter: Minter) -> Result<ExitCode> {
         Ok(staged) => staged,
         Err(code) => return Ok(code),
     };
+    let _gauge = super::observe_unverified(otel.telemetry(), &staged.domains)?;
     let (mut serving, sender) = Serving::start(staged, state, None)?;
     let mut driver = HostDriver {
         control: control.try_clone().context("cloning the control channel")?,

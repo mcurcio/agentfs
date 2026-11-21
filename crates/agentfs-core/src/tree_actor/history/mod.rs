@@ -395,17 +395,23 @@ pub(in crate::tree_actor) fn read_trees(
     Ok(trees)
 }
 
-/// The commit of every direct save the pointers reach, by its event number:
-/// one Git child, its messages folded in as they stream, none held.
-pub(in crate::tree_actor) fn owners(repo: &TreeGit, pointers: &Pointers) -> Result<built::Owners> {
+/// The commit of every direct save the pointers reach, by its event number,
+/// and every one of them history flagged unverified (`verify`): one Git
+/// child, its messages folded in as they stream, none held.
+pub(in crate::tree_actor) fn owners(
+    repo: &TreeGit,
+    pointers: &Pointers,
+) -> Result<(built::Owners, Vec<verify::Unverified>)> {
     let _timer = Timer::start(Which::EventOwners);
     let mut owners = built::Owners::new();
+    let mut flagged = Vec::new();
     repo.for_each_commit_message(&refs::owner_tips(pointers), |oid, message| {
         if let Some(event) = message::direct_event(message) {
             owners.insert(event, oid);
+            flagged.extend(verify::Unverified::of_commit(oid, message));
         }
     })?;
-    Ok(owners)
+    Ok((owners, flagged))
 }
 
 /// Where `tree`'s checkout holds the file named `name`: its `files/` path
