@@ -255,6 +255,31 @@ Two whole-system alternatives were set aside:
 
 ---
 
+## Binding corrections from the second review (2026-11-21)
+
+A second panel (durability, concurrency, git model, simplicity) reviewed the revision and slice 6. Its findings, with evidence, are in `/tmp/claude-0/-home-user-agentfs/d9d7fd5b-08fa-53a9-9d39-8e3a2341a15d/scratchpad/latency-rereview.md` until this page is built. These corrections bind every slice and override any line above that disagrees.
+
+**Compaction (slice 2):**
+- **C2a. A segment is unlinked only after the actor has rolled past it.** The roll is an actor event that history receives. History never decides from a length check alone. A conformance leg parks the compactor between its coverage check and its unlink while the actor appends.
+- **C7. The journal always opens.** After any step of compaction and any power cut, the salt, the redo start B+1 and "no record after B" come from the checkpoint file. A missing or wholly torn segment after B is a torn tail, not corruption. Slice 2's power-loss marks include "covered segments unlinked, next segment's first frame not durable" and "no segment left".
+- **C3 and C4 rewritten.** The checkpoint keeps the latest step head of every pointer at B, which is bounded by the number of pointers. History keeps each head until its built point passes the record at which the actor switched that pointer to an oid. The actor emits that switch as an event under its lock.
+- **C8. Every field of today's `Entry::Checkpoint` has a named source at B.** The recommended source is the recovery fold (`journal/fold.rs`), run by history over the records at or below B. The architect lists every field and its source before slice 2 is cut.
+- **C9. No lock the actor takes is held across I/O or a wait.** That covers History's state, Durability's state, the segment table and relocations. The segment table and the journal length have one owner, with a place in the lock order. The compactor holds History's lock only to clone persistent maps.
+
+**Deferred drops (slice 1):**
+- **Large drops leave request threads altogether.** Replaced values travel back through History's state, the transport `publish_maps`/`take_maps` already uses, to a thread that serves no requests. Slice 1 is proven by the latency of another file's request during `close_frag`, not by the lock hold alone.
+
+**Close stops waiting for the disk (slice 6):**
+- **Contract.** FLUSH (close) returns once the open's records are appended. It never waits for an fsync and never returns a journal fsync error. fsync, FSYNCDIR and O_SYNC/O_DSYNC writes still wait for the disk.
+- **D1, the invariant that makes this safe.** A power cut loses a suffix of the journal: no record survives without every earlier record. After a power cut, the volume equals an uninterrupted run cut after some record r. That r is at or after the last record covered by a returned fsync, FSYNCDIR or O_SYNC write. The loss is every record after the last such call or builder batch, which can be many saves, not one.
+- **D2. A change outside the journal that destroys data waits until the journal record carrying that data is durable.** For example, a move from the untracked area into the tree unlinks the area's file only after its record is durable. The wait is outside the actor's lock. This bug exists today, and slice 6 widens its window.
+- **Proof.** The power-loss oracle checks four things: the recovered journal is a prefix of the appended records; it holds every record up to the last returned fsync, FSYNCDIR or O_SYNC write; the volume opens; and recovery saves what survived. One leg runs close A, rename A over B, close C, create D with no fsync. Another runs the editor pattern: an untracked temp file, fsync or no fsync, then a rename into the tree. The existing XW marks in `power-loss-trees.sh` become may-lose.
+- **Docs and the model.** Slice 6 changes git-model §3 rows 142 and 179 and §18 row 1058, through the model-verification procedure. It also changes guarantees.md, trees.md and the flush in tree_view.rs.
+- **Cost (§9).** A power cut can lose every change since the last fsync, FSYNCDIR or O_SYNC write, or since the last builder batch.
+
+**Measurement (slice 0):**
+- **Measure the interruption at the FUSE edge.** Request latency by op, a probe on another file in the same view and in another view during the workloads, and gate waits by cause. If gate waits or the view's single thread outweigh lock holds, the mapping of the owner's Q1 answer goes back to the owner before slice 2.
+
 ## Review responses
 
 | Finding (reviewers) | Response |
