@@ -13,6 +13,7 @@
 //! way its save is recorded before the close returns.
 
 pub(super) mod file_map;
+pub(super) mod layout;
 pub(super) mod pages;
 
 use std::collections::BTreeSet;
@@ -36,6 +37,7 @@ use super::tree::{DirState, EventNumber, SavedTree};
 use super::{Error, Result, Saved, TreeActor, TreeId};
 use crate::paths::RepoPath;
 pub use file_map::FileMap;
+use layout::{Layout, Positions};
 
 /// Calls name byte positions, never lines; their bytes are in their frame's
 /// tail. Append finds EOF at save time.
@@ -280,11 +282,17 @@ pub(in crate::tree_actor) struct CloseWork {
     reader: Option<CallReader>,
 }
 
+/// A changed file's save as a close decided it: its layout's chunk records,
+/// what the step records before it, and the saved map, the layout laid on
+/// the saved map the close read ([`Layout::lay`]), what a replay of the
+/// records lays. Made off the lock for a close decided there.
+type Decided = (Vec<Vec<u8>>, FileMap);
+
 /// A close decided with the lock released.
 pub(in crate::tree_actor) struct CloseDecision {
     work: CloseWork,
     outcome: SaveOutcome,
-    map: Option<FileMap>,
+    map: Option<Decided>,
     pieces: Vec<(u64, pages::Run)>,
 }
 
@@ -310,7 +318,7 @@ impl CloseWork {
         if self.reader.is_none() && self.pages.is_none() {
             let ranges = self.view.differs_from(&self.saved);
             let (outcome, map) = judge(&self.saved, self.view.clone(), &ranges, || {
-                Ok(self.view.digest_since(self.handle))
+                Ok(Layout::of_view(&self.view, RecordNo::new(self.handle)))
             })?;
             return Ok(CloseDecision {
                 work: self,
@@ -342,21 +350,31 @@ impl CloseWork {
 /// A close's outcome for `map`, the saved map with the close's calls
 /// applied, which may differ from `saved` only over `ranges`: unchanged when
 /// the length and those bytes are the same (finding 36; the owner,
-/// 2026-11-07, "1. A"), else saved with `digest`.
+/// 2026-11-07, "1. A"), else saved with its `layout`.
 fn judge(
     saved: &FileMap,
     map: FileMap,
     ranges: &[Range<u64>],
-    digest: impl FnOnce() -> Result<u64>,
-) -> Result<(SaveOutcome, Option<FileMap>)> {
+    layout: impl FnOnce() -> Result<Layout>,
+) -> Result<(SaveOutcome, Option<Decided>)> {
     if map.len() == saved.len() && map.same_as(saved, ranges)? {
         return Ok((SaveOutcome::Unchanged, None));
     }
-    let outcome = SaveOutcome::Saved {
-        len: map.len(),
-        pieces: digest()?,
-    };
-    Ok((outcome, Some(map)))
+    let layout = layout()?;
+    Ok((layout.outcome(), Some(decided(saved, &layout, &map)?)))
+}
+
+/// What a save of `layout` records and serves: its chunk records, and the
+/// layout laid on `saved`, each place resolved from `computed`, the map the
+/// close's calls left.
+///
+/// # Errors
+///
+/// As [`Layout::lay`]: a layout its own close cannot lay is a bug.
+fn decided(saved: &FileMap, layout: &Layout, computed: &FileMap) -> Result<Decided> {
+    let known = Positions::of_map(computed);
+    let laid = layout.lay(saved, &mut |place| Ok(known.find(place)))?;
+    Ok((layout.to_chunks(), laid))
 }
 
 /// `calls` replayed on `saved` and judged: a close that applies nothing
@@ -364,7 +382,7 @@ fn judge(
 fn replay_judge(
     saved: &FileMap,
     calls: &[(Call, FramePos)],
-) -> Result<(SaveOutcome, Option<FileMap>)> {
+) -> Result<(SaveOutcome, Option<Decided>)> {
     if calls.is_empty() {
         return Ok((SaveOutcome::Unchanged, None));
     }
@@ -374,9 +392,7 @@ fn replay_judge(
         ranges.extend(call.touched(map.len()));
         map.apply(call, pos)?;
     }
-    judge(saved, map, &ranges, || {
-        FileMap::close_digest(saved.len(), calls)
-    })
+    judge(saved, map, &ranges, || Layout::of_close(saved.len(), calls))
 }
 
 impl TreeActor {
@@ -994,11 +1010,11 @@ impl TreeActor {
             && h.bytes.len() != saved.len()
             && h.bytes.piece_count() <= file_map::SMALL_PIECES
         {
-            let outcome = SaveOutcome::Saved {
-                len: h.bytes.len(),
-                pieces: h.bytes.digest_since(handle),
-            };
-            Some((outcome, Some(h.bytes.clone())))
+            let layout = Layout::of_view(&h.bytes, RecordNo::new(handle));
+            match decided(saved, &layout, &h.bytes) {
+                Ok(decided) => Some((layout.outcome(), Some(decided))),
+                Err(e) => return Err(self.close_failed(handle, e)),
+            }
         } else {
             None
         };
@@ -1462,20 +1478,26 @@ impl TreeActor {
         }
     }
 
-    /// A close's save, decided: its record appended (the commit point), then
-    /// applied: the saved map `map` for a changed file, the page-write
-    /// `pieces` it applied named in the record. The open's keys go and its
-    /// handle with them.
+    /// A close's save, decided: its records appended (the commit point), then
+    /// applied. A changed file's save records exactly its layout's outcome,
+    /// its layout in chunk records just before the step, and the page-write
+    /// `pieces` it applied; the saved map is then the layout laid on the
+    /// saved map ([`decided`]): what a replay of the records lays. The one
+    /// writer of a Saved close. The open's keys go and its handle with them.
     fn save_close(
         &mut self,
         handle: u64,
         outcome: SaveOutcome,
-        saved_bytes: Option<FileMap>,
+        saved_bytes: Option<Decided>,
         pieces: Vec<(u64, pages::Run)>,
     ) -> Result<Saved> {
         let h = self.handles.get(&handle).ok_or(Error::NotFound)?;
         let (tree, object, by) = (h.tree, h.object, h.by.clone());
-        let seq = self.next;
+        let (chunks, saved_bytes) = match saved_bytes {
+            Some((chunks, laid)) => (chunks, Some(laid)),
+            None => (Vec::new(), None),
+        };
+        let seq = self.next + chunks.len() as u64;
         let pointers = if saved_bytes.is_some() {
             self.publish(tree, seq)
         } else {
@@ -1497,7 +1519,12 @@ impl TreeActor {
         let started = std::time::Instant::now();
         // Every close lets its open's held keys go, a changed file's or not.
         let keys = self.tree(tree)?.shape.keys(object);
-        self.record_step(by, change, pointers, &mut std::iter::empty())?;
+        let (recorded, _) =
+            self.record_step(by, change, pointers, &mut chunks.into_iter().map(Ok))?;
+        debug_assert_eq!(
+            recorded, seq,
+            "the layout's chunks come just before the step"
+        );
         self.touch(tree, seq, keys);
         self.pending_closes.retain(|pending| *pending != handle);
         self.handles.remove(&handle);
@@ -1734,10 +1761,7 @@ mod tests {
         let calls = pages::close_calls(&own, &pieces);
         match changed(&saved, &calls).unwrap() {
             Some(map) => (
-                SaveOutcome::Saved {
-                    len: map.len(),
-                    pieces: FileMap::close_digest(saved.len(), &calls).unwrap(),
-                },
+                Layout::of_close(saved.len(), &calls).unwrap().outcome(),
                 map.to_vec().unwrap(),
             ),
             None => (SaveOutcome::Unchanged, saved.to_vec().unwrap()),
@@ -1746,8 +1770,8 @@ mod tests {
 
     /// Runs one random history of two opens of one file, closing each
     /// against the oracle, and builds it: every build must succeed, so the
-    /// builder's own check of each save (`Disagrees`) agrees with the
-    /// actor's. `pause` waits 3 ms before each close, which lets the
+    /// builder's own check of each save agrees with the actor's: no commit
+    /// is flagged. `pause` waits 3 ms before each close, which lets the
     /// builder's batches run, and rebase the saved map, at other points.
     /// `closed` gets each close's outcome.
     fn two_opens(seed: u64, pause: bool, closed: &mut Vec<SaveOutcome>) {
@@ -1812,6 +1836,11 @@ mod tests {
         if let Err(e) = v.settle() {
             panic!("seed {seed} at the end: {e}");
         }
+        assert_eq!(
+            v.verification().counts(),
+            crate::tree_actor::UnverifiedCounts::default(),
+            "seed {seed}: the builder's replay of every save agrees with its record"
+        );
     }
 
     /// A1: seeds 1..64 of two opens of one file (writes, appends, truncates,

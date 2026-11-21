@@ -51,15 +51,21 @@ use history::built_log::{self, BuiltLog};
 use history::message::Message;
 use history::repack::Repacker;
 use history::upstreams::Upstreams;
-pub use history::verify::{Checked, UnverifiedCounts, Verdict, Verification};
+use history::verify;
+pub use history::verify::{
+    Checked, EVIDENCE_REF, Flag, Outcome, UnverifiedCounts, VERIFY_REF, Verdict, Verification,
+    VerifyReport, release, verify_flagged,
+};
 use history::{check_objects, clean_packs, read_trees, refs, remove_stale_locks, sync_marker};
 pub use journal::durable::{Durability, DurableError, RecordNo};
 use journal::{
-    Change, Entry, Journal, PointerChange, Record, Replay, RowRecord, Target, compact_at, fold,
+    Change, Entry, Journal, PointerChange, Record, Replay, RowRecord, SaveOutcome, Target,
+    compact_at, fold,
 };
 pub use meta::{Attrs, Kind, Meta, Perm, SetTime, Times};
 use pointers::Pointers;
 pub use recording::file_map::FileMapReader;
+pub use recording::layout::Fingerprint;
 pub use recording::{DirEntry, FileMap, Node, RenameMode};
 use recording::{Handle, pages};
 use rows::SavedRows;
@@ -68,7 +74,7 @@ use stages::Stages;
 use tree::{EventNumber, SavedTree};
 pub use untracked::{AreaWrite, UntrackedArea};
 
-const FORMAT: &str = "agentfs-trees-12\n";
+const FORMAT: &str = "agentfs-trees-13\n";
 /// The volume identity file: [`VolumeIdentity`] as JSON, written once by
 /// [`TreeActor::create`], read before any write at every open.
 const IDENTITY: &str = "volume";
@@ -337,6 +343,8 @@ pub struct TreeActor {
     rules: Arc<agentfs_rules::RuleSet>,
     /// Each tree's untracked area and its hold.
     areas: untracked::Areas,
+    /// The flagged commits by state, which the alarm's gauge reads.
+    verification: Verification,
     _lock: Arc<FileLock>,
 }
 
@@ -354,6 +362,8 @@ struct Started {
     /// The rows and queue entries' sources as of the journal's last record.
     rows: SavedRows,
     sources: BTreeMap<String, TreeId>,
+    /// The flagged commits by state, as history holds them.
+    verification: Verification,
 }
 
 /// What a state area holds: reads `format` and `volume` only, takes no lock,
@@ -766,7 +776,8 @@ impl TreeActor {
         at_built
             .upstreams
             .check_recovered(|fork| trees.contains_key(&fork))?;
-        let owners = history::owners(&repo, &pointers)?;
+        let (owners, flagged) = history::owners(&repo, &pointers)?;
+        let verification = Self::check_flags_at_start(&repo, &flagged, service);
         // The saved state: the built trees with every record after the built
         // point replayed on them, as the actor applied it at the call. Open
         // never waits for the builder, which starts from the same trees.
@@ -824,6 +835,7 @@ impl TreeActor {
             copied: pointers,
             checked_out,
             stale: false,
+            verification: verification.clone(),
         };
         let owner = crate::failpoints::owner();
         let handle = std::thread::Builder::new()
@@ -841,7 +853,38 @@ impl TreeActor {
             trees: replay.trees,
             rows,
             sources,
+            verification,
         })
+    }
+
+    /// The flagged commits' counts, from history: before the builder
+    /// starts, under the volume's lock, each standing flag this release has
+    /// not judged is checked again ([`verify::check_flags`]), its verdict
+    /// committed with the service's identity now. A failure of the check is
+    /// logged and never stops the start.
+    fn check_flags_at_start(
+        repo: &crate::tree_git::TreeGit,
+        flagged: &[verify::Unverified],
+        service: &PodContext,
+    ) -> Verification {
+        let verification = Verification::default();
+        if flagged.is_empty() {
+            return verification;
+        }
+        if let Some(release) = verify::release() {
+            let checked = verify::verdict_committer(service).and_then(|committer| {
+                verify::check_flags(repo, flagged, Some(release), &committer)
+            });
+            if let Err(e) = checked {
+                eprintln!(
+                    "tree HistoryVerifyFailed: the check of flagged saves at start: {e}; their \
+                     flags stand (docs/runbooks/recording-failures.md)"
+                );
+            }
+        }
+        let commits: Vec<Oid> = flagged.iter().map(|flag| flag.commit).collect();
+        verification.set(verify::Notes::read(repo).counts(&commits));
+        verification
     }
 
     /// The rows and the queue entries' sources as of the journal's last
@@ -907,6 +950,7 @@ impl TreeActor {
             trees,
             rows,
             sources,
+            verification,
         } = Self::start_history(
             &root,
             &lock,
@@ -950,6 +994,7 @@ impl TreeActor {
             compacted: (RecordNo::ZERO, BTreeMap::new()),
             rules,
             areas: untracked::Areas::new(&root),
+            verification,
             _lock: lock,
         };
         // After the builder, and once the volume stops it on any error below.
@@ -1469,9 +1514,13 @@ impl TreeActor {
         }
         let cost = change.build_cost()?;
         let rows: Vec<RowRecord> = rows.into_iter().map(RowWrite::record).collect();
-        // A take's step comes after its chunk records.
+        // A take's step, and a save's, comes after its chunk records.
         let ahead = match &change {
             Change::Take { take, .. } => take.chunks,
+            Change::Save {
+                outcome: SaveOutcome::Saved { chunks, .. },
+                ..
+            } => *chunks,
             _ => 0,
         };
         let mut pointers = pointers;
@@ -1922,6 +1971,7 @@ mod tests {
             "agentfs-trees-9\n",
             "agentfs-trees-10\n",
             "agentfs-trees-11\n",
+            "agentfs-trees-12\n",
         ] {
             let tmp = tempfile::tempdir().unwrap();
             drop(new_actor(tmp.path()));

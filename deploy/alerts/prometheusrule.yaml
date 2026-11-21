@@ -168,6 +168,22 @@ spec:
               log has one "not built:" line per key; see docs/trees.md,
               "Operator settings".
             runbook_url: https://github.com/mcurcio/agentfs/blob/main/docs/trees.md#operator-settings
+        - alert: AgentfsHistoryUnverified
+          expr: agentfs_history_unverified > 0
+          for: 0m
+          labels:
+            severity: warning
+          annotations:
+            summary: "saves history could not check: {{ $labels.verdict }} ({{ $labels.instance }})"
+            description: >-
+              {{ $value }} commit(s) of the volume's history are flagged
+              Agentfs-Unverified, {{ $labels.verdict }}: the builder's replay of
+              the save did not match its record. History holds the bytes the
+              workload saved; the volume keeps working. Check them with a later
+              release (agentfs verify) or acknowledge them; see
+              docs/runbooks/recording-failures.md, "A save history could not
+              check".
+            runbook_url: https://github.com/mcurcio/agentfs/blob/main/docs/runbooks/recording-failures.md#8-a-save-history-could-not-check
         - alert: AgentfsTelemetryExportFailing
           expr: |
             increase(agentfs_telemetry_export_failures_total[15m]) > 0

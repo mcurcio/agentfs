@@ -337,14 +337,16 @@ runbook link:
 The CSI Helm chart installs the same `PrometheusRule` with
 `alerts.enabled=true` (off by default; [helm.md](helm.md#3-values)).
 
-For the sidecar, alert on `AgentfsNotBuilt`: the sidecar's mount exports
-`agentfs.not_built` and the count of failed exports, as each CSI volume's
-`agentfs host` does ([csi.md](csi.md#9-operations)). The other rules are
-on the recording engine's metrics, which no launcher emits any more.
+For the sidecar, alert on `AgentfsNotBuilt` and `AgentfsHistoryUnverified`:
+the sidecar's mount exports `agentfs.not_built`, `agentfs.history.unverified`
+and the count of failed exports, as each CSI volume's `agentfs host` does
+([csi.md](csi.md#9-operations)). The other rules are on the recording
+engine's metrics, which no launcher emits any more.
 
 | Alert | Severity | Fires when |
 |---|---|---|
 | `AgentfsNotBuilt` | warning | a tree volume's operator settings name a key whose capability is not built yet (`agentfs.not_built`), for as long as the key stays |
+| `AgentfsHistoryUnverified` | warning | a tree volume's history has commits flagged `Agentfs-Unverified` that no later check has verified or acknowledged (`agentfs.history.unverified`, read at each start; [trees](trees.md#when-history-cannot-check-a-save)) |
 | `AgentfsTelemetryExportFailing` | warning | a telemetry export failed in the last 15 minutes |
 | `AgentfsRecordFailed` | critical | a record failed in the last 10 minutes (`agentfs.record.failures`) |
 | `AgentfsCommitsFailing` | critical | commits failed in every 5 minutes for 10 minutes while the journal holds records |

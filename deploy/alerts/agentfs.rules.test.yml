@@ -229,3 +229,25 @@ tests:
         exp_samples:
           - labels: 'ALERTS{alertname="AgentfsNotBuilt",alertstate="firing",severity="warning",job="agentfs",instance="pod-0",agentfs_volume="v",capability="push"}'
             value: 1
+
+  # A flagged save warns at once, by verdict, while it stands: a verdict
+  # counted 0 does not, and a flag cleared (verified or acknowledged, the
+  # count back to 0) resolves.
+  - interval: 1m
+    input_series:
+      - series: 'agentfs_history_unverified{job="agentfs",instance="pod-0",agentfs_volume="v",verdict="unresolved"}'
+        values: '1x5 0x5'
+      - series: 'agentfs_history_unverified{job="agentfs",instance="pod-0",agentfs_volume="v",verdict="mismatch_confirmed"}'
+        values: '0x10'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: AgentfsHistoryUnverified
+        exp_alerts:
+          - exp_labels: {severity: warning, job: agentfs, instance: pod-0, agentfs_volume: v, verdict: unresolved}
+            exp_annotations:
+              summary: "saves history could not check: unresolved (pod-0)"
+              description: "1 commit(s) of the volume's history are flagged Agentfs-Unverified, unresolved: the builder's replay of the save did not match its record. History holds the bytes the workload saved; the volume keeps working. Check them with a later release (agentfs verify) or acknowledge them; see docs/runbooks/recording-failures.md, \"A save history could not check\"."
+              runbook_url: https://github.com/mcurcio/agentfs/blob/main/docs/runbooks/recording-failures.md#8-a-save-history-could-not-check
+      - eval_time: 8m
+        alertname: AgentfsHistoryUnverified
+        exp_alerts: []

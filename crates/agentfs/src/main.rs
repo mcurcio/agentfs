@@ -1,9 +1,11 @@
 //! The `agentfs` command.
 //!
-//! `init`, `mount` and `fork end` run the tree engine ([`launcher`],
+//! `init`, `mount`, `fork end` and `verify` run the tree engine ([`launcher`],
 //! docs/trees.md): `init` creates or finds a volume, `mount` serves its root
 //! (and optionally a fork) as tree views until SIGINT, SIGTERM, its command's
-//! exit or an unmount, and `fork end` ends a keyed fork. `probe` reports
+//! exit or an unmount, `fork end` ends a keyed fork, and `verify` checks the
+//! saves history flagged unverified again (its exit status:
+//! `launcher/verify.rs`). `probe` reports
 //! whether a mount point holds a live agentfs mount, for Kubernetes probes;
 //! `mount --on-stale-mount recover` makes a sidecar restarted after a crash
 //! mount over the stale mount its predecessor left, and `hold` makes it wait
@@ -140,6 +142,10 @@ enum Command {
     /// optionally run a command in it. SIGTERM, SIGINT, the command's exit
     /// or unmounting every view drains it. Never creates a volume.
     Mount(launcher::MountArgs),
+    /// Check every save history flagged unverified again with this binary,
+    /// one line each. Exit 0 when no flag stands, 2 when one does, 1 on an
+    /// error, 75 while another process holds the volume.
+    Verify(launcher::VerifyArgs),
     /// Serve one tree volume's views on its launcher's requests, read from
     /// the standard input (a Unix socket the launcher holds the other end
     /// of). Its EOF, SIGTERM or SIGINT drains it. Exit 1 refused, 2 not run
@@ -453,6 +459,7 @@ fn real_main() -> Result<ExitCode> {
         Command::Init(args) => return launcher::init(&cli.state, args, minter),
         Command::Mount(args) => return launcher::mount(&cli.state, args, minter),
         Command::Host(args) => return launcher::host(&cli.state, args, minter),
+        Command::Verify(args) => return launcher::verify(&cli.state, args),
         Command::Status(_pod) => {
             // Read-only: no recovery, no lock, so it is safe beside a
             // running `mount` or `run`.
@@ -718,7 +725,7 @@ fn real_main() -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// `init`, `mount`, `host` and `fork end` (the tree engine's) take `--state` only:
+/// `init`, `mount`, `host`, `fork end` and `verify` (the tree engine's) take `--state` only:
 /// a given `--root` (or `AGENTFS_ROOT`) or a non-zero `--wait-lock` is
 /// refused, so an old manifest fails loudly.
 fn tree_command_flags(cli: &Cli) -> Result<(), &'static str> {
@@ -727,14 +734,15 @@ fn tree_command_flags(cli: &Cli) -> Result<(), &'static str> {
         Command::Init(_)
             | Command::Mount(_)
             | Command::Host(_)
+            | Command::Verify(_)
             | Command::Fork {
                 command: fork_cmd::ForkCommand::End(_)
             }
     );
     if tree && (cli.root.is_some() || !cli.wait_lock.is_zero()) {
         return Err(
-            "init, mount, host and fork end take --state only: a tree volume has no backing tree \
-             (--root, AGENTFS_ROOT), and a busy state area exits 75",
+            "init, mount, host, fork end and verify take --state only: a tree volume has no \
+             backing tree (--root, AGENTFS_ROOT), and a busy state area exits 75",
         );
     }
     Ok(())
@@ -746,7 +754,11 @@ fn tree_command_flags(cli: &Cli) -> Result<(), &'static str> {
 /// say which engine it runs.
 fn recording_command(command: &Command) -> Option<&'static str> {
     match command {
-        Command::Init(_) | Command::Mount(_) | Command::Host(_) | Command::Probe { .. } => None,
+        Command::Init(_)
+        | Command::Mount(_)
+        | Command::Host(_)
+        | Command::Verify(_)
+        | Command::Probe { .. } => None,
         Command::Fork {
             command: fork_cmd::ForkCommand::End(_),
         } => None,

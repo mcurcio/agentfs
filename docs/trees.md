@@ -504,14 +504,17 @@ clone it.
   files whole, so an edit of a file near the host's memory needs that memory
   in the `git` child. Blobs over 8 MiB stream through `git fast-import` and
   `git cat-file` (`core.bigFileThreshold`), which never hold them whole.
-- The save record holds the result's length and a digest of what the close
-  wrote: each piece its own calls and page-write pieces left, by file offset,
-  length and place in the journal, and the bytes it kept as runs. The digest
-  is computed from the saved length and the close's calls alone, never from
-  how the kept bytes are sourced (journal frames or the checkout's file), so
-  the builder, which rebases at other points than the view, reaches the same
-  digest for the same save. A replay that does not reach it fails
-  (`Disagrees`).
+- The save record holds the save's layout: the result's length, then each
+  range the close wrote, as zeros or as journal bytes named by their record
+  and offset in its tail; every other byte keeps the value it had before the
+  save at the same offset. The layout is in the tails of chunk records just
+  before the step, 32 bytes a range, so a close of any number of pieces
+  records. The view, a restart's replay and the builder each make the saved
+  map by laying the recorded layout on the map before the save, so all three
+  hold the bytes the workload saved, however each sources the kept bytes
+  (journal frames or the checkout's file). The builder also replays the save
+  from its own inputs and compares the two layouts
+  ([When history cannot check a save](#when-history-cannot-check-a-save)).
 
 ## The library
 
@@ -680,7 +683,7 @@ appends it and applies it to the saved state the views serve; it runs no git.
   `bases/`, `actor.lock`, `format` and rebuilt private checkout caches, which the workload
   never sees. A create writes an `initializing` marker first and removes it last;
   the next `init` starts a cut-short create over. The state format is
-  `agentfs-trees-12`. **Earlier state formats (11 included) do not open**, and
+  `agentfs-trees-13`. **Earlier state formats (12 included) do not open**, and
   are never converted ([upgrading](runbooks/upgrading-the-sidecar.md)).
 
 ## History trails the files
@@ -702,8 +705,11 @@ the private checkouts copied, the checked-out files' maps rebased onto them
 - A commit is dated by its step's record, in `+0000`. A replay after a crash may
   make other objects for steps nothing had seen built.
 - A failed batch (`tree HistoryBuildFailed: <e>`) changes nothing reachable and is
-  retried at the next step or wait; recording goes on. A batch whose replay
-  disagrees with its record (`Disagrees`) fails the same way at every retry: see
+  retried at the next step or wait; recording goes on. A save whose replay does
+  not match its record is built from the record and flagged
+  ([When history cannot check a save](#when-history-cannot-check-a-save)); only
+  a recorded layout that cannot be laid (`Disagrees`) fails the batch, the same
+  way at every retry: see
   [runbooks/recording-failures.md](runbooks/recording-failures.md). A failed copy
   after the built-log entry is logged (`tree CopyStale`) and redone whole at the next
   batch.
@@ -747,6 +753,77 @@ the private checkouts copied, the checked-out files' maps rebased onto them
   names) is admitted, and the calls after it wait until it is built. A failed
   builder holds nothing back here either: the overlay cannot shrink while it
   has failed.
+
+## When history cannot check a save
+
+The builder checks every save. It replays the save from its own inputs (the
+open's calls, the file's page writes, the saved length and the page-write
+pieces the record names) and compares the replay's layout with the one the
+save recorded. The two are equal for every save the view and the builder
+agree on. When they differ, or the replay cannot be made (a piece names no
+page write the builder holds):
+
+- History holds the bytes the workload saved: the commit is built from the
+  recorded layout, as the view served it, and building goes on. A recorded
+  byte the builder does not track is read from the journal by its record.
+- The commit is flagged. Its message ends with a trailer that names the two
+  layouts' fingerprints (a length and a 64-bit digest, for display) and the
+  build of agentfs that flagged it:
+
+  ```text
+  Agentfs-Unverified: recorded 12:6a0b99b6163a070e replayed 6:eeea0a7fac4f2c47 by agentfs 0.1.0 build 0123456789abcdef
+  ```
+
+  `replayed none` when the replay could not be made. The flag is history: it
+  travels with every clone and fork copy, and nothing rewrites it.
+- The replay's inputs are kept as evidence, metadata only (records, offsets
+  and lengths, no file bytes), in a git note on the commit under
+  `refs/notes/agentfs-verify-evidence`, JSON in its own format
+  (`agentfs-verify-evidence-1`). The builder is its only writer, and a
+  failed write is logged (`tree HistoryEvidenceNotWritten`, with the
+  evidence's text) and never fails the batch.
+- One line is logged: `tree HistoryUnverified: step=<n> tree=<tree>
+  commit=<oid> path=<JSON string>: ...`, and the gauge
+  `agentfs.history.unverified{verdict="unresolved"}` counts it
+  ([telemetry](telemetry.md)).
+
+The journal keeps nothing for a flag: the save's records compact as any
+others do. Each flag costs one evidence note in git, about 60 bytes per call
+and page-write run plus 32 bytes per layout range. Evidence is never removed.
+
+**Verdicts.** `refs/notes/agentfs-verify` holds the verdicts, one line each in
+the flagged commit's note: `Agentfs-Verdict: verified|mismatch-confirmed|acknowledged
+by <who>`. A verdict comes from a check by a release of agentfs (the binary,
+named by the first 16 hex digits of its SHA-256):
+
+- a start, before it serves, checks every standing flag that release has not
+  flagged or judged, under the volume's lock, and commits its verdicts as the
+  service;
+- `agentfs verify` does the same on demand, and opens only the store, so a
+  release of another state format can run it on a volume it cannot mount.
+
+The check replays the evidence. `verified` means this release's replay equals
+the recorded layout; `mismatch-confirmed` means it still differs. The
+evidence is the builder's tracked inputs, frozen when it flagged the save, so
+a verdict covers the replay code only: if the cause was in what the builder
+tracked or on the view's side, every later release reports
+`mismatch-confirmed`. The release that flagged a save, or judged it, writes
+nothing again (`same-release`), and a commit with no evidence that parses is
+reported `no-evidence`. A person clears a flag after looking with `git notes
+--ref=agentfs-verify append -m "Agentfs-Verdict: acknowledged by <name>"
+<commit>` ([runbook](runbooks/recording-failures.md#a-save-history-could-not-check)).
+
+The counts come from history at every start: unresolved (no verdict, or a
+verdict note that does not parse), mismatch-confirmed (the latest verdict);
+a latest verdict of `verified` or `acknowledged` counts in neither. Neither
+notes ref is a copy and neither is cached: the store's ref rebuild leaves
+`refs/notes/` alone, and each writer reads a ref's tip just before it moves
+it.
+
+What the check catches: a divergence between the view's and the builder's
+inputs (calls, page writes, the saved length, the choice of pieces) or their
+replay code. It does not catch a fault in the one function both use to apply
+a call to a file map.
 
 ## Takes
 

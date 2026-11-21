@@ -17,6 +17,7 @@ use crate::tree_actor::history::Objects;
 use crate::tree_actor::history::upstreams::Upstreams;
 use crate::tree_actor::meta::Meta;
 use crate::tree_actor::pointers::Pointers;
+use crate::tree_actor::recording::layout::{Layout, Positions};
 use crate::tree_actor::recording::{Call, FileMap, pages};
 use crate::tree_actor::tree::{EventNumber, SavedTree};
 use crate::tree_actor::{Error, Result, TreeId};
@@ -153,8 +154,8 @@ type ReplayOpen = (TreeId, u64, Vec<(u64, Call, FramePos)>);
 
 /// The actor's saved trees replayed over records: each step's own
 /// transition ([`Shape::apply`], [`Shape::save`], a fork's copy) and each
-/// save's calls ([`pages::recorded_close_calls`], [`FileMap::apply`]), the
-/// ones the actor ran at the call. What a start serves from, never waiting
+/// save's recorded layout laid on its saved map ([`Layout::lay`]), as the
+/// actor laid it at the call. What a start serves from, never waiting
 /// for history, and how it numbers objects at the built point: object numbers
 /// are the journal's, never history's.
 pub(in crate::tree_actor) struct Replay {
@@ -276,23 +277,34 @@ impl Replay {
             Change::Save {
                 tree,
                 handle,
-                pages: pieces,
                 outcome,
+                ..
             } => {
                 let (id, object, calls) = self.opens.remove(handle).ok_or(Error::Format)?;
-                let writes = self.pages.get(&(id, object));
                 let saved = match outcome {
-                    SaveOutcome::Saved { .. } if self.maps => {
-                        let t = self.trees.get(&id).ok_or(Error::Format)?;
-                        let (mut map, _) = pages::replay_close(
-                            t.bytes.get(&object).ok_or(Error::Format)?,
-                            &calls,
-                            writes.map_or(&[][..], Vec::as_slice),
-                            pieces,
-                        )?
-                        .ok_or(Error::Format)?;
-                        map.saved_at(RecordNo::new(seq));
-                        Some(map)
+                    SaveOutcome::Saved { len, chunks } => {
+                        let chunks = take_chunks(&mut self.bytes, seq, *chunks)?;
+                        if self.maps {
+                            // The recorded layout, laid on the saved map: the
+                            // map the actor served at the call.
+                            let layout = Layout::read(*len, &chunks)?;
+                            let mut known = Positions::default();
+                            for (_, _, pos) in &calls {
+                                known.add(pos);
+                            }
+                            for (_, run) in self.pages.get(&(id, object)).into_iter().flatten() {
+                                known.add(&run.at);
+                            }
+                            let t = self.trees.get(&id).ok_or(Error::Format)?;
+                            let mut map = layout
+                                .lay(t.bytes.get(&object).ok_or(Error::Format)?, &mut |place| {
+                                    Ok(known.find(place))
+                                })?;
+                            map.saved_at(RecordNo::new(seq));
+                            Some(map)
+                        } else {
+                            None
+                        }
                     }
                     _ => None,
                 };
@@ -523,7 +535,15 @@ pub(in crate::tree_actor) fn fold(frames: &[Frame]) -> Result<Folded> {
                 folded.pointers.check_targets(pointers)?;
                 folded.pointers.apply_targets(pointers);
                 folded.add_step(seq, by, change)?;
-                if matches!(change, Change::Take { .. } | Change::Replace { .. }) {
+                if matches!(
+                    change,
+                    Change::Take { .. }
+                        | Change::Replace { .. }
+                        | Change::Save {
+                            outcome: SaveOutcome::Saved { .. },
+                            ..
+                        }
+                ) {
                     folded.bytes.clear();
                 }
             }
@@ -538,4 +558,74 @@ pub(in crate::tree_actor) fn fold(frames: &[Frame]) -> Result<Folded> {
     folded.page_writes.retain(|key, _| live.contains(key));
     folded.saved_through.retain(|key, _| live.contains(key));
     Ok(folded)
+}
+
+#[cfg(all(test, feature = "failpoints"))]
+mod tests {
+    use std::fs::{self, OpenOptions};
+    use std::os::unix::fs::FileExt;
+    use std::path::Path;
+
+    use super::super::{HEADER, crc_body, header_bytes, read_frame, segment, u32_at};
+    use crate::tree_actor::TreeId;
+    use crate::tree_actor::test_support::{ATTRS, new_actor, reopen, writer};
+
+    /// Rewrites the tail of the first chunk record ([`super::Entry::Bytes`])
+    /// in the journal's one segment with `tail` (the same length), and fixes
+    /// its checksum.
+    fn rewrite_chunk(root: &Path, tail: &[u8]) {
+        let listed = segment::list(&root.join("journal")).unwrap();
+        let path = &listed[0].1;
+        let bytes = fs::read(path).unwrap();
+        let salt = u32_at(&bytes, 4);
+        let mut at = 0;
+        loop {
+            let (header, head, old) = read_frame(&bytes[at..], salt).unwrap();
+            if head.ends_with(b"\"entry\":\"Bytes\"}") {
+                assert_eq!(old.len(), tail.len());
+                let fixed = header_bytes(
+                    salt,
+                    header.record,
+                    header.mark,
+                    header.flags,
+                    head.len() as u32,
+                    tail.len() as u32,
+                    crc_body(head, tail),
+                );
+                let file = OpenOptions::new().write(true).open(path).unwrap();
+                file.write_all_at(&fixed, at as u64).unwrap();
+                file.write_all_at(tail, (at + HEADER + head.len()) as u64)
+                    .unwrap();
+                file.sync_all().unwrap();
+                return;
+            }
+            at += header.frame_len() as usize;
+        }
+    }
+
+    /// A4: a start's replay serves a save as its recorded layout lays it on
+    /// the saved map, never as its calls would: a layout crafted to differ
+    /// from the calls (five zeros where the call wrote "bytes") is what a
+    /// restart serves.
+    #[test]
+    fn a_replay_serves_the_recorded_layout_not_the_calls() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _unbuilt = crate::failpoints::configure("tree.build_before_batch=error@*").unwrap();
+        let mut v = new_actor(tmp.path());
+        let h = v
+            .write_open(TreeId::Root, "a", &writer("w"), Some(ATTRS))
+            .unwrap();
+        v.write(h, 0, b"bytes", false).unwrap();
+        v.close(h).unwrap();
+        v.durability().make_all_durable().unwrap();
+        drop(v);
+        // One range: offset 0, length 5, record 0 (zeros), place 0.
+        let zeros: Vec<u8> = [0_u64, 5, 0, 0]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        rewrite_chunk(tmp.path(), &zeros);
+        let v = reopen(tmp.path());
+        assert_eq!(v.read(TreeId::Root, "a").unwrap(), vec![0; 5]);
+    }
 }
