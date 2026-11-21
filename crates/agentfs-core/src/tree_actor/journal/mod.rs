@@ -38,6 +38,7 @@
 //! with every later segment.
 
 mod commit_point;
+pub(super) mod compaction;
 pub(super) mod durable;
 mod fold;
 pub(super) mod readback;
