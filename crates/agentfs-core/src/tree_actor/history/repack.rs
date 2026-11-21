@@ -1898,10 +1898,10 @@ exec git "$@""#;
         let roll_up = memory.rolled.clone().expect("the roll-up's pack is known");
         assert!(listed(&git_dir).contains(&roll_up));
         let later = std::time::SystemTime::now() + Duration::from_secs(60);
+        // Git writes packs read-only; the owner may set times through a
+        // read-only descriptor (futimens), so no write access is needed.
         for pack in &before {
-            File::options()
-                .write(true)
-                .open(git_dir.join(format!("objects/pack/{pack}.pack")))
+            File::open(git_dir.join(format!("objects/pack/{pack}.pack")))
                 .unwrap()
                 .set_modified(later)
                 .unwrap();
