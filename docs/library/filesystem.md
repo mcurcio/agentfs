@@ -293,6 +293,12 @@ source starts `agentfs:`; `source_volume(source)` gives the volume it names
 - `mount_state(path)` tells `MountState::Live`, `Stale` (the daemon is gone),
   `NotMounted` or `Foreign` from `/proc/self/mountinfo` and a `statfs`.
   Nothing else is read: no state area, no lock.
+- `is_disconnected(errno)` (and `is_disconnected_io` for a `std::io::Error`)
+  tells a dead FUSE connection's answer: `ENOTCONN` once the kernel has
+  disconnected the mount, and `ECONNABORTED` for a call that was queued or in
+  flight when the connection was aborted. That can be a call made just after
+  the daemon died, while a child it forked still holds `/dev/fuse` until its
+  `exec`. Every probe of a possibly dead mount asks it.
 - `detach(path)` detaches whatever is mounted there lazily: `umount2` with
   `MNT_DETACH` with the privilege to unmount, `fusermount3 -u -z` otherwise.
 - `detach_stale_layers(path, max)` detaches stale layers, topmost first, while

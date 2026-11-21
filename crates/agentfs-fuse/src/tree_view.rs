@@ -2794,9 +2794,10 @@ mod tests {
             matches!(stale::mount_state(at).unwrap(), MountState::Stale { .. }),
             "the killed worker's view is stale"
         );
-        assert_eq!(
-            rustix::fs::statfs(at).map(|_| ()),
-            Err(rustix::io::Errno::NOTCONN)
+        let answer = rustix::fs::statfs(at).map(|_| ());
+        assert!(
+            answer.is_err_and(stale::is_disconnected),
+            "the stale view answers as a dead connection: {answer:?}"
         );
     }
 
