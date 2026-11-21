@@ -747,14 +747,19 @@ the private checkouts copied, the checked-out files' maps rebased onto them
 - **The repack.** Each batch is one pack, and a read's cost grows with the pack
   count, so at each built event a task of its own rolls the small packs up,
   one run at a time, beside `git fast-import` and never stopping the builder;
-  events that come while one runs make one more run after it. A run is git's
-  incremental repack, with the deletion deferred to a later run:
+  events that come while one runs make one more run after it. Only a built
+  event starts a run: a failed batch, or a view's shutdown, does not. A run is
+  git's incremental repack, with the deletion deferred to a later run:
   1. `git multi-pack-index expire`, once a built event came after the last
      roll-up ended: git deletes the packs in which the multi-pack index finds
      no object, the ones that roll-up superseded.
   2. The packs `git repack --geometric=2` would pick, by size, go into one new
      pack (`git pack-objects --stdin-packs`, the call geometric repack makes):
-     whole packs, every object, reachable or not. Nothing is deleted.
+     whole packs, every object, reachable or not. Nothing is deleted. The
+     roll-up runs only with twice the size of the packs it takes free on the
+     store's filesystem; otherwise it is skipped and logged (`tree
+     RepackFailed: no room for a roll-up ...`), so it never fills the disk the
+     builder and the journal write to.
   3. `git multi-pack-index write --preferred-pack=<the new pack>`, so the
      packs it rolled up hold no object the index finds there; `objects/pack`
      is fsynced before any of them can go.
@@ -773,7 +778,15 @@ the private checkouts copied, the checked-out files' maps rebased onto them
   stop kills a run in progress with every process it started, but waits for
   an expiry to finish. A failed run is
   logged (`tree RepackFailed: <error>`) and tried again at the next built
-  event; its git children are not counted with the actor's. Costs: an idle
+  event; its git children are not counted with the actor's. A failed step
+  leaves the index in doubt (a failed expiry has deleted packs the index still
+  names, and git writes a new index over the one it reads), so the task
+  removes the index and its lock at once, and its next run only writes the
+  index afresh, preferring the last roll-up it wrote; the run after expires
+  what that rewrite left unreferenced. A
+  git that died mid-write (a roll-up out of space, a killed `fast-import`)
+  leaves a temporary file (`tmp_*`), which the task removes at the next batch
+  end, built or failed, if it is still the same file. Costs: an idle
   volume keeps the packs its last roll-up superseded until its next save or
   start; the volume's own libgit2 handles keep the packs they opened mapped,
   so a deleted pack's disk space comes back only when they let it go, at the

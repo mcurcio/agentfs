@@ -163,8 +163,10 @@ struct State {
     wanted: RecordNo,
     /// Bumped at each request: a failed builder retries at the next one.
     requests: u64,
-    /// Bumped at each built or failed event.
+    /// Bumped at each built or failed event, and at [`History::wake_waiters`].
     epoch: u64,
+    /// The batches ended so far: what the repack task waits on.
+    ends: Ends,
     /// When the first step past the built point was appended.
     oldest_unbuilt: Option<Instant>,
     /// Steps appended past the built point, with when each was appended.
@@ -184,6 +186,14 @@ struct State {
     /// Gated calls waiting for their tree's lag to fall, in arrival order:
     /// the one gate thread answers them ([`History::serve_gate`]).
     gated: Vec<(TreeId, Then)>,
+}
+
+/// How many batches have ended since History started: `built` counts the
+/// built events, `ended` the built and the failed ones.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(in crate::tree_actor) struct Ends {
+    pub built: u64,
+    pub ended: u64,
 }
 
 /// The built state at one built point: heads, refs and the commits behind
@@ -287,6 +297,7 @@ impl History {
                     wanted: built,
                     requests: 0,
                     epoch: 0,
+                    ends: Ends::default(),
                     oldest_unbuilt: None,
                     unbuilt: std::collections::VecDeque::new(),
                     stopping: false,
@@ -481,6 +492,8 @@ impl History {
         }
         state.oldest_unbuilt = state.unbuilt.front().map(|(_, at)| *at);
         state.epoch += 1;
+        state.ends.built += 1;
+        state.ends.ended += 1;
         drop(state);
         self.notify();
     }
@@ -509,6 +522,7 @@ impl History {
         }
         state.failed = Some(error);
         state.epoch += 1;
+        state.ends.ended += 1;
         drop(state);
         self.notify();
     }
@@ -535,10 +549,21 @@ impl History {
         self.notify();
     }
 
-    /// Whether the volume is shutting down: what ends a task that waits on
-    /// built events ([`super::repack::Repacker`]).
-    pub(in crate::tree_actor) fn stopping(&self) -> bool {
-        self.state().stopping
+    /// The batches ended so far, built and failed.
+    pub(in crate::tree_actor) fn ends(&self) -> Ends {
+        self.state().ends
+    }
+
+    /// Returns once more than `after` batches have ended, built or failed,
+    /// with the counts then; `None` once the volume is stopping. Only a
+    /// batch's end moves it, never [`History::wake_waiters`]: what the
+    /// repack task runs on ([`super::repack::Repacker`]).
+    pub(in crate::tree_actor) fn wait_batch_end(&self, after: u64) -> Option<Ends> {
+        let mut state = self.state();
+        while state.ends.ended <= after && !state.stopping && !state.stopped {
+            state = self.wait(state);
+        }
+        (!state.stopping && !state.stopped).then_some(state.ends)
     }
 
     /// Wakes every [`History::wait_epoch`] caller with a new epoch.
@@ -783,5 +808,49 @@ mod tests {
         assert_eq!(history.overlay_bytes(TreeId::Fork(1)), 0);
         assert_eq!(history.overlay_bytes(TreeId::Root), 10);
         assert_eq!(history.lag().health, Health::Current);
+    }
+
+    /// A built event moves both counts, a failed one only `ended`, and a
+    /// wake neither: the repack task runs on built events alone.
+    #[test]
+    fn only_built_events_count_as_built() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut actor = new_actor(&tmp.path().join("state"));
+        let w = crate::tree_actor::test_support::writer("w");
+        let h = actor
+            .write_open(
+                TreeId::Root,
+                "f",
+                &w,
+                Some(crate::tree_actor::test_support::ATTRS),
+            )
+            .unwrap();
+        actor.write(h, 0, b"one\n", false).unwrap();
+        actor.close(h).unwrap();
+        actor.settle().unwrap();
+        let history = actor.history().clone();
+        let start = history.ends();
+        assert!(start.built >= 1 && start.ended >= start.built, "{start:?}");
+        history.wake_waiters();
+        assert_eq!(history.ends(), start, "a wake is no batch end");
+        history.failed_event(BuildError::NoSpace, 0);
+        let failed = history.ends();
+        assert_eq!(
+            failed,
+            Ends {
+                built: start.built,
+                ended: start.ended + 1
+            }
+        );
+        assert_eq!(history.wait_batch_end(start.ended), Some(failed));
+        let h = actor.write_open(TreeId::Root, "f", &w, None).unwrap();
+        actor.write(h, 0, b"two\n", false).unwrap();
+        actor.close(h).unwrap();
+        actor.settle().unwrap();
+        let built = history.ends();
+        assert!(
+            built.built > failed.built && built.ended > failed.ended,
+            "{built:?}"
+        );
     }
 }
