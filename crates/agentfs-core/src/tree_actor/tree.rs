@@ -13,6 +13,7 @@ use git2::Oid;
 
 use serde::{Deserialize, Serialize};
 
+use super::history::retired::Retired;
 use super::journal::{Change, SaveOutcome, TakeRecord, TreeLocals};
 use super::meta::{Attrs, Kind, Meta, Perm, Times};
 use super::recording::FileMap;
@@ -1744,14 +1745,15 @@ impl SavedTree {
     /// and drop every changed entry whose step <= through, keeping the rest
     /// over them. O(entries changed since the last built event). Entries noted
     /// at no step must be sealed first ([`SavedTree::seal`]), or they stay.
-    /// The maps and the shape let go are dropped last, in a section of
-    /// their own (`Stages::lock_hold.drops`).
-    pub(super) fn rebuilt(&mut self, built: &Tree, through: EventNumber) {
+    /// The maps and the shape let go are returned, never dropped here: the
+    /// caller hands them to `History::defer_drops`.
+    pub(super) fn rebuilt(&mut self, built: &Tree, through: EventNumber) -> Retired {
         let shape = self.shape.rebuilt(&built.shape, through);
         let old = std::mem::replace(&mut self.shape, shape);
         let maps = self.bytes.rebuilt(&built.bytes, through);
-        let _kind = super::stages::section(super::stages::Hold::Drops);
-        drop((old, maps));
+        let mut retired = Retired::default();
+        retired.push((old, maps));
+        retired
     }
 
     /// Every changed entry noted at no step (a save, a map, a drop) is noted
@@ -2406,7 +2408,7 @@ mod tests {
                     }
                     through = next;
                     actor.seal(EventNumber::new(seq));
-                    actor.rebuilt(&built, EventNumber::new(through));
+                    drop(actor.rebuilt(&built, EventNumber::new(through)));
                 }
                 let at = format!("seed {seed}, step {seq}, built through {through}");
                 assert_reads_equal(&actor, &oracle, &oracle_bytes, &at);
