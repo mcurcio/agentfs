@@ -582,27 +582,35 @@ impl History {
     /// The overlay limit of the lag gate (`agentfs.overlayLimit`): over it,
     /// a tree's new work waits for the builder.
     pub fn set_overlay_limit(&self, bytes: u64) {
-        let _ = bytes;
-        todo!("agentfs-ln6.13")
+        self.state().gate.set_overlay_limit(bytes);
+        self.notify();
     }
 
     /// The actor's overlay of each tree, as it left them at a release of
     /// its lock: the gate's memory term. Wakes the gate thread when a tree's
     /// admission changed. Lock order: the actor, then History.
-    #[allow(dead_code, reason = "frozen interface of agentfs-ln6.13")]
     pub(in crate::tree_actor) fn overlays(
         &self,
         overlays: impl IntoIterator<Item = (TreeId, u64)>,
     ) {
-        let _ = overlays.into_iter();
-        todo!("agentfs-ln6.13")
+        let mut state = self.state();
+        let mut changed = false;
+        let mut reported = std::collections::BTreeSet::new();
+        for (tree, bytes) in overlays {
+            reported.insert(tree);
+            changed |= state.gate.overlay(tree, bytes);
+        }
+        changed |= state.gate.retain_overlays(|tree| reported.contains(&tree));
+        drop(state);
+        if changed {
+            self.notify();
+        }
     }
 
     /// `tree`'s overlay as the actor last reported it to the gate, in
     /// estimated bytes: 0 before any report. For tests and metrics.
     pub fn overlay_bytes(&self, tree: TreeId) -> u64 {
-        let _ = tree;
-        todo!("agentfs-ln6.13")
+        self.state().gate.overlay_of(tree)
     }
 
     /// The lag gate with these levels: a test's limit, so a call waits.
@@ -687,5 +695,28 @@ impl History {
                 None => state.gate.health(),
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tree_actor::test_support::new_actor;
+
+    /// A tree left out of a report (a fork the actor dropped) no longer
+    /// holds the gate.
+    #[test]
+    fn a_tree_absent_from_a_report_is_dropped_from_the_gate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let actor = new_actor(&tmp.path().join("state"));
+        let history = actor.history();
+        history.set_overlay_limit(1_000);
+        history.overlays([(TreeId::Root, 10), (TreeId::Fork(1), 5_000)]);
+        assert_eq!(history.overlay_bytes(TreeId::Fork(1)), 5_000);
+        assert_eq!(history.lag().health, Health::Stalled);
+        history.overlays([(TreeId::Root, 10)]);
+        assert_eq!(history.overlay_bytes(TreeId::Fork(1)), 0);
+        assert_eq!(history.overlay_bytes(TreeId::Root), 10);
+        assert_eq!(history.lag().health, Health::Current);
     }
 }

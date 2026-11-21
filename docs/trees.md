@@ -127,7 +127,9 @@ the directory of the file naming it, as git does) is checked:
   `http.proxy`), `patches` (`agentfs.patch*`, `agentfsPusher.*`), `lfs` and
   `other`. The `agentfs.not_built` gauge counts them by `capability`
   ([telemetry](telemetry.md)), the standing alarm for a setting that does
-  nothing yet. `agentfs.nested = exclude` is built and not listed. Every key is in
+  nothing yet. `agentfs.nested = exclude` is built and not listed, and so is
+  `agentfs.overlayLimit` (the lag gate's overlay limit, below): a value that is
+  not a positive size exits 1 before the volume is staged. Every key is in
   [configuration](configuration.md#tree-volumes-the-operator-settings-file).
 
 ### Running a command in the mount
@@ -729,6 +731,22 @@ the private checkouts copied, the checked-out files' maps rebased onto them
   holds nothing back. Over 30 s,
   `tree HistoryLagging` is logged once; over the limit, `tree HistoryStalled`.
   The levels are constants, not settings.
+- **The overlay limit.** The actor holds, per tree, each name, directory, object
+  and file map its steps changed since the built point (its overlay); a built
+  event drops what that build covers, so after each rebuild a tree's overlay is
+  its unbuilt steps' entries. The gate estimates it at 256 bytes an entry and
+  counts entries, not a changed map's pieces (the lag's byte term covers a save's
+  bytes). The actor reports every tree's overlay as it releases its lock, so the
+  gate sees it grow at each step and shrink at each rebuild, without a timer.
+  Over `agentfs.overlayLimit` (32 MiB unless set,
+  [configuration](configuration.md#tree-volumes-the-operator-settings-file)),
+  the tree's calls that start new work wait as over the lag limit, until the
+  built event whose rebuild brings the overlay under; the health is `Stalled`
+  meanwhile and `tree HistoryStalled` is logged once. The check is before the
+  call, so one step larger than the limit (a rename of a directory of many
+  names) is admitted, and the calls after it wait until it is built. A failed
+  builder holds nothing back here either: the overlay cannot shrink while it
+  has failed.
 
 ## Takes
 

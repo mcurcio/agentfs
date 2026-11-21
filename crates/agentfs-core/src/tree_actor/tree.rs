@@ -291,9 +291,8 @@ impl From<String> for PathName {
 }
 
 /// What one changed entry of the overlay holds in memory, measured
-/// (`tests/tree_overlay_limit.rs` holds it to the allocation a create's
+/// (`tests/tree_overlay_alloc.rs` holds it to the allocation a create's
 /// entries make): [`SavedTree::overlay_bytes`]'s unit.
-#[allow(dead_code, reason = "frozen interface of agentfs-ln6.13")]
 pub(super) const OVERLAY_ENTRY_BYTES: u64 = 256;
 
 /// The step an overlay entry is noted at before its step is known: a save,
@@ -311,6 +310,13 @@ struct Changed<K>(Option<BTreeMap<K, EventNumber>>);
 impl<K> Default for Changed<K> {
     fn default() -> Self {
         Self(None)
+    }
+}
+
+impl<K> Changed<K> {
+    /// How many keys are noted: O(1).
+    fn len(&self) -> usize {
+        self.0.as_ref().map_or(0, BTreeMap::len)
     }
 }
 
@@ -1739,9 +1745,12 @@ impl SavedTree {
     /// [`OVERLAY_ENTRY_BYTES`] each. O(1): each changed layer's length. A
     /// changed map's own pieces are not counted (the lag gate's byte term
     /// covers a save's bytes).
-    #[allow(dead_code, reason = "frozen interface of agentfs-ln6.13")]
     pub(super) fn overlay_bytes(&self) -> u64 {
-        todo!("agentfs-ln6.13")
+        let entries = self.shape.names.changed.len()
+            + self.shape.dirs.changed.len()
+            + self.shape.objects.changed.len()
+            + self.bytes.changed.len();
+        (entries as u64).saturating_mul(OVERLAY_ENTRY_BYTES)
     }
 
     pub(super) fn drop_object(&mut self, object: u64) {

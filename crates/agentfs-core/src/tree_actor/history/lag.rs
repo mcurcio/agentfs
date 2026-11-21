@@ -17,9 +17,10 @@ pub(in crate::tree_actor) const LAG_ALARM: Duration = Duration::from_secs(30);
 pub(in crate::tree_actor) const LAG_LIMIT: Duration = Duration::from_secs(120);
 /// Over this much overlay, a tree's calls that start new work wait for the
 /// builder (`agentfs.overlayLimit`'s default, docs/configuration.md): the
-/// memory the actor holds for changes history has not built yet.
-#[allow(dead_code, reason = "frozen interface of agentfs-ln6.13")]
-pub(in crate::tree_actor) const OVERLAY_LIMIT: u64 = 32 << 20;
+/// memory the actor holds for changes history has not built yet. One home:
+/// the operator settings' default is this value.
+pub(in crate::tree_actor) const OVERLAY_LIMIT: u64 =
+    crate::operator_settings::DEFAULT_OVERLAY_LIMIT;
 /// The builder's rates before it has measured a batch.
 const INITIAL_NS_PER_STEP: u64 = 5_000_000;
 const INITIAL_NS_PER_BYTE: u64 = 10;
@@ -36,6 +37,11 @@ pub(in crate::tree_actor) struct LagGate {
     /// The journal's compaction is overdue: every tree's new work waits
     /// until no step is unbuilt.
     overdue: bool,
+    /// Each tree's overlay as the actor last reported it, in estimated
+    /// bytes; a tree with none reported is absent.
+    overlay: BTreeMap<TreeId, u64>,
+    /// Over this overlay, a tree's new work waits.
+    overlay_limit: u64,
     /// The last health logged, so each entry into a state logs once.
     logged: Health,
 }
@@ -57,31 +63,57 @@ impl LagGate {
             alarm,
             failed: false,
             overdue: false,
+            overlay: BTreeMap::new(),
+            overlay_limit: OVERLAY_LIMIT,
             logged: Health::Current,
         }
     }
 
     /// The overlay limit: over it, a tree's new work waits ([`OVERLAY_LIMIT`]
     /// until set).
-    #[allow(dead_code, reason = "frozen interface of agentfs-ln6.13")]
     pub(in crate::tree_actor) fn set_overlay_limit(&mut self, bytes: u64) {
-        let _ = bytes;
-        todo!("agentfs-ln6.13")
+        self.overlay_limit = bytes;
+        self.log();
     }
 
     /// The actor's overlay of `tree` is `bytes` now (its last report wins);
-    /// true when that changed whether `tree` is admitted.
-    #[allow(dead_code, reason = "frozen interface of agentfs-ln6.13")]
+    /// true when that changed whether `tree` is admitted. O(log trees) unless
+    /// the report crosses the limit: the actor reports at every release of
+    /// its lock, and a tree's lag is a sum over its unbuilt steps.
     pub(in crate::tree_actor) fn overlay(&mut self, tree: TreeId, bytes: u64) -> bool {
-        let _ = (tree, bytes);
-        todo!("agentfs-ln6.13")
+        let crossed = (self.overlay_of(tree) > self.overlay_limit) != (bytes > self.overlay_limit);
+        let before = crossed && self.admits(tree);
+        if bytes == 0 {
+            self.overlay.remove(&tree);
+        } else {
+            self.overlay.insert(tree, bytes);
+        }
+        if !crossed {
+            return false;
+        }
+        self.log();
+        self.admits(tree) != before
+    }
+
+    /// Drops the overlay of every tree `keep` refuses (a tree the actor no
+    /// longer has); true when that changed whether some tree is admitted.
+    pub(in crate::tree_actor) fn retain_overlays(&mut self, keep: impl Fn(TreeId) -> bool) -> bool {
+        let gone: Vec<TreeId> = self
+            .overlay
+            .keys()
+            .copied()
+            .filter(|tree| !keep(*tree))
+            .collect();
+        let mut changed = false;
+        for tree in gone {
+            changed |= self.overlay(tree, 0);
+        }
+        changed
     }
 
     /// `tree`'s overlay as last reported: 0 before any report.
-    #[allow(dead_code, reason = "frozen interface of agentfs-ln6.13")]
     pub(in crate::tree_actor) fn overlay_of(&self, tree: TreeId) -> u64 {
-        let _ = tree;
-        todo!("agentfs-ln6.13")
+        self.overlay.get(&tree).copied().unwrap_or(0)
     }
 
     /// Sets whether the journal's compaction is overdue; true when that
@@ -146,11 +178,15 @@ impl LagGate {
         Duration::from_nanos(nanos)
     }
 
-    /// Whether `tree`'s new work may start now: its lag is under the limit
-    /// and no overdue compaction waits for the builder, or the builder has
-    /// failed (a failed builder holds nothing back).
+    /// Whether `tree`'s new work may start now: its lag and its overlay are
+    /// under their limits and no overdue compaction waits for the builder,
+    /// or the builder has failed (a failed builder holds nothing back: the
+    /// overlay cannot shrink while it has failed).
     pub(in crate::tree_actor) fn admits(&self, tree: TreeId) -> bool {
-        self.failed || (self.lag(tree) <= self.limit && !(self.overdue && !self.unbuilt.is_empty()))
+        self.failed
+            || (self.lag(tree) <= self.limit
+                && self.overlay_of(tree) <= self.overlay_limit
+                && !(self.overdue && !self.unbuilt.is_empty()))
     }
 
     /// Every tree's lag, worst first.
@@ -168,8 +204,9 @@ impl LagGate {
         trees
     }
 
-    /// The health the lags give, failure aside: stalled over the limit,
-    /// lagging over the alarm level.
+    /// The health the lags and overlays give, failure aside: stalled over
+    /// the lag limit or with an overlay over its limit, lagging over the
+    /// alarm level.
     pub(in crate::tree_actor) fn health(&self) -> Health {
         let worst = self
             .unbuilt
@@ -177,7 +214,11 @@ impl LagGate {
             .map(|tree| self.lag(*tree))
             .max()
             .unwrap_or_default();
-        if worst > self.limit {
+        let overlaid = self
+            .overlay
+            .values()
+            .any(|bytes| *bytes > self.overlay_limit);
+        if worst > self.limit || overlaid {
             Health::Stalled
         } else if worst > self.alarm {
             Health::Lagging
@@ -285,5 +326,71 @@ mod tests {
             gate.appended(A, step(n), 10_000);
         }
         assert_eq!(gate.lag(A), Duration::from_millis(1_000));
+    }
+
+    #[test]
+    fn the_overlay_holds_only_its_tree() {
+        let mut gate = LagGate::default();
+        gate.set_overlay_limit(1_000);
+        assert_eq!(gate.overlay_of(A), 0, "no report yet");
+        assert!(gate.overlay(A, 1_001), "A is held now");
+        assert!(!gate.admits(A));
+        assert!(gate.admits(B), "B has no overlay");
+        assert_eq!(gate.overlay_of(A), 1_001);
+        assert!(!gate.overlay(A, 2_000), "still held: no change");
+        assert!(gate.overlay(A, 1_000), "at the limit: admitted");
+        assert!(gate.admits(A));
+    }
+
+    #[test]
+    fn a_failed_builder_admits_over_the_overlay_limit() {
+        let mut gate = LagGate::default();
+        gate.set_overlay_limit(1_000);
+        gate.overlay(A, 5_000);
+        assert!(!gate.admits(A));
+        gate.failed();
+        assert!(gate.admits(A), "a failed builder holds nothing back");
+    }
+
+    #[test]
+    fn an_overlay_report_under_the_limit_admits() {
+        let mut gate = LagGate::default();
+        assert!(
+            !gate.overlay(A, OVERLAY_LIMIT),
+            "the default limit admits it"
+        );
+        assert!(gate.admits(A));
+        assert!(gate.overlay(A, OVERLAY_LIMIT + 1));
+        assert!(!gate.admits(A));
+        gate.set_overlay_limit(OVERLAY_LIMIT * 2);
+        assert!(gate.admits(A), "a raised limit admits it");
+    }
+
+    #[test]
+    fn an_overlay_over_the_limit_is_stalled() {
+        let mut gate = LagGate::default();
+        gate.set_overlay_limit(1_000);
+        gate.overlay(A, 1_000);
+        assert_eq!(gate.health(), Health::Current);
+        gate.overlay(B, 1_001);
+        assert_eq!(gate.health(), Health::Stalled);
+        gate.overlay(B, 10);
+        assert_eq!(gate.health(), Health::Current);
+    }
+
+    #[test]
+    fn a_tree_left_out_of_a_report_is_dropped() {
+        let mut gate = LagGate::default();
+        gate.set_overlay_limit(1_000);
+        gate.overlay(B, 5_000);
+        assert!(!gate.admits(B));
+        assert!(
+            gate.retain_overlays(|tree| tree == A),
+            "B's admission changed"
+        );
+        assert_eq!(gate.overlay_of(B), 0);
+        assert!(gate.admits(B));
+        assert_eq!(gate.health(), Health::Current);
+        assert!(!gate.retain_overlays(|tree| tree == A));
     }
 }

@@ -682,6 +682,17 @@ with. The behaviour, the state format and the current limits are in
 [trees](../trees.md); the FUSE adapter is in the [filesystem
 layer](filesystem.md#tree-views).
 
+A served volume (`Recording`) gates each call that starts new work in a tree:
+`admit(tree)` returns at once, or `admit_then(tree, then)` runs `then` at once,
+while the tree's lag and overlay are under their limits or the builder has
+failed, else at the built event that brings them under
+([trees](../trees.md#history-trails-the-files)). Each release of the actor's
+lock (`ActorGuard`'s drop) reports every tree's overlay to the gate.
+`Recording::set_overlay_limit(bytes)` sets the overlay limit (the launcher
+passes `OperatorSettings::overlay_limit()`); `History::overlay_bytes(tree)`
+gives a tree's overlay as last reported, in estimated bytes (0 before any
+report), and `History::lag()` the lags and the builder's health.
+
 ### Operator settings
 
 `operator_settings` reads and writes a tree volume's operator settings:
@@ -702,6 +713,9 @@ its `git` children read.
 - `not_built()` lists every configured key whose capability tree volumes do not
   build yet, one per key, sorted. Each is a `NotBuilt { key, capability }`.
   Nothing configured is silently ignored.
+- `overlay_limit()` gives `agentfs.overlayLimit`, the last value set, as a
+  positive size, or `DEFAULT_OVERLAY_LIMIT` (32 MiB) unset; any other value is
+  `SettingsError::BadValue { key, value, expected }`.
 
 `classify(key, value)` is the one table. It compares the key lower-cased, and
 the first match wins:
@@ -710,6 +724,7 @@ the first match wins:
 |---|---|
 | `include.path`, `includeIf.<condition>.path` | none: structure |
 | `agentfs.nested` = `exclude` (any case) | none: tree volumes build it |
+| `agentfs.overlayLimit` | none: tree volumes build it |
 | `agentfs.lfsThreshold`, `lfs.*`, `remote.<name>.lfsurl`, `remote.<name>.lfspushurl`, `remote.<name>.agentfsLfsCredentials`, `remote.<name>.agentfsMaxLfsObjectSize` | `Lfs` |
 | `agentfs.patch*`, `agentfsPusher.*` | `Patches` |
 | `remote.*`, `agentfs.pushInterval`, `agentfs.forkRefs`, `http.proxy` | `Push` |

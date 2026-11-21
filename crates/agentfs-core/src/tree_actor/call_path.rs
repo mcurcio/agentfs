@@ -24,10 +24,27 @@ use super::{Error, Saved, Took, TreeActor, TreeId};
 
 /// The actor, locked through the call path: [`TreeActor`] by `Deref`. Each
 /// guard adds one run of `Stages::actor_lock` when it is dropped, from the
-/// lock taken to its release.
+/// lock taken to its release, and reports each tree's overlay to the lag
+/// gate before the lock is released.
 pub struct ActorGuard<'a> {
     guard: MutexGuard<'a, TreeActor>,
     _held: Timer,
+}
+
+impl Drop for ActorGuard<'_> {
+    /// Every step and every rebuild at a built event runs under a guard, so
+    /// the gate sees each tree's overlay grow at each step and shrink at each
+    /// rebuild: event-driven. Runs before the fields drop, with the actor
+    /// still locked (lock order: the actor, then History).
+    fn drop(&mut self) {
+        let actor = &*self.guard;
+        actor.history().overlays(
+            actor
+                .trees
+                .iter()
+                .map(|(tree, saved)| (*tree, saved.overlay_bytes())),
+        );
+    }
 }
 
 impl Deref for ActorGuard<'_> {
@@ -310,8 +327,7 @@ impl Recording {
     /// launcher from the operator settings): over it, a tree's new work waits
     /// for the builder as it does over the lag limit.
     pub fn set_overlay_limit(&self, bytes: u64) {
-        let _ = bytes;
-        todo!("agentfs-ln6.13")
+        self.history.set_overlay_limit(bytes);
     }
 
     /// History, the one owner of the Git store.

@@ -384,9 +384,9 @@ pub fn mount(state: &Path, args: MountArgs, minter: Minter) -> Result<ExitCode> 
         .chain(fork.as_ref().map(|f| f.spec.at.as_path()))
         .collect();
     mountpoint::outside_the_state_area(state, &views)?;
-    let not_built = settings::at_boot(state, &views)?;
+    let boot = settings::at_boot(state, &views)?;
     let otel = crate::otel::init(name.as_str(), &identity(name.as_str(), &args.pod));
-    otel.telemetry().observe_not_built(&not_built);
+    otel.telemetry().observe_not_built(&boot.not_built);
     let expect: Vec<mountpoint::Expect> = std::iter::once(mountpoint::Expect::Source(
         agentfs_fuse::tree_view::view_source(name.as_str(), TreeId::Root),
     ))
@@ -421,6 +421,7 @@ pub fn mount(state: &Path, args: MountArgs, minter: Minter) -> Result<ExitCode> 
         metrics_output: args.metrics_output,
         command: args.command,
         volume: name,
+        overlay_limit: boot.overlay_limit,
     };
     let code = mount.run(state, root, fork, minter);
     drop(otel);
@@ -491,6 +492,8 @@ struct Mount {
     /// `-- COMMAND`: empty for none.
     command: Vec<OsString>,
     volume: VolumeName,
+    /// The lag gate's overlay limit, from the operator settings.
+    overlay_limit: u64,
 }
 
 /// What a view that could not open says.
@@ -557,7 +560,9 @@ impl Mount {
         minter: Minter,
     ) -> Result<ExitCode> {
         let cap = root_cap(&minter)?;
-        let mut staged = match serving::stage::<MountTrigger>(state, &self.at, cap, minter)? {
+        let staged =
+            serving::stage::<MountTrigger>(state, &self.at, cap, minter, self.overlay_limit)?;
+        let mut staged = match staged {
             Ok(staged) => staged,
             Err(code) => return Ok(code),
         };

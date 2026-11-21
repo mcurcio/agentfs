@@ -17,6 +17,14 @@ use crate::fsutil::sync_dir;
 /// The operator settings file's name in the state area.
 pub const FILE: &str = "config";
 
+/// The key bounding each tree's overlay: the memory the actor holds for
+/// changes history has not built yet (docs/configuration.md).
+pub const OVERLAY_LIMIT_KEY: &str = "agentfs.overlaylimit";
+
+/// `agentfs.overlayLimit` when unset: 32 MiB, about 40,000 unbuilt creates
+/// (a design choice; docs/trees.md, "History trails the files").
+pub const DEFAULT_OVERLAY_LIMIT: u64 = 32 << 20;
+
 /// What a configured key would need that tree volumes do not build yet.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -165,7 +173,19 @@ impl OperatorSettings {
     ///
     /// [`SettingsError::BadValue`] for a value that is not a positive size.
     pub fn overlay_limit(&self) -> Result<u64, SettingsError> {
-        todo!("agentfs-ln6.13")
+        let Some((key, value)) = self
+            .entries
+            .iter()
+            .rev()
+            .find(|(key, _)| key.eq_ignore_ascii_case(OVERLAY_LIMIT_KEY))
+        else {
+            return Ok(DEFAULT_OVERLAY_LIMIT);
+        };
+        crate::config::parse_size(value).ok_or_else(|| SettingsError::BadValue {
+            key: key.clone(),
+            value: value.clone(),
+            expected: "a positive size, such as 32m (k, m and g are powers of 1024)",
+        })
     }
 }
 
@@ -326,7 +346,9 @@ fn quoted(value: &str) -> String {
     out
 }
 
-/// Pure. `None` for `include.path` (structure) and for what tree volumes build (`agentfs.nested` = `exclude`, case-insensitive).
+/// Pure. `None` for `include.path` (structure) and for what tree volumes
+/// build (`agentfs.nested` = `exclude`, case-insensitive; `agentfs.overlaylimit`,
+/// whose value [`OperatorSettings::overlay_limit`] checks).
 /// The key is compared lower-cased (libgit2 lower-cases section and variable
 /// names). First match wins: `agentfs.lfsthreshold`, `lfs.*`,
 /// `remote.<n>.lfsurl`, `remote.<n>.lfspushurl`,
@@ -351,6 +373,9 @@ pub fn classify(key: &str, value: &str) -> Option<Capability> {
         return Some(Capability::Other);
     }
     if key == "agentfs.nested" && value.trim().eq_ignore_ascii_case("exclude") {
+        return None;
+    }
+    if key == OVERLAY_LIMIT_KEY {
         return None;
     }
     if key == "agentfs.lfsthreshold"
@@ -501,6 +526,50 @@ mod tests {
         for (key, value, expected) in cases {
             assert_eq!(classify(key, value), expected, "{key}={value}");
         }
+    }
+
+    fn with_config(text: &str) -> (tempfile::TempDir, OperatorSettings) {
+        let state = tempfile::tempdir().unwrap();
+        fs::write(state.path().join(FILE), text).unwrap();
+        let settings = OperatorSettings::read(state.path()).unwrap();
+        (state, settings)
+    }
+
+    #[test]
+    fn the_overlay_limit_is_32_mib_unset() {
+        let state = tempfile::tempdir().unwrap();
+        let settings = OperatorSettings::read(state.path()).unwrap();
+        assert_eq!(settings.overlay_limit().unwrap(), 32 << 20);
+    }
+
+    #[test]
+    fn the_overlay_limit_is_a_size_the_last_entry_wins() {
+        let (_state, settings) = with_config("[agentfs]\n\toverlayLimit = 64m\n");
+        assert_eq!(settings.overlay_limit().unwrap(), 64 << 20);
+        let (_state, settings) =
+            with_config("[agentfs]\n\toverlayLimit = x\n\toverlaylimit = 1k\n");
+        assert_eq!(settings.overlay_limit().unwrap(), 1 << 10);
+    }
+
+    #[test]
+    fn an_overlay_limit_that_is_not_a_positive_size_is_refused() {
+        for bad in ["0", "x", "-1"] {
+            let (_state, settings) = with_config(&format!("[agentfs]\n\toverlayLimit = {bad}\n"));
+            match settings.overlay_limit() {
+                Err(SettingsError::BadValue { key, value, .. }) => {
+                    assert_eq!(key, "agentfs.overlaylimit");
+                    assert_eq!(value, bad);
+                }
+                other => panic!("{bad}: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn the_overlay_limit_is_built() {
+        assert_eq!(classify("agentfs.overlayLimit", "1m"), None);
+        let (_state, settings) = with_config("[agentfs]\n\toverlayLimit = 1m\n");
+        assert!(settings.not_built().is_empty());
     }
 
     #[test]

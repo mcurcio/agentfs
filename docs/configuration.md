@@ -102,7 +102,8 @@ lines; without `--include` a re-run keeps them. Every `mount` reads it with
 libgit2, which follows the includes, and:
 
 - refuses (exit 1, before the volume is staged) an include under a view's
-  mount point, where the workload could change it;
+  mount point, where the workload could change it, and a key below set to a
+  value it refuses (`operator settings: <key> = "<value>": <expected>`);
 - warns `warning: operator settings: include <path> is missing` for an
   include that does not exist (git skips it);
 - logs, at every boot, one line per key whose capability tree volumes do
@@ -110,9 +111,16 @@ libgit2, which follows the includes, and:
   `capability` one of `push` (`remote.*`, `agentfs.pushInterval`,
   `agentfs.forkRefs`, `http.proxy`), `patches` (`agentfs.patch*`,
   `agentfsPusher.*`), `lfs` (`agentfs.lfsThreshold`, `lfs.*`, a remote's
-  LFS keys) and `other` (every other key, but `agentfs.nested = exclude`,
-  which tree volumes build). The `agentfs.not_built{capability}` gauge
-  counts them ([telemetry](telemetry.md)). The mount serves anyway.
+  LFS keys) and `other` (every other key, but `agentfs.nested = exclude`
+  and the keys below, which tree volumes build). The
+  `agentfs.not_built{capability}` gauge counts them ([telemetry](telemetry.md)).
+  The mount serves anyway.
+
+`agentfs host` reads the file the same way. The keys tree volumes build:
+
+| Key | Type | Default | Meaning and validation |
+|---|---|---|---|
+| `agentfs.overlayLimit` | positive size | `32m` | Bounds each tree's overlay: the memory the actor holds for changes history has not built yet, estimated per changed entry ([trees](trees.md#history-trails-the-files)). Over it, a call that starts new work in that tree waits for the builder, as over the lag limit. Read at every mount and host; the last value set wins. A value that is not a positive size (`0`, `-1`, `x`) refuses the mount (exit 1) |
 
 ## `[agentfs]`
 

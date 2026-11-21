@@ -109,14 +109,14 @@ pub fn host(state: &Path, args: HostArgs, minter: Minter) -> Result<ExitCode> {
         Err(code) => return Ok(code),
     };
     guard(&volume.name, &args.volume)?;
-    let not_built = settings::at_boot(state, &[])?;
+    let boot = settings::at_boot(state, &[])?;
     let otel = crate::otel::init(
         volume.name.as_str(),
         &identity(volume.name.as_str(), &args.pod),
     );
-    otel.telemetry().observe_not_built(&not_built);
+    otel.telemetry().observe_not_built(&boot.not_built);
     let cap = LaunchCap::mint(&minter, launcher, LaunchScope::Root);
-    let staged = match serving::stage::<Line>(state, &at, cap, minter)? {
+    let staged = match serving::stage::<Line>(state, &at, cap, minter, boot.overlay_limit)? {
         Ok(staged) => staged,
         Err(code) => return Ok(code),
     };
