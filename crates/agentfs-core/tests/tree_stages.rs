@@ -98,8 +98,9 @@ fn stages_add_up() {
     let mut got = count(&after.stages, &before.stages);
     let (_, syncs) = got.pop().unwrap();
     let expect = [
-        // the open, the truncate, the write, and the close as a step.
-        ("journal_append", 4 * SAVES),
+        // the open, the truncate, the write, the close's layout chunk, and
+        // the close as a step.
+        ("journal_append", 5 * SAVES),
         // A call is appended with no fsync; the builder makes a batch durable
         // before it reads it.
         ("journal_fsync", SAVES),
@@ -294,7 +295,8 @@ fn a_call_is_not_fsynced_and_flush_fsyncs_once() {
     rec.settle().unwrap();
     let after = Stages::current();
     assert_eq!(after.journal_fsync.count - before.journal_fsync.count, 2);
-    assert_eq!(after.journal_append.count - before.journal_append.count, 10);
+    // The truncate, eight writes, the close's layout chunk and its step.
+    assert_eq!(after.journal_append.count - before.journal_append.count, 11);
 }
 
 /// The distinct objects the store holds, by id. The history's repack runs in
@@ -360,8 +362,9 @@ fn a_save_stores_the_same_objects_at_100_and_10000_files() {
     assert_eq!(cost(10_000), expect, "at 10,000 files");
 }
 
-/// A file's first bytes are all new lines: the builder aligns them with no
-/// `git diff` child, so a create's save starts only `git fast-import`.
+/// A file's first bytes are all new lines: the builder takes them as the
+/// append case with no `git diff` child, so a create's save starts only
+/// `git fast-import`.
 #[test]
 fn an_empty_files_first_alignment_runs_no_child() {
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(PoisonError::into_inner);
@@ -387,7 +390,8 @@ fn an_empty_files_first_alignment_runs_no_child() {
         v.close(h).unwrap();
         v.settle().unwrap();
         let after = v.metrics().stages;
-        assert_eq!(after.align.count - before.align.count, 1, "aligned once");
+        // Bytes that only extend the empty file are the append case.
+        assert_eq!(after.align.count - before.align.count, 0, "not aligned");
         assert_eq!(
             after.git_children - before.git_children,
             1,
